@@ -118,12 +118,16 @@ struct Roots {
     shared_temp: Arc<Snapshot>,
 }
 
-/// The **storage identity** of a file-backed database (spec/design/session.md §2.4): the open pager
-/// + leaf buffer pool and the mutable page accounting, shared by every session over the one file.
-/// `None` on the [`Shared`] core means in-memory (no file; [`Shared::persist`] is a no-op). The
-/// `page_count` / `free_pages` are mutated only under the single-writer gate (so the `Mutex` is
-/// uncontended), and `paging` is itself thread-safe ([`crate::paging::SharedPaging`]) so readers
-/// fault pages concurrently with the committing writer.
+/// The **storage identity** of a database (spec/design/session.md §2.4; bplus-reshape.md B3): the
+/// open pager + leaf buffer pool and the mutable page accounting, shared by every session over the
+/// one byte store. Since B3 **every** database has one — a file-backed database over a
+/// `FileBlockStore`, an in-memory database over a [`crate::blockstore::MemoryBlockStore`] (with a
+/// pinned, unbounded pool — an in-memory database is resident by definition) — so the commit path
+/// is one path: `persist` packs dirty pages into the store either way, and the store's `sync` is
+/// what durability means for that host (a no-op in memory). The `page_count` / `free_pages` are
+/// mutated only under the single-writer gate (so the `Mutex` is uncontended), and `paging` is
+/// itself thread-safe ([`crate::paging::SharedPaging`]) so readers fault pages concurrently with
+/// the committing writer.
 struct Storage {
     /// The page payload size, fixed into the file at creation.
     page_size: u32,
@@ -136,8 +140,9 @@ struct Storage {
     /// The shared pager + bounded leaf buffer pool — one per file, shared by every store/snapshot.
     paging: Arc<crate::paging::SharedPaging>,
     /// Opened read-only (api.md §2.1): every session is then read-only and a write is `25006`.
+    /// Always `false` for an in-memory database.
     read_only: bool,
-    /// The backing file path (a file-backed core always has one); surfaced by [`Database::path`].
+    /// The backing file path; `None` for an in-memory database. Surfaced by [`Database::path`].
     path: Option<std::path::PathBuf>,
 }
 
@@ -156,14 +161,9 @@ struct Shared {
     writer_free: Condvar,
     /// The live-reader registry (transactions.md §8): pinned versions → the reclamation watermark.
     live: Mutex<LiveRegistry>,
-    /// The storage identity for a **file-backed** database (§2.4); `None` is in-memory. Mutated only
-    /// under the writer gate, so the `Mutex` never contends with the publish path.
-    storage: Option<Mutex<Storage>>,
-    /// The page size minted sessions serialize/split at when this core is **in-memory** (`storage`
-    /// is `None`); the file's page size wins when file-backed (see [`Shared::page_size`]). The default
-    /// for a normal in-memory database; [`Database::new_in_memory_with_page_size`] sets it so the
-    /// byte-level fixtures/tests can build an in-memory tree at the size it will serialize to (§8).
-    mem_page_size: u32,
+    /// The storage identity (§2.4) — since B3 every core has one (file- or memory-backed). Mutated
+    /// only under the writer gate, so the `Mutex` never contends with the publish path.
+    storage: Mutex<Storage>,
 }
 
 impl Shared {
@@ -231,36 +231,30 @@ impl Shared {
     /// the physical pages `persist` writes — and so every core builds byte-identical file-backed
     /// databases (CLAUDE.md §8). In-memory this is the default, so it is a no-op there.
     fn page_size(&self) -> u32 {
-        self.storage.as_ref().map_or(self.mem_page_size, |s| {
-            s.lock().expect("storage lock not poisoned").page_size
-        })
+        self.storage.lock().expect("storage lock not poisoned").page_size
     }
 
     /// Whether this core is a read-only file-backed database (a write is `25006`). In-memory cores
     /// are always writable.
     fn read_only(&self) -> bool {
-        self.storage
-            .as_ref()
-            .is_some_and(|s| s.lock().expect("storage lock not poisoned").read_only)
+        self.storage.lock().expect("storage lock not poisoned").read_only
     }
 
     /// The on-disk page high-water for a file-backed core; `0` in-memory (no backing file).
     fn page_count(&self) -> u32 {
-        self.storage.as_ref().map_or(0, |s| {
-            s.lock().expect("storage lock not poisoned").page_count
-        })
+        self.storage.lock().expect("storage lock not poisoned").page_count
     }
 
     /// The backing file path for a file-backed core; `None` in-memory.
     fn path(&self) -> Option<std::path::PathBuf> {
-        self.storage
-            .as_ref()
-            .and_then(|s| s.lock().expect("storage lock not poisoned").path.clone())
+        self.storage.lock().expect("storage lock not poisoned").path.clone()
     }
 
-    /// Durably persist `snap` to the backing file via an **incremental** copy-on-write commit
-    /// (file.rs `persist`, transactions.md §9) — the file-backed publish chokepoint. **In-memory is a
-    /// no-op success** (no storage). Called from [`Session::publish`] under the writer gate, so the
+    /// Durably persist `snap` to the backing store via an **incremental** copy-on-write commit
+    /// (file.rs `persist`, transactions.md §9) — the publish chokepoint for every host (bplus-reshape.md
+    /// B3): a file-backed core pwrites + `fdatasync`s; an in-memory core packs the same dirty pages
+    /// into its `MemoryBlockStore`, whose `sync` is a no-op — the file commit minus durability, one
+    /// code path. Called from [`Session::publish`] under the writer gate, so the
     /// `page_count`/`free_pages` mutation is single-writer. Writes the dirty pages this commit
     /// introduced (reusing reconstruct-on-open free-list pages first), `sync`s, publishes the
     /// alternate meta slot (`snap.txid & 1`), `sync`s. A crash between the two syncs leaves the prior
@@ -268,11 +262,7 @@ impl Shared {
     /// `free_pages` advance only after both syncs succeed, so a write failure leaves the file's prior
     /// meta and this accounting untouched (the working snapshot is then discarded by the caller).
     fn persist(&self, snap: &Snapshot) -> Result<()> {
-        let storage = match &self.storage {
-            Some(s) => s,
-            None => return Ok(()), // in-memory: the committed swap is the whole commit
-        };
-        let mut st = storage.lock().expect("storage lock not poisoned");
+        let mut st = self.storage.lock().expect("storage lock not poisoned");
         let write = snap.incremental_image(
             st.page_size,
             st.page_count,
@@ -353,29 +343,29 @@ impl Database {
     /// non-default page size (the shared-core analogue of `Engine::with_page_size`); a normal
     /// in-memory database uses [`Database::new_in_memory`] (the default page size).
     pub fn new_in_memory_with_page_size(page_size: u32) -> Database {
-        Database(Arc::new(Shared {
-            roots: RwLock::new(Roots {
-                committed: Arc::new(Snapshot::default()),
-                shared_temp: Arc::new(Snapshot::default()),
-            }),
-            writer_active: Mutex::new(false),
-            writer_free: Condvar::new(),
-            live: Mutex::new(LiveRegistry::default()),
-            storage: None,
-            mem_page_size: page_size,
-        }))
+        // B3 (bplus-reshape.md): an in-memory database is a `MemoryBlockStore` seeded with the
+        // empty from-scratch image, read/written through the same pager + Packed path as a file.
+        // txid 0 is the pre-first-commit version (the same committed version an in-memory core
+        // always started at); the first commit publishes txid 1 into the alternate meta slot.
+        let image = Snapshot::default()
+            .to_image(page_size, 0)
+            .expect("an empty in-memory image always serializes");
+        let engine = Engine::from_image(&image).expect("an empty in-memory image always loads");
+        Database::from_engine(engine)
     }
 
-    /// Build a file-backed shared core from a freshly opened/created file-backed [`Engine`]
-    /// (file.rs): lift its committed snapshot into the published roots and its storage identity
-    /// (path/page size/pager/page accounting) into [`Storage`]. The committed snapshot's stores
-    /// already carry the shared `Arc<SharedPaging>`, so every pinned/cloned snapshot faults clean
-    /// pages through the one pool (spec/design/pager.md).
-    fn from_file_engine(engine: Engine) -> Database {
+    /// Build a shared core from a freshly opened/created/loaded [`Engine`] (file.rs / `from_image`):
+    /// lift its committed snapshot into the published roots and its storage identity (path/page
+    /// size/pager/page accounting) into [`Storage`]. Since B3 every engine carries a paging context —
+    /// a file's `FileBlockStore` or an in-memory `MemoryBlockStore` — so this is the one
+    /// constructor for both hosts. The committed snapshot's stores already carry the shared
+    /// `Arc<SharedPaging>`, so every pinned/cloned snapshot faults clean pages through the one pool
+    /// (spec/design/pager.md).
+    fn from_engine(engine: Engine) -> Database {
         let paging = engine
             .paging
             .clone()
-            .expect("a file-backed engine has a paging context");
+            .expect("every engine carries a paging context (B3)");
         let storage = Storage {
             page_size: engine.page_size,
             page_count: engine.page_count,
@@ -384,7 +374,6 @@ impl Database {
             read_only: engine.read_only,
             path: engine.path.clone(),
         };
-        let mem_page_size = engine.page_size;
         Database(Arc::new(Shared {
             roots: RwLock::new(Roots {
                 committed: Arc::new(engine.committed),
@@ -393,8 +382,7 @@ impl Database {
             writer_active: Mutex::new(false),
             writer_free: Condvar::new(),
             live: Mutex::new(LiveRegistry::default()),
-            storage: Some(Mutex::new(storage)),
-            mem_page_size,
+            storage: Mutex::new(storage),
         }))
     }
 
@@ -403,25 +391,11 @@ impl Database {
     /// no backing file (so a write republishes in memory, never persisting). Used by the conformance
     /// harness's `# fixture:` path to run records against a pre-built on-disk state that SQL cannot
     /// construct (the collation version-skew read-safety guard, collation.md §12).
-    fn from_memory_engine(engine: Engine) -> Database {
-        let mem_page_size = engine.page_size;
-        Database(Arc::new(Shared {
-            roots: RwLock::new(Roots {
-                committed: Arc::new(engine.committed),
-                shared_temp: Arc::new(engine.shared_temp_committed),
-            }),
-            writer_active: Mutex::new(false),
-            writer_free: Condvar::new(),
-            live: Mutex::new(LiveRegistry::default()),
-            storage: None,
-            mem_page_size,
-        }))
-    }
-
     /// Reconstruct an **in-memory** shared core from a database image (`XX001` on a malformed image).
-    /// The shared-core analogue of [`Engine::from_image`].
+    /// The shared-core analogue of [`Engine::from_image`] — since B3 the image becomes the core's
+    /// `MemoryBlockStore`, demand-paged like a file (one read path).
     pub fn from_image(image: &[u8]) -> Result<Database> {
-        Ok(Database::from_memory_engine(Engine::from_image(image)?))
+        Ok(Database::from_engine(Engine::from_image(image)?))
     }
 
     /// Serialize the whole committed state to a single, clean from-scratch on-disk image (the inverse
@@ -503,7 +477,7 @@ impl Database {
     /// path already exists. The page size is locked into the file. (The shared-core analogue of
     /// [`Engine::create`].)
     pub fn create<P: AsRef<Path>>(path: P, opts: DatabaseOptions) -> Result<Database> {
-        Ok(Database::from_file_engine(Engine::create(path, opts)?))
+        Ok(Database::from_engine(Engine::create(path, opts)?))
     }
 
     /// Open an **existing** file-backed shared database at `path` with default open settings.
@@ -515,7 +489,7 @@ impl Database {
     /// (the buffer-pool budget, read-only mode, work-mem). (The shared-core analogue of
     /// [`Engine::open_with_options`].)
     pub fn open_with_options<P: AsRef<Path>>(path: P, opts: OpenOptions) -> Result<Database> {
-        Ok(Database::from_file_engine(Engine::open_with_options(
+        Ok(Database::from_engine(Engine::open_with_options(
             path, opts,
         )?))
     }

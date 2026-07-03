@@ -546,6 +546,18 @@ impl TableStore {
         self.rows.root()
     }
 
+    /// Fault the clean leaf at `page` through this store's pool — the whole-image serializer's
+    /// `OnDisk`-child materialization (format.rs `serialize_node`; under B3 every database is
+    /// demand-paged, in-memory included). A store with no paging context cannot hold an `OnDisk`
+    /// child, so the expect is an internal wiring invariant.
+    pub(crate) fn fault_leaf(&self, page: u32) -> Result<Arc<Node>> {
+        let paging = self
+            .paging
+            .as_ref()
+            .expect("an OnDisk leaf implies a paged store");
+        paging.fault_leaf(page, &self.col_types)
+    }
+
     /// The table's resolved column types — the value codec's input on every serialize/decode path
     /// (spec/design/composite.md §4). Empty for an index store (records are the key alone).
     pub(crate) fn col_types(&self) -> &[ColType] {

@@ -1199,7 +1199,7 @@ impl Snapshot {
         for (ti, (_, table, store)) in tables.iter().enumerate() {
             if let Some(root) = store.tree_root() {
                 root_data_page[ti] =
-                    serialize_node(root, store.col_types(), cap, &mut next_index, &mut body)?;
+                    serialize_node(root, store, cap, &mut next_index, &mut body)?;
             }
             // The table's index trees follow its data tree, in catalog (name) order
             // (spec/fileformat/format.md "From-scratch image"). Index records are the key alone —
@@ -1223,7 +1223,7 @@ impl Snapshot {
                 } else {
                     let istore = self.index_store(&idx.name.to_ascii_lowercase());
                     match istore.tree_root() {
-                        Some(root) => serialize_node(root, &[], cap, &mut next_index, &mut body)?,
+                        Some(root) => serialize_node(root, istore, cap, &mut next_index, &mut body)?,
                         None => 0,
                     }
                 };
@@ -1322,21 +1322,23 @@ impl Snapshot {
 /// `RECORD_MAX`) — `feature_not_supported` (`0A000`), matching the v1 oversized-item rule.
 fn serialize_node(
     node: &Arc<Node>,
-    col_types: &[ColType],
+    store: &TableStore,
     cap: usize,
     next_index: &mut u32,
     body: &mut Vec<(u32, u8, u32, u32, Vec<u8>)>,
 ) -> Result<u32> {
+    let col_types = store.col_types();
     let mut child_pages = Vec::with_capacity(node.children.len());
     for child in &node.children {
-        // Whole-image serialize renumbers pages from scratch and runs only on a fully-resident
-        // in-memory database (create's empty image, the golden generator) — a paged file commits
-        // incrementally via `serialize_dirty`. An `OnDisk` child would carry a page id from a
-        // different layout, so it must not appear here.
+        // Whole-image serialize renumbers pages from scratch. Under B3 (bplus-reshape.md) every
+        // database — in-memory included — is demand-paged, so a clean leaf may be an `OnDisk`
+        // reference into the source store: fault it through the store's pool for the duration of
+        // its own serialization (whole-image serialize is not a hot path).
         let cp = match child {
-            Child::Resident(n) => serialize_node(n, col_types, cap, next_index, body)?,
+            Child::Resident(n) => serialize_node(n, store, cap, next_index, body)?,
             Child::OnDisk(p) => {
-                unreachable!("whole-image serialize hit an OnDisk leaf (page {p})")
+                let n = store.fault_leaf(*p)?;
+                serialize_node(&n, store, cap, next_index, body)?
             }
         };
         child_pages.push(cp);
@@ -1355,12 +1357,16 @@ fn serialize_node(
         i
     };
     let (page_type, payload) = if node.children.is_empty() {
-        // A leaf may be **Packed** here: a demand-paged reopen faults a single-leaf table's root leaf
-        // resident (read_skeleton), and `to_image` re-serializes it. Materialize through the accessor
-        // seam (`decoded_rows` reconstructs a Packed leaf, clones a Decoded one) so encode can borrow
-        // the rows. Whole-image serialize is not a hot path (create's empty image / golden generator /
-        // `to_image` canonical), so the Decoded-case clone is acceptable (packed-leaf.md §7).
-        let leaf_rows = node.decoded_rows()?;
+        // A leaf may be **Packed** here: a demand-paged load keeps leaves as page blocks and
+        // `to_image` re-serializes them. Materialize through the accessor seam (`decoded_rows`
+        // reconstructs a Packed leaf, clones a Decoded one), then resolve any lazily-deferred
+        // large values through the store's pager (large-values.md §14) so encode sees resident
+        // bytes. Whole-image serialize is not a hot path (create's empty image / golden
+        // generator / `to_image` canonical), so the clones are acceptable (packed-leaf.md §7).
+        let mut leaf_rows = node.decoded_rows()?;
+        for row in &mut leaf_rows {
+            store.resolve_all(row)?;
+        }
         let rows: Vec<&[Value]> = leaf_rows.iter().map(Vec::as_slice).collect();
         (
             PAGE_LEAF,
@@ -1670,6 +1676,11 @@ impl Engine {
     /// Reconstruct a database from an on-disk image (inverse of `to_image`). Returns
     /// a structured `data_corrupted` (XX001) error for any malformed input.
     pub fn from_image(image: &[u8]) -> Result<Engine> {
+        // B3 (bplus-reshape.md): the image becomes the engine's byte store — a `MemoryBlockStore`
+        // read through the SAME demand-paged loader, pager, and Packed leaf path as a file (one
+        // read path; the eager whole-image `read_tree` loader is gone). The pool is pinned
+        // (unbounded): an in-memory database is resident by definition (§5), so `cache_bytes`
+        // bounds only file-backed eviction and the observable default is unchanged.
         if image.len() < 12 {
             return Err(corrupt("image smaller than a meta header"));
         }
@@ -1677,127 +1688,9 @@ impl Engine {
         if !page_size_valid(page_size) || image.len() < page_size * 2 {
             return Err(corrupt("invalid page size"));
         }
-        let meta = select_meta(image, page_size)?;
-
-        // Build the committed snapshot from the image, then wrap it in a fresh handle that
-        // adopts the file's serialization parameters (spec/design/api.md §2).
-        let mut snap = Snapshot::default();
-        snap.txid = meta.txid;
-        // Reconstruct the free-list (P6.2): collect every page reachable from the committed root —
-        // the catalog chain plus each table's B-tree nodes — as we load it; the rest of `[2,
-        // page_count)` is dead space the next incremental commit may reuse
-        // (spec/fileformat/format.md *Reclamation*).
-        let mut reached: HashSet<u32> = HashSet::new();
-        let mut cat_page = meta.root_page;
-        while cat_page != 0 {
-            reached.insert(cat_page);
-            let page = read_page(image, page_size, cat_page)?;
-            if page.page_type != PAGE_CATALOG {
-                return Err(corrupt("expected a catalog page"));
-            }
-            let mut pos = 0usize;
-            for _ in 0..page.item_count {
-                // Each catalog entry is kind-tagged (v9): 1 = a composite-type entry (registered
-                // now; its nested refs are validated after the full walk), 0 = a table entry.
-                let kind = read_u8(page.payload, &mut pos)?;
-                if kind == 1 {
-                    let ct = decode_composite_type_entry(page.payload, &mut pos)?;
-                    snap.put_type(ct);
-                    continue;
-                }
-                if kind == 2 {
-                    // A sequence entry (v12): self-contained, registered directly (no two-pass).
-                    let s = decode_sequence_entry(page.payload, &mut pos)?;
-                    snap.put_sequence(s);
-                    continue;
-                }
-                if kind == 3 {
-                    // A collation snapshot (v17): the baked `.coll` artifact + an `is_default` flag
-                    // (spec/design/collation.md §5). Registered directly; the default restores the
-                    // per-database default collation.
-                    let (coll, is_default) = decode_collation_entry(page.payload, &mut pos)?;
-                    if is_default {
-                        snap.set_default_collation(Some(coll.name.clone()));
-                    }
-                    snap.put_collation(std::sync::Arc::new(coll));
-                    continue;
-                }
-                if kind != 0 {
-                    return Err(corrupt("unknown catalog entry kind"));
-                }
-                let (table, root_data_page, index_roots) =
-                    decode_table_entry(page.payload, &mut pos)?;
-                let name = table.name.clone();
-                let has_pk = !table.pk_indices().is_empty();
-                let indexes = table.indexes.clone();
-                snap.put_table(table, page_size as u32);
-                // The store resolved each column's `ColType` from the (types-first) catalog at
-                // `put_table`; the codec reads it back rather than re-walking the type catalog.
-                let col_types = snap.store(&name).col_types().to_vec();
-                if root_data_page != 0 {
-                    let (root, len) =
-                        read_tree(image, page_size, root_data_page, &col_types, &mut reached)?;
-                    let store = snap.store_mut(&name);
-                    store.set_tree(Some(root), len);
-                    // No-PK keys are synthetic i64 rowids — advance the counter past the largest
-                    // (the last entry in key order) so future inserts don't collide.
-                    if !has_pk {
-                        // In-memory load (no paging) — `iter_entries` never faults, so `?` is inert.
-                        let entries = store.iter_entries()?;
-                        if let Some((k, _)) = entries.last() {
-                            store.bump_rowid_to(decode_int(ScalarType::Int64, k) + 1);
-                        }
-                    }
-                }
-                // The table's index trees (v5): zero-column stores of entry keys
-                // (spec/design/indexes.md §3), reachable pages included in the walk.
-                for (idx, &iroot) in indexes.iter().zip(&index_roots) {
-                    let cap = page_size - PAGE_HEADER;
-                    let mut istore = TableStore::new(cap, Vec::new());
-                    if iroot != 0 {
-                        if idx.kind == IndexKind::Gist {
-                            // GiST: parse the persisted R-tree (pages 5/6), marking its pages
-                            // reached, and recover its leaf keys to repopulate the flat leaf store.
-                            // The resident R-tree is rebuilt canonically below (rebuild_gist_trees).
-                            let mut keys = Vec::new();
-                            read_gist_leaf_keys(
-                                &|p| {
-                                    let pg = read_page(image, page_size, p)?;
-                                    Ok((pg.page_type, pg.item_count, pg.payload.to_vec()))
-                                },
-                                iroot,
-                                &mut reached,
-                                &mut keys,
-                            )?;
-                            for k in keys {
-                                istore.insert(k, Vec::new())?;
-                            }
-                        } else {
-                            let (root, len) =
-                                read_tree(image, page_size, iroot, &[], &mut reached)?;
-                            istore.set_tree(Some(root), len);
-                        }
-                    }
-                    snap.put_index_store(idx.name.to_ascii_lowercase(), istore);
-                }
-            }
-            cat_page = page.next_page;
-        }
-        // Two-pass: validate the composite-type catalog (existence + acyclicity) now that every
-        // type entry has been read (spec/design/composite.md §3); a bad reference is XX001.
-        snap.validate_composite_types()?;
-        // Build each GiST index's resident R-tree from its now-loaded leaf store (gist.md §4.1).
-        snap.rebuild_gist_trees()?;
-        let mut db = Engine::new();
-        db.page_size = page_size as u32;
-        db.page_count = meta.page_count; // the on-disk high-water for the next incremental commit
-        // The free-list: every body page `[2, page_count)` the committed root does not reach
-        // (P6.2). Ascending by construction (the range is), so the allocator reuses lowest-first.
-        db.free_pages = (ROOT_PAGE..meta.page_count)
-            .filter(|p| !reached.contains(p))
-            .collect();
-        db.committed = snap;
-        Ok(db)
+        let store = crate::blockstore::MemoryBlockStore::new(image.to_vec());
+        let pager = Pager::from_store(Box::new(store))?;
+        Engine::open_paged(pager, usize::MAX)
     }
 
     /// Open a file-backed database **demand-paged** (spec/design/pager.md, P6.4b): load only the
@@ -2102,82 +1995,6 @@ fn read_separators(payload: &[u8], pos: &mut usize, n: usize) -> Result<Vec<Vec<
     }
     *pos = blob + prev as usize;
     Ok(keys)
-}
-
-/// Read a table's on-disk B-tree (rooted at `page_idx`) into an in-memory tree, returning the root
-/// node and the total row count (spec/fileformat/format.md). An interior node's payload is its
-/// `N+1` child pointers then its `N` records; we recurse the pointers, then read the separators.
-/// Weights are recomputed from the value codec (the exact size the writer used), so the loaded tree
-/// is ready for further size-driven splits. Every node page and every overflow chain page reached
-/// (an external value's chain — large-values.md §12) is added to `reached` for the free-list walk.
-fn read_tree(
-    image: &[u8],
-    ps: usize,
-    page_idx: u32,
-    col_types: &[ColType],
-    reached: &mut HashSet<u32>,
-) -> Result<(Arc<Node>, usize)> {
-    reached.insert(page_idx);
-    let page = read_page(image, ps, page_idx)?;
-    let fetch = |p: u32| page_block(image, ps, p);
-    match page.page_type {
-        PAGE_LEAF => {
-            let n = page.item_count as usize;
-            let k = col_types.len();
-            let dirs = parse_pax_leaf(page.payload, n, col_types)?;
-            let (mut keys, mut vals, mut weights) = (
-                Vec::with_capacity(n),
-                Vec::with_capacity(n),
-                Vec::with_capacity(n),
-            );
-            for i in 0..n {
-                let key = dirs.key(page.payload, i)?.to_vec();
-                let mut row = Vec::with_capacity(k);
-                let mut ovf = Vec::new();
-                let mut w = key.len();
-                for (c, ty) in col_types.iter().enumerate() {
-                    w += dirs.value_len(c, i);
-                    if dirs.is_null(page.payload, c, i) {
-                        row.push(Value::Null);
-                        continue;
-                    }
-                    let mut pos = dirs.value_off(c, i);
-                    row.push(match fixed_value_width(ty) {
-                        // A fixed-width slot is the untagged inline body.
-                        Some(_) => {
-                            read_inline_body(ty, page.payload, &mut pos, DecodeMode::Construct)?
-                        }
-                        // A variable value's span is its tagged codec bytes; external chains are
-                        // gathered eagerly here (the fully-resident in-memory load).
-                        None => read_value(ty, page.payload, &mut pos, Some(&fetch), &mut ovf)?,
-                    });
-                }
-                weights.push(w as u32);
-                reached.extend(ovf);
-                keys.push(key);
-                vals.push(row);
-            }
-            Ok((Node::loaded(keys, vals, weights, Vec::new(), page_idx), n))
-        }
-        PAGE_INTERIOR => {
-            let n = page.item_count as usize;
-            let mut pos = 0usize;
-            let mut children = Vec::with_capacity(n + 1);
-            let mut total = 0usize;
-            for _ in 0..=n {
-                let cp = read_u32(page.payload, &mut pos)?;
-                let (child, clen) = read_tree(image, ps, cp, col_types, reached)?;
-                // The in-memory load is fully resident (no pager to fault from); the demand-paged
-                // file load (B2) is a separate path that leaves leaf children `OnDisk`.
-                children.push(Child::Resident(child));
-                total += clen;
-            }
-            // v24: the record-free routing skeleton — separators carry no values or chains.
-            let keys = read_separators(page.payload, &mut pos, n)?;
-            Ok((Node::loaded_interior(keys, children, page_idx), total))
-        }
-        _ => Err(corrupt("expected a B-tree node page")),
-    }
 }
 
 /// Build a GiST index's canonical R-tree from its leaf-key store and serialize it to node pages
