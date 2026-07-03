@@ -1441,7 +1441,7 @@ impl Parser {
     fn parse_insert(&mut self) -> Result<Insert> {
         self.expect_keyword("insert")?;
         self.expect_keyword("into")?;
-        let table = self.expect_identifier()?;
+        let (db, table) = self.parse_qualified_table_name()?;
 
         // Optional column list `( col [, col]* )` before VALUES. An empty `()` is rejected
         // (the first `expect_identifier` errors 42601 on `)`).
@@ -1503,6 +1503,7 @@ impl Parser {
         let returning = self.parse_returning()?;
         Ok(Insert {
             table,
+            db,
             columns,
             overriding,
             source,
@@ -2374,10 +2375,29 @@ impl Parser {
         {
             return self.parse_json_table();
         }
-        let name = self.expect_identifier()?;
+        let mut name = self.expect_identifier()?;
+        // An optional DATABASE qualifier `db "." table` (attached-databases.md §3): a `.` after the
+        // first identifier makes it the database qualifier and the next identifier the table name. A
+        // qualified name is a BASE TABLE only — never a set-returning function (no cross-database SRF)
+        // — so the function `(` branch below is guarded off when a qualifier is present. Mirrors
+        // `parse_column_ref`'s one-`.`-lookahead, the only dotted-name precedent.
+        let db = if matches!(self.peek(), Token::Dot) {
+            self.advance(); // .
+            let table = self.expect_identifier()?;
+            let qualifier = name;
+            name = table;
+            Some(qualifier)
+        } else {
+            None
+        };
         // A `(` right after the name = a set-returning function call (no `*`/`DISTINCT` — those
         // are aggregate/star forms, not an SRF argument list).
         let args = if matches!(self.peek(), Token::LParen) {
+            if db.is_some() {
+                return Err(syntax(
+                    "a database-qualified name cannot be a function call",
+                ));
+            }
             self.advance();
             let mut a = vec![self.parse_expr()?];
             while matches!(self.peek(), Token::Comma) {
@@ -2424,6 +2444,7 @@ impl Parser {
         };
         Ok(TableRef {
             name,
+            db,
             alias,
             args,
             subquery: None,
@@ -2497,6 +2518,8 @@ impl Parser {
         };
         Ok(TableRef {
             name: alias.clone().unwrap_or_default(),
+            // A derived table has no database qualifier (only a base table in table position does).
+            db: None,
             alias,
             args: None,
             subquery,
@@ -2555,6 +2578,8 @@ impl Parser {
         };
         Ok(TableRef {
             name: alias.clone().unwrap_or_else(|| "json_table".to_string()),
+            // A JSON_TABLE source has no database qualifier.
+            db: None,
             alias,
             args: None,
             subquery: None,
@@ -3016,7 +3041,7 @@ impl Parser {
     /// `UPDATE <table> SET <col> = <operand> [, <col> = <operand>]* [WHERE <pred>]`.
     fn parse_update(&mut self) -> Result<Update> {
         self.expect_keyword("update")?;
-        let table = self.expect_identifier()?;
+        let (db, table) = self.parse_qualified_table_name()?;
         self.expect_keyword("set")?;
 
         let mut assignments = Vec::new();
@@ -3039,6 +3064,7 @@ impl Parser {
         let returning = self.parse_returning()?;
         Ok(Update {
             table,
+            db,
             assignments,
             filter,
             returning,
@@ -3049,11 +3075,12 @@ impl Parser {
     fn parse_delete(&mut self) -> Result<Delete> {
         self.expect_keyword("delete")?;
         self.expect_keyword("from")?;
-        let table = self.expect_identifier()?;
+        let (db, table) = self.parse_qualified_table_name()?;
         let filter = self.parse_optional_where()?;
         let returning = self.parse_returning()?;
         Ok(Delete {
             table,
+            db,
             filter,
             returning,
         })
@@ -4341,6 +4368,23 @@ impl Parser {
             Ok((Some(first), second))
         } else {
             Ok((None, first))
+        }
+    }
+
+    /// Parse `qualified_table ::= (identifier ".")? identifier` in DML-target position
+    /// (attached-databases.md §3): an optional database qualifier followed by the table name.
+    /// Returns `(db, name)` where `db` is `None` for a bare (implicit-scope) name. The FROM-position
+    /// analogue is inlined in `parse_table_ref` (which must also disambiguate the function /
+    /// derived-table forms). Mirrors `parse_column_ref`'s one-`.`-lookahead — the only dotted-name
+    /// precedent.
+    fn parse_qualified_table_name(&mut self) -> Result<(Option<String>, String)> {
+        let name = self.expect_identifier()?;
+        if matches!(self.peek(), Token::Dot) {
+            self.advance(); // .
+            let table = self.expect_identifier()?;
+            Ok((Some(name), table))
+        } else {
+            Ok((None, name))
         }
     }
 

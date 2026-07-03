@@ -1825,6 +1825,47 @@ impl Engine {
         self.temp_read_snap().table(name).is_some()
     }
 
+    /// Validate an optional database qualifier on a table reference against the implicit scope
+    /// (spec/design/attached-databases.md §3, Slice 1a). A qualified name reaches a specific database:
+    /// `main` (the file / persistent database) or `temp` (the session-local domain) — the two reserved
+    /// implicit qualifiers this slice recognizes; a host-attached database arrives in Slice 1b, so any
+    /// other qualifier is 42P01 "database … is not attached". Because jed precludes overlaps (a name is
+    /// temp XOR persistent within a session, §3), a valid qualifier resolves to the SAME store the bare
+    /// name would, so this is a VALIDATION GATE, not a routing change: it asserts the named relation
+    /// lives in the claimed database (else 42P01), and the downstream temp-first funnel then resolves it
+    /// to the matching scope. A `None` qualifier (a bare, implicit-scope name) always passes. The
+    /// qualifier is matched case-insensitively (unquoted identifiers fold to lower case).
+    fn check_table_qualifier(&self, qualifier: Option<&str>, name: &str) -> Result<()> {
+        let Some(q) = qualifier else {
+            return Ok(());
+        };
+        match q.to_ascii_lowercase().as_str() {
+            "temp" => {
+                if !self.is_temp_table(name) {
+                    return Err(EngineError::new(
+                        SqlState::UndefinedTable,
+                        format!("relation \"temp.{name}\" does not exist"),
+                    ));
+                }
+            }
+            "main" => {
+                if self.read_snap().table(name).is_none() {
+                    return Err(EngineError::new(
+                        SqlState::UndefinedTable,
+                        format!("relation \"main.{name}\" does not exist"),
+                    ));
+                }
+            }
+            _ => {
+                return Err(EngineError::new(
+                    SqlState::UndefinedTable,
+                    format!("database \"{q}\" is not attached"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// The `DROP TYPE … RESTRICT` dependency check across every visible scope (spec/design/temp-tables.md
     /// §8): the main image (tables + composite fields), then the visible session-local temp snapshot
     /// (its tables). A composite type is always persistent, but a TEMP table column may reference it, so
@@ -5015,12 +5056,16 @@ impl Engine {
     fn execute_insert(&mut self, ins: Insert, params: &[Value], ctx: CteCtx) -> Result<Outcome> {
         let Insert {
             table,
+            db,
             columns: col_list,
             overriding,
             source,
             on_conflict,
             returning,
         } = ins;
+
+        // Validate an optional database qualifier on the target (attached-databases.md §3).
+        self.check_table_qualifier(db.as_deref(), &table)?;
 
         let tdef = self.table(&table).ok_or_else(|| {
             EngineError::new(
@@ -6546,6 +6591,8 @@ impl Engine {
     /// remove them. No WHERE deletes every row. Keys are collected before mutating
     /// so the map is not modified while iterating.
     fn execute_delete(&mut self, del: Delete, params: &[Value], ctx: CteCtx) -> Result<Outcome> {
+        // Validate an optional database qualifier on the target (attached-databases.md §3).
+        self.check_table_qualifier(del.db.as_deref(), &del.table)?;
         let table = self.table(&del.table).ok_or_else(|| {
             EngineError::new(
                 SqlState::UndefinedTable,
@@ -6830,6 +6877,8 @@ impl Engine {
     /// traps `23505` (`<table>_pkey`). A duplicate target column traps `42701`. No WHERE
     /// updates every row.
     fn execute_update(&mut self, upd: Update, params: &[Value], ctx: CteCtx) -> Result<Outcome> {
+        // Validate an optional database qualifier on the target (attached-databases.md §3).
+        self.check_table_qualifier(upd.db.as_deref(), &upd.table)?;
         let table = self.table(&upd.table).ok_or_else(|| {
             EngineError::new(
                 SqlState::UndefinedTable,
@@ -8644,6 +8693,28 @@ impl Engine {
                 derived_meta.push(None);
                 derived_plans.push(None);
                 src = RelSrc::Synthetic(si);
+            } else if tref.db.is_some() {
+                // A database-QUALIFIED name reaches an attachment's table directly
+                // (attached-databases.md §3): it never resolves to a CTE (a CTE has no database
+                // qualifier, so `main.x`/`temp.x` cannot name one) and the qualifier fixes the scope
+                // (no temp-vs-persistent shadow). Validate the qualifier against the implicit scope,
+                // then resolve through the temp-first funnel (which, by preclude-overlaps, lands in the
+                // validated scope).
+                lateral_flags.push(false);
+                srf_meta.push(None);
+                derived_meta.push(None);
+                derived_plans.push(None);
+                self.check_table_qualifier(tref.db.as_deref(), &tref.name)?;
+                src = RelSrc::Base(self.table(&tref.name).ok_or_else(|| {
+                    EngineError::new(
+                        SqlState::UndefinedTable,
+                        format!(
+                            "table does not exist: {}.{}",
+                            tref.db.as_deref().unwrap_or_default(),
+                            tref.name
+                        ),
+                    )
+                })?);
             } else {
                 // A base table NAME — may resolve to a CTE, which SHADOWS a catalog table of the same
                 // name (cte.md §2; case-insensitive). A CTE hit bumps the binding's reference count

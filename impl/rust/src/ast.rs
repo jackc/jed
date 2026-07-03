@@ -358,6 +358,9 @@ pub struct TypeMod {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Insert {
     pub table: String,
+    /// The optional database qualifier on the target (`INSERT INTO reports.t …`), like
+    /// [`TableRef::db`] (spec/design/attached-databases.md §3). `None` = implicit scope.
+    pub db: Option<String>,
     /// An optional explicit column list (`INSERT INTO t (a, c) VALUES ...` / `... SELECT ...`).
     /// `None` is the positional form — every column, in declaration order. Names resolve at
     /// execution time (unknown → 42703, duplicate → 42701); an unlisted column takes its default
@@ -456,6 +459,9 @@ pub enum InsertValue {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Update {
     pub table: String,
+    /// The optional database qualifier on the target (`UPDATE reports.t SET …`), like
+    /// [`TableRef::db`] (spec/design/attached-databases.md §3). `None` = implicit scope.
+    pub db: Option<String>,
     pub assignments: Vec<Assignment>,
     pub filter: Option<Expr>,
     /// The optional terminal `RETURNING` clause (spec/design/grammar.md §32): project each
@@ -475,6 +481,9 @@ pub struct Assignment {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Delete {
     pub table: String,
+    /// The optional database qualifier on the target (`DELETE FROM reports.t …`), like
+    /// [`TableRef::db`] (spec/design/attached-databases.md §3). `None` = implicit scope.
+    pub db: Option<String>,
     pub filter: Option<Expr>,
     /// The optional terminal `RETURNING` clause (spec/design/grammar.md §32): project each
     /// deleted row's OLD values.
@@ -514,6 +523,12 @@ pub struct Delete {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct TableRef {
     pub name: String,
+    /// The optional database qualifier (`reports.sales` → `db = Some("reports")`, `name = "sales"`),
+    /// jed's first multi-part name in table position (spec/design/attached-databases.md §3). `None` =
+    /// a bare, implicit-scope name. Only the reserved implicit qualifiers `main` (the file database)
+    /// and `temp` (the session-local domain) resolve this slice; any other is 42P01 (Slice 1b adds
+    /// host-attached databases). Never set on the function / derived-table alternatives.
+    pub db: Option<String>,
     pub alias: Option<String>,
     pub args: Option<Vec<Expr>>,
     pub subquery: Option<Box<QueryExpr>>,
