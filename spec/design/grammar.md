@@ -626,14 +626,32 @@ The `SELECT` `FROM` clause grows from a single table name to a **left-deep chain
 landed as an executor-only follow-on — see "Outer joins" below). The reasoning lives here; the
 cost contract is in [cost.md](cost.md) §7.
 
-**Table references and aliases.** `table_ref ::= identifier ("AS"? identifier)?` — a table name
-with an optional alias, the `AS` optional (`FROM orders o` = `FROM orders AS o`). The alias, or
+**Table references and aliases.** `table_ref ::= qualified_table ("AS"? identifier)?` — a table
+name with an optional alias, the `AS` optional (`FROM orders o` = `FROM orders AS o`). The alias, or
 the table name when there is none, is the relation's **label**. Labels qualify columns and must
 be **distinct**: two relations with the same label — a self-join written without aliases
 (`FROM t JOIN t ...`) — is **`42712`** (`duplicate_alias`, *"table name t specified more than
 once"*, [../errors/registry.toml](../errors/registry.toml)), matching PostgreSQL. A self-join is
 therefore written with two distinct aliases (`FROM t AS a JOIN t AS b ON ...`). Comparison is
 case-insensitive (§3), like every other identifier.
+
+**The database qualifier (`qualified_table`).** `qualified_table ::= (identifier ".")? identifier`
+— an OPTIONAL leading `db "."` names the **attached database** a table lives in (`reports.sales`),
+jed's first multi-part name in **table** position ([attached-databases.md](attached-databases.md)
+§3). The qualifier is a *database*, not a schema (jed has no schemas / `search_path`); it applies to
+`table_ref` (FROM/JOIN) and the DML targets (`INSERT INTO` / `UPDATE` / `DELETE FROM`). The label is
+still the alias or **table** name — the database qualifier **never** becomes a label or an output
+name (a column stays the 2-part `rel.col` below; there is no 3-part `db.table.col` this slice). A
+bare name resolves in **implicit** scope; the reserved implicit qualifiers `main` (the file database)
+and `temp` (the session-local domain) are the only ones recognized in Slice 1a, an unknown one is
+`42P01` "database … is not attached" (host-attached databases land in Slice 1b). Because jed
+**precludes overlaps** (a name is temp XOR persistent within a session, §3), a `main.`/`temp.`
+qualifier resolves to the *same* relation the bare name would, so the parser change is the only
+observable one this sub-slice: the resolver merely **validates** the relation is in the claimed scope
+(`42P01` otherwise). A `db "."` never precedes the derived-table or set-returning-function forms — a
+database-qualified name is a base table only, so a qualified function call is `42601`. The `db "."`
+slot is free because a bare table name never carried a leading dot (the only dotted name was `rel.col`
+in column position, below).
 
 **Qualified column references.** `column_ref ::= identifier ("." identifier)?` replaces the bare
 `identifier` in `primary` (and in `sort_key`, so `ORDER BY t.a` parses). The `.` is the **`Dot`**
