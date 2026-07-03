@@ -354,21 +354,12 @@ func (p *parser) parseCreateTable() (*createTable, error) {
 		return nil, err
 	}
 	// An optional table_scope between CREATE and TABLE makes the table TEMPORARY
-	// (spec/design/temp-tables.md, grammar.ebnf `table_scope`). SHARED / TEMP / TEMPORARY are NOT
-	// reserved (§3): recognized positionally here — the word after TABLE is always the table name, so
-	// `CREATE TABLE temp (...)` / `CREATE TABLE shared (...)` are ordinary persistent tables. A leading
-	// SHARED makes a database-wide shared temp table (§4) and MUST be immediately followed by
-	// TEMP/TEMPORARY (a stray `CREATE SHARED TABLE …` is 42601); so Shared always has Temp==true.
-	shared := p.peekKeyword() == "shared"
-	if shared {
-		p.advance()
-	}
+	// (spec/design/temp-tables.md, grammar.ebnf `table_scope`). TEMP / TEMPORARY are NOT reserved (§3):
+	// recognized positionally here — the word after TABLE is always the table name, so
+	// `CREATE TABLE temp (...)` is an ordinary persistent table named "temp".
 	temp := p.peekKeyword() == "temp" || p.peekKeyword() == "temporary"
 	if temp {
 		p.advance()
-	}
-	if shared && !temp {
-		return nil, newError(SyntaxError, "SHARED must be followed by TEMP or TEMPORARY")
 	}
 	if err := p.expectKeyword("table"); err != nil {
 		return nil, err
@@ -439,7 +430,7 @@ func (p *parser) parseCreateTable() (*createTable, error) {
 	if len(columns) == 0 {
 		return nil, newError(SyntaxError, "a table must have at least one column")
 	}
-	return &createTable{Name: name, Temp: temp, Shared: shared, Columns: columns, TablePKs: tablePKs, Checks: checks, Uniques: uniques, ForeignKeys: foreignKeys, Excludes: excludes}, nil
+	return &createTable{Name: name, Temp: temp, Columns: columns, TablePKs: tablePKs, Checks: checks, Uniques: uniques, ForeignKeys: foreignKeys, Excludes: excludes}, nil
 }
 
 // atExclusionTableConstraint reports whether the cursor sits on a table-level EXCLUDE constraint:

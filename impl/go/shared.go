@@ -56,14 +56,13 @@ import (
 	"sync/atomic"
 )
 
-// roots are the two published committed roots (spec/design/temp-tables.md §5): the file Snapshot AND
-// the database-wide shared-temp Snapshot. Held in ONE atomic.Pointer so a reader pins both with a
-// single lock-free Load (no torn pin where a concurrent commit advances one root between two Loads)
-// and a writer publishes both with a single Store. sharedTemp is never serialized — it rides the same
-// commit discipline as a pure in-memory swap (no fsync, nothing written to the file).
+// roots is the published committed root (spec/design/transactions.md §2): the file Snapshot. Held in
+// an atomic.Pointer so a reader pins it with a lock-free Load and a writer publishes a new one with a
+// single Store — the §3 short commit window. A published snapshot is immutable, so concurrent readers
+// never race. (A wrapper struct rather than a bare atomic.Pointer[snapshot] so a second published root
+// can be re-added without reshaping the pin discipline.)
 type roots struct {
-	committed  *snapshot // the committed FILE snapshot
-	sharedTemp *snapshot // the committed shared-temp snapshot (never serialized)
+	committed *snapshot // the committed FILE snapshot
 }
 
 // sharedCore is the goroutine-safe state shared by every handle minted from one Database
@@ -283,7 +282,7 @@ func sharedCoreFromEngine(e *engine) *sharedCore {
 		panic("every engine lifted into a shared core carries a paging context (B3)")
 	}
 	c := &sharedCore{live: make(map[uint64]int)}
-	c.roots.Store(&roots{committed: e.committed, sharedTemp: e.sharedTempCommitted})
+	c.roots.Store(&roots{committed: e.committed})
 	c.storage = &storage{
 		pageSize:  e.pageSize,
 		pageCount: e.pageCount,
@@ -407,11 +406,9 @@ func (s *Database) OldestLiveTxid() uint64 {
 func (s *Database) committedEngine() *engine {
 	rt := s.core.roots.Load()
 	return &engine{
-		committed:           rt.committed,
-		pageSize:            s.core.pageSize(),
-		session:             newSession(),
-		sharedTempCommitted: rt.sharedTemp,
-		sharedTempMem:       defaultSharedTempMem,
+		committed: rt.committed,
+		pageSize:  s.core.pageSize(),
+		session:   newSession(),
 	}
 }
 
@@ -463,15 +460,13 @@ func (s *Database) ReadOnly() bool { return s.core.readOnlyMode() }
 // by and never blocking a writer — and a write through it is 25006. The caller must Close it to
 // deregister (advancing the watermark), idiomatically `defer s.Close()`. (The old SharedDB.Read().)
 func (s *Database) ReadSession() *Session {
-	rt := s.core.roots.Load()
-	snap := rt.committed
+	snap := s.core.roots.Load().committed
 	s.core.liveMu.Lock()
 	s.core.live[snap.txid]++
 	s.core.liveMu.Unlock()
 	// Reads never mutate the snapshot (a write is rejected before dispatch), so the engine shares the
-	// immutable pinned snapshots directly — no clone. Both roots are pinned together (temp-tables.md §5),
-	// so the reader sees a consistent file + shared-temp view.
-	engine := &engine{committed: snap, pageSize: s.core.pageSize(), session: newSession(), sharedTempCommitted: rt.sharedTemp, sharedTempMem: defaultSharedTempMem}
+	// immutable pinned snapshot directly — no clone.
+	engine := &engine{committed: snap, pageSize: s.core.pageSize(), session: newSession()}
 	engine.readOnly = true // the executor rejects writes (25006) / poisons a read-only block
 	return &Session{core: s.core, engine: engine, access: accessReadOnly, pinned: true, pinVersion: snap.txid, baseVersion: snap.txid}
 }
@@ -489,11 +484,9 @@ func (s *Database) WriteSession() *Session {
 		return s.ReadSession()
 	}
 	s.core.writeMu.Lock()
-	rt := s.core.roots.Load()
-	base := rt.committed
-	// committed/sharedTemp are the immutable bases (the writer mutates only working / sharedTempWorking,
-	// which beginTx clones off them). Both roots are pinned together (temp-tables.md §5).
-	engine := &engine{committed: base, pageSize: s.core.pageSize(), session: newSession(), sharedTempCommitted: rt.sharedTemp, sharedTempMem: defaultSharedTempMem}
+	base := s.core.roots.Load().committed
+	// committed is the immutable base (the writer mutates only working, which beginTx clones off it).
+	engine := &engine{committed: base, pageSize: s.core.pageSize(), session: newSession()}
 	_, _ = engine.beginTx(true, true)
 	return &Session{core: s.core, engine: engine, access: accessReadWrite, gateHeld: true, baseVersion: base.txid}
 }
@@ -505,9 +498,8 @@ func (s *Database) WriteSession() *Session {
 // publishes, and releases it; BEGIN/COMMIT/ROLLBACK open and end an explicit block. (The old
 // Engine.NewSession swap → an independent owns-its-Engine session.)
 func (s *Database) Session(opts SessionOptions) *Session {
-	rt := s.core.roots.Load()
-	snap := rt.committed
-	engine := &engine{committed: snap, pageSize: s.core.pageSize(), session: newSessionWithOptions(opts), sharedTempCommitted: rt.sharedTemp, sharedTempMem: defaultSharedTempMem}
+	snap := s.core.roots.Load().committed
+	engine := &engine{committed: snap, pageSize: s.core.pageSize(), session: newSessionWithOptions(opts)}
 	// A read-only file-backed core mints read-only sessions (a write is 25006); it pins the committed
 	// version in the watermark like a read session. A writable core mints the autocommit lazy-gate one.
 	if s.core.readOnlyMode() {
@@ -829,24 +821,21 @@ func (s *Session) finishBlock() {
 	}
 }
 
-// refreshCommitted re-pins the latest committed roots as this session's base (spec/design/session.md
+// refreshCommitted re-pins the latest committed root as this session's base (spec/design/session.md
 // §2.4): the autocommit read/write path always works against the newest committed state.
 func (s *Session) refreshCommitted() {
 	rt := s.core.roots.Load()
 	s.baseVersion = rt.committed.txid
 	s.engine.committed = rt.committed
-	s.engine.sharedTempCommitted = rt.sharedTemp
 }
 
-// publish stores the engine's committed roots into the shared cell at the next version (the §3 commit
-// window — a single atomic Store of both roots, temp-tables.md §5). Called after a clean autocommit
-// write or an explicit COMMIT of a writable block, under the writer gate.
+// publish stores the engine's committed root into the shared cell at the next version (the §3 commit
+// window — a single atomic Store, transactions.md §2). Called after a clean autocommit write or an
+// explicit COMMIT of a writable block, under the writer gate.
 //
 // The new snapshot is persisted durably first (sharedCore.persist — packs into the byte store on
-// any host, bplus-reshape.md B3) and the roots are stored only on success, so a persist I/O failure
+// any host, bplus-reshape.md B3) and the root is stored only on success, so a persist I/O failure
 // leaves the shared committed state (and this session's version) unchanged and surfaces the error.
-// The shared-temp root is never serialized — it rides the Store as a pure in-memory pointer
-// (temp-tables.md §2/§5).
 func (s *Session) publish() error {
 	snap := s.engine.committed
 	snap.txid = s.baseVersion + 1 // advance the shared version on every commit
@@ -861,7 +850,7 @@ func (s *Session) publish() error {
 	// path).
 	snap.demoteCleanLeaves()
 	s.engine.committed = snap
-	s.core.roots.Store(&roots{committed: snap, sharedTemp: s.engine.sharedTempCommitted})
+	s.core.roots.Store(&roots{committed: snap})
 	s.baseVersion++
 	return nil
 }
@@ -1123,15 +1112,13 @@ func (s *Session) ClearClockSource()            { s.engine.session.seam.ClearClo
 // privilege, DDL + temp-DDL allowed) — the RESET-style hook for the privilege envelope (§5.3).
 func (s *Session) ResetPrivileges() { s.engine.ResetPrivileges() }
 
-// SetAllowTempDDL / SetAllowSharedTempDDL — the session-local and database-wide temporary-table DDL
-// gates (the temp-scoped splits of AllowDDL, spec/design/temp-tables.md §5); a denied temp DDL is 42501.
-func (s *Session) SetAllowTempDDL(allow bool)       { s.engine.session.allowTempDDL = allow }
-func (s *Session) SetAllowSharedTempDDL(allow bool) { s.engine.session.allowSharedTempDDL = allow }
+// SetAllowTempDDL — the session-local temporary-table DDL gate (the temp-scoped split of AllowDDL,
+// spec/design/temp-tables.md §5); a denied temp DDL is 42501.
+func (s *Session) SetAllowTempDDL(allow bool) { s.engine.session.allowTempDDL = allow }
 
-// SetTempBuffers / SetSharedTempMem — the per-session and global temp-table storage budgets in bytes
-// (0 ⇒ unlimited, spec/design/temp-tables.md §7); an over-budget temp write aborts 54P03.
-func (s *Session) SetTempBuffers(bytes int)   { s.engine.session.tempBuffers = bytes }
-func (s *Session) SetSharedTempMem(bytes int) { s.engine.sharedTempMem = bytes }
+// SetTempBuffers — the per-session temp-table storage budget in bytes (0 ⇒ unlimited,
+// spec/design/temp-tables.md §7); an over-budget temp write aborts 54P03.
+func (s *Session) SetTempBuffers(bytes int) { s.engine.session.tempBuffers = bytes }
 
 // ResetVars clears every session variable — PostgreSQL's RESET ALL for the variable map (§6.1).
 func (s *Session) ResetVars() { s.engine.session.ResetVars() }
