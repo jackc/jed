@@ -1439,16 +1439,50 @@ fn end_session(kind: &str, sess: Session) -> Result<(), String> {
     }
 }
 
+/// Build the shared handle a schedule runs against, attaching a fresh empty read-write in-memory
+/// database for each name (attached-databases.md §6 — the file-level `# attach:` directive, the same
+/// host-API action the sequential runner applies in `run_file`, gated by `harness.attach`). The
+/// attachments are Database-scoped, so every session the schedule opens sees them (a reader pins the
+/// whole roots — `committed` (main) plus `attached` — in one lock-free Load, §5); this is what lets a
+/// schedule assert cross-database snapshot isolation and the reader-liveness watermark over an
+/// attachment. Attaching is host-API, never SQL, so it happens here before any session opens, not as
+/// a schedule step. An attach failure is a corpus authoring error (a reserved/duplicate name), so it
+/// panics rather than threading an error out of every call site.
+fn schedule_db(attaches: &[String]) -> Database {
+    let db = Database::create(CreateOptions::default()).unwrap();
+    for name in attaches {
+        db.attach(name, jed::AttachSource::memory(), false)
+            .unwrap_or_else(|e| panic!("concurrency # attach: {name}: {}", e.message));
+    }
+    db
+}
+
+/// Collect every file-level `# attach: <name>` directive in a concurrency file, in order — the
+/// databases to attach to the shared handle before the schedule runs. Reuses the sequential runner's
+/// `parse_attach_directive`, so both runners honor the directive identically (attached-databases.md §6).
+fn parse_attaches(text: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix('#') {
+            if let Some(name) = parse_attach_directive(rest) {
+                names.push(name);
+            }
+        }
+    }
+    names
+}
+
 /// Run one `# format: concurrency` file in the canonical stepped-SEQUENTIAL mode.
 fn run_concurrency_file(text: &str) -> Result<(), String> {
-    run_steps_sequential(&parse_schedule(text)?)
+    run_steps_sequential(&parse_schedule(text)?, &parse_attaches(text))
 }
 
 /// Run one `# format: concurrency` file in the stepped-THREADED mode (a turn token over per-session
 /// OS threads). Used by `cargo test` for real concurrent-path coverage under the race detector.
 #[cfg(test)]
 fn run_concurrency_file_threaded(text: &str) -> Result<(), String> {
-    run_steps_threaded(&parse_schedule(text)?)
+    run_steps_threaded(&parse_schedule(text)?, &parse_attaches(text))
 }
 
 /// Execute a schedule on a single thread: the canonical, deterministic transcript.
@@ -1459,8 +1493,8 @@ fn run_concurrency_file_threaded(text: &str) -> Result<(), String> {
 /// instant the holder commits/rolls back. That is the equivalent serial order, identical to what a
 /// threaded run consistent with the schedule must produce. `gate_holder` is the live writer's sid
 /// (the single-writer gate), and `blocked` is the at-most-one writer queued on it.
-fn run_steps_sequential(steps: &[Step]) -> Result<(), String> {
-    let db = Database::create(CreateOptions::default()).unwrap();
+fn run_steps_sequential(steps: &[Step], attaches: &[String]) -> Result<(), String> {
+    let db = schedule_db(attaches);
     let mut sessions: HashMap<String, Session> = HashMap::new();
     let mut gate_holder: Option<String> = None; // the live writer holding the gate
     let mut blocked: Option<String> = None; // a writer queued on the gate (Layer 2 `blocks`)
@@ -1648,9 +1682,9 @@ struct Driver {
 
 #[cfg(test)]
 impl Driver {
-    fn new() -> Self {
+    fn new(attaches: &[String]) -> Self {
         Driver {
-            db: Database::create(CreateOptions::default()).unwrap(),
+            db: schedule_db(attaches),
             workers: HashMap::new(),
             gate_holder: None,
             blocked: None,
@@ -1887,8 +1921,8 @@ impl Driver {
 /// stays parked inside `write()` on the held gate (its open ack deferred) until the holder releases
 /// it, the one concurrency path the sequential walk never exercises (§5).
 #[cfg(test)]
-fn run_steps_threaded(steps: &[Step]) -> Result<(), String> {
-    let mut d = Driver::new();
+fn run_steps_threaded(steps: &[Step], attaches: &[String]) -> Result<(), String> {
+    let mut d = Driver::new(attaches);
     let mut result: Result<(), String> = Ok(());
     for step in steps {
         if let Err(e) = d.step(step) {
@@ -1969,8 +2003,8 @@ mod concurrency_threaded_tests {
                 blocks: true,
             },
         ];
-        let err =
-            run_steps_threaded(&steps).expect_err("a leftover holder + blocked writer must error");
+        let err = run_steps_threaded(&steps, &[])
+            .expect_err("a leftover holder + blocked writer must error");
         assert!(
             err.contains("w1") && err.contains("w2"),
             "want a leftover error naming w1 and w2, got: {err}"
