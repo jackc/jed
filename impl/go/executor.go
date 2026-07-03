@@ -152,6 +152,13 @@ type snapshot struct {
 	// load, so a committed snapshot always carries a fresh, cross-core-identical tree a SELECT can
 	// descend. Never mutated in place (replaced wholesale on rebuild), so clone shallow-copies it.
 	gistTrees map[string]*gistTree
+	// tempPaging is the per-domain MemoryBlockStore paging context a TEMP snapshot's stores attach to
+	// (spec/design/temp-tables.md §6, bplus-reshape.md): non-nil only for a session-local or shared temp
+	// snapshot, so its tables ride the same pager + packed-leaf path as an in-memory database (compact,
+	// bounded, spill-ready) instead of a fully-resident decoded tree. nil for the main snapshot (its
+	// paging lives on the storage identity). Carried through clone() so a tx's tempWorking creates stores
+	// against the same domain page space. NEVER serialized (a temp snapshot never is).
+	tempPaging *sharedPaging
 }
 
 // newSnapshot builds an empty snapshot.
@@ -206,7 +213,7 @@ func (s *snapshot) clone() *snapshot {
 	for k, v := range s.gistTrees {
 		gistTrees[k] = v
 	}
-	return &snapshot{txid: s.txid, catGen: s.catGen, tables: tables, types: types, stores: stores, indexStores: indexStores, sequences: sequences, collations: collations, defaultCollation: s.defaultCollation, gistTrees: gistTrees}
+	return &snapshot{txid: s.txid, catGen: s.catGen, tables: tables, types: types, stores: stores, indexStores: indexStores, sequences: sequences, collations: collations, defaultCollation: s.defaultCollation, gistTrees: gistTrees, tempPaging: s.tempPaging}
 }
 
 // demoteCleanLeaves demotes every store's clean, persisted resident leaves to OnDisk references —
@@ -760,7 +767,14 @@ func (s *snapshot) putTable(t *catTable, pageSize uint32) {
 func (s *snapshot) putTableResolved(t *catTable, colTypes []colType, pageSize uint32) {
 	s.bumpCatGen()
 	key := strings.ToLower(t.Name)
-	s.stores[key] = newTableStore(pagePayload(pageSize), colTypes)
+	st := newTableStore(pagePayload(pageSize), colTypes)
+	// A temp snapshot rides a per-domain MemoryBlockStore pager (temp-tables.md §6): its stores demand-page
+	// like a file/in-memory database instead of staying fully-resident decoded. The main snapshot leaves
+	// tempPaging nil (its stores attach the storage identity's paging on load).
+	if s.tempPaging != nil {
+		st.attachPaging(s.tempPaging)
+	}
+	s.stores[key] = st
 	s.tables[key] = t
 }
 
@@ -848,6 +862,11 @@ func (s *snapshot) setColumnDefaultExpr(tableKey string, column int, de *default
 // loader's hook (format.go): the owning table's Indexes list came from its catalog entry,
 // so only the store is registered here.
 func (s *snapshot) putIndexStore(nameKey string, store *tableStore) {
+	// A temp snapshot's index stores ride the same per-domain MemoryBlockStore pager as its tables
+	// (temp-tables.md §6); the main snapshot leaves tempPaging nil.
+	if s.tempPaging != nil && store.paging == nil {
+		store.attachPaging(s.tempPaging)
+	}
 	s.indexStores[nameKey] = store
 }
 
@@ -994,6 +1013,18 @@ type engine struct {
 	// unlimited. The shared analogue of session.tempBuffers, but Engine-level (shared temp is
 	// global). An over-budget shared write aborts 54P03.
 	sharedTempMem int
+	// tempStorage is the SESSION-LOCAL temp domain's storage identity (temp-tables.md §6): the private
+	// in-RAM memoryBlockStore + pager + pinned pool its temp tables ride, with within-session compaction
+	// on. Created lazily on the first session-local temp DDL (newTempStorage); nil until then. Its
+	// pageCount is the domain's footprint — the page-based temp budget. sharedTempStorage is the shared
+	// domain's analogue, core-owned so every session shares one page space (set from the shared layer).
+	tempStorage       *storage
+	sharedTempStorage *storage
+	// openStreams counts this handle's live streaming cursors (Query's pull source, not a materialized
+	// result). A streaming cursor pins a snapshot it faults lazily, so while one is open a temp-domain
+	// compaction (persistTemp → maybeCompact) must NOT reclaim pages — it could free one the cursor still
+	// faults. Incremented when a streaming Rows opens, decremented on Close (single-threaded per handle).
+	openStreams int
 }
 
 // SessionOptions are the relocatable session settings (spec/design/session.md §3 — the bucket-A
@@ -1384,6 +1415,24 @@ func collatedTextKey(coll *Collation, s string) ([]byte, error) {
 		return sortKey(coll, s)
 	}
 	return encodeTerminated([]byte(s)), nil
+}
+
+// tempDomainPaging returns the MemoryBlockStore paging context for a temp domain (temp-tables.md §6),
+// lazily creating the domain's storage identity (newTempStorage — a private in-RAM store + pinned pool
+// with within-session compaction on) on first use. The session-local domain lives on the engine; the
+// shared domain likewise on a single handle, but the shared layer (shared.go) core-owns it so every
+// session of a Database shares one page space — it seeds db.sharedTempStorage before any temp DDL runs.
+func (db *engine) tempDomainPaging(shared bool) *sharedPaging {
+	if shared {
+		if db.sharedTempStorage == nil {
+			db.sharedTempStorage = newTempStorage(db.pageSize)
+		}
+		return db.sharedTempStorage.paging
+	}
+	if db.tempStorage == nil {
+		db.tempStorage = newTempStorage(db.pageSize)
+	}
+	return db.tempStorage.paging
 }
 
 // working is the snapshot a write mutates — the open transaction's working. A write only ever runs
@@ -2358,6 +2407,15 @@ func (db *engine) commitTx() (Outcome, error) {
 		}
 		db.committed = working
 	}
+	// A dirty session-local temp domain materializes its working snapshot into its MemoryBlockStore
+	// (compact packed leaves + within-session compaction) before it is adopted — zero main-file writes
+	// (temp-tables.md §6). Compaction is safe iff no streaming cursor holds an older temp tree. Shared
+	// temp is still the fully-resident decoded pointer-swap (a follow-on).
+	if tx.tempDirty && db.tempStorage != nil {
+		if err := db.tempStorage.persistTemp(tx.tempWorking, db.openStreams == 0); err != nil {
+			return Outcome{}, err
+		}
+	}
 	db.session.tempCommitted = tx.tempWorking
 	db.sharedTempCommitted = tx.sharedTempWorking
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
@@ -2880,7 +2938,18 @@ func (db *engine) checkTempBudget() error {
 	if db.session.tx == nil || !db.session.tx.tempDirty {
 		return nil
 	}
-	if used := db.tempSnap().storageBytes(); used > uint64(limit) {
+	// Page-based footprint of the session-local temp domain (temp-tables.md §7, Design decision 3): the
+	// committed MemoryBlockStore high-water × page size — the honest resident-RAM measure now that temp
+	// rides a pager (a record-byte walk would skip demoted OnDisk leaves and undercount a multi-leaf temp
+	// table, defeating the §13 bound). Deterministic and cross-core-identical: pageCount is a pure
+	// function of operations via the B+tree + within-session compaction. It reflects the state one commit
+	// behind (the pending write commits at statement end), so a domain already over budget aborts the NEXT
+	// temp write and rolls it back — the "already over budget ⇒ further writes abort" contract (§7).
+	var used uint64
+	if db.tempStorage != nil {
+		used = uint64(db.tempStorage.pageCount) * uint64(db.pageSize)
+	}
+	if used > uint64(limit) {
 		return newError(TempStorageLimitExceeded, fmt.Sprintf(
 			"temporary table storage exceeded the limit of %d bytes", limit,
 		))
@@ -4403,6 +4472,14 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 		} else {
 			db.session.tx.tempDirty = true
 			ts = db.session.tx.tempWorking
+		}
+		// The session-local temp snapshot rides a per-domain MemoryBlockStore pager (temp-tables.md §6):
+		// lazily create the domain storage on first use and stamp its paging onto this working snapshot, so
+		// putTableResolved / putIndexStore attach it to every temp store. Shared temp still uses the
+		// fully-resident decoded path (a follow-on on this branch — its cross-session watermark needs the
+		// core-owned storage + version work), so tempPaging stays nil there.
+		if !ct.Shared {
+			ts.tempPaging = db.tempDomainPaging(false)
 		}
 		ts.putTableResolved(table, colTypes, db.pageSize)
 		for _, ix := range table.Indexes {

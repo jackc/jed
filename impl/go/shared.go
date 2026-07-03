@@ -142,6 +142,9 @@ func (c *sharedCore) persist(snap *snapshot) error {
 			if err := p.writeBlock(pg.index, pg.bytes); err != nil {
 				return err
 			}
+			// Drop any stale pool entry for a rewritten page (bufferpool.go invalidate): a no-op unless a
+			// reclaim domain reused a freed page id, in which case the pool's prior decode must be evicted.
+			st.paging.pool.invalidate(pg.index)
 		}
 		if err := p.sync(); err != nil { // body pages durable before the meta can reference them
 			return err
@@ -155,7 +158,8 @@ func (c *sharedCore) persist(snap *snapshot) error {
 	}
 	st.pageCount = write.pageCount
 	st.freePages = write.freeRemaining
-	return st.maybeCompact(snap, write.rootPage, c.oldestLiveVersion(snap.txid))
+	// The main domain reclaims when no reader pins an older version (the file/in-memory watermark).
+	return st.maybeCompact(snap, write.rootPage, c.oldestLiveVersion(snap.txid) == snap.txid)
 }
 
 // oldestLiveVersion is the oldest version a live reader pinned, floored at newTxid (the version this
@@ -185,8 +189,11 @@ func (c *sharedCore) oldestLiveVersion(newTxid uint64) uint64 {
 //     compaction, so page_count oscillates in [live, 2×live] and the walk is amortized O(height)/commit.
 //
 // Runs under the writer gate (caller holds st.mu), so the free-list / pageCount mutation is single-writer.
-func (st *storage) maybeCompact(snap *snapshot, catRoot uint32, oldestLive uint64) error {
-	if !st.reclaimWithinSession || oldestLive != snap.txid {
+// canReclaim is the caller's watermark decision — true iff no live reader/cursor pins a version older than
+// this commit (so no page unreachable from the committed root can still be observed): the main domain
+// passes oldestLive == committed; a temp domain passes "this session has no open streaming cursor".
+func (st *storage) maybeCompact(snap *snapshot, catRoot uint32, canReclaim bool) error {
+	if !st.reclaimWithinSession || !canReclaim {
 		return nil
 	}
 	const minCompactPages = 16 // don't churn a tiny store
@@ -206,6 +213,44 @@ func (st *storage) maybeCompact(snap *snapshot, catRoot uint32, oldestLive uint6
 	st.freePages = free
 	st.liveAtCompaction = uint32(len(reached))
 	return nil
+}
+
+// persistTemp materializes a TEMP snapshot's dirty pages into the domain's in-RAM MemoryBlockStore
+// (temp-tables.md §6): the SAME incremental copy-on-write serialize as a file/in-memory commit, but with
+// NO meta slot and NO sync — a temp domain is never reopened and its memory host has no durability
+// barrier — then the residency flip (clean leaves demote to OnDisk, faulted back through the temp pool:
+// the compact packed footprint) and within-session compaction (Phase A). ZERO main-file writes: only the
+// temp byte store is touched, so the zero-file-write invariant (temp-tables.md §2, D1) is preserved by
+// construction. Assigns page ids on snap in place; the caller adopts snap as the committed temp state
+// afterward. canReclaim is the caller's cursor watermark (no open streaming cursor may hold an older
+// temp tree).
+func (st *storage) persistTemp(snap *snapshot, canReclaim bool) error {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	write, err := snap.incrementalImage(st.pageSize, st.pageCount, st.freePages, st.paging)
+	if err != nil {
+		return err
+	}
+	if err := st.paging.withPager(func(p *pager) error {
+		if err := p.reserve(write.pageCount); err != nil {
+			return err
+		}
+		for _, pg := range write.pages {
+			if err := p.writeBlock(pg.index, pg.bytes); err != nil {
+				return err
+			}
+			// Drop any stale pool entry: within-session compaction may hand this page id back for a new
+			// node, and the pool caches by page id (bufferpool.go invalidate). A no-op for a fresh page.
+			st.paging.pool.invalidate(pg.index)
+		}
+		return nil // no meta write, no sync: never reopened, no durability barrier
+	}); err != nil {
+		return err
+	}
+	st.pageCount = write.pageCount
+	st.freePages = write.freeRemaining
+	snap.demoteCleanLeaves()
+	return st.maybeCompact(snap, write.rootPage, canReclaim)
 }
 
 // readOnlyMode reports whether this core is a read-only file-backed database (a write is 25006).
@@ -597,7 +642,12 @@ func (s *Session) queryStmt(stmt statement, params []Value, sc *scanCache) (*Row
 		s.core.liveMu.Lock()
 		s.core.live[version]++
 		s.core.liveMu.Unlock()
+		// A live streaming cursor also blocks within-session temp compaction: it faults its pinned temp
+		// tree lazily, so a temp commit must not reclaim a page it may still read (temp-tables.md §6). The
+		// counter is on the session's engine (single-threaded per session, like the write path it gates).
+		s.engine.openStreams++
 		rows.attachPin(func() {
+			s.engine.openStreams--
 			s.core.liveMu.Lock()
 			if s.core.live[version]--; s.core.live[version] <= 0 {
 				delete(s.core.live, version)

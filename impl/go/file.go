@@ -187,6 +187,9 @@ func (db *engine) persist(snap *snapshot) error {
 			if err := p.writeBlock(pg.index, pg.bytes); err != nil {
 				return err
 			}
+			// Drop any stale pool entry for a rewritten page (bufferpool.go invalidate): a no-op unless a
+			// reclaim domain reused a freed page id, in which case the pool's prior decode must be evicted.
+			db.paging.pool.invalidate(pg.index)
 		}
 		if err := p.sync(); err != nil { // body pages durable before the meta can reference them
 			return err

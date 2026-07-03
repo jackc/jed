@@ -1264,6 +1264,32 @@ func serializeDirty(n *pnode, colTypes []colType, capacity, ps int, alloc *pageA
 	return index, nil
 }
 
+// newTempStorage builds a fresh per-domain storage identity for a TEMP snapshot (temp-tables.md §6,
+// bplus-reshape.md): a private in-RAM memoryBlockStore read/written through the SAME pager + packed-leaf
+// path as an in-memory database, with a PINNED (unbounded) pool — a temp domain is resident by
+// definition (§5) — and within-session compaction ON, so its copy-on-write orphans are reclaimed rather
+// than leaked (a temp store is never reopened, so reconstruct-on-open never runs). It seeds the store
+// with the empty from-scratch image exactly as an in-memory database does (NewInMemoryWithPageSize), so
+// pagerFromStore reads the page size and pageCount starts past the meta slots. Zero file writes: this
+// byte store is entirely separate from the main database file.
+func newTempStorage(pageSize uint32) *storage {
+	image, err := newSnapshot().ToImage(pageSize, 0)
+	if err != nil {
+		panic("a fresh temp image always serializes: " + err.Error())
+	}
+	p, err := pagerFromStore(newMemoryBlockStore(image))
+	if err != nil {
+		panic("a fresh temp image always opens: " + err.Error())
+	}
+	mt, _ := parseMeta(image[:pageSize])
+	return &storage{
+		pageSize:             pageSize,
+		pageCount:            mt.pageCount,
+		paging:               newSharedPaging(p, math.MaxInt), // pinned/unbounded, mirroring an in-memory database
+		reclaimWithinSession: true,
+	}
+}
+
 // LoadEngine reconstructs a database from an on-disk image (inverse of ToImage). Returns a
 // structured data_corrupted (XX001) error for malformed input.
 //

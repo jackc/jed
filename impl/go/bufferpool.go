@@ -80,5 +80,34 @@ func (p *bufferPool) evictSlot() int {
 	}
 }
 
+// invalidate drops any cached entry for page — required when a commit REWRITES a page in place, which
+// happens when within-session compaction (a reclaim domain — temp, or an in-memory database with
+// reclamation on) hands a freed page id back to a new node: the pool caches by page id, so the stale
+// decode of the page's PRIOR content must be evicted or a later fault returns old rows. A no-op when the
+// page is not resident — the common case, since a copy-on-write commit without reuse only ever writes
+// fresh, never-cached high-water pages (so the main file path pays only a map lookup). Called under the
+// paging mutex (the write path holds it), like every other pool operation.
+func (p *bufferPool) invalidate(page uint32) {
+	i, ok := p.index[page]
+	if !ok {
+		return
+	}
+	delete(p.index, page)
+	// Swap the last slot into the hole so the slice stays dense (capacity accounting + the CLOCK hand
+	// stay well-formed), then shrink.
+	last := len(p.slots) - 1
+	if i != last {
+		moved := p.slots[last]
+		p.slots[i] = moved
+		p.index[moved.page] = i
+	}
+	p.slots = p.slots[:last]
+	if len(p.slots) == 0 {
+		p.hand = 0
+	} else {
+		p.hand %= len(p.slots)
+	}
+}
+
 // resident is the number of pages currently resident — the bound the pool enforces (≤ capacity).
 func (p *bufferPool) resident() int { return len(p.slots) }
