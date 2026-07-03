@@ -25,7 +25,7 @@
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 23 # format_version 23: PAX leaf layout (format.md "Leaf node") — a B-tree LEAF page
+VERSION = 24 # format_version 24: the B+tree reshape (format.md; bplus-reshape.md B1) — records live
 # (page_type 2) stores its records COLUMN-MAJOR: key directory (N+1 u32 prefix-sum) | key blob |
 # column directory (K+1 u32 region offsets, colStart[K] = payload end) | per column a value directory
 # (N+1 u32 prefix-sum) then that column's N value bodies. The per-value codec is byte-unchanged;
@@ -634,6 +634,23 @@ INDEX_TABLE = {
          [3, 20, "00000000-0000-0000-0000-000000000000"]]
 }.freeze
 
+# Degenerate interior fan-out (format.md "Interior node" / "Fan-out"; bplus-reshape.md §4.2): a
+# secondary index over near-RECORD_MAX(0) text keys. Each entry key is 112 bytes (nullable-slot
+# tag + the terminated 105-char text + the 4-byte i32 storage key ≤ RECORD_MAX(0) = 114), so an
+# index leaf holds two entries, and two separators overflow an interior page (8·2 + 4 + 2·112 =
+# 244 > C = 240): the second leaf split forces the pinned `N = 2 → m = 1` interior split, leaving
+# a legal **N = 0 interior node** on disk under a 1-separator root. The table rows themselves
+# externalize their text (the 116-byte inline record exceeds RECORD_MAX(2) = 98; filler64 is
+# incompressible, so store-smaller rejects compression → external-plain chains), so the fixture
+# also pins long-key index entries over spilled values. Values share the incompressible filler64
+# tail behind a distinct leading letter, so keys are distinct and sort by that letter.
+MAX_SEP_TABLE = {
+  name: "m",
+  columns: [col("id", "i32", pk: true), col("s", "text")],
+  indexes: [{ name: "i_s", cols: [1] }],
+  rows: (0...6).map { |i| [i + 1, ("A".ord + i).chr + filler_text(104)] }
+}.freeze
+
 # A table with UNIQUE indexes (v6 — indexes.md §8, constraints.md §5): pins the per-index
 # flags byte. `t_v_key` is the UNIQUE constraint's auto-named index over a NULLABLE column
 # holding two NULLs (NULLS DISTINCT — both entries stored, side by side after the present
@@ -1162,6 +1179,7 @@ FIXTURES = [
   { file: "collation_skew_twin.jed", page_size: 256,
     collations: COLLATION_SKEW_TWIN_TABLE[:collations], tables: COLLATION_SKEW_TWIN_TABLE[:tables] },
   { file: "tall_tree.jed",       page_size: 256, tables: [TALL_TREE] },
+  { file: "max_sep_table.jed",   page_size: 256, tables: [MAX_SEP_TABLE] },
   # Torn-write fallback: same image as pk_table, with one meta slot's CRC smashed.
   { file: "torn_meta_slot0.jed", page_size: 256, tables: [PK_TABLE], corrupt_slot: 0 },
   { file: "torn_meta_slot1.jed", page_size: 256, tables: [PK_TABLE], corrupt_slot: 1 }
@@ -1915,7 +1933,7 @@ end
 def index_entries(table, ix)
   table_entries(table).map do |storage_key, row|
     key = index_entry_key(table, ix, storage_key, row)
-    [key, { key: key, row: [], table: { columns: [] }, forms: [], comps: [], size: 2 + key.bytesize }]
+    [key, { key: key, row: [], table: { columns: [] }, forms: [], comps: [], size: key.bytesize }]
   end.sort_by { |key, _| key }
 end
 
@@ -1933,7 +1951,7 @@ def gin_index_entries(table, ix)
     elems = av.is_a?(Hash) ? av[:elements] : av
     elems.compact.uniq.each do |e|
       key = (key_body(elem_type, e) + storage_key).b
-      pairs << [key, { key: key, row: [], table: { columns: [] }, forms: [], comps: [], size: 2 + key.bytesize }]
+      pairs << [key, { key: key, row: [], table: { columns: [] }, forms: [], comps: [], size: key.bytesize }]
     end
   end
   pairs.sort_by { |key, _| key }
@@ -2220,19 +2238,33 @@ end
 # --- out-of-line large values (large-values.md §12) -------------------------
 
 def spillable?(type) = %w[text bytea decimal].include?(type)
-# RECORD_MAX(K) = (C − max(12, 12+16K))/2 (format.md "Why the record cap"): a PAX leaf's two-record
-# floor carries directoryOverhead(2,K) = 12+16K, so the cap tightens by 8K; K=0 (index/interior)
-# recovers the pre-v23 (C-12)/2.
+# RECORD_MAX(K) = (C − max(12, 12+16K))/2 (format.md "Why the record cap"): the value is KEPT from
+# v23 (bplus-reshape.md §4.2), re-derived leaf-only — the v24 worst-case two-record leaf overhead
+# (all-variable, 12+13K) stays under the reserve. K=0 (index trees) is exact: 2·(C−12)/2 + 12 = C.
 def record_max(cap, k) = [(cap - [12, 12 + 16 * k].max) / 2, 0].max
 
-# directoryOverhead(N,K): a PAX leaf's payload beyond Σ recordSize — the key directory (N+1 u32), the
-# column directory (K+1 u32), and each column's value directory (N+1 u32), less the N dropped
-# per-record key_len u16 (format.md "Leaf node"). Interior nodes stay row-major and do not use this.
-def directory_overhead(n, k) = 4 * (n + 1) + 4 * (k + 1) + 4 * (n + 1) * k - 2 * n
+# The dense-slot width of a FIXED-WIDTH column's value body (format.md v24 "Leaf node"), or nil for
+# a VARIABLE-WIDTH column (text/bytea/decimal/json/jsonb/composite/array/range — the spillable set).
+# The class decides the column's leaf region shape: fixed regions are flags + null bitmap + dense
+# untagged slots; variable regions are flags + an end-offset value directory + tagged codec bytes
+# (NULL = a zero-length span).
+STORAGE_WIDTH = { "i16" => 2, "i32" => 4, "i64" => 8, "boolean" => 1, "uuid" => 16,
+                  "timestamp" => 8, "timestamptz" => 8, "date" => 4, "interval" => 16,
+                  "f64" => 8, "f32" => 4 }.freeze
+def fixed_width(type) = type.is_a?(String) ? STORAGE_WIDTH[type] : nil
 
-# The value-column count of a node's records (0 for an index tree) — a leaf's PAX directory overhead
-# grows with it (format.md v23). Derived from the record plan's table, so no extra threading.
-def node_k(node) = node[:recs].empty? ? 0 : node[:recs][0][:table][:columns].size
+# leaf_overhead(N, cols): a v24 leaf's payload beyond Σ record_size (format.md "Leaf node") — the
+# key directory (4N), the column directory (4(K+1)), and per region a flags byte plus the null
+# bitmap (fixed-width, ceil(N/8)) or the value directory (variable, 4N).
+def leaf_overhead(n, cols)
+  cols.sum(4 * n + 4 * (cols.size + 1)) do |c|
+    1 + (fixed_width(c[:type]) ? (n + 7) / 8 : 4 * n)
+  end
+end
+
+# The value columns of a leaf's records ([] for an index tree) — the leaf overhead needs their
+# classes. Derived from the record plan's table, so no extra threading.
+def leaf_cols(node) = node[:recs].empty? ? [] : node[:recs][0][:table][:columns]
 
 # A value's content payload P(v) — the bytes stored in the overflow chain when externalized: raw
 # UTF-8 / raw bytes for text/bytea, the decimal body for decimal (large-values.md §12).
@@ -2252,11 +2284,20 @@ end
 # (large-values.md §12/§13; format.md "Large values").
 def plan_record(table, key, row, cap)
   cols = table[:columns]
-  inline = cols.each_with_index.map { |c, i| encode_value(c[:type], row[i]).bytesize }
+  # Each column's inline-plain contribution to record_size (the v24 basis — format.md "Record"):
+  # a fixed-width column always its width (NULL occupies a zero-filled slot); a variable column 0
+  # when NULL (a zero-length span) else its tagged inline encoding.
+  inline = cols.each_with_index.map do |c, i|
+    if (w = fixed_width(c[:type]))
+      w
+    else
+      row[i].nil? ? 0 : encode_value(c[:type], row[i]).bytesize
+    end
+  end
   forms = Array.new(cols.size, :inline)
   comps = Array.new(cols.size)
   cur = inline.dup
-  size = 2 + key.bytesize + inline.sum
+  size = key.bytesize + inline.sum
   max = record_max(cap, cols.size)
   return [forms, comps, size] if size <= max
 
@@ -2333,19 +2374,22 @@ def emit_value(c, v, form, comp, cap, alloc, pages)
   end
 end
 
-# Emit one record ROW-MAJOR (key_len | key | values) — for interior separators (format.md).
-def emit_record(rec, cap, alloc, pages)
+# Emit a v24 INTERIOR node payload (format.md "Interior node"): N+1 child pointers, an N-entry
+# end-offset separator directory, then the separator key blob. Record-free.
+def emit_interior(sep_keys, child_pages)
   out = +"".b
-  out << u16(rec[:key].bytesize) << rec[:key]
-  rec[:table][:columns].each_with_index do |c, i|
-    out << emit_value(c, rec[:row][i], rec[:forms][i], rec[:comps][i], cap, alloc, pages)
-  end
+  child_pages.each { |cp| out << u32(cp) }
+  off = 0
+  sep_keys.each { |k| off += k.bytesize; out << u32(off) }
+  sep_keys.each { |k| out << k }
   out
 end
 
-# Emit a leaf's payload COLUMN-MAJOR (PAX, v23 — format.md "Leaf node"): values are encoded in
-# (record, column) order (so overflow chains allocate exactly as row-major), then assembled as
-# key dir | key blob | col dir | per column (value dir | value bodies). `recs` are record plans.
+# Emit a v24 leaf's payload COLUMN-MAJOR (format.md "Leaf node"): values are encoded in
+# (record, column) order (so overflow chains allocate deterministically), then assembled as
+# key dir (N end offsets) | key blob | col dir (K+1) | per region: flags byte, then null bitmap +
+# dense untagged slots (fixed-width) or an N-entry end-offset value directory + tagged bodies
+# (variable; NULL = a zero-length span). `recs` are record plans.
 def emit_leaf_pax(recs, cap, alloc, pages)
   n = recs.size
   cols = recs.empty? ? [] : recs[0][:table][:columns]
@@ -2354,26 +2398,41 @@ def emit_leaf_pax(recs, cap, alloc, pages)
   val_bytes = Array.new(k) { Array.new(n) }
   recs.each_with_index do |rec, i|
     cols.each_with_index do |c, ci|
-      val_bytes[ci][i] = emit_value(c, rec[:row][ci], rec[:forms][ci], rec[:comps][ci], cap, alloc, pages)
+      v = rec[:row][ci]
+      val_bytes[ci][i] =
+        if (w = fixed_width(c[:type]))
+          v.nil? ? ("\x00".b * w) : encode_value(c[:type], v).byteslice(1..) # untagged body; NULL slot zero-filled
+        elsif v.nil?
+          "".b # a zero-length span
+        else
+          emit_value(c, v, rec[:forms][ci], rec[:comps][ci], cap, alloc, pages)
+        end
     end
   end
   out = +"".b
   off = 0
-  (0..n).each { |i| out << u32(off); off += keys[i].bytesize if i < n } # key directory
+  keys.each { |kb| off += kb.bytesize; out << u32(off) }               # key directory (end offsets)
   keys.each { |kb| out << kb }                                          # key blob
   base_after_col_dir = out.bytesize + 4 * (k + 1)
   col_start = []
   cur = base_after_col_dir
   (0...k).each do |c|
     col_start[c] = cur
-    cur += 4 * (n + 1) + val_bytes[c].sum(&:bytesize)
+    cur += 1 + (fixed_width(cols[c][:type]) ? (n + 7) / 8 : 4 * n) + val_bytes[c].sum(&:bytesize)
   end
   col_start[k] = cur
   (0..k).each { |c| out << u32(col_start[c]) }                          # column directory
   (0...k).each do |c|
-    voff = 0
-    (0..n).each { |i| out << u32(voff); voff += val_bytes[c][i].bytesize if i < n } # value directory
-    val_bytes[c].each { |vb| out << vb }                               # value bodies
+    out << "\x00".b                                                    # region flags (reserved)
+    if fixed_width(cols[c][:type])
+      bitmap = Array.new((n + 7) / 8, 0)
+      recs.each_with_index { |rec, i| bitmap[i / 8] |= (0x80 >> (i % 8)) if rec[:row][c].nil? }
+      out << bitmap.pack("C*")
+    else
+      voff = 0
+      val_bytes[c].each { |vb| voff += vb.bytesize; out << u32(voff) } # value directory (end offsets)
+    end
+    val_bytes[c].each { |vb| out << vb }                               # value bodies / slots
   end
   out
 end
@@ -2429,71 +2488,105 @@ end
 
 def node_leaf?(node) = node[:children].empty?
 
-# `recs[i]` is the record PLAN for keys[i] — a hash { key:, row:, table:, ext:, size: } whose
-# `size` is the on-disk (post-spill) record size (large-values.md §12). The tree splits on `size`;
-# the actual pointer bytes (with allocated overflow pages) are emitted later by serialize_tree.
+# A LEAF's `recs[i]` is the record PLAN for keys[i] — a hash { key:, row:, table:, forms:, comps:,
+# size: } whose `size` is the on-disk (post-spill) record size (large-values.md §12). The tree
+# splits on `size`; the actual pointer bytes (with allocated overflow pages) are emitted later by
+# serialize_tree. An INTERIOR node has no recs (v24) — its payload is the separators themselves.
 def node_payload(node)
-  s = node[:recs].sum { |r| r[:size] }
   if node_leaf?(node)
-    s += directory_overhead(node[:keys].size, node_k(node)) # PAX leaf directories (v23)
+    node[:recs].sum { |r| r[:size] } + leaf_overhead(node[:keys].size, leaf_cols(node))
   else
-    s += 4 * node[:children].size # (N+1) child pointers
+    8 * node[:keys].size + 4 + node[:keys].sum(&:bytesize)
   end
-  s
 end
 
-# Split an overflowing node 2-way, promoting one separator: [:split, left, sep_key, sep_rec,
-# right]. Split point (format.md "Split point"): right_edge (the just-inserted record / promoted
-# separator is the node's last) takes the append rule m = min(m_append, N-2) with m_append =
-# largest m in [1,N-1] with leftpayload(m) <= C; anywhere else splits balanced,
-# m = min(m_balanced, m_append, N-2) with m_balanced = smallest m with 2*leftpayload(m) >= payload.
-# This builder only inserts in ascending key order (build_tree), so right_edge is always true
-# here — the balanced arm is implemented so the reference states the whole contract.
+# The kind-shared split-point rule (format.md "Split point"): over the kind's range, m_max = the
+# largest m whose left side fits, m_min = the smallest whose right side fits, m_balanced = the
+# smallest m with 2·leftpayload(m) >= payload; a right-edge edit takes m_max, anything else
+# clamp(min(m_balanced, m_max), m_min, m_max). nil when no m keeps both sides fitting.
+def pick_split_m(range, payload, cap, right_edge, leftp, rightp)
+  m_max = nil
+  range.each { |m| leftp.call(m) <= cap ? m_max = m : break }
+  m_min = nil
+  range.reverse_each { |m| rightp.call(m) <= cap ? m_min = m : break }
+  return nil if m_max.nil? || m_min.nil? || m_min > m_max
+  return m_max if right_edge
+
+  m_bal = range.find { |m| 2 * leftp.call(m) >= payload } || m_max
+  m_bal.clamp(m_min, m_max)
+end
+
+# Split an overflowing node 2-way (format.md "Fan-out", v24): a LEAF splits COPY-UP — the left
+# leaf keeps records [0, m), the right leaf [m, N), and the separator handed up is a COPY of
+# keys[m] (no record leaves the leaf level) — [:split, left, sep_key, right]. An INTERIOR node
+# splits PUSH-UP — the median separator moves up, left keeps [0, m) + children [0, m], right
+# keeps [m+1, N) + children [m+1, N]; with N == 2 the split is pinned to m = 1, producing the
+# legal N = 0 right interior (the degenerate max-separator contract). This builder only inserts
+# in ascending key order (build_tree), so right_edge is always true here — the balanced arm is
+# implemented so the reference states the whole contract.
 def split_node(node, cap, right_edge)
   payload = node_payload(node)
   return [:whole, node] if payload <= cap
 
-  interior = !node_leaf?(node)
-  k = node_k(node)
   n = node[:keys].size
-  best = 1
-  balanced = 0
-  (1...n).each do |m|
-    lp = (interior ? 4 * (m + 1) : directory_overhead(m, k)) + node[:recs][0, m].sum { |r| r[:size] }
-    best = m if lp <= cap
-    balanced = m if balanced.zero? && 2 * lp >= payload
+  if node_leaf?(node)
+    return [:whole, node] if n < 2 # a single over-cap record: unsupported, surfaces upstream
+
+    cols = leaf_cols(node)
+    prefix = [0]
+    node[:recs].each { |r| prefix << prefix.last + r[:size] }
+    leftp = ->(m) { prefix[m] + leaf_overhead(m, cols) }
+    rightp = ->(m) { (prefix[n] - prefix[m]) + leaf_overhead(n - m, cols) }
+    m = pick_split_m(1..(n - 1), payload, cap, right_edge, leftp, rightp)
+    raise "unsplittable leaf (record over RECORD_MAX?)" if m.nil?
+
+    left = { keys: node[:keys][0, m], recs: node[:recs][0, m], children: [] }
+    right = { keys: node[:keys][m..], recs: node[:recs][m..], children: [] }
+    [:split, left, right[:keys][0].dup, right]
+  else
+    m = if n == 2
+          1 # the degenerate pin: sep[1] moves up, the right side is a legal N = 0 interior
+        else
+          prefix = [0]
+          node[:keys].each { |k| prefix << prefix.last + k.bytesize }
+          leftp = ->(mm) { 8 * mm + 4 + prefix[mm] }
+          rightp = ->(mm) { 8 * (n - 1 - mm) + 4 + (prefix[n] - prefix[mm + 1]) }
+          mm = pick_split_m(1..(n - 2), payload, cap, right_edge, leftp, rightp)
+          raise "unsplittable interior on the insert path" if mm.nil?
+
+          mm
+        end
+    left = { keys: node[:keys][0, m], recs: [], children: node[:children][0, m + 1] }
+    right = { keys: node[:keys][(m + 1)..], recs: [], children: node[:children][(m + 1)..] }
+    [:split, left, node[:keys][m], right]
   end
-  best = balanced if !right_edge && balanced.positive? && balanced < best
-  m = [best, n - 2].min
-  left = { keys: node[:keys][0, m], recs: node[:recs][0, m],
-           children: interior ? node[:children][0, m + 1] : [] }
-  right = { keys: node[:keys][(m + 1)..], recs: node[:recs][(m + 1)..],
-            children: interior ? node[:children][(m + 1)..] : [] }
-  [:split, left, node[:keys][m], node[:recs][m], right]
 end
 
-# Insert (key, rec) into the subtree, rebuilding (copy-on-write) and splitting up the path.
+# Insert (key, rec) into the subtree, rebuilding (copy-on-write) and splitting up the path. An
+# interior descent routes by partition_point(sep <= key) — a key equal to a separator lies RIGHT
+# (format.md "Interior node"); leaves hold the records.
 def tree_insert(node, key, rec, cap)
-  i = node[:keys].bsearch_index { |k| k >= key } || node[:keys].size
-  raise "duplicate key in fixture" if i < node[:keys].size && node[:keys][i] == key
-
   if node_leaf?(node)
+    i = node[:keys].bsearch_index { |k| k >= key } || node[:keys].size
+    raise "duplicate key in fixture" if i < node[:keys].size && node[:keys][i] == key
+
     return split_node({ keys: node[:keys].dup.insert(i, key),
                         recs: node[:recs].dup.insert(i, rec), children: [] }, cap,
                       i == node[:keys].size)
   end
+  i = node[:keys].bsearch_index { |k| k > key } || node[:keys].size
   res = tree_insert(node[:children][i], key, rec, cap)
   if res[0] == :split
-    _, left, sk, sr, right = res
+    _, left, sk, right = res
     children = node[:children].dup
     children[i] = left
     children.insert(i + 1, right)
-    split_node({ keys: node[:keys].dup.insert(i, sk), recs: node[:recs].dup.insert(i, sr),
-                 children: children }, cap, i == node[:keys].size)
+    split_node({ keys: node[:keys].dup.insert(i, sk), recs: [], children: children }, cap,
+               i == node[:keys].size)
   else
     children = node[:children].dup
     children[i] = res[1]
-    [:whole, { keys: node[:keys], recs: node[:recs], children: children }]
+    [:whole, { keys: node[:keys], recs: [], children: children }]
   end
 end
 
@@ -2512,7 +2605,7 @@ def build_tree(pairs, cap)
       next
     end
     res = tree_insert(root, key, rec, cap)
-    root = res[0] == :split ? { keys: [res[2]], recs: [res[3]], children: [res[1], res[4]] } : res[1]
+    root = res[0] == :split ? { keys: [res[2]], recs: [], children: [res[1], res[3]] } : res[1]
   end
   root
 end
@@ -2538,10 +2631,9 @@ def serialize_tree(root, next_index, cap, pages)
   end
   n = root[:keys].size
   pages[index] = if node_leaf?(root)
-                   [PAGE_LEAF, n, emit_leaf_pax(root[:recs], cap, alloc, pages), 0] # column-major (v23)
+                   [PAGE_LEAF, n, emit_leaf_pax(root[:recs], cap, alloc, pages), 0] # column-major (v24)
                  else
-                   recs = root[:recs].map { |r| emit_record(r, cap, alloc, pages) }
-                   [PAGE_INTERIOR, n, child_pages.map { |cp| u32(cp) }.join.b + recs.join.b, 0]
+                   [PAGE_INTERIOR, n, emit_interior(root[:keys], child_pages), 0] # record-free (v24)
                  end
   [index, next_index]
 end
@@ -3212,43 +3304,68 @@ def decode_composite_body(fields, buf, pos)
   [vals, pos]
 end
 
-def decode_record(columns, buf, pos, fetch)
-  key_len, pos = take(buf, pos, 2)
-  _key, pos = take(buf, pos, key_len.unpack1("n"))
-  row = []
-  columns.each do |c|
-    v, pos = decode_value(c[:type], buf, pos, fetch)
-    row << v
-  end
-  [row, pos]
-end
-
-# Parse a PAX (column-major) leaf payload (v23 — format.md "Leaf node") into [keys, col_vals,
-# col_off]: keys[i] the i-th key, col_vals[c] column c's concatenated value bytes, col_off[c] its
-# N+1 prefix-sum value directory. n = item_count, k = value-column count.
-def parse_pax_leaf(payload, n, k)
+# Parse a v24 PAX leaf payload (format.md "Leaf node") into [keys, regions]: keys[i] the i-th key;
+# regions[c] a class-shaped hash — { width:, bitmap:, body: } for a fixed-width column (bitmap the
+# raw null-bitmap bytes, body the dense slot bytes) or { ends:, body: } for a variable column
+# (ends the N end offsets, body the tagged value blob). `cols` are the table's column defs.
+def parse_pax_leaf(payload, n, cols)
   pos = 0
-  key_off = (0..n).map { |_| v = payload.byteslice(pos, 4).unpack1("N"); pos += 4; v }
+  key_end = (0...n).map { |_| v = payload.byteslice(pos, 4).unpack1("N"); pos += 4; v }
   key_blob = pos
-  keys = (0...n).map { |i| payload.byteslice(key_blob + key_off[i], key_off[i + 1] - key_off[i]) }
-  pos = key_blob + key_off[n]
+  keys = (0...n).map do |i|
+    lo = i.zero? ? 0 : key_end[i - 1]
+    payload.byteslice(key_blob + lo, key_end[i] - lo)
+  end
+  pos = key_blob + (n.zero? ? 0 : key_end[n - 1])
+  k = cols.size
   col_start = (0..k).map { |_| v = payload.byteslice(pos, 4).unpack1("N"); pos += 4; v }
   raise "PAX leaf column directory start mismatch" unless col_start[0] == pos
 
-  col_vals = []
-  col_off = []
-  (0...k).each do |c|
-    start = col_start[c]
-    col_off[c] = (0..n).map { |i| payload.byteslice(start + i * 4, 4).unpack1("N") }
-    val_base = start + 4 * (n + 1)
-    col_vals[c] = payload.byteslice(val_base, col_start[c + 1] - val_base)
+  regions = cols.each_with_index.map do |c, ci|
+    start = col_start[ci]
+    flags = payload.getbyte(start)
+    raise "PAX leaf region flags has a reserved bit set" unless flags.zero?
+
+    if (w = fixed_width(c[:type]))
+      bitmap = payload.byteslice(start + 1, (n + 7) / 8)
+      body = start + 1 + (n + 7) / 8
+      raise "fixed region extent mismatch" unless body + n * w == col_start[ci + 1]
+
+      { width: w, bitmap: bitmap, body: payload.byteslice(body, n * w) }
+    else
+      ends = (0...n).map { |i| payload.byteslice(start + 1 + i * 4, 4).unpack1("N") }
+      body = start + 1 + 4 * n
+      raise "variable region extent mismatch" unless body + (ends.last || 0) == col_start[ci + 1]
+
+      { ends: ends, body: payload.byteslice(body, (ends.last || 0)) }
+    end
   end
-  [keys, col_vals, col_off]
+  [keys, regions]
 end
 
-# In-order walk of a table's B-tree -> rows in ascending key order (format.md interior layout:
-# (N+1) child pointers, then N records). Independent of how the tree was built. An external value's
-# chain is followed through `fetch` (large-values.md §12).
+# Decode value (record i, column c) from a parsed v24 leaf region: nil from the bitmap (fixed) or
+# the zero-length span (variable); a fixed slot is the untagged body (re-tagged for decode_value);
+# a variable span is the tagged codec bytes as-is.
+def leaf_value(region, type, i, fetch)
+  if region[:width]
+    w = region[:width]
+    return nil if (region[:bitmap].getbyte(i / 8) & (0x80 >> (i % 8))) != 0
+
+    v, = decode_value(type, "\x00".b + region[:body].byteslice(i * w, w), 0, fetch)
+    v
+  else
+    lo = i.zero? ? 0 : region[:ends][i - 1]
+    len = region[:ends][i] - lo
+    return nil if len.zero?
+
+    v, = decode_value(type, region[:body].byteslice(lo, len), 0, fetch)
+    v
+  end
+end
+
+# In-order walk of a table's B+tree -> rows in ascending key order (format.md v24: interior nodes
+# are a record-free routing skeleton; all records live in leaves). Independent of how the tree was
+# built. An external value's chain is followed through `fetch` (large-values.md §12).
 def read_tree_rows(image, ps, root_page, columns)
   rows = []
   fetch = ->(p) { read_page(image, ps, p) }
@@ -3259,25 +3376,14 @@ def read_tree_rows(image, ps, root_page, columns)
     case pg[:type]
     when PAGE_LEAF
       n = pg[:item_count]
-      _keys, col_vals, col_off = parse_pax_leaf(pg[:payload], n, columns.size)
+      _keys, regions = parse_pax_leaf(pg[:payload], n, columns)
       (0...n).each do |i|
-        row = columns.each_with_index.map do |c, ci|
-          vb = col_vals[ci].byteslice(col_off[ci][i], col_off[ci][i + 1] - col_off[ci][i])
-          v, = decode_value(c[:type], vb, 0, fetch)
-          v
-        end
-        rows << row
+        rows << columns.each_with_index.map { |c, ci| leaf_value(regions[ci], c[:type], i, fetch) }
       end
     when PAGE_INTERIOR
       n = pg[:item_count]
       children = (0..n).map { |i| pg[:payload].byteslice(i * 4, 4).unpack1("N") }
-      pos = 4 * (n + 1)
-      n.times do |i|
-        walk.call(children[i])
-        row, pos = decode_record(columns, pg[:payload], pos, fetch)
-        rows << row
-      end
-      walk.call(children[n])
+      children.each { |cp| walk.call(cp) }
     else
       raise "expected a B-tree node page, got type #{pg[:type]}"
     end
@@ -3286,35 +3392,24 @@ def read_tree_rows(image, ps, root_page, columns)
   rows
 end
 
-# In-order walk of an INDEX B-tree -> entry keys in ascending order. An index record has an
-# empty payload, so only the key is read (format.md "Index trees").
+# In-order walk of an INDEX B+tree -> entry keys in ascending order. An index record is its key
+# alone (format.md "Index trees"); interior separators are routing copies, not entries.
 def read_tree_keys(image, ps, root_page)
   keys = []
   walk = lambda do |idx|
     return if idx.zero?
 
     pg = read_page(image, ps, idx)
-    read_rec = lambda do |pos|
-      klb, pos = take(pg[:payload], pos, 2)
-      key, pos = take(pg[:payload], pos, klb.unpack1("n"))
-      keys << key
-      pos
-    end
     case pg[:type]
     when PAGE_LEAF
-      # An index leaf is PAX with K=0 value columns (v23): its payload is just the key directory +
-      # key blob + a 1-entry column directory. parse_pax_leaf returns the keys.
-      leaf_keys, = parse_pax_leaf(pg[:payload], pg[:item_count], 0)
+      # An index leaf is a v24 leaf with K=0 value columns: key directory + key blob + a 1-entry
+      # column directory. parse_pax_leaf returns the keys.
+      leaf_keys, = parse_pax_leaf(pg[:payload], pg[:item_count], [])
       leaf_keys.each { |kk| keys << kk }
     when PAGE_INTERIOR
       n = pg[:item_count]
       children = (0..n).map { |i| pg[:payload].byteslice(i * 4, 4).unpack1("N") }
-      pos = 4 * (n + 1)
-      n.times do |i|
-        walk.call(children[i])
-        pos = read_rec.call(pos)
-      end
-      walk.call(children[n])
+      children.each { |cp| walk.call(cp) }
     else
       raise "expected a B-tree node page, got type #{pg[:type]}"
     end

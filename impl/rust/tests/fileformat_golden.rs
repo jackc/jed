@@ -418,6 +418,24 @@ fn nopk_table_db() -> Session {
 /// 18 rows whose wide text padding forces a HEIGHT-2 tree (an interior node whose children are
 /// themselves interior nodes) at page_size 256 — exercises interior-of-interior child pointers and
 /// post-order page allocation across a deeper tree (spec/fileformat/format.md).
+/// Degenerate interior fan-out (format.md "Interior node" / "Fan-out"; bplus-reshape.md §4.2):
+/// a secondary index over near-`RECORD_MAX(0)` text keys — each 112-byte entry key packs two per
+/// index leaf, and two separators overflow an interior page, so the second leaf split takes the
+/// pinned `N = 2 → m = 1` interior split and leaves a legal N = 0 interior on disk. The table
+/// rows externalize their (incompressible filler64) text. Must match verify.rb's MAX_SEP_TABLE.
+fn max_sep_table_db() -> Session {
+    let mut db =
+        Database::new_in_memory_with_page_size(GOLDEN_PAGE_SIZE).session(SessionOptions::default());
+    run(&mut db, "CREATE TABLE m (id i32 PRIMARY KEY, s text)");
+    run(&mut db, "CREATE INDEX i_s ON m (s)");
+    let tail = filler_text(104);
+    for i in 0..6u8 {
+        let s = format!("{}{}", (b'A' + i) as char, tail);
+        run(&mut db, &format!("INSERT INTO m VALUES ({}, '{s}')", i + 1));
+    }
+    db
+}
+
 fn tall_tree_db() -> Session {
     let mut db =
         Database::new_in_memory_with_page_size(GOLDEN_PAGE_SIZE).session(SessionOptions::default());
@@ -1130,6 +1148,7 @@ fn write_matches_goldens() {
         ("json_table.jed", json_table_db),
         ("jsonb_table.jed", jsonb_table_db),
         ("tall_tree.jed", tall_tree_db),
+        ("max_sep_table.jed", max_sep_table_db),
     ];
     for (name, build) in cases {
         let image = build().to_image(GOLDEN_PAGE_SIZE, 1).unwrap();
@@ -1197,6 +1216,7 @@ fn read_goldens_reproduces_rows() {
         ("serial_table.jed", serial_table_db, "t"),
         ("identity_table.jed", identity_table_db, "t"),
         ("tall_tree.jed", tall_tree_db, "t"),
+        ("max_sep_table.jed", max_sep_table_db, "m"),
         ("torn_meta_slot0.jed", pk_table_db, "t"),
         ("torn_meta_slot1.jed", pk_table_db, "t"),
     ];
