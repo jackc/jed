@@ -12,6 +12,7 @@ import { loadedCollation, loadUnicodeData } from "../collation.ts";
 import { loadTimeZoneData, resolveZone } from "../timezone.ts";
 import {
   advancingClock,
+  attachMemory,
   createDatabase,
   Database,
   DEFAULT_MAX_SQL_LENGTH,
@@ -123,6 +124,19 @@ function parseFixtureDirective(line: string): string | null {
 // state (spec/design/collation.md §12; capability harness.upgrade_collations).
 function parseUpgradeCollationsDirective(line: string): boolean {
   return line.replace(/^#/, "").trim().startsWith("upgrade-collations:");
+}
+
+// parseAttachDirective parses a file-level `# attach: <name>` line (spec/design/attached-databases.md
+// §6) — the corpus's way to attach a fresh, empty READ-WRITE in-memory database named <name> to the
+// running handle before the records run, so SQL can `CREATE TABLE <name>.t`, populate it, and join
+// across attachments. Returns the name, or null if not this directive. Gated by the harness.attach
+// capability. In-memory attachments cannot survive the disk-mode reopen, so an # attach: file is
+// # skip: disk.
+function parseAttachDirective(line: string): string | null {
+  const rest = line.replace(/^#/, "").trim();
+  if (!rest.startsWith("attach:")) return null;
+  const body = rest.slice("attach:".length).trim();
+  return body === "" ? null : body;
 }
 
 // openFixture opens the pre-built database image named by a `# fixture:` directive (path relative to
@@ -525,7 +539,11 @@ function runFile(text: string, disk: boolean): void {
   // file (a `# fixture:` swap flips it off — but fixtures are `# skip: disk`).
   let dbHandle: Database | null = tmpPath === null ? null : createDatabase({ path: tmpPath });
   let onTemp = disk;
-  let db = dbHandle === null ? createDatabase({}).session() : dbHandle.session();
+  // The Database the current session was minted from, held so a `# attach:` directive (memory-mode only
+  // — # skip: disk) can attach a fresh in-memory database into it. In disk mode it is the reopenable file
+  // handle; in memory mode a fresh in-memory Database (never reopened).
+  let attachDb: Database = dbHandle ?? createDatabase({});
+  let db = attachDb.session();
   try {
     const lines = text.split("\n");
     const c: Cursor = { i: 0 };
@@ -580,6 +598,17 @@ function runFile(text: string, disk: boolean): void {
         if (fx !== null) {
           db = openFixture(fx);
           onTemp = false; // the handle is now the fixture image, not the reopenable temp file
+          c.i++;
+          continue;
+        }
+        // `# attach: <name>` (file-level ACTION) attaches a fresh empty read-write in-memory database to
+        // the running handle (attached-databases.md §6): the records then CREATE / populate / join it by
+        // the `<name>.table` qualifier. Every session over the handle sees it (refreshCommitted re-pins
+        // the attached roots per statement). In-memory attachments cannot survive the disk reopen, so
+        // # attach: files are # skip: disk.
+        const at = parseAttachDirective(line);
+        if (at !== null) {
+          attachDb.attach(at, attachMemory(), false);
           c.i++;
           continue;
         }
@@ -660,6 +689,7 @@ function runFile(text: string, disk: boolean): void {
       if (disk && onTemp) {
         dbHandle!.close();
         dbHandle = openDatabase(tmpPath!);
+        attachDb = dbHandle;
         db = dbHandle.session();
       }
       // This record consumes any pending assertions (so they never leak forward).

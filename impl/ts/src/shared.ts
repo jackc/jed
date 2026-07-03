@@ -48,6 +48,7 @@
 // single-handle path and mints additional sessions.
 
 import {
+  type Attachment,
   type CollationInfo,
   Engine,
   SessionState,
@@ -58,7 +59,7 @@ import {
   type TxStatus,
 } from "./executor.ts";
 import { Rows, rowsFromOutcome, Transaction } from "./api.ts";
-import { loadEngine, toImage as toImageBytes } from "./format.ts";
+import { loadEngine, newAttachedStorage, toImage as toImageBytes } from "./format.ts";
 import type { CompositeType, Table } from "./catalog.ts";
 import type { Row } from "./storage.ts";
 import type { Cursor } from "./cursor.ts";
@@ -96,6 +97,19 @@ function databaseFromSnapshot(snap: Snapshot, pageSize: number): Engine {
 // (transactions.md §8). Not exported — only the handles touch it.
 class SharedCore {
   committed: Snapshot;
+  // attached is the published committed root of every host-attached DATABASE-scoped in-memory database
+  // (spec/design/attached-databases.md §5), keyed by lowercased name. A minted session captures this map
+  // (with the committed root) so it sees a CONSISTENT cross-database snapshot; attach/detach REPLACE it
+  // (never mutate in place) so a pinned reader is unaffected. A publish swaps the committing session's
+  // adopted attached view in. Empty when nothing is attached — byte-for-byte the pre-attachment behavior.
+  // Session-local `temp` is NOT here (it is session-private, on SessionState.tempCommitted).
+  attached = new Map<string, Snapshot>();
+  // attachments is the core-owned registry of host-attached databases (attached-databases.md §2/§5),
+  // keyed by lowercased name — each attachment's MUTABLE storage identity (a MemoryBlockStore Engine,
+  // like the temp domain) + its write mode. The immutable published root lives in `attached` under the
+  // same key. Populated by Database.attach / cleared by Database.detach. Read by the executor via
+  // Engine.core (the structural AttachmentCore view) during a commit persist.
+  attachments = new Map<string, Attachment>();
   // live maps a pinned snapshot version to its reader refcount; its minimum key is the reclamation
   // watermark (several readers may pin the same version).
   live = new Map<bigint, number>();
@@ -145,6 +159,14 @@ class SharedCore {
     );
   }
 
+  // hasLiveReaders reports whether any cross-session reader currently pins a committed snapshot (the
+  // live registry, transactions.md §8) — the within-session compaction watermark for a host attachment
+  // (attached-databases.md §5): the committing writer holds the writer flag but is not itself in `live`,
+  // so an empty registry means no other session can observe a page the commit is about to reclaim.
+  hasLiveReaders(): boolean {
+    return this.live.size > 0;
+  }
+
   register(version: bigint): void {
     this.live.set(version, (this.live.get(version) ?? 0) + 1);
   }
@@ -173,6 +195,24 @@ class SharedCore {
     for (const v of this.live.keys()) if (v < oldest) oldest = v;
     return oldest;
   }
+}
+
+// AttachSource selects the backing for a database attached via Database.attach
+// (spec/design/attached-databases.md §4). A stable memory|file variant from Slice 1b: only a MEMORY
+// source is supported now (a fresh, empty in-memory database); a FILE source is reserved for Slice 2 and
+// currently throws 0A000, so the attach signature never changes when file attach lands. Build one with
+// attachMemory() or attachFile(path).
+export type AttachSource = { file: boolean; path?: string };
+
+// attachMemory returns a source for a fresh, empty in-memory attachment (attached-databases.md §6).
+export function attachMemory(): AttachSource {
+  return { file: false };
+}
+
+// attachFile returns a source for a file-backed attachment. Reserved for Slice 2: Database.attach with a
+// file source currently throws 0A000 (feature_not_supported).
+export function attachFile(path: string): AttachSource {
+  return { file: true, path };
 }
 
 // Database is the host-facing database handle (spec/design/session.md §2.1/§2.4): the shared core. It
@@ -221,6 +261,59 @@ export class Database {
     return this.core.oldest();
   }
 
+  // attach adds a database named `name` to this handle, reachable by the database qualifier
+  // `name.table` (spec/design/attached-databases.md §4). Attaching is a HOST-API act, never SQL — an
+  // untrusted, SQL-only session cannot attach anything (the pure-SQL safety spine, §4/§13). In Slice 1b
+  // `source` must be attachMemory() (a fresh, empty in-memory database); attachFile is reserved for
+  // Slice 2 and throws 0A000. `readOnly` attaches it read-only: every write to it (DML or DDL) is 25006,
+  // and it never competes for the one-durable-writer slot (§5). The name is case-folded; it must not
+  // name a reserved database (`main` / `temp`) or one already attached (42710). Publishing the new empty
+  // attachment root replaces the attached map (a pinned reader keeps its old map).
+  attach(name: string, source: AttachSource = attachMemory(), readOnly = false): void {
+    if (source.file) {
+      throw engineError("feature_not_supported", "file attachment is not supported yet (Slice 2)");
+    }
+    const lname = name.toLowerCase();
+    if (lname === "") {
+      throw engineError("duplicate_object", "attachment name must not be empty");
+    }
+    const c = this.core;
+    if (lname === "main" || lname === "temp" || c.attachments.has(lname)) {
+      throw engineError("duplicate_object", `database "${name}" already exists`);
+    }
+    const storage = newAttachedStorage(c.pageSize);
+    c.attachments.set(lname, { name: lname, readOnly, storage });
+    // The fresh attachment's committed root: an empty snapshot whose NEW stores attach to its own paging
+    // (the same tempPaging seam session-local temp uses — a snapshot's tempPaging is "the paging new
+    // stores bind to"). Publish a NEW attached map so a live reader's pinned map is unaffected.
+    const empty = new Snapshot(0n);
+    empty.tempPaging = storage.paging;
+    const na = new Map(c.attached);
+    na.set(lname, empty);
+    c.attached = na;
+  }
+
+  // detach removes a previously attached database (spec/design/attached-databases.md §4/§8). A host-API
+  // act. It is 55006 (object_in_use) while any live reader session / cursor still pins a committed
+  // snapshot (the reader-liveness watermark, §5 — a reader pins the whole roots, so an open reader pins
+  // every attachment), and 42704 if no database of that name is attached (`main` / `temp` are not
+  // detachable). On success the attachment's root is dropped from the published roots and its storage
+  // released.
+  detach(name: string): void {
+    const lname = name.toLowerCase();
+    const c = this.core;
+    if (lname === "main" || lname === "temp" || !c.attachments.has(lname)) {
+      throw engineError("undefined_object", `database "${name}" is not attached`);
+    }
+    if (c.hasLiveReaders()) {
+      throw engineError("object_in_use", `cannot detach database "${name}" while it is in use`);
+    }
+    c.attachments.delete(lname);
+    const na = new Map(c.attached);
+    na.delete(lname);
+    c.attached = na;
+  }
+
   // readSession opens a READ ONLY session over a consistent snapshot (spec/design/session.md §2.4,
   // transactions.md §10). Pins the committed snapshot now and registers its version in the live set;
   // the session serves reads from that snapshot for its life — observing one stable version even as a
@@ -230,6 +323,10 @@ export class Database {
     const snap = this.core.committed; // pin (immutable — no clone)
     this.core.register(snap.txid);
     const engine = databaseFromSnapshot(snap, this.core.pageSize);
+    // The attached roots are pinned together with the committed root (attached-databases.md §5), so the
+    // session sees a consistent cross-database snapshot; it routes attachment persists via the core.
+    engine.core = this.core;
+    engine.attachedCommitted = this.core.attached;
     return new Session(this.core, engine, "ro", snap.txid, snap.txid);
   }
 
@@ -251,6 +348,8 @@ export class Database {
     const base = this.core.committed;
     // committed = the immutable base; beginTx clones it to working.
     const engine = databaseFromSnapshot(base, this.core.pageSize);
+    engine.core = this.core;
+    engine.attachedCommitted = this.core.attached; // pin the attached roots together (§5)
     engine.beginTx(true);
     return new Session(this.core, engine, "rw", base.txid, null, true);
   }
@@ -266,6 +365,8 @@ export class Database {
     const snap = this.core.committed;
     const engine = databaseFromSnapshot(snap, this.core.pageSize);
     engine.session = new SessionState(opts);
+    engine.core = this.core;
+    engine.attachedCommitted = this.core.attached; // pin the attached roots together (§5)
     // A read-only file-backed core mints read-only sessions (a write is 25006); it pins the committed
     // version in the watermark like a read session. A writable core mints the autocommit lazy-gate one.
     if (this.core.readOnly) {
@@ -717,6 +818,7 @@ export class Session {
   private refreshCommitted(): void {
     this.baseVersion = this.core.committed.txid;
     this.engine.committed = this.core.committed;
+    this.engine.attachedCommitted = this.core.attached; // pin the latest attached roots together (§5)
   }
 
   // publish stores the engine's committed root into the shared cell at the next version (the §3 commit
@@ -738,6 +840,12 @@ export class Session {
     snap.demoteCleanLeaves();
     this.engine.committed = snap;
     this.core.committed = snap;
+    // The N-root commit (attached-databases.md §5): publish the new attached roots the commit adopted
+    // (commitTx already packed each dirtied attachment's working root into its in-RAM store and adopted
+    // it into engine.attachedCommitted) together with the new main root, so a reader pins a consistent
+    // cross-database snapshot. An unchanged attachment carries its prior root through; an empty map
+    // (nothing attached) is the pre-attachment single-root publish.
+    this.core.attached = this.engine.attachedCommitted;
     this.baseVersion += 1n;
   }
 

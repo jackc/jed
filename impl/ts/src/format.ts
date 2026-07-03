@@ -2248,6 +2248,16 @@ export function newTempStorage(pageSize: number): Engine {
   return st;
 }
 
+// newAttachedStorage builds a fresh, empty in-RAM storage Engine for a host-attached DATABASE-scoped
+// in-memory database (spec/design/attached-databases.md §6) — the same recipe as newTempStorage (a
+// MemoryBlockStore seeded with the empty from-scratch image, a pinned/unbounded pool, within-session
+// compaction on), differing only in that its root is DATABASE-scoped (published into the core's
+// attached roots and pinned by the cross-session watermark) rather than session-private. In Slice 1b
+// every attachment is in-memory; a file-backed attachment (Slice 2) would open a FileBlockStore here.
+export function newAttachedStorage(pageSize: number): Engine {
+  return newTempStorage(pageSize);
+}
+
 // anySpillable reports whether any column type can spill out-of-line (large-values.md §12).
 // anySpillableMasked is anySpillable restricted to the columns a query's touched set selects —
 // the gate for the masked scan-units walk (cost.md §3 "The touched set"): if no TOUCHED column

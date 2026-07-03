@@ -1549,6 +1549,16 @@ type ActiveTx = {
   // makes zero file writes (temp-tables.md §2). tempDirty mirrors it for the temp snapshot.
   mainDirty: boolean;
   tempDirty: boolean;
+  // attachWorking is the transaction's working copy of a host-attached database's snapshot
+  // (spec/design/attached-databases.md §5), keyed by lowercased attachment name — the attachment
+  // analogue of tempWorking. Cloned lazily from Engine.attachedCommitted[name] on the first write to
+  // that attachment (attachWriteSnap), so a read-only cross-attachment query allocates nothing here.
+  // Adopted into attachedCommitted + persisted+published on a successful COMMIT, discarded on ROLLBACK.
+  // undefined until an attachment is written.
+  attachWorking?: Map<string, Snapshot>;
+  // attachDirty records which attachments this transaction mutated (lowercased names), the
+  // per-attachment analogue of mainDirty/tempDirty — the set the commit persists + publishes.
+  attachDirty?: Set<string>;
 };
 
 // SessionOptions are the relocatable session settings (spec/design/session.md §3 — the bucket-A
@@ -2173,9 +2183,59 @@ function* bufferedRows(
   }
 }
 
+// Attachment is one host-attached DATABASE-scoped database in a handle's namespace
+// (spec/design/attached-databases.md §2): a named (storage, mode) pair reachable by a database
+// qualifier. Its MUTABLE storage identity (page accounting, block store + pager) lives here — an
+// Engine over an in-RAM MemoryBlockStore, exactly like the temp domain (newAttachedStorage). The
+// immutable committed snapshot lives in the core's attached roots under the same key, so a reader pins
+// it lock-free together with every other root. In Slice 1b every attachment is in-memory; a
+// file-backed one (Slice 2) would carry a FileBlockStore-backed storage Engine instead.
+export type Attachment = {
+  name: string; // lowercased qualifier name (the registry key)
+  readOnly: boolean; // a read-only attachment rejects every write (DML + DDL) with 25006 (§4)
+  storage: Engine; // the in-memory block store + pager + page accounting (like the temp domain)
+};
+
+// AttachmentCore is the minimal view of the shared core the executor needs for attachment routing
+// (spec/design/attached-databases.md §5): the core-owned registry + the reader-liveness watermark.
+// SharedCore (shared.ts) implements it structurally; a bare/transient engine carries `core = null`.
+// Declared here (not imported from shared.ts) because shared.ts imports the Engine, not the reverse.
+export interface AttachmentCore {
+  attachments: Map<string, Attachment>;
+  hasLiveReaders(): boolean;
+}
+
+// isReservedScope reports whether a database qualifier names one of the two implicit reserved scopes
+// `main` / `temp` (attached-databases.md §3), which resolve to the SAME store the bare name would — so
+// a qualified reference to one keeps every existing fast path. An undefined qualifier (a bare
+// implicit-scope name) counts as reserved for routing: it too keeps the temp-first funnels.
+function isReservedScope(q: string | undefined): boolean {
+  if (q === undefined) return true;
+  const l = q.toLowerCase();
+  return l === "main" || l === "temp";
+}
+
+// isAttachmentScope reports whether a database qualifier names a HOST-ATTACHED database (not undefined,
+// not reserved main/temp) — the case that routes to the attachment registry rather than the implicit
+// temp-first funnels, and the case that gates off index-bound pushdown this slice (attached-databases.md §8).
+function isAttachmentScope(q: string | undefined): boolean {
+  return !isReservedScope(q);
+}
+
 export class Engine {
   // The last committed, immutable state — what fresh readers (and autocommit reads) see.
   committed: Snapshot;
+  // core is the shared core this engine's session belongs to (attached-databases.md §5), or null for a
+  // bare/transient engine (a test engine, a snapshotEngine, a committed introspection engine — none of
+  // which see attachments). It is the engine's route to the core-owned attachment registry
+  // (core.attachments) during a commit persist; the READ view of attachments is attachedCommitted below.
+  core: AttachmentCore | null = null;
+  // attachedCommitted is the PINNED committed root of every host-attached DATABASE-scoped database
+  // (attached-databases.md §5), keyed by lowercased name — this session's stable read view, snapshot
+  // isolated: refreshed from the core's attached roots at each autocommit statement and pinned for the
+  // life of an explicit BEGIN block. Empty when nothing is attached. Session-local temp is NOT here (it
+  // is on SessionState.tempCommitted); this is only the Database-scoped roots.
+  attachedCommitted: Map<string, Snapshot> = new Map();
   // The DEFAULT SESSION (spec/design/session.md §2.1): the per-connection state this handle runs
   // statements through — the open transaction (the Idle/Open/Failed machine, §2.2), the relocated
   // settings (maxCost/maxSqlLength/workMem, the entropy/clock seam), and the currval/lastval session
@@ -2516,8 +2576,147 @@ export class Engine {
           throw engineError("undefined_table", `relation "main.${name}" does not exist`);
         }
         break;
+      default: {
+        // A host-attached database (attached-databases.md §5): resolve its pinned/working snapshot, then
+        // assert the relation lives there. An unknown name is 42P01 "not attached"; a known database
+        // missing the table is 42P01 "relation … does not exist".
+        const snap = this.attachReadSnap(qualifier.toLowerCase());
+        if (snap === undefined) {
+          throw engineError("undefined_table", `database "${qualifier}" is not attached`);
+        }
+        if (snap.table(name) === undefined) {
+          throw engineError("undefined_table", `relation "${qualifier}.${name}" does not exist`);
+        }
+      }
+    }
+  }
+
+  // checkAttachmentWritable rejects a WRITE (DML or DDL) targeting a READ-ONLY host attachment with
+  // 25006 (attached-databases.md §4), before any I/O. An undefined scope, or `main`/`temp` (never
+  // read-only via a qualifier — the read-only handle path is separate), or a read-write attachment
+  // passes. Unknown attachments are caught by the qualifier gate, so this only inspects the mode.
+  private checkAttachmentWritable(scope: string | undefined): void {
+    if (scope === undefined || this.core === null) return;
+    const name = scope.toLowerCase();
+    if (name === "main" || name === "temp") return;
+    const att = this.core.attachments.get(name);
+    if (att !== undefined && att.readOnly) {
+      throw engineError("read_only_sql_transaction", `cannot write to read-only database "${scope}"`);
+    }
+  }
+
+  // attachReadSnap returns the READ snapshot of a host-attached database (attached-databases.md §5) —
+  // the transaction's working clone if this tx wrote it, else the pinned committed root
+  // (attachedCommitted). undefined when no attachment is named `name` (the caller raises 42P01). name
+  // is expected lowercased.
+  private attachReadSnap(name: string): Snapshot | undefined {
+    const tx = this.session.tx;
+    if (tx !== null && tx.attachWorking !== undefined) {
+      const ws = tx.attachWorking.get(name);
+      if (ws !== undefined) return ws;
+    }
+    return this.attachedCommitted.get(name);
+  }
+
+  // attachWriteSnap returns the WRITE snapshot of a host-attached database, cloning the pinned committed
+  // root into the transaction's per-attachment working set on first write and marking it dirty (the
+  // attachment analogue of working()/tempWorking). undefined if the attachment is unknown (unreachable
+  // after the qualifier gate). name is expected lowercased.
+  private attachWriteSnap(name: string): Snapshot | undefined {
+    const tx = this.session.tx!;
+    if (tx.attachWorking === undefined) {
+      tx.attachWorking = new Map();
+      tx.attachDirty = new Set();
+    }
+    const existing = tx.attachWorking.get(name);
+    if (existing !== undefined) {
+      tx.attachDirty!.add(name);
+      return existing;
+    }
+    const base = this.attachedCommitted.get(name);
+    if (base === undefined) return undefined;
+    const ws = base.clone();
+    tx.attachWorking.set(name, ws);
+    tx.attachDirty!.add(name);
+    return ws;
+  }
+
+  // attachReadView returns the current READ view of every attached database — the transaction's working
+  // clone where this tx wrote it, else the pinned committed root — as one frozen map. Used to freeze a
+  // snapshotEngine's attachment view (whose own tx is null, so it reads straight from this map). Returns
+  // attachedCommitted directly when no attachment has been written this tx (the common case, no alloc).
+  private attachReadView(): Map<string, Snapshot> {
+    const tx = this.session.tx;
+    if (tx === null || tx.attachWorking === undefined || tx.attachWorking.size === 0) {
+      return this.attachedCommitted;
+    }
+    const view = new Map(this.attachedCommitted);
+    for (const [k, v] of tx.attachWorking) view.set(k, v);
+    return view;
+  }
+
+  // snapForScope returns the READ snapshot for an explicit database qualifier (attached-databases.md
+  // §3): `main` / `temp` / a host attachment. Used only when scope is defined; an undefined scope keeps
+  // the bare temp-first funnels (a name is temp XOR persistent). undefined for an unknown attachment
+  // (the qualifier gate already raised 42P01, so unreachable in practice).
+  private snapForScope(scope: string): Snapshot | undefined {
+    switch (scope.toLowerCase()) {
+      case "temp":
+        return this.tempSnap();
+      case "main":
+        return this.readSnap();
       default:
-        throw engineError("undefined_table", `database "${qualifier}" is not attached`);
+        return this.attachReadSnap(scope.toLowerCase());
+    }
+  }
+
+  // lkpTableScoped resolves a table's catalog entry honoring an explicit database qualifier
+  // (attached-databases.md §3); an undefined scope keeps the bare temp-first walk.
+  private lkpTableScoped(scope: string | undefined, name: string): Table | undefined {
+    if (scope === undefined) return this.lkpTable(name);
+    return this.snapForScope(scope)?.table(name);
+  }
+
+  // lkpStoreScoped resolves a table's READ store honoring an explicit database qualifier; an undefined
+  // scope keeps the bare temp-first funnel.
+  private lkpStoreScoped(scope: string | undefined, name: string): TableStore {
+    if (scope === undefined) return this.lkpStore(name);
+    return this.snapForScope(scope)!.store(name);
+  }
+
+  // writeStoreScoped resolves a table's WRITE store honoring an explicit database qualifier, marking the
+  // right domain dirty (main / temp / the attachment); an undefined scope keeps the bare temp-first funnel.
+  private writeStoreScoped(scope: string | undefined, name: string): TableStore {
+    if (scope === undefined) return this.writeStore(name);
+    switch (scope.toLowerCase()) {
+      case "temp":
+        this.session.tx!.tempDirty = true;
+        return this.session.tx!.tempWorking.store(name);
+      case "main":
+        return this.working().store(name);
+      default:
+        return this.attachWriteSnap(scope.toLowerCase())!.store(name);
+    }
+  }
+
+  // lkpIndexStoreScoped / writeIndexStoreScoped are the index-store analogues of lkpStoreScoped /
+  // writeStoreScoped: an index belongs to the same database as its table, so the DML target's scope
+  // routes them. An undefined scope keeps the bare temp-first funnel.
+  private lkpIndexStoreScoped(scope: string | undefined, nameKey: string): TableStore {
+    if (scope === undefined) return this.lkpIndexStore(nameKey);
+    return this.snapForScope(scope)!.indexStore(nameKey);
+  }
+
+  private writeIndexStoreScoped(scope: string | undefined, nameKey: string): TableStore {
+    if (scope === undefined) return this.writeIndexStore(nameKey);
+    switch (scope.toLowerCase()) {
+      case "temp":
+        this.session.tx!.tempDirty = true;
+        return this.session.tx!.tempWorking.indexStore(nameKey);
+      case "main":
+        return this.working().indexStore(nameKey);
+      default:
+        return this.attachWriteSnap(scope.toLowerCase())!.indexStore(nameKey);
     }
   }
 
@@ -3265,6 +3464,26 @@ export class Engine {
       persistTemp(this.tempStorage, tx.tempWorking, this.openStreams === 0);
     }
     this.session.tempCommitted = tx.tempWorking;
+    // Adopt each dirtied host-attached database (attached-databases.md §5, the N-root commit):
+    // materialize its working snapshot into the attachment's in-RAM block store (persistTemp-style — the
+    // same incremental copy-on-write pack as temp, NO fsync, since an in-memory attachment has no
+    // durability barrier) and adopt it into this engine's pinned attached view, so publish (shared.ts)
+    // swaps the new attached roots in one atomic step. Like temp this touches no MAIN file; unlike temp
+    // the root is DATABASE-scoped (published, cross-session-visible). Within-session compaction is safe
+    // only when no cross-session reader pins an older root (the live-registry watermark — the committing
+    // writer holds the gate but is not itself a live reader). Skipped for a bare/core-less engine.
+    if (tx.attachDirty !== undefined && tx.attachDirty.size > 0 && this.core !== null) {
+      const na = new Map(this.attachedCommitted);
+      const canReclaim = !this.core.hasLiveReaders();
+      for (const name of tx.attachDirty) {
+        const att = this.core.attachments.get(name);
+        if (att === undefined) continue; // detached mid-transaction (unreachable) — nothing to persist
+        const ws = tx.attachWorking!.get(name)!;
+        persistTemp(att.storage, ws, canReclaim);
+        na.set(name, ws);
+      }
+      this.attachedCommitted = na;
+    }
     return { kind: "statement", cost: 0n, rowsAffected: null };
   }
 
@@ -3889,7 +4108,36 @@ export class Engine {
     // FOREIGN KEY on a temp table is deferred this slice (§8) — rejected HERE, before any persistent
     // parent resolves, so the error is a clean 0A000. The other temp narrowings (composite/collated
     // columns, serial/IDENTITY) are checked just before registration, once the columns are built.
-    if (ct.temp && ct.excludes.length > 0) {
+    //
+    // Resolve the optional database qualifier (attached-databases.md §3, Slice 1b): `main`/`temp` fold
+    // into the implicit scope (main = bare persistent, temp = TEMP); a host-attached name routes the new
+    // table INTO that attachment's working snapshot (§6). TEMP with an explicit database is
+    // contradictory unless the database IS `temp` (42601).
+    let targetTemp = ct.temp;
+    let attachName = "";
+    if (ct.db !== undefined) {
+      switch (ct.db.toLowerCase()) {
+        case "main":
+          if (ct.temp) {
+            throw engineError("syntax_error", `cannot create a TEMP table in database "main"`);
+          }
+          break;
+        case "temp":
+          targetTemp = true;
+          break;
+        default:
+          if (ct.temp) {
+            throw engineError("syntax_error", "cannot create a TEMP table in an attached database");
+          }
+          attachName = ct.db.toLowerCase();
+          if (this.attachReadSnap(attachName) === undefined) {
+            throw engineError("undefined_table", `database "${ct.db}" is not attached`);
+          }
+          // A DDL write to a READ-ONLY attachment is 25006 before any work (attached-databases.md §4).
+          this.checkAttachmentWritable(ct.db);
+      }
+    }
+    if (targetTemp && ct.excludes.length > 0) {
       // An EXCLUDE constraint's backing GiST index would live on the temp snapshot — deferred with
       // the rest of the GiST-on-temp narrowing (spec/design/gist.md §11), a clean 0A000.
       throw engineError(
@@ -3897,16 +4145,41 @@ export class Engine {
         "an EXCLUDE constraint on a temporary table is not yet supported",
       );
     }
-    if (ct.temp && ct.fks.length > 0) {
+    if (targetTemp && ct.fks.length > 0) {
       throw engineError(
         "feature_not_supported",
         "FOREIGN KEY on a temporary table is not yet supported",
       );
     }
-    // The relation namespace is shared between tables and indexes (indexes.md §2), so a
-    // CREATE TABLE colliding with either kind is the same 42P07 — PG's "relation" word. relationExists
-    // is temp-aware, so a temp name collides with temp + persistent alike (preclude-overlaps, §3).
-    if (this.relationExists(ct.name)) {
+    // Deferred narrowings on an attached-database table this slice (attached-databases.md §8), each a
+    // clean 0A000 before any column work: FOREIGN KEY and EXCLUDE (their probe/backing structures would
+    // need cross-scope catalog access this slice does not thread). Serial/IDENTITY and composite/collated
+    // columns are checked just before registration, once the columns are built (as for temp).
+    if (attachName !== "") {
+      if (ct.fks.length > 0) {
+        throw engineError(
+          "feature_not_supported",
+          "FOREIGN KEY on an attached-database table is not supported yet",
+        );
+      }
+      if (ct.excludes.length > 0) {
+        throw engineError(
+          "feature_not_supported",
+          "an EXCLUDE constraint on an attached-database table is not supported yet",
+        );
+      }
+    }
+    // The relation namespace is shared between tables and indexes (indexes.md §2), so a CREATE TABLE
+    // colliding with either kind is the same 42P07 — PG's "relation" word. For a bare/main/temp target
+    // relationExists is temp-aware (a temp name collides with temp + persistent alike — temp-tables.md
+    // §3); an attachment target checks its OWN snapshot's namespace (each attached database is
+    // independent, §3).
+    if (attachName !== "") {
+      const as = this.attachReadSnap(attachName)!;
+      if (as.table(ct.name) !== undefined || as.findIndex(ct.name) !== null) {
+        throw engineError("duplicate_table", "relation already exists: " + ct.name);
+      }
+    } else if (this.relationExists(ct.name)) {
       throw engineError("duplicate_table", "relation already exists: " + ct.name);
     }
 
@@ -4694,7 +4967,49 @@ export class Engine {
       return an < bn ? -1 : an > bn ? 1 : 0;
     });
 
-    if (ct.temp) {
+    if (attachName !== "") {
+      // Deferred narrowings on an attached-database table this slice (attached-databases.md §8), each a
+      // clean 0A000: a COMPOSITE-typed column (its type lives in the MAIN catalog — no cross-scope type
+      // reference this slice), a serial/IDENTITY column (its OWNED sequence would be a cross-scope
+      // sequence), and a collated column (the attachment snapshot carries no collation catalog). Plain
+      // scalar / array / range / decimal columns with PK / NOT NULL / DEFAULT / CHECK / UNIQUE and
+      // secondary btree indexes are fully supported.
+      for (const c of table.columns) {
+        if (c.type.kind === "composite") {
+          throw engineError(
+            "feature_not_supported",
+            "a composite-typed column on an attached-database table is not supported yet",
+          );
+        }
+        if (c.collation !== null) {
+          throw engineError(
+            "feature_not_supported",
+            `COLLATE on an attached-database-table column ${c.name} is not yet supported`,
+          );
+        }
+      }
+      if (pendingSerials.length > 0) {
+        throw engineError(
+          "feature_not_supported",
+          "a serial / IDENTITY column on an attached-database table is not supported yet",
+        );
+      }
+      // Register into the attachment's working snapshot (attached-databases.md §6) — never the main
+      // image; published into the attached roots at commit (N-root commit, §5). attachWriteSnap clones
+      // the attachment's committed root on first write and marks it dirty. Its NEW stores bind to the
+      // attachment's own paging (the tempPaging seam — the same one temp/in-memory main use).
+      const ws = this.attachWriteSnap(attachName)!;
+      ws.tempPaging = this.core!.attachments.get(attachName)!.storage.paging;
+      const mainTypes = this.readSnap().types;
+      const colTypes = table.columns.map((c) => resolveColType(c.type, mainTypes));
+      ws.putTableResolved(table, colTypes, this.pageSize);
+      for (const ix of table.indexes) {
+        ws.putIndexStore(ix.name.toLowerCase(), new TableStore(pagePayload(this.pageSize), []));
+      }
+      return { kind: "statement", cost: 0n, rowsAffected: null };
+    }
+
+    if (targetTemp) {
       // Deferred narrowing on a temp table this slice (spec/design/temp-tables.md §8), a clean 0A000:
       // a collated column (needs the temp snapshot to carry the collation catalog). Plain
       // scalar/array/range/decimal columns with PK / NOT NULL / DEFAULT / CHECK / UNIQUE,
@@ -5010,12 +5325,18 @@ export class Engine {
   // index is then built by scanning the table once: page_read per node + storage_row_read
   // per row (the metered build scan — cost.md §3); maintenance thereafter is unmetered.
   private executeCreateIndex(ci: CreateIndex): Outcome {
-    // A standalone CREATE INDEX targets whichever scope owns the table — session-local temp, shared
-    // temp, or persistent (spec/design/temp-tables.md §8). The build below is scope-agnostic (the
-    // lkpTable/lkpStore/writeIndexStore funnels route by the resolution walk; the cost meter, UNIQUE
-    // validation, naming/namespace collision, and the storage budget are all generic); only the catalog
-    // putIndex write must target the owning snapshot, so the routing happens there.
-    const table = this.lkpTable(ci.table);
+    // A standalone CREATE INDEX targets whichever scope owns the table — session-local temp, persistent,
+    // or a host-attached database (spec/design/temp-tables.md §8, attached-databases.md §3). The build
+    // below is scope-agnostic (the scoped lkpTable/lkpStore/writeIndexStore funnels route by the
+    // qualifier + resolution walk; the cost meter, UNIQUE validation, naming/namespace collision, and the
+    // storage budget are all generic); only the catalog putIndex write must target the owning snapshot,
+    // so the routing happens there.
+    // A DDL write to a READ-ONLY host attachment is 25006 before any work — checked BEFORE the qualifier
+    // existence gate so a read-only attachment refuses the write deterministically (attached-databases.md §4).
+    this.checkAttachmentWritable(ci.db);
+    this.checkTableQualifier(ci.db, ci.table); // attached-databases.md §3
+    const attachName = isAttachmentScope(ci.db) ? ci.db!.toLowerCase() : "";
+    const table = this.lkpTableScoped(ci.db, ci.table);
     if (!table) {
       throw engineError("undefined_table", "table does not exist: " + ci.table);
     }
@@ -5146,9 +5467,27 @@ export class Engine {
         );
       }
     }
+    // A non-btree (GIN / GiST) index on an attached-database table is a deferred narrowing this slice
+    // (attached-databases.md §8) — the attachment stores only btree PK / UNIQUE / secondary indexes.
+    if (attachName !== "" && kind !== "btree") {
+      throw engineError(
+        "feature_not_supported",
+        `a ${ci.using} index on an attached-database table is not supported yet`,
+      );
+    }
+    // relationTaken checks the namespace of the target scope: an attachment's OWN snapshot for an
+    // attached table (each attached database is an independent namespace, §3), else the temp-aware
+    // implicit namespace.
+    const relationTaken = (n: string): boolean => {
+      if (attachName !== "") {
+        const as = this.attachReadSnap(attachName)!;
+        return as.table(n) !== undefined || as.findIndex(n) !== null;
+      }
+      return this.relationExists(n);
+    };
     let name: string;
     if (ci.name !== null) {
-      if (this.relationExists(ci.name)) {
+      if (relationTaken(ci.name)) {
         throw engineError("duplicate_table", "relation already exists: " + ci.name);
       }
       name = ci.name;
@@ -5159,7 +5498,7 @@ export class Engine {
       for (const cn of ci.columns) base += "_" + cn.toLowerCase();
       base += "_idx";
       name = base;
-      for (let suffix = 1; this.relationExists(name); suffix++) name = base + suffix.toString();
+      for (let suffix = 1; relationTaken(name); suffix++) name = base + suffix.toString();
     }
 
     // The build scan (cost.md §3): page_read per table-tree node + storage_row_read per
@@ -5170,7 +5509,7 @@ export class Engine {
     const mask = columns.map(() => false);
     for (const c of cols) mask[c] = true;
     const def: IndexDef = { name, columns: cols, unique: ci.unique, kind };
-    const store = this.lkpStore(ci.table);
+    const store = this.lkpStoreScoped(ci.db, ci.table);
     const { entries: stored, pages: nodes, slabs } = store.scanWithUnits(mask);
     meter.charge(COSTS.pageRead * BigInt(nodes) + COSTS.valueDecompress * BigInt(slabs));
     const entries: Uint8Array[] = [];
@@ -5207,13 +5546,19 @@ export class Engine {
     // temp snapshot, so the index makes ZERO file writes (the dirty bit lets the commit skip the main
     // image). The entry writes below then route through writeIndexStore, which finds the new store in
     // that same temp snapshot.
-    if (this.isTempTable(ci.table)) {
+    if (attachName !== "") {
+      // The attachment's index catalog entry + (empty) store live in its working snapshot, published
+      // into the attached roots at commit (attached-databases.md §5/§6). attachWriteSnap marks it dirty.
+      const ws = this.attachWriteSnap(attachName)!;
+      ws.tempPaging = this.core!.attachments.get(attachName)!.storage.paging;
+      ws.putIndex(tableKey, def, this.pageSize);
+    } else if (this.isTempTable(ci.table)) {
       this.session.tx!.tempDirty = true;
       this.session.tx!.tempWorking.putIndex(tableKey, def, this.pageSize);
     } else {
       this.working().putIndex(tableKey, def, this.pageSize);
     }
-    const istore = this.writeIndexStore(nameKey);
+    const istore = this.writeIndexStoreScoped(ci.db, nameKey);
     // Insert sorted by entry key (indexes.md §1): every insert is then a right-edge append,
     // so the built tree packs ~full instead of splintering under the storage-key order the
     // scan produced (random in entry-key space). Part of the byte contract — the sort fixes
@@ -5826,15 +6171,26 @@ export class Engine {
   // source additionally validates output arity (42601) and per-column type assignability (42804)
   // up front, before any row is produced — so both fire even over an empty source.
   private executeInsert(ins: Insert, params: Value[], ctx: CteCtx): Outcome {
+    // A write to a READ-ONLY host attachment is 25006 before any I/O — checked BEFORE the qualifier
+    // existence gate so a read-only attachment refuses the write deterministically (attached-databases.md §4).
+    this.checkAttachmentWritable(ins.db);
     this.checkTableQualifier(ins.db, ins.table); // attached-databases.md §3
-    const table = this.lkpTable(ins.table); // temp-first (temp-tables.md §3)
+    // ON CONFLICT into a host attachment is a deferred narrowing this slice (attached-databases.md §8):
+    // the conflict path resolves index stores unscoped. A clean 0A000 before any planning.
+    if (ins.onConflict !== null && isAttachmentScope(ins.db)) {
+      throw engineError(
+        "feature_not_supported",
+        "ON CONFLICT on an attached-database table is not supported yet",
+      );
+    }
+    const table = this.lkpTableScoped(ins.db, ins.table); // scope-aware temp-first (temp-tables.md §3)
     if (!table) {
       throw engineError("undefined_table", "table does not exist: " + ins.table);
     }
     // Refuse the write if any of this table's collated keys are version-skewed (slice 2d): a
     // maintained B-tree would mix two orderings (collation.md §12, XX002).
     this.ensureCollationsWritable(table.columns);
-    const store = this.writeStore(ins.table);
+    const store = this.writeStoreScoped(ins.db, ins.table); // routes a temp / attachment INSERT to its working snapshot
     // The key members in key order — one for a single-column PK, several for a composite
     // (constraints.md §3), empty for a no-PK (rowid) table.
     const pk = pkIndices(table);
@@ -5992,6 +6348,7 @@ export class Engine {
       const { affected, returned } = this.runInsertRows(
         table,
         store,
+        ins.db,
         pk,
         checks,
         defaultExprs,
@@ -6097,6 +6454,7 @@ export class Engine {
     const { affected, returned } = this.runInsertRows(
       table,
       store,
+      ins.db,
       pk,
       checks,
       defaultExprs,
@@ -6127,6 +6485,10 @@ export class Engine {
   private insertRows(
     table: Table,
     store: TableStore,
+    // dbScope is the INSERT target's explicit database qualifier (attached-databases.md §5): its
+    // existence probe + unique-index probes resolve through the scope-aware funnels, so an attachment
+    // target hits its own snapshot. undefined for a bare (implicit-scope) target — the temp-first funnel.
+    dbScope: string | undefined,
     pk: number[],
     checks: NamedCheck[],
     defaultExprs: (RExpr | null)[],
@@ -6149,7 +6511,7 @@ export class Engine {
     // writable-cte.md §2; else working == read-your-writes), so a self-insert sees the pre-insert
     // state and an earlier sub-statement's staged key is invisible here (its collision is caught at
     // phase 2 — §7). The passed `store` is the working set the phase-2 inserts land in.
-    const readStore = this.lkpStore(table.name);
+    const readStore = this.lkpStoreScoped(dbScope, table.name);
     const prepared: { key: Uint8Array | null; row: Row }[] = [];
     const seenKeys = new Set<string>();
     // Per UNIQUE index (catalog/name order), the prefixes earlier rows of this batch
@@ -6216,7 +6578,7 @@ export class Engine {
         const def = uniqDefs[u]!;
         const prefix = indexPrefixKey(table.columns, colls, def, row);
         if (prefix === null) continue;
-        const istore = this.lkpIndexStore(def.name.toLowerCase());
+        const istore = this.lkpIndexStoreScoped(dbScope, def.name.toLowerCase());
         const stored = istore.rangeEntries(uniqueProbeBound(prefix));
         const k = prefix.join(",");
         if (stored.length > 0 || seenPrefixes[u]!.has(k)) {
@@ -6353,7 +6715,7 @@ export class Engine {
     }
     for (let k = 0; k < table.indexes.length; k++) {
       const def = table.indexes[k]!;
-      const istore = this.writeIndexStore(def.name.toLowerCase());
+      const istore = this.writeIndexStoreScoped(dbScope, def.name.toLowerCase());
       for (const ek of indexInserts[k]!) {
         if (!istore.insert(ek, [])) {
           // A cross-sub-statement unique-index collision under the read pin (as above).
@@ -6521,6 +6883,11 @@ export class Engine {
   private runInsertRows(
     table: Table,
     store: TableStore,
+    // dbScope is the INSERT target's explicit database qualifier (attached-databases.md §5), threaded
+    // to insertRows so its existence / unique-index probes resolve stores in the right database.
+    // undefined for a bare (implicit-scope) target. ON CONFLICT is reached only for a reserved scope (an
+    // attachment target is gated 0A000 up front), so the conflict path takes no scope.
+    dbScope: string | undefined,
     pk: number[],
     checks: NamedCheck[],
     defaultExprs: (RExpr | null)[],
@@ -6553,6 +6920,7 @@ export class Engine {
     const returned = this.insertRows(
       table,
       store,
+      dbScope,
       pk,
       checks,
       defaultExprs,
@@ -6969,8 +7337,11 @@ export class Engine {
   // matching rows (only a TRUE predicate matches — Kleene), then removes them. No WHERE
   // deletes every row. Keys are collected before mutating.
   private executeDelete(del: Delete, params: Value[], ctx: CteCtx): Outcome {
+    // A write to a READ-ONLY host attachment is 25006 before any I/O — checked BEFORE the qualifier
+    // existence gate so a read-only attachment refuses the write deterministically (attached-databases.md §4).
+    this.checkAttachmentWritable(del.db);
     this.checkTableQualifier(del.db, del.table); // attached-databases.md §3
-    const table = this.lkpTable(del.table); // temp-first (temp-tables.md §3)
+    const table = this.lkpTableScoped(del.db, del.table); // scope-aware temp-first (temp-tables.md §3)
     if (!table) {
       throw engineError("undefined_table", "table does not exist: " + del.table);
     }
@@ -7023,7 +7394,7 @@ export class Engine {
     };
     // The SCAN reads the visible snapshot (the read pin under a data-modifying WITH — writable-cte.md
     // §2; else working == read-your-writes); the phase-2 REMOVAL writes the transaction's working set.
-    const store = this.lkpStore(del.table);
+    const store = this.lkpStoreScoped(del.db, del.table);
     // matched collects (key, row) pairs before mutating; the rows feed phase 2's
     // index-entry removal (indexed columns are fixed-width and always resident).
     const matched: { key: Uint8Array; row: Row }[] = [];
@@ -7046,12 +7417,20 @@ export class Engine {
     // (empty rows), never a bare statement (grammar.md §32). The whole WHERE stays the
     // residual filter below. page_read per visited node (block, before the rows), then
     // storageRowRead per scanned row.
-    const mb = mutationPkBound(table, filter, this.readSnap());
+    // A host-attached target full-scans this slice (attached-databases.md §8) — a bounded scan would
+    // resolve its index store through the unscoped funnel. The whole WHERE stays the residual filter.
+    const attach = isAttachmentScope(del.db);
+    const mb = attach ? null : mutationPkBound(table, filter, this.readSnap());
     let entries: Entry[] | null;
     let overlap: number;
     let slabs: number;
     if (mb !== null) {
       ({ entries, overlap, slabs } = scanEntries(store, mb, bound, mask));
+    } else if (attach) {
+      const u = store.scanWithUnits(mask);
+      entries = u.entries;
+      overlap = u.pages;
+      slabs = u.slabs;
     } else {
       // GIN bound (gin.md §6): when no PK bound applies, a GIN-accelerable WHERE conjunct bounds the
       // delete's target-row scan through the index instead of a full scan (PK-then-GIN-then-full; the
@@ -7154,10 +7533,10 @@ export class Engine {
         : null;
     // Phase 2: remove the rows, then their secondary-index entries (indexes.md §4 —
     // unmetered write work; an index removal cannot fail).
-    const writeStore = this.writeStore(del.table);
+    const writeStore = this.writeStoreScoped(del.db, del.table);
     for (const m of matched) writeStore.remove(m.key);
     for (const def of table.indexes) {
-      const istore = this.writeIndexStore(def.name.toLowerCase());
+      const istore = this.writeIndexStoreScoped(del.db, def.name.toLowerCase());
       for (const m of matched) {
         for (const ek of indexEntryKeys(table.columns, colls, def, m.key, m.row)) istore.remove(ek);
       }
@@ -7179,8 +7558,11 @@ export class Engine {
   // a collision with another row's key traps 23505 (<table>_pkey). A duplicate target
   // column traps 42701. No WHERE updates every row.
   private executeUpdate(upd: Update, params: Value[], ctx: CteCtx): Outcome {
+    // A write to a READ-ONLY host attachment is 25006 before any I/O — checked BEFORE the qualifier
+    // existence gate so a read-only attachment refuses the write deterministically (attached-databases.md §4).
+    this.checkAttachmentWritable(upd.db);
     this.checkTableQualifier(upd.db, upd.table); // attached-databases.md §3
-    const table = this.lkpTable(upd.table); // temp-first (temp-tables.md §3)
+    const table = this.lkpTableScoped(upd.db, upd.table); // scope-aware temp-first (temp-tables.md §3)
     if (!table) {
       throw engineError("undefined_table", "table does not exist: " + upd.table);
     }
@@ -7321,7 +7703,7 @@ export class Engine {
     // The SCAN + spilled-value reads + compress-cost weigh the visible snapshot (the read pin under a
     // data-modifying WITH — writable-cte.md §2; else working == read-your-writes); the phase-2 REPLACE
     // writes the transaction's working set.
-    const store = this.lkpStore(upd.table);
+    const store = this.lkpStoreScoped(upd.db, upd.table);
     // Each entry is (old key, new key, new row, OLD row) — the old row feeds the index
     // maintenance and the new key the re-keying; for a non-PK UPDATE the new key equals the old.
     const updates: { key: Uint8Array; newKey: Uint8Array; row: Row; oldRow: Row }[] = [];
@@ -7350,12 +7732,20 @@ export class Engine {
     // (empty rows), never a bare statement (grammar.md §32). The whole WHERE stays the
     // residual filter below. page_read per visited node (block, before the rows), then
     // storageRowRead per scanned row.
-    const mb = mutationPkBound(table, filter, this.readSnap());
+    // A host-attached target full-scans this slice (attached-databases.md §8) — a bounded scan would
+    // resolve its index store through the unscoped funnel. The whole WHERE stays the residual filter.
+    const attach = isAttachmentScope(upd.db);
+    const mb = attach ? null : mutationPkBound(table, filter, this.readSnap());
     let entries: Entry[] | null;
     let overlap: number;
     let slabs: number;
     if (mb !== null) {
       ({ entries, overlap, slabs } = scanEntries(store, mb, bound, mask));
+    } else if (attach) {
+      const u = store.scanWithUnits(mask);
+      entries = u.entries;
+      overlap = u.pages;
+      slabs = u.slabs;
     } else {
       // GIN bound (gin.md §6): when no PK bound applies, a GIN-accelerable WHERE conjunct bounds the
       // update's target-row scan through the index over the PRE-update state (PK-then-GIN-then-full;
@@ -7459,7 +7849,7 @@ export class Engine {
       const rewritten = new Set<string>(updates.map((u) => u.key.join(",")));
       for (const def of table.indexes) {
         if (!def.unique) continue;
-        const istore = this.lkpIndexStore(def.name.toLowerCase());
+        const istore = this.lkpIndexStoreScoped(upd.db, def.name.toLowerCase());
         const batch = new Set<string>();
         for (const u of updates) {
           const prefix = indexPrefixKey(table.columns, colls, def, u.row);
@@ -7672,7 +8062,7 @@ export class Engine {
     // (the end state is collision-free, validated above). The index entries move the same way (all
     // removals across rows, then all insertions), since a moved row's new entry can equal another
     // moved row's not-yet-removed old entry.
-    const writeStore = this.writeStore(upd.table);
+    const writeStore = this.writeStoreScoped(upd.db, upd.table);
     if (pkChanged) {
       for (const u of updates) writeStore.remove(u.key);
       for (const u of updates) {
@@ -7687,7 +8077,7 @@ export class Engine {
         }
       }
       for (let k = 0; k < table.indexes.length; k++) {
-        const istore = this.writeIndexStore(table.indexes[k]!.name.toLowerCase());
+        const istore = this.writeIndexStoreScoped(upd.db, table.indexes[k]!.name.toLowerCase());
         for (const mv of indexMoves[k]!) for (const oldEk of mv.removals) istore.remove(oldEk);
         for (const mv of indexMoves[k]!)
           for (const newEk of mv.insertions) {
@@ -7703,7 +8093,7 @@ export class Engine {
     } else {
       for (const u of updates) writeStore.replace(u.key, u.row);
       for (let k = 0; k < table.indexes.length; k++) {
-        const istore = this.writeIndexStore(table.indexes[k]!.name.toLowerCase());
+        const istore = this.writeIndexStoreScoped(upd.db, table.indexes[k]!.name.toLowerCase());
         for (const mv of indexMoves[k]!) {
           for (const oldEk of mv.removals) istore.remove(oldEk);
           for (const newEk of mv.insertions) {
@@ -8602,7 +8992,11 @@ export class Engine {
         // against the implicit scope, then resolve through the temp-first funnel (which, by
         // preclude-overlaps, lands in the validated scope).
         this.checkTableQualifier(tref.db, tref.name);
-        const tbl = this.lkpTable(tref.name);
+        // Route to the qualified database's catalog (attached-databases.md §3): main/temp fall through
+        // to the temp-first funnel (preclude-overlaps lands them in the validated scope), a host
+        // attachment resolves in its own snapshot — where its table lives ONLY. The 1a read path used
+        // the bare lkpTable here, which 42P01'd on an attachment table (the routing gotcha).
+        const tbl = this.lkpTableScoped(tref.db, tref.name);
         if (!tbl) {
           throw engineError("undefined_table", "table does not exist: " + tref.db + "." + tref.name);
         }
@@ -8651,7 +9045,7 @@ export class Engine {
         }
         seenLabels.add(label);
       }
-      rels.push({ label, table: t, offset, cte: cteIdx });
+      rels.push({ label, table: t, offset, cte: cteIdx, db: tref.db });
       srfPlans.push(srf);
       derivedPlans.push(derived);
       lateralFlags.push(lateral);
@@ -9290,6 +9684,7 @@ export class Engine {
     // plan outlives the scope and a correlated subquery can re-execute it per row).
     const planRels: PlanRel[] = scope.rels.map((rel, i) => ({
       tableName: rel.table.name,
+      db: rel.db,
       offset: rel.offset,
       colCount: rel.table.columns.length,
       srf: srfPlans[i],
@@ -10231,6 +10626,10 @@ export class Engine {
     dst.sessionSeq = src.sessionSeq; // currval/lastval reads stay faithful
     dst.sessionLastName = src.sessionLastName;
     dst.tempCommitted = this.tempSnap();
+    // The frozen read engine carries the same pinned attachment view so a streaming read of an attached
+    // database (attached-databases.md §5) resolves through it; it never commits (read-only), so it needs
+    // no core back-ref. tempCommitted above already froze the temp snapshot.
+    e.attachedCommitted = this.attachReadView();
     return e;
   }
 
@@ -10307,7 +10706,7 @@ export class Engine {
         else keyB = b;
       }
       const snap = this.snapshotEngine();
-      const store = snap.lkpStore(sp.rels[0]!.tableName);
+      const store = snap.lkpStoreScoped(sp.rels[0]!.db, sp.rels[0]!.tableName);
       const su = empty ? { pages: 0, slabs: 0 } : store.overlapScanUnits(keyB, sp.relMasks[0]!);
       const meter = snap.session.newMeter();
       meter.accrued = subqueryCost; // the folded constant cost (lifetime already charged)
@@ -10454,7 +10853,7 @@ export class Engine {
     meter: Meter,
     params: Value[],
   ): SelectResult {
-    const store = this.lkpStore(plan.rels[0]!.tableName);
+    const store = this.lkpStoreScoped(plan.rels[0]!.db, plan.rels[0]!.tableName);
 
     // Resolve the scan bound (the PK pushdown, if any) and charge the pageRead block. This path is
     // single-table (gated below), so the only relation is relBounds[0]. A correlated bound resolves
@@ -10555,7 +10954,7 @@ export class Engine {
     if (rel.srf !== undefined || rel.cte !== undefined || rel.derived !== undefined) return false;
     if (needsEagerScan(plan.relBounds[0])) return false;
     if (plan.windowKeys.length !== 0 || plan.orderExprs.length !== 0) return false;
-    const table = this.lkpTable(rel.tableName);
+    const table = this.lkpTableScoped(rel.db, rel.tableName);
     if (table === undefined) return false;
     return plan.windowSpecs.every((spec) => this.windowSpecPrefixSafe(spec, plan, table, rel.offset));
   }
@@ -10612,7 +11011,7 @@ export class Engine {
   // execStreamingScan's LIMIT stop. pageRead is the full block up front (only per-row work
   // short-circuits, like the streaming scan).
   private execWindowTopN(plan: SelectPlan, env: EvalEnv, meter: Meter, params: Value[]): Emitter {
-    const store = this.lkpStore(plan.rels[0]!.tableName);
+    const store = this.lkpStoreScoped(plan.rels[0]!.db, plan.rels[0]!.tableName);
 
     // The scan bound (the PK pushdown, if any) + its pageRead block, exactly as execStreamingScan.
     let bound: KeyBound = unboundedBound();
@@ -10676,7 +11075,7 @@ export class Engine {
     env: EvalEnv,
     meter: Meter,
   ): SelectResult {
-    const store = this.lkpStore(plan.rels[0]!.tableName);
+    const store = this.lkpStoreScoped(plan.rels[0]!.db, plan.rels[0]!.tableName);
     const istore = this.lkpIndexStore(io.nameKey);
     // Up-front index-tree pageRead (the full block; the index store has no payload, so no slabs).
     meter.charge(COSTS.pageRead * BigInt(istore.nodeCount()));
@@ -10736,7 +11135,7 @@ export class Engine {
     meter: Meter,
     params: Value[],
   ): Emitter {
-    const store = this.lkpStore(plan.rels[0]!.tableName);
+    const store = this.lkpStoreScoped(plan.rels[0]!.db, plan.rels[0]!.tableName);
 
     // Resolve the scan bound (the PK pushdown, if any) and charge the pageRead + valueDecompress block
     // up front — identical to the eager scan (cost.md §3). An INDEX bound never reaches here.
@@ -10959,7 +11358,7 @@ export class Engine {
     // A base table: scan in primary-key order via a scanSource (the page_read block + per-row
     // storage_row_read accrue inside the generator — cost.md §3). A PK/index bound seeks/ranges
     // instead of a full walk; an empty bound reads nothing.
-    const store = this.lkpStore(rel.tableName);
+    const store = this.lkpStoreScoped(rel.db, rel.tableName);
     let rows: Row[];
     let nodeCount: number;
     let slabs = 0;
@@ -11158,7 +11557,7 @@ export class Engine {
     params: Value[],
   ): Emitter | null {
     const rel = plan.rels[0]!;
-    const store = this.lkpStore(rel.tableName);
+    const store = this.lkpStoreScoped(rel.db, rel.tableName);
     // File-backed only: an in-memory store's row path is already zero-copy.
     if (!store.isFileBacked()) return null;
     const mask = plan.relMasks[0]!;
@@ -11252,7 +11651,7 @@ export class Engine {
       // the key is a bare scalar-INTEGER column of the base table.
       if (plan.groupKeys.length !== 1 || plan.groupKeys[0] !== gset.keyCols[0]) return false;
       if (gset.slotSrc.length !== 1 || gset.slotSrc[0] !== 0) return false;
-      const store = this.lkpStore(rel.tableName);
+      const store = this.lkpStoreScoped(rel.db, rel.tableName);
       if (!store.columnIsInteger(gset.keyCols[0]! - rel.offset)) return false;
     } else {
       return false;
@@ -11329,7 +11728,7 @@ export class Engine {
     meter: Meter,
   ): Value[][] | null {
     const rel = plan.rels[0]!;
-    const store = this.lkpStore(rel.tableName);
+    const store = this.lkpStoreScoped(rel.db, rel.tableName);
     // File-backed only: an in-memory store's row path is already zero-copy.
     if (!store.isFileBacked()) return null;
     const mask = plan.relMasks[0]!;
@@ -12339,6 +12738,9 @@ function buildIndexAccessPredicate(
 // lowercased-name order — the deterministic tie-break), the first that yields a non-empty
 // access predicate (buildIndexAccessPredicate); else null (full scan).
 function detectScanBound(filter: RExpr, rel: ScopeRel, snap: Snapshot): ScanBound | null {
+  // A host-attached relation full-scans this slice (attached-databases.md §8): the bounded-scan exec
+  // path resolves index stores unscoped, so no PK/index/GiST/GIN bound may apply to an attachment.
+  if (isAttachmentScope(rel.db)) return null;
   const pkLocal = primaryKeyIndex(rel.table);
   if (pkLocal >= 0) {
     // Ordered-equality pushdown is scalar-only; a non-scalar (range) PK skips it (point-lookup
@@ -12484,6 +12886,9 @@ function detectINLBound(
   rel: ScopeRel,
   snap: Snapshot,
 ): ScanBound | null {
+  // A host-attached inner relation full-scans per outer row this slice (attached-databases.md §8): the
+  // seek would resolve its index store unscoped. Index-nested-loop over an attachment is a perf follow-on.
+  if (isAttachmentScope(rel.db)) return null;
   const cutoff = rel.offset;
   const collect = (keyIdx: number, ty: ScalarType, coll: Collation | null): BoundTerm[] => {
     const colColl = coll !== null ? coll.name : null;
@@ -15718,6 +16123,10 @@ type JsonSqlKind = "exists" | "value" | "query";
 // relation; only a srf or derived relation is ever lateral.
 type PlanRel = {
   tableName: string;
+  // db is the relation's explicit database qualifier (attached-databases.md §3), passed to the
+  // scope-aware store funnels at exec (lkpStoreScoped etc.). undefined for a bare implicit-scope name →
+  // the funnels fall through to the temp-first walk (behavior-neutral for every unqualified query).
+  db?: string;
   offset: number;
   colCount: number;
   srf?: SrfPlan;
@@ -20453,6 +20862,12 @@ type ScopeRel = {
   offset: number;
   qualifierOnly?: boolean;
   cte?: number;
+  // db is the relation's explicit database qualifier (attached-databases.md §3), carried from the
+  // tableRef so the store is re-looked-up in the right database at exec (a store is resolved by name
+  // per-access). undefined for a bare (implicit-scope) name — then the scoped funnels fall through to
+  // the temp-first walk, so this is behavior-neutral for every unqualified query. It also gates off
+  // index-bound pushdown for an attachment relation (detectScanBound / detectINLBound).
+  db?: string;
 };
 
 // Resolved is how a column reference resolved against the scope CHAIN (spec/design/grammar.md

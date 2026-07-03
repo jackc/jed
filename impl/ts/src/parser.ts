@@ -431,7 +431,10 @@ class Parser {
     const temp = this.peekKeyword() === "temp" || this.peekKeyword() === "temporary";
     if (temp) this.advance();
     this.expectKeyword("table");
-    const name = this.expectIdentifier();
+    // An optional database qualifier `db.table` (attached-databases.md §3, Slice 1b): create the table
+    // INTO the named database (`main` / `temp` / a host attachment). A bare name uses the implicit
+    // scope. The `.` after the first identifier makes it the qualifier and the next the table name.
+    const [db, name] = this.parseQualifiedTableName();
     this.expect("lparen");
 
     const columns: ColumnDef[] = [];
@@ -467,6 +470,7 @@ class Parser {
     return {
       kind: "createTable",
       name,
+      db,
       temp,
       columns,
       tablePks,
@@ -930,7 +934,9 @@ class Parser {
       (this.peekKindAt(2) === "lparen" || this.peekKeywordAt(2) === "using");
     const name = unnamed ? null : this.expectIdentifier();
     this.expectKeyword("on");
-    const table = this.expectIdentifier();
+    // An optional database qualifier `db.table` on the target table (attached-databases.md §3, Slice
+    // 1b): build the index ON a table in the named database (`main` / `temp` / a host attachment).
+    const [db, table] = this.parseQualifiedTableName();
     // Optional `USING <method>` between the table name and the column list (PG order — gin.md §3,
     // grammar.md §30). Not reserved (positional); the method is resolved at execution (42704 if
     // unknown), not here.
@@ -948,7 +954,7 @@ class Parser {
       if (tok.kind === "rparen") break;
       throw engineError("syntax_error", `expected ',' or ')', found ${tok.kind}`);
     }
-    return { kind: "createIndex", name, table, columns, unique, using };
+    return { kind: "createIndex", name, table, db, columns, unique, using };
   }
 
   // parseDropIndex parses `DROP INDEX <name>` (spec/design/grammar.md §30). A missing

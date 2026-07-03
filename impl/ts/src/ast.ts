@@ -479,6 +479,12 @@ export type Assignment = { column: string; value: Expr };
 export type CreateTable = {
   kind: "createTable";
   name: string;
+  // The optional database qualifier `db.table` written before the table name
+  // (spec/design/attached-databases.md §3, Slice 1b): `main` (the persistent image), `temp` (the
+  // session-local domain), or a host-attached database name — else 42P01. undefined for a bare name
+  // (the implicit scope: temp if `temp`, else main). Creating INTO an attachment routes the table into
+  // that attachment's working snapshot at execution (attached-databases.md §6).
+  db?: string;
   // temp is whether `TEMP` / `TEMPORARY` preceded `TABLE` — a session-local temporary table
   // (spec/design/temp-tables.md). A temp table makes ZERO writes to the database file (it lives
   // outside the serialized snapshot) and is dropped at session close. Its DDL is gated by allowTempDdl
@@ -589,6 +595,11 @@ export type CreateIndex = {
   kind: "createIndex";
   name: string | null;
   table: string;
+  // The optional database qualifier on the target table `CREATE INDEX … ON db.table (…)`
+  // (spec/design/attached-databases.md §3, Slice 1b): the index is built ON a table in that database
+  // (`main` / `temp` / a host attachment), and its store is registered into the owning snapshot.
+  // undefined for a bare (implicit-scope) table name.
+  db?: string;
   columns: string[];
   unique: boolean;
   // The `USING <method>` access method as written, or undefined for the default ordered B-tree.

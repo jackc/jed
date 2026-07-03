@@ -275,6 +275,10 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // Database-qualified table names — `main.`/`temp.` in table position (attached-databases.md §3,
   // Slice 1a).
   "query.qualified_table",
+  // Host-attached in-memory databases — Database.attach/detach + full SQL routing by the `db.table`
+  // qualifier: CREATE TABLE/INDEX into an attachment, INSERT/UPDATE/DELETE/SELECT/JOIN across
+  // attachments, N-root commit (attached-databases.md §5/§6, Slice 1b).
+  "attach.in_memory",
   "query.correlated_pushdown",
   "query.join_pushdown",
   "query.index_nested_loop",
@@ -702,6 +706,11 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // (db.upgradeCollations) on the running DB — clears a version-skew so a corpus test can drive
   // skew→migrate→writable end to end (spec/design/collation.md §12).
   "harness.upgrade_collations",
+  // The `# attach: <name>` directive attaches a fresh empty read-write in-memory database to the
+  // running handle before the records run, so the corpus can populate + join across attachments
+  // (spec/design/attached-databases.md §6). In-memory attachments cannot survive the disk reopen, so
+  // an # attach: file is # skip: disk.
+  "harness.attach",
 ];
 
 // THIS FILE IS THE PUBLIC API of the TS core (CLAUDE.md §2 — the embedding surface): the converged
@@ -715,6 +724,10 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
 
 // --- primary embedding API ---
 export { Database, Session } from "./shared.ts";
+// Host-attached databases (spec/design/attached-databases.md §4): Database.attach/detach + the memory|
+// file source builders. A file source is reserved for Slice 2 (throws 0A000).
+export { attachFile, attachMemory } from "./shared.ts";
+export type { AttachSource } from "./shared.ts";
 export { PreparedStatement, Rows, Transaction } from "./api.ts";
 // The better-sqlite3-style ergonomic layer (spec/design/api.md §11): db.prepare(sql) → a Statement
 // with run/get/all/iterate over native JS params + rows-as-objects. Additive — the raw Value[] path
