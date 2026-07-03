@@ -233,14 +233,6 @@ pub const DEFAULT_MAX_SQL_LENGTH: usize = 1 << 20;
 /// modest default. Identical across cores (§8); the abort point is part of the cross-core contract.
 pub const DEFAULT_TEMP_BUFFERS: usize = 32 << 20;
 
-/// The default GLOBAL storage budget for DATABASE-WIDE shared temporary tables, in **bytes**
-/// (spec/design/temp-tables.md §7). The shared-temp analogue of [`DEFAULT_TEMP_BUFFERS`]: shared temp
-/// data is global (one set of rows across every session of the open `Engine`), so its budget is a
-/// `Engine`-level setting (`shared_temp_mem`) rather than a per-session one. An over-budget shared
-/// write aborts the same `54P03`. `0` ⇒ unlimited; measured identically (deterministic on-disk record
-/// bytes), so the abort point is part of the cross-core contract.
-pub const DEFAULT_SHARED_TEMP_MEM: usize = 32 << 20;
-
 /// The maximum composite-type nesting depth (CLAUDE.md §13; spec/design/cost.md §7b). A composite
 /// type's depth is the length of its deepest chain of nested composites, counting itself: a row of
 /// scalars is depth 1, `CREATE TYPE b AS (x a)` is `1 + depth(a)`, and an array field counts as its
@@ -1173,25 +1165,11 @@ pub struct Engine {
     /// publishes and the file is never written (it is opened without write access). Always
     /// `false` for an in-memory or normally-opened database.
     pub(crate) read_only: bool,
-    /// The DATABASE-WIDE shared temporary-table snapshot (spec/design/temp-tables.md §4): the
-    /// committed rows of every `SHARED` temp table, held in memory and NEVER serialized — the shared
-    /// analogue of `SessionState::temp_committed`, but on the handle (so it is visible to every session
-    /// minted from this `Engine`) rather than per-session. On a single handle this is just a field;
-    /// for the thread-safe shared layer ([`crate::shared`]) it is pinned from / published to the
-    /// shared `Snapshot` root alongside `committed` (the two-root commit, §5). Born empty, gone when
-    /// the handle/database closes — never recovered (divergence D5).
-    pub(crate) shared_temp_committed: Snapshot,
-    /// The GLOBAL byte budget for shared temp storage (`shared_temp_mem`, temp-tables.md §7); `0` ⇒
-    /// unlimited. The shared-temp analogue of `SessionState::temp_buffers`, but `Engine`-level (shared
-    /// temp data is global). An over-budget shared-temp write aborts `54P03`.
-    pub(crate) shared_temp_mem: usize,
     /// The SESSION-LOCAL temp domain's storage identity (temp-tables.md §6): the private in-RAM
     /// `MemoryBlockStore` + pager + pinned pool its temp tables ride, with within-session compaction on.
     /// Created lazily on the first session-local temp DDL ([`Storage::new_temp`]); `None` until then. Its
-    /// `page_count` is the domain's footprint — the page-based temp budget. `shared_temp_storage` is the
-    /// shared domain's analogue (a follow-on: shared temp is still the fully-resident decoded path).
+    /// `page_count` is the domain's footprint — the page-based temp budget.
     pub(crate) temp_storage: Option<crate::shared::Storage>,
-    pub(crate) shared_temp_storage: Option<crate::shared::Storage>,
     /// The count of this handle's live streaming cursors (a `query` pull source, not a materialized
     /// result). A streaming cursor pins a snapshot it faults lazily, so while one is open a temp-domain
     /// compaction (`persist_temp` → `maybe_compact`) must NOT reclaim pages — it could free one the cursor
@@ -1252,11 +1230,6 @@ pub struct SessionOptions {
     /// all DDL). The untrusted-scratch pattern is `allow_ddl = false` + `allow_temp_ddl = Some(true)`
     /// — private scratch tables only, everything else denied, the §5.3 default-deny posture intact.
     pub allow_temp_ddl: Option<bool>,
-    /// Whether DATABASE-WIDE shared **temporary**-table DDL (`CREATE`/`DROP` of a `SHARED` temp table)
-    /// is permitted (spec/design/temp-tables.md §5); a denied shared-temp DDL is `42501`. `None` ⇒
-    /// **inherit `allow_ddl`'s value** (back-compat, like `allow_temp_ddl`). Shared-temp DDL mutates
-    /// global state and charges the global budget, so it is the more privileged of the two temp gates.
-    pub allow_shared_temp_ddl: Option<bool>,
     /// The per-session storage budget for session-local temp tables, in **bytes**
     /// (spec/design/temp-tables.md §7); `0` ⇒ unlimited. Default [`DEFAULT_TEMP_BUFFERS`]. Bounds the
     /// RETAINED temp storage neither cost ceiling covers — an over-budget temp write aborts `54P03`.
@@ -1280,7 +1253,6 @@ impl Default for SessionOptions {
             default_privileges: PrivilegeSet::ALL_TABLE,
             allow_ddl: true,
             allow_temp_ddl: None,
-            allow_shared_temp_ddl: None,
             temp_buffers: DEFAULT_TEMP_BUFFERS,
             time_zone: "UTC".to_string(),
         }
@@ -1389,11 +1361,6 @@ pub struct SessionState {
     /// denied temp DDL is `42501`. Resolved at session creation from
     /// [`SessionOptions::allow_temp_ddl`] (defaulting to `allow_ddl`'s value when unset).
     pub(crate) allow_temp_ddl: bool,
-    /// Whether DATABASE-WIDE shared **temporary**-table DDL is permitted (spec/design/temp-tables.md
-    /// §5); a denied shared-temp DDL is `42501`. Resolved at session creation from
-    /// [`SessionOptions::allow_shared_temp_ddl`] (defaulting to `allow_ddl`'s value when unset). The
-    /// more privileged of the two temp gates — shared-temp DDL is a global-state mutation.
-    pub(crate) allow_shared_temp_ddl: bool,
     /// The per-session temp-table storage budget in **bytes** (spec/design/temp-tables.md §7); `0` ⇒
     /// unlimited. An over-budget temp write aborts `54P03`.
     pub(crate) temp_buffers: usize,
@@ -1480,9 +1447,6 @@ impl SessionState {
             // `allow_ddl`'s value, so a session configured before temp tables existed behaves exactly
             // as it did (one gate governing all DDL).
             allow_temp_ddl: opts.allow_temp_ddl.unwrap_or(opts.allow_ddl),
-            // Shared-temp DDL gate, same back-compat default-inheritance as `allow_temp_ddl`
-            // (temp-tables.md §5).
-            allow_shared_temp_ddl: opts.allow_shared_temp_ddl.unwrap_or(opts.allow_ddl),
             temp_buffers: opts.temp_buffers,
             temp_committed: Snapshot::default(),
             vars: HashMap::new(),
@@ -1581,14 +1545,6 @@ impl SessionState {
     /// Whether session-local temporary-table DDL is permitted on this session.
     pub fn allow_temp_ddl(&self) -> bool {
         self.allow_temp_ddl
-    }
-    /// Set whether shared temporary-table DDL is permitted (spec/design/temp-tables.md §5).
-    pub fn set_allow_shared_temp_ddl(&mut self, allow: bool) {
-        self.allow_shared_temp_ddl = allow;
-    }
-    /// Whether shared temporary-table DDL is permitted on this session.
-    pub fn allow_shared_temp_ddl(&self) -> bool {
-        self.allow_shared_temp_ddl
     }
     /// Set the per-session temp-table storage budget in bytes; `0` ⇒ unlimited.
     pub fn set_temp_buffers(&mut self, bytes: usize) {
@@ -1692,25 +1648,14 @@ pub(crate) struct ActiveTx {
     /// successful COMMIT and discarded on ROLLBACK. The temp analogue of `working`, kept SEPARATE so
     /// it is never serialized.
     temp_working: Snapshot,
-    /// The transaction's working copy of the DATABASE-WIDE shared temp-table snapshot
-    /// (spec/design/temp-tables.md §5): cloned from [`Engine::shared_temp_committed`] at tx open,
-    /// mutated by shared-temp DDL/DML, adopted back into `shared_temp_committed` on a successful COMMIT
-    /// and discarded on ROLLBACK. The shared analogue of `temp_working`; for the thread-safe shared
-    /// layer the adopted state is then published to the shared root (the two-root commit, §5).
-    shared_temp_working: Snapshot,
     /// Whether this transaction mutated the **main** (persistent) snapshot — set by
     /// [`Engine::working_mut`]. Drives the commit's persist decision so a transaction that touched
     /// ONLY temp tables makes zero file writes (temp-tables.md §2).
     main_dirty: bool,
     /// Whether this transaction mutated the **session-local temp** snapshot — set by
-    /// [`Engine::temp_working_mut`]. With `main_dirty`/`shared_temp_dirty` it decides whether COMMIT
-    /// persists the main image (a pure-temp commit skips it; an empty block still persists, preserving
-    /// prior behavior).
+    /// [`Engine::temp_working_mut`]. With `main_dirty` it decides whether COMMIT persists the main
+    /// image (a pure-temp commit skips it; an empty block still persists, preserving prior behavior).
     temp_dirty: bool,
-    /// Whether this transaction mutated the **shared temp** snapshot — set by
-    /// [`Engine::shared_temp_working_mut`]. Like `temp_dirty`, a shared-temp-only commit makes zero
-    /// file writes; it also charges the global `shared_temp_mem` budget.
-    shared_temp_dirty: bool,
 }
 
 impl Default for Engine {
@@ -1738,10 +1683,7 @@ impl Engine {
             paging: None,
             read_only: false,
             session: SessionState::new(),
-            shared_temp_committed: Snapshot::default(),
-            shared_temp_mem: DEFAULT_SHARED_TEMP_MEM,
             temp_storage: None,
-            shared_temp_storage: None,
             open_streams: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
@@ -1761,10 +1703,7 @@ impl Engine {
             paging: None,
             read_only: false,
             session: SessionState::new(),
-            shared_temp_committed: Snapshot::default(),
-            shared_temp_mem: DEFAULT_SHARED_TEMP_MEM,
             temp_storage: None,
-            shared_temp_storage: None,
             open_streams: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
@@ -1829,7 +1768,7 @@ impl Engine {
     /// fresh, canonically-rebuilt tree. Gated on `main_dirty` (set by the statement's own
     /// `working_mut` writes): a read or a temp-only write leaves it unset, so this is a no-op and
     /// never forces a spurious main-image persist (the temp-no-file-write invariant, temp-tables.md
-    /// §2). Trees on temp/shared-temp snapshots are out of scope this slice (GiST on a temp table is
+    /// §2). Trees on temp snapshots are out of scope this slice (GiST on a temp table is
     /// `0A000`, gist.md §11), so only the main working snapshot is refreshed.
     fn rebuild_main_gist_trees_if_dirty(&mut self) -> Result<()> {
         if let Some(tx) = self.session.tx.as_mut()
@@ -1886,49 +1825,17 @@ impl Engine {
         self.temp_read_snap().table(name).is_some()
     }
 
-    /// The DATABASE-WIDE shared temp snapshot for READS (spec/design/temp-tables.md §4/§5): the open
-    /// transaction's `shared_temp_working`, else the handle's `shared_temp_committed`. The shared
-    /// analogue of [`temp_read_snap`](Engine::temp_read_snap).
-    fn shared_temp_read_snap(&self) -> &Snapshot {
-        match &self.session.tx {
-            Some(tx) => &tx.shared_temp_working,
-            None => &self.shared_temp_committed,
-        }
-    }
-
-    /// The shared temp snapshot for WRITES — the open transaction's `shared_temp_working`. Flags
-    /// `shared_temp_dirty` so the commit can skip persisting the (unchanged) main image and charge the
-    /// global budget. A shared-temp write opens an (implicit autocommit) transaction like any write.
-    fn shared_temp_working_mut(&mut self) -> &mut Snapshot {
-        let tx = self
-            .session
-            .tx
-            .as_mut()
-            .expect("a shared-temp write statement runs within a transaction");
-        tx.shared_temp_dirty = true;
-        &mut tx.shared_temp_working
-    }
-
-    /// Whether `name` resolves to a DATABASE-WIDE shared temporary table in the visible shared-temp
-    /// snapshot (spec/design/temp-tables.md §3). Checked AFTER session-local (the resolution walk is
-    /// session-local → shared → persistent); preclude-overlaps keeps a name in at most one scope.
-    fn is_shared_temp_table(&self, name: &str) -> bool {
-        self.shared_temp_read_snap().table(name).is_some()
-    }
-
-    /// The `DROP TYPE … RESTRICT` dependency check across EVERY visible scope (spec/design/temp-tables.md
-    /// §8): the main image (tables + composite fields), then the visible session-local and shared temp
-    /// snapshots (their tables). A composite type is always persistent, but a TEMP table column may
-    /// reference it, so dropping the type while such a temp table exists is 2BP01 — matching the
-    /// persistent case (PostgreSQL blocks the drop). A session sees only its own session-local temp
-    /// tables plus the shared ones, so the check is scoped to what is visible (another session's
-    /// private temp table is invisible by design — and its resolved [`ColType`] is self-contained, so it
-    /// keeps working regardless).
+    /// The `DROP TYPE … RESTRICT` dependency check across every visible scope (spec/design/temp-tables.md
+    /// §8): the main image (tables + composite fields), then the visible session-local temp snapshot
+    /// (its tables). A composite type is always persistent, but a TEMP table column may reference it, so
+    /// dropping the type while such a temp table exists is 2BP01 — matching the persistent case
+    /// (PostgreSQL blocks the drop). A session sees only its own session-local temp tables, so the check
+    /// is scoped to what is visible (another session's private temp table is invisible by design — and
+    /// its resolved [`ColType`] is self-contained, so it keeps working regardless).
     fn composite_dependent_any(&self, name: &str) -> Option<String> {
         self.read_snap()
             .composite_dependent(name)
             .or_else(|| self.temp_read_snap().composite_dependent(name))
-            .or_else(|| self.shared_temp_read_snap().composite_dependent(name))
     }
 
     /// Whether `name` is a secondary index on a SESSION-LOCAL temp table (spec/design/temp-tables.md §8)
@@ -1938,23 +1845,13 @@ impl Engine {
         self.temp_read_snap().find_index(name).is_some()
     }
 
-    /// Whether `name` is a secondary index on a DATABASE-WIDE shared temp table (temp-tables.md §8) — the
-    /// index analogue of [`is_shared_temp_table`](Engine::is_shared_temp_table); checked AFTER the
-    /// session-local index (the resolution walk).
-    fn is_shared_temp_index(&self, name: &str) -> bool {
-        self.shared_temp_read_snap().find_index(name).is_some()
-    }
-
     /// Resolution walk for a sequence by name (spec/design/sequences.md + temp-tables.md §8):
-    /// session-local temp → shared temp → persistent. Preclude-overlaps keeps a name in at most one
-    /// scope (the shared relation namespace), so this is just "where the sequence lives". Every
-    /// sequence READ (nextval/currval/setval resolution, DROP/ALTER SEQUENCE) goes through here, so a
+    /// session-local temp → persistent. Preclude-overlaps keeps a name in at most one scope (the shared
+    /// relation namespace), so this is just "where the sequence lives". Every sequence READ
+    /// (nextval/currval/setval resolution, DROP/ALTER SEQUENCE) goes through here, so a
     /// `serial`/IDENTITY column's OWNED temp sequence resolves exactly like a persistent one.
     fn sequence(&self, name: &str) -> Option<&SequenceDef> {
         if let Some(s) = self.temp_read_snap().sequence(name) {
-            return Some(s);
-        }
-        if let Some(s) = self.shared_temp_read_snap().sequence(name) {
             return Some(s);
         }
         self.read_snap().sequence(name)
@@ -1968,22 +1865,14 @@ impl Engine {
         self.temp_read_snap().sequence(name).is_some()
     }
 
-    /// Whether `name` is a sequence in the DATABASE-WIDE shared temp snapshot (temp-tables.md §8) —
-    /// checked AFTER session-local (the resolution walk).
-    fn is_shared_temp_sequence(&self, name: &str) -> bool {
-        self.shared_temp_read_snap().sequence(name).is_some()
-    }
-
     /// Stage a sequence def into whichever scope currently owns its name (flagging the matching dirty
-    /// bit): session-local temp, shared temp, else the main working set. A `serial`/IDENTITY temp
-    /// column's owned sequence advances (`nextval` flush) into its temp snapshot, so the advance — like
-    /// the table's rows — makes zero file writes (temp-tables.md §2). A brand-new persistent sequence
-    /// is absent from both temp scopes and lands in the main image.
+    /// bit): session-local temp, else the main working set. A `serial`/IDENTITY temp column's owned
+    /// sequence advances (`nextval` flush) into its temp snapshot, so the advance — like the table's
+    /// rows — makes zero file writes (temp-tables.md §2). A brand-new persistent sequence is absent from
+    /// the temp scope and lands in the main image.
     fn put_sequence_routed(&mut self, def: SequenceDef) {
         if self.is_temp_sequence(&def.name) {
             self.temp_working_mut().put_sequence(def);
-        } else if self.is_shared_temp_sequence(&def.name) {
-            self.shared_temp_working_mut().put_sequence(def);
         } else {
             self.working_mut().put_sequence(def);
         }
@@ -1996,8 +1885,6 @@ impl Engine {
         let key = name.to_ascii_lowercase();
         if self.is_temp_sequence(name) {
             self.temp_working_mut().remove_sequence(&key);
-        } else if self.is_shared_temp_sequence(name) {
-            self.shared_temp_working_mut().remove_sequence(&key);
         } else {
             self.working_mut().remove_sequence(&key);
         }
@@ -2009,9 +1896,6 @@ impl Engine {
     fn set_column_default_expr_routed(&mut self, table: &str, col: usize, de: DefaultExpr) {
         if self.is_temp_table(table) {
             self.temp_working_mut()
-                .set_column_default_expr(table, col, de);
-        } else if self.is_shared_temp_table(table) {
-            self.shared_temp_working_mut()
                 .set_column_default_expr(table, col, de);
         } else {
             self.working_mut().set_column_default_expr(table, col, de);
@@ -2026,17 +1910,10 @@ impl Engine {
     /// `temp_buffers = 0` is unlimited; a transaction that did not touch temp cannot have grown it, so
     /// the check self-gates on `temp_dirty` and is a no-op for ordinary (persistent) statements. The
     /// WITHIN-statement bound is `max_cost` (a single huge temp write hits the cost ceiling first).
-    /// The `MemoryBlockStore` paging context for a temp domain (temp-tables.md §6), lazily creating the
-    /// domain's storage identity ([`Storage::new_temp`] — a private in-RAM store + pinned pool with
-    /// within-session compaction on) on first use. The session-local domain lives on this engine; the
-    /// shared domain is a follow-on (shared temp is still the fully-resident decoded path this slice).
-    fn temp_domain_paging(&mut self, shared: bool) -> std::sync::Arc<crate::paging::SharedPaging> {
-        if shared {
-            if self.shared_temp_storage.is_none() {
-                self.shared_temp_storage = Some(crate::shared::Storage::new_temp(self.page_size));
-            }
-            return self.shared_temp_storage.as_ref().unwrap().paging().clone();
-        }
+    /// The `MemoryBlockStore` paging context for the session-local temp domain (temp-tables.md §6),
+    /// lazily creating the domain's storage identity ([`Storage::new_temp`] — a private in-RAM store +
+    /// pinned pool with within-session compaction on) on first use.
+    fn temp_domain_paging(&mut self) -> std::sync::Arc<crate::paging::SharedPaging> {
         if self.temp_storage.is_none() {
             self.temp_storage = Some(crate::shared::Storage::new_temp(self.page_size));
         }
@@ -2078,34 +1955,6 @@ impl Engine {
             return Err(EngineError::new(
                 SqlState::TempStorageLimitExceeded,
                 format!("temporary table storage exceeded the limit of {limit} bytes"),
-            ));
-        }
-        Ok(())
-    }
-
-    /// Enforce the GLOBAL shared-temp storage budget (`shared_temp_mem`, spec/design/temp-tables.md
-    /// §7) — the shared analogue of [`check_temp_budget`](Engine::check_temp_budget), but charged
-    /// against the `Engine`-level budget over the shared-temp footprint. Self-gates on
-    /// `shared_temp_dirty`, so it is a no-op for any statement that did not write shared temp. The
-    /// over-budget write is staged in `shared_temp_working`, so the abort rolls it back. `0` ⇒ unlimited.
-    fn check_shared_temp_budget(&self) -> Result<()> {
-        let limit = self.shared_temp_mem;
-        if limit == 0 {
-            return Ok(());
-        }
-        let dirty = self
-            .session
-            .tx
-            .as_ref()
-            .is_some_and(|t| t.shared_temp_dirty);
-        if !dirty {
-            return Ok(());
-        }
-        let used = self.shared_temp_read_snap().storage_bytes();
-        if used > limit as u64 {
-            return Err(EngineError::new(
-                SqlState::TempStorageLimitExceeded,
-                format!("shared temporary table storage exceeded the limit of {limit} bytes"),
             ));
         }
         Ok(())
@@ -2405,11 +2254,10 @@ impl Engine {
     pub fn reset_privileges(&mut self) {
         self.session.privileges = crate::privileges::Privileges::default();
         self.session.allow_ddl = true;
-        // The temp-DDL gates are part of the authorization envelope (temp-tables.md §5); reset them
-        // with the rest so a `# allow_temp_ddl:` / `# allow_shared_temp_ddl:` directive never leaks
-        // past its record. Default-inherit the reset `allow_ddl = true`.
+        // The temp-DDL gate is part of the authorization envelope (temp-tables.md §5); reset it with
+        // the rest so a `# allow_temp_ddl:` directive never leaks past its record. Default-inherit the
+        // reset `allow_ddl = true`.
         self.session.allow_temp_ddl = true;
-        self.session.allow_shared_temp_ddl = true;
     }
 
     /// Read-only access to the default session's authorization envelope (§5.3).
@@ -2440,18 +2288,6 @@ impl Engine {
         self.session.allow_temp_ddl
     }
 
-    /// Set whether DATABASE-WIDE shared temporary-table DDL is permitted on the default session
-    /// (spec/design/temp-tables.md §5); a denied shared-temp DDL is `42501`. The shared-temp split of
-    /// `allow_ddl`, the more privileged of the two temp gates. A handle setting, not stored in the file.
-    pub fn set_allow_shared_temp_ddl(&mut self, allow: bool) {
-        self.session.allow_shared_temp_ddl = allow;
-    }
-
-    /// Whether shared temporary-table DDL is permitted on the default session.
-    pub fn allow_shared_temp_ddl(&self) -> bool {
-        self.session.allow_shared_temp_ddl
-    }
-
     /// Set the default session's per-session temp-table storage budget in **bytes**
     /// (spec/design/temp-tables.md §7); `0` ⇒ unlimited. An over-budget temp write aborts `54P03`. A
     /// handle setting, not stored in the file.
@@ -2462,18 +2298,6 @@ impl Engine {
     /// The default session's per-session temp-table storage budget (`0` ⇒ unlimited).
     pub fn temp_buffers(&self) -> usize {
         self.session.temp_buffers
-    }
-
-    /// Set the GLOBAL shared-temp storage budget in **bytes** (`shared_temp_mem`,
-    /// spec/design/temp-tables.md §7); `0` ⇒ unlimited. A `Engine`-level setting (shared temp data
-    /// is global); an over-budget shared-temp write aborts `54P03`. Not stored in the file.
-    pub fn set_shared_temp_mem(&mut self, bytes: usize) {
-        self.shared_temp_mem = bytes;
-    }
-
-    /// The handle's shared-temp storage budget (`0` ⇒ unlimited).
-    pub fn shared_temp_mem(&self) -> usize {
-        self.shared_temp_mem
     }
 
     /// Set a session variable on the default session (spec/design/session.md §6.1). Custom variables
@@ -2583,12 +2407,9 @@ impl Engine {
     /// persistent, so this is just "where the table lives", not a precedence contest. Falls through
     /// to the currently-visible main snapshot (the open transaction's working set, else committed).
     pub fn table(&self, name: &str) -> Option<&Table> {
-        // Resolution walk (temp-tables.md §3): session-local temp → shared temp → persistent.
-        // Preclude-overlaps keeps a name in at most one scope, so this is just "where it lives".
+        // Resolution walk (temp-tables.md §3): session-local temp → persistent. Preclude-overlaps keeps
+        // a name in at most one scope, so this is just "where it lives".
         if let Some(t) = self.temp_read_snap().table(name) {
-            return Some(t);
-        }
-        if let Some(t) = self.shared_temp_read_snap().table(name) {
             return Some(t);
         }
         self.read_snap().table(name)
@@ -2822,15 +2643,11 @@ impl Engine {
             } else {
                 self.dispatch_stmt(stmt, params)
             };
-            // Enforce the temp-storage budgets after a successful temp write (temp-tables.md §7): an
-            // over-budget statement (session-local `temp_buffers` OR global `shared_temp_mem`) becomes
-            // a `54P03` error, which aborts the block (the staged temp rows roll back at ROLLBACK). A
-            // no-op for non-temp statements.
-            let result = result.and_then(|out| {
-                self.check_temp_budget()
-                    .and_then(|()| self.check_shared_temp_budget())
-                    .map(|()| out)
-            });
+            // Enforce the temp-storage budget after a successful temp write (temp-tables.md §7): an
+            // over-budget statement (session-local `temp_buffers`) becomes a `54P03` error, which
+            // aborts the block (the staged temp rows roll back at ROLLBACK). A no-op for non-temp
+            // statements.
+            let result = result.and_then(|out| self.check_temp_budget().map(|()| out));
             if result.is_ok() {
                 // Land any nextval advances into the block's working snapshot; COMMIT publishes
                 // them, ROLLBACK discards them with the rest of the working set (sequences.md §5).
@@ -2867,21 +2684,15 @@ impl Engine {
             saved_session_seq: self.session.session_seq.clone(),
             saved_session_last_name: self.session.session_last_name.clone(),
             temp_working: self.session.temp_committed.clone(),
-            shared_temp_working: self.shared_temp_committed.clone(),
             main_dirty: false,
             temp_dirty: false,
-            shared_temp_dirty: false,
         });
         match self.dispatch_stmt(stmt, params) {
             Ok(outcome) => {
-                // Enforce the temp-storage budgets before committing (temp-tables.md §7): if this
-                // (implicit) transaction's temp write pushed the session over `temp_buffers` or the
-                // global `shared_temp_mem`, discard the transaction (rolling back the over-budget temp
-                // + main changes) and surface 54P03.
-                if let Err(e) = self
-                    .check_temp_budget()
-                    .and_then(|()| self.check_shared_temp_budget())
-                {
+                // Enforce the temp-storage budget before committing (temp-tables.md §7): if this
+                // (implicit) transaction's temp write pushed the session over `temp_buffers`, discard
+                // the transaction (rolling back the over-budget temp + main changes) and surface 54P03.
+                if let Err(e) = self.check_temp_budget() {
                     if let Some(tx) = self.session.tx.take() {
                         self.restore_session_state(tx);
                     }
@@ -2931,10 +2742,8 @@ impl Engine {
             saved_session_seq: self.session.session_seq.clone(),
             saved_session_last_name: self.session.session_last_name.clone(),
             temp_working: self.session.temp_committed.clone(),
-            shared_temp_working: self.shared_temp_committed.clone(),
             main_dirty: false,
             temp_dirty: false,
-            shared_temp_dirty: false,
         });
         Ok(Outcome::Statement {
             cost: 0,
@@ -2979,16 +2788,14 @@ impl Engine {
         }
         let main_dirty = tx.main_dirty;
         let temp_dirty = tx.temp_dirty;
-        let shared_temp_dirty = tx.shared_temp_dirty;
         let mut temp_working = tx.temp_working;
-        let shared_temp_working = tx.shared_temp_working;
         let mut working = tx.working;
-        // Persist the main image when it changed; a transaction that touched ONLY temp tables (session-
-        // local and/or shared) skips it entirely so a temp table makes ZERO file writes
-        // (spec/design/temp-tables.md §2). An empty block (no kind dirty) still persists, preserving
-        // prior behavior. Temp state is adopted regardless — it is never serialized, only swapped into
-        // the in-memory committed temp snapshots (the shared root is then published by the shared layer).
-        let pure_temp = !main_dirty && (temp_dirty || shared_temp_dirty);
+        // Persist the main image when it changed; a transaction that touched ONLY session-local temp
+        // tables skips it entirely so a temp table makes ZERO file writes (spec/design/temp-tables.md
+        // §2). An empty block (no kind dirty) still persists, preserving prior behavior. Temp state is
+        // adopted regardless — it is never serialized, only swapped into the in-memory committed temp
+        // snapshot.
+        let pure_temp = !main_dirty && temp_dirty;
         if !pure_temp {
             // The txid is the durable commit counter (spec/design/api.md §2): it advances only on a
             // file-backed commit. An in-memory commit swaps the snapshot but leaves txid unchanged
@@ -3002,19 +2809,16 @@ impl Engine {
         // A dirty session-local temp domain materializes its working snapshot into its `MemoryBlockStore`
         // (compact packed leaves + within-session compaction) before it is adopted — zero main-file
         // writes (temp-tables.md §6). Compaction is safe iff no streaming cursor holds an older temp tree.
-        // Shared temp is still the fully-resident decoded pointer-swap (a follow-on).
         if temp_dirty {
             let can_reclaim = self.open_streams.load(std::sync::atomic::Ordering::Relaxed) == 0;
             if let Some(ts) = self.temp_storage.as_mut() {
                 ts.persist_temp(&mut temp_working, can_reclaim)?;
             }
         }
-        // Adopt the transaction's temp changes into the committed temp snapshots (temp-tables.md §5) —
-        // the temp analogue of publishing `committed`, but purely in memory. SessionState-local temp lives
-        // on the session; shared temp lives on the handle (and is published to the shared root by the
-        // thread-safe layer's `WriteHandle::commit`, the two-root commit).
+        // Adopt the transaction's temp changes into the committed temp snapshot (temp-tables.md §5) — the
+        // temp analogue of publishing `committed`, but purely in memory. SessionState-local temp lives on
+        // the session.
         self.session.temp_committed = temp_working;
-        self.shared_temp_committed = shared_temp_working;
         Ok(Outcome::Statement {
             cost: 0,
             rows_affected: None,
@@ -3069,13 +2873,11 @@ impl Engine {
     }
 
     fn check_privileges(&self, stmt: &Statement) -> Result<()> {
-        // Fast path: a session that allows ALL DDL (persistent + both temp kinds) and grants every
-        // privilege pays nothing. All three gates must be on, since temp DDL now has its own gates
-        // (temp-tables.md §5): a session with `allow_ddl` on but a temp gate off must still reach the
-        // detailed check.
+        // Fast path: a session that allows ALL DDL (persistent + temp) and grants every privilege pays
+        // nothing. Both gates must be on, since temp DDL now has its own gate (temp-tables.md §5): a
+        // session with `allow_ddl` on but the temp gate off must still reach the detailed check.
         if self.session.allow_ddl
             && self.session.allow_temp_ddl
-            && self.session.allow_shared_temp_ddl
             && self.session.privileges.is_permissive()
         {
             return Ok(());
@@ -3083,23 +2885,14 @@ impl Engine {
         let mut req = PrivReq::default();
         collect_stmt_privs(stmt, &mut req);
         if req.is_ddl {
-            // DDL is gated by the kind of relation it targets (temp-tables.md §5): a shared temp table
-            // by `allow_shared_temp_ddl`, a session-local temp table by `allow_temp_ddl`, everything
-            // else (persistent) by `allow_ddl`. The split lets a host grant bounded scratch tables to
-            // an untrusted session while withholding persistent (and shared) schema changes. A CREATE
-            // TABLE is classified statically (`is_*_temp_ddl`); the remaining temp-affecting DDL is
-            // classified by resolving the name — a DROP TABLE / CREATE INDEX by its target table, a DROP
-            // INDEX by the index — shared before session-local, the resolution-walk order (preclude-
-            // overlaps keeps a name in at most one scope, so the order never decides a real conflict).
-            let allowed = if req.is_shared_temp_ddl
-                || matches!(stmt, Statement::DropTable(dt) if dt.names.iter().any(|n| self.is_shared_temp_table(n)))
-                || matches!(stmt, Statement::CreateIndex(ci) if self.is_shared_temp_table(&ci.table))
-                || matches!(stmt, Statement::DropIndex(di) if self.is_shared_temp_index(&di.name))
-                || matches!(stmt, Statement::DropSequence(ds) if ds.names.iter().any(|n| self.is_shared_temp_sequence(n)))
-                || matches!(stmt, Statement::AlterSequence(als) if self.is_shared_temp_sequence(&als.name))
-            {
-                self.session.allow_shared_temp_ddl
-            } else if req.is_temp_ddl
+            // DDL is gated by the kind of relation it targets (temp-tables.md §5): a session-local temp
+            // table by `allow_temp_ddl`, everything else (persistent) by `allow_ddl`. The split lets a
+            // host grant bounded scratch tables to an untrusted session while withholding persistent
+            // schema changes. A CREATE TABLE is classified statically (`is_temp_ddl`); the remaining
+            // temp-affecting DDL is classified by resolving the name — a DROP TABLE / CREATE INDEX by its
+            // target table, a DROP INDEX by the index (preclude-overlaps keeps a name in at most one
+            // scope).
+            let allowed = if req.is_temp_ddl
                 || matches!(stmt, Statement::DropTable(dt) if dt.names.iter().any(|n| self.is_temp_table(n)))
                 || matches!(stmt, Statement::CreateIndex(ci) if self.is_temp_table(&ci.table))
                 || matches!(stmt, Statement::DropIndex(di) if self.is_temp_index(&di.name))
@@ -4301,26 +4094,15 @@ impl Engine {
                     .map(|c| resolve_col_type(&c.ty, &main.types))
                     .collect()
             };
-            // Register into the matching temp snapshot — never the main image, so the table makes zero
-            // file writes (§2). A `SHARED` table goes in the database-wide shared snapshot (visible to
-            // every session, §4); a plain temp table in the session-local one. page_size only weighs
-            // records for the (unused-for-resident) split heuristic.
+            // Register into the session-local temp snapshot — never the main image, so the table makes
+            // zero file writes (§2). page_size only weighs records for the (unused-for-resident) split
+            // heuristic.
             let ps = self.page_size;
             // The session-local temp snapshot rides a per-domain `MemoryBlockStore` pager
             // (temp-tables.md §6): lazily create the domain storage and stamp its paging onto the working
-            // snapshot, so `put_table_resolved` / `put_index_store` attach it to every temp store. Shared
-            // temp still uses the fully-resident decoded path (a follow-on — its cross-session watermark
-            // needs core-owned storage), so `temp_paging` stays `None` there.
-            let temp_paging = if ct.shared {
-                None
-            } else {
-                Some(self.temp_domain_paging(false))
-            };
-            let tw = if ct.shared {
-                self.shared_temp_working_mut()
-            } else {
-                self.temp_working_mut()
-            };
+            // snapshot, so `put_table_resolved` / `put_index_store` attach it to every temp store.
+            let temp_paging = Some(self.temp_domain_paging());
+            let tw = self.temp_working_mut();
             tw.temp_paging = temp_paging;
             tw.put_table_resolved(table, col_types, ps);
             for k in index_keys {
@@ -4452,7 +4234,6 @@ impl Engine {
         // snapshot the removal routes to in phase 3.
         enum Scope {
             Temp,
-            SharedTemp,
             Persistent,
         }
         // ---- Phase 1: resolve & classify every name into the drop set. Nothing is removed yet.
@@ -4465,12 +4246,10 @@ impl Engine {
             if seen.contains(&key) {
                 continue; // already resolved this exact target (deduplicated)
             }
-            // Resolution walk: session-local temp → shared temp → persistent. Preclude-overlaps keeps
-            // a name in at most one scope, so this is just "where it lives" (temp-tables.md §3).
+            // Resolution walk: session-local temp → persistent. Preclude-overlaps keeps a name in at
+            // most one scope, so this is just "where it lives" (temp-tables.md §3).
             let scope = if self.is_temp_table(name) {
                 Scope::Temp
-            } else if self.is_shared_temp_table(name) {
-                Scope::SharedTemp
             } else if self.read_snap().table(name).is_some() {
                 Scope::Persistent
             } else {
@@ -4533,14 +4312,6 @@ impl Engine {
                 Scope::Temp => {
                     let owned = self.temp_read_snap().sequences_owned_by(key);
                     let w = self.temp_working_mut();
-                    for sk in &owned {
-                        w.remove_sequence(sk);
-                    }
-                    w.remove_table(key);
-                }
-                Scope::SharedTemp => {
-                    let owned = self.shared_temp_read_snap().sequences_owned_by(key);
-                    let w = self.shared_temp_working_mut();
                     for sk in &owned {
                         w.remove_sequence(sk);
                     }
@@ -4722,7 +4493,7 @@ impl Engine {
         // unique key — express it as EXCLUDE (… WITH =), GX3) and a single column only (multi-column
         // GiST is GX2/GX3). File persistence (the page-5/6 R-tree + format_version 20) landed in
         // GX1b, so a file-backed GiST index is now supported; only a GiST index on a TEMP table is
-        // still 0A000 (its resident R-tree would live on the temp/shared-temp snapshot — deferred,
+        // still 0A000 (its resident R-tree would live on the temp snapshot — deferred,
         // gist.md §11), failing closed rather than silently dropping the acceleration.
         if kind == IndexKind::Gist {
             if ci.unique {
@@ -4737,7 +4508,7 @@ impl Engine {
                     "a multi-column gist index is not supported yet".to_string(),
                 ));
             }
-            if self.is_temp_table(&ci.table) || self.is_shared_temp_table(&ci.table) {
+            if self.is_temp_table(&ci.table) {
                 return Err(EngineError::new(
                     SqlState::FeatureNotSupported,
                     "a gist index on a temporary table is not supported yet".to_string(),
@@ -4822,16 +4593,12 @@ impl Engine {
         let name_key = def.name.to_ascii_lowercase();
         let ps = self.page_size;
         // Register the index catalog entry + its (empty) store in the snapshot that owns the table
-        // (the resolution walk — temp-tables.md §2/§4/§8): a session-local temp table's index lives in
-        // the session temp snapshot, a shared temp table's in the database-wide shared one, so the index
-        // makes ZERO file writes for either (the dirty bit lets the commit skip the main image). The
-        // entry writes below then route through `index_store_mut`, which finds the new store in that same
-        // temp snapshot (`has_index_store`) and flags the matching dirty bit.
+        // (the resolution walk — temp-tables.md §2/§8): a session-local temp table's index lives in the
+        // session temp snapshot, so the index makes ZERO file writes (the dirty bit lets the commit skip
+        // the main image). The entry writes below then route through `index_store_mut`, which finds the
+        // new store in that same temp snapshot (`has_index_store`) and flags the matching dirty bit.
         if self.is_temp_table(&ci.table) {
             self.temp_working_mut().put_index(&table_key, def, ps);
-        } else if self.is_shared_temp_table(&ci.table) {
-            self.shared_temp_working_mut()
-                .put_index(&table_key, def, ps);
         } else {
             self.working_mut().put_index(&table_key, def, ps);
         }
@@ -4855,10 +4622,10 @@ impl Engine {
 
     /// Run a DROP INDEX (spec/design/indexes.md §2): a table's name is 42809, a missing one
     /// 42704. A pure catalog edit — zero cost, like DROP TABLE. The index is resolved along the
-    /// resolution walk (session-local → shared → persistent — temp-tables.md §8) and removed from the
-    /// snapshot that owns it, so dropping a temp table's index makes zero file writes.
+    /// resolution walk (session-local → persistent — temp-tables.md §8) and removed from the snapshot
+    /// that owns it, so dropping a temp table's index makes zero file writes.
     fn execute_drop_index(&mut self, di: DropIndex) -> Result<Outcome> {
-        // `table` covers all three scopes, so DROP INDEX naming a table is 42809 regardless of kind.
+        // `table` covers both scopes, so DROP INDEX naming a table is 42809 regardless of kind.
         if self.table(&di.name).is_some() {
             return Err(EngineError::new(
                 SqlState::WrongObjectType,
@@ -4894,15 +4661,6 @@ impl Engine {
                 .0
                 .to_string();
             self.temp_working_mut().remove_index(&table_key, &name_key);
-        } else if self.is_shared_temp_index(&di.name) {
-            let table_key = self
-                .shared_temp_read_snap()
-                .find_index(&di.name)
-                .unwrap()
-                .0
-                .to_string();
-            self.shared_temp_working_mut()
-                .remove_index(&table_key, &name_key);
         } else if let Some((table_key, _)) = self.find_index(&di.name) {
             let table_key = table_key.to_string();
             self.working_mut().remove_index(&table_key, &name_key);
@@ -5229,14 +4987,11 @@ impl Engine {
         // Capture the owning scope BEFORE the remove: after dropping the old key the new name is in no
         // scope, so a post-remove route would wrongly default to the main image (temp-tables.md §8).
         let is_temp = self.is_temp_sequence(&existing.name);
-        let is_shared = self.is_shared_temp_sequence(&existing.name);
         let old_key = existing.name.to_ascii_lowercase();
         let mut def = existing.clone();
         def.name = new_name.to_string();
         let w = if is_temp {
             self.temp_working_mut()
-        } else if is_shared {
-            self.shared_temp_working_mut()
         } else {
             self.working_mut()
         };
@@ -11367,7 +11122,7 @@ impl Engine {
     }
 
     /// Build a frozen read-snapshot [`Engine`] for a streaming cursor (spec/design/streaming.md §5):
-    /// the VISIBLE main / session-temp / shared-temp snapshots captured **by value** (copy-on-write
+    /// the VISIBLE main / session-temp snapshots captured **by value** (copy-on-write
     /// `Arc` clones, so this pins the roots cheaply and they stay stable for the cursor's whole life,
     /// isolated from later writes on the live handle) with **no open transaction** — so the owned
     /// engine's reads see exactly the captured frozen state — plus the session envelope the per-row
@@ -11380,7 +11135,6 @@ impl Engine {
     /// handle (so it survives `Database::query`'s transient session, streaming.md §5).
     fn snapshot_engine(&self) -> Engine {
         let mut e = Engine::from_snapshot(self.read_snap().clone());
-        e.shared_temp_committed = self.shared_temp_read_snap().clone();
         e.page_size = self.page_size;
         e.paging = self.paging.clone();
         e.read_only = self.read_only;
@@ -11566,17 +11320,15 @@ impl Engine {
     /// Whether a resolved scan plan may be memoized on a prepared statement (spec/design/api.md §2.4).
     /// The subquery / precompiled-regex exclusion is tracked separately ([`ParamTypes::uncacheable`],
     /// set at the node's birth). Here the relations are vetted: a set-returning / CTE / derived
-    /// relation carries a nested plan or generator we do not vet for reuse, and a temp / shared-temp
-    /// table lives in a snapshot the cache key (`committed.cat_gen`) does not track — so a plan
-    /// referencing any of those is never cached (a point lookup / plain join over persistent base
-    /// tables has none).
+    /// relation carries a nested plan or generator we do not vet for reuse, and a temp table lives in a
+    /// snapshot the cache key (`committed.cat_gen`) does not track — so a plan referencing any of those
+    /// is never cached (a point lookup / plain join over persistent base tables has none).
     fn plan_cacheable(&self, sp: &SelectPlan) -> bool {
         sp.rels.iter().all(|r| {
             r.srf.is_none()
                 && r.cte.is_none()
                 && r.derived.is_none()
                 && !self.is_temp_table(&r.table_name)
-                && !self.is_shared_temp_table(&r.table_name)
         })
     }
 
@@ -13692,39 +13444,30 @@ impl Engine {
     }
 
     /// Shared read access to a table's store (the table is known to exist). Routes by the resolution
-    /// walk (temp-tables.md §2/§4): session-local temp → shared temp → visible main snapshot.
+    /// walk (temp-tables.md §2): session-local temp → visible main snapshot.
     fn store(&self, name: &str) -> &TableStore {
         if self.is_temp_table(name) {
             return self.temp_read_snap().store(name);
-        }
-        if self.is_shared_temp_table(name) {
-            return self.shared_temp_read_snap().store(name);
         }
         self.read_snap().store(name)
     }
 
     /// Mutable access to a table's store (the table is known to exist; a write runs within a
-    /// transaction). Routes a session-local temp write to `temp_working`, a shared temp write to
-    /// `shared_temp_working`, leaving the main image untouched in both cases.
+    /// transaction). Routes a session-local temp write to `temp_working`, leaving the main image
+    /// untouched.
     pub(crate) fn store_mut(&mut self, name: &str) -> &mut TableStore {
         if self.is_temp_table(name) {
             return self.temp_working_mut().store_mut(name);
-        }
-        if self.is_shared_temp_table(name) {
-            return self.shared_temp_working_mut().store_mut(name);
         }
         self.working_mut().store_mut(name)
     }
 
     /// Shared read access to a secondary index's store (the index is known to exist). `name_key` is
-    /// the lowercased index name; a temp table's index lives in the matching temp snapshot
-    /// (temp-tables.md §8). Walks session-local → shared → main.
+    /// the lowercased index name; a temp table's index lives in the temp snapshot (temp-tables.md §8).
+    /// Walks session-local → main.
     fn index_store(&self, name_key: &str) -> &TableStore {
         if self.temp_read_snap().has_index_store(name_key) {
             return self.temp_read_snap().index_store(name_key);
-        }
-        if self.shared_temp_read_snap().has_index_store(name_key) {
-            return self.shared_temp_read_snap().index_store(name_key);
         }
         self.read_snap().index_store(name_key)
     }
@@ -13736,14 +13479,11 @@ impl Engine {
         self.read_snap().gist_tree(name_key)
     }
 
-    /// Mutable access to a secondary index's store; routes a temp table's index to the matching
-    /// working temp snapshot (session-local → shared → main).
+    /// Mutable access to a secondary index's store; routes a temp table's index to the working temp
+    /// snapshot (session-local → main).
     fn index_store_mut(&mut self, name_key: &str) -> &mut TableStore {
         if self.temp_read_snap().has_index_store(name_key) {
             return self.temp_working_mut().index_store_mut(name_key);
-        }
-        if self.shared_temp_read_snap().has_index_store(name_key) {
-            return self.shared_temp_working_mut().index_store_mut(name_key);
         }
         self.working_mut().index_store_mut(name_key)
     }
@@ -13821,13 +13561,12 @@ impl Engine {
     /// Whether `name` is taken in the shared relation namespace (a table OR an index —
     /// spec/design/indexes.md §2), case-insensitively.
     fn relation_exists(&self, name: &str) -> bool {
-        // `self.table` already covers session-local AND shared temp tables (the resolution walk); both
-        // temp snapshots' index names join the namespace too, so a name colliding with a temp table's
+        // `self.table` already covers session-local temp tables (the resolution walk); the temp
+        // snapshot's index names join the namespace too, so a name colliding with a temp table's
         // UNIQUE index is also 42P07 (preclude-overlaps — spec/design/temp-tables.md §3).
         self.table(name).is_some()
             || self.find_index(name).is_some()
             || self.temp_read_snap().find_index(name).is_some()
-            || self.shared_temp_read_snap().find_index(name).is_some()
             || self.sequence(name).is_some()
     }
 
@@ -27521,14 +27260,9 @@ struct PrivReq {
     /// Whether the statement is DDL (CREATE / DROP / ALTER) — gated by `allow_ddl`.
     is_ddl: bool,
     /// Whether the DDL targets a SESSION-LOCAL temporary table (`CREATE TEMP TABLE`) — gated by
-    /// `allow_temp_ddl` instead of `allow_ddl` (spec/design/temp-tables.md §5). Set only for a
-    /// session-local `CREATE TEMP` (a `SHARED` create sets `is_shared_temp_ddl` instead); a `DROP` is
-    /// classified by resolving the name in `check_privileges`.
+    /// `allow_temp_ddl` instead of `allow_ddl` (spec/design/temp-tables.md §5). Set for a `CREATE
+    /// TEMP`; a `DROP` is classified by resolving the name in `check_privileges`.
     is_temp_ddl: bool,
-    /// Whether the DDL targets a DATABASE-WIDE shared temporary table (`CREATE SHARED TEMP TABLE`) —
-    /// gated by `allow_shared_temp_ddl` (temp-tables.md §5). Set for a `CREATE SHARED TEMP`; a `DROP`
-    /// of a shared temp table is classified by resolving the name.
-    is_shared_temp_ddl: bool,
 }
 
 impl PrivReq {
@@ -27548,9 +27282,8 @@ fn collect_stmt_privs(stmt: &Statement, req: &mut PrivReq) {
         Statement::CreateTable(ct) => {
             req.is_ddl = true;
             // A temp table's DDL is gated by the temp-scoped split of `allow_ddl` (temp-tables.md §5):
-            // `allow_shared_temp_ddl` for a `SHARED` table, `allow_temp_ddl` for a session-local one.
-            req.is_shared_temp_ddl = ct.shared;
-            req.is_temp_ddl = ct.temp && !ct.shared;
+            // `allow_temp_ddl` for a session-local temp table.
+            req.is_temp_ddl = ct.temp;
         }
         Statement::DropTable(_)
         | Statement::CreateIndex(_)

@@ -13,9 +13,9 @@
 //! - [`Database`] is the shared core: a cheap clonable handle (`Arc<Shared>`); clones share one
 //!   [`Shared`] core. It is `Send + Sync`, so every thread holds its own clone, and it mints
 //!   [`Session`]s ([`Database::read_session`] / [`Database::write_session`] / [`Database::session`]).
-//! - [`Shared`] holds the published committed roots — the file `Snapshot` **and** the database-wide
-//!   shared-temp `Snapshot` (temp-tables.md §5) — as two `Arc<Snapshot>`s behind ONE `RwLock` (so a
-//!   reader pins both atomically and a writer publishes both in one swap), the single-writer gate (a
+//! - [`Shared`] holds the published committed root — the file `Snapshot` (transactions.md §2) — as
+//!   an `Arc<Snapshot>` behind a `RwLock` (so a reader pins it while a writer publishes a new one in
+//!   one swap), the single-writer gate (a
 //!   `Mutex<bool>` + `Condvar`, so a second writer **blocks**, bbolt semantics), and the
 //!   **live-reader registry** — the multiset of pinned snapshot versions whose minimum is the
 //!   reclamation watermark (transactions.md §8).
@@ -104,18 +104,14 @@ impl LiveRegistry {
     }
 }
 
-/// The two published committed roots (spec/design/temp-tables.md §5), held under ONE lock so a
-/// reader pins both atomically — no torn pin where a concurrent commit advances one root between the
-/// reader's two clones — and a writer publishes both in a single swap. The shared-temp root is never
-/// serialized (temp-tables.md §2); it rides the same commit discipline as the file root but as a pure
-/// in-memory pointer swap (no fsync, nothing written to the file).
+/// The published committed root (spec/design/transactions.md §2): the file `Snapshot`. Held under one
+/// lock so a reader pins it while a concurrent commit swaps in a new one — a published snapshot is
+/// immutable, so readers never race. (A wrapper struct rather than a bare `RwLock<Arc<Snapshot>>` so
+/// a second published root can be re-added without reshaping the pin discipline.)
 struct Roots {
     /// The committed FILE snapshot — what fresh readers (and autocommit reads) see, and what is
     /// (eventually) serialized.
     committed: Arc<Snapshot>,
-    /// The committed DATABASE-WIDE shared-temp snapshot (temp-tables.md §4): the rows of every
-    /// `SHARED` temp table, visible to every session, NEVER serialized.
-    shared_temp: Arc<Snapshot>,
 }
 
 /// The **storage identity** of a database (spec/design/session.md §2.4; bplus-reshape.md B3): the
@@ -261,13 +257,12 @@ impl Storage {
 }
 
 /// The thread-safe core shared by every [`Database`] clone (CLAUDE.md §3). Holds the published
-/// committed roots, the single-writer gate, the live-reader registry, and (file-backed) the
+/// committed root, the single-writer gate, the live-reader registry, and (file-backed) the
 /// storage identity.
 struct Shared {
-    /// The published committed roots (file + shared-temp). A reader pins both by cloning the two
-    /// `Arc`s under one momentary read lock; a writer publishes both under one momentary write lock —
-    /// the §3/§5 short commit window. The `RwLock` is held only for the pointer clone/swap, never for
-    /// query work.
+    /// The published committed root (the file snapshot). A reader pins it by cloning the `Arc` under a
+    /// momentary read lock; a writer publishes a new one under a momentary write lock — the §3 short
+    /// commit window. The `RwLock` is held only for the pointer clone/swap, never for query work.
     roots: RwLock<Roots>,
     /// The single-writer gate: `true` while a write transaction is open. A second `write()` waits
     /// on the condvar until the holder commits or rolls back (CLAUDE.md §3 — at most one writer).
@@ -300,12 +295,11 @@ impl Shared {
         self.writer_free.notify_one();
     }
 
-    /// Pin both committed roots atomically (an `Arc` clone of each under ONE momentary read lock) —
-    /// returns `(file snapshot, shared-temp snapshot)`. Atomic pinning is what makes a reader's view
-    /// consistent across persistent and shared-temp tables (temp-tables.md §5).
-    fn pin(&self) -> (Arc<Snapshot>, Arc<Snapshot>) {
+    /// Pin the committed root (an `Arc` clone under a momentary read lock) — returns the file
+    /// snapshot. The published snapshot is immutable, so the reader runs lock-free against it.
+    fn pin(&self) -> Arc<Snapshot> {
         let r = self.roots.read().expect("roots lock not poisoned");
-        (r.committed.clone(), r.shared_temp.clone())
+        r.committed.clone()
     }
 
     /// The current published committed (file) version (the monotonic commit counter).
@@ -332,12 +326,10 @@ impl Shared {
         })
     }
 
-    /// Publish both new committed roots (the §3/§5 commit window — a pointer swap of each under one
-    /// write lock).
-    fn publish(&self, committed: Arc<Snapshot>, shared_temp: Arc<Snapshot>) {
+    /// Publish the new committed root (the §3 commit window — a pointer swap under one write lock).
+    fn publish(&self, committed: Arc<Snapshot>) {
         let mut r = self.roots.write().expect("roots lock not poisoned");
         r.committed = committed;
-        r.shared_temp = shared_temp;
     }
 
     /// The page size minted sessions serialize/split at: the file's page size for a file-backed core,
@@ -526,7 +518,6 @@ impl Database {
         Database(Arc::new(Shared {
             roots: RwLock::new(Roots {
                 committed: Arc::new(engine.committed),
-                shared_temp: Arc::new(engine.shared_temp_committed),
             }),
             writer_active: Mutex::new(false),
             writer_free: Condvar::new(),
@@ -553,17 +544,17 @@ impl Database {
     /// at `page_size` — the shared-core analogue of `Engine::to_image`, used by the byte-level golden
     /// round-trip tests (CLAUDE.md §8) and by hosts that snapshot an in-memory database to bytes.
     pub fn to_image(&self, page_size: u32, txid: u64) -> Result<Vec<u8>> {
-        let (snap, _shared_temp) = self.0.pin();
+        let snap = self.0.pin();
         snap.to_image(page_size, txid)
     }
 
     /// The canonical name of every persistent table in the latest committed snapshot, sorted
     /// ascending by lowercased name (the catalog's standing order — no map-iteration order may leak,
     /// CLAUDE.md §8). Secondary indexes are not tables and are excluded (api.md §6). Reads a pinned
-    /// snapshot lock-free; session-local / shared temp tables are not visible here (use
+    /// snapshot lock-free; session-local temp tables are not visible here (use
     /// [`Session::table_names`] for a session's view).
     pub fn table_names(&self) -> Vec<String> {
-        let (snap, _shared_temp) = self.0.pin();
+        let snap = self.0.pin();
         snap.table_names()
     }
 
@@ -573,7 +564,7 @@ impl Database {
     /// API — hosts use [`table_names`](Database::table_names); white-box tests / the CLI reach the
     /// catalog detail through `tooling::Table`.
     pub fn table(&self, name: &str) -> Option<Table> {
-        let (snap, _shared_temp) = self.0.pin();
+        let snap = self.0.pin();
         snap.table(name).cloned()
     }
 
@@ -581,7 +572,7 @@ impl Database {
     /// or `None`. Like [`table`](Database::table), the [`CompositeType`] return is the doc-hidden
     /// `tooling` introspection seam, not the embedding API.
     pub fn composite_type(&self, name: &str) -> Option<CompositeType> {
-        let (snap, _shared_temp) = self.0.pin();
+        let snap = self.0.pin();
         snap.composite_type(name).cloned()
     }
 
@@ -618,7 +609,7 @@ impl Database {
     /// (encoded byte) order from the latest committed snapshot, every value fully materialized, or
     /// `None` if absent. Not the embedding API — the SELECT path is the supported row access.
     pub(crate) fn rows_in_key_order(&self, name: &str) -> Option<Vec<Vec<Value>>> {
-        let (snap, _shared_temp) = self.0.pin();
+        let snap = self.0.pin();
         snap.rows_in_key_order(name)
     }
 
@@ -673,12 +664,12 @@ impl Database {
     }
 
     /// Open a **READ ONLY** session over a consistent snapshot (spec/design/session.md §2.4,
-    /// transactions.md §10). Pins the committed roots now and registers the version in the live set;
+    /// transactions.md §10). Pins the committed root now and registers the version in the live set;
     /// the session serves reads from that snapshot for its life — lock-free, never blocked by and
     /// never blocking a writer — and `close`/`Drop` deregisters. A write through it is `25006`.
     /// (The old `SharedDb::read()` → `ReadHandle`.)
     pub fn read_session(&self) -> Session {
-        let (snap, shared_temp) = self.0.pin();
+        let snap = self.0.pin();
         let version = snap.txid;
         self.0
             .live
@@ -688,9 +679,6 @@ impl Database {
         let mut engine = Engine::from_snapshot((*snap).clone());
         engine.page_size = self.0.page_size(); // serialize/split at the file's page size (§8)
         engine.read_only = true; // the executor rejects writes (25006) / poisons a read-only block
-        // Seed the engine with the pinned shared-temp snapshot (temp-tables.md §5): the reader sees the
-        // shared temp tables committed as of its pinned version, consistent with its file snapshot.
-        engine.shared_temp_committed = (*shared_temp).clone();
         Session {
             shared: self.0.clone(),
             engine,
@@ -714,13 +702,10 @@ impl Database {
             return self.read_session();
         }
         self.0.acquire_writer();
-        let (base, shared_temp) = self.0.pin();
+        let base = self.0.pin();
         let base_version = base.txid;
         let mut engine = Engine::from_snapshot((*base).clone());
         engine.page_size = self.0.page_size(); // serialize/split at the file's page size (§8)
-        // Seed the engine with the pinned shared-temp snapshot before opening the block, so its
-        // `shared_temp_working` (cloned at begin_tx) is the latest committed shared temp (temp-tables.md §5).
-        engine.shared_temp_committed = (*shared_temp).clone();
         engine
             .begin_tx(Some(true))
             .expect("a fresh handle has no open transaction");
@@ -742,11 +727,10 @@ impl Database {
     /// explicit block. (The old `Engine::session(opts)` swap → an independent owns-its-`Engine`
     /// session.)
     pub fn session(&self, opts: SessionOptions) -> Session {
-        let (snap, shared_temp) = self.0.pin();
+        let snap = self.0.pin();
         let version = snap.txid;
         let mut engine = Engine::from_snapshot((*snap).clone());
         engine.page_size = self.0.page_size(); // serialize/split at the file's page size (§8)
-        engine.shared_temp_committed = (*shared_temp).clone();
         engine.session = SessionState::with_options(opts);
         // A read-only file-backed core mints read-only sessions (a write is `25006`); it pins the
         // committed version in the watermark like a read session. A writable core mints the autocommit
@@ -1048,24 +1032,22 @@ impl Session {
         }
     }
 
-    /// Re-pin the latest committed roots as this session's base (spec/design/session.md §2.4): the
+    /// Re-pin the latest committed root as this session's base (spec/design/session.md §2.4): the
     /// autocommit read/write path always works against the newest committed state.
     fn refresh_committed(&mut self) {
-        let (snap, shared_temp) = self.shared.pin();
+        let snap = self.shared.pin();
         self.base_version = snap.txid;
         self.engine.committed = (*snap).clone();
-        self.engine.shared_temp_committed = (*shared_temp).clone();
     }
 
-    /// Publish the engine's committed roots into the shared cell at the next version (the §3 commit
-    /// window — a pointer swap of both roots, temp-tables.md §5). Called after a clean autocommit
-    /// write or an explicit COMMIT of a writable block, under the writer gate.
+    /// Publish the engine's committed root into the shared cell at the next version (the §3 commit
+    /// window — a pointer swap, transactions.md §2). Called after a clean autocommit write or an
+    /// explicit COMMIT of a writable block, under the writer gate.
     ///
     /// File-backed: the new file snapshot is **persisted durably first** ([`Shared::persist`]) and the
-    /// roots are swapped only on success, so a persist I/O failure leaves the shared committed state
+    /// root is swapped only on success, so a persist I/O failure leaves the shared committed state
     /// (and this session's version) unchanged and surfaces the error to the caller. In-memory persist
-    /// is a no-op. The shared-temp root is never serialized — it rides the swap as a pure in-memory
-    /// pointer (temp-tables.md §2/§5).
+    /// is a no-op.
     fn publish(&mut self) -> Result<()> {
         let mut snap = self.engine.committed.clone();
         snap.txid = self.base_version + 1; // advance the shared version on every commit
@@ -1077,8 +1059,7 @@ impl Session {
         // residency too (read-your-writes for the NEXT statement re-faults — one read path).
         snap.demote_clean_leaves();
         self.engine.committed = snap.clone();
-        let shared_temp = self.engine.shared_temp_committed.clone();
-        self.shared.publish(Arc::new(snap), Arc::new(shared_temp));
+        self.shared.publish(Arc::new(snap));
         self.base_version += 1;
         Ok(())
     }
@@ -1195,7 +1176,7 @@ impl Session {
     }
 
     /// The definition of table `name` (case-insensitive) as this session sees it — session-local
-    /// temp → shared temp → the session's main snapshot (temp-tables.md §3) — or `None`. The [`Table`]
+    /// temp → the session's main snapshot (temp-tables.md §3) — or `None`. The [`Table`]
     /// type is the doc-hidden `tooling` introspection seam, not the embedding API (see
     /// [`Database::table`]).
     pub fn table(&self, name: &str) -> Option<&Table> {
@@ -1410,17 +1391,9 @@ impl Session {
     pub fn set_allow_temp_ddl(&mut self, allow: bool) {
         self.engine.session.set_allow_temp_ddl(allow);
     }
-    /// Set whether database-wide shared temporary-table DDL is permitted (temp-tables.md §5).
-    pub fn set_allow_shared_temp_ddl(&mut self, allow: bool) {
-        self.engine.session.set_allow_shared_temp_ddl(allow);
-    }
     /// Set the per-session temporary-table storage budget in bytes; `0` ⇒ unlimited (temp-tables.md §7).
     pub fn set_temp_buffers(&mut self, bytes: usize) {
         self.engine.session.set_temp_buffers(bytes);
-    }
-    /// Set the database-wide shared-temp storage budget in bytes; `0` ⇒ unlimited (temp-tables.md §7).
-    pub fn set_shared_temp_mem(&mut self, bytes: usize) {
-        self.engine.set_shared_temp_mem(bytes);
     }
     /// Clear every session variable (§6.1).
     pub fn reset_vars(&mut self) {
@@ -1875,7 +1848,7 @@ mod temp_reclaim_internal_tests {
         // The bare-Engine autocommit path (crate::execute) — like the Go test — correctly skips the main
         // persist for a pure-temp commit, so it is the faithful vehicle for the zero-file-write invariant
         // (the Database/Session publish path persists the main image unconditionally, a pre-existing
-        // issue tracked as a shared-temp follow-on).
+        // publish-path issue — the publish-decoupling follow-on, attached-databases.md §5).
         let path = std::env::temp_dir().join("jed_temp_zerofile_internal.jed");
         let _ = std::fs::remove_file(&path);
         let mut db = Engine::create(&path, DatabaseOptions { page_size: 256 }).unwrap();

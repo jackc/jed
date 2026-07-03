@@ -264,25 +264,15 @@ impl Parser {
     fn parse_create_table(&mut self) -> Result<CreateTable> {
         self.expect_keyword("create")?;
         // An optional table_scope between CREATE and TABLE makes the table TEMPORARY
-        // (spec/design/temp-tables.md, grammar.ebnf `table_scope`). SHARED / TEMP / TEMPORARY are NOT
-        // reserved (§3): recognized positionally here — the word after TABLE is always the table name,
-        // so `CREATE TABLE temp (...)` / `CREATE TABLE shared (...)` are ordinary persistent tables. A
-        // leading SHARED makes a database-wide shared temp table (§4) and MUST be immediately followed
-        // by TEMP/TEMPORARY (a `SHARED` table is always temporary; a stray `CREATE SHARED TABLE …` is
-        // 42601). `shared` thus always has `temp = true`.
-        let shared = self.peek_keyword().as_deref() == Some("shared");
-        if shared {
-            self.advance();
-        }
+        // (spec/design/temp-tables.md, grammar.ebnf `table_scope`). TEMP / TEMPORARY are NOT reserved
+        // (§3): recognized positionally here — the word after TABLE is always the table name, so
+        // `CREATE TABLE temp (...)` is an ordinary persistent table named "temp".
         let temp = matches!(
             self.peek_keyword().as_deref(),
             Some("temp") | Some("temporary")
         );
         if temp {
             self.advance();
-        }
-        if shared && !temp {
-            return Err(syntax("SHARED must be followed by TEMP or TEMPORARY"));
         }
         self.expect_keyword("table")?;
         let name = self.expect_identifier()?;
@@ -329,7 +319,6 @@ impl Parser {
         Ok(CreateTable {
             name,
             temp,
-            shared,
             columns,
             table_pks,
             checks,

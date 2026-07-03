@@ -59,18 +59,11 @@ pub enum Statement {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct CreateTable {
     pub name: String,
-    /// Whether `TEMP` / `TEMPORARY` preceded `TABLE` — a temporary table (spec/design/temp-tables.md).
-    /// A temp table makes ZERO writes to the database file (it lives outside the serialized
-    /// `Snapshot`) and is dropped at session / database close. Its DDL is gated by `allow_temp_ddl`
-    /// (session-local) or `allow_shared_temp_ddl` (shared) rather than `allow_ddl` (temp-tables.md §5).
-    /// `shared` implies `temp` (a `SHARED` table is always temporary).
+    /// Whether `TEMP` / `TEMPORARY` preceded `TABLE` — a session-local temporary table
+    /// (spec/design/temp-tables.md). A temp table makes ZERO writes to the database file (it lives
+    /// outside the serialized `Snapshot`) and is dropped at session close. Its DDL is gated by
+    /// `allow_temp_ddl` rather than `allow_ddl` (temp-tables.md §5).
     pub temp: bool,
-    /// Whether `SHARED` preceded `TEMP`/`TEMPORARY` — a DATABASE-WIDE shared temporary table
-    /// (spec/design/temp-tables.md §4): one set of rows visible to and writable by every session of
-    /// the open `Engine`, but still never written to the file. `shared = true` always has `temp =
-    /// true` (the parser rejects `SHARED` not followed by `TEMP`/`TEMPORARY` as 42601). When `false`
-    /// (and `temp = true`) the table is session-local (private to the creating session).
-    pub shared: bool,
     pub columns: Vec<ColumnDef>,
     /// The table-level `PRIMARY KEY (a, b, …)` constraints, each a list of member column
     /// names in key order (spec/design/grammar.md §28). The parser collects every one it
