@@ -1,7 +1,7 @@
-use jed::{Database, DatabaseOptions, SessionOptions};
+use jed::{CreateOptions, Database, SessionOptions};
 
 fn main() -> jed::Result<()> {
-    let mut db = Database::create("app.jed", DatabaseOptions::default())?;
+    let mut db = Database::create(CreateOptions { path: Some("app.jed".into()), ..Default::default() })?;
 
     // Session variables are PostgreSQL's GUC model — they live on a SESSION, so mint one from the
     // database rather than using the bare handle. A custom variable must be NAMESPACED — a dotted name

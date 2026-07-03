@@ -1,6 +1,6 @@
 import { createDatabase } from 'jed-ts';
 
-const db = createDatabase('app.jed');
+const db = createDatabase({ path: 'app.jed' });
 
 // Session variables are PostgreSQL's GUC model — they live on a SESSION, so mint one from the
 // database rather than using the bare handle. A custom variable must be NAMESPACED — a dotted name

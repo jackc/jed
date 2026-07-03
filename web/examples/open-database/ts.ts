@@ -1,10 +1,10 @@
 import { createDatabase, render } from 'jed-ts';
 
 // Open a database. createDatabase/openDatabase return a Database — the handle you run SQL through. A
-// path gives a single-file database on disk; `Database.newInMemory()` is a transient in-memory one.
+// path gives a single-file database on disk; `createDatabase({})` (no path) is a transient in-memory one.
 // Each bare execute() autocommits durably (it runs on a fresh session); for a multi-statement
 // transaction use db.update(...) or mint a Session.
-const db = createDatabase('people.jed');
+const db = createDatabase({ path: 'people.jed' });
 
 db.execute('CREATE TABLE person (id i32 PRIMARY KEY, name text NOT NULL)');
 db.execute("INSERT INTO person VALUES (1, 'Ada'), (2, 'Grace')");

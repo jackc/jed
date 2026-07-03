@@ -1,6 +1,6 @@
 import { createDatabase, EngineError } from 'jed-ts';
 
-const db = createDatabase('app.jed');
+const db = createDatabase({ path: 'app.jed' });
 
 // Serve untrusted queries through a session bounded TWO ways:
 //   maxCost         — a per-STATEMENT ceiling: one runaway query aborts 54P01.

@@ -1,7 +1,7 @@
-use jed::{Database, DatabaseOptions, SessionOptions};
+use jed::{CreateOptions, Database, SessionOptions};
 
 fn main() -> jed::Result<()> {
-    let mut db = Database::create("app.jed", DatabaseOptions::default())?;
+    let mut db = Database::create(CreateOptions { path: Some("app.jed".into()), ..Default::default() })?;
 
     // Serve untrusted queries through a session bounded TWO ways:
     //   max_cost          — a per-STATEMENT ceiling: one runaway query aborts 54P01.

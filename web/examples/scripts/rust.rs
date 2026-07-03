@@ -1,7 +1,7 @@
-use jed::{split_statements, Database, DatabaseOptions};
+use jed::{split_statements, CreateOptions, Database};
 
 fn main() -> jed::Result<()> {
-    let mut db = Database::create("app.jed", DatabaseOptions::default())?;
+    let mut db = Database::create(CreateOptions { path: Some("app.jed".into()), ..Default::default() })?;
 
     // execute_script runs a whole migration as ONE implicit transaction: split it into statements,
     // run each in order, and commit all-or-nothing (any error rolls the lot back). It DISCARDS

@@ -1,7 +1,7 @@
-use jed::{Database, DatabaseOptions, Privilege, PrivilegeSet, SessionOptions};
+use jed::{CreateOptions, Database, Privilege, PrivilegeSet, SessionOptions};
 
 fn main() -> jed::Result<()> {
-    let mut db = Database::create("app.jed", DatabaseOptions::default())?;
+    let mut db = Database::create(CreateOptions { path: Some("app.jed".into()), ..Default::default() })?;
     db.execute("CREATE TABLE report (id i32 PRIMARY KEY, body text)", &[])?;
     db.execute("INSERT INTO report VALUES (1, 'hello')", &[])?;
 

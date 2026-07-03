@@ -1,6 +1,6 @@
 import { createDatabase, splitStatements } from 'jed-ts';
 
-const db = createDatabase('app.jed');
+const db = createDatabase({ path: 'app.jed' });
 
 // executeScript runs a whole migration as ONE implicit transaction: split it into statements, run
 // each in order, and commit all-or-nothing (any error rolls the lot back). It DISCARDS result rows —

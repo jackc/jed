@@ -8,7 +8,7 @@ import (
 )
 
 func main() {
-	db, err := jed.CreateDatabase("app.jed", jed.DatabaseOptions{})
+	db, err := jed.CreateDatabase(jed.CreateOptions{Path: "app.jed"})
 	if err != nil {
 		log.Fatal(err)
 	}

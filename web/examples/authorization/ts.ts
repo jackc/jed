@@ -1,6 +1,6 @@
 import { createDatabase, PrivilegeSet } from 'jed-ts';
 
-const db = createDatabase('app.jed');
+const db = createDatabase({ path: 'app.jed' });
 db.execute('CREATE TABLE report (id i32 PRIMARY KEY, body text)');
 db.execute("INSERT INTO report VALUES (1, 'hello')");
 

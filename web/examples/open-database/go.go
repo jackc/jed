@@ -9,10 +9,10 @@ import (
 
 func main() {
 	// Open a database. CreateDatabase/OpenDatabase return a *Database — the handle you run SQL
-	// through. A path gives a single-file database on disk; jed.NewDatabase() is a transient
+	// through. A path gives a single-file database on disk; jed.CreateDatabase(jed.CreateOptions{}) (no path) is a transient
 	// in-memory one. Each bare Execute autocommits durably (it runs on a fresh session); for a
 	// multi-statement transaction use db.Update(...) or mint a Session.
-	db, err := jed.CreateDatabase("people.jed", jed.DatabaseOptions{PageSize: jed.DefaultPageSize})
+	db, err := jed.CreateDatabase(jed.CreateOptions{Path: "people.jed"})
 	if err != nil {
 		log.Fatal(err)
 	}

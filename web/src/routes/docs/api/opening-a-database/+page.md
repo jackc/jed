@@ -35,8 +35,9 @@ statements **atomically**, run them in one `update` closure — or on a single s
 ## In-memory databases
 
 Every example on the **SQL** pages of these docs runs against an in-memory database, right in your
-browser — the same engine, no file. Create one with `Database::new_in_memory()` (Rust),
-`jed.NewDatabase()` (Go), or `Database.newInMemory()` (TypeScript).
+browser — the same engine, no file. Create one by calling the unified create constructor with no path:
+`Database::create(CreateOptions::default())` (Rust), `jed.CreateDatabase(jed.CreateOptions{})` (Go), or
+`createDatabase({})` (TypeScript).
 
 ## Running untrusted queries
 
