@@ -209,6 +209,21 @@ func (s *snapshot) clone() *snapshot {
 	return &snapshot{txid: s.txid, catGen: s.catGen, tables: tables, types: types, stores: stores, indexStores: indexStores, sequences: sequences, collations: collations, defaultCollation: s.defaultCollation, gistTrees: gistTrees}
 }
 
+// demoteCleanLeaves demotes every store's clean, persisted resident leaves to OnDisk references —
+// the post-commit residency flip over the whole snapshot (bplus-reshape.md B4), run after a
+// successful persist so the published committed tree is the skeletal `interiors + OnDisk leaves`
+// shape on every host. Table stores and btree/GIN index stores flip; a GiST leaf-key store's nodes
+// are never persisted (its on-disk form is the R-tree), so it no-ops naturally. Map iteration
+// order cannot leak: each store's flip is independent and order-insensitive (CLAUDE.md §8).
+func (s *snapshot) demoteCleanLeaves() {
+	for _, store := range s.stores {
+		store.demoteCleanLeaves()
+	}
+	for _, store := range s.indexStores {
+		store.demoteCleanLeaves()
+	}
+}
+
 // resolveCollation resolves a collation name for USE — query resolution and key encoding
 // (spec/design/collation.md §2/§9). The collations the database has resolved (a cache populated on
 // open from the file's reference entries, carrying their version pin) first, then the engine-global
@@ -13310,19 +13325,13 @@ func encodeKeySet(keyType scalarType, srcs []*rExpr, params []Value, outer []sto
 // per-probe (pages, slabs) blocks sum, so the metered cost is the sum of the individual point
 // lookups — a core that full-scans instead computes a different cost (the cross-core contract,
 // §8). Returns the (key, row) entries so the mutation paths can Remove/Replace by key; SELECT
-// discards the keys. masked selects the reconstruction variant (SELECT reconstructs only the
-// touched columns; a mutation needs whole rows to re-key/remove index entries) — cost-neutral,
-// so both charge the identical (pages, slabs) driven by the shared mask.
+// discards the keys. Reconstruction is uniformly lazy since B4 (bplus-reshape.md) — the old
+// masked/unmasked reconstruction variants are collapsed, and the (pages, slabs) cost stays driven
+// by the shared mask (the cost touched set).
 func (db *engine) pkKeySetRows(store *tableStore, ks *pkKeySetPlan, params []Value, outer []storedRow, mask []bool, left storedRow, masked bool) (entries []entry, pages, slabs int, err error) {
 	for _, k := range encodeKeySet(ks.pkType, ks.srcs, params, outer, ks.coll, left) {
 		b := keyBound{lo: k, loInc: true, hi: k, hiInc: true}
-		var es []entry
-		var p, sl int
-		if masked {
-			es, p, sl, err = store.RangeScanWithUnitsMasked(b, mask)
-		} else {
-			es, p, sl, err = store.RangeScanWithUnits(b, mask)
-		}
+		es, p, sl, err := store.RangeScanWithUnits(b, mask)
 		if err != nil {
 			return nil, 0, 0, err
 		}
@@ -14315,7 +14324,7 @@ func (db *engine) buildScanRows(sp *selectPlan, ptys []scalarType, params []Valu
 			done:     empty || (sp.limit != nil && *sp.limit == 0),
 		}
 		if !cur.done {
-			cur.scan = store.storeScan(b, sp.pkReverse, sp.relMasks[0])
+			cur.scan = store.storeScan(b, sp.pkReverse)
 		}
 		return &Rows{columnNames: sp.columnNames, columnTypes: typeNames(sp.columnTypes), cursor: cur}, true, nil
 	}
@@ -14848,9 +14857,9 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 		}
 		var err error
 		if plan.pkReverse {
-			err = store.ScanRangeRev(b, plan.relMasks[0], visit)
+			err = store.ScanRangeRev(b, visit)
 		} else {
-			err = store.ScanRange(b, plan.relMasks[0], visit)
+			err = store.ScanRange(b, visit)
 		}
 		if err != nil {
 			return selectResult{}, err
@@ -14926,9 +14935,9 @@ func (db *engine) execWindowTopN(plan *selectPlan, env *evalEnv, meter *costMete
 		}
 		var err error
 		if plan.pkReverse {
-			err = store.ScanRangeRev(b, plan.relMasks[0], visit)
+			err = store.ScanRangeRev(b, visit)
 		} else {
-			err = store.ScanRange(b, plan.relMasks[0], visit)
+			err = store.ScanRange(b, visit)
 		}
 		if err != nil {
 			return emitter{}, err
@@ -14977,7 +14986,7 @@ func (db *engine) execIndexOrderScan(plan *selectPlan, io *indexOrderPlan, env *
 	out := make([][]Value, 0)
 	if plan.limit == nil || *plan.limit > 0 {
 		var passed int64
-		err := istore.ScanRange(unboundedBound(), nil, func(ekey []byte, _ storedRow) (bool, error) {
+		err := istore.ScanRange(unboundedBound(), func(ekey []byte, _ storedRow) (bool, error) {
 			if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned entry (CLAUDE.md §13)
 				return false, err
 			}
@@ -15085,7 +15094,7 @@ func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costM
 	if collated {
 		var rows []storedRow
 		if !empty {
-			err := store.ScanRange(b, plan.relMasks[0], func(_ []byte, row storedRow) (bool, error) {
+			err := store.ScanRange(b, func(_ []byte, row storedRow) (bool, error) {
 				if err := meter.Guard(); err != nil {
 					return false, err
 				}
@@ -15123,7 +15132,7 @@ func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costM
 		// the sorter, which spills when it exceeds the budget.
 		s := db.newSorterFor(plan.order)
 		if !empty {
-			err := store.ScanRange(b, plan.relMasks[0], func(_ []byte, row storedRow) (bool, error) {
+			err := store.ScanRange(b, func(_ []byte, row storedRow) (bool, error) {
 				if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned row (CLAUDE.md §13)
 					return false, err
 				}
@@ -15406,7 +15415,7 @@ func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 	} else if sb != nil && sb.pk != nil {
 		b, empty := db.buildKeyBound(sb.pk, params, outer, left)
 		if !empty {
-			entries, pages, sl, err := store.RangeScanWithUnitsMasked(b, plan.relMasks[ri])
+			entries, pages, sl, err := store.RangeScanWithUnits(b, plan.relMasks[ri])
 			if err != nil {
 				return nil, err
 			}
@@ -15435,7 +15444,7 @@ func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 			return nil, err
 		}
 	} else {
-		entries, pages, sl, err := store.ScanWithUnitsMasked(plan.relMasks[ri])
+		entries, pages, sl, err := store.ScanWithUnits(plan.relMasks[ri])
 		if err != nil {
 			return nil, err
 		}
@@ -30121,9 +30130,19 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 	}
 	switch e.kind {
 	case reColumn:
+		// A deferred large value the static touched set missed resolves ON TOUCH — the B4
+		// demand-fault backstop (bplus-reshape.md §5): deterministic rows, never a NULL-fold;
+		// deliberately unmetered (§6).
+		if v := row[e.index]; v.Kind == ValUnfetched {
+			return resolveUnfetchedSelf(v.unfetched())
+		}
 		return row[e.index], nil
 	case reOuterColumn:
-		// A correlated reference: column `index` of the enclosing row `level` hops out (§26).
+		// A correlated reference: column `index` of the enclosing row `level` hops out (§26),
+		// with the same demand-fault backstop as reColumn.
+		if v := env.outer[len(env.outer)-e.level][e.index]; v.Kind == ValUnfetched {
+			return resolveUnfetchedSelf(v.unfetched())
+		}
 		return env.outer[len(env.outer)-e.level][e.index], nil
 	case reParam:
 		// The supplied value, already coerced to its inferred type by bindParams before

@@ -88,8 +88,8 @@ type storeScan struct {
 
 // storeScan builds a pull cursor over this store within b, ascending (reverse=false) or descending
 // (reverse=true) — the same sequence as ScanRange / ScanRangeRev.
-func (s *tableStore) storeScan(b keyBound, reverse bool, mask []bool) *storeScan {
-	return &storeScan{store: s, cur: s.rows.rangeCursor(b, s.leafSrc(), reverse, mask)}
+func (s *tableStore) storeScan(b keyBound, reverse bool) *storeScan {
+	return &storeScan{store: s, cur: s.rows.rangeCursor(b, s.leafSrc(), reverse)}
 }
 
 // next yields the next in-bound (key, row), or ok=false at end (faulting a leaf only on descent — the
@@ -243,13 +243,18 @@ func (s *tableStore) OverlapScanUnits(b keyBound, mask []bool) (pages, slabs int
 	return pages, slabs, nil
 }
 
-// rangeScanWithUnits is the fused single-descent bounded scan shared by the full-row and
-// touched-column variants. mask is the cost touched set (which columns' spill/compress to charge —
-// a §8 byte contract, unchanged across variants). reconMask drives leaf reconstruction: nil rebuilds
-// the whole row, non-nil rebuilds only its columns (the rest NULL). Reconstruction masking is
-// cost-neutral (no per-column-decode unit, cost.md §3) — the cost block below reads only `mask`.
-func (s *tableStore) rangeScanWithUnits(b keyBound, mask, reconMask []bool) ([]entry, int, int, error) {
-	keys, vals, pages, err := s.rows.rangeEntriesCounted(b, s.leafSrc(), reconMask)
+// RangeScanWithUnits is the fused single-descent bounded scan: the admitted (key, row) entries
+// PLUS the (page_read, value_decompress) cost block the bound charges — exactly RangeEntries +
+// OverlapScanUnits, computed in ONE B-tree traversal instead of three (the windowed walk visits
+// precisely the nodes overlapNodeCount counts, and the per-admitted-record spill/compress units
+// are computed inline from the entries it collects). Byte-identical cost and rows by construction.
+// One variant for whole-row and touched-column feeds alike — the old masked/unmasked
+// reconstruction split is collapsed (bplus-reshape.md B4): reconstruction is uniformly lazy
+// (fixed-width columns decode eagerly, variable columns defer as self-resolving Unfetched), so
+// there is nothing left to mask. mask is the cost touched set (which columns' spill/compress to
+// charge — a §8 byte contract).
+func (s *tableStore) RangeScanWithUnits(b keyBound, mask []bool) ([]entry, int, int, error) {
+	keys, vals, pages, err := s.rows.rangeEntriesCounted(b, s.leafSrc())
 	if err != nil {
 		return nil, 0, 0, err
 	}
@@ -268,37 +273,11 @@ func (s *tableStore) rangeScanWithUnits(b keyBound, mask, reconMask []bool) ([]e
 	return out, pages, slabs, nil
 }
 
-// RangeScanWithUnits is the fused single-descent bounded scan: the admitted (key, row) entries
-// PLUS the (page_read, value_decompress) cost block the bound charges — exactly RangeEntries +
-// OverlapScanUnits, computed in ONE B-tree traversal instead of three (the windowed walk visits
-// precisely the nodes overlapNodeCount counts, and the per-admitted-record spill/compress units
-// are computed inline from the entries it collects). Byte-identical cost and rows by construction.
-// Returns WHOLE rows — the safe default for mutation / FK / index-maintenance callers that read a row
-// to recompute its keys; a read-only SELECT feed that touches only some columns uses the Masked
-// variant instead.
-func (s *tableStore) RangeScanWithUnits(b keyBound, mask []bool) ([]entry, int, int, error) {
-	return s.rangeScanWithUnits(b, mask, nil)
-}
-
-// RangeScanWithUnitsMasked is RangeScanWithUnits reconstructing ONLY the touched columns (mask) —
-// the read-only SELECT feed's touched-column path (packed-leaf.md §4; the file-backed leaf skips
-// decoding untouched columns). Identical cost and identical results for any consumer that reads only
-// the touched columns; NOT for a consumer that needs the whole row (use RangeScanWithUnits).
-func (s *tableStore) RangeScanWithUnitsMasked(b keyBound, mask []bool) ([]entry, int, int, error) {
-	return s.rangeScanWithUnits(b, mask, mask)
-}
-
 // ScanWithUnits is the fused single-descent full scan: every (key, row) entry PLUS the full-scan
 // cost block — EntriesInKeyOrder + ScanUnits in one traversal (the unbounded bound visits every
-// node, so the count equals NodeCount). Whole rows (see RangeScanWithUnits).
+// node, so the count equals NodeCount). See RangeScanWithUnits.
 func (s *tableStore) ScanWithUnits(mask []bool) ([]entry, int, int, error) {
 	return s.RangeScanWithUnits(unboundedBound(), mask)
-}
-
-// ScanWithUnitsMasked is ScanWithUnits reconstructing only the touched columns (see
-// RangeScanWithUnitsMasked) — the read-only full-scan SELECT feed.
-func (s *tableStore) ScanWithUnitsMasked(mask []bool) ([]entry, int, int, error) {
-	return s.RangeScanWithUnitsMasked(unboundedBound(), mask)
 }
 
 // ColumnarScanMasked gathers the mask-selected columns of a bounded scan into dense per-column lanes
@@ -430,15 +409,15 @@ func (s *tableStore) resolveAll(row storedRow) (storedRow, error) {
 // ScanRange streams the rows whose primary key lies within the bound to visit, in key order, stopping
 // (without faulting further leaves) the moment visit returns a false `continue` — the genuine LIMIT
 // short-circuit (spec/design/cost.md §3 "LIMIT short-circuit").
-func (s *tableStore) ScanRange(b keyBound, mask []bool, visit func(key []byte, row storedRow) (bool, error)) error {
-	return s.rows.scanRange(b, s.leafSrc(), mask, visit)
+func (s *tableStore) ScanRange(b keyBound, visit func(key []byte, row storedRow) (bool, error)) error {
+	return s.rows.scanRange(b, s.leafSrc(), visit)
 }
 
 // ScanRangeRev is ScanRange in reverse: it yields the in-bound rows in DESCENDING key order — a
 // DESC reverse scan (spec/design/cost.md §3), stopping the same way on a false `continue` so a
 // reverse top-N short-circuits from the high end.
-func (s *tableStore) ScanRangeRev(b keyBound, mask []bool, visit func(key []byte, row storedRow) (bool, error)) error {
-	return s.rows.scanRangeRev(b, s.leafSrc(), mask, visit)
+func (s *tableStore) ScanRangeRev(b keyBound, visit func(key []byte, row storedRow) (bool, error)) error {
+	return s.rows.scanRangeRev(b, s.leafSrc(), visit)
 }
 
 // Entry is one stored (encoded key, row) pair.
@@ -466,6 +445,28 @@ func (s *tableStore) EntriesInKeyOrder() ([]entry, error) {
 // treeRoot is the root B-tree node of this store, for the page-backed serializer
 // (spec/fileformat/format.md). nil for an empty table.
 func (s *tableStore) treeRoot() *pnode { return s.rows.rootNode() }
+
+// demoteCleanLeaves demotes this store's clean, persisted resident leaves to OnDisk references —
+// the post-commit residency flip (bplus-reshape.md B4; pMap.demoteCleanLeaves). A no-op for a
+// store whose nodes were never persisted (a GiST leaf-key store, a bare scratch engine, a table
+// created in-session). Only meaningful on a paged store — the flipped leaves fault back through
+// the pool.
+func (s *tableStore) demoteCleanLeaves() {
+	if s.paging != nil {
+		s.rows.demoteCleanLeaves()
+	}
+}
+
+// faultLeaf faults the clean leaf at page through this store's pool — the whole-image serializer's
+// OnDisk-child materialization (format.go serializeNode; under B3 every database is demand-paged,
+// in-memory included). A store with no paging context cannot hold an OnDisk child, so the panic is
+// an internal wiring invariant.
+func (s *tableStore) faultLeaf(page uint32) (*pnode, error) {
+	if s.paging == nil {
+		panic("an OnDisk leaf implies a paged store")
+	}
+	return s.paging.faultLeaf(page, s.colTypes)
+}
 
 // setTree installs a loaded B-tree as this store's contents (format.go LoadEngine).
 func (s *tableStore) setTree(root *pnode, length int) { s.rows = fromLoaded(root, length) }

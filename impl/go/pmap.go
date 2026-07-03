@@ -36,10 +36,11 @@ import (
 // page is the on-disk page index (0 when dirty), set once at the commit that first persists it.
 type pnode struct {
 	keys [][]byte
-	// The decoded value rows — populated for a Decoded LEAF (in-memory / mutated / dirty), nil for
-	// a Packed leaf (which reconstructs on demand from packed) and for every INTERIOR node
-	// (record-free, v24). Read only through the rowAt / colAt / rowAtMasked / decodedRows seam,
-	// never indexed directly, so the two leaf forms are interchangeable (packed-leaf.md §3/§4).
+	// The decoded value rows — populated for a Decoded LEAF (a writer's transient
+	// materialize-mutate-repack buffer, or an in-memory-created table), nil for a Packed leaf
+	// (which reconstructs on demand from packed) and for every INTERIOR node (record-free, v24).
+	// Read only through the rowAt / colAt / decodedRows seam, never indexed directly, so the two
+	// leaf forms are interchangeable (packed-leaf.md §3/§4).
 	vals     []storedRow
 	weights  []uint32
 	children []childRef
@@ -69,27 +70,6 @@ func (n *pnode) colAt(i, c int) (Value, error) {
 		return n.vals[i][c], nil
 	}
 	return n.packed.value(c, i)
-}
-
-// rowAtMasked reconstructs row i decoding ONLY the columns mask selects (packed-leaf.md §4/§6). A
-// Decoded leaf returns the whole stored row; a Packed leaf leaves untouched columns NULL.
-func (n *pnode) rowAtMasked(i int, mask []bool) (storedRow, error) {
-	if n.packed == nil {
-		return n.vals[i], nil
-	}
-	return n.packed.rowMasked(i, mask)
-}
-
-// rowAtMaybeMasked is the scan-feed value-read seam: a nil mask reconstructs the whole row (rowAt),
-// a non-nil mask reconstructs only its selected columns (rowAtMasked), leaving the rest NULL. The nil
-// guard is load-bearing — rowAtMasked treats a nil/short mask as "no column selected" (all NULL), so a
-// scan with no touched-set (mask == nil) must take the full-row path. Only Packed leaves honor the
-// mask; a Decoded leaf returns its whole stored row either way (packed-leaf.md §4).
-func (n *pnode) rowAtMaybeMasked(i int, mask []bool) (storedRow, error) {
-	if mask == nil {
-		return n.rowAt(i)
-	}
-	return n.rowAtMasked(i, mask)
 }
 
 // decodedRows returns every value row of a LEAF — the mutation-descent materialization
@@ -299,6 +279,54 @@ func (m *pMap) Remove(key []byte, cap int, shape leafShape, src leafSource) (sto
 	return removed, true, nil
 }
 
+// demoteCleanLeaves demotes every clean, PERSISTED resident leaf to its OnDisk(page) child
+// reference — the post-commit residency flip (bplus-reshape.md B4): after a commit assigns page
+// ids to the dirty nodes it wrote, the committed tree sheds its leaf payloads and becomes the
+// skeletal `interior nodes + OnDisk leaves` shape every load already produces, so reads everywhere
+// go through the one Packed pool path and Decoded survives only inside an uncommitted writer. A
+// ROOT leaf stays resident (the pMap root is always a node — the open/load convention); an
+// unpersisted (page 0) leaf is left alone (defensive — a bare scratch engine that never persists).
+// Rebuilds only the interior spine above changed children; an unchanged subtree keeps its node
+// pointer (and its set-once page id), so the flip is O(interior nodes) and the flipped tree stays
+// clean for the next incremental commit.
+func (m *pMap) demoteCleanLeaves() {
+	var demote func(n *pnode) *pnode
+	demote = func(n *pnode) *pnode {
+		if n.isLeaf() {
+			return nil // handled by the parent (a root leaf stays resident)
+		}
+		changed := false
+		children := make([]childRef, 0, len(n.children))
+		for _, c := range n.children {
+			nc := c
+			if c.node != nil {
+				if c.node.isLeaf() {
+					if c.node.page != 0 {
+						changed = true
+						nc = onDiskRef(c.node.page)
+					}
+				} else if rebuilt := demote(c.node); rebuilt != nil {
+					changed = true
+					nc = residentRef(rebuilt)
+				}
+			}
+			children = append(children, nc)
+		}
+		if !changed {
+			return nil
+		}
+		// The rebuilt interior keeps its keys AND its page id — its serialized bytes are unchanged
+		// (children reference the same pages), so it must stay clean or the next incremental commit
+		// would rewrite the whole spine every time.
+		return &pnode{keys: n.keys, children: children, page: n.page}
+	}
+	if m.root != nil {
+		if rebuilt := demote(m.root); rebuilt != nil {
+			m.root = rebuilt
+		}
+	}
+}
+
 // inorder returns all (key, row) pairs in ascending key order — a leaf walk in key order (records
 // are leaf-only, v24). Eager (the cost contract charges per row in the executor loop, not here —
 // spec/design/cost.md), so laziness is unobservable. Faults each OnDisk leaf through src; the faulted
@@ -476,15 +504,18 @@ func (b keyBound) entryWindow(n *pnode) (int, int) {
 // window (entryWindow), then walks only those, so only overlapping leaves fault through src. The
 // unbounded bound walks the whole tree (identical to inorder).
 func (m *pMap) rangeEntries(b keyBound, src leafSource) ([][]byte, []storedRow, error) {
-	keys, vals, _, err := m.rangeEntriesCounted(b, src, nil)
+	keys, vals, _, err := m.rangeEntriesCounted(b, src)
 	return keys, vals, err
 }
 
 // rangeEntriesCounted is rangeEntries plus the number of B+tree nodes the bounded traversal
 // visits — the page_read count overlapNodeCount would return, observed during the ONE windowed
 // walk instead of a second counting descent (the visited sets are identical by construction:
-// both window with childWindow).
-func (m *pMap) rangeEntriesCounted(b keyBound, src leafSource, mask []bool) ([][]byte, []storedRow, int, error) {
+// both window with childWindow). The old two-form masked/unmasked reconstruction seam is
+// collapsed (bplus-reshape.md B4): a Packed leaf's reconstruction is uniformly lazy, so a
+// reconstruction mask no longer exists — the query's touched set survives as the cost basis + the
+// scan layer's resolve prefetch, and a missed value resolves on touch (the demand-fault backstop).
+func (m *pMap) rangeEntriesCounted(b keyBound, src leafSource) ([][]byte, []storedRow, int, error) {
 	var keys [][]byte
 	var vals []storedRow
 	nodes := 0
@@ -494,7 +525,7 @@ func (m *pMap) rangeEntriesCounted(b keyBound, src leafSource, mask []bool) ([][
 		if n.isLeaf() {
 			ef, el := b.entryWindow(n)
 			for i := ef; i < el; i++ {
-				row, err := n.rowAtMaybeMasked(i, mask)
+				row, err := n.rowAt(i)
 				if err != nil {
 					return err
 				}
@@ -651,13 +682,13 @@ func (m *pMap) overlapNodeCount(b keyBound) int {
 // faulted (the LIMIT short-circuit is genuine, not a post-hoc truncation — spec/design/cost.md §3
 // "LIMIT short-circuit"). Like rangeEntries it prunes non-overlapping subtrees; unlike it, it streams
 // (one row at a time, no Vec) so a bounded result holds ~one leaf resident.
-func (m *pMap) scanRange(b keyBound, src leafSource, mask []bool, visit func(key []byte, row storedRow) (bool, error)) error {
+func (m *pMap) scanRange(b keyBound, src leafSource, visit func(key []byte, row storedRow) (bool, error)) error {
 	var walk func(n *pnode) (bool, error)
 	walk = func(n *pnode) (bool, error) {
 		if n.isLeaf() {
 			ef, el := b.entryWindow(n)
 			for i := ef; i < el; i++ {
-				row, err := n.rowAtMaybeMasked(i, mask)
+				row, err := n.rowAt(i)
 				if err != nil {
 					return false, err
 				}
@@ -693,13 +724,13 @@ func (m *pMap) scanRange(b keyBound, src leafSource, mask []bool, visit func(key
 // entryWindow prune (so the visited-node set and page_read cost match), and stops the moment visit
 // returns a false `continue` without faulting leaves past the stop point (a reverse top-N faults
 // from the high end). An interior node walks its windowed children from cl down to cf.
-func (m *pMap) scanRangeRev(b keyBound, src leafSource, mask []bool, visit func(key []byte, row storedRow) (bool, error)) error {
+func (m *pMap) scanRangeRev(b keyBound, src leafSource, visit func(key []byte, row storedRow) (bool, error)) error {
 	var walk func(n *pnode) (bool, error)
 	walk = func(n *pnode) (bool, error) {
 		if n.isLeaf() {
 			ef, el := b.entryWindow(n)
 			for i := el - 1; i >= ef; i-- {
-				row, err := n.rowAtMaybeMasked(i, mask)
+				row, err := n.rowAt(i)
 				if err != nil {
 					return false, err
 				}
@@ -768,14 +799,12 @@ type rangeCursor struct {
 	bound   keyBound
 	src     leafSource
 	reverse bool
-	mask    []bool // touched-column set for leaf reconstruction; nil ⇒ whole row (rowAtMaybeMasked)
 }
 
 // rangeCursor returns a pull cursor over the (key, row) pairs within b. The first node on the stack is
-// the root (always resident); descendants fault through src on descent. mask is the query's touched
-// set (nil ⇒ whole row). See rangeCursor (the type).
-func (m *pMap) rangeCursor(b keyBound, src leafSource, reverse bool, mask []bool) *rangeCursor {
-	c := &rangeCursor{bound: b, src: src, reverse: reverse, mask: mask}
+// the root (always resident); descendants fault through src on descent. See rangeCursor (the type).
+func (m *pMap) rangeCursor(b keyBound, src leafSource, reverse bool) *rangeCursor {
+	c := &rangeCursor{bound: b, src: src, reverse: reverse}
 	if m.root != nil {
 		c.stack = append(c.stack, newScanFrame(m.root, b))
 	}
@@ -803,7 +832,7 @@ func (c *rangeCursor) next() (key []byte, row storedRow, ok bool, err error) {
 			fr.lo++
 		}
 		if fr.isLeaf {
-			row, err := fr.node.rowAtMaybeMasked(p, c.mask)
+			row, err := fr.node.rowAt(p)
 			if err != nil {
 				return nil, nil, false, err
 			}

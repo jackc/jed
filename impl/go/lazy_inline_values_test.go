@@ -357,7 +357,7 @@ func TestLazyInlineFaultedLeafSharesPageBlock(t *testing.T) {
 	// Fault the leaf → Packed form (packed-leaf.md §5): the block + PAX directories are retained and
 	// NO value is decoded (the decoded row vector is empty), so rows are reconstructed on demand.
 	// Reconstruction produces the same inline-deferred Unfetched (form (a)) the eager fault used to.
-	node, err := decodeLeafNode(block, 2, colTypes)
+	node, err := decodeLeafNode(block, 2, colTypes, nil)
 	if err != nil {
 		t.Fatalf("decodeLeafNode: %v", err)
 	}
@@ -405,12 +405,14 @@ func TestLazyInlineFaultedLeafSharesPageBlock(t *testing.T) {
 	}
 }
 
-// TestPackedLeafReconstructsOnlyTouchedColumns — the touched-column path (packed-leaf.md §4/§6, the
-// PAX dividend): colAt / rowAtMasked reconstruct ONLY the requested columns of a Packed leaf,
-// byte-identically to the whole-row reconstruction, leaving untouched columns unread. Mirrors the
-// Rust packed_leaf_reconstructs_only_touched_columns. (colAt/rowAtMasked are S3-ready — built here,
-// not yet driven by the executor.)
-func TestPackedLeafReconstructsOnlyTouchedColumns(t *testing.T) {
+// TestPackedLeafTouchedColumnsAndSelfResolution — the touched-column path (packed-leaf.md §4/§6,
+// the PAX dividend): colAt reconstructs ONLY the requested column of a Packed leaf,
+// byte-identically to the whole-row reconstruction — plus the B4 demand-fault backstop
+// (bplus-reshape.md §5): a deferred value carries its own resolution handles, so
+// resolveUnfetchedSelf reconstructs it with NO caller-supplied type or pager — the path the
+// evaluator's column access takes when the static touched set missed. Mirrors the Rust
+// packed_leaf_reconstructs_only_touched_columns.
+func TestPackedLeafTouchedColumnsAndSelfResolution(t *testing.T) {
 	colTypes := []colType{
 		scalarColType(scalarInt32),
 		scalarColType(scalarText),
@@ -436,7 +438,7 @@ func TestPackedLeafReconstructsOnlyTouchedColumns(t *testing.T) {
 		t.Fatalf("values must stay inline, got %d overflow pages", len(ovf))
 	}
 	block := makePage(ps, pageLeaf, uint32(len(rows)), 0, payload)
-	node, err := decodeLeafNode(block, 2, colTypes)
+	node, err := decodeLeafNode(block, 2, colTypes, nil)
 	if err != nil {
 		t.Fatalf("decodeLeafNode: %v", err)
 	}
@@ -470,16 +472,19 @@ func TestPackedLeafReconstructsOnlyTouchedColumns(t *testing.T) {
 				t.Fatalf("row %d col %d: colAt differs from whole row", i, c)
 			}
 		}
-		// rowAtMasked decodes only the masked columns; the rest stay NULL (unread).
-		masked, err := node.rowAtMasked(i, []bool{false, true, false})
-		if err != nil {
-			t.Fatalf("rowAtMasked %d: %v", i, err)
-		}
-		if masked[0].Kind != ValNull || masked[2].Kind != ValNull {
-			t.Fatalf("row %d: unmasked columns must be NULL (unread), got %v / %v", i, masked[0].Kind, masked[2].Kind)
-		}
-		if !bytes.Equal(resolve(masked[1], 1), resolve(whole[1], 1)) {
-			t.Fatalf("row %d: masked column 1 differs from whole row", i)
+		// The B4 demand-fault backstop: a deferred value carries its own resolution handles, so
+		// resolveUnfetchedSelf reconstructs it with NO caller-supplied type or pager.
+		for c := range colTypes {
+			if whole[c].Kind != ValUnfetched {
+				continue
+			}
+			got, err := resolveUnfetchedSelf(whole[c].unfetched())
+			if err != nil {
+				t.Fatalf("row %d col %d: self-resolve: %v", i, c, err)
+			}
+			if !bytes.Equal(encodeValue(colTypes[c], got), resolve(whole[c], c)) {
+				t.Fatalf("row %d col %d: self-resolution differs from context resolution", i, c)
+			}
 		}
 	}
 }

@@ -800,12 +800,10 @@ func (s *snapshot) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
 	var body []bodyPage
 	rootDataPage := make([]uint32, len(keys))
 	indexRoots := make([][]uint32, len(keys))
-	// Index trees have no value columns — encode against an empty colTypes.
-	var indexColTypes []colType
 	nextIndex := rootPage
 	for ti, k := range keys {
 		if root := s.stores[k].treeRoot(); root != nil {
-			rp, np, err := serializeNode(root, s.stores[k].colTypes, capacity, nextIndex, &body)
+			rp, np, err := serializeNode(root, s.stores[k], capacity, nextIndex, &body)
 			if err != nil {
 				return nil, err
 			}
@@ -827,8 +825,8 @@ func (s *snapshot) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
 					body = append(body, bodyPage{index: p.pageNo, pageType: p.pageType, itemCount: p.itemCount, nextPage: 0, payload: p.payload})
 				}
 				r = root
-			} else if root := s.indexStores[strings.ToLower(idx.Name)].treeRoot(); root != nil {
-				rp, np, err := serializeNode(root, indexColTypes, capacity, nextIndex, &body)
+			} else if istore := s.indexStores[strings.ToLower(idx.Name)]; istore.treeRoot() != nil {
+				rp, np, err := serializeNode(istore.treeRoot(), istore, capacity, nextIndex, &body)
 				if err != nil {
 					return nil, err
 				}
@@ -950,17 +948,23 @@ func serializeGistIndex(s *snapshot, table *catTable, idx indexDef, alloc func()
 // this node's assigned page index and the next free index. A leaf's payload is its records; an
 // interior's is its N+1 child pointers (big-endian u32) then its N records (format.md). A node whose
 // payload would exceed the page is an oversized record (over RECORD_MAX) — feature_not_supported.
-func serializeNode(n *pnode, colTypes []colType, capacity int, nextIndex uint32, body *[]bodyPage) (uint32, uint32, error) {
+func serializeNode(n *pnode, store *tableStore, capacity int, nextIndex uint32, body *[]bodyPage) (uint32, uint32, error) {
+	colTypes := store.colTypes
 	childPages := make([]uint32, len(n.children))
 	for i, c := range n.children {
-		// Whole-image serialize renumbers pages from scratch and runs only on a fully-resident
-		// in-memory database (create's empty image, the golden generator) — a paged file commits
-		// incrementally via serializeDirty. An OnDisk child would carry a page id from a different
-		// layout, so it must not appear here.
-		if c.node == nil {
-			panic("whole-image serialize hit an OnDisk leaf")
+		// Whole-image serialize renumbers pages from scratch. Under B3 (bplus-reshape.md) every
+		// database — in-memory included — is demand-paged, so a clean leaf may be an OnDisk
+		// reference into the source store: fault it through the store's pool for the duration of
+		// its own serialization (whole-image serialize is not a hot path).
+		child := c.node
+		if child == nil {
+			faulted, err := store.faultLeaf(c.page)
+			if err != nil {
+				return 0, 0, err
+			}
+			child = faulted
 		}
-		cp, np, err := serializeNode(c.node, colTypes, capacity, nextIndex, body)
+		cp, np, err := serializeNode(child, store, capacity, nextIndex, body)
 		if err != nil {
 			return 0, 0, err
 		}
@@ -982,14 +986,22 @@ func serializeNode(n *pnode, colTypes []colType, capacity int, nextIndex uint32,
 		pageType = pageInterior
 		payload = encodeInterior(n.keys, childPages)
 	} else {
-		// A leaf may be Packed here: a demand-paged reopen faults a single-leaf table's root leaf
-		// resident (readSkeleton), and toImage re-serializes it. Materialize through the seam
-		// (decodedRows reconstructs a Packed leaf, clones a Decoded one). Whole-image serialize is not
-		// a hot path (create's empty image / golden generator / toImage canonical), so the
-		// Decoded-case clone is acceptable (packed-leaf.md §7).
+		// A leaf may be Packed here: a demand-paged load keeps leaves as page blocks and toImage
+		// re-serializes them. Materialize through the seam (decodedRows reconstructs a Packed leaf,
+		// clones a Decoded one), then resolve any lazily-deferred large values through the store's
+		// pager (large-values.md §14) so encode sees resident bytes. Whole-image serialize is not a
+		// hot path (create's empty image / golden generator / toImage canonical), so the clones are
+		// acceptable (packed-leaf.md §7).
 		rows, err := n.decodedRows()
 		if err != nil {
 			return 0, 0, err
+		}
+		for ri := range rows {
+			resolved, err := store.resolveAll(rows[ri])
+			if err != nil {
+				return 0, 0, err
+			}
+			rows[ri] = resolved
 		}
 		payload = encodeLeafPAX(colTypes, n.keys, rows, capacity, take, &ovf)
 	}
@@ -1252,8 +1264,15 @@ func serializeDirty(n *pnode, colTypes []colType, capacity, ps int, alloc *pageA
 	return index, nil
 }
 
-// LoadEngine reconstructs a database from an on-disk image (inverse of ToImage).
-// Returns a structured data_corrupted (XX001) error for malformed input.
+// LoadEngine reconstructs a database from an on-disk image (inverse of ToImage). Returns a
+// structured data_corrupted (XX001) error for malformed input.
+//
+// B3 (bplus-reshape.md): the image becomes the engine's byte store — a memoryBlockStore read
+// through the SAME demand-paged loader, pager, and Packed leaf path as a file (one read path; the
+// eager whole-image readTree loader is gone). The pool is pinned (unbounded): an in-memory
+// database is resident by definition (§5), so CacheBytes bounds only file-backed eviction and the
+// observable default is unchanged. Basic image validation stays up front so a malformed image is
+// XX001 before any store is built.
 func loadEngine(image []byte) (*engine, error) {
 	if len(image) < 12 {
 		return nil, newError(DataCorrupted, "image smaller than a meta header")
@@ -1262,157 +1281,11 @@ func loadEngine(image []byte) (*engine, error) {
 	if !pageSizeValid(pageSize) || len(image) < pageSize*2 {
 		return nil, newError(DataCorrupted, "invalid page size")
 	}
-	mt, err := selectMeta(image, pageSize)
+	p, err := pagerFromStore(newMemoryBlockStore(image))
 	if err != nil {
 		return nil, err
 	}
-
-	// Build the committed snapshot from the image, then wrap it in a fresh handle that adopts the
-	// file's serialization parameters (spec/design/api.md §2).
-	snap := newSnapshot()
-	snap.txid = mt.txid
-	// Reconstruct the free-list (P6.2): collect every page reachable from the committed root — the
-	// catalog chain plus each table's B-tree nodes — as we load it; the rest of [2, pageCount) is dead
-	// space the next incremental commit may reuse (spec/fileformat/format.md *Reclamation*).
-	reached := make(map[uint32]bool)
-	catPage := mt.rootPage
-	for catPage != 0 {
-		reached[catPage] = true
-		pg, err := readPage(image, pageSize, catPage)
-		if err != nil {
-			return nil, err
-		}
-		if pg.pageType != pageCatalog {
-			return nil, newError(DataCorrupted, "expected a catalog page")
-		}
-		pos := 0
-		for i := uint32(0); i < pg.itemCount; i++ {
-			// Each catalog entry is kind-tagged (v9): 1 = a composite-type entry (registered now;
-			// its nested refs are validated after the full walk), 0 = a table entry.
-			kind, err := readU8(pg.payload, &pos)
-			if err != nil {
-				return nil, err
-			}
-			if kind == 1 {
-				ct, err := decodeCompositeTypeEntry(pg.payload, &pos)
-				if err != nil {
-					return nil, err
-				}
-				snap.putType(ct)
-				continue
-			}
-			if kind == 2 {
-				// A sequence entry (v12): self-contained, registered directly (no two-pass).
-				sq, err := decodeSequenceEntry(pg.payload, &pos)
-				if err != nil {
-					return nil, err
-				}
-				snap.putSequence(sq)
-				continue
-			}
-			if kind == 3 {
-				// A collation snapshot (v17): the baked .coll artifact + an is_default flag
-				// (spec/design/collation.md §5). The default restores the per-database default.
-				coll, isDefault, err := decodeCollationEntry(pg.payload, &pos)
-				if err != nil {
-					return nil, err
-				}
-				if isDefault {
-					snap.defaultCollation = coll.Name
-				}
-				snap.collations[coll.Name] = coll
-				continue
-			}
-			if kind != 0 {
-				return nil, newError(DataCorrupted, "unknown catalog entry kind")
-			}
-			table, tableRoot, indexRoots, err := decodeTableEntry(pg.payload, &pos)
-			if err != nil {
-				return nil, err
-			}
-			name := table.Name
-			hasPK := len(table.PKIndices()) > 0
-			snap.putTable(table, uint32(pageSize))
-			// The store resolved each column's ColType from the (types-first) catalog at putTable; the
-			// codec reads it back rather than re-walking the type catalog (spec/design/composite.md §3).
-			colTypes := snap.stores[strings.ToLower(name)].colTypes
-			if tableRoot != 0 {
-				root, length, err := readTree(image, pageSize, tableRoot, colTypes, reached)
-				if err != nil {
-					return nil, err
-				}
-				store := snap.stores[strings.ToLower(name)]
-				store.setTree(root, length)
-				// No-PK keys are synthetic i64 rowids — advance the counter past the largest (the
-				// last entry in key order) so future inserts don't collide. In-memory load (nil
-				// source) never faults, so the error is inert.
-				if !hasPK && length > 0 {
-					keys, _, err := store.rows.inorder(nil)
-					if err != nil {
-						return nil, err
-					}
-					store.BumpRowidTo(decodeInt(scalarInt64, keys[len(keys)-1]) + 1)
-				}
-			}
-			// The table's index trees (v5): zero-column stores of entry keys
-			// (spec/design/indexes.md §3), reachable pages included in the walk.
-			for k, idx := range table.Indexes {
-				istore := newTableStore(pageSize-pageHeader, nil)
-				if indexRoots[k] != 0 {
-					if idx.Kind == indexGist {
-						// GiST: parse the persisted R-tree (pages 5/6), marking its pages reached, and
-						// recover its leaf keys to repopulate the flat leaf store. The resident R-tree is
-						// rebuilt canonically below (rebuildGistTrees).
-						var keys [][]byte
-						read := func(p uint32) (byte, uint32, []byte, error) {
-							pg, err := readPage(image, pageSize, p)
-							if err != nil {
-								return 0, 0, nil, err
-							}
-							return pg.pageType, pg.itemCount, pg.payload, nil
-						}
-						if err := readGistLeafKeys(read, indexRoots[k], reached, &keys); err != nil {
-							return nil, err
-						}
-						for _, key := range keys {
-							if _, err := istore.Insert(key, nil); err != nil {
-								return nil, err
-							}
-						}
-					} else {
-						root, length, err := readTree(image, pageSize, indexRoots[k], nil, reached)
-						if err != nil {
-							return nil, err
-						}
-						istore.setTree(root, length)
-					}
-				}
-				snap.putIndexStore(strings.ToLower(idx.Name), istore)
-			}
-		}
-		catPage = pg.nextPage
-	}
-	// Two-pass: validate the composite-type catalog (existence + acyclicity) now that every type
-	// entry has been read (spec/design/composite.md §3); a bad reference is XX001.
-	if err := snap.validateCompositeTypes(); err != nil {
-		return nil, err
-	}
-	// Build each GiST index's resident R-tree from its now-loaded leaf store (gist.md §4.1).
-	if err := snap.rebuildGistTrees(); err != nil {
-		return nil, err
-	}
-	db := newEngine()
-	db.pageSize = uint32(pageSize)
-	db.pageCount = mt.pageCount // the on-disk high-water for the next incremental commit
-	// The free-list: every body page [2, pageCount) the committed root does not reach (P6.2).
-	// Ascending by construction, so the allocator reuses lowest-first.
-	for p := rootPage; p < mt.pageCount; p++ {
-		if !reached[p] {
-			db.freePages = append(db.freePages, p)
-		}
-	}
-	db.committed = snap
-	return db, nil
+	return loadEnginePaged(p, math.MaxInt)
 }
 
 // LoadEnginePaged opens a file-backed database demand-paged (spec/design/pager.md, P6.4b): it loads
@@ -1674,7 +1547,9 @@ func collectLeafOverflow(paging *sharedPaging, pageIdx uint32, colTypes []colTyp
 					return err
 				}
 				p := 0
-				v, err := readValueLazy(ty, vb, &p)
+				// The value is discarded right after markChains (only its chain pages matter), so
+				// the paging resolution handle is deliberately dead (nil).
+				v, err := readValueLazy(colTypes, c, vb, &p, nil)
 				if err != nil {
 					return err
 				}
@@ -1796,98 +1671,6 @@ func readSeparators(payload []byte, pos *int, n int) ([][]byte, error) {
 	}
 	*pos = blob + int(prev)
 	return keys, nil
-}
-
-// readTree reads a table's on-disk B+tree (rooted at pageIdx) into an in-memory tree, returning the
-// root node and the total row count (spec/fileformat/format.md). An interior node is the v24
-// record-free routing skeleton (child pointers + separators); records live only in leaves. Each
-// leaf weight is read off the directories (key_len + Σ value_len — the v24 record_size), exactly
-// what the writer split on, so the loaded tree is ready for further size-driven splits.
-func readTree(image []byte, ps int, pageIdx uint32, colTypes []colType, reached map[uint32]bool) (*pnode, int, error) {
-	reached[pageIdx] = true
-	pg, err := readPage(image, ps, pageIdx)
-	if err != nil {
-		return nil, 0, err
-	}
-	fetch := func(p uint32) ([]byte, error) { return pageBlock(image, ps, p) }
-	switch pg.pageType {
-	case pageLeaf:
-		n := int(pg.itemCount)
-		leaf, err := parsePaxLeaf(pg.payload, n, colTypes)
-		if err != nil {
-			return nil, 0, err
-		}
-		keys, vals, weights := make([][]byte, 0, n), make([]storedRow, 0, n), make([]uint32, 0, n)
-		for i := 0; i < n; i++ {
-			key := make([]byte, len(leaf.keys[i]))
-			copy(key, leaf.keys[i])
-			row := make(storedRow, len(colTypes))
-			w := len(key)
-			var ovf []uint32
-			for c, ty := range colTypes {
-				w += leaf.valueLen(c, i)
-				if leaf.isNull(c, i) {
-					row[c] = NullValue()
-					continue
-				}
-				vb, err := leaf.value(c, i)
-				if err != nil {
-					return nil, 0, err
-				}
-				p := 0
-				if _, fixed := fixedValueWidth(ty); fixed {
-					// A fixed-width slot is the untagged inline body.
-					v, err := readInlineBody(ty, vb, &p, decodeConstruct)
-					if err != nil {
-						return nil, 0, err
-					}
-					row[c] = v
-				} else {
-					// A variable value's span is its tagged codec bytes; external chains are
-					// gathered eagerly here (the fully-resident in-memory load).
-					v, err := readValue(ty, vb, &p, fetch, &ovf)
-					if err != nil {
-						return nil, 0, err
-					}
-					row[c] = v
-				}
-			}
-			weights = append(weights, uint32(w))
-			for _, p := range ovf {
-				reached[p] = true
-			}
-			keys = append(keys, key)
-			vals = append(vals, row)
-		}
-		return &pnode{keys: keys, vals: vals, weights: weights, page: pageIdx}, n, nil
-	case pageInterior:
-		n := int(pg.itemCount)
-		pos := 0
-		children := make([]childRef, 0, n+1)
-		total := 0
-		for i := 0; i < n+1; i++ {
-			cp, err := readU32(pg.payload, &pos)
-			if err != nil {
-				return nil, 0, err
-			}
-			child, clen, err := readTree(image, ps, cp, colTypes, reached)
-			if err != nil {
-				return nil, 0, err
-			}
-			// The in-memory load is fully resident (no pager to fault from); the demand-paged file
-			// load (LoadEnginePaged) is a separate path that leaves leaf children OnDisk.
-			children = append(children, residentRef(child))
-			total += clen
-		}
-		// v24: the record-free routing skeleton — separators carry no values or chains.
-		keys, err := readSeparators(pg.payload, &pos, n)
-		if err != nil {
-			return nil, 0, err
-		}
-		return &pnode{keys: keys, children: children, page: pageIdx}, total, nil
-	default:
-		return nil, 0, newError(DataCorrupted, "expected a B-tree node page")
-	}
 }
 
 // isSpillable reports whether a value of this type can be stored out-of-line (a variable-length
@@ -3367,7 +3150,11 @@ func (l *paxLeaf) valueLen(c, i int) int {
 type packedLeaf struct {
 	dirs     *paxLeaf
 	colTypes []colType
-	n        int
+	// paging is the database's shared pager — stamped into each deferred external value so it can
+	// self-resolve at the evaluator's column access (the B4 demand-fault backstop,
+	// bplus-reshape.md §5). A plain pointer (GC — no Rust-style weak ref needed).
+	paging *sharedPaging
+	n      int
 }
 
 // value reconstructs value (record i, column c) — the O(1) PAX column span (packed-leaf.md §4). A
@@ -3388,7 +3175,7 @@ func (p *packedLeaf) value(c, i int) (Value, error) {
 	if _, fixed := fixedValueWidth(p.colTypes[c]); fixed {
 		return readInlineBody(p.colTypes[c], vb, &pos, decodeConstruct)
 	}
-	return readValueLazy(p.colTypes[c], vb, &pos)
+	return readValueLazy(p.colTypes, c, vb, &pos, p.paging)
 }
 
 // row reconstructs the whole value row i (every column). The rowAt whole-record path.
@@ -3404,32 +3191,13 @@ func (p *packedLeaf) row(i int) (storedRow, error) {
 	return row, nil
 }
 
-// rowMasked reconstructs row i decoding ONLY the columns mask selects (the touched-column path,
-// packed-leaf.md §4/§6 — the OP_Column model). Untouched columns are left NULL and their bytes are
-// never read. S3-ready: built for the touched-column scan wiring, not yet driven by the executor.
-func (p *packedLeaf) rowMasked(i int, mask []bool) (storedRow, error) {
-	row := make(storedRow, len(p.colTypes))
-	for c := range p.colTypes {
-		if c < len(mask) && mask[c] {
-			v, err := p.value(c, i)
-			if err != nil {
-				return nil, err
-			}
-			row[c] = v
-		} else {
-			row[c] = NullValue()
-		}
-	}
-	return row, nil
-}
-
 // decodeLeafNode decodes a single leaf page block into a resident node, for the demand-paging fault
 // path (spec/design/pager.md §4; paging.go faultLeaf). block is one page; page is its page id, stamped
 // on the node so a later incremental commit keeps it clean. Decoding is LAZY (large-values.md §14):
 // an external/compressed value becomes an Unfetched reference — no chain read, no decompression —
-// resolved later only for the columns a query touches. Each weight is the bytes the record occupies
-// on the page (exactly the writer's recordSize).
-func decodeLeafNode(block []byte, pageID uint32, colTypes []colType) (*pnode, error) {
+// resolved later only for the columns a query touches (or on demand at the evaluator's column
+// access — the B4 backstop; paging is stamped into every deferred value for that).
+func decodeLeafNode(block []byte, pageID uint32, colTypes []colType, paging *sharedPaging) (*pnode, error) {
 	pg, err := parsePage(block)
 	if err != nil {
 		return nil, err
@@ -3461,7 +3229,7 @@ func decodeLeafNode(block []byte, pageID uint32, colTypes []colType) (*pnode, er
 		weights = append(weights, uint32(w))
 		keys = append(keys, key)
 	}
-	packed := &packedLeaf{dirs: leaf, colTypes: colTypes, n: n}
+	packed := &packedLeaf{dirs: leaf, colTypes: colTypes, paging: paging, n: n}
 	return &pnode{keys: keys, weights: weights, packed: packed, page: pageID}, nil
 }
 
@@ -3882,12 +3650,17 @@ func decodeTableEntry(buf []byte, pos *int) (*catTable, uint32, []uint32, error)
 	return &catTable{Name: name, Columns: columns, PK: pk, Checks: checks, Indexes: indexes, ForeignKeys: foreignKeys, Exclusions: exclusions}, root, indexRoots, nil
 }
 
-// readValueLazy reads one value lazily (spec/design/large-values.md §14): inline-plain and NULL
-// decode as today, but an external/compressed form becomes an Unfetched reference holding exactly
-// the record's pointer fields — no chain read, no decompression. The scan layer resolves the
-// references for the columns a query touches (resolveUnfetched); the commit path resolves the
-// rest when a dirty leaf re-encodes (resolveForEncode).
-func readValueLazy(ty colType, buf []byte, pos *int) (Value, error) {
+// readValueLazy reads one value (column c of a table with the shared resolved types) lazily
+// (spec/design/large-values.md §14): inline-plain and NULL decode as today, but an
+// external/compressed form becomes an Unfetched reference holding exactly the record's pointer
+// fields — no chain read, no decompression. Every deferred reference is stamped with its
+// resolution handles (types+c always, paging on the external forms — bplus-reshape.md §5, B4) so
+// it can self-resolve at the evaluator's column access. The scan layer resolves the references
+// for the columns a query touches (resolveUnfetched); the commit path resolves the rest when a
+// dirty leaf re-encodes (resolveForEncode); a touched-set miss resolves on demand
+// (resolveUnfetchedSelf).
+func readValueLazy(types []colType, c int, buf []byte, pos *int, paging *sharedPaging) (Value, error) {
+	ty := types[c]
 	tag, err := readU8(buf, pos)
 	if err != nil {
 		return Value{}, err
@@ -3910,7 +3683,7 @@ func readValueLazy(ty colType, buf []byte, pos *int) (Value, error) {
 			if err != nil {
 				return Value{}, err
 			}
-			return Value{Kind: ValUnfetched, ref: &Unfetched{Form: 0x00, Comp: span}}, nil
+			return Value{Kind: ValUnfetched, ref: &Unfetched{Form: 0x00, Comp: span, types: types, typeIdx: c}}, nil
 		}
 		return readInlineBody(ty, buf, pos, decodeConstruct)
 	case 0x01:
@@ -3924,7 +3697,7 @@ func readValueLazy(ty colType, buf []byte, pos *int) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
-		return Value{Kind: ValUnfetched, ref: &Unfetched{Form: tagExternal, FirstPage: first, StoredLen: length}}, nil
+		return Value{Kind: ValUnfetched, ref: &Unfetched{Form: tagExternal, FirstPage: first, StoredLen: length, types: types, typeIdx: c, paging: paging}}, nil
 	case tagInlineComp:
 		rawLen, err := readU32(buf, pos)
 		if err != nil {
@@ -3940,7 +3713,7 @@ func readValueLazy(ty colType, buf []byte, pos *int) (Value, error) {
 		}
 		comp := make([]byte, len(compSlice))
 		copy(comp, compSlice)
-		return Value{Kind: ValUnfetched, ref: &Unfetched{Form: tagInlineComp, RawLen: rawLen, Comp: comp}}, nil
+		return Value{Kind: ValUnfetched, ref: &Unfetched{Form: tagInlineComp, RawLen: rawLen, Comp: comp, types: types, typeIdx: c}}, nil
 	case tagExternalComp:
 		first, err := readU32(buf, pos)
 		if err != nil {
@@ -3954,7 +3727,7 @@ func readValueLazy(ty colType, buf []byte, pos *int) (Value, error) {
 		if err != nil {
 			return Value{}, err
 		}
-		return Value{Kind: ValUnfetched, ref: &Unfetched{Form: tagExternalComp, FirstPage: first, StoredLen: stored, RawLen: rawLen}}, nil
+		return Value{Kind: ValUnfetched, ref: &Unfetched{Form: tagExternalComp, FirstPage: first, StoredLen: stored, RawLen: rawLen, types: types, typeIdx: c, paging: paging}}, nil
 	default:
 		return Value{}, newError(DataCorrupted, "invalid value presence tag")
 	}
@@ -3996,6 +3769,34 @@ func resolveUnfetched(ty colType, u *Unfetched, fetch func(uint32) ([]byte, erro
 		return valueFromPayload(ty, payload)
 	default:
 		return Value{}, newError(DataCorrupted, "invalid unfetched value form")
+	}
+}
+
+// resolveUnfetchedSelf resolves a deferred value FROM ITS OWN CARRIED HANDLES — the B4
+// demand-fault backstop (bplus-reshape.md §5/§6): the evaluator's column access calls this when
+// the static touched set missed a value, so a prediction miss is a deterministic on-demand fetch —
+// never a NULL-fold, never wrong rows. The fetch is deliberately UNMETERED (metering it would make
+// cost depend on prediction quality rather than the spec'd static set — §6); the touched set stays
+// the cost basis + prefetch hint. A spill-run-file reload carries the nil sentinel handles
+// (spill.go — it rides the sort output unread by contract), so touching one stays the loud pre-B4
+// poison.
+func resolveUnfetchedSelf(u *Unfetched) (Value, error) {
+	if u.types == nil {
+		panic("BUG: unfetched large value escaped the storage layer (spill pass-through)")
+	}
+	ty := u.types[u.typeIdx]
+	switch u.Form {
+	case 0x00, tagInlineComp:
+		// Inline forms own their bytes — no pager involved (resolveUnfetched never calls fetch).
+		return resolveUnfetched(ty, u, nil)
+	default:
+		// A deferred external value is reachable only through a snapshot whose stores hold the
+		// paging pointer, so a stamped handle is always live while the value is observable.
+		if u.paging == nil {
+			panic("BUG: deferred external value carries no pager handle")
+		}
+		fetch := func(p uint32) ([]byte, error) { return u.paging.readBlock(p) }
+		return resolveUnfetched(ty, u, fetch)
 	}
 }
 

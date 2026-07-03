@@ -479,7 +479,7 @@ func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, env *evalEnv
 // lanes at that row index, untouched columns left NULL), so the predicate's operator_eval charges and
 // its 3VL survivor test (keep iff TRUE) are byte-identical to the scalar WHERE loop — and the result is
 // identical too, because the row path also feeds the filter a MASKED row (untouched columns NULL via
-// resolveColumns / rowAtMasked) and the filter references only masked columns (collectTouched includes
+// resolveColumns) and the filter references only masked columns (collectTouched includes
 // plan.filter), so a scratch row filled from the lanes is the same input. The one reusable scratch row
 // is the allocation win: no full-width storedRow per scanned row, only the int32 survivor indices. The
 // caller has verified no touched column spills, so every masked lane is a non-nil []Value of length

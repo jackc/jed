@@ -33,10 +33,11 @@ package jed
 //         statement, publishes, releases; BEGIN/COMMIT/ROLLBACK open and end an explicit block.
 //
 // File-backed sharing (7c) reuses the same publish point plus the §9 persist chokepoint: the
-// shared core now carries the storage identity (path / page size / pager+buffer-pool / the mutable
-// page accounting) in a *storage, and a writer's publish routes through sharedCore.persist — the
-// incremental copy-on-write file.go recipe, driven by the shared core under the writer gate (a
-// no-op in-memory). Readers' snapshot isolation comes for free from the persistent (copy-on-write)
+// shared core carries the storage identity (path / page size / pager+buffer-pool / the mutable
+// page accounting) in a *storage — since B3 (bplus-reshape.md) EVERY core has one, file- or
+// memory-backed — and a writer's publish routes through sharedCore.persist: the incremental
+// copy-on-write file.go recipe, driven by the shared core under the writer gate (an in-memory
+// core packs the same dirty pages into its memoryBlockStore — one commit path). Readers' snapshot isolation comes for free from the persistent (copy-on-write)
 // stores (pmap.go): a pinned snapshot is immutable and shares structure with later versions, so
 // pinning is a pointer Load and readers concurrently reading it race-free, faulting clean pages
 // through the mutex-guarded sharedPaging alongside the committing writer. Page reclamation stays
@@ -79,44 +80,43 @@ type sharedCore struct {
 	// Its minimum key is the reclamation watermark (several readers may pin the same version).
 	liveMu sync.Mutex
 	live   map[uint64]int
-	// storage is the storage identity for a file-backed database (spec/design/session.md §2.4); nil is
-	// in-memory (persist is then a no-op). Its mutable page accounting is touched only under the writer
-	// gate, so its own mutex is uncontended; paging itself is goroutine-safe (sharedPaging).
+	// storage is the storage identity (spec/design/session.md §2.4) — since B3 (bplus-reshape.md)
+	// every core has one, file- or memory-backed. Its mutable page accounting is touched only under
+	// the writer gate, so its own mutex is uncontended; paging itself is goroutine-safe
+	// (sharedPaging).
 	storage *storage
-	// memPageSize is the page size minted sessions serialize/split at when this core is IN-MEMORY
-	// (storage == nil); the file's page size wins when file-backed. The default for a normal in-memory
-	// database; NewInMemoryWithPageSize sets it so byte-level fixtures/tests build at the size they
-	// serialize to (CLAUDE.md §8).
-	memPageSize uint32
 }
 
-// storage is the storage identity of a file-backed database (spec/design/session.md §2.4): the open
-// pager + leaf buffer pool and the mutable page accounting, shared by every session over the one
-// file. nil on a sharedCore means in-memory. pageCount/freePages are mutated only under the writer
-// gate (so mu is uncontended); paging is itself goroutine-safe, so readers fault pages concurrently
-// with the committing writer.
+// storage is the storage identity of a database (spec/design/session.md §2.4; bplus-reshape.md B3):
+// the open pager + leaf buffer pool and the mutable page accounting, shared by every session over
+// the one byte store. Since B3 EVERY database has one — a file-backed database over a
+// fileBlockStore, an in-memory database over a memoryBlockStore (with a pinned, unbounded pool —
+// an in-memory database is resident by definition) — so the commit path is one path: persist packs
+// dirty pages into the store either way, and the store's sync is what durability means for that
+// host (a no-op in memory). pageCount/freePages are mutated only under the writer gate (so mu is
+// uncontended); paging is itself goroutine-safe, so readers fault pages concurrently with the
+// committing writer.
 type storage struct {
 	mu        sync.Mutex // guards pageCount/freePages (the writer-gate-serialized page accounting)
 	pageSize  uint32     // fixed into the file at creation
 	pageCount uint32     // on-disk high-water; persisted in the meta slot
 	freePages []uint32   // reconstruct-on-open free-list (P6.2) — reused lowest-first, trivially watermark-safe
 	paging    *sharedPaging
-	readOnly  bool   // opened read-only (api.md §2.1): every session is then read-only, a write is 25006
-	path      string // the backing file path (surfaced by Database.Path / Session.Path)
+	readOnly  bool   // opened read-only (api.md §2.1): every session is then read-only, a write is 25006. Always false in-memory.
+	path      string // the backing file path; "" for an in-memory database (surfaced by Database.Path / Session.Path)
 }
 
-// persist durably publishes snap to the backing file via an incremental copy-on-write commit
-// (file.go persist, transactions.md §9) — the file-backed publish chokepoint. In-memory (no storage)
-// is a no-op success. Called from Session.publish under the writer gate, so the pageCount/freePages
-// mutation is single-writer. Writes the dirty pages this commit introduced (reusing reconstruct-on-
-// open free-list pages first), Syncs, publishes the alternate meta slot (snap.txid & 1), Syncs. A
+// persist durably publishes snap to the backing store via an incremental copy-on-write commit
+// (file.go persist, transactions.md §9) — the publish chokepoint for every host (bplus-reshape.md
+// B3): a file-backed core pwrites + fdatasyncs; an in-memory core packs the same dirty pages into
+// its memoryBlockStore, whose sync is a no-op — the file commit minus durability, one code path.
+// Called from Session.publish under the writer gate, so the pageCount/freePages mutation is
+// single-writer. Writes the dirty pages this commit introduced (reusing reconstruct-on-open
+// free-list pages first), Syncs, publishes the alternate meta slot (snap.txid & 1), Syncs. A
 // crash between the two syncs leaves the prior meta intact (copy-on-write: reused pages are reachable
 // from no live snapshot). pageCount/freePages advance only after both syncs succeed.
 func (c *sharedCore) persist(snap *snapshot) error {
 	st := c.storage
-	if st == nil {
-		return nil // in-memory: the committed swap is the whole commit
-	}
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	write, err := snap.incrementalImage(st.pageSize, st.pageCount, st.freePages, st.paging)
@@ -151,43 +151,35 @@ func (c *sharedCore) persist(snap *snapshot) error {
 }
 
 // readOnlyMode reports whether this core is a read-only file-backed database (a write is 25006).
-func (c *sharedCore) readOnlyMode() bool { return c.storage != nil && c.storage.readOnly }
+// In-memory cores are always writable.
+func (c *sharedCore) readOnlyMode() bool { return c.storage.readOnly }
 
-// pageSize is the page size minted sessions serialize/split at: the file's page size for a file-backed
-// core, else the in-memory default. A session's stores must split at the file's page size so they
-// match the physical pages persist writes — and so every core builds byte-identical file-backed
-// databases (CLAUDE.md §8). In-memory this is the default, so it is a no-op there.
-func (c *sharedCore) pageSize() uint32 {
-	if c.storage != nil {
-		return c.storage.pageSize
-	}
-	return c.memPageSize
-}
+// pageSize is the page size minted sessions serialize/split at: the store's page size, fixed at
+// creation. A session's stores must split at that page size so they match the physical pages
+// persist writes — and so every core builds byte-identical databases (CLAUDE.md §8).
+func (c *sharedCore) pageSize() uint32 { return c.storage.pageSize }
 
-// pageCount is the on-disk page high-water for a file-backed core; 0 in-memory.
+// pageCount is the page high-water of the backing store (file- or memory-backed).
 func (c *sharedCore) pageCount() uint32 {
-	if c.storage != nil {
-		c.storage.mu.Lock()
-		defer c.storage.mu.Unlock()
-		return c.storage.pageCount
-	}
-	return 0
+	c.storage.mu.Lock()
+	defer c.storage.mu.Unlock()
+	return c.storage.pageCount
 }
 
 // path is the backing file path for a file-backed core; "" in-memory.
-func (c *sharedCore) path() string {
-	if c.storage != nil {
-		return c.storage.path
-	}
-	return ""
-}
+func (c *sharedCore) path() string { return c.storage.path }
 
-// sharedCoreFromEngine lifts a freshly opened/created file-backed *Engine (file.go) into a shared
-// core: its committed snapshot becomes the published roots and its storage identity (page size /
-// pager / page accounting) becomes the storage. The committed snapshot's stores already carry the
-// shared paging, so every pinned snapshot faults clean pages through the one pool (pager.md).
+// sharedCoreFromEngine lifts a freshly opened/created/loaded *engine (file.go / loadEngine) into a
+// shared core: its committed snapshot becomes the published roots and its storage identity (page
+// size / pager / page accounting) becomes the storage. Since B3 every such engine carries a paging
+// context — a file's fileBlockStore or an in-memory memoryBlockStore — so this is the one
+// constructor for both hosts. The committed snapshot's stores already carry the shared paging, so
+// every pinned snapshot faults clean pages through the one pool (pager.md).
 func sharedCoreFromEngine(e *engine) *sharedCore {
-	c := &sharedCore{live: make(map[uint64]int), memPageSize: e.pageSize}
+	if e.paging == nil {
+		panic("every engine lifted into a shared core carries a paging context (B3)")
+	}
+	c := &sharedCore{live: make(map[uint64]int)}
 	c.roots.Store(&roots{committed: e.committed, sharedTemp: e.sharedTempCommitted})
 	c.storage = &storage{
 		pageSize:  e.pageSize,
@@ -221,10 +213,21 @@ func NewDatabase() *Database {
 // in-memory tree must be built at the size it will serialize to — this builds byte-level fixtures /
 // tests a non-default page size (the shared-core analogue of withPageSize); a normal in-memory
 // database uses NewDatabase (the default page size).
+//
+// B3 (bplus-reshape.md): an in-memory database is a memoryBlockStore seeded with the empty
+// from-scratch image, read/written through the same pager + Packed path as a file. txid 0 is the
+// pre-first-commit version (the same committed version an in-memory core always started at); the
+// first commit publishes txid 1 into the alternate meta slot.
 func NewInMemoryWithPageSize(pageSize uint32) *Database {
-	c := &sharedCore{live: make(map[uint64]int), memPageSize: pageSize}
-	c.roots.Store(&roots{committed: newSnapshot(), sharedTemp: newSnapshot()})
-	return databaseOver(c)
+	image, err := newSnapshot().ToImage(pageSize, 0)
+	if err != nil {
+		panic("an empty in-memory image always serializes: " + err.Error())
+	}
+	e, err := loadEngine(image)
+	if err != nil {
+		panic("an empty in-memory image always loads: " + err.Error())
+	}
+	return databaseOver(sharedCoreFromEngine(e))
 }
 
 // CreateDatabase makes a new file-backed database at path (spec/design/api.md §2) and returns the
@@ -457,10 +460,10 @@ func (db *Database) UpgradeCollations() (int, error) {
 	return s.UpgradeCollations()
 }
 
-// Close closes the backing file (file-backed only). The bare convenience methods autocommit, so there
-// is never uncommitted work to discard. Idempotent.
+// Close closes the backing store (an in-memory store's close is a no-op). The bare convenience
+// methods autocommit, so there is never uncommitted work to discard. Idempotent.
 func (db *Database) Close() error {
-	if st := db.core.storage; st != nil && st.paging != nil {
+	if st := db.core.storage; st.paging != nil {
 		_ = st.paging.close()
 		st.paging = nil
 	}
@@ -714,16 +717,24 @@ func (s *Session) refreshCommitted() {
 // window — a single atomic Store of both roots, temp-tables.md §5). Called after a clean autocommit
 // write or an explicit COMMIT of a writable block, under the writer gate.
 //
-// File-backed: the new file snapshot is persisted durably first (sharedCore.persist) and the roots
-// are stored only on success, so a persist I/O failure leaves the shared committed state (and this
-// session's version) unchanged and surfaces the error. In-memory persist is a no-op. The shared-temp
-// root is never serialized — it rides the Store as a pure in-memory pointer (temp-tables.md §2/§5).
+// The new snapshot is persisted durably first (sharedCore.persist — packs into the byte store on
+// any host, bplus-reshape.md B3) and the roots are stored only on success, so a persist I/O failure
+// leaves the shared committed state (and this session's version) unchanged and surfaces the error.
+// The shared-temp root is never serialized — it rides the Store as a pure in-memory pointer
+// (temp-tables.md §2/§5).
 func (s *Session) publish() error {
 	snap := s.engine.committed
 	snap.txid = s.baseVersion + 1 // advance the shared version on every commit
 	if err := s.core.persist(snap); err != nil {
 		return err // durable before publish; nothing is stored on failure
 	}
+	// The post-commit residency flip (bplus-reshape.md B4): the persist above assigned page ids to
+	// every dirty node it wrote, so the committed tree can shed its leaf payloads — clean leaves
+	// demote to OnDisk references faulted back through the pool on next touch. The session's own
+	// committed base (the same snapshot pointer) takes the flipped shape too, so a long-lived
+	// writer sheds residency as well (read-your-writes for the NEXT statement re-faults — one read
+	// path).
+	snap.demoteCleanLeaves()
 	s.engine.committed = snap
 	s.core.roots.Store(&roots{committed: snap, sharedTemp: s.engine.sharedTempCommitted})
 	s.baseVersion++

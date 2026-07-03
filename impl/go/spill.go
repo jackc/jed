@@ -578,6 +578,10 @@ func spillReadValue(r *bufio.Reader) (Value, error) {
 	case 8:
 		n, err := spillReadU64(r)
 		return TimestamptzValue(int64(n)), err
+	// Tags 9/10/11/21 reload a deferred value's pointer fields. The run file cannot carry runtime
+	// handles, so the reloaded Unfetched keeps the NIL SENTINEL handles (types == nil, the Go zero
+	// value) — it rides the sort output UNREAD by contract (spill.md §4), and touching one stays
+	// the loud pre-B4 poison panic (resolveUnfetchedSelf; bplus-reshape.md §5).
 	case 9:
 		first, err := spillReadU32(r)
 		if err != nil {

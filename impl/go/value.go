@@ -105,12 +105,32 @@ const (
 // resident LZ4 block for inline-compressed, or the body span for inline-deferred. (A value read
 // back from a spill run file owns a fresh copy in Comp — a degenerate form (a), since its page
 // block is long gone — spill.go.)
+//
+// Since B4 (bplus-reshape.md §5) a deferred value is SELF-RESOLVING: it carries its column type
+// (the store's shared column-type slice + this value's ordinal) and — for the external forms — the
+// database's shared paging context, so a value the static touched set missed is resolved ON DEMAND
+// at the evaluator's column access (resolveUnfetchedSelf, the demand-fault backstop) instead of
+// being read as NULL or poisoning. The handles are resolution plumbing, NOT stored identity: an
+// Unfetched only ever rides a Value behind a *Unfetched pointer (never compared or hashed by
+// contents — the comparison/render/encode paths stay poisoned), so equality remains pointer
+// identity and the handles never leak into results. A value reloaded from a spill run file carries
+// the nil sentinel (types == nil): it rides the sort output unread by contract (spill.md §4), and
+// touching one stays the loud pre-B4 poison panic.
 type Unfetched struct {
 	Form      byte
 	FirstPage uint32
 	StoredLen uint32
 	RawLen    uint32
 	Comp      []byte
+	// types is the store's shared resolved column-type slice and typeIdx this value's column
+	// ordinal (one slice-header copy per deferred value, no per-value colType clone);
+	// resolveUnfetchedSelf reads types[typeIdx]. nil types is the spill-run-file sentinel.
+	types   []colType
+	typeIdx int
+	// paging is the database's shared pager for the external forms (a plain pointer — GC, so no
+	// Rust-style weak ref is needed); nil for the inline forms (they own their bytes) and for a
+	// handle that must never resolve (the open-time reachability walk, the spill sentinel).
+	paging *sharedPaging
 }
 
 // Value is a runtime value: SQL NULL, an integer, a boolean, or a text string. Integers

@@ -65,8 +65,9 @@ func (s *sharedPaging) faultLeaf(page uint32, colTypes []colType) (*pnode, error
 		}
 		// Lazy decode (spec/design/large-values.md §14): an external/compressed value stays an
 		// unfetched reference — no chain read, no decompression. The scan layer resolves the
-		// columns a query touches through readBlock below.
-		return decodeLeafNode(block, page, colTypes)
+		// columns a query touches through readBlock below; a deferred value the touched set
+		// missed self-resolves through the paging handle stamped here (bplus-reshape.md §5, B4).
+		return decodeLeafNode(block, page, colTypes, s)
 	})
 }
 
