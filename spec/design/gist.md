@@ -409,8 +409,8 @@ Each is its own vertical slice with a NoREC/oracle obligation ([conformance.md �
   such a type lands — at which point it slots into the same seam.
 - **SP-GiST** (`index_kind = 3`) — a space-partitioning sibling, a separate access method, not
   scheduled.
-- **GiST on a TEMP table** — `0A000` in GX1: the resident R-tree (§4.1) would live on the temp /
-  shared-temp snapshot, deferred with the rest of the container-on-temp work
+- **GiST on a TEMP table** — `0A000` in GX1: the resident R-tree (§4.1) would live on the temp
+  snapshot, deferred with the rest of the container-on-temp work
   ([temp-tables.md](temp-tables.md)). A persistent table's GiST index is fully supported.
 - **Quality / perf refinements** — a better (still deterministic) split than median-linear;
   bulk-load packing for `CREATE INDEX`; node-level skip during descent. GX1's resident tree is

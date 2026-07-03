@@ -250,11 +250,11 @@ so there is no interior-record interleaving to special-case.
   publish. Nothing above the writer sees it.
 - **`MemoryBlockStore` + pinned pool** backs in-memory databases: a growable RAM byte buffer,
   `sync()` a no-op, a non-evicting pool (all pages pinned resident). In-memory `commit` packs
-  dirty nodes to memory pages (no `fsync`) — the file commit minus durability. **Temp-table
-  stores** (session-local + shared) back onto the same store kind; whether each temp store owns
-  a `MemoryBlockStore` or a session shares one is a B3 decision. The `temp_buffers` /
-  `shared_temp_mem` budget survives **by construction** — it is measured in on-disk
-  record-encoding bytes, deliberately representation-independent
+  dirty nodes to memory pages (no `fsync`) — the file commit minus durability. **Session-local
+  temp-table stores** back onto the same store kind; whether each temp store owns a
+  `MemoryBlockStore` or a session shares one is a B3 decision. (A database-wide shared temp kind was
+  later removed — temp-tables.md §13.) The `temp_buffers` budget survives **by construction** — it is
+  measured in on-disk record-encoding bytes, deliberately representation-independent
   ([temp-tables.md §7](temp-tables.md)) — so its *values* move only with the v24 record
   encoding itself (the change-2 NULL bytes), which is part of the one re-baseline.
 - **Demand-fault backstop on the single read path.** With one read path, the correctness fix

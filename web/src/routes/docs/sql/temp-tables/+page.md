@@ -9,14 +9,6 @@
 INSERT INTO scratch VALUES (1, 'alpha', 10), (2, 'beta', 20), (3, 'gamma', 30);`;
 
 	const query = `SELECT id, tag, n FROM scratch ORDER BY n DESC;`;
-
-	const sharedSeed = `CREATE SHARED TEMP TABLE cache (
-  key text PRIMARY KEY,
-  hits i32 NOT NULL
-);
-INSERT INTO cache VALUES ('a', 1), ('b', 2), ('c', 3);`;
-
-	const sharedQuery = `SELECT key, hits FROM cache ORDER BY hits DESC;`;
 </script>
 
 <svelte:head>
@@ -75,44 +67,16 @@ table a safe, bounded scratch space for untrusted SQL — paired with the per-st
 [cost limit](../../api/resource-limits/), a query can be given scratch space without risking
 unbounded memory.
 
-## Shared temporary tables
+## Indexes
 
-A plain temp table is **private** to the session that created it. A `CREATE SHARED TEMP TABLE` (or
-`CREATE SHARED TEMPORARY TABLE`) instead declares a **database-wide** temp table: one set of rows
-**visible to and writable by every session** of the open database — yet, like a session-local temp
-table, it still makes **zero writes to the file**.
-
-<LiveSql seed={sharedSeed} query={sharedQuery} rows={6} />
-
-It behaves like an ordinary table for the session using it — full CRUD, the same constraints, the
-same deferred features — and a write becomes visible to other sessions only when its transaction
-commits (writes ride the single-writer gate; a reader sees a consistent snapshot of both the
-persistent and shared-temp tables). It is dropped when the **database** is closed, and is never
-recovered on reopen.
-
-This is jed-specific: PostgreSQL's `GLOBAL TEMPORARY` shares only a table *definition* and gives
-each session its own *data*, so jed coins the new `SHARED` keyword to mean it shares the **data**
-too. `SHARED` must be immediately followed by `TEMP`/`TEMPORARY` (a `SHARED` table is always
-temporary; a bare `CREATE SHARED TABLE …` is a syntax error `42601`). Its DDL is gated by a separate
-`allow_shared_temp_ddl` capability, and its global storage by a `shared_temp_mem` budget — the same
-`54P03` on overflow.
-
-`TEMP` / `TEMPORARY` / `SHARED` are recognized only between `CREATE` and `TABLE`, so a table *named*
-`shared` is still an ordinary persistent table:
-
-```sql
-CREATE TABLE shared (id i32 PRIMARY KEY);    -- a persistent table called "shared"
-```
-
-A standalone `CREATE INDEX` works on a temp table too (both session-local and shared) — the index
-lives in the same in-memory temp snapshot, so it makes no writes to the file, is built and used to
-speed up queries, and is dropped with its table. Its DDL is gated by the same `allow_temp_ddl` /
-`allow_shared_temp_ddl` capability as the table.
+A standalone `CREATE INDEX` works on a temp table — the index lives in the same in-memory temp
+snapshot, so it makes no writes to the file, is built and used to speed up queries, and is dropped
+with its table. Its DDL is gated by the same `allow_temp_ddl` capability as the table.
 
 ## Auto-numbered columns
 
 `serial` / `bigserial` / `smallserial` and `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY` columns
-work on a temp table too (both session-local and shared), exactly as on a persistent table:
+work on a temp table too, exactly as on a persistent table:
 
 ```sql
 CREATE TEMP TABLE log (id bigserial PRIMARY KEY, msg text NOT NULL);
@@ -122,14 +86,13 @@ INSERT INTO log (msg) VALUES ('first'), ('second');   -- id auto-numbers 1, 2
 The auto-created backing sequence lives in the **same in-memory temp snapshot**, so — like the temp
 table's rows and indexes — it makes **zero writes to the file**, and it is dropped automatically when
 the table is (`DROP TABLE` removes both). It is reachable by its derived name (`nextval('log_id_seq')`,
-`currval`, `setval`), shares the relation namespace (a name collision is `42P07`), and — on a `SHARED`
-temp table — its counter is shared across sessions, so auto-numbering continues from where another
-session left off. Its DDL is gated by the same `allow_temp_ddl` / `allow_shared_temp_ddl` capability.
+`currval`, `setval`), shares the relation namespace (a name collision is `42P07`). Its DDL is gated by
+the same `allow_temp_ddl` capability.
 
 ## Composite-typed columns
 
-A column of a user-defined composite (row) type works on a temp table too (both session-local and
-shared), exactly as on a persistent table:
+A column of a user-defined composite (row) type works on a temp table too, exactly as on a persistent
+table:
 
 ```sql
 CREATE TYPE addr AS (street text, zip i32);
@@ -148,6 +111,5 @@ references is blocked (`2BP01`), just as for a permanent table.
 
 ## Not yet supported on a temp table
 
-This release keeps a few things off temp tables (both session-local and shared — each reported as
-`0A000`, *feature not supported*), to be lifted in later releases: `FOREIGN KEY` constraints and
-`COLLATE` columns.
+This release keeps a few things off temp tables (each reported as `0A000`, *feature not supported*),
+to be lifted in later releases: `FOREIGN KEY` constraints and `COLLATE` columns.

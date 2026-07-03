@@ -473,8 +473,9 @@ cross-core-identical and owns that consequence (the host-extension boundary, §1
   each session-local temp domain is its own in-RAM `MemoryBlockStore` + pinned pager with
   **within-session free-list compaction** (a never-reopened store reclaims its copy-on-write orphans
   rather than leaking a page per commit), so temp is compact + bounded (its `54P03` budget is now the
-  domain's committed page bytes) and spill-to-disk is a clean `BlockStore` swap. Shared temp still
-  rides the decoded arm (a follow-on).
+  domain's committed page bytes) and spill-to-disk is a clean `BlockStore` swap. (A database-wide
+  `SHARED` temp kind was briefly shipped, then removed — `spec/design/attached-databases.md` §6 — so
+  temp is now session-local only.)
   Designing this seam early is what makes "single-file, embeddable, everywhere" work — the OPFS host
   landed as *an added `BlockStore`*, not a reshape, exactly as intended. The
   **formal host interface** — the five-method `BlockStore` byte device, the per-core mapping,

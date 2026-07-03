@@ -166,7 +166,7 @@ two types**, eliminating the third:
 
 ```
 Database ─ THE SHARED CORE (cheap to clone/share across threads):
-  │          committed cell (file + shared-temp roots) · single-writer gate · reader watermark
+  │          committed cell (the file root) · single-writer gate · reader watermark
   │          · storage identity (path · page_size · pager/buffer-pool)
   │ owns one default Session (back-compat)      db.session/read_session/write_session(opts)
   ▼                                                          │ mint additional
@@ -175,9 +175,9 @@ default Session ──────────────── Session ◀─�
    open tx) + an access mode. Independently usable; readers run concurrently with the one writer.
 ```
 
-- **`Database` absorbs the shared core.** It *is* what `SharedDb` was — the committed-roots cell
-  (the file `Snapshot` + the shared-temp `Snapshot`, published together, transactions.md §8/§10),
-  the single-writer gate, and the live-reader watermark — fused with the **storage identity** (§1:
+- **`Database` absorbs the shared core.** It *is* what `SharedDb` was — the committed-root cell
+  (the file `Snapshot`, transactions.md §8/§10), the single-writer gate, and the live-reader
+  watermark — fused with the **storage identity** (§1:
   `path`, `page_size`, the pager/buffer-pool). It is **cheap to clone and safe to share across
   threads**, and it is what `new` / `open` / `create` return ([api.md §2.1/§2.5](api.md)). The
   old single-threaded executor handle named `Database` is **renamed `Engine`** — an internal type a
@@ -435,12 +435,12 @@ privilege — jed has no schema/owner model (§3) — so a session capability **
 privilege is a deferred follow-on (§11), with **one split already designed**: temporary-table DDL
 (temp-tables.md §5). Because a temp table is bounded, never-durable scratch space a host *wants* to
 expose to an otherwise-untouching untrusted session, `allow_ddl` splits by the **kind** of relation
-the statement targets into three gates — **`allow_ddl`** (persistent DDL, the existing gate, name and
-default unchanged), **`allow_temp_ddl`** (session-local temp DDL), and **`allow_shared_temp_ddl`**
-(shared temp DDL). The two new gates **default to `allow_ddl`'s value**, so existing callers are
-unaffected and the §5.3 default-deny posture holds; the untrusted-scratch pattern is
-`allow_ddl = off` + explicit `allow_temp_ddl = on`. The gates land with the temp-table slices
-(`allow_temp_ddl` in slice 1, `allow_shared_temp_ddl` in slice 2).
+the statement targets into two gates — **`allow_ddl`** (persistent DDL, the existing gate, name and
+default unchanged) and **`allow_temp_ddl`** (session-local temp DDL). The new gate **defaults to
+`allow_ddl`'s value**, so existing callers are unaffected and the §5.3 default-deny posture holds; the
+untrusted-scratch pattern is `allow_ddl = off` + explicit `allow_temp_ddl = on`. (A third gate,
+`allow_shared_temp_ddl`, for a database-wide shared temp kind, was briefly shipped and then removed —
+temp-tables.md §13, attached-databases.md §6.)
 
 The capability envelope governs the **SQL surface** only. Privileged **host-API** maintenance ops —
 `db.load_unicode_data`, `db.set_default_collation`, and `db.upgrade_collations()` (the COLLATION
