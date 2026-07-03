@@ -100,10 +100,18 @@ type storage struct {
 	mu        sync.Mutex // guards pageCount/freePages (the writer-gate-serialized page accounting)
 	pageSize  uint32     // fixed into the file at creation
 	pageCount uint32     // on-disk high-water; persisted in the meta slot
-	freePages []uint32   // reconstruct-on-open free-list (P6.2) — reused lowest-first, trivially watermark-safe
-	paging    *sharedPaging
-	readOnly  bool   // opened read-only (api.md §2.1): every session is then read-only, a write is 25006. Always false in-memory.
-	path      string // the backing file path; "" for an in-memory database (surfaced by Database.Path / Session.Path)
+	freePages []uint32   // free-list — reused lowest-first: reconstruct-on-open (P6.2) plus, for a reclaim
+	//                      domain, within-session compaction (maybeCompact); watermark-gated safe.
+	paging *sharedPaging
+	// reclaimWithinSession turns on within-session free-list compaction (maybeCompact): the never-reopened
+	// in-RAM temp domains set it (temp-tables.md §6, bplus-reshape.md), so their copy-on-write orphans are
+	// reclaimed rather than leaked. The main file/in-memory domain leaves it false (reconstruct-on-open only).
+	reclaimWithinSession bool
+	// liveAtCompaction is the reachable page count recorded at the last compaction — the cheap trigger basis:
+	// compaction re-runs only once the high-water passes ~2× it (periodic ~2× bound, no per-commit walk).
+	liveAtCompaction uint32
+	readOnly         bool   // opened read-only (api.md §2.1): every session is then read-only, a write is 25006. Always false in-memory.
+	path             string // the backing file path; "" for an in-memory database (surfaced by Database.Path / Session.Path)
 }
 
 // persist durably publishes snap to the backing store via an incremental copy-on-write commit
@@ -147,6 +155,56 @@ func (c *sharedCore) persist(snap *snapshot) error {
 	}
 	st.pageCount = write.pageCount
 	st.freePages = write.freeRemaining
+	return st.maybeCompact(snap, write.rootPage, c.oldestLiveVersion(snap.txid))
+}
+
+// oldestLiveVersion is the oldest version a live reader pinned, floored at newTxid (the version this
+// commit publishes) so "no live reader" reads as newTxid — the safe case for compaction. Any live
+// reader pins a version older than newTxid (it opened before this commit), so a non-empty registry
+// yields a value < newTxid and defers compaction (transactions.md §8, the reclamation watermark).
+func (c *sharedCore) oldestLiveVersion(newTxid uint64) uint64 {
+	c.liveMu.Lock()
+	defer c.liveMu.Unlock()
+	oldest := newTxid
+	for v := range c.live {
+		if v < oldest {
+			oldest = v
+		}
+	}
+	return oldest
+}
+
+// maybeCompact reclaims within-session copy-on-write orphans for a reclaim domain (temp) by rebuilding
+// the free-list from the live (reachable) set, so later commits reuse dead pages instead of only
+// growing the high-water (temp-tables.md §6, bplus-reshape.md). It is:
+//   - a no-op for the main domain (reclaimWithinSession false) — that keeps its reconstruct-on-open list;
+//   - deferred while any older version is pinned (oldestLive != the committed version): compaction frees
+//     pages unreachable from the committed root, which an older reader may still observe, so it waits for
+//     the pins to drain (a documented shared-temp-under-load limitation, temp-tables.md §6);
+//   - periodic: it walks (O(pages)) only once the high-water passes ~2× the live count at the last
+//     compaction, so page_count oscillates in [live, 2×live] and the walk is amortized O(height)/commit.
+//
+// Runs under the writer gate (caller holds st.mu), so the free-list / pageCount mutation is single-writer.
+func (st *storage) maybeCompact(snap *snapshot, catRoot uint32, oldestLive uint64) error {
+	if !st.reclaimWithinSession || oldestLive != snap.txid {
+		return nil
+	}
+	const minCompactPages = 16 // don't churn a tiny store
+	if st.pageCount <= minCompactPages || uint64(st.pageCount) <= 2*uint64(st.liveAtCompaction) {
+		return nil
+	}
+	reached, err := snap.reachablePages(st.paging, catRoot)
+	if err != nil {
+		return err
+	}
+	free := make([]uint32, 0, int(st.pageCount)-len(reached))
+	for p := rootPage; p < st.pageCount; p++ {
+		if !reached[p] {
+			free = append(free, p)
+		}
+	}
+	st.freePages = free
+	st.liveAtCompaction = uint32(len(reached))
 	return nil
 }
 

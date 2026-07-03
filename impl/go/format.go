@@ -1581,6 +1581,70 @@ func collectLeafOverflow(paging *sharedPaging, pageIdx uint32, colTypes []colTyp
 	}
 }
 
+// reachablePages collects every page reachable from the committed snapshot whose catalog head is
+// catRoot: the catalog chain, every table/index B+tree node, and (for spillable columns) the live
+// overflow chains. It is the inverse of the free-list and the basis of within-session compaction
+// (storage.maybeCompact) — the same live set the open-time reconstruction (loadEnginePaged) derives,
+// but computed against the already-resident committed trees: node page ids come from the in-memory
+// tree walk (no pager reads), and only the catalog chain and spillable-leaf overflow are read through
+// the pager. A reclaim domain (temp) never carries a GiST index (deferred 0A000, temp-tables.md §8),
+// so GiST pages need no handling here — the caller (maybeCompact) skips any snapshot that has one.
+func (s *snapshot) reachablePages(paging *sharedPaging, catRoot uint32) (map[uint32]bool, error) {
+	reached := make(map[uint32]bool)
+	// The catalog chain (rewritten to fresh pages every commit; its predecessor pages are the bulk of
+	// what compaction reclaims).
+	for p := catRoot; p != 0; {
+		reached[p] = true
+		block, err := paging.pgr.readBlock(p)
+		if err != nil {
+			return nil, err
+		}
+		pg, err := parsePage(block)
+		if err != nil {
+			return nil, err
+		}
+		if pg.pageType != pageCatalog {
+			return nil, newError(DataCorrupted, "expected a catalog page")
+		}
+		p = pg.nextPage
+	}
+	// Table data trees + their live overflow chains.
+	for _, st := range s.stores {
+		root := st.treeRoot()
+		collectTreePages(root, reached)
+		if root != nil && root.page != 0 && anySpillable(st.colTypes) {
+			if err := collectLeafOverflow(paging, root.page, st.colTypes, reached); err != nil {
+				return nil, err
+			}
+		}
+	}
+	// Secondary/unique index trees (empty-payload, never spillable).
+	for _, ist := range s.indexStores {
+		collectTreePages(ist.treeRoot(), reached)
+	}
+	return reached, nil
+}
+
+// collectTreePages adds every node page of a resident B+tree to reached: an interior/leaf node's own
+// set-once page, and each OnDisk child leaf's page (walked without faulting it — the page id is on the
+// childRef). A page-0 node is a dirty node not yet persisted (never on a committed tree at compaction
+// time); it is skipped so page 0 (a meta slot) is never marked.
+func collectTreePages(n *pnode, reached map[uint32]bool) {
+	if n == nil {
+		return
+	}
+	if n.page != 0 {
+		reached[n.page] = true
+	}
+	for _, c := range n.children {
+		if c.node == nil {
+			reached[c.page] = true // an OnDisk leaf: page id known without a fault
+		} else {
+			collectTreePages(c.node, reached)
+		}
+	}
+}
+
 // readSkeleton reads a table's on-disk B+tree (rooted at rootPage) into a demand-paged skeleton:
 // interior nodes resident, each leaf left OnDisk. Returns the root node and the total row count. A
 // table whose root is itself a single leaf has no interior parent to hold an OnDisk reference, so the
