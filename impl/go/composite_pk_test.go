@@ -94,7 +94,7 @@ func TestCompositeUniquenessIsTheWholeTuple(t *testing.T) {
 // 42701, more than one primary key across both forms 42P16 — plus the jed narrowings
 // (0A000): out-of-declaration-order list, non-keyable member type.
 func TestCompositeDDLErrorsMatchPostgresAndNarrowings(t *testing.T) {
-	db := NewDatabase().Session(SessionOptions{})
+	db := memDB().Session(SessionOptions{})
 	if _, err := db.Execute("CREATE TYPE addr AS (street text, zip i32)", nil); err != nil {
 		t.Fatal(err)
 	}

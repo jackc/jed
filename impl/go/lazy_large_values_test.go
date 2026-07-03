@@ -192,7 +192,7 @@ func TestLazyUpdateOfOtherColumnsPreservesSpilledValues(t *testing.T) {
 // units equal the resident disposition plan's by construction.
 func TestLazyPagedAndResidentCostsMatch(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "lazy_cost.jed")
-	mem := NewInMemoryWithPageSize(lazyPageSize).Session(SessionOptions{})
+	mem := newInMemoryWithPageSize(lazyPageSize).Session(SessionOptions{})
 	lazySeed(t, mem)
 	db, err := create(path, DatabaseOptions{PageSize: lazyPageSize})
 	if err != nil {

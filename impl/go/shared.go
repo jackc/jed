@@ -47,7 +47,7 @@ package jed
 //
 // The host-facing single handle is *Database (the back-compat bridge — §2.1): the shared core PLUS
 // one long-lived default *Session, whose delegators (Execute/Query/Begin/.../ExecuteScript) drive
-// that default session. NewDatabase / OpenDatabase / CreateDatabase return it; it is also the
+// that default session. CreateDatabase / OpenDatabase return it; it is also the
 // goroutine-safe core itself (Go needs no Rust-style !Send split), so the same *Database both
 // drives the single-handle path and mints additional concurrent sessions.
 
@@ -301,27 +301,53 @@ func sharedCoreFromEngine(e *engine) *sharedCore {
 // a Session, never on the *Database. It also offers bare convenience methods
 // (Execute/Query/ExecuteScript/View/Update) that mint a FRESH autocommit session per call and discard
 // it: committed data persists through the shared core, but no session-local state carries to the next
-// call. NewDatabase / OpenDatabase / CreateDatabase return it.
+// call. CreateDatabase / OpenDatabase return it.
 type Database struct {
 	core *sharedCore
 }
 
-// NewDatabase builds a fresh, empty in-memory database (committed version 0).
-func NewDatabase() *Database {
-	return NewInMemoryWithPageSize(DefaultPageSize)
+// CreateOptions are the settings for creating a fresh database (spec/design/api.md §2.1). Path
+// selects the backing: the zero value "" builds an in-memory database (never touches the
+// filesystem); a non-empty path builds a single-file database on disk (58P02 if it already exists).
+// "" is the documented "unset" — there is no positional CreateDatabase("") to be hit by an
+// uninitialized argument (api.md §2.1). PageSize (0 → DefaultPageSize) is locked into a file's meta
+// at creation and fixes an in-memory database's tree fan-out, so it is meaningful for both backings.
+type CreateOptions struct {
+	Path     string
+	PageSize uint32
 }
 
-// NewInMemoryWithPageSize builds a fresh, empty in-memory database that serializes/splits at
-// pageSize. The page-backed B-tree's fan-out tracks the page size (spec/fileformat/format.md), so an
-// in-memory tree must be built at the size it will serialize to — this builds byte-level fixtures /
-// tests a non-default page size (the shared-core analogue of withPageSize); a normal in-memory
-// database uses NewDatabase (the default page size).
+// CreateDatabase makes a fresh database — in-memory (opts.Path == "") or file-backed (opts.Path set)
+// — and returns the host handle with its default session (spec/design/api.md §2.1). A file that
+// already exists is 58P02; the page size is locked into a file. The in-memory path cannot fail in
+// substance (its returned error is always nil) but shares the uniform (*Database, error) signature —
+// a caller wanting an infallible in-memory handle wraps this (the test suites' memDB helper does).
+func CreateDatabase(opts CreateOptions) (*Database, error) {
+	pageSize := opts.PageSize
+	if pageSize == 0 {
+		pageSize = DefaultPageSize
+	}
+	if opts.Path == "" {
+		return newInMemoryWithPageSize(pageSize), nil
+	}
+	e, err := create(opts.Path, DatabaseOptions{PageSize: pageSize})
+	if err != nil {
+		return nil, err
+	}
+	return databaseOver(sharedCoreFromEngine(e)), nil
+}
+
+// newInMemoryWithPageSize builds a fresh, empty in-memory database that serializes/splits at
+// pageSize (unexported — CreateDatabase and the test helpers are its callers). The page-backed
+// B-tree's fan-out tracks the page size (spec/fileformat/format.md), so an in-memory tree must be
+// built at the size it will serialize to; that is why PageSize is a CreateOptions field for the
+// in-memory backing too.
 //
 // B3 (bplus-reshape.md): an in-memory database is a memoryBlockStore seeded with the empty
 // from-scratch image, read/written through the same pager + Packed path as a file. txid 0 is the
 // pre-first-commit version (the same committed version an in-memory core always started at); the
 // first commit publishes txid 1 into the alternate meta slot.
-func NewInMemoryWithPageSize(pageSize uint32) *Database {
+func newInMemoryWithPageSize(pageSize uint32) *Database {
 	image, err := newSnapshot().ToImage(pageSize, 0)
 	if err != nil {
 		panic("an empty in-memory image always serializes: " + err.Error())
@@ -331,17 +357,6 @@ func NewInMemoryWithPageSize(pageSize uint32) *Database {
 		panic("an empty in-memory image always loads: " + err.Error())
 	}
 	return databaseOver(sharedCoreFromEngine(e))
-}
-
-// CreateDatabase makes a new file-backed database at path (spec/design/api.md §2) and returns the
-// host handle with its default session. 58P02 if the path already exists; the page size is locked
-// into the file.
-func CreateDatabase(path string, opts DatabaseOptions) (*Database, error) {
-	e, err := create(path, opts)
-	if err != nil {
-		return nil, err
-	}
-	return databaseOver(sharedCoreFromEngine(e)), nil
 }
 
 // OpenDatabase opens an existing file-backed database at path with default open settings.

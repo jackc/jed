@@ -30,7 +30,7 @@ func balanceFile() *stressFile {
 // runOnce sets up a fresh handle, runs the workload one way, and returns the final checksum.
 func runOnce(t *testing.T, f *stressFile, sequential bool) string {
 	t.Helper()
-	db := jed.NewDatabase()
+	db := memDB()
 	if err := setup(db, f); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
@@ -77,7 +77,7 @@ func TestModeAgreement(t *testing.T) {
 func TestInvariantCatchesBug(t *testing.T) {
 	f := balanceFile()
 	f.Worker[1].InvariantExpect = "999" // the true sum is always 100
-	db := jed.NewDatabase()
+	db := memDB()
 	if err := setup(db, f); err != nil {
 		t.Fatalf("setup: %v", err)
 	}

@@ -18,7 +18,7 @@ func valArrayFunc(t *testing.T, db dbHandle, sql string) string {
 }
 
 func TestArrayFuncMultidimAndCustomLB(t *testing.T) {
-	db := NewDatabase().Session(SessionOptions{})
+	db := memDB().Session(SessionOptions{})
 	cases := map[string]string{
 		"SELECT array_lower('[2:4]={7,8,9}'::i32[], 1)":            "2",
 		"SELECT array_upper('[2:4]={7,8,9}'::i32[], 1)":            "4",
@@ -36,7 +36,7 @@ func TestArrayFuncMultidimAndCustomLB(t *testing.T) {
 }
 
 func TestArrayFuncErrors(t *testing.T) {
-	db := NewDatabase().Session(SessionOptions{})
+	db := memDB().Session(SessionOptions{})
 	cases := map[string]string{
 		"SELECT array_append(ARRAY[ARRAY[1,2],ARRAY[3,4]], 9)":     "22000",
 		"SELECT array_prepend(9, ARRAY[ARRAY[1,2],ARRAY[3,4]])":    "22000",

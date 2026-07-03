@@ -185,7 +185,7 @@ func TestParamInInList(t *testing.T) {
 }
 
 func TestDDLWithParamsTraps42601(t *testing.T) {
-	db := NewDatabase().Session(SessionOptions{})
+	db := memDB().Session(SessionOptions{})
 	if c := paramErrCode(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)", IntValue(1)); c != "42601" {
 		t.Fatalf("code = %s want 42601", c)
 	}

@@ -72,7 +72,7 @@ func TestLazyInlineValuesMatchResidentAcrossQueryShapes(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	mem := NewDatabase().Session(SessionOptions{})
+	mem := memDB().Session(SessionOptions{})
 	inlineSeed(t, mem)
 	paged, err := open(path)
 	if err != nil {
@@ -145,7 +145,7 @@ func TestLazyInlineMutationsPreserveUntouchedValues(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	mem := NewDatabase().Session(SessionOptions{})
+	mem := memDB().Session(SessionOptions{})
 	inlineSeed(t, mem)
 
 	mutations := []string{
@@ -265,7 +265,7 @@ func TestLazyUntouchedCorruptInlineBodyDefersError(t *testing.T) {
 // still equal the in-memory sort.
 func TestLazyUntouchedDeferredColumnRidesSpillingSort(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "l2_spill.jed")
-	mem := NewDatabase().Session(SessionOptions{})
+	mem := memDB().Session(SessionOptions{})
 	db, err := create(path, DatabaseOptions{PageSize: DefaultPageSize})
 	if err != nil {
 		t.Fatal(err)

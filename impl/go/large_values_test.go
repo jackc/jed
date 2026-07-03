@@ -29,7 +29,7 @@ func countPageType(image []byte, ps int, ty byte) int {
 // chain at page 256: RECORD_MAX = (256-16-12)/2 = 114, cap = 240) plus a small inline value.
 func bigValueDB(t *testing.T) (dbHandle, string) {
 	t.Helper()
-	db := NewDatabase().Session(SessionOptions{})
+	db := memDB().Session(SessionOptions{})
 	big := fillerText(1250) // incompressible, so Slice B keeps it external-plain
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, body text)")
 	mustExec(t, db, fmt.Sprintf("INSERT INTO t VALUES (1, '%s')", big))
@@ -65,7 +65,7 @@ func TestExternalValueSpansOverflowChainAndRoundTrips(t *testing.T) {
 }
 
 func TestSmallValuesNeverSpill(t *testing.T) {
-	db := NewDatabase().Session(SessionOptions{})
+	db := memDB().Session(SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i16)")
 	mustExec(t, db, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
 	image, err := db.ToImage(256, 1)

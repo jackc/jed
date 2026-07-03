@@ -30,7 +30,7 @@ const trackARows = 50_000
 func buildWideTable(b *testing.B, w int) string {
 	b.Helper()
 	path := filepath.Join(b.TempDir(), fmt.Sprintf("wide_w%d.jed", w))
-	db, err := CreateDatabase(path, DefaultDatabaseOptions())
+	db, err := CreateDatabase(CreateOptions{Path: path})
 	if err != nil {
 		b.Fatal(err)
 	}

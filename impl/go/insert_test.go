@@ -7,7 +7,7 @@ import "testing"
 
 func dbWith(t *testing.T, stmts ...string) *Session {
 	t.Helper()
-	db := NewDatabase().Session(SessionOptions{})
+	db := memDB().Session(SessionOptions{})
 	for _, s := range stmts {
 		if _, err := db.Execute(s, nil); err != nil {
 			t.Fatalf("setup %q: %v", s, err)
@@ -61,7 +61,7 @@ func TestBoundaryValuesRoundTrip(t *testing.T) {
 }
 
 func TestInsertIntoMissingTableTraps(t *testing.T) {
-	db := NewDatabase().Session(SessionOptions{})
+	db := memDB().Session(SessionOptions{})
 	wantErr(t, db, "INSERT INTO nope VALUES (1)", "42P01")
 }
 

@@ -29,6 +29,16 @@ import (
 	jed "github.com/jackc/jed/impl/go"
 )
 
+// memDB builds a fresh in-memory database, unwrapping the infallible in-memory CreateDatabase
+// (spec/design/api.md §2.1.1 — the in-memory create cannot fail, so the harness wraps it).
+func memDB() *jed.Database {
+	db, err := jed.CreateDatabase(jed.CreateOptions{})
+	if err != nil {
+		panic("in-memory CreateDatabase is infallible: " + err.Error())
+	}
+	return db
+}
+
 // isConcurrencyFormat reports whether text opts into the schedule format via a
 // `# format: concurrency` header line. Any other (or absent) format is the sequential runner.
 func isConcurrencyFormat(text string) bool {
@@ -307,7 +317,7 @@ func runConcurrencyFile(text string) error {
 // threaded run consistent with the schedule must produce. `gateHolder` is the live writer's sid (the
 // single-writer gate), and `blockedSid` is the at-most-one writer queued on it.
 func runScheduleSequential(steps []cStep) error {
-	db := jed.NewDatabase()
+	db := memDB()
 	sessions := map[string]*cSession{}
 	gateHolder := "" // the live writer holding the single-writer gate, "" if free
 	blockedSid := "" // a writer queued on the gate (Layer 2 `blocks`), "" if none
@@ -508,7 +518,7 @@ type cDriver struct {
 // stays parked inside Write() on the held gate (its open ack deferred) until the holder releases it,
 // the one concurrency path the sequential walk never exercises (§5).
 func runScheduleThreaded(steps []cStep) error {
-	d := &cDriver{db: jed.NewDatabase(), workers: map[string]*cWorker{}}
+	d := &cDriver{db: memDB(), workers: map[string]*cWorker{}}
 	var result error
 	for _, st := range steps {
 		if err := d.step(st); err != nil {

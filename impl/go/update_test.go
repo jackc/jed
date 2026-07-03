@@ -22,7 +22,7 @@ func setupUpdate(t *testing.T) *Session {
 }
 
 func TestUpdateMissingTable(t *testing.T) {
-	wantErr(t, NewDatabase().Session(SessionOptions{}), "UPDATE nope SET a = 1", "42P01")
+	wantErr(t, memDB().Session(SessionOptions{}), "UPDATE nope SET a = 1", "42P01")
 }
 
 func TestUpdateUnknownColumn(t *testing.T) {

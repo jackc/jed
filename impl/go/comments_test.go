@@ -11,7 +11,7 @@ import "testing"
 
 func commentsSetup(t *testing.T) *Session {
 	t.Helper()
-	db := NewDatabase().Session(SessionOptions{})
+	db := memDB().Session(SessionOptions{})
 	mustCreate(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32, s text)")
 	mustCreate(t, db, "INSERT INTO t VALUES (1, 10, '--x /*y*/')")
 	return db

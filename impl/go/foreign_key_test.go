@@ -15,7 +15,7 @@ import (
 
 func fkSetup(t *testing.T, sql ...string) *Session {
 	t.Helper()
-	db := NewDatabase().Session(SessionOptions{})
+	db := memDB().Session(SessionOptions{})
 	for _, s := range sql {
 		if _, err := db.Execute(s, nil); err != nil {
 			t.Fatalf("setup %q: %v", s, err)

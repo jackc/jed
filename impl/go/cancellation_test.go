@@ -45,7 +45,7 @@ func TestMeterGuardCancel(t *testing.T) {
 // A context already canceled at the API entry aborts with 57014 before any work (the cheap
 // boundary poll).
 func TestCancelBeforeRun(t *testing.T) {
-	db := NewDatabase()
+	db := memDB()
 	if _, err := db.Exec(context.Background(), "CREATE TABLE t (id i32 PRIMARY KEY)"); err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +64,7 @@ func TestCancelBeforeRun(t *testing.T) {
 // the cursor boundary. Proven white-box: session.cancel is set directly (bypassing ctx), so only
 // the in-statement Guard can produce the 57014.
 func TestCancelDuringExecution(t *testing.T) {
-	db := NewDatabase()
+	db := memDB()
 	if _, err := db.Exec(context.Background(), "CREATE TABLE t (id i32 PRIMARY KEY)"); err != nil {
 		t.Fatal(err)
 	}

@@ -20,7 +20,7 @@ import (
 // compaction on the (single) storage domain.
 func churnInMemory(t *testing.T, reclaim bool, rounds int) (uint32, *Database) {
 	t.Helper()
-	db := NewInMemoryWithPageSize(256)
+	db := newInMemoryWithPageSize(256)
 	db.core.storage.reclaimWithinSession = reclaim
 	sess := db.Session(SessionOptions{})
 	sessExec(t, sess, "CREATE TABLE t (id i32 PRIMARY KEY, pad text)")
@@ -70,7 +70,7 @@ func TestWithinSessionCompactionBoundsInMemoryChurn(t *testing.T) {
 }
 
 func TestCompactionDefersWhileOlderReaderPinned(t *testing.T) {
-	db := NewInMemoryWithPageSize(256)
+	db := newInMemoryWithPageSize(256)
 	db.core.storage.reclaimWithinSession = true
 	sess := db.Session(SessionOptions{})
 	sessExec(t, sess, "CREATE TABLE t (id i32 PRIMARY KEY, pad text)")

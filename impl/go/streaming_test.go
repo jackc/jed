@@ -22,7 +22,7 @@ import (
 // seededKV builds an in-memory shared db with t(id i32 PK, v i32) holding 1..=n (v = id * 10).
 func seededKV(t *testing.T, n int64) *Database {
 	t.Helper()
-	db := NewDatabase()
+	db := memDB()
 	w := db.WriteSession()
 	if _, err := w.Execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", nil); err != nil {
 		t.Fatalf("create: %v", err)
@@ -490,7 +490,7 @@ func TestSortedSpillMergeStreamsLazily(t *testing.T) {
 		return n
 	}
 
-	db, err := CreateDatabase(path, DatabaseOptions{PageSize: DefaultPageSize})
+	db, err := CreateDatabase(CreateOptions{Path: path, PageSize: DefaultPageSize})
 	if err != nil {
 		t.Fatal(err)
 	}

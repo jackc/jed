@@ -724,13 +724,17 @@ func runFile(text string, disk bool) error {
 		tmpPath = f.Name()
 		f.Close()
 		os.Remove(tmpPath) // CreateDatabase writes the initial image at this path
-		db, err = jed.CreateDatabase(tmpPath, jed.DefaultDatabaseOptions())
+		db, err = jed.CreateDatabase(jed.CreateOptions{Path: tmpPath})
 		if err != nil {
 			os.Remove(tmpPath)
 			return fmt.Errorf("disk mode: create %s: %w", tmpPath, err)
 		}
 	} else {
-		db = jed.NewDatabase()
+		var err error
+		db, err = jed.CreateDatabase(jed.CreateOptions{}) // in-memory: no path
+		if err != nil {
+			return fmt.Errorf("in-memory create: %w", err)
+		}
 	}
 	// Database no longer owns a persistent default session (it mints a fresh session per convenience
 	// call), so the harness drives one explicit session per file — preserving the cross-record state the

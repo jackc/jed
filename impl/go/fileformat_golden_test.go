@@ -47,7 +47,7 @@ func run(t *testing.T, db dbHandle, sql string) {
 // pkTableDB is CREATE TABLE t (id i32 PRIMARY KEY, v i16) with 20 rows (id 3's v
 // is NULL) — enough to span more than one data page at page_size 256.
 func pkTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i16)")
 	for i := int64(1); i <= 20; i++ {
 		v := fmt.Sprintf("%d", i*10)
@@ -60,7 +60,7 @@ func pkTableDB(t *testing.T) *Session {
 }
 
 func oneTableEmptyDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i16)")
 	return db
 }
@@ -71,7 +71,7 @@ func oneTableEmptyDB(t *testing.T) *Session {
 // order-sensitive), with a negative first component and first-component ties broken by
 // the second.
 func compositePKTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (a i32, b i16, v i16, PRIMARY KEY (a, b))")
 	for _, abv := range [][3]int64{
 		{-2, 5, 10},
@@ -94,7 +94,7 @@ func compositePKTableDB(t *testing.T) *Session {
 // quote, decimal literals, >=/<=), stored in name order
 // (price_range < t_b_check < t_note_check).
 func checkTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (a int PRIMARY KEY, b int CHECK (b > 0), price numeric(8,2), "+
 		"CONSTRAINT price_range CHECK (price >= 0.50 AND price <= 9999.99), note text, "+
 		"CHECK (note = 'ok' OR note = 'a''b'))")
@@ -109,7 +109,7 @@ func checkTableDB(t *testing.T) *Session {
 // encoding.md §2.2 presence tag in stored index order — NULL last), and the unnamed index
 // auto-names to t_a_b_idx. Index records have empty payloads (key only).
 func indexTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (a i32, b i32, u uuid, PRIMARY KEY (b, a))")
 	run(t, db, "CREATE INDEX i_u ON t (u)")
 	run(t, db, "CREATE INDEX ON t (a, b)")
@@ -123,7 +123,7 @@ func indexTableDB(t *testing.T) *Session {
 // (NULLS DISTINCT — both stored), the named two-column constraint wv, a CREATE UNIQUE
 // INDEX uq, and the plain index nu (flags 0 beside flags 1).
 func uniqueTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32, "+
 		"UNIQUE (v), CONSTRAINT wv UNIQUE (w, v))")
 	run(t, db, "CREATE INDEX nu ON t (v)")
@@ -138,7 +138,7 @@ func uniqueTableDB(t *testing.T) *Session {
 // (the name + local/ref ordinals + actions byte). Must match the Ruby reference's FK_TABLE
 // (spec/fileformat/verify.rb).
 func fkTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE p (pid i32 PRIMARY KEY, code i32 UNIQUE, a i32, b i32, UNIQUE (a, b))")
 	run(t, db, "INSERT INTO p VALUES (1, 100, 10, 20), (2, 200, 30, 40)")
 	run(t, db, "CREATE TABLE c (id i32 PRIMARY KEY, pid i32, pcode i32, x i32, y i32, mgr i32, "+
@@ -156,7 +156,7 @@ func fkTableDB(t *testing.T) *Session {
 // array (ndim=0), row 3 a NULL element (the HAS_NULLS bitmap) and a whole-value NULL array (the
 // lone 0x01 tag). Must match the Ruby reference's ARRAY_TABLE (spec/fileformat/verify.rb).
 func arrayTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, xs i32[], tags text[])")
 	run(t, db, "INSERT INTO t VALUES (1, ARRAY[10, 20, 30], ARRAY['a', 'b'])")
 	run(t, db, "INSERT INTO t VALUES (2, '{40,50}', '{}')")
@@ -172,7 +172,7 @@ func arrayTableDB(t *testing.T) *Session {
 // (lower-only, both), a NULL range, an exclusive-lower literal with infinite upper ((5,) → [6,)), and
 // a singleton ([1,1] → [1,2)). Pins range_table.jed cross-core.
 func rangeTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, r i32range, br i64range)")
 	run(t, db, "INSERT INTO t VALUES (1, '[1,5)', '[10,20)')")
 	run(t, db, "INSERT INTO t VALUES (2, '[1,5]', NULL)")
@@ -186,7 +186,7 @@ func rangeTableDB(t *testing.T) *Session {
 // range-bounds key (empty/±∞/inclusivity framing around the i32 element key) lands in the key slot.
 // Rows are inserted in ASCENDING range_total_cmp order to match verify.rb's ascending-key tree builder.
 func rangePKTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (k i32range PRIMARY KEY, v i32)")
 	run(t, db, "INSERT INTO t VALUES ('empty', 0)")
 	run(t, db, "INSERT INTO t VALUES ('(,5)', 1)")
@@ -201,7 +201,7 @@ func rangePKTableDB(t *testing.T) *Session {
 // whose key length varies with the element count. Rows are inserted in ASCENDING array_total_cmp
 // order (empty, shorter-prefix, element-wise, NULL element last). Pins array_pk_table.jed cross-core.
 func arrayPKTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE k (key i32[] PRIMARY KEY, v i32)")
 	run(t, db, "INSERT INTO k VALUES ('{}', 40)")
 	run(t, db, "INSERT INTO k VALUES ('{1,2}', 20)")
@@ -215,7 +215,7 @@ func arrayPKTableDB(t *testing.T) *Session {
 // stored bytes are the input text exactly (whitespace/key-order preserved), so this pins the
 // length-prefixed text-shaped json body. Pins json_table.jed cross-core.
 func jsonTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, j json)")
 	run(t, db, "INSERT INTO t VALUES (1, '{\"a\": 1}')")
 	run(t, db, "INSERT INTO t VALUES (2, '[1, 2, 3]')")
@@ -228,7 +228,7 @@ func jsonTableDB(t *testing.T) *Session {
 // (ntagNumber), a nested array (ntagArray) of a boolean (ntagTrue) and JSON null (ntagNull); a bare
 // string (ntagString); a bare number; and a SQL NULL. Pins jsonb_table.jed.
 func jsonbTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, j jsonb)")
 	run(t, db, "INSERT INTO t VALUES (1, '{\"a\": 1, \"b\": [true, null]}')")
 	run(t, db, "INSERT INTO t VALUES (2, '\"hello\"')")
@@ -244,7 +244,7 @@ func jsonbTableDB(t *testing.T) *Session {
 // (row 5). Rows are inserted before the indexes so each builds via the sorted-bulk path, matching
 // the Ruby reference's GIN_ARRAY_TABLE.
 func ginArrayTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, nums i32[], n i32)")
 	run(t, db, "INSERT INTO t VALUES (1, '{10,20,30}', 1), (2, '{20,20,40}', 2), (3, '{}', 3), (4, NULL, 4), (5, '{10,NULL,50}', 5)")
 	run(t, db, "CREATE INDEX i_n ON t (n)")
@@ -257,7 +257,7 @@ func ginArrayTableDB(t *testing.T) *Session {
 // empty range force a median split at GIST_FANOUT = 4, so the on-disk tree is two levels (an interior
 // root over two leaves). Row 8's NULL range is not indexed. Mirrors the Ruby reference GIST_RANGE_TABLE.
 func gistRangeTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, r i32range)")
 	run(t, db, "INSERT INTO t VALUES (1, '[1,5)'), (2, '[10,20)'), (3, '[3,8)'), (4, '[100,200)'), "+
 		"(5, '[50,60)'), (6, '[15,25)'), (7, 'empty'), (8, NULL)")
@@ -271,7 +271,7 @@ func gistRangeTableDB(t *testing.T) *Session {
 // room numbers force a median split at GIST_FANOUT = 4, so the on-disk tree is two levels. Row 9's NULL
 // is not indexed. Mirrors the Ruby reference GIST_SCALAR_TABLE.
 func gistScalarTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, room i32)")
 	run(t, db, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 10), (4, 30), (5, 20), (6, 40), (7, 10), "+
 		"(8, 50), (9, NULL)")
@@ -285,7 +285,7 @@ func gistScalarTableDB(t *testing.T) *Session {
 // concatenated with a range during component. 7 indexed rows force a median split at GIST_FANOUT = 4.
 // Row 8's NULL room is exempt (not indexed). Mirrors the Ruby reference GIST_EXCLUDE_TABLE.
 func gistExcludeTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE booking (id i32 PRIMARY KEY, room i32, during i32range, "+
 		"EXCLUDE USING gist (room WITH =, during WITH &&))")
 	run(t, db, "INSERT INTO booking VALUES (1, 101, '[10,20)'), (2, 101, '[20,30)'), "+
@@ -300,7 +300,7 @@ func gistExcludeTableDB(t *testing.T) *Session {
 // dedup (row 2's duplicate bb), an empty and a NULL whole-value array (rows 3/4 → no entries), and a
 // NULL element (row 5). An ordinary ordered index i_n sits beside it (kind 0).
 func ginUuidTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, tags uuid[], n i32)")
 	run(t, db, "INSERT INTO t VALUES "+
 		"(1, '{00000000-0000-0000-0000-0000000000aa,00000000-0000-0000-0000-0000000000bb,00000000-0000-0000-0000-0000000000cc}', 1), "+
@@ -315,7 +315,7 @@ func ginUuidTableDB(t *testing.T) *Session {
 
 // nopkTableDB has no primary key — exercises the stored synthetic i64 rowid key.
 func nopkTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE r (a i16, b i64)")
 	for _, ab := range [][2]int64{{7, 70}, {8, 80}, {9, 90}} {
 		run(t, db, fmt.Sprintf("INSERT INTO r VALUES (%d, %d)", ab[0], ab[1]))
@@ -330,7 +330,7 @@ func nopkTableDB(t *testing.T) *Session {
 // disk. The table rows externalize their (incompressible filler64) text. Must match verify.rb's
 // MAX_SEP_TABLE.
 func maxSepTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE m (id i32 PRIMARY KEY, s text)")
 	run(t, db, "CREATE INDEX i_s ON m (s)")
 	tail := fillerText(104)
@@ -345,7 +345,7 @@ func maxSepTableDB(t *testing.T) *Session {
 // themselves interior nodes) at page_size 256 — exercises interior-of-interior child pointers and
 // post-order page allocation across a deeper tree (spec/fileformat/format.md).
 func tallTreeDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, pad text)")
 	for i := int64(1); i <= 18; i++ {
 		run(t, db, fmt.Sprintf("INSERT INTO t VALUES (%d, 'row-%02d-%s')", i, i, strings.Repeat("x", 48)))
@@ -357,7 +357,7 @@ func tallTreeDB(t *testing.T) *Session {
 // UTF-8 bytes): the empty string, an embedded quote, a 2-byte char (é), a NULL text value,
 // and a 4-byte astral char (😀). The PK stays i32 (no text key this slice).
 func textTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, s text)")
 	run(t, db, "INSERT INTO t VALUES (1, 'alice')")
 	run(t, db, "INSERT INTO t VALUES (2, '')")
@@ -372,7 +372,7 @@ func textTableDB(t *testing.T) *Session {
 // text-column u32 varchar_max_len typmod slot (spec/design/types.md §15). Stored values are within
 // the limit (a too-long value never reaches a golden). Must match verify.rb's VARCHAR_TABLE.
 func varcharTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, code varchar(5), note text)")
 	run(t, db, "INSERT INTO t VALUES (1, 'alice', 'hi')")
 	run(t, db, "INSERT INTO t VALUES (2, 'ab', NULL)")
@@ -384,7 +384,7 @@ func varcharTableDB(t *testing.T) *Session {
 // bool-byte, 0x00 false / 0x01 true) plus a NULL boolean. The PK stays i32 (the boolean
 // PRIMARY KEY case is boolPKTableDB).
 func boolTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, flag boolean)")
 	run(t, db, "INSERT INTO t VALUES (1, TRUE)")
 	run(t, db, "INSERT INTO t VALUES (2, FALSE)")
@@ -398,7 +398,7 @@ func boolTableDB(t *testing.T) *Session {
 // column. Rows go in via INSERT and the store sorts them into key (byte) order: false (0x00)
 // then true (0x01). Must match spec/fileformat/verify.rb's BOOL_PK_TABLE.
 func boolPKTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (k boolean PRIMARY KEY, v boolean)")
 	run(t, db, "INSERT INTO t VALUES (FALSE, TRUE)")
 	run(t, db, "INSERT INTO t VALUES (TRUE, NULL)")
@@ -410,7 +410,7 @@ func boolPKTableDB(t *testing.T) *Session {
 // byte) order: "" < "Zeta"(0x5A) < "apple"(0x61) < "banana"(0x62) < "é"(0xC3). Must match
 // spec/fileformat/verify.rb's TEXT_PK_TABLE.
 func textPKTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (k text PRIMARY KEY, v i32)")
 	run(t, db, "INSERT INTO t VALUES ('', 4)")
 	run(t, db, "INSERT INTO t VALUES ('Zeta', NULL)")
@@ -424,7 +424,7 @@ func textPKTableDB(t *testing.T) *Session {
 // over raw bytes, so the embedded-0x00 escape is exercised. The store sorts into unsigned-byte
 // (key) order: ” < \x00 < \x61 < \x6100ff62 < \x6161 < \x62. Must match BYTEA_PK_TABLE.
 func byteaPKTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (k bytea PRIMARY KEY, v i32)")
 	run(t, db, `INSERT INTO t VALUES ('\x', 5)`)
 	run(t, db, `INSERT INTO t VALUES ('\x00', 6)`)
@@ -440,7 +440,7 @@ func byteaPKTableDB(t *testing.T) *Session {
 // order: -2.5 < -0.5 < 0 < 0.25 < 1.5 < 10 < 100.50; "100.50" stores scale 2 in its value body
 // but normalizes in the key. Must match spec/fileformat/verify.rb's DECIMAL_PK_TABLE.
 func decimalPKTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (k decimal PRIMARY KEY, v i32)")
 	run(t, db, "INSERT INTO t VALUES (-2.5, 6)")
 	run(t, db, "INSERT INTO t VALUES (-0.5, 5)")
@@ -458,7 +458,7 @@ func decimalPKTableDB(t *testing.T) *Session {
 // so storing them is a no-op coercion). Covers positive, negative, zero, a multi-group
 // coefficient, and a NULL. The PK stays i32 (no decimal key this slice).
 func decimalTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, d numeric, m numeric(10,2))")
 	run(t, db, "INSERT INTO t VALUES (1, 1.50, 1.50), (2, -12345.6789, -12.34), "+
 		"(3, 0.00, 0.00), (4, 100000000.000001, 100.00), (5, NULL, NULL)")
@@ -470,7 +470,7 @@ func decimalTableDB(t *testing.T) *Session {
 // NULL, and a lone 0x00. The PK stays i32 (no bytea key this slice). Literals are the `\x`
 // hex input form, adapting to the bytea column (spec/design/types.md §6).
 func byteaTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, b bytea)")
 	run(t, db, `INSERT INTO t VALUES (1, '\xdeadbeef')`)
 	run(t, db, `INSERT INTO t VALUES (2, '\x')`)
@@ -520,7 +520,7 @@ func fillerBytesHex(n int) string {
 // chain. Row 1 spills both columns (multi-page chains), row 2 stays inline, row 3 is NULL/NULL.
 // Must match the Ruby reference's OVERFLOW_TABLE (spec/fileformat/verify.rb).
 func overflowTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, body text, blob bytea)")
 	run(t, db, fmt.Sprintf("INSERT INTO t VALUES (1, '%s', '\\x%s')", fillerText(600), fillerBytesHex(300)))
 	run(t, db, `INSERT INTO t VALUES (2, 'small', '\xcafe')`)
@@ -535,7 +535,7 @@ func overflowTableDB(t *testing.T) *Session {
 // block); row 3 stays inline-plain; row 4 is NULL/NULL. Must match the Ruby reference's
 // COMPRESSED_TABLE (spec/fileformat/verify.rb).
 func compressedTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, body text, blob bytea)")
 	run(t, db, fmt.Sprintf("INSERT INTO t VALUES (1, '%s', '\\x%s')", strings.Repeat("x", 600), strings.Repeat("ab", 200)))
 	run(t, db, fmt.Sprintf("INSERT INTO t VALUES (2, '%s%s', NULL)", fillerText(200), strings.Repeat("y", 200)))
@@ -550,7 +550,7 @@ func compressedTableDB(t *testing.T) *Session {
 // a present and a NULL uuid value, and the nil/max boundary UUIDs. Must match the Ruby
 // reference's UUID_TABLE (spec/fileformat/verify.rb).
 func uuidTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id uuid PRIMARY KEY, ref uuid)")
 	run(t, db, "INSERT INTO t VALUES "+
 		"('00000000-0000-0000-0000-000000000000', '550e8400-e29b-41d4-a716-446655440000'), "+
@@ -565,7 +565,7 @@ func uuidTableDB(t *testing.T) *Session {
 // a DEFAULT NULL, a NOT NULL column with a default, a decimal default coerced to numeric(6,2),
 // and a plain no-default column. Row 1 takes every default; row 2 provides all values.
 func defaultTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, n i32 DEFAULT 0, note text DEFAULT 'none', "+
 		"maybe i32 DEFAULT NULL, req i32 NOT NULL DEFAULT 7, amt numeric(6,2) DEFAULT 1.5, plain i16)")
 	run(t, db, "INSERT INTO t (id) VALUES (1)")
@@ -579,7 +579,7 @@ func defaultTableDB(t *testing.T) *Session {
 // EMPTY table — the catalog encoding is the cross-core proof; the per-row evaluation is covered
 // by the conformance corpus (it is nondeterministic without an injected seed).
 func defaultExprTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, g uuid DEFAULT uuidv7(), n i32 DEFAULT 1 + 1, "+
 		"k i32 DEFAULT 7, plain i16)")
 	return db
@@ -589,7 +589,7 @@ func defaultExprTableDB(t *testing.T) *Session {
 // positive instant, a pre-1970 negative one, a BC-era one, the ±infinity sentinels, and a
 // NULL. The literals parse to the same micros the golden stores. The PK stays i32.
 func timestampTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, ts timestamp)")
 	run(t, db, "INSERT INTO t VALUES (1, '2024-01-01 12:00:00')")
 	run(t, db, "INSERT INTO t VALUES (2, '1969-12-31 23:59:59.5')")
@@ -603,7 +603,7 @@ func timestampTableDB(t *testing.T) *Session {
 // timestamptzTableDB exercises the same 8-byte branch under type code 9; the +05 literal
 // normalizes to UTC before storage.
 func timestamptzTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, ts timestamptz)")
 	run(t, db, "INSERT INTO t VALUES (1, '2024-01-01 12:00:00+00')")
 	run(t, db, "INSERT INTO t VALUES (2, '2024-01-01 12:00:00+05')")
@@ -618,7 +618,7 @@ func timestamptzTableDB(t *testing.T) *Session {
 // a positive multi-field value, a negative value, the zero interval, a months-only '1 mon'
 // vs a span-equal-but-byte-distinct '30 days', and a NULL. The bare-string literals adapt.
 func intervalTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, d interval)")
 	run(t, db, "INSERT INTO t VALUES (1, '1 mon 2 days 03:04:05')")
 	run(t, db, "INSERT INTO t VALUES (2, '-1 day')")
@@ -635,7 +635,7 @@ func intervalTableDB(t *testing.T) *Session {
 // intervals collide on the span key). Inserted in ascending key order to match verify.rb's
 // build_tree (the split shape is order-sensitive); the out-of-order proof is in the conformance test.
 func intervalPKTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (k interval PRIMARY KEY, v i32)")
 	run(t, db, "INSERT INTO t VALUES ('-1 mon', 6)")
 	run(t, db, "INSERT INTO t VALUES ('-1 day', 5)")
@@ -654,7 +654,7 @@ func intervalPKTableDB(t *testing.T) *Session {
 // adaptation); the specials enter via typed literals in INSERT ... SELECT (a VALUES slot takes only
 // bare literals this slice — float.md). PK is i32 (no float key this slice — float PK → 0A000).
 func float64TableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, d f64)")
 	run(t, db, "INSERT INTO t VALUES (1, 1.5)")
 	run(t, db, "INSERT INTO t VALUES (2, -2.5)")
@@ -672,7 +672,7 @@ func float64TableDB(t *testing.T) *Session {
 // special-value coverage as float64TableDB (canonicalized NaN → 0x7FC00000) plus 100.25 (exactly
 // representable in binary32). PK is i32 (no float key this slice).
 func float32TableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, r f32)")
 	run(t, db, "INSERT INTO t VALUES (1, 1.5)")
 	run(t, db, "INSERT INTO t VALUES (2, -2.5)")
@@ -691,7 +691,7 @@ func float32TableDB(t *testing.T) *Session {
 // In-contract literal values only, so the image is cross-core byte-identical; the row set matches
 // FLOAT64_PK_TABLE in spec/fileformat/verify.rb (insertion order is irrelevant — the PK store sorts).
 func float64PKTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE fk (k f64 PRIMARY KEY, v i32)")
 	run(t, db, "INSERT INTO fk VALUES (1.5, 1)")
 	run(t, db, "INSERT INTO fk SELECT f64 '-Infinity', 2")
@@ -704,7 +704,7 @@ func float64PKTableDB(t *testing.T) *Session {
 
 // float32PKTableDB is float64PKTableDB at binary32 width (the 4-byte float-order-preserving key §2.8).
 func float32PKTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE fk (k f32 PRIMARY KEY, v i32)")
 	run(t, db, "INSERT INTO fk VALUES (1.5, 1)")
 	run(t, db, "INSERT INTO fk SELECT f32 '-Infinity', 2")
@@ -720,7 +720,7 @@ func float32PKTableDB(t *testing.T) *Session {
 // one, the −infinity/+infinity sentinels (i32 min/max), and a NULL. The bare-string literals adapt
 // to the date column. PK is i32 (spec/design/date.md).
 func dateTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, d date)")
 	run(t, db, "INSERT INTO t VALUES (1, '2024-01-15')")
 	run(t, db, "INSERT INTO t VALUES (2, '1969-12-31')")
@@ -735,7 +735,7 @@ func dateTableDB(t *testing.T) *Session {
 // stored values (S3): pins the recursive value codec — the null bitmap, a present-field body, and a
 // NULL field's zero-byte omission (row 2's zip) — spec/design/composite.md §4.
 func compositeTypeTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TYPE addr AS (street text NOT NULL, zip i32)")
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, home addr)")
 	run(t, db, "INSERT INTO t VALUES (1, ROW('Main', 90210))")
@@ -749,7 +749,7 @@ func compositeTypeTableDB(t *testing.T) *Session {
 // composite bodies). Row 2's element has a NULL `zip` field (the composite null-bitmap inside an
 // element); row 3 mixes a present composite element with a NULL element (the array HAS_NULLS bitmap).
 func arrayCompositeTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TYPE addr AS (street text NOT NULL, zip i32)")
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, items addr[])")
 	run(t, db, `INSERT INTO t VALUES (1, '{"(Main,90210)","(Side,5)"}')`)
@@ -766,7 +766,7 @@ func arrayCompositeTableDB(t *testing.T) *Session {
 // array body). Row 2 has an empty array field {} (ndim 0); row 3 a NULL array field (the composite
 // null-bitmap).
 func compositeArrayFieldTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TYPE poly AS (name text, pts i32[])")
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, p poly)")
 	run(t, db, "INSERT INTO t VALUES (1, ROW('a', '{10,20,30}'))")
@@ -781,7 +781,7 @@ func compositeArrayFieldTableDB(t *testing.T) *Session {
 // references, so the two-pass load (collect all, then resolve) is exercised; the row pins the
 // recursive value codec descending through a composite field.
 func nestedCompositeTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TYPE point AS (x i32 NOT NULL, y i32 NOT NULL)")
 	run(t, db, "CREATE TYPE line AS (a point, b point)")
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, ln line)")
@@ -798,7 +798,7 @@ func nestedCompositeTableDB(t *testing.T) *Session {
 // table t follows, proving sequences and tables coexist in catalog order. Must match the Ruby
 // reference's SEQUENCE_TABLE (spec/fileformat/verify.rb).
 func sequenceTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE SEQUENCE s1")
 	run(t, db, "SELECT nextval('s1')")
 	run(t, db, "SELECT nextval('s1')")
@@ -815,7 +815,7 @@ func sequenceTableDB(t *testing.T) *Session {
 // one INSERT advances it once (is_called true, last_value 1). Must match the Ruby reference's
 // SERIAL_TABLE (spec/fileformat/verify.rb), spec/design/sequences.md §12.
 func serialTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id serial PRIMARY KEY, v text)")
 	run(t, db, "INSERT INTO t (v) VALUES ('hello')")
 	return db
@@ -827,7 +827,7 @@ func serialTableDB(t *testing.T) *Session {
 // default-i64 sequence + an expression DEFAULT nextval('<seq>'). One INSERT advances both. Must
 // match the Ruby reference's IDENTITY_TABLE (spec/fileformat/verify.rb), spec/design/sequences.md §13.
 func identityTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, "+
 		"n int GENERATED BY DEFAULT AS IDENTITY, v text)")
 	run(t, db, "INSERT INTO t (v) VALUES ('hi')")
@@ -841,7 +841,7 @@ func identityTableDB(t *testing.T) *Session {
 // COLLATE "C" column (no collation). unicode is NOT imported — it is provided by a loaded bundle, and
 // its metadata entry is emitted because the schema references it. Must match the Ruby COLLATION_TABLE.
 func collationTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	if err := db.SetDefaultCollation("unicode"); err != nil { // loaded — no import
 		t.Fatalf("set default: %v", err)
 	}
@@ -857,7 +857,7 @@ func collationTableDB(t *testing.T) *Session {
 // collation order. unicode is loaded (not the default; its entry is emitted because the columns
 // reference it). Must match the Ruby reference's COLLATION_PK_TABLE.
 func collationPKTableDB(t *testing.T) *Session {
-	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, `CREATE TABLE t (name text COLLATE "unicode" PRIMARY KEY, tag text COLLATE "unicode")`)
 	run(t, db, `CREATE INDEX t_tag_idx ON t (tag)`)
 	// Inserted out of collation order; stored in collation order ('a' < 'z' by the sort key).
@@ -873,7 +873,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		name  string
 		build func(*testing.T) *Session
 	}{
-		{"empty_db.jed", func(*testing.T) *Session { return NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{}) }},
+		{"empty_db.jed", func(*testing.T) *Session { return newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{}) }},
 		{"overflow_table.jed", overflowTableDB},
 		{"compressed_table.jed", compressedTableDB},
 		{"one_table_empty.jed", oneTableEmptyDB},
@@ -1096,7 +1096,7 @@ func TestDefaultSurvivesLoad(t *testing.T) {
 // hex, but the real default must work too).
 func TestRoundTripAtDefaultPageSize(t *testing.T) {
 	// Built at 8192 so the in-memory tree is sized for it (fan-out tracks the page size — format.md).
-	db := NewInMemoryWithPageSize(8192).Session(SessionOptions{})
+	db := newInMemoryWithPageSize(8192).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i16)")
 	for i := int64(1); i <= 20; i++ {
 		v := fmt.Sprintf("%d", i*10)

@@ -61,7 +61,7 @@ func TestCteMaterializedHintForcesBuffering(t *testing.T) {
 // cross-iteration meter (recursive-cte.md §5) — the untrusted-query safety mechanism doing real
 // work. A per-iteration meter would never fire here, so the corpus cannot express it.
 func TestCteRecursiveUnboundedAbortsAtCostCeiling(t *testing.T) {
-	db := NewDatabase().Session(SessionOptions{})
+	db := memDB().Session(SessionOptions{})
 	db.SetMaxCost(1000)
 	_, err := db.Execute("WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c) SELECT n FROM c", nil)
 	if err == nil {
@@ -76,7 +76,7 @@ func TestCteRecursiveUnboundedAbortsAtCostCeiling(t *testing.T) {
 // actual accrued cost, not a per-iteration figure); the 5-row counter accrues 29 (the corpus cost
 // contract).
 func TestCteRecursiveUnderCeilingSucceeds(t *testing.T) {
-	db := NewDatabase().Session(SessionOptions{})
+	db := memDB().Session(SessionOptions{})
 	db.SetMaxCost(1000)
 	if got := cteCost(t, db,
 		"WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 5) SELECT n FROM c"); got != 29 {
@@ -87,7 +87,7 @@ func TestCteRecursiveUnderCeilingSucceeds(t *testing.T) {
 // A recursive CTE is ALWAYS materialized — NOT MATERIALIZED is inert (recursive-cte.md §1), so a
 // single-reference recursive CTE still iterates to a fixpoint (3 rows, cost 17) rather than inlining.
 func TestCteRecursiveHintIsInert(t *testing.T) {
-	db := NewDatabase().Session(SessionOptions{})
+	db := memDB().Session(SessionOptions{})
 	for _, hint := range []string{"", "MATERIALIZED ", "NOT MATERIALIZED "} {
 		sql := "WITH RECURSIVE c(n) AS " + hint +
 			"(SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 3) SELECT n FROM c ORDER BY n"

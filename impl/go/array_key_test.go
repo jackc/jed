@@ -91,7 +91,7 @@ func TestFloatElementArrayMultidimKeyOrder(t *testing.T) {
 // TestCompositeElementArrayKeysRejected: a composite-element array key is still 0A000 (composite not
 // yet keyable), while float-element arrays are accepted everywhere a key is taken.
 func TestCompositeElementArrayKeysRejected(t *testing.T) {
-	db := NewDatabase().Session(SessionOptions{})
+	db := memDB().Session(SessionOptions{})
 	if _, err := db.Execute("CREATE TYPE addr AS (street text, zip i32)", nil); err != nil {
 		t.Fatal(err)
 	}

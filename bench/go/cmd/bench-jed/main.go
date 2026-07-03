@@ -30,7 +30,7 @@ func open(dataDir, dataset string) (bench.Engine, error) {
 			return nil, err
 		}
 		e.scratch = dir
-		db, err := jed.CreateDatabase(filepath.Join(dir, "scratch.jed"), jed.DefaultDatabaseOptions())
+		db, err := jed.CreateDatabase(jed.CreateOptions{Path: filepath.Join(dir, "scratch.jed")})
 		if err != nil {
 			os.RemoveAll(dir)
 			return nil, err

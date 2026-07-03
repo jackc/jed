@@ -27,7 +27,7 @@ func sessCode(t *testing.T, err error) string {
 func TestDefaultSessionIsStatefulAcrossCalls(t *testing.T) {
 	// The Engine-owned default session holds an open BEGIN block across *separate* calls (the
 	// PG/SQLite connection model, §2.1); db.Status() exposes the explicit state machine.
-	db := NewDatabase().Session(SessionOptions{})
+	db := memDB().Session(SessionOptions{})
 	if db.Status() != TxIdle {
 		t.Fatalf("fresh db: want Idle, got %v", db.Status())
 	}
@@ -49,7 +49,7 @@ func TestDefaultSessionIsStatefulAcrossCalls(t *testing.T) {
 func TestFailedBlockIsTheFailedState(t *testing.T) {
 	// A statement error inside a block poisons it: status is Failed, every later statement but
 	// ROLLBACK/COMMIT is 25P02 (§2.2 / transactions.md §6), and ROLLBACK returns to Idle.
-	db := NewDatabase().Session(SessionOptions{})
+	db := memDB().Session(SessionOptions{})
 	sessExec(t, db, "BEGIN")
 	_, err := db.Execute("SELECT * FROM missing", nil)
 	if got := sessCode(t, err); got != "42P01" {
@@ -71,7 +71,7 @@ func TestFailedBlockIsTheFailedState(t *testing.T) {
 func TestAdditionalSessionSharesStorageWithIndependentSettings(t *testing.T) {
 	// Two sessions over one shared Database core: each owns its private Engine, but committed storage
 	// is shared through the core (§2.4) — no swap. Settings (the cost ceiling) are independent.
-	db := NewDatabase()
+	db := memDB()
 	a := db.Session(SessionOptions{})
 	if _, err := a.Execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", nil); err != nil {
 		t.Fatal(err)
@@ -119,7 +119,7 @@ func TestAdditionalSessionSharesStorageWithIndependentSettings(t *testing.T) {
 func TestAdditionalSessionCostCeilingEnforced(t *testing.T) {
 	// The session's settings drive the execution path: a tiny ceiling aborts the scan with 54P01,
 	// while an unlimited session runs it fine — both over the same shared core.
-	db := NewDatabase()
+	db := memDB()
 	a := db.Session(SessionOptions{})
 	if _, err := a.Execute("CREATE TABLE t (id i32 PRIMARY KEY)", nil); err != nil {
 		t.Fatal(err)
@@ -146,7 +146,7 @@ func TestAdditionalSessionCostCeilingEnforced(t *testing.T) {
 }
 
 func TestAdditionalSessionUpdateClosureCommitsToSharedStorage(t *testing.T) {
-	db := NewDatabase()
+	db := memDB()
 	a := db.Session(SessionOptions{})
 	if _, err := a.Execute("CREATE TABLE t (id i32 PRIMARY KEY)", nil); err != nil {
 		t.Fatal(err)

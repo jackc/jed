@@ -105,7 +105,7 @@ func TestSpillingSortMatchesInMemory(t *testing.T) {
 
 	// The source of truth: the same data + queries against a pure in-memory database, which never
 	// spills (spill.md §2).
-	mem := NewDatabase().Session(SessionOptions{})
+	mem := memDB().Session(SessionOptions{})
 	seedSpill(t, mem, 200)
 
 	// A file-backed database with a tiny workMem so every shape spills many runs and k-way-merges.

@@ -94,6 +94,16 @@ type result struct {
 
 // parseOp splits a writer's `op` into the executable statements: bare BEGIN/COMMIT/ROLLBACK are
 // transaction MARKERS, mapped onto the handle's open/commit (§6), so they are dropped here.
+// memDB builds a fresh in-memory database, unwrapping the infallible in-memory CreateDatabase
+// (spec/design/api.md §2.1.1 — the in-memory create cannot fail).
+func memDB() *jed.Database {
+	db, err := jed.CreateDatabase(jed.CreateOptions{})
+	if err != nil {
+		panic("in-memory CreateDatabase is infallible: " + err.Error())
+	}
+	return db
+}
+
 func parseOp(op string) []string {
 	var stmts []string
 	for _, part := range strings.Split(op, ";") {
@@ -437,7 +447,7 @@ func runFile(path string, forceSequential bool) result {
 	}
 	res.Mode = map[bool]string{true: "sequential", false: "threaded"}[sequential]
 
-	db := jed.NewDatabase()
+	db := memDB()
 	if err := setup(db, &f); err != nil {
 		res.Status, res.Error = "fail", err.Error()
 		return res

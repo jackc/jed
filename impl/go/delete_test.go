@@ -17,7 +17,7 @@ func setupDelete(t *testing.T) *Session {
 }
 
 func TestDeleteMissingTable(t *testing.T) {
-	wantErr(t, NewDatabase().Session(SessionOptions{}), "DELETE FROM nope", "42P01")
+	wantErr(t, memDB().Session(SessionOptions{}), "DELETE FROM nope", "42P01")
 }
 
 func TestDeleteUnknownColumn(t *testing.T) {

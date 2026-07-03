@@ -1269,7 +1269,7 @@ func serializeDirty(n *pnode, colTypes []colType, capacity, ps int, alloc *pageA
 // path as an in-memory database, with a PINNED (unbounded) pool — a temp domain is resident by
 // definition (§5) — and within-session compaction ON, so its copy-on-write orphans are reclaimed rather
 // than leaked (a temp store is never reopened, so reconstruct-on-open never runs). It seeds the store
-// with the empty from-scratch image exactly as an in-memory database does (NewInMemoryWithPageSize), so
+// with the empty from-scratch image exactly as an in-memory database does (newInMemoryWithPageSize), so
 // pagerFromStore reads the page size and pageCount starts past the meta slots. Zero file writes: this
 // byte store is entirely separate from the main database file.
 func newTempStorage(pageSize uint32) *storage {

@@ -33,7 +33,7 @@ func readCount(t *testing.T, r *Session) int64 {
 // seeded builds a shared db with table t holding the given ids, committed via a write handle.
 func seeded(t *testing.T, ids ...int64) *Database {
 	t.Helper()
-	db := NewDatabase()
+	db := memDB()
 	w := db.WriteSession()
 	if _, err := w.Execute("CREATE TABLE t (id bigint PRIMARY KEY)", nil); err != nil {
 		t.Fatalf("create: %v", err)

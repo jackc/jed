@@ -106,7 +106,7 @@ func setupJed(dataDir string, ds *bench.Dataset, fingerprint string, force bool)
 	os.Remove(path)
 	os.Remove(bench.SidecarPath(dataDir, ds.Name, "jed"))
 
-	db, err := jed.CreateDatabase(path, jed.DefaultDatabaseOptions())
+	db, err := jed.CreateDatabase(jed.CreateOptions{Path: path})
 	if err != nil {
 		return err
 	}

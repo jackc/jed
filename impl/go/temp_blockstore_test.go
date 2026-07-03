@@ -17,7 +17,7 @@ import (
 // own in-RAM MemoryBlockStore: rows read back correctly (faulting demoted leaves through the temp pool),
 // and heavy churn stays bounded (within-session compaction reclaims copy-on-write orphans — no leak).
 func TestSessionLocalTempRunsThroughBlockStore(t *testing.T) {
-	db := NewInMemoryWithPageSize(256)
+	db := newInMemoryWithPageSize(256)
 	sess := db.Session(SessionOptions{})
 	sessExec(t, sess, "CREATE TEMP TABLE lt (id i32 PRIMARY KEY, pad text)")
 	base := strings.Repeat("x", 40)
@@ -58,7 +58,7 @@ func TestSessionLocalTempRunsThroughBlockStore(t *testing.T) {
 // measure (committed pageCount × page_size) counts every allocated page, so a growing temp table hits
 // 54P03 deterministically.
 func TestSessionLocalTempPageBudgetBoundsMultiLeaf(t *testing.T) {
-	db := NewInMemoryWithPageSize(256)
+	db := newInMemoryWithPageSize(256)
 	// ~20 pages of budget: a single leaf (≤ ~240 record bytes) is far under it, so a record-byte measure
 	// would never abort; the page footprint crosses it as the tree grows past ~20 pages.
 	budget := 20 * 256

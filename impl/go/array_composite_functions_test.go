@@ -11,7 +11,7 @@ import "testing"
 
 func addrDB(t *testing.T) *Session {
 	t.Helper()
-	db := NewDatabase().Session(SessionOptions{})
+	db := memDB().Session(SessionOptions{})
 	runArray(t, db, "CREATE TYPE addr AS (street text, zip i32)")
 	return db
 }
