@@ -61,7 +61,25 @@ import (
 // never race. (A wrapper struct rather than a bare atomic.Pointer[snapshot] so a second published root
 // can be re-added without reshaping the pin discipline.)
 type roots struct {
-	committed *snapshot // the committed FILE snapshot
+	committed *snapshot // the committed FILE snapshot (the `main` database)
+	// attached is the published committed root of every host-attached DATABASE-scoped in-memory
+	// database (spec/design/attached-databases.md §5), keyed by lowercased attachment name. A reader
+	// pins the whole roots in one lock-free Load, so it sees a CONSISTENT cross-database snapshot
+	// (main + every attachment together). nil/empty when nothing is attached — the common case, and
+	// byte-for-byte the pre-attachment behavior. Session-local `temp` is NOT here: it is
+	// session-private (held on sessionState.tempCommitted), invisible to other sessions by design, so
+	// only DATABASE-scoped roots are published. The N-root commit (attached-databases.md §5) swaps
+	// every touched root in this one struct with a single Store.
+	attached map[string]*snapshot
+}
+
+// attachSnapshots returns the attached root for name (lowercased), or nil. A tiny helper so the
+// resolution funnels stay readable; a nil map (nothing attached) yields nil.
+func (r *roots) attachSnapshot(name string) *snapshot {
+	if r.attached == nil {
+		return nil
+	}
+	return r.attached[name]
 }
 
 // sharedCore is the goroutine-safe state shared by every handle minted from one Database
@@ -83,6 +101,34 @@ type sharedCore struct {
 	// the writer gate, so its own mutex is uncontended; paging itself is goroutine-safe
 	// (sharedPaging).
 	storage *storage
+	// attachments is the registry of host-attached DATABASE-scoped databases (attached-databases.md
+	// §2/§5), keyed by lowercased name. Each attachment's MUTABLE storage identity (block store + pager
+	// + page accounting) lives here; its immutable published root lives in roots.attached under the same
+	// key. Populated by Database.Attach / cleared by Database.Detach (host-API, §4), both under the
+	// writer gate. nil/empty when nothing is attached — the common case, byte-for-byte the
+	// pre-attachment behavior. Session-local temp is NOT here (it is session-private, on sessionState).
+	attachments map[string]*attachment
+}
+
+// attachMode is an attachment's write disposition (attached-databases.md §4). A read-only attachment
+// rejects every write (DML + DDL) with 25006 before any I/O — the natural mode for a reference
+// database — and never competes for the one-durable-writer slot (§5).
+type attachMode int
+
+const (
+	attachReadWrite attachMode = iota
+	attachReadOnly
+)
+
+// attachment is one host-attached DATABASE-scoped database in a handle's namespace
+// (attached-databases.md §2): a named (storage, published-root) quad reachable by a database
+// qualifier. The storage identity (mutable page accounting, writer-gated) lives here; the immutable
+// committed snapshot lives in roots.attached[name] so a reader pins it lock-free with every other
+// root. In Slice 1b every attachment is in-memory (a memoryBlockStore, kind file deferred to Slice 2).
+type attachment struct {
+	name    string     // lowercased qualifier name (the map key)
+	mode    attachMode // readWrite | readOnly (§4)
+	storage *storage   // the in-memory block store + pager + page accounting (like the temp domain)
 }
 
 // storage is the storage identity of a database (spec/design/session.md §2.4; bplus-reshape.md B3):
@@ -303,6 +349,23 @@ func sharedCoreFromEngine(e *engine) *sharedCore {
 type Database struct {
 	core *sharedCore
 }
+
+// AttachSource selects the backing for a database attached via Database.Attach
+// (spec/design/attached-databases.md §4). It is a stable memory|file variant from Slice 1b: only a
+// MEMORY source is supported now (a fresh, empty in-memory database); a FILE source is reserved for
+// Slice 2 and currently returns 0A000, so the Attach signature never changes when file attach lands.
+// Build one with AttachMemory() or AttachFile(path).
+type AttachSource struct {
+	file bool   // false = in-memory (Slice 1b); true = file-backed (Slice 2, 0A000 for now)
+	path string // the file path, when file is true
+}
+
+// AttachMemory returns a source for a fresh, empty in-memory attachment (attached-databases.md §6).
+func AttachMemory() AttachSource { return AttachSource{} }
+
+// AttachFile returns a source for a file-backed attachment. Reserved for Slice 2: Database.Attach with
+// a file source is currently 0A000 (feature_not_supported).
+func AttachFile(path string) AttachSource { return AttachSource{file: true, path: path} }
 
 // CreateOptions are the settings for creating a fresh database (spec/design/api.md §2.1). Path
 // selects the backing: the zero value "" builds an in-memory database (never touches the

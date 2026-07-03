@@ -1004,6 +1004,17 @@ type engine struct {
 	// compaction (persistTemp → maybeCompact) must NOT reclaim pages — it could free one the cursor still
 	// faults. Incremented when a streaming Rows opens, decremented on Close (single-threaded per handle).
 	openStreams int
+	// core is the shared core this engine's session belongs to (attached-databases.md §5), or nil for a
+	// bare/transient engine (a test engine, a snapshotEngine, committedEngine — none of which see
+	// attachments). It is the engine's route to the core-owned attachment registry (core.attachments)
+	// during a commit persist; the READ view of attachments is the pinned attachedCommitted below.
+	core *sharedCore
+	// attachedCommitted is the PINNED committed root of every host-attached DATABASE-scoped database
+	// (attached-databases.md §5), keyed by lowercased name — this session's stable read view, snapshot
+	// isolated: refreshed from core.roots.attached at each autocommit statement (refreshCommitted) and
+	// pinned for the life of an explicit BEGIN block. nil/empty when nothing is attached. Session-local
+	// temp is NOT here (it is on sessionState.tempCommitted); this is only the Database-scoped roots.
+	attachedCommitted map[string]*snapshot
 }
 
 // SessionOptions are the relocatable session settings (spec/design/session.md §3 — the bucket-A
@@ -1293,6 +1304,16 @@ type activeTx struct {
 	// write funnels. With mainDirty it decides whether COMMIT persists the main image (a pure-temp
 	// commit skips it; an empty block still persists, preserving prior behavior).
 	tempDirty bool
+	// attachWorking is the transaction's working copy of a host-attached database's snapshot
+	// (attached-databases.md §5), keyed by lowercased attachment name — the attachment analogue of
+	// tempWorking. Cloned lazily from engine.attachedCommitted[name] on the first write to that
+	// attachment (attachWriteSnap), so a read-only cross-attachment query allocates nothing here.
+	// Adopted into engine.attachedCommitted + persisted+published on a successful COMMIT, discarded on
+	// ROLLBACK. nil until an attachment is written.
+	attachWorking map[string]*snapshot
+	// attachDirty records which attachments this transaction mutated (lowercased name → true), the
+	// per-attachment analogue of mainDirty/tempDirty — the set the commit persists + publishes.
+	attachDirty map[string]bool
 }
 
 // NewEngine builds an empty in-memory database.
@@ -1433,9 +1454,165 @@ func (db *engine) checkTableQualifier(qualifier *string, name string) error {
 			return newError(UndefinedTable, `relation "main.`+name+`" does not exist`)
 		}
 	default:
-		return newError(UndefinedTable, `database "`+*qualifier+`" is not attached`)
+		snap := db.attachReadSnap(strings.ToLower(*qualifier))
+		if snap == nil {
+			return newError(UndefinedTable, `database "`+*qualifier+`" is not attached`)
+		}
+		if _, ok := snap.table(name); !ok {
+			return newError(UndefinedTable, `relation "`+*qualifier+`.`+name+`" does not exist`)
+		}
 	}
 	return nil
+}
+
+// checkAttachmentWritable rejects a WRITE (DML or DDL) targeting a READ-ONLY host attachment with 25006
+// (attached-databases.md §4), before any I/O. A nil scope, or `main`/`temp` (never read-only via a
+// qualifier — the read-only handle path is separate), or a read-write attachment passes. Unknown
+// attachments are caught by the qualifier gate, so this only inspects the attachment's mode.
+func (db *engine) checkAttachmentWritable(scope *string) error {
+	if scope == nil || db.core == nil {
+		return nil
+	}
+	name := strings.ToLower(*scope)
+	if name == "main" || name == "temp" {
+		return nil
+	}
+	if att := db.core.attachments[name]; att != nil && att.mode == attachReadOnly {
+		return newError(ReadOnlySqlTransaction,
+			`cannot write to read-only database "`+*scope+`"`)
+	}
+	return nil
+}
+
+// attachReadSnap returns the READ snapshot of a host-attached database (attached-databases.md §5) — the
+// transaction's working clone if this tx wrote it, else the pinned committed root (attachedCommitted).
+// nil when no attachment is named `name` (the caller raises 42P01). name is expected lowercased.
+func (db *engine) attachReadSnap(name string) *snapshot {
+	if db.session.tx != nil {
+		if ws := db.session.tx.attachWorking[name]; ws != nil {
+			return ws
+		}
+	}
+	return db.attachedCommitted[name]
+}
+
+// attachWriteSnap returns the WRITE snapshot of a host-attached database, cloning the pinned committed
+// root into the transaction's per-attachment working set on first write and marking it dirty (the
+// attachment analogue of working()/tempWorking). Returns nil if the attachment is unknown (unreachable
+// after the qualifier gate). name is expected lowercased.
+func (db *engine) attachWriteSnap(name string) *snapshot {
+	tx := db.session.tx
+	if tx.attachWorking == nil {
+		tx.attachWorking = make(map[string]*snapshot)
+		tx.attachDirty = make(map[string]bool)
+	}
+	if ws := tx.attachWorking[name]; ws != nil {
+		tx.attachDirty[name] = true
+		return ws
+	}
+	base := db.attachedCommitted[name]
+	if base == nil {
+		return nil
+	}
+	ws := base.clone()
+	tx.attachWorking[name] = ws
+	tx.attachDirty[name] = true
+	return ws
+}
+
+// snapForScope returns the READ snapshot for an explicit database qualifier (attached-databases.md §3):
+// `main` / `temp` / a host attachment. Used only when scope != nil; a nil scope keeps the bare
+// temp-first funnels (a name is temp XOR persistent). nil for an unknown attachment (the qualifier gate
+// already raised 42P01, so unreachable in practice).
+func (db *engine) snapForScope(scope string) *snapshot {
+	switch strings.ToLower(scope) {
+	case "temp":
+		return db.tempSnap()
+	case "main":
+		return db.readSnap()
+	default:
+		return db.attachReadSnap(strings.ToLower(scope))
+	}
+}
+
+// lkpTableScoped resolves a table's catalog entry honoring an explicit database qualifier
+// (attached-databases.md §3); a nil scope keeps the bare temp-first walk.
+func (db *engine) lkpTableScoped(scope *string, name string) (*catTable, bool) {
+	if scope == nil {
+		return db.lkpTable(name)
+	}
+	snap := db.snapForScope(*scope)
+	if snap == nil {
+		return nil, false
+	}
+	return snap.table(name)
+}
+
+// lkpStoreScoped resolves a table's READ store honoring an explicit database qualifier; nil scope keeps
+// the bare temp-first funnel.
+func (db *engine) lkpStoreScoped(scope *string, name string) *tableStore {
+	if scope == nil {
+		return db.lkpStore(name)
+	}
+	snap := db.snapForScope(*scope)
+	if snap == nil {
+		return nil
+	}
+	return snap.store(name)
+}
+
+// writeStoreScoped resolves a table's WRITE store honoring an explicit database qualifier, marking the
+// right domain dirty (main / temp / the attachment); nil scope keeps the bare temp-first funnel.
+func (db *engine) writeStoreScoped(scope *string, name string) *tableStore {
+	if scope == nil {
+		return db.writeStore(name)
+	}
+	switch strings.ToLower(*scope) {
+	case "temp":
+		db.session.tx.tempDirty = true
+		return db.session.tx.tempWorking.store(name)
+	case "main":
+		return db.working().store(name)
+	default:
+		ws := db.attachWriteSnap(strings.ToLower(*scope))
+		if ws == nil {
+			return nil
+		}
+		return ws.store(name)
+	}
+}
+
+// lkpIndexStoreScoped / writeIndexStoreScoped are the index-store analogues of lkpStoreScoped /
+// writeStoreScoped: an index belongs to the same database as its table, so the DML target's scope
+// routes them. nil scope keeps the bare temp-first funnel.
+func (db *engine) lkpIndexStoreScoped(scope *string, nameKey string) *tableStore {
+	if scope == nil {
+		return db.lkpIndexStore(nameKey)
+	}
+	snap := db.snapForScope(*scope)
+	if snap == nil {
+		return nil
+	}
+	return snap.indexStore(nameKey)
+}
+
+func (db *engine) writeIndexStoreScoped(scope *string, nameKey string) *tableStore {
+	if scope == nil {
+		return db.writeIndexStore(nameKey)
+	}
+	switch strings.ToLower(*scope) {
+	case "temp":
+		db.session.tx.tempDirty = true
+		return db.session.tx.tempWorking.indexStore(nameKey)
+	case "main":
+		return db.working().indexStore(nameKey)
+	default:
+		ws := db.attachWriteSnap(strings.ToLower(*scope))
+		if ws == nil {
+			return nil
+		}
+		return ws.indexStore(nameKey)
+	}
 }
 
 // compositeDependentAny is the DROP TYPE … RESTRICT dependency check across every visible scope
