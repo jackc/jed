@@ -373,6 +373,9 @@ type typeMod struct {
 // (spec/design/grammar.md §12).
 type insert struct {
 	Table string
+	// DB is the optional database qualifier on the target (`INSERT INTO reports.t …`), like
+	// tableRef.DB (spec/design/attached-databases.md §3). Nil = implicit scope.
+	DB *string
 	// Columns is the optional explicit column list (`INSERT INTO t (a, c) VALUES ...` /
 	// `... SELECT ...`); nil is the positional form (every column, in declaration order). Names
 	// resolve at execution time (unknown → 42703, duplicate → 42701); an unlisted column takes
@@ -454,7 +457,10 @@ type insertValue struct {
 // key is recomputed and the row moves (see the executor). The WHERE expression must
 // resolve to boolean.
 type update struct {
-	Table       string
+	Table string
+	// DB is the optional database qualifier on the target (`UPDATE reports.t SET …`), like
+	// tableRef.DB (spec/design/attached-databases.md §3). Nil = implicit scope.
+	DB          *string
 	Assignments []assignment
 	Filter      *exprNode
 	// Returning is the optional terminal RETURNING clause (spec/design/grammar.md §32):
@@ -471,7 +477,10 @@ type assignment struct {
 // Delete is `DELETE FROM <table> [WHERE <expr>]`. No WHERE deletes every row; the
 // WHERE expression must resolve to boolean.
 type deleteStmt struct {
-	Table  string
+	Table string
+	// DB is the optional database qualifier on the target (`DELETE FROM reports.t …`), like
+	// tableRef.DB (spec/design/attached-databases.md §3). Nil = implicit scope.
+	DB     *string
 	Filter *exprNode
 	// Returning is the optional terminal RETURNING clause (spec/design/grammar.md §32):
 	// project each deleted row's OLD values. Nil = no clause.
@@ -505,7 +514,13 @@ type deleteStmt struct {
 // function; a table function is implicitly lateral, so the planner correlates an SRF's args to the
 // earlier siblings whether or not this flag is set.
 type tableRef struct {
-	Name          string
+	Name string
+	// DB is the optional database qualifier (`reports.sales` → DB="reports", Name="sales"), jed's
+	// first multi-part name in table position (spec/design/attached-databases.md §3). Nil = a bare,
+	// implicit-scope name. Only the reserved implicit qualifiers `main` (the file database) and `temp`
+	// (the session-local domain) resolve this slice; any other is 42P01 (Slice 1b adds host-attached
+	// databases). Never set on the function / derived-table alternatives.
+	DB            *string
 	Alias         *string
 	IsFunc        bool
 	Args          []*exprNode

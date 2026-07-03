@@ -348,7 +348,7 @@ type_name      ::= identifier ("(" integer ("," integer)? ")")?
  * explicit value land in a GENERATED ALWAYS column (otherwise 428C9); "OVERRIDING USER VALUE"
  * discards any supplied value and uses the column's identity sequence instead. It is accepted (a
  * no-op) on a statement with no identity target, matching PostgreSQL. */
-insert         ::= "INSERT" "INTO" identifier ("(" identifier ("," identifier)* ")")?
+insert         ::= "INSERT" "INTO" qualified_table ("(" identifier ("," identifier)* ")")?
                    ("OVERRIDING" ("SYSTEM" | "USER") "VALUE")?
                    ( "VALUES" row ("," row)* | select )
                    on_conflict?
@@ -376,14 +376,14 @@ conflict_target ::= "(" identifier ("," identifier)* ")"
 conflict_action ::= "DO" "NOTHING"
                   | "DO" "UPDATE" "SET" assignment ("," assignment)* where_clause?
 
-update         ::= "UPDATE" identifier "SET"
+update         ::= "UPDATE" qualified_table "SET"
                    assignment ("," assignment)*
                    where_clause?
                    returning_clause?
 
 assignment     ::= identifier "=" expr
 
-delete         ::= "DELETE" "FROM" identifier where_clause? returning_clause?
+delete         ::= "DELETE" "FROM" qualified_table where_clause? returning_clause?
 
 /* The terminal clause of the three DML statements (../design/grammar.md §32): the statement
  * becomes a query result projecting each affected row — INSERT the stored row, UPDATE the new
@@ -614,7 +614,25 @@ from_item      ::= table_ref join_clause*
 
 table_ref      ::= "LATERAL"? derived_table derived_alias?
                  | "LATERAL"? table_function ("AS"? identifier)?
-                 | identifier ("AS"? identifier)?
+                 | qualified_table ("AS"? identifier)?
+
+/* A database-QUALIFIED table name (../design/attached-databases.md §3). jed's FIRST multi-part name
+ * in TABLE position: an OPTIONAL leading `db "."` names the ATTACHED DATABASE the table lives in
+ * (`reports.sales` = table `sales` in the attachment `reports`); a bare name resolves in IMPLICIT
+ * scope (the file database `main` + the session-local `temp`). The qualifier is a DATABASE, NOT a
+ * schema (jed has no schemas, no search_path — §3). `main` and `temp` are the two RESERVED implicit
+ * qualifiers, always present; any other qualifier must name a host-attached database (Slice 1b) — an
+ * unknown one is 42P01 ("database \"x\" is not attached"), and a qualified name whose TABLE is absent
+ * in that database is 42P01 as usual. There is NO implicit search into explicit attachments and NO
+ * silent shadowing: you reach an attachment ONLY by qualifier (a divergence from SQLite's attach-order
+ * shadowing — §12 D-ATTACH-2). The qualifier never appears in COLUMN position — a column stays the
+ * 2-part `label.col` (the relation's alias / table name, never the database — §3); 3-part
+ * `db.table.col` is a deferred ergonomic follow-on. The `db "."` slot is free because a bare
+ * `identifier` never carried a leading dot in table position (the only dotted name was `rel.col`, in
+ * column position). DISAMBIGUATION: after the first identifier a `.` begins the qualified form, a `(`
+ * the set-returning function form (a cross-database SRF is not a thing — the function alternative stays
+ * unqualified), and anything else a bare/aliased base table. */
+qualified_table ::= (identifier ".")? identifier
 
 /* A derived table's body is either a query_expr (SELECT / set op) or a VALUES list — a computed
  * relation of literal rows (../design/grammar.md §42). The VALUES body takes NO trailing

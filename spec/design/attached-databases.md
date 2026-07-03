@@ -20,11 +20,17 @@
 > §2/§5). Attachment **generalizes "a few hardcoded extra snapshots" into "N named attachments,"** and
 > in doing so lets temp stop being bespoke machinery and become *an attached in-memory database* (§6).
 >
-> **Status: PROPOSED — design only, nothing sliced.** This doc fixes the model and the decisions
-> before any code, spec-first (CLAUDE.md §11). The two decisions that were open at first draft are now
-> **settled** (maintainer, 2026-07-03): **attach is host-API only — no SQL attach in any form** (§4),
-> and the **`SHARED TEMP` surface is retired** in favor of a `Database`-scoped in-memory attachment
-> (§6). The grammar ([../grammar/grammar.ebnf](../grammar/grammar.ebnf)) and error registry
+> **Status: building. Slice 0 landed; Slice 1 in progress.** This doc fixed the model and the
+> decisions before any code, spec-first (CLAUDE.md §11). The two decisions that were open at first
+> draft are settled (maintainer, 2026-07-03): **attach is host-API only — no SQL attach in any form**
+> (§4), and the **`SHARED TEMP` surface is retired** in favor of a `Database`-scoped in-memory
+> attachment (§6). **Slice 0** (retire `SHARED`, §13) has **landed** (all three cores). **Slice 1** —
+> attached in-memory databases + qualified names + reframe temp — is building in three sub-slices:
+> **1a** the `qualified_table` grammar + parser + resolution against the implicit `main`/`temp` scope
+> (the SQL surface, no registry yet); **1b** the name→attachment registry + host-API in-memory
+> `db.attach`/`detach` + N-root commit + cross-attachment joins + read-only mode; **1c** reframe
+> session-local temp as an implicit in-memory attachment (internal cleanup). The grammar
+> ([../grammar/grammar.ebnf](../grammar/grammar.ebnf)) and error registry
 > ([../errors/registry.toml](../errors/registry.toml)) are authoritative for the surface and codes;
 > when a decision here changes, change them in the same edit.
 
@@ -373,7 +379,31 @@ Sequenced to put the durability-risky part last:
   an implicit in-memory attachment (§6), carrying over the temp-blockstore page budget and compaction
   unchanged. **Point 1 (shared temp) is decided here** per the §6 open decision. Deliverable: SQL can
   join across in-memory attachments; temp is no longer bespoke. All three cores, corpus-tested; the
-  in-memory path keeps temp's zero-file-writes and `54P03`.
+  in-memory path keeps temp's zero-file-writes and `54P03`. Built in three sub-slices:
+  - **1a — `qualified_table` grammar + parser + resolution against the implicit scope.** The
+    SQL-surface half, landing *before* the registry so the fiddly cross-core grammar/parser work is
+    proven green on its own. `qualified_table ::= (identifier ".")? identifier` is threaded into
+    `table_ref` (FROM/JOIN) and the DML targets (`INSERT INTO` / `UPDATE` / `DELETE FROM`); the parser
+    grows the one-`.`-lookahead qualifier (mirroring `column_ref`'s only dotted-name precedent) and the
+    AST carries it. Only the **implicit** qualifiers `main` (the file database) and `temp` (the
+    session-local domain) resolve; any other qualifier is `42P01` "database … is not attached". Because
+    jed **precludes overlaps** (a name is temp XOR persistent within a session, §3), a `main.`/`temp.`
+    qualifier resolves to the *same* store the bare name would — so 1a's resolution is a **validation
+    gate** (assert the named relation is in the claimed implicit scope, else `42P01`), not a routing
+    change; the store lookup is untouched. Corpus-tested (qualified reads/joins/DML over `main`/`temp`,
+    unknown-database `42P01`); no new error code, no `format_version` change. `CREATE INDEX ON` /
+    `REFERENCES` / `CREATE TABLE` qualifiers stay bare this sub-slice (they matter once real
+    attachments exist — 1b).
+  - **1b — the registry + host-API in-memory attach + N-root commit.** Group the temp quad
+    (`storage` + `snapshot` + paging + committed/working) into a per-attachment struct keyed by name;
+    `db.attach(name, memory(), mode)` / `db.detach(name)` add/remove entries (host-API, never SQL, §4);
+    the resolution funnels branch on the resolved attachment (the validation gate of 1a becomes real
+    N-way routing); the two-root commit widens to N in-memory roots (§5); read-only mode rejects writes
+    `25006` (§4); `detach` of a pinned attachment is `55006` (§8, the one new code). Cross-attachment
+    joins, per-core host-API unit tests.
+  - **1c — reframe session-local temp as an implicit in-memory attachment** (§6). Internal cleanup:
+    temp's bespoke fields become the registry's implicit `temp` entry; behavior-neutral (temp keeps its
+    zero-file-writes, page budget, and compaction).
 - **Slice 2 — host-API file attach (read-only + read-write) + cross-file *read* + single-database
   *write*.** `db.attach`/`detach` for file databases with the per-attachment **read-only mode** (§4,
   `25006` on a write to a read-only attachment — the natural reference-DB mode), qualified reads/joins

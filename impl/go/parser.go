@@ -1741,7 +1741,7 @@ func (p *parser) parseInsert() (*insert, error) {
 	if err := p.expectKeyword("into"); err != nil {
 		return nil, err
 	}
-	table, err := p.expectIdentifier()
+	dbQualifier, table, err := p.parseQualifiedTableName()
 	if err != nil {
 		return nil, err
 	}
@@ -1806,7 +1806,7 @@ func (p *parser) parseInsert() (*insert, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &insert{Table: table, Columns: columns, Overriding: overriding, Select: sel, OnConflict: onConflict, Returning: returning}, nil
+		return &insert{Table: table, DB: dbQualifier, Columns: columns, Overriding: overriding, Select: sel, OnConflict: onConflict, Returning: returning}, nil
 	}
 
 	if err := p.expectKeyword("values"); err != nil {
@@ -1834,7 +1834,7 @@ func (p *parser) parseInsert() (*insert, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &insert{Table: table, Columns: columns, Overriding: overriding, Rows: rows, OnConflict: onConflict, Returning: returning}, nil
+	return &insert{Table: table, DB: dbQualifier, Columns: columns, Overriding: overriding, Rows: rows, OnConflict: onConflict, Returning: returning}, nil
 }
 
 // parseOnConflict parses the optional `ON CONFLICT [target] action` clause (UPSERT —
@@ -2666,10 +2666,28 @@ func (p *parser) parseTableRef() (tableRef, error) {
 	if err != nil {
 		return tableRef{}, err
 	}
+	// An optional DATABASE qualifier `db "." table` (attached-databases.md §3): a `.` after the first
+	// identifier makes it the database qualifier and the next identifier the table name. A qualified
+	// name is a BASE TABLE only — never a set-returning function (no cross-database SRF) — so the
+	// function `(` branch below is guarded off when a qualifier is present.
+	var dbQualifier *string
+	if p.peek().Kind == tokDot {
+		p.advance() // .
+		tbl, err := p.expectIdentifier()
+		if err != nil {
+			return tableRef{}, err
+		}
+		q := name
+		dbQualifier = &q
+		name = tbl
+	}
 	// A `(` right after the name = a set-returning function call (no `*`/`DISTINCT`).
 	var args []*exprNode
 	isFunc := false
 	if p.peek().Kind == tokLParen {
+		if dbQualifier != nil {
+			return tableRef{}, newError(SyntaxError, "a database-qualified name cannot be a function call")
+		}
 		isFunc = true
 		p.advance()
 		for {
@@ -2721,7 +2739,7 @@ func (p *parser) parseTableRef() (tableRef, error) {
 		columnDefs = defs
 	}
 	// An SRF is implicitly lateral; Lateral records only whether the keyword was written.
-	return tableRef{Name: name, Alias: alias, IsFunc: isFunc, Args: args, ColumnDefs: columnDefs, Lateral: lateral}, nil
+	return tableRef{Name: name, DB: dbQualifier, Alias: alias, IsFunc: isFunc, Args: args, ColumnDefs: columnDefs, Lateral: lateral}, nil
 }
 
 // parseJsonTable parses `JSON_TABLE(ctx, path [AS n] COLUMNS (col, …)) [AS alias]` (json-table.md §3,
@@ -3514,7 +3532,7 @@ func (p *parser) parseUpdate() (*update, error) {
 	if err := p.expectKeyword("update"); err != nil {
 		return nil, err
 	}
-	table, err := p.expectIdentifier()
+	dbQualifier, table, err := p.parseQualifiedTableName()
 	if err != nil {
 		return nil, err
 	}
@@ -3554,7 +3572,7 @@ func (p *parser) parseUpdate() (*update, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &update{Table: table, Assignments: assignments, Filter: filter, Returning: returning}, nil
+	return &update{Table: table, DB: dbQualifier, Assignments: assignments, Filter: filter, Returning: returning}, nil
 }
 
 // parseDelete parses `DELETE FROM <table> [WHERE <pred>]`. No WHERE deletes all rows.
@@ -3565,7 +3583,7 @@ func (p *parser) parseDelete() (*deleteStmt, error) {
 	if err := p.expectKeyword("from"); err != nil {
 		return nil, err
 	}
-	table, err := p.expectIdentifier()
+	dbQualifier, table, err := p.parseQualifiedTableName()
 	if err != nil {
 		return nil, err
 	}
@@ -3577,7 +3595,7 @@ func (p *parser) parseDelete() (*deleteStmt, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &deleteStmt{Table: table, Filter: filter, Returning: returning}, nil
+	return &deleteStmt{Table: table, DB: dbQualifier, Filter: filter, Returning: returning}, nil
 }
 
 // parseOptionalWhere parses an optional trailing `WHERE <expr>` (shared by
@@ -5031,6 +5049,27 @@ func (p *parser) parseColumnRef() (string, string, error) {
 		return first, second, nil
 	}
 	return "", first, nil
+}
+
+// parseQualifiedTableName parses `qualified_table ::= (identifier ".")? identifier` in DML-target
+// position (attached-databases.md §3): an optional database qualifier followed by the table name.
+// Returns (db, name) where db is nil for a bare (implicit-scope) name. The FROM-position analogue is
+// inlined in parseTableRef (which must also disambiguate the function / derived-table forms).
+func (p *parser) parseQualifiedTableName() (*string, string, error) {
+	name, err := p.expectIdentifier()
+	if err != nil {
+		return nil, "", err
+	}
+	if p.peek().Kind == tokDot {
+		p.advance() // .
+		tbl, err := p.expectIdentifier()
+		if err != nil {
+			return nil, "", err
+		}
+		q := name
+		return &q, tbl, nil
+	}
+	return nil, name, nil
 }
 
 // peek returns the current token without consuming it.

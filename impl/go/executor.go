@@ -1409,6 +1409,35 @@ func (db *engine) isTempTable(name string) bool {
 	return ok
 }
 
+// checkTableQualifier validates an optional database qualifier on a table reference against the
+// implicit scope (spec/design/attached-databases.md §3, Slice 1a). A qualified name reaches a specific
+// database: `main` (the file / persistent database) or `temp` (the session-local domain) — the two
+// reserved implicit qualifiers this slice recognizes; a host-attached database arrives in Slice 1b, so
+// any other qualifier is 42P01 "database … is not attached". Because jed precludes overlaps (a name is
+// temp XOR persistent within a session, §3), a valid qualifier resolves to the SAME store the bare name
+// would, so this is a VALIDATION GATE, not a routing change: it asserts the named relation lives in the
+// claimed database (else 42P01), and the downstream temp-first funnel then resolves it to the matching
+// scope. A nil qualifier (a bare, implicit-scope name) always passes. The qualifier is matched
+// case-insensitively (unquoted identifiers fold to lower case).
+func (db *engine) checkTableQualifier(qualifier *string, name string) error {
+	if qualifier == nil {
+		return nil
+	}
+	switch strings.ToLower(*qualifier) {
+	case "temp":
+		if !db.isTempTable(name) {
+			return newError(UndefinedTable, `relation "temp.`+name+`" does not exist`)
+		}
+	case "main":
+		if _, ok := db.readSnap().table(name); !ok {
+			return newError(UndefinedTable, `relation "main.`+name+`" does not exist`)
+		}
+	default:
+		return newError(UndefinedTable, `database "`+*qualifier+`" is not attached`)
+	}
+	return nil
+}
+
 // compositeDependentAny is the DROP TYPE … RESTRICT dependency check across every visible scope
 // (spec/design/temp-tables.md §8): the main image (tables + composite fields), then the visible
 // session-local temp snapshot (its tables). A composite type is always persistent, but a TEMP table
@@ -5898,6 +5927,9 @@ func (db *engine) rowConflictsCommitted(store *tableStore, table *catTable, pk [
 }
 
 func (db *engine) executeInsert(ins *insert, params []Value, ctx cteCtx) (Outcome, error) {
+	if err := db.checkTableQualifier(ins.DB, ins.Table); err != nil { // attached-databases.md §3
+		return Outcome{}, err
+	}
 	table, ok := db.lkpTable(ins.Table) // temp-first (temp-tables.md §3)
 	if !ok {
 		return Outcome{}, newError(UndefinedTable, "table does not exist: "+ins.Table)
@@ -7167,6 +7199,9 @@ func dmlOutcome(retNames []string, retTypes []string, returned [][]Value, affect
 // remove them. No WHERE deletes every row. Keys are collected before mutating so the
 // map is not modified while iterating.
 func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (Outcome, error) {
+	if err := db.checkTableQualifier(del.DB, del.Table); err != nil { // attached-databases.md §3
+		return Outcome{}, err
+	}
 	table, ok := db.lkpTable(del.Table) // temp-first (temp-tables.md §3)
 	if !ok {
 		return Outcome{}, newError(UndefinedTable, "table does not exist: "+del.Table)
@@ -7426,6 +7461,9 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (Ou
 // key must not change this slice); a duplicate target column traps 42701. No WHERE
 // updates every row.
 func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcome, error) {
+	if err := db.checkTableQualifier(upd.DB, upd.Table); err != nil { // attached-databases.md §3
+		return Outcome{}, err
+	}
 	table, ok := db.lkpTable(upd.Table) // temp-first (temp-tables.md §3)
 	if !ok {
 		return Outcome{}, newError(UndefinedTable, "table does not exist: "+upd.Table)
@@ -9945,6 +9983,20 @@ func (db *engine) planSelect(sel *selectStmt, parent *scope, ctes []*cteBinding,
 					}
 				}
 			}
+		} else if tref.DB != nil {
+			// A database-QUALIFIED name reaches an attachment's table directly (attached-databases.md
+			// §3): it never resolves to a CTE (a CTE has no database qualifier, so `main.x`/`temp.x`
+			// cannot name one) and the qualifier fixes the scope (no temp-vs-persistent shadow). Validate
+			// the qualifier against the implicit scope, then resolve through the temp-first funnel (which,
+			// by preclude-overlaps, lands in the validated scope).
+			if err := db.checkTableQualifier(tref.DB, tref.Name); err != nil {
+				return nil, err
+			}
+			tbl, ok := db.lkpTable(tref.Name)
+			if !ok {
+				return nil, newError(UndefinedTable, "table does not exist: "+*tref.DB+"."+tref.Name)
+			}
+			t = tbl
 		} else {
 			// A plain FROM name (not an SRF call) may resolve to a CTE, which SHADOWS a catalog
 			// table of the same name (cte.md §2); lookup is case-insensitive. A hit bumps the
