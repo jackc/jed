@@ -14,7 +14,15 @@
 > [storage.md](storage.md) §6, and [../fileformat/format.md](../fileformat/format.md) in the
 > same edit.
 >
-> **Status: B1 LANDED** (the format bump — all four implementations byte-identical at
+> **Status: COMPLETE (B0–B4 landed, 2026-07-03).** Benchmarked before/after per CLAUDE.md §10
+> (25 families, 3 cores + wraps, vs the pre-B1 baseline): median core delta **−6.7%**, 63
+> improvements >5% vs 1 residual regression — point lookups **−19%**, secondary lookup **−20%**,
+> full-scan aggregates **−25…−29%** (the fan-out win), durable commit and the window benches
+> flat-to-better on isolated re-runs (the sweep's outliers were fsync/CPU interference noise);
+> the one real residual is TS `order_by_limit` **+16%** on the known full-sort lane (subsumed by
+> the standing "ORDER BY + LIMIT top-k" TODO item). Slice record below:
+>
+> **B1 LANDED** (the format bump — all four implementations byte-identical at
 > `format_version` 24, goldens regenerated incl. the `max_sep_table.jed` degenerate-fan-out
 > fixture, corpus green in both storage modes with zero corpus cost drift; the exact byte
 > contract is [../fileformat/format.md](../fileformat/format.md)); **B2 landed** folded into the
