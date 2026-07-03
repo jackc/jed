@@ -161,10 +161,11 @@ operation on a different backing. Three decisions fix the shape:
 - **No infallible in-memory convenience in the core surface.** `create` returns the fallible
   `Result` / `(Database, error)` uniformly, even though the in-memory path cannot fail. Wrapping it
   in an infallible helper is trivial and belongs to the **caller**, not the core API — and the
-  cores' own **test suites are exactly that caller**: each keeps a private one-line helper (Rust a
-  `fn mem_db()`, Go a `memDB()`, TS a `memDb()`) that calls `create` with no path and unwraps the
-  impossible error. That is where an infallible in-memory handle lives — a test/host convenience,
-  never public core API.
+  cores' own **test suites are exactly that caller**, unwrapping the infallible in-memory `create`
+  in whatever form suits each test layout (Go an in-package `memDB()` helper; TS a `memDb()` test
+  util; Rust, whose integration tests are separate crates, an inline
+  `Database::create(CreateOptions::default()).unwrap()` or a shared `tests/common` helper). That is
+  where an infallible in-memory handle lives — a test/host convenience, never public core API.
 - **`open` is *not* folded into `create`.** Open-existing is a genuinely different operation — the
   file must exist (`58P01` otherwise), it adopts the file's already-locked `page_size`/`txid` and so
   takes **no** `page_size`, and its failure modes differ. Collapsing it into `create` would be
