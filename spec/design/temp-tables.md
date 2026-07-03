@@ -234,8 +234,11 @@ cost meter (the same way the depth gate is independent of the cost gate):
 
 **Determinism is the load-bearing requirement** (CLAUDE.md §8/§10, §13). The budget is measured in
 **byte-identical on-disk record bytes** — the sum, over every temp table store *and* its index
-stores, of each stored record's on-disk encoding size (`record_size`, the exact weight the page B-tree
-splits on, byte-identical across cores by the §8 file-format contract). This is deliberately **not**
+stores, of each stored record's on-disk encoding size (`record_size`, the exact weight the page
+B+tree splits on, byte-identical across cores by the §8 file-format contract; since v24 that is
+`key_len + Σ value_size` — a fixed-width column its slot width NULL-or-not, a variable-width value
+its tagged encoding or 0 when NULL — [../fileformat/format.md](../fileformat/format.md) *Record*,
+so the budget's *values* moved with the v24 encoding while its basis is unchanged). This is deliberately **not**
 the `work_mem` spill estimator: spill is out-of-contract (per-core, §10), so its estimate need not
 agree across cores, whereas `54P03` is **in**-contract — every core must abort at the same point. So
 "budget exceeded" is a **pure function of `(operations, budget)`**, identical across Rust/Go/TS, never

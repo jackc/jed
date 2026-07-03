@@ -274,21 +274,12 @@ impl Node {
         }
     }
 
-    /// Borrow value row `i` for the duration of `f`, avoiding an owned clone on the Decoded hot path
-    /// (the scan/visit callbacks that only need a `&Row`). A **Decoded** leaf lends `&vals[i]`
-    /// directly; a **Packed** leaf reconstructs into a temporary and lends that (the
-    /// "materialize-then-lend" borrow helper, packed-leaf.md §4).
-    #[allow(dead_code)]
-    fn with_row<R>(&self, i: usize, f: impl FnOnce(&Row) -> Result<R>) -> Result<R> {
-        match &self.packed {
-            None => f(&self.vals[i]),
-            Some(p) => f(&p.row(i)?),
-        }
-    }
-
-    /// [`with_row`](Node::with_row) with the Track A1 reconstruction mask: `recon = Some(m)` on a
-    /// **Packed** leaf reconstructs into a temporary decoding only the selected columns and lends that
-    /// (untouched columns `Null`); `recon = None` — and every **Decoded** leaf — lends the whole row.
+    /// Borrow leaf row `i` for the duration of `f`, avoiding an owned clone on the Decoded hot path
+    /// (the scan/visit callbacks that only need a `&Row`), with the Track A1 reconstruction mask:
+    /// `recon = Some(m)` on a **Packed** leaf reconstructs into a temporary decoding only the
+    /// selected columns and lends that (untouched columns `Null`); `recon = None` — and every
+    /// **Decoded** leaf — lends the whole row (the "materialize-then-lend" borrow helper,
+    /// packed-leaf.md §4).
     fn with_row_maybe_masked<R>(
         &self,
         i: usize,
