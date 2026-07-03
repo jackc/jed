@@ -231,6 +231,12 @@ always fully materialized — so a single-mode corpus silently passed a windowed
 returned `NULL` for every row when read from a committed file (only the wall-clock benchmark, which
 opens a real file, caught it). Running both modes turns that whole class into a corpus failure.
 
+> Since the B+tree reshape (bplus-reshape.md B3/B4) the memory-vs-disk divergence class this
+> corpus was built to catch is largely gone **by construction** — an in-memory database reads
+> through the same pager + Packed leaf path as a file. The two-mode run is **retained** as the
+> guard for what still differs: the reopen (a cold skeleton load + faulting), eviction under a
+> bounded pool, and the resolve-and-rewrite path over a durable file.
+
 - **`memory`** (default) — a fresh in-memory `Database`; the historical behaviour.
 - **`disk`** (harness arg `disk`) — a file-backed `Database` **reopened before every record**, so
   each committed read demand-pages (faults) its leaves from disk. Writes reopen too, exercising the

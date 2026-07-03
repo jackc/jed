@@ -90,8 +90,10 @@ RAM-sized-database case stays fully cache-resident, pager.md §3). The budget bo
 cache** — the
 interior B-tree skeleton is always resident (pager.md §1/§4) — and it **never changes what a query
 observes** (results and cost are invariant to it, pager.md §3/§5), so it is purely a memory/throughput
-knob. A read-only gauge, **`resident_leaves`** (`0` for an in-memory database), reports how many leaf
-pages are currently resident — `≤ cache_leaves` by construction. An in-memory database ignores the
+knob. A read-only gauge, **`resident_leaves`**, reports how many leaf pages are currently
+resident — `≤ cache_leaves` by construction for a file; a **real count** for an in-memory
+database too (bplus-reshape.md B3 — its pool is pinned/unbounded, so the gauge tracks its
+faulted set). An in-memory database ignores the
 budget (it is fully resident, nothing to page). Same shape across cores (Rust `OpenOptions {
 cache_bytes }` / Go `OpenOptions { CacheBytes }` / TS `{ cacheBytes }`); the bare `open(path)` form uses
 the default.
@@ -154,9 +156,11 @@ transactions.md §1). The commit boundary and durability are **decoupled** (tran
   success / auto-rollback on error or panic** — the safe default, recommended over a raw
   `begin`. SQL `BEGIN [READ ONLY|READ WRITE]` / `COMMIT` / `ROLLBACK` drive the handle's implicit
   current transaction equivalently.
-- **`commit` / `rollback` are uniform across modes.** **In-memory** → commit is a **no-op
-  success** (no path to write; never an error); rollback discards the working set. **File-backed**
-  → commit publishes + makes durable per the **`synchronous`** setting (below).
+- **`commit` / `rollback` are uniform across modes.** **In-memory** → commit **packs the dirty
+  pages into the database's `MemoryBlockStore`** (bplus-reshape.md B3 — structurally the file
+  commit minus `fsync`, whose memory-host `sync` is a no-op); the observable result is the same
+  success it always was. Rollback discards the working set. **File-backed** → commit publishes +
+  makes durable per the **`synchronous`** setting (below).
 - **Durability — `synchronous` (default `on`).** `on` makes a commit durable **before it
   returns** (the §3 crash-safe recipe). `off`/relaxed makes the commit visible immediately and
   **batches/defers** the fsync — faster, may lose the last few commits on a crash, **never

@@ -49,7 +49,10 @@ bounds what is *expensive* to hold and trivial to refault, and leaves resident w
 keep and costly to recompute:
 
 - **In-memory databases stay fully resident.** A database with no backing file (the pure
-  in-memory mode, and the conformance harness's default) has nowhere to page *from*, so it keeps
+  in-memory mode, and the conformance harness's default) — SUPERSEDED (bplus-reshape.md B3): it
+  now pages from its `MemoryBlockStore` through this same pool, pinned/unbounded (an in-memory
+  database is resident by definition; `cache_bytes` bounds only file-backed eviction). The
+  historical carve-out — it had nowhere to page *from*, so it kept
   its tree resident — the pool is the read path for **file-backed** databases. This is not the
   rejected "fast path for small files"; it is the degenerate no-backing case (a query against an
   in-memory database touches RAM either way). The dominant durable-disk mode is fully paged.
@@ -226,7 +229,8 @@ change lands alone, on a frozen seam:
   **open-time** setting (`open(path, opts)` with `opts.cache_bytes` — the buffer-pool budget in
   **bytes**, default `DEFAULT_CACHE_BYTES = 256 MiB`, converted to a leaf-page capacity by the file's
   page size as `max(1, cache_bytes / page_size)`; a **handle** setting, never stored in the file —
-  api.md §2.1), with a read-only **`resident_leaves`** gauge (`0` for in-memory). The internal
+  api.md §2.1), with a read-only **`resident_leaves`** gauge (a real count for in-memory too
+  since bplus-reshape.md B3). The internal
   `open_with_capacity` seam was promoted to this public API. **Bytes, not a page count**, so the
   caller's budget does not silently scale with the file's `page_size` (§3). **Page-size hardening:** the
   page size is now constrained to a **power of two in `[256, 65536]`** (`MIN_PAGE_SIZE = 256` through

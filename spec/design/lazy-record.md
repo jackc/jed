@@ -140,7 +140,10 @@ inventing a parallel mechanism.
 **Scope mirrors the residency model exactly.** Deferral applies to the **demand-paged, file-backed
 leaf path** — the same path §14 and the buffer pool ([pager.md §1](pager.md)) apply to. The
 **whole-image `from_image` load stays eager** (it has no pager to resolve through later — §14's
-carve-out), so a **pure in-memory database stays fully decoded** (it is RAM-resident by definition;
+carve-out — **superseded by bplus-reshape.md B3**: an in-memory database is now a
+`MemoryBlockStore` demand-paged through the same pager/pool as a file, so its leaves are Packed
+and its values defer exactly like a file's), so historically a pure in-memory database stayed
+fully decoded (it is RAM-resident by definition;
 there is nothing to page from and no resident-memory pressure to relieve). A `Row` therefore freely
 mixes decoded and deferred values across the two paths, exactly as it already does today (a faulted
 leaf holds decoded-small + `Unfetched`-large; `from_image` holds all-decoded).
@@ -344,7 +347,8 @@ S3 / S4 precedent):
   `≈ resident_leaves × page_size` (§9). *Optional but recommended — the dividend §9 exists for.*
 
 Deferred follow-ons (none foreclosed): **keys as block slices** (zero-copy keys under (a));
-**in-memory databases adopting deferral** (only if a Memory pager backing lands — pager.md §6, so
+**in-memory databases adopting deferral** — ✅ **done (bplus-reshape.md B3)**: the Memory pager
+backing landed and in-memory databases defer like files (this follow-on's gate — pager.md §6, so
 they page through the identical path); a **per-column offset cache** on a resident leaf (SQLite's
 `OP_Column` offset memoization — skip re-walking earlier columns on repeated access of the same
 faulted leaf).

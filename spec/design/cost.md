@@ -174,6 +174,15 @@ exactly the property cost requires.
 
 ### The touched set — which columns a scan "reads"
 
+> **Since bplus-reshape.md B4 the touched set is the COST BASIS + the scan layer's resolve
+> prefetch, not the definition of correctness:** a deferred value the static set missed is
+> resolved **on demand** at the evaluator's column access (the demand-fault backstop) —
+> deterministic rows, never a NULL-fold. The backstop fetch is deliberately **unmetered**
+> (metering it would make cost depend on prediction quality rather than this spec'd static
+> set); a touched-set miss is an engine defect, not something a query can construct, and the
+> backstop reads only pages the query's own leaf/overflow set already bounds (CLAUDE.md §13
+> holds).
+
 The **touched set** of a relation is the set of its columns the query **statically references**,
 collected at plan time from the resolved expression trees (a §8 contract — every core collects
 identically): the WHERE filter, every JOIN `ON`, and — for a non-aggregate query — the
