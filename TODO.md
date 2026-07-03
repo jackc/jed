@@ -231,7 +231,11 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     (`key_len + Σ value_size`), `RECORD_MAX` value kept; all 58 goldens regenerated; corpus
     green both storage modes with **zero corpus cost drift** (per-core split-shape pins moved:
     268/278/156/100 → 258/265/143/105).
-  - [ ] **B2 — the Packed simplification** (delete what record-free interiors obsoleted).
+  - [x] **B2 — the Packed simplification** ✅ — folded into each core's B1 port (as the doc
+    anticipated: B1 carried the packed read machinery over the new encoding, so B2 was pure
+    deletion): the interior-`Decoded`-with-records case, the row-major record codec
+    (`encode_record`/`decode_record`/`decode_record_lazy`), the in-order-predecessor delete
+    (`max_kv`), and the interleaved separator-emission scan logic are gone from all three cores.
   - [ ] **B3 — `MemoryBlockStore` + pinned pool** (in-memory + temp-table stores through the
     pager; unify commit; delete the `persist` no-op / `resident_leaves == 0` special cases).
   - [ ] **B4 — retire `Decoded` + the demand-fault backstop** (Decoded = write-scratch only;
