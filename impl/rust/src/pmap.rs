@@ -667,6 +667,64 @@ impl PMap {
         Ok(removed)
     }
 
+    /// Demote every **clean, persisted** resident leaf to its `Child::OnDisk(page)` reference —
+    /// the post-commit residency flip (bplus-reshape.md B4): after a commit assigns page ids to the
+    /// dirty nodes it wrote, the committed tree sheds its leaf payloads and becomes the skeletal
+    /// `interior nodes + OnDisk leaves` shape every load already produces, so reads everywhere go
+    /// through the one Packed pool path and `Decoded` survives only inside an uncommitted writer.
+    /// A **root** leaf stays resident (the `PMap` root is always a node — the open/load convention);
+    /// an unpersisted (page 0) leaf is left alone (defensive — a bare scratch engine that never
+    /// persists). Rebuilds only the interior spine above changed children; an unchanged subtree
+    /// keeps its `Arc` (and its set-once page id), so the flip is O(interior nodes) and the flipped
+    /// tree stays clean for the next incremental commit.
+    pub(crate) fn demote_clean_leaves(&mut self) {
+        fn demote(node: &Arc<Node>) -> Option<Arc<Node>> {
+            if node.is_leaf() {
+                return None; // handled by the parent (a root leaf stays resident)
+            }
+            let mut changed = false;
+            let mut children = Vec::with_capacity(node.children.len());
+            for c in &node.children {
+                let new_child = match c {
+                    Child::OnDisk(p) => Child::OnDisk(*p),
+                    Child::Resident(n) => {
+                        if n.is_leaf() {
+                            let page = n.page.load(std::sync::atomic::Ordering::Acquire);
+                            if page != 0 {
+                                changed = true;
+                                Child::OnDisk(page)
+                            } else {
+                                Child::Resident(n.clone())
+                            }
+                        } else {
+                            match demote(n) {
+                                Some(rebuilt) => {
+                                    changed = true;
+                                    Child::Resident(rebuilt)
+                                }
+                                None => Child::Resident(n.clone()),
+                            }
+                        }
+                    }
+                };
+                children.push(new_child);
+            }
+            if !changed {
+                return None;
+            }
+            // The rebuilt interior keeps its keys AND its page id — its serialized bytes are
+            // unchanged (children reference the same pages), so it must stay clean or the next
+            // incremental commit would rewrite the whole spine every time.
+            let page = node.page.load(std::sync::atomic::Ordering::Acquire);
+            Some(Node::loaded_interior(node.keys.clone(), children, page))
+        }
+        if let Some(root) = &self.root {
+            if let Some(rebuilt) = demote(root) {
+                self.root = Some(rebuilt);
+            }
+        }
+    }
+
     /// The number of B+tree nodes (pages) in this tree — the `page_read` count a full scan
     /// charges (spec/design/cost.md §3 "page_read"). A scan walks every node, so this is the
     /// structural node count (interior + leaf); `0` for an empty map. Deterministic and

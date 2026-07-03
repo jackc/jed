@@ -894,8 +894,14 @@ impl Session {
     fn publish(&mut self) -> Result<()> {
         let mut snap = self.engine.committed.clone();
         snap.txid = self.base_version + 1; // advance the shared version on every commit
-        self.shared.persist(&snap)?; // durable before publish (no-op in-memory)
-        self.engine.committed.txid = snap.txid;
+        self.shared.persist(&snap)?; // durable before publish (packs into the byte store, any host)
+        // The post-commit residency flip (bplus-reshape.md B4): the persist above assigned page ids
+        // to every dirty node it wrote, so the committed tree can shed its leaf payloads — clean
+        // leaves demote to `OnDisk` references faulted back through the pool on next touch. The
+        // session's own committed base takes the same flipped shape, so a long-lived writer sheds
+        // residency too (read-your-writes for the NEXT statement re-faults — one read path).
+        snap.demote_clean_leaves();
+        self.engine.committed = snap.clone();
         let shared_temp = self.engine.shared_temp_committed.clone();
         self.shared.publish(Arc::new(snap), Arc::new(shared_temp));
         self.base_version += 1;

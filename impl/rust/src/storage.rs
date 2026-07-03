@@ -546,6 +546,16 @@ impl TableStore {
         self.rows.root()
     }
 
+    /// Demote this store's clean, persisted resident leaves to `OnDisk` references — the
+    /// post-commit residency flip (bplus-reshape.md B4; [`crate::pmap::PMap::demote_clean_leaves`]).
+    /// A no-op for a store whose nodes were never persisted (a GiST leaf-key store, a bare scratch
+    /// engine). Only meaningful on a paged store — the flipped leaves fault back through the pool.
+    pub(crate) fn demote_clean_leaves(&mut self) {
+        if self.paging.is_some() {
+            self.rows.demote_clean_leaves();
+        }
+    }
+
     /// Fault the clean leaf at `page` through this store's pool — the whole-image serializer's
     /// `OnDisk`-child materialization (format.rs `serialize_node`; under B3 every database is
     /// demand-paged, in-memory included). A store with no paging context cannot hold an `OnDisk`

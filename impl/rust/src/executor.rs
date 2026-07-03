@@ -1072,6 +1072,20 @@ impl Snapshot {
     /// Every table with its store, as `(lowercased key, table, store)` tuples, for the on-disk
     /// serializer (spec/fileformat/format.md). The serializer sorts by the lowercased key so
     /// hash-map iteration order never leaks (CLAUDE.md §8).
+    /// Demote every store's clean, persisted resident leaves to `OnDisk` references — the
+    /// post-commit residency flip over the whole snapshot (bplus-reshape.md B4), run after a
+    /// successful persist so the published committed tree is the skeletal `interiors + OnDisk
+    /// leaves` shape on every host. Table stores and btree/GIN index stores flip; a GiST leaf-key
+    /// store's nodes are never persisted (its on-disk form is the R-tree), so it no-ops naturally.
+    pub(crate) fn demote_clean_leaves(&mut self) {
+        for store in self.stores.values_mut() {
+            store.demote_clean_leaves();
+        }
+        for store in self.index_stores.values_mut() {
+            store.demote_clean_leaves();
+        }
+    }
+
     pub(crate) fn catalog_and_stores(&self) -> Vec<(&str, &Table, &TableStore)> {
         self.tables
             .iter()
