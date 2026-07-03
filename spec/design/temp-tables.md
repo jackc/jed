@@ -20,8 +20,10 @@
 > original "fully-resident decoded" storage model for **session-local** temp: it now rides a per-domain
 > in-RAM `MemoryBlockStore` + pager with within-session free-list compaction, and its `54P03` budget is
 > the domain's committed **page** bytes (§6/§7) — all three cores. **Shared** temp is still
-> fully-resident decoded (its flip is a follow-on, §14). **Slice 3 (spill-to-disk, §6) remains
-> deferred** — the flip put temp on its seam, so spill is now a `BlockStore` swap. This doc was written
+> fully-resident decoded, but its entire surface is now **slated for removal** (decided 2026-07-03) in
+> favor of a `Database`-scoped in-memory **attachment** ([attached-databases.md](attached-databases.md)
+> §6, Slice 0) — the bespoke shared-temp `MemoryBlockStore` flip will **not** be built (§14). **Slice 3
+> (spill-to-disk, §6) remains deferred** — the flip put temp on its seam, so spill is now a `BlockStore` swap. This doc was written
 > first, spec-first (CLAUDE.md §11), and tracks the implemented behavior.
 
 Temporary tables are jed's first relations whose lifetime is shorter than the database file's and
@@ -127,6 +129,12 @@ coordination on a private, gate-free structure — the opposite of what makes se
 §6.)
 
 ## 4. The two kinds, and what "shared" means
+
+> **⚠️ The "shared" kind is slated for removal (decided 2026-07-03).** The `SHARED TEMP` surface is
+> being retired in favor of a `Database`-scoped in-memory **attachment**
+> ([attached-databases.md](attached-databases.md) §6, Slice 0); its in-process (`Database`-lifetime)
+> sharing boundary would clash with future multi-process file access. This section documents its
+> currently-shipping behavior **until Slice 0 lands**; do not extend it.
 
 PostgreSQL's `GLOBAL TEMPORARY` shares a table *definition* across sessions but gives each session its
 own *data*; that is **not** what `SHARED` means here, which is why jed coins a new keyword rather than
@@ -450,12 +458,16 @@ and memory-only per the design decision:
 
 ## 14. Deferred / follow-ons (none foreclosed)
 
-- **Shared temp onto a MemoryBlockStore** — the shared-temp analogue of the temp-blockstore slice.
-  Deferred because the storage identity must be **core-owned** (all sessions of a `Database` share one
-  shared-temp page space) while temp DDL/commit runs at the engine level, and its compaction watermark
-  is the cross-session `live` registry (available at publish, not in the engine's `commit_tx`) — so it
-  needs the storage core-owned + the publish path decoupled (persist main only when main changed).
-  Until it lands, shared temp keeps the fully-resident decoded path and its record-byte budget (§6/§7).
+- **Shared temp onto a MemoryBlockStore — ❌ NOT being built; the whole `SHARED` surface is being
+  removed.** Decided 2026-07-03 (attached-databases.md §6): shared temp's `Database`-scoped, in-process
+  sharing boundary would clash with any future **multi-process** file access, so the concept is retired
+  and re-provided (if needed) as a `Database`-scoped in-memory **attachment**
+  ([attached-databases.md](attached-databases.md) §6, Slice 0). The `SHARED` keyword,
+  `allow_shared_temp_ddl`, `shared_temp_mem`, the `Database`-level shared-temp snapshot, and the
+  shared-temp corpus/concurrency tests are removed; the two-root commit collapses to one durable root +
+  the session-local temp domain. The bespoke shared-temp `MemoryBlockStore` flip is therefore **never
+  built** (it would be sunk cost against a retired surface). Everything §4 / §5 / etc. below still
+  documents currently-shipping behavior **until Slice 0 lands**.
 - `ON COMMIT DELETE ROWS` / `ON COMMIT DROP` (§1, D6).
 - `IF NOT EXISTS`, `CREATE TEMP TABLE … AS SELECT` (§1).
 - `FOREIGN KEY` involving temp tables (§8) — start with FKs among same-kind temp tables.
