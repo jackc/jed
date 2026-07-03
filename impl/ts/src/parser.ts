@@ -425,18 +425,11 @@ class Parser {
   private parseCreateTable(): Statement {
     this.expectKeyword("create");
     // An optional table_scope between CREATE and TABLE makes the table TEMPORARY
-    // (spec/design/temp-tables.md, grammar.ebnf `table_scope`). SHARED / TEMP / TEMPORARY are NOT
-    // reserved (§3): recognized positionally here — the word after TABLE is always the table name, so
-    // `CREATE TABLE temp (...)` / `CREATE TABLE shared (...)` are ordinary persistent tables. A leading
-    // SHARED makes a database-wide shared temp table (§4) and MUST be immediately followed by
-    // TEMP/TEMPORARY (a stray `CREATE SHARED TABLE …` is 42601); so shared always has temp===true.
-    const shared = this.peekKeyword() === "shared";
-    if (shared) this.advance();
+    // (spec/design/temp-tables.md, grammar.ebnf `table_scope`). TEMP / TEMPORARY are NOT reserved (§3):
+    // recognized positionally here — the word after TABLE is always the table name, so
+    // `CREATE TABLE temp (...)` is an ordinary persistent table named "temp".
     const temp = this.peekKeyword() === "temp" || this.peekKeyword() === "temporary";
     if (temp) this.advance();
-    if (shared && !temp) {
-      throw engineError("syntax_error", "SHARED must be followed by TEMP or TEMPORARY");
-    }
     this.expectKeyword("table");
     const name = this.expectIdentifier();
     this.expect("lparen");
@@ -475,7 +468,6 @@ class Parser {
       kind: "createTable",
       name,
       temp,
-      shared,
       columns,
       tablePks,
       checks,

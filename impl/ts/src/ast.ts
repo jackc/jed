@@ -479,18 +479,11 @@ export type Assignment = { column: string; value: Expr };
 export type CreateTable = {
   kind: "createTable";
   name: string;
-  // temp is whether `TEMP` / `TEMPORARY` preceded `TABLE` — a temporary table
+  // temp is whether `TEMP` / `TEMPORARY` preceded `TABLE` — a session-local temporary table
   // (spec/design/temp-tables.md). A temp table makes ZERO writes to the database file (it lives
-  // outside the serialized snapshot) and is dropped at session / database close. Its DDL is gated by
-  // allowTempDdl (session-local) or allowSharedTempDdl (shared) rather than allowDdl (temp-tables.md
-  // §5). shared implies temp (a SHARED table is always temporary).
+  // outside the serialized snapshot) and is dropped at session close. Its DDL is gated by allowTempDdl
+  // rather than allowDdl (temp-tables.md §5).
   temp: boolean;
-  // shared is whether `SHARED` preceded `TEMP`/`TEMPORARY` — a DATABASE-WIDE shared temporary table
-  // (temp-tables.md §4): one set of rows visible to and writable by every session of the open
-  // Engine, still never written to the file. shared===true always has temp===true (the parser
-  // rejects SHARED not followed by TEMP/TEMPORARY as 42601); when false (and temp) the table is
-  // session-local.
-  shared: boolean;
   columns: ColumnDef[];
   tablePks: string[][];
   // Every `[CONSTRAINT name] CHECK ( expr )` of the statement — column-level and

@@ -464,14 +464,6 @@ export const DEFAULT_MAX_SQL_LENGTH = 1 << 20;
 // Identical across cores (§8); the abort point is part of the cross-core contract.
 export const DEFAULT_TEMP_BUFFERS = 32 << 20;
 
-// DEFAULT_SHARED_TEMP_MEM is the default GLOBAL storage budget for DATABASE-WIDE shared temporary
-// tables, in BYTES (spec/design/temp-tables.md §7). The shared-temp analogue of DEFAULT_TEMP_BUFFERS:
-// shared temp data is global (one set of rows across every session of the open Engine), so its
-// budget is a Engine-level setting (sharedTempMem) rather than per-session. An over-budget shared
-// write aborts the same 54P03. 0 ⇒ unlimited; measured identically (deterministic on-disk record
-// bytes), so the abort point is part of the cross-core contract.
-export const DEFAULT_SHARED_TEMP_MEM = 32 << 20;
-
 // MAX_COMPOSITE_DEPTH is the maximum composite-type nesting depth (CLAUDE.md §13; cost.md §7b). A
 // composite type's depth is the length of its deepest chain of nested composites, counting itself: a
 // row of scalars is depth 1, `CREATE TYPE b AS (x a)` is `1 + depth(a)`, and an array field counts
@@ -1552,19 +1544,11 @@ type ActiveTx = {
   // DDL/DML, adopted back into tempCommitted on a successful COMMIT and discarded on ROLLBACK. The
   // temp analogue of working, kept SEPARATE so it is never serialized.
   tempWorking: Snapshot;
-  // sharedTempWorking is the transaction's working copy of the DATABASE-WIDE shared temp-table
-  // snapshot (spec/design/temp-tables.md §5): cloned from Engine.sharedTempCommitted at tx open,
-  // mutated by shared-temp DDL/DML, adopted back on a successful COMMIT and discarded on ROLLBACK. The
-  // shared analogue of tempWorking; for the shared layer the adopted state is then published to the
-  // shared root (the two-root commit, §5).
-  sharedTempWorking: Snapshot;
   // mainDirty is whether this transaction mutated the MAIN (persistent) snapshot — set by working().
-  // Drives the commit's persist decision so a transaction that touched ONLY temp tables (session-local
-  // and/or shared) makes zero file writes (temp-tables.md §2). tempDirty / sharedTempDirty mirror it
-  // for the two temp snapshots.
+  // Drives the commit's persist decision so a transaction that touched ONLY session-local temp tables
+  // makes zero file writes (temp-tables.md §2). tempDirty mirrors it for the temp snapshot.
   mainDirty: boolean;
   tempDirty: boolean;
-  sharedTempDirty: boolean;
 };
 
 // SessionOptions are the relocatable session settings (spec/design/session.md §3 — the bucket-A
@@ -1592,11 +1576,6 @@ export type SessionOptions = {
   // temp DDL is 42501. Absent ⇒ INHERIT allowDdl's value (back-compat: one gate governs all DDL). The
   // untrusted-scratch pattern is allowDdl=false + allowTempDdl=true — private scratch tables only.
   allowTempDdl?: boolean;
-  // Whether DATABASE-WIDE shared temporary-table DDL is permitted (spec/design/temp-tables.md §5); a
-  // denied shared-temp DDL is 42501. Absent ⇒ INHERIT allowDdl's value (back-compat, like
-  // allowTempDdl). Shared-temp DDL mutates global state and charges the global budget, so it is the
-  // more privileged of the two temp gates.
-  allowSharedTempDdl?: boolean;
   // The per-session storage budget for session-local temp tables, in BYTES (spec/design/temp-tables.md
   // §7); 0 ⇒ unlimited; absent ⇒ the engine default (DEFAULT_TEMP_BUFFERS). An over-budget temp write
   // aborts 54P03.
@@ -1687,10 +1666,6 @@ export class SessionState {
   // Whether session-local TEMPORARY-table DDL is permitted (spec/design/temp-tables.md §5); a denied
   // temp DDL is 42501. Resolved at construction from opts.allowTempDdl (defaulting to allowDdl's value).
   allowTempDdl: boolean;
-  // Whether DATABASE-WIDE shared TEMPORARY-table DDL is permitted (spec/design/temp-tables.md §5); a
-  // denied shared-temp DDL is 42501. Resolved at construction from opts.allowSharedTempDdl (defaulting
-  // to allowDdl's value). The more privileged of the two temp gates — a global-state mutation.
-  allowSharedTempDdl: boolean;
   // The per-session temp-table storage budget in BYTES (temp-tables.md §7); 0 ⇒ unlimited. An
   // over-budget temp write aborts 54P03.
   tempBuffers: number;
@@ -1738,10 +1713,9 @@ export class SessionState {
       this.privileges.setDefaultTable(opts.defaultPrivileges);
     }
     this.allowDdl = opts.allowDdl ?? true;
-    // Back-compat default-inheritance (temp-tables.md §5): an unset allowTempDdl / allowSharedTempDdl
-    // takes allowDdl's value, so a session configured before temp tables existed behaves as before.
+    // Back-compat default-inheritance (temp-tables.md §5): an unset allowTempDdl takes allowDdl's
+    // value, so a session configured before temp tables existed behaves as before.
     this.allowTempDdl = opts.allowTempDdl ?? this.allowDdl;
-    this.allowSharedTempDdl = opts.allowSharedTempDdl ?? this.allowDdl;
     this.tempBuffers = opts.tempBuffers ?? DEFAULT_TEMP_BUFFERS;
     this.tempCommitted = new Snapshot();
     this.vars = new Map();
@@ -1820,11 +1794,6 @@ export class SessionState {
   // setAllowTempDdl sets whether session-local temporary-table DDL is permitted (temp-tables.md §5).
   setAllowTempDdl(allow: boolean): void {
     this.allowTempDdl = allow;
-  }
-  // setAllowSharedTempDdl sets whether DATABASE-WIDE shared temporary-table DDL is permitted
-  // (temp-tables.md §5).
-  setAllowSharedTempDdl(allow: boolean): void {
-    this.allowSharedTempDdl = allow;
   }
   // setTempBuffers sets the per-session temp-table storage budget in BYTES (temp-tables.md §7); 0 ⇒
   // unlimited. An over-budget temp write aborts 54P03.
@@ -2253,17 +2222,6 @@ export class Engine {
   // import keeps the executor free of any node:* dependency (the Node `fs` impl lives in spillfile.ts),
   // so the engine runs in a browser bundle (the OPFS host).
   spillSink: SpillSink | null;
-  // sharedTempCommitted is the DATABASE-WIDE shared temporary-table snapshot (temp-tables.md §4): the
-  // committed rows of every SHARED temp table, held in memory and NEVER serialized — the shared
-  // analogue of session.tempCommitted, but on the handle (visible to every session minted from this
-  // Engine) rather than per-session. On a single handle this is just a field; for the shared layer
-  // (shared.ts) it is pinned from / published to the shared roots alongside committed (the two-root
-  // commit, §5). Born empty, gone at close — never recovered (divergence D5).
-  sharedTempCommitted: Snapshot;
-  // sharedTempMem is the GLOBAL byte budget for shared temp storage (shared_temp_mem, §7); 0 ⇒
-  // unlimited. The shared analogue of session.tempBuffers, but Engine-level (shared temp is global).
-  // An over-budget shared write aborts 54P03.
-  sharedTempMem: number;
   // reclaimWithinSession turns on within-session free-list compaction (persist.ts maybeCompact): the
   // never-reopened in-RAM temp domains set it (temp-tables.md §6, bplus-reshape.md), so their
   // copy-on-write orphans are reclaimed rather than leaked. The main file/in-memory domain leaves it
@@ -2276,10 +2234,8 @@ export class Engine {
   // tempStorage is the SESSION-LOCAL temp domain's storage Engine (temp-tables.md §6): the private in-RAM
   // MemoryBlockStore + pager + pinned pool its temp tables ride, with within-session compaction on.
   // Created lazily on the first session-local temp DDL (newTempStorage); null until then. Its pageCount
-  // is the domain's footprint — the page-based temp budget. sharedTempStorage is the shared domain's
-  // analogue (a follow-on: shared temp is still the fully-resident decoded path on this slice).
+  // is the domain's footprint — the page-based temp budget.
   tempStorage: Engine | null;
-  sharedTempStorage: Engine | null;
   // openStreams counts this handle's live streaming cursors (Query's pull source, not a materialized
   // result). A streaming cursor pins a snapshot it faults lazily, so while one is open a temp-domain
   // compaction (persistTemp → maybeCompact) must NOT reclaim pages — it could free one the cursor still
@@ -2297,12 +2253,9 @@ export class Engine {
     this.paging = null;
     this.readOnly = false;
     this.spillSink = null;
-    this.sharedTempCommitted = new Snapshot();
-    this.sharedTempMem = DEFAULT_SHARED_TEMP_MEM;
     this.reclaimWithinSession = false;
     this.liveAtCompaction = 0;
     this.tempStorage = null;
-    this.sharedTempStorage = null;
     this.openStreams = 0;
   }
 
@@ -2361,11 +2314,9 @@ export class Engine {
   resetPrivileges(): void {
     this.session.privileges = new Privileges();
     this.session.allowDdl = true;
-    // The temp-DDL gates are part of the authorization envelope (temp-tables.md §5); reset them with
-    // the rest so a # allow_temp_ddl: / # allow_shared_temp_ddl: directive never leaks past its record.
-    // Default-inherit allowDdl=true.
+    // The temp-DDL gate is part of the authorization envelope (temp-tables.md §5); reset it with the
+    // rest so a # allow_temp_ddl: directive never leaks past its record. Default-inherit allowDdl=true.
     this.session.allowTempDdl = true;
-    this.session.allowSharedTempDdl = true;
   }
 
   // privileges is read-only access to the default session's authorization envelope (§5.3).
@@ -2394,18 +2345,6 @@ export class Engine {
     return this.session.allowTempDdl;
   }
 
-  // setAllowSharedTempDdl sets whether DATABASE-WIDE shared temporary-table DDL is permitted on the
-  // default session (spec/design/temp-tables.md §5) — the shared-temp split of allowDdl, the more
-  // privileged of the two temp gates; a denied shared-temp DDL is 42501.
-  setAllowSharedTempDdl(allow: boolean): void {
-    this.session.allowSharedTempDdl = allow;
-  }
-
-  // allowSharedTempDdl reports whether shared temporary-table DDL is permitted on the default session.
-  allowSharedTempDdl(): boolean {
-    return this.session.allowSharedTempDdl;
-  }
-
   // setTempBuffers sets the default session's per-session temp-table storage budget in BYTES
   // (spec/design/temp-tables.md §7); 0 ⇒ unlimited. An over-budget temp write aborts 54P03.
   setTempBuffers(bytes: number): void {
@@ -2415,14 +2354,6 @@ export class Engine {
   // tempBuffers reports the default session's per-session temp-table storage budget (0 ⇒ unlimited).
   tempBuffers(): number {
     return this.session.tempBuffers;
-  }
-
-  // setSharedTempMem sets the GLOBAL shared-temp storage budget in BYTES (shared_temp_mem,
-  // spec/design/temp-tables.md §7); 0 ⇒ unlimited. A Engine-level setting (shared temp data is
-  // global); an over-budget shared write aborts 54P03. Read the budget back via the public
-  // `sharedTempMem` field (a field, not a method — TS forbids a same-named getter).
-  setSharedTempMem(bytes: number): void {
-    this.sharedTempMem = bytes;
   }
 
   // setVar sets a session variable on the default session (spec/design/session.md §6.1). Custom
@@ -2545,24 +2476,12 @@ export class Engine {
     return this.session.tx !== null ? this.session.tx.tempWorking : this.session.tempCommitted;
   }
 
-  // tempDomainPaging returns the MemoryBlockStore paging context for a temp domain (temp-tables.md §6),
-  // lazily creating the domain's storage Engine (newTempStorage — a private in-RAM store + pinned pool
-  // with within-session compaction on) on first use. The session-local domain lives on this engine; the
-  // shared domain is a follow-on (shared temp is still the fully-resident decoded path on this slice).
-  tempDomainPaging(shared: boolean): SharedPaging {
-    if (shared) {
-      if (this.sharedTempStorage === null) this.sharedTempStorage = newTempStorage(this.pageSize);
-      return this.sharedTempStorage.paging!;
-    }
+  // tempDomainPaging returns the MemoryBlockStore paging context for the session-local temp domain
+  // (temp-tables.md §6), lazily creating the domain's storage Engine (newTempStorage — a private
+  // in-RAM store + pinned pool with within-session compaction on) on first use.
+  tempDomainPaging(): SharedPaging {
     if (this.tempStorage === null) this.tempStorage = newTempStorage(this.pageSize);
     return this.tempStorage.paging!;
-  }
-
-  // sharedTempSnap is the DATABASE-WIDE shared temp-table snapshot for READS (temp-tables.md §4/§5):
-  // the open transaction's sharedTempWorking, else the handle's sharedTempCommitted. The shared
-  // analogue of tempSnap.
-  private sharedTempSnap(): Snapshot {
-    return this.session.tx !== null ? this.session.tx.sharedTempWorking : this.sharedTempCommitted;
   }
 
   // isTempTable reports whether name resolves to a SESSION-LOCAL temporary table in the visible temp
@@ -2572,27 +2491,15 @@ export class Engine {
     return this.tempSnap().table(name) !== undefined;
   }
 
-  // isSharedTempTable reports whether name resolves to a DATABASE-WIDE shared temporary table in the
-  // visible shared-temp snapshot (temp-tables.md §3). Checked AFTER session-local in the resolution
-  // walk (session-local → shared → persistent); preclude-overlaps keeps a name in at most one scope.
-  private isSharedTempTable(name: string): boolean {
-    return this.sharedTempSnap().table(name) !== undefined;
-  }
-
-  // compositeDependentAny is the DROP TYPE … RESTRICT dependency check across EVERY visible scope
+  // compositeDependentAny is the DROP TYPE … RESTRICT dependency check across every visible scope
   // (spec/design/temp-tables.md §8): the main image (tables + composite fields), then the visible
-  // session-local and shared temp snapshots (their tables). A composite type is always persistent, but
-  // a TEMP table column may reference it, so dropping the type while such a temp table exists is 2BP01
-  // — matching the persistent case (PostgreSQL blocks the drop). A session sees only its own
-  // session-local temp tables plus the shared ones, so the check is scoped to what is visible (another
-  // session's private temp table is invisible by design — and its resolved ColType is self-contained,
-  // so it keeps working regardless).
+  // session-local temp snapshot (its tables). A composite type is always persistent, but a TEMP table
+  // column may reference it, so dropping the type while such a temp table exists is 2BP01 — matching the
+  // persistent case (PostgreSQL blocks the drop). A session sees only its own session-local temp tables
+  // (another session's private temp table is invisible by design — and its resolved ColType is
+  // self-contained, so it keeps working regardless).
   private compositeDependentAny(name: string): string | null {
-    return (
-      this.readSnap().compositeDependent(name) ??
-      this.tempSnap().compositeDependent(name) ??
-      this.sharedTempSnap().compositeDependent(name)
-    );
+    return this.readSnap().compositeDependent(name) ?? this.tempSnap().compositeDependent(name);
   }
 
   // isTempIndex reports whether name is a secondary index on a SESSION-LOCAL temp table
@@ -2602,24 +2509,13 @@ export class Engine {
     return this.tempSnap().findIndex(name) !== null;
   }
 
-  // isSharedTempIndex reports whether name is a secondary index on a DATABASE-WIDE shared temp table
-  // (temp-tables.md §8) — the index analogue of isSharedTempTable; checked AFTER the session-local
-  // index (the resolution walk).
-  private isSharedTempIndex(name: string): boolean {
-    return this.sharedTempSnap().findIndex(name) !== null;
-  }
-
-  // sequence resolves a sequence by name along the resolution walk session-local → shared → persistent
+  // sequence resolves a sequence by name along the resolution walk session-local → persistent
   // (spec/design/sequences.md + temp-tables.md §8). Preclude-overlaps keeps a name in at most one scope
   // (the shared relation namespace), so this is just "where the sequence lives". Every sequence READ
   // (nextval/currval/setval resolution, DROP/ALTER SEQUENCE) goes through here, so a serial/IDENTITY
   // column's OWNED temp sequence resolves exactly like a persistent one.
   private sequence(name: string): SequenceDef | undefined {
-    return (
-      this.tempSnap().sequence(name) ??
-      this.sharedTempSnap().sequence(name) ??
-      this.readSnap().sequence(name)
-    );
+    return this.tempSnap().sequence(name) ?? this.readSnap().sequence(name);
   }
 
   // isTempSequence reports whether name is a sequence in the SESSION-LOCAL temp snapshot
@@ -2629,24 +2525,15 @@ export class Engine {
     return this.tempSnap().sequence(name) !== undefined;
   }
 
-  // isSharedTempSequence reports whether name is a sequence in the DATABASE-WIDE shared temp snapshot
-  // (temp-tables.md §8) — checked AFTER session-local (the resolution walk).
-  private isSharedTempSequence(name: string): boolean {
-    return this.sharedTempSnap().sequence(name) !== undefined;
-  }
-
   // putSequenceRouted stages a sequence def into whichever scope currently owns its name (flagging the
-  // matching dirty bit): session-local temp, shared temp, else the main working set. A serial/IDENTITY
-  // temp column's owned sequence advances (nextval flush) into its temp snapshot — like the table's
-  // rows, zero file writes (temp-tables.md §2); a brand-new persistent sequence is absent from both temp
-  // scopes and lands in the main image.
+  // matching dirty bit): session-local temp, else the main working set. A serial/IDENTITY temp column's
+  // owned sequence advances (nextval flush) into its temp snapshot — like the table's rows, zero file
+  // writes (temp-tables.md §2); a brand-new persistent sequence is absent from the temp scope and lands
+  // in the main image.
   private putSequenceRouted(def: SequenceDef): void {
     if (this.isTempSequence(def.name)) {
       this.session.tx!.tempDirty = true;
       this.session.tx!.tempWorking.putSequence(def);
-    } else if (this.isSharedTempSequence(def.name)) {
-      this.session.tx!.sharedTempDirty = true;
-      this.session.tx!.sharedTempWorking.putSequence(def);
     } else {
       this.working().putSequence(def);
     }
@@ -2659,9 +2546,6 @@ export class Engine {
     if (this.isTempSequence(name)) {
       this.session.tx!.tempDirty = true;
       this.session.tx!.tempWorking.removeSequence(key);
-    } else if (this.isSharedTempSequence(name)) {
-      this.session.tx!.sharedTempDirty = true;
-      this.session.tx!.sharedTempWorking.removeSequence(key);
     } else {
       this.working().removeSequence(key);
     }
@@ -2674,70 +2558,50 @@ export class Engine {
     if (this.isTempTable(tableKey)) {
       this.session.tx!.tempDirty = true;
       this.session.tx!.tempWorking.setColumnDefaultExpr(tableKey, column, de);
-    } else if (this.isSharedTempTable(tableKey)) {
-      this.session.tx!.sharedTempDirty = true;
-      this.session.tx!.sharedTempWorking.setColumnDefaultExpr(tableKey, column, de);
     } else {
       this.working().setColumnDefaultExpr(tableKey, column, de);
     }
   }
 
-  // lkpTable resolves a table by name along the resolution walk session-local → shared → persistent
+  // lkpTable resolves a table by name along the resolution walk session-local → persistent
   // (temp-tables.md §3). Preclude-overlaps keeps a name in at most one scope, so this is just "where it lives".
   private lkpTable(name: string): Table | undefined {
-    return (
-      this.tempSnap().table(name) ??
-      this.sharedTempSnap().table(name) ??
-      this.readSnap().table(name)
-    );
+    return this.tempSnap().table(name) ?? this.readSnap().table(name);
   }
 
   // lkpStore returns a table's store for READS, routing by the resolution walk (session-local temp →
-  // shared temp → visible main snapshot — temp-tables.md §2/§4). No dirty flag — reads never persist.
+  // visible main snapshot — temp-tables.md §2). No dirty flag — reads never persist.
   private lkpStore(name: string): TableStore {
     if (this.isTempTable(name)) return this.tempSnap().store(name);
-    if (this.isSharedTempTable(name)) return this.sharedTempSnap().store(name);
     return this.readSnap().store(name);
   }
 
   // writeStore returns a table's store for MUTATION, routing a session-local temp write to tempWorking
-  // (flagging tempDirty), a shared temp write to sharedTempWorking (flagging sharedTempDirty), and a
-  // persistent write to working (which flags mainDirty) — so a pure-temp transaction leaves the main
-  // image untouched (temp-tables.md §2).
+  // (flagging tempDirty) and a persistent write to working (which flags mainDirty) — so a pure-temp
+  // transaction leaves the main image untouched (temp-tables.md §2).
   private writeStore(name: string): TableStore {
     if (this.isTempTable(name)) {
       this.session.tx!.tempDirty = true;
       return this.session.tx!.tempWorking.store(name);
     }
-    if (this.isSharedTempTable(name)) {
-      this.session.tx!.sharedTempDirty = true;
-      return this.session.tx!.sharedTempWorking.store(name);
-    }
     return this.working().store(name);
   }
 
-  // lkpIndexStore returns a secondary index's store for READS, walking session-local → shared → main
+  // lkpIndexStore returns a secondary index's store for READS, walking session-local → main
   // (temp-tables.md §8).
   private lkpIndexStore(nameKey: string): TableStore {
     if (this.tempSnap().hasIndexStore(nameKey)) {
       return this.tempSnap().indexStore(nameKey);
     }
-    if (this.sharedTempSnap().hasIndexStore(nameKey)) {
-      return this.sharedTempSnap().indexStore(nameKey);
-    }
     return this.readSnap().indexStore(nameKey);
   }
 
-  // writeIndexStore returns a secondary index's store for MUTATION, walking session-local → shared →
-  // main (flagging the matching dirty bit).
+  // writeIndexStore returns a secondary index's store for MUTATION, walking session-local → main
+  // (flagging the matching dirty bit).
   private writeIndexStore(nameKey: string): TableStore {
     if (this.tempSnap().hasIndexStore(nameKey)) {
       this.session.tx!.tempDirty = true;
       return this.session.tx!.tempWorking.indexStore(nameKey);
-    }
-    if (this.sharedTempSnap().hasIndexStore(nameKey)) {
-      this.session.tx!.sharedTempDirty = true;
-      return this.session.tx!.sharedTempWorking.indexStore(nameKey);
     }
     return this.working().indexStore(nameKey);
   }
@@ -2941,10 +2805,8 @@ export class Engine {
       failed: false,
       working: this.committed.clone(),
       tempWorking: this.session.tempCommitted.clone(),
-      sharedTempWorking: this.sharedTempCommitted.clone(),
       mainDirty: false,
       tempDirty: false,
-      sharedTempDirty: false,
       savedSessionSeq: new Map(this.session.sessionSeq),
       savedSessionLastName: this.session.sessionLastName,
     };
@@ -3252,11 +3114,10 @@ export class Engine {
           );
         }
         const outcome = this.dispatchStmt(stmt, params);
-        // Enforce the temp-storage budgets after a successful temp write (temp-tables.md §7): an
-        // over-budget statement (session-local tempBuffers OR global sharedTempMem) throws 54P03, which
-        // aborts the block (the staged temp rows roll back at ROLLBACK). A no-op for non-temp statements.
+        // Enforce the temp-storage budget after a successful temp write (temp-tables.md §7): an
+        // over-budget statement (session-local tempBuffers) throws 54P03, which aborts the block (the
+        // staged temp rows roll back at ROLLBACK). A no-op for non-temp statements.
         this.checkTempBudget();
-        this.checkSharedTempBudget();
         // Land any nextval advances into the block's working snapshot; COMMIT publishes them,
         // ROLLBACK discards them with the rest of the working set (sequences.md §5).
         this.flushPendingSequences();
@@ -3287,11 +3148,10 @@ export class Engine {
     let outcome: Outcome;
     try {
       outcome = this.dispatchStmt(stmt, params);
-      // Enforce the temp-storage budgets before committing (temp-tables.md §7): an over-budget temp
-      // write in this implicit transaction (session-local tempBuffers OR global sharedTempMem) is
-      // discarded (rolling back temp + main) and surfaces 54P03.
+      // Enforce the temp-storage budget before committing (temp-tables.md §7): an over-budget temp
+      // write in this implicit transaction (session-local tempBuffers) is discarded (rolling back temp
+      // + main) and surfaces 54P03.
       this.checkTempBudget();
-      this.checkSharedTempBudget();
     } catch (e) {
       // The statement failed before any flush, so session state is untouched; restore from the
       // captured copy anyway to keep the discard path uniform (sequences.md §6).
@@ -3347,12 +3207,11 @@ export class Engine {
       return { kind: "statement", cost: 0n, rowsAffected: null };
     }
     const working = tx.working;
-    // Persist the main image when it changed; a transaction that touched ONLY temp tables (session-
-    // local and/or shared) skips it entirely so a temp table makes ZERO file writes (spec/design/
-    // temp-tables.md §2). An empty block (no kind dirty) still persists, preserving prior behavior.
-    // Temp state is adopted regardless — never serialized, only swapped into the in-memory committed
-    // temp snapshots (the shared root is then published by the shared layer — the two-root commit, §5).
-    const pureTemp = !tx.mainDirty && (tx.tempDirty || tx.sharedTempDirty);
+    // Persist the main image when it changed; a transaction that touched ONLY session-local temp tables
+    // skips it entirely so a temp table makes ZERO file writes (spec/design/temp-tables.md §2). An empty
+    // block (no kind dirty) still persists, preserving prior behavior. Temp state is adopted regardless
+    // — never serialized, only swapped into the in-memory committed temp snapshot.
+    const pureTemp = !tx.mainDirty && tx.tempDirty;
     if (!pureTemp) {
       // The txid advances for a durable database, signalled by the presence of a persistHook (the file
       // and OPFS hosts set one; an in-memory database has none and stays at txid 0). Keyed on persistHook,
@@ -3366,19 +3225,16 @@ export class Engine {
       if (this.persistHook !== null) this.persistHook(this, working);
       this.committed = working;
     }
-    // Adopt the transaction's temp changes into the committed temp snapshots (temp-tables.md §5) — the
+    // Adopt the transaction's temp changes into the committed temp snapshot (temp-tables.md §5) — the
     // temp analogue of publishing committed, but purely in memory. Session-local temp lives on the
-    // session; shared temp lives on the handle (and is published to the shared root by the shared
-    // layer's WriteHandle.commit, the two-root commit).
+    // session.
     // A dirty session-local temp domain materializes its working snapshot into its MemoryBlockStore
     // (compact packed leaves + within-session compaction) before it is adopted — zero main-file writes
-    // (temp-tables.md §6). Compaction is safe iff no streaming cursor holds an older temp tree. Shared
-    // temp is still the fully-resident decoded pointer-swap (a follow-on).
+    // (temp-tables.md §6). Compaction is safe iff no streaming cursor holds an older temp tree.
     if (tx.tempDirty && this.tempStorage !== null) {
       persistTemp(this.tempStorage, tx.tempWorking, this.openStreams === 0);
     }
     this.session.tempCommitted = tx.tempWorking;
-    this.sharedTempCommitted = tx.sharedTempWorking;
     return { kind: "statement", cost: 0n, rowsAffected: null };
   }
 
@@ -3446,32 +3302,10 @@ export class Engine {
     }
   }
 
-  // checkSharedTempBudget enforces the GLOBAL shared-temp storage budget (sharedTempMem, spec/design/
-  // temp-tables.md §7) — the shared analogue of checkTempBudget, charged against the Engine-level
-  // budget over the shared-temp footprint. Self-gates on sharedTempDirty (a no-op for any statement
-  // that did not write shared temp). The over-budget write is staged, so the abort rolls it back.
-  private checkSharedTempBudget(): void {
-    const limit = this.sharedTempMem;
-    if (limit === 0) return;
-    if (this.session.tx === null || !this.session.tx.sharedTempDirty) return;
-    const used = this.sharedTempSnap().storageBytes();
-    if (used > limit) {
-      throw engineError(
-        "temp_storage_limit_exceeded",
-        `shared temporary table storage exceeded the limit of ${limit} bytes`,
-      );
-    }
-  }
-
   private checkPrivileges(stmt: Statement): void {
-    // Fast path: a session that allows ALL DDL (persistent + both temp kinds) and grants every
-    // privilege pays nothing. All three gates must be on, since temp DDL now has its own gates (§5).
-    if (
-      this.session.allowDdl &&
-      this.session.allowTempDdl &&
-      this.session.allowSharedTempDdl &&
-      this.session.privileges.isPermissive()
-    ) {
+    // Fast path: a session that allows ALL DDL (persistent + temp) and grants every privilege pays
+    // nothing. Both gates must be on, since temp DDL now has its own gate (§5).
+    if (this.session.allowDdl && this.session.allowTempDdl && this.session.privileges.isPermissive()) {
       return;
     }
     const req: PrivReq = {
@@ -3479,26 +3313,15 @@ export class Engine {
       functions: [],
       isDdl: false,
       isTempDdl: false,
-      isSharedTempDdl: false,
     };
     collectStmtPrivs(stmt, req);
     if (req.isDdl) {
-      // DDL is gated by the kind of relation it targets (temp-tables.md §5): a shared temp table by
-      // allowSharedTempDdl, a session-local temp table by allowTempDdl, everything else (persistent) by
-      // allowDdl. A CREATE TABLE is classified statically; the rest by resolving the name — a DROP
-      // TABLE / CREATE INDEX by its target table, a DROP INDEX by the index — shared before
-      // session-local (the resolution-walk order; preclude-overlaps keeps a name in one scope).
+      // DDL is gated by the kind of relation it targets (temp-tables.md §5): a session-local temp
+      // table by allowTempDdl, everything else (persistent) by allowDdl. A CREATE TABLE is classified
+      // statically; the rest by resolving the name — a DROP TABLE / CREATE INDEX by its target table, a
+      // DROP INDEX by the index (preclude-overlaps keeps a name in one scope).
       let allowed: boolean;
       if (
-        req.isSharedTempDdl ||
-        (stmt.kind === "dropTable" && stmt.names.some((n) => this.isSharedTempTable(n))) ||
-        (stmt.kind === "createIndex" && this.isSharedTempTable(stmt.table)) ||
-        (stmt.kind === "dropIndex" && this.isSharedTempIndex(stmt.name)) ||
-        (stmt.kind === "dropSequence" && stmt.names.some((n) => this.isSharedTempSequence(n))) ||
-        (stmt.kind === "alterSequence" && this.isSharedTempSequence(stmt.name))
-      ) {
-        allowed = this.session.allowSharedTempDdl;
-      } else if (
         req.isTempDdl ||
         (stmt.kind === "dropTable" && stmt.names.some((n) => this.isTempTable(n))) ||
         (stmt.kind === "createIndex" && this.isTempTable(stmt.table)) ||
@@ -4862,24 +4685,14 @@ export class Engine {
       // the catalog after this (composite.md §4).
       const mainTypes = this.readSnap().types;
       const colTypes = table.columns.map((c) => resolveColType(c.type, mainTypes));
-      // Register into the matching temp snapshot — never the main image, so the table makes zero file
-      // writes (§2). A SHARED table goes in the database-wide shared snapshot (visible to every
-      // session, §4); a plain temp table in the session-local one. Flag the matching dirty bit so the
-      // commit can skip persisting the main image.
-      let ts: Snapshot;
-      if (ct.shared) {
-        this.session.tx!.sharedTempDirty = true;
-        ts = this.session.tx!.sharedTempWorking;
-      } else {
-        this.session.tx!.tempDirty = true;
-        ts = this.session.tx!.tempWorking;
-      }
+      // Register into the session-local temp snapshot — never the main image, so the table makes zero
+      // file writes (§2). Flag tempDirty so the commit can skip persisting the main image.
+      this.session.tx!.tempDirty = true;
+      const ts: Snapshot = this.session.tx!.tempWorking;
       // The session-local temp snapshot rides a per-domain MemoryBlockStore pager (temp-tables.md §6):
       // lazily create the domain storage on first use and stamp its paging onto this working snapshot, so
-      // putTableResolved / putIndexStore attach it to every temp store. Shared temp still uses the fully-
-      // resident decoded path (a follow-on — its cross-session watermark needs core-owned storage), so
-      // tempPaging stays null there.
-      if (!ct.shared) ts.tempPaging = this.tempDomainPaging(false);
+      // putTableResolved / putIndexStore attach it to every temp store.
+      ts.tempPaging = this.tempDomainPaging();
       ts.putTableResolved(table, colTypes, this.pageSize);
       for (const ix of table.indexes) {
         ts.putIndexStore(
@@ -5002,19 +4815,17 @@ export class Engine {
     // ---- Phase 1: resolve & classify every name into the drop set. Nothing is removed yet. A
     // repeated name is deduplicated (PG collects the targets into a set, so `DROP TABLE a, a` drops
     // `a` once and succeeds); `seen` is the set of lowercased keys actually being dropped.
-    type Scope = "temp" | "sharedTemp" | "persistent";
+    type Scope = "temp" | "persistent";
     const targets: { key: string; scope: Scope }[] = [];
     const seen = new Set<string>();
     for (const name of dt.names) {
       const key = name.toLowerCase();
       if (seen.has(key)) continue; // already resolved this exact target (deduplicated)
-      // Resolution walk: session-local temp → shared temp → persistent. Preclude-overlaps keeps a
-      // name in at most one scope, so this is just "where it lives" (temp-tables.md §3).
+      // Resolution walk: session-local temp → persistent. Preclude-overlaps keeps a name in at most one
+      // scope, so this is just "where it lives" (temp-tables.md §3).
       let scope: Scope;
       if (this.isTempTable(name)) {
         scope = "temp";
-      } else if (this.isSharedTempTable(name)) {
-        scope = "sharedTemp";
       } else if (this.readSnap().table(name)) {
         scope = "persistent";
       } else {
@@ -5069,11 +4880,6 @@ export class Engine {
         const ts = this.tempSnap();
         for (const sk of ts.sequencesOwnedBy(tgt.key)) ts.removeSequence(sk);
         ts.removeTable(tgt.key);
-      } else if (tgt.scope === "sharedTemp") {
-        this.session.tx!.sharedTempDirty = true;
-        const ts = this.sharedTempSnap();
-        for (const sk of ts.sequencesOwnedBy(tgt.key)) ts.removeSequence(sk);
-        ts.removeTable(tgt.key);
       } else {
         const ownedSeqs = this.readSnap().sequencesOwnedBy(tgt.key);
         const w = this.working();
@@ -5094,18 +4900,16 @@ export class Engine {
   // table OR an index OR a sequence — spec/design/indexes.md §2, sequences.md §2),
   // case-insensitively.
   private relationExists(name: string): boolean {
-    // Temp tables (session-local AND shared) + their (UNIQUE) index names join the namespace too, so a
-    // name colliding with any temp relation is also 42P07 (preclude-overlaps — spec/design/temp-tables.md
-    // §3). this.table is persistent-only, so both temp snapshots are checked explicitly.
+    // Session-local temp tables + their (UNIQUE) index names join the namespace too, so a name
+    // colliding with any temp relation is also 42P07 (preclude-overlaps — spec/design/temp-tables.md
+    // §3). this.table is persistent-only, so the temp snapshot is checked explicitly.
     return (
       this.table(name) !== undefined ||
       this.tempSnap().table(name) !== undefined ||
-      this.sharedTempSnap().table(name) !== undefined ||
       this.findIndex(name) !== null ||
       this.tempSnap().findIndex(name) !== null ||
-      this.sharedTempSnap().findIndex(name) !== null ||
-      // The sequence funnel walks session-local → shared → persistent, so an owned TEMP sequence's
-      // name joins the namespace (temp-tables.md §8) — a collision with it is 42P07 too.
+      // The sequence funnel walks session-local → persistent, so an owned TEMP sequence's name joins
+      // the namespace (temp-tables.md §8) — a collision with it is 42P07 too.
       this.sequence(name) !== undefined
     );
   }
@@ -5305,7 +5109,7 @@ export class Engine {
           "a multi-column gist index is not supported yet",
         );
       }
-      if (this.isTempTable(ci.table) || this.isSharedTempTable(ci.table)) {
+      if (this.isTempTable(ci.table)) {
         throw engineError(
           "feature_not_supported",
           "a gist index on a temporary table is not supported yet",
@@ -5369,16 +5173,13 @@ export class Engine {
 
     const nameKey = def.name.toLowerCase();
     // Register the index catalog entry + its (empty) store in the snapshot that owns the table (the
-    // resolution walk — temp-tables.md §2/§4/§8): a session-local temp table's index lives in the
-    // session temp snapshot, a shared temp table's in the database-wide shared one, so the index makes
-    // ZERO file writes for either (the dirty bit lets the commit skip the main image). The entry writes
-    // below then route through writeIndexStore, which finds the new store in that same temp snapshot.
+    // resolution walk — temp-tables.md §2/§8): a session-local temp table's index lives in the session
+    // temp snapshot, so the index makes ZERO file writes (the dirty bit lets the commit skip the main
+    // image). The entry writes below then route through writeIndexStore, which finds the new store in
+    // that same temp snapshot.
     if (this.isTempTable(ci.table)) {
       this.session.tx!.tempDirty = true;
       this.session.tx!.tempWorking.putIndex(tableKey, def, this.pageSize);
-    } else if (this.isSharedTempTable(ci.table)) {
-      this.session.tx!.sharedTempDirty = true;
-      this.session.tx!.sharedTempWorking.putIndex(tableKey, def, this.pageSize);
     } else {
       this.working().putIndex(tableKey, def, this.pageSize);
     }
@@ -5398,10 +5199,10 @@ export class Engine {
 
   // executeDropIndex runs a DROP INDEX (spec/design/indexes.md §2): a table's name is
   // 42809, a missing one 42704. A pure catalog edit — zero cost, like DROP TABLE. The index is
-  // resolved along the resolution walk (session-local → shared → persistent — temp-tables.md §8) and
-  // removed from the snapshot that owns it, so dropping a temp table's index makes zero file writes.
+  // resolved along the resolution walk (session-local → persistent — temp-tables.md §8) and removed
+  // from the snapshot that owns it, so dropping a temp table's index makes zero file writes.
   private executeDropIndex(di: DropIndex): Outcome {
-    // lkpTable covers all three scopes, so DROP INDEX naming a table is 42809 regardless of kind.
+    // lkpTable covers both scopes, so DROP INDEX naming a table is 42809 regardless of kind.
     if (this.lkpTable(di.name)) {
       throw engineError("wrong_object_type", di.name + " is not an index");
     }
@@ -5410,10 +5211,6 @@ export class Engine {
       const tableKey = this.tempSnap().findIndex(di.name)![0];
       this.session.tx!.tempDirty = true;
       this.session.tx!.tempWorking.removeIndex(tableKey, nameKey);
-    } else if (this.isSharedTempIndex(di.name)) {
-      const tableKey = this.sharedTempSnap().findIndex(di.name)![0];
-      this.session.tx!.sharedTempDirty = true;
-      this.session.tx!.sharedTempWorking.removeIndex(tableKey, nameKey);
     } else {
       const found = this.findIndex(di.name);
       if (!found) {
@@ -5648,9 +5445,6 @@ export class Engine {
     if (this.isTempSequence(existing.name)) {
       this.session.tx!.tempDirty = true;
       w = this.session.tx!.tempWorking;
-    } else if (this.isSharedTempSequence(existing.name)) {
-      this.session.tx!.sharedTempDirty = true;
-      w = this.session.tx!.sharedTempWorking;
     } else {
       w = this.working();
     }
@@ -10378,11 +10172,9 @@ export class Engine {
   snapshotEngine(): Engine {
     const e = new Engine();
     e.committed = this.readSnap();
-    e.sharedTempCommitted = this.sharedTempSnap();
     e.pageSize = this.pageSize;
     e.paging = this.paging;
     e.readOnly = this.readOnly;
-    e.sharedTempMem = this.sharedTempMem;
     const src = this.session;
     const dst = e.session;
     dst.maxCost = src.maxCost;
@@ -10529,13 +10321,13 @@ export class Engine {
   // planCacheable reports whether a resolved scan plan may be memoized on a prepared statement. The
   // subquery / precompiled-regex exclusion is tracked separately (ParamTypes.uncacheable, set at the
   // node's birth). Here the relations are vetted: a set-returning / CTE / derived relation carries a
-  // nested plan or generator we do not vet for reuse, and a temp / shared-temp table lives in a
-  // snapshot the cache key (committed.catGen) does not track — so a plan referencing any of those is
-  // never cached (a point lookup / plain join over persistent base tables has none).
+  // nested plan or generator we do not vet for reuse, and a temp table lives in a snapshot the cache
+  // key (committed.catGen) does not track — so a plan referencing any of those is never cached (a point
+  // lookup / plain join over persistent base tables has none).
   planCacheable(sp: SelectPlan): boolean {
     for (const r of sp.rels) {
       if (r.srf !== undefined || r.cte !== undefined || r.derived !== undefined) return false;
-      if (this.isTempTable(r.tableName) || this.isSharedTempTable(r.tableName)) return false;
+      if (this.isTempTable(r.tableName)) return false;
     }
     return true;
   }
@@ -21985,13 +21777,9 @@ type PrivReq = {
   functions: string[];
   isDdl: boolean;
   // isTempDdl is whether the DDL targets a SESSION-LOCAL temporary table (CREATE TEMP TABLE) — gated
-  // by allowTempDdl instead of allowDdl (spec/design/temp-tables.md §5). Set only for a session-local
-  // CREATE TEMP (a SHARED create sets isSharedTempDdl); a DROP is classified by resolving the name.
+  // by allowTempDdl instead of allowDdl (spec/design/temp-tables.md §5). Set only for a CREATE TEMP; a
+  // DROP is classified by resolving the name.
   isTempDdl: boolean;
-  // isSharedTempDdl is whether the DDL targets a DATABASE-WIDE shared temporary table (CREATE SHARED
-  // TEMP TABLE) — gated by allowSharedTempDdl (temp-tables.md §5). A DROP of a shared temp table is
-  // classified by resolving the name.
-  isSharedTempDdl: boolean;
 };
 
 // collectStmtPrivs collects the privilege requirements of stmt (spec/design/session.md §5.3).
@@ -22002,9 +21790,8 @@ function collectStmtPrivs(stmt: Statement, req: PrivReq): void {
     case "createTable":
       req.isDdl = true;
       // A temp table's DDL is gated by the temp-scoped split of allowDdl (temp-tables.md §5):
-      // allowSharedTempDdl for a SHARED table, allowTempDdl for a session-local one.
-      req.isSharedTempDdl = stmt.shared;
-      req.isTempDdl = stmt.temp && !stmt.shared;
+      // allowTempDdl for a session-local temp table.
+      req.isTempDdl = stmt.temp;
       break;
     case "dropTable":
     case "createIndex":

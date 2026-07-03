@@ -77,14 +77,12 @@ import type { Privileges, PrivilegeSet } from "./privileges.ts";
 import type { ClockFunc, RandomFill } from "./seam.ts";
 import type { Value } from "./value.ts";
 
-// databaseFromSnapshot builds an in-memory handle whose committed roots are `snap` (the file
-// snapshot) and `sharedTemp` (the database-wide shared-temp snapshot, temp-tables.md §5) — no file
-// backing. A read handle keeps one with no open transaction (reads hit committed = the pinned
-// snapshot); a write handle keeps one with an open READ WRITE block and publishes its working set.
-function databaseFromSnapshot(snap: Snapshot, sharedTemp: Snapshot, pageSize: number): Engine {
+// databaseFromSnapshot builds an in-memory handle whose committed root is `snap` (the file snapshot)
+// — no file backing. A read handle keeps one with no open transaction (reads hit committed = the
+// pinned snapshot); a write handle keeps one with an open READ WRITE block and publishes its working set.
+function databaseFromSnapshot(snap: Snapshot, pageSize: number): Engine {
   const db = new Engine();
   db.committed = snap;
-  db.sharedTempCommitted = sharedTemp;
   // A minted session MUST serialize/split at the FILE's page size (not the in-memory default), so its
   // stores' cap matches the physical pages persist writes — and so every core builds byte-identical
   // file-backed databases (CLAUDE.md §8). In-memory the core's pageSize is the default, so this is a
@@ -94,16 +92,10 @@ function databaseFromSnapshot(snap: Snapshot, sharedTemp: Snapshot, pageSize: nu
 }
 
 // SharedCore is the state shared by every handle minted from one Database: the published committed
-// roots (the file snapshot AND the database-wide shared-temp snapshot, temp-tables.md §5), the
-// single-writer flag, and the live-reader registry (transactions.md §8). Not exported — only the
-// handles touch it. (TS is single-threaded, so a handle reads both roots in one synchronous step:
-// there is no torn pin, hence no need for a combined holder object — two fields suffice.)
+// root (the file snapshot, transactions.md §2), the single-writer flag, and the live-reader registry
+// (transactions.md §8). Not exported — only the handles touch it.
 class SharedCore {
   committed: Snapshot;
-  // sharedTempCommitted is the published shared-temp root (temp-tables.md §4): the rows of every
-  // SHARED temp table, visible to every handle, NEVER serialized. Published alongside `committed` by
-  // WriteHandle.commit — a pure in-memory swap (no fsync, nothing written to the file).
-  sharedTempCommitted: Snapshot;
   // live maps a pinned snapshot version to its reader refcount; its minimum key is the reclamation
   // watermark (several readers may pin the same version).
   live = new Map<bigint, number>();
@@ -124,7 +116,6 @@ class SharedCore {
 
   constructor(snap: Snapshot, storage: Engine) {
     this.committed = snap;
-    this.sharedTempCommitted = new Snapshot();
     this.storage = storage;
   }
 
@@ -204,7 +195,7 @@ export class Database {
   }
 
   // fromEngine lifts a freshly opened/created/loaded Engine (file.ts / loadEngine) into a host
-  // handle: its committed snapshot becomes the published roots and it becomes the storage owner
+  // handle: its committed snapshot becomes the published root and it becomes the storage owner
   // (paging + page accounting). Since B3 every engine carries a paging context — a file's
   // FileBlockStore or an in-memory MemoryBlockStore — so this is the one constructor for both hosts.
   // Called by file.ts's createDatabase/openDatabase wrappers (file.ts is the node host module;
@@ -213,7 +204,6 @@ export class Database {
   // (spec/design/pager.md).
   static fromEngine(engine: Engine): Database {
     const core = new SharedCore(engine.committed, engine);
-    core.sharedTempCommitted = engine.sharedTempCommitted;
     core.readOnly = engine.readOnly;
     return Database.over(core);
   }
@@ -239,9 +229,7 @@ export class Database {
   readSession(): Session {
     const snap = this.core.committed; // pin (immutable — no clone)
     this.core.register(snap.txid);
-    // Pin both roots together (temp-tables.md §5): the reader sees a consistent file + shared-temp
-    // view. Single-threaded JS reads both fields synchronously, so the pin is atomic.
-    const engine = databaseFromSnapshot(snap, this.core.sharedTempCommitted, this.core.pageSize);
+    const engine = databaseFromSnapshot(snap, this.core.pageSize);
     return new Session(this.core, engine, "ro", snap.txid, snap.txid);
   }
 
@@ -261,9 +249,8 @@ export class Database {
     }
     this.core.writerActive = true;
     const base = this.core.committed;
-    // committed/sharedTempCommitted = the immutable bases; beginTx clones them to working /
-    // sharedTempWorking. Both roots are pinned together (temp-tables.md §5).
-    const engine = databaseFromSnapshot(base, this.core.sharedTempCommitted, this.core.pageSize);
+    // committed = the immutable base; beginTx clones it to working.
+    const engine = databaseFromSnapshot(base, this.core.pageSize);
     engine.beginTx(true);
     return new Session(this.core, engine, "rw", base.txid, null, true);
   }
@@ -277,7 +264,7 @@ export class Database {
   // independent owns-its-Engine session.)
   session(opts: SessionOptions = {}): Session {
     const snap = this.core.committed;
-    const engine = databaseFromSnapshot(snap, this.core.sharedTempCommitted, this.core.pageSize);
+    const engine = databaseFromSnapshot(snap, this.core.pageSize);
     engine.session = new SessionState(opts);
     // A read-only file-backed core mints read-only sessions (a write is 25006); it pins the committed
     // version in the watermark like a read session. A writable core mints the autocommit lazy-gate one.
@@ -408,11 +395,7 @@ export class Database {
   // doc-hidden introspection detail white-box tests reach for (CLAUDE.md §10). ---
 
   private committedEngine(): Engine {
-    return databaseFromSnapshot(
-      this.core.committed,
-      this.core.sharedTempCommitted,
-      this.core.pageSize,
-    );
+    return databaseFromSnapshot(this.core.committed, this.core.pageSize);
   }
   // tableNames is every persistent table in the committed snapshot, sorted ascending by lowercased
   // name (CLAUDE.md §8); secondary indexes are excluded (api.md §6).
@@ -729,22 +712,20 @@ export class Session {
     }
   }
 
-  // refreshCommitted re-pins the latest committed roots as this session's base (spec/design/
-  // session.md §2.4): the autocommit read/write path always works against the newest committed state.
+  // refreshCommitted re-pins the latest committed root as this session's base (spec/design/session.md
+  // §2.4): the autocommit read/write path always works against the newest committed state.
   private refreshCommitted(): void {
     this.baseVersion = this.core.committed.txid;
     this.engine.committed = this.core.committed;
-    this.engine.sharedTempCommitted = this.core.sharedTempCommitted;
   }
 
-  // publish stores the engine's committed roots into the shared cell at the next version (the §3
-  // commit window — both roots together, temp-tables.md §5). Called after a clean autocommit write or
-  // an explicit COMMIT of a writable block.
+  // publish stores the engine's committed root into the shared cell at the next version (the §3 commit
+  // window — transactions.md §2). Called after a clean autocommit write or an explicit COMMIT of a
+  // writable block.
   //
   // File-backed: the new file snapshot is persisted durably first (core.persist) and the cell is
   // updated only on success, so a persist I/O failure throws and leaves the shared committed state (and
-  // this session's version) unchanged. In-memory persist is a no-op. The shared-temp root is never
-  // serialized — it rides the swap as a pure in-memory reference (temp-tables.md §2/§5).
+  // this session's version) unchanged. In-memory persist is a no-op.
   private publish(): void {
     const snap = this.engine.committed;
     snap.txid = this.baseVersion + 1n; // advance the shared version on every commit
@@ -757,7 +738,6 @@ export class Session {
     snap.demoteCleanLeaves();
     this.engine.committed = snap;
     this.core.committed = snap;
-    this.core.sharedTempCommitted = this.engine.sharedTempCommitted;
     this.baseVersion += 1n;
   }
 
@@ -914,14 +894,8 @@ export class Session {
   setAllowTempDdl(allow: boolean): void {
     this.engine.setAllowTempDdl(allow);
   }
-  setAllowSharedTempDdl(allow: boolean): void {
-    this.engine.setAllowSharedTempDdl(allow);
-  }
   setTempBuffers(bytes: number): void {
     this.engine.setTempBuffers(bytes);
-  }
-  setSharedTempMem(bytes: number): void {
-    this.engine.setSharedTempMem(bytes);
   }
   setVar(name: string, value: string): void {
     this.engine.session.setVar(name, value);
