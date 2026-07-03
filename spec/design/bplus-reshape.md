@@ -18,7 +18,20 @@
 > `format_version` 24, goldens regenerated incl. the `max_sep_table.jed` degenerate-fan-out
 > fixture, corpus green in both storage modes with zero corpus cost drift; the exact byte
 > contract is [../fileformat/format.md](../fileformat/format.md)); **B2 landed** folded into the
-> per-core B1 ports (pure deletion of the obsoleted interior-record machinery). **B3–B4 pending.**
+> per-core B1 ports (pure deletion of the obsoleted interior-record machinery); **B3 landed** for
+> in-memory databases (a `MemoryBlockStore` seeded with the empty image, demand-paged through the
+> same pager/pool as a file — the eager `from_image` loader and the `persist` no-op are gone);
+> **B4 landed** (the post-commit residency flip — committed clean leaves demote to `OnDisk` and
+> fault back Packed through the pool on every host; `Unfetched` carries its own resolution handles
+> and the evaluator's column access resolves a touched-set miss on demand, unmetered; the
+> two-form masked/unmasked reconstruction seam is deleted). **One deliberate narrowing, recorded
+> here (the §9 risk valve):** **temp-table stores stay fully resident** this reshape — after B4
+> the `Decoded` residency arm must exist anyway (it is the writer's scratch form and every
+> uncommitted read-your-writes view), so temp tables riding it keep **zero** extra machinery
+> alive; moving them onto a per-domain `MemoryBlockStore` is a named follow-on gated on
+> **continuous within-session reclamation** (transactions.md §8's P6.2 follow-on — without it a
+> never-reopened temp store leaks a page per commit), and the deferred temp spill-to-disk seam
+> stays a `BlockStore` swap exactly as §3 planned.
 > Supersedes the "in-memory path deliberately
 > left separate" carve-outs in [hosts.md §7](hosts.md) and [lazy-record.md §4/§11/§12](lazy-record.md),
 > and the B-tree shape decided in [transactions.md §3](transactions.md). Absorbs the PAX

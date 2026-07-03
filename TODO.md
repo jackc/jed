@@ -236,13 +236,21 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     deletion): the interior-`Decoded`-with-records case, the row-major record codec
     (`encode_record`/`decode_record`/`decode_record_lazy`), the in-order-predecessor delete
     (`max_kv`), and the interleaved separator-emission scan logic are gone from all three cores.
-  - [ ] **B3 — `MemoryBlockStore` + pinned pool** (in-memory + temp-table stores through the
-    pager; unify commit; delete the `persist` no-op / `resident_leaves == 0` special cases).
-    _Landed so far:_ the [`MemoryBlockStore`] host itself (all three cores + hosts.md catalog
-    rows — the block-device building block, below the page format).
-  - [ ] **B4 — retire `Decoded` + the demand-fault backstop** (Decoded = write-scratch only;
-    collapse the two-form read seam; resolve-on-demand backstop under the static-touched-set
-    cost basis).
+  - [x] **B3 — `MemoryBlockStore` + pinned pool** ✅ (in-memory databases): an in-memory database
+    is a `MemoryBlockStore` seeded with the empty from-scratch image, demand-paged through the
+    same pager + Packed path as a file (pinned/unbounded pool); the eager whole-image
+    `from_image` loader, the `persist` in-memory no-op, and the separate in-memory constructor
+    are deleted — one loader, one commit path (the file commit minus durability). **Deliberate
+    narrowing (recorded in bplus-reshape.md):** temp-table stores stay fully resident — they ride
+    the `Decoded` writer-scratch arm B4 keeps anyway (zero extra machinery); their store move is
+    a follow-on gated on continuous within-session reclamation (above).
+  - [x] **B4 — retire `Decoded` + the demand-fault backstop** ✅: the post-commit residency flip
+    (committed clean leaves demote to `OnDisk` at publish and fault back Packed through the pool
+    — `Decoded` survives only inside an uncommitted writer); `Unfetched` values carry their own
+    resolution handles (column-type ref + weak pager handle) and the evaluator's column access
+    resolves a touched-set miss **on demand, unmetered** (the backstop — deterministic rows,
+    never a NULL-fold; the touched set stays the cost basis + prefetch); the two-form
+    masked/unmasked reconstruction seam is deleted.
 - [ ] **File compaction / shrink (return space to the OS)** — ⏳ **approach decided, not built.** The free-list recycles dead space for jed but `page_count` is a monotonic high-water, so the file is grow-only. Decided mechanism: a **host-invoked compaction** that re-serializes the committed snapshot through the from-scratch `to_image` serializer into a fresh file + atomic swap (the `create` temp-file + fsync + rename recipe), reclaiming all dead space + defragmenting (the SQLite `VACUUM` / PG `VACUUM FULL` flavor) crash-safely. Explicit / host-invoked, gated on the reader-liveness watermark; needs nothing new at the storage seam. A lighter in-place trailing-free truncation stays open as a cheaper partial complement. → [storage.md §6](spec/design/storage.md) _(size: M–L; deps: P6.2; §9)_
 - [ ] **Streaming + spill-to-disk operators** — bound blocking operators (`ORDER BY`, hash `JOIN`, `GROUP BY`/aggregate, `DISTINCT`) by a memory budget and **spill to disk** when exceeded, so a query over larger-than-RAM data never materializes its whole input/output in memory. **Landed:** the **external merge sort for `ORDER BY`** (a `Sorter` bounded by `work_mem`, spills sorted runs + k-way merges, byte-for-byte identical to the in-memory sort). → [spill.md](spec/design/spill.md) _(size: XL; deps: paged storage; §9/§13)_
   - [ ] **Spilling hash aggregate / `DISTINCT` / hash JOIN** — the remaining blocking operators (spill.md §7). Each needs a *different* algorithm: a partitioned (grace) hash that preserves first-occurrence order for aggregate/DISTINCT, and — for hash JOIN — a hash-join operator first (jed joins are nested-loop today), then grace-hash spill to bound the build side. _(size: L–XL each)_
