@@ -9,7 +9,8 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, EngineError, intValue, type Outcome } from "../src/tooling.ts";
+import { EngineError, intValue, type Outcome } from "../src/tooling.ts";
+import { memDb } from "./mem_db.ts";
 
 function code(fn: () => unknown): string {
   try {
@@ -29,7 +30,7 @@ function queryRows(o: Outcome) {
 test("default session is stateful across calls", () => {
   // The Engine-owned default session holds an open BEGIN block across separate calls (the
   // PG/SQLite connection model, §2.1); db.status() exposes the explicit state machine.
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   assert.strictEqual(db.status(), "Idle");
   db.execute("CREATE TABLE t (id i32 PRIMARY KEY)");
   db.execute("BEGIN");
@@ -43,7 +44,7 @@ test("default session is stateful across calls", () => {
 test("failed block is the Failed state", () => {
   // A statement error inside a block poisons it: status is Failed, every later statement but
   // ROLLBACK/COMMIT is 25P02 (§2.2 / transactions.md §6), and ROLLBACK returns to Idle.
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   db.execute("BEGIN");
   assert.strictEqual(
     code(() => db.execute("SELECT * FROM missing")),
@@ -61,7 +62,7 @@ test("failed block is the Failed state", () => {
 test("additional session shares storage with independent settings", () => {
   // Two sessions over one shared Database core: each owns its private Engine, but committed storage
   // is shared through the core (§2.4) — no swap. Settings (the cost ceiling) are independent.
-  const db = Database.newInMemory();
+  const db = memDb();
   const a = db.session({});
   a.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
   a.execute("INSERT INTO t VALUES (1, 10)");
@@ -91,7 +92,7 @@ test("additional session shares storage with independent settings", () => {
 test("additional session cost ceiling is enforced", () => {
   // The session's settings drive the execution path: a tiny ceiling aborts the scan with 54P01,
   // while an unlimited session runs it fine — both over the same shared core.
-  const db = Database.newInMemory();
+  const db = memDb();
   const a = db.session({});
   a.execute("CREATE TABLE t (id i32 PRIMARY KEY)");
   a.execute("INSERT INTO t VALUES (1), (2), (3)");
@@ -110,7 +111,7 @@ test("additional session cost ceiling is enforced", () => {
 test("additional session update closure commits to shared storage", () => {
   // s.update opens a write block, runs the closure, and publishes on success — another session over
   // the shared core sees the committed rows. Mirrors impl/rust/tests/session.rs.
-  const db = Database.newInMemory();
+  const db = memDb();
   const a = db.session({});
   a.execute("CREATE TABLE t (id i32 PRIMARY KEY)");
 
@@ -125,7 +126,7 @@ test("additional session update closure commits to shared storage", () => {
 });
 
 test("session update rolls back on a thrown error and releases the gate", () => {
-  const db = Database.newInMemory();
+  const db = memDb();
   const s = db.session({});
   s.execute("CREATE TABLE t (id i32 PRIMARY KEY)");
   assert.throws(() =>
@@ -145,7 +146,7 @@ test("session update rolls back on a thrown error and releases the gate", () => 
 test("Database view and update mint a fresh session per call", () => {
   // The bare Database.view/update convenience each mint a fresh autocommit session, run the closure as
   // one transaction, and discard the session — committed data persists through the shared core.
-  const db = Database.newInMemory();
+  const db = memDb();
   db.execute("CREATE TABLE t (id i32 PRIMARY KEY)");
   db.update((tx) => {
     tx.execute("INSERT INTO t VALUES (1)");

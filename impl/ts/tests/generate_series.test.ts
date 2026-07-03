@@ -9,8 +9,9 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, intValue } from "../src/tooling.ts";
+import { intValue } from "../src/tooling.ts";
 import { type Handle, dbWith, errCode, query } from "./util.ts";
+import { memDb } from "./mem_db.ts";
 
 function cost(db: Handle, sql: string): bigint {
   return db.execute(sql).cost;
@@ -21,7 +22,7 @@ function rows1(ns: number[]): string[][] {
 }
 
 test("step of zero is invalid_parameter_value (22023)", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   assert.equal(
     errCode(() => db.execute("SELECT * FROM generate_series(1, 5, 0)")),
     "22023",
@@ -29,7 +30,7 @@ test("step of zero is invalid_parameter_value (22023)", () => {
 });
 
 test("alias forms and qualified column", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   // PG's single-column function-alias rule: `AS g` (or implicit `g`) renames the column to `g`.
   assert.deepStrictEqual(query(db, "SELECT * FROM generate_series(1, 3) g"), rows1([1, 2, 3]));
   const out = db.execute("SELECT * FROM generate_series(1, 3) AS g");
@@ -47,7 +48,7 @@ test("alias forms and qualified column", () => {
 });
 
 test("$N parameter argument", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   const out = db.execute("SELECT * FROM generate_series(1, $1)", [intValue(3n)]);
   assert.equal(out.kind, "query");
   if (out.kind !== "query") return;
@@ -68,7 +69,7 @@ test("a sibling reference works (an SRF is implicitly lateral, grammar.md §44)"
 });
 
 test("generated_row cost and the maxCost ceiling", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   assert.equal(cost(db, "SELECT * FROM generate_series(1, 4)"), 8n);
   db.setMaxCost(50n);
   assert.equal(
@@ -79,7 +80,7 @@ test("generated_row cost and the maxCost ceiling", () => {
 });
 
 test("mixed-width promotes to the wider type", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   const out = db.execute("SELECT * FROM generate_series(CAST(1 AS i16), CAST(5 AS i32))");
   assert.equal(out.kind, "query");
   if (out.kind !== "query") return;
@@ -87,7 +88,7 @@ test("mixed-width promotes to the wider type", () => {
 });
 
 test("i64 overflow while stepping stops cleanly (bigint parity)", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   // Stepping past i64::MAX must STOP, not run forever (bigint never overflows): only the last
   // representable element is emitted, matching Rust/Go's checked_add stop.
   assert.deepStrictEqual(
@@ -97,7 +98,7 @@ test("i64 overflow while stepping stops cleanly (bigint parity)", () => {
 });
 
 test("deferred-form and bad-call errors", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   assert.equal(
     errCode(() => db.execute("SELECT generate_series(1, 5)")),
     "42883",

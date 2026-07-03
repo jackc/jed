@@ -8,7 +8,8 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, EngineError, PrivilegeSet } from "../src/tooling.ts";
+import { EngineError, PrivilegeSet } from "../src/tooling.ts";
+import { memDb } from "./mem_db.ts";
 
 function code(fn: () => unknown): string {
   try {
@@ -26,7 +27,7 @@ const COST5 = "SELECT 1 + 1 + 1 + 1 + 1";
 test("default session has no budget but tracks the cumulative", () => {
   // A fresh session is unlimited (budget 0) yet still TRACKS the cumulative cost — the gauge is
   // always readable (§5.4), it just never aborts.
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   assert.equal(db.lifetimeMaxCost(), 0n);
   assert.equal(db.lifetimeCost(), 0n);
   db.execute("SELECT 1"); // cost 1
@@ -38,7 +39,7 @@ test("default session has no budget but tracks the cumulative", () => {
 test("budget aborts in flight then rejects at admission", () => {
   // Set a budget of 3. The cumulative builds across statements; the one that drives it to the budget
   // aborts 54P02 mid-flight, and every further statement is then rejected 54P02 at admission.
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   db.setLifetimeMaxCost(3n);
   assert.equal(db.lifetimeMaxCost(), 3n);
   db.execute("SELECT 1"); // cumulative 1
@@ -64,7 +65,7 @@ test("budget aborts in flight then rejects at admission", () => {
 test("partial cost of an aborted statement counts", () => {
   // A single statement larger than the whole budget aborts mid-flight, and the partial work it did
   // (up to the budget) still counts — the cumulative lands exactly at the budget (unit charges are 1).
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   db.setLifetimeMaxCost(3n);
   assert.equal(
     code(() => db.execute(COST5)),
@@ -77,7 +78,7 @@ test("the cumulative is session state and does not roll back", () => {
   // The cumulative is SESSION state, not snapshot state (§5.4): a ROLLBACK undoes a statement's DATA
   // effects but NOT the compute it spent. Run work inside an explicit block, roll it back, and the
   // cumulative still reflects every statement's cost.
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   db.execute("BEGIN");
   db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
   db.execute("INSERT INTO t VALUES (1, 10)");
@@ -100,7 +101,7 @@ test("a statement aborts at whichever ceiling it reaches first", () => {
   // maxCost (54P01) and lifetimeMaxCost (54P02) compose: a statement aborts at whichever it reaches
   // first. With the per-statement ceiling tight and the budget far, the per-statement ceiling wins
   // (54P01) — and its partial cost still counts toward the session budget.
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   db.setLifetimeMaxCost(1000n);
   db.setMaxCost(3n);
   assert.equal(
@@ -110,7 +111,7 @@ test("a statement aborts at whichever ceiling it reaches first", () => {
   assert.equal(db.lifetimeCost(), 3n); // the 54P01 partial counted toward the session
 
   // Now the session budget is the nearer ceiling: a tight budget, the per-statement ceiling far.
-  const db2 = Database.newInMemory().session();
+  const db2 = memDb().session();
   db2.setLifetimeMaxCost(3n);
   db2.setMaxCost(1000n);
   assert.equal(
@@ -122,7 +123,7 @@ test("a statement aborts at whichever ceiling it reaches first", () => {
 test("an exact tie breaks to the per-statement ceiling", () => {
   // When both ceilings are reached at the very same accrued value, the inner per-statement ceiling
   // wins the tie (54P01) — the documented, deterministic, cross-core tie rule (§5.4, cost.ts guard).
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   db.setLifetimeMaxCost(3n);
   db.setMaxCost(3n);
   assert.equal(
@@ -135,7 +136,7 @@ test("an additional session carries its own budget", () => {
   // db.session(opts) mints an independent session with its own cumulative + budget (§2.1/§2.4/§5.4):
   // a budgeted additional session aborts at its budget while a permissive one keeps running, and the
   // two cumulatives are independent (each session owns its envelope).
-  const db = Database.newInMemory();
+  const db = memDb();
   const a = db.session({});
   a.execute("SELECT 1"); // a's cumulative 1
 
@@ -158,7 +159,7 @@ test("an additional session carries its own budget", () => {
 test("admission is checked before existence and privileges", () => {
   // The budget admission check runs ahead of privileges AND existence (§5.4): once a session is
   // exhausted, even a query naming a missing table is 54P02, not 42P01 — nothing runs.
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   db.setLifetimeMaxCost(1n);
   // SELECT 1 costs 1, reaching the budget — it aborts 54P02 (and spends the budget).
   assert.equal(

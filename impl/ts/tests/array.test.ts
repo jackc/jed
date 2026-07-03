@@ -6,13 +6,14 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Database } from "../src/tooling.ts";
 import { type Handle, errCode, query } from "./util.ts";
+import { memDb } from "./mem_db.ts";
 
 function run(db: Handle, sql: string): void {
   db.execute(sql);
 }
 
 test("array column survives a whole-image round-trip", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, xs i32[], tags text[])");
   run(db, "INSERT INTO t VALUES (1, ARRAY[10, 20, 30], ARRAY['a', 'b'])");
   run(db, "INSERT INTO t VALUES (2, ARRAY[1, NULL, 3], '{}')");
@@ -28,7 +29,7 @@ test("array column survives a whole-image round-trip", () => {
 // --- AC1: array-of-composite element types (spec/design/array.md §12) -----------------------------
 
 test("AC1: composite-element array round-trips literal + ARRAY[ROW(…)] constructor; access works", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   run(db, "CREATE TYPE addr AS (street text, zip i32)");
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, items addr[])");
   // The text-literal construction path (array_in → record_in per element).
@@ -50,7 +51,7 @@ test("AC1: composite-element array round-trips literal + ARRAY[ROW(…)] constru
 });
 
 test("AC1: an addr[] column survives a whole-image round-trip", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   run(db, "CREATE TYPE addr AS (street text, zip i32)");
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, items addr[])");
   run(db, `INSERT INTO t VALUES (1, '{"(Main,90210)","(Side,5)"}')`);
@@ -65,7 +66,7 @@ test("AC1: an addr[] column survives a whole-image round-trip", () => {
 });
 
 test("AC1: composite element NULL-field ordering operators are definite (the total-order fix)", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   run(db, "CREATE TYPE addr AS (street text, zip i32)");
   // Equal arrays with a NULL composite field: definite, never UNKNOWN.
   assert.deepStrictEqual(
@@ -88,7 +89,7 @@ test("AC1: composite element NULL-field ordering operators are definite (the tot
 });
 
 test("AC1: a composite-element array is still never keyable (0A000)", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   run(db, "CREATE TYPE addr AS (street text, zip i32)");
   assert.strictEqual(
     errCode(() => run(db, "CREATE TABLE t (items addr[] PRIMARY KEY)")),

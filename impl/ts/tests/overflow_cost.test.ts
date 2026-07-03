@@ -11,8 +11,9 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, Session } from "../src/tooling.ts";
+import { Session } from "../src/tooling.ts";
 import { type Handle, fillerBytesHex, fillerText } from "./util.ts";
+import { memDb } from "./mem_db.ts";
 
 // page_size 256 ⇒ cap = 240, RECORD_MAX = 114. A 600-byte text payload spills into
 // ceil(600/240) = 3 overflow pages; a 300-byte bytea into ceil(300/240) = 2.
@@ -21,7 +22,7 @@ const TEXT_CHAIN_PAGES = 3n;
 const BYTEA_CHAIN_PAGES = 2n;
 
 function smallPageDb(): Session {
-  const db = Database.inMemoryWithPageSize(PAGE_SIZE).session();
+  const db = memDb(PAGE_SIZE).session();
   return db;
 }
 

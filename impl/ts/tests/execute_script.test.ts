@@ -6,8 +6,9 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, EngineError, intValue } from "../src/tooling.ts";
+import { EngineError, intValue } from "../src/tooling.ts";
 import type { Handle } from "./util.ts";
+import { memDb } from "./mem_db.ts";
 
 function code(fn: () => unknown): string {
   try {
@@ -26,7 +27,7 @@ function countRows(db: Handle): unknown {
 }
 
 test("script summary counts and commits atomically when Idle", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   const summary = db.executeScript(
     `CREATE TABLE t (id i32 PRIMARY KEY, v i32);
      INSERT INTO t VALUES (1, 10);
@@ -42,7 +43,7 @@ test("script summary counts and commits atomically when Idle", () => {
 });
 
 test("script is all-or-nothing on error", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   db.execute("CREATE TABLE t (id i32 PRIMARY KEY)");
   assert.strictEqual(
     code(() =>
@@ -57,7 +58,7 @@ test("script is all-or-nothing on error", () => {
 });
 
 test("script SELECT rows are discarded but the statement is counted", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   const summary = db.executeScript(
     `CREATE TABLE t (id i32 PRIMARY KEY);
      INSERT INTO t VALUES (1), (2);
@@ -69,14 +70,14 @@ test("script SELECT rows are discarded but the statement is counted", () => {
 });
 
 test("empty script is a no-op success", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   const summary = db.executeScript("  -- just a comment\n /* and a block */ ;;; ");
   assert.deepStrictEqual(summary, { statementsRun: 0, rowsAffectedTotal: 0, cost: 0n });
   assert.strictEqual(db.status(), "Idle");
 });
 
 test("in-script transaction control is 0A000 and rolls the run back", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   db.execute("CREATE TABLE t (id i32 PRIMARY KEY)");
   for (const script of [
     "INSERT INTO t VALUES (1); COMMIT; INSERT INTO t VALUES (2)",
@@ -94,7 +95,7 @@ test("in-script transaction control is 0A000 and rolls the run back", () => {
 });
 
 test("script joins an open transaction without committing", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   db.execute("CREATE TABLE t (id i32 PRIMARY KEY)");
   db.execute("BEGIN");
   const summary = db.executeScript("INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)");
@@ -106,7 +107,7 @@ test("script joins an open transaction without committing", () => {
 });
 
 test("script error inside an open transaction leaves it Failed for the caller", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   db.execute("CREATE TABLE t (id i32 PRIMARY KEY)");
   db.execute("BEGIN");
   assert.strictEqual(
@@ -121,7 +122,7 @@ test("script error inside an open transaction leaves it Failed for the caller", 
 test("additional session runs a script over the shared core", () => {
   // executeScript on an ADDITIONAL session (§2.1/§2.4) shares committed storage through the Database
   // core and commits the run all-or-nothing — another session sees it.
-  const db = Database.newInMemory();
+  const db = memDb();
   const a = db.session({});
   a.execute("CREATE TABLE t (id i32 PRIMARY KEY)");
   const s = db.session({});

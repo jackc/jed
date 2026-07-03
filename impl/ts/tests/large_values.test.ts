@@ -13,6 +13,7 @@ import { test } from "node:test";
 import { loadEngine } from "../src/format.ts";
 import { Database, Session, createDatabase, openDatabase } from "../src/tooling.ts";
 import { type Handle, fillerText } from "./util.ts";
+import { memDb } from "./mem_db.ts";
 
 const PAGE_OVERFLOW = 4; // page_type for an overflow slab (large-values.md §12)
 
@@ -40,7 +41,7 @@ function textOf(v: { kind: string; text?: string } | undefined): string | null {
 const BIG = fillerText(1250); // incompressible, so Slice B keeps it external-plain
 
 function bigValueDB(): Session {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   db.execute("CREATE TABLE t (id i32 PRIMARY KEY, body text)");
   db.execute(`INSERT INTO t VALUES (1, '${BIG}')`);
   db.execute("INSERT INTO t VALUES (2, 'tiny')");
@@ -65,7 +66,7 @@ test("external value spans an overflow chain and round-trips byte-identically", 
 });
 
 test("small values never spill", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i16)");
   db.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)");
   const image = db.toImage(256, 1n);
@@ -96,7 +97,7 @@ test("external value through the default demand-paged file path, with reclamatio
   const path = join(dir, "large_values.jed");
   const big = fillerText(1500); // incompressible ≫ RECORD_MAX at ps 256 ⇒ a multi-page overflow chain
   try {
-    let db = createDatabase(path, { pageSize: 256 });
+    let db = createDatabase({ path, pageSize: 256 });
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY, body text)");
     db.execute(`INSERT INTO t VALUES (1, '${big}')`);
     db.execute("INSERT INTO t VALUES (2, 'small')");

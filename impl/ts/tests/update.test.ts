@@ -6,8 +6,8 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database } from "../src/tooling.ts";
 import { type Handle, dbWith, errCode } from "./util.ts";
+import { memDb } from "./mem_db.ts";
 
 function setup() {
   return dbWith([
@@ -36,7 +36,7 @@ test("unknown column traps 42703; missing table traps 42P01", () => {
     "42703",
   );
   assert.equal(
-    errCode(() => Database.newInMemory().session().execute("UPDATE nope SET a = 1")),
+    errCode(() => memDb().session().execute("UPDATE nope SET a = 1")),
     "42P01",
   );
 });

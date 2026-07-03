@@ -7,8 +7,9 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, EngineError, Session } from "../src/tooling.ts";
+import { EngineError, Session } from "../src/tooling.ts";
 import { type Handle, dbWith, errCode, query } from "./util.ts";
+import { memDb } from "./mem_db.ts";
 
 // A 3-row, single-node table t(id, n) = {(1,10),(2,20),(3,30)}.
 function t3(): Session {
@@ -46,7 +47,7 @@ test("MATERIALIZED / NOT MATERIALIZED hints force the mode", () => {
 // cross-iteration meter (recursive-cte.md §5) — the untrusted-query safety mechanism doing real
 // work. A per-iteration meter would never fire here, so the corpus cannot express it.
 test("WITH RECURSIVE unbounded recursion aborts at the cost ceiling", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   db.setMaxCost(1000n);
   assert.throws(
     () =>
@@ -59,7 +60,7 @@ test("WITH RECURSIVE unbounded recursion aborts at the cost ceiling", () => {
 // A recursion whose total cost fits under the ceiling runs to completion (the ceiling bounds the
 // actual accrued cost); the 5-row counter accrues 29 (the corpus cost contract).
 test("WITH RECURSIVE under the ceiling succeeds", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   db.setMaxCost(1000n);
   assert.strictEqual(
     cost(
@@ -73,7 +74,7 @@ test("WITH RECURSIVE under the ceiling succeeds", () => {
 // A recursive CTE is ALWAYS materialized — NOT MATERIALIZED is inert (recursive-cte.md §1), so a
 // single-reference recursive CTE still iterates to a fixpoint (3 rows, cost 17) rather than inlining.
 test("WITH RECURSIVE materialization hint is inert", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   for (const hint of ["", "MATERIALIZED ", "NOT MATERIALIZED "]) {
     const r = db.execute(
       `WITH RECURSIVE c(n) AS ${hint}(SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 3) SELECT n FROM c ORDER BY n`,

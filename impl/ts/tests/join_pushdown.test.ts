@@ -7,14 +7,15 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, Session } from "../src/tooling.ts";
+import { Session } from "../src/tooling.ts";
 import type { Handle } from "./util.ts";
 import type { Value } from "../src/value.ts";
+import { memDb } from "./mem_db.ts";
 
 // `a` is n rows (id i32 PRIMARY KEY, k i32; k == id) wide enough to span several leaves; `b` is
 // three small rows whose k-values exist as a's k-values, so the join matches.
 function joinTables(n: number): Session {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   db.execute("CREATE TABLE a (id i32 PRIMARY KEY, k i32)");
   db.execute("CREATE TABLE b (id i32 PRIMARY KEY, k i32)");
   const parts: string[] = [];

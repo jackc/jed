@@ -23,12 +23,20 @@ import { loadEnginePaged, toImage } from "./format.ts";
 import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "./paging.ts";
 import { Pager } from "./pager.ts";
 import { persistImpl } from "./persist.ts";
-import { Database } from "./shared.ts";
+import { buildInMemory, Database } from "./shared.ts";
 import { FileSpillSink } from "./spillfile.ts";
 
 // DatabaseOptions are the settings for a newly-created database file (spec/design/api.md §2).
 // pageSize is fixed into the file's meta at creation and cannot change thereafter.
 export type DatabaseOptions = { pageSize?: number };
+
+// CreateOptions are the settings for creating a fresh database (spec/design/api.md §2.1/§2.1.1). path
+// selects the backing: absent → an in-memory database (never touches the filesystem); present → a
+// single file at that path (58P02 if it already exists). It is a genuine optional, not an overloaded
+// empty-string sentinel (api.md §2.1). pageSize (absent/0 → DEFAULT_PAGE_SIZE) is locked into a file's
+// meta at creation and fixes an in-memory database's tree fan-out (the page-backed B-tree's fan-out
+// tracks the page size), so it is meaningful for both backings.
+export type CreateOptions = { path?: string; pageSize?: number };
 
 // create makes a new file-backed database at path with opts (the page size is locked into the
 // file). The path must not already exist — 58P02 otherwise. An initial empty image is written
@@ -130,11 +138,18 @@ export function open(path: string, opts: OpenOptions = {}): Engine {
   }
 }
 
-// createDatabase makes a new file-backed database at path (spec/design/api.md §2/§10 slice 7c) and
-// returns the host Database handle with its default session. 58P02 if the path already exists; the
-// page size is locked into the file. The Database back-compat bridge over the file-backed core.
-export function createDatabase(path: string, opts: DatabaseOptions = {}): Database {
-  return Database.fromEngine(create(path, opts));
+// createDatabase makes a fresh database — in-memory (opts.path absent) or file-backed (opts.path set)
+// — and returns the host Database handle with its default session (spec/design/api.md §2.1/§2.1.1). A
+// file that already exists is 58P02; the page size is locked into the file. The in-memory path cannot
+// fail in substance (it never touches the filesystem) but shares the uniform signature — a caller
+// wanting an infallible in-memory handle wraps this (the tests' memDb helper does). This is the one
+// create constructor for both backings; the in-memory-specific constructors are removed.
+export function createDatabase(opts: CreateOptions = {}): Database {
+  const pageSize = opts.pageSize || DEFAULT_PAGE_SIZE;
+  if (opts.path !== undefined) {
+    return Database.fromEngine(create(opts.path, { pageSize }));
+  }
+  return buildInMemory(pageSize);
 }
 
 // openDatabase opens an existing file-backed database at path with optional open settings and returns

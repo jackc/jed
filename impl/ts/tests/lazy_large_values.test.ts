@@ -12,9 +12,10 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { Database, createDatabase, openDatabase } from "../src/tooling.ts";
+import { createDatabase, openDatabase } from "../src/tooling.ts";
 import { render } from "../src/value.ts";
 import { type Handle, errCode, fillerText } from "./util.ts";
+import { memDb } from "./mem_db.ts";
 
 const PAGE_SIZE = 256;
 const PAGE_OVERFLOW = 4; // page_type for an overflow slab (large-values.md §12)
@@ -86,7 +87,7 @@ test("lazy: chains are read only when touched", () => {
   const dir = mkdtempSync(join(tmpdir(), "jed-lazy-"));
   const path = join(dir, "touch.jed");
   try {
-    let db = createDatabase(path, { pageSize: PAGE_SIZE });
+    let db = createDatabase({ path, pageSize: PAGE_SIZE });
     seed(db);
     db.close();
     corruptOverflowPayloads(path);
@@ -121,7 +122,7 @@ test("lazy: values round-trip exactly through the paged path", () => {
   const dir = mkdtempSync(join(tmpdir(), "jed-lazy-"));
   const path = join(dir, "roundtrip.jed");
   try {
-    let db = createDatabase(path, { pageSize: PAGE_SIZE });
+    let db = createDatabase({ path, pageSize: PAGE_SIZE });
     seed(db);
     db.close();
     db = openDatabase(path);
@@ -143,7 +144,7 @@ test("lazy: UPDATE of other columns preserves spilled values", () => {
   const path = join(dir, "update.jed");
   const big = fillerText(600);
   try {
-    let db = createDatabase(path, { pageSize: PAGE_SIZE });
+    let db = createDatabase({ path, pageSize: PAGE_SIZE });
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY, body text, n i32)");
     db.execute(`INSERT INTO t VALUES (1, '${big}', 10), (2, 'small', 20)`);
     db.close();
@@ -176,9 +177,9 @@ test("lazy: paged and resident costs match", () => {
   const dir = mkdtempSync(join(tmpdir(), "jed-lazy-"));
   const path = join(dir, "cost.jed");
   try {
-    const mem = Database.inMemoryWithPageSize(PAGE_SIZE).session();
+    const mem = memDb(PAGE_SIZE).session();
     seed(mem);
-    const filedb = createDatabase(path, { pageSize: PAGE_SIZE });
+    const filedb = createDatabase({ path, pageSize: PAGE_SIZE });
     seed(filedb);
     filedb.close();
     const paged = openDatabase(path);

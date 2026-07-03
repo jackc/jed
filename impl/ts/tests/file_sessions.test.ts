@@ -40,7 +40,7 @@ test("create + default session persists and reopens", () => {
   const path = join(dir, "roundtrip.jed");
   try {
     {
-      const db = createDatabase(path);
+      const db = createDatabase({ path });
       assert.equal(db.version, 1n); // the initial empty image is committed as version 1
       db.execute("CREATE TABLE t (id i64 PRIMARY KEY)");
       assert.equal(db.version, 2n); // the autocommit CREATE published version 2
@@ -65,7 +65,7 @@ test("explicit transaction on a session persists then rolls back", () => {
   const path = join(dir, "explicit_tx.jed");
   try {
     {
-      const db = createDatabase(path);
+      const db = createDatabase({ path });
       // Explicit transactions live on a Session (the persistent default-session bridge was removed
       // from Database): mint one over the file-backed core and drive begin/commit/rollback on it.
       const s = db.session({});
@@ -100,7 +100,7 @@ test("executeScript on a file-backed default session is all-or-nothing", () => {
   const path = join(dir, "script.jed");
   try {
     {
-      const db = createDatabase(path);
+      const db = createDatabase({ path });
       const summary = db.executeScript(
         "CREATE TABLE t (id i64 PRIMARY KEY); INSERT INTO t VALUES (1); INSERT INTO t VALUES (2);",
       );
@@ -124,7 +124,7 @@ test("a read-only open rejects writes (25006)", () => {
   const path = join(dir, "read_only.jed");
   try {
     {
-      const db = createDatabase(path);
+      const db = createDatabase({ path });
       db.execute("CREATE TABLE t (id i64 PRIMARY KEY)");
       db.execute("INSERT INTO t VALUES (1)");
       db.close();
@@ -161,7 +161,7 @@ test("a file-backed read session stays isolated as the default session commits",
   const dir = tmpDir();
   const path = join(dir, "isolation.jed");
   try {
-    const db = createDatabase(path, { pageSize: 256 }); // small pages so the table spans leaves
+    const db = createDatabase({ path, pageSize: 256 }); // small pages so the table spans leaves
     db.execute("CREATE TABLE t (id i64 PRIMARY KEY)");
     db.execute("INSERT INTO t VALUES (1)");
 

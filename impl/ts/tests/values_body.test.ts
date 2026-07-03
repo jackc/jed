@@ -9,8 +9,9 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, intValue } from "../src/tooling.ts";
+import { intValue } from "../src/tooling.ts";
 import { type Handle, errCode, query } from "./util.ts";
+import { memDb } from "./mem_db.ts";
 
 function names(db: Handle, sql: string): string[] {
   const o = db.execute(sql);
@@ -29,7 +30,7 @@ function cost(db: Handle, sql: string): bigint {
 }
 
 test("VALUES body — basic shape and default column name", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   assert.deepStrictEqual(
     query(db, "SELECT column1 FROM (VALUES (1), (2), (3)) AS v ORDER BY column1"),
     [["1"], ["2"], ["3"]],
@@ -38,7 +39,7 @@ test("VALUES body — basic shape and default column name", () => {
 });
 
 test("VALUES body — multi-column default names and rename list", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   assert.deepStrictEqual(names(db, "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS v"), [
     "column1",
     "column2",
@@ -53,7 +54,7 @@ test("VALUES body — multi-column default names and rename list", () => {
 });
 
 test("VALUES body — per-column type unification across rows", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   // int + int -> int (all bare integer literals are i64 in jed).
   assert.deepStrictEqual(types(db, "SELECT column1 FROM (VALUES (1), (2)) AS v"), ["i64"]);
   // int + decimal -> decimal; the int value coerces.
@@ -69,7 +70,7 @@ test("VALUES body — per-column type unification across rows", () => {
 });
 
 test("VALUES body — a $N is typed by its sibling rows", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   const o = db.execute("SELECT column1 FROM (VALUES (1), ($1)) AS v ORDER BY column1", [
     intValue(7n),
   ]);
@@ -81,7 +82,7 @@ test("VALUES body — a $N is typed by its sibling rows", () => {
 });
 
 test("VALUES body — intrinsic cost", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   // row_produced per VALUES row (3) + outer SELECT row_produced (3) = 6.
   assert.strictEqual(cost(db, "SELECT column1 FROM (VALUES (1), (2), (3)) AS v"), 6n);
   // (1+1) adds one operator_eval.
@@ -89,7 +90,7 @@ test("VALUES body — intrinsic cost", () => {
 });
 
 test("VALUES body — errors / narrowings", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   const cases: [string, string][] = [
     ["SELECT * FROM (VALUES (1), (2, 3)) AS v", "42601"], // differing arity
     ["SELECT * FROM (VALUES (1), ('a')) AS v", "42804"], // types do not unify

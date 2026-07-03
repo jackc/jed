@@ -5,8 +5,8 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database } from "../src/tooling.ts";
 import { type Handle, errCode, query } from "./util.ts";
+import { memDb } from "./mem_db.ts";
 
 // val runs a one-column, one-row scalar query and returns the rendered value.
 function val(db: Handle, sql: string): string {
@@ -17,7 +17,7 @@ function val(db: Handle, sql: string): string {
 }
 
 test("introspection over multidim + custom lower bounds", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   const cases: [string, string][] = [
     ["SELECT array_lower('[2:4]={7,8,9}'::i32[], 1)", "2"],
     ["SELECT array_upper('[2:4]={7,8,9}'::i32[], 1)", "4"],
@@ -31,7 +31,7 @@ test("introspection over multidim + custom lower bounds", () => {
 });
 
 test("error cases", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   const cases: [string, string][] = [
     ["SELECT array_append(ARRAY[ARRAY[1,2],ARRAY[3,4]], 9)", "22000"],
     ["SELECT array_prepend(9, ARRAY[ARRAY[1,2],ARRAY[3,4]])", "22000"],

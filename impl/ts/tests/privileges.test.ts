@@ -7,7 +7,8 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, EngineError, PrivilegeSet } from "../src/tooling.ts";
+import { EngineError, PrivilegeSet } from "../src/tooling.ts";
+import { memDb } from "./mem_db.ts";
 
 function code(fn: () => unknown): string {
   try {
@@ -20,7 +21,7 @@ function code(fn: () => unknown): string {
 }
 
 test("default session is fully permissive", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   assert.equal(db.allowDdl, true);
   assert.equal(db.privileges.isPermissive(), true);
   db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
@@ -30,7 +31,7 @@ test("default session is fully permissive", () => {
 });
 
 test("setDefaultPrivileges makes a read-only session", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
   db.execute("INSERT INTO t VALUES (1, 10)");
   db.setDefaultPrivileges(PrivilegeSet.empty().with("select"));
@@ -50,7 +51,7 @@ test("setDefaultPrivileges makes a read-only session", () => {
 });
 
 test("grant adds and revoke wins", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
 
   db.setDefaultPrivileges(PrivilegeSet.empty());
@@ -67,7 +68,7 @@ test("grant adds and revoke wins", () => {
 });
 
 test("allow_ddl gate is independent of table privileges", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
   db.setAllowDdl(false);
   assert.equal(
@@ -82,7 +83,7 @@ test("allow_ddl gate is independent of table privileges", () => {
 });
 
 test("function EXECUTE is revocable", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   assert.equal(db.privileges.allowsFunction("abs"), true);
   db.execute("SELECT abs(-5)");
   db.revoke(PrivilegeSet.empty().with("execute"), "abs");
@@ -98,7 +99,7 @@ test("an additional session carries its own envelope", () => {
   // db.session(opts) mints an independent session over a shared Database core (§2.4): a restricted
   // one rejects a write a permissive session still allows, and they share committed storage through
   // the core (§2.1/§5.3) — each owns its envelope, no swap.
-  const db = Database.newInMemory();
+  const db = memDb();
   const a = db.session({});
   a.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
 
@@ -118,7 +119,7 @@ test("an additional session carries its own envelope", () => {
 });
 
 test("a missing object is 42P01, not authorization", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   db.setDefaultPrivileges(PrivilegeSet.empty());
   assert.equal(
     code(() => db.execute("SELECT * FROM does_not_exist")),

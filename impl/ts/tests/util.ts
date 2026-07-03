@@ -1,13 +1,7 @@
 // Shared test helpers (not a `*.test.ts` file, so the runner does not execute it).
 
-import {
-  Database,
-  EngineError,
-  type Outcome,
-  render,
-  Session,
-  type Value,
-} from "../src/tooling.ts";
+import { EngineError, type Outcome, render, Session, type Value } from "../src/tooling.ts";
+import { memDb } from "./mem_db.ts";
 
 // Handle is the structural surface converted test helpers drive on a `db` parameter — satisfied by
 // both the public Session (a converted feature test's handle) and Database (a from-image / file-backed
@@ -39,9 +33,7 @@ export function dbWith(stmts: string[], pageSize?: number): Session {
   // size it will serialize to (format.md) — a test that round-trips through toImage(pageSize) must
   // pass that pageSize here (matching how the Rust/Go tests create the DB), or a PAX leaf's directory
   // overhead can overflow the smaller serialize target. Default page size otherwise.
-  const db = (
-    pageSize === undefined ? Database.newInMemory() : Database.inMemoryWithPageSize(pageSize)
-  ).session();
+  const db = memDb(pageSize).session();
   for (const s of stmts) {
     try {
       db.execute(s);

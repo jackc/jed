@@ -7,7 +7,8 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { EngineError, type Session, Database } from "../src/lib.ts";
+import { EngineError, type Session, type Database } from "../src/lib.ts";
+import { memDb } from "./mem_db.ts";
 
 // count runs SELECT count(*) FROM t against a read handle and returns the bigint count.
 function count(r: Session): bigint {
@@ -19,7 +20,7 @@ function count(r: Session): bigint {
 
 // seeded builds a shared db with table t holding the given ids, committed via a write handle.
 function seeded(...ids: number[]): Database {
-  const db = Database.newInMemory();
+  const db = memDb();
   const w = db.writeSession();
   w.execute("CREATE TABLE t (id bigint PRIMARY KEY)");
   for (const id of ids) w.execute(`INSERT INTO t VALUES (${id})`);

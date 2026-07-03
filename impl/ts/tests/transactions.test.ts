@@ -7,8 +7,9 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, EngineError } from "../src/tooling.ts";
+import { EngineError } from "../src/tooling.ts";
 import type { Handle } from "./util.ts";
+import { memDb } from "./mem_db.ts";
 
 // rowCount returns the number of rows of `SELECT * FROM t` against the committed/visible state.
 function rowCount(db: Handle, table: string): number {
@@ -28,7 +29,7 @@ function codeOf(fn: () => void): string {
 }
 
 test("begin → execute → commit is visible", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   db.execute("CREATE TABLE t (id i32 PRIMARY KEY)");
   db.begin(true);
   db.execute("INSERT INTO t VALUES (1)");
@@ -43,7 +44,7 @@ test("begin → execute → commit is visible", () => {
 });
 
 test("begin → execute → rollback discards", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   db.execute("CREATE TABLE t (id i32 PRIMARY KEY)");
   db.execute("INSERT INTO t VALUES (1)");
   db.begin(true);
@@ -54,7 +55,7 @@ test("begin → execute → rollback discards", () => {
 });
 
 test("update closure commits on success", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   db.execute("CREATE TABLE t (id i32 PRIMARY KEY)");
   const n = db.update((tx) => {
     tx.execute("INSERT INTO t VALUES (1)");
@@ -67,7 +68,7 @@ test("update closure commits on success", () => {
 });
 
 test("update closure rolls back on a thrown error", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   db.execute("CREATE TABLE t (id i32 PRIMARY KEY)");
   db.execute("INSERT INTO t VALUES (1)");
   const code = codeOf(() =>
@@ -84,7 +85,7 @@ test("update closure rolls back on a thrown error", () => {
 });
 
 test("view is read-only", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   db.execute("CREATE TABLE t (id i32 PRIMARY KEY)");
   db.execute("INSERT INTO t VALUES (1), (2)");
   // a read inside a view works and returns its value
@@ -101,7 +102,7 @@ test("view is read-only", () => {
 });
 
 test("nested begin is 25001", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   db.execute("CREATE TABLE t (id i32 PRIMARY KEY)");
   db.begin(true);
   db.execute("INSERT INTO t VALUES (1)");
@@ -115,7 +116,7 @@ test("nested begin is 25001", () => {
 });
 
 test("commit and rollback are no-ops in autocommit", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   db.execute("CREATE TABLE t (id i32 PRIMARY KEY)");
   // no open transaction: both are lenient no-op successes (transactions.md §4.2)
   db.commit();

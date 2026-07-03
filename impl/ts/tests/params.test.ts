@@ -4,9 +4,10 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, EngineError, intValue, nullValue } from "../src/tooling.ts";
+import { EngineError, intValue, nullValue } from "../src/tooling.ts";
 import type { Value } from "../src/lib.ts";
 import { type Handle, dbWith } from "./util.ts";
+import { memDb } from "./mem_db.ts";
 
 function text(s: string): Value {
   return { kind: "text", text: s };
@@ -145,7 +146,7 @@ test("param in IN list", () => {
 });
 
 test("DDL with params traps 42601", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   assert.equal(paramErrCode(db, "CREATE TABLE t (id i32 PRIMARY KEY)", [intValue(1n)]), "42601");
 });
 

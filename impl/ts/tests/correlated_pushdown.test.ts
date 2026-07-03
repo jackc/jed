@@ -8,14 +8,15 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, Session } from "../src/tooling.ts";
+import { Session } from "../src/tooling.ts";
 import type { Handle } from "./util.ts";
 import type { Value } from "../src/value.ts";
+import { memDb } from "./mem_db.ts";
 
 // `o` is five outer rows whose k-values all exist as inner ids; `inr` is n rows (id i32 PRIMARY KEY,
 // v i32; v == id) wide enough to span several leaves.
 function correlatedTables(n: number): Session {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   db.execute("CREATE TABLE o (id i32 PRIMARY KEY, k i32)");
   db.execute("CREATE TABLE inr (id i32 PRIMARY KEY, v i32)");
   db.execute("INSERT INTO o VALUES (1, 100), (2, 300), (3, 500), (4, 700), (5, 900)");

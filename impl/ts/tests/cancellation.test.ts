@@ -8,7 +8,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { throwIfAborted } from "../src/cancel.ts";
-import { Database, EngineError } from "../src/tooling.ts";
+import { type Database, EngineError } from "../src/tooling.ts";
+import { memDb } from "./mem_db.ts";
 
 function isCanceled(e: unknown): e is EngineError {
   return e instanceof EngineError && e.code() === "57014";
@@ -34,7 +35,7 @@ test("throwIfAborted: aborted throws 57014, otherwise no-op", () => {
 // A signal already aborted at the API entry aborts with 57014 before any work — the boundary poll, on
 // both the execute and the query path (the autocommit Database surface → Session.executeCancelable).
 test("an already-aborted signal aborts at the boundary", () => {
-  const db = Database.newInMemory();
+  const db = memDb();
   db.execute("CREATE TABLE t (id i32 PRIMARY KEY)");
 
   const ac = new AbortController();
@@ -50,7 +51,7 @@ test("an already-aborted signal aborts at the boundary", () => {
 // An un-aborted (or absent) signal is zero-effect: the statement runs to completion and returns every
 // row, proving the boundary check adds no spurious abort.
 test("an un-aborted signal completes normally", () => {
-  const db = Database.newInMemory();
+  const db = memDb();
   db.execute("CREATE TABLE t (id i32 PRIMARY KEY)");
   for (let i = 1; i <= 20; i++) db.execute(`INSERT INTO t VALUES (${i})`);
 
@@ -63,7 +64,7 @@ test("an un-aborted signal completes normally", () => {
 // Inside an explicit transaction (Transaction.executeCancelable), an aborted signal throws 57014;
 // thrown out of the update() closure it rolls the block back, committing nothing.
 test("a cancellation inside a transaction rolls back", () => {
-  const db = Database.newInMemory();
+  const db = memDb();
   db.execute("CREATE TABLE t (id i32 PRIMARY KEY)");
 
   const ac = new AbortController();
@@ -90,7 +91,7 @@ test("a cancellation inside a transaction rolls back", () => {
 // retroactive effect on the already-returned result; and a signal aborted BETWEEN two statements
 // aborts the second but never the first (there is no mid-statement preemption to observe).
 test("the signal is observed only at statement boundaries", () => {
-  const db = Database.newInMemory();
+  const db = memDb();
   db.execute("CREATE TABLE t (id i32 PRIMARY KEY)");
   db.execute("INSERT INTO t VALUES (1)");
 

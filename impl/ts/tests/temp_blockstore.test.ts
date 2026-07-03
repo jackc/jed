@@ -13,13 +13,13 @@ import { test } from "node:test";
 import {
   close,
   create,
-  Database,
   type Engine,
   EngineError,
   execute,
   type Session,
   type Value,
 } from "../src/tooling.ts";
+import { memDb } from "./mem_db.ts";
 
 // tempStorageOf reaches the session's private temp domain (the Go test's sess.engine.tempStorage) — a
 // white-box cast, since the domain is an internal storage engine with no public surface.
@@ -44,7 +44,7 @@ function textAt(rows: Value[][], i: number): string {
 // own in-RAM MemoryBlockStore: rows read back correctly (faulting demoted leaves through the temp pool),
 // and heavy churn stays bounded (within-session compaction reclaims copy-on-write orphans — no leak).
 test("session-local temp runs through its MemoryBlockStore and churn stays bounded", () => {
-  const db = Database.inMemoryWithPageSize(256);
+  const db = memDb(256);
   const sess = db.session();
   sess.execute("CREATE TEMP TABLE lt (id i32 PRIMARY KEY, pad text)");
   const base = "x".repeat(40);
@@ -82,7 +82,7 @@ test("session-local temp runs through its MemoryBlockStore and churn stays bound
 // measure (committed pageCount × page_size) counts every allocated page, so a growing temp table hits
 // 54P03 deterministically.
 test("a multi-leaf temp table past its page budget aborts 54P03", () => {
-  const db = Database.inMemoryWithPageSize(256);
+  const db = memDb(256);
   // ~20 pages of budget: a single leaf (≤ ~240 record bytes) is far under it, so a record-byte measure
   // would never abort; the page footprint crosses it as the tree grows past ~20 pages.
   const sess = db.session({ tempBuffers: 20 * 256 });

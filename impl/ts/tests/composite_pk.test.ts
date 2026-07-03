@@ -11,6 +11,7 @@ import { pkIndices, primaryKeyIndex } from "../src/catalog.ts";
 import { Database } from "../src/tooling.ts";
 import { loadEngine, toImage } from "../src/format.ts";
 import { type Handle, dbWith, errCode } from "./util.ts";
+import { memDb } from "./mem_db.ts";
 
 // The visible tuple (first two columns) of each row, in stored key order.
 function tuples(db: Handle, table: string): [bigint, bigint][] {
@@ -81,7 +82,7 @@ test("DDL errors mirror PostgreSQL plus the jed narrowings", () => {
   ];
   for (const [sql, want] of cases) {
     assert.equal(
-      errCode(() => Database.newInMemory().session().execute(sql)),
+      errCode(() => memDb().session().execute(sql)),
       want,
       sql,
     );
@@ -89,7 +90,7 @@ test("DDL errors mirror PostgreSQL plus the jed narrowings", () => {
   // f64 IS now a key-encodable PK member (the float-order-preserving key, encoding.md §2.8 — every
   // scalar is keyable); only the recursive composite container is NOT (composite.md §6).
   {
-    const db = Database.newInMemory().session();
+    const db = memDb().session();
     db.execute("CREATE TABLE fpk (a i32, s f64, PRIMARY KEY (a, s))");
     db.execute("CREATE TYPE addr AS (street text, zip i32)");
     assert.equal(
@@ -101,7 +102,7 @@ test("DDL errors mirror PostgreSQL plus the jed narrowings", () => {
   // 0A000 narrowing was lifted by the v5 catalog reshape, constraints.md §3): the table
   // keys by (b, a), so the stored scan order is b-major.
   {
-    const rev = Database.newInMemory().session();
+    const rev = memDb().session();
     rev.execute("CREATE TABLE rev (a i32, b i32, PRIMARY KEY (b, a))");
     assert.deepEqual(pkIndices(rev.table("rev")!), [1, 0]);
     rev.execute("INSERT INTO rev VALUES (1, 20), (2, 10), (3, 15)");
@@ -110,7 +111,7 @@ test("DDL errors mirror PostgreSQL plus the jed narrowings", () => {
   }
 
   // A single-column table constraint is the column-level form's equivalent.
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   db.execute("CREATE TABLE ok (a i32, PRIMARY KEY (a))");
   const t = db.table("ok")!;
   assert.equal(primaryKeyIndex(t), 0);

@@ -8,12 +8,13 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, EngineError, Session } from "../src/tooling.ts";
+import { EngineError, Session } from "../src/tooling.ts";
 import type { Handle } from "./util.ts";
 import { MAX_EXPR_DEPTH, parseSQL } from "../src/parser.ts";
+import { memDb } from "./mem_db.ts";
 
 function depthDB(): Session {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
   db.execute("INSERT INTO t VALUES (1, 1)");
   return db;

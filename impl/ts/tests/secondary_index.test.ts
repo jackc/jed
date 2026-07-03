@@ -12,6 +12,7 @@ import { test } from "node:test";
 import { Database, EngineError, Session, createDatabase, openDatabase } from "../src/tooling.ts";
 import type { Handle } from "./util.ts";
 import { pkIndices } from "../src/catalog.ts";
+import { memDb } from "./mem_db.ts";
 
 function run(db: Handle, sql: string) {
   return db.execute(sql);
@@ -43,7 +44,7 @@ function errCode(fn: () => unknown): string {
 // The 20-row fixture the planner/cost tests run against: v = i % 5 gives 4 rows per
 // value, so an equality admits 4 of 20.
 function db20(): Session {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32)");
   for (let i = 1; i <= 20; i++) {
     run(db, `INSERT INTO t VALUES (${i}, ${i % 5}, ${i})`);
@@ -55,7 +56,7 @@ test("auto-naming matches PostgreSQL", () => {
   // Lowercased <table>_<cols>_idx + the smallest free suffix (oracle-probed, indexes.md
   // §2); duplicates in the column list are allowed and named through; an explicit name
   // round-trips as written. The catalog holds indexes in ascending lowercased-name order.
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   run(db, "CREATE TABLE T (A i32 PRIMARY KEY, B i32)");
   run(db, "CREATE INDEX ON T (B)"); // t_b_idx
   run(db, "CREATE INDEX ON T (B)"); // t_b_idx1
@@ -77,7 +78,7 @@ test("DDL errors match PostgreSQL", () => {
   // Validation order is table → columns (list order) → name collision (oracle-probed,
   // indexes.md §2); the relation namespace is shared with tables; DROP mismatches are
   // 42704/42809.
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   run(db, "CREATE TABLE t (a i32 PRIMARY KEY, s f64)");
   assert.equal(
     errCode(() => run(db, "CREATE INDEX i ON nosuch (nope)")),
@@ -208,7 +209,7 @@ test("file-backed paged reopen uses the index", () => {
   // (page_read is logical — buffer-pool-invisible), and stays maintainable.
   const dir = mkdtempSync(join(tmpdir(), "jed-"));
   const path = join(dir, "secondary_index_paged.jed");
-  const db = createDatabase(path, { pageSize: 256 });
+  const db = createDatabase({ path, pageSize: 256 });
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32)");
   for (let i = 1; i <= 20; i++) {
     run(db, `INSERT INTO t VALUES (${i}, ${i % 5}, ${i})`);

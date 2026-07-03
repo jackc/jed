@@ -19,7 +19,7 @@ import { join } from "node:path";
 
 import { parse as parseToml } from "smol-toml";
 
-import { Database, type Session, render } from "../../../impl/ts/src/lib.ts";
+import { createDatabase, type Database, type Session, render } from "../../../impl/ts/src/lib.ts";
 
 import { Checksum, Prng } from "./lib.ts";
 
@@ -304,7 +304,7 @@ function runFile(path: string, forceSequential: boolean): StressResult {
   res.mode = sequential ? "sequential" : "threaded";
 
   try {
-    const db = Database.newInMemory();
+    const db = createDatabase({});
     setup(db, f.setup);
     res.invariant_checks = runSequential(db, f);
     res.duration_ms = Math.round(performance.now() - start);

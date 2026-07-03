@@ -9,8 +9,9 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, Session } from "../src/tooling.ts";
+import { Session } from "../src/tooling.ts";
 import { type Handle, fillerText } from "./util.ts";
+import { memDb } from "./mem_db.ts";
 
 const PAGE_SIZE = 256;
 // A 600-byte payload = ceil(600/240) = 3 slabs (compress at write, decompress at scan); a
@@ -19,7 +20,7 @@ const SLABS_600 = 3n;
 const SLABS_400 = 2n;
 
 function smallPageDb(): Session {
-  const db = Database.inMemoryWithPageSize(PAGE_SIZE).session();
+  const db = memDb(PAGE_SIZE).session();
   return db;
 }
 

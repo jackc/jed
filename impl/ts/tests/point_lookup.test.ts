@@ -5,12 +5,13 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, Session, createDatabase, intValue, openDatabase } from "../src/tooling.ts";
+import { Session, createDatabase, intValue, openDatabase } from "../src/tooling.ts";
 import type { Handle } from "./util.ts";
 import { PMap, unboundedBound } from "../src/pmap.ts";
 import type { KeyBound } from "../src/pmap.ts";
 import type { Row } from "../src/storage.ts";
 import type { Value } from "../src/value.ts";
+import { memDb } from "./mem_db.ts";
 
 // --- direct storage-primitive check (the page_read drop) ---
 
@@ -58,7 +59,7 @@ test("bounded range + overlap over a multi-leaf tree", () => {
 // --- end-to-end (public API): correctness across leaves + sublinear cost ---
 
 function bigTable(n: number): Session {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
   const parts: string[] = [];
   for (let i = 1; i <= n; i++) parts.push(`(${i},${i})`);
@@ -122,7 +123,7 @@ test("LIMIT short-circuit is sublinear", () => {
 
   // Trap windowing: streaming projects ONLY the windowed rows, so a later trapping row is never
   // reached under a LIMIT that excludes it.
-  const dz = Database.newInMemory().session();
+  const dz = memDb().session();
   dz.execute("CREATE TABLE z (id i32 PRIMARY KEY, c i32)");
   dz.execute("INSERT INTO z VALUES (1, 5), (2, 0), (3, 5)");
   assert.deepStrictEqual(ids(dz, "SELECT 100 / c FROM z LIMIT 1"), [20]);

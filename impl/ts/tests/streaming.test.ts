@@ -14,13 +14,14 @@ import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { createDatabase, Database, EngineError, type Session } from "../src/lib.ts";
+import { createDatabase, type Database, EngineError, type Session } from "../src/lib.ts";
 import { Engine, execute, intValue, prepare, query } from "../src/tooling.ts";
 import type { Value } from "../src/value.ts";
+import { memDb } from "./mem_db.ts";
 
 // seededKV builds an in-memory shared db with t(id i32 PK, v i32) holding 1..=n (v = id * 10).
 function seededKV(n: number): Database {
-  const db = Database.newInMemory();
+  const db = memDb();
   const w = db.writeSession();
   w.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
   for (let i = 1; i <= n; i++) w.execute(`INSERT INTO t VALUES (${i}, ${i * 10})`);
@@ -406,7 +407,7 @@ test("sorted output early exit charges less", () => {
 test("sorted output spilling merge streams lazily", () => {
   const dir = mkdtempSync(join(tmpdir(), "jed-sorted-lazy-"));
   try {
-    const db = createDatabase(join(dir, "db.jed"), {});
+    const db = createDatabase({ path: join(dir, "db.jed") });
     const w = db.writeSession();
     w.execute("CREATE TABLE t (id i32 PRIMARY KEY, k i32)");
     for (let id = 0; id < 200; id++) {

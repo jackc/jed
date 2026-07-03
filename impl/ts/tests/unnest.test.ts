@@ -8,8 +8,8 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database } from "../src/tooling.ts";
 import { type Handle, dbWith, errCode, query } from "./util.ts";
+import { memDb } from "./mem_db.ts";
 
 function cost(db: Handle, sql: string): bigint {
   return db.execute(sql).cost;
@@ -28,7 +28,7 @@ function qOut(db: Handle, sql: string) {
 }
 
 test("unnest names its column at the bound element type", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   // An untyped ARRAY[…] literal is i64[] (jed's literal typing).
   const out = qOut(db, "SELECT * FROM unnest(ARRAY[10,20,30])");
   assert.deepStrictEqual(out.columnNames, ["unnest"]);
@@ -39,7 +39,7 @@ test("unnest names its column at the bound element type", () => {
 });
 
 test("unnest of the empty array or a NULL array yields zero rows", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   for (const sql of ["SELECT * FROM unnest('{}'::i32[])", "SELECT * FROM unnest(NULL::i32[])"]) {
     assert.deepStrictEqual(query(db, sql), [], sql);
     assert.equal(cost(db, sql), 0n, sql);
@@ -47,7 +47,7 @@ test("unnest of the empty array or a NULL array yields zero rows", () => {
 });
 
 test("unnest alias renames the single column", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   assert.deepStrictEqual(
     query(db, "SELECT g.g FROM unnest(ARRAY[7,8]) AS g ORDER BY g.g"),
     rows1([7, 8]),
@@ -89,7 +89,7 @@ test("unnest takes a correlated outer column AND an earlier sibling (implicitly 
 });
 
 test("unnest strictness + deferred-form errors", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   for (const sql of [
     "SELECT * FROM unnest(5)",
     "SELECT * FROM unnest('hi')",
@@ -113,7 +113,7 @@ test("unnest strictness + deferred-form errors", () => {
 });
 
 test("unnest generated_row cost and the maxCost ceiling", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   // '{…}'::i32[] is a const (no operator_eval): 3 generated_row + 3 row_produced.
   assert.equal(cost(db, "SELECT * FROM unnest('{1,2,3}'::i32[])"), 6n);
   // A large array aborts deterministically once accrued cost reaches the ceiling (54P01), before

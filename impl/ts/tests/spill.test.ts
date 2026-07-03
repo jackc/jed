@@ -11,9 +11,10 @@ import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { Database, createDatabase, openDatabase } from "../src/tooling.ts";
+import { createDatabase, openDatabase } from "../src/tooling.ts";
 import type { Handle } from "./util.ts";
 import type { Value } from "../src/lib.ts";
+import { memDb } from "./mem_db.ts";
 
 function runQuery(db: Handle, sql: string): { rows: Value[][]; cost: bigint } {
   const out = db.execute(sql);
@@ -82,11 +83,11 @@ test("spilling sort matches the in-memory rows and cost", () => {
   try {
     // The source of truth: the same data + queries against a pure in-memory database, which never
     // spills (spill.md §2).
-    const mem = Database.newInMemory().session();
+    const mem = memDb().session();
     seedSpill(mem, 200);
 
     // A file-backed database with a tiny workMem so every shape spills many runs and k-way-merges.
-    const db = createDatabase(join(dir, "spill_match.jed"), {}).session();
+    const db = createDatabase({ path: join(dir, "spill_match.jed") }).session();
     seedSpill(db, 200);
     db.setWorkMem(128); // ~2-3 rows per run → dozens of runs, deep merge
 
@@ -113,7 +114,7 @@ test("spilling sort matches the in-memory rows and cost", () => {
 test("spill leaves no temp files", () => {
   const dir = mkdtempSync(join(tmpdir(), "jed-spill-clean-"));
   try {
-    const db = createDatabase(join(dir, "spill_cleanup.jed"), {}).session();
+    const db = createDatabase({ path: join(dir, "spill_cleanup.jed") }).session();
     seedSpill(db, 150);
     db.setWorkMem(64); // force heavy spilling
 
@@ -132,7 +133,7 @@ test("spilling sort is stable on ties", () => {
   // by (run, position) = input order (spill.md §6).
   const dir = mkdtempSync(join(tmpdir(), "jed-spill-stable-"));
   try {
-    const db = createDatabase(join(dir, "spill_stable.jed"), {}).session();
+    const db = createDatabase({ path: join(dir, "spill_stable.jed") }).session();
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY, k i32)");
     for (let id = 0; id < 100; id++) db.execute(`INSERT INTO t VALUES (${id}, 5)`);
     db.setWorkMem(96); // force spilling so the merge tie-break is exercised

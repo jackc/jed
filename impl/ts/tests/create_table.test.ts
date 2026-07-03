@@ -3,9 +3,9 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database } from "../src/tooling.ts";
 import { typeScalar } from "../src/types.ts";
 import { dbWith, errCode } from "./util.ts";
+import { memDb } from "./mem_db.ts";
 
 test("create table then describe via the catalog", () => {
   const db = dbWith(["CREATE TABLE t (id i32 PRIMARY KEY, a i16, b i64)"]);
@@ -45,14 +45,14 @@ test("duplicate table name traps 42P07", () => {
 
 test("duplicate column name traps 42701", () => {
   assert.equal(
-    errCode(() => Database.newInMemory().session().execute("CREATE TABLE t (a i16, a i32)")),
+    errCode(() => memDb().session().execute("CREATE TABLE t (a i16, a i32)")),
     "42701",
   );
 });
 
 test("unknown type traps 42704", () => {
   assert.equal(
-    errCode(() => Database.newInMemory().session().execute("CREATE TABLE t (a notatype)")),
+    errCode(() => memDb().session().execute("CREATE TABLE t (a notatype)")),
     "42704",
   );
 });
@@ -60,9 +60,7 @@ test("unknown type traps 42704", () => {
 test("two primary keys trap 42P16", () => {
   assert.equal(
     errCode(() =>
-      Database.newInMemory()
-        .session()
-        .execute("CREATE TABLE t (a i16 PRIMARY KEY, b i16 PRIMARY KEY)"),
+      memDb().session().execute("CREATE TABLE t (a i16 PRIMARY KEY, b i16 PRIMARY KEY)"),
     ),
     "42P16",
   );

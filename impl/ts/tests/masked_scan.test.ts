@@ -26,9 +26,10 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { Database, createDatabase, openDatabase } from "../src/tooling.ts";
+import { type Database, createDatabase, openDatabase } from "../src/tooling.ts";
 import { render } from "../src/value.ts";
 import type { Handle } from "./util.ts";
+import { memDb } from "./mem_db.ts";
 
 // A wide all-fixed-width table (i16/i32/i64, several nullable) plus a secondary index and a join
 // partner. Every column is fixed-width, so on a paged reopen the leaf is Packed with no deferred values —
@@ -81,11 +82,11 @@ test("paged masked scan matches resident across query shapes", () => {
   const dir = mkdtempSync(join(tmpdir(), "jed-masked-wide-"));
   try {
     const path = join(dir, "wide.jed");
-    const filedb = createDatabase(path, {});
+    const filedb = createDatabase({ path });
     seed(filedb);
     filedb.close();
 
-    const mem = Database.newInMemory().session();
+    const mem = memDb().session();
     seed(mem);
     const paged = openDatabase(path);
 
@@ -195,11 +196,11 @@ test("paged columnar multilevel matches resident", () => {
   const dir = mkdtempSync(join(tmpdir(), "jed-masked-multilevel-"));
   try {
     const path = join(dir, "multilevel.jed");
-    const filedb = createDatabase(path, {});
+    const filedb = createDatabase({ path });
     seedMultilevel(filedb);
     filedb.close();
 
-    const mem = Database.newInMemory().session();
+    const mem = memDb().session();
     seedMultilevel(mem);
     const paged = openDatabase(path);
 

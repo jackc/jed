@@ -7,11 +7,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { Database } from "../src/tooling.ts";
+import type { Database } from "../src/tooling.ts";
 import { intValue } from "../src/value.ts";
+import { memDb } from "./mem_db.ts";
 
 function seeded(): Database {
-  const db = Database.newInMemory();
+  const db = memDb();
   db.run("CREATE TABLE t (id i32 PRIMARY KEY, name text, score f64, flag boolean)");
   db.run("INSERT INTO t VALUES ($1, $2, $3, $4)", 1, "ada", 9.5, true);
   db.run("INSERT INTO t VALUES ($1, $2, $3, $4)", 2, "bob", 7.25, false);
@@ -20,7 +21,7 @@ function seeded(): Database {
 
 // prepare(...).run returns a command tag whose `changes` is the affected-row count; DDL carries none.
 test("run returns the affected-row count; DDL is 0", () => {
-  const db = Database.newInMemory();
+  const db = memDb();
   assert.strictEqual(db.run("CREATE TABLE t (id i32 PRIMARY KEY, name text)").changes, 0);
 
   const ins = db.prepare("INSERT INTO t VALUES ($1, $2)");
@@ -64,7 +65,7 @@ test("iterate yields row objects", () => {
 // The param mapping: bigint→int, an integer-valued number→int (so run(1) binds an integer), boolean,
 // string, null→NULL, a Uint8Array→bytea, and a raw engine Value passes through.
 test("param mapping covers the native JS types", () => {
-  const db = Database.newInMemory();
+  const db = memDb();
   db.run("CREATE TABLE t (id i32 PRIMARY KEY, name text, data bytea)");
 
   db.run("INSERT INTO t VALUES ($1, $2, $3)", 1, "by-number", null); // number → int, null → NULL
@@ -86,7 +87,7 @@ test("param mapping covers the native JS types", () => {
 // decimal, uuid, and the temporal types. (Driven through FROM-less SELECT casts/typed literals —
 // typed literals are not accepted inside INSERT ... VALUES, so those are bound instead.)
 test("rich types map to their canonical text", () => {
-  const db = Database.newInMemory();
+  const db = memDb();
   const row = db.get(
     "SELECT 12.50::numeric(10,2) AS amount, " +
       "'00112233-4455-6677-8899-aabbccddeeff'::uuid AS uid, " +
@@ -101,7 +102,7 @@ test("rich types map to their canonical text", () => {
 // The ergonomic methods are on every handle: a durable Session, and a Transaction (whose work rolls
 // back with the block when the update() closure throws).
 test("methods on Session and Transaction", () => {
-  const db = Database.newInMemory();
+  const db = memDb();
   db.run("CREATE TABLE t (id i32 PRIMARY KEY, name text)");
 
   const s = db.session({});

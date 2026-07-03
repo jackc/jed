@@ -27,7 +27,7 @@ import {
   resolveUnfetchedSelf,
 } from "../src/format.ts";
 import { colAt, rowAt } from "../src/pmap.ts";
-import { Database, createDatabase, openDatabase } from "../src/tooling.ts";
+import { createDatabase, openDatabase } from "../src/tooling.ts";
 import {
   arrayValue,
   byteaValue,
@@ -38,6 +38,7 @@ import {
   type Value,
 } from "../src/value.ts";
 import { type Handle, errCode } from "./util.ts";
+import { memDb } from "./mem_db.ts";
 
 const PAGE_LEAF = 2; // page_type for a B-tree leaf node
 
@@ -80,11 +81,11 @@ test("paged inline values match resident across query shapes", () => {
   const dir = mkdtempSync(join(tmpdir(), "jed-l2-shapes-"));
   try {
     const path = join(dir, "shapes.jed");
-    const filedb = createDatabase(path, {});
+    const filedb = createDatabase({ path });
     seed(filedb);
     filedb.close();
 
-    const mem = Database.newInMemory().session();
+    const mem = memDb().session();
     seed(mem);
     const paged = openDatabase(path);
 
@@ -150,11 +151,11 @@ test("mutations preserve untouched inline values", () => {
   const dir = mkdtempSync(join(tmpdir(), "jed-l2-mut-"));
   try {
     const path = join(dir, "mut.jed");
-    const filedb = createDatabase(path, {});
+    const filedb = createDatabase({ path });
     seed(filedb);
     filedb.close();
 
-    const mem = Database.newInMemory().session();
+    const mem = memDb().session();
     seed(mem);
 
     const mutations = [
@@ -206,7 +207,7 @@ test("untouched corrupt inline body defers its error (read-on-touch)", () => {
   try {
     const path = join(dir, "corrupt.jed");
     const marker = "Zq7Zq7Zq7Zq7Zq7Zq7Zq7Zq7Zq7Zq7Zq"; // 32 chars, not in catalog text
-    const filedb = createDatabase(path, {});
+    const filedb = createDatabase({ path });
     filedb.execute("CREATE TABLE t (id i32 PRIMARY KEY, body text, n i32)");
     filedb.execute(`INSERT INTO t VALUES (1, '${marker}', 42), (2, 'clean', 7)`);
     filedb.close();
@@ -251,8 +252,8 @@ test("untouched deferred column rides a spilling sort", () => {
   const dir = mkdtempSync(join(tmpdir(), "jed-l2-spill-"));
   try {
     const path = join(dir, "spill.jed");
-    const mem = Database.newInMemory().session();
-    const filedb = createDatabase(path, {});
+    const mem = memDb().session();
+    const filedb = createDatabase({ path });
     for (const db of [mem, filedb]) {
       db.execute("CREATE TABLE t (id i32 PRIMARY KEY, k i32, label text, doc jsonb)");
     }

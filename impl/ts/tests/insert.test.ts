@@ -4,8 +4,9 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, Session, intValue } from "../src/tooling.ts";
+import { Session, intValue } from "../src/tooling.ts";
 import { dbWith, errCode, query } from "./util.ts";
+import { memDb } from "./mem_db.ts";
 
 function nums(): Session {
   return dbWith(["CREATE TABLE nums (id i32 PRIMARY KEY, small i16, big i64)"]);
@@ -30,7 +31,7 @@ test("no-PK table accepts repeated rows (synthetic rowid)", () => {
 
 test("insert into a missing table traps 42P01", () => {
   assert.equal(
-    errCode(() => Database.newInMemory().session().execute("INSERT INTO nope VALUES (1)")),
+    errCode(() => memDb().session().execute("INSERT INTO nope VALUES (1)")),
     "42P01",
   );
 });

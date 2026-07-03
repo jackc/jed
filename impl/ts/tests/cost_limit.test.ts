@@ -7,11 +7,12 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, EngineError, Session } from "../src/tooling.ts";
+import { EngineError, Session } from "../src/tooling.ts";
 import type { Handle } from "./util.ts";
+import { memDb } from "./mem_db.ts";
 
 function rowTable(n: number): Session {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
   const parts: string[] = [];
   for (let i = 1; i <= n; i++) parts.push(`(${i},${i})`);

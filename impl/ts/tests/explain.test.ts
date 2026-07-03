@@ -7,7 +7,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
-  Database,
   EngineError,
   intValue,
   type Outcome,
@@ -15,6 +14,7 @@ import {
   render,
   type Session,
 } from "../src/tooling.ts";
+import { memDb } from "./mem_db.ts";
 
 // code runs sql and returns the EngineError SQLSTATE, or "" when it succeeds.
 function code(db: Session, sql: string): string {
@@ -35,7 +35,7 @@ function queryRows(o: Outcome) {
 // EXPLAIN requires the INNER statement's privileges (EXPLAIN INSERT needs INSERT), matching PG —
 // even though plain EXPLAIN never executes.
 test("EXPLAIN delegates the inner statement's privileges", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
   db.execute("INSERT INTO t VALUES (1, 10)");
   db.setDefaultPrivileges(PrivilegeSet.empty().with("select"));
@@ -52,7 +52,7 @@ test("EXPLAIN delegates the inner statement's privileges", () => {
 // Plain EXPLAIN of a write is a READ (it never mutates), so it is allowed in a READ ONLY transaction;
 // EXPLAIN ANALYZE of a write IS a write and is rejected 25006.
 test("EXPLAIN write classification via a READ ONLY transaction", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
   db.execute("INSERT INTO t VALUES (1, 10)");
   db.execute("BEGIN READ ONLY");
@@ -63,7 +63,7 @@ test("EXPLAIN write classification via a READ ONLY transaction", () => {
 
 // Plain EXPLAIN of a DELETE does not mutate; EXPLAIN ANALYZE of an INSERT does (and persists).
 test("plain EXPLAIN does not execute; EXPLAIN ANALYZE does", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
   db.execute("INSERT INTO t VALUES (1, 10)");
   db.execute("INSERT INTO t VALUES (2, 20)");
@@ -76,7 +76,7 @@ test("plain EXPLAIN does not execute; EXPLAIN ANALYZE does", () => {
 // The EXPLAIN statement's OWN cost is one rowProduced per emitted plan row — independent of the
 // (larger) inner cost reported inside the Analyze root.
 test("EXPLAIN owns its render cost (one rowProduced per plan row)", () => {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
   db.execute("INSERT INTO t VALUES (1, 10)");
   db.execute("INSERT INTO t VALUES (2, 20)");

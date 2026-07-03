@@ -545,9 +545,9 @@ function runFile(text: string, disk: boolean): void {
   // dbHandle is the reopenable file-backed Database — held so a per-record reopen can close it and
   // re-open the image; null in memory mode. onTemp tracks whether db/dbHandle still point at the temp
   // file (a `# fixture:` swap flips it off — but fixtures are `# skip: disk`).
-  let dbHandle: Database | null = tmpPath === null ? null : createDatabase(tmpPath);
+  let dbHandle: Database | null = tmpPath === null ? null : createDatabase({ path: tmpPath });
   let onTemp = disk;
-  let db = dbHandle === null ? Database.newInMemory().session() : dbHandle.session();
+  let db = dbHandle === null ? createDatabase({}).session() : dbHandle.session();
   try {
     const lines = text.split("\n");
     const c: Cursor = { i: 0 };
@@ -997,7 +997,7 @@ function endSession(kind: string, s: CSession): void {
 // must produce. `gateHolder` is the live writer's sid (the single-writer gate); `blocked` is the
 // at-most-one writer queued on it.
 function runConcurrencyFile(text: string): void {
-  const db = Database.newInMemory();
+  const db = createDatabase({});
   const sessions = new Map<string, CSession>();
   let gateHolder = ""; // the live writer holding the single-writer gate, "" if free
   let blocked = ""; // a writer queued on the gate (Layer 2 `blocks`), "" if none

@@ -43,13 +43,12 @@
 //
 // The host-facing single handle is Database (the back-compat bridge — §2.1): the shared core PLUS one
 // long-lived default Session, whose delegators (execute/query/begin/.../executeScript) drive that
-// default session. newInMemory and the file.ts open/create wrappers return it; it is also the core
+// default session. The file.ts createDatabase/openDatabase wrappers return it; it is also the core
 // itself (TS needs no Rust-style !Send split — single-threaded), so the same Database both drives the
 // single-handle path and mints additional sessions.
 
 import {
   type CollationInfo,
-  DEFAULT_PAGE_SIZE,
   Engine,
   SessionState,
   Snapshot,
@@ -202,25 +201,6 @@ export class Database {
   // over wraps a shared core as the host handle.
   private static over(core: SharedCore): Database {
     return new Database(core);
-  }
-
-  // newInMemory builds a fresh, empty in-memory database plus its default session (committed version 0).
-  static newInMemory(): Database {
-    return Database.inMemoryWithPageSize(DEFAULT_PAGE_SIZE);
-  }
-
-  // inMemoryWithPageSize builds a fresh in-memory database whose stores serialize/split at pageSize.
-  // The page-backed B-tree's fan-out tracks the page size (spec/fileformat/format.md), so an in-memory
-  // tree must be built at the size it will serialize to — this builds byte-level fixtures / tests a
-  // non-default page size; a normal in-memory database uses newInMemory (the default page size).
-  static inMemoryWithPageSize(pageSize: number): Database {
-    // B3 (bplus-reshape.md): an in-memory database is a MemoryBlockStore seeded with the empty
-    // from-scratch image, read/written through the same pager + Packed path as a file (loadEngine is
-    // the paged open over a memory store). txid 0 is the pre-first-commit version (the same
-    // committed version an in-memory core always started at); the first commit publishes txid 1
-    // into the alternate meta slot.
-    const image = toImageBytes(new Snapshot(0n), pageSize, 0n);
-    return Database.fromEngine(loadEngine(image));
   }
 
   // fromEngine lifts a freshly opened/created/loaded Engine (file.ts / loadEngine) into a host
@@ -503,6 +483,24 @@ export class Database {
       s.close();
     }
   }
+}
+
+// buildInMemory builds a fresh, empty in-memory Database whose stores serialize/split at pageSize —
+// the in-memory backing of the unified createDatabase (spec/design/api.md §2.1.1). NOT part of the
+// public API: it is a module-level function, NOT re-exported by lib.ts. Its callers are file.ts's
+// createDatabase (the in-memory branch) and the tests' memDb helper; keeping it here (not in file.ts)
+// keeps shared.ts browser-clean (file.ts imports from shared.ts, never the reverse). The page-backed
+// B-tree's fan-out tracks the page size (spec/fileformat/format.md), so an in-memory tree must be
+// built at the size it will serialize to — a caller that round-trips through toImage(pageSize) passes
+// that size.
+//
+// B3 (bplus-reshape.md): an in-memory database is a MemoryBlockStore seeded with the empty
+// from-scratch image, read/written through the same pager + Packed path as a file (loadEngine is the
+// paged open over a memory store). txid 0 is the pre-first-commit version (the same committed version
+// an in-memory core always started at); the first commit publishes txid 1 into the alternate meta slot.
+export function buildInMemory(pageSize: number): Database {
+  const image = toImageBytes(new Snapshot(0n), pageSize, 0n);
+  return Database.fromEngine(loadEngine(image));
 }
 
 // Access is the access mode a Session was minted with (spec/design/session.md §2.4/§5.1). Distinct

@@ -8,7 +8,8 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, type Session, type Value } from "../src/tooling.ts";
+import type { Database, Session, Value } from "../src/tooling.ts";
+import { memDb } from "./mem_db.ts";
 
 // setReclaim toggles within-session compaction on a Database's (single) main storage domain — a
 // white-box reach into the private core (the analogue of the Go test's db.core.storage field). There is
@@ -37,7 +38,7 @@ function textAt(rows: Value[][], i: number): string {
 // rewritten catalog). Returns the committed page high-water afterward. `reclaim` toggles within-session
 // compaction on the (single) storage domain.
 function churnInMemory(reclaim: boolean, rounds: number): { pageCount: number; db: Database } {
-  const db = Database.inMemoryWithPageSize(256);
+  const db = memDb(256);
   setReclaim(db, reclaim);
   const sess = db.session();
   sess.execute("CREATE TABLE t (id i32 PRIMARY KEY, pad text)");
@@ -89,7 +90,7 @@ test("within-session compaction bounds in-memory churn", () => {
 });
 
 test("compaction defers while an older reader is pinned", () => {
-  const db = Database.inMemoryWithPageSize(256);
+  const db = memDb(256);
   setReclaim(db, true);
   const sess = db.session();
   sess.execute("CREATE TABLE t (id i32 PRIMARY KEY, pad text)");

@@ -8,8 +8,9 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, Session, render } from "../src/tooling.ts";
+import { Session, render } from "../src/tooling.ts";
 import type { Handle } from "./util.ts";
+import { memDb } from "./mem_db.ts";
 
 function exec(db: Handle, sql: string): void {
   db.execute(sql);
@@ -35,7 +36,7 @@ function i32s(rs: string[][]): number[] {
 }
 
 function setup(): Session {
-  const db = Database.newInMemory().session();
+  const db = memDb().session();
   exec(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
   exec(db, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)");
   return db;
