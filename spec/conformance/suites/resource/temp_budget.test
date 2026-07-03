@@ -1,4 +1,4 @@
-# skip: disk — session-local/shared temp tables do not survive the disk-mode per-record reopen (spec/design/conformance.md §3).
+# skip: disk — session-local temp tables do not survive the disk-mode per-record reopen (spec/design/conformance.md §3).
 # Temp-table storage budget — `temp_buffers` bounds a session's RETAINED temporary-table bytes
 # (spec/design/temp-tables.md §7), the §13 hazard no cost ceiling covers (max_cost bounds work per
 # statement, lifetime_max_cost across statements; neither bounds bytes a temp table HOLDS between

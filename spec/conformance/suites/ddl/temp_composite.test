@@ -1,6 +1,6 @@
-# skip: disk — session-local/shared temp tables do not survive the disk-mode per-record reopen (spec/design/conformance.md §3).
+# skip: disk — session-local temp tables do not survive the disk-mode per-record reopen (spec/design/conformance.md §3).
 # composite-typed columns on a temporary table (spec/design/temp-tables.md §8) — the lifted 0A000
-# narrowing: a temp table (session-local OR database-wide SHARED) now takes a column of a user-defined
+# narrowing: a temp table now takes a column of a user-defined
 # composite (row) type, exactly like a persistent one. The composite TYPE itself is always persistent
 # (CREATE TYPE is persistent DDL); a temp table only REFERENCES it. The column's resolved codec/coercion
 # tree (ColType) is built against the persistent type catalog when the table is staged and is fully
@@ -11,10 +11,10 @@
 # table references is 2BP01 (the dependency check is scope-aware, matching the persistent case). The
 # composite semantics — ROW(...) construction, record_out rendering, field access, comparison/ordering
 # — are identical to a persistent column (validated against PG in types/composite.test); this suite
-# proves they hold in the temp scopes. jed-specific (the temp divergences + the SHARED kind + the
+# proves they hold on a temp table. jed-specific (the temp divergences + the
 # host-configured gate cannot be reproduced via the same SQL on PostgreSQL), so it is CROSS-CORE-checked,
 # NOT PostgreSQL-oracle-checked. Format: ../../../design/conformance.md.
-# requires: ddl.temp_table, ddl.shared_temp_table, types.composite, ddl.create_table, ddl.drop_table, ddl.primary_key, dml.insert, dml.insert_column_list, dml.insert_multi_row, query.select, query.order_by, query.where_eq, query.comparison_order, query.is_null, types.i32, types.text, session.allow_temp_ddl, session.allow_shared_temp_ddl
+# requires: ddl.temp_table, types.composite, ddl.create_table, ddl.drop_table, ddl.primary_key, dml.insert, dml.insert_column_list, dml.insert_multi_row, query.select, query.order_by, query.where_eq, query.comparison_order, query.is_null, types.i32, types.text, session.allow_temp_ddl
 
 # --- a composite column on a SESSION-LOCAL temp table: storable, rendered, field-accessible ----------
 
@@ -78,40 +78,6 @@ DROP TABLE person
 statement ok
 DROP TYPE addr
 
-# --- a composite column on a DATABASE-WIDE SHARED temp table, the same machinery in the shared scope -
-
-statement ok
-CREATE TYPE pt AS (x i32, y i32)
-
-statement ok
-CREATE SHARED TEMP TABLE shapes (id i32 PRIMARY KEY, origin pt)
-
-statement ok
-INSERT INTO shapes VALUES (1, ROW(3, 4)), (2, ROW(0, 0))
-
-query IT nosort
-SELECT id, origin FROM shapes ORDER BY id
-----
-1
-(3,4)
-2
-(0,0)
-
-query I nosort
-SELECT (origin).x FROM shapes WHERE id = 1
-----
-3
-
-# DROP TYPE while the SHARED temp table references it is 2BP01 (the shared scope is visible)
-statement error 2BP01
-DROP TYPE pt
-
-statement ok
-DROP TABLE shapes
-
-statement ok
-DROP TYPE pt
-
 # --- the temp-scoped DDL gate covers a composite temp CREATE (temp-tables.md §5) --------------------
 
 statement ok
@@ -127,8 +93,3 @@ CREATE TEMP TABLE gt (id i32 PRIMARY KEY, c g)
 # allow_temp_ddl: on
 statement ok
 CREATE TEMP TABLE gt (id i32 PRIMARY KEY, c g)
-
-# a composite SHARED temp table is gated by allow_shared_temp_ddl (not allow_temp_ddl)
-# allow_shared_temp_ddl: off
-statement error 42501
-CREATE SHARED TEMP TABLE gs (id i32 PRIMARY KEY, c g)

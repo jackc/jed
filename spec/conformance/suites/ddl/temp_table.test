@@ -1,4 +1,4 @@
-# skip: disk — session-local/shared temp tables do not survive the disk-mode per-record reopen (spec/design/conformance.md §3).
+# skip: disk — session-local temp tables do not survive the disk-mode per-record reopen (spec/design/conformance.md §3).
 # Temporary tables — SESSION-LOCAL temp tables that make ZERO writes to the database file
 # (spec/design/temp-tables.md). They live in a per-session temp snapshot outside the serialized
 # catalog, so there is no format_version change; they support full CRUD + PK/UNIQUE/CHECK/NOT NULL/

@@ -1,18 +1,18 @@
-# skip: disk — session-local/shared temp tables do not survive the disk-mode per-record reopen (spec/design/conformance.md §3).
+# skip: disk — session-local temp tables do not survive the disk-mode per-record reopen (spec/design/conformance.md §3).
 # serial / IDENTITY columns on a temporary table (spec/design/temp-tables.md §8) — the lifted 0A000
-# narrowing: a temp table (session-local OR database-wide SHARED) now takes a `serial`/`bigserial`/
+# narrowing: a temp table now takes a `serial`/`bigserial`/
 # `smallserial` or `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY` column, exactly like a persistent
 # one. Its auto-created OWNED sequence (named <table>_<col>_seq) lives in the SAME in-memory temp
 # snapshot, so it makes ZERO writes to the database file (no format_version change) and is auto-dropped
-# with the table at session/database close. The sequence resolves and advances via the scope-aware
+# with the table at session close. The sequence resolves and advances via the scope-aware
 # sequence funnel (so `nextval`/`currval`/`setval` by name reach it), shares the relation namespace
 # (42P07), is 2BP01 to drop directly (the owner-link dependency), and is gated by the temp-scoped DDL
-# split (allow_temp_ddl / allow_shared_temp_ddl, §5). The serial/IDENTITY semantics are identical to a
+# split (allow_temp_ddl, §5). The serial/IDENTITY semantics are identical to a
 # persistent column (the same desugaring, validated against PG in ddl/serial.test + ddl/identity.test);
-# this suite proves they hold in the temp scopes. jed-specific (the temp divergences + the SHARED kind +
+# this suite proves they hold on a temp table. jed-specific (the temp divergences +
 # the host-configured gate cannot be reproduced via the same SQL on PostgreSQL), so it is CROSS-CORE-
 # checked, NOT PostgreSQL-oracle-checked. Format: ../../../design/conformance.md.
-# requires: ddl.temp_table, ddl.shared_temp_table, ddl.serial, ddl.identity, ddl.sequence, func.sequence, ddl.create_table, ddl.drop_table, ddl.primary_key, dml.insert, dml.insert_column_list, dml.insert_multi_row, dml.update, query.select, query.where_eq, types.i32, types.i64, types.text, session.allow_temp_ddl, session.allow_shared_temp_ddl
+# requires: ddl.temp_table, ddl.serial, ddl.identity, ddl.sequence, func.sequence, ddl.create_table, ddl.drop_table, ddl.primary_key, dml.insert, dml.insert_column_list, dml.insert_multi_row, dml.update, query.select, query.where_eq, types.i32, types.i64, types.text, session.allow_temp_ddl
 
 # --- serial on a SESSION-LOCAL temp table: the OWNED sequence lives in the temp snapshot ----------
 
@@ -144,41 +144,6 @@ CREATE TEMP TABLE t_id_seq (x i32)
 statement ok
 DROP TABLE t_id_seq
 
-# --- serial on a DATABASE-WIDE SHARED temp table, the same machinery in the shared scope ----------
-
-statement ok
-CREATE SHARED TEMP TABLE c (id bigserial PRIMARY KEY, v text)
-
-statement ok
-INSERT INTO c (v) VALUES ('p'), ('q'), ('r')
-
-query IT rowsort
-SELECT id, v FROM c
-----
-1
-p
-2
-q
-3
-r
-
-# the shared temp owned sequence is reachable by name (resolves in the shared scope), now at 3
-query I nosort
-SELECT nextval('c_id_seq')
-----
-4
-
-# DROP SEQUENCE of the owned shared temp sequence is 2BP01
-statement error 2BP01
-DROP SEQUENCE c_id_seq
-
-# DROP TABLE auto-drops the owned shared temp sequence
-statement ok
-DROP TABLE c
-
-statement error 42P01
-SELECT nextval('c_id_seq')
-
 # --- the temp-scoped DDL gate covers serial/IDENTITY temp DDL (temp-tables.md §5) ----------------
 
 # a serial CREATE TEMP TABLE is denied when allow_temp_ddl is off
@@ -196,8 +161,3 @@ CREATE TEMP TABLE g (id serial PRIMARY KEY, v text)
 # allow_temp_ddl: off
 statement error 42501
 DROP SEQUENCE g_id_seq
-
-# a serial SHARED temp table is gated by allow_shared_temp_ddl (not allow_temp_ddl)
-# allow_shared_temp_ddl: off
-statement error 42501
-CREATE SHARED TEMP TABLE gs (id serial PRIMARY KEY)
