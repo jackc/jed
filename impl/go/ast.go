@@ -103,6 +103,12 @@ type createTable struct {
 	// each element (42703/42701/42704/0A000), builds the backing multi-column GiST index, and
 	// names the unnamed ones (42P07/42710).
 	Excludes []excludeDef
+	// DB is the optional database qualifier `db.table` written before the table name
+	// (spec/design/attached-databases.md §3, Slice 1b): `main` (the persistent image), `temp` (the
+	// session-local domain), or a host-attached database name — else 42P01. nil for a bare name (the
+	// implicit scope: temp if Temp, else main). Creating INTO an attachment routes putTable at
+	// execution into that attachment's working snapshot (attached-databases.md §6).
+	DB *string
 }
 
 // ExcludeDef is one parsed EXCLUDE constraint (spec/design/gist.md §7, grammar.md): the optional
@@ -218,6 +224,11 @@ type createIndex struct {
 	// Using is the `USING <method>` access method as written, or "" for the default ordered
 	// B-tree. Resolved at execution: ""/"btree" → B-tree, "gin" → GIN, else 42704 (gin.md §3).
 	Using string
+	// DB is the optional database qualifier on the target table `CREATE INDEX … ON db.table (…)`
+	// (spec/design/attached-databases.md §3, Slice 1b): the index is built ON a table in that
+	// database (`main` / `temp` / a host attachment), and its store is registered into the owning
+	// snapshot. nil for a bare (implicit-scope) table name.
+	DB *string
 }
 
 // DropIndex is a DROP INDEX <name> statement — remove one secondary index

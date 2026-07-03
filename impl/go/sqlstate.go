@@ -163,8 +163,7 @@ const (
 	TempStorageLimitExceeded
 	// ObjectNotInPrerequisiteState is 55000 — {detail}.
 	ObjectNotInPrerequisiteState
-	// ObjectInUse is 55006 — object is in use: {detail}. Detaching a database with a live pinned
-	// snapshot (spec/design/attached-databases.md §8).
+	// ObjectInUse is 55006 — {detail}.
 	ObjectInUse
 	// QueryCanceled is 57014 — canceling statement due to user request.
 	QueryCanceled

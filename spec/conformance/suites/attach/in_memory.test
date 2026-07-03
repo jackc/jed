@@ -1,0 +1,179 @@
+# skip: disk — in-memory host attachments do not survive the disk-mode per-record reopen (a fresh
+# Database handle is opened from the file, and an in-memory attachment lives only on the old handle;
+# spec/design/conformance.md §3, attached-databases.md §5).
+# Host-attached IN-MEMORY databases — Slice 1b of attached databases (spec/design/attached-databases.md
+# §5/§6). The `# attach:` directives below attach two fresh, empty read-write in-memory databases named
+# `mydb` and `refs`; the records then CREATE / populate / read / join / mutate their tables through the
+# `db.table` qualifier, and JOIN across `main` and both attachments in one consistent snapshot. This is
+# the real N-way routing that Slice 1a's validation-gate qualifiers become. jed-specific (PostgreSQL has
+# no embedded multi-database model), so CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
+# attach: mydb
+# attach: refs
+# requires: attach.in_memory, harness.attach, query.qualified_table, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.unique, ddl.check, dml.insert, dml.insert_multi_row, dml.insert_select, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.join_inner, types.i32, types.text
+
+# --- CREATE TABLE into an attachment + populate it --------------------------------------------
+
+statement ok
+CREATE TABLE mydb.item (id i32 PRIMARY KEY, name text, qty i32)
+
+statement ok
+INSERT INTO mydb.item VALUES (1, 'apple', 10), (2, 'pear', 20), (3, 'plum', 30)
+
+# a bare name does NOT resolve into an attachment (no silent shadowing / search path — §3)
+statement error 42P01
+SELECT * FROM item
+
+# the attachment's rows are read by the qualifier
+query IT rowsort
+SELECT id, name FROM mydb.item
+----
+1
+apple
+2
+pear
+3
+plum
+
+# a WHERE on the attachment's key full-scans + residual-filters this slice (still correct)
+query T nosort
+SELECT name FROM mydb.item WHERE id = 2
+----
+pear
+
+# an explicit alias labels the qualified relation
+query I nosort
+SELECT x.qty FROM mydb.item AS x WHERE x.id = 3
+----
+30
+
+# --- a second attachment + a cross-attachment JOIN --------------------------------------------
+
+statement ok
+CREATE TABLE refs.price (item_id i32 PRIMARY KEY, cents i32)
+
+statement ok
+INSERT INTO refs.price VALUES (1, 50), (2, 75), (3, 120)
+
+# join two DIFFERENT attachments in one snapshot
+query TI nosort
+SELECT i.name, p.cents FROM mydb.item AS i JOIN refs.price AS p ON i.id = p.item_id ORDER BY i.id
+----
+apple
+50
+pear
+75
+plum
+120
+
+# --- a main table joined against an attachment ------------------------------------------------
+
+statement ok
+CREATE TABLE tag (id i32 PRIMARY KEY, label text)
+
+statement ok
+INSERT INTO tag VALUES (1, 'fruit'), (2, 'fruit'), (3, 'stone')
+
+query TT nosort
+SELECT i.name, g.label FROM main.tag AS g JOIN mydb.item AS i ON g.id = i.id ORDER BY i.id
+----
+apple
+fruit
+pear
+fruit
+plum
+stone
+
+# --- INSERT ... SELECT into and out of an attachment ------------------------------------------
+
+statement ok
+CREATE TABLE mydb.copy (id i32 PRIMARY KEY, name text)
+
+statement ok
+INSERT INTO mydb.copy SELECT id, name FROM mydb.item
+
+query IT nosort
+SELECT id, name FROM mydb.copy ORDER BY id
+----
+1
+apple
+2
+pear
+3
+plum
+
+# --- UPDATE / DELETE on an attachment ---------------------------------------------------------
+
+statement ok
+UPDATE mydb.item SET qty = 99 WHERE id = 2
+
+query I nosort
+SELECT qty FROM mydb.item WHERE id = 2
+----
+99
+
+statement ok
+DELETE FROM mydb.item WHERE id = 3
+
+query I nosort
+SELECT id FROM mydb.item ORDER BY id
+----
+1
+2
+
+# --- UNIQUE + CHECK + a secondary index on an attachment table --------------------------------
+
+statement ok
+CREATE TABLE mydb.acct (id i32 PRIMARY KEY, email text UNIQUE, balance i32 CHECK (balance >= 0))
+
+statement ok
+INSERT INTO mydb.acct VALUES (1, 'a@x', 100)
+
+# the UNIQUE index on the attachment is maintained — a duplicate email is 23505
+statement error 23505
+INSERT INTO mydb.acct VALUES (2, 'a@x', 5)
+
+# the CHECK on the attachment is enforced — a negative balance is 23514
+statement error 23514
+INSERT INTO mydb.acct VALUES (3, 'b@x', -1)
+
+statement ok
+INSERT INTO mydb.acct VALUES (2, 'b@x', 5)
+
+statement ok
+CREATE INDEX acct_bal_idx ON mydb.acct (balance)
+
+# the index is used only for maintenance this slice (attachment scans full) — the rows are correct
+query IT nosort
+SELECT id, email FROM mydb.acct ORDER BY id
+----
+1
+a@x
+2
+b@x
+
+# --- resolution errors ------------------------------------------------------------------------
+
+# an unattached database qualifier is 42P01
+statement error 42P01
+SELECT * FROM nope.t
+
+statement error 42P01
+CREATE TABLE nope.t (id i32 PRIMARY KEY)
+
+# a known attachment but an absent table is 42P01
+statement error 42P01
+SELECT * FROM mydb.missing
+
+statement error 42P01
+INSERT INTO mydb.missing VALUES (1)
+
+# --- deferred narrowings on an attachment table (each a clean 0A000) --------------------------
+
+statement error 0A000
+CREATE TABLE mydb.s (id serial PRIMARY KEY)
+
+statement error 0A000
+CREATE TABLE mydb.f (id i32 PRIMARY KEY, parent i32 REFERENCES tag (id))
+
+statement error 0A000
+INSERT INTO mydb.acct VALUES (1, 'a@x', 1) ON CONFLICT (id) DO NOTHING

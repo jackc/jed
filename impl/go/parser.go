@@ -364,7 +364,10 @@ func (p *parser) parseCreateTable() (*createTable, error) {
 	if err := p.expectKeyword("table"); err != nil {
 		return nil, err
 	}
-	name, err := p.expectIdentifier()
+	// An optional database qualifier `db.table` (attached-databases.md §3, Slice 1b): create the table
+	// INTO the named database (`main` / `temp` / a host attachment). A bare name uses the implicit
+	// scope. The `.` after the first identifier makes it the qualifier and the next the table name.
+	dbQualifier, name, err := p.parseQualifiedTableName()
 	if err != nil {
 		return nil, err
 	}
@@ -430,7 +433,7 @@ func (p *parser) parseCreateTable() (*createTable, error) {
 	if len(columns) == 0 {
 		return nil, newError(SyntaxError, "a table must have at least one column")
 	}
-	return &createTable{Name: name, Temp: temp, Columns: columns, TablePKs: tablePKs, Checks: checks, Uniques: uniques, ForeignKeys: foreignKeys, Excludes: excludes}, nil
+	return &createTable{Name: name, Temp: temp, DB: dbQualifier, Columns: columns, TablePKs: tablePKs, Checks: checks, Uniques: uniques, ForeignKeys: foreignKeys, Excludes: excludes}, nil
 }
 
 // atExclusionTableConstraint reports whether the cursor sits on a table-level EXCLUDE constraint:
@@ -1048,7 +1051,9 @@ func (p *parser) parseCreateIndex() (*createIndex, error) {
 	if err := p.expectKeyword("on"); err != nil {
 		return nil, err
 	}
-	table, err := p.expectIdentifier()
+	// An optional database qualifier `db.table` on the target table (attached-databases.md §3, Slice
+	// 1b): build the index ON a table in the named database (`main` / `temp` / a host attachment).
+	dbQualifier, table, err := p.parseQualifiedTableName()
 	if err != nil {
 		return nil, err
 	}
@@ -1083,7 +1088,7 @@ func (p *parser) parseCreateIndex() (*createIndex, error) {
 		}
 		return nil, newError(SyntaxError, fmt.Sprintf("expected ',' or ')', found %v", tok))
 	}
-	return &createIndex{Name: name, Table: table, Columns: columns, Unique: unique, Using: using}, nil
+	return &createIndex{Name: name, Table: table, DB: dbQualifier, Columns: columns, Unique: unique, Using: using}, nil
 }
 
 // parseDropIndex parses `DROP INDEX <name>` (spec/design/grammar.md §30). A missing index

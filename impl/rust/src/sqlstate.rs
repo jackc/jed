@@ -160,6 +160,8 @@ pub enum SqlState {
     TempStorageLimitExceeded,
     /// 55000 — {detail}
     ObjectNotInPrerequisiteState,
+    /// 55006 — {detail}
+    ObjectInUse,
     /// 57014 — canceling statement due to user request
     QueryCanceled,
     /// 58030 — I/O error: {detail}
@@ -252,6 +254,7 @@ impl SqlState {
             SqlState::SessionCostLimitExceeded => "54P02",
             SqlState::TempStorageLimitExceeded => "54P03",
             SqlState::ObjectNotInPrerequisiteState => "55000",
+            SqlState::ObjectInUse => "55006",
             SqlState::QueryCanceled => "57014",
             SqlState::IoError => "58030",
             SqlState::UndefinedFile => "58P01",
@@ -348,6 +351,7 @@ pub const ERRORS: &[ErrorDesc] = &[
     ErrorDesc { code: "54P02", name: "session_cost_limit_exceeded", class: "program limit exceeded" },
     ErrorDesc { code: "54P03", name: "temp_storage_limit_exceeded", class: "program limit exceeded" },
     ErrorDesc { code: "55000", name: "object_not_in_prerequisite_state", class: "object not in prerequisite state" },
+    ErrorDesc { code: "55006", name: "object_in_use", class: "object not in prerequisite state" },
     ErrorDesc { code: "57014", name: "query_canceled", class: "operator intervention" },
     ErrorDesc { code: "58030", name: "io_error", class: "system error" },
     ErrorDesc { code: "58P01", name: "undefined_file", class: "system error" },

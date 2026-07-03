@@ -324,6 +324,24 @@ func openFixture(rel string) (*jed.Database, func(), error) {
 	return db, cleanup, nil
 }
 
+// parseAttachDirective parses a file-level `# attach: <name>` line (spec/design/attached-databases.md
+// §6) — the corpus's way to attach a fresh, empty READ-WRITE in-memory database named <name> to the
+// running handle before the records run, so SQL can `CREATE TABLE <name>.t`, populate it, and join
+// across attachments. Returns the name, or ("", false) if not this directive. Gated by the
+// harness.attach capability. In-memory attachments cannot survive the disk-mode reopen, so an
+// # attach: file is # skip: disk.
+func parseAttachDirective(line string) (string, bool) {
+	body, ok := strings.CutPrefix(strings.TrimSpace(strings.TrimPrefix(line, "#")), "attach:")
+	if !ok {
+		return "", false
+	}
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return "", false
+	}
+	return body, true
+}
+
 func parseRequires(text string) []string {
 	for _, line := range strings.Split(text, "\n") {
 		t := strings.TrimSpace(line)
@@ -785,6 +803,18 @@ func runFile(text string, disk bool) error {
 			if name, ok := parseLoadTimezoneDirective(line); ok {
 				if err := loadTimezone(name); err != nil {
 					return err
+				}
+				i++
+				continue
+			}
+			// `# attach: <name>` (file-level) attaches a fresh empty read-write in-memory database to the
+			// running handle (attached-databases.md §6): the records then CREATE / populate / join it by
+			// the `<name>.table` qualifier. An ACTION applied to the Database, so every session over it
+			// sees the attachment (refreshCommitted re-pins roots.attached per statement). In-memory
+			// attachments cannot survive the disk reopen, so # attach: files are # skip: disk.
+			if name, ok := parseAttachDirective(line); ok {
+				if err := db.Attach(name, jed.AttachMemory(), false); err != nil {
+					return fmt.Errorf("attach %q: %w", name, err)
 				}
 				i++
 				continue

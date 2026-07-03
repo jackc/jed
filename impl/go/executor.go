@@ -1484,6 +1484,34 @@ func (db *engine) checkAttachmentWritable(scope *string) error {
 	return nil
 }
 
+// isReservedScope reports whether a database qualifier names one of the two implicit reserved scopes
+// `main` / `temp` (attached-databases.md §3), which resolve to the SAME store the bare name would — so
+// a qualified reference to one keeps every existing fast path. A nil qualifier (a bare implicit-scope
+// name) counts as reserved for routing: it too keeps the temp-first funnels.
+func isReservedScope(q *string) bool {
+	if q == nil {
+		return true
+	}
+	switch strings.ToLower(*q) {
+	case "main", "temp":
+		return true
+	}
+	return false
+}
+
+// isAttachmentScope reports whether a database qualifier names a HOST-ATTACHED database (not nil, not
+// reserved main/temp) — the case that routes to the attachment registry rather than the implicit
+// temp-first funnels, and the case that gates off index-bound pushdown / cross-scope catalog lookups
+// this slice (attached-databases.md §8).
+func isAttachmentScope(q *string) bool { return !isReservedScope(q) }
+
+// isAttachment reports whether this relation targets a host-attached database (attached-databases.md
+// §3) rather than the implicit main/temp scope. Index/PK/GiST/GIN bound pushdown is gated off for
+// attachment relations this slice: the bounded-scan exec path resolves index stores through the
+// UNSCOPED lkpIndexStore funnel, so an attachment relation must full-scan (correct, perf-only — index
+// acceleration for attachments is a Slice 1b perf follow-on). A full scan reads the scoped store.
+func (rel scopeRel) isAttachment() bool { return isAttachmentScope(rel.db) }
+
 // attachReadSnap returns the READ snapshot of a host-attached database (attached-databases.md §5) — the
 // transaction's working clone if this tx wrote it, else the pinned committed root (attachedCommitted).
 // nil when no attachment is named `name` (the caller raises 42P01). name is expected lowercased.
@@ -2471,6 +2499,32 @@ func (db *engine) commitTx() (Outcome, error) {
 		}
 	}
 	db.session.tempCommitted = tx.tempWorking
+	// Adopt each dirtied host-attached database (attached-databases.md §5, the N-root commit): materialize
+	// its working snapshot into the attachment's in-RAM block store (persistTemp-style — the same
+	// incremental copy-on-write pack as temp, NO fsync, since an in-memory attachment has no durability
+	// barrier) and adopt it into this engine's pinned attached view, so publish swaps a new roots.attached.
+	// Like temp this touches no MAIN file; unlike temp the root is DATABASE-scoped (published,
+	// cross-session-visible). Within-session compaction is safe only when no cross-session reader pins an
+	// older root (the live-registry watermark — the committing writer holds the gate but is not in `live`).
+	if len(tx.attachDirty) > 0 {
+		na := make(map[string]*snapshot, len(db.attachedCommitted))
+		for k, v := range db.attachedCommitted {
+			na[k] = v
+		}
+		canReclaim := db.core == nil || !db.core.hasLiveReaders()
+		for name := range tx.attachDirty {
+			ws := tx.attachWorking[name]
+			att := db.core.attachments[name]
+			if att == nil {
+				continue // detached mid-transaction (unreachable under the writer gate) — nothing to persist
+			}
+			if err := att.storage.persistTemp(ws, canReclaim); err != nil {
+				return Outcome{}, err
+			}
+			na[name] = ws
+		}
+		db.attachedCommitted = na
+	}
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 }
 
@@ -3629,19 +3683,69 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 	// FOREIGN KEY on a temp table is deferred this slice (§8) — rejected HERE, before any persistent
 	// parent resolves, so the error is a clean 0A000. The other temp narrowings (composite/collated
 	// columns, serial/IDENTITY) are checked just before registration, once the columns are built.
-	if ct.Temp && len(ct.Excludes) > 0 {
+	//
+	// Resolve the optional database qualifier (attached-databases.md §3, Slice 1b): `main`/`temp` fold
+	// into the implicit scope (main = bare persistent, temp = TEMP); a host-attached name routes the new
+	// table INTO that attachment's working snapshot (§6). TEMP with an explicit database is
+	// contradictory unless the database IS `temp` (42601).
+	targetTemp := ct.Temp
+	attachName := ""
+	if ct.DB != nil {
+		switch strings.ToLower(*ct.DB) {
+		case "main":
+			if ct.Temp {
+				return Outcome{}, newError(SyntaxError, `cannot create a TEMP table in database "main"`)
+			}
+		case "temp":
+			targetTemp = true
+		default:
+			if ct.Temp {
+				return Outcome{}, newError(SyntaxError, "cannot create a TEMP table in an attached database")
+			}
+			attachName = strings.ToLower(*ct.DB)
+			if db.attachReadSnap(attachName) == nil {
+				return Outcome{}, newError(UndefinedTable, `database "`+*ct.DB+`" is not attached`)
+			}
+			// A DDL write to a READ-ONLY attachment is 25006 before any work (attached-databases.md §4).
+			if err := db.checkAttachmentWritable(ct.DB); err != nil {
+				return Outcome{}, err
+			}
+		}
+	}
+	if targetTemp && len(ct.Excludes) > 0 {
 		// An EXCLUDE constraint's backing GiST index would live on the temp snapshot — deferred with
 		// the rest of the GiST-on-temp narrowing (spec/design/gist.md §11), a clean 0A000.
 		return Outcome{}, newError(FeatureNotSupported, "an EXCLUDE constraint on a temporary table is not yet supported")
 	}
-	if ct.Temp && len(ct.ForeignKeys) > 0 {
+	if targetTemp && len(ct.ForeignKeys) > 0 {
 		return Outcome{}, newError(FeatureNotSupported, "FOREIGN KEY on a temporary table is not yet supported")
 	}
-	// The relation namespace is shared between tables and indexes (indexes.md §2), so a
-	// CREATE TABLE colliding with either kind is the same 42P07 — PG's "relation" word.
-	// relationExists is temp-aware, so a temp name collides with temp + persistent alike (preclude-
-	// overlaps — temp-tables.md §3).
-	if db.relationExists(ct.Name) {
+	// Deferred narrowings on an attached-database table this slice (attached-databases.md §8), each a
+	// clean 0A000 before any column work: FOREIGN KEY and EXCLUDE (their probe/backing structures would
+	// need cross-scope catalog access this slice does not thread). Serial/IDENTITY and composite/collated
+	// columns are checked just before registration, once the columns are built (as for temp).
+	if attachName != "" {
+		if len(ct.ForeignKeys) > 0 {
+			return Outcome{}, newError(FeatureNotSupported, "FOREIGN KEY on an attached-database table is not supported yet")
+		}
+		if len(ct.Excludes) > 0 {
+			return Outcome{}, newError(FeatureNotSupported, "an EXCLUDE constraint on an attached-database table is not supported yet")
+		}
+	}
+	// The relation namespace is shared between tables and indexes (indexes.md §2), so a CREATE TABLE
+	// colliding with either kind is the same 42P07 — PG's "relation" word. For a bare/main/temp target
+	// relationExists is temp-aware (a temp name collides with temp + persistent alike — temp-tables.md
+	// §3); an attachment target checks its OWN snapshot's namespace (each attached database is
+	// independent, §3).
+	if attachName != "" {
+		as := db.attachReadSnap(attachName)
+		if _, ok := as.table(ct.Name); ok {
+			return Outcome{}, newError(DuplicateTable, "relation already exists: "+ct.Name)
+		}
+		if _, _, ok := as.findIndex(ct.Name); ok {
+			return Outcome{}, newError(DuplicateTable, "relation already exists: "+ct.Name)
+		}
+	} else if db.relationExists(ct.Name) {
 		return Outcome{}, newError(DuplicateTable, "relation already exists: "+ct.Name)
 	}
 
@@ -4460,7 +4564,43 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 		return strings.ToLower(table.Exclusions[i].Name) < strings.ToLower(table.Exclusions[j].Name)
 	})
 
-	if ct.Temp {
+	if attachName != "" {
+		// Deferred narrowings on an attached-database table this slice (attached-databases.md §8), each a
+		// clean 0A000: a COMPOSITE-typed column (its type lives in the MAIN catalog — no cross-scope type
+		// reference this slice), a serial/IDENTITY column (its OWNED sequence would be a cross-scope
+		// sequence), and a collated column (the attachment snapshot carries no collation catalog). Plain
+		// scalar / array / range / decimal columns with PK / NOT NULL / DEFAULT / CHECK / UNIQUE and
+		// secondary btree indexes are fully supported.
+		for _, c := range table.Columns {
+			if c.Type.IsComposite() {
+				return Outcome{}, newError(FeatureNotSupported, "a composite-typed column on an attached-database table is not supported yet")
+			}
+			if c.Collation != "" {
+				return Outcome{}, newError(FeatureNotSupported, "COLLATE on an attached-database-table column "+c.Name+" is not yet supported")
+			}
+		}
+		if len(pendingSerials) > 0 {
+			return Outcome{}, newError(FeatureNotSupported, "a serial / IDENTITY column on an attached-database table is not supported yet")
+		}
+		// Register into the attachment's working snapshot (attached-databases.md §6) — never the main
+		// image; published into roots.attached at commit (N-root commit, §5). attachWriteSnap clones the
+		// attachment's committed root on first write and marks it dirty. Its NEW stores bind to the
+		// attachment's own paging (the tempPaging seam — the same one temp/in-memory main use).
+		ws := db.attachWriteSnap(attachName)
+		ws.tempPaging = db.core.attachments[attachName].storage.paging
+		mainTypes := db.readSnap().types
+		colTypes := make([]colType, len(table.Columns))
+		for i, c := range table.Columns {
+			colTypes[i] = resolveColType(c.Type, mainTypes)
+		}
+		ws.putTableResolved(table, colTypes, db.pageSize)
+		for _, ix := range table.Indexes {
+			ws.putIndexStore(strings.ToLower(ix.Name), newTableStore(pagePayload(db.pageSize), nil))
+		}
+		return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+	}
+
+	if targetTemp {
 		// Deferred narrowing on a temp table this slice (spec/design/temp-tables.md §8), a clean 0A000:
 		// a collated column (needs the temp snapshot to carry the collation catalog). Plain
 		// scalar/array/range/decimal columns with PK / NOT NULL / DEFAULT / CHECK / UNIQUE,
@@ -4981,12 +5121,25 @@ func (db *engine) relationExists(name string) bool {
 // built by scanning the table once: page_read per node + storage_row_read per row (the
 // metered build scan — cost.md §3); maintenance thereafter is unmetered.
 func (db *engine) executeCreateIndex(ci *createIndex) (Outcome, error) {
-	// A standalone CREATE INDEX targets whichever scope owns the table — session-local temp, shared
-	// temp, or persistent (spec/design/temp-tables.md §8). The build below is scope-agnostic (the
-	// lkpTable/lkpStore/writeIndexStore funnels route by the resolution walk; the cost meter, UNIQUE
-	// validation, naming/namespace collision, and the storage budget are all generic); only the catalog
-	// putIndex write must target the owning snapshot, so the routing happens there.
-	table, ok := db.lkpTable(ci.Table)
+	// A standalone CREATE INDEX targets whichever scope owns the table — session-local temp,
+	// persistent, or a host-attached database (spec/design/temp-tables.md §8, attached-databases.md §3).
+	// The build below is scope-agnostic (the scoped lkpTable/lkpStore/writeIndexStore funnels route by
+	// the qualifier + resolution walk; the cost meter, UNIQUE validation, naming/namespace collision,
+	// and the storage budget are all generic); only the catalog putIndex write must target the owning
+	// snapshot, so the routing happens there.
+	// A DDL write to a READ-ONLY host attachment is 25006 before any work — checked BEFORE the qualifier
+	// existence gate so a read-only attachment refuses the write deterministically (attached-databases.md §4).
+	if err := db.checkAttachmentWritable(ci.DB); err != nil {
+		return Outcome{}, err
+	}
+	if err := db.checkTableQualifier(ci.DB, ci.Table); err != nil { // attached-databases.md §3
+		return Outcome{}, err
+	}
+	attachName := ""
+	if isAttachmentScope(ci.DB) {
+		attachName = strings.ToLower(*ci.DB)
+	}
+	table, ok := db.lkpTableScoped(ci.DB, ci.Table)
 	if !ok {
 		return Outcome{}, newError(UndefinedTable, "table does not exist: "+ci.Table)
 	}
@@ -5090,9 +5243,28 @@ func (db *engine) executeCreateIndex(ci *createIndex) (Outcome, error) {
 			return Outcome{}, newError(FeatureNotSupported, "a gist index on a temporary table is not supported yet")
 		}
 	}
+	// A non-btree (GIN / GiST) index on an attached-database table is a deferred narrowing this slice
+	// (attached-databases.md §8) — the attachment stores only btree PK / UNIQUE / secondary indexes.
+	if attachName != "" && kind != indexBtree {
+		return Outcome{}, newError(FeatureNotSupported, "a "+ci.Using+" index on an attached-database table is not supported yet")
+	}
+	// relationExistsScoped checks the namespace of the target scope: an attachment's OWN snapshot for an
+	// attached table (each attached database is an independent namespace, §3), else the temp-aware
+	// implicit namespace.
+	relationTaken := func(n string) bool {
+		if attachName != "" {
+			as := db.attachReadSnap(attachName)
+			if _, ok := as.table(n); ok {
+				return true
+			}
+			_, _, ok := as.findIndex(n)
+			return ok
+		}
+		return db.relationExists(n)
+	}
 	name := ci.Name
 	if name != "" {
-		if db.relationExists(name) {
+		if relationTaken(name) {
 			return Outcome{}, newError(DuplicateTable, "relation already exists: "+name)
 		}
 	} else {
@@ -5104,7 +5276,7 @@ func (db *engine) executeCreateIndex(ci *createIndex) (Outcome, error) {
 		}
 		base += "_idx"
 		name = base
-		for suffix := 1; db.relationExists(name); suffix++ {
+		for suffix := 1; relationTaken(name); suffix++ {
 			name = base + strconv.Itoa(suffix)
 		}
 	}
@@ -5119,7 +5291,7 @@ func (db *engine) executeCreateIndex(ci *createIndex) (Outcome, error) {
 		mask[c] = true
 	}
 	def := indexDef{Name: name, Columns: cols, Unique: ci.Unique, Kind: kind}
-	store := db.lkpStore(ci.Table)
+	store := db.lkpStoreScoped(ci.DB, ci.Table)
 	stored, nodes, slabs, err := store.ScanWithUnits(mask)
 	if err != nil {
 		return Outcome{}, err
@@ -5171,13 +5343,19 @@ func (db *engine) executeCreateIndex(ci *createIndex) (Outcome, error) {
 	// main image). The entry writes below then route through writeIndexStore, which finds the new store
 	// in that same temp snapshot.
 	switch {
+	case attachName != "":
+		// The attachment's index catalog entry + (empty) store live in its working snapshot, published
+		// into roots.attached at commit (attached-databases.md §5/§6). attachWriteSnap marks it dirty.
+		ws := db.attachWriteSnap(attachName)
+		ws.tempPaging = db.core.attachments[attachName].storage.paging
+		ws.putIndex(tableKey, def, db.pageSize)
 	case db.isTempTable(ci.Table):
 		db.session.tx.tempDirty = true
 		db.session.tx.tempWorking.putIndex(tableKey, def, db.pageSize)
 	default:
 		db.working().putIndex(tableKey, def, db.pageSize)
 	}
-	istore := db.writeIndexStore(nameKey)
+	istore := db.writeIndexStoreScoped(ci.DB, nameKey)
 	// Insert sorted by entry key (indexes.md §1): every insert is then a right-edge append,
 	// so the built tree packs ~full instead of splintering under the storage-key order the
 	// scan produced (random in entry-key space). Part of the byte contract — the sort fixes
@@ -6123,10 +6301,20 @@ func (db *engine) rowConflictsCommitted(store *tableStore, table *catTable, pk [
 }
 
 func (db *engine) executeInsert(ins *insert, params []Value, ctx cteCtx) (Outcome, error) {
+	// A write to a READ-ONLY host attachment is 25006 before any I/O — checked BEFORE the qualifier
+	// existence gate so a read-only attachment refuses the write deterministically (attached-databases.md §4).
+	if err := db.checkAttachmentWritable(ins.DB); err != nil {
+		return Outcome{}, err
+	}
 	if err := db.checkTableQualifier(ins.DB, ins.Table); err != nil { // attached-databases.md §3
 		return Outcome{}, err
 	}
-	table, ok := db.lkpTable(ins.Table) // temp-first (temp-tables.md §3)
+	// ON CONFLICT into a host attachment is a deferred narrowing this slice (attached-databases.md §8):
+	// the conflict path resolves index stores unscoped. A clean 0A000 before any planning.
+	if ins.OnConflict != nil && isAttachmentScope(ins.DB) {
+		return Outcome{}, newError(FeatureNotSupported, "ON CONFLICT on an attached-database table is not supported yet")
+	}
+	table, ok := db.lkpTableScoped(ins.DB, ins.Table) // scope-aware temp-first (temp-tables.md §3)
 	if !ok {
 		return Outcome{}, newError(UndefinedTable, "table does not exist: "+ins.Table)
 	}
@@ -6135,7 +6323,7 @@ func (db *engine) executeInsert(ins *insert, params []Value, ctx cteCtx) (Outcom
 	if err := db.ensureCollationsWritable(table.Columns); err != nil {
 		return Outcome{}, err
 	}
-	store := db.writeStore(ins.Table) // routes a temp INSERT to tempWorking (temp-tables.md §2)
+	store := db.writeStoreScoped(ins.DB, ins.Table) // routes a temp / attachment INSERT to its working snapshot
 	// The key members in key order — one for a single-column PK, several for a composite
 	// (constraints.md §3), empty for a no-PK (rowid) table.
 	pk := table.PKIndices()
@@ -6315,7 +6503,7 @@ func (db *engine) executeInsert(ins *insert, params []Value, ctx cteCtx) (Outcom
 		// RETURNING projection; storing the rows themselves stays unmetered. One meter keeps
 		// one ceiling over the whole statement.
 		meter.Charge(q.cost)
-		affected, returned, err := db.runInsertRows(table, store, pk, checks, defaultExprs, stmtRng, provided, q.rows, cplan, retNodes, bound, ctx, meter)
+		affected, returned, err := db.runInsertRows(table, store, ins.DB, pk, checks, defaultExprs, stmtRng, provided, q.rows, cplan, retNodes, bound, ctx, meter)
 		if err != nil {
 			return Outcome{}, err
 		}
@@ -6444,7 +6632,7 @@ func (db *engine) executeInsert(ins *insert, params []Value, ctx cteCtx) (Outcom
 	if err := db.foldConflictPlan(cplan, bound, &meter.Accrued); err != nil {
 		return Outcome{}, err
 	}
-	affected, returned, err := db.runInsertRows(table, store, pk, checks, defaultExprs, stmtRng, provided, rows, cplan, retNodes, bound, ctx, meter)
+	affected, returned, err := db.runInsertRows(table, store, ins.DB, pk, checks, defaultExprs, stmtRng, provided, rows, cplan, retNodes, bound, ctx, meter)
 	if err != nil {
 		return Outcome{}, err
 	}
@@ -6464,7 +6652,7 @@ func (db *engine) executeInsert(ins *insert, params []Value, ctx cteCtx) (Outcom
 // validated rows after every check passes and BEFORE phase 2 writes — so its subqueries
 // observe the pre-statement snapshot and a ceiling abort stays all-or-nothing; params feeds
 // its $Ns. Returns the projected output rows, nil without a clause.
-func (db *engine) insertRows(table *catTable, store *tableStore, pk []int, checks []namedCheck, defaultExprs []*rExpr, rng *stmtRng, provided []int, rows [][]Value, returning []*rExpr, params []Value, ctes cteCtx, meter *costMeter) ([][]Value, error) {
+func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string, pk []int, checks []namedCheck, defaultExprs []*rExpr, rng *stmtRng, provided []int, rows [][]Value, returning []*rExpr, params []Value, ctes cteCtx, meter *costMeter) ([][]Value, error) {
 	n := len(table.Columns)
 	// Per-column frozen collations for the collated text key form (§2.12), resolved before any
 	// mutation; nil everywhere for a C-only / non-text table (the fast path).
@@ -6550,7 +6738,7 @@ func (db *engine) insertRows(table *catTable, store *tableStore, pk []int, check
 			// (writable-cte.md §2) it sees the PRE-statement table, not an earlier sub-statement's
 			// staged rows; a cross-sub-statement key collision is caught in phase 2 below instead.
 			// readSnap == working for an ordinary INSERT, so this is unchanged there.
-			if _, exists, err := db.lkpStore(table.Name).Get(key); err != nil {
+			if _, exists, err := db.lkpStoreScoped(dbScope, table.Name).Get(key); err != nil {
 				return nil, err
 			} else if exists {
 				return nil, newError(UniqueViolation,
@@ -6571,7 +6759,7 @@ func (db *engine) insertRows(table *catTable, store *tableStore, pk []int, check
 			if !ok {
 				continue
 			}
-			istore := db.lkpIndexStore(strings.ToLower(def.Name))
+			istore := db.lkpIndexStoreScoped(dbScope, strings.ToLower(def.Name))
 			stored, err := istore.RangeEntries(uniqueProbeBound(prefix))
 			if err != nil {
 				return nil, err
@@ -6736,7 +6924,7 @@ func (db *engine) insertRows(table *catTable, store *tableStore, pk []int, check
 		}
 	}
 	for k, def := range table.Indexes {
-		istore := db.writeIndexStore(strings.ToLower(def.Name))
+		istore := db.writeIndexStoreScoped(dbScope, strings.ToLower(def.Name))
 		for _, ek := range indexInserts[k] {
 			inserted, err := istore.Insert(ek, nil)
 			if err != nil {
@@ -6774,11 +6962,14 @@ func (db *engine) foldConflictPlan(plan *conflictPlan, bound []Value, accrued *i
 // runInsertRows dispatches the validated candidate rows to the plain or the ON CONFLICT insert
 // path, shared by both INSERT sources. Returns (rows affected, RETURNING rows): a plain insert
 // affects every candidate row; an ON CONFLICT may insert, update, or skip (spec/design/upsert.md §3).
-func (db *engine) runInsertRows(table *catTable, store *tableStore, pk []int, checks []namedCheck, defaultExprs []*rExpr, rng *stmtRng, provided []int, rows [][]Value, conflict *conflictPlan, returning []*rExpr, params []Value, ctes cteCtx, meter *costMeter) (int64, [][]Value, error) {
+func (db *engine) runInsertRows(table *catTable, store *tableStore, dbScope *string, pk []int, checks []namedCheck, defaultExprs []*rExpr, rng *stmtRng, provided []int, rows [][]Value, conflict *conflictPlan, returning []*rExpr, params []Value, ctes cteCtx, meter *costMeter) (int64, [][]Value, error) {
 	if conflict != nil {
+		// ON CONFLICT is reached only for a reserved scope (an attachment target is 0A000 in
+		// executeInsert), where the bare temp-first funnels resolve the store correctly, so the conflict
+		// path takes no dbScope.
 		return db.insertRowsOnConflict(table, store, pk, checks, defaultExprs, rng, provided, rows, conflict, returning, params, ctes, meter)
 	}
-	returned, err := db.insertRows(table, store, pk, checks, defaultExprs, rng, provided, rows, returning, params, ctes, meter)
+	returned, err := db.insertRows(table, store, dbScope, pk, checks, defaultExprs, rng, provided, rows, returning, params, ctes, meter)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -7395,10 +7586,15 @@ func dmlOutcome(retNames []string, retTypes []string, returned [][]Value, affect
 // remove them. No WHERE deletes every row. Keys are collected before mutating so the
 // map is not modified while iterating.
 func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (Outcome, error) {
+	// A write to a READ-ONLY host attachment is 25006 before any I/O — checked BEFORE the qualifier
+	// existence gate so a read-only attachment refuses the write deterministically (attached-databases.md §4).
+	if err := db.checkAttachmentWritable(del.DB); err != nil {
+		return Outcome{}, err
+	}
 	if err := db.checkTableQualifier(del.DB, del.Table); err != nil { // attached-databases.md §3
 		return Outcome{}, err
 	}
-	table, ok := db.lkpTable(del.Table) // temp-first (temp-tables.md §3)
+	table, ok := db.lkpTableScoped(del.DB, del.Table) // scope-aware temp-first (temp-tables.md §3)
 	if !ok {
 		return Outcome{}, newError(UndefinedTable, "table does not exist: "+del.Table)
 	}
@@ -7465,8 +7661,8 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (Ou
 	// The scan reads the pin (readSnap) — under the writable-CTE read pin (writable-cte.md §2) a
 	// DELETE sees the PRE-statement rows, not an earlier sub-statement's table writes; phase 2 below
 	// writes into working. readSnap == working for an ordinary DELETE, so the scan is unchanged there.
-	store := db.lkpStore(del.Table)
-	writeStore := db.writeStore(del.Table)
+	store := db.lkpStoreScoped(del.DB, del.Table)
+	writeStore := db.writeStoreScoped(del.DB, del.Table)
 	// matched collects (key, row) pairs before mutating; the rows feed phase 2's
 	// index-entry removal (indexed columns are fixed-width and always resident).
 	type matchedRow struct {
@@ -7495,7 +7691,13 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (Ou
 	// page_read per visited node (block, before the rows), then storage_row_read per scanned row.
 	var entries []entry
 	var overlap, slabs int
-	if bp := db.pkBoundFor(table, filter); bp != nil {
+	if isAttachmentScope(del.DB) {
+		// A host-attached target full-scans this slice (attached-databases.md §8) — a bounded scan would
+		// resolve its index store through the unscoped funnel. The whole WHERE stays the residual filter.
+		if entries, overlap, slabs, err = store.ScanWithUnits(mask); err != nil {
+			return Outcome{}, err
+		}
+	} else if bp := db.pkBoundFor(table, filter); bp != nil {
 		// Top-level statement: no enclosing query, so the bound never has a correlated source.
 		kb, empty := db.buildKeyBound(bp, bound, nil, nil)
 		if empty {
@@ -7634,7 +7836,7 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (Ou
 		}
 	}
 	for _, def := range table.Indexes {
-		istore := db.writeIndexStore(strings.ToLower(def.Name))
+		istore := db.writeIndexStoreScoped(del.DB, strings.ToLower(def.Name))
 		for _, m := range matched {
 			eks, err := indexEntryKeys(table.Columns, colls, def, m.key, m.row)
 			if err != nil {
@@ -7657,10 +7859,15 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (Ou
 // key must not change this slice); a duplicate target column traps 42701. No WHERE
 // updates every row.
 func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcome, error) {
+	// A write to a READ-ONLY host attachment is 25006 before any I/O — checked BEFORE the qualifier
+	// existence gate so a read-only attachment refuses the write deterministically (attached-databases.md §4).
+	if err := db.checkAttachmentWritable(upd.DB); err != nil {
+		return Outcome{}, err
+	}
 	if err := db.checkTableQualifier(upd.DB, upd.Table); err != nil { // attached-databases.md §3
 		return Outcome{}, err
 	}
-	table, ok := db.lkpTable(upd.Table) // temp-first (temp-tables.md §3)
+	table, ok := db.lkpTableScoped(upd.DB, upd.Table) // scope-aware temp-first (temp-tables.md §3)
 	if !ok {
 		return Outcome{}, newError(UndefinedTable, "table does not exist: "+upd.Table)
 	}
@@ -7810,8 +8017,8 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 	// The scan + per-row column resolution read the pin (readSnap) — under the writable-CTE read pin
 	// (writable-cte.md §2) an UPDATE sees the PRE-statement rows; phase 2 below writes into working.
 	// readSnap == working for an ordinary UPDATE, so this is unchanged there.
-	store := db.lkpStore(upd.Table)
-	writeStore := db.writeStore(upd.Table)
+	store := db.lkpStoreScoped(upd.DB, upd.Table)
+	writeStore := db.writeStoreScoped(upd.DB, upd.Table)
 	// Each entry is (old key, new key, new row, OLD row) — the old row feeds the index
 	// maintenance and the new key the re-keying; for a non-PK UPDATE the new key equals the old.
 	type pending struct {
@@ -7854,7 +8061,13 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 	// page_read per visited node (block, before the rows), then storage_row_read per scanned row.
 	var entries []entry
 	var overlap, slabs int
-	if bp := db.pkBoundFor(table, filter); bp != nil {
+	if isAttachmentScope(upd.DB) {
+		// A host-attached target full-scans this slice (attached-databases.md §8) — a bounded scan would
+		// resolve its index store through the unscoped funnel. The whole WHERE stays the residual filter.
+		if entries, overlap, slabs, err = store.ScanWithUnits(mask); err != nil {
+			return Outcome{}, err
+		}
+	} else if bp := db.pkBoundFor(table, filter); bp != nil {
 		// Top-level statement: no enclosing query, so the bound never has a correlated source.
 		kb, empty := db.buildKeyBound(bp, bound, nil, nil)
 		if empty {
@@ -8008,7 +8221,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 			if !def.Unique {
 				continue
 			}
-			istore := db.lkpIndexStore(strings.ToLower(def.Name))
+			istore := db.lkpIndexStoreScoped(upd.DB, strings.ToLower(def.Name))
 			batch := make(map[string]struct{})
 			for _, u := range updates {
 				prefix, ok, err := indexPrefixKey(table.Columns, colls, def, u.row)
@@ -8319,7 +8532,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 			}
 		}
 		for k, def := range table.Indexes {
-			istore := db.writeIndexStore(strings.ToLower(def.Name))
+			istore := db.writeIndexStoreScoped(upd.DB, strings.ToLower(def.Name))
 			for _, mv := range indexMoves[k] {
 				for _, oldEk := range mv.removals {
 					if _, err := istore.Remove(oldEk); err != nil {
@@ -8348,7 +8561,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 			}
 		}
 		for k, def := range table.Indexes {
-			istore := db.writeIndexStore(strings.ToLower(def.Name))
+			istore := db.writeIndexStoreScoped(upd.DB, strings.ToLower(def.Name))
 			for _, mv := range indexMoves[k] {
 				for _, oldEk := range mv.removals {
 					if _, err := istore.Remove(oldEk); err != nil {
@@ -10188,7 +10401,10 @@ func (db *engine) planSelect(sel *selectStmt, parent *scope, ctes []*cteBinding,
 			if err := db.checkTableQualifier(tref.DB, tref.Name); err != nil {
 				return nil, err
 			}
-			tbl, ok := db.lkpTable(tref.Name)
+			// Route to the qualified database's catalog (attached-databases.md §3): main/temp fall through
+			// to the temp-first funnel (preclude-overlaps lands them in the validated scope), a host
+			// attachment resolves in its own snapshot — where its table lives ONLY.
+			tbl, ok := db.lkpTableScoped(tref.DB, tref.Name)
 			if !ok {
 				return nil, newError(UndefinedTable, "table does not exist: "+*tref.DB+"."+tref.Name)
 			}
@@ -12713,6 +12929,11 @@ func (db *engine) buildIndexAccessPredicate(filter *rExpr, rel scopeRel, idx ind
 // lowercased-name order — the deterministic tie-break), the first that yields a non-empty
 // access predicate (buildIndexAccessPredicate); else nil (full scan).
 func detectScanBound(filter *rExpr, rel scopeRel, db *engine) *scanBound {
+	// A host-attached relation full-scans this slice (attached-databases.md §8): the bounded-scan exec
+	// path resolves index stores unscoped, so no PK/index/GiST/GIN bound may apply to an attachment.
+	if rel.isAttachment() {
+		return nil
+	}
 	if pkLocal := rel.table.PrimaryKeyIndex(); pkLocal >= 0 {
 		// Ordered-equality pushdown is scalar-only; a non-scalar (range) PK skips it (point-lookup
 		// deferred for containers — ranges.md §10), falling through to a full scan + residual filter.
@@ -12872,6 +13093,12 @@ func reduceKeySet(e *rExpr, keyIdx int, keyType scalarType, colColl string) ([]*
 // superset), so the ROWS are unchanged; only the inner re-scan cost drops. Caller restricts this to
 // a base table that is the right/nullable side of an INNER/CROSS/LEFT join.
 func detectINLBound(on *rExpr, whereFilter *rExpr, rel scopeRel, db *engine) *scanBound {
+	// A host-attached inner relation full-scans per outer row this slice (attached-databases.md §8):
+	// the seek would resolve its index store unscoped. Index-nested-loop over an attachment is a
+	// perf follow-on.
+	if rel.isAttachment() {
+		return nil
+	}
 	cutoff := rel.offset
 	collect := func(keyIdx int, ty scalarType, coll *Collation) []boundTerm {
 		colColl := ""
@@ -18731,9 +18958,9 @@ type planRel struct {
 	// db is the relation's explicit database qualifier (attached-databases.md §3), passed to the
 	// scope-aware store funnels at exec (lkpStoreScoped etc.). nil for a bare implicit-scope name → the
 	// funnels fall through to the temp-first walk (behavior-neutral for every unqualified query).
-	db     *string
-	offset int
-	colCount  int
+	db       *string
+	offset   int
+	colCount int
 	// srf is non-nil when this relation is a COMPUTED set-returning function (generate_series)
 	// rather than a base table: tableName is then the function name (never looked up in the
 	// store) and the executor generates the rows instead of scanning (functions.md §10).

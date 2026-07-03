@@ -207,6 +207,16 @@ func (c *sharedCore) persist(snap *snapshot) error {
 	return st.maybeCompact(snap, write.rootPage, c.oldestLiveVersion(snap.txid) == snap.txid)
 }
 
+// hasLiveReaders reports whether any cross-session reader currently pins a committed snapshot (the live
+// registry, transactions.md §8). Used as the within-session compaction watermark for a host attachment
+// (attached-databases.md §5): the committing writer holds the write gate but is not itself in `live`,
+// so an empty registry means no other session can observe a page the commit is about to reclaim.
+func (c *sharedCore) hasLiveReaders() bool {
+	c.liveMu.Lock()
+	defer c.liveMu.Unlock()
+	return len(c.live) > 0
+}
+
 // oldestLiveVersion is the oldest version a live reader pinned, floored at newTxid (the version this
 // commit publishes) so "no live reader" reads as newTxid — the safe case for compaction. Any live
 // reader pins a version older than newTxid (it opened before this commit), so a non-empty registry
@@ -1000,7 +1010,12 @@ func (s *Session) publish() error {
 	// path).
 	snap.demoteCleanLeaves()
 	s.engine.committed = snap
-	s.core.roots.Store(&roots{committed: snap})
+	// The N-root commit (attached-databases.md §5): publish the new main root TOGETHER with the current
+	// attached roots in one atomic Store, so a reader pins a consistent cross-database snapshot. commitTx
+	// already adopted each dirtied attachment's working root into engine.attachedCommitted (and packed it
+	// into the attachment's in-RAM store); an unchanged attachment carries its prior root through
+	// unchanged. A nil map (nothing attached) is byte-for-byte the pre-attachment single-root publish.
+	s.core.roots.Store(&roots{committed: snap, attached: s.engine.attachedCommitted})
 	s.baseVersion++
 	return nil
 }
