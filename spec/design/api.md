@@ -457,6 +457,9 @@ only and the engine has no wire protocol).
 | inject clock source (§10) | `db.set_clock_source(f)` / `db.clear_clock_source()` | `db.SetClockSource(f)` / `db.ClearClockSource()` | `db.setClockSource(f)` / `db.clearClockSource()` |
 | load Unicode data (collation.md §4) | `db.load_unicode_data(r)` | `db.LoadUnicodeData(r)` | `db.loadUnicodeData(bytes)` |
 | upgrade collations — clear a version-skew (collation.md §12) | `db.upgrade_collations() -> usize` | `db.UpgradeCollations() (int, error)` | `db.upgradeCollations(): number` |
+| attach a database (attached-databases.md §4) | `db.attach(name, source, read_only) -> Result<()>` | `db.Attach(name, source, readOnly) error` | `db.attach(name, source, readOnly): void` |
+| detach a database | `db.detach(name) -> Result<()>` | `db.Detach(name) error` | `db.detach(name): void` |
+| attach source (memory now, file = Slice 2) | `AttachSource::memory()` / `AttachSource::file(path)` | `AttachMemory()` / `AttachFile(path)` | `attachMemory()` / `attachFile(path)` |
 | table lookup (catalog) | `db.table(name) -> Option<&Table>` | `db.Table(name) (*Table, bool)` | `db.table(name): Table \| undefined` |
 | table names (catalog) | `db.table_names() -> Vec<String>` | `db.TableNames() []string` | `db.tableNames(): string[]` |
 

@@ -20,17 +20,19 @@
 > §2/§5). Attachment **generalizes "a few hardcoded extra snapshots" into "N named attachments,"** and
 > in doing so lets temp stop being bespoke machinery and become *an attached in-memory database* (§6).
 >
-> **Status: building. Slice 0 landed; Slice 1 in progress.** This doc fixed the model and the
-> decisions before any code, spec-first (CLAUDE.md §11). The two decisions that were open at first
-> draft are settled (maintainer, 2026-07-03): **attach is host-API only — no SQL attach in any form**
-> (§4), and the **`SHARED TEMP` surface is retired** in favor of a `Database`-scoped in-memory
-> attachment (§6). **Slice 0** (retire `SHARED`, §13) has **landed** (all three cores). **Slice 1** —
-> attached in-memory databases + qualified names + reframe temp — is building in three sub-slices:
-> **1a** the `qualified_table` grammar + parser + resolution against the implicit `main`/`temp` scope
-> (the SQL surface, no registry yet); **1b** the name→attachment registry + host-API in-memory
-> `db.attach`/`detach` + N-root commit + cross-attachment joins + read-only mode; **1c** reframe
-> session-local temp as an implicit in-memory attachment (internal cleanup). The grammar
-> ([../grammar/grammar.ebnf](../grammar/grammar.ebnf)) and error registry
+> **Status: building. Slice 0 + Slice 1a landed; Slice 1b landed in the Go core (Rust/TS porting).**
+> This doc fixed the model and the decisions before any code, spec-first (CLAUDE.md §11). The two
+> decisions that were open at first draft are settled (maintainer, 2026-07-03): **attach is host-API
+> only — no SQL attach in any form** (§4), and the **`SHARED TEMP` surface is retired** in favor of a
+> `Database`-scoped in-memory attachment (§6). **Slice 0** (retire `SHARED`, §13) has **landed** (all
+> three cores). **Slice 1** — attached in-memory databases + qualified names + reframe temp — is
+> building in sub-slices: **1a** the `qualified_table` grammar + parser + resolution against the
+> implicit `main`/`temp` scope (the SQL surface, no registry yet) — **landed, all three cores**; **1b**
+> the name→attachment registry + host-API in-memory `db.attach`/`detach` + the CREATE TABLE / CREATE
+> INDEX qualifier (create-into-attachment) + N-root commit + cross-attachment joins + read-only mode
+> (`25006`) + detach-in-use (`55006`) — the whole capability, **landed in the Go core**, Rust + TS
+> porting; **1c** reframe session-local temp as an implicit in-memory attachment (internal cleanup),
+> deferred. The grammar ([../grammar/grammar.ebnf](../grammar/grammar.ebnf)) and error registry
 > ([../errors/registry.toml](../errors/registry.toml)) are authoritative for the surface and codes;
 > when a decision here changes, change them in the same edit.
 
@@ -329,8 +331,11 @@ The whole design is arranged so the §13 guarantee needs **no new exception**:
 | `42712` | `duplicate_alias` | two relations resolve to the same label across databases (`main.t`+`reports.t`, unaliased) | reused, no new rule (§3) |
 | `42P07` | `duplicate_table` | an overlap **within** one database's implicit namespace | unchanged (temp-tables.md §3) |
 | `25006` | `read_only_sql_transaction` | any write (DML or DDL) targeting a **read-only** attachment (§4) | reused — the read-only-context family (also a read-only txn/handle, transactions.md §4.3); attachment-scoped message |
-| `0A000` | `feature_not_supported` | writing a **second** durable database in one txn (§5); a cross-database FK/type/sequence ref (§8); an attachment name in a **persisted** definition (§7) | the honest v1 narrowings |
-| `55006` | `object_in_use` | `detach` of an attachment with a live pinned snapshot (§8) | code TBD at slice time; PG's `object_in_use` is class 55 |
+| `0A000` | `feature_not_supported` | writing a **second** durable database in one txn (§5); a cross-database FK/type/sequence ref (§8); an attachment name in a **persisted** definition (§7); a `db.attach` **file** source (Slice 2); on an **attachment table** (1b): FOREIGN KEY, EXCLUDE, a composite-typed / serial / IDENTITY column, `COLLATE`, a non-btree (GIN/GiST) index, `ON CONFLICT` | the honest v1 narrowings |
+| `55006` | `object_in_use` | `detach` of an attachment with a live pinned snapshot (§8) | **landed** (registry.toml); PG's `object_in_use` is class 55 |
+| `42710` | `duplicate_object` | `db.attach` of a **reserved** name (`main`/`temp`) or an **already-attached** name | host-API; reused |
+| `42704` | `undefined_object` | `db.detach` of a name that is **not attached** (`main`/`temp` are not detachable) | host-API; reused |
+| `42601` | `syntax_error` | `CREATE TEMP TABLE db.t` — `TEMP` with an explicit database (unless the database *is* `temp`) | 1b; the qualifier and TEMP are contradictory |
 | `58P01`/`58P02`/`58030`/`XX001`/`XX002` | host/file errors | attaching a **file** surfaces the same host-layer codes as opening `main` (hosts.md §4) | raised in the host program layer, above the engine |
 
 Host-API attach/detach and their capability posture are a **host-API surface**, asserted by per-core
@@ -394,13 +399,26 @@ Sequenced to put the durability-risky part last:
     unknown-database `42P01`); no new error code, no `format_version` change. `CREATE INDEX ON` /
     `REFERENCES` / `CREATE TABLE` qualifiers stay bare this sub-slice (they matter once real
     attachments exist — 1b).
-  - **1b — the registry + host-API in-memory attach + N-root commit.** Group the temp quad
-    (`storage` + `snapshot` + paging + committed/working) into a per-attachment struct keyed by name;
-    `db.attach(name, memory(), mode)` / `db.detach(name)` add/remove entries (host-API, never SQL, §4);
-    the resolution funnels branch on the resolved attachment (the validation gate of 1a becomes real
-    N-way routing); the two-root commit widens to N in-memory roots (§5); read-only mode rejects writes
-    `25006` (§4); `detach` of a pinned attachment is `55006` (§8, the one new code). Cross-attachment
-    joins, per-core host-API unit tests.
+  - **1b — the registry + host-API in-memory attach + N-root commit + the DDL qualifier. LANDED in the
+    Go core (Rust + TS porting).** A per-attachment `(storage, published-root)` struct keyed by name
+    lives on the shared core; `db.attach(name, memory(), read_only)` / `db.detach(name)` add/remove
+    entries (host-API, never SQL, §4); the resolution funnels branch on the resolved attachment (1a's
+    validation gate becomes real N-way routing — the scoped `lkp*Store`/`writeStore` funnels + the FROM
+    catalog resolution now route by qualifier); the **CREATE TABLE / CREATE INDEX qualifier** creates
+    *into* an attachment's working snapshot (the sub-slice that lets SQL populate one); the two-root
+    commit widens to N roots published in one atomic `roots{committed, attached}` swap (§5 — in-memory
+    attachments persist pointer-swap, no fsync); read-only mode rejects every write (DML + DDL) `25006`
+    *before any I/O* (§4); `detach` of a pinned attachment is `55006` (§8, the one new code). An
+    attachment table this slice supports plain scalar/array/range columns with PK / NOT NULL / DEFAULT /
+    CHECK / UNIQUE / secondary btree indexes; **deferred narrowings, each a clean `0A000`**: FOREIGN
+    KEY, EXCLUDE, a composite-typed column, a serial / IDENTITY column, `COLLATE`, a non-btree (GIN /
+    GiST) index, and `ON CONFLICT` (no cross-scope catalog / sequence / index-store threading yet). An
+    attachment relation **full-scans** (index-bound pushdown into an attachment is a perf follow-on — the
+    bounded-scan exec path resolves index stores unscoped). Cross-attachment joins are corpus-tested (a
+    new `# attach: <name>` harness directive attaches a fresh empty read-write in-memory db; `# skip:
+    disk` — in-memory attachments cannot survive the per-record reopen); the read-only + detach lifecycle
+    are per-core host-API unit tests. In-memory attachments carry **no** byte contract (never serialized)
+    → no `format_version` change.
   - **1c — reframe session-local temp as an implicit in-memory attachment** (§6). Internal cleanup:
     temp's bespoke fields become the registry's implicit `temp` entry; behavior-neutral (temp keeps its
     zero-file-writes, page budget, and compaction).

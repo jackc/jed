@@ -82,7 +82,7 @@ explainable    ::= query_statement | insert | update | delete
  * session-local temp table is gated by `allow_temp_ddl` — the temp-scoped split of `allow_ddl`
  * (42501 if denied — temp-tables.md §5). `ON COMMIT` is deferred to a later slice (temp-tables.md
  * §1/§13). */
-create_table   ::= "CREATE" table_scope? "TABLE" identifier
+create_table   ::= "CREATE" table_scope? "TABLE" qualified_table
                    "(" table_element ("," table_element)* ")"
 table_scope    ::= "TEMPORARY" | "TEMP"
 
@@ -244,7 +244,7 @@ drop_table     ::= "DROP" "TABLE" ("IF" "EXISTS")? identifier ("," identifier)*
  * constraint-backed unique index drops the UNIQUE constraint with it (a documented PG
  * divergence — jed has no ALTER TABLE ... DROP CONSTRAINT, so the index name is the
  * constraint's only handle; indexes.md §8). */
-create_index   ::= "CREATE" "UNIQUE"? "INDEX" identifier? "ON" identifier
+create_index   ::= "CREATE" "UNIQUE"? "INDEX" identifier? "ON" qualified_table
                    using_clause? "(" identifier ("," identifier)* ")"
 using_clause   ::= "USING" identifier
 drop_index     ::= "DROP" "INDEX" identifier

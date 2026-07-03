@@ -639,16 +639,18 @@ case-insensitive (§3), like every other identifier.
 — an OPTIONAL leading `db "."` names the **attached database** a table lives in (`reports.sales`),
 jed's first multi-part name in **table** position ([attached-databases.md](attached-databases.md)
 §3). The qualifier is a *database*, not a schema (jed has no schemas / `search_path`); it applies to
-`table_ref` (FROM/JOIN) and the DML targets (`INSERT INTO` / `UPDATE` / `DELETE FROM`). The label is
+`table_ref` (FROM/JOIN), the DML targets (`INSERT INTO` / `UPDATE` / `DELETE FROM`), and — added in
+Slice 1b — the DDL targets `CREATE TABLE` and `CREATE INDEX … ON` (creating *into* an attachment; a
+column-level `REFERENCES` parent stays **bare**, a qualified parent there is `42601`). The label is
 still the alias or **table** name — the database qualifier **never** becomes a label or an output
 name (a column stays the 2-part `rel.col` below; there is no 3-part `db.table.col` this slice). A
 bare name resolves in **implicit** scope; the reserved implicit qualifiers `main` (the file database)
-and `temp` (the session-local domain) are the only ones recognized in Slice 1a, an unknown one is
-`42P01` "database … is not attached" (host-attached databases land in Slice 1b). Because jed
-**precludes overlaps** (a name is temp XOR persistent within a session, §3), a `main.`/`temp.`
-qualifier resolves to the *same* relation the bare name would, so the parser change is the only
-observable one this sub-slice: the resolver merely **validates** the relation is in the claimed scope
-(`42P01` otherwise). A `db "."` never precedes the derived-table or set-returning-function forms — a
+and `temp` (the session-local domain) resolve to the implicit scope, and — since Slice 1b — a
+host-attached database name routes to that attachment; an unknown qualifier is `42P01` "database … is
+not attached". Because jed **precludes overlaps** (a name is temp XOR persistent within a session, §3),
+a `main.`/`temp.` qualifier resolves to the *same* relation the bare name would, so for those two the
+resolver merely **validates** the relation is in the claimed scope (`42P01` otherwise); a *host
+attachment* qualifier is real **N-way routing** into that database's own catalog and stores (Slice 1b). A `db "."` never precedes the derived-table or set-returning-function forms — a
 database-qualified name is a base table only, so a qualified function call is `42601`. The `db "."`
 slot is free because a bare table name never carried a leading dot (the only dotted name was `rel.col`
 in column position, below).

@@ -414,7 +414,14 @@ cross-core-identical and owns that consequence (the host-extension boundary, §1
 
 ## 9. Storage
 
-- **Single file** per database.
+- **Single file** per database — *one database = one file*, not one file per **query**. A host may
+  **attach** other jed databases (files or in-memory) to an open handle under a name, and a query may
+  then **span** them by a database-qualified name `reports.sales`, joining across attachments in one
+  consistent snapshot (`spec/design/attached-databases.md`; the in-memory attach + `db.table` routing +
+  N-root commit landed in the Go core, Rust/TS porting). Attaching is a **host-API** act, never SQL
+  (the pure-SQL safety spine, §13); each attached database keeps its own single-file (or in-memory)
+  storage and self-describing format — the single-file guarantee binds *per database*, and a spanning
+  query is a pure function of the pinned per-database snapshots.
 - **Design target: durable on-disk databases whose dataset is RAM-sized.** Two facts hold
   at once, and neither alone is the picture. (a) **Persistent on-disk storage is the dominant
   mode** — the overwhelming majority of databases are durable files on disk, *not* ephemeral
