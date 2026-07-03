@@ -468,7 +468,13 @@ cross-core-identical and owns that consequence (the host-extension boundary, §1
   no longer a separate fully-resident decoded-tree path but the **same pager + packed-leaf read
   path over a RAM byte store** (pinned, unbounded pool), so its commit packs dirty pages (the
   file commit minus fsync) and its resident footprint is compact — serving §9's "the in-memory
-  representation is a first-class concern" with one storage path instead of two.
+  representation is a first-class concern" with one storage path instead of two. **Session-local
+  temporary tables ride the same host** (`spec/design/temp-tables.md` §6, the temp-blockstore slice):
+  each session-local temp domain is its own in-RAM `MemoryBlockStore` + pinned pager with
+  **within-session free-list compaction** (a never-reopened store reclaims its copy-on-write orphans
+  rather than leaking a page per commit), so temp is compact + bounded (its `54P03` budget is now the
+  domain's committed page bytes) and spill-to-disk is a clean `BlockStore` swap. Shared temp still
+  rides the decoded arm (a follow-on).
   Designing this seam early is what makes "single-file, embeddable, everywhere" work — the OPFS host
   landed as *an added `BlockStore`*, not a reshape, exactly as intended. The
   **formal host interface** — the five-method `BlockStore` byte device, the per-core mapping,

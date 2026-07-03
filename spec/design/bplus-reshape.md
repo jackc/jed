@@ -32,14 +32,16 @@
 > **B4 landed** (the post-commit residency flip — committed clean leaves demote to `OnDisk` and
 > fault back Packed through the pool on every host; `Unfetched` carries its own resolution handles
 > and the evaluator's column access resolves a touched-set miss on demand, unmetered; the
-> two-form masked/unmasked reconstruction seam is deleted). **One deliberate narrowing, recorded
-> here (the §9 risk valve):** **temp-table stores stay fully resident** this reshape — after B4
-> the `Decoded` residency arm must exist anyway (it is the writer's scratch form and every
-> uncommitted read-your-writes view), so temp tables riding it keep **zero** extra machinery
-> alive; moving them onto a per-domain `MemoryBlockStore` is a named follow-on gated on
-> **continuous within-session reclamation** (transactions.md §8's P6.2 follow-on — without it a
-> never-reopened temp store leaks a page per commit), and the deferred temp spill-to-disk seam
-> stays a `BlockStore` swap exactly as §3 planned.
+> two-form masked/unmasked reconstruction seam is deleted). **The reshape narrowed temp-table stores
+> to fully resident, and the temp-blockstore slice has since RETIRED that narrowing for session-local
+> temp:** it now rides a per-domain `MemoryBlockStore` + pinned pager like an in-memory database
+> ([temp-tables.md §6](temp-tables.md)), gated — as this note predicted — on **within-session
+> reclamation** (built as periodic ~2×-live free-list compaction, `maybe_compact`, so a never-reopened
+> temp store no longer leaks a page per commit), with the `54P03` budget re-based onto committed **page**
+> bytes. **Shared** temp still rides the `Decoded` arm (a follow-on — its cross-session compaction
+> watermark needs the storage core-owned), which the `Decoded` residency arm keeps alive anyway (it is
+> the writer's scratch form and every uncommitted read-your-writes view). The deferred temp
+> spill-to-disk seam stays a `BlockStore` swap exactly as §3 planned.
 > Supersedes the "in-memory path deliberately
 > left separate" carve-outs in [hosts.md §7](hosts.md) and [lazy-record.md §4/§11/§12](lazy-record.md),
 > and the B-tree shape decided in [transactions.md §3](transactions.md). Absorbs the PAX

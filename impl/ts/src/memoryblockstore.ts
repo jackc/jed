@@ -1,7 +1,10 @@
 // MemoryBlockStore — the pure in-memory storage host (bplus-reshape.md B3): a growable byte buffer
 // with the same positioned-read/write and zero-fill growth semantics as a file host, but with no
-// durability work to do. This is the block-device building block for routing in-memory databases and
-// temp-table stores through the pager in the next B3 slices. Browser-clean: no node:* imports.
+// durability work to do. It is the block-device building block for both in-memory databases (B3) and,
+// since the temp-blockstore slice, per-domain session-local TEMP-table stores (newTempStorage,
+// spec/design/temp-tables.md §6) — each rides the same pager + packed-leaf read path, with
+// within-session compaction reclaiming its copy-on-write orphans (a temp store is never reopened).
+// Browser-clean: no node:* imports.
 
 import type { BlockStore } from "./blockstore.ts";
 

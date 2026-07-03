@@ -11,13 +11,18 @@
 > this doc is the *why* and the precise behavior the three cores reproduce identically
 > (CLAUDE.md §2, §8). When a decision here changes, change the grammar and this doc in the same edit.
 >
-> **Status: slices 1–2 landed (all three cores).** Slice 1 (session-local temp tables, memory-only)
-> and slice 2 (database-wide `SHARED` temp tables — the `Database`-level temp snapshot, the two-root
-> commit, `allow_shared_temp_ddl`, `shared_temp_mem`, and cross-session visibility via the concurrency
-> schedule format) are implemented byte-identically in Rust, Go, and TS. The grammar production
-> (`table_scope`, now including `SHARED`), the `54P03` code, and the budget settings landed with their
-> slices. **Slice 3 (spill-to-disk, §6) remains deferred.** This doc was written first, spec-first
-> (CLAUDE.md §11), and tracks the implemented behavior.
+> **Status: slices 1–2 landed (all three cores); session-local temp reshaped onto a MemoryBlockStore.**
+> Slice 1 (session-local temp tables) and slice 2 (database-wide `SHARED` temp tables — the
+> `Database`-level temp snapshot, the two-root commit, `allow_shared_temp_ddl`, `shared_temp_mem`, and
+> cross-session visibility via the concurrency schedule format) are implemented byte-identically in
+> Rust, Go, and TS. The grammar production (`table_scope`, now including `SHARED`), the `54P03` code,
+> and the budget settings landed with their slices. The **temp-blockstore slice** then retired the
+> original "fully-resident decoded" storage model for **session-local** temp: it now rides a per-domain
+> in-RAM `MemoryBlockStore` + pager with within-session free-list compaction, and its `54P03` budget is
+> the domain's committed **page** bytes (§6/§7) — all three cores. **Shared** temp is still
+> fully-resident decoded (its flip is a follow-on, §14). **Slice 3 (spill-to-disk, §6) remains
+> deferred** — the flip put temp on its seam, so spill is now a `BlockStore` swap. This doc was written
+> first, spec-first (CLAUDE.md §11), and tracks the implemented behavior.
 
 Temporary tables are jed's first relations whose lifetime is shorter than the database file's and
 whose data is **deliberately never durable**. They diverge from PostgreSQL in six recorded ways
@@ -193,20 +198,47 @@ boolean" `allow_ddl` narrowing (session.md §5.3) only for temp tables. The gate
 record by the directives `# allow_ddl:` / `# allow_temp_ddl:` / `# allow_shared_temp_ddl:` (§13),
 and land with their slices (`allow_temp_ddl` in slice 1, `allow_shared_temp_ddl` in slice 2).
 
-## 6. Storage model — memory-only now, spill-to-disk as a designed-in seam
+## 6. Storage model — a per-domain in-RAM MemoryBlockStore, spill-to-disk as a designed-in seam
 
-**Slice 1 is memory-only**, as requested. A temp `TableStore` is created with `paging: None` — the
-exact "fully resident in-memory B-tree" mode that pure in-memory databases already use (pager.md §1,
-pmap.rs `Child::Resident`). No new storage code: the resident B-tree, its splits, its value codec,
-its indexes, and its key encoding are the ones persistent tables use. Memory-only means a temp table
-that outgrows its budget (§7) **errors** (`54P03`) rather than spilling — the bound is hard.
+**Session-local temp rides a per-domain in-RAM `MemoryBlockStore` + pager** — the *same* storage path
+as an in-memory database (bplus-reshape.md B3), not a separate fully-resident decoded B-tree. The
+temp-blockstore slice retired the original slice-1 "`paging: None`, `Child::Resident`" mode: the
+session-local temp domain is now a private `MemoryBlockStore` seeded with the empty from-scratch image,
+read/written through the *same* pager + packed-leaf path (`newTempStorage` / `Storage::new_temp`), with
+a **pinned, unbounded pool** (a temp domain is resident by definition, §5). A temp `TableStore`
+`attach_paging`s that domain's `SharedPaging`, so its leaves demote to `OnDisk` after each commit and
+fault back through the temp pool — the **compact packed footprint** (resident memory ≈ `page_count ×
+page_size`, not the inflated `Value` tree), which is what makes the §7 byte budget honest. A temp
+commit runs `persist_temp`: the same incremental copy-on-write serialize as a file/in-memory commit,
+but **no meta slot and no `sync`** (a temp store is never reopened; its memory host has no durability
+barrier), so it makes **zero main-file writes** (D1) by construction. **Shared** temp is still the
+fully-resident decoded path (a follow-on — its cross-session compaction watermark needs the storage
+core-owned; see §14).
 
-**Spill-to-disk is the deferred follow-on, and the seam already exists** (CLAUDE.md §9
-non-foreclosure; the agents confirmed the B-tree is parameterized over a `LeafSource`/`SharedPaging`,
-not hardwired to the main file). When it lands, a temp store that crosses its **memory** budget flips
-from resident to **paged against a second, temp-only `BlockStore`** — a host-supplied temp file
-(storage.md §2, hosts.md §2), entirely separate from the main file's `BlockStore`, so the
-zero-main-file-writes invariant is preserved by construction. The temp `BlockStore` is *not* the
+**Within-session compaction** is the prerequisite the flip needed. A `MemoryBlockStore` commits
+copy-on-write, so every commit orphans its root→leaf path + the rewritten catalog; page reclamation
+was previously *reconstruct-on-open only*, and a temp store is **never reopened** — so without
+compaction it would leak a page per commit, breaking the `temp_buffers` budget the §13 untrusted-SQL
+guarantee rests on. A reclaim domain (`reclaim_within_session`, set only by temp domains) instead
+rebuilds its free-list from the **live reachable set** at commit (`maybe_compact`, reusing the same
+reachability walk the open-time free-list reconstruction runs — the catalog chain + the in-memory tree
+node pages + spillable-leaf overflow). It is **periodic** (walks only once the high-water passes ~2×
+the live count at the last compaction, so `page_count` oscillates in `[live, 2×live]` and the walk is
+amortized O(height)/commit) and **watermark-gated** (deferred while any older version is pinned — a
+read session or an open streaming cursor over the domain — so a page a live reader may still fault is
+never freed). This reclamation carries **no cross-core byte contract**: a temp store is never
+serialized (D1), so its physical page layout and reclamation are per-core (only the *logical*
+observables — rows, cost, and the `54P03` abort point — stay cross-core-identical), which is what makes
+the mechanism tractable versus the still-deferred general within-file reclamation. The main/file domain
+keeps reconstruct-on-open only (`reclaim_within_session` false) and can opt in later.
+
+**Spill-to-disk is the deferred follow-on, and the flip already put temp on the right seam.** Temp is
+now paged against a `MemoryBlockStore` through the pager, so spill is no longer a "flip from resident to
+paged" reshape — it is a **`BlockStore` swap plus a bounded pool**: replace the in-RAM
+`MemoryBlockStore` with a host-supplied temp-file `BlockStore` (storage.md §2, hosts.md §2), entirely
+separate from the main file's `BlockStore` (so the zero-main-file-writes invariant is preserved by
+construction), and give the temp pool an eviction bound instead of the pinned/unbounded one it runs
+today. The temp `BlockStore` is *not* the
 external-merge-sort spill path (spill.rs), which writes sequential run files for `ORDER BY`: a temp
 table needs random access by key (point lookups, index scans, ongoing mutation), so it reuses the
 **pager + buffer pool + B-tree** machinery (the right tool), while borrowing spill.rs's *idea* of a
@@ -232,19 +264,27 @@ cost meter (the same way the depth gate is independent of the cost gate):
   setting (shared temp data is global, so its budget must be too), charged across
   sessions. `0` = unlimited. Default modest.
 
-**Determinism is the load-bearing requirement** (CLAUDE.md §8/§10, §13). The budget is measured in
-**byte-identical on-disk record bytes** — the sum, over every temp table store *and* its index
-stores, of each stored record's on-disk encoding size (`record_size`, the exact weight the page
-B+tree splits on, byte-identical across cores by the §8 file-format contract; since v24 that is
-`key_len + Σ value_size` — a fixed-width column its slot width NULL-or-not, a variable-width value
-its tagged encoding or 0 when NULL — [../fileformat/format.md](../fileformat/format.md) *Record*,
-so the budget's *values* moved with the v24 encoding while its basis is unchanged). This is deliberately **not**
-the `work_mem` spill estimator: spill is out-of-contract (per-core, §10), so its estimate need not
-agree across cores, whereas `54P03` is **in**-contract — every core must abort at the same point. So
-"budget exceeded" is a **pure function of `(operations, budget)`**, identical across Rust/Go/TS, never
-dependent on allocator behavior, GC, or pointer width. **The check is per-statement:** after a
-statement that writes a temp table, the session's total temp footprint is summed and the statement
-aborts **`54P03 temp_storage_limit_exceeded`** if it *exceeds* `temp_buffers` (`0` ⇒ unlimited); the
+**Determinism is the load-bearing requirement** (CLAUDE.md §8/§10, §13). For the **session-local**
+domain (which rides a `MemoryBlockStore` + pager since the temp-blockstore slice, §6) the budget is the
+domain's **committed page bytes** — `page_count × page_size` off the temp domain's one pager. This is a
+deliberate **re-spec of the basis** from the original on-disk-record-bytes measure, for two reasons.
+(a) **Honesty about real RAM:** once temp is paged, its leaves demote to `OnDisk`, so a record-byte walk
+sees only the one leaf a write touches and *undercounts* a multi-leaf temp table — the §13 bound would
+never fire; the page count charges every allocated page (interior nodes, per-page headers, post-delete
+sparsity a B+tree never compacts), which is what memory actually costs. (b) **Simplicity:** one field
+per domain, no per-store sum. It stays **in-contract**: `page_count` is a pure function of
+`(operations)` via the deterministic B+tree + the deterministic at-commit compaction (whose ~2×-live
+trigger is a spec constant, §6), evaluated at commit boundaries — so `54P03` fires at the *same* point
+across Rust/Go/TS, independent of allocator/GC/pointer width. Two consequences are recorded: the
+measure uses the **logical** `page_count` (not the physical buffer length, which folds in the
+geometric-preallocation slack that is explicitly *not* a byte contract), and it reflects the state **one
+commit behind** (the check runs before the statement's own commit), so a domain already over budget
+aborts the *next* temp write — the "already over budget ⇒ further writes abort" contract. The
+**shared** temp domain is still fully-resident decoded, so its budget stays the record-byte sum until
+the shared flip lands (§14). Either basis is deliberately **not** the `work_mem` spill estimator: spill
+is out-of-contract (per-core, §10), whereas `54P03` is **in**-contract. **The check is per-statement:**
+after a statement that writes a temp table the domain footprint is measured and the statement aborts
+**`54P03 temp_storage_limit_exceeded`** if it *exceeds* `temp_buffers` (`0` ⇒ unlimited); the
 over-budget write is staged in `temp_working`, so the abort rolls it back (nothing commits). The
 **within-statement** bound is `max_cost` — a single huge temp write hits the cost ceiling first — so
 the two gates compose to bound temp resources both per-statement and across statements. Whether a temp
@@ -397,11 +437,25 @@ and memory-only per the design decision:
   file-snapshot root**, so a reader pins both atomically (no torn pin) and a writer publishes both in
   one swap. On a lone `Engine` (a session's private handle) the shared-temp snapshot is a plain field,
   visible to every session minted from it. Same constructs and 0A000 narrowings as slice 1.
-- **Slice 3 — spill-to-disk.** The temp `BlockStore` + the resident→paged flip (§6), the memory→disk
-  budget split, the disk ceiling. Out-of-contract spill file (§10).
+- **Temp-blockstore slice — session-local temp onto a MemoryBlockStore (landed).** The per-domain
+  in-RAM `MemoryBlockStore` + pinned pager (§6), within-session free-list compaction
+  (`reclaim_within_session` / `maybe_compact`, watermark-gated), the residency flip on temp leaves, and
+  the **page-based** `54P03` budget (§7). Session-local only; **shared** temp stays fully-resident
+  decoded (the follow-on below). All three cores; result/cost/byte-neutral (temp is never serialized —
+  no `format_version` bump). Per-core white-box tests (compaction bound, reader-defers gate, compact
+  footprint, zero-file-writes) for what the corpus can't reach.
+- **Slice 3 — spill-to-disk.** With temp already paged (the temp-blockstore slice), spill is the temp
+  `BlockStore` swap + a bounded temp pool (§6), the memory→disk budget split, the disk ceiling.
+  Out-of-contract spill file (§10).
 
 ## 14. Deferred / follow-ons (none foreclosed)
 
+- **Shared temp onto a MemoryBlockStore** — the shared-temp analogue of the temp-blockstore slice.
+  Deferred because the storage identity must be **core-owned** (all sessions of a `Database` share one
+  shared-temp page space) while temp DDL/commit runs at the engine level, and its compaction watermark
+  is the cross-session `live` registry (available at publish, not in the engine's `commit_tx`) — so it
+  needs the storage core-owned + the publish path decoupled (persist main only when main changed).
+  Until it lands, shared temp keeps the fully-resident decoded path and its record-byte budget (§6/§7).
 - `ON COMMIT DELETE ROWS` / `ON COMMIT DROP` (§1, D6).
 - `IF NOT EXISTS`, `CREATE TEMP TABLE … AS SELECT` (§1).
 - `FOREIGN KEY` involving temp tables (§8) — start with FKs among same-kind temp tables.

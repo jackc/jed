@@ -300,6 +300,17 @@ the deferred follow-on — *continuous* within-session reclamation paired with f
 sharing — where a just-orphaned page (last referenced by version `T`) must stay out of the
 free-list until `oldest_live_txid > T`.
 
+**Within-session reclamation has landed for temp domains (the watermark is now load-bearing there).**
+The temp-blockstore slice ([temp-tables.md §6](temp-tables.md)) routes session-local temp stores onto a
+never-reopened in-RAM `MemoryBlockStore`, which reconstruct-on-open can never reclaim — so it rebuilds
+the free-list *within the session* at commit (`maybe_compact`), and that reuse is gated on exactly this
+watermark: `oldest_live_version(new_txid) == new_txid` (no live reader or streaming cursor pins an older
+version), deferring compaction while a pin is held. This is the same coupling the general file
+follow-on will need, exercised first on a surface with **no cross-core byte contract** (a temp store is
+never serialized, so its physical page layout is per-core). The **file/in-memory main** domain keeps
+reconstruct-on-open only (`reclaim_within_session` false); the mechanism is built generically so it can
+opt in later.
+
 **The watermark lives on the `Database` core (§10).** A lone `Engine` (the single-threaded handle a
 session owns privately) has only one live snapshot at a time (`committed`, or an open tx's
 `working`), so its `oldest_live_txid` is trivially the committed version. The interesting case is the

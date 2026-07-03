@@ -119,7 +119,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ the `WITH (OLD AS o, NEW AS n)` aliasing form; `old.*`/`new.*`.
 - [x] **`UPSERT` / `ON CONFLICT`** — `INSERT … ON CONFLICT [target] { DO NOTHING | DO UPDATE SET … [WHERE …] }`; the `excluded` pseudo-relation; column-SET or `ON CONSTRAINT name` arbiter; two-phase / all-or-nothing. → [upsert.md](spec/design/upsert.md), [grammar.md §46](spec/design/grammar.md)
   - [ ] _follow-on:_ `DO UPDATE SET col = DEFAULT` (with the `UPDATE` `SET = DEFAULT` follow-on); `INSERT INTO t AS alias`; the partial-index `WHERE index_predicate` / `COLLATE`/opclass inference decorations; relaxing the DO UPDATE PK-column assignment (`0A000`) — the standalone UPDATE re-keying has landed, but the conflict-path re-key is still deferred. → [upsert.md §10](spec/design/upsert.md)
-- [ ] **Temporary tables** — `CREATE [SHARED] [TEMP|TEMPORARY] TABLE` (+ `DROP`): relations that make **zero writes to the database file** (held outside the serialized `Snapshot`, no `format_version` bump), bounded by a deterministic storage budget to keep the untrusted-SQL guarantee (§13). Namespace precludes overlaps (`42P07`); new code `54P03 temp_storage_limit_exceeded`; `allow_ddl` splits into `allow_ddl` / `allow_temp_ddl` / `allow_shared_temp_ddl`. **Landed:** slices 1–2 (session-local memory-only + database-wide shared with the two-root commit), CREATE/DROP INDEX on a temp table, serial/IDENTITY, composite-typed columns. **Open:** **slice 3 — spill-to-disk** (the resident→paged flip onto a temp `BlockStore`; the seam is already open). → [temp-tables.md](spec/design/temp-tables.md) _(size: L; deps: session model (done), storage seam (done))_
+- [ ] **Temporary tables** — `CREATE [SHARED] [TEMP|TEMPORARY] TABLE` (+ `DROP`): relations that make **zero writes to the database file** (held outside the serialized `Snapshot`, no `format_version` bump), bounded by a deterministic storage budget to keep the untrusted-SQL guarantee (§13). Namespace precludes overlaps (`42P07`); new code `54P03 temp_storage_limit_exceeded`; `allow_ddl` splits into `allow_ddl` / `allow_temp_ddl` / `allow_shared_temp_ddl`. **Landed:** slices 1–2 (session-local + database-wide shared with the two-root commit), CREATE/DROP INDEX on a temp table, serial/IDENTITY, composite-typed columns; and the **temp-blockstore slice** — **session-local** temp now rides a per-domain in-RAM `MemoryBlockStore` + pinned pager (like an in-memory database) with **within-session free-list compaction** (`maybe_compact`, watermark-gated, so a never-reopened store no longer leaks a page per commit) and a **page-based** `54P03` budget (committed `page_count × page_size`) — all 3 cores, result/cost/byte-neutral. **Open:** **shared temp onto a MemoryBlockStore** (core-owned storage + publish decoupling, temp-tables.md §14) and **slice 3 — spill-to-disk** (now a temp-`BlockStore` swap + bounded pool, the flip already put temp on the seam). → [temp-tables.md](spec/design/temp-tables.md) _(size: L; deps: session model (done), storage seam (done))_
   - [ ] _follow-on:_ `ON COMMIT DELETE ROWS`/`DROP`; `IF NOT EXISTS`; `CREATE TEMP TABLE … AS SELECT`; FKs among same-kind temp tables; temporary views. → [temp-tables.md §14](spec/design/temp-tables.md)
 
 ---
@@ -213,7 +213,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 > full-residency assumption above the storage seam.
 
 - [x] **P6.1–P6.4** — incremental COW commit = page-backed B-tree (`format_version` 2, meta-slot root swap); free-list / page reclamation (reconstruct-on-open); the logical `page_read` cost unit; the buffer pool / demand paging (bounded leaf cache, CLOCK eviction, `cache_pages` budget). → [storage.md §4/§6](spec/design/storage.md), [pager.md](spec/design/pager.md)
-  - [ ] _follow-on (where the watermark does real work):_ continuous *within-session* reclamation (return a commit's orphans immediately, paired with file-backed reader sharing); on-disk free-list persistence (claim meta offset 28 to skip the open-time reachable-set walk).
+  - [ ] _follow-on (where the watermark does real work):_ continuous *within-session* reclamation for the **file/in-memory main** domain (return a commit's orphans immediately, paired with file-backed reader sharing) — **the mechanism has landed for temp domains** (periodic ~2×-live free-list compaction, `maybe_compact`, watermark-gated; the temp-blockstore slice, temp-tables.md §6) and is built generically so the main domain can opt in via `reclaim_within_session`; on-disk free-list persistence (claim meta offset 28 to skip the open-time reachable-set walk).
 - [x] **B+tree reshape — one packed representation, one storage path** ✅ COMPLETE (`format_version` 24) — the
   B-tree → **B+tree** pivot (records leaf-only; interior pages a record-free separator skeleton →
   far higher fan-out / shallower trees), absorbing the PAX Stage-4 **per-column leaf null bitmap**
@@ -240,10 +240,11 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     is a `MemoryBlockStore` seeded with the empty from-scratch image, demand-paged through the
     same pager + Packed path as a file (pinned/unbounded pool); the eager whole-image
     `from_image` loader, the `persist` in-memory no-op, and the separate in-memory constructor
-    are deleted — one loader, one commit path (the file commit minus durability). **Deliberate
-    narrowing (recorded in bplus-reshape.md):** temp-table stores stay fully resident — they ride
-    the `Decoded` writer-scratch arm B4 keeps anyway (zero extra machinery); their store move is
-    a follow-on gated on continuous within-session reclamation (above).
+    are deleted — one loader, one commit path (the file commit minus durability). **The reshape
+    narrowed temp-table stores to fully resident; the temp-blockstore slice RETIRED that for
+    session-local temp** — it now rides a per-domain `MemoryBlockStore` + pinned pager with
+    within-session compaction (temp-tables.md §6), the store move this narrowing deferred. **Shared**
+    temp still rides the `Decoded` writer-scratch arm B4 keeps anyway (a follow-on — core-owned storage).
   - [x] **B4 — retire `Decoded` + the demand-fault backstop** ✅: the post-commit residency flip
     (committed clean leaves demote to `OnDisk` at publish and fault back Packed through the pool
     — `Decoded` survives only inside an uncommitted writer); `Unfetched` values carry their own
