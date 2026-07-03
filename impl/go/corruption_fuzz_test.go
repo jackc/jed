@@ -37,7 +37,7 @@ const corruptScanSQL = "SELECT id, body FROM t ORDER BY id"
 func seedCorruptTarget(tb testing.TB) []byte {
 	tb.Helper()
 	path := filepath.Join(tb.TempDir(), "corrupt_seed.jed")
-	db, err := create(path, DatabaseOptions{PageSize: 256})
+	db, err := create(path, databaseOptions{PageSize: 256})
 	if err != nil {
 		tb.Fatal(err)
 	}

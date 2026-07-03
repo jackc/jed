@@ -122,7 +122,7 @@ func TestScalarGistEqualGather(t *testing.T) {
 // [min,max] key blob, distinguished from a range bound by the column's catalog type) and reloads.
 func TestScalarGistFileRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gist_scalar_round_trip.jed")
-	db, err := create(path, DatabaseOptions{PageSize: 256})
+	db, err := create(path, databaseOptions{PageSize: 256})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +154,7 @@ func TestScalarGistFileRoundTrip(t *testing.T) {
 // the index survives a close/reopen and still accelerates &&/@> to the same rows.
 func TestGistFileRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gist_round_trip.jed")
-	db, err := create(path, DatabaseOptions{PageSize: 256})
+	db, err := create(path, databaseOptions{PageSize: 256})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -319,7 +319,7 @@ func TestExcludeBackingIndexCannotBeDropped(t *testing.T) {
 // enforcing the conjunction across a close/reopen.
 func TestExcludeFileRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gist_exclude_round_trip.jed")
-	db, err := create(path, DatabaseOptions{PageSize: 256})
+	db, err := create(path, databaseOptions{PageSize: 256})
 	if err != nil {
 		t.Fatal(err)
 	}

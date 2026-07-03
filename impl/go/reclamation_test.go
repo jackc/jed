@@ -37,7 +37,7 @@ func padOf(t *testing.T, db *engine, id int64) (string, bool) {
 }
 
 func reclaimSetup(t *testing.T, path string, rows int) *engine {
-	db, err := create(path, DatabaseOptions{PageSize: uint32(reclaimPS)})
+	db, err := create(path, databaseOptions{PageSize: uint32(reclaimPS)})
 	if err != nil {
 		t.Fatal(err)
 	}

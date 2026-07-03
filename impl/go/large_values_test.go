@@ -102,7 +102,7 @@ func TestExternalValueThroughPagedFileAndReclaims(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "large_values.jed")
 	big := fillerText(1500) // incompressible ≫ RECORD_MAX at ps 256 ⇒ a multi-page overflow chain
 
-	db, err := create(path, DatabaseOptions{PageSize: 256})
+	db, err := create(path, databaseOptions{PageSize: 256})
 	if err != nil {
 		t.Fatal(err)
 	}

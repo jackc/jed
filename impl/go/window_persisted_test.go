@@ -20,7 +20,7 @@ import (
 func seedPersistedWindow(t *testing.T) *engine {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "window_persisted.jed")
-	db, err := create(path, DatabaseOptions{PageSize: lazyPageSize})
+	db, err := create(path, databaseOptions{PageSize: lazyPageSize})
 	if err != nil {
 		t.Fatal(err)
 	}

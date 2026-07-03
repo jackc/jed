@@ -15,21 +15,21 @@ import (
 	"path/filepath"
 )
 
-// DatabaseOptions are the settings for a newly-created database file (spec/design/api.md §2).
+// databaseOptions are the settings for a newly-created database file (spec/design/api.md §2).
 // PageSize is fixed into the file's meta at creation and cannot change thereafter.
-type DatabaseOptions struct {
+type databaseOptions struct {
 	PageSize uint32
 }
 
-// DefaultDatabaseOptions returns the default create settings (the default page size).
-func DefaultDatabaseOptions() DatabaseOptions {
-	return DatabaseOptions{PageSize: DefaultPageSize}
+// defaultDatabaseOptions returns the default create settings (the default page size).
+func defaultDatabaseOptions() databaseOptions {
+	return databaseOptions{PageSize: DefaultPageSize}
 }
 
 // Create makes a new file-backed database at path with opts (the page size is locked into the
 // file). The path must not already exist — 58P02 otherwise. An initial empty image is written
 // durably immediately, so the file exists with its page size fixed (api.md §2).
-func create(path string, opts DatabaseOptions) (*engine, error) {
+func create(path string, opts databaseOptions) (*engine, error) {
 	if _, err := os.Stat(path); err == nil {
 		return nil, newError(DuplicateFile, "database file already exists: "+path)
 	} else if !errors.Is(err, fs.ErrNotExist) {
@@ -60,7 +60,7 @@ func create(path string, opts DatabaseOptions) (*engine, error) {
 }
 
 // OpenOptions are open-time settings for a file-backed database (spec/design/api.md §2.1). Unlike
-// DatabaseOptions (create-time, fixed into the file), these are handle settings — not stored in the
+// databaseOptions (create-time, fixed into the file), these are handle settings — not stored in the
 // file, so a different host may reopen the same file with different ones.
 type OpenOptions struct {
 	// CacheBytes is the buffer-pool budget in bytes: roughly the maximum memory the resident leaf cache

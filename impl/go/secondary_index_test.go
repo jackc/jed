@@ -256,7 +256,7 @@ func TestIndexDDLIsTransactional(t *testing.T) {
 // commits.
 func TestIndexFileBackedPagedReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "secondary_index_paged.jed")
-	db, err := create(path, DatabaseOptions{PageSize: 256})
+	db, err := create(path, databaseOptions{PageSize: 256})
 	if err != nil {
 		t.Fatal(err)
 	}

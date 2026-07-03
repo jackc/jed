@@ -8,8 +8,9 @@
 //! P5.3 concurrency); the cross-core contract is the recovery *outcome*, asserted identically in Go
 //! and TS (`crash_recovery_test.go`, `crash_recovery.test.ts`).
 
+use crate::file::DatabaseOptions;
 use crate::pager::{Fault, FaultPoint};
-use crate::{DatabaseOptions, Engine, Outcome, Result, Value, execute};
+use crate::{Engine, Outcome, Result, Value, execute};
 
 fn tmp(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(name)

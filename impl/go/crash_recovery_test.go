@@ -28,7 +28,7 @@ func armCommitFault(t *testing.T, db *engine, f commitFault) {
 // durably) and the prior committed txid.
 func seedTwoRows(t *testing.T, path string) (*engine, uint64) {
 	t.Helper()
-	db, err := create(path, DefaultDatabaseOptions())
+	db, err := create(path, defaultDatabaseOptions())
 	if err != nil {
 		t.Fatal(err)
 	}

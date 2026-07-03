@@ -36,7 +36,7 @@ func selectIDs(t *testing.T, db *engine) []int64 {
 func TestSingleRowCommitAppendsOnlyTheDirtyPath(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "incremental_small_growth.jed")
 	const ps = int64(256)
-	db, err := create(path, DatabaseOptions{PageSize: 256})
+	db, err := create(path, databaseOptions{PageSize: 256})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +103,7 @@ func TestDeleteHeavyHistoryReopensCorrectly(t *testing.T) {
 	// dirtying a different node set than inserts. Across many autocommitted inserts and deletes — each
 	// leaking pages — the live snapshot must still reopen exactly (spec/fileformat/format.md).
 	path := filepath.Join(t.TempDir(), "incremental_deletes.jed")
-	db, err := create(path, DatabaseOptions{PageSize: 256})
+	db, err := create(path, databaseOptions{PageSize: 256})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +139,7 @@ func TestDeleteHeavyHistoryReopensCorrectly(t *testing.T) {
 
 func TestMetaSlotsAlternateAcrossCommits(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "incremental_alternation.jed")
-	db, err := create(path, DefaultDatabaseOptions())
+	db, err := create(path, defaultDatabaseOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +176,7 @@ func TestMetaSlotsAlternateAcrossCommits(t *testing.T) {
 
 func TestTornLatestCommitFallsBackToPriorSnapshot(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "incremental_torn_meta.jed")
-	db, err := create(path, DefaultDatabaseOptions())
+	db, err := create(path, defaultDatabaseOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +224,7 @@ func TestCommitPreallocatesFileGrowthGeometrically(t *testing.T) {
 
 	// A from-scratch image is just the empty catalog (Create writes exactly pageCount pages, no
 	// preallocation).
-	db, err := create(path, DefaultDatabaseOptions())
+	db, err := create(path, defaultDatabaseOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -294,7 +294,7 @@ func TestCommitPreallocatesFileGrowthGeometrically(t *testing.T) {
 // 16 KiB floor. Mirrors the Rust/TS small-database tests.
 func TestSmallDatabaseFileStaysProportional(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "small.jed")
-	db, err := create(path, DatabaseOptions{PageSize: 256})
+	db, err := create(path, databaseOptions{PageSize: 256})
 	if err != nil {
 		t.Fatal(err)
 	}

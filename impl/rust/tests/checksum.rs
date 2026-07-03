@@ -10,7 +10,7 @@
 //! `XX001` or the byte-identical correct result — corruption is **caught or inert, never silent**.
 //! Mirrored in Go (checksum_test.go) and TS (tests/checksum.test.ts).
 
-use jed::{CreateOptions, Database, Outcome, Result, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Result, SessionOptions};
 
 const PAGE_SIZE: u32 = 256;
 

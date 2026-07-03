@@ -38,7 +38,7 @@ func wideFixedSeed(t *testing.T, db dbHandle) {
 
 func TestMaskedWideFixedWidthMatchesResident(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "masked_wide_fixed.jed")
-	db, err := create(path, DatabaseOptions{PageSize: DefaultPageSize})
+	db, err := create(path, databaseOptions{PageSize: DefaultPageSize})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,7 +164,7 @@ func TestMaskedColumnarMultiLevelMatchesResident(t *testing.T) {
 		}
 	}
 	path := filepath.Join(t.TempDir(), "masked_multilevel.jed")
-	db, err := create(path, DatabaseOptions{PageSize: DefaultPageSize})
+	db, err := create(path, databaseOptions{PageSize: DefaultPageSize})
 	if err != nil {
 		t.Fatal(err)
 	}

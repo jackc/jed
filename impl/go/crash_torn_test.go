@@ -36,7 +36,7 @@ func recordFatCommit(tb testing.TB) (prior []byte, ops []storeOp, priorIDs, post
 		pad      = "padpadpadpadpadpadpadpadpadpadpadpad" // ~36 chars → ~3 rows/leaf at ps 256
 	)
 	path := filepath.Join(tb.TempDir(), "torn_seed.jed")
-	db, err := create(path, DatabaseOptions{PageSize: pageSize})
+	db, err := create(path, databaseOptions{PageSize: pageSize})
 	if err != nil {
 		tb.Fatal(err)
 	}

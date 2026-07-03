@@ -94,7 +94,7 @@ pub use executor::{
 // conformance bin, the Ruby/WASM wraps) drives those. This crate-private re-export keeps `crate::
 // Engine` resolvable for the engine's own modules + doc links; nothing outside the crate can name it.
 pub(crate) use executor::Engine;
-pub use file::{CreateOptions, DatabaseOptions, OpenOptions};
+pub use file::{CreateOptions, OpenOptions};
 pub use privileges::{Privilege, PrivilegeSet, Privileges};
 pub use seam::{ClockSource, RandomSource, advancing_clock, fixed_clock, seeded_random_source};
 pub use shared::{Database, Session};

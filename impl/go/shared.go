@@ -330,7 +330,7 @@ func CreateDatabase(opts CreateOptions) (*Database, error) {
 	if opts.Path == "" {
 		return newInMemoryWithPageSize(pageSize), nil
 	}
-	e, err := create(opts.Path, DatabaseOptions{PageSize: pageSize})
+	e, err := create(opts.Path, databaseOptions{PageSize: pageSize})
 	if err != nil {
 		return nil, err
 	}

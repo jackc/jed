@@ -69,7 +69,7 @@ func corruptOverflowPayloads(t *testing.T, path string) {
 // touching the spilled column fails XX001 — read-on-touch, physically.
 func TestLazyChainsAreReadOnlyWhenTouched(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "lazy_touch.jed")
-	db, err := create(path, DatabaseOptions{PageSize: lazyPageSize})
+	db, err := create(path, databaseOptions{PageSize: lazyPageSize})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +118,7 @@ func TestLazyChainsAreReadOnlyWhenTouched(t *testing.T) {
 // All three lazy forms materialize exactly through the paged path (resolution correctness).
 func TestLazyValuesRoundTripExactly(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "lazy_roundtrip.jed")
-	db, err := create(path, DatabaseOptions{PageSize: lazyPageSize})
+	db, err := create(path, databaseOptions{PageSize: lazyPageSize})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +152,7 @@ func TestLazyValuesRoundTripExactly(t *testing.T) {
 func TestLazyUpdateOfOtherColumnsPreservesSpilledValues(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "lazy_update.jed")
 	big := fillerText(600)
-	db, err := create(path, DatabaseOptions{PageSize: lazyPageSize})
+	db, err := create(path, databaseOptions{PageSize: lazyPageSize})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +194,7 @@ func TestLazyPagedAndResidentCostsMatch(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "lazy_cost.jed")
 	mem := newInMemoryWithPageSize(lazyPageSize).Session(SessionOptions{})
 	lazySeed(t, mem)
-	db, err := create(path, DatabaseOptions{PageSize: lazyPageSize})
+	db, err := create(path, databaseOptions{PageSize: lazyPageSize})
 	if err != nil {
 		t.Fatal(err)
 	}

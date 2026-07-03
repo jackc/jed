@@ -734,7 +734,7 @@ export { PreparedStatement, Rows, Transaction } from "./api.ts";
 export { Statement } from "./ergonomic.ts";
 export type { JsParam, JsValue, Row, RunResult } from "./ergonomic.ts";
 export { createDatabase, openDatabase } from "./file.ts";
-export type { CreateOptions, DatabaseOptions, OpenOptions } from "./file.ts";
+export type { CreateOptions, OpenOptions } from "./file.ts";
 export type { CollationInfo, Outcome, SessionOptions, TxStatus } from "./executor.ts";
 export { intValue, nullValue, render } from "./value.ts";
 export type { ThreeValued, Value } from "./value.ts";

@@ -18,7 +18,7 @@ func TestDemandPagingScansCorrectlyWithBoundedResidency(t *testing.T) {
 	const cap = 3
 
 	// Build a multi-level tree at a small page size, so a few hundred rows span many pages.
-	db, err := create(path, DatabaseOptions{PageSize: 256})
+	db, err := create(path, databaseOptions{PageSize: 256})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +128,7 @@ func TestMemoryBudgetBoundsResidencyUnderLookups(t *testing.T) {
 	const n = 2000
 	const cap = 4
 
-	db, err := create(path, DatabaseOptions{PageSize: 256})
+	db, err := create(path, databaseOptions{PageSize: 256})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +188,7 @@ func TestTinyBudgetKeepsOneLeafResident(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "tiny.jed")
 	const n = 400
 
-	db, err := create(path, DatabaseOptions{PageSize: 256})
+	db, err := create(path, databaseOptions{PageSize: 256})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -237,7 +237,7 @@ func TestTinyBudgetKeepsOneLeafResident(t *testing.T) {
 // multi-gigabyte allocation.
 func TestCreateRejectsOversizedPageSize(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "huge.jed")
-	_, err := create(path, DatabaseOptions{PageSize: 1 << 20})
+	_, err := create(path, databaseOptions{PageSize: 1 << 20})
 	ee, ok := err.(*EngineError)
 	if !ok || ee.Code() != "0A000" {
 		t.Fatalf("want 0A000 feature_not_supported, got %v", err)
@@ -269,7 +269,7 @@ func TestReadRejectsOversizedPageSize(t *testing.T) {
 func TestRejectsNonPowerOfTwoPageSize(t *testing.T) {
 	// Create: 1000 is within [256, 65536] but not a power of two.
 	path := filepath.Join(t.TempDir(), "pow2.jed")
-	_, err := create(path, DatabaseOptions{PageSize: 1000})
+	_, err := create(path, databaseOptions{PageSize: 1000})
 	ee, ok := err.(*EngineError)
 	if !ok || ee.Code() != "0A000" {
 		t.Fatalf("want 0A000 feature_not_supported, got %v", err)
@@ -293,7 +293,7 @@ func TestRejectsNonPowerOfTwoPageSize(t *testing.T) {
 // of two but below minPageSize — is rejected on Create.
 func TestRejectsPageSizeBelowFloor(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "tiny.jed")
-	_, err := create(path, DatabaseOptions{PageSize: 128})
+	_, err := create(path, databaseOptions{PageSize: 128})
 	ee, ok := err.(*EngineError)
 	if !ok || ee.Code() != "0A000" {
 		t.Fatalf("want 0A000 feature_not_supported, got %v", err)
