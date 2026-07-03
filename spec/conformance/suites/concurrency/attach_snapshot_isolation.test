@@ -1,0 +1,103 @@
+# Snapshot isolation + the reader-liveness watermark across a concurrent writer, but over an
+# ATTACHED in-memory database (spec/design/attached-databases.md §5/§6, concurrency-testing.md §4,
+# Slice 1b-3). This pulls attachments — Slice 1b's N-way routing — inside the §2 concurrency
+# differential net: previously only the single-handle read/write/commit path was corpus-tested, and
+# the cross-session pinning of `roots.attached` was correct only by construction.
+#
+# `# attach: adb` attaches a fresh empty read-write in-memory database `adb` to the shared handle
+# (host-API, never SQL) before the schedule runs; every session opened below sees it, because a
+# reader pins the WHOLE roots — `committed` (main) plus `attached` (the map of attachment snapshots)
+# — in one lock-free Load (§5). The schedule then proves, over the attachment, exactly what
+# snapshot_isolation.test proves over main:
+#   - a read session pins ONE cross-database snapshot for its life and is unaffected by a later
+#     commit to the attachment (main and the attachment move together — a reader never sees main at
+#     version N but the attachment at version N-1, or vice versa);
+#   - an attachment-only commit still advances the shared version and is held back by a live reader,
+#     so `expect version` / `expect oldest_live` track attachment writes exactly like main writes
+#     (every commit bumps committed.txid — the N-root commit publishes one atomic roots swap);
+#   - a write through a read handle to an attachment table is 25006 and does not poison the handle.
+#
+# A core that has not wired the `# attach:` directive into its concurrency runner does not declare
+# harness.attach and SKIPS this file before parsing any record (the capability gate).
+# format: concurrency
+# requires: txn.shared, txn.read_handle, txn.watermark, attach.in_memory, harness.attach, ddl.create_table, ddl.primary_key, dml.insert, query.select, query.join_inner, query.table_alias, query.qualified_column, query.order_by, types.i32
+# attach: adb
+
+# --- seed one row in main AND one in the attachment, committed together as version 1 -------------
+# The N-root commit publishes main (m) and the attachment (adb.t) in ONE atomic roots swap.
+open w write
+on w statement ok
+CREATE TABLE m (id i32 PRIMARY KEY)
+on w statement ok
+CREATE TABLE adb.t (id i32 PRIMARY KEY)
+on w statement ok
+INSERT INTO m VALUES (1)
+on w statement ok
+INSERT INTO adb.t VALUES (1)
+commit w
+expect version 1
+
+# --- pin a reader at version 1; it holds the watermark there ------------------------------------
+open r read
+expect oldest_live 1
+
+# --- a second writer commits version 2 (a new row in BOTH main and the attachment) while r stays
+#     pinned. An attachment write advances the shared version just like a main write. --------------
+open w2 write
+on w2 statement ok
+INSERT INTO m VALUES (2)
+on w2 statement ok
+INSERT INTO adb.t VALUES (2)
+commit w2
+expect version 2
+expect oldest_live 1
+
+# the pinned reader still sees ONLY its snapshot (version 1: one row) in the attachment ...
+on r query I rowsort
+SELECT id FROM adb.t
+----
+1
+
+# ... and in main — the two databases are pinned TOGETHER (a consistent cross-database snapshot) ...
+on r query I rowsort
+SELECT id FROM m
+----
+1
+
+# ... proven by a JOIN across main and the attachment under the one pinned snapshot: only {1}.
+on r query I rowsort
+SELECT m.id FROM m JOIN adb.t AS a ON m.id = a.id
+----
+1
+
+# a write through the read handle to an ATTACHMENT table is rejected (25006) and does not poison it
+on r statement error 25006
+INSERT INTO adb.t VALUES (99)
+
+# r is still usable after the rejected write — still the pinned cross-database snapshot
+on r query I rowsort
+SELECT id FROM adb.t
+----
+1
+
+# a fresh reader sees both rows in the attachment (version 2) and the full cross-database join
+open r2 read
+on r2 query I rowsort
+SELECT id FROM adb.t
+----
+1
+2
+on r2 query I rowsort
+SELECT m.id FROM m JOIN adb.t AS a ON m.id = a.id
+----
+1
+2
+
+# --- closing the old reader lets the watermark advance ------------------------------------------
+close r
+expect oldest_live 2
+close r2
+
+# with no live readers, the watermark is the committed version
+expect oldest_live 2
+expect version 2

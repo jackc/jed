@@ -63,7 +63,7 @@ func TestConcurrencySchedulesThreaded(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse %s: %v", filepath.Base(file), err)
 		}
-		if err := runScheduleThreaded(steps); err != nil {
+		if err := runScheduleThreaded(steps, parseAttaches(text)); err != nil {
 			t.Fatalf("threaded %s: %v", filepath.Base(file), err)
 		}
 		ran++
@@ -84,7 +84,7 @@ func TestThreadedTeardownWithBlockedWriter(t *testing.T) {
 		{kind: "open", sid: "w2", mode: "write", blocks: true},
 	}
 	done := make(chan error, 1)
-	go func() { done <- runScheduleThreaded(steps) }()
+	go func() { done <- runScheduleThreaded(steps, nil) }()
 	select {
 	case err := <-done:
 		if err == nil || !strings.Contains(err.Error(), "w1") || !strings.Contains(err.Error(), "w2") {

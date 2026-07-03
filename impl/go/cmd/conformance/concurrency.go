@@ -39,6 +39,39 @@ func memDB() *jed.Database {
 	return db
 }
 
+// scheduleDB builds the shared handle a schedule runs against, attaching a fresh empty read-write
+// in-memory database for each name (spec/design/attached-databases.md §6, the file-level `# attach:`
+// directive — the same host-API action the sequential runner applies, gated by harness.attach). The
+// attachments are Database-scoped, so every session the schedule opens sees them (a reader pins the
+// whole roots — main + attached — in one lock-free Load, §5); this is what lets a schedule assert
+// cross-database snapshot isolation and the watermark over an attachment. Attaching is host-API, never
+// SQL, so it happens here before any session opens, not as a schedule step.
+func scheduleDB(attaches []string) *jed.Database {
+	db := memDB()
+	for _, name := range attaches {
+		if err := db.Attach(name, jed.AttachMemory(), false); err != nil {
+			panic("concurrency # attach: " + name + ": " + err.Error())
+		}
+	}
+	return db
+}
+
+// parseAttaches collects every file-level `# attach: <name>` directive in a concurrency file, in
+// order — the databases to attach to the shared handle before the schedule runs.
+func parseAttaches(text string) []string {
+	var names []string
+	for _, line := range strings.Split(text, "\n") {
+		t := strings.TrimSpace(line)
+		if !strings.HasPrefix(t, "#") {
+			continue
+		}
+		if name, ok := parseAttachDirective(t); ok {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
 // isConcurrencyFormat reports whether text opts into the schedule format via a
 // `# format: concurrency` header line. Any other (or absent) format is the sequential runner.
 func isConcurrencyFormat(text string) bool {
@@ -305,7 +338,7 @@ func runConcurrencyFile(text string) error {
 	if err != nil {
 		return err
 	}
-	return runScheduleSequential(steps)
+	return runScheduleSequential(steps, parseAttaches(text))
 }
 
 // runScheduleSequential executes a schedule on a single goroutine: the canonical transcript.
@@ -316,8 +349,8 @@ func runConcurrencyFile(text string) error {
 // instant the holder commits/rolls back. That is the equivalent serial order, identical to what a
 // threaded run consistent with the schedule must produce. `gateHolder` is the live writer's sid (the
 // single-writer gate), and `blockedSid` is the at-most-one writer queued on it.
-func runScheduleSequential(steps []cStep) error {
-	db := memDB()
+func runScheduleSequential(steps []cStep, attaches []string) error {
+	db := scheduleDB(attaches)
 	sessions := map[string]*cSession{}
 	gateHolder := "" // the live writer holding the single-writer gate, "" if free
 	blockedSid := "" // a writer queued on the gate (Layer 2 `blocks`), "" if none
@@ -517,8 +550,8 @@ type cDriver struct {
 // `blocks` annotation additionally drives the REAL blocking acquire: the queued writer's goroutine
 // stays parked inside Write() on the held gate (its open ack deferred) until the holder releases it,
 // the one concurrency path the sequential walk never exercises (§5).
-func runScheduleThreaded(steps []cStep) error {
-	d := &cDriver{db: memDB(), workers: map[string]*cWorker{}}
+func runScheduleThreaded(steps []cStep, attaches []string) error {
+	d := &cDriver{db: scheduleDB(attaches), workers: map[string]*cWorker{}}
 	var result error
 	for _, st := range steps {
 		if err := d.step(st); err != nil {
