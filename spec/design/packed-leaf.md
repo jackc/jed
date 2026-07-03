@@ -8,9 +8,13 @@
 > fixed-width columns a null bitmap + dense untagged slots, variable columns end-offset
 > directories with zero-span NULLs — [../fileformat/format.md](../fileformat/format.md) *Leaf
 > node*), which is exactly the dense stride §11's vectorized tracks want. (c) The remaining
-> Decoded-residency cases (in-memory / dirty leaves) and the two-form
-> `rowAtMaybeMasked`/`rowAtMasked` read seam retire in reshape slices B3/B4 (Decoded survives
-> only as the writer's transient materialize–mutate–repack buffer). Body text below is kept as
+> Decoded-residency cases and the two-form `rowAtMaybeMasked`/`rowAtMasked` read seam **have
+> retired** (reshape B3/B4): in-memory databases page from a `MemoryBlockStore`, a commit demotes
+> its clean leaves back to pool-faulted `OnDisk` references, the masked-reconstruction lanes are
+> deleted (reconstruction is uniformly lazy; a touched-set miss resolves on demand — the
+> demand-fault backstop), and `Decoded` survives only as the writer's transient
+> materialize–mutate–repack buffer plus the deliberately-resident temp-table stores
+> ([bplus-reshape.md](bplus-reshape.md) status note). Body text below is kept as
 > the design rationale; where it says "interior nodes are always Decoded" or "B-tree stores
 > records in interior nodes too", read it as v23 history.
 >
