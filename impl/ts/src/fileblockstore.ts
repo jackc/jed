@@ -1,11 +1,10 @@
 // FileBlockStore — the Node `fs` storage host (spec/design/hosts.md §4): an open fd with positioned
 // readSync/writeSync (no shared cursor), a data-only fdatasync barrier, and a durable-grow zero-write +
-// full fsync. The one host built by the BlockStore-extraction slice; OPFS (opfsblockstore.ts) /
-// encrypting / replicating / in-memory are the catalog's other rows. Kept in its own module (separate
-// from the browser-clean BlockStore interface in blockstore.ts) so the `node:fs` import never reaches a
-// browser bundle — the same interface/impl split as spill.ts / spillfile.ts. fs calls throw raw Node
-// errors here exactly as the inlined pager did before the extraction; the host program layer (file.ts)
-// maps them at its boundaries.
+// full fsync. Kept in its own module (separate from the browser-clean BlockStore interface in
+// blockstore.ts, OpfsBlockStore in opfsblockstore.ts, and MemoryBlockStore in memoryblockstore.ts) so
+// the `node:fs` import never reaches a browser bundle — the same interface/impl split as spill.ts /
+// spillfile.ts. fs calls throw raw Node errors here exactly as the inlined pager did before the
+// extraction; the host program layer (file.ts) maps them at its boundaries.
 
 import {
   closeSync,

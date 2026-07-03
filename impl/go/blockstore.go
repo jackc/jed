@@ -6,14 +6,17 @@ package jed
 // above this seam). Keeping the host surface this small is what lets every host — os.File, OPFS, an
 // encrypting/replicating wrap, even a pure in-memory slice — be a thin adapter that cannot drift.
 //
-// This slice extracts the seam and ships the one file host (fileBlockStore); the in-memory, OPFS,
-// encrypting, and replicating hosts are the catalog's other rows (hosts.md §4) and are NOT built here.
-// The extraction is a pure refactor: the file-specific bits (open, the data-only fdatasync, the
-// durable-grow Sync) move out of pager.go into fileBlockStore, while the policy — page math, the 1 MiB
-// preallocation chunk, which barrier each step needs, the fault-injection seam — stays in the
-// host-independent pager (hosts.md §3). No behavior or byte change.
+// This seam first shipped the file host (fileBlockStore); the B+tree reshape's B3 slice adds the pure
+// memoryBlockStore host so later work can route in-memory and temp stores through the same pager. The
+// file-specific bits (open, the data-only fdatasync, the durable-grow Sync) live in fileBlockStore,
+// while the policy — page math, the 1 MiB preallocation chunk, which barrier each step needs, the
+// fault-injection seam — stays in the host-independent pager (hosts.md §3).
 
-import "os"
+import (
+	"errors"
+	"io"
+	"os"
+)
 
 // blockStore is the byte backing for one database file (spec/design/hosts.md §1/§2). The pager
 // converts a page index to a byte offset (off = index × pageSize) and drives this device; the host
@@ -42,8 +45,7 @@ type blockStore interface {
 
 // fileBlockStore is the file storage host (spec/design/hosts.md §4): an *os.File with positioned
 // ReadAt/WriteAt (pread/pwrite — no shared cursor), a data-only fdatasync barrier (datasync, pure Go,
-// no cgo — CLAUDE.md §2), and a durable-grow zero-write + full Sync. The one host built by the
-// BlockStore-extraction slice; OPFS / encrypting / replicating / in-memory are the catalog's other rows.
+// no cgo — CLAUDE.md §2), and a durable-grow zero-write + full Sync.
 type fileBlockStore struct {
 	f *os.File
 }
@@ -110,3 +112,57 @@ func (s *fileBlockStore) setSize(n int64) error {
 func (s *fileBlockStore) close() error {
 	return s.f.Close()
 }
+
+// memoryBlockStore is the pure in-memory storage host (bplus-reshape.md B3): a growable byte slice
+// with the same positioned-read/write and zero-fill growth semantics as a file host, but with no
+// durability work to do. This is the block-device building block for routing in-memory databases and
+// temp-table stores through the pager in the next B3 slices.
+type memoryBlockStore struct {
+	buf []byte
+}
+
+// newMemoryBlockStore copies image so the caller's buffer cannot observe later writes.
+func newMemoryBlockStore(image []byte) *memoryBlockStore {
+	buf := make([]byte, len(image))
+	copy(buf, image)
+	return &memoryBlockStore{buf: buf}
+}
+
+func (s *memoryBlockStore) readAt(off int64, length int) ([]byte, error) {
+	if off < 0 || length < 0 || off+int64(length) > int64(len(s.buf)) {
+		return nil, ioError(io.ErrUnexpectedEOF)
+	}
+	out := make([]byte, length)
+	copy(out, s.buf[off:off+int64(length)])
+	return out, nil
+}
+
+func (s *memoryBlockStore) writeAt(off int64, p []byte) error {
+	if off < 0 {
+		return ioError(errors.New("negative offset"))
+	}
+	end := off + int64(len(p))
+	if end > int64(len(s.buf)) {
+		s.buf = append(s.buf, make([]byte, end-int64(len(s.buf)))...)
+	}
+	copy(s.buf[off:end], p)
+	return nil
+}
+
+func (s *memoryBlockStore) sync() error { return nil }
+
+func (s *memoryBlockStore) size() (int64, error) { return int64(len(s.buf)), nil }
+
+func (s *memoryBlockStore) setSize(n int64) error {
+	if n < 0 {
+		return ioError(errors.New("negative size"))
+	}
+	if n > int64(len(s.buf)) {
+		s.buf = append(s.buf, make([]byte, n-int64(len(s.buf)))...)
+	} else if n < int64(len(s.buf)) {
+		s.buf = s.buf[:n]
+	}
+	return nil
+}
+
+func (s *memoryBlockStore) close() error { return nil }

@@ -332,12 +332,12 @@ representation/residency changes ride byte-invisibly on top:
   (B1), delete what the reshape obsoleted: interior nodes are never packed (they are the
   keys-only skeleton), so the interior-`Decoded`-with-records case and its share of the read
   seam go away. *No further format bump.*
-- **B3 — `MemoryBlockStore` + pinned pool.** In-memory leaves become Packed through the pager;
-  move the **temp-table stores** (session-local + shared) onto the same store (per-store vs.
-  per-session granularity decided here; the record-byte `temp_buffers` basis carries over
-  unchanged — §5); unify `commit`; delete the `persist` no-op / `resident_leaves == 0` /
-  whole-image special cases; decide the in-memory `cache_bytes` semantics (§5). *No format
-  bump.*
+- **B3 — `MemoryBlockStore` + pinned pool.** ⏳ **B3a landed:** the pure memory `BlockStore` host exists
+  in all three cores. Next, in-memory leaves become Packed through the pager; move the
+  **temp-table stores** (session-local + shared) onto the same store (per-store vs. per-session
+  granularity decided here; the record-byte `temp_buffers` basis carries over unchanged — §5); unify
+  `commit`; delete the `persist` no-op / `resident_leaves == 0` / whole-image special cases; decide the
+  in-memory `cache_bytes` semantics (§5). *No format bump.*
 - **B4 — retire `Decoded` + the demand-fault backstop.** Confine `Decoded` to the write-scratch
   buffer; delete the `rowAtMaybeMasked`/`rowAtMasked` two-form seam; add the resolve-on-demand backstop to
   the single Packed read path (correctness no longer rides on the static touched set). *No format

@@ -33,9 +33,10 @@ pager.
 > which now holds just the browser-clean interface, for the OPFS work below), with the policy — page math, the 1 MiB preallocation chunk,
 > the barrier choice, the fault-injection seam — staying in the host-independent `Pager`. It was a
 > pure refactor: the goldens, the conformance corpus, and the crash-recovery suites are unchanged.
-> The **in-memory path remains a separate, fully-resident code path** (no `BlockStore`) — unifying it
-> onto a byte-buffer `BlockStore` would change observable residency/commit semantics, so it is *not*
-> a behavior-preserving refactor and stays deferred (§4 in-memory row). The **OPFS host has since
+> The pure **`MemoryBlockStore` host has landed** in all three cores as the first B3 building block, but
+> the **in-memory database path remains a separate, fully-resident code path** for now — unifying it
+> onto that byte-buffer `BlockStore` changes observable residency/commit semantics and is the next B3
+> wiring slice (§4 in-memory row). The **OPFS host has since
 > landed in the TS core** (§5): an `OpfsBlockStore` over `FileSystemSyncAccessHandle`, validated by
 > file-host byte parity against the Node `fs` host (the §8 cross-core round-trip, run in Node with a
 > fake sync handle), plus a Web-Worker packaging + async client and a Vite/Playwright e2e harness.
@@ -176,7 +177,7 @@ guard, since `read_at` surfaces a short read as `58030` — same `XX001` outcome
 
 | host | backing | status | notes |
 |---|---|---|---|
-| **in-memory** | a `Vec`/slice of bytes (or pages) | ✅ built (**separate path**) | the natural fit for the RAM-sized target (CLAUDE.md §9) and the default for tests/conformance — no filesystem, fully deterministic. `sync()` is a no-op; `commit` is a no-op success (api.md §2.2). Stores its data as a **decoded tree** (no `BlockStore`, fully resident, `persist` a no-op): routing it through a byte-buffer `BlockStore` + pager + pool would change observable residency/commit semantics, so unifying it onto the seam is **deferred** — not a behavior-preserving refactor (§7). |
+| **in-memory** | a `Vec`/slice of bytes (or pages) | ✅ `MemoryBlockStore` host built; engine wiring open | the natural fit for the RAM-sized target (CLAUDE.md §9) and the default for tests/conformance — no filesystem, fully deterministic. `sync()` is a no-op at the host seam. The current engine path still stores data as a **decoded tree** (`persist` a no-op, `resident_leaves() == 0`); B3 next routes this through `MemoryBlockStore` + pager + pinned pool, changing those residency/commit semantics deliberately under [bplus-reshape.md](bplus-reshape.md). |
 | **Rust file** | `std::fs::File`, positioned read/write + `fsync`/`fdatasync` | ✅ built (`FileBlockStore`, `blockstore.rs`) | pure `std::fs`, no dependency, memory-safe (CLAUDE.md §13). Cross-platform `seek`+read/write (no Unix-only `pread`). Closes the file on drop (RAII). |
 | **Go file** | `os.File` `ReadAt`/`WriteAt`/`Truncate`/`Sync` | ✅ built (`fileBlockStore`, `blockstore.go`) | pure Go — **no cgo, no FFI** (CLAUDE.md §2). `fdatasync` via `syscall.Fdatasync` behind a `linux` build tag (`blockstore_datasync_linux.go`), full `Sync` fallback elsewhere. |
 | **Node `fs`** | `openSync`/positioned `writeSync`/`fsyncSync` | ✅ built (`FileBlockStore`, `impl/ts/src/fileblockstore.ts`) | the TS core's durable backing; the `node:fs` impl is isolated in `fileblockstore.ts` (the browser-clean `BlockStore` interface is `blockstore.ts`; the host program layer is `file.ts`) precisely so OPFS is a sibling, not a reshape — and so `node:fs` never reaches a browser bundle. |
@@ -300,12 +301,11 @@ as it crosses. See the two docs for the full designs.
   the host-independent `Pager`. A pure refactor —
   the goldens, the conformance corpus, the crash-recovery suites, and the NoREC sweep are all
   unchanged. Foundation for every host below.
-  - **In-memory path — deliberately left separate** (a documented divergence from this item's
-    original "unify the in-memory path onto it" wording). In all three cores an in-memory database
-    holds its data as a decoded tree (no `BlockStore`, `persist` a no-op, fully resident,
-    `resident_leaves() == 0`); routing it through a byte-buffer `BlockStore` + pager + pool would
-    change observable residency and commit/no-op semantics, so it is **not** a behavior-preserving
-    refactor. Unifying it stays deferred (the §4 in-memory row's eventual shape).
+  - **In-memory path — MemoryBlockStore host landed, engine routing still open.** The byte-buffer host
+    exists in all three cores (`MemoryBlockStore` / `memoryBlockStore`) and is covered by direct
+    contract tests. The database path still holds its data as a decoded tree (`persist` a no-op, fully
+    resident, `resident_leaves() == 0`); routing it through `MemoryBlockStore` + pager + pool is the
+    behavior-changing B3 follow-on.
 - **OPFS host** — ✅ **landed** in the TS core (§5): `OpfsBlockStore`, a thin adapter against the
   extracted seam (not a second pager), plus the Web-Worker packaging + async client. Validated by
   file-host byte parity (Node parity test) + a gated real-browser e2e. TS-only.

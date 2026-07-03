@@ -19,65 +19,15 @@ package jed
 import (
 	"errors"
 	"fmt"
-	"io"
 	"time"
 )
 
-// sliceStore is an in-memory blockStore backed by a growable byte slice — a faithful, fast stand-in
-// for fileBlockStore that mirrors its observable semantics (a short read past size() is a host
-// error; writeAt/setSize grow with zero fill). No fsync to do, so sync() is a no-op. Used both to
+// sliceStore is the test-facing name for the production memoryBlockStore host. It is used both to
 // drive a recorded commit and to open a reconstructed crash/corruption image without touching disk.
-type sliceStore struct {
-	buf []byte
-}
+type sliceStore = memoryBlockStore
 
 // newSliceStore copies image so the caller's buffer stays pristine across a replay sweep.
-func newSliceStore(image []byte) *sliceStore {
-	b := make([]byte, len(image))
-	copy(b, image)
-	return &sliceStore{buf: b}
-}
-
-func (s *sliceStore) readAt(off int64, length int) ([]byte, error) {
-	// Mirror fileBlockStore.readAt / os.File.ReadAt: any short read (past the current length) is an
-	// error, never a half-filled buffer — so a truncated image fails closed (58030) on the missing page.
-	if off < 0 || length < 0 || off+int64(length) > int64(len(s.buf)) {
-		return nil, ioError(io.ErrUnexpectedEOF)
-	}
-	out := make([]byte, length)
-	copy(out, s.buf[off:off+int64(length)])
-	return out, nil
-}
-
-func (s *sliceStore) writeAt(off int64, p []byte) error {
-	if off < 0 {
-		return ioError(errors.New("negative offset"))
-	}
-	end := off + int64(len(p))
-	if end > int64(len(s.buf)) { // pwrite past EOF grows the file (os.File semantics)
-		s.buf = append(s.buf, make([]byte, end-int64(len(s.buf)))...)
-	}
-	copy(s.buf[off:end], p)
-	return nil
-}
-
-func (s *sliceStore) sync() error { return nil } // in-memory: nothing to flush
-
-func (s *sliceStore) size() (int64, error) { return int64(len(s.buf)), nil }
-
-func (s *sliceStore) setSize(n int64) error {
-	if n < 0 {
-		return ioError(errors.New("negative size"))
-	}
-	if n > int64(len(s.buf)) {
-		s.buf = append(s.buf, make([]byte, n-int64(len(s.buf)))...)
-	} else if n < int64(len(s.buf)) {
-		s.buf = s.buf[:n]
-	}
-	return nil
-}
-
-func (s *sliceStore) close() error { return nil }
+func newSliceStore(image []byte) *sliceStore { return newMemoryBlockStore(image) }
 
 // storeOpKind tags the three mutating operations a commit issues at the blockStore seam.
 type storeOpKind int

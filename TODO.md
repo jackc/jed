@@ -238,6 +238,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     (`max_kv`), and the interleaved separator-emission scan logic are gone from all three cores.
   - [ ] **B3 — `MemoryBlockStore` + pinned pool** (in-memory + temp-table stores through the
     pager; unify commit; delete the `persist` no-op / `resident_leaves == 0` special cases).
+    _Landed so far:_ the [`MemoryBlockStore`] host itself (all three cores + hosts.md catalog
+    rows — the block-device building block, below the page format).
   - [ ] **B4 — retire `Decoded` + the demand-fault backstop** (Decoded = write-scratch only;
     collapse the two-form read seam; resolve-on-demand backstop under the static-touched-set
     cost basis).
