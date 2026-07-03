@@ -84,7 +84,7 @@ into an **N-root** commit (§5).
 ```
 Database handle = { attachments: Map<name → Attachment>,   # main + temp + shared + any host-attached
                     write_lock, live_snapshots, synchronous, … }   # unchanged (transactions.md §2)
-Attachment      = { name, kind: file | memory,
+Attachment      = { name, kind: file | memory, mode: read_only | read_write,
                     blockstore, pager, committed: ref<Snapshot>, durable: bool }
 Transaction     = { per-attachment working/read snapshots, base_txids, … }
 ```
@@ -118,16 +118,18 @@ free because `table_ref` is currently unqualified:
   position** in v1 (no 3-part `reports.sales.amount`) — the same rule by which the qualifier never
   appears in a column's output name (grammar.md §15). 3-part column refs are a deferred ergonomic
   follow-on (§14), not a semantic gap.
-- **No implicit search into explicit attachments — no silent shadowing.** An unqualified name resolves
-  **only** in implicit scope (`main` + temp), under the existing **preclude-overlap** rule
-  (temp-tables.md §3, `42P07`). Two attached databases may each contain a `users` — that is *expected*
-  and is **not** an error, because you always reach an explicit attachment by qualifier, so the two
-  never compete. This is a deliberate divergence from SQLite, which searches attachments in attach
-  order and lets an earlier attachment **silently shadow** a later one (§12, D-ATTACH-1). jed's rule —
-  *qualify to reach an attachment; unqualified means the local database* — is more explicit,
-  determinism-friendly (no attach-order dependence in name resolution), and consistent with jed's
-  standing "preclude overlaps, no silent shadowing" posture. An opt-in search path is a follow-on
-  (§14).
+- **No implicit search into explicit attachments — no silent shadowing, and no search path, ever.** An
+  unqualified name resolves **only** in implicit scope (`main` + temp), under the existing
+  **preclude-overlap** rule (temp-tables.md §3, `42P07`). Two attached databases may each contain a
+  `users` — that is *expected* and is **not** an error, because you always reach an explicit attachment
+  by qualifier, so the two never compete. This is a deliberate divergence from SQLite, which searches
+  attachments in attach order and lets an earlier attachment **silently shadow** a later one (§12,
+  D-ATTACH-2). jed's rule — *qualify to reach an attachment; unqualified means the local database* — is
+  more explicit, determinism-friendly (no attach-order dependence in name resolution), and consistent
+  with jed's standing "preclude overlaps, no silent shadowing" posture. jed has **no `search_path`** for
+  attachments and **none is planned** — a query reaches an attached database by qualifier, full stop.
+  This is a firm non-goal, not a deferral: adding an ordered search list would reintroduce exactly the
+  order-dependent, silently-shadowing resolution this rule exists to avoid.
 - **Cross-database self-collision** is the ordinary duplicate-label case: `FROM main.t JOIN reports.t`
   gives **two relations both labeled `t`** → **`42712`** (`duplicate_alias`, grammar.md §15), resolved
   by aliasing one (`FROM main.t a JOIN reports.t b`). No new rule.
@@ -142,12 +144,22 @@ the sanctioned host-supplied inputs (storage bytes, unicode data, entropy/clock)
 **host-API seams, never SQL** (hosts.md §4, session.md §5.3). Attaching a file is exactly such an act,
 so it lands the same way:
 
-- **`db.attach(name, source)`** / **`db.detach(name)`** are **host-API** methods on the `Database`
-  handle ([api.md](api.md) is authoritative for their signatures). `source` is either an already-open
-  file `BlockStore` (the host does the `open`, mapping `58P01`/`58P02` as for `main`, hosts.md §4) or a
-  request for a fresh **in-memory** attachment. These sit **outside** the SQL capability envelope
-  entirely (session.md §5.3) — an untrusted, `{SELECT}`-only session **cannot** attach or detach
-  anything, for the same reason it cannot `load_unicode_data` or open a file.
+- **`db.attach(name, source, mode)`** / **`db.detach(name)`** are **host-API** methods on the
+  `Database` handle ([api.md](api.md) is authoritative for their signatures). `source` is either an
+  already-open file `BlockStore` (the host does the `open`, mapping `58P01`/`58P02` as for `main`,
+  hosts.md §4) or a request for a fresh **in-memory** attachment. These sit **outside** the SQL
+  capability envelope entirely (session.md §5.3) — an untrusted, `{SELECT}`-only session **cannot**
+  attach or detach anything, for the same reason it cannot `load_unicode_data` or open a file.
+- **A database may be attached read-only** (`mode`, per attachment). A **read-only** attachment rejects
+  every write to its objects — DML and DDL alike — **deterministically, before any I/O**, with
+  **`25006`** (the read-only-context family, §11); it is the per-attachment generalization of the
+  read-only *handle* (a read-only `main`, api.md) and the read-only *transaction* (transactions.md
+  §4.3). This is the natural mode for an attached **reference** database: attach it read-only and it
+  can be joined but never mutated, whatever the session's privileges. The host should additionally open
+  the file `BlockStore` `O_RDONLY` (defense in depth), but the engine's deterministic rejection is the
+  contract, not the host's file mode. A read-only attachment also **never competes for the
+  one-durable-writer slot** (§5), so any number may be attached alongside a writable database. The host
+  picks the mode explicitly at attach time; there is no implied default in this doc (api.md fixes it).
 - **The SQL surface gains only qualified *names* (§3)** — the pure power to reference an attachment the
   host chose to expose. Naming data cannot reach the filesystem, so it adds **no** new capability to an
   untrusted query.
@@ -188,7 +200,9 @@ The existing model generalizes with one genuinely new constraint.
   crash-free, and their data is gone on crash anyway — there is no cross-file inconsistency to create),
   so they are always joinable. A transaction that attempts to write a **second** file-backed database
   is **`0A000`** (`feature_not_supported`, message *"a transaction may modify at most one durable
-  database"*) — the honest, forward-compatible narrowing (§11).
+  database"*) — the honest, forward-compatible narrowing (§11). The slot counts only **writable**
+  file databases: a **read-only** attachment (§4) can never be written, so it never occupies the slot —
+  attach as many read-only reference files as you like beside the one writable database.
 - **Commit publishes N roots.** Commit fsyncs the one durable writer's dirty pages per `synchronous`
   (transactions.md §9), then swaps **every** touched attachment's committed root (file root(s) + each
   in-memory root) — the two-root swap of temp-tables.md §5 widened to N. Because ≤1 root is durable,
@@ -308,13 +322,14 @@ The whole design is arranged so the §13 guarantee needs **no new exception**:
 | `42P01` | `undefined_table` | a qualified name whose **database** is not attached, or whose **table** is absent | reused (grammar.md §15). **§11 open point:** a *dedicated* `unknown_database` code may read better than overloading `42P01`; decide when the grammar slice lands. |
 | `42712` | `duplicate_alias` | two relations resolve to the same label across databases (`main.t`+`reports.t`, unaliased) | reused, no new rule (§3) |
 | `42P07` | `duplicate_table` | an overlap **within** one database's implicit namespace | unchanged (temp-tables.md §3) |
+| `25006` | `read_only_sql_transaction` | any write (DML or DDL) targeting a **read-only** attachment (§4) | reused — the read-only-context family (also a read-only txn/handle, transactions.md §4.3); attachment-scoped message |
 | `0A000` | `feature_not_supported` | writing a **second** durable database in one txn (§5); a cross-database FK/type/sequence ref (§8); an attachment name in a **persisted** definition (§7) | the honest v1 narrowings |
 | `55006` | `object_in_use` | `detach` of an attachment with a live pinned snapshot (§8) | code TBD at slice time; PG's `object_in_use` is class 55 |
 | `58P01`/`58P02`/`58030`/`XX001`/`XX002` | host/file errors | attaching a **file** surfaces the same host-layer codes as opening `main` (hosts.md §4) | raised in the host program layer, above the engine |
 
 Host-API attach/detach and their capability posture are a **host-API surface**, asserted by per-core
-unit tests (open/attach/detach/close, the one-durable-writer rejection, detach-in-use) — out of corpus
-reach (CLAUDE.md §10). The **SQL** surface (qualified names, cross-file joins, resolution errors) is
+unit tests (open/attach/detach/close, the one-durable-writer rejection, the read-only-attachment write
+rejection, detach-in-use) — out of corpus reach (CLAUDE.md §10). The **SQL** surface (qualified names, cross-file joins, resolution errors) is
 corpus-tested across all three cores; cross-**file** durability and reopen behavior need the disk
 storage mode (conformance-two-storage-modes) or a per-core host test.
 
@@ -359,10 +374,12 @@ Sequenced to put the durability-risky part last:
   unchanged. **Point 1 (shared temp) is decided here** per the §6 open decision. Deliverable: SQL can
   join across in-memory attachments; temp is no longer bespoke. All three cores, corpus-tested; the
   in-memory path keeps temp's zero-file-writes and `54P03`.
-- **Slice 2 — host-API file attach + cross-file *read* + single-database *write*.** `db.attach`/`detach`
-  for file databases (api.md), qualified reads/joins across files, DDL/DML into **one** attached file
-  (the one-durable-writer rule, §5). Exercises the disk storage mode (conformance-two-storage-modes) and
-  per-core host tests. Deliverable: SQLite-style cross-file queries.
+- **Slice 2 — host-API file attach (read-only + read-write) + cross-file *read* + single-database
+  *write*.** `db.attach`/`detach` for file databases with the per-attachment **read-only mode** (§4,
+  `25006` on a write to a read-only attachment — the natural reference-DB mode), qualified reads/joins
+  across files, DDL/DML into **one** writable attached file (the one-durable-writer rule, §5). Exercises
+  the disk storage mode (conformance-two-storage-modes) and per-core host tests. Deliverable:
+  SQLite-style cross-file queries.
 - **Slice 3 — multi-file atomic write (deferred, hard).** A super-journal / two-phase commit + recovery
   to lift the one-durable-writer restriction (§5). Only if a concrete use case demands it.
 
@@ -371,9 +388,10 @@ Sequenced to put the durability-risky part last:
 - **Multi-file atomic write** (slice 3) — the two-phase protocol lifting the one-durable-writer rule.
 - **SQL-level attach** — deliberately *excluded* in v1 (§4), not merely deferred; revisit only for an
   in-`:memory:`-only, capability-gated form if a host need appears.
-- **Implicit search path into attachments** — an opt-in, ordered, *explicit* search list (never silent
-  attach-order shadowing) if ergonomics demand it (§3).
 - **3-part column references** `db.table.col` (§3) — an ergonomic sugar, not a semantic gap.
+
+(Deliberately **not** a follow-on: an implicit **search path** into attachments — §3 makes it a firm
+non-goal, not a deferral.)
 - **Cross-database FKs / shared catalog types** (§8) — gated on the self-describing question (§7); a
   genuine design problem, not a quick lift.
 - **`temp` spill-to-disk as a `BlockStore` swap** (temp-tables.md slice 3) — now a special case of a
