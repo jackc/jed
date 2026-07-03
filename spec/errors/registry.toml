@@ -646,6 +646,17 @@ name = "object_not_in_prerequisite_state"
 class = "object not in prerequisite state"
 template = "{detail}"
 
+# 55006 object_in_use — a host tried to DETACH a database while a live
+# transaction / cursor still pins a snapshot of it (../design/attached-databases.md
+# §8). The reader-liveness watermark tracks the pin; the detach is refused until it
+# drains. PostgreSQL's object_in_use is class 55; jed reuses the SQLSTATE for the
+# analogous "cannot remove an object something is still using" condition.
+[[error]]
+code = "55006"
+name = "object_in_use"
+class = "object not in prerequisite state"
+template = "{detail}"
+
 # --- operator intervention (class 57) ---------------------------------------
 # 57014 query_canceled — a running statement was canceled through the host's
 # cancellation handle (Go context.Context, Rust cancellation token, TS

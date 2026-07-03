@@ -51,6 +51,7 @@ package jed
 // drives the single-handle path and mints additional concurrent sessions.
 
 import (
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -462,6 +463,83 @@ func (s *Database) OldestLiveTxid() uint64 {
 	return oldest
 }
 
+// Attach adds a database named `name` to this handle, reachable by the database qualifier `name.table`
+// (spec/design/attached-databases.md §4). Attaching is a HOST-API act, never SQL — an untrusted,
+// SQL-only session cannot attach anything (the pure-SQL safety spine, §4/§13). In Slice 1b `source`
+// must be AttachMemory() (a fresh, empty in-memory database); AttachFile is reserved for Slice 2 and
+// returns 0A000. `readOnly` attaches it read-only: every write to it (DML or DDL) is 25006, and it never
+// competes for the one-durable-writer slot (§5). The name is case-folded; it must not name a reserved
+// database (`main` / `temp`) or one already attached (42710). Publishing the new empty attachment root
+// is atomic under the writer gate.
+func (db *Database) Attach(name string, source AttachSource, readOnly bool) error {
+	if source.file {
+		return newError(FeatureNotSupported, "file attachment is not supported yet (Slice 2)")
+	}
+	lname := strings.ToLower(name)
+	if lname == "" {
+		return newError(DuplicateObject, "attachment name must not be empty")
+	}
+	c := db.core
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if lname == "main" || lname == "temp" || c.attachments[lname] != nil {
+		return newError(DuplicateObject, `database "`+name+`" already exists`)
+	}
+	st := newAttachedStorage(c.pageSize())
+	mode := attachReadWrite
+	if readOnly {
+		mode = attachReadOnly
+	}
+	if c.attachments == nil {
+		c.attachments = make(map[string]*attachment)
+	}
+	c.attachments[lname] = &attachment{name: lname, mode: mode, storage: st}
+	// The fresh attachment's committed root: an empty snapshot whose NEW stores attach to its own paging
+	// (the same seam session-local temp uses — a snapshot's tempPaging is "the paging new stores bind to").
+	empty := newSnapshot()
+	empty.tempPaging = st.paging
+	old := c.roots.Load()
+	na := make(map[string]*snapshot, len(old.attached)+1)
+	for k, v := range old.attached {
+		na[k] = v
+	}
+	na[lname] = empty
+	c.roots.Store(&roots{committed: old.committed, attached: na})
+	return nil
+}
+
+// Detach removes a previously attached database (spec/design/attached-databases.md §4/§8). A host-API
+// act. It is 55006 (object_in_use) while any live transaction / cursor still pins a committed snapshot
+// (the reader-liveness watermark, §5 — a reader pins the whole roots, so an open reader pins every
+// attachment), and 42704 if no database of that name is attached (`main` / `temp` are not detachable).
+// On success the attachment's root is dropped from the published roots and its storage released, under
+// the writer gate.
+func (db *Database) Detach(name string) error {
+	lname := strings.ToLower(name)
+	c := db.core
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if lname == "main" || lname == "temp" || c.attachments[lname] == nil {
+		return newError(UndefinedObject, `database "`+name+`" is not attached`)
+	}
+	c.liveMu.Lock()
+	inUse := len(c.live) > 0
+	c.liveMu.Unlock()
+	if inUse {
+		return newError(ObjectInUse, `cannot detach database "`+name+`" while it is in use`)
+	}
+	delete(c.attachments, lname)
+	old := c.roots.Load()
+	na := make(map[string]*snapshot, len(old.attached))
+	for k, v := range old.attached {
+		if k != lname {
+			na[k] = v
+		}
+	}
+	c.roots.Store(&roots{committed: old.committed, attached: na})
+	return nil
+}
+
 // committedEngine builds a transient read engine over the latest committed snapshot for catalog
 // introspection (the shared-core analogue of Rust's Engine::from_snapshot). Not a session — it pins
 // nothing and never writes.
@@ -522,13 +600,16 @@ func (s *Database) ReadOnly() bool { return s.core.readOnlyMode() }
 // by and never blocking a writer — and a write through it is 25006. The caller must Close it to
 // deregister (advancing the watermark), idiomatically `defer s.Close()`. (The old SharedDB.Read().)
 func (s *Database) ReadSession() *Session {
-	snap := s.core.roots.Load().committed
+	rt := s.core.roots.Load()
+	snap := rt.committed
 	s.core.liveMu.Lock()
 	s.core.live[snap.txid]++
 	s.core.liveMu.Unlock()
 	// Reads never mutate the snapshot (a write is rejected before dispatch), so the engine shares the
-	// immutable pinned snapshot directly — no clone.
+	// immutable pinned snapshot directly — no clone. The attached roots are pinned together (§5).
 	engine := &engine{committed: snap, pageSize: s.core.pageSize(), session: newSession()}
+	engine.core = s.core
+	engine.attachedCommitted = rt.attached
 	engine.readOnly = true // the executor rejects writes (25006) / poisons a read-only block
 	return &Session{core: s.core, engine: engine, access: accessReadOnly, pinned: true, pinVersion: snap.txid, baseVersion: snap.txid}
 }
@@ -546,9 +627,12 @@ func (s *Database) WriteSession() *Session {
 		return s.ReadSession()
 	}
 	s.core.writeMu.Lock()
-	base := s.core.roots.Load().committed
+	rt := s.core.roots.Load()
+	base := rt.committed
 	// committed is the immutable base (the writer mutates only working, which beginTx clones off it).
 	engine := &engine{committed: base, pageSize: s.core.pageSize(), session: newSession()}
+	engine.core = s.core
+	engine.attachedCommitted = rt.attached
 	_, _ = engine.beginTx(true, true)
 	return &Session{core: s.core, engine: engine, access: accessReadWrite, gateHeld: true, baseVersion: base.txid}
 }
@@ -560,8 +644,11 @@ func (s *Database) WriteSession() *Session {
 // publishes, and releases it; BEGIN/COMMIT/ROLLBACK open and end an explicit block. (The old
 // Engine.NewSession swap → an independent owns-its-Engine session.)
 func (s *Database) Session(opts SessionOptions) *Session {
-	snap := s.core.roots.Load().committed
+	rt := s.core.roots.Load()
+	snap := rt.committed
 	engine := &engine{committed: snap, pageSize: s.core.pageSize(), session: newSessionWithOptions(opts)}
+	engine.core = s.core
+	engine.attachedCommitted = rt.attached
 	// A read-only file-backed core mints read-only sessions (a write is 25006); it pins the committed
 	// version in the watermark like a read session. A writable core mints the autocommit lazy-gate one.
 	if s.core.readOnlyMode() {
@@ -889,6 +976,7 @@ func (s *Session) refreshCommitted() {
 	rt := s.core.roots.Load()
 	s.baseVersion = rt.committed.txid
 	s.engine.committed = rt.committed
+	s.engine.attachedCommitted = rt.attached // pin the latest attached roots together (§5)
 }
 
 // publish stores the engine's committed root into the shared cell at the next version (the §3 commit

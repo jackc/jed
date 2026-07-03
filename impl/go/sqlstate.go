@@ -163,6 +163,9 @@ const (
 	TempStorageLimitExceeded
 	// ObjectNotInPrerequisiteState is 55000 — {detail}.
 	ObjectNotInPrerequisiteState
+	// ObjectInUse is 55006 — object is in use: {detail}. Detaching a database with a live pinned
+	// snapshot (spec/design/attached-databases.md §8).
+	ObjectInUse
 	// QueryCanceled is 57014 — canceling statement due to user request.
 	QueryCanceled
 	// IoError is 58030 — I/O error: {detail}.
@@ -328,6 +331,8 @@ func (s SqlState) Code() string {
 		return "54P03"
 	case ObjectNotInPrerequisiteState:
 		return "55000"
+	case ObjectInUse:
+		return "55006"
 	case QueryCanceled:
 		return "57014"
 	case IoError:
@@ -430,6 +435,7 @@ var errorDescs = []errorDesc{
 	{Code: "54P02", Name: "session_cost_limit_exceeded", Class: "program limit exceeded"},
 	{Code: "54P03", Name: "temp_storage_limit_exceeded", Class: "program limit exceeded"},
 	{Code: "55000", Name: "object_not_in_prerequisite_state", Class: "object not in prerequisite state"},
+	{Code: "55006", Name: "object_in_use", Class: "object not in prerequisite state"},
 	{Code: "57014", Name: "query_canceled", Class: "operator intervention"},
 	{Code: "58030", Name: "io_error", Class: "system error"},
 	{Code: "58P01", Name: "undefined_file", Class: "system error"},

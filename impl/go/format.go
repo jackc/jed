@@ -1290,6 +1290,16 @@ func newTempStorage(pageSize uint32) *storage {
 	}
 }
 
+// newAttachedStorage builds a fresh, empty in-RAM storage identity for a host-attached DATABASE-scoped
+// in-memory database (spec/design/attached-databases.md §6) — the same recipe as newTempStorage (a
+// memoryBlockStore seeded with the empty from-scratch image, a pinned/unbounded pool, within-session
+// compaction on), differing only in that its root is DATABASE-scoped (published into roots.attached and
+// pinned by the cross-session watermark) rather than session-private. In Slice 1b every attachment is
+// in-memory; a file-backed attachment (Slice 2) would open a fileBlockStore here instead.
+func newAttachedStorage(pageSize uint32) *storage {
+	return newTempStorage(pageSize)
+}
+
 // LoadEngine reconstructs a database from an on-disk image (inverse of ToImage). Returns a
 // structured data_corrupted (XX001) error for malformed input.
 //
