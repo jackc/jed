@@ -1520,6 +1520,25 @@ func (db *engine) attachWriteSnap(name string) *snapshot {
 	return ws
 }
 
+// attachReadView returns the current READ view of every attached database — the transaction's working
+// clone where this tx wrote it, else the pinned committed root — as one frozen map. Used to freeze a
+// snapshotEngine's attachment view (whose own tx is nil, so it reads straight from this map). Returns
+// attachedCommitted directly when no attachment has been written this tx (the common case, no alloc).
+func (db *engine) attachReadView() map[string]*snapshot {
+	tx := db.session.tx
+	if tx == nil || len(tx.attachWorking) == 0 {
+		return db.attachedCommitted
+	}
+	view := make(map[string]*snapshot, len(db.attachedCommitted)+len(tx.attachWorking))
+	for k, v := range db.attachedCommitted {
+		view[k] = v
+	}
+	for k, v := range tx.attachWorking {
+		view[k] = v
+	}
+	return view
+}
+
 // snapForScope returns the READ snapshot for an explicit database qualifier (attached-databases.md §3):
 // `main` / `temp` / a host attachment. Used only when scope != nil; a nil scope keeps the bare
 // temp-first funnels (a name is temp XOR persistent). nil for an unknown attachment (the qualifier gate
@@ -10226,7 +10245,7 @@ func (db *engine) planSelect(sel *selectStmt, parent *scope, ctes []*cteBinding,
 			}
 			seenLabels[label] = true
 		}
-		rels = append(rels, scopeRel{label: label, table: t, offset: offset, cte: cteIdx})
+		rels = append(rels, scopeRel{label: label, table: t, offset: offset, cte: cteIdx, db: tref.DB})
 		offset += len(t.Columns)
 	}
 
@@ -10976,7 +10995,7 @@ func (db *engine) planSelect(sel *selectStmt, parent *scope, ctes []*cteBinding,
 	// plan outlives the scope and a correlated subquery can re-execute it per row).
 	planRels := make([]planRel, len(s.rels))
 	for i, rel := range s.rels {
-		planRels[i] = planRel{tableName: rel.table.Name, offset: rel.offset, colCount: len(rel.table.Columns), srf: srfPlans[i], cte: rel.cte, derived: derivedPlans[i], lateral: lateralFlags[i]}
+		planRels[i] = planRel{tableName: rel.table.Name, db: rel.db, offset: rel.offset, colCount: len(rel.table.Columns), srf: srfPlans[i], cte: rel.cte, derived: derivedPlans[i], lateral: lateralFlags[i]}
 	}
 	// The touched set per relation (cost.md §3 "The touched set"; large-values.md §14): the
 	// columns this query statically references, collected depth-aware so a correlated
@@ -14148,7 +14167,7 @@ func (db *engine) windowTopNEligible(plan *selectPlan) bool {
 	if len(plan.windowKeys) != 0 || len(plan.orderExprs) != 0 {
 		return false
 	}
-	table, ok := db.lkpTable(rel.tableName)
+	table, ok := db.lkpTableScoped(rel.db, rel.tableName)
 	if !ok {
 		return false
 	}
@@ -14239,6 +14258,10 @@ func (db *engine) snapshotEngine() *engine {
 		pageSize:  db.pageSize,
 		paging:    db.paging,
 		readOnly:  db.readOnly,
+		// The frozen read engine carries the same pinned attachment view so a streaming read of an
+		// attached database (attached-databases.md §5) resolves through it; it never commits (read-only),
+		// so it needs no core back-ref. tempCommitted above already froze the temp snapshot.
+		attachedCommitted: db.attachReadView(),
 	}
 }
 
@@ -14355,7 +14378,7 @@ func (db *engine) buildScanRows(sp *selectPlan, ptys []scalarType, params []Valu
 			b, empty = db.buildKeyBound(sp.relBounds[0].pk, bound, nil, nil)
 		}
 		snap := db.snapshotEngine()
-		store := snap.lkpStore(sp.rels[0].tableName)
+		store := snap.lkpStoreScoped(sp.rels[0].db, sp.rels[0].tableName)
 		overlap, slabs := 0, 0
 		if !empty {
 			if overlap, slabs, err = store.OverlapScanUnits(b, sp.relMasks[0]); err != nil {
@@ -14810,7 +14833,7 @@ func (c *deferredCursor) close() {
 }
 
 func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costMeter, params []Value) (selectResult, error) {
-	store := db.lkpStore(plan.rels[0].tableName)
+	store := db.lkpStoreScoped(plan.rels[0].db, plan.rels[0].tableName)
 
 	// Resolve the scan bound (the PK pushdown, if any) and charge the page_read block. A correlated
 	// bound resolves against env.outer (the enclosing rows).
@@ -14937,7 +14960,7 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 // execStreamingScan's LIMIT stop. page_read is the full block up front (only per-row work
 // short-circuits, like the streaming scan).
 func (db *engine) execWindowTopN(plan *selectPlan, env *evalEnv, meter *costMeter, params []Value) (emitter, error) {
-	store := db.lkpStore(plan.rels[0].tableName)
+	store := db.lkpStoreScoped(plan.rels[0].db, plan.rels[0].tableName)
 
 	// The scan bound (the PK pushdown, if any) + its page_read block, exactly as execStreamingScan.
 	b := unboundedBound()
@@ -15032,7 +15055,7 @@ func (db *engine) execWindowTopN(plan *selectPlan, env *evalEnv, meter *costMete
 // each scanned entry then charges its point-lookup's page_read/value_decompress + one
 // storage_row_read, plus row_produced and projection operator_evals per produced row.
 func (db *engine) execIndexOrderScan(plan *selectPlan, io *indexOrderPlan, env *evalEnv, meter *costMeter) (selectResult, error) {
-	store := db.lkpStore(plan.rels[0].tableName)
+	store := db.lkpStoreScoped(plan.rels[0].db, plan.rels[0].tableName)
 	istore := db.lkpIndexStore(io.nameKey)
 	// Up-front index-tree page_read (the full block; the index store has no payload, so no slabs).
 	meter.Charge(costs.PageRead * int64(istore.NodeCount()))
@@ -15112,7 +15135,7 @@ func (db *engine) execIndexOrderScan(plan *selectPlan, io *indexOrderPlan, env *
 // row accrue — only the sort, which is unmetered (cost.md §3), now spills. Gated (by the caller) to a
 // single table, no join, non-aggregate, non-DISTINCT, with an ORDER BY and no index bound.
 func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costMeter, params []Value) (emitter, error) {
-	store := db.lkpStore(plan.rels[0].tableName)
+	store := db.lkpStoreScoped(plan.rels[0].db, plan.rels[0].tableName)
 
 	// Resolve the scan bound (the PK pushdown, if any) and charge the page_read + value_decompress
 	// block up front — identical to the eager scan (cost.md §3). An INDEX bound never reaches here.
@@ -15421,7 +15444,7 @@ func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 	// An index-nested-loop bound (per-outer-row seek) takes precedence over the once-materialized
 	// bound and resolves its sibling source from the current left row (cost.md §3 "JOIN"); else the
 	// once-materialized relBounds.
-	store := db.lkpStore(rel.tableName)
+	store := db.lkpStoreScoped(rel.db, rel.tableName)
 	sb := plan.relINLBounds[ri]
 	if sb == nil {
 		sb = plan.relBounds[ri]
@@ -18705,7 +18728,11 @@ type cteCtx struct {
 // flat offset of its first column, and its column count (for NULL-padding).
 type planRel struct {
 	tableName string
-	offset    int
+	// db is the relation's explicit database qualifier (attached-databases.md §3), passed to the
+	// scope-aware store funnels at exec (lkpStoreScoped etc.). nil for a bare implicit-scope name → the
+	// funnels fall through to the temp-first walk (behavior-neutral for every unqualified query).
+	db     *string
+	offset int
 	colCount  int
 	// srf is non-nil when this relation is a COMPUTED set-returning function (generate_series)
 	// rather than a base table: tableName is then the function name (never looked up in the
@@ -25285,6 +25312,11 @@ type scopeRel struct {
 	table         *catTable
 	offset        int
 	qualifierOnly bool
+	// db is the relation's explicit database qualifier (attached-databases.md §3), carried from the
+	// tableRef so the store is re-looked-up in the right database at exec (a store is resolved by name
+	// per-access, recon). nil for a bare (implicit-scope) name — then the scoped funnels fall through
+	// to the temp-first walk, so this is behavior-neutral for every unqualified query.
+	db *string
 	// cte is non-nil (pointing to the index into the statement's CTE list — spec/design/cte.md)
 	// when this relation is a reference to a CTE rather than a base table: its table is the
 	// binding's synthetic relation and exec delivers its rows from the cteCtx. nil for a base
