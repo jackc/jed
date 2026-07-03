@@ -41,7 +41,7 @@ func TestDemandPagingScansCorrectlyWithBoundedResidency(t *testing.T) {
 	}
 
 	// Reopen demand-paged with a 3-leaf budget.
-	db, err = openWithOptions(path, openOptions{CacheBytes: cap * 256})
+	db, err = openWithOptions(path, OpenOptions{CacheBytes: cap * 256})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +72,7 @@ func TestDemandPagingScansCorrectlyWithBoundedResidency(t *testing.T) {
 	}
 
 	// Mutate through the pool (each statement faults the leaf it touches), reopen, verify.
-	db, err = openWithOptions(path, openOptions{CacheBytes: cap * 256})
+	db, err = openWithOptions(path, OpenOptions{CacheBytes: cap * 256})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +92,7 @@ func TestDemandPagingScansCorrectlyWithBoundedResidency(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db, err = openWithOptions(path, openOptions{CacheBytes: cap * 256})
+	db, err = openWithOptions(path, OpenOptions{CacheBytes: cap * 256})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +150,7 @@ func TestMemoryBudgetBoundsResidencyUnderLookups(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db, err = openWithOptions(path, openOptions{CacheBytes: cap * 256})
+	db, err = openWithOptions(path, OpenOptions{CacheBytes: cap * 256})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +211,7 @@ func TestTinyBudgetKeepsOneLeafResident(t *testing.T) {
 	}
 
 	// A 1-byte budget is far below the 256-byte page size: it must clamp to one resident leaf, not zero.
-	db, err = openWithOptions(path, openOptions{CacheBytes: 1})
+	db, err = openWithOptions(path, OpenOptions{CacheBytes: 1})
 	if err != nil {
 		t.Fatal(err)
 	}

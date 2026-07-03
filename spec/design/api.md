@@ -432,6 +432,7 @@ only and the engine has no wire protocol).
 |---|---|---|---|
 | create (in-memory or file) | `Database::create(opts) -> Result<Database>` (`opts.path: Option<PathBuf>`) | `CreateDatabase(opts) (*Database, error)` (`opts.Path string`) | `createDatabase(opts): Database` (`opts.path?`) |
 | open file | `Database::open(path) -> Result<Database>` | `OpenDatabase(path) (*Database, error)` | `openDatabase(path): Database` |
+| open file with options | `Database::open_with_options(path, OpenOptions) -> Result<Database>` | `OpenDatabaseWithOptions(path, OpenOptions) (*Database, error)` | `openDatabase(path, OpenOptions): Database` |
 | in-memory (no path) | `Database::create(CreateOptions::default())` | `CreateDatabase(CreateOptions{})` | `createDatabase({})` |
 | infallible in-memory (test/host helper) | `fn mem_db()` wrapping `create` | `memDB()` wrapping `CreateDatabase` | `memDb()` wrapping `createDatabase` |
 | commit (current tx) | `db.commit() -> Result<()>` | `db.Commit() error` | `commit(db): void` |

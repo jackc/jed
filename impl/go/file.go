@@ -62,7 +62,7 @@ func create(path string, opts DatabaseOptions) (*engine, error) {
 // OpenOptions are open-time settings for a file-backed database (spec/design/api.md §2.1). Unlike
 // DatabaseOptions (create-time, fixed into the file), these are handle settings — not stored in the
 // file, so a different host may reopen the same file with different ones.
-type openOptions struct {
+type OpenOptions struct {
 	// CacheBytes is the buffer-pool budget in bytes: roughly the maximum memory the resident leaf cache
 	// holds at once (spec/design/pager.md §3, P6.4b/c). Bytes, not a page count, so the budget does not
 	// silently scale with the file's page size; the engine converts it to a leaf-page capacity by the
@@ -86,7 +86,7 @@ type openOptions struct {
 // budget defaults to DefaultCacheBytes (256 MiB). See OpenWithOptions to set the budget. The path must
 // exist — 58P01 otherwise; a malformed file is XX001, a read failure 58030 (api.md §2.1).
 func open(path string) (*engine, error) {
-	return openWithOptions(path, openOptions{})
+	return openWithOptions(path, OpenOptions{})
 }
 
 // OpenWithOptions opens an existing file-backed database at path with explicit open settings (the
@@ -97,7 +97,7 @@ func open(path string) (*engine, error) {
 // (P6.4b). The byte budget is converted to a leaf-page capacity by the file's page size (cacheLeaves).
 // The budget is a handle setting, not stored in the file (§3). Later commits write through the same
 // pager kept open for the handle's life.
-func openWithOptions(path string, opts openOptions) (*engine, error) {
+func openWithOptions(path string, opts OpenOptions) (*engine, error) {
 	cacheBytes := opts.CacheBytes
 	if cacheBytes <= 0 {
 		cacheBytes = defaultCacheBytes

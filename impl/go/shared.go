@@ -359,14 +359,16 @@ func newInMemoryWithPageSize(pageSize uint32) *Database {
 	return databaseOver(sharedCoreFromEngine(e))
 }
 
-// OpenDatabase opens an existing file-backed database at path with default open settings.
+// OpenDatabase opens an existing file-backed database at path with default open settings. Use
+// OpenDatabaseWithOptions to set the buffer-pool budget, read-only mode, or work-memory budget
+// (the mirror of Rust's Database::open / open_with_options — spec/design/api.md §2.1).
 func OpenDatabase(path string) (*Database, error) {
-	return openDatabaseWithOptions(path, openOptions{})
+	return OpenDatabaseWithOptions(path, OpenOptions{})
 }
 
 // OpenDatabaseWithOptions opens an existing file-backed database at path with explicit open settings
 // (buffer-pool budget, read-only mode, work-mem) and returns the host handle with its default session.
-func openDatabaseWithOptions(path string, opts openOptions) (*Database, error) {
+func OpenDatabaseWithOptions(path string, opts OpenOptions) (*Database, error) {
 	e, err := openWithOptions(path, opts)
 	if err != nil {
 		return nil, err

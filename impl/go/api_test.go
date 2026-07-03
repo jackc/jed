@@ -304,7 +304,7 @@ func TestOpenReadOnlyBlocksWritesAndNeverTouchesTheFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rodb, err := openDatabaseWithOptions(path, openOptions{ReadOnly: true})
+	rodb, err := OpenDatabaseWithOptions(path, OpenOptions{ReadOnly: true})
 	if err != nil {
 		t.Fatal(err)
 	}
