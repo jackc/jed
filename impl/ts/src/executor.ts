@@ -2491,6 +2491,36 @@ export class Engine {
     return this.tempSnap().table(name) !== undefined;
   }
 
+  // checkTableQualifier validates an optional database qualifier on a table reference against the
+  // implicit scope (spec/design/attached-databases.md §3, Slice 1a). A qualified name reaches a
+  // specific database: `main` (the file / persistent database) or `temp` (the session-local domain) —
+  // the two reserved implicit qualifiers this slice recognizes; a host-attached database arrives in
+  // Slice 1b, so any other qualifier is 42P01 "database … is not attached". Because jed precludes
+  // overlaps (a name is temp XOR persistent within a session, §3), a valid qualifier resolves to the
+  // SAME store the bare name would, so this is a VALIDATION GATE, not a routing change: it asserts the
+  // named relation lives in the claimed database (else 42P01), and the downstream temp-first funnel
+  // then resolves it to the matching scope. An undefined qualifier (a bare, implicit-scope name) always
+  // passes. The qualifier is matched case-insensitively (unquoted identifiers fold to lower case).
+  private checkTableQualifier(qualifier: string | undefined, name: string): void {
+    if (qualifier === undefined) {
+      return;
+    }
+    switch (qualifier.toLowerCase()) {
+      case "temp":
+        if (!this.isTempTable(name)) {
+          throw engineError("undefined_table", `relation "temp.${name}" does not exist`);
+        }
+        break;
+      case "main":
+        if (this.readSnap().table(name) === undefined) {
+          throw engineError("undefined_table", `relation "main.${name}" does not exist`);
+        }
+        break;
+      default:
+        throw engineError("undefined_table", `database "${qualifier}" is not attached`);
+    }
+  }
+
   // compositeDependentAny is the DROP TYPE … RESTRICT dependency check across every visible scope
   // (spec/design/temp-tables.md §8): the main image (tables + composite fields), then the visible
   // session-local temp snapshot (its tables). A composite type is always persistent, but a TEMP table
@@ -5796,6 +5826,7 @@ export class Engine {
   // source additionally validates output arity (42601) and per-column type assignability (42804)
   // up front, before any row is produced — so both fire even over an empty source.
   private executeInsert(ins: Insert, params: Value[], ctx: CteCtx): Outcome {
+    this.checkTableQualifier(ins.db, ins.table); // attached-databases.md §3
     const table = this.lkpTable(ins.table); // temp-first (temp-tables.md §3)
     if (!table) {
       throw engineError("undefined_table", "table does not exist: " + ins.table);
@@ -6938,6 +6969,7 @@ export class Engine {
   // matching rows (only a TRUE predicate matches — Kleene), then removes them. No WHERE
   // deletes every row. Keys are collected before mutating.
   private executeDelete(del: Delete, params: Value[], ctx: CteCtx): Outcome {
+    this.checkTableQualifier(del.db, del.table); // attached-databases.md §3
     const table = this.lkpTable(del.table); // temp-first (temp-tables.md §3)
     if (!table) {
       throw engineError("undefined_table", "table does not exist: " + del.table);
@@ -7147,6 +7179,7 @@ export class Engine {
   // a collision with another row's key traps 23505 (<table>_pkey). A duplicate target
   // column traps 42701. No WHERE updates every row.
   private executeUpdate(upd: Update, params: Value[], ctx: CteCtx): Outcome {
+    this.checkTableQualifier(upd.db, upd.table); // attached-databases.md §3
     const table = this.lkpTable(upd.table); // temp-first (temp-tables.md §3)
     if (!table) {
       throw engineError("undefined_table", "table does not exist: " + upd.table);
@@ -8562,6 +8595,18 @@ export class Engine {
         t = r.table;
         srf = r.srf;
         lateral = lateralEligible && r.srf.args.some((a) => rexprReferencesOuter(a, 0));
+      } else if (tref.db !== undefined) {
+        // A database-QUALIFIED name reaches an attachment's table directly (attached-databases.md §3):
+        // it never resolves to a CTE (a CTE has no database qualifier, so `main.x`/`temp.x` cannot name
+        // one) and the qualifier fixes the scope (no temp-vs-persistent shadow). Validate the qualifier
+        // against the implicit scope, then resolve through the temp-first funnel (which, by
+        // preclude-overlaps, lands in the validated scope).
+        this.checkTableQualifier(tref.db, tref.name);
+        const tbl = this.lkpTable(tref.name);
+        if (!tbl) {
+          throw engineError("undefined_table", "table does not exist: " + tref.db + "." + tref.name);
+        }
+        t = tbl;
       } else {
         // A plain FROM name (not an SRF call) may resolve to a CTE, which SHADOWS a catalog table of
         // the same name (cte.md §2); lookup is case-insensitive. A hit bumps the binding's reference

@@ -728,6 +728,9 @@ export type AlterSequence = {
 export type Insert = {
   kind: "insert";
   table: string;
+  // The optional database qualifier on the target (`INSERT INTO reports.t …`), like TableRef.db
+  // (spec/design/attached-databases.md §3). undefined = implicit scope.
+  db?: string;
   columns: string[] | null;
   // The optional `OVERRIDING { SYSTEM | USER } VALUE` clause (spec/design/sequences.md §13),
   // governing IDENTITY columns. null is the default (no override).
@@ -815,6 +818,12 @@ export type InsertValue =
 // (`name`/`args`/…) are unused. Implicitly lateral (its `ctx` may reference earlier FROM siblings).
 export type TableRef = {
   name: string;
+  // The optional database qualifier (`reports.sales` → db="reports", name="sales"), jed's first
+  // multi-part name in table position (spec/design/attached-databases.md §3). undefined = a bare,
+  // implicit-scope name. Only the reserved implicit qualifiers `main` (the file database) and `temp`
+  // (the session-local domain) resolve this slice; any other is 42P01 (Slice 1b adds host-attached
+  // databases). Never set on the function / derived-table alternatives.
+  db?: string;
   alias: string | null;
   args: Expr[] | null;
   subquery?: QueryExpr;
@@ -960,6 +969,9 @@ export type Select = {
 export type Update = {
   kind: "update";
   table: string;
+  // The optional database qualifier on the target (`UPDATE reports.t SET …`), like TableRef.db
+  // (spec/design/attached-databases.md §3). undefined = implicit scope.
+  db?: string;
   assignments: Assignment[];
   filter: Expr | null;
   // The optional terminal RETURNING clause (spec/design/grammar.md §32): project each matched
@@ -974,6 +986,9 @@ export type Update = {
 export type Delete = {
   kind: "delete";
   table: string;
+  // The optional database qualifier on the target (`DELETE FROM reports.t …`), like TableRef.db
+  // (spec/design/attached-databases.md §3). undefined = implicit scope.
+  db?: string;
   filter: Expr | null;
   returning: SelectItems | null;
 };

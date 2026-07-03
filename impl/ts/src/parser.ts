@@ -1297,7 +1297,7 @@ class Parser {
   private parseInsert(): Insert {
     this.expectKeyword("insert");
     this.expectKeyword("into");
-    const table = this.expectIdentifier();
+    const [db, table] = this.parseQualifiedTableName();
 
     // Optional column list `( col [, col]* )` before VALUES. An empty `()` is rejected (the
     // first expectIdentifier errors 42601 on `)`).
@@ -1345,6 +1345,7 @@ class Parser {
       return {
         kind: "insert",
         table,
+        db,
         columns,
         overriding,
         source: { kind: "select", select },
@@ -1369,6 +1370,7 @@ class Parser {
     return {
       kind: "insert",
       table,
+      db,
       columns,
       overriding,
       source: { kind: "values", rows },
@@ -2136,10 +2138,23 @@ class Parser {
     if (this.peekKeyword() === "json_table" && this.peekKindAt(1) === "lparen") {
       return this.parseJsonTable();
     }
-    const name = this.expectIdentifier();
+    let name = this.expectIdentifier();
+    // An optional DATABASE qualifier `db "." table` (spec/design/attached-databases.md §3): a `.`
+    // after the first identifier makes it the database qualifier and the next identifier the table
+    // name. A qualified name is a BASE TABLE only — never a set-returning function (no cross-database
+    // SRF) — so the function `(` branch below is guarded off when a qualifier is present.
+    let db: string | undefined;
+    if (this.peek().kind === "dot") {
+      this.advance(); // .
+      db = name;
+      name = this.expectIdentifier();
+    }
     // A `(` right after the name = a set-returning function call (no `*`/`DISTINCT`).
     let args: Expr[] | null = null;
     if (this.peek().kind === "lparen") {
+      if (db !== undefined) {
+        throw engineError("syntax_error", "a database-qualified name cannot be a function call");
+      }
       this.advance();
       args = [this.parseExpr()];
       while (this.peek().kind === "comma") {
@@ -2178,7 +2193,7 @@ class Parser {
       columnDefs = this.parseFieldDefList();
     }
     // An SRF is implicitly lateral; `lateral` records only whether the keyword was written.
-    return { name, alias, args, columnDefs, lateral };
+    return { name, db, alias, args, columnDefs, lateral };
   }
 
   // parseDerivedTable parses a DERIVED TABLE — `"(" query_expr ")" derived_alias?` (grammar.md §42).
@@ -2470,6 +2485,20 @@ class Parser {
     return [null, first];
   }
 
+  // parseQualifiedTableName parses `qualified_table ::= (identifier ".")? identifier` in DML-target
+  // position (spec/design/attached-databases.md §3): an optional database qualifier followed by the
+  // table name. Returns [db, name] where db is undefined for a bare (implicit-scope) name. The
+  // FROM-position analogue is inlined in parseTableRef (which must also disambiguate the function /
+  // derived-table forms).
+  private parseQualifiedTableName(): [string | undefined, string] {
+    const first = this.expectIdentifier();
+    if (this.peek().kind === "dot") {
+      this.advance(); // .
+      return [first, this.expectIdentifier()];
+    }
+    return [undefined, first];
+  }
+
   // parseOrderBy parses an optional `ORDER BY <key> ("," <key>)*` (spec/grammar/grammar.ebnf
   // `order_by`). nullsFirst is resolved here: explicit if given, else the direction default (ASC ->
   // last, DESC -> first). A bare NULLS not followed by FIRST/LAST is a syntax error (42601). Returns []
@@ -2589,7 +2618,7 @@ class Parser {
   // `UPDATE <table> SET <col> = <operand> [, <col> = <operand>]* [WHERE <pred>]`.
   private parseUpdate(): Update {
     this.expectKeyword("update");
-    const table = this.expectIdentifier();
+    const [db, table] = this.parseQualifiedTableName();
     this.expectKeyword("set");
 
     const assignments: Assignment[] = [];
@@ -2610,17 +2639,17 @@ class Parser {
 
     const filter = this.parseOptionalWhere();
     const returning = this.parseReturning();
-    return { kind: "update", table, assignments, filter, returning };
+    return { kind: "update", table, db, assignments, filter, returning };
   }
 
   // parseDelete parses `DELETE FROM <table> [WHERE <pred>]`. No WHERE deletes all rows.
   private parseDelete(): Delete {
     this.expectKeyword("delete");
     this.expectKeyword("from");
-    const table = this.expectIdentifier();
+    const [db, table] = this.parseQualifiedTableName();
     const filter = this.parseOptionalWhere();
     const returning = this.parseReturning();
-    return { kind: "delete", table, filter, returning };
+    return { kind: "delete", table, db, filter, returning };
   }
 
   // parseOptionalWhere parses an optional trailing `WHERE <expr>` (shared by
