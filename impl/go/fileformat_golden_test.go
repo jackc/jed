@@ -323,6 +323,24 @@ func nopkTableDB(t *testing.T) *Session {
 	return db
 }
 
+// maxSepTableDB is the degenerate interior fan-out fixture (format.md "Interior node" / "Fan-out";
+// bplus-reshape.md §4.2): a secondary index over near-RECORD_MAX(0) text keys — each 112-byte
+// entry key packs two per index leaf, and two separators overflow an interior page, so the second
+// leaf split takes the pinned N = 2 → m = 1 interior split and leaves a legal N = 0 interior on
+// disk. The table rows externalize their (incompressible filler64) text. Must match verify.rb's
+// MAX_SEP_TABLE.
+func maxSepTableDB(t *testing.T) *Session {
+	db := NewInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	run(t, db, "CREATE TABLE m (id i32 PRIMARY KEY, s text)")
+	run(t, db, "CREATE INDEX i_s ON m (s)")
+	tail := fillerText(104)
+	for i := 0; i < 6; i++ {
+		s := string(rune('A'+i)) + tail
+		run(t, db, fmt.Sprintf("INSERT INTO m VALUES (%d, '%s')", i+1, s))
+	}
+	return db
+}
+
 // tallTreeDB's wide text padding forces a HEIGHT-2 tree (an interior node whose children are
 // themselves interior nodes) at page_size 256 — exercises interior-of-interior child pointers and
 // post-order page allocation across a deeper tree (spec/fileformat/format.md).
@@ -908,6 +926,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"json_table.jed", jsonTableDB},
 		{"jsonb_table.jed", jsonbTableDB},
 		{"tall_tree.jed", tallTreeDB},
+		{"max_sep_table.jed", maxSepTableDB},
 	}
 	for _, c := range cases {
 		image, err := c.build(t).ToImage(goldenPageSize, 1)
@@ -980,6 +999,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"json_table.jed", jsonTableDB, "t"},
 		{"jsonb_table.jed", jsonbTableDB, "t"},
 		{"tall_tree.jed", tallTreeDB, "t"},
+		{"max_sep_table.jed", maxSepTableDB, "m"},
 		{"torn_meta_slot0.jed", pkTableDB, "t"},
 		{"torn_meta_slot1.jed", pkTableDB, "t"},
 	}

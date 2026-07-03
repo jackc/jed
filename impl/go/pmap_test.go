@@ -10,13 +10,17 @@ import (
 
 // A small page cap so a few-thousand-entry map is several levels deep — exercises split,
 // merge-then-split, root growth and collapse (the in-RAM analog of page_size 256). pmW is a
-// realistic per-entry weight (8-byte key + a ~5-byte int value record), well under RECORD_MAX.
-// These maps are in-memory (no paging), so every traversal passes a nil leaf source and never faults.
+// realistic per-entry weight (8-byte key + an 8-byte i64 slot = 16 bytes, so a 240-byte leaf holds
+// ~12 entries before splitting, well under RECORD_MAX). pmShape is the leaf column-class shape —
+// pmRow has one fixed-width value column, so the v24 leaf overhead scales with {fixed: 1, var: 0}
+// (format.md "Leaf node"). These maps are in-memory (no paging), so every traversal passes a nil
+// leaf source and never faults.
 const (
 	pmCap = 240
-	pmW   = 15
-	pmK   = 1 // pmRow has one value column — the PAX leaf directory overhead (format.md v23)
+	pmW   = 16
 )
+
+var pmShape = leafShape{fixed: 1}
 
 func pmKey(n uint64) []byte {
 	b := make([]byte, 8)
@@ -42,32 +46,78 @@ func pmShuffled(n uint64) []uint64 {
 	return v
 }
 
-// pmCheckInvariants asserts every node (except the root) fits a page and stays non-empty — the
-// structural invariant the byte contract relies on (spec/fileformat/format.md).
+// pmCheckInvariants asserts the structural invariants the byte contract relies on (format.md
+// "Fan-out"): every node fits a page; every leaf is non-empty; an interior node has N+1 children
+// (N ≥ 0 only in the degenerate near-cap-separator case — these small-key tests never produce it,
+// so N ≥ 1 is asserted); records (vals/weights) live only in leaves; all leaves at the same depth;
+// and every key in a subtree respects its bounding separators (lo ≤ key < hi).
 func pmCheckInvariants(t *testing.T, pm *pMap) {
 	t.Helper()
-	var walk func(n *pnode, isRoot bool)
-	walk = func(n *pnode, isRoot bool) {
-		if n == nil {
-			return
+	var walk func(n *pnode, isRoot bool, lo, hi []byte) int
+	walk = func(n *pnode, isRoot bool, lo, hi []byte) int {
+		if n.isLeaf() {
+			if len(n.keys) == 0 && !isRoot {
+				t.Fatal("non-root leaf is empty")
+			}
+			if n.packed == nil && len(n.keys) != len(n.vals) {
+				t.Fatal("keys/vals length mismatch")
+			}
+			if len(n.keys) != len(n.weights) {
+				t.Fatal("keys/weights length mismatch")
+			}
+		} else {
+			if len(n.keys) == 0 && !isRoot {
+				t.Fatal("0-key interior unexpected")
+			}
+			if len(n.vals) != 0 || len(n.weights) != 0 {
+				t.Fatal("interior node carries records")
+			}
+			if len(n.children) != len(n.keys)+1 {
+				t.Fatal("interior child count")
+			}
 		}
-		if len(n.keys) == 0 && !isRoot {
-			t.Fatal("non-root node is empty")
+		for i := 1; i < len(n.keys); i++ {
+			if bytes.Compare(n.keys[i-1], n.keys[i]) >= 0 {
+				t.Fatal("keys out of order")
+			}
 		}
-		if len(n.keys) != len(n.vals) || len(n.keys) != len(n.weights) {
-			t.Fatal("keys/vals/weights length mismatch")
+		// Subtree keys respect the bounding separators: lo ≤ key < hi (lo inclusive because a
+		// separator equals the right subtree's first key at split time).
+		for _, k := range n.keys {
+			if lo != nil && bytes.Compare(k, lo) < 0 {
+				t.Fatal("key below its subtree's low separator")
+			}
+			if hi != nil && bytes.Compare(k, hi) >= 0 {
+				t.Fatal("key at/above its subtree's high separator")
+			}
 		}
-		if !n.isLeaf() && len(n.children) != len(n.keys)+1 {
-			t.Fatal("interior child count")
+		if n.payload(pmShape) > pmCap {
+			t.Fatalf("node payload %d exceeds cap %d", n.payload(pmShape), pmCap)
 		}
-		if n.payload(pmK) > pmCap {
-			t.Fatalf("node payload %d exceeds cap %d", n.payload(pmK), pmCap)
+		if n.isLeaf() {
+			return 1
 		}
-		for _, c := range n.children {
-			walk(c.node, false) // fully resident in-memory tree
+		depth := -1
+		for i, c := range n.children {
+			clo, chi := lo, hi
+			if i > 0 {
+				clo = n.keys[i-1]
+			}
+			if i < len(n.keys) {
+				chi = n.keys[i]
+			}
+			d := walk(c.node, false, clo, chi) // fully resident in-memory tree
+			if depth == -1 {
+				depth = d
+			} else if depth != d {
+				t.Fatal("leaves at unequal depth")
+			}
 		}
+		return depth + 1
 	}
-	walk(pm.root, true)
+	if pm.root != nil {
+		walk(pm.root, true, nil, nil)
+	}
 }
 
 func TestPMapInsertGetRemoveVsReference(t *testing.T) {
@@ -76,7 +126,7 @@ func TestPMapInsertGetRemoveVsReference(t *testing.T) {
 	const n = 4000
 
 	for _, k := range pmShuffled(n) {
-		_, had, _ := pm.Insert(pmKey(k), pmRow(int64(k)), pmW, pmCap, pmK, nil)
+		_, had, _ := pm.Insert(pmKey(k), pmRow(int64(k)), pmW, pmCap, pmShape, nil)
 		_, refHad := ref[string(pmKey(k))]
 		if had != refHad {
 			t.Fatalf("insert 'had' mismatch at %d: %v vs %v", k, had, refHad)
@@ -110,7 +160,7 @@ func TestPMapInsertGetRemoveVsReference(t *testing.T) {
 
 	// Overwrite returns the old value and does not change len (kept in sync with the reference).
 	before := pm.Len()
-	old, replaced, _ := pm.Insert(pmKey(7), pmRow(777), pmW, pmCap, pmK, nil)
+	old, replaced, _ := pm.Insert(pmKey(7), pmRow(777), pmW, pmCap, pmShape, nil)
 	if !replaced || !reflect.DeepEqual(old, pmRow(7)) {
 		t.Fatalf("overwrite: old=%v replaced=%v", old, replaced)
 	}
@@ -121,7 +171,7 @@ func TestPMapInsertGetRemoveVsReference(t *testing.T) {
 
 	// Interleave removes with invariant checks so merge-then-split is exercised mid-stream.
 	for step, k := range pmShuffled(n) {
-		got, ok, _ := pm.Remove(pmKey(k), pmCap, pmK, nil)
+		got, ok, _ := pm.Remove(pmKey(k), pmCap, pmShape, nil)
 		want, wok := ref[string(pmKey(k))]
 		delete(ref, string(pmKey(k)))
 		if ok != wok || !reflect.DeepEqual(got, want) {
@@ -134,7 +184,7 @@ func TestPMapInsertGetRemoveVsReference(t *testing.T) {
 	if pm.Len() != 0 {
 		t.Fatalf("not empty after removing all: len %d", pm.Len())
 	}
-	if _, ok, _ := pm.Remove(pmKey(123), pmCap, pmK, nil); ok {
+	if _, ok, _ := pm.Remove(pmKey(123), pmCap, pmShape, nil); ok {
 		t.Fatal("remove of absent key reported present")
 	}
 }
@@ -142,20 +192,20 @@ func TestPMapInsertGetRemoveVsReference(t *testing.T) {
 func TestPMapCloneIsIndependentSnapshot(t *testing.T) {
 	var base pMap
 	for k := uint64(0); k < 2000; k++ {
-		base.Insert(pmKey(k), pmRow(int64(k)), pmW, pmCap, pmK, nil)
+		base.Insert(pmKey(k), pmRow(int64(k)), pmW, pmCap, pmShape, nil)
 	}
 	snap := base // an O(1) value-copy snapshot
 
 	// Mutate a separate copy heavily; the snapshot must be untouched.
 	other := base
 	for k := uint64(0); k < 2000; k++ {
-		other.Insert(pmKey(k), pmRow(-int64(k)), pmW, pmCap, pmK, nil) // overwrite every value
+		other.Insert(pmKey(k), pmRow(-int64(k)), pmW, pmCap, pmShape, nil) // overwrite every value
 	}
 	for k := uint64(2000); k < 3000; k++ {
-		other.Insert(pmKey(k), pmRow(int64(k)), pmW, pmCap, pmK, nil) // grow
+		other.Insert(pmKey(k), pmRow(int64(k)), pmW, pmCap, pmShape, nil) // grow
 	}
 	for k := uint64(0); k < 500; k++ {
-		other.Remove(pmKey(k), pmCap, pmK, nil) // shrink
+		other.Remove(pmKey(k), pmCap, pmShape, nil) // shrink
 	}
 
 	if snap.Len() != 2000 {
@@ -184,23 +234,122 @@ func TestPMapCloneIsIndependentSnapshot(t *testing.T) {
 }
 
 // Wide values (near RECORD_MAX) force tiny fan-out — the stress case for the split point and the
-// non-empty-halves guarantee. With weight 100 (≤ RECORD_MAX(240,1) = 106 — the PAX leaf reserves
-// 12+16·K, format.md v23) a two-record leaf (2·100 + directoryOverhead(2,1)=28 = 228 ≤ 240) fits
-// but a third record overflows, so a node holds ~2 entries.
+// non-empty-halves guarantee. With weight 100 (≤ RECORD_MAX(240,1) = (240−28)/2 = 106) a
+// two-record leaf (2·100 + leafOverhead(2, {fixed:1}) = 218 ≤ 240) fits but a third record
+// overflows, so a node holds ~2 entries.
 func TestPMapWideValuesKeepNodesValid(t *testing.T) {
 	var pm pMap
-	ref := map[string]bool{}
 	for _, k := range pmShuffled(300) {
-		pm.Insert(pmKey(k), pmRow(int64(k)), 100, pmCap, pmK, nil)
-		ref[string(pmKey(k))] = true
+		pm.Insert(pmKey(k), pmRow(int64(k)), 100, pmCap, pmShape, nil)
 		pmCheckInvariants(t, &pm)
 	}
 	for _, k := range pmShuffled(300) {
-		pm.Remove(pmKey(k), pmCap, pmK, nil)
+		pm.Remove(pmKey(k), pmCap, pmShape, nil)
 		pmCheckInvariants(t, &pm)
 	}
 	if pm.Len() != 0 {
 		t.Fatalf("not empty: %d", pm.Len())
+	}
+}
+
+// Near-cap KEYS (the max-size-separator case, format.md "Interior node"): separators are key
+// copies, so two of them overflow an interior node, forcing the pinned degenerate N = 2 → m = 1
+// split and legal 0-key interiors. The map must stay correct through inserts, scans, and removes
+// (a looser invariant check — 0-key interiors are legal here).
+func TestPMapNearCapKeysDegenerateInterior(t *testing.T) {
+	// Index-tree shape: zero value columns, record = key alone. RECORD_MAX(0) = (240−12)/2 = 114;
+	// keys of 110 bytes keep records under the cap while two separators (2·110 + 20) overflow an
+	// interior.
+	shape := leafShape{}
+	bigKey := func(n uint64) []byte {
+		k := make([]byte, 110)
+		for i := range k {
+			k[i] = 0xAB
+		}
+		binary.BigEndian.PutUint64(k[:8], n)
+		return k
+	}
+	var pm pMap
+	ref := map[string]bool{}
+	for _, k := range pmShuffled(60) {
+		pm.Insert(bigKey(k), storedRow{}, 110, pmCap, shape, nil)
+		ref[string(bigKey(k))] = true
+	}
+	if pm.Len() != len(ref) {
+		t.Fatalf("len %d != %d", pm.Len(), len(ref))
+	}
+	// Structure: fits + routing correctness (0-key interiors allowed).
+	var walk func(n *pnode)
+	walk = func(n *pnode) {
+		if n.payload(shape) > pmCap {
+			t.Fatalf("node payload %d overflows its page", n.payload(shape))
+		}
+		if !n.isLeaf() {
+			if len(n.children) != len(n.keys)+1 {
+				t.Fatal("interior child count")
+			}
+			for _, c := range n.children {
+				walk(c.node)
+			}
+		}
+	}
+	walk(pm.root)
+	keys, _, err := pm.inorder(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 60 {
+		t.Fatalf("inorder len %d != 60", len(keys))
+	}
+	if !sort.SliceIsSorted(keys, func(a, b int) bool { return bytes.Compare(keys[a], keys[b]) < 0 }) {
+		t.Fatal("iteration not in key order")
+	}
+	for k := uint64(0); k < 60; k++ {
+		if _, ok, _ := pm.Get(bigKey(k), nil); !ok {
+			t.Fatalf("get miss at %d", k)
+		}
+	}
+	for _, k := range pmShuffled(60) {
+		if _, ok, _ := pm.Remove(bigKey(k), pmCap, shape, nil); !ok {
+			t.Fatalf("remove miss at %d", k)
+		}
+	}
+	if pm.Len() != 0 {
+		t.Fatalf("not empty: %d", pm.Len())
+	}
+}
+
+// The bounded scan yields exactly the in-bound rows, in order, and the nodes counted during the
+// one windowed walk match overlapNodeCount's second counting descent (the page_read contract,
+// cost.md §3).
+func TestPMapBoundedScanCountsAgree(t *testing.T) {
+	var pm pMap
+	for _, k := range pmShuffled(2000) {
+		pm.Insert(pmKey(k), pmRow(int64(k)), pmW, pmCap, pmShape, nil)
+	}
+	b := keyBound{lo: pmKey(500), loInc: true, hi: pmKey(1500), hiInc: false}
+	keys, _, nodes, err := pm.rangeEntriesCounted(b, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 1000 {
+		t.Fatalf("entries %d != 1000", len(keys))
+	}
+	if !bytes.Equal(keys[0], pmKey(500)) || !bytes.Equal(keys[999], pmKey(1499)) {
+		t.Fatal("bounded scan endpoints wrong")
+	}
+	if want := pm.overlapNodeCount(b); nodes != want {
+		t.Fatalf("counted nodes %d != overlapNodeCount %d", nodes, want)
+	}
+
+	// Exclusive lo / inclusive hi.
+	b2 := keyBound{lo: pmKey(500), loInc: false, hi: pmKey(1500), hiInc: true}
+	keys2, _, err := pm.rangeEntries(b2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys2) != 1000 || !bytes.Equal(keys2[0], pmKey(501)) || !bytes.Equal(keys2[999], pmKey(1500)) {
+		t.Fatal("exclusive-lo/inclusive-hi window wrong")
 	}
 }
 
@@ -212,16 +361,16 @@ func TestPMapEmptyAndSingle(t *testing.T) {
 	if _, ok, _ := pm.Get(pmKey(1), nil); ok {
 		t.Fatal("get on empty")
 	}
-	if _, ok, _ := pm.Remove(pmKey(1), pmCap, pmK, nil); ok {
+	if _, ok, _ := pm.Remove(pmKey(1), pmCap, pmShape, nil); ok {
 		t.Fatal("remove on empty")
 	}
-	if _, replaced, _ := pm.Insert(pmKey(1), pmRow(1), pmW, pmCap, pmK, nil); replaced {
+	if _, replaced, _ := pm.Insert(pmKey(1), pmRow(1), pmW, pmCap, pmShape, nil); replaced {
 		t.Fatal("first insert reported overwrite")
 	}
 	if v, ok, _ := pm.Get(pmKey(1), nil); !ok || !reflect.DeepEqual(v, pmRow(1)) {
 		t.Fatal("get after insert")
 	}
-	if v, ok, _ := pm.Remove(pmKey(1), pmCap, pmK, nil); !ok || !reflect.DeepEqual(v, pmRow(1)) {
+	if v, ok, _ := pm.Remove(pmKey(1), pmCap, pmShape, nil); !ok || !reflect.DeepEqual(v, pmRow(1)) {
 		t.Fatal("remove returns the value")
 	}
 	if pm.Len() != 0 || pm.root != nil {
@@ -230,13 +379,13 @@ func TestPMapEmptyAndSingle(t *testing.T) {
 }
 
 // TestPMapReverseScanIsForwardReversed checks scanRangeRev yields the EXACT reverse of scanRange's
-// row sequence over a MULTI-LEVEL tree — the interior-node interleaving (separators between
-// children) and the asymmetric inclusive-lo edge that single-leaf conformance tables (the
-// DESC-LIMIT corpus cases) cannot exercise. 200 entries at pmCap build several levels.
+// row sequence over a MULTI-LEVEL tree — the interior child windowing (descend high→low, v24) that
+// single-leaf conformance tables (the DESC-LIMIT corpus cases) cannot exercise. 200 entries at
+// pmCap build several levels.
 func TestPMapReverseScanIsForwardReversed(t *testing.T) {
 	var pm pMap
 	for n := uint64(0); n < 200; n++ {
-		pm.Insert(pmKey(n), pmRow(int64(n)), pmW, pmCap, pmK, nil)
+		pm.Insert(pmKey(n), pmRow(int64(n)), pmW, pmCap, pmShape, nil)
 	}
 	if pm.nodeCount() <= 2 {
 		t.Fatal("test needs a multi-level tree")
@@ -290,7 +439,7 @@ func TestPMapReverseScanIsForwardReversed(t *testing.T) {
 func TestPMapRangeCursorMatchesScanRange(t *testing.T) {
 	var pm pMap
 	for n := uint64(0); n < 200; n++ {
-		pm.Insert(pmKey(n), pmRow(int64(n)), pmW, pmCap, pmK, nil)
+		pm.Insert(pmKey(n), pmRow(int64(n)), pmW, pmCap, pmShape, nil)
 	}
 	if pm.nodeCount() <= 2 {
 		t.Fatal("test needs a multi-level tree")

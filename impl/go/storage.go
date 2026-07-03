@@ -12,7 +12,7 @@ package jed
 type storedRow []Value
 
 // TableStore holds one table's rows, keyed by encoded primary key. Since Phase 6 (P6.1) the PMap is
-// the page-backed B-tree, so the store carries the page payload cap (= page_size − 16) and the
+// the page-backed B+tree, so the store carries the page payload cap (= page_size − 16) and the
 // column types to weigh each record (recordSize) for the size-driven split (spec/fileformat/format.md).
 type tableStore struct {
 	rows pMap
@@ -26,6 +26,10 @@ type tableStore struct {
 	// spec/design/composite.md §4), for computing record weights and the recursive value codec.
 	cap      int
 	colTypes []colType
+	// shape is the leaf column-class shape ({fixed, variable} counts — spec/fileformat/format.md
+	// v24 "Leaf node"), derived once from colTypes: the B+tree's leaf-overhead arithmetic needs it
+	// on every size-driven split/merge decision without seeing the types themselves.
+	shape leafShape
 	// paging is the shared pager + leaf buffer pool for a file-backed database (spec/design/pager.md):
 	// the read/mutation path faults OnDisk leaves through it. nil for an in-memory database and for a
 	// table created in-session (fully resident until the file is reopened); attached by the
@@ -36,7 +40,7 @@ type tableStore struct {
 // NewTableStore builds an empty store for a table whose columns have the given resolved types,
 // serializing at page payload cap (= page_size − 16). In-memory (no paging) until attachPaging.
 func newTableStore(cap int, colTypes []colType) *tableStore {
-	return &tableStore{cap: cap, colTypes: colTypes}
+	return &tableStore{cap: cap, colTypes: colTypes, shape: leafShapeFor(colTypes)}
 }
 
 // clone returns an independent O(1) snapshot of the store: the PMap value-copy shares structure
@@ -44,7 +48,7 @@ func newTableStore(cap int, colTypes []colType) *tableStore {
 // transaction model (spec/design/transactions.md §2). The shared paging context is shared, not copied
 // (one pool per database).
 func (s *tableStore) clone() *tableStore {
-	return &tableStore{rows: s.rows, nextRowid: s.nextRowid, cap: s.cap, colTypes: s.colTypes, paging: s.paging}
+	return &tableStore{rows: s.rows, nextRowid: s.nextRowid, cap: s.cap, colTypes: s.colTypes, shape: s.shape, paging: s.paging}
 }
 
 // attachPaging attaches this database's shared paging context (the demand-paged file load, format.go):
@@ -100,16 +104,12 @@ func (s *storeScan) resolveColumns(row storedRow, mask []bool) (storedRow, error
 	return s.store.resolveColumns(row, mask)
 }
 
-// weight is this row's on-disk record size — the weight the page-backed B-tree splits on. Accounts
+// weight is this row's on-disk record size — the weight the page-backed B+tree splits on. Accounts
 // for out-of-line spill at cap (an externalized value weighs its pointer, not its full body —
 // large-values.md §12), so split points match the serialized pages.
 func (s *tableStore) weight(key []byte, row storedRow) uint32 {
 	return uint32(recordSize(s.colTypes, key, row, s.cap))
 }
-
-// paxK is the value-column count threaded into the B-tree split math — a leaf's PAX directory
-// overhead grows with it (format.md v23). An index store carries no value columns (K=0).
-func (s *tableStore) paxK() int { return len(s.colTypes) }
 
 // Insert adds a row under its encoded key. Returns (false, nil) if the key already exists
 // (primary-key uniqueness); the caller decides how to surface that. May fault the target leaf through
@@ -121,7 +121,7 @@ func (s *tableStore) Insert(key []byte, row storedRow) (bool, error) {
 	} else if ok {
 		return false, nil
 	}
-	if _, _, err := s.rows.Insert(key, row, s.weight(key, row), s.cap, s.paxK(), src); err != nil {
+	if _, _, err := s.rows.Insert(key, row, s.weight(key, row), s.cap, s.shape, src); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -146,14 +146,14 @@ func (s *tableStore) BumpRowidTo(n int64) {
 // Replace overwrites the row stored at an existing key (UPDATE). The key is
 // unchanged, so key order and the rowid counter are untouched. May fault the target leaf.
 func (s *tableStore) Replace(key []byte, row storedRow) error {
-	_, _, err := s.rows.Insert(key, row, s.weight(key, row), s.cap, s.paxK(), s.leafSrc())
+	_, _, err := s.rows.Insert(key, row, s.weight(key, row), s.cap, s.shape, s.leafSrc())
 	return err
 }
 
 // Remove deletes the row at key (DELETE). Returns whether a row was present. May fault leaves the
 // delete descends into / rebalances against.
 func (s *tableStore) Remove(key []byte) (bool, error) {
-	_, ok, err := s.rows.Remove(key, s.cap, s.paxK(), s.leafSrc())
+	_, ok, err := s.rows.Remove(key, s.cap, s.shape, s.leafSrc())
 	return ok, err
 }
 

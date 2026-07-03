@@ -45,19 +45,22 @@ func TestSplitShapeCostsArePinned(t *testing.T) {
 	}
 
 	// The same logical table costs nearly the same full scan whichever order built it:
-	// ascending packs ~full (append splits), shuffled lands ~2 nodes behind (balanced
+	// ascending packs ~full (append splits), shuffled lands a few nodes behind (balanced
 	// splits). Under the old always-largest-left rule the shuffled tree splintered into
-	// hundreds of near-empty nodes and this cost exploded. The counts rose from the pre-v23
-	// row-major layout (259/261/139/103) because a PAX leaf's per-column directory overhead
-	// (format.md v23) lowers leaf fan-out, so a scan touches a few more pages.
+	// hundreds of near-empty nodes and this cost exploded. The counts dropped from v23
+	// (268/278/156) with the v24 B+tree (format.md): interior nodes are a record-free
+	// separator skeleton with far higher fan-out, so a full scan touches fewer pages.
 	asc := splitShapeDB(t, false)
-	pin(asc, "SELECT count(*) FROM t", 268)
+	pin(asc, "SELECT count(*) FROM t", 258)
 	shuf := splitShapeDB(t, true)
-	pin(shuf, "SELECT count(*) FROM t", 278)
+	pin(shuf, "SELECT count(*) FROM t", 265)
 
 	// Sorted index build (indexes.md §1) packs the index tree like the ascending case;
 	// the build charges only its table scan, and the bounded lookup's cost pins the
-	// index path's shape (pk ≡ 3 mod 7 in [0,120] ⇒ 17 admitted rows for v = 3).
-	pin(shuf, "CREATE INDEX t_v_idx ON t (v)", 156)
-	pin(shuf, "SELECT id FROM t WHERE v = 3", 100)
+	// index path's shape (pk ≡ 3 mod 7 in [0,120] ⇒ 17 admitted rows for v = 3). The
+	// lookup rose from v23's 100: a B+tree point lookup always descends to a leaf
+	// (interior records could terminate a v23 descent early), so each of the 17 table
+	// fetches pays the full root→leaf path.
+	pin(shuf, "CREATE INDEX t_v_idx ON t (v)", 143)
+	pin(shuf, "SELECT id FROM t WHERE v = 3", 105)
 }

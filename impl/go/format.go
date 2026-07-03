@@ -23,16 +23,16 @@ import (
 var magic = [4]byte{'J', 'E', 'D', 'B'}
 
 const (
-	formatVersion   uint16 = 23    // on-disk format version (23 = PAX leaf layout (spec/fileformat/format.md "Leaf node"): a B-tree LEAF page (page_type 2) stores its records COLUMN-MAJOR — key directory (N+1 u32 prefix-sum) ‖ key blob ‖ column directory (K+1 u32 region offsets, colStart[K] = payload end) ‖ per column a value directory (N+1 u32 prefix-sum) then that column's N value bodies. The value codec is byte-unchanged (same 1-byte tag + body); interior pages (page_type 3) stay row-major (child pointers ‖ records). The per-record key_len u16 is dropped (the key directory carries lengths), so a record's split weight is unchanged (2 + key_len + Σ value_size) but a leaf's payload gains directoryOverhead(N,K); RECORD_MAX tightens to (C − (12+16K))/2. No catalog-shape change — a file's catalog/interior/overflow bytes are identical to v22; only leaf payload byte-order moves. 22 = varchar(n) length limits (spec/design/types.md §15): a text column entry appends a u32 varchar_max_len in the typmod slot (type_code 4) — 0 = unbounded, 1…10485760 = the varchar(n)/string(n) limit; a composite text field carries the same u32. The value codec is unchanged (a value is checked/truncated before encoding). A file whose every text column is unbounded still moves to v22 by its version byte + a 0 on each text column/field. 21 = EXCLUDE constraints (spec/design/gist.md §7/§8, GX3): a per-table exclusion list after the foreign-key list — each entry the constraint name, its backing GiST index name, and a (column ordinal u16, operator strategy u8) element vector (&& = 0, = 1). The backing GiST index is stored like any GiST index — the index list now admits MULTI-COLUMN GiST indexes whose leaf/interior bound is the per-column component bounds concatenated (single-column GX1/GX2 bytes unchanged). A table with no exclusion still moves to v21 by its version byte + the zero count. 20 = GiST indexes (spec/design/gist.md, GX1): a per-index index_kind = 2 selects the GiST access method, and the index's on-disk form is a persisted R-tree of bounding-predicate nodes — two new page types 5 (GiST leaf) / 6 (GiST interior). A leaf entry is bound_len(u16) ‖ encode_range_body(bound) ‖ skey_len(u16) ‖ skey; an interior entry is bound_len(u16) ‖ encode_range_body(union) ‖ child_page(u32). The catalog index entry is unchanged (index_root_page points at the R-tree root, 0 for empty); a file with no GiST index still moves to v20 only by its version byte. 19 = storable json/jsonb columns (spec/design/json.md, J1/J1b): a column type can be json (type_code 18) or jsonb (type_code 19) — plain scalar catalog entries with no extra descriptor (the has_jsonb_dict door §3.2 stays clear, zero bytes). A json value's body is the verbatim text, length-prefixed like text (§4); a jsonb value's body is the self-delimiting tagged-node tree (§2 — node tags + LEB128 varint counts, numbers as the decimal body), riding the large-value overflow + LZ4 path. No catalog-shape change, so a file with no json/jsonb column still moves to v19 only by its version byte. 18 = reference-only collations: the catalog entry_kind 3 collation entry is metadata ONLY — a flags byte bit0 is_default, then name + unicode_version + cldr_version + description (each u16-len + UTF-8) — emitted after sequences and before tables; the compiled table is NOT in the file, it is vendored into the binary and resolved by name on open, spec/design/collation.md §2/§5/§9. This supersedes v17's baked snapshot (the LZ4-compressed .coll artifact is gone). The per-column collation is unchanged (column flags byte bit6 has_collation + a trailing name). 17 = baked collations (superseded). 16 = range columns: type_code 17 + an inline element-type descriptor in the catalog — one scalar code, spec/design/ranges.md §3 — and the compact range value body, a flags byte EMPTY/LB_INF/UB_INF/LB_INC/UB_INC + present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: an entry_kind = 2 catalog entry — name + six i64 fields + a flags byte — emitted after composite-type entries and before table entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4. 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
-	pageHeader             = 16    // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
-	interiorReserve        = 12    // bytes reserved inside RECORD_MAX for a two-key interior node's 3 child pointers (4·3) — independent of pageHeader (format.md "Why the record cap")
-	pageCatalog     byte   = 1     // page_type for a catalog page
-	pageLeaf        byte   = 2     // page_type for a B-tree leaf node
-	pageInterior    byte   = 3     // page_type for a B-tree interior node
-	pageOverflow    byte   = 4     // page_type for an out-of-line value slab (large-values.md §12)
-	rootPage        uint32 = 2     // catalog root of a fresh empty db (relocatable thereafter)
-	minPageSize            = 256   // smallest valid page size; chosen floor above the structural min pageHeader+36=52 (format.md *Page model*)
-	maxPageSize            = 65536 // largest valid page size, 64 KiB (format.md *Page model*; CLAUDE.md §13)
+	formatVersion    uint16 = 24    // on-disk format version (24 = the B+tree reshape (spec/design/bplus-reshape.md, slice B1; spec/fileformat/format.md "The per-table data B+tree"): records live ONLY in leaves — an INTERIOR page (page_type 3) is a record-free routing skeleton, N+1 child pointers ‖ an N-entry end-offset separator directory ‖ the separator key blob (a separator is a COPY of a boundary key; leaf splits copy up, interior splits push up, leaf merges remove the parent separator, interior merges pull it down). A LEAF page's column regions each lead with a reserved flags byte (0 — the string-dictionary door) and take a class-determined shape: a FIXED-WIDTH column is a null bitmap (ceil(N/8), MSB-first, set = NULL) + N×width dense UNTAGGED slots (a NULL slot zero-filled); a VARIABLE-WIDTH column is an N-entry end-offset value directory + the tagged v23 codec bytes with NULL a ZERO-LENGTH SPAN (no 0x01 tag inside a leaf; the single-value codec elsewhere is unchanged). All directories become N-entry END offsets (the redundant leading 0 of the v23 N+1 prefix sums is dropped). record_size is restated as key_len + Σ value_size (fixed → its width always, variable → 0 when NULL else the tagged encoded size; the v23 phantom 2+ is dropped); RECORD_MAX keeps its v23 value (C − max(12, 12+16K))/2, re-derived leaf-only. Catalog/overflow/GiST pages are byte-identical to v23. 23 = PAX leaf layout (spec/fileformat/format.md "Leaf node"): a B-tree LEAF page (page_type 2) stores its records COLUMN-MAJOR — key directory (N+1 u32 prefix-sum) ‖ key blob ‖ column directory (K+1 u32 region offsets, colStart[K] = payload end) ‖ per column a value directory (N+1 u32 prefix-sum) then that column's N value bodies. The value codec is byte-unchanged (same 1-byte tag + body); interior pages (page_type 3) stay row-major (child pointers ‖ records). 22 = varchar(n) length limits (spec/design/types.md §15): a text column entry appends a u32 varchar_max_len in the typmod slot (type_code 4) — 0 = unbounded, 1…10485760 = the varchar(n)/string(n) limit; a composite text field carries the same u32. The value codec is unchanged (a value is checked/truncated before encoding). A file whose every text column is unbounded still moves to v22 by its version byte + a 0 on each text column/field. 21 = EXCLUDE constraints (spec/design/gist.md §7/§8, GX3): a per-table exclusion list after the foreign-key list — each entry the constraint name, its backing GiST index name, and a (column ordinal u16, operator strategy u8) element vector (&& = 0, = 1). The backing GiST index is stored like any GiST index — the index list now admits MULTI-COLUMN GiST indexes whose leaf/interior bound is the per-column component bounds concatenated (single-column GX1/GX2 bytes unchanged). A table with no exclusion still moves to v21 by its version byte + the zero count. 20 = GiST indexes (spec/design/gist.md, GX1): a per-index index_kind = 2 selects the GiST access method, and the index's on-disk form is a persisted R-tree of bounding-predicate nodes — two new page types 5 (GiST leaf) / 6 (GiST interior). A leaf entry is bound_len(u16) ‖ encode_range_body(bound) ‖ skey_len(u16) ‖ skey; an interior entry is bound_len(u16) ‖ encode_range_body(union) ‖ child_page(u32). The catalog index entry is unchanged (index_root_page points at the R-tree root, 0 for empty); a file with no GiST index still moves to v20 only by its version byte. 19 = storable json/jsonb columns (spec/design/json.md, J1/J1b): a column type can be json (type_code 18) or jsonb (type_code 19) — plain scalar catalog entries with no extra descriptor (the has_jsonb_dict door §3.2 stays clear, zero bytes). A json value's body is the verbatim text, length-prefixed like text (§4); a jsonb value's body is the self-delimiting tagged-node tree (§2 — node tags + LEB128 varint counts, numbers as the decimal body), riding the large-value overflow + LZ4 path. No catalog-shape change, so a file with no json/jsonb column still moves to v19 only by its version byte. 18 = reference-only collations: the catalog entry_kind 3 collation entry is metadata ONLY — a flags byte bit0 is_default, then name + unicode_version + cldr_version + description (each u16-len + UTF-8) — emitted after sequences and before tables; the compiled table is NOT in the file, it is vendored into the binary and resolved by name on open, spec/design/collation.md §2/§5/§9. This supersedes v17's baked snapshot (the LZ4-compressed .coll artifact is gone). The per-column collation is unchanged (column flags byte bit6 has_collation + a trailing name). 17 = baked collations (superseded). 16 = range columns: type_code 17 + an inline element-type descriptor in the catalog — one scalar code, spec/design/ranges.md §3 — and the compact range value body, a flags byte EMPTY/LB_INF/UB_INF/LB_INC/UB_INC + present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: an entry_kind = 2 catalog entry — name + six i64 fields + a flags byte — emitted after composite-type entries and before table entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4. 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
+	pageHeader              = 16    // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
+	recordMaxReserve        = 12    // bytes reserved inside RECORD_MAX beyond the per-column term — independent of pageHeader (format.md "Why the record cap"). Historically the two-key interior node's 3 child pointers (4·3); since v24 the value is kept as the K = 0 floor of the leaf-only re-derivation (a two-record index leaf is exactly 2·(C−12)/2 + 4·2 + 4 = C)
+	pageCatalog      byte   = 1     // page_type for a catalog page
+	pageLeaf         byte   = 2     // page_type for a B-tree leaf node
+	pageInterior     byte   = 3     // page_type for a B-tree interior node
+	pageOverflow     byte   = 4     // page_type for an out-of-line value slab (large-values.md §12)
+	rootPage         uint32 = 2     // catalog root of a fresh empty db (relocatable thereafter)
+	minPageSize             = 256   // smallest valid page size; chosen floor above the structural min pageHeader+36=52 (format.md *Page model*)
+	maxPageSize             = 65536 // largest valid page size, 64 KiB (format.md *Page model*; CLAUDE.md §13)
 
 	// Value-codec presence tags beyond 0x00 present-inline-plain / 0x01 NULL (large-values.md
 	// §12/§13; format.md "Large values"): 0x02 external-plain (u32 first_page + u32 payload_len),
@@ -970,22 +970,17 @@ func serializeNode(n *pnode, colTypes []colType, capacity int, nextIndex uint32,
 	index := nextIndex
 	nextIndex++
 
-	// Encode records, spilling over-large values to overflow pages allocated after this node's index
-	// (post-order traversal + record-then-column order → deterministic, golden-pinnable layout). A LEAF
-	// is column-major (PAX, v23 — encodeLeafPAX); an INTERIOR node stays row-major (child pointers ‖
-	// separator records), format.md "Leaf node".
+	// Encode a leaf's records, spilling over-large values to overflow pages allocated after this
+	// node's index (post-order traversal + record-then-column order → deterministic, golden-pinnable
+	// layout; only LEAVES allocate chains in v24). A LEAF is column-major (PAX — encodeLeafPAX); an
+	// INTERIOR node is the record-free keys+children skeleton (encodeInterior), format.md.
 	var ovf []overflowPageOut
 	take := func() uint32 { p := nextIndex; nextIndex++; return p }
 	var payload []byte
 	pageType := pageLeaf
 	if len(n.children) > 0 {
 		pageType = pageInterior
-		for _, cp := range childPages {
-			payload = appendU32(payload, cp)
-		}
-		for i := range n.keys {
-			payload = append(payload, encodeRecord(colTypes, n.keys[i], n.vals[i], capacity, take, &ovf)...)
-		}
+		payload = encodeInterior(n.keys, childPages)
 	} else {
 		// A leaf may be Packed here: a demand-paged reopen faults a single-leaf table's root leaf
 		// resident (readSkeleton), and toImage re-serializes it. Materialize through the seam
@@ -1221,33 +1216,28 @@ func serializeDirty(n *pnode, colTypes []colType, capacity, ps int, alloc *pageA
 		}
 		childPages[i] = cp
 	}
-	// Encode records, spilling over-large values to overflow pages drawn from the same allocator
-	// (free-list first, then high-water — large-values.md §12). A dirty node may carry rows the
-	// lazy load left unfetched (a sibling row's mutation dirtied them): resolve those through the
-	// pager first — unmetered commit work, large-values.md §14 — so the re-encode re-plans the
-	// resident row exactly as an eager writer would (chains are rewritten fresh; sharing an
-	// unchanged chain is the deferred byte-layout follow-on). A LEAF is column-major (PAX v23); an
-	// INTERIOR node stays row-major (child pointers ‖ separator records).
-	rows := make([]storedRow, len(n.keys))
-	for i := range n.keys {
-		row, err := resolveForEncode(n.vals[i], colTypes, paging)
-		if err != nil {
-			return 0, err
-		}
-		rows[i] = row
-	}
+	// Encode a leaf's records, spilling over-large values to overflow pages drawn from the same
+	// allocator (free-list first, then high-water — large-values.md §12). A dirty leaf may carry
+	// rows the lazy load left unfetched (a sibling row's mutation dirtied them): resolve those
+	// through the pager first — unmetered commit work, large-values.md §14 — so the re-encode
+	// re-plans the resident row exactly as an eager writer would (chains are rewritten fresh;
+	// sharing an unchanged chain is the deferred byte-layout follow-on). An INTERIOR node is the
+	// record-free keys+children skeleton (v24) — no values, no chains.
 	var ovf []overflowPageOut
 	var payload []byte
 	pageType := pageLeaf
 	if len(n.children) > 0 {
 		pageType = pageInterior
-		for _, cp := range childPages {
-			payload = appendU32(payload, cp)
-		}
-		for i := range n.keys {
-			payload = append(payload, encodeRecord(colTypes, n.keys[i], rows[i], capacity, alloc.take, &ovf)...)
-		}
+		payload = encodeInterior(n.keys, childPages)
 	} else {
+		rows := make([]storedRow, len(n.keys))
+		for i := range n.keys {
+			row, err := resolveForEncode(n.vals[i], colTypes, paging)
+			if err != nil {
+				return 0, err
+			}
+			rows[i] = row
+		}
 		payload = encodeLeafPAX(colTypes, n.keys, rows, capacity, alloc.take, &ovf)
 	}
 	if len(payload) > capacity {
@@ -1645,12 +1635,13 @@ func anySpillable(colTypes []colType) bool {
 	return false
 }
 
-// collectLeafOverflow walks a table's on-disk B-tree, reading each leaf and adding the overflow chain
-// pages its records reference to reached (large-values.md §12). Interior separators are skipped here —
-// readSkeletonNode already collected their chains. Used only for tables with spillable columns during
-// the paged-open free-list reconstruction; it decodes each leaf lazily and follows its chains by
-// HEADERS only (chainPages — large-values.md §14), so opening a file never materializes or
-// decompresses a large value.
+// collectLeafOverflow walks a table's on-disk B+tree, reading each leaf and adding the overflow chain
+// pages its records reference to reached (large-values.md §12). Only leaves own chains in v24 (an
+// interior node is record-free) — an interior page contributes just its child pointers to the walk.
+// Used only for tables with spillable columns during the paged-open free-list reconstruction; it
+// decodes each non-null variable-width span lazily and follows its chains by HEADERS only
+// (chainPages — large-values.md §14), so opening a file never materializes or decompresses a large
+// value.
 func collectLeafOverflow(paging *sharedPaging, pageIdx uint32, colTypes []colType, reached map[uint32]bool) error {
 	block, err := paging.pgr.readBlock(pageIdx)
 	if err != nil {
@@ -1664,13 +1655,20 @@ func collectLeafOverflow(paging *sharedPaging, pageIdx uint32, colTypes []colTyp
 	case pageLeaf:
 		fetch := func(p uint32) ([]byte, error) { return paging.pgr.readBlock(p) }
 		n := int(pg.itemCount)
-		leaf, err := parsePaxLeaf(pg.payload, n, len(colTypes))
+		leaf, err := parsePaxLeaf(pg.payload, n, colTypes)
 		if err != nil {
 			return err
 		}
-		row := make(storedRow, len(colTypes))
-		for i := 0; i < n; i++ {
-			for c, ty := range colTypes {
+		// Only variable-width (spillable) columns can own a chain; fixed-width regions are
+		// skipped entirely, and a NULL (zero-length span) has no bytes to decode.
+		for c, ty := range colTypes {
+			if _, fixed := fixedValueWidth(ty); fixed {
+				continue
+			}
+			for i := 0; i < n; i++ {
+				if leaf.isNull(c, i) {
+					continue
+				}
 				vb, err := leaf.value(c, i)
 				if err != nil {
 					return err
@@ -1680,10 +1678,9 @@ func collectLeafOverflow(paging *sharedPaging, pageIdx uint32, colTypes []colTyp
 				if err != nil {
 					return err
 				}
-				row[c] = v
-			}
-			if err := markChains(row, fetch, reached); err != nil {
-				return err
+				if err := markChains(storedRow{v}, fetch, reached); err != nil {
+					return err
+				}
 			}
 		}
 		return nil
@@ -1709,7 +1706,7 @@ func collectLeafOverflow(paging *sharedPaging, pageIdx uint32, colTypes []colTyp
 	}
 }
 
-// readSkeleton reads a table's on-disk B-tree (rooted at rootPage) into a demand-paged skeleton:
+// readSkeleton reads a table's on-disk B+tree (rooted at rootPage) into a demand-paged skeleton:
 // interior nodes resident, each leaf left OnDisk. Returns the root node and the total row count. A
 // table whose root is itself a single leaf has no interior parent to hold an OnDisk reference, so the
 // root leaf is faulted resident (spec/design/pager.md §1/§4).
@@ -1728,10 +1725,10 @@ func readSkeleton(paging *sharedPaging, root uint32, colTypes []colType, reached
 	return node, length, nil
 }
 
-// readSkeletonNode reads one B-tree node through the pager, once: a leaf becomes an OnDisk childRef
+// readSkeletonNode reads one B+tree node through the pager, once: a leaf becomes an OnDisk childRef
 // (its rows counted from the header, then dropped — not retained); an interior node becomes a resident
-// childRef with its children resolved recursively. Returns the child reference and the subtree's row
-// count.
+// childRef — the record-free separators + children skeleton (v24) — with its children resolved
+// recursively. Returns the child reference and the subtree's row count.
 func readSkeletonNode(paging *sharedPaging, pageIdx uint32, colTypes []colType, reached map[uint32]bool) (childRef, int, error) {
 	reached[pageIdx] = true
 	block, err := paging.pgr.readBlock(pageIdx)
@@ -1762,37 +1759,52 @@ func readSkeletonNode(paging *sharedPaging, pageIdx uint32, colTypes []colType, 
 			children = append(children, child)
 			total += clen
 		}
-		keys, vals, weights := make([][]byte, 0, n), make([]storedRow, 0, n), make([]uint32, 0, n)
-		// Separators decode lazily like leaves (large-values.md §14): an external value stays an
-		// unfetched reference; its chain is marked reachable by headers only.
-		fetch := func(p uint32) ([]byte, error) { return paging.pgr.readBlock(p) }
-		for i := 0; i < n; i++ {
-			key, row, w, err := decodeRecordLazy(colTypes, pg.payload, &pos)
-			if err != nil {
-				return childRef{}, 0, err
-			}
-			weights = append(weights, uint32(w))
-			if err := markChains(row, fetch, reached); err != nil {
-				return childRef{}, 0, err
-			}
-			keys = append(keys, key)
-			vals = append(vals, row)
+		// v24: the record-free routing skeleton — an end-offset separator directory + key blob.
+		// Separators carry no values, so no lazy decode and no chains to mark.
+		keys, err := readSeparators(pg.payload, &pos, n)
+		if err != nil {
+			return childRef{}, 0, err
 		}
-		total += n
-		return residentRef(&pnode{keys: keys, vals: vals, weights: weights, children: children, page: pageIdx}), total, nil
+		return residentRef(&pnode{keys: keys, children: children, page: pageIdx}), total, nil
 	default:
 		return childRef{}, 0, newError(DataCorrupted, "expected a B-tree node page")
 	}
 }
 
-// readTree reads a table's on-disk B-tree (rooted at pageIdx) into an in-memory tree, returning the
-// root node and the total row count (spec/fileformat/format.md). An interior node's payload is its
-// N+1 child pointers then its N records; we recurse the pointers, then read the separators. Weights
-// are recomputed from the value codec (the exact size the writer used), so the loaded tree is ready
-// for further size-driven splits.
+// readSeparators reads a v24 interior node's separator keys: the N-entry end-offset directory then
+// the key blob, pos at the directory's first byte (spec/fileformat/format.md "Interior node").
+func readSeparators(payload []byte, pos *int, n int) ([][]byte, error) {
+	ends := make([]uint32, n)
+	for i := range ends {
+		e, err := readU32(payload, pos)
+		if err != nil {
+			return nil, err
+		}
+		ends[i] = e
+	}
+	blob := *pos
+	keys := make([][]byte, 0, n)
+	prev := uint32(0)
+	for _, e := range ends {
+		if e < prev || blob+int(e) > len(payload) {
+			return nil, newError(DataCorrupted, "interior separator directory out of range")
+		}
+		key := make([]byte, e-prev)
+		copy(key, payload[blob+int(prev):blob+int(e)])
+		keys = append(keys, key)
+		prev = e
+	}
+	*pos = blob + int(prev)
+	return keys, nil
+}
+
+// readTree reads a table's on-disk B+tree (rooted at pageIdx) into an in-memory tree, returning the
+// root node and the total row count (spec/fileformat/format.md). An interior node is the v24
+// record-free routing skeleton (child pointers + separators); records live only in leaves. Each
+// leaf weight is read off the directories (key_len + Σ value_len — the v24 record_size), exactly
+// what the writer split on, so the loaded tree is ready for further size-driven splits.
 func readTree(image []byte, ps int, pageIdx uint32, colTypes []colType, reached map[uint32]bool) (*pnode, int, error) {
 	reached[pageIdx] = true
-	capacity := ps - pageHeader
 	pg, err := readPage(image, ps, pageIdx)
 	if err != nil {
 		return nil, 0, err
@@ -1801,7 +1813,7 @@ func readTree(image []byte, ps int, pageIdx uint32, colTypes []colType, reached 
 	switch pg.pageType {
 	case pageLeaf:
 		n := int(pg.itemCount)
-		leaf, err := parsePaxLeaf(pg.payload, n, len(colTypes))
+		leaf, err := parsePaxLeaf(pg.payload, n, colTypes)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -1810,20 +1822,35 @@ func readTree(image []byte, ps int, pageIdx uint32, colTypes []colType, reached 
 			key := make([]byte, len(leaf.keys[i]))
 			copy(key, leaf.keys[i])
 			row := make(storedRow, len(colTypes))
-			w := 2 + len(key)
+			w := len(key)
 			var ovf []uint32
 			for c, ty := range colTypes {
+				w += leaf.valueLen(c, i)
+				if leaf.isNull(c, i) {
+					row[c] = NullValue()
+					continue
+				}
 				vb, err := leaf.value(c, i)
 				if err != nil {
 					return nil, 0, err
 				}
 				p := 0
-				v, err := readValue(ty, vb, &p, fetch, &ovf)
-				if err != nil {
-					return nil, 0, err
+				if _, fixed := fixedValueWidth(ty); fixed {
+					// A fixed-width slot is the untagged inline body.
+					v, err := readInlineBody(ty, vb, &p, decodeConstruct)
+					if err != nil {
+						return nil, 0, err
+					}
+					row[c] = v
+				} else {
+					// A variable value's span is its tagged codec bytes; external chains are
+					// gathered eagerly here (the fully-resident in-memory load).
+					v, err := readValue(ty, vb, &p, fetch, &ovf)
+					if err != nil {
+						return nil, 0, err
+					}
+					row[c] = v
 				}
-				row[c] = v
-				w += len(vb)
 			}
 			weights = append(weights, uint32(w))
 			for _, p := range ovf {
@@ -1852,21 +1879,12 @@ func readTree(image []byte, ps int, pageIdx uint32, colTypes []colType, reached 
 			children = append(children, residentRef(child))
 			total += clen
 		}
-		keys, vals, weights := make([][]byte, 0, n), make([]storedRow, 0, n), make([]uint32, 0, n)
-		for i := 0; i < n; i++ {
-			key, row, ovf, err := decodeRecord(colTypes, pg.payload, &pos, fetch)
-			if err != nil {
-				return nil, 0, err
-			}
-			weights = append(weights, uint32(recordSize(colTypes, key, row, capacity)))
-			for _, p := range ovf {
-				reached[p] = true
-			}
-			keys = append(keys, key)
-			vals = append(vals, row)
+		// v24: the record-free routing skeleton — separators carry no values or chains.
+		keys, err := readSeparators(pg.payload, &pos, n)
+		if err != nil {
+			return nil, 0, err
 		}
-		total += n
-		return &pnode{keys: keys, vals: vals, weights: weights, children: children, page: pageIdx}, total, nil
+		return &pnode{keys: keys, children: children, page: pageIdx}, total, nil
 	default:
 		return nil, 0, newError(DataCorrupted, "expected a B-tree node page")
 	}
@@ -1900,15 +1918,14 @@ func pagePayload(pageSize uint32) int {
 	return int(pageSize) - pageHeader
 }
 
-// recordMaxFor is the largest a single record may serialize to and still satisfy the B-tree split
-// contract — RECORD_MAX(C,K) = (C − max(12, 12+16·K))/2 where C = capacity is the page payload and
-// K the value-column count (format.md "Why the record cap"). A PAX leaf's two-record floor carries
-// the directory overhead directoryOverhead(2,K) = 12+16·K, so the cap tightens by 8·K to keep
-// 2·RECORD_MAX + directoryOverhead(2,K) ≤ C (a two-record leaf never overflows). K=0 (index trees,
-// interior separators) reduces to the historical (C−12)/2. The spill planner reduces a record to ≤
-// this by externalizing values.
+// recordMaxFor is the largest a single LEAF record may serialize to and still satisfy the B+tree
+// split contract — RECORD_MAX(C,K) = (C − max(12, 12+16·K))/2 where C = capacity is the page
+// payload and K the value-column count (format.md "Why the record cap"). The value is deliberately
+// KEPT from v23 (bplus-reshape.md §4.2), re-derived leaf-only: the worst-case (all-variable)
+// two-record leaf overhead is 12 + 13·K ≤ 12 + 16·K, so a two-record leaf never overflows. The
+// spill planner reduces a record to ≤ this by externalizing values.
 func recordMaxFor(capacity, k int) int {
-	reserve := interiorReserve + 16*k // = max(12, 12+16K) since k ≥ 0
+	reserve := recordMaxReserve + 16*k // = max(12, 12+16K) since k ≥ 0
 	m := (capacity - reserve) / 2
 	if m < 0 {
 		m = 0
@@ -1916,16 +1933,74 @@ func recordMaxFor(capacity, k int) int {
 	return m
 }
 
-// directoryOverhead is the extra bytes a PAX (column-major) leaf's payload carries beyond
-// Σ recordSize (format.md "Leaf node"): the key directory (N+1 u32 prefix-sum), the column
-// directory (K+1 u32), and each column's value directory (N+1 u32), minus the N per-record
-// key_len u16 prefixes PAX drops (the key length lives in the key directory instead):
+// fixedValueWidth is the storage width of a FIXED-WIDTH column's value body (the dense leaf slot
+// stride — spec/fileformat/format.md v24 "Leaf node"), or (0, false) for a VARIABLE-WIDTH column
+// (text / bytea / decimal / json / jsonb / composite / array / range — exactly the spillable set).
+// The class decides the column's leaf region shape: fixed-width regions are a null bitmap + dense
+// untagged slots; variable regions are a value directory + tagged codec bytes (NULL = a
+// zero-length span). MUST stay the exact complement of isSpillable.
+func fixedValueWidth(ty colType) (int, bool) {
+	if ty.Composite || ty.Elem != nil || ty.RangeElem != nil {
+		return 0, false
+	}
+	switch ty.Scalar {
+	case scalarInt16:
+		return 2, true
+	case scalarInt32:
+		return 4, true
+	case scalarInt64:
+		return 8, true
+	case scalarBool:
+		return 1, true
+	case scalarUuid:
+		return 16, true
+	case scalarTimestamp, scalarTimestamptz:
+		return 8, true
+	case scalarDate:
+		return 4, true
+	case scalarInterval:
+		return 16, true
+	case scalarFloat64:
+		return 8, true
+	case scalarFloat32:
+		return 4, true
+	default:
+		// text/decimal/bytea/json/jsonb are variable-width; jsonpath is not storable as a column
+		// (type code 20 is reserved), classed variable defensively.
+		return 0, false
+	}
+}
+
+// leafShape is a leaf's column-class shape — the two counts leafOverhead needs beyond N (the fixed
+// and variable column counts, fixed + variable = K). Computed once per store from its column types
+// and threaded through the B+tree's size arithmetic (pmap), which never sees the types themselves.
+type leafShape struct {
+	fixed    int
+	variable int
+}
+
+func (s leafShape) k() int { return s.fixed + s.variable }
+
+// leafShapeFor is the shape of a leaf for a table with these value-column types (an index tree —
+// empty colTypes — is {0, 0}).
+func leafShapeFor(colTypes []colType) leafShape {
+	fixed := 0
+	for _, ty := range colTypes {
+		if _, ok := fixedValueWidth(ty); ok {
+			fixed++
+		}
+	}
+	return leafShape{fixed: fixed, variable: len(colTypes) - fixed}
+}
+
+// leafOverhead is the bytes a v24 leaf's payload carries BEYOND Σ recordSize (format.md "Leaf
+// node"): the key directory (4·N), the column directory (4·(K+1)), and per region a flags byte
+// plus — fixed-width — the null bitmap (ceil(N/8)) or — variable-width — the value directory
+// (4·N). Interior nodes do not use this (their payload is 8·N + 4 + Σ sep_len):
 //
-//	directoryOverhead(N,K) = 4·(N+1) + 4·(K+1) + 4·(N+1)·K − 2·N
-//
-// Interior nodes stay row-major and do not use this (their child-pointer term is 4·(N+1)).
-func directoryOverhead(n, k int) int {
-	return 4*(n+1) + 4*(k+1) + 4*(n+1)*k - 2*n
+//	leafOverhead(N, cols) = 4·N + 4·(K+1) + F·(1 + ceil(N/8)) + V·(1 + 4·N)
+func leafOverhead(n int, shape leafShape) int {
+	return 4*n + 4*(shape.k()+1) + shape.fixed*(1+(n+7)/8) + shape.variable*(1+4*n)
 }
 
 // valueDisp is a value's planned on-disk disposition (large-values.md §2/§12/§13).
@@ -1958,10 +2033,19 @@ type recordPlan struct {
 // block) until the record fits. Shared by the serializer and recordSize (the B-tree split
 // weight): in-memory node boundaries must match the serialized pages.
 func planDispositions(colTypes []colType, key []byte, row storedRow, capacity int) recordPlan {
+	// Each column's inline-plain contribution to recordSize (the v24 basis — format.md "Record"):
+	// a fixed-width column always its width (a NULL occupies a zero-filled slot); a variable-width
+	// column 0 when NULL (a zero-length span) else its tagged inline encoding.
 	inline := make([]int, len(colTypes))
-	size := 2 + len(key)
+	size := len(key)
 	for i, ty := range colTypes {
-		inline[i] = len(encodeValue(ty, row[i]))
+		if w, ok := fixedValueWidth(ty); ok {
+			inline[i] = w
+		} else if row[i].IsNull() {
+			inline[i] = 0
+		} else {
+			inline[i] = len(encodeValue(ty, row[i]))
+		}
 		size += inline[i]
 	}
 	plan := recordPlan{
@@ -2033,10 +2117,12 @@ func planDispositions(colTypes []colType, key []byte, row storedRow, capacity in
 	return plan
 }
 
-// recordSize is the on-disk size of a record — the weight the page-backed B-tree splits on
-// (format.md). Accounts for compression and out-of-line spill: a compressed value contributes its
-// compressed inline form, an externalized one its fixed pointer size (large-values.md §12/§13).
-// Must equal what the serializer produces, so in-memory node boundaries match serialized pages.
+// recordSize is the on-disk size of a record — the weight the page-backed B+tree splits on
+// (format.md "Record": key_len + Σ value_size — a fixed-width column always its width, a NULL
+// variable-width value 0). Accounts for compression and out-of-line spill: a compressed value
+// contributes its compressed inline form, an externalized one its fixed pointer size
+// (large-values.md §12/§13). Must equal what the serializer produces, so in-memory node
+// boundaries match serialized pages.
 func recordSize(colTypes []colType, key []byte, row storedRow, capacity int) int {
 	return planDispositions(colTypes, key, row, capacity).size
 }
@@ -2191,18 +2277,21 @@ func valueFromPayload(ty colType, payload []byte) (Value, error) {
 	}
 }
 
-// encodeRecord builds one record (key_len(u16) | key | payload), spilling over-large values out-of-
-// line per the disposition plan (large-values.md §12). For each externalized value, allocate overflow
-// page(s) via take, append them to *ovf, and write a tag|first_page|len pointer instead of the inline
-// body. capacity is the page payload (the slab size + the spill-plan input). Shared by the whole-image
-// (serializeNode) and incremental (serializeDirty) writers, which differ only in how take allocates.
-func encodeRecord(colTypes []colType, key []byte, row storedRow, capacity int, take func() uint32, ovf *[]overflowPageOut) []byte {
-	plan := planDispositions(colTypes, key, row, capacity)
-	out := make([]byte, 0, 2+len(key)+len(row)*2)
-	out = appendU16(out, uint16(len(key)))
-	out = append(out, key...)
-	for i, ty := range colTypes {
-		out = append(out, encodeDisposedValue(ty, row[i], plan.disp[i], plan.comp[i], capacity, take, ovf)...)
+// encodeInterior builds a v24 INTERIOR node payload (spec/fileformat/format.md "Interior node"):
+// N+1 child pointers ‖ an N-entry end-offset separator directory ‖ the separator key blob.
+// Record-free — no value codec, no overflow chains; a separator is raw order-preserving key bytes.
+func encodeInterior(seps [][]byte, childPages []uint32) []byte {
+	var out []byte
+	for _, cp := range childPages {
+		out = appendU32(out, cp)
+	}
+	off := uint32(0)
+	for _, s := range seps {
+		off += uint32(len(s))
+		out = appendU32(out, off)
+	}
+	for _, s := range seps {
+		out = append(out, s...)
 	}
 	return out
 }
@@ -2242,65 +2331,96 @@ func encodeDisposedValue(ty colType, v Value, disp valueDisp, comp []byte, capac
 	}
 }
 
-// encodeLeafPAX builds a PAX (column-major) leaf payload from records in ascending key order
-// (format.md v23 "Leaf node"). Values are encoded in (record, column) order — so each external
-// value's overflow chain is allocated via take in exactly the row-major order (a node's own page
-// is allocated by the caller first; then chains in record-then-column order), keeping the overflow
-// page indices golden-pinned. The bytes are then assembled column-major:
+// encodeLeafPAX builds a v24 PAX (column-major) leaf payload from records in ascending key order
+// (format.md "Leaf node"). Values are encoded in (record, column) order — so each external value's
+// overflow chain is allocated via take in exactly that order (a node's own page is allocated by
+// the caller first; then chains in record-then-column order), keeping the overflow page indices
+// golden-pinned. The bytes are then assembled column-major:
 //
-//	key dir : keyOff[0..N]   (N+1) u32 prefix-sum into the key blob
+//	key dir : keyEnd[0..N)   N u32 END offsets into the key blob (leading 0 implicit)
 //	key blob: N keys concatenated (ascending)
 //	col dir : colStart[0..K] (K+1) u32 absolute payload offset of each column region; colStart[K]=end
-//	col c   : valOff[0..N]   (N+1) u32 prefix-sum into the column's values, then N value bodies
+//	col c   : a flags byte (0), then — fixed-width — the null bitmap (ceil(N/8), MSB-first, set =
+//	          NULL) + N×width dense UNTAGGED slots (a NULL slot zero-filled), or — variable-width —
+//	          an N-entry u32 end-offset value directory + the tagged value bodies (NULL = a
+//	          zero-length span)
 func encodeLeafPAX(colTypes []colType, keys [][]byte, rows []storedRow, capacity int, take func() uint32, ovf *[]overflowPageOut) []byte {
 	n := len(keys)
 	k := len(colTypes)
-	// Encode each value in (record, column) order; overflow chains allocate here, matching row-major.
+	// Encode each value in (record, column) order; overflow chains allocate here. A fixed-width
+	// column's slot is the untagged inline body (encodeValue minus its 0x00 tag; zeros for NULL);
+	// a variable column's bytes are the tagged disposed form (empty for NULL).
 	valBytes := make([][][]byte, k) // valBytes[c][i]
+	nulls := make([][]bool, k)      // nulls[c][i]
 	for c := range valBytes {
 		valBytes[c] = make([][]byte, n)
+		nulls[c] = make([]bool, n)
 	}
 	for i := 0; i < n; i++ {
 		plan := planDispositions(colTypes, keys[i], rows[i], capacity)
 		for c, ty := range colTypes {
-			valBytes[c][i] = encodeDisposedValue(ty, rows[i][c], plan.disp[c], plan.comp[c], capacity, take, ovf)
+			isNull := rows[i][c].IsNull()
+			nulls[c][i] = isNull
+			w, fixed := fixedValueWidth(ty)
+			switch {
+			case fixed && isNull:
+				valBytes[c][i] = make([]byte, w) // a zero-filled slot, never read
+			case fixed:
+				valBytes[c][i] = encodeValue(ty, rows[i][c])[1:] // the untagged body
+			case isNull:
+				valBytes[c][i] = nil // a zero-length span
+			default:
+				valBytes[c][i] = encodeDisposedValue(ty, rows[i][c], plan.disp[c], plan.comp[c], capacity, take, ovf)
+			}
 		}
 	}
-	// key directory (prefix-sum) + key blob.
+	// key directory (N end offsets) + key blob.
 	out := []byte{}
 	off := 0
-	for i := 0; i <= n; i++ {
+	for i := 0; i < n; i++ {
+		off += len(keys[i])
 		out = appendU32(out, uint32(off))
-		if i < n {
-			off += len(keys[i])
-		}
 	}
 	for i := 0; i < n; i++ {
 		out = append(out, keys[i]...)
 	}
-	// column directory: absolute payload offset of each column region (valOff dir + values).
+	// column directory: absolute payload offset of each column region.
 	baseAfterColDir := len(out) + 4*(k+1)
 	colStart := make([]int, k+1)
 	cur := baseAfterColDir
 	for c := 0; c < k; c++ {
 		colStart[c] = cur
-		region := 4 * (n + 1)
+		bodies := 0
 		for i := 0; i < n; i++ {
-			region += len(valBytes[c][i])
+			bodies += len(valBytes[c][i])
 		}
-		cur += region
+		if _, fixed := fixedValueWidth(colTypes[c]); fixed {
+			cur += 1 + (n+7)/8 + bodies
+		} else {
+			cur += 1 + 4*n + bodies
+		}
 	}
 	colStart[k] = cur // payload end
 	for c := 0; c <= k; c++ {
 		out = appendU32(out, uint32(colStart[c]))
 	}
-	// each column region: value directory (prefix-sum) then value bodies.
+	// each column region: flags byte, then bitmap + dense slots (fixed) or value directory +
+	// tagged bodies (variable).
 	for c := 0; c < k; c++ {
-		voff := 0
-		for i := 0; i <= n; i++ {
-			out = appendU32(out, uint32(voff))
-			if i < n {
+		out = append(out, 0) // region flags — reserved (the dictionary door)
+		if _, fixed := fixedValueWidth(colTypes[c]); fixed {
+			bitmap := make([]byte, (n+7)/8)
+			for i, isNull := range nulls[c] {
+				if isNull {
+					bitmap[i/8] |= 0x80 >> (i % 8)
+				}
+			}
+			out = append(out, bitmap...)
+		} else {
+			voff := 0
+			for i := 0; i < n; i++ {
 				voff += len(valBytes[c][i])
+				out = appendU32(out, uint32(voff))
 			}
 		}
 		for i := 0; i < n; i++ {
@@ -3086,36 +3206,55 @@ func pageBlock(image []byte, ps int, index uint32) ([]byte, error) {
 // paxLeaf is a parsed PAX (column-major) leaf's directories + spans (format.md v23 "Leaf node").
 // keys and colVals are zero-copy views into the page payload; colOff[c] is column c's value
 // directory (N+1 prefix-sum offsets into colVals[c]).
-type paxLeaf struct {
-	keys    [][]byte   // n key spans
-	colVals [][]byte   // k column value-byte spans (after each column's value directory)
-	colOff  [][]uint32 // k value directories (n+1 offsets each)
+// paxRegion is one leaf column region's parsed shape (v24 — format.md "Leaf node"),
+// class-dependent: a fixed-width region is a null bitmap + dense untagged slots; a variable region
+// is an end-offset value directory + tagged codec bytes (NULL = a zero-length span).
+type paxRegion struct {
+	// width > 0 ⇒ a fixed-width region (bitmap + body slots are meaningful); width == 0 ⇒ a
+	// variable region (ends + body blob).
+	width  int
+	bitmap []byte   // fixed: the ceil(N/8) null bitmap span (MSB-first, set = NULL)
+	ends   []uint32 // variable: N end offsets into the value blob (ends[i] = one past value i)
+	body   []byte   // the value bodies: N×width dense slots (fixed) or the value blob (variable)
 }
 
-// parsePaxLeaf decodes a PAX leaf payload's three directories into key spans and per-column value
-// spans (format.md v23 "Leaf node"). Column regions are validated to be contiguous, in order, and
-// within the payload; a malformed directory is data_corrupted. Because the page body is zero-padded
-// to the page size, the authoritative content end is colStart[K], not len(payload).
-func parsePaxLeaf(payload []byte, n, k int) (*paxLeaf, error) {
+type paxLeaf struct {
+	keys    [][]byte // n key spans (views into the page payload)
+	regions []paxRegion
+}
+
+// parsePaxLeaf decodes a v24 PAX leaf payload's directories into key spans and per-column regions
+// (format.md "Leaf node"). Column regions are validated to be contiguous, in order, within the
+// payload, and matching their class shape; a malformed directory, a set region flags bit, or a
+// region whose extent disagrees with its class shape is data_corrupted. Because the page body is
+// zero-padded to the page size, the authoritative content end is colStart[K], not len(payload).
+func parsePaxLeaf(payload []byte, n int, colTypes []colType) (*paxLeaf, error) {
+	k := len(colTypes)
 	pos := 0
-	keyOff := make([]uint32, n+1)
-	for i := range keyOff {
-		v, err := readU32(payload, &pos)
+	keyEnd := make([]uint32, n)
+	prev := uint32(0)
+	for i := range keyEnd {
+		e, err := readU32(payload, &pos)
 		if err != nil {
 			return nil, err
 		}
-		keyOff[i] = v
+		if e < prev {
+			return nil, newError(DataCorrupted, "PAX leaf key directory not ascending")
+		}
+		keyEnd[i] = e
+		prev = e
 	}
 	keyBlob := pos
-	keys := make([][]byte, n)
-	for i := 0; i < n; i++ {
-		lo, hi := int(keyOff[i]), int(keyOff[i+1])
-		if lo > hi || keyBlob+hi > len(payload) {
-			return nil, newError(DataCorrupted, "PAX leaf key directory out of range")
-		}
-		keys[i] = payload[keyBlob+lo : keyBlob+hi]
+	if keyBlob+int(prev) > len(payload) {
+		return nil, newError(DataCorrupted, "PAX leaf key blob overruns page")
 	}
-	pos = keyBlob + int(keyOff[n])
+	keys := make([][]byte, n)
+	lo := uint32(0)
+	for i := 0; i < n; i++ {
+		keys[i] = payload[keyBlob+int(lo) : keyBlob+int(keyEnd[i])]
+		lo = keyEnd[i]
+	}
+	pos = keyBlob + int(prev)
 	colStart := make([]uint32, k+1)
 	for c := range colStart {
 		v, err := readU32(payload, &pos)
@@ -3127,48 +3266,96 @@ func parsePaxLeaf(payload []byte, n, k int) (*paxLeaf, error) {
 	if int(colStart[0]) != pos {
 		return nil, newError(DataCorrupted, "PAX leaf column directory start mismatch")
 	}
-	colVals := make([][]byte, k)
-	colOff := make([][]uint32, k)
-	for c := 0; c < k; c++ {
+	regions := make([]paxRegion, k)
+	for c, ty := range colTypes {
 		start, end := int(colStart[c]), int(colStart[c+1])
-		p := start
-		voff := make([]uint32, n+1)
-		for i := range voff {
-			v, err := readU32(payload, &p)
-			if err != nil {
-				return nil, err
-			}
-			voff[i] = v
-		}
-		valBase := start + 4*(n+1)
-		if start+region4(n)+int(voff[n]) != end || end > len(payload) || end < valBase {
+		if start > end || end > len(payload) {
 			return nil, newError(DataCorrupted, "PAX leaf column region out of range")
 		}
-		colVals[c] = payload[valBase:end]
-		colOff[c] = voff
+		p := start
+		flags, err := readU8(payload, &p)
+		if err != nil {
+			return nil, err
+		}
+		if flags != 0 {
+			return nil, newError(DataCorrupted, "PAX leaf region flags has a reserved bit set")
+		}
+		if w, fixed := fixedValueWidth(ty); fixed {
+			body := p + (n+7)/8
+			if body > end || body+n*w != end {
+				return nil, newError(DataCorrupted, "PAX leaf fixed region extent mismatch")
+			}
+			regions[c] = paxRegion{width: w, bitmap: payload[p:body], body: payload[body:end]}
+		} else {
+			ends := make([]uint32, n)
+			vprev := uint32(0)
+			for i := range ends {
+				e, err := readU32(payload, &p)
+				if err != nil {
+					return nil, err
+				}
+				if e < vprev {
+					return nil, newError(DataCorrupted, "PAX leaf value directory not ascending")
+				}
+				ends[i] = e
+				vprev = e
+			}
+			if p > end || p+int(vprev) != end {
+				return nil, newError(DataCorrupted, "PAX leaf variable region extent mismatch")
+			}
+			regions[c] = paxRegion{ends: ends, body: payload[p:end]}
+		}
 	}
-	if int(colStart[k]) > len(payload) {
-		return nil, newError(DataCorrupted, "PAX leaf payload overruns page")
-	}
-	return &paxLeaf{keys: keys, colVals: colVals, colOff: colOff}, nil
+	return &paxLeaf{keys: keys, regions: regions}, nil
 }
 
-// region4 is the byte size of a value directory (N+1 u32) — the fixed header of a column region.
-func region4(n int) int { return 4 * (n + 1) }
+// isNull reports whether value (record i, column c) is NULL — the region bitmap (fixed-width) or
+// the zero-length span (variable), with NO value decode (format.md "Leaf node").
+func (l *paxLeaf) isNull(c, i int) bool {
+	r := &l.regions[c]
+	if r.width > 0 {
+		return r.bitmap[i/8]&(0x80>>(i%8)) != 0
+	}
+	lo := uint32(0)
+	if i > 0 {
+		lo = r.ends[i-1]
+	}
+	return r.ends[i] == lo
+}
 
-// value returns the codec bytes for record i of column c (a view into the page payload).
+// value returns the bytes of value (record i, column c), a view into the page payload: a
+// fixed-width slot (the untagged body) or a variable value's tagged codec bytes. A NULL fixed
+// slot is zero-filled and must never be read (the bitmap is the sole authority — isNull first).
 func (l *paxLeaf) value(c, i int) ([]byte, error) {
-	lo, hi := int(l.colOff[c][i]), int(l.colOff[c][i+1])
-	if lo > hi || hi > len(l.colVals[c]) {
+	r := &l.regions[c]
+	if r.width > 0 {
+		return r.body[i*r.width : (i+1)*r.width], nil
+	}
+	lo := uint32(0)
+	if i > 0 {
+		lo = r.ends[i-1]
+	}
+	hi := r.ends[i]
+	if int(hi) > len(r.body) {
 		return nil, newError(DataCorrupted, "PAX leaf value offset out of range")
 	}
-	return l.colVals[c][lo:hi], nil
+	return r.body[lo:hi], nil
 }
 
-// valueLen is the on-disk byte length of value (record i, column c) — the value directory's
-// prefix-sum span. Equals what readValueLazy advances by, so a record's weight is derivable from the
-// directories alone with no value decode (packed-leaf.md §3/§5).
-func (l *paxLeaf) valueLen(c, i int) int { return int(l.colOff[c][i+1] - l.colOff[c][i]) }
+// valueLen is the bytes value (record i, column c) contributes to recordSize — the slot width
+// (fixed-width, NULL included) or the span length (variable; 0 for NULL). Derivable from the
+// directories alone, with no value decode (packed-leaf.md §3/§5).
+func (l *paxLeaf) valueLen(c, i int) int {
+	r := &l.regions[c]
+	if r.width > 0 {
+		return r.width
+	}
+	lo := uint32(0)
+	if i > 0 {
+		lo = r.ends[i-1]
+	}
+	return int(r.ends[i] - lo)
+}
 
 // packedLeaf is a faulted leaf's block-backed resident form (packed-leaf.md §5): the parsed PAX
 // directories (views into the page block) plus the table's column types, retained instead of
@@ -3183,16 +3370,24 @@ type packedLeaf struct {
 	n        int
 }
 
-// value reconstructs value (record i, column c) — the O(1) PAX column span decoded by the same
-// readValueLazy the eager fault ran (packed-leaf.md §4). A spillable body becomes an inline-deferred
-// Unfetched (a block view); a fixed-width scalar decodes eagerly. Byte-identical to the eager value,
-// moved from fault-time to touch-time (§8); a corrupt touched inline body surfaces XX001 here.
+// value reconstructs value (record i, column c) — the O(1) PAX column span (packed-leaf.md §4). A
+// NULL is answered from the region bitmap / zero-length span with no decode. A fixed-width slot is
+// the untagged inline body, decoded eagerly (deferring a fixed-width scalar buys nothing,
+// lazy-record.md §6); a variable value's span takes the lazy tag path — a spillable body becomes an
+// inline-deferred Unfetched (a block view). Byte-identical to the eager value, moved from
+// fault-time to touch-time (§8); a corrupt touched inline body surfaces XX001 here.
 func (p *packedLeaf) value(c, i int) (Value, error) {
+	if p.dirs.isNull(c, i) {
+		return NullValue(), nil
+	}
 	vb, err := p.dirs.value(c, i)
 	if err != nil {
 		return Value{}, err
 	}
 	pos := 0
+	if _, fixed := fixedValueWidth(p.colTypes[c]); fixed {
+		return readInlineBody(p.colTypes[c], vb, &pos, decodeConstruct)
+	}
 	return readValueLazy(p.colTypes[c], vb, &pos)
 }
 
@@ -3244,7 +3439,7 @@ func decodeLeafNode(block []byte, pageID uint32, colTypes []colType) (*pnode, er
 	}
 	n := int(pg.itemCount)
 	k := len(colTypes)
-	leaf, err := parsePaxLeaf(pg.payload, n, k)
+	leaf, err := parsePaxLeaf(pg.payload, n, colTypes)
 	if err != nil {
 		return nil, err
 	}
@@ -3252,13 +3447,14 @@ func decodeLeafNode(block []byte, pageID uint32, colTypes []colType) (*pnode, er
 	// PAX directories, decode NO values. parsePaxLeaf validated + parsed the directories in one pass
 	// with no value decode, so a malformed directory still surfaces data_corrupted here; a malformed
 	// value body surfaces XX001 only when the column is touched (§8). Keys and weights are derivable
-	// from the directories alone (§3): the weight is 2 + len(key) + Σ_c valueLen(c, i), exactly what
-	// the eager decode summed — so the resident leaf is ≈ pageSize (§9), never an inflated row vector.
+	// from the directories alone (§3): the weight is len(key) + Σ_c valueLen(c, i) (the v24
+	// record_size), exactly what the writer split on — so the resident leaf is ≈ pageSize (§9),
+	// never an inflated row vector.
 	keys, weights := make([][]byte, 0, n), make([]uint32, 0, n)
 	for i := 0; i < n; i++ {
 		key := make([]byte, len(leaf.keys[i]))
 		copy(key, leaf.keys[i])
-		w := 2 + len(key)
+		w := len(key)
 		for c := 0; c < k; c++ {
 			w += leaf.valueLen(c, i)
 		}
@@ -3764,33 +3960,6 @@ func readValueLazy(ty colType, buf []byte, pos *int) (Value, error) {
 	}
 }
 
-// decodeRecordLazy decodes one record (readValueLazy per column) and returns (key, row, weight),
-// where the weight is the bytes the record occupies on the page — exactly the recordSize the
-// writer split on, read off the cursor instead of re-planned (a re-plan would need the unfetched
-// bytes).
-func decodeRecordLazy(colTypes []colType, buf []byte, pos *int) ([]byte, storedRow, int, error) {
-	start := *pos
-	keyLen, err := readU16(buf, pos)
-	if err != nil {
-		return nil, nil, 0, err
-	}
-	keySlice, err := take(buf, pos, int(keyLen))
-	if err != nil {
-		return nil, nil, 0, err
-	}
-	key := make([]byte, len(keySlice))
-	copy(key, keySlice)
-	row := make(storedRow, len(colTypes))
-	for i, ty := range colTypes {
-		v, err := readValueLazy(ty, buf, pos)
-		if err != nil {
-			return nil, nil, 0, err
-		}
-		row[i] = v
-	}
-	return key, row, *pos - start, nil
-}
-
 // resolveUnfetched materializes an unfetched reference into its plain Value
 // (spec/design/large-values.md §14): gather the overflow chain through fetch for an external
 // form, decompress a compressed one, and reconstruct by column type. Decompression errors are
@@ -3883,32 +4052,6 @@ func markChains(row storedRow, fetch func(uint32) ([]byte, error), reached map[u
 		}
 	}
 	return nil
-}
-
-// decodeRecord decodes one record (key, row) and the overflow chain pages any external value
-// followed (for the free-list reachability walk — large-values.md §12). fetch reads a page block by
-// index, used to follow overflow chains; nil is only valid where no value can be external (a default).
-func decodeRecord(colTypes []colType, buf []byte, pos *int, fetch func(uint32) ([]byte, error)) ([]byte, storedRow, []uint32, error) {
-	keyLen, err := readU16(buf, pos)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	keySlice, err := take(buf, pos, int(keyLen))
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	key := make([]byte, len(keySlice))
-	copy(key, keySlice)
-	row := make(storedRow, len(colTypes))
-	var ovf []uint32
-	for i, ty := range colTypes {
-		v, err := readValue(ty, buf, pos, fetch, &ovf)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		row[i] = v
-	}
-	return key, row, ovf, nil
 }
 
 // readValue reads one value via the value codec (inverse of encodeValue). The presence tag is read

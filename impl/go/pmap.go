@@ -1,7 +1,8 @@
 package jed
 
-// Persistent (copy-on-write) ordered map — the page-backed B-tree (decision B1,
-// spec/design/transactions.md §3; spec/fileformat/format.md "The per-table data B-tree").
+// Persistent (copy-on-write) ordered map — the page-backed B+tree (decision B1,
+// spec/design/bplus-reshape.md; spec/design/transactions.md §3; spec/fileformat/format.md "The
+// per-table data B+tree").
 //
 // Keyed by the encoded key bytes (compared with bytes.Compare = memcmp = the order-preserving
 // key encoding's contract, spec/design/encoding.md). Every mutation returns a new map that shares
@@ -9,29 +10,36 @@ package jed
 // so copying a PMap value (which shares the root pointer) is an O(1) independent snapshot. That
 // cheap, structurally-shared snapshot carries the §3 staging-buffer / transaction model.
 //
-// Since Phase 6 (P6.1) this IS the on-disk B-tree, node-for-page: its fan-out is size-driven — a
-// node holds as many entries as fit a page payload cap (= page_size − 16) and splits when it would
-// overflow, so the node boundaries (and serialized bytes) are a §8 byte contract (format.md). The
-// caller supplies each entry's on-disk weight (record size) so this map can sum payloads without
-// knowing the value codec; cap is passed per call (held by the TableStore). Each node also carries
-// a set-once on-disk page id (0 = dirty) for the incremental commit (P6.1 part B). Delete rebalances
-// by merge-then-maybe-split (no borrow — merge subsumes it; format.md "Delete").
+// This IS the on-disk B+tree, node-for-page (v24). Records live ONLY in leaves; an interior node is
+// a record-free routing skeleton — separator keys + child pointers. A separator is a COPY of a
+// boundary key (a leaf split copies the right half's first key up; an interior split pushes its
+// median separator up) and may go stale after deletes — it keeps routing (left < sep ≤ right holds
+// forever). Fan-out is size-driven: a node holds as many entries as fit a page payload cap
+// (= page_size − 16) and splits when it would overflow, so the node boundaries (and serialized
+// bytes) are a §8 byte contract (format.md). The caller supplies each leaf entry's on-disk weight
+// (record size) so this map can sum leaf payloads without knowing the value codec; interior
+// payloads come from the separators themselves. cap and the leaf's column-class shape are passed
+// per call (properties of the database's page size and the table's column types, held by the
+// TableStore). Each node also carries a set-once on-disk page id (0 = dirty) for the incremental
+// commit (P6.1 part B). Delete rebalances by merge-then-maybe-split (no borrow — merge subsumes it;
+// an interior merge whose result cannot 2-way split is ABANDONED, format.md "Delete").
 
 import (
 	"bytes"
 	"sort"
 )
 
-// pnode is one B-tree node. children is empty for a leaf; otherwise len(children) == len(keys)+1.
-// len(keys) == len(vals) == len(weights) always. weights[i] is entry i's on-disk record size, used
-// only for the size-driven split/merge. Nodes are never mutated after construction. page is the
-// on-disk page index (0 when dirty), set once at the commit that first persists this node.
+// pnode is one B+tree node. A LEAF has no children and len(keys) == len(vals) == len(weights)
+// (or a packed block in place of vals). An INTERIOR node has len(children) == len(keys)+1 and
+// EMPTY vals/weights — its keys are the routing separators, its payload is derived from the
+// separator bytes themselves (v24, record-free). Nodes are never mutated after construction.
+// page is the on-disk page index (0 when dirty), set once at the commit that first persists it.
 type pnode struct {
 	keys [][]byte
-	// The decoded value rows — populated for a Decoded node (in-memory / mutated / dirty leaves and
-	// EVERY interior node), nil/empty for a Packed leaf (which reconstructs on demand from packed).
-	// Read only through the rowAt / colAt / rowAtMasked / decodedRows seam, never indexed directly, so
-	// the two forms are interchangeable (packed-leaf.md §3/§4).
+	// The decoded value rows — populated for a Decoded LEAF (in-memory / mutated / dirty), nil for
+	// a Packed leaf (which reconstructs on demand from packed) and for every INTERIOR node
+	// (record-free, v24). Read only through the rowAt / colAt / rowAtMasked / decodedRows seam,
+	// never indexed directly, so the two leaf forms are interchangeable (packed-leaf.md §3/§4).
 	vals     []storedRow
 	weights  []uint32
 	children []childRef
@@ -43,10 +51,10 @@ type pnode struct {
 	page   uint32
 }
 
-// rowAt reconstructs value row i as a storedRow — the value-read seam (packed-leaf.md §4). A Decoded
-// node (always the case for interior nodes) returns the stored row (shared, read-only by convention);
-// a Packed leaf reconstructs it from the retained PAX directories on demand. Errors on a corrupt
-// touched inline body (XX001); the Decoded path never errors.
+// rowAt reconstructs value row i as a storedRow — the value-read seam (packed-leaf.md §4), on a
+// LEAF. A Decoded leaf returns the stored row (shared, read-only by convention); a Packed leaf
+// reconstructs it from the retained PAX directories on demand. Errors on a corrupt touched inline
+// body (XX001); the Decoded path never errors.
 func (n *pnode) rowAt(i int) (storedRow, error) {
 	if n.packed == nil {
 		return n.vals[i], nil
@@ -55,8 +63,7 @@ func (n *pnode) rowAt(i int) (storedRow, error) {
 }
 
 // colAt reconstructs ONLY column c of row i — the touched-column path (packed-leaf.md §4/§6, the
-// OP_Column model PAX's colOff makes O(1)). S3-ready: built for the touched-column scan wiring, not
-// yet driven by the executor.
+// OP_Column model PAX's column regions make O(1)).
 func (n *pnode) colAt(i, c int) (Value, error) {
 	if n.packed == nil {
 		return n.vals[i][c], nil
@@ -65,7 +72,7 @@ func (n *pnode) colAt(i, c int) (Value, error) {
 }
 
 // rowAtMasked reconstructs row i decoding ONLY the columns mask selects (packed-leaf.md §4/§6). A
-// Decoded node returns the whole stored row; a Packed leaf leaves untouched columns NULL. S3-ready.
+// Decoded leaf returns the whole stored row; a Packed leaf leaves untouched columns NULL.
 func (n *pnode) rowAtMasked(i int, mask []bool) (storedRow, error) {
 	if n.packed == nil {
 		return n.vals[i], nil
@@ -77,7 +84,7 @@ func (n *pnode) rowAtMasked(i int, mask []bool) (storedRow, error) {
 // a non-nil mask reconstructs only its selected columns (rowAtMasked), leaving the rest NULL. The nil
 // guard is load-bearing — rowAtMasked treats a nil/short mask as "no column selected" (all NULL), so a
 // scan with no touched-set (mask == nil) must take the full-row path. Only Packed leaves honor the
-// mask; a Decoded node returns its whole stored row either way (packed-leaf.md §4).
+// mask; a Decoded leaf returns its whole stored row either way (packed-leaf.md §4).
 func (n *pnode) rowAtMaybeMasked(i int, mask []bool) (storedRow, error) {
 	if mask == nil {
 		return n.rowAt(i)
@@ -85,9 +92,9 @@ func (n *pnode) rowAtMaybeMasked(i int, mask []bool) (storedRow, error) {
 	return n.rowAtMasked(i, mask)
 }
 
-// decodedRows returns every value row — the mutation-descent materialization (packed-leaf.md §7). A
-// Decoded node clones vals; a Packed leaf reconstructs every row so the rebuilt node is Decoded
-// (build / nodeInsert / nodeRemove / mergeAt then run unchanged). Interior nodes are always Decoded.
+// decodedRows returns every value row of a LEAF — the mutation-descent materialization
+// (packed-leaf.md §7). A Decoded leaf clones vals; a Packed leaf reconstructs every row so the
+// rebuilt node is Decoded (buildLeaf / nodeInsert / nodeRemove / mergeAt then run unchanged).
 func (n *pnode) decodedRows() ([]storedRow, error) {
 	if n.packed == nil {
 		return cloneVals(n.vals), nil
@@ -103,7 +110,7 @@ func (n *pnode) decodedRows() ([]storedRow, error) {
 	return rows, nil
 }
 
-// childRef is a B-tree node's reference to one child. Under demand paging (P6.4b, spec/design/pager.md
+// childRef is a B+tree node's reference to one child. Under demand paging (P6.4b, spec/design/pager.md
 // §4) a clean leaf need not be resident: an interior node keeps an OnDisk page id for such a child and
 // the read path faults it through the buffer pool on access. node != nil ⇒ resident (a dirty node, a
 // resident interior skeleton node, or a materialized leaf); node == nil ⇒ OnDisk(page) — always a
@@ -118,7 +125,7 @@ func residentRef(n *pnode) childRef  { return childRef{node: n} }
 func onDiskRef(page uint32) childRef { return childRef{page: page} }
 
 // leafSource faults a clean leaf page to a resident node on demand (pager.md §4) — the buffer pool,
-// behind the table's column types. Defined here so the B-tree traversal can fault without depending on
+// behind the table's column types. Defined here so the B+tree traversal can fault without depending on
 // the storage/format layers (they implement it); a fully-resident in-memory database passes a nil
 // source and never faults.
 type leafSource interface {
@@ -140,23 +147,26 @@ func resolveChild(c childRef, src leafSource) (*pnode, error) {
 
 func (n *pnode) isLeaf() bool { return len(n.children) == 0 }
 
-// payload is this node's serialized size (format.md): Σ weights plus, for an interior node,
-// 4·(N+1) for its child pointers, or for a LEAF node (PAX v23) directoryOverhead(N,K) for the
-// key/column/value directories. k is the value-column count of the tree (0 for an index tree).
-func (n *pnode) payload(k int) int {
-	total := 0
-	for _, w := range n.weights {
-		total += int(w)
-	}
+// payload is this node's serialized size (format.md): a leaf is Σ weights +
+// leafOverhead(N, shape); an interior node is 8·N + 4 + Σ sep_len (child pointers + separator
+// directory + key blob — record-free, v24).
+func (n *pnode) payload(shape leafShape) int {
 	if n.isLeaf() {
-		total += directoryOverhead(len(n.keys), k)
-	} else {
-		total += 4 * len(n.children)
+		total := 0
+		for _, w := range n.weights {
+			total += int(w)
+		}
+		return total + leafOverhead(len(n.keys), shape)
+	}
+	total := 8*len(n.keys) + 4
+	for _, k := range n.keys {
+		total += len(k)
 	}
 	return total
 }
 
-// search returns (index, found): found ⇒ key is at keys[index]; else index is the child slot.
+// search binary-searches a LEAF's keys, returning (index, found): found ⇒ key is at keys[index];
+// else index is the insertion slot.
 func (n *pnode) search(key []byte) (int, bool) {
 	lo, hi := 0, len(n.keys)
 	for lo < hi {
@@ -171,6 +181,13 @@ func (n *pnode) search(key []byte) (int, bool) {
 		}
 	}
 	return lo, false
+}
+
+// childSlot is the child an INTERIOR descent takes for key: partition_point(sep ≤ key) — a key
+// equal to a separator lies in the RIGHT subtree (the copy-up separator is the right half's first
+// key; format.md "Interior node").
+func (n *pnode) childSlot(key []byte) int {
+	return sort.Search(len(n.keys), func(i int) bool { return bytes.Compare(n.keys[i], key) > 0 })
 }
 
 // PMap is a persistent ordered map from encoded key to Row. A value copy is an O(1) independent
@@ -192,36 +209,36 @@ func (m *pMap) rootNode() *pnode { return m.root }
 // fromLoaded reconstructs a map from a loaded root (format.go LoadEngine).
 func fromLoaded(root *pnode, length int) pMap { return pMap{root: root, length: length} }
 
-// Get looks up the row at key. src faults an OnDisk leaf on the descent (nil for a fully-resident
-// in-memory tree); an I/O error propagates.
+// Get looks up the row at key — a root→leaf descent (interior nodes only route, v24). src faults an
+// OnDisk leaf on the descent (nil for a fully-resident in-memory tree); an I/O error propagates.
 func (m *pMap) Get(key []byte, src leafSource) (storedRow, bool, error) {
 	n := m.root
-	for n != nil {
-		i, found := n.search(key)
-		if found {
-			row, err := n.rowAt(i)
-			if err != nil {
-				return nil, false, err
-			}
-			return row, true, nil
-		}
-		if n.isLeaf() {
-			return nil, false, nil
-		}
-		child, err := resolveChild(n.children[i], src)
+	if n == nil {
+		return nil, false, nil
+	}
+	for !n.isLeaf() {
+		child, err := resolveChild(n.children[n.childSlot(key)], src)
 		if err != nil {
 			return nil, false, err
 		}
 		n = child
 	}
-	return nil, false, nil
+	i, found := n.search(key)
+	if !found {
+		return nil, false, nil
+	}
+	row, err := n.rowAt(i)
+	if err != nil {
+		return nil, false, err
+	}
+	return row, true, nil
 }
 
 // Insert inserts or overwrites key with val (on-disk record size weight); cap is the page payload
-// capacity. Returns the previous row and true if key was present (an overwrite); otherwise nil and
-// false (a new insert, which grows the length). An overwrite can change the weight, so it too may
-// overflow and split.
-func (m *pMap) Insert(key []byte, val storedRow, weight uint32, cap, k int, src leafSource) (storedRow, bool, error) {
+// capacity and shape the leaf's column-class shape. Returns the previous row and true if key was
+// present (an overwrite); otherwise nil and false (a new insert, which grows the length). An
+// overwrite can change the weight, so it too may overflow and split.
+func (m *pMap) Insert(key []byte, val storedRow, weight uint32, cap int, shape leafShape, src leafSource) (storedRow, bool, error) {
 	if m.root == nil {
 		m.root = &pnode{keys: [][]byte{key}, vals: []storedRow{val}, weights: []uint32{weight}}
 		m.length++
@@ -229,7 +246,7 @@ func (m *pMap) Insert(key []byte, val storedRow, weight uint32, cap, k int, src 
 	}
 	var old storedRow
 	replaced := false
-	out, err := nodeInsert(m.root, key, val, weight, &old, &replaced, src, cap, k)
+	out, err := nodeInsert(m.root, key, val, weight, &old, &replaced, src, cap, shape)
 	if err != nil {
 		return nil, false, err
 	}
@@ -237,7 +254,7 @@ func (m *pMap) Insert(key []byte, val storedRow, weight uint32, cap, k int, src 
 		m.root = out.whole
 	} else {
 		m.root = &pnode{
-			keys: [][]byte{out.midK}, vals: []storedRow{out.midV}, weights: []uint32{out.midW},
+			keys:     [][]byte{out.sep},
 			children: []childRef{residentRef(out.left), residentRef(out.right)},
 		}
 	}
@@ -249,19 +266,19 @@ func (m *pMap) Insert(key []byte, val storedRow, weight uint32, cap, k int, src 
 
 // Remove deletes key. Returns the removed row and true, or (nil,false) if absent (then the map is
 // unchanged). cap is the page payload capacity (the rebalance threshold).
-func (m *pMap) Remove(key []byte, cap, k int, src leafSource) (storedRow, bool, error) {
+func (m *pMap) Remove(key []byte, cap int, shape leafShape, src leafSource) (storedRow, bool, error) {
 	if m.root == nil {
 		return nil, false, nil
 	}
-	newRoot, removed, ok, err := nodeRemove(m.root, key, src, cap, k)
+	newRoot, removed, ok, err := nodeRemove(m.root, key, src, cap, shape)
 	if err != nil {
 		return nil, false, err
 	}
 	if !ok {
 		return nil, false, nil
 	}
-	// The root may have drained to zero keys: an empty leaf becomes the empty map; an empty internal
-	// node (one child) hands the root down a level (height shrinks). The root is exempt from the
+	// The root may have drained to zero keys: an empty leaf becomes the empty map; a 0-key interior
+	// root (one child) hands the root down a level (height shrinks). The root is exempt from the
 	// underfull rule, so no rebalance here.
 	if len(newRoot.keys) == 0 {
 		if newRoot.isLeaf() {
@@ -282,10 +299,11 @@ func (m *pMap) Remove(key []byte, cap, k int, src leafSource) (storedRow, bool, 
 	return removed, true, nil
 }
 
-// inorder returns all (key, row) pairs in ascending key order. Eager (the cost contract charges per
-// row in the executor loop, not here — spec/design/cost.md), so laziness is unobservable. Faults each
-// OnDisk leaf through src; the faulted node is dropped (GC) once its rows are appended, so the resident
-// leaf set stays bounded by the pool, not the tree (pager.md §4).
+// inorder returns all (key, row) pairs in ascending key order — a leaf walk in key order (records
+// are leaf-only, v24). Eager (the cost contract charges per row in the executor loop, not here —
+// spec/design/cost.md), so laziness is unobservable. Faults each OnDisk leaf through src; the faulted
+// node is dropped (GC) once its rows are appended, so the resident leaf set stays bounded by the
+// pool, not the tree (pager.md §4).
 func (m *pMap) inorder(src leafSource) ([][]byte, []storedRow, error) {
 	keys := make([][]byte, 0, m.length)
 	vals := make([]storedRow, 0, m.length)
@@ -305,7 +323,7 @@ func (m *pMap) inorder(src leafSource) ([][]byte, []storedRow, error) {
 			}
 			return nil
 		}
-		for i := range n.keys {
+		for i := range n.children {
 			child, err := resolveChild(n.children[i], src)
 			if err != nil {
 				return err
@@ -313,14 +331,8 @@ func (m *pMap) inorder(src leafSource) ([][]byte, []storedRow, error) {
 			if err := walk(child); err != nil {
 				return err
 			}
-			keys = append(keys, n.keys[i])
-			vals = append(vals, n.vals[i])
 		}
-		last, err := resolveChild(n.children[len(n.keys)], src)
-		if err != nil {
-			return err
-		}
-		return walk(last)
+		return nil
 	}
 	if err := walk(m.root); err != nil {
 		return nil, nil, err
@@ -328,7 +340,7 @@ func (m *pMap) inorder(src leafSource) ([][]byte, []storedRow, error) {
 	return keys, vals, nil
 }
 
-// nodeCount is the number of B-tree nodes (pages) in this tree — the page_read count a full scan
+// nodeCount is the number of B+tree nodes (pages) in this tree — the page_read count a full scan
 // charges (spec/design/cost.md §3 "page_read"). A scan walks every node, so this is the structural
 // node count (interior + leaf); 0 for an empty map. Deterministic and byte-identical across cores
 // (the node boundaries are a §8 byte contract — format.md).
@@ -355,8 +367,8 @@ func (m *pMap) nodeCount() int {
 }
 
 // residentRecordBytes is the total on-disk record bytes stored in this tree — the sum of every
-// entry's weight over every node (this is a B-tree: records live in interior nodes too, not only
-// leaves). The deterministic, cross-core-identical measure of a temp table's storage footprint
+// leaf entry's weight (records live only in leaves, v24; interior weights are empty). The
+// deterministic, cross-core-identical measure of a temp table's storage footprint
 // (spec/design/temp-tables.md §7; weight is the on-disk record_size, byte-identical across cores —
 // §8). The tree is fully resident for a temp store (temp data never pages), so this never faults; an
 // OnDisk child would contribute 0 (defensive — temp stores have none).
@@ -381,7 +393,7 @@ func (m *pMap) residentRecordBytes() uint64 {
 }
 
 // keyBound is a contiguous range of encoded keys — the form a primary-key predicate pushes down to
-// a bounded B-tree scan (spec/design/cost.md §3 "bounded scan / point lookup", encoding.md). lo/hi
+// a bounded B+tree scan (spec/design/cost.md §3 "bounded scan / point lookup", encoding.md). lo/hi
 // are encoded key bytes; a nil endpoint is open on that side (−∞ / +∞), and the flags say whether
 // the endpoint key itself is included. Because the key encoding is order-preserving (bytes.Compare =
 // value order), a byte range is a value range. A bounded scan visits exactly the nodes whose key
@@ -399,18 +411,15 @@ type keyBound struct {
 // full scan exactly.
 func unboundedBound() keyBound { return keyBound{} }
 
-// childWindow is the contiguous window [first, last] of n's child indices whose separator span can
-// overlap the bound — child i spans the OPEN interval (keys[i-1], keys[i]), so it is pruned iff
-// keys[i] ≤ lo (entirely at/below lo) or keys[i-1] ≥ hi (entirely at/above hi). The keys are sorted,
-// so the surviving children are contiguous and both edges binary-search: first = the first child not
-// below lo, last = the last child not above hi. The strict comparisons are exact regardless of
-// endpoint inclusivity — the separators are entries in this node (covered by entryWindow), never in
-// a child. The node's own outer brackets need no test: the parent descended here only because this
-// subtree overlaps. rangeEntries (which descends) and overlapNodeCount (which counts) window
-// identically, so they visit the SAME node set — the §8 cross-core determinism the page_read cost
-// depends on — decided from the resident interior separators WITHOUT faulting an OnDisk leaf. A
-// bound admitting only a separator entry in this node yields first > last (every child pruned): an
-// empty child window, still a valid entry window.
+// childWindow is the contiguous window [first, last] of n's child indices whose key span can
+// overlap the bound. Child i spans [keys[i-1], keys[i]) (v24 — a key equal to a separator lies
+// right), so child i is pruned iff keys[i] ≤ lo (entirely at/below lo) or keys[i-1] is at/above
+// hi — > hi for an INCLUSIVE hi (a child whose low separator equals hi can still hold hi itself),
+// ≥ hi for an exclusive one. The separators are sorted, so the surviving children are contiguous
+// and both edges binary-search. rangeEntries (which descends) and overlapNodeCount (which counts)
+// window identically, so they visit the SAME node set — the §8 cross-core determinism the
+// page_read cost depends on — decided from the resident interior separators WITHOUT faulting an
+// OnDisk leaf.
 func (b keyBound) childWindow(n *pnode) (int, int) {
 	first := 0
 	if b.lo != nil {
@@ -418,15 +427,22 @@ func (b keyBound) childWindow(n *pnode) (int, int) {
 	}
 	last := len(n.keys)
 	if b.hi != nil {
-		last = sort.Search(len(n.keys), func(i int) bool { return bytes.Compare(n.keys[i], b.hi) >= 0 })
+		if b.hiInc {
+			last = sort.Search(len(n.keys), func(i int) bool { return bytes.Compare(n.keys[i], b.hi) > 0 })
+		} else {
+			last = sort.Search(len(n.keys), func(i int) bool { return bytes.Compare(n.keys[i], b.hi) >= 0 })
+		}
+	}
+	if last < first {
+		last = first
 	}
 	return first, last
 }
 
-// entryWindow is the contiguous half-open window [first, last) of n's own entry indices whose keys
-// lie within the bound — the binary-searched equivalent of testing containment per key, honoring the
-// endpoint inclusivity flags. On a leaf this is the admitted row range; on an interior node it is
-// the admitted separator entries (a B-tree stores records in interior nodes too).
+// entryWindow is the contiguous half-open window [first, last) of a LEAF's record indices whose
+// keys lie within the bound — the binary-searched equivalent of testing containment per key,
+// honoring the endpoint inclusivity flags. Applies only at leaves (v24 — interior nodes hold no
+// records).
 func (b keyBound) entryWindow(n *pnode) (int, int) {
 	first := 0
 	if b.lo != nil {
@@ -455,18 +471,16 @@ func (b keyBound) entryWindow(n *pnode) (int, int) {
 }
 
 // rangeEntries returns the (key, row) pairs whose key lies within the bound, in ascending key
-// order — a bounded in-order traversal that binary-searches each node's child window (the children
-// whose separator span can overlap the bound — childWindow) and in-bound entry window (entryWindow),
-// then walks only those, so only overlapping leaves fault through src. The unbounded bound walks the
-// whole tree (identical to inorder). One asymmetric edge: a separator entry equal to an INCLUSIVE lo
-// is in bound while both its adjacent children are pruned, so the entry window can start one slot
-// before the child window — emitted before the descent loop.
+// order — a bounded in-order traversal that binary-searches each interior node's child window (the
+// children whose separator span can overlap the bound — childWindow) and each leaf's in-bound entry
+// window (entryWindow), then walks only those, so only overlapping leaves fault through src. The
+// unbounded bound walks the whole tree (identical to inorder).
 func (m *pMap) rangeEntries(b keyBound, src leafSource) ([][]byte, []storedRow, error) {
 	keys, vals, _, err := m.rangeEntriesCounted(b, src, nil)
 	return keys, vals, err
 }
 
-// rangeEntriesCounted is rangeEntries plus the number of B-tree nodes the bounded traversal
+// rangeEntriesCounted is rangeEntries plus the number of B+tree nodes the bounded traversal
 // visits — the page_read count overlapNodeCount would return, observed during the ONE windowed
 // walk instead of a second counting descent (the visited sets are identical by construction:
 // both window with childWindow).
@@ -477,8 +491,8 @@ func (m *pMap) rangeEntriesCounted(b keyBound, src leafSource, mask []bool) ([][
 	var walk func(n *pnode) error
 	walk = func(n *pnode) error {
 		nodes++
-		ef, el := b.entryWindow(n)
 		if n.isLeaf() {
+			ef, el := b.entryWindow(n)
 			for i := ef; i < el; i++ {
 				row, err := n.rowAtMaybeMasked(i, mask)
 				if err != nil {
@@ -490,10 +504,6 @@ func (m *pMap) rangeEntriesCounted(b keyBound, src leafSource, mask []bool) ([][
 			return nil
 		}
 		cf, cl := b.childWindow(n)
-		if ef < cf {
-			keys = append(keys, n.keys[ef])
-			vals = append(vals, n.vals[ef])
-		}
 		for i := cf; i <= cl; i++ {
 			child, err := resolveChild(n.children[i], src)
 			if err != nil {
@@ -501,10 +511,6 @@ func (m *pMap) rangeEntriesCounted(b keyBound, src leafSource, mask []bool) ([][
 			}
 			if err := walk(child); err != nil {
 				return err
-			}
-			if i >= ef && i < el {
-				keys = append(keys, n.keys[i])
-				vals = append(vals, n.vals[i])
 			}
 		}
 		return nil
@@ -521,11 +527,11 @@ func (m *pMap) rangeEntriesCounted(b keyBound, src leafSource, mask []bool) ([][
 // lanes (cols[c] of length rowCount for each selected c; nil otherwise), never building a full-width
 // storedRow — the A2 columnar-gather feed (packed-leaf.md §11 Track A2, the allocation dividend A1
 // leaves on the table). It mirrors rangeEntriesCounted's traversal EXACTLY (same node visits ⇒ the
-// same page_read count; same in-order entry sequence, interior separators included as a B-tree stores
-// records there too), but reads each admitted row's selected columns via colAt — an O(1) PAX column
-// span on a Packed leaf, vals[i][c] on a Decoded node — so a wide-table single-column scan never
-// materializes the untouched columns NOR a full-width row. Each cols[c] is in scan order, so it equals
-// the column-c stride of rangeEntriesCounted's rows. rowCount is the admitted entry count.
+// same page_read count; same in-order record sequence — leaf-only, v24), but reads each admitted
+// row's selected columns via colAt — an O(1) PAX column span on a Packed leaf, vals[i][c] on a
+// Decoded leaf — so a wide-table single-column scan never materializes the untouched columns NOR a
+// full-width row. Each cols[c] is in scan order, so it equals the column-c stride of
+// rangeEntriesCounted's rows. rowCount is the admitted entry count.
 func (m *pMap) columnarScan(b keyBound, src leafSource, mask []bool) ([][]Value, int, int, error) {
 	k := len(mask)
 	cols := make([][]Value, k)
@@ -533,35 +539,24 @@ func (m *pMap) columnarScan(b keyBound, src leafSource, mask []bool) ([][]Value,
 	var walk func(n *pnode) error
 	walk = func(n *pnode) error {
 		nodes++
-		ef, el := b.entryWindow(n)
-		gather := func(i int) error {
-			for c := 0; c < k; c++ {
-				if !mask[c] {
-					continue
-				}
-				v, err := n.colAt(i, c)
-				if err != nil {
-					return err
-				}
-				cols[c] = append(cols[c], v)
-			}
-			rowCount++
-			return nil
-		}
 		if n.isLeaf() {
+			ef, el := b.entryWindow(n)
 			for i := ef; i < el; i++ {
-				if err := gather(i); err != nil {
-					return err
+				for c := 0; c < k; c++ {
+					if !mask[c] {
+						continue
+					}
+					v, err := n.colAt(i, c)
+					if err != nil {
+						return err
+					}
+					cols[c] = append(cols[c], v)
 				}
+				rowCount++
 			}
 			return nil
 		}
 		cf, cl := b.childWindow(n)
-		if ef < cf {
-			if err := gather(ef); err != nil {
-				return err
-			}
-		}
 		for i := cf; i <= cl; i++ {
 			child, err := resolveChild(n.children[i], src)
 			if err != nil {
@@ -569,11 +564,6 @@ func (m *pMap) columnarScan(b keyBound, src leafSource, mask []bool) ([][]Value,
 			}
 			if err := walk(child); err != nil {
 				return err
-			}
-			if i >= ef && i < el {
-				if err := gather(i); err != nil {
-					return err
-				}
 			}
 		}
 		return nil
@@ -586,36 +576,28 @@ func (m *pMap) columnarScan(b keyBound, src leafSource, mask []bool) ([][]Value,
 	return cols, rowCount, nodes, nil
 }
 
-// foldScan walks the bounded scan calling visit(n, i) for each row i (in scan / key order) of the
-// node n it belongs to, faulting leaves via src — the fold-during-walk twin of columnarScan
-// (packed-leaf.md §11): the aggregate folds each row's touched columns (read on demand via n.colAt)
-// straight into its accumulator, so a whole-table/grouped aggregate never materializes a per-column
-// lane (O(1) memory instead of O(rows)). It visits the IDENTICAL nodes columnarScan does and returns
-// the same (rowCount, nodeCount), so the caller charges the identical page_read / storage_row_read.
-// visit's error aborts the walk.
+// foldScan walks the bounded scan calling visit(n, i) for each admitted leaf record i (in scan / key
+// order) of the leaf n it belongs to, faulting leaves via src — the fold-during-walk twin of
+// columnarScan (packed-leaf.md §11): the aggregate folds each row's touched columns (read on demand
+// via n.colAt) straight into its accumulator, so a whole-table/grouped aggregate never materializes a
+// per-column lane (O(1) memory instead of O(rows)). It visits the IDENTICAL nodes columnarScan does
+// and returns the same (rowCount, nodeCount), so the caller charges the identical page_read /
+// storage_row_read. visit's error aborts the walk.
 func (m *pMap) foldScan(b keyBound, src leafSource, visit func(n *pnode, i int) error) (rowCount, nodes int, err error) {
 	var walk func(n *pnode) error
 	walk = func(n *pnode) error {
 		nodes++
-		ef, el := b.entryWindow(n)
-		emit := func(i int) error {
-			rowCount++
-			return visit(n, i)
-		}
 		if n.isLeaf() {
+			ef, el := b.entryWindow(n)
 			for i := ef; i < el; i++ {
-				if e := emit(i); e != nil {
+				rowCount++
+				if e := visit(n, i); e != nil {
 					return e
 				}
 			}
 			return nil
 		}
 		cf, cl := b.childWindow(n)
-		if ef < cf {
-			if e := emit(ef); e != nil {
-				return e
-			}
-		}
 		for i := cf; i <= cl; i++ {
 			child, e := resolveChild(n.children[i], src)
 			if e != nil {
@@ -623,11 +605,6 @@ func (m *pMap) foldScan(b keyBound, src leafSource, visit func(n *pnode, i int) 
 			}
 			if e := walk(child); e != nil {
 				return e
-			}
-			if i >= ef && i < el {
-				if e := emit(i); e != nil {
-					return e
-				}
 			}
 		}
 		return nil
@@ -640,7 +617,7 @@ func (m *pMap) foldScan(b keyBound, src leafSource, visit func(n *pnode, i int) 
 	return rowCount, nodes, nil
 }
 
-// overlapNodeCount is the number of B-tree nodes a bounded scan over b visits — the page_read it
+// overlapNodeCount is the number of B+tree nodes a bounded scan over b visits — the page_read it
 // charges (spec/design/cost.md §3). It mirrors rangeEntries' traversal exactly (same childWindow
 // prune, root always visited), counting an OnDisk leaf as one node WITHOUT faulting it (the
 // resident-skeleton dividend, pager.md §5). The unbounded bound returns nodeCount() (every node
@@ -677,8 +654,8 @@ func (m *pMap) overlapNodeCount(b keyBound) int {
 func (m *pMap) scanRange(b keyBound, src leafSource, mask []bool, visit func(key []byte, row storedRow) (bool, error)) error {
 	var walk func(n *pnode) (bool, error)
 	walk = func(n *pnode) (bool, error) {
-		ef, el := b.entryWindow(n)
 		if n.isLeaf() {
+			ef, el := b.entryWindow(n)
 			for i := ef; i < el; i++ {
 				row, err := n.rowAtMaybeMasked(i, mask)
 				if err != nil {
@@ -692,12 +669,6 @@ func (m *pMap) scanRange(b keyBound, src leafSource, mask []bool, visit func(key
 			return true, nil
 		}
 		cf, cl := b.childWindow(n)
-		if ef < cf {
-			cont, err := visit(n.keys[ef], n.vals[ef])
-			if err != nil || !cont {
-				return cont, err
-			}
-		}
 		for i := cf; i <= cl; i++ {
 			child, err := resolveChild(n.children[i], src)
 			if err != nil {
@@ -705,12 +676,6 @@ func (m *pMap) scanRange(b keyBound, src leafSource, mask []bool, visit func(key
 			}
 			if cont, err := walk(child); err != nil || !cont {
 				return cont, err
-			}
-			if i >= ef && i < el {
-				cont, err := visit(n.keys[i], n.vals[i])
-				if err != nil || !cont {
-					return cont, err
-				}
 			}
 		}
 		return true, nil
@@ -727,14 +692,12 @@ func (m *pMap) scanRange(b keyBound, src leafSource, mask []bool, visit func(key
 // cost.md §3 "ORDER BY satisfied by primary-key order"). It windows with the same childWindow/
 // entryWindow prune (so the visited-node set and page_read cost match), and stops the moment visit
 // returns a false `continue` without faulting leaves past the stop point (a reverse top-N faults
-// from the high end). For an interior node it walks children from cl down to cf, emitting the
-// in-window separator BEFORE descending its child, and the asymmetric inclusive-lo separator
-// key[ef] (when ef<cf) LAST.
+// from the high end). An interior node walks its windowed children from cl down to cf.
 func (m *pMap) scanRangeRev(b keyBound, src leafSource, mask []bool, visit func(key []byte, row storedRow) (bool, error)) error {
 	var walk func(n *pnode) (bool, error)
 	walk = func(n *pnode) (bool, error) {
-		ef, el := b.entryWindow(n)
 		if n.isLeaf() {
+			ef, el := b.entryWindow(n)
 			for i := el - 1; i >= ef; i-- {
 				row, err := n.rowAtMaybeMasked(i, mask)
 				if err != nil {
@@ -749,23 +712,11 @@ func (m *pMap) scanRangeRev(b keyBound, src leafSource, mask []bool, visit func(
 		}
 		cf, cl := b.childWindow(n)
 		for i := cl; i >= cf; i-- {
-			if i >= ef && i < el {
-				cont, err := visit(n.keys[i], n.vals[i])
-				if err != nil || !cont {
-					return cont, err
-				}
-			}
 			child, err := resolveChild(n.children[i], src)
 			if err != nil {
 				return false, err
 			}
 			if cont, err := walk(child); err != nil || !cont {
-				return cont, err
-			}
-		}
-		if ef < cf {
-			cont, err := visit(n.keys[ef], n.vals[ef])
-			if err != nil || !cont {
 				return cont, err
 			}
 		}
@@ -778,33 +729,29 @@ func (m *pMap) scanRangeRev(b keyBound, src leafSource, mask []bool, visit func(
 	return err
 }
 
-// scanFrame is one node on a rangeCursor's explicit traversal stack: the node, its bound windows, and
-// the half-open span [lo, hi) of *interleaved positions* still to process. A leaf's positions are its
-// in-bound key indices [ef, el) directly. An interior node's positions run [0, 2·nkeys+1), where an
-// EVEN p is child p/2 (descended iff cf ≤ p/2 ≤ cl) and an ODD p is separator key p/2 (emitted iff
-// ef ≤ p/2 < el). This single interleaved sequence reproduces scanRange's order — including the
-// asymmetric inclusive-lo separator (ef = cf−1, whose odd position 2·ef+1 = 2·cf−1 falls just before
-// child cf) — and reverses cleanly by consuming [lo, hi) from the back, with no separate forward/
-// reverse logic.
+// scanFrame is one node on a rangeCursor's explicit traversal stack: the node and the half-open span
+// [lo, hi) of positions still to process. A LEAF's positions are its in-bound record indices (its
+// entry window). An INTERIOR node's positions are its overlapping child indices (its child window) —
+// interior nodes emit nothing (records are leaf-only, v24), so the frame only descends. Reversal
+// consumes [lo, hi) from the back, with no separate forward/reverse logic.
 type scanFrame struct {
-	node           *pnode
-	isLeaf         bool
-	ef, el, cf, cl int
-	lo, hi         int
+	node   *pnode
+	isLeaf bool
+	lo, hi int
 }
 
 func newScanFrame(n *pnode, b keyBound) scanFrame {
-	ef, el := b.entryWindow(n)
 	if n.isLeaf() {
-		return scanFrame{node: n, isLeaf: true, ef: ef, el: el, lo: ef, hi: el}
+		ef, el := b.entryWindow(n)
+		return scanFrame{node: n, isLeaf: true, lo: ef, hi: el}
 	}
 	cf, cl := b.childWindow(n)
-	return scanFrame{node: n, isLeaf: false, ef: ef, el: el, cf: cf, cl: cl, lo: 0, hi: 2*len(n.keys) + 1}
+	return scanFrame{node: n, isLeaf: false, lo: cf, hi: cl + 1}
 }
 
 // rangeCursor is a PULL (stateful) cursor over a pMap's (key, row) pairs within a keyBound, in
 // ascending (reverse=false) or descending (reverse=true) key order — the pull-model equivalent of
-// scanRange / scanRangeRev (the S2 pull B-tree scan cursor, spec/design/streaming.md §3/§5). Where
+// scanRange / scanRangeRev (the S2 pull B+tree scan cursor, spec/design/streaming.md §3/§5). Where
 // scanRange PUSHES each row to a visit callback and owns the control flow, this cursor lets the
 // CALLER own it: each next() yields the next in-bound pair, advancing an explicit frame stack over
 // the persistent map. That is the VDBE-forward shape (streaming.md §3): a stateful next/rewind cursor
@@ -836,257 +783,268 @@ func (m *pMap) rangeCursor(b keyBound, src leafSource, reverse bool, mask []bool
 }
 
 // next yields the next in-bound (key, row), or ok=false when the traversal is exhausted. Each call
-// advances the frame stack until it emits a row, descends into (and faults) a child, or pops an
+// advances the frame stack until it emits a leaf row, descends into (and faults) a child, or pops an
 // exhausted frame.
 func (c *rangeCursor) next() (key []byte, row storedRow, ok bool, err error) {
 	for len(c.stack) > 0 {
-		// &c.stack[top] is stable through the inner loop (no append/pop there); the descend/pop arms
-		// below re-fetch the top after they mutate the stack, so no stale pointer is used across a
-		// reslice.
+		// &c.stack[top] is mutated before any append reslices the stack, so no stale pointer is
+		// used across a reallocation (the loop re-fetches the top each iteration).
 		fr := &c.stack[len(c.stack)-1]
-		descend := -1
-		for fr.lo < fr.hi {
-			var p int
-			if c.reverse {
-				fr.hi--
-				p = fr.hi
-			} else {
-				p = fr.lo
-				fr.lo++
-			}
-			if fr.isLeaf {
-				// A leaf's positions are its in-bound key indices [ef, el) directly.
-				row, err := fr.node.rowAtMaybeMasked(p, c.mask)
-				if err != nil {
-					return nil, nil, false, err
-				}
-				return fr.node.keys[p], row, true, nil
-			}
-			if p%2 == 0 {
-				i := p / 2
-				if fr.cf <= i && i <= fr.cl {
-					descend = i
-					break
-				}
-			} else {
-				j := p / 2
-				if fr.ef <= j && j < fr.el {
-					return fr.node.keys[j], fr.node.vals[j], true, nil
-				}
-			}
-		}
-		if descend >= 0 {
-			parent := c.stack[len(c.stack)-1].node
-			child, e := resolveChild(parent.children[descend], c.src)
-			if e != nil {
-				return nil, nil, false, e
-			}
-			c.stack = append(c.stack, newScanFrame(child, c.bound))
+		if fr.lo >= fr.hi {
+			c.stack = c.stack[:len(c.stack)-1]
 			continue
 		}
-		c.stack = c.stack[:len(c.stack)-1]
+		var p int
+		if c.reverse {
+			fr.hi--
+			p = fr.hi
+		} else {
+			p = fr.lo
+			fr.lo++
+		}
+		if fr.isLeaf {
+			row, err := fr.node.rowAtMaybeMasked(p, c.mask)
+			if err != nil {
+				return nil, nil, false, err
+			}
+			return fr.node.keys[p], row, true, nil
+		}
+		child, e := resolveChild(fr.node.children[p], c.src)
+		if e != nil {
+			return nil, nil, false, e
+		}
+		c.stack = append(c.stack, newScanFrame(child, c.bound))
 	}
 	return nil, nil, false, nil
 }
 
-// insOut is the result of inserting into a subtree: a whole rebuilt node, or a split.
+// insOut is the result of inserting into a subtree: a whole rebuilt node, or a node that overflowed
+// and split into left, a SEPARATOR key for the parent, and right. A leaf split COPIES the right
+// leaf's first key up (no record leaves the leaf level); an interior split PUSHES its median
+// separator up (format.md "Fan-out").
 type insOut struct {
 	whole *pnode // non-nil ⇒ no split
 	left  *pnode
-	midK  []byte
-	midV  storedRow
-	midW  uint32
+	sep   []byte
 	right *pnode
 }
 
-// build constructs a node from the parts; if its payload overflows cap it splits 2-way and promotes
-// one median (format.md "Split point"). rightEdge says the just-edited record (the inserted/replaced
-// one, or the separator a child split promoted) is the node's LAST: then the split is the append rule
-// m = min(m_append, N-2) with m_append = largest m in [1,N-1] with leftpayload(m) ≤ cap — sequential
-// ascending loads pack left nodes ~full. Anywhere else (and the delete path's merge-overflow, which
-// has no edited position) splits BALANCED: m = min(m_balanced, m_append, N-2) with m_balanced =
-// smallest m with 2·leftpayload(m) ≥ payload — without it, largest-left degenerates to [N-2 | 1]
-// splinters and random-order inserts converge on a few-percent fill (benchmarks.md finding). Either
-// m yields two non-empty, fitting halves under the RECORD_MAX = (cap-12)/2 cap (format.md). The < 3
-// guard is defensive against an oversized record — it leaves the node whole, and the oversize is
-// surfaced as 0A000 when the node is serialized (format.go).
-func build(keys [][]byte, vals []storedRow, weights []uint32, children []childRef, cap, k int, rightEdge bool) insOut {
-	interior := len(children) > 0
+// splitPoint is the kind-shared split decision (format.md "Split point"): given the per-boundary
+// leftpayload/rightpayload functions over m in [mLo, mHi], pick
+// m = rightEdge ? m_max : clamp(min(m_balanced, m_max), m_min, m_max), or ok=false when no m in the
+// range keeps both sides fitting (the interior merge-abandon case — unreachable on the insert path,
+// format.md "Why the record cap"). leftpayload is nondecreasing in m and rightpayload nonincreasing,
+// so both bounds scan cleanly; the ranges are tiny (page fan-out), so a linear scan is clearest.
+func splitPoint(mLo, mHi, payload, cap int, rightEdge bool, leftpayload, rightpayload func(int) int) (int, bool) {
+	mMax, haveMax := 0, false
+	for m := mLo; m <= mHi; m++ {
+		if leftpayload(m) <= cap {
+			mMax, haveMax = m, true
+		} else {
+			break
+		}
+	}
+	if !haveMax {
+		return 0, false
+	}
+	mMin, haveMin := 0, false
+	for m := mHi; m >= mLo; m-- {
+		if rightpayload(m) <= cap {
+			mMin, haveMin = m, true
+		} else {
+			break
+		}
+	}
+	if !haveMin || mMin > mMax {
+		return 0, false
+	}
+	if rightEdge {
+		return mMax, true
+	}
+	mBalanced := mMax
+	for m := mLo; m <= mHi; m++ {
+		if 2*leftpayload(m) >= payload {
+			mBalanced = m
+			break
+		}
+	}
+	m := mBalanced
+	if m > mMax {
+		m = mMax
+	}
+	if m < mMin {
+		m = mMin
+	}
+	return m, true
+}
+
+// buildLeaf builds a leaf from its parts; if its payload overflows cap, it splits 2-way COPY-UP
+// (format.md "Leaf split"): the left leaf keeps records [0, m), the right leaf [m, N), and the
+// separator handed up is a COPY of keys[m] (the right leaf's first key). edited is the index of the
+// just-inserted/replaced record (-1 for the delete path's merge-overflow, which splits balanced). A
+// leaf with a single over-cap record is left whole (defensive — the oversize surfaces as 0A000 when
+// serialized).
+func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap int, shape leafShape, edited int) insOut {
+	n := len(keys)
 	payload := 0
 	for _, w := range weights {
 		payload += int(w)
 	}
-	if interior {
-		payload += 4 * len(children)
-	} else {
-		payload += directoryOverhead(len(keys), k)
+	payload += leafOverhead(n, shape)
+	if payload <= cap || n < 2 {
+		return insOut{whole: &pnode{keys: keys, vals: vals, weights: weights}}
 	}
-	if payload <= cap || len(keys) < 3 {
-		return insOut{whole: &pnode{keys: keys, vals: vals, weights: weights, children: children}}
+	prefix := make([]int, n+1)
+	for i, w := range weights {
+		prefix[i+1] = prefix[i] + int(w)
 	}
-
-	n := len(keys)
-	best := 1
-	prefix := 0
-	balanced := 0
-	for m := 1; m < n; m++ {
-		prefix += int(weights[m-1])
-		lp := prefix
-		if interior {
-			lp += 4 * (m + 1)
-		} else {
-			lp += directoryOverhead(m, k)
-		}
-		if lp <= cap {
-			best = m
-		}
-		if balanced == 0 && 2*lp >= payload {
-			balanced = m
-		}
-	}
-	m := best
-	if !rightEdge && balanced != 0 && balanced < m {
-		m = balanced
-	}
-	if n-2 < m {
-		m = n - 2
-	}
-	if m < 1 {
-		m = 1
-	}
-
-	var lchildren, rchildren []childRef
-	if interior {
-		lchildren = cloneChildren(children[:m+1])
-		rchildren = cloneChildren(children[m+1:])
+	total := prefix[n]
+	leftpayload := func(m int) int { return prefix[m] + leafOverhead(m, shape) }
+	rightpayload := func(m int) int { return total - prefix[m] + leafOverhead(n-m, shape) }
+	m, ok := splitPoint(1, n-1, payload, cap, edited == n-1, leftpayload, rightpayload)
+	if !ok {
+		// Unreachable under the RECORD_MAX cap (a two-record leaf always fits — format.md "Why the
+		// record cap"); defensively leave the node whole (0A000 at serialize).
+		return insOut{whole: &pnode{keys: keys, vals: vals, weights: weights}}
 	}
 	return insOut{
-		left: &pnode{
-			keys: cloneKeys(keys[:m]), vals: cloneVals(vals[:m]),
-			weights: cloneWeights(weights[:m]), children: lchildren,
-		},
-		midK: keys[m], midV: vals[m], midW: weights[m],
-		right: &pnode{
-			keys: cloneKeys(keys[m+1:]), vals: cloneVals(vals[m+1:]),
-			weights: cloneWeights(weights[m+1:]), children: rchildren,
-		},
+		left:  &pnode{keys: cloneKeys(keys[:m]), vals: cloneVals(vals[:m]), weights: cloneWeights(weights[:m])},
+		sep:   keys[m],
+		right: &pnode{keys: cloneKeys(keys[m:]), vals: cloneVals(vals[m:]), weights: cloneWeights(weights[m:])},
 	}
 }
 
-// nodeInsert is the recursive insert. On overwrite it sets *old/*replaced and rebuilds the path with
-// the value+weight replaced (which may now overflow). On a new key it inserts into the leaf and
-// splits overflowing nodes back up the path.
-func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedRow, replaced *bool, src leafSource, cap, k int) (insOut, error) {
-	i, found := n.search(key)
-	if found {
-		vals, err := n.decodedRows()
-		if err != nil {
-			return insOut{}, err
-		}
-		weights := cloneWeights(n.weights)
-		*old = vals[i]
-		*replaced = true
-		vals[i] = val
-		weights[i] = weight
-		return build(cloneKeys(n.keys), vals, weights, cloneChildren(n.children), cap, k, i == len(n.keys)-1), nil
+// buildInterior builds an interior node from its parts; if its payload overflows cap, it splits
+// 2-way PUSH-UP (format.md "Interior split"): the left node keeps separators [0, m) + children
+// [0, m], separator m moves up, the right node keeps [m+1, N) + children [m+1, N]. With N = 2 (only
+// reachable with near-cap separators) the split is pinned to m = 1, producing a legal N = 0 right
+// interior (the degenerate fan-out contract). Returns ok=false when the node overflows and no valid
+// split point exists — the caller (only the interior MERGE path can hit it) abandons the merge.
+func buildInterior(keys [][]byte, children []childRef, cap int, edited int) (insOut, bool) {
+	n := len(keys)
+	payload := 8*n + 4
+	for _, k := range keys {
+		payload += len(k)
 	}
-	if n.isLeaf() {
-		rows, err := n.decodedRows()
-		if err != nil {
-			return insOut{}, err
+	if payload <= cap || n < 2 {
+		return insOut{whole: &pnode{keys: keys, children: children}}, true
+	}
+	var m int
+	if n == 2 {
+		// The degenerate pin (format.md "Interior split"): the left keeps sep[0] (fits, by the
+		// minimum-fanout invariant), sep[1] moves up, the right is the legal N = 0 interior.
+		m = 1
+	} else {
+		prefix := make([]int, n+1)
+		for i, k := range keys {
+			prefix[i+1] = prefix[i] + len(k)
 		}
-		return build(insertKeyAt(n.keys, i, key), insertValAt(rows, i, val), insertWeightAt(n.weights, i, weight), nil, cap, k, i == len(n.keys)), nil
+		total := prefix[n]
+		leftpayload := func(m int) int { return 8*m + 4 + prefix[m] }
+		rightpayload := func(m int) int { return 8*(n-1-m) + 4 + (total - prefix[m+1]) }
+		var ok bool
+		m, ok = splitPoint(1, n-2, payload, cap, edited == n-1, leftpayload, rightpayload)
+		if !ok {
+			return insOut{}, false
+		}
+	}
+	return insOut{
+		left:  &pnode{keys: cloneKeys(keys[:m]), children: cloneChildren(children[:m+1])},
+		sep:   keys[m],
+		right: &pnode{keys: cloneKeys(keys[m+1:]), children: cloneChildren(children[m+1:])},
+	}, true
+}
+
+// nodeInsert is the recursive insert. It descends to the holding leaf (interior nodes only route,
+// via childSlot); on overwrite it sets *old/*replaced and rebuilds with the value+weight replaced
+// (which may now overflow). Splits propagate back up: a leaf split copies its boundary key up, an
+// interior receiving a separator may push-split in turn.
+func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedRow, replaced *bool, src leafSource, cap int, shape leafShape) (insOut, error) {
+	if n.isLeaf() {
+		i, found := n.search(key)
+		var keys [][]byte
+		var vals []storedRow
+		var weights []uint32
+		if found {
+			rows, err := n.decodedRows()
+			if err != nil {
+				return insOut{}, err
+			}
+			*old = rows[i]
+			*replaced = true
+			rows[i] = val
+			keys = cloneKeys(n.keys)
+			vals = rows
+			weights = cloneWeights(n.weights)
+			weights[i] = weight
+		} else {
+			rows, err := n.decodedRows()
+			if err != nil {
+				return insOut{}, err
+			}
+			keys = insertKeyAt(n.keys, i, key)
+			vals = insertValAt(rows, i, val)
+			weights = insertWeightAt(n.weights, i, weight)
+		}
+		return buildLeaf(keys, vals, weights, cap, shape, i), nil
 	}
 	// Fault the target child (a resident interior, or an OnDisk leaf brought in for mutation — it
 	// becomes a dirty resident node on the rebuilt path).
+	i := n.childSlot(key)
 	childNode, err := resolveChild(n.children[i], src)
 	if err != nil {
 		return insOut{}, err
 	}
-	sub, err := nodeInsert(childNode, key, val, weight, old, replaced, src, cap, k)
+	sub, err := nodeInsert(childNode, key, val, weight, old, replaced, src, cap, shape)
 	if err != nil {
 		return insOut{}, err
 	}
 	if sub.whole != nil {
+		// This node's separators are unchanged, so it cannot overflow — rebuild whole.
 		children := cloneChildren(n.children)
 		children[i] = residentRef(sub.whole)
-		return insOut{whole: &pnode{keys: cloneKeys(n.keys), vals: cloneVals(n.vals), weights: cloneWeights(n.weights), children: children}}, nil
+		return insOut{whole: &pnode{keys: cloneKeys(n.keys), children: children}}, nil
 	}
-	keys := insertKeyAt(n.keys, i, sub.midK)
-	vals := insertValAt(n.vals, i, sub.midV)
-	weights := insertWeightAt(n.weights, i, sub.midW)
+	keys := insertKeyAt(n.keys, i, sub.sep)
 	children := cloneChildren(n.children)
 	children[i] = residentRef(sub.left)
 	children = insertChildAt(children, i+1, residentRef(sub.right))
-	return build(keys, vals, weights, children, cap, k, i == len(n.keys)), nil
+	out, ok := buildInterior(keys, children, cap, i)
+	if !ok {
+		panic("insert-path interior split always has a valid split point")
+	}
+	return out, nil
 }
 
-// maxKV is the rightmost (largest) entry of a subtree — its in-order predecessor. Faults the rightmost
-// leaf through src if it is OnDisk.
-func maxKV(n *pnode, src leafSource) ([]byte, storedRow, uint32, error) {
-	for !n.isLeaf() {
-		child, err := resolveChild(n.children[len(n.children)-1], src)
-		if err != nil {
-			return nil, nil, 0, err
-		}
-		n = child
-	}
-	row, err := n.rowAt(len(n.keys) - 1)
-	if err != nil {
-		return nil, nil, 0, err
-	}
-	return n.keys[len(n.keys)-1], row, n.weights[len(n.weights)-1], nil
+// underfull: a non-root node is underfull when its payload is below half a page (cap/2), the
+// threshold at which delete rebalances it (format.md "Delete"). The root is exempt.
+func underfull(n *pnode, cap int, shape leafShape) bool {
+	return n.payload(shape) < cap/2
 }
 
-// nodeRemove is the recursive delete (copy-on-write). Returns the rebuilt subtree (possibly
-// underfull — the caller rebalances it) and the removed row. A separator found in an interior node
-// is replaced by its in-order predecessor (drawn from the left subtree), which is then deleted from
-// that subtree; the touched child is rebalanced via rebalanceChild.
-func nodeRemove(n *pnode, key []byte, src leafSource, cap, k int) (*pnode, storedRow, bool, error) {
-	i, found := n.search(key)
-	if found {
-		if n.isLeaf() {
-			rows, err := n.decodedRows()
-			if err != nil {
-				return nil, nil, false, err
-			}
-			vals, removed := removeValAt(rows, i)
-			return &pnode{keys: removeKeyAt(n.keys, i), vals: vals, weights: removeWeightAt(n.weights, i)}, removed, true, nil
-		}
-		removed := n.vals[i]
-		// Fault the left subtree once; both the predecessor lookup and its deletion descend it.
-		leftChild, err := resolveChild(n.children[i], src)
-		if err != nil {
-			return nil, nil, false, err
-		}
-		pk, pv, pw, err := maxKV(leftChild, src)
-		if err != nil {
-			return nil, nil, false, err
-		}
-		newChild, _, _, err := nodeRemove(leftChild, pk, src, cap, k)
-		if err != nil {
-			return nil, nil, false, err
-		}
-		keys := cloneKeys(n.keys)
-		vals := cloneVals(n.vals)
-		weights := cloneWeights(n.weights)
-		children := cloneChildren(n.children)
-		keys[i], vals[i], weights[i], children[i] = pk, pv, pw, residentRef(newChild)
-		rebuilt := &pnode{keys: keys, vals: vals, weights: weights, children: children}
-		out, err := rebalanceChild(rebuilt, i, src, cap, k)
-		if err != nil {
-			return nil, nil, false, err
-		}
-		return out, removed, true, nil
-	}
+// nodeRemove is the recursive delete (copy-on-write). It descends to the holding LEAF (a separator
+// equal to the key just routes right — it is never itself deleted or replaced; separators may go
+// stale, format.md "Delete"). Returns the rebuilt subtree (possibly underfull — the caller
+// rebalances it) and the removed row. The touched child is rebalanced via rebalanceChild.
+func nodeRemove(n *pnode, key []byte, src leafSource, cap int, shape leafShape) (*pnode, storedRow, bool, error) {
 	if n.isLeaf() {
-		return n, nil, false, nil
+		i, found := n.search(key)
+		if !found {
+			return n, nil, false, nil
+		}
+		rows, err := n.decodedRows()
+		if err != nil {
+			return nil, nil, false, err
+		}
+		vals, removed := removeValAt(rows, i)
+		return &pnode{keys: removeKeyAt(n.keys, i), vals: vals, weights: removeWeightAt(n.weights, i)}, removed, true, nil
 	}
+	i := n.childSlot(key)
 	childNode, err := resolveChild(n.children[i], src)
 	if err != nil {
 		return nil, nil, false, err
 	}
-	newChild, removed, ok, err := nodeRemove(childNode, key, src, cap, k)
+	newChild, removed, ok, err := nodeRemove(childNode, key, src, cap, shape)
 	if err != nil {
 		return nil, nil, false, err
 	}
@@ -1095,39 +1053,48 @@ func nodeRemove(n *pnode, key []byte, src leafSource, cap, k int) (*pnode, store
 	}
 	children := cloneChildren(n.children)
 	children[i] = residentRef(newChild)
-	rebuilt := &pnode{keys: cloneKeys(n.keys), vals: cloneVals(n.vals), weights: cloneWeights(n.weights), children: children}
-	out, err := rebalanceChild(rebuilt, i, src, cap, k)
+	rebuilt := &pnode{keys: cloneKeys(n.keys), children: children}
+	out, err := rebalanceChild(rebuilt, i, src, cap, shape)
 	if err != nil {
 		return nil, nil, false, err
 	}
 	return out, removed, true, nil
 }
 
-// rebalanceChild: if children[i] is underfull (payload < cap/2), merge it with an adjacent sibling
-// (prefer the right one), then split the merged node back if it overflows — the unified rebalance
-// (no borrow). The returned parent may itself have lost a key and become underfull; its own parent
-// handles that as the recursion unwinds.
-func rebalanceChild(n *pnode, i int, src leafSource, cap, k int) (*pnode, error) {
+// rebalanceChild: if children[i] is underfull, merge it with an adjacent sibling (prefer the right
+// one), then split the merged node back if it overflows — the unified rebalance (no borrow). The
+// returned parent may itself have lost a key and become underfull; its own parent handles that as
+// the recursion unwinds.
+func rebalanceChild(n *pnode, i int, src leafSource, cap int, shape leafShape) (*pnode, error) {
 	// children[i] was just rebuilt resident by nodeRemove, so inspecting it faults nothing.
 	childNode, err := resolveChild(n.children[i], src)
 	if err != nil {
 		return nil, err
 	}
-	if childNode.payload(k) >= cap/2 {
+	if !underfull(childNode, cap, shape) {
+		return n, nil
+	}
+	if len(n.children) < 2 {
+		// A 0-key interior (one child, the degenerate max-separator shape) has no sibling to merge
+		// with — its own parent merges IT away; the root case collapses in pMap.Remove.
 		return n, nil
 	}
 	j := i
 	if i+1 >= len(n.children) {
 		j = i - 1
 	}
-	return mergeAt(n, j, src, cap, k)
+	return mergeAt(n, j, src, cap, shape)
 }
 
-// mergeAt merges children[j], separator j, and children[j+1] into one node M. If M fits, it replaces
-// the pair and the parent loses separator j and child j+1. If M overflows, it is split 2-way and the
-// two halves + the new separator replace the pair (the parent's key count is unchanged). M < 2·cap
-// always (format.md), so a single split restores fit.
-func mergeAt(n *pnode, j int, src leafSource, cap, k int) (*pnode, error) {
+// mergeAt merges children[j] and children[j+1] into one node M (format.md "Delete"): a LEAF merge
+// concatenates the two record lists and the parent separator j is REMOVED (it was a routing copy —
+// nothing comes down); an INTERIOR merge PULLS the separator DOWN between the two key lists (the
+// merged children need a routing key between them). If M fits, it replaces the pair (the parent
+// loses one key); if it overflows, it is split 2-way by the balanced rule and the halves + the new
+// separator replace the pair (the parent's key count is unchanged). An INTERIOR M that overflows
+// but admits no valid split (near-cap separators) ABANDONS the merge — the parent is returned
+// unchanged (format.md "Delete", the deterministic abandon rule).
+func mergeAt(n *pnode, j int, src leafSource, cap int, shape leafShape) (*pnode, error) {
 	// Fault both children — the underfull child (just rebuilt resident) and its sibling, which may
 	// still be an OnDisk leaf the delete never touched.
 	left, err := resolveChild(n.children[j], src)
@@ -1138,53 +1105,57 @@ func mergeAt(n *pnode, j int, src leafSource, cap, k int) (*pnode, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Materialize both children (a leaf may be Packed) before merging — the merged node is Decoded.
-	leftRows, err := left.decodedRows()
-	if err != nil {
-		return nil, err
-	}
-	rightRows, err := right.decodedRows()
-	if err != nil {
-		return nil, err
-	}
 
-	mkeys := make([][]byte, 0, len(left.keys)+1+len(right.keys))
-	mkeys = append(mkeys, left.keys...)
-	mkeys = append(mkeys, n.keys[j])
-	mkeys = append(mkeys, right.keys...)
-	mvals := make([]storedRow, 0, len(leftRows)+1+len(rightRows))
-	mvals = append(mvals, leftRows...)
-	mvals = append(mvals, n.vals[j])
-	mvals = append(mvals, rightRows...)
-	mweights := make([]uint32, 0, len(left.weights)+1+len(right.weights))
-	mweights = append(mweights, left.weights...)
-	mweights = append(mweights, n.weights[j])
-	mweights = append(mweights, right.weights...)
-	var mchildren []childRef
-	if !left.isLeaf() {
-		mchildren = make([]childRef, 0, len(left.children)+len(right.children))
+	var merged insOut
+	if left.isLeaf() {
+		// Materialize both leaves (either may be Packed) before merging — the merged node is Decoded.
+		leftRows, err := left.decodedRows()
+		if err != nil {
+			return nil, err
+		}
+		rightRows, err := right.decodedRows()
+		if err != nil {
+			return nil, err
+		}
+		mkeys := make([][]byte, 0, len(left.keys)+len(right.keys))
+		mkeys = append(mkeys, left.keys...)
+		mkeys = append(mkeys, right.keys...)
+		mvals := make([]storedRow, 0, len(leftRows)+len(rightRows))
+		mvals = append(mvals, leftRows...)
+		mvals = append(mvals, rightRows...)
+		mweights := make([]uint32, 0, len(left.weights)+len(right.weights))
+		mweights = append(mweights, left.weights...)
+		mweights = append(mweights, right.weights...)
+		merged = buildLeaf(mkeys, mvals, mweights, cap, shape, -1) // merge-overflow: balanced
+	} else {
+		mkeys := make([][]byte, 0, len(left.keys)+1+len(right.keys))
+		mkeys = append(mkeys, left.keys...)
+		mkeys = append(mkeys, n.keys[j]) // the separator pulls down
+		mkeys = append(mkeys, right.keys...)
+		mchildren := make([]childRef, 0, len(left.children)+len(right.children))
 		mchildren = append(mchildren, left.children...)
 		mchildren = append(mchildren, right.children...)
+		var ok bool
+		merged, ok = buildInterior(mkeys, mchildren, cap, -1)
+		if !ok {
+			// No valid 2-way split point (near-cap separators): abandon the merge — the two
+			// children and the parent separator stay exactly as they were (underfull tolerated).
+			return n, nil
+		}
 	}
 
 	keys := cloneKeys(n.keys)
-	vals := cloneVals(n.vals)
-	weights := cloneWeights(n.weights)
 	children := cloneChildren(n.children)
-
-	out := build(mkeys, mvals, mweights, mchildren, cap, k, false) // merge-overflow: balanced (format.md)
-	if out.whole != nil {
+	if merged.whole != nil {
 		keys = removeKeyAt(keys, j)
-		vals, _ = removeValAt(vals, j)
-		weights = removeWeightAt(weights, j)
-		children[j] = residentRef(out.whole)
+		children[j] = residentRef(merged.whole)
 		children = removeChildAt(children, j+1)
-		return &pnode{keys: keys, vals: vals, weights: weights, children: children}, nil
+		return &pnode{keys: keys, children: children}, nil
 	}
-	keys[j], vals[j], weights[j] = out.midK, out.midV, out.midW
-	children[j] = residentRef(out.left)
-	children[j+1] = residentRef(out.right)
-	return &pnode{keys: keys, vals: vals, weights: weights, children: children}, nil
+	keys[j] = merged.sep
+	children[j] = residentRef(merged.left)
+	children[j+1] = residentRef(merged.right)
+	return &pnode{keys: keys, children: children}, nil
 }
 
 // --- immutable slice helpers (each returns a fresh slice, leaving the input untouched) -------
