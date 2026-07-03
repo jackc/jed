@@ -107,7 +107,7 @@ const PAGE_CATALOG = 1; // page_type for a catalog page
 const PAGE_LEAF = 2; // page_type for a B-tree leaf node
 const PAGE_INTERIOR = 3; // page_type for a B-tree interior node
 const PAGE_OVERFLOW = 4; // page_type for an out-of-line value slab (large-values.md §12)
-const ROOT_PAGE = 2; // catalog root of a fresh empty db (relocatable thereafter)
+export const ROOT_PAGE = 2; // catalog root of a fresh empty db (relocatable thereafter); exported for within-session compaction (persist.ts maybeCompact)
 // Value-codec presence tags beyond 0x00 present-inline-plain / 0x01 NULL (large-values.md
 // §12/§13; format.md "Large values"): 0x02 external-plain (u32 first_page + u32 payload_len),
 // 0x03 inline-compressed (u32 raw_len + u16 comp_len + LZ4 block — lz4.md), 0x04
@@ -2233,6 +2233,21 @@ export function loadEngine(image: Uint8Array): Engine {
   return loadEnginePaged(new SharedPaging(pager, Number.MAX_SAFE_INTEGER));
 }
 
+// newTempStorage builds a fresh per-domain storage Engine for a TEMP snapshot (temp-tables.md §6,
+// bplus-reshape.md): a private in-RAM MemoryBlockStore read/written through the SAME pager + packed-leaf
+// path as an in-memory database, with a PINNED (unbounded) pool — a temp domain is resident by
+// definition (§5) — and within-session compaction ON, so its copy-on-write orphans are reclaimed rather
+// than leaked (a temp store is never reopened, so reconstruct-on-open never runs). It seeds the store
+// with the empty from-scratch image exactly as an in-memory database does (loadEngine), so its pageCount
+// starts past the meta slots. Zero file writes: this byte store is entirely separate from the main
+// database file. Only its storage fields (paging/pageCount/freePages/reclaimWithinSession) are used — its
+// committed snapshot is unused, like the shared core's storage Engine (shared.ts).
+export function newTempStorage(pageSize: number): Engine {
+  const st = loadEngine(toImage(new Snapshot(0n), pageSize, 0n));
+  st.reclaimWithinSession = true;
+  return st;
+}
+
 // anySpillable reports whether any column type can spill out-of-line (large-values.md §12).
 // anySpillableMasked is anySpillable restricted to the columns a query's touched set selects —
 // the gate for the masked scan-units walk (cost.md §3 "The touched set"): if no TOUCHED column
@@ -2284,6 +2299,54 @@ function collectLeafOverflow(
     return;
   }
   throw engineError("data_corrupted", "expected a B-tree node page");
+}
+
+// reachablePages collects every page reachable from the committed snapshot whose catalog head is
+// catRoot: the catalog chain, every table/index B+tree node, and (for spillable columns) the live
+// overflow chains. It is the inverse of the free-list and the basis of within-session compaction
+// (persist.ts maybeCompact) — the same live set the open-time reconstruction (loadEnginePaged) derives,
+// but computed against the already-resident committed trees: node page ids come from the in-memory tree
+// walk (no pager reads), and only the catalog chain and spillable-leaf overflow are read through the
+// pager. A reclaim domain (temp) never carries a GiST index (deferred 0A000, temp-tables.md §8), so GiST
+// pages need no handling here — the caller skips any snapshot that has one.
+export function reachablePages(snap: Snapshot, paging: SharedPaging, catRoot: number): Set<number> {
+  const reached = new Set<number>();
+  // The catalog chain (rewritten to fresh pages every commit; its predecessor pages are the bulk of
+  // what compaction reclaims).
+  for (let p = catRoot; p !== 0; ) {
+    reached.add(p);
+    const pg = parsePage(paging.readBlock(p));
+    if (pg.pageType !== PAGE_CATALOG)
+      throw engineError("data_corrupted", "expected a catalog page");
+    p = pg.nextPage;
+  }
+  // Table data trees + their live overflow chains.
+  for (const st of snap.stores.values()) {
+    const root = st.treeRoot();
+    collectTreePages(root, reached);
+    if (root !== null && root.page !== 0 && anySpillable(st.columnTypes())) {
+      collectLeafOverflow(paging, root.page, st.columnTypes(), reached);
+    }
+  }
+  // Secondary/unique index trees (empty-payload, never spillable).
+  for (const ist of snap.indexStores.values()) {
+    collectTreePages(ist.treeRoot(), reached);
+  }
+  return reached;
+}
+
+// collectTreePages adds every node page of a resident B+tree to reached: an interior/leaf node's own
+// set-once page, and each OnDisk child leaf's page (walked without faulting it — the page id is on the
+// child ref). A page-0 node is a dirty node not yet persisted (never on a committed tree at compaction
+// time); it is skipped so page 0 (a meta slot) is never marked.
+function collectTreePages(n: PNode | null, reached: Set<number>): void {
+  if (n === null) return;
+  if (n.page !== 0) reached.add(n.page);
+  for (const c of n.children) {
+    if (c.node === null)
+      reached.add(c.page); // an OnDisk leaf: page id known without a fault
+    else collectTreePages(c.node, reached);
+  }
 }
 
 // loadEnginePaged opens a file-backed database demand-paged (spec/design/pager.md, P6.4b): it loads

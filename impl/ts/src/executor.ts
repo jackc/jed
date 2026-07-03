@@ -121,7 +121,8 @@ import {
   type ExtractSrc,
   extractField,
 } from "./datetime_fn.ts";
-import { crc32Ieee, pagePayload, resolveUnfetchedSelf } from "./format.ts";
+import { crc32Ieee, newTempStorage, pagePayload, resolveUnfetchedSelf } from "./format.ts";
+import { persistTemp } from "./persist.ts";
 import {
   Decimal,
   decimalFromParts,
@@ -941,6 +942,14 @@ export class Snapshot {
   // content-deterministic, gist.md §3) at every mutating statement and on load. Never mutated in
   // place (replaced wholesale on rebuild), so clone shallow-copies it.
   gistTrees: Map<string, GistTree> = new Map();
+  // tempPaging is the per-domain MemoryBlockStore paging context a TEMP snapshot's stores attach to
+  // (spec/design/temp-tables.md §6, bplus-reshape.md): non-null only for a session-local (or, later,
+  // shared) temp snapshot, so its tables ride the same pager + packed-leaf path as an in-memory database
+  // (compact, bounded, spill-ready) instead of a fully-resident decoded tree. null for the main snapshot
+  // (its paging lives on the store, attached by the file/in-memory loader). Carried through clone() so a
+  // tx's tempWorking creates stores against the same domain page space. NEVER serialized (a temp snapshot
+  // never is).
+  tempPaging: SharedPaging | null = null;
 
   constructor(
     txid: bigint = 0n,
@@ -979,6 +988,8 @@ export class Snapshot {
     // GiST trees are never mutated in place — only replaced wholesale — so a shallow Map copy is safe.
     c.gistTrees = new Map(this.gistTrees);
     c.catGen = this.catGen;
+    // The temp domain's paging is shared by reference (one pool per domain), like a store's paging.
+    c.tempPaging = this.tempPaging;
     return c;
   }
 
@@ -1403,7 +1414,12 @@ export class Snapshot {
   putTableResolved(t: Table, colTypes: ColType[], pageSize: number): void {
     this.bumpCatGen();
     const key = t.name.toLowerCase();
-    this.stores.set(key, new TableStore(pagePayload(pageSize), colTypes));
+    const st = new TableStore(pagePayload(pageSize), colTypes);
+    // A temp snapshot rides a per-domain MemoryBlockStore pager (temp-tables.md §6): its stores demand-
+    // page like a file/in-memory database instead of staying fully-resident decoded. The main snapshot
+    // leaves tempPaging null (its stores attach the storage identity's paging on load).
+    if (this.tempPaging !== null) st.attachPaging(this.tempPaging);
+    this.stores.set(key, st);
     this.tables.set(key, t);
   }
 
@@ -1476,6 +1492,9 @@ export class Snapshot {
   // loader's hook (format.ts): the owning table's indexes list came from its catalog
   // entry, so only the store is registered here.
   putIndexStore(nameKey: string, store: TableStore): void {
+    // A temp snapshot's index stores ride the same per-domain MemoryBlockStore pager as its tables
+    // (temp-tables.md §6); the main snapshot leaves tempPaging null.
+    if (this.tempPaging !== null && !store.isFileBacked()) store.attachPaging(this.tempPaging);
     this.indexStores.set(nameKey, store);
   }
 
@@ -2245,6 +2264,27 @@ export class Engine {
   // unlimited. The shared analogue of session.tempBuffers, but Engine-level (shared temp is global).
   // An over-budget shared write aborts 54P03.
   sharedTempMem: number;
+  // reclaimWithinSession turns on within-session free-list compaction (persist.ts maybeCompact): the
+  // never-reopened in-RAM temp domains set it (temp-tables.md §6, bplus-reshape.md), so their
+  // copy-on-write orphans are reclaimed rather than leaked. The main file/in-memory domain leaves it
+  // false (reconstruct-on-open only). When TS models a "storage" it is an Engine, so this rides here.
+  reclaimWithinSession: boolean;
+  // liveAtCompaction is the reachable page count recorded at the last compaction — the cheap trigger
+  // basis: compaction re-runs only once the high-water passes ~2× it (periodic ~2× bound, no per-commit
+  // walk).
+  liveAtCompaction: number;
+  // tempStorage is the SESSION-LOCAL temp domain's storage Engine (temp-tables.md §6): the private in-RAM
+  // MemoryBlockStore + pager + pinned pool its temp tables ride, with within-session compaction on.
+  // Created lazily on the first session-local temp DDL (newTempStorage); null until then. Its pageCount
+  // is the domain's footprint — the page-based temp budget. sharedTempStorage is the shared domain's
+  // analogue (a follow-on: shared temp is still the fully-resident decoded path on this slice).
+  tempStorage: Engine | null;
+  sharedTempStorage: Engine | null;
+  // openStreams counts this handle's live streaming cursors (Query's pull source, not a materialized
+  // result). A streaming cursor pins a snapshot it faults lazily, so while one is open a temp-domain
+  // compaction (persistTemp → maybeCompact) must NOT reclaim pages — it could free one the cursor still
+  // faults. Incremented when a streaming Rows opens (shared.ts), decremented on Close.
+  openStreams: number;
 
   constructor() {
     this.committed = new Snapshot();
@@ -2259,6 +2299,11 @@ export class Engine {
     this.spillSink = null;
     this.sharedTempCommitted = new Snapshot();
     this.sharedTempMem = DEFAULT_SHARED_TEMP_MEM;
+    this.reclaimWithinSession = false;
+    this.liveAtCompaction = 0;
+    this.tempStorage = null;
+    this.sharedTempStorage = null;
+    this.openStreams = 0;
   }
 
   // setMaxCost sets the execution-cost ceiling for statements run on this handle (CLAUDE.md §13;
@@ -2498,6 +2543,19 @@ export class Engine {
   // (it does not consult readPin — a writable-CTE pins only the main snapshot).
   private tempSnap(): Snapshot {
     return this.session.tx !== null ? this.session.tx.tempWorking : this.session.tempCommitted;
+  }
+
+  // tempDomainPaging returns the MemoryBlockStore paging context for a temp domain (temp-tables.md §6),
+  // lazily creating the domain's storage Engine (newTempStorage — a private in-RAM store + pinned pool
+  // with within-session compaction on) on first use. The session-local domain lives on this engine; the
+  // shared domain is a follow-on (shared temp is still the fully-resident decoded path on this slice).
+  tempDomainPaging(shared: boolean): SharedPaging {
+    if (shared) {
+      if (this.sharedTempStorage === null) this.sharedTempStorage = newTempStorage(this.pageSize);
+      return this.sharedTempStorage.paging!;
+    }
+    if (this.tempStorage === null) this.tempStorage = newTempStorage(this.pageSize);
+    return this.tempStorage.paging!;
   }
 
   // sharedTempSnap is the DATABASE-WIDE shared temp-table snapshot for READS (temp-tables.md §4/§5):
@@ -3312,6 +3370,13 @@ export class Engine {
     // temp analogue of publishing committed, but purely in memory. Session-local temp lives on the
     // session; shared temp lives on the handle (and is published to the shared root by the shared
     // layer's WriteHandle.commit, the two-root commit).
+    // A dirty session-local temp domain materializes its working snapshot into its MemoryBlockStore
+    // (compact packed leaves + within-session compaction) before it is adopted — zero main-file writes
+    // (temp-tables.md §6). Compaction is safe iff no streaming cursor holds an older temp tree. Shared
+    // temp is still the fully-resident decoded pointer-swap (a follow-on).
+    if (tx.tempDirty && this.tempStorage !== null) {
+      persistTemp(this.tempStorage, tx.tempWorking, this.openStreams === 0);
+    }
     this.session.tempCommitted = tx.tempWorking;
     this.sharedTempCommitted = tx.sharedTempWorking;
     return { kind: "statement", cost: 0n, rowsAffected: null };
@@ -3365,7 +3430,14 @@ export class Engine {
     const limit = this.session.tempBuffers;
     if (limit === 0) return;
     if (this.session.tx === null || !this.session.tx.tempDirty) return;
-    const used = this.tempSnap().storageBytes();
+    // Page-based footprint of the session-local temp domain (temp-tables.md §7, Design decision 3): the
+    // committed MemoryBlockStore high-water × page size — the honest resident-RAM measure now that temp
+    // rides a pager (a record-byte walk would skip demoted OnDisk leaves and undercount a multi-leaf temp
+    // table, defeating the §13 bound). Deterministic and cross-core-identical: pageCount is a pure
+    // function of operations via the B+tree + within-session compaction. It reflects the state one commit
+    // behind (the pending write commits at statement end), so a domain already over budget aborts the
+    // NEXT temp write and rolls it back — the "already over budget ⇒ further writes abort" contract (§7).
+    const used = this.tempStorage !== null ? this.tempStorage.pageCount * this.pageSize : 0;
     if (used > limit) {
       throw engineError(
         "temp_storage_limit_exceeded",
@@ -4802,6 +4874,12 @@ export class Engine {
         this.session.tx!.tempDirty = true;
         ts = this.session.tx!.tempWorking;
       }
+      // The session-local temp snapshot rides a per-domain MemoryBlockStore pager (temp-tables.md §6):
+      // lazily create the domain storage on first use and stamp its paging onto this working snapshot, so
+      // putTableResolved / putIndexStore attach it to every temp store. Shared temp still uses the fully-
+      // resident decoded path (a follow-on — its cross-session watermark needs core-owned storage), so
+      // tempPaging stays null there.
+      if (!ct.shared) ts.tempPaging = this.tempDomainPaging(false);
       ts.putTableResolved(table, colTypes, this.pageSize);
       for (const ix of table.indexes) {
         ts.putIndexStore(

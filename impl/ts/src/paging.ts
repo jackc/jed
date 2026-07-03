@@ -77,6 +77,14 @@ export class SharedPaging {
     this.pager.writeBlock(index, bytes);
   }
 
+  // invalidate drops any stale pool entry for a rewritten page (bufferpool.ts invalidate). The commit
+  // write path calls it after writeBlock: a no-op unless a reclaim domain reused a freed page id, in
+  // which case the pool's prior decode of that page must be evicted (the pool is private here, so the
+  // persist path reaches BufferPool.invalidate only through this delegator).
+  invalidate(page: number): void {
+    this.pool.invalidate(page);
+  }
+
   sync(): void {
     this.pager.sync();
   }

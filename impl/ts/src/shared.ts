@@ -71,7 +71,7 @@ import {
   Statement as ErgoStatement,
 } from "./ergonomic.ts";
 import { engineError } from "./errors.ts";
-import { persistImpl } from "./persist.ts";
+import { maybeCompact, persistImpl } from "./persist.ts";
 import type { Statement } from "./ast.ts";
 import type { ScriptSummary } from "./split.ts";
 import type { Privileges, PrivilegeSet } from "./privileges.ts";
@@ -143,7 +143,16 @@ class SharedCore {
   // engine advance only after both syncs succeed, so a write failure leaves the file's prior meta
   // untouched.
   persist(snap: Snapshot): void {
-    persistImpl(this.storage, snap);
+    const write = persistImpl(this.storage, snap);
+    // Within-session reclamation for the main domain runs only when enabled (off by default —
+    // reconstruct-on-open) and no reader pins an older version (the in-memory watermark, temp-tables.md
+    // §6 Phase A). A no-op for the default main domain; the toggle is exercised by the reclamation tests.
+    maybeCompact(
+      this.storage,
+      snap,
+      write.rootPage,
+      this.oldestLiveVersion(snap.txid) === snap.txid,
+    );
   }
 
   register(version: bigint): void {
@@ -160,6 +169,17 @@ class SharedCore {
   // map scan is order-independent (a minimum), so no map iteration order leaks (CLAUDE.md §8).
   oldest(): bigint {
     let oldest = this.committed.txid;
+    for (const v of this.live.keys()) if (v < oldest) oldest = v;
+    return oldest;
+  }
+
+  // oldestLiveVersion is the oldest still-pinned version, floored at newTxid (the version this commit
+  // publishes) so "no live reader" reads as newTxid — the safe case for compaction (temp-tables.md §6).
+  // Any live reader pins a version older than newTxid (it opened before this commit), so a non-empty
+  // registry yields a value < newTxid and defers compaction. Distinct from oldest(), which floors at the
+  // CURRENTLY-committed version; during a persist (before committed swaps) the two differ.
+  oldestLiveVersion(newTxid: bigint): bigint {
+    let oldest = newTxid;
     for (const v of this.live.keys()) if (v < oldest) oldest = v;
     return oldest;
   }
@@ -552,8 +572,15 @@ export class Session {
     const pin = (built: { columnNames: string[]; cursor: Cursor }): Rows => {
       const version = this.baseVersion;
       this.core.register(version);
+      // A live streaming cursor also blocks within-session temp compaction: it faults its pinned temp
+      // tree lazily, so a temp commit must not reclaim a page it may still read (temp-tables.md §6). The
+      // counter is on the session's engine (single-threaded), like the write path it gates.
+      this.engine.openStreams++;
       const rows = new Rows(built.columnNames, built.cursor);
-      rows.attachPin(() => this.core.deregister(version));
+      rows.attachPin(() => {
+        this.engine.openStreams--;
+        this.core.deregister(version);
+      });
       return rows;
     };
     // One plan-once scan lane serves both streaming and buffered shapes (this ad-hoc path plans once

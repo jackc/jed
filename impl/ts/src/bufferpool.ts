@@ -70,4 +70,27 @@ export class BufferPool {
   resident(): number {
     return this.slots.length;
   }
+
+  // invalidate drops any cached entry for page — required when a commit REWRITES a page in place, which
+  // happens when within-session compaction (a reclaim domain — temp, or an in-memory database with
+  // reclamation on) hands a freed page id back to a new node: the pool caches by page id, so the stale
+  // decode of the page's PRIOR content must be evicted or a later fault returns old rows. A no-op when the
+  // page is not resident — the common case, since a copy-on-write commit without reuse only ever writes
+  // fresh, never-cached high-water pages (so the main file path pays only a map lookup).
+  invalidate(page: number): void {
+    const i = this.index.get(page);
+    if (i === undefined) return;
+    this.index.delete(page);
+    // Swap the last slot into the hole so the array stays dense (capacity accounting + the CLOCK hand
+    // stay well-formed), then shrink.
+    const last = this.slots.length - 1;
+    if (i !== last) {
+      const moved = this.slots[last]!;
+      this.slots[i] = moved;
+      this.index.set(moved.page, i);
+    }
+    this.slots.pop();
+    if (this.slots.length === 0) this.hand = 0;
+    else this.hand %= this.slots.length;
+  }
 }
