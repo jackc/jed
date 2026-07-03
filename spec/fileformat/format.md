@@ -15,25 +15,51 @@ and (b) write the same logical database to bytes that equal the golden *exactly*
 other's output. A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 23)
+## Version scope (`format_version` 24)
 
-`format_version` **23** — **PAX leaf layout** (*Leaf node* below). A B-tree **leaf** page
-(`page_type = 2`) now stores its records **column-major** (a *Partition Attributes Across* layout —
-each record still lives wholly on one page, but its columns are grouped): the payload is a **key
-directory** (`N+1` `u32` prefix-sum offsets into the key blob) ‖ the **key blob** (the `N` keys
-concatenated, ascending) ‖ a **column directory** (`K+1` `u32` — each column region's absolute payload
-offset, `colStart[K]` = payload end) ‖ then per column a **value directory** (`N+1` `u32` prefix-sum
-into that column's values) followed by the column's `N` **value bodies**. The per-value codec is
-**byte-unchanged** (the same 1-byte presence tag + body, incl. the large-value `0x02`–`0x04` forms);
-only the *arrangement* of a leaf's bytes moves. **Interior** pages (`page_type = 3`) stay **row-major**
-(child pointers ‖ separator records) — column-grouping buys nothing for the sparse separator set, and
-keeping it row-major confines the change to one page type. The per-record `key_len u16` is dropped (the
-key directory carries lengths), so a record's **split weight is unchanged** (`2 + key_len + Σ
-value_size`) but a leaf's *payload* gains `directoryOverhead(N,K)` (below) and `RECORD_MAX` tightens to
-`(C − (12+16·K))/2`. There is **no catalog / interior / overflow byte change** — a v23 file's
-non-leaf-payload bytes are identical to v22; a table with no leaf pages (an empty table) moves to v23
-only by its version byte + meta CRC. The payoff is a **single-column scan reads one contiguous byte
-run** — the enabler for columnar/vectorized execution ([../design/storage.md](../design/storage.md)).
+`format_version` **24** — the **B+tree reshape** ([../design/bplus-reshape.md](../design/bplus-reshape.md),
+slice B1). Two coupled changes, deliberately one bump:
+
+1. **B-tree → B+tree.** Every ordered tree (table stores, secondary btree indexes, GIN entry
+   trees) becomes a **B+tree**: records live **only in leaves**; an **interior** page
+   (`page_type = 3`) is a record-free routing skeleton — `N+1` child pointers ‖ a **separator
+   directory** ‖ the separator **key blob** (*Interior node* below). A separator is a **copy of a
+   boundary key** (never a record), so interior fan-out is governed by `(separator + pointer)` fit —
+   far higher than v23's `(record + pointer)` fit, so trees are shallower. The **split/merge byte
+   contract is regenerated** for the two node kinds: leaf splits **copy up** the right half's first
+   key; interior splits **push up** the median separator; leaf merges concatenate and **remove** the
+   parent separator; interior merges **pull it down** (*Fan-out* below). GiST pages (`page_type`
+   5/6) are untouched (their own layout); overflow and catalog pages are byte-identical to v23.
+2. **Leaf column regions gain a region header; the per-value NULL tag is gone.** Each leaf column
+   region now leads with a **flags byte** (reserved `0` — the door a later string dictionary will
+   use) and stores its values in one of two class-determined shapes (*Leaf node* below): a
+   **fixed-width** column region is a **null bitmap** + a **dense `N × width` slot array** (no
+   per-value presence tag, no value directory — the gather/SIMD stride); a **variable-width**
+   column region is a **value directory** + the v23 per-value codec bytes with **NULL encoded as a
+   zero-length span** (no bitmap, no `0x01` tag byte). The presence tag `0x01` never appears inside
+   a v24 leaf; the single-value codec — catalog defaults, overflow chain content, composite/array
+   element bodies — is **byte-unchanged** (`0x01` lives on there).
+
+Directories throughout (leaf key directory, variable-region value directories, interior separator
+directory) are **end-offset directories**: `N` big-endian `u32`s where `off[i]` is the byte offset
+one past item `i` within its blob — item `i` spans `[off[i−1], off[i])` with `off[−1] = 0` (the
+redundant leading zero of v23's `N+1`-entry prefix sums is dropped; this is part of what keeps the
+two-record fit under the unchanged `RECORD_MAX`, *Why the record cap* below). The record's **split
+weight** is restated as its actual attributable bytes — `record_size = key_len + Σ value_size`
+with a NULL variable-width value contributing **0** and a fixed-width value always contributing its
+**width** (*Record* below); the v23 phantom `2 +` is dropped. `RECORD_MAX` **keeps its v23 value**
+`(C − max(12, 12+16·K))/2`, re-derived leaf-only (*Why the record cap*).
+
+`format_version` **23** was the **PAX leaf layout** (superseded in arrangement details by v24; the
+column-major *shape* carries forward). A B-tree **leaf** page stored its records **column-major**
+(a *Partition Attributes Across* layout — each record still lives wholly on one page, but its
+columns are grouped): a key directory (`N+1` `u32` prefix-sum) ‖ key blob ‖ a column directory
+(`K+1` `u32`) ‖ per column a value directory (`N+1` `u32` prefix-sum) + the column's value bodies
+(the unchanged 1-byte-presence-tag codec, NULL = a `0x01` byte). **Interior** pages stayed
+row-major and carried full records (a CLRS-style B-tree). The per-record `key_len u16` was dropped
+(directories carry lengths); the split weight stayed `2 + key_len + Σ value_size` and `RECORD_MAX`
+tightened to `(C − (12+16·K))/2`. The payoff — a **single-column scan reads one contiguous byte
+run**, the columnar/vectorized-execution enabler — carries into v24 unchanged.
 
 `format_version` **22** — **`varchar(n)` length limits** ([../design/types.md §15](../design/types.md)).
 A `text` column entry now appends, in the **typmod slot** (where a `decimal` appends precision/scale),
@@ -247,7 +273,7 @@ reserved (written 0, read-validated).
    root page, in ascending lowercased-name order).
 3. Each index is an on-disk **B-tree of empty-payload records** — the same node pages,
    split/merge rules, and commit model as a table tree; only the record's value-column
-   count (zero) differs (*The per-table data B-tree* below).
+   count (zero) differs (*The per-table data B+tree* below).
 
 `format_version` 4 added **`CHECK` constraints to the catalog table entry** (a per-table
 list of `(name, expression-text)` pairs after the column entries — *Catalog* below;
@@ -322,26 +348,31 @@ page-payload capacities derive from the page size and recur throughout:
 
 ```
 C             = page_size - 16                    # PAGE_HEADER (v7); the bytes a page body may hold
-RECORD_MAX(K) = (C - max(12, 12 + 16·K)) / 2 (floor)  # largest a single B-tree record may serialize to
+RECORD_MAX(K) = (C - max(12, 12 + 16·K)) / 2 (floor)  # largest a single B-tree LEAF record may serialize to
 ```
 
 The `- 16` in `C` is the **v7 page header** (12-byte v6 header + a 4-byte per-page `crc32`).
-The reserve inside `RECORD_MAX` is a **separate** quantity that keeps a **two-record node** fitting
-`C`. For a **row-major** node (interior, or an index tree with `K = 0` value columns) it is `12` —
-room for a two-key interior node's three child pointers (`4·3`) — unchanged across versions (through
-v6 it coincided with the header width; v7 widened the header but not this reserve). For a **PAX leaf**
-(v23) a two-record page also carries `directoryOverhead(2,K) = 12 + 16·K` of directories, so the
-reserve is `12 + 16·K` and `K` (the value-column count) enters `RECORD_MAX`. Either way
-`2·RECORD_MAX + reserve ≤ C`, so a two-record node — leaf *or* interior — **never** overflows.
-Overflow therefore happens only at `N ≥ 3` keys, which is what lets every split be a clean
-2-way with two non-empty halves (see *Why the record cap* below). `RECORD_MAX(0) = (C-12)/2`
-recovers the pre-v23 value, so index trees and interior separators are cap-unchanged.
+The reserve inside `RECORD_MAX` is a **separate** quantity that keeps a **two-record leaf** fitting
+`C` (since v24 records live only in leaves, so the cap is a **leaf** rule; v23's interior-pair
+co-justification evaporated with interior records — the value is deliberately **kept**,
+[../design/bplus-reshape.md §4.2](../design/bplus-reshape.md)). The v24 worst-case two-record leaf
+overhead is `leafOverhead(2, cols) ≤ 12 + 13·K` (all-variable columns — *Leaf node* below), so
+`2·RECORD_MAX(K) + leafOverhead(2, cols) ≤ C` holds for every column mix and a two-record leaf
+**never** overflows; leaf overflow therefore happens only at `N ≥ 3` records, which is what lets
+every leaf split be a clean 2-way with two non-empty halves (see *Why the record cap* below).
+`RECORD_MAX(0) = (C-12)/2` is exact for index trees: a two-record index leaf is
+`2·(C−12)/2 + 4·2 + 4 = C`. Interior nodes have **no record cap** — a separator is a copy of a key
+(itself ≤ `RECORD_MAX(0)` by the leaf cap), and the interior split rules handle the degenerate
+fan-out a near-cap separator forces (*Fan-out* below).
 
-`directoryOverhead(N,K)` is the bytes a PAX leaf's payload carries **beyond** `Σ recordSize`
-(the key/column/value directories, less the `N` dropped per-record `key_len` u16 — *Leaf node* below):
+`leafOverhead(N, cols)` is the bytes a v24 leaf's payload carries **beyond** `Σ record_size` — the
+key directory (`4·N`), the column directory (`4·(K+1)`), and each column region's header: a
+**fixed-width** column contributes its flags byte + null bitmap (`1 + ceil(N/8)`), a
+**variable-width** column its flags byte + value directory (`1 + 4·N`) (*Leaf node* below; `F` + `V`
+= the table's fixed/variable column counts, `F + V = K`):
 
 ```
-directoryOverhead(N, K) = 4·(N+1) + 4·(K+1) + 4·(N+1)·K − 2·N
+leafOverhead(N, cols) = 4·N + 4·(K+1) + F·(1 + ceil(N/8)) + V·(1 + 4·N)
 ```
 
 | page index | role |
@@ -359,7 +390,7 @@ and slot selection):
 | offset | size | field |
 |---|---|---|
 | 0  | 4 | `magic` = `4A 45 44 42` (ASCII `JEDB`, for the engine `jed`) |
-| 4  | 2 | `format_version` (u16) — current = **`23`** |
+| 4  | 2 | `format_version` (u16) — current = **`24`** |
 | 6  | 2 | reserved (0) |
 | 8  | 4 | `page_size` (u32) |
 | 12 | 8 | `txid` (u64) — commit counter; the highest valid slot wins on open |
@@ -388,7 +419,7 @@ present (copy-on-write never overwrote them). `create` seeds **both** slots with
 `txid = 1` meta, so two valid slots exist from the first moment (the first even-`txid` commit
 then overwrites slot 0).
 
-**Opening (slot selection).** Validate each slot independently (magic, `format_version == 23`,
+**Opening (slot selection).** Validate each slot independently (magic, `format_version == 24`,
 reserved == 0, `crc32`). Choose the **valid** slot with the **highest `txid`**; on a tie,
 slot 0. Exactly one valid → use it (torn-write fallback). Neither valid → `data_corrupted`.
 
@@ -742,90 +773,127 @@ bytes, the parsed token sequence re-rendered by the closed token table in *Check
 below — identical to how a `CHECK` persists, and re-parsed on load (`XX001` if it fails). bit2 and
 bit3 are **mutually exclusive** (both set is `XX001`).
 
-## The per-table data B-tree
+## The per-table data B+tree
 
-Each non-empty table's rows are an **ordered B-tree** keyed by the row's encoded storage key
+Each non-empty table's rows are an **ordered B+tree** keyed by the row's encoded storage key
 (memcmp order — [encoding.md](../design/encoding.md)), rooted at the table's `root_data_page`.
-It is the on-disk image of the in-memory copy-on-write B-tree (transactions.md §3, pmap):
-node ↔ page, one-to-one. A node holds keys **and** their row values at *every* level (a
-CLRS-style B-tree, not a B+-tree — values are not pushed to the leaves), plus child pointers
-when interior. The same record encoding serves leaves and interior separators.
+It is the on-disk image of the in-memory copy-on-write B+tree (transactions.md §3, pmap):
+node ↔ page, one-to-one. **All records live in leaves** (v24 —
+[../design/bplus-reshape.md](../design/bplus-reshape.md)); an **interior** node is a record-free
+routing skeleton of **separator keys** and child pointers. A separator is a **copy of a boundary
+key** — the first key of the right subtree at the moment of the split (*Fan-out* below) — and may
+go **stale** after later deletes (it keeps routing correctly: every key in the left subtree is
+`< sep` and every key in the right is `≥ sep`, forever). Lookups always descend to a leaf; a key
+**equal** to a separator lies in the **right** subtree.
 
 ### Record (a key and its row)
 
-A **record** is a key and its row value. Its **row-major** serialization — used verbatim by
-**interior** separators (*Interior node*) and as the abstract **split weight** everywhere — is:
+A **record** is a key and its row value, stored only in leaves, column-major (*Leaf node* below).
+The key is **stored, not derived** (a no-PK synthetic rowid is not reconstructable from row data).
+There is no per-record payload length — a value's width comes from its type and its region's
+directory/stride. The **on-disk size of a record** — the **split weight** the fan-out rules below
+measure, and the byte basis of the temp-table budget ([../design/temp-tables.md §7](../design/temp-tables.md)) —
+is its actual attributable bytes:
 
-| field | encoding |
-|---|---|
-| `key_len` | u16 |
-| `key` | `key_len` bytes — the row's storage key, exactly as the engine encoded it |
-| `payload` | each column's value, in declaration order, via the value codec |
+```
+record_size = key_len + Σ_columns value_size
+value_size  = width(type)          for a fixed-width column (NULL included — a NULL occupies a slot)
+            = 0                    for a NULL variable-width value (a zero-length span)
+            = its stored codec bytes (presence tag + body, or a pointer form — *Large values*)
+                                   for a present variable-width value
+```
 
-A **leaf** (v23) stores the same keys and the same per-value codec bytes but **column-major** (the key
-lengths move into a directory, so no per-record `key_len` — *Leaf node* below). The key is **stored,
-not derived** (a no-PK synthetic rowid is not reconstructable from row data). There is no per-record
-payload length — the reader walks the columns in declaration order, taking each value's width from its
-type (fixed for integers / 8-byte timestamps / 1-byte boolean / 16-byte uuid; self-describing for
-text/bytea via their `u16` length and for decimal via `ndigits`). The **on-disk size of a record** —
-`2 + key_len + Σ value_size` — is the quantity the split/merge rules below measure (the `key_len` term
-is counted for a leaf too, offset by the `−2·N` term in `directoryOverhead`, so the split weight is
-layout-independent).
+The v23 phantom `2 +` (the long-gone per-record `key_len u16`) is dropped: `record_size` is exactly
+the bytes the record contributes to its leaf beyond `leafOverhead`.
+
+**Column classes.** Every column type is either **fixed-width** — `i16` (2), `i32` (4), `i64` (8),
+`boolean` (1), `uuid` (16), `timestamp`/`timestamptz` (8), `date` (4), `interval` (16), `f64` (8),
+`f32` (4) — or **variable-width**: `text`, `bytea`, `decimal`, `json`, `jsonb`, composite, array,
+range (exactly the spillable set of *Large values*). The class decides the column's leaf region
+shape (*Leaf node* below).
 
 **Index trees (v5).** A secondary index ([../design/indexes.md](../design/indexes.md)) is a
-B-tree of exactly this shape, rooted at the catalog's `index_root_page`, whose records have
-**zero value columns**: a record is `key_len ‖ key` (the entry key — indexes.md §3) with an
-empty payload, `record size = 2 + key_len`. Every node, split/merge, allocation, commit, and
-reclamation rule below applies to an index tree unchanged.
+B+tree of exactly this shape, rooted at the catalog's `index_root_page`, whose records have
+**zero value columns**: a record is its entry key alone (indexes.md §3), `record_size = key_len`.
+Every node, split/merge, allocation, commit, and reclamation rule below applies to an index tree
+unchanged — a GIN index's entry tree too ([../design/gin.md §4](../design/gin.md)).
 
 **`RECORD_MAX`.** A single record's **stored** on-disk size must be ≤ `RECORD_MAX(K) =
-(C − max(12, 12+16·K))/2` (floor), `K` the value-column count; this is **tighter than v1's ≤ `C`** rule
-and is what makes every node split clean (see *Why the record cap* below). Since **v3**, a record over
+(C − max(12, 12+16·K))/2` (floor), `K` the value-column count. The cap is what makes every leaf
+split clean (see *Why the record cap* below); its **value is deliberately kept from v23**
+([../design/bplus-reshape.md §4.2](../design/bplus-reshape.md)) so the overflow/spill thresholds of
+[../design/large-values.md](../design/large-values.md) do not churn. Since **v3**, a record over
 the cap is **not** rejected — its large values are **compressed** and/or **spill out-of-line** (the
 *Large values* section), so the *stored* record (with pointers) falls back under `RECORD_MAX`. Only a
 record that can't be reduced below the cap even after compressing and externalizing every spillable
 value remains a write-side `feature_not_supported` (**`0A000`**). At the 8192 default a `K = 1` table
 caps a stored record at `RECORD_MAX(1) = (8176−28)/2 = 4074`; the 256-byte fixtures cap a `K = 1` record
 at `(240−28)/2 = 106` bytes (a `K = 2` record at 98), which is what makes `overflow_table.jed`'s
-~600/300-byte values spill. `K = 0` (index trees) recovers the pre-v23 `RECORD_MAX = (C-12)/2`.
+~600/300-byte values spill. `K = 0` (index trees) is `RECORD_MAX = (C-12)/2`, so an index entry
+key may be up to `(C-12)/2` bytes — the bound the interior separator rules below inherit.
 
 ### Leaf node (`page_type = 2`)
 
-Header (`item_count = N`, `next_page = 0`) followed by a **column-major (PAX)** payload (v23). The
-`N` records' keys are in **ascending key order**; the per-value codec bytes are exactly those of the
-row-major form, only regrouped by column. The payload, in order:
+Header (`item_count = N`, `next_page = 0`) followed by a **column-major (PAX)** payload. The
+`N` records' keys are in **ascending key order**. The payload, in order:
 
-1. **key directory** — `N+1` big-endian `u32`, a prefix-sum: `keyOff[i]` is the byte offset of key
-   `i` within the key blob (`keyOff[0] = 0`, `keyOff[N]` = total key bytes). Key `i` is
-   `keyBlob[keyOff[i] : keyOff[i+1]]`.
+1. **key directory** — `N` big-endian `u32` **end offsets**: `keyOff[i]` is the byte offset one
+   past key `i` within the key blob; key `i` is `keyBlob[keyOff[i−1] : keyOff[i]]` with
+   `keyOff[−1] = 0`. (`keyOff[N−1]` = total key bytes.)
 2. **key blob** — the `N` keys concatenated in ascending order (`Σ key_len` bytes).
 3. **column directory** — `K+1` big-endian `u32`: `colStart[c]` is the **absolute payload offset**
    of column `c`'s region; `colStart[K]` is the payload end (the authoritative content length — the
    page body beyond it is zero-fill). For an index tree (`K = 0`) this is the single value
    `colStart[0]` = payload end, and there are no column regions.
-4. **column regions**, `c = 0 … K−1` in declaration order — each a **value directory** (`N+1`
-   big-endian `u32` prefix-sum `valOff` into the column's value bytes) then the column's `N` **value
-   bodies** (the same 1-byte tag + body as row-major). Value `(i, c)` is
-   `region_c.values[valOff[i] : valOff[i+1]]`, where `region_c.values` begins `4·(N+1)` bytes into
-   the region (after its value directory).
+4. **column regions**, `c = 0 … K−1` in declaration order. Every region leads with a **flags byte**
+   (v24): all bits reserved, written `0`, validated `0` on read (`XX001` if set) — the door a later
+   column string dictionary will claim ([../design/json.md §3](../design/json.md)). The rest of the
+   region depends on the column's **class** (*Record* above):
+   - **Fixed-width column** — a **null bitmap** of `ceil(N/8)` bytes (**MSB-first**: record `i`'s
+     NULL bit is `0x80 >> (i mod 8)` of byte `i / 8`; a set bit = NULL — the composite/array bitmap
+     convention), then a **dense slot array** of `N × width` bytes: slot `i` is record `i`'s value
+     body (the type's fixed-width inline body, **no presence tag**) at byte offset `i·width`; a
+     NULL's slot is present but **zero-filled** (never read — the bitmap is the sole authority).
+     There is **no value directory** — the stride is the width. This is the vectorizable
+     gather/SIMD layout ([../design/bplus-reshape.md §4.1](../design/bplus-reshape.md)).
+   - **Variable-width column** — a **value directory** of `N` big-endian `u32` **end offsets**
+     (`valOff[i]` = one past value `i`'s bytes within the region's value blob; value `i` spans
+     `[valOff[i−1], valOff[i])` with `valOff[−1] = 0`), then the value blob: each **present** value's
+     stored codec bytes exactly as v23 (**presence tag `0x00`/`0x02`/`0x03`/`0x04` + body** — the
+     *Value codec* / *Large values* forms). A **NULL is a zero-length span** (`valOff[i] ==
+     valOff[i−1]`) — no bitmap, no tag byte; a present value's span is never empty (every present
+     form is ≥ 1 byte), so span-emptiness is exact. The tag `0x01` **never appears** inside a v24
+     leaf region.
 
-A leaf's payload size is `Σ record_size + directoryOverhead(N, K)`. A single-column scan therefore
-reads one contiguous run (`colStart[c] … colStart[c+1]`) plus its value directory — the columnar-scan
-enabler. To parse: read `N` from the header and `K` from the table's column count, then the three
-directories in order.
+A leaf's payload size is `Σ record_size + leafOverhead(N, cols)` (*Page model* above). A
+single-column scan reads one contiguous run (`colStart[c] … colStart[c+1]`) — the columnar-scan
+enabler, now tag-free and dense for fixed-width columns. To parse: read `N` from the header, the
+table's column classes from the catalog, then the directories in order.
 
 ### Interior node (`page_type = 3`)
 
-Header (`item_count = N`, `next_page = 0`) followed by the payload — **row-major, unchanged** (v23
-regroups leaves only; the sparse separator set does not benefit from column-grouping):
+Header (`item_count = N`, `next_page = 0`) followed by the **record-free** payload (v24):
 
 1. **`N + 1` child pointers** — each a big-endian `u32` page index, the roots of the `N + 1`
-   subtrees (`child[0] < key[0] < child[1] < key[1] < … < key[N-1] < child[N]`).
-2. **`N` records** — the separators (the row-major *Record* form above), in ascending key order,
-   each carrying its own row value (this B-tree stores a value with every key, separators included).
+   subtrees. Child `i` holds keys in `[sep[i−1], sep[i])` (with `sep[−1] = −∞`, `sep[N] = +∞`);
+   a key equal to `sep[i]` lies in child `i+1`.
+2. **separator directory** — `N` big-endian `u32` **end offsets** into the key blob (the same
+   end-offset convention as the leaf key directory).
+3. **key blob** — the `N` separator keys concatenated, ascending, each the raw order-preserving
+   encoded bytes of a boundary key ([encoding.md](../design/encoding.md)) — descent is
+   byte-memcmp, no decode.
 
-An interior node's payload size is `4·(N + 1) + Σ record_size`. To parse: read `N` from the
-header, read `N + 1` child pointers, then read `N` row-major records.
+An interior node's payload size is `4·(N+1) + 4·N + Σ sep_len = 8·N + 4 + Σ sep_len`. To parse:
+read `N` from the header, `N+1` child pointers, the `N`-entry directory, then the blob.
+
+**`N = 0` interior nodes are legal** (one child pointer, an empty directory and blob — payload 4):
+the degenerate product of splitting a two-separator interior whose separators are so large no
+2-way split can keep a separator on each side (*Fan-out* below; only reachable with near-cap keys —
+the `max_sep_table.jed` fixture pins the shape). A 0-key interior routes everything to its single
+child, is always underfull, and is merged away by the next rebalance that touches it. The
+**minimum-fanout invariant**: any single separator + two pointers always fits —
+`12 + sep_len ≤ 12 + RECORD_MAX(0) = 12 + (C−12)/2 ≤ C` — so every interior split can leave at
+least one side with a separator.
 
 An empty table has `root_data_page = 0` and no node pages. A one-row table is a single leaf
 with `N = 1`. The root may be a leaf (small table) or an interior node (taller tree); it is
@@ -833,52 +901,43 @@ distinguished by its `page_type`, never by its index.
 
 ### Fan-out: the size-driven split/merge byte contract
 
-Fan-out is governed by **page fit**: a node may hold any number of keys whose serialized form
+Fan-out is governed by **page fit**: a node may hold any number of entries whose serialized form
 fits the page payload `C`, and it splits when it would overflow. This makes the node
 boundaries — and therefore the on-disk bytes — a deterministic function of the **key set and
 the order of mutations** (not of any in-RAM tuning constant). Every core and the Ruby
-reference run the identical rules, so the trees are byte-identical. The rules:
+reference run the identical rules, so the trees are byte-identical. The rules (v24 — restated
+for the two node kinds; [../design/bplus-reshape.md §4.2](../design/bplus-reshape.md)):
 
 **A node "fits"** iff its payload size ≤ `C`. The invariant the writer maintains: every
-committed node fits, every committed node is **non-empty** (`N ≥ 1`), and every non-root node
-is **at least half full** where it can be (`payload ≥ C/2`) — "where it can be" because a row
-near `RECORD_MAX` may force an underfull node, which is correct, just not compact.
+committed node fits; every committed **leaf** is non-empty (`N ≥ 1`); an **interior** node has
+`N ≥ 0` separators and `N+1` children (`N = 0` only in the degenerate case above); and every
+non-root node is **at least half full** where it can be (`payload ≥ C/2`) — "where it can be"
+because a record near `RECORD_MAX` (or a merge abandoned by the interior guard below) may leave
+an underfull node, which is correct, just not compact.
 
-**Insert.** Descend to the target leaf, insert the record in key order, then walk back up:
-whenever a node overflows (`payload > C`), **split it 2-way** and **promote one separator**
-to the parent (which may then overflow and split, etc.; a root split grows the height by one).
+**Insert.** Descend to the target leaf (interior nodes only route — `partition_point(sep ≤ key)`),
+insert the record in key order, then walk back up: whenever a node overflows (`payload > C`),
+**split it 2-way** and hand one separator to the parent (which may then overflow and split, etc.;
+a root split grows the height by one, the new root an interior node with one separator).
 
-**Split point.** For an overflowing node with records `r[0 … N)` (and, if interior, children
-`c[0 … N]`), define the left-payload after taking the first `m` records:
+**Split point (shared machinery).** For an overflowing node with entries `e[0 … N)`, define
+`leftpayload(m)` / `rightpayload(m)` as the payload of the would-be left / right node under the
+kind's split shape (below), and:
 
 ```
-leftpayload(m) = (interior ? 4·(m + 1) : directoryOverhead(m, K)) + Σ_{i < m} record_size(i)
-m_append       = the largest  m in [1, N-1] with leftpayload(m) ≤ C
-m_balanced     = the smallest m in [1, N-1] with 2·leftpayload(m) ≥ payload
+m_min      = the smallest m in the kind's range with rightpayload(m) ≤ C
+m_max      = the largest  m in the kind's range with leftpayload(m)  ≤ C
+m_balanced = the smallest m in the kind's range with 2·leftpayload(m) ≥ payload
+m          = right-edge edit ? m_max : clamp(min(m_balanced, m_max), m_min, m_max)
 ```
 
-`payload` here is the whole node's size — `Σ record_size` plus the interior child-pointer term
-`4·(N+1)` or the leaf `directoryOverhead(N, K)`. A PAX leaf's `leftpayload(m)` counts the directory
-overhead of a fresh `m`-record leaf, so split points stay an exact monotonic function of `(m, K)`.
-
-The split point depends on **where the just-edited record sits** — the record whose
-insert/replace triggered this rebuild (for an interior node: the separator the child split
-just promoted into it):
-
-- **Right-edge (append) split** — the edited record is the node's **last** (`index N-1`):
-  `m = min(m_append, N-2)`. Sequential ascending loads land here every time and keep
-  packing left nodes ~full.
-- **Balanced split** — anywhere else: `m = min(m_balanced, m_append, N-2)` (the `m_append`
-  term keeps the left half fitting `C` even with near-`RECORD_MAX` records).
-- The delete path's **merge-overflow** split (below) always uses the **balanced** rule —
-  no edited position exists there.
-
-In both cases `m` is clamped to at least `1`. Promote `r[m]`; the **left** node gets
-`r[0 … m)` (and `c[0 … m]`), the **right** node gets `r[m+1 … N)` (and `c[m+1 … N]`). The
-`RECORD_MAX = C/2` cap guarantees either `m` yields two **non-empty** nodes that each
-**fit** (proof under *Why C/2*; for the balanced case additionally:
-`leftpayload(m) ≤ leftpayload(m_append) ≤ C` by the `min`, and the right half is
-`≤ payload − leftpayload(m_balanced) ≤ payload/2 ≤ C` under the same `payload ≤ 2C` bound).
+A **right-edge edit** means the entry whose insert/replace triggered the rebuild is the node's
+last (`index N−1`; for an interior node, the separator the child split just handed up landed at
+the right edge) — sequential ascending loads land here every time and keep packing left nodes
+~full. The delete path's **merge-overflow** split (below) has no edited position and always takes
+the balanced arm. `m_min ≤ m_max` always holds on the insert path (the cap arithmetic below); the
+one reachable exception — an interior **merge**-overflow with near-cap separators — **abandons the
+merge** instead (below).
 
 > Why two rules: largest-left-fit alone is optimal for ascending appends but degenerates to
 > a `[N-2 | 1]` splinter for **any other** insert position — under random-order inserts
@@ -887,38 +946,63 @@ In both cases `m` is clamped to at least `1`. Promote `r[m]`; the **left** node 
 > The position hint keeps the ascending fast path byte-for-byte unchanged while random
 > inserts settle at the classic ~66-70% B-tree fill.
 
-**Delete.** Descend to the key (replacing an interior separator by its **in-order
-predecessor** — the rightmost record of the left subtree — and deleting that from the left
-child), remove the record, then walk back up rebalancing by **merge-then-maybe-split** (no
-borrow rotation — merge subsumes it):
+**Leaf split (copy-up).** Range `m ∈ [1, N−1]`. The left leaf gets records `[0, m)`, the right
+leaf gets `[m, N)` — **no record leaves the leaf level** — and the parent gains a separator that is
+a **copy of `key[m]`** (the right leaf's first key). `leftpayload(m) = Σ_{i<m} record_size(i) +
+leafOverhead(m, cols)`; `rightpayload(m)` symmetrically over `[m, N)`. Both sides are non-empty by
+the range; both fit by the cap (*Why the record cap*).
+
+**Interior split (push-up).** The median separator **moves up** (it is a pure routing key —
+nothing below owns it): the left node gets separators `[0, m)` + children `[0, m]`, separator
+`sep[m]` is handed to the parent, the right node gets separators `[m+1, N)` + children
+`[m+1, N]`. `leftpayload(m) = 8·m + 4 + Σ_{i<m} sep_len(i)`; `rightpayload(m) = 8·(N−1−m) + 4 +
+Σ_{i>m} sep_len(i)`. Range: `m ∈ [1, N−2]` when `N ≥ 3` (both sides keep a separator); when
+`N = 2` (only reachable when two separators + pointers overflow `C` — near-cap separators) the
+split is **pinned to `m = 1`**: the left node keeps `sep[0]` (fits, by the minimum-fanout
+invariant), `sep[1]` moves up, and the right node is the degenerate `N = 0` interior.
+
+**Delete.** Descend to the holding **leaf** (a separator equal to the key just routes right — it
+is never deleted or replaced; separators may go stale), remove the record, then walk back up
+rebalancing by **merge-then-maybe-split** (no borrow rotation — merge subsumes it):
 
 - A non-root child is **underfull** when its `payload < C/2`.
 - When a child is underfull, **merge** it with an adjacent sibling — prefer the **right**
-  sibling (`child[i+1]`) if it exists, else the **left** (`child[i-1]`) — by concatenating
-  `left records‖separator‖right records` (and the children, if interior) into one node `M`,
-  removing that separator and the absorbed child from the parent.
+  sibling (`child[i+1]`) if it exists, else the **left** (`child[i-1]`):
+  - **Leaf merge:** concatenate the two leaves' records into one leaf `M`; the parent **removes**
+    the separator between them and the absorbed child (nothing is pulled down — the separator was
+    only a routing copy).
+  - **Interior merge:** concatenate `left separators ‖ parent separator ‖ right separators` (the
+    separator **pulls down** — the merged node's children on either side need a routing key
+    between them) and the two children lists into one node `M`; the parent removes that separator
+    and the absorbed child.
   - If `M` fits (`payload(M) ≤ C`): `M` replaces the pair; the **parent loses one key**, so
     the parent may itself become underfull — handled when it returns to *its* parent.
-  - If `M` overflows: **split `M` 2-way** by the rule above; the two halves and the new
-    separator replace the pair, so the **parent's key count is unchanged**.
-- **Root collapse:** if the root drains to `N = 0`, it is replaced by its single child
-  (interior root → height − 1) or becomes empty (leaf root → `root_data_page = 0`).
+  - If `M` overflows: **split `M` 2-way** by the balanced rule above; the two halves and the new
+    separator replace the pair, so the **parent's key count is unchanged**. A **leaf** `M` always
+    splits cleanly (`payload(M) ≤ ~1.5·C` — an underfull leaf + a fitting leaf). An **interior**
+    `M` (which absorbed a pulled-down separator, `payload(M) < 2·C`) can, with near-cap
+    separators, admit **no** valid 2-way split (`m_min > m_max`): then the merge is **abandoned** —
+    the two children and the parent separator stay exactly as they were (an underfull interior is
+    tolerated; correctness is unaffected, only compactness). The abandon rule is deterministic
+    and part of this byte contract.
+- **Root collapse:** a leaf root that drains to `N = 0` empties the table
+  (`root_data_page = 0`); an interior root that drains to `N = 0` is replaced by its single
+  child (height − 1).
 
-Because a merged node is at most `(< C/2) + RECORD_MAX + (≤ C) < 2·C` (the underfull child is
-`< C/2`, the separator ≤ `RECORD_MAX`, the sibling ≤ `C`), a single 2-way split always restores
-fit — the same `≤ 2C ⇒ one split suffices` bound the insert path relies on.
-
-**Why the record cap.** Capping a record at `RECORD_MAX(K) = (C − max(12, 12+16·K))/2` makes a
-two-record node — leaf or interior — never exceed `C`. An **interior** pair is `2·RECORD_MAX(K) +
-12 ≤ 2·(C-12)/2 + 12 = C` (its `K=0`-style reserve of 12 covers three child pointers). A **PAX leaf**
-pair is `2·RECORD_MAX(K) + directoryOverhead(2,K) = 2·(C−12−16K)/2 + (12+16K) = C` (the `12+16·K`
-reserve exactly cancels the two-record directory overhead). So a node overflows only at
-`N ≥ 3`, and the split point (either rule above — both are bounded by `min(m_append, N-2)`)
-always lands in `[1, N-2]` with both halves non-empty and ≤ `C`. Without the cap, a node could overflow on
-its **last**, oversized record, forcing an empty sibling (a degenerate node) or a multi-way
-spill — both of which complicate the byte contract across four implementations. The cap buys an
-all-2-way, no-empty-node scheme at the cost of a tighter (and later-liftable) oversized-row
-limit.
+**Why the record cap.** Capping a **leaf** record at `RECORD_MAX(K) = (C − max(12, 12+16·K))/2`
+makes a two-record leaf never exceed `C`, for every column mix: the worst case is all-variable
+columns (`V = K`), where a two-record leaf's overhead is `leafOverhead(2, cols) = 8 + 4·(K+1) +
+K·(1 + 8) = 12 + 13·K ≤ 12 + 16·K`, so `2·RECORD_MAX(K) + leafOverhead(2, cols) ≤ (C − 12 − 16K) +
+(12 + 13K) = C − 3K ≤ C`; an index leaf (`K = 0`) is exact: `2·(C−12)/2 + 12 = C`. (This fit is
+what the v24 end-offset directories buy — with v23's `N+1`-entry prefix sums the same cap would
+overflow by `4 + 2K`.) So a leaf overflows only at `N ≥ 3` records and the split point always
+lands in `[1, N−1]` with both halves non-empty and fitting. Without the cap, a leaf could overflow
+on its **last**, oversized record, forcing an empty sibling or a multi-way spill — both of which
+complicate the byte contract across four implementations. Interior nodes carry no records, so the
+cap does not bind them; their guarantee is the **minimum-fanout invariant** (one separator + two
+pointers always fit — *Interior node* above) plus the pinned `N = 2` degenerate split and the
+merge-abandon guard, which together make every interior operation total. The cap buys an
+all-2-way scheme at the cost of a tighter (and later-liftable) oversized-row limit.
 
 ### Value codec
 
@@ -927,7 +1011,13 @@ forms begin with a 1-byte **presence tag**: `0x00` **present-inline-plain**, `0x
 tag alone), `0x02` **present-external-plain** (the body is an overflow pointer), `0x03`
 **present-inline-compressed**, `0x04` **present-external-compressed** (the `0x02`–`0x04` bodies
 are in *Large values* below). Any other tag is `data_corrupted`. `0x00` and `0x01` are **unchanged
-from v1**. The present-**inline-plain** body depends on the type:
+from v1**. **Inside a v24 leaf** the tags are partly elided (*Leaf node* above): a fixed-width
+column's region stores bare bodies in dense slots (presence from the region bitmap — no tag at
+all), and a variable-width column's region stores the tagged forms for present values but encodes
+NULL as a zero-length span — so `0x01` never appears in a leaf. This full tagged codec — including
+`0x01` — remains normative for every **single-value context**: a catalog constant `DEFAULT`,
+overflow-chain content reconstruction, and the recursive composite/array element bodies below.
+The present-**inline-plain** body depends on the type:
 
 - **Integers** (`i16`/`i32`/`i64`) — the **same order-preserving bytes as keys**
   ([encoding.md §2.1](../design/encoding.md)): fixed-width big-endian, sign-bit flipped.
@@ -1003,9 +1093,11 @@ the cap (the design rationale and decisions are in
 [../design/large-values.md](../design/large-values.md) §12/§13). The mechanism:
 
 - **Disposition decision (deterministic, a §8 contract).** Compute the all-inline-plain record
-  size `R = 2 + key_len + Σ value_size`; if `R ≤ RECORD_MAX`, every value stays inline-plain —
-  a record that fits is **never** compressed or spilled. Otherwise run two passes over the
-  spillable values (`text`/`bytea`/`decimal`; fixed-width types never compress or spill), each
+  size `R = key_len + Σ value_size` (the v24 `record_size` basis — *Record* above: a fixed-width
+  column contributes its width, a NULL variable-width value 0, a present variable-width value its
+  tagged inline-plain encoding); if `R ≤ RECORD_MAX`, every value stays inline-plain — a record
+  that fits is **never** compressed or spilled. Otherwise run two passes over the spillable
+  values (the variable-width class; fixed-width types never compress or spill), each
   pass visiting **largest encoded size first, ties broken by ascending column index**:
 
   1. **Compress pass.** Candidates: spillable values whose content payload is
@@ -1052,11 +1144,11 @@ the cap (the design rationale and decisions are in
 
 - **Allocation order (golden-pinned).** In a from-scratch image a node's own page is allocated
   first, then each external value's chain is allocated in **(record, column) order** — records in
-  ascending key order, and within a record its columns in declaration order. This is **unchanged by
-  v23**: a PAX leaf emits its value *bodies* column-major, but the writer still visits values in
-  (record, column) order to encode them (allocating chains as it goes), then assembles the payload
-  column-major — so the overflow page indices are identical to the row-major layout, minimizing golden
-  churn. This fixes the byte layout the goldens pin (`overflow_table.jed`).
+  ascending key order, and within a record its columns in declaration order: the writer visits
+  values in (record, column) order to encode them (allocating chains as it goes), then assembles
+  the leaf payload column-major. Only **leaves** allocate chains in v24 — an interior node carries
+  no values, so no overflow page ever hangs off an interior separator. This fixes the byte layout
+  the goldens pin (`overflow_table.jed`).
 
 A record that still exceeds `RECORD_MAX` after compressing and externalizing **every** spillable
 value (pathological: a huge key, or very many columns at a tiny page) remains a write-side
@@ -1166,7 +1258,8 @@ the interior-node format and the split contract.
 | `overflow_table.jed` | large **incompressible** `text` + `bytea` values that **spill out-of-line plain** (v3) — `page_type 4` overflow chains (3-page + 2-page), the `0x02` external pointer (compression attempted, rejected by *store-smaller*), and an inline+external+NULL mix in one leaf ([../design/large-values.md](../design/large-values.md) §12) |
 | `compressed_table.jed` | large **compressible** values (v3, Slice B) — a `0x03` inline-compressed text (a long run that compresses back under `RECORD_MAX`), a `0x04` external-compressed text (compressed block still over the cap → a chain holding **compressed** bytes), an inline-compressed bytea, and an inline-plain + NULL mix ([../design/large-values.md](../design/large-values.md) §13, [lz4.md](lz4.md)) |
 | `one_table_empty.jed` | one table, zero rows (`root_data_page = 0`) |
-| `pk_table.jed` | an int PK table whose rows force a **3-node tree** (interior root + two leaves) at page 256 — the load-bearing interior-node + split proof; includes a NULL value in a row |
+| `pk_table.jed` | an int PK table whose rows force a **3-node tree** (record-free interior root + two leaves holding **all** the records — the v24 B+tree shape) at page 256 — the load-bearing interior-node + copy-up split proof; includes a NULL value in a row (exercising the fixed-width region's null bitmap + zero-filled slot) |
+| `max_sep_table.jed` | **degenerate interior fan-out** ([../design/bplus-reshape.md §4.2](../design/bplus-reshape.md)) — a secondary index over near-`RECORD_MAX(0)` text keys, sized so two separators + pointers overflow `C` and the pinned `N = 2 → m = 1` interior split produces a legal **`N = 0` interior node**; pins the minimum-fanout invariant and the degenerate split shape |
 | `text_table.jed` | a text column — the value codec's text branch; empty string, embedded quote, multi-byte + astral chars, a NULL (single leaf) |
 | `varchar_table.jed` | a `varchar(n)` column — the v22 text-column `u32 varchar_max_len` typmod slot (a bounded `varchar(5)` beside an unbounded `text` column, in one catalog); stored values are within-limit text |
 | `bool_table.jed` | a boolean column — the `bool-byte` value branch (single leaf) |

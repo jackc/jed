@@ -103,6 +103,10 @@ pub struct TableStore {
     /// field-type tree), for the value codec and for computing each row's on-disk record weight
     /// ([`crate::format::record_size`]). `Arc` so a snapshot clone stays O(1).
     col_types: Arc<Vec<ColType>>,
+    /// The leaf column-class shape (`{fixed, var}` counts — spec/fileformat/format.md v24 "Leaf
+    /// node"), derived once from `col_types`: the B+tree's leaf-overhead arithmetic needs it on
+    /// every size-driven split/merge decision without seeing the types themselves.
+    shape: crate::format::LeafShape,
     /// The shared pager + leaf buffer pool for a **file-backed** database (spec/design/pager.md):
     /// the read/mutation path faults `OnDisk` leaves through it. `None` for an in-memory database
     /// and for a table created in-session (fully resident until the file is reopened); attached by
@@ -114,11 +118,13 @@ impl TableStore {
     /// A new empty store for a table whose columns have the given resolved types, serializing at
     /// page payload `cap` (= `page_size − 16`). In-memory (no paging) until [`attach_paging`].
     pub fn new(cap: usize, col_types: Vec<ColType>) -> Self {
+        let shape = crate::format::leaf_shape(&col_types);
         TableStore {
             rows: PMap::new(),
             next_rowid: 0,
             cap,
             col_types: Arc::new(col_types),
+            shape,
             paging: None,
         }
     }
@@ -142,13 +148,12 @@ impl TableStore {
     /// through the buffer pool (an I/O error then propagates).
     pub fn insert(&mut self, key: Vec<u8>, row: Row) -> Result<bool> {
         let w = self.weight(&key, &row); // full `&self` borrow — taken before the leaf source
-        let k = self.col_types.len(); // PAX leaf directory overhead (format.md v23)
         let src = make_src(&self.paging, &self.col_types);
         let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
         if self.rows.get(&key, src_ref)?.is_some() {
             return Ok(false);
         }
-        self.rows.insert(key, row, w, self.cap, k, src_ref)?;
+        self.rows.insert(key, row, w, self.cap, self.shape, src_ref)?;
         Ok(true)
     }
 
@@ -173,21 +178,22 @@ impl TableStore {
     /// just found, so the overwrite always lands on a present key. May fault the target leaf.
     pub fn replace(&mut self, key: &[u8], row: Row) -> Result<()> {
         let w = self.weight(key, &row);
-        let k = self.col_types.len();
         let src = make_src(&self.paging, &self.col_types);
         let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
         self.rows
-            .insert(key.to_vec(), row, w, self.cap, k, src_ref)?;
+            .insert(key.to_vec(), row, w, self.cap, self.shape, src_ref)?;
         Ok(())
     }
 
     /// Remove the row at `key` (DELETE). Returns whether a row was present. May fault leaves the
     /// delete descends into / rebalances against.
     pub fn remove(&mut self, key: &[u8]) -> Result<bool> {
-        let k = self.col_types.len();
         let src = make_src(&self.paging, &self.col_types);
         let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
-        Ok(self.rows.remove(key, self.cap, k, src_ref)?.is_some())
+        Ok(self
+            .rows
+            .remove(key, self.cap, self.shape, src_ref)?
+            .is_some())
     }
 
     /// Look up a row by its exact encoded key. Returns an **owned** row — under demand paging the

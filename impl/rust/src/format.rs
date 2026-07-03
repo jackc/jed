@@ -81,7 +81,7 @@ const MAGIC: [u8; 4] = *b"JEDB";
 /// `bound_len u16 ‖ encode_range_body(union) ‖ child_page u32`. The catalog index entry is unchanged
 /// (the `index_root_page` slot points at the R-tree root, `0` for an empty index); only the node
 /// pages it reaches differ. A file with no GiST index still moves to v20 only by its version byte.
-const FORMAT_VERSION: u16 = 23;
+const FORMAT_VERSION: u16 = 24;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
 /// (`page_type`, `item_count`, `next_page`) plus a 4-byte per-page `crc32` (offset 12).
 pub(crate) const PAGE_HEADER: usize = 16;
@@ -93,10 +93,11 @@ pub(crate) const PAGE_HEADER: usize = 16;
 pub(crate) fn page_payload(page_size: u32) -> usize {
     page_size as usize - PAGE_HEADER
 }
-/// Bytes reserved inside `RECORD_MAX` for a two-key interior node's three child pointers (`4·3`)
-/// — **independent of `PAGE_HEADER`** (spec/fileformat/format.md "Why the record cap"). Both were
-/// 12 through v6; v7 widened the header to 16 but this reserve stays 12.
-const INTERIOR_RESERVE: usize = 12;
+/// Bytes reserved inside `RECORD_MAX` beyond the per-column term — **independent of
+/// `PAGE_HEADER`** (spec/fileformat/format.md "Why the record cap"). Historically the two-key
+/// interior node's three child pointers (`4·3`); since v24 the value is kept as the `K = 0` floor
+/// of the leaf-only re-derivation (a two-record index leaf is exactly `2·(C−12)/2 + 4·2 + 4 = C`).
+const RECORD_MAX_RESERVE: usize = 12;
 /// Smallest valid page size (spec/fileformat/format.md *Page model*). A chosen floor of 256,
 /// comfortably above the structural minimum `PAGE_HEADER + 36 = 52` (below which the 36-byte meta
 /// header would not fit); sub-256 sizes have only ever served tiny test fixtures.
@@ -775,24 +776,84 @@ pub(crate) fn any_spillable_masked(col_types: &[ColType], mask: &[bool]) -> bool
         .any(|(ty, &m)| m && is_spillable(ty))
 }
 
-/// The largest a single record may serialize to and still satisfy the B-tree split contract —
-/// `RECORD_MAX(K) = (C − max(12, 12+16·K))/2` where `C = cap` is the page payload and `K` the
-/// value-column count (spec/fileformat/format.md "Why the record cap"). A PAX leaf's two-record
-/// floor carries `directory_overhead(2,K) = 12+16·K`, so the cap tightens by `8·K`; `K = 0` (index
-/// trees, interior separators) recovers the historical `(C-12)/2`. The spill planner reduces a
-/// record to ≤ this by externalizing values.
+/// The largest a single **leaf** record may serialize to and still satisfy the B+tree split
+/// contract — `RECORD_MAX(K) = (C − max(12, 12+16·K))/2` where `C = cap` is the page payload and
+/// `K` the value-column count (spec/fileformat/format.md "Why the record cap"). The value is
+/// deliberately **kept from v23** (bplus-reshape.md §4.2), re-derived leaf-only: the worst-case
+/// (all-variable) two-record leaf overhead is `12 + 13·K ≤ 12 + 16·K`, so a two-record leaf never
+/// overflows. The spill planner reduces a record to ≤ this by externalizing values.
 fn record_max(cap: usize, k: usize) -> usize {
-    cap.saturating_sub(INTERIOR_RESERVE + 16 * k) / 2
+    cap.saturating_sub(RECORD_MAX_RESERVE + 16 * k) / 2
 }
 
-/// The extra bytes a PAX (column-major) leaf's payload carries beyond `Σ record_size`
-/// (spec/fileformat/format.md "Leaf node"): the key directory (`N+1` u32), the column directory
-/// (`K+1` u32), and each column's value directory (`N+1` u32), less the `N` per-record `key_len`
-/// u16 prefixes PAX drops. Interior nodes stay row-major and do not use this.
+/// The storage width of a **fixed-width** column's value body (the dense leaf slot stride —
+/// spec/fileformat/format.md v24 "Leaf node"), or `None` for a **variable-width** column (text /
+/// bytea / decimal / json / jsonb / composite / array / range — exactly the spillable set). The
+/// class decides the column's leaf region shape: fixed-width regions are bitmap + dense untagged
+/// slots; variable regions are a value directory + tagged codec bytes (NULL = a zero-length span).
+pub(crate) fn fixed_value_width(ty: &ColType) -> Option<usize> {
+    match ty {
+        ColType::Scalar(s) => match s {
+            ScalarType::Int16 => Some(2),
+            ScalarType::Int32 => Some(4),
+            ScalarType::Int64 => Some(8),
+            ScalarType::Bool => Some(1),
+            ScalarType::Uuid => Some(16),
+            ScalarType::Timestamp | ScalarType::Timestamptz => Some(8),
+            ScalarType::Date => Some(4),
+            ScalarType::Interval => Some(16),
+            ScalarType::Float64 => Some(8),
+            ScalarType::Float32 => Some(4),
+            // jsonpath is not storable as a column (type code 20 is reserved — a value reaching
+            // the codec panics there); classed variable defensively.
+            ScalarType::Text
+            | ScalarType::Decimal
+            | ScalarType::Bytea
+            | ScalarType::Json
+            | ScalarType::Jsonb
+            | ScalarType::JsonPath => None,
+        },
+        ColType::Composite { .. } | ColType::Array(_) | ColType::Range(_) => None,
+    }
+}
+
+/// A leaf's column-class shape — the two counts `leaf_overhead` needs beyond `N` (the fixed and
+/// variable column counts, `fixed + var = K`). Computed once per store from its column types and
+/// threaded through the B+tree's size arithmetic (pmap), which never sees the types themselves.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct LeafShape {
+    pub(crate) fixed: usize,
+    pub(crate) var: usize,
+}
+
+impl LeafShape {
+    pub(crate) fn k(&self) -> usize {
+        self.fixed + self.var
+    }
+}
+
+/// The shape of a leaf for a table with these value-column types (an index tree — empty
+/// `col_types` — is `{0, 0}`).
+pub(crate) fn leaf_shape(col_types: &[ColType]) -> LeafShape {
+    let fixed = col_types
+        .iter()
+        .filter(|t| fixed_value_width(t).is_some())
+        .count();
+    LeafShape {
+        fixed,
+        var: col_types.len() - fixed,
+    }
+}
+
+/// The bytes a v24 leaf's payload carries **beyond** `Σ record_size`
+/// (spec/fileformat/format.md "Leaf node"): the key directory (`4·N`), the column directory
+/// (`4·(K+1)`), and per region a flags byte plus — fixed-width — the null bitmap (`ceil(N/8)`)
+/// or — variable-width — the value directory (`4·N`). Interior nodes do not use this (their
+/// payload is `8·N + 4 + Σ sep_len`).
 ///
-/// `directory_overhead(N,K) = 4·(N+1) + 4·(K+1) + 4·(N+1)·K − 2·N`
-pub(crate) fn directory_overhead(n: usize, k: usize) -> usize {
-    4 * (n + 1) + 4 * (k + 1) + 4 * (n + 1) * k - 2 * n
+/// `leaf_overhead(N, cols) = 4·N + 4·(K+1) + F·(1 + ceil(N/8)) + V·(1 + 4·N)`
+pub(crate) fn leaf_overhead(n: usize, shape: LeafShape) -> usize {
+    4 * n + 4 * (shape.k() + 1) + shape.fixed * (1 + n.div_ceil(8)) + shape.var * (1 + 4 * n)
 }
 
 /// A value's planned on-disk disposition (spec/design/large-values.md §2/§12/§13). The compressed
@@ -823,14 +884,23 @@ struct RecordPlan {
 /// page-backed B-tree splits on, shared by the serializer and `record_size`: in-memory node
 /// boundaries must match the serialized pages.
 fn plan_dispositions(col_types: &[ColType], key: &[u8], row: &[Value], cap: usize) -> RecordPlan {
+    // Each column's inline-plain contribution to `record_size` (the v24 basis — format.md
+    // "Record"): a fixed-width column always its width (a NULL occupies a zero-filled slot); a
+    // variable-width column 0 when NULL (a zero-length span) else its tagged inline encoding.
     let inline: Vec<usize> = col_types
         .iter()
         .zip(row.iter())
-        .map(|(ty, v)| encode_value(ty, v).len())
+        .map(|(ty, v)| match fixed_value_width(ty) {
+            Some(w) => w,
+            None => match v {
+                Value::Null => 0,
+                _ => encode_value(ty, v).len(),
+            },
+        })
         .collect();
     let mut disp: Vec<Disp> = (0..row.len()).map(|_| Disp::Inline).collect();
     let mut cur = inline.clone();
-    let mut size = 2 + key.len() + inline.iter().sum::<usize>();
+    let mut size = key.len() + inline.iter().sum::<usize>();
     let max = record_max(cap, col_types.len());
     let mut compress_units = 0usize;
     if size <= max {
@@ -1297,21 +1367,7 @@ fn serialize_node(
             encode_leaf_pax(col_types, &node.keys, &rows, cap, &mut take, &mut ovf),
         )
     } else {
-        let mut payload = Vec::new();
-        for &cp in &child_pages {
-            payload.extend_from_slice(&cp.to_be_bytes());
-        }
-        for i in 0..node.keys.len() {
-            payload.extend_from_slice(&encode_record(
-                col_types,
-                &node.keys[i],
-                &node.vals[i],
-                cap,
-                &mut take,
-                &mut ovf,
-            ));
-        }
-        (PAGE_INTERIOR, payload)
+        (PAGE_INTERIOR, encode_interior(&node.keys, &child_pages))
     };
     if payload.len() > cap {
         return Err(EngineError::new(
@@ -1557,13 +1613,13 @@ fn serialize_dirty(
         child_pages.push(cp);
     }
     let n = node.keys.len() as u32;
-    // Encode records, spilling over-large values to overflow pages drawn from the same allocator
-    // (free-list first, then high-water — large-values.md §12). A dirty node may carry rows the
-    // lazy load left unfetched (a sibling row's mutation dirtied them): resolve those through the
-    // pager first — unmetered commit work, large-values.md §14 — so the re-encode re-plans the
-    // resident row exactly as an eager writer would. A LEAF is column-major (PAX v23); an INTERIOR
-    // node stays row-major. Scoped so the `&mut alloc` borrow ends before this node's own page is
-    // allocated.
+    // Encode a leaf's records, spilling over-large values to overflow pages drawn from the same
+    // allocator (free-list first, then high-water — large-values.md §12). A dirty leaf may carry
+    // rows the lazy load left unfetched (a sibling row's mutation dirtied them): resolve those
+    // through the pager first — unmetered commit work, large-values.md §14 — so the re-encode
+    // re-plans the resident row exactly as an eager writer would. An INTERIOR node is the
+    // record-free keys+children skeleton (v24) — no values, no chains. Scoped so the `&mut alloc`
+    // borrow ends before this node's own page is allocated.
     let mut ovf = Vec::new();
     let (page_type, payload) = {
         let mut take = || alloc.take();
@@ -1581,23 +1637,7 @@ fn serialize_dirty(
                 encode_leaf_pax(col_types, &node.keys, &rows, cap, &mut take, &mut ovf),
             )
         } else {
-            let mut payload = Vec::new();
-            for &cp in &child_pages {
-                payload.extend_from_slice(&cp.to_be_bytes());
-            }
-            for i in 0..node.keys.len() {
-                let resolved = resolve_for_encode(&node.vals[i], col_types, paging)?;
-                let row = resolved.as_ref().unwrap_or(&node.vals[i]);
-                payload.extend_from_slice(&encode_record(
-                    col_types,
-                    &node.keys[i],
-                    row,
-                    cap,
-                    &mut take,
-                    &mut ovf,
-                ));
-            }
-            (PAGE_INTERIOR, payload)
+            (PAGE_INTERIOR, encode_interior(&node.keys, &child_pages))
         }
     };
     if payload.len() > cap {
@@ -1949,20 +1989,25 @@ fn collect_leaf_overflow(
         PAGE_LEAF => {
             let fetch = |p: u32| paging.pager().read_block(p);
             let n = page.item_count as usize;
-            let k = col_types.len();
-            // The reachability walk discards each row right after `mark_chains` (only an external
+            // The reachability walk discards each value right after `mark_chains` (only an external
             // chain matters here, never an inline-deferred body), so the form-(a) `Arc` wrap (L3)
-            // is dropped per leaf — it exists only to satisfy the lazy decoder's signature.
+            // is dropped per leaf — it exists only to satisfy the lazy decoder's signature. Only
+            // variable-width (spillable) columns can own a chain; fixed-width regions are skipped.
             let shared: Arc<[u8]> = Arc::from(block.as_slice());
             let payload = &shared[PAGE_HEADER..];
-            let dirs = parse_pax_leaf(payload, n, k)?;
-            for i in 0..n {
-                let mut row = Vec::with_capacity(k);
-                for (c, ty) in col_types.iter().enumerate() {
-                    let mut pos = dirs.value_off(n, c, i);
-                    row.push(read_value_lazy(ty, &shared, payload, &mut pos)?);
+            let dirs = parse_pax_leaf(payload, n, col_types)?;
+            for (c, ty) in col_types.iter().enumerate() {
+                if fixed_value_width(ty).is_some() {
+                    continue;
                 }
-                mark_chains(&row, &fetch, reached)?;
+                for i in 0..n {
+                    if dirs.is_null(payload, c, i) {
+                        continue;
+                    }
+                    let mut pos = dirs.value_off(c, i);
+                    let v = read_value_lazy(ty, &shared, payload, &mut pos)?;
+                    mark_chains(&[v], &fetch, reached)?;
+                }
             }
             Ok(())
         }
@@ -2016,11 +2061,7 @@ fn read_skeleton_node(
         PAGE_LEAF => Ok((Child::OnDisk(page_idx), page.item_count as usize)),
         PAGE_INTERIOR => {
             let n = page.item_count as usize;
-            // Form (a) (lazy-record.md §5a, L3): an interior node is resident in the skeleton, and its
-            // separator rows carry deferred values too — share this interior block with them via one
-            // `Arc<[u8]>` (`payload` drives both the child-pointer reads and the separator decode).
-            let shared: Arc<[u8]> = Arc::from(block.as_slice());
-            let payload = &shared[PAGE_HEADER..];
+            let payload = page.payload;
             let mut pos = 0usize;
             let mut children = Vec::with_capacity(n + 1);
             let mut total = 0usize;
@@ -2030,29 +2071,37 @@ fn read_skeleton_node(
                 children.push(child);
                 total += clen;
             }
-            let (mut keys, mut vals, mut weights) = (
-                Vec::with_capacity(n),
-                Vec::with_capacity(n),
-                Vec::with_capacity(n),
-            );
-            // Separators decode lazily like leaves (large-values.md §14): an external value
-            // stays an unfetched reference; its chain is marked reachable by headers only.
-            let fetch = |p: u32| paging.pager().read_block(p);
-            for _ in 0..n {
-                let (key, row, w) = decode_record_lazy(col_types, &shared, payload, &mut pos)?;
-                weights.push(w as u32);
-                mark_chains(&row, &fetch, reached)?;
-                keys.push(key);
-                vals.push(row);
-            }
-            total += n;
+            // v24: the record-free routing skeleton — an end-offset separator directory + key
+            // blob. Separators carry no values, so no lazy decode and no chains to mark.
+            let keys = read_separators(payload, &mut pos, n)?;
             Ok((
-                Child::Resident(Node::loaded(keys, vals, weights, children, page_idx)),
+                Child::Resident(Node::loaded_interior(keys, children, page_idx)),
                 total,
             ))
         }
         _ => Err(corrupt("expected a B-tree node page")),
     }
+}
+
+/// Read a v24 interior node's separator keys: the `N`-entry end-offset directory then the key
+/// blob, `pos` at the directory's first byte (spec/fileformat/format.md "Interior node").
+fn read_separators(payload: &[u8], pos: &mut usize, n: usize) -> Result<Vec<Vec<u8>>> {
+    let mut ends = Vec::with_capacity(n);
+    for _ in 0..n {
+        ends.push(read_u32(payload, pos)?);
+    }
+    let blob = *pos;
+    let mut keys = Vec::with_capacity(n);
+    let mut prev = 0u32;
+    for &e in &ends {
+        if e < prev || blob + e as usize > payload.len() {
+            return Err(corrupt("interior separator directory out of range"));
+        }
+        keys.push(payload[blob + prev as usize..blob + e as usize].to_vec());
+        prev = e;
+    }
+    *pos = blob + prev as usize;
+    Ok(keys)
 }
 
 /// Read a table's on-disk B-tree (rooted at `page_idx`) into an in-memory tree, returning the root
@@ -2069,14 +2118,13 @@ fn read_tree(
     reached: &mut HashSet<u32>,
 ) -> Result<(Arc<Node>, usize)> {
     reached.insert(page_idx);
-    let cap = ps - PAGE_HEADER;
     let page = read_page(image, ps, page_idx)?;
     let fetch = |p: u32| page_block(image, ps, p);
     match page.page_type {
         PAGE_LEAF => {
             let n = page.item_count as usize;
             let k = col_types.len();
-            let dirs = parse_pax_leaf(page.payload, n, k)?;
+            let dirs = parse_pax_leaf(page.payload, n, col_types)?;
             let (mut keys, mut vals, mut weights) = (
                 Vec::with_capacity(n),
                 Vec::with_capacity(n),
@@ -2086,18 +2134,23 @@ fn read_tree(
                 let key = dirs.key(page.payload, i)?.to_vec();
                 let mut row = Vec::with_capacity(k);
                 let mut ovf = Vec::new();
-                let mut w = 2 + key.len();
+                let mut w = key.len();
                 for (c, ty) in col_types.iter().enumerate() {
-                    let mut pos = dirs.value_off(n, c, i);
-                    let before = pos;
-                    row.push(read_value(
-                        ty,
-                        page.payload,
-                        &mut pos,
-                        Some(&fetch),
-                        &mut ovf,
-                    )?);
-                    w += pos - before;
+                    w += dirs.value_len(c, i);
+                    if dirs.is_null(page.payload, c, i) {
+                        row.push(Value::Null);
+                        continue;
+                    }
+                    let mut pos = dirs.value_off(c, i);
+                    row.push(match fixed_value_width(ty) {
+                        // A fixed-width slot is the untagged inline body.
+                        Some(_) => {
+                            read_inline_body(ty, page.payload, &mut pos, DecodeMode::Construct)?
+                        }
+                        // A variable value's span is its tagged codec bytes; external chains are
+                        // gathered eagerly here (the fully-resident in-memory load).
+                        None => read_value(ty, page.payload, &mut pos, Some(&fetch), &mut ovf)?,
+                    });
                 }
                 weights.push(w as u32);
                 reached.extend(ovf);
@@ -2119,21 +2172,9 @@ fn read_tree(
                 children.push(Child::Resident(child));
                 total += clen;
             }
-            let (mut keys, mut vals, mut weights) = (
-                Vec::with_capacity(n),
-                Vec::with_capacity(n),
-                Vec::with_capacity(n),
-            );
-            for _ in 0..n {
-                let (key, row, ovf) =
-                    decode_record(col_types, page.payload, &mut pos, Some(&fetch))?;
-                weights.push(record_size(col_types, &key, &row, cap) as u32);
-                reached.extend(ovf);
-                keys.push(key);
-                vals.push(row);
-            }
-            total += n;
-            Ok((Node::loaded(keys, vals, weights, children, page_idx), total))
+            // v24: the record-free routing skeleton — separators carry no values or chains.
+            let keys = read_separators(page.payload, &mut pos, n)?;
+            Ok((Node::loaded_interior(keys, children, page_idx), total))
         }
         _ => Err(corrupt("expected a B-tree node page")),
     }
@@ -2248,27 +2289,21 @@ struct OverflowPageOut {
 /// into the record instead of the inline body. `cap` is the page payload (the slab size + the
 /// spill-plan input). Shared by the whole-image (`serialize_node`) and incremental (`serialize_dirty`)
 /// writers, which differ only in how `take` allocates a page.
-fn encode_record(
-    col_types: &[ColType],
-    key: &[u8],
-    row: &[Value],
-    cap: usize,
-    take: &mut dyn FnMut() -> u32,
-    ovf: &mut Vec<OverflowPageOut>,
-) -> Vec<u8> {
-    let plan = plan_dispositions(col_types, key, row, cap);
+/// Build a v24 **interior** node payload (spec/fileformat/format.md "Interior node"): `N+1` child
+/// pointers ‖ an `N`-entry end-offset separator directory ‖ the separator key blob. Record-free —
+/// no value codec, no overflow chains; a separator is raw order-preserving key bytes.
+fn encode_interior(seps: &[Vec<u8>], child_pages: &[u32]) -> Vec<u8> {
     let mut out = Vec::new();
-    out.extend_from_slice(&(key.len() as u16).to_be_bytes());
-    out.extend_from_slice(key);
-    for (i, (ty, val)) in col_types.iter().zip(row.iter()).enumerate() {
-        out.extend_from_slice(&encode_disposed_value(
-            ty,
-            val,
-            &plan.disp[i],
-            cap,
-            take,
-            ovf,
-        ));
+    for &cp in child_pages {
+        out.extend_from_slice(&cp.to_be_bytes());
+    }
+    let mut off = 0u32;
+    for s in seps {
+        off += s.len() as u32;
+        out.extend_from_slice(&off.to_be_bytes());
+    }
+    for s in seps {
+        out.extend_from_slice(s);
     }
     out
 }
@@ -2315,12 +2350,14 @@ fn encode_disposed_value(
     out
 }
 
-/// Build a PAX (column-major) leaf payload from records in ascending key order (format.md v23
+/// Build a v24 PAX (column-major) leaf payload from records in ascending key order (format.md
 /// "Leaf node"). Values are encoded in (record, column) order — so each external value's overflow
-/// chain is allocated via `take` in exactly the row-major order, keeping overflow page indices
-/// golden-pinned — then assembled column-major: key directory (`N+1` u32 prefix-sum) ‖ key blob ‖
-/// column directory (`K+1` u32 absolute offsets, `col_start[K]` = payload end) ‖ per column a value
-/// directory (`N+1` u32 prefix-sum) then the column's `N` value bodies.
+/// chain is allocated via `take` in exactly that order, keeping overflow page indices
+/// golden-pinned — then assembled column-major: key directory (`N` u32 end offsets) ‖ key blob ‖
+/// column directory (`K+1` u32 absolute offsets, `col_start[K]` = payload end) ‖ per column a
+/// region: a flags byte (0), then — fixed-width — the null bitmap + `N × width` dense untagged
+/// slots (a NULL slot zero-filled), or — variable-width — an `N`-entry end-offset value directory
+/// + the tagged value bodies (NULL = a zero-length span).
 fn encode_leaf_pax(
     col_types: &[ColType],
     keys: &[Vec<u8>],
@@ -2331,29 +2368,31 @@ fn encode_leaf_pax(
 ) -> Vec<u8> {
     let n = keys.len();
     let k = col_types.len();
-    // Encode each value in (record, column) order; overflow chains allocate here, matching row-major.
+    // Encode each value in (record, column) order; overflow chains allocate here. A fixed-width
+    // column's slot is the untagged inline body (`encode_value` minus its 0x00 tag; zeros for
+    // NULL); a variable column's bytes are the tagged disposed form (empty for NULL).
     let mut val_bytes: Vec<Vec<Vec<u8>>> = (0..k).map(|_| Vec::with_capacity(n)).collect();
+    let mut nulls: Vec<Vec<bool>> = (0..k).map(|_| vec![false; n]).collect();
     for (i, &row) in rows.iter().enumerate() {
         let plan = plan_dispositions(col_types, &keys[i], row, cap);
         for (c, (ty, val)) in col_types.iter().zip(row.iter()).enumerate() {
-            val_bytes[c].push(encode_disposed_value(
-                ty,
-                val,
-                &plan.disp[c],
-                cap,
-                take,
-                ovf,
-            ));
+            let is_null = matches!(val, Value::Null);
+            nulls[c][i] = is_null;
+            let bytes = match (fixed_value_width(ty), is_null) {
+                (Some(w), true) => vec![0u8; w],
+                (Some(_), false) => encode_value(ty, val)[1..].to_vec(),
+                (None, true) => Vec::new(),
+                (None, false) => encode_disposed_value(ty, val, &plan.disp[c], cap, take, ovf),
+            };
+            val_bytes[c].push(bytes);
         }
     }
     let mut out = Vec::new();
-    // key directory (prefix-sum) + key blob.
+    // key directory (N end offsets) + key blob.
     let mut off = 0u32;
-    for i in 0..=n {
+    for key in keys {
+        off += key.len() as u32;
         out.extend_from_slice(&off.to_be_bytes());
-        if i < n {
-            off += keys[i].len() as u32;
-        }
     }
     for key in keys {
         out.extend_from_slice(key);
@@ -2364,20 +2403,33 @@ fn encode_leaf_pax(
     let mut cur = base_after_col_dir;
     for c in 0..k {
         col_start[c] = cur;
-        let region: usize = 4 * (n + 1) + val_bytes[c].iter().map(Vec::len).sum::<usize>();
-        cur += region;
+        let bodies: usize = val_bytes[c].iter().map(Vec::len).sum();
+        cur += 1 + match fixed_value_width(&col_types[c]) {
+            Some(_) => n.div_ceil(8) + bodies,
+            None => 4 * n + bodies,
+        };
     }
     col_start[k] = cur;
     for &cs in &col_start {
         out.extend_from_slice(&(cs as u32).to_be_bytes());
     }
-    // each column region: value directory (prefix-sum) then value bodies.
+    // each column region: flags byte, then bitmap + dense slots (fixed) or value directory +
+    // tagged bodies (variable).
     for c in 0..k {
-        let mut voff = 0u32;
-        for i in 0..=n {
-            out.extend_from_slice(&voff.to_be_bytes());
-            if i < n {
-                voff += val_bytes[c][i].len() as u32;
+        out.push(0u8); // region flags — reserved (the dictionary door)
+        if fixed_value_width(&col_types[c]).is_some() {
+            let mut bitmap = vec![0u8; n.div_ceil(8)];
+            for (i, &is_null) in nulls[c].iter().enumerate() {
+                if is_null {
+                    bitmap[i / 8] |= 0x80 >> (i % 8);
+                }
+            }
+            out.extend_from_slice(&bitmap);
+        } else {
+            let mut voff = 0u32;
+            for vb in &val_bytes[c] {
+                voff += vb.len() as u32;
+                out.extend_from_slice(&voff.to_be_bytes());
             }
         }
         for vb in &val_bytes[c] {
@@ -2829,34 +2881,77 @@ fn page_block(image: &[u8], ps: usize, index: u32) -> Result<Vec<u8>> {
 /// A parsed PAX (column-major) leaf's directories (spec/fileformat/format.md v23 "Leaf node"). All
 /// offsets index into the page payload; value bytes are read in place (`value_off`) so the lazy
 /// decoder's zero-copy form still references the shared page block.
+/// One leaf column region's parsed shape (v24 — spec/fileformat/format.md "Leaf node"), class-
+/// dependent: a fixed-width region is a null bitmap + dense untagged slots; a variable region is
+/// an end-offset value directory + tagged codec bytes (NULL = zero-length span).
+enum RegionDir {
+    Fixed {
+        width: usize,
+        /// Payload offset of the region's null bitmap (`ceil(N/8)` bytes, MSB-first, set = NULL).
+        bitmap: usize,
+        /// Payload offset of slot 0; slot `i` is `width` bytes at `body + i·width`.
+        body: usize,
+    },
+    Var {
+        /// The `N` end offsets into the value blob (`ends[i]` = one past value `i`'s bytes).
+        ends: Vec<u32>,
+        /// Payload offset of the value blob.
+        body: usize,
+    },
+}
+
 struct PaxDirs {
-    key_blob: usize,        // payload offset where the key blob starts
-    key_off: Vec<u32>,      // N+1 prefix-sum into the key blob
-    col_start: Vec<u32>, // K+1 absolute payload offsets of each column region; col_start[K] = end
-    col_off: Vec<Vec<u32>>, // K value directories (N+1 prefix-sum into each column's values)
+    key_blob: usize,   // payload offset where the key blob starts
+    key_end: Vec<u32>, // N end offsets into the key blob (end-offset directory, v24)
+    regions: Vec<RegionDir>, // K regions, in declaration order
 }
 
 impl PaxDirs {
     /// Key `i`'s span within `payload`.
     fn key<'a>(&self, payload: &'a [u8], i: usize) -> Result<&'a [u8]> {
-        let lo = self.key_blob + self.key_off[i] as usize;
-        let hi = self.key_blob + self.key_off[i + 1] as usize;
+        let lo = self.key_blob + if i == 0 { 0 } else { self.key_end[i - 1] as usize };
+        let hi = self.key_blob + self.key_end[i] as usize;
         if lo > hi || hi > payload.len() {
             return Err(corrupt("PAX leaf key directory out of range"));
         }
         Ok(&payload[lo..hi])
     }
 
-    /// The payload offset where value `(record i, column c)`'s codec bytes begin.
-    fn value_off(&self, n: usize, c: usize, i: usize) -> usize {
-        self.col_start[c] as usize + 4 * (n + 1) + self.col_off[c][i] as usize
+    /// Whether value `(record i, column c)` is NULL — the region bitmap (fixed-width) or the
+    /// zero-length span (variable), with **no value decode**.
+    fn is_null(&self, payload: &[u8], c: usize, i: usize) -> bool {
+        match &self.regions[c] {
+            RegionDir::Fixed { bitmap, .. } => {
+                payload[bitmap + i / 8] & (0x80 >> (i % 8)) != 0
+            }
+            RegionDir::Var { ends, .. } => {
+                let start = if i == 0 { 0 } else { ends[i - 1] };
+                ends[i] == start
+            }
+        }
     }
 
-    /// The on-disk byte length of value `(record i, column c)` — the value directory's prefix-sum
-    /// span. Equals what `read_value_lazy` advances the cursor by, so a record's weight is derivable
-    /// from the directories alone, with **no value decode** (packed-leaf.md §3/§5).
+    /// The payload offset where value `(record i, column c)`'s bytes begin: a fixed-width slot
+    /// (untagged body) or a variable value's tagged codec bytes. Meaningless for a NULL.
+    fn value_off(&self, c: usize, i: usize) -> usize {
+        match &self.regions[c] {
+            RegionDir::Fixed { width, body, .. } => body + i * width,
+            RegionDir::Var { ends, body } => {
+                body + if i == 0 { 0 } else { ends[i - 1] as usize }
+            }
+        }
+    }
+
+    /// The bytes value `(record i, column c)` contributes to `record_size` — the slot width
+    /// (fixed-width, NULL included) or the span length (variable; 0 for NULL). Derivable from the
+    /// directories alone, with **no value decode** (packed-leaf.md §3/§5).
     fn value_len(&self, c: usize, i: usize) -> usize {
-        (self.col_off[c][i + 1] - self.col_off[c][i]) as usize
+        match &self.regions[c] {
+            RegionDir::Fixed { width, .. } => *width,
+            RegionDir::Var { ends, .. } => {
+                (ends[i] - if i == 0 { 0 } else { ends[i - 1] }) as usize
+            }
+        }
     }
 }
 
@@ -2890,8 +2985,18 @@ impl PackedLeaf {
     /// touch-time (§8). A corrupt *touched* inline body surfaces `XX001` here.
     pub(crate) fn value(&self, c: usize, i: usize) -> Result<Value> {
         let payload = &self.block[self.payload_off..];
-        let mut pos = self.dirs.value_off(self.n, c, i);
-        read_value_lazy(&self.col_types[c], &self.block, payload, &mut pos)
+        if self.dirs.is_null(payload, c, i) {
+            return Ok(Value::Null);
+        }
+        let ty = &self.col_types[c];
+        let mut pos = self.dirs.value_off(c, i);
+        match fixed_value_width(ty) {
+            // A fixed-width slot is the untagged inline body — decoded eagerly (deferring a
+            // fixed-width scalar buys nothing, lazy-record.md §6).
+            Some(_) => read_inline_body(ty, payload, &mut pos, DecodeMode::Construct),
+            // A variable value's span is its tagged codec bytes — the lazy tag path.
+            None => read_value_lazy(ty, &self.block, payload, &mut pos),
+        }
     }
 
     /// Reconstruct the whole value row `i` (every column). The `row_at` whole-record path.
@@ -2923,18 +3028,26 @@ impl PackedLeaf {
     }
 }
 
-/// Parse a PAX leaf payload's three directories (spec/fileformat/format.md v23 "Leaf node"). Column
-/// regions are validated contiguous, in order, and within the payload; a malformed directory is
-/// `data_corrupted`. The page body is zero-padded to the page size, so the authoritative content end
-/// is `col_start[K]`, not `payload.len()`.
-fn parse_pax_leaf(payload: &[u8], n: usize, k: usize) -> Result<PaxDirs> {
+/// Parse a v24 PAX leaf payload's directories (spec/fileformat/format.md "Leaf node"). Column
+/// regions are validated contiguous, in order, and within the payload; a malformed directory, a
+/// set region flags bit, or a region whose extent disagrees with its class shape is
+/// `data_corrupted`. The page body is zero-padded to the page size, so the authoritative content
+/// end is `colStart[K]`, not `payload.len()`.
+fn parse_pax_leaf(payload: &[u8], n: usize, col_types: &[ColType]) -> Result<PaxDirs> {
+    let k = col_types.len();
     let mut pos = 0usize;
-    let mut key_off = Vec::with_capacity(n + 1);
-    for _ in 0..=n {
-        key_off.push(read_u32(payload, &mut pos)?);
+    let mut key_end = Vec::with_capacity(n);
+    let mut prev = 0u32;
+    for _ in 0..n {
+        let e = read_u32(payload, &mut pos)?;
+        if e < prev {
+            return Err(corrupt("PAX leaf key directory not ascending"));
+        }
+        key_end.push(e);
+        prev = e;
     }
     let key_blob = pos;
-    pos = key_blob + key_off[n] as usize;
+    pos = key_blob + prev as usize;
     if pos > payload.len() {
         return Err(corrupt("PAX leaf key blob overruns page"));
     }
@@ -2945,29 +3058,52 @@ fn parse_pax_leaf(payload: &[u8], n: usize, k: usize) -> Result<PaxDirs> {
     if col_start[0] as usize != pos {
         return Err(corrupt("PAX leaf column directory start mismatch"));
     }
-    let mut col_off = Vec::with_capacity(k);
-    for c in 0..k {
+    let mut regions = Vec::with_capacity(k);
+    for (c, ty) in col_types.iter().enumerate() {
         let start = col_start[c] as usize;
-        let mut p = start;
-        let mut voff = Vec::with_capacity(n + 1);
-        for _ in 0..=n {
-            voff.push(read_u32(payload, &mut p)?);
-        }
-        let val_base = start + 4 * (n + 1);
         let end = col_start[c + 1] as usize;
-        if val_base > end || end > payload.len() || val_base + voff[n] as usize != end {
+        if start > end || end > payload.len() {
             return Err(corrupt("PAX leaf column region out of range"));
         }
-        col_off.push(voff);
-    }
-    if col_start[k] as usize > payload.len() {
-        return Err(corrupt("PAX leaf payload overruns page"));
+        let mut p = start;
+        if read_u8(payload, &mut p)? != 0 {
+            return Err(corrupt("PAX leaf region flags has a reserved bit set"));
+        }
+        match fixed_value_width(ty) {
+            Some(width) => {
+                let bitmap = p;
+                let body = bitmap + n.div_ceil(8);
+                if body + n * width != end {
+                    return Err(corrupt("PAX leaf fixed region extent mismatch"));
+                }
+                regions.push(RegionDir::Fixed {
+                    width,
+                    bitmap,
+                    body,
+                });
+            }
+            None => {
+                let mut ends = Vec::with_capacity(n);
+                let mut vprev = 0u32;
+                for _ in 0..n {
+                    let e = read_u32(payload, &mut p)?;
+                    if e < vprev {
+                        return Err(corrupt("PAX leaf value directory not ascending"));
+                    }
+                    ends.push(e);
+                    vprev = e;
+                }
+                if p + vprev as usize != end {
+                    return Err(corrupt("PAX leaf variable region extent mismatch"));
+                }
+                regions.push(RegionDir::Var { ends, body: p });
+            }
+        }
     }
     Ok(PaxDirs {
         key_blob,
-        key_off,
-        col_start,
-        col_off,
+        key_end,
+        regions,
     })
 }
 
@@ -2992,16 +3128,17 @@ pub(crate) fn decode_leaf_node(
     // values. `parse_pax_leaf` validates + parses the directories in one pass with no value decode,
     // so a malformed *directory* still surfaces `data_corrupted` here; a malformed value *body*
     // surfaces `XX001` only when the column is touched (§8). Keys and weights are derivable from the
-    // directories alone (§3) — the weight is `2 + key_len + Σ_c value_len(c, i)`, exactly what the
-    // eager decode summed — so the resident leaf is `≈ page_size` (§9), never an inflated row vector.
+    // directories alone (§3) — the weight is `key_len + Σ_c value_len(c, i)` (the v24 record_size),
+    // exactly what the writer split on — so the resident leaf is `≈ page_size` (§9), never an
+    // inflated row vector.
     let shared: Arc<[u8]> = Arc::from(block);
     let payload = &shared[PAGE_HEADER..];
-    let dirs = parse_pax_leaf(payload, n, k)?;
+    let dirs = parse_pax_leaf(payload, n, col_types.as_slice())?;
     let mut keys = Vec::with_capacity(n);
     let mut weights = Vec::with_capacity(n);
     for i in 0..n {
         let key = dirs.key(payload, i)?.to_vec();
-        let mut w = 2 + key.len();
+        let mut w = key.len();
         for c in 0..k {
             w += dirs.value_len(c, i);
         }
@@ -3582,26 +3719,6 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u3
     ))
 }
 
-/// Decode one record `(key, row)` and the **overflow chain pages** any external value followed
-/// (for the free-list reachability walk — spec/design/large-values.md §12). `fetch` reads a page
-/// block by index, used to follow overflow chains; `None` is only valid where no value can be
-/// external (e.g. a catalog default).
-fn decode_record(
-    col_types: &[ColType],
-    buf: &[u8],
-    pos: &mut usize,
-    fetch: Option<&dyn Fn(u32) -> Result<Vec<u8>>>,
-) -> Result<(Vec<u8>, Row, Vec<u32>)> {
-    let key_len = read_u16(buf, pos)? as usize;
-    let key = take(buf, pos, key_len)?.to_vec();
-    let mut row = Vec::with_capacity(col_types.len());
-    let mut ovf = Vec::new();
-    for ty in col_types {
-        row.push(read_value(ty, buf, pos, fetch, &mut ovf)?);
-    }
-    Ok((key, row, ovf))
-}
-
 /// Whether the value decoder **constructs** each leaf [`Value`] or merely **advances the cursor**
 /// past its body (spec/design/lazy-record.md §6). Both modes run the identical cursor-advancing
 /// reads — the same length / tag / count reads and the same recursion — so a `Skip` walk finds
@@ -4081,33 +4198,6 @@ fn read_value_lazy(ty: &ColType, block: &Arc<[u8]>, buf: &[u8], pos: &mut usize)
     }
 }
 
-/// Decode one record lazily (`read_value_lazy` per column) and return `(key, row, weight)`,
-/// where the weight is the bytes the record occupies on the page — exactly the
-/// [`record_size`] the writer split on, read off the cursor instead of re-planned (a re-plan
-/// would need the unfetched bytes).
-fn decode_record_lazy(
-    col_types: &[ColType],
-    block: &Arc<[u8]>,
-    buf: &[u8],
-    pos: &mut usize,
-) -> Result<(Vec<u8>, Row, usize)> {
-    // `buf` must be the page payload of `block` (`block[PAGE_HEADER..]`) — `read_value_lazy` records
-    // a deferred value's offset within the shared block as `PAGE_HEADER + (its offset in buf)` (§5a).
-    debug_assert_eq!(
-        block.len(),
-        buf.len() + PAGE_HEADER,
-        "lazy decode: buf must be block[PAGE_HEADER..]"
-    );
-    let start = *pos;
-    let key_len = read_u16(buf, pos)? as usize;
-    let key = take(buf, pos, key_len)?.to_vec();
-    let mut row = Vec::with_capacity(col_types.len());
-    for ty in col_types {
-        row.push(read_value_lazy(ty, block, buf, pos)?);
-    }
-    Ok((key, row, *pos - start))
-}
-
 /// Materialize an unfetched reference into its plain [`Value`] (spec/design/large-values.md
 /// §14): gather the overflow chain through `fetch` for an external form, decompress a
 /// compressed one, and reconstruct by column type. Decompression errors are `data_corrupted`,
@@ -4181,7 +4271,7 @@ fn chain_pages(first: u32, len: usize, fetch: &dyn Fn(u32) -> Result<Vec<u8>>) -
 /// Add the overflow chain pages a lazily-decoded row references to `reached` (the free-list
 /// reachability walk), via the header-only [`chain_pages`] hop.
 fn mark_chains(
-    row: &Row,
+    row: &[Value],
     fetch: &dyn Fn(u32) -> Result<Vec<u8>>,
     reached: &mut HashSet<u32>,
 ) -> Result<()> {

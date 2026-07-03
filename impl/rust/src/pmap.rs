@@ -1,5 +1,6 @@
-//! Persistent (copy-on-write) ordered map — the page-backed B-tree (decision **B1**,
-//! spec/design/transactions.md §3; spec/fileformat/format.md "The per-table data B-tree").
+//! Persistent (copy-on-write) ordered map — the page-backed **B+tree** (decision **B1**,
+//! spec/design/bplus-reshape.md; spec/design/transactions.md §3; spec/fileformat/format.md "The
+//! per-table data B+tree").
 //!
 //! Keyed by the encoded key bytes (`Vec<u8>`, whose `Ord` is lexicographic = the
 //! order-preserving key encoding's memcmp contract, spec/design/encoding.md). Every mutation
@@ -7,12 +8,17 @@
 //! unchanged — so a snapshot is an O(1) `Arc` clone and a commit is a pointer swap
 //! (transactions.md §2).
 //!
-//! **This is the on-disk B-tree, node-for-page (Phase 6, P6.1).** Its fan-out is **size-driven**:
-//! a node holds as many entries as fit a page payload `cap` (= `page_size − 16`) and **splits when
-//! it would overflow** — so the node boundaries, and therefore the serialized bytes, are a §8 byte
-//! contract (format.md). The caller supplies each entry's on-disk **weight** (its record size) so
-//! this map can sum payloads without knowing the value codec; `cap` is passed per call (it is a
-//! property of the database's page size, held by the [`crate::storage::TableStore`]).
+//! **This is the on-disk B+tree, node-for-page (v24).** Records live **only in leaves**; an
+//! interior node is a record-free routing skeleton — separator keys + child pointers. A separator
+//! is a **copy of a boundary key** (a leaf split copies the right half's first key up; an interior
+//! split pushes its median separator up) and may go stale after deletes — it keeps routing
+//! (left < sep ≤ right holds forever). Fan-out is **size-driven**: a node holds as many entries as
+//! fit a page payload `cap` (= `page_size − 16`) and **splits when it would overflow** — so the
+//! node boundaries, and therefore the serialized bytes, are a §8 byte contract (format.md). The
+//! caller supplies each leaf entry's on-disk **weight** (its record size) so this map can sum leaf
+//! payloads without knowing the value codec; interior payloads come from the separators
+//! themselves. `cap` and the leaf's column-class `shape` are passed per call (properties of the
+//! database's page size and the table's column types, held by [`crate::storage::TableStore`]).
 //!
 //! Each [`Node`] also carries a set-once on-disk **page id** (`0` = dirty/unpersisted): an
 //! incremental commit writes only the dirty nodes a mutation introduced (format.rs / file.rs).
@@ -20,19 +26,21 @@
 //! stays shared. `AtomicU32` keeps the shared tree `Send + Sync` (P5.3b) under a relaxed set-once
 //! store — the node is otherwise immutable.
 //!
-//! Boring and explicit (CLAUDE.md §10): one `Node` type (a leaf has no children), recursive insert
-//! with split-on-overflow, recursive delete via in-order-predecessor replacement and
-//! **merge-then-maybe-split** rebalancing (no borrow — merge subsumes it; format.md "Delete").
+//! Boring and explicit (CLAUDE.md §10): one `Node` type (a leaf has no children; an interior has
+//! no vals/weights), recursive insert with split-on-overflow (leaf copy-up / interior push-up,
+//! format.md "Fan-out"), recursive delete with **merge-then-maybe-split** rebalancing (no borrow —
+//! merge subsumes it; an interior merge whose result cannot 2-way split is **abandoned**,
+//! format.md "Delete").
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
 use crate::error::Result;
-use crate::format::PackedLeaf;
+use crate::format::{LeafShape, PackedLeaf, leaf_overhead};
 use crate::storage::Row;
 use crate::value::Value;
 
-/// A B-tree node's reference to one child. Under demand paging (P6.4b, spec/design/pager.md §4) a
+/// A B+tree node's reference to one child. Under demand paging (P6.4b, spec/design/pager.md §4) a
 /// clean leaf need not be resident: an interior node keeps `OnDisk(page_id)` for such a child and
 /// the read path faults it through the buffer pool on access. A `Resident` child is an in-memory
 /// node — a dirty/uncommitted node, a resident interior skeleton node (interior nodes are *always*
@@ -59,7 +67,7 @@ impl Child {
 }
 
 /// Source for faulting a clean **leaf** page to a resident node on demand (spec/design/pager.md §4) —
-/// the buffer pool, behind the table's column types. Defined here so the B-tree traversal can fault
+/// the buffer pool, behind the table's column types. Defined here so the B+tree traversal can fault
 /// without depending on the storage/format layers (they implement it); a fully-resident in-memory
 /// database passes `None` and never faults.
 pub(crate) trait LeafSource {
@@ -81,25 +89,28 @@ fn child(node: &Node, i: usize, src: Option<&dyn LeafSource>) -> Result<Arc<Node
     }
 }
 
-/// One B-tree node. `children` is empty for a leaf; otherwise `children.len() == keys.len() + 1`.
-/// `keys.len() == vals.len() == weights.len()` always. `weights[i]` is entry `i`'s on-disk record
-/// size (format.md), used only for the size-driven split/merge decisions. Nodes are shared behind
-/// `Arc`; a mutation clones only the root→leaf path and shares every untouched subtree.
+/// One B+tree node. A **leaf** has no children and `keys.len() == vals.len() == weights.len()`
+/// (or a `packed` block in place of `vals`). An **interior** node has `children.len() ==
+/// keys.len() + 1` and **empty** `vals`/`weights` — its keys are the routing separators, its
+/// payload is derived from the separator bytes themselves (v24, record-free). Nodes are shared
+/// behind `Arc`; a mutation clones only the root→leaf path and shares every untouched subtree.
 pub(crate) struct Node {
     pub(crate) keys: Vec<Vec<u8>>,
-    /// The decoded value rows, one per key — populated for a **Decoded** node (in-memory / mutated /
-    /// dirty leaves, and *every* interior node), **empty** for a **Packed** leaf (which reconstructs
-    /// on demand from `packed`). Read only through the [`row_at`](Node::row_at) /
-    /// [`col_at`](Node::col_at) / [`with_row`](Node::with_row) / [`decoded_rows`](Node::decoded_rows)
-    /// seam, never indexed directly, so the two forms are interchangeable (packed-leaf.md §3/§4).
+    /// The decoded value rows, one per key — populated for a **Decoded leaf** (in-memory /
+    /// mutated / dirty), **empty** for a **Packed** leaf (which reconstructs on demand from
+    /// `packed`) and for every **interior** node (record-free, v24). Read only through the
+    /// [`row_at`](Node::row_at) / [`col_at`](Node::col_at) / [`with_row`](Node::with_row) /
+    /// [`decoded_rows`](Node::decoded_rows) seam on leaves, never indexed directly.
     pub(crate) vals: Vec<Row>,
+    /// Each leaf record's on-disk size (`format::record_size`) — the size-driven split weight.
+    /// Empty for interior nodes.
     pub(crate) weights: Vec<u32>,
     pub(crate) children: Vec<Child>,
     /// The **Packed** (block-backed) resident form of a demand-paged clean leaf (packed-leaf.md §5):
     /// the page block + the PAX directories, from which `vals` are reconstructed on demand. `None` for
-    /// a Decoded node — every interior node, an in-memory/`from_image` leaf, and any dirty (mutated)
-    /// leaf (mutation materializes Packed→Decoded first, §7). A Packed leaf is always clean (`page` ≠
-    /// `0`), so it is never serialized.
+    /// a Decoded node — an in-memory/`from_image` leaf, any dirty (mutated) leaf (mutation
+    /// materializes Packed→Decoded first, §7), and every interior node. A Packed leaf is always
+    /// clean (`page` ≠ `0`), so it is never serialized.
     pub(crate) packed: Option<PackedLeaf>,
     /// On-disk page index, or `0` when dirty (never persisted / changed since). Set once by the
     /// incremental commit that first persists this node (format.rs `serialize_dirty`, P6.1 part B);
@@ -109,26 +120,33 @@ pub(crate) struct Node {
 }
 
 impl Node {
-    /// A fresh **dirty** node (page `0`) — every copy-on-write rebuild goes through here.
-    fn new(
-        keys: Vec<Vec<u8>>,
-        vals: Vec<Row>,
-        weights: Vec<u32>,
-        children: Vec<Child>,
-    ) -> Arc<Node> {
+    /// A fresh **dirty leaf** (page `0`) — every copy-on-write leaf rebuild goes through here.
+    fn new_leaf(keys: Vec<Vec<u8>>, vals: Vec<Row>, weights: Vec<u32>) -> Arc<Node> {
         Arc::new(Node {
             keys,
             vals,
             weights,
+            children: Vec::new(),
+            packed: None,
+            page: AtomicU32::new(0),
+        })
+    }
+
+    /// A fresh **dirty interior** node (page `0`) — separators + children, no records (v24).
+    fn new_interior(keys: Vec<Vec<u8>>, children: Vec<Child>) -> Arc<Node> {
+        debug_assert_eq!(children.len(), keys.len() + 1, "interior child count");
+        Arc::new(Node {
+            keys,
+            vals: Vec::new(),
+            weights: Vec::new(),
             children,
             packed: None,
             page: AtomicU32::new(0),
         })
     }
 
-    /// A node reconstructed from disk at `page` (format.rs `read_tree`), already persisted. Its
-    /// children may be `Resident` (the fully-resident in-memory load) or `OnDisk` (the demand-paged
-    /// skeleton load, B2) — the constructor is agnostic.
+    /// A leaf reconstructed from disk at `page` (format.rs `read_tree`), already persisted and
+    /// fully decoded (the in-memory eager load).
     pub(crate) fn loaded(
         keys: Vec<Vec<u8>>,
         vals: Vec<Row>,
@@ -140,6 +158,21 @@ impl Node {
             keys,
             vals,
             weights,
+            children,
+            packed: None,
+            page: AtomicU32::new(page),
+        })
+    }
+
+    /// An interior node reconstructed from disk at `page` (format.rs `read_tree` /
+    /// `read_skeleton_node`): the record-free separators + children skeleton (v24). Children may be
+    /// `Resident` (the fully-resident in-memory load) or `OnDisk` (the demand-paged skeleton load).
+    pub(crate) fn loaded_interior(keys: Vec<Vec<u8>>, children: Vec<Child>, page: u32) -> Arc<Node> {
+        debug_assert_eq!(children.len(), keys.len() + 1, "interior child count");
+        Arc::new(Node {
+            keys,
+            vals: Vec::new(),
+            weights: Vec::new(),
             children,
             packed: None,
             page: AtomicU32::new(page),
@@ -171,30 +204,36 @@ impl Node {
         self.children.is_empty()
     }
 
-    /// This node's serialized payload size (format.md): `Σ weights` plus, for an interior node,
-    /// `4·(N+1)` for its child pointers, or for a LEAF (PAX v23) `directory_overhead(N, K)` for the
-    /// key/column/value directories. `k` is the tree's value-column count (0 for an index tree).
-    fn payload(&self, k: usize) -> usize {
-        let entries: usize = self.weights.iter().map(|&w| w as usize).sum();
-        entries
-            + if self.is_leaf() {
-                crate::format::directory_overhead(self.keys.len(), k)
-            } else {
-                4 * self.children.len()
-            }
+    /// This node's serialized payload size (format.md): a leaf is `Σ weights +
+    /// leaf_overhead(N, shape)`; an interior node is `8·N + 4 + Σ sep_len` (child pointers +
+    /// separator directory + key blob — record-free, v24).
+    fn payload(&self, shape: LeafShape) -> usize {
+        if self.is_leaf() {
+            self.weights.iter().map(|&w| w as usize).sum::<usize>()
+                + leaf_overhead(self.keys.len(), shape)
+        } else {
+            8 * self.keys.len() + 4 + self.keys.iter().map(Vec::len).sum::<usize>()
+        }
     }
 
-    /// Binary-search this node's keys: `Ok(i)` if `key` sits at index `i`, else `Err(i)` for the
-    /// child/insertion slot. `Vec<u8>::cmp` is lexicographic (memcmp) — the key contract.
+    /// Binary-search a **leaf**'s keys: `Ok(i)` if `key` sits at index `i`, else `Err(i)` for the
+    /// insertion slot. `Vec<u8>::cmp` is lexicographic (memcmp) — the key contract.
     fn search(&self, key: &[u8]) -> std::result::Result<usize, usize> {
         self.keys.binary_search_by(|k| k.as_slice().cmp(key))
     }
 
-    /// Reconstruct value row `i` as an owned [`Row`] — the value-read seam (packed-leaf.md §4).
-    /// A **Decoded** node (always the case for interior nodes) clones `vals[i]`; a **Packed** leaf
-    /// reconstructs the whole row from the retained PAX directories on demand. Fallible so the Packed
-    /// reconstruction can surface a corrupt *touched* inline body (`XX001`, packed-leaf.md §8); the
-    /// Decoded path never errors.
+    /// The child an **interior** descent takes for `key`: `partition_point(sep ≤ key)` — a key
+    /// equal to a separator lies in the **right** subtree (the copy-up separator is the right
+    /// half's first key; format.md "Interior node").
+    fn child_slot(&self, key: &[u8]) -> usize {
+        self.keys.partition_point(|k| k.as_slice() <= key)
+    }
+
+    /// Reconstruct value row `i` as an owned [`Row`] — the value-read seam (packed-leaf.md §4), on
+    /// a **leaf**. A **Decoded** leaf clones `vals[i]`; a **Packed** leaf reconstructs the whole row
+    /// from the retained PAX directories on demand. Fallible so the Packed reconstruction can
+    /// surface a corrupt *touched* inline body (`XX001`, packed-leaf.md §8); the Decoded path never
+    /// errors.
     pub(crate) fn row_at(&self, i: usize) -> Result<Row> {
         match &self.packed {
             None => Ok(self.vals[i].clone()),
@@ -203,8 +242,8 @@ impl Node {
     }
 
     /// Reconstruct **only** column `c` of row `i` — the touched-column path (packed-leaf.md §4/§6,
-    /// the `OP_Column`/`slot_getsomeattrs` model PAX's `colOff` makes O(1)). A **Decoded** node clones
-    /// `vals[i][c]`; a **Packed** leaf decodes the single column span and reads no other column.
+    /// the `OP_Column`/`slot_getsomeattrs` model PAX's column regions make O(1)). A **Decoded** leaf
+    /// clones `vals[i][c]`; a **Packed** leaf decodes the single column span and reads no other column.
     pub(crate) fn col_at(&self, i: usize, c: usize) -> Result<Value> {
         match &self.packed {
             None => Ok(self.vals[i][c].clone()),
@@ -213,7 +252,7 @@ impl Node {
     }
 
     /// Reconstruct row `i` decoding **only** the columns `mask` selects (packed-leaf.md §4/§6). A
-    /// **Decoded** node returns the whole `vals[i]` (already decoded — masking buys nothing); a
+    /// **Decoded** leaf returns the whole `vals[i]` (already decoded — masking buys nothing); a
     /// **Packed** leaf leaves untouched columns `Null` and never reads their bytes.
     pub(crate) fn row_at_masked(&self, i: usize, mask: &[bool]) -> Result<Row> {
         match &self.packed {
@@ -227,7 +266,7 @@ impl Node {
     /// columns ([`row_at_masked`](Node::row_at_masked)), leaving the rest `Null`. A `None` recon is the
     /// whole-row default the mutation / FK / index-maintenance feeds keep (they recompute keys from the
     /// old row); a read-only SELECT feed passes `Some(touched)` so a Packed leaf skips decoding the
-    /// untouched columns. A **Decoded** node returns its whole row either way (already decoded).
+    /// untouched columns. A **Decoded** leaf returns its whole row either way (already decoded).
     pub(crate) fn row_at_maybe_masked(&self, i: usize, recon: Option<&[bool]>) -> Result<Row> {
         match recon {
             None => self.row_at(i),
@@ -236,9 +275,10 @@ impl Node {
     }
 
     /// Borrow value row `i` for the duration of `f`, avoiding an owned clone on the Decoded hot path
-    /// (the scan/visit callbacks that only need a `&Row`). A **Decoded** node lends `&vals[i]`
+    /// (the scan/visit callbacks that only need a `&Row`). A **Decoded** leaf lends `&vals[i]`
     /// directly; a **Packed** leaf reconstructs into a temporary and lends that (the
     /// "materialize-then-lend" borrow helper, packed-leaf.md §4).
+    #[allow(dead_code)]
     fn with_row<R>(&self, i: usize, f: impl FnOnce(&Row) -> Result<R>) -> Result<R> {
         match &self.packed {
             None => f(&self.vals[i]),
@@ -248,7 +288,7 @@ impl Node {
 
     /// [`with_row`](Node::with_row) with the Track A1 reconstruction mask: `recon = Some(m)` on a
     /// **Packed** leaf reconstructs into a temporary decoding only the selected columns and lends that
-    /// (untouched columns `Null`); `recon = None` — and every **Decoded** node — lends the whole row.
+    /// (untouched columns `Null`); `recon = None` — and every **Decoded** leaf — lends the whole row.
     fn with_row_maybe_masked<R>(
         &self,
         i: usize,
@@ -262,10 +302,10 @@ impl Node {
         }
     }
 
-    /// Every value row, owned — the mutation-descent materialization (packed-leaf.md §7). A
-    /// **Decoded** node clones `vals`; a **Packed** leaf reconstructs every row so the rebuilt node
-    /// is Decoded (`build`/`node_insert`/`node_remove`/`merge_at` then run unchanged). Interior
-    /// nodes are always Decoded, so this is a plain clone for them.
+    /// Every value row of a **leaf**, owned — the mutation-descent materialization
+    /// (packed-leaf.md §7). A **Decoded** leaf clones `vals`; a **Packed** leaf reconstructs every
+    /// row so the rebuilt node is Decoded (`build_leaf`/`node_insert`/`node_remove`/`merge_at` then
+    /// run unchanged).
     pub(crate) fn decoded_rows(&self) -> Result<Vec<Row>> {
         match &self.packed {
             None => Ok(self.vals.clone()),
@@ -275,16 +315,166 @@ impl Node {
 }
 
 /// The result of inserting into a subtree: either the rebuilt subtree, or a node that overflowed
-/// and split into `left`, a median `(key, val, weight)` to promote, and `right`.
+/// and split into `left`, a **separator key** for the parent, and `right`. A leaf split **copies**
+/// the right leaf's first key up (no record leaves the leaf level); an interior split **pushes**
+/// its median separator up (format.md "Fan-out").
 enum Ins {
     Whole(Arc<Node>),
     Split {
         left: Arc<Node>,
-        key: Vec<u8>,
-        val: Row,
-        weight: u32,
+        sep: Vec<u8>,
         right: Arc<Node>,
     },
+}
+
+/// The kind-shared split decision (format.md "Split point"): given the per-boundary
+/// `leftpayload`/`rightpayload` functions over `m` in `[m_lo, m_hi]`, pick
+/// `m = right_edge ? m_max : clamp(min(m_balanced, m_max), m_min, m_max)`, or `None` when no `m`
+/// in the range keeps both sides fitting (the interior merge-abandon case — unreachable on the
+/// insert path, format.md "Why the record cap").
+fn split_point(
+    m_lo: usize,
+    m_hi: usize,
+    payload: usize,
+    cap: usize,
+    right_edge: bool,
+    leftpayload: impl Fn(usize) -> usize,
+    rightpayload: impl Fn(usize) -> usize,
+) -> Option<usize> {
+    debug_assert!(m_lo <= m_hi);
+    // leftpayload is nondecreasing in m and rightpayload nonincreasing, so both bounds
+    // binary-search cleanly; the ranges are tiny (page fan-out), so a linear scan is clearer.
+    let mut m_max = None;
+    for m in m_lo..=m_hi {
+        if leftpayload(m) <= cap {
+            m_max = Some(m);
+        } else {
+            break;
+        }
+    }
+    let m_max = m_max?;
+    let mut m_min = None;
+    for m in (m_lo..=m_hi).rev() {
+        if rightpayload(m) <= cap {
+            m_min = Some(m);
+        } else {
+            break;
+        }
+    }
+    let m_min = m_min?;
+    if m_min > m_max {
+        return None;
+    }
+    if right_edge {
+        return Some(m_max);
+    }
+    let mut m_balanced = m_max;
+    for m in m_lo..=m_hi {
+        if 2 * leftpayload(m) >= payload {
+            m_balanced = m;
+            break;
+        }
+    }
+    Some(m_balanced.min(m_max).max(m_min))
+}
+
+/// Build a leaf from its parts; if its payload overflows `cap`, split it 2-way **copy-up**
+/// (format.md "Leaf split"): the left leaf keeps records `[0, m)`, the right leaf `[m, N)`, and
+/// the separator handed up is a **copy of `keys[m]`** (the right leaf's first key). `edited` is
+/// the index of the just-inserted/replaced record (`None` for the delete path's merge-overflow,
+/// which splits balanced). A leaf with a single over-cap record is left whole (defensive — the
+/// oversize surfaces as `0A000` when serialized).
+fn build_leaf(
+    keys: Vec<Vec<u8>>,
+    vals: Vec<Row>,
+    weights: Vec<u32>,
+    cap: usize,
+    shape: LeafShape,
+    edited: Option<usize>,
+) -> Ins {
+    let n = keys.len();
+    let payload: usize =
+        weights.iter().map(|&w| w as usize).sum::<usize>() + leaf_overhead(n, shape);
+    if payload <= cap || n < 2 {
+        return Ins::Whole(Node::new_leaf(keys, vals, weights));
+    }
+    let prefix: Vec<usize> = std::iter::once(0)
+        .chain(weights.iter().scan(0usize, |acc, &w| {
+            *acc += w as usize;
+            Some(*acc)
+        }))
+        .collect();
+    let total = prefix[n];
+    let leftpayload = |m: usize| prefix[m] + leaf_overhead(m, shape);
+    let rightpayload = |m: usize| (total - prefix[m]) + leaf_overhead(n - m, shape);
+    let right_edge = edited == Some(n - 1);
+    let m = match split_point(1, n - 1, payload, cap, right_edge, leftpayload, rightpayload) {
+        Some(m) => m,
+        // Unreachable under the RECORD_MAX cap (a two-record leaf always fits — format.md "Why
+        // the record cap"); defensively leave the node whole (0A000 at serialize).
+        None => return Ins::Whole(Node::new_leaf(keys, vals, weights)),
+    };
+
+    let mut keys = keys;
+    let mut vals = vals;
+    let mut weights = weights;
+    let rkeys = keys.split_off(m);
+    let rvals = vals.split_off(m);
+    let rweights = weights.split_off(m);
+    let sep = rkeys[0].clone();
+    Ins::Split {
+        left: Node::new_leaf(keys, vals, weights),
+        sep,
+        right: Node::new_leaf(rkeys, rvals, rweights),
+    }
+}
+
+/// Build an interior node from its parts; if its payload overflows `cap`, split it 2-way
+/// **push-up** (format.md "Interior split"): the left node keeps separators `[0, m)` + children
+/// `[0, m]`, separator `m` moves up, the right node keeps `[m+1, N)` + children `[m+1, N]`. With
+/// `N = 2` (only reachable with near-cap separators) the split is pinned to `m = 1`, producing a
+/// legal `N = 0` right interior (the degenerate fan-out contract). Returns `None` when the node
+/// overflows and no valid split point exists — the caller (only the interior **merge** path can
+/// hit it) abandons the merge.
+fn build_interior(
+    keys: Vec<Vec<u8>>,
+    children: Vec<Child>,
+    cap: usize,
+    edited: Option<usize>,
+) -> Option<Ins> {
+    let n = keys.len();
+    let payload = 8 * n + 4 + keys.iter().map(Vec::len).sum::<usize>();
+    if payload <= cap || n < 2 {
+        return Some(Ins::Whole(Node::new_interior(keys, children)));
+    }
+    let m = if n == 2 {
+        // The degenerate pin (format.md "Interior split"): the left keeps sep[0] (fits, by the
+        // minimum-fanout invariant), sep[1] moves up, the right is the legal N = 0 interior.
+        1
+    } else {
+        let prefix: Vec<usize> = std::iter::once(0)
+            .chain(keys.iter().scan(0usize, |acc, k| {
+                *acc += k.len();
+                Some(*acc)
+            }))
+            .collect();
+        let total = prefix[n];
+        let leftpayload = |m: usize| 8 * m + 4 + prefix[m];
+        let rightpayload = |m: usize| 8 * (n - 1 - m) + 4 + (total - prefix[m + 1]);
+        let right_edge = edited == Some(n - 1);
+        split_point(1, n - 2, payload, cap, right_edge, leftpayload, rightpayload)?
+    };
+
+    let mut keys = keys;
+    let mut children = children;
+    let rkeys = keys.split_off(m + 1);
+    let sep = keys.pop().expect("split point m ≥ 1 leaves a separator");
+    let rchildren = children.split_off(m + 1);
+    Some(Ins::Split {
+        left: Node::new_interior(keys, children),
+        sep,
+        right: Node::new_interior(rkeys, rchildren),
+    })
 }
 
 /// A persistent ordered map from encoded key to [`Row`]. `Clone` is O(1) (an `Arc` bump on the root
@@ -297,7 +487,7 @@ pub struct PMap {
 }
 
 /// A contiguous range of encoded keys — the form a primary-key predicate pushes down to a bounded
-/// B-tree scan (spec/design/cost.md §3 "bounded scan / point lookup", encoding.md). `lo`/`hi` are
+/// B+tree scan (spec/design/cost.md §3 "bounded scan / point lookup", encoding.md). `lo`/`hi` are
 /// encoded key bytes; `None` is open on that side (−∞ / +∞), and the `_inc` flags say whether the
 /// endpoint key itself is included. Because the key encoding is order-preserving (`[u8]::cmp` = value
 /// order), a byte range is a value range. A bounded scan visits exactly the nodes whose key span
@@ -318,18 +508,15 @@ impl KeyBound {
         KeyBound::default()
     }
 
-    /// The contiguous window `[first ..= last]` of `node`'s child indices whose separator span can
-    /// overlap the bound — child `i` spans the OPEN interval `(keys[i-1], keys[i])`, so it is pruned
-    /// iff `keys[i] ≤ lo` (entirely at/below lo) or `keys[i-1] ≥ hi` (entirely at/above hi). The keys
-    /// are sorted, so the surviving children are contiguous and both edges binary-search:
-    /// `first` = the first child not below lo, `last` = the last child not above hi. The strict
-    /// comparisons are exact regardless of endpoint inclusivity — the separators are entries in this
-    /// node (covered by [`entry_window`]), never in a child. The node's own outer brackets need no
-    /// test: the parent descended here only because this subtree overlaps. `range_entries` (descends)
-    /// and `overlap_node_count` (counts) window identically, so they visit the SAME node set — the §8
-    /// determinism the `page_read` cost depends on — decided from resident separators WITHOUT
-    /// faulting an OnDisk leaf. A bound admitting only a separator entry in this node yields
-    /// `first > last` (every child pruned): an empty child window, still a valid entry window.
+    /// The contiguous window `[first ..= last]` of an **interior** node's child indices whose key
+    /// span can overlap the bound. Child `i` spans `[sep[i−1], sep[i])` (v24 — a key equal to a
+    /// separator lies right), so child `i` is pruned iff `sep[i] ≤ lo` (entirely at/below lo) or
+    /// `sep[i−1]` is at/above hi — `> hi` for an inclusive hi (a child whose low separator equals
+    /// `hi` can still hold `hi` itself), `≥ hi` for an exclusive one. The separators are sorted, so
+    /// the surviving children are contiguous and both edges binary-search. `range_entries`
+    /// (descends) and `overlap_node_count` (counts) window identically, so they visit the SAME node
+    /// set — the §8 determinism the `page_read` cost depends on — decided from resident separators
+    /// WITHOUT faulting an OnDisk leaf.
     fn child_window(&self, node: &Node) -> (usize, usize) {
         let first = match &self.lo {
             None => 0,
@@ -337,15 +524,15 @@ impl KeyBound {
         };
         let last = match &self.hi {
             None => node.keys.len(),
+            Some(hi) if self.hi_inc => node.keys.partition_point(|k| k.as_slice() <= hi.as_slice()),
             Some(hi) => node.keys.partition_point(|k| k.as_slice() < hi.as_slice()),
         };
-        (first, last)
+        (first, last.max(first))
     }
 
-    /// The contiguous half-open window `[first .. last)` of `node`'s own entry indices whose keys lie
-    /// within the bound — the binary-searched equivalent of testing `contains` per key, honoring the
-    /// endpoint inclusivity flags. On a leaf this is the admitted row range; on an interior node it is
-    /// the admitted separator entries (a B-tree stores records in interior nodes too).
+    /// The contiguous half-open window `[first .. last)` of a **leaf**'s record indices whose keys
+    /// lie within the bound — the binary-searched equivalent of testing `contains` per key,
+    /// honoring the endpoint inclusivity flags.
     fn entry_window(&self, node: &Node) -> (usize, usize) {
         let first = match &self.lo {
             None => 0,
@@ -384,57 +571,46 @@ impl PMap {
         PMap { root, len }
     }
 
-    /// Look up the row at `key`, or `None`. Returns an **owned** row: under demand paging (P6.4b)
-    /// the leaf holding it may live only in the buffer pool, not the resident tree, so a borrow
-    /// could not outlive the pool lock — the read path clones the row out (spec/design/pager.md §4).
-    /// `src` faults an `OnDisk` leaf on the descent (`None` for a fully-resident in-memory tree).
+    /// Look up the row at `key`, or `None` — a root→leaf descent (interior nodes only route, v24).
+    /// Returns an **owned** row: under demand paging (P6.4b) the leaf holding it may live only in
+    /// the buffer pool, not the resident tree, so a borrow could not outlive the pool lock — the
+    /// read path clones the row out (spec/design/pager.md §4). `src` faults an `OnDisk` leaf on the
+    /// descent (`None` for a fully-resident in-memory tree).
     pub(crate) fn get(&self, key: &[u8], src: Option<&dyn LeafSource>) -> Result<Option<Row>> {
         // Hold an owned `Arc` to the current node so a faulted leaf outlives the step that reads it.
         let mut cur = match &self.root {
             None => return Ok(None),
             Some(root) => root.clone(),
         };
-        loop {
-            match cur.search(key) {
-                Ok(i) => return Ok(Some(cur.row_at(i)?)),
-                Err(i) => {
-                    if cur.is_leaf() {
-                        return Ok(None);
-                    }
-                    cur = child(&cur, i, src)?;
-                }
-            }
+        while !cur.is_leaf() {
+            cur = child(&cur, cur.child_slot(key), src)?;
+        }
+        match cur.search(key) {
+            Ok(i) => Ok(Some(cur.row_at(i)?)),
+            Err(_) => Ok(None),
         }
     }
 
     /// Insert or overwrite `key` with `val` (whose on-disk record size is `weight`); `cap` is the
-    /// page payload capacity. Returns the previous row if `key` was present (an overwrite), else
-    /// `None` (a new insert, which grows `len`). An overwrite can change the weight, so it too may
-    /// overflow and split.
+    /// page payload capacity and `shape` the leaf's column-class shape. Returns the previous row if
+    /// `key` was present (an overwrite), else `None` (a new insert, which grows `len`). An
+    /// overwrite can change the weight, so it too may overflow and split.
     pub(crate) fn insert(
         &mut self,
         key: Vec<u8>,
         val: Row,
         weight: u32,
         cap: usize,
-        k: usize,
+        shape: LeafShape,
         src: Option<&dyn LeafSource>,
     ) -> Result<Option<Row>> {
         let mut old = None;
         let new_root = match &self.root {
-            None => Node::new(vec![key], vec![val], vec![weight], Vec::new()),
-            Some(root) => match node_insert(root, key, val, weight, &mut old, src, cap, k)? {
+            None => Node::new_leaf(vec![key], vec![val], vec![weight]),
+            Some(root) => match node_insert(root, key, val, weight, &mut old, src, cap, shape)? {
                 Ins::Whole(n) => n,
-                Ins::Split {
-                    left,
-                    key,
-                    val,
-                    weight,
-                    right,
-                } => Node::new(
-                    vec![key],
-                    vec![val],
-                    vec![weight],
+                Ins::Split { left, sep, right } => Node::new_interior(
+                    vec![sep],
                     vec![Child::Resident(left), Child::Resident(right)],
                 ),
             },
@@ -452,24 +628,24 @@ impl PMap {
         &mut self,
         key: &[u8],
         cap: usize,
-        k: usize,
+        shape: LeafShape,
         src: Option<&dyn LeafSource>,
     ) -> Result<Option<Row>> {
         let root = match self.root.as_ref() {
             None => return Ok(None),
             Some(r) => r.clone(),
         };
-        let (new_root, removed) = node_remove(&root, key, src, cap, k)?;
+        let (new_root, removed) = node_remove(&root, key, src, cap, shape)?;
         if removed.is_some() {
-            // The root may have drained to zero keys: an empty leaf becomes the empty map; an empty
-            // internal node (one child) hands the root down a level (height shrinks). The root is
-            // exempt from the underfull rule, so no rebalance here.
+            // The root may have drained: an empty leaf becomes the empty map; a 0-key interior
+            // root hands the root down a level (height shrinks). The root is exempt from the
+            // underfull rule, so no rebalance here.
             self.root = if new_root.keys.is_empty() {
                 if new_root.is_leaf() {
                     None
                 } else {
-                    // The lone surviving child becomes the new root — fault it if it is an OnDisk leaf
-                    // (a tree of height 2 can collapse to its single bottom child).
+                    // The lone surviving child becomes the new root — fault it if it is an OnDisk
+                    // leaf (a tree of height 2 can collapse to its single bottom child).
                     Some(child(&new_root, 0, src)?)
                 }
             } else {
@@ -480,7 +656,7 @@ impl PMap {
         Ok(removed)
     }
 
-    /// The number of B-tree nodes (pages) in this tree — the `page_read` count a full scan
+    /// The number of B+tree nodes (pages) in this tree — the `page_read` count a full scan
     /// charges (spec/design/cost.md §3 "page_read"). A scan walks every node, so this is the
     /// structural node count (interior + leaf); `0` for an empty map. Deterministic and
     /// byte-identical across cores (the node boundaries are a §8 byte contract — format.md).
@@ -502,11 +678,11 @@ impl PMap {
         self.root.as_deref().map(count).unwrap_or(0)
     }
 
-    /// Total on-disk record bytes stored in this tree — the sum of every entry's `weight` over every
-    /// node (this is a B-tree: records live in interior nodes too, not only leaves). The deterministic,
-    /// cross-core-identical measure of a temp table's storage footprint (spec/design/temp-tables.md §7;
-    /// `weight` is `format::record_size`, the byte-identical on-disk encoding size — §8). The tree is
-    /// fully resident for a temp store (temp data never pages), so this never faults; an `OnDisk` child
+    /// Total on-disk record bytes stored in this tree — the sum of every leaf entry's `weight`
+    /// (records live only in leaves, v24). The deterministic, cross-core-identical measure of a
+    /// temp table's storage footprint (spec/design/temp-tables.md §7; `weight` is
+    /// `format::record_size`, the byte-identical on-disk encoding size — §8). The tree is fully
+    /// resident for a temp store (temp data never pages), so this never faults; an `OnDisk` child
     /// would contribute 0 (defensive — temp stores have none).
     pub(crate) fn resident_record_bytes(&self) -> u64 {
         fn walk(node: &Node) -> u64 {
@@ -552,7 +728,7 @@ impl PMap {
         Ok(self.range_entries_counted(b, src, None)?.0)
     }
 
-    /// [`range_entries`](PMap::range_entries) plus the number of B-tree nodes the bounded traversal
+    /// [`range_entries`](PMap::range_entries) plus the number of B+tree nodes the bounded traversal
     /// visits — the `page_read` count [`overlap_node_count`](PMap::overlap_node_count) would return,
     /// observed during the ONE windowed walk instead of a second counting descent (the visited sets
     /// are identical by construction: both window with [`KeyBound::child_window`]).
@@ -574,12 +750,11 @@ impl PMap {
     /// (`cols[c]` of length `row_count` for each selected `c`, empty otherwise), never building a
     /// full-width [`Row`] — the A2/A3 columnar-gather feed (packed-leaf.md §11 Track A2, the allocation
     /// dividend A1 leaves on the table). It mirrors [`range_entries_counted`]'s traversal EXACTLY (same
-    /// node visits ⇒ the same `page_read` count; same in-order entry sequence, interior separators
-    /// included as a B-tree stores records there too), but reads each admitted row's selected columns via
-    /// [`Node::col_at`] — an O(1) PAX column span on a Packed leaf, `vals[i][c]` on a Decoded node — so a
-    /// wide-table single-column scan never materializes the untouched columns NOR a full-width row. Each
-    /// `cols[c]` is in scan order, so it equals the column-`c` stride of the row feed. Returns
-    /// `(cols, row_count, nodes)`.
+    /// node visits ⇒ the same `page_read` count; same in-order record sequence — leaf-only, v24), but
+    /// reads each admitted row's selected columns via [`Node::col_at`] — an O(1) PAX column span on a
+    /// Packed leaf, `vals[i][c]` on a Decoded leaf — so a wide-table single-column scan never
+    /// materializes the untouched columns NOR a full-width row. Each `cols[c]` is in scan order, so it
+    /// equals the column-`c` stride of the row feed. Returns `(cols, row_count, nodes)`.
     pub(crate) fn columnar_scan(
         &self,
         b: &KeyBound,
@@ -596,10 +771,10 @@ impl PMap {
     }
 
     /// The fold-during-walk twin of [`columnar_scan`](PMap::columnar_scan) (packed-leaf.md §11): the
-    /// same windowed, interior-separator-inclusive walk (identical visited-node set → identical
-    /// `page_read`), but calls `visit(node, i)` per admitted entry — which reads only the row's touched
-    /// columns via [`Node::col_at`] and folds them straight into an accumulator — instead of gathering
-    /// a per-column lane. So a whole-table / single-int-key aggregate is O(1) memory, never O(rows).
+    /// same windowed walk (identical visited-node set → identical `page_read`), but calls
+    /// `visit(node, i)` per admitted leaf record — which reads only the row's touched columns via
+    /// [`Node::col_at`] and folds them straight into an accumulator — instead of gathering a
+    /// per-column lane. So a whole-table / single-int-key aggregate is O(1) memory, never O(rows).
     /// Returns `(row_count, node_count)`, identical to `columnar_scan`, so the caller charges the same
     /// `page_read` / `storage_row_read`.
     pub(crate) fn fold_scan(
@@ -616,7 +791,7 @@ impl PMap {
         Ok((row_count, nodes))
     }
 
-    /// The number of B-tree nodes a bounded scan over `b` visits — the `page_read` it charges
+    /// The number of B+tree nodes a bounded scan over `b` visits — the `page_read` it charges
     /// (cost.md §3). Mirrors `range_entries`' traversal exactly (same `child_window` prune, root
     /// always visited), counting an `OnDisk` leaf as one node WITHOUT faulting it (pager.md §5). The
     /// unbounded bound returns `node_count()`, so a full scan's cost is unchanged.
@@ -678,7 +853,7 @@ impl PMap {
     /// A **pull** cursor over the `(key, row)` pairs within `b`, in ascending (`reverse = false`) or
     /// descending (`reverse = true`) key order — the pull-model equivalent of
     /// [`scan_range`](PMap::scan_range) / [`scan_range_rev`](PMap::scan_range_rev) (the S2 pull
-    /// B-tree scan cursor, spec/design/streaming.md §3/§5). It owns the moved `b` and the `Arc<Node>`
+    /// B+tree scan cursor, spec/design/streaming.md §3/§5). It owns the moved `b` and the `Arc<Node>`
     /// frames it descends into, so it borrows nothing and is `'static` — the leaf source is supplied
     /// **per [`next`](RangeCursor::next) call** (rebuilt cheaply by the caller from its own paging
     /// context, storage.rs), which lets a streaming cursor own its snapshot and outlive the handle
@@ -703,59 +878,39 @@ impl PMap {
     }
 }
 
-/// One node on a [`RangeCursor`]'s explicit traversal stack: the node, its bound windows, and the
-/// half-open span `[lo, hi)` of *interleaved positions* still to process. A leaf's positions are its
-/// in-bound key indices `[ef, el)` directly. An interior node's positions run `[0, 2·nkeys + 1)`,
-/// where an **even** `p` is child `p/2` (descended iff `cf ≤ p/2 ≤ cl`) and an **odd** `p` is
-/// separator key `p/2` (emitted iff `ef ≤ p/2 < el`). This single interleaved sequence reproduces
-/// `scan_range`'s order — including the asymmetric inclusive-`lo` separator (`ef = cf − 1`, whose
-/// odd position `2·ef + 1 = 2·cf − 1` falls just before child `cf`) — and reverses cleanly by
-/// consuming `[lo, hi)` from the back, with no separate forward/reverse logic.
+/// One node on a [`RangeCursor`]'s explicit traversal stack: the node and the half-open span
+/// `[lo, hi)` of positions still to process. A **leaf**'s positions are its in-bound record
+/// indices (its entry window). An **interior** node's positions are its overlapping child indices
+/// (its child window) — interior nodes emit nothing (records are leaf-only, v24), so the frame
+/// only descends. Reversal consumes `[lo, hi)` from the back, with no separate forward/reverse
+/// logic.
 struct ScanFrame {
     node: Arc<Node>,
     is_leaf: bool,
-    ef: usize,
-    el: usize,
-    cf: usize,
-    cl: usize,
     lo: usize,
     hi: usize,
 }
 
 impl ScanFrame {
     fn new(node: Arc<Node>, b: &KeyBound) -> ScanFrame {
-        let (ef, el) = b.entry_window(&node);
-        if node.is_leaf() {
-            ScanFrame {
-                node,
-                is_leaf: true,
-                ef,
-                el,
-                cf: 0,
-                cl: 0,
-                lo: ef,
-                hi: el,
-            }
+        let (lo, hi) = if node.is_leaf() {
+            b.entry_window(&node)
         } else {
             let (cf, cl) = b.child_window(&node);
-            let hi = 2 * node.keys.len() + 1;
-            ScanFrame {
-                node,
-                is_leaf: false,
-                ef,
-                el,
-                cf,
-                cl,
-                lo: 0,
-                hi,
-            }
+            (cf, cl + 1)
+        };
+        ScanFrame {
+            is_leaf: node.is_leaf(),
+            node,
+            lo,
+            hi,
         }
     }
 }
 
 /// A **pull** (stateful) cursor over a [`PMap`]'s `(key, row)` pairs within a [`KeyBound`] — the
 /// pull-model equivalent of [`PMap::scan_range`] (spec/design/streaming.md §3/§5, the S2 pull
-/// B-tree scan cursor). Where `scan_range` *pushes* each row to a `visit` callback and owns the
+/// B+tree scan cursor). Where `scan_range` *pushes* each row to a `visit` callback and owns the
 /// control flow, this cursor lets the **caller** own it: each [`next`](RangeCursor::next) yields the
 /// next in-bound pair, advancing an explicit frame stack over the persistent map. That is the
 /// VDBE-forward shape (streaming.md §3): a stateful `OP_Next`/`OP_Rewind`-style cursor a future
@@ -779,27 +934,21 @@ pub(crate) struct RangeCursor {
 
 impl RangeCursor {
     /// The next in-bound `(key, row)` pair, or `None` when the traversal is exhausted. Each call
-    /// advances the frame stack until it emits a row, descends into (and faults `src`) a child, or
-    /// pops an exhausted frame. `src` is supplied per call (rebuilt cheaply by the caller) so the
+    /// advances the frame stack until it emits a leaf row, descends into (and faults `src`) a child,
+    /// or pops an exhausted frame. `src` is supplied per call (rebuilt cheaply by the caller) so the
     /// cursor itself borrows nothing — see [`RangeCursor`].
     pub(crate) fn next(&mut self, src: Option<&dyn LeafSource>) -> Result<Option<(Vec<u8>, Row)>> {
-        enum Step {
-            Emit(Vec<u8>, Row),
-            Descend(usize),
-            Pop,
-        }
         let reverse = self.reverse;
         let recon = self.recon.as_deref();
         loop {
-            // Decide the next step from the top frame in a scoped borrow, so the descend/pop arms
-            // can re-borrow `self.stack` to fault + push or to pop.
-            let step = {
+            let (emit, descend) = {
                 let frame = match self.stack.last_mut() {
                     Some(f) => f,
                     None => return Ok(None),
                 };
-                let mut step = Step::Pop;
-                while frame.lo < frame.hi {
+                if frame.lo >= frame.hi {
+                    (None, None)
+                } else {
                     let p = if reverse {
                         frame.hi -= 1;
                         frame.hi
@@ -809,40 +958,26 @@ impl RangeCursor {
                         x
                     };
                     if frame.is_leaf {
-                        // A leaf's positions are its in-bound key indices [ef, el) directly.
-                        step = Step::Emit(
-                            frame.node.keys[p].clone(),
-                            frame.node.row_at_maybe_masked(p, recon)?,
-                        );
-                        break;
-                    }
-                    if p & 1 == 0 {
-                        let i = p / 2;
-                        if frame.cf <= i && i <= frame.cl {
-                            step = Step::Descend(i);
-                            break;
-                        }
+                        (
+                            Some((
+                                frame.node.keys[p].clone(),
+                                frame.node.row_at_maybe_masked(p, recon)?,
+                            )),
+                            None,
+                        )
                     } else {
-                        let j = p / 2;
-                        if frame.ef <= j && j < frame.el {
-                            step = Step::Emit(
-                                frame.node.keys[j].clone(),
-                                frame.node.row_at_maybe_masked(j, recon)?,
-                            );
-                            break;
-                        }
+                        (None, Some(p))
                     }
                 }
-                step
             };
-            match step {
-                Step::Emit(k, v) => return Ok(Some((k, v))),
-                Step::Descend(i) => {
+            match (emit, descend) {
+                (Some(pair), _) => return Ok(Some(pair)),
+                (None, Some(i)) => {
                     let parent = self.stack.last().expect("top frame present for descend");
                     let ch = child(&parent.node, i, src)?;
                     self.stack.push(ScanFrame::new(ch, &self.bound));
                 }
-                Step::Pop => {
+                (None, None) => {
                     self.stack.pop();
                 }
             }
@@ -850,96 +985,11 @@ impl RangeCursor {
     }
 }
 
-/// Build a node from its parts; if its payload overflows `cap`, split it 2-way and promote one
-/// median (format.md "Split point"). `right_edge` says the just-edited record (the
-/// inserted/replaced one, or the separator a child split promoted) is the node's LAST: then the
-/// split is the append rule `m = min(m_append, N-2)` with `m_append` = largest m in [1,N-1] with
-/// leftpayload(m) ≤ cap — sequential ascending loads pack left nodes ~full. Anywhere else (and the
-/// delete path's merge-overflow, which has no edited position) splits BALANCED:
-/// `m = min(m_balanced, m_append, N-2)` with `m_balanced` = smallest m with
-/// 2·leftpayload(m) ≥ payload — without it, largest-left degenerates to [N-2 | 1] splinters and
-/// random-order inserts converge on a few-percent fill (benchmarks.md finding). Either `m` yields
-/// two non-empty, fitting halves under the `RECORD_MAX = (cap-12)/2` cap (format.md "Why the
-/// record cap"). `children` empty ⇒ leaf.
-fn build(
-    keys: Vec<Vec<u8>>,
-    vals: Vec<Row>,
-    weights: Vec<u32>,
-    children: Vec<Child>,
-    cap: usize,
-    k: usize,
-    right_edge: bool,
-) -> Ins {
-    let interior = !children.is_empty();
-    let payload: usize = weights.iter().map(|&w| w as usize).sum::<usize>()
-        + if interior {
-            4 * children.len()
-        } else {
-            crate::format::directory_overhead(keys.len(), k)
-        };
-    // Under `RECORD_MAX = (cap-12)/2` a node with ≤ 2 keys never overflows (format.md), so a node
-    // that overflows here always has ≥ 3 keys and splits cleanly. The `< 3` guard is purely
-    // defensive against an oversized record (one larger than `RECORD_MAX`): it leaves the node
-    // whole rather than splitting an unsplittable one — the oversize is then surfaced as `0A000`
-    // when the node is serialized (format.rs), matching the v1 behaviour.
-    if payload <= cap || keys.len() < 3 {
-        return Ins::Whole(Node::new(keys, vals, weights, children));
-    }
-
-    let n = keys.len();
-    // m_append = largest m in [1, n-1] with leftpayload(m) ≤ cap;
-    // m_balanced = smallest m in [1, n-1] with 2·leftpayload(m) ≥ payload.
-    let mut best = 1usize;
-    let mut balanced = 0usize;
-    let mut prefix = 0usize;
-    for m in 1..n {
-        prefix += weights[m - 1] as usize;
-        let lp = if interior {
-            4 * (m + 1)
-        } else {
-            crate::format::directory_overhead(m, k)
-        } + prefix;
-        if lp <= cap {
-            best = m;
-        }
-        if balanced == 0 && 2 * lp >= payload {
-            balanced = m;
-        }
-    }
-    if !right_edge && balanced != 0 && balanced < best {
-        best = balanced;
-    }
-    let m = best.min(n - 2).max(1);
-
-    let mut keys = keys;
-    let mut vals = vals;
-    let mut weights = weights;
-    let mut children = children;
-    let rkeys = keys.split_off(m + 1);
-    let mkey = keys.pop().unwrap();
-    let rvals = vals.split_off(m + 1);
-    let mval = vals.pop().unwrap();
-    let rweights = weights.split_off(m + 1);
-    let mweight = weights.pop().unwrap();
-    let (lchildren, rchildren) = if interior {
-        let rc = children.split_off(m + 1);
-        (children, rc)
-    } else {
-        (Vec::new(), Vec::new())
-    };
-
-    Ins::Split {
-        left: Node::new(keys, vals, weights, lchildren),
-        key: mkey,
-        val: mval,
-        weight: mweight,
-        right: Node::new(rkeys, rvals, rweights, rchildren),
-    }
-}
-
-/// Recursive insert. On overwrite, sets `*old` and rebuilds with the value+weight replaced (which
-/// may now overflow). On a new key, inserts into the target leaf and splits overflowing nodes back
-/// up the path.
+/// Recursive insert. Descends to the holding leaf (interior nodes route via
+/// [`Node::child_slot`]); on overwrite, sets `*old` and rebuilds with the value+weight replaced
+/// (which may now overflow). Splits propagate back up: a leaf split copies its boundary key up, an
+/// interior receiving a separator may push-split in turn.
+#[allow(clippy::too_many_arguments)]
 fn node_insert(
     node: &Arc<Node>,
     key: Vec<u8>,
@@ -948,170 +998,96 @@ fn node_insert(
     old: &mut Option<Row>,
     src: Option<&dyn LeafSource>,
     cap: usize,
-    k: usize,
+    shape: LeafShape,
 ) -> Result<Ins> {
-    match node.search(&key) {
-        Ok(i) => {
-            let mut vals = node.decoded_rows()?;
-            *old = Some(std::mem::replace(&mut vals[i], val));
-            let mut weights = node.weights.clone();
-            weights[i] = weight;
-            Ok(build(
-                node.keys.clone(),
-                vals,
-                weights,
-                node.children.clone(),
-                cap,
-                k,
-                i == node.keys.len() - 1,
-            ))
-        }
-        Err(i) => {
-            if node.is_leaf() {
+    if node.is_leaf() {
+        let (i, edited_keys, mut vals, mut weights) = match node.search(&key) {
+            Ok(i) => {
+                let mut vals = node.decoded_rows()?;
+                *old = Some(std::mem::replace(&mut vals[i], val));
+                let mut weights = node.weights.clone();
+                weights[i] = weight;
+                (i, node.keys.clone(), vals, weights)
+            }
+            Err(i) => {
                 let mut keys = node.keys.clone();
                 let mut vals = node.decoded_rows()?;
                 let mut weights = node.weights.clone();
                 keys.insert(i, key);
                 vals.insert(i, val);
                 weights.insert(i, weight);
-                Ok(build(
-                    keys,
-                    vals,
-                    weights,
-                    Vec::new(),
-                    cap,
-                    k,
-                    i == node.keys.len(),
-                ))
-            } else {
-                // Fault the target child (a `Resident` interior, or an `OnDisk` leaf brought in for
-                // mutation — it becomes a dirty resident node on the rebuilt path).
-                let c = child(node, i, src)?;
-                match node_insert(&c, key, val, weight, old, src, cap, k)? {
-                    Ins::Whole(c) => {
-                        // This node's separators are unchanged, so it cannot overflow — rebuild whole.
-                        let mut children = node.children.clone();
-                        children[i] = Child::Resident(c);
-                        Ok(Ins::Whole(Node::new(
-                            node.keys.clone(),
-                            node.decoded_rows()?,
-                            node.weights.clone(),
-                            children,
-                        )))
-                    }
-                    Ins::Split {
-                        left,
-                        key: mk,
-                        val: mv,
-                        weight: mw,
-                        right,
-                    } => {
-                        let mut keys = node.keys.clone();
-                        let mut vals = node.decoded_rows()?;
-                        let mut weights = node.weights.clone();
-                        let mut children = node.children.clone();
-                        keys.insert(i, mk);
-                        vals.insert(i, mv);
-                        weights.insert(i, mw);
-                        children[i] = Child::Resident(left);
-                        children.insert(i + 1, Child::Resident(right));
-                        Ok(build(
-                            keys,
-                            vals,
-                            weights,
-                            children,
-                            cap,
-                            k,
-                            i == node.keys.len(),
-                        ))
-                    }
-                }
+                (i, keys, vals, weights)
             }
+        };
+        let _ = &mut vals;
+        let _ = &mut weights;
+        return Ok(build_leaf(edited_keys, vals, weights, cap, shape, Some(i)));
+    }
+    // Fault the target child (a `Resident` interior, or an `OnDisk` leaf brought in for
+    // mutation — it becomes a dirty resident node on the rebuilt path).
+    let i = node.child_slot(&key);
+    let c = child(node, i, src)?;
+    match node_insert(&c, key, val, weight, old, src, cap, shape)? {
+        Ins::Whole(c) => {
+            // This node's separators are unchanged, so it cannot overflow — rebuild whole.
+            let mut children = node.children.clone();
+            children[i] = Child::Resident(c);
+            Ok(Ins::Whole(Node::new_interior(node.keys.clone(), children)))
+        }
+        Ins::Split { left, sep, right } => {
+            let mut keys = node.keys.clone();
+            let mut children = node.children.clone();
+            keys.insert(i, sep);
+            children[i] = Child::Resident(left);
+            children.insert(i + 1, Child::Resident(right));
+            let edited = Some(i);
+            Ok(build_interior(keys, children, cap, edited)
+                .expect("insert-path interior split always has a valid split point"))
         }
     }
 }
 
 /// A non-root node is **underfull** when its payload is below half a page (`cap/2`), the threshold
 /// at which delete rebalances it (format.md "Delete"). The root is exempt.
-fn underfull(node: &Node, cap: usize, k: usize) -> bool {
-    node.payload(k) < cap / 2
+fn underfull(node: &Node, cap: usize, shape: LeafShape) -> bool {
+    node.payload(shape) < cap / 2
 }
 
-/// The rightmost `(key, val, weight)` of a subtree — its in-order predecessor entry. Holds an owned
-/// `Arc` as it descends so a faulted rightmost leaf stays alive while it is read.
-fn max_kv(node: &Arc<Node>, src: Option<&dyn LeafSource>) -> Result<(Vec<u8>, Row, u32)> {
-    let mut n = node.clone();
-    while !n.is_leaf() {
-        let last = n.children.len() - 1;
-        n = child(&n, last, src)?;
-    }
-    Ok((
-        n.keys.last().unwrap().clone(),
-        n.row_at(n.keys.len() - 1)?,
-        *n.weights.last().unwrap(),
-    ))
-}
-
-/// Recursive delete (copy-on-write). Returns the rebuilt subtree (possibly underfull — the caller
-/// rebalances it) and the removed row (or `None` if absent). A separator found in an interior node
-/// is replaced by its in-order **predecessor** (drawn from the left subtree), which is then deleted
-/// from that subtree; the touched child is rebalanced via [`rebalance_child`].
+/// Recursive delete (copy-on-write). Descends to the holding **leaf** (a separator equal to the
+/// key routes right and is never itself deleted — separators may go stale, format.md "Delete").
+/// Returns the rebuilt subtree (possibly underfull — the caller rebalances it) and the removed row
+/// (or `None` if absent). The touched child is rebalanced via [`rebalance_child`].
 fn node_remove(
     node: &Arc<Node>,
     key: &[u8],
     src: Option<&dyn LeafSource>,
     cap: usize,
-    k: usize,
+    shape: LeafShape,
 ) -> Result<(Arc<Node>, Option<Row>)> {
-    match node.search(key) {
-        Ok(i) => {
-            if node.is_leaf() {
+    if node.is_leaf() {
+        return match node.search(key) {
+            Ok(i) => {
                 let mut keys = node.keys.clone();
                 let mut vals = node.decoded_rows()?;
                 let mut weights = node.weights.clone();
                 keys.remove(i);
                 let removed = vals.remove(i);
                 weights.remove(i);
-                Ok((Node::new(keys, vals, weights, Vec::new()), Some(removed)))
-            } else {
-                let removed = node.row_at(i)?;
-                // Fault the left subtree once; both the predecessor lookup and its deletion descend it.
-                let left_child = child(node, i, src)?;
-                let (pk, pv, pw) = max_kv(&left_child, src)?;
-                let (new_child, _) = node_remove(&left_child, &pk, src, cap, k)?;
-                let mut keys = node.keys.clone();
-                let mut vals = node.decoded_rows()?;
-                let mut weights = node.weights.clone();
-                let mut children = node.children.clone();
-                keys[i] = pk;
-                vals[i] = pv;
-                weights[i] = pw;
-                children[i] = Child::Resident(new_child);
-                let rebuilt = Node::new(keys, vals, weights, children);
-                Ok((rebalance_child(&rebuilt, i, src, cap, k)?, Some(removed)))
+                Ok((Node::new_leaf(keys, vals, weights), Some(removed)))
             }
-        }
-        Err(i) => {
-            if node.is_leaf() {
-                Ok((node.clone(), None))
-            } else {
-                let c = child(node, i, src)?;
-                let (new_child, removed) = node_remove(&c, key, src, cap, k)?;
-                if removed.is_none() {
-                    return Ok((node.clone(), None));
-                }
-                let mut children = node.children.clone();
-                children[i] = Child::Resident(new_child);
-                let rebuilt = Node::new(
-                    node.keys.clone(),
-                    node.decoded_rows()?,
-                    node.weights.clone(),
-                    children,
-                );
-                Ok((rebalance_child(&rebuilt, i, src, cap, k)?, removed))
-            }
-        }
+            Err(_) => Ok((node.clone(), None)),
+        };
     }
+    let i = node.child_slot(key);
+    let c = child(node, i, src)?;
+    let (new_child, removed) = node_remove(&c, key, src, cap, shape)?;
+    if removed.is_none() {
+        return Ok((node.clone(), None));
+    }
+    let mut children = node.children.clone();
+    children[i] = Child::Resident(new_child);
+    let rebuilt = Node::new_interior(node.keys.clone(), children);
+    Ok((rebalance_child(&rebuilt, i, src, cap, shape)?, removed))
 }
 
 /// If `node.children[i]` is underfull, merge it with an adjacent sibling (prefer the right one),
@@ -1123,10 +1099,15 @@ fn rebalance_child(
     i: usize,
     src: Option<&dyn LeafSource>,
     cap: usize,
-    k: usize,
+    shape: LeafShape,
 ) -> Result<Arc<Node>> {
     // `children[i]` was just rebuilt resident by `node_remove`, so inspecting it faults nothing.
-    if !underfull(node.children[i].resident(), cap, k) {
+    if !underfull(node.children[i].resident(), cap, shape) {
+        return Ok(node.clone());
+    }
+    if node.children.len() < 2 {
+        // A 0-key interior (one child, the degenerate max-separator shape) has no sibling to merge
+        // with — its own parent merges *it* away; the root case collapses in `PMap::remove`.
         return Ok(node.clone());
     }
     let j = if i + 1 < node.children.len() {
@@ -1134,70 +1115,71 @@ fn rebalance_child(
     } else {
         i - 1
     };
-    merge_at(node, j, src, cap, k)
+    merge_at(node, j, src, cap, shape)
 }
 
-/// Merge `children[j]`, separator `j`, and `children[j+1]` into one node `M`. If `M` fits, it
-/// replaces the pair and the parent loses separator `j` and child `j+1`. If `M` overflows, it is
-/// split 2-way and the two halves + the new separator replace the pair (the parent's key count is
-/// unchanged). `M < 2·cap` always (format.md), so a single split restores fit.
+/// Merge `children[j]` and `children[j+1]` into one node `M` (format.md "Delete"): a **leaf**
+/// merge concatenates the two record lists and the parent separator `j` is **removed** (it was a
+/// routing copy — nothing comes down); an **interior** merge **pulls the separator down** between
+/// the two key lists (the merged children need a routing key between them). If `M` fits, it
+/// replaces the pair (the parent loses one key); if it overflows, it is split 2-way by the
+/// balanced rule and the halves + the new separator replace the pair (the parent's key count is
+/// unchanged). An **interior** `M` that overflows but admits no valid split (near-cap separators)
+/// **abandons the merge** — the parent is returned unchanged (format.md "Delete", the deterministic
+/// abandon rule).
 fn merge_at(
     node: &Arc<Node>,
     j: usize,
     src: Option<&dyn LeafSource>,
     cap: usize,
-    k: usize,
+    shape: LeafShape,
 ) -> Result<Arc<Node>> {
     // Fault both children — the underfull child (just rebuilt resident) and its sibling, which may
     // still be an `OnDisk` leaf the delete never touched.
     let left = child(node, j, src)?;
     let right = child(node, j + 1, src)?;
 
-    let mut mkeys = left.keys.clone();
-    let mut mvals = left.decoded_rows()?;
-    let mut mweights = left.weights.clone();
-    mkeys.push(node.keys[j].clone());
-    mvals.push(node.row_at(j)?);
-    mweights.push(node.weights[j]);
-    mkeys.extend(right.keys.iter().cloned());
-    mvals.extend(right.decoded_rows()?);
-    mweights.extend(right.weights.iter().copied());
-    let mut mchildren = left.children.clone();
-    mchildren.extend(right.children.iter().cloned());
+    let merged = if left.is_leaf() {
+        let mut mkeys = left.keys.clone();
+        let mut mvals = left.decoded_rows()?;
+        let mut mweights = left.weights.clone();
+        mkeys.extend(right.keys.iter().cloned());
+        mvals.extend(right.decoded_rows()?);
+        mweights.extend(right.weights.iter().copied());
+        build_leaf(mkeys, mvals, mweights, cap, shape, None)
+    } else {
+        let mut mkeys = left.keys.clone();
+        mkeys.push(node.keys[j].clone());
+        mkeys.extend(right.keys.iter().cloned());
+        let mut mchildren = left.children.clone();
+        mchildren.extend(right.children.iter().cloned());
+        match build_interior(mkeys, mchildren, cap, None) {
+            Some(ins) => ins,
+            // No valid 2-way split point (near-cap separators): abandon the merge — the two
+            // children and the parent separator stay exactly as they were (underfull tolerated).
+            None => return Ok(node.clone()),
+        }
+    };
 
     let mut keys = node.keys.clone();
-    let mut vals = node.decoded_rows()?;
-    let mut weights = node.weights.clone();
     let mut children = node.children.clone();
-
-    // Merge-overflow: balanced split (format.md — no edited position exists here).
-    match build(mkeys, mvals, mweights, mchildren, cap, k, false) {
-        Ins::Whole(merged) => {
+    match merged {
+        Ins::Whole(m) => {
             keys.remove(j);
-            vals.remove(j);
-            weights.remove(j);
-            children[j] = Child::Resident(merged);
+            children[j] = Child::Resident(m);
             children.remove(j + 1);
-            Ok(Node::new(keys, vals, weights, children))
+            Ok(Node::new_interior(keys, children))
         }
-        Ins::Split {
-            left,
-            key,
-            val,
-            weight,
-            right,
-        } => {
-            keys[j] = key;
-            vals[j] = val;
-            weights[j] = weight;
+        Ins::Split { left, sep, right } => {
+            keys[j] = sep;
             children[j] = Child::Resident(left);
             children[j + 1] = Child::Resident(right);
-            Ok(Node::new(keys, vals, weights, children))
+            Ok(Node::new_interior(keys, children))
         }
     }
 }
 
-/// In-order walk: child[0], key[0], child[1], key[1], …, key[n-1], child[n]. Clones each
+/// In-order walk — a leaf walk in key order (records are leaf-only, v24). Clones each
 /// `(key, row)` out (owned) — see [`PMap::iter`] for why the walk does not borrow. Faults each
 /// `OnDisk` leaf through `src`; the faulted `Arc` is dropped as soon as its rows are copied out, so
 /// the resident leaf set stays bounded by the pool, not the tree (pager.md §4).
@@ -1208,24 +1190,19 @@ fn collect(node: &Node, src: Option<&dyn LeafSource>, out: &mut Vec<(Vec<u8>, Ro
         }
         return Ok(());
     }
-    for i in 0..node.keys.len() {
+    for i in 0..node.children.len() {
         let c = child(node, i, src)?;
         collect(&c, src, out)?;
-        out.push((node.keys[i].clone(), node.row_at(i)?));
     }
-    let last = child(node, node.keys.len(), src)?;
-    collect(&last, src, out)?;
     Ok(())
 }
 
 /// The pruned `collect` for a bounded scan: binary-search the child window (the children whose
-/// separator span can overlap the bound — [`KeyBound::child_window`]) and the in-bound entry window
-/// ([`KeyBound::entry_window`]), then walk only those, in order. Mirrors
+/// separator span can overlap the bound — [`KeyBound::child_window`]) and, at each leaf, the
+/// in-bound entry window ([`KeyBound::entry_window`]), then walk only those, in order. Mirrors
 /// [`PMap::overlap_node_count`]'s traversal so the visited-node set — and the `page_read` cost — is
-/// identical. One asymmetric edge: a separator entry equal to an INCLUSIVE `lo` is in bound while
-/// both its adjacent children are pruned, so the entry window can start one slot before the child
-/// window — emitted before the descent loop. `nodes` counts every node the walk enters — the same
-/// total [`PMap::overlap_node_count`] computes, observed for free during the collecting descent.
+/// identical. `nodes` counts every node the walk enters — the same total
+/// [`PMap::overlap_node_count`] computes, observed for free during the collecting descent.
 fn collect_range(
     node: &Node,
     b: &KeyBound,
@@ -1235,30 +1212,24 @@ fn collect_range(
     nodes: &mut usize,
 ) -> Result<()> {
     *nodes += 1;
-    let (ef, el) = b.entry_window(node);
     if node.is_leaf() {
+        let (ef, el) = b.entry_window(node);
         for i in ef..el {
             out.push((node.keys[i].clone(), node.row_at_maybe_masked(i, recon)?));
         }
         return Ok(());
     }
     let (cf, cl) = b.child_window(node);
-    if ef < cf {
-        out.push((node.keys[ef].clone(), node.row_at_maybe_masked(ef, recon)?));
-    }
     for i in cf..=cl {
         let ch = child(node, i, src)?;
         collect_range(&ch, b, src, recon, out, nodes)?;
-        if i >= ef && i < el {
-            out.push((node.keys[i].clone(), node.row_at_maybe_masked(i, recon)?));
-        }
     }
     Ok(())
 }
 
-/// Gather the columns `mask` selects of row `i` into the per-column lanes (the A2 columnar feed's
-/// per-entry step). Reads each selected column via [`Node::col_at`] — an O(1) PAX span on a Packed
-/// leaf — so no full-width row is built. The untouched lanes are left untouched.
+/// Gather the columns `mask` selects of leaf row `i` into the per-column lanes (the A2 columnar
+/// feed's per-entry step). Reads each selected column via [`Node::col_at`] — an O(1) PAX span on a
+/// Packed leaf — so no full-width row is built. The untouched lanes are left untouched.
 fn gather_cols(node: &Node, i: usize, mask: &[bool], cols: &mut [Vec<Value>]) -> Result<()> {
     for (c, &m) in mask.iter().enumerate() {
         if m {
@@ -1268,10 +1239,10 @@ fn gather_cols(node: &Node, i: usize, mask: &[bool], cols: &mut [Vec<Value>]) ->
     Ok(())
 }
 
-/// The columnar twin of [`collect_range`] (packed-leaf.md §11 Track A2): the same windowed,
-/// interior-separator-inclusive walk (so the visited-node set — and the `page_read` cost — is
-/// identical), but gathers each admitted entry's selected columns into `cols` lanes via [`gather_cols`]
-/// instead of pushing a `(key, row)` pair. `row_count` counts the admitted entries.
+/// The columnar twin of [`collect_range`] (packed-leaf.md §11 Track A2): the same windowed walk (so
+/// the visited-node set — and the `page_read` cost — is identical), but gathers each admitted leaf
+/// record's selected columns into `cols` lanes via [`gather_cols`] instead of pushing a
+/// `(key, row)` pair. `row_count` counts the admitted records.
 fn columnar_collect(
     node: &Node,
     b: &KeyBound,
@@ -1282,8 +1253,8 @@ fn columnar_collect(
     nodes: &mut usize,
 ) -> Result<()> {
     *nodes += 1;
-    let (ef, el) = b.entry_window(node);
     if node.is_leaf() {
+        let (ef, el) = b.entry_window(node);
         for i in ef..el {
             gather_cols(node, i, mask, cols)?;
             *row_count += 1;
@@ -1291,26 +1262,18 @@ fn columnar_collect(
         return Ok(());
     }
     let (cf, cl) = b.child_window(node);
-    if ef < cf {
-        gather_cols(node, ef, mask, cols)?;
-        *row_count += 1;
-    }
     for i in cf..=cl {
         let ch = child(node, i, src)?;
         columnar_collect(&ch, b, src, mask, cols, row_count, nodes)?;
-        if i >= ef && i < el {
-            gather_cols(node, i, mask, cols)?;
-            *row_count += 1;
-        }
     }
     Ok(())
 }
 
 /// The fold-during-walk twin of [`columnar_collect`] (packed-leaf.md §11 Track A2): the identical
-/// windowed, interior-separator-inclusive walk (so the visited-node set — and `page_read` — is
-/// identical), but calls `visit(node, i)` per admitted entry instead of gathering its columns into
-/// lanes. `visit` reads the entry's touched columns via [`Node::col_at`]. `row_count` counts admitted
-/// entries; `nodes` counts visited nodes.
+/// windowed walk (so the visited-node set — and `page_read` — is identical), but calls
+/// `visit(node, i)` per admitted leaf record instead of gathering its columns into lanes. `visit`
+/// reads the record's touched columns via [`Node::col_at`]. `row_count` counts admitted records;
+/// `nodes` counts visited nodes.
 fn fold_walk(
     node: &Node,
     b: &KeyBound,
@@ -1320,8 +1283,8 @@ fn fold_walk(
     nodes: &mut usize,
 ) -> Result<()> {
     *nodes += 1;
-    let (ef, el) = b.entry_window(node);
     if node.is_leaf() {
+        let (ef, el) = b.entry_window(node);
         for i in ef..el {
             visit(node, i)?;
             *row_count += 1;
@@ -1329,24 +1292,16 @@ fn fold_walk(
         return Ok(());
     }
     let (cf, cl) = b.child_window(node);
-    if ef < cf {
-        visit(node, ef)?;
-        *row_count += 1;
-    }
     for i in cf..=cl {
         let ch = child(node, i, src)?;
         fold_walk(&ch, b, src, visit, row_count, nodes)?;
-        if i >= ef && i < el {
-            visit(node, i)?;
-            *row_count += 1;
-        }
     }
     Ok(())
 }
 
-/// The early-stoppable, streaming `collect_range`: calls `visit` per in-bound row instead of pushing
-/// to a `Vec`, and stops the whole traversal (returning `Ok(false)`) when `visit` does — without
-/// faulting any leaf past the stop point. Mirrors `collect_range`'s windowed walk.
+/// The early-stoppable, streaming `collect_range`: calls `visit` per in-bound leaf row instead of
+/// pushing to a `Vec`, and stops the whole traversal (returning `Ok(false)`) when `visit` does —
+/// without faulting any leaf past the stop point. Mirrors `collect_range`'s windowed walk.
 fn walk_range_visit(
     node: &Node,
     b: &KeyBound,
@@ -1354,8 +1309,8 @@ fn walk_range_visit(
     recon: Option<&[bool]>,
     visit: &mut dyn FnMut(&[u8], &Row) -> Result<bool>,
 ) -> Result<bool> {
-    let (ef, el) = b.entry_window(node);
     if node.is_leaf() {
+        let (ef, el) = b.entry_window(node);
         for i in ef..el {
             if !node.with_row_maybe_masked(i, recon, |row| visit(&node.keys[i], row))? {
                 return Ok(false);
@@ -1364,31 +1319,19 @@ fn walk_range_visit(
         return Ok(true);
     }
     let (cf, cl) = b.child_window(node);
-    if ef < cf && !node.with_row_maybe_masked(ef, recon, |row| visit(&node.keys[ef], row))? {
-        return Ok(false);
-    }
     for i in cf..=cl {
         let ch = child(node, i, src)?;
         if !walk_range_visit(&ch, b, src, recon, visit)? {
-            return Ok(false);
-        }
-        if i >= ef
-            && i < el
-            && !node.with_row_maybe_masked(i, recon, |row| visit(&node.keys[i], row))?
-        {
             return Ok(false);
         }
     }
     Ok(true)
 }
 
-/// The reverse-order `walk_range_visit`: visits the in-bound entries in **descending** key order,
+/// The reverse-order `walk_range_visit`: visits the in-bound leaf rows in **descending** key order,
 /// the exact reverse of the forward traversal's sequence (so an `ORDER BY pk DESC` is satisfied by
-/// the scan). For an interior node the forward order is `[key[ef] if ef<cf]`, then for `i` in
-/// `cf..=cl`: child[i], `key[i]` (when in the entry window); the reverse walks `i` from `cl` down to
-/// `cf`, emitting the in-window separator BEFORE descending its child, and the asymmetric
-/// inclusive-`lo` separator `key[ef]` (when `ef<cf`) LAST. Stops the whole traversal (returning
-/// `Ok(false)`) when `visit` does, without faulting leaves past the stop point.
+/// the scan). Stops the whole traversal (returning `Ok(false)`) when `visit` does, without faulting
+/// leaves past the stop point.
 fn walk_range_visit_rev(
     node: &Node,
     b: &KeyBound,
@@ -1396,8 +1339,8 @@ fn walk_range_visit_rev(
     recon: Option<&[bool]>,
     visit: &mut dyn FnMut(&[u8], &Row) -> Result<bool>,
 ) -> Result<bool> {
-    let (ef, el) = b.entry_window(node);
     if node.is_leaf() {
+        let (ef, el) = b.entry_window(node);
         for i in (ef..el).rev() {
             if !node.with_row_maybe_masked(i, recon, |row| visit(&node.keys[i], row))? {
                 return Ok(false);
@@ -1407,19 +1350,10 @@ fn walk_range_visit_rev(
     }
     let (cf, cl) = b.child_window(node);
     for i in (cf..=cl).rev() {
-        if i >= ef
-            && i < el
-            && !node.with_row_maybe_masked(i, recon, |row| visit(&node.keys[i], row))?
-        {
-            return Ok(false);
-        }
         let ch = child(node, i, src)?;
         if !walk_range_visit_rev(&ch, b, src, recon, visit)? {
             return Ok(false);
         }
-    }
-    if ef < cf && !node.with_row_maybe_masked(ef, recon, |row| visit(&node.keys[ef], row))? {
-        return Ok(false);
     }
     Ok(true)
 }
@@ -1432,8 +1366,9 @@ mod tests {
     // A small page cap so a few-thousand-entry map is several levels deep — exercises split,
     // merge-then-split, root growth and collapse (the in-RAM analog of page_size 256).
     const CAP: usize = 240;
-    /// `row` has one value column — the PAX leaf directory overhead scales with it (format.md v23).
-    const K: usize = 1;
+    /// `row` has one fixed-width value column — the v24 leaf overhead scales with the class mix
+    /// (format.md "Leaf node").
+    const SHAPE: LeafShape = LeafShape { fixed: 1, var: 0 };
 
     fn row(n: i64) -> Row {
         vec![Value::Int(n)]
@@ -1443,9 +1378,9 @@ mod tests {
         n.to_be_bytes().to_vec()
     }
 
-    /// A realistic per-entry weight: 8-byte key + a ~5-byte int value record ≈ 15 bytes, so a
-    /// 240-byte node holds ~16 entries before splitting (well under RECORD_MAX = (240-12)/2 = 114).
-    const W: u32 = 15;
+    /// A realistic per-entry weight: 8-byte key + an 8-byte i64 slot = 16 bytes, so a 240-byte
+    /// leaf holds ~12 entries before splitting (well under RECORD_MAX).
+    const W: u32 = 16;
 
     /// A deterministic permutation of `0..n` (an LCG-driven shuffle) — no wall-clock / RNG, so the
     /// test is reproducible (CLAUDE.md §10).
@@ -1462,37 +1397,74 @@ mod tests {
         v
     }
 
-    /// Every node (except the root) must fit a page and stay non-empty — the structural invariant
-    /// the byte contract relies on (format.md). Checked over the whole tree.
+    /// The structural invariants the byte contract relies on (format.md "Fan-out"): every node
+    /// fits a page; every leaf is non-empty; an interior node has `N+1` children (`N ≥ 0` only in
+    /// the degenerate case — these small-key tests never produce it, so `N ≥ 1` is asserted);
+    /// records (vals/weights) live only in leaves; all leaves at the same depth; and every key in
+    /// a subtree respects its bounding separators (left < sep ≤ right).
     fn check_invariants(pm: &PMap) {
-        fn walk(node: &Node, is_root: bool, cap: usize) {
-            assert!(!node.keys.is_empty() || is_root, "non-root node is empty");
-            // A Decoded node's `vals` parallels `keys`; a Packed leaf holds no row vector (§3). These
-            // in-memory tests build only Decoded nodes, so `packed` is always `None` here.
-            if node.packed.is_none() {
-                assert_eq!(node.keys.len(), node.vals.len());
-            }
-            assert_eq!(node.keys.len(), node.weights.len());
-            if !node.is_leaf() {
+        fn walk(
+            node: &Node,
+            is_root: bool,
+            cap: usize,
+            lo: Option<&[u8]>,
+            hi: Option<&[u8]>,
+        ) -> usize {
+            if node.is_leaf() {
+                assert!(!node.keys.is_empty() || is_root, "non-root leaf is empty");
+                if node.packed.is_none() {
+                    assert_eq!(node.keys.len(), node.vals.len());
+                }
+                assert_eq!(node.keys.len(), node.weights.len());
+            } else {
+                assert!(!node.keys.is_empty() || is_root, "0-key interior unexpected");
+                assert!(node.vals.is_empty(), "interior node carries records");
+                assert!(node.weights.is_empty(), "interior node carries weights");
                 assert_eq!(
                     node.children.len(),
                     node.keys.len() + 1,
                     "interior child count"
                 );
             }
-            let payload: usize = node.weights.iter().map(|&w| w as usize).sum::<usize>()
-                + if node.is_leaf() {
-                    crate::format::directory_overhead(node.keys.len(), K)
-                } else {
-                    4 * node.children.len()
-                };
-            assert!(payload <= cap, "node payload {payload} exceeds cap {cap}");
-            for c in &node.children {
-                walk(c.resident(), false, cap);
+            for w in node.keys.windows(2) {
+                assert!(w[0] < w[1], "keys out of order");
             }
+            // Subtree keys respect the bounding separators: lo ≤ key < hi (lo inclusive because a
+            // separator equals the right subtree's first key at split time).
+            for k in &node.keys {
+                if let Some(lo) = lo {
+                    assert!(k.as_slice() >= lo, "key below its subtree's low separator");
+                }
+                if let Some(hi) = hi {
+                    assert!(k.as_slice() < hi, "key at/above its subtree's high separator");
+                }
+            }
+            assert!(
+                node.payload(SHAPE) <= cap,
+                "node payload {} exceeds cap {cap}",
+                node.payload(SHAPE)
+            );
+            if node.is_leaf() {
+                return 1;
+            }
+            let mut depth = None;
+            for (i, c) in node.children.iter().enumerate() {
+                let clo = if i == 0 { lo } else { Some(node.keys[i - 1].as_slice()) };
+                let chi = if i == node.keys.len() {
+                    hi
+                } else {
+                    Some(node.keys[i].as_slice())
+                };
+                let d = walk(c.resident(), false, cap, clo, chi);
+                match depth {
+                    None => depth = Some(d),
+                    Some(prev) => assert_eq!(prev, d, "leaves at unequal depth"),
+                }
+            }
+            depth.unwrap() + 1
         }
         if let Some(root) = &pm.root {
-            walk(root, true, CAP);
+            walk(root, true, CAP, None, None);
         }
     }
 
@@ -1505,7 +1477,7 @@ mod tests {
 
         for k in shuffled(n) {
             assert_eq!(
-                pm.insert(key(k), row(k as i64), W, CAP, K, None).unwrap(),
+                pm.insert(key(k), row(k as i64), W, CAP, SHAPE, None).unwrap(),
                 bt.insert(key(k), row(k as i64))
             );
         }
@@ -1521,7 +1493,7 @@ mod tests {
         // Overwrite returns the old value and does not change len.
         let before = pm.len();
         assert_eq!(
-            pm.insert(key(7), row(777), W, CAP, K, None).unwrap(),
+            pm.insert(key(7), row(777), W, CAP, SHAPE, None).unwrap(),
             bt.insert(key(7), row(777))
         );
         assert_eq!(pm.len(), before);
@@ -1530,7 +1502,7 @@ mod tests {
         // Interleave removes with invariant checks so merge-then-split is exercised mid-stream.
         for (step, k) in shuffled(n).into_iter().enumerate() {
             assert_eq!(
-                pm.remove(&key(k), CAP, K, None).unwrap(),
+                pm.remove(&key(k), CAP, SHAPE, None).unwrap(),
                 bt.remove(&key(k))
             );
             if step % 257 == 0 {
@@ -1539,30 +1511,31 @@ mod tests {
         }
         assert!(pm.is_empty());
         assert_eq!(pm.iter(None).unwrap().len(), 0);
-        assert_eq!(pm.remove(&key(123), CAP, K, None).unwrap(), None);
+        assert_eq!(pm.remove(&key(123), CAP, SHAPE, None).unwrap(), None);
     }
 
     #[test]
     fn clone_is_an_independent_snapshot() {
         let mut base = PMap::new();
         for k in 0..2000 {
-            base.insert(key(k), row(k as i64), W, CAP, K, None).unwrap();
+            base.insert(key(k), row(k as i64), W, CAP, SHAPE, None)
+                .unwrap();
         }
         let snap = base.clone();
 
         let mut other = base.clone();
         for k in 0..2000 {
             other
-                .insert(key(k), row(-(k as i64)), W, CAP, K, None)
+                .insert(key(k), row(-(k as i64)), W, CAP, SHAPE, None)
                 .unwrap(); // overwrite every value
         }
         for k in 2000..3000 {
             other
-                .insert(key(k), row(k as i64), W, CAP, K, None)
+                .insert(key(k), row(k as i64), W, CAP, SHAPE, None)
                 .unwrap(); // and grow it
         }
         for k in 0..500 {
-            other.remove(&key(k), CAP, K, None).unwrap(); // and shrink it
+            other.remove(&key(k), CAP, SHAPE, None).unwrap(); // and shrink it
         }
 
         // `snap` still sees the original contents, untouched.
@@ -1588,307 +1561,166 @@ mod tests {
         let mut pm = PMap::new();
         assert!(pm.is_empty());
         assert_eq!(pm.get(&key(1), None).unwrap(), None);
-        assert_eq!(pm.remove(&key(1), CAP, K, None).unwrap(), None);
-        assert_eq!(pm.insert(key(1), row(1), W, CAP, K, None).unwrap(), None);
+        assert_eq!(pm.remove(&key(1), CAP, SHAPE, None).unwrap(), None);
+        assert_eq!(pm.insert(key(1), row(1), W, CAP, SHAPE, None).unwrap(), None);
         assert_eq!(pm.get(&key(1), None).unwrap(), Some(row(1)));
-        assert_eq!(pm.remove(&key(1), CAP, K, None).unwrap(), Some(row(1)));
+        assert_eq!(pm.remove(&key(1), CAP, SHAPE, None).unwrap(), Some(row(1)));
         assert!(pm.is_empty());
         assert!(pm.root.is_none());
     }
 
-    /// Wide values (near RECORD_MAX) force tiny fan-out — the stress case for the split point and
-    /// the non-empty-halves guarantee. With weight 100 (≤ RECORD_MAX(240,1) = 106 — the PAX leaf
-    /// reserves 12+16·K, format.md v23), a two-record leaf fits but a third overflows.
+    /// Wide records (near RECORD_MAX) force tiny fan-out — the stress case for the split point and
+    /// the fit guarantee. With weight 100 (≤ RECORD_MAX(240, 1) = 106), a two-record leaf fits but
+    /// a third overflows.
     #[test]
     fn wide_values_keep_nodes_valid() {
         use std::collections::BTreeMap;
         let mut pm = PMap::new();
         let mut bt: BTreeMap<Vec<u8>, Row> = BTreeMap::new();
         for k in shuffled(300) {
-            pm.insert(key(k), row(k as i64), 100, CAP, K, None).unwrap();
+            pm.insert(key(k), row(k as i64), 100, CAP, SHAPE, None)
+                .unwrap();
             bt.insert(key(k), row(k as i64));
             check_invariants(&pm);
         }
         for k in shuffled(300) {
-            pm.remove(&key(k), CAP, K, None).unwrap();
+            pm.remove(&key(k), CAP, SHAPE, None).unwrap();
             bt.remove(&key(k));
             check_invariants(&pm);
         }
         assert!(pm.is_empty());
     }
 
+    /// Near-cap KEYS (the max-size-separator case, format.md "Interior node"): separators are key
+    /// copies, so two of them overflow an interior node, forcing the pinned degenerate `N = 2 →
+    /// m = 1` split and legal 0-key interiors. The map must stay correct through inserts, scans,
+    /// and removes (a looser invariant check — 0-key interiors are legal here).
     #[test]
-    fn bounded_range_and_overlap() {
-        // 200 entries at CAP 240 build a multi-leaf tree (the in-RAM analog of a paged store), so the
-        // bounded-scan primitive (spec/design/cost.md §3) can be checked where page_read drops below
-        // node_count — the property single-leaf conformance tables cannot show.
+    fn near_cap_keys_degenerate_interior() {
+        use std::collections::BTreeMap;
+        // Index-tree shape: zero value columns, record = key alone. RECORD_MAX(0) = (240-12)/2
+        // = 114; keys of 110 bytes keep records under the cap while two separators (2·110 + 20)
+        // overflow an interior.
+        let shape = LeafShape { fixed: 0, var: 0 };
+        let big_key = |n: u64| {
+            let mut k = vec![0xAB; 110];
+            k[..8].copy_from_slice(&n.to_be_bytes());
+            k
+        };
         let mut pm = PMap::new();
-        for n in 0..200u64 {
-            pm.insert(key(n), row(n as i64), W, CAP, K, None).unwrap();
+        let mut bt: BTreeMap<Vec<u8>, Row> = BTreeMap::new();
+        for k in shuffled(60) {
+            pm.insert(big_key(k), Vec::new(), 110, CAP, shape, None)
+                .unwrap();
+            bt.insert(big_key(k), Vec::new());
         }
-        assert!(pm.node_count() > 1, "test needs a multi-leaf tree");
-
-        // A point bound visits strictly fewer nodes than the whole tree (the page_read win), and
-        // returns exactly the one matching entry.
-        let pb = KeyBound {
-            lo: Some(key(100)),
-            lo_inc: true,
-            hi: Some(key(100)),
-            hi_inc: true,
-        };
-        assert!(pm.overlap_node_count(&pb) < pm.node_count());
-        let got = pm.range_entries(&pb, None).unwrap();
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].0, key(100));
-
-        // An inclusive range spanning many leaves returns exactly those entries, in key order.
-        let decode = |k: &[u8]| u64::from_be_bytes(k.try_into().unwrap());
-        let rb = KeyBound {
-            lo: Some(key(50)),
-            lo_inc: true,
-            hi: Some(key(150)),
-            hi_inc: true,
-        };
-        let vals: Vec<u64> = pm
-            .range_entries(&rb, None)
-            .unwrap()
-            .iter()
-            .map(|(k, _)| decode(k))
-            .collect();
-        assert_eq!(vals, (50..=150).collect::<Vec<_>>());
-
-        // Exclusive endpoints drop both boundary keys (51..=149).
-        let ex = KeyBound {
-            lo: Some(key(50)),
-            lo_inc: false,
-            hi: Some(key(150)),
-            hi_inc: false,
-        };
-        assert_eq!(pm.range_entries(&ex, None).unwrap().len(), 99);
-
-        // Half-open (>= 195) reaches the end of the key space (195..=199).
-        let hi_open = KeyBound {
-            lo: Some(key(195)),
-            lo_inc: true,
-            hi: None,
-            hi_inc: false,
-        };
-        assert_eq!(pm.range_entries(&hi_open, None).unwrap().len(), 5);
-
-        // The unbounded bound reproduces the full scan exactly.
-        let unb = KeyBound::unbounded();
-        assert_eq!(pm.overlap_node_count(&unb), pm.node_count());
-        assert_eq!(pm.range_entries(&unb, None).unwrap().len(), 200);
+        assert_eq!(pm.len(), bt.len());
+        // Structure: fits + routing correctness (0-key interiors allowed).
+        fn walk(node: &Node, cap: usize, shape: LeafShape) {
+            assert!(node.payload(shape) <= cap, "node overflows its page");
+            if !node.is_leaf() {
+                assert_eq!(node.children.len(), node.keys.len() + 1);
+                for c in &node.children {
+                    walk(c.resident(), cap, shape);
+                }
+            }
+        }
+        walk(pm.root().unwrap(), CAP, shape);
+        let got: Vec<_> = pm.iter(None).unwrap();
+        let want: Vec<_> = bt.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        assert_eq!(got, want);
+        for k in 0..60 {
+            assert!(pm.get(&big_key(k), None).unwrap().is_some());
+        }
+        for k in shuffled(60) {
+            assert_eq!(pm.remove(&big_key(k), CAP, shape, None).unwrap(), Some(Vec::new()));
+        }
+        assert!(pm.is_empty());
     }
 
+    /// The bounded scan yields exactly the in-bound rows, in order, and the counted nodes match
+    /// `overlap_node_count`; the pull cursor and the reverse walk agree with it.
     #[test]
-    fn reverse_scan_is_forward_reversed() {
-        // scan_range_rev must yield the EXACT reverse of scan_range's row sequence over a MULTI-LEVEL
-        // tree — the interior-node interleaving (separators between children) and the asymmetric
-        // inclusive-lo edge that single-leaf conformance tables (the DESC-LIMIT corpus cases) cannot
-        // exercise. 200 entries at CAP 240 build several levels.
+    fn bounded_scans_and_cursor_agree() {
         let mut pm = PMap::new();
-        for n in 0..200u64 {
-            pm.insert(key(n), row(n as i64), W, CAP, K, None).unwrap();
+        for k in shuffled(2000) {
+            pm.insert(key(k), row(k as i64), W, CAP, SHAPE, None).unwrap();
         }
-        assert!(pm.node_count() > 2, "test needs a multi-level tree");
-
-        let decode = |k: &[u8]| u64::from_be_bytes(k.try_into().unwrap());
-        let collect = |b: &KeyBound, rev: bool| -> Vec<u64> {
-            let mut out = Vec::new();
-            let mut visit = |k: &[u8], _r: &Row| -> Result<bool> {
-                out.push(decode(k));
-                Ok(true)
-            };
-            if rev {
-                pm.scan_range_rev(b, None, None, &mut visit).unwrap();
-            } else {
-                pm.scan_range(b, None, None, &mut visit).unwrap();
-            }
-            out
+        let b = KeyBound {
+            lo: Some(key(500)),
+            lo_inc: true,
+            hi: Some(key(1500)),
+            hi_inc: false,
         };
+        let (entries, nodes) = pm.range_entries_counted(&b, None, None).unwrap();
+        assert_eq!(entries.len(), 1000);
+        assert_eq!(entries[0].0, key(500));
+        assert_eq!(entries[999].0, key(1499));
+        assert_eq!(nodes, pm.overlap_node_count(&b));
 
-        // Every bound shape: unbounded, an inclusive range spanning many leaves, exclusive endpoints,
-        // a half-open tail, a point, and an inclusive-lo whose separator sits at a pruned child edge.
-        for (i, b) in [
-            KeyBound::unbounded(),
-            KeyBound {
-                lo: Some(key(50)),
-                lo_inc: true,
-                hi: Some(key(150)),
-                hi_inc: true,
-            },
-            KeyBound {
-                lo: Some(key(50)),
-                lo_inc: false,
-                hi: Some(key(150)),
-                hi_inc: false,
-            },
-            KeyBound {
-                lo: Some(key(195)),
-                lo_inc: true,
-                hi: None,
-                hi_inc: false,
-            },
-            KeyBound {
-                lo: Some(key(100)),
-                lo_inc: true,
-                hi: Some(key(100)),
-                hi_inc: true,
-            },
-            KeyBound {
-                lo: Some(key(73)),
-                lo_inc: true,
-                hi: Some(key(181)),
-                hi_inc: false,
-            },
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let mut fwd = collect(&b, false);
-            let rev = collect(&b, true);
-            fwd.reverse();
-            assert_eq!(
-                fwd, rev,
-                "reverse scan must equal forward-reversed for bound #{i}"
-            );
-        }
-
-        // The reverse short-circuit stops from the HIGH end: stopping after 3 visits yields the 3
-        // largest keys in descending order, faulting no further.
-        let mut got = Vec::new();
-        let mut n = 0;
-        pm.scan_range_rev(&KeyBound::unbounded(), None, None, &mut |k, _r| {
-            got.push(decode(k));
-            n += 1;
-            Ok(n < 3)
+        // Push walk agrees.
+        let mut push = Vec::new();
+        pm.scan_range(&b, None, None, &mut |k, r| {
+            push.push((k.to_vec(), r.clone()));
+            Ok(true)
         })
         .unwrap();
-        assert_eq!(got, vec![199, 198, 197]);
-    }
+        assert_eq!(push, entries);
 
-    #[test]
-    fn range_cursor_matches_scan_range() {
-        // The S2 pull cursor (range_cursor) must yield the EXACT same (key, row) sequence as the push
-        // scan_range / scan_range_rev over a MULTI-LEVEL tree — the contract the streaming pipeline
-        // (S3) rests on. This is internal machinery, not corpus-expressible (CLAUDE.md §10), so it
-        // is unit-tested per core against the existing push scan.
-        let mut pm = PMap::new();
-        for n in 0..200u64 {
-            pm.insert(key(n), row(n as i64), W, CAP, K, None).unwrap();
+        // Reverse push walk is the exact reverse.
+        let mut rev = Vec::new();
+        pm.scan_range_rev(&b, None, None, &mut |k, r| {
+            rev.push((k.to_vec(), r.clone()));
+            Ok(true)
+        })
+        .unwrap();
+        let mut expect = entries.clone();
+        expect.reverse();
+        assert_eq!(rev, expect);
+
+        // Pull cursor agrees, both directions.
+        let mut fwd = Vec::new();
+        let mut cur = pm.range_cursor(
+            KeyBound {
+                lo: Some(key(500)),
+                lo_inc: true,
+                hi: Some(key(1500)),
+                hi_inc: false,
+            },
+            false,
+            None,
+        );
+        while let Some(pair) = cur.next(None).unwrap() {
+            fwd.push(pair);
         }
-        assert!(pm.node_count() > 2, "test needs a multi-level tree");
+        assert_eq!(fwd, entries);
 
-        let decode = |k: &[u8]| u64::from_be_bytes(k.try_into().unwrap());
-        let val = |r: &Row| match &r[0] {
-            Value::Int(v) => *v,
-            other => panic!("unexpected row value {other:?}"),
-        };
-
-        // Collect the push scan's sequence as (key, row-value) pairs.
-        let pushed = |b: &KeyBound, rev: bool| -> Vec<(u64, i64)> {
-            let mut out = Vec::new();
-            let mut visit = |k: &[u8], r: &Row| -> Result<bool> {
-                out.push((decode(k), val(r)));
-                Ok(true)
-            };
-            if rev {
-                pm.scan_range_rev(b, None, None, &mut visit).unwrap();
-            } else {
-                pm.scan_range(b, None, None, &mut visit).unwrap();
-            }
-            out
-        };
-        // Drain the pull cursor into the same shape.
-        let pulled = |b: KeyBound, rev: bool| -> Vec<(u64, i64)> {
-            let mut c = pm.range_cursor(b, rev, None);
-            let mut out = Vec::new();
-            while let Some((k, r)) = c.next(None).unwrap() {
-                out.push((decode(&k), val(&r)));
-            }
-            out
-        };
-
-        let bounds = || {
-            vec![
-                KeyBound::unbounded(),
-                KeyBound {
-                    lo: Some(key(50)),
-                    lo_inc: true,
-                    hi: Some(key(150)),
-                    hi_inc: true,
-                },
-                KeyBound {
-                    lo: Some(key(50)),
-                    lo_inc: false,
-                    hi: Some(key(150)),
-                    hi_inc: false,
-                },
-                KeyBound {
-                    lo: Some(key(195)),
-                    lo_inc: true,
-                    hi: None,
-                    hi_inc: false,
-                },
-                KeyBound {
-                    lo: Some(key(100)),
-                    lo_inc: true,
-                    hi: Some(key(100)),
-                    hi_inc: true,
-                },
-                KeyBound {
-                    lo: Some(key(73)),
-                    lo_inc: true,
-                    hi: Some(key(181)),
-                    hi_inc: false,
-                },
-                // An empty bound (lo > hi) yields nothing on both paths.
-                KeyBound {
-                    lo: Some(key(150)),
-                    lo_inc: true,
-                    hi: Some(key(50)),
-                    hi_inc: true,
-                },
-            ]
-        };
-
-        for (i, b) in bounds().into_iter().enumerate() {
-            for rev in [false, true] {
-                let push = pushed(&b, rev);
-                let pull = pulled(b_clone(&b), rev);
-                assert_eq!(
-                    push, pull,
-                    "cursor must match scan_range for bound #{i} rev={rev}"
-                );
-            }
+        let mut bwd = Vec::new();
+        let mut cur = pm.range_cursor(
+            KeyBound {
+                lo: Some(key(500)),
+                lo_inc: true,
+                hi: Some(key(1500)),
+                hi_inc: false,
+            },
+            true,
+            None,
+        );
+        while let Some(pair) = cur.next(None).unwrap() {
+            bwd.push(pair);
         }
+        assert_eq!(bwd, expect);
 
-        // Early abandonment: pulling only N rows then dropping the cursor yields the first N of the
-        // full sequence (forward and reverse), proving the pull short-circuit (the streaming win).
-        for rev in [false, true] {
-            let full = pushed(&KeyBound::unbounded(), rev);
-            let mut c = pm.range_cursor(KeyBound::unbounded(), rev, None);
-            let mut got = Vec::new();
-            for _ in 0..3 {
-                let (k, r) = c.next(None).unwrap().unwrap();
-                got.push((decode(&k), val(&r)));
-            }
-            assert_eq!(
-                got,
-                full[..3],
-                "early-abandoned cursor must be the prefix (rev={rev})"
-            );
-        }
-    }
-
-    // KeyBound is move-only here (no Clone derive); this rebuilds one for the second consumer.
-    fn b_clone(b: &KeyBound) -> KeyBound {
-        KeyBound {
-            lo: b.lo.clone(),
-            lo_inc: b.lo_inc,
-            hi: b.hi.clone(),
-            hi_inc: b.hi_inc,
-        }
+        // Exclusive lo / inclusive hi.
+        let b2 = KeyBound {
+            lo: Some(key(500)),
+            lo_inc: false,
+            hi: Some(key(1500)),
+            hi_inc: true,
+        };
+        let got = pm.range_entries(&b2, None).unwrap();
+        assert_eq!(got[0].0, key(501));
+        assert_eq!(got.last().unwrap().0, key(1500));
+        assert_eq!(got.len(), 1000);
     }
 }
