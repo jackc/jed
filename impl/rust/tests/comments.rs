@@ -3,10 +3,12 @@
 //! `1--2` is `1`); `/* */` block comments NEST per PG / the SQL standard; an
 //! unterminated block is 42601; comment openers inside a string literal are text.
 
-use jed::{Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn setup() -> Session {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32, s text)", &[])
         .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10, '--x /*y*/')", &[])

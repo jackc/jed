@@ -8,7 +8,7 @@
 //! spilled column is touched. Mirrored in Go (lazy_large_values_test.go) and TS
 //! (tests/lazy_large_values.test.ts).
 
-use jed::{Database, DatabaseOptions, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 const PAGE_SIZE: u32 = 256;
 
@@ -110,12 +110,10 @@ fn chains_are_read_only_when_touched() {
     let path = tmp("jed_lazy_touch.jed");
     let _ = std::fs::remove_file(&path);
     {
-        let mut db = Database::create(
-            &path,
-            DatabaseOptions {
-                page_size: PAGE_SIZE,
-            },
-        )
+        let mut db = Database::create(CreateOptions {
+            path: Some(std::path::PathBuf::from(&path)),
+            page_size: PAGE_SIZE,
+        })
         .unwrap()
         .session(SessionOptions::default());
         seed(&mut db);
@@ -159,12 +157,10 @@ fn lazy_values_round_trip_exactly() {
     let path = tmp("jed_lazy_roundtrip.jed");
     let _ = std::fs::remove_file(&path);
     {
-        let mut db = Database::create(
-            &path,
-            DatabaseOptions {
-                page_size: PAGE_SIZE,
-            },
-        )
+        let mut db = Database::create(CreateOptions {
+            path: Some(std::path::PathBuf::from(&path)),
+            page_size: PAGE_SIZE,
+        })
         .unwrap()
         .session(SessionOptions::default());
         seed(&mut db);
@@ -198,12 +194,10 @@ fn update_of_other_columns_preserves_spilled_values() {
     let _ = std::fs::remove_file(&path);
     let big = filler_text(600);
     {
-        let mut db = Database::create(
-            &path,
-            DatabaseOptions {
-                page_size: PAGE_SIZE,
-            },
-        )
+        let mut db = Database::create(CreateOptions {
+            path: Some(std::path::PathBuf::from(&path)),
+            page_size: PAGE_SIZE,
+        })
         .unwrap()
         .session(SessionOptions::default());
         db.execute("CREATE TABLE t (id i32 PRIMARY KEY, body text, n i32)", &[])
@@ -245,16 +239,18 @@ fn update_of_other_columns_preserves_spilled_values() {
 fn paged_and_resident_costs_match() {
     let path = tmp("jed_lazy_cost.jed");
     let _ = std::fs::remove_file(&path);
-    let mut mem =
-        Database::new_in_memory_with_page_size(PAGE_SIZE).session(SessionOptions::default());
+    let mut mem = Database::create(CreateOptions {
+        page_size: PAGE_SIZE,
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
     seed(&mut mem);
     {
-        let mut db = Database::create(
-            &path,
-            DatabaseOptions {
-                page_size: PAGE_SIZE,
-            },
-        )
+        let mut db = Database::create(CreateOptions {
+            path: Some(std::path::PathBuf::from(&path)),
+            page_size: PAGE_SIZE,
+        })
         .unwrap()
         .session(SessionOptions::default());
         seed(&mut db);

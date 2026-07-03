@@ -8,7 +8,7 @@
 //! independent variables, and `reset_vars` (PG `RESET ALL`). CLAUDE.md §10.
 
 use jed::value::Value;
-use jed::{Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 /// Run a single-row, single-column query and return the lone value.
 fn scalar(db: &mut Session, sql: &str) -> Value {
@@ -36,7 +36,9 @@ fn err_code(db: &mut Session, sql: &str) -> String {
 #[test]
 fn host_set_and_read_round_trip() {
     // set_var stores; var() reads it back through the host API; current_setting reads it in SQL.
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(db.var("myapp.tenant"), None); // unset
     db.set_var("myapp.tenant", "acme").unwrap();
     assert_eq!(db.var("myapp.tenant"), Some("acme".to_string()));
@@ -50,7 +52,9 @@ fn host_set_and_read_round_trip() {
 fn set_and_reset_var_reject_a_non_dotted_name() {
     // A variable must be namespaced (dotted) — a non-dotted name is a built-in setting name, and v1
     // exposes none through this map (the time_zone built-in is its own slice), so it is 42704.
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(db.set_var("bogus", "x").err().unwrap().code(), "42704");
     assert_eq!(db.reset_var("bogus").err().unwrap().code(), "42704");
     // The host getter never errors — a non-dotted (or any unset) name simply reads as None.
@@ -59,7 +63,9 @@ fn set_and_reset_var_reject_a_non_dotted_name() {
 
 #[test]
 fn reset_var_removes_and_is_idempotent() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.set_var("myapp.k", "v").unwrap();
     db.reset_var("myapp.k").unwrap();
     assert_eq!(db.var("myapp.k"), None);
@@ -75,7 +81,9 @@ fn reset_var_removes_and_is_idempotent() {
 #[test]
 fn names_are_case_insensitive_but_values_are_verbatim() {
     // The NAME folds to lowercase (PG GUC names are case-insensitive); the VALUE is preserved exactly.
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.set_var("myApp.Tenant", "AcmeCorp").unwrap();
     assert_eq!(db.var("myapp.tenant"), Some("AcmeCorp".to_string()));
     assert_eq!(db.var("MYAPP.TENANT"), Some("AcmeCorp".to_string()));
@@ -87,7 +95,9 @@ fn names_are_case_insensitive_but_values_are_verbatim() {
 
 #[test]
 fn missing_ok_turns_the_unset_error_into_null() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(
         err_code(&mut db, "SELECT current_setting('myapp.unset')"),
         "42704"
@@ -107,7 +117,9 @@ fn missing_ok_turns_the_unset_error_into_null() {
 fn a_null_name_propagates_to_null() {
     // null = "propagates": a NULL name short-circuits to NULL before the lookup. A text column holding
     // a NULL is the typed-NULL the corpus cannot write (jed defers text casts, so no NULL::text yet).
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY, n text)", &[])
         .unwrap();
     db.execute("INSERT INTO t VALUES (1, NULL)", &[]).unwrap();
@@ -122,7 +134,9 @@ fn a_null_name_propagates_to_null() {
 fn variables_are_session_state_not_snapshot_state() {
     // Variables are SESSION state, not snapshot state (§6.1): a ROLLBACK undoes DATA but never a
     // session variable (PG SET SESSION). Set one outside, one inside a block, roll back — both survive.
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.set_var("myapp.outer", "a").unwrap();
     db.execute("BEGIN", &[]).unwrap();
     db.set_var("myapp.inner", "b").unwrap();
@@ -139,7 +153,7 @@ fn variables_are_session_state_not_snapshot_state() {
 fn an_additional_session_has_independent_variables() {
     // db.session(opts) mints an independent session over a shared core (§2.1/§2.4): its variable map
     // is its own — a variable set on it is invisible to another session and vice versa.
-    let db = Database::new_in_memory();
+    let db = Database::create(CreateOptions::default()).unwrap();
     let mut a = db.session(SessionOptions::default());
     a.set_var("myapp.who", "a").unwrap();
 
@@ -167,7 +181,9 @@ fn an_additional_session_has_independent_variables() {
 #[test]
 fn reset_vars_clears_every_variable() {
     // reset_vars is PG RESET ALL for the variable map.
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.set_var("myapp.a", "1").unwrap();
     db.set_var("myapp.b", "2").unwrap();
     db.reset_vars();

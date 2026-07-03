@@ -6,10 +6,12 @@
 //! 23503 enforcement at every write site, MATCH SIMPLE, the batch end state, 42830/2BP01 — is the
 //! corpus's job. Mirrored in impl/go/foreign_key_test.go and impl/ts/tests/foreign_key.test.ts.
 
-use jed::{Database, Session, SessionOptions};
+use jed::{CreateOptions, Database, Session, SessionOptions};
 
 fn db_with(sql: &[&str]) -> Session {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     for s in sql {
         db.execute(s, &[])
             .unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));

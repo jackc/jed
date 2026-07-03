@@ -7,7 +7,7 @@
 //! spill-vs-control table deltas. Mirrored in Go (compressed_cost_test.go) and TS
 //! (tests/compressed_cost.test.ts).
 
-use jed::{Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 const PAGE_SIZE: u32 = 256;
 // A 600-byte payload = ceil(600/240) = 3 slabs (compress at write, decompress at scan); a
@@ -41,8 +41,12 @@ fn cost(db: &mut Session, sql: &str) -> i64 {
 /// RECORD_MAX, so no chain); `control` is the same shape fully inline-plain. Row 2 is inline in
 /// both. Same tree shape (one leaf each), so cost deltas isolate the compression units.
 fn two_tables() -> Session {
-    let mut db =
-        Database::new_in_memory_with_page_size(PAGE_SIZE).session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions {
+        page_size: PAGE_SIZE,
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
     let run600 = "x".repeat(600);
     db.execute("CREATE TABLE comp (id i32 PRIMARY KEY, body text)", &[])
         .unwrap();
@@ -77,8 +81,12 @@ fn external_compressed_charges_chain_pages_plus_decompress_slabs() {
     // A 400-char half-filler/half-run text compresses to ~212 B — smaller than plain but still
     // over RECORD_MAX → 0x04 external-compressed: ceil(212/240) = 1 chain page_read PLUS
     // ceil(400/240) = 2 value_decompress slabs.
-    let mut db =
-        Database::new_in_memory_with_page_size(PAGE_SIZE).session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions {
+        page_size: PAGE_SIZE,
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
     let mix = format!("{}{}", filler_text(200), "y".repeat(200));
     db.execute("CREATE TABLE comp (id i32 PRIMARY KEY, body text)", &[])
         .unwrap();
@@ -113,8 +121,12 @@ fn bounded_scan_charges_only_admitted_values_and_limit_does_not_lower() {
 
 #[test]
 fn insert_meters_compress_attempts_adopted_or_rejected() {
-    let mut db =
-        Database::new_in_memory_with_page_size(PAGE_SIZE).session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions {
+        page_size: PAGE_SIZE,
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY, body text)", &[])
         .unwrap();
     // A fully-inline row attempts nothing: INSERT stays zero-cost.
@@ -160,8 +172,12 @@ fn decimal_payloads_compress_too() {
     // like text/bytea (large-values.md §12/§13). 801 digits (an "12"-run plus ".5" so the
     // literal types as numeric) → 201 base-10⁴ groups → a 407-byte payload: over RECORD_MAX,
     // compressible (repeating groups), and ceil(407/240) = 2 slabs both ways.
-    let mut db =
-        Database::new_in_memory_with_page_size(PAGE_SIZE).session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions {
+        page_size: PAGE_SIZE,
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
     let digits = format!("{}.5", "12".repeat(400));
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY, d numeric)", &[])
         .unwrap();

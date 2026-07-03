@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 
 use jed::value::Value;
-use jed::{Database, DatabaseOptions, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn tmp(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name)
@@ -47,9 +47,12 @@ fn a_single_row_commit_appends_only_the_dirty_path() {
     let path = tmp("incremental_small_growth.jed");
     let _ = std::fs::remove_file(&path);
     let ps = 256u64;
-    let mut db = Database::create(&path, DatabaseOptions { page_size: 256 })
-        .unwrap()
-        .session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions {
+        path: Some(std::path::PathBuf::from(&path)),
+        page_size: 256,
+    })
+    .unwrap()
+    .session(SessionOptions::default());
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY, pad text)", &[])
         .unwrap();
     // Enough rows for a multi-level tree at 256-byte pages (≈3 records/leaf). Each insert
@@ -108,9 +111,12 @@ fn delete_heavy_history_reopens_correctly() {
     let path = tmp("incremental_deletes.jed");
     let _ = std::fs::remove_file(&path);
     let pad = "x".repeat(48);
-    let mut db = Database::create(&path, DatabaseOptions { page_size: 256 })
-        .unwrap()
-        .session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions {
+        path: Some(std::path::PathBuf::from(&path)),
+        page_size: 256,
+    })
+    .unwrap()
+    .session(SessionOptions::default());
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY, pad text)", &[])
         .unwrap();
     for i in 1..=30 {
@@ -136,9 +142,12 @@ fn delete_heavy_history_reopens_correctly() {
 fn meta_slots_alternate_across_commits() {
     let path = tmp("incremental_alternation.jed");
     let _ = std::fs::remove_file(&path);
-    let mut db = Database::create(&path, DatabaseOptions::default())
-        .unwrap()
-        .session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions {
+        path: Some(std::path::PathBuf::from(&path)),
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
 
     // `create` seeds BOTH slots at txid 1, so two valid metas exist from the first moment.
     let img = std::fs::read(&path).unwrap();
@@ -165,9 +174,12 @@ fn meta_slots_alternate_across_commits() {
 fn torn_latest_commit_falls_back_to_prior_snapshot() {
     let path = tmp("incremental_torn_meta.jed");
     let _ = std::fs::remove_file(&path);
-    let mut db = Database::create(&path, DatabaseOptions::default())
-        .unwrap()
-        .session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions {
+        path: Some(std::path::PathBuf::from(&path)),
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
         .unwrap(); // txid 2 (slot 0)
     db.execute("INSERT INTO t VALUES (1)", &[]).unwrap(); // txid 3 (slot 1)
@@ -201,9 +213,12 @@ fn torn_latest_commit_falls_back_to_prior_snapshot() {
 fn small_database_file_stays_proportional() {
     let path = tmp("prealloc_small.jed");
     let _ = std::fs::remove_file(&path);
-    let mut db = Database::create(&path, DatabaseOptions { page_size: 256 })
-        .unwrap()
-        .session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions {
+        path: Some(std::path::PathBuf::from(&path)),
+        page_size: 256,
+    })
+    .unwrap()
+    .session(SessionOptions::default());
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
         .unwrap();
     for i in 0..30 {

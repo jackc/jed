@@ -2,10 +2,12 @@
 //! NOT NULL (23502) and unique-PK (23505) enforcement, storage in PK order.
 
 use jed::value::Value;
-use jed::{Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn db_with(sql: &[&str]) -> Session {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     for s in sql {
         db.execute(s, &[])
             .unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
@@ -80,7 +82,9 @@ fn int32_and_int64_overflow_boundaries() {
 
 #[test]
 fn insert_into_missing_table_traps() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     let err = db.execute("INSERT INTO nope VALUES (1)", &[]).unwrap_err();
     assert_eq!(err.code(), "42P01");
 }

@@ -9,11 +9,13 @@
 //! COLUMN), so it exercises the per-row `evalCast` path, not the resolve-time literal fold.
 
 use jed::value::Value;
-use jed::{Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 /// Build a one-column text table `t(id i32 pk, s text)` seeded with `rows` (id = 1.., s = each str).
 fn seeded(rows: &[&str]) -> Session {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY, s text)", &[])
         .unwrap();
     for (i, s) in rows.iter().enumerate() {
@@ -114,7 +116,9 @@ fn text_to_float_overflow_and_malformed() {
 
 #[test]
 fn text_to_float_null_propagates() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY, s text)", &[])
         .unwrap();
     db.execute("INSERT INTO t VALUES (1, NULL)", &[]).unwrap();

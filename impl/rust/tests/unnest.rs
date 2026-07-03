@@ -7,7 +7,7 @@
 //! position 42883, the bare-untyped-NULL 42P18, a wrong arity / non-array 42883).
 
 use jed::value::Value;
-use jed::{Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn query(db: &mut Session, sql: &str) -> Vec<Vec<Value>> {
     match db
@@ -41,7 +41,9 @@ fn ints(ns: &[i64]) -> Vec<Vec<Value>> {
 
 #[test]
 fn names_and_types_its_column_at_the_element_type() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     // An untyped ARRAY[…] literal is i64[] (jed's literal typing), so the column is i64.
     let out = db
         .execute("SELECT * FROM unnest(ARRAY[10, 20, 30])", &[])
@@ -73,7 +75,9 @@ fn names_and_types_its_column_at_the_element_type() {
 
 #[test]
 fn empty_and_null_arrays_yield_zero_rows() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(
         query(&mut db, "SELECT * FROM unnest('{}'::i32[])"),
         Vec::<Vec<Value>>::new()
@@ -91,7 +95,9 @@ fn empty_and_null_arrays_yield_zero_rows() {
 
 #[test]
 fn alias_renames_the_single_column() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     // PG's single-column function-alias rule: `AS g` makes the column `g`, so `g.unnest` is 42703.
     assert_eq!(
         query(
@@ -108,7 +114,9 @@ fn alias_renames_the_single_column() {
 
 #[test]
 fn correlated_outer_array_column_and_sibling_are_legal_args() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY, xs i32[])", &[])
         .unwrap();
     db.execute(
@@ -149,7 +157,9 @@ fn correlated_outer_array_column_and_sibling_are_legal_args() {
 
 #[test]
 fn non_array_and_wrong_arity_are_undefined_function() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     // A non-array argument has no anyarray overload.
     assert_eq!(err_code(&mut db, "SELECT * FROM unnest(5)"), "42883");
     assert_eq!(err_code(&mut db, "SELECT * FROM unnest('hi')"), "42883");
@@ -162,7 +172,9 @@ fn non_array_and_wrong_arity_are_undefined_function() {
 
 #[test]
 fn bare_untyped_null_is_indeterminate_datatype() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     // A bare untyped NULL leaves ELEM undeterminable — jed's polymorphic posture (PG would default
     // to text / report "not unique"; out of the oracle corpus). A TYPED null array resolves.
     assert_eq!(err_code(&mut db, "SELECT * FROM unnest(NULL)"), "42P18");
@@ -170,7 +182,9 @@ fn bare_untyped_null_is_indeterminate_datatype() {
 
 #[test]
 fn select_list_srf_position_is_deferred() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     // unnest is a FROM-clause row source only this slice; in the SELECT list it is not a scalar
     // function (the SELECT-list SRF position is deferred, like generate_series) → 42883.
     assert_eq!(err_code(&mut db, "SELECT unnest(ARRAY[1,2,3])"), "42883");
@@ -180,7 +194,9 @@ fn select_list_srf_position_is_deferred() {
 
 #[test]
 fn generated_row_cost_and_ceiling() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     // '{…}'::i32[] is a const (no operator_eval): 3 generated_row + 3 row_produced.
     assert_eq!(cost(&mut db, "SELECT * FROM unnest('{1,2,3}'::i32[])"), 6);
     // A large array aborts deterministically once accrued cost reaches the ceiling (54P01),

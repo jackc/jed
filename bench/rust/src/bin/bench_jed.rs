@@ -2,7 +2,8 @@
 
 use std::time::Instant;
 
-use jed::{Database, DatabaseOptions, PreparedStatement, Session, SessionOptions, Value};
+use jed::{CreateOptions, Database, PreparedStatement, Session, SessionOptions, Value};
+
 use jed_bench::{
     Arg, BoxResult, Checksum, ConcurrentOutcome, Config, Engine, main_with, read_sidecar,
 };
@@ -30,8 +31,11 @@ fn open(data_dir: &str, dataset: &str) -> BoxResult<Box<dyn Engine>> {
     if dataset == "scratch" {
         let dir = format!("{data_dir}/scratch-rust-{}", std::process::id());
         std::fs::create_dir_all(&dir)?;
-        let db = Database::create(format!("{dir}/scratch.jed"), DatabaseOptions::default())
-            .map_err(|e| e.to_string())?;
+        let db = Database::create(CreateOptions {
+            path: Some(std::path::PathBuf::from(format!("{dir}/scratch.jed"))),
+            ..Default::default()
+        })
+        .map_err(|e| e.to_string())?;
         let sess = db.session(SessionOptions::default());
         return Ok(Box::new(JedEngine {
             sess,

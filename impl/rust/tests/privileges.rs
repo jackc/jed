@@ -5,7 +5,7 @@
 //! `Privilege`/`PrivilegeSet` surface, the per-session independence of an additional session, and
 //! the introspection accessors (CLAUDE.md §10).
 
-use jed::{Database, Outcome, Privilege, PrivilegeSet, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Privilege, PrivilegeSet, Session, SessionOptions};
 
 fn code(db: &mut Session, sql: &str) -> String {
     db.execute(sql, &[])
@@ -24,7 +24,9 @@ fn ok(db: &mut Session, sql: &str) -> Outcome {
 fn default_session_is_fully_permissive() {
     // A fresh session grants every table privilege and allows DDL, so nothing is
     // gated until the host narrows the envelope.
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     assert!(db.allow_ddl());
     assert!(db.privileges().is_permissive());
     ok(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
@@ -36,7 +38,9 @@ fn default_session_is_fully_permissive() {
 #[test]
 fn set_default_privileges_makes_a_read_only_session() {
     // A {SELECT} default is the read-only session (§5.3): reads pass, every write is 42501.
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     ok(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
     ok(&mut db, "INSERT INTO t VALUES (1, 10)");
     db.set_default_privileges(PrivilegeSet::EMPTY.with(Privilege::Select));
@@ -50,7 +54,9 @@ fn set_default_privileges_makes_a_read_only_session() {
 fn grant_adds_and_revoke_wins() {
     // grant adds a privilege beyond an empty default; revoke beats a contradictory grant (deny
     // wins, order-independent — §5.3).
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     ok(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
 
     db.set_default_privileges(PrivilegeSet::EMPTY);
@@ -68,7 +74,9 @@ fn grant_adds_and_revoke_wins() {
 #[test]
 fn allow_ddl_gate_is_independent_of_table_privileges() {
     // allow_ddl gates only schema changes; DML over a permissive default still runs.
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     ok(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
     db.set_allow_ddl(false);
     assert_eq!(
@@ -83,7 +91,9 @@ fn allow_ddl_gate_is_independent_of_table_privileges() {
 fn function_execute_is_revocable() {
     // Functions default to EXECUTE on all; a revoke blocks calls to that one (the determinism-
     // pinning use case), operators stay ungated.
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     assert!(db.privileges().allows_function("abs"));
     ok(&mut db, "SELECT abs(-5)");
     db.revoke(PrivilegeSet::EMPTY.with(Privilege::Execute), "abs");
@@ -97,7 +107,7 @@ fn an_additional_session_carries_its_own_envelope() {
     // db.session(opts) mints an independent session over a shared Database core (§2.4): a restricted
     // one rejects a write a permissive session still allows, and they share committed storage
     // through the core (spec/design/session.md §2.1/§5.3) — each owns its envelope, no swap.
-    let db = Database::new_in_memory();
+    let db = Database::create(CreateOptions::default()).unwrap();
     let mut a = db.session(SessionOptions::default());
     a.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
         .expect("create on the permissive session");
@@ -131,7 +141,9 @@ fn an_additional_session_carries_its_own_envelope() {
 fn missing_object_is_42p01_not_42501() {
     // Authorization gates only resolved objects: a missing table is 42P01 even under an empty
     // envelope (existence before authorization — §5.3).
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.set_default_privileges(PrivilegeSet::EMPTY);
     assert_eq!(code(&mut db, "SELECT * FROM does_not_exist"), "42P01");
 }

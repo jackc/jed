@@ -6,11 +6,13 @@
 //! primary-key lookup survives a ceiling a full scan would blow, and that the abort threads through
 //! SELECT / DELETE / UPDATE and a pathological expression.
 
-use jed::{Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 /// A table of `n` rows (id i32 PRIMARY KEY, v i32; v == id).
 fn table(n: i64) -> Session {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
         .unwrap();
     let mut sql = String::from("INSERT INTO t VALUES ");

@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 use jed::value::Value;
-use jed::{Database, DatabaseOptions, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn run(db: &mut Session, sql: &str) -> Outcome {
     db.execute(sql, &[])
@@ -36,7 +36,9 @@ fn err_code(db: &mut Session, sql: &str) -> String {
 
 /// A table of i32 ranges, one per row, plus a NULL-range and an empty-range row.
 fn ranges_db() -> Session {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, r i32range)");
     run(&mut db, "CREATE INDEX t_r_gist ON t USING gist (r)");
     for (id, lit) in [
@@ -115,7 +117,9 @@ fn drop_gist_index() {
 
 #[test]
 fn gist_on_unsupported_type_is_42704() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, f f64)");
     // No GiST opclass at all for a non-keyable, non-range type (float) — 42704 (gist.md §6).
     assert_eq!(
@@ -129,7 +133,9 @@ fn gist_on_unsupported_type_is_42704() {
 /// the roadmap like each GIN element type — NOT `42704` (which means no opclass exists at all).
 #[test]
 fn gist_on_deferred_scalar_is_0a000() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     run(
         &mut db,
         "CREATE TABLE t (id i32 PRIMARY KEY, s text, b bytea, d decimal, v interval)",
@@ -150,7 +156,9 @@ fn gist_on_deferred_scalar_is_0a000() {
 /// gather (not a PK/btree bound) is what fires.
 #[test]
 fn scalar_gist_equal_gather() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, room i32)");
     run(&mut db, "CREATE INDEX t_room_gist ON t USING gist (room)");
     for (id, room) in [(1, 10), (2, 20), (3, 10), (4, 30), (5, 20), (6, 10)] {
@@ -204,9 +212,12 @@ fn scalar_gist_file_backed_round_trip() {
     let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("gist_scalar_round_trip.jed");
     let _ = std::fs::remove_file(&path);
     {
-        let mut db = Database::create(&path, DatabaseOptions { page_size: 256 })
-            .unwrap()
-            .session(SessionOptions::default());
+        let mut db = Database::create(CreateOptions {
+            path: Some(std::path::PathBuf::from(&path)),
+            page_size: 256,
+        })
+        .unwrap()
+        .session(SessionOptions::default());
         run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, room i32)");
         run(&mut db, "CREATE INDEX t_room_gist ON t USING gist (room)");
         for (id, room) in [(1, 10), (2, 20), (3, 10), (4, 30), (5, 20), (6, 10)] {
@@ -244,7 +255,9 @@ fn scalar_gist_file_backed_round_trip() {
 
 #[test]
 fn gist_unique_and_multicolumn_are_0a000() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     run(
         &mut db,
         "CREATE TABLE t (id i32 PRIMARY KEY, r i32range, s i32range)",
@@ -261,7 +274,9 @@ fn gist_unique_and_multicolumn_are_0a000() {
 
 #[test]
 fn gist_unknown_access_method_is_42704() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, r i32range)");
     assert_eq!(
         err_code(&mut db, "CREATE INDEX ON t USING brin (r)"),
@@ -274,7 +289,9 @@ fn gist_unknown_access_method_is_42704() {
 /// the acceleration. (File persistence, by contrast, landed in GX1b — see the round-trip below.)
 #[test]
 fn gist_on_temp_table_is_0a000() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     run(
         &mut db,
         "CREATE TEMP TABLE t (id i32 PRIMARY KEY, r i32range)",
@@ -294,9 +311,12 @@ fn gist_file_backed_round_trip() {
     let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("gist_round_trip.jed");
     let _ = std::fs::remove_file(&path);
     {
-        let mut db = Database::create(&path, DatabaseOptions { page_size: 256 })
-            .unwrap()
-            .session(SessionOptions::default());
+        let mut db = Database::create(CreateOptions {
+            path: Some(std::path::PathBuf::from(&path)),
+            page_size: 256,
+        })
+        .unwrap()
+        .session(SessionOptions::default());
         run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, r i32range)");
         run(&mut db, "CREATE INDEX t_r_gist ON t USING gist (r)");
         for (id, lit) in [
@@ -368,7 +388,9 @@ fn gist_file_backed_round_trip() {
 /// — no two rows may share a `room` AND have overlapping `during`. Needs the scalar `=` opclass
 /// (GX2) for `room` and `range_ops` (GX1) for `during`.
 fn booking_db() -> Session {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     run(
         &mut db,
         "CREATE TABLE booking (id i32 PRIMARY KEY, room i32, during i32range, \
@@ -490,7 +512,9 @@ fn exclude_update_end_state_swap_succeeds() {
 
 #[test]
 fn single_column_range_exclude() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     run(
         &mut db,
         "CREATE TABLE rsv (id i32 PRIMARY KEY, during i32range, EXCLUDE USING gist (during WITH &&))",
@@ -506,7 +530,9 @@ fn single_column_range_exclude() {
 
 #[test]
 fn exclude_type_errors() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     // `&&` over a non-range column → 42704 (no range_ops opclass for it).
     assert_eq!(
         err_code(
@@ -566,9 +592,12 @@ fn exclude_file_backed_round_trip() {
     let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("gist_exclude_round_trip.jed");
     let _ = std::fs::remove_file(&path);
     {
-        let mut db = Database::create(&path, DatabaseOptions { page_size: 256 })
-            .unwrap()
-            .session(SessionOptions::default());
+        let mut db = Database::create(CreateOptions {
+            path: Some(std::path::PathBuf::from(&path)),
+            page_size: 256,
+        })
+        .unwrap()
+        .session(SessionOptions::default());
         run(
             &mut db,
             "CREATE TABLE booking (id i32 PRIMARY KEY, room i32, during i32range, \

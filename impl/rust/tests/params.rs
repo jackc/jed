@@ -3,10 +3,12 @@
 //! context and supplied values are coerced two-phase before any row is touched.
 
 use jed::value::Value;
-use jed::{Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn db_with(sql: &[&str]) -> Session {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     for s in sql {
         db.execute(s, &[])
             .unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
@@ -228,7 +230,9 @@ fn param_in_in_list() {
 
 #[test]
 fn ddl_with_params_traps_42601() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(
         err_code(
             &mut db,

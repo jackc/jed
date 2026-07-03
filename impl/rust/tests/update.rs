@@ -4,10 +4,12 @@
 //! end-state-valid key swap / cascade that PG rejects on the per-row transient) live here
 //! rather than the oracle corpus, the same divergence UNIQUE carries (indexes.md §8).
 
-use jed::{Database, Session, SessionOptions, Value};
+use jed::{CreateOptions, Database, Session, SessionOptions, Value};
 
 fn db_with(stmts: &[&str]) -> Session {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     for s in stmts {
         db.execute(s, &[])
             .unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
@@ -38,7 +40,9 @@ fn setup() -> Session {
 
 #[test]
 fn update_missing_table_traps() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(
         db.execute("UPDATE nope SET a = 1", &[]).unwrap_err().code(),
         "42P01"

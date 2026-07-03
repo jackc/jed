@@ -2,7 +2,7 @@
 //! concatenation operator and the search/edit functions `array_remove`, `array_replace`,
 //! `array_position`, `array_positions`. Every expected value is pinned against PostgreSQL 18.
 
-use jed::{Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn err(db: &mut Session, sql: &str) -> String {
     db.execute(sql, &[])
@@ -29,7 +29,9 @@ fn val(db: &mut Session, sql: &str) -> String {
 
 #[test]
 fn concat_three_forms() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     // array || array → array_cat; array || element → array_append; element || array → array_prepend.
     assert_eq!(val(&mut db, "SELECT ARRAY[1,2] || ARRAY[3,4]"), "{1,2,3,4}");
     assert_eq!(val(&mut db, "SELECT ARRAY[1,2] || 3"), "{1,2,3}");
@@ -51,7 +53,9 @@ fn concat_three_forms() {
 
 #[test]
 fn concat_null_prefers_cat() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     // A BARE untyped NULL operand resolves to array_cat (the NULL array is the identity) — PG.
     assert_eq!(val(&mut db, "SELECT ARRAY[1,2] || NULL"), "{1,2}");
     assert_eq!(val(&mut db, "SELECT NULL || ARRAY[1,2]"), "{1,2}");
@@ -65,7 +69,9 @@ fn concat_null_prefers_cat() {
 
 #[test]
 fn concat_errors() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     // Element-type conflict / non-array / text||text — no overload (42883).
     assert_eq!(err(&mut db, "SELECT ARRAY[1,2] || ARRAY['a','b']"), "42883");
     assert_eq!(err(&mut db, "SELECT 5 || ARRAY['a','b']"), "42883");
@@ -84,7 +90,9 @@ fn concat_errors() {
 
 #[test]
 fn array_remove_kernel() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(
         val(&mut db, "SELECT array_remove(ARRAY[1,2,3,2], 2)"),
         "{1,3}"
@@ -130,7 +138,9 @@ fn array_remove_kernel() {
 
 #[test]
 fn array_replace_kernel() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(
         val(&mut db, "SELECT array_replace(ARRAY[1,2,3,2], 2, 9)"),
         "{1,9,3,9}"
@@ -172,7 +182,9 @@ fn array_replace_kernel() {
 
 #[test]
 fn array_position_kernel() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(
         val(&mut db, "SELECT array_position(ARRAY[10,20,30,20], 20)"),
         "2"
@@ -237,7 +249,9 @@ fn array_position_kernel() {
 
 #[test]
 fn array_positions_kernel() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(
         val(&mut db, "SELECT array_positions(ARRAY[10,20,30,20], 20)"),
         "{2,4}"

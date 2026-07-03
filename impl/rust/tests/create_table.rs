@@ -3,7 +3,7 @@
 
 use jed::catalog::Table;
 use jed::types::ScalarType;
-use jed::{Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn create(db: &mut Session, sql: &str) -> jed::Result<Outcome> {
     db.execute(sql, &[])
@@ -11,7 +11,9 @@ fn create(db: &mut Session, sql: &str) -> jed::Result<Outcome> {
 
 #[test]
 fn creates_table_with_resolved_types_and_pk() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     let out = create(
         &mut db,
         "CREATE TABLE nums (id i32 PRIMARY KEY, small i16, big i64)",
@@ -43,7 +45,9 @@ fn creates_table_with_resolved_types_and_pk() {
 
 #[test]
 fn sql_standard_type_aliases_resolve() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     create(
         &mut db,
         "CREATE TABLE t (a smallint, b integer, c int, d bigint)",
@@ -58,7 +62,9 @@ fn sql_standard_type_aliases_resolve() {
 
 #[test]
 fn table_and_type_names_are_case_insensitive() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     create(&mut db, "create table T (Id I32 primary key)").unwrap();
     assert!(db.table("t").is_some());
     assert!(db.table("T").is_some());
@@ -66,7 +72,9 @@ fn table_and_type_names_are_case_insensitive() {
 
 #[test]
 fn duplicate_table_is_rejected() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     create(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY)").unwrap();
     let err = create(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY)").unwrap_err();
     assert_eq!(err.code(), "42P07");
@@ -74,14 +82,18 @@ fn duplicate_table_is_rejected() {
 
 #[test]
 fn duplicate_column_is_rejected() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     let err = create(&mut db, "CREATE TABLE t (a i32, a i16)").unwrap_err();
     assert_eq!(err.code(), "42701");
 }
 
 #[test]
 fn unknown_type_is_rejected() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     let err = create(&mut db, "CREATE TABLE t (a int128)").unwrap_err();
     assert_eq!(err.code(), "42704");
     // The old jed bit-names are a CLEAN BREAK — replaced by the i/f prefix, no longer
@@ -106,7 +118,9 @@ fn pg_byte_shorthand_type_names_are_accepted() {
     // byte-namespace, so PG's byte-shorthand is accepted as aliases (CLAUDE.md §1/§4;
     // types.md §11): int2→i16, int4→i32, int8→i64, float4→f32, float8→f64. There is no
     // int8-means-8-bit collision, and a future 8-bit i8 stays free.
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     create(
         &mut db,
         "CREATE TABLE t (a int2, b int4, c int8, d float4, e float8)",
@@ -127,7 +141,9 @@ fn pg_byte_shorthand_type_names_are_accepted() {
 
 #[test]
 fn multiple_primary_keys_are_rejected() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     let err = create(
         &mut db,
         "CREATE TABLE t (a i32 PRIMARY KEY, b i32 PRIMARY KEY)",
@@ -138,7 +154,9 @@ fn multiple_primary_keys_are_rejected() {
 
 #[test]
 fn syntax_errors_are_reported() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(
         create(&mut db, "CREATE TABLE t").unwrap_err().code(),
         "42601"

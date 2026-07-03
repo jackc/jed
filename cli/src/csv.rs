@@ -229,7 +229,9 @@ mod tests {
     }
 
     fn demo_table() -> jed::Session {
-        let mut db = jed::Database::new_in_memory().session(jed::SessionOptions::default());
+        let mut db = jed::Database::create(jed::CreateOptions::default())
+            .expect("in-memory create is infallible")
+            .session(jed::SessionOptions::default());
         db.execute("CREATE TABLE t (id i32 PRIMARY KEY, name text, score numeric(5,2), ok boolean DEFAULT true)", &[])
         .unwrap();
         db

@@ -8,10 +8,12 @@
 //! `SELECT distinct` lookahead consequence — → 42703; an untyped $1 → 42P18).
 
 use jed::value::Value;
-use jed::{Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn db_with(stmts: &[&str]) -> Session {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     for s in stmts {
         db.execute(s, &[])
             .unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
@@ -47,7 +49,9 @@ fn err_code(db: &mut Session, sql: &str) -> String {
 
 #[test]
 fn literal_select_returns_one_row_costing_one_row_produced() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     let out = db.execute("SELECT 1", &[]).unwrap();
     match &out {
         Outcome::Query {
@@ -64,7 +68,9 @@ fn literal_select_returns_one_row_costing_one_row_produced() {
 
 #[test]
 fn expression_select_charges_its_operator_evals() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(query(&mut db, "SELECT 1 + 2"), vec![vec![Value::Int(3)]]);
     // 1 operator_eval (the `+` node) + 1 row_produced.
     assert_eq!(cost(&mut db, "SELECT 1 + 2"), 2);
@@ -72,7 +78,9 @@ fn expression_select_charges_its_operator_evals() {
 
 #[test]
 fn where_filters_the_virtual_row() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(
         query(&mut db, "SELECT 1 WHERE false"),
         Vec::<Vec<Value>>::new()
@@ -88,7 +96,9 @@ fn where_filters_the_virtual_row() {
 
 #[test]
 fn aggregates_fold_the_single_group() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     // The virtual row is the one input row of the whole-table group (aggregates.md §4).
     assert_eq!(query(&mut db, "SELECT count(*)"), vec![vec![Value::Int(1)]]);
     assert_eq!(cost(&mut db, "SELECT count(*)"), 2); // 1 aggregate_accumulate + 1 row_produced
@@ -108,7 +118,9 @@ fn aggregates_fold_the_single_group() {
 
 #[test]
 fn distinct_and_limit_apply_to_the_single_row() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(
         query(&mut db, "SELECT DISTINCT 1"),
         vec![vec![Value::Int(1)]]
@@ -124,7 +136,9 @@ fn distinct_and_limit_apply_to_the_single_row() {
 
 #[test]
 fn set_operation_operands() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     let mut got: Vec<i64> = query(&mut db, "SELECT 1 UNION SELECT 2")
         .into_iter()
         .map(|r| match r[0] {
@@ -178,7 +192,9 @@ fn insert_select_source() {
 
 #[test]
 fn star_with_no_tables_is_42601_with_pg_message() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     let err = db.execute("SELECT *", &[]).unwrap_err();
     assert_eq!(err.code(), "42601");
     assert_eq!(
@@ -189,7 +205,9 @@ fn star_with_no_tables_is_42601_with_pg_message() {
 
 #[test]
 fn bare_columns_resolve_nothing() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(err_code(&mut db, "SELECT nope"), "42703");
     // The DISTINCT two-token lookahead is unchanged: at end of input the word is a column
     // reference, not the modifier (grammar.md §34 — previously died at the FROM expect).
@@ -202,7 +220,9 @@ fn bare_columns_resolve_nothing() {
 
 #[test]
 fn untyped_param_is_42p18_and_a_sibling_operand_types_it() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     let err = db.execute("SELECT $1", &[Value::Int(7)]).unwrap_err();
     assert_eq!(err.code(), "42P18");
     // The sibling-operand rule (grammar.md §5) works without a FROM.

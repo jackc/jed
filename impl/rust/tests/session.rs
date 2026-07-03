@@ -7,7 +7,7 @@
 //! SQL-in/rows-out — CLAUDE.md §10), so they live here.
 
 use jed::value::Value;
-use jed::{Database, Outcome, SessionOptions, TxStatus};
+use jed::{CreateOptions, Database, Outcome, SessionOptions, TxStatus};
 
 fn rows(o: Outcome) -> Vec<Vec<Value>> {
     match o {
@@ -20,7 +20,9 @@ fn rows(o: Outcome) -> Vec<Vec<Value>> {
 fn default_session_is_stateful_across_calls() {
     // A session holds an open BEGIN block across *separate* calls (the PG/SQLite connection model,
     // §2.1), and `db.status()` exposes the explicit state machine.
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(db.status(), TxStatus::Idle);
 
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
@@ -42,7 +44,9 @@ fn default_session_is_stateful_across_calls() {
 fn failed_block_is_the_failed_state() {
     // A statement error inside a block poisons it: status is `Failed`, every later statement but
     // ROLLBACK/COMMIT is 25P02 (§2.2 / transactions.md §6), and ROLLBACK returns to Idle.
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.execute("BEGIN", &[]).unwrap();
     assert_eq!(
         db.execute("SELECT * FROM missing", &[])
@@ -61,7 +65,7 @@ fn failed_block_is_the_failed_state() {
 fn additional_session_shares_storage_with_independent_settings() {
     // Two sessions over one shared Database core: each owns its private Engine, but committed storage
     // is shared through the core (§2.4) — no swap. Settings (the cost ceiling) are independent.
-    let db = Database::new_in_memory();
+    let db = Database::create(CreateOptions::default()).unwrap();
     let mut a = db.session(SessionOptions::default());
     a.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
         .unwrap();
@@ -97,7 +101,7 @@ fn additional_session_shares_storage_with_independent_settings() {
 fn additional_session_cost_ceiling_is_enforced() {
     // The session's *settings* drive the execution path: a tiny ceiling aborts the scan with 54P01,
     // while an unlimited session runs it fine — both over the same shared core.
-    let db = Database::new_in_memory();
+    let db = Database::create(CreateOptions::default()).unwrap();
     let mut a = db.session(SessionOptions::default());
     a.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
         .unwrap();
@@ -122,7 +126,7 @@ fn additional_session_cost_ceiling_is_enforced() {
 
 #[test]
 fn additional_session_update_closure_commits_to_shared_storage() {
-    let db = Database::new_in_memory();
+    let db = Database::create(CreateOptions::default()).unwrap();
     let mut a = db.session(SessionOptions::default());
     a.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
         .unwrap();

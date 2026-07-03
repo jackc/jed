@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 
 use jed::value::Value;
-use jed::{Database, DatabaseOptions, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn tmp(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name)
@@ -61,13 +61,18 @@ fn spilling_sort_matches_in_memory_rows_and_cost() {
 
     // The source of truth: the same data + queries against a pure in-memory database, which never
     // spills (spill.md §2).
-    let mut mem = Database::new_in_memory().session(SessionOptions::default());
+    let mut mem = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     seed(&mut mem, 200);
 
     // A file-backed database with a tiny work_mem so every shape spills many runs and k-way-merges.
-    let mut db = Database::create(&path, DatabaseOptions::default())
-        .unwrap()
-        .session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions {
+        path: Some(std::path::PathBuf::from(&path)),
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
     seed(&mut db, 200);
     db.set_work_mem(128); // ~2-3 rows per run → dozens of runs, deep merge
 
@@ -113,9 +118,12 @@ fn spill_leaves_no_temp_files() {
     };
     let before = count_spill_files();
 
-    let mut db = Database::create(&path, DatabaseOptions::default())
-        .unwrap()
-        .session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions {
+        path: Some(std::path::PathBuf::from(&path)),
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
     seed(&mut db, 150);
     db.set_work_mem(64); // force heavy spilling
 
@@ -140,9 +148,12 @@ fn spilling_sort_is_stable_on_ties() {
     let path = tmp("spill_stable.jed");
     let _ = std::fs::remove_file(&path);
 
-    let mut db = Database::create(&path, DatabaseOptions::default())
-        .unwrap()
-        .session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions {
+        path: Some(std::path::PathBuf::from(&path)),
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY, k i32)", &[])
         .unwrap();
     for id in 0..100 {

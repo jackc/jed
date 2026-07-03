@@ -2,10 +2,12 @@
 //! (spec/design/decimal.md). Assertions are on the **rendered** output — the cross-core
 //! contract — since decimal value-equality (1.5 == 1.50) is intentionally scale-insensitive.
 
-use jed::{Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn db_with(stmts: &[&str]) -> Session {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     for s in stmts {
         db.execute(s, &[])
             .unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));

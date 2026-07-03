@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 use jed::value::Value;
-use jed::{Database, DatabaseOptions, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn tmp(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name)
@@ -32,7 +32,9 @@ fn err_code(db: &mut Session, sql: &str) -> String {
 /// (PostgreSQL keeps it — its sequences are non-transactional). jed is deterministic instead.
 #[test]
 fn nextval_rolls_back() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.execute("CREATE SEQUENCE s", &[]).unwrap();
     assert_eq!(one_int(&mut db, "SELECT nextval('s')"), Some(1)); // committed: last_value 1
 
@@ -55,7 +57,9 @@ fn nextval_rolls_back() {
 /// A failed autocommit statement does not advance the sequence either (the per-statement rollback).
 #[test]
 fn failed_statement_does_not_advance() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     // A two-value [1, 2] sequence (MINVALUE == MAXVALUE is rejected, matching PG — §15.2).
     db.execute("CREATE SEQUENCE s MAXVALUE 2", &[]).unwrap();
     assert_eq!(one_int(&mut db, "SELECT nextval('s')"), Some(1));
@@ -70,7 +74,9 @@ fn failed_statement_does_not_advance() {
 /// allowed there (spec/design/sequences.md §4/§6).
 #[test]
 fn nextval_in_read_only_is_25006() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.execute("CREATE SEQUENCE s", &[]).unwrap();
     one_int(&mut db, "SELECT nextval('s')"); // 1, defines the session value
 
@@ -88,7 +94,9 @@ fn nextval_in_read_only_is_25006() {
 /// currval is session-local and 55000 before the first nextval.
 #[test]
 fn currval_session_state() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.execute("CREATE SEQUENCE s", &[]).unwrap();
     assert_eq!(err_code(&mut db, "SELECT currval('s')"), "55000");
     one_int(&mut db, "SELECT nextval('s')");
@@ -103,7 +111,9 @@ fn currval_session_state() {
 /// is discarded — PostgreSQL would keep it.
 #[test]
 fn setval_rolls_back() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.execute("CREATE SEQUENCE s START 1", &[]).unwrap();
     assert_eq!(one_int(&mut db, "SELECT nextval('s')"), Some(1)); // committed last_value 1
 
@@ -118,7 +128,9 @@ fn setval_rolls_back() {
 /// An `ALTER SEQUENCE … RESTART` is transactional as well (the same §5 divergence).
 #[test]
 fn alter_restart_rolls_back() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.execute("CREATE SEQUENCE s START 10", &[]).unwrap();
     assert_eq!(one_int(&mut db, "SELECT nextval('s')"), Some(10));
 
@@ -138,7 +150,9 @@ fn alter_restart_rolls_back() {
 /// sequence — live in the oracle corpus; this asserts only the rollback, which the corpus cannot.)
 #[test]
 fn lastval_rolls_back() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.execute("CREATE SEQUENCE a START 100", &[]).unwrap();
     db.execute("CREATE SEQUENCE b START 200", &[]).unwrap();
     one_int(&mut db, "SELECT nextval('a')"); // committed: lastval → a's 100
@@ -159,7 +173,9 @@ fn lastval_rolls_back() {
 /// (The option set INCREMENT/MINVALUE/… and RENAME TO are now supported — see ddl/alter_sequence.test.)
 #[test]
 fn alter_unsupported_actions_are_0a000() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.execute("CREATE SEQUENCE s", &[]).unwrap();
     assert_eq!(err_code(&mut db, "ALTER SEQUENCE s AS bigint"), "0A000");
     assert_eq!(err_code(&mut db, "ALTER SEQUENCE s OWNED BY t.c"), "0A000");
@@ -177,7 +193,9 @@ fn alter_unsupported_actions_are_0a000() {
 /// (PG's sequence definition change is non-transactional), so a per-core unit test, not corpus.
 #[test]
 fn alter_options_roll_back() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.execute("CREATE SEQUENCE s INCREMENT 1", &[]).unwrap();
     db.execute("BEGIN", &[]).unwrap();
     db.execute("ALTER SEQUENCE s INCREMENT BY 100", &[])
@@ -192,7 +210,9 @@ fn alter_options_roll_back() {
 /// its own block, since the error poisons the block). `lastval`/`currval` (pure reads) are allowed.
 #[test]
 fn setval_alter_in_read_only_is_25006() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.execute("CREATE SEQUENCE s", &[]).unwrap();
     one_int(&mut db, "SELECT nextval('s')"); // 1, defines session state
 
@@ -221,7 +241,9 @@ fn setval_alter_in_read_only_is_25006() {
 /// auto-created OWNED sequence named `<table>_<col>_seq`. Inserts auto-number from 1.
 #[test]
 fn serial_desugars_to_owned_sequence() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.execute(
         "CREATE TABLE t (id serial PRIMARY KEY, b bigserial, s smallserial, v text)",
         &[],
@@ -252,7 +274,9 @@ fn serial_desugars_to_owned_sequence() {
 /// the default and does NOT advance the sequence (PG).
 #[test]
 fn serial_not_null_and_explicit_override() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.execute("CREATE TABLE t (id serial PRIMARY KEY, v text)", &[])
         .unwrap();
     assert_eq!(
@@ -274,7 +298,9 @@ fn serial_not_null_and_explicit_override() {
 /// An explicit DEFAULT on a serial column conflicts with the synthesized one — 42601 (PG).
 #[test]
 fn serial_with_explicit_default_is_42601() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(
         err_code(&mut db, "CREATE TABLE t (id serial DEFAULT 5)"),
         "42601"
@@ -284,7 +310,9 @@ fn serial_with_explicit_default_is_42601() {
 /// The auto-name collision-resolves with a numeric suffix when `<table>_<col>_seq` is taken (PG).
 #[test]
 fn serial_seq_name_collision_resolves() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.execute("CREATE SEQUENCE t_id_seq", &[]).unwrap();
     db.execute("CREATE TABLE t (id serial)", &[]).unwrap();
     // The pre-existing t_id_seq forced the owned sequence to t_id_seq1.
@@ -298,7 +326,9 @@ fn serial_seq_name_collision_resolves() {
 /// DROP SEQUENCE of an OWNED (serial) sequence is 2BP01; DROP TABLE auto-drops it.
 #[test]
 fn owned_sequence_drop_rules() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.execute("CREATE TABLE t (id serial PRIMARY KEY)", &[])
         .unwrap();
     // Cannot drop the owned sequence directly.
@@ -317,9 +347,12 @@ fn owned_link_survives_reopen() {
     let path = tmp("serial_owned_reopen.jed");
     let _ = std::fs::remove_file(&path);
     {
-        let mut db = Database::create(&path, DatabaseOptions::default())
-            .unwrap()
-            .session(SessionOptions::default());
+        let mut db = Database::create(CreateOptions {
+            path: Some(std::path::PathBuf::from(&path)),
+            ..Default::default()
+        })
+        .unwrap()
+        .session(SessionOptions::default());
         db.execute("CREATE TABLE t (id serial PRIMARY KEY, v text)", &[])
             .unwrap();
         db.execute("INSERT INTO t (v) VALUES ('a')", &[]).unwrap();
@@ -342,7 +375,9 @@ fn owned_link_survives_reopen() {
 /// `serial` is recognized only in a column-type position — a CAST to it is an undefined type.
 #[test]
 fn serial_is_not_a_castable_type() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     // 42704 undefined_object (serial is not a real type outside CREATE TABLE).
     assert_eq!(err_code(&mut db, "SELECT 1::serial"), "42704");
 }

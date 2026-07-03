@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 
 use jed::value::Value;
-use jed::{Database, DatabaseOptions, OpenOptions, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, OpenOptions, Outcome, Session, SessionOptions};
 
 fn tmp(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name)
@@ -16,9 +16,12 @@ fn create_commit_reopen_round_trips() {
     let path = tmp("round_trip.jed");
     let _ = std::fs::remove_file(&path);
 
-    let mut db = Database::create(&path, DatabaseOptions::default())
-        .unwrap()
-        .session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions {
+        path: Some(std::path::PathBuf::from(&path)),
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
     assert_eq!(db.txid(), 1); // the initial empty image is committed at create
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
         .unwrap();
@@ -55,14 +58,20 @@ fn open_missing_file_is_58p01() {
 fn create_over_existing_file_is_58p02() {
     let path = tmp("already_here.jed");
     let _ = std::fs::remove_file(&path);
-    Database::create(&path, DatabaseOptions::default())
-        .unwrap()
-        .session(SessionOptions::default());
+    Database::create(CreateOptions {
+        path: Some(std::path::PathBuf::from(&path)),
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
     assert_eq!(
-        Database::create(&path, DatabaseOptions::default())
-            .err()
-            .unwrap()
-            .code(),
+        Database::create(CreateOptions {
+            path: Some(std::path::PathBuf::from(&path)),
+            ..Default::default()
+        })
+        .err()
+        .unwrap()
+        .code(),
         "58P02"
     );
 }
@@ -71,9 +80,12 @@ fn create_over_existing_file_is_58p02() {
 fn create_with_custom_page_size_round_trips() {
     let path = tmp("page256.jed");
     let _ = std::fs::remove_file(&path);
-    let db = Database::create(&path, DatabaseOptions { page_size: 256 })
-        .unwrap()
-        .session(SessionOptions::default());
+    let db = Database::create(CreateOptions {
+        path: Some(std::path::PathBuf::from(&path)),
+        page_size: 256,
+    })
+    .unwrap()
+    .session(SessionOptions::default());
     assert_eq!(db.page_size(), 256);
     drop(db);
 
@@ -93,9 +105,12 @@ fn autocommit_persists_each_write_across_close() {
     // original "no autocommit" model this test used to assert.
     let path = tmp("autocommit.jed");
     let _ = std::fs::remove_file(&path);
-    let mut db = Database::create(&path, DatabaseOptions::default())
-        .unwrap()
-        .session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions {
+        path: Some(std::path::PathBuf::from(&path)),
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
         .unwrap();
     db.execute("INSERT INTO t VALUES (1)", &[]).unwrap(); // autocommitted, no explicit commit
@@ -119,7 +134,9 @@ fn autocommit_persists_each_write_across_close() {
 #[test]
 fn commit_and_rollback_are_noops_under_autocommit() {
     // With no explicit transaction open, both are lenient no-op successes (transactions.md §4.2).
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
         .unwrap();
     db.execute("INSERT INTO t VALUES (1)", &[]).unwrap();
@@ -133,7 +150,9 @@ fn commit_and_rollback_are_noops_under_autocommit() {
 
 #[test]
 fn prepare_execute_and_query_with_params() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
         .unwrap();
     let insert = db.prepare("INSERT INTO t VALUES ($1, $2)").unwrap();
@@ -152,7 +171,9 @@ fn prepare_execute_and_query_with_params() {
 
 #[test]
 fn one_shot_query_iterates_rows() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
         .unwrap();
     db.execute("INSERT INTO t VALUES (1), (2), (3)", &[])
@@ -167,7 +188,9 @@ fn one_shot_query_iterates_rows() {
 
 #[test]
 fn query_on_non_query_statement_errors() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     assert!(
         db.query("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
             .is_err()
@@ -176,13 +199,17 @@ fn query_on_non_query_statement_errors() {
 
 #[test]
 fn errors_surface_with_sqlstate() {
-    let db = Database::new_in_memory().session(SessionOptions::default());
+    let db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(db.prepare("SELCT 1").err().unwrap().code(), "42601");
 }
 
 #[test]
 fn commit_on_in_memory_is_noop_success() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
         .unwrap();
     let before = db.txid();
@@ -200,9 +227,12 @@ fn incremental_commit_round_trips_to_canonical_image() {
     // db's, byte-for-byte (spec/fileformat/format.md, *Allocation & incremental commit*).
     let path = tmp("incremental_canonical.jed");
     let _ = std::fs::remove_file(&path);
-    let mut db = Database::create(&path, DatabaseOptions::default())
-        .unwrap()
-        .session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions {
+        path: Some(std::path::PathBuf::from(&path)),
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
         .unwrap();
     db.execute("INSERT INTO t VALUES (5, 50)", &[]).unwrap();
@@ -229,9 +259,12 @@ fn open_read_only_blocks_writes_and_never_touches_the_file() {
     // 25006, and the file bytes are never touched.
     let path = tmp("readonly.jed");
     let _ = std::fs::remove_file(&path);
-    let mut db = Database::create(&path, DatabaseOptions::default())
-        .unwrap()
-        .session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions {
+        path: Some(std::path::PathBuf::from(&path)),
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
         .unwrap();
     db.execute("INSERT INTO t VALUES (1)", &[]).unwrap();
@@ -310,7 +343,9 @@ fn rows_affected_reports_dml_counts() {
     // how many rows they touched (PostgreSQL's command-tag count); a DML statement that
     // matched nothing reports Some(0); DDL and transaction control report None; DML with
     // RETURNING is a query outcome (its row count is the result's length).
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     let affected = |out: Outcome| match out {
         Outcome::Statement { rows_affected, .. } => rows_affected,
         Outcome::Query { .. } => panic!("expected a statement outcome"),
@@ -352,7 +387,9 @@ fn rows_affected_reports_dml_counts() {
 fn table_names_lists_tables_sorted_excluding_indexes() {
     // The catalog-read surface (api.md §6): canonical names, sorted ascending by
     // lowercased name; secondary indexes are relations but not tables.
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(db.table_names(), Vec::<String>::new());
     db.execute("CREATE TABLE Zed (id i32 PRIMARY KEY, v i32)", &[])
         .unwrap();

@@ -22,7 +22,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use jed::{Database, Session, Value};
+use jed::{CreateOptions, Database, Session, Value};
+
 use jed_bench::{Checksum, Prng};
 
 /// Bounds a threaded run: the balance workload finishes in well under a second, so a minute with no
@@ -513,7 +514,7 @@ fn run_file(path: &str, force_sequential: bool) -> StressResult {
     }
     res.mode = if sequential { "sequential" } else { "threaded" }.into();
 
-    let db = Database::new_in_memory();
+    let db = Database::create(CreateOptions::default()).unwrap();
     if let Err(e) = setup(&db, &f) {
         res.status = "fail".into();
         res.error = e;

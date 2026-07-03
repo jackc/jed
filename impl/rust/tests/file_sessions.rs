@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 
 use jed::value::Value;
-use jed::{Database, DatabaseOptions, OpenOptions, Session, SessionOptions};
+use jed::{CreateOptions, Database, OpenOptions, Session, SessionOptions};
 
 fn tmp(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name)
@@ -36,7 +36,11 @@ fn create_default_session_persists_and_reopens() {
     let path = tmp("file_sessions_roundtrip.jed");
     let _ = std::fs::remove_file(&path);
     {
-        let mut db = Database::create(&path, DatabaseOptions::default()).unwrap();
+        let mut db = Database::create(CreateOptions {
+            path: Some(std::path::PathBuf::from(&path)),
+            ..Default::default()
+        })
+        .unwrap();
         assert_eq!(db.version(), 1); // the initial empty image is committed as version 1
         db.execute("CREATE TABLE t (id i64 PRIMARY KEY)", &[])
             .unwrap();
@@ -61,7 +65,11 @@ fn explicit_transaction_on_a_session_persists_then_rolls_back() {
     let path = tmp("file_sessions_explicit_tx.jed");
     let _ = std::fs::remove_file(&path);
     {
-        let mut db = Database::create(&path, DatabaseOptions::default()).unwrap();
+        let mut db = Database::create(CreateOptions {
+            path: Some(std::path::PathBuf::from(&path)),
+            ..Default::default()
+        })
+        .unwrap();
         // Explicit transactions live on a Session (the persistent default-session bridge was removed
         // from `Database`): mint one over the file-backed core and drive BEGIN/COMMIT/ROLLBACK on it.
         let mut s = db.session(SessionOptions::default());
@@ -89,7 +97,11 @@ fn execute_script_on_a_file_backed_default_session_is_all_or_nothing() {
     let path = tmp("file_sessions_script.jed");
     let _ = std::fs::remove_file(&path);
     {
-        let mut db = Database::create(&path, DatabaseOptions::default()).unwrap();
+        let mut db = Database::create(CreateOptions {
+            path: Some(std::path::PathBuf::from(&path)),
+            ..Default::default()
+        })
+        .unwrap();
         let summary = db
             .execute_script(
                 "CREATE TABLE t (id i64 PRIMARY KEY); INSERT INTO t VALUES (1); INSERT INTO t VALUES (2);",
@@ -108,7 +120,11 @@ fn read_only_open_rejects_writes() {
     let path = tmp("file_sessions_read_only.jed");
     let _ = std::fs::remove_file(&path);
     {
-        let mut db = Database::create(&path, DatabaseOptions::default()).unwrap();
+        let mut db = Database::create(CreateOptions {
+            path: Some(std::path::PathBuf::from(&path)),
+            ..Default::default()
+        })
+        .unwrap();
         db.execute("CREATE TABLE t (id i64 PRIMARY KEY)", &[])
             .unwrap();
         db.execute("INSERT INTO t VALUES (1)", &[]).unwrap();
@@ -148,7 +164,11 @@ fn file_backed_readers_run_concurrently_with_a_committing_writer() {
     {
         // Small pages so the table spans several leaves (exercising real page faults), and a tiny
         // cache so reads genuinely fault from disk rather than staying fully resident.
-        let mut db = Database::create(&path, DatabaseOptions { page_size: 256 }).unwrap();
+        let mut db = Database::create(CreateOptions {
+            path: Some(std::path::PathBuf::from(&path)),
+            page_size: 256,
+        })
+        .unwrap();
         db.execute("CREATE TABLE t (id i64 PRIMARY KEY)", &[])
             .unwrap();
         db.execute("INSERT INTO t VALUES (1)", &[]).unwrap();

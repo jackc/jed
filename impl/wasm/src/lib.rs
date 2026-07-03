@@ -59,7 +59,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use jed::{
-    Database, DatabaseOptions, OpenOptions, Outcome, PreparedStatement, Rows, Session,
+    CreateOptions, Database, OpenOptions, Outcome, PreparedStatement, Rows, Session,
     SessionOptions, Value,
 };
 use std::ffi::CStr;
@@ -348,7 +348,9 @@ fn new_conn(db: Database) -> Conn {
 #[unsafe(no_mangle)]
 pub extern "C" fn jed_open_memory() -> *mut u8 {
     guard(|| {
-        ok_handle(Box::into_raw(Box::new(new_conn(Database::new_in_memory()))) as usize as u64)
+        ok_handle(Box::into_raw(Box::new(new_conn(
+            Database::create(CreateOptions::default()).expect("in-memory create is infallible"),
+        ))) as usize as u64)
     })
 }
 
@@ -360,7 +362,10 @@ pub extern "C" fn jed_create(path: *const c_char) -> *mut u8 {
             Ok(s) => s,
             Err(b) => return b,
         };
-        match Database::create(path, DatabaseOptions::default()) {
+        match Database::create(CreateOptions {
+            path: Some(std::path::PathBuf::from(path)),
+            ..Default::default()
+        }) {
             Ok(db) => ok_handle(Box::into_raw(Box::new(new_conn(db))) as usize as u64),
             Err(e) => err_buf(e.code(), &e.message),
         }

@@ -6,7 +6,7 @@
 //! and (b) finer assertions on the composite-specific NULL rules. Every expected value is pinned
 //! against PostgreSQL 18.
 
-use jed::{Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn run(db: &mut Session, sql: &str) {
     db.execute(sql, &[])
@@ -48,7 +48,9 @@ fn col(db: &mut Session, sql: &str) -> Vec<String> {
 }
 
 fn addr_db() -> Session {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     run(&mut db, "CREATE TYPE addr AS (street text, zip i32)");
     db
 }

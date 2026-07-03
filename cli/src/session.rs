@@ -167,7 +167,9 @@ mod tests {
 
     fn mem() -> Session {
         Session::new(
-            jed::Database::new_in_memory().session(jed::SessionOptions::default()),
+            jed::Database::create(jed::CreateOptions::default())
+                .expect("in-memory create is infallible")
+                .session(jed::SessionOptions::default()),
             "memory".to_string(),
         )
     }

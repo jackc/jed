@@ -6,7 +6,7 @@
 //! impl/ts/tests/returning.test.ts.
 
 use jed::value::Value;
-use jed::{Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn run(db: &mut Session, sql: &str) -> Outcome {
     db.execute(sql, &[])
@@ -42,7 +42,9 @@ fn err_code(db: &mut Session, sql: &str) -> String {
 }
 
 fn setup() -> Session {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     for s in [
         "CREATE TABLE t (id i32 PRIMARY KEY, v i32 DEFAULT 7, w i32)",
         "INSERT INTO t VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300)",
@@ -350,7 +352,9 @@ fn returning_grows_the_touched_set() {
     // ceil(100000/8180) = 13 slabs.
     let big = format!("INSERT INTO big VALUES (1, 0, '{}')", "x".repeat(100_000));
     let fresh = || {
-        let mut db = Database::new_in_memory().session(SessionOptions::default());
+        let mut db = Database::create(CreateOptions::default())
+            .unwrap()
+            .session(SessionOptions::default());
         run(
             &mut db,
             "CREATE TABLE big (id i32 PRIMARY KEY, w i32, t text)",
@@ -483,7 +487,9 @@ fn old_new_naming_and_star() {
 fn old_new_shadowed_by_table_name() {
     // A target table literally named old (or new) keeps the ordinary table-qualified
     // meaning — the row-version pseudo-relation is suppressed (PG-probed).
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     run(&mut db, "CREATE TABLE old (x i32)");
     assert_eq!(
         rows(&mut db, "INSERT INTO old VALUES (1) RETURNING old.x"),
@@ -543,7 +549,9 @@ fn old_new_touched_set() {
     // nothing. Compressed 100k text at page_size 8192 = 13 slabs.
     let big = format!("INSERT INTO big VALUES (1, 0, '{}')", "x".repeat(100_000));
     let fresh = || {
-        let mut db = Database::new_in_memory().session(SessionOptions::default());
+        let mut db = Database::create(CreateOptions::default())
+            .unwrap()
+            .session(SessionOptions::default());
         run(
             &mut db,
             "CREATE TABLE big (id i32 PRIMARY KEY, w i32, t text)",

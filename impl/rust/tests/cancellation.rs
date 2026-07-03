@@ -9,7 +9,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use jed::cost::{Lifetime, Meter};
-use jed::{CancellationToken, Database, SessionOptions};
+use jed::{CancellationToken, CreateOptions, Database, SessionOptions};
 
 /// The meter's `guard` aborts with `57014` the instant the cancel poll is flipped, independently of
 /// the cost ceilings (a zero-limit meter never aborts on cost). The token is `Arc`-shared, so flipping
@@ -37,7 +37,7 @@ fn meter_guard_honors_cancel() {
 /// runs through `Session::execute_cancelable`).
 #[test]
 fn cancel_before_run_aborts_at_boundary() {
-    let mut db = Database::new_in_memory();
+    let mut db = Database::create(CreateOptions::default()).unwrap();
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
         .unwrap();
 
@@ -65,7 +65,7 @@ fn cancel_before_run_aborts_at_boundary() {
 /// rows, proving the arming adds no spurious abort (the §8 cost determinism is untouched).
 #[test]
 fn armed_but_not_cancelled_completes() {
-    let mut db = Database::new_in_memory();
+    let mut db = Database::create(CreateOptions::default()).unwrap();
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
         .unwrap();
     for i in 1..=20 {
@@ -87,7 +87,7 @@ fn armed_but_not_cancelled_completes() {
 /// closure returns the error and `update` rolls back, exactly as for any other error.)
 #[test]
 fn cancel_in_transaction_rolls_back() {
-    let mut db = Database::new_in_memory();
+    let mut db = Database::create(CreateOptions::default()).unwrap();
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
         .unwrap();
 

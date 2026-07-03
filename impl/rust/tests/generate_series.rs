@@ -8,10 +8,12 @@
 //! generated_row cost contract + the max_cost ceiling, and the deferred-form errors.
 
 use jed::value::Value;
-use jed::{Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn db_with(stmts: &[&str]) -> Session {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     for s in stmts {
         db.execute(s, &[])
             .unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
@@ -53,7 +55,9 @@ fn ints(ns: &[i64]) -> Vec<Vec<Value>> {
 
 #[test]
 fn zero_step_is_invalid_parameter_value() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     let e = db
         .execute("SELECT * FROM generate_series(1, 5, 0)", &[])
         .expect_err("expected an error");
@@ -65,7 +69,9 @@ fn zero_step_is_invalid_parameter_value() {
 
 #[test]
 fn alias_forms_and_qualified_column() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     // PG's single-column function-alias rule: `AS g` (or the implicit `g`) renames the output
     // column to `g`, so the column is `g.g`, and `g.generate_series` is 42703 (no such column).
     assert_eq!(
@@ -103,7 +109,9 @@ fn alias_forms_and_qualified_column() {
 
 #[test]
 fn param_argument() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     let out = db
         .execute("SELECT * FROM generate_series(1, $1)", &[Value::Int(3)])
         .unwrap();
@@ -135,7 +143,9 @@ fn sibling_reference_works_implicitly_lateral() {
 
 #[test]
 fn generated_row_cost_and_ceiling() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     // 4 generated_row + 4 row_produced.
     assert_eq!(cost(&mut db, "SELECT * FROM generate_series(1, 4)"), 8);
     // A runaway series aborts deterministically once accrued cost reaches the ceiling (54P01),
@@ -151,7 +161,9 @@ fn generated_row_cost_and_ceiling() {
 
 #[test]
 fn mixed_width_promotes_to_the_wider_type() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     let out = db
         .execute(
             "SELECT * FROM generate_series(CAST(1 AS i16), CAST(5 AS i32))",
@@ -169,7 +181,9 @@ fn mixed_width_promotes_to_the_wider_type() {
 
 #[test]
 fn i64_overflow_while_stepping_stops_cleanly() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     // Stepping past i64::MAX must STOP, not trap: the last representable element is emitted then
     // the series ends (matching PostgreSQL). start = MAX-1, step 2 → just {MAX-1}.
     assert_eq!(
@@ -185,7 +199,9 @@ fn i64_overflow_while_stepping_stops_cleanly() {
 
 #[test]
 fn deferred_and_bad_call_errors() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     // SELECT-list SRF is deferred — `generate_series` is not a scalar function.
     assert_eq!(err_code(&mut db, "SELECT generate_series(1, 5)"), "42883");
     // Column-alias list on a table function is deferred.

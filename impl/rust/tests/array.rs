@@ -4,7 +4,7 @@
 //! scalar elements; multidim values, arrays-in-keys, slices, and the array function surface are
 //! deferred (§12).
 
-use jed::{Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn run(db: &mut Session, sql: &str) {
     db.execute(sql, &[])
@@ -37,7 +37,9 @@ fn query(db: &mut Session, sql: &str) -> Vec<Vec<String>> {
 /// array). The on-disk array body is version-independent (spec/design/array.md §4).
 #[test]
 fn array_image_roundtrip() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     run(
         &mut db,
         "CREATE TABLE t (id i32 PRIMARY KEY, xs i32[], tags text[])",
@@ -75,7 +77,9 @@ fn array_image_roundtrip() {
 /// composite, field access reads into it, a slice yields `addr[]`.
 #[test]
 fn array_of_composite_roundtrip_and_access() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     run(&mut db, "CREATE TYPE addr AS (street text, zip i32)");
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, items addr[])");
     // The text-literal construction path.
@@ -117,7 +121,9 @@ fn array_of_composite_roundtrip_and_access() {
 /// codec — composite element bodies inside the array body; complements the cross-core golden).
 #[test]
 fn array_of_composite_image_roundtrip() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     run(&mut db, "CREATE TYPE addr AS (street text, zip i32)");
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, items addr[])");
     run(
@@ -147,7 +153,9 @@ fn array_of_composite_image_roundtrip() {
 /// `<` FALSE; a NULL field sorts AFTER a present field (spec/design/array.md §5, oracle-pinned).
 #[test]
 fn array_of_composite_null_field_ordering_operators() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     run(&mut db, "CREATE TYPE addr AS (street text, zip i32)");
     // Equal arrays with a NULL composite field: definite, never UNKNOWN.
     assert_eq!(
@@ -174,7 +182,9 @@ fn array_of_composite_null_field_ordering_operators() {
 /// §8) — the new element type does not relax the key gate.
 #[test]
 fn array_of_composite_primary_key_is_0a000() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     run(&mut db, "CREATE TYPE addr AS (street text, zip i32)");
     assert_eq!(
         err(&mut db, "CREATE TABLE t (items addr[] PRIMARY KEY)"),

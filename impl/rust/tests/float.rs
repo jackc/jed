@@ -3,10 +3,12 @@
 //! tag tolerates layout, but these finite values render identically), the total order, the trap
 //! model, strict-island coercion, the casts, the canonical-order-fold SUM/AVG, and a transcendental.
 
-use jed::{Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn db_with(stmts: &[&str]) -> Session {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     for s in stmts {
         db.execute(s, &[])
             .unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
@@ -123,7 +125,9 @@ fn distinct_and_group_by_collapse_neg_zero_and_nan() {
 
 #[test]
 fn rendering_of_special_values() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(one(&mut db, "SELECT float 'Infinity'"), "Infinity");
     assert_eq!(one(&mut db, "SELECT float '-Infinity'"), "-Infinity");
     assert_eq!(one(&mut db, "SELECT float 'NaN'"), "NaN");

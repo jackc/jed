@@ -7,10 +7,12 @@
 //! shapes; this exercises the per-vector boundary and that the abort is independent of `max_cost`.
 
 use jed::parser::{MAX_EXPR_DEPTH, Parser};
-use jed::{Database, Session, SessionOptions};
+use jed::{CreateOptions, Database, Session, SessionOptions};
 
 fn db() -> Session {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
         .unwrap();
     db.execute("INSERT INTO t VALUES (1, 1)", &[]).unwrap();

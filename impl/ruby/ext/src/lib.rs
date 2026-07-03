@@ -55,7 +55,7 @@
 // wrapping the safe core (CLAUDE.md §13; ruby.md §4).
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use jed::{Database, DatabaseOptions, OpenOptions, Outcome, Session, SessionOptions, Value};
+use jed::{CreateOptions, Database, OpenOptions, Outcome, Session, SessionOptions, Value};
 use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -335,10 +335,14 @@ pub extern "C" fn jed_abi_version() -> u32 {
 }
 
 /// Open a new in-memory database. Infallible; returns an opaque handle (null only on an internal
-/// panic, which cannot happen for `Database::new_in_memory`).
+/// panic, which cannot happen for the in-memory `Database::create`).
 #[unsafe(no_mangle)]
 pub extern "C" fn jed_open_memory() -> *mut Conn {
-    match catch_unwind(|| Box::into_raw(Box::new(new_conn(Database::new_in_memory())))) {
+    match catch_unwind(|| {
+        Box::into_raw(Box::new(new_conn(
+            Database::create(CreateOptions::default()).expect("in-memory create is infallible"),
+        )))
+    }) {
         Ok(p) => p,
         Err(_) => std::ptr::null_mut(),
     }
@@ -353,7 +357,10 @@ pub extern "C" fn jed_create(path: *const c_char) -> *mut u8 {
             Ok(s) => s,
             Err(b) => return b,
         };
-        match Database::create(path, DatabaseOptions::default()) {
+        match Database::create(CreateOptions {
+            path: Some(std::path::PathBuf::from(path)),
+            ..Default::default()
+        }) {
             Ok(db) => ok_handle(db),
             Err(e) => err_buf(e.code(), &e.message),
         }

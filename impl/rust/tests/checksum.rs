@@ -10,7 +10,7 @@
 //! `XX001` or the byte-identical correct result — corruption is **caught or inert, never silent**.
 //! Mirrored in Go (checksum_test.go) and TS (tests/checksum.test.ts).
 
-use jed::{Database, DatabaseOptions, Outcome, Result, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Result, Session, SessionOptions};
 
 const PAGE_SIZE: u32 = 256;
 
@@ -51,12 +51,10 @@ fn scan(path: &std::path::Path) -> Result<Vec<Vec<String>>> {
 /// Seed a file whose tree spans every body-page kind at `page_size = 256`: a multi-leaf B-tree
 /// (interior root) of ~30 rows, with row 1 a 600-char incompressible body that spills out-of-line.
 fn seed(path: &std::path::Path) {
-    let mut db = Database::create(
-        path,
-        DatabaseOptions {
-            page_size: PAGE_SIZE,
-        },
-    )
+    let mut db = Database::create(CreateOptions {
+        path: Some(std::path::PathBuf::from(path)),
+        page_size: PAGE_SIZE,
+    })
     .unwrap()
     .session(SessionOptions::default());
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY, body text)", &[])

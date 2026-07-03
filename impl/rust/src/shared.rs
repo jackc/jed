@@ -69,7 +69,7 @@ use crate::executor::{
     CachedPlan, CollationInfo, Engine, Outcome, ScriptSummary, SessionOptions, SessionState,
     Snapshot, TxStatus, stmt_is_write,
 };
-use crate::file::{DatabaseOptions, OpenOptions};
+use crate::file::{CreateOptions, DatabaseOptions, OpenOptions};
 use crate::privileges::{PrivilegeSet, Privileges};
 use crate::value::Value;
 use std::cell::RefCell;
@@ -478,22 +478,17 @@ pub struct Database(Arc<Shared>);
 
 impl Default for Database {
     fn default() -> Self {
-        Self::new_in_memory()
+        Self::in_memory(crate::executor::DEFAULT_PAGE_SIZE)
     }
 }
 
 impl Database {
-    /// A fresh, empty in-memory shared core (committed version 0, no backing file).
-    pub fn new_in_memory() -> Database {
-        Database::new_in_memory_with_page_size(crate::executor::DEFAULT_PAGE_SIZE)
-    }
-
-    /// A fresh, empty in-memory shared core that serializes/splits at `page_size`. The page-backed
-    /// B-tree's fan-out tracks the page size (spec/fileformat/format.md), so an in-memory tree must
-    /// be built at the size it will serialize to — this builds byte-level fixtures / tests a
-    /// non-default page size (the shared-core analogue of `Engine::with_page_size`); a normal
-    /// in-memory database uses [`Database::new_in_memory`] (the default page size).
-    pub fn new_in_memory_with_page_size(page_size: u32) -> Database {
+    /// A fresh, empty in-memory shared core that serializes/splits at `page_size` (private —
+    /// [`Database::create`]'s in-memory branch, [`Database::default`], and the test helpers are its
+    /// callers). The page-backed B-tree's fan-out tracks the page size (spec/fileformat/format.md),
+    /// so an in-memory tree must be built at the size it will serialize to; that is why
+    /// [`CreateOptions::page_size`] is meaningful for the in-memory backing too.
+    fn in_memory(page_size: u32) -> Database {
         // B3 (bplus-reshape.md): an in-memory database is a `MemoryBlockStore` seeded with the
         // empty from-scratch image, read/written through the same pager + Packed path as a file.
         // txid 0 is the pre-first-commit version (the same committed version an in-memory core
@@ -627,11 +622,25 @@ impl Database {
         snap.rows_in_key_order(name)
     }
 
-    /// Create a **new** file-backed shared database at `path` (spec/design/api.md §2). `58P02` if the
-    /// path already exists. The page size is locked into the file. (The shared-core analogue of
-    /// [`Engine::create`].)
-    pub fn create<P: AsRef<Path>>(path: P, opts: DatabaseOptions) -> Result<Database> {
-        Ok(Database::from_engine(Engine::create(path, opts)?))
+    /// Create a **new** shared database — in-memory (`opts.path` is `None`) or file-backed
+    /// (`opts.path` is `Some`) — and return the host handle (spec/design/api.md §2.1). A file that
+    /// already exists is `58P02`; the page size (`0` → [`DEFAULT_PAGE_SIZE`](crate::executor::DEFAULT_PAGE_SIZE))
+    /// is locked into a file's meta at creation. The in-memory path cannot fail in substance (its
+    /// returned `Result` is always `Ok`) but shares the uniform `Result` signature — a caller
+    /// wanting an infallible in-memory handle wraps this (api.md §2.1.1).
+    pub fn create(opts: CreateOptions) -> Result<Database> {
+        let page_size = if opts.page_size == 0 {
+            crate::executor::DEFAULT_PAGE_SIZE
+        } else {
+            opts.page_size
+        };
+        match opts.path {
+            Some(path) => Ok(Database::from_engine(Engine::create(
+                path,
+                DatabaseOptions { page_size },
+            )?)),
+            None => Ok(Database::in_memory(page_size)),
+        }
     }
 
     /// Open an **existing** file-backed shared database at `path` with default open settings.
@@ -1593,7 +1602,7 @@ mod cancel_internal_tests {
     /// surface-during-iteration contract S4 adds; the cancel-threads-through-the-meter proof is unchanged.)
     #[test]
     fn cancel_mid_scan_aborts_via_meter() {
-        let mut db = Database::new_in_memory();
+        let mut db = Database::create(CreateOptions::default()).unwrap();
         db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
             .unwrap();
         for i in 1..=20 {
@@ -1656,7 +1665,11 @@ mod temp_reclaim_internal_tests {
     /// compaction on the (single) main storage domain — a white-box reach into the private core (the
     /// analogue of the Go test's `db.core.storage`; the main domain is reconstruct-on-open by default).
     fn churn_in_memory(reclaim: bool, rounds: usize) -> (u32, Database) {
-        let db = Database::new_in_memory_with_page_size(256);
+        let db = Database::create(CreateOptions {
+            page_size: 256,
+            ..Default::default()
+        })
+        .unwrap();
         db.0.storage.lock().unwrap().reclaim_within_session = reclaim;
         let mut sess = db.session(SessionOptions::default());
         sess.execute("CREATE TABLE t (id i32 PRIMARY KEY, pad text)", &[])
@@ -1716,7 +1729,11 @@ mod temp_reclaim_internal_tests {
 
     #[test]
     fn compaction_defers_while_older_reader_pinned() {
-        let db = Database::new_in_memory_with_page_size(256);
+        let db = Database::create(CreateOptions {
+            page_size: 256,
+            ..Default::default()
+        })
+        .unwrap();
         db.0.storage.lock().unwrap().reclaim_within_session = true;
         let mut sess = db.session(SessionOptions::default());
         sess.execute("CREATE TABLE t (id i32 PRIMARY KEY, pad text)", &[])
@@ -1767,7 +1784,11 @@ mod temp_reclaim_internal_tests {
 
     #[test]
     fn session_local_temp_runs_through_blockstore() {
-        let db = Database::new_in_memory_with_page_size(256);
+        let db = Database::create(CreateOptions {
+            page_size: 256,
+            ..Default::default()
+        })
+        .unwrap();
         let mut sess = db.session(SessionOptions::default());
         sess.execute("CREATE TEMP TABLE lt (id i32 PRIMARY KEY, pad text)", &[])
             .unwrap();
@@ -1816,7 +1837,11 @@ mod temp_reclaim_internal_tests {
     fn multi_leaf_temp_past_page_budget_aborts_54p03() {
         // ~20 pages of budget: a single leaf (≤ ~240 record bytes) is far under it, so a record-byte
         // measure would never abort; the page footprint crosses it as the tree grows past ~20 pages.
-        let db = Database::new_in_memory_with_page_size(256);
+        let db = Database::create(CreateOptions {
+            page_size: 256,
+            ..Default::default()
+        })
+        .unwrap();
         let mut opts = SessionOptions::default();
         opts.temp_buffers = 20 * 256;
         let mut sess = db.session(opts);

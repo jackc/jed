@@ -15,7 +15,8 @@
 //! core is the writer; the Go/TS harnesses stay pure verifiers, so re-running them is the
 //! independent cross-core check that all cores agree on the new costs (CLAUDE.md §8).
 
-use jed::{Database, Outcome, SUPPORTED_CAPABILITIES, Session as JedSession, Value};
+use jed::{CreateOptions, Database, Outcome, SUPPORTED_CAPABILITIES, Session as JedSession, Value};
+
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -583,9 +584,12 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
     // committed read faults from disk; in MEMORY mode it is a fresh in-memory Database
     // (spec/design/conformance.md §3).
     let mut db = match &tmp_path {
-        Some(p) => Database::create(p, jed::DatabaseOptions::default())
-            .map_err(|e| format!("disk mode: create {}: {}", p.display(), e.message))?,
-        None => Database::new_in_memory(),
+        Some(p) => Database::create(CreateOptions {
+            path: Some(std::path::PathBuf::from(p)),
+            ..Default::default()
+        })
+        .map_err(|e| format!("disk mode: create {}: {}", p.display(), e.message))?,
+        None => Database::create(CreateOptions::default()).unwrap(),
     };
     // `on_temp` tracks whether db/sess still point at the reopenable temp-file handle (a `# fixture:`
     // swap flips it off — but fixtures are `# skip: disk`, so that never coexists with disk mode).
@@ -877,7 +881,7 @@ fn rebaseline_file(text: &str) -> Option<String> {
         return None;
     }
     let mut out: Vec<String> = text.lines().map(str::to_string).collect();
-    let mut db = Database::new_in_memory();
+    let mut db = Database::create(CreateOptions::default()).unwrap();
     // One explicit session per file (see `run_file`): `Database` no longer keeps a persistent
     // default session, so the cost walk drives the same per-file session it would in `run_file`.
     let mut sess = db.session(jed::SessionOptions::default());
@@ -1471,7 +1475,7 @@ fn run_concurrency_file_threaded(text: &str) -> Result<(), String> {
 /// threaded run consistent with the schedule must produce. `gate_holder` is the live writer's sid
 /// (the single-writer gate), and `blocked` is the at-most-one writer queued on it.
 fn run_steps_sequential(steps: &[Step]) -> Result<(), String> {
-    let db = Database::new_in_memory();
+    let db = Database::create(CreateOptions::default()).unwrap();
     let mut sessions: HashMap<String, Session> = HashMap::new();
     let mut gate_holder: Option<String> = None; // the live writer holding the gate
     let mut blocked: Option<String> = None; // a writer queued on the gate (Layer 2 `blocks`)
@@ -1661,7 +1665,7 @@ struct Driver {
 impl Driver {
     fn new() -> Self {
         Driver {
-            db: Database::new_in_memory(),
+            db: Database::create(CreateOptions::default()).unwrap(),
             workers: HashMap::new(),
             gate_holder: None,
             blocked: None,

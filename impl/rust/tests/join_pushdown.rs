@@ -6,12 +6,14 @@
 //! bounded) vs `WHERE a.k = c` (not the PK, full scan), which return the SAME row because k == id.
 
 use jed::value::Value;
-use jed::{Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 /// `a` is `n` rows (id i32 PRIMARY KEY, k i32; k == id), wide enough to span several leaves; `b`
 /// is three small rows whose k-values exist as a's k-values, so the join matches.
 fn tables(n: i64) -> Session {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.execute("CREATE TABLE a (id i32 PRIMARY KEY, k i32)", &[])
         .unwrap();
     db.execute("CREATE TABLE b (id i32 PRIMARY KEY, k i32)", &[])

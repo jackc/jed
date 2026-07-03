@@ -6,7 +6,7 @@
 //! checks here run alongside (CLAUDE.md §10 — the per-core test covers only what the corpus cannot).
 
 use jed::value::Value;
-use jed::{Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn err_code(db: &mut Session, sql: &str) -> String {
     match db.execute(sql, &[]) {
@@ -30,7 +30,9 @@ const UUID16: [u8; 16] = [
 /// uuid → bytea is the 16 raw bytes (PG: 42846 — jed adds this cast).
 #[test]
 fn uuid_to_bytea_is_the_16_bytes() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(
         one(
             &mut db,
@@ -44,7 +46,9 @@ fn uuid_to_bytea_is_the_16_bytes() {
 /// hyphen-less hex; the result renders as the canonical lowercase uuid.
 #[test]
 fn bytea_to_uuid_is_the_16_bytes() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(
         one(
             &mut db,
@@ -58,7 +62,9 @@ fn bytea_to_uuid_is_the_16_bytes() {
 /// there is no PG code to match, so jed reuses invalid_text_representation).
 #[test]
 fn bytea_to_uuid_wrong_length_traps_22p02() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(err_code(&mut db, "SELECT '\\xabcd'::bytea::uuid"), "22P02"); // 2 bytes
     assert_eq!(err_code(&mut db, "SELECT '\\x'::bytea::uuid"), "22P02"); // empty (0 bytes)
     // 17 bytes (one too many)
@@ -75,7 +81,9 @@ fn bytea_to_uuid_wrong_length_traps_22p02() {
 /// equals the bytea column, and the bytea column → uuid equals the uuid column. NULL adapts.
 #[test]
 fn uuid_bytea_round_trip_through_columns() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY, u uuid, b bytea)", &[])
         .unwrap();
     db.execute(
@@ -107,7 +115,9 @@ fn uuid_bytea_round_trip_through_columns() {
 /// runtime text→uuid parses PG-flexibly (22P02 on malformed), uuid→text renders canonical lowercase.
 #[test]
 fn text_uuid_smoke() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY, s text, u uuid)", &[])
         .unwrap();
     // an UPPERCASE text value casts to the same 16 bytes and renders lowercase

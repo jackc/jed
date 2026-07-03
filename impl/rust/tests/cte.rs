@@ -6,10 +6,12 @@
 //! cost-ceiling termination of a non-terminating recursion (`54P01`, a host-API `max_cost`) and the
 //! inert materialization hint.
 
-use jed::{Database, Session, SessionOptions};
+use jed::{CreateOptions, Database, Session, SessionOptions};
 
 fn db_with(stmts: &[&str]) -> Session {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     for s in stmts {
         db.execute(s, &[])
             .unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
@@ -60,7 +62,9 @@ fn materialized_hint_forces_buffering() {
 /// doing real work. A per-iteration meter would never fire here, so the corpus cannot express it.
 #[test]
 fn recursive_unbounded_aborts_at_cost_ceiling() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.set_max_cost(1000);
     let err = db
         .execute(
@@ -75,7 +79,9 @@ fn recursive_unbounded_aborts_at_cost_ceiling() {
 /// *actual* accrued cost, not a per-iteration figure).
 #[test]
 fn recursive_under_ceiling_succeeds() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     // The 5-row counter accrues 29 (the corpus cost contract); a ceiling above it lets it through.
     db.set_max_cost(1000);
     let r = db.execute("WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 5) SELECT n FROM c", &[])
@@ -87,7 +93,9 @@ fn recursive_under_ceiling_succeeds() {
 /// single-reference recursive CTE still iterates to a fixpoint rather than inlining its body.
 #[test]
 fn recursive_hint_is_inert() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     for hint in ["", "MATERIALIZED ", "NOT MATERIALIZED "] {
         let sql = format!(
             "WITH RECURSIVE c(n) AS {hint}(SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 3) SELECT n FROM c ORDER BY n"

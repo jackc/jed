@@ -30,6 +30,19 @@ impl Default for DatabaseOptions {
     }
 }
 
+/// Settings for creating a fresh database (spec/design/api.md §2.1). `path` selects the backing:
+/// `None` builds an **in-memory** database (never touches the filesystem); `Some(p)` builds a
+/// **single-file** database at `p` (`58P02` if it already exists). `page_size` (`0` →
+/// [`DEFAULT_PAGE_SIZE`](crate::executor::DEFAULT_PAGE_SIZE)) is locked into a file's meta at
+/// creation and fixes an in-memory database's tree fan-out, so it is meaningful for both backings.
+/// The default value (`path: None`, `page_size: 0`) is a default in-memory database at the default
+/// page size.
+#[derive(Clone, Debug, Default)]
+pub struct CreateOptions {
+    pub path: Option<PathBuf>,
+    pub page_size: u32,
+}
+
 /// Open-time settings for a file-backed database (spec/design/api.md §2.1). Unlike
 /// [`DatabaseOptions`] (create-time, fixed into the file), these are **handle** settings — not stored
 /// in the file, so a different host may reopen the same file with different ones.

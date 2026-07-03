@@ -7,7 +7,7 @@
 //! (§7). Mirrored in impl/go/writable_cte_test.go and impl/ts/tests/writable_cte.test.ts.
 
 use jed::value::Value;
-use jed::{Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn run(db: &mut Session, sql: &str) -> Outcome {
     db.execute(sql, &[])
@@ -54,7 +54,9 @@ fn setup(db: &mut Session) {
 
 #[test]
 fn with_on_insert_primary_no_returning_reports_affected_count() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     setup(&mut db);
     exec(&mut db, "CREATE TABLE dst (x i32)");
     // A WITH feeding an INSERT primary with no RETURNING is a STATEMENT whose count is the
@@ -69,7 +71,9 @@ fn with_on_insert_primary_no_returning_reports_affected_count() {
 
 #[test]
 fn with_on_delete_primary_no_returning_reports_affected_count() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     setup(&mut db);
     let n = affected(
         &mut db,
@@ -81,7 +85,9 @@ fn with_on_delete_primary_no_returning_reports_affected_count() {
 
 #[test]
 fn with_on_update_primary_no_returning_reports_affected_count() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     setup(&mut db);
     let n = affected(
         &mut db,
@@ -92,7 +98,9 @@ fn with_on_update_primary_no_returning_reports_affected_count() {
 
 #[test]
 fn data_modifying_cte_count_not_surfaced_under_select_primary() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     setup(&mut db);
     // The data-modifying CTE inserts 1 row, but the SELECT primary's result is what is returned —
     // and it reads the PRE-statement table (the pin, §2), so count is 3, not 4.
@@ -112,7 +120,9 @@ fn data_modifying_cte_count_not_surfaced_under_select_primary() {
 
 #[test]
 fn same_row_two_updates_last_write_wins() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     setup(&mut db);
     // Two CTEs update id=1. Each reads the PIN (pre-statement v=10) and returns its own new value,
     // so BOTH return a row; the writes apply in lexical order, last-write-wins, so the table ends
@@ -138,7 +148,9 @@ fn same_row_two_updates_last_write_wins() {
 
 #[test]
 fn same_row_update_then_delete_delete_wins() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     setup(&mut db);
     // CTE a updates id=1 to 100; CTE b deletes id=1. Both read the pin (the pre-statement row), so
     // a returns 100 and b returns the pre-statement old value 10; b's delete applies after a's
@@ -149,7 +161,9 @@ fn same_row_update_then_delete_delete_wins() {
     ));
     assert_eq!(upd, vec![100]);
     // Reset and run the combined conflict.
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     setup(&mut db);
     let r = i32s(rows(
         &mut db,

@@ -9,7 +9,7 @@
 //! layer as a loud poison panic, never silent NULL). Mirrored in Go (lazy_inline_values_test.go)
 //! and TS (tests/lazy_inline_values.test.ts).
 
-use jed::{Database, DatabaseOptions, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn tmp(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(name)
@@ -88,19 +88,21 @@ fn paged_inline_values_match_resident_across_query_shapes() {
     let path = tmp("jed_l2_shapes.jed");
     let _ = std::fs::remove_file(&path);
     {
-        let mut db = Database::create(
-            &path,
-            DatabaseOptions {
-                page_size: jed::DEFAULT_PAGE_SIZE,
-            },
-        )
+        let mut db = Database::create(CreateOptions {
+            path: Some(std::path::PathBuf::from(&path)),
+            page_size: jed::DEFAULT_PAGE_SIZE,
+        })
         .unwrap()
         .session(SessionOptions::default());
         seed(&mut db);
         drop(db);
     }
-    let mut mem = Database::new_in_memory_with_page_size(jed::DEFAULT_PAGE_SIZE)
-        .session(SessionOptions::default());
+    let mut mem = Database::create(CreateOptions {
+        page_size: jed::DEFAULT_PAGE_SIZE,
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
     seed(&mut mem);
     let mut paged = Database::open(&path)
         .unwrap()
@@ -185,19 +187,21 @@ fn mutations_preserve_untouched_inline_values() {
     let path = tmp("jed_l2_mutations.jed");
     let _ = std::fs::remove_file(&path);
     {
-        let mut db = Database::create(
-            &path,
-            DatabaseOptions {
-                page_size: jed::DEFAULT_PAGE_SIZE,
-            },
-        )
+        let mut db = Database::create(CreateOptions {
+            path: Some(std::path::PathBuf::from(&path)),
+            page_size: jed::DEFAULT_PAGE_SIZE,
+        })
         .unwrap()
         .session(SessionOptions::default());
         seed(&mut db);
         drop(db);
     }
-    let mut mem = Database::new_in_memory_with_page_size(jed::DEFAULT_PAGE_SIZE)
-        .session(SessionOptions::default());
+    let mut mem = Database::create(CreateOptions {
+        page_size: jed::DEFAULT_PAGE_SIZE,
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
     seed(&mut mem);
 
     let mutations = [
@@ -277,12 +281,10 @@ fn untouched_corrupt_inline_body_defers_its_error() {
     // A distinctive 32-byte marker that appears only in the corruptible text body.
     let marker = "Zq7Zq7Zq7Zq7Zq7Zq7Zq7Zq7Zq7Zq7Zq"; // 32 chars, no overlap with catalog text
     {
-        let mut db = Database::create(
-            &path,
-            DatabaseOptions {
-                page_size: jed::DEFAULT_PAGE_SIZE,
-            },
-        )
+        let mut db = Database::create(CreateOptions {
+            path: Some(std::path::PathBuf::from(&path)),
+            page_size: jed::DEFAULT_PAGE_SIZE,
+        })
         .unwrap()
         .session(SessionOptions::default());
         db.execute("CREATE TABLE t (id i32 PRIMARY KEY, body text, n i32)", &[])
@@ -354,11 +356,16 @@ fn untouched_corrupt_inline_body_defers_its_error() {
 fn untouched_deferred_column_rides_a_spilling_sort() {
     let path = tmp("jed_l2_spill.jed");
     let _ = std::fs::remove_file(&path);
-    let mut mem = Database::new_in_memory().session(SessionOptions::default());
+    let mut mem = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     {
-        let mut db = Database::create(&path, DatabaseOptions::default())
-            .unwrap()
-            .session(SessionOptions::default());
+        let mut db = Database::create(CreateOptions {
+            path: Some(std::path::PathBuf::from(&path)),
+            ..Default::default()
+        })
+        .unwrap()
+        .session(SessionOptions::default());
         for db in [&mut mem as &mut Session, &mut db] {
             db.execute(
                 "CREATE TABLE t (id i32 PRIMARY KEY, k i32, label text, doc jsonb)",

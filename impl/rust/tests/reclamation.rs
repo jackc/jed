@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 
 use jed::value::Value;
-use jed::{Database, DatabaseOptions, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 const PS: u64 = 256;
 
@@ -61,12 +61,10 @@ fn pad_of(db: &mut Session, id: i64) -> Option<String> {
 
 fn setup(path: &PathBuf, rows: i64) -> Session {
     let _ = std::fs::remove_file(path);
-    let mut db = Database::create(
-        path,
-        DatabaseOptions {
-            page_size: PS as u32,
-        },
-    )
+    let mut db = Database::create(CreateOptions {
+        path: Some(std::path::PathBuf::from(path)),
+        page_size: PS as u32,
+    })
     .unwrap()
     .session(SessionOptions::default());
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY, pad text)", &[])

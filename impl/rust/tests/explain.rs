@@ -4,7 +4,9 @@
 //! itself is asserted in the corpus (query/explain*.test, dml/explain_dml.test), which runs on every
 //! core, so it is deliberately NOT re-tested here (CLAUDE.md §10 — corpus by default).
 
-use jed::{Database, Outcome, Privilege, PrivilegeSet, Session, SessionOptions, Value};
+use jed::{
+    CreateOptions, Database, Outcome, Privilege, PrivilegeSet, Session, SessionOptions, Value,
+};
 
 fn ok(db: &mut Session, sql: &str) -> Outcome {
     db.execute(sql, &[])
@@ -34,7 +36,9 @@ fn scalar_int(db: &mut Session, sql: &str) -> i64 {
 /// even though plain EXPLAIN never executes.
 #[test]
 fn explain_delegates_inner_privileges() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     ok(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
     ok(&mut db, "INSERT INTO t VALUES (1, 10)");
     db.set_default_privileges(PrivilegeSet::EMPTY.with(Privilege::Select));
@@ -52,7 +56,9 @@ fn explain_delegates_inner_privileges() {
 /// transaction; EXPLAIN ANALYZE of a write IS a write and is rejected 25006.
 #[test]
 fn explain_write_classification() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     ok(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
     ok(&mut db, "INSERT INTO t VALUES (1, 10)");
     ok(&mut db, "BEGIN READ ONLY");
@@ -68,7 +74,9 @@ fn explain_write_classification() {
 /// Plain EXPLAIN of a DELETE does not mutate; EXPLAIN ANALYZE of an INSERT does (and persists).
 #[test]
 fn explain_analyze_executes_writes() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     ok(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
     ok(&mut db, "INSERT INTO t VALUES (1, 10)");
     ok(&mut db, "INSERT INTO t VALUES (2, 20)");
@@ -90,7 +98,9 @@ fn explain_analyze_executes_writes() {
 /// (larger) inner cost reported inside the Analyze root.
 #[test]
 fn explain_owns_render_cost() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     ok(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
     ok(&mut db, "INSERT INTO t VALUES (1, 10)");
     ok(&mut db, "INSERT INTO t VALUES (2, 20)");

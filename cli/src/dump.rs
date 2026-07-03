@@ -131,7 +131,9 @@ mod tests {
     }
 
     fn rich_db() -> jed::Session {
-        let mut db = jed::Database::new_in_memory().session(jed::SessionOptions::default());
+        let mut db = jed::Database::create(jed::CreateOptions::default())
+            .expect("in-memory create is infallible")
+            .session(jed::SessionOptions::default());
         for sql in [
             "CREATE TABLE users (
                 id i32,
@@ -187,7 +189,9 @@ mod tests {
     fn dump_replays_to_an_identical_dump() {
         let mut db = rich_db();
         let first = dump_to_string(&mut db);
-        let mut replayed = jed::Database::new_in_memory().session(jed::SessionOptions::default());
+        let mut replayed = jed::Database::create(jed::CreateOptions::default())
+            .expect("in-memory create is infallible")
+            .session(jed::SessionOptions::default());
         for stmt in crate::splitter::split(&first).unwrap() {
             replayed.execute(&stmt.sql, &[]).unwrap();
         }
@@ -196,7 +200,9 @@ mod tests {
 
     #[test]
     fn empty_database_dumps_an_empty_transaction() {
-        let mut db = jed::Database::new_in_memory().session(jed::SessionOptions::default());
+        let mut db = jed::Database::create(jed::CreateOptions::default())
+            .expect("in-memory create is infallible")
+            .session(jed::SessionOptions::default());
         assert_eq!(dump_to_string(&mut db), "BEGIN;\nCOMMIT;\n");
     }
 }

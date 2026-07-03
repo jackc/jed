@@ -6,7 +6,7 @@
 //! only surfaced through the window_running_sum benchmark, which reads a committed file. Mirrored in
 //! Go (window_persisted_test.go) and TS (tests/window_persisted.test.ts).
 
-use jed::{Database, DatabaseOptions, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 const PAGE_SIZE: u32 = 256;
 
@@ -23,12 +23,10 @@ fn query_rows(db: &mut Session, sql: &str) -> Vec<Vec<jed::Value>> {
 fn seed_persisted_window(path: &std::path::Path) -> Session {
     let _ = std::fs::remove_file(path);
     {
-        let mut db = Database::create(
-            path,
-            DatabaseOptions {
-                page_size: PAGE_SIZE,
-            },
-        )
+        let mut db = Database::create(CreateOptions {
+            path: Some(std::path::PathBuf::from(path)),
+            page_size: PAGE_SIZE,
+        })
         .unwrap()
         .session(SessionOptions::default());
         db.execute(

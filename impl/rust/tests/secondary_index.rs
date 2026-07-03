@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 use jed::value::Value;
-use jed::{Database, DatabaseOptions, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn tmp(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name)
@@ -48,7 +48,9 @@ fn err_code(db: &mut Session, sql: &str) -> String {
 /// The 20-row fixture the planner/cost tests run against: `v = i % 5` gives 4 rows per
 /// value, so an equality admits 4 of 20.
 fn db20() -> Session {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32)");
     for i in 1..=20 {
         run(
@@ -65,7 +67,9 @@ fn db20() -> Session {
 /// indexes in ascending lowercased-name order.
 #[test]
 fn auto_naming_matches_postgres() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     run(&mut db, "CREATE TABLE T (A i32 PRIMARY KEY, B i32)");
     run(&mut db, "CREATE INDEX ON T (B)"); // t_b_idx
     run(&mut db, "CREATE INDEX ON T (B)"); // t_b_idx1
@@ -98,7 +102,9 @@ fn auto_naming_matches_postgres() {
 /// tables; DROP mismatches are 42704/42809.
 #[test]
 fn ddl_errors_match_postgres() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     run(&mut db, "CREATE TABLE t (a i32 PRIMARY KEY, s f64)");
     // Table existence first (even with a bad column).
     assert_eq!(
@@ -231,9 +237,12 @@ fn index_ddl_is_transactional() {
 fn file_backed_paged_reopen_uses_the_index() {
     let path = tmp("secondary_index_paged.jed");
     let _ = std::fs::remove_file(&path);
-    let mut db = Database::create(&path, DatabaseOptions { page_size: 256 })
-        .unwrap()
-        .session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions {
+        path: Some(std::path::PathBuf::from(&path)),
+        page_size: 256,
+    })
+    .unwrap()
+    .session(SessionOptions::default());
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32)");
     for i in 1..=20 {
         run(

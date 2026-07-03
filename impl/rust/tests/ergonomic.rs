@@ -4,10 +4,10 @@
 //! error codes the corpus cannot express (catalog-free, host-side). The underlying SQL behavior is
 //! the corpus's job — every method funnels through the same parser + executor the raw path uses.
 
-use jed::{Database, SessionOptions, Value};
+use jed::{CreateOptions, Database, SessionOptions, Value};
 
 fn seeded() -> Database {
-    let mut db = Database::new_in_memory();
+    let mut db = Database::create(CreateOptions::default()).unwrap();
     db.run(
         "CREATE TABLE t (id i32 PRIMARY KEY, name text, score f64)",
         (),
@@ -29,7 +29,7 @@ fn seeded() -> Database {
 /// `run` binds a heterogeneous tuple and returns the affected-row count; DDL carries no count (0).
 #[test]
 fn run_binds_tuple_and_returns_affected() {
-    let mut db = Database::new_in_memory();
+    let mut db = Database::create(CreateOptions::default()).unwrap();
     assert_eq!(
         db.run("CREATE TABLE t (id i32 PRIMARY KEY, name text)", ())
             .unwrap(),
@@ -107,7 +107,7 @@ fn query_map_and_query_row() {
 /// scalar target rejects NULL with `22004`.
 #[test]
 fn null_scanning() {
-    let mut db = Database::new_in_memory();
+    let mut db = Database::create(CreateOptions::default()).unwrap();
     db.run("CREATE TABLE t (id i32 PRIMARY KEY, name text)", ())
         .unwrap();
     db.run(
@@ -129,7 +129,7 @@ fn null_scanning() {
 /// index/name `42703`.
 #[test]
 fn scan_error_codes() {
-    let mut db = Database::new_in_memory();
+    let mut db = Database::create(CreateOptions::default()).unwrap();
     db.run("CREATE TABLE t (big i64 PRIMARY KEY, label text)", ())
         .unwrap();
     db.run("INSERT INTO t VALUES ($1, $2)", (5_000_000_000_i64, "x"))
@@ -185,7 +185,7 @@ fn params_shapes() {
 /// back with the block on a thrown error).
 #[test]
 fn on_session_and_transaction() {
-    let db = Database::new_in_memory();
+    let db = Database::create(CreateOptions::default()).unwrap();
     let mut s = db.session(SessionOptions::default());
     s.run("CREATE TABLE t (id i32 PRIMARY KEY, name text)", ())
         .unwrap();

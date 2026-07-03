@@ -5,7 +5,7 @@
 //! (`DROP TABLE a, b`), and CASCADE/RESTRICT behaviors all agree with PostgreSQL and live in
 //! the corpus (suites/ddl/drop_table.test).
 
-use jed::{Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn run(db: &mut Session, sql: &str) -> jed::Result<Outcome> {
     db.execute(sql, &[])
@@ -13,7 +13,9 @@ fn run(db: &mut Session, sql: &str) -> jed::Result<Outcome> {
 
 #[test]
 fn drop_removes_table_and_rows() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i16)").unwrap();
     run(&mut db, "INSERT INTO t VALUES (1, 10), (2, 20)").unwrap();
     assert!(db.table("t").is_some());
@@ -32,7 +34,9 @@ fn drop_removes_table_and_rows() {
 
 #[test]
 fn name_is_free_to_recreate_after_drop() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i16)").unwrap();
     run(&mut db, "INSERT INTO t VALUES (1, 10)").unwrap();
     run(&mut db, "DROP TABLE t").unwrap();
@@ -44,7 +48,9 @@ fn name_is_free_to_recreate_after_drop() {
 
 #[test]
 fn drop_is_case_insensitive() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     run(&mut db, "create table T (id i32 primary key)").unwrap();
     run(&mut db, "DROP TABLE t").unwrap();
     assert!(db.table("t").is_none());
@@ -52,7 +58,9 @@ fn drop_is_case_insensitive() {
 
 #[test]
 fn drop_leaves_other_tables_intact() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     run(&mut db, "CREATE TABLE a (id i32 PRIMARY KEY)").unwrap();
     run(&mut db, "CREATE TABLE b (id i32 PRIMARY KEY)").unwrap();
     run(&mut db, "INSERT INTO b VALUES (2)").unwrap();
@@ -64,7 +72,9 @@ fn drop_leaves_other_tables_intact() {
 
 #[test]
 fn syntax_errors_are_reported() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     // A bare DROP TABLE with no name.
     assert_eq!(run(&mut db, "DROP TABLE").unwrap_err().code(), "42601");
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY)").unwrap();

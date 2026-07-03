@@ -5,10 +5,12 @@
 //! not exercise: `s.begin(writable)`, the `s.view`/`s.update` closure wrappers, the Drop
 //! rollback safety net, and `s.commit`/`s.rollback` as the same mechanism.
 
-use jed::{Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn db_with(sql: &[&str]) -> Session {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     for s in sql {
         db.execute(s, &[])
             .unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
@@ -56,7 +58,7 @@ fn dropping_a_session_with_an_open_block_rolls_back() {
     // The bbolt safety net: an unfinished transaction never silently commits. With the Session API
     // the guard is the Session itself — dropping a session that left a block open rolls the block
     // back, so a fresh session over the same shared core sees only the pre-block committed state.
-    let db = Database::new_in_memory();
+    let db = Database::create(CreateOptions::default()).unwrap();
     {
         let mut s = db.session(SessionOptions::default());
         s.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])

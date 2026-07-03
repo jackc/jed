@@ -6,10 +6,12 @@
 //! impl/go/composite_pk_test.go and impl/ts/tests/composite_pk.test.ts.
 
 use jed::value::Value;
-use jed::{Database, Session, SessionOptions};
+use jed::{CreateOptions, Database, Session, SessionOptions};
 
 fn db_with(sql: &[&str]) -> Session {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     for s in sql {
         db.execute(s, &[])
             .unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
@@ -83,7 +85,9 @@ fn uniqueness_is_the_whole_tuple() {
 /// (0A000): out-of-declaration-order list, non-keyable member type.
 #[test]
 fn ddl_errors_match_postgres_and_narrowings() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(
         err_code(&mut db, "CREATE TABLE t (a i32, PRIMARY KEY (a, nosuch))"),
         "42703"

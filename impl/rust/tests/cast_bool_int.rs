@@ -11,7 +11,7 @@
 //!     literal adapts to the i32 the bool cast needs and overflows it) where PG says `42846`.
 
 use jed::value::Value;
-use jed::{Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn err_code(db: &mut Session, sql: &str) -> String {
     match db.execute(sql, &[]) {
@@ -30,7 +30,9 @@ fn one(db: &mut Session, sql: &str) -> Value {
 /// bool → i16 and bool → i64 are forbidden (PG has only bool → int4): jed 42804, PG 42846.
 #[test]
 fn bool_to_non_i32_is_forbidden() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(err_code(&mut db, "SELECT CAST(TRUE AS i16)"), "42804");
     assert_eq!(err_code(&mut db, "SELECT CAST(TRUE AS i64)"), "42804");
     // the PG byte-shorthand spellings resolve to the same widths
@@ -42,7 +44,9 @@ fn bool_to_non_i32_is_forbidden() {
 /// A column carries the width unambiguously (a bare literal would adapt to i32).
 #[test]
 fn non_i32_to_bool_is_forbidden() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY, s i16, b i64)", &[])
         .unwrap();
     db.execute("INSERT INTO t VALUES (1, 5, 9)", &[]).unwrap();
@@ -60,7 +64,9 @@ fn non_i32_to_bool_is_forbidden() {
 /// traps 22003 (PG reports 42846 — it types the literal as int8 first). A documented divergence.
 #[test]
 fn literal_beyond_i32_to_bool_overflows() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(
         err_code(&mut db, "SELECT CAST(5000000000 AS boolean)"),
         "22003"
@@ -72,7 +78,9 @@ fn literal_beyond_i32_to_bool_overflows() {
 /// the exhaustive behavior is in the corpus). true→1, false→0, 0→false, nonzero→true, NULL→NULL.
 #[test]
 fn bool_i32_round_trip_smoke() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(one(&mut db, "SELECT CAST(TRUE AS i32)"), Value::Int(1));
     assert_eq!(one(&mut db, "SELECT FALSE::int"), Value::Int(0));
     assert_eq!(

@@ -3,7 +3,7 @@
 //! `array_lower`/`array_upper`/`cardinality`/`array_dims`) and builder (`array_append`/
 //! `array_prepend`/`array_cat`) functions. Every expected value is pinned against PostgreSQL 18.
 
-use jed::{Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn err(db: &mut Session, sql: &str) -> String {
     db.execute(sql, &[])
@@ -30,7 +30,9 @@ fn val(db: &mut Session, sql: &str) -> String {
 
 #[test]
 fn introspection_custom_lower_bound_and_multidim() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(
         val(&mut db, "SELECT array_lower('[2:4]={7,8,9}'::i32[], 1)"),
         "2"
@@ -62,7 +64,9 @@ fn introspection_custom_lower_bound_and_multidim() {
 
 #[test]
 fn error_cases() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     // array_append/prepend reject a multidimensional array (22000).
     assert_eq!(
         err(
@@ -102,7 +106,9 @@ fn error_cases() {
 
 #[test]
 fn result_types_polymorphic() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     // text[] flows through the builders; introspection returns i32/text regardless of element.
     assert_eq!(
         val(&mut db, "SELECT array_append(ARRAY['a','b'], 'c')"),

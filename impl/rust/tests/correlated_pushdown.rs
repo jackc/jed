@@ -7,12 +7,14 @@
 //! re-scan), which return the SAME rows because v == id.
 
 use jed::value::Value;
-use jed::{Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 /// `o` is a handful of outer rows; `inr` is `n` rows (id i32 PRIMARY KEY, v i32; v == id), wide
 /// enough to span several leaves. The outer k-values are all present as inner ids.
 fn tables(n: i64) -> Session {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.execute("CREATE TABLE o (id i32 PRIMARY KEY, k i32)", &[])
         .unwrap();
     db.execute("CREATE TABLE inr (id i32 PRIMARY KEY, v i32)", &[])

@@ -6,7 +6,7 @@
 //! impl/ts/tests/unique.test.ts.
 
 use jed::value::Value;
-use jed::{Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn run(db: &mut Session, sql: &str) -> Outcome {
     db.execute(sql, &[])
@@ -61,7 +61,9 @@ fn index_names(db: &Session, table: &str) -> Vec<(String, bool)> {
 /// index name as written.
 #[test]
 fn constraint_naming_matches_postgres() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     run(&mut db, "CREATE TABLE other (x i32)");
     run(&mut db, "CREATE INDEX walk_a_key ON other (x)"); // occupies the derived base
     run(
@@ -94,7 +96,9 @@ fn constraint_naming_matches_postgres() {
 /// identical to the primary key's folds away entirely; a differing ORDER is distinct.
 #[test]
 fn dedup_and_pk_fold_match_postgres() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     // Repeated bare UNIQUE + the table-level twin all fold into one auto-named index.
     run(&mut db, "CREATE TABLE e3 (a i32 UNIQUE UNIQUE, UNIQUE (a))");
     assert_eq!(index_names(&db, "e3"), vec![("e3_a_key".to_string(), true)]);
@@ -137,7 +141,9 @@ fn dedup_and_pk_fold_match_postgres() {
 /// table's constraint names).
 #[test]
 fn ddl_errors_match_postgres() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     run(&mut db, "CREATE TABLE other (x i32)");
     // Member resolution, PG's wording-bearing codes.
     assert_eq!(
@@ -210,7 +216,9 @@ fn ddl_errors_match_postgres() {
 /// the catalog (name) order.
 #[test]
 fn insert_enforcement() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     run(
         &mut db,
         "CREATE TABLE t (id i32 PRIMARY KEY, v i32 UNIQUE, w i32, CONSTRAINT wv UNIQUE (w, v), CHECK (id < 100))",
@@ -274,7 +282,9 @@ fn insert_enforcement() {
 /// untouched rows and in-batch collisions trap 23505; nothing is written on failure.
 #[test]
 fn update_enforcement_end_state() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     run(&mut db, "CREATE TABLE m (id i32 PRIMARY KEY, v i32 UNIQUE)");
     run(&mut db, "INSERT INTO m VALUES (1, 1), (2, 2), (3, 30)");
     // PG fails both of these on the transient per-row collision; jed's end state is unique.
@@ -309,7 +319,9 @@ fn update_enforcement_end_state() {
 /// thereafter it enforces like a constraint-backed index. The auto-name keeps `_idx`.
 #[test]
 fn create_unique_index_build() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     run(&mut db, "CREATE TABLE d (id i32 PRIMARY KEY, a i32, n i32)");
     run(
         &mut db,
@@ -335,7 +347,9 @@ fn create_unique_index_build() {
 /// name is the constraint's only handle).
 #[test]
 fn drop_index_drops_the_constraint() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32 UNIQUE)");
     run(&mut db, "INSERT INTO t VALUES (1, 10)");
     assert_eq!(err_code(&mut db, "INSERT INTO t VALUES (2, 10)"), "23505");
@@ -349,7 +363,9 @@ fn drop_index_drops_the_constraint() {
 /// scan. The planner treats a unique index like any other (the bounded-scan cost).
 #[test]
 fn costs_are_unchanged_by_unique() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32)");
     for i in 1..=20 {
         run(
@@ -370,7 +386,9 @@ fn costs_are_unchanged_by_unique() {
 /// database still enforces), and the image is byte-stable across a second serialize.
 #[test]
 fn round_trip_preserves_unique() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     run(
         &mut db,
         "CREATE TABLE t (id i32 PRIMARY KEY, v i32 UNIQUE, w i32)",
@@ -397,7 +415,9 @@ fn round_trip_preserves_unique() {
 /// definition, no store, no enforcement (the §3 snapshot model).
 #[test]
 fn transactional_ddl_rolls_back() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
     run(&mut db, "INSERT INTO t VALUES (1, 10)");
     run(&mut db, "BEGIN");

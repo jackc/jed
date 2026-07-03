@@ -322,7 +322,9 @@ mod tests {
     use super::*;
 
     fn app() -> App {
-        let mut db = jed::Database::new_in_memory().session(jed::SessionOptions::default());
+        let mut db = jed::Database::create(jed::CreateOptions::default())
+            .expect("in-memory create is infallible")
+            .session(jed::SessionOptions::default());
         db.execute("CREATE TABLE Users (id i32 PRIMARY KEY, score i32)", &[])
             .unwrap();
         db.execute("CREATE TABLE selections (sel i32 PRIMARY KEY)", &[])

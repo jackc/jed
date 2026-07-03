@@ -8,7 +8,7 @@
 //! cost, and the error / narrowing codes (42601 / 42804 / 42703 / 42803 / 42P18).
 
 use jed::value::Value;
-use jed::{Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn query(db: &mut Session, sql: &str) -> Vec<Vec<Value>> {
     match db
@@ -60,7 +60,9 @@ fn cost(db: &mut Session, sql: &str) -> i64 {
 
 #[test]
 fn single_column_rows_default_name() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     // Default column name is column1 (PostgreSQL), one row per VALUES row, in body order.
     assert_eq!(
         ints(
@@ -77,7 +79,9 @@ fn single_column_rows_default_name() {
 
 #[test]
 fn multi_column_and_rename_list() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     // Two columns -> column1, column2; the rename list renames left-to-right.
     assert_eq!(
         names(&mut db, "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS v"),
@@ -106,7 +110,9 @@ fn multi_column_and_rename_list() {
 
 #[test]
 fn column_type_unification() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     // int + int -> int (widths widen): all bare integer literals are i64 in jed.
     assert_eq!(
         types(&mut db, "SELECT column1 FROM (VALUES (1), (2)) AS v"),
@@ -144,7 +150,9 @@ fn column_type_unification() {
 
 #[test]
 fn params_typed_by_sibling_rows() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     // A $1 in a column with a concrete sibling literal is typed by the unified column type.
     match db
         .execute(
@@ -164,7 +172,9 @@ fn params_typed_by_sibling_rows() {
 
 #[test]
 fn intrinsic_cost() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     // The VALUES body charges row_produced per row (3); the outer SELECT charges row_produced per
     // output row (3) — its projection is a bare column (no operator_eval). Total 6. Deterministic,
     // cross-core identical (the jed contract; cost.md §3, the inline derived-table path).
@@ -183,7 +193,9 @@ fn intrinsic_cost() {
 
 #[test]
 fn errors() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     let cases: &[(&str, &str)] = &[
         // Rows of differing arity -> 42601.
         ("SELECT * FROM (VALUES (1), (2, 3)) AS v", "42601"),

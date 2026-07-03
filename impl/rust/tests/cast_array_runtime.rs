@@ -10,7 +10,7 @@
 //!   (d) runtime text → f32[]/f64[] element casts, kept out of the corpus because the float renderer
 //!       is in the determinism-exception ledger.
 
-use jed::{Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 /// The rendered scalar of `SELECT <expr>` (single row, single column).
 fn scalar(db: &mut Session, expr: &str) -> String {
@@ -36,7 +36,9 @@ fn err(db: &mut Session, sql: &str) -> String {
 
 #[test]
 fn array_to_text_is_explicit_only() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY, label text)", &[])
         .unwrap();
     // Assignment context: an array value into a text column is a datatype mismatch, NOT a silent
@@ -60,7 +62,9 @@ fn array_to_text_is_explicit_only() {
 
 #[test]
 fn uuid_array_to_bytea_array_and_back() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     // uuid[] → bytea[]: each element is its 16 raw bytes; bytea[] → uuid[] reverses it. PG has no
     // bytea⇄uuid cast at all (42846), so this whole round-trip is jed-only.
     let round = scalar(
@@ -82,7 +86,9 @@ fn uuid_array_to_bytea_array_and_back() {
 
 #[test]
 fn forbidden_element_pairs() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     // A scalar element pair with no cast between the element types → 42804 (jed's strict-matrix
     // convention; PG reports 42846). i32 → timestamp has no cast.
     assert_eq!(
@@ -107,7 +113,9 @@ fn forbidden_element_pairs() {
 
 #[test]
 fn runtime_text_to_float_arrays() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY, s text)", &[])
         .unwrap();
     db.execute("INSERT INTO t VALUES (1, '{0.5,0.25,-1.5}')", &[])

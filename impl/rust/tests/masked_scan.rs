@@ -21,7 +21,7 @@
 //! scalar group machinery on rows AND cost (the conformance corpus proves the in-memory row path; this
 //! battery proves the paged columnar path against the resident oracle).
 
-use jed::{Database, DatabaseOptions, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn tmp(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(name)
@@ -110,19 +110,21 @@ fn paged_masked_scan_matches_resident_across_query_shapes() {
     let path = tmp("jed_masked_wide_fixed.jed");
     let _ = std::fs::remove_file(&path);
     {
-        let mut db = Database::create(
-            &path,
-            DatabaseOptions {
-                page_size: jed::DEFAULT_PAGE_SIZE,
-            },
-        )
+        let mut db = Database::create(CreateOptions {
+            path: Some(std::path::PathBuf::from(&path)),
+            page_size: jed::DEFAULT_PAGE_SIZE,
+        })
         .unwrap()
         .session(SessionOptions::default());
         seed(&mut db);
         drop(db);
     }
-    let mut mem = Database::new_in_memory_with_page_size(jed::DEFAULT_PAGE_SIZE)
-        .session(SessionOptions::default());
+    let mut mem = Database::create(CreateOptions {
+        page_size: jed::DEFAULT_PAGE_SIZE,
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
     seed(&mut mem);
     let mut paged = Database::open(&path)
         .unwrap()
@@ -251,19 +253,21 @@ fn paged_columnar_multilevel_matches_resident() {
     let path = tmp("jed_masked_multilevel.jed");
     let _ = std::fs::remove_file(&path);
     {
-        let mut db = Database::create(
-            &path,
-            DatabaseOptions {
-                page_size: jed::DEFAULT_PAGE_SIZE,
-            },
-        )
+        let mut db = Database::create(CreateOptions {
+            path: Some(std::path::PathBuf::from(&path)),
+            page_size: jed::DEFAULT_PAGE_SIZE,
+        })
         .unwrap()
         .session(SessionOptions::default());
         seed_multilevel(&mut db);
         drop(db);
     }
-    let mut mem = Database::new_in_memory_with_page_size(jed::DEFAULT_PAGE_SIZE)
-        .session(SessionOptions::default());
+    let mut mem = Database::create(CreateOptions {
+        page_size: jed::DEFAULT_PAGE_SIZE,
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
     seed_multilevel(&mut mem);
     let mut paged = Database::open(&path)
         .unwrap()

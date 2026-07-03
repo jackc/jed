@@ -7,7 +7,7 @@
 // cache actually engages (skips planning) is proved by the point_lookup_pk benchmark, not here.
 
 use jed::value::Value;
-use jed::{Database, Session, SessionOptions};
+use jed::{CreateOptions, Database, Session, SessionOptions};
 
 // Compile-time guard (the `static_assertions::assert_not_impl_any!` pattern): `PreparedStatement` is
 // INTENTIONALLY `!Send` — its plan cache holds an `Rc<SelectPlan>` (the plan is `!Sync` via a regex
@@ -32,7 +32,9 @@ const _: fn() = || {
 };
 
 fn mem() -> Session {
-    Database::new_in_memory().session(SessionOptions::default())
+    Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default())
 }
 
 fn exec(s: &mut Session, sql: &str) {

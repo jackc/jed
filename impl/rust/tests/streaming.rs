@@ -13,11 +13,11 @@
 //! projection of the rows it never pulls (the top-N-over-the-buffer win, §4).
 
 use jed::value::Value;
-use jed::{Database, DatabaseOptions, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 /// Seed an in-memory shared db with `t(id i32 PK, v i32)` holding `1..=n` (v = id * 10).
 fn seeded(n: i64) -> Database {
-    let db = Database::new_in_memory();
+    let db = Database::create(CreateOptions::default()).unwrap();
     let mut w = db.write_session();
     w.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
         .unwrap();
@@ -446,7 +446,11 @@ fn sorted_spill_merge_streams_lazily() {
             .count()
     };
 
-    let db = Database::create(&path, DatabaseOptions::default()).unwrap();
+    let db = Database::create(CreateOptions {
+        path: Some(std::path::PathBuf::from(&path)),
+        ..Default::default()
+    })
+    .unwrap();
     {
         let mut w = db.write_session();
         w.execute("CREATE TABLE t (id i32 PRIMARY KEY, k i32)", &[])

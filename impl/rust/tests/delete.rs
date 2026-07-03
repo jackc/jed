@@ -1,10 +1,12 @@
 //! Step 6: DELETE — predicate-matched removal, no-WHERE clears, three-valued logic,
 //! and the no-PK monotonic-rowid regression (DELETE then INSERT must not collide).
 
-use jed::{Database, Session, SessionOptions};
+use jed::{CreateOptions, Database, Session, SessionOptions};
 
 fn db_with(stmts: &[&str]) -> Session {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     for s in stmts {
         db.execute(s, &[])
             .unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
@@ -24,7 +26,9 @@ fn setup() -> Session {
 
 #[test]
 fn delete_from_missing_table_traps() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     assert_eq!(
         db.execute("DELETE FROM nope", &[]).unwrap_err().code(),
         "42P01"

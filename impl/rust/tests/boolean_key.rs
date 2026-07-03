@@ -5,7 +5,7 @@
 //! (tests/fileformat_golden.rs); these are the behavioral checks.
 
 use jed::value::Value;
-use jed::{Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn err_code(db: &mut Session, sql: &str) -> String {
     match db.execute(sql, &[]) {
@@ -24,7 +24,9 @@ fn rows(db: &mut Session, sql: &str) -> Vec<Vec<Value>> {
 /// A boolean PRIMARY KEY is accepted (the gate lifted) and CRUD works.
 #[test]
 fn boolean_primary_key_crud() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.execute("CREATE TABLE t (k boolean PRIMARY KEY, v i32)", &[])
         .unwrap();
     db.execute("INSERT INTO t VALUES (FALSE, 10), (TRUE, 20)", &[])
@@ -50,7 +52,9 @@ fn boolean_primary_key_crud() {
 /// A boolean member of a COMPOSITE primary key concatenates with the other component.
 #[test]
 fn boolean_composite_primary_key() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.execute(
         "CREATE TABLE t (a i32, b boolean, v i32, PRIMARY KEY (a, b))",
         &[],
@@ -80,7 +84,9 @@ fn boolean_composite_primary_key() {
 /// A secondary index on a (nullable) boolean column is accepted and serves equality.
 #[test]
 fn boolean_secondary_index() {
-    let mut db = Database::new_in_memory().session(SessionOptions::default());
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY, flag boolean)", &[])
         .unwrap();
     db.execute(
