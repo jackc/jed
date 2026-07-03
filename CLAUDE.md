@@ -463,7 +463,12 @@ cross-core-identical and owns that consequence (the host-extension boundary, §1
   the permanent shape.
 - The core defines a **storage seam** (a block/file interface) that each host
   implements: `os.File` in Go, the **Browser/OPFS host** (`FileSystemSyncAccessHandle`, ✅ built in the
-  TS core — engine-in-a-Web-Worker, `spec/design/hosts.md` §5), direct file access natively.
+  TS core — engine-in-a-Web-Worker, `spec/design/hosts.md` §5), direct file access natively — and
+  the **in-memory host** (`MemoryBlockStore`, ✅ the B+tree reshape B3): an in-memory database is
+  no longer a separate fully-resident decoded-tree path but the **same pager + packed-leaf read
+  path over a RAM byte store** (pinned, unbounded pool), so its commit packs dirty pages (the
+  file commit minus fsync) and its resident footprint is compact — serving §9's "the in-memory
+  representation is a first-class concern" with one storage path instead of two.
   Designing this seam early is what makes "single-file, embeddable, everywhere" work — the OPFS host
   landed as *an added `BlockStore`*, not a reshape, exactly as intended. The
   **formal host interface** — the five-method `BlockStore` byte device, the per-core mapping,
