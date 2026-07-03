@@ -29,7 +29,7 @@ function pnodeRow(n: number): Row {
 
 test("bounded range + overlap over a multi-leaf tree", () => {
   const m = new PMap();
-  for (let n = 0; n < 200; n++) m.insert(key(n), pnodeRow(n), W, CAP, 1, null); // k=1 value column
+  for (let n = 0; n < 200; n++) m.insert(key(n), pnodeRow(n), W, CAP, { fixed: 1, var: 0 }, null); // one fixed-width value column
   assert.ok(m.nodeCount() > 1, "test needs a multi-leaf tree");
 
   // A point bound visits strictly fewer nodes than the whole tree (the page_read win).

@@ -159,12 +159,13 @@ test("paged masked scan matches resident across query shapes", () => {
   }
 });
 
-// Seed a MULTI-LEVEL B-tree (enough rows that the tree splits past a single leaf into a root interior
-// node carrying separator entries), so the A2/A3 columnar projection gather's interior-separator path — a
-// B-tree stores records in interior nodes too, gathered alongside the leaves — is exercised against the
-// in-memory row oracle. The single-leaf `w` table above never builds an interior node, so its columnar
-// walk only visits leaves. Both databases use the DEFAULT page size so their tree shapes (hence the
-// page_read node counts) are identical; the depth comes from the row count, not a shrunk page.
+// Seed a MULTI-LEVEL B+tree (enough rows that the tree splits past a single leaf under a routing
+// interior root), so the A2/A3 columnar projection gather's windowed interior DESCENT — records are
+// leaf-only in v24, but the walk must window and recurse the right children — is exercised against
+// the in-memory row oracle. The single-leaf `w` table above never builds an interior node, so its
+// columnar walk only visits one leaf. Both databases use the DEFAULT page size so their tree shapes
+// (hence the page_read node counts) are identical; the depth comes from the row count, not a shrunk
+// page.
 function seedMultilevel(db: Handle): void {
   db.execute("CREATE TABLE m (id i32 PRIMARY KEY, k i32, a i32, b i16, f f64)");
   const ROWS = 5000;
@@ -183,11 +184,11 @@ function seedMultilevel(db: Handle): void {
 }
 
 // Bare-column PROJECTIONS over a multi-level tree take the A2/A3 columnar projection path ("columnar"
-// emitter) on the paged (file-backed) database and the row path on the resident one — the interior
-// separators are gathered into the lanes alongside the leaf records, so a mis-indexed gather diverges from
+// emitter) on the paged (file-backed) database and the row path on the resident one — every record is
+// gathered from a windowed leaf reached through the interior descent, so a mis-indexed gather diverges from
 // the resident row path on rows or cost. FILTERED projections take the A3 columnar path: the predicate is
 // applied over the gathered lanes into a selection vector, and the emit visits only the selected lane
-// positions — so a mis-indexed selection vector (an off-by-one against the interior-node gather) diverges
+// positions — so a mis-indexed selection vector (an off-by-one against the multi-leaf gather) diverges
 // loudly here. Both the EAGER (execute → "columnar") and LAZY (query() → bufferedRows "columnar") drives
 // are checked against the resident row path on rows AND cost.
 test("paged columnar multilevel matches resident", () => {
@@ -203,21 +204,21 @@ test("paged columnar multilevel matches resident", () => {
     const paged = openDatabase(path);
 
     const queries = [
-      // Bare-column projections — the columnar projection path (interior + leaf a/k/b values gathered).
+      // Bare-column projections — the columnar projection path (a/k/b values gathered from the leaves).
       "SELECT a FROM m",
       "SELECT k, a, b FROM m",
       "SELECT id FROM m", // the PK column projected
       "SELECT a FROM m WHERE id = 2500", // PK point → columnar with a point bound
       "SELECT k, b FROM m WHERE id >= 100 AND id < 400", // PK range → columnar with a range bound
       // Filtered projections — the A3 columnar path over the multi-level tree (selection vector over the
-      // interior-separator + leaf gather).
+      // leaf gather reached through the interior descent).
       "SELECT a FROM m WHERE k = 3", // one of 8 recurring buckets, spanning leaves
       "SELECT id, a FROM m WHERE a >= 200 AND a < 800", // proper subset
       "SELECT a FROM m WHERE a < 0", // empty selection vector
       "SELECT k, a FROM m WHERE b IS NULL", // filter on the nullable column
       "SELECT id FROM m WHERE a > 5 AND k < 4", // AND predicate over two columns
-      // Whole-table aggregates — the columnar aggregate gather (foldAggWhole over the interior + leaf
-      // lanes), a WHERE (A3) applied over the lanes into a selection vector before the fold.
+      // Whole-table aggregates — the columnar aggregate gather (foldAggWhole over the leaf lanes), a
+      // WHERE (A3) applied over the lanes into a selection vector before the fold.
       "SELECT count(*) FROM m",
       "SELECT sum(a) FROM m",
       "SELECT sum(a), count(b), count(*) FROM m", // multi-spec, nullable operand

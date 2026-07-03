@@ -2901,15 +2901,20 @@ enum RegionDir {
 }
 
 struct PaxDirs {
-    key_blob: usize,   // payload offset where the key blob starts
-    key_end: Vec<u32>, // N end offsets into the key blob (end-offset directory, v24)
+    key_blob: usize,         // payload offset where the key blob starts
+    key_end: Vec<u32>,       // N end offsets into the key blob (end-offset directory, v24)
     regions: Vec<RegionDir>, // K regions, in declaration order
 }
 
 impl PaxDirs {
     /// Key `i`'s span within `payload`.
     fn key<'a>(&self, payload: &'a [u8], i: usize) -> Result<&'a [u8]> {
-        let lo = self.key_blob + if i == 0 { 0 } else { self.key_end[i - 1] as usize };
+        let lo = self.key_blob
+            + if i == 0 {
+                0
+            } else {
+                self.key_end[i - 1] as usize
+            };
         let hi = self.key_blob + self.key_end[i] as usize;
         if lo > hi || hi > payload.len() {
             return Err(corrupt("PAX leaf key directory out of range"));
@@ -2921,9 +2926,7 @@ impl PaxDirs {
     /// zero-length span (variable), with **no value decode**.
     fn is_null(&self, payload: &[u8], c: usize, i: usize) -> bool {
         match &self.regions[c] {
-            RegionDir::Fixed { bitmap, .. } => {
-                payload[bitmap + i / 8] & (0x80 >> (i % 8)) != 0
-            }
+            RegionDir::Fixed { bitmap, .. } => payload[bitmap + i / 8] & (0x80 >> (i % 8)) != 0,
             RegionDir::Var { ends, .. } => {
                 let start = if i == 0 { 0 } else { ends[i - 1] };
                 ends[i] == start
@@ -2936,9 +2939,7 @@ impl PaxDirs {
     fn value_off(&self, c: usize, i: usize) -> usize {
         match &self.regions[c] {
             RegionDir::Fixed { width, body, .. } => body + i * width,
-            RegionDir::Var { ends, body } => {
-                body + if i == 0 { 0 } else { ends[i - 1] as usize }
-            }
+            RegionDir::Var { ends, body } => body + if i == 0 { 0 } else { ends[i - 1] as usize },
         }
     }
 

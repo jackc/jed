@@ -153,7 +153,8 @@ impl TableStore {
         if self.rows.get(&key, src_ref)?.is_some() {
             return Ok(false);
         }
-        self.rows.insert(key, row, w, self.cap, self.shape, src_ref)?;
+        self.rows
+            .insert(key, row, w, self.cap, self.shape, src_ref)?;
         Ok(true)
     }
 

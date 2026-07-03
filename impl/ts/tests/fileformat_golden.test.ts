@@ -342,6 +342,24 @@ function tallTreeDB(): Engine {
   return db;
 }
 
+// maxSepTableDB pins degenerate interior fan-out (format.md "Interior node" / "Fan-out";
+// bplus-reshape.md §4.2): a secondary index over near-RECORD_MAX(0) text keys — each 112-byte entry
+// key packs two per index leaf, and two separators overflow an interior page, so the second leaf
+// split takes the pinned N = 2 → m = 1 interior split and leaves a legal N = 0 interior on disk.
+// The table rows externalize their (incompressible filler64) text. Must match verify.rb's
+// MAX_SEP_TABLE and Rust's max_sep_table_db.
+function maxSepTableDB(): Engine {
+  const db = goldenDb();
+  run(db, "CREATE TABLE m (id i32 PRIMARY KEY, s text)");
+  run(db, "CREATE INDEX i_s ON m (s)");
+  const tail = fillerText(104);
+  for (let i = 0; i < 6; i++) {
+    const s = String.fromCharCode(65 + i) + tail; // 'A' + i
+    run(db, `INSERT INTO m VALUES (${i + 1}, '${s}')`);
+  }
+  return db;
+}
+
 // textTableDB has a text column — exercises the value codec's text branch (u16 length +
 // UTF-8 bytes): the empty string, an embedded quote, a 2-byte char (é), a NULL text value,
 // and a 4-byte astral char (😀). The PK stays i32 (no text key this slice).
@@ -918,6 +936,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "json_table.jed", build: jsonTableDB },
     { name: "jsonb_table.jed", build: jsonbTableDB },
     { name: "tall_tree.jed", build: tallTreeDB },
+    { name: "max_sep_table.jed", build: maxSepTableDB },
   ];
   for (const c of cases) {
     const image = toImage(c.build(), GOLDEN_PAGE_SIZE, 1n);
@@ -986,6 +1005,7 @@ test("read goldens reproduces rows", () => {
     { name: "json_table.jed", build: jsonTableDB, table: "t" },
     { name: "jsonb_table.jed", build: jsonbTableDB, table: "t" },
     { name: "tall_tree.jed", build: tallTreeDB, table: "t" },
+    { name: "max_sep_table.jed", build: maxSepTableDB, table: "m" },
     { name: "torn_meta_slot0.jed", build: pkTableDB, table: "t" },
     { name: "torn_meta_slot1.jed", build: pkTableDB, table: "t" },
   ];

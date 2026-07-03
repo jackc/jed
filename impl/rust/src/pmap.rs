@@ -167,7 +167,11 @@ impl Node {
     /// An interior node reconstructed from disk at `page` (format.rs `read_tree` /
     /// `read_skeleton_node`): the record-free separators + children skeleton (v24). Children may be
     /// `Resident` (the fully-resident in-memory load) or `OnDisk` (the demand-paged skeleton load).
-    pub(crate) fn loaded_interior(keys: Vec<Vec<u8>>, children: Vec<Child>, page: u32) -> Arc<Node> {
+    pub(crate) fn loaded_interior(
+        keys: Vec<Vec<u8>>,
+        children: Vec<Child>,
+        page: u32,
+    ) -> Arc<Node> {
         debug_assert_eq!(children.len(), keys.len() + 1, "interior child count");
         Arc::new(Node {
             keys,
@@ -399,7 +403,15 @@ fn build_leaf(
     let leftpayload = |m: usize| prefix[m] + leaf_overhead(m, shape);
     let rightpayload = |m: usize| (total - prefix[m]) + leaf_overhead(n - m, shape);
     let right_edge = edited == Some(n - 1);
-    let m = match split_point(1, n - 1, payload, cap, right_edge, leftpayload, rightpayload) {
+    let m = match split_point(
+        1,
+        n - 1,
+        payload,
+        cap,
+        right_edge,
+        leftpayload,
+        rightpayload,
+    ) {
         Some(m) => m,
         // Unreachable under the RECORD_MAX cap (a two-record leaf always fits — format.md "Why
         // the record cap"); defensively leave the node whole (0A000 at serialize).
@@ -453,7 +465,15 @@ fn build_interior(
         let leftpayload = |m: usize| 8 * m + 4 + prefix[m];
         let rightpayload = |m: usize| 8 * (n - 1 - m) + 4 + (total - prefix[m + 1]);
         let right_edge = edited == Some(n - 1);
-        split_point(1, n - 2, payload, cap, right_edge, leftpayload, rightpayload)?
+        split_point(
+            1,
+            n - 2,
+            payload,
+            cap,
+            right_edge,
+            leftpayload,
+            rightpayload,
+        )?
     };
 
     let mut keys = keys;
@@ -1408,7 +1428,10 @@ mod tests {
                 }
                 assert_eq!(node.keys.len(), node.weights.len());
             } else {
-                assert!(!node.keys.is_empty() || is_root, "0-key interior unexpected");
+                assert!(
+                    !node.keys.is_empty() || is_root,
+                    "0-key interior unexpected"
+                );
                 assert!(node.vals.is_empty(), "interior node carries records");
                 assert!(node.weights.is_empty(), "interior node carries weights");
                 assert_eq!(
@@ -1427,7 +1450,10 @@ mod tests {
                     assert!(k.as_slice() >= lo, "key below its subtree's low separator");
                 }
                 if let Some(hi) = hi {
-                    assert!(k.as_slice() < hi, "key at/above its subtree's high separator");
+                    assert!(
+                        k.as_slice() < hi,
+                        "key at/above its subtree's high separator"
+                    );
                 }
             }
             assert!(
@@ -1440,7 +1466,11 @@ mod tests {
             }
             let mut depth = None;
             for (i, c) in node.children.iter().enumerate() {
-                let clo = if i == 0 { lo } else { Some(node.keys[i - 1].as_slice()) };
+                let clo = if i == 0 {
+                    lo
+                } else {
+                    Some(node.keys[i - 1].as_slice())
+                };
                 let chi = if i == node.keys.len() {
                     hi
                 } else {
@@ -1468,7 +1498,8 @@ mod tests {
 
         for k in shuffled(n) {
             assert_eq!(
-                pm.insert(key(k), row(k as i64), W, CAP, SHAPE, None).unwrap(),
+                pm.insert(key(k), row(k as i64), W, CAP, SHAPE, None)
+                    .unwrap(),
                 bt.insert(key(k), row(k as i64))
             );
         }
@@ -1553,7 +1584,10 @@ mod tests {
         assert!(pm.is_empty());
         assert_eq!(pm.get(&key(1), None).unwrap(), None);
         assert_eq!(pm.remove(&key(1), CAP, SHAPE, None).unwrap(), None);
-        assert_eq!(pm.insert(key(1), row(1), W, CAP, SHAPE, None).unwrap(), None);
+        assert_eq!(
+            pm.insert(key(1), row(1), W, CAP, SHAPE, None).unwrap(),
+            None
+        );
         assert_eq!(pm.get(&key(1), None).unwrap(), Some(row(1)));
         assert_eq!(pm.remove(&key(1), CAP, SHAPE, None).unwrap(), Some(row(1)));
         assert!(pm.is_empty());
@@ -1624,7 +1658,10 @@ mod tests {
             assert!(pm.get(&big_key(k), None).unwrap().is_some());
         }
         for k in shuffled(60) {
-            assert_eq!(pm.remove(&big_key(k), CAP, shape, None).unwrap(), Some(Vec::new()));
+            assert_eq!(
+                pm.remove(&big_key(k), CAP, shape, None).unwrap(),
+                Some(Vec::new())
+            );
         }
         assert!(pm.is_empty());
     }
@@ -1635,7 +1672,8 @@ mod tests {
     fn bounded_scans_and_cursor_agree() {
         let mut pm = PMap::new();
         for k in shuffled(2000) {
-            pm.insert(key(k), row(k as i64), W, CAP, SHAPE, None).unwrap();
+            pm.insert(key(k), row(k as i64), W, CAP, SHAPE, None)
+                .unwrap();
         }
         let b = KeyBound {
             lo: Some(key(500)),
