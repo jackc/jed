@@ -2659,6 +2659,16 @@ export class Engine {
   // §3): `main` / `temp` / a host attachment. Used only when scope is defined; an undefined scope keeps
   // the bare temp-first funnels (a name is temp XOR persistent). undefined for an unknown attachment
   // (the qualifier gate already raised 42P01, so unreachable in practice).
+  //
+  // This funnel IS where Slice 1c's "temp is an implicit in-memory attachment" reframe is realized
+  // (attached-databases.md §6): `temp`, `main`, and every host attachment resolve through one
+  // scoped-routing path, so a temp table is a citizen of the same mechanism an attachment is. What stays
+  // deliberately distinct is temp's lifecycle — it is SESSION-SCOPED (tempSnap reads session-private
+  // state; commit lands on the session's temp root with no cross-session roots publish; its reclamation
+  // watermark is the session's open-cursor count, not the Database-wide live registry). That divergence
+  // is correct, not a gap: relocating temp into the Database-scoped attachment registry would re-share
+  // it across sessions (what Slice 0 removed). So temp routes like an attachment here but keeps its own
+  // home.
   private snapForScope(scope: string): Snapshot | undefined {
     switch (scope.toLowerCase()) {
       case "temp":

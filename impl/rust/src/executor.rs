@@ -2010,6 +2010,16 @@ impl Engine {
     /// The READ snapshot for an explicit database qualifier (attached-databases.md §3): `main` / `temp`
     /// / a host attachment. Used only when a scope is present; a bare (`None`) name keeps the temp-first
     /// funnels. `None` for an unknown attachment (the qualifier gate already raised 42P01).
+    ///
+    /// This funnel IS where Slice 1c's "temp is an implicit in-memory attachment" reframe is realized
+    /// (attached-databases.md §6): `temp`, `main`, and every host attachment resolve through one
+    /// scoped-routing path, so a temp table is a citizen of the same mechanism an attachment is. What
+    /// stays deliberately distinct is temp's *lifecycle* — it is SESSION-SCOPED (temp_read_snap reads
+    /// session-private state; commit lands on the session's temp root with no cross-session roots
+    /// publish; its reclamation watermark is the session's open-cursor count, not the Database-wide live
+    /// registry). That divergence is correct, not a gap: relocating temp into the Database-scoped
+    /// attachment registry would re-share it across sessions (what Slice 0 removed). So temp routes like
+    /// an attachment here but keeps its own home.
     fn snap_for_scope(&self, scope: &str) -> Option<&Snapshot> {
         match scope.to_ascii_lowercase().as_str() {
             "temp" => Some(self.temp_read_snap()),

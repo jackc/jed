@@ -20,8 +20,8 @@
 > §2/§5). Attachment **generalizes "a few hardcoded extra snapshots" into "N named attachments,"** and
 > in doing so lets temp stop being bespoke machinery and become *an attached in-memory database* (§6).
 >
-> **Status: building. Slice 0 + Slice 1a + Slice 1b landed (all three cores); Slice 1b-3 (bring
-> attachments into the concurrency differential net) building.**
+> **Status: Slice 0 + Slice 1a + Slice 1b + Slice 1b-3 landed (all three cores); Slice 1c (reframe
+> temp) resolved at the resolution-funnel level — see §6/§13.**
 > This doc fixed the model and the decisions before any code, spec-first (CLAUDE.md §11). The two
 > decisions that were open at first draft are settled (maintainer, 2026-07-03): **attach is host-API
 > only — no SQL attach in any form** (§4), and the **`SHARED TEMP` surface is retired** in favor of a
@@ -36,8 +36,10 @@
 > the file-level `# attach:` directive so a schedule exercises concurrent readers/writer over a
 > host-attached in-memory database (`suites/concurrency/attach_snapshot_isolation.test`), asserting
 > cross-database snapshot isolation + the watermark (the threaded cores drive it under the race
-> detector — [concurrency-testing.md](concurrency-testing.md) §4/§9), **building**; **1c** reframe
-> session-local temp as an implicit in-memory attachment (internal cleanup), deferred. The grammar ([../grammar/grammar.ebnf](../grammar/grammar.ebnf)) and error registry
+> detector — [concurrency-testing.md](concurrency-testing.md) §4/§9), **landed, all three cores**; **1c**
+> reframes session-local temp as an implicit in-memory attachment — **resolved** at the resolution-funnel
+> level (1b already routes `temp`/`main`/attachments through one scoped-routing path), with temp's
+> **session-scoped** home kept as a deliberate divergence (§6). The grammar ([../grammar/grammar.ebnf](../grammar/grammar.ebnf)) and error registry
 > ([../errors/registry.toml](../errors/registry.toml)) are authoritative for the surface and codes;
 > when a decision here changes, change them in the same edit.
 
@@ -245,6 +247,28 @@ zero-file-writes invariant carry over unchanged), with the one *surface* additio
 become referenceable by the reserved qualifier `temp.` if desired (unqualified still works, since temp
 is in implicit scope, §3).
 
+> **Resolved (§6, Slice 1c, 2026-07-03): the reframe is realized at the *resolution-funnel* level, and
+> temp keeps its session-scoped home.** In implementation, "temp is an in-memory attachment" is true
+> where it *observably matters* — **name resolution**. Slice 1b's scoped funnels (`snapForScope`,
+> `lkpTableScoped`/`lkpStoreScoped`/`writeStoreScoped` and their index analogues) route `main`, `temp`,
+> and every host attachment through **one** scoped-routing path, so `temp` is already a citizen of the
+> same mechanism an attachment is: a `temp.` qualifier resolves through the same funnel, and the temp
+> table it names lives in the same `Snapshot`/storage-quad shape (§2) as an attachment. What is
+> **deliberately not** unified is temp's *lifecycle*, because it genuinely differs from a host
+> attachment and folding it away would add complexity, not remove it: temp is **session-scoped** (a
+> session-private domain, invisible to other sessions), so its committed root lives on the session (no
+> cross-session `roots` publish — the atomic swap an attachment needs to become visible handle-wide has
+> nothing to publish *to* for a private domain), and its reclamation watermark is the session-private
+> open-cursor count, not the `Database`-wide reader-liveness registry an attachment gates on. Physically
+> relocating temp's fields into the host-attachment registry (which is `Database`-scoped) would therefore
+> be **wrong** (it would re-share temp across sessions — exactly what Slice 0 removed); a session-local
+> mirror-registry would be lateral field movement whose commit path still needs a session-vs-database
+> branch to pick the right watermark. So 1c is **resolved, not deferred**: the unification that pays off
+> (one resolution mechanism, `temp` reachable by qualifier) is done; temp's distinct session-scoped
+> lifecycle is the **correct divergence** from a `Database`-scoped attachment, recorded here rather than
+> engineered away. This preserves temp's zero-file-writes, `54P03` page budget, and within-session
+> compaction unchanged (temp-tables.md §6).
+
 **This is where point 1 (shared temp) resolves — the `SHARED` surface is retired.** "Shared temp"
 stops being a coined feature with its own `SHARED` keyword; a host that wants cross-session in-RAM
 scratch **attaches a `Database`-scoped in-memory database** instead. The reframing also names *why* the
@@ -434,9 +458,18 @@ Sequenced to put the durability-risky part last:
     (`rake concurrency:race`) — a reader pinning `roots.attached` on its own goroutine/thread while a
     writer publishes a fresh attached map — the hardening proof; TS runs it stepped-sequentially.
     Additive tests + a harness extension, no engine change, no `format_version` change.
-  - **1c — reframe session-local temp as an implicit in-memory attachment** (§6). Internal cleanup:
-    temp's bespoke fields become the registry's implicit `temp` entry; behavior-neutral (temp keeps its
-    zero-file-writes, page budget, and compaction).
+  - **1c — reframe session-local temp as an implicit in-memory attachment (§6). RESOLVED at the
+    resolution-funnel level, all three cores.** The substantive reframe — one name-resolution mechanism
+    for `main`/`temp`/attachments — **already landed in 1b**: the scoped funnels route all three through
+    one path, so `temp` is a citizen of the same routing an attachment is (a `temp.` qualifier resolves
+    through it; a temp table lives in the same `Snapshot`/storage-quad shape). What is **deliberately not**
+    done is physically relocating temp's fields into the (`Database`-scoped) host-attachment registry:
+    temp is **session-scoped** with a session-private reclamation watermark and no cross-session `roots`
+    publish, so relocating it would be either wrong (re-sharing temp across sessions — what Slice 0
+    removed) or lateral movement whose commit path still branches session-vs-database. Temp's distinct
+    session-scoped lifecycle is the **correct divergence** from a `Database`-scoped attachment (§6),
+    recorded rather than engineered away; behavior-neutral (temp keeps its zero-file-writes, `54P03`
+    page budget, and within-session compaction).
 - **Slice 2 — host-API file attach (read-only + read-write) + cross-file *read* + single-database
   *write*.** `db.attach`/`detach` for file databases with the per-attachment **read-only mode** (§4,
   `25006` on a write to a read-only attachment — the natural reference-DB mode), qualified reads/joins
