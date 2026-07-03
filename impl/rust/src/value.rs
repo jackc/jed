@@ -113,8 +113,13 @@ pub enum Value {
 /// The on-disk form an unfetched large value was stored in (spec/design/large-values.md §14;
 /// spec/fileformat/format.md "Large values") — exactly the record's pointer fields, so the
 /// scan layer can resolve it through the pager (and the cost walk can count its chain pages /
-/// decompress slabs) without reading the value.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+/// decompress slabs) without reading the value. Since B4 (bplus-reshape.md §5) every variant is
+/// **self-resolving**: it carries its column type ([`TypeRef`]) and — for the external forms — a
+/// `Weak` handle to its database's pager, so a value the static touched set missed is resolved
+/// **on demand** at the evaluator's column access (the demand-fault backstop) instead of being
+/// read as NULL or poisoning. `PartialEq`/`Hash` are manual and ignore the type/pager handles
+/// (two references to the same stored bytes are equal whatever handle they rode in on).
+#[derive(Clone, Debug)]
 pub enum Unfetched {
     /// `0x00` inline-plain, **deferred** (spec/design/lazy-record.md §5a, L3): the value's bytes are
     /// resident in the record, but its decode is deferred until the column is touched. **Form (a),
@@ -131,18 +136,173 @@ pub enum Unfetched {
         block: Arc<[u8]>,
         off: u32,
         len: u32,
+        ty: TypeRef,
     },
     /// `0x02` external-plain: the chain carries `len` payload bytes from `first_page`.
-    External { first_page: u32, len: u32 },
+    External {
+        first_page: u32,
+        len: u32,
+        ty: TypeRef,
+        paging: PagerRef,
+    },
     /// `0x03` inline-compressed: the LZ4 block is resident (it lives in the record), but
     /// decompression is deferred until the column is touched.
-    InlineComp { comp: Vec<u8>, raw_len: u32 },
+    InlineComp {
+        comp: Vec<u8>,
+        raw_len: u32,
+        ty: TypeRef,
+    },
     /// `0x04` external-compressed: the chain carries the `stored_len`-byte LZ4 block.
     ExternalComp {
         first_page: u32,
         stored_len: u32,
         raw_len: u32,
+        ty: TypeRef,
+        paging: PagerRef,
     },
+}
+
+/// An opaque, weakly-held handle to the database's pager, carried by a deferred external value so
+/// it can self-resolve at the evaluator's column access (the B4 demand-fault backstop). Public in
+/// type position only (it rides the public [`Value`] enum); its innards are crate-private. Weak —
+/// a strong ref would cycle pool → node → paging.
+#[derive(Clone, Debug, Default)]
+pub struct PagerRef(pub(crate) std::sync::Weak<crate::paging::SharedPaging>);
+
+/// A cheap shared reference to a deferred value's column type (bplus-reshape.md B4): the store's
+/// shared column-type vector plus this value's column ordinal — one `Arc` bump per deferred value,
+/// no per-value `ColType` clone. `resolve_self` reads `cols[idx]`.
+#[derive(Clone, Debug)]
+pub struct TypeRef {
+    pub(crate) cols: Arc<Vec<crate::catalog::ColType>>,
+    pub(crate) idx: usize,
+}
+
+impl TypeRef {
+    pub(crate) fn new(cols: Arc<Vec<crate::catalog::ColType>>, idx: usize) -> TypeRef {
+        TypeRef { cols, idx }
+    }
+
+    /// The sentinel reference of a spill-run-file reload (`spill.rs` tags 9/10/11/21): the run
+    /// file cannot carry runtime handles, so a reloaded deferred value keeps NO resolvable type —
+    /// it rides the sort output **unread** (spill.md §4). Touching one is an engine bug and
+    /// panics loudly in `resolve_self`, exactly like the pre-B4 poison contract.
+    pub(crate) fn sentinel() -> TypeRef {
+        TypeRef {
+            cols: Arc::new(Vec::new()),
+            idx: 0,
+        }
+    }
+
+    pub(crate) fn is_sentinel(&self) -> bool {
+        self.cols.is_empty()
+    }
+
+    pub(crate) fn ty(&self) -> &crate::catalog::ColType {
+        &self.cols[self.idx]
+    }
+}
+
+/// Equality/hash over the STORED identity only — the pointer fields (and, for a deferred inline
+/// body, its bytes) — never the type/pager handles, which are resolution plumbing.
+impl PartialEq for Unfetched {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Unfetched::Inline {
+                    block: a,
+                    off: ao,
+                    len: al,
+                    ..
+                },
+                Unfetched::Inline {
+                    block: b,
+                    off: bo,
+                    len: bl,
+                    ..
+                },
+            ) => a == b && ao == bo && al == bl,
+            (
+                Unfetched::External {
+                    first_page: a,
+                    len: al,
+                    ..
+                },
+                Unfetched::External {
+                    first_page: b,
+                    len: bl,
+                    ..
+                },
+            ) => a == b && al == bl,
+            (
+                Unfetched::InlineComp {
+                    comp: a,
+                    raw_len: al,
+                    ..
+                },
+                Unfetched::InlineComp {
+                    comp: b,
+                    raw_len: bl,
+                    ..
+                },
+            ) => a == b && al == bl,
+            (
+                Unfetched::ExternalComp {
+                    first_page: a,
+                    stored_len: asl,
+                    raw_len: al,
+                    ..
+                },
+                Unfetched::ExternalComp {
+                    first_page: b,
+                    stored_len: bsl,
+                    raw_len: bl,
+                    ..
+                },
+            ) => a == b && asl == bsl && al == bl,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Unfetched {}
+
+impl std::hash::Hash for Unfetched {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            Unfetched::Inline {
+                block, off, len, ..
+            } => {
+                0u8.hash(state);
+                block.hash(state);
+                off.hash(state);
+                len.hash(state);
+            }
+            Unfetched::External {
+                first_page, len, ..
+            } => {
+                1u8.hash(state);
+                first_page.hash(state);
+                len.hash(state);
+            }
+            Unfetched::InlineComp { comp, raw_len, .. } => {
+                2u8.hash(state);
+                comp.hash(state);
+                raw_len.hash(state);
+            }
+            Unfetched::ExternalComp {
+                first_page,
+                stored_len,
+                raw_len,
+                ..
+            } => {
+                3u8.hash(state);
+                first_page.hash(state);
+                stored_len.hash(state);
+                raw_len.hash(state);
+            }
+        }
+    }
 }
 
 /// A shaped array value (spec/design/array.md §4). Shape is a value property: `dims` holds the

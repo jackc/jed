@@ -57,7 +57,11 @@ impl SharedPaging {
     /// the cached `Arc`, a miss reads + decodes the page (with this table's `col_types`) and caches
     /// it, evicting under CLOCK if full. A page id belongs to exactly one table, so caching by global
     /// page id with a caller-supplied decoder is consistent (pager.md §4).
-    pub(crate) fn fault_leaf(&self, page: u32, col_types: &Arc<Vec<ColType>>) -> Result<Arc<Node>> {
+    pub(crate) fn fault_leaf(
+        self: &Arc<Self>,
+        page: u32,
+        col_types: &Arc<Vec<ColType>>,
+    ) -> Result<Arc<Node>> {
         let mut pool = self.pool.lock().expect("buffer pool mutex poisoned");
         pool.get_or_load(page, || {
             let block = self
@@ -69,7 +73,12 @@ impl SharedPaging {
             // values — a spillable value is reconstructed as an unfetched reference only when a
             // column the query touches is read. The shared `col_types` `Arc` is cloned into the leaf
             // (O(1)), so a resident leaf adds no per-leaf column-type copy (§9).
-            crate::format::decode_leaf_node(&block, page, Arc::clone(col_types))
+            crate::format::decode_leaf_node(
+                &block,
+                page,
+                Arc::clone(col_types),
+                Arc::downgrade(self),
+            )
         })
     }
 

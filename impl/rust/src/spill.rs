@@ -488,16 +488,20 @@ fn write_value<W: Write>(w: &mut W, v: &Value) -> io::Result<()> {
         // it opaquely (the pointer/inline block) so it round-trips, never resolving it. The same
         // pass-through covers an inline-deferred value (lazy-record.md §5a) — tag 21: write just its
         // body span out of the shared page block (the block itself never reaches the run file).
-        Value::Unfetched(Unfetched::Inline { block, off, len }) => {
+        Value::Unfetched(Unfetched::Inline {
+            block, off, len, ..
+        }) => {
             w.write_all(&[21])?;
             write_bytes(w, &block[*off as usize..*off as usize + *len as usize])
         }
-        Value::Unfetched(Unfetched::External { first_page, len }) => {
+        Value::Unfetched(Unfetched::External {
+            first_page, len, ..
+        }) => {
             w.write_all(&[9])?;
             write_u32(w, *first_page)?;
             write_u32(w, *len)
         }
-        Value::Unfetched(Unfetched::InlineComp { comp, raw_len }) => {
+        Value::Unfetched(Unfetched::InlineComp { comp, raw_len, .. }) => {
             w.write_all(&[10])?;
             write_u32(w, *raw_len)?;
             write_bytes(w, comp)
@@ -506,6 +510,7 @@ fn write_value<W: Write>(w: &mut W, v: &Value) -> io::Result<()> {
             first_page,
             stored_len,
             raw_len,
+            ..
         }) => {
             w.write_all(&[11])?;
             write_u32(w, *first_page)?;
@@ -591,21 +596,30 @@ fn read_value<R: Read>(r: &mut R) -> io::Result<Value> {
                 block: Arc::from(body),
                 off: 0,
                 len,
+                ty: crate::value::TypeRef::sentinel(),
             })
         }
         9 => Value::Unfetched(Unfetched::External {
             first_page: read_u32(r)?,
             len: read_u32(r)?,
+            ty: crate::value::TypeRef::sentinel(),
+            paging: crate::value::PagerRef::default(),
         }),
         10 => {
             let raw_len = read_u32(r)?;
             let comp = read_bytes(r)?;
-            Value::Unfetched(Unfetched::InlineComp { comp, raw_len })
+            Value::Unfetched(Unfetched::InlineComp {
+                comp,
+                raw_len,
+                ty: crate::value::TypeRef::sentinel(),
+            })
         }
         11 => Value::Unfetched(Unfetched::ExternalComp {
             first_page: read_u32(r)?,
             stored_len: read_u32(r)?,
             raw_len: read_u32(r)?,
+            ty: crate::value::TypeRef::sentinel(),
+            paging: crate::value::PagerRef::default(),
         }),
         12 => {
             let mut mb = [0u8; 4];

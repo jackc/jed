@@ -255,45 +255,18 @@ impl Node {
         }
     }
 
-    /// Reconstruct row `i` decoding **only** the columns `mask` selects (packed-leaf.md §4/§6). A
-    /// **Decoded** leaf returns the whole `vals[i]` (already decoded — masking buys nothing); a
-    /// **Packed** leaf leaves untouched columns `Null` and never reads their bytes.
-    pub(crate) fn row_at_masked(&self, i: usize, mask: &[bool]) -> Result<Row> {
+    /// Borrow leaf row `i` for the duration of `f`, avoiding an owned clone on the Decoded hot
+    /// path (the scan/visit callbacks that only need a `&Row`) — the "materialize-then-lend"
+    /// borrow helper (packed-leaf.md §4). The old two-form masked/unmasked reconstruction seam is
+    /// **collapsed** (bplus-reshape.md B4): a Packed leaf's reconstruction is uniformly lazy
+    /// (fixed-width columns decode eagerly, variable columns defer as self-resolving `Unfetched`),
+    /// so a reconstruction mask no longer exists — the query's touched set survives as the cost
+    /// basis + the scan layer's resolve prefetch, and a missed value resolves on touch (the
+    /// demand-fault backstop).
+    fn with_row<R>(&self, i: usize, f: impl FnOnce(&Row) -> Result<R>) -> Result<R> {
         match &self.packed {
-            None => Ok(self.vals[i].clone()),
-            Some(p) => p.row_masked(i, mask),
-        }
-    }
-
-    /// The scan-feed value-read seam (packed-leaf.md §4, Track A1): `recon = None` reconstructs the
-    /// **whole** row ([`row_at`](Node::row_at)), `recon = Some(m)` reconstructs **only** its selected
-    /// columns ([`row_at_masked`](Node::row_at_masked)), leaving the rest `Null`. A `None` recon is the
-    /// whole-row default the mutation / FK / index-maintenance feeds keep (they recompute keys from the
-    /// old row); a read-only SELECT feed passes `Some(touched)` so a Packed leaf skips decoding the
-    /// untouched columns. A **Decoded** leaf returns its whole row either way (already decoded).
-    pub(crate) fn row_at_maybe_masked(&self, i: usize, recon: Option<&[bool]>) -> Result<Row> {
-        match recon {
-            None => self.row_at(i),
-            Some(m) => self.row_at_masked(i, m),
-        }
-    }
-
-    /// Borrow leaf row `i` for the duration of `f`, avoiding an owned clone on the Decoded hot path
-    /// (the scan/visit callbacks that only need a `&Row`), with the Track A1 reconstruction mask:
-    /// `recon = Some(m)` on a **Packed** leaf reconstructs into a temporary decoding only the
-    /// selected columns and lends that (untouched columns `Null`); `recon = None` — and every
-    /// **Decoded** leaf — lends the whole row (the "materialize-then-lend" borrow helper,
-    /// packed-leaf.md §4).
-    fn with_row_maybe_masked<R>(
-        &self,
-        i: usize,
-        recon: Option<&[bool]>,
-        f: impl FnOnce(&Row) -> Result<R>,
-    ) -> Result<R> {
-        match (&self.packed, recon) {
-            (None, _) => f(&self.vals[i]),
-            (Some(p), None) => f(&p.row(i)?),
-            (Some(p), Some(m)) => f(&p.row_masked(i, m)?),
+            None => f(&self.vals[i]),
+            Some(p) => f(&p.row(i)?),
         }
     }
 
@@ -794,7 +767,7 @@ impl PMap {
         b: &KeyBound,
         src: Option<&dyn LeafSource>,
     ) -> Result<Vec<(Vec<u8>, Row)>> {
-        Ok(self.range_entries_counted(b, src, None)?.0)
+        Ok(self.range_entries_counted(b, src)?.0)
     }
 
     /// [`range_entries`](PMap::range_entries) plus the number of B+tree nodes the bounded traversal
@@ -805,12 +778,11 @@ impl PMap {
         &self,
         b: &KeyBound,
         src: Option<&dyn LeafSource>,
-        recon: Option<&[bool]>,
     ) -> Result<(Vec<(Vec<u8>, Row)>, usize)> {
         let mut out = Vec::new();
         let mut nodes = 0usize;
         if let Some(root) = &self.root {
-            collect_range(root, b, src, recon, &mut out, &mut nodes)?;
+            collect_range(root, b, src, &mut out, &mut nodes)?;
         }
         Ok((out, nodes))
     }
@@ -891,11 +863,10 @@ impl PMap {
         &self,
         b: &KeyBound,
         src: Option<&dyn LeafSource>,
-        recon: Option<&[bool]>,
         visit: &mut dyn FnMut(&[u8], &Row) -> Result<bool>,
     ) -> Result<()> {
         if let Some(root) = &self.root {
-            walk_range_visit(root, b, src, recon, visit)?;
+            walk_range_visit(root, b, src, visit)?;
         }
         Ok(())
     }
@@ -910,11 +881,10 @@ impl PMap {
         &self,
         b: &KeyBound,
         src: Option<&dyn LeafSource>,
-        recon: Option<&[bool]>,
         visit: &mut dyn FnMut(&[u8], &Row) -> Result<bool>,
     ) -> Result<()> {
         if let Some(root) = &self.root {
-            walk_range_visit_rev(root, b, src, recon, visit)?;
+            walk_range_visit_rev(root, b, src, visit)?;
         }
         Ok(())
     }
@@ -928,12 +898,7 @@ impl PMap {
     /// context, storage.rs), which lets a streaming cursor own its snapshot and outlive the handle
     /// (streaming.md §5). The first node on the stack is the root (always resident). See
     /// [`RangeCursor`].
-    pub(crate) fn range_cursor(
-        &self,
-        b: KeyBound,
-        reverse: bool,
-        recon: Option<Vec<bool>>,
-    ) -> RangeCursor {
+    pub(crate) fn range_cursor(&self, b: KeyBound, reverse: bool) -> RangeCursor {
         let mut stack = Vec::new();
         if let Some(root) = &self.root {
             stack.push(ScanFrame::new(root.clone(), &b));
@@ -942,7 +907,6 @@ impl PMap {
             stack,
             bound: b,
             reverse,
-            recon,
         }
     }
 }
@@ -995,10 +959,6 @@ pub(crate) struct RangeCursor {
     stack: Vec<ScanFrame>,
     bound: KeyBound,
     reverse: bool,
-    /// The Track A1 reconstruction mask (owned so the cursor stays `'static`): `Some(touched)` makes a
-    /// Packed leaf decode only the touched columns per emitted row (a read-only SELECT feed), `None`
-    /// reconstructs the whole row (the default). See [`Node::row_at_maybe_masked`].
-    recon: Option<Vec<bool>>,
 }
 
 impl RangeCursor {
@@ -1008,7 +968,6 @@ impl RangeCursor {
     /// cursor itself borrows nothing — see [`RangeCursor`].
     pub(crate) fn next(&mut self, src: Option<&dyn LeafSource>) -> Result<Option<(Vec<u8>, Row)>> {
         let reverse = self.reverse;
-        let recon = self.recon.as_deref();
         loop {
             let (emit, descend) = {
                 let frame = match self.stack.last_mut() {
@@ -1028,10 +987,7 @@ impl RangeCursor {
                     };
                     if frame.is_leaf {
                         (
-                            Some((
-                                frame.node.keys[p].clone(),
-                                frame.node.row_at_maybe_masked(p, recon)?,
-                            )),
+                            Some((frame.node.keys[p].clone(), frame.node.row_at(p)?)),
                             None,
                         )
                     } else {
@@ -1276,7 +1232,6 @@ fn collect_range(
     node: &Node,
     b: &KeyBound,
     src: Option<&dyn LeafSource>,
-    recon: Option<&[bool]>,
     out: &mut Vec<(Vec<u8>, Row)>,
     nodes: &mut usize,
 ) -> Result<()> {
@@ -1284,14 +1239,14 @@ fn collect_range(
     if node.is_leaf() {
         let (ef, el) = b.entry_window(node);
         for i in ef..el {
-            out.push((node.keys[i].clone(), node.row_at_maybe_masked(i, recon)?));
+            out.push((node.keys[i].clone(), node.row_at(i)?));
         }
         return Ok(());
     }
     let (cf, cl) = b.child_window(node);
     for i in cf..=cl {
         let ch = child(node, i, src)?;
-        collect_range(&ch, b, src, recon, out, nodes)?;
+        collect_range(&ch, b, src, out, nodes)?;
     }
     Ok(())
 }
@@ -1375,13 +1330,12 @@ fn walk_range_visit(
     node: &Node,
     b: &KeyBound,
     src: Option<&dyn LeafSource>,
-    recon: Option<&[bool]>,
     visit: &mut dyn FnMut(&[u8], &Row) -> Result<bool>,
 ) -> Result<bool> {
     if node.is_leaf() {
         let (ef, el) = b.entry_window(node);
         for i in ef..el {
-            if !node.with_row_maybe_masked(i, recon, |row| visit(&node.keys[i], row))? {
+            if !node.with_row(i, |row| visit(&node.keys[i], row))? {
                 return Ok(false);
             }
         }
@@ -1390,7 +1344,7 @@ fn walk_range_visit(
     let (cf, cl) = b.child_window(node);
     for i in cf..=cl {
         let ch = child(node, i, src)?;
-        if !walk_range_visit(&ch, b, src, recon, visit)? {
+        if !walk_range_visit(&ch, b, src, visit)? {
             return Ok(false);
         }
     }
@@ -1405,13 +1359,12 @@ fn walk_range_visit_rev(
     node: &Node,
     b: &KeyBound,
     src: Option<&dyn LeafSource>,
-    recon: Option<&[bool]>,
     visit: &mut dyn FnMut(&[u8], &Row) -> Result<bool>,
 ) -> Result<bool> {
     if node.is_leaf() {
         let (ef, el) = b.entry_window(node);
         for i in (ef..el).rev() {
-            if !node.with_row_maybe_masked(i, recon, |row| visit(&node.keys[i], row))? {
+            if !node.with_row(i, |row| visit(&node.keys[i], row))? {
                 return Ok(false);
             }
         }
@@ -1420,7 +1373,7 @@ fn walk_range_visit_rev(
     let (cf, cl) = b.child_window(node);
     for i in (cf..=cl).rev() {
         let ch = child(node, i, src)?;
-        if !walk_range_visit_rev(&ch, b, src, recon, visit)? {
+        if !walk_range_visit_rev(&ch, b, src, visit)? {
             return Ok(false);
         }
     }
@@ -1739,7 +1692,7 @@ mod tests {
             hi: Some(key(1500)),
             hi_inc: false,
         };
-        let (entries, nodes) = pm.range_entries_counted(&b, None, None).unwrap();
+        let (entries, nodes) = pm.range_entries_counted(&b, None).unwrap();
         assert_eq!(entries.len(), 1000);
         assert_eq!(entries[0].0, key(500));
         assert_eq!(entries[999].0, key(1499));
@@ -1747,7 +1700,7 @@ mod tests {
 
         // Push walk agrees.
         let mut push = Vec::new();
-        pm.scan_range(&b, None, None, &mut |k, r| {
+        pm.scan_range(&b, None, &mut |k, r| {
             push.push((k.to_vec(), r.clone()));
             Ok(true)
         })
@@ -1756,7 +1709,7 @@ mod tests {
 
         // Reverse push walk is the exact reverse.
         let mut rev = Vec::new();
-        pm.scan_range_rev(&b, None, None, &mut |k, r| {
+        pm.scan_range_rev(&b, None, &mut |k, r| {
             rev.push((k.to_vec(), r.clone()));
             Ok(true)
         })
@@ -1775,7 +1728,6 @@ mod tests {
                 hi_inc: false,
             },
             false,
-            None,
         );
         while let Some(pair) = cur.next(None).unwrap() {
             fwd.push(pair);
@@ -1791,7 +1743,6 @@ mod tests {
                 hi_inc: false,
             },
             true,
-            None,
         );
         while let Some(pair) = cur.next(None).unwrap() {
             bwd.push(pair);

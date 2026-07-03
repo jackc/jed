@@ -29,7 +29,7 @@ pub type Row = Vec<Value>;
 /// from the store's `paging` + `col_types` (disjoint field borrows, so it composes with a `&mut`
 /// mutation of `rows`). A store with no `paging` (in-memory) builds none and never faults.
 struct PagedSource<'a> {
-    paging: &'a SharedPaging,
+    paging: &'a Arc<SharedPaging>,
     col_types: &'a Arc<Vec<ColType>>,
 }
 
@@ -292,43 +292,18 @@ impl TableStore {
     /// computed in ONE B-tree traversal instead of three (the windowed walk visits precisely the
     /// nodes `overlap_node_count` counts, and the per-admitted-record spill/compress units are
     /// computed inline from the entries it collects). Byte-identical cost and rows by construction.
+    /// Fused single-descent bounded scan (whole-row and touched-column feeds alike — the old
+    /// masked/unmasked reconstruction split is collapsed, bplus-reshape.md B4: reconstruction is
+    /// uniformly lazy, so there is nothing left to mask). `mask` is the cost touched set (which
+    /// columns' spill/compress to charge — a §8 byte contract).
     pub(crate) fn range_scan_with_units(
         &self,
         b: &KeyBound,
         mask: &[bool],
     ) -> Result<(Vec<(Vec<u8>, Row)>, usize, usize)> {
-        self.range_scan_with_units_recon(b, mask, None)
-    }
-
-    /// [`range_scan_with_units`](TableStore::range_scan_with_units) reconstructing **only** the touched
-    /// columns (`mask`) per admitted row — the read-only SELECT feed's Track A1 touched-column path
-    /// (packed-leaf.md §11): a Packed leaf skips decoding the untouched columns (left `Null`). Identical
-    /// cost and identical results for a consumer that reads only the touched columns; NOT for one that
-    /// needs the whole row (mutation / FK / index-maintenance keep the whole-row variant, which recompute
-    /// keys from the old row). Cost is byte-identical — reconstruction masking carries no cost unit
-    /// (cost.md §3); the block below reads only `mask` (the same static touched set).
-    pub(crate) fn range_scan_with_units_masked(
-        &self,
-        b: &KeyBound,
-        mask: &[bool],
-    ) -> Result<(Vec<(Vec<u8>, Row)>, usize, usize)> {
-        self.range_scan_with_units_recon(b, mask, Some(mask))
-    }
-
-    /// The fused bounded scan shared by the whole-row and touched-column variants. `mask` is the cost
-    /// touched set (which columns' spill/compress to charge — a §8 byte contract, unchanged across
-    /// variants). `recon` drives leaf reconstruction: `None` rebuilds the whole row, `Some(m)` rebuilds
-    /// only its columns (the rest `Null`). Reconstruction masking is cost-neutral (no per-column-decode
-    /// unit, cost.md §3) — the cost block below reads only `mask`.
-    fn range_scan_with_units_recon(
-        &self,
-        b: &KeyBound,
-        mask: &[bool],
-        recon: Option<&[bool]>,
-    ) -> Result<(Vec<(Vec<u8>, Row)>, usize, usize)> {
         let src = make_src(&self.paging, &self.col_types);
         let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
-        let (entries, mut pages) = self.rows.range_entries_counted(b, src_ref, recon)?;
+        let (entries, mut pages) = self.rows.range_entries_counted(b, src_ref)?;
         let mut slabs = 0usize;
         if crate::format::any_spillable_masked(&self.col_types, mask) {
             for (k, row) in &entries {
@@ -348,16 +323,6 @@ impl TableStore {
         mask: &[bool],
     ) -> Result<(Vec<(Vec<u8>, Row)>, usize, usize)> {
         self.range_scan_with_units(&KeyBound::unbounded(), mask)
-    }
-
-    /// [`scan_with_units`](TableStore::scan_with_units) reconstructing only the touched columns — the
-    /// read-only full-scan SELECT feed (see
-    /// [`range_scan_with_units_masked`](TableStore::range_scan_with_units_masked)).
-    pub(crate) fn scan_with_units_masked(
-        &self,
-        mask: &[bool],
-    ) -> Result<(Vec<(Vec<u8>, Row)>, usize, usize)> {
-        self.range_scan_with_units_masked(&KeyBound::unbounded(), mask)
     }
 
     /// Gather the mask-selected columns of a bounded scan into dense per-column lanes (`cols[c]`, length
@@ -498,12 +463,11 @@ impl TableStore {
     pub(crate) fn scan_range(
         &self,
         b: &KeyBound,
-        recon: Option<&[bool]>,
         visit: &mut dyn FnMut(&[u8], &Row) -> Result<bool>,
     ) -> Result<()> {
         let src = make_src(&self.paging, &self.col_types);
         let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
-        self.rows.scan_range(b, src_ref, recon, visit)
+        self.rows.scan_range(b, src_ref, visit)
     }
 
     /// Like [`scan_range`](TableStore::scan_range) but yields the in-bound rows in **descending**
@@ -512,12 +476,11 @@ impl TableStore {
     pub(crate) fn scan_range_rev(
         &self,
         b: &KeyBound,
-        recon: Option<&[bool]>,
         visit: &mut dyn FnMut(&[u8], &Row) -> Result<bool>,
     ) -> Result<()> {
         let src = make_src(&self.paging, &self.col_types);
         let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
-        self.rows.scan_range_rev(b, src_ref, recon, visit)
+        self.rows.scan_range_rev(b, src_ref, visit)
     }
 
     /// A **pull** scan cursor over this store's `(key, row)` pairs within `b`, in ascending
@@ -528,14 +491,9 @@ impl TableStore {
     /// transactions.md §5), and rebuilds the leaf source per [`next`](StoreScan::next) call from that
     /// owned snapshot's paging context, so the returned `StoreScan` borrows nothing and is `'static`.
     /// This is what lets a streaming `Rows` cursor outlive the handle that produced it.
-    pub(crate) fn store_scan(
-        &self,
-        b: KeyBound,
-        reverse: bool,
-        recon: Option<Vec<bool>>,
-    ) -> StoreScan {
+    pub(crate) fn store_scan(&self, b: KeyBound, reverse: bool) -> StoreScan {
         StoreScan {
-            cursor: self.rows.range_cursor(b, reverse, recon),
+            cursor: self.rows.range_cursor(b, reverse),
             store: self.clone(),
         }
     }

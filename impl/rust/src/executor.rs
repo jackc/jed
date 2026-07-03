@@ -11026,12 +11026,10 @@ impl Engine {
                     None => true,
                 })
             };
-            // Read-only SELECT feed: reconstruct only the touched columns (Track A1, packed-leaf.md §11).
-            let recon = Some(plan.rel_masks[0].as_slice());
             if reverse {
-                store.scan_range_rev(&bound, recon, &mut visit)?;
+                store.scan_range_rev(&bound, &mut visit)?;
             } else {
-                store.scan_range(&bound, recon, &mut visit)?;
+                store.scan_range(&bound, &mut visit)?;
             }
         }
         Ok(SelectResult {
@@ -11212,11 +11210,10 @@ impl Engine {
                 rows.push(row.clone());
                 Ok((rows.len() as i64) < cap) // stop once the OFFSET+LIMIT window is filled
             };
-            let recon = Some(plan.rel_masks[0].as_slice());
             if reverse {
-                store.scan_range_rev(&bound, recon, &mut visit)?;
+                store.scan_range_rev(&bound, &mut visit)?;
             } else {
-                store.scan_range(&bound, recon, &mut visit)?;
+                store.scan_range(&bound, &mut visit)?;
             }
         }
 
@@ -11392,12 +11389,10 @@ impl Engine {
                 snap.store(&plan.rels[0].table_name)
                     .overlap_scan_units(&bound, &plan.rel_masks[0])?
             };
-            // Read-only streaming SELECT feed: reconstruct only the touched columns (Track A1). The
             // cursor is `'static`, so it owns the mask.
-            let recon = Some(plan.rel_masks[0].clone());
             let scan = snap
                 .store(&plan.rels[0].table_name)
-                .store_scan(bound, reverse, recon);
+                .store_scan(bound, reverse);
             let mut meter = snap.session.new_meter();
             meter.accrued = subquery_cost; // the folded constant cost (lifetime already charged)
             meter.charge(COSTS.page_read * overlap as i64 + COSTS.value_decompress * slabs as i64);
@@ -11606,7 +11601,7 @@ impl Engine {
                 })
             };
             // An index store has no payload columns, so its rows carry nothing to mask — whole-row scan.
-            istore.scan_range(&KeyBound::unbounded(), None, &mut visit)?;
+            istore.scan_range(&KeyBound::unbounded(), &mut visit)?;
         }
         Ok(SelectResult {
             column_names: plan.column_names.clone(),
@@ -11675,8 +11670,7 @@ impl Engine {
             let mut rows: Vec<Row> = Vec::new();
             if !empty {
                 // Read-only SELECT feed: reconstruct only the touched columns (Track A1).
-                let recon = Some(plan.rel_masks[0].as_slice());
-                store.scan_range(&bound, recon, &mut |_key, row| {
+                store.scan_range(&bound, &mut |_key, row| {
                     meter.guard()?;
                     meter.charge(COSTS.storage_row_read);
                     let resolved = if TableStore::needs_resolution(row, &plan.rel_masks[0]) {
@@ -11709,8 +11703,7 @@ impl Engine {
             let mut sorter = self.new_sorter(&plan.order);
             if !empty {
                 // Read-only SELECT feed: reconstruct only the touched columns (Track A1).
-                let recon = Some(plan.rel_masks[0].as_slice());
-                store.scan_range(&bound, recon, &mut |_key, row| {
+                store.scan_range(&bound, &mut |_key, row| {
                     meter.guard()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
                     meter.charge(COSTS.storage_row_read);
                     let resolved = if TableStore::needs_resolution(row, &plan.rel_masks[0]) {
@@ -11947,7 +11940,7 @@ impl Engine {
                     // leaf skips decoding the untouched ones. Cost- and result-identical to the whole-row
                     // scan for a consumer that reads only the touched set (packed-leaf.md §11).
                     let (entries, pages, slabs) =
-                        store.range_scan_with_units_masked(&b, &plan.rel_masks[ri])?;
+                        store.range_scan_with_units(&b, &plan.rel_masks[ri])?;
                     let rows = entries.into_iter().map(|(_, v)| v).collect();
                     (rows, (pages, slabs))
                 }
@@ -12024,7 +12017,7 @@ impl Engine {
             }
             None => {
                 // Read-only full-scan SELECT feed: reconstruct only the touched columns (Track A1).
-                let (entries, pages, slabs) = store.scan_with_units_masked(&plan.rel_masks[ri])?;
+                let (entries, pages, slabs) = store.scan_with_units(&plan.rel_masks[ri])?;
                 let rows = entries.into_iter().map(|(_, v)| v).collect();
                 (rows, (pages, slabs))
             }
@@ -13880,7 +13873,7 @@ impl Engine {
                 hi_inc: true,
             };
             let (es, p, s) = if masked {
-                store.range_scan_with_units_masked(&b, mask)?
+                store.range_scan_with_units(&b, mask)?
             } else {
                 store.range_scan_with_units(&b, mask)?
             };
@@ -34455,12 +34448,21 @@ impl RExpr {
         m.guard()?;
         match self {
             // The value is read out of a borrowed stored row, so it is cloned (Value is
-            // Clone, not Copy, now that a text value owns a String).
-            RExpr::Column(i) => Ok(row[*i].clone()),
+            // Clone, not Copy, now that a text value owns a String). A deferred large value the
+            // static touched set missed resolves ON TOUCH — the B4 demand-fault backstop
+            // (bplus-reshape.md §5): deterministic rows, never a NULL-fold; unmetered (§6).
+            RExpr::Column(i) => match &row[*i] {
+                Value::Unfetched(u) => crate::format::resolve_unfetched_self(u),
+                v => Ok(v.clone()),
+            },
             // A correlated reference: the column `index` of the enclosing row `level` hops out
-            // (1 = immediate parent). A leaf — reads from the outer-row environment (§26).
+            // (1 = immediate parent). A leaf — reads from the outer-row environment (§26), with
+            // the same demand-fault backstop as `Column`.
             RExpr::OuterColumn { level, index } => {
-                Ok(env.outer[env.outer.len() - level][*index].clone())
+                match &env.outer[env.outer.len() - level][*index] {
+                    Value::Unfetched(u) => crate::format::resolve_unfetched_self(u),
+                    v => Ok(v.clone()),
+                }
             }
             // A bind parameter — the supplied value, already coerced to its inferred type by
             // `bind_params` before execution (spec/design/api.md §5).

@@ -231,23 +231,36 @@ impl Shared {
     /// the physical pages `persist` writes — and so every core builds byte-identical file-backed
     /// databases (CLAUDE.md §8). In-memory this is the default, so it is a no-op there.
     fn page_size(&self) -> u32 {
-        self.storage.lock().expect("storage lock not poisoned").page_size
+        self.storage
+            .lock()
+            .expect("storage lock not poisoned")
+            .page_size
     }
 
     /// Whether this core is a read-only file-backed database (a write is `25006`). In-memory cores
     /// are always writable.
     fn read_only(&self) -> bool {
-        self.storage.lock().expect("storage lock not poisoned").read_only
+        self.storage
+            .lock()
+            .expect("storage lock not poisoned")
+            .read_only
     }
 
     /// The on-disk page high-water for a file-backed core; `0` in-memory (no backing file).
     fn page_count(&self) -> u32 {
-        self.storage.lock().expect("storage lock not poisoned").page_count
+        self.storage
+            .lock()
+            .expect("storage lock not poisoned")
+            .page_count
     }
 
     /// The backing file path for a file-backed core; `None` in-memory.
     fn path(&self) -> Option<std::path::PathBuf> {
-        self.storage.lock().expect("storage lock not poisoned").path.clone()
+        self.storage
+            .lock()
+            .expect("storage lock not poisoned")
+            .path
+            .clone()
     }
 
     /// Durably persist `snap` to the backing store via an **incremental** copy-on-write commit

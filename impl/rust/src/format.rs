@@ -1198,8 +1198,7 @@ impl Snapshot {
         let mut next_index = ROOT_PAGE;
         for (ti, (_, table, store)) in tables.iter().enumerate() {
             if let Some(root) = store.tree_root() {
-                root_data_page[ti] =
-                    serialize_node(root, store, cap, &mut next_index, &mut body)?;
+                root_data_page[ti] = serialize_node(root, store, cap, &mut next_index, &mut body)?;
             }
             // The table's index trees follow its data tree, in catalog (name) order
             // (spec/fileformat/format.md "From-scratch image"). Index records are the key alone —
@@ -1223,7 +1222,9 @@ impl Snapshot {
                 } else {
                     let istore = self.index_store(&idx.name.to_ascii_lowercase());
                     match istore.tree_root() {
-                        Some(root) => serialize_node(root, istore, cap, &mut next_index, &mut body)?,
+                        Some(root) => {
+                            serialize_node(root, istore, cap, &mut next_index, &mut body)?
+                        }
                         None => 0,
                     }
                 };
@@ -1873,7 +1874,7 @@ impl Engine {
 fn collect_leaf_overflow(
     paging: &SharedPaging,
     page_idx: u32,
-    col_types: &[ColType],
+    col_types: &Arc<Vec<ColType>>,
     reached: &mut HashSet<u32>,
 ) -> Result<()> {
     let block = paging.pager().read_block(page_idx)?;
@@ -1893,12 +1894,21 @@ fn collect_leaf_overflow(
                 if fixed_value_width(ty).is_some() {
                     continue;
                 }
+                let tyref = crate::value::TypeRef::new(Arc::clone(col_types), c);
                 for i in 0..n {
                     if dirs.is_null(payload, c, i) {
                         continue;
                     }
                     let mut pos = dirs.value_off(c, i);
-                    let v = read_value_lazy(ty, &shared, payload, &mut pos)?;
+                    // The value is discarded right after `mark_chains` (only its chain pages
+                    // matter), so the resolution handle is deliberately dead.
+                    let v = read_value_lazy(
+                        &tyref,
+                        &shared,
+                        payload,
+                        &mut pos,
+                        &std::sync::Weak::new(),
+                    )?;
                     mark_chains(&[v], &fetch, reached)?;
                 }
             }
@@ -1925,7 +1935,7 @@ fn collect_leaf_overflow(
 /// whose root is itself a single leaf has no interior parent to hold an `OnDisk` reference, so the
 /// root leaf is faulted resident (spec/design/pager.md §1/§4).
 fn read_skeleton(
-    paging: &SharedPaging,
+    paging: &Arc<SharedPaging>,
     root_page: u32,
     col_types: &Arc<Vec<ColType>>,
     reached: &mut HashSet<u32>,
@@ -2791,6 +2801,10 @@ pub(crate) struct PackedLeaf {
     /// The table's resolved value column types — shared (`Arc`) across all this table's leaves, so a
     /// resident leaf adds no per-leaf column-type copy (§9).
     col_types: Arc<Vec<ColType>>,
+    /// The database's pager, weakly held (a strong ref would cycle pool → node → paging) — stamped
+    /// into each deferred external value so it can self-resolve at the evaluator's column access
+    /// (the B4 demand-fault backstop, bplus-reshape.md §5).
+    paging: std::sync::Weak<SharedPaging>,
     /// Record count (`= keys.len()`), for the value-directory index arithmetic.
     n: usize,
 }
@@ -2813,7 +2827,13 @@ impl PackedLeaf {
             // fixed-width scalar buys nothing, lazy-record.md §6).
             Some(_) => read_inline_body(ty, payload, &mut pos, DecodeMode::Construct),
             // A variable value's span is its tagged codec bytes — the lazy tag path.
-            None => read_value_lazy(ty, &self.block, payload, &mut pos),
+            None => read_value_lazy(
+                &crate::value::TypeRef::new(Arc::clone(&self.col_types), c),
+                &self.block,
+                payload,
+                &mut pos,
+                &self.paging,
+            ),
         }
     }
 
@@ -2822,21 +2842,6 @@ impl PackedLeaf {
         (0..self.col_types.len())
             .map(|c| self.value(c, i))
             .collect()
-    }
-
-    /// Reconstruct only the columns `mask` selects (the touched-column path, packed-leaf.md §4/§6 —
-    /// the `OP_Column`/`slot_getsomeattrs` model). An untouched column is left `Value::Null` and its
-    /// bytes are never read, so a corrupt untouched body does not surface (§8). `mask.len()` must be
-    /// the column count; a shorter mask leaves the tail untouched.
-    pub(crate) fn row_masked(&self, i: usize, mask: &[bool]) -> Result<Vec<Value>> {
-        let k = self.col_types.len();
-        let mut row = vec![Value::Null; k];
-        for c in 0..k {
-            if mask.get(c).copied().unwrap_or(false) {
-                row[c] = self.value(c, i)?;
-            }
-        }
-        Ok(row)
     }
 
     /// The shared page block — the buffer-pool pin (§7). Exposed for the fault-path invariant tests.
@@ -2935,6 +2940,7 @@ pub(crate) fn decode_leaf_node(
     block: &[u8],
     page: u32,
     col_types: Arc<Vec<ColType>>,
+    paging: std::sync::Weak<SharedPaging>,
 ) -> Result<Node> {
     let parsed = parse_page(block)?;
     if parsed.page_type != PAGE_LEAF {
@@ -2968,6 +2974,7 @@ pub(crate) fn decode_leaf_node(
         payload_off: PAGE_HEADER,
         dirs,
         col_types,
+        paging,
         n,
     };
     Ok(Node::leaf_loaded_packed(keys, weights, packed, page))
@@ -3963,7 +3970,14 @@ fn read_overflow_chain(
 /// record's pointer fields — no chain read, no decompression. The scan layer resolves the
 /// references for the columns a query touches ([`resolve_unfetched`]); the commit path resolves
 /// the rest when a dirty leaf re-encodes (`resolve_for_encode`).
-fn read_value_lazy(ty: &ColType, block: &Arc<[u8]>, buf: &[u8], pos: &mut usize) -> Result<Value> {
+fn read_value_lazy(
+    tyref: &crate::value::TypeRef,
+    block: &Arc<[u8]>,
+    buf: &[u8],
+    pos: &mut usize,
+    paging: &std::sync::Weak<SharedPaging>,
+) -> Result<Value> {
+    let ty = tyref.ty();
     match read_u8(buf, pos)? {
         // A present inline value (lazy-record.md §12, L3): a variable-length / structured body
         // (the `is_spillable` set — §6) is **deferred** as an `Unfetched::Inline` referencing the
@@ -3985,6 +3999,7 @@ fn read_value_lazy(ty: &ColType, block: &Arc<[u8]>, buf: &[u8], pos: &mut usize)
                     block: Arc::clone(block),
                     off,
                     len,
+                    ty: tyref.clone(),
                 }))
             } else {
                 read_inline_body(ty, buf, pos, DecodeMode::Construct)
@@ -3994,13 +4009,22 @@ fn read_value_lazy(ty: &ColType, block: &Arc<[u8]>, buf: &[u8], pos: &mut usize)
         TAG_EXTERNAL => {
             let first_page = read_u32(buf, pos)?;
             let len = read_u32(buf, pos)?;
-            Ok(Value::Unfetched(Unfetched::External { first_page, len }))
+            Ok(Value::Unfetched(Unfetched::External {
+                first_page,
+                len,
+                ty: tyref.clone(),
+                paging: crate::value::PagerRef(paging.clone()),
+            }))
         }
         TAG_INLINE_COMP => {
             let raw_len = read_u32(buf, pos)?;
             let comp_len = read_u16(buf, pos)? as usize;
             let comp = take(buf, pos, comp_len)?.to_vec();
-            Ok(Value::Unfetched(Unfetched::InlineComp { comp, raw_len }))
+            Ok(Value::Unfetched(Unfetched::InlineComp {
+                comp,
+                raw_len,
+                ty: tyref.clone(),
+            }))
         }
         TAG_EXTERNAL_COMP => {
             let first_page = read_u32(buf, pos)?;
@@ -4010,6 +4034,8 @@ fn read_value_lazy(ty: &ColType, block: &Arc<[u8]>, buf: &[u8], pos: &mut usize)
                 first_page,
                 stored_len,
                 raw_len,
+                ty: tyref.clone(),
+                paging: crate::value::PagerRef(paging.clone()),
             }))
         }
         _ => Err(corrupt("invalid value presence tag")),
@@ -4031,18 +4057,22 @@ pub(crate) fn resolve_unfetched(
         // no chain read, no decompression. Re-run the decoder over the captured span
         // `block[off .. off + len]` in `Construct` mode; it must consume exactly the span (the
         // zero-drift invariant of §6, debug-checked here).
-        Unfetched::Inline { block, off, len } => {
+        Unfetched::Inline {
+            block, off, len, ..
+        } => {
             let body = &block[*off as usize..*off as usize + *len as usize];
             let mut p = 0;
             let v = read_inline_body(ty, body, &mut p, DecodeMode::Construct)?;
             debug_assert_eq!(p, body.len(), "inline deferral span over/under-consumed");
             Ok(v)
         }
-        Unfetched::External { first_page, len } => {
+        Unfetched::External {
+            first_page, len, ..
+        } => {
             let payload = read_overflow_chain(*first_page, *len as usize, fetch, &mut sink)?;
             value_from_payload(ty, &payload)
         }
-        Unfetched::InlineComp { comp, raw_len } => {
+        Unfetched::InlineComp { comp, raw_len, .. } => {
             let payload = crate::lz4::decompress(comp, *raw_len as usize)?;
             value_from_payload(ty, &payload)
         }
@@ -4050,10 +4080,49 @@ pub(crate) fn resolve_unfetched(
             first_page,
             stored_len,
             raw_len,
+            ..
         } => {
             let comp = read_overflow_chain(*first_page, *stored_len as usize, fetch, &mut sink)?;
             let payload = crate::lz4::decompress(&comp, *raw_len as usize)?;
             value_from_payload(ty, &payload)
+        }
+    }
+}
+
+/// Resolve a deferred value **from its own carried handles** — the B4 demand-fault backstop
+/// (bplus-reshape.md §5/§6): the evaluator's column access calls this when the static touched set
+/// missed a value, so a prediction miss is a deterministic on-demand fetch — never a NULL-fold,
+/// never wrong rows. The fetch is deliberately **unmetered** (metering it would make cost depend
+/// on prediction quality rather than the spec'd static set — §6); the touched set stays the cost
+/// basis + prefetch hint. A spill-run-file reload carries sentinel handles (`spill.rs` — it rides
+/// the sort output unread by contract), so touching one stays the loud pre-B4 poison.
+pub(crate) fn resolve_unfetched_self(u: &Unfetched) -> Result<Value> {
+    let (tyref, paging) = match u {
+        Unfetched::Inline { ty, .. } | Unfetched::InlineComp { ty, .. } => (ty, None),
+        Unfetched::External { ty, paging, .. } | Unfetched::ExternalComp { ty, paging, .. } => {
+            (ty, Some(paging))
+        }
+    };
+    if tyref.is_sentinel() {
+        panic!("BUG: unfetched large value escaped the storage layer (spill pass-through)");
+    }
+    let ty = tyref.ty();
+    match paging {
+        // Inline forms own their bytes — no pager involved.
+        None => {
+            let fetch = |_p: u32| -> Result<Vec<u8>> {
+                unreachable!("an inline deferred value reads no overflow pages")
+            };
+            resolve_unfetched(ty, u, &fetch)
+        }
+        Some(w) => {
+            // A deferred external value is reachable only through a snapshot whose stores hold the
+            // paging `Arc`, so the upgrade cannot fail while the value is observable.
+            let paging =
+                w.0.upgrade()
+                    .expect("a deferred value's database outlives it");
+            let fetch = |p: u32| paging.pager().read_block(p);
+            resolve_unfetched(ty, u, &fetch)
         }
     }
 }
@@ -4096,7 +4165,9 @@ fn mark_chains(
     for v in row {
         if let Value::Unfetched(u) = v {
             match u {
-                Unfetched::External { first_page, len } => {
+                Unfetched::External {
+                    first_page, len, ..
+                } => {
                     reached.extend(chain_pages(*first_page, *len as usize, fetch)?);
                 }
                 Unfetched::ExternalComp {
@@ -4741,7 +4812,13 @@ mod tests {
         // and NO value is decoded, so the decoded row vector is empty and rows are reconstructed on
         // demand by `row_at`. Reconstruction produces the same Unfetched::Inline block-slices the
         // eager fault used to, so the form-(a) sharing property still holds.
-        let node = decode_leaf_node(&block, 2, Arc::new(col_types.clone())).expect("decode leaf");
+        let node = decode_leaf_node(
+            &block,
+            2,
+            Arc::new(col_types.clone()),
+            std::sync::Weak::new(),
+        )
+        .expect("decode leaf");
         assert!(node.packed.is_some(), "a faulted leaf is Packed");
         assert!(
             node.vals.is_empty(),
@@ -4834,7 +4911,13 @@ mod tests {
         let payload = encode_leaf_pax(&col_types, &keys, &row_refs, cap, &mut take, &mut ovf);
         assert!(ovf.is_empty());
         let block = make_page(ps, PAGE_LEAF, rows.len() as u32, 0, &payload);
-        let node = decode_leaf_node(&block, 2, Arc::new(col_types.clone())).expect("decode leaf");
+        let node = decode_leaf_node(
+            &block,
+            2,
+            Arc::new(col_types.clone()),
+            std::sync::Weak::new(),
+        )
+        .expect("decode leaf");
 
         let fetch = |_p: u32| -> Result<Vec<u8>> { unreachable!("inline values read no overflow") };
         let resolve = |v: &Value, c: usize| -> Value {
@@ -4852,20 +4935,18 @@ mod tests {
                 let one = node.col_at(i, c).expect("col_at");
                 assert_eq!(resolve(&one, c), resolve(&whole[c], c));
             }
-            // `row_at_masked` decodes only the masked columns; the rest stay Null (unread).
-            let mask = [false, true, false];
-            let masked = node.row_at_masked(i, &mask).expect("row_at_masked");
-            assert_eq!(
-                masked[0],
-                Value::Null,
-                "unmasked column is not reconstructed"
-            );
-            assert_eq!(
-                masked[2],
-                Value::Null,
-                "unmasked column is not reconstructed"
-            );
-            assert_eq!(resolve(&masked[1], 1), resolve(&whole[1], 1));
+            // The B4 demand-fault backstop: a deferred value carries its own resolution handles,
+            // so `resolve_unfetched_self` reconstructs it with NO caller-supplied type or pager —
+            // the path the evaluator's column access takes when the static touched set missed.
+            for c in 0..col_types.len() {
+                if let Value::Unfetched(u) = &whole[c] {
+                    assert_eq!(
+                        resolve_unfetched_self(u).expect("self-resolve"),
+                        resolve(&whole[c], c),
+                        "self-resolution equals context resolution"
+                    );
+                }
+            }
         }
     }
 }
