@@ -739,8 +739,9 @@ Not one slice — a sequence of vertical slices (CLAUDE.md §10), each independe
    - **7d — docs.** ✅ The website's host/embedding docs now teach the converged surface: the six
      `web/examples/*` topics (open-database, transactions, scripts, authorization, resource-limits,
      session-variables) × {Rust, Go, TS} were rewritten to the `Database` handle and its delegators —
-     `Database::create`/`open`/`new_in_memory` (Rust), `jed.CreateDatabase`/`OpenDatabase`/`NewDatabase`
-     (Go), `createDatabase`/`openDatabase`/`Database.newInMemory()` (TS) — running SQL via `db.execute`/
+     `Database::create`/`open` (Rust), `jed.CreateDatabase`/`OpenDatabase` (Go),
+     `createDatabase`/`openDatabase` (TS) — an in-memory database is `create` with no path
+     ([api.md §2.1.1](api.md)) — running SQL via `db.execute`/
      `db.query`, minting an untrusted/concurrent **session** with `db.session(opts)` (whose `execute`/
      `query` no longer take a `db` argument — the session owns its `Engine`), and `tx`/`update`/`view`
      in Rust/Go (TS drives the block via `begin`/`commit`/`rollback`, having no closure helper). The

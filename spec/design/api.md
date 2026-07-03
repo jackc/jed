@@ -52,18 +52,37 @@ mapping table in §6.
 
 ### 2.1 Opening a database
 
-Two file constructors, deliberately split (open ≠ create):
+Two lifecycle constructors, deliberately split — **`create` vs `open`** — because bringing a
+*fresh* database into being and attaching to an *existing* file are genuinely different
+operations (different preconditions, error modes, and which options apply). **`create` covers
+both backings**, in-memory and file: an in-memory database **is** a create — a fresh empty
+database that simply has no file behind it — so the backing is a **property of the create
+options**, not a separate constructor. This is why there is **no** in-memory-specific constructor
+(the former `new()` / `NewDatabase()` / `newInMemory()` are **removed**); see §2.1.1.
 
-- **`create(path, opts)`** — make a **new** file-backed database. `opts.page_size` (default
-  **8192**, the [storage.md](storage.md) §3 default) is **locked into the file's meta at creation**
-  and cannot change thereafter. It must be a **power of two** in **`[256, 65536]`** —
-  `MIN_PAGE_SIZE` (256) through `MAX_PAGE_SIZE` (64 KiB; [../fileformat/format.md](../fileformat/format.md)
-  *Page model*, the nine legal values); a page size below the minimum is `0A000 feature_not_supported`
-  "page size too small", one above the maximum `0A000` "page size too large" (the cap bounds the largest
-  single allocation, including against a hostile file — §2.1 *open*), and a non-power-of-two value in
-  range `0A000` "page size must be a power of two". `create` writes an initial empty durable
-  image immediately (§3), so the file exists with its page size fixed. If the path **already exists**,
-  it is `58P02 duplicate_file` — `create` never clobbers.
+- **`create(opts)`** — make a **new** database, in-memory or file-backed. **`opts.path`** selects
+  the backing — **absent → in-memory** (never touches the filesystem), **present → a single file
+  at that path**. It is expressed as a genuine *optional*, never an overloaded empty-string
+  sentinel: Rust `path: Option<PathBuf>`, TS `path?: string`, Go `Path string` where the zero
+  value (`""`) is the documented "unset" (Go has no option type; the field name + doc carry the
+  intent, and no *positional* `create("")` exists to be hit by an uninitialized argument). This
+  deliberately does **not** follow SQLite/DuckDB's overloaded path string, whose `""` means
+  *opposite* things across those two engines (SQLite: a temp on-disk DB; DuckDB: in-memory).
+  **`opts.page_size`** (default **8192**, the [storage.md](storage.md) §3 default) is **locked into
+  the file's meta at creation** and cannot change thereafter; for an **in-memory** database it fixes
+  the tree fan-out the database would serialize to (the page-backed B-tree's fan-out tracks the page
+  size — [../fileformat/format.md](../fileformat/format.md), §9), so it is meaningful for both
+  backings. It must be a **power of two** in **`[256, 65536]`** — `MIN_PAGE_SIZE` (256) through
+  `MAX_PAGE_SIZE` (64 KiB; [../fileformat/format.md](../fileformat/format.md) *Page model*, the nine
+  legal values); a page size below the minimum is `0A000 feature_not_supported` "page size too
+  small", one above the maximum `0A000` "page size too large" (the cap bounds the largest single
+  allocation, including against a hostile file — §2.1 *open*), and a non-power-of-two value in range
+  `0A000` "page size must be a power of two". When a **path is given**, `create` writes an initial
+  empty durable image immediately (§3), so the file exists with its page size fixed, and if the path
+  **already exists** it is `58P02 duplicate_file` — `create` never clobbers. The **in-memory** path
+  cannot fail in substance, but `create` still returns the uniform `Result` / `(Database, error)`
+  signature (the error is invariably success in-memory) — a caller who wants an infallible in-memory
+  handle wraps `create` (§2.1.1).
 - **`open(path, opts?)`** — open an **existing** file: load it ([../fileformat/format.md](../fileformat/format.md)),
   adopting its recorded `page_size` and `txid`. The recorded `page_size` is validated to the same
   **power-of-two `[256, 65536]`** rule as `create` (above); a value outside the range *or* not a power
@@ -126,10 +145,53 @@ it — it has nowhere to spill, so a blocking operator stays fully resident rega
 mirroring the buffer pool's in-memory residency). Same shape across cores; the bare `open(path)`
 form uses the default.
 
-In-memory databases use the **existing constructors** (`Database::new()` / `NewDatabase()` /
-`new Database()`) — no backing file, default settings, kept verbatim for back-compat (the
-conformance harnesses and unit suites use them). An in-memory database never touches the
-filesystem.
+#### 2.1.1 One create, no in-memory constructor
+
+The interface is deliberately **two constructors** — `create` (fresh, either backing) and `open`
+(existing file) — and nothing else. The earlier surface had **five** overlapping entry points
+(an in-memory `new()`, an in-memory-with-page-size variant, a file `create`, a file `open`, and a
+hidden open-with-options); the first two **collapse into `create`** because they are the same
+operation on a different backing. Three decisions fix the shape:
+
+- **In-memory is signalled by an absent path, not its own constructor.** The knob analysis is
+  what makes this clean: every option an in-memory database will *ever* accept is a **subset** of a
+  file's (see the "future create-time knobs" note below), so one `CreateOptions` carries both
+  backings and only grows in shared directions — parallel constructors would drift, a single
+  `create(opts)` absorbs each new knob in one place.
+- **No infallible in-memory convenience in the core surface.** `create` returns the fallible
+  `Result` / `(Database, error)` uniformly, even though the in-memory path cannot fail. Wrapping it
+  in an infallible helper is trivial and belongs to the **caller**, not the core API — and the
+  cores' own **test suites are exactly that caller**: each keeps a private one-line helper (Rust a
+  `fn mem_db()`, Go a `memDB()`, TS a `memDb()`) that calls `create` with no path and unwraps the
+  impossible error. That is where an infallible in-memory handle lives — a test/host convenience,
+  never public core API.
+- **`open` is *not* folded into `create`.** Open-existing is a genuinely different operation — the
+  file must exist (`58P01` otherwise), it adopts the file's already-locked `page_size`/`txid` and so
+  takes **no** `page_size`, and its failure modes differ. Collapsing it into `create` would be
+  SQLite's flag-soup (`SQLITE_OPEN_CREATE` toggling create-vs-open on one call); keeping the two
+  split keeps each intent explicit.
+
+**Future create-time knobs (the shared `CreateOptions` is their one home).** `page_size` is the only
+create-time knob today. The neighbouring embedded engines point at what comes next, and every
+candidate is either backing-agnostic or a subset of the file case — so each lands as a new
+`CreateOptions` field, not a new constructor:
+
+- **A memory ceiling** — the standout. It is the in-memory twin of the file handle's
+  `open` `cache_bytes` buffer-pool budget (§2.1): `cache_bytes` bounds the resident *cache* of a
+  larger-than-RAM file; a `memory_limit` would bound the resident *dataset* of an in-memory
+  database (which cannot evict, so the bound is a deterministic abort — a `53200`-style
+  out-of-memory error, fitting the untrusted-query resource guarantee, CLAUDE.md §13). DuckDB's
+  `memory_limit` (default 80% of RAM) and SQLite's `soft_heap_limit`/`cache_size` are this knob.
+- **A spill target** — jed already has the `work_mem` *budget* (`open` opts, §2.1) but no *location*
+  for where a spilling operator ([spill.md](spill.md)) overflows to; DuckDB's `temporary_directory`
+  / SQLite's `temp_store` are this.
+- **A thread/parallelism count** — a later lever on the near-lock-free read path (CLAUDE.md §2/§3);
+  DuckDB's `threads` / SQLite's worker-thread limit.
+
+Everything else those engines expose at construction — text encoding, default null/sort order,
+collation, journal/`synchronous` mode — jed either **fixes by design** (determinism / PG semantics,
+CLAUDE.md §8) or attaches to the **file/durability** side, so it never becomes an in-memory create
+knob. An in-memory database never touches the filesystem.
 
 ### 2.2 Transactions, autocommit, and durability
 
@@ -228,7 +290,7 @@ commit. `close` is idempotent.
 > concurrency handle. The shape below is the converged surface; `SharedDb`/`ReadHandle`/`WriteHandle`
 > no longer exist as types.
 
-`Database` (returned by `new`/`open`/`create`, §2.1) is **cheap to clone and safe to share across
+`Database` (returned by `create`/`open`, §2.1) is **cheap to clone and safe to share across
 threads** — it holds the committed-roots cell, the single-writer gate, and the live-reader watermark
 (transactions.md §8/§10). Its **default session** (§2.4) is the simple, fast single-handle path.
 For **concurrent readers running alongside a writer**, a host mints **additional sessions**:
@@ -367,9 +429,10 @@ only and the engine has no wire protocol).
 
 | Concept / op | Rust | Go | TS |
 |---|---|---|---|
-| create file | `Database::create(path, opts) -> Result<Database>` | `Create(path, opts) (*Database, error)` | `create(path, opts): Database` |
-| open file | `Database::open(path) -> Result<Database>` | `Open(path) (*Database, error)` | `open(path): Database` |
-| open in-memory | `Database::new()` | `NewDatabase()` | `new Database()` |
+| create (in-memory or file) | `Database::create(opts) -> Result<Database>` (`opts.path: Option<PathBuf>`) | `CreateDatabase(opts) (*Database, error)` (`opts.Path string`) | `createDatabase(opts): Database` (`opts.path?`) |
+| open file | `Database::open(path) -> Result<Database>` | `OpenDatabase(path) (*Database, error)` | `openDatabase(path): Database` |
+| in-memory (no path) | `Database::create(CreateOptions::default())` | `CreateDatabase(CreateOptions{})` | `createDatabase({})` |
+| infallible in-memory (test/host helper) | `fn mem_db()` wrapping `create` | `memDB()` wrapping `CreateDatabase` | `memDb()` wrapping `createDatabase` |
 | commit (current tx) | `db.commit() -> Result<()>` | `db.Commit() error` | `commit(db): void` |
 | rollback (current tx) | `db.rollback() -> Result<()>` | `db.Rollback() error` | `rollback(db): void` |
 | begin | `db.begin(writable) -> Result<Transaction>` | `db.Begin(writable) (*Transaction, error)` | `begin(db, writable): Transaction` |
