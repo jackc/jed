@@ -8,6 +8,7 @@
 // column; a NULL boolean (unknown) is the "null" Value, so {true, false, NULL} is the
 // three-valued domain, ordered false < true.
 
+import type { ColType } from "./catalog.ts";
 import { Decimal } from "./decimal.ts";
 import { type Interval, intervalCmp, renderInterval } from "./interval.ts";
 import { renderTimestamp, renderTimestamptz } from "./timestamp.ts";
@@ -119,13 +120,52 @@ export type Value =
 // the compressed forms; comp holds the resident LZ4 block for inline-compressed, or the body-span
 // view for inline-deferred. (A value read back from a spill run file owns a fresh copy in `comp` — a
 // degenerate form (a), since its page block is long gone — spill.ts.)
+//
+// Since B4 (spec/design/bplus-reshape.md §5) every form is SELF-RESOLVING: it carries its column type
+// (`ty`, a TypeRef — the store's shared column-type array + this value's ordinal) and — for the
+// external forms — a plain reference to its database's paging context (`paging`; a GC language needs
+// no Rust-style weak handle), so a value the static touched set missed is resolved ON DEMAND at the
+// evaluator's column access (the demand-fault backstop, format.ts resolveUnfetchedSelf) instead of
+// being read as NULL or poisoning. The handles are resolution PLUMBING, not value identity: any
+// comparison/render/encode of an unfetched value stays poisoned (below) exactly as before — the
+// stored identity is the pointer fields alone, never `ty`/`paging`. A spill-run-file reload carries
+// the SENTINEL handles (sentinelTypeRef + null paging — spill.ts): it rides the sort output unread by
+// contract, so touching one stays the loud pre-B4 poison.
 export type Unfetched = {
   form: number;
   firstPage: number;
   storedLen: number;
   rawLen: number;
   comp: Uint8Array | undefined;
+  ty: TypeRef;
+  paging: UnfetchedPager | null;
 };
+
+// TypeRef is a cheap shared reference to a deferred value's column type (bplus-reshape.md B4): the
+// store's shared column-type array plus this value's column ordinal — one reference per deferred
+// value, no per-value ColType copy. resolveUnfetchedSelf reads cols[idx].
+export type TypeRef = { cols: ColType[]; idx: number };
+
+// sentinelTypeRef is the reference of a spill-run-file reload (spill.ts tags 9/10/11/21): the run
+// file cannot carry runtime handles, so a reloaded deferred value keeps NO resolvable type — it
+// rides the sort output UNREAD (spill.md §4). Touching one is an engine bug and throws loudly in
+// resolveUnfetchedSelf, exactly like the pre-B4 poison contract.
+export function sentinelTypeRef(): TypeRef {
+  return { cols: [], idx: 0 };
+}
+
+export function isSentinelTypeRef(t: TypeRef): boolean {
+  return t.cols.length === 0;
+}
+
+// UnfetchedPager is the opaque handle to the database's paging context a deferred EXTERNAL value
+// carries so it can self-resolve at the evaluator's column access (the B4 demand-fault backstop).
+// Typed minimally here (paging.ts's SharedPaging satisfies it structurally) so value.ts stays free
+// of a value↔paging import cycle; null for the inline forms (they own their bytes) and for a dead
+// handle (the open-time reachability walk, whose values are discarded right after chain-marking).
+export interface UnfetchedPager {
+  readBlock(index: number): Uint8Array;
+}
 
 // intValue builds a non-null integer value.
 export function intValue(n: bigint): Value {

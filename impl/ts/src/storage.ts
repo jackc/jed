@@ -235,38 +235,15 @@ export class TableStore {
   // overlapScanUnits, computed in ONE B-tree traversal instead of three (the windowed walk visits
   // precisely the nodes overlapNodeCount counts, and the per-admitted-record spill/compress units
   // are computed inline from the entries it collects). Byte-identical cost and rows by construction.
+  // Serves the whole-row and touched-column feeds alike — the old masked/unmasked reconstruction
+  // split is collapsed (bplus-reshape.md B4: reconstruction is uniformly lazy, so there is nothing
+  // left to mask). `mask` is the cost touched set (which columns' spill/compress to charge — a §8
+  // byte contract).
   rangeScanWithUnits(
     b: KeyBound,
     mask: boolean[],
   ): { entries: Entry[]; pages: number; slabs: number } {
-    return this.rangeScanWithUnitsRecon(b, mask, null);
-  }
-
-  // rangeScanWithUnitsMasked is rangeScanWithUnits reconstructing ONLY the touched columns (mask) per
-  // admitted row — the read-only SELECT feed's Track A1 touched-column path (packed-leaf.md §11): a
-  // Packed leaf skips decoding the untouched columns (left NULL). Identical cost and identical results
-  // for a consumer that reads only the touched columns; NOT for one that needs the whole row (mutation /
-  // FK / index-maintenance keep the whole-row variant, which recompute keys from the old row). Cost is
-  // byte-identical — reconstruction masking carries no cost unit (cost.md §3); the block below reads only
-  // `mask` (the same static touched set).
-  rangeScanWithUnitsMasked(
-    b: KeyBound,
-    mask: boolean[],
-  ): { entries: Entry[]; pages: number; slabs: number } {
-    return this.rangeScanWithUnitsRecon(b, mask, mask);
-  }
-
-  // The fused bounded scan shared by the whole-row and touched-column variants. `mask` is the cost
-  // touched set (which columns' spill/compress to charge — a §8 byte contract, unchanged across
-  // variants). `recon` drives leaf reconstruction: null rebuilds the whole row, a mask rebuilds only its
-  // columns (the rest NULL). Reconstruction masking is cost-neutral (no per-column-decode unit,
-  // cost.md §3) — the cost block below reads only `mask`.
-  private rangeScanWithUnitsRecon(
-    b: KeyBound,
-    mask: boolean[],
-    recon: boolean[] | null,
-  ): { entries: Entry[]; pages: number; slabs: number } {
-    const { keys, vals, nodes } = this.rows.rangeEntriesCounted(b, this.leafSrc(), recon);
+    const { keys, vals, nodes } = this.rows.rangeEntriesCounted(b, this.leafSrc());
     const entries = keys.map((k, i) => ({ key: k, row: vals[i] }));
     let pages = nodes;
     let slabs = 0;
@@ -285,12 +262,6 @@ export class TableStore {
   // node, so the count equals nodeCount).
   scanWithUnits(mask: boolean[]): { entries: Entry[]; pages: number; slabs: number } {
     return this.rangeScanWithUnits(unboundedBound(), mask);
-  }
-
-  // scanWithUnitsMasked is scanWithUnits reconstructing only the touched columns — the read-only
-  // full-scan SELECT feed (see rangeScanWithUnitsMasked).
-  scanWithUnitsMasked(mask: boolean[]): { entries: Entry[]; pages: number; slabs: number } {
-    return this.rangeScanWithUnitsMasked(unboundedBound(), mask);
   }
 
   // columnarScanMasked gathers the mask-selected columns of a bounded scan into dense per-column lanes
@@ -418,23 +389,15 @@ export class TableStore {
   // scanRange streams the rows whose primary key lies within b to visit, in key order, stopping
   // (without faulting further leaves) the moment visit returns false — the genuine LIMIT short-circuit
   // (spec/design/cost.md §3 "LIMIT short-circuit").
-  scanRange(
-    b: KeyBound,
-    recon: boolean[] | null,
-    visit: (key: Uint8Array, row: Row) => boolean,
-  ): void {
-    this.rows.scanRange(b, this.leafSrc(), recon, visit);
+  scanRange(b: KeyBound, visit: (key: Uint8Array, row: Row) => boolean): void {
+    this.rows.scanRange(b, this.leafSrc(), visit);
   }
 
   // scanRangeRev is scanRange in reverse: it yields the in-bound rows in DESCENDING key order — a
   // DESC reverse scan (spec/design/cost.md §3), stopping the same way on a false visit so a reverse
   // top-N short-circuits from the high end.
-  scanRangeRev(
-    b: KeyBound,
-    recon: boolean[] | null,
-    visit: (key: Uint8Array, row: Row) => boolean,
-  ): void {
-    this.rows.scanRangeRev(b, this.leafSrc(), recon, visit);
+  scanRangeRev(b: KeyBound, visit: (key: Uint8Array, row: Row) => boolean): void {
+    this.rows.scanRangeRev(b, this.leafSrc(), visit);
   }
 
   // scanIter is the PULL form of scanRange / scanRangeRev — a generator yielding (key, row) within b
@@ -443,17 +406,33 @@ export class TableStore {
   // so this store (a snapshot clone) pins its pages for the cursor's life (transactions.md §5); a leaf
   // faults through the pool only on descent, so a caller that stops early faults no leaves past the
   // stop (the LIMIT short-circuit, cost.md §3).
-  scanIter(b: KeyBound, reverse: boolean, recon: boolean[] | null): Generator<[Uint8Array, Row]> {
+  scanIter(b: KeyBound, reverse: boolean): Generator<[Uint8Array, Row]> {
     const src = this.leafSrc();
-    return reverse
-      ? this.rows.scanRangeRevIter(b, src, recon)
-      : this.rows.scanRangeIter(b, src, recon);
+    return reverse ? this.rows.scanRangeRevIter(b, src) : this.rows.scanRangeIter(b, src);
   }
 
   // treeRoot is the root B-tree node of this store, for the page-backed serializer
   // (spec/fileformat/format.md). null for an empty table.
   treeRoot(): PNode | null {
     return this.rows.rootNode();
+  }
+
+  // demoteCleanLeaves demotes this store's clean, persisted resident leaves to OnDisk references —
+  // the post-commit residency flip (bplus-reshape.md B4; pmap.ts PMap.demoteCleanLeaves). A no-op
+  // for a store whose nodes were never persisted (a GiST leaf-key store, a bare scratch engine).
+  // Only meaningful on a paged store — the flipped leaves fault back through the pool.
+  demoteCleanLeaves(): void {
+    if (this.paging !== null) this.rows.demoteCleanLeaves();
+  }
+
+  // faultLeaf faults the clean leaf at page through this store's pool — the whole-image
+  // serializer's OnDisk-child materialization (format.ts serializeNode; under B3 every database is
+  // demand-paged, in-memory included). A store with no paging context cannot hold an OnDisk child,
+  // so the throw is an internal wiring invariant.
+  faultLeaf(page: number): PNode {
+    const paging = this.paging;
+    if (paging === null) throw new Error("an OnDisk leaf implies a paged store");
+    return paging.faultLeaf(page, this.colTypes);
   }
 
   // columnTypes is the store's resolved per-column ColTypes (a scalar, or a composite resolved to

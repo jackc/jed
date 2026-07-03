@@ -20,6 +20,7 @@ import {
   jsonValue,
   jsonbValue,
   rangeValue,
+  sentinelTypeRef,
 } from "./value.ts";
 
 // SpillSink is the host backing for spilled runs — the Node `fs` implementation is FileSpillSink
@@ -554,6 +555,9 @@ function readValue(r: SpillByteReader): Value {
     case 17:
       return { kind: "date", days: r.u64() };
     case 9:
+      // A reloaded deferred value carries SENTINEL handles (the run file cannot carry runtime
+      // handles): it rides the sort output UNREAD by contract (spill.md §4), and touching one stays
+      // the loud pre-B4 poison (resolveUnfetchedSelf).
       return {
         kind: "unfetched",
         ref: {
@@ -562,12 +566,25 @@ function readValue(r: SpillByteReader): Value {
           storedLen: readU32(r),
           rawLen: 0,
           comp: undefined,
+          ty: sentinelTypeRef(),
+          paging: null,
         },
       };
     case 10: {
       const rawLen = readU32(r);
       const comp = r.bytes(readU32(r));
-      return { kind: "unfetched", ref: { form: 0x03, firstPage: 0, storedLen: 0, rawLen, comp } };
+      return {
+        kind: "unfetched",
+        ref: {
+          form: 0x03,
+          firstPage: 0,
+          storedLen: 0,
+          rawLen,
+          comp,
+          ty: sentinelTypeRef(),
+          paging: null,
+        },
+      };
     }
     case 11:
       return {
@@ -578,13 +595,23 @@ function readValue(r: SpillByteReader): Value {
           storedLen: readU32(r),
           rawLen: readU32(r),
           comp: undefined,
+          ty: sentinelTypeRef(),
+          paging: null,
         },
       };
     case 21: {
       const body = r.bytes(readU32(r));
       return {
         kind: "unfetched",
-        ref: { form: 0x00, firstPage: 0, storedLen: 0, rawLen: 0, comp: body },
+        ref: {
+          form: 0x00,
+          firstPage: 0,
+          storedLen: 0,
+          rawLen: 0,
+          comp: body,
+          ty: sentinelTypeRef(),
+          paging: null,
+        },
       };
     }
     case 12: {

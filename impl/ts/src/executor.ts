@@ -121,7 +121,7 @@ import {
   type ExtractSrc,
   extractField,
 } from "./datetime_fn.ts";
-import { crc32Ieee, pagePayload } from "./format.ts";
+import { crc32Ieee, pagePayload, resolveUnfetchedSelf } from "./format.ts";
 import {
   Decimal,
   decimalFromParts,
@@ -1020,6 +1020,19 @@ export class Snapshot {
       const keys = store ? store.entriesInKeyOrder().map((e) => e.key) : [];
       this.gistTrees.set(sp.nameKey, buildGistFromLeafKeys(sp.ops, keys));
     }
+  }
+
+  // demoteCleanLeaves demotes every store's clean, persisted resident leaves to OnDisk references —
+  // the post-commit residency flip over the whole snapshot (bplus-reshape.md B4), run after a
+  // successful persist so the published committed tree is the skeletal `interiors + OnDisk leaves`
+  // shape on every host. Table stores and btree/GIN index stores flip; a GiST leaf-key store's
+  // nodes are never persisted (its on-disk form is the R-tree) and a store with no paging context
+  // (a table created in-session, a temp store) has nothing to fault from — both no-op inside
+  // TableStore.demoteCleanLeaves. Map iteration order is irrelevant (each store flips
+  // independently), so no order leak (CLAUDE.md §8).
+  demoteCleanLeaves(): void {
+    for (const store of this.stores.values()) store.demoteCleanLeaves();
+    for (const store of this.indexStores.values()) store.demoteCleanLeaves();
   }
 
   // resolveCollation resolves a collation name for USE — query resolution and key encoding
@@ -2074,8 +2087,7 @@ function* streamRows(
   let passed = 0n;
   let produced = 0n;
   // A pkReverse plan (ORDER BY the full PK all-DESC) walks the tree backward; everything else forward.
-  // Read-only streaming SELECT feed: reconstruct only the touched columns (Track A1, packed-leaf.md §11).
-  for (const [, rawRow] of store.scanIter(bound, sp.pkReverse, sp.relMasks[0]!)) {
+  for (const [, rawRow] of store.scanIter(bound, sp.pkReverse)) {
     meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
     meter.charge(COSTS.storageRowRead);
     // Materialize the touched columns left unfetched by the lazy load (large-values.md §14); the chain
@@ -5656,9 +5668,9 @@ export class Engine {
   // per-probe (pages, slabs) blocks sum, so the metered cost is the sum of the individual point
   // lookups — a core that full-scans instead computes a different cost (the cross-core contract, §8).
   // Returns the (key, row) entries so the mutation paths can remove/replace by key; SELECT discards
-  // the keys. masked selects the reconstruction variant (SELECT reconstructs only the touched
-  // columns; a mutation needs whole rows to re-key/remove index entries) — cost-neutral, so both
-  // charge the identical (pages, slabs) driven by the shared mask.
+  // the keys. The SELECT/mutation feeds share the one lazy reconstruction (the masked/unmasked
+  // split is collapsed — bplus-reshape.md B4); both charge the identical (pages, slabs) driven by
+  // the shared mask.
   pkKeySetRows(
     store: TableStore,
     ks: PkKeySet,
@@ -5666,14 +5678,13 @@ export class Engine {
     outer: Row[],
     mask: boolean[],
     left: Row,
-    masked: boolean,
   ): { entries: Entry[]; pages: number; slabs: number } {
     const entries: Entry[] = [];
     let pages = 0;
     let slabs = 0;
     for (const k of encodeKeySet(ks.pkType, ks.srcs, params, outer, ks.coll, left)) {
       const b: KeyBound = { lo: k, loInc: true, hi: k, hiInc: true };
-      const u = masked ? store.rangeScanWithUnitsMasked(b, mask) : store.rangeScanWithUnits(b, mask);
+      const u = store.rangeScanWithUnits(b, mask);
       for (const e of u.entries) entries.push(e);
       pages += u.pages;
       slabs += u.slabs;
@@ -7163,7 +7174,7 @@ export class Engine {
         // Merged PK point-set delete (cost.md §3 "OR / IN-list"): a union of point probes over the
         // distinct sorted keys; whole rows so index entries can be removed. The predicate stays the
         // residual filter below.
-        const r = this.pkKeySetRows(store, ks, bound, [], mask, [], false);
+        const r = this.pkKeySetRows(store, ks, bound, [], mask, []);
         entries = r.entries;
         overlap = r.pages;
         slabs = r.slabs;
@@ -7465,7 +7476,7 @@ export class Engine {
         // Merged PK point-set update (cost.md §3 "OR / IN-list"): a union of point probes over the
         // distinct sorted keys of the PRE-update state; whole rows. The predicate stays the residual
         // filter below.
-        const r = this.pkKeySetRows(store, ks, bound, [], mask, [], false);
+        const r = this.pkKeySetRows(store, ks, bound, [], mask, []);
         entries = r.entries;
         overlap = r.pages;
         slabs = r.slabs;
@@ -10592,11 +10603,9 @@ export class Engine {
         return limit === null ? true : BigInt(out.length) < limit;
       };
       // A pkReverse plan (ORDER BY the full PK all-DESC) walks the tree backward; everything else
-      // (forward pkOrdered, or the no-ORDER-BY LIMIT short-circuit) walks forward. Read-only SELECT feed:
-      // reconstruct only the touched columns (Track A1, packed-leaf.md §11).
-      const recon = plan.relMasks[0]!;
-      if (plan.pkReverse) store.scanRangeRev(bound, recon, visit);
-      else store.scanRange(bound, recon, visit);
+      // (forward pkOrdered, or the no-ORDER-BY LIMIT short-circuit) walks forward.
+      if (plan.pkReverse) store.scanRangeRev(bound, visit);
+      else store.scanRange(bound, visit);
     }
     return {
       columnNames: plan.columnNames,
@@ -10721,9 +10730,8 @@ export class Engine {
         rows.push(row);
         return BigInt(rows.length) < cap; // stop once the OFFSET+LIMIT window is filled
       };
-      const recon = plan.relMasks[0]!;
-      if (plan.pkReverse) store.scanRangeRev(bound, recon, visit);
-      else store.scanRange(bound, recon, visit);
+      if (plan.pkReverse) store.scanRangeRev(bound, visit);
+      else store.scanRange(bound, visit);
     }
 
     // The window stage over the collected prefix — identical to the eager path (§5.2), just fewer rows.
@@ -10764,7 +10772,7 @@ export class Engine {
     if (limit !== 0n) {
       let passed = 0n;
       // An index store has no payload columns, so its rows carry nothing to mask — whole-row scan.
-      istore.scanRange(unboundedBound(), null, (ekey) => {
+      istore.scanRange(unboundedBound(), (ekey) => {
         meter.guard(); // enforce the cost ceiling per scanned entry (CLAUDE.md §13)
         // Peel the fixed-width PK suffix off the END of the index entry key (indexes.md §3): the
         // entry key is `<index columns> ‖ storage_key`, and storage_key is exactly io.pkWidth bytes.
@@ -10844,7 +10852,7 @@ export class Engine {
       const rows: Row[] = [];
       if (!empty) {
         // Read-only SELECT feed: reconstruct only the touched columns (Track A1).
-        store.scanRange(bound, plan.relMasks[0]!, (_key, rawRow) => {
+        store.scanRange(bound, (_key, rawRow) => {
           meter.guard();
           meter.charge(COSTS.storageRowRead);
           const row = store.resolveColumns(rawRow, plan.relMasks[0]!);
@@ -10866,7 +10874,7 @@ export class Engine {
       const sorter = this.newSorterFor(plan.order);
       if (!empty) {
         // Read-only SELECT feed: reconstruct only the touched columns (Track A1).
-        store.scanRange(bound, plan.relMasks[0]!, (_key, rawRow) => {
+        store.scanRange(bound, (_key, rawRow) => {
           meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
           meter.charge(COSTS.storageRowRead);
           const row = store.resolveColumns(rawRow, plan.relMasks[0]!);
@@ -11089,7 +11097,7 @@ export class Engine {
         // Read-only SELECT feed: reconstruct only the touched columns (Track A1) — a Packed leaf skips
         // decoding the untouched ones. Cost- and result-identical for a consumer that reads only the
         // touched set (packed-leaf.md §11).
-        const u = store.rangeScanWithUnitsMasked(b, plan.relMasks[ri]!);
+        const u = store.rangeScanWithUnits(b, plan.relMasks[ri]!);
         rows = u.entries.map((e) => e.row);
         nodeCount = u.pages;
         slabs = u.slabs;
@@ -11097,15 +11105,7 @@ export class Engine {
     } else if (relBound !== null && relBound.kind === "pkSet") {
       // Merged PK point-set (cost.md §3 "OR / IN-list"): a union of point probes over the distinct
       // sorted keys; the whole WHERE stays the residual filter downstream.
-      const r = this.pkKeySetRows(
-        store,
-        relBound.pkSet,
-        params,
-        outer,
-        plan.relMasks[ri]!,
-        left,
-        true,
-      );
+      const r = this.pkKeySetRows(store, relBound.pkSet, params, outer, plan.relMasks[ri]!, left);
       rows = r.entries.map((e) => e.row);
       nodeCount = r.pages;
       slabs = r.slabs;
@@ -11124,7 +11124,7 @@ export class Engine {
       slabs = r.slabs;
     } else {
       // Read-only full-scan SELECT feed: reconstruct only the touched columns (Track A1).
-      const u = store.scanWithUnitsMasked(plan.relMasks[ri]!);
+      const u = store.scanWithUnits(plan.relMasks[ri]!);
       rows = u.entries.map((e) => e.row);
       nodeCount = u.pages;
       slabs = u.slabs;
@@ -27938,11 +27938,19 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
   // is a no-op when no ceiling is set (spec/design/cost.md §6).
   m.guard();
   switch (e.kind) {
-    case "column":
-      return row[e.index]!;
-    case "outerColumn":
-      // A correlated reference: column `index` of the enclosing row `level` hops out (§26).
-      return env.outer[env.outer.length - e.level]![e.index]!;
+    case "column": {
+      // A deferred large value the static touched set missed resolves ON TOUCH — the B4
+      // demand-fault backstop (spec/design/bplus-reshape.md §5): deterministic rows, never a
+      // NULL-fold; deliberately unmetered (§6).
+      const v = row[e.index]!;
+      return v.kind === "unfetched" ? resolveUnfetchedSelf(v.ref) : v;
+    }
+    case "outerColumn": {
+      // A correlated reference: column `index` of the enclosing row `level` hops out (§26), with
+      // the same demand-fault backstop as the column case.
+      const v = env.outer[env.outer.length - e.level]![e.index]!;
+      return v.kind === "unfetched" ? resolveUnfetchedSelf(v.ref) : v;
+    }
     case "param":
       // The supplied value, already coerced to its inferred type by bindParams before execution
       // (spec/design/api.md §5).

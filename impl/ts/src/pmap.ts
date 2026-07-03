@@ -30,12 +30,11 @@ import type { Value } from "./value.ts";
 // below). Built by format.ts decodeLeafNode.
 export interface PackedLeaf {
   readonly n: number;
-  // Reconstruct the whole value row i.
+  // Reconstruct the whole value row i — uniformly LAZY (bplus-reshape.md B4): fixed-width columns
+  // decode eagerly, variable columns defer as self-resolving unfetched values.
   row(i: number): Row;
-  // Reconstruct only column c of row i — the touched-column path (S3-ready, not yet driven).
+  // Reconstruct only column c of row i — the touched-column path (the A2/A3 columnar gather).
   col(i: number, c: number): Value;
-  // Reconstruct row i decoding only the columns mask selects; untouched columns are NULL (S3-ready).
-  rowMasked(i: number, mask: boolean[]): Row;
 }
 
 // One B+tree node. `children` is empty for a leaf; otherwise children.length === keys.length+1 and
@@ -46,10 +45,11 @@ export interface PackedLeaf {
 // node. Exported so the serializer (format.ts) can read/build it.
 export type PNode = {
   keys: Uint8Array[];
-  // The decoded value rows — populated for a Decoded leaf (in-memory / mutated / dirty), empty for
-  // a Packed leaf (which reconstructs on demand from `packed`) and for EVERY interior node
-  // (record-free, v24). Read only through the rowAt / colAt / rowAtMasked / decodedRows seam on
-  // leaves, never indexed directly, so the two leaf forms are interchangeable (packed-leaf.md §3/§4).
+  // The decoded value rows — populated for a Decoded leaf (the writer's transient
+  // materialize-mutate-repack scratch, bplus-reshape.md §5), empty for a Packed leaf (which
+  // reconstructs on demand from `packed`) and for EVERY interior node (record-free, v24). Read only
+  // through the rowAt / colAt / decodedRows seam on leaves, never indexed directly, so the two leaf
+  // forms are interchangeable (packed-leaf.md §3/§4).
   vals: Row[];
   weights: number[];
   children: Child[];
@@ -63,7 +63,12 @@ export type PNode = {
 
 // rowAt reconstructs value row i — the value-read seam (packed-leaf.md §4), on a LEAF. A Decoded
 // leaf returns the stored row (read-only by convention); a Packed leaf reconstructs it from the
-// retained PAX directories. Throws on a corrupt touched inline body (XX001).
+// retained PAX directories. Throws on a corrupt touched inline body (XX001). The old two-form
+// masked/unmasked reconstruction seam (rowAtMasked / rowAtMaybeMasked) is COLLAPSED
+// (bplus-reshape.md B4): a Packed leaf's reconstruction is uniformly lazy (fixed-width columns
+// decode eagerly, variable columns defer as self-resolving unfetched values), so a reconstruction
+// mask no longer exists — the query's touched set survives as the cost basis + the scan layer's
+// resolve prefetch, and a missed value resolves on touch (the demand-fault backstop).
 export function rowAt(n: PNode, i: number): Row {
   return n.packed ? n.packed.row(i) : n.vals[i]!;
 }
@@ -72,21 +77,6 @@ export function rowAt(n: PNode, i: number): Row {
 // OP_Column model).
 export function colAt(n: PNode, i: number, c: number): Value {
   return n.packed ? n.packed.col(i, c) : n.vals[i]![c]!;
-}
-
-// rowAtMasked reconstructs row i decoding ONLY the columns mask selects (packed-leaf.md §4/§6). A
-// Decoded leaf returns the whole stored row; a Packed leaf leaves untouched columns NULL.
-export function rowAtMasked(n: PNode, i: number, mask: boolean[]): Row {
-  return n.packed ? n.packed.rowMasked(i, mask) : n.vals[i]!;
-}
-
-// rowAtMaybeMasked is the scan-feed value-read seam (packed-leaf.md §4/§11, Track A1): recon === null
-// reconstructs the WHOLE row (rowAt) — the whole-row default the mutation / FK / index-maintenance feeds
-// keep (they recompute keys from the old row) — while recon !== null reconstructs only its selected
-// columns (rowAtMasked), leaving the rest NULL, for a read-only SELECT feed so a Packed leaf skips
-// decoding the untouched columns. A Decoded leaf returns its whole row either way (already decoded).
-export function rowAtMaybeMasked(n: PNode, i: number, recon: boolean[] | null): Row {
-  return recon === null ? rowAt(n, i) : rowAtMasked(n, i, recon);
 }
 
 // decodedRows returns every value row of a LEAF — the mutation-descent materialization
@@ -434,7 +424,7 @@ export class PMap {
   // entry window (entryWindow), then walks only those, so only overlapping leaves fault through src.
   // The unbounded bound walks the whole tree (identical to inorder).
   rangeEntries(b: KeyBound, src: LeafSource | null): { keys: Uint8Array[]; vals: Row[] } {
-    const { keys, vals } = this.rangeEntriesCounted(b, src, null);
+    const { keys, vals } = this.rangeEntriesCounted(b, src);
     return { keys, vals };
   }
 
@@ -445,7 +435,6 @@ export class PMap {
   rangeEntriesCounted(
     b: KeyBound,
     src: LeafSource | null,
-    recon: boolean[] | null,
   ): { keys: Uint8Array[]; vals: Row[]; nodes: number } {
     const keys: Uint8Array[] = [];
     const vals: Row[] = [];
@@ -456,7 +445,7 @@ export class PMap {
         const [ef, el] = entryWindow(b, n);
         for (let i = ef; i < el; i++) {
           keys.push(n.keys[i]);
-          vals.push(rowAtMaybeMasked(n, i, recon));
+          vals.push(rowAt(n, i));
         }
         return;
       }
@@ -564,14 +553,13 @@ export class PMap {
   scanRange(
     b: KeyBound,
     src: LeafSource | null,
-    recon: boolean[] | null,
     visit: (key: Uint8Array, row: Row) => boolean,
   ): void {
     const walk = (n: PNode): boolean => {
       if (isLeaf(n)) {
         const [ef, el] = entryWindow(b, n);
         for (let i = ef; i < el; i++) {
-          if (!visit(n.keys[i], rowAtMaybeMasked(n, i, recon))) return false;
+          if (!visit(n.keys[i], rowAt(n, i))) return false;
         }
         return true;
       }
@@ -593,14 +581,13 @@ export class PMap {
   scanRangeRev(
     b: KeyBound,
     src: LeafSource | null,
-    recon: boolean[] | null,
     visit: (key: Uint8Array, row: Row) => boolean,
   ): void {
     const walk = (n: PNode): boolean => {
       if (isLeaf(n)) {
         const [ef, el] = entryWindow(b, n);
         for (let i = el - 1; i >= ef; i--) {
-          if (!visit(n.keys[i], rowAtMaybeMasked(n, i, recon))) return false;
+          if (!visit(n.keys[i], rowAt(n, i))) return false;
         }
         return true;
       }
@@ -623,60 +610,90 @@ export class PMap {
   // circuit, cost.md §3). It yields the stored row reference (like scanRange's callback); the GC keeps
   // a faulted leaf's row alive as long as a pulled row references it, even after the pool evicts the
   // leaf. A faulted-leaf read error in resolveChild propagates as a thrown exception.
-  *scanRangeIter(
-    b: KeyBound,
-    src: LeafSource | null,
-    recon: boolean[] | null,
-  ): Generator<[Uint8Array, Row]> {
-    if (this.root !== null) yield* walkIter(this.root, b, src, recon);
+  *scanRangeIter(b: KeyBound, src: LeafSource | null): Generator<[Uint8Array, Row]> {
+    if (this.root !== null) yield* walkIter(this.root, b, src);
   }
 
   // scanRangeRevIter is scanRangeIter in reverse — the pull-model equivalent of scanRangeRev,
   // yielding the in-bound pairs in DESCENDING key order (the exact reverse of scanRangeIter).
-  *scanRangeRevIter(
-    b: KeyBound,
-    src: LeafSource | null,
-    recon: boolean[] | null,
-  ): Generator<[Uint8Array, Row]> {
-    if (this.root !== null) yield* walkRevIter(this.root, b, src, recon);
+  *scanRangeRevIter(b: KeyBound, src: LeafSource | null): Generator<[Uint8Array, Row]> {
+    if (this.root !== null) yield* walkRevIter(this.root, b, src);
+  }
+
+  // demoteCleanLeaves demotes every CLEAN, PERSISTED resident leaf to its OnDisk(page) reference —
+  // the post-commit residency flip (bplus-reshape.md B4): after a commit assigns page ids to the
+  // dirty nodes it wrote, the committed tree sheds its leaf payloads and becomes the skeletal
+  // `interior nodes + OnDisk leaves` shape every load already produces, so reads everywhere go
+  // through the one Packed pool path and Decoded survives only inside an uncommitted writer
+  // (write-scratch). A ROOT leaf stays resident (the PMap root is always a node — the open/load
+  // convention); an unpersisted (page 0) leaf is left alone (defensive — a bare scratch engine that
+  // never persists). Rebuilds only the interior spine above changed children; an unchanged subtree
+  // keeps its node object (and its set-once page id), so the flip is O(interior nodes) and the
+  // flipped tree stays clean for the next incremental commit.
+  demoteCleanLeaves(): void {
+    const demote = (node: PNode): PNode | null => {
+      if (isLeaf(node)) return null; // handled by the parent (a root leaf stays resident)
+      let changed = false;
+      const children: Child[] = new Array(node.children.length);
+      for (let i = 0; i < node.children.length; i++) {
+        const c = node.children[i]!;
+        if (c.node === null) {
+          children[i] = c; // already OnDisk
+        } else if (isLeaf(c.node)) {
+          if (c.node.page !== 0) {
+            changed = true;
+            children[i] = onDiskRef(c.node.page);
+          } else {
+            children[i] = c;
+          }
+        } else {
+          const rebuilt = demote(c.node);
+          if (rebuilt !== null) {
+            changed = true;
+            children[i] = residentRef(rebuilt);
+          } else {
+            children[i] = c;
+          }
+        }
+      }
+      if (!changed) return null;
+      // The rebuilt interior keeps its keys AND its page id — its serialized bytes are unchanged
+      // (children reference the same pages), so it must stay clean or the next incremental commit
+      // would rewrite the whole spine every time.
+      return { keys: node.keys, vals: [], weights: [], children, page: node.page };
+    };
+    if (this.root !== null) {
+      const rebuilt = demote(this.root);
+      if (rebuilt !== null) this.root = rebuilt;
+    }
   }
 }
 
 // walkIter mirrors PMap.scanRange's recursive in-order walk, yielding [key, row] instead of calling a
 // visit callback — so it is identical by construction (same structure, same windowing, same descent
 // order; only leaves yield, v24).
-function* walkIter(
-  n: PNode,
-  b: KeyBound,
-  src: LeafSource | null,
-  recon: boolean[] | null,
-): Generator<[Uint8Array, Row]> {
+function* walkIter(n: PNode, b: KeyBound, src: LeafSource | null): Generator<[Uint8Array, Row]> {
   if (isLeaf(n)) {
     const [ef, el] = entryWindow(b, n);
-    for (let i = ef; i < el; i++) yield [n.keys[i], rowAtMaybeMasked(n, i, recon)];
+    for (let i = ef; i < el; i++) yield [n.keys[i], rowAt(n, i)];
     return;
   }
   const [cf, cl] = childWindow(b, n);
   for (let i = cf; i <= cl; i++) {
-    yield* walkIter(resolveChild(n.children[i], src), b, src, recon);
+    yield* walkIter(resolveChild(n.children[i], src), b, src);
   }
 }
 
 // walkRevIter mirrors PMap.scanRangeRev's reverse walk, yielding instead of pushing.
-function* walkRevIter(
-  n: PNode,
-  b: KeyBound,
-  src: LeafSource | null,
-  recon: boolean[] | null,
-): Generator<[Uint8Array, Row]> {
+function* walkRevIter(n: PNode, b: KeyBound, src: LeafSource | null): Generator<[Uint8Array, Row]> {
   if (isLeaf(n)) {
     const [ef, el] = entryWindow(b, n);
-    for (let i = el - 1; i >= ef; i--) yield [n.keys[i], rowAtMaybeMasked(n, i, recon)];
+    for (let i = el - 1; i >= ef; i--) yield [n.keys[i], rowAt(n, i)];
     return;
   }
   const [cf, cl] = childWindow(b, n);
   for (let i = cl; i >= cf; i--) {
-    yield* walkRevIter(resolveChild(n.children[i], src), b, src, recon);
+    yield* walkRevIter(resolveChild(n.children[i], src), b, src);
   }
 }
 

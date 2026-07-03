@@ -274,7 +274,7 @@ test("pmap: bounded scans and cursor agree", () => {
   const pm = new PMap();
   for (const k of shuffled(2000)) pm.insert(key(k), row(k), W, CAP, SHAPE, null);
   const b: KeyBound = { lo: key(500), loInc: true, hi: key(1500), hiInc: false };
-  const { keys, vals, nodes } = pm.rangeEntriesCounted(b, null, null);
+  const { keys, vals, nodes } = pm.rangeEntriesCounted(b, null);
   assert.equal(keys.length, 1000);
   assert.deepEqual(keys[0], key(500));
   assert.deepEqual(keys[999], key(1499));
@@ -282,7 +282,7 @@ test("pmap: bounded scans and cursor agree", () => {
 
   // Push walk agrees.
   const push: [Uint8Array, Row][] = [];
-  pm.scanRange(b, null, null, (k, r) => {
+  pm.scanRange(b, null, (k: Uint8Array, r: Row) => {
     push.push([k, r]);
     return true;
   });
@@ -293,16 +293,16 @@ test("pmap: bounded scans and cursor agree", () => {
 
   // Reverse push walk is the exact reverse.
   const rev: [Uint8Array, Row][] = [];
-  pm.scanRangeRev(b, null, null, (k, r) => {
+  pm.scanRangeRev(b, null, (k: Uint8Array, r: Row) => {
     rev.push([k, r]);
     return true;
   });
   assert.deepEqual(rev, [...push].reverse());
 
   // Pull cursor agrees, both directions.
-  const fwd = [...pm.scanRangeIter(b, null, null)];
+  const fwd = [...pm.scanRangeIter(b, null)];
   assert.deepEqual(fwd, push);
-  const bwd = [...pm.scanRangeRevIter(b, null, null)];
+  const bwd = [...pm.scanRangeRevIter(b, null)];
   assert.deepEqual(bwd, rev);
 
   // Exclusive lo / inclusive hi.
@@ -329,8 +329,8 @@ test("pmap: reverse scan is the forward scan reversed", () => {
       out.push(decode(k));
       return true;
     };
-    if (rev) pm.scanRangeRev(b, null, null, visit);
-    else pm.scanRange(b, null, null, visit);
+    if (rev) pm.scanRangeRev(b, null, visit);
+    else pm.scanRange(b, null, visit);
     return out;
   };
   const bounds: KeyBound[] = [
@@ -353,7 +353,7 @@ test("pmap: reverse scan is the forward scan reversed", () => {
   // The reverse short-circuit stops from the HIGH end: stopping after 3 visits yields the 3 largest
   // keys descending, faulting no further.
   const got: number[] = [];
-  pm.scanRangeRev(unboundedBound(), null, null, (k) => {
+  pm.scanRangeRev(unboundedBound(), null, (k: Uint8Array) => {
     got.push(decode(k));
     return got.length < 3;
   });
@@ -384,14 +384,14 @@ test("pmap: pull cursor (scanRangeIter) matches the push scan", () => {
       out.push([decode(k), val(r)]);
       return true;
     };
-    if (rev) pm.scanRangeRev(b, null, null, visit);
-    else pm.scanRange(b, null, null, visit);
+    if (rev) pm.scanRangeRev(b, null, visit);
+    else pm.scanRange(b, null, visit);
     return out;
   };
   // Drain the pull generator into the same shape.
   const pulled = (b: KeyBound, rev: boolean): Pair[] => {
     const out: Pair[] = [];
-    const it = rev ? pm.scanRangeRevIter(b, null, null) : pm.scanRangeIter(b, null, null);
+    const it = rev ? pm.scanRangeRevIter(b, null) : pm.scanRangeIter(b, null);
     for (const [k, r] of it) out.push([decode(k), val(r)]);
     return out;
   };
@@ -419,8 +419,8 @@ test("pmap: pull cursor (scanRangeIter) matches the push scan", () => {
   for (const rev of [false, true]) {
     const full = pushed(unboundedBound(), rev);
     const it = rev
-      ? pm.scanRangeRevIter(unboundedBound(), null, null)
-      : pm.scanRangeIter(unboundedBound(), null, null);
+      ? pm.scanRangeRevIter(unboundedBound(), null)
+      : pm.scanRangeIter(unboundedBound(), null);
     const out: Pair[] = [];
     for (const [k, r] of it) {
       out.push([decode(k), val(r)]);

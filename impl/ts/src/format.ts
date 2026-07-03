@@ -45,10 +45,12 @@ import {
   serializeGistTree,
 } from "./gist.ts";
 import { lz4Compress, lz4Decompress } from "./lz4.ts";
+import { MemoryBlockStore } from "./memoryblockstore.ts";
+import { Pager } from "./pager.ts";
 import { decodedRows, onDiskRef, residentRef } from "./pmap.ts";
 import { rangeForElement } from "./range.ts";
 import type { Child, LeafShape, PackedLeaf, PNode } from "./pmap.ts";
-import type { SharedPaging } from "./paging.ts";
+import { SharedPaging } from "./paging.ts";
 import { TableStore, type Row } from "./storage.ts";
 import {
   type DecimalTypmod,
@@ -72,9 +74,11 @@ import {
   widthBytes,
 } from "./types.ts";
 import {
+  type TypeRef,
   type Unfetched,
   type Value,
   boolValue,
+  isSentinelTypeRef,
   byteaValue,
   emptyArray,
   compositeValue,
@@ -1767,14 +1771,12 @@ export function toImage(src: Engine | Snapshot, pageSize: number, txid: bigint):
   const body: BodyPage[] = [];
   const rootDataPage: number[] = new Array(keys.length).fill(0);
   const indexRoots: number[][] = keys.map(() => []);
-  // Index records are the key alone — no value columns, so they encode against an empty colTypes.
-  const indexColTypes: ColType[] = [];
   let nextIndex = ROOT_PAGE;
   for (let ti = 0; ti < keys.length; ti++) {
     const store = snap.stores.get(keys[ti]!)!;
     const root = store.treeRoot();
     if (root !== null) {
-      const r = serializeNode(root, store.columnTypes(), capacity, nextIndex, body);
+      const r = serializeNode(root, store, capacity, nextIndex, body);
       rootDataPage[ti] = r.index;
       nextIndex = r.next;
     }
@@ -1793,9 +1795,10 @@ export function toImage(src: Engine | Snapshot, pageSize: number, txid: bigint):
         ir = r.index;
         nextIndex = r.next;
       } else {
-        const iroot = snap.indexStore(idx.name.toLowerCase()).treeRoot();
+        const istore = snap.indexStore(idx.name.toLowerCase());
+        const iroot = istore.treeRoot();
         if (iroot !== null) {
-          const r = serializeNode(iroot, indexColTypes, capacity, nextIndex, body);
+          const r = serializeNode(iroot, istore, capacity, nextIndex, body);
           ir = r.index;
           nextIndex = r.next;
         }
@@ -1917,20 +1920,20 @@ function serializeGistIndex(
 // whose payload would exceed the page is an oversized record (over RECORD_MAX) → feature_not_supported.
 function serializeNode(
   n: PNode,
-  colTypes: ColType[],
+  store: TableStore,
   capacity: number,
   nextIndex: number,
   body: BodyPage[],
 ): { index: number; next: number } {
+  const colTypes = store.columnTypes();
   const childPages: number[] = [];
   for (const c of n.children) {
-    // Whole-image serialize renumbers pages from scratch and runs only on a fully-resident in-memory
-    // database (create's empty image, the golden generator) — a paged file commits incrementally via
-    // serializeDirty. An OnDisk child would carry a page id from a different layout, so it must not
-    // appear here.
-    if (c.node === null)
-      throw engineError("data_corrupted", "whole-image serialize hit an OnDisk leaf");
-    const r = serializeNode(c.node, colTypes, capacity, nextIndex, body);
+    // Whole-image serialize renumbers pages from scratch. Under B3 (bplus-reshape.md) every
+    // database — in-memory included — is demand-paged, so a clean leaf may be an OnDisk reference
+    // into the source store: fault it through the store's pool for the duration of its own
+    // serialization (whole-image serialize is not a hot path).
+    const child = c.node !== null ? c.node : store.faultLeaf(c.page);
+    const r = serializeNode(child, store, capacity, nextIndex, body);
     childPages.push(r.index);
     nextIndex = r.next;
   }
@@ -1949,11 +1952,14 @@ function serializeNode(
     pageType = PAGE_INTERIOR;
     payload = encodeInterior(n.keys, childPages);
   } else {
-    // A leaf may be Packed here: a demand-paged reopen faults a single-leaf table's root leaf resident
-    // (readSkeleton), and toImage re-serializes it. Materialize through the seam (decodedRows
-    // reconstructs a Packed leaf, clones a Decoded one). Whole-image serialize is not a hot path
-    // (create's empty image / golden generator / toImage canonical), so the clone is acceptable (§7).
-    payload = encodeLeafPax(colTypes, n.keys, decodedRows(n), capacity, take, ovf);
+    // A leaf may be Packed here: a demand-paged load keeps leaves as page blocks and toImage
+    // re-serializes them. Materialize through the seam (decodedRows reconstructs a Packed leaf,
+    // clones a Decoded one), then resolve any lazily-deferred large values through the store's
+    // pager (large-values.md §14) so encode sees resident bytes. Whole-image serialize is not a
+    // hot path (create's empty image / golden generator / toImage canonical), so the clones are
+    // acceptable (packed-leaf.md §7).
+    const rows = decodedRows(n).map((row) => store.resolveAll(row));
+    payload = encodeLeafPax(colTypes, n.keys, rows, capacity, take, ovf);
   }
   if (payload.length > capacity) {
     throw engineError(
@@ -2208,6 +2214,12 @@ function serializeDirty(
 
 // loadEngine reconstructs a database from an on-disk image (inverse of toImage).
 // Throws a structured data_corrupted (XX001) error for malformed input.
+//
+// B3 (bplus-reshape.md): the image becomes the engine's byte store — a MemoryBlockStore read
+// through the SAME demand-paged loader, pager, and Packed leaf path as a file (one read path; the
+// eager whole-image readTree loader is gone). The pool is PINNED (unbounded): an in-memory database
+// is resident by definition (§5), so cacheBytes bounds only file-backed eviction and the observable
+// default is unchanged.
 export function loadEngine(image: Uint8Array): Engine {
   if (image.length < 12) {
     throw engineError("data_corrupted", "image smaller than a meta header");
@@ -2217,107 +2229,8 @@ export function loadEngine(image: Uint8Array): Engine {
   if (!pageSizeValid(pageSize) || image.length < pageSize * 2) {
     throw engineError("data_corrupted", "invalid page size");
   }
-  const mt = selectMeta(image, dv, pageSize);
-
-  // Build the committed snapshot from the image, then wrap it in a fresh handle that adopts the
-  // file's serialization parameters (spec/design/api.md §2).
-  const snap = new Snapshot(mt.txid);
-  // Reconstruct the free-list (P6.2): collect every page reachable from the committed root — the
-  // catalog chain plus each table's B-tree nodes — as we load it; the rest of [2, pageCount) is dead
-  // space the next incremental commit may reuse (spec/fileformat/format.md *Reclamation*).
-  const reached = new Set<number>();
-  let catPage = mt.rootPage;
-  while (catPage !== 0) {
-    reached.add(catPage);
-    const pg = readPage(image, dv, pageSize, catPage);
-    if (pg.pageType !== PAGE_CATALOG) {
-      throw engineError("data_corrupted", "expected a catalog page");
-    }
-    const cur = { pos: 0 };
-    for (let i = 0; i < pg.itemCount; i++) {
-      // Each catalog entry is kind-tagged (v9/v12): 1 = a composite-type entry (registered now; its
-      // nested refs are validated after the full walk), 2 = a sequence entry (v12; self-contained,
-      // registered directly — no two-pass), 0 = a table entry.
-      const kind = readU8(pg.payload, cur);
-      if (kind === 1) {
-        snap.putType(decodeCompositeTypeEntry(pg.payload, cur));
-        continue;
-      }
-      if (kind === 2) {
-        snap.putSequence(decodeSequenceEntry(pg.payload, cur));
-        continue;
-      }
-      if (kind === 3) {
-        // A collation snapshot (v17): the baked .coll artifact + an is_default flag
-        // (spec/design/collation.md §5); the default restores the per-database default.
-        const { coll, isDefault } = decodeCollationEntry(pg.payload, cur);
-        if (isDefault) snap.defaultCollation = coll.name;
-        snap.collations.set(coll.name, coll);
-        continue;
-      }
-      if (kind !== 0) throw engineError("data_corrupted", "unknown catalog entry kind");
-      const { table, root, indexRoots } = decodeTableEntry(pg.payload, cur);
-      const hasPK = pkIndices(table).length > 0;
-      snap.putTable(table, pageSize);
-      // The store resolved each column's ColType from the (types-first) catalog at putTable; the
-      // codec reads it back rather than re-walking the type catalog (spec/design/composite.md §3).
-      const store = snap.stores.get(table.name.toLowerCase())!;
-      const colTypes = store.columnTypes();
-      if (root !== 0) {
-        const t = readTree(image, dv, pageSize, root, colTypes, reached);
-        store.setTree(t.node, t.length);
-        // No-PK keys are synthetic i64 rowids — advance the counter past the largest (the last
-        // entry in key order) so future inserts don't collide.
-        if (!hasPK && t.length > 0) {
-          const entries = store.entriesInKeyOrder();
-          store.bumpRowidTo(decodeInt("i64", entries[entries.length - 1]!.key) + 1n);
-        }
-      }
-      // The table's index trees (v5): zero-column stores of entry keys
-      // (spec/design/indexes.md §3), reachable pages included in the walk.
-      for (let k = 0; k < table.indexes.length; k++) {
-        const istore = new TableStore(pageSize - PAGE_HEADER, []);
-        if (indexRoots[k]! !== 0) {
-          if (table.indexes[k]!.kind === "gist") {
-            // GiST: parse the persisted R-tree (pages 5/6), marking its pages reached, and recover its
-            // leaf keys to repopulate the flat leaf store. The resident R-tree is rebuilt canonically
-            // below (rebuildGistTrees).
-            const out: Uint8Array[] = [];
-            readGistLeafKeys(
-              (p) => {
-                const pg2 = readPage(image, dv, pageSize, p);
-                return { pageType: pg2.pageType, itemCount: pg2.itemCount, payload: pg2.payload };
-              },
-              indexRoots[k]!,
-              reached,
-              out,
-            );
-            for (const key of out) istore.insert(key, []);
-          } else {
-            const t = readTree(image, dv, pageSize, indexRoots[k]!, [], reached);
-            istore.setTree(t.node, t.length);
-          }
-        }
-        snap.putIndexStore(table.indexes[k]!.name.toLowerCase(), istore);
-      }
-    }
-    catPage = pg.nextPage;
-  }
-  // Two-pass: validate the composite-type catalog (existence + acyclicity) now that every type
-  // entry has been read (spec/design/composite.md §3); a bad reference is XX001.
-  snap.validateCompositeTypes();
-  // Build each GiST index's resident R-tree from its now-loaded leaf store (gist.md §4.1).
-  snap.rebuildGistTrees();
-  const db = new Engine();
-  db.pageSize = pageSize;
-  db.pageCount = mt.pageCount; // the on-disk high-water for the next incremental commit
-  // The free-list: every body page [2, pageCount) the committed root does not reach (P6.2). Ascending
-  // by construction, so the allocator reuses lowest-first.
-  for (let p = ROOT_PAGE; p < mt.pageCount; p++) {
-    if (!reached.has(p)) db.freePages.push(p);
-  }
-  db.committed = snap;
-  return db;
+  const pager = Pager.fromStore(new MemoryBlockStore(image));
+  return loadEnginePaged(new SharedPaging(pager, Number.MAX_SAFE_INTEGER));
 }
 
 // anySpillable reports whether any column type can spill out-of-line (large-values.md §12).
@@ -2352,9 +2265,12 @@ function collectLeafOverflow(
     const dirs = parsePaxLeaf(pg.payload, n, colTypes);
     for (let c = 0; c < colTypes.length; c++) {
       if (fixedValueWidth(colTypes[c]!) !== null) continue;
+      const tyref: TypeRef = { cols: colTypes, idx: c };
       for (let i = 0; i < n; i++) {
         if (paxIsNull(pg.payload, dirs, c, i)) continue;
-        const v = readValueLazy(colTypes[c]!, pg.payload, { pos: paxValueOff(dirs, c, i) });
+        // The value is discarded right after markChains (only its chain pages matter), so the
+        // resolution handle is deliberately dead (null paging).
+        const v = readValueLazy(tyref, pg.payload, { pos: paxValueOff(dirs, c, i) }, null);
         markChains([v], fetch, reached);
       }
     }
@@ -2568,76 +2484,6 @@ function readSeparators(payload: Uint8Array, cur: Cursor, n: number): Uint8Array
   return keys;
 }
 
-// readTree reads a table's on-disk B+tree (rooted at pageIdx) into an in-memory tree, returning the
-// root node and the total row count (spec/fileformat/format.md). A leaf's records decode eagerly
-// (external chains gathered — the fully-resident in-memory load); an interior node is the v24
-// record-free separator skeleton. Weights come off the directories (the v24 recordSize — key_len +
-// Σ value_size), exactly what the writer split on, so the loaded tree is ready for further
-// size-driven splits.
-function readTree(
-  image: Uint8Array,
-  dv: DataView,
-  ps: number,
-  pageIdx: number,
-  colTypes: ColType[],
-  reached: Set<number>,
-): { node: PNode; length: number } {
-  reached.add(pageIdx);
-  const pg = readPage(image, dv, ps, pageIdx);
-  const fetch = (p: number): Uint8Array => pageBlock(image, ps, p);
-  if (pg.pageType === PAGE_LEAF) {
-    const n = pg.itemCount;
-    const k = colTypes.length;
-    const dirs = parsePaxLeaf(pg.payload, n, colTypes);
-    const keys: Uint8Array[] = [];
-    const vals: Row[] = [];
-    const weights: number[] = [];
-    for (let i = 0; i < n; i++) {
-      const key = paxKey(pg.payload, dirs, i).slice();
-      const row: Row = new Array(k);
-      const ovf: number[] = [];
-      let w = key.length;
-      for (let c = 0; c < k; c++) {
-        w += paxValueLen(dirs, c, i);
-        if (paxIsNull(pg.payload, dirs, c, i)) {
-          row[c] = nullValue();
-          continue;
-        }
-        const cur = { pos: paxValueOff(dirs, c, i) };
-        // A fixed-width slot is the untagged inline body; a variable value's span is its tagged
-        // codec bytes (external chains gathered eagerly here — the fully-resident in-memory load).
-        row[c] =
-          fixedValueWidth(colTypes[c]!) !== null
-            ? readInlineBody(colTypes[c]!, pg.payload, cur, "construct")
-            : readValue(colTypes[c]!, pg.payload, cur, fetch, ovf);
-      }
-      weights.push(w);
-      for (const p of ovf) reached.add(p);
-      keys.push(key);
-      vals.push(row);
-    }
-    return { node: { keys, vals, weights, children: [], page: pageIdx }, length: n };
-  }
-  if (pg.pageType === PAGE_INTERIOR) {
-    const n = pg.itemCount;
-    const cur = { pos: 0 };
-    const children: Child[] = [];
-    let total = 0;
-    for (let i = 0; i < n + 1; i++) {
-      const cp = readU32(pg.payload, cur);
-      const r = readTree(image, dv, ps, cp, colTypes, reached);
-      // The in-memory load is fully resident (no pager to fault from); the demand-paged file load
-      // (loadEnginePaged) is a separate path that leaves leaf children OnDisk.
-      children.push(residentRef(r.node));
-      total += r.length;
-    }
-    // v24: the record-free routing skeleton — separators carry no values or chains.
-    const keys = readSeparators(pg.payload, cur, n);
-    return { node: { keys, vals: [], weights: [], children, page: pageIdx }, length: total };
-  }
-  throw engineError("data_corrupted", "expected a B-tree node page");
-}
-
 // metaPage is one meta slot's full pageSize bytes (the 36-byte header + its CRC, zero-padded): its
 // only content. toImage copies it into both slots; an incremental commit pwrites it to the alternate
 // slot (file.ts). Single-sources the meta byte layout (spec/fileformat/format.md). Reserved bytes are
@@ -2715,41 +2561,9 @@ function writePage(
 // next free page an incremental commit appends at (P6.1 part B).
 type Meta = { txid: bigint; rootPage: number; pageCount: number };
 
-// readMeta validates one meta slot; null if it is not a valid meta.
-function readMeta(image: Uint8Array, dv: DataView, ps: number, slot: number): Meta | null {
-  const off = slot * ps;
-  if (off + ps > image.length) return null;
-  if (
-    !(
-      image[off] === 0x4a &&
-      image[off + 1] === 0x45 &&
-      image[off + 2] === 0x44 &&
-      image[off + 3] === 0x42
-    )
-  ) {
-    return null;
-  }
-  if (dv.getUint16(off + 4, false) !== FORMAT_VERSION) return null;
-  if (
-    image[off + 6] !== 0 ||
-    image[off + 7] !== 0 ||
-    image[off + 28] !== 0 ||
-    image[off + 29] !== 0 ||
-    image[off + 30] !== 0 ||
-    image[off + 31] !== 0
-  ) {
-    return null;
-  }
-  if (crc32Ieee(image.subarray(off, off + 32)) !== dv.getUint32(off + 32, false)) return null;
-  return {
-    txid: dv.getBigUint64(off + 12, false),
-    rootPage: dv.getUint32(off + 20, false),
-    pageCount: dv.getUint32(off + 24, false),
-  };
-}
-
 // parseMeta validates a standalone meta block; null if it is not a valid meta. Shared by the
-// demand-paged loader (which reads meta slots 0/1 as individual blocks).
+// demand-paged loader (which reads meta slots 0/1 as individual blocks — since B3 the ONLY loader;
+// the whole-image readMeta/selectMeta/readPage/pageBlock readers went with the eager readTree path).
 function parseMeta(block: Uint8Array): Meta | null {
   if (block.length < 36) return null;
   const dv = new DataView(block.buffer, block.byteOffset, block.byteLength);
@@ -2774,48 +2588,11 @@ function parseMeta(block: Uint8Array): Meta | null {
   };
 }
 
-// selectMeta picks the valid slot with the highest txid (tie → slot 0); the lone valid
-// slot on a torn write; error if neither is valid (format.md).
-function selectMeta(image: Uint8Array, dv: DataView, ps: number): Meta {
-  const a = readMeta(image, dv, ps, 0);
-  const b = readMeta(image, dv, ps, 1);
-  if (a && b) return b.txid > a.txid ? b : a;
-  if (a) return a;
-  if (b) return b;
-  throw engineError("data_corrupted", "no valid meta page");
-}
-
 // Page is a parsed page: header fields + a borrowed payload slice.
 type Page = { pageType: number; itemCount: number; nextPage: number; payload: Uint8Array };
 
-function readPage(image: Uint8Array, dv: DataView, ps: number, index: number): Page {
-  const off = index * ps;
-  if (off + ps > image.length) {
-    throw engineError("data_corrupted", "page index out of range");
-  }
-  // Verify the per-page checksum (v7) before trusting any header field (format.md *Page header*).
-  if (pageCrc(image.subarray(off, off + ps)) !== dv.getUint32(off + 12, false)) {
-    throw engineError("data_corrupted", "page checksum mismatch (corrupted page)");
-  }
-  return {
-    pageType: image[off]!,
-    itemCount: dv.getUint32(off + 4, false),
-    nextPage: dv.getUint32(off + 8, false),
-    payload: image.subarray(off + PAGE_HEADER, off + ps),
-  };
-}
-
-// pageBlock returns one page's full block, copied out of a whole image — the overflow-chain fetch for
-// the in-memory load path (readTree, large-values.md §12).
-function pageBlock(image: Uint8Array, ps: number, index: number): Uint8Array {
-  const off = index * ps;
-  if (off + ps > image.length) throw engineError("data_corrupted", "page index out of range");
-  return image.slice(off, off + ps);
-}
-
 // parsePage parses one standalone page block (header + payload). The single-block reader the
-// demand-paged loader and fault path use (a page read through the pager is exactly one block);
-// readPage slices it out of a whole image.
+// demand-paged loader and fault path use (a page read through the pager is exactly one block).
 function parsePage(block: Uint8Array): Page {
   if (block.length < PAGE_HEADER)
     throw engineError("data_corrupted", "page shorter than its header");
@@ -2948,7 +2725,12 @@ function paxValueLen(d: PaxDirs, c: number, i: number): number {
   return r.ends[i]! - (i === 0 ? 0 : r.ends[i - 1]!);
 }
 
-export function decodeLeafNode(block: Uint8Array, page: number, colTypes: ColType[]): PNode {
+export function decodeLeafNode(
+  block: Uint8Array,
+  page: number,
+  colTypes: ColType[],
+  paging: SharedPaging | null,
+): PNode {
   const pg = parsePage(block);
   if (pg.pageType !== PAGE_LEAF)
     throw engineError("data_corrupted", "demand-paged a non-leaf page");
@@ -2977,14 +2759,18 @@ export function decodeLeafNode(block: Uint8Array, page: number, colTypes: ColTyp
   // eagerly (deferring a fixed-width scalar buys nothing, lazy-record.md §6); a variable value's
   // span is its tagged codec bytes — the lazy tag path (readValueLazy is the SAME codec the eager
   // fault ran; a spillable body becomes an inline-deferred Unfetched block view), byte-identical to
-  // the eager value, moved to touch-time (§8).
+  // the eager value, moved to touch-time (§8). Each deferred value is stamped with its resolution
+  // handles (a per-column TypeRef over the shared colTypes + this database's paging context), so a
+  // value the static touched set missed self-resolves at the evaluator's column access — the B4
+  // demand-fault backstop (bplus-reshape.md §5).
+  const tyrefs: TypeRef[] = colTypes.map((_, c) => ({ cols: colTypes, idx: c }));
   const col = (i: number, c: number): Value => {
     if (paxIsNull(payload, dirs, c, i)) return nullValue();
     const ty = colTypes[c]!;
     const cur = { pos: paxValueOff(dirs, c, i) };
     return fixedValueWidth(ty) !== null
       ? readInlineBody(ty, payload, cur, "construct")
-      : readValueLazy(ty, payload, cur);
+      : readValueLazy(tyrefs[c]!, payload, cur, paging);
   };
   const packed: PackedLeaf = {
     n,
@@ -2992,11 +2778,6 @@ export function decodeLeafNode(block: Uint8Array, page: number, colTypes: ColTyp
     row(i: number): Row {
       const row: Row = new Array(k);
       for (let c = 0; c < k; c++) row[c] = col(i, c);
-      return row;
-    },
-    rowMasked(i: number, mask: boolean[]): Row {
-      const row: Row = new Array(k);
-      for (let c = 0; c < k; c++) row[c] = mask[c] ? col(i, c) : nullValue();
       return row;
     },
   };
@@ -3295,8 +3076,17 @@ function decodeTableEntry(
 // decode as today, but an external/compressed form becomes an unfetched reference holding exactly
 // the record's pointer fields — no chain read, no decompression. The scan layer resolves the
 // references for the columns a query touches (resolveUnfetched); the commit path resolves the
-// rest when a dirty leaf re-encodes (resolveForEncode).
-function readValueLazy(ty: ColType, buf: Uint8Array, cur: Cursor): Value {
+// rest when a dirty leaf re-encodes (resolveForEncode); a value the static touched set missed
+// self-resolves from the tyref + paging handles stamped here (resolveUnfetchedSelf — the B4
+// demand-fault backstop, bplus-reshape.md §5). paging may be null for a DEAD handle (the open-time
+// reachability walk discards the value right after chain-marking).
+function readValueLazy(
+  tyref: TypeRef,
+  buf: Uint8Array,
+  cur: Cursor,
+  paging: SharedPaging | null,
+): Value {
+  const ty = tyref.cols[tyref.idx]!;
   const tag = readU8(buf, cur);
   // A present inline value (lazy-record.md §12, L3): a variable-length / structured body (the
   // isSpillable set — §6) is DEFERRED as an unfetched (form 0x00) referencing the shared page block —
@@ -3313,7 +3103,15 @@ function readValueLazy(ty: ColType, buf: Uint8Array, cur: Cursor): Value {
       const body = inlineBodySpan(ty, buf, cur);
       return {
         kind: "unfetched",
-        ref: { form: 0x00, firstPage: 0, storedLen: 0, rawLen: 0, comp: body },
+        ref: {
+          form: 0x00,
+          firstPage: 0,
+          storedLen: 0,
+          rawLen: 0,
+          comp: body,
+          ty: tyref,
+          paging: null,
+        },
       };
     }
     return readInlineBody(ty, buf, cur, "construct");
@@ -3324,7 +3122,15 @@ function readValueLazy(ty: ColType, buf: Uint8Array, cur: Cursor): Value {
     const len = readU32(buf, cur);
     return {
       kind: "unfetched",
-      ref: { form: TAG_EXTERNAL, firstPage: first, storedLen: len, rawLen: 0, comp: undefined },
+      ref: {
+        form: TAG_EXTERNAL,
+        firstPage: first,
+        storedLen: len,
+        rawLen: 0,
+        comp: undefined,
+        ty: tyref,
+        paging,
+      },
     };
   }
   if (tag === TAG_INLINE_COMP) {
@@ -3333,7 +3139,15 @@ function readValueLazy(ty: ColType, buf: Uint8Array, cur: Cursor): Value {
     const comp = take(buf, cur, compLen).slice(); // copy out of the borrowed page slice
     return {
       kind: "unfetched",
-      ref: { form: TAG_INLINE_COMP, firstPage: 0, storedLen: 0, rawLen, comp },
+      ref: {
+        form: TAG_INLINE_COMP,
+        firstPage: 0,
+        storedLen: 0,
+        rawLen,
+        comp,
+        ty: tyref,
+        paging: null,
+      },
     };
   }
   if (tag === TAG_EXTERNAL_COMP) {
@@ -3348,6 +3162,8 @@ function readValueLazy(ty: ColType, buf: Uint8Array, cur: Cursor): Value {
         storedLen: stored,
         rawLen,
         comp: undefined,
+        ty: tyref,
+        paging,
       },
     };
   }
@@ -3380,6 +3196,35 @@ export function resolveUnfetched(
     return valueFromPayload(ty, lz4Decompress(comp, ref.rawLen));
   }
   throw engineError("data_corrupted", "invalid unfetched value form");
+}
+
+// resolveUnfetchedSelf resolves a deferred value FROM ITS OWN CARRIED HANDLES — the B4 demand-fault
+// backstop (spec/design/bplus-reshape.md §5/§6): the evaluator's column access calls this when the
+// static touched set missed a value, so a prediction miss is a deterministic on-demand fetch —
+// never a NULL-fold, never wrong rows. The fetch is deliberately UNMETERED (metering it would make
+// cost depend on prediction quality rather than the spec'd static set — §6); the touched set stays
+// the cost basis + prefetch hint. A spill-run-file reload carries sentinel handles (spill.ts — it
+// rides the sort output unread by contract), so touching one stays the loud pre-B4 poison.
+export function resolveUnfetchedSelf(ref: Unfetched): Value {
+  if (isSentinelTypeRef(ref.ty)) {
+    throw new Error("BUG: unfetched large value escaped the storage layer (spill pass-through)");
+  }
+  const ty = ref.ty.cols[ref.ty.idx]!;
+  if (ref.form === 0x00 || ref.form === TAG_INLINE_COMP) {
+    // Inline forms own their bytes — no pager involved.
+    const fetch = (): Uint8Array => {
+      throw new Error("an inline deferred value reads no overflow pages");
+    };
+    return resolveUnfetched(ty, ref, fetch);
+  }
+  // A deferred external value is reachable only through a snapshot whose stores hold the paging
+  // context, so a dead handle here is an internal wiring bug (the reachability walk's values never
+  // escape chain-marking).
+  const paging = ref.paging;
+  if (paging === null) {
+    throw new Error("a deferred external value carries no paging handle");
+  }
+  return resolveUnfetched(ty, ref, (p) => paging.readBlock(p));
 }
 
 // chainPages returns the page indices of the overflow chain carrying `length` payload bytes from

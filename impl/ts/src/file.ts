@@ -134,13 +134,13 @@ export function open(path: string, opts: OpenOptions = {}): Engine {
 // returns the host Database handle with its default session. 58P02 if the path already exists; the
 // page size is locked into the file. The Database back-compat bridge over the file-backed core.
 export function createDatabase(path: string, opts: DatabaseOptions = {}): Database {
-  return Database.fromFileEngine(create(path, opts));
+  return Database.fromEngine(create(path, opts));
 }
 
 // openDatabase opens an existing file-backed database at path with optional open settings and returns
 // the host Database handle with its default session (the back-compat bridge, spec/design/session.md §2.4).
 export function openDatabase(path: string, opts: OpenOptions = {}): Database {
-  return Database.fromFileEngine(open(path, opts));
+  return Database.fromEngine(open(path, opts));
 }
 
 // residentLeaves is the number of leaf pages currently resident in the buffer pool — 0 for an

@@ -36,8 +36,7 @@ export class MemoryBlockStore implements BlockStore {
   }
 
   setSize(bytes: number): void {
-    if (bytes < 0)
-      throw new Error("I/O error: negative memory block store size");
+    if (bytes < 0) throw new Error("I/O error: negative memory block store size");
     this.resize(bytes);
   }
 
@@ -46,8 +45,7 @@ export class MemoryBlockStore implements BlockStore {
   }
 
   private checkOffset(offset: number): void {
-    if (offset < 0)
-      throw new Error("I/O error: negative memory block store offset");
+    if (offset < 0) throw new Error("I/O error: negative memory block store offset");
   }
 
   private resize(size: number): void {

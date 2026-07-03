@@ -53,9 +53,11 @@ export class SharedPaging {
     // block holds only the pointer — spec/design/large-values.md §12).
     // Lazy decode (spec/design/large-values.md §14): an external/compressed value stays an
     // unfetched reference — no chain read, no decompression. The scan layer resolves the
-    // columns a query touches through readBlock below.
+    // columns a query touches through readBlock below; `this` is stamped into each deferred
+    // external value so a touched-set miss self-resolves (the B4 demand-fault backstop,
+    // format.ts resolveUnfetchedSelf).
     return this.pool.getOrLoad(page, () =>
-      decodeLeafNode(this.pager.readBlock(page), page, colTypes),
+      decodeLeafNode(this.pager.readBlock(page), page, colTypes, this),
     );
   }
 

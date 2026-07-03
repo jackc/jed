@@ -110,36 +110,40 @@ class SharedCore {
   live = new Map<bigint, number>();
   // writerActive is true while a write transaction is open (at most one — CLAUDE.md §3).
   writerActive = false;
-  // storage is the file-backed Engine that owns the storage identity (the pager + buffer pool + the
-  // mutable page accounting: paging/pageSize/pageCount/freePages); null is in-memory (persist is then
-  // a no-op). Only those fields are used — its committed snapshot is unused; readers/writers carry the
-  // published snapshot, whose stores already reference the same paging.
-  storage: Engine | null = null;
+  // storage is the Engine that owns the storage identity (the pager + buffer pool + the mutable page
+  // accounting: paging/pageSize/pageCount/freePages) — since B3 (bplus-reshape.md) EVERY core has
+  // one: a file-backed core over a FileBlockStore, an in-memory core over a MemoryBlockStore (with a
+  // pinned, unbounded pool — an in-memory database is resident by definition). So the commit path is
+  // one path: persist packs dirty pages into the byte store either way, and the store's sync is what
+  // durability means for that host (a no-op in memory). Only those fields are used — its committed
+  // snapshot is unused; readers/writers carry the published snapshot, whose stores already reference
+  // the same paging.
+  storage: Engine;
   // readOnly marks a read-only file-backed core (api.md §2.1): every session is then read-only, a
-  // write is 25006.
+  // write is 25006. Always false for an in-memory core.
   readOnly = false;
-  // memPageSize is the serialization page size for an in-memory core (no storage); DEFAULT_PAGE_SIZE
-  // unless inMemoryWithPageSize set it, so a byte-fixture / non-default-page-size test builds the tree
-  // at the size it will serialize to (CLAUDE.md §8). Ignored once storage is set (the file wins).
-  memPageSize = DEFAULT_PAGE_SIZE;
 
-  constructor(snap: Snapshot) {
+  constructor(snap: Snapshot, storage: Engine) {
     this.committed = snap;
     this.sharedTempCommitted = new Snapshot();
+    this.storage = storage;
   }
 
-  // pageSize is the file's page size for a file-backed core, else the in-memory serialization size.
-  // Minted sessions adopt it so their stores' cap matches the physical pages (CLAUDE.md §8).
+  // pageSize is the byte store's page size (fixed into the file/image at creation). Minted sessions
+  // adopt it so their stores' cap matches the physical pages persist writes (CLAUDE.md §8).
   get pageSize(): number {
-    return this.storage?.pageSize ?? this.memPageSize;
+    return this.storage.pageSize;
   }
 
   // persist durably publishes snap to the backing store via an incremental copy-on-write commit
-  // (persistImpl — the host-independent recipe, transactions.md §9). In-memory (no storage) is a no-op
-  // success. Called from Session.publish; pageCount/freePages on the storage engine advance only after
-  // both syncs succeed, so a write failure leaves the file's prior meta untouched.
+  // (persistImpl — the host-independent recipe, transactions.md §9) — the publish chokepoint for
+  // every host (bplus-reshape.md B3): a file-backed core pwrites + fdatasyncs; an in-memory core
+  // packs the same dirty pages into its MemoryBlockStore, whose sync is a no-op — the file commit
+  // minus durability, one code path. Called from Session.publish; pageCount/freePages on the storage
+  // engine advance only after both syncs succeed, so a write failure leaves the file's prior meta
+  // untouched.
   persist(snap: Snapshot): void {
-    if (this.storage !== null) persistImpl(this.storage, snap);
+    persistImpl(this.storage, snap);
   }
 
   register(version: bigint): void {
@@ -182,7 +186,7 @@ export class Database {
 
   // newInMemory builds a fresh, empty in-memory database plus its default session (committed version 0).
   static newInMemory(): Database {
-    return Database.over(new SharedCore(new Snapshot(0n)));
+    return Database.inMemoryWithPageSize(DEFAULT_PAGE_SIZE);
   }
 
   // inMemoryWithPageSize builds a fresh in-memory database whose stores serialize/split at pageSize.
@@ -190,19 +194,26 @@ export class Database {
   // tree must be built at the size it will serialize to — this builds byte-level fixtures / tests a
   // non-default page size; a normal in-memory database uses newInMemory (the default page size).
   static inMemoryWithPageSize(pageSize: number): Database {
-    const core = new SharedCore(new Snapshot(0n));
-    core.memPageSize = pageSize;
-    return Database.over(core);
+    // B3 (bplus-reshape.md): an in-memory database is a MemoryBlockStore seeded with the empty
+    // from-scratch image, read/written through the same pager + Packed path as a file (loadEngine is
+    // the paged open over a memory store). txid 0 is the pre-first-commit version (the same
+    // committed version an in-memory core always started at); the first commit publishes txid 1
+    // into the alternate meta slot.
+    const image = toImageBytes(new Snapshot(0n), pageSize, 0n);
+    return Database.fromEngine(loadEngine(image));
   }
 
-  // fromFileEngine lifts a freshly opened/created file-backed Engine (file.ts) into a host handle: its
-  // committed snapshot becomes the published roots and it becomes the storage owner (paging + page
-  // accounting). Called by file.ts's createDatabase/openDatabase wrappers (file.ts is the node host
-  // module; shared.ts stays browser-clean by not importing it).
-  static fromFileEngine(engine: Engine): Database {
-    const core = new SharedCore(engine.committed);
+  // fromEngine lifts a freshly opened/created/loaded Engine (file.ts / loadEngine) into a host
+  // handle: its committed snapshot becomes the published roots and it becomes the storage owner
+  // (paging + page accounting). Since B3 every engine carries a paging context — a file's
+  // FileBlockStore or an in-memory MemoryBlockStore — so this is the one constructor for both hosts.
+  // Called by file.ts's createDatabase/openDatabase wrappers (file.ts is the node host module;
+  // shared.ts stays browser-clean by not importing it). The committed snapshot's stores already
+  // carry the shared paging, so every pinned/cloned snapshot faults clean pages through the one pool
+  // (spec/design/pager.md).
+  static fromEngine(engine: Engine): Database {
+    const core = new SharedCore(engine.committed, engine);
     core.sharedTempCommitted = engine.sharedTempCommitted;
-    core.storage = engine;
     core.readOnly = engine.readOnly;
     return Database.over(core);
   }
@@ -373,11 +384,11 @@ export class Database {
       s.close();
     }
   }
-  // close closes the backing file (file-backed only). The bare convenience methods autocommit, so
-  // there is never uncommitted work to discard. Idempotent.
+  // close closes the backing byte store (an in-memory store's close is a no-op). The bare
+  // convenience methods autocommit, so there is never uncommitted work to discard. Idempotent.
   close(): void {
     const st = this.core.storage;
-    if (st !== null && st.paging !== null) {
+    if (st.paging !== null) {
       st.paging.close();
       st.paging = null;
     }
@@ -385,12 +396,11 @@ export class Database {
 
   // fromImage lifts a from-scratch on-disk image (spec/fileformat/format.md) into an in-memory host
   // handle — the inverse of toImage, used by the byte-level golden round-trip tests and by a host
-  // rehydrating an in-memory database from bytes. (No backing file; commit is a no-op.)
+  // rehydrating an in-memory database from bytes. Since B3 the image becomes the core's
+  // MemoryBlockStore, demand-paged like a file (one read path); there is no backing file (path stays
+  // null) and a commit packs pages into the memory store.
   static fromImage(image: Uint8Array): Database {
-    const e = loadEngine(image);
-    const core = new SharedCore(e.committed);
-    core.sharedTempCommitted = e.sharedTempCommitted;
-    return Database.over(core);
+    return Database.fromEngine(loadEngine(image));
   }
 
   // --- Catalog / storage introspection (spec/design/api.md §6): reads the latest committed snapshot.
@@ -431,13 +441,14 @@ export class Database {
   get pageSize(): number {
     return this.core.pageSize;
   }
-  // pageCount is the on-disk page high-water for a file-backed database; 0 in-memory.
+  // pageCount is the byte store's page high-water (since B3 an in-memory database has a real one —
+  // its MemoryBlockStore's committed page count).
   get pageCount(): number {
-    return this.core.storage?.pageCount ?? 0;
+    return this.core.storage.pageCount;
   }
   // path is the backing file path for a file-backed database; null in-memory.
   get path(): string | null {
-    return this.core.storage?.path ?? null;
+    return this.core.storage.path;
   }
   // readOnly reports whether this database was opened read-only. In-memory databases are writable.
   get readOnly(): boolean {
@@ -712,7 +723,13 @@ export class Session {
   private publish(): void {
     const snap = this.engine.committed;
     snap.txid = this.baseVersion + 1n; // advance the shared version on every commit
-    this.core.persist(snap); // durable before publish; throws (publishing nothing) on I/O failure
+    this.core.persist(snap); // durable before publish (packs into the byte store, any host)
+    // The post-commit residency flip (bplus-reshape.md B4): the persist above assigned page ids to
+    // every dirty node it wrote, so the committed tree can shed its leaf payloads — clean leaves
+    // demote to OnDisk references faulted back through the pool on next touch. The session's own
+    // committed base IS this snapshot (one object, single-threaded), so a long-lived writer sheds
+    // residency too (read-your-writes for the NEXT statement re-faults — one read path).
+    snap.demoteCleanLeaves();
     this.engine.committed = snap;
     this.core.committed = snap;
     this.core.sharedTempCommitted = this.engine.sharedTempCommitted;

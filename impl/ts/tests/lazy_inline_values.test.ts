@@ -24,8 +24,9 @@ import {
   makePage,
   type OverflowPageOut,
   resolveUnfetched,
+  resolveUnfetchedSelf,
 } from "../src/format.ts";
-import { colAt, rowAt, rowAtMasked } from "../src/pmap.ts";
+import { colAt, rowAt } from "../src/pmap.ts";
 import { Database, createDatabase, openDatabase } from "../src/tooling.ts";
 import {
   arrayValue,
@@ -333,7 +334,7 @@ test("a faulted leaf shares one page block across its deferred values", () => {
   // Fault the leaf → Packed form (packed-leaf.md §5): the block + PAX directories are retained and NO
   // value is decoded (the decoded row vector is empty); rows reconstruct on demand, producing the same
   // inline-deferred unfetched (form (a)) block views the eager fault used to.
-  const node = decodeLeafNode(block, 2, colTypes);
+  const node = decodeLeafNode(block, 2, colTypes, null);
   assert.ok(node.packed !== undefined, "a faulted leaf is Packed (packed-leaf.md §5)");
   assert.equal(
     node.vals.length,
@@ -376,10 +377,12 @@ test("a faulted leaf shares one page block across its deferred values", () => {
   assert.equal(deferred, 12, "every deferrable present value defers (form (a))");
 });
 
-// The touched-column path (packed-leaf.md §4/§6, the PAX dividend): colAt / rowAtMasked reconstruct
-// ONLY the requested columns of a Packed leaf, byte-identically to the whole-row reconstruction,
-// leaving untouched columns unread. Mirrors the Rust packed_leaf_reconstructs_only_touched_columns
-// and the Go equivalent. (colAt/rowAtMasked are S3-ready — built here, not yet driven by the executor.)
+// The touched-column path (packed-leaf.md §4/§6, the PAX dividend): colAt reconstructs ONLY the
+// requested column of a Packed leaf, byte-identically to the whole-row reconstruction. Since B4
+// (bplus-reshape.md §5) the masked row form is gone — reconstruction is uniformly lazy and a
+// deferred value carries its own resolution handles, so resolveUnfetchedSelf reconstructs it with
+// NO caller-supplied type or pager (the path the evaluator's column access takes when the static
+// touched set missed). Mirrors the Rust packed_leaf_reconstructs_only_touched_columns.
 test("a Packed leaf reconstructs only the touched columns", () => {
   const sc = (s: "i32" | "text" | "i64"): ColType => ({ kind: "scalar", scalar: s });
   const colTypes: ColType[] = [sc("i32"), sc("text"), sc("i64")];
@@ -400,7 +403,7 @@ test("a Packed leaf reconstructs only the touched columns", () => {
   const payload = encodeLeafPax(colTypes, keys, rows, capacity, take, ovf);
   assert.equal(ovf.length, 0);
   const block = makePage(ps, PAGE_LEAF, rows.length, 0, payload);
-  const node = decodeLeafNode(block, 2, colTypes);
+  const node = decodeLeafNode(block, 2, colTypes, null);
 
   // Resolve a (possibly-deferred) value to its comparable eager bytes.
   const resolve = (v: Value, c: number): Uint8Array => {
@@ -423,10 +426,16 @@ test("a Packed leaf reconstructs only the touched columns", () => {
         `row ${i} col ${c}: colAt differs from whole row`,
       );
     }
-    // rowAtMasked decodes only the masked columns; the rest stay NULL (unread).
-    const masked = rowAtMasked(node, i, [false, true, false]);
-    assert.equal(masked[0]!.kind, "null", "unmasked column must be NULL (unread)");
-    assert.equal(masked[2]!.kind, "null", "unmasked column must be NULL (unread)");
-    assert.deepEqual(resolve(masked[1]!, 1), resolve(whole[1]!, 1));
+    // The B4 demand-fault backstop: a deferred value carries its own resolution handles, so
+    // resolveUnfetchedSelf reconstructs it with NO caller-supplied type or pager.
+    for (let c = 0; c < colTypes.length; c++) {
+      const v = whole[c]!;
+      if (v.kind !== "unfetched") continue;
+      assert.deepEqual(
+        encodeValue(colTypes[c]!, resolveUnfetchedSelf(v.ref)),
+        resolve(v, c),
+        `row ${i} col ${c}: self-resolution differs from context resolution`,
+      );
+    }
   }
 });
