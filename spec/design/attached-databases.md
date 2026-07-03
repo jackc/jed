@@ -20,7 +20,8 @@
 > §2/§5). Attachment **generalizes "a few hardcoded extra snapshots" into "N named attachments,"** and
 > in doing so lets temp stop being bespoke machinery and become *an attached in-memory database* (§6).
 >
-> **Status: building. Slice 0 + Slice 1a landed; Slice 1b landed in the Go core (Rust/TS porting).**
+> **Status: building. Slice 0 + Slice 1a + Slice 1b landed (all three cores); Slice 1b-3 (bring
+> attachments into the concurrency differential net) building.**
 > This doc fixed the model and the decisions before any code, spec-first (CLAUDE.md §11). The two
 > decisions that were open at first draft are settled (maintainer, 2026-07-03): **attach is host-API
 > only — no SQL attach in any form** (§4), and the **`SHARED TEMP` surface is retired** in favor of a
@@ -30,9 +31,13 @@
 > implicit `main`/`temp` scope (the SQL surface, no registry yet) — **landed, all three cores**; **1b**
 > the name→attachment registry + host-API in-memory `db.attach`/`detach` + the CREATE TABLE / CREATE
 > INDEX qualifier (create-into-attachment) + N-root commit + cross-attachment joins + read-only mode
-> (`25006`) + detach-in-use (`55006`) — the whole capability, **landed in the Go core**, Rust + TS
-> porting; **1c** reframe session-local temp as an implicit in-memory attachment (internal cleanup),
-> deferred. The grammar ([../grammar/grammar.ebnf](../grammar/grammar.ebnf)) and error registry
+> (`25006`) + detach-in-use (`55006`) — the whole capability, **landed, all three cores**; **1b-3**
+> pulls attachments inside the concurrency differential net — the `# format: concurrency` runner learns
+> the file-level `# attach:` directive so a schedule exercises concurrent readers/writer over a
+> host-attached in-memory database (`suites/concurrency/attach_snapshot_isolation.test`), asserting
+> cross-database snapshot isolation + the watermark (the threaded cores drive it under the race
+> detector — [concurrency-testing.md](concurrency-testing.md) §4/§9), **building**; **1c** reframe
+> session-local temp as an implicit in-memory attachment (internal cleanup), deferred. The grammar ([../grammar/grammar.ebnf](../grammar/grammar.ebnf)) and error registry
 > ([../errors/registry.toml](../errors/registry.toml)) are authoritative for the surface and codes;
 > when a decision here changes, change them in the same edit.
 
@@ -399,8 +404,8 @@ Sequenced to put the durability-risky part last:
     unknown-database `42P01`); no new error code, no `format_version` change. `CREATE INDEX ON` /
     `REFERENCES` / `CREATE TABLE` qualifiers stay bare this sub-slice (they matter once real
     attachments exist — 1b).
-  - **1b — the registry + host-API in-memory attach + N-root commit + the DDL qualifier. LANDED in the
-    Go core (Rust + TS porting).** A per-attachment `(storage, published-root)` struct keyed by name
+  - **1b — the registry + host-API in-memory attach + N-root commit + the DDL qualifier. LANDED (all
+    three cores).** A per-attachment `(storage, published-root)` struct keyed by name
     lives on the shared core; `db.attach(name, memory(), read_only)` / `db.detach(name)` add/remove
     entries (host-API, never SQL, §4); the resolution funnels branch on the resolved attachment (1a's
     validation gate becomes real N-way routing — the scoped `lkp*Store`/`writeStore` funnels + the FROM
@@ -419,6 +424,16 @@ Sequenced to put the durability-risky part last:
     disk` — in-memory attachments cannot survive the per-record reopen); the read-only + detach lifecycle
     are per-core host-API unit tests. In-memory attachments carry **no** byte contract (never serialized)
     → no `format_version` change.
+  - **1b-3 — pull attachments inside the concurrency differential net (concurrency-testing.md §4/§9).**
+    The `# format: concurrency` schedule runner learns the file-level `# attach: <name>` directive
+    (attaching a fresh empty read-write in-memory database to the shared handle before the schedule
+    runs, host-API — never a schedule step); a new shared schedule
+    `suites/concurrency/attach_snapshot_isolation.test` asserts, over an attachment, the same
+    cross-database snapshot isolation + watermark + version-advance-on-commit the single-handle 1b path
+    was only correct-by-construction for. The threaded cores (Go/Rust) run it under the race detector
+    (`rake concurrency:race`) — a reader pinning `roots.attached` on its own goroutine/thread while a
+    writer publishes a fresh attached map — the hardening proof; TS runs it stepped-sequentially.
+    Additive tests + a harness extension, no engine change, no `format_version` change.
   - **1c — reframe session-local temp as an implicit in-memory attachment** (§6). Internal cleanup:
     temp's bespoke fields become the registry's implicit `temp` entry; behavior-neutral (temp keeps its
     zero-file-writes, page budget, and compaction).

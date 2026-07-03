@@ -74,6 +74,18 @@ result grammar verbatim (`statement ok` / `statement error <code>`, `query <colt
 <sortmode>` + `----` + expected rows, with `rowsort`/`valuesort` and the `R` float tag), so
 all row rendering, sorting and comparison code is shared with the sequential harness.
 
+A concurrency file may also carry the file-level **`# attach: <name>`** directive (the same one
+the sequential harness reads — [attached-databases.md](attached-databases.md) §6): before the
+schedule runs, the runner attaches a fresh empty read-write in-memory database under `<name>` to the
+shared handle. Attaching is a host-API act, never SQL (attached-databases.md §2), so it happens when
+the shared `Database` is built — not as a schedule step — and, because attachments are
+Database-scoped, every session the schedule opens sees them. This is what lets a schedule exercise
+concurrent readers and a writer over an *attached* database: a reader pins the whole roots — main
+plus the attachment snapshots — in one lock-free `Load`, so cross-database snapshot isolation and the
+watermark are asserted over an attachment exactly as over main (Slice 1b-3). Gated by
+`harness.attach` + `attach.in_memory`, so a core that has not wired the directive into its
+concurrency runner skips the file before parsing (§4.4).
+
 ### 4.1 Directives
 
 Operations are scoped to a named **session**; control and assertion directives are new.
@@ -351,9 +363,13 @@ the "spec is the contract" net, Layer 3 inside the "checked-answer benchmarks" n
   stepped-threaded mode** — one goroutine/OS-thread per session under a turn token — driven under
   the race detector by `rake concurrency:race` (`go test -race`; Rust `cargo test` proving
   `Send`/`Sync` + the threaded run, a TSan run optional). TS is sequential-only (JS has no
-  shared-memory threads for live objects, §4.3). Three schedules so far: `snapshot_isolation.test`
+  shared-memory threads for live objects, §4.3). Four schedules so far: `snapshot_isolation.test`
   (cross-handle visibility + the watermark), `watermark_refcount.test` (reader refcounting + a
-  rolled-back writer), and `gate_blocking.test` (the Layer 2 write-gate block + hand-off).
+  rolled-back writer), `gate_blocking.test` (the Layer 2 write-gate block + hand-off), and
+  `attach_snapshot_isolation.test` (cross-database snapshot isolation + the watermark over a
+  host-attached in-memory database via the `# attach:` directive, §4 — Slice 1b-3, which pulled
+  attachments inside this net; the threaded cores drive a reader pinning `roots.attached` on its own
+  goroutine/thread while a writer publishes a fresh attached map, under the race detector).
 - **Layer 2 — landed (all three cores).** The `open <sid> write blocks` annotation and the
   `txn.gate_blocking` capability (§5). All three cores defer the queued open to the gate-releasing
   step (the canonical, timing-free result); Go and Rust additionally park the queued writer's thread
