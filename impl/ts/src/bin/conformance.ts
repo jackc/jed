@@ -843,6 +843,34 @@ function runFile(text: string, disk: boolean): void {
 // The result grammar (statement / query, sortmodes, the R float tag) is reused verbatim from the
 // sequential runner (runFile) — only the session control + state assertions are new.
 
+// parseAttaches collects every file-level `# attach: <name>` directive in a concurrency file, in
+// order — the databases to attach to the shared handle before the schedule runs. Reuses the
+// sequential runner's parseAttachDirective, so a schedule declares an attachment exactly the way a
+// sequential file does.
+function parseAttaches(text: string): string[] {
+  const names: string[] = [];
+  for (const raw of text.split("\n")) {
+    const t = raw.trim();
+    if (!t.startsWith("#")) continue;
+    const name = parseAttachDirective(t);
+    if (name !== null) names.push(name);
+  }
+  return names;
+}
+
+// scheduleDatabase builds the shared handle a schedule runs against, attaching a fresh empty
+// read-write in-memory database for each name (spec/design/attached-databases.md §6, the file-level
+// `# attach:` directive — the same host-API action the sequential runner applies, gated by
+// harness.attach). The attachments are Database-scoped, so every session the schedule opens sees them
+// (a reader pins the WHOLE roots — main + attached — in one lock-free Load, §5); this is what lets a
+// schedule assert cross-database snapshot isolation and the watermark over an attachment. Attaching is
+// host-API, never SQL, so it happens here before any session opens, not as a schedule step.
+function scheduleDatabase(attaches: string[]): Database {
+  const db = createDatabase({});
+  for (const name of attaches) db.attach(name, attachMemory(), false); // throws on error
+  return db;
+}
+
 // isConcurrencyFormat reports whether text opts into the schedule format via a `# format:
 // concurrency` header line. Any other (or absent) format is the sequential runner.
 function isConcurrencyFormat(text: string): boolean {
@@ -993,7 +1021,9 @@ function endSession(kind: string, s: CSession): void {
 // must produce. `gateHolder` is the live writer's sid (the single-writer gate); `blocked` is the
 // at-most-one writer queued on it.
 function runConcurrencyFile(text: string): void {
-  const db = createDatabase({});
+  // Attaching is host-API, never SQL, so any `# attach:` databases are wired in when the shared
+  // handle is built — before any session opens, not as a schedule step (attached-databases.md §6).
+  const db = scheduleDatabase(parseAttaches(text));
   const sessions = new Map<string, CSession>();
   let gateHolder = ""; // the live writer holding the single-writer gate, "" if free
   let blocked = ""; // a writer queued on the gate (Layer 2 `blocks`), "" if none
