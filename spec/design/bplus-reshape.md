@@ -14,7 +14,11 @@
 > [storage.md](storage.md) §6, and [../fileformat/format.md](../fileformat/format.md) in the
 > same edit.
 >
-> **Status: PROPOSED (B0 — spec only, no code).** Supersedes the "in-memory path deliberately
+> **Status: B1 LANDED** (the format bump — all four implementations byte-identical at
+> `format_version` 24, goldens regenerated incl. the `max_sep_table.jed` degenerate-fan-out
+> fixture, corpus green in both storage modes with zero corpus cost drift; the exact byte
+> contract is [../fileformat/format.md](../fileformat/format.md)). **B2–B4 pending.**
+> Supersedes the "in-memory path deliberately
 > left separate" carve-outs in [hosts.md §7](hosts.md) and [lazy-record.md §4/§11/§12](lazy-record.md),
 > and the B-tree shape decided in [transactions.md §3](transactions.md). Absorbs the PAX
 > Stage-4 **per-column null bitmap**, previously earmarked as its own v24 bump (the Stage-4
