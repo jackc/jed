@@ -92,6 +92,12 @@ pub struct CreateTable {
     /// resolves each element (42703/42701/42704/0A000), builds the backing multi-column GiST index,
     /// and names the unnamed ones (42P07/42710).
     pub excludes: Vec<ExcludeDef>,
+    /// The optional database qualifier `db.table` written before the table name
+    /// (spec/design/attached-databases.md §3, Slice 1b): `main` (the persistent image), `temp` (the
+    /// session-local domain), or a host-attached database name — else 42P01. `None` for a bare name
+    /// (the implicit scope: temp if `temp`, else main). Creating INTO an attachment routes the new
+    /// table into that attachment's working snapshot at execution (attached-databases.md §6).
+    pub db: Option<String>,
 }
 
 /// A referential action for `ON DELETE` / `ON UPDATE` (spec/design/constraints.md §6.6). Only
@@ -201,6 +207,11 @@ pub struct CreateIndex {
     /// The `USING <method>` access method as written, or `None` for the default ordered B-tree.
     /// Resolved at execution: `None`/`btree` → B-tree, `gin` → GIN, else 42704 (gin.md §3).
     pub using: Option<String>,
+    /// The optional database qualifier on the target table `CREATE INDEX … ON db.table (…)`
+    /// (spec/design/attached-databases.md §3, Slice 1b): the index is built ON a table in that
+    /// database (`main` / `temp` / a host attachment), and its store is registered into the owning
+    /// snapshot. `None` for a bare (implicit-scope) table name.
+    pub db: Option<String>,
 }
 
 /// `DROP INDEX <name>` — remove one secondary index (spec/design/indexes.md §2).

@@ -207,6 +207,18 @@ fn parse_timezone_directive(rest: &str) -> Option<String> {
 /// on-disk state that SQL cannot construct (a version-skewed collation pin + a wrong-for-loaded
 /// index — the skew read-safety regression, spec/design/collation.md §12/§14). The path is relative
 /// to `spec/`. Gated by the `harness.fixture_open` capability. Returns the path, or None.
+/// Parse a file-level `# attach: <name>` directive — the corpus's way to attach a fresh, empty
+/// READ-WRITE in-memory database named `<name>` to the running handle before the records run
+/// (spec/design/attached-databases.md §6), so SQL can `CREATE TABLE <name>.t`, populate it, and join
+/// across attachments. Returns the name, or None if not this directive. Gated by `harness.attach`.
+fn parse_attach_directive(rest: &str) -> Option<String> {
+    let body = rest.trim_start().strip_prefix("attach:")?.trim();
+    if body.is_empty() {
+        return None;
+    }
+    Some(body.to_string())
+}
+
 fn parse_fixture_directive(rest: &str) -> Option<String> {
     let body = rest.trim_start().strip_prefix("fixture:")?.trim();
     (!body.is_empty()).then(|| body.to_string())
@@ -614,6 +626,16 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
             // `AT TIME ZONE` (timezones.md §11).
             if let Some(name) = parse_load_timezone_directive(rest) {
                 load_timezone(&name)?;
+                continue;
+            }
+            // `# attach: <name>` (file-level) attaches a fresh empty read-write in-memory database to
+            // the running handle (attached-databases.md §6): the records then CREATE / populate / join
+            // it by the `<name>.table` qualifier. An ACTION applied to the Database, so every session
+            // over it sees the attachment (refresh_committed re-pins the attached roots per statement).
+            // In-memory attachments cannot survive the disk reopen, so # attach: files are # skip: disk.
+            if let Some(name) = parse_attach_directive(rest) {
+                db.attach(&name, jed::AttachSource::memory(), false)
+                    .map_err(|e| format!("attach {name:?}: {}", e.message))?;
                 continue;
             }
             // `# fixture:` (file-level) opens a PRE-BUILT image in place of the fresh `Engine::new()`

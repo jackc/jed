@@ -97,7 +97,7 @@ pub(crate) use executor::Engine;
 pub use file::{CreateOptions, OpenOptions};
 pub use privileges::{Privilege, PrivilegeSet, Privileges};
 pub use seam::{ClockSource, RandomSource, advancing_clock, fixed_clock, seeded_random_source};
-pub use shared::{Database, Session};
+pub use shared::{AttachSource, Database, Session};
 pub use spill::DEFAULT_WORK_MEM;
 pub use split::{SplitStatements, StatementSpan, split_statements};
 pub use timezone::{load_time_zone_data, resolve_zone};
@@ -329,6 +329,10 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // Database-qualified table names — `main.`/`temp.` in table position (attached-databases.md §3,
     // Slice 1a).
     "query.qualified_table",
+    // Host-attached in-memory databases — Database::attach/detach + full SQL routing by the `db.table`
+    // qualifier: CREATE TABLE/INDEX into an attachment, INSERT/UPDATE/DELETE/SELECT/JOIN across
+    // attachments, N-root commit (attached-databases.md §5/§6, Slice 1b).
+    "attach.in_memory",
     "query.correlated_pushdown",
     "query.join_pushdown",
     "query.index_nested_loop",
@@ -766,6 +770,11 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // cannot construct — e.g. the version-skew read-safety regression (spec/design/collation.md
     // §12/§14, spec/design/conformance.md). Reconstructed in memory via `Engine::from_image`.
     "harness.fixture_open",
+    // The `# attach: <name>` directive attaches a fresh empty read-write in-memory database to the
+    // running handle before the records run, so the corpus can populate + join across attachments
+    // (spec/design/attached-databases.md §6). In-memory attachments cannot survive the disk reopen, so
+    // an # attach: file is # skip: disk.
+    "harness.attach",
     // The `# upgrade-collations:` directive runs the COLLATION UPGRADE migration
     // (`db.upgrade_collations`) on the running DB — clears a version-skew so a corpus test can drive
     // skew→migrate→writable end to end (spec/design/collation.md §12).

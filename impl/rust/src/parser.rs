@@ -275,7 +275,10 @@ impl Parser {
             self.advance();
         }
         self.expect_keyword("table")?;
-        let name = self.expect_identifier()?;
+        // An optional database qualifier `db.table` (attached-databases.md §3, Slice 1b): create the
+        // table INTO the named database (`main` / `temp` / a host attachment). A bare name uses the
+        // implicit scope. The `.` after the first identifier makes it the qualifier, the next the name.
+        let (db, name) = self.parse_qualified_table_name()?;
         self.expect(&Token::LParen)?;
 
         let mut columns = Vec::new();
@@ -325,6 +328,7 @@ impl Parser {
             uniques,
             foreign_keys,
             excludes,
+            db,
         })
     }
 
@@ -857,7 +861,10 @@ impl Parser {
             Some(self.expect_identifier()?)
         };
         self.expect_keyword("on")?;
-        let table = self.expect_identifier()?;
+        // An optional database qualifier `db.table` on the target table (attached-databases.md §3,
+        // Slice 1b): build the index ON a table in the named database (`main` / `temp` / a host
+        // attachment).
+        let (db, table) = self.parse_qualified_table_name()?;
         // Optional `USING <method>` (PG order: between the table and the column list — gin.md §3,
         // grammar.md §30). Not reserved (recognized positionally); the method name is resolved —
         // and an unknown one rejected 42704 — at execution, not here.
@@ -883,6 +890,7 @@ impl Parser {
             columns,
             unique,
             using,
+            db,
         })
     }
 

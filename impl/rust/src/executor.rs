@@ -359,6 +359,14 @@ impl Snapshot {
         self.cat_gen += 1;
     }
 
+    /// Bind this snapshot's NEW stores to a per-domain `MemoryBlockStore` paging context (the temp seam
+    /// — spec/design/temp-tables.md §6, attached-databases.md §6). Set on a host-attached in-memory
+    /// database's committed root at attach time (shared.rs) so its tables/indexes ride the same pager +
+    /// packed-leaf path as an in-memory database. NEVER serialized (an attachment snapshot never is).
+    pub(crate) fn set_temp_paging(&mut self, paging: std::sync::Arc<crate::paging::SharedPaging>) {
+        self.temp_paging = Some(paging);
+    }
+
     /// Register a composite type (CREATE TYPE). Lower-cased name is the key. The caller has
     /// already resolved field types and checked for a duplicate.
     pub(crate) fn put_type(&mut self, ty: CompositeType) {
@@ -1177,6 +1185,20 @@ pub struct Engine {
     /// (via an `OpenStreamGuard` bundled into the cursor's pin) — hence the `Arc<AtomicUsize>`: the guard
     /// outlives the `&mut self` borrow that built the cursor.
     pub(crate) open_streams: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// The shared core this engine's session belongs to (attached-databases.md §5), or `None` for a
+    /// bare/transient engine (a test [`Engine::new`], a `snapshot_engine`, a `from_snapshot` read view —
+    /// none of which commit attachments). It is the engine's route to the core-owned attachment registry
+    /// during a commit persist; the READ view of attachments is the pinned `attached_committed` below.
+    /// Set at session mint (shared.rs).
+    pub(crate) core: Option<std::sync::Arc<crate::shared::Shared>>,
+    /// The PINNED committed root of every host-attached DATABASE-scoped database
+    /// (attached-databases.md §5), keyed by lowercased name — this session's stable read view, snapshot
+    /// isolated: refreshed from the core's published `Roots::attached` at each autocommit statement
+    /// (`refresh_committed`) and pinned for the life of an explicit `BEGIN` block. Empty when nothing is
+    /// attached. Session-local temp is NOT here (it rides `SessionState::temp_committed`); this holds
+    /// only the DATABASE-scoped roots. Set at session mint; adopted from a tx's `attach_working` on a
+    /// successful commit.
+    pub(crate) attached_committed: HashMap<String, std::sync::Arc<Snapshot>>,
 }
 
 /// An RAII counter for a live streaming cursor (temp-tables.md §6): built by [`Engine::open_stream_guard`]
@@ -1656,6 +1678,16 @@ pub(crate) struct ActiveTx {
     /// [`Engine::temp_working_mut`]. With `main_dirty` it decides whether COMMIT persists the main
     /// image (a pure-temp commit skips it; an empty block still persists, preserving prior behavior).
     temp_dirty: bool,
+    /// The transaction's working copy of each host-attached database's snapshot
+    /// (attached-databases.md §5), keyed by lowercased attachment name — the attachment analogue of
+    /// `temp_working`. Cloned lazily from [`Engine::attached_committed`] on the first write to that
+    /// attachment ([`Engine::attach_write_snap`]), so a read-only cross-attachment query allocates
+    /// nothing here. Adopted into `attached_committed` + persisted+published on a successful COMMIT,
+    /// discarded on ROLLBACK. Empty until an attachment is written.
+    attach_working: HashMap<String, Snapshot>,
+    /// Which attachments this transaction mutated (lowercased names) — the per-attachment analogue of
+    /// `main_dirty`/`temp_dirty`, the set the commit persists + publishes.
+    attach_dirty: HashSet<String>,
 }
 
 impl Default for Engine {
@@ -1685,6 +1717,8 @@ impl Engine {
             session: SessionState::new(),
             temp_storage: None,
             open_streams: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            core: None,
+            attached_committed: HashMap::new(),
         }
     }
 
@@ -1705,6 +1739,8 @@ impl Engine {
             session: SessionState::new(),
             temp_storage: None,
             open_streams: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            core: None,
+            attached_committed: HashMap::new(),
         }
     }
 
@@ -1857,13 +1893,202 @@ impl Engine {
                 }
             }
             _ => {
-                return Err(EngineError::new(
-                    SqlState::UndefinedTable,
-                    format!("database \"{q}\" is not attached"),
-                ));
+                // A host-attached database (attached-databases.md §5): the qualifier must name an
+                // attachment (else 42P01 "database … is not attached") and it must carry the table
+                // (else 42P01 "relation … does not exist"). Slice 1a's default case was always 42P01;
+                // Slice 1b routes it to the attachment registry.
+                let scope = q.to_ascii_lowercase();
+                match self.attach_read_snap(&scope) {
+                    None => {
+                        return Err(EngineError::new(
+                            SqlState::UndefinedTable,
+                            format!("database \"{q}\" is not attached"),
+                        ));
+                    }
+                    Some(snap) => {
+                        if snap.table(name).is_none() {
+                            return Err(EngineError::new(
+                                SqlState::UndefinedTable,
+                                format!("relation \"{q}.{name}\" does not exist"),
+                            ));
+                        }
+                    }
+                }
             }
         }
         Ok(())
+    }
+
+    /// Reject a WRITE (DML or DDL) targeting a READ-ONLY host attachment with `25006`
+    /// (attached-databases.md §4), before any I/O. A `None` scope, or `main`/`temp` (never read-only via
+    /// a qualifier — the read-only *handle* path is separate), or a read-write attachment passes.
+    /// Unknown attachments are caught by the qualifier gate, so this only inspects the mode.
+    fn check_attachment_writable(&self, scope: Option<&str>) -> Result<()> {
+        let Some(q) = scope else { return Ok(()) };
+        let Some(core) = &self.core else {
+            return Ok(());
+        };
+        let name = q.to_ascii_lowercase();
+        if name == "main" || name == "temp" {
+            return Ok(());
+        }
+        if core.attachment_mode(&name) == Some(crate::shared::AttachMode::ReadOnly) {
+            return Err(EngineError::new(
+                SqlState::ReadOnlySqlTransaction,
+                format!("cannot write to read-only database \"{q}\""),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The READ snapshot of a host-attached database (attached-databases.md §5) — the transaction's
+    /// working clone if this tx wrote it, else the pinned committed root (`attached_committed`). `None`
+    /// when no attachment is named `name` (the caller raises 42P01). `name` is expected lowercased.
+    fn attach_read_snap(&self, name: &str) -> Option<&Snapshot> {
+        if let Some(tx) = &self.session.tx
+            && let Some(ws) = tx.attach_working.get(name)
+        {
+            return Some(ws);
+        }
+        self.attached_committed.get(name).map(|a| a.as_ref())
+    }
+
+    /// The WRITE snapshot of a host-attached database, cloning the pinned committed root into the
+    /// transaction's per-attachment working set on first write and marking it dirty (the attachment
+    /// analogue of `working_mut`/`temp_working_mut`). A write runs within a transaction, and the
+    /// attachment is known to exist (the qualifier gate ran), so this never panics in a correct flow.
+    /// `name` is expected lowercased.
+    fn attach_write_snap(&mut self, name: &str) -> &mut Snapshot {
+        let present = self
+            .session
+            .tx
+            .as_ref()
+            .is_some_and(|tx| tx.attach_working.contains_key(name));
+        if !present {
+            // Clone the committed base BEFORE borrowing `session.tx` mutably (no field-overlap borrow).
+            let base = self
+                .attached_committed
+                .get(name)
+                .expect("a write to an attached database resolves its committed root")
+                .as_ref()
+                .clone();
+            let tx = self
+                .session
+                .tx
+                .as_mut()
+                .expect("a write statement runs within a transaction");
+            tx.attach_working.insert(name.to_string(), base);
+        }
+        let tx = self
+            .session
+            .tx
+            .as_mut()
+            .expect("a write statement runs within a transaction");
+        tx.attach_dirty.insert(name.to_string());
+        tx.attach_working
+            .get_mut(name)
+            .expect("the working snapshot was just inserted")
+    }
+
+    /// The current READ view of every attached database — the transaction's working clone where this tx
+    /// wrote it, else the pinned committed root — as one frozen map. Used to freeze a `snapshot_engine`'s
+    /// attachment view (whose own tx is `None`, so it reads straight from this map). Returns
+    /// `attached_committed` cloned directly when no attachment has been written this tx (the common case).
+    fn attach_read_view(&self) -> HashMap<String, std::sync::Arc<Snapshot>> {
+        match &self.session.tx {
+            Some(tx) if !tx.attach_working.is_empty() => {
+                let mut view = self.attached_committed.clone();
+                for (k, v) in &tx.attach_working {
+                    view.insert(k.clone(), std::sync::Arc::new(v.clone()));
+                }
+                view
+            }
+            _ => self.attached_committed.clone(),
+        }
+    }
+
+    /// The READ snapshot for an explicit database qualifier (attached-databases.md §3): `main` / `temp`
+    /// / a host attachment. Used only when a scope is present; a bare (`None`) name keeps the temp-first
+    /// funnels. `None` for an unknown attachment (the qualifier gate already raised 42P01).
+    fn snap_for_scope(&self, scope: &str) -> Option<&Snapshot> {
+        match scope.to_ascii_lowercase().as_str() {
+            "temp" => Some(self.temp_read_snap()),
+            "main" => Some(self.read_snap()),
+            other => self.attach_read_snap(other),
+        }
+    }
+
+    /// Resolve a table's catalog entry honoring an explicit database qualifier (attached-databases.md
+    /// §3); a `None` scope keeps the bare temp-first walk.
+    fn table_scoped(&self, scope: Option<&str>, name: &str) -> Option<&Table> {
+        match scope {
+            None => self.table(name),
+            Some(q) => self.snap_for_scope(q).and_then(|s| s.table(name)),
+        }
+    }
+
+    /// A table's READ store honoring an explicit database qualifier; a `None` scope keeps the bare
+    /// temp-first funnel. The table is known to exist (resolved upstream).
+    fn store_scoped(&self, scope: Option<&str>, name: &str) -> &TableStore {
+        match scope {
+            None => self.store(name),
+            Some(q) => match q.to_ascii_lowercase().as_str() {
+                "temp" => self.temp_read_snap().store(name),
+                "main" => self.read_snap().store(name),
+                other => self
+                    .attach_read_snap(other)
+                    .expect("attachment resolved upstream")
+                    .store(name),
+            },
+        }
+    }
+
+    /// A table's WRITE store honoring an explicit database qualifier, marking the right domain dirty
+    /// (main / temp / the attachment); a `None` scope keeps the bare temp-first funnel.
+    fn store_mut_scoped(&mut self, scope: Option<&str>, name: &str) -> &mut TableStore {
+        match scope {
+            None => self.store_mut(name),
+            Some(q) => match q.to_ascii_lowercase().as_str() {
+                "temp" => self.temp_working_mut().store_mut(name),
+                "main" => self.working_mut().store_mut(name),
+                other => {
+                    let other = other.to_string();
+                    self.attach_write_snap(&other).store_mut(name)
+                }
+            },
+        }
+    }
+
+    /// A secondary index's READ store honoring an explicit database qualifier (an index belongs to the
+    /// same database as its table); a `None` scope keeps the bare temp-first funnel.
+    fn index_store_scoped(&self, scope: Option<&str>, name_key: &str) -> &TableStore {
+        match scope {
+            None => self.index_store(name_key),
+            Some(q) => match q.to_ascii_lowercase().as_str() {
+                "temp" => self.temp_read_snap().index_store(name_key),
+                "main" => self.read_snap().index_store(name_key),
+                other => self
+                    .attach_read_snap(other)
+                    .expect("attachment resolved upstream")
+                    .index_store(name_key),
+            },
+        }
+    }
+
+    /// A secondary index's WRITE store honoring an explicit database qualifier; a `None` scope keeps the
+    /// bare temp-first funnel.
+    fn index_store_mut_scoped(&mut self, scope: Option<&str>, name_key: &str) -> &mut TableStore {
+        match scope {
+            None => self.index_store_mut(name_key),
+            Some(q) => match q.to_ascii_lowercase().as_str() {
+                "temp" => self.temp_working_mut().index_store_mut(name_key),
+                "main" => self.working_mut().index_store_mut(name_key),
+                other => {
+                    let other = other.to_string();
+                    self.attach_write_snap(&other).index_store_mut(name_key)
+                }
+            },
+        }
     }
 
     /// The `DROP TYPE … RESTRICT` dependency check across every visible scope (spec/design/temp-tables.md
@@ -2727,6 +2952,8 @@ impl Engine {
             temp_working: self.session.temp_committed.clone(),
             main_dirty: false,
             temp_dirty: false,
+            attach_working: HashMap::new(),
+            attach_dirty: HashSet::new(),
         });
         match self.dispatch_stmt(stmt, params) {
             Ok(outcome) => {
@@ -2785,6 +3012,8 @@ impl Engine {
             temp_working: self.session.temp_committed.clone(),
             main_dirty: false,
             temp_dirty: false,
+            attach_working: HashMap::new(),
+            attach_dirty: HashSet::new(),
         });
         Ok(Outcome::Statement {
             cost: 0,
@@ -2831,6 +3060,8 @@ impl Engine {
         let temp_dirty = tx.temp_dirty;
         let mut temp_working = tx.temp_working;
         let mut working = tx.working;
+        let mut attach_working = tx.attach_working;
+        let attach_dirty = tx.attach_dirty;
         // Persist the main image when it changed; a transaction that touched ONLY session-local temp
         // tables skips it entirely so a temp table makes ZERO file writes (spec/design/temp-tables.md
         // §2). An empty block (no kind dirty) still persists, preserving prior behavior. Temp state is
@@ -2860,6 +3091,30 @@ impl Engine {
         // temp analogue of publishing `committed`, but purely in memory. SessionState-local temp lives on
         // the session.
         self.session.temp_committed = temp_working;
+        // Adopt each dirtied host-attached database (attached-databases.md §5, the N-root commit):
+        // materialize its working snapshot into the attachment's in-RAM block store (persist_temp-style —
+        // the same incremental copy-on-write pack as temp, NO fsync, an in-memory attachment has no
+        // durability barrier) and adopt it into this engine's pinned attached view, so `publish` swaps a
+        // new `Roots::attached`. Like temp this touches no MAIN file; unlike temp the root is
+        // DATABASE-scoped (published, cross-session-visible). Within-session compaction is safe only when
+        // no cross-session reader pins an older root (the live-registry watermark — the committing writer
+        // holds the gate but is not in `live`).
+        if !attach_dirty.is_empty() {
+            let core = self.core.clone();
+            let can_reclaim = core.as_ref().is_none_or(|c| !c.has_live_readers());
+            let mut na = self.attached_committed.clone();
+            for name in &attach_dirty {
+                let Some(mut ws) = attach_working.remove(name) else {
+                    continue;
+                };
+                if let Some(c) = &core {
+                    // A detached-mid-transaction attachment (unreachable under the writer gate) no-ops.
+                    c.persist_attachment(name, &mut ws, can_reclaim)?;
+                }
+                na.insert(name.clone(), std::sync::Arc::new(ws));
+            }
+            self.attached_committed = na;
+        }
         Ok(Outcome::Statement {
             cost: 0,
             rows_affected: None,
@@ -3074,7 +3329,44 @@ impl Engine {
         // before any persistent parent resolves, so the error is a clean 0A000 (not a 42P01 from
         // resolving a parent). The other temp narrowings (composite/collated columns, serial/IDENTITY)
         // are checked just before registration, once the columns are built.
-        if ct.temp && !ct.excludes.is_empty() {
+        // Resolve the optional database qualifier (attached-databases.md §3, Slice 1b): `main`/`temp`
+        // fold into the implicit scope (main = bare persistent, temp = TEMP); a host-attached name routes
+        // the new table INTO that attachment's working snapshot (§6). TEMP with an explicit database is
+        // contradictory unless the database IS `temp` (42601).
+        let mut target_temp = ct.temp;
+        let mut attach_name: Option<String> = None;
+        if let Some(qual) = &ct.db {
+            match qual.to_ascii_lowercase().as_str() {
+                "main" => {
+                    if ct.temp {
+                        return Err(EngineError::new(
+                            SqlState::SyntaxError,
+                            "cannot create a TEMP table in database \"main\"",
+                        ));
+                    }
+                }
+                "temp" => target_temp = true,
+                other => {
+                    if ct.temp {
+                        return Err(EngineError::new(
+                            SqlState::SyntaxError,
+                            "cannot create a TEMP table in an attached database",
+                        ));
+                    }
+                    let lname = other.to_string();
+                    if self.attach_read_snap(&lname).is_none() {
+                        return Err(EngineError::new(
+                            SqlState::UndefinedTable,
+                            format!("database \"{qual}\" is not attached"),
+                        ));
+                    }
+                    // A DDL write to a READ-ONLY attachment is 25006 before any work (§4).
+                    self.check_attachment_writable(ct.db.as_deref())?;
+                    attach_name = Some(lname);
+                }
+            }
+        }
+        if target_temp && !ct.excludes.is_empty() {
             // An EXCLUDE constraint's backing GiST index would live on the temp snapshot — deferred
             // with the rest of the GiST-on-temp narrowing (spec/design/gist.md §11), a clean 0A000
             // before any column resolves.
@@ -3083,17 +3375,46 @@ impl Engine {
                 "an EXCLUDE constraint on a temporary table is not yet supported",
             ));
         }
-        if ct.temp && !ct.foreign_keys.is_empty() {
+        if target_temp && !ct.foreign_keys.is_empty() {
             return Err(EngineError::new(
                 SqlState::FeatureNotSupported,
                 "FOREIGN KEY on a temporary table is not yet supported",
             ));
         }
+        // Deferred narrowings on an attached-database table this slice (attached-databases.md §8), each a
+        // clean 0A000 before any column work: FOREIGN KEY and EXCLUDE (their probe/backing structures
+        // would need cross-scope catalog access this slice does not thread). Serial/IDENTITY and
+        // composite/collated columns are checked just before registration, once the columns are built.
+        if attach_name.is_some() {
+            if !ct.foreign_keys.is_empty() {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "FOREIGN KEY on an attached-database table is not supported yet",
+                ));
+            }
+            if !ct.excludes.is_empty() {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "an EXCLUDE constraint on an attached-database table is not supported yet",
+                ));
+            }
+        }
         // The relation namespace is shared between tables and indexes (indexes.md §2), so a
-        // CREATE TABLE colliding with either kind is the same 42P07 — PG's "relation" word.
-        // `relation_exists` is temp-aware, so a temp name collides with temp + persistent alike
-        // (preclude-overlaps — temp-tables.md §3).
-        if self.relation_exists(&ct.name) {
+        // CREATE TABLE colliding with either kind is the same 42P07 — PG's "relation" word. For a
+        // bare/main/temp target `relation_exists` is temp-aware (preclude-overlaps — temp-tables.md §3);
+        // an attachment target checks its OWN snapshot's namespace (each attached database is
+        // independent, §3).
+        if let Some(name) = &attach_name {
+            let as_snap = self
+                .attach_read_snap(name)
+                .expect("attachment resolved above");
+            if as_snap.table(&ct.name).is_some() || as_snap.find_index(&ct.name).is_some() {
+                return Err(EngineError::new(
+                    SqlState::DuplicateTable,
+                    format!("relation already exists: {}", ct.name),
+                ));
+            }
+        } else if self.relation_exists(&ct.name) {
             return Err(EngineError::new(
                 SqlState::DuplicateTable,
                 format!("relation already exists: {}", ct.name),
@@ -4105,7 +4426,64 @@ impl Engine {
         // The table is brand new (no rows), so each backing index store starts empty.
         let cap = crate::format::page_payload(self.page_size);
 
-        if ct.temp {
+        if let Some(name) = attach_name.clone() {
+            // Deferred narrowings on an attached-database table this slice (attached-databases.md §8),
+            // each a clean 0A000: a COMPOSITE-typed column (its type lives in the MAIN catalog — no
+            // cross-scope type reference this slice), a serial/IDENTITY column (its OWNED sequence would
+            // be a cross-scope sequence), and a collated column (the attachment snapshot carries no
+            // collation catalog). Plain scalar / array / range / decimal columns with PK / NOT NULL /
+            // DEFAULT / CHECK / UNIQUE and secondary btree indexes are fully supported.
+            for c in &table.columns {
+                if c.ty.is_composite() {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "a composite-typed column on an attached-database table is not supported yet",
+                    ));
+                }
+                if c.collation.is_some() {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        format!(
+                            "COLLATE on an attached-database-table column {} is not yet supported",
+                            c.name
+                        ),
+                    ));
+                }
+            }
+            if !pending_serials.is_empty() {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "a serial / IDENTITY column on an attached-database table is not supported yet",
+                ));
+            }
+            // Resolve each column's `ColType` against the MAIN snapshot's composite-type catalog (as for
+            // temp) — attachment tables carry no composite column (gated above), so this is trivially
+            // scalar, but the resolved tree is self-contained regardless (composite.md §4).
+            let col_types: Vec<ColType> = {
+                let main = self.read_snap();
+                table
+                    .columns
+                    .iter()
+                    .map(|c| resolve_col_type(&c.ty, &main.types))
+                    .collect()
+            };
+            let ps = self.page_size;
+            // Register into the attachment's working snapshot (attached-databases.md §6) — never the main
+            // image; published into `Roots::attached` at commit (N-root commit, §5). `attach_write_snap`
+            // clones the attachment's committed root (which already carries its `temp_paging`) on first
+            // write and marks it dirty, so its NEW stores bind to the attachment's own paging.
+            let ws = self.attach_write_snap(&name);
+            ws.put_table_resolved(table, col_types, ps);
+            for k in index_keys {
+                ws.put_index_store(k, TableStore::new(cap, Vec::new()));
+            }
+            return Ok(Outcome::Statement {
+                cost: 0,
+                rows_affected: None,
+            });
+        }
+
+        if target_temp {
             // Deferred narrowing on a temp table this slice (spec/design/temp-tables.md §8), a clean
             // 0A000: a collated column (needs the temp snapshot to carry the collation catalog). Plain
             // scalar/array/range/decimal columns with PK / NOT NULL / DEFAULT / CHECK / UNIQUE,
@@ -4383,17 +4761,28 @@ impl Engine {
     /// built by scanning the table once: `page_read` per node + `storage_row_read` per row
     /// (the metered build scan — cost.md §3); maintenance thereafter is unmetered.
     fn execute_create_index(&mut self, ci: CreateIndex) -> Result<Outcome> {
-        // A standalone CREATE INDEX targets whichever scope owns the table — session-local temp, shared
-        // temp, or persistent (spec/design/temp-tables.md §8). The build below is scope-agnostic (the
-        // `table`/`store`/`index_store_mut` funnels route by the resolution walk; the cost meter, UNIQUE
-        // validation, naming/namespace collision, and the storage budget are all generic); only the
-        // catalog `put_index` write must target the owning snapshot, so the routing happens there.
-        let table = self.table(&ci.table).ok_or_else(|| {
-            EngineError::new(
-                SqlState::UndefinedTable,
-                format!("table does not exist: {}", ci.table),
-            )
-        })?;
+        // A standalone CREATE INDEX targets whichever scope owns the table — session-local temp,
+        // persistent, or a host-attached database (temp-tables.md §8, attached-databases.md §3). The
+        // build below is scope-agnostic (the scoped `table`/`store`/`index_store_mut` funnels route by
+        // the qualifier + resolution walk); only the catalog `put_index` write must target the owning
+        // snapshot, so the routing happens there.
+        // A DDL write to a READ-ONLY host attachment is 25006 before any work — checked BEFORE the
+        // qualifier existence gate so a read-only attachment refuses the write deterministically (§4).
+        self.check_attachment_writable(ci.db.as_deref())?;
+        self.check_table_qualifier(ci.db.as_deref(), &ci.table)?; // attached-databases.md §3
+        let attach_name: Option<String> = if is_attachment_scope(ci.db.as_deref()) {
+            ci.db.as_ref().map(|d| d.to_ascii_lowercase())
+        } else {
+            None
+        };
+        let table = self
+            .table_scoped(ci.db.as_deref(), &ci.table)
+            .ok_or_else(|| {
+                EngineError::new(
+                    SqlState::UndefinedTable,
+                    format!("table does not exist: {}", ci.table),
+                )
+            })?;
         let table_key = table.name.to_ascii_lowercase();
         let columns = table.columns.clone();
         // Refuse building a collated index on a version-skewed table (slice 2d, collation.md §12,
@@ -4556,9 +4945,34 @@ impl Engine {
                 ));
             }
         }
+        // A non-btree (GIN / GiST) index on an attached-database table is a deferred narrowing this
+        // slice (attached-databases.md §8) — the attachment stores only btree PK / UNIQUE / secondary
+        // indexes.
+        if attach_name.is_some() && kind != IndexKind::Btree {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                format!(
+                    "a {} index on an attached-database table is not supported yet",
+                    ci.using.as_deref().unwrap_or("")
+                ),
+            ));
+        }
+        // `relation_taken` checks the namespace of the target scope: an attachment's OWN snapshot for an
+        // attached table (each attached database is an independent namespace, §3), else the temp-aware
+        // implicit namespace.
+        let relation_taken = |n: &str| -> bool {
+            if let Some(name) = &attach_name {
+                let as_snap = self
+                    .attach_read_snap(name)
+                    .expect("attachment resolved above");
+                as_snap.table(n).is_some() || as_snap.find_index(n).is_some()
+            } else {
+                self.relation_exists(n)
+            }
+        };
         let name = match &ci.name {
             Some(n) => {
-                if self.relation_exists(n) {
+                if relation_taken(n) {
                     return Err(EngineError::new(
                         SqlState::DuplicateTable,
                         format!("relation already exists: {n}"),
@@ -4577,7 +4991,7 @@ impl Engine {
                 base.push_str("_idx");
                 let mut candidate = base.clone();
                 let mut suffix = 0u32;
-                while self.relation_exists(&candidate) {
+                while relation_taken(&candidate) {
                     suffix += 1;
                     candidate = format!("{base}{suffix}");
                 }
@@ -4600,7 +5014,7 @@ impl Engine {
             unique: ci.unique,
             kind,
         };
-        let store = self.store(&ci.table);
+        let store = self.store_scoped(ci.db.as_deref(), &ci.table);
         let (table_entries, nodes, slabs) = store.scan_with_units(&mask)?;
         meter.charge(COSTS.page_read * nodes as i64 + COSTS.value_decompress * slabs as i64);
         let mut entries: Vec<Vec<u8>> = Vec::with_capacity(store.len());
@@ -4638,12 +5052,18 @@ impl Engine {
         // session temp snapshot, so the index makes ZERO file writes (the dirty bit lets the commit skip
         // the main image). The entry writes below then route through `index_store_mut`, which finds the
         // new store in that same temp snapshot (`has_index_store`) and flags the matching dirty bit.
-        if self.is_temp_table(&ci.table) {
+        if let Some(name) = &attach_name {
+            // The attachment's index catalog entry + (empty) store live in its working snapshot,
+            // published into `Roots::attached` at commit (attached-databases.md §5/§6).
+            // `attach_write_snap` clones the attachment's committed root (which carries its
+            // `temp_paging`) on first write and marks it dirty.
+            self.attach_write_snap(name).put_index(&table_key, def, ps);
+        } else if self.is_temp_table(&ci.table) {
             self.temp_working_mut().put_index(&table_key, def, ps);
         } else {
             self.working_mut().put_index(&table_key, def, ps);
         }
-        let istore = self.index_store_mut(&name_key);
+        let istore = self.index_store_mut_scoped(ci.db.as_deref(), &name_key);
         // Insert sorted by entry key (indexes.md §1): every insert is then a right-edge append,
         // so the built tree packs ~full instead of splintering under the storage-key order the
         // scan produced (random in entry-key space). Part of the byte contract — the sort fixes
@@ -5064,10 +5484,21 @@ impl Engine {
             returning,
         } = ins;
 
+        // A write to a READ-ONLY host attachment is 25006 before any I/O — checked BEFORE the qualifier
+        // existence gate so a read-only attachment refuses the write deterministically (§4).
+        self.check_attachment_writable(db.as_deref())?;
         // Validate an optional database qualifier on the target (attached-databases.md §3).
         self.check_table_qualifier(db.as_deref(), &table)?;
+        // ON CONFLICT into a host attachment is a deferred narrowing this slice (attached-databases.md
+        // §8): the conflict path resolves index stores UNSCOPED. A clean 0A000 before any planning.
+        if on_conflict.is_some() && is_attachment_scope(db.as_deref()) {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "ON CONFLICT on an attached-database table is not supported yet",
+            ));
+        }
 
-        let tdef = self.table(&table).ok_or_else(|| {
+        let tdef = self.table_scoped(db.as_deref(), &table).ok_or_else(|| {
             EngineError::new(
                 SqlState::UndefinedTable,
                 format!("table does not exist: {table}"),
@@ -5098,7 +5529,10 @@ impl Engine {
         let default_exprs = self.resolve_default_exprs(tdef)?;
         // The columns' resolved `ColType`s (a scalar, or a composite resolved to its field tree),
         // for composite-aware materialization + store-coercion (spec/design/composite.md §4).
-        let col_types: Vec<ColType> = self.store(&table).col_types().to_vec();
+        let col_types: Vec<ColType> = self
+            .store_scoped(db.as_deref(), &table)
+            .col_types()
+            .to_vec();
         let stmt_rng = std::cell::Cell::new(crate::seam::StmtRng::new());
 
         // Resolve the optional column list once. `provided[i] = Some(p)` means table column i
@@ -5284,6 +5718,7 @@ impl Engine {
                 self.fold_conflict_plan(&mut conflict_plan, &bound, &mut meter.accrued)?;
                 let (affected, returned) = self.run_insert_rows(
                     &table,
+                    db.as_deref(),
                     &columns,
                     &pk,
                     &checks,
@@ -5437,6 +5872,7 @@ impl Engine {
                 meter.charge(q.cost);
                 let (affected, returned) = self.run_insert_rows(
                     &table,
+                    db.as_deref(),
                     &columns,
                     &pk,
                     &checks,
@@ -5487,6 +5923,7 @@ impl Engine {
     fn insert_rows(
         &mut self,
         table: &str,
+        db_scope: Option<&str>,
         columns: &[Column],
         pk: &[(usize, Type)],
         checks: &[(String, RExpr)],
@@ -5502,13 +5939,14 @@ impl Engine {
         let n = columns.len();
         // The canonical relation name for the 23514 message (the `table` argument is the
         // name as the statement spelled it), and the index definitions phase 2 maintains
-        // (spec/design/indexes.md §4 — unmetered write work, like the row writes).
+        // (spec/design/indexes.md §4 — unmetered write work, like the row writes). Scope-aware so an
+        // attachment table's indexes are found (its table lives only in its own snapshot, §3).
         let (relation, indexes) = self
-            .table(table)
+            .table_scoped(db_scope, table)
             .map(|t| (t.name.clone(), t.indexes.clone()))
             .unwrap_or_else(|| (table.to_string(), Vec::new()));
         // The columns' resolved `ColType`s, for composite-aware store coercion (composite.md §4).
-        let col_types: Vec<ColType> = self.store(table).col_types().to_vec();
+        let col_types: Vec<ColType> = self.store_scoped(db_scope, table).col_types().to_vec();
         // Per-column frozen collations for the collated text key form (§2.12), resolved once before
         // any mutation; `None` everywhere for a C-only / non-text table (the fast path).
         let colls = self.column_collations(columns);
@@ -5574,7 +6012,7 @@ impl Engine {
                 // key order (encoding.md §2.3 — `encode_pk_key`); a single-column key is the
                 // one-member case of the same rule.
                 let k = encode_pk_key(pk, &colls, &row)?;
-                if seen_keys.contains(&k) || self.store(table).get(&k)?.is_some() {
+                if seen_keys.contains(&k) || self.store_scoped(db_scope, table).get(&k)?.is_some() {
                     // The PK's 23505 reports PostgreSQL's derived auto-name for the PK
                     // index, `<table>_pkey` — jed persists/reserves no such relation
                     // (constraints.md §5.4).
@@ -5598,7 +6036,7 @@ impl Engine {
                 let Some(prefix) = index_prefix_key(columns, &colls, def, &row)? else {
                     continue;
                 };
-                let istore = self.index_store(&def.name.to_ascii_lowercase());
+                let istore = self.index_store_scoped(db_scope, &def.name.to_ascii_lowercase());
                 let stored = !istore
                     .range_entries(&unique_probe_bound(&prefix))?
                     .is_empty();
@@ -5616,7 +6054,7 @@ impl Engine {
             // §3). For a no-PK table the synthetic rowid is allocated in phase 2; only the key
             // LENGTH feeds the plan, so an 8-byte placeholder stands in deterministically.
             {
-                let store = self.store(table);
+                let store = self.store_scoped(db_scope, table);
                 let placeholder = [0u8; 8];
                 let kb: &[u8] = key.as_deref().unwrap_or(&placeholder);
                 cunits += store.write_compress_units(kb, &row) as i64;
@@ -5745,7 +6183,7 @@ impl Engine {
         // secondary-index entries are computed against its final key (the rowid included)
         // and written after the rows (indexes.md §4 — an index write cannot fail, so
         // all-or-nothing is unchanged).
-        let store = self.store_mut(table);
+        let store = self.store_mut_scoped(db_scope, table);
         let mut index_inserts: Vec<Vec<Vec<u8>>> = vec![Vec::new(); indexes.len()];
         for (key, row) in prepared {
             let key = key.unwrap_or_else(|| encode_int(ScalarType::Int64, store.alloc_rowid()));
@@ -5768,7 +6206,7 @@ impl Engine {
             }
         }
         for (k, def) in indexes.iter().enumerate() {
-            let istore = self.index_store_mut(&def.name.to_ascii_lowercase());
+            let istore = self.index_store_mut_scoped(db_scope, &def.name.to_ascii_lowercase());
             for ek in index_inserts[k].drain(..) {
                 if !istore.insert(ek, Vec::new())? {
                     // A cross-sub-statement unique-index collision under the read pin (as above).
@@ -6470,6 +6908,7 @@ impl Engine {
     fn run_insert_rows(
         &mut self,
         table: &str,
+        db_scope: Option<&str>,
         columns: &[Column],
         pk: &[(usize, Type)],
         checks: &[(String, RExpr)],
@@ -6484,6 +6923,9 @@ impl Engine {
         meter: &mut Meter,
     ) -> Result<(i64, Option<Vec<Vec<Value>>>)> {
         match conflict {
+            // ON CONFLICT is reached only for a reserved scope (an attachment target is 0A000 in
+            // `execute_insert`), where the bare temp-first funnels resolve the store correctly, so the
+            // conflict path takes no `db_scope`.
             Some(plan) => self.insert_rows_on_conflict(
                 table,
                 columns,
@@ -6503,6 +6945,7 @@ impl Engine {
                 let inserted = rows.len() as i64;
                 let returned = self.insert_rows(
                     table,
+                    db_scope,
                     columns,
                     pk,
                     checks,
@@ -6591,14 +7034,21 @@ impl Engine {
     /// remove them. No WHERE deletes every row. Keys are collected before mutating
     /// so the map is not modified while iterating.
     fn execute_delete(&mut self, del: Delete, params: &[Value], ctx: CteCtx) -> Result<Outcome> {
+        // A write to a READ-ONLY host attachment is 25006 before any I/O — BEFORE the existence gate (§4).
+        self.check_attachment_writable(del.db.as_deref())?;
         // Validate an optional database qualifier on the target (attached-databases.md §3).
         self.check_table_qualifier(del.db.as_deref(), &del.table)?;
-        let table = self.table(&del.table).ok_or_else(|| {
-            EngineError::new(
-                SqlState::UndefinedTable,
-                format!("table does not exist: {}", del.table),
-            )
-        })?;
+        // A host-attached target full-scans this slice (attached-databases.md §8) — a bounded scan
+        // would resolve its index store through the unscoped funnel. All bounds are gated off below.
+        let del_is_attach = is_attachment_scope(del.db.as_deref());
+        let table = self
+            .table_scoped(del.db.as_deref(), &del.table)
+            .ok_or_else(|| {
+                EngineError::new(
+                    SqlState::UndefinedTable,
+                    format!("table does not exist: {}", del.table),
+                )
+            })?;
         // Refuse the write if any collated key is version-skewed (slice 2d, collation.md §12, XX002):
         // a DELETE must locate + remove a stored key, which a skewed encoding cannot match.
         self.ensure_collations_writable(&table.columns)?;
@@ -6682,11 +7132,14 @@ impl Engine {
         // A primary-key bound seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
         // scan"); an empty bound deletes nothing. The whole WHERE stays the residual filter below.
         // page_read per visited node (block, before the rows), then storage_row_read per scanned row.
-        let pk_bound = match (&filter, pk_info) {
+        // A host-attached target full-scans this slice (attached-databases.md §8): every index/PK bound
+        // is gated off, so the delete takes the full-scan arm below (the bounded exec would resolve its
+        // index store through the unscoped funnel — index accel for attachments is a perf follow-on).
+        let pk_bound = match (del_is_attach, &filter, pk_info) {
             // A collated `Skewed` PK refuses pushdown (`key_collation_ctx` → `None`) — though a
             // skewed table's write is already refused `XX002` upstream (`ensure_collations_writable`),
             // so this is reached only for a `C` or `Full`-collated PK (collation.md §8/§12).
-            (Some(f), Some((pk_idx, pk_ty))) => {
+            (false, Some(f), Some((pk_idx, pk_ty))) => {
                 match key_collation_ctx(self, &table.columns[pk_idx]) {
                     Some(coll) => detect_pk_bound(f, pk_idx, pk_ty, coll),
                     None => None,
@@ -6699,21 +7152,21 @@ impl Engine {
         // scan through the index instead of a full scan. A mutation uses PK-then-GIN-then-full —
         // the ordered-index equality bound stays SELECT-only (a follow-on). `tcolumns` is the full
         // column list whenever the table has any index, so it is populated when a GIN index exists.
-        let gin_bound = match (&filter, &pk_bound) {
-            (Some(f), None) => detect_gin_bound(f, &indexes, &tcolumns, 0),
+        let gin_bound = match (del_is_attach, &filter, &pk_bound) {
+            (false, Some(f), None) => detect_gin_bound(f, &indexes, &tcolumns, 0),
             _ => None,
         };
         // GiST bound (gist.md §5): when neither a PK nor a GIN bound applies, a `&&`/`@>` conjunct
         // over a GiST-indexed range column bounds the delete's target scan via the resident R-tree.
-        let gist_bound = match (&filter, &pk_bound, &gin_bound) {
-            (Some(f), None, None) => detect_gist_bound(f, &indexes, &tcolumns, 0),
+        let gist_bound = match (del_is_attach, &filter, &pk_bound, &gin_bound) {
+            (false, Some(f), None, None) => detect_gist_bound(f, &indexes, &tcolumns, 0),
             _ => None,
         };
         // Merged PK point-set (cost.md §3 "OR / IN-list") — LAST RESORT for a mutation, after
         // PK/GIN/GiST. A secondary-index point-set for DML is a separate follow-on, so mutations
         // bound only by the primary key here.
-        let pk_set = match (&filter, &pk_bound, &gin_bound, &gist_bound) {
-            (Some(f), None, None, None) => self.pk_set_for(table, Some(f)),
+        let pk_set = match (del_is_attach, &filter, &pk_bound, &gin_bound, &gist_bound) {
+            (false, Some(f), None, None, None) => self.pk_set_for(table, Some(f)),
             _ => None,
         };
         // DELETE's touched set (cost.md §3): the filter's columns plus the RETURNING items'
@@ -6738,8 +7191,9 @@ impl Engine {
             // Top-level statement: no enclosing query, so the bound never has a correlated source.
             (Some(bp), _, _, _) => match build_key_bound(bp, &bound, &[], &[]) {
                 Some(b) => {
-                    let (entries, pages, slabs) =
-                        self.store(&del.table).range_scan_with_units(&b, &mask)?;
+                    let (entries, pages, slabs) = self
+                        .store_scoped(del.db.as_deref(), &del.table)
+                        .range_scan_with_units(&b, &mask)?;
                     (entries, (pages, slabs))
                 }
                 None => (Vec::new(), (0, 0)),
@@ -6763,16 +7217,18 @@ impl Engine {
             // the distinct sorted keys; whole rows so index entries can be removed. The predicate
             // stays the residual filter below.
             (None, None, None, Some(ks)) => {
-                let store = self.store(&del.table);
+                let store = self.store_scoped(del.db.as_deref(), &del.table);
                 self.pk_key_set_rows(store, ks, &bound, &[], &mask, &[], false)?
             }
             (None, None, None, None) => {
-                let (entries, pages, slabs) = self.store(&del.table).scan_with_units(&mask)?;
+                let (entries, pages, slabs) = self
+                    .store_scoped(del.db.as_deref(), &del.table)
+                    .scan_with_units(&mask)?;
                 (entries, (pages, slabs))
             }
         };
         meter.charge(COSTS.page_read * overlap as i64 + COSTS.value_decompress * slabs as i64);
-        let store = self.store(&del.table);
+        let store = self.store_scoped(del.db.as_deref(), &del.table);
         for (k, mut row) in entries {
             meter.guard()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
             meter.charge(COSTS.storage_row_read);
@@ -6842,12 +7298,13 @@ impl Engine {
 
         // Phase 2: remove the rows, then their secondary-index entries (indexes.md §4 —
         // unmetered write work; an index removal cannot fail).
-        let store = self.store_mut(&del.table);
+        let store = self.store_mut_scoped(del.db.as_deref(), &del.table);
         for (k, _) in &matched {
             store.remove(k)?;
         }
         for def in &indexes {
-            let istore = self.index_store_mut(&def.name.to_ascii_lowercase());
+            let istore =
+                self.index_store_mut_scoped(del.db.as_deref(), &def.name.to_ascii_lowercase());
             for (k, row) in &matched {
                 for ek in index_entry_keys(&tcolumns, &colls, def, k, row)? {
                     istore.remove(&ek)?;
@@ -6877,14 +7334,20 @@ impl Engine {
     /// traps `23505` (`<table>_pkey`). A duplicate target column traps `42701`. No WHERE
     /// updates every row.
     fn execute_update(&mut self, upd: Update, params: &[Value], ctx: CteCtx) -> Result<Outcome> {
+        // A write to a READ-ONLY host attachment is 25006 before any I/O — BEFORE the existence gate (§4).
+        self.check_attachment_writable(upd.db.as_deref())?;
         // Validate an optional database qualifier on the target (attached-databases.md §3).
         self.check_table_qualifier(upd.db.as_deref(), &upd.table)?;
-        let table = self.table(&upd.table).ok_or_else(|| {
-            EngineError::new(
-                SqlState::UndefinedTable,
-                format!("table does not exist: {}", upd.table),
-            )
-        })?;
+        // A host-attached target full-scans this slice (attached-databases.md §8) — bounds gated below.
+        let upd_is_attach = is_attachment_scope(upd.db.as_deref());
+        let table = self
+            .table_scoped(upd.db.as_deref(), &upd.table)
+            .ok_or_else(|| {
+                EngineError::new(
+                    SqlState::UndefinedTable,
+                    format!("table does not exist: {}", upd.table),
+                )
+            })?;
         // Refuse the write if any collated key is version-skewed (slice 2d, collation.md §12, XX002):
         // an UPDATE re-encodes + re-places keys, which a skewed encoding would corrupt.
         self.ensure_collations_writable(&table.columns)?;
@@ -7078,13 +7541,18 @@ impl Engine {
         // A primary-key bound seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
         // scan"); an empty bound updates nothing. The whole WHERE stays the residual filter below.
         // page_read per visited node (block, before the rows), then storage_row_read per scanned row.
-        let pk_bound = match (&filter, pk_info) {
+        // A host-attached target full-scans this slice (attached-databases.md §8): every index/PK bound
+        // is gated off so the update takes the full-scan arm (the bounded exec would resolve its index
+        // store through the unscoped funnel — index accel for attachments is a perf follow-on).
+        let pk_bound = match (upd_is_attach, &filter, pk_info) {
             // A collated `Skewed` PK refuses pushdown (`key_collation_ctx` → `None`); a skewed
             // table's write is already refused `XX002` upstream, so this is a `C`/`Full`-collated PK.
-            (Some(f), Some((pk_i, pk_ty))) => match key_collation_ctx(self, &table.columns[pk_i]) {
-                Some(coll) => detect_pk_bound(f, pk_i, pk_ty, coll),
-                None => None,
-            },
+            (false, Some(f), Some((pk_i, pk_ty))) => {
+                match key_collation_ctx(self, &table.columns[pk_i]) {
+                    Some(coll) => detect_pk_bound(f, pk_i, pk_ty, coll),
+                    None => None,
+                }
+            }
             _ => None,
         };
         // GIN bound (gin.md §6): when no PK bound applies, a GIN-accelerable WHERE conjunct
@@ -7092,23 +7560,23 @@ impl Engine {
         // scan through the index instead of a full scan (PK-then-GIN-then-full; the ordered-index
         // bound stays SELECT-only). The bound is over the PRE-update index state (the WHERE reads
         // the old row), so it admits exactly the rows the full scan would match.
-        let gin_bound = match (&filter, &pk_bound) {
-            (Some(f), None) => detect_gin_bound(f, &indexes, &tcolumns, 0),
+        let gin_bound = match (upd_is_attach, &filter, &pk_bound) {
+            (false, Some(f), None) => detect_gin_bound(f, &indexes, &tcolumns, 0),
             _ => None,
         };
         // GiST bound (gist.md §5): when neither a PK nor a GIN bound applies, a `&&`/`@>` conjunct
         // over a GiST-indexed range column bounds the update's target scan via the resident R-tree
         // (over the pre-update index state — the WHERE reads the old row, so it admits exactly the
         // rows the full scan would match).
-        let gist_bound = match (&filter, &pk_bound, &gin_bound) {
-            (Some(f), None, None) => detect_gist_bound(f, &indexes, &tcolumns, 0),
+        let gist_bound = match (upd_is_attach, &filter, &pk_bound, &gin_bound) {
+            (false, Some(f), None, None) => detect_gist_bound(f, &indexes, &tcolumns, 0),
             _ => None,
         };
         // Merged PK point-set (cost.md §3 "OR / IN-list") — LAST RESORT for a mutation, after
         // PK/GIN/GiST. A secondary-index point-set for DML is a separate follow-on, so mutations
         // bound only by the primary key here.
-        let pk_set = match (&filter, &pk_bound, &gin_bound, &gist_bound) {
-            (Some(f), None, None, None) => self.pk_set_for(table, Some(f)),
+        let pk_set = match (upd_is_attach, &filter, &pk_bound, &gin_bound, &gist_bound) {
+            (false, Some(f), None, None, None) => self.pk_set_for(table, Some(f)),
             _ => None,
         };
         // UPDATE's touched set (cost.md §3): the filter's columns, every assignment SOURCE's,
@@ -7139,8 +7607,9 @@ impl Engine {
             // Top-level statement: no enclosing query, so the bound never has a correlated source.
             (Some(bp), _, _, _) => match build_key_bound(bp, &bound, &[], &[]) {
                 Some(b) => {
-                    let (entries, pages, slabs) =
-                        self.store(&upd.table).range_scan_with_units(&b, &mask)?;
+                    let (entries, pages, slabs) = self
+                        .store_scoped(upd.db.as_deref(), &upd.table)
+                        .range_scan_with_units(&b, &mask)?;
                     (entries, (pages, slabs))
                 }
                 None => (Vec::new(), (0, 0)),
@@ -7164,16 +7633,18 @@ impl Engine {
             // the distinct sorted keys; whole rows so the rewrite can re-key / update index entries.
             // The predicate stays the residual filter below.
             (None, None, None, Some(ks)) => {
-                let store = self.store(&upd.table);
+                let store = self.store_scoped(upd.db.as_deref(), &upd.table);
                 self.pk_key_set_rows(store, ks, &bound, &[], &mask, &[], false)?
             }
             (None, None, None, None) => {
-                let (entries, pages, slabs) = self.store(&upd.table).scan_with_units(&mask)?;
+                let (entries, pages, slabs) = self
+                    .store_scoped(upd.db.as_deref(), &upd.table)
+                    .scan_with_units(&mask)?;
                 (entries, (pages, slabs))
             }
         };
         meter.charge(COSTS.page_read * overlap as i64 + COSTS.value_decompress * slabs as i64);
-        let store = self.store(&upd.table);
+        let store = self.store_scoped(upd.db.as_deref(), &upd.table);
         for (key, mut row) in entries {
             meter.guard()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
             meter.charge(COSTS.storage_row_read);
@@ -7232,7 +7703,7 @@ impl Engine {
         if pk_changed {
             let rewritten: HashSet<&[u8]> =
                 updates.iter().map(|(k, _, _, _)| k.as_slice()).collect();
-            let store = self.store(&upd.table);
+            let store = self.store_scoped(upd.db.as_deref(), &upd.table);
             let mut batch: HashSet<&[u8]> = HashSet::new();
             for (_, new_key, _, _) in &updates {
                 let collides = !batch.insert(new_key.as_slice())
@@ -7260,7 +7731,8 @@ impl Engine {
             let rewritten: HashSet<&[u8]> =
                 updates.iter().map(|(k, _, _, _)| k.as_slice()).collect();
             for def in indexes.iter().filter(|d| d.unique) {
-                let istore = self.index_store(&def.name.to_ascii_lowercase());
+                let istore =
+                    self.index_store_scoped(upd.db.as_deref(), &def.name.to_ascii_lowercase());
                 let mut batch: HashSet<Vec<u8>> = HashSet::new();
                 for (_, _, new_row, _) in &updates {
                     let Some(prefix) = index_prefix_key(&tcolumns, &colls, def, new_row)? else {
@@ -7472,7 +7944,7 @@ impl Engine {
         // Each rewritten row's disposition plan may attempt compression (a record over
         // RECORD_MAX) — meter the attempts (value_compress, cost.md §3) and enforce the
         // ceiling BEFORE phase 2 writes anything, preserving all-or-nothing.
-        let store = self.store(&upd.table);
+        let store = self.store_scoped(upd.db.as_deref(), &upd.table);
         let mut cunits: i64 = 0;
         for (_, new_key, row, _) in &updates {
             cunits += store.write_compress_units(new_key, row) as i64;
@@ -7534,7 +8006,7 @@ impl Engine {
         // removals across rows, then all insertions), since a moved row's new entry can equal
         // another moved row's not-yet-removed old entry.
         let updated = updates.len() as i64;
-        let store = self.store_mut(&upd.table);
+        let store = self.store_mut_scoped(upd.db.as_deref(), &upd.table);
         if pk_changed {
             let relation_lc = relation.to_ascii_lowercase();
             for (old_key, _, _, _) in &updates {
@@ -7555,7 +8027,8 @@ impl Engine {
                 }
             }
             for (k, def) in indexes.iter().enumerate() {
-                let istore = self.index_store_mut(&def.name.to_ascii_lowercase());
+                let istore =
+                    self.index_store_mut_scoped(upd.db.as_deref(), &def.name.to_ascii_lowercase());
                 for (removals, _) in &index_moves[k] {
                     for old_ek in removals {
                         istore.remove(old_ek)?;
@@ -7581,7 +8054,8 @@ impl Engine {
                 store.replace(&key, row)?;
             }
             for (k, def) in indexes.iter().enumerate() {
-                let istore = self.index_store_mut(&def.name.to_ascii_lowercase());
+                let istore =
+                    self.index_store_mut_scoped(upd.db.as_deref(), &def.name.to_ascii_lowercase());
                 for (removals, insertions) in index_moves[k].drain(..) {
                     for old_ek in removals {
                         istore.remove(&old_ek)?;
@@ -8694,27 +9168,31 @@ impl Engine {
                 derived_plans.push(None);
                 src = RelSrc::Synthetic(si);
             } else if tref.db.is_some() {
-                // A database-QUALIFIED name reaches an attachment's table directly
+                // A database-QUALIFIED name reaches its database's table directly
                 // (attached-databases.md §3): it never resolves to a CTE (a CTE has no database
                 // qualifier, so `main.x`/`temp.x` cannot name one) and the qualifier fixes the scope
-                // (no temp-vs-persistent shadow). Validate the qualifier against the implicit scope,
-                // then resolve through the temp-first funnel (which, by preclude-overlaps, lands in the
-                // validated scope).
+                // (no temp-vs-persistent shadow). Validate the qualifier, then resolve via the SCOPED
+                // funnel — a host attachment's table lives ONLY in its own snapshot, so the bare
+                // temp-first `table()` would 42P01 (Slice 1a's read-path bug); `main`/`temp` fall
+                // through by preclude-overlaps to the validated scope.
                 lateral_flags.push(false);
                 srf_meta.push(None);
                 derived_meta.push(None);
                 derived_plans.push(None);
                 self.check_table_qualifier(tref.db.as_deref(), &tref.name)?;
-                src = RelSrc::Base(self.table(&tref.name).ok_or_else(|| {
-                    EngineError::new(
-                        SqlState::UndefinedTable,
-                        format!(
-                            "table does not exist: {}.{}",
-                            tref.db.as_deref().unwrap_or_default(),
-                            tref.name
-                        ),
-                    )
-                })?);
+                src = RelSrc::Base(
+                    self.table_scoped(tref.db.as_deref(), &tref.name)
+                        .ok_or_else(|| {
+                            EngineError::new(
+                                SqlState::UndefinedTable,
+                                format!(
+                                    "table does not exist: {}.{}",
+                                    tref.db.as_deref().unwrap_or_default(),
+                                    tref.name
+                                ),
+                            )
+                        })?,
+                );
             } else {
                 // A base table NAME — may resolve to a CTE, which SHADOWS a catalog table of the same
                 // name (cte.md §2; case-insensitive). A CTE hit bumps the binding's reference count
@@ -8775,7 +9253,12 @@ impl Engine {
                     format!("table name {label} specified more than once"),
                 ));
             }
-            finalized.push(FinalRel { label, offset, src });
+            finalized.push(FinalRel {
+                label,
+                offset,
+                src,
+                db: tref.db.clone(),
+            });
             offset += col_count;
         }
         // Assemble the persistent scope: every synthetic table now has a stable address (no more
@@ -8791,6 +9274,7 @@ impl Engine {
                     RelSrc::Cte(_, ci) => Some(ci),
                     _ => None,
                 },
+                db: fr.db.clone(),
             })
             .collect();
 
@@ -9723,6 +10207,7 @@ impl Engine {
             .enumerate()
             .map(|(i, r)| PlanRel {
                 table_name: r.table.name.clone(),
+                db: r.db.clone(),
                 offset: r.offset,
                 col_count: r.table.columns.len(),
                 srf: srf_plans[i].take(),
@@ -9902,6 +10387,9 @@ impl Engine {
             && rels[0].cte.is_none()
             && rels[0].derived.is_none()
             && rel_bounds[0].is_none()
+            // A host-attached relation full-scans this slice (attached-databases.md §8): the
+            // index-order exec resolves its index store UNSCOPED, so gate it off (perf follow-on).
+            && !scope.rels[0].is_attachment()
         {
             order_satisfied_by_index(scope.rels[0].table, rels[0].offset, &order, self)
         } else {
@@ -10879,7 +11367,7 @@ impl Engine {
         meter: &mut Meter,
         params: &[Value],
     ) -> Result<SelectResult> {
-        let store = self.store(&plan.rels[0].table_name);
+        let store = self.store_scoped(plan.rels[0].db.as_deref(), &plan.rels[0].table_name);
         // A `pk_reverse` plan (ORDER BY the full PK all-DESC) walks the tree backward; everything
         // else (forward `pk_ordered`, or the no-ORDER-BY LIMIT short-circuit) walks forward.
         let reverse = plan.pk_reverse;
@@ -11039,7 +11527,7 @@ impl Engine {
         if !plan.window_keys.is_empty() || !plan.order_exprs.is_empty() {
             return false;
         }
-        let Some(table) = self.table(&rel.table_name) else {
+        let Some(table) = self.table_scoped(rel.db.as_deref(), &rel.table_name) else {
             return false;
         };
         plan.window_specs
@@ -11107,7 +11595,7 @@ impl Engine {
         meter: &mut Meter,
         params: &[Value],
     ) -> Result<Emitter> {
-        let store = self.store(&plan.rels[0].table_name);
+        let store = self.store_scoped(plan.rels[0].db.as_deref(), &plan.rels[0].table_name);
         let reverse = plan.pk_reverse;
 
         let (bound, empty) = match &plan.rel_bounds[0] {
@@ -11222,6 +11710,10 @@ impl Engine {
         dst.session_seq = src.session_seq.clone(); // currval/lastval reads stay faithful
         dst.session_last_name = src.session_last_name.clone();
         dst.temp_committed = self.temp_read_snap().clone();
+        // The frozen read engine carries the same pinned attachment view so a streaming read of an
+        // attached database (attached-databases.md §5) resolves through it; it never commits
+        // (read-only), so it needs no core back-ref (`core` stays `None`).
+        e.attached_committed = self.attach_read_view();
         e
     }
 
@@ -11338,12 +11830,12 @@ impl Engine {
             let (overlap, slabs) = if empty {
                 (0, 0)
             } else {
-                snap.store(&plan.rels[0].table_name)
+                snap.store_scoped(plan.rels[0].db.as_deref(), &plan.rels[0].table_name)
                     .overlap_scan_units(&bound, &plan.rel_masks[0])?
             };
             // cursor is `'static`, so it owns the mask.
             let scan = snap
-                .store(&plan.rels[0].table_name)
+                .store_scoped(plan.rels[0].db.as_deref(), &plan.rels[0].table_name)
                 .store_scan(bound, reverse);
             let mut meter = snap.session.new_meter();
             meter.accrued = subquery_cost; // the folded constant cost (lifetime already charged)
@@ -11501,7 +11993,7 @@ impl Engine {
         env: &EvalEnv,
         meter: &mut Meter,
     ) -> Result<SelectResult> {
-        let store = self.store(&plan.rels[0].table_name);
+        let store = self.store_scoped(plan.rels[0].db.as_deref(), &plan.rels[0].table_name);
         let istore = self.index_store(&io.name_key);
         // Up-front index-tree page_read (the full block; the index store has no payload, so no slabs).
         meter.charge(COSTS.page_read * istore.node_count() as i64);
@@ -11580,7 +12072,7 @@ impl Engine {
         meter: &mut Meter,
         params: &[Value],
     ) -> Result<Emitter> {
-        let store = self.store(&plan.rels[0].table_name);
+        let store = self.store_scoped(plan.rels[0].db.as_deref(), &plan.rels[0].table_name);
 
         // Resolve the scan bound (the PK pushdown, if any) and charge the page_read +
         // value_decompress block up front — identical to the eager scan (cost.md §3). An INDEX
@@ -11879,7 +12371,7 @@ impl Engine {
         // of a full walk; an empty bound reads nothing. An index-nested-loop bound (`rel_inl_bounds`)
         // takes precedence and resolves its `Sibling` source from the current left row (cost.md §3
         // "JOIN"); else the once-materialized `rel_bounds`.
-        let store = self.store(&rel.table_name);
+        let store = self.store_scoped(rel.db.as_deref(), &rel.table_name);
         let bound = plan.rel_inl_bounds[ri]
             .as_ref()
             .or(plan.rel_bounds[ri].as_ref());
@@ -12134,7 +12626,7 @@ impl Engine {
         meter: &mut Meter,
     ) -> Result<Option<Emitter>> {
         let rel = &plan.rels[0];
-        let store = self.store(&rel.table_name);
+        let store = self.store_scoped(rel.db.as_deref(), &rel.table_name);
         // File-backed only: an in-memory store's row path is already zero-copy.
         if !store.is_file_backed() {
             return Ok(None);
@@ -12267,7 +12759,7 @@ impl Engine {
                 if gset.slot_src.len() != 1 || gset.slot_src[0] != Some(0) {
                     return false;
                 }
-                let store = self.store(&rel.table_name);
+                let store = self.store_scoped(rel.db.as_deref(), &rel.table_name);
                 let ord = gset.key_cols[0].wrapping_sub(rel.offset);
                 match store.col_types().get(ord) {
                     Some(ColType::Scalar(s)) if s.is_integer() => {}
@@ -12397,7 +12889,7 @@ impl Engine {
         meter: &mut Meter,
     ) -> Result<Option<Vec<Vec<Value>>>> {
         let rel = &plan.rels[0];
-        let store = self.store(&rel.table_name);
+        let store = self.store_scoped(rel.db.as_deref(), &rel.table_name);
         // File-backed only: an in-memory store's row path is already zero-copy.
         if !store.is_file_backed() {
             return Ok(None);
@@ -14143,6 +14635,38 @@ struct ScopeRel<'a> {
     /// base table — its `table` is the binding's synthetic relation and exec delivers its rows from
     /// the `CteCtx`. `None` for a base table / SRF / pseudo-relation.
     cte: Option<usize>,
+    /// The relation's explicit database qualifier (attached-databases.md §3), carried from the
+    /// `TableRef` so the store is re-looked-up in the right database at exec (a store is resolved by
+    /// name per-access). `None` for a bare (implicit-scope) name — then the scoped funnels fall through
+    /// to the temp-first walk, so this is behavior-neutral for every unqualified query.
+    db: Option<String>,
+}
+
+impl ScopeRel<'_> {
+    /// Whether this relation targets a HOST-ATTACHED database (attached-databases.md §3) rather than
+    /// the implicit `main`/`temp` scope. Index/PK/GiST/GIN bound pushdown is gated OFF for an attachment
+    /// relation this slice — the bounded-scan exec path resolves index stores through the UNSCOPED
+    /// funnel, so an attachment relation must full-scan (correct, perf-only — index acceleration for
+    /// attachments is a Slice 1b perf follow-on). A full scan reads the scoped store.
+    fn is_attachment(&self) -> bool {
+        is_attachment_scope(self.db.as_deref())
+    }
+}
+
+/// Whether a database qualifier names one of the two implicit reserved scopes `main` / `temp`
+/// (attached-databases.md §3), which resolve to the SAME store the bare name would. A `None` qualifier
+/// (a bare implicit-scope name) counts as reserved for routing: it too keeps the temp-first funnels.
+fn is_reserved_scope(q: Option<&str>) -> bool {
+    match q {
+        None => true,
+        Some(s) => matches!(s.to_ascii_lowercase().as_str(), "main" | "temp"),
+    }
+}
+
+/// Whether a database qualifier names a HOST-ATTACHED database (not `None`, not reserved `main`/`temp`)
+/// — the case that routes to the attachment registry and gates off index-bound pushdown this slice.
+fn is_attachment_scope(q: Option<&str>) -> bool {
+    !is_reserved_scope(q)
 }
 
 /// Where a finalized FROM relation's `&Table` comes from, recorded during the LATERAL-aware FROM
@@ -14164,6 +14688,10 @@ struct FinalRel<'a> {
     label: String,
     offset: usize,
     src: RelSrc<'a>,
+    /// The relation's explicit database qualifier (attached-databases.md §3), carried from the
+    /// `TableRef` into the `ScopeRel`/`PlanRel` so the store routes to the right database at exec.
+    /// `None` for a bare (implicit-scope) name / a synthetic relation.
+    db: Option<String>,
 }
 
 impl<'a> FinalRel<'a> {
@@ -14201,6 +14729,7 @@ fn build_prefix_scope<'s>(
                 // The prefix is only for column resolution; a correlated reference into a CTE-backed
                 // relation reads its already-delivered row, so it adds no CTE reference here.
                 cte: None,
+                db: fr.db.clone(),
             })
             .collect(),
         parent,
@@ -14324,6 +14853,7 @@ impl<'a> Scope<'a> {
                 offset: 0,
                 qualifier_only: false,
                 cte: None,
+                db: None,
             }],
             parent: None,
             catalog,
@@ -14369,6 +14899,7 @@ impl<'a> Scope<'a> {
             offset: 0,
             qualifier_only: false,
             cte: None,
+            db: None,
         }];
         for (pseudo, offset) in [("old", old_offset), ("new", new_offset)] {
             if label != pseudo {
@@ -14378,6 +14909,7 @@ impl<'a> Scope<'a> {
                     offset,
                     qualifier_only: true,
                     cte: None,
+                    db: None,
                 });
             }
         }
@@ -14407,6 +14939,7 @@ impl<'a> Scope<'a> {
             offset: 0,
             qualifier_only: false,
             cte: None,
+            db: None,
         }];
         if label != "excluded" {
             rels.push(ScopeRel {
@@ -14415,6 +14948,7 @@ impl<'a> Scope<'a> {
                 offset: n,
                 qualifier_only: true,
                 cte: None,
+                db: None,
             });
         }
         Scope {
@@ -16338,6 +16872,10 @@ fn resolved_range_element_scalar(elem: &ResolvedType) -> Option<ScalarType> {
 /// the executor generates the rows instead of scanning (spec/design/functions.md §10).
 struct PlanRel {
     table_name: String,
+    /// The relation's explicit database qualifier (attached-databases.md §3), passed to the scope-aware
+    /// store funnels at exec (`store_scoped` etc.). `None` for a bare implicit-scope name → the funnels
+    /// fall through to the temp-first walk (behavior-neutral for every unqualified query).
+    db: Option<String>,
     offset: usize,
     col_count: usize,
     srf: Option<SrfPlan>,
@@ -17514,6 +18052,11 @@ fn build_index_access_predicate(
 /// tie-break), the first that yields a non-empty access predicate
 /// ([`build_index_access_predicate`]); else `None` (full scan).
 fn detect_scan_bound(filter: &RExpr, rel: &ScopeRel, catalog: &Engine) -> Option<ScanBound> {
+    // A host-attached relation full-scans this slice (attached-databases.md §8): the bounded-scan exec
+    // path resolves index stores UNSCOPED, so no PK/index/GiST/GIN bound may apply to an attachment.
+    if rel.is_attachment() {
+        return None;
+    }
     if let Some(b) = rel.table.primary_key_index().and_then(|pk_local| {
         // Ordered-equality pushdown is scalar-only; a non-scalar (range) PK skips it (point-lookup
         // deferred for containers — ranges.md §10), falling through to a full scan + residual filter.
@@ -17692,6 +18235,12 @@ fn detect_inl_bound(
     rel: &ScopeRel,
     catalog: &Engine,
 ) -> Option<ScanBound> {
+    // A host-attached inner relation full-scans per outer row this slice (attached-databases.md §8):
+    // the seek would resolve its index store unscoped. Index-nested-loop over an attachment is a
+    // perf follow-on.
+    if rel.is_attachment() {
+        return None;
+    }
     let cutoff = Some(rel.offset);
     // Collect the key's bound terms from BOTH the ON and the WHERE (a NULL predicate contributes
     // none), with sibling columns admitted.

@@ -56,7 +56,7 @@
 //! return it. The [`Database`] (the `Send + Sync` core, the old `Database`) is reached via
 //! [`Database::core`] for genuine concurrency (it is what crosses threads and mints sessions).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
@@ -110,8 +110,72 @@ impl LiveRegistry {
 /// a second published root can be re-added without reshaping the pin discipline.)
 struct Roots {
     /// The committed FILE snapshot — what fresh readers (and autocommit reads) see, and what is
-    /// (eventually) serialized.
+    /// (eventually) serialized (the `main` database).
     committed: Arc<Snapshot>,
+    /// The published committed root of every host-attached DATABASE-scoped in-memory database
+    /// (spec/design/attached-databases.md §5), keyed by lowercased attachment name. A reader pins the
+    /// whole `Roots` under one read lock, so it sees a CONSISTENT cross-database snapshot (main + every
+    /// attachment together). Empty when nothing is attached — the common case, byte-for-byte the
+    /// pre-attachment behavior. Session-local `temp` is NOT here (it is session-private, held on the
+    /// `Engine`/`SessionState`); only DATABASE-scoped roots are published. The N-root commit
+    /// (attached-databases.md §5) swaps `committed` + this map together under one write lock.
+    attached: HashMap<String, Arc<Snapshot>>,
+}
+
+/// An attachment's write disposition (spec/design/attached-databases.md §4). A read-only attachment
+/// rejects every write (DML + DDL) with `25006` before any I/O — the natural mode for a reference
+/// database — and never competes for the one-durable-writer slot (§5).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttachMode {
+    ReadWrite,
+    ReadOnly,
+}
+
+/// One host-attached DATABASE-scoped database in a handle's namespace (attached-databases.md §2): a
+/// named (storage, published-root) quad reachable by a database qualifier. The mutable storage
+/// identity (page accounting, writer-gated) lives here; the immutable committed snapshot lives in
+/// [`Roots::attached`] under the same key so a reader pins it lock-free with every other root. In
+/// Slice 1b every attachment is in-memory (a `MemoryBlockStore`; a file source is deferred to Slice 2).
+pub(crate) struct Attachment {
+    /// Lowercased qualifier name (the map key).
+    #[allow(dead_code)]
+    name: String,
+    mode: AttachMode,
+    /// The in-memory block store + pager + page accounting (the temp-domain recipe).
+    storage: Storage,
+}
+
+/// Selects the backing for a database attached via [`Database::attach`]
+/// (spec/design/attached-databases.md §4). A stable memory|file variant from Slice 1b: only a MEMORY
+/// source is supported now (a fresh, empty in-memory database); a FILE source is reserved for Slice 2
+/// and currently returns `0A000`, so the `attach` signature never changes when file attach lands.
+/// Build one with [`AttachSource::memory`] or [`AttachSource::file`].
+#[derive(Clone, Debug)]
+pub struct AttachSource {
+    /// `false` = in-memory (Slice 1b); `true` = file-backed (Slice 2, `0A000` for now).
+    file: bool,
+    /// The file path, when `file` is true.
+    #[allow(dead_code)]
+    path: Option<std::path::PathBuf>,
+}
+
+impl AttachSource {
+    /// A source for a fresh, empty in-memory attachment (attached-databases.md §6).
+    pub fn memory() -> AttachSource {
+        AttachSource {
+            file: false,
+            path: None,
+        }
+    }
+
+    /// A source for a file-backed attachment. Reserved for Slice 2: [`Database::attach`] with a file
+    /// source is currently `0A000` (feature_not_supported).
+    pub fn file<P: AsRef<Path>>(path: P) -> AttachSource {
+        AttachSource {
+            file: true,
+            path: Some(path.as_ref().to_path_buf()),
+        }
+    }
 }
 
 /// The **storage identity** of a database (spec/design/session.md §2.4; bplus-reshape.md B3): the
@@ -259,7 +323,7 @@ impl Storage {
 /// The thread-safe core shared by every [`Database`] clone (CLAUDE.md §3). Holds the published
 /// committed root, the single-writer gate, the live-reader registry, and (file-backed) the
 /// storage identity.
-struct Shared {
+pub(crate) struct Shared {
     /// The published committed root (the file snapshot). A reader pins it by cloning the `Arc` under a
     /// momentary read lock; a writer publishes a new one under a momentary write lock — the §3 short
     /// commit window. The `RwLock` is held only for the pointer clone/swap, never for query work.
@@ -273,6 +337,12 @@ struct Shared {
     /// The storage identity (§2.4) — since B3 every core has one (file- or memory-backed). Mutated
     /// only under the writer gate, so the `Mutex` never contends with the publish path.
     storage: Mutex<Storage>,
+    /// The registry of host-attached DATABASE-scoped databases (attached-databases.md §2/§5), keyed by
+    /// lowercased name. Each attachment's MUTABLE storage identity lives here; its immutable published
+    /// root lives in [`Roots::attached`] under the same key. Populated by [`Database::attach`] / cleared
+    /// by [`Database::detach`] (host-API, §4), both under the writer gate — so the `Mutex` never
+    /// contends. Empty when nothing is attached (the common case). Session-local temp is NOT here.
+    attachments: Mutex<HashMap<String, Attachment>>,
 }
 
 impl Shared {
@@ -302,6 +372,61 @@ impl Shared {
         r.committed.clone()
     }
 
+    /// Pin the whole `Roots` under one read lock (attached-databases.md §5): the committed file
+    /// snapshot together with the current attached roots, so a session captures a CONSISTENT
+    /// cross-database view (snapshot isolation across `main` + every attachment). Used at session mint
+    /// and per-autocommit-statement refresh; a single Load, never two racy reads.
+    fn pin_roots(&self) -> (Arc<Snapshot>, HashMap<String, Arc<Snapshot>>) {
+        let r = self.roots.read().expect("roots lock not poisoned");
+        (r.committed.clone(), r.attached.clone())
+    }
+
+    /// Whether any cross-session reader currently pins a committed snapshot (the live registry,
+    /// transactions.md §8). The within-session compaction watermark for a host attachment
+    /// (attached-databases.md §5): the committing writer holds the write gate but is not itself in
+    /// `live`, so an empty registry means no other session can observe a page the commit reclaims.
+    /// Also the [`Database::detach`] in-use gate (a live reader pins the whole roots → every
+    /// attachment).
+    pub(crate) fn has_live_readers(&self) -> bool {
+        self.live
+            .lock()
+            .expect("live lock not poisoned")
+            .oldest()
+            .is_some()
+    }
+
+    /// The mode of the host attachment named `name` (lowercased), or `None` if no such attachment —
+    /// the read-only write gate's inspection point ([`Engine::check_attachment_writable`]).
+    pub(crate) fn attachment_mode(&self, name: &str) -> Option<AttachMode> {
+        self.attachments
+            .lock()
+            .expect("attachments lock not poisoned")
+            .get(name)
+            .map(|a| a.mode)
+    }
+
+    /// Materialize a dirtied attachment's working snapshot into its in-RAM block store
+    /// (attached-databases.md §5, the N-root commit): the SAME incremental copy-on-write pack as temp
+    /// (`persist_temp` — NO fsync, an in-memory attachment has no durability barrier), watermark-gated
+    /// compaction via `can_reclaim`. Called from [`Engine::commit_tx`] under the writer gate, so the
+    /// storage mutation is single-writer. A detached-mid-transaction attachment (unreachable under the
+    /// gate) no-ops.
+    pub(crate) fn persist_attachment(
+        &self,
+        name: &str,
+        snap: &mut Snapshot,
+        can_reclaim: bool,
+    ) -> Result<()> {
+        let mut atts = self
+            .attachments
+            .lock()
+            .expect("attachments lock not poisoned");
+        if let Some(att) = atts.get_mut(name) {
+            att.storage.persist_temp(snap, can_reclaim)?;
+        }
+        Ok(())
+    }
+
     /// The current published committed (file) version (the monotonic commit counter).
     fn committed_version(&self) -> u64 {
         self.roots
@@ -326,10 +451,16 @@ impl Shared {
         })
     }
 
-    /// Publish the new committed root (the §3 commit window — a pointer swap under one write lock).
-    fn publish(&self, committed: Arc<Snapshot>) {
+    /// Publish the new committed root TOGETHER with the current attached roots (the §3 commit window +
+    /// the N-root commit, attached-databases.md §5) — one pointer/map swap under a single write lock, so
+    /// a reader pins a consistent cross-database snapshot. `attached` is the committing session's pinned
+    /// attachment view (unchanged attachments carry their prior root through; a dirtied one carries its
+    /// freshly-adopted root). An empty map (nothing attached) is byte-for-byte the pre-attachment
+    /// single-root publish.
+    fn publish(&self, committed: Arc<Snapshot>, attached: HashMap<String, Arc<Snapshot>>) {
         let mut r = self.roots.write().expect("roots lock not poisoned");
         r.committed = committed;
+        r.attached = attached;
     }
 
     /// The page size minted sessions serialize/split at: the file's page size for a file-backed core,
@@ -518,11 +649,13 @@ impl Database {
         Database(Arc::new(Shared {
             roots: RwLock::new(Roots {
                 committed: Arc::new(engine.committed),
+                attached: HashMap::new(),
             }),
             writer_active: Mutex::new(false),
             writer_free: Condvar::new(),
             live: Mutex::new(LiveRegistry::default()),
             storage: Mutex::new(storage),
+            attachments: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -663,13 +796,123 @@ impl Database {
         live.oldest().map(|o| o.min(committed)).unwrap_or(committed)
     }
 
+    /// Attach a database named `name` to this handle, reachable by the database qualifier `name.table`
+    /// (spec/design/attached-databases.md §4). Attaching is a HOST-API act, never SQL — an untrusted,
+    /// SQL-only session cannot attach anything (the pure-SQL safety spine, §4/§13). In Slice 1b `source`
+    /// must be [`AttachSource::memory`] (a fresh, empty in-memory database); a file source is reserved
+    /// for Slice 2 and returns `0A000`. `read_only` attaches it read-only: every write to it (DML or
+    /// DDL) is `25006`, and it never competes for the one-durable-writer slot (§5). The name is
+    /// case-folded; it must not name a reserved database (`main` / `temp`) or one already attached
+    /// (`42710`). Publishing the new empty attachment root is atomic under the writer gate.
+    pub fn attach(&self, name: &str, source: AttachSource, read_only: bool) -> Result<()> {
+        if source.file {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "file attachment is not supported yet (Slice 2)",
+            ));
+        }
+        let lname = name.to_ascii_lowercase();
+        if lname.is_empty() {
+            return Err(EngineError::new(
+                SqlState::DuplicateObject,
+                "attachment name must not be empty",
+            ));
+        }
+        self.0.acquire_writer();
+        let result = (|| {
+            {
+                let atts = self
+                    .0
+                    .attachments
+                    .lock()
+                    .expect("attachments lock not poisoned");
+                if lname == "main" || lname == "temp" || atts.contains_key(&lname) {
+                    return Err(EngineError::new(
+                        SqlState::DuplicateObject,
+                        format!("database \"{name}\" already exists"),
+                    ));
+                }
+            }
+            let page_size = self.0.page_size();
+            let storage = Storage::new_temp(page_size);
+            // The fresh attachment's committed root: an empty snapshot whose NEW stores attach to its
+            // OWN paging (the temp seam — a snapshot's `temp_paging` is "the paging new stores bind to").
+            let mut empty = Snapshot::default();
+            empty.set_temp_paging(storage.paging().clone());
+            let mode = if read_only {
+                AttachMode::ReadOnly
+            } else {
+                AttachMode::ReadWrite
+            };
+            self.0
+                .attachments
+                .lock()
+                .expect("attachments lock not poisoned")
+                .insert(
+                    lname.clone(),
+                    Attachment {
+                        name: lname.clone(),
+                        mode,
+                        storage,
+                    },
+                );
+            let mut r = self.0.roots.write().expect("roots lock not poisoned");
+            r.attached.insert(lname.clone(), Arc::new(empty));
+            Ok(())
+        })();
+        self.0.release_writer();
+        result
+    }
+
+    /// Detach a previously attached database (spec/design/attached-databases.md §4/§8). A host-API act.
+    /// It is `55006` (object_in_use) while any live transaction / cursor still pins a committed snapshot
+    /// (the reader-liveness watermark, §5 — a reader pins the whole roots, so an open reader pins every
+    /// attachment), and `42704` if no database of that name is attached (`main` / `temp` are not
+    /// detachable). On success the attachment's root is dropped from the published roots and its storage
+    /// released, under the writer gate.
+    pub fn detach(&self, name: &str) -> Result<()> {
+        let lname = name.to_ascii_lowercase();
+        self.0.acquire_writer();
+        let result = (|| {
+            {
+                let atts = self
+                    .0
+                    .attachments
+                    .lock()
+                    .expect("attachments lock not poisoned");
+                if lname == "main" || lname == "temp" || !atts.contains_key(&lname) {
+                    return Err(EngineError::new(
+                        SqlState::UndefinedObject,
+                        format!("database \"{name}\" is not attached"),
+                    ));
+                }
+            }
+            if self.0.has_live_readers() {
+                return Err(EngineError::new(
+                    SqlState::ObjectInUse,
+                    format!("cannot detach database \"{name}\" while it is in use"),
+                ));
+            }
+            self.0
+                .attachments
+                .lock()
+                .expect("attachments lock not poisoned")
+                .remove(&lname);
+            let mut r = self.0.roots.write().expect("roots lock not poisoned");
+            r.attached.remove(&lname);
+            Ok(())
+        })();
+        self.0.release_writer();
+        result
+    }
+
     /// Open a **READ ONLY** session over a consistent snapshot (spec/design/session.md §2.4,
     /// transactions.md §10). Pins the committed root now and registers the version in the live set;
     /// the session serves reads from that snapshot for its life — lock-free, never blocked by and
     /// never blocking a writer — and `close`/`Drop` deregisters. A write through it is `25006`.
     /// (The old `SharedDb::read()` → `ReadHandle`.)
     pub fn read_session(&self) -> Session {
-        let snap = self.0.pin();
+        let (snap, attached) = self.0.pin_roots();
         let version = snap.txid;
         self.0
             .live
@@ -679,6 +922,8 @@ impl Database {
         let mut engine = Engine::from_snapshot((*snap).clone());
         engine.page_size = self.0.page_size(); // serialize/split at the file's page size (§8)
         engine.read_only = true; // the executor rejects writes (25006) / poisons a read-only block
+        engine.core = Some(self.0.clone()); // route to the attachment registry (§5)
+        engine.attached_committed = attached; // pin the attached roots together (§5)
         Session {
             shared: self.0.clone(),
             engine,
@@ -702,10 +947,12 @@ impl Database {
             return self.read_session();
         }
         self.0.acquire_writer();
-        let base = self.0.pin();
+        let (base, attached) = self.0.pin_roots();
         let base_version = base.txid;
         let mut engine = Engine::from_snapshot((*base).clone());
         engine.page_size = self.0.page_size(); // serialize/split at the file's page size (§8)
+        engine.core = Some(self.0.clone()); // route to the attachment registry (§5)
+        engine.attached_committed = attached; // pin the attached roots together (§5)
         engine
             .begin_tx(Some(true))
             .expect("a fresh handle has no open transaction");
@@ -727,10 +974,12 @@ impl Database {
     /// explicit block. (The old `Engine::session(opts)` swap → an independent owns-its-`Engine`
     /// session.)
     pub fn session(&self, opts: SessionOptions) -> Session {
-        let snap = self.0.pin();
+        let (snap, attached) = self.0.pin_roots();
         let version = snap.txid;
         let mut engine = Engine::from_snapshot((*snap).clone());
         engine.page_size = self.0.page_size(); // serialize/split at the file's page size (§8)
+        engine.core = Some(self.0.clone()); // route to the attachment registry (§5)
+        engine.attached_committed = attached; // pin the attached roots together (§5)
         engine.session = SessionState::with_options(opts);
         // A read-only file-backed core mints read-only sessions (a write is `25006`); it pins the
         // committed version in the watermark like a read session. A writable core mints the autocommit
@@ -1035,9 +1284,10 @@ impl Session {
     /// Re-pin the latest committed root as this session's base (spec/design/session.md §2.4): the
     /// autocommit read/write path always works against the newest committed state.
     fn refresh_committed(&mut self) {
-        let snap = self.shared.pin();
+        let (snap, attached) = self.shared.pin_roots();
         self.base_version = snap.txid;
         self.engine.committed = (*snap).clone();
+        self.engine.attached_committed = attached; // re-pin the latest attached roots together (§5)
     }
 
     /// Publish the engine's committed root into the shared cell at the next version (the §3 commit
@@ -1059,7 +1309,13 @@ impl Session {
         // residency too (read-your-writes for the NEXT statement re-faults — one read path).
         snap.demote_clean_leaves();
         self.engine.committed = snap.clone();
-        self.shared.publish(Arc::new(snap));
+        // The N-root commit (attached-databases.md §5): publish the new main root TOGETHER with the
+        // current attached roots in one atomic swap. `commit_tx` already adopted each dirtied
+        // attachment's working root into `engine.attached_committed` (and packed it into the attachment's
+        // in-RAM store); an unchanged attachment carries its prior root through. An empty map (nothing
+        // attached) is byte-for-byte the pre-attachment single-root publish.
+        self.shared
+            .publish(Arc::new(snap), self.engine.attached_committed.clone());
         self.base_version += 1;
         Ok(())
     }
