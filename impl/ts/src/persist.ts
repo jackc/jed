@@ -54,7 +54,7 @@ export function persistImpl(db: Engine, snap: Snapshot): IncrementalWrite {
 //   - a no-op for the main domain (reclaimWithinSession false) — that keeps its reconstruct-on-open list;
 //   - deferred while any older version is pinned (canReclaim false): compaction frees pages unreachable
 //     from the committed root, which an older reader may still observe, so it waits for the pins to drain
-//     (a documented shared-temp-under-load limitation, temp-tables.md §6);
+//     (temp-tables.md §6);
 //   - periodic: it walks (O(pages)) only once the high-water passes ~2× the live count at the last
 //     compaction, so pageCount oscillates in [live, 2×live] and the walk is amortized O(height)/commit.
 // canReclaim is the caller's watermark decision — true iff no live reader/cursor pins a version older

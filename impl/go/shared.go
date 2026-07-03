@@ -14,10 +14,9 @@ package jed
 // Shape (the converged §2.4 design — SharedDB/ReadHandle/WriteHandle folded into two types):
 //   - Database is the shared core: it wraps a *sharedCore (safe to share, cheap to copy — a pointer)
 //     and mints Sessions (ReadSession / WriteSession / Session).
-//   - sharedCore holds the published committed roots — the file Snapshot AND the database-wide
-//     shared-temp Snapshot (temp-tables.md §5) — in ONE atomic.Pointer[roots] (so a reader pins both
-//     with a single lock-free Load and a writer publishes both with a single Store), the single-writer
-//     gate (a sync.Mutex held for the write transaction's life, so a second WriteSession blocks —
+//   - sharedCore holds the published committed root — the file Snapshot — in an atomic.Pointer[roots]
+//     (so a reader pins it with a lock-free Load and a writer publishes with a single Store), the
+//     single-writer gate (a sync.Mutex held for the write transaction's life, so a second WriteSession blocks —
 //     bbolt semantics), and the live-reader registry (pinned versions → the reclamation watermark, §8).
 //   - Session is the unified per-caller handle = the §3 envelope + a private *Engine + an access mode:
 //       - A READ ONLY session (ReadSession) pins the committed snapshot at mint (a lock-free Load) and
@@ -68,9 +67,9 @@ type roots struct {
 // sharedCore is the goroutine-safe state shared by every handle minted from one Database
 // (CLAUDE.md §3): the published committed roots, the single-writer gate, and the live registry.
 type sharedCore struct {
-	// roots is the published committed roots (file + shared-temp). A reader pins both with a lock-free
-	// Load; a writer publishes new ones with a single Store — the §3/§5 short commit window. A
-	// published roots and its Snapshots are immutable, so concurrent readers never race.
+	// roots is the published committed root (the file Snapshot). A reader pins it with a lock-free
+	// Load; a writer publishes a new one with a single Store — the §3 short commit window. A
+	// published roots and its Snapshot are immutable, so concurrent readers never race.
 	roots atomic.Pointer[roots]
 	// writeMu is the single-writer gate: a goroutine holds it for its whole write transaction, so a
 	// second Write blocks until the holder commits or rolls back (CLAUDE.md §3 — at most one writer).
@@ -183,7 +182,7 @@ func (c *sharedCore) oldestLiveVersion(newTxid uint64) uint64 {
 //   - a no-op for the main domain (reclaimWithinSession false) — that keeps its reconstruct-on-open list;
 //   - deferred while any older version is pinned (oldestLive != the committed version): compaction frees
 //     pages unreachable from the committed root, which an older reader may still observe, so it waits for
-//     the pins to drain (a documented shared-temp-under-load limitation, temp-tables.md §6);
+//     the pins to drain (temp-tables.md §6);
 //   - periodic: it walks (O(pages)) only once the high-water passes ~2× the live count at the last
 //     compaction, so page_count oscillates in [live, 2×live] and the walk is amortized O(height)/commit.
 //

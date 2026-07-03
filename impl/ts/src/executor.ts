@@ -10160,7 +10160,7 @@ export class Engine {
   // short-circuit. Rows match the eager path exactly: the offset..offset+limit slice of the
   // primary-key-ordered filtered rows (which, for a pkOrdered query, IS the ORDER BY's result).
   // snapshotEngine builds a frozen read-snapshot Engine for a streaming cursor (spec/design/streaming.md
-  // §5): the VISIBLE main / session-temp / shared-temp snapshots captured (the snapshots are immutable
+  // §5): the VISIBLE main / session-temp snapshots captured (the snapshots are immutable
   // copy-on-write, so sharing the references pins the roots and keeps them stable for the cursor's life,
   // isolated from later writes on the live handle) with NO open transaction — so the engine's reads see
   // exactly the captured frozen state — plus the session envelope the per-row eval / the cost meter read:

@@ -145,7 +145,7 @@ type snapshot struct {
 	// descend. Never mutated in place (replaced wholesale on rebuild), so clone shallow-copies it.
 	gistTrees map[string]*gistTree
 	// tempPaging is the per-domain MemoryBlockStore paging context a TEMP snapshot's stores attach to
-	// (spec/design/temp-tables.md §6, bplus-reshape.md): non-nil only for a session-local or shared temp
+	// (spec/design/temp-tables.md §6, bplus-reshape.md): non-nil only for a session-local temp
 	// snapshot, so its tables ride the same pager + packed-leaf path as an in-memory database (compact,
 	// bounded, spill-ready) instead of a fully-resident decoded tree. nil for the main snapshot (its
 	// paging lives on the storage identity). Carried through clone() so a tx's tempWorking creates stores
@@ -13986,7 +13986,7 @@ func frameBackwardSafe(frame *resolvedFrame, unique bool) bool {
 }
 
 // snapshotEngine builds a frozen read-snapshot engine for a streaming cursor (spec/design/streaming.md
-// §5): the VISIBLE main / session-temp / shared-temp snapshots captured (the snapshots are immutable
+// §5): the VISIBLE main / session-temp snapshots captured (the snapshots are immutable
 // copy-on-write, so sharing the pointers pins the roots cheaply and keeps them stable for the cursor's
 // life, isolated from later writes on the live handle) with NO open transaction — so the engine's
 // reads see exactly the captured frozen state — plus the session envelope the per-row eval / the cost
