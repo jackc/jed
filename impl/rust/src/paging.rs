@@ -87,6 +87,18 @@ impl SharedPaging {
         self.pager.lock().expect("pager mutex poisoned")
     }
 
+    /// Drop any stale pool entry for a rewritten page (bufferpool.rs `invalidate`): a no-op unless a
+    /// reclaim domain reused a freed page id, in which case the pool's prior decode must be evicted. This
+    /// locks ONLY the pool; `fault_leaf` locks pool-then-pager, so invalidating while a pager guard is
+    /// held would be the reverse order (deadlock). The commit write paths therefore collect the rewritten
+    /// page ids and call this only AFTER the pager guard drops.
+    pub(crate) fn invalidate(&self, page: u32) {
+        self.pool
+            .lock()
+            .expect("buffer pool mutex poisoned")
+            .invalidate(page);
+    }
+
     /// The number of leaf pages currently resident in the pool — the gauge the public
     /// [`crate::Engine::resident_leaves`] reports and the `cache_pages` budget bounds (P6.4c,
     /// spec/design/pager.md §3).

@@ -309,6 +309,14 @@ pub struct Snapshot {
     /// (the tree is replaced wholesale on rebuild, never mutated in place). The on-disk form is the
     /// persisted R-tree (page types 5/6); this in-memory tree is rebuilt from the loaded leaf store.
     gist_trees: HashMap<String, std::sync::Arc<crate::gist::GistTree>>,
+    /// The per-domain `MemoryBlockStore` paging context a TEMP snapshot's stores attach to
+    /// (spec/design/temp-tables.md §6, bplus-reshape.md): `Some` only for a session-local (or, later,
+    /// shared) temp snapshot, so its tables ride the same pager + packed-leaf path as an in-memory
+    /// database (compact, bounded, spill-ready) instead of a fully-resident decoded tree. `None` for the
+    /// main snapshot (its paging lives on the store, attached by the file/in-memory loader). Rides
+    /// `#[derive(Clone)]` (an `Arc` bump) so a tx's `temp_working` creates stores against the same domain
+    /// page space, and `#[derive(Default)]` (`None`). NEVER serialized (a temp snapshot never is).
+    temp_paging: Option<std::sync::Arc<crate::paging::SharedPaging>>,
 }
 
 /// One FOREIGN KEY dependent surfaced by a multi-table `DROP TABLE`'s dependency scan
@@ -905,8 +913,14 @@ impl Snapshot {
         self.bump_cat_gen();
         let key = table.name.to_ascii_lowercase();
         let cap = crate::format::page_payload(page_size);
-        self.stores
-            .insert(key.clone(), TableStore::new(cap, col_types));
+        let mut st = TableStore::new(cap, col_types);
+        // A temp snapshot rides a per-domain `MemoryBlockStore` pager (temp-tables.md §6): its stores
+        // demand-page like a file/in-memory database instead of staying fully-resident decoded. The main
+        // snapshot leaves `temp_paging` `None` (its stores attach the storage identity's paging on load).
+        if let Some(paging) = &self.temp_paging {
+            st.attach_paging(paging.clone());
+        }
+        self.stores.insert(key.clone(), st);
         self.tables.insert(key, table);
     }
 
@@ -991,8 +1005,26 @@ impl Snapshot {
     /// Register a loaded index store under its (lowercased) name — the file loader's hook
     /// (format.rs): the owning table's `indexes` list came from its catalog entry, so only
     /// the store is registered here.
-    pub(crate) fn put_index_store(&mut self, name_key: String, store: TableStore) {
+    pub(crate) fn put_index_store(&mut self, name_key: String, mut store: TableStore) {
+        // A temp snapshot's index stores ride the same per-domain `MemoryBlockStore` pager as its tables
+        // (temp-tables.md §6); the main snapshot leaves `temp_paging` `None`.
+        if let Some(paging) = &self.temp_paging {
+            if !store.is_file_backed() {
+                store.attach_paging(paging.clone());
+            }
+        }
         self.index_stores.insert(name_key, store);
+    }
+
+    /// Iterate every table data store — the store-page reachability walk (format.rs `reachable_pages`,
+    /// the within-session compaction basis) reads each store's tree root + column types.
+    pub(crate) fn stores_iter(&self) -> impl Iterator<Item = &TableStore> {
+        self.stores.values()
+    }
+
+    /// Iterate every secondary/unique index store (empty-payload trees, never spillable).
+    pub(crate) fn index_stores_iter(&self) -> impl Iterator<Item = &TableStore> {
+        self.index_stores.values()
     }
 
     /// The resident GiST R-tree of the named index (lowercased key), or `None` if the index is not
@@ -1153,6 +1185,36 @@ pub struct Engine {
     /// unlimited. The shared-temp analogue of `SessionState::temp_buffers`, but `Engine`-level (shared
     /// temp data is global). An over-budget shared-temp write aborts `54P03`.
     pub(crate) shared_temp_mem: usize,
+    /// The SESSION-LOCAL temp domain's storage identity (temp-tables.md §6): the private in-RAM
+    /// `MemoryBlockStore` + pager + pinned pool its temp tables ride, with within-session compaction on.
+    /// Created lazily on the first session-local temp DDL ([`Storage::new_temp`]); `None` until then. Its
+    /// `page_count` is the domain's footprint — the page-based temp budget. `shared_temp_storage` is the
+    /// shared domain's analogue (a follow-on: shared temp is still the fully-resident decoded path).
+    pub(crate) temp_storage: Option<crate::shared::Storage>,
+    pub(crate) shared_temp_storage: Option<crate::shared::Storage>,
+    /// The count of this handle's live streaming cursors (a `query` pull source, not a materialized
+    /// result). A streaming cursor pins a snapshot it faults lazily, so while one is open a temp-domain
+    /// compaction (`persist_temp` → `maybe_compact`) must NOT reclaim pages — it could free one the cursor
+    /// still faults. Incremented when a streaming `Rows` opens (shared.rs), decremented on its `Drop`
+    /// (via an `OpenStreamGuard` bundled into the cursor's pin) — hence the `Arc<AtomicUsize>`: the guard
+    /// outlives the `&mut self` borrow that built the cursor.
+    pub(crate) open_streams: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// An RAII counter for a live streaming cursor (temp-tables.md §6): built by [`Engine::open_stream_guard`]
+/// (which increments [`Engine::open_streams`]) and bundled into the cursor's pin, so its `Drop`
+/// decrements the count when the cursor is closed or dropped — even though the cursor ([`crate::Rows`])
+/// outlives the `&mut Engine` borrow that built it (hence the `Arc<AtomicUsize>`). While the count is
+/// non-zero a session-local temp compaction defers, so a page the cursor may still fault is never freed.
+pub(crate) struct OpenStreamGuard {
+    count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for OpenStreamGuard {
+    fn drop(&mut self) {
+        self.count
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// The relocatable session settings (spec/design/session.md §3 — the bucket-A envelope subset that
@@ -1678,6 +1740,9 @@ impl Engine {
             session: SessionState::new(),
             shared_temp_committed: Snapshot::default(),
             shared_temp_mem: DEFAULT_SHARED_TEMP_MEM,
+            temp_storage: None,
+            shared_temp_storage: None,
+            open_streams: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -1698,6 +1763,9 @@ impl Engine {
             session: SessionState::new(),
             shared_temp_committed: Snapshot::default(),
             shared_temp_mem: DEFAULT_SHARED_TEMP_MEM,
+            temp_storage: None,
+            shared_temp_storage: None,
+            open_streams: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -1958,6 +2026,34 @@ impl Engine {
     /// `temp_buffers = 0` is unlimited; a transaction that did not touch temp cannot have grown it, so
     /// the check self-gates on `temp_dirty` and is a no-op for ordinary (persistent) statements. The
     /// WITHIN-statement bound is `max_cost` (a single huge temp write hits the cost ceiling first).
+    /// The `MemoryBlockStore` paging context for a temp domain (temp-tables.md §6), lazily creating the
+    /// domain's storage identity ([`Storage::new_temp`] — a private in-RAM store + pinned pool with
+    /// within-session compaction on) on first use. The session-local domain lives on this engine; the
+    /// shared domain is a follow-on (shared temp is still the fully-resident decoded path this slice).
+    fn temp_domain_paging(&mut self, shared: bool) -> std::sync::Arc<crate::paging::SharedPaging> {
+        if shared {
+            if self.shared_temp_storage.is_none() {
+                self.shared_temp_storage = Some(crate::shared::Storage::new_temp(self.page_size));
+            }
+            return self.shared_temp_storage.as_ref().unwrap().paging().clone();
+        }
+        if self.temp_storage.is_none() {
+            self.temp_storage = Some(crate::shared::Storage::new_temp(self.page_size));
+        }
+        self.temp_storage.as_ref().unwrap().paging().clone()
+    }
+
+    /// Increment [`Engine::open_streams`] and return the RAII guard that decrements it on `Drop`
+    /// (bundled into a streaming cursor's pin — shared.rs). While a guard is live a session-local temp
+    /// compaction defers (temp-tables.md §6), so a page the cursor may still fault is never reclaimed.
+    pub(crate) fn open_stream_guard(&self) -> OpenStreamGuard {
+        self.open_streams
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        OpenStreamGuard {
+            count: self.open_streams.clone(),
+        }
+    }
+
     fn check_temp_budget(&self) -> Result<()> {
         let limit = self.session.temp_buffers;
         if limit == 0 {
@@ -1967,7 +2063,17 @@ impl Engine {
         if !temp_dirty {
             return Ok(());
         }
-        let used = self.temp_read_snap().storage_bytes();
+        // Page-based footprint of the session-local temp domain (temp-tables.md §7, Design decision 3):
+        // the committed `MemoryBlockStore` high-water × page size — the honest resident-RAM measure now
+        // that temp rides a pager (a record-byte walk would skip demoted `OnDisk` leaves and undercount a
+        // multi-leaf temp table, defeating the §13 bound). Deterministic and cross-core-identical:
+        // `page_count` is a pure function of operations via the B+tree + within-session compaction. It
+        // reflects the state one commit behind (the pending write commits at statement end), so a domain
+        // already over budget aborts the NEXT temp write and rolls it back (§7).
+        let used = self
+            .temp_storage
+            .as_ref()
+            .map_or(0, |ts| ts.page_count() as u64 * self.page_size as u64);
         if used > limit as u64 {
             return Err(EngineError::new(
                 SqlState::TempStorageLimitExceeded,
@@ -2874,7 +2980,7 @@ impl Engine {
         let main_dirty = tx.main_dirty;
         let temp_dirty = tx.temp_dirty;
         let shared_temp_dirty = tx.shared_temp_dirty;
-        let temp_working = tx.temp_working;
+        let mut temp_working = tx.temp_working;
         let shared_temp_working = tx.shared_temp_working;
         let mut working = tx.working;
         // Persist the main image when it changed; a transaction that touched ONLY temp tables (session-
@@ -2892,6 +2998,16 @@ impl Engine {
             }
             self.persist(&working)?; // no-op for an in-memory database
             self.committed = working;
+        }
+        // A dirty session-local temp domain materializes its working snapshot into its `MemoryBlockStore`
+        // (compact packed leaves + within-session compaction) before it is adopted — zero main-file
+        // writes (temp-tables.md §6). Compaction is safe iff no streaming cursor holds an older temp tree.
+        // Shared temp is still the fully-resident decoded pointer-swap (a follow-on).
+        if temp_dirty {
+            let can_reclaim = self.open_streams.load(std::sync::atomic::Ordering::Relaxed) == 0;
+            if let Some(ts) = self.temp_storage.as_mut() {
+                ts.persist_temp(&mut temp_working, can_reclaim)?;
+            }
         }
         // Adopt the transaction's temp changes into the committed temp snapshots (temp-tables.md §5) —
         // the temp analogue of publishing `committed`, but purely in memory. SessionState-local temp lives
@@ -4190,11 +4306,22 @@ impl Engine {
             // every session, §4); a plain temp table in the session-local one. page_size only weighs
             // records for the (unused-for-resident) split heuristic.
             let ps = self.page_size;
+            // The session-local temp snapshot rides a per-domain `MemoryBlockStore` pager
+            // (temp-tables.md §6): lazily create the domain storage and stamp its paging onto the working
+            // snapshot, so `put_table_resolved` / `put_index_store` attach it to every temp store. Shared
+            // temp still uses the fully-resident decoded path (a follow-on — its cross-session watermark
+            // needs core-owned storage), so `temp_paging` stays `None` there.
+            let temp_paging = if ct.shared {
+                None
+            } else {
+                Some(self.temp_domain_paging(false))
+            };
             let tw = if ct.shared {
                 self.shared_temp_working_mut()
             } else {
                 self.temp_working_mut()
             };
+            tw.temp_paging = temp_paging;
             tw.put_table_resolved(table, col_types, ps);
             for k in index_keys {
                 tw.put_index_store(k, TableStore::new(cap, Vec::new()));

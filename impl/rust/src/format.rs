@@ -146,7 +146,7 @@ const EXTERNAL_COMP_PTR_LEN: usize = 1 + 4 + 4 + 4;
 const S_COMPRESS: usize = 32;
 /// Catalog root page index of a *fresh empty* database (pages 0,1 are the meta slots). The catalog
 /// root is **relocatable** thereafter — a reader follows `meta.root_page`, never assumes `2`.
-const ROOT_PAGE: u32 = 2;
+pub(crate) const ROOT_PAGE: u32 = 2;
 
 /// Stable on-disk type code for a scalar type — independent of the in-memory enum
 /// discriminant (which may be reordered). See spec/fileformat/format.md.
@@ -1927,6 +1927,73 @@ fn collect_leaf_overflow(
             Ok(())
         }
         _ => Err(corrupt("expected a B-tree node page")),
+    }
+}
+
+/// Collect every page reachable from the committed snapshot whose catalog head is `cat_root`: the
+/// catalog chain, every table/index B+tree node, and (for spillable columns) the live overflow chains.
+/// The inverse of the free-list and the basis of within-session compaction (shared.rs `maybe_compact`)
+/// — the same live set the open-time reconstruction (`open_paged`) derives, but computed against the
+/// already-resident committed trees: node page ids come from the in-memory tree walk (no pager reads),
+/// and only the catalog chain and spillable-leaf overflow are read through the pager. A reclaim domain
+/// (temp) never carries a GiST index (deferred 0A000, temp-tables.md §8), so GiST pages need no
+/// handling here — the caller (`maybe_compact`) skips any snapshot that has one.
+pub(crate) fn reachable_pages(
+    snap: &Snapshot,
+    paging: &SharedPaging,
+    cat_root: u32,
+) -> Result<HashSet<u32>> {
+    let mut reached: HashSet<u32> = HashSet::new();
+    // The catalog chain (rewritten to fresh pages every commit; its predecessor pages are the bulk of
+    // what compaction reclaims).
+    let mut p = cat_root;
+    while p != 0 {
+        reached.insert(p);
+        let block = paging.pager().read_block(p)?;
+        let page = parse_page(&block)?;
+        if page.page_type != PAGE_CATALOG {
+            return Err(corrupt("expected a catalog page"));
+        }
+        p = page.next_page;
+    }
+    // Table data trees + their live overflow chains.
+    for st in snap.stores_iter() {
+        if let Some(root) = st.tree_root() {
+            collect_tree_pages(root, &mut reached);
+            let root_page = root.page.load(std::sync::atomic::Ordering::Acquire);
+            if root_page != 0 {
+                let col_types = Arc::new(st.col_types().to_vec());
+                if any_spillable(&col_types) {
+                    collect_leaf_overflow(paging, root_page, &col_types, &mut reached)?;
+                }
+            }
+        }
+    }
+    // Secondary/unique index trees (empty-payload, never spillable).
+    for st in snap.index_stores_iter() {
+        if let Some(root) = st.tree_root() {
+            collect_tree_pages(root, &mut reached);
+        }
+    }
+    Ok(reached)
+}
+
+/// Add every node page of a resident B+tree to `reached`: an interior/leaf node's own set-once page,
+/// and each `OnDisk` child leaf's page (walked without faulting it — the page id is on the child). A
+/// page-0 node is a dirty node not yet persisted (never on a committed tree at compaction time); it is
+/// skipped so page 0 (a meta slot) is never marked.
+fn collect_tree_pages(node: &Node, reached: &mut HashSet<u32>) {
+    let page = node.page.load(std::sync::atomic::Ordering::Acquire);
+    if page != 0 {
+        reached.insert(page);
+    }
+    for child in &node.children {
+        match child {
+            Child::Resident(n) => collect_tree_pages(n, reached),
+            Child::OnDisk(p) => {
+                reached.insert(*p);
+            }
+        }
     }
 }
 

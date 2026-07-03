@@ -128,14 +128,15 @@ struct Roots {
 /// mutated only under the single-writer gate (so the `Mutex` is uncontended), and `paging` is
 /// itself thread-safe ([`crate::paging::SharedPaging`]) so readers fault pages concurrently with
 /// the committing writer.
-struct Storage {
+pub(crate) struct Storage {
     /// The page payload size, fixed into the file at creation.
     page_size: u32,
     /// The on-disk high-water (page count) — advances as the file grows; persisted in the meta slot.
     page_count: u32,
     /// The reconstruct-on-open free-list (P6.2, transactions.md §8): pages that were dead at the
     /// opened committed version, reused lowest-first by the incremental commit allocator. Every entry
-    /// predates any live reader's pinned version, so reuse is trivially watermark-safe.
+    /// predates any live reader's pinned version, so reuse is trivially watermark-safe. A reclaim
+    /// domain (temp) additionally rebuilds this within-session ([`Storage::maybe_compact`]).
     free_pages: Vec<u32>,
     /// The shared pager + bounded leaf buffer pool — one per file, shared by every store/snapshot.
     paging: Arc<crate::paging::SharedPaging>,
@@ -144,6 +145,119 @@ struct Storage {
     read_only: bool,
     /// The backing file path; `None` for an in-memory database. Surfaced by [`Database::path`].
     path: Option<std::path::PathBuf>,
+    /// Turns on within-session free-list compaction ([`Storage::maybe_compact`]): the never-reopened
+    /// in-RAM temp domains set it (temp-tables.md §6, bplus-reshape.md), so their copy-on-write orphans
+    /// are reclaimed rather than leaked. The main file/in-memory domain leaves it `false`
+    /// (reconstruct-on-open only).
+    reclaim_within_session: bool,
+    /// The reachable page count recorded at the last compaction — the cheap trigger basis: compaction
+    /// re-runs only once the high-water passes ~2× it (periodic ~2× bound, no per-commit walk).
+    live_at_compaction: u32,
+}
+
+impl Storage {
+    /// A fresh per-domain storage identity for a TEMP snapshot (temp-tables.md §6, bplus-reshape.md): a
+    /// private in-RAM `MemoryBlockStore` read/written through the SAME pager + packed-leaf path as an
+    /// in-memory database, with a PINNED (unbounded) pool — a temp domain is resident by definition (§5)
+    /// — and within-session compaction ON, so its copy-on-write orphans are reclaimed rather than leaked
+    /// (a temp store is never reopened, so reconstruct-on-open never runs). Seeded with the empty
+    /// from-scratch image exactly as an in-memory database, so `page_count` starts past the meta slots.
+    /// Zero file writes: this byte store is entirely separate from the main database file.
+    pub(crate) fn new_temp(page_size: u32) -> Storage {
+        let image = Snapshot::default()
+            .to_image(page_size, 0)
+            .expect("a fresh temp image always serializes");
+        let page_count = (image.len() / page_size as usize) as u32;
+        let store: Box<dyn crate::blockstore::BlockStore> =
+            Box::new(crate::blockstore::MemoryBlockStore::new(image));
+        let pager =
+            crate::pager::Pager::from_store(store).expect("a fresh temp image always opens");
+        Storage {
+            page_size,
+            page_count,
+            free_pages: Vec::new(),
+            // Pinned/unbounded pool, mirroring an in-memory database (resident by definition).
+            paging: crate::paging::SharedPaging::new(pager, usize::MAX),
+            read_only: false,
+            path: None,
+            reclaim_within_session: true,
+            live_at_compaction: 0,
+        }
+    }
+
+    /// The domain's shared pager (attached to every temp store so its `OnDisk` leaves fault through the
+    /// temp pool).
+    pub(crate) fn paging(&self) -> &Arc<crate::paging::SharedPaging> {
+        &self.paging
+    }
+
+    /// The committed page high-water — the page-based temp budget basis (temp-tables.md §7).
+    pub(crate) fn page_count(&self) -> u32 {
+        self.page_count
+    }
+
+    /// Materialize a TEMP snapshot's dirty pages into the domain's in-RAM `MemoryBlockStore`
+    /// (temp-tables.md §6): the SAME incremental copy-on-write serialize as a file/in-memory commit, but
+    /// with NO meta slot and NO sync — a temp domain is never reopened and its memory host has no
+    /// durability barrier — then the residency flip (clean leaves demote to `OnDisk`) and within-session
+    /// compaction. ZERO main-file writes: only the temp byte store is touched. Assigns page ids on `snap`
+    /// in place; the caller adopts `snap` as the committed temp state afterward. `can_reclaim` is the
+    /// caller's cursor watermark (no open streaming cursor may hold an older temp tree).
+    pub(crate) fn persist_temp(&mut self, snap: &mut Snapshot, can_reclaim: bool) -> Result<()> {
+        let write = snap.incremental_image(
+            self.page_size,
+            self.page_count,
+            &self.free_pages,
+            Some(&self.paging),
+        )?;
+        {
+            let mut pager = self.paging.pager();
+            pager.reserve(write.page_count)?;
+            for (index, bytes) in &write.pages {
+                pager.write_block(*index, bytes)?;
+            }
+            // No meta write, no sync: never reopened, no durability barrier.
+        }
+        // Invalidate rewritten pages AFTER the pager guard drops — pool-then-pager order (paging.rs): a
+        // no-op unless compaction handed a freed page id back for a new node.
+        for (index, _) in &write.pages {
+            self.paging.invalidate(*index);
+        }
+        self.page_count = write.page_count;
+        self.free_pages = write.free_remaining;
+        snap.demote_clean_leaves();
+        self.maybe_compact(snap, write.root_page, can_reclaim)
+    }
+
+    /// Reclaim within-session copy-on-write orphans (temp-tables.md §6) by rebuilding the free-list from
+    /// the live (reachable) set, so later commits reuse dead pages instead of only growing the
+    /// high-water. A no-op for a non-reclaim domain; deferred while an older version is pinned
+    /// (`can_reclaim` false); periodic — walks (O(pages)) only once the high-water passes ~2× the live
+    /// count at the last compaction, so `page_count` oscillates in `[live, 2×live]` and the walk is
+    /// amortized O(height)/commit.
+    pub(crate) fn maybe_compact(
+        &mut self,
+        snap: &Snapshot,
+        cat_root: u32,
+        can_reclaim: bool,
+    ) -> Result<()> {
+        if !self.reclaim_within_session || !can_reclaim {
+            return Ok(());
+        }
+        const MIN_COMPACT_PAGES: u32 = 16; // don't churn a tiny store
+        if self.page_count <= MIN_COMPACT_PAGES
+            || (self.page_count as u64) <= 2 * self.live_at_compaction as u64
+        {
+            return Ok(());
+        }
+        let reached = crate::format::reachable_pages(snap, &self.paging, cat_root)?;
+        let free: Vec<u32> = (crate::format::ROOT_PAGE..self.page_count)
+            .filter(|p| !reached.contains(p))
+            .collect();
+        self.free_pages = free;
+        self.live_at_compaction = reached.len() as u32;
+        Ok(())
+    }
 }
 
 /// The thread-safe core shared by every [`Database`] clone (CLAUDE.md §3). Holds the published
@@ -275,6 +389,10 @@ impl Shared {
     /// `free_pages` advance only after both syncs succeed, so a write failure leaves the file's prior
     /// meta and this accounting untouched (the working snapshot is then discarded by the caller).
     fn persist(&self, snap: &Snapshot) -> Result<()> {
+        // The main domain reclaims within-session only when enabled (off by default) and no reader pins
+        // an older version (the file/in-memory watermark, temp-tables.md §6 Phase A). Compute the
+        // watermark BEFORE the storage lock so the `live` lock is never held under it (a clean order).
+        let can_reclaim = self.oldest_live_version(snap.txid) == snap.txid;
         let mut st = self.storage.lock().expect("storage lock not poisoned");
         let write = snap.incremental_image(
             st.page_size,
@@ -296,9 +414,29 @@ impl Shared {
             pager.write_block((snap.txid & 1) as u32, &meta)?;
             pager.sync()?; // the commit is published
         }
+        // Invalidate rewritten pages AFTER the pager guard drops — pool-then-pager order (paging.rs): a
+        // no-op unless a reclaim domain reused a freed page id, in which case the pool's prior decode
+        // must be evicted.
+        for (index, _) in &write.pages {
+            st.paging.invalidate(*index);
+        }
         st.page_count = write.page_count;
         st.free_pages = write.free_remaining;
-        Ok(())
+        st.maybe_compact(snap, write.root_page, can_reclaim)
+    }
+
+    /// The oldest version a live reader pinned, floored at `new_txid` (the version this commit
+    /// publishes) so "no live reader" reads as `new_txid` — the safe case for compaction (temp-tables.md
+    /// §6). Any live reader pins a version older than `new_txid` (it opened before this commit), so a
+    /// non-empty registry yields a value `< new_txid` and defers compaction. Distinct from the public
+    /// [`Database::oldest_live_txid`], which floors at the CURRENTLY-committed version.
+    fn oldest_live_version(&self, new_txid: u64) -> u64 {
+        self.live
+            .lock()
+            .expect("live lock not poisoned")
+            .oldest()
+            .map(|o| o.min(new_txid))
+            .unwrap_or(new_txid)
     }
 }
 
@@ -386,6 +524,9 @@ impl Database {
             paging,
             read_only: engine.read_only,
             path: engine.path.clone(),
+            // The main domain keeps reconstruct-on-open only (unchanged behavior); temp domains opt in.
+            reclaim_within_session: false,
+            live_at_compaction: 0,
         };
         Database(Arc::new(Shared {
             roots: RwLock::new(Roots {
@@ -713,13 +854,25 @@ impl Session {
         // cached plan (`cache`). Register the pinned snapshot version in the watermark (streaming.md
         // §5); the returned guard deregisters on cursor close/drop, advancing `oldest_live_txid`.
         if let Some(mut rows) = self.engine.try_scan_query(ast, params, cache)? {
-            rows.attach_pin(self.shared.reader_pin(self.base_version));
+            // Bundle the reader-liveness pin with an open-stream guard: the guard increments the engine's
+            // open_streams so a session-local temp compaction defers while this cursor may still fault its
+            // pinned temp tree (temp-tables.md §6); both release on cursor close/drop.
+            rows.attach_pin(Box::new((
+                self.shared.reader_pin(self.base_version),
+                self.engine.open_stream_guard(),
+            )));
             return Ok(rows);
         }
         if let Some(mut rows) = self.engine.try_deferred_query(ast, params)? {
             // A lazy deferred set-op / WITH cursor (streaming.md §7) is a live reader too — pin its
             // snapshot version in the watermark, released on cursor close/drop.
-            rows.attach_pin(self.shared.reader_pin(self.base_version));
+            // Bundle the reader-liveness pin with an open-stream guard: the guard increments the engine's
+            // open_streams so a session-local temp compaction defers while this cursor may still fault its
+            // pinned temp tree (temp-tables.md §6); both release on cursor close/drop.
+            rows.attach_pin(Box::new((
+                self.shared.reader_pin(self.base_version),
+                self.engine.open_stream_guard(),
+            )));
             return Ok(rows);
         }
         Rows::from_outcome(self.dispatch(ast.clone(), params)?)
@@ -1466,5 +1619,278 @@ mod cancel_internal_tests {
         session.engine.session.cancel = None;
         let rows = session.query("SELECT id FROM t", &[]).unwrap();
         assert_eq!(rows.count(), 20);
+    }
+}
+
+#[cfg(test)]
+mod temp_reclaim_internal_tests {
+    //! Within-session free-list compaction (Phase A) + session-local temp through a MemoryBlockStore
+    //! (Phase B) — spec/design/temp-tables.md §6, spec/design/bplus-reshape.md. These per-core tests
+    //! reach the private storage internals the corpus cannot express: the high-water bound (~2× live),
+    //! the watermark gate (compaction defers while an older reader is pinned), the compact temp footprint,
+    //! and the zero-file-write invariant. The SQL-visible temp behavior (rows, errors, 54P03) is the
+    //! corpus's job (resource/temp_budget.test); these assert the storage internals. Mirrors the Go
+    //! reclaim_compaction_test.go / temp_blockstore_test.go and the TS reclaim_compaction/temp_blockstore
+    //! tests.
+
+    use super::*;
+    use crate::file::DatabaseOptions;
+
+    fn rows(sess: &mut Session, sql: &str) -> Vec<Vec<Value>> {
+        match sess.execute(sql, &[]).unwrap() {
+            Outcome::Query { rows, .. } => rows,
+            other => panic!("expected a query, got {other:?}"),
+        }
+    }
+
+    fn text0(rows: &[Vec<Value>]) -> &str {
+        match &rows[0][0] {
+            Value::Text(s) => s,
+            v => panic!("expected a text value, got {v:?}"),
+        }
+    }
+
+    /// Build a small multi-level tree in an in-memory database at page 256, then update one row `rounds`
+    /// times (each an autocommit copy-on-write commit that orphans its root→leaf path + the rewritten
+    /// catalog). Returns the committed page high-water afterward. `reclaim` toggles within-session
+    /// compaction on the (single) main storage domain — a white-box reach into the private core (the
+    /// analogue of the Go test's `db.core.storage`; the main domain is reconstruct-on-open by default).
+    fn churn_in_memory(reclaim: bool, rounds: usize) -> (u32, Database) {
+        let db = Database::new_in_memory_with_page_size(256);
+        db.0.storage.lock().unwrap().reclaim_within_session = reclaim;
+        let mut sess = db.session(SessionOptions::default());
+        sess.execute("CREATE TABLE t (id i32 PRIMARY KEY, pad text)", &[])
+            .unwrap();
+        let base = "x".repeat(40);
+        for i in 1..=30 {
+            sess.execute(
+                &format!("INSERT INTO t VALUES ({i}, 'r{i:02}-{base}')"),
+                &[],
+            )
+            .unwrap();
+        }
+        let pad = "y".repeat(40);
+        for k in 0..rounds {
+            sess.execute(
+                &format!("UPDATE t SET pad = 'a{k}-{pad}' WHERE id = 15"),
+                &[],
+            )
+            .unwrap();
+        }
+        let pc = db.page_count();
+        (pc, db)
+    }
+
+    #[test]
+    fn within_session_compaction_bounds_in_memory_churn() {
+        let rounds = 300;
+
+        // Control: reclaim OFF is the pre-Phase-A behavior — a never-reopened in-memory store leaks a
+        // page per commit, so the high-water grows roughly linearly with the churn count.
+        let (leaked, _off) = churn_in_memory(false, rounds);
+        assert!(
+            leaked as usize > rounds,
+            "control (reclaim off) should leak ~1 page/commit; high-water only {leaked} after {rounds}",
+        );
+
+        // Reclaim ON: the high-water plateaus at ~2× the live page count (a few dozen pages),
+        // independent of the churn count — bounded well under the leaked control.
+        let (bounded, on_db) = churn_in_memory(true, rounds);
+        assert!(
+            bounded <= 128,
+            "reclaim on should bound the high-water at ~2×live; got {bounded} (leaked {leaked})",
+        );
+        assert!(
+            bounded * 4 <= leaked,
+            "reclaim on ({bounded}) should be far below the leaked control ({leaked})",
+        );
+
+        // The churned value and every row survive the reuse (a reclaimed page was dead, never a live one).
+        let mut sess = on_db.session(SessionOptions::default());
+        let want = format!("a{}-{}", rounds - 1, "y".repeat(40));
+        let got = rows(&mut sess, "SELECT pad FROM t WHERE id = 15");
+        assert_eq!(got.len(), 1);
+        assert_eq!(text0(&got), want);
+        assert_eq!(rows(&mut sess, "SELECT id FROM t").len(), 30);
+    }
+
+    #[test]
+    fn compaction_defers_while_older_reader_pinned() {
+        let db = Database::new_in_memory_with_page_size(256);
+        db.0.storage.lock().unwrap().reclaim_within_session = true;
+        let mut sess = db.session(SessionOptions::default());
+        sess.execute("CREATE TABLE t (id i32 PRIMARY KEY, pad text)", &[])
+            .unwrap();
+        let base = "x".repeat(40);
+        for i in 1..=30 {
+            sess.execute(
+                &format!("INSERT INTO t VALUES ({i}, 'r{i:02}-{base}')"),
+                &[],
+            )
+            .unwrap();
+        }
+        let pad = "y".repeat(40);
+
+        // Pin an older version with an open read session: compaction must NOT free pages it may still
+        // observe, so it defers and the high-water leaks while the reader is open.
+        let reader = db.read_session();
+        for k in 0..200 {
+            sess.execute(
+                &format!("UPDATE t SET pad = 'p{k}-{pad}' WHERE id = 15"),
+                &[],
+            )
+            .unwrap();
+        }
+        let with_reader_open = db.page_count();
+        assert!(
+            with_reader_open > 200,
+            "with an older reader pinned, compaction should defer and leak; high-water only {with_reader_open}",
+        );
+
+        // Drop the reader (watermark advances to committed): a further churn now compacts, so the
+        // high-water stops climbing — it grows by a handful of pages (the first post-close commit
+        // extends before its own compaction reclaims), not by another ~200.
+        drop(reader);
+        for k in 200..400 {
+            sess.execute(
+                &format!("UPDATE t SET pad = 'q{k}-{pad}' WHERE id = 15"),
+                &[],
+            )
+            .unwrap();
+        }
+        let after = db.page_count();
+        assert!(
+            after - with_reader_open <= 64,
+            "after the reader closed, compaction should reuse pages, not keep growing: {with_reader_open} then {after}",
+        );
+    }
+
+    #[test]
+    fn session_local_temp_runs_through_blockstore() {
+        let db = Database::new_in_memory_with_page_size(256);
+        let mut sess = db.session(SessionOptions::default());
+        sess.execute("CREATE TEMP TABLE lt (id i32 PRIMARY KEY, pad text)", &[])
+            .unwrap();
+        let base = "x".repeat(40);
+        for i in 1..=60 {
+            // 60 rows at page 256 → a multi-level tree with demoted leaves.
+            sess.execute(
+                &format!("INSERT INTO lt VALUES ({i}, 'r{i:02}-{base}')"),
+                &[],
+            )
+            .unwrap();
+        }
+        assert!(
+            sess.engine.temp_storage.is_some(),
+            "session-local temp DDL should have created a temp storage domain",
+        );
+
+        // Reads fault demoted leaves back through the temp pool.
+        let got = rows(&mut sess, "SELECT pad FROM lt WHERE id = 42");
+        assert_eq!(got.len(), 1);
+        assert_eq!(text0(&got), format!("r42-{base}"));
+        assert_eq!(rows(&mut sess, "SELECT id FROM lt").len(), 60);
+
+        // Churn one row 400×; the high-water plateaus (compaction), it does not grow ~linearly.
+        let pad = "y".repeat(40);
+        for k in 0..400 {
+            sess.execute(
+                &format!("UPDATE lt SET pad = 'u{k}-{pad}' WHERE id = 30"),
+                &[],
+            )
+            .unwrap();
+        }
+        let pc = sess.engine.temp_storage.as_ref().unwrap().page_count();
+        assert!(
+            pc <= 200,
+            "temp churn not bounded by compaction: page_count={pc} after 400 updates",
+        );
+
+        let after = rows(&mut sess, "SELECT pad FROM lt WHERE id = 30");
+        assert_eq!(after.len(), 1);
+        assert_eq!(text0(&after), format!("u399-{pad}"));
+        assert_eq!(rows(&mut sess, "SELECT id FROM lt").len(), 60);
+    }
+
+    #[test]
+    fn multi_leaf_temp_past_page_budget_aborts_54p03() {
+        // ~20 pages of budget: a single leaf (≤ ~240 record bytes) is far under it, so a record-byte
+        // measure would never abort; the page footprint crosses it as the tree grows past ~20 pages.
+        let db = Database::new_in_memory_with_page_size(256);
+        let mut opts = SessionOptions::default();
+        opts.temp_buffers = 20 * 256;
+        let mut sess = db.session(opts);
+        sess.execute("CREATE TEMP TABLE lt (id i32 PRIMARY KEY, pad text)", &[])
+            .unwrap();
+        let pad = "z".repeat(40);
+        let mut aborted = false;
+        for i in 1..=400 {
+            match sess.execute(&format!("INSERT INTO lt VALUES ({i}, 'r-{pad}')"), &[]) {
+                Ok(_) => {}
+                Err(e) => {
+                    assert_eq!(
+                        e.code(),
+                        "54P03",
+                        "insert {i}: want 54P03, got {}",
+                        e.code()
+                    );
+                    aborted = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            aborted,
+            "a multi-leaf temp table past its page budget should abort 54P03; it never did (undercount bug)",
+        );
+    }
+
+    #[test]
+    fn session_local_temp_makes_zero_file_writes() {
+        // The bare-Engine autocommit path (crate::execute) — like the Go test — correctly skips the main
+        // persist for a pure-temp commit, so it is the faithful vehicle for the zero-file-write invariant
+        // (the Database/Session publish path persists the main image unconditionally, a pre-existing
+        // issue tracked as a shared-temp follow-on).
+        let path = std::env::temp_dir().join("jed_temp_zerofile_internal.jed");
+        let _ = std::fs::remove_file(&path);
+        let mut db = Engine::create(&path, DatabaseOptions { page_size: 256 }).unwrap();
+        crate::execute(&mut db, "CREATE TABLE p (id i32 PRIMARY KEY)").unwrap();
+        crate::execute(&mut db, "INSERT INTO p VALUES (1)").unwrap();
+        let base_txid = db.txid();
+        let base_pages = db.page_count();
+
+        crate::execute(
+            &mut db,
+            "CREATE TEMP TABLE lt (id i32 PRIMARY KEY, pad text)",
+        )
+        .unwrap();
+        let pad = "q".repeat(40);
+        for i in 1..=40 {
+            crate::execute(&mut db, &format!("INSERT INTO lt VALUES ({i}, '{pad}')")).unwrap();
+        }
+        for k in 0..40 {
+            crate::execute(
+                &mut db,
+                &format!("UPDATE lt SET pad = 'u{k}' WHERE id = 20"),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            db.txid(),
+            base_txid,
+            "session-local temp writes advanced the file txid"
+        );
+        assert_eq!(
+            db.page_count(),
+            base_pages,
+            "session-local temp writes grew the file high-water",
+        );
+
+        // The temp data is nonetheless present and correct (it lives in the temp store).
+        match crate::execute(&mut db, "SELECT id FROM lt").unwrap() {
+            Outcome::Query { rows, .. } => assert_eq!(rows.len(), 40),
+            other => panic!("expected a query, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }

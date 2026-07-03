@@ -103,6 +103,31 @@ impl<T> BufferPool<T> {
     pub(crate) fn resident(&self) -> usize {
         self.slots.len()
     }
+
+    /// Drop any cached entry for `page` — required when a commit REWRITES a page in place, which happens
+    /// when within-session compaction (a reclaim domain — temp, or an in-memory database with reclamation
+    /// on) hands a freed page id back to a new node: the pool caches by page id, so the stale decode of
+    /// the page's PRIOR content must be evicted or a later fault returns old rows. A no-op when the page
+    /// is not resident — the common case, since a copy-on-write commit without reuse only ever writes
+    /// fresh, never-cached high-water pages (so the main file path pays only a map lookup).
+    pub(crate) fn invalidate(&mut self, page: u32) {
+        let Some(i) = self.index.remove(&page) else {
+            return;
+        };
+        // Swap the last slot into the hole so the Vec stays dense (capacity accounting + the CLOCK hand
+        // stay well-formed), then pop.
+        let last = self.slots.len() - 1;
+        if i != last {
+            self.slots.swap(i, last);
+            self.index.insert(self.slots[i].page_id, i);
+        }
+        self.slots.pop();
+        if self.slots.is_empty() {
+            self.hand = 0;
+        } else {
+            self.hand %= self.slots.len();
+        }
+    }
 }
 
 #[cfg(test)]
