@@ -125,7 +125,7 @@ writes one, and an index write cannot fail, so atomicity is unchanged:
   CLAUDE.md §11 step 6), so the suffix is stable.
 - **CREATE INDEX on a non-empty table** builds the index by scanning the table once in
   key order (cost: §5), then inserting the computed entries **sorted by entry key** —
-  ascending inserts take the B-tree's right-edge append split every time
+  ascending inserts take the B+tree's right-edge append split every time
   (spec/fileformat/format.md "Split point"), so the built tree packs leaves ~full instead
   of the few-percent fill that storage-key-order (random in entry-key space) insertion
   produced. The sort order is part of the byte contract: it fixes the built tree's shape,

@@ -515,10 +515,16 @@ cross-core-identical and owns that consequence (the host-extension boundary, §1
   units (§13).
 - On-disk format and key encoding are spec'd with byte fixtures (§8). **Status:** the
   single-file on-disk format is authored in `spec/fileformat/format.md` and is now the
-  **page-backed copy-on-write B-tree** (`format_version` 2, Phase 6): each table's rows are an
-  on-disk B-tree (leaf + interior node pages) and a commit is **incremental** — it writes only
-  the dirty pages a mutation introduced and publishes the new root by alternating the meta slot
-  (P6.1), rather than rewriting the whole image. **Page reclamation** (P6.2) reconstructs a
+  **page-backed copy-on-write B+tree** (`format_version` 24 — the B+tree reshape,
+  [spec/design/bplus-reshape.md](spec/design/bplus-reshape.md) B1: records live **only in
+  leaves**; an interior page is a record-free `separator keys + child pointers` routing skeleton
+  with far higher fan-out; leaf splits copy the boundary key up, interior splits push the median
+  separator up, and the leaf column regions carry a flags byte + per-column **null bitmap** /
+  zero-length-span NULLs in place of the per-value `0x01` tag — dense untagged slots for
+  fixed-width columns, the vectorizable stride): each table's rows are an on-disk tree (leaf +
+  interior node pages) and a commit is **incremental** — it writes only the dirty pages a
+  mutation introduced and publishes the new root by alternating the meta slot (P6.1), rather
+  than rewriting the whole image. **Page reclamation** (P6.2) reconstructs a
   **free-list** of dead pages on open and the commit allocator reuses them, so a file no longer
   grows without bound. All three cores (Rust, Go, TS) **and** the Ruby reference read/write
   byte-identical files, verified against shared golden fixtures (the §8 cross-core round-trip;

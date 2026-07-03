@@ -252,10 +252,12 @@ sits so the options stay open (CLAUDE.md §9).
   P6.4c added the `cache_bytes` memory-budget API + hardening). The `page_read` cost unit (P6.3)
   is a **logical** count, so the cache stays invisible to the deterministic cost (pager.md §5,
   cost.md §3). The whole-image load survives only as `from_image`/`create`/the goldens (§1).
-- **Within-page structure** — variable-length records packed contiguously into a B-tree node
-  page (a record stores its key + each column's value); an interior node prefixes its records
-  with `N+1` child pointers. Slotted-page layout (intra-page free space, in-place updates) is
-  a later refinement; P6.1 rewrites a whole node page when it changes.
+- **Within-page structure** — the tree is a **B+tree** (v24, [bplus-reshape.md](bplus-reshape.md)):
+  a **leaf** page holds **all** the records, column-major (each record stores its key + each
+  column's value in per-column class-shaped regions — format.md *Leaf node*); an **interior**
+  page holds only `separator keys + N+1 child pointers` (record-free routing). Slotted-page
+  layout (intra-page free space, in-place updates) is a later refinement; P6.1 rewrites a whole
+  node page when it changes.
 - **Crash-recovery story** — the meta double-buffer (§4) gives atomic commit; **no WAL is
   needed** — the copy-on-write + root-swap model gives both atomicity *and* reader/writer
   concurrency (transactions.md §10) for free, which are the two reasons an embedded engine

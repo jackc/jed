@@ -97,27 +97,35 @@ operations: `get`, `insert→new`, `remove→new`, in-order `iter`, and `range` 
 Each mutation **path-copies** root→leaf and shares the untouched siblings, so the prior root
 is provably unchanged and a snapshot is an O(1) reference clone.
 
-**Recommended shape: a copy-on-write B-tree.** Chosen deliberately as the in-memory
-precursor of the on-disk B-tree (Phase 6, [storage.md](storage.md) §6): when incremental
-copy-on-write commit lands, it **page-backs the tree we already have** rather than building
-one — which collapses the two separate Phase-6 XL items ("incremental COW commit" and
-"B-tree interior pages") into one coherent slice ([TODO.md](../../TODO.md) Phase 6). *Decided:
-B-tree, not a persistent BST* — a binary node never maps to a page, so a BST would still
-force a re-pack at Phase 6; the B-tree avoids it. (A persistent BST remains the documented
-fallback if the B-tree proves too costly to keep in lockstep across three cores; it preserves
-every §2 guarantee and only forfeits the Phase-6 convergence.)
+**Decided shape: a copy-on-write B+tree** (v24 — [bplus-reshape.md](bplus-reshape.md); it was
+a CLRS-style B-tree with records at every level through v23). Chosen deliberately as the
+in-memory form of the on-disk tree (Phase 6, [storage.md](storage.md) §6): the incremental
+copy-on-write commit **page-backs the tree we already have** rather than building one. Records
+live **only in leaves**; an interior node is a record-free routing skeleton of **separator
+keys** (a copy of a boundary key, possibly stale after deletes — it keeps routing: left < sep
+≤ right holds forever) plus child pointers, so `get` always descends to a leaf and a range
+scan is a leaf walk driven by a **cursor stack** — deliberately **no leaf sibling pointers**,
+which would break copy-on-write (fixing a neighbour's back-link would copy the neighbour on
+every split; bbolt avoids them for the same reason). The original *"B-tree, not a persistent
+BST"* call stands — a binary node never maps to a page; the reshape doubled down on the
+page-mappable-tree bet, and the BST fallback once noted here is **retired** (the goldens + the
+cross-core round-trip keep the lockstep tractable — bplus-reshape.md §11).
 
 **Cross-core contract — widened at Phase 6.** Through Phase 5 only **iteration order**
 (ascending encoded key) and the **serialized on-disk bytes** were contractual; the in-RAM node
 structure (fan-out, split points) was a **private per-core detail**. **P6.1 closed that
-freedom:** the in-memory copy-on-write B-tree *is* the on-disk B-tree (node ↔ page), so its
-node layout and its **size-driven split/merge rules are now a §8 byte contract**, spec'd with
-golden fixtures in [../fileformat/format.md](../fileformat/format.md). All four
-implementations (Rust/Go/TS + the Ruby reference) run identical split (`payload > C` → 2-way
-median-promote, split point `m = min(largest m with leftpayload ≤ C, N-2)`) and rebalance
-(underfull `payload < C/2` → merge-then-maybe-split) rules over a `RECORD_MAX = (C-12)/2`
-single-record cap, so the trees — and therefore the bytes — are identical. Fan-out is now
-governed by **page fit**, not a tuning constant.
+freedom:** the in-memory copy-on-write tree *is* the on-disk tree (node ↔ page), so its node
+layout and its **size-driven split/merge rules are a §8 byte contract**, spec'd with golden
+fixtures in [../fileformat/format.md](../fileformat/format.md). All four implementations
+(Rust/Go/TS + the Ruby reference) run the identical v24 rules (format.md "Fan-out"): a **leaf**
+that overflows `C` splits 2-way and **copies** the right half's first key up as the parent's
+separator; an **interior** node that overflows **pushes up** its median separator (with the
+pinned degenerate `N = 2 → m = 1` split for near-cap separators); delete rebalances underfull
+(`payload < C/2`) nodes by **merge-then-maybe-split** (a leaf merge removes the parent
+separator; an interior merge pulls it down; an interior merge whose result cannot 2-way split
+is abandoned) — over the kept `RECORD_MAX(K) = (C − max(12, 12+16·K))/2` leaf-record cap. The
+trees — and therefore the bytes — are identical. Fan-out is governed by **page fit**, not a
+tuning constant.
 
 **In-memory reclamation is free.** An old `Snapshot` is reclaimed by the language's own
 mechanism the instant nothing references it — `Arc` refcount in Rust, GC in Go/TS — so the

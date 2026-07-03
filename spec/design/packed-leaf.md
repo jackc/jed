@@ -1,6 +1,20 @@
 # Packed (block-backed) leaves — decode-in-place resident representation over PAX
 
-> The reasoning behind giving a **demand-paged, file-backed B-tree leaf** a *packed* resident form:
+> **Status note (v24, [bplus-reshape.md](bplus-reshape.md)):** the B+tree reshape supersedes this
+> doc's v23-era framing in three places. (a) **Interior nodes no longer hold records** — the
+> "interior nodes are always Decoded (with separator rows)" case below *ceased to exist*: an
+> interior node is a record-free `separator keys + children` skeleton, and every record-bearing
+> node is a leaf. (b) The **leaf region encoding gained the v24 region header** (a flags byte;
+> fixed-width columns a null bitmap + dense untagged slots, variable columns end-offset
+> directories with zero-span NULLs — [../fileformat/format.md](../fileformat/format.md) *Leaf
+> node*), which is exactly the dense stride §11's vectorized tracks want. (c) The remaining
+> Decoded-residency cases (in-memory / dirty leaves) and the two-form
+> `rowAtMaybeMasked`/`rowAtMasked` read seam retire in reshape slices B3/B4 (Decoded survives
+> only as the writer's transient materialize–mutate–repack buffer). Body text below is kept as
+> the design rationale; where it says "interior nodes are always Decoded" or "B-tree stores
+> records in interior nodes too", read it as v23 history.
+>
+> The reasoning behind giving a **demand-paged, file-backed B+tree leaf** a *packed* resident form:
 > stop faulting each clean leaf into a fully-decoded `Vec<Row>` / `[]storedRow` detached from the page,
 > and instead keep the leaf as its **raw page block + the PAX directories the fault already parses**,
 > reconstructing each row (or, better, each *touched column*) **on demand** at scan/emit time — the
