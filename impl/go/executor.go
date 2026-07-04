@@ -1548,6 +1548,14 @@ func (db *engine) attachWriteSnap(name string) *snapshot {
 	return ws
 }
 
+// attachPageSize is the page size of a host attachment's OWN page space (attached-databases.md §2) —
+// used to build its NEW stores (CREATE TABLE / CREATE INDEX) at the size its commit serializes to. A
+// FILE attachment carries its own page size, baked into the file, which may differ from main's; an
+// in-memory attachment matches main. The attachment is known to exist (the qualifier gate passed).
+func (db *engine) attachPageSize(name string) uint32 {
+	return db.core.attachments[name].storage.pageSize
+}
+
 // attachReadView returns the current READ view of every attached database — the transaction's working
 // clone where this tx wrote it, else the pinned committed root — as one frozen map. Used to freeze a
 // snapshotEngine's attachment view (whose own tx is nil, so it reads straight from this map). Returns
@@ -2485,6 +2493,14 @@ func (db *engine) commitTx() (outcome, error) {
 		return outcome{Kind: outcomeStatement, Cost: 0}, nil
 	}
 	working := tx.working
+	// One durable writer per transaction (attached-databases.md §5): at most one FILE-backed database —
+	// MAIN or an attached file — may be written per tx (any number of in-memory attachments + session
+	// temp are free). Checked here, before any durable page is written (in the shared-core path the main
+	// persist is deferred to Session.publish, and the attachment durable commits are the loop below), so a
+	// violating tx commits nothing and rolls back cleanly. Deterministic (a count, order-independent).
+	if err := db.checkOneDurableWriter(tx); err != nil {
+		return outcome{}, err
+	}
 	// Persist the main image when it changed; a transaction that touched ONLY session-local temp tables
 	// skips it entirely so a temp table makes ZERO file writes (temp-tables.md §2). An empty block (no
 	// kind dirty) still persists, preserving prior behavior. Temp state is adopted regardless — never
@@ -2508,13 +2524,15 @@ func (db *engine) commitTx() (outcome, error) {
 		}
 	}
 	db.session.tempCommitted = tx.tempWorking
-	// Adopt each dirtied host-attached database (attached-databases.md §5, the N-root commit): materialize
-	// its working snapshot into the attachment's in-RAM block store (persistTemp-style — the same
-	// incremental copy-on-write pack as temp, NO fsync, since an in-memory attachment has no durability
-	// barrier) and adopt it into this engine's pinned attached view, so publish swaps a new roots.attached.
-	// Like temp this touches no MAIN file; unlike temp the root is DATABASE-scoped (published,
-	// cross-session-visible). Within-session compaction is safe only when no cross-session reader pins an
-	// older root (the live-registry watermark — the committing writer holds the gate but is not in `live`).
+	// Adopt each dirtied host-attached database (attached-databases.md §5, the N-root commit) and adopt it
+	// into this engine's pinned attached view, so publish swaps a new roots.attached. An IN-MEMORY
+	// attachment materializes into its block store persistTemp-style (the same incremental copy-on-write
+	// pack as temp, NO fsync — no durability barrier); a FILE attachment (Slice 2) commits DURABLY through
+	// commitDurable (dirty pages + alternating meta slot + fsync, its own page space) and takes the
+	// post-commit residency flip. The root is DATABASE-scoped (published, cross-session-visible). At most
+	// one file attachment is dirty here (the one-durable-writer check above), so ≤1 fsync path runs.
+	// Within-session compaction (in-memory only) is safe iff no cross-session reader pins an older root
+	// (the live-registry watermark — the committing writer holds the gate but is not in `live`).
 	if len(tx.attachDirty) > 0 {
 		na := make(map[string]*snapshot, len(db.attachedCommitted))
 		for k, v := range db.attachedCommitted {
@@ -2527,7 +2545,14 @@ func (db *engine) commitTx() (outcome, error) {
 			if att == nil {
 				continue // detached mid-transaction (unreachable under the writer gate) — nothing to persist
 			}
-			if err := att.storage.persistTemp(ws, canReclaim); err != nil {
+			if att.isFile() {
+				// Advance the version for the alternating meta slot + reopen (like the main file commit).
+				ws.txid = db.attachedCommitted[name].txid + 1
+				if err := att.storage.commitDurable(ws, canReclaim); err != nil {
+					return outcome{}, err
+				}
+				ws.demoteCleanLeaves() // post-commit residency flip (bplus-reshape.md B4), like Session.publish
+			} else if err := att.storage.persistTemp(ws, canReclaim); err != nil {
 				return outcome{}, err
 			}
 			na[name] = ws
@@ -2535,6 +2560,39 @@ func (db *engine) commitTx() (outcome, error) {
 		db.attachedCommitted = na
 	}
 	return outcome{Kind: outcomeStatement, Cost: 0}, nil
+}
+
+// checkOneDurableWriter enforces the one-durable-writer rule (attached-databases.md §5): a single
+// transaction may modify at most one FILE-backed (durable) database — MAIN or one attached file. Any
+// number of in-memory attachments and the session temp domain are free (their commit is a crash-free
+// pointer swap). Counts the durable databases this tx dirtied; > 1 is 0A000 (the honest v1 narrowing —
+// multi-file atomic write is Slice 3). Called at commit, before any durable page is written.
+func (db *engine) checkOneDurableWriter(tx *activeTx) error {
+	durable := 0
+	if tx.mainDirty && db.mainIsDurable() {
+		durable++
+	}
+	if db.core != nil {
+		for name := range tx.attachDirty {
+			if att := db.core.attachments[name]; att != nil && att.isFile() {
+				durable++
+			}
+		}
+	}
+	if durable > 1 {
+		return newError(FeatureNotSupported, "a transaction may modify at most one durable database")
+	}
+	return nil
+}
+
+// mainIsDurable reports whether this handle's MAIN database is file-backed (durable) rather than
+// in-memory — the input to the one-durable-writer count (§5). In the shared-core path the backing path
+// lives on the core's storage; a standalone engine carries it on db.path.
+func (db *engine) mainIsDurable() bool {
+	if db.core != nil {
+		return db.core.storage.path != ""
+	}
+	return db.path != ""
 }
 
 // rollbackTx rolls back the current transaction (spec/design/transactions.md §4.2). With no open
@@ -4659,9 +4717,12 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 		for i, c := range table.Columns {
 			colTypes[i] = resolveColType(c.Type, mainTypes)
 		}
-		ws.putTableResolved(table, colTypes, db.pageSize)
+		// Build the attachment's new stores at ITS OWN page size (§2) — a file attachment may serialize at
+		// a different page size than main, and its records must split to match its physical pages.
+		aps := db.attachPageSize(attachName)
+		ws.putTableResolved(table, colTypes, aps)
 		for _, ix := range table.Indexes {
-			ws.putIndexStore(strings.ToLower(ix.Name), newTableStore(pagePayload(db.pageSize), nil))
+			ws.putIndexStore(strings.ToLower(ix.Name), newTableStore(pagePayload(aps), nil))
 		}
 		return outcome{Kind: outcomeStatement, Cost: 0}, nil
 	}
@@ -5414,7 +5475,7 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 		// into roots.attached at commit (attached-databases.md §5/§6). attachWriteSnap marks it dirty.
 		ws := db.attachWriteSnap(attachName)
 		ws.tempPaging = db.core.attachments[attachName].storage.paging
-		ws.putIndex(tableKey, def, db.pageSize)
+		ws.putIndex(tableKey, def, db.attachPageSize(attachName)) // the attachment's own page space (§2)
 	case db.isTempTable(ci.Table):
 		db.session.tx.tempDirty = true
 		db.session.tx.tempWorking.putIndex(tableKey, def, db.pageSize)

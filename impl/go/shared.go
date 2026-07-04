@@ -125,12 +125,21 @@ const (
 // (attached-databases.md §2): a named (storage, published-root) quad reachable by a database
 // qualifier. The storage identity (mutable page accounting, writer-gated) lives here; the immutable
 // committed snapshot lives in roots.attached[name] so a reader pins it lock-free with every other
-// root. In Slice 1b every attachment is in-memory (a memoryBlockStore, kind file deferred to Slice 2).
+// root. An attachment is file-backed (Slice 2 — storage.path != "", a fileBlockStore behind the pager,
+// committed durably via storage.commitDurable) or in-memory (storage.path == "", a memoryBlockStore
+// committed via persistTemp). The storage kind is the sole source of the file/memory distinction — no
+// separate flag.
 type attachment struct {
 	name    string     // lowercased qualifier name (the map key)
 	mode    attachMode // readWrite | readOnly (§4)
-	storage *storage   // the in-memory block store + pager + page accounting (like the temp domain)
+	storage *storage   // the block store (file or in-memory) + pager + page accounting
 }
+
+// isFile reports whether this attachment is file-backed (durable, Slice 2) rather than in-memory. A
+// file-backed database has a non-empty backing path; an in-memory one has "". The write-commit path
+// branches on it (durable commitDurable vs pointer-swap persistTemp) and the one-durable-writer rule
+// (§5) counts only file-backed attachments.
+func (a *attachment) isFile() bool { return a.storage.path != "" }
 
 // storage is the storage identity of a database (spec/design/session.md §2.4; bplus-reshape.md B3):
 // the open pager + leaf buffer pool and the mutable page accounting, shared by every session over
@@ -169,7 +178,22 @@ type storage struct {
 // crash between the two syncs leaves the prior meta intact (copy-on-write: reused pages are reachable
 // from no live snapshot). pageCount/freePages advance only after both syncs succeed.
 func (c *sharedCore) persist(snap *snapshot) error {
-	st := c.storage
+	// The main domain reclaims when no reader pins an older version (the file/in-memory watermark).
+	return c.storage.commitDurable(snap, c.oldestLiveVersion(snap.txid) == snap.txid)
+}
+
+// commitDurable durably publishes snap into this storage via an incremental copy-on-write commit
+// (spec/fileformat/format.md; transactions.md §9) — the same recipe sharedCore.persist uses for the
+// MAIN domain, factored out so a host-attached FILE database (attached-databases.md §5, Slice 2)
+// commits durably through it too: write the dirty pages this commit introduced (reusing free-list
+// pages first), Sync, publish the alternate meta slot (snap.txid & 1), Sync. A crash between the two
+// syncs leaves the prior meta intact (copy-on-write: reused pages are reachable from no live
+// snapshot). pageCount/freePages advance only after both syncs succeed. For an IN-MEMORY store the
+// meta write + Sync are byte-store operations whose sync is a no-op — the file commit minus
+// durability (bplus-reshape.md B3). Runs under the caller's writer gate (single-writer page
+// accounting). canReclaim gates within-session compaction (a no-op for a file/main domain, whose
+// reclaimWithinSession is false — it reconstructs its free-list on open instead).
+func (st *storage) commitDurable(snap *snapshot, canReclaim bool) error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	write, err := snap.incrementalImage(st.pageSize, st.pageCount, st.freePages, st.paging)
@@ -203,8 +227,17 @@ func (c *sharedCore) persist(snap *snapshot) error {
 	}
 	st.pageCount = write.pageCount
 	st.freePages = write.freeRemaining
-	// The main domain reclaims when no reader pins an older version (the file/in-memory watermark).
-	return st.maybeCompact(snap, write.rootPage, c.oldestLiveVersion(snap.txid) == snap.txid)
+	return st.maybeCompact(snap, write.rootPage, canReclaim)
+}
+
+// close releases a file-backed storage's open pager (closing the underlying file); a no-op for an
+// in-memory store whose memoryBlockStore close is itself a no-op. Used by Database.Detach for a file
+// attachment (attached-databases.md §4) so detaching releases the OS handle.
+func (st *storage) close() error {
+	if st.paging == nil {
+		return nil
+	}
+	return st.paging.close()
 }
 
 // hasLiveReaders reports whether any cross-session reader currently pins a committed snapshot (the live
@@ -362,20 +395,22 @@ type Database struct {
 }
 
 // AttachSource selects the backing for a database attached via Database.Attach
-// (spec/design/attached-databases.md §4). It is a stable memory|file variant from Slice 1b: only a
-// MEMORY source is supported now (a fresh, empty in-memory database); a FILE source is reserved for
-// Slice 2 and currently returns 0A000, so the Attach signature never changes when file attach lands.
-// Build one with AttachMemory() or AttachFile(path).
+// (spec/design/attached-databases.md §4). A MEMORY source is a fresh, empty in-memory database
+// (Slice 1b); a FILE source opens an existing single-file jed database on disk (Slice 2). Build one
+// with AttachMemory() or AttachFile(path).
 type AttachSource struct {
-	file bool   // false = in-memory (Slice 1b); true = file-backed (Slice 2, 0A000 for now)
+	file bool   // false = in-memory (Slice 1b); true = file-backed (Slice 2)
 	path string // the file path, when file is true
 }
 
 // AttachMemory returns a source for a fresh, empty in-memory attachment (attached-databases.md §6).
 func AttachMemory() AttachSource { return AttachSource{} }
 
-// AttachFile returns a source for a file-backed attachment. Reserved for Slice 2: Database.Attach with
-// a file source is currently 0A000 (feature_not_supported).
+// AttachFile returns a source for a file-backed attachment: an existing single-file jed database at
+// path (attached-databases.md §4, Slice 2). The file's own page size is honored (each attachment is
+// its own page space, §2). Combine with readOnly=true (the natural reference-database mode) to open it
+// O_RDONLY as well as reject every write (25006); readOnly=false opens it O_RDWR so DDL/DML can target
+// it (subject to the one-durable-writer rule, §5).
 func AttachFile(path string) AttachSource { return AttachSource{file: true, path: path} }
 
 // CreateOptions are the settings for creating a fresh database (spec/design/api.md §2.1). Path
@@ -475,27 +510,55 @@ func (s *Database) OldestLiveTxid() uint64 {
 
 // Attach adds a database named `name` to this handle, reachable by the database qualifier `name.table`
 // (spec/design/attached-databases.md §4). Attaching is a HOST-API act, never SQL — an untrusted,
-// SQL-only session cannot attach anything (the pure-SQL safety spine, §4/§13). In Slice 1b `source`
-// must be AttachMemory() (a fresh, empty in-memory database); AttachFile is reserved for Slice 2 and
-// returns 0A000. `readOnly` attaches it read-only: every write to it (DML or DDL) is 25006, and it never
-// competes for the one-durable-writer slot (§5). The name is case-folded; it must not name a reserved
-// database (`main` / `temp`) or one already attached (42710). Publishing the new empty attachment root
-// is atomic under the writer gate.
+// SQL-only session cannot attach anything (the pure-SQL safety spine, §4/§13). `source` is either
+// AttachMemory() (a fresh, empty in-memory database) or AttachFile(path) (an existing single-file jed
+// database on disk, Slice 2 — its committed state becomes the attachment's initial root, its own page
+// size honored). `readOnly` attaches it read-only: every write to it (DML or DDL) is 25006, it never
+// competes for the one-durable-writer slot (§5), and a file source is additionally opened O_RDONLY
+// (defense in depth). The name is case-folded; it must not name a reserved database (`main` / `temp`)
+// or one already attached (42710). Opening a file surfaces the same host/file codes as opening `main`
+// (58P01/58P02/XX001/…, hosts.md §4). Publishing the new attachment root is atomic under the writer gate.
 func (db *Database) Attach(name string, source AttachSource, readOnly bool) error {
-	if source.file {
-		return newError(FeatureNotSupported, "file attachment is not supported yet (Slice 2)")
-	}
 	lname := strings.ToLower(name)
 	if lname == "" {
 		return newError(DuplicateObject, "attachment name must not be empty")
+	}
+	// Open a file source BEFORE taking the writer gate (an open may block on I/O and can fail): a
+	// standalone engine over the file, whose committed snapshot + storage identity become the attachment.
+	var st *storage
+	var root *snapshot
+	if source.file {
+		e, err := openWithOptions(source.path, OpenOptions{ReadOnly: readOnly})
+		if err != nil {
+			return err
+		}
+		st = &storage{
+			pageSize:  e.pageSize,
+			pageCount: e.pageCount,
+			freePages: e.freePages,
+			paging:    e.paging,
+			readOnly:  e.readOnly,
+			path:      e.path,
+		}
+		root = e.committed // its stores fault through st.paging (bound at load); tempPaging stays nil
 	}
 	c := db.core
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	if lname == "main" || lname == "temp" || c.attachments[lname] != nil {
+		if st != nil {
+			_ = st.close() // release the just-opened file — the name is taken
+		}
 		return newError(DuplicateObject, `database "`+name+`" already exists`)
 	}
-	st := newAttachedStorage(c.pageSize())
+	if st == nil {
+		// A fresh in-memory attachment: an empty root whose NEW stores attach to its own paging (the same
+		// seam session-local temp uses — a snapshot's tempPaging is "the paging new stores bind to").
+		st = newAttachedStorage(c.pageSize())
+		empty := newSnapshot()
+		empty.tempPaging = st.paging
+		root = empty
+	}
 	mode := attachReadWrite
 	if readOnly {
 		mode = attachReadOnly
@@ -504,16 +567,12 @@ func (db *Database) Attach(name string, source AttachSource, readOnly bool) erro
 		c.attachments = make(map[string]*attachment)
 	}
 	c.attachments[lname] = &attachment{name: lname, mode: mode, storage: st}
-	// The fresh attachment's committed root: an empty snapshot whose NEW stores attach to its own paging
-	// (the same seam session-local temp uses — a snapshot's tempPaging is "the paging new stores bind to").
-	empty := newSnapshot()
-	empty.tempPaging = st.paging
 	old := c.roots.Load()
 	na := make(map[string]*snapshot, len(old.attached)+1)
 	for k, v := range old.attached {
 		na[k] = v
 	}
-	na[lname] = empty
+	na[lname] = root
 	c.roots.Store(&roots{committed: old.committed, attached: na})
 	return nil
 }
@@ -538,6 +597,7 @@ func (db *Database) Detach(name string) error {
 	if inUse {
 		return newError(ObjectInUse, `cannot detach database "`+name+`" while it is in use`)
 	}
+	att := c.attachments[lname]
 	delete(c.attachments, lname)
 	old := c.roots.Load()
 	na := make(map[string]*snapshot, len(old.attached))
@@ -547,7 +607,9 @@ func (db *Database) Detach(name string) error {
 		}
 	}
 	c.roots.Store(&roots{committed: old.committed, attached: na})
-	return nil
+	// Release a file attachment's OS handle once it is unpublished and unreferenced (a no-op for an
+	// in-memory attachment). No live reader can still fault it — detach-in-use was rejected above.
+	return att.storage.close()
 }
 
 // committedEngine builds a transient read engine over the latest committed snapshot for catalog
@@ -728,10 +790,19 @@ func (db *Database) UpgradeCollations() (int, error) {
 // Close closes the backing store (an in-memory store's close is a no-op). The bare convenience
 // methods autocommit, so there is never uncommitted work to discard. Idempotent.
 func (db *Database) Close() error {
-	if st := db.core.storage; st.paging != nil {
+	c := db.core
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if st := c.storage; st.paging != nil {
 		_ = st.paging.close()
 		st.paging = nil
 	}
+	// Release any still-attached file databases (an in-memory attachment's close is a no-op), so the
+	// host need not detach before Close (attached-databases.md §4). Order-independent (just closing).
+	for _, att := range c.attachments {
+		_ = att.storage.close()
+	}
+	c.attachments = nil
 	return nil
 }
 
