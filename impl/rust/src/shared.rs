@@ -134,28 +134,28 @@ pub(crate) enum AttachMode {
 /// One host-attached DATABASE-scoped database in a handle's namespace (attached-databases.md §2): a
 /// named (storage, published-root) quad reachable by a database qualifier. The mutable storage
 /// identity (page accounting, writer-gated) lives here; the immutable committed snapshot lives in
-/// [`Roots::attached`] under the same key so a reader pins it lock-free with every other root. In
-/// Slice 1b every attachment is in-memory (a `MemoryBlockStore`; a file source is deferred to Slice 2).
+/// [`Roots::attached`] under the same key so a reader pins it lock-free with every other root. An
+/// attachment is file-backed (Slice 2 — `storage.path` is `Some`, a `FileBlockStore`, committed durably
+/// via [`Storage::commit_durable`]) or in-memory (`storage.path` is `None`, a `MemoryBlockStore`,
+/// committed via `persist_temp`). The storage kind is the sole source of the file/memory distinction.
 pub(crate) struct Attachment {
     /// Lowercased qualifier name (the map key).
     #[allow(dead_code)]
     name: String,
     mode: AttachMode,
-    /// The in-memory block store + pager + page accounting (the temp-domain recipe).
+    /// The block store (file or in-memory) + pager + page accounting.
     storage: Storage,
 }
 
 /// Selects the backing for a database attached via [`Database::attach`]
-/// (spec/design/attached-databases.md §4). A stable memory|file variant from Slice 1b: only a MEMORY
-/// source is supported now (a fresh, empty in-memory database); a FILE source is reserved for Slice 2
-/// and currently returns `0A000`, so the `attach` signature never changes when file attach lands.
-/// Build one with [`AttachSource::memory`] or [`AttachSource::file`].
+/// (spec/design/attached-databases.md §4). A MEMORY source is a fresh, empty in-memory database
+/// (Slice 1b); a FILE source opens an existing single-file jed database on disk (Slice 2). Build one
+/// with [`AttachSource::memory`] or [`AttachSource::file`].
 #[derive(Clone, Debug)]
 pub struct AttachSource {
-    /// `false` = in-memory (Slice 1b); `true` = file-backed (Slice 2, `0A000` for now).
+    /// `false` = in-memory (Slice 1b); `true` = file-backed (Slice 2).
     file: bool,
     /// The file path, when `file` is true.
-    #[allow(dead_code)]
     path: Option<std::path::PathBuf>,
 }
 
@@ -168,8 +168,11 @@ impl AttachSource {
         }
     }
 
-    /// A source for a file-backed attachment. Reserved for Slice 2: [`Database::attach`] with a file
-    /// source is currently `0A000` (feature_not_supported).
+    /// A source for a file-backed attachment: an existing single-file jed database at `path`
+    /// (attached-databases.md §4, Slice 2). The file's own page size is honored (each attachment is its
+    /// own page space, §2). With `read_only` true it is opened `O_RDONLY` as well as write-rejected
+    /// (`25006`); with `read_only` false it is opened `O_RDWR` so DDL/DML can target it (subject to the
+    /// one-durable-writer rule, §5).
     pub fn file<P: AsRef<Path>>(path: P) -> AttachSource {
         AttachSource {
             file: true,
@@ -289,6 +292,48 @@ impl Storage {
         self.maybe_compact(snap, write.root_page, can_reclaim)
     }
 
+    /// Durably publish `snap` into this storage via an **incremental** copy-on-write commit
+    /// (spec/fileformat/format.md; transactions.md §9) — the same recipe [`Shared::persist`] uses for
+    /// the MAIN domain, factored out so a host-attached FILE database (attached-databases.md §5, Slice 2)
+    /// commits durably through it too: write the dirty pages this commit introduced (reusing free-list
+    /// pages first), `sync`, publish the alternate meta slot (`snap.txid & 1`), `sync`. A crash between
+    /// the two syncs leaves the prior meta intact (copy-on-write: reused pages are reachable from no live
+    /// snapshot). `page_count`/`free_pages` advance only after both syncs succeed. For an IN-MEMORY store
+    /// the store's `sync` is a no-op — the file commit minus durability (bplus-reshape.md B3). Runs under
+    /// the caller's writer gate. `can_reclaim` gates within-session compaction (a no-op for a file/main
+    /// domain, whose `reclaim_within_session` is false — it reconstructs its free-list on open instead).
+    pub(crate) fn commit_durable(&mut self, snap: &Snapshot, can_reclaim: bool) -> Result<()> {
+        let write = snap.incremental_image(
+            self.page_size,
+            self.page_count,
+            &self.free_pages,
+            Some(&self.paging),
+        )?;
+        let meta =
+            crate::format::meta_page(self.page_size, snap.txid, write.root_page, write.page_count);
+        {
+            let mut pager = self.paging.pager();
+            // Preallocate ahead of the high-water so the body `fdatasync` carries no file-growth
+            // metadata journaling (spec/design/pager.md §7).
+            pager.reserve(write.page_count)?;
+            for (index, bytes) in &write.pages {
+                pager.write_block(*index, bytes)?;
+            }
+            pager.sync()?; // body pages durable before the meta can reference them
+            pager.write_block((snap.txid & 1) as u32, &meta)?;
+            pager.sync()?; // the commit is published
+        }
+        // Invalidate rewritten pages AFTER the pager guard drops — pool-then-pager order (paging.rs): a
+        // no-op unless a reclaim domain reused a freed page id, in which case the pool's prior decode
+        // must be evicted.
+        for (index, _) in &write.pages {
+            self.paging.invalidate(*index);
+        }
+        self.page_count = write.page_count;
+        self.free_pages = write.free_remaining;
+        self.maybe_compact(snap, write.root_page, can_reclaim)
+    }
+
     /// Reclaim within-session copy-on-write orphans (temp-tables.md §6) by rebuilding the free-list from
     /// the live (reachable) set, so later commits reuse dead pages instead of only growing the
     /// high-water. A no-op for a non-reclaim domain; deferred while an older version is pinned
@@ -405,16 +450,19 @@ impl Shared {
             .map(|a| a.mode)
     }
 
-    /// Materialize a dirtied attachment's working snapshot into its in-RAM block store
-    /// (attached-databases.md §5, the N-root commit): the SAME incremental copy-on-write pack as temp
-    /// (`persist_temp` — NO fsync, an in-memory attachment has no durability barrier), watermark-gated
-    /// compaction via `can_reclaim`. Called from [`Engine::commit_tx`] under the writer gate, so the
-    /// storage mutation is single-writer. A detached-mid-transaction attachment (unreachable under the
-    /// gate) no-ops.
-    pub(crate) fn persist_attachment(
+    /// Commit a dirtied attachment's working snapshot into its block store (attached-databases.md §5, the
+    /// N-root commit). An IN-MEMORY attachment packs persist_temp-style (NO fsync — no durability
+    /// barrier). A FILE attachment (Slice 2) advances the version (`base_txid + 1`) for its alternating
+    /// meta slot + reopen, commits DURABLY through [`Storage::commit_durable`] (dirty pages + meta +
+    /// fsync, its own page space), then takes the post-commit residency flip. `can_reclaim` gates the
+    /// in-memory within-session compaction. Called from [`Engine::commit_tx`] under the writer gate, so
+    /// the storage mutation is single-writer. A detached-mid-transaction attachment (unreachable under
+    /// the gate) no-ops.
+    pub(crate) fn commit_attachment(
         &self,
         name: &str,
         snap: &mut Snapshot,
+        base_txid: u64,
         can_reclaim: bool,
     ) -> Result<()> {
         let mut atts = self
@@ -422,7 +470,13 @@ impl Shared {
             .lock()
             .expect("attachments lock not poisoned");
         if let Some(att) = atts.get_mut(name) {
-            att.storage.persist_temp(snap, can_reclaim)?;
+            if att.storage.path.is_some() {
+                snap.txid = base_txid + 1;
+                att.storage.commit_durable(snap, can_reclaim)?;
+                snap.demote_clean_leaves(); // post-commit residency flip (bplus-reshape.md B4)
+            } else {
+                att.storage.persist_temp(snap, can_reclaim)?;
+            }
         }
         Ok(())
     }
@@ -517,35 +571,39 @@ impl Shared {
         // watermark BEFORE the storage lock so the `live` lock is never held under it (a clean order).
         let can_reclaim = self.oldest_live_version(snap.txid) == snap.txid;
         let mut st = self.storage.lock().expect("storage lock not poisoned");
-        let write = snap.incremental_image(
-            st.page_size,
-            st.page_count,
-            &st.free_pages,
-            Some(&st.paging),
-        )?;
-        let meta =
-            crate::format::meta_page(st.page_size, snap.txid, write.root_page, write.page_count);
-        {
-            let mut pager = st.paging.pager();
-            // Preallocate ahead of the high-water so the body `fdatasync` carries no file-growth
-            // metadata journaling (spec/design/pager.md §7).
-            pager.reserve(write.page_count)?;
-            for (index, bytes) in &write.pages {
-                pager.write_block(*index, bytes)?;
-            }
-            pager.sync()?; // body pages durable before the meta can reference them
-            pager.write_block((snap.txid & 1) as u32, &meta)?;
-            pager.sync()?; // the commit is published
-        }
-        // Invalidate rewritten pages AFTER the pager guard drops — pool-then-pager order (paging.rs): a
-        // no-op unless a reclaim domain reused a freed page id, in which case the pool's prior decode
-        // must be evicted.
-        for (index, _) in &write.pages {
-            st.paging.invalidate(*index);
-        }
-        st.page_count = write.page_count;
-        st.free_pages = write.free_remaining;
-        st.maybe_compact(snap, write.root_page, can_reclaim)
+        st.commit_durable(snap, can_reclaim)
+    }
+
+    /// Whether MAIN is file-backed (durable) rather than in-memory — the input to the one-durable-writer
+    /// count (attached-databases.md §5).
+    pub(crate) fn is_file_backed(&self) -> bool {
+        self.storage
+            .lock()
+            .expect("storage lock not poisoned")
+            .path
+            .is_some()
+    }
+
+    /// Whether the host attachment `name` (lowercased) is file-backed (durable, Slice 2) rather than
+    /// in-memory — it counts against the one-durable-writer slot (§5) and selects the durable commit path.
+    pub(crate) fn attachment_is_file(&self, name: &str) -> bool {
+        self.attachments
+            .lock()
+            .expect("attachments lock not poisoned")
+            .get(name)
+            .is_some_and(|a| a.storage.path.is_some())
+    }
+
+    /// The page size of the host attachment `name`'s OWN page space (attached-databases.md §2) — used to
+    /// build its NEW stores (CREATE TABLE / CREATE INDEX) at the size its commit serializes to. A file
+    /// attachment carries its own page size, baked into the file, which may differ from main's.
+    pub(crate) fn attachment_page_size(&self, name: &str) -> u32 {
+        self.attachments
+            .lock()
+            .expect("attachments lock not poisoned")
+            .get(name)
+            .map(|a| a.storage.page_size)
+            .expect("attachment exists (the qualifier gate passed)")
     }
 
     /// The oldest version a live reader pinned, floored at `new_txid` (the version this commit
@@ -798,19 +856,16 @@ impl Database {
 
     /// Attach a database named `name` to this handle, reachable by the database qualifier `name.table`
     /// (spec/design/attached-databases.md §4). Attaching is a HOST-API act, never SQL — an untrusted,
-    /// SQL-only session cannot attach anything (the pure-SQL safety spine, §4/§13). In Slice 1b `source`
-    /// must be [`AttachSource::memory`] (a fresh, empty in-memory database); a file source is reserved
-    /// for Slice 2 and returns `0A000`. `read_only` attaches it read-only: every write to it (DML or
-    /// DDL) is `25006`, and it never competes for the one-durable-writer slot (§5). The name is
-    /// case-folded; it must not name a reserved database (`main` / `temp`) or one already attached
-    /// (`42710`). Publishing the new empty attachment root is atomic under the writer gate.
+    /// SQL-only session cannot attach anything (the pure-SQL safety spine, §4/§13). `source` is either
+    /// [`AttachSource::memory`] (a fresh, empty in-memory database) or [`AttachSource::file`] (an existing
+    /// single-file jed database on disk, Slice 2 — its committed state becomes the attachment's initial
+    /// root, its own page size honored). `read_only` attaches it read-only: every write to it (DML or
+    /// DDL) is `25006`, it never competes for the one-durable-writer slot (§5), and a file source is
+    /// additionally opened `O_RDONLY`. The name is case-folded; it must not name a reserved database
+    /// (`main` / `temp`) or one already attached (`42710`). Opening a file surfaces the same host/file
+    /// codes as opening `main` (`58P01`/`58P02`/`XX001`/…). Publishing the new root is atomic under the
+    /// writer gate.
     pub fn attach(&self, name: &str, source: AttachSource, read_only: bool) -> Result<()> {
-        if source.file {
-            return Err(EngineError::new(
-                SqlState::FeatureNotSupported,
-                "file attachment is not supported yet (Slice 2)",
-            ));
-        }
         let lname = name.to_ascii_lowercase();
         if lname.is_empty() {
             return Err(EngineError::new(
@@ -818,6 +873,36 @@ impl Database {
                 "attachment name must not be empty",
             ));
         }
+        // Open a file source BEFORE taking the writer gate (an open may block on I/O and can fail): a
+        // standalone engine over the file, whose committed snapshot + storage identity become the
+        // attachment. If the name is taken, the built `Storage` drops here (closing the just-opened file).
+        let file_backing: Option<(Storage, Snapshot)> = if source.file {
+            let path = source.path.as_ref().expect("a file source carries a path");
+            let engine = Engine::open_with_options(
+                path,
+                OpenOptions {
+                    read_only,
+                    ..OpenOptions::default()
+                },
+            )?;
+            let paging = engine
+                .paging
+                .clone()
+                .expect("an opened engine carries a paging context (B3)");
+            let storage = Storage {
+                page_size: engine.page_size,
+                page_count: engine.page_count,
+                free_pages: engine.free_pages.clone(),
+                paging,
+                read_only: engine.read_only,
+                path: engine.path.clone(),
+                reclaim_within_session: false,
+                live_at_compaction: 0,
+            };
+            Some((storage, engine.committed))
+        } else {
+            None
+        };
         self.0.acquire_writer();
         let result = (|| {
             {
@@ -833,12 +918,18 @@ impl Database {
                     ));
                 }
             }
-            let page_size = self.0.page_size();
-            let storage = Storage::new_temp(page_size);
-            // The fresh attachment's committed root: an empty snapshot whose NEW stores attach to its
-            // OWN paging (the temp seam — a snapshot's `temp_paging` is "the paging new stores bind to").
-            let mut empty = Snapshot::default();
-            empty.set_temp_paging(storage.paging().clone());
+            // A file source becomes (its storage, its committed root); an in-memory source is a fresh,
+            // empty snapshot whose NEW stores attach to its OWN paging (the temp seam — a snapshot's
+            // `temp_paging` is "the paging new stores bind to").
+            let (storage, root) = match file_backing {
+                Some((st, committed)) => (st, committed),
+                None => {
+                    let storage = Storage::new_temp(self.0.page_size());
+                    let mut empty = Snapshot::default();
+                    empty.set_temp_paging(storage.paging().clone());
+                    (storage, empty)
+                }
+            };
             let mode = if read_only {
                 AttachMode::ReadOnly
             } else {
@@ -857,7 +948,7 @@ impl Database {
                     },
                 );
             let mut r = self.0.roots.write().expect("roots lock not poisoned");
-            r.attached.insert(lname.clone(), Arc::new(empty));
+            r.attached.insert(lname.clone(), Arc::new(root));
             Ok(())
         })();
         self.0.release_writer();

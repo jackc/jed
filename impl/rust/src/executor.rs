@@ -1962,6 +1962,27 @@ impl Engine {
         Ok(())
     }
 
+    /// Whether this handle's MAIN database is file-backed (durable) rather than in-memory — the input to
+    /// the one-durable-writer count (attached-databases.md §5). In the shared-core path the backing path
+    /// lives on the core's storage; a standalone engine carries it on `self.path`.
+    fn main_is_durable(&self) -> bool {
+        match &self.core {
+            Some(c) => c.is_file_backed(),
+            None => self.path.is_some(),
+        }
+    }
+
+    /// The page size of a host attachment's OWN page space (attached-databases.md §2) — used to build its
+    /// NEW stores (CREATE TABLE / CREATE INDEX) at the size its commit serializes to. A file attachment
+    /// carries its own page size, baked into the file, which may differ from main's. The attachment is
+    /// known to exist (the qualifier gate passed).
+    fn attach_page_size(&self, name: &str) -> u32 {
+        self.core
+            .as_ref()
+            .expect("an attachment write has a shared core")
+            .attachment_page_size(name)
+    }
+
     /// The READ snapshot of a host-attached database (attached-databases.md §5) — the transaction's
     /// working clone if this tx wrote it, else the pinned committed root (`attached_committed`). `None`
     /// when no attachment is named `name` (the caller raises 42P01). `name` is expected lowercased.
@@ -3093,6 +3114,27 @@ impl Engine {
         let mut working = tx.working;
         let mut attach_working = tx.attach_working;
         let attach_dirty = tx.attach_dirty;
+        // One durable writer per transaction (attached-databases.md §5): at most one FILE-backed database
+        // — MAIN or an attached file — may be written per tx (any number of in-memory attachments +
+        // session temp are free). Checked here, before any durable page is written (in the shared-core
+        // path the main persist is deferred to `Session::publish`, and the attachment durable commits are
+        // the loop below), so a violating tx commits nothing. Deterministic (a count, order-independent).
+        {
+            let mut durable = usize::from(main_dirty && self.main_is_durable());
+            if let Some(c) = &self.core {
+                durable += attach_dirty
+                    .iter()
+                    .filter(|name| c.attachment_is_file(name))
+                    .count();
+            }
+            if durable > 1 {
+                // `tx` was already taken above, so the working sets drop here — nothing is committed.
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "a transaction may modify at most one durable database",
+                ));
+            }
+        }
         // Persist the main image when it changed; a transaction that touched ONLY session-local temp
         // tables skips it entirely so a temp table makes ZERO file writes (spec/design/temp-tables.md
         // §2). An empty block (no kind dirty) still persists, preserving prior behavior. Temp state is
@@ -3122,14 +3164,16 @@ impl Engine {
         // temp analogue of publishing `committed`, but purely in memory. SessionState-local temp lives on
         // the session.
         self.session.temp_committed = temp_working;
-        // Adopt each dirtied host-attached database (attached-databases.md §5, the N-root commit):
-        // materialize its working snapshot into the attachment's in-RAM block store (persist_temp-style —
-        // the same incremental copy-on-write pack as temp, NO fsync, an in-memory attachment has no
-        // durability barrier) and adopt it into this engine's pinned attached view, so `publish` swaps a
-        // new `Roots::attached`. Like temp this touches no MAIN file; unlike temp the root is
-        // DATABASE-scoped (published, cross-session-visible). Within-session compaction is safe only when
-        // no cross-session reader pins an older root (the live-registry watermark — the committing writer
-        // holds the gate but is not in `live`).
+        // Adopt each dirtied host-attached database (attached-databases.md §5, the N-root commit) and
+        // adopt it into this engine's pinned attached view, so `publish` swaps a new `Roots::attached`. An
+        // IN-MEMORY attachment packs persist_temp-style (the same incremental copy-on-write pack as temp,
+        // NO fsync — no durability barrier); a FILE attachment (Slice 2) commits DURABLY (dirty pages +
+        // alternating meta slot + fsync, its own page space) — [`Shared::commit_attachment`] branches on
+        // the storage kind. The root is DATABASE-scoped (published, cross-session-visible). At most one
+        // file attachment is dirty here (the one-durable-writer check above), so ≤1 fsync path runs.
+        // Within-session compaction (in-memory only) is safe only when no cross-session reader pins an
+        // older root (the live-registry watermark — the committing writer holds the gate but is not in
+        // `live`).
         if !attach_dirty.is_empty() {
             let core = self.core.clone();
             let can_reclaim = core.as_ref().is_none_or(|c| !c.has_live_readers());
@@ -3140,7 +3184,8 @@ impl Engine {
                 };
                 if let Some(c) = &core {
                     // A detached-mid-transaction attachment (unreachable under the writer gate) no-ops.
-                    c.persist_attachment(name, &mut ws, can_reclaim)?;
+                    let base_txid = self.attached_committed.get(name).map_or(0, |a| a.txid);
+                    c.commit_attachment(name, &mut ws, base_txid, can_reclaim)?;
                 }
                 na.insert(name.clone(), std::sync::Arc::new(ws));
             }
@@ -4553,7 +4598,10 @@ impl Engine {
                     .map(|c| resolve_col_type(&c.ty, &main.types))
                     .collect()
             };
-            let ps = self.page_size;
+            // Build the attachment's new stores at ITS OWN page size (§2) — a file attachment may
+            // serialize at a different page size than main, and its records must split to match.
+            let ps = self.attach_page_size(&name);
+            let acap = crate::format::page_payload(ps);
             // Register into the attachment's working snapshot (attached-databases.md §6) — never the main
             // image; published into `Roots::attached` at commit (N-root commit, §5). `attach_write_snap`
             // clones the attachment's committed root (which already carries its `temp_paging`) on first
@@ -4561,7 +4609,7 @@ impl Engine {
             let ws = self.attach_write_snap(&name);
             ws.put_table_resolved(table, col_types, ps);
             for k in index_keys {
-                ws.put_index_store(k, TableStore::new(cap, Vec::new()));
+                ws.put_index_store(k, TableStore::new(acap, Vec::new()));
             }
             return Ok(Outcome::Statement {
                 cost: 0,
@@ -5142,8 +5190,10 @@ impl Engine {
             // The attachment's index catalog entry + (empty) store live in its working snapshot,
             // published into `Roots::attached` at commit (attached-databases.md §5/§6).
             // `attach_write_snap` clones the attachment's committed root (which carries its
-            // `temp_paging`) on first write and marks it dirty.
-            self.attach_write_snap(name).put_index(&table_key, def, ps);
+            // `temp_paging`) on first write and marks it dirty. Build it at the attachment's own page
+            // size (§2), which may differ from main's.
+            let aps = self.attach_page_size(name);
+            self.attach_write_snap(name).put_index(&table_key, def, aps);
         } else if self.is_temp_table(&ci.table) {
             self.temp_working_mut().put_index(&table_key, def, ps);
         } else {
