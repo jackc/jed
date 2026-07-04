@@ -1,0 +1,102 @@
+# The jed_ name reservation (spec/design/introspection.md §4): a USER-written name for any object
+# in the relation namespace (table — incl. TEMP — index, sequence, or a named UNIQUE/EXCLUDE
+# constraint, whose name IS its backing index) or the type namespace (composite type) may not begin
+# with jed_ — the prefix is reserved for the engine's future catalog relations (jed_tables,
+# jed_columns, …). Case-insensitive (resolution folds case; there is no quoted-identifier escape —
+# grammar.md §3): 42939 reserved_name. The check sits with each site's namespace-collision check, so
+# established validation orders keep priority (42P01 before 42939 for CREATE INDEX). Deliberately
+# NOT reserved (each pinned below): column names, CHECK constraint names (per-table namespace only),
+# and engine-GENERATED names — a serial's <table>_<col>_seq and an index auto-name both stay legal
+# for a table named jed. IF NOT EXISTS does not suppress the error (a reservation is not a
+# collision).
+# requires: ddl.create_table, ddl.primary_key, ddl.temp_table, session.allow_temp_ddl, ddl.secondary_index, ddl.unique, ddl.exclusion_constraint, ddl.check, ddl.sequence, ddl.alter_sequence, ddl.serial, func.sequence, types.composite, types.range, dml.insert, dml.insert_column_list, query.select, types.i32
+
+# --- the relation namespace: tables (persistent + TEMP), case-insensitively ------------------------
+
+statement error 42939
+CREATE TABLE jed_tables (a i32)
+
+statement error 42939
+CREATE TABLE JED_Tables (a i32)
+
+# the bare prefix itself is a valid identifier — and reserved
+statement error 42939
+CREATE TABLE jed_ (a i32)
+
+statement error 42939
+CREATE TEMP TABLE jed_scratch (a i32)
+
+# --- indexes, sequences, named UNIQUE / EXCLUDE constraints ----------------------------------------
+
+statement ok
+CREATE TABLE t (a i32)
+
+statement error 42939
+CREATE INDEX jed_idx ON t (a)
+
+statement error 42939
+CREATE SEQUENCE jed_seq
+
+# a reservation is not a collision: IF NOT EXISTS does not suppress it
+statement error 42939
+CREATE SEQUENCE IF NOT EXISTS jed_seq
+
+# a named UNIQUE constraint IS its backing index (constraints.md §5) — the name enters the
+# relation namespace
+statement error 42939
+CREATE TABLE u1 (a i32, CONSTRAINT jed_u UNIQUE (a))
+
+# same for a named EXCLUDE constraint's backing GiST index (gist.md §7)
+statement error 42939
+CREATE TABLE e1 (id i32 PRIMARY KEY, r i32range, CONSTRAINT jed_e EXCLUDE (r WITH &&))
+
+# --- the type namespace: composite types -----------------------------------------------------------
+
+statement error 42939
+CREATE TYPE jed_point AS (x i32, y i32)
+
+# --- validation order: existence checks keep priority over the reserved-name check -----------------
+
+statement error 42P01
+CREATE INDEX jed_i ON nosuch (a)
+
+# --- a rename cannot smuggle a reserved name in ----------------------------------------------------
+
+statement ok
+CREATE SEQUENCE s1
+
+statement error 42939
+ALTER SEQUENCE s1 RENAME TO jed_s1
+
+# --- NOT reserved: near-miss relation names, column names, CHECK constraint names ------------------
+
+statement ok
+CREATE TABLE jedx (a i32)
+
+statement ok
+CREATE TABLE myjed_t (a i32)
+
+statement ok
+CREATE TABLE t2 (jed_col i32)
+
+statement ok
+CREATE TABLE t3 (a i32, CONSTRAINT jed_c CHECK (a > 0))
+
+# --- engine-GENERATED names are exempt: a table legally named jed ----------------------------------
+
+# the serial column auto-creates the OWNED sequence jed_id_seq (sequences.md §12) — legal
+statement ok
+CREATE TABLE jed (id serial, v i32)
+
+statement ok
+INSERT INTO jed (v) VALUES (7)
+
+query II nosort
+SELECT id, v FROM jed
+----
+1
+7
+
+# the unnamed index auto-names itself jed_v_idx (indexes.md §2) — legal
+statement ok
+CREATE INDEX ON jed (v)

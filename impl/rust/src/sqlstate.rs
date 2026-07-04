@@ -138,6 +138,8 @@ pub enum SqlState {
     IndeterminateCollation,
     /// 42710 — constraint {name} for relation {table} already exists
     DuplicateObject,
+    /// 42939 — {kind} name {name} is reserved (the jed_ prefix is reserved for system objects)
+    ReservedName,
     /// 42809 — {name} is not {kind}
     WrongObjectType,
     /// 42622 — identifier exceeds the maximum length of {max} bytes
@@ -243,6 +245,7 @@ impl SqlState {
             SqlState::CollationMismatch => "42P21",
             SqlState::IndeterminateCollation => "42P22",
             SqlState::DuplicateObject => "42710",
+            SqlState::ReservedName => "42939",
             SqlState::WrongObjectType => "42809",
             SqlState::NameTooLong => "42622",
             SqlState::GeneratedAlways => "428C9",
@@ -340,6 +343,7 @@ pub const ERRORS: &[ErrorDesc] = &[
     ErrorDesc { code: "42P21", name: "collation_mismatch", class: "syntax error or access rule violation" },
     ErrorDesc { code: "42P22", name: "indeterminate_collation", class: "syntax error or access rule violation" },
     ErrorDesc { code: "42710", name: "duplicate_object", class: "syntax error or access rule violation" },
+    ErrorDesc { code: "42939", name: "reserved_name", class: "syntax error or access rule violation" },
     ErrorDesc { code: "42809", name: "wrong_object_type", class: "syntax error or access rule violation" },
     ErrorDesc { code: "42622", name: "name_too_long", class: "syntax error or access rule violation" },
     ErrorDesc { code: "428C9", name: "generated_always", class: "syntax error or access rule violation" },

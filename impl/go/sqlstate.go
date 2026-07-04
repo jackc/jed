@@ -141,6 +141,8 @@ const (
 	IndeterminateCollation
 	// DuplicateObject is 42710 — constraint {name} for relation {table} already exists.
 	DuplicateObject
+	// ReservedName is 42939 — {kind} name {name} is reserved (the jed_ prefix is reserved for system objects).
+	ReservedName
 	// WrongObjectType is 42809 — {name} is not {kind}.
 	WrongObjectType
 	// NameTooLong is 42622 — identifier exceeds the maximum length of {max} bytes.
@@ -308,6 +310,8 @@ func (s SqlState) Code() string {
 		return "42P22"
 	case DuplicateObject:
 		return "42710"
+	case ReservedName:
+		return "42939"
 	case WrongObjectType:
 		return "42809"
 	case NameTooLong:
@@ -423,6 +427,7 @@ var errorDescs = []errorDesc{
 	{Code: "42P21", Name: "collation_mismatch", Class: "syntax error or access rule violation"},
 	{Code: "42P22", Name: "indeterminate_collation", Class: "syntax error or access rule violation"},
 	{Code: "42710", Name: "duplicate_object", Class: "syntax error or access rule violation"},
+	{Code: "42939", Name: "reserved_name", Class: "syntax error or access rule violation"},
 	{Code: "42809", Name: "wrong_object_type", Class: "syntax error or access rule violation"},
 	{Code: "42622", Name: "name_too_long", Class: "syntax error or access rule violation"},
 	{Code: "428C9", Name: "generated_always", Class: "syntax error or access rule violation"},

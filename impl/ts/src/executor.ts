@@ -483,6 +483,22 @@ export const MAX_COMPOSITE_DEPTH = 32;
 // identically across cores (§8). A TextEncoder is available in Node and the browser (the OPFS
 // host), so this stays host-agnostic.
 const SQL_BYTE_ENCODER = new TextEncoder();
+// checkReservedName rejects a USER-written catalog object name beginning jed_ — the prefix is
+// reserved for the engine's own catalog relations (spec/design/introspection.md §4). Case-insensitive
+// (resolution folds case and there is no quoted-identifier escape — grammar.md §3). Engine-GENERATED
+// names (a serial's <table>_<col>_seq, an index auto-name — both legal for a table named jed) never
+// pass through here; the check sits with each site's namespace-collision check so established
+// validation orders (42P01/42703 before name checks) are preserved. kind is the object word in the
+// message: table / index / sequence / type / constraint.
+function checkReservedName(kind: string, name: string): void {
+  if (name.length >= 4 && name.slice(0, 4).toLowerCase() === "jed_") {
+    throw engineError(
+      "reserved_name",
+      `${kind} name ${name} is reserved (the jed_ prefix is reserved for system objects)`,
+    );
+  }
+}
+
 function utf8ByteLength(s: string): number {
   return SQL_BYTE_ENCODER.encode(s).length;
 }
@@ -4281,6 +4297,7 @@ export class Engine {
         );
       }
     }
+    checkReservedName("table", ct.name);
     // The relation namespace is shared between tables and indexes (indexes.md §2), so a CREATE TABLE
     // colliding with either kind is the same 42P07 — PG's "relation" word. For a bare/main/temp target
     // relationExists is temp-aware (a temp name collides with temp + persistent alike — temp-tables.md
@@ -4787,6 +4804,10 @@ export class Engine {
     for (const ru of survivors) {
       let name: string;
       if (ru.name !== null) {
+        // A named UNIQUE constraint IS its backing index (constraints.md §5), so the
+        // user-written name enters the relation namespace — reserved-prefix checked like
+        // any relation name (introspection.md §4).
+        checkReservedName("constraint", ru.name);
         if (relationTaken(ru.name)) {
           throw engineError("duplicate_table", "relation already exists: " + ru.name);
         }
@@ -5046,6 +5067,9 @@ export class Engine {
         table.exclusions.some((e) => e.name.toLowerCase() === n.toLowerCase());
       let name: string;
       if (exc.name !== null) {
+        // The named EXCLUDE constraint's backing GiST index carries the user-written name
+        // into the relation namespace (introspection.md §4).
+        checkReservedName("constraint", exc.name);
         if (relTaken(exc.name)) {
           throw engineError("duplicate_table", "relation already exists: " + exc.name);
         }
@@ -5602,6 +5626,7 @@ export class Engine {
     };
     let name: string;
     if (ci.name !== null) {
+      checkReservedName("index", ci.name);
       if (relationTaken(ci.name)) {
         throw engineError("duplicate_table", "relation already exists: " + ci.name);
       }
@@ -5727,6 +5752,7 @@ export class Engine {
   // duplicate field name (42701), then register the composite type in the catalog. Named
   // composites only.
   private executeCreateType(ct: CreateType): Outcome {
+    checkReservedName("type", ct.name);
     if (this.compositeType(ct.name) !== undefined) {
       throw engineError("duplicate_object", "type " + ct.name + " already exists");
     }
@@ -5841,6 +5867,9 @@ export class Engine {
   // the option overrides against the INCREMENT sign's type defaults, validate the set (22023),
   // reject a relation-namespace collision (42P07 unless IF NOT EXISTS), and register the sequence.
   private executeCreateSequence(cs: CreateSequence): Outcome {
+    // The reservation is not a collision, so IF NOT EXISTS does not suppress it
+    // (spec/design/introspection.md §4).
+    checkReservedName("sequence", cs.name);
     if (this.relationExists(cs.name)) {
       if (cs.ifNotExists) return { kind: "statement", cost: 0n, rowsAffected: null };
       throw engineError("duplicate_table", `relation already exists: ${cs.name}`);
@@ -5913,6 +5942,7 @@ export class Engine {
   // to nextval('s2') (the rows survive — not via putTable) so a later INSERT still advances the
   // renamed sequence (jed resolves the sequence by name, unlike PG's OID reference).
   private alterSequenceRename(existing: SequenceDef, newName: string): void {
+    checkReservedName("sequence", newName);
     if (this.relationExists(newName)) {
       throw engineError("duplicate_table", `relation already exists: ${newName}`);
     }

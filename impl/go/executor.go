@@ -3869,6 +3869,9 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 			return outcome{}, newError(FeatureNotSupported, "an EXCLUDE constraint on an attached-database table is not supported yet")
 		}
 	}
+	if err := checkReservedName("table", ct.Name); err != nil {
+		return outcome{}, err
+	}
 	// The relation namespace is shared between tables and indexes (indexes.md §2), so a CREATE TABLE
 	// colliding with either kind is the same 42P07 — PG's "relation" word. For a bare/main/temp target
 	// relationExists is temp-aware (a temp name collides with temp + persistent alike — temp-tables.md
@@ -4363,6 +4366,12 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 	for _, ru := range survivors {
 		name := ru.name
 		if name != "" {
+			// A named UNIQUE constraint IS its backing index (constraints.md §5), so the
+			// user-written name enters the relation namespace — reserved-prefix checked like
+			// any relation name (introspection.md §4).
+			if err := checkReservedName("constraint", name); err != nil {
+				return outcome{}, err
+			}
 			if relationTaken(name) {
 				return outcome{}, newError(DuplicateTable, "relation already exists: "+name)
 			}
@@ -4665,6 +4674,11 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 		}
 		var name string
 		if exc.Name != "" {
+			// The named EXCLUDE constraint's backing GiST index carries the user-written name
+			// into the relation namespace (introspection.md §4).
+			if err := checkReservedName("constraint", exc.Name); err != nil {
+				return outcome{}, err
+			}
 			if relTaken(exc.Name) {
 				return outcome{}, newError(DuplicateTable, "relation already exists: "+exc.Name)
 			}
@@ -5229,6 +5243,20 @@ func (db *engine) findIndex(name string) (string, indexDef, bool) {
 	return db.readSnap().findIndex(name)
 }
 
+// checkReservedName rejects a USER-written catalog object name beginning jed_ — the prefix is
+// reserved for the engine's own catalog relations (spec/design/introspection.md §4). Case-insensitive
+// (resolution folds case and there is no quoted-identifier escape — grammar.md §3). Engine-GENERATED
+// names (a serial's <table>_<col>_seq, an index auto-name — both legal for a table named jed) never
+// pass through here; the check sits with each site's namespace-collision check so established
+// validation orders (42P01/42703 before name checks) are preserved. kind is the object word in the
+// message: table / index / sequence / type.
+func checkReservedName(kind, name string) error {
+	if len(name) >= 4 && strings.EqualFold(name[:4], "jed_") {
+		return newError(ReservedName, kind+" name "+name+" is reserved (the jed_ prefix is reserved for system objects)")
+	}
+	return nil
+}
+
 // relationExists reports whether name is taken in the shared relation namespace (a table
 // OR an index — spec/design/indexes.md §2), case-insensitively.
 func (db *engine) relationExists(name string) bool {
@@ -5404,6 +5432,9 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 	}
 	name := ci.Name
 	if name != "" {
+		if err := checkReservedName("index", name); err != nil {
+			return outcome{}, err
+		}
 		if relationTaken(name) {
 			return outcome{}, newError(DuplicateTable, "relation already exists: "+name)
 		}
@@ -5554,6 +5585,9 @@ func (db *engine) executeDropIndex(di *dropIndex) (outcome, error) {
 // composite — 42704 if unknown; no self- or forward-reference), reject a duplicate field name
 // (42701), then register the composite type in the catalog. Named composites only.
 func (db *engine) executeCreateType(ct *createType) (outcome, error) {
+	if err := checkReservedName("type", ct.Name); err != nil {
+		return outcome{}, err
+	}
 	if db.readSnap().compositeType(ct.Name) != nil {
 		return outcome{}, newError(DuplicateObject, "type "+ct.Name+" already exists")
 	}
@@ -5650,6 +5684,11 @@ func (db *engine) executeDropType(dt *dropType) (outcome, error) {
 // the option overrides against the INCREMENT sign's type defaults, validate the set (22023),
 // reject a relation-namespace collision (42P07 unless IF NOT EXISTS), and register the sequence.
 func (db *engine) executeCreateSequence(cs *createSequence) (outcome, error) {
+	// The reservation is not a collision, so IF NOT EXISTS does not suppress it
+	// (spec/design/introspection.md §4).
+	if err := checkReservedName("sequence", cs.Name); err != nil {
+		return outcome{}, err
+	}
 	if db.relationExists(cs.Name) {
 		if cs.IfNotExists {
 			return outcome{Kind: outcomeStatement, Cost: 0}, nil
@@ -5741,6 +5780,9 @@ func (db *engine) executeAlterSequence(as *alterSequence) (outcome, error) {
 // nextval('s2') (the rows survive — not via putTable) so a later INSERT still advances the renamed
 // sequence (jed resolves the sequence by name, unlike PG's OID reference).
 func (db *engine) alterSequenceRename(existing *sequenceDef, newName string) error {
+	if err := checkReservedName("sequence", newName); err != nil {
+		return err
+	}
 	if db.relationExists(newName) {
 		return newError(DuplicateTable, "relation already exists: "+newName)
 	}

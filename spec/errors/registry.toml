@@ -484,6 +484,21 @@ class = "syntax error or access rule violation"
 template = "constraint {name} for relation {table} already exists"
 
 [[error]]
+code = "42939"
+name = "reserved_name"
+class = "syntax error or access rule violation"
+# The jed_ name prefix is reserved for the engine's own catalog relations (the future
+# jed_tables / jed_columns — spec/design/introspection.md §4). Raised when DDL supplies a
+# USER-written name beginning jed_ (case-insensitive; there is no quoted-identifier escape)
+# for any object in the relation namespace (table — incl. TEMP — index, sequence, or a named
+# UNIQUE/EXCLUDE constraint, whose name IS its backing index) or the type namespace (composite
+# type). Engine-GENERATED names (a serial's <table>_<col>_seq for a table legally named jed)
+# are exempt. PG's code — PG uses it for the pg_ schema prefix; reserving in the relation/type
+# namespaces is jed's (schema-less) form of the same rule, per the recorded §1 divergence.
+# {kind} is the object word: table / index / sequence / type / constraint.
+template = "{kind} name {name} is reserved (the jed_ prefix is reserved for system objects)"
+
+[[error]]
 code = "42809"
 name = "wrong_object_type"
 class = "syntax error or access rule violation"

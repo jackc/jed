@@ -3548,6 +3548,7 @@ impl Engine {
                 ));
             }
         }
+        check_reserved_name("table", &ct.name)?;
         // The relation namespace is shared between tables and indexes (indexes.md §2), so a
         // CREATE TABLE colliding with either kind is the same 42P07 — PG's "relation" word. For a
         // bare/main/temp target `relation_exists` is temp-aware (preclude-overlaps — temp-tables.md §3);
@@ -4175,6 +4176,10 @@ impl Engine {
             };
             let name = match uname {
                 Some(n) => {
+                    // A named UNIQUE constraint IS its backing index (constraints.md §5), so the
+                    // user-written name enters the relation namespace — reserved-prefix checked
+                    // like any relation name (introspection.md §4).
+                    check_reserved_name("constraint", &n)?;
                     if taken(self, &table, &n) {
                         return Err(EngineError::new(
                             SqlState::DuplicateTable,
@@ -4510,6 +4515,9 @@ impl Engine {
             };
             let name = match &exc.name {
                 Some(n) => {
+                    // The named EXCLUDE constraint's backing GiST index carries the user-written
+                    // name into the relation namespace (introspection.md §4).
+                    check_reserved_name("constraint", n)?;
                     if taken(self, &table, n) {
                         return Err(EngineError::new(
                             SqlState::DuplicateTable,
@@ -5124,6 +5132,7 @@ impl Engine {
         };
         let name = match &ci.name {
             Some(n) => {
+                check_reserved_name("index", n)?;
                 if relation_taken(n) {
                     return Err(EngineError::new(
                         SqlState::DuplicateTable,
@@ -5296,6 +5305,7 @@ impl Engine {
     /// — 42704 if unknown; no self- or forward-reference), reject a duplicate field name (42701),
     /// then register the composite type in the catalog. Named composites only.
     fn execute_create_type(&mut self, ct: CreateType) -> Result<Outcome> {
+        check_reserved_name("type", &ct.name)?;
         if self.read_snap().composite_type(&ct.name).is_some() {
             return Err(EngineError::new(
                 SqlState::DuplicateObject,
@@ -5450,6 +5460,9 @@ impl Engine {
     /// against the INCREMENT sign's type defaults, validate the set (22023), reject a relation-
     /// namespace collision (42P07 unless `IF NOT EXISTS`), and register the sequence.
     fn execute_create_sequence(&mut self, cs: CreateSequence) -> Result<Outcome> {
+        // The reservation is not a collision, so IF NOT EXISTS does not suppress it
+        // (spec/design/introspection.md §4).
+        check_reserved_name("sequence", &cs.name)?;
         if self.relation_exists(&cs.name) {
             if cs.if_not_exists {
                 return Ok(Outcome::Statement {
@@ -5576,6 +5589,7 @@ impl Engine {
     /// `nextval('s2')` so a later INSERT still advances the renamed sequence (jed resolves the
     /// sequence by name, unlike PG's OID reference).
     fn alter_sequence_rename(&mut self, existing: &SequenceDef, new_name: &str) -> Result<()> {
+        check_reserved_name("sequence", new_name)?;
         if self.relation_exists(new_name) {
             return Err(EngineError::new(
                 SqlState::DuplicateTable,
@@ -14822,6 +14836,25 @@ impl ScopeRel<'_> {
 /// Whether a database qualifier names one of the two implicit reserved scopes `main` / `temp`
 /// (attached-databases.md §3), which resolve to the SAME store the bare name would. A `None` qualifier
 /// (a bare implicit-scope name) counts as reserved for routing: it too keeps the temp-first funnels.
+/// Reject a USER-written catalog object name beginning `jed_` — the prefix is reserved for the
+/// engine's own catalog relations (spec/design/introspection.md §4). Case-insensitive (resolution
+/// folds case and there is no quoted-identifier escape — grammar.md §3). Engine-GENERATED names (a
+/// serial's `<table>_<col>_seq`, an index auto-name — both legal for a table named `jed`) never
+/// pass through here; the check sits with each site's namespace-collision check so established
+/// validation orders (42P01/42703 before name checks) are preserved. `kind` is the object word in
+/// the message: table / index / sequence / type.
+fn check_reserved_name(kind: &str, name: &str) -> Result<()> {
+    if name.len() >= 4 && name.as_bytes()[..4].eq_ignore_ascii_case(b"jed_") {
+        return Err(EngineError::new(
+            SqlState::ReservedName,
+            format!(
+                "{kind} name {name} is reserved (the jed_ prefix is reserved for system objects)"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn is_reserved_scope(q: Option<&str>) -> bool {
     match q {
         None => true,

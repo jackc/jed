@@ -73,6 +73,7 @@ export type SqlState =
   | "collation_mismatch" // 42P21 — collation mismatch between explicit collations {left} and {right}
   | "indeterminate_collation" // 42P22 — could not determine which collation to use for string comparison
   | "duplicate_object" // 42710 — constraint {name} for relation {table} already exists
+  | "reserved_name" // 42939 — {kind} name {name} is reserved (the jed_ prefix is reserved for system objects)
   | "wrong_object_type" // 42809 — {name} is not {kind}
   | "name_too_long" // 42622 — identifier exceeds the maximum length of {max} bytes
   | "generated_always" // 428C9 — {detail}
@@ -156,6 +157,7 @@ const CODES: Record<SqlState, string> = {
   collation_mismatch: "42P21",
   indeterminate_collation: "42P22",
   duplicate_object: "42710",
+  reserved_name: "42939",
   wrong_object_type: "42809",
   name_too_long: "42622",
   generated_always: "428C9",
@@ -255,6 +257,7 @@ export const ERRORS: readonly ErrorDesc[] = [
   { code: "42P21", name: "collation_mismatch", class: "syntax error or access rule violation" },
   { code: "42P22", name: "indeterminate_collation", class: "syntax error or access rule violation" },
   { code: "42710", name: "duplicate_object", class: "syntax error or access rule violation" },
+  { code: "42939", name: "reserved_name", class: "syntax error or access rule violation" },
   { code: "42809", name: "wrong_object_type", class: "syntax error or access rule violation" },
   { code: "42622", name: "name_too_long", class: "syntax error or access rule violation" },
   { code: "428C9", name: "generated_always", class: "syntax error or access rule violation" },
