@@ -133,7 +133,24 @@ implicit transaction *is* read-only). Because no write transaction can open, no 
 publishes; the file is additionally opened **without write access**, so the OS enforces what
 the guards promise (a read-only handle works on a read-only filesystem). The handle exposes
 `read_only()` / `ReadOnly()` / `.readOnly`. Like the memory budget it is a handle setting, not
-stored in the file — another handle may have the same file open writable.
+stored in the file. (Under the default file lock — next paragraph — a read-only handle still
+holds the file exclusively; it is a promise about *this handle's* behavior, not an invitation
+for a concurrent writer.)
+
+**File lock — an open-time property ([locking.md](locking.md)).** `create`, `open`, and file
+`attach` acquire an **exclusive whole-file lock by default**, held for the handle's lifetime
+and released at `close`/`detach` (kernel-owned, so a crash leaves no stale lock; mechanism per
+host in locking.md §4). A second open of a locked file — from another process *or* the same
+one — fails **`55006 object_in_use`**, or waits up to **`opts.lock_timeout_ms`** (default `0`
+= fail immediately) before failing: the zero-downtime-deploy knob — the incoming process opens
+with a generous timeout and acquires the moment the outgoing process closes (locking.md §1).
+**`opts.locking`** — `exclusive` (default) | `none` — is the escape hatch for externally
+coordinated access, static files, and network filesystems, where the caller owns the
+aloneness guarantee the engine otherwise enforces. A host with no locking mechanism at all
+fails the default closed (`0A000`, locking.md §2.2) rather than silently not enforcing.
+In-memory databases have no file and no lock. Same shape across cores (Rust `OpenOptions {
+locking, lock_timeout_ms }` / Go `OpenOptions { Locking, LockTimeoutMs }`, zero value =
+exclusive / TS `{ locking, lockTimeoutMs }`).
 
 **Work-memory budget — a handle setting ([spill.md](spill.md) §3).** `open`'s `opts.work_mem`
 (Rust `OpenOptions { work_mem }` / Go `OpenOptions { WorkMem }` / TS `{ workMem }`; default

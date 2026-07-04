@@ -192,6 +192,15 @@ out-of-range header is `XX001 data_corrupted`. These are raised in the **host pr
 (api.md), which is above the `BlockStore`; the `BlockStore` itself surfaces raw I/O failures
 that the layer maps. The class is a stable category (api.md §7).
 
+**File locking is a host-layer duty, not a `BlockStore` method ([locking.md](locking.md)).**
+The default-exclusive whole-file lock (locking.md §2) is acquired by the host program layer's
+file open — before the first content read — like the class-58 errors above; the five-method
+byte seam stays lock-unaware. Each host declares a **locking tier** (locking.md §4, normative
+per OS so cores mutually exclude): `os` (Rust/Go — `flock` on Unix, share-mode-0 on Windows),
+`cooperative` (TS — the `<path>.lock` side-car, best-effort), `inherent` (OPFS —
+`createSyncAccessHandle` *is* the lock), `unavailable` (wasm32-wasip1 — default-exclusive
+opens fail closed, `0A000`).
+
 ## 5. The OPFS host (the build target)
 
 The browser host backs the database on the Origin Private File System via a
@@ -314,6 +323,10 @@ as it crosses. See the two docs for the full designs.
     OPFS-backed `SpillSink` is the path); read-only multi-handle via `createSyncAccessHandle({ mode })`
     (not portable yet); and running the real-browser e2e in CI (needs a headless-Chromium binary, today
     outside `rake ci`).
+- **File locking** — ⏳ **decided, spec'd ([locking.md](locking.md)), not built**: the
+  default-exclusive whole-file lock (§4 above) as the immediate implementation; shared
+  multi-process access with the lease refinement is the recorded follow-on (locking.md §7 —
+  OFD `fcntl`/`LockFileEx` sentinel ranges, a Rust edge dependency needing §14 confirmation).
 - **Encryption codec** — ⏳ design door ([encryption.md](encryption.md)); not built. Crypto is a
   §14 vetted-library decision requiring explicit confirmation before any dependency lands.
 - **Replication tee** — ⏳ design door ([replication.md](replication.md)); block-shipping decided,

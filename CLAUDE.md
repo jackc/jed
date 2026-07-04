@@ -597,6 +597,19 @@ cross-core-identical and owns that consequence (the host-extension boundary, §1
   **explicit** and `close` does **not** auto-flush (uncommitted changes are discarded); an
   in-memory `commit` is a no-op success, so the operation stays uniform and forward-compatible
   with the future §3 staging-buffer transactions. Same shape across all three cores.
+- **Multi-process access: exclusive-by-default file locking (`spec/design/locking.md`) —
+  decided, spec'd, not yet built.** The engine assumes it is alone with the file (free-list
+  reconstruct-on-open, buffer pool, the in-process watermark); the lock makes that an enforced
+  invariant instead of a hope: `open`/`create`/file-`attach` take an **exclusive whole-file
+  lock** by default (Unix `flock`, Windows share-mode-0, TS a cooperative side-car, OPFS
+  inherent — normative per-OS so cores mutually exclude), a second open fails `55006` or waits
+  up to `lock_timeout_ms` — which serves the zero-downtime deploy (the new process waits for
+  the old to close; requests queue seconds, no shared state). `locking = none` is the explicit
+  opt-out. **Shared multi-process access** (co-resident writers: presence + write-gate locks,
+  append-only commits while co-resident, the lease refinement making the alone case cost
+  what exclusive mode costs) is **designed and recorded as an unscheduled follow-on**
+  (locking.md §7) — v1 deliberately stays exclusive-only so the follow-on's lock-state space
+  stays unambiguous.
 
 ---
 

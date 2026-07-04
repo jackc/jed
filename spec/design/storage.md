@@ -219,6 +219,18 @@ sits so the options stay open (CLAUDE.md §9).
   the watermark gate then does real work, paired with file-backed reader sharing) and on-disk
   free-list persistence (so open skips the reachable-set walk —
   [../fileformat/format.md](../fileformat/format.md) *Reclamation*).
+- **Multi-process file locking** — ⏳ **decided, spec'd ([locking.md](locking.md)), not
+  built.** Everything above assumes the engine is alone with the file (the open-time
+  free-list walk, the buffer pool, the in-process watermark); today nothing enforces it — two
+  handles on one file is undefined corruption. The decided immediate implementation is an
+  **exclusive-by-default whole-file lock** at `open`/`create`/`attach` (second open `55006`,
+  or bounded wait via `lock_timeout_ms` — the zero-downtime-deploy pattern, locking.md §1),
+  which turns this doc's aloneness *assumptions* into enforced invariants with no new gating
+  (locking.md §5). **Shared multi-process access** (presence + write-gate locks, append-only
+  commits while co-resident, the lease refinement that keeps the alone case at exclusive-mode
+  cost) is designed and **recorded as an unscheduled follow-on** (locking.md §7); it is where
+  reclamation, compaction, and free-list persistence gain a *cross-process* "provably alone"
+  gate alongside the watermark.
 - **File compaction / shrink (returning space to the OS)** — ⏳ **approach decided, not built.**
   The free-list (above) recycles dead space for *jed*, but it never gives it back: `page_count` is
   a monotonic high-water (plus the pager.md §7 preallocation slack), so the file is **grow-only** —
