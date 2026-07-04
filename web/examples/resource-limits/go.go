@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 
@@ -14,6 +15,8 @@ func main() {
 	}
 	defer db.Close()
 
+	ctx := context.Background()
+
 	// Serve untrusted queries through a session bounded TWO ways:
 	//   MaxCost         — a per-STATEMENT ceiling: one runaway query aborts 54P01.
 	//   LifetimeMaxCost — a per-SESSION budget: the session's cumulative cost is capped, so a flood
@@ -22,18 +25,18 @@ func main() {
 	defer untrusted.Close()
 
 	// Each statement accrues into the session's running total; read it with LifetimeCost().
-	untrusted.Execute("SELECT 1", nil) // cost 1 — cumulative 1
-	untrusted.Execute("SELECT 1", nil) // cost 1 — cumulative 2
+	untrusted.Exec(ctx, "SELECT 1") // cost 1 — cumulative 1
+	untrusted.Exec(ctx, "SELECT 1") // cost 1 — cumulative 2
 
 	// The third drives the cumulative to the budget — the in-flight statement aborts 54P02, and the
 	// partial cost still counts, so the session is now spent.
-	if _, err := untrusted.Execute("SELECT 1", nil); err != nil {
+	if _, err := untrusted.Exec(ctx, "SELECT 1"); err != nil {
 		fmt.Println("denied:", err.(*jed.EngineError).Code()) // 54P02
 	}
 	fmt.Println("spent:", untrusted.LifetimeCost()) // 3 — the budget
 
 	// Once spent, every further statement is rejected at admission — the session is done.
-	if _, err := untrusted.Execute("SELECT 1", nil); err != nil {
+	if _, err := untrusted.Exec(ctx, "SELECT 1"); err != nil {
 		fmt.Println("admission:", err.(*jed.EngineError).Code()) // 54P02
 	}
 }

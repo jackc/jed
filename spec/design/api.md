@@ -38,13 +38,17 @@ mapping table in §6.
   is additive and back-compatible.
 - **`PreparedStatement`** — a parsed, reusable statement. Parameter count/types are fixed at
   prepare time; the same statement runs many times with different bound values.
-- **`Outcome`** — the result of running a statement: either a bare statement result carrying
-  the accrued `cost` (plus, for DML, the affected-row count — §4), or a query result carrying
-  column names, rows, and `cost`. Which variant a statement yields follows from its SQL: a
-  `SELECT` (or set operation) is a query result, and so is a DML statement with a `RETURNING`
-  clause ([grammar.md](grammar.md) §32); everything else is a bare statement result.
-- **`Rows`** — a cursor over a query result, yielding one row at a time, plus the column
-  names and the accrued cost.
+- **`Rows`** — the **one** result type: a cursor over a query result, yielding one row at a time,
+  plus the column names, the column types, the accrued cost, and — for a statement — the command
+  tag (affected-row count, §4). Running a statement is **total**: `query` always returns `Rows`,
+  and a **non-query statement** (CREATE / INSERT / UPDATE / DELETE without `RETURNING`,
+  transaction control) is observably a `Rows` with **no output columns** that carries only its
+  command tag. Which shape a statement yields follows from its SQL: a `SELECT` (or set operation),
+  or a DML statement with a `RETURNING` clause ([grammar.md](grammar.md) §32), yields output
+  columns; everything else is the no-column statement form. The exec-side call (`run` / `Exec` /
+  `execute`) drains this cursor and returns just the command tag. (The engine's internal
+  materialized statement result, `Outcome`, is **not** part of the public surface — the single
+  `query -> Rows` seam replaced it; see §11.)
 - **`EngineError` / `SqlState`** — the structured error surface (errors are data, not prose
   — CLAUDE.md §5). Every operation surfaces these idiomatically.
 
@@ -250,14 +254,16 @@ commit. `close` is idempotent.
   here) and returns a reusable handle. (Introspecting a statement's inferred parameter count
   before binding is deferred — the count is enforced at execute time via the `42601`
   count-mismatch check.)
-- **`statement.execute(params) -> Outcome`** runs a (possibly mutating) statement and
-  returns the materialized outcome. `statement.query(params) -> Rows` runs a query and
-  returns a cursor. `params` is empty when the statement has no placeholders. A prepared
-  statement runs **within a transaction** — an explicit one (on a `Transaction`) or, on the
-  handle directly, the autocommit single-statement transaction of §2.2.
-- One-shot convenience: `db.execute(sql, params)` / `db.query(sql, params)` are sugar for
-  prepare-then-run (autocommit). The pre-API free function `execute(db, sql)` is kept unchanged
-  (zero parameters) — the conformance harnesses depend on it.
+- **`statement.query(params) -> Rows`** runs a (possibly mutating) statement over the one total
+  seam and returns a cursor (a non-query statement yields a no-column `Rows` carrying its command
+  tag). **`statement.execute(params)`** is the exec-side sibling: it runs the same seam, drains the
+  cursor, and returns just the command tag (the affected-row count — Rust `u64`, TS `RunResult`;
+  Go's `Exec` returns a `Result`). `params` is empty when the statement has no placeholders. A
+  prepared statement runs **within a transaction** — an explicit one (on a `Transaction`) or, on
+  the handle directly, the autocommit single-statement transaction of §2.2.
+- One-shot convenience: `db.execute(sql, params)` (command tag) / `db.query(sql, params)` (cursor)
+  are sugar for prepare-then-run (autocommit). The internal free function `execute(db, sql)` (zero
+  parameters, kept for the conformance harnesses / white-box tests) drains the same `query` seam.
 - **Plan cache.** A `PreparedStatement.query` caches its **resolved plan** (not just the parsed
   AST) and reuses it across executes, so a repeated query skips planning entirely — the dominant
   cost of a trivial-plan / high-frequency lookup (planning is ~⅔ of a point lookup's latency and
@@ -379,10 +385,10 @@ drained** (it accrues as rows are pulled — [streaming.md §6](streaming.md)). 
 `54P01` cost abort, a `57014` cancellation, an arithmetic trap) surfaces during iteration — Rust
 stashes it for [`Rows::error()`](streaming.md), Go sets `Rows.Err()`, TS throws out of the
 iterator; this is so even for the `Buffered` cursor, whose blocking part runs on the first pull
-(not at `query()`). **`execute()` still returns a fully materialized `Outcome`** (the conformance
-harness drives it, so every `# cost:` value is unchanged — the lazy cursor is a `query()`-only
-optimization, internal machinery whose only contract is identical rows + total cost under full
-drain). A top-level set-operation / pure-query `WITH` read now streams too (a lazy **deferred** cursor,
+(not at `query()`). The exec-side `execute` / `run` / `Exec` **drains this same lazy cursor** for its
+command tag (so a mid-drain streaming error surfaces to the exec caller too, and every `# cost:` value
+is unchanged — the lazy cursor's only contract is identical rows + total cost under full drain). A
+top-level set-operation / pure-query `WITH` read now streams too (a lazy **deferred** cursor,
 [streaming.md §7](streaming.md) S6: it defers the whole run to the first pull and yields the result one
 row at a time); and a **prepared** query streams identically to an ad-hoc one — `prepare` + `query_prepared`
 routes the prepared AST through the same lazy lanes ([streaming.md §7](streaming.md) S8), so a prepared
@@ -442,15 +448,16 @@ only and the engine has no wire protocol).
 | tx commit / rollback | `tx.commit()` / `tx.rollback()` | `tx.Commit()` / `tx.Rollback() error` | `tx.commit()` / `tx.rollback()` |
 | close | `db.close()` + `Drop` | `db.Close() error` | `close(db): void` |
 | prepare | `db.prepare(sql) -> Result<PreparedStatement>` | `db.Prepare(sql) (*PreparedStatement, error)` | `prepare(db, sql): PreparedStatement` |
-| stmt execute | `stmt.execute(&mut db, &params) -> Result<Outcome>` | `stmt.Execute(params) (Outcome, error)` | `stmt.execute(params): Outcome` |
-| stmt query | `stmt.query(&mut db, &params) -> Result<Rows>` | `stmt.Query(params) (*Rows, error)` | `stmt.query(params): Rows` |
-| one-shot execute | `db.execute_params(sql, &params)` / free `execute(db, sql)` | `db.ExecuteSQL(sql, params)` / `Execute(db, sql)` | `executeSql(db, sql, params)` / `execute(db, sql)` |
-| one-shot query | `db.query_sql(sql, &params) -> Result<Rows>` | `db.QuerySQL(sql, params) (*Rows, error)` | `querySql(db, sql, params): Rows` |
+| stmt execute (tag) | `db.execute_prepared(&stmt, &params) -> Result<u64>` | `stmt.Exec(ctx, args…) (Result, error)` | `stmt.execute(params): RunResult` |
+| stmt query (cursor) | `db.query_prepared(&stmt, &params) -> Result<Rows>` | `stmt.QueryValues(params) (*Rows, error)` | `stmt.query(params): Rows` |
+| one-shot execute (tag) | `db.execute(sql, &params) -> Result<u64>` | `db.Exec(ctx, sql, args…) (Result, error)` | `db.execute(sql, params): RunResult` |
+| one-shot query (cursor) | `db.query(sql, &params) -> Result<Rows>` | `db.QueryValues(sql, params) (*Rows, error)` | `db.query(sql, params): Rows` |
 | rows iterate | `impl Iterator<Item = Vec<Value>>` | `for rows.Next() { rows.Row() }` | `for (const row of rows)` |
 | rows columns | `rows.column_names()` | `rows.ColumnNames()` | `rows.columnNames` |
+| rows column types | `rows.column_types()` | `rows.ColumnTypes()` | `rows.columnTypes` |
 | rows cost | `rows.cost()` | `rows.Cost()` | `rows.cost` |
 | rows close ([streaming.md §5](streaming.md)) | `rows.close()` + `Drop` | `rows.Close()` | `rows.close()` |
-| rows affected (§4) | `Outcome::Statement { rows_affected: Option<i64>, .. }` | `outcome.RowsAffected, outcome.HasRowsAffected` | `outcome.rowsAffected: number \| null` |
+| rows affected (§4) | `rows.rows_affected() -> Option<i64>` | `rows.RowsAffected() (int64, bool)` | `rows.rowsAffected: number \| null` |
 | set cost ceiling (§8) | `db.set_max_cost(limit)` | `db.SetMaxCost(limit)` | `db.setMaxCost(limit)` |
 | set input-size limit (§8) | `db.set_max_sql_length(bytes)` | `db.SetMaxSQLLength(bytes)` | `db.setMaxSqlLength(bytes)` |
 | inject random source (§10) | `db.set_random_source(f)` / `db.clear_random_source()` | `db.SetRandomSource(f)` / `db.ClearRandomSource()` | `db.setRandomSource(f)` / `db.clearRandomSource()` |
@@ -520,7 +527,7 @@ A first-class use case is **safely evaluating untrusted, user-supplied queries**
 ([cost.md](cost.md)) of every statement run on it:
 
 - `limit <= 0` (the **default**, `0`) ⇒ **unlimited** (the metered cost is still reported on
-  `Outcome`/`Rows`, nothing aborts).
+  `Rows`, nothing aborts).
 - `limit > 0` ⇒ the instant a statement's accrued cost **reaches** `limit`, execution aborts
   with **`54P01`** (`cost_limit_exceeded`). The ceiling is the first *disallowed* value: a query
   whose true cost equals `limit` aborts, one costing `limit − 1` completes.
@@ -573,8 +580,8 @@ input-size cap cross-core.
   top-level set operation / pure-query `WITH` is a lazy **deferred** cursor that defers its run to the
   first pull (S6), the `exec_streaming_sort` output is yielded lazily from the `SortedRows` pull
   iterator (S7), and a **prepared** query (`prepare` + `query_prepared`) routes its AST through those
-  same lazy lanes (S8) — all pin their snapshot for their life (`execute()` stays materialized — the
-  corpus drives it). The internally-streamed *operators* (the `ORDER BY` external merge sort spilling
+  same lazy lanes (S8) — all pin their snapshot for their life (the exec-side `execute` / `run` drains
+  that same lazy cursor for its command tag). The internally-streamed *operators* (the `ORDER BY` external merge sort spilling
   under `work_mem`, [spill.md](spill.md)) landed earlier. What stays deferred is a `Database::query`
   watermark on the bare single-handle path, the spilling hash aggregate / `DISTINCT` / hash JOIN
   ([spill.md §7](spill.md)), and lazy small-inline-column decode ([streaming.md §8](streaming.md)).

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 
@@ -13,6 +14,7 @@ func main() {
 		log.Fatal(err)
 	}
 	defer db.Close()
+	ctx := context.Background()
 	mustExec(db, "CREATE TABLE report (id i32 PRIMARY KEY, body text)")
 	mustExec(db, "INSERT INTO report VALUES (1, 'hello')")
 
@@ -24,10 +26,10 @@ func main() {
 	noDDL := false
 	untrusted := db.Session(jed.SessionOptions{DefaultPrivileges: &readOnly, AllowDDL: &noDDL})
 	defer untrusted.Close() // release the session (and its reader pin)
-	if _, err := untrusted.Execute("SELECT body FROM report", nil); err != nil {
+	if _, err := untrusted.Exec(ctx, "SELECT body FROM report"); err != nil {
 		log.Fatal(err)
 	}
-	if _, err := untrusted.Execute("DELETE FROM report", nil); err != nil {
+	if _, err := untrusted.Exec(ctx, "DELETE FROM report"); err != nil {
 		fmt.Println("denied:", err) // 42501 permission denied for table report
 	}
 
@@ -36,13 +38,13 @@ func main() {
 	locked := db.Session(jed.SessionOptions{})
 	defer locked.Close()
 	locked.Revoke(jed.PrivSetEmpty.With(jed.PrivExecute), "uuidv4")
-	if _, err := locked.Execute("SELECT uuidv4()", nil); err != nil {
+	if _, err := locked.Exec(ctx, "SELECT uuidv4()"); err != nil {
 		fmt.Println("denied:", err) // 42501
 	}
 }
 
 func mustExec(db *jed.Database, sql string) {
-	if _, err := db.Execute(sql, nil); err != nil {
+	if _, err := db.Exec(context.Background(), sql); err != nil {
 		log.Fatal(err)
 	}
 }

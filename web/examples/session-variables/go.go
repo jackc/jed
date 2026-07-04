@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 
@@ -13,6 +14,8 @@ func main() {
 		log.Fatal(err)
 	}
 	defer db.Close()
+
+	ctx := context.Background()
 
 	// Session variables are PostgreSQL's GUC model — they live on a SESSION, so mint one from the
 	// database rather than using the bare handle. A custom variable must be NAMESPACED — a dotted name
@@ -29,7 +32,7 @@ func main() {
 	}
 
 	// ... or in SQL with current_setting(): SELECT current_setting('myapp.tenant') -> "acme".
-	if _, err := s.Query("SELECT current_setting('myapp.tenant')", nil); err != nil {
+	if _, err := s.Exec(ctx, "SELECT current_setting('myapp.tenant')"); err != nil {
 		log.Fatal(err)
 	}
 

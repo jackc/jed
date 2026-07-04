@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 
@@ -13,6 +14,8 @@ func main() {
 		log.Fatal(err)
 	}
 	defer db.Close()
+
+	ctx := context.Background()
 
 	// ExecuteScript runs a whole migration as ONE implicit transaction: split it into statements,
 	// run each in order, and commit all-or-nothing (any error rolls the lot back). It DISCARDS
@@ -31,7 +34,7 @@ func main() {
 	// statement's rows, loop it yourself and run the spans through the normal path — the host owns
 	// the policy (one transaction or autocommit, drain rows or drop them).
 	for stmt := range jed.SplitStatements("SELECT id FROM account; SELECT balance FROM account") {
-		if _, err := db.Query(stmt.Text, nil); err != nil {
+		if _, err := db.Query(ctx, stmt.Text); err != nil {
 			log.Fatal(err)
 		}
 	}
