@@ -159,6 +159,15 @@ func (db *engine) QuerySQL(sql string, params []Value) (*Rows, error) {
 // ad-hoc one but reuses its cached plan across executes. (This is the bare single-handle engine; the
 // watermark pin lives on the shared-core Session.Query path.)
 func (db *engine) queryStmt(stmt statement, params []Value, sc *scanCache) (*Rows, error) {
+	// A read served by a lazy lane skips the materialized dispatch, so enforce the read-path admission
+	// gates (25P02 / 54P02 / 42501) up front — reads only (transaction control must work in a failed
+	// block; a write is gated inside dispatch on the fall-through). Keeps the bare-engine Query a safe
+	// total seam like the shared-core Session.Query (executor.go gateReadLanes, CLAUDE.md §13).
+	if stmt.Begin == nil && stmt.Commit == nil && stmt.Rollback == nil && !stmtIsWrite(stmt) {
+		if err := db.gateReadLanes(stmt); err != nil {
+			return nil, err
+		}
+	}
 	if rows, ok, err := db.tryScanQuery(stmt, params, sc); err != nil {
 		return nil, err
 	} else if ok {
@@ -173,7 +182,7 @@ func (db *engine) queryStmt(stmt statement, params []Value, sc *scanCache) (*Row
 	if err != nil {
 		return nil, err
 	}
-	return rowsFromOutcome(out)
+	return rowsFromOutcome(out), nil
 }
 
 // Rows is a cursor over a query's rows (spec/design/api.md §4). It walks the pull source (cursor.go)
@@ -184,6 +193,12 @@ func (db *engine) queryStmt(stmt statement, params []Value, sc *scanCache) (*Row
 type Rows struct {
 	columnNames []string
 	columnTypes []string
+	// rowsAffected / hasAffected carry the command tag (spec/design/api.md §4) for a statement run
+	// through the now-total query seam (rowsFromOutcome): how many rows a DML statement touched, and
+	// whether it carries a count at all (a SELECT / DDL / transaction control has none). This is how
+	// the exec-side path (ergoExec) reads the tag off a drained Rows — "Exec is throw away the rows".
+	rowsAffected int64
+	hasAffected  bool
 	// cursor is the pull source (cursor.go): a bufCursor over a materialized result, or a
 	// streamingCursor (S3, executor.go) running scan → resolve → WHERE → project lazily over a pinned
 	// snapshot (streaming.md §4).
@@ -205,15 +220,20 @@ type Rows struct {
 	err error
 }
 
-func rowsFromOutcome(out Outcome) (*Rows, error) {
-	if out.Kind != OutcomeQuery {
-		return nil, newError(SyntaxError, "Query called on a statement that produces no rows; use Execute")
-	}
+// rowsFromOutcome wraps a materialized Outcome (the executor's internal result) as a *Rows. It is
+// TOTAL: a non-query statement is observably a Rows with no output columns — an empty buffered cursor
+// seeded with the accrued cost, carrying the statement's command tag (rows-affected). This is the
+// single exec/query seam: the exec-side path (Exec) drains-and-discards such a Rows and returns the
+// tag, so "Query on a statement that produces no rows" is valid, not a 42601 (the effect-then-error
+// bug this removes — a write reached here after dispatch already committed it; spec/design/api.md §11).
+func rowsFromOutcome(out Outcome) *Rows {
 	return &Rows{
-		columnNames: out.ColumnNames,
-		columnTypes: out.ColumnTypes,
-		cursor:      bufferedCursor(out.Rows, out.Cost),
-	}, nil
+		columnNames:  out.ColumnNames,
+		columnTypes:  out.ColumnTypes,
+		cursor:       bufferedCursor(out.Rows, out.Cost),
+		rowsAffected: out.RowsAffected,
+		hasAffected:  out.HasRowsAffected,
+	}
 }
 
 // attachPin records the reader-liveness pin's deregister for a streaming cursor (the watermark,
@@ -254,3 +274,10 @@ func (r *Rows) ColumnNames() []string { return r.columnNames }
 
 // Cost is the deterministic execution cost accrued by the query (CLAUDE.md §13).
 func (r *Rows) Cost() int64 { return r.cursor.costAccrued() }
+
+// RowsAffected reports the command tag carried on a Rows: how many rows a DML statement
+// (INSERT/UPDATE/DELETE without RETURNING) touched; ok is false for a SELECT / DDL / transaction
+// control, which have no count (spec/design/api.md §4). This is how the exec-side path (Exec) surfaces
+// the tag after draining the result set — a statement run through the total query seam is a Rows with
+// no columns whose tag lives here.
+func (r *Rows) RowsAffected() (n int64, ok bool) { return r.rowsAffected, r.hasAffected }

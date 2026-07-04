@@ -85,20 +85,28 @@ func ergoQuery(ctx context.Context, eng *engine, args []any, raw func([]Value) (
 	return rows, nil
 }
 
-func ergoExec(ctx context.Context, eng *engine, args []any, raw func([]Value) (Outcome, error)) (Result, error) {
-	params, err := toValues(args)
+// ergoExec runs a statement through the same total query seam as ergoQuery and returns its command
+// tag — "Exec is simply throw away any result set". It drains the Rows (a write is a buffered empty
+// cursor, so the drain is trivial; a SELECT run through Exec streams and is discarded in O(1) peak
+// memory), which on Close releases any reader-liveness pin the streaming path registered (Go has no
+// destructor — the deferred Close is load-bearing, spec/design/streaming.md §5). The affected count +
+// accrued cost are then read off the drained Rows. A mid-drain fault (a 54P01 cost abort, a 57014
+// cancellation, an arithmetic trap) surfaces from rows.Err(); a pre-drain error (e.g. a 23505 write
+// conflict) surfaces from ergoQuery. Cancellation is armed once, in ergoQuery, so it is not repeated
+// here (spec/design/api.md §11).
+func ergoExec(ctx context.Context, eng *engine, args []any, raw func([]Value) (*Rows, error)) (Result, error) {
+	rows, err := ergoQuery(ctx, eng, args, raw)
 	if err != nil {
 		return Result{}, err
 	}
-	if err := ctxErr(ctx); err != nil {
+	defer rows.Close()
+	for rows.Next() {
+	}
+	if err := rows.Err(); err != nil {
 		return Result{}, err
 	}
-	defer eng.armCancel(ctx)()
-	out, err := raw(params)
-	if err != nil {
-		return Result{}, err
-	}
-	return Result{rowsAffected: out.RowsAffected, hasAffected: out.HasRowsAffected, cost: out.Cost}, nil
+	n, ok := rows.RowsAffected()
+	return Result{rowsAffected: n, hasAffected: ok, cost: rows.Cost()}, nil
 }
 
 // Query runs a query on the autocommit handle, binding native args. It mints the fresh autocommit
@@ -110,11 +118,13 @@ func (db *Database) Query(ctx context.Context, sql string, args ...any) (*Rows, 
 	return ergoQuery(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.Query(sql, p) })
 }
 
-// Exec runs a non-query statement on the autocommit handle and returns its command tag.
+// Exec runs a non-query statement on the autocommit handle and returns its command tag. It routes
+// through the same total query seam as Query and discards any result set (§11) — so Exec and Query
+// are one path, and a SELECT run through Exec is valid (its rows are dropped).
 func (db *Database) Exec(ctx context.Context, sql string, args ...any) (Result, error) {
 	s := db.Session(SessionOptions{})
 	defer s.Close()
-	return ergoExec(ctx, s.engine, args, func(p []Value) (Outcome, error) { return s.Execute(sql, p) })
+	return ergoExec(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.Query(sql, p) })
 }
 
 // QueryRow runs a query and returns a one-row handle; a setup error defers to Row.Scan.
@@ -131,7 +141,7 @@ func (tx *Transaction) Query(ctx context.Context, sql string, args ...any) (*Row
 }
 
 func (tx *Transaction) Exec(ctx context.Context, sql string, args ...any) (Result, error) {
-	return ergoExec(ctx, tx.db, args, func(p []Value) (Outcome, error) { return tx.Execute(sql, p) })
+	return ergoExec(ctx, tx.db, args, func(p []Value) (*Rows, error) { return tx.QueryValues(sql, p) })
 }
 
 func (tx *Transaction) QueryRow(ctx context.Context, sql string, args ...any) *Row {
@@ -147,12 +157,22 @@ func (s *PreparedStatement) Query(ctx context.Context, args ...any) (*Rows, erro
 }
 
 func (s *PreparedStatement) Exec(ctx context.Context, args ...any) (Result, error) {
-	return ergoExec(ctx, s.execEngine(), args, s.Execute)
+	return ergoExec(ctx, s.execEngine(), args, s.QueryValues)
 }
 
 func (s *PreparedStatement) QueryRow(ctx context.Context, args ...any) *Row {
 	rows, err := s.Query(ctx, args...)
 	return &Row{rows: rows, err: err}
+}
+
+// Exec runs a non-query statement on this session and returns its command tag — the ergonomic exec
+// surface, Session's analogue of Database.Exec. Unlike the autocommit Database.Exec, session state (an
+// open block, session variables, session-local temp) persists across calls. Sugar over the same total
+// query seam (drain-and-discard the raw Session.Query); a SELECT run through it streams and is
+// discarded (spec/design/api.md §11). The raw Session.Execute(sql, []Value) primitive remains for
+// white-box tests.
+func (s *Session) Exec(ctx context.Context, sql string, args ...any) (Result, error) {
+	return ergoExec(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.Query(sql, p) })
 }
 
 // ───────────────────────────── Result (command tag) ─────────────────────────────

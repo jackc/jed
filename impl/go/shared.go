@@ -803,6 +803,16 @@ func (s *Session) queryStmt(stmt statement, params []Value, sc *scanCache) (*Row
 	if s.access != accessReadOnly && s.engine.session.tx == nil && !stmtIsWrite(stmt) {
 		s.refreshCommitted()
 	}
+	// A read served by a lazy lane never reaches the materialized dispatch, so enforce the read-path
+	// admission gates (failed-block 25P02 / lifetime 54P02 / privilege 42501) here — after refreshing so
+	// privilege resolution sees the snapshot the read will use. Reads only: transaction control must
+	// still work in a failed block, and a write is gated inside dispatch when it falls through below
+	// (executor.go gateReadLanes — the safe-total-Query contract, CLAUDE.md §13).
+	if stmt.Begin == nil && stmt.Commit == nil && stmt.Rollback == nil && !stmtIsWrite(stmt) {
+		if err := s.engine.gateReadLanes(stmt); err != nil {
+			return nil, err
+		}
+	}
 	// pin registers the cursor's snapshot version in the reader-liveness watermark (streaming.md §5);
 	// the deregister runs on cursor Close (Go has no destructor), advancing oldestLiveTxid.
 	pin := func(rows *Rows) *Rows {
@@ -844,7 +854,7 @@ func (s *Session) queryStmt(stmt statement, params []Value, sc *scanCache) (*Row
 	if err != nil {
 		return nil, err
 	}
-	return rowsFromOutcome(out)
+	return rowsFromOutcome(out), nil
 }
 
 // Prepare parses sql once into a reusable prepared statement bound to this session (spec/design/api.md

@@ -46,6 +46,26 @@ func TestSetDefaultPrivilegesMakesAReadOnlySession(t *testing.T) {
 	}
 }
 
+// TestQueryPathEnforcesSelectPrivilege locks the §13 safety fix that made Query a total-AND-safe seam
+// (gateReadLanes). A SELECT served by the lazy streaming lane (here a PK point lookup) used to bypass
+// the privilege envelope entirely — it never reached the materialized dispatch where checkPrivileges
+// lives — so a restricted session could read a table it held no SELECT on through the ergonomic Query
+// path. The corpus drives this via the harness's Query re-plumb; this pins it at the Go host surface.
+func TestQueryPathEnforcesSelectPrivilege(t *testing.T) {
+	db := memDB().Session(SessionOptions{})
+	sessExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
+	sessExec(t, db, "INSERT INTO t VALUES (1, 10)")
+	db.SetDefaultPrivileges(PrivSetEmpty) // no SELECT
+	rows, err := db.Query("SELECT v FROM t WHERE id = 1", nil)
+	if err == nil {
+		_ = rows.Close()
+		t.Fatal("SELECT via the streaming Query path without SELECT privilege should be 42501, got rows")
+	}
+	if got := sessCode(t, err); got != "42501" {
+		t.Fatalf("want 42501, got %s", got)
+	}
+}
+
 func TestGrantAddsAndRevokeWins(t *testing.T) {
 	db := memDB().Session(SessionOptions{})
 	sessExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")

@@ -174,10 +174,57 @@ func TestPrepareExecuteAndQueryWithParams(t *testing.T) {
 	}
 }
 
-func TestQueryOnNonQueryStatementErrors(t *testing.T) {
+// TestQueryOnNonQueryStatementIsTotal locks in the total exec/query seam (spec/design/api.md §11):
+// Query on a statement that produces no rows is VALID — it returns a Rows with no columns carrying the
+// command tag, and (the effect-then-error bug this fixed) the statement's effect actually lands. A
+// write run through Query used to commit and THEN return 42601; now it just succeeds.
+func TestQueryOnNonQueryStatementIsTotal(t *testing.T) {
 	db := memDB().Session(SessionOptions{})
-	if _, err := db.Query("CREATE TABLE t (id i32 PRIMARY KEY)", nil); err == nil {
-		t.Fatal("expected error")
+
+	// DDL through Query: no columns, no rows, no error, and the table is really created.
+	rows, err := db.Query("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", nil)
+	if err != nil {
+		t.Fatalf("Query(CREATE TABLE) errored: %v", err)
+	}
+	if got := rows.ColumnNames(); len(got) != 0 {
+		t.Fatalf("statement Rows has columns %v, want none", got)
+	}
+	if rows.Next() {
+		t.Fatal("statement Rows produced a row")
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("drain error: %v", err)
+	}
+	_ = rows.Close()
+
+	// A write through Query commits AND carries the affected count on the Rows (no 42601).
+	wr, err := db.Query("INSERT INTO t VALUES (1, 100), (2, 200)", nil)
+	if err != nil {
+		t.Fatalf("Query(INSERT) errored: %v", err)
+	}
+	for wr.Next() {
+		t.Fatal("INSERT via Query produced a row")
+	}
+	if n, ok := wr.RowsAffected(); !ok || n != 2 {
+		t.Fatalf("RowsAffected = (%d,%v), want (2,true)", n, ok)
+	}
+	_ = wr.Close()
+
+	// The insert really landed (proves the write committed, not merely reported).
+	sel, err := db.Query("SELECT v FROM t ORDER BY id", nil)
+	if err != nil {
+		t.Fatalf("Query(SELECT) errored: %v", err)
+	}
+	var got [][]Value
+	for sel.Next() {
+		got = append(got, append([]Value(nil), sel.Row()...))
+	}
+	if err := sel.Err(); err != nil {
+		t.Fatalf("SELECT drain error: %v", err)
+	}
+	_ = sel.Close()
+	if len(got) != 2 || got[0][0].Int != 100 || got[1][0].Int != 200 {
+		t.Fatalf("rows after INSERT via Query = %v", got)
 	}
 }
 

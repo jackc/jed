@@ -3107,6 +3107,26 @@ func (db *engine) checkPrivileges(stmt statement) error {
 	return nil
 }
 
+// gateReadLanes runs the admission gates that the lazy read lanes (tryScanQuery / tryDeferredQuery)
+// would otherwise skip. Those gates live on the materialized dispatchStmt / ExecuteStmtParams path, but
+// a SELECT served by a streaming/deferred cursor never reaches it — so before Exec/Query became the one
+// total seam, a read through the ergonomic Query path bypassed authorization entirely (a §13 hole).
+// Enforcing them here makes Query a total AND safe seam: a read inside a failed block is 25P02, a
+// lifetime-exhausted session is 54P02, and a restricted read is 42501 — whichever lane ends up serving
+// it. The caller applies this only to reads (transaction control must still work in a failed block, and
+// a write keeps its existing gating inside dispatch); the three checks are pure, so a read that falls
+// through to the materialized path re-running them is harmless (identical result).
+func (db *engine) gateReadLanes(stmt statement) error {
+	if db.session.tx != nil && db.session.tx.failed {
+		return newError(InFailedSqlTransaction,
+			"current transaction is aborted, commands ignored until end of transaction block")
+	}
+	if err := db.checkLifetimeAdmission(); err != nil {
+		return err
+	}
+	return db.checkPrivileges(stmt)
+}
+
 // collectStmtPrivs collects the privilege requirements of stmt (spec/design/session.md §5.3).
 // Transaction control carries none (handled before dispatch); DDL just sets isDDL.
 func collectStmtPrivs(stmt statement, req *privReq) {

@@ -1008,13 +1008,14 @@ func runFile(text string, disk bool) error {
 			}
 			i++
 			sql := takeSQL(lines, &i)
-			outcome, err := sess.Execute(sql, nil)
+			// A statement runs through the total Query seam too (a no-row statement is a valid Query).
+			_, _, _, cost, err := drainQuery(sess, sql, "nosort", 1)
 			switch expect {
 			case "ok":
 				if err != nil {
 					return fmt.Errorf("statement expected ok, got error %s\n  SQL: %s", err.Error(), sql)
 				}
-				if cerr := assertCost(expectedCost, outcome.Cost, sql); cerr != nil {
+				if cerr := assertCost(expectedCost, cost, sql); cerr != nil {
 					return cerr
 				}
 			case "error":
@@ -1047,26 +1048,25 @@ func runFile(text string, disk bool) error {
 				expected = append(expected, strings.TrimSpace(lines[i]))
 				i++
 			}
-			outcome, err := sess.Execute(sql, nil)
-			if err != nil {
-				return fmt.Errorf("query failed with %s\n  SQL: %s", err.Error(), sql)
-			}
 			cols := len(coltypes)
 			if cols == 0 {
 				cols = 1
 			}
-			actual := renderOutcome(outcome, cols, sortmode)
+			actual, names, types, cost, err := drainQuery(sess, sql, sortmode, cols)
+			if err != nil {
+				return fmt.Errorf("query failed with %s\n  SQL: %s", err.Error(), sql)
+			}
 			expected = applySort(expected, cols, sortmode)
 			if !equalColtyped(actual, expected, coltypes, cols) {
 				return fmt.Errorf("query result mismatch\n  SQL: %s\n  expected: %v\n  actual:   %v", sql, expected, actual)
 			}
-			if cerr := assertCost(expectedCost, outcome.Cost, sql); cerr != nil {
+			if cerr := assertCost(expectedCost, cost, sql); cerr != nil {
 				return cerr
 			}
-			if nerr := assertNames(expectedNames, outcome.ColumnNames, sql); nerr != nil {
+			if nerr := assertNames(expectedNames, names, sql); nerr != nil {
 				return nerr
 			}
-			if terr := assertTypes(expectedTypes, outcome.ColumnTypes, sql); terr != nil {
+			if terr := assertTypes(expectedTypes, types, sql); terr != nil {
 				return terr
 			}
 		default:
@@ -1103,6 +1103,31 @@ func takeSQLUntilSeparator(lines []string, i *int) string {
 		*i++
 	}
 	return strings.Join(sql, "\n")
+}
+
+// drainQuery runs sql through the session's TOTAL query seam and fully drains it, returning the
+// flattened+sorted result cells, the column metadata, and the final accrued cost. Routing BOTH
+// statement and query directives through Query (not the raw Execute/Outcome primitive) is the
+// harness's standing proof that the seam is total: a statement that returns no rows is a valid Query
+// with an empty column list (spec/design/api.md §11). The cursor is always Closed (releasing any
+// streaming reader-liveness pin), and Cost is read after the full drain — a streaming query's cost is
+// final only at exhaustion.
+func drainQuery(sess *jed.Session, sql, sortmode string, cols int) (cells, names, types []string, cost int64, err error) {
+	rows, qerr := sess.Query(sql, nil)
+	if qerr != nil {
+		return nil, nil, nil, 0, qerr
+	}
+	defer rows.Close()
+	var flat []string
+	for rows.Next() {
+		for _, v := range rows.Row() {
+			flat = append(flat, v.Render())
+		}
+	}
+	if derr := rows.Err(); derr != nil {
+		return nil, nil, nil, 0, derr
+	}
+	return applySort(flat, cols, sortmode), rows.ColumnNames(), rows.ColumnTypes(), rows.Cost(), nil
 }
 
 func renderOutcome(o jed.Outcome, cols int, sortmode string) []string {
