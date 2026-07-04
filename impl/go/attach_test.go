@@ -13,7 +13,7 @@ import "testing"
 // attachExec runs a statement on a session and fails the test on error.
 func attachExec(t *testing.T, s *Session, sql string) {
 	t.Helper()
-	if _, err := s.Execute(sql, nil); err != nil {
+	if _, err := queryOutcome(s, sql, nil); err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}
 }
@@ -21,7 +21,7 @@ func attachExec(t *testing.T, s *Session, sql string) {
 // attachErrCode runs a statement expected to fail and returns its SQLSTATE.
 func attachErrCode(t *testing.T, s *Session, sql string) string {
 	t.Helper()
-	_, err := s.Execute(sql, nil)
+	_, err := queryOutcome(s, sql, nil)
 	if err == nil {
 		t.Fatalf("%q: expected an error, got nil", sql)
 	}
@@ -39,7 +39,7 @@ func TestAttachLifecycle(t *testing.T) {
 	attachExec(t, s, "CREATE TABLE mydb.t (id i32 PRIMARY KEY, v i32)")
 	attachExec(t, s, "INSERT INTO mydb.t VALUES (1, 10), (2, 20)")
 
-	rows, err := s.Query("SELECT v FROM mydb.t ORDER BY id", nil)
+	rows, err := s.QueryValues("SELECT v FROM mydb.t ORDER BY id", nil)
 	if err != nil {
 		t.Fatalf("select: %v", err)
 	}
@@ -57,7 +57,7 @@ func TestAttachLifecycle(t *testing.T) {
 	// cursor fully so it releases its reader pin (an undrained streaming cursor would hold the roots
 	// and make the detach below 55006).
 	s2 := db.Session(SessionOptions{})
-	r2, err := s2.Query("SELECT v FROM mydb.t WHERE id = 1", nil)
+	r2, err := s2.QueryValues("SELECT v FROM mydb.t WHERE id = 1", nil)
 	if err != nil {
 		t.Fatalf("second session cannot see attachment: %v", err)
 	}
@@ -167,7 +167,7 @@ func TestAttachCaseInsensitiveQualifier(t *testing.T) {
 	s := db.Session(SessionOptions{})
 	attachExec(t, s, "CREATE TABLE reports.sales (id i32 PRIMARY KEY)")
 	attachExec(t, s, "INSERT INTO REPORTS.sales VALUES (1)")
-	if _, err := s.Query("SELECT id FROM Reports.sales", nil); err != nil {
+	if _, err := s.QueryValues("SELECT id FROM Reports.sales", nil); err != nil {
 		t.Fatalf("case-insensitive qualifier: %v", err)
 	}
 }

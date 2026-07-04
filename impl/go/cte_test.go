@@ -21,7 +21,7 @@ func cteT3(t *testing.T) *Session {
 // cteCost runs sql and returns its accrued cost.
 func cteCost(t *testing.T, db dbHandle, sql string) int64 {
 	t.Helper()
-	out, err := db.Execute(sql, nil)
+	out, err := queryOutcome(db, sql, nil)
 	if err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}
@@ -63,7 +63,7 @@ func TestCteMaterializedHintForcesBuffering(t *testing.T) {
 func TestCteRecursiveUnboundedAbortsAtCostCeiling(t *testing.T) {
 	db := memDB().Session(SessionOptions{})
 	db.SetMaxCost(1000)
-	_, err := db.Execute("WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c) SELECT n FROM c", nil)
+	_, err := queryOutcome(db, "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c) SELECT n FROM c", nil)
 	if err == nil {
 		t.Fatal("an unbounded recursion must abort, not loop forever")
 	}
@@ -91,7 +91,7 @@ func TestCteRecursiveHintIsInert(t *testing.T) {
 	for _, hint := range []string{"", "MATERIALIZED ", "NOT MATERIALIZED "} {
 		sql := "WITH RECURSIVE c(n) AS " + hint +
 			"(SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 3) SELECT n FROM c ORDER BY n"
-		out, err := db.Execute(sql, nil)
+		out, err := queryOutcome(db, sql, nil)
 		if err != nil {
 			t.Fatalf("hint %q: %v", hint, err)
 		}
@@ -112,7 +112,7 @@ func TestCteRecursiveHintIsInert(t *testing.T) {
 func TestNestedWithDoesNotInheritEnclosingCtes(t *testing.T) {
 	// (a) No base table named e: the inner reference to the enclosing CTE e is unresolved -> 42P01.
 	db := cteT3(t)
-	_, err := db.Execute("WITH e AS (SELECT 1 AS v) SELECT * FROM (WITH ic AS (SELECT v FROM e) SELECT v FROM ic) s", nil)
+	_, err := queryOutcome(db, "WITH e AS (SELECT 1 AS v) SELECT * FROM (WITH ic AS (SELECT v FROM e) SELECT v FROM ic) s", nil)
 	if ee, ok := err.(*EngineError); !ok || ee.Code() != "42P01" {
 		t.Fatalf("enclosing CTE inside a nested WITH: want 42P01, got %v", err)
 	}

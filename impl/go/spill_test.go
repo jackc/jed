@@ -19,11 +19,11 @@ import (
 // runQuery runs sql and returns (rows, cost).
 func runQuery(t *testing.T, db dbHandle, sql string) ([][]Value, int64) {
 	t.Helper()
-	out, err := db.Execute(sql, nil)
+	out, err := queryOutcome(db, sql, nil)
 	if err != nil {
 		t.Fatalf("query %q: %v", sql, err)
 	}
-	if out.Kind != OutcomeQuery {
+	if out.Kind != outcomeQuery {
 		t.Fatalf("query %q: not a query result", sql)
 	}
 	return out.Rows, out.Cost
@@ -34,7 +34,7 @@ func runQuery(t *testing.T, db dbHandle, sql string) ([][]Value, int64) {
 // ordering), and a variable-length s (so a spilled run carries variable-width values).
 func seedSpill(t *testing.T, db dbHandle, n int64) {
 	t.Helper()
-	if _, err := db.Execute("CREATE TABLE t (id i32 PRIMARY KEY, k i32, s text)", nil); err != nil {
+	if _, err := queryOutcome(db, "CREATE TABLE t (id i32 PRIMARY KEY, k i32, s text)", nil); err != nil {
 		t.Fatal(err)
 	}
 	for id := int64(0); id < n; id++ {
@@ -43,7 +43,7 @@ func seedSpill(t *testing.T, db dbHandle, n int64) {
 			k = fmt.Sprintf("%d", (id*48271)%100)
 		}
 		s := strings.Repeat("x", int(id%17))
-		if _, err := db.Execute(fmt.Sprintf("INSERT INTO t VALUES (%d, %s, '%s')", id, k, s), nil); err != nil {
+		if _, err := queryOutcome(db, fmt.Sprintf("INSERT INTO t VALUES (%d, %s, '%s')", id, k, s), nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -183,11 +183,11 @@ func TestSpillingSortIsStableOnTies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Execute("CREATE TABLE t (id i32 PRIMARY KEY, k i32)", nil); err != nil {
+	if _, err := queryOutcome(db, "CREATE TABLE t (id i32 PRIMARY KEY, k i32)", nil); err != nil {
 		t.Fatal(err)
 	}
 	for id := int64(0); id < 100; id++ {
-		if _, err := db.Execute(fmt.Sprintf("INSERT INTO t VALUES (%d, 5)", id), nil); err != nil {
+		if _, err := queryOutcome(db, fmt.Sprintf("INSERT INTO t VALUES (%d, 5)", id), nil); err != nil {
 			t.Fatal(err)
 		}
 	}

@@ -13,11 +13,11 @@ import "testing"
 
 func valuesNames(t *testing.T, db dbHandle, sql string) []string {
 	t.Helper()
-	out, err := db.Execute(sql, nil)
+	out, err := queryOutcome(db, sql, nil)
 	if err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}
-	if out.Kind != OutcomeQuery {
+	if out.Kind != outcomeQuery {
 		t.Fatalf("expected a query result for %q", sql)
 	}
 	return out.ColumnNames
@@ -25,7 +25,7 @@ func valuesNames(t *testing.T, db dbHandle, sql string) []string {
 
 func valuesTypes(t *testing.T, db dbHandle, sql string) []string {
 	t.Helper()
-	out, err := db.Execute(sql, nil)
+	out, err := queryOutcome(db, sql, nil)
 	if err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}
@@ -34,7 +34,7 @@ func valuesTypes(t *testing.T, db dbHandle, sql string) []string {
 
 func valuesCost(t *testing.T, db dbHandle, sql string) int64 {
 	t.Helper()
-	out, err := db.Execute(sql, nil)
+	out, err := queryOutcome(db, sql, nil)
 	if err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}

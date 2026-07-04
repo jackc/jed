@@ -1,7 +1,7 @@
 package jed
 
 // Phase 7: the formal host API (spec/design/api.md) — open/create/commit/close a database file,
-// Prepare/Execute/Query, the Rows cursor, and the structured-error surface. Files are written
+// Prepare/QueryValues/Exec, the Rows cursor, and the structured-error surface. Files are written
 // under t.TempDir(), never the repo tree. Everything runs through the public Database/Session
 // surface; the low-level engine is internal.
 
@@ -16,7 +16,7 @@ import (
 
 func mustExec(t *testing.T, db dbHandle, sql string) {
 	t.Helper()
-	if _, err := db.Execute(sql, nil); err != nil {
+	if _, err := queryOutcome(db, sql, nil); err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}
 }
@@ -144,10 +144,10 @@ func TestPrepareExecuteAndQueryWithParams(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := insert.Execute([]Value{IntValue(1), IntValue(100)}); err != nil {
+	if _, err := prepOutcome(insert, []Value{IntValue(1), IntValue(100)}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := insert.Execute([]Value{IntValue(2), IntValue(200)}); err != nil {
+	if _, err := prepOutcome(insert, []Value{IntValue(2), IntValue(200)}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -182,7 +182,7 @@ func TestQueryOnNonQueryStatementIsTotal(t *testing.T) {
 	db := memDB().Session(SessionOptions{})
 
 	// DDL through Query: no columns, no rows, no error, and the table is really created.
-	rows, err := db.Query("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", nil)
+	rows, err := db.QueryValues("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", nil)
 	if err != nil {
 		t.Fatalf("Query(CREATE TABLE) errored: %v", err)
 	}
@@ -198,7 +198,7 @@ func TestQueryOnNonQueryStatementIsTotal(t *testing.T) {
 	_ = rows.Close()
 
 	// A write through Query commits AND carries the affected count on the Rows (no 42601).
-	wr, err := db.Query("INSERT INTO t VALUES (1, 100), (2, 200)", nil)
+	wr, err := db.QueryValues("INSERT INTO t VALUES (1, 100), (2, 200)", nil)
 	if err != nil {
 		t.Fatalf("Query(INSERT) errored: %v", err)
 	}
@@ -211,7 +211,7 @@ func TestQueryOnNonQueryStatementIsTotal(t *testing.T) {
 	_ = wr.Close()
 
 	// The insert really landed (proves the write committed, not merely reported).
-	sel, err := db.Query("SELECT v FROM t ORDER BY id", nil)
+	sel, err := db.QueryValues("SELECT v FROM t ORDER BY id", nil)
 	if err != nil {
 		t.Fatalf("Query(SELECT) errored: %v", err)
 	}
@@ -286,11 +286,11 @@ func TestRowsAffectedReportsDMLCounts(t *testing.T) {
 	db := memDB().Session(SessionOptions{})
 	affected := func(sql string) (int64, bool) {
 		t.Helper()
-		out, err := db.Execute(sql, nil)
+		out, err := queryOutcome(db, sql, nil)
 		if err != nil {
 			t.Fatalf("%q: %v", sql, err)
 		}
-		if out.Kind != OutcomeStatement {
+		if out.Kind != outcomeStatement {
 			t.Fatalf("%q: expected a statement outcome", sql)
 		}
 		return out.RowsAffected, out.HasRowsAffected
@@ -323,11 +323,11 @@ func TestRowsAffectedReportsDMLCounts(t *testing.T) {
 	if n, ok := affected("INSERT INTO dst SELECT id FROM t"); !ok || n != 2 {
 		t.Fatalf("INSERT ... SELECT: got (%d, %v) want (2, true)", n, ok)
 	}
-	out, err := db.Execute("DELETE FROM dst RETURNING id", nil)
+	out, err := queryOutcome(db, "DELETE FROM dst RETURNING id", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out.Kind != OutcomeQuery || len(out.Rows) != 2 {
+	if out.Kind != outcomeQuery || len(out.Rows) != 2 {
 		t.Fatalf("RETURNING must yield a query outcome with 2 rows, got kind=%v rows=%d", out.Kind, len(out.Rows))
 	}
 }
@@ -362,7 +362,7 @@ func TestOpenReadOnlyBlocksWritesAndNeverTouchesTheFile(t *testing.T) {
 	s := rodb.Session(SessionOptions{})
 	wantCode := func(sql, code string) {
 		t.Helper()
-		_, err := s.Execute(sql, nil)
+		_, err := queryOutcome(s, sql, nil)
 		var ee *EngineError
 		if !errors.As(err, &ee) || ee.Code() != code {
 			t.Fatalf("%q: got %v, want %s", sql, err, code)
@@ -370,7 +370,7 @@ func TestOpenReadOnlyBlocksWritesAndNeverTouchesTheFile(t *testing.T) {
 	}
 
 	// Reads work — bare and inside an explicit block (plain BEGIN defaults to READ ONLY here).
-	out, err := s.Execute("SELECT id FROM t", nil)
+	out, err := queryOutcome(s, "SELECT id FROM t", nil)
 	if err != nil || len(out.Rows) != 1 {
 		t.Fatalf("read on a read-only handle: %v", err)
 	}
@@ -394,7 +394,7 @@ func TestOpenReadOnlyBlocksWritesAndNeverTouchesTheFile(t *testing.T) {
 	if err := rodb.View(func(tx *Transaction) error { _, err := tx.QueryValues("SELECT id FROM t", nil); return err }); err != nil {
 		t.Fatalf("View on a read-only handle: %v", err)
 	}
-	err = rodb.Update(func(tx *Transaction) error { _, err := tx.Execute("DELETE FROM t", nil); return err })
+	err = rodb.Update(func(tx *Transaction) error { _, err := queryOutcome(tx, "DELETE FROM t", nil); return err })
 	if !errors.As(err, &ee) || ee.Code() != "25006" {
 		t.Fatalf("Update on a read-only handle: %v", err)
 	}

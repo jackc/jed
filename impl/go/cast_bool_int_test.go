@@ -17,7 +17,7 @@ import "testing"
 
 func castErrCode(t *testing.T, db dbHandle, sql string) string {
 	t.Helper()
-	_, err := db.Execute(sql, nil)
+	_, err := queryOutcome(db, sql, nil)
 	if err == nil {
 		t.Fatalf("expected an error from %q", sql)
 	}
@@ -26,7 +26,7 @@ func castErrCode(t *testing.T, db dbHandle, sql string) string {
 
 func castOne(t *testing.T, db dbHandle, sql string) Value {
 	t.Helper()
-	out, err := db.Execute(sql, nil)
+	out, err := queryOutcome(db, sql, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -9,11 +9,11 @@ import "testing"
 // queryRows runs a parameterized query and returns its rows; t.Fatal on error.
 func queryRows(t *testing.T, db dbHandle, sql string, params ...Value) [][]Value {
 	t.Helper()
-	out, err := db.Execute(sql, params)
+	out, err := queryOutcome(db, sql, params)
 	if err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}
-	if out.Kind != OutcomeQuery {
+	if out.Kind != outcomeQuery {
 		t.Fatalf("%q: expected a query result", sql)
 	}
 	return out.Rows
@@ -22,7 +22,7 @@ func queryRows(t *testing.T, db dbHandle, sql string, params ...Value) [][]Value
 // paramErrCode runs a parameterized statement expected to fail and returns its SQLSTATE.
 func paramErrCode(t *testing.T, db dbHandle, sql string, params ...Value) string {
 	t.Helper()
-	_, err := db.Execute(sql, params)
+	_, err := queryOutcome(db, sql, params)
 	if err == nil {
 		t.Fatalf("%q: expected an error", sql)
 	}
@@ -73,7 +73,7 @@ func TestParamAdoptsNarrowColumnTypeAndTrapsOverflow(t *testing.T) {
 
 func TestInsertValuesParamsRoundTrip(t *testing.T) {
 	db := dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY, name text)")
-	if _, err := db.Execute("INSERT INTO t VALUES ($1, $2)", []Value{IntValue(7), TextValue("alice")}); err != nil {
+	if _, err := queryOutcome(db, "INSERT INTO t VALUES ($1, $2)", []Value{IntValue(7), TextValue("alice")}); err != nil {
 		t.Fatal(err)
 	}
 	rows := queryRows(t, db, "SELECT id, name FROM t WHERE id = $1", IntValue(7))
@@ -100,7 +100,7 @@ func TestUpdateSetAndWhereParams(t *testing.T) {
 	db := dbWith(t,
 		"CREATE TABLE t (id i32 PRIMARY KEY, v i32)",
 		"INSERT INTO t VALUES (1, 10), (2, 20)")
-	if _, err := db.Execute("UPDATE t SET v = $1 WHERE id = $2", []Value{IntValue(99), IntValue(2)}); err != nil {
+	if _, err := queryOutcome(db, "UPDATE t SET v = $1 WHERE id = $2", []Value{IntValue(99), IntValue(2)}); err != nil {
 		t.Fatal(err)
 	}
 	rows := queryRows(t, db, "SELECT v FROM t WHERE id = $1", IntValue(2))
@@ -113,7 +113,7 @@ func TestDeleteWhereParam(t *testing.T) {
 	db := dbWith(t,
 		"CREATE TABLE t (id i32 PRIMARY KEY)",
 		"INSERT INTO t VALUES (1), (2), (3)")
-	if _, err := db.Execute("DELETE FROM t WHERE id = $1", []Value{IntValue(2)}); err != nil {
+	if _, err := queryOutcome(db, "DELETE FROM t WHERE id = $1", []Value{IntValue(2)}); err != nil {
 		t.Fatal(err)
 	}
 	rows := queryRows(t, db, "SELECT id FROM t")
@@ -245,7 +245,7 @@ func TestLexerRejectsBadParamTokens(t *testing.T) {
 		"SELECT id FROM t WHERE id = $",
 		"SELECT id FROM t WHERE id = $01",
 	} {
-		if _, err := db.Execute(sql, nil); err == nil {
+		if _, err := queryOutcome(db, sql, nil); err == nil {
 			t.Fatalf("%q: expected 42601", sql)
 		} else if ee, ok := err.(*EngineError); !ok || ee.Code() != "42601" {
 			t.Fatalf("%q: code = %v want 42601", sql, err)

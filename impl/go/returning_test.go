@@ -1,7 +1,7 @@
 package jed
 
 // The RETURNING clause (spec/design/grammar.md §32, cost.md §3) — covers what the corpus
-// suite (dml/returning.test) cannot: the Outcome variant split (Statement vs Query),
+// suite (dml/returning.test) cannot: the outcome variant split (Statement vs Query),
 // output column names, pinned costs (the projection charge, the touched-set growth, the
 // fold-once/correlated split), the ceiling's all-or-nothing abort, $N binding, and
 // transactional behavior. Mirrored in impl/rust/tests/returning.rs and
@@ -14,9 +14,9 @@ import (
 	"testing"
 )
 
-func retRun(t *testing.T, db dbHandle, sql string) Outcome {
+func retRun(t *testing.T, db dbHandle, sql string) outcome {
 	t.Helper()
-	o, err := db.Execute(sql, nil)
+	o, err := queryOutcome(db, sql, nil)
 	if err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}
@@ -31,7 +31,7 @@ func retCost(t *testing.T, db dbHandle, sql string) int64 {
 func retRows(t *testing.T, db dbHandle, sql string) [][]Value {
 	t.Helper()
 	o := retRun(t, db, sql)
-	if o.Kind != OutcomeQuery {
+	if o.Kind != outcomeQuery {
 		t.Fatalf("expected a query result for %q", sql)
 	}
 	return o.Rows
@@ -39,7 +39,7 @@ func retRows(t *testing.T, db dbHandle, sql string) [][]Value {
 
 func retErrCode(t *testing.T, db dbHandle, sql string) string {
 	t.Helper()
-	_, err := db.Execute(sql, nil)
+	_, err := queryOutcome(db, sql, nil)
 	if err == nil {
 		t.Fatalf("expected an error from %q", sql)
 	}
@@ -70,7 +70,7 @@ func retSetup(t *testing.T) *Session {
 		"CREATE TABLE t (id i32 PRIMARY KEY, v i32 DEFAULT 7, w i32)",
 		"INSERT INTO t VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300)",
 	} {
-		if _, err := db.Execute(s, nil); err != nil {
+		if _, err := queryOutcome(db, s, nil); err != nil {
 			t.Fatalf("setup %q: %v", s, err)
 		}
 	}
@@ -80,7 +80,7 @@ func retSetup(t *testing.T) *Session {
 func TestInsertValuesReturningRowsAndVariant(t *testing.T) {
 	db := retSetup(t)
 	// Without RETURNING an INSERT stays a bare statement outcome.
-	if o := retRun(t, db, "INSERT INTO t VALUES (10, 1, 2)"); o.Kind != OutcomeStatement {
+	if o := retRun(t, db, "INSERT INTO t VALUES (10, 1, 2)"); o.Kind != outcomeStatement {
 		t.Fatalf("plain INSERT must be a statement outcome")
 	}
 	// With it, the stored rows project back — including multi-row and the `*` glob with
@@ -128,7 +128,7 @@ func TestUpdateReturningNewValues(t *testing.T) {
 	}
 	// Zero matched rows: still a QUERY outcome — empty rows, names intact.
 	o := retRun(t, db, "UPDATE t SET v = 0 WHERE id = 999 RETURNING id")
-	if o.Kind != OutcomeQuery || len(o.Rows) != 0 || !reflect.DeepEqual(o.ColumnNames, []string{"id"}) {
+	if o.Kind != outcomeQuery || len(o.Rows) != 0 || !reflect.DeepEqual(o.ColumnNames, []string{"id"}) {
 		t.Fatalf("zero-row RETURNING must still be a query result: %+v", o)
 	}
 }
@@ -264,15 +264,15 @@ func TestReturningCeilingAbortIsAllOrNothing(t *testing.T) {
 func TestReturningBindParams(t *testing.T) {
 	db := retSetup(t)
 	// A $N in the RETURNING list types from context like anywhere else (api.md §5).
-	o, err := db.Execute("INSERT INTO t VALUES (80, 3, 0) RETURNING v + $1", []Value{IntValue(5)})
+	o, err := queryOutcome(db, "INSERT INTO t VALUES (80, 3, 0) RETURNING v + $1", []Value{IntValue(5)})
 	if err != nil {
 		t.Fatalf("bind: %v", err)
 	}
-	if o.Kind != OutcomeQuery || retGrid(o.Rows) != "8" {
+	if o.Kind != outcomeQuery || retGrid(o.Rows) != "8" {
 		t.Fatalf("got %+v", o)
 	}
 	// A parameter no context types is 42P18.
-	if _, err := db.Execute("INSERT INTO t VALUES (81, 3, 0) RETURNING $1", []Value{IntValue(5)}); err == nil {
+	if _, err := queryOutcome(db, "INSERT INTO t VALUES (81, 3, 0) RETURNING $1", []Value{IntValue(5)}); err == nil {
 		t.Fatalf("an untypable parameter must fail")
 	} else if code := err.(*EngineError).Code(); code != "42P18" {
 		t.Fatalf("got %s want 42P18", code)
@@ -443,7 +443,7 @@ func TestOldNewTouchedSet(t *testing.T) {
 	// DELETE RETURNING new.t reads nothing (NULL side): the 4-unit shape, value NULL.
 	db := fresh()
 	o := retRun(t, db, "DELETE FROM big WHERE id = 1 RETURNING new.t")
-	if o.Kind != OutcomeQuery || retGrid(o.Rows) != "NULL" || o.Cost != 4 {
+	if o.Kind != outcomeQuery || retGrid(o.Rows) != "NULL" || o.Cost != 4 {
 		t.Fatalf("delete new side: got %+v", o)
 	}
 }

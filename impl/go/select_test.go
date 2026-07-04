@@ -8,11 +8,11 @@ import "testing"
 
 func query(t *testing.T, db dbHandle, sql string) [][]Value {
 	t.Helper()
-	out, err := db.Execute(sql, nil)
+	out, err := queryOutcome(db, sql, nil)
 	if err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}
-	if out.Kind != OutcomeQuery {
+	if out.Kind != outcomeQuery {
 		t.Fatalf("expected query result for %q", sql)
 	}
 	return out.Rows
@@ -63,7 +63,7 @@ func TestLimitOffsetWindowReducesProducedCost(t *testing.T) {
 	// (spec/design/cost.md §3). (Ordering by the PK instead short-circuits — pinned cross-core in
 	// query/limit_offset.test, cost 5.)
 	db := limitDB(t)
-	out, err := db.Execute("SELECT id FROM t ORDER BY v LIMIT 2", nil)
+	out, err := queryOutcome(db, "SELECT id FROM t ORDER BY v LIMIT 2", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

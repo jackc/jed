@@ -115,7 +115,7 @@ func ergoExec(ctx context.Context, eng *engine, args []any, raw func([]Value) (*
 func (db *Database) Query(ctx context.Context, sql string, args ...any) (*Rows, error) {
 	s := db.Session(SessionOptions{})
 	defer s.Close()
-	return ergoQuery(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.Query(sql, p) })
+	return ergoQuery(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.QueryValues(sql, p) })
 }
 
 // Exec runs a non-query statement on the autocommit handle and returns its command tag. It routes
@@ -124,7 +124,7 @@ func (db *Database) Query(ctx context.Context, sql string, args ...any) (*Rows, 
 func (db *Database) Exec(ctx context.Context, sql string, args ...any) (Result, error) {
 	s := db.Session(SessionOptions{})
 	defer s.Close()
-	return ergoExec(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.Query(sql, p) })
+	return ergoExec(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.QueryValues(sql, p) })
 }
 
 // QueryRow runs a query and returns a one-row handle; a setup error defers to Row.Scan.
@@ -150,7 +150,7 @@ func (tx *Transaction) QueryRow(ctx context.Context, sql string, args ...any) *R
 }
 
 // Query / Exec / QueryRow on a prepared statement — SQL is fixed at Prepare, so there is no sql
-// argument. The raw QueryValues/Execute methods match the helper closures directly; the statement
+// argument. The raw QueryValues method matches the helper closure directly; the statement
 // runs on execEngine (the bound session's engine, else the statement's own).
 func (s *PreparedStatement) Query(ctx context.Context, args ...any) (*Rows, error) {
 	return ergoQuery(ctx, s.execEngine(), args, s.QueryValues)
@@ -168,11 +168,10 @@ func (s *PreparedStatement) QueryRow(ctx context.Context, args ...any) *Row {
 // Exec runs a non-query statement on this session and returns its command tag — the ergonomic exec
 // surface, Session's analogue of Database.Exec. Unlike the autocommit Database.Exec, session state (an
 // open block, session variables, session-local temp) persists across calls. Sugar over the same total
-// query seam (drain-and-discard the raw Session.Query); a SELECT run through it streams and is
-// discarded (spec/design/api.md §11). The raw Session.Execute(sql, []Value) primitive remains for
-// white-box tests.
+// query seam (drain-and-discard the raw Session.QueryValues); a SELECT run through it streams and is
+// discarded (spec/design/api.md §11).
 func (s *Session) Exec(ctx context.Context, sql string, args ...any) (Result, error) {
-	return ergoExec(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.Query(sql, p) })
+	return ergoExec(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.QueryValues(sql, p) })
 }
 
 // ───────────────────────────── Result (command tag) ─────────────────────────────

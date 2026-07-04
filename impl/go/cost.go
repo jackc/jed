@@ -26,10 +26,10 @@ import "fmt"
 // Meter accrues deterministic execution cost and enforces an optional per-statement ceiling
 // AND an optional per-session budget (CLAUDE.md §13; spec/design/session.md §5.4). Threaded by
 // pointer through the executor and the recursive expression evaluator; the accrued
-// (per-statement) total is reported on Outcome, while the session cumulative is updated live.
+// (per-statement) total is reported on outcome, while the session cumulative is updated live.
 type costMeter struct {
 	// Accrued is the total cost so far FOR THIS STATEMENT (CLAUDE.md §13) — the figure reported
-	// on Outcome and asserted by the `# cost:` directive. i64 mirrors the engine's native
+	// on outcome and asserted by the `# cost:` directive. i64 mirrors the engine's native
 	// integer; the per-statement ceiling compares against this counter.
 	Accrued int64
 	// Limit is the caller-set per-statement cost ceiling, or 0 (the default) for unlimited. A

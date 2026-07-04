@@ -3,7 +3,7 @@ package jed
 // Data-modifying (writable) CTEs (spec/design/writable-cte.md) — the per-core slice that the
 // PostgreSQL-clean conformance corpus (cte/data_modifying.test, cte/with_dml.test,
 // cte/data_modifying_errors.test) cannot express: the command tag of a data-modifying primary (the
-// OutcomeStatement affected-row count, which the corpus's `statement ok` does not assert), and jed's
+// outcomeStatement affected-row count, which the corpus's `statement ok` does not assert), and jed's
 // deterministic last-write-wins resolution of an update/update or update/delete of the SAME row — a
 // documented divergence on a case PostgreSQL leaves unspecified (§7). Mirrors
 // impl/rust/tests/writable_cte.rs and impl/ts/tests/writable_cte.test.ts.
@@ -14,9 +14,9 @@ import (
 )
 
 // wcRun executes sql and returns its outcome, failing the test on error.
-func wcRun(t *testing.T, db dbHandle, sql string) Outcome {
+func wcRun(t *testing.T, db dbHandle, sql string) outcome {
 	t.Helper()
-	out, err := db.Execute(sql, nil)
+	out, err := queryOutcome(db, sql, nil)
 	if err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}
@@ -27,7 +27,7 @@ func wcRun(t *testing.T, db dbHandle, sql string) Outcome {
 func wcRows(t *testing.T, db dbHandle, sql string) []storedRow {
 	t.Helper()
 	out := wcRun(t, db, sql)
-	if out.Kind != OutcomeQuery {
+	if out.Kind != outcomeQuery {
 		t.Fatalf("expected a query result for %q", sql)
 	}
 	rows := make([]storedRow, len(out.Rows))
@@ -42,7 +42,7 @@ func wcRows(t *testing.T, db dbHandle, sql string) []storedRow {
 func wcAffected(t *testing.T, db dbHandle, sql string) int64 {
 	t.Helper()
 	out := wcRun(t, db, sql)
-	if out.Kind != OutcomeStatement || !out.HasRowsAffected {
+	if out.Kind != outcomeStatement || !out.HasRowsAffected {
 		t.Fatalf("expected a statement result for %q", sql)
 	}
 	return out.RowsAffected

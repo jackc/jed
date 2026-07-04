@@ -11,7 +11,7 @@ import "testing"
 
 func privCode(t *testing.T, db dbHandle, sql string) string {
 	t.Helper()
-	_, err := db.Execute(sql, nil)
+	_, err := queryOutcome(db, sql, nil)
 	return sessCode(t, err)
 }
 
@@ -56,7 +56,7 @@ func TestQueryPathEnforcesSelectPrivilege(t *testing.T) {
 	sessExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 	sessExec(t, db, "INSERT INTO t VALUES (1, 10)")
 	db.SetDefaultPrivileges(PrivSetEmpty) // no SELECT
-	rows, err := db.Query("SELECT v FROM t WHERE id = 1", nil)
+	rows, err := db.QueryValues("SELECT v FROM t WHERE id = 1", nil)
 	if err == nil {
 		_ = rows.Close()
 		t.Fatal("SELECT via the streaming Query path without SELECT privilege should be 42501, got rows")
@@ -119,27 +119,27 @@ func TestAnAdditionalSessionCarriesItsOwnEnvelope(t *testing.T) {
 	// the core (§2.1/§5.3) — each owns its envelope, no swap.
 	db := memDB()
 	a := db.Session(SessionOptions{})
-	if _, err := a.Execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", nil); err != nil {
+	if _, err := queryOutcome(a, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)", nil); err != nil {
 		t.Fatal(err)
 	}
 
 	readOnly := PrivSetEmpty.With(PrivSelect)
 	restricted := db.Session(SessionOptions{DefaultPrivileges: &readOnly})
-	if _, err := restricted.Execute("SELECT * FROM t", nil); err != nil {
+	if _, err := queryOutcome(restricted, "SELECT * FROM t", nil); err != nil {
 		t.Fatalf("read should be allowed on the restricted session: %v", err)
 	}
-	if _, err := restricted.Execute("INSERT INTO t VALUES (1, 10)", nil); sessCode(t, err) != "42501" {
+	if _, err := queryOutcome(restricted, "INSERT INTO t VALUES (1, 10)", nil); sessCode(t, err) != "42501" {
 		t.Fatalf("write should be 42501 on the restricted session")
 	}
 
 	// The permissive session is unaffected — it still writes.
-	if _, err := a.Execute("INSERT INTO t VALUES (1, 10)", nil); err != nil {
+	if _, err := queryOutcome(a, "INSERT INTO t VALUES (1, 10)", nil); err != nil {
 		t.Fatal(err)
 	}
 
 	// A grant on the additional session lifts the restriction for it alone.
 	restricted.Grant(PrivSetEmpty.With(PrivInsert), "t")
-	if _, err := restricted.Execute("INSERT INTO t VALUES (2, 20)", nil); err != nil {
+	if _, err := queryOutcome(restricted, "INSERT INTO t VALUES (2, 20)", nil); err != nil {
 		t.Fatalf("insert should be allowed after grant on the restricted session: %v", err)
 	}
 }

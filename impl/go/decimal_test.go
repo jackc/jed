@@ -1,7 +1,7 @@
 package jed
 
 // Phase 3: the exact decimal / numeric type — unit tests on the Decimal type and end-to-end
-// tests through Execute (spec/design/decimal.md). End-to-end assertions are on RENDERED output
+// tests through the query seam (spec/design/decimal.md). End-to-end assertions are on RENDERED output
 // (the cross-core contract), since decimal value-equality (1.5 == 1.50) is scale-insensitive.
 
 import (
@@ -191,11 +191,11 @@ func TestDecimalBigMultiplicationExact(t *testing.T) {
 	}
 }
 
-// --- end-to-end through Execute ---------------------------------------------
+// --- end-to-end through the query seam ---------------------------------------------
 
 func decExec(t *testing.T, db dbHandle, sql string) {
 	t.Helper()
-	if _, err := db.Execute(sql, nil); err != nil {
+	if _, err := queryOutcome(db, sql, nil); err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}
 }
@@ -301,7 +301,7 @@ func TestDecimalCostCeilingAbortsAheadOfBigMultiply(t *testing.T) {
 	db := decDB(t, "CREATE TABLE t (id i32 PRIMARY KEY)", "INSERT INTO t VALUES (1)")
 	big := strings.Repeat("9", 20000) + ".5"
 	db.SetMaxCost(1000)
-	_, err := db.Execute("SELECT "+big+" * "+big+" FROM t", nil)
+	_, err := queryOutcome(db, "SELECT "+big+" * "+big+" FROM t", nil)
 	if err == nil {
 		t.Fatal("expected the cost ceiling to abort the multiply")
 	}

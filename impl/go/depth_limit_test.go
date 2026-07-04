@@ -21,7 +21,7 @@ func depthDB(t *testing.T) *Session {
 
 // codeOf returns the SQLSTATE of running sql, or "ok" if it succeeded.
 func codeOf(db dbHandle, sql string) string {
-	_, err := db.Execute(sql, nil)
+	_, err := queryOutcome(db, sql, nil)
 	if err == nil {
 		return "ok"
 	}

@@ -90,7 +90,7 @@ func TestAF7QuantifiedOverCompositeTotalOrder(t *testing.T) {
 // The AF7 code change #1: unnest(composite[]).
 func TestAF7UnnestComposite(t *testing.T) {
 	db := addrDB(t)
-	out, err := db.Execute(`SELECT * FROM unnest('{"(a,1)","(b,2)"}'::addr[])`, nil)
+	out, err := queryOutcome(db, `SELECT * FROM unnest('{"(a,1)","(b,2)"}'::addr[])`, nil)
 	if err != nil {
 		t.Fatalf("unnest composite: %v", err)
 	}

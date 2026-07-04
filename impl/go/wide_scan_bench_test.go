@@ -40,7 +40,7 @@ func buildWideTable(b *testing.B, w int) string {
 	for j := 0; j < w; j++ {
 		cols = append(cols, fmt.Sprintf("c%d i32", j))
 	}
-	if _, err := db.Execute("CREATE TABLE t ("+strings.Join(cols, ", ")+")", nil); err != nil {
+	if _, err := queryOutcome(db, "CREATE TABLE t ("+strings.Join(cols, ", ")+")", nil); err != nil {
 		b.Fatal(err)
 	}
 
@@ -60,7 +60,7 @@ func buildWideTable(b *testing.B, w int) string {
 			}
 			sb.WriteByte(')')
 		}
-		if _, err := db.Execute(sb.String(), nil); err != nil {
+		if _, err := queryOutcome(db, sb.String(), nil); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -97,7 +97,7 @@ func BenchmarkTrackAWideScan(b *testing.B) {
 			b.Run(fmt.Sprintf("w%02d/%s", w, q.name), func(b *testing.B) {
 				b.ReportAllocs()
 				for i := 0; i < b.N; i++ {
-					rows, err := sess.Query(q.sql, nil)
+					rows, err := sess.QueryValues(q.sql, nil)
 					if err != nil {
 						b.Fatal(err)
 					}

@@ -7,7 +7,7 @@ import (
 )
 
 // EXPLAIN renders the planner's chosen plan as a deterministic, cross-core-identical result set
-// (spec/design/explain.md). The output is an ordinary query Outcome with three columns:
+// (spec/design/explain.md). The output is an ordinary query outcome with three columns:
 //
 //	depth  i32   the plan node's nesting level (0-based), from a pre-order DFS of the plan tree
 //	node   text  the operator label (a fixed vocabulary — the §8 cross-core spelling contract)
@@ -37,18 +37,18 @@ func (r *explainRender) emit(depth int, node, detail string) {
 // executeExplain plans the inner statement and renders the plan (spec/design/explain.md). Plain
 // EXPLAIN never executes the inner statement — planExplainInner produces the plan structs, which
 // renderQueryPlan walks. The EXPLAIN statement's own cost is one row_produced per emitted plan row.
-func (db *engine) executeExplain(ex *explain, params []Value) (Outcome, error) {
+func (db *engine) executeExplain(ex *explain, params []Value) (outcome, error) {
 	if ex.Analyze {
 		return db.executeExplainAnalyze(ex.Inner, params)
 	}
 	if len(params) > 0 {
 		// Plain EXPLAIN renders the plan structurally (a $N bound source prints as "$N", not its
 		// bound value), so supplied parameters are neither needed nor bound.
-		return Outcome{}, newError(SyntaxError, "bind parameters are not allowed in EXPLAIN")
+		return outcome{}, newError(SyntaxError, "bind parameters are not allowed in EXPLAIN")
 	}
 	var r explainRender
 	if err := db.renderExplain(&r, ex.Inner, 0); err != nil {
-		return Outcome{}, err
+		return outcome{}, err
 	}
 	return db.explainOutcome(r.rows), nil
 }
@@ -60,21 +60,21 @@ func (db *engine) executeExplain(ex *explain, params []Value) (Outcome, error) {
 // statement executes for real (a DML inner mutates, and the outer autocommit commits it — EXPLAIN
 // ANALYZE of a write IS a write, classified by stmtIsWrite). The EXPLAIN statement's OWN cost is one
 // row_produced per emitted plan row (independent of the inner cost, which appears only in the root).
-func (db *engine) executeExplainAnalyze(inner *statement, params []Value) (Outcome, error) {
+func (db *engine) executeExplainAnalyze(inner *statement, params []Value) (outcome, error) {
 	// Render the plan tree first (plan-only, no execution — pre-mutation).
 	var body explainRender
 	if err := db.renderExplain(&body, inner, 0); err != nil {
-		return Outcome{}, err
+		return outcome{}, err
 	}
 	// Execute the inner statement for real, capturing its actual accrued cost + row count. Privileges
 	// and the lifetime budget were already admitted on the EXPLAIN (dispatchStmt recurses into the
 	// inner), and the write gate / commit are handled by the outer autocommit.
 	innerOut, err := db.dispatchStmtBody(*inner, params)
 	if err != nil {
-		return Outcome{}, err
+		return outcome{}, err
 	}
 	actualRows := int64(len(innerOut.Rows))
-	if innerOut.Kind == OutcomeStatement {
+	if innerOut.Kind == outcomeStatement {
 		actualRows = innerOut.RowsAffected // a DML statement without RETURNING
 	}
 	// Assemble: the Analyze root carries the actual figures; the plan tree sits one level deeper.
@@ -86,13 +86,13 @@ func (db *engine) executeExplainAnalyze(inner *statement, params []Value) (Outco
 	return db.explainOutcome(r.rows), nil
 }
 
-// explainOutcome wraps rendered plan rows as a query Outcome, charging the EXPLAIN's own cost — one
+// explainOutcome wraps rendered plan rows as a query outcome, charging the EXPLAIN's own cost — one
 // row_produced per emitted plan row (a deterministic function of the plan-row count).
-func (db *engine) explainOutcome(rows [][]Value) Outcome {
+func (db *engine) explainOutcome(rows [][]Value) outcome {
 	meter := db.session.newMeter()
 	meter.Charge(costs.RowProduced * int64(len(rows)))
-	return Outcome{
-		Kind:        OutcomeQuery,
+	return outcome{
+		Kind:        outcomeQuery,
 		ColumnNames: []string{"depth", "node", "detail"},
 		ColumnTypes: []string{"i32", "text", "text"},
 		Rows:        rows,

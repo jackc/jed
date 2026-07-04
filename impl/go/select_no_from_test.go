@@ -16,7 +16,7 @@ import (
 
 func costOf(t *testing.T, db dbHandle, sql string) int64 {
 	t.Helper()
-	out, err := db.Execute(sql, nil)
+	out, err := queryOutcome(db, sql, nil)
 	if err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}
@@ -25,7 +25,7 @@ func costOf(t *testing.T, db dbHandle, sql string) int64 {
 
 func TestNoFromLiteralSelect(t *testing.T) {
 	db := memDB().Session(SessionOptions{})
-	out, err := db.Execute("SELECT 1", nil)
+	out, err := queryOutcome(db, "SELECT 1", nil)
 	if err != nil {
 		t.Fatalf("SELECT 1: %v", err)
 	}
@@ -149,7 +149,7 @@ func TestNoFromSubqueries(t *testing.T) {
 
 func TestNoFromInsertSelectSource(t *testing.T) {
 	db := dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY)")
-	out, err := db.Execute("INSERT INTO t SELECT 3", nil)
+	out, err := queryOutcome(db, "INSERT INTO t SELECT 3", nil)
 	if err != nil {
 		t.Fatalf("INSERT INTO t SELECT 3: %v", err)
 	}
@@ -163,7 +163,7 @@ func TestNoFromInsertSelectSource(t *testing.T) {
 
 func TestNoFromStarIs42601WithPGMessage(t *testing.T) {
 	db := memDB().Session(SessionOptions{})
-	_, err := db.Execute("SELECT *", nil)
+	_, err := queryOutcome(db, "SELECT *", nil)
 	if err == nil {
 		t.Fatal("SELECT *: expected an error")
 	}

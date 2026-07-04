@@ -25,7 +25,7 @@ func subqueryAB(t *testing.T) *Session {
 
 func errCode(t *testing.T, db dbHandle, sql string) string {
 	t.Helper()
-	_, err := db.Execute(sql, nil)
+	_, err := queryOutcome(db, sql, nil)
 	if err == nil {
 		t.Fatalf("expected error for %q", sql)
 	}
@@ -38,8 +38,8 @@ func errCode(t *testing.T, db dbHandle, sql string) string {
 
 func TestSubqueryCostAddedOnce(t *testing.T) {
 	db := subqueryAB(t)
-	base, _ := db.Execute("SELECT id FROM a WHERE k = 999", nil)
-	withSub, _ := db.Execute("SELECT id FROM a WHERE k = (SELECT max(k) FROM b)", nil)
+	base, _ := queryOutcome(db, "SELECT id FROM a WHERE k = 999", nil)
+	withSub, _ := queryOutcome(db, "SELECT id FROM a WHERE k = (SELECT max(k) FROM b)", nil)
 	// The folded constant is a leaf, so the only delta is the subquery's own cost (1 page_read +
 	// 3 scan + 3 accumulate + 1 produced = 8), added exactly once.
 	if d := withSub.Cost - base.Cost; d != 8 {
@@ -74,8 +74,8 @@ func TestDeleteCorrelatedSubqueryCostIsPerRow(t *testing.T) {
 	// A correlated DELETE subquery re-runs per scanned row; an uncorrelated one folds once. The
 	// correlated cost therefore exceeds the uncorrelated baseline on the same data — proving the
 	// per-row execution. Both are deterministic + cross-core identical (CLAUDE.md §13).
-	corr, _ := subqueryAB(t).Execute("DELETE FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)", nil)
-	uncorr, _ := subqueryAB(t).Execute("DELETE FROM a WHERE k IN (SELECT k FROM b)", nil)
+	corr, _ := queryOutcome(subqueryAB(t), "DELETE FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)", nil)
+	uncorr, _ := queryOutcome(subqueryAB(t), "DELETE FROM a WHERE k IN (SELECT k FROM b)", nil)
 	if corr.Cost <= uncorr.Cost {
 		t.Errorf("correlated cost %d should exceed uncorrelated %d", corr.Cost, uncorr.Cost)
 	}

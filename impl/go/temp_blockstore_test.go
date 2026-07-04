@@ -67,7 +67,7 @@ func TestSessionLocalTempPageBudgetBoundsMultiLeaf(t *testing.T) {
 	pad := strings.Repeat("z", 40)
 	aborted := false
 	for i := 1; i <= 400 && !aborted; i++ {
-		_, err := sess.Execute(fmt.Sprintf("INSERT INTO lt VALUES (%d, 'r-%s')", i, pad), nil)
+		_, err := queryOutcome(sess, fmt.Sprintf("INSERT INTO lt VALUES (%d, 'r-%s')", i, pad), nil)
 		if err != nil {
 			if code := err.(*EngineError).Code(); code != "54P03" {
 				t.Fatalf("insert %d: want 54P03, got %s (%v)", i, code, err)

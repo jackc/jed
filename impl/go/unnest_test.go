@@ -29,7 +29,7 @@ func unnestInts(t *testing.T, db dbHandle, sql string) []int64 {
 func TestUnnestNamesAndElementType(t *testing.T) {
 	db := memDB().Session(SessionOptions{})
 	// An untyped ARRAY[…] literal is i64[] (jed's literal typing).
-	out, err := db.Execute("SELECT * FROM unnest(ARRAY[10,20,30])", nil)
+	out, err := queryOutcome(db, "SELECT * FROM unnest(ARRAY[10,20,30])", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -40,12 +40,12 @@ func TestUnnestNamesAndElementType(t *testing.T) {
 		t.Errorf("column types: %v", out.ColumnTypes)
 	}
 	// A typed '{…}'::i32[] literal pins the element type.
-	out, _ = db.Execute("SELECT * FROM unnest('{1,2,3}'::i32[])", nil)
+	out, _ = queryOutcome(db, "SELECT * FROM unnest('{1,2,3}'::i32[])", nil)
 	if out.ColumnTypes[0] != "i32" {
 		t.Errorf("i32[] element type = %s, want i32", out.ColumnTypes[0])
 	}
 	// A text[] argument → a text column.
-	out, _ = db.Execute("SELECT * FROM unnest(ARRAY['a','b'])", nil)
+	out, _ = queryOutcome(db, "SELECT * FROM unnest(ARRAY['a','b'])", nil)
 	if out.ColumnTypes[0] != "text" {
 		t.Errorf("text[] element type = %s, want text", out.ColumnTypes[0])
 	}
@@ -57,7 +57,7 @@ func TestUnnestEmptyAndNullArraysYieldZeroRows(t *testing.T) {
 		"SELECT * FROM unnest('{}'::i32[])",
 		"SELECT * FROM unnest(NULL::i32[])",
 	} {
-		out, err := db.Execute(sql, nil)
+		out, err := queryOutcome(db, sql, nil)
 		if err != nil {
 			t.Fatalf("%q: %v", sql, err)
 		}
@@ -132,7 +132,7 @@ func TestUnnestStrictnessAndDeferredErrors(t *testing.T) {
 func TestUnnestGeneratedRowCostAndCeiling(t *testing.T) {
 	db := memDB().Session(SessionOptions{})
 	// '{…}'::i32[] is a const (no operator_eval): 3 generated_row + 3 row_produced.
-	out, _ := db.Execute("SELECT * FROM unnest('{1,2,3}'::i32[])", nil)
+	out, _ := queryOutcome(db, "SELECT * FROM unnest('{1,2,3}'::i32[])", nil)
 	if out.Cost != 6 {
 		t.Errorf("cost = %d, want 6", out.Cost)
 	}

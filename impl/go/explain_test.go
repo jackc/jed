@@ -63,7 +63,7 @@ func TestExplainOwnsRenderCost(t *testing.T) {
 	sessExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 	sessExec(t, db, "INSERT INTO t VALUES (1, 10)")
 	sessExec(t, db, "INSERT INTO t VALUES (2, 20)")
-	out, err := db.Execute("EXPLAIN ANALYZE SELECT * FROM t", nil)
+	out, err := queryOutcome(db, "EXPLAIN ANALYZE SELECT * FROM t", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +78,7 @@ func TestExplainOwnsRenderCost(t *testing.T) {
 
 func scalarInt(t *testing.T, db dbHandle, sql string) int64 {
 	t.Helper()
-	out, err := db.Execute(sql, nil)
+	out, err := queryOutcome(db, sql, nil)
 	if err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}

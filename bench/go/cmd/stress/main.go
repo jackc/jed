@@ -124,8 +124,18 @@ func parseOp(op string) []string {
 // canonical string (Value.Render — the same deterministic rendering the conformance harness uses, so
 // e.g. the decimal `sum(bigint)` result `1000` renders identically across cores). The invariant is a
 // string comparison against `invariant_expect`, not folded into the cross-core checksum.
+// execWrite runs a write statement through the raw QueryValues seam (Session.Execute is gone), draining
+// and releasing the row-less cursor — a write materializes at the call, so this returns its error.
+func execWrite(sess *jed.Session, sql string) error {
+	rows, err := sess.QueryValues(sql, nil)
+	if err != nil {
+		return err
+	}
+	return rows.Close()
+}
+
 func queryScalar(r *jed.Session, sql string) (string, error) {
-	rows, err := r.Query(sql, nil)
+	rows, err := r.QueryValues(sql, nil)
 	if err != nil {
 		return "", err
 	}
@@ -141,7 +151,7 @@ func queryScalar(r *jed.Session, sql string) (string, error) {
 func setup(db *jed.Database, f *stressFile) error {
 	w := db.WriteSession()
 	for _, s := range f.Setup.SQL {
-		if _, err := w.Execute(s, nil); err != nil {
+		if err := execWrite(w, s); err != nil {
 			_ = w.Rollback()
 			return fmt.Errorf("setup %q: %w", s, err)
 		}
@@ -157,7 +167,7 @@ func checkFinal(db *jed.Database, fin *stressFinal) (checksum string, ok bool, e
 	}
 	r := db.ReadSession()
 	defer r.Close()
-	rows, err := r.Query(fin.Query, nil)
+	rows, err := r.QueryValues(fin.Query, nil)
 	if err != nil {
 		return "", false, err
 	}
@@ -212,7 +222,7 @@ func runWriter(db *jed.Database, stmts []string, iterations int) error {
 	for i := 0; i < iterations; i++ {
 		w := db.WriteSession()
 		for _, s := range stmts {
-			if _, err := w.Execute(s, nil); err != nil {
+			if err := execWrite(w, s); err != nil {
 				_ = w.Rollback()
 				return fmt.Errorf("writer exec %q: %w", s, err)
 			}
@@ -368,7 +378,7 @@ func stepSeq(db *jed.Database, w *seqWorker, idx int, gateHolder *int, checks *i
 			*gateHolder = idx
 			w.op++
 		case w.op <= len(w.stmts): // exec stmt[op-1]
-			if _, err := w.wh.Execute(w.stmts[w.op-1], nil); err != nil {
+			if err := execWrite(w.wh, w.stmts[w.op-1]); err != nil {
 				_ = w.wh.Rollback()
 				return fmt.Errorf("writer exec %q: %w", w.stmts[w.op-1], err)
 			}

@@ -12,7 +12,7 @@ import "testing"
 // txCount returns the number of rows of `SELECT * FROM t` against the committed/visible state.
 func txCount(t *testing.T, db dbHandle, table string) int {
 	t.Helper()
-	out, err := db.Execute("SELECT * FROM "+table, nil)
+	out, err := queryOutcome(db, "SELECT * FROM "+table, nil)
 	if err != nil {
 		t.Fatalf("count %s: %v", table, err)
 	}
@@ -25,14 +25,14 @@ func TestBeginExecuteCommitIsVisible(t *testing.T) {
 	if err := db.Begin(true); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Execute("INSERT INTO t VALUES (1)", nil); err != nil {
+	if _, err := queryOutcome(db, "INSERT INTO t VALUES (1)", nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Execute("INSERT INTO t VALUES (2)", nil); err != nil {
+	if _, err := queryOutcome(db, "INSERT INTO t VALUES (2)", nil); err != nil {
 		t.Fatal(err)
 	}
 	// read-your-writes within the transaction
-	rows, err := db.Query("SELECT id FROM t", nil)
+	rows, err := db.QueryValues("SELECT id FROM t", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +61,7 @@ func TestBeginExecuteRollbackDiscards(t *testing.T) {
 	if err := db.Begin(true); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Execute("INSERT INTO t VALUES (2)", nil); err != nil {
+	if _, err := queryOutcome(db, "INSERT INTO t VALUES (2)", nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Rollback(); err != nil {
@@ -83,10 +83,10 @@ func TestDroppingASessionWithAnOpenBlockRollsBack(t *testing.T) {
 	func() {
 		s := db.Session(SessionOptions{})
 		defer s.Close()
-		if _, err := s.Execute("CREATE TABLE t (id i32 PRIMARY KEY)", nil); err != nil {
+		if _, err := queryOutcome(s, "CREATE TABLE t (id i32 PRIMARY KEY)", nil); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := s.Execute("INSERT INTO t VALUES (1)", nil); err != nil {
+		if _, err := queryOutcome(s, "INSERT INTO t VALUES (1)", nil); err != nil {
 			t.Fatal(err)
 		}
 	}()
@@ -96,7 +96,7 @@ func TestDroppingASessionWithAnOpenBlockRollsBack(t *testing.T) {
 		if err := s.Begin(true); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := s.Execute("INSERT INTO t VALUES (2)", nil); err != nil {
+		if _, err := queryOutcome(s, "INSERT INTO t VALUES (2)", nil); err != nil {
 			t.Fatal(err)
 		}
 		// s closed here without commit/rollback — the safety net rolls the block back
@@ -115,10 +115,10 @@ func TestUpdateClosureCommitsOnNil(t *testing.T) {
 	db := memDB().Session(SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	err := db.Update(func(tx *Transaction) error {
-		if _, e := tx.Execute("INSERT INTO t VALUES (1)", nil); e != nil {
+		if _, e := queryOutcome(tx, "INSERT INTO t VALUES (1)", nil); e != nil {
 			return e
 		}
-		_, e := tx.Execute("INSERT INTO t VALUES (2)", nil)
+		_, e := queryOutcome(tx, "INSERT INTO t VALUES (2)", nil)
 		return e
 	})
 	if err != nil {
@@ -137,11 +137,11 @@ func TestUpdateClosureRollsBackOnErr(t *testing.T) {
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	mustExec(t, db, "INSERT INTO t VALUES (1)")
 	err := db.Update(func(tx *Transaction) error {
-		if _, e := tx.Execute("INSERT INTO t VALUES (2)", nil); e != nil {
+		if _, e := queryOutcome(tx, "INSERT INTO t VALUES (2)", nil); e != nil {
 			return e
 		}
 		// a duplicate key fails the closure -> the whole Update auto-rolls-back
-		_, e := tx.Execute("INSERT INTO t VALUES (1)", nil)
+		_, e := queryOutcome(tx, "INSERT INTO t VALUES (1)", nil)
 		return e
 	})
 	if err == nil || err.(*EngineError).Code() != "23505" {
@@ -179,7 +179,7 @@ func TestViewIsReadOnly(t *testing.T) {
 	}
 	// a write inside a View is 25006, and the View auto-rolls-back
 	err := db.View(func(tx *Transaction) error {
-		_, e := tx.Execute("INSERT INTO t VALUES (3)", nil)
+		_, e := queryOutcome(tx, "INSERT INTO t VALUES (3)", nil)
 		return e
 	})
 	if err == nil || err.(*EngineError).Code() != "25006" {
@@ -196,11 +196,11 @@ func TestNestedBeginIs25001(t *testing.T) {
 	if err := db.Begin(true); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Execute("INSERT INTO t VALUES (1)", nil); err != nil {
+	if _, err := queryOutcome(db, "INSERT INTO t VALUES (1)", nil); err != nil {
 		t.Fatal(err)
 	}
 	// a SQL BEGIN inside an already-open transaction is 25001
-	if _, e := db.Execute("BEGIN", nil); e == nil || e.(*EngineError).Code() != "25001" {
+	if _, e := queryOutcome(db, "BEGIN", nil); e == nil || e.(*EngineError).Code() != "25001" {
 		t.Fatalf("expected 25001, got %v", e)
 	}
 	if err := db.Commit(); err != nil {

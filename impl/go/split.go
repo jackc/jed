@@ -10,7 +10,7 @@ import (
 // Engine — a top-level core export, conceptually part of the lexer surface (CLAUDE.md §5).
 
 // StatementSpan is one statement carved out of a multi-statement string (spec/design/session.md
-// §4.1). Text is the statement's source — feed it to ExecuteSQL/QuerySQL/Prepare — and Offset is
+// §4.1). Text is the statement's source — feed it to QueryValues/Prepare — and Offset is
 // the byte offset of its first significant byte in the original input (for error reporting).
 type StatementSpan struct {
 	Text   string

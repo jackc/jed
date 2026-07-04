@@ -45,7 +45,7 @@ func idsABC(db dbHandle) []string {
 // per-row check fails on the transient collision. Each row's non-key columns move with it.
 func TestUpdatePkSwapIsEndStateValid(t *testing.T) {
 	db := setupUpdate(t)
-	if _, err := db.Execute("UPDATE t SET id = 3 - id WHERE id <= 2", nil); err != nil {
+	if _, err := queryOutcome(db, "UPDATE t SET id = 3 - id WHERE id <= 2", nil); err != nil {
 		t.Fatalf("swap: %v", err)
 	}
 	got := idsABC(db)
@@ -59,7 +59,7 @@ func TestUpdatePkSwapIsEndStateValid(t *testing.T) {
 // three rows — where PostgreSQL rejects the per-row transient (id 1 → 2 while 2 still exists).
 func TestUpdatePkIncrementCascadeSucceeds(t *testing.T) {
 	db := setupUpdate(t)
-	if _, err := db.Execute("UPDATE t SET id = id + 1", nil); err != nil {
+	if _, err := queryOutcome(db, "UPDATE t SET id = id + 1", nil); err != nil {
 		t.Fatalf("cascade: %v", err)
 	}
 	got := idsABC(db)

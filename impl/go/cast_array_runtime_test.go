@@ -32,7 +32,7 @@ func TestArrayToTextIsExplicitOnly(t *testing.T) {
 	if got := castErr(t, db, "INSERT INTO t VALUES (1, ARRAY[1,2,3])"); got != "42804" {
 		t.Fatalf("INSERT array into text col: want 42804, got %s", got)
 	}
-	if _, err := db.Execute("INSERT INTO t VALUES (1, '{1,2,3}')", nil); err != nil {
+	if _, err := queryOutcome(db, "INSERT INTO t VALUES (1, '{1,2,3}')", nil); err != nil {
 		t.Fatal(err)
 	}
 	// Implicit context: comparing a text column to an array value is a mismatch.
@@ -70,7 +70,7 @@ func TestArrayForbiddenElementPairs(t *testing.T) {
 		t.Fatalf("i32[] → timestamp[]: want 42804, got %s", got)
 	}
 	// A composite-element array cast is the deferred composite cast surface → 0A000.
-	if _, err := db.Execute("CREATE TYPE addr AS (street text, zip i32)", nil); err != nil {
+	if _, err := queryOutcome(db, "CREATE TYPE addr AS (street text, zip i32)", nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := castErr(t, db, "SELECT (ARRAY[ROW('Main',90210)::addr]::addr[])::text[]"); got != "0A000" {
@@ -86,7 +86,7 @@ func TestArrayForbiddenElementPairs(t *testing.T) {
 
 func TestRuntimeTextToFloatArrays(t *testing.T) {
 	db := dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY, s text)")
-	if _, err := db.Execute("INSERT INTO t VALUES (1, '{0.5,0.25,-1.5}')", nil); err != nil {
+	if _, err := queryOutcome(db, "INSERT INTO t VALUES (1, '{0.5,0.25,-1.5}')", nil); err != nil {
 		t.Fatal(err)
 	}
 	got := castOne(t, db, "SELECT (s::float8[])::text FROM t WHERE id = 1").Render()

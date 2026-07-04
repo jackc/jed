@@ -22,7 +22,7 @@ import (
 // errRange executes sql expecting an error and returns its SQLSTATE code.
 func errRange(t *testing.T, db dbHandle, sql string) string {
 	t.Helper()
-	_, err := db.Execute(sql, nil)
+	_, err := queryOutcome(db, sql, nil)
 	if err == nil {
 		t.Fatalf("%s: expected an error", sql)
 	}
@@ -97,7 +97,7 @@ func TestRangeCanonicalNameAndAliases(t *testing.T) {
 	// stays a per-core test).
 	db3 := memDB().Session(SessionOptions{})
 	run(t, db3, "CREATE TABLE u (id i32 PRIMARY KEY, r int4range)")
-	_, err := db3.Execute("CREATE INDEX ON u USING gin (r)", nil)
+	_, err := queryOutcome(db3, "CREATE INDEX ON u USING gin (r)", nil)
 	if err == nil {
 		t.Fatal("a gin index over a plain range column should be rejected")
 	}

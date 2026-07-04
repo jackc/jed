@@ -10,7 +10,7 @@ import "testing"
 
 func jpErr(t *testing.T, db dbHandle, sql string) string {
 	t.Helper()
-	_, err := db.Execute(sql, nil)
+	_, err := queryOutcome(db, sql, nil)
 	if err == nil {
 		t.Fatalf("%s: expected an error", sql)
 	}

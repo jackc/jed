@@ -17,7 +17,7 @@ import (
 
 func countVia(t *testing.T, db *Database) int64 {
 	t.Helper()
-	out, err := db.Execute("SELECT count(*) FROM t", nil)
+	out, err := queryOutcome(db, "SELECT count(*) FROM t", nil)
 	if err != nil {
 		t.Fatalf("count query: %v", err)
 	}
@@ -35,14 +35,14 @@ func TestFileBackedRoundtripAndReopen(t *testing.T) {
 		if db.Version() != 1 {
 			t.Fatalf("fresh version = %d, want 1", db.Version())
 		}
-		if _, err := db.Execute("CREATE TABLE t (id i64 PRIMARY KEY)", nil); err != nil {
+		if _, err := queryOutcome(db, "CREATE TABLE t (id i64 PRIMARY KEY)", nil); err != nil {
 			t.Fatalf("create table: %v", err)
 		}
 		if db.Version() != 2 {
 			t.Fatalf("after CREATE version = %d, want 2", db.Version())
 		}
 		for i := 1; i <= 5; i++ {
-			if _, err := db.Execute(fmt.Sprintf("INSERT INTO t VALUES (%d)", i), nil); err != nil {
+			if _, err := queryOutcome(db, fmt.Sprintf("INSERT INTO t VALUES (%d)", i), nil); err != nil {
 				t.Fatalf("insert %d: %v", i, err)
 			}
 		}
@@ -76,17 +76,17 @@ func TestFileBackedExplicitTransactionPersistsThenRollsBack(t *testing.T) {
 		// from Database): mint one over the file-backed core and drive BEGIN/COMMIT/ROLLBACK on it.
 		s := db.Session(SessionOptions{})
 		defer s.Close()
-		if _, err := s.Execute("CREATE TABLE t (id i64 PRIMARY KEY)", nil); err != nil {
+		if _, err := queryOutcome(s, "CREATE TABLE t (id i64 PRIMARY KEY)", nil); err != nil {
 			t.Fatalf("create table: %v", err)
 		}
 		// A committed explicit block is durable.
 		if err := s.Begin(true); err != nil {
 			t.Fatalf("begin: %v", err)
 		}
-		if _, err := s.Execute("INSERT INTO t VALUES (1)", nil); err != nil {
+		if _, err := queryOutcome(s, "INSERT INTO t VALUES (1)", nil); err != nil {
 			t.Fatalf("insert 1: %v", err)
 		}
-		if _, err := s.Execute("INSERT INTO t VALUES (2)", nil); err != nil {
+		if _, err := queryOutcome(s, "INSERT INTO t VALUES (2)", nil); err != nil {
 			t.Fatalf("insert 2: %v", err)
 		}
 		if err := s.Commit(); err != nil {
@@ -99,7 +99,7 @@ func TestFileBackedExplicitTransactionPersistsThenRollsBack(t *testing.T) {
 		if err := s.Begin(true); err != nil {
 			t.Fatalf("begin2: %v", err)
 		}
-		if _, err := s.Execute("INSERT INTO t VALUES (3)", nil); err != nil {
+		if _, err := queryOutcome(s, "INSERT INTO t VALUES (3)", nil); err != nil {
 			t.Fatalf("insert 3: %v", err)
 		}
 		if err := s.Rollback(); err != nil {
@@ -172,13 +172,13 @@ func TestFileBackedReadOnlyOpenRejectsWrites(t *testing.T) {
 	if got := countVia(t, db); got != 1 {
 		t.Fatalf("count = %d, want 1", got)
 	}
-	if _, err := db.Execute("INSERT INTO t VALUES (2)", nil); err == nil || errCodeOf(err) != "25006" {
+	if _, err := queryOutcome(db, "INSERT INTO t VALUES (2)", nil); err == nil || errCodeOf(err) != "25006" {
 		t.Fatalf("write on read-only handle: got %v, want 25006", err)
 	}
 	// A read/write session minted from a read-only core also rejects writes.
 	w := db.WriteSession()
 	defer w.Close()
-	if _, err := w.Execute("INSERT INTO t VALUES (3)", nil); err == nil || errCodeOf(err) != "25006" {
+	if _, err := queryOutcome(w, "INSERT INTO t VALUES (3)", nil); err == nil || errCodeOf(err) != "25006" {
 		t.Fatalf("write via session on read-only core: got %v, want 25006", err)
 	}
 }
@@ -213,7 +213,7 @@ func TestFileBackedReadersRunConcurrentlyWithAWriter(t *testing.T) {
 		defer wg.Done()
 		for i := 2; i <= 40; i++ {
 			w := db.WriteSession()
-			if _, err := w.Execute(fmt.Sprintf("INSERT INTO t VALUES (%d)", i), nil); err != nil {
+			if _, err := queryOutcome(w, fmt.Sprintf("INSERT INTO t VALUES (%d)", i), nil); err != nil {
 				t.Errorf("writer insert %d: %v", i, err)
 				w.Close()
 				return
@@ -265,7 +265,7 @@ func TestFileBackedReadersRunConcurrentlyWithAWriter(t *testing.T) {
 
 func execDB(t *testing.T, db *Database, sql string) {
 	t.Helper()
-	if _, err := db.Execute(sql, nil); err != nil {
+	if _, err := queryOutcome(db, sql, nil); err != nil {
 		t.Fatalf("exec %q: %v", sql, err)
 	}
 }

@@ -12,7 +12,7 @@ func ocDB(t *testing.T, sql ...string) *Session {
 	t.Helper()
 	db := memDB().Session(SessionOptions{})
 	for _, s := range sql {
-		if _, err := db.Execute(s, nil); err != nil {
+		if _, err := queryOutcome(db, s, nil); err != nil {
 			t.Fatalf("setup %q: %v", s, err)
 		}
 	}
@@ -21,7 +21,7 @@ func ocDB(t *testing.T, sql ...string) *Session {
 
 func ocErr(t *testing.T, db dbHandle, sql string) string {
 	t.Helper()
-	_, err := db.Execute(sql, nil)
+	_, err := queryOutcome(db, sql, nil)
 	if err == nil {
 		t.Fatalf("expected an error from %q", sql)
 	}
@@ -30,11 +30,11 @@ func ocErr(t *testing.T, db dbHandle, sql string) string {
 
 func ocAffected(t *testing.T, db dbHandle, sql string) (int64, bool) {
 	t.Helper()
-	out, err := db.Execute(sql, nil)
+	out, err := queryOutcome(db, sql, nil)
 	if err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}
-	if out.Kind != OutcomeStatement {
+	if out.Kind != outcomeStatement {
 		t.Fatalf("expected a statement outcome from %q", sql)
 	}
 	return out.RowsAffected, out.HasRowsAffected

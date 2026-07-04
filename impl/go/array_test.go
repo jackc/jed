@@ -11,14 +11,14 @@ import (
 
 func runArray(t *testing.T, db dbHandle, sql string) {
 	t.Helper()
-	if _, err := db.Execute(sql, nil); err != nil {
+	if _, err := queryOutcome(db, sql, nil); err != nil {
 		t.Fatalf("%s: %v", sql, err)
 	}
 }
 
 func errArray(t *testing.T, db dbHandle, sql string) string {
 	t.Helper()
-	_, err := db.Execute(sql, nil)
+	_, err := queryOutcome(db, sql, nil)
 	if err == nil {
 		t.Fatalf("%s: expected an error", sql)
 	}

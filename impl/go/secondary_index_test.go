@@ -15,9 +15,9 @@ import (
 	"testing"
 )
 
-func siRun(t *testing.T, db dbHandle, sql string) Outcome {
+func siRun(t *testing.T, db dbHandle, sql string) outcome {
 	t.Helper()
-	o, err := db.Execute(sql, nil)
+	o, err := queryOutcome(db, sql, nil)
 	if err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}
@@ -44,7 +44,7 @@ func siIds(t *testing.T, db dbHandle, sql string) []int64 {
 
 func siErr(t *testing.T, db dbHandle, sql string) string {
 	t.Helper()
-	_, err := db.Execute(sql, nil)
+	_, err := queryOutcome(db, sql, nil)
 	if err == nil {
 		t.Fatalf("expected an error from %q", sql)
 	}

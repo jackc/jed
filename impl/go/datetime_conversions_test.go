@@ -16,7 +16,7 @@ import "testing"
 
 func dtErrCode(t *testing.T, db dbHandle, sql string) string {
 	t.Helper()
-	_, err := db.Execute(sql, nil)
+	_, err := queryOutcome(db, sql, nil)
 	if err == nil {
 		t.Fatalf("expected an error from %q", sql)
 	}

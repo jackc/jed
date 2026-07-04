@@ -676,21 +676,15 @@ func (s *Database) Session(opts SessionOptions) *Session {
 // core; session-local state (an open block, session variables, currval, session-local temp tables)
 // does NOT carry to the next call — for durable connection state mint an explicit Session. ---
 
-// Execute runs a (possibly mutating) statement on a fresh autocommit session, binding $N params.
-func (db *Database) Execute(sql string, params []Value) (Outcome, error) {
-	s := db.Session(SessionOptions{})
-	defer s.Close()
-	return s.Execute(sql, params)
-}
-
-// QueryValues runs a query on a fresh autocommit session, returning a row cursor (the rows are
+// QueryValues runs a statement on a fresh autocommit session, returning a row cursor (the rows are
 // materialized, so the cursor stays valid after the session is closed). This is the raw []Value
-// path; the ergonomic Query(ctx, sql, args...) (ergonomic.go, spec/design/api.md §11) is the
-// preferred surface and owns the Query name.
+// path; the ergonomic Query/Exec(ctx, sql, args...) (ergonomic.go, spec/design/api.md §11) is the
+// preferred surface and owns the Query name. Total: a non-query statement returns a no-column cursor
+// carrying the command tag.
 func (db *Database) QueryValues(sql string, params []Value) (*Rows, error) {
 	s := db.Session(SessionOptions{})
 	defer s.Close()
-	return s.Query(sql, params)
+	return s.QueryValues(sql, params)
 }
 
 // ExecuteScript runs a multi-statement script on a fresh autocommit session (spec/design/session.md
@@ -770,19 +764,11 @@ type Session struct {
 	baseVersion uint64
 }
 
-// Execute runs a (possibly mutating) statement on this session, binding $N params (spec/design/api.md
-// §5). Routes by the session's state (read-only / open block / autocommit) with the lazy-gate
-// lifecycle (§2.4).
-func (s *Session) Execute(sql string, params []Value) (Outcome, error) {
-	stmt, err := s.engine.parse(sql)
-	if err != nil {
-		return Outcome{}, err
-	}
-	return s.dispatch(stmt, params)
-}
-
-// Query runs a query on this session, returning a row cursor.
-func (s *Session) Query(sql string, params []Value) (*Rows, error) {
+// QueryValues runs a statement on this session, returning a row cursor (the raw []Value path — the
+// ergonomic Query(ctx, sql, args...) in ergonomic.go owns the Query name, api.md §11). Total: a
+// non-query statement (CREATE/INSERT/…) returns a cursor with no output columns carrying the command
+// tag (RowsAffected/Cost) — Exec is just this drained-and-discarded.
+func (s *Session) QueryValues(sql string, params []Value) (*Rows, error) {
 	stmt, err := s.engine.parse(sql)
 	if err != nil {
 		return nil, err
@@ -810,7 +796,7 @@ func (s *Session) queryStmt(stmt statement, params []Value, sc *scanCache) (*Row
 	// (executor.go gateReadLanes — the safe-total-Query contract, CLAUDE.md §13).
 	if stmt.Begin == nil && stmt.Commit == nil && stmt.Rollback == nil && !stmtIsWrite(stmt) {
 		if err := s.engine.gateReadLanes(stmt); err != nil {
-			return nil, err
+			return nil, s.engine.poisonOnLaneErr(err)
 		}
 	}
 	// pin registers the cursor's snapshot version in the reader-liveness watermark (streaming.md §5);
@@ -832,13 +818,15 @@ func (s *Session) queryStmt(stmt statement, params []Value, sc *scanCache) (*Row
 			}
 			s.core.liveMu.Unlock()
 		})
-		return rows
+		// A drain-time fault inside an open block aborts it (the open-time lane errors are poisoned at the
+		// returns below); a no-op for an autocommit read.
+		return s.engine.attachBlockPoison(rows)
 	}
 	// A single-table no-blocking-op read streams (S3); a blocking read uses the lazy buffered cursor
 	// (S4). One plan-once lane serves both; a prepared statement reuses its cached plan (sc). Both are
 	// live readers and pin their snapshot in the watermark.
 	if rows, ok, err := s.engine.tryScanQuery(stmt, params, sc); err != nil {
-		return nil, err
+		return nil, s.engine.poisonOnLaneErr(err)
 	} else if ok {
 		return pin(rows), nil
 	}
@@ -846,10 +834,14 @@ func (s *Session) queryStmt(stmt statement, params []Value, sc *scanCache) (*Row
 	// it defers the whole run to the first pull and yields the result one row at a time; it is a live
 	// reader too and pins its snapshot in the watermark.
 	if rows, ok, err := s.engine.tryDeferredQuery(stmt, params); err != nil {
-		return nil, err
+		return nil, s.engine.poisonOnLaneErr(err)
 	} else if ok {
 		return pin(rows), nil
 	}
+	// The dispatch fall-through handles transaction control (BEGIN/COMMIT/ROLLBACK — a nested BEGIN's
+	// 25001 must NOT poison the block) and self-poisons on a regular statement error (ExecuteStmtParams),
+	// so its nuanced poisoning is left intact — only the lazy-lane reads above, which bypass it, are
+	// poisoned here.
 	out, err := s.dispatch(stmt, params)
 	if err != nil {
 		return nil, err
@@ -873,7 +865,7 @@ func (s *Session) Prepare(sql string) (*PreparedStatement, error) {
 // a writable block); a statement inside an open block runs against the working set; an autocommit
 // read pins the latest committed for that statement; an autocommit write takes the gate, publishes,
 // and releases it.
-func (s *Session) dispatch(stmt statement, params []Value) (Outcome, error) {
+func (s *Session) dispatch(stmt statement, params []Value) (outcome, error) {
 	if s.access == accessReadOnly {
 		// Every read-only session sets engine.readOnly, so the executor enforces it (PostgreSQL
 		// hot-standby — api.md §2.1): an autocommit write / an in-block write / an explicit BEGIN READ
@@ -919,7 +911,7 @@ func (s *Session) dispatch(stmt statement, params []Value) (Outcome, error) {
 // latest committed; a READ ONLY block pins its snapshot and registers it in the watermark (like a
 // read session) without the gate. writable/modeSet match the engine's beginTx so the access mode
 // resolves identically.
-func (s *Session) beginBlock(writable, modeSet bool) (Outcome, error) {
+func (s *Session) beginBlock(writable, modeSet bool) (outcome, error) {
 	// A nested BEGIN (a block is already open) is 25001 — reject it BEFORE touching the gate/pin: a
 	// writable nested BEGIN would otherwise re-lock the single-writer mutex from the same goroutine and
 	// self-deadlock. beginTx returns the 25001 without mutating state.
@@ -956,8 +948,8 @@ func (s *Session) beginBlock(writable, modeSet bool) (Outcome, error) {
 // endBlock ends the open block (spec/design/session.md §2.4). Commit: a clean writable block
 // publishes its working set at the next version; a failed/read-only block publishes nothing (a failed
 // COMMIT is a ROLLBACK, PostgreSQL). Either way the gate is released and any pin deregistered.
-func (s *Session) endBlock(commit bool) (Outcome, error) {
-	var out Outcome
+func (s *Session) endBlock(commit bool) (outcome, error) {
+	var out outcome
 	var err error
 	if commit {
 		failed := s.engine.session.tx != nil && s.engine.session.tx.failed

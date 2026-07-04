@@ -16,11 +16,11 @@ import "testing"
 func TestMultidimAndLowerBoundKeyOrder(t *testing.T) {
 	db := dbWith(t, "CREATE TABLE m (k i32[] PRIMARY KEY)")
 	for _, v := range []string{"{1,2,3,4}", "{{1,2},{3,4}}", "{1,2,3}", "[2:4]={1,2,3}"} {
-		if _, err := db.Execute("INSERT INTO m VALUES ('"+v+"')", nil); err != nil {
+		if _, err := queryOutcome(db, "INSERT INTO m VALUES ('"+v+"')", nil); err != nil {
 			t.Fatalf("insert %q: %v", v, err)
 		}
 	}
-	out, err := db.Execute("SELECT k FROM m ORDER BY k", nil)
+	out, err := queryOutcome(db, "SELECT k FROM m ORDER BY k", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,7 +39,7 @@ func TestMultidimAndLowerBoundKeyOrder(t *testing.T) {
 // firstColRows runs a SELECT and returns the rendered first-column values.
 func firstColRows(t *testing.T, db dbHandle, sql string) []string {
 	t.Helper()
-	out, err := db.Execute(sql, nil)
+	out, err := queryOutcome(db, sql, nil)
 	if err != nil {
 		t.Fatalf("%s: %v", sql, err)
 	}
@@ -56,7 +56,7 @@ func firstColRows(t *testing.T, db dbHandle, sql string) []string {
 func TestFloatElementArrayKeyIsKeyable(t *testing.T) {
 	db := dbWith(t, "CREATE TABLE m (k f64[] PRIMARY KEY)")
 	for _, v := range []string{"{1.5,2.5}", "{1.5}", "{-Infinity}", "{NaN}", "{1.5,2.0}"} {
-		if _, err := db.Execute("INSERT INTO m VALUES ('"+v+"')", nil); err != nil {
+		if _, err := queryOutcome(db, "INSERT INTO m VALUES ('"+v+"')", nil); err != nil {
 			t.Fatalf("insert %q: %v", v, err)
 		}
 	}
@@ -75,7 +75,7 @@ func TestFloatElementArrayKeyIsKeyable(t *testing.T) {
 func TestFloatElementArrayMultidimKeyOrder(t *testing.T) {
 	db := dbWith(t, "CREATE TABLE m (k f64[] PRIMARY KEY)")
 	for _, v := range []string{"{1.5,2.5,3.5,4.5}", "{{1.5,2.5},{3.5,4.5}}", "{1.5,2.5,3.5}", "[2:4]={1.5,2.5,3.5}"} {
-		if _, err := db.Execute("INSERT INTO m VALUES ('"+v+"')", nil); err != nil {
+		if _, err := queryOutcome(db, "INSERT INTO m VALUES ('"+v+"')", nil); err != nil {
 			t.Fatalf("insert %q: %v", v, err)
 		}
 	}
@@ -92,19 +92,19 @@ func TestFloatElementArrayMultidimKeyOrder(t *testing.T) {
 // yet keyable), while float-element arrays are accepted everywhere a key is taken.
 func TestCompositeElementArrayKeysRejected(t *testing.T) {
 	db := memDB().Session(SessionOptions{})
-	if _, err := db.Execute("CREATE TYPE addr AS (street text, zip i32)", nil); err != nil {
+	if _, err := queryOutcome(db, "CREATE TYPE addr AS (street text, zip i32)", nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := castErrCode(t, db, "CREATE TABLE bad (k addr[] PRIMARY KEY)"); got != "0A000" {
 		t.Fatalf("addr[] PK: want 0A000, got %s", got)
 	}
-	if _, err := db.Execute("CREATE TABLE ok (id i32 PRIMARY KEY, k f32[] UNIQUE)", nil); err != nil {
+	if _, err := queryOutcome(db, "CREATE TABLE ok (id i32 PRIMARY KEY, k f32[] UNIQUE)", nil); err != nil {
 		t.Fatalf("f32[] UNIQUE: %v", err)
 	}
-	if _, err := db.Execute("CREATE TABLE ok2 (id i32 PRIMARY KEY, k f64[])", nil); err != nil {
+	if _, err := queryOutcome(db, "CREATE TABLE ok2 (id i32 PRIMARY KEY, k f64[])", nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Execute("CREATE INDEX ix ON ok2 (k)", nil); err != nil {
+	if _, err := queryOutcome(db, "CREATE INDEX ix ON ok2 (k)", nil); err != nil {
 		t.Fatalf("f64[] index: %v", err)
 	}
 }

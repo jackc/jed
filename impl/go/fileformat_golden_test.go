@@ -39,7 +39,7 @@ func fixture(t *testing.T, name string) []byte {
 
 func run(t *testing.T, db dbHandle, sql string) {
 	t.Helper()
-	if _, err := db.Execute(sql, nil); err != nil {
+	if _, err := queryOutcome(db, sql, nil); err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}
 }
@@ -1066,7 +1066,7 @@ func TestRowidCounterSurvivesLoad(t *testing.T) {
 		t.Fatalf("load: %v", err)
 	}
 	// The next insert must get rowid 3, not 0 — otherwise it collides (23505).
-	if _, err := loaded.Execute("INSERT INTO r VALUES (10, 100)", nil); err != nil {
+	if _, err := queryOutcome(loaded, "INSERT INTO r VALUES (10, 100)", nil); err != nil {
 		t.Fatalf("insert after load should not collide: %v", err)
 	}
 	if got := len(loaded.RowsInKeyOrder("r")); got != 4 {

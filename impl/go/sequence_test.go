@@ -15,11 +15,11 @@ import (
 // seqOneInt runs sql and returns its single int result (or nil for a NULL result).
 func seqOneInt(t *testing.T, db dbHandle, sql string) *int64 {
 	t.Helper()
-	out, err := db.Execute(sql, nil)
+	out, err := queryOutcome(db, sql, nil)
 	if err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}
-	if out.Kind != OutcomeQuery {
+	if out.Kind != outcomeQuery {
 		t.Fatalf("%q: expected a query, got kind %v", sql, out.Kind)
 	}
 	v := out.Rows[0][0]
@@ -49,7 +49,7 @@ func seqMustInt(t *testing.T, db dbHandle, sql string, want int64) {
 
 func seqErrCode(t *testing.T, db dbHandle, sql string) string {
 	t.Helper()
-	_, err := db.Execute(sql, nil)
+	_, err := queryOutcome(db, sql, nil)
 	if err == nil {
 		t.Fatalf("expected an error from %q", sql)
 	}
@@ -60,17 +60,17 @@ func seqErrCode(t *testing.T, db dbHandle, sql string) string {
 // (PostgreSQL keeps it — its sequences are non-transactional). jed is deterministic instead.
 func TestSequenceNextvalRollsBack(t *testing.T) {
 	db := memDB().Session(SessionOptions{})
-	if _, err := db.Execute("CREATE SEQUENCE s", nil); err != nil {
+	if _, err := queryOutcome(db, "CREATE SEQUENCE s", nil); err != nil {
 		t.Fatal(err)
 	}
 	seqMustInt(t, db, "SELECT nextval('s')", 1) // committed: last_value 1
 
-	if _, err := db.Execute("BEGIN", nil); err != nil {
+	if _, err := queryOutcome(db, "BEGIN", nil); err != nil {
 		t.Fatal(err)
 	}
 	seqMustInt(t, db, "SELECT nextval('s')", 2) // working: last_value 2
 	seqMustInt(t, db, "SELECT nextval('s')", 3) // working: last_value 3
-	if _, err := db.Execute("ROLLBACK", nil); err != nil {
+	if _, err := queryOutcome(db, "ROLLBACK", nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -79,11 +79,11 @@ func TestSequenceNextvalRollsBack(t *testing.T) {
 	seqMustInt(t, db, "SELECT nextval('s')", 2)
 
 	// A COMMITted advance, by contrast, persists (identical to PG).
-	if _, err := db.Execute("BEGIN", nil); err != nil {
+	if _, err := queryOutcome(db, "BEGIN", nil); err != nil {
 		t.Fatal(err)
 	}
 	seqMustInt(t, db, "SELECT nextval('s')", 3)
-	if _, err := db.Execute("COMMIT", nil); err != nil {
+	if _, err := queryOutcome(db, "COMMIT", nil); err != nil {
 		t.Fatal(err)
 	}
 	seqMustInt(t, db, "SELECT nextval('s')", 4)
@@ -93,7 +93,7 @@ func TestSequenceNextvalRollsBack(t *testing.T) {
 func TestSequenceFailedStatementDoesNotAdvance(t *testing.T) {
 	db := memDB().Session(SessionOptions{})
 	// A two-value [1, 2] sequence (MINVALUE == MAXVALUE is rejected, matching PG — §15.2).
-	if _, err := db.Execute("CREATE SEQUENCE s MAXVALUE 2", nil); err != nil {
+	if _, err := queryOutcome(db, "CREATE SEQUENCE s MAXVALUE 2", nil); err != nil {
 		t.Fatal(err)
 	}
 	seqMustInt(t, db, "SELECT nextval('s')", 1)
@@ -112,28 +112,28 @@ func TestSequenceFailedStatementDoesNotAdvance(t *testing.T) {
 // allowed there (spec/design/sequences.md §4/§6).
 func TestSequenceNextvalInReadOnlyIs25006(t *testing.T) {
 	db := memDB().Session(SessionOptions{})
-	if _, err := db.Execute("CREATE SEQUENCE s", nil); err != nil {
+	if _, err := queryOutcome(db, "CREATE SEQUENCE s", nil); err != nil {
 		t.Fatal(err)
 	}
 	seqMustInt(t, db, "SELECT nextval('s')", 1) // 1, defines the session value
 
-	if _, err := db.Execute("BEGIN READ ONLY", nil); err != nil {
+	if _, err := queryOutcome(db, "BEGIN READ ONLY", nil); err != nil {
 		t.Fatal(err)
 	}
 	if code := seqErrCode(t, db, "SELECT nextval('s')"); code != "25006" {
 		t.Fatalf("expected 25006, got %s", code)
 	}
-	if _, err := db.Execute("ROLLBACK", nil); err != nil {
+	if _, err := queryOutcome(db, "ROLLBACK", nil); err != nil {
 		t.Fatal(err)
 	}
 
 	// currval is allowed in a read-only transaction (it mutates nothing) — a fresh block, since the
 	// 25006 above poisoned the previous one (any in-block error aborts it).
-	if _, err := db.Execute("BEGIN READ ONLY", nil); err != nil {
+	if _, err := queryOutcome(db, "BEGIN READ ONLY", nil); err != nil {
 		t.Fatal(err)
 	}
 	seqMustInt(t, db, "SELECT currval('s')", 1)
-	if _, err := db.Execute("ROLLBACK", nil); err != nil {
+	if _, err := queryOutcome(db, "ROLLBACK", nil); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -141,7 +141,7 @@ func TestSequenceNextvalInReadOnlyIs25006(t *testing.T) {
 // currval is session-local and 55000 before the first nextval.
 func TestSequenceCurrvalSessionState(t *testing.T) {
 	db := memDB().Session(SessionOptions{})
-	if _, err := db.Execute("CREATE SEQUENCE s", nil); err != nil {
+	if _, err := queryOutcome(db, "CREATE SEQUENCE s", nil); err != nil {
 		t.Fatal(err)
 	}
 	if code := seqErrCode(t, db, "SELECT currval('s')"); code != "55000" {
@@ -277,11 +277,11 @@ func TestSequenceSetvalAlterInReadOnlyIs25006(t *testing.T) {
 // seqQueryRows runs sql and returns the int values of its rows (panicking on NULL/non-int cells).
 func seqQueryRows(t *testing.T, db dbHandle, sql string) [][]int64 {
 	t.Helper()
-	out, err := db.Execute(sql, nil)
+	out, err := queryOutcome(db, sql, nil)
 	if err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}
-	if out.Kind != OutcomeQuery {
+	if out.Kind != outcomeQuery {
 		t.Fatalf("%q: expected a query, got kind %v", sql, out.Kind)
 	}
 	rows := make([][]int64, len(out.Rows))

@@ -11,7 +11,7 @@ import "testing"
 
 func sessExec(t *testing.T, db dbHandle, sql string) {
 	t.Helper()
-	if _, err := db.Execute(sql, nil); err != nil {
+	if _, err := queryOutcome(db, sql, nil); err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}
 }
@@ -51,14 +51,14 @@ func TestFailedBlockIsTheFailedState(t *testing.T) {
 	// ROLLBACK/COMMIT is 25P02 (§2.2 / transactions.md §6), and ROLLBACK returns to Idle.
 	db := memDB().Session(SessionOptions{})
 	sessExec(t, db, "BEGIN")
-	_, err := db.Execute("SELECT * FROM missing", nil)
+	_, err := queryOutcome(db, "SELECT * FROM missing", nil)
 	if got := sessCode(t, err); got != "42P01" {
 		t.Fatalf("want 42P01, got %s", got)
 	}
 	if db.Status() != TxFailed {
 		t.Fatalf("after error in block: want Failed, got %v", db.Status())
 	}
-	_, err = db.Execute("SELECT 1", nil)
+	_, err = queryOutcome(db, "SELECT 1", nil)
 	if got := sessCode(t, err); got != "25P02" {
 		t.Fatalf("want 25P02, got %s", got)
 	}
@@ -73,10 +73,10 @@ func TestAdditionalSessionSharesStorageWithIndependentSettings(t *testing.T) {
 	// is shared through the core (§2.4) — no swap. Settings (the cost ceiling) are independent.
 	db := memDB()
 	a := db.Session(SessionOptions{})
-	if _, err := a.Execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", nil); err != nil {
+	if _, err := queryOutcome(a, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)", nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := a.Execute("INSERT INTO t VALUES (1, 10)", nil); err != nil {
+	if _, err := queryOutcome(a, "INSERT INTO t VALUES (1, 10)", nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -90,7 +90,7 @@ func TestAdditionalSessionSharesStorageWithIndependentSettings(t *testing.T) {
 	}
 
 	// It sees a's committed data (committed storage is shared via the core).
-	out, err := s.Execute("SELECT id, v FROM t", nil)
+	out, err := queryOutcome(s, "SELECT id, v FROM t", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,10 +99,10 @@ func TestAdditionalSessionSharesStorageWithIndependentSettings(t *testing.T) {
 	}
 
 	// A write through the second session (autocommit, lazy gate) is visible to a's next read.
-	if _, err := s.Execute("INSERT INTO t VALUES (2, 20)", nil); err != nil {
+	if _, err := queryOutcome(s, "INSERT INTO t VALUES (2, 20)", nil); err != nil {
 		t.Fatal(err)
 	}
-	out, err = a.Execute("SELECT id FROM t ORDER BY id", nil)
+	out, err = queryOutcome(a, "SELECT id FROM t ORDER BY id", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,23 +121,23 @@ func TestAdditionalSessionCostCeilingEnforced(t *testing.T) {
 	// while an unlimited session runs it fine — both over the same shared core.
 	db := memDB()
 	a := db.Session(SessionOptions{})
-	if _, err := a.Execute("CREATE TABLE t (id i32 PRIMARY KEY)", nil); err != nil {
+	if _, err := queryOutcome(a, "CREATE TABLE t (id i32 PRIMARY KEY)", nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := a.Execute("INSERT INTO t VALUES (1), (2), (3)", nil); err != nil {
+	if _, err := queryOutcome(a, "INSERT INTO t VALUES (1), (2), (3)", nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := a.Execute("SELECT * FROM t", nil); err != nil { // unlimited
+	if _, err := queryOutcome(a, "SELECT * FROM t", nil); err != nil { // unlimited
 		t.Fatal(err)
 	}
 
 	s := db.Session(SessionOptions{MaxCost: 1})
-	_, err := s.Execute("SELECT * FROM t", nil)
+	_, err := queryOutcome(s, "SELECT * FROM t", nil)
 	if got := sessCode(t, err); got != "54P01" {
 		t.Fatalf("want 54P01, got %s", got)
 	}
 
-	if _, err := a.Execute("SELECT * FROM t", nil); err != nil { // a unaffected
+	if _, err := queryOutcome(a, "SELECT * FROM t", nil); err != nil { // a unaffected
 		t.Fatal(err)
 	}
 	if a.MaxCost() != 0 {
@@ -148,16 +148,16 @@ func TestAdditionalSessionCostCeilingEnforced(t *testing.T) {
 func TestAdditionalSessionUpdateClosureCommitsToSharedStorage(t *testing.T) {
 	db := memDB()
 	a := db.Session(SessionOptions{})
-	if _, err := a.Execute("CREATE TABLE t (id i32 PRIMARY KEY)", nil); err != nil {
+	if _, err := queryOutcome(a, "CREATE TABLE t (id i32 PRIMARY KEY)", nil); err != nil {
 		t.Fatal(err)
 	}
 
 	s := db.Session(SessionOptions{})
 	err := s.Update(func(tx *Transaction) error {
-		if _, err := tx.Execute("INSERT INTO t VALUES (1)", nil); err != nil {
+		if _, err := queryOutcome(tx, "INSERT INTO t VALUES (1)", nil); err != nil {
 			return err
 		}
-		_, err := tx.Execute("INSERT INTO t VALUES (2)", nil)
+		_, err := queryOutcome(tx, "INSERT INTO t VALUES (2)", nil)
 		return err
 	})
 	if err != nil {
@@ -165,7 +165,7 @@ func TestAdditionalSessionUpdateClosureCommitsToSharedStorage(t *testing.T) {
 	}
 
 	// The update closure committed through the shared core; another session sees both rows.
-	out, err := a.Execute("SELECT count(*) FROM t", nil)
+	out, err := queryOutcome(a, "SELECT count(*) FROM t", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

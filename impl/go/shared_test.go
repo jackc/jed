@@ -16,7 +16,7 @@ import (
 // readCount runs SELECT count(*) FROM t against a read handle and returns the count.
 func readCount(t *testing.T, r *Session) int64 {
 	t.Helper()
-	rows, err := r.Query("SELECT count(*) FROM t", nil)
+	rows, err := r.QueryValues("SELECT count(*) FROM t", nil)
 	if err != nil {
 		t.Fatalf("count query: %v", err)
 	}
@@ -35,11 +35,11 @@ func seeded(t *testing.T, ids ...int64) *Database {
 	t.Helper()
 	db := memDB()
 	w := db.WriteSession()
-	if _, err := w.Execute("CREATE TABLE t (id bigint PRIMARY KEY)", nil); err != nil {
+	if _, err := queryOutcome(w, "CREATE TABLE t (id bigint PRIMARY KEY)", nil); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	for _, id := range ids {
-		if _, err := w.Execute(fmt.Sprintf("INSERT INTO t VALUES (%d)", id), nil); err != nil {
+		if _, err := queryOutcome(w, fmt.Sprintf("INSERT INTO t VALUES (%d)", id), nil); err != nil {
 			t.Fatalf("insert %d: %v", id, err)
 		}
 	}
@@ -65,7 +65,7 @@ func TestSharedReadHandleRejectsWrites(t *testing.T) {
 	db := seeded(t, 1)
 	r := db.ReadSession()
 	defer r.Close()
-	_, err := r.Execute("INSERT INTO t VALUES (2)", nil)
+	_, err := queryOutcome(r, "INSERT INTO t VALUES (2)", nil)
 	if err == nil {
 		t.Fatal("expected a write through a read handle to fail")
 	}
@@ -82,7 +82,7 @@ func TestSharedReaderDoesNotBlockOnOpenWriter(t *testing.T) {
 	// must see the pre-commit (committed) state — the core "readers parallel with a writer" claim.
 	db := seeded(t, 1)
 	w := db.WriteSession()
-	if _, err := w.Execute("INSERT INTO t VALUES (2)", nil); err != nil { // staged, not committed
+	if _, err := queryOutcome(w, "INSERT INTO t VALUES (2)", nil); err != nil { // staged, not committed
 		t.Fatalf("staged insert: %v", err)
 	}
 	r := db.ReadSession() // does NOT block on the open writer
@@ -112,7 +112,7 @@ func TestSharedPinnedReaderIsolatedFromConcurrentWriter(t *testing.T) {
 	go func() {
 		defer close(done)
 		w := db.WriteSession()
-		if _, err := w.Execute("INSERT INTO t VALUES (2)", nil); err != nil {
+		if _, err := queryOutcome(w, "INSERT INTO t VALUES (2)", nil); err != nil {
 			t.Errorf("writer insert: %v", err)
 			return
 		}
@@ -147,7 +147,7 @@ func TestSharedManyReadersParallelWithWriter(t *testing.T) {
 		defer wg.Done()
 		for i := int64(2); i <= 20; i++ {
 			w := db.WriteSession()
-			if _, err := w.Execute(fmt.Sprintf("INSERT INTO t VALUES (%d)", i), nil); err != nil {
+			if _, err := queryOutcome(w, fmt.Sprintf("INSERT INTO t VALUES (%d)", i), nil); err != nil {
 				t.Errorf("writer insert %d: %v", i, err)
 				return
 			}
@@ -204,7 +204,7 @@ func TestSharedOldestLiveTxidTracksPinnedReaders(t *testing.T) {
 	}
 
 	w := db.WriteSession()
-	if _, err := w.Execute("INSERT INTO t VALUES (2)", nil); err != nil {
+	if _, err := queryOutcome(w, "INSERT INTO t VALUES (2)", nil); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
 	if err := w.Commit(); err != nil { // version 2
@@ -236,7 +236,7 @@ func TestSharedOldestLiveTxidTracksPinnedReaders(t *testing.T) {
 func TestSharedRolledBackWriterPublishesNothing(t *testing.T) {
 	db := seeded(t, 1)
 	w := db.WriteSession()
-	if _, err := w.Execute("INSERT INTO t VALUES (2)", nil); err != nil {
+	if _, err := queryOutcome(w, "INSERT INTO t VALUES (2)", nil); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
 	if err := w.Rollback(); err != nil {
@@ -253,7 +253,7 @@ func TestSharedRolledBackWriterPublishesNothing(t *testing.T) {
 
 	// A second writer can proceed after the first rolled back (the gate was released).
 	w2 := db.WriteSession()
-	if _, err := w2.Execute("INSERT INTO t VALUES (3)", nil); err != nil {
+	if _, err := queryOutcome(w2, "INSERT INTO t VALUES (3)", nil); err != nil {
 		t.Fatalf("second insert: %v", err)
 	}
 	if err := w2.Commit(); err != nil {

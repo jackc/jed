@@ -97,7 +97,7 @@ func TestLazyChainsAreReadOnlyWhenTouched(t *testing.T) {
 	// Touching the spilled column reads the chain: the corruption surfaces as XX001 —
 	// non-UTF-8 for the external-plain text, a malformed LZ4 block for external-compressed.
 	for _, id := range []int{1, 2} {
-		_, err := db.Execute(fmt.Sprintf("SELECT body FROM t WHERE id = %d", id), nil)
+		_, err := queryOutcome(db, fmt.Sprintf("SELECT body FROM t WHERE id = %d", id), nil)
 		if err == nil {
 			t.Fatalf("id %d: a corrupted chain must fail when touched", id)
 		}

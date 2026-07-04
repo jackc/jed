@@ -52,14 +52,14 @@ func TestPointLookupMultiLeaf(t *testing.T) {
 	}
 
 	// End-to-end point lookup: exactly one row, and the cost is sublinear in n (it did not full-scan).
-	out, err := db.Execute("SELECT v FROM t WHERE id = 500", nil)
+	out, err := queryOutcome(db, "SELECT v FROM t WHERE id = 500", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(out.Rows) != 1 || out.Rows[0][0].Int != 500 {
 		t.Errorf("point lookup got %v, want [500]", out.Rows)
 	}
-	full, err := db.Execute("SELECT v FROM t", nil)
+	full, err := queryOutcome(db, "SELECT v FROM t", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +71,7 @@ func TestPointLookupMultiLeaf(t *testing.T) {
 	}
 
 	// A point-lookup MISS still visits the leaf it would live in (page_read > 0) but reads no row.
-	miss, err := db.Execute("SELECT v FROM t WHERE id = 99999", nil)
+	miss, err := queryOutcome(db, "SELECT v FROM t WHERE id = 99999", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +103,7 @@ func TestRangeScanCrossesLeafBoundaries(t *testing.T) {
 	}
 
 	// Empty (contradictory) bound: zero rows, zero cost — proved without scanning.
-	empty, err := db.Execute("SELECT id FROM t WHERE id > 700 AND id < 300", nil)
+	empty, err := queryOutcome(db, "SELECT id FROM t WHERE id > 700 AND id < 300", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,14 +118,14 @@ func TestLimitShortCircuitMultiLeaf(t *testing.T) {
 
 	// LIMIT without ORDER BY stops the scan early: it returns `limit` rows at sublinear cost (it did
 	// NOT read all 1000). The rows are the primary-key-order prefix (our cores' deterministic choice).
-	out, err := db.Execute("SELECT v FROM t LIMIT 5", nil)
+	out, err := queryOutcome(db, "SELECT v FROM t LIMIT 5", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(out.Rows) != 5 {
 		t.Fatalf("LIMIT 5 got %d rows, want 5", len(out.Rows))
 	}
-	full, err := db.Execute("SELECT v FROM t", nil)
+	full, err := queryOutcome(db, "SELECT v FROM t", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,7 +156,7 @@ func TestLimitShortCircuitMultiLeaf(t *testing.T) {
 	if rows := query(t, dz, "SELECT 100 / c FROM z LIMIT 1"); len(rows) != 1 || rows[0][0].Int != 20 {
 		t.Errorf("LIMIT 1 should produce only the safe first row (100/5=20), got %v", rows)
 	}
-	if _, err := dz.Execute("SELECT 100 / c FROM z LIMIT 2", nil); err == nil {
+	if _, err := queryOutcome(dz, "SELECT 100 / c FROM z LIMIT 2", nil); err == nil {
 		t.Errorf("LIMIT 2 reaches the c=0 row and must trap (division by zero)")
 	}
 }
@@ -166,7 +166,7 @@ func TestMutationPushdownMultiLeaf(t *testing.T) {
 	db := bigTable(t, n)
 
 	// DELETE by primary key seeks one row at sublinear cost and leaves the rest intact.
-	d, err := db.Execute("DELETE FROM t WHERE id = 500", nil)
+	d, err := queryOutcome(db, "DELETE FROM t WHERE id = 500", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +181,7 @@ func TestMutationPushdownMultiLeaf(t *testing.T) {
 	}
 
 	// UPDATE by primary key likewise.
-	u, err := db.Execute("UPDATE t SET v = -1 WHERE id = 700", nil)
+	u, err := queryOutcome(db, "UPDATE t SET v = -1 WHERE id = 700", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

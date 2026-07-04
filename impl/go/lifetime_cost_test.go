@@ -15,7 +15,7 @@ const cost5 = "SELECT 1 + 1 + 1 + 1 + 1"
 
 func lifeCode(t *testing.T, db dbHandle, sql string) string {
 	t.Helper()
-	_, err := db.Execute(sql, nil)
+	_, err := queryOutcome(db, sql, nil)
 	return sessCode(t, err)
 }
 
@@ -147,16 +147,16 @@ func TestAnAdditionalSessionCarriesItsOwnBudget(t *testing.T) {
 	// two cumulatives are independent (each session owns its envelope).
 	db := memDB()
 	a := db.Session(SessionOptions{})
-	if _, err := a.Execute("SELECT 1", nil); err != nil { // a's cumulative 1
+	if _, err := queryOutcome(a, "SELECT 1", nil); err != nil { // a's cumulative 1
 		t.Fatal(err)
 	}
 
 	budgeted := db.Session(SessionOptions{LifetimeMaxCost: 2})
-	if _, err := budgeted.Execute("SELECT 1", nil); err != nil { // its cumulative 1
+	if _, err := queryOutcome(budgeted, "SELECT 1", nil); err != nil { // its cumulative 1
 		t.Fatalf("first: %v", err)
 	}
 	// Its second statement drives its own budget to 2 and aborts 54P02 — independent of a.
-	if _, err := budgeted.Execute("SELECT 1", nil); err == nil || err.(*EngineError).Code() != "54P02" {
+	if _, err := queryOutcome(budgeted, "SELECT 1", nil); err == nil || err.(*EngineError).Code() != "54P02" {
 		t.Fatalf("second: want 54P02, got %v", err)
 	}
 	if budgeted.LifetimeCost() != 2 {
@@ -168,7 +168,7 @@ func TestAnAdditionalSessionCarriesItsOwnBudget(t *testing.T) {
 	if a.LifetimeCost() != 1 {
 		t.Fatalf("a cumulative: want 1, got %d", a.LifetimeCost())
 	}
-	if _, err := a.Execute("SELECT 1", nil); err != nil {
+	if _, err := queryOutcome(a, "SELECT 1", nil); err != nil {
 		t.Fatal(err)
 	}
 	if a.LifetimeCost() != 2 {

@@ -9,7 +9,7 @@ func dbWith(t *testing.T, stmts ...string) *Session {
 	t.Helper()
 	db := memDB().Session(SessionOptions{})
 	for _, s := range stmts {
-		if _, err := db.Execute(s, nil); err != nil {
+		if _, err := queryOutcome(db, s, nil); err != nil {
 			t.Fatalf("setup %q: %v", s, err)
 		}
 	}
@@ -99,7 +99,7 @@ func TestInsertSelectParamInSourceWhere(t *testing.T) {
 		"CREATE TABLE dst (id i32 PRIMARY KEY, a i16)",
 	)
 	// A $1 inside the source SELECT binds through the SELECT's own resolver.
-	if _, err := db.Execute("INSERT INTO dst SELECT id, a FROM src WHERE id >= $1", []Value{IntValue(2)}); err != nil {
+	if _, err := queryOutcome(db, "INSERT INTO dst SELECT id, a FROM src WHERE id >= $1", []Value{IntValue(2)}); err != nil {
 		t.Fatalf("INSERT ... SELECT with param: %v", err)
 	}
 	if got := ids(db.RowsInKeyOrder("dst")); !eqInts(got, 2, 3) {
@@ -117,7 +117,7 @@ func TestInsertSelectCostIsEmbeddedSelectCost(t *testing.T) {
 	// 1 page_read (src is one leaf) + 3 scanned + 3 produced + 0 projection (bare columns) = 7;
 	// storing the rows is unmetered.
 	out := mustCreate(t, db, "INSERT INTO dst SELECT id, a, b FROM src")
-	if out.Kind != OutcomeStatement || out.Cost != 7 {
+	if out.Kind != outcomeStatement || out.Cost != 7 {
 		t.Errorf("got kind=%v cost=%d, want statement cost=7", out.Kind, out.Cost)
 	}
 }

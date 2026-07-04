@@ -2,8 +2,8 @@ package jed
 
 // White-box tests for the prepared-statement plan cache (spec/design/api.md §2.4). A prepared
 // statement caches its resolved scan plan and reuses it across executes, re-planning only when the
-// catalog changes. The behavior is invisible to the conformance corpus (which drives the materialized
-// Execute path and never reuses a plan), and the interesting properties are internal — that a hit
+// catalog changes. The behavior is invisible to the conformance corpus (which never reuses a plan
+// across statements), and the interesting properties are internal — that a hit
 // reuses the exact plan (not re-plans), that reuse is cost-identical, that DDL invalidates, that a
 // subquery / precompiled-regex / temp plan is never cached, and that a plan first executed inside a
 // transaction is not cached from the uncommitted working set — so they live here, not in the corpus

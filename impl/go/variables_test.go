@@ -14,7 +14,7 @@ import "testing"
 // varScalar runs a single-row, single-column query and returns the lone value.
 func varScalar(t *testing.T, db dbHandle, sql string) Value {
 	t.Helper()
-	out, err := db.Execute(sql, nil)
+	out, err := queryOutcome(db, sql, nil)
 	if err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}
@@ -26,7 +26,7 @@ func varScalar(t *testing.T, db dbHandle, sql string) Value {
 
 func varErrCode(t *testing.T, db dbHandle, sql string) string {
 	t.Helper()
-	_, err := db.Execute(sql, nil)
+	_, err := queryOutcome(db, sql, nil)
 	if err == nil {
 		t.Fatalf("%q: expected an error", sql)
 	}
@@ -166,7 +166,7 @@ func TestVarAdditionalSessionHasIndependentVariables(t *testing.T) {
 	if err := other.SetVar("myapp.who", "other"); err != nil {
 		t.Fatal(err)
 	}
-	out, err := other.Execute("SELECT current_setting('myapp.who')", nil)
+	out, err := queryOutcome(other, "SELECT current_setting('myapp.who')", nil)
 	if err != nil {
 		t.Fatalf("other execute: %v", err)
 	}

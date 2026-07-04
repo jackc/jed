@@ -18,11 +18,11 @@ func setopAB(t *testing.T) *Session {
 
 func TestSetOpDispatchReturnsQuery(t *testing.T) {
 	db := setopAB(t)
-	out, err := db.Execute("SELECT k FROM a UNION SELECT k FROM b", nil)
+	out, err := queryOutcome(db, "SELECT k FROM a UNION SELECT k FROM b", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out.Kind != OutcomeQuery {
+	if out.Kind != outcomeQuery {
 		t.Fatalf("expected query outcome, got %v", out.Kind)
 	}
 }
@@ -30,4 +30,4 @@ func TestSetOpDispatchReturnsQuery(t *testing.T) {
 // The per-feature row/multiset/precedence/unification/error assertions that used to live here
 // are covered by the shared conformance corpus (spec/conformance/suites/setops/*.test), which
 // runs on all three cores. TestSetOpDispatchReturnsQuery is retained: it asserts the internal
-// Outcome.Kind discriminant, which the SQL-in->rows corpus cannot observe.
+// outcome.Kind discriminant, which the SQL-in->rows corpus cannot observe.

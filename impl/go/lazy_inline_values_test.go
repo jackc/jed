@@ -249,7 +249,7 @@ func TestLazyUntouchedCorruptInlineBodyDefersError(t *testing.T) {
 		t.Fatal("the clean row's body must resolve")
 	}
 	for _, sql := range []string{"SELECT body FROM t WHERE id = 1", "SELECT * FROM t ORDER BY id"} {
-		_, err := db.Execute(sql, nil)
+		_, err := queryOutcome(db, sql, nil)
 		if err == nil {
 			t.Fatalf("touching the corrupted body must fail: %q", sql)
 		}

@@ -105,7 +105,7 @@ func TestUnknownCollationIs42704(t *testing.T) {
 	// A collation neither loaded nor referenced is 42704 (the loaded-set fallback must not mask it).
 	loadFixtureBundle(t)
 	db := memDB().Session(SessionOptions{})
-	if _, err := db.Execute(`SELECT 'x' COLLATE "no-such-collation"`, nil); err == nil || err.(*EngineError).Code() != "42704" {
+	if _, err := queryOutcome(db, `SELECT 'x' COLLATE "no-such-collation"`, nil); err == nil || err.(*EngineError).Code() != "42704" {
 		t.Fatalf("want 42704, got %v", err)
 	}
 }
@@ -139,7 +139,7 @@ func TestImplicitConflictIs42P22(t *testing.T) {
 	run(t, db, `CREATE TABLE t (a text COLLATE "unicode", b text COLLATE "es", c text COLLATE "C")`)
 	run(t, db, `INSERT INTO t VALUES ('a','z','b')`)
 	for _, sql := range []string{`SELECT a < b FROM t`, `SELECT a < c FROM t`} {
-		if _, err := db.Execute(sql, nil); err == nil || err.(*EngineError).Code() != "42P22" {
+		if _, err := queryOutcome(db, sql, nil); err == nil || err.(*EngineError).Code() != "42P22" {
 			t.Fatalf("%s: want 42P22, got %v", sql, err)
 		}
 	}
@@ -161,10 +161,10 @@ func TestImplicitConflictIs42P22(t *testing.T) {
 func TestNonTextCollateIs42804UnknownName42704(t *testing.T) {
 	loadFixtureBundle(t)
 	db := memDB().Session(SessionOptions{})
-	if _, err := db.Execute(`CREATE TABLE t (a i32 COLLATE "unicode")`, nil); err == nil || err.(*EngineError).Code() != "42804" {
+	if _, err := queryOutcome(db, `CREATE TABLE t (a i32 COLLATE "unicode")`, nil); err == nil || err.(*EngineError).Code() != "42804" {
 		t.Fatalf("non-text COLLATE: want 42804, got %v", err)
 	}
-	if _, err := db.Execute(`CREATE TABLE t (a text COLLATE "nope")`, nil); err == nil || err.(*EngineError).Code() != "42704" {
+	if _, err := queryOutcome(db, `CREATE TABLE t (a text COLLATE "nope")`, nil); err == nil || err.(*EngineError).Code() != "42704" {
 		t.Fatalf("unknown name: want 42704, got %v", err)
 	}
 }
@@ -242,7 +242,7 @@ func TestCollatedUniqueDedupsByByteIdentity(t *testing.T) {
 	db := memDB().Session(SessionOptions{})
 	run(t, db, `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "unicode" UNIQUE)`)
 	run(t, db, `INSERT INTO t VALUES (1,'a'),(2,'A'),(3,'b')`)
-	if _, err := db.Execute(`INSERT INTO t VALUES (4,'a')`, nil); err == nil || err.(*EngineError).Code() != "23505" {
+	if _, err := queryOutcome(db, `INSERT INTO t VALUES (4,'a')`, nil); err == nil || err.(*EngineError).Code() != "23505" {
 		t.Fatalf("collated UNIQUE duplicate: want 23505, got %v", err)
 	}
 	if got := texts(t, query(t, db, `SELECT name FROM t ORDER BY name`)); !eqStrings(got, []string{"a", "A", "b"}) {
@@ -337,7 +337,7 @@ func TestSkewedCollationBlocksWrites(t *testing.T) {
 		`INSERT INTO t VALUES ('b'), ('a')`,
 		`INSERT INTO t VALUES ('c')`, // Full → succeeds
 	} {
-		if _, err := db.Execute(sql, nil); err != nil {
+		if _, err := queryOutcome(db, sql, nil); err != nil {
 			t.Fatalf("%s: unexpected error %v", sql, err)
 		}
 	}
@@ -372,7 +372,7 @@ func TestSkewedCollationBlocksWrites(t *testing.T) {
 	}
 
 	// Reads still work — all three rows come back (values are version-independent §4.1).
-	out, err := db.Execute(`SELECT x FROM t ORDER BY x COLLATE "unicode"`, nil)
+	out, err := queryOutcome(db, `SELECT x FROM t ORDER BY x COLLATE "unicode"`, nil)
 	if err != nil {
 		t.Fatalf("read after skew: %v", err)
 	}
@@ -387,7 +387,7 @@ func TestSkewedCollationBlocksWrites(t *testing.T) {
 		`DELETE FROM t WHERE x = 'a'`,
 		`CREATE INDEX t_x ON t (x)`,
 	} {
-		if _, err := db.Execute(sql, nil); err == nil || err.(*EngineError).Code() != "XX002" {
+		if _, err := queryOutcome(db, sql, nil); err == nil || err.(*EngineError).Code() != "XX002" {
 			t.Fatalf("%s: want XX002, got %v", sql, err)
 		}
 	}
@@ -405,7 +405,7 @@ func TestUpgradeCollationsClearsSkew(t *testing.T) {
 		`CREATE TABLE t (x text COLLATE "unicode" PRIMARY KEY)`,
 		`INSERT INTO t VALUES ('b'), ('a')`,
 	} {
-		if _, err := db.Execute(sql, nil); err != nil {
+		if _, err := queryOutcome(db, sql, nil); err != nil {
 			t.Fatalf("%s: unexpected error %v", sql, err)
 		}
 	}
@@ -431,7 +431,7 @@ func TestUpgradeCollationsClearsSkew(t *testing.T) {
 			}
 		}
 	}
-	if _, err := db.Execute(`INSERT INTO t VALUES ('c')`, nil); err != nil {
+	if _, err := queryOutcome(db, `INSERT INTO t VALUES ('c')`, nil); err != nil {
 		t.Fatalf("writable after upgrade: %v", err)
 	}
 	if n, err := db.UpgradeCollations(); err != nil || n != 0 {

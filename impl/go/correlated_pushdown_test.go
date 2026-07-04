@@ -37,7 +37,7 @@ func correlatedTables(t *testing.T, n int) *Session {
 
 func mustIds(t *testing.T, db dbHandle, sql string) []int64 {
 	t.Helper()
-	out, err := db.Execute(sql, nil)
+	out, err := queryOutcome(db, sql, nil)
 	if err != nil {
 		t.Fatalf("%s: unexpected error %v", sql, err)
 	}
@@ -101,7 +101,7 @@ func TestCorrelatedMissAndNullOuterSeekNothing(t *testing.T) {
 
 	// An outer k with no matching inner id is a point-lookup miss (visits the leaf, reads no row); a
 	// NULL outer k is a 3VL-empty bound (reads no page, no row). Neither re-scans the inner.
-	if _, err := db.Execute("INSERT INTO o VALUES (6, 999999), (7, NULL)", nil); err != nil {
+	if _, err := queryOutcome(db, "INSERT INTO o VALUES (6, 999999), (7, NULL)", nil); err != nil {
 		t.Fatal(err)
 	}
 	const q = "SELECT o.id FROM o WHERE EXISTS (SELECT 1 FROM inr WHERE inr.id = o.k)"

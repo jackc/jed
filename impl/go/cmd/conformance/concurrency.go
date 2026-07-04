@@ -117,10 +117,14 @@ type cSession struct {
 	isWrite bool
 }
 
-// execute runs sql against the session's handle, returning the outcome. A read session's writes are
-// rejected with 25006 by the session itself (without poisoning it).
-func (s *cSession) execute(sql string) (jed.Outcome, error) {
-	return s.h.Execute(sql, nil)
+// execute runs sql against the session's handle through the TOTAL query seam, returning the cursor. A
+// read session's writes are rejected with 25006 by the session itself (without poisoning it). Routing
+// through QueryValues (not a separate Execute) keeps the concurrency runner on the one production seam
+// — and is watermark-neutral: a read session is pinned READ ONLY (its snapshot never re-pins), and a
+// streaming cursor's transient reader-liveness pin is opened and released inside runRecord's drain,
+// before the next `expect` step observes the watermark.
+func (s *cSession) execute(sql string) (*jed.Rows, error) {
+	return s.h.QueryValues(sql, nil)
 }
 
 // --- parsing (shared by both modes) ----------------------------------------------------------
@@ -266,13 +270,17 @@ func parseSchedule(text string) ([]cStep, error) {
 	return steps, nil
 }
 
-// runRecord runs one `on <sid>` record against exec (a session's Execute), returning the first
-// mismatch as an error. exec is a function so the same logic drives both the sequential map and a
-// worker goroutine's handle.
-func runRecord(exec func(string) (jed.Outcome, error), sid string, rec cRecord) error {
+// runRecord runs one `on <sid>` record against exec (a session's QueryValues seam), returning the
+// first mismatch as an error. exec is a function so the same logic drives both the sequential map and a
+// worker goroutine's handle. The cursor is always fully drained + closed here (before this returns), so
+// any streaming reader-liveness pin is released before the schedule's next step observes the watermark.
+func runRecord(exec func(string) (*jed.Rows, error), sid string, rec cRecord) error {
 	switch rec.kind {
 	case "statement":
-		_, err := exec(rec.sql)
+		rows, err := exec(rec.sql)
+		if err == nil {
+			_, err = drainRecord(rows, 1, "nosort") // drain to surface any deferred error + release the cursor
+		}
 		switch rec.expect {
 		case "ok":
 			if err != nil {
@@ -289,7 +297,7 @@ func runRecord(exec func(string) (jed.Outcome, error), sid string, rec cRecord) 
 			return fmt.Errorf("[%s] unknown statement kind %q", sid, rec.expect)
 		}
 	case "query":
-		outcome, err := exec(rec.sql)
+		rows, err := exec(rec.sql)
 		if err != nil {
 			return fmt.Errorf("[%s] query failed with %s\n  SQL: %s", sid, err.Error(), rec.sql)
 		}
@@ -297,7 +305,10 @@ func runRecord(exec func(string) (jed.Outcome, error), sid string, rec cRecord) 
 		if cols == 0 {
 			cols = 1
 		}
-		actual := renderOutcome(outcome, cols, rec.sortmode)
+		actual, derr := drainRecord(rows, cols, rec.sortmode)
+		if derr != nil {
+			return fmt.Errorf("[%s] query failed with %s\n  SQL: %s", sid, derr.Error(), rec.sql)
+		}
 		expected := applySort(rec.expected, cols, rec.sortmode)
 		if !equalColtyped(actual, expected, rec.coltypes, cols) {
 			return fmt.Errorf("[%s] query result mismatch\n  SQL: %s\n  expected: %v\n  actual:   %v", sid, rec.sql, expected, actual)
@@ -306,6 +317,27 @@ func runRecord(exec func(string) (jed.Outcome, error), sid string, rec cRecord) 
 		return fmt.Errorf("[%s] unknown record kind %q", sid, rec.kind)
 	}
 	return nil
+}
+
+// drainRecord pulls a cursor to exhaustion and returns its rendered+sorted result cells (nil for a
+// no-column statement result), always closing the cursor — the concurrency runner's analogue of
+// main.go's drainQuery. Cost is not needed here (concurrency schedules assert on rows, not cost).
+func drainRecord(rows *jed.Rows, cols int, sortmode string) ([]string, error) {
+	defer rows.Close()
+	hasCols := len(rows.ColumnNames()) > 0
+	var flat []string
+	for rows.Next() {
+		for _, v := range rows.Row() {
+			flat = append(flat, v.Render())
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if !hasCols {
+		return nil, nil // a bare statement result (the total-query contract — no output columns)
+	}
+	return applySort(flat, cols, sortmode), nil
 }
 
 // endSession ends a session: commit/rollback a write session, close a read session.

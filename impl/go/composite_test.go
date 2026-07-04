@@ -13,7 +13,7 @@ import (
 // runComposite executes sql, failing the test on error.
 func runComposite(t *testing.T, db dbHandle, sql string) {
 	t.Helper()
-	if _, err := db.Execute(sql, nil); err != nil {
+	if _, err := queryOutcome(db, sql, nil); err != nil {
 		t.Fatalf("%s: %v", sql, err)
 	}
 }
@@ -21,7 +21,7 @@ func runComposite(t *testing.T, db dbHandle, sql string) {
 // errComposite executes sql expecting an error and returns its SQLSTATE code.
 func errComposite(t *testing.T, db dbHandle, sql string) string {
 	t.Helper()
-	_, err := db.Execute(sql, nil)
+	_, err := queryOutcome(db, sql, nil)
 	if err == nil {
 		t.Fatalf("%s: expected an error", sql)
 	}

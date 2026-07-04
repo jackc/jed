@@ -19,7 +19,7 @@ func seededText(t *testing.T, rows ...string) *Session {
 	t.Helper()
 	db := dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY, s text)")
 	for i, s := range rows {
-		if _, err := db.Execute("INSERT INTO t VALUES ("+itoaTest(i+1)+", '"+s+"')", nil); err != nil {
+		if _, err := queryOutcome(db, "INSERT INTO t VALUES ("+itoaTest(i+1)+", '"+s+"')", nil); err != nil {
 			t.Fatalf("seed %q: %v", s, err)
 		}
 	}

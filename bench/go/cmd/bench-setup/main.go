@@ -111,8 +111,13 @@ func setupJed(dataDir string, ds *bench.Dataset, fingerprint string, force bool)
 		return err
 	}
 	exec := func(sql string) error {
-		_, err := db.Execute(sql, nil)
-		return err
+		// Database.Execute is gone; run the DDL/write through the raw QueryValues seam and release the
+		// (row-less) cursor — a write materializes at the call.
+		rows, err := db.QueryValues(sql, nil)
+		if err != nil {
+			return err
+		}
+		return rows.Close()
 	}
 	for _, t := range ds.Table {
 		if !t.AppliesTo("jed") {

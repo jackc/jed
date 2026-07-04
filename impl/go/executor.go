@@ -26,21 +26,21 @@ func exprEqual(a, b exprNode) bool { return reflect.DeepEqual(a, b) }
 // SCAFFOLD (step-5 Phase A): dispatches a parsed statement; each arm is filled in
 // feature-by-feature (Phases B–E).
 
-// OutcomeKind distinguishes a bare statement result from a query result set.
-type OutcomeKind int
+// outcomeKind distinguishes a bare statement result from a query result set.
+type outcomeKind int
 
 const (
-	// OutcomeStatement is a statement producing no result set (CREATE, INSERT).
-	OutcomeStatement OutcomeKind = iota
-	// OutcomeQuery is a query result set.
-	OutcomeQuery
+	// outcomeStatement is a statement producing no result set (CREATE, INSERT).
+	outcomeStatement outcomeKind = iota
+	// outcomeQuery is a query result set.
+	outcomeQuery
 )
 
-// Outcome is the result of executing one statement. Cost is the deterministic execution
+// outcome is the result of executing one statement. Cost is the deterministic execution
 // cost accrued while running it (CLAUDE.md §13) — a DML statement accrues its scan +
 // filter cost even though it returns no rows.
-type Outcome struct {
-	Kind OutcomeKind
+type outcome struct {
+	Kind outcomeKind
 	// ColumnNames are the output column names of a query result (nil for a non-query
 	// statement); the column count is len(ColumnNames) (spec/design/grammar.md §8).
 	ColumnNames []string
@@ -1949,8 +1949,8 @@ func (db *engine) MaxSQLLength() int { return db.session.maxSQLLength }
 // (CLAUDE.md §13; spec/design/api.md §8, cost.md §7). The §13 input-size gate: an over-limit
 // statement is rejected with 54000 before lexing, so unbounded untrusted input cannot exhaust
 // parse memory/CPU (the cost meter cannot catch this — parsing precedes metering). maxSQLLength
-// == 0 is unlimited. Every handle-bound parse path routes through here (Execute/ExecuteParams/
-// Prepare/ExecuteSQL/the session handles), so the per-handle limit has no hole. The byte length is
+// == 0 is unlimited. Every handle-bound parse path routes through here (QueryValues/Exec/
+// Prepare/the session handles), so the per-handle limit has no hole. The byte length is
 // len(sql) (Go strings are UTF-8).
 func (db *engine) parse(sql string) (statement, error) {
 	if db.session.maxSQLLength > 0 && len(sql) > db.session.maxSQLLength {
@@ -2300,7 +2300,7 @@ func (db *engine) Collations() []collationInfo {
 }
 
 // ExecuteStmt executes one parsed statement with no bind parameters.
-func (db *engine) ExecuteStmt(stmt statement) (Outcome, error) {
+func (db *engine) ExecuteStmt(stmt statement) (outcome, error) {
 	return db.ExecuteStmtParams(stmt, nil)
 }
 
@@ -2324,7 +2324,7 @@ func (db *engine) ExecuteStmt(stmt statement) (Outcome, error) {
 //     (synchronous, the single persist chokepoint). Any failure — in the statement or in the
 //     durable write — restores the captured state (rollback-on-error, discarding partial work and
 //     any rowid allocations, §7). For an in-memory database persist is a no-op.
-func (db *engine) ExecuteStmtParams(stmt statement, params []Value) (Outcome, error) {
+func (db *engine) ExecuteStmtParams(stmt statement, params []Value) (outcome, error) {
 	switch {
 	case stmt.Begin != nil:
 		return db.beginTx(stmt.Begin.Writable, stmt.Begin.ModeSet)
@@ -2342,17 +2342,17 @@ func (db *engine) ExecuteStmtParams(stmt statement, params []Value) (Outcome, er
 	// Inside an explicit block?
 	if db.session.tx != nil {
 		if db.session.tx.failed {
-			return Outcome{}, newError(InFailedSqlTransaction,
+			return outcome{}, newError(InFailedSqlTransaction,
 				"current transaction is aborted, commands ignored until end of transaction block")
 		}
 		// Run the statement; ANY error aborts the block (it enters the failed state — §6).
-		var outcome Outcome
+		var out outcome
 		var err error
 		if stmtIsWrite(stmt) && !db.session.tx.writable {
 			err = newError(ReadOnlySqlTransaction,
 				"cannot execute "+stmtKind(stmt)+" in a read-only transaction")
 		} else {
-			outcome, err = db.dispatchStmt(stmt, params)
+			out, err = db.dispatchStmt(stmt, params)
 		}
 		// Enforce the temp-storage budget after a successful temp write (temp-tables.md §7): an
 		// over-budget statement (session-local tempBuffers) becomes a 54P03 error, which aborts the
@@ -2362,12 +2362,12 @@ func (db *engine) ExecuteStmtParams(stmt statement, params []Value) (Outcome, er
 		}
 		if err != nil {
 			db.session.tx.failed = true
-			return Outcome{}, err
+			return outcome{}, err
 		}
 		// Land any nextval advances into the block's working snapshot; COMMIT publishes them,
 		// ROLLBACK discards them with the rest of the working set (sequences.md §5).
 		db.flushPendingSequences()
-		return outcome, nil
+		return out, nil
 	}
 
 	// Autocommit (no open block): an autocommit write runs as an implicit single-statement
@@ -2381,11 +2381,11 @@ func (db *engine) ExecuteStmtParams(stmt statement, params []Value) (Outcome, er
 	// behavior — api.md §2.1), so an autocommit write fails exactly like a write inside a
 	// READ ONLY block.
 	if db.readOnly {
-		return Outcome{}, newError(ReadOnlySqlTransaction,
+		return outcome{}, newError(ReadOnlySqlTransaction,
 			"cannot execute "+stmtKind(stmt)+" in a read-only transaction")
 	}
 	db.session.tx = db.newTx(true)
-	outcome, err := db.dispatchStmt(stmt, params)
+	out, err := db.dispatchStmt(stmt, params)
 	// Enforce the temp-storage budget before committing (temp-tables.md §7): an over-budget temp write
 	// in this implicit transaction (session-local tempBuffers) is discarded (rolling back the temp +
 	// main changes) and surfaces 54P03.
@@ -2397,15 +2397,15 @@ func (db *engine) ExecuteStmtParams(stmt statement, params []Value) (Outcome, er
 		// captured copy anyway to keep the discard path uniform (sequences.md §6).
 		db.restoreSessionState(db.session.tx)
 		db.session.tx = nil
-		return Outcome{}, err
+		return outcome{}, err
 	}
 	// Persist any nextval advances into the working snapshot before publishing it (sequences.md
 	// §5); a non-sequence statement flushes nothing.
 	db.flushPendingSequences()
 	if _, cerr := db.commitTx(); cerr != nil {
-		return Outcome{}, cerr
+		return outcome{}, cerr
 	}
-	return outcome, nil
+	return out, nil
 }
 
 // beginTx opens an explicit transaction (spec/design/transactions.md §4.2). A nested BEGIN (a block
@@ -2416,19 +2416,19 @@ func (db *engine) ExecuteStmtParams(stmt statement, params []Value) (Outcome, er
 // snapshot — a writable tx mutates it in place; a read-only tx reads it unchanged (read-your-
 // snapshot, §4.3). Cheap: the persistent stores clone O(1) (pmap.go) and the catalog is shallow.
 // committed is untouched until commit.
-func (db *engine) beginTx(writable, modeSet bool) (Outcome, error) {
+func (db *engine) beginTx(writable, modeSet bool) (outcome, error) {
 	if db.session.tx != nil {
-		return Outcome{}, newError(ActiveSqlTransaction, "there is already a transaction in progress")
+		return outcome{}, newError(ActiveSqlTransaction, "there is already a transaction in progress")
 	}
 	if modeSet && writable && db.readOnly {
-		return Outcome{}, newError(ReadOnlySqlTransaction,
+		return outcome{}, newError(ReadOnlySqlTransaction,
 			"cannot set transaction read-write mode on a read-only database")
 	}
 	if !modeSet {
 		writable = !db.readOnly
 	}
 	db.session.tx = db.newTx(writable)
-	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+	return outcome{Kind: outcomeStatement, Cost: 0}, nil
 }
 
 // newTx opens a transaction over a clone of the committed snapshot, capturing the handle's
@@ -2462,10 +2462,10 @@ func (db *engine) restoreSessionState(tx *activeTx) {
 // publishes its working snapshot: bump its txid (file-backed only — an in-memory database stays at
 // txid 0), make it durable (the single persist chokepoint, §9), then swap it in as committed. A
 // durable-write failure leaves committed untouched and propagates. Returns to autocommit.
-func (db *engine) commitTx() (Outcome, error) {
+func (db *engine) commitTx() (outcome, error) {
 	tx := db.session.tx
 	if tx == nil {
-		return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+		return outcome{Kind: outcomeStatement, Cost: 0}, nil
 	}
 	db.session.tx = nil
 	if tx.failed || !tx.writable {
@@ -2473,7 +2473,7 @@ func (db *engine) commitTx() (Outcome, error) {
 		// in-block session updates revert with the discarded working set (§5/§6). The discarded
 		// tempWorking rolls back temp changes too (dropped with tx).
 		db.restoreSessionState(tx)
-		return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+		return outcome{Kind: outcomeStatement, Cost: 0}, nil
 	}
 	working := tx.working
 	// Persist the main image when it changed; a transaction that touched ONLY session-local temp tables
@@ -2486,7 +2486,7 @@ func (db *engine) commitTx() (Outcome, error) {
 			working.txid = db.committed.txid + 1
 		}
 		if err := db.persist(working); err != nil { // no-op for an in-memory database
-			return Outcome{}, err
+			return outcome{}, err
 		}
 		db.committed = working
 	}
@@ -2495,7 +2495,7 @@ func (db *engine) commitTx() (Outcome, error) {
 	// (temp-tables.md §6). Compaction is safe iff no streaming cursor holds an older temp tree.
 	if tx.tempDirty && db.tempStorage != nil {
 		if err := db.tempStorage.persistTemp(tx.tempWorking, db.openStreams == 0); err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 	}
 	db.session.tempCommitted = tx.tempWorking
@@ -2519,13 +2519,13 @@ func (db *engine) commitTx() (Outcome, error) {
 				continue // detached mid-transaction (unreachable under the writer gate) — nothing to persist
 			}
 			if err := att.storage.persistTemp(ws, canReclaim); err != nil {
-				return Outcome{}, err
+				return outcome{}, err
 			}
 			na[name] = ws
 		}
 		db.attachedCommitted = na
 	}
-	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+	return outcome{Kind: outcomeStatement, Cost: 0}, nil
 }
 
 // rollbackTx rolls back the current transaction (spec/design/transactions.md §4.2). With no open
@@ -2534,12 +2534,12 @@ func (db *engine) commitTx() (Outcome, error) {
 // committed was never mutated, so there is nothing to restore there. The handle's currval/lastval
 // session state, however, was updated in place by in-block nextval/setval, so it is restored from
 // the block's captured copy (sequences.md §5/§6).
-func (db *engine) rollbackTx() (Outcome, error) {
+func (db *engine) rollbackTx() (outcome, error) {
 	if db.session.tx != nil {
 		db.restoreSessionState(db.session.tx)
 	}
 	db.session.tx = nil
-	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+	return outcome{Kind: outcomeStatement, Cost: 0}, nil
 }
 
 // seqNextval implements nextval('name') (spec/design/sequences.md §4): advance the named sequence
@@ -3127,6 +3127,43 @@ func (db *engine) gateReadLanes(stmt statement) error {
 	return db.checkPrivileges(stmt)
 }
 
+// failOpenBlock puts an open, failable transaction block into the aborted state (tx.failed). A no-op
+// outside a block, and idempotent. This is the block-abort that a lazy read lane bypasses: the
+// materialized ExecuteStmtParams poisons in its block branch, but a SELECT served by a streaming /
+// deferred cursor never reaches it (transactions.md §6). PostgreSQL aborts a block on ANY statement
+// error, so a failing read has to poison here — otherwise the next statement wrongly succeeds instead
+// of 25P02. Only reads reach these paths (transaction control and writes go to dispatch, which
+// self-poisons with the right nuance — a nested BEGIN's 25001 must NOT abort).
+func (db *engine) failOpenBlock() {
+	if db.session.tx != nil {
+		db.session.tx.failed = true
+	}
+}
+
+// poisonOnLaneErr aborts an open block when a lazy read lane returns an error at open time (a missing
+// table, a denied read, a plan-time trap) — the counterpart to gateReadLanes: gateReadLanes enforces
+// the admission gates the lanes skip, poisonOnLaneErr the block-abort they skip. Wraps a lane error
+// return; the returned err is unchanged.
+func (db *engine) poisonOnLaneErr(err error) error {
+	if err != nil {
+		db.failOpenBlock()
+	}
+	return err
+}
+
+// attachBlockPoison hooks a lazy-lane cursor so a DRAIN-time read error inside an open block aborts it
+// too. A streaming (S3) / deferred (S7) cursor's error surfaces during the caller's Next(), after
+// queryStmt has returned, so the open-time poisonOnLaneErr can't see it — the cursor's onErr hook does
+// (executor's blocking buffered read already surfaces its error at open, poisoned above). A no-op when
+// no block is open; the hook re-checks the block at error time (a read may outlive the block it began
+// in — poisoning an already-ended block is harmless).
+func (db *engine) attachBlockPoison(rows *Rows) *Rows {
+	if db.session.tx != nil {
+		rows.attachErrHook(func(error) { db.failOpenBlock() })
+	}
+	return rows
+}
+
 // collectStmtPrivs collects the privilege requirements of stmt (spec/design/session.md §5.3).
 // Transaction control carries none (handled before dispatch); DDL just sets isDDL.
 func collectStmtPrivs(stmt statement, req *privReq) {
@@ -3573,14 +3610,14 @@ func stmtKind(stmt statement) string {
 
 // dispatchStmt routes one parsed statement to its executor. The autocommit transaction handling
 // (capture / durable commit / rollback-on-error) lives in ExecuteStmtParams.
-func (db *engine) dispatchStmt(stmt statement, params []Value) (Outcome, error) {
+func (db *engine) dispatchStmt(stmt statement, params []Value) (outcome, error) {
 	// Lifetime budget admission (spec/design/session.md §5.4): once the session's cumulative cost has
 	// reached lifetime_max_cost, every further statement is rejected 54P02 BEFORE it can accrue —
 	// checked ahead of privileges/existence, so an exhausted session runs nothing. A no-op when the
 	// budget is unlimited (the default). Transaction control (BEGIN/COMMIT/ROLLBACK) never reaches
 	// dispatch (handled earlier), so an exhausted session can still close out an open block.
 	if err := db.checkLifetimeAdmission(); err != nil {
-		return Outcome{}, err
+		return outcome{}, err
 	}
 	// Authorization (spec/design/session.md §5.3): enforce the session's privilege envelope before the
 	// statement runs — DDL gated by allowDDL, DML by per-table/per-function privileges, all 42501.
@@ -3588,7 +3625,7 @@ func (db *engine) dispatchStmt(stmt statement, params []Value) (Outcome, error) 
 	// physical access-mode gate (25006) is checked earlier in ExecuteStmtParams, so it wins when both
 	// apply.
 	if err := db.checkPrivileges(stmt); err != nil {
-		return Outcome{}, err
+		return outcome{}, err
 	}
 	out, err := db.dispatchStmtBody(stmt, params)
 	// Keep each GiST index's resident R-tree current: after a statement that mutated the main image,
@@ -3596,7 +3633,7 @@ func (db *engine) dispatchStmt(stmt statement, params []Value) (Outcome, error) 
 	// §3/§4.1). A no-op for reads / temp-only writes (mainDirty unset).
 	if err == nil {
 		if herr := db.rebuildMainGistTreesIfDirty(); herr != nil {
-			return Outcome{}, herr
+			return outcome{}, herr
 		}
 	}
 	return out, err
@@ -3614,51 +3651,51 @@ func (db *engine) rebuildMainGistTreesIfDirty() error {
 	return nil
 }
 
-func (db *engine) dispatchStmtBody(stmt statement, params []Value) (Outcome, error) {
+func (db *engine) dispatchStmtBody(stmt statement, params []Value) (outcome, error) {
 	switch {
 	case stmt.CreateTable != nil:
 		if err := rejectParamsForDDL(params); err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 		return db.executeCreateTable(stmt.CreateTable)
 	case stmt.DropTable != nil:
 		if err := rejectParamsForDDL(params); err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 		return db.executeDropTable(stmt.DropTable)
 	case stmt.CreateIndex != nil:
 		if err := rejectParamsForDDL(params); err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 		return db.executeCreateIndex(stmt.CreateIndex)
 	case stmt.DropIndex != nil:
 		if err := rejectParamsForDDL(params); err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 		return db.executeDropIndex(stmt.DropIndex)
 	case stmt.CreateType != nil:
 		if err := rejectParamsForDDL(params); err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 		return db.executeCreateType(stmt.CreateType)
 	case stmt.DropType != nil:
 		if err := rejectParamsForDDL(params); err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 		return db.executeDropType(stmt.DropType)
 	case stmt.CreateSequence != nil:
 		if err := rejectParamsForDDL(params); err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 		return db.executeCreateSequence(stmt.CreateSequence)
 	case stmt.AlterSequence != nil:
 		if err := rejectParamsForDDL(params); err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 		return db.executeAlterSequence(stmt.AlterSequence)
 	case stmt.DropSequence != nil:
 		if err := rejectParamsForDDL(params); err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 		return db.executeDropSequence(stmt.DropSequence)
 	case stmt.Insert != nil:
@@ -3676,7 +3713,7 @@ func (db *engine) dispatchStmtBody(stmt statement, params []Value) (Outcome, err
 	case stmt.Explain != nil:
 		return db.executeExplain(stmt.Explain, params)
 	default:
-		return Outcome{}, newError(SyntaxError, "empty statement")
+		return outcome{}, newError(SyntaxError, "empty statement")
 	}
 }
 
@@ -3697,7 +3734,7 @@ func rejectParamsForDDL(params []Value) error {
 // a second primary key traps 42P16 before its members resolve; members resolve
 // left to right (unknown 42703, repeated 42701); then the jed narrowings — the
 // declaration-order rule and the per-member key-type gate — trap 0A000.
-func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
+func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 	// A session-local temporary table (spec/design/temp-tables.md) is built exactly like a persistent
 	// one but registered into the session temp snapshot at the end (§2), so it makes zero file writes.
 	// FOREIGN KEY on a temp table is deferred this slice (§8) — rejected HERE, before any persistent
@@ -3714,31 +3751,31 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 		switch strings.ToLower(*ct.DB) {
 		case "main":
 			if ct.Temp {
-				return Outcome{}, newError(SyntaxError, `cannot create a TEMP table in database "main"`)
+				return outcome{}, newError(SyntaxError, `cannot create a TEMP table in database "main"`)
 			}
 		case "temp":
 			targetTemp = true
 		default:
 			if ct.Temp {
-				return Outcome{}, newError(SyntaxError, "cannot create a TEMP table in an attached database")
+				return outcome{}, newError(SyntaxError, "cannot create a TEMP table in an attached database")
 			}
 			attachName = strings.ToLower(*ct.DB)
 			if db.attachReadSnap(attachName) == nil {
-				return Outcome{}, newError(UndefinedTable, `database "`+*ct.DB+`" is not attached`)
+				return outcome{}, newError(UndefinedTable, `database "`+*ct.DB+`" is not attached`)
 			}
 			// A DDL write to a READ-ONLY attachment is 25006 before any work (attached-databases.md §4).
 			if err := db.checkAttachmentWritable(ct.DB); err != nil {
-				return Outcome{}, err
+				return outcome{}, err
 			}
 		}
 	}
 	if targetTemp && len(ct.Excludes) > 0 {
 		// An EXCLUDE constraint's backing GiST index would live on the temp snapshot — deferred with
 		// the rest of the GiST-on-temp narrowing (spec/design/gist.md §11), a clean 0A000.
-		return Outcome{}, newError(FeatureNotSupported, "an EXCLUDE constraint on a temporary table is not yet supported")
+		return outcome{}, newError(FeatureNotSupported, "an EXCLUDE constraint on a temporary table is not yet supported")
 	}
 	if targetTemp && len(ct.ForeignKeys) > 0 {
-		return Outcome{}, newError(FeatureNotSupported, "FOREIGN KEY on a temporary table is not yet supported")
+		return outcome{}, newError(FeatureNotSupported, "FOREIGN KEY on a temporary table is not yet supported")
 	}
 	// Deferred narrowings on an attached-database table this slice (attached-databases.md §8), each a
 	// clean 0A000 before any column work: FOREIGN KEY and EXCLUDE (their probe/backing structures would
@@ -3746,10 +3783,10 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 	// columns are checked just before registration, once the columns are built (as for temp).
 	if attachName != "" {
 		if len(ct.ForeignKeys) > 0 {
-			return Outcome{}, newError(FeatureNotSupported, "FOREIGN KEY on an attached-database table is not supported yet")
+			return outcome{}, newError(FeatureNotSupported, "FOREIGN KEY on an attached-database table is not supported yet")
 		}
 		if len(ct.Excludes) > 0 {
-			return Outcome{}, newError(FeatureNotSupported, "an EXCLUDE constraint on an attached-database table is not supported yet")
+			return outcome{}, newError(FeatureNotSupported, "an EXCLUDE constraint on an attached-database table is not supported yet")
 		}
 	}
 	// The relation namespace is shared between tables and indexes (indexes.md §2), so a CREATE TABLE
@@ -3760,13 +3797,13 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 	if attachName != "" {
 		as := db.attachReadSnap(attachName)
 		if _, ok := as.table(ct.Name); ok {
-			return Outcome{}, newError(DuplicateTable, "relation already exists: "+ct.Name)
+			return outcome{}, newError(DuplicateTable, "relation already exists: "+ct.Name)
 		}
 		if _, _, ok := as.findIndex(ct.Name); ok {
-			return Outcome{}, newError(DuplicateTable, "relation already exists: "+ct.Name)
+			return outcome{}, newError(DuplicateTable, "relation already exists: "+ct.Name)
 		}
 	} else if db.relationExists(ct.Name) {
-		return Outcome{}, newError(DuplicateTable, "relation already exists: "+ct.Name)
+		return outcome{}, newError(DuplicateTable, "relation already exists: "+ct.Name)
 	}
 
 	columns := make([]catColumn, 0, len(ct.Columns))
@@ -3782,7 +3819,7 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 	for _, def := range ct.Columns {
 		for _, c := range columns {
 			if strings.EqualFold(c.Name, def.Name) {
-				return Outcome{}, newError(DuplicateColumn, "duplicate column name: "+def.Name)
+				return outcome{}, newError(DuplicateColumn, "duplicate column name: "+def.Name)
 			}
 		}
 		// Resolve the column type: a built-in scalar, or a user-defined composite referenced by name
@@ -3805,7 +3842,7 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 		if isSerial {
 			// A serial column takes no typmod (serial(5) is 42601) and no [] (the array branch).
 			if def.TypeMod != nil {
-				return Outcome{}, newError(SyntaxError,
+				return outcome{}, newError(SyntaxError,
 					"type modifier is not allowed for type "+def.TypeName)
 			}
 			colType = scalarT(serialKind)
@@ -3814,7 +3851,7 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 			// previously-defined composite (array-of-composite, §12 AC1 — element_type_code 14 +
 			// name); a nested-array element and an array typmod (numeric(p,s)[]) stay deferred (0A000).
 			if def.TypeMod != nil {
-				return Outcome{}, newError(FeatureNotSupported,
+				return outcome{}, newError(FeatureNotSupported,
 					"a type modifier on an array type is not supported yet")
 			}
 			if elemScalar, scalarOK := scalarTypeFromName(base); scalarOK {
@@ -3822,7 +3859,7 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 			} else if ctype := db.readSnap().compositeType(base); ctype != nil {
 				colType = arrayT(compositeT(ctype.Name))
 			} else {
-				return Outcome{}, newError(UndefinedObject, "type does not exist: "+base)
+				return outcome{}, newError(UndefinedObject, "type does not exist: "+base)
 			}
 			isArray = true
 		} else if rdesc, ok := rangeByName(def.TypeName); ok {
@@ -3830,7 +3867,7 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 			// inline. A range takes no typmod (numrange(10,2) is not a thing — the element is the
 			// unconstrained subtype), so a type modifier is rejected.
 			if def.TypeMod != nil {
-				return Outcome{}, newError(FeatureNotSupported,
+				return outcome{}, newError(FeatureNotSupported,
 					"a type modifier on a range type is not supported")
 			}
 			colType = rangeT(scalarT(elementScalar(rdesc)))
@@ -3838,25 +3875,25 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 		} else if _, ok := scalarTypeFromName(def.TypeName); ok {
 			ty, d, vl, err := resolveTypeAndTypmod(def.TypeName, def.TypeMod)
 			if err != nil {
-				return Outcome{}, err
+				return outcome{}, err
 			}
 			// jsonpath is literal-only this slice (P1a) — a jsonpath COLUMN is 0A000, like a J0-stage
 			// json column (a storable jsonpath is a follow-on).
 			if ty == scalarJsonPath {
-				return Outcome{}, newError(FeatureNotSupported, "a jsonpath column is not supported yet")
+				return outcome{}, newError(FeatureNotSupported, "a jsonpath column is not supported yet")
 			}
 			colType = scalarT(ty)
 			decimal = d
 			varcharLen = vl
 		} else if ctype := db.readSnap().compositeType(def.TypeName); ctype != nil {
 			if def.TypeMod != nil {
-				return Outcome{}, newError(FeatureNotSupported,
+				return outcome{}, newError(FeatureNotSupported,
 					"a type modifier is not supported for composite type "+def.TypeName)
 			}
 			colType = compositeT(ctype.Name)
 			isComposite = true
 		} else {
-			return Outcome{}, newError(UndefinedObject, "type does not exist: "+def.TypeName)
+			return outcome{}, newError(UndefinedObject, "type does not exist: "+def.TypeName)
 		}
 		if def.PrimaryKey {
 			// The key-encodable scalars may be a PRIMARY KEY. The fixed-width ones — integers,
@@ -3874,19 +3911,19 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 				// A composite PRIMARY KEY (composite.md §6) or a non-keyable array PRIMARY KEY (a
 				// composite element) is rejected 0A000. colType.CanonicalName() gives the
 				// canonical type name (e.g. addr[], even when declared with an alias).
-				return Outcome{}, newError(FeatureNotSupported,
+				return outcome{}, newError(FeatureNotSupported,
 					"a "+colType.CanonicalName()+" primary key is not supported yet")
 			}
 			// A range / keyable array is a container key (encoding.md §2.11/§2.14); every other
 			// keyable column is a scalar, gated here.
 			if !isRange && !isArray {
 				if ty := colType.Scalar; !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() && !ty.IsInterval() && !ty.IsFloat() {
-					return Outcome{}, newError(FeatureNotSupported,
+					return outcome{}, newError(FeatureNotSupported,
 						"a "+ty.CanonicalName()+" primary key is not supported yet")
 				}
 			}
 			if pkSeen {
-				return Outcome{}, newError(InvalidTableDefinition,
+				return outcome{}, newError(InvalidTableDefinition,
 					"multiple primary keys for table "+ct.Name+" are not allowed")
 			}
 			pkSeen = true
@@ -3912,19 +3949,19 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 			// (sequences.md §13.1). serial's type is the pseudo-type (always integer), so this only
 			// bites an identity column written on a non-integer type.
 			if def.Identity != nil && !colType.IsInteger() {
-				return Outcome{}, newError(InvalidParameterValue,
+				return outcome{}, newError(InvalidParameterValue,
 					"identity column type must be smallint, integer, or bigint")
 			}
 			// Conflicts (42601, sequences.md §13.2). An explicit DEFAULT — or a serial type, itself a
 			// synthesized default — alongside IDENTITY is "both default and identity"; a serial column
 			// with its own explicit DEFAULT is "multiple default values" (the S3 message, unchanged).
 			if def.Identity != nil && (def.Default != nil || isSerial) {
-				return Outcome{}, newError(SyntaxError, fmt.Sprintf(
+				return outcome{}, newError(SyntaxError, fmt.Sprintf(
 					"both default and identity specified for column %s of table %s", def.Name, ct.Name,
 				))
 			}
 			if isSerial && def.Default != nil {
-				return Outcome{}, newError(SyntaxError, fmt.Sprintf(
+				return outcome{}, newError(SyntaxError, fmt.Sprintf(
 					"multiple default values specified for column %s of table %s", def.Name, ct.Name,
 				))
 			}
@@ -3942,7 +3979,7 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 			// conflicts with that — 42601 (PG: "conflicting or redundant options"). serial carries no
 			// parsed options, so this only fires for identity.
 			if opts.DataType != "" {
-				return Outcome{}, newError(SyntaxError, "conflicting or redundant options")
+				return outcome{}, newError(SyntaxError, "conflicting or redundant options")
 			}
 			seqScalar := serialKind
 			if !isSerial {
@@ -3951,13 +3988,13 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 			seqDtype, ok := seqDataTypeForScalar(seqScalar)
 			if !ok {
 				// Unreachable: a serial / identity column is i16/i32/i64 (gated above).
-				return Outcome{}, newError(InvalidParameterValue,
+				return outcome{}, newError(InvalidParameterValue,
 					"serial / identity column is i16/i32/i64")
 			}
 			opts.DataType = seqDtype.PgName()
 			seqDef, err := buildSequenceDef(seqName, opts, owner)
 			if err != nil {
-				return Outcome{}, err
+				return outcome{}, err
 			}
 			pendingSerials = append(pendingSerials, seqDef)
 			// Render the synthetic default exactly as the parser would the equivalent
@@ -3967,7 +4004,7 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 			exprText := "nextval ( '" + strings.ReplaceAll(seqName, "'", "''") + "' )"
 			expr, err := parseExpression(exprText)
 			if err != nil {
-				return Outcome{}, err
+				return outcome{}, err
 			}
 			defaultExpr = &defaultExprDef{ExprText: exprText, Expr: expr}
 			if def.Identity != nil {
@@ -3981,7 +4018,7 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 			// A DEFAULT on a composite-, array-, or range-typed column is not supported this slice
 			// (composite.md §12 / array.md §12 / ranges.md §8).
 			if def.Default != nil {
-				return Outcome{}, newError(FeatureNotSupported,
+				return outcome{}, newError(FeatureNotSupported,
 					"a DEFAULT on a composite-, array-, or range-typed column is not supported yet")
 			}
 		} else if def.Default != nil {
@@ -3989,19 +4026,19 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 			if def.Default.Expr.Kind == exprLiteral {
 				dv, err := storeValue(literalToValue(*def.Default.Expr.Literal), ty, decimal, varcharLen, false, def.Name)
 				if err != nil {
-					return Outcome{}, err
+					return outcome{}, err
 				}
 				defaultVal = &dv
 			} else {
 				if err := rejectDefaultStructure(def.Default.Expr); err != nil {
-					return Outcome{}, err
+					return outcome{}, err
 				}
 				_, rt, err := resolve(emptyScope(db), def.Default.Expr, &ty, &aggCtx{collecting: false}, &paramTypes{})
 				if err != nil {
-					return Outcome{}, err
+					return outcome{}, err
 				}
 				if !assignableTo(rt, ty) {
-					return Outcome{}, typeError(fmt.Sprintf(
+					return outcome{}, typeError(fmt.Sprintf(
 						"column %s is of type %s but default expression is of type %s",
 						def.Name, ty.CanonicalName(), rtName(rt),
 					))
@@ -4016,12 +4053,12 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 		collation := ""
 		if def.Collation != "" {
 			if !colType.IsText() {
-				return Outcome{}, typeError(fmt.Sprintf(
+				return outcome{}, typeError(fmt.Sprintf(
 					"collations are not supported by type %s", colType.CanonicalName(),
 				))
 			}
 			if _, err := resolveCollationName(db, def.Collation); err != nil {
-				return Outcome{}, err
+				return outcome{}, err
 			}
 			if def.Collation != "C" {
 				collation = def.Collation
@@ -4052,7 +4089,7 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 	// per-member key-type gate (0A000) remains.
 	for _, pkList := range ct.TablePKs {
 		if pkSeen {
-			return Outcome{}, newError(InvalidTableDefinition,
+			return outcome{}, newError(InvalidTableDefinition,
 				"multiple primary keys for table "+ct.Name+" are not allowed")
 		}
 		pkSeen = true
@@ -4066,11 +4103,11 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 				}
 			}
 			if idx < 0 {
-				return Outcome{}, newError(UndefinedColumn,
+				return outcome{}, newError(UndefinedColumn,
 					"column "+name+" named in key does not exist")
 			}
 			if slices.Contains(indices, idx) {
-				return Outcome{}, newError(DuplicateColumn,
+				return outcome{}, newError(DuplicateColumn,
 					"column "+name+" appears twice in primary key constraint")
 			}
 			indices = append(indices, idx)
@@ -4078,7 +4115,7 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 		for _, i := range indices {
 			ty := columns[i].Type
 			if !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() && !ty.IsInterval() && !ty.IsFloat() && !ty.IsRange() && !isArrayKeyable(ty) {
-				return Outcome{}, newError(FeatureNotSupported,
+				return outcome{}, newError(FeatureNotSupported,
 					"a "+ty.CanonicalName()+" primary key is not supported yet")
 			}
 			columns[i].PrimaryKey = true
@@ -4110,11 +4147,11 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 				}
 			}
 			if idx < 0 {
-				return Outcome{}, newError(UndefinedColumn,
+				return outcome{}, newError(UndefinedColumn,
 					"column "+cname+" named in key does not exist")
 			}
 			if slices.Contains(indices, idx) {
-				return Outcome{}, newError(DuplicateColumn,
+				return outcome{}, newError(DuplicateColumn,
 					"column "+cname+" appears twice in unique constraint")
 			}
 			indices = append(indices, idx)
@@ -4122,7 +4159,7 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 		for _, i := range indices {
 			ty := columns[i].Type
 			if !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() && !ty.IsInterval() && !ty.IsFloat() && !ty.IsRange() && !isArrayKeyable(ty) {
-				return Outcome{}, newError(FeatureNotSupported,
+				return outcome{}, newError(FeatureNotSupported,
 					"a "+ty.CanonicalName()+" unique constraint member is not supported yet")
 			}
 		}
@@ -4141,15 +4178,15 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 		// divergence from PG, which interleaves them with name/type resolution): subquery
 		// 0A000, aggregate 42803, bind parameter 42P02 (constraints.md §4.1).
 		if err := rejectCheckStructure(def.Expr); err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 		s := singleScope(db, table)
 		_, ty, err := resolve(s, def.Expr, nil, &aggCtx{collecting: false}, &paramTypes{})
 		if err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 		if ty.kind != rtBool && ty.kind != rtNull {
-			return Outcome{}, typeError("argument of CHECK must be boolean")
+			return outcome{}, typeError("argument of CHECK must be boolean")
 		}
 	}
 	// Naming (constraints.md §4.3): a single pass in textual order. An explicit name is
@@ -4172,7 +4209,7 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 		name := def.Name
 		if name != "" {
 			if nameTaken(name) {
-				return Outcome{}, newError(DuplicateObject,
+				return outcome{}, newError(DuplicateObject,
 					"constraint "+name+" for relation "+table.Name+" already exists")
 			}
 		} else {
@@ -4247,10 +4284,10 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 		name := ru.name
 		if name != "" {
 			if relationTaken(name) {
-				return Outcome{}, newError(DuplicateTable, "relation already exists: "+name)
+				return outcome{}, newError(DuplicateTable, "relation already exists: "+name)
 			}
 			if checkNameTaken(name) {
-				return Outcome{}, newError(DuplicateObject,
+				return outcome{}, newError(DuplicateObject,
 					"constraint "+name+" for relation "+table.Name+" already exists")
 			}
 		} else {
@@ -4299,11 +4336,11 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 				}
 			}
 			if idx < 0 {
-				return Outcome{}, newError(UndefinedColumn,
+				return outcome{}, newError(UndefinedColumn,
 					"column "+cname+" named in key does not exist")
 			}
 			if slices.Contains(local, idx) {
-				return Outcome{}, newError(DuplicateColumn,
+				return outcome{}, newError(DuplicateColumn,
 					"column "+cname+" appears twice in foreign key constraint")
 			}
 			local = append(local, idx)
@@ -4316,7 +4353,7 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 		} else {
 			p, ok := db.Table(fk.RefTable)
 			if !ok {
-				return Outcome{}, newError(UndefinedTable, "table does not exist: "+fk.RefTable)
+				return outcome{}, newError(UndefinedTable, "table does not exist: "+fk.RefTable)
 			}
 			parent = p
 		}
@@ -4327,7 +4364,7 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 				// Omitting the referenced list defaults to the parent's PRIMARY KEY; a parent
 				// without one is 42704 (PG's code here — undefined_object — even when the parent
 				// has a UNIQUE), distinct from the explicit-no-match 42830.
-				return Outcome{}, newError(UndefinedObject,
+				return outcome{}, newError(UndefinedObject,
 					"there is no primary key for referenced table "+parent.Name)
 			}
 			refs = append([]int(nil), parent.PK...)
@@ -4342,11 +4379,11 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 					}
 				}
 				if idx < 0 {
-					return Outcome{}, newError(UndefinedColumn,
+					return outcome{}, newError(UndefinedColumn,
 						"column "+cname+" named in key does not exist")
 				}
 				if slices.Contains(refs, idx) {
-					return Outcome{}, newError(DuplicateColumn,
+					return outcome{}, newError(DuplicateColumn,
 						"column "+cname+" appears twice in foreign key constraint")
 				}
 				refs = append(refs, idx)
@@ -4354,7 +4391,7 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 		}
 		// 4. Referencing/referenced count must agree.
 		if len(local) != len(refs) {
-			return Outcome{}, newError(InvalidForeignKey,
+			return outcome{}, newError(InvalidForeignKey,
 				"number of referencing and referenced columns for foreign key disagree")
 		}
 		// 5. Name — the per-table constraint namespace, shared with CHECK (§6.2/§6.7).
@@ -4376,7 +4413,7 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 				}
 			}
 			if collide {
-				return Outcome{}, newError(DuplicateObject,
+				return outcome{}, newError(DuplicateObject,
 					"constraint "+fk.Name+" for relation "+table.Name+" already exists")
 			}
 			name = fk.Name
@@ -4407,11 +4444,11 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 		// 6. Reject the unsupported write-actions (§6.6).
 		onDelete, err := newFkAction(fk.OnDelete, "DELETE")
 		if err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 		onUpdate, err := newFkAction(fk.OnUpdate, "UPDATE")
 		if err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 		// 7. The referenced columns must be the parent's PK or a UNIQUE set (§6.2).
 		refSet := sortedUnique(refs)
@@ -4425,7 +4462,7 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 			}
 		}
 		if !matchesUnique {
-			return Outcome{}, newError(InvalidForeignKey,
+			return outcome{}, newError(InvalidForeignKey,
 				"there is no unique constraint matching given keys for referenced table "+parent.Name)
 		}
 		// 8. Same-type pairing (§6.2). Because the referenced columns are a PK/UNIQUE key they
@@ -4435,7 +4472,7 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 			lt := table.Columns[local[i]].Type
 			rt := parent.Columns[refs[i]].Type
 			if !typesEqual(lt, rt) {
-				return Outcome{}, newError(DatatypeMismatch, fmt.Sprintf(
+				return outcome{}, newError(DatatypeMismatch, fmt.Sprintf(
 					"foreign key constraint %s cannot be implemented: key columns %s and %s are of incompatible types: %s and %s",
 					name,
 					table.Columns[local[i]].Name,
@@ -4468,7 +4505,7 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 	// that enforces it. The probe + 23P01 live in INSERT/UPDATE.
 	for _, exc := range ct.Excludes {
 		if exc.Using != "" && !strings.EqualFold(exc.Using, "gist") {
-			return Outcome{}, newError(UndefinedObject, "access method "+exc.Using+" does not support exclusion constraints")
+			return outcome{}, newError(UndefinedObject, "access method "+exc.Using+" does not support exclusion constraints")
 		}
 		indices := make([]int, 0, len(exc.Elements))
 		elements := make([]exclusionElement, 0, len(exc.Elements))
@@ -4481,10 +4518,10 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 				}
 			}
 			if ci < 0 {
-				return Outcome{}, newError(UndefinedColumn, "column "+el.Column+" named in key does not exist")
+				return outcome{}, newError(UndefinedColumn, "column "+el.Column+" named in key does not exist")
 			}
 			if slices.Contains(indices, ci) {
-				return Outcome{}, newError(DuplicateColumn, "column "+el.Column+" appears twice in exclusion constraint")
+				return outcome{}, newError(DuplicateColumn, "column "+el.Column+" appears twice in exclusion constraint")
 			}
 			ty := table.Columns[ci].Type
 			// The WITH operator must pair with the column's GiST opclass (gist.md §7): && over a
@@ -4493,7 +4530,7 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 			switch el.Op {
 			case "&&":
 				if !ty.IsRange() {
-					return Outcome{}, newError(UndefinedObject,
+					return outcome{}, newError(UndefinedObject,
 						"data type "+ty.CanonicalName()+" has no default operator class for access method gist that accepts operator &&")
 				}
 				op = exclOverlaps
@@ -4502,14 +4539,14 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 				case isGistScalarType(ty):
 					op = exclEqual
 				case isGistDeferredScalarType(ty):
-					return Outcome{}, newError(FeatureNotSupported,
+					return outcome{}, newError(FeatureNotSupported,
 						"an exclusion constraint with = over "+ty.CanonicalName()+" is not supported yet")
 				default:
-					return Outcome{}, newError(UndefinedObject,
+					return outcome{}, newError(UndefinedObject,
 						"data type "+ty.CanonicalName()+" has no default operator class for access method gist")
 				}
 			default:
-				return Outcome{}, newError(FeatureNotSupported, "exclusion constraint operator "+el.Op+" is not supported yet")
+				return outcome{}, newError(FeatureNotSupported, "exclusion constraint operator "+el.Op+" is not supported yet")
 			}
 			indices = append(indices, ci)
 			elements = append(elements, exclusionElement{Column: ci, Op: op})
@@ -4549,10 +4586,10 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 		var name string
 		if exc.Name != "" {
 			if relTaken(exc.Name) {
-				return Outcome{}, newError(DuplicateTable, "relation already exists: "+exc.Name)
+				return outcome{}, newError(DuplicateTable, "relation already exists: "+exc.Name)
 			}
 			if conTaken(exc.Name) {
-				return Outcome{}, newError(DuplicateObject, "constraint "+exc.Name+" for relation "+table.Name+" already exists")
+				return outcome{}, newError(DuplicateObject, "constraint "+exc.Name+" for relation "+table.Name+" already exists")
 			}
 			name = exc.Name
 		} else {
@@ -4593,14 +4630,14 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 		// secondary btree indexes are fully supported.
 		for _, c := range table.Columns {
 			if c.Type.IsComposite() {
-				return Outcome{}, newError(FeatureNotSupported, "a composite-typed column on an attached-database table is not supported yet")
+				return outcome{}, newError(FeatureNotSupported, "a composite-typed column on an attached-database table is not supported yet")
 			}
 			if c.Collation != "" {
-				return Outcome{}, newError(FeatureNotSupported, "COLLATE on an attached-database-table column "+c.Name+" is not yet supported")
+				return outcome{}, newError(FeatureNotSupported, "COLLATE on an attached-database-table column "+c.Name+" is not yet supported")
 			}
 		}
 		if len(pendingSerials) > 0 {
-			return Outcome{}, newError(FeatureNotSupported, "a serial / IDENTITY column on an attached-database table is not supported yet")
+			return outcome{}, newError(FeatureNotSupported, "a serial / IDENTITY column on an attached-database table is not supported yet")
 		}
 		// Register into the attachment's working snapshot (attached-databases.md §6) — never the main
 		// image; published into roots.attached at commit (N-root commit, §5). attachWriteSnap clones the
@@ -4617,7 +4654,7 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 		for _, ix := range table.Indexes {
 			ws.putIndexStore(strings.ToLower(ix.Name), newTableStore(pagePayload(db.pageSize), nil))
 		}
-		return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+		return outcome{Kind: outcomeStatement, Cost: 0}, nil
 	}
 
 	if targetTemp {
@@ -4628,7 +4665,7 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 		// COMPOSITE-typed columns (resolved against the MAIN type catalog just below) are fully supported.
 		for _, c := range table.Columns {
 			if c.Collation != "" {
-				return Outcome{}, newError(FeatureNotSupported, "COLLATE on temporary-table column "+c.Name+" is not yet supported")
+				return outcome{}, newError(FeatureNotSupported, "COLLATE on temporary-table column "+c.Name+" is not yet supported")
 			}
 		}
 		// Resolve each column's ColType against the MAIN snapshot's composite-type catalog
@@ -4661,7 +4698,7 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 		for _, s := range pendingSerials {
 			ts.putSequence(s)
 		}
-		return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+		return outcome{Kind: outcomeStatement, Cost: 0}, nil
 	}
 
 	db.putTable(table)
@@ -4676,7 +4713,7 @@ func (db *engine) executeCreateTable(ct *createTable) (Outcome, error) {
 		db.working().putSequence(s)
 	}
 	// DDL touches no rows and evaluates no expressions: zero cost.
-	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+	return outcome{Kind: outcomeStatement, Cost: 0}, nil
 }
 
 // resolveChecks resolves a table's CHECK constraints for a write statement: each stored
@@ -4785,7 +4822,7 @@ type dropTarget struct {
 // anything removed. A repeated name is deduplicated; a FK between two tables both in the drop set
 // never blocks; CASCADE drops the surviving tables' now-dangling FK constraints. Like CREATE TABLE
 // it touches no rows and evaluates no expression tree, so it accrues zero cost.
-func (db *engine) executeDropTable(dt *dropTable) (Outcome, error) {
+func (db *engine) executeDropTable(dt *dropTable) (outcome, error) {
 	// ---- Phase 1: resolve & classify every name into the drop set. Nothing is removed yet. A
 	// repeated name is deduplicated (PG collects the targets into a set, so `DROP TABLE a, a` drops
 	// `a` once and succeeds); seen is the set of lowercased keys actually being dropped.
@@ -4810,12 +4847,12 @@ func (db *engine) executeDropTable(dt *dropTable) (Outcome, error) {
 				// indexes.md §2); IF EXISTS does NOT suppress this. Otherwise a missing table is
 				// 42P01, unless IF EXISTS makes it a no-op for just this name.
 				if _, _, ok := db.findIndex(name); ok {
-					return Outcome{}, newError(WrongObjectType, name+" is not a table")
+					return outcome{}, newError(WrongObjectType, name+" is not a table")
 				}
 				if dt.IfExists {
 					continue
 				}
-				return Outcome{}, newError(UndefinedTable, "table does not exist: "+name)
+				return outcome{}, newError(UndefinedTable, "table does not exist: "+name)
 			}
 		}
 		seen[key] = true
@@ -4834,7 +4871,7 @@ func (db *engine) executeDropTable(dt *dropTable) (Outcome, error) {
 		// RESTRICT (the default, and the bare form's behavior): an external FK dependent blocks the
 		// drop with 2BP01 — the same message the single-table check produced.
 		d := deps[0]
-		return Outcome{}, newError(DependentObjectsStillExist,
+		return outcome{}, newError(DependentObjectsStillExist,
 			"cannot drop table "+d.droppedName+" because other objects depend on it: constraint "+
 				d.fkName+" on table "+d.refTableName)
 	}
@@ -4866,7 +4903,7 @@ func (db *engine) executeDropTable(dt *dropTable) (Outcome, error) {
 			w.removeTable(tgt.key)
 		}
 	}
-	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+	return outcome{Kind: outcomeStatement, Cost: 0}, nil
 }
 
 // chooseSerialSeqName chooses the auto-generated name for a serial column's OWNED sequence
@@ -5140,7 +5177,7 @@ func (db *engine) relationExists(name string) bool {
 // the lowercased <table>_<col>..._idx with the smallest free suffix. The index is then
 // built by scanning the table once: page_read per node + storage_row_read per row (the
 // metered build scan — cost.md §3); maintenance thereafter is unmetered.
-func (db *engine) executeCreateIndex(ci *createIndex) (Outcome, error) {
+func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 	// A standalone CREATE INDEX targets whichever scope owns the table — session-local temp,
 	// persistent, or a host-attached database (spec/design/temp-tables.md §8, attached-databases.md §3).
 	// The build below is scope-agnostic (the scoped lkpTable/lkpStore/writeIndexStore funnels route by
@@ -5150,10 +5187,10 @@ func (db *engine) executeCreateIndex(ci *createIndex) (Outcome, error) {
 	// A DDL write to a READ-ONLY host attachment is 25006 before any work — checked BEFORE the qualifier
 	// existence gate so a read-only attachment refuses the write deterministically (attached-databases.md §4).
 	if err := db.checkAttachmentWritable(ci.DB); err != nil {
-		return Outcome{}, err
+		return outcome{}, err
 	}
 	if err := db.checkTableQualifier(ci.DB, ci.Table); err != nil { // attached-databases.md §3
-		return Outcome{}, err
+		return outcome{}, err
 	}
 	attachName := ""
 	if isAttachmentScope(ci.DB) {
@@ -5161,14 +5198,14 @@ func (db *engine) executeCreateIndex(ci *createIndex) (Outcome, error) {
 	}
 	table, ok := db.lkpTableScoped(ci.DB, ci.Table)
 	if !ok {
-		return Outcome{}, newError(UndefinedTable, "table does not exist: "+ci.Table)
+		return outcome{}, newError(UndefinedTable, "table does not exist: "+ci.Table)
 	}
 	tableKey := strings.ToLower(table.Name)
 	columns := table.Columns
 	// Refuse building a collated index on a version-skewed table (slice 2d, collation.md §12, XX002):
 	// the new B-tree would be pinned inconsistently with the file's other structures.
 	if err := db.ensureCollationsWritable(columns); err != nil {
-		return Outcome{}, err
+		return outcome{}, err
 	}
 	// Per-column frozen collations for the collated text key form (§2.12); nil everywhere for a
 	// C-only / non-text table (the fast path).
@@ -5185,19 +5222,19 @@ func (db *engine) executeCreateIndex(ci *createIndex) (Outcome, error) {
 	case "gist":
 		kind = indexGist
 	default:
-		return Outcome{}, newError(UndefinedObject, "access method does not exist: "+ci.Using)
+		return outcome{}, newError(UndefinedObject, "access method does not exist: "+ci.Using)
 	}
 	cols := make([]int, 0, len(ci.Columns))
 	for _, name := range ci.Columns {
 		idx := table.ColumnIndex(name)
 		if idx < 0 {
-			return Outcome{}, newError(UndefinedColumn, "column does not exist: "+name)
+			return outcome{}, newError(UndefinedColumn, "column does not exist: "+name)
 		}
 		ty := columns[idx].Type
 		switch kind {
 		case indexBtree:
 			if !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() && !ty.IsInterval() && !ty.IsFloat() && !ty.IsRange() && !isArrayKeyable(ty) {
-				return Outcome{}, newError(FeatureNotSupported,
+				return outcome{}, newError(FeatureNotSupported,
 					"a "+ty.CanonicalName()+" index column is not supported yet")
 			}
 		case indexGin:
@@ -5207,11 +5244,11 @@ func (db *engine) executeCreateIndex(ci *createIndex) (Outcome, error) {
 			// uuid, date, timestamp, timestamptz (interval's GIN-element support is a separate
 			// follow-on — its key landed but the GIN slice has not; gin.md §3/§10).
 			if ty.Array == nil {
-				return Outcome{}, newError(UndefinedObject,
+				return outcome{}, newError(UndefinedObject,
 					"data type "+ty.CanonicalName()+" has no default operator class for access method gin")
 			}
 			if elem, ok := ty.Array.AsScalar(); !ok || !isGinElementType(elem) {
-				return Outcome{}, newError(FeatureNotSupported,
+				return outcome{}, newError(FeatureNotSupported,
 					"a gin index on "+ty.CanonicalName()+" is not supported yet")
 			}
 		case indexGist:
@@ -5227,10 +5264,10 @@ func (db *engine) executeCreateIndex(ci *createIndex) (Outcome, error) {
 				case isGistScalarType(ty):
 					// supported scalar `=` opclass — ok
 				case isGistDeferredScalarType(ty):
-					return Outcome{}, newError(FeatureNotSupported,
+					return outcome{}, newError(FeatureNotSupported,
 						"a gist index on "+ty.CanonicalName()+" is not supported yet")
 				default:
-					return Outcome{}, newError(UndefinedObject,
+					return outcome{}, newError(UndefinedObject,
 						"data type "+ty.CanonicalName()+" has no default operator class for access method gist")
 				}
 			}
@@ -5242,10 +5279,10 @@ func (db *engine) executeCreateIndex(ci *createIndex) (Outcome, error) {
 	// index) and a single column only — both deferred 0A000.
 	if kind == indexGin {
 		if ci.Unique {
-			return Outcome{}, newError(FeatureNotSupported, "access method gin does not support unique indexes")
+			return outcome{}, newError(FeatureNotSupported, "access method gin does not support unique indexes")
 		}
 		if len(cols) != 1 {
-			return Outcome{}, newError(FeatureNotSupported, "a multi-column gin index is not supported yet")
+			return outcome{}, newError(FeatureNotSupported, "a multi-column gin index is not supported yet")
 		}
 	}
 	// GiST narrowings (gist.md §1/§5/§11): no uniqueness (express it as EXCLUDE … WITH =, GX3) and a
@@ -5254,19 +5291,19 @@ func (db *engine) executeCreateIndex(ci *createIndex) (Outcome, error) {
 	// landed in GX1b, so a file-backed GiST index is supported.
 	if kind == indexGist {
 		if ci.Unique {
-			return Outcome{}, newError(FeatureNotSupported, "access method gist does not support unique indexes")
+			return outcome{}, newError(FeatureNotSupported, "access method gist does not support unique indexes")
 		}
 		if len(cols) != 1 {
-			return Outcome{}, newError(FeatureNotSupported, "a multi-column gist index is not supported yet")
+			return outcome{}, newError(FeatureNotSupported, "a multi-column gist index is not supported yet")
 		}
 		if db.isTempTable(ci.Table) {
-			return Outcome{}, newError(FeatureNotSupported, "a gist index on a temporary table is not supported yet")
+			return outcome{}, newError(FeatureNotSupported, "a gist index on a temporary table is not supported yet")
 		}
 	}
 	// A non-btree (GIN / GiST) index on an attached-database table is a deferred narrowing this slice
 	// (attached-databases.md §8) — the attachment stores only btree PK / UNIQUE / secondary indexes.
 	if attachName != "" && kind != indexBtree {
-		return Outcome{}, newError(FeatureNotSupported, "a "+ci.Using+" index on an attached-database table is not supported yet")
+		return outcome{}, newError(FeatureNotSupported, "a "+ci.Using+" index on an attached-database table is not supported yet")
 	}
 	// relationExistsScoped checks the namespace of the target scope: an attachment's OWN snapshot for an
 	// attached table (each attached database is an independent namespace, §3), else the temp-aware
@@ -5285,7 +5322,7 @@ func (db *engine) executeCreateIndex(ci *createIndex) (Outcome, error) {
 	name := ci.Name
 	if name != "" {
 		if relationTaken(name) {
-			return Outcome{}, newError(DuplicateTable, "relation already exists: "+name)
+			return outcome{}, newError(DuplicateTable, "relation already exists: "+name)
 		}
 	} else {
 		// PG's ChooseIndexName (probed): lowercased table + every listed column name
@@ -5314,7 +5351,7 @@ func (db *engine) executeCreateIndex(ci *createIndex) (Outcome, error) {
 	store := db.lkpStoreScoped(ci.DB, ci.Table)
 	stored, nodes, slabs, err := store.ScanWithUnits(mask)
 	if err != nil {
-		return Outcome{}, err
+		return outcome{}, err
 	}
 	meter.Charge(costs.PageRead*int64(nodes) + costs.ValueDecompress*int64(slabs))
 	entries := make([][]byte, 0, len(stored))
@@ -5324,23 +5361,23 @@ func (db *engine) executeCreateIndex(ci *createIndex) (Outcome, error) {
 	seenPrefixes := make(map[string]bool)
 	for _, e := range stored {
 		if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned row
-			return Outcome{}, err
+			return outcome{}, err
 		}
 		meter.Charge(costs.StorageRowRead)
 		// The build reads the indexed key columns directly; resolve a faulted row's inline-deferred
 		// values (lazy-record.md §5b — always inline for a key column, so cost-free) before encoding.
 		row, err := store.resolveInlineColumns(e.Row)
 		if err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 		if def.Unique {
 			prefix, ok, err := indexPrefixKey(columns, colls, def, row)
 			if err != nil {
-				return Outcome{}, err
+				return outcome{}, err
 			}
 			if ok {
 				if seenPrefixes[string(prefix)] {
-					return Outcome{}, newError(UniqueViolation,
+					return outcome{}, newError(UniqueViolation,
 						"duplicate key value violates unique constraint: "+def.Name)
 				}
 				seenPrefixes[string(prefix)] = true
@@ -5348,12 +5385,12 @@ func (db *engine) executeCreateIndex(ci *createIndex) (Outcome, error) {
 		}
 		eks, err := indexEntryKeys(columns, colls, def, e.Key, row)
 		if err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 		entries = append(entries, eks...)
 	}
 	if err := meter.Guard(); err != nil {
-		return Outcome{}, err
+		return outcome{}, err
 	}
 
 	nameKey := strings.ToLower(def.Name)
@@ -5384,23 +5421,23 @@ func (db *engine) executeCreateIndex(ci *createIndex) (Outcome, error) {
 	for _, ek := range entries {
 		inserted, err := istore.Insert(ek, nil)
 		if err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 		if !inserted {
 			panic("index entry keys are unique (storage-key suffix)")
 		}
 	}
-	return Outcome{Kind: OutcomeStatement, Cost: meter.Accrued}, nil
+	return outcome{Kind: outcomeStatement, Cost: meter.Accrued}, nil
 }
 
 // executeDropIndex runs a DROP INDEX (spec/design/indexes.md §2): a table's name is
 // 42809, a missing one 42704. A pure catalog edit — zero cost, like DROP TABLE. The index is
 // resolved along the resolution walk (session-local → persistent — temp-tables.md §8) and removed
 // from the snapshot that owns it, so dropping a temp table's index makes zero file writes.
-func (db *engine) executeDropIndex(di *dropIndex) (Outcome, error) {
+func (db *engine) executeDropIndex(di *dropIndex) (outcome, error) {
 	// lkpTable covers both scopes, so DROP INDEX naming a table is 42809 regardless of kind.
 	if _, ok := db.lkpTable(di.Name); ok {
-		return Outcome{}, newError(WrongObjectType, di.Name+" is not an index")
+		return outcome{}, newError(WrongObjectType, di.Name+" is not an index")
 	}
 	nameKey := strings.ToLower(di.Name)
 	switch {
@@ -5411,7 +5448,7 @@ func (db *engine) executeDropIndex(di *dropIndex) (Outcome, error) {
 	default:
 		tableKey, _, ok := db.findIndex(di.Name)
 		if !ok {
-			return Outcome{}, newError(UndefinedObject, "index does not exist: "+di.Name)
+			return outcome{}, newError(UndefinedObject, "index does not exist: "+di.Name)
 		}
 		// An index that backs an EXCLUDE constraint cannot be dropped directly — the constraint owns
 		// it (the UNIQUE-backing precedent; jed has no ALTER TABLE … DROP CONSTRAINT yet). 2BP01,
@@ -5419,29 +5456,29 @@ func (db *engine) executeDropIndex(di *dropIndex) (Outcome, error) {
 		if t, tok := db.lkpTable(tableKey); tok {
 			for _, e := range t.Exclusions {
 				if strings.EqualFold(e.Index, di.Name) {
-					return Outcome{}, newError(DependentObjectsStillExist,
+					return outcome{}, newError(DependentObjectsStillExist,
 						"cannot drop index "+di.Name+" because constraint "+di.Name+" on table "+t.Name+" requires it")
 				}
 			}
 		}
 		db.working().removeIndex(tableKey, nameKey)
 	}
-	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+	return outcome{Kind: outcomeStatement, Cost: 0}, nil
 }
 
 // executeCreateType analyzes and runs a CREATE TYPE (spec/design/composite.md): reject a duplicate
 // type name (42710), resolve each field's type (a built-in scalar, or a previously-defined
 // composite — 42704 if unknown; no self- or forward-reference), reject a duplicate field name
 // (42701), then register the composite type in the catalog. Named composites only.
-func (db *engine) executeCreateType(ct *createType) (Outcome, error) {
+func (db *engine) executeCreateType(ct *createType) (outcome, error) {
 	if db.readSnap().compositeType(ct.Name) != nil {
-		return Outcome{}, newError(DuplicateObject, "type "+ct.Name+" already exists")
+		return outcome{}, newError(DuplicateObject, "type "+ct.Name+" already exists")
 	}
 	fields := make([]compositeField, 0, len(ct.Fields))
 	for _, f := range ct.Fields {
 		for _, g := range fields {
 			if strings.EqualFold(g.Name, f.Name) {
-				return Outcome{}, newError(DuplicateColumn, "attribute "+f.Name+" specified more than once")
+				return outcome{}, newError(DuplicateColumn, "attribute "+f.Name+" specified more than once")
 			}
 		}
 		var fty dataType
@@ -5453,7 +5490,7 @@ func (db *engine) executeCreateType(ct *createType) (Outcome, error) {
 			// 14 + name on disk); a nested-array element and an array typmod stay deferred (0A000),
 			// exactly as for an array column.
 			if f.TypeMod != nil {
-				return Outcome{}, newError(FeatureNotSupported,
+				return outcome{}, newError(FeatureNotSupported,
 					"a type modifier on an array type is not supported yet")
 			}
 			if elemScalar, scalarOK := scalarTypeFromName(base); scalarOK {
@@ -5461,28 +5498,28 @@ func (db *engine) executeCreateType(ct *createType) (Outcome, error) {
 			} else if ctype := db.readSnap().compositeType(base); ctype != nil {
 				fty = arrayT(compositeT(ctype.Name))
 			} else {
-				return Outcome{}, newError(UndefinedObject, "type does not exist: "+base)
+				return outcome{}, newError(UndefinedObject, "type does not exist: "+base)
 			}
 		} else if _, ok := scalarTypeFromName(f.TypeName); ok {
 			s, d, vl, err := resolveTypeAndTypmod(f.TypeName, f.TypeMod)
 			if err != nil {
-				return Outcome{}, err
+				return outcome{}, err
 			}
 			fty, fdecimal, fvarchar = scalarT(s), d, vl
 		} else if _, ok := rangeByName(f.TypeName); ok {
 			// A range-typed composite field (a range inside CREATE TYPE) is deferred this slice (only
 			// range *columns* are storable — spec/design/ranges.md §3); the type name IS known, so this
 			// is 0A000, not the 42704 below.
-			return Outcome{}, newError(FeatureNotSupported,
+			return outcome{}, newError(FeatureNotSupported,
 				"a range-typed composite field ("+f.TypeName+") is not supported yet")
 		} else if db.readSnap().compositeType(f.TypeName) != nil {
 			if f.TypeMod != nil {
-				return Outcome{}, newError(FeatureNotSupported,
+				return outcome{}, newError(FeatureNotSupported,
 					"a type modifier is not supported for composite type "+f.TypeName)
 			}
 			fty = compositeT(f.TypeName)
 		} else {
-			return Outcome{}, newError(UndefinedObject, "type does not exist: "+f.TypeName)
+			return outcome{}, newError(UndefinedObject, "type does not exist: "+f.TypeName)
 		}
 		fields = append(fields, compositeField{Name: f.Name, Type: fty, Decimal: fdecimal, VarcharLen: fvarchar, NotNull: f.NotNull})
 	}
@@ -5501,53 +5538,53 @@ func (db *engine) executeCreateType(ct *createType) (Outcome, error) {
 		}
 	}
 	if depth := 1 + maxField; depth > maxCompositeDepth {
-		return Outcome{}, newError(StatementTooComplex,
+		return outcome{}, newError(StatementTooComplex,
 			fmt.Sprintf("composite type %s nesting depth %d exceeds the maximum of %d", ct.Name, depth, maxCompositeDepth))
 	}
 	db.working().putType(&compositeType{Name: ct.Name, Fields: fields})
-	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+	return outcome{Kind: outcomeStatement, Cost: 0}, nil
 }
 
 // executeDropType analyzes and runs a DROP TYPE (spec/design/composite.md §7). RESTRICT (the only
 // behavior this slice): a missing type is 42704 unless IF EXISTS; if any table column or composite
 // field still references the type, 2BP01; otherwise remove it from the catalog.
-func (db *engine) executeDropType(dt *dropType) (Outcome, error) {
+func (db *engine) executeDropType(dt *dropType) (outcome, error) {
 	if db.readSnap().compositeType(dt.Name) == nil {
 		if dt.IfExists {
-			return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+			return outcome{Kind: outcomeStatement, Cost: 0}, nil
 		}
-		return Outcome{}, newError(UndefinedObject, "type does not exist: "+dt.Name)
+		return outcome{}, newError(UndefinedObject, "type does not exist: "+dt.Name)
 	}
 	if dep, ok := db.compositeDependentAny(dt.Name); ok {
-		return Outcome{}, newError(DependentObjectsStillExist,
+		return outcome{}, newError(DependentObjectsStillExist,
 			"cannot drop type "+dt.Name+" because other objects depend on it: "+dep)
 	}
 	db.working().removeType(strings.ToLower(dt.Name))
-	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+	return outcome{Kind: outcomeStatement, Cost: 0}, nil
 }
 
 // executeCreateSequence analyzes and runs a CREATE SEQUENCE (spec/design/sequences.md). Resolve
 // the option overrides against the INCREMENT sign's type defaults, validate the set (22023),
 // reject a relation-namespace collision (42P07 unless IF NOT EXISTS), and register the sequence.
-func (db *engine) executeCreateSequence(cs *createSequence) (Outcome, error) {
+func (db *engine) executeCreateSequence(cs *createSequence) (outcome, error) {
 	if db.relationExists(cs.Name) {
 		if cs.IfNotExists {
-			return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+			return outcome{Kind: outcomeStatement, Cost: 0}, nil
 		}
-		return Outcome{}, newError(DuplicateTable, "relation already exists: "+cs.Name)
+		return outcome{}, newError(DuplicateTable, "relation already exists: "+cs.Name)
 	}
 	def, err := buildSequenceDef(cs.Name, cs.Options, nil)
 	if err != nil {
-		return Outcome{}, err
+		return outcome{}, err
 	}
 	db.working().putSequence(def)
-	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+	return outcome{Kind: outcomeStatement, Cost: 0}, nil
 }
 
 // executeDropSequence analyzes and runs a DROP SEQUENCE (spec/design/sequences.md §1).
 // RESTRICT-only: a missing sequence is 42P01 unless IF EXISTS. No dependency tracking this slice
 // (a plain DEFAULT nextval('s') creates none — PG). Multiple names are dropped left to right.
-func (db *engine) executeDropSequence(ds *dropSequence) (Outcome, error) {
+func (db *engine) executeDropSequence(ds *dropSequence) (outcome, error) {
 	for _, name := range ds.Names {
 		// Missing → 42P01 (unless IF EXISTS). An OWNED (serial) sequence has a dependent — its
 		// column's default — so RESTRICT (the only mode this slice; CASCADE 0A000) is 2BP01
@@ -5557,7 +5594,7 @@ func (db *engine) executeDropSequence(ds *dropSequence) (Outcome, error) {
 			if ds.IfExists {
 				continue
 			}
-			return Outcome{}, newError(UndefinedTable, "sequence does not exist: "+name)
+			return outcome{}, newError(UndefinedTable, "sequence does not exist: "+name)
 		}
 		if seq.OwnedBy != nil {
 			// The owning table is always present (its own DROP TABLE would auto-drop this sequence
@@ -5570,7 +5607,7 @@ func (db *engine) executeDropSequence(ds *dropSequence) (Outcome, error) {
 					colName = t.Columns[seq.OwnedBy.Column].Name
 				}
 			}
-			return Outcome{}, newError(DependentObjectsStillExist, fmt.Sprintf(
+			return outcome{}, newError(DependentObjectsStillExist, fmt.Sprintf(
 				"cannot drop sequence %s because other objects depend on it: default value for column %s of table %s depends on sequence %s",
 				seq.Name, colName, tableName, seq.Name,
 			))
@@ -5579,7 +5616,7 @@ func (db *engine) executeDropSequence(ds *dropSequence) (Outcome, error) {
 		// routed path is reached only for a plain persistent sequence — temp-tables.md §8).
 		db.removeSequenceRouted(name)
 	}
-	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+	return outcome{Kind: outcomeStatement, Cost: 0}, nil
 }
 
 // executeAlterSequence analyzes and runs an ALTER SEQUENCE [IF EXISTS] s <action>
@@ -5587,32 +5624,32 @@ func (db *engine) executeDropSequence(ds *dropSequence) (Outcome, error) {
 // The option form re-edits the definition (PG init_params, isInit=false — only written options
 // change, the counter preserved unless RESTART); RENAME TO moves the catalog key. Touches no session
 // state (currval/lastval unchanged). A catalog write (the write path, transactional, §5).
-func (db *engine) executeAlterSequence(as *alterSequence) (Outcome, error) {
+func (db *engine) executeAlterSequence(as *alterSequence) (outcome, error) {
 	snapDef := db.sequence(as.Name)
 	if snapDef == nil {
 		if as.IfExists {
-			return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+			return outcome{Kind: outcomeStatement, Cost: 0}, nil
 		}
-		return Outcome{}, newError(UndefinedTable, "relation does not exist: "+as.Name)
+		return outcome{}, newError(UndefinedTable, "relation does not exist: "+as.Name)
 	}
 	existing := *snapDef
 	if as.RenameTo != "" {
 		if err := db.alterSequenceRename(&existing, as.RenameTo); err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 	} else {
 		// AS type on ALTER is 0A000 — the value type is not persisted (sequences.md §14.4), so the
 		// original type for re-deriving a default bound is gone.
 		if as.Options.DataType != "" {
-			return Outcome{}, newError(FeatureNotSupported, "ALTER SEQUENCE ... AS type is not supported")
+			return outcome{}, newError(FeatureNotSupported, "ALTER SEQUENCE ... AS type is not supported")
 		}
 		newDef, err := applySeqAlter(&existing, as.Options, as.Restart)
 		if err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 		db.putSequenceRouted(newDef)
 	}
-	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+	return outcome{Kind: outcomeStatement, Cost: 0}, nil
 }
 
 // alterSequenceRename implements ALTER SEQUENCE s RENAME TO s2 (spec/design/sequences.md §15.3): a
@@ -6320,28 +6357,28 @@ func (db *engine) rowConflictsCommitted(store *tableStore, table *catTable, pk [
 	return false, nil
 }
 
-func (db *engine) executeInsert(ins *insert, params []Value, ctx cteCtx) (Outcome, error) {
+func (db *engine) executeInsert(ins *insert, params []Value, ctx cteCtx) (outcome, error) {
 	// A write to a READ-ONLY host attachment is 25006 before any I/O — checked BEFORE the qualifier
 	// existence gate so a read-only attachment refuses the write deterministically (attached-databases.md §4).
 	if err := db.checkAttachmentWritable(ins.DB); err != nil {
-		return Outcome{}, err
+		return outcome{}, err
 	}
 	if err := db.checkTableQualifier(ins.DB, ins.Table); err != nil { // attached-databases.md §3
-		return Outcome{}, err
+		return outcome{}, err
 	}
 	// ON CONFLICT into a host attachment is a deferred narrowing this slice (attached-databases.md §8):
 	// the conflict path resolves index stores unscoped. A clean 0A000 before any planning.
 	if ins.OnConflict != nil && isAttachmentScope(ins.DB) {
-		return Outcome{}, newError(FeatureNotSupported, "ON CONFLICT on an attached-database table is not supported yet")
+		return outcome{}, newError(FeatureNotSupported, "ON CONFLICT on an attached-database table is not supported yet")
 	}
 	table, ok := db.lkpTableScoped(ins.DB, ins.Table) // scope-aware temp-first (temp-tables.md §3)
 	if !ok {
-		return Outcome{}, newError(UndefinedTable, "table does not exist: "+ins.Table)
+		return outcome{}, newError(UndefinedTable, "table does not exist: "+ins.Table)
 	}
 	// Refuse the write if any of this table's collated keys are version-skewed (slice 2d): a
 	// maintained B-tree would mix two orderings (collation.md §12, XX002).
 	if err := db.ensureCollationsWritable(table.Columns); err != nil {
-		return Outcome{}, err
+		return outcome{}, err
 	}
 	store := db.writeStoreScoped(ins.DB, ins.Table) // routes a temp / attachment INSERT to its working snapshot
 	// The key members in key order — one for a single-column PK, several for a composite
@@ -6351,13 +6388,13 @@ func (db *engine) executeInsert(ins *insert, params []Value, ctx cteCtx) (Outcom
 	// insertRows evaluates them per candidate row (constraints.md §4.4).
 	checks, err := db.resolveChecks(table)
 	if err != nil {
-		return Outcome{}, err
+		return outcome{}, err
 	}
 	// Each column's EXPRESSION default, resolved once per statement (constraints.md §2);
 	// applied per omitted column / DEFAULT slot, sharing one per-statement StmtRng.
 	defaultExprs, err := db.resolveDefaultExprs(table)
 	if err != nil {
-		return Outcome{}, err
+		return outcome{}, err
 	}
 	stmtRng := newStmtRng()
 
@@ -6375,12 +6412,12 @@ func (db *engine) executeInsert(ins *insert, params []Value, ctx cteCtx) (Outcom
 		for p, name := range ins.Columns {
 			idx := table.ColumnIndex(name)
 			if idx < 0 {
-				return Outcome{}, newError(UndefinedColumn, fmt.Sprintf(
+				return outcome{}, newError(UndefinedColumn, fmt.Sprintf(
 					"column %s of relation %s does not exist", name, table.Name,
 				))
 			}
 			if provided[idx] >= 0 {
-				return Outcome{}, newError(DuplicateColumn,
+				return outcome{}, newError(DuplicateColumn,
 					"column "+table.Columns[idx].Name+" specified more than once")
 			}
 			provided[idx] = p
@@ -6421,7 +6458,7 @@ func (db *engine) executeInsert(ins *insert, params []Value, ctx cteCtx) (Outcom
 		// explicit value, so targeting an ALWAYS identity column without OVERRIDING SYSTEM VALUE is
 		// 428C9 — raised up front (PG raises it at rewrite), firing even over a zero-row source.
 		if len(alwaysTargeted) > 0 {
-			return Outcome{}, newError(GeneratedAlways, fmt.Sprintf(
+			return outcome{}, newError(GeneratedAlways, fmt.Sprintf(
 				"cannot insert a non-DEFAULT value into column %s", table.Columns[alwaysTargeted[0].col].Name,
 			))
 		}
@@ -6435,48 +6472,48 @@ func (db *engine) executeInsert(ins *insert, params []Value, ctx cteCtx) (Outcom
 		ptypes := &paramTypes{}
 		plan, err := db.planQuery(queryExpr{Select: ins.Select}, nil, ctx.bindings, ptypes)
 		if err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 		var retNodes []*rExpr
 		var retNames []string
 		var retTypes []string
 		if ins.Returning != nil {
 			if retNodes, retNames, retTypes, err = db.resolveReturning(table, *ins.Returning, false, ctx.bindings, ptypes); err != nil {
-				return Outcome{}, err
+				return outcome{}, err
 			}
 		}
 		var cplan *conflictPlan
 		if ins.OnConflict != nil {
 			if cplan, err = db.resolveOnConflict(table, ins.OnConflict, ptypes); err != nil {
-				return Outcome{}, err
+				return outcome{}, err
 			}
 		}
 		ptys, err := ptypes.finalize()
 		if err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 		bound, err := bindParams(params, ptys)
 		if err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 		meter := db.session.newMeter()
 		if err := db.foldUncorrelatedInPlan(&plan, bound, ctx, &meter.Accrued); err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 		// Uncorrelated subqueries in the RETURNING list fold once (cost.md §3), reading the
 		// pre-statement snapshot (grammar.md §32). They see the statement's CTE bindings
 		// (writable-cte.md) via ctx.
 		for _, node := range retNodes {
 			if err := db.foldUncorrelatedInRExpr(node, bound, ctx, &meter.Accrued); err != nil {
-				return Outcome{}, err
+				return outcome{}, err
 			}
 		}
 		if err := db.foldConflictPlan(cplan, bound, &meter.Accrued); err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 		q, err := db.execQueryPlan(&plan, nil, bound, ctx)
 		if err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 		// Arity: the SELECT's output column count must match the target — checked before any
 		// row is produced, so it fires even when the source returns zero rows.
@@ -6485,7 +6522,7 @@ func (db *engine) executeInsert(ins *insert, params []Value, ctx cteCtx) (Outcom
 			if arity == 1 {
 				noun = "column"
 			}
-			return Outcome{}, newError(SyntaxError, fmt.Sprintf(
+			return outcome{}, newError(SyntaxError, fmt.Sprintf(
 				"INSERT into table %s has %d target %s but SELECT produces %d",
 				table.Name, arity, noun, len(q.columnNames),
 			))
@@ -6499,19 +6536,19 @@ func (db *engine) executeInsert(ins *insert, params []Value, ctx cteCtx) (Outcom
 				// INSERT ... SELECT into a composite column lands in a later slice (the VALUES +
 				// ROW(...) path is S3 — spec/design/composite.md §12).
 				if col.Type.IsComposite() {
-					return Outcome{}, newError(FeatureNotSupported, fmt.Sprintf(
+					return outcome{}, newError(FeatureNotSupported, fmt.Sprintf(
 						"INSERT ... SELECT into composite column %s is not supported yet", col.Name,
 					))
 				}
 				// INSERT ... SELECT into a range column is deferred (the VALUES + range literal/cast
 				// path is the supported input — spec/design/ranges.md §1).
 				if col.Type.IsRange() {
-					return Outcome{}, newError(FeatureNotSupported, fmt.Sprintf(
+					return outcome{}, newError(FeatureNotSupported, fmt.Sprintf(
 						"INSERT ... SELECT into range column %s is not supported yet", col.Name,
 					))
 				}
 				if !assignableTo(q.columnTypes[p], col.Type.ScalarTy()) {
-					return Outcome{}, typeError(fmt.Sprintf(
+					return outcome{}, typeError(fmt.Sprintf(
 						"column %s is of type %s but expression is of type %s",
 						col.Name, col.Type.CanonicalName(), rtName(q.columnTypes[p]),
 					))
@@ -6525,7 +6562,7 @@ func (db *engine) executeInsert(ins *insert, params []Value, ctx cteCtx) (Outcom
 		meter.Charge(q.cost)
 		affected, returned, err := db.runInsertRows(table, store, ins.DB, pk, checks, defaultExprs, stmtRng, provided, q.rows, cplan, retNodes, bound, ctx, meter)
 		if err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 		return dmlOutcome(retNames, retTypes, returned, affected, meter.Accrued), nil
 	}
@@ -6540,7 +6577,7 @@ func (db *engine) executeInsert(ins *insert, params []Value, ctx cteCtx) (Outcom
 			if ins.Columns != nil {
 				expected = "target columns are"
 			}
-			return Outcome{}, newError(SyntaxError, fmt.Sprintf(
+			return outcome{}, newError(SyntaxError, fmt.Sprintf(
 				"INSERT row has %d values but %d %s expected for table %s",
 				len(values), arity, expected, table.Name,
 			))
@@ -6552,7 +6589,7 @@ func (db *engine) executeInsert(ins *insert, params []Value, ctx cteCtx) (Outcom
 				if iv := values[p]; iv.IsParam && !col.Type.IsComposite() {
 					ct := col.Type.ScalarTy()
 					if err := ptypes.note(int(iv.Param)-1, &ct); err != nil {
-						return Outcome{}, err
+						return outcome{}, err
 					}
 				}
 			}
@@ -6571,7 +6608,7 @@ func (db *engine) executeInsert(ins *insert, params []Value, ctx cteCtx) (Outcom
 			}
 		}
 		if nonDefault {
-			return Outcome{}, newError(GeneratedAlways, fmt.Sprintf(
+			return outcome{}, newError(GeneratedAlways, fmt.Sprintf(
 				"cannot insert a non-DEFAULT value into column %s", table.Columns[at.col].Name,
 			))
 		}
@@ -6584,23 +6621,23 @@ func (db *engine) executeInsert(ins *insert, params []Value, ctx cteCtx) (Outcom
 	if ins.Returning != nil {
 		var rerr error
 		if retNodes, retNames, retTypes, rerr = db.resolveReturning(table, *ins.Returning, false, ctx.bindings, ptypes); rerr != nil {
-			return Outcome{}, rerr
+			return outcome{}, rerr
 		}
 	}
 	var cplan *conflictPlan
 	if ins.OnConflict != nil {
 		var cerr error
 		if cplan, cerr = db.resolveOnConflict(table, ins.OnConflict, ptypes); cerr != nil {
-			return Outcome{}, cerr
+			return outcome{}, cerr
 		}
 	}
 	ptys, err := ptypes.finalize()
 	if err != nil {
-		return Outcome{}, err
+		return outcome{}, err
 	}
 	bound, err := bindParams(params, ptys)
 	if err != nil {
-		return Outcome{}, err
+		return outcome{}, err
 	}
 
 	// INSERT ... VALUES reads no rows; with only literal values and constant defaults it
@@ -6626,7 +6663,7 @@ func (db *engine) executeInsert(ins *insert, params []Value, ctx cteCtx) (Outcom
 					// DEFAULT at the top level → the column's default (constant or per-row expression).
 					dv, err := db.evalDefault(col, defaultExprs[i], stmtRng, meter)
 					if err != nil {
-						return Outcome{}, err
+						return outcome{}, err
 					}
 					rv[p] = dv
 				} else {
@@ -6634,7 +6671,7 @@ func (db *engine) executeInsert(ins *insert, params []Value, ctx cteCtx) (Outcom
 					// (composite-aware — spec/design/composite.md §1/§4).
 					mv, err := materializeInsertValue(iv, store.colTypes[i], bound)
 					if err != nil {
-						return Outcome{}, err
+						return outcome{}, err
 					}
 					rv[p] = mv
 				}
@@ -6646,15 +6683,15 @@ func (db *engine) executeInsert(ins *insert, params []Value, ctx cteCtx) (Outcom
 	// pre-statement snapshot (grammar.md §32). They see the statement's CTE bindings via ctx.
 	for _, node := range retNodes {
 		if err := db.foldUncorrelatedInRExpr(node, bound, ctx, &meter.Accrued); err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 	}
 	if err := db.foldConflictPlan(cplan, bound, &meter.Accrued); err != nil {
-		return Outcome{}, err
+		return outcome{}, err
 	}
 	affected, returned, err := db.runInsertRows(table, store, ins.DB, pk, checks, defaultExprs, stmtRng, provided, rows, cplan, retNodes, bound, ctx, meter)
 	if err != nil {
-		return Outcome{}, err
+		return outcome{}, err
 	}
 	return dmlOutcome(retNames, retTypes, returned, affected, meter.Accrued), nil
 }
@@ -7591,37 +7628,37 @@ func (db *engine) projectReturning(nodes []*rExpr, rows []storedRow, others []st
 // when a RETURNING clause was resolved (retNames non-nil — grammar.md §32; zero affected
 // rows is an EMPTY query result, never a bare statement), else a bare statement result
 // carrying the affected-row count (spec/design/api.md §4).
-func dmlOutcome(retNames []string, retTypes []string, returned [][]Value, affected int64, cost int64) Outcome {
+func dmlOutcome(retNames []string, retTypes []string, returned [][]Value, affected int64, cost int64) outcome {
 	if retNames != nil {
 		if returned == nil {
 			returned = [][]Value{}
 		}
-		return Outcome{Kind: OutcomeQuery, ColumnNames: retNames, ColumnTypes: retTypes, Rows: returned, Cost: cost}
+		return outcome{Kind: outcomeQuery, ColumnNames: retNames, ColumnTypes: retTypes, Rows: returned, Cost: cost}
 	}
-	return Outcome{Kind: OutcomeStatement, Cost: cost, RowsAffected: affected, HasRowsAffected: true}
+	return outcome{Kind: outcomeStatement, Cost: cost, RowsAffected: affected, HasRowsAffected: true}
 }
 
 // executeDelete analyzes and runs a DELETE: resolve the table and optional predicate,
 // collect the keys of matching rows (only a TRUE predicate matches — Kleene), then
 // remove them. No WHERE deletes every row. Keys are collected before mutating so the
 // map is not modified while iterating.
-func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (Outcome, error) {
+func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (outcome, error) {
 	// A write to a READ-ONLY host attachment is 25006 before any I/O — checked BEFORE the qualifier
 	// existence gate so a read-only attachment refuses the write deterministically (attached-databases.md §4).
 	if err := db.checkAttachmentWritable(del.DB); err != nil {
-		return Outcome{}, err
+		return outcome{}, err
 	}
 	if err := db.checkTableQualifier(del.DB, del.Table); err != nil { // attached-databases.md §3
-		return Outcome{}, err
+		return outcome{}, err
 	}
 	table, ok := db.lkpTableScoped(del.DB, del.Table) // scope-aware temp-first (temp-tables.md §3)
 	if !ok {
-		return Outcome{}, newError(UndefinedTable, "table does not exist: "+del.Table)
+		return outcome{}, newError(UndefinedTable, "table does not exist: "+del.Table)
 	}
 	// Refuse the write if any collated key is version-skewed (slice 2d, collation.md §12, XX002): a
 	// DELETE must locate + remove a stored key, which a skewed encoding cannot match.
 	if err := db.ensureCollationsWritable(table.Columns); err != nil {
-		return Outcome{}, err
+		return outcome{}, err
 	}
 	// Per-column frozen collations for the collated text key form (§2.12) — indexes both the FK
 	// parent-side probe (parent is this table) and the index-entry path.
@@ -7637,7 +7674,7 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (Ou
 	if del.Filter != nil {
 		f, err := resolveBooleanFilter(s, del.Filter, ptypes)
 		if err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 		filter = f
 	}
@@ -7647,16 +7684,16 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (Ou
 	if del.Returning != nil {
 		var rerr error
 		if retNodes, retNames, retTypes, rerr = db.resolveReturning(table, *del.Returning, true, ctx.bindings, ptypes); rerr != nil {
-			return Outcome{}, rerr
+			return outcome{}, rerr
 		}
 	}
 	ptys, err := ptypes.finalize()
 	if err != nil {
-		return Outcome{}, err
+		return outcome{}, err
 	}
 	bound, err := bindParams(params, ptys)
 	if err != nil {
-		return Outcome{}, err
+		return outcome{}, err
 	}
 
 	// Fold globally-uncorrelated WHERE subqueries once (their cost is added a single time —
@@ -7667,14 +7704,14 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (Ou
 	meter := db.session.newMeter()
 	if filter != nil {
 		if err := db.foldUncorrelatedInRExpr(filter, bound, ctx, &meter.Accrued); err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 	}
 	// Uncorrelated subqueries in the RETURNING list fold once (cost.md §3), reading the
 	// pre-statement snapshot (grammar.md §32).
 	for _, node := range retNodes {
 		if err := db.foldUncorrelatedInRExpr(node, bound, ctx, &meter.Accrued); err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 	}
 	env := &evalEnv{exec: db, params: bound, rng: newStmtRng(), ctes: ctx}
@@ -7715,7 +7752,7 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (Ou
 		// A host-attached target full-scans this slice (attached-databases.md §8) — a bounded scan would
 		// resolve its index store through the unscoped funnel. The whole WHERE stays the residual filter.
 		if entries, overlap, slabs, err = store.ScanWithUnits(mask); err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 	} else if bp := db.pkBoundFor(table, filter); bp != nil {
 		// Top-level statement: no enclosing query, so the bound never has a correlated source.
@@ -7726,7 +7763,7 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (Ou
 			return dmlOutcome(retNames, retTypes, nil, 0, meter.Accrued), nil
 		}
 		if entries, overlap, slabs, err = store.RangeScanWithUnits(kb, mask); err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 	} else if gb := detectGinBound(filter, table.Indexes, table.Columns, 0); gb != nil {
 		// GIN-bounded delete (gin.md §6): when no PK bound applies, gather the candidate (key,row)
@@ -7738,7 +7775,7 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (Ou
 			query = q
 		}
 		if entries, overlap, slabs, err = db.ginBoundRows(del.Table, gb, query, env, meter, mask); err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 	} else if gb := detectGistBound(filter, table.Indexes, table.Columns, 0); gb != nil {
 		// GiST-bounded delete (gist.md §5): gather candidates by descending the resident R-tree; the
@@ -7748,37 +7785,37 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (Ou
 			query = q
 		}
 		if entries, overlap, slabs, err = db.gistBoundRows(del.Table, gb, query, env, meter, mask); err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 	} else if ks := db.pkSetFor(table, filter); ks != nil {
 		// Merged PK point-set delete (cost.md §3 "OR / IN-list"): a union of point probes over the
 		// distinct sorted keys; whole rows so index entries can be removed. The predicate stays the
 		// residual filter below.
 		if entries, overlap, slabs, err = db.pkKeySetRows(store, ks, bound, nil, mask, nil, false); err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 	} else {
 		if entries, overlap, slabs, err = store.ScanWithUnits(mask); err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 	}
 	meter.Charge(costs.PageRead*int64(overlap) + costs.ValueDecompress*int64(slabs))
 	for _, e := range entries {
 		if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned row (CLAUDE.md §13)
-			return Outcome{}, err
+			return outcome{}, err
 		}
 		meter.Charge(costs.StorageRowRead)
 		// Materialize the filter's columns if the lazy load left them unfetched — exactly the
 		// touched set the block above charged (large-values.md §14).
 		row, err := store.resolveColumns(e.Row, mask)
 		if err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 		keep := true
 		if filter != nil {
 			v, err := filter.eval(row, env, meter)
 			if err != nil {
-				return Outcome{}, err
+				return outcome{}, err
 			}
 			keep = v.IsTrue()
 		}
@@ -7788,7 +7825,7 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (Ou
 			// always inline, so cost-free) so those paths see resident values.
 			row, err = store.resolveInlineColumns(row)
 			if err != nil {
-				return Outcome{}, err
+				return outcome{}, err
 			}
 			matched = append(matched, matchedRow{key: e.Key, row: row})
 		}
@@ -7817,17 +7854,17 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (Ou
 				// parent is the delete target itself, so its key columns use colls (§2.12).
 				probe, ok, err := buildFkProbe(&r.fk, parent, colls, m.row, r.fk.RefColumns)
 				if err != nil {
-					return Outcome{}, err
+					return outcome{}, err
 				}
 				if !ok {
 					continue // a NULL referenced value cannot be referenced (MATCH SIMPLE)
 				}
 				referenced, err := db.fkChildReferences(r.childTable, &r.fk, parent, probe.bytes, exclude)
 				if err != nil {
-					return Outcome{}, err
+					return outcome{}, err
 				}
 				if referenced {
-					return Outcome{}, newError(ForeignKeyViolation,
+					return outcome{}, newError(ForeignKeyViolation,
 						"update or delete on table "+parent.Name+" violates foreign key constraint "+r.fk.Name+" on table "+r.childTable)
 				}
 			}
@@ -7844,7 +7881,7 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (Ou
 			prows[i] = matched[i].row
 		}
 		if returned, err = db.projectReturning(retNodes, prows, nil, bound, ctx, meter); err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 	}
 	// Phase 2: remove the rows, then their secondary-index entries (indexes.md §4 —
@@ -7852,7 +7889,7 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (Ou
 	// when the scan above read the pin.
 	for _, m := range matched {
 		if _, err := writeStore.Remove(m.key); err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 	}
 	for _, def := range table.Indexes {
@@ -7860,11 +7897,11 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (Ou
 		for _, m := range matched {
 			eks, err := indexEntryKeys(table.Columns, colls, def, m.key, m.row)
 			if err != nil {
-				return Outcome{}, err
+				return outcome{}, err
 			}
 			for _, ek := range eks {
 				if _, err := istore.Remove(ek); err != nil {
-					return Outcome{}, err
+					return outcome{}, err
 				}
 			}
 		}
@@ -7878,23 +7915,23 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (Ou
 // writes. Phase 2 applies. Assigning a PRIMARY KEY column traps 0A000 (the storage
 // key must not change this slice); a duplicate target column traps 42701. No WHERE
 // updates every row.
-func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcome, error) {
+func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcome, error) {
 	// A write to a READ-ONLY host attachment is 25006 before any I/O — checked BEFORE the qualifier
 	// existence gate so a read-only attachment refuses the write deterministically (attached-databases.md §4).
 	if err := db.checkAttachmentWritable(upd.DB); err != nil {
-		return Outcome{}, err
+		return outcome{}, err
 	}
 	if err := db.checkTableQualifier(upd.DB, upd.Table); err != nil { // attached-databases.md §3
-		return Outcome{}, err
+		return outcome{}, err
 	}
 	table, ok := db.lkpTableScoped(upd.DB, upd.Table) // scope-aware temp-first (temp-tables.md §3)
 	if !ok {
-		return Outcome{}, newError(UndefinedTable, "table does not exist: "+upd.Table)
+		return outcome{}, newError(UndefinedTable, "table does not exist: "+upd.Table)
 	}
 	// Refuse the write if any collated key is version-skewed (slice 2d, collation.md §12, XX002): an
 	// UPDATE re-encodes + re-places keys, which a skewed encoding would corrupt.
 	if err := db.ensureCollationsWritable(table.Columns); err != nil {
-		return Outcome{}, err
+		return outcome{}, err
 	}
 	// Per-column frozen collations for the collated text key form (§2.12) — indexes both the FK
 	// probe and the index-entry move path.
@@ -7915,18 +7952,18 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 	for _, a := range upd.Assignments {
 		idx := table.ColumnIndex(a.Column)
 		if idx < 0 {
-			return Outcome{}, newError(UndefinedColumn, "column does not exist: "+a.Column)
+			return outcome{}, newError(UndefinedColumn, "column does not exist: "+a.Column)
 		}
 		// A GENERATED ALWAYS identity column can only be set to DEFAULT (sequences.md §13.4); jed's
 		// UPDATE has no `= DEFAULT` form, so any assignment is 428C9. Ordered before the PK-narrowing
 		// 0A000 so an ALWAYS identity PRIMARY KEY reports 428C9 (PG's code).
 		if c := table.Columns[idx].Identity; c != nil && *c == identityAlways {
-			return Outcome{}, newError(GeneratedAlways,
+			return outcome{}, newError(GeneratedAlways,
 				fmt.Sprintf("column %s can only be updated to DEFAULT", a.Column))
 		}
 		for _, p := range plans {
 			if p.idx == idx {
-				return Outcome{}, newError(DuplicateColumn,
+				return outcome{}, newError(DuplicateColumn,
 					"column "+a.Column+" assigned more than once")
 			}
 		}
@@ -7935,7 +7972,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 		// assignment coercion — composite.md §12); reject it for now (0A000). Range and array columns
 		// ARE updatable (ranges.md §4 / array.md §4) through the container path below.
 		if col.Type.IsComposite() {
-			return Outcome{}, newError(FeatureNotSupported,
+			return outcome{}, newError(FeatureNotSupported,
 				"updating composite column "+a.Column+" is not supported yet")
 		}
 		if scalar, ok := col.Type.AsScalar(); ok {
@@ -7945,10 +7982,10 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 			colScalar := scalar
 			src, ty, err := resolve(s, a.Value, &colScalar, &aggCtx{collecting: false}, ptypes)
 			if err != nil {
-				return Outcome{}, err
+				return outcome{}, err
 			}
 			if err := requireAssignable(ty, colScalar, a.Column); err != nil {
-				return Outcome{}, err
+				return outcome{}, err
 			}
 			plans = append(plans, assignPlan{
 				idx: idx, name: col.Name, target: colScalar, decimal: col.Decimal, varcharLen: col.VarcharLen, notNull: col.NotNull, source: src,
@@ -7959,7 +7996,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 			// through coerceForStore (carried on the plan as colType).
 			src, err := resolveContainerAssign(s, col, a.Value, &aggCtx{collecting: false}, ptypes)
 			if err != nil {
-				return Outcome{}, err
+				return outcome{}, err
 			}
 			ct := resolveColType(col.Type, s.catalog.readSnap().types)
 			plans = append(plans, assignPlan{
@@ -7978,7 +8015,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 	if upd.Filter != nil {
 		f, err := resolveBooleanFilter(s, upd.Filter, ptypes)
 		if err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 		filter = f
 	}
@@ -7990,24 +8027,24 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 	if upd.Returning != nil {
 		var rerr error
 		if retNodes, retNames, retTypes, rerr = db.resolveReturning(table, *upd.Returning, false, ctx.bindings, ptypes); rerr != nil {
-			return Outcome{}, rerr
+			return outcome{}, rerr
 		}
 	}
 	// The CHECK constraints, resolved once per statement in evaluation (name) order;
 	// phase 1 evaluates them on each post-assignment row (constraints.md §4.4).
 	checks, err := db.resolveChecks(table)
 	if err != nil {
-		return Outcome{}, err
+		return outcome{}, err
 	}
 	// All assignment RHSs + the WHERE + the RETURNING are resolved: finalize + bind before
 	// any scan.
 	ptys, err := ptypes.finalize()
 	if err != nil {
-		return Outcome{}, err
+		return outcome{}, err
 	}
 	bound, err := bindParams(params, ptys)
 	if err != nil {
-		return Outcome{}, err
+		return outcome{}, err
 	}
 
 	// Fold globally-uncorrelated subqueries (in any assignment RHS or the WHERE) once — their
@@ -8020,17 +8057,17 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 	meter := db.session.newMeter()
 	for i := range plans {
 		if err := db.foldUncorrelatedInRExpr(plans[i].source, bound, ctx, &meter.Accrued); err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 	}
 	if filter != nil {
 		if err := db.foldUncorrelatedInRExpr(filter, bound, ctx, &meter.Accrued); err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 	}
 	for _, node := range retNodes {
 		if err := db.foldUncorrelatedInRExpr(node, bound, ctx, &meter.Accrued); err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 	}
 	env := &evalEnv{exec: db, params: bound, rng: newStmtRng(), ctes: ctx}
@@ -8085,7 +8122,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 		// A host-attached target full-scans this slice (attached-databases.md §8) — a bounded scan would
 		// resolve its index store through the unscoped funnel. The whole WHERE stays the residual filter.
 		if entries, overlap, slabs, err = store.ScanWithUnits(mask); err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 	} else if bp := db.pkBoundFor(table, filter); bp != nil {
 		// Top-level statement: no enclosing query, so the bound never has a correlated source.
@@ -8096,7 +8133,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 			return dmlOutcome(retNames, retTypes, nil, 0, meter.Accrued), nil
 		}
 		if entries, overlap, slabs, err = store.RangeScanWithUnits(kb, mask); err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 	} else if gb := detectGinBound(filter, table.Indexes, table.Columns, 0); gb != nil {
 		// GIN-bounded update (gin.md §6): when no PK bound applies, gather the candidate (key,row)
@@ -8107,7 +8144,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 			query = q
 		}
 		if entries, overlap, slabs, err = db.ginBoundRows(upd.Table, gb, query, env, meter, mask); err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 	} else if gb := detectGistBound(filter, table.Indexes, table.Columns, 0); gb != nil {
 		// GiST-bounded update (gist.md §5): gather candidates by descending the resident R-tree over
@@ -8117,36 +8154,36 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 			query = q
 		}
 		if entries, overlap, slabs, err = db.gistBoundRows(upd.Table, gb, query, env, meter, mask); err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 	} else if ks := db.pkSetFor(table, filter); ks != nil {
 		// Merged PK point-set update (cost.md §3 "OR / IN-list"): a union of point probes over the
 		// distinct sorted keys of the PRE-update state; whole rows. The predicate stays the residual
 		// filter below.
 		if entries, overlap, slabs, err = db.pkKeySetRows(store, ks, bound, nil, mask, nil, false); err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 	} else {
 		if entries, overlap, slabs, err = store.ScanWithUnits(mask); err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 	}
 	meter.Charge(costs.PageRead*int64(overlap) + costs.ValueDecompress*int64(slabs))
 	for _, e := range entries {
 		if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned row (CLAUDE.md §13)
-			return Outcome{}, err
+			return outcome{}, err
 		}
 		meter.Charge(costs.StorageRowRead)
 		// Materialize the filter's + assignment sources' columns if the lazy load left them
 		// unfetched — exactly the touched set the block above charged (large-values.md §14).
 		row, err := store.resolveColumns(e.Row, mask)
 		if err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 		if filter != nil {
 			v, err := filter.eval(row, env, meter)
 			if err != nil {
-				return Outcome{}, err
+				return outcome{}, err
 			}
 			if !v.IsTrue() {
 				continue
@@ -8156,18 +8193,18 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 		// below); resolve its inline-deferred values (lazy-record.md §5b — a key column is always
 		// inline, so cost-free) so that maintenance sees resident values.
 		if row, err = store.resolveInlineColumns(row); err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 		newRow := make(storedRow, len(row))
 		copy(newRow, row)
 		for _, p := range plans {
 			raw, err := p.source.eval(row, env, meter)
 			if err != nil {
-				return Outcome{}, err
+				return outcome{}, err
 			}
 			checked, err := p.check(raw)
 			if err != nil {
-				return Outcome{}, err
+				return outcome{}, err
 			}
 			newRow[p.idx] = checked
 		}
@@ -8175,7 +8212,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 		// columns so its weight/disposition re-plan exactly as an eager writer's would —
 		// unmetered, part of the rewrite like commit work (large-values.md §14).
 		if newRow, err = store.resolveAll(newRow); err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 		// CHECK constraints, in name order, on the post-assignment row — after the
 		// assignments coerced (22003/23502 in p.check above), on the fully-resident row
@@ -8183,14 +8220,14 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 		// columns); TRUE and NULL pass, the first FALSE aborts the statement (phase 1 —
 		// nothing has been written).
 		if err := evalChecks(checks, table.Name, newRow, env, meter); err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 		// The row's NEW storage key: recomputed from the post-assignment row when a key member
 		// was assigned (re-keying), else the unchanged old key.
 		newKey := e.Key
 		if pkChanged {
 			if newKey, err = encodePkKey(table, pkMembers, colls, newRow); err != nil {
-				return Outcome{}, err
+				return outcome{}, err
 			}
 		}
 		updates = append(updates, pending{key: e.Key, newKey: newKey, row: newRow, oldRow: row})
@@ -8213,12 +8250,12 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 			if _, dup := batch[string(u.newKey)]; dup {
 				collides = true
 			} else if _, exists, gerr := store.Get(u.newKey); gerr != nil {
-				return Outcome{}, gerr
+				return outcome{}, gerr
 			} else if _, own := rewritten[string(u.newKey)]; exists && !own {
 				collides = true
 			}
 			if collides {
-				return Outcome{}, newError(UniqueViolation,
+				return outcome{}, newError(UniqueViolation,
 					"duplicate key value violates unique constraint: "+strings.ToLower(table.Name)+"_pkey")
 			}
 			batch[string(u.newKey)] = struct{}{}
@@ -8246,7 +8283,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 			for _, u := range updates {
 				prefix, ok, err := indexPrefixKey(table.Columns, colls, def, u.row)
 				if err != nil {
-					return Outcome{}, err
+					return outcome{}, err
 				}
 				if !ok {
 					continue
@@ -8257,7 +8294,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 				} else {
 					entries, err := istore.RangeEntries(uniqueProbeBound(prefix))
 					if err != nil {
-						return Outcome{}, err
+						return outcome{}, err
 					}
 					for _, e := range entries {
 						if _, own := rewritten[string(e.Key[len(prefix):])]; !own {
@@ -8267,7 +8304,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 					}
 				}
 				if conflict {
-					return Outcome{}, newError(UniqueViolation,
+					return outcome{}, newError(UniqueViolation,
 						"duplicate key value violates unique constraint: "+def.Name)
 				}
 				batch[string(prefix)] = struct{}{}
@@ -8304,14 +8341,14 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 					}
 				}
 				if conflict {
-					return Outcome{}, newError(ExclusionViolation,
+					return outcome{}, newError(ExclusionViolation,
 						"conflicting key value violates exclusion constraint: "+exc.Name)
 				}
 			}
 			for i := range updates {
 				for j := 0; j < i; j++ {
 					if exclusionPairConflicts(table.Columns, exc, updates[i].row, updates[j].row) {
-						return Outcome{}, newError(ExclusionViolation,
+						return outcome{}, newError(ExclusionViolation,
 							"conflicting key value violates exclusion constraint: "+exc.Name)
 					}
 				}
@@ -8353,7 +8390,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 			for _, u := range updates {
 				probe, ok, err := buildFkProbe(fk, parent, parentColls, u.row, fk.RefColumns)
 				if err != nil {
-					return Outcome{}, err
+					return outcome{}, err
 				}
 				if ok {
 					batch[string(probe.bytes)] = struct{}{}
@@ -8363,7 +8400,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 		for _, u := range updates {
 			probe, ok, err := buildFkProbe(fk, parent, parentColls, u.row, fk.Columns)
 			if err != nil {
-				return Outcome{}, err
+				return outcome{}, err
 			}
 			if !ok {
 				continue // a NULL local column → exempt (MATCH SIMPLE)
@@ -8373,10 +8410,10 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 			}
 			hit, err := db.fkProbeHits(probe, fk.RefTable)
 			if err != nil {
-				return Outcome{}, err
+				return outcome{}, err
 			}
 			if !hit {
-				return Outcome{}, newError(ForeignKeyViolation,
+				return outcome{}, newError(ForeignKeyViolation,
 					"insert or update on table "+relation+" violates foreign key constraint "+fk.Name)
 			}
 		}
@@ -8407,7 +8444,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 			for _, u := range updates {
 				probe, ok, err := buildFkProbe(&r.fk, parent, colls, u.row, r.fk.RefColumns)
 				if err != nil {
-					return Outcome{}, err
+					return outcome{}, err
 				}
 				if ok {
 					newPresent[string(probe.bytes)] = struct{}{}
@@ -8420,7 +8457,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 				for _, u := range updates {
 					probe, ok, err := buildFkProbe(&r.fk, parent, colls, u.row, r.fk.Columns)
 					if err != nil {
-						return Outcome{}, err
+						return outcome{}, err
 					}
 					if ok {
 						newChildRefs[string(probe.bytes)] = struct{}{}
@@ -8434,7 +8471,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 			for _, u := range updates {
 				oldProbe, ok, err := buildFkProbe(&r.fk, parent, colls, u.oldRow, r.fk.RefColumns)
 				if err != nil {
-					return Outcome{}, err
+					return outcome{}, err
 				}
 				if !ok {
 					continue // a NULL old referenced value was referenced by nothing
@@ -8442,7 +8479,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 				// Unchanged tuples (incl. a NULL → already skipped) do not disappear.
 				newProbe, ok, err := buildFkProbe(&r.fk, parent, colls, u.row, r.fk.RefColumns)
 				if err != nil {
-					return Outcome{}, err
+					return outcome{}, err
 				}
 				if ok {
 					if bytes.Equal(newProbe.bytes, oldProbe.bytes) {
@@ -8457,10 +8494,10 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 				// still points at the disappearing tuple.
 				referenced, err := db.fkChildReferences(r.childTable, &r.fk, parent, oldProbe.bytes, exclude)
 				if err != nil {
-					return Outcome{}, err
+					return outcome{}, err
 				}
 				if _, dangles := newChildRefs[string(oldProbe.bytes)]; referenced || dangles {
-					return Outcome{}, newError(ForeignKeyViolation,
+					return outcome{}, newError(ForeignKeyViolation,
 						"update or delete on table "+parent.Name+" violates foreign key constraint "+r.fk.Name+" on table "+r.childTable)
 				}
 			}
@@ -8476,7 +8513,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 	}
 	meter.Charge(costs.ValueCompress * cunits)
 	if err := meter.Guard(); err != nil {
-		return Outcome{}, err
+		return outcome{}, err
 	}
 
 	// The RETURNING projection (grammar.md §32, cost.md §3): evaluate over the matched rows'
@@ -8492,7 +8529,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 			olds[i] = updates[i].oldRow
 		}
 		if returned, err = db.projectReturning(retNodes, prows, olds, bound, ctx, meter); err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 	}
 
@@ -8511,11 +8548,11 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 			// keeping the copy-on-write dirty set byte-identical across cores.
 			oldEks, err := indexEntryKeys(table.Columns, colls, def, u.key, u.oldRow)
 			if err != nil {
-				return Outcome{}, err
+				return outcome{}, err
 			}
 			newEks, err := indexEntryKeys(table.Columns, colls, def, u.newKey, u.row)
 			if err != nil {
-				return Outcome{}, err
+				return outcome{}, err
 			}
 			removals := bytesDiff(oldEks, newEks)
 			insertions := bytesDiff(newEks, oldEks)
@@ -8535,19 +8572,19 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 	if pkChanged {
 		for _, u := range updates {
 			if _, err := writeStore.Remove(u.key); err != nil {
-				return Outcome{}, err
+				return outcome{}, err
 			}
 		}
 		for _, u := range updates {
 			inserted, err := writeStore.Insert(u.newKey, u.row)
 			if err != nil {
-				return Outcome{}, err
+				return outcome{}, err
 			}
 			if !inserted {
 				// Reachable only under the writable-CTE read pin (writable-cte.md §7): an earlier
 				// sub-statement staged this key, unseen by phase 1. Aborts all-or-nothing, matching
 				// INSERT. For a single statement, phase 1's end-state check caught every duplicate.
-				return Outcome{}, newError(UniqueViolation,
+				return outcome{}, newError(UniqueViolation,
 					"duplicate key value violates unique constraint: "+strings.ToLower(table.Name)+"_pkey")
 			}
 		}
@@ -8556,7 +8593,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 			for _, mv := range indexMoves[k] {
 				for _, oldEk := range mv.removals {
 					if _, err := istore.Remove(oldEk); err != nil {
-						return Outcome{}, err
+						return outcome{}, err
 					}
 				}
 			}
@@ -8564,11 +8601,11 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 				for _, newEk := range mv.insertions {
 					inserted, err := istore.Insert(newEk, nil)
 					if err != nil {
-						return Outcome{}, err
+						return outcome{}, err
 					}
 					if !inserted {
 						// A cross-sub-statement collision under the read pin (as above).
-						return Outcome{}, newError(UniqueViolation,
+						return outcome{}, newError(UniqueViolation,
 							"duplicate key value violates unique constraint: "+def.Name)
 					}
 				}
@@ -8577,7 +8614,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 	} else {
 		for _, u := range updates {
 			if err := writeStore.Replace(u.key, u.row); err != nil {
-				return Outcome{}, err
+				return outcome{}, err
 			}
 		}
 		for k, def := range table.Indexes {
@@ -8585,13 +8622,13 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (Outcom
 			for _, mv := range indexMoves[k] {
 				for _, oldEk := range mv.removals {
 					if _, err := istore.Remove(oldEk); err != nil {
-						return Outcome{}, err
+						return outcome{}, err
 					}
 				}
 				for _, newEk := range mv.insertions {
 					inserted, err := istore.Insert(newEk, nil)
 					if err != nil {
-						return Outcome{}, err
+						return outcome{}, err
 					}
 					if !inserted {
 						panic("index entry keys are unique (storage-key suffix)")
@@ -8632,7 +8669,7 @@ func (db *engine) RowsInKeyOrder(name string) []storedRow {
 
 // selectResult is the full result of running a SELECT (runSelect): the output column names and
 // their resolved types, the rows in result order, and the accrued cost. Internal to the
-// executor — executeSelect drops the types into the public Outcome, while INSERT ... SELECT uses
+// executor — executeSelect drops the types into the public outcome, while INSERT ... SELECT uses
 // the types to gate assignability up front (spec/design/grammar.md §24).
 type selectResult struct {
 	columnNames []string
@@ -8641,29 +8678,29 @@ type selectResult struct {
 	cost        int64
 }
 
-// executeSelect runs a SELECT as a top-level statement: runSelect, then wrap as a query Outcome
+// executeSelect runs a SELECT as a top-level statement: runSelect, then wrap as a query outcome
 // (the projection types are internal — only INSERT ... SELECT consumes them).
-func (db *engine) executeSelect(sel *selectStmt, params []Value) (Outcome, error) {
+func (db *engine) executeSelect(sel *selectStmt, params []Value) (outcome, error) {
 	r, err := db.runSelect(sel, params)
 	if err != nil {
-		return Outcome{}, err
+		return outcome{}, err
 	}
-	return Outcome{Kind: OutcomeQuery, ColumnNames: r.columnNames, ColumnTypes: typeNames(r.columnTypes), Rows: r.rows, Cost: r.cost}, nil
+	return outcome{Kind: outcomeQuery, ColumnNames: r.columnNames, ColumnTypes: typeNames(r.columnTypes), Rows: r.rows, Cost: r.cost}, nil
 }
 
 // executeSetOp runs a set operation as a top-level statement: runSetOp, then wrap as a query
-// Outcome. Cost is lhs.cost + rhs.cost — the combine, sort, and window are unmetered (cost.md §3).
-func (db *engine) executeSetOp(so *setOp, params []Value) (Outcome, error) {
+// outcome. Cost is lhs.cost + rhs.cost — the combine, sort, and window are unmetered (cost.md §3).
+func (db *engine) executeSetOp(so *setOp, params []Value) (outcome, error) {
 	r, err := db.runSetOp(so, params)
 	if err != nil {
-		return Outcome{}, err
+		return outcome{}, err
 	}
-	return Outcome{Kind: OutcomeQuery, ColumnNames: r.columnNames, ColumnTypes: typeNames(r.columnTypes), Rows: r.rows, Cost: r.cost}, nil
+	return outcome{Kind: outcomeQuery, ColumnNames: r.columnNames, ColumnTypes: typeNames(r.columnTypes), Rows: r.rows, Cost: r.cost}, nil
 }
 
 // executeWith runs a WITH query (spec/design/cte.md) — the host-API entry point; runWith does the
 // CTE orchestration.
-func (db *engine) executeWith(wq *withQuery, params []Value) (Outcome, error) {
+func (db *engine) executeWith(wq *withQuery, params []Value) (outcome, error) {
 	// A WITH containing any data-modifying part (a data-modifying CTE or a data-modifying primary)
 	// runs through the writable-CTE orchestrator (spec/design/writable-cte.md): it pins the
 	// pre-statement snapshot and runs the parts in lexical order, all-or-nothing. A pure-query WITH
@@ -8673,9 +8710,9 @@ func (db *engine) executeWith(wq *withQuery, params []Value) (Outcome, error) {
 	}
 	r, err := db.runWith(wq, params)
 	if err != nil {
-		return Outcome{}, err
+		return outcome{}, err
 	}
-	return Outcome{Kind: OutcomeQuery, ColumnNames: r.columnNames, ColumnTypes: typeNames(r.columnTypes), Rows: r.rows, Cost: r.cost}, nil
+	return outcome{Kind: outcomeQuery, ColumnNames: r.columnNames, ColumnTypes: typeNames(r.columnTypes), Rows: r.rows, Cost: r.cost}, nil
 }
 
 // planCteBindings plans every CTE in a WITH list into bindings (spec/design/cte.md §2,
@@ -8978,7 +9015,7 @@ func (db *engine) materializeRecursive(ci int, rt *recursiveTerm,
 // crosses only via a CTE's RETURNING buffer), runs the parts in lexical order, and returns the
 // primary's result. The whole statement is one all-or-nothing transaction — the autocommit (or block)
 // wrapper publishes the accumulated working only if this returns nil error (§6).
-func (db *engine) executeWithDml(wq *withQuery, params []Value) (Outcome, error) {
+func (db *engine) executeWithDml(wq *withQuery, params []Value) (outcome, error) {
 	// Pin the pre-statement snapshot. A write statement runs with a transaction open (autocommit
 	// opened one), and nothing is written yet, so the pin equals working == committed. Cleared on
 	// every exit path so the next statement reads normally.
@@ -8991,12 +9028,12 @@ func (db *engine) executeWithDml(wq *withQuery, params []Value) (Outcome, error)
 // runWithDml is the body of executeWithDml, run under the read pin. Plans every CTE binding + the
 // query primary, runs the data-modifying CTEs / materialized query CTEs in list order, then the
 // primary — every read against the pin, every write into the transaction's working.
-func (db *engine) runWithDml(wq *withQuery, params []Value) (Outcome, error) {
+func (db *engine) runWithDml(wq *withQuery, params []Value) (outcome, error) {
 	ptypes := &paramTypes{}
 	// (1) Plan every CTE binding (query plans + data-modifying RETURNING schemas).
 	bindings, err := db.planCteBindings(wq.Ctes, wq.Recursive, ptypes)
 	if err != nil {
-		return Outcome{}, err
+		return outcome{}, err
 	}
 	// (2) Plan a query primary now (to bump refs + surface resolution errors, incl. a 0A000 FROM
 	//     reference to a no-RETURNING data-modifying CTE). A data-modifying primary is resolved and
@@ -9006,7 +9043,7 @@ func (db *engine) runWithDml(wq *withQuery, params []Value) (Outcome, error) {
 	if q := wq.Body.AsQuery(); q != nil {
 		p, perr := db.planQuery(*q, nil, bindings, ptypes)
 		if perr != nil {
-			return Outcome{}, perr
+			return outcome{}, perr
 		}
 		primaryPlan = &p
 	}
@@ -9028,11 +9065,11 @@ func (db *engine) runWithDml(wq *withQuery, params []Value) (Outcome, error) {
 	}
 	ptys, err := ptypes.finalize()
 	if err != nil {
-		return Outcome{}, err
+		return outcome{}, err
 	}
 	bound, err := bindParams(params, ptys)
 	if err != nil {
-		return Outcome{}, err
+		return outcome{}, err
 	}
 	modes := cteModes(bindings)
 
@@ -9046,14 +9083,14 @@ func (db *engine) runWithDml(wq *withQuery, params []Value) (Outcome, error) {
 		case bindings[i].recursive != nil:
 			b, rerr := db.materializeRecursive(i, bindings[i].recursive, modes, bindings, buffers, bound, &totalCost)
 			if rerr != nil {
-				return Outcome{}, rerr
+				return outcome{}, rerr
 			}
 			buf = b
 		case bindings[i].isDml():
 			ctx := cteCtx{modes: modes[:i], bindings: bindings[:i], buffers: buffers}
 			rows, cost, derr := db.execDmCte(i, bindings, bound, ctx)
 			if derr != nil {
-				return Outcome{}, derr
+				return outcome{}, derr
 			}
 			totalCost += cost
 			buf = rows
@@ -9062,7 +9099,7 @@ func (db *engine) runWithDml(wq *withQuery, params []Value) (Outcome, error) {
 			cplan := bindings[i].plan
 			r, rerr := db.execQueryPlan(&cplan, nil, bound, ctx)
 			if rerr != nil {
-				return Outcome{}, rerr
+				return outcome{}, rerr
 			}
 			totalCost += r.cost
 			buf = rowsFromValues(r.rows)
@@ -9072,35 +9109,35 @@ func (db *engine) runWithDml(wq *withQuery, params []Value) (Outcome, error) {
 
 	// (4) Execute the primary against the full CTE context, adding the materialization cost.
 	ctx := cteCtx{modes: modes, bindings: bindings, buffers: buffers}
-	var outcome Outcome
+	var out outcome
 	switch {
 	case wq.Body.AsQuery() != nil:
 		var subqueryCost int64
 		if err := db.foldUncorrelatedInPlan(primaryPlan, bound, ctx, &subqueryCost); err != nil {
-			return Outcome{}, err
+			return outcome{}, err
 		}
 		r, rerr := db.execQueryPlan(primaryPlan, nil, bound, ctx)
 		if rerr != nil {
-			return Outcome{}, rerr
+			return outcome{}, rerr
 		}
-		outcome = Outcome{
-			Kind:        OutcomeQuery,
+		out = outcome{
+			Kind:        outcomeQuery,
 			ColumnNames: r.columnNames,
 			ColumnTypes: typeNames(r.columnTypes),
 			Rows:        r.rows,
 			Cost:        r.cost + subqueryCost,
 		}
 	case wq.Body.Insert != nil:
-		outcome, err = db.executeInsert(wq.Body.Insert, params, ctx)
+		out, err = db.executeInsert(wq.Body.Insert, params, ctx)
 	case wq.Body.Update != nil:
-		outcome, err = db.executeUpdate(wq.Body.Update, params, ctx)
+		out, err = db.executeUpdate(wq.Body.Update, params, ctx)
 	default:
-		outcome, err = db.executeDelete(wq.Body.Delete, params, ctx)
+		out, err = db.executeDelete(wq.Body.Delete, params, ctx)
 	}
 	if err != nil {
-		return Outcome{}, err
+		return outcome{}, err
 	}
-	return addOutcomeCost(outcome, totalCost), nil
+	return addOutcomeCost(out, totalCost), nil
 }
 
 // execDmCte executes a data-modifying CTE (spec/design/writable-cte.md §3): run the INSERT/UPDATE/
@@ -9109,23 +9146,23 @@ func (db *engine) runWithDml(wq *withQuery, params []Value) (Outcome, error) {
 // scan) + its cost. A body with no RETURNING runs for its effect and buffers no rows.
 func (db *engine) execDmCte(i int, bindings []*cteBinding, params []Value, ctx cteCtx) ([]storedRow, int64, error) {
 	dm := bindings[i].dm
-	var outcome Outcome
+	var out outcome
 	var err error
 	switch {
 	case dm.insert != nil:
-		outcome, err = db.executeInsert(dm.insert, params, ctx)
+		out, err = db.executeInsert(dm.insert, params, ctx)
 	case dm.update != nil:
-		outcome, err = db.executeUpdate(dm.update, params, ctx)
+		out, err = db.executeUpdate(dm.update, params, ctx)
 	default:
-		outcome, err = db.executeDelete(dm.delete, params, ctx)
+		out, err = db.executeDelete(dm.delete, params, ctx)
 	}
 	if err != nil {
 		return nil, 0, err
 	}
-	if outcome.Kind == OutcomeQuery {
-		return rowsFromValues(outcome.Rows), outcome.Cost, nil
+	if out.Kind == outcomeQuery {
+		return rowsFromValues(out.Rows), out.Cost, nil
 	}
-	return nil, outcome.Cost, nil
+	return nil, out.Cost, nil
 }
 
 // === WITH RECURSIVE analysis (spec/design/recursive-cte.md) ==========================
@@ -9391,7 +9428,7 @@ func cteModes(bindings []*cteBinding) []cteMode {
 // addOutcomeCost adds extra cost to an outcome (the writable-CTE orchestrator folds the
 // materialization cost of the data-modifying / query CTEs into the primary's result —
 // spec/design/writable-cte.md §8).
-func addOutcomeCost(outcome Outcome, extra int64) Outcome {
+func addOutcomeCost(outcome outcome, extra int64) outcome {
 	outcome.Cost += extra
 	return outcome
 }
@@ -14555,8 +14592,9 @@ func (db *engine) planCacheable(sp *selectPlan) bool {
 // stmtIsWrite — or a top-level set-op / VALUES / WITH), so the caller falls through to the deferred /
 // materialized paths. When sc is non-nil (a prepared statement) a repeated execute over an unchanged
 // catalog reuses the cached plan and skips planning + the fold; ad-hoc callers pass nil and still
-// plan exactly once. The conformance corpus drives the materialized Execute path, so this lane stays
-// invisible to it (unit-tested to yield identical rows + total cost under full drain, streaming.md §6).
+// plan exactly once. The conformance corpus drives this lazy lane for every read (the harness routes
+// through QueryValues), cross-checked to yield identical rows + total cost as the materialized drive
+// under full drain (streaming.md §6).
 func (db *engine) tryScanQuery(stmt statement, params []Value, sc *scanCache) (*Rows, bool, error) {
 	if stmt.Select == nil || stmtIsWrite(stmt) {
 		return nil, false, nil
@@ -14952,8 +14990,9 @@ func (c *bufferedScanCursor) close() {
 // buffered result one row at a time over a frozen snapshot (§5). Returns (nil,false,nil) for any
 // non-set-op/WITH statement, or a write-classified one (a data-modifying WITH, a nextval/setval call —
 // stmtIsWrite), which falls back to the materialized dispatch path. Under full drain the rows + total
-// cost are byte-identical to the eager Execute path (it drives the SAME runSetOp / runWith, §6), so the
-// corpus — which drives Execute — stays green by construction; per-core unit tests pin Query == Execute.
+// cost are byte-identical to the materialized drive (it drives the SAME runSetOp / runWith, §6), so the
+// corpus — which drives the total QueryValues seam — stays green by construction; per-core unit tests
+// pin the lazy drive == the materialized drive.
 func (db *engine) tryDeferredQuery(stmt statement, params []Value) (*Rows, bool, error) {
 	// A write-classified statement (a data-modifying WITH, a sequence mutator) must take the write gate
 	// and never streams (streaming.md §7 / sequences.md §4).
@@ -15026,7 +15065,7 @@ type deferredQuery struct {
 // records the accrued cost, and yields the materialized result ONE row at a time. The input is still
 // buffered (a set op dedups / a WITH materializes — it must), so the win here is only lazy-yield: the
 // work is deferred to the first pull and the result rows are handed out incrementally rather than
-// wrapped in an eager Outcome. Under full drain the rows + total cost are byte-identical to the eager
+// wrapped in an eager outcome. Under full drain the rows + total cost are byte-identical to the eager
 // path (it drives the SAME runSetOp / runWith, §6).
 type deferredCursor struct {
 	eng    *engine
@@ -15808,9 +15847,9 @@ func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 
 func (db *engine) execSelectPlan(plan *selectPlan, outer []storedRow, params []Value, ctes cteCtx) (selectResult, error) {
 	// Run the blocking part to an emitter, then drive the emission EAGERLY into a slice (the
-	// materialized Execute path the conformance corpus drives — byte-unchanged). The lazy Query path
-	// drives the SAME emitter row by row via bufferedCursor (streaming.md §4); both charge the
-	// identical units at the identical sites, so the totals agree (streaming.md §6).
+	// materialized drive). The lazy QueryValues drive walks the SAME emitter row by row via
+	// bufferedCursor (streaming.md §4); both charge the identical units at the identical sites, so the
+	// totals agree (streaming.md §6).
 	rng := newStmtRng()
 	meter := db.session.newMeter()
 	em, err := db.execSelectEmit(plan, outer, params, ctes, rng, meter)
@@ -15857,7 +15896,7 @@ const (
 // emitter describes how a selectPlan's output rows are emitted (spec/design/streaming.md §4, S4): a
 // SELECT runs its blocking part (scan/join/WHERE/window/sort/GROUP BY/DISTINCT) into a buffer, then
 // emits a row at a time. execSelectEmit returns this so the emission can be driven EAGERLY (the
-// materialized Execute path — execSelectPlan's drainEager builds a slice) or LAZILY (the Query path —
+// materialized drive — execSelectPlan's drainEager builds a slice) or LAZILY (the QueryValues drive —
 // bufferedCursor yields it row by row, bounding output memory and short-circuiting a caller's early
 // exit). Both drives charge the identical units at the identical sites (streaming.md §6).
 //   - emitProject: `src` holds the UNPROJECTED rows, windowed to [start, end) — emission evaluates the
@@ -15884,9 +15923,9 @@ type emitter struct {
 	mode     emitMode
 }
 
-// drainEager builds the full output slice from the emitter — the materialized Execute drive
-// (spec/design/streaming.md §4). The lazy Query drive (bufferedCursor) emits the same rows one at a
-// time instead; both charge the identical units in the identical order, so totals agree (§6).
+// drainEager builds the full output slice from the emitter — the materialized drive
+// (spec/design/streaming.md §4). The lazy QueryValues drive (bufferedCursor) emits the same rows one at
+// a time instead; both charge the identical units in the identical order, so totals agree (§6).
 func (em emitter) drainEager(db *engine, plan *selectPlan, outer []storedRow, params []Value, ctes cteCtx, rng *stmtRng, meter *costMeter) ([][]Value, error) {
 	switch em.mode {
 	case emitFinal:
@@ -17915,7 +17954,7 @@ func assignableTo(t resolvedType, colTy scalarType) bool {
 
 // rtName is t's type name, for a 42804 assignability message (the integer width is exact).
 // typeNames renders a projection's resolved types as their canonical names for the public
-// Outcome.ColumnTypes — the `# types:` directive's assertion surface (spec/design/conformance.md
+// outcome.ColumnTypes — the `# types:` directive's assertion surface (spec/design/conformance.md
 // §7). Same names as the 42804 message (rtName): the exact integer width, the unconstrained
 // "decimal".
 func typeNames(ts []resolvedType) []string {

@@ -24,11 +24,11 @@ func seededKV(t *testing.T, n int64) *Database {
 	t.Helper()
 	db := memDB()
 	w := db.WriteSession()
-	if _, err := w.Execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", nil); err != nil {
+	if _, err := queryOutcome(w, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)", nil); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	for i := int64(1); i <= n; i++ {
-		if _, err := w.Execute(fmt.Sprintf("INSERT INTO t VALUES (%d, %d)", i, i*10), nil); err != nil {
+		if _, err := queryOutcome(w, fmt.Sprintf("INSERT INTO t VALUES (%d, %d)", i, i*10), nil); err != nil {
 			t.Fatalf("insert %d: %v", i, err)
 		}
 	}
@@ -41,11 +41,11 @@ func seededKV(t *testing.T, n int64) *Database {
 // eagerResult: the materialized (Execute) rows + total cost — the oracle the streaming cursor matches.
 func eagerResult(t *testing.T, s *Session, sql string) ([][]Value, int64) {
 	t.Helper()
-	out, err := s.Execute(sql, nil)
+	out, err := queryOutcome(s, sql, nil)
 	if err != nil {
 		t.Fatalf("execute %q: %v", sql, err)
 	}
-	if out.Kind != OutcomeQuery {
+	if out.Kind != outcomeQuery {
 		t.Fatalf("not a query: %q", sql)
 	}
 	return out.Rows, out.Cost
@@ -54,7 +54,7 @@ func eagerResult(t *testing.T, s *Session, sql string) ([][]Value, int64) {
 // streamResult: the streaming (Query) rows, fully drained, + final cost.
 func streamResult(t *testing.T, s *Session, sql string) ([][]Value, int64) {
 	t.Helper()
-	rows, err := s.Query(sql, nil)
+	rows, err := s.QueryValues(sql, nil)
 	if err != nil {
 		t.Fatalf("query %q: %v", sql, err)
 	}
@@ -129,7 +129,7 @@ func TestStreamingEarlyExitChargesLess(t *testing.T) {
 
 	_, fullCost := streamResult(t, s, "SELECT id FROM t ORDER BY id")
 
-	rows, err := s.Query("SELECT id FROM t ORDER BY id", nil)
+	rows, err := s.QueryValues("SELECT id FROM t ORDER BY id", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,7 +158,7 @@ func TestStreamingCursorPinsSnapshot(t *testing.T) {
 	reader := db.Session(SessionOptions{})
 	defer reader.Close()
 
-	rows, err := reader.Query("SELECT id FROM t ORDER BY id", nil)
+	rows, err := reader.QueryValues("SELECT id FROM t ORDER BY id", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +171,7 @@ func TestStreamingCursorPinsSnapshot(t *testing.T) {
 
 	// A concurrent writer commits two more rows (version 2) while the cursor is open.
 	w := db.WriteSession()
-	if _, err := w.Execute("INSERT INTO t VALUES (4, 40), (5, 50)", nil); err != nil {
+	if _, err := queryOutcome(w, "INSERT INTO t VALUES (4, 40), (5, 50)", nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := w.Commit(); err != nil {
@@ -211,7 +211,7 @@ func TestStreamingMidDrainCostAbort(t *testing.T) {
 	db := seededKV(t, 1000)
 	s := db.Session(SessionOptions{MaxCost: 50})
 	defer s.Close()
-	rows, err := s.Query("SELECT id FROM t ORDER BY id", nil)
+	rows, err := s.QueryValues("SELECT id FROM t ORDER BY id", nil)
 	if err != nil {
 		t.Fatalf("query (build) must not abort: %v", err)
 	}
@@ -300,7 +300,7 @@ func TestBufferedEarlyExitChargesLess(t *testing.T) {
 		t.Fatalf("full drain = %d rows, want 1000", len(fullRows))
 	}
 
-	rows, err := s.Query(sql, nil)
+	rows, err := s.QueryValues(sql, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -334,7 +334,7 @@ func TestBufferedCursorPinsSnapshot(t *testing.T) {
 
 	// A blocking query (ORDER BY v — not PK order) → the buffered cursor. Pull one row (runs the
 	// blocking part over the v1 snapshot), keep the cursor live.
-	rows, err := reader.Query("SELECT v FROM t ORDER BY v", nil)
+	rows, err := reader.QueryValues("SELECT v FROM t ORDER BY v", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -346,7 +346,7 @@ func TestBufferedCursorPinsSnapshot(t *testing.T) {
 	}
 
 	w := db.WriteSession()
-	if _, err := w.Execute("INSERT INTO t VALUES (4, 40), (5, 50)", nil); err != nil {
+	if _, err := queryOutcome(w, "INSERT INTO t VALUES (4, 40), (5, 50)", nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := w.Commit(); err != nil {
@@ -380,7 +380,7 @@ func TestBufferedMidDrainCostAbort(t *testing.T) {
 	db := seededKV(t, 1000)
 	s := db.Session(SessionOptions{MaxCost: 50})
 	defer s.Close()
-	rows, err := s.Query("SELECT v FROM t ORDER BY v", nil)
+	rows, err := s.QueryValues("SELECT v FROM t ORDER BY v", nil)
 	if err != nil {
 		t.Fatalf("query (build) must not abort: %v", err)
 	}
@@ -448,7 +448,7 @@ func TestSortedEarlyExitChargesLess(t *testing.T) {
 		t.Fatalf("full drain = %d rows, want 1000", len(fullRows))
 	}
 
-	rows, err := s.Query(sql, nil)
+	rows, err := s.QueryValues(sql, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -495,12 +495,12 @@ func TestSortedSpillMergeStreamsLazily(t *testing.T) {
 		t.Fatal(err)
 	}
 	w := db.WriteSession()
-	if _, err := w.Execute("CREATE TABLE t (id i32 PRIMARY KEY, k i32)", nil); err != nil {
+	if _, err := queryOutcome(w, "CREATE TABLE t (id i32 PRIMARY KEY, k i32)", nil); err != nil {
 		t.Fatal(err)
 	}
 	for id := int64(0); id < 200; id++ {
 		k := (id * 48271) % 100 // scrambled key with many duplicates
-		if _, err := w.Execute(fmt.Sprintf("INSERT INTO t VALUES (%d, %d)", id, k), nil); err != nil {
+		if _, err := queryOutcome(w, fmt.Sprintf("INSERT INTO t VALUES (%d, %d)", id, k), nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -533,7 +533,7 @@ func TestSortedSpillMergeStreamsLazily(t *testing.T) {
 	// merge's run files, so none leak.
 	s2 := db.Session(SessionOptions{})
 	s2.SetWorkMem(128)
-	rows, err := s2.Query(sql, nil)
+	rows, err := s2.QueryValues(sql, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -603,7 +603,7 @@ func TestDeferredRunsFullyOnFirstPull(t *testing.T) {
 		t.Fatalf("full drain = %d rows, want 200", len(fullRows))
 	}
 
-	rows, err := s.Query(sql, nil)
+	rows, err := s.QueryValues(sql, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -633,7 +633,7 @@ func TestDeferredCursorPinsSnapshot(t *testing.T) {
 
 	// A top-level UNION → the deferred cursor. Pull one row (runs the set op over the v1 snapshot),
 	// keep the cursor live.
-	rows, err := reader.Query("SELECT v FROM t WHERE id <= 2 UNION SELECT v FROM t WHERE id = 3 ORDER BY v", nil)
+	rows, err := reader.QueryValues("SELECT v FROM t WHERE id <= 2 UNION SELECT v FROM t WHERE id = 3 ORDER BY v", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -645,7 +645,7 @@ func TestDeferredCursorPinsSnapshot(t *testing.T) {
 	}
 
 	w := db.WriteSession()
-	if _, err := w.Execute("INSERT INTO t VALUES (4, 40), (5, 50)", nil); err != nil {
+	if _, err := queryOutcome(w, "INSERT INTO t VALUES (4, 40), (5, 50)", nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := w.Commit(); err != nil {
@@ -679,7 +679,7 @@ func TestDeferredMidDrainCostAbort(t *testing.T) {
 	db := seededKV(t, 1000)
 	s := db.Session(SessionOptions{MaxCost: 50})
 	defer s.Close()
-	rows, err := s.Query("SELECT id FROM t UNION ALL SELECT id FROM t ORDER BY id", nil)
+	rows, err := s.QueryValues("SELECT id FROM t UNION ALL SELECT id FROM t ORDER BY id", nil)
 	if err != nil {
 		t.Fatalf("query (build) must not abort: %v", err)
 	}
@@ -709,7 +709,7 @@ func TestDeferredSkipsDataModifyingWith(t *testing.T) {
 	defer s.Close()
 	// A writable CTE: INSERT … RETURNING fed to the primary. This is stmtIsWrite, so it bypasses
 	// tryDeferredQuery and runs through the write path — but Query still surfaces its rows.
-	rows, err := s.Query("WITH ins AS (INSERT INTO t VALUES (6, 60), (7, 70) RETURNING id) SELECT id FROM ins ORDER BY id", nil)
+	rows, err := s.QueryValues("WITH ins AS (INSERT INTO t VALUES (6, 60), (7, 70) RETURNING id) SELECT id FROM ins ORDER BY id", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -875,7 +875,7 @@ func TestPreparedQueryPinsSnapshot(t *testing.T) {
 	}
 
 	w := db.WriteSession()
-	if _, err := w.Execute("INSERT INTO t VALUES (4, 40), (5, 50)", nil); err != nil {
+	if _, err := queryOutcome(w, "INSERT INTO t VALUES (4, 40), (5, 50)", nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := w.Commit(); err != nil {
@@ -959,7 +959,7 @@ func TestDatabaseQueryPreparedConvenienceStreams(t *testing.T) {
 // streamResultParams: the streaming (Query) rows + cost for a parameterized query, fully drained.
 func streamResultParams(t *testing.T, s *Session, sql string, params []Value) ([][]Value, int64) {
 	t.Helper()
-	rows, err := s.Query(sql, params)
+	rows, err := s.QueryValues(sql, params)
 	if err != nil {
 		t.Fatalf("query %q: %v", sql, err)
 	}

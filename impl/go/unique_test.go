@@ -15,9 +15,9 @@ import (
 	"testing"
 )
 
-func uqRun(t *testing.T, db dbHandle, sql string) Outcome {
+func uqRun(t *testing.T, db dbHandle, sql string) outcome {
 	t.Helper()
-	o, err := db.Execute(sql, nil)
+	o, err := queryOutcome(db, sql, nil)
 	if err != nil {
 		t.Fatalf("%q: %v", sql, err)
 	}
@@ -44,7 +44,7 @@ func uqIds(t *testing.T, db dbHandle, sql string) []int64 {
 
 func uqErr(t *testing.T, db dbHandle, sql string) (string, string) {
 	t.Helper()
-	_, err := db.Execute(sql, nil)
+	_, err := queryOutcome(db, sql, nil)
 	if err == nil {
 		t.Fatalf("expected an error from %q", sql)
 	}

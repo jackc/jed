@@ -12,17 +12,13 @@ type Transaction struct {
 	done bool
 }
 
-// Execute runs a (possibly mutating) statement within this transaction, binding params. A write
-// in a READ ONLY transaction is 25006; a statement error aborts the block (every later statement
-// but commit/rollback is then 25P02).
-func (tx *Transaction) Execute(sql string, params []Value) (Outcome, error) {
-	return tx.db.ExecuteSQL(sql, params)
-}
-
-// QueryValues runs a query within this transaction, returning a row cursor (the raw []Value
-// path; the ergonomic Query(ctx, sql, args...) in ergonomic.go owns the Query name — api.md §11).
+// QueryValues runs a statement within this transaction, returning a row cursor (the raw []Value
+// path; the ergonomic Query/Exec(ctx, sql, args...) in ergonomic.go owns the Query name — api.md §11).
+// Total: a non-query statement (a write in a READ ONLY transaction is 25006; a statement error aborts
+// the block, every later statement but commit/rollback then 25P02) returns a no-column cursor carrying
+// the command tag.
 func (tx *Transaction) QueryValues(sql string, params []Value) (*Rows, error) {
-	return tx.db.QuerySQL(sql, params)
+	return tx.db.QueryValues(sql, params)
 }
 
 // Commit publishes the transaction durably (per synchronous). Idempotent after the transaction
@@ -106,22 +102,13 @@ func (db *engine) Prepare(sql string) (*PreparedStatement, error) {
 	return &PreparedStatement{db: db, ast: stmt}, nil
 }
 
-// Execute runs this statement, binding params to its $N placeholders (nil when it has none),
-// returning the materialized outcome.
-func (s *PreparedStatement) Execute(params []Value) (Outcome, error) {
-	if s.sess != nil {
-		return s.sess.dispatch(s.ast, params)
-	}
-	return s.db.ExecuteStmtParams(s.ast, params)
-}
-
-// QueryValues runs this query statement, returning a row cursor. The prepared AST routes through the
-// same lazy streaming / buffered / deferred lanes as the ad-hoc Query (spec/design/streaming.md §3/§4/§7)
+// QueryValues runs this prepared statement, returning a row cursor. The prepared AST routes through the
+// same lazy streaming / buffered / deferred lanes as the ad-hoc QueryValues (spec/design/streaming.md §3/§4/§7)
 // — so a prepared query streams exactly like a one-shot one. When prepared on a Session (sess set) it
 // routes through the session (the pinned snapshot + watermark, the converged §2.4 semantics); a bare
-// engine prepared statement routes through the engine. A non-query statement is a 42601 (use Execute).
-// This is the raw []Value path; the ergonomic Query(ctx, args...) in ergonomic.go owns the Query name
-// (api.md §11).
+// engine prepared statement routes through the engine. Total: a non-query statement returns a no-column
+// cursor carrying the command tag. This is the raw []Value path; the ergonomic Query/Exec(ctx, args...)
+// in ergonomic.go owns the Query name (api.md §11).
 func (s *PreparedStatement) QueryValues(params []Value) (*Rows, error) {
 	if s.sess != nil {
 		return s.sess.queryStmt(s.ast, params, &s.sc)
@@ -129,21 +116,16 @@ func (s *PreparedStatement) QueryValues(params []Value) (*Rows, error) {
 	return s.db.queryStmt(s.ast, params, &s.sc)
 }
 
-// ExecuteSQL is a one-shot: parse + execute sql, binding params, returning the outcome. (The
-// package function Execute(db, sql) is the zero-parameter convenience kept for back-compat.)
-func (db *engine) ExecuteSQL(sql string, params []Value) (Outcome, error) {
-	return executeParams(db, sql, params)
-}
-
-// QuerySQL is a one-shot: parse + run a query sql, binding params, returning a row cursor. A
+// QueryValues is a one-shot: parse + run a statement, binding params, returning a row cursor. A
 // single-table no-blocking-operator read is served by a lazy STREAMING cursor (spec/design/streaming.md
 // §4, S3); a blocking read (ORDER BY/DISTINCT/aggregate/window/join) by a lazy BUFFERED cursor (S4)
 // that buffers the input but yields the output one row at a time. Both pull over a pinned snapshot with
 // bounded peak output memory and a caller early-exit; a top-level set operation / pure-query WITH is
 // served by a lazy DEFERRED cursor (streaming.md §7) that defers the run to the first pull and yields
-// the result one row at a time. (This is the bare single-handle engine; the watermark pin lives on the
-// shared-core Session.Query path.)
-func (db *engine) QuerySQL(sql string, params []Value) (*Rows, error) {
+// the result one row at a time. Total: a non-query statement returns a no-column cursor carrying the
+// command tag. (This is the bare single-handle engine; the watermark pin lives on the shared-core
+// Session.QueryValues path.)
+func (db *engine) QueryValues(sql string, params []Value) (*Rows, error) {
 	stmt, err := db.parse(sql)
 	if err != nil {
 		return nil, err
@@ -154,30 +136,33 @@ func (db *engine) QuerySQL(sql string, params []Value) (*Rows, error) {
 // queryStmt routes an already-parsed query AST through the lazy scan (streaming/buffered) then
 // deferred lanes, planning a scan-shaped SELECT exactly once (tryScanQuery), and falling back to the
 // materialized ExecuteStmtParams for a shape no lazy lane covers (a write, a nextval/setval SELECT, a
-// data-modifying WITH). Shared by QuerySQL (parse-then-route, sc nil) and a prepared query
+// data-modifying WITH). Shared by QueryValues (parse-then-route, sc nil) and a prepared query
 // (PreparedStatement.QueryValues passes its scanCache), so a prepared query streams identically to an
 // ad-hoc one but reuses its cached plan across executes. (This is the bare single-handle engine; the
-// watermark pin lives on the shared-core Session.Query path.)
+// watermark pin lives on the shared-core Session.QueryValues path.)
 func (db *engine) queryStmt(stmt statement, params []Value, sc *scanCache) (*Rows, error) {
 	// A read served by a lazy lane skips the materialized dispatch, so enforce the read-path admission
 	// gates (25P02 / 54P02 / 42501) up front — reads only (transaction control must work in a failed
-	// block; a write is gated inside dispatch on the fall-through). Keeps the bare-engine Query a safe
-	// total seam like the shared-core Session.Query (executor.go gateReadLanes, CLAUDE.md §13).
+	// block; a write is gated inside dispatch on the fall-through). Keeps the bare-engine QueryValues a
+	// safe total seam like the shared-core Session.QueryValues (executor.go gateReadLanes, CLAUDE.md §13).
 	if stmt.Begin == nil && stmt.Commit == nil && stmt.Rollback == nil && !stmtIsWrite(stmt) {
 		if err := db.gateReadLanes(stmt); err != nil {
-			return nil, err
+			return nil, db.poisonOnLaneErr(err)
 		}
 	}
 	if rows, ok, err := db.tryScanQuery(stmt, params, sc); err != nil {
-		return nil, err
+		return nil, db.poisonOnLaneErr(err)
 	} else if ok {
-		return rows, nil
+		return db.attachBlockPoison(rows), nil
 	}
 	if rows, ok, err := db.tryDeferredQuery(stmt, params); err != nil {
-		return nil, err
+		return nil, db.poisonOnLaneErr(err)
 	} else if ok {
-		return rows, nil
+		return db.attachBlockPoison(rows), nil
 	}
+	// The fall-through handles transaction control (BEGIN/COMMIT/ROLLBACK — a nested BEGIN's 25001 must
+	// NOT poison) and self-poisons on a regular statement error (ExecuteStmtParams), so its nuanced
+	// poisoning is left intact — only the lazy-lane reads above, which bypass it, are poisoned here.
 	out, err := db.ExecuteStmtParams(stmt, params)
 	if err != nil {
 		return nil, err
@@ -185,11 +170,12 @@ func (db *engine) queryStmt(stmt statement, params []Value, sc *scanCache) (*Row
 	return rowsFromOutcome(out), nil
 }
 
-// Rows is a cursor over a query's rows (spec/design/api.md §4). It walks the pull source (cursor.go)
-// one row at a time, exposing the column names and the accrued execution cost. The source is buffered
-// for the materialized Execute path (the conformance corpus, byte-unchanged) and a lazy streaming
-// pull pipeline (S3, streaming.md §4) for a single-table no-blocking-op Query — the seam is the same
-// either way, so callers are unchanged.
+// Rows is a cursor over a statement's rows (spec/design/api.md §4). It walks the pull source (cursor.go)
+// one row at a time, exposing the column names, command tag, and accrued execution cost. The source is
+// buffered for the materialized drive (a write / a shape no lazy lane covers) and a lazy streaming pull
+// pipeline (S3, streaming.md §4) for a single-table no-blocking-op read — the seam is the same either
+// way, so callers are unchanged. It is the one result type of the total QueryValues seam: a non-query
+// statement is a Rows with no output columns, carrying its command tag (rowsAffected).
 type Rows struct {
 	columnNames []string
 	columnTypes []string
@@ -204,7 +190,7 @@ type Rows struct {
 	// snapshot (streaming.md §4).
 	cursor cursor
 	// onClose is the reader-liveness pin's deregister (the watermark, streaming.md §5) — set by
-	// Session.Query for a streaming cursor, called by Close (Go has no destructor; the ergonomic
+	// Session.QueryValues for a streaming cursor, called by Close (Go has no destructor; the ergonomic
 	// iterators close on loop exit). nil for a buffered cursor or a bare single-handle stream.
 	onClose func()
 	// current is the row the last successful Next produced; valid reports whether there is one.
@@ -218,15 +204,21 @@ type Rows struct {
 	// err holds a terminal error reached during iteration (a canceled ctx, a future mid-stream
 	// fault). Surfaced by Err() after the loop — the bufio.Scanner / database/sql idiom.
 	err error
+	// onErr fires once when a terminal iteration error is first set (a drain-time streaming/deferred
+	// fault). Set by Session/engine.queryStmt (attachBlockPoison) for a read inside an open block, to
+	// abort the block — the open-time lane errors are poisoned at the queryStmt returns, this covers the
+	// errors that surface only during the caller's Next(). nil for an autocommit read or a buffered
+	// cursor (whose error surfaces at open, not drain).
+	onErr func(error)
 }
 
-// rowsFromOutcome wraps a materialized Outcome (the executor's internal result) as a *Rows. It is
+// rowsFromOutcome wraps a materialized outcome (the executor's internal result) as a *Rows. It is
 // TOTAL: a non-query statement is observably a Rows with no output columns — an empty buffered cursor
 // seeded with the accrued cost, carrying the statement's command tag (rows-affected). This is the
 // single exec/query seam: the exec-side path (Exec) drains-and-discards such a Rows and returns the
 // tag, so "Query on a statement that produces no rows" is valid, not a 42601 (the effect-then-error
 // bug this removes — a write reached here after dispatch already committed it; spec/design/api.md §11).
-func rowsFromOutcome(out Outcome) *Rows {
+func rowsFromOutcome(out outcome) *Rows {
 	return &Rows{
 		columnNames:  out.ColumnNames,
 		columnTypes:  out.ColumnTypes,
@@ -240,6 +232,20 @@ func rowsFromOutcome(out Outcome) *Rows {
 // spec/design/streaming.md §5); Close calls it.
 func (r *Rows) attachPin(deregister func()) { r.onClose = deregister }
 
+// attachErrHook records a callback fired once when iteration first hits a terminal error (queryStmt's
+// attachBlockPoison uses it to abort an open block on a drain-time read fault).
+func (r *Rows) attachErrHook(hook func(error)) { r.onErr = hook }
+
+// setErr records a terminal iteration error and fires the onErr hook exactly once (subsequent Next
+// short-circuits on r.err, so the hook cannot double-fire).
+func (r *Rows) setErr(err error) {
+	r.err = err
+	if r.onErr != nil {
+		r.onErr(err)
+		r.onErr = nil
+	}
+}
+
 // Next advances to the next row, returning false when the result is exhausted OR the captured
 // context has been canceled (Err then reports the cancellation).
 func (r *Rows) Next() bool {
@@ -248,14 +254,15 @@ func (r *Rows) Next() bool {
 		return false
 	}
 	if err := ctxErr(r.ctx); err != nil {
-		r.err = err
+		r.setErr(err)
 		return false
 	}
 	row, ok, err := r.cursor.nextRow()
 	if err != nil {
 		// A mid-drain streaming error (a 54P01 cost abort, a canceled ctx surfaced by the meter, or an
-		// arithmetic trap): stop iteration; Err() surfaces it (streaming.md §6).
-		r.err = err
+		// arithmetic trap): stop iteration; Err() surfaces it (streaming.md §6). setErr also aborts an
+		// open block (attachBlockPoison) — PG aborts a transaction on a drain-time statement error too.
+		r.setErr(err)
 		return false
 	}
 	if !ok {

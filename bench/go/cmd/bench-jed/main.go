@@ -48,13 +48,24 @@ func open(dataDir, dataset string) (bench.Engine, error) {
 	return e, nil
 }
 
+// drainExec runs a statement through the raw QueryValues seam to completion, discarding any rows — the
+// bench equivalent of the removed Execute (a write materializes at the call; Close releases the cursor).
+func drainExec(rows *jed.Rows, err error) error {
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+	}
+	rows.Close()
+	return rows.Err()
+}
+
 func (e *engine) Exec(sql string) error {
-	_, err := e.sess.Execute(sql, nil)
-	return err
+	return drainExec(e.sess.QueryValues(sql, nil))
 }
 
 func (e *engine) QueryInt(sql string) (int64, error) {
-	rows, err := e.sess.Query(sql, nil)
+	rows, err := e.sess.QueryValues(sql, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -109,8 +120,7 @@ func bindArgs(args []any) []jed.Value {
 }
 
 func (s *jedStmt) Exec(args []any) error {
-	_, err := s.stmt.Execute(bindArgs(args))
-	return err
+	return drainExec(s.stmt.QueryValues(bindArgs(args)))
 }
 
 func (s *jedStmt) Query(args []any, sum *bench.Checksum) (int, error) {
@@ -180,7 +190,7 @@ func (p *jedPool) Close() error {
 type jedReader struct{ s *jed.Session }
 
 func (r jedReader) Query(sql string, args []any, sum *bench.Checksum) (int, error) {
-	rows, err := r.s.Query(sql, bindArgs(args))
+	rows, err := r.s.QueryValues(sql, bindArgs(args))
 	if err != nil {
 		return 0, err
 	}

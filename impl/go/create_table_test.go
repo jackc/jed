@@ -5,9 +5,9 @@ package jed
 
 import "testing"
 
-func mustCreate(t *testing.T, db dbHandle, sql string) Outcome {
+func mustCreate(t *testing.T, db dbHandle, sql string) outcome {
 	t.Helper()
-	out, err := db.Execute(sql, nil)
+	out, err := queryOutcome(db, sql, nil)
 	if err != nil {
 		t.Fatalf("Execute(%q) error: %v", sql, err)
 	}
@@ -16,7 +16,7 @@ func mustCreate(t *testing.T, db dbHandle, sql string) Outcome {
 
 func wantErr(t *testing.T, db dbHandle, sql, code string) {
 	t.Helper()
-	_, err := db.Execute(sql, nil)
+	_, err := queryOutcome(db, sql, nil)
 	if err == nil {
 		t.Fatalf("Execute(%q): expected error %s, got success", sql, code)
 	}
@@ -28,7 +28,7 @@ func wantErr(t *testing.T, db dbHandle, sql, code string) {
 func TestCreatesTableWithResolvedTypesAndPK(t *testing.T) {
 	db := memDB().Session(SessionOptions{})
 	out := mustCreate(t, db, "CREATE TABLE nums (id i32 PRIMARY KEY, small i16, big i64)")
-	if out.Kind != OutcomeStatement {
+	if out.Kind != outcomeStatement {
 		t.Fatalf("expected statement outcome, got %v", out.Kind)
 	}
 	tbl, ok := db.Table("nums")

@@ -36,14 +36,14 @@ func TestOrInPointSetMultiLeaf(t *testing.T) {
 		t.Fatalf("test needs a multi-leaf tree; got nodeCount=%d (raise n)", store.NodeCount())
 	}
 
-	full, err := db.Execute("SELECT a FROM t", nil)
+	full, err := queryOutcome(db, "SELECT a FROM t", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// An IN-list of three scattered keys reads exactly three rows at cost far below the full scan: a
 	// union of three point probes, not a walk of 1000 rows (the merged-point-lookup win).
-	out, err := db.Execute("SELECT a FROM t WHERE id IN (10, 500, 990)", nil)
+	out, err := queryOutcome(db, "SELECT a FROM t WHERE id IN (10, 500, 990)", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +65,7 @@ func TestOrInPointSetMultiLeaf(t *testing.T) {
 	}
 
 	// The OR spelling is the identical bound.
-	or, err := db.Execute("SELECT a FROM t WHERE id = 10 OR id = 500 OR id = 990", nil)
+	or, err := queryOutcome(db, "SELECT a FROM t WHERE id = 10 OR id = 500 OR id = 990", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +74,7 @@ func TestOrInPointSetMultiLeaf(t *testing.T) {
 	}
 
 	// A mix of hits and misses: only the present keys yield rows; every probe still charges its path.
-	mix, err := db.Execute("SELECT a FROM t WHERE id IN (7, 99999, 42)", nil)
+	mix, err := queryOutcome(db, "SELECT a FROM t WHERE id IN (7, 99999, 42)", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +91,7 @@ func TestOrInPointSetParamsAndCorrelated(t *testing.T) {
 		"INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40)")
 
 	// Bind params in the IN-list.
-	out, err := db.Execute("SELECT a FROM t WHERE id IN ($1, $2, $3) ORDER BY a", []Value{
+	out, err := queryOutcome(db, "SELECT a FROM t WHERE id IN ($1, $2, $3) ORDER BY a", []Value{
 		IntValue(1), IntValue(3), IntValue(99),
 	})
 	if err != nil {
@@ -102,7 +102,7 @@ func TestOrInPointSetParamsAndCorrelated(t *testing.T) {
 	}
 
 	// A duplicate param value de-duplicates to one probe (same as a literal duplicate).
-	dup, err := db.Execute("SELECT a FROM t WHERE id IN ($1, $2)", []Value{IntValue(2), IntValue(2)})
+	dup, err := queryOutcome(db, "SELECT a FROM t WHERE id IN ($1, $2)", []Value{IntValue(2), IntValue(2)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,11 +124,11 @@ func TestOrInPointSetParamsAndCorrelated(t *testing.T) {
 func TestOrInPointSetAggregate(t *testing.T) {
 	const n = 1000
 	db := bigTableAV(t, n)
-	full, err := db.Execute("SELECT count(*) FROM t", nil)
+	full, err := queryOutcome(db, "SELECT count(*) FROM t", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := db.Execute("SELECT count(*) FROM t WHERE id IN (1, 2, 3, 4, 5)", nil)
+	out, err := queryOutcome(db, "SELECT count(*) FROM t WHERE id IN (1, 2, 3, 4, 5)", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +146,7 @@ func TestOrInPointSetMutation(t *testing.T) {
 	const n = 1000
 	db := bigTableAV(t, n)
 
-	d, err := db.Execute("DELETE FROM t WHERE id IN (100, 300, 500)", nil)
+	d, err := queryOutcome(db, "DELETE FROM t WHERE id IN (100, 300, 500)", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +160,7 @@ func TestOrInPointSetMutation(t *testing.T) {
 		t.Errorf("neighbouring rows must survive the point-set delete, got %v", got)
 	}
 
-	u, err := db.Execute("UPDATE t SET a = -1 WHERE id = 200 OR id = 400", nil)
+	u, err := queryOutcome(db, "UPDATE t SET a = -1 WHERE id = 200 OR id = 400", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,7 +192,7 @@ func TestOrInPointSetExplain(t *testing.T) {
 		{"EXPLAIN UPDATE t SET a = 0 WHERE id = 2 OR id = 3", "PK point set: id in (2, 3)"},
 	}
 	for _, c := range cases {
-		out, err := db.Execute(c.sql, nil)
+		out, err := queryOutcome(db, c.sql, nil)
 		if err != nil {
 			t.Fatalf("%q: %v", c.sql, err)
 		}

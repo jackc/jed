@@ -3,9 +3,9 @@ package jed
 // cursor is the pull source a Rows cursor drives (spec/design/streaming.md §4).
 //
 // Four shapes, chosen by the plan (streaming.md §4/§7):
-//   - bufCursor — a fully materialized result, walked one row at a time. The executor ran the query
-//     to completion (the Execute path the conformance corpus drives, byte-unchanged); cost is final.
-//     The Query fallback for the shapes no lazy cursor covers yet (a data-modifying WITH).
+//   - bufCursor — a fully materialized result, walked one row at a time. The executor ran the
+//     statement to completion (the materialized drive); cost is final. The QueryValues fallback for the
+//     shapes no lazy cursor covers yet (a write, a data-modifying WITH).
 //   - streamingCursor (S3, executor.go) — a lazy pull pipeline for the single-table no-blocking-op
 //     scan: scan → resolve → WHERE → project, ONE row per nextRow over a pinned snapshot, accruing
 //     cost as it is pulled (streaming.md §6). Peak memory is one row; a caller that stops early faults

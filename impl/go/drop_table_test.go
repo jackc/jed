@@ -16,7 +16,7 @@ func TestDropRemovesTableAndRows(t *testing.T) {
 	mustCreate(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i16)")
 	mustCreate(t, db, "INSERT INTO t VALUES (1, 10), (2, 20)")
 	out := mustCreate(t, db, "DROP TABLE t")
-	if out.Kind != OutcomeStatement || out.Cost != 0 {
+	if out.Kind != outcomeStatement || out.Cost != 0 {
 		t.Fatalf("DROP TABLE outcome = %+v, want statement cost 0", out)
 	}
 	if _, ok := db.Table("t"); ok {

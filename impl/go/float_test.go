@@ -162,7 +162,7 @@ func TestFloatMixedWidthArithmeticPromotes(t *testing.T) {
 		"CREATE TABLE f (id i32 PRIMARY KEY, a f32, b f64)",
 		"INSERT INTO f VALUES (1, '1.5', '2.25')",
 	)
-	out, err := db.Execute("SELECT a + b FROM f", nil)
+	out, err := queryOutcome(db, "SELECT a + b FROM f", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

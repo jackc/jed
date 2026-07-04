@@ -10,7 +10,7 @@ import "testing"
 
 func scriptCount(t *testing.T, db dbHandle) int64 {
 	t.Helper()
-	out, err := db.Execute("SELECT count(*) FROM t", nil)
+	out, err := queryOutcome(db, "SELECT count(*) FROM t", nil)
 	if err != nil {
 		t.Fatalf("count: %v", err)
 	}
@@ -162,7 +162,7 @@ func TestAdditionalSessionRunsAScriptOverTheSharedCore(t *testing.T) {
 	// core and commits the run all-or-nothing — another session sees it.
 	db := memDB()
 	a := db.Session(SessionOptions{})
-	if _, err := a.Execute("CREATE TABLE t (id i32 PRIMARY KEY)", nil); err != nil {
+	if _, err := queryOutcome(a, "CREATE TABLE t (id i32 PRIMARY KEY)", nil); err != nil {
 		t.Fatal(err)
 	}
 	s := db.Session(SessionOptions{})
@@ -173,7 +173,7 @@ func TestAdditionalSessionRunsAScriptOverTheSharedCore(t *testing.T) {
 	if summary.StatementsRun != 2 {
 		t.Fatalf("StatementsRun: want 2, got %d", summary.StatementsRun)
 	}
-	out, err := a.Execute("SELECT count(*) FROM t", nil)
+	out, err := queryOutcome(a, "SELECT count(*) FROM t", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
