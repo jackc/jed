@@ -11,7 +11,7 @@ use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 const PAGE_SIZE: u32 = 256;
 
 fn query_rows(db: &mut Session, sql: &str) -> Vec<Vec<jed::Value>> {
-    match db.execute(sql, &[]).unwrap() {
+    match db.query_outcome(sql, &[]).unwrap() {
         Outcome::Query { rows, .. } => rows,
         _ => panic!("expected a query result"),
     }
@@ -29,13 +29,13 @@ fn seed_persisted_window(path: &std::path::Path) -> Session {
         })
         .unwrap()
         .session(SessionOptions::default());
-        db.execute(
+        db.query_outcome(
             "CREATE TABLE t (id i32 PRIMARY KEY, grp i32, amount i32)",
             &[],
         )
         .unwrap();
         for i in 1..=40 {
-            db.execute(
+            db.query_outcome(
                 &format!("INSERT INTO t VALUES ({i}, {}, {})", i % 3, i * 10),
                 &[],
             )

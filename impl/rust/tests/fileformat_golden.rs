@@ -36,7 +36,7 @@ fn load_unicode() {
 }
 
 fn run(db: &mut Session, sql: &str) {
-    db.execute(sql, &[])
+    db.query_outcome(sql, &[])
         .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message));
 }
 
@@ -1514,7 +1514,7 @@ fn rowid_counter_survives_serialize_and_load() {
         .session(SessionOptions::default());
     // The next insert must get rowid 3, not 0 — otherwise it collides (23505).
     loaded
-        .execute("INSERT INTO r VALUES (10, 100)", &[])
+        .query_outcome("INSERT INTO r VALUES (10, 100)", &[])
         .expect("insert after load");
     assert_eq!(loaded.rows_in_key_order("r").unwrap().len(), 4);
 }

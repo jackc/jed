@@ -12,7 +12,7 @@ fn big_table(n: i64) -> Session {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
+    db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
         .unwrap();
     let mut sql = String::from("INSERT INTO t VALUES ");
     for i in 1..=n {
@@ -21,19 +21,19 @@ fn big_table(n: i64) -> Session {
         }
         sql.push_str(&format!("({i},{i})"));
     }
-    db.execute(&sql, &[]).unwrap();
+    db.query_outcome(&sql, &[]).unwrap();
     db
 }
 
 fn cost(db: &mut Session, sql: &str) -> i64 {
-    match db.execute(sql, &[]).unwrap() {
+    match db.query_outcome(sql, &[]).unwrap() {
         Outcome::Query { cost, .. } => cost,
         Outcome::Statement { cost, .. } => cost,
     }
 }
 
 fn ids(db: &mut Session, sql: &str) -> Vec<i64> {
-    match db.execute(sql, &[]).unwrap() {
+    match db.query_outcome(sql, &[]).unwrap() {
         Outcome::Query { rows, .. } => rows
             .into_iter()
             .map(|r| match r[0] {
@@ -111,13 +111,14 @@ fn limit_short_circuit_is_sublinear() {
     let mut dz = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    dz.execute("CREATE TABLE z (id i32 PRIMARY KEY, c i32)", &[])
+    dz.query_outcome("CREATE TABLE z (id i32 PRIMARY KEY, c i32)", &[])
         .unwrap();
-    dz.execute("INSERT INTO z VALUES (1, 5), (2, 0), (3, 5)", &[])
+    dz.query_outcome("INSERT INTO z VALUES (1, 5), (2, 0), (3, 5)", &[])
         .unwrap();
     assert_eq!(ids(&mut dz, "SELECT 100 / c FROM z LIMIT 1"), vec![20]);
     assert!(
-        dz.execute("SELECT 100 / c FROM z LIMIT 2", &[]).is_err(),
+        dz.query_outcome("SELECT 100 / c FROM z LIMIT 2", &[])
+            .is_err(),
         "LIMIT 2 reaches the c=0 row and must trap"
     );
 }

@@ -85,8 +85,8 @@ pub use decimal::Decimal;
 pub use ergonomic::{FromValue, Params, Row, ToValue};
 pub use error::{EngineError, Result, SqlState};
 pub use executor::{
-    CollationInfo, DEFAULT_MAX_SQL_LENGTH, DEFAULT_PAGE_SIZE, Outcome, ScriptSummary,
-    SessionOptions, TxStatus,
+    CollationInfo, DEFAULT_MAX_SQL_LENGTH, DEFAULT_PAGE_SIZE, ScriptSummary, SessionOptions,
+    TxStatus,
 };
 // The low-level single-threaded `Engine` is a purely INTERNAL concern — not the public embedding
 // API and not reachable by any external crate. The converged §2.4 handles ([`Database`] /
@@ -94,6 +94,10 @@ pub use executor::{
 // conformance bin, the Ruby/WASM wraps) drives those. This crate-private re-export keeps `crate::
 // Engine` resolvable for the engine's own modules + doc links; nothing outside the crate can name it.
 pub(crate) use executor::Engine;
+// `Outcome` is the engine's INTERNAL materialized statement result (the pre-total-`query` shape). The
+// public seam is `query -> Rows`; `Outcome` stays crate-visible for the executor's own dispatch + the
+// white-box test drain helper (`query_outcome`), never nameable outside the crate.
+pub(crate) use executor::Outcome;
 pub use file::{CreateOptions, OpenOptions};
 pub use privileges::{Privilege, PrivilegeSet, Privileges};
 pub use seam::{ClockSource, RandomSource, advancing_clock, fixed_clock, seeded_random_source};

@@ -13,15 +13,16 @@ fn db() -> Session {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
+    db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
         .unwrap();
-    db.execute("INSERT INTO t VALUES (1, 1)", &[]).unwrap();
+    db.query_outcome("INSERT INTO t VALUES (1, 1)", &[])
+        .unwrap();
     db
 }
 
 /// The SQLSTATE of running `sql`, or `"ok"` if it succeeded.
 fn code(db: &mut Session, sql: &str) -> String {
-    match db.execute(sql, &[]) {
+    match db.query_outcome(sql, &[]) {
         Ok(_) => "ok".to_string(),
         Err(e) => e.code().to_string(),
     }

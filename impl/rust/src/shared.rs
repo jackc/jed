@@ -1046,9 +1046,8 @@ impl Session {
     /// Run a (possibly mutating) statement on this session, binding `$N` params (spec/design/api.md
     /// §5). Routes by the session's state (read-only / open block / autocommit) with the lazy-gate
     /// lifecycle (§2.4).
-    pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<Outcome> {
-        let ast = self.engine.parse(sql)?;
-        self.dispatch(ast, params)
+    pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<u64> {
+        crate::api::drain_affected(self.query(sql, params)?)
     }
 
     /// Run a **query** on this session, returning a row cursor. A single-table no-blocking-operator
@@ -1157,7 +1156,7 @@ impl Session {
         sql: &str,
         params: &[Value],
         cancel: &CancellationToken,
-    ) -> Result<Outcome> {
+    ) -> Result<u64> {
         self.armed(cancel, |s| s.execute(sql, params))
     }
 
@@ -1716,12 +1715,8 @@ impl Session {
     }
     /// Run a [`PreparedStatement`] on this session, binding `$N` params — the prepared analogue of
     /// [`execute`](Session::execute), dispatched through the session's lazy-gate lifecycle (§2.4).
-    pub fn execute_prepared(
-        &mut self,
-        stmt: &PreparedStatement,
-        params: &[Value],
-    ) -> Result<Outcome> {
-        self.dispatch(stmt.ast().clone(), params)
+    pub fn execute_prepared(&mut self, stmt: &PreparedStatement, params: &[Value]) -> Result<u64> {
+        crate::api::drain_affected(self.query_prepared(stmt, params)?)
     }
     /// Run a prepared **query** on this session, returning a row cursor. The prepared AST routes
     /// through the same lazy lanes as the ad-hoc [`query`](Session::query) (spec/design/streaming.md
@@ -1750,8 +1745,9 @@ impl Database {
     // [`session`](Database::session) / [`read_session`](Database::read_session) /
     // [`write_session`](Database::write_session). ---
 
-    /// Run a (possibly mutating) statement, binding `$N` params, on a fresh autocommit session.
-    pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<Outcome> {
+    /// Run a (possibly mutating) statement, binding `$N` params, on a fresh autocommit session,
+    /// returning the affected-row count (exec-side sugar over the total `query` seam).
+    pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<u64> {
         self.session(SessionOptions::default()).execute(sql, params)
     }
 
@@ -1767,7 +1763,7 @@ impl Database {
         sql: &str,
         params: &[Value],
         cancel: &CancellationToken,
-    ) -> Result<Outcome> {
+    ) -> Result<u64> {
         self.session(SessionOptions::default())
             .execute_cancelable(sql, params, cancel)
     }
@@ -1816,11 +1812,7 @@ impl Database {
 
     /// Run a [`PreparedStatement`] on a fresh autocommit session, binding `$N` params (the prepared
     /// analogue of [`execute`](Database::execute)).
-    pub fn execute_prepared(
-        &mut self,
-        stmt: &PreparedStatement,
-        params: &[Value],
-    ) -> Result<Outcome> {
+    pub fn execute_prepared(&mut self, stmt: &PreparedStatement, params: &[Value]) -> Result<u64> {
         self.session(SessionOptions::default())
             .execute_prepared(stmt, params)
     }
@@ -1859,10 +1851,10 @@ mod cancel_internal_tests {
     #[test]
     fn cancel_mid_scan_aborts_via_meter() {
         let mut db = Database::create(CreateOptions::default()).unwrap();
-        db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
+        db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
             .unwrap();
         for i in 1..=20 {
-            db.execute(&format!("INSERT INTO t VALUES ({i})"), &[])
+            db.query_outcome(&format!("INSERT INTO t VALUES ({i})"), &[])
                 .unwrap();
         }
 
@@ -1902,7 +1894,7 @@ mod temp_reclaim_internal_tests {
     use crate::file::DatabaseOptions;
 
     fn rows(sess: &mut Session, sql: &str) -> Vec<Vec<Value>> {
-        match sess.execute(sql, &[]).unwrap() {
+        match sess.query_outcome(sql, &[]).unwrap() {
             Outcome::Query { rows, .. } => rows,
             other => panic!("expected a query, got {other:?}"),
         }
@@ -1928,11 +1920,11 @@ mod temp_reclaim_internal_tests {
         .unwrap();
         db.0.storage.lock().unwrap().reclaim_within_session = reclaim;
         let mut sess = db.session(SessionOptions::default());
-        sess.execute("CREATE TABLE t (id i32 PRIMARY KEY, pad text)", &[])
+        sess.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY, pad text)", &[])
             .unwrap();
         let base = "x".repeat(40);
         for i in 1..=30 {
-            sess.execute(
+            sess.query_outcome(
                 &format!("INSERT INTO t VALUES ({i}, 'r{i:02}-{base}')"),
                 &[],
             )
@@ -1940,7 +1932,7 @@ mod temp_reclaim_internal_tests {
         }
         let pad = "y".repeat(40);
         for k in 0..rounds {
-            sess.execute(
+            sess.query_outcome(
                 &format!("UPDATE t SET pad = 'a{k}-{pad}' WHERE id = 15"),
                 &[],
             )
@@ -1992,11 +1984,11 @@ mod temp_reclaim_internal_tests {
         .unwrap();
         db.0.storage.lock().unwrap().reclaim_within_session = true;
         let mut sess = db.session(SessionOptions::default());
-        sess.execute("CREATE TABLE t (id i32 PRIMARY KEY, pad text)", &[])
+        sess.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY, pad text)", &[])
             .unwrap();
         let base = "x".repeat(40);
         for i in 1..=30 {
-            sess.execute(
+            sess.query_outcome(
                 &format!("INSERT INTO t VALUES ({i}, 'r{i:02}-{base}')"),
                 &[],
             )
@@ -2008,7 +2000,7 @@ mod temp_reclaim_internal_tests {
         // observe, so it defers and the high-water leaks while the reader is open.
         let reader = db.read_session();
         for k in 0..200 {
-            sess.execute(
+            sess.query_outcome(
                 &format!("UPDATE t SET pad = 'p{k}-{pad}' WHERE id = 15"),
                 &[],
             )
@@ -2025,7 +2017,7 @@ mod temp_reclaim_internal_tests {
         // extends before its own compaction reclaims), not by another ~200.
         drop(reader);
         for k in 200..400 {
-            sess.execute(
+            sess.query_outcome(
                 &format!("UPDATE t SET pad = 'q{k}-{pad}' WHERE id = 15"),
                 &[],
             )
@@ -2046,12 +2038,12 @@ mod temp_reclaim_internal_tests {
         })
         .unwrap();
         let mut sess = db.session(SessionOptions::default());
-        sess.execute("CREATE TEMP TABLE lt (id i32 PRIMARY KEY, pad text)", &[])
+        sess.query_outcome("CREATE TEMP TABLE lt (id i32 PRIMARY KEY, pad text)", &[])
             .unwrap();
         let base = "x".repeat(40);
         for i in 1..=60 {
             // 60 rows at page 256 → a multi-level tree with demoted leaves.
-            sess.execute(
+            sess.query_outcome(
                 &format!("INSERT INTO lt VALUES ({i}, 'r{i:02}-{base}')"),
                 &[],
             )
@@ -2071,7 +2063,7 @@ mod temp_reclaim_internal_tests {
         // Churn one row 400×; the high-water plateaus (compaction), it does not grow ~linearly.
         let pad = "y".repeat(40);
         for k in 0..400 {
-            sess.execute(
+            sess.query_outcome(
                 &format!("UPDATE lt SET pad = 'u{k}-{pad}' WHERE id = 30"),
                 &[],
             )
@@ -2101,12 +2093,12 @@ mod temp_reclaim_internal_tests {
         let mut opts = SessionOptions::default();
         opts.temp_buffers = 20 * 256;
         let mut sess = db.session(opts);
-        sess.execute("CREATE TEMP TABLE lt (id i32 PRIMARY KEY, pad text)", &[])
+        sess.query_outcome("CREATE TEMP TABLE lt (id i32 PRIMARY KEY, pad text)", &[])
             .unwrap();
         let pad = "z".repeat(40);
         let mut aborted = false;
         for i in 1..=400 {
-            match sess.execute(&format!("INSERT INTO lt VALUES ({i}, 'r-{pad}')"), &[]) {
+            match sess.query_outcome(&format!("INSERT INTO lt VALUES ({i}, 'r-{pad}')"), &[]) {
                 Ok(_) => {}
                 Err(e) => {
                     assert_eq!(

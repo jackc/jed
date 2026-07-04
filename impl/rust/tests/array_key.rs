@@ -12,7 +12,7 @@
 use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn rows(db: &mut Session, sql: &str) -> Vec<String> {
-    match db.execute(sql, &[]).unwrap() {
+    match db.query_outcome(sql, &[]).unwrap() {
         Outcome::Query { rows, .. } => rows
             .iter()
             .map(|r| r.iter().map(|v| v.render()).collect::<Vec<_>>().join("|"))
@@ -22,7 +22,7 @@ fn rows(db: &mut Session, sql: &str) -> Vec<String> {
 }
 
 fn err(db: &mut Session, sql: &str) -> String {
-    match db.execute(sql, &[]) {
+    match db.query_outcome(sql, &[]) {
         Err(e) => e.code().to_string(),
         Ok(o) => panic!("expected error for {sql}, got {o:?}"),
     }
@@ -35,7 +35,7 @@ fn multidim_and_lower_bound_key_order() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    db.execute("CREATE TABLE m (k i32[] PRIMARY KEY)", &[])
+    db.query_outcome("CREATE TABLE m (k i32[] PRIMARY KEY)", &[])
         .unwrap();
     // Same flattened elements / count but different shape, plus a custom lower bound. jed's array key
     // reproduces array_cmp: equal element prefix → fewer elements → smaller ndim → smaller lower
@@ -43,7 +43,7 @@ fn multidim_and_lower_bound_key_order() {
     // (2-D, count 4). PostgreSQL's ORDER BY would put the 2-D value FIRST among the count-4 pair (the
     // abbreviated-key artifact jed avoids), so this order is jed-defined, not oracle-checked.
     for v in ["{1,2,3,4}", "{{1,2},{3,4}}", "{1,2,3}", "[2:4]={1,2,3}"] {
-        db.execute(&format!("INSERT INTO m VALUES ('{v}')"), &[])
+        db.query_outcome(&format!("INSERT INTO m VALUES ('{v}')"), &[])
             .unwrap();
     }
     assert_eq!(
@@ -67,12 +67,12 @@ fn float_element_array_key_is_keyable() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    db.execute("CREATE TABLE m (k f64[] PRIMARY KEY)", &[])
+    db.query_outcome("CREATE TABLE m (k f64[] PRIMARY KEY)", &[])
         .unwrap();
     // The '{…}' array literal coerces each element through f64 input, so the specials (NaN/Infinity)
     // arrive without an INSERT ... SELECT (which is 0A000 into an array column this slice).
     for v in ["{1.5,2.5}", "{1.5}", "{-Infinity}", "{NaN}", "{1.5,2.0}"] {
-        db.execute(&format!("INSERT INTO m VALUES ('{v}')"), &[])
+        db.query_outcome(&format!("INSERT INTO m VALUES ('{v}')"), &[])
             .unwrap();
     }
     assert_eq!(
@@ -95,7 +95,7 @@ fn float_element_array_multidim_key_order() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    db.execute("CREATE TABLE m (k f64[] PRIMARY KEY)", &[])
+    db.query_outcome("CREATE TABLE m (k f64[] PRIMARY KEY)", &[])
         .unwrap();
     for v in [
         "{1.5,2.5,3.5,4.5}",
@@ -103,7 +103,7 @@ fn float_element_array_multidim_key_order() {
         "{1.5,2.5,3.5}",
         "[2:4]={1.5,2.5,3.5}",
     ] {
-        db.execute(&format!("INSERT INTO m VALUES ('{v}')"), &[])
+        db.query_outcome(&format!("INSERT INTO m VALUES ('{v}')"), &[])
             .unwrap();
     }
     assert_eq!(
@@ -123,16 +123,16 @@ fn composite_element_array_keys_are_rejected() {
         .unwrap()
         .session(SessionOptions::default());
     // A composite-element array key is 0A000 (composite is not yet keyable — composite.md §6).
-    db.execute("CREATE TYPE addr AS (street text, zip i32)", &[])
+    db.query_outcome("CREATE TYPE addr AS (street text, zip i32)", &[])
         .unwrap();
     assert_eq!(
         err(&mut db, "CREATE TABLE bad2 (k addr[] PRIMARY KEY)"),
         "0A000"
     );
     // float-element arrays, by contrast, ARE accepted everywhere a key is taken.
-    db.execute("CREATE TABLE ok (id i32 PRIMARY KEY, k f32[] UNIQUE)", &[])
+    db.query_outcome("CREATE TABLE ok (id i32 PRIMARY KEY, k f32[] UNIQUE)", &[])
         .unwrap();
-    db.execute("CREATE TABLE ok2 (id i32 PRIMARY KEY, k f64[])", &[])
+    db.query_outcome("CREATE TABLE ok2 (id i32 PRIMARY KEY, k f64[])", &[])
         .unwrap();
-    db.execute("CREATE INDEX ix ON ok2 (k)", &[]).unwrap();
+    db.query_outcome("CREATE INDEX ix ON ok2 (k)", &[]).unwrap();
 }

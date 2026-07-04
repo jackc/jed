@@ -15,7 +15,7 @@ fn db_with(stmts: &[&str]) -> Session {
         .unwrap()
         .session(SessionOptions::default());
     for s in stmts {
-        db.execute(s, &[])
+        db.query_outcome(s, &[])
             .unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
@@ -23,7 +23,7 @@ fn db_with(stmts: &[&str]) -> Session {
 
 fn query(db: &mut Session, sql: &str) -> Vec<Vec<Value>> {
     match db
-        .execute(sql, &[])
+        .query_outcome(sql, &[])
         .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
     {
         Outcome::Query { rows, .. } => rows,
@@ -32,13 +32,13 @@ fn query(db: &mut Session, sql: &str) -> Vec<Vec<Value>> {
 }
 
 fn cost(db: &mut Session, sql: &str) -> i64 {
-    db.execute(sql, &[])
+    db.query_outcome(sql, &[])
         .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
         .cost()
 }
 
 fn err_code(db: &mut Session, sql: &str) -> String {
-    db.execute(sql, &[])
+    db.query_outcome(sql, &[])
         .err()
         .unwrap_or_else(|| panic!("{sql:?}: expected an error"))
         .code()
@@ -52,7 +52,7 @@ fn literal_select_returns_one_row_costing_one_row_produced() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    let out = db.execute("SELECT 1", &[]).unwrap();
+    let out = db.query_outcome("SELECT 1", &[]).unwrap();
     match &out {
         Outcome::Query {
             column_names, rows, ..
@@ -180,7 +180,7 @@ fn subqueries_uncorrelated_and_correlated() {
 #[test]
 fn insert_select_source() {
     let mut db = db_with(&["CREATE TABLE t (id i32 PRIMARY KEY)"]);
-    let out = db.execute("INSERT INTO t SELECT 3", &[]).unwrap();
+    let out = db.query_outcome("INSERT INTO t SELECT 3", &[]).unwrap();
     assert_eq!(out.cost(), 1); // exactly the embedded SELECT's cost
     assert_eq!(
         query(&mut db, "SELECT id FROM t"),
@@ -195,7 +195,7 @@ fn star_with_no_tables_is_42601_with_pg_message() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    let err = db.execute("SELECT *", &[]).unwrap_err();
+    let err = db.query_outcome("SELECT *", &[]).unwrap_err();
     assert_eq!(err.code(), "42601");
     assert_eq!(
         err.message,
@@ -223,10 +223,10 @@ fn untyped_param_is_42p18_and_a_sibling_operand_types_it() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    let err = db.execute("SELECT $1", &[Value::Int(7)]).unwrap_err();
+    let err = db.query_outcome("SELECT $1", &[Value::Int(7)]).unwrap_err();
     assert_eq!(err.code(), "42P18");
     // The sibling-operand rule (grammar.md §5) works without a FROM.
-    let out = db.execute("SELECT $1 + 1", &[Value::Int(7)]).unwrap();
+    let out = db.query_outcome("SELECT $1 + 1", &[Value::Int(7)]).unwrap();
     match out {
         Outcome::Query { rows, .. } => assert_eq!(rows, vec![vec![Value::Int(8)]]),
         other => panic!("expected a query result, got {other:?}"),

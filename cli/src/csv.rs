@@ -310,9 +310,9 @@ mod tests {
             import_statement(table, &records).unwrap().unwrap()
         };
         db.execute(&sql, &[]).unwrap();
-        match db.execute("SELECT count(*) FROM t", &[]).unwrap() {
-            jed::Outcome::Query { rows, .. } => assert_eq!(rows[0][0], jed::Value::Int(2)),
-            _ => panic!("expected a query"),
-        }
+        // Drain the total `query` seam (a statement is a no-column cursor; a SELECT carries rows).
+        let counted: Vec<Vec<jed::Value>> =
+            db.query("SELECT count(*) FROM t", &[]).unwrap().collect();
+        assert_eq!(counted[0][0], jed::Value::Int(2));
     }
 }

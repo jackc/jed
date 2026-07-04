@@ -8,7 +8,7 @@ fn db_with(stmts: &[&str]) -> Session {
         .unwrap()
         .session(SessionOptions::default());
     for s in stmts {
-        db.execute(s, &[])
+        db.query_outcome(s, &[])
             .unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
@@ -30,7 +30,9 @@ fn delete_from_missing_table_traps() {
         .unwrap()
         .session(SessionOptions::default());
     assert_eq!(
-        db.execute("DELETE FROM nope", &[]).unwrap_err().code(),
+        db.query_outcome("DELETE FROM nope", &[])
+            .unwrap_err()
+            .code(),
         "42P01"
     );
 }
@@ -39,7 +41,7 @@ fn delete_from_missing_table_traps() {
 fn delete_unknown_column_traps() {
     let mut db = setup();
     assert_eq!(
-        db.execute("DELETE FROM t WHERE nope = 1", &[])
+        db.query_outcome("DELETE FROM t WHERE nope = 1", &[])
             .unwrap_err()
             .code(),
         "42703"

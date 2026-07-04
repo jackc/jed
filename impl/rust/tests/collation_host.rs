@@ -31,7 +31,7 @@ fn load_unicode() {
 
 fn query(db: &mut Session, sql: &str) -> Vec<Vec<Value>> {
     match db
-        .execute(sql, &[])
+        .query_outcome(sql, &[])
         .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
     {
         Outcome::Query { rows, .. } => rows,
@@ -115,7 +115,7 @@ fn unknown_collation_is_42704() {
         .unwrap()
         .session(SessionOptions::default());
     assert_eq!(
-        db.execute("SELECT 'x' COLLATE \"no-such-collation\"", &[])
+        db.query_outcome("SELECT 'x' COLLATE \"no-such-collation\"", &[])
             .unwrap_err()
             .code(),
         "42704"
@@ -131,12 +131,12 @@ fn per_column_collation_orders_implicitly_and_is_referenced() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    db.execute(
+    db.query_outcome(
         "CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE \"unicode\")",
         &[],
     )
     .unwrap();
-    db.execute("INSERT INTO t VALUES (1,'z'),(2,'ä'),(3,'a')", &[])
+    db.query_outcome("INSERT INTO t VALUES (1,'z'),(2,'ä'),(3,'a')", &[])
         .unwrap();
     assert_eq!(
         texts(query(&mut db, "SELECT name FROM t ORDER BY name")),
@@ -164,19 +164,23 @@ fn implicit_conflict_is_42p22() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    db.execute(
+    db.query_outcome(
         "CREATE TABLE t (a text COLLATE \"unicode\", b text COLLATE \"es\", c text COLLATE \"C\")",
         &[],
     )
     .unwrap();
-    db.execute("INSERT INTO t VALUES ('a','z','b')", &[])
+    db.query_outcome("INSERT INTO t VALUES ('a','z','b')", &[])
         .unwrap();
     assert_eq!(
-        db.execute("SELECT a < b FROM t", &[]).unwrap_err().code(),
+        db.query_outcome("SELECT a < b FROM t", &[])
+            .unwrap_err()
+            .code(),
         "42P22"
     );
     assert_eq!(
-        db.execute("SELECT a < c FROM t", &[]).unwrap_err().code(),
+        db.query_outcome("SELECT a < c FROM t", &[])
+            .unwrap_err()
+            .code(),
         "42P22"
     );
     // An explicit COLLATE on one side breaks the tie (no error): a='a' < (b='z') = true.
@@ -196,13 +200,13 @@ fn non_text_collate_is_42804_unknown_name_42704() {
         .unwrap()
         .session(SessionOptions::default());
     assert_eq!(
-        db.execute("CREATE TABLE t (a i32 COLLATE \"unicode\")", &[])
+        db.query_outcome("CREATE TABLE t (a i32 COLLATE \"unicode\")", &[])
             .unwrap_err()
             .code(),
         "42804"
     );
     assert_eq!(
-        db.execute("CREATE TABLE t (a text COLLATE \"nope\")", &[])
+        db.query_outcome("CREATE TABLE t (a text COLLATE \"nope\")", &[])
             .unwrap_err()
             .code(),
         "42704"
@@ -220,13 +224,13 @@ fn default_collation_inherited_by_unannotated_column() {
         .unwrap()
         .session(SessionOptions::default());
     assert_eq!(db.default_collation(), "C");
-    db.execute("CREATE TABLE before (id i32 PRIMARY KEY, name text)", &[])
+    db.query_outcome("CREATE TABLE before (id i32 PRIMARY KEY, name text)", &[])
         .unwrap();
     db.set_default_collation("unicode").unwrap();
     assert_eq!(db.default_collation(), "unicode");
-    db.execute("CREATE TABLE after (id i32 PRIMARY KEY, name text)", &[])
+    db.query_outcome("CREATE TABLE after (id i32 PRIMARY KEY, name text)", &[])
         .unwrap();
-    db.execute("INSERT INTO after VALUES (1,'z'),(2,'ä'),(3,'a')", &[])
+    db.query_outcome("INSERT INTO after VALUES (1,'z'),(2,'ä'),(3,'a')", &[])
         .unwrap();
     // `after.name` inherited unicode → ä sorts next to a even with no COLLATE clause.
     assert_eq!(
@@ -234,7 +238,7 @@ fn default_collation_inherited_by_unannotated_column() {
         vec!["a", "ä", "z"]
     );
     // `before.name` was frozen at C → byte order.
-    db.execute("INSERT INTO before VALUES (1,'z'),(2,'ä'),(3,'a')", &[])
+    db.query_outcome("INSERT INTO before VALUES (1,'z'),(2,'ä'),(3,'a')", &[])
         .unwrap();
     assert_eq!(
         texts(query(&mut db, "SELECT name FROM before ORDER BY name")),
@@ -270,20 +274,20 @@ fn collated_primary_key_is_stored_in_collation_order() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    db.execute(
+    db.query_outcome(
         "CREATE TABLE t (name text COLLATE \"unicode\" PRIMARY KEY)",
         &[],
     )
     .unwrap();
-    db.execute("INSERT INTO t VALUES ('Z'),('a'),('b'),('A')", &[])
+    db.query_outcome("INSERT INTO t VALUES ('Z'),('a'),('b'),('A')", &[])
         .unwrap();
     assert_eq!(
         texts(query(&mut db, "SELECT name FROM t")),
         vec!["a", "A", "b", "Z"]
     );
-    db.execute("CREATE TABLE c (name text PRIMARY KEY)", &[])
+    db.query_outcome("CREATE TABLE c (name text PRIMARY KEY)", &[])
         .unwrap();
-    db.execute("INSERT INTO c VALUES ('Z'),('a'),('b'),('A')", &[])
+    db.query_outcome("INSERT INTO c VALUES ('Z'),('a'),('b'),('A')", &[])
         .unwrap();
     assert_eq!(
         texts(query(&mut db, "SELECT name FROM c")),
@@ -299,15 +303,15 @@ fn collated_unique_dedups_by_byte_identity() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    db.execute(
+    db.query_outcome(
         "CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE \"unicode\" UNIQUE)",
         &[],
     )
     .unwrap();
-    db.execute("INSERT INTO t VALUES (1,'a'),(2,'A'),(3,'b')", &[])
+    db.query_outcome("INSERT INTO t VALUES (1,'a'),(2,'A'),(3,'b')", &[])
         .unwrap();
     assert_eq!(
-        db.execute("INSERT INTO t VALUES (4,'a')", &[])
+        db.query_outcome("INSERT INTO t VALUES (4,'a')", &[])
             .unwrap_err()
             .code(),
         "23505"
@@ -335,12 +339,12 @@ fn reference_only_file_round_trip() {
     .unwrap()
     .session(SessionOptions::default());
     db.set_default_collation("unicode").unwrap(); // loaded — no import
-    db.execute(
+    db.query_outcome(
         "CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE \"unicode\", plain text)",
         &[],
     )
     .unwrap();
-    db.execute(
+    db.query_outcome(
         "INSERT INTO t VALUES (1,'z','z'),(2,'ä','ä'),(3,'a','a')",
         &[],
     )

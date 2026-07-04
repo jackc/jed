@@ -15,14 +15,14 @@ fn db_with(stmts: &[&str]) -> Session {
         .unwrap()
         .session(SessionOptions::default());
     for s in stmts {
-        db.execute(s, &[])
+        db.query_outcome(s, &[])
             .unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
 }
 
 fn cost(db: &mut Session, sql: &str) -> i64 {
-    db.execute(sql, &[])
+    db.query_outcome(sql, &[])
         .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
         .cost()
 }
@@ -38,7 +38,7 @@ fn ab() -> Session {
 
 fn query(db: &mut Session, sql: &str) -> Vec<Vec<Value>> {
     match db
-        .execute(sql, &[])
+        .query_outcome(sql, &[])
         .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
     {
         Outcome::Query { rows, .. } => rows,
@@ -90,7 +90,7 @@ fn correlated_inner_error_raised_over_empty_outer() {
         "INSERT INTO f VALUES (1, 1)",
     ]);
     assert_eq!(
-        db.execute("SELECT (SELECT id, v FROM f WHERE v = e.v) FROM e", &[])
+        db.query_outcome("SELECT (SELECT id, v FROM f WHERE v = e.v) FROM e", &[])
             .unwrap_err()
             .code(),
         "42601"
@@ -145,7 +145,7 @@ fn param_inside_subquery_inner_context() {
     let mut db = ab();
     let i = |v: i64| Value::Int(v);
     let run = |db: &mut Session, sql: &str, p: &[Value]| -> Vec<i64> {
-        match db.execute(sql, p).unwrap() {
+        match db.query_outcome(sql, p).unwrap() {
             Outcome::Query { rows, .. } => rows
                 .into_iter()
                 .map(|r| match r[0] {
@@ -192,7 +192,7 @@ fn param_inside_subquery_uninferable_is_42p18() {
     // with a value bound (the type, not the value, is what's missing). PG diverges (defaults text).
     let mut db = ab();
     assert_eq!(
-        db.execute(
+        db.query_outcome(
             "SELECT id FROM a WHERE k = (SELECT $1 FROM b LIMIT 1)",
             &[Value::Int(10)]
         )

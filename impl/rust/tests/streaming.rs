@@ -19,10 +19,10 @@ use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 fn seeded(n: i64) -> Database {
     let db = Database::create(CreateOptions::default()).unwrap();
     let mut w = db.write_session();
-    w.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
+    w.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
         .unwrap();
     for i in 1..=n {
-        w.execute(&format!("INSERT INTO t VALUES ({i}, {})", i * 10), &[])
+        w.query_outcome(&format!("INSERT INTO t VALUES ({i}, {})", i * 10), &[])
             .unwrap();
     }
     w.commit().unwrap();
@@ -32,7 +32,7 @@ fn seeded(n: i64) -> Database {
 /// The materialized (`execute()`) result: rows + total cost — the oracle the streaming cursor must
 /// match under full drain (§6).
 fn eager(sess: &mut Session, sql: &str) -> (Vec<Vec<Value>>, i64) {
-    match sess.execute(sql, &[]).unwrap() {
+    match sess.query_outcome(sql, &[]).unwrap() {
         Outcome::Query { rows, cost, .. } => (rows, cost),
         _ => panic!("expected a query"),
     }
@@ -146,7 +146,7 @@ fn streaming_cursor_pins_its_snapshot_and_watermark() {
     // A concurrent writer commits two more rows (version 2) while the cursor is open.
     {
         let mut w = db.write_session();
-        w.execute("INSERT INTO t VALUES (4, 40), (5, 50)", &[])
+        w.query_outcome("INSERT INTO t VALUES (4, 40), (5, 50)", &[])
             .unwrap();
         w.commit().unwrap();
     }
@@ -314,7 +314,7 @@ fn buffered_cursor_pins_its_snapshot_and_watermark() {
     // A concurrent writer commits two more rows (version 2) while the cursor is open.
     {
         let mut w = db.write_session();
-        w.execute("INSERT INTO t VALUES (4, 40), (5, 50)", &[])
+        w.query_outcome("INSERT INTO t VALUES (4, 40), (5, 50)", &[])
             .unwrap();
         w.commit().unwrap();
     }
@@ -453,11 +453,11 @@ fn sorted_spill_merge_streams_lazily() {
     .unwrap();
     {
         let mut w = db.write_session();
-        w.execute("CREATE TABLE t (id i32 PRIMARY KEY, k i32)", &[])
+        w.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY, k i32)", &[])
             .unwrap();
         for id in 0..200i64 {
             let k = (id * 48271) % 100; // scrambled key with many duplicates
-            w.execute(&format!("INSERT INTO t VALUES ({id}, {k})"), &[])
+            w.query_outcome(&format!("INSERT INTO t VALUES ({id}, {k})"), &[])
                 .unwrap();
         }
         w.commit().unwrap();
@@ -583,7 +583,7 @@ fn deferred_cursor_pins_its_snapshot_and_watermark() {
     // A concurrent writer commits more rows (version 2) while the cursor is open.
     {
         let mut w = db.write_session();
-        w.execute("INSERT INTO t VALUES (4, 40), (5, 50)", &[])
+        w.query_outcome("INSERT INTO t VALUES (4, 40), (5, 50)", &[])
             .unwrap();
         w.commit().unwrap();
     }
@@ -785,7 +785,7 @@ fn prepared_query_pins_its_snapshot_and_watermark() {
 
     {
         let mut w = db.write_session();
-        w.execute("INSERT INTO t VALUES (4, 40), (5, 50)", &[])
+        w.query_outcome("INSERT INTO t VALUES (4, 40), (5, 50)", &[])
             .unwrap();
         w.commit().unwrap();
     }

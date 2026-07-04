@@ -14,14 +14,14 @@ use jed::value::Value;
 use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn err_code(db: &mut Session, sql: &str) -> String {
-    match db.execute(sql, &[]) {
+    match db.query_outcome(sql, &[]) {
         Err(e) => e.code().to_string(),
         Ok(_) => panic!("expected error for {sql}"),
     }
 }
 
 fn one(db: &mut Session, sql: &str) -> Value {
-    match db.execute(sql, &[]).unwrap() {
+    match db.query_outcome(sql, &[]).unwrap() {
         Outcome::Query { rows, .. } => rows[0][0].clone(),
         other => panic!("expected query, got {other:?}"),
     }
@@ -47,9 +47,10 @@ fn non_i32_to_bool_is_forbidden() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, s i16, b i64)", &[])
+    db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY, s i16, b i64)", &[])
         .unwrap();
-    db.execute("INSERT INTO t VALUES (1, 5, 9)", &[]).unwrap();
+    db.query_outcome("INSERT INTO t VALUES (1, 5, 9)", &[])
+        .unwrap();
     assert_eq!(
         err_code(&mut db, "SELECT CAST(s AS boolean) FROM t WHERE id = 1"),
         "42804"

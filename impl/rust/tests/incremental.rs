@@ -30,7 +30,7 @@ fn slot_txid(bytes: &[u8], slot: usize) -> u64 {
 }
 
 fn ids(db: &mut Session) -> Vec<i64> {
-    match db.execute("SELECT id FROM t", &[]).unwrap() {
+    match db.query_outcome("SELECT id FROM t", &[]).unwrap() {
         Outcome::Query { rows, .. } => rows
             .iter()
             .map(|r| match &r[0] {
@@ -53,13 +53,13 @@ fn a_single_row_commit_appends_only_the_dirty_path() {
     })
     .unwrap()
     .session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, pad text)", &[])
+    db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY, pad text)", &[])
         .unwrap();
     // Enough rows for a multi-level tree at 256-byte pages (≈3 records/leaf). Each insert
     // autocommits, so the file already holds many leaked pages by the end of the loop.
     let pad = "x".repeat(48);
     for i in 1..=30 {
-        db.execute(
+        db.query_outcome(
             &format!("INSERT INTO t VALUES ({i}, 'row-{i:02}-{pad}')"),
             &[],
         )
@@ -79,7 +79,7 @@ fn a_single_row_commit_appends_only_the_dirty_path() {
     // high-water (spec/design/pager.md §7), so its physical size jumps by a geometric preallocation
     // step, not by the dirty-page count.
     let pc_before = db.page_count();
-    db.execute(&format!("INSERT INTO t VALUES (31, 'row-31-{pad}')"), &[])
+    db.query_outcome(&format!("INSERT INTO t VALUES (31, 'row-31-{pad}')"), &[])
         .unwrap();
     let appended = (db.page_count() - pc_before) as u64;
     assert!(
@@ -117,17 +117,17 @@ fn delete_heavy_history_reopens_correctly() {
     })
     .unwrap()
     .session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, pad text)", &[])
+    db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY, pad text)", &[])
         .unwrap();
     for i in 1..=30 {
-        db.execute(
+        db.query_outcome(
             &format!("INSERT INTO t VALUES ({i}, 'row-{i:02}-{pad}')"),
             &[],
         )
         .unwrap();
     }
     for i in 1..=20 {
-        db.execute(&format!("DELETE FROM t WHERE id = {i}"), &[])
+        db.query_outcome(&format!("DELETE FROM t WHERE id = {i}"), &[])
             .unwrap();
     }
     drop(db);
@@ -154,9 +154,9 @@ fn meta_slots_alternate_across_commits() {
     assert_eq!(slot_txid(&img, 0), 1);
     assert_eq!(slot_txid(&img, 1), 1);
 
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
+    db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
         .unwrap(); // txid 2 → slot 0
-    db.execute("INSERT INTO t VALUES (1)", &[]).unwrap(); // txid 3 → slot 1
+    db.query_outcome("INSERT INTO t VALUES (1)", &[]).unwrap(); // txid 3 → slot 1
     drop(db);
 
     // Each commit writes only the *alternate* slot, leaving the prior published meta intact.
@@ -180,10 +180,10 @@ fn torn_latest_commit_falls_back_to_prior_snapshot() {
     })
     .unwrap()
     .session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
+    db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
         .unwrap(); // txid 2 (slot 0)
-    db.execute("INSERT INTO t VALUES (1)", &[]).unwrap(); // txid 3 (slot 1)
-    db.execute("INSERT INTO t VALUES (2)", &[]).unwrap(); // txid 4 (slot 0) — the newest commit
+    db.query_outcome("INSERT INTO t VALUES (1)", &[]).unwrap(); // txid 3 (slot 1)
+    db.query_outcome("INSERT INTO t VALUES (2)", &[]).unwrap(); // txid 4 (slot 0) — the newest commit
     drop(db);
 
     // Simulate a torn write of the newest commit: corrupt slot 0's checksum (txid 4). The loader
@@ -219,10 +219,10 @@ fn small_database_file_stays_proportional() {
     })
     .unwrap()
     .session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
+    db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
         .unwrap();
     for i in 0..30 {
-        db.execute(&format!("INSERT INTO t VALUES ({i}, {i})"), &[])
+        db.query_outcome(&format!("INSERT INTO t VALUES ({i}, {i})"), &[])
             .unwrap();
     }
     let logical = db.page_count() as u64 * db.page_size() as u64;

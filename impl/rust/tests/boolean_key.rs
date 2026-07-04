@@ -8,14 +8,14 @@ use jed::value::Value;
 use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn err_code(db: &mut Session, sql: &str) -> String {
-    match db.execute(sql, &[]) {
+    match db.query_outcome(sql, &[]) {
         Err(e) => e.code().to_string(),
         Ok(_) => panic!("expected error for {sql}"),
     }
 }
 
 fn rows(db: &mut Session, sql: &str) -> Vec<Vec<Value>> {
-    match db.execute(sql, &[]).unwrap() {
+    match db.query_outcome(sql, &[]).unwrap() {
         Outcome::Query { rows, .. } => rows,
         other => panic!("expected query, got {other:?}"),
     }
@@ -27,9 +27,9 @@ fn boolean_primary_key_crud() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    db.execute("CREATE TABLE t (k boolean PRIMARY KEY, v i32)", &[])
+    db.query_outcome("CREATE TABLE t (k boolean PRIMARY KEY, v i32)", &[])
         .unwrap();
-    db.execute("INSERT INTO t VALUES (FALSE, 10), (TRUE, 20)", &[])
+    db.query_outcome("INSERT INTO t VALUES (FALSE, 10), (TRUE, 20)", &[])
         .unwrap();
 
     // Point lookup on the boolean PK resolves to the right row.
@@ -55,12 +55,12 @@ fn boolean_composite_primary_key() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    db.execute(
+    db.query_outcome(
         "CREATE TABLE t (a i32, b boolean, v i32, PRIMARY KEY (a, b))",
         &[],
     )
     .unwrap();
-    db.execute(
+    db.query_outcome(
         "INSERT INTO t VALUES (1, TRUE, 10), (1, FALSE, 20), (2, FALSE, 30)",
         &[],
     )
@@ -87,14 +87,14 @@ fn boolean_secondary_index() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, flag boolean)", &[])
+    db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY, flag boolean)", &[])
         .unwrap();
-    db.execute(
+    db.query_outcome(
         "INSERT INTO t VALUES (1, TRUE), (2, FALSE), (3, NULL), (4, TRUE)",
         &[],
     )
     .unwrap();
-    db.execute("CREATE INDEX i ON t (flag)", &[]).unwrap();
+    db.query_outcome("CREATE INDEX i ON t (flag)", &[]).unwrap();
     let mut ids: Vec<i64> = rows(&mut db, "SELECT id FROM t WHERE flag = TRUE")
         .into_iter()
         .map(|r| match r[0] {

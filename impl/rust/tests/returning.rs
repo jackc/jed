@@ -9,7 +9,7 @@ use jed::value::Value;
 use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn run(db: &mut Session, sql: &str) -> Outcome {
-    db.execute(sql, &[])
+    db.query_outcome(sql, &[])
         .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
 }
 
@@ -35,7 +35,7 @@ fn names(db: &mut Session, sql: &str) -> Vec<String> {
 }
 
 fn err_code(db: &mut Session, sql: &str) -> String {
-    db.execute(sql, &[])
+    db.query_outcome(sql, &[])
         .expect_err(&format!("expected an error from {sql:?}"))
         .code()
         .to_string()
@@ -49,7 +49,7 @@ fn setup() -> Session {
         "CREATE TABLE t (id i32 PRIMARY KEY, v i32 DEFAULT 7, w i32)",
         "INSERT INTO t VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300)",
     ] {
-        db.execute(s, &[])
+        db.query_outcome(s, &[])
             .unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
@@ -326,7 +326,7 @@ fn returning_bind_params() {
     let mut db = setup();
     // A $N in the RETURNING list types from context like anywhere else (api.md §5).
     let out = db
-        .execute(
+        .query_outcome(
             "INSERT INTO t VALUES (80, 3, 0) RETURNING v + $1",
             &[Value::Int(5)],
         )
@@ -337,7 +337,7 @@ fn returning_bind_params() {
     }
     // A parameter no context types is 42P18.
     let err = db
-        .execute(
+        .query_outcome(
             "INSERT INTO t VALUES (81, 3, 0) RETURNING $1",
             &[Value::Int(5)],
         )

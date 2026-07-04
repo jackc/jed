@@ -9,14 +9,14 @@ use jed::value::Value;
 use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn err_code(db: &mut Session, sql: &str) -> String {
-    match db.execute(sql, &[]) {
+    match db.query_outcome(sql, &[]) {
         Err(e) => e.code().to_string(),
         Ok(_) => panic!("expected error for {sql}"),
     }
 }
 
 fn one(db: &mut Session, sql: &str) -> Value {
-    match db.execute(sql, &[]).unwrap() {
+    match db.query_outcome(sql, &[]).unwrap() {
         Outcome::Query { rows, .. } => rows[0][0].clone(),
         other => panic!("expected query, got {other:?}"),
     }
@@ -84,9 +84,9 @@ fn uuid_bytea_round_trip_through_columns() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, u uuid, b bytea)", &[])
+    db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY, u uuid, b bytea)", &[])
         .unwrap();
-    db.execute(
+    db.query_outcome(
         "INSERT INTO t VALUES (1, '550e8400-e29b-41d4-a716-446655440000', \
          '\\x550e8400e29b41d4a716446655440000'), (2, NULL, NULL)",
         &[],
@@ -118,10 +118,10 @@ fn text_uuid_smoke() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, s text, u uuid)", &[])
+    db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY, s text, u uuid)", &[])
         .unwrap();
     // an UPPERCASE text value casts to the same 16 bytes and renders lowercase
-    db.execute(
+    db.query_outcome(
         "INSERT INTO t VALUES (1, '550E8400-E29B-41D4-A716-446655440000', \
          '550e8400-e29b-41d4-a716-446655440000')",
         &[],
@@ -136,7 +136,7 @@ fn text_uuid_smoke() {
         Value::Text("550e8400-e29b-41d4-a716-446655440000".to_string())
     );
     // a malformed runtime text → uuid traps 22P02 (not a literal — the column path)
-    db.execute("INSERT INTO t VALUES (2, 'not-a-uuid', NULL)", &[])
+    db.query_outcome("INSERT INTO t VALUES (2, 'not-a-uuid', NULL)", &[])
         .unwrap();
     assert_eq!(
         err_code(&mut db, "SELECT s::uuid FROM t WHERE id = 2"),

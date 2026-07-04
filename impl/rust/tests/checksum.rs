@@ -37,7 +37,7 @@ fn tmp(name: &str) -> std::path::PathBuf {
 /// The full scan result as rendered strings, or the error if any page read failed.
 fn scan(path: &std::path::Path) -> Result<Vec<Vec<String>>> {
     let mut db = Database::open(path)?.session(SessionOptions::default());
-    let out = match db.execute("SELECT id, body FROM t ORDER BY id", &[])? {
+    let out = match db.query_outcome("SELECT id, body FROM t ORDER BY id", &[])? {
         Outcome::Query { rows, .. } => rows
             .iter()
             .map(|r| r.iter().map(|v| v.render()).collect())
@@ -57,14 +57,14 @@ fn seed(path: &std::path::Path) {
     })
     .unwrap()
     .session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, body text)", &[])
+    db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY, body text)", &[])
         .unwrap();
     let big = filler_text(600);
     let mut sql = format!("INSERT INTO t VALUES (1, '{big}')");
     for id in 2..=30 {
         sql.push_str(&format!(", ({id}, 'row{id}')"));
     }
-    db.execute(&sql, &[]).unwrap();
+    db.query_outcome(&sql, &[]).unwrap();
     drop(db);
 }
 

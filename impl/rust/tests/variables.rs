@@ -13,7 +13,7 @@ use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 /// Run a single-row, single-column query and return the lone value.
 fn scalar(db: &mut Session, sql: &str) -> Value {
     match db
-        .execute(sql, &[])
+        .query_outcome(sql, &[])
         .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
     {
         Outcome::Query { rows, .. } => {
@@ -26,7 +26,7 @@ fn scalar(db: &mut Session, sql: &str) -> Value {
 }
 
 fn err_code(db: &mut Session, sql: &str) -> String {
-    db.execute(sql, &[])
+    db.query_outcome(sql, &[])
         .err()
         .unwrap_or_else(|| panic!("expected an error from: {sql}"))
         .code()
@@ -120,9 +120,10 @@ fn a_null_name_propagates_to_null() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, n text)", &[])
+    db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY, n text)", &[])
         .unwrap();
-    db.execute("INSERT INTO t VALUES (1, NULL)", &[]).unwrap();
+    db.query_outcome("INSERT INTO t VALUES (1, NULL)", &[])
+        .unwrap();
     db.set_var("myapp.x", "set").unwrap();
     assert_eq!(
         scalar(&mut db, "SELECT current_setting(n) FROM t WHERE id = 1"),
@@ -138,9 +139,9 @@ fn variables_are_session_state_not_snapshot_state() {
         .unwrap()
         .session(SessionOptions::default());
     db.set_var("myapp.outer", "a").unwrap();
-    db.execute("BEGIN", &[]).unwrap();
+    db.query_outcome("BEGIN", &[]).unwrap();
     db.set_var("myapp.inner", "b").unwrap();
-    db.execute("ROLLBACK", &[]).unwrap();
+    db.query_outcome("ROLLBACK", &[]).unwrap();
     assert_eq!(db.var("myapp.outer"), Some("a".to_string()));
     assert_eq!(db.var("myapp.inner"), Some("b".to_string()));
     assert_eq!(
@@ -162,7 +163,7 @@ fn an_additional_session_has_independent_variables() {
 
     // Each session reads its own value.
     match other
-        .execute("SELECT current_setting('myapp.who')", &[])
+        .query_outcome("SELECT current_setting('myapp.who')", &[])
         .unwrap()
     {
         Outcome::Query { rows, .. } => {

@@ -11,7 +11,7 @@ fn db_with(stmts: &[&str]) -> Session {
         .unwrap()
         .session(SessionOptions::default());
     for s in stmts {
-        db.execute(s, &[])
+        db.query_outcome(s, &[])
             .unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
@@ -20,7 +20,7 @@ fn db_with(stmts: &[&str]) -> Session {
 /// Run a query and return its rows.
 fn query(db: &mut Session, sql: &str) -> Vec<Vec<Value>> {
     match db
-        .execute(sql, &[])
+        .query_outcome(sql, &[])
         .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
     {
         Outcome::Query { rows, .. } => rows,

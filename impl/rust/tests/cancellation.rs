@@ -38,7 +38,7 @@ fn meter_guard_honors_cancel() {
 #[test]
 fn cancel_before_run_aborts_at_boundary() {
     let mut db = Database::create(CreateOptions::default()).unwrap();
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
+    db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
         .unwrap();
 
     let token = CancellationToken::new();
@@ -66,10 +66,10 @@ fn cancel_before_run_aborts_at_boundary() {
 #[test]
 fn armed_but_not_cancelled_completes() {
     let mut db = Database::create(CreateOptions::default()).unwrap();
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
+    db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
         .unwrap();
     for i in 1..=20 {
-        db.execute(&format!("INSERT INTO t VALUES ({i})"), &[])
+        db.query_outcome(&format!("INSERT INTO t VALUES ({i})"), &[])
             .unwrap();
     }
 
@@ -88,7 +88,7 @@ fn armed_but_not_cancelled_completes() {
 #[test]
 fn cancel_in_transaction_rolls_back() {
     let mut db = Database::create(CreateOptions::default()).unwrap();
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
+    db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
         .unwrap();
 
     let token = CancellationToken::new();

@@ -8,7 +8,7 @@
 use jed::{CreateOptions, Database, Outcome, Privilege, PrivilegeSet, Session, SessionOptions};
 
 fn code(db: &mut Session, sql: &str) -> String {
-    db.execute(sql, &[])
+    db.query_outcome(sql, &[])
         .err()
         .unwrap_or_else(|| panic!("expected an error from: {sql}"))
         .code()
@@ -16,7 +16,7 @@ fn code(db: &mut Session, sql: &str) -> String {
 }
 
 fn ok(db: &mut Session, sql: &str) -> Outcome {
-    db.execute(sql, &[])
+    db.query_outcome(sql, &[])
         .unwrap_or_else(|e| panic!("expected ok from {sql}, got {}: {}", e.code(), e.message))
 }
 
@@ -109,7 +109,7 @@ fn an_additional_session_carries_its_own_envelope() {
     // through the core (spec/design/session.md §2.1/§5.3) — each owns its envelope, no swap.
     let db = Database::create(CreateOptions::default()).unwrap();
     let mut a = db.session(SessionOptions::default());
-    a.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
+    a.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
         .expect("create on the permissive session");
 
     let mut restricted = db.session(SessionOptions {
@@ -118,22 +118,22 @@ fn an_additional_session_carries_its_own_envelope() {
     });
     // The restricted session may read but not write.
     restricted
-        .execute("SELECT * FROM t", &[])
+        .query_outcome("SELECT * FROM t", &[])
         .expect("read allowed on the restricted session");
     let err = restricted
-        .execute("INSERT INTO t VALUES (1, 10)", &[])
+        .query_outcome("INSERT INTO t VALUES (1, 10)", &[])
         .err()
         .unwrap();
     assert_eq!(err.code(), "42501");
 
     // The permissive session is unaffected — it still writes.
-    a.execute("INSERT INTO t VALUES (1, 10)", &[])
+    a.query_outcome("INSERT INTO t VALUES (1, 10)", &[])
         .expect("insert allowed on the permissive session");
 
     // A grant on the additional session lifts the restriction for it alone.
     restricted.grant(PrivilegeSet::EMPTY.with(Privilege::Insert), "t");
     restricted
-        .execute("INSERT INTO t VALUES (2, 20)", &[])
+        .query_outcome("INSERT INTO t VALUES (2, 20)", &[])
         .expect("insert allowed after grant on the restricted session");
 }
 

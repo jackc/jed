@@ -11,7 +11,7 @@ use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn query(db: &mut Session, sql: &str) -> Vec<Vec<Value>> {
     match db
-        .execute(sql, &[])
+        .query_outcome(sql, &[])
         .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
     {
         Outcome::Query { rows, .. } => rows,
@@ -20,13 +20,13 @@ fn query(db: &mut Session, sql: &str) -> Vec<Vec<Value>> {
 }
 
 fn cost(db: &mut Session, sql: &str) -> i64 {
-    db.execute(sql, &[])
+    db.query_outcome(sql, &[])
         .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
         .cost()
 }
 
 fn err_code(db: &mut Session, sql: &str) -> String {
-    db.execute(sql, &[])
+    db.query_outcome(sql, &[])
         .err()
         .unwrap_or_else(|| panic!("{sql:?}: expected an error"))
         .code()
@@ -46,7 +46,7 @@ fn names_and_types_its_column_at_the_element_type() {
         .session(SessionOptions::default());
     // An untyped ARRAY[…] literal is i64[] (jed's literal typing), so the column is i64.
     let out = db
-        .execute("SELECT * FROM unnest(ARRAY[10, 20, 30])", &[])
+        .query_outcome("SELECT * FROM unnest(ARRAY[10, 20, 30])", &[])
         .unwrap();
     match &out {
         Outcome::Query {
@@ -61,12 +61,12 @@ fn names_and_types_its_column_at_the_element_type() {
     }
     // A typed '{…}'::i32[] literal pins the element type — the column is i32.
     let out = db
-        .execute("SELECT * FROM unnest('{1,2,3}'::i32[])", &[])
+        .query_outcome("SELECT * FROM unnest('{1,2,3}'::i32[])", &[])
         .unwrap();
     assert_eq!(out.column_types(), &["i32"]);
     // A text[] argument → a text column.
     let out = db
-        .execute("SELECT * FROM unnest(ARRAY['a','b'])", &[])
+        .query_outcome("SELECT * FROM unnest(ARRAY['a','b'])", &[])
         .unwrap();
     assert_eq!(out.column_types(), &["text"]);
 }
@@ -117,9 +117,9 @@ fn correlated_outer_array_column_and_sibling_are_legal_args() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, xs i32[])", &[])
+    db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY, xs i32[])", &[])
         .unwrap();
-    db.execute(
+    db.query_outcome(
         "INSERT INTO t VALUES (1, ARRAY[10,20]), (2, '{30}'), (3, NULL), (4, '{}')",
         &[],
     )
@@ -146,7 +146,7 @@ fn correlated_outer_array_column_and_sibling_are_legal_args() {
         "SELECT id, u FROM t CROSS JOIN unnest(xs) AS u",
         "SELECT id, u FROM t CROSS JOIN unnest(t.xs) AS u",
     ] {
-        match db.execute(sql, &[]).unwrap() {
+        match db.query_outcome(sql, &[]).unwrap() {
             Outcome::Query { rows, .. } => assert_eq!(rows.len(), 3),
             other => panic!("expected a query result, got {other:?}"),
         }

@@ -45,7 +45,7 @@ use std::sync::LazyLock;
 /// execution `cost` accrued while running the statement (CLAUDE.md §13) — a DML
 /// statement accrues its scan + filter cost even though it returns no rows.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Outcome {
+pub(crate) enum Outcome {
     /// A statement that produces no result set (CREATE, INSERT, UPDATE, DELETE).
     Statement {
         cost: i64,

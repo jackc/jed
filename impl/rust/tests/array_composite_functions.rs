@@ -9,12 +9,12 @@
 use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn run(db: &mut Session, sql: &str) {
-    db.execute(sql, &[])
+    db.query_outcome(sql, &[])
         .unwrap_or_else(|e| panic!("{sql}: {}", e.message));
 }
 
 fn err(db: &mut Session, sql: &str) -> String {
-    db.execute(sql, &[])
+    db.query_outcome(sql, &[])
         .err()
         .unwrap_or_else(|| panic!("{sql}: expected an error"))
         .code()
@@ -24,7 +24,7 @@ fn err(db: &mut Session, sql: &str) -> String {
 /// One-column, one-row query → the rendered value ("NULL" for SQL-NULL).
 fn val(db: &mut Session, sql: &str) -> String {
     match db
-        .execute(sql, &[])
+        .query_outcome(sql, &[])
         .unwrap_or_else(|e| panic!("{sql}: {}", e.message))
     {
         Outcome::Query { rows, .. } => {
@@ -39,7 +39,7 @@ fn val(db: &mut Session, sql: &str) -> String {
 /// A multi-row, one-column query → the rendered values.
 fn col(db: &mut Session, sql: &str) -> Vec<String> {
     match db
-        .execute(sql, &[])
+        .query_outcome(sql, &[])
         .unwrap_or_else(|e| panic!("{sql}: {}", e.message))
     {
         Outcome::Query { rows, .. } => rows.iter().map(|r| r[0].render()).collect(),
@@ -230,7 +230,7 @@ fn unnest_composite_array() {
     let mut db = addr_db();
     // One composite row per element, typed at the composite element type.
     let out = db
-        .execute(r#"SELECT * FROM unnest('{"(a,1)","(b,2)"}'::addr[])"#, &[])
+        .query_outcome(r#"SELECT * FROM unnest('{"(a,1)","(b,2)"}'::addr[])"#, &[])
         .unwrap();
     match &out {
         Outcome::Query {

@@ -4,7 +4,7 @@
 //! transaction has FAILED (a statement errored inside it, so everything but
 //! COMMIT/ROLLBACK now answers 25P02).
 
-use jed::{EngineError, Outcome, Value};
+use jed::{EngineError, Value};
 
 /// One statement's result, shaped for display.
 #[derive(Debug)]
@@ -65,7 +65,7 @@ impl Session {
     /// Execute one already-split statement. Errors pass through for the caller to
     /// display; transaction state is tracked either way.
     pub fn run(&mut self, sql: &str) -> Result<ExecOutput, EngineError> {
-        let result = self.db.execute(sql, &[]);
+        let result = self.exec_output(sql);
         // Failed-transaction tracking (cli.md §6): an error while a transaction is open
         // poisons it (the engine answers 25P02 from then on); any path that leaves the
         // transaction (COMMIT/ROLLBACK, or autocommit all along) clears the flag.
@@ -74,26 +74,31 @@ impl Session {
         } else if result.is_err() {
             self.tx_failed = true;
         }
-        match result {
-            Ok(Outcome::Statement {
-                cost,
-                rows_affected,
-            }) => Ok(ExecOutput::Statement {
+        result
+    }
+
+    /// Run one statement through the one total `query` seam (spec/design/api.md §11) and materialize
+    /// the cursor into the CLI's render shape: a cursor with output columns is a query; a no-column
+    /// cursor IS a bare statement carrying its command tag. A **mid-drain** streaming error (a `54P01`
+    /// cost abort, `57014` cancellation, or arithmetic trap) surfaces here via [`jed::Rows::error`].
+    fn exec_output(&mut self, sql: &str) -> Result<ExecOutput, EngineError> {
+        let mut rows = self.db.query(sql, &[])?;
+        let columns = rows.column_names().to_vec();
+        let drained: Vec<Vec<Value>> = rows.by_ref().collect();
+        rows.error()?;
+        let cost = rows.cost();
+        if columns.is_empty() {
+            Ok(ExecOutput::Statement {
                 tag: statement_tag(sql),
                 cost,
-                rows: rows_affected,
-            }),
-            Ok(Outcome::Query {
-                column_names,
-                rows,
+                rows: rows.rows_affected(),
+            })
+        } else {
+            Ok(ExecOutput::Query {
+                columns,
+                rows: drained,
                 cost,
-                ..
-            }) => Ok(ExecOutput::Query {
-                columns: column_names,
-                rows,
-                cost,
-            }),
-            Err(e) => Err(e),
+            })
         }
     }
 

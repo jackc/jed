@@ -8,7 +8,7 @@ use jed::value::Value;
 use jed::{CreateOptions, Database, Outcome, Session, SessionOptions, TxStatus};
 
 fn count(db: &mut Session) -> i64 {
-    match db.execute("SELECT count(*) FROM t", &[]).unwrap() {
+    match db.query_outcome("SELECT count(*) FROM t", &[]).unwrap() {
         Outcome::Query { rows, .. } => match rows[0][0] {
             Value::Int(n) => n,
             ref other => panic!("expected an int count, got {other:?}"),
@@ -50,7 +50,7 @@ fn script_is_all_or_nothing_on_error() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
+    db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
         .unwrap();
 
     let err = db
@@ -106,7 +106,7 @@ fn in_script_transaction_control_is_feature_not_supported() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
+    db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
         .unwrap();
 
     for script in [
@@ -129,10 +129,10 @@ fn script_joins_an_open_transaction_without_committing() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
+    db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
         .unwrap();
 
-    db.execute("BEGIN", &[]).unwrap();
+    db.query_outcome("BEGIN", &[]).unwrap();
     let summary = db
         .execute_script("INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)")
         .unwrap();
@@ -140,7 +140,7 @@ fn script_joins_an_open_transaction_without_committing() {
     assert_eq!(db.status(), TxStatus::Open); // NOT auto-committed — the caller's block stays open
     assert_eq!(count(&mut db), 2); // visible inside the block
 
-    db.execute("ROLLBACK", &[]).unwrap();
+    db.query_outcome("ROLLBACK", &[]).unwrap();
     assert_eq!(db.status(), TxStatus::Idle);
     assert_eq!(count(&mut db), 0); // the caller rolled the joined work back
 }
@@ -152,10 +152,10 @@ fn script_error_inside_an_open_transaction_leaves_it_failed_for_the_caller() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
+    db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
         .unwrap();
 
-    db.execute("BEGIN", &[]).unwrap();
+    db.query_outcome("BEGIN", &[]).unwrap();
     let err = db
         .execute_script("INSERT INTO t VALUES (1); INSERT INTO t VALUES (1)")
         .err()
@@ -163,7 +163,7 @@ fn script_error_inside_an_open_transaction_leaves_it_failed_for_the_caller() {
     assert_eq!(err.code(), "23505");
     assert_eq!(db.status(), TxStatus::Failed);
 
-    db.execute("ROLLBACK", &[]).unwrap();
+    db.query_outcome("ROLLBACK", &[]).unwrap();
     assert_eq!(db.status(), TxStatus::Idle);
     assert_eq!(count(&mut db), 0);
 }
@@ -174,7 +174,7 @@ fn additional_session_runs_a_script_over_the_shared_core() {
     // storage through the Database core and commits the run all-or-nothing — another session sees it.
     let db = Database::create(CreateOptions::default()).unwrap();
     let mut a = db.session(SessionOptions::default());
-    a.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
+    a.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
         .unwrap();
 
     let mut s = db.session(SessionOptions::default());
@@ -184,7 +184,7 @@ fn additional_session_runs_a_script_over_the_shared_core() {
     assert_eq!(summary.statements_run, 2);
 
     // Committed through the additional session, visible to another session over the core.
-    match a.execute("SELECT count(*) FROM t", &[]).unwrap() {
+    match a.query_outcome("SELECT count(*) FROM t", &[]).unwrap() {
         Outcome::Query { rows, .. } => assert_eq!(rows[0][0], Value::Int(2)),
         other => panic!("expected a query, got {other:?}"),
     }

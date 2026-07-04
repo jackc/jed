@@ -9,16 +9,16 @@ fn setup() -> Session {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32, s text)", &[])
+    db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY, v i32, s text)", &[])
         .unwrap();
-    db.execute("INSERT INTO t VALUES (1, 10, '--x /*y*/')", &[])
+    db.query_outcome("INSERT INTO t VALUES (1, 10, '--x /*y*/')", &[])
         .unwrap();
     db
 }
 
 /// Run a query expected to produce exactly one value; return it rendered.
 fn one(db: &mut Session, sql: &str) -> String {
-    match db.execute(sql, &[]).unwrap() {
+    match db.query_outcome(sql, &[]).unwrap() {
         Outcome::Query { rows, .. } => {
             assert_eq!(rows.len(), 1, "{sql}");
             assert_eq!(rows[0].len(), 1, "{sql}");
@@ -88,7 +88,11 @@ fn unterminated_block_comment_is_42601() {
         "SELECT v FROM t /* outer /* inner */ still open",
         "SELECT v FROM t /*/", // the close cannot overlap the open
     ] {
-        assert_eq!(db.execute(sql, &[]).unwrap_err().code(), "42601", "{sql}");
+        assert_eq!(
+            db.query_outcome(sql, &[]).unwrap_err().code(),
+            "42601",
+            "{sql}"
+        );
     }
 }
 
@@ -97,7 +101,9 @@ fn stray_close_is_not_comment_syntax() {
     let mut db = setup();
     // `*/` with no opener lexes as `*` `/` and fails at parse.
     assert_eq!(
-        db.execute("SELECT v */ 1 FROM t", &[]).unwrap_err().code(),
+        db.query_outcome("SELECT v */ 1 FROM t", &[])
+            .unwrap_err()
+            .code(),
         "42601"
     );
 }
@@ -106,6 +112,10 @@ fn stray_close_is_not_comment_syntax() {
 fn comment_only_input_is_no_statement() {
     let mut db = setup();
     for sql in ["-- nothing here", "/* nothing here */", "  /* a */ -- b"] {
-        assert_eq!(db.execute(sql, &[]).unwrap_err().code(), "42601", "{sql}");
+        assert_eq!(
+            db.query_outcome(sql, &[]).unwrap_err().code(),
+            "42601",
+            "{sql}"
+        );
     }
 }

@@ -13,14 +13,14 @@ fn db_with(sql: &[&str]) -> Session {
         .unwrap()
         .session(SessionOptions::default());
     for s in sql {
-        db.execute(s, &[])
+        db.query_outcome(s, &[])
             .unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
 }
 
 fn err_code(db: &mut Session, sql: &str) -> String {
-    db.execute(sql, &[])
+    db.query_outcome(sql, &[])
         .expect_err(&format!("expected an error from {sql:?}"))
         .code()
         .to_string()
@@ -49,7 +49,7 @@ fn composite_key_orders_by_tuple() {
         "INSERT INTO t VALUES (1, 1, 20)",
         "INSERT INTO t VALUES (2, 0, 40)",
     ] {
-        db.execute(stmt, &[]).unwrap();
+        db.query_outcome(stmt, &[]).unwrap();
     }
     let rows = db.rows_in_key_order("t").unwrap();
     let tuples: Vec<(i64, i64)> = rows
@@ -70,7 +70,8 @@ fn uniqueness_is_the_whole_tuple() {
         "CREATE TABLE t (a i32, b i32, PRIMARY KEY (a, b))",
         "INSERT INTO t VALUES (1, 1)",
     ]);
-    db.execute("INSERT INTO t VALUES (1, 2)", &[]).unwrap(); // shared prefix: distinct row
+    db.query_outcome("INSERT INTO t VALUES (1, 2)", &[])
+        .unwrap(); // shared prefix: distinct row
     assert_eq!(err_code(&mut db, "INSERT INTO t VALUES (1, 1)"), "23505");
     assert_eq!(
         err_code(&mut db, "INSERT INTO t VALUES (5, 5), (5, 5)"),
@@ -121,10 +122,10 @@ fn ddl_errors_match_postgres_and_narrowings() {
     // The list order is the KEY order — it may differ from declaration order (the original
     // 0A000 narrowing was lifted by the v5 catalog reshape, constraints.md §3): the table
     // keys by (b, a), so the stored scan order is b-major.
-    db.execute("CREATE TABLE t (a i32, b i32, PRIMARY KEY (b, a))", &[])
+    db.query_outcome("CREATE TABLE t (a i32, b i32, PRIMARY KEY (b, a))", &[])
         .unwrap();
     assert_eq!(db.table("t").unwrap().pk_indices(), vec![1, 0]);
-    db.execute("INSERT INTO t VALUES (1, 20), (2, 10), (3, 15)", &[])
+    db.query_outcome("INSERT INTO t VALUES (1, 20), (2, 10), (3, 15)", &[])
         .unwrap();
     let rows = db.rows_in_key_order("t").unwrap();
     let bs: Vec<i64> = rows
@@ -139,14 +140,14 @@ fn ddl_errors_match_postgres_and_narrowings() {
         vec![10, 15, 20],
         "stored order is the (b, a) tuple order"
     );
-    db.execute("DROP TABLE t", &[]).unwrap();
+    db.query_outcome("DROP TABLE t", &[]).unwrap();
     // f64 IS now a key-encodable PK member (the float-order-preserving key, encoding.md §2.8 — every
     // scalar is keyable): a composite PK with a float member succeeds.
-    db.execute("CREATE TABLE fpk (a i32, s f64, PRIMARY KEY (a, s))", &[])
+    db.query_outcome("CREATE TABLE fpk (a i32, s f64, PRIMARY KEY (a, s))", &[])
         .unwrap();
     // The recursive composite container is NOT keyable (composite.md §6), so a composite PK member
     // is still the 0A000 narrowing.
-    db.execute("CREATE TYPE addr AS (street text, zip i32)", &[])
+    db.query_outcome("CREATE TYPE addr AS (street text, zip i32)", &[])
         .unwrap();
     assert_eq!(
         err_code(
@@ -156,7 +157,7 @@ fn ddl_errors_match_postgres_and_narrowings() {
         "0A000"
     );
     // A single-column table constraint is the column-level form's equivalent.
-    db.execute("CREATE TABLE ok (a i32, PRIMARY KEY (a))", &[])
+    db.query_outcome("CREATE TABLE ok (a i32, PRIMARY KEY (a))", &[])
         .unwrap();
     let t = db.table("ok").unwrap();
     assert_eq!(t.primary_key_index(), Some(0));
@@ -181,9 +182,9 @@ fn members_are_not_null_and_rekey() {
         "23502"
     );
     // Assigning a key member re-keys the row: (1,1) → (9,1) → (9,9); a non-member is in place.
-    db.execute("UPDATE t SET a = 9", &[]).unwrap();
-    db.execute("UPDATE t SET b = 9", &[]).unwrap();
-    db.execute("UPDATE t SET v = 11", &[]).unwrap();
+    db.query_outcome("UPDATE t SET a = 9", &[]).unwrap();
+    db.query_outcome("UPDATE t SET b = 9", &[]).unwrap();
+    db.query_outcome("UPDATE t SET v = 11", &[]).unwrap();
     let rows = db.rows_in_key_order("t").unwrap();
     assert_eq!(rows.len(), 1);
     assert!(matches!(
@@ -202,7 +203,7 @@ fn mixed_uuid_int_components_order_correctly() {
         "INSERT INTO t VALUES ('00000000-0000-0000-0000-000000000001', 7)",
         "INSERT INTO t VALUES ('00000000-0000-0000-0000-000000000001', -2)",
     ] {
-        db.execute(stmt, &[]).unwrap();
+        db.query_outcome(stmt, &[]).unwrap();
     }
     let rows = db.rows_in_key_order("t").unwrap();
     let ns: Vec<i64> = rows
@@ -250,7 +251,7 @@ fn round_trips_through_the_on_disk_image() {
         "23505"
     );
     loaded
-        .execute("INSERT INTO t VALUES (2, 2, 50)", &[])
+        .query_outcome("INSERT INTO t VALUES (2, 2, 50)", &[])
         .unwrap();
     assert_eq!(loaded.rows_in_key_order("t").unwrap().len(), 4);
 }

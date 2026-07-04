@@ -59,8 +59,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use jed::{
-    CreateOptions, Database, OpenOptions, Outcome, PreparedStatement, Rows, Session,
-    SessionOptions, Value,
+    CreateOptions, Database, OpenOptions, PreparedStatement, Rows, Session, SessionOptions, Value,
 };
 use std::ffi::CStr;
 use std::os::raw::c_char;
@@ -135,59 +134,37 @@ fn ok_handle(ptr: u64) -> *mut u8 {
     b.finish()
 }
 
-/// Encode an executed statement's [`Outcome`] into a STATEMENT or QUERY buffer.
-fn ok_outcome(o: Outcome) -> *mut u8 {
-    match o {
-        Outcome::Statement { rows_affected, .. } => {
-            let mut b = Buf::new(TAG_STATEMENT);
-            match rows_affected {
-                Some(n) => {
-                    b.u8(1);
-                    b.i64(n);
-                }
-                None => {
-                    b.u8(0);
-                    b.i64(0);
-                }
-            }
-            b.finish()
-        }
-        Outcome::Query {
-            column_names, rows, ..
-        } => encode_query(column_names.len(), rows.into_iter()),
+/// Encode a total-`query` [`Rows`] into a STATEMENT or QUERY buffer. A cursor carrying output columns
+/// is a query (drain + encode QUERY); a no-column cursor IS a non-query statement (the total-`query`
+/// contract), encoded as a STATEMENT from its command tag. A statement yields no rows, but the drain
+/// still finalizes the tag and surfaces any error.
+fn ok_result(mut rows: Rows) -> *mut u8 {
+    if !rows.column_names().is_empty() {
+        return ok_rows(rows);
     }
-}
-
-/// Encode a query result (ncols + materialized rows) into a QUERY buffer.
-fn encode_query(ncols: usize, rows: impl Iterator<Item = Vec<Value>>) -> *mut u8 {
-    let mut b = Buf::new(TAG_QUERY);
-    b.u32(ncols as u32);
-    let nrows_pos = b.0.len();
-    b.u32(0); // back-filled with the actual row count
-    let mut nrows: u32 = 0;
-    for row in rows {
-        nrows += 1;
-        for v in row {
-            match v {
-                // A SQL NULL is the flag — NOT the rendered string "NULL".
-                Value::Null => b.u8(1),
-                other => {
-                    b.u8(0);
-                    b.str(&other.render());
-                }
-            }
+    for _ in &mut rows {}
+    if let Err(e) = rows.error() {
+        return err_buf(e.code(), &e.message);
+    }
+    let mut b = Buf::new(TAG_STATEMENT);
+    match rows.rows_affected() {
+        Some(n) => {
+            b.u8(1);
+            b.i64(n);
+        }
+        None => {
+            b.u8(0);
+            b.i64(0);
         }
     }
-    b.0[nrows_pos..nrows_pos + 4].copy_from_slice(&nrows.to_le_bytes());
     b.finish()
 }
 
-/// Drain a streaming [`Rows`] cursor into a QUERY buffer, surfacing a **mid-drain** error (a `54P01`
-/// cost abort, `57014` cancellation, or arithmetic trap) as an ERROR buffer rather than a silently
-/// truncated result. Prepared queries stream (spec/design/streaming.md §7), so the per-row error can
-/// surface *during* the drain rather than at `query_prepared` — the partial buffer is discarded if it
-/// does. (The materialized [`ok_outcome`] path encodes a `Vec` iterator that never errors, so it stays
-/// on [`encode_query`].)
+/// Drain a total-`query` [`Rows`] cursor into a QUERY buffer, surfacing a **mid-drain** error (a
+/// `54P01` cost abort, `57014` cancellation, or arithmetic trap) as an ERROR buffer rather than a
+/// silently truncated result. Reads stream (spec/design/streaming.md §4/§7), so the per-row error can
+/// surface *during* the drain rather than at `query`/`query_prepared` — the partial buffer is discarded
+/// if it does.
 fn ok_rows(mut rows: Rows) -> *mut u8 {
     let ncols = rows.column_names().len();
     let mut b = Buf::new(TAG_QUERY);
@@ -444,8 +421,8 @@ pub extern "C" fn jed_execute(db: *mut Conn, sql: *const c_char) -> *mut u8 {
             Ok(s) => s,
             Err(b) => return b,
         };
-        match conn.sess.execute(sql, &[]) {
-            Ok(outcome) => ok_outcome(outcome),
+        match conn.sess.query(sql, &[]) {
+            Ok(rows) => ok_result(rows),
             Err(e) => err_buf(e.code(), &e.message),
         }
     })
@@ -522,8 +499,8 @@ pub extern "C" fn jed_stmt_execute(
             Ok(v) => v,
             Err(b) => return b,
         };
-        match conn.sess.execute_prepared(stmt, &params) {
-            Ok(outcome) => ok_outcome(outcome),
+        match conn.sess.query_prepared(stmt, &params) {
+            Ok(rows) => ok_result(rows),
             Err(e) => err_buf(e.code(), &e.message),
         }
     })

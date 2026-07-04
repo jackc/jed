@@ -19,10 +19,10 @@ fn count(r: &mut Session) -> i64 {
 fn seeded(ids: &[i64]) -> Database {
     let db = Database::create(CreateOptions::default()).unwrap();
     let mut w = db.write_session();
-    w.execute("CREATE TABLE t (id bigint PRIMARY KEY)", &[])
+    w.query_outcome("CREATE TABLE t (id bigint PRIMARY KEY)", &[])
         .unwrap();
     for id in ids {
-        w.execute(&format!("INSERT INTO t VALUES ({id})"), &[])
+        w.query_outcome(&format!("INSERT INTO t VALUES ({id})"), &[])
             .unwrap();
     }
     w.commit().unwrap();
@@ -42,7 +42,9 @@ fn read_handle_rejects_writes() {
     let db = seeded(&[1]);
     let mut r = db.read_session();
     // A write through a read handle is 25006 (read-only snapshot) — and does not poison it.
-    let err = r.execute("INSERT INTO t VALUES (2)", &[]).unwrap_err();
+    let err = r
+        .query_outcome("INSERT INTO t VALUES (2)", &[])
+        .unwrap_err();
     assert_eq!(err.code(), "25006");
     assert_eq!(count(&mut r), 1); // still usable, still the pinned snapshot
 }
@@ -53,7 +55,7 @@ fn reader_does_not_block_on_an_open_writer() {
     // must see the pre-commit (committed) state — the core "readers parallel with a writer" claim.
     let db = seeded(&[1]);
     let mut w = db.write_session();
-    w.execute("INSERT INTO t VALUES (2)", &[]).unwrap(); // staged, not yet committed
+    w.query_outcome("INSERT INTO t VALUES (2)", &[]).unwrap(); // staged, not yet committed
     let mut r = db.read_session(); // does NOT block on the open writer
     assert_eq!(count(&mut r), 1); // sees only the committed row, not the writer's staged one
     w.commit().unwrap();
@@ -73,7 +75,7 @@ fn pinned_reader_is_isolated_from_a_concurrent_writer_thread() {
         let db = db.clone();
         std::thread::spawn(move || {
             let mut w = db.write_session();
-            w.execute("INSERT INTO t VALUES (2)", &[]).unwrap();
+            w.query_outcome("INSERT INTO t VALUES (2)", &[]).unwrap();
             w.commit().unwrap();
         })
     };
@@ -98,7 +100,7 @@ fn many_reader_threads_run_in_parallel_with_a_writer() {
         std::thread::spawn(move || {
             for i in 2..=20 {
                 let mut w = db.write_session();
-                w.execute(&format!("INSERT INTO t VALUES ({i})"), &[])
+                w.query_outcome(&format!("INSERT INTO t VALUES ({i})"), &[])
                     .unwrap();
                 w.commit().unwrap();
             }
@@ -144,7 +146,7 @@ fn oldest_live_txid_tracks_pinned_readers() {
 
     {
         let mut w = db.write_session();
-        w.execute("INSERT INTO t VALUES (2)", &[]).unwrap();
+        w.query_outcome("INSERT INTO t VALUES (2)", &[]).unwrap();
         w.commit().unwrap(); // version 2
     }
     assert_eq!(db.version(), 2);
@@ -165,7 +167,7 @@ fn rolled_back_writer_publishes_nothing() {
     let db = seeded(&[1]);
     {
         let mut w = db.write_session();
-        w.execute("INSERT INTO t VALUES (2)", &[]).unwrap();
+        w.query_outcome("INSERT INTO t VALUES (2)", &[]).unwrap();
         w.rollback().unwrap();
     }
     let mut r = db.read_session();
@@ -175,7 +177,7 @@ fn rolled_back_writer_publishes_nothing() {
     // A dropped (un-ended) writer also rolls back, and releases the gate for the next writer.
     {
         let mut w = db.write_session();
-        w.execute("INSERT INTO t VALUES (3)", &[]).unwrap();
+        w.query_outcome("INSERT INTO t VALUES (3)", &[]).unwrap();
         // dropped here without commit
     }
     let mut r2 = db.read_session();

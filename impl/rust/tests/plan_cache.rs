@@ -38,7 +38,7 @@ fn mem() -> Session {
 }
 
 fn exec(s: &mut Session, sql: &str) {
-    s.execute(sql, &[]).unwrap();
+    s.query_outcome(sql, &[]).unwrap();
 }
 
 /// Run a prepared query, fully drain it, return (rows, final cost).

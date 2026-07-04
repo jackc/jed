@@ -9,7 +9,7 @@
 use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn err(db: &mut Session, sql: &str) -> String {
-    db.execute(sql, &[])
+    db.query_outcome(sql, &[])
         .err()
         .unwrap_or_else(|| panic!("{sql}: expected an error"))
         .code()
@@ -19,7 +19,7 @@ fn err(db: &mut Session, sql: &str) -> String {
 /// One-column, one-row scalar query → the rendered value (NULL renders as "NULL").
 fn val(db: &mut Session, sql: &str) -> String {
     match db
-        .execute(sql, &[])
+        .query_outcome(sql, &[])
         .unwrap_or_else(|e| panic!("{sql}: {}", e.message))
     {
         Outcome::Query { rows, .. } => {

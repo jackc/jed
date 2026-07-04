@@ -10,7 +10,7 @@ fn db_with(sql: &[&str]) -> Session {
         .unwrap()
         .session(SessionOptions::default());
     for s in sql {
-        db.execute(s, &[])
+        db.query_outcome(s, &[])
             .unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
@@ -18,7 +18,7 @@ fn db_with(sql: &[&str]) -> Session {
 
 fn rows(db: &mut Session, sql: &str, params: &[Value]) -> Vec<Vec<Value>> {
     match db
-        .execute(sql, params)
+        .query_outcome(sql, params)
         .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
     {
         Outcome::Query { rows, .. } => rows,
@@ -27,7 +27,7 @@ fn rows(db: &mut Session, sql: &str, params: &[Value]) -> Vec<Vec<Value>> {
 }
 
 fn err_code(db: &mut Session, sql: &str, params: &[Value]) -> String {
-    db.execute(sql, params)
+    db.query_outcome(sql, params)
         .err()
         .unwrap_or_else(|| panic!("{sql:?}: expected an error"))
         .code()
@@ -49,7 +49,8 @@ fn param_adopts_narrow_column_type_and_traps_overflow() {
     // `$1` compared against an i16 column is typed i16; a value out of i16 range traps
     // 22003 at bind, before any scan.
     let mut db = db_with(&["CREATE TABLE t (id i32 PRIMARY KEY, s i16)"]);
-    db.execute("INSERT INTO t VALUES (1, 100)", &[]).unwrap();
+    db.query_outcome("INSERT INTO t VALUES (1, 100)", &[])
+        .unwrap();
     assert_eq!(
         err_code(
             &mut db,
@@ -66,7 +67,7 @@ fn param_adopts_narrow_column_type_and_traps_overflow() {
 #[test]
 fn insert_values_params_round_trip() {
     let mut db = db_with(&["CREATE TABLE t (id i32 PRIMARY KEY, name text)"]);
-    db.execute(
+    db.query_outcome(
         "INSERT INTO t VALUES ($1, $2)",
         &[Value::Int(7), Value::Text("alice".into())],
     )
@@ -112,7 +113,7 @@ fn update_set_and_where_params() {
         "CREATE TABLE t (id i32 PRIMARY KEY, v i32)",
         "INSERT INTO t VALUES (1, 10), (2, 20)",
     ]);
-    db.execute(
+    db.query_outcome(
         "UPDATE t SET v = $1 WHERE id = $2",
         &[Value::Int(99), Value::Int(2)],
     )
@@ -127,7 +128,7 @@ fn delete_where_param() {
         "CREATE TABLE t (id i32 PRIMARY KEY)",
         "INSERT INTO t VALUES (1), (2), (3)",
     ]);
-    db.execute("DELETE FROM t WHERE id = $1", &[Value::Int(2)])
+    db.query_outcome("DELETE FROM t WHERE id = $1", &[Value::Int(2)])
         .unwrap();
     let got = rows(&mut db, "SELECT id FROM t", &[]);
     assert_eq!(got, vec![vec![Value::Int(1)], vec![Value::Int(3)]]);
@@ -297,7 +298,9 @@ fn lexer_rejects_bad_param_tokens() {
         "SELECT id FROM t WHERE id = $01",
     ] {
         assert_eq!(
-            db.execute(sql, &[]).err().map(|e| e.code().to_string()),
+            db.query_outcome(sql, &[])
+                .err()
+                .map(|e| e.code().to_string()),
             Some("42601".to_string()),
             "{sql:?} should be 42601"
         );

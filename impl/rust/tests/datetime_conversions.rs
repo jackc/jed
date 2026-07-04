@@ -15,7 +15,7 @@
 use jed::{CreateOptions, Database, Session, SessionOptions};
 
 fn err_code(db: &mut Session, sql: &str) -> String {
-    match db.execute(sql, &[]) {
+    match db.query_outcome(sql, &[]) {
         Err(e) => e.code().to_string(),
         Ok(_) => panic!("expected error for {sql}"),
     }

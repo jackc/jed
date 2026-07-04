@@ -9,7 +9,7 @@ fn db_with(stmts: &[&str]) -> Session {
         .unwrap()
         .session(SessionOptions::default());
     for s in stmts {
-        db.execute(s, &[])
+        db.query_outcome(s, &[])
             .unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
@@ -18,7 +18,7 @@ fn db_with(stmts: &[&str]) -> Session {
 /// Run a query and render every cell to its canonical string (row-major).
 fn rendered(db: &mut Session, sql: &str) -> Vec<Vec<String>> {
     match db
-        .execute(sql, &[])
+        .query_outcome(sql, &[])
         .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
     {
         Outcome::Query { rows, .. } => rows
@@ -66,7 +66,7 @@ fn on_disk_round_trip_preserves_decimals_and_typmod() {
         "-12345.6789"
     );
     loaded
-        .execute("INSERT INTO t VALUES (4, 9.999, 9.999)", &[])
+        .query_outcome("INSERT INTO t VALUES (4, 9.999, 9.999)", &[])
         .unwrap();
     assert_eq!(
         one(&mut loaded, "SELECT money FROM t WHERE id = 4"),
@@ -109,7 +109,7 @@ fn cost_ceiling_aborts_ahead_of_a_big_multiply() {
     ]);
     let big = format!("{}.5", "9".repeat(20000));
     db.set_max_cost(1000);
-    match db.execute(&format!("SELECT {big} * {big} FROM t"), &[]) {
+    match db.query_outcome(&format!("SELECT {big} * {big} FROM t"), &[]) {
         Err(e) => assert_eq!(e.code(), "54P01", "want the cost-limit abort"),
         Ok(_) => panic!("expected the cost ceiling to abort the multiply"),
     }

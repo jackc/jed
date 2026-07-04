@@ -50,7 +50,7 @@ fn filler_bytes_hex(n: usize) -> String {
 }
 
 fn cost(db: &mut Session, sql: &str) -> i64 {
-    match db.execute(sql, &[]).unwrap() {
+    match db.query_outcome(sql, &[]).unwrap() {
         Outcome::Query { cost, .. } => cost,
         Outcome::Statement { cost, .. } => cost,
     }
@@ -66,16 +66,16 @@ fn two_tables() -> Session {
     .unwrap()
     .session(SessionOptions::default());
     let big = filler_text(600);
-    db.execute("CREATE TABLE spill (id i32 PRIMARY KEY, body text)", &[])
+    db.query_outcome("CREATE TABLE spill (id i32 PRIMARY KEY, body text)", &[])
         .unwrap();
-    db.execute(
+    db.query_outcome(
         &format!("INSERT INTO spill VALUES (1, '{big}'), (2, 'small')"),
         &[],
     )
     .unwrap();
-    db.execute("CREATE TABLE control (id i32 PRIMARY KEY, body text)", &[])
+    db.query_outcome("CREATE TABLE control (id i32 PRIMARY KEY, body text)", &[])
         .unwrap();
-    db.execute("INSERT INTO control VALUES (1, 'tiny'), (2, 'small')", &[])
+    db.query_outcome("INSERT INTO control VALUES (1, 'tiny'), (2, 'small')", &[])
         .unwrap();
     db
 }
@@ -114,16 +114,16 @@ fn limit_does_not_lower_the_block() {
     .unwrap()
     .session(SessionOptions::default());
     let big = filler_text(600);
-    db.execute("CREATE TABLE spill (id i32 PRIMARY KEY, body text)", &[])
+    db.query_outcome("CREATE TABLE spill (id i32 PRIMARY KEY, body text)", &[])
         .unwrap();
-    db.execute(
+    db.query_outcome(
         &format!("INSERT INTO spill VALUES (1, 'small'), (2, '{big}')"),
         &[],
     )
     .unwrap();
-    db.execute("CREATE TABLE control (id i32 PRIMARY KEY, body text)", &[])
+    db.query_outcome("CREATE TABLE control (id i32 PRIMARY KEY, body text)", &[])
         .unwrap();
-    db.execute("INSERT INTO control VALUES (1, 'small'), (2, 'tiny')", &[])
+    db.query_outcome("INSERT INTO control VALUES (1, 'small'), (2, 'tiny')", &[])
         .unwrap();
     let spill = cost(&mut db, "SELECT * FROM spill LIMIT 1");
     let control = cost(&mut db, "SELECT * FROM control LIMIT 1");
@@ -179,22 +179,22 @@ fn multiple_chains_sum() {
     .session(SessionOptions::default());
     let big_text = filler_text(600);
     let big_hex = filler_bytes_hex(300);
-    db.execute(
+    db.query_outcome(
         "CREATE TABLE spill (id i32 PRIMARY KEY, body text, blob bytea)",
         &[],
     )
     .unwrap();
-    db.execute(
+    db.query_outcome(
         &format!("INSERT INTO spill VALUES (1, '{big_text}', '\\x{big_hex}')"),
         &[],
     )
     .unwrap();
-    db.execute(
+    db.query_outcome(
         "CREATE TABLE control (id i32 PRIMARY KEY, body text, blob bytea)",
         &[],
     )
     .unwrap();
-    db.execute("INSERT INTO control VALUES (1, 'tiny', '\\xcafe')", &[])
+    db.query_outcome("INSERT INTO control VALUES (1, 'tiny', '\\xcafe')", &[])
         .unwrap();
     let spill = cost(&mut db, "SELECT * FROM spill");
     let control = cost(&mut db, "SELECT * FROM control");

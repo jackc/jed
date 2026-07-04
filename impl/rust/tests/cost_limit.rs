@@ -13,7 +13,7 @@ fn table(n: i64) -> Session {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
+    db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
         .unwrap();
     let mut sql = String::from("INSERT INTO t VALUES ");
     for i in 1..=n {
@@ -22,12 +22,12 @@ fn table(n: i64) -> Session {
         }
         sql.push_str(&format!("({i},{i})"));
     }
-    db.execute(&sql, &[]).unwrap();
+    db.query_outcome(&sql, &[]).unwrap();
     db
 }
 
 fn cost(db: &mut Session, sql: &str) -> i64 {
-    match db.execute(sql, &[]).unwrap() {
+    match db.query_outcome(sql, &[]).unwrap() {
         Outcome::Query { cost, .. } => cost,
         Outcome::Statement { cost, .. } => cost,
     }
@@ -35,7 +35,7 @@ fn cost(db: &mut Session, sql: &str) -> i64 {
 
 /// Assert running `sql` aborts with `54P01` (cost limit exceeded).
 fn assert_aborts(db: &mut Session, sql: &str) {
-    match db.execute(sql, &[]) {
+    match db.query_outcome(sql, &[]) {
         Err(e) => assert_eq!(
             e.code(),
             "54P01",
@@ -122,7 +122,7 @@ fn abort_threads_through_delete_and_update() {
     // Nothing was mutated (the aborted statements rolled back).
     db.set_max_cost(0);
     assert_eq!(cost(&mut db, "SELECT v FROM t"), scan_cost);
-    let n = match db.execute("SELECT v FROM t", &[]).unwrap() {
+    let n = match db.query_outcome("SELECT v FROM t", &[]).unwrap() {
         Outcome::Query { rows, .. } => rows.len(),
         _ => unreachable!(),
     };
@@ -151,7 +151,7 @@ fn empty_bound_under_a_tiny_ceiling_succeeds() {
     let mut db = table(10);
     db.set_max_cost(1);
     match db
-        .execute("SELECT v FROM t WHERE id > 5 AND id < 5", &[])
+        .query_outcome("SELECT v FROM t WHERE id > 5 AND id < 5", &[])
         .unwrap()
     {
         Outcome::Query { rows, cost, .. } => {

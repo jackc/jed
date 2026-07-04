@@ -19,9 +19,9 @@ fn tmp(name: &str) -> std::path::PathBuf {
 /// Default page size (8192) keeps every value inline-plain, so on a paged reopen each lands as
 /// `Unfetched::Inline` — the L2 case (nothing spills; that is large-values.md §14's case).
 fn seed(db: &mut Session) {
-    db.execute("CREATE TYPE addr AS (street text, zip i32)", &[])
+    db.query_outcome("CREATE TYPE addr AS (street text, zip i32)", &[])
         .unwrap();
-    db.execute(
+    db.query_outcome(
         "CREATE TABLE t (\
             id i32 PRIMARY KEY, \
             name text, \
@@ -34,20 +34,21 @@ fn seed(db: &mut Session) {
         &[],
     )
     .unwrap();
-    db.execute("CREATE INDEX t_name ON t (name)", &[]).unwrap();
-    db.execute("INSERT INTO t VALUES \
+    db.query_outcome("CREATE INDEX t_name ON t (name)", &[])
+        .unwrap();
+    db.query_outcome("INSERT INTO t VALUES \
             (1, 'alice',  '\\xdeadbeef', 100.50, '{\"k\": 1, \"tag\": \"x\"}', ARRAY[10, 20, 30], ROW('Main St', 90210), '[1,5)'), \
             (2, 'bob',    '\\xcafe',     2.25,   '{\"k\": 2}',                ARRAY[1, NULL, 3], ROW('Oak Ave', 12345), '[10,20]'), \
             (3, 'carol',  NULL,          NULL,   NULL,                        NULL,              ROW('Elm', NULL),      'empty'), \
             (4, 'dave',   '\\x00ff',     9999.99,'{\"k\": 4, \"nested\": {\"a\": [1,2,3]}}', '{}',  ROW(NULL, 7),         '(,9)')", &[])
     .unwrap();
 
-    db.execute(
+    db.query_outcome(
         "CREATE TABLE u (id i32 PRIMARY KEY, t_id i32, note text)",
         &[],
     )
     .unwrap();
-    db.execute("INSERT INTO u VALUES (1, 1, 'first'), (2, 1, 'again'), (3, 3, 'lonely'), (4, 99, 'orphan')", &[])
+    db.query_outcome("INSERT INTO u VALUES (1, 1, 'first'), (2, 1, 'again'), (3, 3, 'lonely'), (4, 99, 'orphan')", &[])
     .unwrap();
 }
 
@@ -56,7 +57,7 @@ fn seed(db: &mut Session) {
 /// way).
 fn rows_sorted(db: &mut Session, sql: &str) -> Vec<Vec<String>> {
     let mut rs: Vec<Vec<String>> = match db
-        .execute(sql, &[])
+        .query_outcome(sql, &[])
         .unwrap_or_else(|e| panic!("{sql}: {e:?}"))
     {
         Outcome::Query { rows, .. } => rows
@@ -71,7 +72,7 @@ fn rows_sorted(db: &mut Session, sql: &str) -> Vec<Vec<String>> {
 
 fn cost(db: &mut Session, sql: &str) -> i64 {
     match db
-        .execute(sql, &[])
+        .query_outcome(sql, &[])
         .unwrap_or_else(|e| panic!("{sql}: {e:?}"))
     {
         Outcome::Query { cost, .. } => cost,
@@ -223,7 +224,7 @@ fn mutations_preserve_untouched_inline_values() {
 
     // Apply to the resident baseline directly.
     for m in mutations {
-        mem.execute(m, &[]).unwrap();
+        mem.query_outcome(m, &[]).unwrap();
     }
     // Apply to the paged store across a reopen so each mutation runs against lazily-faulted rows.
     {
@@ -231,7 +232,7 @@ fn mutations_preserve_untouched_inline_values() {
             .unwrap()
             .session(SessionOptions::default());
         for m in mutations {
-            paged.execute(m, &[]).unwrap();
+            paged.query_outcome(m, &[]).unwrap();
         }
         drop(paged);
     }
@@ -287,9 +288,9 @@ fn untouched_corrupt_inline_body_defers_its_error() {
         })
         .unwrap()
         .session(SessionOptions::default());
-        db.execute("CREATE TABLE t (id i32 PRIMARY KEY, body text, n i32)", &[])
+        db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY, body text, n i32)", &[])
             .unwrap();
-        db.execute(
+        db.query_outcome(
             &format!("INSERT INTO t VALUES (1, '{marker}', 42), (2, 'clean', 7)"),
             &[],
         )
@@ -333,12 +334,12 @@ fn untouched_corrupt_inline_body_defers_its_error() {
     );
     // Touching the corrupted body runs the real decode: XX001.
     let err = db
-        .execute("SELECT body FROM t WHERE id = 1", &[])
+        .query_outcome("SELECT body FROM t WHERE id = 1", &[])
         .expect_err("a corrupted inline body must fail when touched");
     assert_eq!(err.code(), "XX001");
     // It also surfaces through a whole-row projection that includes the body.
     let err = db
-        .execute("SELECT * FROM t ORDER BY id", &[])
+        .query_outcome("SELECT * FROM t ORDER BY id", &[])
         .expect_err("touching the body through SELECT * must fail");
     assert_eq!(err.code(), "XX001");
 
@@ -367,7 +368,7 @@ fn untouched_deferred_column_rides_a_spilling_sort() {
         .unwrap()
         .session(SessionOptions::default());
         for db in [&mut mem as &mut Session, &mut db] {
-            db.execute(
+            db.query_outcome(
                 "CREATE TABLE t (id i32 PRIMARY KEY, k i32, label text, doc jsonb)",
                 &[],
             )
@@ -380,8 +381,8 @@ fn untouched_deferred_column_rides_a_spilling_sort() {
             let row = format!(
                 "INSERT INTO t VALUES ({id}, {k}, 'label-{id}-xxxxxxxxxx', '{{\"id\": {id}}}')"
             );
-            mem.execute(&row, &[]).unwrap();
-            db.execute(&row, &[]).unwrap();
+            mem.query_outcome(&row, &[]).unwrap();
+            db.query_outcome(&row, &[]).unwrap();
         }
         drop(db);
     }

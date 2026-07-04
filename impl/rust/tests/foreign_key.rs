@@ -13,14 +13,14 @@ fn db_with(sql: &[&str]) -> Session {
         .unwrap()
         .session(SessionOptions::default());
     for s in sql {
-        db.execute(s, &[])
+        db.query_outcome(s, &[])
             .unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
 }
 
 fn err(db: &mut Session, sql: &str) -> String {
-    db.execute(sql, &[])
+    db.query_outcome(sql, &[])
         .expect_err(&format!("expected an error from {sql:?}"))
         .code()
         .to_string()
@@ -73,7 +73,7 @@ fn strict_same_type_pairing() {
         "42804"
     );
     // The same type is accepted.
-    db.execute("CREATE TABLE c3 (x i32 REFERENCES p)", &[])
+    db.query_outcome("CREATE TABLE c3 (x i32 REFERENCES p)", &[])
         .unwrap();
 }
 
@@ -104,7 +104,7 @@ fn referential_actions_narrowed() {
         "0A000"
     );
     // NO ACTION / RESTRICT (and the default) are fine.
-    db.execute(
+    db.query_outcome(
         "CREATE TABLE c4 (x i32 REFERENCES p ON DELETE NO ACTION ON UPDATE RESTRICT)",
         &[],
     )
@@ -125,7 +125,7 @@ fn parent_update_end_state_swap_allowed() {
     ]);
     // Swap 100 ⇄ 200 across the two parent rows: the end state still contains {100, 200}, so both
     // children remain valid. jed accepts this (PG would reject the transient collision).
-    db.execute(
+    db.query_outcome(
         "UPDATE p SET code = CASE code WHEN 100 THEN 200 ELSE 100 END",
         &[],
     )

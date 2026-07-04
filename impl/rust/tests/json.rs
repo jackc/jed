@@ -8,12 +8,12 @@
 use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn run(db: &mut Session, sql: &str) {
-    db.execute(sql, &[])
+    db.query_outcome(sql, &[])
         .unwrap_or_else(|e| panic!("{sql}: {}", e.message));
 }
 
 fn err(db: &mut Session, sql: &str) -> String {
-    db.execute(sql, &[])
+    db.query_outcome(sql, &[])
         .err()
         .unwrap_or_else(|| panic!("{sql}: expected an error"))
         .code()
@@ -22,7 +22,7 @@ fn err(db: &mut Session, sql: &str) -> String {
 
 fn query(db: &mut Session, sql: &str) -> Vec<Vec<String>> {
     match db
-        .execute(sql, &[])
+        .query_outcome(sql, &[])
         .unwrap_or_else(|e| panic!("{sql}: {}", e.message))
     {
         Outcome::Query { rows, .. } => rows
@@ -171,7 +171,7 @@ fn jsonb_pretty_matches_pg() {
         .unwrap()
         .session(SessionOptions::default());
     let q = |db: &mut Session, sql: &str| -> String {
-        match db.execute(sql, &[]).unwrap() {
+        match db.query_outcome(sql, &[]).unwrap() {
             Outcome::Query { rows, .. } => rows[0][0].render(),
             other => panic!("{other:?}"),
         }

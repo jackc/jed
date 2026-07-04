@@ -32,14 +32,14 @@ fn tmp(name: &str) -> std::path::PathBuf {
 }
 
 fn cost(db: &mut Session, sql: &str) -> i64 {
-    match db.execute(sql, &[]).unwrap() {
+    match db.query_outcome(sql, &[]).unwrap() {
         Outcome::Query { cost, .. } => cost,
         Outcome::Statement { cost, .. } => cost,
     }
 }
 
 fn query_rows(db: &mut Session, sql: &str) -> Vec<Vec<jed::Value>> {
-    match db.execute(sql, &[]).unwrap() {
+    match db.query_outcome(sql, &[]).unwrap() {
         Outcome::Query { rows, .. } => rows,
         _ => panic!("expected a query result"),
     }
@@ -50,12 +50,12 @@ fn query_rows(db: &mut Session, sql: &str) -> Vec<Vec<jed::Value>> {
 /// filler / half run → the ~212-byte block spills to a 1-page chain), id 3
 /// inline-compressed (a 600-char run), id 4 plain inline.
 fn seed(db: &mut Session) {
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, body text)", &[])
+    db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY, body text)", &[])
         .unwrap();
     let plain = filler_text(600);
     let extc = format!("{}{}", filler_text(200), "y".repeat(200));
     let inlc = "x".repeat(600);
-    db.execute(
+    db.query_outcome(
         &format!("INSERT INTO t VALUES (1, '{plain}'), (2, '{extc}'), (3, '{inlc}'), (4, 'tiny')"),
         &[],
     )
@@ -136,7 +136,7 @@ fn chains_are_read_only_when_touched() {
     // non-UTF-8 for the external-plain text, a malformed LZ4 block for external-compressed.
     for id in [1, 2] {
         let err = db
-            .execute(&format!("SELECT body FROM t WHERE id = {id}"), &[])
+            .query_outcome(&format!("SELECT body FROM t WHERE id = {id}"), &[])
             .expect_err("a corrupted chain must fail when touched");
         assert_eq!(err.code(), "XX001", "id {id}");
     }
@@ -200,9 +200,9 @@ fn update_of_other_columns_preserves_spilled_values() {
         })
         .unwrap()
         .session(SessionOptions::default());
-        db.execute("CREATE TABLE t (id i32 PRIMARY KEY, body text, n i32)", &[])
+        db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY, body text, n i32)", &[])
             .unwrap();
-        db.execute(
+        db.query_outcome(
             &format!("INSERT INTO t VALUES (1, '{big}', 10), (2, 'small', 20)"),
             &[],
         )
@@ -215,9 +215,11 @@ fn update_of_other_columns_preserves_spilled_values() {
             .session(SessionOptions::default());
         // Dirties the leaf carrying row 1's unfetched body without touching it: row 2's
         // rewrite resolves nothing, row 1 resolves at commit.
-        db.execute("UPDATE t SET n = 99 WHERE id = 2", &[]).unwrap();
+        db.query_outcome("UPDATE t SET n = 99 WHERE id = 2", &[])
+            .unwrap();
         // Rewrites row 1 itself: the rewrite materializes its body (part of the write work).
-        db.execute("UPDATE t SET n = 11 WHERE id = 1", &[]).unwrap();
+        db.query_outcome("UPDATE t SET n = 11 WHERE id = 1", &[])
+            .unwrap();
         drop(db);
     }
     let mut db = Database::open(&path)

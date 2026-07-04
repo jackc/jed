@@ -9,12 +9,12 @@ use jed::{
 };
 
 fn ok(db: &mut Session, sql: &str) -> Outcome {
-    db.execute(sql, &[])
+    db.query_outcome(sql, &[])
         .unwrap_or_else(|e| panic!("expected ok from {sql}, got {}: {}", e.code(), e.message))
 }
 
 fn code(db: &mut Session, sql: &str) -> String {
-    db.execute(sql, &[])
+    db.query_outcome(sql, &[])
         .err()
         .unwrap_or_else(|| panic!("expected an error from: {sql}"))
         .code()
@@ -23,7 +23,7 @@ fn code(db: &mut Session, sql: &str) -> String {
 
 /// The single integer of a scalar `SELECT` result.
 fn scalar_int(db: &mut Session, sql: &str) -> i64 {
-    match db.execute(sql, &[]).unwrap() {
+    match db.query_outcome(sql, &[]).unwrap() {
         Outcome::Query { rows, .. } => match rows[0][0] {
             Value::Int(n) => n,
             ref v => panic!("expected an Int from {sql}, got {}", v.render()),

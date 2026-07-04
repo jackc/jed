@@ -10,7 +10,7 @@ fn db_with(stmts: &[&str]) -> Session {
         .unwrap()
         .session(SessionOptions::default());
     for s in stmts {
-        db.execute(s, &[])
+        db.query_outcome(s, &[])
             .unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
@@ -18,7 +18,7 @@ fn db_with(stmts: &[&str]) -> Session {
 
 fn rendered(db: &mut Session, sql: &str) -> Vec<Vec<String>> {
     match db
-        .execute(sql, &[])
+        .query_outcome(sql, &[])
         .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
     {
         Outcome::Query { rows, .. } => rows
@@ -38,7 +38,7 @@ fn one(db: &mut Session, sql: &str) -> String {
 
 fn col_types(db: &mut Session, sql: &str) -> Vec<String> {
     match db
-        .execute(sql, &[])
+        .query_outcome(sql, &[])
         .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
     {
         Outcome::Query { column_types, .. } => column_types,
@@ -47,7 +47,7 @@ fn col_types(db: &mut Session, sql: &str) -> Vec<String> {
 }
 
 fn err_code(db: &mut Session, sql: &str) -> String {
-    db.execute(sql, &[])
+    db.query_outcome(sql, &[])
         .err()
         .unwrap_or_else(|| panic!("{sql:?} should have failed"))
         .code()
@@ -78,7 +78,10 @@ fn aliases_resolve_and_rejected_spellings_fail() {
     let mut db3 = db_with(&["CREATE TABLE t (a float4, b float8)"]);
     assert_eq!(col_types(&mut db3, "SELECT * FROM t"), vec!["f32", "f64"]);
     // The `float(p)` precision typmod is still rejected.
-    assert!(db.execute("CREATE TABLE u (x float(10))", &[]).is_err());
+    assert!(
+        db.query_outcome("CREATE TABLE u (x float(10))", &[])
+            .is_err()
+    );
 }
 
 #[test]

@@ -14,12 +14,12 @@
 use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn run(db: &mut Session, sql: &str) {
-    db.execute(sql, &[])
+    db.query_outcome(sql, &[])
         .unwrap_or_else(|e| panic!("{sql}: {}", e.message));
 }
 
 fn err(db: &mut Session, sql: &str) -> String {
-    db.execute(sql, &[])
+    db.query_outcome(sql, &[])
         .err()
         .unwrap_or_else(|| panic!("{sql}: expected an error"))
         .code()
@@ -28,7 +28,7 @@ fn err(db: &mut Session, sql: &str) -> String {
 
 fn query(db: &mut Session, sql: &str) -> Vec<Vec<String>> {
     match db
-        .execute(sql, &[])
+        .query_outcome(sql, &[])
         .unwrap_or_else(|e| panic!("{sql}: {}", e.message))
     {
         Outcome::Query { rows, .. } => rows
@@ -103,7 +103,7 @@ fn canonical_name_and_aliases() {
         .session(SessionOptions::default());
     run(&mut db3, "CREATE TABLE u (id i32 PRIMARY KEY, r int4range)");
     let msg = db3
-        .execute("CREATE INDEX ON u USING gin (r)", &[])
+        .query_outcome("CREATE INDEX ON u USING gin (r)", &[])
         .expect_err("a gin index over a plain range column is rejected")
         .message;
     assert!(msg.contains("i32range"), "message names i32range: {msg}");

@@ -17,7 +17,7 @@ fn tmp(name: &str) -> PathBuf {
 }
 
 fn run(db: &mut Session, sql: &str) -> Outcome {
-    db.execute(sql, &[])
+    db.query_outcome(sql, &[])
         .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
 }
 

@@ -31,13 +31,13 @@ fn tmp(name: &str) -> std::path::PathBuf {
 /// partner. Every column is fixed-width, so on a paged reopen the leaf is Packed with no deferred
 /// values — the case `row_at_masked` skips whole-column decodes that `row_at` would have done.
 fn seed(db: &mut Session) {
-    db.execute(
+    db.query_outcome(
         "CREATE TABLE w (\
             id i32 PRIMARY KEY, c0 i16, c1 i32, c2 i64, c3 i32, c4 i16, c5 i64, c6 i32, c7 i32)",
         &[],
     )
     .unwrap();
-    db.execute(
+    db.query_outcome(
         "INSERT INTO w VALUES \
             (1, 10, 100, 1000, 7, 3, 500, 42, 9), \
             (2, 20, 100, 2000, 7, NULL, 600, 43, 8), \
@@ -47,10 +47,11 @@ fn seed(db: &mut Session) {
         &[],
     )
     .unwrap();
-    db.execute("CREATE INDEX w_c3 ON w (c3)", &[]).unwrap();
-    db.execute("CREATE TABLE w2 (id i32 PRIMARY KEY, k i32, note i32)", &[])
+    db.query_outcome("CREATE INDEX w_c3 ON w (c3)", &[])
         .unwrap();
-    db.execute(
+    db.query_outcome("CREATE TABLE w2 (id i32 PRIMARY KEY, k i32, note i32)", &[])
+        .unwrap();
+    db.query_outcome(
         "INSERT INTO w2 VALUES (1, 7, 71), (2, 8, 82), (3, 7, 73), (5, 9, 95)",
         &[],
     )
@@ -61,7 +62,7 @@ fn seed(db: &mut Session) {
 /// `ORDER BY` has unspecified order, CLAUDE.md §8; sorting both sides is sound for equality either way).
 fn rows_sorted(db: &mut Session, sql: &str) -> Vec<Vec<String>> {
     let mut rs: Vec<Vec<String>> = match db
-        .execute(sql, &[])
+        .query_outcome(sql, &[])
         .unwrap_or_else(|e| panic!("{sql}: {e:?}"))
     {
         Outcome::Query { rows, .. } => rows
@@ -76,7 +77,7 @@ fn rows_sorted(db: &mut Session, sql: &str) -> Vec<Vec<String>> {
 
 fn cost(db: &mut Session, sql: &str) -> i64 {
     match db
-        .execute(sql, &[])
+        .query_outcome(sql, &[])
         .unwrap_or_else(|e| panic!("{sql}: {e:?}"))
     {
         Outcome::Query { cost, .. } => cost,
@@ -204,7 +205,7 @@ fn paged_masked_scan_matches_resident_across_query_shapes() {
 /// columnar walk only visits leaves. Both databases use the DEFAULT page size so their tree shapes (hence
 /// the page_read node counts) are identical; the depth comes from the row count, not a shrunk page.
 fn seed_multilevel(db: &mut Session) {
-    db.execute(
+    db.query_outcome(
         "CREATE TABLE m (id i32 PRIMARY KEY, k i32, a i32, b i16, f f64)",
         &[],
     )
@@ -237,7 +238,7 @@ fn seed_multilevel(db: &mut Session) {
             ));
             i += 1;
         }
-        db.execute(&sql, &[]).unwrap();
+        db.query_outcome(&sql, &[]).unwrap();
         start += CHUNK;
     }
 }

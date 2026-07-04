@@ -7,7 +7,7 @@
 use jed::{CreateOptions, Database, Session, SessionOptions};
 
 fn err(db: &mut Session, sql: &str) -> String {
-    db.execute(sql, &[])
+    db.query_outcome(sql, &[])
         .err()
         .unwrap_or_else(|| panic!("{sql}: expected an error"))
         .code()

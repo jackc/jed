@@ -492,10 +492,7 @@ impl Row {
 /// arithmetic trap — streaming.md §6) rather than silently dropping it.
 fn run_with(q: impl FnOnce(&[Value]) -> Result<Rows>, params: impl Params) -> Result<u64> {
     let values = params.into_values()?;
-    let mut rows = q(&values)?;
-    while rows.next().is_some() {}
-    rows.error()?;
-    Ok(rows.rows_affected().map(|n| n.max(0) as u64).unwrap_or(0))
+    crate::api::drain_affected(q(&values)?)
 }
 
 /// Bind `params`, run `q`, and collect the result into typed [`Row`]s (column names shared `Rc`).

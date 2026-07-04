@@ -9,7 +9,7 @@ fn db_with(sql: &[&str]) -> Session {
         .unwrap()
         .session(SessionOptions::default());
     for s in sql {
-        db.execute(s, &[])
+        db.query_outcome(s, &[])
             .unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
@@ -24,7 +24,7 @@ fn negative_keys_sort_before_positive() {
         "INSERT INTO t VALUES (-1)",
         "INSERT INTO t VALUES (0)",
     ] {
-        db.execute(v, &[]).unwrap();
+        db.query_outcome(v, &[]).unwrap();
     }
     let rows = db.rows_in_key_order("t").unwrap();
     let ids: Vec<Value> = rows.iter().map(|r| r[0].clone()).collect();
@@ -34,9 +34,9 @@ fn negative_keys_sort_before_positive() {
 #[test]
 fn boundary_values_round_trip() {
     let mut db = db_with(&["CREATE TABLE t (id i32 PRIMARY KEY, s i16, b i64)"]);
-    db.execute("INSERT INTO t VALUES (1, 32767, 9223372036854775807)", &[])
+    db.query_outcome("INSERT INTO t VALUES (1, 32767, 9223372036854775807)", &[])
         .unwrap();
-    db.execute(
+    db.query_outcome(
         "INSERT INTO t VALUES (2, -32768, -9223372036854775808)",
         &[],
     )
@@ -64,14 +64,14 @@ fn boundary_values_round_trip() {
 fn int32_and_int64_overflow_boundaries() {
     let mut db = db_with(&["CREATE TABLE t (id i32 PRIMARY KEY, n i32)"]);
     assert_eq!(
-        db.execute("INSERT INTO t VALUES (1, 2147483648)", &[])
+        db.query_outcome("INSERT INTO t VALUES (1, 2147483648)", &[])
             .unwrap_err()
             .code(),
         "22003"
     );
     // i32 max fits.
     assert_eq!(
-        db.execute("INSERT INTO t VALUES (2, 2147483647)", &[])
+        db.query_outcome("INSERT INTO t VALUES (2, 2147483647)", &[])
             .unwrap(),
         Outcome::Statement {
             cost: 0,
@@ -85,7 +85,9 @@ fn insert_into_missing_table_traps() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    let err = db.execute("INSERT INTO nope VALUES (1)", &[]).unwrap_err();
+    let err = db
+        .query_outcome("INSERT INTO nope VALUES (1)", &[])
+        .unwrap_err();
     assert_eq!(err.code(), "42P01");
 }
 
@@ -95,7 +97,7 @@ fn insert_into_missing_table_traps() {
 fn no_pk_multi_row_insert_keeps_insertion_order() {
     let mut db = db_with(&["CREATE TABLE log (a i32)"]);
     // No PK ⇒ monotonic synthetic rowids, allocated left-to-right; key order = insertion order.
-    db.execute("INSERT INTO log VALUES (30), (10), (20)", &[])
+    db.query_outcome("INSERT INTO log VALUES (30), (10), (20)", &[])
         .unwrap();
     let vals: Vec<Value> = db
         .rows_in_key_order("log")
@@ -109,14 +111,15 @@ fn no_pk_multi_row_insert_keeps_insertion_order() {
 #[test]
 fn no_pk_multi_row_insert_is_all_or_nothing() {
     let mut db = db_with(&["CREATE TABLE log (a i16)"]);
-    db.execute("INSERT INTO log VALUES (1)", &[]).unwrap();
+    db.query_outcome("INSERT INTO log VALUES (1)", &[]).unwrap();
     // The batch fails validation (second row overflows i16), so its first row (2) must
     // not be stored either — even though a no-PK row can never collide on its rowid.
     let err = db
-        .execute("INSERT INTO log VALUES (2), (99999)", &[])
+        .query_outcome("INSERT INTO log VALUES (2), (99999)", &[])
         .unwrap_err();
     assert_eq!(err.code(), "22003");
-    db.execute("INSERT INTO log VALUES (3), (4)", &[]).unwrap();
+    db.query_outcome("INSERT INTO log VALUES (3), (4)", &[])
+        .unwrap();
     let vals: Vec<Value> = db
         .rows_in_key_order("log")
         .unwrap()
@@ -139,7 +142,7 @@ fn insert_select_param_in_source_where() {
         "CREATE TABLE dst (id i32 PRIMARY KEY, a i16)",
     ]);
     // A `$1` inside the source SELECT binds through the SELECT's own resolver.
-    db.execute(
+    db.query_outcome(
         "INSERT INTO dst SELECT id, a FROM src WHERE id >= $1",
         &[Value::Int(2)],
     )
@@ -163,7 +166,7 @@ fn insert_select_cost_is_the_embedded_select_cost() {
     // 1 page_read (src is one leaf) + 3 scanned + 3 produced + 0 projection (bare columns) = 7;
     // storing the rows is unmetered.
     assert_eq!(
-        db.execute("INSERT INTO dst SELECT id, a, b FROM src", &[])
+        db.query_outcome("INSERT INTO dst SELECT id, a, b FROM src", &[])
             .unwrap(),
         Outcome::Statement {
             cost: 7,

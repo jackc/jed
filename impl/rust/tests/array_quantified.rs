@@ -9,7 +9,7 @@
 use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn err(db: &mut Session, sql: &str) -> String {
-    db.execute(sql, &[])
+    db.query_outcome(sql, &[])
         .err()
         .unwrap_or_else(|| panic!("{sql}: expected an error"))
         .code()
@@ -19,7 +19,7 @@ fn err(db: &mut Session, sql: &str) -> String {
 /// One-column, one-row scalar query → the rendered value (NULL renders as "NULL").
 fn val(db: &mut Session, sql: &str) -> String {
     match db
-        .execute(sql, &[])
+        .query_outcome(sql, &[])
         .unwrap_or_else(|e| panic!("{sql}: {}", e.message))
     {
         Outcome::Query { rows, .. } => {
@@ -111,9 +111,9 @@ fn column_literal_adaptation() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, xs i32[])", &[])
+    db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY, xs i32[])", &[])
         .unwrap();
-    db.execute(
+    db.query_outcome(
         "INSERT INTO t VALUES (1, ARRAY[10,20,30]), (2, ARRAY[40,50])",
         &[],
     )

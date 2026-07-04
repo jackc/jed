@@ -6,7 +6,7 @@ use jed::types::ScalarType;
 use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn create(db: &mut Session, sql: &str) -> jed::Result<Outcome> {
-    db.execute(sql, &[])
+    db.query_outcome(sql, &[])
 }
 
 #[test]

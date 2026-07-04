@@ -10,7 +10,7 @@
 use jed::{CreateOptions, Database, PrivilegeSet, Session, SessionOptions};
 
 fn code(db: &mut Session, sql: &str) -> String {
-    db.execute(sql, &[])
+    db.query_outcome(sql, &[])
         .err()
         .unwrap_or_else(|| panic!("expected an error from: {sql}"))
         .code()
@@ -29,9 +29,9 @@ fn default_session_has_no_budget_but_tracks_the_cumulative() {
         .session(SessionOptions::default());
     assert_eq!(db.lifetime_max_cost(), 0);
     assert_eq!(db.lifetime_cost(), 0);
-    db.execute("SELECT 1", &[]).unwrap(); // cost 1
+    db.query_outcome("SELECT 1", &[]).unwrap(); // cost 1
     assert_eq!(db.lifetime_cost(), 1);
-    db.execute(COST5, &[]).unwrap(); // cost 5
+    db.query_outcome(COST5, &[]).unwrap(); // cost 5
     assert_eq!(db.lifetime_cost(), 6);
 }
 
@@ -45,8 +45,8 @@ fn budget_aborts_in_flight_then_rejects_at_admission() {
     db.set_lifetime_max_cost(3);
     assert_eq!(db.lifetime_max_cost(), 3);
 
-    db.execute("SELECT 1", &[]).unwrap(); // cumulative 1
-    db.execute("SELECT 1", &[]).unwrap(); // cumulative 2
+    db.query_outcome("SELECT 1", &[]).unwrap(); // cumulative 1
+    db.query_outcome("SELECT 1", &[]).unwrap(); // cumulative 2
     // The third SELECT 1 drives the cumulative to 3 and aborts 54P02 (the instant it reaches the
     // budget). Its partial cost counts, so the cumulative is now exactly the budget.
     assert_eq!(code(&mut db, "SELECT 1"), "54P02");
@@ -80,22 +80,23 @@ fn the_cumulative_is_session_state_and_does_not_roll_back() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    db.execute("BEGIN", &[]).unwrap();
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
+    db.query_outcome("BEGIN", &[]).unwrap();
+    db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
         .unwrap();
-    db.execute("INSERT INTO t VALUES (1, 10)", &[]).unwrap();
-    db.execute(COST5, &[]).unwrap(); // cost 5
+    db.query_outcome("INSERT INTO t VALUES (1, 10)", &[])
+        .unwrap();
+    db.query_outcome(COST5, &[]).unwrap(); // cost 5
     let before_rollback = db.lifetime_cost();
     assert!(
         before_rollback >= 5,
         "cumulative should include the block's cost"
     );
-    db.execute("ROLLBACK", &[]).unwrap();
+    db.query_outcome("ROLLBACK", &[]).unwrap();
     // The table is gone (data rolled back) but the cumulative is unchanged (compute was spent).
     assert_eq!(db.lifetime_cost(), before_rollback);
     assert_eq!(code(&mut db, "SELECT v FROM t"), "42P01"); // table really did roll back
     // And the cumulative keeps building from there.
-    db.execute("SELECT 1", &[]).unwrap();
+    db.query_outcome("SELECT 1", &[]).unwrap();
     assert_eq!(db.lifetime_cost(), before_rollback + 1);
 }
 
@@ -140,22 +141,22 @@ fn an_additional_session_carries_its_own_budget() {
     // the two cumulatives are independent (each session owns its envelope).
     let db = Database::create(CreateOptions::default()).unwrap();
     let mut a = db.session(SessionOptions::default());
-    a.execute("SELECT 1", &[]).unwrap(); // a's cumulative 1
+    a.query_outcome("SELECT 1", &[]).unwrap(); // a's cumulative 1
 
     let mut budgeted = db.session(SessionOptions {
         lifetime_max_cost: 2,
         ..SessionOptions::default()
     });
-    budgeted.execute("SELECT 1", &[]).unwrap(); // its cumulative 1
+    budgeted.query_outcome("SELECT 1", &[]).unwrap(); // its cumulative 1
     // Its second statement drives its own budget to 2 and aborts 54P02 — independent of `a`.
-    let err = budgeted.execute("SELECT 1", &[]).err().unwrap();
+    let err = budgeted.query_outcome("SELECT 1", &[]).err().unwrap();
     assert_eq!(err.code(), "54P02");
     assert_eq!(budgeted.lifetime_cost(), 2);
 
     // `a` is untouched by the additional session's budget — it still runs, and its cumulative
     // reflects only its own statements.
     assert_eq!(a.lifetime_cost(), 1);
-    a.execute("SELECT 1", &[]).unwrap();
+    a.query_outcome("SELECT 1", &[]).unwrap();
     assert_eq!(a.lifetime_cost(), 2);
 }
 

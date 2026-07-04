@@ -42,11 +42,11 @@ fn create_default_session_persists_and_reopens() {
         })
         .unwrap();
         assert_eq!(db.version(), 1); // the initial empty image is committed as version 1
-        db.execute("CREATE TABLE t (id i64 PRIMARY KEY)", &[])
+        db.query_outcome("CREATE TABLE t (id i64 PRIMARY KEY)", &[])
             .unwrap();
         assert_eq!(db.version(), 2); // the autocommit CREATE published version 2
         for i in 1..=5 {
-            db.execute(&format!("INSERT INTO t VALUES ({i})"), &[])
+            db.query_outcome(&format!("INSERT INTO t VALUES ({i})"), &[])
                 .unwrap();
         }
         assert_eq!(count_via(&mut db), 5);
@@ -73,17 +73,17 @@ fn explicit_transaction_on_a_session_persists_then_rolls_back() {
         // Explicit transactions live on a Session (the persistent default-session bridge was removed
         // from `Database`): mint one over the file-backed core and drive BEGIN/COMMIT/ROLLBACK on it.
         let mut s = db.session(SessionOptions::default());
-        s.execute("CREATE TABLE t (id i64 PRIMARY KEY)", &[])
+        s.query_outcome("CREATE TABLE t (id i64 PRIMARY KEY)", &[])
             .unwrap();
         // A committed explicit block is durable.
         s.begin(true).unwrap();
-        s.execute("INSERT INTO t VALUES (1)", &[]).unwrap();
-        s.execute("INSERT INTO t VALUES (2)", &[]).unwrap();
+        s.query_outcome("INSERT INTO t VALUES (1)", &[]).unwrap();
+        s.query_outcome("INSERT INTO t VALUES (2)", &[]).unwrap();
         s.commit().unwrap();
         assert_eq!(count_session(&mut s), 2);
         // A rolled-back block leaves nothing.
         s.begin(true).unwrap();
-        s.execute("INSERT INTO t VALUES (3)", &[]).unwrap();
+        s.query_outcome("INSERT INTO t VALUES (3)", &[]).unwrap();
         s.rollback().unwrap();
         assert_eq!(count_session(&mut s), 2);
     }
@@ -125,9 +125,9 @@ fn read_only_open_rejects_writes() {
             ..Default::default()
         })
         .unwrap();
-        db.execute("CREATE TABLE t (id i64 PRIMARY KEY)", &[])
+        db.query_outcome("CREATE TABLE t (id i64 PRIMARY KEY)", &[])
             .unwrap();
-        db.execute("INSERT INTO t VALUES (1)", &[]).unwrap();
+        db.query_outcome("INSERT INTO t VALUES (1)", &[]).unwrap();
     }
     let mut db = Database::open_with_options(
         &path,
@@ -139,12 +139,14 @@ fn read_only_open_rejects_writes() {
     .unwrap();
     // Reads work; a write is 25006 on the read-only handle (it never touches the file).
     assert_eq!(count_via(&mut db), 1);
-    let err = db.execute("INSERT INTO t VALUES (2)", &[]).unwrap_err();
+    let err = db
+        .query_outcome("INSERT INTO t VALUES (2)", &[])
+        .unwrap_err();
     assert_eq!(err.code(), "25006");
     // A read/write session minted from a read-only core also rejects writes.
     let mut w = db.write_session();
     assert_eq!(
-        w.execute("INSERT INTO t VALUES (3)", &[])
+        w.query_outcome("INSERT INTO t VALUES (3)", &[])
             .unwrap_err()
             .code(),
         "25006",
@@ -169,9 +171,9 @@ fn file_backed_readers_run_concurrently_with_a_committing_writer() {
             page_size: 256,
         })
         .unwrap();
-        db.execute("CREATE TABLE t (id i64 PRIMARY KEY)", &[])
+        db.query_outcome("CREATE TABLE t (id i64 PRIMARY KEY)", &[])
             .unwrap();
-        db.execute("INSERT INTO t VALUES (1)", &[]).unwrap();
+        db.query_outcome("INSERT INTO t VALUES (1)", &[]).unwrap();
     }
 
     let db = Database::open_with_options(
@@ -189,7 +191,7 @@ fn file_backed_readers_run_concurrently_with_a_committing_writer() {
         std::thread::spawn(move || {
             for i in 2..=40 {
                 let mut w = core.write_session();
-                w.execute(&format!("INSERT INTO t VALUES ({i})"), &[])
+                w.query_outcome(&format!("INSERT INTO t VALUES ({i})"), &[])
                     .unwrap();
                 w.commit().unwrap();
             }

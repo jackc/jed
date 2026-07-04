@@ -23,9 +23,9 @@ fn create_commit_reopen_round_trips() {
     .unwrap()
     .session(SessionOptions::default());
     assert_eq!(db.txid(), 1); // the initial empty image is committed at create
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
+    db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
         .unwrap();
-    db.execute("INSERT INTO t VALUES (1, 10), (2, 20)", &[])
+    db.query_outcome("INSERT INTO t VALUES (1, 10), (2, 20)", &[])
         .unwrap();
     db.commit().unwrap();
     let after_commit = db.txid();
@@ -35,7 +35,7 @@ fn create_commit_reopen_round_trips() {
         .unwrap()
         .session(SessionOptions::default());
     assert_eq!(db.txid(), after_commit);
-    match db.execute("SELECT id, v FROM t", &[]).unwrap() {
+    match db.query_outcome("SELECT id, v FROM t", &[]).unwrap() {
         Outcome::Query { rows, .. } => assert_eq!(
             rows,
             vec![
@@ -111,15 +111,15 @@ fn autocommit_persists_each_write_across_close() {
     })
     .unwrap()
     .session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
+    db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
         .unwrap();
-    db.execute("INSERT INTO t VALUES (1)", &[]).unwrap(); // autocommitted, no explicit commit
+    db.query_outcome("INSERT INTO t VALUES (1)", &[]).unwrap(); // autocommitted, no explicit commit
     drop(db);
 
     let mut db = Database::open(&path)
         .unwrap()
         .session(SessionOptions::default());
-    match db.execute("SELECT id FROM t", &[]).unwrap() {
+    match db.query_outcome("SELECT id FROM t", &[]).unwrap() {
         Outcome::Query { rows, .. } => {
             assert_eq!(
                 rows,
@@ -137,9 +137,9 @@ fn commit_and_rollback_are_noops_under_autocommit() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
+    db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
         .unwrap();
-    db.execute("INSERT INTO t VALUES (1)", &[]).unwrap();
+    db.query_outcome("INSERT INTO t VALUES (1)", &[]).unwrap();
     db.commit().unwrap();
     db.rollback().unwrap(); // does NOT undo the autocommitted insert
     match db.query("SELECT id FROM t", &[]).unwrap().next() {
@@ -153,7 +153,7 @@ fn prepare_execute_and_query_with_params() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
+    db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
         .unwrap();
     let insert = db.prepare("INSERT INTO t VALUES ($1, $2)").unwrap();
     db.execute_prepared(&insert, &[Value::Int(1), Value::Int(100)])
@@ -174,9 +174,9 @@ fn one_shot_query_iterates_rows() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
+    db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
         .unwrap();
-    db.execute("INSERT INTO t VALUES (1), (2), (3)", &[])
+    db.query_outcome("INSERT INTO t VALUES (1), (2), (3)", &[])
         .unwrap();
     let ids: Vec<Value> = db
         .query("SELECT id FROM t", &[])
@@ -207,6 +207,36 @@ fn query_on_non_query_statement_is_total() {
 }
 
 #[test]
+fn execute_returns_affected_row_count() {
+    // The raw `execute` seam is exec-side sugar over the total `query` seam: it drains the cursor and
+    // returns the command tag as an affected-row count (rusqlite's `execute -> usize`). A SELECT / DDL
+    // carries no count and reports 0 (spec/design/api.md §11).
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
+    assert_eq!(
+        db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
+            .unwrap(),
+        0 // DDL carries no row count
+    );
+    assert_eq!(
+        db.execute("INSERT INTO t VALUES (1), (2), (3)", &[])
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        db.execute("UPDATE t SET id = id + 10 WHERE id >= 2", &[])
+            .unwrap(),
+        2
+    );
+    assert_eq!(db.execute("DELETE FROM t WHERE id = 1", &[]).unwrap(), 1);
+    assert_eq!(db.execute("SELECT id FROM t", &[]).unwrap(), 0); // a drained SELECT carries no count
+    // The prepared exec sibling returns the same count off the total `query` seam.
+    let ins = db.prepare("INSERT INTO t VALUES ($1)").unwrap();
+    assert_eq!(db.execute_prepared(&ins, &[Value::Int(99)]).unwrap(), 1);
+}
+
+#[test]
 fn errors_surface_with_sqlstate() {
     let db = Database::create(CreateOptions::default())
         .unwrap()
@@ -219,7 +249,7 @@ fn commit_on_in_memory_is_noop_success() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
+    db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
         .unwrap();
     let before = db.txid();
     db.commit().unwrap(); // no open block -> a no-op success, not an error
@@ -242,9 +272,10 @@ fn incremental_commit_round_trips_to_canonical_image() {
     })
     .unwrap()
     .session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
+    db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
         .unwrap();
-    db.execute("INSERT INTO t VALUES (5, 50)", &[]).unwrap();
+    db.query_outcome("INSERT INTO t VALUES (5, 50)", &[])
+        .unwrap();
     db.commit().unwrap();
     let canonical = db.to_image(db.page_size(), db.txid()).unwrap();
     drop(db);
@@ -274,9 +305,9 @@ fn open_read_only_blocks_writes_and_never_touches_the_file() {
     })
     .unwrap()
     .session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
+    db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
         .unwrap();
-    db.execute("INSERT INTO t VALUES (1)", &[]).unwrap();
+    db.query_outcome("INSERT INTO t VALUES (1)", &[]).unwrap();
     drop(db);
     let before = std::fs::read(&path).unwrap();
 
@@ -292,42 +323,46 @@ fn open_read_only_blocks_writes_and_never_touches_the_file() {
     assert!(db.read_only());
 
     // Reads work — bare and inside an explicit block (plain BEGIN defaults to READ ONLY here).
-    match db.execute("SELECT id FROM t", &[]).unwrap() {
+    match db.query_outcome("SELECT id FROM t", &[]).unwrap() {
         Outcome::Query { rows, .. } => assert_eq!(rows, vec![vec![Value::Int(1)]]),
         _ => panic!("expected a query"),
     }
-    db.execute("BEGIN", &[]).unwrap();
-    db.execute("SELECT id FROM t", &[]).unwrap();
-    db.execute("COMMIT", &[]).unwrap();
+    db.query_outcome("BEGIN", &[]).unwrap();
+    db.query_outcome("SELECT id FROM t", &[]).unwrap();
+    db.query_outcome("COMMIT", &[]).unwrap();
 
     // Autocommit writes are 25006 (the implicit transaction is read-only)...
     assert_eq!(
-        db.execute("INSERT INTO t VALUES (2)", &[])
+        db.query_outcome("INSERT INTO t VALUES (2)", &[])
             .unwrap_err()
             .code(),
         "25006"
     );
     // ...as are writes inside a block (which then poisons, like any in-block error)...
-    db.execute("BEGIN", &[]).unwrap();
+    db.query_outcome("BEGIN", &[]).unwrap();
     assert_eq!(
-        db.execute("DELETE FROM t", &[]).unwrap_err().code(),
+        db.query_outcome("DELETE FROM t", &[]).unwrap_err().code(),
         "25006"
     );
     assert_eq!(
-        db.execute("SELECT id FROM t", &[]).unwrap_err().code(),
+        db.query_outcome("SELECT id FROM t", &[])
+            .unwrap_err()
+            .code(),
         "25P02"
     );
-    db.execute("ROLLBACK", &[]).unwrap();
+    db.query_outcome("ROLLBACK", &[]).unwrap();
     // ...and an explicit READ WRITE request, via SQL or the host API.
     assert_eq!(
-        db.execute("BEGIN READ WRITE", &[]).unwrap_err().code(),
+        db.query_outcome("BEGIN READ WRITE", &[])
+            .unwrap_err()
+            .code(),
         "25006"
     );
     assert_eq!(db.begin(true).err().unwrap().code(), "25006");
     db.view(|tx| tx.query("SELECT id FROM t", &[]).map(|_| ()))
         .unwrap();
     assert_eq!(
-        db.update(|tx| tx.execute("DELETE FROM t", &[]).map(|_| ()))
+        db.update(|tx| tx.query_outcome("DELETE FROM t", &[]).map(|_| ()))
             .err()
             .unwrap()
             .code(),
@@ -343,7 +378,7 @@ fn open_read_only_blocks_writes_and_never_touches_the_file() {
         .unwrap()
         .session(SessionOptions::default());
     assert!(!db.read_only());
-    db.execute("INSERT INTO t VALUES (2)", &[]).unwrap();
+    db.query_outcome("INSERT INTO t VALUES (2)", &[]).unwrap();
 }
 
 #[test]
@@ -361,32 +396,39 @@ fn rows_affected_reports_dml_counts() {
     };
 
     let ddl = db
-        .execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
+        .query_outcome("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
         .unwrap();
     assert_eq!(affected(ddl), None);
     let ins = db
-        .execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)", &[])
+        .query_outcome("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)", &[])
         .unwrap();
     assert_eq!(affected(ins), Some(3));
     let upd = db
-        .execute("UPDATE t SET v = v + 1 WHERE id <= 2", &[])
+        .query_outcome("UPDATE t SET v = v + 1 WHERE id <= 2", &[])
         .unwrap();
     assert_eq!(affected(upd), Some(2));
-    let del = db.execute("DELETE FROM t WHERE id = 3", &[]).unwrap();
+    let del = db.query_outcome("DELETE FROM t WHERE id = 3", &[]).unwrap();
     assert_eq!(affected(del), Some(1));
-    let none = db.execute("DELETE FROM t WHERE id = 99", &[]).unwrap();
+    let none = db
+        .query_outcome("DELETE FROM t WHERE id = 99", &[])
+        .unwrap();
     assert_eq!(affected(none), Some(0));
-    let begin = db.execute("BEGIN", &[]).unwrap();
+    let begin = db.query_outcome("BEGIN", &[]).unwrap();
     assert_eq!(affected(begin), None);
-    let commit = db.execute("COMMIT", &[]).unwrap();
+    let commit = db.query_outcome("COMMIT", &[]).unwrap();
     assert_eq!(affected(commit), None);
 
     // INSERT ... SELECT counts the inserted rows; DML with RETURNING is a Query.
-    db.execute("CREATE TABLE dst (id i32 PRIMARY KEY)", &[])
+    db.query_outcome("CREATE TABLE dst (id i32 PRIMARY KEY)", &[])
         .unwrap();
-    let ins_sel = db.execute("INSERT INTO dst SELECT id FROM t", &[]).unwrap();
+    let ins_sel = db
+        .query_outcome("INSERT INTO dst SELECT id FROM t", &[])
+        .unwrap();
     assert_eq!(affected(ins_sel), Some(2));
-    match db.execute("DELETE FROM dst RETURNING id", &[]).unwrap() {
+    match db
+        .query_outcome("DELETE FROM dst RETURNING id", &[])
+        .unwrap()
+    {
         Outcome::Query { rows, .. } => assert_eq!(rows.len(), 2),
         _ => panic!("RETURNING must yield a query outcome"),
     }
@@ -400,11 +442,11 @@ fn table_names_lists_tables_sorted_excluding_indexes() {
         .unwrap()
         .session(SessionOptions::default());
     assert_eq!(db.table_names(), Vec::<String>::new());
-    db.execute("CREATE TABLE Zed (id i32 PRIMARY KEY, v i32)", &[])
+    db.query_outcome("CREATE TABLE Zed (id i32 PRIMARY KEY, v i32)", &[])
         .unwrap();
-    db.execute("CREATE TABLE apple (id i32 PRIMARY KEY)", &[])
+    db.query_outcome("CREATE TABLE apple (id i32 PRIMARY KEY)", &[])
         .unwrap();
-    db.execute("CREATE INDEX zed_v_idx ON Zed (v)", &[])
+    db.query_outcome("CREATE INDEX zed_v_idx ON Zed (v)", &[])
         .unwrap();
     // Sorted by LOWERCASED name (apple < zed), returning the canonical spelling (`Zed`).
     assert_eq!(
@@ -412,10 +454,10 @@ fn table_names_lists_tables_sorted_excluding_indexes() {
         vec!["apple".to_string(), "Zed".to_string()]
     );
     // The visible snapshot includes an open transaction's working set.
-    db.execute("BEGIN", &[]).unwrap();
-    db.execute("CREATE TABLE mid (id i32 PRIMARY KEY)", &[])
+    db.query_outcome("BEGIN", &[]).unwrap();
+    db.query_outcome("CREATE TABLE mid (id i32 PRIMARY KEY)", &[])
         .unwrap();
     assert_eq!(db.table_names(), vec!["apple", "mid", "Zed"]);
-    db.execute("ROLLBACK", &[]).unwrap();
+    db.query_outcome("ROLLBACK", &[]).unwrap();
     assert_eq!(db.table_names(), vec!["apple", "Zed"]);
 }

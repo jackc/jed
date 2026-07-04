@@ -55,7 +55,7 @@
 // wrapping the safe core (CLAUDE.md §13; ruby.md §4).
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use jed::{CreateOptions, Database, OpenOptions, Outcome, Session, SessionOptions, Value};
+use jed::{CreateOptions, Database, OpenOptions, Rows, Session, SessionOptions, Value};
 use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -151,58 +151,58 @@ fn ok_handle(db: Database) -> *mut u8 {
     b.finish()
 }
 
-/// Encode an executed statement's [`Outcome`] into a STATEMENT or QUERY buffer.
-fn ok_outcome(o: &Outcome) -> *mut u8 {
-    match o {
-        Outcome::Statement {
-            cost,
-            rows_affected,
-        } => {
-            let mut b = Buf::new(TAG_STATEMENT);
-            match rows_affected {
-                Some(n) => {
-                    b.u8(1);
-                    b.i64(*n);
-                }
-                None => {
-                    b.u8(0);
-                    b.i64(0);
-                }
+/// Encode a total-`query` [`Rows`] cursor into a STATEMENT or QUERY buffer. A cursor carrying output
+/// columns is a query (drain + encode QUERY); a no-column cursor IS a non-query statement (the
+/// total-`query` contract), encoded as a STATEMENT from its command tag. A **mid-drain** streaming
+/// error (a `54P01` cost abort, `57014` cancellation, or arithmetic trap) surfaces as an ERROR buffer
+/// rather than a silently truncated result.
+fn ok_result(mut rows: Rows) -> *mut u8 {
+    let column_names: Vec<String> = rows.column_names().to_vec();
+    let column_types: Vec<String> = rows.column_types().to_vec();
+    let drained: Vec<Vec<Value>> = rows.by_ref().collect();
+    if let Err(e) = rows.error() {
+        return err_buf(e.code(), &e.message);
+    }
+    let cost = rows.cost();
+    if column_names.is_empty() {
+        let mut b = Buf::new(TAG_STATEMENT);
+        match rows.rows_affected() {
+            Some(n) => {
+                b.u8(1);
+                b.i64(n);
             }
-            b.i64(*cost);
-            b.finish()
+            None => {
+                b.u8(0);
+                b.i64(0);
+            }
         }
-        Outcome::Query {
-            column_names,
-            column_types,
-            rows,
-            cost,
-        } => {
-            let mut b = Buf::new(TAG_QUERY);
-            b.i64(*cost);
-            b.u32(column_names.len() as u32);
-            for (i, name) in column_names.iter().enumerate() {
-                b.str(name);
-                // `column_types` is parallel to `column_names` by construction; fall back to
-                // "unknown" defensively so a short vector can never desync the wire layout.
-                b.str(column_types.get(i).map(|s| s.as_str()).unwrap_or("unknown"));
-            }
-            b.u32(rows.len() as u32);
-            for row in rows {
-                for v in row {
-                    match v {
-                        // A SQL NULL is the flag — NOT the rendered string "NULL" — so the gem can
-                        // distinguish it from a text value that happens to be "NULL" (ruby.md §3).
-                        Value::Null => b.u8(1),
-                        other => {
-                            b.u8(0);
-                            b.str(&other.render());
-                        }
+        b.i64(cost);
+        b.finish()
+    } else {
+        let mut b = Buf::new(TAG_QUERY);
+        b.i64(cost);
+        b.u32(column_names.len() as u32);
+        for (i, name) in column_names.iter().enumerate() {
+            b.str(name);
+            // `column_types` is parallel to `column_names` by construction; fall back to
+            // "unknown" defensively so a short vector can never desync the wire layout.
+            b.str(column_types.get(i).map(|s| s.as_str()).unwrap_or("unknown"));
+        }
+        b.u32(drained.len() as u32);
+        for row in &drained {
+            for v in row {
+                match v {
+                    // A SQL NULL is the flag — NOT the rendered string "NULL" — so the gem can
+                    // distinguish it from a text value that happens to be "NULL" (ruby.md §3).
+                    Value::Null => b.u8(1),
+                    other => {
+                        b.u8(0);
+                        b.str(&other.render());
                     }
                 }
             }
-            b.finish()
         }
+        b.finish()
     }
 }
 
@@ -412,8 +412,8 @@ pub extern "C" fn jed_execute(
             Ok(v) => v,
             Err(b) => return b,
         };
-        match conn.sess.execute(sql, &params) {
-            Ok(outcome) => ok_outcome(&outcome),
+        match conn.sess.query(sql, &params) {
+            Ok(rows) => ok_result(rows),
             Err(e) => err_buf(e.code(), &e.message),
         }
     })

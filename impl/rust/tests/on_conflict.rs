@@ -13,14 +13,14 @@ fn db_with(sql: &[&str]) -> Session {
         .unwrap()
         .session(SessionOptions::default());
     for s in sql {
-        db.execute(s, &[])
+        db.query_outcome(s, &[])
             .unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
 }
 
 fn err(db: &mut Session, sql: &str) -> String {
-    db.execute(sql, &[])
+    db.query_outcome(sql, &[])
         .expect_err(&format!("expected an error from {sql:?}"))
         .code()
         .to_string()
@@ -28,7 +28,7 @@ fn err(db: &mut Session, sql: &str) -> String {
 
 fn affected(db: &mut Session, sql: &str) -> Option<i64> {
     match db
-        .execute(sql, &[])
+        .query_outcome(sql, &[])
         .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
     {
         Outcome::Statement { rows_affected, .. } => rows_affected,

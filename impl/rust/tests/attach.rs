@@ -11,13 +11,13 @@ use jed::{AttachSource, CreateOptions, Database, Session, SessionOptions};
 
 /// Run a statement on a session and fail the test on error.
 fn exec(s: &mut Session, sql: &str) {
-    s.execute(sql, &[])
+    s.query_outcome(sql, &[])
         .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message));
 }
 
 /// Run a statement expected to fail and return its SQLSTATE.
 fn err_code(s: &mut Session, sql: &str) -> String {
-    s.execute(sql, &[])
+    s.query_outcome(sql, &[])
         .expect_err(&format!("{sql:?}: expected an error"))
         .code()
         .to_string()

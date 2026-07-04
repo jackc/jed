@@ -14,9 +14,9 @@ fn tables(n: i64) -> Session {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    db.execute("CREATE TABLE a (id i32 PRIMARY KEY, k i32)", &[])
+    db.query_outcome("CREATE TABLE a (id i32 PRIMARY KEY, k i32)", &[])
         .unwrap();
-    db.execute("CREATE TABLE b (id i32 PRIMARY KEY, k i32)", &[])
+    db.query_outcome("CREATE TABLE b (id i32 PRIMARY KEY, k i32)", &[])
         .unwrap();
     let mut sql = String::from("INSERT INTO a VALUES ");
     for i in 1..=n {
@@ -25,21 +25,21 @@ fn tables(n: i64) -> Session {
         }
         sql.push_str(&format!("({i},{i})"));
     }
-    db.execute(&sql, &[]).unwrap();
-    db.execute("INSERT INTO b VALUES (1, 500), (2, 600), (3, 700)", &[])
+    db.query_outcome(&sql, &[]).unwrap();
+    db.query_outcome("INSERT INTO b VALUES (1, 500), (2, 600), (3, 700)", &[])
         .unwrap();
     db
 }
 
 fn cost(db: &mut Session, sql: &str) -> i64 {
-    match db.execute(sql, &[]).unwrap() {
+    match db.query_outcome(sql, &[]).unwrap() {
         Outcome::Query { cost, .. } => cost,
         Outcome::Statement { cost, .. } => cost,
     }
 }
 
 fn ids(db: &mut Session, sql: &str) -> Vec<i64> {
-    match db.execute(sql, &[]).unwrap() {
+    match db.query_outcome(sql, &[]).unwrap() {
         Outcome::Query { rows, .. } => rows
             .into_iter()
             .map(|r| match r[0] {

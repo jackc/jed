@@ -17,7 +17,7 @@ fn tmp(name: &str) -> PathBuf {
 
 /// Run a query, returning `(rows, cost)`.
 fn run(db: &mut Session, sql: &str) -> (Vec<Vec<Value>>, i64) {
-    match db.execute(sql, &[]).unwrap() {
+    match db.query_outcome(sql, &[]).unwrap() {
         Outcome::Query { rows, cost, .. } => (rows, cost),
         other => panic!("expected a query result, got {other:?}"),
     }
@@ -27,7 +27,7 @@ fn run(db: &mut Session, sql: &str) -> (Vec<Vec<Value>>, i64) {
 /// has many duplicates + a repeating NULL (to exercise the stable-sort tie-break and NULL ordering),
 /// and a variable-length `s` (so a spilled run carries variable-width values).
 fn seed(db: &mut Session, n: i64) {
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, k i32, s text)", &[])
+    db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY, k i32, s text)", &[])
         .unwrap();
     for id in 0..n {
         // A scrambled key with duplicates; every 7th row's key is NULL.
@@ -37,7 +37,7 @@ fn seed(db: &mut Session, n: i64) {
             ((id * 48271) % 100).to_string()
         };
         let s = "x".repeat((id % 17) as usize); // 0..16 chars, variable width
-        db.execute(&format!("INSERT INTO t VALUES ({id}, {k}, '{s}')"), &[])
+        db.query_outcome(&format!("INSERT INTO t VALUES ({id}, {k}, '{s}')"), &[])
             .unwrap();
     }
 }
@@ -154,10 +154,10 @@ fn spilling_sort_is_stable_on_ties() {
     })
     .unwrap()
     .session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, k i32)", &[])
+    db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY, k i32)", &[])
         .unwrap();
     for id in 0..100 {
-        db.execute(&format!("INSERT INTO t VALUES ({id}, 5)"), &[])
+        db.query_outcome(&format!("INSERT INTO t VALUES ({id}, 5)"), &[])
             .unwrap();
     }
     db.set_work_mem(96); // force spilling so the merge tie-break is exercised

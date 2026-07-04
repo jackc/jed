@@ -10,7 +10,7 @@ fn db_with(stmts: &[&str]) -> Session {
         .unwrap()
         .session(SessionOptions::default());
     for s in stmts {
-        db.execute(s, &[])
+        db.query_outcome(s, &[])
             .unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
@@ -19,7 +19,7 @@ fn db_with(stmts: &[&str]) -> Session {
 /// Run a query and return its rows as nested Value vectors.
 fn query(db: &mut Session, sql: &str) -> Vec<Vec<Value>> {
     match db
-        .execute(sql, &[])
+        .query_outcome(sql, &[])
         .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
     {
         Outcome::Query { rows, .. } => rows,
@@ -98,7 +98,7 @@ fn limit_offset_window_reduces_produced_cost() {
         "INSERT INTO t VALUES (5, 50)",
     ]);
     let cost = db
-        .execute("SELECT id FROM t ORDER BY v LIMIT 2", &[])
+        .query_outcome("SELECT id FROM t ORDER BY v LIMIT 2", &[])
         .unwrap()
         .cost();
     assert_eq!(cost, 8);
@@ -108,11 +108,13 @@ fn limit_offset_window_reduces_produced_cost() {
 fn unknown_column_traps() {
     let mut db = setup();
     assert_eq!(
-        db.execute("SELECT nope FROM t", &[]).unwrap_err().code(),
+        db.query_outcome("SELECT nope FROM t", &[])
+            .unwrap_err()
+            .code(),
         "42703"
     );
     assert_eq!(
-        db.execute("SELECT id FROM t WHERE nope = 1", &[])
+        db.query_outcome("SELECT id FROM t WHERE nope = 1", &[])
             .unwrap_err()
             .code(),
         "42703"

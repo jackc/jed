@@ -16,10 +16,10 @@ fn seeded(rows: &[&str]) -> Session {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, s text)", &[])
+    db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY, s text)", &[])
         .unwrap();
     for (i, s) in rows.iter().enumerate() {
-        db.execute(&format!("INSERT INTO t VALUES ({}, '{}')", i + 1, s), &[])
+        db.query_outcome(&format!("INSERT INTO t VALUES ({}, '{}')", i + 1, s), &[])
             .unwrap();
     }
     db
@@ -28,7 +28,7 @@ fn seeded(rows: &[&str]) -> Session {
 /// The scalar value of `SELECT <expr> FROM t WHERE id = <id>`.
 fn at(db: &mut Session, expr: &str, id: usize) -> Value {
     match db
-        .execute(&format!("SELECT {expr} FROM t WHERE id = {id}"), &[])
+        .query_outcome(&format!("SELECT {expr} FROM t WHERE id = {id}"), &[])
         .unwrap()
     {
         Outcome::Query { rows, .. } => rows[0][0].clone(),
@@ -38,7 +38,7 @@ fn at(db: &mut Session, expr: &str, id: usize) -> Value {
 
 /// The SQLSTATE of a query expected to error per row.
 fn err_at(db: &mut Session, expr: &str, id: usize) -> String {
-    match db.execute(&format!("SELECT {expr} FROM t WHERE id = {id}"), &[]) {
+    match db.query_outcome(&format!("SELECT {expr} FROM t WHERE id = {id}"), &[]) {
         Err(e) => e.code().to_string(),
         Ok(_) => panic!("expected error for {expr} (id {id})"),
     }
@@ -119,8 +119,9 @@ fn text_to_float_null_propagates() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY, s text)", &[])
+    db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY, s text)", &[])
         .unwrap();
-    db.execute("INSERT INTO t VALUES (1, NULL)", &[]).unwrap();
+    db.query_outcome("INSERT INTO t VALUES (1, NULL)", &[])
+        .unwrap();
     assert_eq!(at(&mut db, "s :: float8", 1), Value::Null);
 }

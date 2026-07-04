@@ -12,7 +12,7 @@ use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
 
 fn query(db: &mut Session, sql: &str) -> Vec<Vec<Value>> {
     match db
-        .execute(sql, &[])
+        .query_outcome(sql, &[])
         .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
     {
         Outcome::Query { rows, .. } => rows,
@@ -22,7 +22,7 @@ fn query(db: &mut Session, sql: &str) -> Vec<Vec<Value>> {
 
 fn names(db: &mut Session, sql: &str) -> Vec<String> {
     match db
-        .execute(sql, &[])
+        .query_outcome(sql, &[])
         .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
     {
         Outcome::Query { column_names, .. } => column_names,
@@ -32,7 +32,7 @@ fn names(db: &mut Session, sql: &str) -> Vec<String> {
 
 fn types(db: &mut Session, sql: &str) -> Vec<String> {
     match db
-        .execute(sql, &[])
+        .query_outcome(sql, &[])
         .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
     {
         Outcome::Query { column_types, .. } => column_types,
@@ -51,7 +51,7 @@ fn ints(db: &mut Session, sql: &str) -> Vec<i64> {
 }
 
 fn cost(db: &mut Session, sql: &str) -> i64 {
-    db.execute(sql, &[])
+    db.query_outcome(sql, &[])
         .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
         .cost()
 }
@@ -155,7 +155,7 @@ fn params_typed_by_sibling_rows() {
         .session(SessionOptions::default());
     // A $1 in a column with a concrete sibling literal is typed by the unified column type.
     match db
-        .execute(
+        .query_outcome(
             "SELECT column1 FROM (VALUES (1), ($1)) AS v ORDER BY column1",
             &[Value::Int(7)],
         )
@@ -213,6 +213,10 @@ fn errors() {
         ("SELECT * FROM (VALUES (1)) AS v(a, b)", "42P10"),
     ];
     for (sql, code) in cases {
-        assert_eq!(db.execute(sql, &[]).unwrap_err().code(), *code, "{sql}");
+        assert_eq!(
+            db.query_outcome(sql, &[]).unwrap_err().code(),
+            *code,
+            "{sql}"
+        );
     }
 }

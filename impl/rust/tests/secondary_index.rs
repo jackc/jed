@@ -14,7 +14,7 @@ fn tmp(name: &str) -> PathBuf {
 }
 
 fn run(db: &mut Session, sql: &str) -> Outcome {
-    db.execute(sql, &[])
+    db.query_outcome(sql, &[])
         .unwrap_or_else(|e| panic!("{sql:?}: {}", e.message))
 }
 
@@ -39,7 +39,7 @@ fn ids(db: &mut Session, sql: &str) -> Vec<i64> {
 }
 
 fn err_code(db: &mut Session, sql: &str) -> String {
-    db.execute(sql, &[])
+    db.query_outcome(sql, &[])
         .expect_err(&format!("expected an error from {sql:?}"))
         .code()
         .to_string()

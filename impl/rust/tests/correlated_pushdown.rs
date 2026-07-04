@@ -15,11 +15,11 @@ fn tables(n: i64) -> Session {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    db.execute("CREATE TABLE o (id i32 PRIMARY KEY, k i32)", &[])
+    db.query_outcome("CREATE TABLE o (id i32 PRIMARY KEY, k i32)", &[])
         .unwrap();
-    db.execute("CREATE TABLE inr (id i32 PRIMARY KEY, v i32)", &[])
+    db.query_outcome("CREATE TABLE inr (id i32 PRIMARY KEY, v i32)", &[])
         .unwrap();
-    db.execute(
+    db.query_outcome(
         "INSERT INTO o VALUES (1, 100), (2, 300), (3, 500), (4, 700), (5, 900)",
         &[],
     )
@@ -31,19 +31,19 @@ fn tables(n: i64) -> Session {
         }
         sql.push_str(&format!("({i},{i})"));
     }
-    db.execute(&sql, &[]).unwrap();
+    db.query_outcome(&sql, &[]).unwrap();
     db
 }
 
 fn cost(db: &mut Session, sql: &str) -> i64 {
-    match db.execute(sql, &[]).unwrap() {
+    match db.query_outcome(sql, &[]).unwrap() {
         Outcome::Query { cost, .. } => cost,
         Outcome::Statement { cost, .. } => cost,
     }
 }
 
 fn ids(db: &mut Session, sql: &str) -> Vec<i64> {
-    match db.execute(sql, &[]).unwrap() {
+    match db.query_outcome(sql, &[]).unwrap() {
         Outcome::Query { rows, .. } => rows
             .into_iter()
             .map(|r| match r[0] {
@@ -110,7 +110,7 @@ fn correlated_miss_and_null_outer_seek_nothing() {
     let mut db = tables(1000);
     // An outer k with no matching inner id is a point-lookup miss (visits the leaf, reads no row); a
     // NULL outer k is a 3VL-empty bound (reads no page, no row). Neither re-scans the inner.
-    db.execute("INSERT INTO o VALUES (6, 999999), (7, NULL)", &[])
+    db.query_outcome("INSERT INTO o VALUES (6, 999999), (7, NULL)", &[])
         .unwrap();
     let got = ids(
         &mut db,

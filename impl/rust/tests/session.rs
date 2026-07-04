@@ -25,17 +25,17 @@ fn default_session_is_stateful_across_calls() {
         .session(SessionOptions::default());
     assert_eq!(db.status(), TxStatus::Idle);
 
-    db.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
+    db.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
         .unwrap();
-    db.execute("BEGIN", &[]).unwrap();
+    db.query_outcome("BEGIN", &[]).unwrap();
     assert_eq!(db.status(), TxStatus::Open);
-    db.execute("INSERT INTO t VALUES (1)", &[]).unwrap();
+    db.query_outcome("INSERT INTO t VALUES (1)", &[]).unwrap();
     assert_eq!(db.status(), TxStatus::Open); // still open across the separate call
-    db.execute("COMMIT", &[]).unwrap();
+    db.query_outcome("COMMIT", &[]).unwrap();
     assert_eq!(db.status(), TxStatus::Idle);
 
     assert_eq!(
-        rows(db.execute("SELECT id FROM t", &[]).unwrap()),
+        rows(db.query_outcome("SELECT id FROM t", &[]).unwrap()),
         vec![vec![Value::Int(1)]]
     );
 }
@@ -47,17 +47,20 @@ fn failed_block_is_the_failed_state() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    db.execute("BEGIN", &[]).unwrap();
+    db.query_outcome("BEGIN", &[]).unwrap();
     assert_eq!(
-        db.execute("SELECT * FROM missing", &[])
+        db.query_outcome("SELECT * FROM missing", &[])
             .err()
             .unwrap()
             .code(),
         "42P01"
     );
     assert_eq!(db.status(), TxStatus::Failed);
-    assert_eq!(db.execute("SELECT 1", &[]).err().unwrap().code(), "25P02");
-    db.execute("ROLLBACK", &[]).unwrap();
+    assert_eq!(
+        db.query_outcome("SELECT 1", &[]).err().unwrap().code(),
+        "25P02"
+    );
+    db.query_outcome("ROLLBACK", &[]).unwrap();
     assert_eq!(db.status(), TxStatus::Idle);
 }
 
@@ -67,9 +70,10 @@ fn additional_session_shares_storage_with_independent_settings() {
     // is shared through the core (§2.4) — no swap. Settings (the cost ceiling) are independent.
     let db = Database::create(CreateOptions::default()).unwrap();
     let mut a = db.session(SessionOptions::default());
-    a.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
+    a.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", &[])
         .unwrap();
-    a.execute("INSERT INTO t VALUES (1, 10)", &[]).unwrap();
+    a.query_outcome("INSERT INTO t VALUES (1, 10)", &[])
+        .unwrap();
 
     // A second session with its own cost ceiling — `a`'s is untouched.
     let mut s = db.session(SessionOptions {
@@ -81,14 +85,18 @@ fn additional_session_shares_storage_with_independent_settings() {
 
     // It sees `a`'s committed data (committed storage is shared via the core).
     assert_eq!(
-        rows(s.execute("SELECT id, v FROM t", &[]).unwrap()),
+        rows(s.query_outcome("SELECT id, v FROM t", &[]).unwrap()),
         vec![vec![Value::Int(1), Value::Int(10)]]
     );
 
     // A write through the second session (autocommit, lazy gate) is visible to `a`'s next read.
-    s.execute("INSERT INTO t VALUES (2, 20)", &[]).unwrap();
+    s.query_outcome("INSERT INTO t VALUES (2, 20)", &[])
+        .unwrap();
     assert_eq!(
-        rows(a.execute("SELECT id FROM t ORDER BY id", &[]).unwrap()),
+        rows(
+            a.query_outcome("SELECT id FROM t ORDER BY id", &[])
+                .unwrap()
+        ),
         vec![vec![Value::Int(1)], vec![Value::Int(2)]]
     );
 
@@ -103,24 +111,27 @@ fn additional_session_cost_ceiling_is_enforced() {
     // while an unlimited session runs it fine — both over the same shared core.
     let db = Database::create(CreateOptions::default()).unwrap();
     let mut a = db.session(SessionOptions::default());
-    a.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
+    a.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
         .unwrap();
-    a.execute("INSERT INTO t VALUES (1), (2), (3)", &[])
+    a.query_outcome("INSERT INTO t VALUES (1), (2), (3)", &[])
         .unwrap();
 
-    a.execute("SELECT * FROM t", &[]).unwrap(); // unlimited
+    a.query_outcome("SELECT * FROM t", &[]).unwrap(); // unlimited
 
     let mut s = db.session(SessionOptions {
         max_cost: 1,
         ..SessionOptions::default()
     });
     assert_eq!(
-        s.execute("SELECT * FROM t", &[]).err().unwrap().code(),
+        s.query_outcome("SELECT * FROM t", &[])
+            .err()
+            .unwrap()
+            .code(),
         "54P01"
     );
 
     // The unlimited session is unaffected.
-    a.execute("SELECT * FROM t", &[]).unwrap();
+    a.query_outcome("SELECT * FROM t", &[]).unwrap();
     assert_eq!(a.max_cost(), 0);
 }
 
@@ -128,20 +139,20 @@ fn additional_session_cost_ceiling_is_enforced() {
 fn additional_session_update_closure_commits_to_shared_storage() {
     let db = Database::create(CreateOptions::default()).unwrap();
     let mut a = db.session(SessionOptions::default());
-    a.execute("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
+    a.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
         .unwrap();
 
     let mut s = db.session(SessionOptions::default());
     s.update(|tx| {
-        tx.execute("INSERT INTO t VALUES (1)", &[])?;
-        tx.execute("INSERT INTO t VALUES (2)", &[])?;
+        tx.query_outcome("INSERT INTO t VALUES (1)", &[])?;
+        tx.query_outcome("INSERT INTO t VALUES (2)", &[])?;
         Ok(())
     })
     .unwrap();
 
     // The update closure committed through the shared core; another session sees both rows.
     assert_eq!(
-        rows(a.execute("SELECT count(*) FROM t", &[]).unwrap()),
+        rows(a.query_outcome("SELECT count(*) FROM t", &[]).unwrap()),
         vec![vec![Value::Int(2)]]
     );
     assert_eq!(a.status(), TxStatus::Idle);

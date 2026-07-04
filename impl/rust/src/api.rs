@@ -43,12 +43,6 @@ impl PreparedStatement {
         &self.cache
     }
 
-    /// Run this statement against a low-level [`Engine`] handle, binding `params` to its `$N`
-    /// placeholders. Internal: the public path is [`Database::execute_prepared`](crate::Database::execute_prepared).
-    pub(crate) fn execute(&self, db: &mut Engine, params: &[Value]) -> Result<Outcome> {
-        db.execute_stmt_params(self.ast.clone(), params)
-    }
-
     /// Run this **query** statement against a low-level [`Engine`] handle, routing the parsed AST
     /// through the same lazy streaming / buffered / deferred lanes as the ad-hoc
     /// [`Engine::query`](Engine::query) (spec/design/streaming.md §3/§4/§7) — so a prepared query
@@ -212,6 +206,19 @@ impl Rows {
     }
 }
 
+/// Drain a total-`query` cursor to exhaustion and return its command tag as an affected-row count
+/// (`0` for a SELECT / DDL / transaction control, which carry no count — matching PostgreSQL). This is
+/// the shared exec-side lowering — "run the `query` seam, throw away the rows, keep the tag" — behind
+/// every `execute*`/`run` method (spec/design/api.md §11). A write already ran at the `query` call; a
+/// SELECT run this way streams to completion (O(1) peak, releasing its pin on drop). The full drain
+/// surfaces a mid-drain streaming error (a `54P01` cost abort, `57014` cancellation, or an arithmetic
+/// trap — streaming.md §6) rather than silently dropping it.
+pub(crate) fn drain_affected(mut rows: Rows) -> Result<u64> {
+    while rows.next().is_some() {}
+    rows.error()?;
+    Ok(rows.rows_affected().map(|n| n.max(0) as u64).unwrap_or(0))
+}
+
 impl Iterator for Rows {
     type Item = Vec<Value>;
 
@@ -258,7 +265,7 @@ impl Transaction<'_> {
     /// Run a (possibly mutating) statement within this transaction, binding `params`. A write in
     /// a READ ONLY transaction is `25006`; a statement error aborts the block (every later
     /// statement but commit/rollback is then `25P02`).
-    pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<Outcome> {
+    pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<u64> {
         self.db.execute(sql, params)
     }
 
@@ -276,7 +283,7 @@ impl Transaction<'_> {
         sql: &str,
         params: &[Value],
         cancel: &CancellationToken,
-    ) -> Result<Outcome> {
+    ) -> Result<u64> {
         cancel.check()?;
         let prev = self.db.session.cancel.replace(cancel.clone());
         let r = self.db.execute(sql, params);
@@ -393,12 +400,11 @@ impl Engine {
         })
     }
 
-    /// One-shot: parse + execute `sql`, binding `params` to its `$N` placeholders, returning the
-    /// materialized outcome. (The free function `jed::execute(db, sql)` is the zero-parameter
-    /// convenience kept for back-compat.)
-    pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<Outcome> {
-        let ast = self.parse(sql)?;
-        self.execute_stmt_params(ast, params)
+    /// One-shot: parse + run `sql`, binding `params` to its `$N` placeholders, and return the
+    /// affected-row count (`0` for a SELECT / DDL / transaction control). Exec-side sugar over the
+    /// total [`query`](Engine::query) seam — run, drain-and-discard the rows, return the tag (§11).
+    pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<u64> {
+        drain_affected(self.query(sql, params)?)
     }
 
     /// One-shot: parse + run a **query** `sql`, binding `params`, returning a row cursor. A
@@ -543,5 +549,66 @@ impl Engine {
             summary.cost += outcome.cost();
         }
         Ok(summary)
+    }
+}
+
+// ───────────────────────── white-box test seam (`query_outcome`) ─────────────────────────
+// The public API has one result type — `Rows` (a non-query statement is a `Rows` with no output
+// columns, carrying the command tag). These `#[cfg(test)]` helpers drain that real `query` cursor into
+// an `Outcome` so a test asserts on the full result set + tag at once — the shape the removed
+// `execute -> Outcome` API returned, but built over the seam callers actually use (CLAUDE.md §10:
+// prefer the real surface; a helper exists only for what a bare cursor makes verbose — draining every
+// row). They are inherent `pub(crate)` methods, so every in-crate test module calls `x.query_outcome(..)`
+// with no extra import. The Go core's `helpers_test.go` (`queryOutcome`/`drainOutcome`) is the mirror.
+
+/// Drain a total-`query` cursor into an [`Outcome`]: a cursor carrying output columns materializes to
+/// `Outcome::Query`; a no-column cursor IS a non-query statement, materializing to `Outcome::Statement`
+/// from its command tag. Cost + rows-affected are read after the drain (a streaming cursor accrues cost
+/// as it is pulled).
+#[cfg(test)]
+pub(crate) fn drain_to_outcome(mut rows: Rows) -> Result<Outcome> {
+    let column_names = rows.column_names().to_vec();
+    let column_types = rows.column_types().to_vec();
+    let mut out_rows = Vec::new();
+    while let Some(row) = rows.next() {
+        out_rows.push(row);
+    }
+    rows.error()?;
+    let cost = rows.cost();
+    if column_names.is_empty() {
+        Ok(Outcome::Statement {
+            cost,
+            rows_affected: rows.rows_affected(),
+        })
+    } else {
+        Ok(Outcome::Query {
+            column_names,
+            column_types,
+            rows: out_rows,
+            cost,
+        })
+    }
+}
+
+#[cfg(test)]
+impl Transaction<'_> {
+    /// Run `sql` through the real total-`query` seam and materialize the cursor into an [`Outcome`]
+    /// (white-box test helper — see [`drain_to_outcome`]).
+    pub(crate) fn query_outcome(&mut self, sql: &str, params: &[Value]) -> Result<Outcome> {
+        drain_to_outcome(self.query(sql, params)?)
+    }
+}
+
+#[cfg(test)]
+impl crate::Database {
+    pub(crate) fn query_outcome(&mut self, sql: &str, params: &[Value]) -> Result<Outcome> {
+        drain_to_outcome(self.query(sql, params)?)
+    }
+}
+
+#[cfg(test)]
+impl crate::Session {
+    pub(crate) fn query_outcome(&mut self, sql: &str, params: &[Value]) -> Result<Outcome> {
+        drain_to_outcome(self.query(sql, params)?)
     }
 }

@@ -11,7 +11,7 @@ fn db_with(stmts: &[&str]) -> Session {
         .unwrap()
         .session(SessionOptions::default());
     for s in stmts {
-        db.execute(s, &[])
+        db.query_outcome(s, &[])
             .unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
     }
     db
@@ -44,7 +44,9 @@ fn update_missing_table_traps() {
         .unwrap()
         .session(SessionOptions::default());
     assert_eq!(
-        db.execute("UPDATE nope SET a = 1", &[]).unwrap_err().code(),
+        db.query_outcome("UPDATE nope SET a = 1", &[])
+            .unwrap_err()
+            .code(),
         "42P01"
     );
 }
@@ -53,7 +55,9 @@ fn update_missing_table_traps() {
 fn update_unknown_column_traps() {
     let mut db = setup();
     assert_eq!(
-        db.execute("UPDATE t SET nope = 1", &[]).unwrap_err().code(),
+        db.query_outcome("UPDATE t SET nope = 1", &[])
+            .unwrap_err()
+            .code(),
         "42703"
     );
 }
@@ -64,7 +68,7 @@ fn update_unknown_column_traps() {
 #[test]
 fn update_pk_swap_is_end_state_valid() {
     let mut db = setup();
-    db.execute("UPDATE t SET id = 3 - id WHERE id <= 2", &[])
+    db.query_outcome("UPDATE t SET id = 3 - id WHERE id <= 2", &[])
         .unwrap();
     // (1,10,11)→(2,10,11) and (2,20,22)→(1,20,22); id 3 untouched.
     assert_eq!(ids_abs(&db), vec![(1, 20, 22), (2, 10, 11), (3, 30, 33)]);
@@ -76,7 +80,7 @@ fn update_pk_swap_is_end_state_valid() {
 #[test]
 fn update_pk_increment_cascade_succeeds() {
     let mut db = setup();
-    db.execute("UPDATE t SET id = id + 1", &[]).unwrap();
+    db.query_outcome("UPDATE t SET id = id + 1", &[]).unwrap();
     assert_eq!(ids_abs(&db), vec![(2, 10, 11), (3, 20, 22), (4, 30, 33)]);
 }
 
@@ -85,7 +89,7 @@ fn update_pk_increment_cascade_succeeds() {
 fn update_pk_collision_with_existing_traps() {
     let mut db = setup();
     assert_eq!(
-        db.execute("UPDATE t SET id = 3 WHERE id = 1", &[])
+        db.query_outcome("UPDATE t SET id = 3 WHERE id = 1", &[])
             .unwrap_err()
             .code(),
         "23505"
