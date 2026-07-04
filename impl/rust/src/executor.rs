@@ -308,7 +308,7 @@ pub struct Snapshot {
     /// main snapshot (its paging lives on the store, attached by the file/in-memory loader). Rides
     /// `#[derive(Clone)]` (an `Arc` bump) so a tx's `temp_working` creates stores against the same domain
     /// page space, and `#[derive(Default)]` (`None`). NEVER serialized (a temp snapshot never is).
-    temp_paging: Option<std::sync::Arc<crate::paging::SharedPaging>>,
+    store_paging: Option<std::sync::Arc<crate::paging::SharedPaging>>,
 }
 
 /// One FOREIGN KEY dependent surfaced by a multi-table `DROP TABLE`'s dependency scan
@@ -363,8 +363,8 @@ impl Snapshot {
     /// — spec/design/temp-tables.md §6, attached-databases.md §6). Set on a host-attached in-memory
     /// database's committed root at attach time (shared.rs) so its tables/indexes ride the same pager +
     /// packed-leaf path as an in-memory database. NEVER serialized (an attachment snapshot never is).
-    pub(crate) fn set_temp_paging(&mut self, paging: std::sync::Arc<crate::paging::SharedPaging>) {
-        self.temp_paging = Some(paging);
+    pub(crate) fn set_store_paging(&mut self, paging: std::sync::Arc<crate::paging::SharedPaging>) {
+        self.store_paging = Some(paging);
     }
 
     /// Register a composite type (CREATE TYPE). Lower-cased name is the key. The caller has
@@ -916,8 +916,8 @@ impl Snapshot {
         let mut st = TableStore::new(cap, col_types);
         // A temp snapshot rides a per-domain `MemoryBlockStore` pager (temp-tables.md §6): its stores
         // demand-page like a file/in-memory database instead of staying fully-resident decoded. The main
-        // snapshot leaves `temp_paging` `None` (its stores attach the storage identity's paging on load).
-        if let Some(paging) = &self.temp_paging {
+        // snapshot leaves `store_paging` `None` (its stores attach the storage identity's paging on load).
+        if let Some(paging) = &self.store_paging {
             st.attach_paging(paging.clone());
         }
         self.stores.insert(key.clone(), st);
@@ -1007,8 +1007,8 @@ impl Snapshot {
     /// the store is registered here.
     pub(crate) fn put_index_store(&mut self, name_key: String, mut store: TableStore) {
         // A temp snapshot's index stores ride the same per-domain `MemoryBlockStore` pager as its tables
-        // (temp-tables.md §6); the main snapshot leaves `temp_paging` `None`.
-        if let Some(paging) = &self.temp_paging {
+        // (temp-tables.md §6); the main snapshot leaves `store_paging` `None`.
+        if let Some(paging) = &self.store_paging {
             if !store.is_file_backed() {
                 store.attach_paging(paging.clone());
             }
@@ -4604,7 +4604,7 @@ impl Engine {
             let acap = crate::format::page_payload(ps);
             // Register into the attachment's working snapshot (attached-databases.md §6) — never the main
             // image; published into `Roots::attached` at commit (N-root commit, §5). `attach_write_snap`
-            // clones the attachment's committed root (which already carries its `temp_paging`) on first
+            // clones the attachment's committed root (which already carries its `store_paging`) on first
             // write and marks it dirty, so its NEW stores bind to the attachment's own paging.
             let ws = self.attach_write_snap(&name);
             ws.put_table_resolved(table, col_types, ps);
@@ -4654,9 +4654,9 @@ impl Engine {
             // The session-local temp snapshot rides a per-domain `MemoryBlockStore` pager
             // (temp-tables.md §6): lazily create the domain storage and stamp its paging onto the working
             // snapshot, so `put_table_resolved` / `put_index_store` attach it to every temp store.
-            let temp_paging = Some(self.temp_domain_paging());
+            let store_paging = Some(self.temp_domain_paging());
             let tw = self.temp_working_mut();
-            tw.temp_paging = temp_paging;
+            tw.store_paging = store_paging;
             tw.put_table_resolved(table, col_types, ps);
             for k in index_keys {
                 tw.put_index_store(k, TableStore::new(cap, Vec::new()));
@@ -5190,7 +5190,7 @@ impl Engine {
             // The attachment's index catalog entry + (empty) store live in its working snapshot,
             // published into `Roots::attached` at commit (attached-databases.md §5/§6).
             // `attach_write_snap` clones the attachment's committed root (which carries its
-            // `temp_paging`) on first write and marks it dirty. Build it at the attachment's own page
+            // `store_paging`) on first write and marks it dirty. Build it at the attachment's own page
             // size (§2), which may differ from main's.
             let aps = self.attach_page_size(name);
             self.attach_write_snap(name).put_index(&table_key, def, aps);

@@ -313,7 +313,7 @@ export class Database {
         engine.paging?.close(); // release the just-opened file — the name is taken
         throw engineError("duplicate_object", `database "${name}" already exists`);
       }
-      storage = engine; // its stores fault through engine.paging (bound at load); tempPaging stays unset
+      storage = engine; // its stores fault through engine.paging (bound at load); storePaging stays unset
       root = engine.committed;
     } else {
       if (lname === "main" || lname === "temp" || c.attachments.has(lname)) {
@@ -321,10 +321,10 @@ export class Database {
       }
       storage = newAttachedStorage(c.pageSize);
       // The fresh attachment's committed root: an empty snapshot whose NEW stores attach to its own paging
-      // (the same tempPaging seam session-local temp uses — a snapshot's tempPaging is "the paging new
+      // (the same storePaging seam session-local temp uses — a snapshot's storePaging is "the paging new
       // stores bind to").
       const empty = new Snapshot(0n);
-      empty.tempPaging = storage.paging;
+      empty.storePaging = storage.paging;
       root = empty;
     }
     c.attachments.set(lname, { name: lname, readOnly, storage });

@@ -936,14 +936,14 @@ export class Snapshot {
   // content-deterministic, gist.md §3) at every mutating statement and on load. Never mutated in
   // place (replaced wholesale on rebuild), so clone shallow-copies it.
   gistTrees: Map<string, GistTree> = new Map();
-  // tempPaging is the per-domain MemoryBlockStore paging context a TEMP snapshot's stores attach to
+  // storePaging is the per-domain MemoryBlockStore paging context a TEMP snapshot's stores attach to
   // (spec/design/temp-tables.md §6, bplus-reshape.md): non-null only for a session-local (or, later,
   // shared) temp snapshot, so its tables ride the same pager + packed-leaf path as an in-memory database
   // (compact, bounded, spill-ready) instead of a fully-resident decoded tree. null for the main snapshot
   // (its paging lives on the store, attached by the file/in-memory loader). Carried through clone() so a
   // tx's tempWorking creates stores against the same domain page space. NEVER serialized (a temp snapshot
   // never is).
-  tempPaging: SharedPaging | null = null;
+  storePaging: SharedPaging | null = null;
 
   constructor(
     txid: bigint = 0n,
@@ -983,7 +983,7 @@ export class Snapshot {
     c.gistTrees = new Map(this.gistTrees);
     c.catGen = this.catGen;
     // The temp domain's paging is shared by reference (one pool per domain), like a store's paging.
-    c.tempPaging = this.tempPaging;
+    c.storePaging = this.storePaging;
     return c;
   }
 
@@ -1411,8 +1411,8 @@ export class Snapshot {
     const st = new TableStore(pagePayload(pageSize), colTypes);
     // A temp snapshot rides a per-domain MemoryBlockStore pager (temp-tables.md §6): its stores demand-
     // page like a file/in-memory database instead of staying fully-resident decoded. The main snapshot
-    // leaves tempPaging null (its stores attach the storage identity's paging on load).
-    if (this.tempPaging !== null) st.attachPaging(this.tempPaging);
+    // leaves storePaging null (its stores attach the storage identity's paging on load).
+    if (this.storePaging !== null) st.attachPaging(this.storePaging);
     this.stores.set(key, st);
     this.tables.set(key, t);
   }
@@ -1487,8 +1487,8 @@ export class Snapshot {
   // entry, so only the store is registered here.
   putIndexStore(nameKey: string, store: TableStore): void {
     // A temp snapshot's index stores ride the same per-domain MemoryBlockStore pager as its tables
-    // (temp-tables.md §6); the main snapshot leaves tempPaging null.
-    if (this.tempPaging !== null && !store.isFileBacked()) store.attachPaging(this.tempPaging);
+    // (temp-tables.md §6); the main snapshot leaves storePaging null.
+    if (this.storePaging !== null && !store.isFileBacked()) store.attachPaging(this.storePaging);
     this.indexStores.set(nameKey, store);
   }
 
@@ -5102,9 +5102,9 @@ export class Engine {
       // Register into the attachment's working snapshot (attached-databases.md §6) — never the main
       // image; published into the attached roots at commit (N-root commit, §5). attachWriteSnap clones
       // the attachment's committed root on first write and marks it dirty. Its NEW stores bind to the
-      // attachment's own paging (the tempPaging seam — the same one temp/in-memory main use).
+      // attachment's own paging (the storePaging seam — the same one temp/in-memory main use).
       const ws = this.attachWriteSnap(attachName)!;
-      ws.tempPaging = this.core!.attachments.get(attachName)!.storage.paging;
+      ws.storePaging = this.core!.attachments.get(attachName)!.storage.paging;
       const mainTypes = this.readSnap().types;
       const colTypes = table.columns.map((c) => resolveColType(c.type, mainTypes));
       // Build the attachment's new stores at ITS OWN page size (§2) — a file attachment may serialize at
@@ -5145,7 +5145,7 @@ export class Engine {
       // The session-local temp snapshot rides a per-domain MemoryBlockStore pager (temp-tables.md §6):
       // lazily create the domain storage on first use and stamp its paging onto this working snapshot, so
       // putTableResolved / putIndexStore attach it to every temp store.
-      ts.tempPaging = this.tempDomainPaging();
+      ts.storePaging = this.tempDomainPaging();
       ts.putTableResolved(table, colTypes, this.pageSize);
       for (const ix of table.indexes) {
         ts.putIndexStore(
@@ -5658,7 +5658,7 @@ export class Engine {
       // The attachment's index catalog entry + (empty) store live in its working snapshot, published
       // into the attached roots at commit (attached-databases.md §5/§6). attachWriteSnap marks it dirty.
       const ws = this.attachWriteSnap(attachName)!;
-      ws.tempPaging = this.core!.attachments.get(attachName)!.storage.paging;
+      ws.storePaging = this.core!.attachments.get(attachName)!.storage.paging;
       ws.putIndex(tableKey, def, this.attachPageSize(attachName)); // the attachment's own page space (§2)
     } else if (this.isTempTable(ci.table)) {
       this.session.tx!.tempDirty = true;

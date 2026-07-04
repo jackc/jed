@@ -540,7 +540,7 @@ func (db *Database) Attach(name string, source AttachSource, readOnly bool) erro
 			readOnly:  e.readOnly,
 			path:      e.path,
 		}
-		root = e.committed // its stores fault through st.paging (bound at load); tempPaging stays nil
+		root = e.committed // its stores fault through st.paging (bound at load); storePaging stays nil
 	}
 	c := db.core
 	c.writeMu.Lock()
@@ -553,10 +553,10 @@ func (db *Database) Attach(name string, source AttachSource, readOnly bool) erro
 	}
 	if st == nil {
 		// A fresh in-memory attachment: an empty root whose NEW stores attach to its own paging (the same
-		// seam session-local temp uses — a snapshot's tempPaging is "the paging new stores bind to").
+		// seam session-local temp uses — a snapshot's storePaging is "the paging new stores bind to").
 		st = newAttachedStorage(c.pageSize())
 		empty := newSnapshot()
-		empty.tempPaging = st.paging
+		empty.storePaging = st.paging
 		root = empty
 	}
 	mode := attachReadWrite

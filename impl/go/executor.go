@@ -144,13 +144,13 @@ type snapshot struct {
 	// load, so a committed snapshot always carries a fresh, cross-core-identical tree a SELECT can
 	// descend. Never mutated in place (replaced wholesale on rebuild), so clone shallow-copies it.
 	gistTrees map[string]*gistTree
-	// tempPaging is the per-domain MemoryBlockStore paging context a TEMP snapshot's stores attach to
+	// storePaging is the per-domain MemoryBlockStore paging context a TEMP snapshot's stores attach to
 	// (spec/design/temp-tables.md §6, bplus-reshape.md): non-nil only for a session-local temp
 	// snapshot, so its tables ride the same pager + packed-leaf path as an in-memory database (compact,
 	// bounded, spill-ready) instead of a fully-resident decoded tree. nil for the main snapshot (its
 	// paging lives on the storage identity). Carried through clone() so a tx's tempWorking creates stores
 	// against the same domain page space. NEVER serialized (a temp snapshot never is).
-	tempPaging *sharedPaging
+	storePaging *sharedPaging
 }
 
 // newSnapshot builds an empty snapshot.
@@ -205,7 +205,7 @@ func (s *snapshot) clone() *snapshot {
 	for k, v := range s.gistTrees {
 		gistTrees[k] = v
 	}
-	return &snapshot{txid: s.txid, catGen: s.catGen, tables: tables, types: types, stores: stores, indexStores: indexStores, sequences: sequences, collations: collations, defaultCollation: s.defaultCollation, gistTrees: gistTrees, tempPaging: s.tempPaging}
+	return &snapshot{txid: s.txid, catGen: s.catGen, tables: tables, types: types, stores: stores, indexStores: indexStores, sequences: sequences, collations: collations, defaultCollation: s.defaultCollation, gistTrees: gistTrees, storePaging: s.storePaging}
 }
 
 // demoteCleanLeaves demotes every store's clean, persisted resident leaves to OnDisk references —
@@ -762,9 +762,9 @@ func (s *snapshot) putTableResolved(t *catTable, colTypes []colType, pageSize ui
 	st := newTableStore(pagePayload(pageSize), colTypes)
 	// A temp snapshot rides a per-domain MemoryBlockStore pager (temp-tables.md §6): its stores demand-page
 	// like a file/in-memory database instead of staying fully-resident decoded. The main snapshot leaves
-	// tempPaging nil (its stores attach the storage identity's paging on load).
-	if s.tempPaging != nil {
-		st.attachPaging(s.tempPaging)
+	// storePaging nil (its stores attach the storage identity's paging on load).
+	if s.storePaging != nil {
+		st.attachPaging(s.storePaging)
 	}
 	s.stores[key] = st
 	s.tables[key] = t
@@ -855,9 +855,9 @@ func (s *snapshot) setColumnDefaultExpr(tableKey string, column int, de *default
 // so only the store is registered here.
 func (s *snapshot) putIndexStore(nameKey string, store *tableStore) {
 	// A temp snapshot's index stores ride the same per-domain MemoryBlockStore pager as its tables
-	// (temp-tables.md §6); the main snapshot leaves tempPaging nil.
-	if s.tempPaging != nil && store.paging == nil {
-		store.attachPaging(s.tempPaging)
+	// (temp-tables.md §6); the main snapshot leaves storePaging nil.
+	if s.storePaging != nil && store.paging == nil {
+		store.attachPaging(s.storePaging)
 	}
 	s.indexStores[nameKey] = store
 }
@@ -4709,9 +4709,9 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 		// Register into the attachment's working snapshot (attached-databases.md §6) — never the main
 		// image; published into roots.attached at commit (N-root commit, §5). attachWriteSnap clones the
 		// attachment's committed root on first write and marks it dirty. Its NEW stores bind to the
-		// attachment's own paging (the tempPaging seam — the same one temp/in-memory main use).
+		// attachment's own paging (the storePaging seam — the same one temp/in-memory main use).
 		ws := db.attachWriteSnap(attachName)
-		ws.tempPaging = db.core.attachments[attachName].storage.paging
+		ws.storePaging = db.core.attachments[attachName].storage.paging
 		mainTypes := db.readSnap().types
 		colTypes := make([]colType, len(table.Columns))
 		for i, c := range table.Columns {
@@ -4755,7 +4755,7 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 		// The session-local temp snapshot rides a per-domain MemoryBlockStore pager (temp-tables.md §6):
 		// lazily create the domain storage on first use and stamp its paging onto this working snapshot, so
 		// putTableResolved / putIndexStore attach it to every temp store.
-		ts.tempPaging = db.tempDomainPaging()
+		ts.storePaging = db.tempDomainPaging()
 		ts.putTableResolved(table, colTypes, db.pageSize)
 		for _, ix := range table.Indexes {
 			ts.putIndexStore(strings.ToLower(ix.Name), newTableStore(pagePayload(db.pageSize), nil))
@@ -5474,7 +5474,7 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 		// The attachment's index catalog entry + (empty) store live in its working snapshot, published
 		// into roots.attached at commit (attached-databases.md §5/§6). attachWriteSnap marks it dirty.
 		ws := db.attachWriteSnap(attachName)
-		ws.tempPaging = db.core.attachments[attachName].storage.paging
+		ws.storePaging = db.core.attachments[attachName].storage.paging
 		ws.putIndex(tableKey, def, db.attachPageSize(attachName)) // the attachment's own page space (§2)
 	case db.isTempTable(ci.Table):
 		db.session.tx.tempDirty = true

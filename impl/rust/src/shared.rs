@@ -920,13 +920,13 @@ impl Database {
             }
             // A file source becomes (its storage, its committed root); an in-memory source is a fresh,
             // empty snapshot whose NEW stores attach to its OWN paging (the temp seam — a snapshot's
-            // `temp_paging` is "the paging new stores bind to").
+            // `store_paging` is "the paging new stores bind to").
             let (storage, root) = match file_backing {
                 Some((st, committed)) => (st, committed),
                 None => {
                     let storage = Storage::new_temp(self.0.page_size());
                     let mut empty = Snapshot::default();
-                    empty.set_temp_paging(storage.paging().clone());
+                    empty.set_store_paging(storage.paging().clone());
                     (storage, empty)
                 }
             };
