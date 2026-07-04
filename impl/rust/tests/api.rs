@@ -187,14 +187,23 @@ fn one_shot_query_iterates_rows() {
 }
 
 #[test]
-fn query_on_non_query_statement_errors() {
+fn query_on_non_query_statement_is_total() {
+    // `query` is the one total seam (spec/design/api.md §11): a non-query statement is observably a
+    // `Rows` with no output columns, carrying its command tag — NOT a "use execute" error (the removed
+    // effect-then-error surprise). A DDL run through `query` succeeds and yields an empty result.
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
-    assert!(
-        db.query("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
-            .is_err()
-    );
+    let mut rows = db
+        .query("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
+        .unwrap();
+    assert!(rows.column_names().is_empty());
+    assert!(rows.next().is_none());
+    assert_eq!(rows.rows_affected(), None); // DDL carries no row count
+    // And a write run through `query` performs the write and exposes its tag.
+    let mut ins = db.query("INSERT INTO t VALUES (1), (2)", &[]).unwrap();
+    while ins.next().is_some() {}
+    assert_eq!(ins.rows_affected(), Some(2));
 }
 
 #[test]

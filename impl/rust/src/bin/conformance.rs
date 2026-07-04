@@ -15,7 +15,7 @@
 //! core is the writer; the Go/TS harnesses stay pure verifiers, so re-running them is the
 //! independent cross-core check that all cores agree on the new costs (CLAUDE.md §8).
 
-use jed::{CreateOptions, Database, Outcome, SUPPORTED_CAPABILITIES, Session as JedSession, Value};
+use jed::{CreateOptions, Database, SUPPORTED_CAPABILITIES, Session as JedSession, Value};
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -784,7 +784,7 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
                 }
                 let expect = parts.next().unwrap_or("");
                 let sql = take_sql(&mut lines);
-                let result = sess.execute(&sql, &[]);
+                let result = drain_query(&mut sess, &sql);
                 match expect {
                     "ok" => match result {
                         Ok(outcome) => assert_cost(expected_cost, outcome.cost(), &sql)?,
@@ -827,7 +827,7 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
                     }
                     expected.push(l.trim().to_string());
                 }
-                let outcome = sess.execute(&sql, &[]).map_err(|e| {
+                let outcome = drain_query(&mut sess, &sql).map_err(|e| {
                     format!(
                         "query failed with {}: {}\n  SQL: {sql}",
                         e.code(),
@@ -835,7 +835,7 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
                     )
                 })?;
                 let cols = coltypes.len().max(1);
-                let actual = render_outcome(&outcome, cols, sortmode);
+                let actual = render_drained(&outcome, cols, sortmode);
                 let expected = apply_sort(expected, cols, sortmode);
                 if !results_match(&expected, &actual, coltypes, cols, sortmode) {
                     return Err(format!(
@@ -951,7 +951,7 @@ fn rebaseline_file(text: &str) -> Option<String> {
                     sql.push(out[i].clone());
                     i += 1;
                 }
-                let result = sess.execute(&sql.join("\n"), &[]);
+                let result = drain_query(&mut sess, &sql.join("\n"));
                 // Only a `statement ok` carries a cost; an error record never does.
                 if expect == "ok" {
                     result.ok().map(|o| o.cost())
@@ -973,7 +973,9 @@ fn rebaseline_file(text: &str) -> Option<String> {
                 while i < out.len() && !out[i].trim().is_empty() {
                     i += 1;
                 }
-                sess.execute(&sql.join("\n"), &[]).ok().map(|o| o.cost())
+                drain_query(&mut sess, &sql.join("\n"))
+                    .ok()
+                    .map(|o| o.cost())
             }
             _ => {
                 i += 1;
@@ -1023,15 +1025,58 @@ fn take_sql_until_separator<'a, I: Iterator<Item = &'a str>>(
     sql.join("\n")
 }
 
-/// Render a query outcome to a flat, row-major vector of value strings, then apply
-/// the sort mode. A non-query outcome renders empty (and will mismatch).
-fn render_outcome(outcome: &Outcome, cols: usize, sortmode: &str) -> Vec<String> {
-    let rows = match outcome {
-        Outcome::Query { rows, .. } => rows,
-        Outcome::Statement { .. } => return Vec::new(),
-    };
+/// The drained result of one statement run through the total streaming `query` seam — the bin's local
+/// stand-in for the (crate-internal) `Outcome`, so conformance exercises the one host-API seam
+/// (spec/design/api.md §11) real callers use, including its streaming / lazy lanes. A non-query
+/// statement has empty `column_names`/`column_types`.
+struct Drained {
+    column_names: Vec<String>,
+    column_types: Vec<String>,
+    rows: Vec<Vec<Value>>,
+    cost: i64,
+}
+
+impl Drained {
+    fn cost(&self) -> i64 {
+        self.cost
+    }
+    fn column_names(&self) -> &[String] {
+        &self.column_names
+    }
+    fn column_types(&self) -> &[String] {
+        &self.column_types
+    }
+}
+
+/// Run `sql` through the total `query` seam and drain it to a [`Drained`] — the single exec/query
+/// seam (a non-query statement is a `Rows` with no output columns). Draining exercises the same
+/// streaming/buffered/deferred lanes as a real host caller, so a mid-drain streaming error
+/// (`54P01` cost abort, `57014` cancellation, or an arithmetic trap — streaming.md §6) surfaces here,
+/// exactly matching the materialized path's error; a failing read inside a block poisons it via the
+/// cursor's drain hook (transactions.md §6).
+fn drain_query(sess: &mut JedSession, sql: &str) -> jed::Result<Drained> {
+    let mut rows = sess.query(sql, &[])?;
+    let column_names = rows.column_names().to_vec();
+    let column_types = rows.column_types().to_vec();
+    let mut collected = Vec::new();
+    while let Some(row) = rows.next() {
+        collected.push(row);
+    }
+    rows.error()?;
+    let cost = rows.cost();
+    Ok(Drained {
+        column_names,
+        column_types,
+        rows: collected,
+        cost,
+    })
+}
+
+/// Render a drained query result to a flat, row-major vector of value strings, then apply the sort
+/// mode. A non-query result renders empty (and will mismatch a `query` record).
+fn render_drained(drained: &Drained, cols: usize, sortmode: &str) -> Vec<String> {
     let mut flat = Vec::new();
-    for row in rows {
+    for row in &drained.rows {
         for v in row {
             flat.push(render_value(v));
         }
@@ -1221,7 +1266,7 @@ impl Session {
 fn run_record(sess: &mut JedSession, sid: &str, record: &Record) -> Result<(), String> {
     match record {
         Record::Statement { expect, code, sql } => {
-            let result = sess.execute(sql, &[]);
+            let result = drain_query(sess, sql);
             match expect.as_str() {
                 "ok" => {
                     if let Err(e) = result {
@@ -1255,7 +1300,7 @@ fn run_record(sess: &mut JedSession, sid: &str, record: &Record) -> Result<(), S
             sql,
             expected,
         } => {
-            let outcome = sess.execute(sql, &[]).map_err(|e| {
+            let outcome = drain_query(sess, sql).map_err(|e| {
                 format!(
                     "[{sid}] query failed with {}: {}\n  SQL: {sql}",
                     e.code(),
@@ -1263,7 +1308,7 @@ fn run_record(sess: &mut JedSession, sid: &str, record: &Record) -> Result<(), S
                 )
             })?;
             let cols = coltypes.len().max(1);
-            let actual = render_outcome(&outcome, cols, sortmode);
+            let actual = render_drained(&outcome, cols, sortmode);
             let exp = apply_sort(expected.clone(), cols, sortmode);
             if !results_match(&exp, &actual, coltypes, cols, sortmode) {
                 return Err(format!(

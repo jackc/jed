@@ -30,7 +30,6 @@ use std::rc::Rc;
 use crate::api::{Rows, Transaction};
 use crate::decimal::Decimal;
 use crate::error::{EngineError, Result, SqlState};
-use crate::executor::Outcome;
 use crate::shared::{Database, Session};
 use crate::value::Value;
 
@@ -485,18 +484,18 @@ impl Row {
 
 // ───────────────────────────── shared lowering helpers ─────────────────────────────
 
-/// Bind `params`, run `exec`, and return the affected-row count (`0` for DDL / transaction control,
-/// which carry no count — matching PostgreSQL / the raw [`Outcome`]).
-fn run_with(exec: impl FnOnce(&[Value]) -> Result<Outcome>, params: impl Params) -> Result<u64> {
+/// Bind `params`, run the total `query` seam, drain-and-discard the rows, and return the affected-row
+/// count (`0` for a SELECT / DDL / transaction control, which carry no count — matching PostgreSQL).
+/// This is the exec-side "throw away the rows, keep the tag": a write already ran at the `query` call,
+/// and a SELECT run via `run` streams to completion (O(1) peak, releasing its pin on drop). The full
+/// drain surfaces a mid-drain streaming error (a `54P01` cost abort, `57014` cancellation, or an
+/// arithmetic trap — streaming.md §6) rather than silently dropping it.
+fn run_with(q: impl FnOnce(&[Value]) -> Result<Rows>, params: impl Params) -> Result<u64> {
     let values = params.into_values()?;
-    let out = exec(&values)?;
-    Ok(match out {
-        Outcome::Statement {
-            rows_affected: Some(n),
-            ..
-        } => n.max(0) as u64,
-        _ => 0,
-    })
+    let mut rows = q(&values)?;
+    while rows.next().is_some() {}
+    rows.error()?;
+    Ok(rows.rows_affected().map(|n| n.max(0) as u64).unwrap_or(0))
 }
 
 /// Bind `params`, run `q`, and collect the result into typed [`Row`]s (column names shared `Rc`).
@@ -524,16 +523,18 @@ fn map_rows<T>(rows: Vec<Row>, mut f: impl FnMut(&Row) -> Result<T>) -> Result<V
 }
 
 /// The four ergonomic methods, generated for each handle type (`Database`, `Session`,
-/// `Transaction`). Each delegates to that type's existing raw `execute`/`query` — so the
-/// conformance contract is untouched — and differs only in which method it calls. Inherent methods
-/// cannot be shared by a trait without shadowing the raw `execute`/`query`, so a small macro keeps
-/// the three copies identical rather than hand-drifting (CLAUDE.md §5 — data over divergence).
+/// `Transaction`). Each delegates to that type's raw total `query` seam — so the conformance contract
+/// is untouched — including `run`, which drains the rows and reads the command tag off the cursor (the
+/// one internal exec/query seam). Inherent methods cannot be shared by a trait without shadowing the
+/// raw `query`, so a small macro keeps the three copies identical rather than hand-drifting
+/// (CLAUDE.md §5 — data over divergence).
 macro_rules! ergonomic_methods {
-    ($exec:ident, $query:ident) => {
-        /// Run a statement, binding native `params`, and return the affected-row count (`0` for DDL
-        /// / transaction control). The ergonomic sibling of the raw `execute` (rusqlite's `execute`).
+    ($query:ident) => {
+        /// Run a statement, binding native `params`, and return the affected-row count (`0` for a
+        /// SELECT / DDL / transaction control). The ergonomic sibling of rusqlite's `execute` — sugar
+        /// over the total `query` seam: run, drain-and-discard the rows, return the tag.
         pub fn run<P: Params>(&mut self, sql: &str, params: P) -> Result<u64> {
-            run_with(|v| self.$exec(sql, v), params)
+            run_with(|v| self.$query(sql, v), params)
         }
 
         /// Run a query, binding native `params`, and return every row as a typed [`Row`]
@@ -571,13 +572,13 @@ macro_rules! ergonomic_methods {
 }
 
 impl Database {
-    ergonomic_methods!(execute, query);
+    ergonomic_methods!(query);
 }
 
 impl Session {
-    ergonomic_methods!(execute, query);
+    ergonomic_methods!(query);
 }
 
 impl Transaction<'_> {
-    ergonomic_methods!(execute, query);
+    ergonomic_methods!(query);
 }

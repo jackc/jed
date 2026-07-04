@@ -1092,32 +1092,59 @@ impl Session {
         if self.access != Access::ReadOnly && !self.engine.in_transaction() && !stmt_is_write(ast) {
             self.refresh_committed();
         }
+        // A read served by a lazy lane never reaches the materialized `dispatch`, so enforce the
+        // read-path admission gates (25P02 / 54P02 / 42501) here — after refreshing so privilege
+        // resolution sees the snapshot the read will use. Reads only: transaction control must still
+        // work in a failed block, and a write is gated inside dispatch on the fall-through below (the
+        // safe-total-`query` contract, CLAUDE.md §13).
+        if !matches!(
+            ast,
+            Statement::Begin { .. } | Statement::Commit | Statement::Rollback
+        ) && !stmt_is_write(ast)
+        {
+            if let Err(e) = self.engine.gate_read_lanes(ast) {
+                return Err(self.engine.poison_on_lane_err(e));
+            }
+        }
         // One plan-once scan lane serves streaming AND buffered; a prepared statement reuses its
         // cached plan (`cache`). Register the pinned snapshot version in the watermark (streaming.md
         // §5); the returned guard deregisters on cursor close/drop, advancing `oldest_live_txid`.
-        if let Some(mut rows) = self.engine.try_scan_query(ast, params, cache)? {
-            // Bundle the reader-liveness pin with an open-stream guard: the guard increments the engine's
-            // open_streams so a session-local temp compaction defers while this cursor may still fault its
-            // pinned temp tree (temp-tables.md §6); both release on cursor close/drop.
-            rows.attach_pin(Box::new((
-                self.shared.reader_pin(self.base_version),
-                self.engine.open_stream_guard(),
-            )));
-            return Ok(rows);
+        match self.engine.try_scan_query(ast, params, cache) {
+            Err(e) => return Err(self.engine.poison_on_lane_err(e)),
+            Ok(Some(mut rows)) => {
+                // Bundle the reader-liveness pin with an open-stream guard: the guard increments the
+                // engine's open_streams so a session-local temp compaction defers while this cursor may
+                // still fault its pinned temp tree (temp-tables.md §6); both release on close/drop.
+                rows.attach_pin(Box::new((
+                    self.shared.reader_pin(self.base_version),
+                    self.engine.open_stream_guard(),
+                )));
+                // A drain-time fault inside an open block aborts it (the open-time lane errors are
+                // poisoned at the returns above); a no-op for an autocommit read.
+                self.engine.attach_block_poison(&mut rows);
+                return Ok(rows);
+            }
+            Ok(None) => {}
         }
-        if let Some(mut rows) = self.engine.try_deferred_query(ast, params)? {
-            // A lazy deferred set-op / WITH cursor (streaming.md §7) is a live reader too — pin its
-            // snapshot version in the watermark, released on cursor close/drop.
-            // Bundle the reader-liveness pin with an open-stream guard: the guard increments the engine's
-            // open_streams so a session-local temp compaction defers while this cursor may still fault its
-            // pinned temp tree (temp-tables.md §6); both release on cursor close/drop.
-            rows.attach_pin(Box::new((
-                self.shared.reader_pin(self.base_version),
-                self.engine.open_stream_guard(),
-            )));
-            return Ok(rows);
+        match self.engine.try_deferred_query(ast, params) {
+            Err(e) => return Err(self.engine.poison_on_lane_err(e)),
+            Ok(Some(mut rows)) => {
+                // A lazy deferred set-op / WITH cursor (streaming.md §7) is a live reader too — pin its
+                // snapshot version in the watermark, released on cursor close/drop (bundled with the
+                // open-stream guard, as above).
+                rows.attach_pin(Box::new((
+                    self.shared.reader_pin(self.base_version),
+                    self.engine.open_stream_guard(),
+                )));
+                self.engine.attach_block_poison(&mut rows);
+                return Ok(rows);
+            }
+            Ok(None) => {}
         }
-        Rows::from_outcome(self.dispatch(ast.clone(), params)?)
+        // The dispatch fall-through handles transaction control (a nested BEGIN's 25001 must NOT
+        // poison) and self-poisons on a regular statement error, so its nuanced poisoning is left
+        // intact — only the lazy-lane reads above, which bypass it, are poisoned here.
+        Ok(Rows::from_outcome(self.dispatch(ast.clone(), params)?))
     }
 
     /// Run a (possibly mutating) statement under a [`CancellationToken`] (spec/design/api.md §11.4):

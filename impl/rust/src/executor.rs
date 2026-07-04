@@ -1296,7 +1296,7 @@ impl TxStatus {
     fn of(tx: &Option<ActiveTx>) -> TxStatus {
         match tx {
             None => TxStatus::Idle,
-            Some(t) if t.failed => TxStatus::Failed,
+            Some(t) if t.is_failed() => TxStatus::Failed,
             Some(_) => TxStatus::Open,
         }
     }
@@ -1655,7 +1655,13 @@ impl SessionState {
 /// never mutated). Either way `committed` is untouched until commit, so ROLLBACK just drops this.
 pub(crate) struct ActiveTx {
     writable: bool,
-    failed: bool,
+    /// The block's aborted flag (spec/design/transactions.md §6). An `Arc<AtomicBool>` rather than a
+    /// plain `bool` so a **streaming/deferred read cursor born in this block can poison it from its
+    /// drain** (a mid-drain trap aborts the block, PG-faithful): the cursor outlives the `&mut Engine`
+    /// borrow, so it holds a clone of this flag and flips it on error — the same shared-`Arc` channel
+    /// the open-stream guard uses (`Engine::attach_block_poison`). Cloning is scoped to this block, so
+    /// a cursor that outlives its block only touches an orphaned flag (harmless).
+    failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     working: Snapshot,
     /// The handle's `currval`/`lastval` session state (spec/design/sequences.md §6) captured when
     /// this transaction opened. A `nextval`/`setval` inside the block updates the handle's session
@@ -1688,6 +1694,21 @@ pub(crate) struct ActiveTx {
     /// Which attachments this transaction mutated (lowercased names) — the per-attachment analogue of
     /// `main_dirty`/`temp_dirty`, the set the commit persists + publishes.
     attach_dirty: HashSet<String>,
+}
+
+impl ActiveTx {
+    /// Whether the block is aborted (spec/design/transactions.md §6) — reads the shared `failed` flag.
+    fn is_failed(&self) -> bool {
+        self.failed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Abort the block (set the shared `failed` flag). Takes `&self` because the flag is an
+    /// `Arc<AtomicBool>` — so a poison from a lane cursor's drain (which only holds `&self`-equivalent
+    /// access via a clone) reaches the same store.
+    fn mark_failed(&self) {
+        self.failed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl Default for Engine {
@@ -2449,7 +2470,7 @@ impl Engine {
     /// ([`crate::shared`]) reads this at commit to know whether to publish (a failed block
     /// publishes nothing — a failed COMMIT is a ROLLBACK, PostgreSQL).
     pub(crate) fn tx_failed(&self) -> bool {
-        self.session.tx.as_ref().is_some_and(|t| t.failed)
+        self.session.tx.as_ref().is_some_and(|t| t.is_failed())
     }
 
     /// The monotonic commit counter (spec/design/api.md §2): 0 for a fresh in-memory database,
@@ -2899,7 +2920,7 @@ impl Engine {
         if self.session.tx.is_some() {
             let (failed, writable) = {
                 let tx = self.session.tx.as_ref().expect("tx is open");
-                (tx.failed, tx.writable)
+                (tx.is_failed(), tx.writable)
             };
             if failed {
                 return Err(EngineError::new(
@@ -2929,7 +2950,7 @@ impl Engine {
                 // them, ROLLBACK discards them with the rest of the working set (sequences.md §5).
                 self.flush_pending_sequences();
             } else {
-                self.session.tx.as_mut().expect("tx is open").failed = true;
+                self.session.tx.as_ref().expect("tx is open").mark_failed();
             }
             return result;
         }
@@ -2955,7 +2976,7 @@ impl Engine {
         }
         self.session.tx = Some(ActiveTx {
             writable: true,
-            failed: false,
+            failed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             working: self.committed.clone(),
             saved_session_seq: self.session.session_seq.clone(),
             saved_session_last_name: self.session.session_last_name.clone(),
@@ -3015,7 +3036,7 @@ impl Engine {
         }
         self.session.tx = Some(ActiveTx {
             writable: writable.unwrap_or(!self.read_only),
-            failed: false,
+            failed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             working: self.committed.clone(),
             saved_session_seq: self.session.session_seq.clone(),
             saved_session_last_name: self.session.session_last_name.clone(),
@@ -3056,7 +3077,7 @@ impl Engine {
             }
             Some(tx) => tx,
         };
-        if tx.failed || !tx.writable {
+        if tx.is_failed() || !tx.writable {
             // A failed or read-only block publishes nothing — a failed COMMIT is a ROLLBACK (PG),
             // so any in-block session updates revert with the discarded working set (§5/§6). The
             // discarded `temp_working` rolls back temp changes too (dropped with `tx`).
@@ -3238,6 +3259,61 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// Enforce the read-path admission gates a lazy read lane bypasses (the safe-total-`query`
+    /// contract, CLAUDE.md §13). A SELECT served by a streaming (S3) / deferred (S7) cursor never
+    /// reaches the materialized `execute_stmt_params`, where the failed-block / lifetime / privilege
+    /// gates live — so a total `query` would leak restricted rows and run reads in a failed/exhausted
+    /// session. `query_ast_cached` calls this before the lanes for a **read**: `25P02` (aborted block)
+    /// / `54P02` (lifetime budget) / `42501` (privilege). Reads only — transaction control must still
+    /// work in a failed block, and a write is gated inside `dispatch_stmt` on the materialized
+    /// fall-through. The three checks are pure, so the fall-through re-running them is harmless.
+    pub(crate) fn gate_read_lanes(&self, stmt: &Statement) -> Result<()> {
+        if self.tx_failed() {
+            return Err(EngineError::new(
+                SqlState::InFailedSqlTransaction,
+                "current transaction is aborted, commands ignored until end of transaction block",
+            ));
+        }
+        self.check_lifetime_admission()?;
+        self.check_privileges(stmt)
+    }
+
+    /// Abort an open, failable block (spec/design/transactions.md §6) — the block-abort a lazy read
+    /// lane bypasses. The materialized `execute_stmt_params` poisons in its block branch, but a SELECT
+    /// served by a streaming/deferred cursor never reaches it; PostgreSQL aborts a block on ANY
+    /// statement error, so a failing read must poison here. A no-op outside a block; idempotent. Only
+    /// reads reach these paths (transaction control and writes go to `dispatch_stmt`, which
+    /// self-poisons with the right nuance — a nested BEGIN's `25001` must NOT abort).
+    pub(crate) fn fail_open_block(&self) {
+        if let Some(tx) = self.session.tx.as_ref() {
+            tx.mark_failed();
+        }
+    }
+
+    /// Abort an open block when a lazy read lane errors at **open time** (a missing table, a denied
+    /// read, a plan-time trap) — the counterpart to [`gate_read_lanes`](Engine::gate_read_lanes).
+    /// Wraps a lane error return; `err` is returned unchanged.
+    pub(crate) fn poison_on_lane_err(&self, err: EngineError) -> EngineError {
+        self.fail_open_block();
+        err
+    }
+
+    /// Hook a lazy-lane cursor so a **drain-time** read error inside an open block aborts it too
+    /// (spec/design/transactions.md §6). A streaming (S3) / deferred (S7) cursor's error surfaces
+    /// during the caller's drain — after `query` returned — so the open-time `poison_on_lane_err`
+    /// cannot see it. The cursor cannot reach the block state (it outlives the `&mut Engine` borrow),
+    /// so it holds a clone of the block's shared `failed` flag and flips it on error (the same
+    /// shared-`Arc` channel the open-stream guard uses). A no-op when no block is open; a cursor that
+    /// outlives its block only touches an orphaned flag (harmless).
+    pub(crate) fn attach_block_poison(&self, rows: &mut Rows) {
+        if let Some(tx) = self.session.tx.as_ref() {
+            let flag = tx.failed.clone();
+            rows.attach_error_hook(Box::new(move || {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            }));
+        }
     }
 
     /// Dispatch one parsed statement to its executor. The autocommit transaction handling
@@ -11855,6 +11931,7 @@ impl Engine {
             let offset = plan.offset.unwrap_or(0);
             let distinct = plan.distinct;
             let column_names = plan.column_names.clone();
+            let column_types = type_names(&plan.column_types);
             let done = empty || limit == Some(0);
             let stream = StreamingScan {
                 engine: snap,
@@ -11871,7 +11948,11 @@ impl Engine {
                 produced: 0,
                 done,
             };
-            return Ok(Some(Rows::from_streaming(column_names, Box::new(stream))));
+            return Ok(Some(Rows::from_streaming(
+                column_names,
+                column_types,
+                Box::new(stream),
+            )));
         }
 
         // Blocking (buffered) shape: buffers its input but yields the output one row at a time.
@@ -11879,6 +11960,7 @@ impl Engine {
         let mut meter = snap.session.new_meter();
         meter.accrued = subquery_cost; // the folded constant cost (lifetime already charged)
         let column_names = plan.column_names.clone();
+        let column_types = type_names(&plan.column_types);
         let stream = BufferedScan {
             engine: snap,
             plan,
@@ -11887,7 +11969,11 @@ impl Engine {
             meter,
             state: BufState::Pending,
         };
-        Ok(Some(Rows::from_streaming(column_names, Box::new(stream))))
+        Ok(Some(Rows::from_streaming(
+            column_names,
+            column_types,
+            Box::new(stream),
+        )))
     }
 
     /// Whether a resolved scan plan may be memoized on a prepared statement (spec/design/api.md §2.4).
@@ -11938,7 +12024,7 @@ impl Engine {
         // the deferred run produces (the run on first pull reuses `run_set_op`/`run_with` verbatim, so
         // there is no rows/cost drift). A planning error (42P01/42804/…) surfaces at `query()`,
         // matching the eager path.
-        let column_names = self.deferred_column_names(ast)?;
+        let (column_names, column_types) = self.deferred_column_names(ast)?;
         let stream = DeferredResult {
             engine: self.snapshot_engine(),
             query: Some(query),
@@ -11946,7 +12032,11 @@ impl Engine {
             state: DeferredState::Pending,
             cost: 0,
         };
-        Ok(Some(Rows::from_streaming(column_names, Box::new(stream))))
+        Ok(Some(Rows::from_streaming(
+            column_names,
+            column_types,
+            Box::new(stream),
+        )))
     }
 
     /// The output column names of a top-level set operation / pure-query `WITH`, resolved by planning
@@ -11954,33 +12044,31 @@ impl Engine {
     /// ([`try_deferred_query`]). Mirrors the planning prefix of `run_set_op` / `run_with` exactly so the
     /// names match the deferred run's. Bound params are not needed: column names never depend on bound
     /// values.
-    fn deferred_column_names(&self, ast: &Statement) -> Result<Vec<String>> {
+    fn deferred_column_names(&self, ast: &Statement) -> Result<(Vec<String>, Vec<String>)> {
         let mut ptypes = ParamTypes::default();
-        let names = match ast {
-            Statement::SetOp(so) => self
-                .plan_query(
-                    &QueryExpr::SetOp(Box::new(so.clone())),
-                    None,
-                    &[],
-                    &mut ptypes,
-                )?
-                .column_names()
-                .to_vec(),
+        let plan = match ast {
+            Statement::SetOp(so) => self.plan_query(
+                &QueryExpr::SetOp(Box::new(so.clone())),
+                None,
+                &[],
+                &mut ptypes,
+            )?,
             Statement::With(wq) => {
                 // The planning prefix of `run_with` (cte.md): plan the CTE bindings, then the body with
-                // them visible. The body's column names are the WITH's output names.
+                // them visible. The body's column names/types are the WITH's output names/types.
                 let bindings = self.plan_cte_bindings(&wq.ctes, wq.recursive, &mut ptypes)?;
                 let body_q = wq
                     .body
                     .as_query()
                     .expect("a pure-query WITH (DML excluded by stmt_is_write)");
                 self.plan_query(body_q, None, &bindings, &mut ptypes)?
-                    .column_names()
-                    .to_vec()
             }
             _ => unreachable!("try_deferred_query only calls this for SetOp / With"),
         };
-        Ok(names)
+        Ok((
+            plan.column_names().to_vec(),
+            type_names(plan.column_types()),
+        ))
     }
 
     /// Streaming secondary-index-order scan (spec/design/cost.md §3 "secondary-index order"): an

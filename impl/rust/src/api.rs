@@ -68,12 +68,28 @@ impl PreparedStatement {
 /// is the same either way, so callers are unchanged.
 pub struct Rows {
     column_names: Vec<String>,
+    /// The canonical type name of each output column (parallel to `column_names`), carried on the
+    /// total `query` seam so a streaming read exposes its types like the materialized [`Outcome`] did
+    /// — `i16`/`text`/`decimal`/…, or `unknown` for an untyped NULL column (spec/design/conformance.md
+    /// §7). Empty for a non-query statement.
+    column_types: Vec<String>,
     cursor: Cursor,
+    /// The command tag for a statement run through the now-total `query` seam (spec/design/api.md §4):
+    /// how many rows a DML statement (INSERT/UPDATE/DELETE without RETURNING) touched. `None` for a
+    /// SELECT / DDL / transaction control, which carry no count. This is how the exec-side path (`run`)
+    /// reads the tag off a drained `Rows` — "run is throw away the rows, keep the count."
+    rows_affected: Option<i64>,
     /// A mid-drain error from a streaming cursor (a `54P01` cost abort, `57014` cancellation, or an
     /// arithmetic trap). The `Iterator` yields `Option`, so an error mid-drain stops iteration and is
     /// stashed here; [`Rows::error`] / the ergonomic collectors surface it after draining
     /// (streaming.md §6). Always `None` for the buffered cursor (its work is already done).
     error: Option<EngineError>,
+    /// Fired **once** when iteration first hits a terminal error (a drain-time streaming/deferred
+    /// fault). Set by the shared-core query path ([`Engine::attach_block_poison`]) for a read inside an
+    /// open block, to abort the block — the open-time lane errors are poisoned at the `query` return,
+    /// this covers the errors that surface only during the caller's drain. `None` for an autocommit
+    /// read or a buffered cursor (whose error surfaces at open, not drain).
+    on_error: Option<Box<dyn FnOnce()>>,
     /// The reader-liveness pin (the watermark registration, spec/design/streaming.md §5), released on
     /// `close`/`Drop`. Opaque (`Box<dyn Any>`) so `api.rs` stays free of the shared-core type; its
     /// `Drop` deregisters. `None` for a buffered cursor or a bare single-handle stream (no shared core
@@ -82,35 +98,57 @@ pub struct Rows {
 }
 
 impl Rows {
-    pub(crate) fn from_outcome(outcome: Outcome) -> Result<Rows> {
+    /// Wrap a materialized [`Outcome`] as a `Rows`. **Total**: a non-query statement is observably a
+    /// `Rows` with no output columns — an empty buffered cursor seeded with the accrued cost, carrying
+    /// the command tag (rows-affected). This is the single exec/query seam: the exec-side path (`run`)
+    /// drains-and-discards such a `Rows` and returns the tag, so `query` on a statement that produces
+    /// no rows is valid, not a `42601` (the effect-then-error bug this removes — a write reached here
+    /// after `dispatch` already committed it; spec/design/api.md §11).
+    pub(crate) fn from_outcome(outcome: Outcome) -> Rows {
         match outcome {
             Outcome::Query {
                 column_names,
+                column_types,
                 rows,
                 cost,
-                ..
-            } => Ok(Rows {
+            } => Rows {
                 column_names,
+                column_types,
                 cursor: Cursor::buffered(rows, cost),
+                rows_affected: None,
                 error: None,
+                on_error: None,
                 _pin: None,
-            }),
-            Outcome::Statement { .. } => Err(EngineError::new(
-                SqlState::SyntaxError,
-                "query() called on a statement that produces no rows; use execute()",
-            )),
+            },
+            Outcome::Statement {
+                cost,
+                rows_affected,
+            } => Rows {
+                column_names: Vec::new(),
+                column_types: Vec::new(),
+                cursor: Cursor::buffered(Vec::new(), cost),
+                rows_affected,
+                error: None,
+                on_error: None,
+                _pin: None,
+            },
         }
     }
 
-    /// Wrap a lazy streaming pull source as a `Rows` cursor (S3, spec/design/streaming.md §4).
+    /// Wrap a lazy streaming pull source as a `Rows` cursor (S3, spec/design/streaming.md §4),
+    /// carrying the resolved output column names and types.
     pub(crate) fn from_streaming(
         column_names: Vec<String>,
+        column_types: Vec<String>,
         source: Box<dyn crate::cursor::RowStream>,
     ) -> Rows {
         Rows {
             column_names,
+            column_types,
             cursor: Cursor::streaming(source),
+            rows_affected: None,
             error: None,
+            on_error: None,
             _pin: None,
         }
     }
@@ -122,9 +160,30 @@ impl Rows {
         self._pin = Some(pin);
     }
 
+    /// Record a callback fired once when iteration first hits a terminal error
+    /// ([`Engine::attach_block_poison`] uses it to abort an open block on a drain-time read fault).
+    pub(crate) fn attach_error_hook(&mut self, hook: Box<dyn FnOnce()>) {
+        self.on_error = Some(hook);
+    }
+
     /// The output column names of the query result.
     pub fn column_names(&self) -> &[String] {
         &self.column_names
+    }
+
+    /// The canonical type name of each output column (parallel to [`column_names`](Rows::column_names);
+    /// empty for a non-query statement) — `i16`/`text`/`decimal`/…, or `unknown` for an untyped NULL
+    /// column (spec/design/conformance.md §7).
+    pub fn column_types(&self) -> &[String] {
+        &self.column_types
+    }
+
+    /// The command tag of the statement run through the total `query` seam (spec/design/api.md §4):
+    /// `Some(n)` rows touched by a DML statement (INSERT/UPDATE/DELETE without RETURNING); `None` for
+    /// a SELECT / DDL / transaction control, which carry no count. The exec-side `run` reads this off a
+    /// drained `Rows`.
+    pub fn rows_affected(&self) -> Option<i64> {
+        self.rows_affected
     }
 
     /// The deterministic execution cost accrued by the query (CLAUDE.md §13). Final once the
@@ -165,6 +224,11 @@ impl Iterator for Rows {
             Err(e) => {
                 // Stash the mid-drain error (streaming.md §6) and end iteration; `error()` surfaces it.
                 self.error = Some(e);
+                // Fire the block-poison hook once (transactions.md §6): a drain-time read fault inside
+                // an open block aborts it, so the next statement is `25P02` rather than wrongly running.
+                if let Some(hook) = self.on_error.take() {
+                    hook();
+                }
                 None
             }
         }
@@ -372,13 +436,41 @@ impl Engine {
         params: &[Value],
         cache: Option<&RefCell<Option<CachedPlan>>>,
     ) -> Result<Rows> {
-        if let Some(rows) = self.try_scan_query(ast, params, cache)? {
-            return Ok(rows);
+        // A read served by a lazy lane skips the materialized `execute_stmt_params`, so enforce the
+        // read-path admission gates (25P02 / 54P02 / 42501) up front — reads only (transaction control
+        // must work in a failed block; a write is gated inside dispatch on the fall-through). Keeps the
+        // bare-engine `query` a safe total seam (CLAUDE.md §13).
+        if !matches!(
+            ast,
+            Statement::Begin { .. } | Statement::Commit | Statement::Rollback
+        ) && !crate::executor::stmt_is_write(ast)
+        {
+            if let Err(e) = self.gate_read_lanes(ast) {
+                return Err(self.poison_on_lane_err(e));
+            }
         }
-        if let Some(rows) = self.try_deferred_query(ast, params)? {
-            return Ok(rows);
+        match self.try_scan_query(ast, params, cache) {
+            Err(e) => return Err(self.poison_on_lane_err(e)),
+            Ok(Some(mut rows)) => {
+                self.attach_block_poison(&mut rows);
+                return Ok(rows);
+            }
+            Ok(None) => {}
         }
-        Rows::from_outcome(self.execute_stmt_params(ast.clone(), params)?)
+        match self.try_deferred_query(ast, params) {
+            Err(e) => return Err(self.poison_on_lane_err(e)),
+            Ok(Some(mut rows)) => {
+                self.attach_block_poison(&mut rows);
+                return Ok(rows);
+            }
+            Ok(None) => {}
+        }
+        // The fall-through handles transaction control (a nested BEGIN's 25001 must NOT poison) and
+        // self-poisons on a regular statement error (`execute_stmt_params`), so its nuanced poisoning
+        // is left intact — only the lazy-lane reads above, which bypass it, are poisoned here.
+        Ok(Rows::from_outcome(
+            self.execute_stmt_params(ast.clone(), params)?,
+        ))
     }
 
     /// Run a multi-statement `sql` **script** on the default session (spec/design/session.md §4.2):
