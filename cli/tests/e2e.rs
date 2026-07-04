@@ -468,3 +468,149 @@ fn dump_replays_into_an_identical_database() {
     let _ = std::fs::remove_file(&dump_path);
     let _ = std::fs::remove_file(&replayed);
 }
+
+// ───────────────────────────── `jed migrate` subcommand ─────────────────────────────
+
+/// The shared migrate corpus directory (../migrate/testdata/<sub>), used read-only.
+fn migrate_testdata(sub: &str) -> String {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../migrate/testdata")
+        .join(sub)
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
+fn tmp_dir(name: &str) -> PathBuf {
+    let p = std::env::temp_dir().join(format!("jed_e2e_{}_{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&p);
+    p
+}
+
+#[test]
+fn migrate_applies_up_then_status_then_down() {
+    let db = tmp("migrate.jed");
+    let db_str = db.to_str().unwrap();
+    let migs = migrate_testdata("blog");
+
+    // Apply to last on a fresh (nonexistent) file — it is created and every migration runs.
+    let r = run(&["migrate", "-m", &migs, db_str], "");
+    assert_eq!((r.code, r.stderr.as_str()), (0, ""), "apply: {}", r.stderr);
+    assert!(r.stdout.contains("up    001_create_users"), "{}", r.stdout);
+    assert!(r.stdout.contains("done — now at version 3"), "{}", r.stdout);
+
+    // status reports the high-water mark.
+    let r = run(&["migrate", "status", "-m", &migs, db_str], "");
+    assert_eq!((r.code, r.stderr.as_str()), (0, ""));
+    assert!(r.stdout.contains("version:  3 of 3"), "{}", r.stdout);
+    assert!(r.stdout.contains("[x] 003_add_email_index"), "{}", r.stdout);
+
+    // Down to 1 (via an absolute destination), then a re-run is a no-op.
+    let r = run(&["migrate", "-d", "1", "-m", &migs, db_str], "");
+    assert_eq!((r.code, r.stderr.as_str()), (0, ""));
+    assert!(
+        r.stdout.contains("down  003_add_email_index"),
+        "{}",
+        r.stdout
+    );
+    assert!(r.stdout.contains("now at version 1"), "{}", r.stdout);
+
+    let r = run(&["migrate", "-d", "1", "-m", &migs, db_str], "");
+    assert_eq!((r.code, r.stderr.as_str()), (0, ""));
+    assert!(r.stdout.contains("nothing to do"), "{}", r.stdout);
+
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn migrate_irreversible_down_exits_2() {
+    let db = tmp("migrate_irr.jed");
+    let db_str = db.to_str().unwrap();
+    let migs = migrate_testdata("irreversible");
+
+    let r = run(&["migrate", "-m", &migs, db_str], "");
+    assert_eq!(r.code, 0, "{}", r.stderr);
+
+    // Migrating down through the irreversible 002 fails with exit code 2.
+    let r = run(&["migrate", "-d", "0", "-m", &migs, db_str], "");
+    assert_eq!(r.code, 2);
+    assert!(r.stderr.contains("irreversible"), "{}", r.stderr);
+
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn migrate_failing_statement_exits_2() {
+    let db = tmp("migrate_txc.jed");
+    let db_str = db.to_str().unwrap();
+    let migs = migrate_testdata("tx_control");
+
+    let r = run(&["migrate", "-m", &migs, db_str], "");
+    assert_eq!(r.code, 2);
+    assert!(r.stderr.contains("0A000"), "{}", r.stderr);
+    assert!(r.stderr.contains("in statement:"), "{}", r.stderr);
+
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn migrate_bad_target_exits_1() {
+    let db = tmp("migrate_bad.jed");
+    let db_str = db.to_str().unwrap();
+    let migs = migrate_testdata("blog");
+    let r = run(&["migrate", "-d", "9", "-m", &migs, db_str], "");
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("out of range"), "{}", r.stderr);
+    let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn migrate_status_on_missing_db_exits_1() {
+    let db = tmp("migrate_missing.jed");
+    let r = run(
+        &[
+            "migrate",
+            "status",
+            "-m",
+            &migrate_testdata("blog"),
+            db.to_str().unwrap(),
+        ],
+        "",
+    );
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("does not exist"), "{}", r.stderr);
+}
+
+#[test]
+fn migrate_new_scaffolds_next_sequence() {
+    let dir = tmp_dir("migrate_new");
+    let dir_str = dir.to_str().unwrap();
+
+    let r = run(&["migrate", "new", "create_users", "-m", dir_str], "");
+    assert_eq!((r.code, r.stderr.as_str()), (0, ""));
+    assert!(r.stdout.contains("001_create_users.sql"), "{}", r.stdout);
+
+    let r = run(&["migrate", "new", "add_posts", "-m", dir_str], "");
+    assert_eq!(r.code, 0);
+    assert!(r.stdout.contains("002_add_posts.sql"), "{}", r.stdout);
+
+    let created = std::fs::read_to_string(dir.join("001_create_users.sql")).unwrap();
+    assert!(created.contains("---- create above / drop below ----"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn migrate_new_without_name_exits_1() {
+    let r = run(&["migrate", "new"], "");
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains("needs a NAME"), "{}", r.stderr);
+}
+
+#[test]
+fn a_dbfile_is_not_shadowed_by_the_migrate_verb() {
+    // The reserved word is only the *first* token; a normal invocation is untouched.
+    let r = run(&["-c", "SELECT 1 AS x"], "");
+    assert_eq!((r.code, r.stderr.as_str()), (0, ""));
+    assert!(r.stdout.contains("x"), "{}", r.stdout);
+}

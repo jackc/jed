@@ -27,6 +27,7 @@
       "impl/ts/**/*.js",
       "bench/ts/**/*.ts",
       "bench/ts/**/*.js",
+      "migrate/ts/**/*.ts",
       "!**/node_modules/**",
       "!impl/ts/src/operators.ts",
       "!impl/ts/src/costs.ts",

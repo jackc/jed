@@ -85,6 +85,38 @@ path.
 **Exit codes.** `0` success · `1` startup/usage error (bad flags; `58P01`/`58P02`/
 `XX001`/`58030` on open/create) · `2` a SQL statement failed in script mode.
 
+### 3.1 The `migrate` subcommand (the one reserved first-token verb)
+
+The CLI bundles the **`jed-migrate` Rust crate** (`/migrate`, spec `/migrate/design.md`) so schema
+migrations ship in the CLI with no separate binary — "the command line tool will bundle it in as
+well." This introduces the CLI's **first and only reserved first-token word**: if the first token is
+the literal **`migrate`**, everything after it is the migration subcommand; **any other first token
+is the DBFILE, exactly as above** (the `jed [OPTIONS] [DBFILE]` grammar is untouched for every
+non-`migrate` invocation). The only collision — a database file literally named `migrate` (no
+extension, in the cwd) — is reached by qualifying its path (`jed ./migrate`); the example dbfiles here
+carry a `.jed` extension, so it is a non-issue in practice.
+
+```
+jed migrate [-d TARGET] [-m DIR] [--version-table NAME] DBFILE   apply migrations up/down to TARGET
+jed migrate status       [-m DIR] [--version-table NAME] DBFILE  current version, target, pending count
+jed migrate new NAME     [-m DIR]                                scaffold NNN_NAME.sql (no database)
+
+  -d, --destination TARGET   integer | +N | -N | -+N | last   (tern's grammar; default: last)
+  -m, --migrations DIR       migrations directory              (default: ./migrations)
+      --version-table NAME   override the default `schema_version`
+```
+
+`status` and `new` are the fixed, small set of `migrate` sub-verbs; a first argument after `migrate`
+that is not one of them is the DBFILE for the default apply action. Bare `jed migrate DBFILE` applies
+to `last` (the tern-parity default), **creating DBFILE if it does not exist** (the migration-bootstrap
+workflow — the one place the CLI opens-or-creates, since a migrate run is expected to bring a fresh
+project's database into being); `-d`'s relative grammar is resolved to an absolute target before the
+library runs (design.md §6/§9). `migrate new` needs no database. Migration progress prints one line
+per applied migration; errors carry the migration name, direction, failing statement, and SQLSTATE.
+Exit codes extend §3's: `0` success · `1` usage/open/load error · **`2` a migration failed** (a
+statement error, or a down through an irreversible migration). The interactive TUI is out of scope
+for migrations in v1. Full contract: [`/migrate/design.md`](../../migrate/design.md) §9.
+
 **`--import-csv TABLE=FILE` imports a CSV** — the read half of the CSV story (`--format
 csv` + `-o` is the export half). It parses the RFC 4180 dialect the exporter writes
 (header row required; quoted fields, `""` escaping, CRLF or LF; quoted fields may span

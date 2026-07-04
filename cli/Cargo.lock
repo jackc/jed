@@ -221,8 +221,16 @@ version = "0.1.0"
 dependencies = [
  "crossterm",
  "jed",
+ "jed-migrate",
  "ratatui",
  "tui-textarea",
+]
+
+[[package]]
+name = "jed-migrate"
+version = "0.0.0"
+dependencies = [
+ "jed",
 ]
 
 [[package]]

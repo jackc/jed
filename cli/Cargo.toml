@@ -17,6 +17,10 @@ path = "src/main.rs"
 
 [dependencies]
 jed = { path = "../impl/rust" }
+# The `jed migrate` subcommand bundles the migrate crate (design.md §9): a sibling consumer of
+# the same Rust core, so migrations ship in the CLI with no separate binary to install. Not a
+# third-party dependency — it is part of this repo and depends only on the jed core + std.
+jed-migrate = { path = "../migrate/rust" }
 ratatui = "0.29"
 crossterm = "0.28"
 tui-textarea = "0.7"

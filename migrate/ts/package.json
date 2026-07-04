@@ -1,0 +1,15 @@
+{
+  "name": "jed-migrate",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A small, opt-in schema-migration library for jed, modeled on tern (spec: ../design.md). Runs on modern Node via native type-stripping; no build step. Depends only on its own jed core.",
+  "scripts": {
+    "test": "node --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.8.0"
+  }
+}

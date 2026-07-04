@@ -1,0 +1,19 @@
+{
+  // Type-checking only — the library and its tests RUN on bare Node via native
+  // type-stripping (no emit), so what tsc accepts here is exactly what Node can strip and
+  // run (the impl/ts convention). `erasableSyntaxOnly` enforces the elidable-TS subset.
+  "compilerOptions": {
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "target": "esnext",
+    "lib": ["esnext"],
+    "types": ["node"],
+    "strict": true,
+    "noEmit": true,
+    "erasableSyntaxOnly": true,
+    "verbatimModuleSyntax": true,
+    "allowImportingTsExtensions": true,
+    "skipLibCheck": true
+  },
+  "include": ["src/**/*.ts", "tests/**/*.ts"]
+}

@@ -45,3 +45,8 @@
 # RQG firehose (scripts/rqg_gen.rb): the transient candidate batch the harness runs (the curated
 # suites/rqg/*.test it emits ARE committed; the report dir lives under the ignored /bench/results/).
 /spec/conformance/suites/_rqg_tmp/
+
+# jed-migrate packages (/migrate — a CONSUMER of the engine, not a core; design.md §2). Build
+# artifacts mirror the per-core ignores above; Cargo.lock / package-lock.json ARE committed.
+/migrate/rust/target/
+/migrate/ts/node_modules/

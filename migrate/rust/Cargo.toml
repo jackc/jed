@@ -1,0 +1,18 @@
+# jed-migrate — a small, opt-in schema-migration library for jed (../design.md).
+# A CONSUMER of the engine, never a core: it links the Rust core in and drives it through
+# the public host API. Standalone crate (like cli/), deliberately NOT in a workspace with
+# impl/rust so the engine crate stays hermetic. Depends only on its own jed core plus the
+# Rust standard library (design.md §2) — no third-party dependencies.
+[package]
+name = "jed-migrate"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Schema migrations for jed, modeled on tern (spec: ../design.md)."
+
+[lib]
+name = "jed_migrate"
+path = "src/lib.rs"
+
+[dependencies]
+jed = { path = "../../impl/rust" }

@@ -302,6 +302,11 @@ implementation. Suggested layout:
   go/
   ts/                   # later
   ...
+/migrate/               # jed-migrate: an opt-in schema-migration library (tern-modeled), one package
+                        # per core (go/ rust/ ts/) over a shared design.md contract + testdata/ corpus.
+                        # A NON-CORE CONSUMER (the cli/ + bench/ precedent, §14): links a core in and
+                        # drives it through the public host API; no core depends on it. Bundled by the
+                        # CLI as `jed migrate`. See /migrate/design.md.
 /web/                   # the jed website: static SvelteKit + Tailwind docs + live in-browser
                         # playground. A NON-CORE tooling module (the bench/ precedent, §14): its
                         # deps never touch a core manifest. Consumes the TS core (impl/ts) via a

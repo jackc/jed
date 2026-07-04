@@ -181,12 +181,21 @@ WASM_TARGET   = "wasm32-wasip1"
 WASM_ARTIFACT = File.join(__dir__, "impl/wasm/target", WASM_TARGET, "release/jed_wasm.wasm")
 GO_DIR        = File.join(__dir__, "impl/go")
 TS_DIR        = File.join(__dir__, "impl/ts")
-TS_CORE_DIRS  = %w[impl/ts bench/ts] # biome (mise-pinned); biome.json scopes paths + excludes generated
+TS_CORE_DIRS  = %w[impl/ts bench/ts migrate/ts] # biome (mise-pinned); biome.json scopes paths + excludes generated
 WEB_DIR       = "web"                # prettier (npm-pinned); reuses web's format / format:check scripts
+# jed-migrate (spec at /migrate/design.md): a CONSUMER of the engine per language, NOT a core — like
+# cli/ and bench/, its deps never touch a core manifest (CLAUDE.md §14). Its three package suites run
+# in `rake test` (and so `rake ci`); its Rust crate + Go package join the fmt gate.
+MIGRATE_GO_DIR        = File.join(__dir__, "migrate/go")
+MIGRATE_RUST_MANIFEST = File.join(__dir__, "migrate/rust/Cargo.toml")
+MIGRATE_TS_DIR        = File.join(__dir__, "migrate/ts")
 
 # The Go files gofumpt would rewrite. `gofumpt -l` exits 0 even when files differ, so the
 # signal is the printed file list, not the exit status.
-def gofumpt_unformatted = capture("gofumpt", "-l", GO_DIR).first.split("\n").map(&:strip).reject(&:empty?)
+def gofumpt_unformatted(*dirs)
+  dirs = [GO_DIR, MIGRATE_GO_DIR] if dirs.empty?
+  capture("gofumpt", "-l", *dirs).first.split("\n").map(&:strip).reject(&:empty?)
+end
 
 # Bootstrap an npm project's deps with `npm ci` (reproducible from its committed lockfile —
 # CLAUDE.md §14), reinstalling whenever they are STALE — not only when node_modules is absent.
@@ -232,7 +241,12 @@ namespace :fmt do
       failures << "wasm"
     end
 
-    puts "go:   gofumpt -l impl/go"
+    puts "migrate-rust: cargo fmt --check (the jed-migrate Rust crate)"
+    unless system("cargo", "fmt", "--check", "--manifest-path", MIGRATE_RUST_MANIFEST)
+      failures << "migrate-rust"
+    end
+
+    puts "go:   gofumpt -l impl/go migrate/go"
     unformatted = gofumpt_unformatted
     unless unformatted.empty?
       warn "  unformatted: #{unformatted.map { |f| f.delete_prefix("#{__dir__}/") }.join(', ')}"
@@ -256,7 +270,8 @@ namespace :fmt do
     sh "cargo", "fmt", "--manifest-path", CLI_MANIFEST
     sh "cargo", "fmt", "--manifest-path", RUBY_EXT_MANIFEST
     sh "cargo", "fmt", "--manifest-path", WASM_MANIFEST
-    sh "gofumpt", "-w", GO_DIR
+    sh "cargo", "fmt", "--manifest-path", MIGRATE_RUST_MANIFEST
+    sh "gofumpt", "-w", GO_DIR, MIGRATE_GO_DIR
     sh "biome", "format", "--write", *TS_CORE_DIRS
     npm_ci_if_stale(WEB_DIR)
     sh "npm", "run", "--silent", "--prefix", WEB_DIR, "format"
@@ -396,6 +411,36 @@ namespace :cli do
   desc "Run the jed CLI's unit + end-to-end golden tests"
   task :test do
     sh "cargo", "test", "--manifest-path", CLI_MANIFEST
+  end
+end
+
+# migrate — the jed-migrate library (spec: /migrate/design.md), a schema-migration CONSUMER of the
+# engine, one package per core (Go / Rust / TS). It links a core in and drives it through the public
+# host API; it is NOT a core, and no core depends on it (the cli/ + bench/ precedent, CLAUDE.md §14).
+# The three packages are independent implementations of one shared contract, verified against the
+# shared /migrate/testdata corpus. Like cli:test, migrate:test runs in `rake test` (and so `rake ci`).
+namespace :migrate do
+  desc "Run the jed-migrate packages' tests on all three cores (Go + Rust + TS)"
+  task test: %w[migrate:test:go migrate:test:rust migrate:test:ts]
+
+  namespace :test do
+    desc "Run the Go jed-migrate package's tests"
+    task :go do
+      puts "migrate: go"
+      Dir.chdir(MIGRATE_GO_DIR) { sh "go", "test", "./..." }
+    end
+
+    desc "Run the Rust jed-migrate crate's tests"
+    task :rust do
+      puts "migrate: rust"
+      sh "cargo", "test", "--manifest-path", MIGRATE_RUST_MANIFEST
+    end
+
+    desc "Run the TS jed-migrate package's tests (bare Node via type-stripping — no install)"
+    task :ts do
+      puts "migrate: ts"
+      sh "node", "--test", *Dir[File.join(MIGRATE_TS_DIR, "tests/*.test.ts")]
+    end
   end
 end
 
@@ -713,8 +758,8 @@ task unit: %w[unit:rust unit:go unit:ts]
 # conformance corpus on all three cores + each core's unit suite + the CLI golden tests. This is
 # the inner dev loop; `rake ci` is the SUPERSET that wraps it with the static/spec/metamorphic
 # gates below.
-desc "Engine test suites: conformance corpus (×3 cores) + per-core unit tests + CLI + Ruby-gem tests"
-task test: %w[conformance unit cli:test ruby:test]
+desc "Engine test suites: conformance corpus (×3 cores) + per-core unit tests + CLI + Ruby-gem + migrate tests"
+task test: %w[conformance unit cli:test ruby:test migrate:test]
 
 # ci — the full merge gate, a SUPERSET of `rake test`. Adds the checks that aren't example-based
 # tests: spec-data + byte-fixture verification + codegen-drift (`verify`), the formatter gate
