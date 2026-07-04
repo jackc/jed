@@ -415,13 +415,15 @@ cross-core-identical and owns that consequence (the host-extension boundary, §1
 ## 9. Storage
 
 - **Single file** per database — *one database = one file*, not one file per **query**. A host may
-  **attach** other jed databases (files or in-memory) to an open handle under a name, and a query may
-  then **span** them by a database-qualified name `reports.sales`, joining across attachments in one
-  consistent snapshot (`spec/design/attached-databases.md`; the in-memory attach + `db.table` routing +
-  N-root commit landed in the Go core, Rust/TS porting). Attaching is a **host-API** act, never SQL
-  (the pure-SQL safety spine, §13); each attached database keeps its own single-file (or in-memory)
-  storage and self-describing format — the single-file guarantee binds *per database*, and a spanning
-  query is a pure function of the pinned per-database snapshots.
+  **attach** other jed databases (files on disk, or pure in-memory) to an open handle under a name, and a
+  query may then **span** them by a database-qualified name `reports.sales`, joining across attachments in
+  one consistent snapshot (`spec/design/attached-databases.md`; in-memory *and* file attach + `db.table`
+  routing + the N-root commit landed in all three cores — a file attachment commits durably through its
+  own pager, and a transaction writes **at most one durable (file-backed) database** until multi-file
+  atomic write lands). Attaching is a **host-API** act, never SQL (the pure-SQL safety spine, §13); each
+  attached database keeps its own single-file (or in-memory) storage and self-describing format — the
+  single-file guarantee binds *per database* (a single *query* may span several), and a spanning query is
+  a pure function of the pinned per-database snapshots.
 - **Design target: durable on-disk databases whose dataset is RAM-sized.** Two facts hold
   at once, and neither alone is the picture. (a) **Persistent on-disk storage is the dominant
   mode** — the overwhelming majority of databases are durable files on disk, *not* ephemeral

@@ -20,8 +20,11 @@
 > §2/§5). Attachment **generalizes "a few hardcoded extra snapshots" into "N named attachments,"** and
 > in doing so lets temp stop being bespoke machinery and become *an attached in-memory database* (§6).
 >
-> **Status: Slice 0 + Slice 1a + Slice 1b + Slice 1b-3 landed (all three cores); Slice 1c (reframe
-> temp) resolved at the resolution-funnel level — see §6/§13.**
+> **Status: Slice 0 + Slice 1a + Slice 1b + Slice 1b-3 + Slice 2 landed (all three cores); Slice 1c
+> (reframe temp) resolved at the resolution-funnel level — see §6/§13. Slice 2 (host-API *file* attach +
+> cross-file read + single-durable write) is the first with real cross-file durability: a file attachment
+> commits durably through its own pager, and a tx may write at most one file-backed database (0A000
+> otherwise) until multi-file atomic write (Slice 3) lands.**
 > This doc fixed the model and the decisions before any code, spec-first (CLAUDE.md §11). The two
 > decisions that were open at first draft are settled (maintainer, 2026-07-03): **attach is host-API
 > only — no SQL attach in any form** (§4), and the **`SHARED TEMP` surface is retired** in favor of a
@@ -360,7 +363,7 @@ The whole design is arranged so the §13 guarantee needs **no new exception**:
 | `42712` | `duplicate_alias` | two relations resolve to the same label across databases (`main.t`+`reports.t`, unaliased) | reused, no new rule (§3) |
 | `42P07` | `duplicate_table` | an overlap **within** one database's implicit namespace | unchanged (temp-tables.md §3) |
 | `25006` | `read_only_sql_transaction` | any write (DML or DDL) targeting a **read-only** attachment (§4) | reused — the read-only-context family (also a read-only txn/handle, transactions.md §4.3); attachment-scoped message |
-| `0A000` | `feature_not_supported` | writing a **second** durable database in one txn (§5); a cross-database FK/type/sequence ref (§8); an attachment name in a **persisted** definition (§7); a `db.attach` **file** source (Slice 2); on an **attachment table** (1b): FOREIGN KEY, EXCLUDE, a composite-typed / serial / IDENTITY column, `COLLATE`, a non-btree (GIN/GiST) index, `ON CONFLICT` | the honest v1 narrowings |
+| `0A000` | `feature_not_supported` | writing a **second** durable (file-backed) database in one txn (§5, Slice 2); a cross-database FK/type/sequence ref (§8); an attachment name in a **persisted** definition (§7); on an **attachment table** (1b): FOREIGN KEY, EXCLUDE, a composite-typed / serial / IDENTITY column, `COLLATE`, a non-btree (GIN/GiST) index, `ON CONFLICT` | the honest v1 narrowings |
 | `55006` | `object_in_use` | `detach` of an attachment with a live pinned snapshot (§8) | **landed** (registry.toml); PG's `object_in_use` is class 55 |
 | `42710` | `duplicate_object` | `db.attach` of a **reserved** name (`main`/`temp`) or an **already-attached** name | host-API; reused |
 | `42704` | `undefined_object` | `db.detach` of a name that is **not attached** (`main`/`temp` are not detachable) | host-API; reused |
@@ -391,9 +394,10 @@ From **PostgreSQL** (the semantic default): PG has **no** embedded multi-file at
 nothing to diverge *from* on feature shape — this is a "we own our surface" case (CLAUDE.md §1, §12).
 Every *semantic* the feature touches still tracks PG.
 
-**CLAUDE.md §9 amendment** (to make when slice 1 lands): "one database = one file" holds **per
-database**; a single *query* may reference several attached databases. Not a relaxation of the
-self-describing or single-file guarantees (§7, §10) — a scope clarification.
+**CLAUDE.md §9 amendment** (made — §9 first bullet): "one database = one file" holds **per database**;
+a single *query* may reference several attached databases, and a transaction writes at most one durable
+(file-backed) database until Slice 3. Not a relaxation of the self-describing or single-file guarantees
+(§7, §10) — a scope clarification.
 
 ## 13. Slicing (the build plan — TODO.md will track it)
 
@@ -471,11 +475,23 @@ Sequenced to put the durability-risky part last:
     recorded rather than engineered away; behavior-neutral (temp keeps its zero-file-writes, `54P03`
     page budget, and within-session compaction).
 - **Slice 2 — host-API file attach (read-only + read-write) + cross-file *read* + single-database
-  *write*.** `db.attach`/`detach` for file databases with the per-attachment **read-only mode** (§4,
-  `25006` on a write to a read-only attachment — the natural reference-DB mode), qualified reads/joins
-  across files, DDL/DML into **one** writable attached file (the one-durable-writer rule, §5). Exercises
-  the disk storage mode (conformance-two-storage-modes) and per-core host tests. Deliverable:
-  SQLite-style cross-file queries.
+  *write*. LANDED (all three cores).** `db.attach(name, AttachFile(path), read_only)` opens an existing
+  single-file jed database via the same `open` path as `main` (its committed snapshot + storage identity
+  become the attachment, its own page size honored — each attachment is its own page space, §2); its
+  pages fault through its own pager, so cross-file reads/joins "just work" through the Slice-1b scoped
+  funnels. A dirtied file attachment commits **durably** at the N-root commit through a factored-out
+  durable-commit path (dirty pages + alternating meta slot + fsync + the residency flip — the same recipe
+  as the `main` persist), *before* the roots publish; an in-memory attachment still pointer-swaps. The
+  per-attachment **read-only mode** rejects every write (DML + DDL) with `25006`. The **one-durable-writer
+  rule** (§5) is enforced at commit — a tx that dirtied more than one *file-backed* database (main or an
+  attached file) is `0A000` before any durable page is written, so it commits nothing (in-memory
+  attachments + temp are free). Detach/close release the OS file handle. The host-API surface + the
+  file-specific behaviors (read-only cross-file join + `25006`, read-write durability across a standalone
+  reopen, one-durable-writer `0A000`, page-size independence, missing-file `58P01`) are **per-core host
+  tests** (out of corpus reach — cross-file durability/reopen needs the disk storage mode); the in-memory
+  SQL routing stays corpus-tested (`suites/attach/in_memory.test`). No `format_version` change (a file
+  attachment is an ordinary jed file in the unchanged on-disk format; in-memory attachments are never
+  serialized). Deliverable: SQLite-style cross-file queries.
 - **Slice 3 — multi-file atomic write (deferred, hard).** A super-journal / two-phase commit + recovery
   to lift the one-durable-writer restriction (§5). Only if a concrete use case demands it.
 
