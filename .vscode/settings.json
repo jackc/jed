@@ -1,0 +1,10 @@
+{
+  "go.goroot": "/persist/shared/mise/data/installs/go/1.26.3",
+  "debug.javascript.defaultRuntimeExecutable": {
+    "pwa-node": "/persist/shared/mise/data/shims/node"
+  },
+  "go.alternateTools": {
+    "go": "/persist/shared/mise/data/shims/go",
+    "gopls": "/persist/shared/mise/data/shims/gopls"
+  }
+}
