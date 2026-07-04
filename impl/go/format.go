@@ -1432,18 +1432,17 @@ func loadEnginePaged(pgr *pager, capacity int) (*engine, error) {
 			// (spec/design/composite.md §3).
 			colTypes := store.colTypes
 			if tableRoot != 0 {
-				root, length, err := readSkeleton(paging, tableRoot, colTypes)
+				// Reads only the interior spine — leaves stay OnDisk, the row count is left unknown
+				// (spec/design/storage.md §6). v25 already dropped the free-list reachability walk;
+				// dropping the row-count leaf sum makes open O(interior spine).
+				root, err := readSkeleton(paging, tableRoot, colTypes)
 				if err != nil {
 					return nil, err
 				}
-				// v25: the persisted free-list already excludes live overflow chains (they were kept
-				// reachable when the list was rebuilt — reachablePages/collectLeafOverflow at commit
-				// time), so open no longer re-reads every spillable leaf to protect them (the second
-				// full leaf pass is gone — the open-speed win, format.md *Reclamation*).
-				store.setTree(root, length)
-				if !hasPK && length > 0 {
+				store.setSkeleton(root)
+				if !hasPK {
 					// No-PK rowid reconstruction faults the leaves to find the largest key; only for
-					// keyless tables (most have a PK), bounded by the pool.
+					// keyless tables (most have a PK), bounded by the pool. tableRoot != 0 ⇒ non-empty.
 					keys, _, err := store.rows.inorder(store.leafSrc())
 					if err != nil {
 						return nil, err
@@ -1482,11 +1481,11 @@ func loadEnginePaged(pgr *pager, capacity int) (*engine, error) {
 				} else {
 					istore.attachPaging(paging)
 					if indexRoots[k] != 0 {
-						root, length, err := readSkeleton(paging, indexRoots[k], nil)
+						root, err := readSkeleton(paging, indexRoots[k], nil)
 						if err != nil {
 							return nil, err
 						}
-						istore.setTree(root, length)
+						istore.setSkeleton(root)
 					}
 				}
 				snap.putIndexStore(strings.ToLower(idx.Name), istore)
@@ -1836,68 +1835,89 @@ func planFreeList(snap *snapshot, paging *sharedPaging, catRoot uint32, written 
 }
 
 // readSkeleton reads a table's on-disk B+tree (rooted at rootPage) into a demand-paged skeleton:
-// interior nodes resident, each leaf left OnDisk. Returns the root node and the total row count. A
-// table whose root is itself a single leaf has no interior parent to hold an OnDisk reference, so the
-// root leaf is faulted resident (spec/design/pager.md §1/§4).
-func readSkeleton(paging *sharedPaging, root uint32, colTypes []colType) (*pnode, int, error) {
-	c, length, err := readSkeletonNode(paging, root, colTypes)
+// interior nodes resident, every leaf left OnDisk (faulted on first access). Returns the root node
+// only — the row count is NOT computed (open reads only the interior spine, not the leaves; the
+// store's count stays unknown, spec/design/storage.md §6). A table whose root is itself a single leaf
+// has no interior parent to hold an OnDisk reference, so the root leaf is faulted resident
+// (spec/design/pager.md §1/§4).
+func readSkeleton(paging *sharedPaging, root uint32, colTypes []colType) (*pnode, error) {
+	c, err := readSkeletonNode(paging, root, colTypes)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 	if c.node != nil {
-		return c.node, length, nil
+		return c.node, nil
 	}
-	node, err := paging.faultLeaf(c.page, colTypes)
-	if err != nil {
-		return nil, 0, err
-	}
-	return node, length, nil
+	return paging.faultLeaf(c.page, colTypes)
 }
 
-// readSkeletonNode reads one B+tree node through the pager, once: a leaf becomes an OnDisk childRef
-// (its rows counted from the header, then dropped — not retained); an interior node becomes a resident
-// childRef — the record-free separators + children skeleton (v24) — with its children resolved
-// recursively. Returns the child reference and the subtree's row count. (The free-list is loaded from
-// the persisted chain in v25, so this walk no longer tracks reachability — it still reads each leaf
-// once for the row count, the remaining open-speed follow-on.)
-func readSkeletonNode(paging *sharedPaging, pageIdx uint32, colTypes []colType) (childRef, int, error) {
+// readSkeletonNode resolves one B+tree node into a childRef WITHOUT reading the leaf level. A leaf
+// page yields an OnDisk childRef — its bytes are not read here at all; the parent hands down the page
+// id and the leaf faults on first access. An interior page yields a resident childRef — the
+// record-free separators + children skeleton (v24) — with its children resolved.
+//
+// The open-speed trick (spec/design/storage.md §6, "drop the eager count"): an interior's children
+// are homogeneous — a B+tree keeps every leaf at one depth, so an interior's children are either all
+// leaves or all interiors. We resolve only the first child to learn which; if it came back OnDisk (a
+// leaf), every sibling is a leaf too and becomes an OnDisk reference WITHOUT a block read. Only
+// interior pages are read, so open is O(interior spine) rather than O(leaves) — the second and last
+// reason open used to touch every leaf (after v25 dropped the free-list reachability walk) is gone.
+// The cost: the first child of each bottom-level interior is still read (to classify the level), i.e.
+// ~leaves/fanout leaf reads, negligible beside the former per-leaf walk. A corrupt leaf is now
+// surfaced at fault rather than at open (still XX001, never wrong rows — spec/design/storage.md §7);
+// the interior spine is still CRC-validated here at open.
+func readSkeletonNode(paging *sharedPaging, pageIdx uint32, colTypes []colType) (childRef, error) {
 	block, err := paging.pgr.readBlock(pageIdx)
 	if err != nil {
-		return childRef{}, 0, err
+		return childRef{}, err
 	}
 	pg, err := parsePage(block)
 	if err != nil {
-		return childRef{}, 0, err
+		return childRef{}, err
 	}
 	switch pg.pageType {
 	case pageLeaf:
-		return onDiskRef(pageIdx), int(pg.itemCount), nil
+		return onDiskRef(pageIdx), nil
 	case pageInterior:
 		n := int(pg.itemCount)
 		pos := 0
-		children := make([]childRef, 0, n+1)
-		total := 0
+		// Child pointers precede the separator directory (format.md "Interior node").
+		childPtrs := make([]uint32, 0, n+1)
 		for i := 0; i < n+1; i++ {
 			cp, err := readU32(pg.payload, &pos)
 			if err != nil {
-				return childRef{}, 0, err
+				return childRef{}, err
 			}
-			child, clen, err := readSkeletonNode(paging, cp, colTypes)
-			if err != nil {
-				return childRef{}, 0, err
-			}
-			children = append(children, child)
-			total += clen
+			childPtrs = append(childPtrs, cp)
 		}
 		// v24: the record-free routing skeleton — an end-offset separator directory + key blob.
 		// Separators carry no values, so no lazy decode and no chains to mark.
 		keys, err := readSeparators(pg.payload, &pos, n)
 		if err != nil {
-			return childRef{}, 0, err
+			return childRef{}, err
 		}
-		return residentRef(&pnode{keys: keys, children: children, page: pageIdx}), total, nil
+		// Resolve the first child to classify the level, then avoid reading leaf siblings.
+		children := make([]childRef, 0, n+1)
+		first, err := readSkeletonNode(paging, childPtrs[0], colTypes)
+		if err != nil {
+			return childRef{}, err
+		}
+		childrenAreLeaves := first.node == nil
+		children = append(children, first)
+		for _, cp := range childPtrs[1:] {
+			if childrenAreLeaves {
+				children = append(children, onDiskRef(cp)) // a leaf sibling — not read at open
+				continue
+			}
+			child, err := readSkeletonNode(paging, cp, colTypes)
+			if err != nil {
+				return childRef{}, err
+			}
+			children = append(children, child)
+		}
+		return residentRef(&pnode{keys: keys, children: children, page: pageIdx}), nil
 	default:
-		return childRef{}, 0, newError(DataCorrupted, "expected a B-tree node page")
+		return childRef{}, newError(DataCorrupted, "expected a B-tree node page")
 	}
 }
 

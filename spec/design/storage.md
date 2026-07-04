@@ -136,12 +136,15 @@ meta — detail specified in [../fileformat/format.md](../fileformat/format.md).
 > **Free-list reclamation has since landed** — P6.2 reconstruct-on-open, then **v25 persisted +
 > continuous within-session** (§6): the commit allocator reuses dead pages from a free-list that
 > is now **read from the persisted `page_type 7` chain on open** (no reachability walk) and
-> **reclaimed in-commit** each commit, so the file stays bounded within a session too. Demand
-> paging / the bounded buffer pool (P6.4, [pager.md](pager.md)), overflow pages for over-large
-> values, and LZ4 compression (both v3, [large-values.md](large-values.md)) have **also landed**.
-> **Still deferred** (later Phase-6 items, none foreclosed): per-subtree/per-table row counts so
-> open need not walk leaves for the row count either, and the spill-to-disk hash join / aggregate
-> / DISTINCT operators ([spill.md](spill.md)). The
+> **reclaimed in-commit** each commit, so the file stays bounded within a session too. **Open now
+> reads only the interior spine** — the two reasons it used to touch every leaf are both gone (v25
+> dropped the free-list reachability walk; the follow-on **dropped the eager row-count** leaf sum, so
+> a loaded store carries an *unknown* count and derives emptiness from its root), making open
+> O(interior spine) rather than O(file). Demand paging / the bounded buffer pool (P6.4,
+> [pager.md](pager.md)), overflow pages for over-large values, and LZ4 compression (both v3,
+> [large-values.md](large-values.md)) have **also landed**. **Still deferred** (later Phase-6 items,
+> none foreclosed): the spill-to-disk hash join / aggregate / DISTINCT operators
+> ([spill.md](spill.md)). The
 > whole-image `to_image` survives as the **from-scratch** serializer used by
 > `create`'s initial write and the golden fixtures (the special case where every node is
 > dirty); the live commit path is the incremental one.
@@ -214,8 +217,7 @@ sits so the options stay open (CLAUDE.md §9).
   index first) before extending the file. **v25 persists the free-list** (meta offset 28 →
   a `page_type 7` chain — [../fileformat/format.md](../fileformat/format.md) *Free-list page*),
   so **open reads it directly** rather than reconstructing it by walking every leaf (the second
-  full leaf pass for spillable overflow chains is gone; the row-count leaf walk stays until the
-  per-subtree-count follow-on). Persistence is paired with **continuous within-session
+  full leaf pass for spillable overflow chains is gone). Persistence is paired with **continuous within-session
   reclamation** for the file/in-memory main domain: a file commit reclaims **this commit's fresh
   orphans in-commit** — periodically, once the high-water passes ~2× the live count, so the file
   oscillates in `[live, 2×live]` and the O(live) reachability walk is amortized O(height)/commit
@@ -226,9 +228,20 @@ sits so the options stay open (CLAUDE.md §9).
   pins an older version. A free-list page is drawn from the free-list itself (never the
   high-water), so persisting the free-list does not grow the file, and it is torn-write-safe (a
   reused/rewritten page is dead at the fallback snapshot). An in-memory database reclaims the
-  same way with **no persistence** (no meta, never reopened — post-commit RAM rebuild). **Deferred
-  follow-on:** per-subtree/per-table row counts so open need not walk leaves for the row count
-  either (the remaining open-speed item).
+  same way with **no persistence** (no meta, never reopened — post-commit RAM rebuild).
+- **Open reads only the interior spine** — ✅ **landed ("drop the eager count").** After v25
+  removed the reachability walk, the *last* reason open touched every leaf was summing the per-table
+  row count from each leaf header. That eager count is now **dropped**: `read_skeleton` builds the
+  demand-paged interior skeleton **without reading the leaf level** — it exploits the B+tree
+  same-depth invariant (an interior's children are homogeneous), resolving only the **first** child of
+  each interior to classify the level, then referencing leaf siblings as `OnDisk` without reading
+  them. A disk-loaded store therefore carries an **unknown** row count (`Option`/nullable — nothing in
+  the engine needs a loaded table's exact count; a capacity hint tolerates its absence) and derives
+  **emptiness from its root** (exact, O(1) — an empty tree has no root). Open is now **O(interior
+  spine)** — catalog + interior pages + ~one leaf per bottom-level interior (the classify peek) + the
+  meta/free-list pages — not O(file). The lone exception is a **no-PK** table, whose synthetic-rowid
+  reconstruction still faults its leaves to find `max key + 1` (most tables have a PK; bounded by the
+  pool).
 - **Multi-process file locking** — ⏳ **decided, spec'd ([locking.md](locking.md)), not
   built.** Everything above assumes the engine is alone with the file (the open-time
   free-list walk, the buffer pool, the in-process watermark); today nothing enforces it — two
@@ -295,9 +308,12 @@ sits so the options stay open (CLAUDE.md §9).
   7 adds a per-page CRC-32/IEEE to every body page** (the page header grows 12→16 bytes —
   [../fileformat/format.md](../fileformat/format.md) *Page header*), verified the instant a page
   is parsed: a mismatch is `data_corrupted` (`XX001`). Because every read funnels through that
-  parse — the demand-paged leaf fault and the open-time free-list reachability walk included —
-  corruption of a catalog/interior/overflow page is caught at **open** and a leaf the moment it
-  faults. It is **not** end-to-end integrity (a malicious rewriter can recompute the CRC; that is
+  parse, corruption is caught the instant the page is read: **at open for a catalog or interior
+  (routing-spine) page** — the pages the demand-paged loader reads — and **at fault for a leaf or
+  overflow page**, which open no longer reads (open reads only the interior spine — the free-list
+  reachability walk and the row-count leaf walk are both gone). Either way it is caught **or inert**
+  (a corrupted *dead* page is never read), never served as wrong rows; a full scan validates every
+  live page. It is **not** end-to-end integrity (a malicious rewriter can recompute the CRC; that is
   the encryption-at-rest / authenticated-page door below, not this), and it is **not** metered
   (physical I/O, invisible to `page_read` cost). A dedicated per-core corruption test
   complements the fault-injection matrix.

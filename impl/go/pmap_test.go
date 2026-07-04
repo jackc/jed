@@ -28,6 +28,18 @@ func pmKey(n uint64) []byte {
 	return b
 }
 
+// pmLen returns m's exact row count, failing if the map does not know it. An in-memory map (built
+// from empty by Insert) always knows its count; a disk-loaded skeleton does not (spec/design/storage.md
+// §6, "drop the eager count"), but these tests never load one.
+func pmLen(t *testing.T, m *pMap) int {
+	t.Helper()
+	n, known := m.Count()
+	if !known {
+		t.Fatal("expected a known row count on an in-memory map")
+	}
+	return n
+}
+
 func pmRow(n int64) storedRow { return storedRow{IntValue(n)} }
 
 // pmShuffled is a deterministic permutation of 0..n (LCG-driven) — no RNG / wall-clock, so the
@@ -133,8 +145,8 @@ func TestPMapInsertGetRemoveVsReference(t *testing.T) {
 		}
 		ref[string(pmKey(k))] = pmRow(int64(k))
 	}
-	if pm.Len() != len(ref) {
-		t.Fatalf("len %d != %d", pm.Len(), len(ref))
+	if pmLen(t, &pm) != len(ref) {
+		t.Fatalf("len %d != %d", pmLen(t, &pm), len(ref))
 	}
 	pmCheckInvariants(t, &pm)
 	for k := uint64(0); k < n; k++ {
@@ -159,13 +171,13 @@ func TestPMapInsertGetRemoveVsReference(t *testing.T) {
 	}
 
 	// Overwrite returns the old value and does not change len (kept in sync with the reference).
-	before := pm.Len()
+	before := pmLen(t, &pm)
 	old, replaced, _ := pm.Insert(pmKey(7), pmRow(777), pmW, pmCap, pmShape, nil)
 	if !replaced || !reflect.DeepEqual(old, pmRow(7)) {
 		t.Fatalf("overwrite: old=%v replaced=%v", old, replaced)
 	}
 	ref[string(pmKey(7))] = pmRow(777)
-	if pm.Len() != before {
+	if pmLen(t, &pm) != before {
 		t.Fatal("overwrite changed len")
 	}
 
@@ -181,8 +193,8 @@ func TestPMapInsertGetRemoveVsReference(t *testing.T) {
 			pmCheckInvariants(t, &pm)
 		}
 	}
-	if pm.Len() != 0 {
-		t.Fatalf("not empty after removing all: len %d", pm.Len())
+	if pmLen(t, &pm) != 0 {
+		t.Fatalf("not empty after removing all: len %d", pmLen(t, &pm))
 	}
 	if _, ok, _ := pm.Remove(pmKey(123), pmCap, pmShape, nil); ok {
 		t.Fatal("remove of absent key reported present")
@@ -208,8 +220,8 @@ func TestPMapCloneIsIndependentSnapshot(t *testing.T) {
 		other.Remove(pmKey(k), pmCap, pmShape, nil) // shrink
 	}
 
-	if snap.Len() != 2000 {
-		t.Fatalf("snapshot len changed: %d", snap.Len())
+	if pmLen(t, &snap) != 2000 {
+		t.Fatalf("snapshot len changed: %d", pmLen(t, &snap))
 	}
 	for k := uint64(0); k < 2000; k++ {
 		got, _, _ := snap.Get(pmKey(k), nil)
@@ -218,8 +230,8 @@ func TestPMapCloneIsIndependentSnapshot(t *testing.T) {
 		}
 	}
 	pmCheckInvariants(t, &snap)
-	if other.Len() != 2500 {
-		t.Fatalf("other len %d", other.Len())
+	if pmLen(t, &other) != 2500 {
+		t.Fatalf("other len %d", pmLen(t, &other))
 	}
 	if _, ok, _ := other.Get(pmKey(0), nil); ok {
 		t.Fatal("other should have removed key 0")
@@ -247,8 +259,8 @@ func TestPMapWideValuesKeepNodesValid(t *testing.T) {
 		pm.Remove(pmKey(k), pmCap, pmShape, nil)
 		pmCheckInvariants(t, &pm)
 	}
-	if pm.Len() != 0 {
-		t.Fatalf("not empty: %d", pm.Len())
+	if pmLen(t, &pm) != 0 {
+		t.Fatalf("not empty: %d", pmLen(t, &pm))
 	}
 }
 
@@ -275,8 +287,8 @@ func TestPMapNearCapKeysDegenerateInterior(t *testing.T) {
 		pm.Insert(bigKey(k), storedRow{}, 110, pmCap, shape, nil)
 		ref[string(bigKey(k))] = true
 	}
-	if pm.Len() != len(ref) {
-		t.Fatalf("len %d != %d", pm.Len(), len(ref))
+	if pmLen(t, &pm) != len(ref) {
+		t.Fatalf("len %d != %d", pmLen(t, &pm), len(ref))
 	}
 	// Structure: fits + routing correctness (0-key interiors allowed).
 	var walk func(n *pnode)
@@ -314,8 +326,8 @@ func TestPMapNearCapKeysDegenerateInterior(t *testing.T) {
 			t.Fatalf("remove miss at %d", k)
 		}
 	}
-	if pm.Len() != 0 {
-		t.Fatalf("not empty: %d", pm.Len())
+	if pmLen(t, &pm) != 0 {
+		t.Fatalf("not empty: %d", pmLen(t, &pm))
 	}
 }
 
@@ -355,7 +367,7 @@ func TestPMapBoundedScanCountsAgree(t *testing.T) {
 
 func TestPMapEmptyAndSingle(t *testing.T) {
 	var pm pMap
-	if pm.Len() != 0 {
+	if pmLen(t, &pm) != 0 {
 		t.Fatal("fresh map not empty")
 	}
 	if _, ok, _ := pm.Get(pmKey(1), nil); ok {
@@ -373,7 +385,7 @@ func TestPMapEmptyAndSingle(t *testing.T) {
 	if v, ok, _ := pm.Remove(pmKey(1), pmCap, pmShape, nil); !ok || !reflect.DeepEqual(v, pmRow(1)) {
 		t.Fatal("remove returns the value")
 	}
-	if pm.Len() != 0 || pm.root != nil {
+	if pmLen(t, &pm) != 0 || pm.root != nil {
 		t.Fatal("not empty after removing the only key")
 	}
 }

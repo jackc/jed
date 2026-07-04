@@ -467,10 +467,17 @@ fn build_interior(
 /// A persistent ordered map from encoded key to [`Row`]. `Clone` is O(1) (an `Arc` bump on the root
 /// plus a length copy) and yields an independent snapshot: mutating the clone leaves this map
 /// untouched.
+///
+/// `count` is the exact row count **when known** (`Some`): a map built from empty by insert/remove
+/// maintains it for free. A map loaded from a disk skeleton (`from_skeleton`) carries `None` —
+/// **unknown** — because the count would cost a full leaf walk to compute and nothing needs it
+/// eagerly (open reads only the interior spine now, spec/design/storage.md §6). `is_empty` never
+/// consults it: it derives emptiness from the root (an empty map has no root), which is exact and
+/// O(1) whether or not the count is known.
 #[derive(Clone, Default)]
 pub struct PMap {
     root: Option<Arc<Node>>,
-    len: usize,
+    count: Option<usize>,
 }
 
 /// A contiguous range of encoded keys — the form a primary-key predicate pushes down to a bounded
@@ -537,15 +544,21 @@ impl KeyBound {
 
 impl PMap {
     pub fn new() -> Self {
-        PMap { root: None, len: 0 }
+        PMap {
+            root: None,
+            count: Some(0),
+        }
     }
 
-    pub fn len(&self) -> usize {
-        self.len
+    /// The exact row count, or `None` when unknown (a disk-loaded skeleton — see the struct doc).
+    /// Callers that only need a capacity hint use `.unwrap_or(0)`; callers that need an exact count
+    /// on a disk-loaded map must scan (nothing in the engine does — the count is near-vestigial).
+    pub fn count(&self) -> Option<usize> {
+        self.count
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.root.is_none()
     }
 
     /// The root node, for the serializer (format.rs). `None` for an empty map.
@@ -553,9 +566,10 @@ impl PMap {
         self.root.as_ref()
     }
 
-    /// Reconstruct a map from a loaded root (format.rs `from_image`).
-    pub(crate) fn from_loaded(root: Option<Arc<Node>>, len: usize) -> Self {
-        PMap { root, len }
+    /// Reconstruct a map from a disk-loaded skeleton root (format.rs `read_skeleton`). The count is
+    /// **unknown** — open no longer walks the leaves to sum it (spec/design/storage.md §6).
+    pub(crate) fn from_skeleton(root: Option<Arc<Node>>) -> Self {
+        PMap { root, count: None }
     }
 
     /// Look up the row at `key`, or `None` — a root→leaf descent (interior nodes only route, v24).
@@ -604,7 +618,9 @@ impl PMap {
         };
         self.root = Some(new_root);
         if old.is_none() {
-            self.len += 1;
+            // Maintain the count only when it is known (`Some`). A disk-loaded skeleton stays
+            // `None` — we never learned the base to increment from, and nothing needs it.
+            self.count = self.count.map(|n| n + 1);
         }
         Ok(old)
     }
@@ -638,7 +654,7 @@ impl PMap {
             } else {
                 Some(new_root)
             };
-            self.len -= 1;
+            self.count = self.count.map(|n| n - 1);
         }
         Ok(removed)
     }
@@ -753,7 +769,7 @@ impl PMap {
     /// the executor materializes the rows it scans (streaming the rows themselves is a deferred,
     /// out-of-scope follow-on — spec/design/pager.md §4/§6).
     pub(crate) fn iter(&self, src: Option<&dyn LeafSource>) -> Result<Vec<(Vec<u8>, Row)>> {
-        let mut out = Vec::with_capacity(self.len);
+        let mut out = Vec::with_capacity(self.count.unwrap_or(0));
         if let Some(root) = &self.root {
             collect(root, src, &mut out)?;
         }
@@ -1517,7 +1533,8 @@ mod tests {
                 bt.insert(key(k), row(k as i64))
             );
         }
-        assert_eq!(pm.len(), bt.len());
+        // An in-memory map (built from empty) tracks its count exactly (`Some`).
+        assert_eq!(pm.count(), Some(bt.len()));
         check_invariants(&pm);
         for k in 0..n {
             assert_eq!(pm.get(&key(k), None).unwrap().as_ref(), bt.get(&key(k)));
@@ -1526,13 +1543,13 @@ mod tests {
         let want: Vec<_> = bt.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         assert_eq!(got, want);
 
-        // Overwrite returns the old value and does not change len.
-        let before = pm.len();
+        // Overwrite returns the old value and does not change the count.
+        let before = pm.count();
         assert_eq!(
             pm.insert(key(7), row(777), W, CAP, SHAPE, None).unwrap(),
             bt.insert(key(7), row(777))
         );
-        assert_eq!(pm.len(), before);
+        assert_eq!(pm.count(), before);
         assert_eq!(pm.get(&key(7), None).unwrap(), Some(row(777)));
 
         // Interleave removes with invariant checks so merge-then-split is exercised mid-stream.
@@ -1575,7 +1592,7 @@ mod tests {
         }
 
         // `snap` still sees the original contents, untouched.
-        assert_eq!(snap.len(), 2000);
+        assert_eq!(snap.count(), Some(2000));
         for k in 0..2000 {
             assert_eq!(snap.get(&key(k), None).unwrap(), Some(row(k as i64)));
         }
@@ -1585,7 +1602,7 @@ mod tests {
         assert_eq!(snap_rows[1999], (key(1999), row(1999)));
         check_invariants(&snap);
 
-        assert_eq!(other.len(), 2500);
+        assert_eq!(other.count(), Some(2500));
         assert_eq!(other.get(&key(0), None).unwrap(), None);
         assert_eq!(other.get(&key(1000), None).unwrap(), Some(row(-1000)));
         assert_eq!(other.get(&key(2500), None).unwrap(), Some(row(2500)));
@@ -1653,7 +1670,7 @@ mod tests {
                 .unwrap();
             bt.insert(big_key(k), Vec::new());
         }
-        assert_eq!(pm.len(), bt.len());
+        assert_eq!(pm.count(), Some(bt.len()));
         // Structure: fits + routing correctness (0-key interiors allowed).
         fn walk(node: &Node, cap: usize, shape: LeafShape) {
             assert!(node.payload(shape) <= cap, "node overflows its page");

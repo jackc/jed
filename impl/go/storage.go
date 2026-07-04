@@ -469,11 +469,10 @@ func (s *tableStore) faultLeaf(page uint32) (*pnode, error) {
 	return s.paging.faultLeaf(page, s.colTypes)
 }
 
-// setTree installs a loaded B-tree as this store's contents (format.go LoadEngine).
-func (s *tableStore) setTree(root *pnode, length int) { s.rows = fromLoaded(root, length) }
-
-// Len returns the row count.
-func (s *tableStore) Len() int { return s.rows.Len() }
+// setSkeleton installs a disk-loaded B+tree skeleton as this store's contents (format.go
+// loadEnginePaged). The row count is left unknown — open reads only the interior spine, not the
+// leaves (spec/design/storage.md §6).
+func (s *tableStore) setSkeleton(root *pnode) { s.rows = fromSkeleton(root) }
 
 // storedBytes is the total on-disk record bytes this store holds — the deterministic,
 // cross-core-identical footprint measure the temp-table budget sums (spec/design/temp-tables.md §7).

@@ -2543,15 +2543,13 @@ export function loadEnginePaged(paging: SharedPaging): Engine {
       // (spec/design/composite.md §3).
       const colTypes = store.columnTypes();
       if (root !== 0) {
-        const t = readSkeleton(paging, root, colTypes);
-        // v25: the persisted free-list already excludes live overflow chains (they were kept reachable
-        // when the list was rebuilt — reachablePages/collectLeafOverflow at commit time), so open no
-        // longer re-reads every spillable leaf to protect them (the second full leaf pass is gone — the
-        // open-speed win, format.md *Reclamation*).
-        store.setTree(t.node, t.length);
-        if (!hasPK && t.length > 0) {
+        // Reads only the interior spine — leaves stay OnDisk, the row count is left unknown
+        // (spec/design/storage.md §6). v25 already dropped the free-list reachability walk; dropping
+        // the row-count leaf sum makes open O(interior spine).
+        store.setSkeleton(readSkeleton(paging, root, colTypes));
+        if (!hasPK) {
           // No-PK rowid reconstruction faults the leaves to find the largest key; only for keyless
-          // tables (most have a PK), and bounded by the pool.
+          // tables (most have a PK), and bounded by the pool. root !== 0 ⇒ the table is non-empty.
           const entries = store.entriesInKeyOrder();
           store.bumpRowidTo(decodeInt("i64", entries[entries.length - 1]!.key) + 1n);
         }
@@ -2577,8 +2575,7 @@ export function loadEnginePaged(paging: SharedPaging): Engine {
         } else {
           istore.attachPaging(paging);
           if (indexRoots[k]! !== 0) {
-            const t = readSkeleton(paging, indexRoots[k]!, []);
-            istore.setTree(t.node, t.length);
+            istore.setSkeleton(readSkeleton(paging, indexRoots[k]!, []));
           }
         }
         snap.putIndexStore(table.indexes[k]!.name.toLowerCase(), istore);
@@ -2612,47 +2609,56 @@ export function loadEnginePaged(paging: SharedPaging): Engine {
 }
 
 // readSkeleton reads a table's on-disk B-tree (rooted at root) into a demand-paged skeleton: interior
-// nodes resident, each leaf left OnDisk. Returns the root node and the total row count. A table whose
-// root is itself a single leaf has no interior parent to hold an OnDisk reference, so the root leaf is
-// faulted resident (spec/design/pager.md §1/§4).
-function readSkeleton(
-  paging: SharedPaging,
-  root: number,
-  colTypes: ColType[],
-): { node: PNode; length: number } {
-  const r = readSkeletonNode(paging, root);
-  if (r.child.node !== null) return { node: r.child.node, length: r.length };
-  return { node: paging.faultLeaf(r.child.page, colTypes), length: r.length };
+// nodes resident, every leaf left OnDisk (faulted on first access). Returns the root node only — the
+// row count is NOT computed (open reads only the interior spine, not the leaves; the store's count
+// stays unknown, spec/design/storage.md §6). A table whose root is itself a single leaf has no
+// interior parent to hold an OnDisk reference, so the root leaf is faulted resident
+// (spec/design/pager.md §1/§4).
+function readSkeleton(paging: SharedPaging, root: number, colTypes: ColType[]): PNode {
+  const child = readSkeletonNode(paging, root);
+  if (child.node !== null) return child.node;
+  return paging.faultLeaf(child.page, colTypes);
 }
 
-// readSkeletonNode reads one B+tree node through the pager, once: a leaf becomes an OnDisk child (its
-// rows counted from the header, then dropped — not retained); an interior node becomes a resident child
-// with its children resolved recursively. Returns the child reference and the subtree's row count.
-// (The free-list is loaded from the persisted chain in v25, so this walk no longer tracks reachability
-// — it still reads each leaf once for the row count, the remaining open-speed follow-on.)
-function readSkeletonNode(paging: SharedPaging, pageIdx: number): { child: Child; length: number } {
+// readSkeletonNode resolves one B+tree node into a Child WITHOUT reading the leaf level. A leaf page
+// yields an OnDisk child — its bytes are not read here at all; the parent hands down the page id and
+// the leaf faults on first access. An interior page yields a resident child — the record-free
+// separators + children skeleton (v24) — with its children resolved.
+//
+// The open-speed trick (spec/design/storage.md §6, "drop the eager count"): an interior's children
+// are homogeneous — a B+tree keeps every leaf at one depth, so an interior's children are either all
+// leaves or all interiors. We resolve only the first child to learn which; if it came back OnDisk (a
+// leaf), every sibling is a leaf too and becomes an OnDisk reference WITHOUT a block read. Only
+// interior pages are read, so open is O(interior spine) rather than O(leaves) — the second and last
+// reason open used to touch every leaf (after v25 dropped the free-list reachability walk) is gone.
+// The cost: the first child of each bottom-level interior is still read (to classify the level), i.e.
+// ~leaves/fanout leaf reads, negligible beside the former per-leaf walk. A corrupt leaf is now
+// surfaced at fault rather than at open (still XX001, never wrong rows — spec/design/storage.md §7);
+// the interior spine is still CRC-validated here at open.
+function readSkeletonNode(paging: SharedPaging, pageIdx: number): Child {
   const pg = parsePage(paging.readBlock(pageIdx));
   if (pg.pageType === PAGE_LEAF) {
-    return { child: onDiskRef(pageIdx), length: pg.itemCount };
+    return onDiskRef(pageIdx);
   }
   if (pg.pageType === PAGE_INTERIOR) {
     const n = pg.itemCount;
     const cur = { pos: 0 };
-    const children: Child[] = [];
-    let total = 0;
-    for (let i = 0; i < n + 1; i++) {
-      const cp = readU32(pg.payload, cur);
-      const r = readSkeletonNode(paging, cp);
-      children.push(r.child);
-      total += r.length;
-    }
+    // Child pointers precede the separator directory (format.md "Interior node").
+    const childPtrs: number[] = [];
+    for (let i = 0; i < n + 1; i++) childPtrs.push(readU32(pg.payload, cur));
     // v24: the record-free routing skeleton — an end-offset separator directory + key blob.
     // Separators carry no values, so no lazy decode and no chains to mark.
     const keys = readSeparators(pg.payload, cur, n);
-    return {
-      child: residentRef({ keys, vals: [], weights: [], children, page: pageIdx }),
-      length: total,
-    };
+    // Resolve the first child to classify the level, then avoid reading leaf siblings.
+    const first = readSkeletonNode(paging, childPtrs[0]!);
+    const childrenAreLeaves = first.node === null;
+    const children: Child[] = [first];
+    for (let i = 1; i < childPtrs.length; i++) {
+      children.push(
+        childrenAreLeaves ? onDiskRef(childPtrs[i]!) : readSkeletonNode(paging, childPtrs[i]!),
+      );
+    }
+    return residentRef({ keys, vals: [], weights: [], children, page: pageIdx });
   }
   throw engineError("data_corrupted", "expected a B-tree node page");
 }

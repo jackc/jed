@@ -31,6 +31,15 @@ function row(n: number): Row {
   return [intValue(BigInt(n))];
 }
 
+// pmCount returns pm's exact row count, asserting the map knows it. An in-memory map (built from
+// empty by insert) always knows its count; a disk-loaded skeleton does not (spec/design/storage.md
+// §6, "drop the eager count"), but these tests never load one.
+function pmCount(pm: PMap): number {
+  const c = pm.getCount();
+  assert.notEqual(c, null, "expected a known row count on an in-memory map");
+  return c!;
+}
+
 function keyStr(k: Uint8Array): string {
   let s = "";
   for (const b of k) s += String.fromCharCode(b);
@@ -132,7 +141,7 @@ test("pmap: insert/get/remove vs a reference map", () => {
     assert.equal(had, refHad, `insert 'had' mismatch at ${k}`);
     ref.set(keyStr(key(k)), row(k));
   }
-  assert.equal(pm.size, ref.size);
+  assert.equal(pmCount(pm), ref.size);
   checkInvariants(pm);
   for (let k = 0; k < n; k++) {
     assert.deepEqual(pm.get(key(k), null), ref.get(keyStr(key(k))));
@@ -149,10 +158,10 @@ test("pmap: insert/get/remove vs a reference map", () => {
   }
 
   // Overwrite returns the old value and does not change size (kept in sync with the reference).
-  const before = pm.size;
+  const before = pmCount(pm);
   assert.deepEqual(pm.insert(key(7), row(777), W, CAP, SHAPE, null), row(7));
   ref.set(keyStr(key(7)), row(777));
-  assert.equal(pm.size, before);
+  assert.equal(pmCount(pm), before);
   assert.deepEqual(pm.get(key(7), null), row(777));
 
   // Interleave removes with invariant checks so merge-then-split is exercised mid-stream.
@@ -164,7 +173,7 @@ test("pmap: insert/get/remove vs a reference map", () => {
     assert.deepEqual(got, want, `remove mismatch at ${k}`);
     if (step++ % 257 === 0) checkInvariants(pm);
   }
-  assert.equal(pm.size, 0);
+  assert.equal(pmCount(pm), 0);
   assert.equal(pm.inorder(null).keys.length, 0);
   assert.equal(pm.remove(key(123), CAP, SHAPE, null), undefined);
 });
@@ -180,10 +189,10 @@ test("pmap: clone is an independent snapshot", () => {
   for (let k = 2000; k < 3000; k++) other.insert(key(k), row(k), W, CAP, SHAPE, null); // grow
   for (let k = 0; k < 500; k++) other.remove(key(k), CAP, SHAPE, null); // shrink
 
-  assert.equal(snap.size, 2000);
+  assert.equal(pmCount(snap), 2000);
   for (let k = 0; k < 2000; k++) assert.deepEqual(snap.get(key(k), null), row(k));
   checkInvariants(snap);
-  assert.equal(other.size, 2500);
+  assert.equal(pmCount(other), 2500);
   assert.equal(other.get(key(0), null), undefined);
   assert.deepEqual(other.get(key(1000), null), row(-1000));
   assert.deepEqual(other.get(key(2500), null), row(2500));
@@ -192,13 +201,13 @@ test("pmap: clone is an independent snapshot", () => {
 
 test("pmap: empty and single", () => {
   const pm = new PMap();
-  assert.equal(pm.size, 0);
+  assert.equal(pmCount(pm), 0);
   assert.equal(pm.get(key(1), null), undefined);
   assert.equal(pm.remove(key(1), CAP, SHAPE, null), undefined);
   assert.equal(pm.insert(key(1), row(1), W, CAP, SHAPE, null), undefined);
   assert.deepEqual(pm.get(key(1), null), row(1));
   assert.deepEqual(pm.remove(key(1), CAP, SHAPE, null), row(1));
-  assert.equal(pm.size, 0);
+  assert.equal(pmCount(pm), 0);
   assert.equal(pm.rootNode(), null);
 });
 
@@ -215,7 +224,7 @@ test("pmap: wide values keep nodes valid", () => {
     pm.remove(key(k), CAP, SHAPE, null);
     checkInvariants(pm);
   }
-  assert.equal(pm.size, 0);
+  assert.equal(pmCount(pm), 0);
 });
 
 // Near-cap KEYS (the max-size-separator case, format.md "Interior node"): separators are key
@@ -238,7 +247,7 @@ test("pmap: near-cap keys force degenerate interior nodes", () => {
     pm.insert(bigKey(k), [], 110, CAP, shape, null);
     ref.set(keyStr(bigKey(k)), []);
   }
-  assert.equal(pm.size, ref.size);
+  assert.equal(pmCount(pm), ref.size);
   // Structure: fits + routing correctness (0-key interiors allowed).
   const walk = (n: PNode): void => {
     assert.ok(nodePayload(n, shape) <= CAP, "node overflows its page");
@@ -265,7 +274,7 @@ test("pmap: near-cap keys force degenerate interior nodes", () => {
   for (const k of shuffled(60)) {
     assert.deepEqual(pm.remove(bigKey(k), CAP, shape, null), []);
   }
-  assert.equal(pm.size, 0);
+  assert.equal(pmCount(pm), 0);
 });
 
 // The bounded scan yields exactly the in-bound rows, in order, and the counted nodes match

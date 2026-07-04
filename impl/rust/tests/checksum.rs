@@ -2,8 +2,9 @@
 //! interior, and overflow — carries a CRC-32/IEEE over its own bytes (spec/fileformat/format.md
 //! *Page header*; spec/design/storage.md §6). This pins the durability guarantee that distinguishes
 //! reliability item #3 from the meta-only checksum: a silently corrupted **live** page is detected
-//! as `XX001` the instant it is read — at open for a catalog/interior/overflow page (the loader and
-//! the free-list reachability walk), at fault for a leaf — and is **never** served as wrong rows. A
+//! as `XX001` the instant it is read — at open for a catalog/interior (routing-spine) page (the
+//! pages the loader reads), at fault for a leaf or overflow page (open reads only the interior spine
+//! — spec/design/storage.md §6) — and is **never** served as wrong rows. A
 //! corrupted **dead** page (free space an earlier incremental commit abandoned, P6.2) is harmless:
 //! it is not reachable from the committed snapshot, so the file still reads back exactly. The
 //! invariant the loop asserts is therefore the strong one: corrupting *any* body page yields either

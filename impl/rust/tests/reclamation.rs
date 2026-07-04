@@ -11,9 +11,13 @@
 //! page was dead, so overwriting it never damaged the fallback).
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
+use jed::blockstore::{BlockStore, FileBlockStore};
+use jed::pager::Pager;
 use jed::value::Value;
-use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Engine, Outcome, Session, SessionOptions};
 
 const PS: u64 = 256;
 
@@ -338,4 +342,75 @@ fn torn_commit_after_reuse_falls_back_to_the_intact_prior_snapshot() {
         Some(&format!("A-{pad}")[..])
     );
     assert_eq!(ids(&mut db), (1..=20).collect::<Vec<_>>());
+}
+
+/// A `BlockStore` that counts `read_at` calls — the observable for the open-cost invariant below.
+struct CountingStore {
+    inner: FileBlockStore,
+    reads: Arc<AtomicU32>,
+}
+
+impl BlockStore for CountingStore {
+    fn read_at(&mut self, offset: u64, len: usize) -> jed::Result<Vec<u8>> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.inner.read_at(offset, len)
+    }
+    fn write_at(&mut self, offset: u64, bytes: &[u8]) -> jed::Result<()> {
+        self.inner.write_at(offset, bytes)
+    }
+    fn sync(&mut self) -> jed::Result<()> {
+        self.inner.sync()
+    }
+    fn size(&mut self) -> jed::Result<u64> {
+        self.inner.size()
+    }
+    fn set_size(&mut self, bytes: u64) -> jed::Result<()> {
+        self.inner.set_size(bytes)
+    }
+}
+
+/// Open reads the **interior spine, not every leaf** (spec/design/storage.md §6, "drop the eager
+/// count"). Since v25 dropped the free-list reachability walk and this slice dropped the row-count
+/// leaf sum, `open` faults only catalog + interior pages + ~one leaf per bottom-level interior (to
+/// classify the level) + the meta/free-list pages — all O(interior spine). The block-read count must
+/// therefore stay **well below the leaf count**, and above all must **not scale with it**. A counting
+/// `BlockStore` is the only way to see this (it is not SQL-observable); the invariant is byte-identical
+/// across cores, so the reference core pins it and the corpus disk mode covers the others' correctness.
+#[test]
+fn open_reads_the_interior_spine_not_every_leaf() {
+    // A many-leaf table (page 256, ~4 rows/leaf) so "every leaf" is a large, distinctive number.
+    let path = tmp("open_spine_only.jed");
+    drop(setup(&path, 400));
+
+    let bytes = std::fs::read(&path).unwrap();
+    let ps = be32(&bytes, 8) as usize;
+    let page_count = bytes.len() / ps;
+    let leaves = (0..page_count).filter(|&i| bytes[i * ps] == 2).count(); // page_type 2 = leaf
+    assert!(
+        leaves >= 50,
+        "the seed should span many leaves, got {leaves}"
+    );
+
+    // Open through the counting store and tally the block reads `open` performs.
+    let reads = Arc::new(AtomicU32::new(0));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let store = CountingStore {
+        inner: FileBlockStore::new(file),
+        reads: Arc::clone(&reads),
+    };
+    let pager = Pager::from_store(Box::new(store)).unwrap();
+    let db = Engine::open_paged(pager, 100_000).unwrap();
+    let n = reads.load(Ordering::Relaxed) as usize;
+
+    // The ceiling is deliberately loose (`< leaves`) — the point is that open does NOT read every
+    // leaf, and in practice n ≪ leaves (only the spine + a peek per bottom-level interior).
+    assert!(
+        n < leaves,
+        "open read {n} pages for a {leaves}-leaf table — it must read only the interior spine, not every leaf"
+    );
+    drop(db);
 }

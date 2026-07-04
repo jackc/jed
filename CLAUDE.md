@@ -593,10 +593,14 @@ cross-core-identical and owns that consequence (the host-extension boundary, §1
   and **on-disk free-list persistence + continuous within-session reclamation**
   (`format_version` 25 — meta offset 28 `free_list_head` + a new `page_type 7` free-list page; open
   reads the persisted free-list instead of the reachability walk, and a file commit reclaims its fresh
-  orphans in-commit under the reader watermark, `spec/design/storage.md` §6). **Still deferred**
-  (later Phase-6, none foreclosed): per-subtree/per-table row counts so open need not walk leaves for
-  the row count either (the remaining open-speed follow-on). The from-scratch whole-image serializer
-  survives as `create`'s initial write and the golden generator.
+  orphans in-commit under the reader watermark, `spec/design/storage.md` §6). **Open now reads only
+  the interior spine** — with v25's free-list persistence, the last reason open touched every leaf
+  (summing the per-table row count from each leaf header) was **dropped**: `read_skeleton` classifies
+  each interior's children by the B+tree same-depth invariant (resolve only the first child, reference
+  leaf siblings as `OnDisk` without reading them), so a disk-loaded store carries an *unknown* count
+  and derives emptiness from its root, and open is O(interior spine) not O(file) (`spec/design/storage.md`
+  §6; the no-PK synthetic-rowid table is the lone leaf-faulting exception). The from-scratch whole-image
+  serializer survives as `create`'s initial write and the golden generator.
 - **Host file API (Phase 7).** The embedding surface (`spec/design/api.md`) `open`s/`create`s
   a database file and `commit`s the whole image **durably** via temp-file + fsync + atomic
   rename + dir fsync (whole-image rewrite ⇒ rename gives all-or-nothing for free). `commit` is

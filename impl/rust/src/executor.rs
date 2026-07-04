@@ -5169,7 +5169,7 @@ impl Engine {
         let store = self.store_scoped(ci.db.as_deref(), &ci.table);
         let (table_entries, nodes, slabs) = store.scan_with_units(&mask)?;
         meter.charge(COSTS.page_read * nodes as i64 + COSTS.value_decompress * slabs as i64);
-        let mut entries: Vec<Vec<u8>> = Vec::with_capacity(store.len());
+        let mut entries: Vec<Vec<u8>> = Vec::with_capacity(table_entries.len());
         // A UNIQUE build verifies the existing rows before the index is registered
         // (indexes.md §8): two rows sharing a fully-non-NULL key tuple — i.e. an exempt-free
         // prefix — trap 23505 and create nothing. Unmetered validation (cost.md §3).

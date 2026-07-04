@@ -1889,13 +1889,12 @@ impl Engine {
                 // `put_table` (spec/design/composite.md §3).
                 let col_types = Arc::new(snap.store(&name).col_types().to_vec());
                 if root_data_page != 0 {
-                    let (root, len) = read_skeleton(&paging, root_data_page, &col_types)?;
-                    // v25: the persisted free-list already excludes live overflow chains (they were
-                    // kept reachable when the list was rebuilt — reachable_pages/collect_leaf_overflow
-                    // at commit time), so open no longer re-reads every spillable leaf to protect them
-                    // (the second full leaf pass is gone — the open-speed win, format.md *Reclamation*).
+                    // Reads only the interior spine — leaves stay `OnDisk`, the row count is left
+                    // unknown (spec/design/storage.md §6). v25 already dropped the free-list
+                    // reachability walk; dropping the row-count leaf sum makes open O(interior spine).
+                    let root = read_skeleton(&paging, root_data_page, &col_types)?;
                     let store = snap.store_mut(&name);
-                    store.set_tree(Some(root), len);
+                    store.set_skeleton(Some(root));
                     if !has_pk {
                         // No-PK rowid reconstruction faults the leaves to find the largest key; only
                         // for keyless tables (most have a PK), and bounded by the pool.
@@ -1933,8 +1932,8 @@ impl Engine {
                             istore.attach_paging(paging.clone());
                             // An index tree has zero value columns (empty-payload records); its
                             // Packed leaves reconstruct empty rows from a shared empty col-type list.
-                            let (root, len) = read_skeleton(&paging, iroot, &Arc::new(Vec::new()))?;
-                            istore.set_tree(Some(root), len);
+                            let root = read_skeleton(&paging, iroot, &Arc::new(Vec::new()))?;
+                            istore.set_skeleton(Some(root));
                         }
                     } else {
                         istore.attach_paging(paging.clone());
@@ -2158,55 +2157,73 @@ fn collect_tree_pages(node: &Node, reached: &mut HashSet<u32>) {
 }
 
 /// Read a table's on-disk B-tree (rooted at `root_page`) into a demand-paged **skeleton**: interior
-/// nodes resident, each leaf left `OnDisk`. Returns the root node and the total row count. A table
-/// whose root is itself a single leaf has no interior parent to hold an `OnDisk` reference, so the
-/// root leaf is faulted resident (spec/design/pager.md §1/§4).
+/// nodes resident, every leaf left `OnDisk` (faulted on first access). Returns the root node only —
+/// the row count is **not** computed (open reads only the interior spine, not the leaves; the store's
+/// count stays unknown, spec/design/storage.md §6). A table whose root is itself a single leaf has no
+/// interior parent to hold an `OnDisk` reference, so the root leaf is faulted resident
+/// (spec/design/pager.md §1/§4).
 fn read_skeleton(
     paging: &Arc<SharedPaging>,
     root_page: u32,
     col_types: &Arc<Vec<ColType>>,
-) -> Result<(Arc<Node>, usize)> {
-    let (child, len) = read_skeleton_node(paging, root_page, col_types)?;
-    let root = match child {
-        Child::Resident(node) => node,
-        Child::OnDisk(page) => paging.fault_leaf(page, col_types)?,
-    };
-    Ok((root, len))
+) -> Result<Arc<Node>> {
+    match read_skeleton_node(paging, root_page, col_types)? {
+        Child::Resident(node) => Ok(node),
+        Child::OnDisk(page) => paging.fault_leaf(page, col_types),
+    }
 }
 
-/// Read one B-tree node through the pager, **once**: a leaf becomes `Child::OnDisk` (its rows counted
-/// from the header, then dropped — not retained); an interior node becomes `Child::Resident` with its
-/// children resolved recursively. Returns the child reference and the subtree's row count. (The
-/// free-list is loaded from the persisted chain in v25, so this walk no longer tracks reachability —
-/// it still reads each leaf once for the row count, the remaining open-speed follow-on.)
+/// Resolve one B-tree node into a [`Child`] **without reading the leaf level**. A leaf page yields
+/// `Child::OnDisk(page_idx)` — its bytes are not read here at all; the parent hands down the page id
+/// and the leaf faults on first access. An interior page yields `Child::Resident` with its children
+/// resolved.
+///
+/// The open-speed trick (spec/design/storage.md §6, "drop the eager count"): an interior's children
+/// are **homogeneous** — a B+tree keeps every leaf at one depth, so an interior's children are either
+/// all leaves or all interiors. We resolve only the **first** child to learn which; if it came back
+/// `OnDisk` (a leaf), every sibling is a leaf too and becomes an `OnDisk` reference **without a
+/// block read**. Only interior pages are read, so open is O(interior spine) rather than O(leaves) —
+/// the second and last reason open used to touch every leaf (after v25 dropped the free-list
+/// reachability walk) is gone. The cost: the first child of each bottom-level interior is still read
+/// (to classify the level), i.e. ~`leaves / fanout` leaf reads, negligible beside the former per-leaf
+/// walk. A corrupt leaf is now surfaced at fault rather than at open (still `XX001`, never wrong
+/// rows — spec/design/storage.md §7); the interior spine is still CRC-validated here at open.
 fn read_skeleton_node(
     paging: &SharedPaging,
     page_idx: u32,
     col_types: &[ColType],
-) -> Result<(Child, usize)> {
+) -> Result<Child> {
     let block = paging.pager().read_block(page_idx)?;
     let page = parse_page(&block)?;
     match page.page_type {
-        PAGE_LEAF => Ok((Child::OnDisk(page_idx), page.item_count as usize)),
+        PAGE_LEAF => Ok(Child::OnDisk(page_idx)),
         PAGE_INTERIOR => {
             let n = page.item_count as usize;
             let payload = page.payload;
             let mut pos = 0usize;
-            let mut children = Vec::with_capacity(n + 1);
-            let mut total = 0usize;
+            // Child pointers precede the separator directory (format.md "Interior node").
+            let mut child_ptrs = Vec::with_capacity(n + 1);
             for _ in 0..=n {
-                let cp = read_u32(payload, &mut pos)?;
-                let (child, clen) = read_skeleton_node(paging, cp, col_types)?;
-                children.push(child);
-                total += clen;
+                child_ptrs.push(read_u32(payload, &mut pos)?);
             }
             // v24: the record-free routing skeleton — an end-offset separator directory + key
             // blob. Separators carry no values, so no lazy decode and no chains to mark.
             let keys = read_separators(payload, &mut pos, n)?;
-            Ok((
-                Child::Resident(Node::loaded_interior(keys, children, page_idx)),
-                total,
-            ))
+            // Resolve the first child to classify the level, then avoid reading leaf siblings.
+            let mut children = Vec::with_capacity(n + 1);
+            let first = read_skeleton_node(paging, child_ptrs[0], col_types)?;
+            let children_are_leaves = matches!(first, Child::OnDisk(_));
+            children.push(first);
+            for &cp in &child_ptrs[1..] {
+                children.push(if children_are_leaves {
+                    Child::OnDisk(cp) // a leaf sibling — not read at open
+                } else {
+                    read_skeleton_node(paging, cp, col_types)?
+                });
+            }
+            Ok(Child::Resident(Node::loaded_interior(
+                keys, children, page_idx,
+            )))
         }
         _ => Err(corrupt("expected a B-tree node page")),
     }

@@ -287,3 +287,69 @@ func checkIDs1to(t *testing.T, got []int64, n int) {
 		}
 	}
 }
+
+// countingStore wraps a fileBlockStore and counts readAt calls — the observable for the open-cost
+// invariant below (the other methods are promoted from the embedded store).
+type countingStore struct {
+	*fileBlockStore
+	reads *int
+}
+
+func (s *countingStore) readAt(off int64, length int) ([]byte, error) {
+	*s.reads++
+	return s.fileBlockStore.readAt(off, length)
+}
+
+// TestOpenReadsInteriorSpineNotEveryLeaf: open reads the interior spine, NOT every leaf
+// (spec/design/storage.md §6, "drop the eager count"). Since v25 dropped the free-list reachability
+// walk and this slice dropped the row-count leaf sum, open faults only catalog + interior pages + ~one
+// leaf per bottom-level interior (to classify the level) + the meta/free-list pages — all O(interior
+// spine). The block-read count must stay well below the leaf count, and above all must not scale with
+// it. A counting blockStore is the only way to see this (it is not SQL-observable).
+func TestOpenReadsInteriorSpineNotEveryLeaf(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "open_spine_only.jed")
+	// A many-leaf table (page 256, ~4 rows/leaf) so "every leaf" is a large, distinctive number.
+	db := reclaimSetup(t, path, 400)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	img, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ps := int(binary.BigEndian.Uint32(img[8:12]))
+	leaves := 0
+	for i := 0; i < len(img)/ps; i++ {
+		if img[i*ps] == 2 { // page_type 2 = leaf
+			leaves++
+		}
+	}
+	if leaves < 50 {
+		t.Fatalf("the seed should span many leaves, got %d", leaves)
+	}
+
+	// Open through the counting store and tally the block reads open performs.
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reads := 0
+	cs := &countingStore{fileBlockStore: &fileBlockStore{f: f}, reads: &reads}
+	p, err := pagerFromStore(cs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db2, err := loadEnginePaged(p, cacheLeaves(defaultCacheBytes, p.pageSize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The ceiling is deliberately loose (< leaves) — the point is that open does NOT read every leaf,
+	// and in practice reads ≪ leaves (only the spine + a peek per bottom-level interior).
+	if reads >= leaves {
+		t.Fatalf("open read %d pages for a %d-leaf table — it must read only the interior spine, not every leaf", reads, leaves)
+	}
+	if err := db2.Close(); err != nil {
+		t.Fatal(err)
+	}
+}

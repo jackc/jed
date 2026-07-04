@@ -9,10 +9,15 @@
 // round-trips, and that a torn latest commit *after reuse* still falls back to the intact prior snapshot.
 
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import type { BlockStore } from "../src/blockstore.ts";
+import { FileBlockStore } from "../src/fileblockstore.ts";
+import { loadEnginePaged } from "../src/format.ts";
+import { Pager } from "../src/pager.ts";
+import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "../src/paging.ts";
 import { close, create, type Engine, execute, open } from "../src/tooling.ts";
 
 const PS = 256;
@@ -226,6 +231,74 @@ test("a torn commit after reuse falls back to the intact prior snapshot", () => 
     assert.equal(padOf(db3, 11), orig11, "the torn commit's row-11 update vanished");
     assert.equal(padOf(db3, 10), `A-${pad}`);
     assert.deepEqual(ids(db3), expectedIds(20));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// CountingStore wraps a FileBlockStore and counts readAt calls — the observable for the open-cost
+// invariant below.
+class CountingStore implements BlockStore {
+  reads = 0;
+  private inner: FileBlockStore;
+  constructor(inner: FileBlockStore) {
+    this.inner = inner;
+  }
+  readAt(offset: number, len: number): Uint8Array {
+    this.reads++;
+    return this.inner.readAt(offset, len);
+  }
+  writeAt(offset: number, bytes: Uint8Array): void {
+    this.inner.writeAt(offset, bytes);
+  }
+  sync(): void {
+    this.inner.sync();
+  }
+  size(): number {
+    return this.inner.size();
+  }
+  setSize(bytes: number): void {
+    this.inner.setSize(bytes);
+  }
+  close(): void {
+    this.inner.close();
+  }
+}
+
+// open reads the interior spine, NOT every leaf (spec/design/storage.md §6, "drop the eager count").
+// Since v25 dropped the free-list reachability walk and this slice dropped the row-count leaf sum, open
+// faults only catalog + interior pages + ~one leaf per bottom-level interior (to classify the level) +
+// the meta/free-list pages — all O(interior spine). The block-read count must stay well below the leaf
+// count, and above all must not scale with it. A counting BlockStore is the only way to see this (it is
+// not SQL-observable).
+test("open reads the interior spine, not every leaf", () => {
+  const dir = tmpDir();
+  try {
+    const path = join(dir, "open_spine_only.jed");
+    // A many-leaf table (page 256, ~4 rows/leaf) so "every leaf" is a large, distinctive number.
+    const db = setup(path, 400);
+    close(db);
+
+    const img = readFileSync(path);
+    const dv = new DataView(img.buffer, img.byteOffset, img.byteLength);
+    const ps = dv.getUint32(8, false);
+    let leaves = 0;
+    for (let i = 0; i < Math.floor(img.length / ps); i++) {
+      if (img[i * ps] === 2) leaves++; // page_type 2 = leaf
+    }
+    assert.ok(leaves >= 50, `the seed should span many leaves, got ${leaves}`);
+
+    // Open through the counting store and tally the block reads open performs.
+    const store = new CountingStore(new FileBlockStore(openSync(path, "r+")));
+    const pager = Pager.fromStore(store);
+    loadEnginePaged(new SharedPaging(pager, cacheLeaves(DEFAULT_CACHE_BYTES, pager.pageSize)));
+    // The ceiling is deliberately loose (< leaves) — the point is that open does NOT read every leaf,
+    // and in practice reads ≪ leaves (only the spine + a peek per bottom-level interior).
+    assert.ok(
+      store.reads < leaves,
+      `open read ${store.reads} pages for a ${leaves}-leaf table — it must read only the interior spine, not every leaf`,
+    );
+    store.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

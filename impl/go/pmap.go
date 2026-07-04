@@ -174,22 +174,35 @@ func (n *pnode) childSlot(key []byte) int {
 
 // PMap is a persistent ordered map from encoded key to Row. A value copy is an O(1) independent
 // snapshot (the root pointer is shared; nodes are immutable).
+//
+// length is the exact row count when known. A map built from empty by Insert/Remove maintains it
+// for free; a map loaded from a disk skeleton (fromSkeleton) leaves lengthUnknown set — open reads
+// only the interior spine and never walks the leaves to sum it (spec/design/storage.md §6), and
+// nothing needs the exact count of a loaded table. lengthUnknown is deliberately the NON-zero-value
+// flag: a fresh (zero-value) pMap and newPMap are known-0, matching newTableStore's zero-value rows.
 type pMap struct {
-	root   *pnode
-	length int
+	root          *pnode
+	length        int
+	lengthUnknown bool
 }
 
-// NewPMap returns an empty map.
+// NewPMap returns an empty map (known count 0).
 func newPMap() pMap { return pMap{} }
 
-// Len returns the entry count.
-func (m *pMap) Len() int { return m.length }
+// Count returns the exact row count and whether it is known. A disk-loaded skeleton returns
+// (0, false); nothing in the engine needs a loaded table's exact count (IsEmpty uses the root).
+func (m *pMap) Count() (int, bool) { return m.length, !m.lengthUnknown }
+
+// IsEmpty reports whether the map has no rows — derived from the root (exact, O(1)), independent of
+// whether the count is known.
+func (m *pMap) IsEmpty() bool { return m.root == nil }
 
 // root exposes the root node to the serializer (format.go). nil for an empty map.
 func (m *pMap) rootNode() *pnode { return m.root }
 
-// fromLoaded reconstructs a map from a loaded root (format.go LoadEngine).
-func fromLoaded(root *pnode, length int) pMap { return pMap{root: root, length: length} }
+// fromSkeleton reconstructs a map from a disk-loaded skeleton root (format.go loadEnginePaged). The
+// count is unknown — open reads only the interior spine (spec/design/storage.md §6).
+func fromSkeleton(root *pnode) pMap { return pMap{root: root, lengthUnknown: true} }
 
 // Get looks up the row at key — a root→leaf descent (interior nodes only route, v24). src faults an
 // OnDisk leaf on the descent (nil for a fully-resident in-memory tree); an I/O error propagates.
@@ -223,7 +236,9 @@ func (m *pMap) Get(key []byte, src leafSource) (storedRow, bool, error) {
 func (m *pMap) Insert(key []byte, val storedRow, weight uint32, cap int, shape leafShape, src leafSource) (storedRow, bool, error) {
 	if m.root == nil {
 		m.root = &pnode{keys: [][]byte{key}, vals: []storedRow{val}, weights: []uint32{weight}}
-		m.length++
+		if !m.lengthUnknown {
+			m.length++
+		}
 		return nil, false, nil
 	}
 	var old storedRow
@@ -240,7 +255,7 @@ func (m *pMap) Insert(key []byte, val storedRow, weight uint32, cap int, shape l
 			children: []childRef{residentRef(out.left), residentRef(out.right)},
 		}
 	}
-	if !replaced {
+	if !replaced && !m.lengthUnknown {
 		m.length++
 	}
 	return old, replaced, nil
@@ -277,7 +292,9 @@ func (m *pMap) Remove(key []byte, cap int, shape leafShape, src leafSource) (sto
 	} else {
 		m.root = newRoot
 	}
-	m.length--
+	if !m.lengthUnknown {
+		m.length--
+	}
 	return removed, true, nil
 }
 

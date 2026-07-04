@@ -542,13 +542,16 @@ impl TableStore {
         self.paging.is_some()
     }
 
-    /// Install a loaded B-tree as this store's contents (format.rs `from_image`).
-    pub(crate) fn set_tree(&mut self, root: Option<Arc<Node>>, len: usize) {
-        self.rows = PMap::from_loaded(root, len);
+    /// Install a disk-loaded B+tree skeleton as this store's contents (format.rs `read_skeleton`).
+    /// The row count is left **unknown** — open no longer walks the leaves to sum it
+    /// (spec/design/storage.md §6).
+    pub(crate) fn set_skeleton(&mut self, root: Option<Arc<Node>>) {
+        self.rows = PMap::from_skeleton(root);
     }
 
-    pub fn len(&self) -> usize {
-        self.rows.len()
+    /// The exact row count, or `None` when unknown (a disk-loaded store — see [`PMap::count`]).
+    pub fn count(&self) -> Option<usize> {
+        self.rows.count()
     }
 
     pub fn is_empty(&self) -> bool {

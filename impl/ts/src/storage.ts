@@ -12,7 +12,7 @@
 
 import type { Value } from "./value.ts";
 import type { ColType } from "./catalog.ts";
-import { PMap, pmapFromLoaded, unboundedBound } from "./pmap.ts";
+import { PMap, pmapFromSkeleton, unboundedBound } from "./pmap.ts";
 import type { KeyBound, LeafShape, LeafSource, PNode } from "./pmap.ts";
 import type { SharedPaging } from "./paging.ts";
 import {
@@ -445,14 +445,16 @@ export class TableStore {
     return this.colTypes;
   }
 
-  // setTree installs a loaded B-tree as this store's contents (format.ts loadEngine).
-  setTree(root: PNode | null, length: number): void {
-    this.rows = pmapFromLoaded(root, length);
+  // setSkeleton installs a disk-loaded B+tree skeleton as this store's contents (format.ts
+  // loadEnginePaged). The row count is left unknown — open reads only the interior spine, not the
+  // leaves (spec/design/storage.md §6).
+  setSkeleton(root: PNode | null): void {
+    this.rows = pmapFromSkeleton(root);
   }
 
-  // len returns the row count.
-  len(): number {
-    return this.rows.size;
+  // count returns the exact row count, or null when unknown (a disk-loaded store — see PMap).
+  count(): number | null {
+    return this.rows.getCount();
   }
 
   // storedBytes is the total on-disk record bytes this store holds — the deterministic,

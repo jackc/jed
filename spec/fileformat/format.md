@@ -271,9 +271,10 @@ live page rather than returning wrong results or panicking
    `next_page` (*Page header* below). Through v6 only the meta slots were checksummed; a
    bit flip in any other page went undetected. Now **every** body page carries a
    CRC-32/IEEE over its own bytes, verified the instant the page is parsed (`XX001` on
-   mismatch) — including the open-time reachability walk, so corruption of a catalog page,
-   an interior node, or an overflow chain is caught at **open**, and a leaf the moment it
-   faults in.
+   mismatch). Corruption is caught the moment the page is read: a catalog or interior
+   (routing-spine) page — the pages open reads — is caught at **open**; a leaf or overflow
+   page, which open no longer reads (open reads only the interior spine — *Reclamation*
+   below), the moment it **faults in**.
 2. Because the header is 4 bytes wider, the page payload `C = page_size − 16` shrinks by 4
    and the byte layout of every multi-record page shifts (`RECORD_MAX` falls from 116 to
    114 at the 256-byte fixture size). The **`− 12` inside `RECORD_MAX`** is *unchanged* — it
@@ -337,8 +338,12 @@ below), so a file no longer grows without bound across its lifetime. **v25 persi
 walking every leaf, and pairs it with **continuous within-session reclamation** (orphans returned at
 each commit, under the reader watermark) so the persisted list stays bounded. Live overflow chains
 (v3) are kept reachable and never freed; a dead chain (from an updated/deleted row) is reclaimed at
-the next within-session rebuild. **Still deferred, not foreclosed**: per-subtree/per-table row counts
-so open need not touch leaves for the row count either (the remaining open-speed follow-on).
+the next within-session rebuild. **Open reads only the interior spine**: with the free-list read from
+the persisted chain, the *last* reason open touched every leaf — summing the per-table row count from
+each leaf header — is also **dropped**, so `read_skeleton` builds the interior skeleton without
+reading the leaf level (a disk-loaded store carries an *unknown* row count and derives emptiness from
+its root — [../design/storage.md §6](../design/storage.md)). A **no-PK** table is the lone exception:
+its synthetic rowid is reconstructed as `max key + 1`, which still faults its leaves.
 
 ## Conventions
 
