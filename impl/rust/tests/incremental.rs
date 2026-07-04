@@ -50,6 +50,7 @@ fn a_single_row_commit_appends_only_the_dirty_path() {
     let mut db = Database::create(CreateOptions {
         path: Some(std::path::PathBuf::from(&path)),
         page_size: 256,
+        ..Default::default()
     })
     .unwrap()
     .session(SessionOptions::default());
@@ -115,6 +116,7 @@ fn delete_heavy_history_reopens_correctly() {
     let mut db = Database::create(CreateOptions {
         path: Some(std::path::PathBuf::from(&path)),
         page_size: 256,
+        ..Default::default()
     })
     .unwrap()
     .session(SessionOptions::default());
@@ -217,6 +219,7 @@ fn small_database_file_stays_proportional() {
     let mut db = Database::create(CreateOptions {
         path: Some(std::path::PathBuf::from(&path)),
         page_size: 256,
+        ..Default::default()
     })
     .unwrap()
     .session(SessionOptions::default());

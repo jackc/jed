@@ -83,6 +83,7 @@ fn create_with_custom_page_size_round_trips() {
     let db = Database::create(CreateOptions {
         path: Some(std::path::PathBuf::from(&path)),
         page_size: 256,
+        ..Default::default()
     })
     .unwrap()
     .session(SessionOptions::default());

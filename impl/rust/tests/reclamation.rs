@@ -151,6 +151,7 @@ fn setup(path: &PathBuf, rows: i64) -> Session {
     let mut db = Database::create(CreateOptions {
         path: Some(std::path::PathBuf::from(path)),
         page_size: PS as u32,
+        ..Default::default()
     })
     .unwrap()
     .session(SessionOptions::default());
@@ -399,7 +400,7 @@ fn open_reads_the_interior_spine_not_every_leaf() {
         .open(&path)
         .unwrap();
     let store = CountingStore {
-        inner: FileBlockStore::new(file),
+        inner: FileBlockStore::new(file, false),
         reads: Arc::clone(&reads),
     };
     let pager = Pager::from_store(Box::new(store)).unwrap();

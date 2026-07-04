@@ -114,6 +114,7 @@ fn paged_masked_scan_matches_resident_across_query_shapes() {
         let mut db = Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(&path)),
             page_size: jed::DEFAULT_PAGE_SIZE,
+            ..Default::default()
         })
         .unwrap()
         .session(SessionOptions::default());
@@ -257,6 +258,7 @@ fn paged_columnar_multilevel_matches_resident() {
         let mut db = Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(&path)),
             page_size: jed::DEFAULT_PAGE_SIZE,
+            ..Default::default()
         })
         .unwrap()
         .session(SessionOptions::default());

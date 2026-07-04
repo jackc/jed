@@ -370,6 +370,22 @@ ext4 file-growth metadata journaling — `insert_commit_durable` fell ~9 ms → 
 three cores. This changes only fsync *timing/flavor*, never the commit-visibility boundary, and is
 byte- and cost-neutral (the slack is trailing zeros past the high-water).
 
+**`no_fsync` — the built dev/testing knob (distinct from `synchronous=off`).** `synchronous=off`
+above is a *durability-preserving* relaxation (batched/deferred fsync, **never corrupts** — a valid
+older snapshot always remains). Realizing it on a copy-on-write engine is subtle: because the durable
+on-disk root would then lag the in-memory one, the allocator must **not reuse a page the lagging
+durable snapshot still references** (else a power loss corrupts the fallback), so it needs a
+durable-watermark-gated reclamation pass — hence "designed, not yet built." The **implemented** knob is
+**`no_fsync`** (api.md §2.1): a create/open handle setting that makes the per-commit `fdatasync`
+barriers (and the create-time image + durable-grow fsyncs) **no-ops**. A commit writes the *identical
+bytes in the same order* — byte/cost/result-neutral, and reclamation is untouched (it still reclaims
+exactly as `synchronous=on`, because `no_fsync` makes no durability promise it must protect) — but the
+flush is skipped entirely. So it is **not** "never corrupts": durable across a **process** crash (the
+OS page cache flushes) but **not** an OS crash / power loss — the standard `PRAGMA synchronous=OFF`
+trade, for throwaway/rebuildable databases, bulk loads, and the conformance disk harness (which reopens
+a temp image before every record to exercise the on-disk read path, where the fsync-per-commit was
+~78% of disk-mode wall time). Production that must not lose a commit keeps the default fsync-on path.
+
 ## 10. Concurrency mechanism & the testing split
 
 - **Single writer, lock-free readers.** A read transaction takes **no** lock and never blocks —

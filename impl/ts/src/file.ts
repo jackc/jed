@@ -28,7 +28,10 @@ import { FileSpillSink } from "./spillfile.ts";
 
 // DatabaseOptions are the settings for a newly-created database file (spec/design/api.md §2).
 // pageSize is fixed into the file's meta at creation and cannot change thereafter.
-export type DatabaseOptions = { pageSize?: number };
+// noSync is the fsync=off host setting (api.md §2.1): a commit writes identical bytes in the same order
+// but skips the fdatasync barrier. Unlike pageSize it is NOT fixed into the file — it is a runtime handle
+// setting. DEV/TESTING only (durable across a process crash, not an OS crash).
+export type DatabaseOptions = { pageSize?: number; noSync?: boolean };
 
 // CreateOptions are the settings for creating a fresh database (spec/design/api.md §2.1/§2.1.1). path
 // selects the backing: absent → an in-memory database (never touches the filesystem); present → a
@@ -36,7 +39,11 @@ export type DatabaseOptions = { pageSize?: number };
 // empty-string sentinel (api.md §2.1). pageSize (absent/0 → DEFAULT_PAGE_SIZE) is locked into a file's
 // meta at creation and fixes an in-memory database's tree fan-out (the page-backed B-tree's fan-out
 // tracks the page size), so it is meaningful for both backings.
-export type CreateOptions = { path?: string; pageSize?: number };
+// noFsync turns off the per-commit fsync for this handle (the fsync=off host setting, api.md §2.1):
+// commits write identical bytes in the same order but skip the fdatasync barrier. DEV/TESTING ONLY —
+// durable across a process crash, not an OS crash / power loss. Ignored for an in-memory database (no
+// path) which never fsyncs. Byte/cost/result-neutral; default false.
+export type CreateOptions = { path?: string; pageSize?: number; noFsync?: boolean };
 
 // create makes a new file-backed database at path with opts (the page size is locked into the
 // file). The path must not already exist — 58P02 otherwise. An initial empty image is written
@@ -50,7 +57,8 @@ export function create(path: string, opts: DatabaseOptions = {}): Engine {
   db.pageSize = opts.pageSize ?? DEFAULT_PAGE_SIZE;
   db.committed.txid = 1n; // the initial empty image is committed as txid 1
   db.persistHook = persistImpl; // publish each later commit incrementally (transactions.md §4.1/§9)
-  writeFullImage(db); // lay down the from-scratch image; later commits are incremental
+  const noSync = opts.noSync ?? false;
+  writeFullImage(db, noSync); // lay down the from-scratch image; later commits are incremental
   // Adopt the just-written file as the open pager + buffer pool, so later commits write through the
   // seam without re-opening (spec/design/pager.md). Tables built in this session bind this pager at
   // creation (Snapshot.storePaging), so their committed leaves demote at each commit and fault back
@@ -62,7 +70,7 @@ export function create(path: string, opts: DatabaseOptions = {}): Engine {
     throw ioError(e);
   }
   db.paging = new SharedPaging(
-    Pager.fromStore(new FileBlockStore(fd)),
+    Pager.fromStore(new FileBlockStore(fd, noSync)),
     cacheLeaves(DEFAULT_CACHE_BYTES, db.pageSize),
   ); // valid header
   db.committed.storePaging = db.paging;
@@ -74,10 +82,10 @@ export function create(path: string, opts: DatabaseOptions = {}): Engine {
 // special case — spec/fileformat/format.md) durably via temp-file + rename, and records the on-disk
 // page high-water. Used by create to establish a fresh file with both meta slots seeded; every later
 // commit is incremental (persistImpl).
-function writeFullImage(db: Engine): void {
+function writeFullImage(db: Engine, noSync: boolean): void {
   if (db.path === null) return;
   const bytes = toImage(db.committed, db.pageSize, db.committed.txid);
-  writeAtomic(db.path, bytes);
+  writeAtomic(db.path, bytes, noSync);
   db.pageCount = Math.floor(bytes.length / db.pageSize);
 }
 
@@ -96,7 +104,16 @@ function writeFullImage(db: Engine): void {
 // (spec/design/spill.md §3, api.md §2.1): the ORDER BY external merge sort holds at most roughly this
 // many bytes of rows resident, then spills sorted runs. Like cacheBytes it is a handle setting that
 // never changes what a query observes (spill.md §6). Default DEFAULT_WORK_MEM (256 MiB).
-export type OpenOptions = { cacheBytes?: number; readOnly?: boolean; workMem?: number };
+// noFsync turns off the per-commit fsync (the fsync=off host setting, api.md §2.1): a commit still writes
+// the same bytes in the same order but the fdatasync barrier becomes a no-op — much faster. DEV/TESTING
+// ONLY: the data survives a process crash (the OS page cache still flushes) but NOT an OS crash / power
+// loss. Never changes what a query observes or the on-disk bytes; default false.
+export type OpenOptions = {
+  cacheBytes?: number;
+  readOnly?: boolean;
+  workMem?: number;
+  noFsync?: boolean;
+};
 
 // open opens an existing file-backed database at path with optional open settings (the memory budget,
 // opts.cacheBytes). Loads its committed state, adopting its page size / txid. The path must exist —
@@ -125,7 +142,7 @@ export function open(path: string, opts: OpenOptions = {}): Engine {
     // Read the file's page size first, then convert the byte budget to a leaf-page capacity; the loader
     // rejects an out-of-range page size as corrupt (cacheLeaves clamps the divisor so a malformed
     // page_size = 0 cannot divide by zero before that check runs).
-    const pager = Pager.fromStore(new FileBlockStore(fd));
+    const pager = Pager.fromStore(new FileBlockStore(fd, opts.noFsync ?? false));
     const db = loadEnginePaged(new SharedPaging(pager, cacheLeaves(cacheBytes, pager.pageSize)));
     db.path = path;
     db.persistHook = persistImpl; // autocommit each later write (transactions.md §4.1)
@@ -154,9 +171,9 @@ registerFileAttachOpener((path, readOnly) => open(path, { readOnly }));
 export function createDatabase(opts: CreateOptions = {}): Database {
   const pageSize = opts.pageSize || DEFAULT_PAGE_SIZE;
   if (opts.path !== undefined) {
-    return Database.fromEngine(create(opts.path, { pageSize }));
+    return Database.fromEngine(create(opts.path, { pageSize, noSync: opts.noFsync }));
   }
-  return buildInMemory(pageSize);
+  return buildInMemory(pageSize); // in-memory never fsyncs; noFsync is a no-op
 }
 
 // openDatabase opens an existing file-backed database at path with optional open settings and returns
@@ -202,14 +219,15 @@ export function close(db: Engine): void {
 
 // writeAtomic writes bytes to path crash-safely (spec/design/api.md §3): a sibling temp file,
 // fsync, atomic rename over the target, then a best-effort directory fsync so the rename is
-// durable.
-function writeAtomic(path: string, bytes: Uint8Array): void {
+// durable. Under noSync (fsync=off) the two fsyncs are skipped — the write + rename still happen,
+// but the bytes are only in the OS page cache (dev/testing; no durability on an OS crash).
+function writeAtomic(path: string, bytes: Uint8Array, noSync: boolean): void {
   const tmp = path + ".jedtmp";
   try {
     const fd = openSync(tmp, "w");
     try {
       writeFileSync(fd, bytes);
-      fsyncSync(fd);
+      if (!noSync) fsyncSync(fd);
     } finally {
       closeSync(fd);
     }
@@ -222,6 +240,7 @@ function writeAtomic(path: string, bytes: Uint8Array): void {
     }
     throw ioError(e);
   }
+  if (noSync) return; // fsync=off: skip the directory-fsync barrier too (dev/testing).
   // Directory fsync makes the rename itself durable. Best-effort: not every platform allows
   // opening a directory for fsync (Windows), and the rename is already atomic there.
   try {

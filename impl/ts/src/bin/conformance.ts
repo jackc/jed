@@ -538,7 +538,11 @@ function runFile(text: string, disk: boolean): void {
   // dbHandle is the reopenable file-backed Database — held so a per-record reopen can close it and
   // re-open the image; null in memory mode. onTemp tracks whether db/dbHandle still point at the temp
   // file (a `# fixture:` swap flips it off — but fixtures are `# skip: disk`).
-  let dbHandle: Database | null = tmpPath === null ? null : createDatabase({ path: tmpPath });
+  // fsync=off (api.md §2.1): the disk pass reopens a throwaway temp image before every record to exercise
+  // the on-disk faulted read path — durability across an OS crash is irrelevant, so skip the per-commit
+  // fdatasync (the ~20x cost) while keeping the identical on-disk bytes + read path.
+  let dbHandle: Database | null =
+    tmpPath === null ? null : createDatabase({ path: tmpPath, noFsync: true });
   let onTemp = disk;
   // The Database the current session was minted from, held so a `# attach:` directive (memory-mode only
   // — # skip: disk) can attach a fresh in-memory database into it. In disk mode it is the reopenable file
@@ -689,7 +693,7 @@ function runFile(text: string, disk: boolean): void {
       // resolve-and-rewrite path. No-op in memory mode or after a fixture swap (which is `# skip: disk`).
       if (disk && onTemp) {
         dbHandle!.close();
-        dbHandle = openDatabase(tmpPath!);
+        dbHandle = openDatabase(tmpPath!, { noFsync: true }); // fsync=off (throwaway image)
         attachDb = dbHandle;
         db = dbHandle.session();
       }

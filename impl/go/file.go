@@ -19,6 +19,10 @@ import (
 // PageSize is fixed into the file's meta at creation and cannot change thereafter.
 type databaseOptions struct {
 	PageSize uint32
+	// noSync is the fsync=off host setting (api.md §2.1): the commit writes identical bytes in the same
+	// order but skips the fdatasync barriers. Unlike PageSize this is NOT fixed into the file — it is a
+	// runtime handle setting. DEV/TESTING only (durable across a process crash, not an OS crash).
+	noSync bool
 }
 
 // defaultDatabaseOptions returns the default create settings (the default page size).
@@ -38,8 +42,8 @@ func create(path string, opts databaseOptions) (*engine, error) {
 	db := newEngine()
 	db.path = path
 	db.pageSize = opts.PageSize
-	db.committed.txid = 1                       // the initial empty image is committed as txid 1
-	if err := db.writeFullImage(); err != nil { // lay down the from-scratch image; later commits are incremental
+	db.committed.txid = 1                                  // the initial empty image is committed as txid 1
+	if err := db.writeFullImage(opts.noSync); err != nil { // lay down the from-scratch image; later commits are incremental
 		return nil, err
 	}
 	// Adopt the just-written file as the open pager + buffer pool, so later commits write through the
@@ -50,7 +54,7 @@ func create(path string, opts databaseOptions) (*engine, error) {
 	if err != nil {
 		return nil, ioError(err)
 	}
-	p, err := pagerFromStore(&fileBlockStore{f: f})
+	p, err := pagerFromStore(&fileBlockStore{f: f, noSync: opts.noSync})
 	if err != nil {
 		_ = f.Close()
 		return nil, err
@@ -81,6 +85,11 @@ type OpenOptions struct {
 	// this many bytes of rows resident, then spills sorted runs. Like CacheBytes it is a handle
 	// setting that never changes what a query observes (spill.md §6). 0 → DefaultWorkMem (256 MiB).
 	WorkMem int
+	// NoFsync turns off the per-commit fsync (the fsync=off host setting, api.md §2.1). A commit still
+	// writes the same bytes in the same order, but the fdatasync barrier becomes a no-op — much faster.
+	// DEV/TESTING ONLY: the data survives a process crash (the OS page cache still flushes) but NOT an
+	// OS crash / power loss. Never changes what a query observes or the on-disk bytes; default false.
+	NoFsync bool
 }
 
 // Open opens an existing file-backed database at path with default open settings — the buffer-pool
@@ -116,7 +125,7 @@ func openWithOptions(path string, opts OpenOptions) (*engine, error) {
 		}
 		return nil, ioError(err)
 	}
-	p, err := pagerFromStore(&fileBlockStore{f: f})
+	p, err := pagerFromStore(&fileBlockStore{f: f, noSync: opts.NoFsync})
 	if err != nil {
 		_ = f.Close()
 		return nil, err
@@ -141,12 +150,12 @@ func openWithOptions(path string, opts OpenOptions) (*engine, error) {
 // special case — spec/fileformat/format.md) durably via temp-file + rename, and records the on-disk
 // page high-water. Used by Create to establish a fresh file with both meta slots seeded; every later
 // commit is incremental (persist).
-func (db *engine) writeFullImage() error {
+func (db *engine) writeFullImage(noSync bool) error {
 	bytes, err := db.committed.ToImage(db.pageSize, db.committed.txid)
 	if err != nil {
 		return err
 	}
-	if err := writeAtomic(db.path, bytes); err != nil {
+	if err := writeAtomic(db.path, bytes, noSync); err != nil {
 		return err
 	}
 	db.pageCount = uint32(len(bytes) / int(db.pageSize))
@@ -273,8 +282,9 @@ func (db *engine) Close() error {
 
 // writeAtomic writes bytes to path crash-safely (spec/design/api.md §3): a sibling temp file,
 // fsync, atomic rename over the target, then a best-effort directory fsync so the rename is
-// durable.
-func writeAtomic(path string, bytes []byte) error {
+// durable. Under noSync (fsync=off) the two fsyncs are skipped — the write + rename still happen,
+// but the bytes are only in the OS page cache (dev/testing; no durability on an OS crash).
+func writeAtomic(path string, bytes []byte, noSync bool) error {
 	dir := filepath.Dir(path)
 	tmp := path + ".jedtmp"
 	f, err := os.Create(tmp)
@@ -286,10 +296,12 @@ func writeAtomic(path string, bytes []byte) error {
 		os.Remove(tmp)
 		return ioError(err)
 	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return ioError(err)
+	if !noSync {
+		if err := f.Sync(); err != nil {
+			f.Close()
+			os.Remove(tmp)
+			return ioError(err)
+		}
 	}
 	if err := f.Close(); err != nil {
 		os.Remove(tmp)
@@ -300,10 +312,13 @@ func writeAtomic(path string, bytes []byte) error {
 		return ioError(err)
 	}
 	// Directory fsync makes the rename itself durable. Best-effort: not every platform allows
-	// opening a directory for fsync (Windows), and the rename is already atomic there.
-	if d, derr := os.Open(dir); derr == nil {
-		_ = d.Sync()
-		_ = d.Close()
+	// opening a directory for fsync (Windows), and the rename is already atomic there. Skipped under
+	// noSync (fsync=off).
+	if !noSync {
+		if d, derr := os.Open(dir); derr == nil {
+			_ = d.Sync()
+			_ = d.Close()
+		}
 	}
 	return nil
 }

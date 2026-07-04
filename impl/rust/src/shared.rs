@@ -914,9 +914,12 @@ impl Database {
         match opts.path {
             Some(path) => Ok(Database::from_engine(Engine::create(
                 path,
-                DatabaseOptions { page_size },
+                DatabaseOptions {
+                    page_size,
+                    no_sync: opts.no_fsync,
+                },
             )?)),
-            None => Ok(Database::in_memory(page_size)),
+            None => Ok(Database::in_memory(page_size)), // in-memory never fsyncs; no_fsync is a no-op
         }
     }
 
@@ -2313,7 +2316,14 @@ mod temp_reclaim_internal_tests {
         // publish-path issue — the publish-decoupling follow-on, attached-databases.md §5).
         let path = std::env::temp_dir().join("jed_temp_zerofile_internal.jed");
         let _ = std::fs::remove_file(&path);
-        let mut db = Engine::create(&path, DatabaseOptions { page_size: 256 }).unwrap();
+        let mut db = Engine::create(
+            &path,
+            DatabaseOptions {
+                page_size: 256,
+                no_sync: false,
+            },
+        )
+        .unwrap();
         crate::execute(&mut db, "CREATE TABLE p (id i32 PRIMARY KEY)").unwrap();
         crate::execute(&mut db, "INSERT INTO p VALUES (1)").unwrap();
         let base_txid = db.txid();
@@ -2447,6 +2457,7 @@ mod residency_flip_tests {
         let mut db = Database::create(CreateOptions {
             path: Some(path.clone()),
             page_size: 256,
+            ..Default::default()
         })
         .unwrap();
         run(&mut db);

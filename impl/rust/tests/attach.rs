@@ -27,6 +27,7 @@ fn make_file_db(path: PathBuf, page_size: u32, stmts: &[&str]) -> PathBuf {
     let db = Database::create(CreateOptions {
         path: Some(path.clone()),
         page_size,
+        ..Default::default()
     })
     .expect("create file db");
     let mut s = db.session(SessionOptions::default());

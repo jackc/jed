@@ -115,6 +115,8 @@ mod lifetime_cost;
 mod lz4_vectors;
 #[path = "../tests/masked_scan.rs"]
 mod masked_scan;
+#[path = "../tests/nosync.rs"]
+mod nosync;
 #[path = "../tests/on_conflict.rs"]
 mod on_conflict;
 #[path = "../tests/overflow_cost.rs"]

@@ -37,6 +37,7 @@ fn split_shape_db(name: &str, shuffled: bool) -> Session {
     let mut db = Database::create(CreateOptions {
         path: Some(std::path::PathBuf::from(&path)),
         page_size: 256,
+        ..Default::default()
     })
     .unwrap()
     .session(SessionOptions::default());

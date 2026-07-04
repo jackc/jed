@@ -92,6 +92,7 @@ fn paged_inline_values_match_resident_across_query_shapes() {
         let mut db = Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(&path)),
             page_size: jed::DEFAULT_PAGE_SIZE,
+            ..Default::default()
         })
         .unwrap()
         .session(SessionOptions::default());
@@ -191,6 +192,7 @@ fn mutations_preserve_untouched_inline_values() {
         let mut db = Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(&path)),
             page_size: jed::DEFAULT_PAGE_SIZE,
+            ..Default::default()
         })
         .unwrap()
         .session(SessionOptions::default());
@@ -285,6 +287,7 @@ fn untouched_corrupt_inline_body_defers_its_error() {
         let mut db = Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(&path)),
             page_size: jed::DEFAULT_PAGE_SIZE,
+            ..Default::default()
         })
         .unwrap()
         .session(SessionOptions::default());

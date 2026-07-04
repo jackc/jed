@@ -215,6 +215,7 @@ fn scalar_gist_file_backed_round_trip() {
         let mut db = Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(&path)),
             page_size: 256,
+            ..Default::default()
         })
         .unwrap()
         .session(SessionOptions::default());
@@ -314,6 +315,7 @@ fn gist_file_backed_round_trip() {
         let mut db = Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(&path)),
             page_size: 256,
+            ..Default::default()
         })
         .unwrap()
         .session(SessionOptions::default());
@@ -595,6 +597,7 @@ fn exclude_file_backed_round_trip() {
         let mut db = Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(&path)),
             page_size: 256,
+            ..Default::default()
         })
         .unwrap()
         .session(SessionOptions::default());

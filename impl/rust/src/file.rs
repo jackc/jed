@@ -20,12 +20,17 @@ use crate::paging::{DEFAULT_CACHE_BYTES, SharedPaging, cache_leaves};
 #[derive(Clone, Copy, Debug)]
 pub struct DatabaseOptions {
     pub page_size: u32,
+    /// `fsync=off` (the host setting, api.md §2.1): a commit writes identical bytes in the same order
+    /// but skips the `fdatasync` barrier. Unlike `page_size` this is NOT fixed into the file — it is a
+    /// runtime handle setting. DEV/TESTING only (durable across a process crash, not an OS crash).
+    pub no_sync: bool,
 }
 
 impl Default for DatabaseOptions {
     fn default() -> Self {
         DatabaseOptions {
             page_size: DEFAULT_PAGE_SIZE,
+            no_sync: false,
         }
     }
 }
@@ -41,6 +46,11 @@ impl Default for DatabaseOptions {
 pub struct CreateOptions {
     pub path: Option<PathBuf>,
     pub page_size: u32,
+    /// Turn off the per-commit fsync for this handle (the `fsync=off` host setting, api.md §2.1):
+    /// commits write identical bytes in the same order but skip the `fdatasync` barrier. DEV/TESTING
+    /// ONLY — durable across a process crash, not an OS crash / power loss. Ignored for an in-memory
+    /// database (`path: None`) which never fsyncs. Byte/cost/result-neutral; default `false`.
+    pub no_fsync: bool,
 }
 
 /// Open-time settings for a file-backed database (spec/design/api.md §2.1). Unlike
@@ -66,6 +76,11 @@ pub struct OpenOptions {
     /// spill). Like `cache_bytes` it is a handle setting that never changes what a query observes
     /// (spill.md §6). Default [`DEFAULT_WORK_MEM`](crate::spill::DEFAULT_WORK_MEM) (256 MiB).
     pub work_mem: usize,
+    /// Turn off the per-commit fsync (the `fsync=off` host setting, api.md §2.1). A commit still writes
+    /// the same bytes in the same order, but the `fdatasync` barrier becomes a no-op — much faster.
+    /// DEV/TESTING ONLY: the data survives a process crash (the OS page cache still flushes) but NOT an
+    /// OS crash / power loss. Never changes what a query observes or the on-disk bytes; default `false`.
+    pub no_fsync: bool,
 }
 
 impl Default for OpenOptions {
@@ -74,6 +89,7 @@ impl Default for OpenOptions {
             cache_bytes: DEFAULT_CACHE_BYTES,
             read_only: false,
             work_mem: crate::spill::DEFAULT_WORK_MEM,
+            no_fsync: false,
         }
     }
 }
@@ -94,7 +110,7 @@ impl Engine {
         db.path = Some(path.to_path_buf());
         db.page_size = opts.page_size;
         db.committed.txid = 1; // the initial empty image is committed as txid 1
-        db.write_full_image()?; // lay down the from-scratch image; later commits are incremental
+        db.write_full_image(opts.no_sync)?; // lay down the from-scratch image; later commits are incremental
         // Adopt the just-written file as the open pager + buffer pool, so later commits write through
         // the seam without re-opening (spec/design/pager.md). Tables built in this session bind this
         // pager at creation (`Snapshot::store_paging`), so their committed leaves demote at each
@@ -105,7 +121,7 @@ impl Engine {
             .open(path)
             .map_err(io_error)?;
         let paging = SharedPaging::new(
-            Pager::from_store(Box::new(FileBlockStore::new(file)))?,
+            Pager::from_store(Box::new(FileBlockStore::new(file, opts.no_sync)))?,
             cache_leaves(DEFAULT_CACHE_BYTES, db.page_size),
         );
         db.committed.set_store_paging(paging.clone());
@@ -148,7 +164,7 @@ impl Engine {
             }
             Err(e) => return Err(io_error(e)),
         };
-        let pager = Pager::from_store(Box::new(FileBlockStore::new(file)))?;
+        let pager = Pager::from_store(Box::new(FileBlockStore::new(file, opts.no_fsync)))?;
         // Convert the byte budget to a leaf-page capacity by the file's page size; `open_paged`
         // rejects an out-of-range page size as corrupt (`cache_leaves` clamps the divisor so a
         // malformed `page_size = 0` cannot divide by zero before that check runs).
@@ -171,12 +187,12 @@ impl Engine {
     /// spec/fileformat/format.md) durably via temp-file + rename, and record the on-disk page
     /// high-water. Used by `create` to establish a fresh file with both meta slots seeded; every later
     /// commit is incremental (`persist`).
-    fn write_full_image(&mut self) -> Result<()> {
+    fn write_full_image(&mut self, no_sync: bool) -> Result<()> {
         let path = self.path.clone().expect("write_full_image requires a path");
         let bytes = self
             .committed
             .to_image(self.page_size, self.committed.txid)?;
-        write_atomic(&path, &bytes)?;
+        write_atomic(&path, &bytes, no_sync)?;
         self.page_count = (bytes.len() / self.page_size as usize) as u32;
         Ok(())
     }
@@ -306,24 +322,31 @@ impl Engine {
 }
 
 /// Write `bytes` to `path` crash-safely (spec/design/api.md §3): a sibling temp file, fsync,
-/// atomic rename over the target, then a best-effort directory fsync so the rename is durable.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+/// atomic rename over the target, then a best-effort directory fsync so the rename is durable. Under
+/// `no_sync` (fsync=off) the two fsyncs are skipped — the write + rename still happen, but the bytes
+/// are only in the OS page cache (dev/testing; no durability on an OS crash).
+fn write_atomic(path: &Path, bytes: &[u8], no_sync: bool) -> Result<()> {
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
     let tmp = tmp_path(path);
     {
         let mut f = File::create(&tmp).map_err(io_error)?;
         f.write_all(bytes).map_err(io_error)?;
-        f.sync_all().map_err(io_error)?;
+        if !no_sync {
+            f.sync_all().map_err(io_error)?;
+        }
     }
     if let Err(e) = fs::rename(&tmp, path) {
         let _ = fs::remove_file(&tmp);
         return Err(io_error(e));
     }
     // Directory fsync makes the rename itself durable. Best-effort: not every platform allows
-    // opening a directory for fsync (Windows), and the rename is already atomic there.
-    if let Some(dir) = dir {
-        if let Ok(d) = File::open(dir) {
-            let _ = d.sync_all();
+    // opening a directory for fsync (Windows), and the rename is already atomic there. Skipped under
+    // no_sync (fsync=off).
+    if !no_sync {
+        if let Some(dir) = dir {
+            if let Ok(d) = File::open(dir) {
+                let _ = d.sync_all();
+            }
         }
     }
     Ok(())
@@ -363,7 +386,14 @@ mod tests {
 
         // Build a multi-level tree at a small page size, so a few hundred rows span many pages.
         {
-            let mut db = Engine::create(&path, DatabaseOptions { page_size: 256 }).unwrap();
+            let mut db = Engine::create(
+                &path,
+                DatabaseOptions {
+                    page_size: 256,
+                    no_sync: false,
+                },
+            )
+            .unwrap();
             execute(&mut db, "CREATE TABLE t (k i32 PRIMARY KEY, v i32)").unwrap();
             execute(&mut db, "BEGIN").unwrap(); // one commit, not 600
             for k in 0..n {
@@ -459,7 +489,14 @@ mod tests {
         const CAP: usize = 4;
 
         {
-            let mut db = Engine::create(&path, DatabaseOptions { page_size: 256 }).unwrap();
+            let mut db = Engine::create(
+                &path,
+                DatabaseOptions {
+                    page_size: 256,
+                    no_sync: false,
+                },
+            )
+            .unwrap();
             execute(&mut db, "CREATE TABLE t (k i32 PRIMARY KEY, v i32)").unwrap();
             execute(&mut db, "BEGIN").unwrap();
             for k in 0..n {
@@ -516,7 +553,14 @@ mod tests {
         let n = 400i64;
 
         {
-            let mut db = Engine::create(&path, DatabaseOptions { page_size: 256 }).unwrap();
+            let mut db = Engine::create(
+                &path,
+                DatabaseOptions {
+                    page_size: 256,
+                    no_sync: false,
+                },
+            )
+            .unwrap();
             execute(&mut db, "CREATE TABLE t (k i32 PRIMARY KEY, v i32)").unwrap();
             execute(&mut db, "BEGIN").unwrap();
             for k in 0..n {
@@ -557,9 +601,15 @@ mod tests {
     fn create_rejects_oversized_page_size() {
         let path = tmp("jed_p64c_huge_page.jed");
         let _ = std::fs::remove_file(&path);
-        let err = Engine::create(&path, DatabaseOptions { page_size: 1 << 20 })
-            .err()
-            .expect("oversized page size must be rejected");
+        let err = Engine::create(
+            &path,
+            DatabaseOptions {
+                page_size: 1 << 20,
+                no_sync: false,
+            },
+        )
+        .err()
+        .expect("oversized page size must be rejected");
         assert_eq!(err.state, SqlState::FeatureNotSupported);
         assert!(
             err.message.contains("too large"),
@@ -595,9 +645,15 @@ mod tests {
         // create: 1000 is within [256, 65536] but not a power of two.
         let path = tmp("jed_pow2_create.jed");
         let _ = std::fs::remove_file(&path);
-        let err = Engine::create(&path, DatabaseOptions { page_size: 1000 })
-            .err()
-            .expect("a non-power-of-two page size must be rejected");
+        let err = Engine::create(
+            &path,
+            DatabaseOptions {
+                page_size: 1000,
+                no_sync: false,
+            },
+        )
+        .err()
+        .expect("a non-power-of-two page size must be rejected");
         assert_eq!(err.state, SqlState::FeatureNotSupported);
         assert!(
             err.message.contains("power of two"),
@@ -624,9 +680,15 @@ mod tests {
     fn rejects_page_size_below_floor() {
         let path = tmp("jed_pow2_floor.jed");
         let _ = std::fs::remove_file(&path);
-        let err = Engine::create(&path, DatabaseOptions { page_size: 128 })
-            .err()
-            .expect("a sub-256 page size must be rejected");
+        let err = Engine::create(
+            &path,
+            DatabaseOptions {
+                page_size: 128,
+                no_sync: false,
+            },
+        )
+        .err()
+        .expect("a sub-256 page size must be rejected");
         assert_eq!(err.state, SqlState::FeatureNotSupported);
         assert!(err.message.contains("too small"), "{}", err.message);
         assert!(!path.exists(), "no file written on a rejected page size");
@@ -659,7 +721,14 @@ mod tests {
         };
 
         {
-            let mut db = Engine::create(&path, DatabaseOptions { page_size: 256 }).unwrap();
+            let mut db = Engine::create(
+                &path,
+                DatabaseOptions {
+                    page_size: 256,
+                    no_sync: false,
+                },
+            )
+            .unwrap();
             execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, body text)").unwrap();
             execute(&mut db, &format!("INSERT INTO t VALUES (1, '{big}')")).unwrap();
             execute(&mut db, "INSERT INTO t VALUES (2, 'small')").unwrap();

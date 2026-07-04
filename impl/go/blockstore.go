@@ -48,6 +48,11 @@ type blockStore interface {
 // no cgo — CLAUDE.md §2), and a durable-grow zero-write + full Sync.
 type fileBlockStore struct {
 	f *os.File
+	// noSync makes the fdatasync barriers (sync, and the durable-grow full Sync) no-ops — the fsync=off
+	// host setting (api.md §2.1). The commit writes the same bytes in the same order; only the flush to
+	// the platter is skipped. DEV/TESTING only: durable across a process crash (the OS page cache still
+	// flushes) but NOT across an OS crash / power loss. Default false (fsync on).
+	noSync bool
 }
 
 func (s *fileBlockStore) readAt(off int64, length int) ([]byte, error) {
@@ -66,6 +71,9 @@ func (s *fileBlockStore) writeAt(off int64, p []byte) error {
 }
 
 func (s *fileBlockStore) sync() error {
+	if s.noSync {
+		return nil // fsync=off (api.md §2.1): skip the durability barrier — dev/testing only.
+	}
 	// datasync (fdatasync), not a full Sync: an overwrite into the preallocated region flushes only
 	// data, never a file-size/inode-timestamp metadata journal (spec/design/pager.md §7). The
 	// platform split lives in blockstore_datasync_*.go (Linux syscall.Fdatasync, pure Go, no cgo;
@@ -98,8 +106,10 @@ func (s *fileBlockStore) setSize(n int64) error {
 		if _, err := s.f.WriteAt(zeros, cur); err != nil {
 			return ioError(err)
 		}
-		if err := s.f.Sync(); err != nil {
-			return ioError(err)
+		if !s.noSync { // fsync=off skips the durable-grow barrier too (dev/testing — no OS-crash durability).
+			if err := s.f.Sync(); err != nil {
+				return ioError(err)
+			}
 		}
 	} else if n < cur {
 		if err := s.f.Truncate(n); err != nil { // truncate; no barrier needed

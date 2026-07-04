@@ -113,6 +113,7 @@ fn chains_are_read_only_when_touched() {
         let mut db = Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(&path)),
             page_size: PAGE_SIZE,
+            ..Default::default()
         })
         .unwrap()
         .session(SessionOptions::default());
@@ -160,6 +161,7 @@ fn lazy_values_round_trip_exactly() {
         let mut db = Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(&path)),
             page_size: PAGE_SIZE,
+            ..Default::default()
         })
         .unwrap()
         .session(SessionOptions::default());
@@ -197,6 +199,7 @@ fn update_of_other_columns_preserves_spilled_values() {
         let mut db = Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(&path)),
             page_size: PAGE_SIZE,
+            ..Default::default()
         })
         .unwrap()
         .session(SessionOptions::default());
@@ -252,6 +255,7 @@ fn paged_and_resident_costs_match() {
         let mut db = Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(&path)),
             page_size: PAGE_SIZE,
+            ..Default::default()
         })
         .unwrap()
         .session(SessionOptions::default());

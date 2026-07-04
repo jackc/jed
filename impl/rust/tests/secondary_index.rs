@@ -240,6 +240,7 @@ fn file_backed_paged_reopen_uses_the_index() {
     let mut db = Database::create(CreateOptions {
         path: Some(std::path::PathBuf::from(&path)),
         page_size: 256,
+        ..Default::default()
     })
     .unwrap()
     .session(SessionOptions::default());

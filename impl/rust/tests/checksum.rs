@@ -55,6 +55,7 @@ fn seed(path: &std::path::Path) {
     let mut db = Database::create(CreateOptions {
         path: Some(std::path::PathBuf::from(path)),
         page_size: PAGE_SIZE,
+        ..Default::default()
     })
     .unwrap()
     .session(SessionOptions::default());

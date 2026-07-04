@@ -335,6 +335,7 @@ fn reference_only_file_round_trip() {
     let mut db = Database::create(CreateOptions {
         path: Some(std::path::PathBuf::from(&path)),
         page_size: 256,
+        ..Default::default()
     })
     .unwrap()
     .session(SessionOptions::default());

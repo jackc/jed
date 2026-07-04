@@ -147,6 +147,7 @@ fn open_database(a: &args::Args) -> Result<(jed::Session, String), u8> {
         Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(path)),
             page_size: a.page_size.unwrap_or(jed::DEFAULT_PAGE_SIZE),
+            ..Default::default()
         })
     } else if a.readonly {
         Database::open_with_options(

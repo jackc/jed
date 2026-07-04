@@ -169,6 +169,7 @@ fn file_backed_readers_run_concurrently_with_a_committing_writer() {
         let mut db = Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(&path)),
             page_size: 256,
+            ..Default::default()
         })
         .unwrap();
         db.query_outcome("CREATE TABLE t (id i64 PRIMARY KEY)", &[])

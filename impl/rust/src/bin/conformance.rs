@@ -569,8 +569,12 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
     // committed read faults from disk; in MEMORY mode it is a fresh in-memory Database
     // (spec/design/conformance.md §3).
     let mut db = match &tmp_path {
+        // fsync=off (api.md §2.1): the disk pass reopens a throwaway temp image before every record to
+        // exercise the on-disk faulted read path — durability across an OS crash is irrelevant, so skip
+        // the per-commit fdatasync (the ~20x cost) while keeping the identical on-disk bytes + read path.
         Some(p) => Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(p)),
+            no_fsync: true,
             ..Default::default()
         })
         .map_err(|e| format!("disk mode: create {}: {}", p.display(), e.message))?,
@@ -704,8 +708,14 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
         // just-committed image.
         if disk && on_temp {
             let p = tmp_path.as_ref().expect("disk mode has a temp path");
-            db = Database::open(p)
-                .map_err(|e| format!("disk reopen: open {}: {}", p.display(), e.message))?;
+            db = Database::open_with_options(
+                p,
+                jed::OpenOptions {
+                    no_fsync: true, // fsync=off (throwaway image)
+                    ..Default::default()
+                },
+            )
+            .map_err(|e| format!("disk reopen: open {}: {}", p.display(), e.message))?;
             sess = db.session(jed::SessionOptions::default());
         }
         // This record consumes any pending assertions (so they never leak forward).

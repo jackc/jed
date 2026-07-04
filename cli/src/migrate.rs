@@ -247,6 +247,7 @@ fn open_or_create(path: &Path) -> Result<Database, u8> {
         Database::create(CreateOptions {
             path: Some(path.to_path_buf()),
             page_size: jed::DEFAULT_PAGE_SIZE,
+            ..Default::default()
         })
     };
     result.map_err(|e| {

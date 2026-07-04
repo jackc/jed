@@ -19,9 +19,15 @@ import type { BlockStore } from "./blockstore.ts";
 
 export class FileBlockStore implements BlockStore {
   private fd: number;
+  // fsync=off (the host setting, api.md §2.1): make sync() and the durable-grow fsync no-ops. The
+  // commit writes the same bytes in the same order; only the flush to the platter is skipped.
+  // DEV/TESTING only — durable across a process crash (the OS page cache still flushes) but NOT across
+  // an OS crash / power loss. Default false (fsync on).
+  private noSync: boolean;
 
-  constructor(fd: number) {
+  constructor(fd: number, noSync = false) {
     this.fd = fd;
+    this.noSync = noSync;
   }
 
   readAt(offset: number, len: number): Uint8Array {
@@ -35,6 +41,7 @@ export class FileBlockStore implements BlockStore {
   }
 
   sync(): void {
+    if (this.noSync) return; // fsync=off (api.md §2.1): skip the durability barrier — dev/testing only.
     // fdatasync, not a full fsync: an overwrite into the preallocated region flushes only data, never
     // a file-size/inode-timestamp metadata journal (spec/design/pager.md §7).
     fdatasyncSync(this.fd);
@@ -52,7 +59,7 @@ export class FileBlockStore implements BlockStore {
       // flush that metadata, defeating the durable-commit win — spec/design/pager.md §7).
       const zeros = new Uint8Array(bytes - cur);
       writeSync(this.fd, zeros, 0, zeros.length, cur);
-      fsyncSync(this.fd);
+      if (!this.noSync) fsyncSync(this.fd); // fsync=off skips the durable-grow barrier too (dev/testing).
     } else if (bytes < cur) {
       ftruncateSync(this.fd, bytes); // truncate; no barrier needed
     }

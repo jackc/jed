@@ -50,14 +50,19 @@ pub(crate) trait BlockStore: Send {
 /// closed when this value drops (RAII), so the pager needs no explicit `close`.
 pub(crate) struct FileBlockStore {
     file: File,
+    /// `fsync=off` (the host setting, api.md §2.1): make [`sync`](FileBlockStore::sync) and the
+    /// durable-grow `sync_all` no-ops. The commit writes the same bytes in the same order; only the
+    /// flush to the platter is skipped. DEV/TESTING only — durable across a process crash (the OS page
+    /// cache still flushes) but NOT across an OS crash / power loss. Default `false` (fsync on).
+    no_sync: bool,
 }
 
 impl FileBlockStore {
     /// Adopt an already-open (read, or read+write) file as the byte backing. The host layer
     /// (`file.rs`) opens the file — mapping a missing path to `58P01`, an existing one on `create` to
-    /// `58P02` — and hands the open handle here.
-    pub(crate) fn new(file: File) -> FileBlockStore {
-        FileBlockStore { file }
+    /// `58P02` — and hands the open handle here. `no_sync` selects `fsync=off` (dev/testing).
+    pub(crate) fn new(file: File, no_sync: bool) -> FileBlockStore {
+        FileBlockStore { file, no_sync }
     }
 }
 
@@ -75,6 +80,9 @@ impl BlockStore for FileBlockStore {
     }
 
     fn sync(&mut self) -> Result<()> {
+        if self.no_sync {
+            return Ok(()); // fsync=off (api.md §2.1): skip the durability barrier — dev/testing only.
+        }
         // `sync_data` (fdatasync), not `sync_all`: an overwrite into the preallocated region flushes
         // only data, never a file-size/inode-timestamp metadata journal (spec/design/pager.md §7).
         self.file.sync_data().map_err(io_error)
@@ -93,7 +101,10 @@ impl BlockStore for FileBlockStore {
             let zeros = vec![0u8; (bytes - cur) as usize];
             self.file.seek(SeekFrom::Start(cur)).map_err(io_error)?;
             self.file.write_all(&zeros).map_err(io_error)?;
-            self.file.sync_all().map_err(io_error)?;
+            if !self.no_sync {
+                // fsync=off skips the durable-grow barrier too (dev/testing — no OS-crash durability).
+                self.file.sync_all().map_err(io_error)?;
+            }
         } else if bytes < cur {
             self.file.set_len(bytes).map_err(io_error)?; // truncate; no barrier needed
         }
