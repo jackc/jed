@@ -16,6 +16,7 @@ import {
   type Engine,
   EngineError,
   execute,
+  queryOutcome,
   type Session,
   type Value,
 } from "../src/tooling.ts";
@@ -29,7 +30,7 @@ function tempStorageOf(sess: Session): { pageCount: number } | null {
 }
 
 function rowsOf(sess: Session, sql: string): Value[][] {
-  const o = sess.execute(sql);
+  const o = queryOutcome(sess, sql);
   if (o.kind !== "query") throw new Error("expected a query");
   return o.rows;
 }

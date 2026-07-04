@@ -7,8 +7,8 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { EngineError, Session } from "../src/tooling.ts";
-import { type Handle, dbWith, errCode, query } from "./util.ts";
+import { EngineError, type Session } from "../src/tooling.ts";
+import { type Handle, dbWith, errCode, query, queryOutcome } from "./util.ts";
 import { memDb } from "./mem_db.ts";
 
 // A 3-row, single-node table t(id, n) = {(1,10),(2,20),(3,30)}.
@@ -20,7 +20,7 @@ function t3(): Session {
 }
 
 function cost(db: Handle, sql: string): bigint {
-  return db.execute(sql).cost;
+  return queryOutcome(db, sql).cost;
 }
 
 test("MATERIALIZED / NOT MATERIALIZED hints force the mode", () => {
@@ -76,7 +76,8 @@ test("WITH RECURSIVE under the ceiling succeeds", () => {
 test("WITH RECURSIVE materialization hint is inert", () => {
   const db = memDb().session();
   for (const hint of ["", "MATERIALIZED ", "NOT MATERIALIZED "]) {
-    const r = db.execute(
+    const r = queryOutcome(
+      db,
       `WITH RECURSIVE c(n) AS ${hint}(SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 3) SELECT n FROM c ORDER BY n`,
     );
     assert.equal(r.kind, "query", `hint ${JSON.stringify(hint)} kind`);

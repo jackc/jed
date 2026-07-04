@@ -7,12 +7,10 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database } from "../src/tooling.ts";
-import type { Engine } from "../src/tooling.ts";
-import { type Handle, dbWith, errCode } from "./util.ts";
+import { type Handle, dbWith, errCode, queryOutcome } from "./util.ts";
 
 function affected(db: Handle, sql: string): number | null {
-  const out = db.execute(sql);
+  const out = queryOutcome(db, sql);
   assert.equal(out.kind, "statement", `expected a statement outcome from ${sql}`);
   return out.kind === "statement" ? out.rowsAffected : null;
 }

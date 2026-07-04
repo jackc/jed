@@ -1,7 +1,21 @@
 // Shared test helpers (not a `*.test.ts` file, so the runner does not execute it).
 
-import { EngineError, type Outcome, render, Session, type Value } from "../src/tooling.ts";
+import {
+  drainOutcome,
+  EngineError,
+  type Outcome,
+  queryOutcome,
+  render,
+  type Session,
+} from "../src/tooling.ts";
 import { memDb } from "./mem_db.ts";
+
+// Re-export the white-box query-seam drain helpers so a converted test can import them alongside the
+// other shared helpers here (they live in tooling.ts, the internal surface — the public seam is
+// `query -> Rows`; these drain it into an Outcome for assertion, exactly as the removed `execute ->
+// Outcome` API returned; CLAUDE.md §10).
+export { drainOutcome, queryOutcome };
+export type { Outcome };
 
 // Handle is the structural surface converted test helpers drive on a `db` parameter — satisfied by
 // both the public Session (a converted feature test's handle) and Database (a from-image / file-backed
@@ -11,6 +25,7 @@ import { memDb } from "./mem_db.ts";
 export type Handle = Pick<
   Session,
   | "execute"
+  | "query"
   | "executeScript"
   | "tableNames"
   | "table"
@@ -44,9 +59,10 @@ export function dbWith(stmts: string[], pageSize?: number): Session {
   return db;
 }
 
-// query runs a SELECT and returns its rows rendered as strings (NULL → "NULL").
+// query runs a SELECT and returns its rows rendered as strings (NULL → "NULL"). It drains the real
+// total-`query` seam (queryOutcome), not a parallel exec path.
 export function query(db: Handle, sql: string): string[][] {
-  const o = db.execute(sql);
+  const o = queryOutcome(db, sql);
   if (o.kind !== "query") throw new Error(`expected a query result for ${sql}`);
   return o.rows.map((r) => r.map(render));
 }

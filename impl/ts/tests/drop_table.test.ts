@@ -7,15 +7,14 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database } from "../src/tooling.ts";
-import { dbWith, errCode, query } from "./util.ts";
+import { dbWith, errCode, query, queryOutcome } from "./util.ts";
 
 test("drop removes the table and its rows", () => {
   const db = dbWith([
     "CREATE TABLE t (id i32 PRIMARY KEY, v i16)",
     "INSERT INTO t VALUES (1, 10), (2, 20)",
   ]);
-  const out = db.execute("DROP TABLE t");
+  const out = queryOutcome(db, "DROP TABLE t");
   assert.deepStrictEqual(out, { kind: "statement", cost: 0n, rowsAffected: null });
   assert.equal(db.table("t"), undefined);
   assert.deepStrictEqual(db.rowsInKeyOrder("t"), []);

@@ -37,7 +37,7 @@ import {
   textValue,
   type Value,
 } from "../src/value.ts";
-import { type Handle, errCode } from "./util.ts";
+import { type Handle, errCode, queryOutcome } from "./util.ts";
 import { memDb } from "./mem_db.ts";
 
 const PAGE_LEAF = 2; // page_type for a B-tree leaf node
@@ -68,13 +68,13 @@ function seed(db: Handle): void {
 // rowsSorted runs sql and returns its rows rendered to strings and sorted — an order-insensitive
 // multiset compare (a query without ORDER BY has unspecified order; sorting both sides is sound).
 function rowsSorted(db: Handle, sql: string): string[] {
-  const o = db.execute(sql);
+  const o = queryOutcome(db, sql);
   if (o.kind !== "query") throw new Error(`expected a query: ${sql}`);
   return o.rows.map((r) => r.map((v) => render(v)).join("\x1f")).sort();
 }
 
 function costOf(db: Handle, sql: string): bigint {
-  return db.execute(sql).cost;
+  return queryOutcome(db, sql).cost;
 }
 
 test("paged inline values match resident across query shapes", () => {

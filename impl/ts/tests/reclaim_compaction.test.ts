@@ -8,7 +8,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { Database, Session, Value } from "../src/tooling.ts";
+import { type Database, queryOutcome, type Session, type Value } from "../src/tooling.ts";
 import { memDb } from "./mem_db.ts";
 
 // setReclaim toggles within-session compaction on a Database's (single) main storage domain — a
@@ -22,7 +22,7 @@ function setReclaim(db: Database, on: boolean): void {
 }
 
 function rowsOf(sess: Session, sql: string): Value[][] {
-  const o = sess.execute(sql);
+  const o = queryOutcome(sess, sql);
   if (o.kind !== "query") throw new Error("expected a query");
   return o.rows;
 }

@@ -22,6 +22,7 @@ import {
   type Privilege,
   PrivilegeSet,
   privilegeFromName,
+  queryOutcome,
   render,
   seededRandomSource,
   openDatabase,
@@ -768,7 +769,7 @@ function runFile(text: string, disk: boolean): void {
         let err: unknown = null;
         let outcome: Outcome | null = null;
         try {
-          outcome = db.execute(sql);
+          outcome = queryOutcome(db, sql);
         } catch (e) {
           err = e;
         }
@@ -801,7 +802,7 @@ function runFile(text: string, disk: boolean): void {
         }
         let outcome: Outcome;
         try {
-          outcome = db.execute(sql);
+          outcome = queryOutcome(db, sql);
         } catch (e) {
           throw new Error(`query failed with ${msgOf(e)}\n  SQL: ${sql}`);
         }
@@ -887,10 +888,12 @@ function isConcurrencyFormat(text: string): boolean {
 // the end step dispatches commit vs. close — §2.4 folded ReadHandle/WriteHandle into one type).
 type CSession = { h: Session; isWrite: boolean };
 
-// sessionExecute runs sql against the session's handle, returning the outcome. A read session's
+// sessionExecute runs sql against the session's handle through the total `query` seam, materializing
+// the cursor into an outcome (so the schedule runner streams reads exactly like the sequential runner,
+// exercising the read-lane gates + block-poisoning — concurrency-testing.md §4). A read session's
 // writes are rejected with 25006 by the session itself (without poisoning it).
 function sessionExecute(s: CSession, sql: string): Outcome {
-  return s.h.execute(sql);
+  return queryOutcome(s.h, sql);
 }
 
 // concurrencyDirectives are the line-leading keywords that bound a record body. Unlike the

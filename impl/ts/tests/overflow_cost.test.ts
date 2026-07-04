@@ -11,8 +11,8 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Session } from "../src/tooling.ts";
-import { type Handle, fillerBytesHex, fillerText } from "./util.ts";
+import type { Session } from "../src/tooling.ts";
+import { type Handle, fillerBytesHex, fillerText, queryOutcome } from "./util.ts";
 import { memDb } from "./mem_db.ts";
 
 // page_size 256 ⇒ cap = 240, RECORD_MAX = 114. A 600-byte text payload spills into
@@ -27,7 +27,7 @@ function smallPageDb(): Session {
 }
 
 function cost(db: Handle, sql: string): bigint {
-  return db.execute(sql).cost;
+  return queryOutcome(db, sql).cost;
 }
 
 // Two tables of identical shape: `spill` row 1 carries a 600-char text (3-page chain), `control`

@@ -8,11 +8,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Database, EngineError } from "../src/tooling.ts";
-import type { Handle } from "./util.ts";
+import { type Handle, queryOutcome } from "./util.ts";
 import { memDb } from "./mem_db.ts";
 
 function run(db: Handle, sql: string) {
-  return db.execute(sql);
+  return queryOutcome(db, sql);
 }
 
 function cost(db: Handle, sql: string): bigint {

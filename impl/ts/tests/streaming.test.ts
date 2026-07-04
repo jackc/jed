@@ -15,7 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { createDatabase, type Database, EngineError, type Session } from "../src/lib.ts";
-import { Engine, execute, intValue, prepare, query } from "../src/tooling.ts";
+import { Engine, execute, intValue, prepare, query, queryOutcome } from "../src/tooling.ts";
 import type { Value } from "../src/value.ts";
 import { memDb } from "./mem_db.ts";
 
@@ -31,7 +31,7 @@ function seededKV(n: number): Database {
 
 // eagerResult: the materialized (execute) rows + total cost — the oracle the streaming cursor matches.
 function eagerResult(s: Session, sql: string): { rows: Value[][]; cost: bigint } {
-  const out = s.execute(sql);
+  const out = queryOutcome(s, sql);
   assert.equal(out.kind, "query", `not a query: ${sql}`);
   if (out.kind !== "query") throw new Error("unreachable");
   return { rows: out.rows, cost: out.cost };

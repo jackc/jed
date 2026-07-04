@@ -21,7 +21,7 @@
 // a pure function of its entry set; pages are assigned in a canonical post-order walk. This is the
 // lockstep port of impl/rust/src/gist.rs (CLAUDE.md §2) — byte-identical by construction.
 
-import { type ColType } from "./catalog.ts";
+import type { ColType } from "./catalog.ts";
 import { engineError } from "./errors.ts";
 import { encodeRangeBody, readRangeBody } from "./format.ts";
 import { rangeContains, rangeOverlaps, rangeTotalCmp, rangeUnion } from "./range.ts";

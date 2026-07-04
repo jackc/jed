@@ -13,12 +13,12 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { type Database, createDatabase, openDatabase } from "../src/tooling.ts";
 import { render } from "../src/value.ts";
-import type { Handle } from "./util.ts";
+import { type Handle, queryOutcome } from "./util.ts";
 
 const PAGE_SIZE = 256;
 
 function rowsOf(db: Handle, sql: string) {
-  const o = db.execute(sql);
+  const o = queryOutcome(db, sql);
   if (o.kind !== "query") throw new Error("expected a query");
   return o.rows;
 }

@@ -9,7 +9,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { EngineError, intValue, type Outcome } from "../src/tooling.ts";
+import { EngineError, intValue, type Outcome, queryOutcome } from "../src/tooling.ts";
 import { memDb } from "./mem_db.ts";
 
 function code(fn: () => unknown): string {
@@ -73,13 +73,13 @@ test("additional session shares storage with independent settings", () => {
   assert.strictEqual(a.maxCost, 0n);
 
   // It sees a's committed data (committed storage is shared via the core).
-  assert.deepStrictEqual(queryRows(s.execute("SELECT id, v FROM t")), [
+  assert.deepStrictEqual(queryRows(queryOutcome(s, "SELECT id, v FROM t")), [
     [intValue(1n), intValue(10n)],
   ]);
 
   // A write through the second session (autocommit, lazy gate) is visible to a's next read.
   s.execute("INSERT INTO t VALUES (2, 20)");
-  assert.deepStrictEqual(queryRows(a.execute("SELECT id FROM t ORDER BY id")), [
+  assert.deepStrictEqual(queryRows(queryOutcome(a, "SELECT id FROM t ORDER BY id")), [
     [intValue(1n)],
     [intValue(2n)],
   ]);
@@ -121,7 +121,7 @@ test("additional session update closure commits to shared storage", () => {
     tx.execute("INSERT INTO t VALUES (2)");
   });
 
-  assert.deepStrictEqual(queryRows(a.execute("SELECT count(*) FROM t")), [[intValue(2n)]]);
+  assert.deepStrictEqual(queryRows(queryOutcome(a, "SELECT count(*) FROM t")), [[intValue(2n)]]);
   assert.strictEqual(a.status(), "Idle");
 });
 
@@ -137,10 +137,10 @@ test("session update rolls back on a thrown error and releases the gate", () => 
   );
   // The block rolled back (the row is gone), the session is back to Idle, and the writer gate is free
   // (a fresh write succeeds).
-  assert.deepStrictEqual(queryRows(s.execute("SELECT count(*) FROM t")), [[intValue(0n)]]);
+  assert.deepStrictEqual(queryRows(queryOutcome(s, "SELECT count(*) FROM t")), [[intValue(0n)]]);
   assert.strictEqual(s.status(), "Idle");
   s.update((tx) => tx.execute("INSERT INTO t VALUES (9)"));
-  assert.deepStrictEqual(queryRows(s.execute("SELECT count(*) FROM t")), [[intValue(1n)]]);
+  assert.deepStrictEqual(queryRows(queryOutcome(s, "SELECT count(*) FROM t")), [[intValue(1n)]]);
 });
 
 test("Database view and update mint a fresh session per call", () => {

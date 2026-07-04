@@ -10,23 +10,23 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { intValue } from "../src/tooling.ts";
-import { type Handle, errCode, query } from "./util.ts";
+import { type Handle, errCode, query, queryOutcome } from "./util.ts";
 import { memDb } from "./mem_db.ts";
 
 function names(db: Handle, sql: string): string[] {
-  const o = db.execute(sql);
+  const o = queryOutcome(db, sql);
   if (o.kind !== "query") throw new Error(`expected a query result for ${sql}`);
   return o.columnNames;
 }
 
 function types(db: Handle, sql: string): string[] {
-  const o = db.execute(sql);
+  const o = queryOutcome(db, sql);
   if (o.kind !== "query") throw new Error(`expected a query result for ${sql}`);
   return o.columnTypes;
 }
 
 function cost(db: Handle, sql: string): bigint {
-  return db.execute(sql).cost;
+  return queryOutcome(db, sql).cost;
 }
 
 test("VALUES body — basic shape and default column name", () => {
@@ -71,7 +71,7 @@ test("VALUES body — per-column type unification across rows", () => {
 
 test("VALUES body — a $N is typed by its sibling rows", () => {
   const db = memDb().session();
-  const o = db.execute("SELECT column1 FROM (VALUES (1), ($1)) AS v ORDER BY column1", [
+  const o = queryOutcome(db, "SELECT column1 FROM (VALUES (1), ($1)) AS v ORDER BY column1", [
     intValue(7n),
   ]);
   if (o.kind !== "query") throw new Error("expected a query");

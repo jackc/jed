@@ -11,13 +11,13 @@ import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { createDatabase, openDatabase } from "../src/tooling.ts";
-import type { Handle } from "./util.ts";
+import { createDatabase } from "../src/tooling.ts";
+import { type Handle, queryOutcome } from "./util.ts";
 import type { Value } from "../src/lib.ts";
 import { memDb } from "./mem_db.ts";
 
 function runQuery(db: Handle, sql: string): { rows: Value[][]; cost: bigint } {
-  const out = db.execute(sql);
+  const out = queryOutcome(db, sql);
   if (out.kind !== "query") throw new Error(`not a query: ${sql}`);
   return { rows: out.rows, cost: out.cost };
 }

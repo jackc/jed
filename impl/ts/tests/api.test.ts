@@ -166,9 +166,20 @@ test("one-shot query iterates rows", () => {
   assert.deepStrictEqual(ids, [1n, 2n, 3n]);
 });
 
-test("query on a non-query statement throws", () => {
+test("query on a non-query statement is total (no rows, statement still runs)", () => {
+  // `query` is the one total seam (spec/design/api.md §11): a non-query statement is observably a Rows
+  // with no output columns — NOT a "use execute" throw (the removed effect-then-error surprise). The
+  // DDL still takes effect, and a write exposes its command tag via rowsAffected.
   const db = new Engine();
-  assert.throws(() => query(db, "CREATE TABLE t (id i32 PRIMARY KEY)"));
+  const ddl = query(db, "CREATE TABLE t (id i32 PRIMARY KEY)");
+  assert.equal(ddl.columnNames.length, 0);
+  assert.deepStrictEqual([...ddl], []);
+  assert.equal(ddl.rowsAffected, null); // DDL carries no row count
+  ddl.close();
+  const ins = query(db, "INSERT INTO t VALUES (1), (2)");
+  assert.deepStrictEqual([...ins], []);
+  assert.equal(ins.rowsAffected, 2);
+  ins.close();
 });
 
 test("errors surface with SQLSTATE", () => {

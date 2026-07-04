@@ -14,7 +14,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { createDatabase, openDatabase } from "../src/tooling.ts";
 import { render } from "../src/value.ts";
-import { type Handle, errCode, fillerText } from "./util.ts";
+import { type Handle, errCode, fillerText, queryOutcome } from "./util.ts";
 import { memDb } from "./mem_db.ts";
 
 const PAGE_SIZE = 256;
@@ -74,13 +74,13 @@ function corruptOverflowPayloads(path: string): void {
 }
 
 function rowsOf(db: Handle, sql: string) {
-  const o = db.execute(sql);
+  const o = queryOutcome(db, sql);
   if (o.kind !== "query") throw new Error("expected a query");
   return o.rows;
 }
 
 function costOf(db: Handle, sql: string): bigint {
-  return db.execute(sql).cost;
+  return queryOutcome(db, sql).cost;
 }
 
 test("lazy: chains are read only when touched", () => {

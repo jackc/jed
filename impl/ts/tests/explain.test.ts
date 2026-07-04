@@ -11,6 +11,7 @@ import {
   intValue,
   type Outcome,
   PrivilegeSet,
+  queryOutcome,
   render,
   type Session,
 } from "../src/tooling.ts";
@@ -68,9 +69,9 @@ test("plain EXPLAIN does not execute; EXPLAIN ANALYZE does", () => {
   db.execute("INSERT INTO t VALUES (1, 10)");
   db.execute("INSERT INTO t VALUES (2, 20)");
   db.execute("EXPLAIN DELETE FROM t"); // plan-only — deletes nothing
-  assert.deepStrictEqual(queryRows(db.execute("SELECT count(*) FROM t")), [[intValue(2n)]]);
+  assert.deepStrictEqual(queryRows(queryOutcome(db, "SELECT count(*) FROM t")), [[intValue(2n)]]);
   db.execute("EXPLAIN ANALYZE INSERT INTO t VALUES (3, 30)"); // executes
-  assert.deepStrictEqual(queryRows(db.execute("SELECT count(*) FROM t")), [[intValue(3n)]]);
+  assert.deepStrictEqual(queryRows(queryOutcome(db, "SELECT count(*) FROM t")), [[intValue(3n)]]);
 });
 
 // The EXPLAIN statement's OWN cost is one rowProduced per emitted plan row — independent of the
@@ -80,7 +81,7 @@ test("EXPLAIN owns its render cost (one rowProduced per plan row)", () => {
   db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
   db.execute("INSERT INTO t VALUES (1, 10)");
   db.execute("INSERT INTO t VALUES (2, 20)");
-  const out = db.execute("EXPLAIN ANALYZE SELECT * FROM t");
+  const out = queryOutcome(db, "EXPLAIN ANALYZE SELECT * FROM t");
   if (out.kind !== "query") throw new Error("expected a query result");
   assert.equal(out.cost, BigInt(out.rows.length));
   // The Analyze root (row 0) reports the inner cost, which exceeds the render cost here.

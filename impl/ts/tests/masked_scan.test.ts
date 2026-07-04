@@ -28,7 +28,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { type Database, createDatabase, openDatabase } from "../src/tooling.ts";
 import { render } from "../src/value.ts";
-import type { Handle } from "./util.ts";
+import { type Handle, queryOutcome } from "./util.ts";
 import { memDb } from "./mem_db.ts";
 
 // A wide all-fixed-width table (i16/i32/i64, several nullable) plus a secondary index and a join
@@ -55,13 +55,13 @@ function seed(db: Handle): void {
 // order-insensitive multiset compare (a query without ORDER BY has unspecified order; sorting both
 // sides is sound for equality either way).
 function rowsSorted(db: Handle, sql: string): string[] {
-  const o = db.execute(sql);
+  const o = queryOutcome(db, sql);
   if (o.kind !== "query") throw new Error(`expected a query: ${sql}`);
   return o.rows.map((r) => r.map((v) => render(v)).join("\x1f")).sort();
 }
 
 function costOf(db: Handle, sql: string): bigint {
-  return db.execute(sql).cost;
+  return queryOutcome(db, sql).cost;
 }
 
 // streamedSorted drains the LAZY query() cursor (the "columnar" bufferedRows arm), rendering + sorting

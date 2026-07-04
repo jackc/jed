@@ -8,12 +8,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { EngineError } from "../src/tooling.ts";
-import type { Handle } from "./util.ts";
+import { type Handle, queryOutcome } from "./util.ts";
 import { memDb } from "./mem_db.ts";
 
 // rowCount returns the number of rows of `SELECT * FROM t` against the committed/visible state.
 function rowCount(db: Handle, table: string): number {
-  const o = db.execute(`SELECT * FROM ${table}`);
+  const o = queryOutcome(db, `SELECT * FROM ${table}`);
   if (o.kind !== "query") throw new Error("expected a query result");
   return o.rows.length;
 }

@@ -8,11 +8,11 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { type Handle, dbWith, errCode, query } from "./util.ts";
+import { type Handle, dbWith, errCode, query, queryOutcome } from "./util.ts";
 import { memDb } from "./mem_db.ts";
 
 function cost(db: Handle, sql: string): bigint {
-  return db.execute(sql).cost;
+  return queryOutcome(db, sql).cost;
 }
 
 function rows1(ns: number[]): string[][] {
@@ -22,7 +22,7 @@ function rows1(ns: number[]): string[][] {
 // qOut runs a query and narrows the result to the query Outcome (so columnNames / columnTypes
 // are accessible without a union-member error).
 function qOut(db: Handle, sql: string) {
-  const o = db.execute(sql);
+  const o = queryOutcome(db, sql);
   if (o.kind !== "query") throw new Error(`expected a query result for ${sql}`);
   return o;
 }
@@ -81,7 +81,7 @@ test("unnest takes a correlated outer column AND an earlier sibling (implicitly 
     "SELECT id, u FROM t CROSS JOIN unnest(xs) AS u",
     "SELECT id, u FROM t CROSS JOIN unnest(t.xs) AS u",
   ]) {
-    const out = db.execute(sql);
+    const out = queryOutcome(db, sql);
     assert.equal(out.kind, "query");
     if (out.kind !== "query") return;
     assert.equal(out.rows.length, 3);

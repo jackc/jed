@@ -105,6 +105,8 @@ import {
 } from "./collation.ts";
 import { COSTS } from "./costs.ts";
 import { Cursor, type RowSource } from "./cursor.ts";
+// Type-only (erased) — no runtime cycle: the executor↔api value edge stays one-directional.
+import type { RunResult } from "./ergonomic.ts";
 import {
   instantToLocalMicros,
   loadTimeZoneData as loadTimeZoneDataGlobal,
@@ -3304,12 +3306,18 @@ export class Engine {
     return this.executeStmtParams(stmt, []);
   }
 
-  // execute parses and runs one statement, binding $N params — the method form of the free `execute`
-  // helper, so the low-level Engine satisfies the same shape as Session/Database. The white-box
-  // storage/catalog tests that legitimately stay on the internal Engine reach it through the shared
-  // test helpers (util.ts's Handle); production hosts use Session/Database.
-  execute(sql: string, params: Value[] = []): Outcome {
-    return this.executeStmtParams(this.parse(sql), params);
+  // execute parses and runs one statement, binding $N params, and returns its command tag — the method
+  // form of the exec-side seam, so the low-level Engine satisfies the same {changes, cost} shape as
+  // Session/Database (their `.execute` drains the streaming `query` seam; the bare Engine runs the
+  // materialized path directly, results/cost-identical, and cannot import the api.ts query seam without
+  // a cycle). The white-box storage/catalog tests that legitimately stay on the internal Engine reach
+  // it through the shared test helpers (util.ts's Handle); production hosts use Session/Database.
+  execute(sql: string, params: Value[] = []): RunResult {
+    const out = this.executeStmtParams(this.parse(sql), params);
+    return {
+      changes: out.kind === "statement" ? (out.rowsAffected ?? 0) : 0,
+      cost: out.cost,
+    };
   }
 
   // executeStmtParams executes one parsed statement, binding params to its $N placeholders (an
@@ -3666,6 +3674,40 @@ export class Engine {
       if (!this.session.privileges.allowsFunction(key)) {
         throw engineError("insufficient_privilege", "permission denied for function " + key);
       }
+    }
+  }
+
+  // gateReadLanes runs the admission gates the lazy read lanes (tryScanQuery / tryDeferredQuery) would
+  // otherwise skip. Those gates live on the materialized dispatchStmt path, but a SELECT served by a
+  // streaming/deferred cursor never reaches it — so a read through the total query seam would bypass
+  // authorization entirely (a §13 hole). Enforcing them here makes query a total AND safe seam: a read
+  // inside a failed block is 25P02, a lifetime-exhausted session is 54P02, and a restricted read is
+  // 42501 — whichever lane serves it. The caller applies this only to reads (transaction control must
+  // still work in a failed block, and a write keeps its gating inside dispatch); the three checks are
+  // pure, so a read that falls through to the materialized path re-running them is harmless (identical
+  // result). (CLAUDE.md §13 — the safe-total-query contract.)
+  gateReadLanes(stmt: Statement): void {
+    if (this.session.tx !== null && this.session.tx.failed) {
+      throw engineError(
+        "in_failed_sql_transaction",
+        "current transaction is aborted, commands ignored until end of transaction block",
+      );
+    }
+    this.checkLifetimeAdmission();
+    this.checkPrivileges(stmt);
+  }
+
+  // failOpenBlock puts an open, failable transaction block into the aborted state (tx.failed). A no-op
+  // outside a block, and idempotent. This is the block-abort a lazy read lane bypasses: the materialized
+  // executeStmtParams poisons in its block branch, but a SELECT served by a streaming / deferred cursor
+  // never reaches it (transactions.md §6). PostgreSQL aborts a block on ANY statement error, so a
+  // failing read has to poison here — an OPEN-time lane error (the query call site's catch) or a
+  // DRAIN-time fault (the Rows onErr hook the call site attaches). Only reads reach these paths
+  // (transaction control and writes go to dispatch, which self-poisons with the right nuance — a nested
+  // BEGIN's 25001 must NOT abort).
+  failOpenBlock(): void {
+    if (this.session.tx !== null) {
+      this.session.tx.failed = true;
     }
   }
 
@@ -10714,7 +10756,7 @@ export class Engine {
     stmt: Statement,
     params: Value[],
     holder: ScanCacheHolder | null,
-  ): { columnNames: string[]; cursor: Cursor } | null {
+  ): { columnNames: string[]; columnTypes: string[]; cursor: Cursor } | null {
     if (stmt.kind !== "select" || stmtIsWrite(stmt)) return null;
     const snap = this.readSnap();
     const gen = snap.catGen;
@@ -10759,7 +10801,7 @@ export class Engine {
     sp: SelectPlan,
     bound: Value[],
     subqueryCost: bigint,
-  ): { columnNames: string[]; cursor: Cursor } {
+  ): { columnNames: string[]; columnTypes: string[]; cursor: Cursor } {
     if (streamingScanEligible(sp)) {
       // Resolve the scan bound (the PK pushdown, if any) and the up-front cost block. An empty bound
       // (e.g. pk = NULL) admits no row.
@@ -10798,7 +10840,11 @@ export class Engine {
           gen.return(undefined);
         },
       };
-      return { columnNames: sp.columnNames, cursor: Cursor.streaming(source) };
+      return {
+      columnNames: sp.columnNames,
+      columnTypes: typeNames(sp.columnTypes),
+      cursor: Cursor.streaming(source),
+    };
     }
 
     // Blocking (buffered) shape: buffers its input but yields the output one row at a time.
@@ -10825,7 +10871,11 @@ export class Engine {
         gen.return(undefined);
       },
     };
-    return { columnNames: sp.columnNames, cursor: Cursor.streaming(source) };
+    return {
+      columnNames: sp.columnNames,
+      columnTypes: typeNames(sp.columnTypes),
+      cursor: Cursor.streaming(source),
+    };
   }
 
   // planCacheable reports whether a resolved scan plan may be memoized on a prepared statement. The
@@ -10853,16 +10903,19 @@ export class Engine {
   // to the materialized dispatch path. Under full drain the rows + total cost are byte-identical to the
   // eager execute() path (it drives the SAME runSetOp / runWith, §6), so the corpus — which drives
   // execute() — stays green by construction; per-core unit tests pin query() == execute().
-  tryDeferredQuery(stmt: Statement, params: Value[]): { columnNames: string[]; cursor: Cursor } | null {
+  tryDeferredQuery(
+    stmt: Statement,
+    params: Value[],
+  ): { columnNames: string[]; columnTypes: string[]; cursor: Cursor } | null {
     // A write-classified statement (a data-modifying WITH, a sequence mutator) must take the write gate
     // and never streams (streaming.md §7 / sequences.md §4).
     if (stmtIsWrite(stmt)) return null;
     if (stmt.kind !== "setOp" && stmt.kind !== "with") return null;
-    // Resolve the output column names up front (the Rows cursor exposes them before the first pull).
-    // Planning is unmetered + deterministic, so the names read here are IDENTICAL to what the deferred
-    // run produces (it reuses runSetOp/runWith verbatim, so there is no rows/cost drift). A planning
-    // error (42P01/42804/…) surfaces at query(), matching the eager path.
-    const columnNames = this.deferredColumnNames(stmt);
+    // Resolve the output column names + types up front (the Rows cursor exposes them before the first
+    // pull). Planning is unmetered + deterministic, so the names read here are IDENTICAL to what the
+    // deferred run produces (it reuses runSetOp/runWith verbatim, so there is no rows/cost drift). A
+    // planning error (42P01/42804/…) surfaces at query(), matching the eager path.
+    const { columnNames, columnTypes } = this.deferredColumnNames(stmt);
     const snap = this.snapshotEngine();
     // Run the whole set op / WITH on the FIRST pull (streaming.md §7), reusing the eager runSetOp /
     // runWith verbatim so the rows + cost match execute() exactly.
@@ -10894,23 +10947,28 @@ export class Engine {
         rows = [];
       },
     };
-    return { columnNames, cursor: Cursor.streaming(source) };
+    return { columnNames, columnTypes, cursor: Cursor.streaming(source) };
   }
 
   // deferredColumnNames resolves the output column names of a top-level set operation / pure-query WITH
   // by planning only (no execution) — fills a deferred cursor's Rows metadata before its first pull
   // (tryDeferredQuery). Mirrors the planning prefix of runSetOp / runWith exactly so the names match the
   // deferred run's. Bound params are not needed: column names never depend on bound values.
-  private deferredColumnNames(stmt: SetOp | WithQuery): string[] {
+  private deferredColumnNames(stmt: SetOp | WithQuery): {
+    columnNames: string[];
+    columnTypes: string[];
+  } {
     const ptypes = new ParamTypes();
     if (stmt.kind === "setOp") {
-      return this.planQuery(stmt, null, [], ptypes).columnNames;
+      const plan = this.planQuery(stmt, null, [], ptypes);
+      return { columnNames: plan.columnNames, columnTypes: typeNames(plan.columnTypes) };
     }
     // The planning prefix of runWith (cte.md): plan the CTE bindings, then the body with them visible.
     const bindings = this.planCteBindings(stmt.ctes, stmt.recursive, ptypes);
     const bodyQuery = cteBodyAsQuery(stmt.body); // pure-query WITH (DML excluded by stmtIsWrite)
     if (bodyQuery === null) throw new Error("a pure-query WITH is required here");
-    return this.planQuery(bodyQuery, null, bindings, ptypes).columnNames;
+    const plan = this.planQuery(bodyQuery, null, bindings, ptypes);
+    return { columnNames: plan.columnNames, columnTypes: typeNames(plan.columnTypes) };
   }
 
   private execStreamingScan(

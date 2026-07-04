@@ -25,7 +25,6 @@
 
 import type { Rows } from "./api.ts";
 import { engineError } from "./errors.ts";
-import type { Outcome } from "./executor.ts";
 import { Decimal } from "./decimal.ts";
 import {
   type Value,
@@ -65,10 +64,28 @@ export type Row = Record<string, JsValue>;
 // use RETURNING to read generated columns back.
 export type RunResult = { changes: number; cost: bigint };
 
+// drainRun drains a total-query cursor and returns its command tag as a RunResult ({changes, cost}) —
+// the shared exec-side lowering behind Statement.run AND every handle .execute* method: run the query
+// seam, drain-and-discard the rows, keep the tag (a SELECT / DDL / transaction control carries no count
+// → changes 0). The full drain surfaces a mid-drain streaming error (a 54P01 cost abort, 57014
+// cancellation, or arithmetic trap) rather than dropping it. A raw streaming Rows is closed after
+// draining — JS has no destructor and the iterator does not auto-close — so its reader-liveness pin is
+// released in `finally` (spec/design/api.md §11, streaming.md §5).
+export function drainRun(rows: Rows): RunResult {
+  try {
+    for (const _row of rows) {
+      // drain-and-discard
+    }
+    return { changes: rows.rowsAffected ?? 0, cost: rows.cost };
+  } finally {
+    rows.close();
+  }
+}
+
 // ErgonomicHandle is the raw surface a Statement runs on — satisfied structurally by Database,
-// Session, and Transaction (all expose execute/query over Value[]).
+// Session, and Transaction (all expose the total `query` seam over Value[]). run/get/all/iterate all
+// route through `query` (run drains-and-discards for its command tag), the one internal exec/query seam.
 export interface ErgonomicHandle {
-  execute(sql: string, params: Value[]): Outcome;
   query(sql: string, params: Value[]): Rows;
 }
 
@@ -145,11 +162,15 @@ export class Statement {
     this.source = sql;
   }
 
-  // run executes a non-query statement, binding native params, and returns its command tag. (A
-  // query statement is still accepted — `changes` is then 0; use get/all to read its rows.)
+  // run executes a statement, binding native params, and returns its command tag — exec-side sugar over
+  // the total query seam: run, drain-and-discard the rows, read the tag off the drained cursor (a
+  // SELECT / DDL / transaction control carries no count → `changes` 0). The full drain surfaces a
+  // mid-drain streaming error (a 54P01 cost abort, 57014 cancellation, or arithmetic trap) rather than
+  // dropping it. A raw streaming Rows must be closed after draining — JS has no destructor and the
+  // iterator does not auto-close — so its reader-liveness pin is released in `finally` (api.md §11,
+  // streaming.md §5); this is stricter than get/all/iterate, which drain without closing.
   run(...params: JsParam[]): RunResult {
-    const out = this.handle.execute(this.source, bindParams(params));
-    return { changes: out.kind === "statement" ? (out.rowsAffected ?? 0) : 0, cost: out.cost };
+    return drainRun(this.handle.query(this.source, bindParams(params)));
   }
 
   // get runs a query, binding native params, and returns its FIRST row as an object — or undefined

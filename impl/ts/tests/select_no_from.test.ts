@@ -10,16 +10,16 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { EngineError, intValue } from "../src/tooling.ts";
-import { type Handle, dbWith, errCode, query } from "./util.ts";
+import { type Handle, dbWith, errCode, query, queryOutcome } from "./util.ts";
 import { memDb } from "./mem_db.ts";
 
 function cost(db: Handle, sql: string): bigint {
-  return db.execute(sql).cost;
+  return queryOutcome(db, sql).cost;
 }
 
 test("SELECT 1 returns one row costing one row_produced", () => {
   const db = memDb().session();
-  const out = db.execute("SELECT 1");
+  const out = queryOutcome(db, "SELECT 1");
   assert.equal(out.kind, "query");
   if (out.kind !== "query") return;
   assert.deepStrictEqual(out.columnNames, ["?column?"]);
@@ -88,7 +88,7 @@ test("subqueries: uncorrelated fold and correlated outward resolution", () => {
 
 test("INSERT ... SELECT source", () => {
   const db = dbWith(["CREATE TABLE t (id i32 PRIMARY KEY)"]);
-  const out = db.execute("INSERT INTO t SELECT 3");
+  const out = queryOutcome(db, "INSERT INTO t SELECT 3");
   assert.equal(out.cost, 1n); // exactly the embedded SELECT's cost
   assert.deepStrictEqual(query(db, "SELECT id FROM t"), [["3"]]);
 });
@@ -140,7 +140,7 @@ test("an untyped $1 is 42P18; a sibling operand types it", () => {
     "42P18",
   );
   // The sibling-operand rule (grammar.md §5) works without a FROM.
-  const out = db.execute("SELECT $1 + 1", [intValue(7n)]);
+  const out = queryOutcome(db, "SELECT $1 + 1", [intValue(7n)]);
   assert.equal(out.kind, "query");
   if (out.kind !== "query") return;
   assert.equal(out.rows.length, 1);

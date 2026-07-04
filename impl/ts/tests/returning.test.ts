@@ -7,8 +7,8 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, intValue, render, type Engine } from "../src/tooling.ts";
-import { type Handle, dbWith, errCode } from "./util.ts";
+import { intValue, render } from "../src/tooling.ts";
+import { type Handle, dbWith, errCode, queryOutcome } from "./util.ts";
 
 function setup() {
   return dbWith([
@@ -19,20 +19,20 @@ function setup() {
 
 // rows runs sql (which must yield a query result) and renders its rows as strings.
 function rows(db: Handle, sql: string): string[][] {
-  const o = db.execute(sql);
+  const o = queryOutcome(db, sql);
   assert.equal(o.kind, "query", `expected a query result for ${sql}`);
   if (o.kind !== "query") throw new Error("unreachable");
   return o.rows.map((r) => r.map(render));
 }
 
 function cost(db: Handle, sql: string): bigint {
-  return db.execute(sql).cost;
+  return queryOutcome(db, sql).cost;
 }
 
 test("INSERT VALUES RETURNING: rows and the outcome variant", () => {
   const db = setup();
   // Without RETURNING an INSERT stays a bare statement outcome.
-  assert.equal(db.execute("INSERT INTO t VALUES (10, 1, 2)").kind, "statement");
+  assert.equal(queryOutcome(db, "INSERT INTO t VALUES (10, 1, 2)").kind, "statement");
   // With it, the stored rows project back — including multi-row and the `*` glob with
   // the DEFAULT fill-in (v = 7) and the omitted column (w = NULL).
   assert.deepStrictEqual(rows(db, "INSERT INTO t VALUES (11, 5, 6) RETURNING id, v"), [
@@ -48,7 +48,10 @@ test("RETURNING output names and expressions", () => {
   const db = setup();
   // §8 naming: ?column? for an expression, the AS label, the canonical name for a
   // bare/qualified column. Expressions evaluate against the stored row.
-  const o = db.execute("INSERT INTO t VALUES (14, 5, 0) RETURNING v + 1, v * 2 AS dbl, t.w, id");
+  const o = queryOutcome(
+    db,
+    "INSERT INTO t VALUES (14, 5, 0) RETURNING v + 1, v * 2 AS dbl, t.w, id",
+  );
   assert.equal(o.kind, "query");
   if (o.kind !== "query") throw new Error("unreachable");
   assert.deepStrictEqual(o.columnNames, ["?column?", "dbl", "w", "id"]);
@@ -81,7 +84,7 @@ test("UPDATE RETURNING projects the NEW values; zero rows stay a query result", 
     ["2", "21"],
   ]);
   // Zero matched rows: still a QUERY outcome — empty rows, names intact.
-  const o = db.execute("UPDATE t SET v = 0 WHERE id = 999 RETURNING id");
+  const o = queryOutcome(db, "UPDATE t SET v = 0 WHERE id = 999 RETURNING id");
   assert.equal(o.kind, "query");
   if (o.kind !== "query") throw new Error("unreachable");
   assert.deepStrictEqual(o.columnNames, ["id"]);
@@ -215,7 +218,7 @@ test("a ceiling abort during RETURNING is all-or-nothing", () => {
 test("$N binds in the RETURNING list", () => {
   const db = setup();
   // A $N in the RETURNING list types from context like anywhere else (api.md §5).
-  const o = db.execute("INSERT INTO t VALUES (80, 3, 0) RETURNING v + $1", [intValue(5n)]);
+  const o = queryOutcome(db, "INSERT INTO t VALUES (80, 3, 0) RETURNING v + $1", [intValue(5n)]);
   assert.equal(o.kind, "query");
   if (o.kind !== "query") throw new Error("unreachable");
   assert.deepStrictEqual(
@@ -298,12 +301,12 @@ test("old/new qualifiers per statement", () => {
 test("old/new naming and star", () => {
   const db = setup();
   // §8: the qualifier never leaks into the output name (old.v is named v, like PG).
-  const o = db.execute("UPDATE t SET v = 1 WHERE id = 1 RETURNING old.v, new.w");
+  const o = queryOutcome(db, "UPDATE t SET v = 1 WHERE id = 1 RETURNING old.v, new.w");
   assert.equal(o.kind, "query");
   if (o.kind !== "query") throw new Error("unreachable");
   assert.deepStrictEqual(o.columnNames, ["v", "w"]);
   // The pseudo-relations are qualifier-only: `*` still expands exactly the table's columns.
-  const o2 = db.execute("INSERT INTO t (id) VALUES (41) RETURNING *");
+  const o2 = queryOutcome(db, "INSERT INTO t (id) VALUES (41) RETURNING *");
   assert.equal(o2.kind, "query");
   if (o2.kind !== "query") throw new Error("unreachable");
   assert.deepStrictEqual(o2.columnNames, ["id", "v", "w"]);
@@ -360,7 +363,7 @@ test("old/new touched-set sides", () => {
   assert.equal(cost(fresh(), "UPDATE big SET w = 1 WHERE id = 1 RETURNING old.t"), 30n);
   // DELETE RETURNING new.t reads nothing (NULL side): the 4-unit shape, value NULL.
   const db = fresh();
-  const o = db.execute("DELETE FROM big WHERE id = 1 RETURNING new.t");
+  const o = queryOutcome(db, "DELETE FROM big WHERE id = 1 RETURNING new.t");
   assert.equal(o.kind, "query");
   if (o.kind !== "query") throw new Error("unreachable");
   assert.deepStrictEqual(

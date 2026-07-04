@@ -10,7 +10,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { EngineError } from "../src/tooling.ts";
-import type { Handle } from "./util.ts";
+import { type Handle, queryOutcome } from "./util.ts";
 import type { Value } from "../src/value.ts";
 import { memDb } from "./mem_db.ts";
 
@@ -26,7 +26,7 @@ function code(fn: () => unknown): string {
 
 // scalar runs a single-row, single-column query and returns the lone value.
 function scalar(db: Handle, sql: string): Value {
-  const o = db.execute(sql);
+  const o = queryOutcome(db, sql);
   if (o.kind !== "query") throw new Error("expected a query result");
   assert.equal(o.rows.length, 1, sql);
   assert.equal(o.rows[0]!.length, 1, sql);
@@ -133,7 +133,7 @@ test("an additional session has independent variables", () => {
   const other = db.session({});
   other.setVar("myapp.who", "other");
 
-  const o = other.execute("SELECT current_setting('myapp.who')");
+  const o = queryOutcome(other, "SELECT current_setting('myapp.who')");
   if (o.kind !== "query") throw new Error("expected a query result");
   assertText(o.rows[0]![0]!, "other");
   assert.equal(a.var("myapp.who"), "a");

@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { EngineError, intValue, nullValue } from "../src/tooling.ts";
 import type { Value } from "../src/lib.ts";
-import { type Handle, dbWith } from "./util.ts";
+import { type Handle, dbWith, queryOutcome } from "./util.ts";
 import { memDb } from "./mem_db.ts";
 
 function text(s: string): Value {
@@ -14,7 +14,7 @@ function text(s: string): Value {
 }
 
 function rows(db: Handle, sql: string, params: Value[]): Value[][] {
-  const o = db.execute(sql, params);
+  const o = queryOutcome(db, sql, params);
   if (o.kind !== "query") throw new Error(`expected a query result for ${sql}`);
   return o.rows;
 }

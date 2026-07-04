@@ -4,8 +4,8 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Session, intValue } from "../src/tooling.ts";
-import { dbWith, errCode, query } from "./util.ts";
+import { type Session, intValue } from "../src/tooling.ts";
+import { dbWith, errCode, query, queryOutcome } from "./util.ts";
 import { memDb } from "./mem_db.ts";
 
 function nums(): Session {
@@ -74,7 +74,7 @@ test("INSERT ... SELECT cost is the embedded SELECT's accrued cost", () => {
   ]);
   // 1 page_read (src is one leaf) + 3 scanned + 3 produced + 0 projection (bare columns) = 7;
   // storing the rows is unmetered.
-  const o = db.execute("INSERT INTO dst SELECT id, a, b FROM src");
+  const o = queryOutcome(db, "INSERT INTO dst SELECT id, a, b FROM src");
   assert.equal(o.kind, "statement");
   assert.equal(o.cost, 7n);
 });

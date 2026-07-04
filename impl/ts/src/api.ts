@@ -7,13 +7,13 @@ import type { Statement } from "./ast.ts";
 import { throwIfAborted } from "./cancel.ts";
 import { Cursor } from "./cursor.ts";
 import {
+  drainRun,
   type JsParam,
   type Row as ErgoRow,
   type RunResult,
   Statement as ErgoStatement,
 } from "./ergonomic.ts";
-import type { Engine, Outcome, ScanCacheHolder } from "./executor.ts";
-import { engineError } from "./errors.ts";
+import { type Engine, type Outcome, type ScanCacheHolder, stmtIsWrite } from "./executor.ts";
 import type { Value } from "./value.ts";
 
 // PreparedStatement is a parsed, reusable statement (spec/design/api.md §2.4). It holds the
@@ -33,10 +33,11 @@ export class PreparedStatement {
     this.ast = ast;
   }
 
-  // execute runs this statement, binding params to its $N placeholders (empty when it has none),
-  // returning the materialized outcome.
-  execute(params: Value[] = []): Outcome {
-    return this.db.executeStmtParams(this.ast, params);
+  // execute runs this statement, binding params to its $N placeholders (empty when it has none), and
+  // returns its command tag — exec-side sugar over the total query seam (drain-and-discard the rows,
+  // keep the tag). Use query() to read a result set.
+  execute(params: Value[] = []): RunResult {
+    return drainRun(this.query(params));
   }
 
   // query runs this query statement, returning a row cursor. The prepared AST routes through the same
@@ -56,15 +57,37 @@ export class PreparedStatement {
 // streaming contract): once iterated it is drained.
 export class Rows implements Iterable<Value[]> {
   readonly columnNames: string[];
+  // The canonical type name of each output column (parallel to columnNames), carried on the total query
+  // seam so a streaming read exposes its types like the materialized Outcome did — i16/text/decimal/…,
+  // or "unknown" for an untyped NULL column (spec/design/conformance.md §7). Empty for a non-query
+  // statement.
+  readonly columnTypes: string[];
   private readonly cursor: Cursor;
+  // The command tag for a statement run through the now-total query seam (spec/design/api.md §4): how
+  // many rows a DML statement (INSERT/UPDATE/DELETE without RETURNING) touched. null for a SELECT / DDL
+  // / transaction control, which carry no count. This is how the exec-side path (Statement.run) reads
+  // the tag off a drained Rows — "run is throw away the rows, keep the count."
+  private readonly rowsAffectedValue: number | null;
   // The reader-liveness pin's deregister (the watermark, streaming.md §5) — set by Session.query for a
   // streaming cursor, called by close (JS has no destructor; the ergonomic iterators close on loop
   // exit). undefined for a buffered cursor or a bare single-handle stream.
   private onClose?: () => void;
+  // Fired ONCE when iteration first hits a terminal error (a drain-time streaming/deferred fault). Set
+  // by the query call site (attachBlockPoison) for a read inside an open block, to abort the block — the
+  // open-time lane errors are poisoned at the query return, this covers the errors that surface only
+  // during the caller's drain. undefined for an autocommit read or a buffered cursor.
+  private onErr?: () => void;
 
-  constructor(columnNames: string[], cursor: Cursor) {
+  constructor(
+    columnNames: string[],
+    columnTypes: string[],
+    cursor: Cursor,
+    rowsAffected: number | null,
+  ) {
     this.columnNames = columnNames;
+    this.columnTypes = columnTypes;
     this.cursor = cursor;
+    this.rowsAffectedValue = rowsAffected;
   }
 
   // attachPin records the reader-liveness pin's deregister for a streaming cursor (the watermark,
@@ -73,10 +96,33 @@ export class Rows implements Iterable<Value[]> {
     this.onClose = deregister;
   }
 
+  // attachErrHook records a callback fired once when iteration first hits a terminal error (the query
+  // call site's attachBlockPoison uses it to abort an open block on a drain-time read fault).
+  attachErrHook(hook: () => void): void {
+    this.onErr = hook;
+  }
+
+  // fireErr fires the drain-time error hook exactly once (the iterator short-circuits after, so it
+  // cannot double-fire).
+  private fireErr(): void {
+    if (this.onErr) {
+      const hook = this.onErr;
+      this.onErr = undefined;
+      hook();
+    }
+  }
+
   // cost is the deterministic execution cost accrued by the query (CLAUDE.md §13). Final once the
   // cursor is drained (streaming.md §6); for a buffered cursor it is final immediately.
   get cost(): bigint {
     return this.cursor.cost();
+  }
+
+  // rowsAffected is the command tag carried on a Rows: how many rows a DML statement (INSERT/UPDATE/
+  // DELETE without RETURNING) touched; null for a SELECT / DDL / transaction control, which have no
+  // count (spec/design/api.md §4). The exec-side Statement.run reads this off a drained Rows.
+  get rowsAffected(): number | null {
+    return this.rowsAffectedValue;
   }
 
   // close releases the read snapshot the cursor pins (streaming.md §5): it closes the underlying
@@ -93,11 +139,20 @@ export class Rows implements Iterable<Value[]> {
 
   [Symbol.iterator](): Iterator<Value[]> {
     const cursor = this.cursor;
+    const self = this;
     return {
       // nextRow may throw mid-drain for a streaming cursor (a 54P01 cost abort or an arithmetic trap);
-      // the throw propagates out of the for..of as the statement's error (streaming.md §6).
+      // the throw propagates out of the for..of as the statement's error (streaming.md §6). Before it
+      // propagates, fire the block-poison hook once: a drain-time read fault inside an open block aborts
+      // it, so the next statement is 25P02 rather than wrongly running (transactions.md §6).
       next(): IteratorResult<Value[]> {
-        const row = cursor.nextRow();
+        let row: Value[] | undefined;
+        try {
+          row = cursor.nextRow();
+        } catch (e) {
+          self.fireErr();
+          throw e;
+        }
         return row !== undefined
           ? { done: false, value: row }
           : { done: true, value: undefined as unknown as Value[] };
@@ -106,14 +161,17 @@ export class Rows implements Iterable<Value[]> {
   }
 }
 
+// rowsFromOutcome wraps a materialized outcome as a Rows. It is TOTAL: a non-query statement is
+// observably a Rows with no output columns — an empty buffered cursor seeded with the accrued cost,
+// carrying the statement's command tag (rows-affected). This is the single exec/query seam: the
+// exec-side path (Statement.run) drains-and-discards such a Rows and returns the tag, so "query on a
+// statement that produces no rows" is valid, not a 42601 (the effect-then-error bug this removes — a
+// write reached here after dispatch already committed it; spec/design/api.md §11).
 export function rowsFromOutcome(out: Outcome): Rows {
-  if (out.kind !== "query") {
-    throw engineError(
-      "syntax_error",
-      "query called on a statement that produces no rows; use execute",
-    );
+  if (out.kind === "query") {
+    return new Rows(out.columnNames, out.columnTypes, Cursor.buffered(out.rows, out.cost), null);
   }
-  return new Rows(out.columnNames, Cursor.buffered(out.rows, out.cost));
+  return new Rows([], [], Cursor.buffered([], out.cost), out.rowsAffected);
 }
 
 // prepare parses sql once into a reusable prepared statement (spec/design/api.md §2.4). Parse
@@ -146,10 +204,42 @@ function queryStmt(
   params: Value[],
   holder: ScanCacheHolder | null,
 ): Rows {
-  const scanned = db.tryScanQuery(stmt, params, holder);
-  if (scanned !== null) return new Rows(scanned.columnNames, scanned.cursor);
-  const deferred = db.tryDeferredQuery(stmt, params);
-  if (deferred !== null) return new Rows(deferred.columnNames, deferred.cursor);
+  // attachBlockPoison: a DRAIN-time read fault inside an open block aborts it (open-time lane errors are
+  // poisoned by the catch below); a no-op for an autocommit read. The hook re-checks the block at error
+  // time, so poisoning an already-ended block is harmless (transactions.md §6).
+  const attachPoison = (rows: Rows): Rows => {
+    if (db.session.tx !== null) rows.attachErrHook(() => db.failOpenBlock());
+    return rows;
+  };
+  // A read served by a lazy lane never reaches the materialized executeStmtParams, so enforce the
+  // read-path admission gates (25P02 / 54P02 / 42501) here — reads only: transaction control must still
+  // work in a failed block, and a write is gated inside executeStmtParams on the fall-through below (the
+  // safe-total-query contract, CLAUDE.md §13). An open-time lane error poisons the block (the catch).
+  const isRead =
+    stmt.kind !== "begin" &&
+    stmt.kind !== "commit" &&
+    stmt.kind !== "rollback" &&
+    !stmtIsWrite(stmt);
+  try {
+    if (isRead) db.gateReadLanes(stmt);
+    const scanned = db.tryScanQuery(stmt, params, holder);
+    if (scanned !== null) {
+      return attachPoison(new Rows(scanned.columnNames, scanned.columnTypes, scanned.cursor, null));
+    }
+    const deferred = db.tryDeferredQuery(stmt, params);
+    if (deferred !== null) {
+      return attachPoison(
+        new Rows(deferred.columnNames, deferred.columnTypes, deferred.cursor, null),
+      );
+    }
+  } catch (e) {
+    db.failOpenBlock();
+    throw e;
+  }
+  // The materialized dispatch fall-through (a write / nextval / data-modifying WITH / transaction
+  // control) self-poisons in executeStmtParams's block branch with the right nuance (a nested BEGIN's
+  // 25001 must NOT poison), so it is left intact — only the lazy-lane reads above, which bypass it, are
+  // poisoned by the catch.
   return rowsFromOutcome(db.executeStmtParams(stmt, params));
 }
 
@@ -178,23 +268,25 @@ export class Transaction {
     this.end = end;
   }
 
-  // execute runs a (possibly mutating) statement within this transaction, binding params. A write
-  // in a READ ONLY transaction is 25006; a statement error aborts the block (every later statement
-  // but commit/rollback is then 25P02).
-  execute(sql: string, params: Value[] = []): Outcome {
-    return this.db.executeStmtParams(this.db.parse(sql), params);
+  // execute runs a (possibly mutating) statement within this transaction, binding params, and returns
+  // its command tag (exec-side sugar over the total query seam — drain-and-discard, keep the tag). A
+  // write in a READ ONLY transaction is 25006; a statement error aborts the block (every later
+  // statement but commit/rollback is then 25P02).
+  execute(sql: string, params: Value[] = []): RunResult {
+    return drainRun(this.query(sql, params));
   }
 
-  // query runs a query within this transaction, returning a row cursor.
+  // query runs a query within this transaction, returning a row cursor over the total query seam (a
+  // non-query statement is a Rows with no output columns, carrying the command tag).
   query(sql: string, params: Value[] = []): Rows {
-    return rowsFromOutcome(this.execute(sql, params));
+    return rowsFromOutcome(this.db.executeStmtParams(this.db.parse(sql), params));
   }
 
   // executeCancelable runs a statement within this transaction under an AbortSignal (spec/design/
   // api.md §11.4): an already-aborted signal throws 57014 before any work, which — like any error —
   // poisons the block (25P02 on the next statement). TS is synchronous, so the check is at this
   // boundary only (cancel.ts).
-  executeCancelable(sql: string, params: Value[] = [], signal?: AbortSignal): Outcome {
+  executeCancelable(sql: string, params: Value[] = [], signal?: AbortSignal): RunResult {
     throwIfAborted(signal);
     return this.execute(sql, params);
   }

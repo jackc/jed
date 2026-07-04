@@ -7,8 +7,8 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { EngineError, Session } from "../src/tooling.ts";
-import type { Handle } from "./util.ts";
+import { EngineError, type Session } from "../src/tooling.ts";
+import { type Handle, queryOutcome } from "./util.ts";
 import { memDb } from "./mem_db.ts";
 
 function rowTable(n: number): Session {
@@ -21,11 +21,11 @@ function rowTable(n: number): Session {
 }
 
 function cost(db: Handle, sql: string): bigint {
-  return db.execute(sql).cost;
+  return queryOutcome(db, sql).cost;
 }
 
 function rowCount(db: Handle, sql: string): number {
-  const o = db.execute(sql);
+  const o = queryOutcome(db, sql);
   if (o.kind !== "query") throw new Error("expected a query result");
   return o.rows.length;
 }
@@ -107,7 +107,7 @@ test("a pathological expression aborts on one row (per-node eval guard)", () => 
 test("a provably-empty bound accrues 0 and survives a ceiling of 1", () => {
   const db = rowTable(10);
   db.setMaxCost(1n);
-  const o = db.execute("SELECT v FROM t WHERE id > 5 AND id < 5");
+  const o = queryOutcome(db, "SELECT v FROM t WHERE id > 5 AND id < 5");
   if (o.kind !== "query") throw new Error("expected a query result");
   assert.strictEqual(o.rows.length, 0);
   assert.strictEqual(o.cost, 0n);

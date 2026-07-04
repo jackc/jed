@@ -8,8 +8,8 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Session, render } from "../src/tooling.ts";
-import type { Handle } from "./util.ts";
+import { type Session, render } from "../src/tooling.ts";
+import { type Handle, queryOutcome } from "./util.ts";
 import { memDb } from "./mem_db.ts";
 
 function exec(db: Handle, sql: string): void {
@@ -18,14 +18,14 @@ function exec(db: Handle, sql: string): void {
 
 // rows runs sql (which must yield a query result) and returns its rows rendered as strings.
 function rows(db: Handle, sql: string): string[][] {
-  const o = db.execute(sql);
+  const o = queryOutcome(db, sql);
   if (o.kind !== "query") throw new Error(`expected a query result for ${sql}`);
   return o.rows.map((r) => r.map(render));
 }
 
 // affected runs sql (which must yield a statement result) and returns its affected-row count.
 function affected(db: Handle, sql: string): number | null {
-  const o = db.execute(sql);
+  const o = queryOutcome(db, sql);
   if (o.kind !== "statement") throw new Error(`expected a statement result for ${sql}`);
   return o.rowsAffected;
 }

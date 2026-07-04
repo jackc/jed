@@ -65,6 +65,7 @@ import type { Row } from "./storage.ts";
 import type { Cursor } from "./cursor.ts";
 import { throwIfAborted } from "./cancel.ts";
 import {
+  drainRun,
   type JsParam,
   type Row as ErgoRow,
   type RunResult,
@@ -425,8 +426,9 @@ export class Database {
   // core; session-local state (an open block, session variables, currval, session-local temp tables)
   // does NOT carry to the next call — for durable connection state mint an explicit session(). ---
 
-  // execute runs a (possibly mutating) statement on a fresh autocommit session, binding $N params.
-  execute(sql: string, params: Value[] = []): Outcome {
+  // execute runs a (possibly mutating) statement on a fresh autocommit session, binding $N params, and
+  // returns its command tag (exec-side sugar over the total query seam).
+  execute(sql: string, params: Value[] = []): RunResult {
     const s = this.session({});
     try {
       return s.execute(sql, params);
@@ -448,7 +450,7 @@ export class Database {
   // executeCancelable runs a statement on a fresh autocommit session under an AbortSignal
   // (spec/design/api.md §11.4): an already-aborted signal throws 57014 before any work. TS is
   // synchronous, so the check is at this boundary only (cancel.ts).
-  executeCancelable(sql: string, params: Value[] = [], signal?: AbortSignal): Outcome {
+  executeCancelable(sql: string, params: Value[] = [], signal?: AbortSignal): RunResult {
     const s = this.session({});
     try {
       return s.executeCancelable(sql, params, signal);
@@ -676,8 +678,8 @@ export class Session {
   // execute runs a (possibly mutating) statement on this session, binding $N params (spec/design/
   // api.md §5). Routes by the session's state (read-only / open block / autocommit) with the
   // lazy-gate lifecycle (§2.4).
-  execute(sql: string, params: Value[] = []): Outcome {
-    return this.dispatch(this.engine.parse(sql), params);
+  execute(sql: string, params: Value[] = []): RunResult {
+    return drainRun(this.query(sql, params));
   }
 
   // query runs a query on this session, returning a row cursor. A single-table no-blocking-operator
@@ -697,31 +699,57 @@ export class Session {
     if (this.access !== "ro" && this.engine.session.tx === null && !stmtIsWrite(stmt)) {
       this.refreshCommitted();
     }
+    // A read served by a lazy lane never reaches the materialized dispatch, so enforce the read-path
+    // admission gates (failed-block 25P02 / lifetime 54P02 / privilege 42501) here — after refreshing so
+    // privilege resolution sees the snapshot the read will use. Reads only: transaction control must
+    // still work in a failed block, and a write is gated inside dispatch on the fall-through below
+    // (executor.ts gateReadLanes — the safe-total-query contract, CLAUDE.md §13).
+    const isRead =
+      stmt.kind !== "begin" &&
+      stmt.kind !== "commit" &&
+      stmt.kind !== "rollback" &&
+      !stmtIsWrite(stmt);
     // pin registers the cursor's snapshot version in the watermark (streaming.md §5); the deregister
     // runs on cursor close (JS has no destructor), advancing oldestLiveTxid.
-    const pin = (built: { columnNames: string[]; cursor: Cursor }): Rows => {
+    const pin = (built: { columnNames: string[]; columnTypes: string[]; cursor: Cursor }): Rows => {
       const version = this.baseVersion;
       this.core.register(version);
       // A live streaming cursor also blocks within-session temp compaction: it faults its pinned temp
       // tree lazily, so a temp commit must not reclaim a page it may still read (temp-tables.md §6). The
       // counter is on the session's engine (single-threaded), like the write path it gates.
       this.engine.openStreams++;
-      const rows = new Rows(built.columnNames, built.cursor);
+      const rows = new Rows(built.columnNames, built.columnTypes, built.cursor, null);
       rows.attachPin(() => {
         this.engine.openStreams--;
         this.core.deregister(version);
       });
+      // A drain-time fault inside an open block aborts it (the open-time lane errors are poisoned at the
+      // catch below); a no-op for an autocommit read.
+      if (this.engine.session.tx !== null) {
+        rows.attachErrHook(() => this.engine.failOpenBlock());
+      }
       return rows;
     };
-    // One plan-once scan lane serves both streaming and buffered shapes (this ad-hoc path plans once
-    // per call, holder null). Both are live readers and pin their snapshot in the watermark.
-    const scanned = this.engine.tryScanQuery(stmt, params, null);
-    if (scanned !== null) return pin(scanned);
-    // A top-level set operation / pure-query WITH is served by a lazy DEFERRED cursor (streaming.md §7):
-    // it defers the whole run to the first pull and yields the result one row at a time; it is a live
-    // reader too and pins its snapshot in the watermark.
-    const deferred = this.engine.tryDeferredQuery(stmt, params);
-    if (deferred !== null) return pin(deferred);
+    try {
+      if (isRead) this.engine.gateReadLanes(stmt);
+      // One plan-once scan lane serves both streaming and buffered shapes (this ad-hoc path plans once
+      // per call, holder null). Both are live readers and pin their snapshot in the watermark.
+      const scanned = this.engine.tryScanQuery(stmt, params, null);
+      if (scanned !== null) return pin(scanned);
+      // A top-level set operation / pure-query WITH is served by a lazy DEFERRED cursor (streaming.md
+      // §7): it defers the whole run to the first pull and yields the result one row at a time; it is a
+      // live reader too and pins its snapshot in the watermark.
+      const deferred = this.engine.tryDeferredQuery(stmt, params);
+      if (deferred !== null) return pin(deferred);
+    } catch (e) {
+      // An open-time lane error (a missing table, a denied read, a plan-time trap, or a gate rejection)
+      // aborts an open block — the counterpart to the drain-time hook above.
+      this.engine.failOpenBlock();
+      throw e;
+    }
+    // The dispatch fall-through handles transaction control (a nested BEGIN's 25001 must NOT poison) and
+    // self-poisons on a regular statement error (executeStmtParams), so its nuanced poisoning is left
+    // intact — only the lazy-lane reads above, which bypass it, are poisoned here.
     return rowsFromOutcome(this.dispatch(stmt, params));
   }
 
@@ -730,7 +758,7 @@ export class Session {
   // synchronous (one event loop), so the signal cannot flip mid-statement — the check is at this
   // boundary only, the deliberate per-language divergence from Go/Rust's mid-statement meter poll (the
   // cancel.ts note). Useful for skipping work an already-canceled caller no longer wants.
-  executeCancelable(sql: string, params: Value[] = [], signal?: AbortSignal): Outcome {
+  executeCancelable(sql: string, params: Value[] = [], signal?: AbortSignal): RunResult {
     throwIfAborted(signal);
     return this.execute(sql, params);
   }

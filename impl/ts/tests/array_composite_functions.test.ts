@@ -8,8 +8,8 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, Session, type Engine } from "../src/tooling.ts";
-import { type Handle, dbWith, errCode, query } from "./util.ts";
+import type { Session } from "../src/tooling.ts";
+import { type Handle, dbWith, errCode, query, queryOutcome } from "./util.ts";
 
 function addrDb(): Session {
   return dbWith(["CREATE TYPE addr AS (street text, zip i32)"]);
@@ -32,7 +32,7 @@ function col(db: Handle, sql: string): string[] {
 }
 
 function qOut(db: Handle, sql: string) {
-  const o = db.execute(sql);
+  const o = queryOutcome(db, sql);
   if (o.kind !== "query") throw new Error(`expected a query result for ${sql}`);
   return o;
 }

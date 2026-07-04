@@ -9,8 +9,8 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Session } from "../src/tooling.ts";
-import { type Handle, fillerText } from "./util.ts";
+import type { Session } from "../src/tooling.ts";
+import { type Handle, fillerText, queryOutcome } from "./util.ts";
 import { memDb } from "./mem_db.ts";
 
 const PAGE_SIZE = 256;
@@ -25,7 +25,7 @@ function smallPageDb(): Session {
 }
 
 function cost(db: Handle, sql: string): bigint {
-  return db.execute(sql).cost;
+  return queryOutcome(db, sql).cost;
 }
 
 // `comp` row 1 carries a 600-char "x" run → 0x03 inline-compressed (LZ4 shrinks it far under

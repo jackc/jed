@@ -5,8 +5,8 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Session, createDatabase, intValue, openDatabase } from "../src/tooling.ts";
-import type { Handle } from "./util.ts";
+import { type Session, intValue } from "../src/tooling.ts";
+import { type Handle, queryOutcome } from "./util.ts";
 import { PMap, unboundedBound } from "../src/pmap.ts";
 import type { KeyBound } from "../src/pmap.ts";
 import type { Row } from "../src/storage.ts";
@@ -68,7 +68,7 @@ function bigTable(n: number): Session {
 }
 
 function cost(db: Handle, sql: string): bigint {
-  return db.execute(sql).cost;
+  return queryOutcome(db, sql).cost;
 }
 
 function intOf(v: Value): number {
@@ -77,7 +77,7 @@ function intOf(v: Value): number {
 }
 
 function ids(db: Handle, sql: string): number[] {
-  const o = db.execute(sql);
+  const o = queryOutcome(db, sql);
   if (o.kind !== "query") throw new Error("expected a query result");
   return o.rows.map((r) => intOf(r[0]));
 }

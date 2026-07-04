@@ -10,11 +10,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { intValue } from "../src/tooling.ts";
-import { type Handle, dbWith, errCode, query } from "./util.ts";
+import { type Handle, dbWith, errCode, query, queryOutcome } from "./util.ts";
 import { memDb } from "./mem_db.ts";
 
 function cost(db: Handle, sql: string): bigint {
-  return db.execute(sql).cost;
+  return queryOutcome(db, sql).cost;
 }
 
 function rows1(ns: number[]): string[][] {
@@ -33,7 +33,7 @@ test("alias forms and qualified column", () => {
   const db = memDb().session();
   // PG's single-column function-alias rule: `AS g` (or implicit `g`) renames the column to `g`.
   assert.deepStrictEqual(query(db, "SELECT * FROM generate_series(1, 3) g"), rows1([1, 2, 3]));
-  const out = db.execute("SELECT * FROM generate_series(1, 3) AS g");
+  const out = queryOutcome(db, "SELECT * FROM generate_series(1, 3) AS g");
   assert.equal(out.kind, "query");
   if (out.kind === "query") assert.deepStrictEqual(out.columnNames, ["g"]);
   assert.deepStrictEqual(query(db, "SELECT g.g FROM generate_series(1, 3) AS g"), rows1([1, 2, 3]));
@@ -49,7 +49,7 @@ test("alias forms and qualified column", () => {
 
 test("$N parameter argument", () => {
   const db = memDb().session();
-  const out = db.execute("SELECT * FROM generate_series(1, $1)", [intValue(3n)]);
+  const out = queryOutcome(db, "SELECT * FROM generate_series(1, $1)", [intValue(3n)]);
   assert.equal(out.kind, "query");
   if (out.kind !== "query") return;
   assert.deepStrictEqual(
@@ -62,7 +62,7 @@ test("a sibling reference works (an SRF is implicitly lateral, grammar.md §44)"
   const db = dbWith(["CREATE TABLE t (id i32 PRIMARY KEY, n i32)", "INSERT INTO t VALUES (1, 3)"]);
   // The rows are pinned by suites/joins/lateral.test; here we only assert the prior non-LATERAL
   // 42P01 rejection is lifted — generate_series(1, t.n) re-runs per t row (1 row, n=3 ⇒ 3 rows).
-  const out = db.execute("SELECT * FROM t CROSS JOIN generate_series(1, t.n)");
+  const out = queryOutcome(db, "SELECT * FROM t CROSS JOIN generate_series(1, t.n)");
   assert.equal(out.kind, "query");
   if (out.kind !== "query") return;
   assert.equal(out.rows.length, 3);
@@ -81,7 +81,7 @@ test("generated_row cost and the maxCost ceiling", () => {
 
 test("mixed-width promotes to the wider type", () => {
   const db = memDb().session();
-  const out = db.execute("SELECT * FROM generate_series(CAST(1 AS i16), CAST(5 AS i32))");
+  const out = queryOutcome(db, "SELECT * FROM generate_series(CAST(1 AS i16), CAST(5 AS i32))");
   assert.equal(out.kind, "query");
   if (out.kind !== "query") return;
   assert.deepStrictEqual(out.columnTypes, ["i32"]);

@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { EngineError, intValue } from "../src/tooling.ts";
-import type { Handle } from "./util.ts";
+import { type Handle, queryOutcome } from "./util.ts";
 import { memDb } from "./mem_db.ts";
 
 function code(fn: () => unknown): string {
@@ -21,7 +21,7 @@ function code(fn: () => unknown): string {
 }
 
 function countRows(db: Handle): unknown {
-  const out = db.execute("SELECT count(*) FROM t");
+  const out = queryOutcome(db, "SELECT count(*) FROM t");
   if (out.kind !== "query") throw new Error("expected a query result");
   return out.rows;
 }
@@ -128,7 +128,7 @@ test("additional session runs a script over the shared core", () => {
   const s = db.session({});
   const summary = s.executeScript("INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)");
   assert.strictEqual(summary.statementsRun, 2);
-  const o = a.execute("SELECT count(*) FROM t");
+  const o = queryOutcome(a, "SELECT count(*) FROM t");
   if (o.kind !== "query") throw new Error("expected a query result");
   assert.deepStrictEqual(o.rows, [[intValue(2n)]]);
   assert.strictEqual(a.status(), "Idle");

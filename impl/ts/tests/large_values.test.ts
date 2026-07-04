@@ -11,8 +11,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { loadEngine } from "../src/format.ts";
-import { Database, Session, createDatabase, openDatabase } from "../src/tooling.ts";
-import { type Handle, fillerText } from "./util.ts";
+import { Database, type Session, createDatabase, openDatabase } from "../src/tooling.ts";
+import { type Handle, fillerText, queryOutcome } from "./util.ts";
 import { memDb } from "./mem_db.ts";
 
 const PAGE_OVERFLOW = 4; // page_type for an overflow slab (large-values.md §12)
@@ -27,7 +27,7 @@ function countPageType(image: Uint8Array, ps: number, ty: number): number {
 
 // rowsOf runs a SELECT and returns the rows (asserting it is a query).
 function rowsOf(db: Handle, sql: string) {
-  const o = db.execute(sql);
+  const o = queryOutcome(db, sql);
   assert.equal(o.kind, "query");
   if (o.kind !== "query") throw new Error("expected a query");
   return o.rows;

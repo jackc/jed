@@ -8,31 +8,70 @@
 // worker is the one other internal consumer; it deep-imports executor.ts/opfs.ts/parser.ts directly
 // (the Node-`fs`-free seam, hosts.md §5) rather than through here.
 
-import type { Outcome } from "./executor.ts";
-import type { Engine } from "./executor.ts";
+import type { Rows } from "./api.ts";
+import type { Engine, Outcome } from "./executor.ts";
 import type { ScriptSummary } from "./split.ts";
 import type { Value } from "./value.ts";
 
 // The entire public embedding API.
 export * from "./lib.ts";
 
+// `Outcome` is dropped from the public ./lib.ts export (the public seam is `query -> Rows`), but the
+// core's internal statement result stays nameable here — the conformance harness, benches, and unit
+// tests render/assert against it (the analogue of Rust's `pub(crate) Outcome` reachable in-crate).
+export type { Outcome } from "./executor.ts";
+
 // The low-level handle + its functional API (every helper whose signature names `Engine`), plus the
 // golden/byte tooling. Kept out of ./lib.ts so the public surface is the converged handles only.
 export { Engine } from "./executor.ts";
 export { loadEngine, toImage } from "./format.ts";
 export { create, open, commit, rollback, close } from "./file.ts";
+import { query } from "./api.ts";
 export { begin, prepare, query, querySql, update, view } from "./api.ts";
 
-// execute parses and executes one SQL statement against a low-level `Engine` (no bind parameters).
-export function execute(db: Engine, sql: string): Outcome {
-  return db.executeStmt(db.parse(sql));
+// drainOutcome pulls a total-`query` cursor to exhaustion and packages the result set + command tag as
+// an Outcome — the shape the removed `execute -> Outcome` API returned, but built over the seam callers
+// actually use (CLAUDE.md §10: tests assert on the real `query` seam, not a parallel exec path). A
+// cursor carrying output columns is a query; a no-column cursor IS a non-query statement (the total-
+// `query` contract). Cost + rows-affected are read after the drain (a streaming cursor accrues cost as
+// it is pulled), and the pin is released via close().
+export function drainOutcome(rows: Rows): Outcome {
+  const columnNames = rows.columnNames;
+  const columnTypes = rows.columnTypes;
+  const collected: Value[][] = [];
+  for (const row of rows) collected.push(row);
+  const cost = rows.cost;
+  const rowsAffected = rows.rowsAffected;
+  rows.close();
+  if (columnNames.length > 0) {
+    return { kind: "query", columnNames, columnTypes, rows: collected, cost };
+  }
+  return { kind: "statement", cost, rowsAffected };
 }
 
-// executeParams parses and executes one SQL statement against a low-level `Engine`, binding params to
-// its $N placeholders (spec/design/api.md §5). A count mismatch is 42601; a parameter whose type cannot
-// be inferred is 42P18; a bound value out of range / of the wrong family fails like a literal.
+// queryOutcome runs sql through a handle's real `query` seam and materializes the cursor into an
+// Outcome (the white-box test/tooling helper — see drainOutcome). Works for any handle exposing the
+// total `query` seam (Database / Session / Transaction).
+export function queryOutcome(
+  handle: { query(sql: string, params: Value[]): Rows },
+  sql: string,
+  params: Value[] = [],
+): Outcome {
+  return drainOutcome(handle.query(sql, params));
+}
+
+// execute parses and runs one SQL statement against a low-level `Engine` (no bind parameters) and
+// materializes it into an Outcome, draining the total `query` seam.
+export function execute(db: Engine, sql: string): Outcome {
+  return drainOutcome(query(db, sql));
+}
+
+// executeParams parses and runs one SQL statement against a low-level `Engine`, binding params to its
+// $N placeholders (spec/design/api.md §5), materialized into an Outcome via the total `query` seam. A
+// count mismatch is 42601; a parameter whose type cannot be inferred is 42P18; a bound value out of
+// range / of the wrong family fails like a literal.
 export function executeParams(db: Engine, sql: string, params: Value[]): Outcome {
-  return db.executeStmtParams(db.parse(sql), params);
+  return drainOutcome(query(db, sql, params));
 }
 
 // executeScript runs a multi-statement SQL script against a low-level `Engine`'s default session

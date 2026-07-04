@@ -8,9 +8,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { EngineError } from "../src/errors.ts";
-import { Database, type Engine } from "../src/tooling.ts";
-import { loadEngine, toImage } from "../src/format.ts";
-import { type Handle, dbWith, errCode } from "./util.ts";
+import { Database } from "../src/tooling.ts";
+import { type Handle, dbWith, errCode, queryOutcome } from "./util.ts";
 
 function errInfo(fn: () => void): { code: string; message: string } {
   try {
@@ -237,13 +236,13 @@ test("the full expression surface works inside a check", () => {
 test("check evaluation is metered", () => {
   const db = dbWith(["CREATE TABLE c (a int CHECK (a > 0))"]);
   // One interior node (>) × one row.
-  let o = db.execute("INSERT INTO c VALUES (1)");
+  let o = queryOutcome(db, "INSERT INTO c VALUES (1)");
   assert.equal(o.cost, 1n);
   // Two rows × one node.
-  o = db.execute("INSERT INTO c VALUES (2), (3)");
+  o = queryOutcome(db, "INSERT INTO c VALUES (2), (3)");
   assert.equal(o.cost, 2n);
   // UPDATE: page_read(1) + 3×storage_row_read + 3×(a + 1) + 3×(a > 0) = 10.
-  o = db.execute("UPDATE c SET a = a + 1");
+  o = queryOutcome(db, "UPDATE c SET a = a + 1");
   assert.equal(o.cost, 10n);
   // The ceiling aborts mid-validation deterministically.
   db.setMaxCost(2n);

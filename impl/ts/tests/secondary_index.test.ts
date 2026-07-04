@@ -9,13 +9,19 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { Database, EngineError, Session, createDatabase, openDatabase } from "../src/tooling.ts";
-import type { Handle } from "./util.ts";
+import {
+  Database,
+  EngineError,
+  type Session,
+  createDatabase,
+  openDatabase,
+} from "../src/tooling.ts";
+import { type Handle, queryOutcome } from "./util.ts";
 import { pkIndices } from "../src/catalog.ts";
 import { memDb } from "./mem_db.ts";
 
 function run(db: Handle, sql: string) {
-  return db.execute(sql);
+  return queryOutcome(db, sql);
 }
 
 function cost(db: Handle, sql: string): bigint {

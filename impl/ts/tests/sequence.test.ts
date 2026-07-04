@@ -11,12 +11,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { EngineError, createDatabase, openDatabase } from "../src/tooling.ts";
-import type { Handle } from "./util.ts";
+import { type Handle, queryOutcome } from "./util.ts";
 import { memDb } from "./mem_db.ts";
 
 // oneInt runs a single-column SELECT and returns its one int value, or null for a NULL value.
 function oneInt(db: Handle, sql: string): bigint | null {
-  const o = db.execute(sql);
+  const o = queryOutcome(db, sql);
   if (o.kind !== "query") throw new Error(`expected a query, got ${o.kind}`);
   const v = o.rows[0]![0]!;
   if (v.kind === "int") return v.int;
@@ -210,7 +210,7 @@ test("setval/ALTER in read-only transaction is 25006", () => {
 
 // queryRows runs sql and returns its rows' int cells (throwing on a NULL/non-int cell).
 function queryRows(db: Handle, sql: string): bigint[][] {
-  const o = db.execute(sql);
+  const o = queryOutcome(db, sql);
   if (o.kind !== "query") throw new Error(`expected a query, got ${o.kind}`);
   return o.rows.map((r) =>
     r.map((v) => {

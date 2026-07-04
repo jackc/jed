@@ -16,9 +16,28 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadedCollation, versionSkew } from "../src/collation.ts";
-import { close, commit, create, Engine, execute, loadUnicodeData, open } from "../src/tooling.ts";
+import {
+  close,
+  commit,
+  create,
+  Engine,
+  execute,
+  loadUnicodeData,
+  open,
+  render,
+} from "../src/tooling.ts";
 import { specPath } from "./tomlmini.ts";
-import { errCode, query } from "./util.ts";
+import { errCode } from "./util.ts";
+
+// query renders a bare-`Engine` SELECT's rows. The shared util `query()` helper drives a `.query`-method
+// handle (Session/Database); the low-level `new Engine()` these host tests use runs through the tooling
+// free `execute` — the total `query` seam materialized into an Outcome (the executor↔api cycle keeps a
+// `.query` method off the bare Engine).
+function query(db: Engine, sql: string): string[][] {
+  const o = execute(db, sql);
+  if (o.kind !== "query") throw new Error(`expected a query result for ${sql}`);
+  return o.rows.map((r) => r.map(render));
+}
 
 // exec runs a statement (DDL / INSERT) whose outcome is not a query result.
 function exec(db: Engine, sql: string): void {

@@ -7,8 +7,8 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Session } from "../src/tooling.ts";
-import type { Handle } from "./util.ts";
+import type { Session } from "../src/tooling.ts";
+import { type Handle, queryOutcome } from "./util.ts";
 import type { Value } from "../src/value.ts";
 import { memDb } from "./mem_db.ts";
 
@@ -26,7 +26,7 @@ function joinTables(n: number): Session {
 }
 
 function cost(db: Handle, sql: string): bigint {
-  return db.execute(sql).cost;
+  return queryOutcome(db, sql).cost;
 }
 
 function intOf(v: Value): number {
@@ -35,7 +35,7 @@ function intOf(v: Value): number {
 }
 
 function ids(db: Handle, sql: string): number[] {
-  const o = db.execute(sql);
+  const o = queryOutcome(db, sql);
   if (o.kind !== "query") throw new Error("expected a query result");
   return o.rows.map((r) => intOf(r[0]!));
 }
