@@ -96,18 +96,20 @@ impl Engine {
         db.committed.txid = 1; // the initial empty image is committed as txid 1
         db.write_full_image()?; // lay down the from-scratch image; later commits are incremental
         // Adopt the just-written file as the open pager + buffer pool, so later commits write through
-        // the seam without re-opening (spec/design/pager.md). A freshly-created database has no rows,
-        // so nothing is `OnDisk` yet — tables built in this session stay resident until a reopen
-        // demand-pages them.
+        // the seam without re-opening (spec/design/pager.md). Tables built in this session bind this
+        // pager at creation (`Snapshot::store_paging`), so their committed leaves demote at each
+        // commit and fault back through the pool — same residency shape as after a reopen.
         let file = fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(path)
             .map_err(io_error)?;
-        db.paging = Some(SharedPaging::new(
+        let paging = SharedPaging::new(
             Pager::from_store(Box::new(FileBlockStore::new(file)))?,
             cache_leaves(DEFAULT_CACHE_BYTES, db.page_size),
-        ));
+        );
+        db.committed.set_store_paging(paging.clone());
+        db.paging = Some(paging);
         Ok(db)
     }
 

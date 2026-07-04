@@ -144,12 +144,15 @@ type snapshot struct {
 	// load, so a committed snapshot always carries a fresh, cross-core-identical tree a SELECT can
 	// descend. Never mutated in place (replaced wholesale on rebuild), so clone shallow-copies it.
 	gistTrees map[string]*gistTree
-	// storePaging is the per-domain MemoryBlockStore paging context a TEMP snapshot's stores attach to
-	// (spec/design/temp-tables.md §6, bplus-reshape.md): non-nil only for a session-local temp
-	// snapshot, so its tables ride the same pager + packed-leaf path as an in-memory database (compact,
-	// bounded, spill-ready) instead of a fully-resident decoded tree. nil for the main snapshot (its
-	// paging lives on the storage identity). Carried through clone() so a tx's tempWorking creates stores
-	// against the same domain page space. NEVER serialized (a temp snapshot never is).
+	// storePaging is this snapshot's domain paging context — the pager a store created IN-SESSION
+	// (putTableResolved / putIndexStore / putIndex) binds at creation, so it joins the post-commit
+	// residency flip (demoteCleanLeaves) instead of staying a fully-resident decoded tree forever.
+	// Every domain sets it: the main file/in-memory snapshot binds the storage identity's paging at
+	// load/create (format.go / file.go), a session-local temp snapshot its per-domain MemoryBlockStore
+	// pager (spec/design/temp-tables.md §6), an attachment its own storage's pager. nil only on a bare
+	// scratch engine that never persists. Stores loaded FROM a file attach the same pager individually
+	// at load; binding at creation is what covers the stores load never sees. Carried through clone()
+	// so a tx's working snapshot creates stores against the same domain page space. NEVER serialized.
 	storePaging *sharedPaging
 }
 
@@ -760,9 +763,10 @@ func (s *snapshot) putTableResolved(t *catTable, colTypes []colType, pageSize ui
 	s.bumpCatGen()
 	key := strings.ToLower(t.Name)
 	st := newTableStore(pagePayload(pageSize), colTypes)
-	// A temp snapshot rides a per-domain MemoryBlockStore pager (temp-tables.md §6): its stores demand-page
-	// like a file/in-memory database instead of staying fully-resident decoded. The main snapshot leaves
-	// storePaging nil (its stores attach the storage identity's paging on load).
+	// Bind the domain's pager (snapshot.storePaging) so the new store demand-pages like a loaded one:
+	// its committed leaves demote at each commit (demoteCleanLeaves) and fault back through the pool,
+	// instead of staying fully-resident decoded for the handle's lifetime. nil only on a bare scratch
+	// engine that never persists.
 	if s.storePaging != nil {
 		st.attachPaging(s.storePaging)
 	}
@@ -815,7 +819,11 @@ func (s *snapshot) storageBytes() uint64 {
 func (s *snapshot) putIndex(tableKey string, def indexDef, pageSize uint32) {
 	s.bumpCatGen()
 	nameKey := strings.ToLower(def.Name)
-	s.indexStores[nameKey] = newTableStore(pagePayload(pageSize), nil)
+	fresh := newTableStore(pagePayload(pageSize), nil)
+	if s.storePaging != nil {
+		fresh.attachPaging(s.storePaging) // bind the domain pager, like putTableResolved/putIndexStore
+	}
+	s.indexStores[nameKey] = fresh
 	old := s.tables[tableKey]
 	t := *old
 	pos := len(old.Indexes)
@@ -854,8 +862,8 @@ func (s *snapshot) setColumnDefaultExpr(tableKey string, column int, de *default
 // loader's hook (format.go): the owning table's Indexes list came from its catalog entry,
 // so only the store is registered here.
 func (s *snapshot) putIndexStore(nameKey string, store *tableStore) {
-	// A temp snapshot's index stores ride the same per-domain MemoryBlockStore pager as its tables
-	// (temp-tables.md §6); the main snapshot leaves storePaging nil.
+	// An index store created in-session binds the domain's pager like a table store (putTableResolved)
+	// so it joins the post-commit residency flip; a store loaded from a file already attached it.
 	if s.storePaging != nil && store.paging == nil {
 		store.attachPaging(s.storePaging)
 	}

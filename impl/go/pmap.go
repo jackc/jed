@@ -37,8 +37,10 @@ import (
 type pnode struct {
 	keys [][]byte
 	// The decoded value rows — populated for a Decoded LEAF (a writer's transient
-	// materialize-mutate-repack buffer, or an in-memory-created table), nil for a Packed leaf
-	// (which reconstructs on demand from packed) and for every INTERIOR node (record-free, v24).
+	// materialize-mutate-repack buffer; the post-commit residency flip demotes it once persisted,
+	// so Decoded survives a commit only in a root leaf, a GiST leaf-key store, or a bare scratch
+	// engine), nil for a Packed leaf (which reconstructs on demand from packed) and for every
+	// INTERIOR node (record-free, v24).
 	// Read only through the rowAt / colAt / decodedRows seam, never indexed directly, so the two
 	// leaf forms are interchangeable (packed-leaf.md §3/§4).
 	vals     []storedRow

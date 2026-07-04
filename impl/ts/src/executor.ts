@@ -936,13 +936,16 @@ export class Snapshot {
   // content-deterministic, gist.md §3) at every mutating statement and on load. Never mutated in
   // place (replaced wholesale on rebuild), so clone shallow-copies it.
   gistTrees: Map<string, GistTree> = new Map();
-  // storePaging is the per-domain MemoryBlockStore paging context a TEMP snapshot's stores attach to
-  // (spec/design/temp-tables.md §6, bplus-reshape.md): non-null only for a session-local (or, later,
-  // shared) temp snapshot, so its tables ride the same pager + packed-leaf path as an in-memory database
-  // (compact, bounded, spill-ready) instead of a fully-resident decoded tree. null for the main snapshot
-  // (its paging lives on the store, attached by the file/in-memory loader). Carried through clone() so a
-  // tx's tempWorking creates stores against the same domain page space. NEVER serialized (a temp snapshot
-  // never is).
+  // storePaging is this snapshot's domain paging context — the pager a store created IN-SESSION
+  // (putTableResolved / putIndexStore / putIndex) binds at creation, so it joins the post-commit
+  // residency flip (demoteCleanLeaves) instead of staying a fully-resident decoded tree forever.
+  // Every domain sets it: the main file/in-memory snapshot binds the storage identity's paging at
+  // load/create (format.ts / file.ts / opfs.ts), a session-local temp snapshot its per-domain
+  // MemoryBlockStore pager (spec/design/temp-tables.md §6), an attachment its own storage's pager.
+  // null only on a bare scratch engine that never persists. Stores loaded FROM a file attach the
+  // same pager individually at load; binding at creation is what covers the stores load never sees.
+  // Carried through clone() so a tx's working snapshot creates stores against the same domain page
+  // space. NEVER serialized.
   storePaging: SharedPaging | null = null;
 
   constructor(
@@ -1409,9 +1412,10 @@ export class Snapshot {
     this.bumpCatGen();
     const key = t.name.toLowerCase();
     const st = new TableStore(pagePayload(pageSize), colTypes);
-    // A temp snapshot rides a per-domain MemoryBlockStore pager (temp-tables.md §6): its stores demand-
-    // page like a file/in-memory database instead of staying fully-resident decoded. The main snapshot
-    // leaves storePaging null (its stores attach the storage identity's paging on load).
+    // Bind the domain's pager (Snapshot.storePaging) so the new store demand-pages like a loaded one:
+    // its committed leaves demote at each commit (demoteCleanLeaves) and fault back through the pool,
+    // instead of staying fully-resident decoded for the handle's lifetime. null only on a bare scratch
+    // engine that never persists.
     if (this.storePaging !== null) st.attachPaging(this.storePaging);
     this.stores.set(key, st);
     this.tables.set(key, t);
@@ -1456,7 +1460,10 @@ export class Snapshot {
   putIndex(tableKey: string, def: IndexDef, pageSize: number): void {
     this.bumpCatGen();
     const nameKey = def.name.toLowerCase();
-    this.indexStores.set(nameKey, new TableStore(pagePayload(pageSize), []));
+    const fresh = new TableStore(pagePayload(pageSize), []);
+    // Bind the domain pager, like putTableResolved / putIndexStore.
+    if (this.storePaging !== null) fresh.attachPaging(this.storePaging);
+    this.indexStores.set(nameKey, fresh);
     const old = this.tables.get(tableKey)!;
     let pos = old.indexes.length;
     for (let i = 0; i < old.indexes.length; i++) {
@@ -1486,8 +1493,8 @@ export class Snapshot {
   // loader's hook (format.ts): the owning table's indexes list came from its catalog
   // entry, so only the store is registered here.
   putIndexStore(nameKey: string, store: TableStore): void {
-    // A temp snapshot's index stores ride the same per-domain MemoryBlockStore pager as its tables
-    // (temp-tables.md §6); the main snapshot leaves storePaging null.
+    // An index store created in-session binds the domain's pager like a table store (putTableResolved)
+    // so it joins the post-commit residency flip; a store loaded from a file already attached it.
     if (this.storePaging !== null && !store.isFileBacked()) store.attachPaging(this.storePaging);
     this.indexStores.set(nameKey, store);
   }

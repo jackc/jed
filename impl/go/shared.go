@@ -540,7 +540,7 @@ func (db *Database) Attach(name string, source AttachSource, readOnly bool) erro
 			readOnly:  e.readOnly,
 			path:      e.path,
 		}
-		root = e.committed // its stores fault through st.paging (bound at load); storePaging stays nil
+		root = e.committed // its stores fault through st.paging; loadEnginePaged bound storePaging too
 	}
 	c := db.core
 	c.writeMu.Lock()

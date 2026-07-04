@@ -43,9 +43,9 @@ func create(path string, opts databaseOptions) (*engine, error) {
 		return nil, err
 	}
 	// Adopt the just-written file as the open pager + buffer pool, so later commits write through the
-	// seam without re-opening (spec/design/pager.md). A freshly-created database has no rows, so
-	// nothing is OnDisk yet — tables built in this session stay resident until a reopen demand-pages
-	// them.
+	// seam without re-opening (spec/design/pager.md). Tables built in this session bind this pager at
+	// creation (snapshot.storePaging), so their committed leaves demote at each commit and fault back
+	// through the pool — same residency shape as after a reopen.
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		return nil, ioError(err)
@@ -56,6 +56,7 @@ func create(path string, opts databaseOptions) (*engine, error) {
 		return nil, err
 	}
 	db.paging = newSharedPaging(p, cacheLeaves(defaultCacheBytes, db.pageSize))
+	db.committed.storePaging = db.paging
 	return db, nil
 }
 

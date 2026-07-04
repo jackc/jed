@@ -1,6 +1,7 @@
 package jed
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"path/filepath"
@@ -301,4 +302,104 @@ func TestRejectsPageSizeBelowFloor(t *testing.T) {
 	if got := ee.Message; !strings.Contains(got, "too small") {
 		t.Fatalf("message should name the cause, got %q", got)
 	}
+}
+
+// countLeafForms walks a committed table's B+tree and tallies leaf residency forms: Decoded
+// (vals resident), Packed (block-backed), and OnDisk (demoted references).
+func countLeafForms(st *tableStore) (decoded, packed, ondisk int) {
+	var walk func(n *pnode)
+	walk = func(n *pnode) {
+		if n.isLeaf() {
+			if n.packed != nil {
+				packed++
+			} else {
+				decoded++
+			}
+			return
+		}
+		for _, c := range n.children {
+			if c.node == nil {
+				ondisk++
+			} else {
+				walk(c.node)
+			}
+		}
+	}
+	if root := st.treeRoot(); root != nil {
+		walk(root)
+	}
+	return
+}
+
+// TestInSessionTableJoinsResidencyFlip pins the storePaging-at-creation contract: a table CREATEd
+// in this session (never loaded from a file) binds the domain pager at creation, so the post-commit
+// residency flip demotes its committed leaves — an in-memory database (which never reopens) must not
+// keep every table fully-resident decoded for the handle's lifetime, and a file-backed database must
+// take the same shape in its creating session as after a reopen.
+func TestInSessionTableJoinsResidencyFlip(t *testing.T) {
+	run := func(t *testing.T, db *Database) {
+		if _, err := db.ExecuteScript("CREATE TABLE t (k i32 PRIMARY KEY, v i32)"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecuteScript("CREATE INDEX t_v ON t (v)"); err != nil {
+			t.Fatal(err)
+		}
+		// 200 rows at page size 256 → a multi-leaf tree; autocommit runs the flip on every commit.
+		for k := 0; k < 200; k++ {
+			if _, err := db.ExecuteScript(fmt.Sprintf("INSERT INTO t VALUES (%d, %d)", k, k*2)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		snap := db.core.roots.Load().committed
+		st := snap.stores["t"]
+		if st.paging == nil {
+			t.Fatal("an in-session-created table store should bind the domain pager at creation")
+		}
+		if ix := snap.indexStores["t_v"]; ix == nil || ix.paging == nil {
+			t.Fatal("an in-session-created index store should bind the domain pager at creation")
+		}
+		decoded, packed, ondisk := countLeafForms(st)
+		// The root leaf stays resident by the pMap convention; every other committed leaf must have
+		// demoted. A multi-leaf tree therefore has OnDisk children and no Decoded leaf at all (the
+		// root is interior); nothing should be resident-Packed right after a commit (packed forms
+		// arise on fault, and the flip demoted the just-written Decoded forms).
+		if ondisk == 0 {
+			t.Fatalf("expected a multi-leaf demoted tree, got decoded=%d packed=%d ondisk=%d", decoded, packed, ondisk)
+		}
+		if decoded != 0 {
+			t.Fatalf("committed leaves should demote after the flip, got decoded=%d packed=%d ondisk=%d", decoded, packed, ondisk)
+		}
+		// Reads fault the demoted leaves back through the pool and still see every row.
+		rows, err := db.Query(context.Background(), "SELECT count(*), sum(v) FROM t")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		var n, sum int64
+		if !rows.Next() {
+			t.Fatal("no row")
+		}
+		if err := rows.Scan(&n, &sum); err != nil {
+			t.Fatal(err)
+		}
+		if n != 200 || sum != 39800 {
+			t.Fatalf("count=%d sum=%d", n, sum)
+		}
+	}
+	t.Run("in-memory", func(t *testing.T) {
+		db, err := CreateDatabase(CreateOptions{PageSize: 256})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		run(t, db)
+	})
+	t.Run("file-create-session", func(t *testing.T) {
+		db, err := CreateDatabase(CreateOptions{Path: filepath.Join(t.TempDir(), "flip.jed"), PageSize: 256})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		run(t, db)
+	})
 }

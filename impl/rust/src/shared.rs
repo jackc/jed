@@ -2258,3 +2258,103 @@ mod temp_reclaim_internal_tests {
         let _ = std::fs::remove_file(&path);
     }
 }
+
+#[cfg(test)]
+mod residency_flip_tests {
+    //! The storePaging-at-creation contract (bplus-reshape.md B4): a table CREATEd in this session
+    //! (never loaded from a file) binds the domain pager at creation, so the post-commit residency
+    //! flip demotes its committed leaves — an in-memory database (which never reopens) must not keep
+    //! every table fully-resident decoded for the handle's lifetime, and a file-backed database must
+    //! take the same shape in its creating session as after a reopen. Mirrors the Go
+    //! TestInSessionTableJoinsResidencyFlip and the TS residency_flip test.
+
+    use super::*;
+    use crate::pmap::{Child, Node};
+
+    /// Tally a committed table tree's leaf residency forms: Decoded (vals resident), Packed
+    /// (block-backed), and OnDisk (demoted references).
+    fn count_leaf_forms(root: &Node) -> (usize, usize, usize) {
+        fn walk(n: &Node, acc: &mut (usize, usize, usize)) {
+            if n.is_leaf() {
+                if n.packed.is_some() {
+                    acc.1 += 1;
+                } else {
+                    acc.0 += 1;
+                }
+                return;
+            }
+            for c in &n.children {
+                match c {
+                    Child::OnDisk(_) => acc.2 += 1,
+                    Child::Resident(child) => walk(child, acc),
+                }
+            }
+        }
+        let mut acc = (0, 0, 0);
+        walk(root, &mut acc);
+        acc
+    }
+
+    fn run(db: &mut Database) {
+        db.execute_script("CREATE TABLE t (k i32 PRIMARY KEY, v i32)")
+            .unwrap();
+        db.execute_script("CREATE INDEX t_v ON t (v)").unwrap();
+        // 200 rows at page size 256 → a multi-leaf tree; autocommit runs the flip on every commit.
+        for k in 0..200 {
+            db.execute_script(&format!("INSERT INTO t VALUES ({k}, {})", k * 2))
+                .unwrap();
+        }
+        let snap = db.0.pin();
+        let st = snap.store("t");
+        assert!(
+            st.is_file_backed(),
+            "an in-session-created table store should bind the domain pager at creation"
+        );
+        assert!(
+            snap.index_store("t_v").is_file_backed(),
+            "an in-session-created index store should bind the domain pager at creation"
+        );
+        let (decoded, packed, ondisk) = count_leaf_forms(st.tree_root().expect("t is non-empty"));
+        // The root leaf stays resident by the PMap convention; every other committed leaf must have
+        // demoted. A multi-leaf tree therefore has OnDisk children and no Decoded leaf at all (the
+        // root is interior); nothing should be resident-Packed right after a commit (packed forms
+        // arise on fault, and the flip demoted the just-written Decoded forms).
+        assert!(
+            ondisk > 0,
+            "expected a multi-leaf demoted tree, got decoded={decoded} packed={packed} ondisk={ondisk}"
+        );
+        assert_eq!(
+            decoded, 0,
+            "committed leaves should demote after the flip (packed={packed} ondisk={ondisk})"
+        );
+        // Reads fault the demoted leaves back through the pool and still see every row.
+        let mut rows = db.query("SELECT count(*), sum(v) FROM t", &[]).unwrap();
+        let row = rows.next().expect("one row");
+        assert_eq!(row[0], Value::Int(200));
+        assert_eq!(row[1], Value::Int(39800));
+    }
+
+    #[test]
+    fn in_memory_table_joins_residency_flip() {
+        let mut db = Database::create(CreateOptions {
+            page_size: 256,
+            ..CreateOptions::default()
+        })
+        .unwrap();
+        run(&mut db);
+    }
+
+    #[test]
+    fn file_create_session_table_joins_residency_flip() {
+        let path = std::env::temp_dir().join("jed_residency_flip.jed");
+        let _ = std::fs::remove_file(&path);
+        let mut db = Database::create(CreateOptions {
+            path: Some(path.clone()),
+            page_size: 256,
+        })
+        .unwrap();
+        run(&mut db);
+        db.close().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+}

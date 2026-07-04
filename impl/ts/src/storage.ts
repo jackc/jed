@@ -419,8 +419,10 @@ export class TableStore {
 
   // demoteCleanLeaves demotes this store's clean, persisted resident leaves to OnDisk references —
   // the post-commit residency flip (bplus-reshape.md B4; pmap.ts PMap.demoteCleanLeaves). A no-op
-  // for a store whose nodes were never persisted (a GiST leaf-key store, a bare scratch engine).
-  // Only meaningful on a paged store — the flipped leaves fault back through the pool.
+  // for a store whose nodes were never persisted (a GiST leaf-key store — its on-disk form is the
+  // R-tree, so its PMap nodes keep page 0 — or a bare scratch engine). A store created in-session
+  // bound the domain pager at creation (Snapshot.storePaging), so it flips like a loaded one; the
+  // flipped leaves fault back through the pool.
   demoteCleanLeaves(): void {
     if (this.paging !== null) this.rows.demoteCleanLeaves();
   }

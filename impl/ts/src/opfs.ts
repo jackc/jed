@@ -57,6 +57,9 @@ export function createOpfsWithHandle(handle: SyncAccessHandle, opts: DatabaseOpt
     Pager.fromStore(new OpfsBlockStore(handle)),
     cacheLeaves(DEFAULT_CACHE_BYTES, db.pageSize),
   );
+  // Tables built in this session bind this pager at creation (Snapshot.storePaging), so their
+  // committed leaves demote at each commit — same residency shape as after a reopen (file.ts create).
+  db.committed.storePaging = db.paging;
   return db;
 }
 

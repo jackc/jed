@@ -301,13 +301,17 @@ pub struct Snapshot {
     /// (the tree is replaced wholesale on rebuild, never mutated in place). The on-disk form is the
     /// persisted R-tree (page types 5/6); this in-memory tree is rebuilt from the loaded leaf store.
     gist_trees: HashMap<String, std::sync::Arc<crate::gist::GistTree>>,
-    /// The per-domain `MemoryBlockStore` paging context a TEMP snapshot's stores attach to
-    /// (spec/design/temp-tables.md §6, bplus-reshape.md): `Some` only for a session-local (or, later,
-    /// shared) temp snapshot, so its tables ride the same pager + packed-leaf path as an in-memory
-    /// database (compact, bounded, spill-ready) instead of a fully-resident decoded tree. `None` for the
-    /// main snapshot (its paging lives on the store, attached by the file/in-memory loader). Rides
-    /// `#[derive(Clone)]` (an `Arc` bump) so a tx's `temp_working` creates stores against the same domain
-    /// page space, and `#[derive(Default)]` (`None`). NEVER serialized (a temp snapshot never is).
+    /// This snapshot's domain paging context — the pager a store created IN-SESSION
+    /// (`put_table_resolved` / `put_index_store` / `put_index`) binds at creation, so it joins the
+    /// post-commit residency flip (`demote_clean_leaves`) instead of staying a fully-resident decoded
+    /// tree forever. Every domain sets it: the main file/in-memory snapshot binds the storage
+    /// identity's paging at load/create (format.rs / file.rs), a session-local temp snapshot its
+    /// per-domain `MemoryBlockStore` pager (spec/design/temp-tables.md §6), an attachment its own
+    /// storage's pager. `None` only on a bare scratch engine that never persists. Stores loaded FROM
+    /// a file attach the same pager individually at load; binding at creation is what covers the
+    /// stores load never sees. Rides `#[derive(Clone)]` (an `Arc` bump) so a tx's working snapshot
+    /// creates stores against the same domain page space, and `#[derive(Default)]` (`None`).
+    /// NEVER serialized.
     store_paging: Option<std::sync::Arc<crate::paging::SharedPaging>>,
 }
 
@@ -914,9 +918,10 @@ impl Snapshot {
         let key = table.name.to_ascii_lowercase();
         let cap = crate::format::page_payload(page_size);
         let mut st = TableStore::new(cap, col_types);
-        // A temp snapshot rides a per-domain `MemoryBlockStore` pager (temp-tables.md §6): its stores
-        // demand-page like a file/in-memory database instead of staying fully-resident decoded. The main
-        // snapshot leaves `store_paging` `None` (its stores attach the storage identity's paging on load).
+        // Bind the domain's pager (`Snapshot::store_paging`) so the new store demand-pages like a
+        // loaded one: its committed leaves demote at each commit (`demote_clean_leaves`) and fault
+        // back through the pool, instead of staying fully-resident decoded for the handle's lifetime.
+        // `None` only on a bare scratch engine that never persists.
         if let Some(paging) = &self.store_paging {
             st.attach_paging(paging.clone());
         }
@@ -973,8 +978,12 @@ impl Snapshot {
         self.bump_cat_gen();
         let name_key = def.name.to_ascii_lowercase();
         let cap = crate::format::page_payload(page_size);
-        self.index_stores
-            .insert(name_key.clone(), TableStore::new(cap, Vec::new()));
+        let mut fresh = TableStore::new(cap, Vec::new());
+        if let Some(paging) = &self.store_paging {
+            // Bind the domain pager, like put_table_resolved / put_index_store.
+            fresh.attach_paging(paging.clone());
+        }
+        self.index_stores.insert(name_key.clone(), fresh);
         let table = self.tables.get_mut(table_key).expect("table exists");
         let pos = table
             .indexes
@@ -1006,8 +1015,9 @@ impl Snapshot {
     /// (format.rs): the owning table's `indexes` list came from its catalog entry, so only
     /// the store is registered here.
     pub(crate) fn put_index_store(&mut self, name_key: String, mut store: TableStore) {
-        // A temp snapshot's index stores ride the same per-domain `MemoryBlockStore` pager as its tables
-        // (temp-tables.md §6); the main snapshot leaves `store_paging` `None`.
+        // An index store created in-session binds the domain's pager like a table store
+        // (put_table_resolved) so it joins the post-commit residency flip; a store loaded from a
+        // file already attached it.
         if let Some(paging) = &self.store_paging {
             if !store.is_file_backed() {
                 store.attach_paging(paging.clone());

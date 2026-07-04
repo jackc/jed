@@ -42,6 +42,17 @@
 > watermark needs the storage core-owned), which the `Decoded` residency arm keeps alive anyway (it is
 > the writer's scratch form and every uncommitted read-your-writes view). The deferred temp
 > spill-to-disk seam stays a `BlockStore` swap exactly as §3 planned.
+> **A post-landing fix (2026-07-04) closed the in-session-created-store hole in B4:** a store
+> created in-session on the main domain (`CREATE TABLE`/`CREATE INDEX` — which is *every* table of
+> an in-memory database, and every table a file's creating session builds before its first reopen)
+> bound no pager, so the flip no-opped on it and its committed tree stayed fully-resident `Decoded`
+> for the handle's lifetime — an in-memory database paid for BOTH the packed page image its commits
+> write and the decoded tree. The fix binds the domain's pager at store creation through
+> `Snapshot.storePaging` (the seam formerly named `tempPaging` — temp and in-memory attachments
+> already bound through it; the main domain now does too, set at load/create), so an
+> in-session-created store demotes at each commit exactly like a loaded one. Binding at creation
+> (not at flip time) keeps the flip race-free: a store wrapper shared with an older pinned snapshot
+> is never written after publish.
 > Supersedes the "in-memory path deliberately
 > left separate" carve-outs in [hosts.md §7](hosts.md) and [lazy-record.md §4/§11/§12](lazy-record.md),
 > and the B-tree shape decided in [transactions.md §3](transactions.md). Absorbs the PAX

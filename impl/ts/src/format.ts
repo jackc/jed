@@ -2482,6 +2482,9 @@ export function loadEnginePaged(paging: SharedPaging): Engine {
   }
   db.committed = snap;
   db.paging = paging;
+  // Stores created in a LATER session bind this same pager at creation (Snapshot.storePaging), so
+  // they join the post-commit residency flip like the loaded stores attached above.
+  snap.storePaging = paging;
   return db;
 }
 

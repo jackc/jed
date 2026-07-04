@@ -1519,6 +1519,9 @@ func loadEnginePaged(pgr *pager, capacity int) (*engine, error) {
 	}
 	db.committed = snap
 	db.paging = paging
+	// Stores created in a LATER session bind this same pager at creation (snapshot.storePaging), so
+	// they join the post-commit residency flip like the loaded stores attached above.
+	snap.storePaging = paging
 	return db, nil
 }
 

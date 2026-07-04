@@ -46,7 +46,8 @@ use crate::value::Value;
 /// node — a dirty/uncommitted node, a resident interior skeleton node (interior nodes are *always*
 /// resident, §1), or a leaf currently materialized. Because only **leaves** are paged, an `OnDisk`
 /// child is always a leaf — which is exactly what lets `node_count` (cost §5) be computed without
-/// loading any leaf. An in-memory database constructs no `OnDisk` child (it is fully resident).
+/// loading any leaf. Since B3 every host demand-pages — an in-memory database's committed
+/// leaves demote to `OnDisk` children too, faulting back through its pinned pool.
 #[derive(Clone)]
 pub(crate) enum Child {
     Resident(Arc<Node>),
@@ -96,8 +97,10 @@ fn child(node: &Node, i: usize, src: Option<&dyn LeafSource>) -> Result<Arc<Node
 /// behind `Arc`; a mutation clones only the root→leaf path and shares every untouched subtree.
 pub(crate) struct Node {
     pub(crate) keys: Vec<Vec<u8>>,
-    /// The decoded value rows, one per key — populated for a **Decoded leaf** (in-memory /
-    /// mutated / dirty), **empty** for a **Packed** leaf (which reconstructs on demand from
+    /// The decoded value rows, one per key — populated for a **Decoded leaf** (a writer's
+    /// transient materialize-mutate-repack buffer; the post-commit residency flip demotes it once
+    /// persisted, so Decoded survives a commit only in a root leaf, a GiST leaf-key store, or a
+    /// bare scratch engine), **empty** for a **Packed** leaf (which reconstructs on demand from
     /// `packed`) and for every **interior** node (record-free, v24). Read only through the
     /// [`row_at`](Node::row_at) / [`col_at`](Node::col_at) / [`with_row`](Node::with_row) /
     /// [`decoded_rows`](Node::decoded_rows) seam on leaves, never indexed directly.

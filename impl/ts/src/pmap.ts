@@ -46,7 +46,9 @@ export interface PackedLeaf {
 export type PNode = {
   keys: Uint8Array[];
   // The decoded value rows — populated for a Decoded leaf (the writer's transient
-  // materialize-mutate-repack scratch, bplus-reshape.md §5), empty for a Packed leaf (which
+  // materialize-mutate-repack scratch, bplus-reshape.md §5; the post-commit residency flip demotes
+  // it once persisted, so Decoded survives a commit only in a root leaf, a GiST leaf-key store, or
+  // a bare scratch engine), empty for a Packed leaf (which
   // reconstructs on demand from `packed`) and for EVERY interior node (record-free, v24). Read only
   // through the rowAt / colAt / decodedRows seam on leaves, never indexed directly, so the two leaf
   // forms are interchangeable (packed-leaf.md §3/§4).

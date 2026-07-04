@@ -1860,6 +1860,9 @@ impl Engine {
             .filter(|p| !reached.contains(p))
             .collect();
         db.committed = snap;
+        // Stores created in a LATER session bind this same pager at creation (Snapshot::store_paging),
+        // so they join the post-commit residency flip like the loaded stores attached above.
+        db.committed.set_store_paging(paging.clone());
         db.paging = Some(paging);
         Ok(db)
     }

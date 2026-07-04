@@ -52,8 +52,9 @@ export function create(path: string, opts: DatabaseOptions = {}): Engine {
   db.persistHook = persistImpl; // publish each later commit incrementally (transactions.md §4.1/§9)
   writeFullImage(db); // lay down the from-scratch image; later commits are incremental
   // Adopt the just-written file as the open pager + buffer pool, so later commits write through the
-  // seam without re-opening (spec/design/pager.md). A freshly-created database has no rows, so nothing
-  // is OnDisk yet — tables built in this session stay resident until a reopen demand-pages them.
+  // seam without re-opening (spec/design/pager.md). Tables built in this session bind this pager at
+  // creation (Snapshot.storePaging), so their committed leaves demote at each commit and fault back
+  // through the pool — same residency shape as after a reopen.
   let fd: number;
   try {
     fd = openSync(path, "r+");
@@ -64,6 +65,7 @@ export function create(path: string, opts: DatabaseOptions = {}): Engine {
     Pager.fromStore(new FileBlockStore(fd)),
     cacheLeaves(DEFAULT_CACHE_BYTES, db.pageSize),
   ); // valid header
+  db.committed.storePaging = db.paging;
   db.spillSink = new FileSpillSink(dirname(path)); // ORDER BY spills next to the database file (spill.md §4)
   return db;
 }
