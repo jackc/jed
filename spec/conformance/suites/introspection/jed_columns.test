@@ -1,0 +1,238 @@
+# The jed_columns catalog relation (spec/design/introspection.md §5, slice I1): one row per column
+# of every USER table of the qualified database — table_name / name / ordinal (1-based, CREATE
+# TABLE order) / type (the CANONICAL type text) / not_null (declared NOT NULL or PRIMARY KEY
+# member) / pk_ordinal (1-based position in the PRIMARY KEY in KEY order; NULL for a non-member).
+# The canonical `type` text is a COMPATIBILITY SURFACE from the moment it ships — this file pins
+# every renderable type: the scalar canonical names, the typmods applied at the leaf (varchar(10),
+# decimal(8,2) — including through an array element: varchar(5)[]), a composite's name as created,
+# a range's canonical id, `[]` per array. Growth of the relation is by ADDING columns — consumers
+# select by name, never `SELECT *` positionally. Scoping / read-only / privileges / cost are the
+# same model as jed_tables (pinned there). jed-specific, so CROSS-CORE-checked, NOT
+# PostgreSQL-oracle-checked.
+# requires: introspect.columns, introspect.tables, ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.not_null, dml.insert, query.select, query.where_eq, query.order_by, query.join_inner, query.aggregates, resource.cost_metering, types.i16, types.i32, types.i64, types.text, types.varchar_length, types.boolean_storable, types.decimal, types.bytea, types.uuid, types.timestamp, types.timestamptz, types.interval, types.f32, types.f64, types.date, types.json, types.jsonb, types.composite, types.array, types.array_composite, types.range
+
+# --- an empty database yields no column rows ------------------------------------------------------
+
+query T rowsort
+SELECT name FROM jed_columns
+----
+
+# --- the full scalar surface: one column per canonical type text ----------------------------------
+
+statement ok
+CREATE TABLE scalars (
+  a i16,
+  b i32,
+  c i64,
+  d text,
+  e varchar(10),
+  f boolean,
+  g decimal,
+  h decimal(8,2),
+  i bytea,
+  j uuid,
+  k timestamp,
+  l timestamptz,
+  m interval,
+  n f32,
+  o f64,
+  p date,
+  q json,
+  r jsonb
+)
+
+# aliases normalize to the canonical name (int → i32, character names → text, numeric → decimal)
+query ITT nosort
+SELECT ordinal, name, type FROM jed_columns WHERE table_name = 'scalars' ORDER BY ordinal
+----
+1
+a
+i16
+2
+b
+i32
+3
+c
+i64
+4
+d
+text
+5
+e
+varchar(10)
+6
+f
+boolean
+7
+g
+decimal
+8
+h
+decimal(8,2)
+9
+i
+bytea
+10
+j
+uuid
+11
+k
+timestamp
+12
+l
+timestamptz
+13
+m
+interval
+14
+n
+f32
+15
+o
+f64
+16
+p
+date
+17
+q
+json
+18
+r
+jsonb
+
+# PG-shorthand aliases render canonically too (int8 → i64, float4 → f32, numeric → decimal)
+statement ok
+CREATE TABLE aliased (x int8, y float4, z numeric(3,1))
+
+query TT nosort
+SELECT name, type FROM jed_columns WHERE table_name = 'aliased' ORDER BY ordinal
+----
+x
+i64
+y
+f32
+z
+decimal(3,1)
+
+# --- containers: arrays (typmod applies to the element), ranges, composites ----------------------
+
+statement ok
+CREATE TYPE addr AS (street text, zip i32)
+
+# (a typmod on an array's ELEMENT type — varchar(5)[] — is not constructible yet, 0A000; when the
+# narrowing lifts, the canonical rendering applies the typmod at the leaf: varchar(5)[].)
+statement ok
+CREATE TABLE containers (
+  a i32[],
+  b text[],
+  e i32range,
+  f i64range,
+  g numrange,
+  h tsrange,
+  i tstzrange,
+  j daterange,
+  k addr,
+  l addr[]
+)
+
+query TT nosort
+SELECT name, type FROM jed_columns WHERE table_name = 'containers' ORDER BY ordinal
+----
+a
+i32[]
+b
+text[]
+e
+i32range
+f
+i64range
+g
+numrange
+h
+tsrange
+i
+tstzrange
+j
+daterange
+k
+addr
+l
+addr[]
+
+# --- not_null: declared NOT NULL or PRIMARY KEY membership; pk_ordinal is KEY order --------------
+
+# the PK is declared (b, a) — key order differs from declaration order, and pk_ordinal follows the
+# KEY: b → 1, a → 2. PK members are not_null without an explicit NOT NULL.
+statement ok
+CREATE TABLE keyed (a i32, b i64, c text NOT NULL, d text, PRIMARY KEY (b, a))
+
+query TITBI nosort
+SELECT name, ordinal, type, not_null, pk_ordinal FROM jed_columns WHERE table_name = 'keyed' ORDER BY ordinal
+----
+a
+1
+i32
+true
+2
+b
+2
+i64
+true
+1
+c
+3
+text
+true
+NULL
+d
+4
+text
+false
+NULL
+
+# a no-PK table: the synthetic rowid is NOT a column — only declared columns appear
+statement ok
+CREATE TABLE nopk (x i32, y text)
+
+query TBI nosort
+SELECT name, not_null, pk_ordinal FROM jed_columns WHERE table_name = 'nopk' ORDER BY ordinal
+----
+x
+false
+NULL
+y
+false
+NULL
+
+# --- ordinary composition: joins against jed_tables, aggregation over the catalog ----------------
+
+query TI nosort
+SELECT t.name, count(*) FROM jed_tables t JOIN jed_columns c ON c.table_name = t.name GROUP BY t.name ORDER BY t.name
+----
+aliased
+3
+containers
+10
+keyed
+4
+nopk
+2
+scalars
+18
+
+# --- read-only, like jed_tables -------------------------------------------------------------------
+
+statement error 42809
+INSERT INTO jed_columns VALUES ('t', 'c', 1, 'i32', false, NULL)
+
+statement error 42809
+DROP TABLE jed_columns
+
+# --- cost: one generated_row per produced row (37 columns across the 5 tables), zero page_read ----
+
+# 37 generated_row + the aggregate fold + 1 output row; the catalog is resident, so no page is read.
+# cost: 75
+query I nosort
+SELECT count(*) FROM jed_columns
+----
+37

@@ -1,0 +1,181 @@
+# The jed_tables catalog relation (spec/design/introspection.md §5, slice I1): a read-only
+# COMPUTED relation — one row per USER table (`name text NOT NULL`, the canonical CREATE
+# TABLE-spelled name) — resolved like any table and scoped by the database qualifier (unqualified =
+# main). Rows derive at execution from the pinned catalog snapshot: no storage, self-excluding
+# (catalog relations list user objects only). Resolution order: a statement-local CTE shadows it
+# (PG-matching); it wins over the user catalog (the I0 reservation makes a collision impossible).
+# Read-only: DML / CREATE INDEX targets are 42809 `cannot modify system relation`, DROP TABLE is
+# 42809 `cannot drop system relation` (IF EXISTS does not suppress a kind rejection). Privileges:
+# gated exactly like a user table — per-table SELECT under the session envelope (42501). Cost: one
+# generated_row per produced row, ZERO page_read / storage_row_read (the catalog is resident by
+# construction). jed-specific (PostgreSQL has no jed_ catalog), so CROSS-CORE-checked, NOT
+# PostgreSQL-oracle-checked.
+# requires: introspect.tables, ddl.create_table, ddl.primary_key, ddl.drop_table, ddl.secondary_index, dml.insert, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.cte, query.join_inner, query.qualified_table, query.explain, query.aggregates, session.privileges, resource.cost_metering, types.i32, types.text
+
+# --- an empty database lists no tables (self-exclusion: jed_tables does not list itself) ----------
+
+query T rowsort
+SELECT name FROM jed_tables
+----
+
+statement ok
+CREATE TABLE items (id i32 PRIMARY KEY, label text)
+
+statement ok
+CREATE TABLE Orders (id i32 PRIMARY KEY)
+
+# --- one row per user table; `name` is the canonical CREATE TABLE-spelled name (case preserved) ---
+
+query T nosort
+SELECT name FROM jed_tables ORDER BY name
+----
+Orders
+items
+
+# resolution is case-insensitive, like any relation name (identifier resolution folds case)
+query T nosort
+SELECT name FROM JED_Tables ORDER BY name
+----
+Orders
+items
+
+# a FROM alias renames the RELATION, never its column (no single-column function-alias rule —
+# these are relations, not set-returning functions)
+query T nosort
+SELECT jt.name FROM jed_tables AS jt ORDER BY jt.name
+----
+Orders
+items
+
+# ordinary WHERE / projection over the computed rows
+query T nosort
+SELECT name FROM jed_tables WHERE name = 'items'
+----
+items
+
+# --- the qualifier scopes the relation: unqualified = main, main. is explicit -------------------
+
+query T nosort
+SELECT name FROM main.jed_tables ORDER BY name
+----
+Orders
+items
+
+# an unknown qualifier is 42P01, the ordinary attached-database wording
+statement error 42P01
+SELECT name FROM nope.jed_tables
+
+# --- DDL is reflected immediately (rows derive from the pinned snapshot at execution) ------------
+
+statement ok
+CREATE TABLE fleeting (id i32 PRIMARY KEY)
+
+query I nosort
+SELECT count(*) FROM jed_tables
+----
+3
+
+statement ok
+DROP TABLE fleeting
+
+query I nosort
+SELECT count(*) FROM jed_tables
+----
+2
+
+# --- a statement-local CTE SHADOWS the catalog relation (PG-matching resolution order) -----------
+
+query I nosort
+WITH jed_tables AS (SELECT 1 AS x) SELECT x FROM jed_tables
+----
+1
+
+# --- joins compose like any relation -------------------------------------------------------------
+
+query TT nosort
+SELECT a.name, b.name FROM jed_tables a JOIN jed_tables b ON a.name = b.name ORDER BY a.name
+----
+Orders
+Orders
+items
+items
+
+# --- read-only: every mutation / DDL target naming a catalog relation is rejected ---------------
+
+statement error 42809
+INSERT INTO jed_tables VALUES ('x')
+
+statement error 42809
+UPDATE jed_tables SET name = 'x'
+
+statement error 42809
+DELETE FROM jed_tables
+
+# case-insensitive, like resolution
+statement error 42809
+DELETE FROM JED_TABLES
+
+statement error 42809
+DROP TABLE jed_tables
+
+# IF EXISTS does not suppress a kind rejection (the relation exists)
+statement error 42809
+DROP TABLE IF EXISTS jed_tables
+
+statement error 42809
+CREATE INDEX i ON jed_tables (name)
+
+# CREATE of any jed_-prefixed name stays the I0 reservation (42939), not 42809
+statement error 42939
+CREATE TABLE jed_tables (a i32)
+
+# --- cost: one generated_row per produced row, zero page_read / storage_row_read ----------------
+
+# 2 tables: 2 generated_row + 2 row_produced = 4. No page is read — the catalog is resident.
+# cost: 4
+query T rowsort
+SELECT name FROM jed_tables
+----
+Orders
+items
+
+# a WHERE evaluates per generated row and only the survivor is produced: 2 generated_row +
+# 2 operator_eval + 2 × 4 varlen_compare (the text-equality byte scan, W−1 over the shorter
+# operand) + 1 row_produced = 13.
+# cost: 13
+query T nosort
+SELECT name FROM jed_tables WHERE name = 'items'
+----
+items
+
+# --- EXPLAIN: a Catalog Scan leaf carrying its database scope ------------------------------------
+
+query ITT nosort
+EXPLAIN SELECT name FROM jed_tables
+----
+0
+Catalog Scan jed_tables
+db=main
+
+# --- privileges: gated exactly like a user table (per-table SELECT under the envelope) -----------
+
+# an explicit-grant session without a grant on jed_tables cannot see the schema...
+# default_privileges: NONE
+statement error 42501
+SELECT name FROM jed_tables
+
+# ...a grant on the relation's own name opens exactly it
+# default_privileges: NONE
+# grant: SELECT ON jed_tables
+query T nosort
+SELECT name FROM jed_tables ORDER BY name
+----
+Orders
+items
+
+# the default-permissive envelope (ALL) sees it, like every table
+# default_privileges: ALL
+query I nosort
+SELECT count(*) FROM jed_tables
+----
+2

@@ -352,6 +352,15 @@ impl Snapshot {
             .collect()
     }
 
+    /// All tables in ascending lowercased-name order — a deterministic order with no map-iteration
+    /// leak (CLAUDE.md §8); the jed_tables / jed_columns generation order
+    /// (spec/design/introspection.md §5).
+    pub(crate) fn tables_sorted(&self) -> Vec<&Table> {
+        let mut keys: Vec<&String> = self.tables.keys().collect();
+        keys.sort();
+        keys.into_iter().map(|k| &self.tables[k]).collect()
+    }
+
     /// Look up a composite type definition by name (case-insensitive).
     pub fn composite_type(&self, name: &str) -> Option<&CompositeType> {
         self.types.get(&name.to_ascii_lowercase())
@@ -2088,6 +2097,29 @@ impl Engine {
         }
     }
 
+    /// Validate a catalog relation's database qualifier and return the scope string
+    /// `snap_for_scope` resolves at exec (introspection.md §5): `None` (unqualified) ⇒ `"main"`
+    /// (the implicit scope); `main`/`temp` pass; any other qualifier must name a host attachment
+    /// (else `42P01`, the check_table_qualifier wording). Unlike a user table there is no per-table
+    /// existence half — the relation exists in EVERY valid scope, so only the scope itself is
+    /// validated.
+    fn resolve_catalog_scope(&self, qualifier: Option<&str>) -> Result<String> {
+        let Some(q) = qualifier else {
+            return Ok("main".to_string());
+        };
+        let lq = q.to_ascii_lowercase();
+        if lq == "main" || lq == "temp" {
+            return Ok(lq);
+        }
+        if self.attach_read_snap(&lq).is_none() {
+            return Err(EngineError::new(
+                SqlState::UndefinedTable,
+                format!("database \"{q}\" is not attached"),
+            ));
+        }
+        Ok(lq)
+    }
+
     /// Resolve a table's catalog entry honoring an explicit database qualifier (attached-databases.md
     /// §3); a `None` scope keeps the bare temp-first walk.
     fn table_scoped(&self, scope: Option<&str>, name: &str) -> Option<&Table> {
@@ -3304,8 +3336,13 @@ impl Engine {
         for (name, priv_) in &req.tables {
             let key = name.to_ascii_lowercase();
             // Only a name that resolves to an existing catalog table is privilege-checked; a missing
-            // one is left to raise 42P01 in execution (existence before authorization).
-            if snap.table(&key).is_some() && !self.session.privileges.allows_table(&key, *priv_) {
+            // one is left to raise 42P01 in execution (existence before authorization). A built-in
+            // catalog relation (jed_tables / jed_columns) is gated exactly like a user table —
+            // per-table SELECT on its own name under the session envelope, no special case
+            // (introspection.md §5) — so an explicit-grant session sees the schema only if the host
+            // granted it.
+            let exists = is_catalog_rel_name(&key) || snap.table(&key).is_some();
+            if exists && !self.session.privileges.allows_table(&key, *priv_) {
                 return Err(EngineError::new(
                     SqlState::InsufficientPrivilege,
                     format!("permission denied for table {key}"),
@@ -4825,6 +4862,15 @@ impl Engine {
             if seen.contains(&key) {
                 continue; // already resolved this exact target (deduplicated)
             }
+            // A built-in catalog relation resolves BEFORE the user catalog (introspection.md §5),
+            // and a system relation cannot be dropped: 42809. IF EXISTS does not suppress this (the
+            // relation exists — this is a kind rejection, not a missing name).
+            if is_catalog_rel_name(&key) {
+                return Err(EngineError::new(
+                    SqlState::WrongObjectType,
+                    format!("cannot drop system relation \"{key}\""),
+                ));
+            }
             // Resolution walk: session-local temp → persistent. Preclude-overlaps keeps a name in at
             // most one scope, so this is just "where it lives" (temp-tables.md §3).
             let scope = if self.is_temp_table(name) {
@@ -4926,6 +4972,9 @@ impl Engine {
         // build below is scope-agnostic (the scoped `table`/`store`/`index_store_mut` funnels route by
         // the qualifier + resolution walk); only the catalog `put_index` write must target the owning
         // snapshot, so the routing happens there.
+        // A built-in catalog relation cannot be indexed (introspection.md §5): 42809, checked by
+        // NAME before qualifier validation, like the DML targets.
+        check_catalog_rel_write(&ci.table)?;
         // A DDL write to a READ-ONLY host attachment is 25006 before any work — checked BEFORE the
         // qualifier existence gate so a read-only attachment refuses the write deterministically (§4).
         self.check_attachment_writable(ci.db.as_deref())?;
@@ -5652,6 +5701,9 @@ impl Engine {
             returning,
         } = ins;
 
+        // A catalog relation is read-only (introspection.md §5): a DML target naming one is 42809,
+        // checked by NAME before qualifier validation (the built-in resolves in every database).
+        check_catalog_rel_write(&table)?;
         // A write to a READ-ONLY host attachment is 25006 before any I/O — checked BEFORE the qualifier
         // existence gate so a read-only attachment refuses the write deterministically (§4).
         self.check_attachment_writable(db.as_deref())?;
@@ -7202,6 +7254,9 @@ impl Engine {
     /// remove them. No WHERE deletes every row. Keys are collected before mutating
     /// so the map is not modified while iterating.
     fn execute_delete(&mut self, del: Delete, params: &[Value], ctx: CteCtx) -> Result<Outcome> {
+        // A catalog relation is read-only (introspection.md §5): a DML target naming one is 42809,
+        // checked by NAME before qualifier validation (the built-in resolves in every database).
+        check_catalog_rel_write(&del.table)?;
         // A write to a READ-ONLY host attachment is 25006 before any I/O — BEFORE the existence gate (§4).
         self.check_attachment_writable(del.db.as_deref())?;
         // Validate an optional database qualifier on the target (attached-databases.md §3).
@@ -7502,6 +7557,9 @@ impl Engine {
     /// traps `23505` (`<table>_pkey`). A duplicate target column traps `42701`. No WHERE
     /// updates every row.
     fn execute_update(&mut self, upd: Update, params: &[Value], ctx: CteCtx) -> Result<Outcome> {
+        // A catalog relation is read-only (introspection.md §5): a DML target naming one is 42809,
+        // checked by NAME before qualifier validation (the built-in resolves in every database).
+        check_catalog_rel_write(&upd.table)?;
         // A write to a READ-ONLY host attachment is 25006 before any I/O — BEFORE the existence gate (§4).
         self.check_attachment_writable(upd.db.as_deref())?;
         // Validate an optional database qualifier on the target (attached-databases.md §3).
@@ -9211,9 +9269,11 @@ impl Engine {
             .chain(sel.joins.iter().map(|j| &j.table))
             .collect();
         let mut synthetic: Vec<Box<Table>> = Vec::new();
-        // Per FROM item: `None` = a base table; `Some((synthetic_index, srf_args, kind, jt))` = an
-        // SRF (`jt` is the JSON_TABLE plan for a `JsonTable` kind, else `None`).
-        let mut srf_meta: Vec<Option<(usize, Vec<RExpr>, SrfKind, Option<Box<JtPlan>>)>> =
+        // Per FROM item: `None` = a base table; `Some((synthetic_index, srf_args, kind, jt, scope))`
+        // = an SRF or a computed catalog relation (`jt` is the JSON_TABLE plan for a `JsonTable`
+        // kind, else `None`; `scope` is the validated database scope of a `JedTables`/`JedColumns`
+        // catalog relation, else empty — introspection.md §5).
+        let mut srf_meta: Vec<Option<(usize, Vec<RExpr>, SrfKind, Option<Box<JtPlan>>, String)>> =
             Vec::with_capacity(from_items.len());
         // Per FROM item: the planned body of a DERIVED TABLE (grammar.md §42), else `None`.
         let mut derived_plans: Vec<Option<QueryPlan>> = Vec::with_capacity(from_items.len());
@@ -9304,7 +9364,7 @@ impl Engine {
                     .push(lateral_eligible && rargs.iter().any(|a| rexpr_references_outer(a, 0)));
                 synthetic.push(table);
                 let si = synthetic.len() - 1;
-                srf_meta.push(Some((si, rargs, kind, None)));
+                srf_meta.push(Some((si, rargs, kind, None, String::new())));
                 derived_meta.push(None);
                 derived_plans.push(None);
                 src = RelSrc::Synthetic(si);
@@ -9331,7 +9391,13 @@ impl Engine {
                     .push(lateral_eligible && rargs.iter().any(|a| rexpr_references_outer(a, 0)));
                 synthetic.push(table);
                 let si = synthetic.len() - 1;
-                srf_meta.push(Some((si, rargs, SrfKind::JsonTable, Some(Box::new(plan)))));
+                srf_meta.push(Some((
+                    si,
+                    rargs,
+                    SrfKind::JsonTable,
+                    Some(Box::new(plan)),
+                    String::new(),
+                )));
                 derived_meta.push(None);
                 derived_plans.push(None);
                 src = RelSrc::Synthetic(si);
@@ -9339,34 +9405,46 @@ impl Engine {
                 // A database-QUALIFIED name reaches its database's table directly
                 // (attached-databases.md §3): it never resolves to a CTE (a CTE has no database
                 // qualifier, so `main.x`/`temp.x` cannot name one) and the qualifier fixes the scope
-                // (no temp-vs-persistent shadow). Validate the qualifier, then resolve via the SCOPED
-                // funnel — a host attachment's table lives ONLY in its own snapshot, so the bare
-                // temp-first `table()` would 42P01 (Slice 1a's read-path bug); `main`/`temp` fall
-                // through by preclude-overlaps to the validated scope.
+                // (no temp-vs-persistent shadow). A built-in catalog relation resolves in EVERY
+                // database's relation namespace (temp.jed_tables, reports.jed_tables —
+                // introspection.md §5), before the user catalog; only the qualifier itself needs
+                // validating. Otherwise validate the qualifier, then resolve via the SCOPED funnel —
+                // a host attachment's table lives ONLY in its own snapshot, so the bare temp-first
+                // `table()` would 42P01 (Slice 1a's read-path bug); `main`/`temp` fall through by
+                // preclude-overlaps to the validated scope.
                 lateral_flags.push(false);
-                srf_meta.push(None);
                 derived_meta.push(None);
                 derived_plans.push(None);
-                self.check_table_qualifier(tref.db.as_deref(), &tref.name)?;
-                src = RelSrc::Base(
-                    self.table_scoped(tref.db.as_deref(), &tref.name)
-                        .ok_or_else(|| {
-                            EngineError::new(
-                                SqlState::UndefinedTable,
-                                format!(
-                                    "table does not exist: {}.{}",
-                                    tref.db.as_deref().unwrap_or_default(),
-                                    tref.name
-                                ),
-                            )
-                        })?,
-                );
+                if let Some(kind) = catalog_rel_kind(&tref.name) {
+                    let scope = self.resolve_catalog_scope(tref.db.as_deref())?;
+                    synthetic.push(catalog_rel_table(kind));
+                    let si = synthetic.len() - 1;
+                    srf_meta.push(Some((si, Vec::new(), kind, None, scope)));
+                    src = RelSrc::Synthetic(si);
+                } else {
+                    srf_meta.push(None);
+                    self.check_table_qualifier(tref.db.as_deref(), &tref.name)?;
+                    src = RelSrc::Base(
+                        self.table_scoped(tref.db.as_deref(), &tref.name)
+                            .ok_or_else(|| {
+                                EngineError::new(
+                                    SqlState::UndefinedTable,
+                                    format!(
+                                        "table does not exist: {}.{}",
+                                        tref.db.as_deref().unwrap_or_default(),
+                                        tref.name
+                                    ),
+                                )
+                            })?,
+                    );
+                }
             } else {
                 // A base table NAME — may resolve to a CTE, which SHADOWS a catalog table of the same
                 // name (cte.md §2; case-insensitive). A CTE hit bumps the binding's reference count
-                // (the inline-vs-materialize decision — cost.md §3).
+                // (the inline-vs-materialize decision — cost.md §3). A built-in catalog relation
+                // (introspection.md §5) is checked AFTER a CTE (a CTE shadows it — PG-matching) and
+                // BEFORE the user catalog; unqualified = the implicit scope (main).
                 lateral_flags.push(false);
-                srf_meta.push(None);
                 derived_meta.push(None);
                 derived_plans.push(None);
                 let lname = tref.name.to_ascii_lowercase();
@@ -9384,14 +9462,26 @@ impl Engine {
                             }
                         }
                         ctes[ci].refs.set(ctes[ci].refs.get() + 1);
+                        srf_meta.push(None);
                         RelSrc::Cte(&*ctes[ci].table, ci)
                     }
-                    None => RelSrc::Base(self.table(&tref.name).ok_or_else(|| {
-                        EngineError::new(
-                            SqlState::UndefinedTable,
-                            format!("table does not exist: {}", tref.name),
-                        )
-                    })?),
+                    None => match catalog_rel_kind(&tref.name) {
+                        Some(kind) => {
+                            synthetic.push(catalog_rel_table(kind));
+                            let si = synthetic.len() - 1;
+                            srf_meta.push(Some((si, Vec::new(), kind, None, "main".to_string())));
+                            RelSrc::Synthetic(si)
+                        }
+                        None => {
+                            srf_meta.push(None);
+                            RelSrc::Base(self.table(&tref.name).ok_or_else(|| {
+                                EngineError::new(
+                                    SqlState::UndefinedTable,
+                                    format!("table does not exist: {}", tref.name),
+                                )
+                            })?)
+                        }
+                    },
                 };
             }
             // RIGHT/FULL JOIN to a CORRELATED lateral item is rejected (§44): the right side cannot be
@@ -10352,7 +10442,7 @@ impl Engine {
         let mut srf_plans: Vec<Option<SrfPlan>> = srf_meta
             .into_iter()
             .map(|m| {
-                m.map(|(si, args, kind, json_table)| {
+                m.map(|(si, args, kind, json_table, introspect_scope)| {
                     // A record-returning SRF carries its declared columns (the C0 col-def list, held
                     // on the synthetic table) so the row generator can map members → columns.
                     let record_cols = if matches!(kind, SrfKind::JsonRecord { .. }) {
@@ -10365,6 +10455,7 @@ impl Engine {
                         args,
                         record_cols,
                         json_table,
+                        introspect_scope,
                     }
                 })
             })
@@ -11328,6 +11419,65 @@ impl Engine {
     /// stepping STOPS the series cleanly (no trap). Each generated element charges one
     /// `generated_row` AT THE SOURCE, guarded so a `max_cost` ceiling aborts a runaway series
     /// (54P01) mid-generation before the whole thing materializes (CLAUDE.md §13).
+    /// Generate the rows of the `jed_tables` catalog relation (introspection.md §5): one row per
+    /// USER table of the scope's pinned catalog snapshot — the canonical (CREATE TABLE-spelled)
+    /// name — in ascending lowercased-name order (deterministic, no map-iteration leak; the
+    /// multiset is the contract, order without ORDER BY stays unspecified — CLAUDE.md §8). Derived
+    /// entirely from the resident catalog: zero `page_read` / `storage_row_read`; each produced row
+    /// charges one `generated_row` AT THE SOURCE, guarded so a max_cost ceiling aborts
+    /// deterministically (§13).
+    fn jed_tables_rows(&self, srf: &SrfPlan, meter: &mut Meter) -> Result<Vec<Row>> {
+        let Some(snap) = self.snap_for_scope(&srf.introspect_scope) else {
+            // The attachment was valid at plan time but is gone at exec (a detached-then-reused plan).
+            return Err(EngineError::new(
+                SqlState::UndefinedTable,
+                format!("database \"{}\" is not attached", srf.introspect_scope),
+            ));
+        };
+        let mut out: Vec<Row> = Vec::new();
+        for t in snap.tables_sorted() {
+            meter.guard()?;
+            meter.charge(COSTS.generated_row);
+            out.push(vec![Value::Text(t.name.clone())]);
+        }
+        Ok(out)
+    }
+
+    /// Generate the rows of the `jed_columns` catalog relation (introspection.md §5): one row per
+    /// column of every user table of the scope's snapshot, in (lowercased table name, ordinal)
+    /// order. `ordinal` is 1-based CREATE TABLE order; `type` is the canonical type text
+    /// (`catalog_type_text`); `not_null` covers a declared NOT NULL and PRIMARY KEY membership;
+    /// `pk_ordinal` is the 1-based position in the PRIMARY KEY in KEY order (which may differ from
+    /// declaration order — constraints.md §3), NULL for a non-member. Cost mirrors jed_tables_rows.
+    fn jed_columns_rows(&self, srf: &SrfPlan, meter: &mut Meter) -> Result<Vec<Row>> {
+        let Some(snap) = self.snap_for_scope(&srf.introspect_scope) else {
+            return Err(EngineError::new(
+                SqlState::UndefinedTable,
+                format!("database \"{}\" is not attached", srf.introspect_scope),
+            ));
+        };
+        let mut out: Vec<Row> = Vec::new();
+        for t in snap.tables_sorted() {
+            for (i, c) in t.columns.iter().enumerate() {
+                meter.guard()?;
+                meter.charge(COSTS.generated_row);
+                let pk_ordinal = match t.pk.iter().position(|&ord| ord == i) {
+                    Some(k) => Value::Int(k as i64 + 1),
+                    None => Value::Null,
+                };
+                out.push(vec![
+                    Value::Text(t.name.clone()),
+                    Value::Text(c.name.clone()),
+                    Value::Int(i as i64 + 1),
+                    Value::Text(catalog_type_text(&c.ty, c.decimal.as_ref(), c.varchar_len)),
+                    Value::Bool(c.not_null || c.primary_key),
+                    pk_ordinal,
+                ]);
+            }
+        }
+        Ok(out)
+    }
+
     fn generate_series_rows(
         &self,
         srf: &SrfPlan,
@@ -12510,6 +12660,8 @@ impl Engine {
                 | SrfKind::JsonRecord { .. }
                 | SrfKind::JsonbPathQuery => self.json_srf_rows(srf, &env, meter),
                 SrfKind::JsonTable => self.json_table_rows(srf, &env, meter),
+                SrfKind::JedTables => self.jed_tables_rows(srf, meter),
+                SrfKind::JedColumns => self.jed_columns_rows(srf, meter),
             };
         }
         // A CTE reference delivers its rows from the per-statement context (cte.md §3/§5): a
@@ -17168,6 +17320,16 @@ enum SrfKind {
     /// the recursive default-plan expansion. `args` is `[ctx]`; the resolved column tree is the
     /// SrfPlan's `json_table` field.
     JsonTable,
+    /// The `jed_tables` catalog relation (spec/design/introspection.md §5): a read-only COMPUTED
+    /// relation — one row per user table of the qualified database, derived at execution from its
+    /// pinned catalog snapshot. Not a function (it is resolved as a table name), but it rides the
+    /// SRF plan shape so every "computed, not scanned" gate handles it: no store, no index
+    /// pushdown, no PK order, excluded from the fast-path lanes. `args` is empty; the scope is the
+    /// SrfPlan's `introspect_scope`.
+    JedTables,
+    /// The `jed_columns` catalog relation (introspection.md §5) — one row per column of every user
+    /// table of the qualified database, in (table, ordinal) order.
+    JedColumns,
 }
 
 /// A resolved `JSON_TABLE` plan (T1, json-table.md §3) — the compiled root path + the column tree.
@@ -17224,6 +17386,117 @@ struct SrfPlan {
     record_cols: Vec<Column>,
     /// The resolved column tree for a `JSON_TABLE` SRF (`JsonTable`), else `None`.
     json_table: Option<Box<JtPlan>>,
+    /// The validated database scope of a catalog relation (`JedTables` / `JedColumns` —
+    /// introspection.md §5): `"main"` (also the unqualified default), `"temp"`, or a lowercased
+    /// attachment name. Empty for every other kind.
+    introspect_scope: String,
+}
+
+/// Classify a relation name as a built-in catalog relation (introspection.md §5): `jed_tables` /
+/// `jed_columns`, case-insensitively (identifier resolution folds case; grammar.md §3 leaves no
+/// quoted escape). Built-in names resolve in every database's relation namespace, checked AFTER a
+/// statement-local CTE (a CTE shadows a catalog relation — PG-matching, oracle-checked) and BEFORE
+/// the user catalog (post-I0 the two can never collide; for a pre-reservation legacy file the
+/// built-in wins and the user relation is unreachable by name — §5).
+fn catalog_rel_kind(name: &str) -> Option<SrfKind> {
+    match name.to_ascii_lowercase().as_str() {
+        "jed_tables" => Some(SrfKind::JedTables),
+        "jed_columns" => Some(SrfKind::JedColumns),
+        _ => None,
+    }
+}
+
+/// Whether `name` is a built-in catalog relation (`jed_tables` / `jed_columns`). The write paths
+/// use it to reject a catalog relation as a mutation/DDL target (`42809` — a catalog relation is
+/// read-only, introspection.md §5); the privilege gate uses it so a built-in is SELECT-gated
+/// exactly like a user table under an explicit-grant session envelope.
+fn is_catalog_rel_name(name: &str) -> bool {
+    catalog_rel_kind(name).is_some()
+}
+
+/// Reject a mutation target (INSERT / UPDATE / DELETE / CREATE INDEX ON) naming a built-in catalog
+/// relation: `42809` wrong_object_type, `cannot modify system relation` (introspection.md §5 — the
+/// relations are read-only computed views of the catalog). Checked by NAME, before qualifier
+/// validation: the built-in resolves in every database's namespace, so the rejection is
+/// scope-independent.
+fn check_catalog_rel_write(name: &str) -> Result<()> {
+    if is_catalog_rel_name(name) {
+        return Err(EngineError::new(
+            SqlState::WrongObjectType,
+            format!(
+                "cannot modify system relation \"{}\"",
+                name.to_ascii_lowercase()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Build the FIXED synthetic schema of a catalog relation (introspection.md §5). Unlike an SRF's
+/// single-column alias rule, a FROM alias renames the RELATION only — the column names are part of
+/// the introspection surface. Growth is by ADDING columns (consumers select by name, not position
+/// — §5).
+fn catalog_rel_table(kind: SrfKind) -> Box<Table> {
+    let col = |name: &str, ty: ScalarType, not_null: bool| Column {
+        name: name.to_string(),
+        ty: Type::Scalar(ty),
+        decimal: None,
+        varchar_len: None,
+        primary_key: false,
+        not_null,
+        default: None,
+        default_expr: None,
+        identity: None,
+        collation: None,
+    };
+    match kind {
+        SrfKind::JedTables => Box::new(Table {
+            name: "jed_tables".to_string(),
+            columns: vec![col("name", ScalarType::Text, true)],
+            pk: Vec::new(),
+            checks: Vec::new(),
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+            exclusions: Vec::new(),
+        }),
+        _ => Box::new(Table {
+            name: "jed_columns".to_string(),
+            columns: vec![
+                col("table_name", ScalarType::Text, true),
+                col("name", ScalarType::Text, true),
+                col("ordinal", ScalarType::Int32, true),
+                col("type", ScalarType::Text, true),
+                col("not_null", ScalarType::Bool, true),
+                col("pk_ordinal", ScalarType::Int32, false),
+            ],
+            pk: Vec::new(),
+            checks: Vec::new(),
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+            exclusions: Vec::new(),
+        }),
+    }
+}
+
+/// Render a column's declared type in the CANONICAL introspection form (introspection.md §5): the
+/// scalar's canonical name with its typmod applied at the leaf (`varchar(10)`, `decimal(8,2)`), a
+/// composite's name as created, a range's canonical id (`i32range`, `numrange`, …), and `[]`
+/// appended for an array (the typmod applies to the element: `varchar(5)[]`). This text is a
+/// compatibility surface the moment it ships — pinned by the corpus.
+fn catalog_type_text(ty: &Type, dec: Option<&DecimalTypmod>, vlen: Option<u32>) -> String {
+    match ty {
+        Type::Array(elem) => format!("{}[]", catalog_type_text(elem, dec, vlen)),
+        Type::Scalar(ScalarType::Text) if vlen.is_some() => {
+            format!("varchar({})", vlen.unwrap())
+        }
+        Type::Scalar(ScalarType::Decimal) if dec.is_some() => {
+            let d = dec.unwrap();
+            format!("decimal({},{})", d.precision, d.scale)
+        }
+        // The scalar / composite / range canonical rendering is shared with error messages
+        // (types.rs): composite → its name as created, range → the ranges.toml id.
+        _ => ty.canonical_name(),
+    }
 }
 
 /// Build a set-returning function's **synthetic one-column relation** (spec/design/functions.md
@@ -27327,7 +27600,17 @@ impl Engine {
         note: &str,
     ) -> Result<()> {
         let rel = &sp.rels[i];
-        if rel.srf.is_some() {
+        if let Some(srf) = &rel.srf {
+            // A catalog relation (introspection.md §5) is computed, not scanned — its own node name
+            // (it is a relation, not a function) plus the database scope it reads.
+            if matches!(srf.kind, SrfKind::JedTables | SrfKind::JedColumns) {
+                r.emit(
+                    depth,
+                    format!("Catalog Scan {}", rel.table_name),
+                    with_note(&format!("db={}", srf.introspect_scope), note),
+                );
+                return Ok(());
+            }
             r.emit(
                 depth,
                 format!("SRF {}", rel.table_name),

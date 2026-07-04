@@ -1106,6 +1106,13 @@ export class Snapshot {
     this.types.delete(key);
   }
 
+  // tablesSorted is all tables in ascending lowercased-name order — a deterministic order with no
+  // map-iteration leak (CLAUDE.md §8); the jed_tables / jed_columns generation order
+  // (spec/design/introspection.md §5).
+  tablesSorted(): Table[] {
+    return [...this.tables.keys()].sort().map((k) => this.tables.get(k)!);
+  }
+
   // compositeTypesSorted is all composite types in ascending lowercased-name order — the on-disk
   // emission order (spec/fileformat/format.md) and a deterministic order with no map-iteration leak
   // (§8). Keys are ASCII (so code-unit sort == byte sort).
@@ -3687,8 +3694,12 @@ export class Engine {
     for (const t of req.tables) {
       const key = t.name.toLowerCase();
       // Only a name that resolves to an existing catalog table is privilege-checked; a missing one is
-      // left to raise 42P01 in execution (existence before authorization).
-      if (snap.table(key) !== undefined && !this.session.privileges.allowsTable(key, t.priv)) {
+      // left to raise 42P01 in execution (existence before authorization). A built-in catalog relation
+      // (jed_tables / jed_columns) is gated exactly like a user table — per-table SELECT on its own
+      // name under the session envelope, no special case (introspection.md §5) — so an explicit-grant
+      // session sees the schema only if the host granted it.
+      const exists = isCatalogRelName(key) || snap.table(key) !== undefined;
+      if (exists && !this.session.privileges.allowsTable(key, t.priv)) {
         throw engineError("insufficient_privilege", "permission denied for table " + key);
       }
     }
@@ -4110,6 +4121,16 @@ export class Engine {
   ): void {
     const rel = sp.rels[i]!;
     if (rel.srf !== undefined) {
+      // A catalog relation (introspection.md §5) is computed, not scanned — its own node name (it
+      // is a relation, not a function) plus the database scope it reads.
+      if (rel.srf.kind === "jed_tables" || rel.srf.kind === "jed_columns") {
+        r.emit(
+          depth,
+          "Catalog Scan " + rel.tableName,
+          withNote("db=" + rel.srf.introspectScope, note),
+        );
+        return;
+      }
       r.emit(depth, "SRF " + rel.tableName, withNote("-", note));
       return;
     }
@@ -5305,6 +5326,12 @@ export class Engine {
     for (const name of dt.names) {
       const key = name.toLowerCase();
       if (seen.has(key)) continue; // already resolved this exact target (deduplicated)
+      // A built-in catalog relation resolves BEFORE the user catalog (introspection.md §5), and a
+      // system relation cannot be dropped: 42809. IF EXISTS does not suppress this (the relation
+      // exists — this is a kind rejection, not a missing name).
+      if (isCatalogRelName(key)) {
+        throw engineError("wrong_object_type", `cannot drop system relation "${key}"`);
+      }
       // Resolution walk: session-local temp → persistent. Preclude-overlaps keeps a name in at most one
       // scope, so this is just "where it lives" (temp-tables.md §3).
       let scope: Scope;
@@ -5470,6 +5497,9 @@ export class Engine {
     // qualifier + resolution walk; the cost meter, UNIQUE validation, naming/namespace collision, and the
     // storage budget are all generic); only the catalog putIndex write must target the owning snapshot,
     // so the routing happens there.
+    // A built-in catalog relation cannot be indexed (introspection.md §5): 42809, checked by NAME
+    // before qualifier validation, like the DML targets.
+    checkCatalogRelWrite(ci.table);
     // A DDL write to a READ-ONLY host attachment is 25006 before any work — checked BEFORE the qualifier
     // existence gate so a read-only attachment refuses the write deterministically (attached-databases.md §4).
     this.checkAttachmentWritable(ci.db);
@@ -6316,6 +6346,9 @@ export class Engine {
   // source additionally validates output arity (42601) and per-column type assignability (42804)
   // up front, before any row is produced — so both fire even over an empty source.
   private executeInsert(ins: Insert, params: Value[], ctx: CteCtx): Outcome {
+    // A catalog relation is read-only (introspection.md §5): a DML target naming one is 42809,
+    // checked by NAME before qualifier validation (the built-in resolves in every database).
+    checkCatalogRelWrite(ins.table);
     // A write to a READ-ONLY host attachment is 25006 before any I/O — checked BEFORE the qualifier
     // existence gate so a read-only attachment refuses the write deterministically (attached-databases.md §4).
     this.checkAttachmentWritable(ins.db);
@@ -7482,6 +7515,9 @@ export class Engine {
   // matching rows (only a TRUE predicate matches — Kleene), then removes them. No WHERE
   // deletes every row. Keys are collected before mutating.
   private executeDelete(del: Delete, params: Value[], ctx: CteCtx): Outcome {
+    // A catalog relation is read-only (introspection.md §5): a DML target naming one is 42809,
+    // checked by NAME before qualifier validation (the built-in resolves in every database).
+    checkCatalogRelWrite(del.table);
     // A write to a READ-ONLY host attachment is 25006 before any I/O — checked BEFORE the qualifier
     // existence gate so a read-only attachment refuses the write deterministically (attached-databases.md §4).
     this.checkAttachmentWritable(del.db);
@@ -7703,6 +7739,9 @@ export class Engine {
   // a collision with another row's key traps 23505 (<table>_pkey). A duplicate target
   // column traps 42701. No WHERE updates every row.
   private executeUpdate(upd: Update, params: Value[], ctx: CteCtx): Outcome {
+    // A catalog relation is read-only (introspection.md §5): a DML target naming one is 42809,
+    // checked by NAME before qualifier validation (the built-in resolves in every database).
+    checkCatalogRelWrite(upd.table);
     // A write to a READ-ONLY host attachment is 25006 before any I/O — checked BEFORE the qualifier
     // existence gate so a read-only attachment refuses the write deterministically (attached-databases.md §4).
     this.checkAttachmentWritable(upd.db);
@@ -9133,19 +9172,32 @@ export class Engine {
       } else if (tref.db !== undefined) {
         // A database-QUALIFIED name reaches an attachment's table directly (attached-databases.md §3):
         // it never resolves to a CTE (a CTE has no database qualifier, so `main.x`/`temp.x` cannot name
-        // one) and the qualifier fixes the scope (no temp-vs-persistent shadow). Validate the qualifier
-        // against the implicit scope, then resolve through the temp-first funnel (which, by
-        // preclude-overlaps, lands in the validated scope).
-        this.checkTableQualifier(tref.db, tref.name);
-        // Route to the qualified database's catalog (attached-databases.md §3): main/temp fall through
-        // to the temp-first funnel (preclude-overlaps lands them in the validated scope), a host
-        // attachment resolves in its own snapshot — where its table lives ONLY. The 1a read path used
-        // the bare lkpTable here, which 42P01'd on an attachment table (the routing gotcha).
-        const tbl = this.lkpTableScoped(tref.db, tref.name);
-        if (!tbl) {
-          throw engineError("undefined_table", "table does not exist: " + tref.db + "." + tref.name);
+        // one) and the qualifier fixes the scope (no temp-vs-persistent shadow).
+        // A built-in catalog relation resolves in EVERY database's relation namespace
+        // (temp.jed_tables, reports.jed_tables — introspection.md §5), before the user catalog;
+        // only the qualifier itself needs validating.
+        const kind = catalogRelKind(tref.name);
+        if (kind !== undefined) {
+          const scope = this.resolveCatalogScope(tref.db);
+          t = catalogRelTable(kind);
+          srf = { kind, args: [], introspectScope: scope };
+        } else {
+          // Validate the qualifier against the implicit scope, then resolve through the temp-first
+          // funnel (which, by preclude-overlaps, lands in the validated scope).
+          this.checkTableQualifier(tref.db, tref.name);
+          // Route to the qualified database's catalog (attached-databases.md §3): main/temp fall through
+          // to the temp-first funnel (preclude-overlaps lands them in the validated scope), a host
+          // attachment resolves in its own snapshot — where its table lives ONLY. The 1a read path used
+          // the bare lkpTable here, which 42P01'd on an attachment table (the routing gotcha).
+          const tbl = this.lkpTableScoped(tref.db, tref.name);
+          if (!tbl) {
+            throw engineError(
+              "undefined_table",
+              "table does not exist: " + tref.db + "." + tref.name,
+            );
+          }
+          t = tbl;
         }
-        t = tbl;
       } else {
         // A plain FROM name (not an SRF call) may resolve to a CTE, which SHADOWS a catalog table of
         // the same name (cte.md §2); lookup is case-insensitive. A hit bumps the binding's reference
@@ -9167,9 +9219,17 @@ export class Engine {
           t = ctes[ci]!.table;
           cteIdx = ci;
         } else {
-          const tbl = this.lkpTable(tref.name); // temp-first (temp-tables.md §3)
-          if (!tbl) throw engineError("undefined_table", "table does not exist: " + tref.name);
-          t = tbl;
+          // A built-in catalog relation (introspection.md §5), checked AFTER a CTE (a CTE shadows
+          // it — PG-matching) and BEFORE the user catalog. Unqualified = the implicit scope (main).
+          const kind = catalogRelKind(tref.name);
+          if (kind !== undefined) {
+            t = catalogRelTable(kind);
+            srf = { kind, args: [], introspectScope: "main" };
+          } else {
+            const tbl = this.lkpTable(tref.name); // temp-first (temp-tables.md §3)
+            if (!tbl) throw engineError("undefined_table", "table does not exist: " + tref.name);
+            t = tbl;
+          }
         }
       }
       // RIGHT/FULL JOIN to a CORRELATED lateral item is rejected (§44): the right side cannot be both
@@ -10573,6 +10633,74 @@ export class Engine {
   // (54P01) mid-generation. Note (cross-core parity): TS values are bigint, which does NOT overflow
   // at 64 bits — so the i64 boundary must be detected EXPLICITLY here, or TS would emit rows Rust/Go
   // never reach.
+  // resolveCatalogScope validates a catalog relation's database qualifier and returns the scope
+  // string snapForScope resolves at exec (introspection.md §5): undefined (unqualified) ⇒ "main"
+  // (the implicit scope); "main"/"temp" pass; any other qualifier must name a host attachment (else
+  // 42P01, the checkTableQualifier wording). Unlike a user table there is no per-table existence
+  // half — the relation exists in EVERY valid scope, so only the scope itself is validated.
+  private resolveCatalogScope(qualifier: string | undefined): string {
+    if (qualifier === undefined) return "main";
+    const q = qualifier.toLowerCase();
+    if (q === "main" || q === "temp") return q;
+    if (this.attachReadSnap(q) === undefined) {
+      throw engineError("undefined_table", `database "${qualifier}" is not attached`);
+    }
+    return q;
+  }
+
+  // jedTablesRows generates the rows of the jed_tables catalog relation (introspection.md §5): one
+  // row per USER table of the scope's pinned catalog snapshot — the canonical (CREATE
+  // TABLE-spelled) name — in ascending lowercased-name order (deterministic, no map-iteration
+  // leak; the multiset is the contract, order without ORDER BY stays unspecified — CLAUDE.md §8).
+  // Derived entirely from the resident catalog: zero page_read / storage_row_read; each produced
+  // row charges one generated_row AT THE SOURCE, guarded so a maxCost ceiling aborts
+  // deterministically (§13).
+  private jedTablesRows(srf: SrfPlan, meter: Meter): Row[] {
+    const snap = this.snapForScope(srf.introspectScope!);
+    if (snap === undefined) {
+      // The attachment was valid at plan time but is gone at exec (a detached-then-reused plan).
+      throw engineError("undefined_table", `database "${srf.introspectScope}" is not attached`);
+    }
+    const out: Row[] = [];
+    for (const t of snap.tablesSorted()) {
+      meter.guard();
+      meter.charge(COSTS.generatedRow);
+      out.push([textValue(t.name)]);
+    }
+    return out;
+  }
+
+  // jedColumnsRows generates the rows of the jed_columns catalog relation (introspection.md §5):
+  // one row per column of every user table of the scope's snapshot, in (lowercased table name,
+  // ordinal) order. ordinal is 1-based CREATE TABLE order; type is the canonical type text
+  // (catalogTypeText); not_null covers a declared NOT NULL and PRIMARY KEY membership; pk_ordinal
+  // is the 1-based position in the PRIMARY KEY in KEY order (which may differ from declaration
+  // order — constraints.md §3), NULL for a non-member. Cost mirrors jedTablesRows.
+  private jedColumnsRows(srf: SrfPlan, meter: Meter): Row[] {
+    const snap = this.snapForScope(srf.introspectScope!);
+    if (snap === undefined) {
+      throw engineError("undefined_table", `database "${srf.introspectScope}" is not attached`);
+    }
+    const out: Row[] = [];
+    for (const t of snap.tablesSorted()) {
+      for (let i = 0; i < t.columns.length; i++) {
+        const c = t.columns[i]!;
+        meter.guard();
+        meter.charge(COSTS.generatedRow);
+        const k = t.pk.indexOf(i);
+        out.push([
+          textValue(t.name),
+          textValue(c.name),
+          intValue(BigInt(i + 1)),
+          textValue(catalogTypeText(c.type, c.decimal, c.varcharLen)),
+          boolValue(c.notNull || c.primaryKey),
+          k >= 0 ? intValue(BigInt(k + 1)) : nullValue(),
+        ]);
+      }
+    }
+    return out;
+  }
+
   private generateSeriesRows(srf: SrfPlan, env: EvalEnv, meter: Meter): Row[] {
     const evalInt = (e: RExpr): bigint | null => {
       const v = evalExpr(e, [], env, meter);
@@ -11483,6 +11611,10 @@ export class Engine {
           return this.jsonSrfRows(rel.srf, env, meter);
         case "json_table":
           return this.jsonTableRows(rel.srf, env, meter);
+        case "jed_tables":
+          return this.jedTablesRows(rel.srf, meter);
+        case "jed_columns":
+          return this.jedColumnsRows(rel.srf, meter);
       }
     }
     // A CTE reference delivers its rows from the per-statement context (cte.md §3/§5): a MATERIALIZED
@@ -16326,7 +16458,17 @@ type SrfKind =
   // JSON_TABLE(ctx, path COLUMNS (…)) (T1, json-table.md §3): a multi-column relation produced by the
   // recursive default-plan expansion. `args` is `[ctx]`; the resolved column tree is the SrfPlan's
   // `jtPlan` field.
-  | "json_table";
+  | "json_table"
+  // The jed_tables catalog relation (spec/design/introspection.md §5): a read-only COMPUTED
+  // relation — one row per user table of the qualified database, derived at execution from its
+  // pinned catalog snapshot. Not a function (it is resolved as a table name), but it rides the SRF
+  // plan shape so every "computed, not scanned" gate handles it: no store, no index pushdown, no
+  // PK order, excluded from the fast-path lanes. `args` is empty; the scope is the SrfPlan's
+  // introspectScope.
+  | "jed_tables"
+  // The jed_columns catalog relation (introspection.md §5) — one row per column of every user
+  // table of the qualified database, in (table, ordinal) order.
+  | "jed_columns";
 
 // SrfPlan is a resolved set-returning-function row source (spec/design/functions.md §10,
 // array-functions.md §9). kind selects the generator: generate_series(start, stop[, step]) (args =
@@ -16344,7 +16486,109 @@ type SrfPlan = {
   // The resolved column tree for a `JSON_TABLE` SRF (the `json_table` kind, T1, json-table.md §3),
   // else absent.
   jtPlan?: JtPlan;
+  // The validated database scope of a catalog relation (the `jed_tables` / `jed_columns` kinds —
+  // introspection.md §5): "main" (also the unqualified default), "temp", or a lowercased
+  // attachment name. Absent for every other kind.
+  introspectScope?: string;
 };
+
+// catalogRelKind classifies a relation name as a built-in catalog relation (introspection.md §5):
+// jed_tables / jed_columns, case-insensitively (identifier resolution folds case; grammar.md §3
+// leaves no quoted escape). Built-in names resolve in every database's relation namespace, checked
+// AFTER a statement-local CTE (a CTE shadows a catalog relation — PG-matching, oracle-checked) and
+// BEFORE the user catalog (post-I0 the two can never collide; for a pre-reservation legacy file the
+// built-in wins and the user relation is unreachable by name — §5).
+function catalogRelKind(name: string): "jed_tables" | "jed_columns" | undefined {
+  const lname = name.toLowerCase();
+  if (lname === "jed_tables" || lname === "jed_columns") return lname;
+  return undefined;
+}
+
+// isCatalogRelName reports whether name is a built-in catalog relation (jed_tables / jed_columns).
+// The write paths use it to reject a catalog relation as a mutation/DDL target (42809 — a catalog
+// relation is read-only, introspection.md §5); the privilege gate uses it so a built-in is
+// SELECT-gated exactly like a user table under an explicit-grant session envelope.
+function isCatalogRelName(name: string): boolean {
+  return catalogRelKind(name) !== undefined;
+}
+
+// checkCatalogRelWrite rejects a mutation target (INSERT / UPDATE / DELETE / CREATE INDEX ON)
+// naming a built-in catalog relation: 42809 wrong_object_type, `cannot modify system relation`
+// (introspection.md §5 — the relations are read-only computed views of the catalog). Checked by
+// NAME, before qualifier validation: the built-in resolves in every database's namespace, so the
+// rejection is scope-independent.
+function checkCatalogRelWrite(name: string): void {
+  if (isCatalogRelName(name)) {
+    throw engineError(
+      "wrong_object_type",
+      `cannot modify system relation "${name.toLowerCase()}"`,
+    );
+  }
+}
+
+// catalogRelTable builds the FIXED synthetic schema of a catalog relation (introspection.md §5).
+// Unlike an SRF's single-column alias rule, a FROM alias renames the RELATION only — the column
+// names are part of the introspection surface. Growth is by ADDING columns (consumers select by
+// name, not position — §5).
+function catalogRelTable(kind: "jed_tables" | "jed_columns"): Table {
+  const col = (name: string, ty: ScalarType, notNull: boolean): Column => ({
+    name,
+    type: scalarT(ty),
+    decimal: null,
+    varcharLen: null,
+    primaryKey: false,
+    notNull,
+    default: null,
+    defaultExpr: null,
+    identity: null,
+    collation: null,
+  });
+  if (kind === "jed_tables") {
+    return {
+      name: "jed_tables",
+      columns: [col("name", "text", true)],
+      pk: [],
+      checks: [],
+      indexes: [],
+      fks: [],
+      exclusions: [],
+    };
+  }
+  return {
+    name: "jed_columns",
+    columns: [
+      col("table_name", "text", true),
+      col("name", "text", true),
+      col("ordinal", "i32", true),
+      col("type", "text", true),
+      col("not_null", "boolean", true),
+      col("pk_ordinal", "i32", false),
+    ],
+    pk: [],
+    checks: [],
+    indexes: [],
+    fks: [],
+    exclusions: [],
+  };
+}
+
+// catalogTypeText renders a column's declared type in the CANONICAL introspection form
+// (introspection.md §5): the scalar's canonical name with its typmod applied at the leaf
+// (varchar(10), decimal(8,2)), a composite's name as created, a range's canonical id (i32range,
+// numrange, …), and `[]` appended for an array (the typmod applies to the element: varchar(5)[]).
+// This text is a compatibility surface the moment it ships — pinned by the corpus.
+function catalogTypeText(ty: Type, dec: DecimalTypmod | null, vlen: number | null): string {
+  if (ty.kind === "array") return catalogTypeText(ty.elem, dec, vlen) + "[]";
+  if (ty.kind === "scalar" && ty.scalar === "text" && vlen !== null) {
+    return `varchar(${vlen})`;
+  }
+  if (ty.kind === "scalar" && ty.scalar === "decimal" && dec !== null) {
+    return `decimal(${dec.precision},${dec.scale})`;
+  }
+  // The scalar / composite / range canonical rendering is shared with error messages (types.ts):
+  // composite → its name as created, range → the ranges.toml id.
+  return typeCanonicalName(ty);
+}
 
 // JtPlan is a resolved `JSON_TABLE` plan (T1, json-table.md §3) — the compiled root path + the
 // column tree. `width` is the total flattened output-column count.

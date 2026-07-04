@@ -2,8 +2,9 @@
 
 > How a query (and through it, a host) discovers what a database contains: the decision —
 > **`jed_`-prefixed virtual catalog relations**, scoped per database by the existing qualifier —
-> plus the **`jed_` name reservation** that keeps their namespace clear (§4, **implemented**;
-> the relations themselves are **designed, not yet built** — §5, §8).
+> plus the **`jed_` name reservation** that keeps their namespace clear (§4, **implemented**).
+> The first two relations, **`jed_tables` + `jed_columns`, are implemented** (slice I1 — §5, §8);
+> `jed_indexes` / `jed_constraints` / `jed_sequences` / `jed_types` remain designed-only.
 > [attached-databases.md](attached-databases.md) §3 owns the qualifier model the scoping rides;
 > [session.md](session.md) owns the privilege gating; [api.md](api.md) §7 owns `table_names`,
 > the one host-level introspection call that predates this doc; [grammar.md](grammar.md) §3 owns
@@ -153,7 +154,7 @@ Recorded here per the §1 rule.
 Conformance: `suites/ddl/reserved_names.test` (rides the existing DDL capabilities — the
 reservation is part of each DDL statement's semantics, not an optional feature).
 
-## 5. The catalog relations — designed, not yet built
+## 5. The catalog relations — `jed_tables` + `jed_columns` implemented (I1)
 
 **Model.** Each catalog relation is a **read-only computed relation**: at execution its rows are
 derived from the **pinned catalog snapshot** of the database it is qualified into — never
@@ -161,32 +162,56 @@ stored, never maintained, no on-disk presence. This does not breach §9's "no ex
 row sources" guarantee: that rule keeps files reopenable without external code or data, and a
 catalog relation is derived entirely from the file's *own* catalog. A spanning query mixing
 `jed_tables` and `reports.jed_tables` is, like any spanning query, a pure function of the
-per-database pinned snapshots (attached-databases.md §5).
+per-database pinned snapshots (attached-databases.md §5). In every core the relation rides the
+existing computed-relation (SRF-plan) execution shape, so each "computed, not scanned" gate —
+no store, no index pushdown, no PK scan order, excluded from the streaming/vectorized fast
+lanes — holds by construction rather than by N new checks.
 
-**Resolution.** Built-in catalog names resolve in every database's relation namespace, **checked
-before the user catalog** (deterministic, PG's `pg_catalog`-first shape). Post-§4 the two can
-never collide; for a legacy file that already contains a user relation named `jed_tables`, the
-built-in wins and the user relation becomes unreachable by name (its data is intact and
-re-reachable by dump/recreate under a legal name) — accepted and recorded rather than allowing
-shadowing, which attached-databases.md §3 deliberately banned. Writes to a catalog relation
-(INSERT/UPDATE/DELETE, or DROP/CREATE against its name post-resolution) are rejected — exact
-code pinned in the implementing slice (PG uses `42809 wrong_object_type` for kind mismatches).
+**Resolution** (implemented, pinned by `suites/introspection/`). Built-in catalog names resolve
+in every database's relation namespace, **checked before the user catalog** (deterministic, PG's
+`pg_catalog`-first shape) and **after a statement-local CTE** — `WITH jed_tables AS (…)` shadows
+the built-in, matching PostgreSQL's CTE-over-catalog resolution (oracle-checked against
+`pg_tables`). An **unqualified** name reads the **implicit scope (`main`)** — never the temp-first
+walk, since the built-in exists in *every* database and the scope must be pinned;
+`temp.jed_tables` / `<attachment>.jed_tables` read that database's snapshot, and an unknown
+qualifier is `42P01` (the ordinary "database … is not attached" wording). A FROM **alias renames
+the relation only, never its column** (no single-column function-alias rule — these are
+relations, not functions). Post-§4 a user-catalog collision is impossible; for a legacy file that
+already contains a user relation named `jed_tables`, the built-in wins and the user relation
+becomes unreachable by name (its data is intact and re-reachable by dump/recreate under a legal
+name) — accepted and recorded rather than allowing shadowing, which attached-databases.md §3
+deliberately banned.
+
+**Read-only** (implemented). A mutation or DDL target naming a catalog relation is **`42809
+wrong_object_type`**, checked by *name* before qualifier validation (the built-in resolves in
+every database, so the rejection is scope-independent): INSERT / UPDATE / DELETE and `CREATE
+INDEX … ON` raise `cannot modify system relation "jed_tables"`; `DROP TABLE` raises `cannot drop
+system relation "jed_tables"`, and **`IF EXISTS` does not suppress it** (a kind rejection, not a
+missing name). `CREATE` of any `jed_`-prefixed name stays the §4 reservation (`42939`). A
+`REFERENCES jed_tables` FK parent stays `42P01` (the parent lookup resolves user tables only — a
+catalog relation has no key to reference).
 
 **Self-exclusion.** Catalog relations list **user objects only** — they do not list themselves
 or each other, matching what `table_names()` returns today (api.md §7 stays user-objects-only).
 
-**Privileges.** A catalog relation is gated exactly like a user table: per-table `SELECT` under
-the session envelope (session.md), no special case. Whether an untrusted session may see the
-schema is thereby a host policy decision made with existing machinery — grant `SELECT` on
-`jed_tables` or don't. Secure by default under explicit-grant sessions.
+**Privileges** (implemented). A catalog relation is gated exactly like a user table: per-table
+`SELECT` under the session envelope (session.md), no special case — the privilege gate treats the
+built-in names as existing relations, so an explicit-grant session (`default_privileges = NONE`)
+raises `42501` without a `grant: SELECT ON jed_tables`. Whether an untrusted session may see the
+schema is thereby a host policy decision made with existing machinery. Secure by default under
+explicit-grant sessions.
 
-**Determinism & cost.** Content is a pure function of the pinned snapshot (CLAUDE.md §10). Row
-order is unspecified without `ORDER BY` (§8 — the corpus compares `rowsort`). Execution is
-metered with the ordinary row-production units and **zero `page_read`** (the catalog is resident
-by construction — pager.md's catalog residency); the exact unit schedule is pinned in
-[cost.md](cost.md) by the implementing slice, cross-core-identical like every cost.
+**Determinism & cost** (implemented; pinned in [cost.md](cost.md) "`generated_row`"). Content is
+a pure function of the pinned snapshot (CLAUDE.md §10). Rows are generated in ascending
+lowercased-name order (jed_columns: then ordinal) — a deterministic internal order with no
+map-iteration leak; the observable contract is the **multiset**, row order without `ORDER BY`
+stays unspecified (§8 — the corpus compares `rowsort`). Each produced row charges one
+**`generated_row`** at the source, under the meter guard (a ceiling aborts mid-generation,
+CLAUDE.md §13), and a catalog scan charges **zero `page_read` / `storage_row_read`** (the catalog
+is resident by construction — pager.md's catalog residency). `EXPLAIN` renders the leaf as
+`Catalog Scan jed_tables (db=<scope>)`.
 
-**First slice — proposed column sets** (the implementing slice may adjust; changes land here):
+**Column sets** (implemented as proposed):
 
 ```
 jed_tables(
@@ -197,19 +222,26 @@ jed_columns(
   table_name  text NOT NULL,     -- canonical owning-table name
   name        text NOT NULL,     -- canonical column name
   ordinal     i32  NOT NULL,     -- 1-based, CREATE TABLE order
-  type        text NOT NULL,     -- canonical type rendering: i32, text, varchar(10),
-                                 --   decimal(8,2), i32[], numrange, a composite's name, …
+  type        text NOT NULL,     -- canonical type rendering (below)
   not_null    boolean NOT NULL,  -- declared NOT NULL or PRIMARY KEY member
-  pk_ordinal  i32                -- 1-based position in the PRIMARY KEY; NULL if not a member
+  pk_ordinal  i32                -- 1-based position in the PRIMARY KEY, in KEY order
+                                 --   (constraints.md §3 — may differ from declaration order);
+                                 --   NULL if not a member
 )
 ```
+
+**The canonical `type` text** (a compatibility surface from the moment it ships; every
+renderable type is pinned in `suites/introspection/jed_columns.test`): the scalar's canonical
+name (`i32`, `text`, `boolean`, `decimal`, `f64`, `jsonb`, …) with the **typmod applied at the
+leaf** — `varchar(10)`, `decimal(8,2)`; a composite renders **its name as created**; a range its
+canonical id from ranges.toml (`i32range`, `numrange`, …); an array appends `[]` to its element's
+rendering (`i32[]`, `addr[]` — and when the element-typmod narrowing lifts, `varchar(5)[]`).
 
 Deliberately minimal: no row counts (a count would force the leaf walks the v25 open work just
 removed — storage.md §6), no `DEFAULT` rendering yet (it needs a pinned canonical
 expression-text form; deferred to a later column addition). **Growth is by adding columns**, so
 consumers should select columns by name, not `SELECT *` positionally — documented at the
-relation, PG's own catalog posture. The canonical `type` text becomes a compatibility surface
-the moment it ships: the implementing slice pins every renderable type in the corpus.
+relation, PG's own catalog posture.
 
 **Later relations** (same model, own slices): `jed_indexes` (name, table, columns, unique,
 method), `jed_constraints` (CHECK / UNIQUE / FK / EXCLUDE, per constraints.md), `jed_sequences`
@@ -232,15 +264,17 @@ relation a pure function of one database's snapshot.
 | Code | Name | Raised |
 |---|---|---|
 | `42939` | `reserved_name` | a user-supplied relation/type name beginning `jed_` (§4) — **registered and implemented now** |
+| `42809` | `wrong_object_type` | a mutation / `CREATE INDEX` / `DROP TABLE` target naming a catalog relation (§5 — read-only; an existing registered code, this use pinned by I1) |
+| `42501` | `insufficient_privilege` | `SELECT` on a catalog relation without a grant under an explicit-grant session envelope (§5; the ordinary session.md gate) |
 
-The relations' own errors (read-only violation, etc.) are pinned by their implementing slices.
+The later relations' own errors (if any new arise) are pinned by their implementing slices.
 
 ## 8. Slices & status
 
 | Slice | Contents | Status |
 |---|---|---|
-| **I0** | this doc; `42939` in the error registry; the `jed_` reservation in all three cores; `suites/ddl/reserved_names.test` | ✅ **this change** |
-| I1 | `jed_tables` + `jed_columns`: resolution funnel interception, computed-relation execution, privilege gating, cost pinning, canonical-type-text corpus, `/web` docs | not started |
+| **I0** | this doc; `42939` in the error registry; the `jed_` reservation in all three cores; `suites/ddl/reserved_names.test` | ✅ landed |
+| **I1** | `jed_tables` + `jed_columns`: resolution funnel interception (CTE-shadow / built-in-first / qualifier scoping), computed-relation execution riding the SRF plan shape, privilege gating, the 42809 read-only rejections, `generated_row` cost pinning (cost.md), `EXPLAIN` `Catalog Scan`, capabilities `introspect.tables`/`introspect.columns`, the canonical-type-text corpus (`suites/introspection/`, 4 files incl. temp + attachment scoping), `/web` docs | ✅ **this change** |
 | I2 | `jed_indexes`, `jed_constraints` | not started |
 | I3 | `jed_sequences`, `jed_types` | not started |
 | — | `information_schema` compat views over the `jed_` relations | door open, **not planned** |

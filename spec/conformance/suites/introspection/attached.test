@@ -1,0 +1,67 @@
+# skip: disk — in-memory host attachments do not survive the disk-mode per-record reopen
+# (spec/design/conformance.md §3, attached-databases.md §5).
+# Catalog relations under an attachment qualifier (spec/design/introspection.md §5):
+# `<attachment>.jed_tables` / `<attachment>.jed_columns` resolve the SAME built-in relations
+# against the attached database's pinned catalog snapshot — the SQLite `aux.sqlite_schema` shape.
+# Every database carries the built-ins in its relation namespace; only the qualifier must name an
+# attached database (else 42P01). jed-specific, CROSS-CORE-checked, NOT oracle-checked.
+# requires: introspect.tables, introspect.columns, harness.attach, attach.in_memory, query.qualified_table, ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.order_by, query.join_inner, query.aggregates, types.i32, types.text
+# attach: reports
+
+# --- a fresh attachment lists nothing -------------------------------------------------------------
+
+query T rowsort
+SELECT name FROM reports.jed_tables
+----
+
+statement ok
+CREATE TABLE main_only (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE reports.sales (id i32 PRIMARY KEY, region text NOT NULL, total i32)
+
+# --- each database's catalog relation lists ONLY its own tables ----------------------------------
+
+query T nosort
+SELECT name FROM reports.jed_tables
+----
+sales
+
+query T nosort
+SELECT name FROM jed_tables
+----
+main_only
+
+# --- the attachment's columns, described from its own snapshot -----------------------------------
+
+query TITB nosort
+SELECT name, ordinal, type, not_null FROM reports.jed_columns WHERE table_name = 'sales' ORDER BY ordinal
+----
+id
+1
+i32
+true
+region
+2
+text
+true
+total
+3
+i32
+false
+
+# --- a spanning query mixes scopes in one consistent snapshot ------------------------------------
+
+query TT nosort
+SELECT m.name, r.name FROM jed_tables m JOIN reports.jed_tables r ON 1 = 1 ORDER BY m.name
+----
+main_only
+sales
+
+# --- writes into an attachment-qualified catalog relation stay rejected --------------------------
+
+statement error 42809
+INSERT INTO reports.jed_tables VALUES ('x')
+
+statement error 42809
+DELETE FROM reports.jed_columns

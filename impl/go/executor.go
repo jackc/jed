@@ -468,6 +468,22 @@ func (s *snapshot) compositeTypesSorted() []*compositeType {
 	return out
 }
 
+// tablesSorted returns all tables in ascending lowercased-name order — a deterministic order
+// with no map-iteration leak (CLAUDE.md §8); the jed_tables / jed_columns generation order
+// (spec/design/introspection.md §5).
+func (s *snapshot) tablesSorted() []*catTable {
+	keys := make([]string, 0, len(s.tables))
+	for k := range s.tables {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]*catTable, len(keys))
+	for i, k := range keys {
+		out[i] = s.tables[k]
+	}
+	return out
+}
+
 // sequence looks up a sequence definition by name (case-insensitive); nil if absent.
 func (s *snapshot) sequence(name string) *sequenceDef {
 	return s.sequences[strings.ToLower(name)]
@@ -3173,8 +3189,15 @@ func (db *engine) checkPrivileges(stmt statement) error {
 	for _, t := range req.tables {
 		key := strings.ToLower(t.name)
 		// Only a name that resolves to an existing catalog table is privilege-checked; a missing one is
-		// left to raise 42P01 in execution (existence before authorization).
-		if _, ok := snap.table(key); ok && !db.session.privileges.AllowsTable(key, t.priv) {
+		// left to raise 42P01 in execution (existence before authorization). A built-in catalog relation
+		// (jed_tables / jed_columns) is gated exactly like a user table — per-table SELECT on its own
+		// name under the session envelope, no special case (introspection.md §5) — so an explicit-grant
+		// session sees the schema only if the host granted it.
+		exists := isCatalogRelName(key)
+		if !exists {
+			_, exists = snap.table(key)
+		}
+		if exists && !db.session.privileges.AllowsTable(key, t.priv) {
 			return newError(InsufficientPrivilege, "permission denied for table "+key)
 		}
 	}
@@ -4930,6 +4953,12 @@ func (db *engine) executeDropTable(dt *dropTable) (outcome, error) {
 		if seen[key] {
 			continue // already resolved this exact target (deduplicated)
 		}
+		// A built-in catalog relation resolves BEFORE the user catalog (introspection.md §5), and a
+		// system relation cannot be dropped: 42809. IF EXISTS does not suppress this (the relation
+		// exists — this is a kind rejection, not a missing name).
+		if isCatalogRelName(key) {
+			return outcome{}, newError(WrongObjectType, `cannot drop system relation "`+key+`"`)
+		}
 		// Resolution walk: session-local temp → persistent. Preclude-overlaps keeps a name in at most one
 		// scope, so this is just "where it lives" (temp-tables.md §3).
 		var scope dropScope
@@ -5295,6 +5324,11 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 	// the qualifier + resolution walk; the cost meter, UNIQUE validation, naming/namespace collision,
 	// and the storage budget are all generic); only the catalog putIndex write must target the owning
 	// snapshot, so the routing happens there.
+	// A built-in catalog relation cannot be indexed (introspection.md §5): 42809, checked by NAME
+	// before qualifier validation, like the DML targets.
+	if err := checkCatalogRelWrite(ci.Table); err != nil {
+		return outcome{}, err
+	}
 	// A DDL write to a READ-ONLY host attachment is 25006 before any work — checked BEFORE the qualifier
 	// existence gate so a read-only attachment refuses the write deterministically (attached-databases.md §4).
 	if err := db.checkAttachmentWritable(ci.DB); err != nil {
@@ -6483,6 +6517,11 @@ func (db *engine) rowConflictsCommitted(store *tableStore, table *catTable, pk [
 }
 
 func (db *engine) executeInsert(ins *insert, params []Value, ctx cteCtx) (outcome, error) {
+	// A catalog relation is read-only (introspection.md §5): a DML target naming one is 42809,
+	// checked by NAME before qualifier validation (the built-in resolves in every database).
+	if err := checkCatalogRelWrite(ins.Table); err != nil {
+		return outcome{}, err
+	}
 	// A write to a READ-ONLY host attachment is 25006 before any I/O — checked BEFORE the qualifier
 	// existence gate so a read-only attachment refuses the write deterministically (attached-databases.md §4).
 	if err := db.checkAttachmentWritable(ins.DB); err != nil {
@@ -7768,6 +7807,11 @@ func dmlOutcome(retNames []string, retTypes []string, returned [][]Value, affect
 // remove them. No WHERE deletes every row. Keys are collected before mutating so the
 // map is not modified while iterating.
 func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (outcome, error) {
+	// A catalog relation is read-only (introspection.md §5): a DML target naming one is 42809,
+	// checked by NAME before qualifier validation (the built-in resolves in every database).
+	if err := checkCatalogRelWrite(del.Table); err != nil {
+		return outcome{}, err
+	}
 	// A write to a READ-ONLY host attachment is 25006 before any I/O — checked BEFORE the qualifier
 	// existence gate so a read-only attachment refuses the write deterministically (attached-databases.md §4).
 	if err := db.checkAttachmentWritable(del.DB); err != nil {
@@ -8041,6 +8085,11 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (ou
 // key must not change this slice); a duplicate target column traps 42701. No WHERE
 // updates every row.
 func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcome, error) {
+	// A catalog relation is read-only (introspection.md §5): a DML target naming one is 42809,
+	// checked by NAME before qualifier validation (the built-in resolves in every database).
+	if err := checkCatalogRelWrite(upd.Table); err != nil {
+		return outcome{}, err
+	}
 	// A write to a READ-ONLY host attachment is 25006 before any I/O — checked BEFORE the qualifier
 	// existence gate so a read-only attachment refuses the write deterministically (attached-databases.md §4).
 	if err := db.checkAttachmentWritable(upd.DB); err != nil {
@@ -10577,20 +10626,32 @@ func (db *engine) planSelect(sel *selectStmt, parent *scope, ctes []*cteBinding,
 		} else if tref.DB != nil {
 			// A database-QUALIFIED name reaches an attachment's table directly (attached-databases.md
 			// §3): it never resolves to a CTE (a CTE has no database qualifier, so `main.x`/`temp.x`
-			// cannot name one) and the qualifier fixes the scope (no temp-vs-persistent shadow). Validate
-			// the qualifier against the implicit scope, then resolve through the temp-first funnel (which,
-			// by preclude-overlaps, lands in the validated scope).
-			if err := db.checkTableQualifier(tref.DB, tref.Name); err != nil {
-				return nil, err
+			// cannot name one) and the qualifier fixes the scope (no temp-vs-persistent shadow).
+			// A built-in catalog relation resolves in EVERY database's relation namespace
+			// (temp.jed_tables, reports.jed_tables — introspection.md §5), before the user catalog;
+			// only the qualifier itself needs validating.
+			if kind, ok := catalogRelKind(tref.Name); ok {
+				scope, serr := db.resolveCatalogScope(tref.DB)
+				if serr != nil {
+					return nil, serr
+				}
+				t = catalogRelTable(kind)
+				srfPlans[i] = &srfPlan{kind: kind, introspectScope: scope}
+			} else {
+				// Validate the qualifier against the implicit scope, then resolve through the temp-first
+				// funnel (which, by preclude-overlaps, lands in the validated scope).
+				if err := db.checkTableQualifier(tref.DB, tref.Name); err != nil {
+					return nil, err
+				}
+				// Route to the qualified database's catalog (attached-databases.md §3): main/temp fall through
+				// to the temp-first funnel (preclude-overlaps lands them in the validated scope), a host
+				// attachment resolves in its own snapshot — where its table lives ONLY.
+				tbl, ok := db.lkpTableScoped(tref.DB, tref.Name)
+				if !ok {
+					return nil, newError(UndefinedTable, "table does not exist: "+*tref.DB+"."+tref.Name)
+				}
+				t = tbl
 			}
-			// Route to the qualified database's catalog (attached-databases.md §3): main/temp fall through
-			// to the temp-first funnel (preclude-overlaps lands them in the validated scope), a host
-			// attachment resolves in its own snapshot — where its table lives ONLY.
-			tbl, ok := db.lkpTableScoped(tref.DB, tref.Name)
-			if !ok {
-				return nil, newError(UndefinedTable, "table does not exist: "+*tref.DB+"."+tref.Name)
-			}
-			t = tbl
 		} else {
 			// A plain FROM name (not an SRF call) may resolve to a CTE, which SHADOWS a catalog
 			// table of the same name (cte.md §2); lookup is case-insensitive. A hit bumps the
@@ -10615,6 +10676,12 @@ func (db *engine) planSelect(sel *selectStmt, parent *scope, ctes []*cteBinding,
 				idx := ci
 				cteIdx = &idx
 				t = ctes[ci].table
+			} else if kind, ok := catalogRelKind(tref.Name); ok {
+				// A built-in catalog relation (introspection.md §5), checked AFTER a CTE (a CTE
+				// shadows it — PG-matching) and BEFORE the user catalog. Unqualified = the implicit
+				// scope (main).
+				t = catalogRelTable(kind)
+				srfPlans[i] = &srfPlan{kind: kind, introspectScope: "main"}
 			} else {
 				tbl, ok := db.lkpTable(tref.Name) // temp-first (temp-tables.md §3)
 				if !ok {
@@ -12174,6 +12241,168 @@ func srfKindName(kind srfKind) string {
 	default:
 		panic("srfKindName is only for the json two-column SRFs")
 	}
+}
+
+// catalogRelKind classifies a relation name as a built-in catalog relation (introspection.md §5):
+// jed_tables / jed_columns, case-insensitively (identifier resolution folds case; grammar.md §3
+// leaves no quoted escape). Built-in names resolve in every database's relation namespace, checked
+// AFTER a statement-local CTE (a CTE shadows a catalog relation — PG-matching, oracle-checked) and
+// BEFORE the user catalog (post-I0 the two can never collide; for a pre-reservation legacy file
+// the built-in wins and the user relation is unreachable by name — §5).
+func catalogRelKind(name string) (srfKind, bool) {
+	switch strings.ToLower(name) {
+	case "jed_tables":
+		return srfJedTables, true
+	case "jed_columns":
+		return srfJedColumns, true
+	}
+	return 0, false
+}
+
+// isCatalogRelName reports whether name is a built-in catalog relation (jed_tables / jed_columns).
+// The write paths use it to reject a catalog relation as a mutation/DDL target (42809 — a catalog
+// relation is read-only, introspection.md §5); the privilege gate uses it so a built-in is
+// SELECT-gated exactly like a user table under an explicit-grant session envelope.
+func isCatalogRelName(name string) bool { _, ok := catalogRelKind(name); return ok }
+
+// checkCatalogRelWrite rejects a mutation target (INSERT / UPDATE / DELETE / CREATE INDEX ON)
+// naming a built-in catalog relation: 42809 wrong_object_type, `cannot modify system relation`
+// (introspection.md §5 — the relations are read-only computed views of the catalog). Checked by
+// NAME, before qualifier validation: the built-in resolves in every database's namespace, so the
+// rejection is scope-independent.
+func checkCatalogRelWrite(name string) error {
+	if isCatalogRelName(name) {
+		return newError(WrongObjectType,
+			`cannot modify system relation "`+strings.ToLower(name)+`"`)
+	}
+	return nil
+}
+
+// catalogRelTable builds the FIXED synthetic schema of a catalog relation (introspection.md §5).
+// Unlike an SRF's single-column alias rule, a FROM alias renames the RELATION only — the column
+// names are part of the introspection surface. Growth is by ADDING columns (consumers select by
+// name, not position — §5).
+func catalogRelTable(kind srfKind) *catTable {
+	switch kind {
+	case srfJedTables:
+		return &catTable{Name: "jed_tables", Columns: []catColumn{
+			{Name: "name", Type: scalarT(scalarText), NotNull: true},
+		}}
+	default: // srfJedColumns
+		return &catTable{Name: "jed_columns", Columns: []catColumn{
+			{Name: "table_name", Type: scalarT(scalarText), NotNull: true},
+			{Name: "name", Type: scalarT(scalarText), NotNull: true},
+			{Name: "ordinal", Type: scalarT(scalarInt32), NotNull: true},
+			{Name: "type", Type: scalarT(scalarText), NotNull: true},
+			{Name: "not_null", Type: scalarT(scalarBool), NotNull: true},
+			{Name: "pk_ordinal", Type: scalarT(scalarInt32)},
+		}}
+	}
+}
+
+// resolveCatalogScope validates a catalog relation's database qualifier and returns the scope
+// string snapForScope resolves at exec (introspection.md §5): nil (unqualified) ⇒ "main" (the
+// implicit scope); "main"/"temp" pass; any other qualifier must name a host attachment (else
+// 42P01, the checkTableQualifier wording). Unlike a user table there is no per-table existence
+// half — the relation exists in EVERY valid scope, so only the scope itself is validated.
+func (db *engine) resolveCatalogScope(qualifier *string) (string, error) {
+	if qualifier == nil {
+		return "main", nil
+	}
+	q := strings.ToLower(*qualifier)
+	if q == "main" || q == "temp" {
+		return q, nil
+	}
+	if db.attachReadSnap(q) == nil {
+		return "", newError(UndefinedTable, `database "`+*qualifier+`" is not attached`)
+	}
+	return q, nil
+}
+
+// catalogTypeText renders a column's declared type in the CANONICAL introspection form
+// (introspection.md §5): the scalar's canonical name with its typmod applied at the leaf
+// (varchar(10), decimal(8,2)), a composite's name as created, a range's canonical id (i32range,
+// numrange, …), and `[]` appended for an array (the typmod applies to the element: varchar(5)[]).
+// This text is a compatibility surface the moment it ships — pinned by the corpus.
+func catalogTypeText(ty dataType, dec *decimalTypmod, vlen *uint32) string {
+	if ty.Array != nil {
+		return catalogTypeText(*ty.Array, dec, vlen) + "[]"
+	}
+	if ty.Range != nil {
+		desc, _ := rangeForElement(ty.Range.ScalarTy())
+		return desc.ID
+	}
+	if ty.Comp != nil {
+		return ty.Comp.Name
+	}
+	if ty.Scalar == scalarText && vlen != nil {
+		return fmt.Sprintf("varchar(%d)", *vlen)
+	}
+	if ty.Scalar == scalarDecimal && dec != nil {
+		return fmt.Sprintf("decimal(%d,%d)", dec.Precision, dec.Scale)
+	}
+	return ty.Scalar.CanonicalName()
+}
+
+// jedTablesRows generates the rows of the jed_tables catalog relation (introspection.md §5): one
+// row per USER table of the scope's pinned catalog snapshot — the canonical (CREATE TABLE-spelled)
+// name — in ascending lowercased-name order (deterministic, no map-iteration leak; the multiset is
+// the contract, order without ORDER BY stays unspecified — CLAUDE.md §8). Derived entirely from
+// the resident catalog: zero page_read / storage_row_read; each produced row charges one
+// generated_row AT THE SOURCE, guarded so a max_cost ceiling aborts deterministically (§13).
+func (db *engine) jedTablesRows(sp *srfPlan, m *costMeter) ([]storedRow, error) {
+	snap := db.snapForScope(sp.introspectScope)
+	if snap == nil {
+		// The attachment was valid at plan time but is gone at exec (a detached-then-reused plan).
+		return nil, newError(UndefinedTable, `database "`+sp.introspectScope+`" is not attached`)
+	}
+	var out []storedRow
+	for _, t := range snap.tablesSorted() {
+		if err := m.Guard(); err != nil {
+			return nil, err
+		}
+		m.Charge(costs.GeneratedRow)
+		out = append(out, storedRow{TextValue(t.Name)})
+	}
+	return out, nil
+}
+
+// jedColumnsRows generates the rows of the jed_columns catalog relation (introspection.md §5): one
+// row per column of every user table of the scope's snapshot, in (lowercased table name, ordinal)
+// order. ordinal is 1-based CREATE TABLE order; type is the canonical type text (catalogTypeText);
+// not_null covers a declared NOT NULL and PRIMARY KEY membership; pk_ordinal is the 1-based
+// position in the PRIMARY KEY in KEY order (which may differ from declaration order —
+// constraints.md §3), NULL for a non-member. Cost mirrors jedTablesRows.
+func (db *engine) jedColumnsRows(sp *srfPlan, m *costMeter) ([]storedRow, error) {
+	snap := db.snapForScope(sp.introspectScope)
+	if snap == nil {
+		return nil, newError(UndefinedTable, `database "`+sp.introspectScope+`" is not attached`)
+	}
+	var out []storedRow
+	for _, t := range snap.tablesSorted() {
+		for i, c := range t.Columns {
+			if err := m.Guard(); err != nil {
+				return nil, err
+			}
+			m.Charge(costs.GeneratedRow)
+			pkOrdinal := NullValue()
+			for k, ord := range t.PK {
+				if ord == i {
+					pkOrdinal = IntValue(int64(k + 1))
+					break
+				}
+			}
+			out = append(out, storedRow{
+				TextValue(t.Name),
+				TextValue(c.Name),
+				IntValue(int64(i + 1)),
+				TextValue(catalogTypeText(c.Type, c.Decimal, c.VarcharLen)),
+				BoolValue(c.NotNull || c.PrimaryKey),
+				pkOrdinal,
+			})
+		}
+	}
+	return out, nil
 }
 
 // generateSeriesRows generates the rows of a generate_series(start, stop[, step]) FROM-clause
@@ -15807,6 +16036,10 @@ func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 			return db.jsonSrfRows(rel.srf, env, meter)
 		case srfJsonTable:
 			return db.jsonTableRows(rel.srf, env, meter)
+		case srfJedTables:
+			return db.jedTablesRows(rel.srf, meter)
+		case srfJedColumns:
+			return db.jedColumnsRows(rel.srf, meter)
 		}
 		return nil, nil
 	}
@@ -19208,6 +19441,16 @@ const (
 	// relation produced by the recursive default-plan expansion. `args` is `[ctx]`; the resolved column
 	// tree is the srfPlan's `jsonTable` field.
 	srfJsonTable
+	// srfJedTables is the jed_tables catalog relation (spec/design/introspection.md §5): a read-only
+	// COMPUTED relation — one row per user table of the qualified database, derived at execution from
+	// its pinned catalog snapshot. Not a function (it is resolved as a table name), but it rides the
+	// srf plan shape so every "computed, not scanned" gate handles it: no store, no index pushdown, no
+	// PK order, excluded from the streaming/vectorized fast paths. `args` is empty; the scope is the
+	// srfPlan's introspectScope.
+	srfJedTables
+	// srfJedColumns is the jed_columns catalog relation (introspection.md §5) — one row per column of
+	// every user table of the qualified database, in (table, ordinal) order.
+	srfJedColumns
 )
 
 // srfPlan is a resolved set-returning-function row source (spec/design/functions.md §10,
@@ -19223,6 +19466,10 @@ type srfPlan struct {
 	recordCols []catColumn
 	// jsonTable is the resolved column tree for a JSON_TABLE SRF (srfJsonTable), else nil.
 	jsonTable *jtPlan
+	// introspectScope is the validated database scope of a catalog relation (srfJedTables /
+	// srfJedColumns — introspection.md §5): "main" (also the unqualified default), "temp", or a
+	// lowercased attachment name. "" for every other kind.
+	introspectScope string
 }
 
 // jtPlan is a resolved JSON_TABLE plan (T1, json-table.md §3) — the compiled root path + the column

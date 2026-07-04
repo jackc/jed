@@ -36,7 +36,8 @@ export const DOCS_NAV: readonly DocSection[] = [
       { title: 'Indexes', href: '/docs/sql/indexes/' },
       { title: 'Querying', href: '/docs/sql/select/' },
       { title: 'EXPLAIN', href: '/docs/sql/explain/' },
-      { title: 'Pattern matching', href: '/docs/sql/pattern-matching/' }
+      { title: 'Pattern matching', href: '/docs/sql/pattern-matching/' },
+      { title: 'Introspection', href: '/docs/sql/introspection/' }
     ]
   },
   {

@@ -1,0 +1,78 @@
+# skip: disk — the disk mode reopens a fresh Database (and session) per record, and session-local
+# temp state does not survive that reopen (spec/design/conformance.md §3, temp-tables.md §2).
+# Catalog relations under the temp qualifier (spec/design/introspection.md §5): `temp.jed_tables` /
+# `temp.jed_columns` resolve the SAME built-in relations against the SESSION-LOCAL temp domain's
+# catalog snapshot — the qualifier picks the database, exactly as for a user table. Unqualified
+# stays main (never temp-first: the built-in exists in every database, so the implicit scope is
+# pinned to main rather than walking). jed-specific, CROSS-CORE-checked, NOT oracle-checked.
+# requires: introspect.tables, introspect.columns, ddl.create_table, ddl.primary_key, ddl.temp_table, ddl.drop_table, dml.insert, query.select, query.where_eq, query.order_by, query.qualified_table, query.aggregates, session.allow_temp_ddl, types.i32, types.text
+
+# --- an empty temp domain lists nothing -----------------------------------------------------------
+
+query T rowsort
+SELECT name FROM temp.jed_tables
+----
+
+statement ok
+CREATE TABLE persistent (id i32 PRIMARY KEY, v text)
+
+statement ok
+CREATE TEMP TABLE scratch (x i32, y text NOT NULL)
+
+# --- the qualifier picks the database: temp lists ONLY temp tables, main ONLY persistent ---------
+
+query T nosort
+SELECT name FROM temp.jed_tables
+----
+scratch
+
+query T nosort
+SELECT name FROM main.jed_tables
+----
+persistent
+
+# unqualified = the implicit scope (main) — a temp table never shadows into it
+query T nosort
+SELECT name FROM jed_tables
+----
+persistent
+
+# --- temp.jed_columns describes the temp table's columns ------------------------------------------
+
+query TITB nosort
+SELECT name, ordinal, type, not_null FROM temp.jed_columns WHERE table_name = 'scratch' ORDER BY ordinal
+----
+x
+1
+i32
+false
+y
+2
+text
+true
+
+# --- temp DDL is reflected immediately, and DROP removes the row ---------------------------------
+
+statement ok
+CREATE TEMP TABLE second (a i32)
+
+query I nosort
+SELECT count(*) FROM temp.jed_tables
+----
+2
+
+statement ok
+DROP TABLE second
+
+query T nosort
+SELECT name FROM temp.jed_tables
+----
+scratch
+
+# --- read-only regardless of scope (checked by name, before qualifier routing) -------------------
+
+statement error 42809
+DELETE FROM temp.jed_tables
+
+statement error 42809
+INSERT INTO temp.jed_columns VALUES ('t', 'c', 1, 'i32', false, NULL)

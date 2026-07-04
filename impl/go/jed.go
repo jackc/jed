@@ -707,6 +707,13 @@ var SupportedCapabilities = []string{
 	"expr.json_query_fns",
 	// JSON_TABLE with the default plan (T1, json-table.md §3): COLUMNS, FOR ORDINALITY, EXISTS, NESTED.
 	"func.json_table",
+	// The jed_tables catalog relation (I1, spec/design/introspection.md §5): a read-only computed
+	// relation — one row per user table of the qualified database, derived at execution from its
+	// pinned catalog snapshot; SELECT-gated like a user table; write/DDL targets are 42809.
+	"introspect.tables",
+	// The jed_columns catalog relation (I1): one row per column of every user table — ordinal,
+	// canonical type text, not_null, pk_ordinal (introspection.md §5).
+	"introspect.columns",
 }
 
 // Execute parses and executes one SQL statement against db (no bind parameters).
