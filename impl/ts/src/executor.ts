@@ -122,7 +122,7 @@ import {
   extractField,
 } from "./datetime_fn.ts";
 import { crc32Ieee, newTempStorage, pagePayload, resolveUnfetchedSelf } from "./format.ts";
-import { persistTemp } from "./persist.ts";
+import { commitDurableAttachment, persistTemp } from "./persist.ts";
 import {
   Decimal,
   decimalFromParts,
@@ -2188,21 +2188,25 @@ function* bufferedRows(
 // qualifier. Its MUTABLE storage identity (page accounting, block store + pager) lives here — an
 // Engine over an in-RAM MemoryBlockStore, exactly like the temp domain (newAttachedStorage). The
 // immutable committed snapshot lives in the core's attached roots under the same key, so a reader pins
-// it lock-free together with every other root. In Slice 1b every attachment is in-memory; a
-// file-backed one (Slice 2) would carry a FileBlockStore-backed storage Engine instead.
+// it lock-free together with every other root. An attachment is file-backed (Slice 2 — storage.path is
+// non-null, a FileBlockStore behind the pager, committed durably via commitDurableAttachment) or
+// in-memory (storage.path is null, a MemoryBlockStore, committed via persistTemp). The storage Engine's
+// path is the sole source of the file/memory distinction.
 export type Attachment = {
   name: string; // lowercased qualifier name (the registry key)
   readOnly: boolean; // a read-only attachment rejects every write (DML + DDL) with 25006 (§4)
-  storage: Engine; // the in-memory block store + pager + page accounting (like the temp domain)
+  storage: Engine; // the block store (file or in-memory) + pager + page accounting
 };
 
 // AttachmentCore is the minimal view of the shared core the executor needs for attachment routing
-// (spec/design/attached-databases.md §5): the core-owned registry + the reader-liveness watermark.
-// SharedCore (shared.ts) implements it structurally; a bare/transient engine carries `core = null`.
-// Declared here (not imported from shared.ts) because shared.ts imports the Engine, not the reverse.
+// (spec/design/attached-databases.md §5): the core-owned registry, the reader-liveness watermark, and
+// whether MAIN is durable (the one-durable-writer count, §5). SharedCore (shared.ts) implements it
+// structurally; a bare/transient engine carries `core = null`. Declared here (not imported from
+// shared.ts) because shared.ts imports the Engine, not the reverse.
 export interface AttachmentCore {
   attachments: Map<string, Attachment>;
   hasLiveReaders(): boolean;
+  mainIsDurable(): boolean;
 }
 
 // isReservedScope reports whether a database qualifier names one of the two implicit reserved scopes
@@ -2639,6 +2643,14 @@ export class Engine {
     tx.attachWorking.set(name, ws);
     tx.attachDirty!.add(name);
     return ws;
+  }
+
+  // attachPageSize is the page size of a host attachment's OWN page space (attached-databases.md §2) —
+  // used to build its NEW stores (CREATE TABLE / CREATE INDEX) at the size its commit serializes to. A
+  // file attachment carries its own page size, baked into the file, which may differ from main's; an
+  // in-memory one matches main. The attachment is known to exist (the qualifier gate passed).
+  private attachPageSize(name: string): number {
+    return this.core!.attachments.get(name)!.storage.pageSize;
   }
 
   // attachReadView returns the current READ view of every attached database — the transaction's working
@@ -3446,6 +3458,17 @@ export class Engine {
       return { kind: "statement", cost: 0n, rowsAffected: null };
     }
     const working = tx.working;
+    // One durable writer per transaction (attached-databases.md §5): at most one FILE-backed database —
+    // MAIN or an attached file — may be written per tx (any number of in-memory attachments + session
+    // temp are free). Checked here, before any durable page is written (the shared-core main persist is
+    // deferred to Session.publish, and the attachment durable commits are the loop below), so a violating
+    // tx commits nothing. Deterministic (a count, order-independent).
+    if (this.oneDurableWriterExceeded(tx)) {
+      throw engineError(
+        "feature_not_supported",
+        "a transaction may modify at most one durable database",
+      );
+    }
     // Persist the main image when it changed; a transaction that touched ONLY session-local temp tables
     // skips it entirely so a temp table makes ZERO file writes (spec/design/temp-tables.md §2). An empty
     // block (no kind dirty) still persists, preserving prior behavior. Temp state is adopted regardless
@@ -3489,12 +3512,42 @@ export class Engine {
         const att = this.core.attachments.get(name);
         if (att === undefined) continue; // detached mid-transaction (unreachable) — nothing to persist
         const ws = tx.attachWorking!.get(name)!;
-        persistTemp(att.storage, ws, canReclaim);
+        // A FILE attachment commits DURABLY (dirty pages + alternating meta slot + fsync, its own page
+        // space); an in-memory one packs persist_temp-style (NO fsync). At most one file attachment is
+        // dirty here (the one-durable-writer check above), so ≤1 fsync path runs.
+        if (att.storage.path !== null) {
+          ws.txid = (this.attachedCommitted.get(name)?.txid ?? 0n) + 1n; // alternating meta slot + reopen
+          commitDurableAttachment(att.storage, ws, canReclaim);
+        } else {
+          persistTemp(att.storage, ws, canReclaim);
+        }
         na.set(name, ws);
       }
       this.attachedCommitted = na;
     }
     return { kind: "statement", cost: 0n, rowsAffected: null };
+  }
+
+  // oneDurableWriterExceeded reports whether this transaction would write more than one FILE-backed
+  // (durable) database — MAIN or an attached file (attached-databases.md §5). In-memory attachments and
+  // session temp are free (their commit is a crash-free pointer swap). > 1 durable is 0A000 (the honest
+  // v1 narrowing — multi-file atomic write is Slice 3).
+  private oneDurableWriterExceeded(tx: ActiveTx): boolean {
+    let durable = tx.mainDirty && this.mainIsDurable() ? 1 : 0;
+    if (this.core !== null && tx.attachDirty !== undefined) {
+      for (const name of tx.attachDirty) {
+        const att = this.core.attachments.get(name);
+        if (att !== undefined && att.storage.path !== null) durable++;
+      }
+    }
+    return durable > 1;
+  }
+
+  // mainIsDurable reports whether this handle's MAIN database is file-backed (durable) — the input to the
+  // one-durable-writer count (§5). In the shared-core path the core knows (its storage's backing path);
+  // a standalone engine is durable iff it carries a persistHook (the file/OPFS host set one).
+  private mainIsDurable(): boolean {
+    return this.core !== null ? this.core.mainIsDurable() : this.persistHook !== null;
   }
 
   // rollbackTx rolls back the current transaction (spec/design/transactions.md §4.2). With no open
@@ -5012,9 +5065,12 @@ export class Engine {
       ws.tempPaging = this.core!.attachments.get(attachName)!.storage.paging;
       const mainTypes = this.readSnap().types;
       const colTypes = table.columns.map((c) => resolveColType(c.type, mainTypes));
-      ws.putTableResolved(table, colTypes, this.pageSize);
+      // Build the attachment's new stores at ITS OWN page size (§2) — a file attachment may serialize at
+      // a different page size than main, and its records must split to match.
+      const aps = this.attachPageSize(attachName);
+      ws.putTableResolved(table, colTypes, aps);
       for (const ix of table.indexes) {
-        ws.putIndexStore(ix.name.toLowerCase(), new TableStore(pagePayload(this.pageSize), []));
+        ws.putIndexStore(ix.name.toLowerCase(), new TableStore(pagePayload(aps), []));
       }
       return { kind: "statement", cost: 0n, rowsAffected: null };
     }
@@ -5561,7 +5617,7 @@ export class Engine {
       // into the attached roots at commit (attached-databases.md §5/§6). attachWriteSnap marks it dirty.
       const ws = this.attachWriteSnap(attachName)!;
       ws.tempPaging = this.core!.attachments.get(attachName)!.storage.paging;
-      ws.putIndex(tableKey, def, this.pageSize);
+      ws.putIndex(tableKey, def, this.attachPageSize(attachName)); // the attachment's own page space (§2)
     } else if (this.isTempTable(ci.table)) {
       this.session.tx!.tempDirty = true;
       this.session.tx!.tempWorking.putIndex(tableKey, def, this.pageSize);

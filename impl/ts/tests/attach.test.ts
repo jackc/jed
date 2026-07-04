@@ -1,15 +1,71 @@
-// Host-attached in-memory databases — the Database.attach/detach host API (spec/design/attached-
-// databases.md §4/§6, Slice 1b). These are the behaviors the shared corpus CANNOT express (it is
-// single-handle SQL-in/rows-out and cannot call db.attach — CLAUDE.md §10): the attach/detach
-// lifecycle, the read-only write-rejection (25006), detach-in-use (55006), reserved/duplicate names
-// (42710), unknown detach (42704), and the file-source deferral (0A000). The SQL routing itself lives
-// in the corpus (suites/attach/in_memory.test). Mirrors impl/go/attach_test.go and
+// Host-attached databases — the Database.attach/detach host API (spec/design/attached-databases.md
+// §4/§6, Slices 1b + 2). These are the behaviors the shared corpus CANNOT express (it is single-handle
+// SQL-in/rows-out and cannot call db.attach — CLAUDE.md §10): the attach/detach lifecycle, the read-only
+// write-rejection (25006), detach-in-use (55006), reserved/duplicate names (42710), unknown detach
+// (42704), and — for FILE attachments (Slice 2) — cross-file read/join, read-write durability across a
+// standalone reopen, the one-durable-writer rule (0A000), page-size independence, and missing-file
+// (58P01). The in-memory SQL routing lives in the corpus (suites/attach/in_memory.test); file durability
+// / reopen is inherently a per-core host test (out of corpus reach). Mirrors impl/go/attach_test.go and
 // impl/rust/tests/attach.rs.
 
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
-import { attachFile, attachMemory, type Database, EngineError, type Session } from "../src/lib.ts";
+import {
+  attachFile,
+  attachMemory,
+  createDatabase,
+  type Database,
+  EngineError,
+  openDatabase,
+  type Session,
+  type Value,
+} from "../src/lib.ts";
 import { memDb } from "./mem_db.ts";
+
+// tmpDir makes a fresh scratch directory (never the repo tree), matching tests/api.test.ts.
+function tmpDir(): string {
+  return mkdtempSync(join(tmpdir(), "jed-attach-"));
+}
+
+// makeFileDb creates a fresh single-file database at dir/name with page size `pageSize` (0 → default),
+// runs each statement (autocommitting durably), and closes it — the reusable fixture for the file-attach
+// tests (a self-describing jed file another handle can attach). Returns the path.
+function makeFileDb(dir: string, name: string, pageSize: number, stmts: string[]): string {
+  const path = join(dir, name);
+  const db = createDatabase(pageSize === 0 ? { path } : { path, pageSize });
+  const s = db.session();
+  for (const sql of stmts) s.execute(sql);
+  s.close();
+  db.close();
+  return path;
+}
+
+// intCol collects a single-column bigint result from a session query, closing the cursor.
+function intCol(s: Session, sql: string): bigint[] {
+  const rows = s.query(sql);
+  const out: bigint[] = [];
+  for (const r of rows) {
+    const v = r[0]!;
+    out.push(v.kind === "int" ? v.int : -1n);
+  }
+  rows.close();
+  return out;
+}
+
+// textCol collects a single-column text result from a session query, closing the cursor.
+function textCol(s: Session, sql: string): string[] {
+  const rows = s.query(sql);
+  const out: string[] = [];
+  for (const r of rows) {
+    const v: Value = r[0]!;
+    out.push(v.kind === "text" ? v.text : "");
+  }
+  rows.close();
+  return out;
+}
 
 // errCode runs a statement expected to fail and returns its SQLSTATE.
 function errCode(s: Session, sql: string): string {
@@ -121,15 +177,202 @@ test("reserved / duplicate attach names are 42710; unknown detach is 42704", () 
   }
 });
 
-// TestAttachFileSourceDeferred — a FILE-backed attach source is Slice 2; Database.attach with a file
-// source throws 0A000 now, so the host-API signature never changes when file attach lands. This is
-// also the one-durable-writer guard's inert form in 1b (no writable file attachment can exist yet).
-test("file attach source is deferred (0A000)", () => {
-  const db = memDb();
-  assert.throws(
-    () => db.attach("f", attachFile("/tmp/whatever.jed"), false),
-    (e: unknown) => e instanceof EngineError && e.code() === "0A000",
-  );
+// Attach an existing file database read-only, join a local table against it, and confirm every write to
+// it is 25006 (the natural reference-database mode, attached-databases.md §4, Slice 2). Reads fault the
+// attached file's pages through its own pager.
+test("file attach read-only: cross-file join + 25006 writes", () => {
+  const dir = tmpDir();
+  try {
+    const ref = makeFileDb(dir, "ref.jed", 0, [
+      "CREATE TABLE city (id i32 PRIMARY KEY, name text)",
+      "INSERT INTO city VALUES (1, 'Ada'), (2, 'Bos')",
+    ]);
+    const db = memDb();
+    db.attach("ref", attachFile(ref), true);
+    const s = db.session();
+    s.execute("CREATE TABLE visit (city_id i32 PRIMARY KEY, n i32)");
+    s.execute("INSERT INTO visit VALUES (1, 7), (2, 9)");
+
+    // A cross-FILE join: local `visit` against the read-only attached file's `city`.
+    assert.deepEqual(
+      textCol(s, "SELECT c.name FROM visit v JOIN ref.city c ON c.id = v.city_id ORDER BY c.id"),
+      ["Ada", "Bos"],
+    );
+    // Every write to the read-only attachment is 25006, before any I/O.
+    for (const sql of [
+      "CREATE TABLE ref.t (id i32 PRIMARY KEY)",
+      "INSERT INTO ref.city VALUES (3, 'Cai')",
+      "UPDATE ref.city SET name = 'x'",
+      "DELETE FROM ref.city",
+    ]) {
+      assert.equal(errCode(s, sql), "25006", sql);
+    }
+    s.close();
+    db.detach("ref");
+    db.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Attach a file read-write, create+populate a table in it by qualifier, detach, then open that file
+// STANDALONE and confirm the writes are durable (attached-databases.md §5 — a file attachment commits
+// durably through its own pager + alternating meta slot + fsync).
+test("file attach read-write persists across a standalone reopen", () => {
+  const dir = tmpDir();
+  try {
+    const work = makeFileDb(dir, "work.jed", 0, []); // an empty writable file to attach
+    const db = memDb();
+    db.attach("work", attachFile(work), false);
+    const s = db.session();
+    s.execute("CREATE TABLE work.acct (id i32 PRIMARY KEY, bal i32)");
+    s.execute("INSERT INTO work.acct VALUES (1, 100), (2, 200)");
+    s.execute("CREATE INDEX acct_bal ON work.acct (bal)");
+    s.close();
+    db.detach("work");
+    db.close();
+
+    // Reopen the attached file on its own — the rows + index must be there (durable + self-describing).
+    const reopened = openDatabase(work);
+    const rs = reopened.session();
+    assert.deepEqual(intCol(rs, "SELECT bal FROM acct ORDER BY id"), [100n, 200n]);
+    rs.close();
+    const tbl = reopened.table("acct")!;
+    assert.equal(tbl.indexes.length, 1);
+    assert.equal(tbl.indexes[0]!.name, "acct_bal");
+    reopened.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// A transaction may write at most one FILE-backed database (§5). With a FILE main and a read-write FILE
+// attachment, a block that writes BOTH is 0A000 at COMMIT and commits nothing; writing either one alone
+// succeeds. In-memory attachments never count against the slot.
+test("file attach: one durable writer per transaction (0A000)", () => {
+  const dir = tmpDir();
+  try {
+    const mainPath = makeFileDb(dir, "main.jed", 0, ["CREATE TABLE m (id i32 PRIMARY KEY)"]);
+    const extra = makeFileDb(dir, "extra.jed", 0, ["CREATE TABLE e (id i32 PRIMARY KEY)"]);
+
+    const db = openDatabase(mainPath);
+    db.attach("extra", attachFile(extra), false);
+    const s = db.session();
+    s.begin(true);
+    s.execute("INSERT INTO m VALUES (1)"); // main (file) dirtied
+    s.execute("INSERT INTO extra.e VALUES (1)"); // a SECOND durable (file) database dirtied
+    assert.throws(
+      () => s.commit(),
+      (e: unknown) => e instanceof EngineError && e.code() === "0A000",
+    );
+    // Nothing was committed — both files are still empty of the attempted rows.
+    assert.deepEqual(intCol(s, "SELECT count(*) FROM m"), [0n]);
+    assert.deepEqual(intCol(s, "SELECT count(*) FROM extra.e"), [0n]);
+
+    // Writing each durable database ALONE (its own autocommit statement) is fine.
+    s.execute("INSERT INTO m VALUES (2)");
+    s.execute("INSERT INTO extra.e VALUES (2)");
+    assert.deepEqual(intCol(s, "SELECT id FROM m"), [2n]);
+    assert.deepEqual(intCol(s, "SELECT id FROM extra.e"), [2n]);
+    s.close();
+    db.detach("extra");
+    db.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// The slot counts only FILE databases: an IN-MEMORY main plus a read-write FILE attachment is ONE
+// durable writer, so a block writing both commits cleanly (§5).
+test("file attach: memory main + one file attachment commits together", () => {
+  const dir = tmpDir();
+  try {
+    const work = makeFileDb(dir, "work.jed", 0, ["CREATE TABLE w (id i32 PRIMARY KEY)"]);
+    const db = memDb(); // in-memory main — not durable
+    db.attach("work", attachFile(work), false);
+    const s = db.session();
+    s.execute("CREATE TABLE local (id i32 PRIMARY KEY)");
+    s.begin(true);
+    s.execute("INSERT INTO local VALUES (1)"); // in-memory main (free)
+    s.execute("INSERT INTO work.w VALUES (1)"); // the one durable writer
+    s.commit();
+    assert.deepEqual(intCol(s, "SELECT id FROM work.w"), [1n]);
+    s.close();
+    db.detach("work");
+    db.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// An attached file keeps its OWN page space (§2): attaching a file created at a non-default page size
+// and writing into it serializes at THAT page size, verified by a standalone reopen. Guards the CREATE
+// TABLE / CREATE INDEX page-size routing (attachPageSize).
+test("file attach: attachment keeps its own page size", () => {
+  const dir = tmpDir();
+  try {
+    const small = makeFileDb(dir, "small.jed", 256, []); // a 256-byte-page file, unlike the default main
+    const db = memDb();
+    db.attach("small", attachFile(small), false);
+    const s = db.session();
+    s.execute("CREATE TABLE small.grid (id i32 PRIMARY KEY, v i32)");
+    // Enough rows to force at least one leaf split at the small page size (its own page space).
+    for (let i = 1; i <= 40; i++) s.execute(`INSERT INTO small.grid VALUES (${i}, ${i * i})`);
+    s.close();
+    db.detach("small");
+    db.close();
+
+    const reopened = openDatabase(small);
+    assert.equal(reopened.pageSize, 256);
+    const rs = reopened.session();
+    // sum of i*i for i in 1..=40 = 22140.
+    assert.deepEqual(intCol(rs, "SELECT count(*) FROM grid"), [40n]);
+    assert.deepEqual(intCol(rs, "SELECT sum(v) FROM grid"), [22140n]);
+    rs.close();
+    reopened.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Detaching a file releases it, so the same file can be attached again.
+test("file attach: detach releases, re-attach works", () => {
+  const dir = tmpDir();
+  try {
+    const ref = makeFileDb(dir, "ref.jed", 0, [
+      "CREATE TABLE t (id i32 PRIMARY KEY)",
+      "INSERT INTO t VALUES (1)",
+    ]);
+    const db = memDb();
+    for (let i = 0; i < 3; i++) {
+      db.attach("ref", attachFile(ref), true);
+      const s = db.session();
+      assert.deepEqual(intCol(s, "SELECT id FROM ref.t"), [1n], `attach #${i}`);
+      s.close();
+      db.detach("ref");
+    }
+    db.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Attaching a nonexistent file surfaces the same host/file code as opening main (§11 / hosts.md §4); the
+// failed attach leaves no registry entry.
+test("file attach: missing file is 58P01, leaves the name free", () => {
+  const dir = tmpDir();
+  try {
+    const db = memDb();
+    assert.throws(
+      () => db.attach("x", attachFile(join(dir, "nope.jed")), true),
+      (e: unknown) => e instanceof EngineError && e.code() === "58P01",
+    );
+    // The name is free after the failed attach.
+    db.attach("x", attachMemory(), false);
+    db.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // TestAttachCaseInsensitiveQualifier — an attachment is reached case-insensitively by its qualifier

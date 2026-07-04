@@ -23,7 +23,7 @@ import { loadEnginePaged, toImage } from "./format.ts";
 import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "./paging.ts";
 import { Pager } from "./pager.ts";
 import { persistImpl } from "./persist.ts";
-import { buildInMemory, Database } from "./shared.ts";
+import { buildInMemory, Database, registerFileAttachOpener } from "./shared.ts";
 import { FileSpillSink } from "./spillfile.ts";
 
 // DatabaseOptions are the settings for a newly-created database file (spec/design/api.md §2).
@@ -137,6 +137,11 @@ export function open(path: string, opts: OpenOptions = {}): Engine {
     throw ioError(e);
   }
 }
+
+// Register the Node file host as the file-attach opener (attached-databases.md §4, Slice 2): importing
+// file.ts (the node host) enables `db.attach(name, attachFile(path))` without shared.ts importing a host
+// module (it stays browser-clean). The OPFS host registers its own. Read-only opens the file O_RDONLY.
+registerFileAttachOpener((path, readOnly) => open(path, { readOnly }));
 
 // createDatabase makes a fresh database — in-memory (opts.path absent) or file-backed (opts.path set)
 // — and returns the host Database handle with its default session (spec/design/api.md §2.1/§2.1.1). A

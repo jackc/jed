@@ -167,6 +167,13 @@ class SharedCore {
     return this.live.size > 0;
   }
 
+  // mainIsDurable reports whether MAIN is file-backed (durable) rather than in-memory — the input to the
+  // one-durable-writer count (attached-databases.md §5). The storage identity's byte store carries a
+  // path only for a file-backed core.
+  mainIsDurable(): boolean {
+    return this.storage.path !== null;
+  }
+
   register(version: bigint): void {
     this.live.set(version, (this.live.get(version) ?? 0) + 1);
   }
@@ -198,9 +205,8 @@ class SharedCore {
 }
 
 // AttachSource selects the backing for a database attached via Database.attach
-// (spec/design/attached-databases.md §4). A stable memory|file variant from Slice 1b: only a MEMORY
-// source is supported now (a fresh, empty in-memory database); a FILE source is reserved for Slice 2 and
-// currently throws 0A000, so the attach signature never changes when file attach lands. Build one with
+// (spec/design/attached-databases.md §4). A MEMORY source is a fresh, empty in-memory database
+// (Slice 1b); a FILE source opens an existing single-file jed database on disk (Slice 2). Build one with
 // attachMemory() or attachFile(path).
 export type AttachSource = { file: boolean; path?: string };
 
@@ -209,10 +215,26 @@ export function attachMemory(): AttachSource {
   return { file: false };
 }
 
-// attachFile returns a source for a file-backed attachment. Reserved for Slice 2: Database.attach with a
-// file source currently throws 0A000 (feature_not_supported).
+// attachFile returns a source for a file-backed attachment: an existing single-file jed database at path
+// (attached-databases.md §4, Slice 2). The file's own page size is honored (each attachment is its own
+// page space, §2). With readOnly=true it is opened read-only (as well as write-rejected, 25006);
+// readOnly=false opens it read-write so DDL/DML can target it (subject to the one-durable-writer rule, §5).
 export function attachFile(path: string): AttachSource {
   return { file: true, path };
+}
+
+// fileAttachOpener is the host-injected file opener for a file-backed attachment (attached-databases.md
+// §4, Slice 2): the node host (file.ts) registers it at load, so Database.attach can open a file-backed
+// attachment WITHOUT shared.ts importing a host module (keeping it browser-clean — the same reason
+// file.ts, not shared.ts, owns open/create). Returns the opened storage Engine (its committed snapshot +
+// paging become the attachment). null until a host registers one → a file attach then throws
+// feature_not_supported (a pure in-memory build has no file layer to reach).
+let fileAttachOpener: ((path: string, readOnly: boolean) => Engine) | null = null;
+
+// registerFileAttachOpener installs the host file layer that Database.attach uses for a file source
+// (called once, at file.ts module load). The OPFS host would register its own.
+export function registerFileAttachOpener(fn: (path: string, readOnly: boolean) => Engine): void {
+  fileAttachOpener = fn;
 }
 
 // Database is the host-facing database handle (spec/design/session.md §2.1/§2.4): the shared core. It
@@ -263,33 +285,51 @@ export class Database {
 
   // attach adds a database named `name` to this handle, reachable by the database qualifier
   // `name.table` (spec/design/attached-databases.md §4). Attaching is a HOST-API act, never SQL — an
-  // untrusted, SQL-only session cannot attach anything (the pure-SQL safety spine, §4/§13). In Slice 1b
-  // `source` must be attachMemory() (a fresh, empty in-memory database); attachFile is reserved for
-  // Slice 2 and throws 0A000. `readOnly` attaches it read-only: every write to it (DML or DDL) is 25006,
-  // and it never competes for the one-durable-writer slot (§5). The name is case-folded; it must not
-  // name a reserved database (`main` / `temp`) or one already attached (42710). Publishing the new empty
-  // attachment root replaces the attached map (a pinned reader keeps its old map).
+  // untrusted, SQL-only session cannot attach anything (the pure-SQL safety spine, §4/§13). `source` is
+  // either attachMemory() (a fresh, empty in-memory database) or attachFile(path) (an existing single-file
+  // jed database on disk, Slice 2 — its committed state becomes the attachment's initial root, its own
+  // page size honored). `readOnly` attaches it read-only: every write to it (DML or DDL) is 25006, it
+  // never competes for the one-durable-writer slot (§5), and a file source is additionally opened
+  // read-only. The name is case-folded; it must not name a reserved database (`main` / `temp`) or one
+  // already attached (42710). Opening a file surfaces the same host/file codes as opening `main`
+  // (58P01/XX001/…). Publishing the new root replaces the attached map (a pinned reader keeps its old map).
   attach(name: string, source: AttachSource = attachMemory(), readOnly = false): void {
-    if (source.file) {
-      throw engineError("feature_not_supported", "file attachment is not supported yet (Slice 2)");
-    }
     const lname = name.toLowerCase();
     if (lname === "") {
       throw engineError("duplicate_object", "attachment name must not be empty");
     }
     const c = this.core;
-    if (lname === "main" || lname === "temp" || c.attachments.has(lname)) {
-      throw engineError("duplicate_object", `database "${name}" already exists`);
+    let storage: Engine;
+    let root: Snapshot;
+    if (source.file) {
+      if (fileAttachOpener === null) {
+        // A pure in-memory build (no node/OPFS host imported) has no file layer to reach.
+        throw engineError("feature_not_supported", "file attachment needs a host file layer");
+      }
+      // Open the file BEFORE the dup check (an open may throw 58P01/XX001); on a name conflict close it.
+      const engine = fileAttachOpener(source.path!, readOnly);
+      if (lname === "main" || lname === "temp" || c.attachments.has(lname)) {
+        engine.paging?.close(); // release the just-opened file — the name is taken
+        throw engineError("duplicate_object", `database "${name}" already exists`);
+      }
+      storage = engine; // its stores fault through engine.paging (bound at load); tempPaging stays unset
+      root = engine.committed;
+    } else {
+      if (lname === "main" || lname === "temp" || c.attachments.has(lname)) {
+        throw engineError("duplicate_object", `database "${name}" already exists`);
+      }
+      storage = newAttachedStorage(c.pageSize);
+      // The fresh attachment's committed root: an empty snapshot whose NEW stores attach to its own paging
+      // (the same tempPaging seam session-local temp uses — a snapshot's tempPaging is "the paging new
+      // stores bind to").
+      const empty = new Snapshot(0n);
+      empty.tempPaging = storage.paging;
+      root = empty;
     }
-    const storage = newAttachedStorage(c.pageSize);
     c.attachments.set(lname, { name: lname, readOnly, storage });
-    // The fresh attachment's committed root: an empty snapshot whose NEW stores attach to its own paging
-    // (the same tempPaging seam session-local temp uses — a snapshot's tempPaging is "the paging new
-    // stores bind to"). Publish a NEW attached map so a live reader's pinned map is unaffected.
-    const empty = new Snapshot(0n);
-    empty.tempPaging = storage.paging;
+    // Publish a NEW attached map so a live reader's pinned map is unaffected.
     const na = new Map(c.attached);
-    na.set(lname, empty);
+    na.set(lname, root);
     c.attached = na;
   }
 
@@ -308,10 +348,14 @@ export class Database {
     if (c.hasLiveReaders()) {
       throw engineError("object_in_use", `cannot detach database "${name}" while it is in use`);
     }
+    const att = c.attachments.get(lname)!;
     c.attachments.delete(lname);
     const na = new Map(c.attached);
     na.delete(lname);
     c.attached = na;
+    // Release a file attachment's OS handle once it is unpublished and unreferenced (a no-op for an
+    // in-memory attachment). No live reader can still fault it — detach-in-use was rejected above.
+    att.storage.paging?.close();
   }
 
   // readSession opens a READ ONLY session over a consistent snapshot (spec/design/session.md §2.4,
@@ -480,6 +524,10 @@ export class Database {
       st.paging.close();
       st.paging = null;
     }
+    // Release any still-attached file databases (an in-memory attachment's close is a no-op), so the host
+    // need not detach before close (attached-databases.md §4). Order-independent (just closing).
+    for (const att of this.core.attachments.values()) att.storage.paging?.close();
+    this.core.attachments = new Map();
   }
 
   // fromImage lifts a from-scratch on-disk image (spec/fileformat/format.md) into an in-memory host

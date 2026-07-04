@@ -48,6 +48,19 @@ export function persistImpl(db: Engine, snap: Snapshot): IncrementalWrite {
   return write;
 }
 
+// commitDurableAttachment durably commits a FILE-backed host attachment's working snapshot into its own
+// byte store (attached-databases.md §5, Slice 2): the SAME durable recipe as the main persist
+// (persistImpl — dirty pages + alternating meta slot + fsync, its own page space), then the post-commit
+// residency flip (demoteCleanLeaves — bplus-reshape.md B4) and within-session compaction (a no-op for a
+// file domain, whose reclaimWithinSession is false — it reconstructs its free-list on open instead). The
+// caller advances snap.txid before calling (the alternating meta slot + reopen). Runs under the writer
+// gate (single-writer page accounting). An in-memory attachment uses persistTemp instead (no fsync).
+export function commitDurableAttachment(db: Engine, snap: Snapshot, canReclaim: boolean): void {
+  const write = persistImpl(db, snap);
+  snap.demoteCleanLeaves();
+  maybeCompact(db, snap, write.rootPage, canReclaim);
+}
+
 // maybeCompact reclaims within-session copy-on-write orphans for a reclaim domain (temp) by rebuilding
 // the free-list from the live (reachable) set, so later commits reuse dead pages instead of only growing
 // the high-water (temp-tables.md §6, bplus-reshape.md). It is:

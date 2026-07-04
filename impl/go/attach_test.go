@@ -1,12 +1,14 @@
 package jed
 
-// Host-attached in-memory databases — the Database.Attach/Detach host API (spec/design/attached-
-// databases.md §4/§6, Slice 1b). These are the behaviors the shared corpus CANNOT express (it is
-// single-handle SQL-in/rows-out and cannot call db.Attach — CLAUDE.md §10): the attach/detach
-// lifecycle, the read-only write-rejection (25006), detach-in-use (55006), reserved/duplicate names
-// (42710), unknown detach (42704), and the file-source deferral (0A000). The SQL routing itself lives
-// in the corpus (suites/attach/in_memory.test). Mirrors impl/rust/tests/attach.rs and
-// impl/ts/test/attach.test.ts.
+// Host-attached databases — the Database.Attach/Detach host API (spec/design/attached-databases.md
+// §4/§6, Slices 1b + 2). These are the behaviors the shared corpus CANNOT express (it is single-handle
+// SQL-in/rows-out and cannot call db.Attach — CLAUDE.md §10): the attach/detach lifecycle, the read-only
+// write-rejection (25006), detach-in-use (55006), reserved/duplicate names (42710), unknown detach
+// (42704), and — for FILE attachments (Slice 2) — cross-file read/join, read-write durability across a
+// standalone reopen, the one-durable-writer rule (0A000), page-size independence, and missing-file
+// (58P01). The in-memory SQL routing lives in the corpus (suites/attach/in_memory.test); file durability
+// / reopen is inherently a per-core host test (out of corpus reach). Mirrors impl/rust/tests/attach.rs
+// and impl/ts/tests/attach.test.ts.
 
 import (
 	"path/filepath"
@@ -190,7 +192,8 @@ func TestAttachFileReadOnlyCrossRead(t *testing.T) {
 
 	// A cross-FILE join: local `visit` against the read-only attached file's `city`.
 	rows, err := s.QueryValues(
-		"SELECT c.name, v.n FROM visit v JOIN ref.city c ON c.id = v.city_id ORDER BY c.id", nil)
+		"SELECT c.name, v.n FROM visit v JOIN ref.city c ON c.id = v.city_id ORDER BY c.id", nil,
+	)
 	if err != nil {
 		t.Fatalf("cross-file join: %v", err)
 	}
@@ -277,8 +280,8 @@ func TestAttachFileOneDurableWriter(t *testing.T) {
 	if err := s.Begin(true); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	attachExec(t, s, "INSERT INTO m VALUES (1)")         // main (file) dirtied
-	attachExec(t, s, "INSERT INTO extra.e VALUES (1)")   // a SECOND durable (file) database dirtied
+	attachExec(t, s, "INSERT INTO m VALUES (1)")       // main (file) dirtied
+	attachExec(t, s, "INSERT INTO extra.e VALUES (1)") // a SECOND durable (file) database dirtied
 	if err := s.Commit(); err == nil {
 		t.Fatal("commit writing two durable databases: want 0A000, got nil")
 	} else if code := err.(*EngineError).Code(); code != "0A000" {
@@ -318,8 +321,8 @@ func TestAttachFileWithMemoryMainMultiWrite(t *testing.T) {
 	if err := s.Begin(true); err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	attachExec(t, s, "INSERT INTO local VALUES (1)")   // in-memory main (free)
-	attachExec(t, s, "INSERT INTO work.w VALUES (1)")  // the one durable writer
+	attachExec(t, s, "INSERT INTO local VALUES (1)")  // in-memory main (free)
+	attachExec(t, s, "INSERT INTO work.w VALUES (1)") // the one durable writer
 	if err := s.Commit(); err != nil {
 		t.Fatalf("memory-main + one file attachment should commit: %v", err)
 	}

@@ -1,10 +1,12 @@
-//! Host-attached in-memory databases — the `Database::attach`/`detach` host API (spec/design/attached-
-//! databases.md §4/§6, Slice 1b). These are the behaviors the shared corpus CANNOT express (it is
-//! single-handle SQL-in/rows-out and cannot call `db.attach` — CLAUDE.md §10): the attach/detach
-//! lifecycle, the read-only write-rejection (25006), detach-in-use (55006), reserved/duplicate names
-//! (42710), unknown detach (42704), and the file-source deferral (0A000). The SQL routing itself lives
-//! in the corpus (suites/attach/in_memory.test). Mirrors impl/go/attach_test.go and
-//! impl/ts/test/attach.test.ts.
+//! Host-attached databases — the `Database::attach`/`detach` host API (spec/design/attached-databases.md
+//! §4/§6, Slices 1b + 2). These are the behaviors the shared corpus CANNOT express (it is single-handle
+//! SQL-in/rows-out and cannot call `db.attach` — CLAUDE.md §10): the attach/detach lifecycle, the
+//! read-only write-rejection (25006), detach-in-use (55006), reserved/duplicate names (42710), unknown
+//! detach (42704), and — for FILE attachments (Slice 2) — cross-file read/join, read-write durability
+//! across a standalone reopen, the one-durable-writer rule (0A000), page-size independence, and
+//! missing-file (58P01). The in-memory SQL routing lives in the corpus (suites/attach/in_memory.test);
+//! file durability / reopen is inherently a per-core host test (out of corpus reach). Mirrors
+//! impl/go/attach_test.go and impl/ts/tests/attach.test.ts.
 
 use std::path::PathBuf;
 
@@ -188,7 +190,10 @@ fn attach_file_read_only_cross_read() {
     db.attach("ref", AttachSource::file(&refdb), true)
         .expect("attach file read-only");
     let mut s = db.session(SessionOptions::default());
-    exec(&mut s, "CREATE TABLE visit (city_id i32 PRIMARY KEY, n i32)");
+    exec(
+        &mut s,
+        "CREATE TABLE visit (city_id i32 PRIMARY KEY, n i32)",
+    );
     exec(&mut s, "INSERT INTO visit VALUES (1, 7), (2, 9)");
 
     // A cross-FILE join: local `visit` against the read-only attached file's `city`.
@@ -223,7 +228,10 @@ fn attach_file_read_write_persists_across_reopen() {
     db.attach("work", AttachSource::file(&work), false)
         .expect("attach file read-write");
     let mut s = db.session(SessionOptions::default());
-    exec(&mut s, "CREATE TABLE work.acct (id i32 PRIMARY KEY, bal i32)");
+    exec(
+        &mut s,
+        "CREATE TABLE work.acct (id i32 PRIMARY KEY, bal i32)",
+    );
     exec(&mut s, "INSERT INTO work.acct VALUES (1, 100), (2, 200)");
     exec(&mut s, "CREATE INDEX acct_bal ON work.acct (bal)");
     s.close();
@@ -248,8 +256,16 @@ fn attach_file_read_write_persists_across_reopen() {
 /// alone succeeds. In-memory attachments never count against the slot.
 #[test]
 fn attach_file_one_durable_writer() {
-    let main_path = make_file_db(tmp("main_odw.jed"), 0, &["CREATE TABLE m (id i32 PRIMARY KEY)"]);
-    let extra = make_file_db(tmp("extra_odw.jed"), 0, &["CREATE TABLE e (id i32 PRIMARY KEY)"]);
+    let main_path = make_file_db(
+        tmp("main_odw.jed"),
+        0,
+        &["CREATE TABLE m (id i32 PRIMARY KEY)"],
+    );
+    let extra = make_file_db(
+        tmp("extra_odw.jed"),
+        0,
+        &["CREATE TABLE e (id i32 PRIMARY KEY)"],
+    );
 
     let db = Database::open(&main_path).expect("open file main");
     db.attach("extra", AttachSource::file(&extra), false)
@@ -281,7 +297,11 @@ fn attach_file_one_durable_writer() {
 /// durable writer, so a block writing both commits cleanly (§5).
 #[test]
 fn attach_file_with_memory_main_multi_write() {
-    let work = make_file_db(tmp("work_mm.jed"), 0, &["CREATE TABLE w (id i32 PRIMARY KEY)"]);
+    let work = make_file_db(
+        tmp("work_mm.jed"),
+        0,
+        &["CREATE TABLE w (id i32 PRIMARY KEY)"],
+    );
     let db = mem_db(); // in-memory main — not durable
     db.attach("work", AttachSource::file(&work), false)
         .expect("attach");
@@ -307,7 +327,10 @@ fn attach_file_page_size_independent() {
     db.attach("small", AttachSource::file(&small), false)
         .expect("attach");
     let mut s = db.session(SessionOptions::default());
-    exec(&mut s, "CREATE TABLE small.grid (id i32 PRIMARY KEY, v i32)");
+    exec(
+        &mut s,
+        "CREATE TABLE small.grid (id i32 PRIMARY KEY, v i32)",
+    );
     // Enough rows to force at least one leaf split at the small page size (its own page space).
     for i in 1..=40 {
         exec(
@@ -323,10 +346,7 @@ fn attach_file_page_size_independent() {
     assert_eq!(reopened.page_size(), 256);
     let mut rs = reopened.session(SessionOptions::default());
     // sum of i*i for i in 1..=40 = 22140.
-    assert_eq!(
-        query_ints(&mut rs, "SELECT count(*) FROM grid"),
-        vec![40]
-    );
+    assert_eq!(query_ints(&mut rs, "SELECT count(*) FROM grid"), vec![40]);
     assert_eq!(query_ints(&mut rs, "SELECT sum(v) FROM grid"), vec![22140]);
 }
 
@@ -336,7 +356,10 @@ fn attach_file_reattach() {
     let refdb = make_file_db(
         tmp("ref_reattach.jed"),
         0,
-        &["CREATE TABLE t (id i32 PRIMARY KEY)", "INSERT INTO t VALUES (1)"],
+        &[
+            "CREATE TABLE t (id i32 PRIMARY KEY)",
+            "INSERT INTO t VALUES (1)",
+        ],
     );
     let db = mem_db();
     for _ in 0..3 {
