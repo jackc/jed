@@ -23,13 +23,14 @@ import (
 var magic = [4]byte{'J', 'E', 'D', 'B'}
 
 const (
-	formatVersion    uint16 = 24    // on-disk format version (24 = the B+tree reshape (spec/design/bplus-reshape.md, slice B1; spec/fileformat/format.md "The per-table data B+tree"): records live ONLY in leaves — an INTERIOR page (page_type 3) is a record-free routing skeleton, N+1 child pointers ‖ an N-entry end-offset separator directory ‖ the separator key blob (a separator is a COPY of a boundary key; leaf splits copy up, interior splits push up, leaf merges remove the parent separator, interior merges pull it down). A LEAF page's column regions each lead with a reserved flags byte (0 — the string-dictionary door) and take a class-determined shape: a FIXED-WIDTH column is a null bitmap (ceil(N/8), MSB-first, set = NULL) + N×width dense UNTAGGED slots (a NULL slot zero-filled); a VARIABLE-WIDTH column is an N-entry end-offset value directory + the tagged v23 codec bytes with NULL a ZERO-LENGTH SPAN (no 0x01 tag inside a leaf; the single-value codec elsewhere is unchanged). All directories become N-entry END offsets (the redundant leading 0 of the v23 N+1 prefix sums is dropped). record_size is restated as key_len + Σ value_size (fixed → its width always, variable → 0 when NULL else the tagged encoded size; the v23 phantom 2+ is dropped); RECORD_MAX keeps its v23 value (C − max(12, 12+16K))/2, re-derived leaf-only. Catalog/overflow/GiST pages are byte-identical to v23. 23 = PAX leaf layout (spec/fileformat/format.md "Leaf node"): a B-tree LEAF page (page_type 2) stores its records COLUMN-MAJOR — key directory (N+1 u32 prefix-sum) ‖ key blob ‖ column directory (K+1 u32 region offsets, colStart[K] = payload end) ‖ per column a value directory (N+1 u32 prefix-sum) then that column's N value bodies. The value codec is byte-unchanged (same 1-byte tag + body); interior pages (page_type 3) stay row-major (child pointers ‖ records). 22 = varchar(n) length limits (spec/design/types.md §15): a text column entry appends a u32 varchar_max_len in the typmod slot (type_code 4) — 0 = unbounded, 1…10485760 = the varchar(n)/string(n) limit; a composite text field carries the same u32. The value codec is unchanged (a value is checked/truncated before encoding). A file whose every text column is unbounded still moves to v22 by its version byte + a 0 on each text column/field. 21 = EXCLUDE constraints (spec/design/gist.md §7/§8, GX3): a per-table exclusion list after the foreign-key list — each entry the constraint name, its backing GiST index name, and a (column ordinal u16, operator strategy u8) element vector (&& = 0, = 1). The backing GiST index is stored like any GiST index — the index list now admits MULTI-COLUMN GiST indexes whose leaf/interior bound is the per-column component bounds concatenated (single-column GX1/GX2 bytes unchanged). A table with no exclusion still moves to v21 by its version byte + the zero count. 20 = GiST indexes (spec/design/gist.md, GX1): a per-index index_kind = 2 selects the GiST access method, and the index's on-disk form is a persisted R-tree of bounding-predicate nodes — two new page types 5 (GiST leaf) / 6 (GiST interior). A leaf entry is bound_len(u16) ‖ encode_range_body(bound) ‖ skey_len(u16) ‖ skey; an interior entry is bound_len(u16) ‖ encode_range_body(union) ‖ child_page(u32). The catalog index entry is unchanged (index_root_page points at the R-tree root, 0 for empty); a file with no GiST index still moves to v20 only by its version byte. 19 = storable json/jsonb columns (spec/design/json.md, J1/J1b): a column type can be json (type_code 18) or jsonb (type_code 19) — plain scalar catalog entries with no extra descriptor (the has_jsonb_dict door §3.2 stays clear, zero bytes). A json value's body is the verbatim text, length-prefixed like text (§4); a jsonb value's body is the self-delimiting tagged-node tree (§2 — node tags + LEB128 varint counts, numbers as the decimal body), riding the large-value overflow + LZ4 path. No catalog-shape change, so a file with no json/jsonb column still moves to v19 only by its version byte. 18 = reference-only collations: the catalog entry_kind 3 collation entry is metadata ONLY — a flags byte bit0 is_default, then name + unicode_version + cldr_version + description (each u16-len + UTF-8) — emitted after sequences and before tables; the compiled table is NOT in the file, it is vendored into the binary and resolved by name on open, spec/design/collation.md §2/§5/§9. This supersedes v17's baked snapshot (the LZ4-compressed .coll artifact is gone). The per-column collation is unchanged (column flags byte bit6 has_collation + a trailing name). 17 = baked collations (superseded). 16 = range columns: type_code 17 + an inline element-type descriptor in the catalog — one scalar code, spec/design/ranges.md §3 — and the compact range value body, a flags byte EMPTY/LB_INF/UB_INF/LB_INC/UB_INC + present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: an entry_kind = 2 catalog entry — name + six i64 fields + a flags byte — emitted after composite-type entries and before table entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4. 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
+	formatVersion    uint16 = 25    // on-disk format version (25 = on-disk free-list persistence (spec/fileformat/format.md; storage.md §6): meta offset 28 becomes free_list_head (0 = empty), and a page_type 7 free-list page persists the unconsumed free-list so open reads it directly instead of reconstructing it by walking every leaf; paired with continuous within-session reclamation. A from-scratch image (create/goldens) has an EMPTY free-list, so free_list_head = 0 and no page_type 7 page: every golden's only v25 change is its version byte + meta CRC. 24 = the B+tree reshape (spec/design/bplus-reshape.md, slice B1; spec/fileformat/format.md "The per-table data B+tree"): records live ONLY in leaves — an INTERIOR page (page_type 3) is a record-free routing skeleton, N+1 child pointers ‖ an N-entry end-offset separator directory ‖ the separator key blob (a separator is a COPY of a boundary key; leaf splits copy up, interior splits push up, leaf merges remove the parent separator, interior merges pull it down). A LEAF page's column regions each lead with a reserved flags byte (0 — the string-dictionary door) and take a class-determined shape: a FIXED-WIDTH column is a null bitmap (ceil(N/8), MSB-first, set = NULL) + N×width dense UNTAGGED slots (a NULL slot zero-filled); a VARIABLE-WIDTH column is an N-entry end-offset value directory + the tagged v23 codec bytes with NULL a ZERO-LENGTH SPAN (no 0x01 tag inside a leaf; the single-value codec elsewhere is unchanged). All directories become N-entry END offsets (the redundant leading 0 of the v23 N+1 prefix sums is dropped). record_size is restated as key_len + Σ value_size (fixed → its width always, variable → 0 when NULL else the tagged encoded size; the v23 phantom 2+ is dropped); RECORD_MAX keeps its v23 value (C − max(12, 12+16K))/2, re-derived leaf-only. Catalog/overflow/GiST pages are byte-identical to v23. 23 = PAX leaf layout (spec/fileformat/format.md "Leaf node"): a B-tree LEAF page (page_type 2) stores its records COLUMN-MAJOR — key directory (N+1 u32 prefix-sum) ‖ key blob ‖ column directory (K+1 u32 region offsets, colStart[K] = payload end) ‖ per column a value directory (N+1 u32 prefix-sum) then that column's N value bodies. The value codec is byte-unchanged (same 1-byte tag + body); interior pages (page_type 3) stay row-major (child pointers ‖ records). 22 = varchar(n) length limits (spec/design/types.md §15): a text column entry appends a u32 varchar_max_len in the typmod slot (type_code 4) — 0 = unbounded, 1…10485760 = the varchar(n)/string(n) limit; a composite text field carries the same u32. The value codec is unchanged (a value is checked/truncated before encoding). A file whose every text column is unbounded still moves to v22 by its version byte + a 0 on each text column/field. 21 = EXCLUDE constraints (spec/design/gist.md §7/§8, GX3): a per-table exclusion list after the foreign-key list — each entry the constraint name, its backing GiST index name, and a (column ordinal u16, operator strategy u8) element vector (&& = 0, = 1). The backing GiST index is stored like any GiST index — the index list now admits MULTI-COLUMN GiST indexes whose leaf/interior bound is the per-column component bounds concatenated (single-column GX1/GX2 bytes unchanged). A table with no exclusion still moves to v21 by its version byte + the zero count. 20 = GiST indexes (spec/design/gist.md, GX1): a per-index index_kind = 2 selects the GiST access method, and the index's on-disk form is a persisted R-tree of bounding-predicate nodes — two new page types 5 (GiST leaf) / 6 (GiST interior). A leaf entry is bound_len(u16) ‖ encode_range_body(bound) ‖ skey_len(u16) ‖ skey; an interior entry is bound_len(u16) ‖ encode_range_body(union) ‖ child_page(u32). The catalog index entry is unchanged (index_root_page points at the R-tree root, 0 for empty); a file with no GiST index still moves to v20 only by its version byte. 19 = storable json/jsonb columns (spec/design/json.md, J1/J1b): a column type can be json (type_code 18) or jsonb (type_code 19) — plain scalar catalog entries with no extra descriptor (the has_jsonb_dict door §3.2 stays clear, zero bytes). A json value's body is the verbatim text, length-prefixed like text (§4); a jsonb value's body is the self-delimiting tagged-node tree (§2 — node tags + LEB128 varint counts, numbers as the decimal body), riding the large-value overflow + LZ4 path. No catalog-shape change, so a file with no json/jsonb column still moves to v19 only by its version byte. 18 = reference-only collations: the catalog entry_kind 3 collation entry is metadata ONLY — a flags byte bit0 is_default, then name + unicode_version + cldr_version + description (each u16-len + UTF-8) — emitted after sequences and before tables; the compiled table is NOT in the file, it is vendored into the binary and resolved by name on open, spec/design/collation.md §2/§5/§9. This supersedes v17's baked snapshot (the LZ4-compressed .coll artifact is gone). The per-column collation is unchanged (column flags byte bit6 has_collation + a trailing name). 17 = baked collations (superseded). 16 = range columns: type_code 17 + an inline element-type descriptor in the catalog — one scalar code, spec/design/ranges.md §3 — and the compact range value body, a flags byte EMPTY/LB_INF/UB_INF/LB_INC/UB_INC + present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: an entry_kind = 2 catalog entry — name + six i64 fields + a flags byte — emitted after composite-type entries and before table entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4. 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
 	pageHeader              = 16    // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
 	recordMaxReserve        = 12    // bytes reserved inside RECORD_MAX beyond the per-column term — independent of pageHeader (format.md "Why the record cap"). Historically the two-key interior node's 3 child pointers (4·3); since v24 the value is kept as the K = 0 floor of the leaf-only re-derivation (a two-record index leaf is exactly 2·(C−12)/2 + 4·2 + 4 = C)
 	pageCatalog      byte   = 1     // page_type for a catalog page
 	pageLeaf         byte   = 2     // page_type for a B-tree leaf node
 	pageInterior     byte   = 3     // page_type for a B-tree interior node
 	pageOverflow     byte   = 4     // page_type for an out-of-line value slab (large-values.md §12)
+	pageFreelist     byte   = 7     // page_type for a persisted free-list page (v25 — item_count u32 free page indices, chained by next_page; spec/fileformat/format.md *Free-list page*)
 	rootPage         uint32 = 2     // catalog root of a fresh empty db (relocatable thereafter)
 	minPageSize             = 256   // smallest valid page size; chosen floor above the structural min pageHeader+36=52 (format.md *Page model*)
 	maxPageSize             = 65536 // largest valid page size, 64 KiB (format.md *Page model*; CLAUDE.md §13)
@@ -1028,8 +1029,10 @@ type incrementalWrite struct {
 	pages     []dirtyPage
 	rootPage  uint32
 	pageCount uint32
-	// freeRemaining is the free-list entries this commit did not consume — the new free-list (P6.2).
-	// file.go stores it back on the handle for the next commit (spec/fileformat/format.md *Reclamation*).
+	// freeRemaining is the free-list entries this commit did not consume by its tree/catalog pages —
+	// all pages dead at the fallback (prior) snapshot, so safe to overwrite this commit. The durable
+	// path draws its persisted page_type 7 free-list pages from these (never the high-water) and
+	// reclaims this commit's fresh orphans into the persisted list too (serializeFreeList / planFreeList).
 	freeRemaining []uint32
 }
 
@@ -1360,12 +1363,10 @@ func loadEnginePaged(pgr *pager, capacity int) (*engine, error) {
 
 	snap := newSnapshot()
 	snap.txid = mt.txid
-	// Reconstruct the free-list (P6.2) from the pages the skeleton load marks reachable — every
-	// interior node, plus each leaf's page id (recorded without retaining the leaf).
-	reached := make(map[uint32]bool)
+	// v25: the free-list is read from the persisted chain (below), not reconstructed by a reachability
+	// walk — so the catalog + skeleton load no longer tracks a reached set.
 	catPage := mt.rootPage
 	for catPage != 0 {
-		reached[catPage] = true
 		block, err := pgr.readBlock(catPage)
 		if err != nil {
 			return nil, err
@@ -1431,20 +1432,14 @@ func loadEnginePaged(pgr *pager, capacity int) (*engine, error) {
 			// (spec/design/composite.md §3).
 			colTypes := store.colTypes
 			if tableRoot != 0 {
-				root, length, err := readSkeleton(paging, tableRoot, colTypes, reached)
+				root, length, err := readSkeleton(paging, tableRoot, colTypes)
 				if err != nil {
 					return nil, err
 				}
-				// The skeleton leaves leaves OnDisk (unread), so their records' overflow chains are
-				// invisible to the reachability walk above. For a table with spillable columns, read
-				// the leaves now to collect those live chains — else the free-list would reclaim still-
-				// referenced overflow pages (large-values.md §12; default open is this paged path).
-				// Dead chains still leak until the next open, matching the P6.2 orphan model.
-				if anySpillable(colTypes) {
-					if err := collectLeafOverflow(paging, tableRoot, colTypes, reached); err != nil {
-						return nil, err
-					}
-				}
+				// v25: the persisted free-list already excludes live overflow chains (they were kept
+				// reachable when the list was rebuilt — reachablePages/collectLeafOverflow at commit
+				// time), so open no longer re-reads every spillable leaf to protect them (the second
+				// full leaf pass is gone — the open-speed win, format.md *Reclamation*).
 				store.setTree(root, length)
 				if !hasPK && length > 0 {
 					// No-PK rowid reconstruction faults the leaves to find the largest key; only for
@@ -1462,8 +1457,8 @@ func loadEnginePaged(pgr *pager, capacity int) (*engine, error) {
 			for k, idx := range table.Indexes {
 				istore := newTableStore(pageSize-pageHeader, nil)
 				if indexRoots[k] != 0 && idx.Kind == indexGist {
-					// GiST is EAGER-loaded, not demand-paged (gist.md §4.1(a)): read the whole R-tree
-					// (marking pages reached), recover its leaf keys into a fully-resident leaf store.
+					// GiST is EAGER-loaded, not demand-paged (gist.md §4.1(a)): read the whole R-tree,
+					// recover its leaf keys into a fully-resident leaf store.
 					var keys [][]byte
 					read := func(p uint32) (byte, uint32, []byte, error) {
 						block, err := paging.readBlock(p)
@@ -1476,7 +1471,7 @@ func loadEnginePaged(pgr *pager, capacity int) (*engine, error) {
 						}
 						return pg.pageType, pg.itemCount, pg.payload, nil
 					}
-					if err := readGistLeafKeys(read, indexRoots[k], reached, &keys); err != nil {
+					if err := readGistLeafKeys(read, indexRoots[k], &keys); err != nil {
 						return nil, err
 					}
 					for _, key := range keys {
@@ -1487,7 +1482,7 @@ func loadEnginePaged(pgr *pager, capacity int) (*engine, error) {
 				} else {
 					istore.attachPaging(paging)
 					if indexRoots[k] != 0 {
-						root, length, err := readSkeleton(paging, indexRoots[k], nil, reached)
+						root, length, err := readSkeleton(paging, indexRoots[k], nil)
 						if err != nil {
 							return nil, err
 						}
@@ -1512,10 +1507,17 @@ func loadEnginePaged(pgr *pager, capacity int) (*engine, error) {
 	db := newEngine()
 	db.pageSize = uint32(pageSize)
 	db.pageCount = mt.pageCount
-	for p := rootPage; p < mt.pageCount; p++ {
-		if !reached[p] {
-			db.freePages = append(db.freePages, p)
-		}
+	// v25: load the free-list directly from the persisted chain (meta offset 28) — no reachability
+	// walk (spec/fileformat/format.md *Reclamation*).
+	free, err := readFreeList(paging, mt.freeListHead)
+	if err != nil {
+		return nil, err
+	}
+	db.freePages = free
+	// Seed the within-session compaction trigger with the live estimate (page_count minus the
+	// free-list), so the first commit after open does not compact spuriously (planFreeList).
+	if live := int(mt.pageCount) - len(db.freePages); live > 0 {
+		db.liveAtCompaction = uint32(live)
 	}
 	db.committed = snap
 	db.paging = paging
@@ -1622,12 +1624,13 @@ func collectLeafOverflow(paging *sharedPaging, pageIdx uint32, colTypes []colTyp
 
 // reachablePages collects every page reachable from the committed snapshot whose catalog head is
 // catRoot: the catalog chain, every table/index B+tree node, and (for spillable columns) the live
-// overflow chains. It is the inverse of the free-list and the basis of within-session compaction
-// (storage.maybeCompact) — the same live set the open-time reconstruction (loadEnginePaged) derives,
-// but computed against the already-resident committed trees: node page ids come from the in-memory
-// tree walk (no pager reads), and only the catalog chain and spillable-leaf overflow are read through
-// the pager. A reclaim domain (temp) never carries a GiST index (deferred 0A000, temp-tables.md §8),
-// so GiST pages need no handling here — the caller (maybeCompact) skips any snapshot that has one.
+// overflow chains. It is the basis of within-session compaction (storage.maybeCompact / planFreeList):
+// node page ids come from the in-memory tree walk (no pager reads), and only the catalog chain and
+// spillable-leaf overflow are read through the pager. It does NOT cover a GiST index's on-disk R-tree
+// pages (the resident GiST store holds only the leaf-key set, no on-disk page ids) nor the current
+// persisted free-list pages — both are handled by the caller unioning the pages this commit just wrote
+// into the reached set (a GiST index rewrites its whole R-tree every commit — gist.md §4.1(b) — so all
+// live GiST pages are in that write set), so a rebuild never frees a live GiST or free-list page.
 func (s *snapshot) reachablePages(paging *sharedPaging, catRoot uint32) (map[uint32]bool, error) {
 	reached := make(map[uint32]bool)
 	// The catalog chain (rewritten to fresh pages every commit; its predecessor pages are the bulk of
@@ -1684,12 +1687,160 @@ func collectTreePages(n *pnode, reached map[uint32]bool) {
 	}
 }
 
+// readFreeList reads a persisted free-list (v25) by following the page_type 7 chain from head (meta
+// offset 28) through the pager, collecting every free page index. head == 0 is an empty free-list.
+// The inverse of the serialization in serializeFreeList; replaces the v24 reconstruct-on-open
+// reachability walk (spec/fileformat/format.md *Reclamation*).
+func readFreeList(paging *sharedPaging, head uint32) ([]uint32, error) {
+	var free []uint32
+	for p := head; p != 0; {
+		block, err := paging.pgr.readBlock(p)
+		if err != nil {
+			return nil, err
+		}
+		pg, err := parsePage(block)
+		if err != nil {
+			return nil, err
+		}
+		if pg.pageType != pageFreelist {
+			return nil, newError(DataCorrupted, "expected a free-list page")
+		}
+		pos := 0
+		for i := uint32(0); i < pg.itemCount; i++ {
+			e, err := readU32(pg.payload, &pos)
+			if err != nil {
+				return nil, err
+			}
+			free = append(free, e)
+		}
+		p = pg.nextPage
+	}
+	return free, nil
+}
+
+// serializeFreeList serializes the full free-list persist (ascending — the pages dead at the new
+// committed snapshot, including this commit's fresh orphans) into a page_type 7 chain (v25 —
+// spec/fileformat/format.md *Free-list page*), and returns the chain pages, its head (0 when empty),
+// the list actually persisted (persist minus the pages the chain occupies), and the new high-water.
+//
+// The chain's own pages are drawn from safe — the subset of the free-list that is dead at the FALLBACK
+// (prior) snapshot too (freeRemaining), so overwriting them this commit is torn-write-safe — NOT from
+// the high-water, so persisting the free-list does not grow the file. The high-water is extended only
+// if safe is exhausted (rare: a large delete on an otherwise-tight file). A free-list page is consumed
+// here, so it never appears in the list it carries; this commit's fresh orphans (in persist, not in
+// safe) are persisted but not reused until the next commit (the watermark — still reachable from the
+// fallback).
+func serializeFreeList(persist, safe []uint32, cap, ps int, next uint32) ([]dirtyPage, uint32, []uint32, uint32) {
+	// Nothing worth persisting when it would take the whole list to hold itself (empty, or a lone
+	// page): leave the residue in RAM, reclaimed at the next compaction (a bounded transient leak).
+	if len(persist) < 2 {
+		return nil, 0, append([]uint32(nil), persist...), next
+	}
+	per := cap / 4
+	if per < 1 {
+		per = 1
+	}
+	// Draw free-list pages (from safe, then the high-water) until they hold every entry that then
+	// remains. Each page drawn from safe also removes itself from what must be held (it is in persist),
+	// so the loop converges; a high-water page adds a slot without shrinking the content.
+	var flIDs []uint32
+	si := 0
+	hw := next
+	safeDrawn := 0
+	for {
+		content := len(persist) - safeDrawn
+		if (content+per-1)/per <= len(flIDs) {
+			break
+		}
+		if si < len(safe) {
+			flIDs = append(flIDs, safe[si])
+			si++
+			safeDrawn++
+		} else {
+			flIDs = append(flIDs, hw)
+			hw++
+		}
+	}
+	// The persisted list is persist minus the pages drawn from it (the first safeDrawn flIDs).
+	drawn := make(map[uint32]bool, safeDrawn)
+	for _, id := range flIDs[:safeDrawn] {
+		drawn[id] = true
+	}
+	var persisted []uint32
+	for _, p := range persist {
+		if !drawn[p] {
+			persisted = append(persisted, p)
+		}
+	}
+	pages := make([]dirtyPage, 0, len(flIDs))
+	for ci, pageNo := range flIDs {
+		lo := ci * per
+		if lo > len(persisted) {
+			lo = len(persisted)
+		}
+		hi := (ci + 1) * per
+		if hi > len(persisted) {
+			hi = len(persisted)
+		}
+		chunk := persisted[lo:hi]
+		var nextPage uint32
+		if ci+1 < len(flIDs) {
+			nextPage = flIDs[ci+1]
+		}
+		payload := make([]byte, 0, len(chunk)*4)
+		for _, e := range chunk {
+			var b [4]byte
+			binary.BigEndian.PutUint32(b[:], e)
+			payload = append(payload, b[:]...)
+		}
+		pages = append(pages, dirtyPage{index: pageNo, bytes: makePage(ps, pageFreelist, uint32(len(chunk)), nextPage, payload)})
+	}
+	return pages, flIDs[0], persisted, hw
+}
+
+// planFreeList is the v25 durable-commit free-list plan, shared by the file commit paths
+// (shared.commitFile and file.persist). It runs IN-COMMIT (after the tree + catalog are written to the
+// pager, before the meta), so the list it persists includes THIS commit's fresh orphans — without
+// that, a short open→commit→close session would leak them forever (open no longer reconstructs the
+// free-list, v25). COMPACT (periodic — the high-water has grown past ~2× the live count at the last
+// compaction, and no reader pins an older version): the persisted list is [2, pageCount) − reached
+// (written unioned in so a wholesale-rewritten GiST R-tree is never freed; the catalog + new overflow
+// are covered by reading the just-written pages back). CARRY (otherwise): the persisted list is
+// freeRemaining (this commit's orphans wait for the next compaction). Either way the chain pages come
+// from freeRemaining. Returns the chain pages, head, the new free-list, the new high-water, and the
+// live count to remember (unchanged when not compacting).
+func planFreeList(snap *snapshot, paging *sharedPaging, catRoot uint32, written []dirtyPage, freeRemaining []uint32, pageCount, liveAtCompaction uint32, cap, ps int, canReclaim bool) ([]dirtyPage, uint32, []uint32, uint32, uint32, error) {
+	const minCompactPages = 16 // don't churn a tiny store
+	compact := canReclaim && pageCount > minCompactPages && uint64(pageCount) > 2*uint64(liveAtCompaction)
+	persistList := freeRemaining
+	newLive := liveAtCompaction
+	if compact {
+		reached, err := snap.reachablePages(paging, catRoot)
+		if err != nil {
+			return nil, 0, nil, 0, 0, err
+		}
+		for _, w := range written {
+			reached[w.index] = true
+		}
+		var free []uint32
+		for p := rootPage; p < pageCount; p++ {
+			if !reached[p] {
+				free = append(free, p)
+			}
+		}
+		persistList = free
+		newLive = uint32(len(reached))
+	}
+	pages, head, persisted, newPC := serializeFreeList(persistList, freeRemaining, cap, ps, pageCount)
+	return pages, head, persisted, newPC, newLive, nil
+}
+
 // readSkeleton reads a table's on-disk B+tree (rooted at rootPage) into a demand-paged skeleton:
 // interior nodes resident, each leaf left OnDisk. Returns the root node and the total row count. A
 // table whose root is itself a single leaf has no interior parent to hold an OnDisk reference, so the
 // root leaf is faulted resident (spec/design/pager.md §1/§4).
-func readSkeleton(paging *sharedPaging, root uint32, colTypes []colType, reached map[uint32]bool) (*pnode, int, error) {
-	c, length, err := readSkeletonNode(paging, root, colTypes, reached)
+func readSkeleton(paging *sharedPaging, root uint32, colTypes []colType) (*pnode, int, error) {
+	c, length, err := readSkeletonNode(paging, root, colTypes)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1706,9 +1857,10 @@ func readSkeleton(paging *sharedPaging, root uint32, colTypes []colType, reached
 // readSkeletonNode reads one B+tree node through the pager, once: a leaf becomes an OnDisk childRef
 // (its rows counted from the header, then dropped — not retained); an interior node becomes a resident
 // childRef — the record-free separators + children skeleton (v24) — with its children resolved
-// recursively. Returns the child reference and the subtree's row count.
-func readSkeletonNode(paging *sharedPaging, pageIdx uint32, colTypes []colType, reached map[uint32]bool) (childRef, int, error) {
-	reached[pageIdx] = true
+// recursively. Returns the child reference and the subtree's row count. (The free-list is loaded from
+// the persisted chain in v25, so this walk no longer tracks reachability — it still reads each leaf
+// once for the row count, the remaining open-speed follow-on.)
+func readSkeletonNode(paging *sharedPaging, pageIdx uint32, colTypes []colType) (childRef, int, error) {
 	block, err := paging.pgr.readBlock(pageIdx)
 	if err != nil {
 		return childRef{}, 0, err
@@ -1730,7 +1882,7 @@ func readSkeletonNode(paging *sharedPaging, pageIdx uint32, colTypes []colType, 
 			if err != nil {
 				return childRef{}, 0, err
 			}
-			child, clen, err := readSkeletonNode(paging, cp, colTypes, reached)
+			child, clen, err := readSkeletonNode(paging, cp, colTypes)
 			if err != nil {
 				return childRef{}, 0, err
 			}
@@ -2923,7 +3075,7 @@ func pack(sizes []int, capacity int) ([][]int, error) {
 // metaPage is one meta slot's full pageSize bytes (the 36-byte header + its CRC, zero-padded): its
 // only content. ToImage copies it into both slots; an incremental commit pwrites it to the alternate
 // slot (file.go). Single-sources the meta byte layout (spec/fileformat/format.md).
-func metaPage(pageSize uint32, txid uint64, root, pageCount uint32) []byte {
+func metaPage(pageSize uint32, txid uint64, root, pageCount, freeListHead uint32) []byte {
 	p := make([]byte, pageSize)
 	copy(p[0:4], magic[:])
 	binary.BigEndian.PutUint16(p[4:], formatVersion)
@@ -2931,6 +3083,7 @@ func metaPage(pageSize uint32, txid uint64, root, pageCount uint32) []byte {
 	binary.BigEndian.PutUint64(p[12:], txid)
 	binary.BigEndian.PutUint32(p[20:], root)
 	binary.BigEndian.PutUint32(p[24:], pageCount)
+	binary.BigEndian.PutUint32(p[28:], freeListHead) // v25: the persisted free-list head (0 = empty)
 	binary.BigEndian.PutUint32(p[32:], crc32IEEE(p[0:32]))
 	return p
 }
@@ -2949,10 +3102,11 @@ func makePage(ps int, pageType byte, itemCount, nextPage uint32, payload []byte)
 	return p
 }
 
-// writeMeta writes a meta slot into image (the whole-image path; metaPage is the single source).
+// writeMeta writes a meta slot into image (the whole-image path; metaPage is the single source). A
+// from-scratch image has an empty free-list, so free_list_head = 0 (v25).
 func writeMeta(image []byte, ps, slot int, pageSize uint32, txid uint64, root, pageCount uint32) {
 	off := slot * ps
-	copy(image[off:off+ps], metaPage(pageSize, txid, root, pageCount))
+	copy(image[off:off+ps], metaPage(pageSize, txid, root, pageCount, 0))
 }
 
 // writePage writes a catalog/data page into image (the whole-image path; makePage is the single source).
@@ -2968,6 +3122,9 @@ type meta struct {
 	// pageCount is the on-disk page high-water — the next free page an incremental commit appends at
 	// (P6.1 part B).
 	pageCount uint32
+	// freeListHead is the persisted free-list head (v25 — meta offset 28): the first page_type 7 page,
+	// or 0 for an empty free-list. Open follows this chain instead of reconstructing the free-list.
+	freeListHead uint32
 }
 
 // parseMeta validates a standalone meta block; ok=false if it is not a valid meta. Shared by readMeta
@@ -2982,16 +3139,23 @@ func parseMeta(m []byte) (meta, bool) {
 	if binary.BigEndian.Uint16(m[4:6]) != formatVersion {
 		return meta{}, false
 	}
-	if m[6] != 0 || m[7] != 0 || m[28] != 0 || m[29] != 0 || m[30] != 0 || m[31] != 0 {
+	if m[6] != 0 || m[7] != 0 {
 		return meta{}, false
 	}
 	if crc32IEEE(m[0:32]) != binary.BigEndian.Uint32(m[32:36]) {
 		return meta{}, false
 	}
+	pageCount := binary.BigEndian.Uint32(m[24:28])
+	// v25: offset 28 is the free-list head — 0 (empty) or a real body page in [2, page_count).
+	freeListHead := binary.BigEndian.Uint32(m[28:32])
+	if freeListHead != 0 && (freeListHead < rootPage || freeListHead >= pageCount) {
+		return meta{}, false
+	}
 	return meta{
-		txid:      binary.BigEndian.Uint64(m[12:20]),
-		rootPage:  binary.BigEndian.Uint32(m[20:24]),
-		pageCount: binary.BigEndian.Uint32(m[24:28]),
+		txid:         binary.BigEndian.Uint64(m[12:20]),
+		rootPage:     binary.BigEndian.Uint32(m[20:24]),
+		pageCount:    pageCount,
+		freeListHead: freeListHead,
 	}, true
 }
 
@@ -3001,24 +3165,7 @@ func readMeta(image []byte, ps, slot int) (meta, bool) {
 	if off+ps > len(image) {
 		return meta{}, false
 	}
-	m := image[off : off+ps]
-	if !bytes.Equal(m[0:4], magic[:]) {
-		return meta{}, false
-	}
-	if binary.BigEndian.Uint16(m[4:6]) != formatVersion {
-		return meta{}, false
-	}
-	if m[6] != 0 || m[7] != 0 || m[28] != 0 || m[29] != 0 || m[30] != 0 || m[31] != 0 {
-		return meta{}, false
-	}
-	if crc32IEEE(m[0:32]) != binary.BigEndian.Uint32(m[32:36]) {
-		return meta{}, false
-	}
-	return meta{
-		txid:      binary.BigEndian.Uint64(m[12:20]),
-		rootPage:  binary.BigEndian.Uint32(m[20:24]),
-		pageCount: binary.BigEndian.Uint32(m[24:28]),
-	}, true
+	return parseMeta(image[off : off+ps])
 }
 
 // selectMeta picks the valid slot with the highest txid (tie → slot 0); the lone

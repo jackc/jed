@@ -200,10 +200,26 @@ func (st *storage) commitDurable(snap *snapshot, canReclaim bool) error {
 	if err != nil {
 		return err
 	}
-	meta := metaPage(st.pageSize, snap.txid, write.rootPage, write.pageCount)
+	if st.path != "" {
+		return st.commitFile(snap, write, canReclaim)
+	}
+	return st.commitInMemory(snap, write, canReclaim)
+}
+
+// commitFile is the FILE branch of commitDurable (v25): write the dirty tree + catalog, then — in the
+// same commit, before the meta — plan and serialize the persisted page_type 7 free-list (which reclaims
+// this commit's fresh orphans, planFreeList), then the alternate meta slot. The free-list walk reads the
+// just-written catalog back through the pager, so the tree+catalog write and the free-list write are two
+// body blocks under one sync (the body barrier), then the meta under a second sync — the same
+// crash-recovery ordering the fault-injection matrix asserts (storage.md §7). A crash between the syncs
+// leaves the prior meta intact (reused pages are dead at the fallback snapshot). Caller holds st.mu.
+func (st *storage) commitFile(snap *snapshot, write incrementalWrite, canReclaim bool) error {
+	ps := int(st.pageSize)
+	cap := ps - pageHeader
+	// Write the dirty tree + catalog first (unsynced) so the reachability walk can read the new catalog
+	// back (the pager writes through — read-your-writes). Preallocate ahead of the high-water so the body
+	// fdatasync carries no file-growth metadata journaling (spec/design/pager.md §7).
 	if err := st.paging.withPager(func(p *pager) error {
-		// Preallocate ahead of the high-water so the body fdatasync carries no file-growth metadata
-		// journaling (spec/design/pager.md §7).
 		if err := p.reserve(write.pageCount); err != nil {
 			return err
 		}
@@ -211,11 +227,30 @@ func (st *storage) commitDurable(snap *snapshot, canReclaim bool) error {
 			if err := p.writeBlock(pg.index, pg.bytes); err != nil {
 				return err
 			}
-			// Drop any stale pool entry for a rewritten page (bufferpool.go invalidate): a no-op unless a
-			// reclaim domain reused a freed page id, in which case the pool's prior decode must be evicted.
 			st.paging.pool.invalidate(pg.index)
 		}
-		if err := p.sync(); err != nil { // body pages durable before the meta can reference them
+		return nil
+	}); err != nil {
+		return err
+	}
+	flPages, head, persisted, newPC, newLive, err := planFreeList(
+		snap, st.paging, write.rootPage, write.pages, write.freeRemaining, write.pageCount, st.liveAtCompaction, cap, ps, canReclaim,
+	)
+	if err != nil {
+		return err
+	}
+	meta := metaPage(st.pageSize, snap.txid, write.rootPage, newPC, head)
+	if err := st.paging.withPager(func(p *pager) error {
+		if err := p.reserve(newPC); err != nil {
+			return err
+		}
+		for _, pg := range flPages {
+			if err := p.writeBlock(pg.index, pg.bytes); err != nil {
+				return err
+			}
+			st.paging.pool.invalidate(pg.index)
+		}
+		if err := p.sync(); err != nil { // every body page (tree/catalog/free-list) durable before the meta
 			return err
 		}
 		if err := p.writeBlock(uint32(snap.txid&1), meta); err != nil {
@@ -225,9 +260,41 @@ func (st *storage) commitDurable(snap *snapshot, canReclaim bool) error {
 	}); err != nil {
 		return err
 	}
+	st.pageCount = newPC
+	st.freePages = persisted
+	st.liveAtCompaction = newLive
+	return nil
+}
+
+// commitInMemory is the IN-MEMORY branch of commitDurable: a memoryBlockStore is never reopened, so it
+// keeps its free-list in RAM and persists NO page_type 7 pages (writing them would waste memory pages);
+// the meta write + sync are no-ops on the store. Within-session reclamation is a POST-commit RAM rebuild
+// (maybeCompact) — there is no reopen to worry about, so it need not be in-commit. Caller holds st.mu.
+func (st *storage) commitInMemory(snap *snapshot, write incrementalWrite, canReclaim bool) error {
+	meta := metaPage(st.pageSize, snap.txid, write.rootPage, write.pageCount, 0)
+	if err := st.paging.withPager(func(p *pager) error {
+		if err := p.reserve(write.pageCount); err != nil {
+			return err
+		}
+		for _, pg := range write.pages {
+			if err := p.writeBlock(pg.index, pg.bytes); err != nil {
+				return err
+			}
+			st.paging.pool.invalidate(pg.index)
+		}
+		if err := p.sync(); err != nil { // a no-op on a memoryBlockStore
+			return err
+		}
+		if err := p.writeBlock(uint32(snap.txid&1), meta); err != nil {
+			return err
+		}
+		return p.sync()
+	}); err != nil {
+		return err
+	}
 	st.pageCount = write.pageCount
 	st.freePages = write.freeRemaining
-	return st.maybeCompact(snap, write.rootPage, canReclaim)
+	return st.maybeCompact(snap, write.rootPage, write.pages, canReclaim)
 }
 
 // close releases a file-backed storage's open pager (closing the underlying file); a no-op for an
@@ -266,21 +333,21 @@ func (c *sharedCore) oldestLiveVersion(newTxid uint64) uint64 {
 	return oldest
 }
 
-// maybeCompact reclaims within-session copy-on-write orphans for a reclaim domain (temp) by rebuilding
-// the free-list from the live (reachable) set, so later commits reuse dead pages instead of only
-// growing the high-water (temp-tables.md §6, bplus-reshape.md). It is:
-//   - a no-op for the main domain (reclaimWithinSession false) — that keeps its reconstruct-on-open list;
-//   - deferred while any older version is pinned (oldestLive != the committed version): compaction frees
-//     pages unreachable from the committed root, which an older reader may still observe, so it waits for
-//     the pins to drain (temp-tables.md §6);
+// maybeCompact reclaims within-session copy-on-write orphans IN RAM by rebuilding the free-list from the
+// live (reachable) set — the POST-commit form used by never-reopened stores (session temp, in-memory
+// attachments, in-memory main), which need no persisted free-list. (A file-backed store instead reclaims
+// IN-COMMIT so the reclaimed list is durable — planFreeList.) It is:
+//   - a no-op for a non-reclaim domain (reclaimWithinSession false);
+//   - deferred while any older version is pinned (canReclaim false): compaction frees pages unreachable
+//     from the committed root, which an older reader may still observe, so it waits for the pins to drain;
 //   - periodic: it walks (O(pages)) only once the high-water passes ~2× the live count at the last
 //     compaction, so page_count oscillates in [live, 2×live] and the walk is amortized O(height)/commit.
 //
-// Runs under the writer gate (caller holds st.mu), so the free-list / pageCount mutation is single-writer.
-// canReclaim is the caller's watermark decision — true iff no live reader/cursor pins a version older than
-// this commit (so no page unreachable from the committed root can still be observed): the main domain
-// passes oldestLive == committed; a temp domain passes "this session has no open streaming cursor".
-func (st *storage) maybeCompact(snap *snapshot, catRoot uint32, canReclaim bool) error {
+// Runs under the writer gate (caller holds st.mu). written is the pages THIS commit wrote — unioned into
+// the live set so a live GiST R-tree (rewritten wholesale each commit, invisible to reachablePages) is
+// never freed. canReclaim is the caller's watermark decision — true iff no live reader/cursor pins a
+// version older than this commit.
+func (st *storage) maybeCompact(snap *snapshot, catRoot uint32, written []dirtyPage, canReclaim bool) error {
 	if !st.reclaimWithinSession || !canReclaim {
 		return nil
 	}
@@ -291,6 +358,9 @@ func (st *storage) maybeCompact(snap *snapshot, catRoot uint32, canReclaim bool)
 	reached, err := snap.reachablePages(st.paging, catRoot)
 	if err != nil {
 		return err
+	}
+	for _, w := range written {
+		reached[w.index] = true
 	}
 	free := make([]uint32, 0, int(st.pageCount)-len(reached))
 	for p := rootPage; p < st.pageCount; p++ {
@@ -338,7 +408,7 @@ func (st *storage) persistTemp(snap *snapshot, canReclaim bool) error {
 	st.pageCount = write.pageCount
 	st.freePages = write.freeRemaining
 	snap.demoteCleanLeaves()
-	return st.maybeCompact(snap, write.rootPage, canReclaim)
+	return st.maybeCompact(snap, write.rootPage, write.pages, canReclaim)
 }
 
 // readOnlyMode reports whether this core is a read-only file-backed database (a write is 25006).
@@ -379,6 +449,11 @@ func sharedCoreFromEngine(e *engine) *sharedCore {
 		paging:    e.paging,
 		readOnly:  e.readOnly,
 		path:      e.path,
+		// v25: the main domain (file or in-memory) reclaims within-session — the open path reads the
+		// persisted free-list and no longer reconstructs it, so mid-session orphans must be returned at
+		// each commit or they would leak permanently (format.md *Reclamation*).
+		reclaimWithinSession: true,
+		liveAtCompaction:     e.liveAtCompaction,
 	}
 	return c
 }
@@ -539,6 +614,9 @@ func (db *Database) Attach(name string, source AttachSource, readOnly bool) erro
 			paging:    e.paging,
 			readOnly:  e.readOnly,
 			path:      e.path,
+			// v25: a file attachment persists + reclaims like the main file domain.
+			reclaimWithinSession: true,
+			liveAtCompaction:     e.liveAtCompaction,
 		}
 		root = e.committed // its stores fault through st.paging; loadEnginePaged bound storePaging too
 	}

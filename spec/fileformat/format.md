@@ -15,9 +15,35 @@ and (b) write the same logical database to bytes that equal the golden *exactly*
 other's output. A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 24)
+## Version scope (`format_version` 25)
 
-`format_version` **24** — the **B+tree reshape** ([../design/bplus-reshape.md](../design/bplus-reshape.md),
+`format_version` **25** — **on-disk free-list persistence** ([../design/storage.md §6](../design/storage.md),
+CLAUDE.md §9). Through v24 the free-list was **reconstructed on open** — a full walk of the committed
+tree marking every reachable page, the complement of which is the free-list (the reserved meta offset
+28 stayed `0`). v25 **persists** the free-list so open reads it directly and skips that walk. Two
+coupled changes, deliberately one bump:
+
+1. **Meta offset 28 becomes `free_list_head` (u32)** — the first free-list page, or `0` for an empty
+   free-list (*Meta page* below). No longer a reserved-zero field: a reader loads the free-list from
+   the chain it heads instead of deriving it (*Reclamation* below). A non-zero head must satisfy
+   `2 ≤ head < page_count` (else `XX001`).
+2. **A new `page_type = 7` — the free-list page** (*Free-list page* below). Its payload is `N`
+   big-endian `u32` free page indices; the whole free-list is emitted **ascending**, chunked across
+   a `next_page`-linked chain rooted at `free_list_head`. Free-list pages are ordinary body pages
+   (16-byte header, per-page `crc32`), rewritten fresh every commit like the catalog chain and drawn
+   from the **high-water** (never from the free-list they encode), so they are live-and-reachable at
+   the committed snapshot and absent from the list they carry.
+
+A **from-scratch image** (`to_image` — `create` and every golden fixture) has an **empty** free-list,
+so `free_list_head = 0` and it writes **no** `page_type 7` page: every existing golden changes **only**
+by its version byte + meta CRC. A non-empty persisted free-list arises only from an **incremental
+commit** (create + churn), whose bytes depend on commit history, so it is pinned by per-core tests, not
+a static golden (*Fixtures* below). Persistence is paired with **continuous within-session reclamation**
+for the file/in-memory main domain (orphans returned at each commit under the reader watermark, so the
+persisted list stays bounded rather than leaking what reconstruct-on-open used to sweep — storage.md
+§6, [../design/transactions.md §8](../design/transactions.md)).
+
+`format_version` **24** was the **B+tree reshape** ([../design/bplus-reshape.md](../design/bplus-reshape.md),
 slice B1). Two coupled changes, deliberately one bump:
 
 1. **B-tree → B+tree.** Every ordered tree (table stores, secondary btree indexes, GIN entry
@@ -305,12 +331,14 @@ value codec** — and only it — with the external and compressed value states 
 values + a per-row overflow chain; *Value codec* / *Large values* below); every **inline-plain** and
 **NULL** value is still byte-unchanged, and the type codes / catalog / CRC / keys are untouched.
 
-**Reclamation (P6.2)** — the allocator reuses dead pages from a free-list **reconstructed on open**
-(see *Reclamation* below), so a file no longer grows without bound across its lifetime. The
-reachability walk also collects each live record's **overflow chain** (v3), so spilled-value pages
-are never handed out as free; a dead chain (from an updated/deleted row) leaks until the next open,
-matching the B-tree-orphan model. **Still deferred, not foreclosed**: continuous *within-session*
-reclamation + on-disk free-list persistence (the P6.2 follow-ons).
+**Reclamation (P6.2 + v25)** — the allocator reuses dead pages from a free-list (see *Reclamation*
+below), so a file no longer grows without bound across its lifetime. **v25 persists the free-list**
+(meta offset 28 → a `page_type 7` chain), so open reads it directly instead of reconstructing it by
+walking every leaf, and pairs it with **continuous within-session reclamation** (orphans returned at
+each commit, under the reader watermark) so the persisted list stays bounded. Live overflow chains
+(v3) are kept reachable and never freed; a dead chain (from an updated/deleted row) is reclaimed at
+the next within-session rebuild. **Still deferred, not foreclosed**: per-subtree/per-table row counts
+so open need not touch leaves for the row count either (the remaining open-speed follow-on).
 
 ## Conventions
 
@@ -390,13 +418,13 @@ and slot selection):
 | offset | size | field |
 |---|---|---|
 | 0  | 4 | `magic` = `4A 45 44 42` (ASCII `JEDB`, for the engine `jed`) |
-| 4  | 2 | `format_version` (u16) — current = **`24`** |
+| 4  | 2 | `format_version` (u16) — current = **`25`** |
 | 6  | 2 | reserved (0) |
 | 8  | 4 | `page_size` (u32) |
 | 12 | 8 | `txid` (u64) — commit counter; the highest valid slot wins on open |
 | 20 | 4 | `root_page` (u32) — the **catalog chain head** (relocatable; ≥ 2) |
 | 24 | 4 | `page_count` (u32) — total pages in the file |
-| 28 | 4 | reserved (0) — an on-disk free-list head may claim this later; **still written `0`** (P6.2 reconstructs the free-list on open rather than persisting it — see *Allocation & incremental commit*) |
+| 28 | 4 | `free_list_head` (u32) — **new in v25**: the first free-list page (`page_type 7`), or `0` for an empty free-list. A non-zero head must satisfy `2 ≤ head < page_count` (else `XX001`). Replaces the v24 reserved-zero field; a reader loads the free-list from this chain instead of reconstructing it (*Reclamation* below) |
 | 32 | 4 | `crc32` (u32) — CRC-32/IEEE over meta bytes `[0, 32)` (excludes this field and the zero-fill tail) |
 
 `page_size` lives at a fixed offset so a reader can learn it before it knows where page 1
@@ -419,15 +447,17 @@ present (copy-on-write never overwrote them). `create` seeds **both** slots with
 `txid = 1` meta, so two valid slots exist from the first moment (the first even-`txid` commit
 then overwrites slot 0).
 
-**Opening (slot selection).** Validate each slot independently (magic, `format_version == 24`,
-reserved == 0, `crc32`). Choose the **valid** slot with the **highest `txid`**; on a tie,
-slot 0. Exactly one valid → use it (torn-write fallback). Neither valid → `data_corrupted`.
+**Opening (slot selection).** Validate each slot independently (magic, `format_version == 25`,
+offsets 6–7 reserved == 0, `free_list_head` == 0 or in `[2, page_count)`, `crc32`). Choose the
+**valid** slot with the **highest `txid`**; on a tie, slot 0. Exactly one valid → use it (torn-write
+fallback). Neither valid → `data_corrupted`. The chosen meta's `free_list_head` is followed to load
+the free-list (*Reclamation* below) — no reachability walk.
 
 ## Page header (catalog and B-tree pages, 16 bytes — v7)
 
 | offset | size | field |
 |---|---|---|
-| 0 | 1 | `page_type` (u8) — `1` = catalog, `2` = B-tree **leaf**, `3` = B-tree **interior**, `4` = overflow; `5` = GiST **leaf**, `6` = GiST **interior** (**new in v20** — a persisted R-tree node, [../design/gist.md §4.1](../design/gist.md): a leaf entry is `bound_len u16 ‖ encode_range_body(bound) ‖ skey_len u16 ‖ skey`, an interior entry `bound_len u16 ‖ encode_range_body(union) ‖ child_page u32`) |
+| 0 | 1 | `page_type` (u8) — `1` = catalog, `2` = B-tree **leaf**, `3` = B-tree **interior**, `4` = overflow; `5` = GiST **leaf**, `6` = GiST **interior** (**new in v20** — a persisted R-tree node, [../design/gist.md §4.1](../design/gist.md): a leaf entry is `bound_len u16 ‖ encode_range_body(bound) ‖ skey_len u16 ‖ skey`, an interior entry `bound_len u16 ‖ encode_range_body(union) ‖ child_page u32`); `7` = **free-list** (**new in v25** — a persisted free-list chunk, `item_count` free page indices as big-endian `u32`s, `next_page` the next chunk — *Free-list page* below) |
 | 1 | 1 | reserved (0) |
 | 2 | 2 | reserved (0) |
 | 4 | 4 | `item_count` (u32) — entries (catalog) / keys `N` (B-tree node) on this page |
@@ -437,11 +467,11 @@ slot 0. Exactly one valid → use it (torn-write fallback). Neither valid → `d
 The payload follows at offset **16** and is zero-filled to `page_size`.
 
 **Per-page checksum (v7).** Every body page (catalog `1`, leaf `2`, interior `3`, overflow
-`4`) carries a `crc32` over all its own bytes except the 4-byte field itself. It uses the
-**same CRC-32/IEEE** routine and polynomial as the meta slot (below). A reader computes the
+`4`, free-list `7`) carries a `crc32` over all its own bytes except the 4-byte field itself. It uses
+the **same CRC-32/IEEE** routine and polynomial as the meta slot (below). A reader computes the
 checksum the instant it parses a page and rejects a mismatch as `data_corrupted` (`XX001`).
 Because *every* page read funnels through one parse — including the demand-paged leaf fault
-and the open-time free-list reachability walk (which follows catalog and overflow chains by
+and the open-time free-list chain walk (v25 — which reads the persisted `page_type 7` pages by
 header) — a single-bit flip in any live page is **detected**, not silently served. The
 checksum is part of physical page I/O and is **not** a metered cost unit (it is invisible to
 the deterministic `page_read` cost, like the buffer pool — [../design/cost.md](../design/cost.md),
@@ -1177,9 +1207,12 @@ only its **dirty** pages, then publishing the new root. The §2 atomicity rests 
      (v5), in the catalog's index order (lowercased-name ascending), post-order each.
    - Then the **catalog chain** (always rewritten fresh: it carries the possibly-moved
      `root_data_page` of every table), as consecutive pages.
+   - Then (v25) the **free-list pages** encoding the free entries this commit did not consume
+     — allocated from the **high-water** (never from the free-list they carry), so a from-scratch
+     image with an empty free-list writes none (*Free-list page* below).
 3. **`sync()`** — every body page is durable.
 4. **Write the meta** to slot `txid & 1` (new `txid`, new `root_page` = the new catalog head,
-   new `page_count`).
+   new `page_count`, new `free_list_head`).
 5. **`sync()`** — the meta is durable; the commit is **published**.
 
 A crash between steps 3 and 5 leaves the prior meta valid (its body pages are intact — copy-on-
@@ -1194,48 +1227,64 @@ a damaged catalog/node/overflow page surfaces as `XX001` rather than wrong rows.
 crash/tear armed on the pager, exercising mid-body, between-syncs, and torn-meta-write points with a
 cross-core recovery matrix.
 
-### Reclamation (the free-list, P6.2)
+### Free-list page (`page_type = 7`, v25)
 
-P6.1 **leaked** every page an old root stopped referencing — `page_count` only grew. **P6.2
-reconstructs a free-list of those dead pages and the allocator (step 1) reuses them**, so a
-file's size is bounded by its live data plus a session's churn instead of growing on every
-commit. The free-list is **reconstructed on open, not persisted** (the TODO's
-*reconstruct-on-open first*; the meta's reserved offset-28 field stays `0` — an on-disk
-free-list head that lets open skip the walk is a later *open-speed* optimization):
+A free-list page is an ordinary body page — the 16-byte header (`page_type = 7`,
+`item_count = N` entries, `next_page` = the next chunk or `0`, per-page `crc32`) — whose payload
+is `N` big-endian `u32` free page indices, zero-filled to `page_size` (so the CRC is a pure
+function of content). The whole free-list is emitted in **ascending index order**, split into
+chunks of `entries_per_page = (page_size − 16) / 4`, one page per chunk, linked head-to-tail by
+`next_page`; `free_list_head` (meta offset 28) points at the first chunk. An empty free-list is
+`free_list_head = 0` and **no** `page_type 7` page.
 
-- **On open**, the free-list is `[2, page_count)` **minus the pages reachable from the
-  committed root** (the catalog chain plus every table **and index** B-tree node — all
-  already walked while loading). Those reachable pages are the only live ones; everything else in the file is dead
-  space left by earlier commits and is free.
-- **During a session**, the allocator (step 1) draws dirty/catalog pages from the free-list
-  (lowest index first) before extending the file. A page leaves the list **only** by being
-  allocated, which makes it live in the new committed version — so **a free-list page is never
-  reachable from the committed snapshot nor from the immediately-prior (fallback) snapshot**,
-  and overwriting it is torn-write-safe (a crash mid-commit falls back to a snapshot that does
-  not reference it — *Allocation & incremental commit* above).
-- Pages an old root orphans **during** the session are **not** returned to the free-list this
-  slice; they are reclaimed at the **next open** (when the free-list is reconstructed). A
-  long-lived writer therefore still grows within one session, then compacts on reopen.
+### Reclamation (the free-list, v25 — persisted + continuous within-session)
+
+Every commit copy-on-writes a path of pages, **orphaning** the pages the old root referenced but
+the new one no longer does. Two mechanisms recover them; through v24 only the first existed.
+
+- **Persisted free-list (v25).** The allocator (step 1) draws dirty/catalog pages from the
+  free-list (lowest index first) before extending the file, exactly as before; at commit the
+  free entries that were **not** consumed are written to `page_type 7` pages and their head
+  recorded at meta offset 28 (*Allocation & incremental commit* above). **On open** the free-list
+  is read directly from that chain — no reachability walk (through v24 it was
+  `[2, page_count)` minus the reachable set, which forced open to touch every leaf). A page leaves
+  the list **only** by being allocated, which makes it live in the new committed version, so **a
+  free-list page is never reachable from the committed snapshot nor from the immediately-prior
+  (fallback) snapshot**, and overwriting it is torn-write-safe (a crash mid-commit falls back to a
+  snapshot that does not reference it — *Allocation & incremental commit* above). The **current
+  committed** free-list pages *are* reachable from the committed snapshot (via offset 28), so they
+  are excluded from the list they carry and never handed back for reuse until the next commit
+  orphans them.
+
+- **Continuous within-session reclamation (v25).** Pages an old root orphans **during** the
+  session are returned to the free-list **within the session** (not only at the next open):
+  periodically — once the high-water passes ~2× the live page count — the writer rebuilds the
+  free-list as `[2, page_count)` minus the pages reachable from the committed root (the catalog
+  chain, every table/index node, live overflow chains, **and** the current free-list pages), so
+  `page_count` oscillates in `[live, 2×live]` and the rebuild is amortized O(height)/commit. This
+  is what keeps the **persisted** free-list bounded: without it, orphans would accumulate untouched
+  (reconstruct-on-open used to sweep them, but v25 no longer walks on open), so the file would grow
+  without bound across sessions. A pure in-memory database (no meta, never reopened) gets this
+  reclamation with no persistence.
 
 **The watermark (transactions.md §8).** A page freed at `txid T` is reusable only once
-`oldest_live_txid > T`. Every reconstructed free-list page was already dead at the committed
-version when the file was opened (`last-ref < committed.txid`), and on a single file-backed
-handle `oldest_live_txid == committed.txid`, so the gate holds trivially. It becomes
-load-bearing when **continuous (within-session) reclamation** and **file-backed reader
-sharing** land together: returning a just-orphaned page to the free-list must then wait until
-`oldest_live_txid` passes the version that last referenced it, lest a still-open reader on an
-older snapshot observe a recycled page. Continuous reclamation (return orphans immediately —
-needs O(dirty) orphan tracking so a commit stays incremental, or an O(live) reachable-set
-recompute) and on-disk free-list persistence are the documented follow-ons.
+`oldest_live_txid > T`. The within-session rebuild is **gated** on it: a page unreachable from the
+committed root may still be observed by a live reader (a streaming cursor) pinned to an older
+snapshot, so the rebuild is deferred while any reader pins a version older than the committed one
+(on an otherwise-idle single writer `oldest_live_txid == committed.txid` and the gate is a no-op).
+This is what makes the watermark load-bearing (through v24 the reconstruct-on-open list held only
+pages already dead at open, so the gate held trivially).
 
 **From-scratch image (`to_image`).** A clean, garbage-free image of a snapshot — used by
 `create`'s initial write and by the **golden tests / Ruby reference** — is the special case
 where *every* node is dirty: allocate and write the whole tree (post-order per table, in
 name order; each table's tree then its index trees in catalog order) starting at page 2,
-then the catalog chain, then both meta slots at `txid = 1`.
-This is what the fixtures pin. (An incrementally-committed file additionally contains leaked
-pages from intermediate commits; its round-trip correctness is verified by per-core tests, not
-by a static golden, because it depends on the commit history.)
+then the catalog chain, then both meta slots at `txid = 1`. Its free-list is **empty**, so
+`free_list_head = 0` and it writes no `page_type 7` page (v25) — a golden's only v25 change is
+its version byte + meta CRC. This is what the fixtures pin. (An incrementally-committed file
+additionally contains a persisted free-list and leaked pages from intermediate commits; its
+round-trip correctness — including the free-list chain bytes — is verified by per-core tests,
+not by a static golden, because it depends on the commit history.)
 
 ## Edge cases
 

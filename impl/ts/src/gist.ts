@@ -510,18 +510,15 @@ export function buildGistFromLeafKeys(ops: GistOpclass[], keys: Uint8Array[]): G
   return tree;
 }
 
-// readGistLeafKeys walks a persisted GiST R-tree (rooted at root, page types 5/6), marking every node
-// page in reached (so the free-list keeps the live tree) and collecting each leaf's leaf key (bound ‖
-// skey — the tuple's self-delimiting bound bytes concatenated with the storage key). OPCLASS-
-// AGNOSTIC: the whole bound blob is copied verbatim (single- or multi-column), so no element type is
-// needed. read returns one page's { pageType, itemCount, payload }.
+// readGistLeafKeys walks a persisted GiST R-tree (rooted at root, page types 5/6), collecting each
+// leaf's leaf key (bound ‖ skey — the tuple's self-delimiting bound bytes concatenated with the storage
+// key). OPCLASS-AGNOSTIC: the whole bound blob is copied verbatim (single- or multi-column), so no
+// element type is needed. read returns one page's { pageType, itemCount, payload }.
 export function readGistLeafKeys(
   read: (pageNo: number) => { pageType: number; itemCount: number; payload: Uint8Array },
   pageNo: number,
-  reached: Set<number>,
   out: Uint8Array[],
 ): void {
-  reached.add(pageNo);
   const { pageType, itemCount, payload } = read(pageNo);
   const cur = { pos: 0 };
   if (pageType === PAGE_GIST_LEAF) {
@@ -541,7 +538,7 @@ export function readGistLeafKeys(
       takeBytes(payload, cur, blen); // skip the union bound
       children.push(readU32(payload, cur));
     }
-    for (const cp of children) readGistLeafKeys(read, cp, reached, out);
+    for (const cp of children) readGistLeafKeys(read, cp, out);
     return;
   }
   throw engineError("data_corrupted", "expected a GiST node page");

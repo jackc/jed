@@ -72,7 +72,7 @@ import {
   Statement as ErgoStatement,
 } from "./ergonomic.ts";
 import { engineError } from "./errors.ts";
-import { maybeCompact, persistImpl } from "./persist.ts";
+import { persistImpl } from "./persist.ts";
 import type { Statement } from "./ast.ts";
 import type { ScriptSummary } from "./split.ts";
 import type { Privileges, PrivilegeSet } from "./privileges.ts";
@@ -148,16 +148,9 @@ class SharedCore {
   // engine advance only after both syncs succeed, so a write failure leaves the file's prior meta
   // untouched.
   persist(snap: Snapshot): void {
-    const write = persistImpl(this.storage, snap);
-    // Within-session reclamation for the main domain runs only when enabled (off by default —
-    // reconstruct-on-open) and no reader pins an older version (the in-memory watermark, temp-tables.md
-    // §6 Phase A). A no-op for the default main domain; the toggle is exercised by the reclamation tests.
-    maybeCompact(
-      this.storage,
-      snap,
-      write.rootPage,
-      this.oldestLiveVersion(snap.txid) === snap.txid,
-    );
+    // v25: persistImpl reclaims within-session itself (in-commit for a file store, post-commit for an
+    // in-memory one), gated on the reader watermark — no reader pins a version older than this commit.
+    persistImpl(this.storage, snap, this.oldestLiveVersion(snap.txid) === snap.txid);
   }
 
   // hasLiveReaders reports whether any cross-session reader currently pins a committed snapshot (the
@@ -266,6 +259,10 @@ export class Database {
   // carry the shared paging, so every pinned/cloned snapshot faults clean pages through the one pool
   // (spec/design/pager.md).
   static fromEngine(engine: Engine): Database {
+    // v25: the main domain (file or in-memory) reclaims within-session — the open path reads the
+    // persisted free-list and no longer reconstructs it, so mid-session orphans must be returned at each
+    // commit or they would leak permanently (format.md *Reclamation*).
+    engine.reclaimWithinSession = true;
     const core = new SharedCore(engine.committed, engine);
     core.readOnly = engine.readOnly;
     return Database.over(core);
@@ -313,6 +310,8 @@ export class Database {
         engine.paging?.close(); // release the just-opened file — the name is taken
         throw engineError("duplicate_object", `database "${name}" already exists`);
       }
+      // v25: a file attachment persists + reclaims like the main file domain.
+      engine.reclaimWithinSession = true;
       storage = engine; // its stores fault through engine.paging (bound at load); storePaging stays unset
       root = engine.committed;
     } else {

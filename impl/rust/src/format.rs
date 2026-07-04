@@ -81,7 +81,7 @@ const MAGIC: [u8; 4] = *b"JEDB";
 /// `bound_len u16 ‖ encode_range_body(union) ‖ child_page u32`. The catalog index entry is unchanged
 /// (the `index_root_page` slot points at the R-tree root, `0` for an empty index); only the node
 /// pages it reaches differ. A file with no GiST index still moves to v20 only by its version byte.
-const FORMAT_VERSION: u16 = 24;
+const FORMAT_VERSION: u16 = 25;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
 /// (`page_type`, `item_count`, `next_page`) plus a 4-byte per-page `crc32` (offset 12).
 pub(crate) const PAGE_HEADER: usize = 16;
@@ -125,6 +125,11 @@ const PAGE_INTERIOR: u8 = 3;
 /// by `next_page` (spec/design/large-values.md §4/§12). Large values spill here so their record
 /// stays ≤ `RECORD_MAX`.
 const PAGE_OVERFLOW: u8 = 4;
+/// `page_type` for a **free-list** page (v25 — spec/fileformat/format.md *Free-list page*): an
+/// ordinary body page whose payload is `item_count` big-endian `u32` free page indices, chained by
+/// `next_page`. Persists the free-list so open reads it directly (meta offset 28 → the chain head)
+/// instead of reconstructing it by walking every leaf.
+const PAGE_FREELIST: u8 = 7;
 
 /// Value-codec presence tags beyond `0x00` present-inline-plain / `0x01` NULL
 /// (spec/design/large-values.md §12/§13; spec/fileformat/format.md "Large values"):
@@ -1421,8 +1426,11 @@ pub(crate) struct IncrementalWrite {
     pub(crate) pages: Vec<(u32, Vec<u8>)>,
     pub(crate) root_page: u32,
     pub(crate) page_count: u32,
-    /// The free-list entries this commit did **not** consume — the new free-list (P6.2). `file.rs`
-    /// stores it back on the handle for the next commit (spec/fileformat/format.md *Reclamation*).
+    /// The free-list entries this commit did **not** consume by its tree/catalog pages — all pages
+    /// dead at the fallback (prior) snapshot, so **safe** to overwrite this commit. The durable path
+    /// draws its persisted `page_type 7` free-list pages from these (never the high-water, so
+    /// persisting the free-list never grows the file), and reclaims this commit's fresh orphans into
+    /// the persisted list too (shared.rs / file.rs — spec/fileformat/format.md *Reclamation*).
     pub(crate) free_remaining: Vec<u32>,
 }
 
@@ -1460,6 +1468,9 @@ impl Snapshot {
     /// win); the catalog chain is always rewritten (it carries each table's possibly-moved root). The
     /// dirty nodes' set-once page ids are assigned here. The page size was validated at file
     /// creation, so no size check is repeated.
+    /// Assembles only the dirty tree + rewritten catalog (v25: the persisted `page_type 7` free-list
+    /// pages are serialized separately by the durable path *after* an in-commit reachability walk, so
+    /// this-commit's fresh orphans are reclaimed into the persisted list — [`serialize_free_list`]).
     pub(crate) fn incremental_image(
         &self,
         page_size: u32,
@@ -1588,6 +1599,102 @@ impl Snapshot {
             free_remaining: alloc.free[alloc.cursor..].to_vec(),
         })
     }
+}
+
+/// Serialize the full free-list `persist` (ascending — the pages dead at the new committed snapshot,
+/// including this commit's fresh orphans) into a `page_type 7` chain (v25 — spec/fileformat/format.md
+/// *Free-list page*), and return the chain pages, its head (`0` when empty), the list actually
+/// persisted (`persist` minus the pages the chain itself occupies), and the new high-water.
+///
+/// The chain's own pages are drawn from `safe` — the subset of the free-list that is dead at the
+/// **fallback** (prior) snapshot too (`free_remaining`), so overwriting them this commit is
+/// torn-write-safe — **not** from the high-water, so persisting the free-list does not grow the file.
+/// The high-water is extended only if `safe` is exhausted (rare: a large delete on an otherwise-tight
+/// file). A free-list page is consumed here, so it never appears in the list it carries; this
+/// commit's fresh orphans (in `persist`, not in `safe`) are persisted but not reused until the next
+/// commit (the watermark — they are still reachable from the fallback).
+fn serialize_free_list(
+    persist: &[u32],
+    safe: &[u32],
+    cap: usize,
+    ps: usize,
+    next: u32,
+) -> (Vec<(u32, Vec<u8>)>, u32, Vec<u32>, u32) {
+    // Nothing worth persisting when it would take the whole list to hold itself (empty, or a lone
+    // page): leave the residue in RAM, reclaimed at the next compaction (a bounded transient leak).
+    if persist.len() < 2 {
+        return (Vec::new(), 0, persist.to_vec(), next);
+    }
+    let per = (cap / 4).max(1);
+    // Draw free-list pages (from `safe`, then the high-water) until they hold every entry that then
+    // remains. Each page drawn from `safe` also *removes* itself from what must be held (it is in
+    // `persist`), so the loop converges; a high-water page adds a slot without shrinking the content.
+    let mut fl_ids: Vec<u32> = Vec::new();
+    let mut si = 0usize;
+    let mut hw = next;
+    let mut safe_drawn = 0usize;
+    loop {
+        let content = persist.len() - safe_drawn;
+        if content.div_ceil(per) <= fl_ids.len() {
+            break;
+        }
+        if si < safe.len() {
+            fl_ids.push(safe[si]);
+            si += 1;
+            safe_drawn += 1;
+        } else {
+            fl_ids.push(hw);
+            hw += 1;
+        }
+    }
+    // The persisted list is `persist` minus the pages drawn from it (the first `safe_drawn` fl_ids).
+    let drawn: HashSet<u32> = fl_ids[..safe_drawn].iter().copied().collect();
+    let persisted: Vec<u32> = persist
+        .iter()
+        .copied()
+        .filter(|p| !drawn.contains(p))
+        .collect();
+    let mut pages = Vec::with_capacity(fl_ids.len());
+    for (ci, &page_no) in fl_ids.iter().enumerate() {
+        let lo = (ci * per).min(persisted.len());
+        let chunk = &persisted[lo..((ci + 1) * per).min(persisted.len())];
+        let next_page = if ci + 1 < fl_ids.len() {
+            fl_ids[ci + 1]
+        } else {
+            0
+        };
+        let mut payload = Vec::with_capacity(chunk.len() * 4);
+        for &e in chunk {
+            payload.extend_from_slice(&e.to_be_bytes());
+        }
+        pages.push((
+            page_no,
+            make_page(ps, PAGE_FREELIST, chunk.len() as u32, next_page, &payload),
+        ));
+    }
+    (pages, fl_ids[0], persisted, hw)
+}
+
+/// Read a persisted free-list (v25) by following the `page_type 7` chain from `head` (meta offset
+/// 28) through the pager, collecting every free page index. `head == 0` is an empty free-list. The
+/// inverse of the free-list serialization in [`Snapshot::incremental_image`]; replaces the v24
+/// reconstruct-on-open reachability walk (spec/fileformat/format.md *Reclamation*).
+fn read_free_list(paging: &SharedPaging, head: u32) -> Result<Vec<u32>> {
+    let mut free = Vec::new();
+    let mut p = head;
+    while p != 0 {
+        let block = paging.pager().read_block(p)?;
+        let page = parse_page(&block)?;
+        if page.page_type != PAGE_FREELIST {
+            return Err(corrupt("expected a free-list page"));
+        }
+        let mut pos = 0usize;
+        for _ in 0..page.item_count {
+            free.push(read_u32(page.payload, &mut pos)?);
+        }
+        p = page.next_page;
+    }
+    Ok(free)
 }
 
 /// Assign a page to one **dirty** node (and its dirty descendants) post-order, appending each as a
@@ -1732,12 +1839,10 @@ impl Engine {
 
         let mut snap = Snapshot::default();
         snap.txid = meta.txid;
-        // Reconstruct the free-list (P6.2) from the pages the skeleton load marks reachable — every
-        // interior node, plus each leaf's page id (recorded without retaining the leaf).
-        let mut reached: HashSet<u32> = HashSet::new();
+        // v25: the free-list is read from the persisted chain (below), not reconstructed by a
+        // reachability walk — so the catalog + skeleton load no longer tracks a `reached` set.
         let mut cat_page = meta.root_page;
         while cat_page != 0 {
-            reached.insert(cat_page);
             let block = paging.pager().read_block(cat_page)?;
             let page = parse_page(&block)?;
             if page.page_type != PAGE_CATALOG {
@@ -1784,17 +1889,11 @@ impl Engine {
                 // `put_table` (spec/design/composite.md §3).
                 let col_types = Arc::new(snap.store(&name).col_types().to_vec());
                 if root_data_page != 0 {
-                    let (root, len) =
-                        read_skeleton(&paging, root_data_page, &col_types, &mut reached)?;
-                    // The skeleton leaves leaves `OnDisk` (unread), so their records' overflow
-                    // chains are invisible to the reachability walk above. For a table with
-                    // spillable columns, read the leaves now to collect those live chains — else
-                    // the free-list would reclaim still-referenced overflow pages
-                    // (spec/design/large-values.md §12; default `open` is this paged path). Dead
-                    // chains still leak until the next open, matching the P6.2 orphan model.
-                    if any_spillable(&col_types) {
-                        collect_leaf_overflow(&paging, root_data_page, &col_types, &mut reached)?;
-                    }
+                    let (root, len) = read_skeleton(&paging, root_data_page, &col_types)?;
+                    // v25: the persisted free-list already excludes live overflow chains (they were
+                    // kept reachable when the list was rebuilt — reachable_pages/collect_leaf_overflow
+                    // at commit time), so open no longer re-reads every spillable leaf to protect them
+                    // (the second full leaf pass is gone — the open-speed win, format.md *Reclamation*).
                     let store = snap.store_mut(&name);
                     store.set_tree(Some(root), len);
                     if !has_pk {
@@ -1815,8 +1914,8 @@ impl Engine {
                     if iroot != 0 {
                         if idx.kind == IndexKind::Gist {
                             // GiST is EAGER-loaded, not demand-paged (gist.md §4.1(a)): read the
-                            // whole R-tree (marking pages reached), recover its leaf keys into a
-                            // fully-resident leaf store. The resident R-tree is rebuilt below.
+                            // whole R-tree, recover its leaf keys into a fully-resident leaf store.
+                            // The resident R-tree is rebuilt below.
                             let mut keys = Vec::new();
                             read_gist_leaf_keys(
                                 &|p| {
@@ -1825,7 +1924,6 @@ impl Engine {
                                     Ok((pg.page_type, pg.item_count, pg.payload.to_vec()))
                                 },
                                 iroot,
-                                &mut reached,
                                 &mut keys,
                             )?;
                             for k in keys {
@@ -1835,8 +1933,7 @@ impl Engine {
                             istore.attach_paging(paging.clone());
                             // An index tree has zero value columns (empty-payload records); its
                             // Packed leaves reconstruct empty rows from a shared empty col-type list.
-                            let (root, len) =
-                                read_skeleton(&paging, iroot, &Arc::new(Vec::new()), &mut reached)?;
+                            let (root, len) = read_skeleton(&paging, iroot, &Arc::new(Vec::new()))?;
                             istore.set_tree(Some(root), len);
                         }
                     } else {
@@ -1856,9 +1953,13 @@ impl Engine {
         let mut db = Engine::new();
         db.page_size = page_size as u32;
         db.page_count = meta.page_count;
-        db.free_pages = (ROOT_PAGE..meta.page_count)
-            .filter(|p| !reached.contains(p))
-            .collect();
+        // v25: load the free-list directly from the persisted chain (meta offset 28) — no
+        // reachability walk (spec/fileformat/format.md *Reclamation*).
+        db.free_pages = read_free_list(&paging, meta.free_list_head)?;
+        // Seed the within-session compaction trigger with the live estimate (`page_count` minus the
+        // free-list), so the first commit after open does not compact spuriously (format.rs
+        // `compacted_free_list`).
+        db.live_at_compaction = meta.page_count.saturating_sub(db.free_pages.len() as u32);
         db.committed = snap;
         // Stores created in a LATER session bind this same pager at creation (Snapshot::store_paging),
         // so they join the post-commit residency flip like the loaded stores attached above.
@@ -1935,12 +2036,14 @@ fn collect_leaf_overflow(
 
 /// Collect every page reachable from the committed snapshot whose catalog head is `cat_root`: the
 /// catalog chain, every table/index B+tree node, and (for spillable columns) the live overflow chains.
-/// The inverse of the free-list and the basis of within-session compaction (shared.rs `maybe_compact`)
-/// — the same live set the open-time reconstruction (`open_paged`) derives, but computed against the
-/// already-resident committed trees: node page ids come from the in-memory tree walk (no pager reads),
-/// and only the catalog chain and spillable-leaf overflow are read through the pager. A reclaim domain
-/// (temp) never carries a GiST index (deferred 0A000, temp-tables.md §8), so GiST pages need no
-/// handling here — the caller (`maybe_compact`) skips any snapshot that has one.
+/// The basis of within-session compaction (shared.rs `maybe_compact`): node page ids come from the
+/// in-memory tree walk (no pager reads), and only the catalog chain and spillable-leaf overflow are
+/// read through the pager. It does **not** cover a **GiST** index's on-disk R-tree pages (the resident
+/// GiST store holds only the leaf-key set, no on-disk page ids) nor the current persisted free-list
+/// pages — both are handled by the caller unioning **the pages this commit just wrote** into the
+/// reached set (a GiST index rewrites its whole R-tree every commit — gist.md §4.1(b) — so all live
+/// GiST pages are in that write set, as are the free-list pages), so a within-session rebuild never
+/// frees a live GiST or free-list page.
 pub(crate) fn reachable_pages(
     snap: &Snapshot,
     paging: &SharedPaging,
@@ -1981,6 +2084,60 @@ pub(crate) fn reachable_pages(
     Ok(reached)
 }
 
+/// The v25 durable-commit free-list plan, shared by the file commit paths (`shared.rs::commit_durable`
+/// and `file.rs::Engine::persist`). It runs **in-commit** (after the tree + catalog are written to the
+/// pager, before the meta), so the list it persists includes **this commit's fresh orphans** — without
+/// that, a short open→commit→close session would leak them forever (open no longer reconstructs the
+/// free-list, v25). Two modes:
+///
+/// - **Compact** (periodic — the high-water has grown past ~2× the live count at the last compaction,
+///   and no reader pins an older version): the persisted list is the full reachable-complement
+///   `[2, page_count) − reached`, reclaiming every dead page. `written` (the pages this commit wrote)
+///   is unioned into the live set so a wholesale-rewritten GiST R-tree is never freed; the catalog +
+///   new overflow are covered by reading the just-written pages back (`reachable_pages`). The
+///   O(live) walk is amortized to O(height)/commit by the ~2× trigger.
+/// - **Carry** (otherwise): the persisted list is `free_remaining` (the pages already free minus what
+///   this commit consumed) — this commit's orphans wait for the next compaction (the file stays
+///   bounded in `[live, 2×live]`).
+///
+/// Either way the chain's own pages are drawn from `free_remaining` (safe to overwrite — dead at the
+/// fallback snapshot too), so persisting never grows the file (`serialize_free_list`). Returns the
+/// chain pages, its head, the list to keep as the new free-list, the new high-water, and the live
+/// count to remember (unchanged when not compacting). The caller has gated on the reader watermark.
+pub(crate) fn plan_free_list(
+    snap: &Snapshot,
+    paging: &SharedPaging,
+    cat_root: u32,
+    written: &[(u32, Vec<u8>)],
+    free_remaining: &[u32],
+    page_count: u32,
+    live_at_compaction: u32,
+    cap: usize,
+    ps: usize,
+    can_reclaim: bool,
+) -> Result<(Vec<(u32, Vec<u8>)>, u32, Vec<u32>, u32, u32)> {
+    const MIN_COMPACT_PAGES: u32 = 16; // don't churn a tiny store
+    let compact = can_reclaim
+        && page_count > MIN_COMPACT_PAGES
+        && (page_count as u64) > 2 * live_at_compaction as u64;
+    let (persist_list, new_live) = if compact {
+        let mut reached = reachable_pages(snap, paging, cat_root)?;
+        for (index, _) in written {
+            reached.insert(*index);
+        }
+        let free: Vec<u32> = (ROOT_PAGE..page_count)
+            .filter(|p| !reached.contains(p))
+            .collect();
+        let live = reached.len() as u32;
+        (free, live)
+    } else {
+        (free_remaining.to_vec(), live_at_compaction)
+    };
+    let (pages, head, persisted, new_pc) =
+        serialize_free_list(&persist_list, free_remaining, cap, ps, page_count);
+    Ok((pages, head, persisted, new_pc, new_live))
+}
+
 /// Add every node page of a resident B+tree to `reached`: an interior/leaf node's own set-once page,
 /// and each `OnDisk` child leaf's page (walked without faulting it — the page id is on the child). A
 /// page-0 node is a dirty node not yet persisted (never on a committed tree at compaction time); it is
@@ -2008,9 +2165,8 @@ fn read_skeleton(
     paging: &Arc<SharedPaging>,
     root_page: u32,
     col_types: &Arc<Vec<ColType>>,
-    reached: &mut HashSet<u32>,
 ) -> Result<(Arc<Node>, usize)> {
-    let (child, len) = read_skeleton_node(paging, root_page, col_types, reached)?;
+    let (child, len) = read_skeleton_node(paging, root_page, col_types)?;
     let root = match child {
         Child::Resident(node) => node,
         Child::OnDisk(page) => paging.fault_leaf(page, col_types)?,
@@ -2020,14 +2176,14 @@ fn read_skeleton(
 
 /// Read one B-tree node through the pager, **once**: a leaf becomes `Child::OnDisk` (its rows counted
 /// from the header, then dropped — not retained); an interior node becomes `Child::Resident` with its
-/// children resolved recursively. Returns the child reference and the subtree's row count.
+/// children resolved recursively. Returns the child reference and the subtree's row count. (The
+/// free-list is loaded from the persisted chain in v25, so this walk no longer tracks reachability —
+/// it still reads each leaf once for the row count, the remaining open-speed follow-on.)
 fn read_skeleton_node(
     paging: &SharedPaging,
     page_idx: u32,
     col_types: &[ColType],
-    reached: &mut HashSet<u32>,
 ) -> Result<(Child, usize)> {
-    reached.insert(page_idx);
     let block = paging.pager().read_block(page_idx)?;
     let page = parse_page(&block)?;
     match page.page_type {
@@ -2040,7 +2196,7 @@ fn read_skeleton_node(
             let mut total = 0usize;
             for _ in 0..=n {
                 let cp = read_u32(payload, &mut pos)?;
-                let (child, clen) = read_skeleton_node(paging, cp, col_types, reached)?;
+                let (child, clen) = read_skeleton_node(paging, cp, col_types)?;
                 children.push(child);
                 total += clen;
             }
@@ -2109,25 +2265,18 @@ fn serialize_gist_index<A: FnMut() -> u32>(
 }
 
 /// Walk a persisted GiST R-tree (rooted at `root`, page types 5/6 — spec/design/gist.md §4.1),
-/// marking every node page in `reached` (so the free-list keeps the live tree) and collecting each
-/// leaf's **leaf key** (`bound ‖ skey` — the bound bytes concatenated with the storage key,
-/// recovered by re-joining the two length-prefixed fields). The bound bytes are the opclass's
-/// self-delimiting form (`range_ops`' range body / the scalar `=` opclass's `[min,max]` key blob),
-/// copied verbatim — so this walk is **opclass-agnostic** (no element type needed). The leaf keys
-/// repopulate the in-memory leaf-key store (the maintenance source of truth); the resident R-tree
-/// the planner descends is rebuilt canonically from them afterward (`Snapshot::rebuild_gist_trees`).
-/// `read` returns one page's `(page_type, item_count, payload)`, reading from the whole image or
-/// through the pager.
-fn read_gist_leaf_keys<F>(
-    read: &F,
-    page_no: u32,
-    reached: &mut HashSet<u32>,
-    out: &mut Vec<Vec<u8>>,
-) -> Result<()>
+/// collecting each leaf's **leaf key** (`bound ‖ skey` — the bound bytes concatenated with the
+/// storage key, recovered by re-joining the two length-prefixed fields). The bound bytes are the
+/// opclass's self-delimiting form (`range_ops`' range body / the scalar `=` opclass's `[min,max]` key
+/// blob), copied verbatim — so this walk is **opclass-agnostic** (no element type needed). The leaf
+/// keys repopulate the in-memory leaf-key store (the maintenance source of truth); the resident
+/// R-tree the planner descends is rebuilt canonically from them afterward
+/// (`Snapshot::rebuild_gist_trees`). `read` returns one page's `(page_type, item_count, payload)`,
+/// reading from the whole image or through the pager.
+fn read_gist_leaf_keys<F>(read: &F, page_no: u32, out: &mut Vec<Vec<u8>>) -> Result<()>
 where
     F: Fn(u32) -> Result<(u8, u32, Vec<u8>)>,
 {
-    reached.insert(page_no);
     let (page_type, n, payload) = read(page_no)?;
     let mut pos = 0usize;
     match page_type {
@@ -2152,7 +2301,7 @@ where
                 children.push(read_u32(&payload, &mut pos)?);
             }
             for cp in children {
-                read_gist_leaf_keys(read, cp, reached, out)?;
+                read_gist_leaf_keys(read, cp, out)?;
             }
             Ok(())
         }
@@ -2618,7 +2767,13 @@ fn pack(sizes: &[usize], cap: usize) -> Result<Vec<Vec<usize>>> {
 /// One meta slot's full `page_size` bytes (the 36-byte header + its CRC, zero-padded): its only
 /// content. `to_image` copies it into both slots; an incremental commit pwrites it to the alternate
 /// slot (`file.rs`). Single-sources the meta byte layout (spec/fileformat/format.md).
-pub(crate) fn meta_page(page_size: u32, txid: u64, root_page: u32, page_count: u32) -> Vec<u8> {
+pub(crate) fn meta_page(
+    page_size: u32,
+    txid: u64,
+    root_page: u32,
+    page_count: u32,
+    free_list_head: u32,
+) -> Vec<u8> {
     let mut p = vec![0u8; page_size as usize];
     p[0..4].copy_from_slice(&MAGIC);
     p[4..6].copy_from_slice(&FORMAT_VERSION.to_be_bytes());
@@ -2626,6 +2781,8 @@ pub(crate) fn meta_page(page_size: u32, txid: u64, root_page: u32, page_count: u
     p[12..20].copy_from_slice(&txid.to_be_bytes());
     p[20..24].copy_from_slice(&root_page.to_be_bytes());
     p[24..28].copy_from_slice(&page_count.to_be_bytes());
+    // v25: offset 28 is the persisted free-list head (0 = empty); through v24 it was reserved 0.
+    p[28..32].copy_from_slice(&free_list_head.to_be_bytes());
     let crc = crc32_ieee(&p[0..32]);
     p[32..36].copy_from_slice(&crc.to_be_bytes());
     p
@@ -2646,7 +2803,8 @@ fn make_page(ps: usize, page_type: u8, item_count: u32, next_page: u32, payload:
     p
 }
 
-/// Write a meta slot into `image` (the whole-image path; `meta_page` is the single source).
+/// Write a meta slot into `image` (the whole-image path; `meta_page` is the single source). A
+/// from-scratch image has an empty free-list, so `free_list_head = 0` (v25).
 fn write_meta(
     image: &mut [u8],
     ps: usize,
@@ -2657,7 +2815,7 @@ fn write_meta(
     page_count: u32,
 ) {
     let off = slot * ps;
-    image[off..off + ps].copy_from_slice(&meta_page(page_size, txid, root_page, page_count));
+    image[off..off + ps].copy_from_slice(&meta_page(page_size, txid, root_page, page_count, 0));
 }
 
 /// Write a catalog / data page into `image` (the whole-image path; `make_page` is the single source).
@@ -2680,6 +2838,9 @@ struct Meta {
     root_page: u32,
     /// On-disk page high-water — the next free page an incremental commit appends at (P6.1 part B).
     page_count: u32,
+    /// The persisted free-list head (v25 — meta offset 28): the first `page_type 7` page, or `0`
+    /// for an empty free-list. Open follows this chain instead of reconstructing the free-list.
+    free_list_head: u32,
 }
 
 /// Validate a standalone meta block; None if it is not a valid meta. Shared by `read_meta` (whole
@@ -2694,17 +2855,24 @@ fn parse_meta(m: &[u8]) -> Option<Meta> {
     if u16::from_be_bytes([m[4], m[5]]) != FORMAT_VERSION {
         return None;
     }
-    if m[6] != 0 || m[7] != 0 || m[28..32] != [0, 0, 0, 0] {
+    if m[6] != 0 || m[7] != 0 {
         return None;
     }
     let stored = u32::from_be_bytes([m[32], m[33], m[34], m[35]]);
     if crc32_ieee(&m[0..32]) != stored {
         return None;
     }
+    let page_count = u32::from_be_bytes(m[24..28].try_into().unwrap());
+    // v25: offset 28 is the free-list head — 0 (empty) or a real body page in [2, page_count).
+    let free_list_head = u32::from_be_bytes(m[28..32].try_into().unwrap());
+    if free_list_head != 0 && (free_list_head < ROOT_PAGE || free_list_head >= page_count) {
+        return None;
+    }
     Some(Meta {
         txid: u64::from_be_bytes(m[12..20].try_into().unwrap()),
         root_page: u32::from_be_bytes(m[20..24].try_into().unwrap()),
-        page_count: u32::from_be_bytes(m[24..28].try_into().unwrap()),
+        page_count,
+        free_list_head,
     })
 }
 

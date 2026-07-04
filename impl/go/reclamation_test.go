@@ -1,15 +1,17 @@
 package jed
 
-// P6.2 — free-list / page reclamation (spec/fileformat/format.md, *Reclamation*). The commit
-// allocator reuses pages a prior root abandoned instead of always extending the file: on open the
-// free-list is reconstructed as [2, pageCount) minus the committed root's reachable pages, and a commit
-// draws dirty/catalog pages from it (lowest-first) before extending. These per-core tests cover what a
-// static golden cannot (the bytes depend on commit history): that reopening reclaims the dead pages a
-// churn left so a later churn reuses them (the file stops growing), that reuse round-trips, and that a
-// torn latest commit *after reuse* still falls back to the intact prior snapshot (a reused page was
-// dead, so overwriting it never damaged the fallback).
+// Free-list / page reclamation (spec/fileformat/format.md, *Reclamation*). The commit allocator reuses
+// pages a prior root abandoned instead of always extending the file. Since v25 the free-list is
+// persisted (meta offset 28 → a page_type 7 chain) and reclamation is continuous within-session: a file
+// commit reclaims this commit's fresh orphans in-commit (periodically — once the high-water passes ~2×
+// the live count), so the high-water oscillates in [live, 2×live] across a long churn rather than growing
+// monotonically, and open reads the persisted free-list directly (no reconstruction walk). These per-core
+// tests cover what a static golden cannot (the bytes depend on commit history): that within-session churn
+// stays bounded, that reopening reads the persisted free-list and a later churn stays bounded, that reuse
+// round-trips, and that a torn latest commit *after reuse* still falls back to the intact prior snapshot.
 
 import (
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -49,24 +51,28 @@ func reclaimSetup(t *testing.T, path string, rows int) *engine {
 	return db
 }
 
-func TestReopenReclaimsDeadPagesSoALaterChurnReuses(t *testing.T) {
+func TestWithinSessionChurnStaysBoundedAndReopensFromPersistedFreeList(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "reclaim_reuse.jed")
 	db := reclaimSetup(t, path, 30) // a multi-level tree at page 256
 	pad := strings.Repeat("y", 40)
 
-	// Churn within this session: each UPDATE commit copies the root→leaf path + rewrites the catalog
-	// to fresh pages and leaks the old ones (P6.2 does not reclaim mid-session), so the logical
-	// high-water grows. (We track the committed pageCount, not the file length — the file is
-	// preallocated in chunks ahead of it, spec/design/pager.md §7.)
+	// Churn within this session: each UPDATE commit copies the root→leaf path + rewrites the catalog to
+	// fresh pages, and v25 reclaims the pages the prior root abandoned in-commit (periodically), so the
+	// high-water oscillates in [live, 2×live] rather than growing monotonically with the 60 updates.
+	// (We track the committed pageCount, not the file length — preallocated in chunks, pager.md §7.)
 	for k := 0; k < 60; k++ {
 		mustExec(t, db, fmt.Sprintf("UPDATE t SET pad = 'a%d-%s' WHERE id = 15", k, pad))
 	}
 	pcAfterChurn1 := reclaimPageCount(db)
+	if pcAfterChurn1 >= 60 {
+		t.Fatalf("within-session reclamation should bound the high-water, got %d (60 updates × ~2 pages without it)", pcAfterChurn1)
+	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	// Reopen: the free-list is reconstructed from the ~60 churn iterations' dead pages.
+	// Reopen: the free-list is read directly from the persisted chain (no reconstruction walk); the
+	// high-water is whatever the last commit recorded.
 	db, err := open(path)
 	if err != nil {
 		t.Fatal(err)
@@ -75,19 +81,19 @@ func TestReopenReclaimsDeadPagesSoALaterChurnReuses(t *testing.T) {
 		t.Fatalf("reopen changed the high-water: %d vs %d", pc, pcAfterChurn1)
 	}
 
-	// The very first post-reopen commit reuses a free page rather than extending the high-water.
+	// The first post-reopen commit reuses free pages from the persisted list rather than extending.
 	mustExec(t, db, fmt.Sprintf("UPDATE t SET pad = 'b0-%s' WHERE id = 15", pad))
-	if got := reclaimPageCount(db); got != pcAfterChurn1 {
-		t.Fatalf("first commit after reopen grew the high-water (no reuse): %d vs %d", got, pcAfterChurn1)
+	if got := reclaimPageCount(db); got > pcAfterChurn1+4 {
+		t.Fatalf("first commit after reopen did not reuse the persisted free-list: %d vs %d", got, pcAfterChurn1)
 	}
 
-	// A whole second churn — shorter than the first, so the reclaimed pool covers it — does not grow
-	// the high-water: the page count after equals the count after the first churn.
+	// A whole second churn stays bounded too — reusing reclaimed pages, the high-water does not grow
+	// with the churn count.
 	for k := 1; k < 40; k++ {
 		mustExec(t, db, fmt.Sprintf("UPDATE t SET pad = 'b%d-%s' WHERE id = 15", k, pad))
 	}
-	if got := reclaimPageCount(db); got != pcAfterChurn1 {
-		t.Fatalf("second churn grew the high-water despite reuse: %d vs %d", got, pcAfterChurn1)
+	if got := reclaimPageCount(db); got > 2*pcAfterChurn1 {
+		t.Fatalf("second churn grew the high-water beyond the [live, 2×live] band: %d vs ~2×%d", got, pcAfterChurn1)
 	}
 
 	// And the data is exactly right (reuse never clobbered a live page).
@@ -107,6 +113,76 @@ func TestReopenReclaimsDeadPagesSoALaterChurnReuses(t *testing.T) {
 		t.Fatalf("after final reopen row 15 pad = %q (ok=%v), want %q", got, ok, want)
 	}
 	checkIDs1to(t, selectIDs(t, db), 30)
+}
+
+// freeListHead returns the live meta slot's free_list_head (v25, meta offset 28) in a raw image.
+func freeListHead(b []byte) uint32 {
+	ps := int(binary.BigEndian.Uint32(b[8:12]))
+	live := 0
+	if slotTxid(b, 1) > slotTxid(b, 0) {
+		live = 1
+	}
+	return binary.BigEndian.Uint32(b[live*ps+28:])
+}
+
+// countFreelistPages counts the page_type 7 free-list pages over all pageCount pages of a raw image.
+func countFreelistPages(b []byte) int {
+	ps := int(binary.BigEndian.Uint32(b[8:12]))
+	live := 0
+	if slotTxid(b, 1) > slotTxid(b, 0) {
+		live = 1
+	}
+	pageCount := int(binary.BigEndian.Uint32(b[live*ps+24:]))
+	n := 0
+	for i := 0; i < pageCount; i++ {
+		if b[i*ps] == 7 {
+			n++
+		}
+	}
+	return n
+}
+
+// TestPersistedFreeListHeadsAPageType7Chain: after enough churn to build a free-list, the meta records a
+// non-zero free_list_head (offset 28) that heads a page_type 7 chain, and reopening reads it back so the
+// file stays bounded — the persisted-free-list byte contract a static golden cannot pin (it depends on
+// commit history; format.md *Free-list page*).
+func TestPersistedFreeListHeadsAPageType7Chain(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reclaim_persisted.jed")
+	db := reclaimSetup(t, path, 40)
+	big := strings.Repeat("z", 40)
+	for round := 0; round < 40; round++ {
+		for id := 1; id <= 40; id++ {
+			mustExec(t, db, fmt.Sprintf("UPDATE t SET pad = 'r%d-%d-%s' WHERE id = %d", round, id, big, id))
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	bytes, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := freeListHead(bytes)
+	if head < 2 {
+		t.Fatalf("the meta should record a persisted free-list head (offset 28), got %d", head)
+	}
+	ps := int(binary.BigEndian.Uint32(bytes[8:12]))
+	if bytes[int(head)*ps] != 7 {
+		t.Fatalf("the free-list head page is not page_type 7, got %d", bytes[int(head)*ps])
+	}
+	if countFreelistPages(bytes) < 1 {
+		t.Fatal("the file should carry at least one persisted free-list page")
+	}
+
+	db, err = open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkIDs1to(t, selectIDs(t, db), 40)
+	if pc := reclaimPageCount(db); pc >= 200 {
+		t.Fatalf("reopened file should be bounded by within-session reclamation, got %d", pc)
+	}
 }
 
 func TestHeavyInsertDeleteChurnReopensWithReuse(t *testing.T) {

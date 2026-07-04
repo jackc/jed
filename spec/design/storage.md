@@ -133,13 +133,15 @@ meta — detail specified in [../fileformat/format.md](../fileformat/format.md).
 > ([../fileformat/format.md](../fileformat/format.md)). The block seam (§2) is real: a commit
 > writes individual pages in place / appends, rather than rewriting the whole file.
 >
-> **Free-list reclamation (P6.2) has since landed** (reconstruct-on-open): the commit allocator
-> reuses dead pages from a free-list rebuilt on open, so the file no longer grows without bound
-> (§6). Demand paging / the bounded buffer pool (P6.4, [pager.md](pager.md)), overflow pages
-> for over-large values, and LZ4 compression (both v3, [large-values.md](large-values.md)) have
-> **also landed**. **Still deferred** (later Phase-6 items, none foreclosed): continuous
-> within-session reclamation + on-disk free-list persistence (P6.2 follow-ons), and the
-> spill-to-disk hash join / aggregate / DISTINCT operators ([spill.md](spill.md)). The
+> **Free-list reclamation has since landed** — P6.2 reconstruct-on-open, then **v25 persisted +
+> continuous within-session** (§6): the commit allocator reuses dead pages from a free-list that
+> is now **read from the persisted `page_type 7` chain on open** (no reachability walk) and
+> **reclaimed in-commit** each commit, so the file stays bounded within a session too. Demand
+> paging / the bounded buffer pool (P6.4, [pager.md](pager.md)), overflow pages for over-large
+> values, and LZ4 compression (both v3, [large-values.md](large-values.md)) have **also landed**.
+> **Still deferred** (later Phase-6 items, none foreclosed): per-subtree/per-table row counts so
+> open need not walk leaves for the row count either, and the spill-to-disk hash join / aggregate
+> / DISTINCT operators ([spill.md](spill.md)). The
 > whole-image `to_image` survives as the **from-scratch** serializer used by
 > `create`'s initial write and the golden fixtures (the special case where every node is
 > dirty); the live commit path is the incremental one.
@@ -205,20 +207,28 @@ sits so the options stay open (CLAUDE.md §9).
   writes only the dirty path of the copy-on-write B-tree + the rewritten catalog to fresh
   appended pages, then publishes the alternate meta slot (§4 status note). The no-PK rowid is
   a **monotonic counter**, reconstructed on load as `max key + 1`.
-- **Free-list / page reclamation** — ✅ **landed (P6.2), reconstruct-on-open form.** P6.1
-  *leaked* every page an old root dropped (the file grew on every commit); P6.2 reconstructs a
-  free-list — `[2, page_count)` minus the pages reachable from the committed root — **on open**,
-  and the commit allocator (§4) reuses them (lowest index first) before extending the file. A
-  page leaves the list only by being allocated into the new committed version, so it is never
-  reachable from a fallback snapshot and reuse is torn-write-safe; the oldest-live-snapshot
-  watermark (transactions.md §8 — a page freed at `txid T` is reusable only once
-  `oldest_live_txid > T`) holds trivially on a single file-backed handle
-  (`oldest_live_txid == committed.txid`). The free-list is **not persisted** (reserved meta
-  offset 28 stays `0`); orphans created *within* a session are reclaimed at the next open.
-  **Deferred follow-ons:** continuous within-session reclamation (return orphans immediately —
-  the watermark gate then does real work, paired with file-backed reader sharing) and on-disk
-  free-list persistence (so open skips the reachable-set walk —
-  [../fileformat/format.md](../fileformat/format.md) *Reclamation*).
+- **Free-list / page reclamation** — ✅ **landed (P6.2 reconstruct-on-open, then v25
+  persisted + continuous).** P6.1 *leaked* every page an old root dropped (the file grew on
+  every commit); P6.2 reconstructed a free-list — `[2, page_count)` minus the pages reachable
+  from the committed root — **on open**, and the commit allocator (§4) reuses them (lowest
+  index first) before extending the file. **v25 persists the free-list** (meta offset 28 →
+  a `page_type 7` chain — [../fileformat/format.md](../fileformat/format.md) *Free-list page*),
+  so **open reads it directly** rather than reconstructing it by walking every leaf (the second
+  full leaf pass for spillable overflow chains is gone; the row-count leaf walk stays until the
+  per-subtree-count follow-on). Persistence is paired with **continuous within-session
+  reclamation** for the file/in-memory main domain: a file commit reclaims **this commit's fresh
+  orphans in-commit** — periodically, once the high-water passes ~2× the live count, so the file
+  oscillates in `[live, 2×live]` and the O(live) reachability walk is amortized O(height)/commit
+  — because with open no longer reconstructing, orphans left unpersisted would leak permanently
+  (a short open→commit→close session especially). This is what makes the **oldest-live-snapshot
+  watermark** (transactions.md §8 — a page freed at `txid T` is reusable only once
+  `oldest_live_txid > T`) **load-bearing**: the in-commit rebuild is deferred while any reader
+  pins an older version. A free-list page is drawn from the free-list itself (never the
+  high-water), so persisting the free-list does not grow the file, and it is torn-write-safe (a
+  reused/rewritten page is dead at the fallback snapshot). An in-memory database reclaims the
+  same way with **no persistence** (no meta, never reopened — post-commit RAM rebuild). **Deferred
+  follow-on:** per-subtree/per-table row counts so open need not walk leaves for the row count
+  either (the remaining open-speed item).
 - **Multi-process file locking** — ⏳ **decided, spec'd ([locking.md](locking.md)), not
   built.** Everything above assumes the engine is alone with the file (the open-time
   free-list walk, the buffer pool, the in-process watermark); today nothing enforces it — two
@@ -386,7 +396,7 @@ concurrency and `$N`).
 | no fault (baseline) | full commit | **new** snapshot |
 
 After any recovery-to-prior, a follow-on test **continues committing** (insert/delete churn) to confirm
-the **free-list reconstruction** (§6, reconstruct-on-open) is correct after a crash — reuse stays
+the **free-list** (§6 — v25 persisted + reclaimed in-commit) is correct after a crash — reuse stays
 torn-write-safe and the file does not corrupt or grow unbounded.
 
 **Write-through fidelity caveat.** The seam writes through to the real file (it does not model "unsynced

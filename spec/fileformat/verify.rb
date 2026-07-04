@@ -25,7 +25,13 @@
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 24 # format_version 24: the B+tree reshape (format.md; bplus-reshape.md B1) — records live
+VERSION = 25 # format_version 25: on-disk free-list persistence (format.md; storage.md §6) — meta
+# offset 28 becomes free_list_head (0 = empty), and a page_type 7 free-list page persists the
+# unconsumed free-list so open reads it directly instead of reconstructing it by walking every leaf.
+# A from-scratch image (build_image) has an EMPTY free-list, so free_list_head = 0 and no page_type 7
+# page: every golden's only v25 change is its version byte + meta CRC (a non-empty persisted free-list
+# arises only from incremental churn, pinned by per-core tests). format_version 24: the B+tree reshape
+# (format.md; bplus-reshape.md B1) — records live
 # (page_type 2) stores its records COLUMN-MAJOR: key directory (N+1 u32 prefix-sum) | key blob |
 # column directory (K+1 u32 region offsets, colStart[K] = payload end) | per column a value directory
 # (N+1 u32 prefix-sum) then that column's N value bodies. The per-value codec is byte-unchanged;

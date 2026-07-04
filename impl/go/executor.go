@@ -983,13 +983,18 @@ type engine struct {
 	// free-list is exhausted (spec/fileformat/format.md). Set from the file's meta on Open, from the
 	// initial image on Create; 0 (unused) for an in-memory database.
 	pageCount uint32
-	// freePages is the free-list (P6.2): page indices a prior root abandoned, reusable by the next
-	// incremental commit (spec/fileformat/format.md *Reclamation*). Reconstructed on Open as
-	// [2, pageCount) minus the committed root's reachable pages; drawn lowest-first before the file is
-	// extended. A page leaves the list only by being allocated into a new committed version, so it is
-	// reachable from no live snapshot and reuse is torn-write-safe. nil for an in-memory database and
+	// freePages is the free-list (P6.2 + v25): page indices a prior root abandoned, reusable by the
+	// next incremental commit (spec/fileformat/format.md *Reclamation*). Read from the persisted chain
+	// on Open (v25 — meta offset 28), and returned to within-session by periodic compaction; drawn
+	// lowest-first before the file is extended. A page leaves the list only by being allocated into a
+	// new committed version, so it is reachable from no live snapshot and reuse is torn-write-safe. nil
 	// for a freshly-created file (a from-scratch image leaks nothing).
 	freePages []uint32
+	// liveAtCompaction is the live (reachable) page count recorded at this handle's last within-session
+	// compaction — the cheap periodic trigger basis (v25): a bare-engine file commit re-runs the
+	// reclamation walk only once the high-water passes ~2× it, mirroring storage (shared.go). 0 for an
+	// in-memory database (no persistence).
+	liveAtCompaction uint32
 	// paging is the shared paging context for a file-backed database (spec/design/pager.md): the open
 	// pager (kept for the handle's life) + the bounded leaf buffer pool, shared with every table store
 	// so reads fault OnDisk leaves through the one pool. The load reads pages through it and every

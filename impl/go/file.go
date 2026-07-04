@@ -170,17 +170,18 @@ func (db *engine) persist(snap *snapshot) error {
 	if db.paging == nil {
 		return nil
 	}
+	ps := int(db.pageSize)
+	cap := ps - pageHeader
 	write, err := snap.incrementalImage(db.pageSize, db.pageCount, db.freePages, db.paging)
 	if err != nil {
 		return err
 	}
-	meta := metaPage(db.pageSize, snap.txid, write.rootPage, write.pageCount)
-	// Write the dirty pages + meta through the shared pager (under the pool lock, so a concurrent
-	// fault cannot race): body pages, Sync, then the alternate meta slot, Sync.
+	// v25: write the dirty tree + catalog first (unsynced), so the in-commit reachability walk can read
+	// the new catalog back through the pager (read-your-writes) — the free-list persisted this commit
+	// thus reclaims this commit's fresh orphans (planFreeList); a short open→commit→close session no
+	// longer leaks them (open no longer reconstructs the free-list). Preallocate ahead of the high-water
+	// so the body fdatasync carries no file-growth journaling (spec/design/pager.md §7).
 	if err := db.paging.withPager(func(p *pager) error {
-		// Preallocate the file ahead of the high-water in chunks, so this commit's body write — and
-		// most later commits' — lands in already-allocated space and the body fdatasync below carries
-		// no file-growth metadata journaling (spec/design/pager.md §7).
 		if err := p.reserve(write.pageCount); err != nil {
 			return err
 		}
@@ -188,11 +189,32 @@ func (db *engine) persist(snap *snapshot) error {
 			if err := p.writeBlock(pg.index, pg.bytes); err != nil {
 				return err
 			}
-			// Drop any stale pool entry for a rewritten page (bufferpool.go invalidate): a no-op unless a
-			// reclaim domain reused a freed page id, in which case the pool's prior decode must be evicted.
 			db.paging.pool.invalidate(pg.index)
 		}
-		if err := p.sync(); err != nil { // body pages durable before the meta can reference them
+		return nil
+	}); err != nil {
+		return err
+	}
+	// Watermark-gated by this handle's live streaming cursors; periodic (~2×-live) inside planFreeList.
+	canReclaim := db.openStreams == 0
+	flPages, head, persisted, newPC, newLive, err := planFreeList(
+		snap, db.paging, write.rootPage, write.pages, write.freeRemaining, write.pageCount, db.liveAtCompaction, cap, ps, canReclaim,
+	)
+	if err != nil {
+		return err
+	}
+	meta := metaPage(db.pageSize, snap.txid, write.rootPage, newPC, head)
+	if err := db.paging.withPager(func(p *pager) error {
+		if err := p.reserve(newPC); err != nil {
+			return err
+		}
+		for _, pg := range flPages {
+			if err := p.writeBlock(pg.index, pg.bytes); err != nil {
+				return err
+			}
+			db.paging.pool.invalidate(pg.index)
+		}
+		if err := p.sync(); err != nil { // every body page (tree/catalog/free-list) durable before the meta
 			return err
 		}
 		if err := p.writeBlock(uint32(snap.txid&1), meta); err != nil {
@@ -202,8 +224,9 @@ func (db *engine) persist(snap *snapshot) error {
 	}); err != nil {
 		return err
 	}
-	db.pageCount = write.pageCount
-	db.freePages = write.freeRemaining
+	db.pageCount = newPC
+	db.freePages = persisted
+	db.liveAtCompaction = newLive
 	return nil
 }
 

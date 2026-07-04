@@ -550,9 +550,12 @@ cross-core-identical and owns that consequence (the host-extension boundary, §1
   fixed-width columns, the vectorizable stride): each table's rows are an on-disk tree (leaf +
   interior node pages) and a commit is **incremental** — it writes only the dirty pages a
   mutation introduced and publishes the new root by alternating the meta slot (P6.1), rather
-  than rewriting the whole image. **Page reclamation** (P6.2) reconstructs a
-  **free-list** of dead pages on open and the commit allocator reuses them, so a file no longer
-  grows without bound. All three cores (Rust, Go, TS) **and** the Ruby reference read/write
+  than rewriting the whole image. **Page reclamation** (P6.2, then `format_version` 25) gives the
+  commit allocator a **free-list** of dead pages to reuse so a file no longer grows without bound —
+  since v25 **persisted on disk** (meta offset 28 → a `page_type 7` chain, so open reads it directly
+  instead of walking every leaf) and reclaimed **continuously within-session** (this commit's orphans
+  returned in-commit, watermark-gated, so the file stays bounded within a long session too). All three
+  cores (Rust, Go, TS) **and** the Ruby reference read/write
   byte-identical files, verified against shared golden fixtures (the §8 cross-core round-trip;
   the goldens pin the clean *from-scratch* image). The double-buffered meta page + root pointer
   are the hooks the incremental commit model (§3) uses. **Landed since:** demand paging / the
@@ -586,11 +589,14 @@ cross-core-identical and owns that consequence (the host-extension boundary, §1
   and the **`serial` owned-sequence link** (`format_version` 14 — the sequence-entry flags byte gains
   a `has_owner` bit + a trailing owner table-name/column-ordinal; a `serial`/`bigserial`/`smallserial`
   column auto-creates an *owned* default-i64 sequence with a `DEFAULT nextval(...)`, so `DROP TABLE`
-  auto-drops it and `DROP SEQUENCE` of an owned sequence is `2BP01`, `spec/design/sequences.md` §12).
-  **Still deferred**
-  (later Phase-6, none foreclosed): continuous within-session reclamation + on-disk free-list
-  persistence (the P6.2 follow-ons). The from-scratch whole-image serializer survives as
-  `create`'s initial write and the golden generator.
+  auto-drops it and `DROP SEQUENCE` of an owned sequence is `2BP01`, `spec/design/sequences.md` §12),
+  and **on-disk free-list persistence + continuous within-session reclamation**
+  (`format_version` 25 — meta offset 28 `free_list_head` + a new `page_type 7` free-list page; open
+  reads the persisted free-list instead of the reachability walk, and a file commit reclaims its fresh
+  orphans in-commit under the reader watermark, `spec/design/storage.md` §6). **Still deferred**
+  (later Phase-6, none foreclosed): per-subtree/per-table row counts so open need not walk leaves for
+  the row count either (the remaining open-speed follow-on). The from-scratch whole-image serializer
+  survives as `create`'s initial write and the golden generator.
 - **Host file API (Phase 7).** The embedding surface (`spec/design/api.md`) `open`s/`create`s
   a database file and `commit`s the whole image **durably** via temp-file + fsync + atomic
   rename + dir fsync (whole-image rewrite ⇒ rename gives all-or-nothing for free). `commit` is

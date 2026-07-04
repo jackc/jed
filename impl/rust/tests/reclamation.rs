@@ -1,11 +1,14 @@
-//! P6.2 — free-list / page reclamation (spec/fileformat/format.md, *Reclamation*). The commit
-//! allocator reuses pages a prior root abandoned instead of always extending the file: on open the
-//! free-list is reconstructed as `[2, page_count)` minus the committed root's reachable pages, and a
-//! commit draws dirty/catalog pages from it (lowest-first) before extending. These per-core tests
-//! cover what a static golden cannot (the bytes depend on commit history): that reopening reclaims
-//! the dead pages a churn left so a later churn reuses them (the file stops growing), that reuse
-//! round-trips, and that a torn latest commit *after reuse* still falls back to the intact prior
-//! snapshot (a reused page was dead, so overwriting it never damaged the fallback).
+//! Free-list / page reclamation (spec/fileformat/format.md, *Reclamation*). The commit allocator
+//! reuses pages a prior root abandoned instead of always extending the file. Since **v25** the
+//! free-list is **persisted** (meta offset 28 → a `page_type 7` chain) and reclamation is
+//! **continuous within-session**: a file commit reclaims this commit's fresh orphans **in-commit**
+//! (periodically — once the high-water passes ~2× the live count), so the high-water oscillates in
+//! `[live, 2×live]` across a long churn rather than growing monotonically, and open reads the
+//! persisted free-list directly (no reconstruction walk). These per-core tests cover what a static
+//! golden cannot (the bytes depend on commit history): that within-session churn stays bounded, that
+//! reopening reads the persisted free-list and a later churn stays bounded, that reuse round-trips,
+//! and that a torn latest commit *after reuse* still falls back to the intact prior snapshot (a reused
+//! page was dead, so overwriting it never damaged the fallback).
 
 use std::path::PathBuf;
 
@@ -24,6 +27,86 @@ fn be32(b: &[u8], at: usize) -> u32 {
 
 fn be64(b: &[u8], at: usize) -> u64 {
     u64::from_be_bytes(b[at..at + 8].try_into().unwrap())
+}
+
+/// The live meta slot's `free_list_head` (v25, meta offset 28) in a raw file image.
+fn free_list_head(bytes: &[u8]) -> u32 {
+    let ps = be32(bytes, 8) as usize;
+    let live = if slot_txid(bytes, 0) >= slot_txid(bytes, 1) {
+        0
+    } else {
+        1
+    };
+    be32(bytes, live * ps + 28)
+}
+
+/// The `page_type` (byte 0) of page `idx` in a raw file image.
+fn page_type(bytes: &[u8], idx: u32) -> u8 {
+    let ps = be32(bytes, 8) as usize;
+    bytes[idx as usize * ps]
+}
+
+/// Count the `page_type 7` free-list pages in a raw file image (over all `page_count` pages).
+fn count_freelist_pages(bytes: &[u8]) -> usize {
+    let ps = be32(bytes, 8) as usize;
+    let live = if slot_txid(bytes, 0) >= slot_txid(bytes, 1) {
+        0
+    } else {
+        1
+    };
+    let page_count = be32(bytes, live * ps + 24) as usize;
+    (0..page_count).filter(|&i| bytes[i * ps] == 7).count()
+}
+
+/// v25: after enough churn to build a multi-page free-list, the meta records a non-zero
+/// `free_list_head` (offset 28) that heads a `page_type 7` chain, and reopening reads it back so the
+/// file stays bounded — the persisted-free-list byte contract a static golden cannot pin (it depends
+/// on commit history; format.md *Free-list page*).
+#[test]
+fn persisted_free_list_heads_a_page_type_7_chain() {
+    let path = tmp("reclaim_persisted.jed");
+    let mut db = setup(&path, 40);
+    let big = "z".repeat(40);
+    // Churn many rows so the free-list (and its page_type 7 chain) is comfortably non-empty and, at
+    // page 256 (60 entries/free-list page), likely spans more than one chain page.
+    for round in 0..40 {
+        for id in 1..=40 {
+            db.query_outcome(
+                &format!("UPDATE t SET pad = 'r{round}-{id}-{big}' WHERE id = {id}"),
+                &[],
+            )
+            .unwrap();
+        }
+    }
+    drop(db);
+
+    let bytes = std::fs::read(&path).unwrap();
+    let head = free_list_head(&bytes);
+    assert!(
+        head >= 2,
+        "the meta records a persisted free-list head (offset 28), got {head}"
+    );
+    assert_eq!(
+        page_type(&bytes, head),
+        7,
+        "the free-list head page is page_type 7"
+    );
+    assert!(
+        count_freelist_pages(&bytes) >= 1,
+        "the file carries at least one persisted free-list page"
+    );
+
+    // Reopen (reads the persisted free-list, no reconstruction) and confirm the data round-trips and
+    // the file is bounded (within-session reclamation, not monotonic churn growth).
+    let mut db = Database::open(&path)
+        .unwrap()
+        .session(SessionOptions::default());
+    assert_eq!(ids(&mut db), (1..=40).collect::<Vec<_>>());
+    assert!(
+        db.page_count() < 200,
+        "reopened file is bounded by within-session reclamation (got {})",
+        db.page_count()
+    );
 }
 
 /// `txid` of meta slot `slot` in a raw file image (spec/fileformat/format.md).
@@ -81,16 +164,16 @@ fn setup(path: &PathBuf, rows: i64) -> Session {
 }
 
 #[test]
-fn reopen_reclaims_dead_pages_so_a_later_churn_reuses_them() {
+fn within_session_churn_stays_bounded_and_reopens_from_the_persisted_free_list() {
     let path = tmp("reclaim_reuse.jed");
     let mut db = setup(&path, 30); // a multi-level tree at page 256
     let pad = "y".repeat(40);
 
-    // Churn within this session: each UPDATE commit copies the root→leaf path + rewrites the
-    // catalog to fresh pages and *leaks* the old ones (P6.2 does not reclaim mid-session), so the
-    // logical high-water grows monotonically across the 60 updates. (We track the committed
-    // `page_count`, not the file length — the file is preallocated in chunks ahead of it,
-    // spec/design/pager.md §7.)
+    // Churn within this session: each UPDATE commit copies the root→leaf path + rewrites the catalog
+    // to fresh pages, and v25 reclaims the pages the prior root abandoned IN-COMMIT (periodically), so
+    // the high-water oscillates in [live, 2×live] rather than growing monotonically with the 60
+    // updates. (We track the committed `page_count`, not the file length — the file is preallocated in
+    // chunks ahead of it, spec/design/pager.md §7.)
     for k in 0..60 {
         db.query_outcome(
             &format!("UPDATE t SET pad = 'a{k}-{pad}' WHERE id = 15"),
@@ -99,29 +182,35 @@ fn reopen_reclaims_dead_pages_so_a_later_churn_reuses_them() {
         .unwrap();
     }
     let pc_after_churn1 = db.page_count();
+    assert!(
+        pc_after_churn1 < 60,
+        "within-session reclamation bounds the high-water (got {pc_after_churn1}); without it the 60 \
+         updates would leak ~2 pages each",
+    );
     drop(db);
 
-    // Reopen: the free-list is reconstructed from the ~60 churn iterations' dead pages.
+    // Reopen: the free-list is read directly from the persisted chain (no reconstruction walk); the
+    // high-water is whatever the last commit recorded.
     let mut db = Database::open(&path)
         .unwrap()
         .session(SessionOptions::default());
     assert_eq!(
         db.page_count(),
         pc_after_churn1,
-        "reopen does not change the high-water"
+        "reopen reads the persisted high-water, unchanged"
     );
 
-    // The very first post-reopen commit reuses a free page rather than extending the high-water.
+    // The first post-reopen commit reuses free pages from the persisted list rather than extending.
     db.query_outcome(&format!("UPDATE t SET pad = 'b0-{pad}' WHERE id = 15"), &[])
         .unwrap();
-    assert_eq!(
+    assert!(
+        db.page_count() <= pc_after_churn1 + 4,
+        "the first commit after reopen reuses the persisted free-list (got {}, was {pc_after_churn1})",
         db.page_count(),
-        pc_after_churn1,
-        "the first commit after reopen reuses a dead page (no growth)"
     );
 
-    // A whole second churn — shorter than the first, so the reclaimed pool covers it — extends the
-    // high-water not at all: the page count after equals the count after the first churn.
+    // A whole second churn stays bounded too — reusing reclaimed pages, the high-water does not grow
+    // with the churn count.
     for k in 1..40 {
         db.query_outcome(
             &format!("UPDATE t SET pad = 'b{k}-{pad}' WHERE id = 15"),
@@ -129,10 +218,10 @@ fn reopen_reclaims_dead_pages_so_a_later_churn_reuses_them() {
         )
         .unwrap();
     }
-    assert_eq!(
+    assert!(
+        db.page_count() <= 2 * pc_after_churn1,
+        "the second churn stays bounded (got {}, ~2×{pc_after_churn1})",
         db.page_count(),
-        pc_after_churn1,
-        "reusing reclaimed pages, the second churn does not grow the high-water"
     );
 
     // And the data is exactly right (reuse never clobbered a live page).

@@ -199,6 +199,8 @@ impl Engine {
         if self.paging.is_none() {
             return Ok(());
         }
+        let ps = self.page_size as usize;
+        let cap = ps - crate::format::PAGE_HEADER;
         let free = self.free_pages.clone();
         let write = snap.incremental_image(
             self.page_size,
@@ -206,24 +208,60 @@ impl Engine {
             &free,
             self.paging.as_deref(),
         )?;
-        let meta =
-            crate::format::meta_page(self.page_size, snap.txid, write.root_page, write.page_count);
+        // v25: write the dirty tree + catalog first (unsynced), so the in-commit reachability walk can
+        // read the new catalog back through the pager (read-your-writes) — the free-list persisted this
+        // commit thus reclaims this commit's fresh orphans (`plan_free_list`); a short open→commit→close
+        // session no longer leaks them (open no longer reconstructs the free-list). Preallocate ahead of
+        // the high-water so the body `fdatasync` carries no file-growth journaling (pager.md §7).
         {
             let paging = self.paging.as_ref().expect("paging present");
             let mut pager = paging.pager();
-            // Preallocate the file ahead of the high-water in chunks, so this commit's body write —
-            // and most later commits' — lands in already-allocated space and the body `fdatasync`
-            // below carries no file-growth metadata journaling (spec/design/pager.md §7).
             pager.reserve(write.page_count)?;
             for (index, bytes) in &write.pages {
                 pager.write_block(*index, bytes)?;
             }
-            pager.sync()?; // body pages durable before the meta can reference them
+        }
+        // Watermark-gated by this handle's live streaming cursors; periodic (~2×-live) inside
+        // `plan_free_list`. A file is never reopened concurrently by this bare-`Engine` handle.
+        let can_reclaim = self.open_streams.load(std::sync::atomic::Ordering::Relaxed) == 0;
+        let paging = self.paging.clone().expect("paging present");
+        let (fl_pages, head, persisted, new_page_count, new_live) = crate::format::plan_free_list(
+            snap,
+            &paging,
+            write.root_page,
+            &write.pages,
+            &write.free_remaining,
+            write.page_count,
+            self.live_at_compaction,
+            cap,
+            ps,
+            can_reclaim,
+        )?;
+        let meta = crate::format::meta_page(
+            self.page_size,
+            snap.txid,
+            write.root_page,
+            new_page_count,
+            head,
+        );
+        {
+            let mut pager = paging.pager();
+            pager.reserve(new_page_count)?;
+            for (index, bytes) in &fl_pages {
+                pager.write_block(*index, bytes)?;
+            }
+            pager.sync()?; // every body page (tree/catalog/free-list) durable before the meta
             pager.write_block((snap.txid & 1) as u32, &meta)?;
             pager.sync()?; // the commit is published
         }
-        self.page_count = write.page_count;
-        self.free_pages = write.free_remaining;
+        // Invalidate rewritten pages AFTER the pager guard drops (pool-then-pager order, paging.rs):
+        // evicts a stale pool decode of any free page this commit reused for new content.
+        for (index, _) in write.pages.iter().chain(fl_pages.iter()) {
+            paging.invalidate(*index);
+        }
+        self.page_count = new_page_count;
+        self.free_pages = persisted;
+        self.live_at_compaction = new_live;
         Ok(())
     }
 

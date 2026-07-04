@@ -61,22 +61,22 @@ func TestSingleRowCommitAppendsOnlyTheDirtyPath(t *testing.T) {
 		t.Fatalf("the tree should span several pages, got %d", wholePages)
 	}
 
-	// One more row: the incremental commit appends only the rebuilt root→leaf path + catalog —
-	// far fewer pages than the whole tree, and bounded by tree height, not table size. We track the
-	// committed pageCount delta, not the file length — the file is preallocated in chunks ahead of
-	// the high-water (spec/design/pager.md §7), so its physical size jumps by a chunk, not the
-	// dirty-page count.
+	// v25: within-session reclamation keeps the high-water bounded at ~2× the live tree across the 30
+	// inserts (each insert copies its root→leaf path + catalog and reclaims the pages the prior root
+	// abandoned), NOT 30× the dirty-path size — so the committed pageCount is a small multiple of the
+	// whole (garbage-free) tree, proving the commit is incremental, not a whole-tree rewrite.
 	before := int64(db.PageCount())
+	if before > 3*wholePages {
+		t.Fatalf("within-session reclamation bounds the high-water at ~2× the %d-page tree, not monotonic churn growth (got %d)", wholePages, before)
+	}
+	// One more row: the incremental commit rebuilds only its root→leaf path + catalog (bounded by tree
+	// height, not table size), and REUSES reclaimed free pages — so the high-water grows by at most a
+	// handful of pages, and often not at all. We track the committed pageCount delta, not the file
+	// length — the file is preallocated in chunks ahead of the high-water (spec/design/pager.md §7).
 	mustExec(t, db, fmt.Sprintf("INSERT INTO t VALUES (31, 'row-31-%s')", pad))
 	appended := int64(db.PageCount()) - before
-	if appended < 2 {
-		t.Fatalf("the commit must append its dirty path + catalog, got %d", appended)
-	}
-	if appended >= wholePages {
-		t.Fatalf("incremental commit (%d pages) must not rewrite the whole %d-page tree", appended, wholePages)
-	}
 	if appended > 8 {
-		t.Fatalf("the dirty path is bounded by tree height, not table size, got %d", appended)
+		t.Fatalf("the dirty path is bounded by tree height, not table size, and reuses free pages, got %d", appended)
 	}
 
 	// And it reopens to the full, correct contents (leaked pages and all).

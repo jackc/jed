@@ -590,13 +590,11 @@ func gistCollectLeafKeys(node *gistNode, ops []gistOpclass, out *[][]byte) {
 	}
 }
 
-// readGistLeafKeys walks a persisted GiST R-tree (rooted at root, page types 5/6), marking every
-// node page in reached (so the free-list keeps the live tree) and collecting each leaf's leaf key
-// (bound ‖ skey — the tuple's self-delimiting bound bytes concatenated with the storage key).
-// OPCLASS-AGNOSTIC: the whole bound blob is copied verbatim (single- or multi-column), so no element
-// type is needed. read returns one page's (pageType, itemCount, payload).
-func readGistLeafKeys(read func(uint32) (byte, uint32, []byte, error), pageNo uint32, reached map[uint32]bool, out *[][]byte) error {
-	reached[pageNo] = true
+// readGistLeafKeys walks a persisted GiST R-tree (rooted at root, page types 5/6), collecting each
+// leaf's leaf key (bound ‖ skey — the tuple's self-delimiting bound bytes concatenated with the
+// storage key). OPCLASS-AGNOSTIC: the whole bound blob is copied verbatim (single- or multi-column),
+// so no element type is needed. read returns one page's (pageType, itemCount, payload).
+func readGistLeafKeys(read func(uint32) (byte, uint32, []byte, error), pageNo uint32, out *[][]byte) error {
 	pageType, n, payload, err := read(pageNo)
 	if err != nil {
 		return err
@@ -642,7 +640,7 @@ func readGistLeafKeys(read func(uint32) (byte, uint32, []byte, error), pageNo ui
 			children = append(children, cp)
 		}
 		for _, cp := range children {
-			if err := readGistLeafKeys(read, cp, reached, out); err != nil {
+			if err := readGistLeafKeys(read, cp, out); err != nil {
 				return err
 			}
 		}

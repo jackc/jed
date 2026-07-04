@@ -267,6 +267,8 @@ impl Storage {
     /// in place; the caller adopts `snap` as the committed temp state afterward. `can_reclaim` is the
     /// caller's cursor watermark (no open streaming cursor may hold an older temp tree).
     pub(crate) fn persist_temp(&mut self, snap: &mut Snapshot, can_reclaim: bool) -> Result<()> {
+        // A temp/in-memory store keeps its free-list in RAM (no meta), so it persists no free-list
+        // pages; within-session reclamation is the post-commit RAM rebuild (`maybe_compact`).
         let write = snap.incremental_image(
             self.page_size,
             self.page_count,
@@ -289,7 +291,7 @@ impl Storage {
         self.page_count = write.page_count;
         self.free_pages = write.free_remaining;
         snap.demote_clean_leaves();
-        self.maybe_compact(snap, write.root_page, can_reclaim)
+        self.maybe_compact(snap, write.root_page, &write.pages, can_reclaim)
     }
 
     /// Durably publish `snap` into this storage via an **incremental** copy-on-write commit
@@ -300,8 +302,9 @@ impl Storage {
     /// the two syncs leaves the prior meta intact (copy-on-write: reused pages are reachable from no live
     /// snapshot). `page_count`/`free_pages` advance only after both syncs succeed. For an IN-MEMORY store
     /// the store's `sync` is a no-op — the file commit minus durability (bplus-reshape.md B3). Runs under
-    /// the caller's writer gate. `can_reclaim` gates within-session compaction (a no-op for a file/main
-    /// domain, whose `reclaim_within_session` is false — it reconstructs its free-list on open instead).
+    /// the caller's writer gate. `can_reclaim` gates within-session compaction (v25: on for the
+    /// file/main domain — it persists the free-list and reclaims within-session rather than
+    /// reconstructing on open).
     pub(crate) fn commit_durable(&mut self, snap: &Snapshot, can_reclaim: bool) -> Result<()> {
         let write = snap.incremental_image(
             self.page_size,
@@ -309,57 +312,147 @@ impl Storage {
             &self.free_pages,
             Some(&self.paging),
         )?;
-        let meta =
-            crate::format::meta_page(self.page_size, snap.txid, write.root_page, write.page_count);
+        if self.path.is_some() {
+            self.commit_file(snap, write, can_reclaim)
+        } else {
+            self.commit_in_memory(snap, write, can_reclaim)
+        }
+    }
+
+    /// The FILE branch of [`commit_durable`] (v25): write the dirty tree + catalog, then — in the same
+    /// commit, before the meta — plan and serialize the persisted `page_type 7` free-list (which
+    /// reclaims this commit's fresh orphans, `plan_free_list`), then the alternate meta slot. The
+    /// free-list walk reads the just-written catalog back through the pager, so the tree+catalog write
+    /// and the free-list write are two body blocks under one `sync` (the body barrier), then the meta
+    /// under a second `sync` — the same crash-recovery ordering the fault-injection matrix asserts
+    /// (storage.md §7). A crash between the syncs leaves the prior meta intact (reused pages are dead at
+    /// the fallback snapshot).
+    fn commit_file(
+        &mut self,
+        snap: &Snapshot,
+        write: crate::format::IncrementalWrite,
+        can_reclaim: bool,
+    ) -> Result<()> {
+        let ps = self.page_size as usize;
+        let cap = ps - crate::format::PAGE_HEADER;
+        // Write the dirty tree + catalog first (unsynced) so the reachability walk can read the new
+        // catalog back (the pager writes through — read-your-writes). The guard is released before the
+        // walk, which re-locks the pager itself.
         {
             let mut pager = self.paging.pager();
-            // Preallocate ahead of the high-water so the body `fdatasync` carries no file-growth
-            // metadata journaling (spec/design/pager.md §7).
             pager.reserve(write.page_count)?;
             for (index, bytes) in &write.pages {
                 pager.write_block(*index, bytes)?;
             }
-            pager.sync()?; // body pages durable before the meta can reference them
+        }
+        let (fl_pages, head, persisted, new_page_count, new_live) = crate::format::plan_free_list(
+            snap,
+            &self.paging,
+            write.root_page,
+            &write.pages,
+            &write.free_remaining,
+            write.page_count,
+            self.live_at_compaction,
+            cap,
+            ps,
+            can_reclaim,
+        )?;
+        let meta = crate::format::meta_page(
+            self.page_size,
+            snap.txid,
+            write.root_page,
+            new_page_count,
+            head,
+        );
+        {
+            let mut pager = self.paging.pager();
+            pager.reserve(new_page_count)?;
+            for (index, bytes) in &fl_pages {
+                pager.write_block(*index, bytes)?;
+            }
+            pager.sync()?; // every body page (tree/catalog/free-list) durable before the meta
             pager.write_block((snap.txid & 1) as u32, &meta)?;
             pager.sync()?; // the commit is published
         }
-        // Invalidate rewritten pages AFTER the pager guard drops — pool-then-pager order (paging.rs): a
-        // no-op unless a reclaim domain reused a freed page id, in which case the pool's prior decode
-        // must be evicted.
+        // Invalidate rewritten pages AFTER the pager guard drops (pool-then-pager order, paging.rs):
+        // evicts a stale pool decode of any free page this commit reused for new content.
+        for (index, _) in write.pages.iter().chain(fl_pages.iter()) {
+            self.paging.invalidate(*index);
+        }
+        self.page_count = new_page_count;
+        self.free_pages = persisted;
+        self.live_at_compaction = new_live;
+        Ok(())
+    }
+
+    /// The IN-MEMORY branch of [`commit_durable`]: a `MemoryBlockStore` is never reopened, so it keeps
+    /// its free-list in RAM and persists NO `page_type 7` pages (writing them would waste memory pages);
+    /// the meta write + `sync` are no-ops on the store. Within-session reclamation is a **post-commit**
+    /// RAM rebuild ([`Storage::maybe_compact`]) — there is no reopen to worry about, so it need not be
+    /// in-commit.
+    fn commit_in_memory(
+        &mut self,
+        snap: &Snapshot,
+        write: crate::format::IncrementalWrite,
+        can_reclaim: bool,
+    ) -> Result<()> {
+        let meta = crate::format::meta_page(
+            self.page_size,
+            snap.txid,
+            write.root_page,
+            write.page_count,
+            0,
+        );
+        {
+            let mut pager = self.paging.pager();
+            pager.reserve(write.page_count)?;
+            for (index, bytes) in &write.pages {
+                pager.write_block(*index, bytes)?;
+            }
+            pager.sync()?; // a no-op on a MemoryBlockStore
+            pager.write_block((snap.txid & 1) as u32, &meta)?;
+            pager.sync()?;
+        }
         for (index, _) in &write.pages {
             self.paging.invalidate(*index);
         }
         self.page_count = write.page_count;
         self.free_pages = write.free_remaining;
-        self.maybe_compact(snap, write.root_page, can_reclaim)
+        self.maybe_compact(snap, write.root_page, &write.pages, can_reclaim)
     }
 
-    /// Reclaim within-session copy-on-write orphans (temp-tables.md §6) by rebuilding the free-list from
-    /// the live (reachable) set, so later commits reuse dead pages instead of only growing the
-    /// high-water. A no-op for a non-reclaim domain; deferred while an older version is pinned
-    /// (`can_reclaim` false); periodic — walks (O(pages)) only once the high-water passes ~2× the live
-    /// count at the last compaction, so `page_count` oscillates in `[live, 2×live]` and the walk is
-    /// amortized O(height)/commit.
+    /// Reclaim within-session copy-on-write orphans (temp-tables.md §6) **in RAM** by rebuilding the
+    /// free-list from the live (reachable) set — the **post-commit** form used by never-reopened stores
+    /// (session temp, in-memory attachments, in-memory main), which need no *persisted* free-list. (A
+    /// file-backed store instead reclaims **in-commit** so the reclaimed list is durable — `plan_free_list`.)
+    /// A no-op for a non-reclaim domain; deferred while an older version is pinned (`can_reclaim` false);
+    /// periodic — walks (O(pages)) only once the high-water passes ~2× the live count at the last
+    /// compaction, so `page_count` oscillates in `[live, 2×live]` and the walk is amortized
+    /// O(height)/commit. `written` is the pages **this commit wrote** — unioned into the live set so a
+    /// live GiST R-tree (rewritten wholesale each commit, invisible to `reachable_pages`) is never freed.
     pub(crate) fn maybe_compact(
         &mut self,
         snap: &Snapshot,
         cat_root: u32,
+        written: &[(u32, Vec<u8>)],
         can_reclaim: bool,
     ) -> Result<()> {
+        const MIN_COMPACT_PAGES: u32 = 16; // don't churn a tiny store
         if !self.reclaim_within_session || !can_reclaim {
             return Ok(());
         }
-        const MIN_COMPACT_PAGES: u32 = 16; // don't churn a tiny store
         if self.page_count <= MIN_COMPACT_PAGES
             || (self.page_count as u64) <= 2 * self.live_at_compaction as u64
         {
             return Ok(());
         }
-        let reached = crate::format::reachable_pages(snap, &self.paging, cat_root)?;
-        let free: Vec<u32> = (crate::format::ROOT_PAGE..self.page_count)
+        let mut reached = crate::format::reachable_pages(snap, &self.paging, cat_root)?;
+        for (index, _) in written {
+            reached.insert(*index);
+        }
+        self.free_pages = (crate::format::ROOT_PAGE..self.page_count)
             .filter(|p| !reached.contains(p))
             .collect();
-        self.free_pages = free;
         self.live_at_compaction = reached.len() as u32;
         Ok(())
     }
@@ -700,9 +793,11 @@ impl Database {
             paging,
             read_only: engine.read_only,
             path: engine.path.clone(),
-            // The main domain keeps reconstruct-on-open only (unchanged behavior); temp domains opt in.
-            reclaim_within_session: false,
-            live_at_compaction: 0,
+            // v25: the main domain (file or in-memory) now reclaims within-session — the open path
+            // reads the persisted free-list and no longer reconstructs it, so mid-session orphans must
+            // be returned at each commit or they would leak permanently (format.md *Reclamation*).
+            reclaim_within_session: true,
+            live_at_compaction: engine.live_at_compaction,
         };
         Database(Arc::new(Shared {
             roots: RwLock::new(Roots {
@@ -896,8 +991,9 @@ impl Database {
                 paging,
                 read_only: engine.read_only,
                 path: engine.path.clone(),
-                reclaim_within_session: false,
-                live_at_compaction: 0,
+                // v25: a file attachment persists + reclaims like the main file domain (above).
+                reclaim_within_session: true,
+                live_at_compaction: engine.live_at_compaction,
             };
             Some((storage, engine.committed))
         } else {

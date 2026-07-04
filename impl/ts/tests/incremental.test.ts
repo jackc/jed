@@ -53,22 +53,23 @@ test("a single-row commit appends only the dirty path", () => {
     const wholePages = Math.floor(toImage(db, db.pageSize, db.txid).length / ps);
     assert.ok(wholePages >= 10, `the tree should span several pages (got ${wholePages})`);
 
-    // One more row: the incremental commit appends only the rebuilt root→leaf path + catalog —
-    // far fewer pages than the whole tree, and bounded by tree height, not table size. We track the
-    // committed pageCount delta, not the file length — the file is preallocated ahead of the
-    // high-water (spec/design/pager.md §7), so its physical size jumps by a geometric preallocation
-    // step, not the dirty-page count.
+    // v25: within-session reclamation keeps the high-water bounded at ~2× the live tree across the 30
+    // inserts (each insert copies its root→leaf path + catalog and reclaims the pages the prior root
+    // abandoned), NOT 30× the dirty-path size — so the committed pageCount is a small multiple of the
+    // whole (garbage-free) tree, proving the commit is incremental, not a whole-tree rewrite.
     const before = db.pageCount;
+    assert.ok(
+      before <= 3 * wholePages,
+      `within-session reclamation bounds the high-water at ~2× the ${wholePages}-page tree (got ${before})`,
+    );
+    // One more row: the incremental commit rebuilds only its root→leaf path + catalog (bounded by tree
+    // height, not table size), and REUSES reclaimed free pages — so the high-water grows by at most a
+    // handful of pages, and often not at all.
     execute(db, `INSERT INTO t VALUES (31, 'row-31-${pad}')`);
     const appended = db.pageCount - before;
-    assert.ok(appended >= 2, `the commit must append its dirty path + catalog (got ${appended})`);
-    assert.ok(
-      appended < wholePages,
-      `an incremental commit (${appended} pages) must not rewrite the whole ${wholePages}-page tree`,
-    );
     assert.ok(
       appended <= 8,
-      `the dirty path is bounded by tree height, not table size (got ${appended})`,
+      `the dirty path is bounded by tree height, not table size, and reuses free pages (got ${appended})`,
     );
 
     // And it reopens to the full, correct contents (leaked pages and all).

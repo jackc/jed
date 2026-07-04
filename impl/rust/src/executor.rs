@@ -1163,13 +1163,19 @@ pub struct Engine {
     /// free-list is exhausted (spec/fileformat/format.md). Set from the file's meta on `open`, from
     /// the initial image on `create`; `0` (unused) for an in-memory database.
     pub(crate) page_count: u32,
-    /// The free-list (P6.2): page indices a prior root abandoned, reusable by the next incremental
-    /// commit (spec/fileformat/format.md *Reclamation*). **Reconstructed on open** as `[2,
-    /// page_count)` minus the committed root's reachable pages; drawn from lowest-first before the
-    /// file is extended. A page leaves the list only by being allocated into a new committed
-    /// version, so it is reachable from no live snapshot and reuse is torn-write-safe. Empty for an
-    /// in-memory database and for a freshly-created file (a from-scratch image leaks nothing).
+    /// The free-list (P6.2 + v25): page indices a prior root abandoned, reusable by the next
+    /// incremental commit (spec/fileformat/format.md *Reclamation*). **Read from the persisted chain
+    /// on open** (v25 — meta offset 28), and returned to within-session by periodic compaction
+    /// ([`compacted_free_list`]); drawn lowest-first before the file is extended. A page leaves the
+    /// list only by being allocated into a new committed version, so it is reachable from no live
+    /// snapshot and reuse is torn-write-safe. Empty for a freshly-created file (a from-scratch image
+    /// leaks nothing).
     pub(crate) free_pages: Vec<u32>,
+    /// The live (reachable) page count recorded at this handle's last within-session compaction — the
+    /// cheap periodic trigger basis (v25): a bare-`Engine` file commit re-runs the reclamation walk
+    /// only once the high-water passes ~2× it, mirroring [`crate::shared::Storage`]. `0` for an
+    /// in-memory database (no persistence).
+    pub(crate) live_at_compaction: u32,
     /// The shared paging context for a file-backed database (spec/design/pager.md): the open pager
     /// (kept for the handle's life) + the bounded leaf buffer pool, shared (`Arc`) with every table
     /// store so reads fault `OnDisk` leaves through the one pool. The load reads pages through it and
@@ -1743,6 +1749,7 @@ impl Engine {
             page_size,
             page_count: 0,
             free_pages: Vec::new(),
+            live_at_compaction: 0,
             paging: None,
             read_only: false,
             session: SessionState::new(),
@@ -1765,6 +1772,7 @@ impl Engine {
             page_size: DEFAULT_PAGE_SIZE,
             page_count: 0,
             free_pages: Vec::new(),
+            live_at_compaction: 0,
             paging: None,
             read_only: false,
             session: SessionState::new(),
