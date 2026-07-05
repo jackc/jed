@@ -370,6 +370,8 @@ import {
 // columnNames) — i16/i32/i64/text/boolean/decimal/…, or "unknown" for an untyped NULL
 // column. The resolved SCALAR type — for decimal the unconstrained "decimal", not the
 // numeric(p,s) typmod (spec/design/conformance.md §7).
+import type { AssignPlan } from "./window.ts";
+import { applyWindowStage, checkAssign, keyCmp, materializeOrderExprs, not3, or3, sortRows, valueCmp } from "./window.ts";
 export type Outcome =
   | { kind: "statement"; cost: bigint; rowsAffected: number | null }
   | {
@@ -384,7 +386,7 @@ export type Outcome =
 // their resolved types, the rows in result order, and the accrued cost. Internal — executeSelect
 // drops the types into the public Outcome, while INSERT ... SELECT uses the types to gate
 // assignability up front (spec/design/grammar.md §24).
-type SelectResult = {
+export type SelectResult = {
   columnNames: string[];
   columnTypes: ResolvedType[];
   rows: Value[][];
@@ -402,7 +404,7 @@ type SelectResult = {
 //     (positioned past the OFFSET) — emission pulls the next sorted row, charges rowProduced, and
 //     evaluates the projection list per windowed row, [0, end). So the output array is never built and a
 //     caller's early exit skips the projection (and rowProduced) of the rows it never pulls (§4/§7).
-type EmitMode = "project" | "identity" | "final" | "sorted" | "columnar";
+export type EmitMode = "project" | "identity" | "final" | "sorted" | "columnar";
 
 // Emitter describes how a SelectPlan's output rows are emitted (spec/design/streaming.md §4, S4): a
 // SELECT runs its blocking part (scan/join/WHERE/window/sort/GROUP BY/DISTINCT) into a buffer, then
@@ -413,7 +415,7 @@ type EmitMode = "project" | "identity" | "final" | "sorted" | "columnar";
 // sites (streaming.md §6). For "project"/"identity" the buffer is windowed to [start, end); for
 // "final" start/end span the whole result; for "sorted" `sorted` is the streaming-sort output pull
 // iterator (positioned past the OFFSET) and [0, end) is the window.
-type Emitter = {
+export type Emitter = {
   rows: Value[][];
   start: number;
   end: number;
@@ -433,14 +435,14 @@ type Emitter = {
 
 // finalEmitter wraps an already-projected-and-charged result (the special input-streaming paths) as a
 // "final" Emitter — emission hands the rows out with no further charge (spec/design/streaming.md §4).
-function finalEmitter(rows: Value[][]): Emitter {
+export function finalEmitter(rows: Value[][]): Emitter {
   return { rows, start: 0, end: rows.length, mode: "final" };
 }
 
 // sortedEmitter wraps the streaming external sort's output (positioned past the OFFSET, with `remaining`
 // windowed rows still to emit) as a "sorted" Emitter — emission pulls + projects + charges rowProduced
 // per row, so the output array is never built (spec/design/streaming.md §4/§7).
-function sortedEmitter(sorted: SortedRows, remaining: number): Emitter {
+export function sortedEmitter(sorted: SortedRows, remaining: number): Emitter {
   return { rows: [], start: 0, end: remaining, mode: "sorted", sorted };
 }
 
@@ -482,7 +484,7 @@ export const MAX_COMPOSITE_DEPTH = 32;
 // matching the byte counts Rust (&str::len) and Go (len(string)) use, so the cap accepts / rejects
 // identically across cores (§8). A TextEncoder is available in Node and the browser (the OPFS
 // host), so this stays host-agnostic.
-const SQL_BYTE_ENCODER = new TextEncoder();
+export const SQL_BYTE_ENCODER = new TextEncoder();
 // checkReservedName rejects a USER-written catalog object name beginning jed_ — the prefix is
 // reserved for the engine's own catalog relations (spec/design/introspection.md §4). Case-insensitive
 // (resolution folds case and there is no quoted-identifier escape — grammar.md §3). Engine-GENERATED
@@ -490,7 +492,7 @@ const SQL_BYTE_ENCODER = new TextEncoder();
 // pass through here; the check sits with each site's namespace-collision check so established
 // validation orders (42P01/42703 before name checks) are preserved. kind is the object word in the
 // message: table / index / sequence / type / constraint.
-function checkReservedName(kind: string, name: string): void {
+export function checkReservedName(kind: string, name: string): void {
   if (name.length >= 4 && name.slice(0, 4).toLowerCase() === "jed_") {
     throw engineError(
       "reserved_name",
@@ -499,7 +501,7 @@ function checkReservedName(kind: string, name: string): void {
   }
 }
 
-function utf8ByteLength(s: string): number {
+export function utf8ByteLength(s: string): number {
   return SQL_BYTE_ENCODER.encode(s).length;
 }
 
@@ -508,13 +510,13 @@ function utf8ByteLength(s: string): number {
 // MAX_RESULT_CHARS is the character-count cap for the result-amplifying string functions (lpad /
 // rpad / repeat): PostgreSQL's MaxAllocSize (0x3FFFFFFF). A requested length above it traps 54000
 // (program_limit_exceeded), bounding the allocation an untrusted query can request (CLAUDE.md §13).
-const MAX_RESULT_CHARS = 0x3fffffffn;
+export const MAX_RESULT_CHARS = 0x3fffffffn;
 
 // padChars is lpad/rpad over CODE POINTS (string-functions.md §3): pad s to `length` characters with
 // `fill` (cyclically), on the left if `left` else the right; a string longer than `length` is
 // truncated to its first `length` characters; an empty fill cannot pad (returns the truncated
 // string); a length ≤ 0 is empty. A length above MAX_RESULT_CHARS traps 54000. Matches PG lpad/rpad.
-function padChars(s: string, length: bigint, fill: string, left: boolean): string {
+export function padChars(s: string, length: bigint, fill: string, left: boolean): string {
   if (length > MAX_RESULT_CHARS)
     throw engineError("program_limit_exceeded", "requested length too large");
   if (length <= 0n) return "";
@@ -533,7 +535,7 @@ function padChars(s: string, length: bigint, fill: string, left: boolean): strin
 // trimChars is btrim/ltrim/rtrim over CODE POINTS (string-functions.md §3): remove from the chosen
 // end(s) the longest run of characters each present in the set (a SET of code points, not a
 // substring; default a single space). An empty set trims nothing. Matches PostgreSQL's *trim.
-function trimChars(s: string, set: string, doLeft: boolean, doRight: boolean): string {
+export function trimChars(s: string, set: string, doLeft: boolean, doRight: boolean): string {
   const inSet = new Set([...set]);
   const chars = [...s];
   let start = 0;
@@ -546,7 +548,7 @@ function trimChars(s: string, set: string, doLeft: boolean, doRight: boolean): s
 // translateChars is translate(s, from, to) over CODE POINTS (string-functions.md §3): each
 // character of s that occurs in from is replaced by the character at the same position in to, or
 // DELETED if to is shorter; a character's FIRST occurrence in from wins. Matches PostgreSQL.
-function translateChars(s: string, from: string, to: string): string {
+export function translateChars(s: string, from: string, to: string): string {
   const tochars = [...to];
   const fromchars = [...from];
   const map = new Map<string, string | null>(); // null = delete
@@ -569,7 +571,7 @@ function translateChars(s: string, from: string, to: string): string {
 // repeatText is repeat(s, n) (string-functions.md §3): concatenate s n times; n ≤ 0 is empty. The
 // result's byte size is bounded at MAX_RESULT_CHARS (PG's MaxAllocSize, a UTF-8-byte cap matching
 // Rust/Go) — an over-large n·bytes traps 54000. Matches PostgreSQL's repeat.
-function repeatText(s: string, n: bigint): string {
+export function repeatText(s: string, n: bigint): string {
   if (n <= 0n || s.length === 0) return "";
   const bytes = BigInt(utf8ByteLength(s));
   if (n > MAX_RESULT_CHARS / bytes)
@@ -581,7 +583,7 @@ function repeatText(s: string, n: bigint): string {
 // return the n-th field (1-based; a negative n counts from the end). Out of range → ''; n = 0 traps
 // 22023. An EMPTY delim treats the whole string as one field (String.split would otherwise split
 // into characters — a cross-core trap). Matches PostgreSQL's split_part.
-function splitPart(s: string, delim: string, n: bigint): string {
+export function splitPart(s: string, delim: string, n: bigint): string {
   if (n === 0n) throw engineError("invalid_parameter_value", "field position must not be zero");
   const fields = delim === "" ? [s] : s.split(delim);
   const len = BigInt(fields.length);
@@ -593,7 +595,7 @@ function splitPart(s: string, delim: string, n: bigint): string {
 // chrText is chr(n) (string-functions.md §3): the one-character string for the Unicode code point n.
 // PostgreSQL's error split: a negative n traps 22023; 0, a value above U+10FFFF, and a UTF-16
 // surrogate (U+D800..U+DFFF) trap 54000.
-function chrText(n: bigint): string {
+export function chrText(n: bigint): string {
   if (n < 0n) throw engineError("invalid_parameter_value", "character number must be positive");
   if (n === 0n) throw engineError("program_limit_exceeded", "null character not permitted");
   if (n > 0x10ffffn)
@@ -604,13 +606,13 @@ function chrText(n: bigint): string {
 }
 
 // BASE64_ALPHABET is the standard RFC 4648 base64 alphabet (string-functions.md §3, encode/decode).
-const BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+export const BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 // encodeBytea is encode(bytes, format) (string-functions.md §3): render binary as text. hex = two
 // lowercase hex digits per byte; base64 = RFC 4648 wrapped at 76 chars with \n (PostgreSQL's style);
 // escape = printable bytes verbatim, 0x00 → \000, backslash doubled, high-bit bytes → \nnn octal. An
 // unrecognized format traps 22023.
-function encodeBytea(bytes: Uint8Array, format: string): string {
+export function encodeBytea(bytes: Uint8Array, format: string): string {
   if (format === "hex") {
     let out = "";
     for (const b of bytes) out += b.toString(16).padStart(2, "0");
@@ -631,7 +633,7 @@ function encodeBytea(bytes: Uint8Array, format: string): string {
 }
 
 // base64EncodeWrapped is RFC 4648 base64 wrapped at 76 chars with \n (no trailing newline).
-function base64EncodeWrapped(bytes: Uint8Array): string {
+export function base64EncodeWrapped(bytes: Uint8Array): string {
   let b64 = "";
   for (let i = 0; i < bytes.length; i += 3) {
     const has1 = i + 1 < bytes.length;
@@ -653,7 +655,7 @@ function base64EncodeWrapped(bytes: Uint8Array): string {
 // quoteLiteralText is quote_literal(s) (string-functions.md §3): wrap s as a SQL string literal —
 // single-quoted, each internal ' doubled; if s contains a backslash, each \ is doubled and the
 // literal is E-prefixed (matching PostgreSQL). Shared by quote_literal and quote_nullable.
-function quoteLiteralText(s: string): string {
+export function quoteLiteralText(s: string): string {
   const hasBackslash = s.includes("\\");
   let inner = "";
   for (const c of s) {
@@ -668,7 +670,7 @@ function quoteLiteralText(s: string): string {
 // unchanged if it is already a safe unquoted identifier (^[a-z_][a-z0-9_]*$), else double-quoted
 // with each internal " doubled. jed quotes by the LEXICAL pattern only — no reserved-keyword
 // quoting (jed has no enumerated keyword set), a documented divergence from PostgreSQL.
-function quoteIdentText(s: string): string {
+export function quoteIdentText(s: string): string {
   let safe = s.length > 0;
   for (let i = 0; i < s.length && safe; i++) {
     const code = s.charCodeAt(i);
@@ -685,7 +687,7 @@ function quoteIdentText(s: string): string {
 // ignore whitespace; a malformed hex/base64 string traps 22023; a malformed escape sequence traps
 // 22P02 (PostgreSQL's split). An unrecognized format traps 22023. Operates on the input's UTF-8
 // bytes (SQL_BYTE_ENCODER), matching Rust (as_bytes) / Go ([]byte).
-function decodeText(s: string, format: string): Uint8Array {
+export function decodeText(s: string, format: string): Uint8Array {
   const bytes = SQL_BYTE_ENCODER.encode(s);
   if (format === "hex") return decodeHex(bytes);
   if (format === "base64") return decodeBase64(bytes);
@@ -693,19 +695,19 @@ function decodeText(s: string, format: string): Uint8Array {
   throw engineError("invalid_parameter_value", `unrecognized encoding: "${format}"`);
 }
 
-function hexNibble(c: number): number | null {
+export function hexNibble(c: number): number | null {
   if (c >= 48 && c <= 57) return c - 48; // 0-9
   if (c >= 97 && c <= 102) return c - 97 + 10; // a-f
   if (c >= 65 && c <= 70) return c - 65 + 10; // A-F
   return null;
 }
 
-function isAsciiWhitespace(c: number): boolean {
+export function isAsciiWhitespace(c: number): boolean {
   return c === 32 || c === 9 || c === 10 || c === 13 || c === 11 || c === 12;
 }
 
 // decodeHex: pairs of hex digits (case-insensitive); whitespace ignored; non-hex / odd → 22023.
-function decodeHex(bytes: Uint8Array): Uint8Array {
+export function decodeHex(bytes: Uint8Array): Uint8Array {
   const nibbles: number[] = [];
   for (const b of bytes) {
     if (isAsciiWhitespace(b)) continue;
@@ -721,7 +723,7 @@ function decodeHex(bytes: Uint8Array): Uint8Array {
 }
 
 // decodeBase64 (RFC 4648); whitespace ignored; out-of-alphabet / data-after-pad → 22023.
-function decodeBase64(bytes: Uint8Array): Uint8Array {
+export function decodeBase64(bytes: Uint8Array): Uint8Array {
   const out: number[] = [];
   let acc = 0;
   let nbits = 0;
@@ -752,7 +754,7 @@ function decodeBase64(bytes: Uint8Array): Uint8Array {
 
 // decodeEscape: \\ → backslash, \nnn (exactly 3 octal digits ≤ 255) → that byte, any other byte →
 // itself. A lone/short backslash or an octal > 255 traps 22P02.
-function decodeEscape(bytes: Uint8Array): Uint8Array {
+export function decodeEscape(bytes: Uint8Array): Uint8Array {
   const bad = () => engineError("invalid_text_representation", "invalid input syntax for type bytea");
   const oct = (c: number): number | null => (c >= 48 && c <= 55 ? c - 48 : null);
   const out: number[] = [];
@@ -788,7 +790,7 @@ function decodeEscape(bytes: Uint8Array): Uint8Array {
 // deterministic and cross-core-identical — full Unicode word classification would risk the
 // cross-core Unicode-version trap). PostgreSQL agrees for ASCII; a non-ASCII letter is a word
 // boundary (a documented divergence). Iterates code points ([...s]) for UTF-16 safety.
-function initcapAscii(s: string): string {
+export function initcapAscii(s: string): string {
   let out = "";
   let wordStart = true;
   for (const c of s) {
@@ -817,7 +819,7 @@ function initcapAscii(s: string): string {
 // window [start, start+count) (or [start, ∞) for the 2-arg form) intersected with [1, n]. A start
 // ≤ 0 / past the end clips; a NEGATIVE count traps 22011. Matches PostgreSQL's text substr. Indices
 // are bigint (so start+count never overflows); [...s] yields code points, not UTF-16 units.
-function substrChars(s: string, start: bigint, count: bigint | null): string {
+export function substrChars(s: string, start: bigint, count: bigint | null): string {
   const chars = [...s];
   const n = BigInt(chars.length);
   let to: bigint;
@@ -835,7 +837,7 @@ function substrChars(s: string, start: bigint, count: bigint | null): string {
 
 // leftChars is left(s, n) over CODE POINTS (string-functions.md §3): the first n characters; a
 // negative n returns all but the last |n|. Matches PostgreSQL's left.
-function leftChars(s: string, n: bigint): string {
+export function leftChars(s: string, n: bigint): string {
   const chars = [...s];
   const len = BigInt(chars.length);
   let end: bigint;
@@ -850,7 +852,7 @@ function leftChars(s: string, n: bigint): string {
 
 // rightChars is right(s, n) over CODE POINTS (string-functions.md §3): the last n characters; a
 // negative n returns all but the first |n|. Matches PostgreSQL's right.
-function rightChars(s: string, n: bigint): string {
+export function rightChars(s: string, n: bigint): string {
   const chars = [...s];
   const len = BigInt(chars.length);
   let start: bigint;
@@ -891,7 +893,7 @@ export type CollationInfo = {
 // (spec/design/grammar.md §13): an FK on a table that survives the drop, referencing a table being
 // dropped. RESTRICT formats refTableName/fkName/droppedName into its 2BP01 detail; CASCADE uses
 // refTableKey/fkName to remove the now-dangling constraint.
-type FkDependent = {
+export type FkDependent = {
   refTableKey: string; // lowercased key of the (surviving) referencing table — for the CASCADE removal
   fkName: string; // the FK constraint's name
   refTableName: string; // canonical referencing-table name — for the RESTRICT detail
@@ -1560,7 +1562,7 @@ export class Snapshot {
 // (every later statement but COMMIT/ROLLBACK is 25P02 — §6). `working` is the transaction's
 // snapshot: a writable tx mutates it in place and publishes it at commit; a read-only tx reads it
 // unchanged (read-your-snapshot, §4.3). committed is untouched until commit, so ROLLBACK drops this.
-type ActiveTx = {
+export type ActiveTx = {
   writable: boolean;
   failed: boolean;
   working: Snapshot;
@@ -1639,7 +1641,7 @@ export type SessionOptions = {
 // TS subset — no enum, CLAUDE.md §2).
 export type TxStatus = "Idle" | "Open" | "Failed";
 
-function txStatusOf(tx: ActiveTx | null): TxStatus {
+export function txStatusOf(tx: ActiveTx | null): TxStatus {
   if (tx === null) return "Idle";
   return tx.failed ? "Failed" : "Open";
 }
@@ -1656,7 +1658,7 @@ function txStatusOf(tx: ActiveTx | null): TxStatus {
 // non-dotted name would be a built-in setting, and v1 exposes none through this map (the time_zone
 // built-in is a separate slice), so it is 42704. Returns the case-folded (lowercase, PG GUC names are
 // case-insensitive) map key.
-function requireCustomVarName(name: string): string {
+export function requireCustomVarName(name: string): string {
   if (name.includes(".")) {
     return name.toLowerCase();
   }
@@ -1892,7 +1894,7 @@ export class SessionState {
 // store (not an SRF / CTE / derived source). Both execSelectPlan (which routes to the eager
 // execStreamingScan) and tryStreamingQuery (the lazy query() lane) gate on this ONE predicate, so the
 // two never drift.
-function streamingScanEligible(plan: SelectPlan): boolean {
+export function streamingScanEligible(plan: SelectPlan): boolean {
   return (
     plan.rels.length === 1 &&
     plan.joins.length === 0 &&
@@ -1912,7 +1914,7 @@ function streamingScanEligible(plan: SelectPlan): boolean {
 // unique. A ROWS frame uses physical position, so it never expands to peers. The default frame
 // (undefined/null, with a window ORDER BY) is RANGE UNBOUNDED PRECEDING TO CURRENT ROW — safe only
 // when the key is unique.
-function frameBackwardSafe(frame: ResolvedFrame | null | undefined, unique: boolean): boolean {
+export function frameBackwardSafe(frame: ResolvedFrame | null | undefined, unique: boolean): boolean {
   if (frame === null || frame === undefined) return unique;
   switch (frame.end.kind) {
     case "unboundedPreceding":
@@ -1934,7 +1936,7 @@ function frameBackwardSafe(frame: ResolvedFrame | null | undefined, unique: bool
 // store / paging / spillable / column-range gates live in projectColumnar, which declines to that path.
 // LIMIT/OFFSET is excluded deliberately: a LIMIT with no ORDER BY streams with an early exit
 // (streamingScanEligible), which the whole-table gather must not steal.
-function vectorizedProjectEligible(plan: SelectPlan): boolean {
+export function vectorizedProjectEligible(plan: SelectPlan): boolean {
   if (plan.isAgg || plan.hasWindow || plan.distinct) return false;
   if (plan.rels.length !== 1 || plan.joins.length !== 0) return false;
   const rel = plan.rels[0]!;
@@ -1970,7 +1972,7 @@ function vectorizedProjectEligible(plan: SelectPlan): boolean {
 // the allocation win: no full-width row per scanned row, only the survivor indices. The caller has
 // verified no touched column spills, so every masked lane is a non-empty Value[] of length rowCount (an
 // untouched column's lane stays empty but is never read).
-function filterColumnar(
+export function filterColumnar(
   filter: RExpr,
   cols: Value[][],
   mask: boolean[],
@@ -1996,7 +1998,7 @@ function filterColumnar(
 // (their fold charges running-sum-dependent decimalWork); MIN/MAX fold ANY type through valueCmp. The
 // ordered-set / hypothetical / json plans are excluded by the switch's default; reusing the shared
 // foldAcc keeps the fold byte-identical to the scalar path (the scalar grouped path folds through it).
-function vectorizedSpecEligible(spec: AggSpec): boolean {
+export function vectorizedSpecEligible(spec: AggSpec): boolean {
   if (spec.distinct === true) return false;
   if (spec.filter !== undefined && spec.filter !== null) return false;
   switch (spec.plan) {
@@ -2017,7 +2019,7 @@ function vectorizedSpecEligible(spec: AggSpec): boolean {
 // operandCol is the bare-column ordinal an eligible aggregate reads (its operand `{kind:"column"}`), or
 // null for COUNT(*) (which folds no value). Eligibility (vectorizedSpecEligible) guarantees the operand
 // is either absent or a bare column, so this is total over an eligible spec.
-function operandCol(spec: AggSpec): number | null {
+export function operandCol(spec: AggSpec): number | null {
   return spec.operand !== null && spec.operand.kind === "column" ? spec.operand.index : null;
 }
 
@@ -2025,7 +2027,7 @@ function operandCol(spec: AggSpec): number | null {
 // row path (a Row[] of full rows) and the columnar path (dense per-column lanes + an optional A3
 // selection vector). `at(j, col)` reads survivor j's value in column col, so the fold kernels below are
 // written once and run either way. Cost is unaffected: both feed the same values in scan order.
-type LaneAt = (j: number, col: number) => Value;
+export type LaneAt = (j: number, col: number) => Value;
 
 // foldAggWhole folds one WHOLE-TABLE grand-total group over `nsurv` survivors from `at`, returning the
 // finalized aggregate results [agg0, …] (the synthetic row for a () group — no key columns). It builds
@@ -2033,7 +2035,7 @@ type LaneAt = (j: number, col: number) => Value;
 // state, hence finalizeAcc, to the scalar path), charging aggregateAccumulate once per (survivor × spec)
 // in bulk — the identical total to the scalar loop (per row × spec), cost-safe because the caller gates
 // to the unmetered lane (no per-row guard to preserve).
-function foldAggWhole(specs: AggSpec[], at: LaneAt, nsurv: number, meter: Meter): Value[] {
+export function foldAggWhole(specs: AggSpec[], at: LaneAt, nsurv: number, meter: Meter): Value[] {
   const accs = specs.map((s) => newAccFromSpec(s));
   specs.forEach((spec, si) => {
     meter.charge(COSTS.aggregateAccumulate * BigInt(nsurv));
@@ -2053,7 +2055,7 @@ function foldAggWhole(specs: AggSpec[], at: LaneAt, nsurv: number, meter: Meter)
 // (survivor × spec) in bulk — the identical total to the scalar loop. The bucketing is unmetered
 // (cost.md §3), so the bigint map is a free internal choice. The caller has verified every needed lane
 // is populated.
-function groupByIntKey(
+export function groupByIntKey(
   specs: AggSpec[],
   keyCol: number,
   at: LaneAt,
@@ -2251,7 +2253,7 @@ export interface AttachmentCore {
 // `main` / `temp` (attached-databases.md §3), which resolve to the SAME store the bare name would — so
 // a qualified reference to one keeps every existing fast path. An undefined qualifier (a bare
 // implicit-scope name) counts as reserved for routing: it too keeps the temp-first funnels.
-function isReservedScope(q: string | undefined): boolean {
+export function isReservedScope(q: string | undefined): boolean {
   if (q === undefined) return true;
   const l = q.toLowerCase();
   return l === "main" || l === "temp";
@@ -2260,7 +2262,7 @@ function isReservedScope(q: string | undefined): boolean {
 // isAttachmentScope reports whether a database qualifier names a HOST-ATTACHED database (not undefined,
 // not reserved main/temp) — the case that routes to the attachment registry rather than the implicit
 // temp-first funnels, and the case that gates off index-bound pushdown this slice (attached-databases.md §8).
-function isAttachmentScope(q: string | undefined): boolean {
+export function isAttachmentScope(q: string | undefined): boolean {
   return !isReservedScope(q);
 }
 
@@ -13000,7 +13002,7 @@ function* scanSource(rows: Row[], nodeCount: number, meter: Meter): Generator<Ro
 // the ordered-index equality bound wins over GIN (gin.md §6). The point-set bounds (pkSet/indexSet)
 // are a LAST-RESORT access path, chosen only when no contiguous PK/index/GIN/GiST bound applies, so
 // they never displace an existing plan.
-type ScanBound =
+export type ScanBound =
   | { kind: "pk"; pk: PkBound }
   | { kind: "index"; index: IndexBound }
   | { kind: "gin"; gin: GinBound }
@@ -13016,7 +13018,7 @@ type ScanBound =
 // handles via a single buildKeyBound). Every single-table fast-path gate consults this so the
 // point-set bounds are interpreted in exactly ONE place (materializeRel), never silently dropped to
 // a full scan by a fast path that only understands `pk`. Nil-safe (a null/undefined bound is not eager).
-function needsEagerScan(sb: ScanBound | null | undefined): boolean {
+export function needsEagerScan(sb: ScanBound | null | undefined): boolean {
   if (sb === null || sb === undefined) return false;
   return (
     sb.kind === "index" ||
@@ -13034,13 +13036,13 @@ function needsEagerScan(sb: ScanBound | null | undefined): boolean {
 // time each src encodes into the PK key space; the resulting keys are de-duplicated and sorted, and
 // each becomes a point probe [k, k]. The whole WHERE stays the residual filter (the union is a
 // superset), so the result is unchanged. coll is the PK's key collation (null for a C key).
-type PkKeySet = { pkType: ScalarType; coll: Collation | null; srcs: RExpr[] };
+export type PkKeySet = { pkType: ScalarType; coll: Collation | null; srcs: RExpr[] };
 
 // IndexKeySet is the PkKeySet analog over a leading B-tree secondary-index column (indexes.md §5):
 // each distinct encoded value becomes an index point probe (prefix scan + per-entry row lookup), and
 // the rows are gathered in ascending value order. tailTypes is the remaining key components' types
 // (as in IndexBound) — the per-entry key-suffix skip.
-type IndexKeySet = {
+export type IndexKeySet = {
   nameKey: string;
   colType: ScalarType;
   coll: Collation | null;
@@ -13053,7 +13055,7 @@ type IndexKeySet = {
 // descent strategy, and the column's global scope index. Like GinBound, the constant query operand is
 // NOT stored (re-found in plan.filter at exec time by gistMatch). No element type — the gather
 // descends the resident R-tree (gist.md §4.1), whose bounds are already decoded.
-type GistBound = {
+export type GistBound = {
   nameKey: string;
   strategy: GistStrategy;
   colGlobal: number;
@@ -13070,14 +13072,14 @@ type GistBound = {
 // query operand recovered by ginMatch is the scalar c, not an array; for "equal" it is the array Q
 // whose distinct non-NULL elements gather the same superset as `@> Q` (equal arrays have identical
 // element multisets, so col = Q ⟹ col @> Q), made exact by the residual = filter.
-type GinStrategy = "contains" | "overlaps" | "member" | "equal";
+export type GinStrategy = "contains" | "overlaps" | "member" | "equal";
 
 // GinBound is the plan-time result of GIN analysis (spec/design/gin.md §6): the chosen GIN
 // index (lowest lowercased name whose array column has a `col @> const` / `col && const`
 // conjunct), the array ELEMENT type (for encode(term) — the term bytes), the operator
 // strategy, and the column's global scope index. The constant query Q is NOT stored; it is
 // re-found in plan.filter at exec time by ginMatch and evaluated there.
-type GinBound = {
+export type GinBound = {
   nameKey: string;
   elemType: ScalarType;
   strategy: GinStrategy;
@@ -13089,11 +13091,11 @@ type GinBound = {
 // equality const-source bound to it. At exec time the sources must agree on one value (else the bound
 // is provably empty). A collated column encodes its probe via the UCA sort key (encoding.md §2.12) to
 // match the index's stored key form (collation.md §8).
-type IndexEqCol = { colType: ScalarType; coll: Collation | null; srcs: RExpr[] };
+export type IndexEqCol = { colType: ScalarType; coll: Collation | null; srcs: RExpr[] };
 
 // IndexRange is the optional trailing range of an index access predicate (indexes.md §5.1): a range
 // on the key column immediately after the equality prefix. Its column is fixed-width (never collated).
-type IndexRange = { colType: ScalarType; terms: BoundTerm[] };
+export type IndexRange = { colType: ScalarType; terms: BoundTerm[] };
 
 // IndexBound is the plan-time result of index analysis (indexes.md §5.1): the chosen index (lowest
 // lowercased name yielding a non-empty access predicate) and the predicate — a maximal EQUALITY PREFIX
@@ -13103,7 +13105,7 @@ type IndexRange = { colType: ScalarType; terms: BoundTerm[] };
 // types of the index columns AFTER the equality prefix (columns[eqCols.length..]) — the range column
 // (if any) plus every trailing column — each FIXED-WIDTH so an admitted entry's row-key suffix is
 // recovered by width-skipping them past P.
-type IndexBound = {
+export type IndexBound = {
   nameKey: string;
   eqCols: IndexEqCol[];
   range: IndexRange | null;
@@ -13120,7 +13122,7 @@ type IndexBound = {
 // scalar — the width-based key-suffix skip needs it). siblingCutoff opens the index-nested-loop door
 // (>= 0 admits a bare sibling "column" node with index < cutoff as a bound source, resolved per outer
 // row); -1 is the ordinary once-materialized bound.
-function buildIndexAccessPredicate(
+export function buildIndexAccessPredicate(
   filter: RExpr,
   rel: ScopeRel,
   idx: IndexDef,
@@ -13179,7 +13181,7 @@ function buildIndexAccessPredicate(
 // single-column PK bound first; else, among the relation's indexes (held in ascending
 // lowercased-name order — the deterministic tie-break), the first that yields a non-empty
 // access predicate (buildIndexAccessPredicate); else null (full scan).
-function detectScanBound(filter: RExpr, rel: ScopeRel, snap: Snapshot): ScanBound | null {
+export function detectScanBound(filter: RExpr, rel: ScopeRel, snap: Snapshot): ScanBound | null {
   // A host-attached relation full-scans this slice (attached-databases.md §8): the bounded-scan exec
   // path resolves index stores unscoped, so no PK/index/GiST/GIN bound may apply to an attachment.
   if (isAttachmentScope(rel.db)) return null;
@@ -13265,7 +13267,7 @@ function detectScanBound(filter: RExpr, rel: ScopeRel, snap: Snapshot): ScanBoun
 // reducing operands — an AND, a NOT, a range comparison, or an equality on a different column makes it
 // non-reducing, so a mixed disjunction (`pk = 1 OR x = 2`) or a NOT IN (`NOT (pk = 1 OR …)`) correctly
 // yields no bound. Conservative + sound: an unrecognized filter contributes no bound.
-function detectKeySet(
+export function detectKeySet(
   filter: RExpr | null,
   keyIdx: number,
   keyType: ScalarType,
@@ -13291,7 +13293,7 @@ function detectKeySet(
 // null if it is not a pure disjunction of `keycol = const` (detectKeySet). Descends OR nodes only; a
 // single `keycol = const` leaf is the base case (reusing asBoundTerm, siblingCutoff -1 — no sibling
 // references in a once-materialized bound).
-function reduceKeySet(
+export function reduceKeySet(
   e: RExpr,
   keyIdx: number,
   keyType: ScalarType,
@@ -13322,7 +13324,7 @@ function reduceKeySet(
 // ride along and tighten the per-outer-row seek. The whole on/where stays the residual filter (a
 // superset), so the ROWS are unchanged; only the inner re-scan cost drops. Caller restricts this to a
 // base table that is the right/nullable side of an INNER/CROSS/LEFT join.
-function detectINLBound(
+export function detectINLBound(
   on: RExpr | null,
   whereFilter: RExpr | null,
   rel: ScopeRel,
@@ -13420,7 +13422,7 @@ function detectINLBound(
 //     read-safety rule §12; seeking a loaded-version probe in a file-version B-tree would mis-match —
 //     the tripwire suites/collation/skew.test stays green only because this refuses). An unresolvable
 //     collation likewise refuses rather than mis-encoding.
-function keyCollationCtx(snap: Snapshot, col: Column): { coll: Collation | null } | null {
+export function keyCollationCtx(snap: Snapshot, col: Column): { coll: Collation | null } | null {
   if (col.collation === null) return { coll: null };
   if (snap.collationSkew(col.collation) !== undefined) return null;
   const c = snap.resolveCollation(col.collation);
@@ -13439,7 +13441,7 @@ function keyCollationCtx(snap: Snapshot, col: Column): { coll: Collation | null 
 // composite PK would have the eager sort break ties in PK-ascending input order, which a reverse
 // scan inverts — so reverse is restricted to the unique full key, where no ties remain. The PK
 // columns are NOT NULL, so a key's NULLS FIRST|LAST is a no-op and is ignored.
-function orderSatisfiedByPK(
+export function orderSatisfiedByPK(
   snap: Snapshot,
   table: Table,
   offset: number,
@@ -13475,7 +13477,7 @@ function orderSatisfiedByPK(
 // the table has no PK. Used by the secondary-index-order scan to peel the PK suffix off the END of
 // each index entry key (the "key-suffix skip", cost.md §3) — sound only when that suffix is a known
 // fixed length.
-function pkStorageWidth(table: Table): number | null {
+export function pkStorageWidth(table: Table): number | null {
   const pk = pkIndices(table);
   if (pk.length === 0) return null; // a no-PK table keys on a synthetic rowid — not handled here
   let w = 0;
@@ -13489,7 +13491,7 @@ function pkStorageWidth(table: Table): number | null {
 
 // IndexOrder is the secondary-index-order plan: walk a B-tree index in key order to satisfy an ORDER
 // BY without a sort, point-looking-up each row by its primary key (cost.md §3).
-type IndexOrder = { nameKey: string; pkWidth: number };
+export type IndexOrder = { nameKey: string; pkWidth: number };
 
 // orderSatisfiedByIndex reports whether a single base relation's ORDER BY is satisfied by walking one
 // of its B-tree SECONDARY indexes in key order (cost.md §3 "secondary-index order"), and which index.
@@ -13501,7 +13503,7 @@ type IndexOrder = { nameKey: string; pkWidth: number };
 // match) and sorting by the column's stored key collation (Skewed/unresolvable → refuse, §12), AND
 // the table's PK is fixed-width. The exact-match requirement is load-bearing: a strict prefix of a
 // multi-column index would tie-break by the remaining index columns, not the PK.
-function orderSatisfiedByIndex(
+export function orderSatisfiedByIndex(
   snap: Snapshot,
   table: Table,
   offset: number,
@@ -13548,7 +13550,7 @@ function orderSatisfiedByIndex(
 // `col && const`, `const = ANY(col)`, or `col = const`). Factored out so the SELECT planner
 // (detectScanBound) and the UPDATE/DELETE scan both use the identical detection — the mutations
 // pass their own table's indexes/columns at offset 0.
-function detectGinBound(
+export function detectGinBound(
   filter: RExpr | null,
   indexes: IndexDef[],
   columns: Column[],
@@ -13582,7 +13584,7 @@ function detectGinBound(
 // column be ANY's array operand and c the scalar. Returns the strategy and the constant query
 // operand (the scalar c for "member", the array Q otherwise). Used at plan time (strategy) and exec
 // time (recover the operand from plan.filter), so the two agree on the same conjunct by construction.
-function ginMatch(
+export function ginMatch(
   filter: RExpr,
   colGlobal: number,
 ): { strategy: GinStrategy; query: RExpr } | null {
@@ -13632,7 +13634,7 @@ function ginMatch(
 // lowest-named GiST index whose range column at offset+ci has a `col && const` / `col @> const`
 // conjunct. Factored out so the SELECT planner (detectScanBound) and the UPDATE/DELETE scan share the
 // identical detection (the GIN precedent) — the mutations pass their indexes/columns at offset 0.
-function detectGistBound(
+export function detectGistBound(
   filter: RExpr | null,
   indexes: IndexDef[],
   columns: Column[],
@@ -13674,7 +13676,7 @@ function detectGistBound(
 // Equality is commutative (the column may be either operand). <> and the inequalities are not
 // accelerated (the `=` opclass has only the equal strategy). Returns the constant operand — used at
 // plan time (existence) and exec time (recover from plan.filter).
-function gistScalarMatch(filter: RExpr, colGlobal: number): { query: RExpr } | null {
+export function gistScalarMatch(filter: RExpr, colGlobal: number): { query: RExpr } | null {
   if (filter.kind === "and") {
     return gistScalarMatch(filter.lhs, colGlobal) ?? gistScalarMatch(filter.rhs, colGlobal);
   }
@@ -13688,7 +13690,7 @@ function gistScalarMatch(filter: RExpr, colGlobal: number): { query: RExpr } | n
 // gistQueryOperand recovers a GiST bound's constant query operand from the live filter at exec time —
 // gistMatch for range_ops (&&/@>), gistScalarMatch for the scalar `=` opclass. Centralizes the
 // strategy dispatch so every scan site (SELECT / UPDATE / DELETE) recovers the operand uniformly.
-function gistQueryOperand(filter: RExpr, gb: GistBound): RExpr | null {
+export function gistQueryOperand(filter: RExpr, gb: GistBound): RExpr | null {
   if (gb.strategy === "equal") return gistScalarMatch(filter, gb.colGlobal)?.query ?? null;
   return gistMatch(filter, gb.colGlobal)?.query ?? null;
 }
@@ -13698,7 +13700,7 @@ function gistQueryOperand(filter: RExpr, gb: GistBound): RExpr | null {
 // the column must be the LEFT operand; `Q @> col` is the non-accelerated <@). Q must be a constant.
 // The other range operators stay full-scan this slice. Returns the strategy and the constant query
 // operand — used at plan time (strategy) and exec time (recover from plan.filter).
-function gistMatch(
+export function gistMatch(
   filter: RExpr,
   colGlobal: number,
 ): { strategy: GistStrategy; query: RExpr } | null {
@@ -13721,7 +13723,7 @@ function gistMatch(
 }
 
 // isColumnRef reports whether e is a reference to the column at global scope index colGlobal.
-function isColumnRef(e: RExpr, colGlobal: number): boolean {
+export function isColumnRef(e: RExpr, colGlobal: number): boolean {
   return e.kind === "column" && e.index === colGlobal;
 }
 
@@ -13729,7 +13731,7 @@ function isColumnRef(e: RExpr, colGlobal: number): boolean {
 // same for every scanned row — computable once). False for any column, correlated outer column, or
 // subquery; true for literals, params, and pure operations over them. Used to admit a GIN query
 // operand Q (spec/design/gin.md §6: a constant query only this slice).
-function rexprIsConstant(e: RExpr): boolean {
+export function rexprIsConstant(e: RExpr): boolean {
   switch (e.kind) {
     case "column":
     case "outerColumn":
@@ -13813,7 +13815,7 @@ function rexprIsConstant(e: RExpr): boolean {
 // order-preserving key bytes when present, the lone 0x01 for NULL (always tagged, even
 // for a NOT NULL column) — then the row's storage key as the suffix. Indexable types are
 // fixed-width and never spill, so the values are always resident (never unfetched).
-function indexEntryKey(
+export function indexEntryKey(
   columns: Column[],
   colls: (Collation | null)[],
   def: IndexDef,
@@ -13874,7 +13876,7 @@ function indexEntryKey(
 // one for an ordered (B-tree) index — the §3 nullable-slot entry key — or one per DISTINCT non-NULL
 // element for a GIN index. Every write path (build, INSERT, DELETE, UPDATE) treats an index
 // uniformly as "a row maps to a set of entries."
-function indexEntryKeys(
+export function indexEntryKeys(
   columns: Column[],
   colls: (Collation | null)[],
   def: IndexDef,
@@ -13890,7 +13892,7 @@ function indexEntryKeys(
 // range_ops for a range column (its element subtype as a ColType — the codec/comparator key for the
 // R-tree bounds, §4.1), the scalar `=` opclass otherwise (a fixed-width keyable scalar, the CREATE
 // INDEX gate). Computed consistently in gistEntries, the resident-tree rebuild, and the serializer.
-function gistOpclassFor(colType: Type): GistOpclass {
+export function gistOpclassFor(colType: Type): GistOpclass {
   if (colType.kind === "range") {
     return gistRangeOpclass({ kind: "scalar", scalar: typeScalar(colType.elem) });
   }
@@ -13903,7 +13905,7 @@ function gistOpclassFor(colType: Type): GistOpclass {
 // single-column GX1/GX2 index has one component; an EXCLUDE backing index one per WITH column. A NULL
 // in ANY indexed column produces no entry (the §7 exclusion NULL rule — a row with a NULL excluded
 // column never conflicts and is left out of the tree). The empty range is a real value and IS indexed.
-function gistEntries(
+export function gistEntries(
   columns: Column[],
   def: IndexDef,
   storageKey: Uint8Array,
@@ -13933,7 +13935,7 @@ function gistEntries(
 // a && element holds the empty range (empty && anything is FALSE, so the conjunction can never be
 // TRUE — this also sidesteps the empty-range overlap-descend trap, gist.md §5). The query is fed to
 // the resident GiST tree's search, whose leaf recheck IS the full conjunction, so a hit is a conflict.
-function exclusionProbeQuery(
+export function exclusionProbeQuery(
   columns: Column[],
   exc: ExclusionConstraint,
   row: Row,
@@ -13961,7 +13963,7 @@ function exclusionProbeQuery(
 // holds only stored rows). A NULL in any excluded column of either row, or an empty range under &&
 // (rangeOverlaps of an empty range is FALSE), makes that element not-TRUE → no conflict. Returns true
 // only when EVERY element is definitely TRUE.
-function exclusionPairConflicts(
+export function exclusionPairConflicts(
   columns: Column[],
   exc: ExclusionConstraint,
   a: Row,
@@ -13996,7 +13998,7 @@ function exclusionPairConflicts(
 // ordered-index / PK keys — are 0A000 here, as is float. interval is fixed-width keyable (its 16-byte
 // span key landed, encoding.md §2.10) but its GIN element support is a separate follow-on slice
 // (gin.md §3/§10), so it is not yet admitted here.
-function isGinElementType(elem: Type): boolean {
+export function isGinElementType(elem: Type): boolean {
   return (
     typeIsInteger(elem) ||
     typeIsBoolean(elem) ||
@@ -14011,7 +14013,7 @@ function isGinElementType(elem: Type): boolean {
 // the FIXED-WIDTH keyables — integers, boolean, uuid, date, timestamp, timestamptz — whose bound is
 // [min,max] over the order-preserving key encoding, compared as raw bytes (no decode, no collation).
 // Exactly isGinElementType's set, kept a separate predicate so the two surfaces evolve independently.
-function isGistScalarType(ty: Type): boolean {
+export function isGistScalarType(ty: Type): boolean {
   return (
     typeIsInteger(ty) ||
     typeIsBoolean(ty) ||
@@ -14025,11 +14027,11 @@ function isGistScalarType(ty: Type): boolean {
 // isGistDeferredScalarType reports a keyable scalar the GiST scalar `=` opclass will eventually admit
 // but defers this slice (gist.md §6/§11): the VARIABLE-width / collation-sensitive keyables — text,
 // bytea, decimal, interval. A column of one of these is 0A000 ("not supported yet"), not 42704.
-function isGistDeferredScalarType(ty: Type): boolean {
+export function isGistDeferredScalarType(ty: Type): boolean {
   return typeIsText(ty) || typeIsBytea(ty) || typeIsDecimal(ty) || typeIsInterval(ty);
 }
 
-function ginEntries(
+export function ginEntries(
   columns: Column[],
   def: IndexDef,
   storageKey: Uint8Array,
@@ -14066,7 +14068,7 @@ function ginEntries(
 }
 
 // cmpBytes compares two byte strings lexicographically (-1/0/1), the on-disk storage-key order.
-function cmpBytes(a: Uint8Array, b: Uint8Array): number {
+export function cmpBytes(a: Uint8Array, b: Uint8Array): number {
   const n = Math.min(a.length, b.length);
   for (let i = 0; i < n; i++) {
     if (a[i]! !== b[i]!) return a[i]! - b[i]!;
@@ -14076,7 +14078,7 @@ function cmpBytes(a: Uint8Array, b: Uint8Array): number {
 
 // byteKey is a stable string key for a (small) byte string — used to dedup / count storage keys in
 // the GIN posting combine. Storage keys are short (an encoded PK or rowid), so per-char is fine.
-function byteKey(a: Uint8Array): string {
+export function byteKey(a: Uint8Array): string {
   let s = "";
   for (let i = 0; i < a.length; i++) s += String.fromCharCode(a[i]!);
   return s;
@@ -14085,7 +14087,7 @@ function byteKey(a: Uint8Array): string {
 // intersectPostings returns the storage keys present in EVERY posting list (the @> mode-ALL
 // combine), sorted ascending. Each posting list holds distinct keys (one (term,row) entry per row),
 // so a per-list count == the number of lists means the key is in all of them.
-function intersectPostings(postings: Uint8Array[][]): Uint8Array[] {
+export function intersectPostings(postings: Uint8Array[][]): Uint8Array[] {
   if (postings.length === 0) return [];
   const count = new Map<string, number>();
   for (const list of postings) {
@@ -14105,7 +14107,7 @@ function intersectPostings(postings: Uint8Array[][]): Uint8Array[] {
 
 // unionPostings returns the storage keys present in ANY posting list (the && mode-ANY combine),
 // deduplicated and sorted ascending.
-function unionPostings(postings: Uint8Array[][]): Uint8Array[] {
+export function unionPostings(postings: Uint8Array[][]): Uint8Array[] {
   const seen = new Set<string>();
   const out: Uint8Array[] = [];
   for (const list of postings) {
@@ -14123,7 +14125,7 @@ function unionPostings(postings: Uint8Array[][]): Uint8Array[] {
 
 // bytesDiff returns the entries in a that are not in b (set difference over byte strings),
 // preserving a's order — the UPDATE symmetric-difference for GIN / B-tree maintenance (gin.md §5).
-function bytesDiff(a: Uint8Array[], b: Uint8Array[]): Uint8Array[] {
+export function bytesDiff(a: Uint8Array[], b: Uint8Array[]): Uint8Array[] {
   return a.filter((x) => !b.some((y) => bytesEq(x, y)));
 }
 
@@ -14132,7 +14134,7 @@ function bytesDiff(a: Uint8Array[], b: Uint8Array[]): Uint8Array[] {
 // so the concatenation is self-delimiting and byte comparison equals the tuple's logical order.
 // Shared by the INSERT duplicate check and the ON CONFLICT arbiter probe (upsert.md §3); a PK
 // column is NOT NULL, so there is no presence tag.
-function encodePkKey(
+export function encodePkKey(
   table: Table,
   pk: number[],
   colls: (Collation | null)[],
@@ -14190,10 +14192,10 @@ function encodePkKey(
 
 // Arbiter is which uniqueness constraint an ON CONFLICT arbitrates (spec/design/upsert.md §2):
 // the primary key (isPK), or a unique index by position in table.indexes (indexPos).
-type Arbiter = { isPK: true } | { isPK: false; indexPos: number };
+export type Arbiter = { isPK: true } | { isPK: false; indexPos: number };
 
 // ConflictPlan is a resolved ON CONFLICT clause (spec/design/upsert.md), built by resolveOnConflict.
-type ConflictPlan = {
+export type ConflictPlan = {
   // arb is the arbiter constraint; null = no target (legal only with DO NOTHING — any uniqueness
   // conflict is then skipped).
   arb: Arbiter | null;
@@ -14206,7 +14208,7 @@ type ConflictPlan = {
 // column list is matched as an order-independent SET against a unique index / the primary key (no
 // match → 42P10); ON CONSTRAINT name names a unique index or the synthesized <table>_pkey (miss →
 // 42704). A null target → null arbiter (legal only with DO NOTHING).
-function resolveArbiter(table: Table, target: ConflictTarget | null): Arbiter | null {
+export function resolveArbiter(table: Table, target: ConflictTarget | null): Arbiter | null {
   if (target === null) return null;
   const pk = pkIndices(table);
   if (target.kind === "columns") {
@@ -14240,7 +14242,7 @@ function resolveArbiter(table: Table, target: ConflictTarget | null): Arbiter | 
 }
 
 // sameIntSet reports whether the array's values (as a set) equal the given set.
-function sameIntSet(arr: number[], set: Set<number>): boolean {
+export function sameIntSet(arr: number[], set: Set<number>): boolean {
   const seen = new Set(arr);
   if (seen.size !== set.size) return false;
   for (const v of seen) if (!set.has(v)) return false;
@@ -14250,7 +14252,7 @@ function sameIntSet(arr: number[], set: Set<number>): boolean {
 // arbiterKey is the arbiter key of a candidate row (spec/design/upsert.md §3): the storage key for
 // a PK arbiter (never NULL), or the unique-index prefix for an index arbiter (null when a nullable
 // arbiter column is NULL — NULLS DISTINCT, so the row never conflicts).
-function arbiterKey(
+export function arbiterKey(
   arb: Arbiter,
   table: Table,
   pk: number[],
@@ -14265,7 +14267,7 @@ function arbiterKey(
 // (spec/design/indexes.md §8): the §3 entry key's slot prefix — without the storage-key
 // suffix — or null when any component is NULL (NULLS DISTINCT: such a tuple never
 // conflicts). Two rows conflict iff they yield the same non-null prefix.
-function indexPrefixKey(
+export function indexPrefixKey(
   columns: Column[],
   colls: (Collation | null)[],
   def: IndexDef,
@@ -14323,12 +14325,12 @@ function indexPrefixKey(
 // uniqueProbeBound is the half-open byte range [prefix, byte-successor(prefix)) — every
 // index entry whose slot prefix equals prefix (the suffix makes tree keys unique, so
 // equal prefixes sit adjacent). The uniqueness probes range over it (indexes.md §8).
-function uniqueProbeBound(prefix: Uint8Array): KeyBound {
+export function uniqueProbeBound(prefix: Uint8Array): KeyBound {
   return { lo: prefix, loInc: true, hi: prefixSuccessor(prefix), hiInc: false };
 }
 
 // bytesEq reports byte equality of two keys.
-function bytesEq(a: Uint8Array, b: Uint8Array): boolean {
+export function bytesEq(a: Uint8Array, b: Uint8Array): boolean {
   return compareBytes(a, b) === 0;
 }
 
@@ -14339,11 +14341,11 @@ function bytesEq(a: Uint8Array, b: Uint8Array): boolean {
 // collation's UCA sort key when coll is non-null (a non-C collated column), else the C
 // text-terminated-escape body (§2.4). The sort key throws (0A000) on a code point the collation does
 // not map — propagated, so a collated INSERT of an unmapped string aborts the write.
-function collatedTextKey(coll: Collation | null, s: string): Uint8Array {
+export function collatedTextKey(coll: Collation | null, s: string): Uint8Array {
   return coll !== null ? collationSortKey(coll, s) : encodeTerminated(SQL_BYTE_ENCODER.encode(s));
 }
 
-function encodeKeyValue(ty: ScalarType, value: Value, coll: Collation | null): Uint8Array {
+export function encodeKeyValue(ty: ScalarType, value: Value, coll: Collation | null): Uint8Array {
   if (value.kind === "int") return encodeInt(ty, value.int);
   if (value.kind === "bool") return encodeBool(value.value);
   if (value.kind === "uuid") return value.bytes.slice();
@@ -14366,7 +14368,7 @@ function encodeKeyValue(ty: ScalarType, value: Value, coll: Collation | null): U
 // encodeKeyValue. value is non-NULL (callers handle the NULL slot tag), and a range column always
 // holds a range value, so the scalar arm never sees a range type. coll selects a text column's key
 // form (§2.12); it never applies to a range element (no range subtype is text).
-function encodeTypedKey(ty: Type, value: Value, coll: Collation | null): Uint8Array {
+export function encodeTypedKey(ty: Type, value: Value, coll: Collation | null): Uint8Array {
   if (value.kind === "range") {
     if (ty.kind !== "range") {
       throw new Error("a range key value has a range column type");
@@ -14391,7 +14393,7 @@ function encodeTypedKey(ty: Type, value: Value, coll: Collation | null): Uint8Ar
 // elements included since the §2.8 lift; the DDL gate rejects only a composite element 0A000), so the
 // per-element key is encodeKeyValue with the C byte order (a collated array-element key is not a
 // feature this slice).
-function encodeArrayKey(
+export function encodeArrayKey(
   elem: ScalarType,
   a: { dims: number[]; lbounds: number[]; elements: Value[] },
 ): Uint8Array {
@@ -14417,7 +14419,7 @@ function encodeArrayKey(
 // typeIsKeyableScalar reports whether a Type is a key-encodable scalar — the element-type gate for
 // typeIsArrayKeyable. With float keys exercised (§2.8) every scalar is keyable; only the recursive
 // composite container is excluded (it is not a scalar Type).
-function typeIsKeyableScalar(t: Type): boolean {
+export function typeIsKeyableScalar(t: Type): boolean {
   return (
     typeIsInteger(t) ||
     typeIsBoolean(t) ||
@@ -14437,7 +14439,7 @@ function typeIsKeyableScalar(t: Type): boolean {
 // array is a valid PRIMARY KEY / index / UNIQUE / FK key (encoding.md §2.14, array-elements-terminated).
 // A float-element array (f64[]/f32[]) IS keyable (the §2.8 lift); only a composite-element array is
 // NOT keyable (composite is not yet keyable).
-function typeIsArrayKeyable(t: Type): boolean {
+export function typeIsArrayKeyable(t: Type): boolean {
   return t.kind === "array" && typeIsKeyableScalar(t.elem);
 }
 
@@ -14446,14 +14448,14 @@ function typeIsArrayKeyable(t: Type): boolean {
 // encodings concatenated, in PK key order) or a parent unique index's prefix (0x00-tagged slots,
 // in index-key order, plus the lowercased index name). A discriminated union (the TS idiom), with
 // fkProbeBytes returning the raw bytes for batch-membership comparison.
-type FkProbe =
+export type FkProbe =
   | { kind: "pk"; bytes: Uint8Array }
   | { kind: "unique"; index: string; prefix: Uint8Array };
 
 // fkProbeBytes returns the raw probe bytes — used to compare against this statement's batch end
 // state (§6.4). Two probes of one FK share the same byte space (a given FK always probes the PK or
 // always a fixed unique index), so byte equality is a valid set membership test.
-function fkProbeBytes(p: FkProbe): Uint8Array {
+export function fkProbeBytes(p: FkProbe): Uint8Array {
   return p.kind === "pk" ? p.bytes : p.prefix;
 }
 
@@ -14463,7 +14465,7 @@ function fkProbeBytes(p: FkProbe): Uint8Array {
 // `ordinals = fk.refColumns` (the row viewed as a parent). Returns null when any supplied value is
 // NULL (MATCH SIMPLE exempt — §6.3). The probe uses the parent's PK when the referenced set is the
 // PK, else the matching unique index (re-derived deterministically — §6.8).
-function fkProbe(
+export function fkProbe(
   fk: ForeignKey,
   parent: Table,
   parentColls: (Collation | null)[],
@@ -14504,7 +14506,7 @@ function fkProbe(
 }
 
 // concatBytes concatenates a list of byte arrays into one (the key-build helper).
-function concatBytes(parts: Uint8Array[]): Uint8Array {
+export function concatBytes(parts: Uint8Array[]): Uint8Array {
   const total = parts.reduce((acc, b) => acc + b.length, 0);
   const out = new Uint8Array(total);
   let off = 0;
@@ -14518,7 +14520,7 @@ function concatBytes(parts: Uint8Array[]): Uint8Array {
 // sortedUnique returns a column-ordinal list as a sorted, deduplicated set (for the
 // order-independent FK referenced-columns ⇄ PK/unique-key set comparison —
 // spec/design/constraints.md §6.2).
-function sortedUnique(v: number[]): number[] {
+export function sortedUnique(v: number[]): number[] {
   const s = [...v].sort((a, b) => a - b);
   const out: number[] = [];
   for (const x of s) {
@@ -14528,14 +14530,14 @@ function sortedUnique(v: number[]): number[] {
 }
 
 // sameSet reports whether two already-sorted-unique ordinal lists are equal.
-function sameSet(a: number[], b: number[]): boolean {
+export function sameSet(a: number[], b: number[]): boolean {
   return a.length === b.length && a.every((v, i) => v === b[i]);
 }
 
 // fkTypesEqual reports structural equality of two catalog Types — the FK same-type pairing gate
 // (spec/design/constraints.md §6.2). An FK column is always a scalar (a key-encodable PK/UNIQUE
 // type), but the comparison is full structural for completeness, mirroring Rust's `ty == ty`.
-function fkTypesEqual(a: Type, b: Type): boolean {
+export function fkTypesEqual(a: Type, b: Type): boolean {
   if (a.kind === "scalar" && b.kind === "scalar") return a.scalar === b.scalar;
   if (a.kind === "composite" && b.kind === "composite") return a.name === b.name;
   if (a.kind === "array" && b.kind === "array") return fkTypesEqual(a.elem, b.elem);
@@ -14546,7 +14548,7 @@ function fkTypesEqual(a: Type, b: Type): boolean {
 // fkAction maps a parsed referential action to its persisted form, rejecting the unsupported
 // write-actions (CASCADE / SET NULL / SET DEFAULT) as 0A000 (spec/design/constraints.md §6.6).
 // `clause` is "DELETE" or "UPDATE" for the message.
-function fkAction(a: RefAction, clause: string): FkAction {
+export function fkAction(a: RefAction, clause: string): FkAction {
   if (a === "noAction") return "noAction";
   if (a === "restrict") return "restrict";
   const word = a === "cascade" ? "CASCADE" : a === "setNull" ? "SET NULL" : "SET DEFAULT";
@@ -14556,7 +14558,7 @@ function fkAction(a: RefAction, clause: string): FkAction {
 // prefixSuccessor is the byte-successor of a prefix: the smallest byte string greater
 // than every string that extends p. Increment the last non-0xFF byte and truncate after
 // it; an all-0xFF prefix has no successor (null ⇒ unbounded high end).
-function prefixSuccessor(p: Uint8Array): Uint8Array | null {
+export function prefixSuccessor(p: Uint8Array): Uint8Array | null {
   let end = p.length;
   while (end > 0 && p[end - 1] === 0xff) end--;
   if (end === 0) return null;
@@ -14567,7 +14569,7 @@ function prefixSuccessor(p: Uint8Array): Uint8Array | null {
 
 // BoundTerm is one `pk <op> const-source` from a WHERE AND-chain, normalized so the PK is the LEFT side
 // (a `5 < pk` flips to `pk > 5`). src is the constant/parameter operand node.
-type BoundTerm = { op: BinaryOp; src: RExpr };
+export type BoundTerm = { op: BinaryOp; src: RExpr };
 
 // PkBound is the plan-time result of PK analysis: the PK's storage type + the bound terms. The concrete
 // key range is built per execution by buildKeyBound.
@@ -14575,16 +14577,16 @@ type BoundTerm = { op: BinaryOp; src: RExpr };
 // the file pin) — the probe encodes via this collation's UCA sort key (encoding.md §2.12), seeking
 // the same key FORM the B-tree stores (spec/design/collation.md §8). null for a C (raw-byte) key. A
 // Skewed collated key never produces a PkBound (keyCollationCtx refuses the bound — collation.md §12).
-type PkBound = { pkType: ScalarType; terms: BoundTerm[]; coll: Collation | null };
+export type PkBound = { pkType: ScalarType; terms: BoundTerm[]; coll: Collation | null };
 
 // BoundKey is the outcome of encoding a const-source into the PK key space: a usable key, a NULL const
 // (the comparison is 3VL-unknown ⇒ empty range), or an out-of-range integer (drop this half-bound).
-type BoundKey = { kind: "key"; key: Uint8Array } | { kind: "null" } | { kind: "outOfRange" };
+export type BoundKey = { kind: "key"; key: Uint8Array } | { kind: "null" } | { kind: "outOfRange" };
 
 // detectPkBound flattens the WHERE's top-level AND-chain (an OR is never descended — a disjunction is
 // not a contiguous range) and collects every `pk <cmp> const-source` conjunct. null ⇒ full scan.
 // Conservative + sound: an unrecognized conjunct contributes no bound and stays in the residual filter.
-function detectPkBound(
+export function detectPkBound(
   filter: RExpr,
   pkIdx: number,
   pkType: ScalarType,
@@ -14609,7 +14611,7 @@ function detectPkBound(
 // PK column ("column" at pkIdx — a correlated "outerColumn" is a different kind, so it never matches) on
 // one side and a const-source of the PK's own type on the other (a promoted comparison — e.g. intpk = 2.5
 // → a constDecimal — does not match, so it stays residual). The op is flipped when the PK is on the right.
-function asBoundTerm(
+export function asBoundTerm(
   e: RExpr,
   pkIdx: number,
   pkType: ScalarType,
@@ -14649,7 +14651,7 @@ function asBoundTerm(
 // resolved per outer row from the combined left-hand row (like "outerColumn", a bare sibling column implies
 // a type match — a mismatch is a cast, never bare). -1 (the ordinary once-materialized bound) accepts only
 // literals/params/outer references.
-function isConstSource(e: RExpr, pkType: ScalarType, siblingCutoff: number): boolean {
+export function isConstSource(e: RExpr, pkType: ScalarType, siblingCutoff: number): boolean {
   switch (e.kind) {
     case "param":
     case "constNull":
@@ -14683,7 +14685,7 @@ function isConstSource(e: RExpr, pkType: ScalarType, siblingCutoff: number): boo
 }
 
 // flipCmp swaps a comparison's sense (for `const <op> pk` ⇒ `pk <flipped> const`). eq is symmetric.
-function flipCmp(op: BinaryOp): BinaryOp {
+export function flipCmp(op: BinaryOp): BinaryOp {
   switch (op) {
     case "lt":
       return "gt";
@@ -14706,7 +14708,7 @@ function flipCmp(op: BinaryOp): BinaryOp {
 // the current outer row's value; it is empty for a top-level statement. left is the current combined
 // left-hand row of a left-deep join, from which an index-nested-loop "column" (sibling) source resolves
 // (empty outside the join loop — a sibling never appears there).
-function buildKeyBound(bp: PkBound, params: Value[], outer: Row[], left: Row): KeyBound | null {
+export function buildKeyBound(bp: PkBound, params: Value[], outer: Row[], left: Row): KeyBound | null {
   const b = unboundedBound();
   for (const t of bp.terms) {
     const r = encodeBoundKey(bp.pkType, t.src, params, outer, bp.coll, left);
@@ -14743,7 +14745,7 @@ function buildKeyBound(bp: PkBound, params: Value[], outer: Row[], left: Row): K
 // NULL / disagreeing prefix equality, a NULL range endpoint, or a contradictory range). prefixLen =
 // p.length, the byte count the row-key suffix skip advances past the equality-prefix slots before
 // width-skipping the remaining components.
-function buildIndexBound(
+export function buildIndexBound(
   ib: IndexBound,
   params: Value[],
   outer: Row[],
@@ -14814,7 +14816,7 @@ function buildIndexBound(
 // encodeInt for integer/timestamp widths, the raw 16 bytes for uuid, the 1-byte bool-byte for boolean).
 // param/outerColumn resolve to a runtime Value first (the param table / the enclosing outer row) and
 // then encode through the shared path.
-function encodeBoundKey(
+export function encodeBoundKey(
   pkType: ScalarType,
   src: RExpr,
   params: Value[],
@@ -14872,7 +14874,7 @@ function encodeBoundKey(
 // to a full scan + residual filter — which reproduces the exact non-pushdown answer (empty for =,
 // since equality is byte-identity §7; the 0A000 for an ordering compare iff any row is scanned).
 // Identical across cores (mirrors Rust encode_text_bound / Go encodeTextBound).
-function encodeTextBound(s: string, coll: Collation | null): BoundKey {
+export function encodeTextBound(s: string, coll: Collation | null): BoundKey {
   if (coll === null) return { kind: "key", key: encodeTerminated(SQL_BYTE_ENCODER.encode(s)) };
   try {
     return { kind: "key", key: collationSortKey(coll, s) };
@@ -14885,7 +14887,7 @@ function encodeTextBound(s: string, coll: Collation | null): BoundKey {
 // key. A NULL value makes the comparison 3VL-unknown (an empty range); a value of a kind no key can hold
 // (or an integer outside the PK width) drops its half-bound, widening — still sound. coll selects a text
 // value's key form (collated sort key vs raw bytes — encodeTextBound).
-function encodeValueKey(pkType: ScalarType, v: Value, coll: Collation | null): BoundKey {
+export function encodeValueKey(pkType: ScalarType, v: Value, coll: Collation | null): BoundKey {
   if (v.kind === "null") return { kind: "null" };
   if (v.kind === "bool") return { kind: "key", key: encodeBool(v.value) };
   if (v.kind === "uuid") return { kind: "key", key: v.bytes.slice() };
@@ -14911,7 +14913,7 @@ function encodeValueKey(pkType: ScalarType, v: Value, coll: Collation | null): B
 // Byte-dedup == value-dedup and byte-sort == value-sort under the order-preserving key encoding
 // (encoding.md §2), so probing the sorted distinct keys yields rows in ascending key order with no
 // row visited twice. Shared by the PK and secondary-index point-set executors.
-function encodeKeySet(
+export function encodeKeySet(
   keyType: ScalarType,
   srcs: RExpr[],
   params: Value[],
@@ -14935,7 +14937,7 @@ function encodeKeySet(
 
 // intersectLo tightens b's lower bound to the more restrictive of (current, key); at an equal key an
 // exclusive bound (inc=false) wins.
-function intersectLo(b: KeyBound, key: Uint8Array, inc: boolean): void {
+export function intersectLo(b: KeyBound, key: Uint8Array, inc: boolean): void {
   if (b.lo === null) {
     b.lo = key;
     b.loInc = inc;
@@ -14950,7 +14952,7 @@ function intersectLo(b: KeyBound, key: Uint8Array, inc: boolean): void {
 
 // intersectHi tightens b's upper bound to the more restrictive of (current, key); at an equal key an
 // exclusive bound wins.
-function intersectHi(b: KeyBound, key: Uint8Array, inc: boolean): void {
+export function intersectHi(b: KeyBound, key: Uint8Array, inc: boolean): void {
   if (b.hi === null) {
     b.hi = key;
     b.hiInc = inc;
@@ -14965,7 +14967,7 @@ function intersectHi(b: KeyBound, key: Uint8Array, inc: boolean): void {
 
 // boundEmpty reports whether the bound admits no key: lo above hi, or lo == hi with a non-inclusive
 // endpoint.
-function boundEmpty(b: KeyBound): boolean {
+export function boundEmpty(b: KeyBound): boolean {
   if (b.lo === null || b.hi === null) return false;
   const c = compareBytes(b.lo, b.hi);
   if (c > 0) return true;
@@ -14974,7 +14976,7 @@ function boundEmpty(b: KeyBound): boolean {
 }
 
 // mutationPkBound detects a single-table UPDATE/DELETE's PK pushdown bound; null ⇒ full scan.
-function mutationPkBound(table: Table, filter: RExpr | null, snap: Snapshot): PkBound | null {
+export function mutationPkBound(table: Table, filter: RExpr | null, snap: Snapshot): PkBound | null {
   if (filter === null) return null;
   const pkIdx = primaryKeyIndex(table);
   if (pkIdx < 0) return null;
@@ -14994,7 +14996,7 @@ function mutationPkBound(table: Table, filter: RExpr | null, snap: Snapshot): Pk
 // point-set bound for the UPDATE/DELETE scan (cost.md §3 "OR / IN-list"). Like mutationPkBound it
 // applies only to a scalar, non-Skewed-collated PK. A secondary-index point-set for DML is the
 // separate index-scans-for-DML follow-on, so mutations bound only by the primary key here.
-function pkSetFor(table: Table, filter: RExpr | null, snap: Snapshot): PkKeySet | null {
+export function pkSetFor(table: Table, filter: RExpr | null, snap: Snapshot): PkKeySet | null {
   if (filter === null) return null;
   const pkIdx = primaryKeyIndex(table);
   if (pkIdx < 0) return null;
@@ -15010,7 +15012,7 @@ function pkSetFor(table: Table, filter: RExpr | null, snap: Snapshot): PkKeySet 
 // scanEntries returns the (key,row) entries a mutation scans + the page_read node count: a primary-key
 // bound seeks/ranges, an empty bound yields entries=null (the caller charges nothing and mutates
 // nothing), and no bound is the full scan (cost.md §3 "bounded scan").
-function scanEntries(
+export function scanEntries(
   store: TableStore,
   pkBound: PkBound | null,
   params: Value[],
@@ -15034,7 +15036,7 @@ function scanEntries(
 // have descended INTO this plan (0 = its own clauses); an outerColumn at level points above iff
 // level > depth. The fold pass calls it with depth 0 on a subquery's sub-plan to fold (uncorrelated)
 // or leave (correlated) it.
-function queryPlanReferencesOuter(plan: QueryPlan, depth: number): boolean {
+export function queryPlanReferencesOuter(plan: QueryPlan, depth: number): boolean {
   if (plan.kind === "setOp") {
     return queryPlanReferencesOuter(plan.lhs, depth) || queryPlanReferencesOuter(plan.rhs, depth);
   }
@@ -15073,7 +15075,7 @@ function queryPlanReferencesOuter(plan: QueryPlan, depth: number): boolean {
   return false;
 }
 
-function rexprReferencesOuter(e: RExpr, depth: number): boolean {
+export function rexprReferencesOuter(e: RExpr, depth: number): boolean {
   switch (e.kind) {
     case "outerColumn":
       return e.level > depth;
@@ -15162,7 +15164,7 @@ function rexprReferencesOuter(e: RExpr, depth: number): boolean {
 
 // rSubscriptBounds is the bound RExprs of a list of resolved subscript specs (each index, or a
 // slice's present lower/upper bounds) — for the RExpr tree walkers (spec/design/array.md §6).
-function rSubscriptBounds(subs: RSubscript[]): RExpr[] {
+export function rSubscriptBounds(subs: RSubscript[]): RExpr[] {
   const out: RExpr[] = [];
   for (const s of subs) {
     if (!s.isSlice) out.push(s.index);
@@ -15181,7 +15183,7 @@ function rSubscriptBounds(subs: RSubscript[]): RExpr[] {
 // column with level === depth is a correlated reference back into the target scope (touches).
 // Purely syntactic — a never-taken CASE branch still touches — so the set is deterministic and
 // cross-core identical (a §8 contract).
-function collectTouched(e: RExpr, depth: number, touched: boolean[]): void {
+export function collectTouched(e: RExpr, depth: number, touched: boolean[]): void {
   switch (e.kind) {
     case "column":
       // A Column index beyond the real columns is a SYNTHETIC slot (an aggregate or window result,
@@ -15297,7 +15299,7 @@ function collectTouched(e: RExpr, depth: number, touched: boolean[]): void {
 // collectTouchedPlan walks a nested plan's expression surfaces for outer references back into
 // the target scope — the same five surfaces selectPlanReferencesOuter checks (slot lists like
 // group keys / ORDER BY index the nested plan's own rows and can never reach outward).
-function collectTouchedPlan(plan: QueryPlan, depth: number, touched: boolean[]): void {
+export function collectTouchedPlan(plan: QueryPlan, depth: number, touched: boolean[]): void {
   if (plan.kind === "select") {
     for (const j of plan.joins) if (j.on !== null) collectTouched(j.on, depth, touched);
     if (plan.filter !== null) collectTouched(plan.filter, depth, touched);
@@ -15335,40 +15337,40 @@ function collectTouchedPlan(plan: QueryPlan, depth: number, touched: boolean[]):
 // §5.1). Far above any real column/synthetic-slot count, and below 2^31 so it is valid on a 32-bit
 // usize (the Rust wasm32 build) as well as an exact number here. Kept identical across the three cores.
 // (Written as 2**28, not 1<<28, to match the WINDOW_KEY/GROUPING bases below where a 1<<N would risk wrap.)
-const WINDOW_RESULT_BASE = 2 ** 28;
+export const WINDOW_RESULT_BASE = 2 ** 28;
 
 // WINDOW_KEY_BASE is the placeholder base a materialized window-key expression (a non-column
 // PARTITION BY / ORDER BY key — `PARTITION BY a + b`) carries until the rebase pass rewrites it to
 // its real synthetic slot inputWidth+k (spec/design/window.md §5.1). Disjoint from
 // WINDOW_RESULT_BASE's range, below 2**31 (32-bit-usize / wasm32 safe). A bare-column key is NOT
 // materialized — it keeps its real row slot. (2 ** 29.)
-const WINDOW_KEY_BASE = 2 ** 29;
+export const WINDOW_KEY_BASE = 2 ** 29;
 
 // GROUPING_GS_BASE is the placeholder base a GROUPING(...) call carries until the rebase pass rewrites
 // it to its real trailing synthetic slot groupKeys.length+aggSpecs.length+g (the GROUPING results
 // follow the master columns + aggregate results — spec/design/aggregates.md §12). Disjoint from the
 // window bases, below 2**31 (32-bit-usize / wasm32 safe). GROUPING is mutually exclusive with window
 // functions, so its placeholders never coexist with the window ones in a projection. (2 ** 30.)
-const GROUPING_GS_BASE = 2 ** 30;
+export const GROUPING_GS_BASE = 2 ** 30;
 
 // ORDER_EXPR_BASE is the placeholder base a materialized ORDER BY EXPRESSION key's sort slot carries
 // until it is rebased to its real trailing slot finalRowWidth+k (the materialized order values are
 // appended after the input / window / grouped columns — grammar.md §10). Used only in the OrderSlot
 // idx field (a different namespace from the RExpr column bases above), but kept disjoint and below
 // 2**31 (32-bit-usize / wasm32 safe) for the same reasons. A column / ordinal key keeps its real slot.
-const ORDER_EXPR_BASE = 2 ** 27;
+export const ORDER_EXPR_BASE = 2 ** 27;
 
 // MAX_GROUPING_SETS bounds a GROUP BY's total expansion (CUBE of n columns alone is 2^n). Beyond this
 // the statement is aborted 54001 (statement_too_complex) — jed's structural-complexity gate (a
 // deliberate divergence from PostgreSQL's per-construct "CUBE is limited to 12 elements" / 54011; jed
 // bounds the total expansion instead). spec/design/aggregates.md §12.
-const MAX_GROUPING_SETS = 4096;
+export const MAX_GROUPING_SETS = 4096;
 
 // GroupSet is one resolved grouping set of a GROUP BY (spec/design/aggregates.md §12). A plain GROUP
 // BY has exactly one; ROLLUP/CUBE/GROUPING SETS produce several. Each is bucketed independently over
 // the post-WHERE rows and its groups projected into the shared synthetic row, whose first
 // groupKeys.length slots are the master grouping columns (the ordered union of all sets' columns).
-type GroupSet = {
+export type GroupSet = {
   // keyCols: the flat input-row indices this set buckets on (its key, in key order). Empty = one
   // grand-total group (always emits one row, even over an empty input — the () / whole-table case).
   keyCols: number[];
@@ -15381,7 +15383,7 @@ type GroupSet = {
 
 // groupItemSetCount is the number of grouping sets a single GROUP BY term expands to, saturating well
 // below MAX_GROUPING_SETS+1 so a huge CUBE cannot overflow the product before the limit check.
-function groupItemSetCount(item: GroupItem): number {
+export function groupItemSetCount(item: GroupItem): number {
   switch (item.kind) {
     case "set":
       return 1;
@@ -15403,7 +15405,7 @@ function groupItemSetCount(item: GroupItem): number {
 // expandGroupItem expands a single GROUP BY term into its grouping sets, each a list of column Exprs
 // (ROLLUP/CUBE/GROUPING SETS and nesting — spec/design/aggregates.md §12). The per-set column order
 // is textual; the set order is deterministic and identical across cores (tests compare with rowsort).
-function expandGroupItem(item: GroupItem): Expr[][] {
+export function expandGroupItem(item: GroupItem): Expr[][] {
   switch (item.kind) {
     case "set":
       return [item.cols.slice()];
@@ -15439,7 +15441,7 @@ function expandGroupItem(item: GroupItem): Expr[][] {
 // expandGroupBy expands a whole GROUP BY clause into its grouping sets: the cross-product of the
 // top-level terms' expansions. An empty clause yields one empty set (the whole-table grand total).
 // Aborts 54001 if the expansion exceeds MAX_GROUPING_SETS (spec/design/aggregates.md §12).
-function expandGroupBy(items: GroupItem[]): Expr[][] {
+export function expandGroupBy(items: GroupItem[]): Expr[][] {
   let total = 1;
   for (const it of items) {
     total *= groupItemSetCount(it);
@@ -15463,7 +15465,7 @@ function expandGroupBy(items: GroupItem[]): Expr[][] {
 // GroupKeyResolved is the resolution of one GROUP BY grouping term (aggregates.md §15): either an
 // input COLUMN at a flat row index, or a general EXPRESSION to materialize (its resolved node + type
 // + canonical AST). Mirrors Rust's GroupKeyResolved enum.
-type GroupKeyResolved =
+export type GroupKeyResolved =
   | { kind: "column"; index: number }
   | { kind: "expr"; node: RExpr; ty: ResolvedType; canon: Expr };
 
@@ -15471,7 +15473,7 @@ type GroupKeyResolved =
 // (aggregates.md §15). Classifies the term: a bare integer literal is a select-list ORDINAL (1-based;
 // out of range 42P10) whose target select item is then resolved as a term; otherwise it is a column
 // / alias / general expression (resolveGroupNamed).
-function resolveGroupTerm(
+export function resolveGroupTerm(
   scope: Scope,
   term: Expr,
   items: SelectItems,
@@ -15503,7 +15505,7 @@ function resolveGroupTerm(
 // or a general expression (aggregates.md §15). A bare name resolves an INPUT column FIRST, then —
 // only if there is no such column — an output alias (PG's rule, the opposite of ORDER BY's
 // output-first rule).
-function resolveGroupNamed(
+export function resolveGroupNamed(
   scope: Scope,
   term: Expr,
   items: SelectItems,
@@ -15542,7 +15544,7 @@ function resolveGroupNamed(
 // matches it); anything else is MATERIALIZED — resolved against the input row with aggregates
 // forbidden (an aggregate in GROUP BY is 42803), its canonical AST kept for projection matching
 // (aggregates.md §15).
-function resolveGroupExpr(scope: Scope, e: Expr, params: ParamTypes): GroupKeyResolved {
+export function resolveGroupExpr(scope: Scope, e: Expr, params: ParamTypes): GroupKeyResolved {
   if (e.kind === "column") {
     const r = scope.resolveBare(e.name);
     if (r.level === 0) return { kind: "column", index: r.index };
@@ -15560,7 +15562,7 @@ function resolveGroupExpr(scope: Scope, e: Expr, params: ParamTypes): GroupKeyRe
 // in a collecting context with groupKeyExprs; an aggregate operand / FILTER resolves under Forbidden
 // (no groupKeyExprs), so a grouping expression there is correctly NOT remapped (it is a per-row
 // value, not the group key).
-function matchGroupExpr(ag: AggCtx, e: Expr): { slot: number; ty: ResolvedType } | null {
+export function matchGroupExpr(ag: AggCtx, e: Expr): { slot: number; ty: ResolvedType } | null {
   const gke = ag.groupKeyExprs;
   if (gke === undefined) return null;
   for (let p = 0; p < gke.length; p++) {
@@ -15572,7 +15574,7 @@ function matchGroupExpr(ag: AggCtx, e: Expr): { slot: number; ty: ResolvedType }
 
 // groupingValue computes a GROUPING(args) result for a group from the grouping set whose mask is
 // given: bit (k-1-j) of the result is bit positions[j] of mask (spec/design/aggregates.md §12).
-function groupingValue(positions: number[], mask: bigint): bigint {
+export function groupingValue(positions: number[], mask: bigint): bigint {
   const k = positions.length;
   let r = 0n;
   for (let j = 0; j < k; j++) {
@@ -15595,7 +15597,7 @@ function groupingValue(positions: number[], mask: bigint): bigint {
 // count is far below that gap, so bounding to [from, 2·from) keeps the bases isolated — a
 // window-result rebase no longer clobbers a GROUPING() placeholder (the two now COEXIST in a
 // GROUPING SETS + window query — aggregates.md §21).
-function rebasePlaceholderCols(e: RExpr, from: number, target: number): void {
+export function rebasePlaceholderCols(e: RExpr, from: number, target: number): void {
   switch (e.kind) {
     case "column":
       if (e.index >= from && e.index < from * 2) e.index = target + (e.index - from);
@@ -15701,7 +15703,7 @@ function rebasePlaceholderCols(e: RExpr, from: number, target: number): void {
 
 // valueToRExpr builds the constant rExpr for a folded subquery value (§26). The static type is
 // carried separately (the node's type), so a NULL value here is just constNull.
-function valueToRExpr(v: Value): RExpr {
+export function valueToRExpr(v: Value): RExpr {
   switch (v.kind) {
     case "int":
       return { kind: "constInt", value: v.int };
@@ -15749,7 +15751,7 @@ function valueToRExpr(v: Value): RExpr {
 // field can contain, so e.g. (1,23) and (12,3) do not collide (spec/design/grammar.md §11).
 // NULL == NULL falls out (both encode "n"), matching the NULL-safe DISTINCT rule. Ints use
 // bigint.toString() — exact, never the lossy `number` path (CLAUDE.md §8).
-function distinctRowKey(row: Value[]): string {
+export function distinctRowKey(row: Value[]): string {
   return row.map(distinctValueKey).join("|");
 }
 
@@ -15758,7 +15760,7 @@ function distinctRowKey(row: Value[]): string {
 // so composites group/dedup structurally — NULL-safe, with NULL fields included (spec/design/composite.md
 // §5). Shared by distinctRowKey (which joins the per-field keys with a separator no scalar key can
 // contain).
-function distinctValueKey(v: Value): string {
+export function distinctValueKey(v: Value): string {
   switch (v.kind) {
     case "composite":
       // Length-prefix the field count and each field's key so a composite never collides with a
@@ -15869,7 +15871,7 @@ function distinctValueKey(v: Value): string {
 
 // ResolvedType is the static type of a resolved expression. "null" is an untyped NULL
 // literal (its integer type, if needed, is settled by the surrounding operator/context).
-type ResolvedType =
+export type ResolvedType =
   | { kind: "int"; ty: ScalarType }
   // The float family (spec/design/float.md): ty is f32 or f64. A strict island — no
   // implicit cross-family coercion (int/decimal ⊕ float is 42804); within-family widening
@@ -15913,13 +15915,13 @@ type ResolvedType =
 
 // RSubscript is one resolved subscript spec in a "subscript" RExpr (spec/design/array.md §6): an
 // index `a[i]`, or a slice `a[m:n]` whose bounds may be null (omitted: `a[:n]`/`a[m:]`/`a[:]`).
-type RSubscript =
+export type RSubscript =
   | { isSlice: false; index: RExpr }
   | { isSlice: true; lower: RExpr | null; upper: RExpr | null };
 
 // RExpr is a resolved expression over fixed column indices. Arithmetic/neg nodes carry
 // their (promotion-tower) result type so the computed value can be range-checked.
-type RExpr =
+export type RExpr =
   | { kind: "column"; index: number }
   // A bind parameter, by 0-based index into the bound-values array passed to evalExpr. Its
   // static type was inferred from context at resolve (spec/design/api.md §5); the value is
@@ -16228,31 +16230,31 @@ type RExpr =
     };
 
 // SubqueryKind selects which subquery form a "subquery" RExpr is (spec/design/grammar.md §26).
-type SubqueryKind = "scalar" | "exists" | "in" | "quantified";
+export type SubqueryKind = "scalar" | "exists" | "in" | "quantified";
 
 // JsonGetOp selects which jsonb accessor operator a "jsonGet" RExpr applies
 // (spec/design/json-sql-functions.md §1): "arrow" `->` — field by key (text arg) or element by
 // index (integer arg), result jsonb; "arrowText" `->>` — same access, rendered as text; "hashArrow"
 // `#>` — get at a `text[]` path, result jsonb; "hashArrowText" `#>>` — get at a `text[]` path,
 // rendered as text.
-type JsonGetOp = "arrow" | "arrowText" | "hashArrow" | "hashArrowText";
+export type JsonGetOp = "arrow" | "arrowText" | "hashArrow" | "hashArrowText";
 
 // HasKeyKind selects which jsonb key-existence operator a "jsonHasKey" RExpr applies
 // (spec/design/json-sql-functions.md §1, J5): "one" `?` — a single key (text) exists; "any" `?|` —
 // any key of a `text[]` exists; "all" `?&` — all keys of a `text[]` exist.
-type HasKeyKind = "one" | "any" | "all";
+export type HasKeyKind = "one" | "any" | "all";
 
 // DeleteKind selects which jsonb delete form a "jsonDelete" RExpr applies
 // (spec/design/json-sql-functions.md §1, J6): "key" `jsonb - text` — delete a key (object) or
 // matching string elements (array); "index" `jsonb - int` — delete the array element at an index;
 // "keys" `jsonb - text[]` — delete each key; "path" `jsonb #- text[]` — delete the element at a path.
-type DeleteKind = "key" | "index" | "keys" | "path";
+export type DeleteKind = "key" | "index" | "keys" | "path";
 
 // ScalarFuncName is the internal identity of a scalar-function node. abs/round span int/decimal
 // AND float overloads; the rest (ceil…tan) are float-only (spec/design/float.md §8). The
 // exact-vs-transcendental split is a conformance-layer concern (the R tag + the determinism
 // ledger), not a code distinction here — all are ordinary per-row function nodes.
-type ScalarFuncName =
+export type ScalarFuncName =
   | "abs"
   | "round"
   | "ceil"
@@ -16451,7 +16453,7 @@ type ScalarFuncName =
 // ArrayFuncName is the internal identity of a polymorphic array-function node
 // (spec/design/array-functions.md §3). Each name is single-arity; the kernel recovers everything
 // from the operand values (the array's own shape header).
-type ArrayFuncName =
+export type ArrayFuncName =
   | "array_ndims"
   | "array_length"
   | "array_lower"
@@ -16476,7 +16478,7 @@ type ArrayFuncName =
 // (spec/design/range-functions.md §1, RF1). Each name is single-arity; the kernel recovers
 // everything from the operand range value (self-describing). lower/upper yield the bound value
 // (ELEM) or NULL when empty/unbounded; the rest yield boolean. All are STRICT (a NULL range → NULL).
-type RangeFuncName =
+export type RangeFuncName =
   | "lower"
   | "upper"
   | "isempty"
@@ -16491,7 +16493,7 @@ type RangeFuncName =
 // "containsElem"/"elemContainedBy" are the element overloads of @>/<@ (the other operand is a bare
 // element coerced to the range's element type); the rest are range-against-range. The kernels live in
 // range.ts.
-type RangeOpName =
+export type RangeOpName =
   | "contains" // a @> b — range a contains range b
   | "containsElem" // r @> e — range r contains element e (the element overload of @>)
   | "containedBy" // a <@ b — range a is contained by range b
@@ -16507,7 +16509,7 @@ type RangeOpName =
 // §4, RF4). Each combines two ranges over a common element type into a new range. "union"/"difference"
 // raise 22000 on a non-contiguous result; "intersect"/"merge" never error. The kernels live in
 // range.ts.
-type RangeSetOpName =
+export type RangeSetOpName =
   | "union" // a + b — the smallest single range covering both (22000 if they leave a gap)
   | "intersect" // a * b — the overlap (empty when the ranges are disjoint)
   | "difference" // a - b — the part of a not in b (22000 if b splits a in two)
@@ -16515,12 +16517,12 @@ type RangeSetOpName =
 
 // VariadicFuncName is the internal identity of a VARIADIC counting-function node
 // (spec/design/array-functions.md §12). Both return i32; the call form lives on the node.
-type VariadicFuncName = "num_nulls" | "num_nonnulls";
+export type VariadicFuncName = "num_nulls" | "num_nonnulls";
 
 // JsonBuildKind selects which json/jsonb builder a "jsonBuild" RExpr node is (json-sql-functions.md
 // §2): "array" — json[b]_build_array, every argument is one array element (NULL → JSON null);
 // "object" — json[b]_build_object, alternating key/value arguments (odd count / NULL key → 22023).
-type JsonBuildKind = "array" | "object";
+export type JsonBuildKind = "array" | "object";
 
 // JsonPathFnKind selects which scalar jsonpath query function a "jsonPathFn" RExpr node is
 // (jsonpath.md §5): "exists" — jsonb_path_exists → boolean (the sequence is non-empty);
@@ -16528,13 +16530,13 @@ type JsonBuildKind = "array" | "object";
 // "queryArray" — jsonb_path_query_array → the sequence wrapped in a JSON array;
 // "match" — jsonb_path_match (and the `@@` operator) → the single boolean the path/predicate
 // produces (22038 if not exactly one boolean item).
-type JsonPathFnKind = "exists" | "queryFirst" | "queryArray" | "match";
+export type JsonPathFnKind = "exists" | "queryFirst" | "queryArray" | "match";
 
 // JsonSqlKind selects which SQL/JSON query function a "jsonSqlFn" RExpr node is
 // (json-sql-functions.md §5, S2): "exists" — JSON_EXISTS → boolean (non-empty sequence); errors
 // honor ON ERROR (default FALSE); "value" — JSON_VALUE → a single scalar coerced to the RETURNING
 // type (default text); "query" — JSON_QUERY → a json/jsonb value (wrapper / quotes controlled).
-type JsonSqlKind = "exists" | "value" | "query";
+export type JsonSqlKind = "exists" | "value" | "query";
 
 // ============================================================================
 // Query plans — the resolved, owned form of a query, executable repeatedly (a correlated
@@ -16563,7 +16565,7 @@ type JsonSqlKind = "exists" | "value" | "query";
 // re-materializes it ONCE PER combined left-hand row (with that row pushed as its immediate outer —
 // the correlated-subquery mechanism), rather than materializing it once. Always false for the first
 // relation; only a srf or derived relation is ever lateral.
-type PlanRel = {
+export type PlanRel = {
   tableName: string;
   // db is the relation's explicit database qualifier (attached-databases.md §3), passed to the
   // scope-aware store funnels at exec (lkpStoreScoped etc.). undefined for a bare implicit-scope name →
@@ -16591,7 +16593,7 @@ type PlanRel = {
 //                                 object's members to the C0 col-def-list columns by name + coerce.
 //                                 The `recordSet`/`recordCols` fields on the plan carry the form +
 //                                 declared columns.
-type SrfKind =
+export type SrfKind =
   | "generate_series"
   | "unnest"
   | "jsonb_array_elements"
@@ -16633,7 +16635,7 @@ type SrfKind =
 // recordSet/recordCols apply only to the `json_record` kind (R1, json-table.md §2): recordSet
 // selects the recordset form (one row per array element) vs. the single record row, and recordCols
 // is the declared C0 col-def-list columns used to map JSON members → columns by name + coerce.
-type SrfPlan = {
+export type SrfPlan = {
   kind: SrfKind;
   args: RExpr[];
   recordSet?: boolean;
@@ -16653,9 +16655,9 @@ type SrfPlan = {
 // AFTER a statement-local CTE (a CTE shadows a catalog relation — PG-matching, oracle-checked) and
 // BEFORE the user catalog (post-I0 the two can never collide; for a pre-reservation legacy file the
 // built-in wins and the user relation is unreachable by name — §5).
-type CatalogRelKind = "jed_tables" | "jed_columns" | "jed_indexes" | "jed_constraints";
+export type CatalogRelKind = "jed_tables" | "jed_columns" | "jed_indexes" | "jed_constraints";
 
-function catalogRelKind(name: string): CatalogRelKind | undefined {
+export function catalogRelKind(name: string): CatalogRelKind | undefined {
   const lname = name.toLowerCase();
   if (
     lname === "jed_tables" ||
@@ -16672,7 +16674,7 @@ function catalogRelKind(name: string): CatalogRelKind | undefined {
 // The write paths use it to reject a catalog relation as a mutation/DDL target (42809 — a catalog
 // relation is read-only, introspection.md §5); the privilege gate uses it so a built-in is
 // SELECT-gated exactly like a user table under an explicit-grant session envelope.
-function isCatalogRelName(name: string): boolean {
+export function isCatalogRelName(name: string): boolean {
   return catalogRelKind(name) !== undefined;
 }
 
@@ -16681,7 +16683,7 @@ function isCatalogRelName(name: string): boolean {
 // (introspection.md §5 — the relations are read-only computed views of the catalog). Checked by
 // NAME, before qualifier validation: the built-in resolves in every database's namespace, so the
 // rejection is scope-independent.
-function checkCatalogRelWrite(name: string): void {
+export function checkCatalogRelWrite(name: string): void {
   if (isCatalogRelName(name)) {
     throw engineError(
       "wrong_object_type",
@@ -16694,7 +16696,7 @@ function checkCatalogRelWrite(name: string): void {
 // Unlike an SRF's single-column alias rule, a FROM alias renames the RELATION only — the column
 // names are part of the introspection surface. Growth is by ADDING columns (consumers select by
 // name, not position — §5).
-function catalogRelTable(kind: CatalogRelKind): Table {
+export function catalogRelTable(kind: CatalogRelKind): Table {
   const mkCol = (name: string, ty: Type, notNull: boolean): Column => ({
     name,
     type: ty,
@@ -16759,7 +16761,7 @@ function catalogRelTable(kind: CatalogRelKind): Table {
 // (varchar(10), decimal(8,2)), a composite's name as created, a range's canonical id (i32range,
 // numrange, …), and `[]` appended for an array (the typmod applies to the element: varchar(5)[]).
 // This text is a compatibility surface the moment it ships — pinned by the corpus.
-function catalogTypeText(ty: Type, dec: DecimalTypmod | null, vlen: number | null): string {
+export function catalogTypeText(ty: Type, dec: DecimalTypmod | null, vlen: number | null): string {
   if (ty.kind === "array") return catalogTypeText(ty.elem, dec, vlen) + "[]";
   if (ty.kind === "scalar" && ty.scalar === "text" && vlen !== null) {
     return `varchar(${vlen})`;
@@ -16774,7 +16776,7 @@ function catalogTypeText(ty: Type, dec: DecimalTypmod | null, vlen: number | nul
 
 // JtPlan is a resolved `JSON_TABLE` plan (T1, json-table.md §3) — the compiled root path + the
 // column tree. `width` is the total flattened output-column count.
-type JtPlan = {
+export type JtPlan = {
   // The compiled root jsonpath (its evaluation over `ctx` yields the row items).
   rootPath: string;
   // The total number of flattened output columns.
@@ -16785,7 +16787,7 @@ type JtPlan = {
 
 // JtCol is one resolved `JSON_TABLE` column (json-table.md §3.3), a discriminated union. Leaf
 // columns carry their flat output index `idx`.
-type JtCol =
+export type JtCol =
   // `FOR ORDINALITY` — the level's 1-based row counter.
   | { kind: "ordinality"; idx: number }
   // A regular column: evaluate `path` over the row item, apply JSON_VALUE (scalar) or JSON_QUERY
@@ -16812,7 +16814,7 @@ type JtCol =
 // NAME follows PostgreSQL's single-column function-alias rule — the table alias when one is given,
 // else the function name — and its TYPE is colTy (the promoted integer for generate_series, the
 // bound element type for unnest).
-function srfTable(funcName: string, alias: string | null, colTy: Type): Table {
+export function srfTable(funcName: string, alias: string | null, colTy: Type): Table {
   return {
     name: funcName,
     columns: [
@@ -16841,7 +16843,7 @@ function srfTable(funcName: string, alias: string | null, colTy: Type): Table {
 // json-table.md §1) — the generalization of srfTable to N named/typed columns. The column NAMES are
 // fixed by the function (e.g. jsonb_each → key, value); the FROM alias renames the RELATION, not its
 // columns. Used by json[b]_each[_text] (and, with a col-def list, the record functions).
-function srfTableCols(funcName: string, alias: string | null, cols: [string, Type][]): Table {
+export function srfTableCols(funcName: string, alias: string | null, cols: [string, Type][]): Table {
   return {
     name: alias ?? funcName,
     columns: cols.map(([name, type]) => ({
@@ -16867,7 +16869,7 @@ function srfTableCols(funcName: string, alias: string | null, cols: [string, Typ
 // jsonRecordRow builds one output row for `json[b]_to_record(set)` (R1): map each declared column to
 // the JSON object's member of that name, coercing it to the column type. A missing member or a JSON
 // null → SQL NULL; a non-object node → 22023. (json-table.md §2)
-function jsonRecordRow(node: JsonNode, cols: Column[], env: EvalEnv, meter: Meter): Row {
+export function jsonRecordRow(node: JsonNode, cols: Column[], env: EvalEnv, meter: Meter): Row {
   if (node.kind !== "object") {
     throw engineError(
       "invalid_parameter_value",
@@ -16890,7 +16892,7 @@ function jsonRecordRow(node: JsonNode, cols: Column[], env: EvalEnv, meter: Mete
 // path): a `jsonb` column embeds the node, a `json` column its canonical text, every other scalar
 // coerces the node's `->>`-style text through the cast machinery (so `"42"` / `42` → an `int`
 // column, etc.). A composite/array column type is a deferred 0A000.
-function coerceJsonMember(
+export function coerceJsonMember(
   node: JsonNode,
   colTy: Type,
   decimal: DecimalTypmod | null,
@@ -16915,14 +16917,14 @@ function coerceJsonMember(
 // isSqljsonError reports whether an error is a SQL/JSON error the query functions' `ON ERROR` clause
 // catches: a data exception (class `22`). Resource / cost aborts (class `53`/`54`) propagate
 // unconditionally. Port of impl/rust/src/executor.rs `is_sqljson_error`.
-function isSqljsonError(e: unknown): e is EngineError {
+export function isSqljsonError(e: unknown): e is EngineError {
   return e instanceof EngineError && e.code().startsWith("22");
 }
 
 // applyJsonBehavior applies a constant `ON ERROR` / `ON EMPTY` behavior → a value of the RETURNING
 // type. `underlying` is the SQL/JSON error this behavior replaces (rethrown verbatim by `error`).
 // Port of impl/rust/src/executor.rs `apply_json_behavior`.
-function applyJsonBehavior(
+export function applyJsonBehavior(
   behavior: JsonOnBehavior,
   underlying: EngineError,
   returning: ScalarType,
@@ -16950,7 +16952,7 @@ function applyJsonBehavior(
 // jsonNodeAsReturning renders a json result node as the RETURNING type: `jsonb` embeds, `json` its
 // canonical text, any other scalar coerces the node's `->>`-style text through the cast machinery.
 // Port of impl/rust/src/executor.rs `json_node_as_returning`.
-function jsonNodeAsReturning(
+export function jsonNodeAsReturning(
   node: JsonNode,
   returning: ScalarType,
   env: EvalEnv,
@@ -16962,7 +16964,7 @@ function jsonNodeAsReturning(
 // evalJsonSqlResult applies the SQL/JSON query-function semantics (JSON_VALUE / JSON_QUERY) to an
 // evaluated sequence. (JSON_EXISTS is handled inline — non-empty → true.) Port of
 // impl/rust/src/executor.rs `eval_json_sql_result`.
-function evalJsonSqlResult(
+export function evalJsonSqlResult(
   kind: JsonSqlKind,
   seq: JsonNode[],
   returning: ScalarType,
@@ -17069,11 +17071,11 @@ function evalJsonSqlResult(
 
 // JtAssign is a sparse assignment of a `JSON_TABLE` row — `[flat column index, value]` pairs;
 // unassigned columns are NULL (the LEFT-OUTER / sibling-UNION fill).
-type JtAssign = [number, Value][];
+export type JtAssign = [number, Value][];
 
 // jtColumn builds a synthetic `JSON_TABLE` output column. Port of impl/rust/src/executor.rs
 // `jt_column`.
-function jtColumn(name: string, ty: ScalarType, decimal: DecimalTypmod | null): Column {
+export function jtColumn(name: string, ty: ScalarType, decimal: DecimalTypmod | null): Column {
   return {
     name,
     type: scalarT(ty),
@@ -17090,7 +17092,7 @@ function jtColumn(name: string, ty: ScalarType, decimal: DecimalTypmod | null): 
 
 // jtScalarType resolves a `JSON_TABLE` column type name → its scalar type (a composite → 0A000, an
 // unknown name → 42704). Port of impl/rust/src/executor.rs `jt_scalar_type`.
-function jtScalarType(db: Engine, typeName: string): ScalarType {
+export function jtScalarType(db: Engine, typeName: string): ScalarType {
   const st = scalarTypeFromName(typeName);
   if (st !== undefined) return st;
   if (db.compositeType(typeName) !== undefined) {
@@ -17105,7 +17107,7 @@ function jtScalarType(db: Engine, typeName: string): ScalarType {
 // jtCompilePath compiles a `JSON_TABLE` column path — the explicit `PATH p`, or the default
 // `$.<column_name>` — to its canonical rendered form (validating; malformed → 42601). Port of
 // impl/rust/src/executor.rs `jt_compile_path`.
-function jtCompilePath(path: string | null, name: string): string {
+export function jtCompilePath(path: string | null, name: string): string {
   const src = path ?? `$.${name}`;
   return jsonPathRender(jsonPathCompile(src));
 }
@@ -17113,7 +17115,7 @@ function jtCompilePath(path: string | null, name: string): string {
 // expandJtLevel expands a `JSON_TABLE` COLUMNS level over a sequence of row items → the sparse rows
 // (the parent→child LEFT OUTER product with sibling NESTED paths UNIONed, json-table.md §3.3). Port
 // of impl/rust/src/executor.rs `expand_jt_level`.
-function expandJtLevel(cols: JtCol[], items: JsonNode[], env: EvalEnv, meter: Meter): JtAssign[] {
+export function expandJtLevel(cols: JtCol[], items: JsonNode[], env: EvalEnv, meter: Meter): JtAssign[] {
   const rows: JtAssign[] = [];
   for (let i = 0; i < items.length; i++) {
     meter.guard();
@@ -17165,7 +17167,7 @@ function expandJtLevel(cols: JtCol[], items: JsonNode[], env: EvalEnv, meter: Me
 // UNION of the siblings (each row fills only its own subtree), with the parent→child LEFT OUTER fill
 // (no child rows at all → one all-NULL nested row). Port of impl/rust/src/executor.rs
 // `expand_jt_nested`.
-function expandJtNested(
+export function expandJtNested(
   children: (JtCol & { kind: "nested" })[],
   item: JsonNode,
   env: EvalEnv,
@@ -17190,7 +17192,7 @@ function expandJtNested(
 // evalJtRegular evaluates a regular `JSON_TABLE` column over a row item — JSON_VALUE (scalar) /
 // JSON_QUERY (json/jsonb) semantics, with the column's wrapper / ON EMPTY / ON ERROR. Port of
 // impl/rust/src/executor.rs `eval_jt_regular`.
-function evalJtRegular(
+export function evalJtRegular(
   item: JsonNode,
   path: string,
   query: boolean,
@@ -17219,7 +17221,7 @@ function evalJtRegular(
 // evalJtExists evaluates an `EXISTS` `JSON_TABLE` column over a row item — JSON_EXISTS, coerced to
 // the column type (a NON-empty sequence is true; a structural error honors ON ERROR, default FALSE).
 // Port of impl/rust/src/executor.rs `eval_jt_exists`.
-function evalJtExists(
+export function evalJtExists(
   item: JsonNode,
   path: string,
   returning: ScalarType,
@@ -17262,13 +17264,13 @@ function evalJtExists(
 
 // PlanJoin is one join in a SELECT plan: its kind and resolved ON predicate (null for CROSS). The
 // right relation is rels[k+1].
-type PlanJoin = { kind: JoinKind; on: RExpr | null };
+export type PlanJoin = { kind: JoinKind; on: RExpr | null };
 
 // OrderSlot is a resolved ORDER BY key: a flat/synthetic slot + per-key direction flags + an optional
 // collation. A null collation is the C/value order; a non-null collation orders this key by its UCA
 // sort key (spec/design/collation.md §8) via the decorate sorter — it never reaches the spill Sorter
 // (collation is in-memory only this slice), which ignores the field.
-type OrderSlot = {
+export type OrderSlot = {
   idx: number;
   descending: boolean;
   nullsFirst: boolean;
@@ -17277,7 +17279,7 @@ type OrderSlot = {
 
 // SelectPlan is a resolved SELECT, executable against an outer-row environment (the execute half
 // of the old runSelect, lifted to a value so a correlated subquery can re-run it per outer row).
-type SelectPlan = {
+export type SelectPlan = {
   kind: "select";
   rels: PlanRel[];
   joins: PlanJoin[];
@@ -17370,7 +17372,7 @@ type SelectPlan = {
 
 // SetOpPlan is a resolved set operation: both operands planned with the same parent scope, the
 // unified output types, and the trailing ORDER BY / LIMIT / OFFSET resolved by output column.
-type SetOpPlan = {
+export type SetOpPlan = {
   kind: "setOp";
   op: SetOpKind;
   all: boolean;
@@ -17389,7 +17391,7 @@ type SetOpPlan = {
 // columnTypes is the per-column type unified across the rows like a set operation (§25), and
 // columnNames is column1, column2, … (PostgreSQL; the derived table's optional column-rename list
 // overrides them at the synthetic relation). All rows have columnTypes.length values.
-type ValuesPlan = {
+export type ValuesPlan = {
   kind: "values";
   rows: RExpr[][];
   columnTypes: ResolvedType[];
@@ -17401,7 +17403,7 @@ type ValuesPlan = {
 // bindings are materialized once and `body` runs against a fresh CTE context (they establish their
 // own scope — the enclosing context is NOT chained in, the documented narrowing §7). columnTypes /
 // columnNames mirror the body's, so a WithPlan exposes its output columns like any other plan.
-type WithPlan = {
+export type WithPlan = {
   kind: "with";
   bindings: CteBinding[];
   modes: CteMode[];
@@ -17413,7 +17415,7 @@ type WithPlan = {
 // QueryPlan is a resolved query expression: a SELECT plan, a set-op plan, a VALUES-body relation, or
 // a nested WITH plan (mirrors QueryExpr's bodies). A VALUES plan is only ever produced as a
 // derived-table body.
-type QueryPlan = SelectPlan | SetOpPlan | ValuesPlan | WithPlan;
+export type QueryPlan = SelectPlan | SetOpPlan | ValuesPlan | WithPlan;
 
 // ScanCache is a prepared statement's memoized scan plan (spec/design/api.md §2.4): the resolved
 // SelectPlan (shared by reference, so a cache hit rebuilds the cursor around the SAME plan object and
@@ -17444,7 +17446,7 @@ export type ScanCacheHolder = { cache: ScanCache | null };
 //                  cte_scan_row.
 //   "materialize": run the body once, buffer the rows; each reference scans the buffer, charging
 //                  cte_scan_row per buffered row.
-type CteMode = "inline" | "materialize";
+export type CteMode = "inline" | "materialize";
 
 // CteBinding is a planned common table expression (spec/design/cte.md), built by planCteBindings for
 // the whole statement so the scopes that reference its synthetic `table` can see it. `name` is
@@ -17457,8 +17459,8 @@ type CteMode = "inline" | "materialize";
 // (its column types fix the synthetic relation's) and `recursive` carries the recursive term + the
 // UNION ALL flag; the binding is in scope inside its own recursive term, so the self-reference
 // resolves to it.
-type RecursiveTerm = { plan: QueryPlan; unionAll: boolean };
-type CteBinding = {
+export type RecursiveTerm = { plan: QueryPlan; unionAll: boolean };
+export type CteBinding = {
   name: string;
   table: Table;
   source: CteSource;
@@ -17471,15 +17473,15 @@ type CteBinding = {
 // holds a planned query body; a DATA-MODIFYING CTE holds the statement to execute (for its effect +
 // RETURNING buffer). A data-modifying CTE is always materialized (writable-cte.md §3), so the
 // inline-execution path never touches a "dml" source.
-type CteSource = { kind: "query"; plan: QueryPlan } | { kind: "dml"; dm: DmCte };
+export type CteSource = { kind: "query"; plan: QueryPlan } | { kind: "dml"; dm: DmCte };
 
 // DmCte is a data-modifying CTE's body (spec/design/writable-cte.md): the INSERT/UPDATE/DELETE to run
 // (cloned from the AST, executed with the statement's CTE context threaded in) and whether it has no
 // RETURNING clause — in which case a FROM reference to it is 0A000 (§5).
-type DmCte = { stmt: DmStmt; noReturning: boolean };
+export type DmCte = { stmt: DmStmt; noReturning: boolean };
 
 // DmStmt is a data-modifying statement in a writable-CTE position (a CTE body or the WITH primary).
-type DmStmt = Insert | Update | Delete;
+export type DmStmt = Insert | Update | Delete;
 
 // CteCtx is the per-statement CTE execution context, threaded through exec_* and EvalEnv so a FROM
 // reference (any nesting depth) can deliver a CTE's rows (spec/design/cte.md §5). `modes` and
@@ -17489,14 +17491,14 @@ type DmStmt = Insert | Update | Delete;
 // serves a data-modifying CTE's own inner queries, which resolve against the earlier bindings when
 // the writable-CTE orchestrator executes them (writable-cte.md §2). EMPTY_CTE_CTX is the empty
 // context for every non-WITH execution path.
-type CteCtx = { modes: CteMode[]; bindings: CteBinding[]; buffers: Row[][] };
-const EMPTY_CTE_CTX: CteCtx = { modes: [], bindings: [], buffers: [] };
+export type CteCtx = { modes: CteMode[]; bindings: CteBinding[]; buffers: Row[][] };
+export const EMPTY_CTE_CTX: CteCtx = { modes: [], bindings: [], buffers: [] };
 
 // EvalEnv is the environment threaded into the per-row evaluator (spec/design/grammar.md §26): the
 // bound parameters, the stack of enclosing rows (innermost LAST) a correlated reference reads, and
 // a runSubquery callback (a correlated subquery re-runs its inner plan against the pushed stack).
 // outer is empty at the top level; an outerColumn at frame `level` reads outer[outer.length-level].
-type EvalEnv = {
+export type EvalEnv = {
   params: Value[];
   outer: Row[];
   runSubquery(plan: QueryPlan, outer: Row[]): SelectResult;
@@ -17527,7 +17529,7 @@ type EvalEnv = {
 
 // AggPlan is the runtime plan for one aggregate, fixed at resolve from the function + operand
 // type (the PG widening — spec/design/aggregates.md §3).
-type AggPlan =
+export type AggPlan =
   | "countStar" // COUNT(*) — count every row
   | "count" // COUNT(expr) — count non-NULL inputs
   | "sumInt" // SUM(i16|i32) — accumulate i64, result i64 (trap at i64)
@@ -17582,7 +17584,7 @@ type AggPlan =
 // aggregates.md §5) folds only the distinct non-NULL argument values — the fold loop keeps a
 // per-group value-canonical set and skips a value already seen. Only set in the aggregation stage;
 // a window aggregate is never DISTINCT (0A000, rejected at resolve).
-type AggSpec = {
+export type AggSpec = {
   plan: AggPlan;
   operand: RExpr | null;
   floatWidth?: ScalarType;
@@ -17620,7 +17622,7 @@ type AggSpec = {
 
 // KeySort is a single WITHIN GROUP ordering-key sort spec (aggregates.md §13/§19): direction, NULL
 // placement, and optional collation (text keys only).
-type KeySort = {
+export type KeySort = {
   desc: boolean;
   nullsFirst: boolean;
   collation: Collation | null;
@@ -17631,7 +17633,7 @@ type KeySort = {
 // reference grouping columns); keys are the WITHIN GROUP key operands (evaluated PER ROW during the
 // fold and buffered as a tuple); sorts is the per-key ordering spec. The three arrays have equal
 // length (the arity check at resolve).
-type HypoParams = {
+export type HypoParams = {
   args: RExpr[];
   keys: RExpr[];
   sorts: KeySort[];
@@ -17653,9 +17655,9 @@ type HypoParams = {
 // GroupKeyExpr records a general-expression GROUP BY key (`GROUP BY a + b`, aggregates.md §15): its
 // canonical AST (so a matching projection / HAVING / ORDER BY expression resolves to its synthetic
 // slot) and its resolved type.
-type GroupKeyExpr = { canon: Expr; ty: ResolvedType };
+export type GroupKeyExpr = { canon: Expr; ty: ResolvedType };
 
-type AggCtx = {
+export type AggCtx = {
   collecting: boolean;
   groupKeys: number[];
   // groupKeyExprs is parallel to groupKeys: for each master grouping key, a non-null GroupKeyExpr
@@ -17681,7 +17683,7 @@ type AggCtx = {
 // PARTITION BY key column slots (flat input-row indices), and the resolved within-partition ORDER
 // BY (sort keys over the input row, PK tie-break applied by the stable sort over the PK-ordered
 // scan).
-type WindowSpec = {
+export type WindowSpec = {
   plan: WindowPlan;
   partition: number[];
   order: OrderSlot[];
@@ -17709,7 +17711,7 @@ type WindowSpec = {
 
 // ResolvedFrame is a resolved window frame (spec/design/window.md §6): ROWS physical offsets,
 // GROUPS peer-group offsets (both integer counts), and RANGE value offsets over the ordering key.
-type ResolvedFrame = {
+export type ResolvedFrame = {
   mode: FrameMode;
   start: ResolvedBound;
   end: ResolvedBound;
@@ -17720,7 +17722,7 @@ type ResolvedFrame = {
 // A resolved frame boundary. preceding/following carry the offset as a Value: an int Value (the
 // row/group count) for ROWS/GROUPS, or the numeric Value (int over an integer key, decimal over a
 // decimal key) added to / subtracted from the ordering key for RANGE.
-type ResolvedBound =
+export type ResolvedBound =
   | { kind: "unboundedPreceding" }
   | { kind: "preceding"; offset: Value }
   | { kind: "currentRow" }
@@ -17729,7 +17731,7 @@ type ResolvedBound =
 
 // WindowPlan is the runtime plan for one window function (spec/design/window.md §4). S0:
 // row_number only; ranking / offset / aggregate-window / frame plans land in S1–S4.
-type WindowPlan =
+export type WindowPlan =
   // ROW_NUMBER() — the 1-based sequence position within the partition (frame-insensitive).
   | "rowNumber"
   // RANK() — 1 + rows in earlier peer groups (ties share a rank, then a gap).
@@ -17765,7 +17767,7 @@ type WindowPlan =
 // float.md §7, fold order ledgered non-deterministic), with the NaN/±Inf presence tracked in the flags
 // so the special-value resolution stays order-independent; `floatWidth` (fixed at resolve) re-rounds
 // `floatTotal` to binary32 each add when f32.
-type Acc = {
+export type Acc = {
   plan: AggPlan;
   count: bigint;
   sumInt: bigint;
@@ -17807,7 +17809,7 @@ type Acc = {
   hypoRows?: Value[][];
 };
 
-function newAcc(
+export function newAcc(
   plan: AggPlan,
   floatWidth: ScalarType = "f64",
   jsonAsJson = false,
@@ -17839,7 +17841,7 @@ function newAcc(
 // the spec, not the plan); every other plan delegates to newAcc. Only the aggregation stage builds
 // ordered-set accumulators — the window stage (which calls newAcc directly) never sees one (an
 // ordered-set aggregate with OVER is 0A000, rejected at resolve).
-function newAccFromSpec(s: AggSpec): Acc {
+export function newAccFromSpec(s: AggSpec): Acc {
   if (
     s.plan === "mode" ||
     s.plan === "percentileDisc" ||
@@ -17882,7 +17884,7 @@ function newAccFromSpec(s: AggSpec): Acc {
 // the Rust `Acc: Clone`). Decimals are immutable (Decimal ops return fresh values) and the float fold
 // is a scalar running total, so only the collected slices below need a real copy; `cur` is a Value
 // (treated immutably by foldAcc/finalizeAcc).
-function cloneAcc(a: Acc): Acc {
+export function cloneAcc(a: Acc): Acc {
   // Ordered-set accumulators are never windowed (clone is the window-stage snapshot), but copy the
   // collected slices anyway so a clone never aliases the original.
   return {
@@ -17900,7 +17902,7 @@ function cloneAcc(a: Acc): Acc {
 // A decimal SUM/AVG fold charges size-scaled decimal_work against the running accumulator
 // (the `+` formula — spec/design/cost.md §3 "decimal_work"); MIN/MAX folds are direct Value
 // compares like the sort's and stay unmetered.
-function foldAcc(a: Acc, v: Value, m: Meter): void {
+export function foldAcc(a: Acc, v: Value, m: Meter): void {
   switch (a.plan) {
     case "countStar":
       a.count += 1n;
@@ -18034,7 +18036,7 @@ function foldAcc(a: Acc, v: Value, m: Meter): void {
 // add-then-remove is exact and order-independent). Every other accumulator is never un-folded — a
 // moving frame over SUM/AVG/MIN/MAX/float re-folds from scratch instead (decimal scale,
 // intermediate-overflow trap order, and float non-associativity make them unsafe to invert).
-function unfoldAcc(a: Acc, v: Value, _m: Meter): void {
+export function unfoldAcc(a: Acc, v: Value, _m: Meter): void {
   switch (a.plan) {
     case "countStar":
       a.count -= 1n;
@@ -18049,7 +18051,7 @@ function unfoldAcc(a: Acc, v: Value, _m: Meter): void {
 
 // finalizeAcc produces the aggregate's final value over the group. COUNT → its count (0 over
 // empty); SUM/MIN/MAX → NULL over an empty/all-NULL group; AVG → sum/count (NULL if count 0).
-function finalizeAcc(a: Acc): Value {
+export function finalizeAcc(a: Acc): Value {
   switch (a.plan) {
     case "countStar":
     case "count":
@@ -18129,7 +18131,7 @@ function finalizeAcc(a: Acc): Value {
 // order); percentileDisc → an actual value at 1-based row ceil(p·N); percentileCont → the
 // interpolated f64. The fraction range check (22003) fires here, after the NULL-fraction check and
 // before the empty-group check — matching PG.
-function finalizeOrderedSet(a: Acc): Value {
+export function finalizeOrderedSet(a: Acc): Value {
   const desc = a.osaDesc === true;
   if (a.plan === "mode") {
     const vals = a.osaVals!;
@@ -18195,7 +18197,7 @@ function finalizeOrderedSet(a: Acc): Value {
 // empty-group check; an empty/all-NULL group → NULL (the whole result, even for an array). For an
 // array fraction the result is an array with one percentile per element (a NULL element → a NULL
 // element), after every non-NULL element has passed the range check.
-function finalizePercentile(
+export function finalizePercentile(
   frac: Value | null | undefined,
   empty: boolean,
   compute: (p: number) => Value,
@@ -18226,7 +18228,7 @@ function finalizePercentile(
 
 // expectInterval returns the Interval of a buffered interval Value (an orderedSetContInterval group
 // only ever buffers intervals — the resolver gates the operand to interval).
-function expectInterval(v: Value): Interval {
+export function expectInterval(v: Value): Interval {
   if (v.kind !== "interval") throw new Error("percentile_cont(interval) buffered a non-interval");
   return v.iv;
 }
@@ -18235,7 +18237,7 @@ function expectInterval(v: Value): Interval {
 // to f64 (aggregates.md §13/§17). null / a NULL Value → null (a NULL fraction yields NULL). A numeric
 // value (the resolver restricts the fraction to a numeric family) widens via the IEEE / correctly-
 // rounded decimal cast. The range check (22003) is applied by the caller after this.
-function fractionToF64(frac: Value | null | undefined): number | null {
+export function fractionToF64(frac: Value | null | undefined): number | null {
   if (frac === null || frac === undefined || frac.kind === "null") return null;
   switch (frac.kind) {
     case "f64":
@@ -18254,7 +18256,7 @@ function fractionToF64(frac: Value | null | undefined): number | null {
 // ceil(p·N) (1-based), i.e. the smallest K with K/N ≥ p (PG orderedsetaggs.c). Caller guarantees
 // non-empty + the fraction in range. Reads vals non-destructively (returns the picked element by
 // reference, never removing it) so an array fraction can read it repeatedly. spec/design/aggregates.md §13.
-function percentileDiscAt(vals: Value[], p: number): Value {
+export function percentileDiscAt(vals: Value[], p: number): Value {
   const n = vals.length;
   // PG: rownum = ceil(p·N) (1-based), then the value at max(rownum, 1).
   const rownum = Math.ceil(p * n);
@@ -18267,7 +18269,7 @@ function percentileDiscAt(vals: Value[], p: number): Value {
 // between the two bracketing rows, in f64 with PG's exact operation order — bit-identical across
 // cores and to PG (spec/design/aggregates.md §13). Caller guarantees non-empty + the fraction in
 // range.
-function percentileContAt(floats: number[], p: number): number {
+export function percentileContAt(floats: number[], p: number): number {
   const n = floats.length;
   const pos = p * (n - 1);
   const first = Math.floor(pos);
@@ -18280,7 +18282,7 @@ function percentileContAt(floats: number[], p: number): number {
 }
 
 // dirCmp applies a WITHIN GROUP sort direction to a comparison result (DESC reverses).
-function dirCmp(c: number, desc: boolean): number {
+export function dirCmp(c: number, desc: boolean): number {
   return desc ? -c : c;
 }
 
@@ -18290,7 +18292,7 @@ function dirCmp(c: number, desc: boolean): number {
 // key bytes (a collated key is always text; an unmapped code point fails 0A000 at this deterministic
 // point, like the query ORDER BY). JS Array.prototype.sort is stable, so a comparator that returns 0
 // for collation-equal keys keeps them in scan order — deterministic and cross-core identical.
-function sortOsaVals(vals: Value[], collation: Collation | null, desc: boolean): void {
+export function sortOsaVals(vals: Value[], collation: Collation | null, desc: boolean): void {
   if (collation === null) {
     vals.sort((a, b) => dirCmp(valueCmp(a, b), desc));
     return;
@@ -18314,7 +18316,7 @@ function sortOsaVals(vals: Value[], collation: Collation | null, desc: boolean):
 // distinct values strictly before; percent_rank = (rank-1)/N; cume_dist = (#rows ≤ hyp + 1)/(N+1) —
 // PG's orderedsetaggs.c formulas exactly. Over an empty group: rank/dense_rank 1, percent_rank 0,
 // cume_dist 1.
-function finalizeHypothetical(
+export function finalizeHypothetical(
   plan: AggPlan,
   rows: Value[][],
   hyp: Value[],
@@ -18366,7 +18368,7 @@ function finalizeHypothetical(
 // hypoCmp compares a buffered key tuple a to the hypothetical row b by the WITHIN GROUP order
 // (aggregates.md §19): the first key whose comparison is non-equal decides. Each key honors its NULL
 // placement, direction, and collation (a collated text key can fail 0A000).
-function hypoCmp(a: Value[], b: Value[], sorts: KeySort[]): number {
+export function hypoCmp(a: Value[], b: Value[], sorts: KeySort[]): number {
   for (let i = 0; i < sorts.length; i++) {
     const ord = compareHypoKey(a[i]!, b[i]!, sorts[i]!);
     if (ord !== 0) return ord;
@@ -18377,7 +18379,7 @@ function hypoCmp(a: Value[], b: Value[], sorts: KeySort[]): number {
 // compareHypoKey compares one WITHIN GROUP key pair under its sort spec (NULL placement + direction +
 // collation), mirroring the query ORDER BY key comparison plus the collated-text path (aggregates.md
 // §19).
-function compareHypoKey(a: Value, b: Value, ks: KeySort): number {
+export function compareHypoKey(a: Value, b: Value, ks: KeySort): number {
   if (a.kind === "null" && b.kind === "null") return 0;
   if (a.kind === "null") return ks.nullsFirst ? -1 : 1;
   if (b.kind === "null") return ks.nullsFirst ? 1 : -1;
@@ -18393,7 +18395,7 @@ function compareHypoKey(a: Value, b: Value, ks: KeySort): number {
 // checkPercentileFraction is the percentile fraction range gate (aggregates.md §13): < 0, > 1, or
 // NaN is 22003 (numeric_value_out_of_range), matching PG's "percentile value … is not between 0 and
 // 1". Called per group at finalize, after the NULL-fraction check.
-function checkPercentileFraction(p: number): void {
+export function checkPercentileFraction(p: number): void {
   if (Number.isNaN(p) || p < 0 || p > 1) {
     throw engineError("numeric_value_out_of_range", `percentile value ${p} is not between 0 and 1`);
   }
@@ -18402,7 +18404,7 @@ function checkPercentileFraction(p: number): void {
 // percentileInputF64 widens a numeric value to f64 for percentile_cont (aggregates.md §13): integers
 // via Number(), decimals via the correctly-rounded Number(render()) cast (matching PG's
 // numeric→float8), floats unchanged. The resolver restricts the operand to a numeric family.
-function percentileInputF64(v: Value): number {
+export function percentileInputF64(v: Value): number {
   switch (v.kind) {
     case "int":
       return Number(v.int);
@@ -18425,7 +18427,7 @@ function percentileInputF64(v: Value): number {
 //      it reached ±Inf from finite inputs it is a finite-overflow 22003 (a final isFinite test is
 //      equivalent to a per-add one — finite + ±Inf cannot recover to finite; PG yields ±Inf, a
 //      documented divergence).
-function resolveFloatFold(a: Acc): number {
+export function resolveFloatFold(a: Acc): number {
   if (a.floatNaN) return NaN;
   if (a.floatPosInf && a.floatNegInf) return NaN;
   if (a.floatPosInf) return Infinity;
@@ -18436,7 +18438,7 @@ function resolveFloatFold(a: Acc): number {
 }
 
 // itemsHaveAggregate reports whether any select item contains an aggregate call.
-function itemsHaveAggregate(items: SelectItems): boolean {
+export function itemsHaveAggregate(items: SelectItems): boolean {
   if (items.kind === "all") return false;
   return items.items.some((it) => exprHasAggregate(it.expr));
 }
@@ -18446,7 +18448,7 @@ function itemsHaveAggregate(items: SelectItems): boolean {
 // an aggregate query (a whole-table aggregate if there is no GROUP BY), exactly as a top-level
 // aggregate would, so the window keys resolve against the grouped row. Used by both the inline-over
 // walk in exprHasAggregate and the WINDOW-clause scan that computes isAgg.
-function windowDefHasAggregate(wd: WindowDef): boolean {
+export function windowDefHasAggregate(wd: WindowDef): boolean {
   return wd.partition.some(exprHasAggregate) || wd.order.some((k) => exprHasAggregate(k.expr));
 }
 
@@ -18454,14 +18456,14 @@ function windowDefHasAggregate(wd: WindowDef): boolean {
 // AS (ORDER BY sum(x))`), which — like a top-level aggregate — makes the query an aggregate query
 // (spec/design/window.md §5.1). The entries are still named references at this point (the OVER-name
 // desugar runs later), so the WINDOW clause is scanned directly.
-function windowsHaveAggregate(windows: [string, WindowDef][]): boolean {
+export function windowsHaveAggregate(windows: [string, WindowDef][]): boolean {
   return windows.some(([, wd]) => windowDefHasAggregate(wd));
 }
 
 // isAggregateName reports whether name (case-insensitive) is a catalog aggregate, one of the
 // hand-resolved json[b]_object_agg[_unique] aggregates (no catalog row, B4), or an ordered-set
 // aggregate (mode/percentile_*, §13 — also not catalog rows, their result/arg mold is special).
-function isAggregateName(name: string): boolean {
+export function isAggregateName(name: string): boolean {
   const lname = name.toLowerCase();
   return (
     AGGREGATES.some((a) => a.surface.toLowerCase() === lname) ||
@@ -18473,7 +18475,7 @@ function isAggregateName(name: string): boolean {
 // objectAggClassify classifies a json[b]_object_agg[_unique] name → { asJson, unique }, else null.
 // These 2-argument aggregates are hand-resolved (the single-operand aggregate catalog can't express a
 // key/value pair), like jsonb_set among the scalar functions (json-sql-functions.md §4).
-function objectAggClassify(name: string): { asJson: boolean; unique: boolean } | null {
+export function objectAggClassify(name: string): { asJson: boolean; unique: boolean } | null {
   switch (name.toLowerCase()) {
     case "jsonb_object_agg":
       return { asJson: false, unique: false };
@@ -18492,14 +18494,14 @@ function objectAggClassify(name: string): { asJson: boolean; unique: boolean } |
 // surface (mode / percentile_cont / percentile_disc — spec/design/aggregates.md §13). These take a
 // WITHIN GROUP (ORDER BY …) clause and are resolved by resolveOrderedSetAggregate, intercepted before
 // the generic aggregate/scalar dispatch.
-function isOrderedSetAggregateName(name: string): boolean {
+export function isOrderedSetAggregateName(name: string): boolean {
   const lname = name.toLowerCase();
   return lname === "mode" || lname === "percentile_cont" || lname === "percentile_disc";
 }
 
 // astSubscriptExprs is the sub-expressions of a list of AST subscript specs (each index, or a
 // slice's present bounds) — for the Expr tree walkers (spec/design/array.md §6).
-function astSubscriptExprs(subs: SubscriptSpec[]): Expr[] {
+export function astSubscriptExprs(subs: SubscriptSpec[]): Expr[] {
   const out: Expr[] = [];
   for (const s of subs) {
     if (!s.isSlice) out.push(s.index);
@@ -18514,7 +18516,7 @@ function astSubscriptExprs(subs: SubscriptSpec[]): Expr[] {
 // exprHasAggregate reports whether an expression tree contains an AGGREGATE call anywhere. A
 // scalar-function call is not itself an aggregate but may CONTAIN one (abs(sum(x))), so its
 // arguments are walked.
-function exprHasAggregate(e: Expr): boolean {
+export function exprHasAggregate(e: Expr): boolean {
   switch (e.kind) {
     case "funcCall":
       // An aggregate name carrying OVER (inline or a named-window reference) is a WINDOW function,
@@ -18582,7 +18584,7 @@ function exprHasAggregate(e: Expr): boolean {
 
 // itemsHaveWindow reports whether any select item contains a window-function call (a funcCall
 // carrying OVER). A window query resolves its projection in window mode (spec/design/window.md §5.1).
-function itemsHaveWindow(items: SelectItems): boolean {
+export function itemsHaveWindow(items: SelectItems): boolean {
   if (items.kind === "all") return false;
   return items.items.some((it) => exprHasWindow(it.expr));
 }
@@ -18590,7 +18592,7 @@ function itemsHaveWindow(items: SelectItems): boolean {
 // orderByHasWindow reports whether any ORDER BY key is (or contains) a window function, so a query
 // whose only OVER call sits in the ORDER BY still sets up the window machinery (grammar.md §10,
 // window.md §5.1). An ordinal/column key carries no expression.
-function orderByHasWindow(keys: OrderKey[]): boolean {
+export function orderByHasWindow(keys: OrderKey[]): boolean {
   return keys.some((k) => k.expr !== null && exprHasWindow(k.expr));
 }
 
@@ -18599,7 +18601,7 @@ function orderByHasWindow(keys: OrderKey[]): boolean {
 // (abs(row_number() OVER ())), so the arguments are walked; a window call's own PARTITION BY /
 // ORDER BY may not contain a window function (rejected at resolve, 42P20), so they are not walked
 // here. A subquery is an independent query — a window inside it is the subquery's own.
-function exprHasWindow(e: Expr): boolean {
+export function exprHasWindow(e: Expr): boolean {
   switch (e.kind) {
     case "funcCall":
       return e.over != null || e.overName != null || e.args.some(exprHasWindow);
@@ -18660,7 +18662,7 @@ function exprHasWindow(e: Expr): boolean {
 // none (42P20 otherwise), and the base must not carry a frame (42P20). The three checks fire in
 // PostgreSQL's priority order: PARTITION, then ORDER, then frame. Returns the merged inline
 // definition (base = null).
-function extendWindow(base: WindowDef, ext: WindowDef, baseName: string): WindowDef {
+export function extendWindow(base: WindowDef, ext: WindowDef, baseName: string): WindowDef {
   if (ext.partition.length > 0) {
     throw engineError(
       "windowing_error",
@@ -18689,7 +18691,7 @@ function extendWindow(base: WindowDef, ext: WindowDef, baseName: string): Window
 // earlier entry (a self- or forward-reference is therefore "does not exist" — 42704), via
 // extendWindow. Every entry is resolved — even ones no OVER references — matching PostgreSQL's
 // whole-clause check.
-function resolveWindowClause(windows: [string, WindowDef][]): [string, WindowDef][] {
+export function resolveWindowClause(windows: [string, WindowDef][]): [string, WindowDef][] {
   const resolved: [string, WindowDef][] = [];
   for (const [name, def] of windows) {
     let r = def;
@@ -18705,7 +18707,7 @@ function resolveWindowClause(windows: [string, WindowDef][]): [string, WindowDef
 // lookupWindow finds a (resolved, base = null) window definition by name in `windows`,
 // case-insensitively, returning a structured clone (to avoid aliasing), or throws 42704
 // `window "<name>" does not exist`.
-function lookupWindow(windows: [string, WindowDef][], name: string): WindowDef {
+export function lookupWindow(windows: [string, WindowDef][], name: string): WindowDef {
   const found = windows.find(([n]) => n.toLowerCase() === name.toLowerCase());
   if (found === undefined) {
     throw engineError("undefined_object", `window "${name}" does not exist`);
@@ -18719,7 +18721,7 @@ function lookupWindow(windows: [string, WindowDef][], name: string): WindowDef {
 // onto the named base (extendWindow); an undefined name is 42704. After this every window call
 // carries an inline `over` (base = null), so resolution (S0–S4) handles named and inline windows
 // uniformly. Mutates `items`.
-function desugarItems(items: SelectItems, windows: [string, WindowDef][]): void {
+export function desugarItems(items: SelectItems, windows: [string, WindowDef][]): void {
   if (items.kind === "all") return;
   for (const it of items.items) {
     desugarNamedWindows(it.expr, windows);
@@ -18730,7 +18732,7 @@ function desugarItems(items: SelectItems, windows: [string, WindowDef][]): void 
 // `overName` with the matching WINDOW-clause definition (case-insensitively), throwing 42704 for an
 // undefined name. Mirrors Rust's desugar_named_windows exactly (leaves, subscripts, and subqueries
 // carry no top-level window ref to rewrite).
-function desugarNamedWindows(e: Expr, windows: [string, WindowDef][]): void {
+export function desugarNamedWindows(e: Expr, windows: [string, WindowDef][]): void {
   switch (e.kind) {
     case "funcCall":
       if (e.overName != null) {
@@ -18817,12 +18819,12 @@ function desugarNamedWindows(e: Expr, windows: [string, WindowDef][]): void {
 
 // NamedCheck is one statement-resolved CHECK constraint: its name (for the 23514 message)
 // and the resolved expression evaluated per candidate row.
-type NamedCheck = { name: string; node: RExpr };
+export type NamedCheck = { name: string; node: RExpr };
 
 // evalChecks evaluates a row's CHECK constraints in name order (constraints.md §4.4):
 // TRUE and NULL pass; the first FALSE aborts with 23514 and PG's message. Shared by the
 // INSERT and UPDATE write paths.
-function evalChecks(
+export function evalChecks(
   checks: NamedCheck[],
   relation: string,
   row: Row,
@@ -18845,7 +18847,7 @@ function evalChecks(
 // resolution: a subquery is 0A000, an aggregate call 42803, a bind parameter 42P02 — PG's
 // codes and messages (oracle-probed; PG interleaves these with resolution in parse order,
 // a documented micro-order divergence).
-function rejectCheckStructure(e: Expr): void {
+export function rejectCheckStructure(e: Expr): void {
   switch (e.kind) {
     case "scalarSubquery":
     case "exists":
@@ -18931,7 +18933,7 @@ function rejectCheckStructure(e: Expr): void {
 // with one more: it may NOT reference a column (it is computed before the row exists). Codes
 // match PostgreSQL (oracle-probed): a column reference / subquery is 0A000, an aggregate 42803,
 // a parameter 42P02.
-function rejectDefaultStructure(e: Expr): void {
+export function rejectDefaultStructure(e: Expr): void {
   switch (e.kind) {
     case "column":
     case "qualifiedColumn":
@@ -19022,7 +19024,7 @@ function rejectDefaultStructure(e: Expr): void {
 // one distinct column → <table>_<col>_check). Resolution already validated every
 // reference, so an unknown name is simply skipped; a qualified reference counts its column
 // like a bare one (oracle-probed).
-function checkReferencedColumns(e: Expr, columns: Column[]): number[] {
+export function checkReferencedColumns(e: Expr, columns: Column[]): number[] {
   const out: number[] = [];
   const note = (name: string): void => {
     const lower = name.toLowerCase();
@@ -19107,7 +19109,7 @@ function checkReferencedColumns(e: Expr, columns: Column[]): number[] {
 // AggSpec. Valid only in collect mode; in Forbidden mode (WHERE/ON/nested) it is 42803. The
 // operand resolves in a fresh Forbidden sub-context (a nested aggregate is 42803; its columns
 // resolve against the real row). The result type follows the PG widening (aggregates.md §3).
-function resolveAggregate(
+export function resolveAggregate(
   scope: Scope,
   e: { name: string; args: Expr[]; star: boolean; distinct: boolean; filter?: Expr | null },
   ag: AggCtx,
@@ -19207,7 +19209,7 @@ function resolveAggregate(
 // reference. The WITHIN GROUP key is the aggregate's operand (resolved with aggregates forbidden — a
 // nested aggregate is 42803); the parenthesized args are the per-group direct argument (the
 // percentile fraction; empty for mode).
-function resolveOrderedSetAggregate(
+export function resolveOrderedSetAggregate(
   scope: Scope,
   e: {
     name: string;
@@ -19336,7 +19338,7 @@ function resolveOrderedSetAggregate(
 // fraction (percentile_cont(ARRAY[…])) computes one percentile per element and returns an array (§18).
 // A non-numeric fraction or a wrong argument count matches no overload (42883); a NULL fraction yields
 // a NULL result at finalize.
-function resolveOsaFraction(
+export function resolveOsaFraction(
   scope: Scope,
   name: string,
   args: Expr[],
@@ -19370,7 +19372,7 @@ function resolveOsaFraction(
 
 // arrayIf returns Array(t) when isArray, else t — the result type of an ordered-set aggregate whose
 // direct argument is an array vs. a scalar fraction (aggregates.md §18).
-function arrayIf(t: ResolvedType, isArray: boolean): ResolvedType {
+export function arrayIf(t: ResolvedType, isArray: boolean): ResolvedType {
   return isArray ? { kind: "array", elem: t } : t;
 }
 
@@ -19378,7 +19380,7 @@ function arrayIf(t: ResolvedType, isArray: boolean): ResolvedType {
 // dense_rank / percent_rank / cume_dist used with WITHIN GROUP (spec/design/aggregates.md §19).
 // These names are ALSO window functions; the WITHIN GROUP clause routes them here instead of the
 // window path.
-function isHypotheticalSetName(name: string): boolean {
+export function isHypotheticalSetName(name: string): boolean {
   const lname = name.toLowerCase();
   return (
     lname === "rank" ||
@@ -19394,7 +19396,7 @@ function isHypotheticalSetName(name: string): boolean {
 // match (else 42883). Each key operand is buffered per row; each direct arg is evaluated per group
 // (it may reference grouping columns) and coerced to the key's type. Like the other ordered-set
 // aggregates, OVER is 0A000, DISTINCT is 42601, and it is valid only in a collecting context.
-function resolveHypotheticalSetAggregate(
+export function resolveHypotheticalSetAggregate(
   scope: Scope,
   e: {
     name: string;
@@ -19517,7 +19519,7 @@ function resolveHypotheticalSetAggregate(
 // must be the same scalar family (numeric Int/Decimal/Float each only match themselves — both float
 // kinds match each other since the value comparator orders them — so the buffered key tuple and the
 // hypothetical row compare meaningfully).
-function hypoArgCompatible(arg: ResolvedType, key: ResolvedType): boolean {
+export function hypoArgCompatible(arg: ResolvedType, key: ResolvedType): boolean {
   if (arg.kind === "null") return true;
   return (
     (arg.kind === "int" && key.kind === "int") ||
@@ -19540,7 +19542,7 @@ function hypoArgCompatible(arg: ResolvedType, key: ResolvedType): boolean {
 // integer (i32) whose bit (k-1-j) is 1 iff c_j is grouped away in the row's grouping set. The value
 // is computed per group row at execution from the grouping set's mask, so the call resolves to the
 // placeholder slot GROUPING_GS_BASE+index (rebased to its real trailing synthetic slot afterwards).
-function resolveGrouping(
+export function resolveGrouping(
   scope: Scope,
   e: { name: string; args: Expr[]; star: boolean },
   ag: AggCtx,
@@ -19585,7 +19587,7 @@ function resolveGrouping(
 // grouped, spec/design/window.md §5.1) it reads the real input row directly; in collect mode it
 // must be a grouping key — resolved to its synthetic-row slot (its position among the group keys)
 // — else 42803.
-function collectColumn(
+export function collectColumn(
   scope: Scope,
   ag: AggCtx,
   idx: number,
@@ -19599,12 +19601,12 @@ function collectColumn(
 }
 
 // noAggOverload is 42883 — an aggregate over an operand family it has no overload for.
-function noAggOverload(fn: string): EngineError {
+export function noAggOverload(fn: string): EngineError {
   return engineError("undefined_function", "no " + fn + " aggregate for that argument type");
 }
 
 // noFuncOverload is 42883 — a scalar function over argument types it has no overload for.
-function noFuncOverload(fn: string): EngineError {
+export function noFuncOverload(fn: string): EngineError {
   return engineError("undefined_function", "no " + fn + " function for those argument types");
 }
 
@@ -19612,7 +19614,7 @@ function noFuncOverload(fn: string): EngineError {
 // (row_number/rank/…). Data-driven over the catalog (WINDOWS). Such a function REQUIRES an OVER
 // clause — used without one it is 42809 (spec/design/window.md §7). The catalog aggregates double
 // as window functions but are not in WINDOWS, so they are still valid without OVER.
-function isWindowOnlyName(name: string): boolean {
+export function isWindowOnlyName(name: string): boolean {
   const lname = name.toLowerCase();
   return WINDOWS.some((w) => w.surface.toLowerCase() === lname);
 }
@@ -19621,7 +19623,7 @@ function isWindowOnlyName(name: string): boolean {
 // (spec/design/window.md §5.1). Valid only in a window query's projection (ag.window set);
 // anywhere else (WHERE / JOIN ON / HAVING / an aggregate query) it is 42P20. The call collects
 // into a WindowSpec and resolves to the synthetic slot base + windowIndex. S0: only row_number().
-function resolveWindowCall(
+export function resolveWindowCall(
   scope: Scope,
   e: { name: string; args: Expr[]; star: boolean; over: WindowDef; filter?: Expr | null },
   ag: AggCtx,
@@ -19843,7 +19845,7 @@ function resolveWindowCall(
 // is byte-identical to before. Any compound expression is materialized into windowKeys at the
 // placeholder slot WINDOW_KEY_BASE+k (rebased once the row layout is final). A key referencing an
 // enclosing query (a correlated window — clause names it) is the deferred follow-on (0A000).
-function windowKeySlot(rexpr: RExpr, clause: string, windowKeys: RExpr[]): number {
+export function windowKeySlot(rexpr: RExpr, clause: string, windowKeys: RExpr[]): number {
   if (rexprReferencesOuter(rexpr, 0)) {
     throw engineError("feature_not_supported", `${clause} may not reference an outer query column`);
   }
@@ -19861,7 +19863,7 @@ function windowKeySlot(rexpr: RExpr, clause: string, windowKeys: RExpr[]): numbe
 // aggregate key keeps its real slot; any compound key is materialized into windowKeys at a
 // WINDOW_KEY_BASE+k placeholder. A key referencing an enclosing-query column (a correlated window) is
 // 0A000; a window function inside a key is rejected by keyCtx (42P20).
-function resolveWindowDef(
+export function resolveWindowDef(
   scope: Scope,
   wd: WindowDef,
   keyCtx: AggCtx,
@@ -19910,7 +19912,7 @@ function resolveWindowDef(
 // ORDER BY (42P20); a RANGE value offset requires exactly one ORDER BY column (42P20) of an integer,
 // decimal, or float type (a timestamp/date key is the deferred D4 follow-on, any other type is
 // 0A000). A negative offset is 22013. Mirrors Rust's resolve_frame.
-function resolveFrame(f: WindowFrame, order: OrderSlot[], orderTypes: Type[]): ResolvedFrame {
+export function resolveFrame(f: WindowFrame, order: OrderSlot[], orderTypes: Type[]): ResolvedFrame {
   const isOffset = (b: FrameBound): boolean => b.kind === "preceding" || b.kind === "following";
   const hasOffset = isOffset(f.start) || isOffset(f.end);
   switch (f.mode) {
@@ -19966,7 +19968,7 @@ function resolveFrame(f: WindowFrame, order: OrderSlot[], orderTypes: Type[]): R
 
 // resolveIntBound resolves a ROWS/GROUPS frame bound: the offset of `n PRECEDING`/`n FOLLOWING` must
 // be a non-negative integer literal (22013 if negative; a non-literal/non-integer offset is 0A000).
-function resolveIntBound(b: FrameBound): ResolvedBound {
+export function resolveIntBound(b: FrameBound): ResolvedBound {
   const offsetOf = (e: Expr): Value => {
     if (e.kind === "literal" && e.literal.kind === "int") {
       const n = e.literal.int;
@@ -20001,7 +20003,7 @@ function resolveIntBound(b: FrameBound): ResolvedBound {
 // a float key takes an integer or decimal offset converted to f64 (PG's in_range_float*_float8 — the
 // offset is float8 for both f32 and f64 keys). The decimal→f64 conversion traps 22003 on overflow
 // (jed's float-cast rule); an int offset is always finite.
-function resolveRangeBound(b: FrameBound, kt: Type): ResolvedBound {
+export function resolveRangeBound(b: FrameBound, kt: Type): ResolvedBound {
   const offsetOf = (e: Expr): Value => {
     if (e.kind === "literal" && e.literal.kind === "int") {
       const n = e.literal.int;
@@ -20071,7 +20073,7 @@ function resolveRangeBound(b: FrameBound, kt: Type): ResolvedBound {
 // argFamily is the family a resolved type satisfies, for matching a catalog argFamilies slot.
 // null for the NULL family: an untyped NULL matches no *concrete* family (so abs(NULL)/sum(NULL)
 // find no overload — 42883), and only the wildcard "any" slot accepts it.
-function argFamily(t: ResolvedType): string | null {
+export function argFamily(t: ResolvedType): string | null {
   switch (t.kind) {
     case "int":
       return "integer";
@@ -20119,26 +20121,26 @@ function argFamily(t: ResolvedType): string | null {
 
 // familyMatches reports whether a resolved argument satisfies one catalog family slot. "any"
 // accepts everything (NULL included); a concrete family matches only its own type.
-function familyMatches(slot: string, t: ResolvedType): boolean {
+export function familyMatches(slot: string, t: ResolvedType): boolean {
   return slot === "any" || argFamily(t) === slot;
 }
 
 // isScalarFuncName reports whether name (lowercased) is a registered scalar function (catalog
 // kind === "function") — the data-driven replacement for the old hand-written known-name gate.
-function isScalarFuncName(name: string): boolean {
+export function isScalarFuncName(name: string): boolean {
   return OPERATORS.some((o) => o.kind === "function" && o.name === name);
 }
 
 // isVariadicFuncName reports whether name (lowercased) is a VARIADIC scalar function
 // (array-functions.md §12) — a kind === "function" row with `variadic` set (num_nulls/num_nonnulls).
-function isVariadicFuncName(name: string): boolean {
+export function isVariadicFuncName(name: string): boolean {
   return OPERATORS.some((o) => o.kind === "function" && o.variadic && o.name === name);
 }
 
 // lookupScalarOverload returns the matched scalar-function overload row for name over the resolved
 // argument types: the kind === "function" catalog row whose argFamilies agree by arity + per-slot
 // family. undefined ⇒ no overload (42883). make_interval resolves on its own path (§11).
-function lookupScalarOverload(name: string, tys: ResolvedType[]): OperatorDesc | undefined {
+export function lookupScalarOverload(name: string, tys: ResolvedType[]): OperatorDesc | undefined {
   return OPERATORS.find(
     (o) =>
       o.kind === "function" &&
@@ -20150,7 +20152,7 @@ function lookupScalarOverload(name: string, tys: ResolvedType[]): OperatorDesc |
 
 // resolvedScalarType is the concrete ScalarType carried by a numeric resolved type (for the
 // "promoted" / "same_as_input" result rules). Only reached for the numeric families they admit.
-function resolvedScalarType(t: ResolvedType): ScalarType {
+export function resolvedScalarType(t: ResolvedType): ScalarType {
   switch (t.kind) {
     case "int":
     case "float":
@@ -20165,7 +20167,7 @@ function resolvedScalarType(t: ResolvedType): ScalarType {
 // scalarResultType is the result ScalarType of a scalar function from its catalog result code
 // (functions.md §9): "promoted" = the (single) operand's own type; otherwise the code is a literal
 // scalar-type id (e.g. "decimal", "f64", "interval", "i16", "timestamptz", "uuid").
-function scalarResultType(code: string, tys: ResolvedType[]): ScalarType {
+export function scalarResultType(code: string, tys: ResolvedType[]): ScalarType {
   if (code === "promoted") return resolvedScalarType(tys[0]!);
   const ty = scalarTypeFromName(code);
   if (ty === undefined) throw new Error("scalarResultType: unknown result code " + code);
@@ -20174,14 +20176,14 @@ function scalarResultType(code: string, tys: ResolvedType[]): ScalarType {
 
 // aggregateHasStar reports whether aggregate surface (lowercased) has a COUNT(*)-style star
 // overload — only COUNT does. The data-driven replacement for the special-cased star arm.
-function aggregateHasStar(surface: string): boolean {
+export function aggregateHasStar(surface: string): boolean {
   return AGGREGATES.some((a) => a.surface.toLowerCase() === surface && a.arg === "star");
 }
 
 // lookupAggregateOverload returns the matched aggregate overload row for surface (lowercased) over
 // a single operand of resolved type t: the arg === "expr" catalog row whose lone argFamilies slot
 // matches. undefined ⇒ no overload (42883, e.g. SUM(text)). MIN/MAX/COUNT take "any".
-function lookupAggregateOverload(surface: string, t: ResolvedType): AggregateDesc | undefined {
+export function lookupAggregateOverload(surface: string, t: ResolvedType): AggregateDesc | undefined {
   return AGGREGATES.find(
     (a) =>
       a.surface.toLowerCase() === surface &&
@@ -20196,7 +20198,7 @@ function lookupAggregateOverload(surface: string, t: ResolvedType): AggregateDes
 // widening — aggregates.md §3). The plan is the aggregate's kernel id (fold/finalize switch on it);
 // selecting it from the registered result code keeps the name gate + overload validation
 // data-driven while the kernel stays hand-written (§5). surface is the lowercased call name.
-function aggregatePlan(
+export function aggregatePlan(
   surface: string,
   code: string,
   t: ResolvedType,
@@ -20235,14 +20237,14 @@ function aggregatePlan(
 
 // JsonAggFlags carries the two B4 flags fixed at resolve (asJson → json result type; strict → skip a
 // NULL-valued row), threaded onto the AggSpec / WindowSpec so newAcc can build the matching Acc.
-type JsonAggFlags = { asJson: boolean; strict: boolean };
+export type JsonAggFlags = { asJson: boolean; strict: boolean };
 
 // resolveFuncCall resolves a function call: an aggregate (COUNT/SUM/MIN/MAX/AVG), a scalar
 // function (abs/round/…, spec/design/functions.md §9), the named/defaulted make_interval (§11), or
 // 42883 for any other name. Aggregates and scalar functions share the call syntax (grammar.md §17);
 // they are distinguished here. Named notation (name => value) is valid only for a function that
 // declares parameter names (make_interval); on every other function it is 42883.
-function resolveFuncCall(
+export function resolveFuncCall(
   scope: Scope,
   e: {
     name: string;
@@ -20462,7 +20464,7 @@ function resolveFuncCall(
 // type (text / text[]) lives in the surrounding ResolvedType. Both are STRICT (text args, NULL
 // propagates). A constant pattern is precompiled once here (regex.md §5) — but only when the
 // case-insensitive `i` flag is statically known (the flags arg absent or a constant).
-function resolveRegexFunc(
+export function resolveRegexFunc(
   scope: Scope,
   e: { name: string; args: Expr[]; star: boolean },
   ag: AggCtx,
@@ -20566,7 +20568,7 @@ function resolveRegexFunc(
 
 // rejectNamed throws 42883 if any argument is named — named notation is valid only for a function
 // that declares parameter names (PG's "function ... has no parameter named X").
-function rejectNamed(name: string, argNames: (string | null)[]): void {
+export function rejectNamed(name: string, argNames: (string | null)[]): void {
   for (const n of argNames) {
     if (n !== null) {
       throw engineError(
@@ -20580,14 +20582,14 @@ function rejectNamed(name: string, argNames: (string | null)[]): void {
 // scalarFuncDesc returns the lone scalar-function catalog row of this name (e.g. make_interval),
 // reading named/default/family metadata for named-notation resolution (functions.md §11) from the
 // generated catalog table (CLAUDE.md §5) rather than re-hardcoding it.
-function scalarFuncDesc(name: string): OperatorDesc | undefined {
+export function scalarFuncDesc(name: string): OperatorDesc | undefined {
   return OPERATORS.find((o) => o.kind === "function" && o.name === name);
 }
 
 // scalarFuncDescArity is scalarFuncDesc restricted to a given arity — for a named function
 // overloaded on arity (make_timestamptz: a 6-arg session-zone form + a 7-arg explicit-zone form),
 // so named-notation resolution reads the right slot list (functions.md §11).
-function scalarFuncDescArity(name: string, arity: number): OperatorDesc | undefined {
+export function scalarFuncDescArity(name: string, arity: number): OperatorDesc | undefined {
   return OPERATORS.find((o) => o.kind === "function" && o.name === name && o.arity === arity);
 }
 
@@ -20595,7 +20597,7 @@ function scalarFuncDescArity(name: string, arity: number): OperatorDesc | undefi
 // given family, so it adapts (functions.md §11): an integer slot offers i64, a float slot offers
 // f64 (so a bare 0/1.5 becomes f64 for secs), a text slot offers text (so a bare 'UTC' adapts to
 // the make_timestamptz timezone slot). Other families offer no hint (null).
-function familyHint(family: string): ScalarType | null {
+export function familyHint(family: string): ScalarType | null {
   if (family === "integer") return "i64";
   if (family === "float") return "f64";
   if (family === "text") return "text";
@@ -20605,7 +20607,7 @@ function familyHint(family: string): ScalarType | null {
 // defaultExpr materializes a catalog DEFAULT (an integer-literal string, verify.rb-checked) as an
 // Expr so an omitted trailing argument resolves through the normal literal path — adapting to its
 // slot's family (e.g. "0" → f64 for secs). functions.md §11.
-function defaultExpr(lit: string): Expr {
+export function defaultExpr(lit: string): Expr {
   return { kind: "literal", literal: { kind: "int", int: BigInt(lit) } };
 }
 
@@ -20614,7 +20616,7 @@ function defaultExpr(lit: string): Expr {
 // + DEFAULTs, functions.md §11). Returns the positional Expr array of length desc.arity. Errors:
 // 42601 a positional arg after a named one (also caught at parse) or a duplicated name; 42883 an
 // unknown parameter name, too many arguments, or a missing non-defaulted slot (no overload).
-function normalizeNamedArgs(desc: OperatorDesc, args: Expr[], argNames: (string | null)[]): Expr[] {
+export function normalizeNamedArgs(desc: OperatorDesc, args: Expr[], argNames: (string | null)[]): Expr[] {
   const arity = desc.arity;
   const slots: (Expr | null)[] = new Array(arity).fill(null);
   const namesEmpty = argNames.length === 0;
@@ -20662,7 +20664,7 @@ function normalizeNamedArgs(desc: OperatorDesc, args: Expr[], argNames: (string 
 // defaults onto the seven slots, resolve each with its declared family as the type hint (so a bare
 // numeric literal adapts to the f64 secs slot), and emit a make_interval node. The arguments
 // keep their families (no promotion); a wrong family in a slot is 42883.
-function resolveMakeInterval(
+export function resolveMakeInterval(
   scope: Scope,
   e: { name: string; args: Expr[]; argNames: (string | null)[]; star: boolean },
   ag: AggCtx,
@@ -20696,7 +20698,7 @@ function resolveMakeInterval(
 // catalog row then drives named-notation normalization. Each slot resolves with its declared family
 // as the type hint (a bare numeric literal adapts to the f64 sec slot, a bare string to the text
 // timezone slot); a wrong family in a slot is 42883.
-function resolveMakeTimestamp(
+export function resolveMakeTimestamp(
   scope: Scope,
   name: string, // "make_timestamp" | "make_timestamptz"
   e: { name: string; args: Expr[]; argNames: (string | null)[]; star: boolean },
@@ -20745,7 +20747,7 @@ function resolveMakeTimestamp(
 // correctly-rounded multiply, rounded half-away-from-zero to a bigint (the engine's one mode —
 // float.md §6, via floatToIntHalfAway). A non-finite or out-of-i64-range product traps 22008
 // (interval out of range), matching PG and the other cores.
-function f64ToMicros(secs: number): bigint {
+export function f64ToMicros(secs: number): bigint {
   const p = secs * 1_000_000;
   if (!Number.isFinite(p)) throw engineError("datetime_field_overflow", "interval out of range");
   const r = floatToIntHalfAway(p); // bigint, half-away-from-zero
@@ -20759,7 +20761,7 @@ function f64ToMicros(secs: number): bigint {
 // Unlike an aggregate it is legal in any context, so its arguments resolve in the SAME ag
 // context (a nested aggregate is still collected in a projection and 42803 in WHERE). The
 // overload is picked by the argument families; no match is 42883. spec/design/functions.md §9.
-function resolveScalarFunc(
+export function resolveScalarFunc(
   scope: Scope,
   e: { name: string; args: Expr[]; star: boolean },
   ag: AggCtx,
@@ -20806,7 +20808,7 @@ function resolveScalarFunc(
 }
 
 // scalarFuncNode builds a resolved scalar-function node + its public type.
-function scalarFuncNode(
+export function scalarFuncNode(
   func: ScalarFuncName,
   args: RExpr[],
   result: ScalarType,
@@ -20823,7 +20825,7 @@ function scalarFuncNode(
 // spread of trailing arguments OR (with the VARIADIC keyword) a single array passed directly.
 // Non-strict (null = "none"): the node carries no blanket NULL short-circuit. The result type is the
 // catalog `result` (i32 here), independent of the arguments.
-function resolveVariadicFunc(
+export function resolveVariadicFunc(
   scope: Scope,
   e: { name: string; args: Expr[]; star: boolean; variadic: boolean },
   ag: AggCtx,
@@ -20896,7 +20898,7 @@ function resolveVariadicFunc(
 
 // jsonBuildClassify classifies a VARIADIC json/jsonb builder name → { buildKind, json }, or null for
 // the count functions (num_nulls/num_nonnulls keep RExpr "variadic"). json-sql-functions.md §2.
-function jsonBuildClassify(name: string): { buildKind: JsonBuildKind; json: boolean } | null {
+export function jsonBuildClassify(name: string): { buildKind: JsonBuildKind; json: boolean } | null {
   switch (name) {
     case "jsonb_build_array":
       return { buildKind: "array", json: false };
@@ -20920,7 +20922,7 @@ function jsonBuildClassify(name: string): { buildKind: JsonBuildKind; json: bool
 
 // isArrayFuncName reports whether name (lowercased) is a polymorphic array function — a
 // kind === "function" catalog row whose argFamilies mention anyarray/anyelement. Data-driven.
-function isArrayFuncName(name: string): boolean {
+export function isArrayFuncName(name: string): boolean {
   return OPERATORS.some(
     (o) =>
       o.kind === "function" &&
@@ -20935,7 +20937,7 @@ function isArrayFuncName(name: string): boolean {
 // The ScalarType of a scalar resolved type, or null for a container/null type (composite / array /
 // range / json / null). Used by the element-wise array→array cast resolver (spec/design/array.md §7)
 // to decide whether the source element is a scalar with an admitted scalarPairCastable cast.
-function resolvedToScalar(t: ResolvedType): ScalarType | null {
+export function resolvedToScalar(t: ResolvedType): ScalarType | null {
   switch (t.kind) {
     case "int":
     case "float":
@@ -20968,7 +20970,7 @@ function resolvedToScalar(t: ResolvedType): ScalarType | null {
 // for the pairs an array element can take: numeric↔numeric, text→numeric/boolean/uuid, boolean⇄i32,
 // uuid⇄text, uuid⇄bytea. The identity (from === to) is handled by the caller. A pair outside this set
 // is rejected (42804) at resolve.
-function scalarPairCastable(from: ScalarType, to: ScalarType): boolean {
+export function scalarPairCastable(from: ScalarType, to: ScalarType): boolean {
   const numeric = (t: ScalarType) => isInteger(t) || isDecimal(t) || isFloat(t);
   if (numeric(from) && numeric(to)) return true;
   if (isText(from) && (numeric(to) || isBool(to) || isUuid(to))) return true;
@@ -20979,7 +20981,7 @@ function scalarPairCastable(from: ScalarType, to: ScalarType): boolean {
   return false;
 }
 
-function resolvedTypeEqual(a: ResolvedType, b: ResolvedType): boolean {
+export function resolvedTypeEqual(a: ResolvedType, b: ResolvedType): boolean {
   if (a.kind !== b.kind) return false;
   if (a.kind === "int" || a.kind === "float") return a.ty === (b as { ty: ScalarType }).ty;
   if (a.kind === "array" || a.kind === "range")
@@ -20999,7 +21001,7 @@ function resolvedTypeEqual(a: ResolvedType, b: ResolvedType): boolean {
 // argument types, returning { elem, matched }. When matched, elem is null if every polymorphic arg was
 // an untyped NULL (ELEM undeterminable). Three passes: anyarray (binds ELEM := the element type),
 // anyelement (may precede its binding array — array_prepend), then concrete family slots.
-function matchPoly(
+export function matchPoly(
   slots: readonly string[],
   tys: ResolvedType[],
 ): { elem: ResolvedType | null; matched: boolean } {
@@ -21054,7 +21056,7 @@ function matchPoly(
 // polyResultType is the result ResolvedType of an array function from its catalog result code and the
 // bound ELEM: anyarray → ELEM[], anyelement → ELEM (both 42P18 if ELEM is undeterminable); any other
 // code is a concrete scalar id (i32, text).
-function polyResultType(code: string, elem: ResolvedType | null): ResolvedType {
+export function polyResultType(code: string, elem: ResolvedType | null): ResolvedType {
   if (code === "anyarray") {
     if (elem === null) throw indeterminatePoly();
     return { kind: "array", elem };
@@ -21082,7 +21084,7 @@ function polyResultType(code: string, elem: ResolvedType | null): ResolvedType {
 
 // indeterminatePoly is the 42P18 raised when an array function's polymorphic type cannot be
 // determined because every polymorphic argument was an untyped NULL (array_append(NULL, NULL)).
-function indeterminatePoly(): EngineError {
+export function indeterminatePoly(): EngineError {
   return engineError(
     "indeterminate_datatype",
     "could not determine polymorphic type because input has type unknown",
@@ -21093,7 +21095,7 @@ function indeterminatePoly(): EngineError {
 // (array-functions.md §2): the bound array element type is threaded back as the ctx when re-resolving
 // the polymorphic args, so a bare integer/decimal literal element adapts (with range-checking) to it.
 // null for a composite/array/NULL element.
-function elemScalarHint(t: ResolvedType): ScalarType | null {
+export function elemScalarHint(t: ResolvedType): ScalarType | null {
   switch (t.kind) {
     case "int":
     case "float":
@@ -21134,7 +21136,7 @@ function elemScalarHint(t: ResolvedType): ScalarType | null {
 // re-resolves the polymorphic-slot arguments with it as the ctx, so an untyped literal element (or an
 // ARRAY[…] constructor argument) adapts to the array's element type, with a range check. The kernel id
 // is the name; NULL handling lives in the eval kernel.
-function resolveArrayFunc(
+export function resolveArrayFunc(
   scope: Scope,
   e: { name: string; args: Expr[]; star: boolean },
   ag: AggCtx,
@@ -21184,7 +21186,7 @@ function resolveArrayFunc(
 // isRangeFuncName reports whether name (lowercased) is a polymorphic range function — a
 // kind === "function" catalog row whose argFamilies mention anyrange (range-functions.md §1).
 // Data-driven, so a new range-function row wires here without touching this gate.
-function isRangeFuncName(name: string): boolean {
+export function isRangeFuncName(name: string): boolean {
   return OPERATORS.some(
     (o) => o.kind === "function" && o.name === name && o.argFamilies.some((f) => f === "anyrange"),
   );
@@ -21192,7 +21194,7 @@ function isRangeFuncName(name: string): boolean {
 
 // rangeFuncId is the kernel id for range accessor name (each is single-arity, so the name selects
 // the kernel). Total over the catalog's range-function names (isRangeFuncName gates the call).
-function rangeFuncId(name: string): RangeFuncName {
+export function rangeFuncId(name: string): RangeFuncName {
   switch (name) {
     case "lower":
     case "upper":
@@ -21213,7 +21215,7 @@ function rangeFuncId(name: string): RangeFuncName {
 // range keeps its range type and ignores the scalar hint). A text/NULL argument folds case ("casing",
 // result text); a range argument is the bound accessor ("rangeFunc", result the element type);
 // anything else is 42883 (no overload).
-function resolveLowerUpper(
+export function resolveLowerUpper(
   scope: Scope,
   name: string,
   e: { name: string; args: Expr[] },
@@ -21242,7 +21244,7 @@ function resolveLowerUpper(
 // of value: timestamptz → timestamp (render the instant locally) and timestamp → timestamptz
 // (interpret the wall clock in the zone). Any other value family — or an untyped/NULL value, which
 // cannot pick an overload — is 42883.
-function resolveTimezone(
+export function resolveTimezone(
   scope: Scope,
   e: { name: string; args: Expr[] },
   ag: AggCtx,
@@ -21276,7 +21278,7 @@ function resolveTimezone(
 // (text) is the 3-arg form, valid only for a timestamptz value. The result family is the value
 // family. A non-text unit/zone, a non-datetime value, or the 3-arg form on a non-timestamptz value is
 // 42883 (a date value also has no overload — jed has no implicit date->timestamp cast).
-function resolveDateTrunc(
+export function resolveDateTrunc(
   scope: Scope,
   e: { name: string; args: Expr[] },
   ag: AggCtx,
@@ -21308,7 +21310,7 @@ function resolveDateTrunc(
 // with no anyelement arg, so there is no element-hint literal adaptation. lower/upper resolve to ELEM
 // (the bound type), the rest to boolean. The kernel id is the name; NULL handling lives in the eval
 // kernel.
-function resolveRangeFunc(
+export function resolveRangeFunc(
   scope: Scope,
   e: { name: string; args: Expr[]; star: boolean },
   ag: AggCtx,
@@ -21349,7 +21351,7 @@ function resolveRangeFunc(
 // numrange/…). The constructor functions are the only ones whose name is a range type name, so
 // rangeByName resolving is exactly the gate — data-driven over the RANGES table, no hand-written
 // name list.
-function isRangeCtorName(name: string): boolean {
+export function isRangeCtorName(name: string): boolean {
   return rangeByName(name) !== undefined;
 }
 
@@ -21359,7 +21361,7 @@ function isRangeCtorName(name: string): boolean {
 // decimal element; a decimal to a decimal element; an already-temporal value to its own element;
 // and a string literal/text to a temporal element (parsed at eval). Anything else is no overload
 // (42883).
-function rangeBoundAssignable(t: ResolvedType, elem: ScalarType): boolean {
+export function rangeBoundAssignable(t: ResolvedType, elem: ScalarType): boolean {
   switch (t.kind) {
     case "null":
       return true;
@@ -21387,7 +21389,7 @@ function rangeBoundAssignable(t: ResolvedType, elem: ScalarType): boolean {
 // adapts to the element width, `'2024-01-01'` to a date), then is type-checked assignable to the
 // element; the optional third argument is the bounds-flags TEXT. The kernel (evalRangeCtor) does the
 // element coercion (assignment-style, 22003), the flags parse (42601 / 22000), and finalize.
-function resolveRangeCtor(
+export function resolveRangeCtor(
   scope: Scope,
   e: { name: string; args: Expr[]; star: boolean },
   ag: AggCtx,
@@ -21424,7 +21426,7 @@ function resolveRangeCtor(
 }
 
 // groupingErrorColumn is the 42803 for a non-aggregated column with no GROUP BY.
-function groupingErrorColumn(name: string): EngineError {
+export function groupingErrorColumn(name: string): EngineError {
   return engineError(
     "grouping_error",
     "column " + name + " must appear in the GROUP BY clause or be used in an aggregate function",
@@ -21453,7 +21455,7 @@ function groupingErrorColumn(name: string): EngineError {
 // `cte` is set (to the CTE list index) when this relation is a reference to a CTE
 // (spec/design/cte.md) rather than a base table — its `table` is the binding's synthetic relation
 // and exec delivers its rows from the CteCtx. Undefined for a base table / SRF / pseudo-relation.
-type ScopeRel = {
+export type ScopeRel = {
   label: string;
   table: Table;
   offset: number;
@@ -21471,16 +21473,16 @@ type ScopeRel = {
 // §26): level === 0 is a LOCAL column of this query (a flat index into the joined row); level >= 1
 // is a correlated OUTER reference to an enclosing query (level hops outward, index the flat column
 // index within that ancestor's row).
-type Resolved = { level: number; index: number };
+export type Resolved = { level: number; index: number };
 
 // MergeCol is a USING/NATURAL merged column (spec/design/grammar.md §15): `name` is the (lowercased)
 // join column and `index` the flat row index a bare reference resolves to — the surviving side (the
 // left column for INNER/LEFT, the right for RIGHT; FULL JOIN USING, a COALESCE, is deferred 0A000).
 // Both underlying copies are recorded in the scope's `hidden` set.
-type MergeCol = { name: string; index: number };
+export type MergeCol = { name: string; index: number };
 
 // outerOf lifts a parent-scope resolution into the child's frame: one more hop outward.
-function outerOf(r: Resolved): Resolved {
+export function outerOf(r: Resolved): Resolved {
   return { level: r.level + 1, index: r.index };
 }
 
@@ -21489,7 +21491,7 @@ function outerOf(r: Resolved): Resolved {
 // (rels[k+1]), in LEFT order with each name taken once (its first occurrence). An empty result
 // degenerates the join to a CROSS join. (A merged column on the left keeps its underlying name, so a
 // re-merge via a NATURAL chain is found here too.)
-function naturalCommonCols(rels: ScopeRel[], seg: number, k: number): string[] {
+export function naturalCommonCols(rels: ScopeRel[], seg: number, k: number): string[] {
   const right = rels[k + 1]!;
   const seen = new Set<string>();
   const out: string[] = [];
@@ -21508,7 +21510,7 @@ function naturalCommonCols(rels: ScopeRel[], seg: number, k: number): string[] {
 // relOfIndex returns the [label, column-name] of the relation owning a flat row index — used to
 // synthesize a USING/NATURAL join predicate's qualified column references (spec/design/grammar.md
 // §15). The index is known valid (resolution produced it), so the scan always finds an owner.
-function relOfIndex(rels: ScopeRel[], idx: number): [string, string] {
+export function relOfIndex(rels: ScopeRel[], idx: number): [string, string] {
   for (const r of rels) {
     const n = r.table.columns.length;
     if (idx >= r.offset && idx < r.offset + n) return [r.label, r.table.columns[idx - r.offset]!.name];
@@ -21516,7 +21518,7 @@ function relOfIndex(rels: ScopeRel[], idx: number): [string, string] {
   throw new Error("USING merge index out of range");
 }
 
-class Scope {
+export class Scope {
   rels: ScopeRel[];
   // parent is the enclosing query's scope, for correlated resolution (null at top level).
   parent: Scope | null;
@@ -21704,22 +21706,22 @@ class Scope {
 }
 
 // undefinedColumn is 42703 — a column name that no relation in scope defines.
-function undefinedColumn(name: string): EngineError {
+export function undefinedColumn(name: string): EngineError {
   return engineError("undefined_column", "column does not exist: " + name);
 }
 
 // ambiguousColumn is 42702 — a bare column name that more than one relation in scope defines.
-function ambiguousColumn(name: string): EngineError {
+export function ambiguousColumn(name: string): EngineError {
   return engineError("ambiguous_column", "column reference " + name + " is ambiguous");
 }
 
 // missingFromEntry is 42P01 — a qualifier that names no relation in the FROM clause.
-function missingFromEntry(qualifier: string): EngineError {
+export function missingFromEntry(qualifier: string): EngineError {
   return engineError("undefined_table", "missing FROM-clause entry for table " + qualifier);
 }
 
 // resolvedTypeOf is the resolved (static) type of a column of scalar type ty.
-function resolvedTypeOf(ty: ScalarType): ResolvedType {
+export function resolvedTypeOf(ty: ScalarType): ResolvedType {
   if (isText(ty)) return { kind: "text" };
   if (isBool(ty)) return { kind: "bool" };
   if (isDecimal(ty)) return { kind: "decimal" };
@@ -21740,7 +21742,7 @@ function resolvedTypeOf(ty: ScalarType): ResolvedType {
 // resolvedTypeOf, or a composite resolved to a CompositeRType (its name + the resolved field types,
 // recursing) against the database's composite-type catalog (spec/design/composite.md §5). The
 // composite reference is guaranteed to resolve (CREATE TYPE / the two-pass load validated it).
-function resolvedTypeOfCol(ty: Type, db: Engine): ResolvedType {
+export function resolvedTypeOfCol(ty: Type, db: Engine): ResolvedType {
   if (ty.kind === "scalar") return resolvedTypeOf(ty.scalar);
   if (ty.kind === "array") return { kind: "array", elem: resolvedTypeOfCol(ty.elem, db) };
   if (ty.kind === "range") return { kind: "range", elem: resolvedTypeOfCol(ty.elem, db) };
@@ -21767,7 +21769,7 @@ function resolvedTypeOfCol(ty: Type, db: Engine): ResolvedType {
 // timestamptz only to a timestamptz column (the two never cross — they do not even compare,
 // timestamp.md), and a NULL-typed projection to any column (a NOT NULL target then traps 23502
 // per row). A non-assignable pair is a 42804.
-function assignableTo(t: ResolvedType, colTy: ScalarType): boolean {
+export function assignableTo(t: ResolvedType, colTy: ScalarType): boolean {
   switch (t.kind) {
     case "null":
       return true;
@@ -21831,11 +21833,11 @@ function assignableTo(t: ResolvedType, colTy: ScalarType): boolean {
 // Outcome columnTypes — the `# types:` directive's assertion surface (spec/design/conformance.md
 // §7). Same names as the 42804 message (rtName): the exact integer width, the unconstrained
 // "decimal".
-function typeNames(ts: ResolvedType[]): string[] {
+export function typeNames(ts: ResolvedType[]): string[] {
   return ts.map(rtName);
 }
 
-function rtName(t: ResolvedType): string {
+export function rtName(t: ResolvedType): string {
   switch (t.kind) {
     case "int":
       return canonicalName(t.ty);
@@ -21887,7 +21889,7 @@ function rtName(t: ResolvedType): string {
 // resolvedRangeElementScalar returns the scalar element type of a resolved range element. A range's
 // element is always one of the six scalar subtypes; undefined for anything else (never a valid
 // range). Used to name a range and to build its codec.
-function resolvedRangeElementScalar(elem: ResolvedType): ScalarType | undefined {
+export function resolvedRangeElementScalar(elem: ResolvedType): ScalarType | undefined {
   switch (elem.kind) {
     case "int":
       return elem.ty;
@@ -21917,7 +21919,7 @@ function resolvedRangeElementScalar(elem: ResolvedType): ScalarType | undefined 
 // { recursive: false } when the body does not reference name (an ordinary CTE, even under
 // RECURSIVE); otherwise it validates the recursive shape and returns { recursive: true, unionAll },
 // or throws (42P19 for a malformed recursion, 0A000 for a deferred shape).
-function analyzeRecursiveCte(
+export function analyzeRecursiveCte(
   name: string,
   body: QueryExpr,
 ): { recursive: boolean; unionAll: boolean } {
@@ -21963,7 +21965,7 @@ function analyzeRecursiveCte(
 // relation, not on the nullable side of an outer join; the term must contain no aggregate. The
 // checks fire in PostgreSQL's order — a self-reference in a bad CONTEXT (a sublink, an outer join)
 // is reported as that context even when a valid FROM reference also exists.
-function validateRecursiveTerm(name: string, sel: Select): void {
+export function validateRecursiveTerm(name: string, sel: Select): void {
   if (countSublinkSelfRefs(sel, name) >= 1) {
     throw engineError(
       "invalid_recursion",
@@ -22001,14 +22003,14 @@ function validateRecursiveTerm(name: string, sel: Select): void {
 // body or a data-modifying primary (spec/design/writable-cte.md). Such a statement runs through the
 // writable-CTE orchestrator (the read pin + lexical-order, all-or-nothing execution); a pure-query
 // WITH keeps the runWith path.
-function withHasDml(wq: WithQuery): boolean {
+export function withHasDml(wq: WithQuery): boolean {
   return cteBodyIsDataModifying(wq.body) || wq.ctes.some((c) => cteBodyIsDataModifying(c.body));
 }
 
 // cteModes computes each CTE binding's evaluation mode (spec/design/cte.md §3, writable-cte.md §3): a
 // RECURSIVE or data-modifying CTE is ALWAYS materialized; otherwise a MATERIALIZED hint or >=2
 // references → materialize, else inline.
-function cteModes(bindings: CteBinding[]): CteMode[] {
+export function cteModes(bindings: CteBinding[]): CteMode[] {
   return bindings.map((b) => {
     if (b.recursive !== null || b.source.kind === "dml") return "materialize";
     if (b.hint === true) return "materialize";
@@ -22020,7 +22022,7 @@ function cteModes(bindings: CteBinding[]): CteMode[] {
 // addOutcomeCost adds extra cost to an outcome (the writable-CTE orchestrator folds the
 // materialization cost of the data-modifying / query CTEs into the primary's result —
 // spec/design/writable-cte.md §8).
-function addOutcomeCost(outcome: Outcome, extra: bigint): Outcome {
+export function addOutcomeCost(outcome: Outcome, extra: bigint): Outcome {
   return { ...outcome, cost: outcome.cost + extra };
 }
 
@@ -22029,7 +22031,7 @@ function addOutcomeCost(outcome: Outcome, extra: bigint): Outcome {
 // to the query counter; a data-modifying body counts the references in its source query / WHERE / SET
 // RHSs / ON CONFLICT / RETURNING sublinks. Used by the orchestrator to count the references a
 // NON-planned data-modifying part contributes to the inline-vs-materialize decision.
-function countCteRefsDml(body: CteBody, name: string): number {
+export function countCteRefsDml(body: CteBody, name: string): number {
   if (body.kind === "select" || body.kind === "setOp" || body.kind === "withExpr") {
     return countSelfRefsQuery(body, name);
   }
@@ -22058,14 +22060,14 @@ function countCteRefsDml(body: CteBody, name: string): number {
 }
 
 // countReturningRefs counts references to CTE `name` in a RETURNING item list's sublinks.
-function countReturningRefs(returning: SelectItems | null, name: string): number {
+export function countReturningRefs(returning: SelectItems | null, name: string): number {
   if (returning === null || returning.kind !== "list") return 0;
   return returning.items.reduce((a, it) => a + countSelfRefsExpr(it.expr, name), 0);
 }
 
 // countSelfRefsQuery counts self-references to name anywhere in a query expression (deep — FROM
 // relations at every nesting level plus expression sublinks).
-function countSelfRefsQuery(qe: QueryExpr, name: string): number {
+export function countSelfRefsQuery(qe: QueryExpr, name: string): number {
   if (qe.kind === "select") return countSelfRefsSelect(qe, name);
   // A nested WITH establishes its own CTE scope (spec/design/cte.md §7): an enclosing CTE name is
   // NOT visible inside it (a reference there resolves to a base table / the nested CTE, never the
@@ -22076,7 +22078,7 @@ function countSelfRefsQuery(qe: QueryExpr, name: string): number {
 
 // countSelfRefsSelect counts self-references in a SELECT: its FROM relations (deep) plus all of its
 // expressions' sublinks.
-function countSelfRefsSelect(s: Select, name: string): number {
+export function countSelfRefsSelect(s: Select, name: string): number {
   let n = 0;
   for (const tref of fromRelations(s)) n += countSelfRefsTableref(tref, name);
   for (const e of selectExprs(s)) n += countSelfRefsExpr(e, name);
@@ -22086,7 +22088,7 @@ function countSelfRefsSelect(s: Select, name: string): number {
 // countSelfRefsTableref counts self-references reachable through one FROM relation: a plain table
 // reference with the matching name (+1), a derived-table subquery (recurse), or a table-function's
 // / VALUES' argument exprs.
-function countSelfRefsTableref(tref: TableRef, name: string): number {
+export function countSelfRefsTableref(tref: TableRef, name: string): number {
   if (isPlainRelation(tref)) return tref.name.toLowerCase() === name ? 1 : 0;
   let n = 0;
   if (tref.subquery !== undefined) n += countSelfRefsQuery(tref.subquery, name);
@@ -22102,7 +22104,7 @@ function countSelfRefsTableref(tref: TableRef, name: string): number {
 // countSelfRefsExpr counts self-references inside an expression — only reachable through a sublink
 // (a subquery is an independent query whose own FROM may reference the CTE). The walk is exhaustive
 // (like exprHasAggregate).
-function countSelfRefsExpr(e: Expr, name: string): number {
+export function countSelfRefsExpr(e: Expr, name: string): number {
   switch (e.kind) {
     case "scalarSubquery":
     case "exists":
@@ -22173,7 +22175,7 @@ function countSelfRefsExpr(e: Expr, name: string): number {
 
 // countDirectFromSelfRefs counts self-references that are DIRECT FROM/JOIN relations of this SELECT
 // (a plain table ref matching the name). This is the only valid position for a recursive reference.
-function countDirectFromSelfRefs(s: Select, name: string): number {
+export function countDirectFromSelfRefs(s: Select, name: string): number {
   let n = 0;
   for (const tref of fromRelations(s)) {
     if (isPlainRelation(tref) && tref.name.toLowerCase() === name) n++;
@@ -22183,7 +22185,7 @@ function countDirectFromSelfRefs(s: Select, name: string): number {
 
 // countFromSubquerySelfRefs counts self-references nested inside a FROM-position subquery /
 // table-function args / VALUES of this SELECT (the deferred 0A000 shape).
-function countFromSubquerySelfRefs(s: Select, name: string): number {
+export function countFromSubquerySelfRefs(s: Select, name: string): number {
   let n = 0;
   for (const tref of fromRelations(s)) {
     if (!isPlainRelation(tref)) n += countSelfRefsTableref(tref, name);
@@ -22193,7 +22195,7 @@ function countFromSubquerySelfRefs(s: Select, name: string): number {
 
 // countSublinkSelfRefs counts self-references reachable only through an expression sublink in this
 // SELECT's top-level expressions — the `within a subquery` position.
-function countSublinkSelfRefs(s: Select, name: string): number {
+export function countSublinkSelfRefs(s: Select, name: string): number {
   let n = 0;
   for (const e of selectExprs(s)) n += countSelfRefsExpr(e, name);
   return n;
@@ -22203,7 +22205,7 @@ function countSublinkSelfRefs(s: Select, name: string): number {
 // NULLABLE side of an outer join — the position PostgreSQL rejects. The FROM is a left-deep chain:
 // relation 0 is `from`, relation i+1 is joins[i].table, combined by joins[i].kind. A LEFT/FULL join
 // makes its right operand nullable; a RIGHT/FULL join makes the whole accumulated left nullable.
-function directSelfRefOnNullableSide(s: Select, name: string): boolean {
+export function directSelfRefOnNullableSide(s: Select, name: string): boolean {
   const rels = fromRelations(s);
   const nullable = new Array<boolean>(rels.length).fill(false);
   for (let j = 0; j < s.joins.length; j++) {
@@ -22229,7 +22231,7 @@ function directSelfRefOnNullableSide(s: Select, name: string): boolean {
 
 // isPlainRelation reports whether a FROM relation is a plain table NAME — not a derived-table
 // subquery, a table function, or a VALUES body. Only a plain relation can resolve to a CTE.
-function isPlainRelation(tref: TableRef): boolean {
+export function isPlainRelation(tref: TableRef): boolean {
   return (
     (tref.args === null || tref.args === undefined) &&
     tref.subquery === undefined &&
@@ -22239,7 +22241,7 @@ function isPlainRelation(tref: TableRef): boolean {
 
 // fromRelations returns the FROM relations of a SELECT in left-deep order: from (if present) then
 // each join's table.
-function fromRelations(s: Select): TableRef[] {
+export function fromRelations(s: Select): TableRef[] {
   const rels: TableRef[] = [];
   if (s.from !== null) rels.push(s.from);
   for (const j of s.joins) rels.push(j.table);
@@ -22249,7 +22251,7 @@ function fromRelations(s: Select): TableRef[] {
 // selectExprs returns every top-level expression of a SELECT that can hold a sublink (select items,
 // WHERE, GROUP BY, HAVING, join ON conditions). ORDER BY keys are bare/qualified column references
 // (never expressions), so they carry no sublink.
-function selectExprs(s: Select): Expr[] {
+export function selectExprs(s: Select): Expr[] {
   const v: Expr[] = [];
   if (s.items.kind === "list") for (const it of s.items.items) v.push(it.expr);
   if (s.filter !== null) v.push(s.filter);
@@ -22264,7 +22266,7 @@ function selectExprs(s: Select): Expr[] {
 // assignable to them — a literal adapts, an equal type passes, a WIDER type is 42804 (matching
 // PostgreSQL). Mechanically the would-be UNION unified type must EQUAL the anchor type; any widening
 // of the anchor is the error. An arity mismatch is 42601, like a plain UNION.
-function checkRecursiveColumnTypes(anchor: QueryPlan, recursive: QueryPlan, name: string): void {
+export function checkRecursiveColumnTypes(anchor: QueryPlan, recursive: QueryPlan, name: string): void {
   const a = anchor.columnTypes;
   const r = recursive.columnTypes;
   if (a.length !== r.length) {
@@ -22286,14 +22288,14 @@ function checkRecursiveColumnTypes(anchor: QueryPlan, recursive: QueryPlan, name
 // with MORE aliases is 42P10) or the body's own output names, typed from the planned body. The
 // relation has no primary key / constraints — it is read-only and its rows come from the CTE
 // context, never a store.
-function cteSyntheticTable(name: string, plan: QueryPlan, rename: string[] | null): Table {
+export function cteSyntheticTable(name: string, plan: QueryPlan, rename: string[] | null): Table {
   return cteSyntheticTableCols(name, plan.columnNames, plan.columnTypes, rename);
 }
 
 // cteSyntheticTableCols is the shared core of cteSyntheticTable, over explicit body column names +
 // types — so a data-modifying CTE (whose "body output" is its RETURNING projection, not a QueryPlan)
 // builds its synthetic relation the same way (spec/design/writable-cte.md §1).
-function cteSyntheticTableCols(
+export function cteSyntheticTableCols(
   name: string,
   bodyNames: string[],
   bodyTypes: ResolvedType[],
@@ -22334,7 +22336,7 @@ function cteSyntheticTableCols(
 // (PostgreSQL's unknown -> text rule). A decimal's per-column typmod is irrelevant for a read-only
 // CTE column (values flow through unchanged), so it is dropped. An anonymous ROW(...) composite has
 // no catalog type to name — deferred (0A000), a corner not reached by the corpus.
-function typeFromResolved(rt: ResolvedType): Type {
+export function typeFromResolved(rt: ResolvedType): Type {
   switch (rt.kind) {
     case "int":
     case "float":
@@ -22383,7 +22385,7 @@ function typeFromResolved(rt: ResolvedType): Type {
 // statement (spec/design/api.md §5). types[i] is the inferred scalar type of $(i+1); a null entry
 // marks a parameter referenced before any context fixed its type. Shared across every clause so a
 // $1 used in both WHERE and the select list unifies, then finalized.
-class ParamTypes {
+export class ParamTypes {
   types: (ScalarType | null)[] = [];
   // uncacheable is set during resolution when a node is created that makes the resolved plan
   // un-reusable across executions: a subquery (the uncorrelated-subquery fold rewrites it to a
@@ -22423,7 +22425,7 @@ class ParamTypes {
 
 // unifyParamType unifies two inferred types for the same parameter: equal agrees; two integer
 // widths widen to the wider; any other mismatch is 42804 (spec/design/api.md §5).
-function unifyParamType(a: ScalarType, b: ScalarType, idx0: number): ScalarType {
+export function unifyParamType(a: ScalarType, b: ScalarType, idx0: number): ScalarType {
   if (a === b) return a;
   if (isInteger(a) && isInteger(b)) return rank(a) >= rank(b) ? a : b;
   throw engineError("datatype_mismatch", `inconsistent types inferred for parameter $${idx0 + 1}`);
@@ -22432,7 +22434,7 @@ function unifyParamType(a: ScalarType, b: ScalarType, idx0: number): ScalarType 
 // bindParams coerces each supplied bind value to its inferred parameter type, two-phase /
 // all-or-nothing like INSERT (spec/design/api.md §5): a count mismatch is 42601 and every value
 // is validated up front (22003/42804/22P02/23502 via storeValue) before any row is touched.
-function bindParams(supplied: Value[], types: ScalarType[]): Value[] {
+export function bindParams(supplied: Value[], types: ScalarType[]): Value[] {
   if (supplied.length !== types.length) {
     throw engineError(
       "syntax_error",
@@ -22444,7 +22446,7 @@ function bindParams(supplied: Value[], types: ScalarType[]): Value[] {
 
 // rejectParamsForDDL throws 42601 if bind parameters are supplied to a CREATE/DROP TABLE (which
 // has no expressions to bind — spec/design/api.md §5).
-function rejectParamsForDDL(params: Value[]): void {
+export function rejectParamsForDDL(params: Value[]): void {
   if (params.length > 0) {
     throw engineError("syntax_error", "bind parameters are not allowed in a DDL statement");
   }
@@ -22457,7 +22459,7 @@ function rejectParamsForDDL(params: Value[]): void {
 // range, MINVALUE ≤ MAXVALUE, and START in [min, max] (each 22023); a fresh sequence starts with
 // lastValue = start, isCalled = false. ownedBy carries the IDENTITY / serial owner link (undefined
 // for a plain CREATE SEQUENCE).
-function buildSequenceDef(
+export function buildSequenceDef(
   name: string,
   options: SeqOptions,
   ownedBy: SeqOwner | undefined,
@@ -22538,7 +22540,7 @@ function buildSequenceDef(
 
 // seqBoundCheckStart is PG's START-in-bounds cross-check (init_params): start ∈ [min, max], else
 // 22023 with PG's wording. Shared by CREATE (buildSequenceDef) and ALTER (applySeqAlter).
-function seqBoundCheckStart(start: bigint, minValue: bigint, maxValue: bigint): void {
+export function seqBoundCheckStart(start: bigint, minValue: bigint, maxValue: bigint): void {
   if (start < minValue) {
     throw engineError(
       "invalid_parameter_value",
@@ -22555,7 +22557,7 @@ function seqBoundCheckStart(start: bigint, minValue: bigint, maxValue: bigint): 
 
 // seqBoundCheckLast is PG's last_value (RESTART) cross-check (init_params): the post-edit last_value ∈
 // [min, max], else 22023. PG uses the "RESTART value …" wording even with no RESTART written (§15.2).
-function seqBoundCheckLast(lastValue: bigint, minValue: bigint, maxValue: bigint): void {
+export function seqBoundCheckLast(lastValue: bigint, minValue: bigint, maxValue: bigint): void {
   if (lastValue < minValue) {
     throw engineError(
       "invalid_parameter_value",
@@ -22575,7 +22577,7 @@ function seqBoundCheckLast(lastValue: bigint, minValue: bigint, maxValue: bigint
 // change; lastValue/isCalled are preserved unless restart is given. The value type is not persisted
 // (§14.4), so NO MINVALUE/NO MAXVALUE reset the open direction to the bigint bound and an explicit
 // bound is i64-checked only. options.dataType must be null (the caller rejects AS as 0A000 first).
-function applySeqAlter(
+export function applySeqAlter(
   existing: SequenceDef,
   options: SeqOptions,
   restart: SeqRestart | null,
@@ -22630,7 +22632,7 @@ function applySeqAlter(
 // (spec/design/sequences.md §12) — serial/serial4 → i32, bigserial/serial8 → i64,
 // smallserial/serial2 → i16. undefined for any other name. Recognized only in a CREATE TABLE
 // column-type position; the match is case-insensitive.
-function serialPseudoType(name: string): ScalarType | undefined {
+export function serialPseudoType(name: string): ScalarType | undefined {
   switch (name.toLowerCase()) {
     case "serial":
     case "serial4":
@@ -22685,7 +22687,7 @@ export function stmtIsWrite(stmt: Statement): boolean {
 // (sequences.md §4). Only the read-shaped statements need checking: INSERT/UPDATE/DELETE/DDL are
 // already writes (stmtIsWrite short-circuits before this), and an INSERT VALUES slot is literal-only
 // (no function call). currval is a pure read and is NOT counted.
-function stmtCallsSeqMutator(stmt: Statement): boolean {
+export function stmtCallsSeqMutator(stmt: Statement): boolean {
   switch (stmt.kind) {
     case "select":
       return selectCallsSeqMutator(stmt);
@@ -22703,12 +22705,12 @@ function stmtCallsSeqMutator(stmt: Statement): boolean {
 // cteBodyCallsSeqMutator reports whether a cte_body calls a sequence-mutating function. A query body
 // delegates to the query walk; a data-modifying body already makes the WITH a write (via withHasDml),
 // so this is not reached for it — it is treated as a write regardless (writable-cte.md).
-function cteBodyCallsSeqMutator(body: CteBody): boolean {
+export function cteBodyCallsSeqMutator(body: CteBody): boolean {
   const q = cteBodyAsQuery(body);
   return q !== null ? queryCallsSeqMutator(q) : true;
 }
 
-function queryCallsSeqMutator(qe: QueryExpr): boolean {
+export function queryCallsSeqMutator(qe: QueryExpr): boolean {
   if (qe.kind === "setOp") return setOpCallsSeqMutator(qe);
   if (qe.kind === "withExpr") {
     // A nested WITH's CTE bodies and main body may call a sequence mutator (cte.md §7).
@@ -22718,11 +22720,11 @@ function queryCallsSeqMutator(qe: QueryExpr): boolean {
   return selectCallsSeqMutator(qe);
 }
 
-function setOpCallsSeqMutator(so: SetOp): boolean {
+export function setOpCallsSeqMutator(so: SetOp): boolean {
   return queryCallsSeqMutator(so.lhs) || queryCallsSeqMutator(so.rhs);
 }
 
-function selectCallsSeqMutator(s: Select): boolean {
+export function selectCallsSeqMutator(s: Select): boolean {
   const itemCalls =
     s.items.kind === "list" && s.items.items.some((i) => exprCallsSeqMutator(i.expr));
   return (
@@ -22743,7 +22745,7 @@ function selectCallsSeqMutator(s: Select): boolean {
   );
 }
 
-function tableRefCallsSeqMutator(t: TableRef): boolean {
+export function tableRefCallsSeqMutator(t: TableRef): boolean {
   return (
     t.args?.some(exprCallsSeqMutator) ||
     (t.subquery !== undefined && queryCallsSeqMutator(t.subquery)) ||
@@ -22753,7 +22755,7 @@ function tableRefCallsSeqMutator(t: TableRef): boolean {
 
 // exprCallsSeqMutator is exhaustive over Expr (every kind is matched): true iff the tree contains a
 // sequence-mutating call (nextval or setval).
-function exprCallsSeqMutator(e: Expr): boolean {
+export function exprCallsSeqMutator(e: Expr): boolean {
   switch (e.kind) {
     case "funcCall": {
       const n = e.name.toLowerCase();
@@ -22829,7 +22831,7 @@ function exprCallsSeqMutator(e: Expr): boolean {
 // the per-table privileges (each (table, privilege) pair), the named functions (each needs EXECUTE),
 // and whether the statement is DDL (gated by allowDdl). Collected by an exhaustive AST walk
 // (mirroring exprCallsSeqMutator).
-type PrivReq = {
+export type PrivReq = {
   tables: { name: string; priv: Privilege }[];
   functions: string[];
   isDdl: boolean;
@@ -22841,7 +22843,7 @@ type PrivReq = {
 
 // collectStmtPrivs collects the privilege requirements of stmt (spec/design/session.md §5.3).
 // Transaction control carries none (handled before dispatch); DDL just sets isDdl.
-function collectStmtPrivs(stmt: Statement, req: PrivReq): void {
+export function collectStmtPrivs(stmt: Statement, req: PrivReq): void {
   const locals = new Set<string>();
   switch (stmt.kind) {
     case "createTable":
@@ -22889,7 +22891,7 @@ function collectStmtPrivs(stmt: Statement, req: PrivReq): void {
   }
 }
 
-function collectInsertPrivs(ins: Insert, req: PrivReq, locals: Set<string>): void {
+export function collectInsertPrivs(ins: Insert, req: PrivReq, locals: Set<string>): void {
   // The write target needs INSERT. A bare INSERT … VALUES reads nothing (the slots are literals /
   // params), so it needs only INSERT; an INSERT … SELECT source needs SELECT on its tables.
   req.tables.push({ name: ins.table, priv: "insert" });
@@ -22903,7 +22905,7 @@ function collectInsertPrivs(ins: Insert, req: PrivReq, locals: Set<string>): voi
   collectItemsPrivs(ins.returning, req, locals);
 }
 
-function collectUpdatePrivs(upd: Update, req: PrivReq, locals: Set<string>): void {
+export function collectUpdatePrivs(upd: Update, req: PrivReq, locals: Set<string>): void {
   req.tables.push({ name: upd.table, priv: "update" });
   // SELECT on the target if it reads any column — a WHERE, a RETURNING, or a column/subquery-
   // referencing assignment RHS (a constant-only SET a = 1 with no WHERE/RETURNING reads nothing).
@@ -22917,7 +22919,7 @@ function collectUpdatePrivs(upd: Update, req: PrivReq, locals: Set<string>): voi
   collectItemsPrivs(upd.returning, req, locals);
 }
 
-function collectDeletePrivs(del: Delete, req: PrivReq, locals: Set<string>): void {
+export function collectDeletePrivs(del: Delete, req: PrivReq, locals: Set<string>): void {
   req.tables.push({ name: del.table, priv: "delete" });
   // DELETE reads the target's columns through a WHERE or a RETURNING.
   if (del.filter !== null || del.returning !== null) {
@@ -22927,7 +22929,7 @@ function collectDeletePrivs(del: Delete, req: PrivReq, locals: Set<string>): voi
   collectItemsPrivs(del.returning, req, locals);
 }
 
-function collectQueryPrivs(qe: QueryExpr, req: PrivReq, locals: Set<string>): void {
+export function collectQueryPrivs(qe: QueryExpr, req: PrivReq, locals: Set<string>): void {
   if (qe.kind === "setOp") collectSetOpPrivs(qe, req, locals);
   else if (qe.kind === "withExpr") {
     // A nested WITH establishes its own CTE scope (spec/design/cte.md §7): the enclosing locals are
@@ -22942,12 +22944,12 @@ function collectQueryPrivs(qe: QueryExpr, req: PrivReq, locals: Set<string>): vo
   } else collectSelectPrivs(qe, req, locals);
 }
 
-function collectSetOpPrivs(so: SetOp, req: PrivReq, locals: Set<string>): void {
+export function collectSetOpPrivs(so: SetOp, req: PrivReq, locals: Set<string>): void {
   collectQueryPrivs(so.lhs, req, locals);
   collectQueryPrivs(so.rhs, req, locals);
 }
 
-function collectWithPrivs(wq: WithQuery, req: PrivReq, locals: Set<string>): void {
+export function collectWithPrivs(wq: WithQuery, req: PrivReq, locals: Set<string>): void {
   // A CTE name shadows a base table inside the WITH (a FROM <cte> is not a catalog object), so it is
   // added to the local scope and never privilege-checked. Forward-only visibility: each CTE body sees
   // the CTE names declared before it. A data-modifying body / primary needs the write privilege on
@@ -22963,14 +22965,14 @@ function collectWithPrivs(wq: WithQuery, req: PrivReq, locals: Set<string>): voi
 // collectCteBodyPrivs collects the privilege requirements of a cte_body — a query, or a
 // data-modifying statement (spec/design/writable-cte.md) which needs the write privilege on its
 // target.
-function collectCteBodyPrivs(body: CteBody, req: PrivReq, locals: Set<string>): void {
+export function collectCteBodyPrivs(body: CteBody, req: PrivReq, locals: Set<string>): void {
   if (body.kind === "insert") collectInsertPrivs(body, req, locals);
   else if (body.kind === "update") collectUpdatePrivs(body, req, locals);
   else if (body.kind === "delete") collectDeletePrivs(body, req, locals);
   else collectQueryPrivs(body, req, locals);
 }
 
-function collectSelectPrivs(s: Select, req: PrivReq, locals: Set<string>): void {
+export function collectSelectPrivs(s: Select, req: PrivReq, locals: Set<string>): void {
   if (s.from !== null) collectTableRefPrivs(s.from, req, locals);
   for (const j of s.joins) {
     collectTableRefPrivs(j.table, req, locals);
@@ -22984,7 +22986,7 @@ function collectSelectPrivs(s: Select, req: PrivReq, locals: Set<string>): void 
   if (s.having !== null) collectExprPrivs(s.having, req, locals);
 }
 
-function collectTableRefPrivs(t: TableRef, req: PrivReq, locals: Set<string>): void {
+export function collectTableRefPrivs(t: TableRef, req: PrivReq, locals: Set<string>): void {
   if (t.args !== null) {
     // A set-returning function used as a row source — EXECUTE on the function; its args are exprs.
     req.functions.push(t.name);
@@ -22999,7 +23001,7 @@ function collectTableRefPrivs(t: TableRef, req: PrivReq, locals: Set<string>): v
   }
 }
 
-function collectItemsPrivs(items: SelectItems | null, req: PrivReq, locals: Set<string>): void {
+export function collectItemsPrivs(items: SelectItems | null, req: PrivReq, locals: Set<string>): void {
   if (items !== null && items.kind === "list") {
     for (const it of items.items) collectExprPrivs(it.expr, req, locals);
   }
@@ -23007,7 +23009,7 @@ function collectItemsPrivs(items: SelectItems | null, req: PrivReq, locals: Set<
 
 // collectExprPrivs is exhaustive over Expr (mirroring exprCallsSeqMutator): collect every named
 // function call (EXECUTE) and walk every subquery (its tables need SELECT).
-function collectExprPrivs(e: Expr, req: PrivReq, locals: Set<string>): void {
+export function collectExprPrivs(e: Expr, req: PrivReq, locals: Set<string>): void {
   switch (e.kind) {
     case "funcCall":
       req.functions.push(e.name);
@@ -23106,7 +23108,7 @@ function collectExprPrivs(e: Expr, req: PrivReq, locals: Set<string>): void {
 // exprReadsColumns reports whether e reads a stored column or a subquery's rows — the trigger for an
 // UPDATE's SELECT requirement on its target (spec/design/session.md §5.3). A column reference or any
 // subquery counts; a pure constant / parameter expression does not. Exhaustive over Expr.
-function exprReadsColumns(e: Expr): boolean {
+export function exprReadsColumns(e: Expr): boolean {
   switch (e.kind) {
     case "column":
     case "qualifiedColumn":
@@ -23177,7 +23179,7 @@ function exprReadsColumns(e: Expr): boolean {
 
 // stmtKind is a short label for a statement kind, for the 25006 read-only-violation message (the
 // message text is informational — never matched; spec/design/conformance.md §2).
-function stmtKind(stmt: Statement): string {
+export function stmtKind(stmt: Statement): string {
   switch (stmt.kind) {
     case "createTable":
       return "CREATE TABLE";
@@ -23220,11 +23222,11 @@ function stmtKind(stmt: Statement): string {
 // contract. The Engine methods above walk the plan; these module-level helpers spell each token.
 
 // ExplainRow is one rendered plan row before it becomes a Value triple in explainOutcome.
-type ExplainRow = { depth: number; node: string; detail: string };
+export type ExplainRow = { depth: number; node: string; detail: string };
 
 // ExplainRender accumulates the rendered plan rows. emit normalizes an empty detail to the "-"
 // sentinel so no cell renders blank (spec/design/explain.md §2).
-class ExplainRender {
+export class ExplainRender {
   rows: ExplainRow[] = [];
   emit(depth: number, node: string, detail: string): void {
     this.rows.push({ depth, node, detail: detail === "" ? "-" : detail });
@@ -23232,14 +23234,14 @@ class ExplainRender {
 }
 
 // insertDetail renders an INSERT's ON CONFLICT disposition (or "-" when there is none).
-function insertDetail(ins: Insert): string {
+export function insertDetail(ins: Insert): string {
   if (ins.onConflict === null) return "-";
   return ins.onConflict.doUpdate ? "on conflict do update" : "on conflict do nothing";
 }
 
 // cteDetail renders a CTE binding's attributes: its materialization mode (inlined vs materialized —
 // the planner's choice) and whether it is recursive.
-function cteDetail(b: CteBinding, mode: CteMode): string {
+export function cteDetail(b: CteBinding, mode: CteMode): string {
   const parts = [mode === "materialize" ? "materialized" : "inlined"];
   if (b.recursive !== null) parts.push("recursive");
   return parts.join("; ");
@@ -23247,7 +23249,7 @@ function cteDetail(b: CteBinding, mode: CteMode): string {
 
 // aggDetail renders an Aggregate node's attributes: the grouping-key count, aggregate count, the
 // grouping-set count when there is more than one set, and the HAVING conjunct count.
-function aggDetail(sp: SelectPlan): string {
+export function aggDetail(sp: SelectPlan): string {
   const parts = [`groups=${sp.groupKeys.length} aggs=${sp.aggSpecs.length}`];
   if (sp.groupSets.length > 1) parts.push(`sets=${sp.groupSets.length}`);
   if (sp.having !== null) parts.push(`having:conjuncts=${conjunctCount(sp.having)}`);
@@ -23256,25 +23258,25 @@ function aggDetail(sp: SelectPlan): string {
 
 // joinDetail renders a Nested Loop node's attributes: the join kind and the ON predicate's conjunct
 // count (a CROSS join has no ON). The JoinKind labels (inner/cross/left/right/full) are the spelling.
-function joinDetail(j: PlanJoin): string {
+export function joinDetail(j: PlanJoin): string {
   if (j.on === null) return j.kind;
   return `${j.kind}; on:conjuncts=${conjunctCount(j.on)}`;
 }
 
 // setOpNodeName is the node label for a set-operation kind.
-function setOpNodeName(op: SetOpKind): string {
+export function setOpNodeName(op: SetOpKind): string {
   return op === "union" ? "Union" : op === "intersect" ? "Intersect" : "Except";
 }
 
 // withNote appends an elided-ORDER-BY note to a node's detail (replacing a "-" sentinel).
-function withNote(detail: string, note: string): string {
+export function withNote(detail: string, note: string): string {
   if (note === "") return detail;
   if (detail === "" || detail === "-") return "ordered: " + note;
   return detail + "; ordered: " + note;
 }
 
 // limitDetail renders a Limit node's `limit=N` / `offset=M` attributes (an absent side is omitted).
-function limitDetail(limit: bigint | null, offset: bigint | null): string {
+export function limitDetail(limit: bigint | null, offset: bigint | null): string {
   const parts: string[] = [];
   if (limit !== null) parts.push(`limit=${limit}`);
   if (offset !== null) parts.push(`offset=${offset}`);
@@ -23282,7 +23284,7 @@ function limitDetail(limit: bigint | null, offset: bigint | null): string {
 }
 
 // countTrue counts the set entries in a touched-set mask (null ⇒ 0, the DML-scan case).
-function countTrue(mask: boolean[] | null): number {
+export function countTrue(mask: boolean[] | null): number {
   if (mask === null) return 0;
   let n = 0;
   for (const b of mask) if (b) n++;
@@ -23291,7 +23293,7 @@ function countTrue(mask: boolean[] | null): number {
 
 // renderBoundTerms renders a primary-key bound's terms as `col <op> <src>` conjuncts joined by
 // " and " — e.g. `id = $1`, `id >= 5 and id < 10`.
-function renderBoundTerms(col: string, terms: BoundTerm[]): string {
+export function renderBoundTerms(col: string, terms: BoundTerm[]): string {
   return terms.map((t) => `${col} ${boundOpText(t.op)} ${renderBoundSrc(t.src)}`).join(" and ");
 }
 
@@ -23299,12 +23301,12 @@ function renderBoundTerms(col: string, terms: BoundTerm[]): string {
 // (cost.md §3 "OR / IN-list"), in source order (the plan-time order, before the exec-time encode /
 // dedup / sort) — deterministic across cores. Each source renders via renderBoundSrc (a bind param as
 // `$N`, a correlated column as `outer`, a literal via its token).
-function renderKeySet(col: string, srcs: RExpr[]): string {
+export function renderKeySet(col: string, srcs: RExpr[]): string {
   return col + " in (" + srcs.map((s) => renderBoundSrc(s)).join(", ") + ")";
 }
 
 // boundOpText is the symbol for a bound comparison operator.
-function boundOpText(op: BinaryOp): string {
+export function boundOpText(op: BinaryOp): string {
   switch (op) {
     case "eq":
       return "=";
@@ -23325,7 +23327,7 @@ function boundOpText(op: BinaryOp): string {
 
 // renderBoundSrc renders a bound's const-source operand: a bind parameter as `$N` (1-based), a
 // correlated outer-column reference as `outer`, or a literal via renderBoundLit.
-function renderBoundSrc(e: RExpr | null): string {
+export function renderBoundSrc(e: RExpr | null): string {
   if (e === null) return "?";
   switch (e.kind) {
     case "param":
@@ -23347,7 +23349,7 @@ function renderBoundSrc(e: RExpr | null): string {
 // determinism-ledger exception, kept out of the plan text — spec/design/explain.md §6); a text literal
 // renders verbatim unless it contains a newline (which would split the cell), in which case `<text>`;
 // every other constant type renders as `<value>` for now (a later slice widens this).
-function renderBoundLit(e: RExpr): string {
+export function renderBoundLit(e: RExpr): string {
   switch (e.kind) {
     case "constInt":
       return e.value.toString();
@@ -23367,7 +23369,7 @@ function renderBoundLit(e: RExpr): string {
 // conjunctCount counts the top-level AND conjuncts of a residual filter (a deterministic integer —
 // the plan text carries the count, not the expression itself; a full expression printer is a later
 // slice, spec/design/explain.md §5).
-function conjunctCount(e: RExpr | null): number {
+export function conjunctCount(e: RExpr | null): number {
   if (e === null) return 0;
   if (e.kind === "and") return conjunctCount(e.lhs) + conjunctCount(e.rhs);
   return 1;
@@ -23376,7 +23378,7 @@ function conjunctCount(e: RExpr | null): number {
 // cloneStores captures the committed stores cheaply for rollback-on-error: each store is an O(1)
 // persistent-map clone (the catalog map of Table objects is shallow-copied by the caller, since
 // Table objects are never mutated in place — only added/removed).
-function cloneStores(stores: Map<string, TableStore>): Map<string, TableStore> {
+export function cloneStores(stores: Map<string, TableStore>): Map<string, TableStore> {
   const out = new Map<string, TableStore>();
   for (const [k, s] of stores) out.set(k, s.clone());
   return out;
@@ -23386,7 +23388,7 @@ function cloneStores(stores: Map<string, TableStore>): Map<string, TableStore> {
 // when a RETURNING clause was resolved (retNames non-null — grammar.md §32; zero affected
 // rows is an EMPTY query result, never a bare statement), else a bare statement result
 // carrying the affected-row count (spec/design/api.md §4).
-function dmlOutcome(
+export function dmlOutcome(
   retNames: string[] | null,
   retTypes: string[] | null,
   returned: Value[][] | null,
@@ -23409,7 +23411,7 @@ function dmlOutcome(
 // allowed in the select list, including boolean — SELECT a = b), each paired with its output
 // column name (spec/design/grammar.md §8). `*` expands across ALL relations in FROM order,
 // each relation's columns in catalog order (§15).
-function resolveProjections(
+export function resolveProjections(
   scope: Scope,
   items: SelectItems,
   ag: AggCtx,
@@ -23507,7 +23509,7 @@ function resolveProjections(
 // bare or qualified column reference takes the catalog's canonical name (never the qualifier,
 // never the SELECT spelling); every other expression takes the fixed "?column?". The column is
 // known to exist — resolve validated it.
-function outputName(scope: Scope, e: Expr): string {
+export function outputName(scope: Scope, e: Expr): string {
   // A bare/qualified column takes the catalog's canonical name, whether it resolves to a local
   // relation or (correlated) an enclosing one — columnOf handles both. A qualifier that names no
   // relation (the column.field ambiguity fallback) takes the written name (PG; matching Rust).
@@ -23544,7 +23546,7 @@ function outputName(scope: Scope, e: Expr): string {
 // case-insensitive (§8). Only an explicit list is scanned — with * the output names are the scope
 // columns, so the FROM-scope fallback already binds the same column. Two items of the same name with
 // DIFFERENT expressions are ambiguous (42702); the same expression twice is not, matching PG.
-function orderAliasMatch(items: SelectItems, name: string, scope: Scope): Expr | null {
+export function orderAliasMatch(items: SelectItems, name: string, scope: Scope): Expr | null {
   if (items.kind !== "list") return null;
   const lower = name.toLowerCase();
   let found: Expr | null = null;
@@ -23560,7 +23562,7 @@ function orderAliasMatch(items: SelectItems, name: string, scope: Scope): Expr |
 
 // resolveBooleanFilter resolves a WHERE / ON expression; it must resolve to boolean (or an
 // untyped NULL, always unknown → no rows). An integer- or text-valued one is a 42804.
-function resolveBooleanFilter(scope: Scope, e: Expr, params: ParamTypes): RExpr {
+export function resolveBooleanFilter(scope: Scope, e: Expr, params: ParamTypes): RExpr {
   // WHERE / ON filters run before any grouping, so an aggregate here is 42803 (Forbidden).
   const { node, type } = resolve(
     scope,
@@ -23579,7 +23581,7 @@ function resolveBooleanFilter(scope: Scope, e: Expr, params: ParamTypes): RExpr 
 // obeys the grouping rule (collectColumn); an Outer (correlated) reference is a per-outer-row
 // CONSTANT, so it bypasses that rule and resolves to an outerColumn reading the enclosing row at
 // eval; its type is the ancestor column's.
-function resolveColumnRef(
+export function resolveColumnRef(
   scope: Scope,
   ag: AggCtx,
   r: Resolved,
@@ -23597,7 +23599,7 @@ function resolveColumnRef(
 // (wrong_object_type, PG's "column notation applied to non-composite") — and `field` must name one
 // of its fields case-insensitively (PG folds the identifier), else 42703 (undefined_column). Returns
 // the `field` RExpr node carrying the fixed field ordinal, plus the field's static type.
-function resolveFieldOf(
+export function resolveFieldOf(
   baseNode: RExpr,
   baseType: ResolvedType,
   field: string,
@@ -23629,7 +23631,7 @@ function resolveFieldOf(
 // divergence from PostgreSQL, which defaults such a $N to text — grammar.md §26). The inner query is
 // resolved ONCE, with `scope` as its parent, so correlated references become outerColumn and errors
 // fire even over an empty outer.
-function planSubquery(scope: Scope, inner: QueryExpr, params: ParamTypes): QueryPlan {
+export function planSubquery(scope: Scope, inner: QueryExpr, params: ParamTypes): QueryPlan {
   if (!scope.allowSubquery) {
     throw engineError(
       "feature_not_supported",
@@ -23649,7 +23651,7 @@ function planSubquery(scope: Scope, inner: QueryExpr, params: ParamTypes): Query
 // resolve resolves one Expr into an RExpr plus its static type. ctx (non-null) is the
 // type an untyped integer literal should adapt to (spec/design/types.md §6); null
 // defaults a bare literal to i64.
-function resolve(
+export function resolve(
   scope: Scope,
   e: Expr,
   ctx: ScalarType | null,
@@ -24879,7 +24881,7 @@ function resolve(
 // built-in byte / code-point order → null (the unchanged fast path); any other name resolves through
 // the reference-only read path (the database's resolved set, then the binary's vendored set), else
 // 42704.
-function resolveCollationName(catalog: Engine, name: string): Collation | null {
+export function resolveCollationName(catalog: Engine, name: string): Collation | null {
   if (name === "C") return null;
   const c = catalog.resolveCollationByName(name);
   if (c === undefined) {
@@ -24892,7 +24894,7 @@ function resolveCollationName(catalog: Engine, name: string): Collation | null {
 // collation (a non-text expr or a bare literal); "implicit" = a column's frozen collation (C counts
 // as a distinct implicit collation); "explicit" = an explicit COLLATE; "indeterminate" = two
 // different implicit collations met — 42P22 when consumed.
-type Deriv =
+export type Deriv =
   | { kind: "none" }
   | { kind: "implicit"; name: string }
   | { kind: "explicit"; name: string }
@@ -24901,7 +24903,7 @@ type Deriv =
 // deriveCollation derives the collation + derivation level of a (text) expression subtree. A COLLATE
 // is explicit; a column reference is implicit (its frozen collation, C if none); || combines its
 // operands. Every other shape resets to none (takes a neighbour's) — a documented narrowing (§14).
-function deriveCollation(scope: Scope, e: Expr): Deriv {
+export function deriveCollation(scope: Scope, e: Expr): Deriv {
   if (e.kind === "collate") return { kind: "explicit", name: e.collation };
   if (e.kind === "column") return columnDeriv(scope, () => scope.resolveBare(e.name));
   if (e.kind === "qualifiedColumn") {
@@ -24916,7 +24918,7 @@ function deriveCollation(scope: Scope, e: Expr): Deriv {
 // columnDeriv is the implicit derivation of a resolved column reference: a text column carries its
 // frozen collation (C → "C", a distinct implicit collation); a non-text or unresolvable reference
 // is "none".
-function columnDeriv(scope: Scope, resolve: () => Resolved): Deriv {
+export function columnDeriv(scope: Scope, resolve: () => Resolved): Deriv {
   let col: Column;
   try {
     col = scope.columnOf(resolve());
@@ -24930,7 +24932,7 @@ function columnDeriv(scope: Scope, resolve: () => Resolved): Deriv {
 // combineDeriv combines two operands' derivations (spec/design/collation.md §1/§7, PG's rules).
 // Explicit dominates; two DIFFERENT explicit collations conflict eagerly (42P21); two different
 // implicit collations yield "indeterminate" (deferred to 42P22 on use); explicit resolves it.
-function combineDeriv(a: Deriv, b: Deriv): Deriv {
+export function combineDeriv(a: Deriv, b: Deriv): Deriv {
   if (a.kind === "explicit" && b.kind === "explicit") {
     if (a.name !== b.name) {
       throw engineError(
@@ -24955,7 +24957,7 @@ function combineDeriv(a: Deriv, b: Deriv): Deriv {
 // resolveDeriv resolves a derivation to the concrete collation a comparison / ORDER BY uses. "none"
 // and C → null (byte order, the fast path); a loaded name → its table (42704 if it vanished);
 // "indeterminate" → 42P22 (the collation is required but ambiguous).
-function resolveDeriv(catalog: Engine, d: Deriv): Collation | null {
+export function resolveDeriv(catalog: Engine, d: Deriv): Collation | null {
   if (d.kind === "indeterminate") {
     throw engineError(
       "indeterminate_collation",
@@ -24971,11 +24973,11 @@ function resolveDeriv(catalog: Engine, d: Deriv): Collation | null {
 // collatedCmp compares two non-NULL text values under a loaded collation (spec/design/collation.md
 // §6/§7): order by the UCA sort keys, whose memcmp order IS the collation order. The caller charges
 // the collate cost and handles NULLs. Returns <0, 0, >0.
-function collatedCmp(coll: Collation, a: string, b: string): number {
+export function collatedCmp(coll: Collation, a: string, b: string): number {
   return cmpBytes(collationSortKey(coll, a), collationSortKey(coll, b));
 }
 
-function resolveBinary(
+export function resolveBinary(
   scope: Scope,
   op: BinaryOp,
   lhs: Expr,
@@ -25204,7 +25206,7 @@ function resolveBinary(
 // left un-adapted. matchPoly defers a bare NULL in an anyarray slot, so cat-first makes `arr || NULL`
 // / `NULL || arr` resolve to array_cat (the NULL array = identity), matching PostgreSQL; adapting the
 // bare NULL to a typed element would wrongly steer it into array_append.
-function resolveConcat(
+export function resolveConcat(
   scope: Scope,
   lhs: Expr,
   rhs: Expr,
@@ -25263,7 +25265,7 @@ function resolveConcat(
 // noSetOpOverload is the "operator does not exist" error (42883) for a containment/positional
 // operator whose operands are neither arrays of a common element type nor ranges of a common element
 // type (matches PG).
-function noSetOpOverload(): EngineError {
+export function noSetOpOverload(): EngineError {
   return engineError(
     "undefined_function",
     "operator does not exist: the operands are not arrays or ranges of a common element type",
@@ -25275,7 +25277,7 @@ function noSetOpOverload(): EngineError {
 // (array-functions.md §10, only `@>`/`<@`/`&&`); a range operand → the range boolean surface
 // (range-functions.md §3). The result is always boolean (strict — a NULL operand short-circuits to
 // NULL at eval). A non-array / non-range pair, or a positional operator on arrays, is 42883.
-function resolveSetOp(
+export function resolveSetOp(
   scope: Scope,
   op: BinaryOp,
   lhs: Expr,
@@ -25335,7 +25337,7 @@ function resolveSetOp(
 // (`text`) or an array index (`integer`); for `#>`/`#>>` it is a `text[]` path (a bare string
 // literal `'{a,b}'` adapts via array_in). The result is `jsonb` (`-> #>`) or `text` (`->> #>>`); a
 // missing access yields SQL NULL at eval.
-function resolveJsonAccess(
+export function resolveJsonAccess(
   scope: Scope,
   op: BinaryOp,
   lhs: Expr,
@@ -25419,7 +25421,7 @@ function resolveJsonAccess(
 }
 
 // jsonOpSymbol is the display symbol for a jsonb accessor operator, for error messages.
-function jsonOpSymbol(op: BinaryOp): string {
+export function jsonOpSymbol(op: BinaryOp): string {
   switch (op) {
     case "jsonGet":
       return "->";
@@ -25437,7 +25439,7 @@ function jsonOpSymbol(op: BinaryOp): string {
 // jsonArgNode is the node tree of a json/jsonb function argument: a jsonb value IS the canonical
 // node; a json value is parsed from its verbatim text on demand, preserving key order + duplicates
 // (json.md §4). The resolver restricts a json/jsonb function argument to json/jsonb.
-function jsonArgNode(v: Value): JsonNode {
+export function jsonArgNode(v: Value): JsonNode {
   if (v.kind === "jsonb") return v.node;
   if (v.kind === "json") return parsePreservingJson(v.text);
   throw new Error("jsonArgNode: a json/jsonb function argument must be json/jsonb");
@@ -25446,7 +25448,7 @@ function jsonArgNode(v: Value): JsonNode {
 // evalJsonpath recompiles a `jsonpath` value's canonical text and evaluates it over a `jsonb` context
 // value (the shared kernel of the jsonpath query functions). A NULL context or path yields `null`
 // (→ SQL NULL / zero rows). Port of impl/rust/src/executor.rs `eval_jsonpath`.
-function evalJsonpath(ctx: Value, path: Value): JsonNode[] | null {
+export function evalJsonpath(ctx: Value, path: Value): JsonNode[] | null {
   if (ctx.kind === "null" || path.kind === "null") return null;
   const node = jsonArgNode(ctx);
   if (path.kind !== "jsonpath") {
@@ -25457,7 +25459,7 @@ function evalJsonpath(ctx: Value, path: Value): JsonNode[] | null {
 
 // jsonPredKindMatches reports whether a parsed JSON node matches an `IS JSON [kind]` predicate's kind
 // (json-sql-functions.md §5).
-function jsonPredKindMatches(node: JsonNode, kind: JsonPredicateKind): boolean {
+export function jsonPredKindMatches(node: JsonNode, kind: JsonPredicateKind): boolean {
   switch (kind) {
     case "value":
       return true;
@@ -25476,7 +25478,7 @@ function jsonPredKindMatches(node: JsonNode, kind: JsonPredicateKind): boolean {
 // type-info-dependent / float-divergent sources — composite (needs field names), float (the
 // binary→decimal divergence), datetime/uuid/bytea/interval (string-render divergences), and a
 // multidimensional array — are a deferred 0A000 follow-on.
-function valueToNode(v: Value): JsonNode {
+export function valueToNode(v: Value): JsonNode {
   switch (v.kind) {
     case "null": // an array element (a top-level NULL is strict-propagated)
       return { kind: "null" };
@@ -25533,7 +25535,7 @@ function valueToNode(v: Value): JsonNode {
 // embeds VERBATIM, a `jsonb` value its canonical (spaced) render, everything else the compact
 // to_jsonb image (valueToNode → jsonCompactOut). This is how PG's json_build_array/json_build_object
 // (and to_json) embed an argument's own json form.
-function elemJsonText(v: Value): string {
+export function elemJsonText(v: Value): string {
   if (v.kind === "json") return v.text;
   if (v.kind === "jsonb") return jsonbOut(v.node);
   return jsonCompactOut(valueToNode(v));
@@ -25543,7 +25545,7 @@ function elemJsonText(v: Value): string {
 // error message). PG coerces a key to text via the type's output: text as-is, integer/decimal/boolean
 // rendered. A NULL key is `22023`; a non-scalar key type is a deferred `0A000` follow-on. jed integers
 // are bigint, rendered via toString (never a float path — CLAUDE.md §2).
-function objectKeyText(v: Value, pos: number): string {
+export function objectKeyText(v: Value, pos: number): string {
   switch (v.kind) {
     case "null":
       throw engineError("invalid_parameter_value", `argument ${pos}: key must not be null`);
@@ -25564,14 +25566,14 @@ function objectKeyText(v: Value, pos: number): string {
 }
 
 // objectKeyNull is the `22004` raised when a `json_object` / `jsonb_object` key element is NULL.
-function objectKeyNull(): EngineError {
+export function objectKeyNull(): EngineError {
   return engineError("null_value_not_allowed", "null value not allowed for object key");
 }
 
 // valueToOptTextArray extracts a `text[]` value into a list of (string | null), preserving NULL
 // elements (null for a NULL element). Used by `json_object` (a NULL value → JSON null; a NULL key →
 // 22004). The resolver guarantees a `text[]` argument, so non-text elements cannot occur.
-function valueToOptTextArray(v: Value): (string | null)[] {
+export function valueToOptTextArray(v: Value): (string | null)[] {
   if (v.kind !== "array") throw new Error("resolver guarantees a text[] arg");
   return v.elements.map((e) => (e.kind === "text" ? e.text : null));
 }
@@ -25580,7 +25582,7 @@ function valueToOptTextArray(v: Value): (string | null)[] {
 // J5). Both operands must be `jsonb` (a bare string literal adapts via `jsonbIn`); a `json` operand
 // has no @> operator class (42883). `<@` resolves to a "jsonContains" node with the operands swapped
 // (`a <@ b` is `b @> a`). The result is boolean; the operator is strict (a NULL operand → SQL NULL).
-function resolveJsonbContains(
+export function resolveJsonbContains(
   scope: Scope,
   op: BinaryOp,
   lhs: Expr,
@@ -25608,7 +25610,7 @@ function resolveJsonbContains(
 // §1, J5). The base must be `jsonb` (a json base is 42883 — no operator). `?` takes a `text` key;
 // `?|`/`?&` take a `text[]` (a bare `'{a,b}'` string literal adapts via array_in). The result is
 // boolean; the operator is strict.
-function resolveJsonHasKey(
+export function resolveJsonHasKey(
   scope: Scope,
   kind: HasKeyKind,
   lhs: Expr,
@@ -25655,7 +25657,7 @@ function resolveJsonHasKey(
 }
 
 // hasKeySymbol is the display symbol for a key-existence operator, for error messages.
-function hasKeySymbol(kind: HasKeyKind): string {
+export function hasKeySymbol(kind: HasKeyKind): string {
   switch (kind) {
     case "one":
       return "?";
@@ -25668,7 +25670,7 @@ function hasKeySymbol(kind: HasKeyKind): string {
 
 // resolveJsonbConcat resolves a jsonb `||` concatenation/merge (json-sql-functions.md §1, J6). Both
 // operands must be jsonb (a string literal adapts via `jsonbIn`). Result jsonb; strict.
-function resolveJsonbConcat(
+export function resolveJsonbConcat(
   scope: Scope,
   lhs: Expr,
   rhs: Expr,
@@ -25690,7 +25692,7 @@ function resolveJsonbConcat(
 // (rbase, jsonb-typed). The form is chosen by the argument type; a bare `'{a,b}'` string literal
 // adapts to `text[]` only for `#-` (for `-` it is a single text key, verbatim like PG). Result
 // jsonb; strict.
-function resolveJsonbDelete(
+export function resolveJsonbDelete(
   scope: Scope,
   isPath: boolean,
   rhs: Expr,
@@ -25737,7 +25739,7 @@ function resolveJsonbDelete(
 // resolveTextArrayArg resolves a `text[]` operator argument (the `#-` path): a bare string literal
 // `'{a,b}'` adapts via `coerceStringToArray`; otherwise the resolved type must be `text[]` (or NULL).
 // `sym` is the operator symbol for the error message.
-function resolveTextArrayArg(
+export function resolveTextArrayArg(
   scope: Scope,
   rhs: Expr,
   sym: string,
@@ -25759,7 +25761,7 @@ function resolveTextArrayArg(
 // and a bare string `value` literal adapts to jsonb (the `Some(ScalarType::Jsonb)` hint). STRICT (the
 // eval propagates any NULL). The optional flag defaults to `true` for jsonb_set (create_if_missing) /
 // `false` for jsonb_insert (insert_after).
-function resolveJsonbSetInsert(
+export function resolveJsonbSetInsert(
   scope: Scope,
   name: string,
   mode: PathSetMode,
@@ -25791,7 +25793,7 @@ function resolveJsonbSetInsert(
 // resolveJsonObject resolves `json_object` / `jsonb_object` (json-sql-functions.md §2): one `text[]`
 // of alternating keys/values, or two `text[]` (keys, values). A bare `'{…}'` literal adapts to text[].
 // STRICT (the eval propagates a NULL whole-array argument). Wrong arity (not 1 or 2 args) → 42883.
-function resolveJsonObject(
+export function resolveJsonObject(
   scope: Scope,
   name: string,
   json: boolean,
@@ -25811,7 +25813,7 @@ function resolveJsonObject(
 // resolveJsonpathFn resolves a scalar jsonpath query function (P2, jsonpath.md §5): `(ctx jsonb, path
 // jsonpath)`. A bare string literal adapts (the context to jsonb, the path to a compiled jsonpath).
 // STRICT.
-function resolveJsonpathFn(
+export function resolveJsonpathFn(
   scope: Scope,
   name: string,
   kind: JsonPathFnKind,
@@ -25829,7 +25831,7 @@ function resolveJsonpathFn(
 // jsonpath query functions (the SRF and the scalar forms). A bare string literal adapts: the context
 // to jsonb, the path to a compiled `jsonpath`. Exactly two args this slice (the optional `vars` /
 // `silent` are a follow-on).
-function resolveJsonpathArgs(
+export function resolveJsonpathArgs(
   scope: Scope,
   name: string,
   args: Expr[],
@@ -25847,7 +25849,7 @@ function resolveJsonpathArgs(
 // resolveJsonSqlFn resolves a SQL/JSON query function JSON_EXISTS / JSON_VALUE / JSON_QUERY
 // (json-sql-functions.md §5, S2) → a "jsonSqlFn" RExpr + its fixed result type. Port of
 // impl/rust/src/executor.rs `resolve_json_sql_fn`.
-function resolveJsonSqlFn(
+export function resolveJsonSqlFn(
   scope: Scope,
   kind: JsonSqlKind,
   ctx: Expr,
@@ -25928,7 +25930,7 @@ function resolveJsonSqlFn(
 }
 
 // rangeOpFor maps a containment/positional BinaryOp to its range-against-range kernel (RangeOpName).
-function rangeOpFor(op: BinaryOp): RangeOpName {
+export function rangeOpFor(op: BinaryOp): RangeOpName {
   switch (op) {
     case "contains":
       return "contains";
@@ -25958,7 +25960,7 @@ function rangeOpFor(op: BinaryOp): RangeOpName {
 // element` and `element <@ range` re-resolve the element operand with the range's element type as the
 // hint and type-check assignability. A bare untyped NULL on one side is treated as a NULL range (the
 // range×range overload; eval yields NULL). Anything else is 42883.
-function resolveRangeOp(
+export function resolveRangeOp(
   scope: Scope,
   op: BinaryOp,
   lhs: Expr,
@@ -26055,7 +26057,7 @@ function resolveRangeOp(
 // is taken as a NULL range (the range×range overload; eval → NULL, strict). The result is a range over
 // that element type. range_merge does NOT come through here (it is a function call — see
 // resolveRangeFunc); it shares the "rangeSetOp" node with op = "merge".
-function resolveRangeSetOp(
+export function resolveRangeSetOp(
   op: BinaryOp,
   rl: RExpr,
   lt: ResolvedType,
@@ -26097,7 +26099,7 @@ function resolveRangeSetOp(
 // element type, a bare ARRAY[…] operand adapts its elements to `x`'s type. The right operand must be
 // an array (a non-array side is 42809; a bare untyped NULL is 42P18); `x` and the element type must
 // be comparable (else 42883, PG's operator-not-found). The result is always boolean.
-function resolveQuantified(
+export function resolveQuantified(
   scope: Scope,
   op: BinaryOp,
   all: boolean,
@@ -26154,7 +26156,7 @@ function resolveQuantified(
 
 // binaryOpSymbol is the infix symbol of a comparison/arithmetic operator, for an
 // `operator does not exist` message (only the comparison operators reach resolveQuantified).
-function binaryOpSymbol(op: BinaryOp): string {
+export function binaryOpSymbol(op: BinaryOp): string {
   switch (op) {
     case "eq":
       return "=";
@@ -26234,7 +26236,7 @@ function binaryOpSymbol(op: BinaryOp): string {
 // operand-pair resolution (literal adaptation), then settling the result type. Both operands must be
 // integer or decimal (a float/other operand → 42883); the result is the promoted integer type when
 // both are integer, else "decimal" (an integer operand promotes, as PG does).
-function resolveIntOrDecimalPair(
+export function resolveIntOrDecimalPair(
   scope: Scope,
   name: string,
   lhs: Expr,
@@ -26254,7 +26256,7 @@ function resolveIntOrDecimalPair(
 // gcdBigint is the gcd of two bigints by the Euclidean algorithm, NON-NEGATIVE (bigint is exact, so
 // no intermediate overflow). The caller range-checks the result against the promoted integer type
 // (so |MinInt64| = 2^63 → 22003, matching the other cores' i64::MIN-abs overflow).
-function gcdBigint(a: bigint, b: bigint): bigint {
+export function gcdBigint(a: bigint, b: bigint): bigint {
   while (b !== 0n) {
     [a, b] = [b, a % b];
   }
@@ -26264,7 +26266,7 @@ function gcdBigint(a: bigint, b: bigint): bigint {
 // gcdDecimalValue is the gcd of two decimals by the Euclidean algorithm over rem, NON-NEGATIVE at
 // scale max(sₐ, s_b) (PG numeric gcd). The values share a fixed scale through the chain, so it
 // reduces to an integer gcd and terminates; the final pad to the target scale is exact.
-function gcdDecimalValue(a: Decimal, b: Decimal): Decimal {
+export function gcdDecimalValue(a: Decimal, b: Decimal): Decimal {
   const target = Math.max(a.scale, b.scale);
   let x = a;
   let y = b;
@@ -26278,7 +26280,7 @@ function gcdDecimalValue(a: Decimal, b: Decimal): Decimal {
 // lcmBigint is the lcm of two bigints, NON-NEGATIVE: |a/gcd·b| (bigint is exact). The caller
 // range-checks the result against the promoted integer type (an out-of-range magnitude → 22003,
 // matching the other cores' checked-overflow). lcm(_, 0) = 0.
-function lcmBigint(a: bigint, b: bigint): bigint {
+export function lcmBigint(a: bigint, b: bigint): bigint {
   if (a === 0n || b === 0n) return 0n;
   const g = gcdBigint(a, b);
   const prod = (a / g) * b;
@@ -26287,7 +26289,7 @@ function lcmBigint(a: bigint, b: bigint): bigint {
 
 // lcmDecimalValue is the lcm of two decimals, NON-NEGATIVE at scale max(sₐ, s_b): |a/gcd·b| (the
 // a/gcd division is exact). lcm(_, 0) = 0. A magnitude over the decimal value cap traps 22003.
-function lcmDecimalValue(a: Decimal, b: Decimal): Decimal {
+export function lcmDecimalValue(a: Decimal, b: Decimal): Decimal {
   const target = Math.max(a.scale, b.scale);
   if (a.isZero() || b.isZero()) return Decimal.zero(target);
   const g = gcdDecimalValue(a, b);
@@ -26295,7 +26297,7 @@ function lcmDecimalValue(a: Decimal, b: Decimal): Decimal {
 }
 
 // widthBucketErr is the 2201G raised by width_bucket for a bad count / equal-or-nonfinite bounds.
-function widthBucketErr(detail: string): EngineError {
+export function widthBucketErr(detail: string): EngineError {
   return engineError("invalid_argument_for_width_bucket_function", detail);
 }
 
@@ -26303,7 +26305,7 @@ function widthBucketErr(detail: string): EngineError {
 // fractional zeros (decimal.md, the shared engine of min_scale/trim_scale). roundToScale(t-1)
 // equals the value iff the digit at scale t is zero (otherwise it rounds, changing the value), so
 // the loop stops at the first non-zero fractional digit. Zero → 0.
-function minScaleOf(d: Decimal): number {
+export function minScaleOf(d: Decimal): number {
   if (d.isZero()) return 0;
   let t = d.scale;
   while (t > 0 && d.roundToScale(t - 1).cmpValue(d) === 0) t--;
@@ -26314,7 +26316,7 @@ function minScaleOf(d: Decimal): number {
 // 0 below low / count+1 at-or-above high, and the reversed (low > high) range. The bucket is an EXACT
 // truncated decimal quotient (all-positive in range, so trunc == floor). Returns the raw index (the
 // caller range-checks it to int4). count > 0 is checked by the caller.
-function widthBucketNumeric(op: Decimal, low: Decimal, high: Decimal, count: bigint): bigint {
+export function widthBucketNumeric(op: Decimal, low: Decimal, high: Decimal, count: bigint): bigint {
   const cmpBounds = low.cmpValue(high);
   if (cmpBounds === 0) throw widthBucketErr("lower bound cannot equal upper bound");
   const countDec = Decimal.fromBigInt(count);
@@ -26341,7 +26343,7 @@ function widthBucketNumeric(op: Decimal, low: Decimal, high: Decimal, count: big
 // widthBucketFloat is width_bucket over f64: the same index in binary64 (a single correctly-rounded
 // chain, so cross-core identical). A NaN operand/bound → 2201G; a non-finite bound → 2201G (the
 // operand may be ±Inf, handled by the comparisons). Returns the raw index.
-function widthBucketFloat(op: number, low: number, high: number, count: bigint): bigint {
+export function widthBucketFloat(op: number, low: number, high: number, count: bigint): bigint {
   if (Number.isNaN(op) || Number.isNaN(low) || Number.isNaN(high))
     throw widthBucketErr("operand, lower bound, and upper bound cannot be NaN");
   if (!Number.isFinite(low) || !Number.isFinite(high))
@@ -26358,7 +26360,7 @@ function widthBucketFloat(op: number, low: number, high: number, count: bigint):
   return BigInt(Math.floor(((low - op) / (low - high)) * cf)) + 1n;
 }
 
-function resolveOperandPair(
+export function resolveOperandPair(
   scope: Scope,
   lhs: Expr,
   rhs: Expr,
@@ -26392,7 +26394,7 @@ function resolveOperandPair(
 // decimal), both text, or both boolean (NULL counts as either). A mixed numeric/text pair, or
 // a boolean with a non-boolean, is a 42804 type error — comparison is overloaded across these
 // families but never compares across them.
-function classifyComparable(lt: ResolvedType, rt: ResolvedType): void {
+export function classifyComparable(lt: ResolvedType, rt: ResolvedType): void {
   // json is NOT comparable: PostgreSQL ships no btree/hash operator class for `json`, so jed matches
   // it (spec/design/json.md §5). ANY json comparison — even json × json, json × jsonb, or json × a
   // bare NULL — is 42883 (operator does not exist), distinct from the cross-family 42804 other types
@@ -26527,7 +26529,7 @@ function classifyComparable(lt: ResolvedType, rt: ResolvedType): void {
 // non-float context the resolve decimal case ignores the context and stays decimal, so this widens
 // adaptation ONLY for the float case (the int/decimal behavior is unchanged: a decimal literal
 // against an int/decimal sibling still resolves to decimal).
-function isAdaptableOperand(e: Expr): boolean {
+export function isAdaptableOperand(e: Expr): boolean {
   if (e.kind === "param") return true;
   return (
     e.kind === "literal" &&
@@ -26540,7 +26542,7 @@ function isAdaptableOperand(e: Expr): boolean {
 // the hex/uuid input); a bind parameter additionally adopts a decimal/boolean sibling (a literal
 // ignores those — its arm keeps i64/text — so widening the mapping is safe). Only a bare NULL
 // offers no context (spec/design/api.md §5).
-function ctxOf(t: ResolvedType): ScalarType | null {
+export function ctxOf(t: ResolvedType): ScalarType | null {
   if (t.kind === "int") return t.ty;
   // A float sibling offers its width so an integer/decimal literal adapts to a float context
   // (float.md §4): `f + 1.5` types `1.5` as the float width, `f = 2` types `2` as the float width.
@@ -26562,7 +26564,7 @@ function ctxOf(t: ResolvedType): ScalarType | null {
 }
 
 // intTypeOf returns the integer type of t (for promotion), or null.
-function intTypeOf(t: ResolvedType): ScalarType | null {
+export function intTypeOf(t: ResolvedType): ScalarType | null {
   return t.kind === "int" ? t.ty : null;
 }
 
@@ -26570,7 +26572,7 @@ function intTypeOf(t: ResolvedType): ScalarType | null {
 // input form (parseByteaHex), mapping malformed hex to a 22P02 (invalid_text_representation).
 // Used when a string literal adapts to a bytea context (types.md §6/§13); the trap is
 // deterministic and fires at resolve time, before any scan.
-function decodeByteaLiteral(str: string): Uint8Array {
+export function decodeByteaLiteral(str: string): Uint8Array {
   const r = parseByteaHex(str);
   if ("error" in r) {
     throw engineError(
@@ -26584,7 +26586,7 @@ function decodeByteaLiteral(str: string): Uint8Array {
 // decodeUuidLiteral decodes a single-quoted literal's content as a uuid value via the
 // PG-flexible input (parseUuid), mapping malformed input to a 22P02. Used when a string literal
 // adapts to a uuid context (types.md §6/§14); deterministic, fires at resolve before any scan.
-function decodeUuidLiteral(str: string): Uint8Array {
+export function decodeUuidLiteral(str: string): Uint8Array {
   const r = parseUuid(str);
   if ("error" in r) {
     throw engineError(
@@ -26598,9 +26600,9 @@ function decodeUuidLiteral(str: string): Uint8Array {
 // LIT_WS is the ASCII whitespace set trimmed by the int/decimal/bool string coercions — EXACTLY
 // Rust's is_ascii_whitespace (space, tab, LF, FF, CR; NO vertical tab), so the three cores trim
 // byte-identically (a §8 determinism surface — JS's Unicode-aware String.trim would diverge).
-const LIT_WS = /^[ \t\n\f\r]+|[ \t\n\f\r]+$/g;
-const trimLit = (s: string): string => s.replace(LIT_WS, "");
-const allAsciiDigits = (s: string): boolean => /^[0-9]+$/.test(s);
+export const LIT_WS = /^[ \t\n\f\r]+|[ \t\n\f\r]+$/g;
+export const trimLit = (s: string): string => s.replace(LIT_WS, "");
+export const allAsciiDigits = (s: string): boolean => /^[0-9]+$/.test(s);
 
 // floatFromDecimalLiteral converts an untyped decimal/integer literal adapting to a float context
 // into a float constant (float.md §4): the nearest binary64 to the exact decimal value (round-
@@ -26609,7 +26611,7 @@ const allAsciiDigits = (s: string): boolean => /^[0-9]+$/.test(s);
 // literal adapting to a float column is a float value, not a stored decimal. A magnitude beyond the
 // binary64 range becomes ±Infinity here — but a finite literal is meant, so an out-of-range literal
 // traps 22003 (the finite-overflow rule, §3) rather than silently yielding Infinity.
-function floatFromDecimalLiteral(d: Decimal, ty: ScalarType): { node: RExpr; type: ResolvedType } {
+export function floatFromDecimalLiteral(d: Decimal, ty: ScalarType): { node: RExpr; type: ResolvedType } {
   const exact = Number(d.render());
   if (!Number.isFinite(exact)) throw overflow(ty);
   const n = roundToWidth(ty, exact);
@@ -26630,7 +26632,7 @@ function floatFromDecimalLiteral(d: Decimal, ty: ScalarType): { node: RExpr; typ
 // is the typed NULL, and any other expression must resolve to the SAME container type (matching
 // element) else 42804. A top-level $N parameter is deferred (0A000) — INSERT's param-to-container
 // handling is special and not generalized to the assignment RHS yet.
-function resolveContainerAssign(
+export function resolveContainerAssign(
   scope: Scope,
   col: Column,
   e: Expr,
@@ -26681,7 +26683,7 @@ function resolveContainerAssign(
   return node;
 }
 
-function coerceStringToRangeExpr(
+export function coerceStringToRangeExpr(
   text: string,
   desc: RangeDesc,
 ): { node: RExpr; type: ResolvedType } {
@@ -26693,7 +26695,7 @@ function coerceStringToRangeExpr(
   };
 }
 
-function coerceStringToRange(text: string, desc: RangeDesc): Value {
+export function coerceStringToRange(text: string, desc: RangeDesc): Value {
   const parsed = parseRangeText(text);
   if (parsed.empty) return emptyRangeValue();
   const elem = elementScalar(desc);
@@ -26713,7 +26715,7 @@ function coerceStringToRange(text: string, desc: RangeDesc): Value {
 // parse by their own input, text is identity, and int/decimal/boolean are the cast from text
 // admitted only for a literal operand. 22P02 malformed / 22003 out of range / the type's parse
 // code. typmod (decimal only) re-scales the result.
-function coerceStringLiteral(
+export function coerceStringLiteral(
   s: string,
   target: ScalarType,
   typmod: DecimalTypmod | null,
@@ -26817,7 +26819,7 @@ function coerceStringLiteral(
 // typed literal (its own parse errors surface — e.g. 22P02 for a non-integer); a nested composite
 // field recurses. Folds to a `row` RExpr of the coerced const field nodes, typed as the named
 // composite (the TS-idiomatic equivalent of the Rust `RExpr::Row` over `ResolvedType::Composite`).
-function coerceStringToComposite(
+export function coerceStringToComposite(
   text: string,
   ct: CompositeType,
   db: Engine,
@@ -26873,7 +26875,7 @@ function coerceStringToComposite(
 // text→integer coercion for INTEGER '42' / CAST('42' AS int) (grammar.md §36). jed's OWN
 // integer-literal grammar: trimmed ASCII whitespace, optional +/-, then ASCII decimal digits
 // (NO hex/octal/binary or underscores — 22P02, a documented PG divergence). Out of range → 22003.
-function parseIntLiteral(s: string, ty: ScalarType): bigint {
+export function parseIntLiteral(s: string, ty: ScalarType): bigint {
   const invalid = (): Error =>
     engineError(
       "invalid_text_representation",
@@ -26901,7 +26903,7 @@ function parseIntLiteral(s: string, ty: ScalarType): bigint {
 // (digits, scale) the lexer feeds Decimal.fromDigitsScale (via the shared decimalFromParts), so
 // NUMERIC 'x' is byte-identical to writing x. NO NaN / Infinity and no hex/underscore (22P02).
 // Caller applies typmod / cap-check.
-function parseDecimalLiteral(s: string): Decimal {
+export function parseDecimalLiteral(s: string): Decimal {
   const invalid = (): Error =>
     engineError("invalid_text_representation", `invalid input syntax for type numeric: "${s}"`);
   let t = trimLit(s);
@@ -26962,7 +26964,7 @@ function parseDecimalLiteral(s: string): Decimal {
 // BOOLEAN 'true' / CAST('t' AS boolean) (grammar.md §36). Matches PostgreSQL's boolin: trimmed
 // ASCII whitespace, case-insensitive; t/tr/tru/true, y/ye/yes, on, 1 → true and f/fa/fal/fals/
 // false, n/no, off, 0 → false; anything else 22P02.
-function parseBoolLiteral(s: string): boolean {
+export function parseBoolLiteral(s: string): boolean {
   switch (trimLit(s).toLowerCase()) {
     case "t":
     case "tr":
@@ -26997,7 +26999,7 @@ function parseBoolLiteral(s: string): boolean {
 // e-notation) or one of the special words. It is validated explicitly — NOT via parseFloat, which
 // is too lenient (it accepts "1.5xyz", leading junk after trim, etc.). Anchored to the whole
 // (trimmed) string so trailing junk is rejected → 22P02.
-const FLOAT_FINITE = /^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$/;
+export const FLOAT_FINITE = /^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$/;
 
 // parseFloatLiteral parses a string literal's content as a float of type ty — the text→float
 // coercion for `float '1.5'` / `real '1e10'` / CAST('Infinity' AS f64) (float.md §4). Grammar:
@@ -27007,7 +27009,7 @@ const FLOAT_FINITE = /^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?
 // parsed binary64 is Math.fround'd; a finite value that frounds to ±Inf (beyond binary32 range)
 // also traps 22003. NaN/±Infinity are first-class here (they enter ONLY via this path, casts, or
 // stored values — float.md §3).
-function parseFloatLiteral(s: string, ty: ScalarType): number {
+export function parseFloatLiteral(s: string, ty: ScalarType): number {
   const invalid = (): Error =>
     engineError(
       "invalid_text_representation",
@@ -27048,7 +27050,7 @@ function parseFloatLiteral(s: string, ty: ScalarType): number {
 }
 
 // FLOAT_GRAMMAR_OK tests the finite-decimal grammar (a named wrapper so the regex's role is legible).
-function FLOAT_GRAMMAR_OK(t: string): boolean {
+export function FLOAT_GRAMMAR_OK(t: string): boolean {
   return FLOAT_FINITE.test(t);
 }
 
@@ -27056,13 +27058,13 @@ function FLOAT_GRAMMAR_OK(t: string): boolean {
 // the target (f32 → f64 is lossless — float.md §2), so a mixed-width float arithmetic /
 // comparison node sees both sides at one width. Identity when from === to. Implemented as a `cast`
 // RExpr (the evaluator's evalCast handles float→float widening), so no new node kind is needed.
-function widenFloatTo(node: RExpr, from: ScalarType, to: ScalarType): RExpr {
+export function widenFloatTo(node: RExpr, from: ScalarType, to: ScalarType): RExpr {
   return from === to ? node : { kind: "cast", target: to, typmod: null, varcharLen: null, operand: node };
 }
 
 // promote is the promotion-tower result type of two arithmetic operands: the
 // higher-ranked integer type, or i64 when both are untyped NULLs.
-function promote(a: ResolvedType, b: ResolvedType): ScalarType {
+export function promote(a: ResolvedType, b: ResolvedType): ScalarType {
   const ax = intTypeOf(a);
   const bx = intTypeOf(b);
   if (ax !== null && bx !== null) return rank(ax) >= rank(bx) ? ax : bx;
@@ -27073,7 +27075,7 @@ function promote(a: ResolvedType, b: ResolvedType): ScalarType {
 
 // requireNumericOperand requires that an arithmetic operand is numeric (integer or decimal,
 // or NULL); a boolean or text operand is a 42804 type error.
-function requireNumericOperand(t: ResolvedType): void {
+export function requireNumericOperand(t: ResolvedType): void {
   if (
     t.kind === "bool" ||
     t.kind === "text" ||
@@ -27103,13 +27105,13 @@ function requireNumericOperand(t: ResolvedType): void {
 // undefined when neither operand is temporal (then arithmetic falls through to the numeric path).
 // A temporal operand in an unsupported combination throws 42804. A NULL operand adopts the other
 // side's temporal type (so `timestamp ± NULL` types as timestamp and evaluates to NULL).
-type RtKind = ResolvedType["kind"];
+export type RtKind = ResolvedType["kind"];
 
 // intervalScaleResult gives the result type of an interval ×÷ number (spec/design/interval.md §5):
 // interval * number, number * interval (commute), interval / number → interval. undefined when no
 // interval is involved (or the op is not * / /). number / interval and interval × interval return
 // undefined and fall to the ±-only temporal rule (which reports the 42804).
-function intervalScaleResult(op: BinaryOp, lt: RtKind, rt: RtKind): ScalarType | undefined {
+export function intervalScaleResult(op: BinaryOp, lt: RtKind, rt: RtKind): ScalarType | undefined {
   const lIv = lt === "interval";
   const rIv = rt === "interval";
   if (!lIv && !rIv) return undefined;
@@ -27120,13 +27122,13 @@ function intervalScaleResult(op: BinaryOp, lt: RtKind, rt: RtKind): ScalarType |
 }
 
 // factorToFraction returns a numeric factor value as an exact fraction [num, den] with den > 0.
-function factorToFraction(v: Value): [bigint, bigint] {
+export function factorToFraction(v: Value): [bigint, bigint] {
   if (v.kind === "int") return [v.int, 1n];
   if (v.kind === "decimal") return parseFactorDecimal(v.dec.render());
   throw typeError("internal: non-numeric interval-scale factor");
 }
 
-function temporalArithResult(op: BinaryOp, lt: RtKind, rt: RtKind): ScalarType | undefined {
+export function temporalArithResult(op: BinaryOp, lt: RtKind, rt: RtKind): ScalarType | undefined {
   const temporal = (k: RtKind) => k === "interval" || k === "timestamp" || k === "timestamptz";
   if (!temporal(lt) && !temporal(rt)) return undefined;
   const l = lt === "null" ? rt : lt;
@@ -27160,7 +27162,7 @@ function temporalArithResult(op: BinaryOp, lt: RtKind, rt: RtKind): ScalarType |
 // integer − date nor interval − date. Any other combination involving a date is a 42804 (PG reports
 // 42883; jed uses its datatype-mismatch code, like the interval rule). A bare untyped NULL partner
 // is NOT adopted — date ± NULL is a 42804 (PG rejects the ambiguous form too).
-function dateArithResult(op: BinaryOp, lt: RtKind, rt: RtKind): ScalarType {
+export function dateArithResult(op: BinaryOp, lt: RtKind, rt: RtKind): ScalarType {
   if (
     (op === "add" && lt === "date" && rt === "int") ||
     (op === "add" && lt === "int" && rt === "date") ||
@@ -27177,7 +27179,7 @@ function dateArithResult(op: BinaryOp, lt: RtKind, rt: RtKind): ScalarType {
   throw typeError("unsupported operand types for date arithmetic");
 }
 
-function requireBool(t: ResolvedType, msg: string): void {
+export function requireBool(t: ResolvedType, msg: string): void {
   if (
     t.kind === "int" ||
     t.kind === "float" ||
@@ -27201,7 +27203,7 @@ function requireBool(t: ResolvedType, msg: string): void {
 // requireTextOrNull: LIKE requires both operands be text (or a bare NULL literal, which is
 // comparable with anything and makes the result NULL at eval). A non-text operand is a 42804
 // type error (spec/design/grammar.md §22).
-function requireTextOrNull(t: ResolvedType): void {
+export function requireTextOrNull(t: ResolvedType): void {
   if (t.kind !== "text" && t.kind !== "null") throw typeError("LIKE requires text operands");
 }
 
@@ -27210,7 +27212,7 @@ function requireTextOrNull(t: ResolvedType): void {
 // via the promotion tower (no runtime coercion — every integer is a bigint). Otherwise every element
 // must be the SAME family — a cross-family mix (including int + decimal) is a documented 42804
 // narrowing this slice (the representation-changing coercion is deferred with numeric(p,s)[]).
-function unifyArrayElementTypes(types: ResolvedType[]): ResolvedType {
+export function unifyArrayElementTypes(types: ResolvedType[]): ResolvedType {
   const nonNull = types.filter((t) => t.kind !== "null");
   if (nonNull.length === 0) return { kind: "text" };
   if (nonNull.every((t) => t.kind === "int")) {
@@ -27226,14 +27228,14 @@ function unifyArrayElementTypes(types: ResolvedType[]): ResolvedType {
 }
 
 // arraySubscriptErr is a 2202E array-subscript error (spec/design/array.md §11).
-function arraySubscriptErr(detail: string): Error {
+export function arraySubscriptErr(detail: string): Error {
   return engineError("array_subscript_error", detail);
 }
 
 // countNulls counts the NULL (when wantNulls) or non-NULL values in vals — the shared kernel of
 // num_nulls / num_nonnulls (spec/design/array-functions.md §12), over either the spread arguments or
 // a VARIADIC array's flattened elements.
-function countNulls(vals: Value[], wantNulls: boolean): number {
+export function countNulls(vals: Value[], wantNulls: boolean): number {
   let n = 0;
   for (const v of vals) if ((v.kind === "null") === wantNulls) n++;
   return n;
@@ -27243,7 +27245,7 @@ function countNulls(vals: Value[], wantNulls: boolean): number {
 // (spec/design/array-functions.md §3). The introspectors propagate NULL and return NULL for an
 // out-of-shape request; the builders are non-strict (a NULL array argument is the identity/empty, NOT
 // a propagated NULL). The resolver guarantees the array operand is an array or NULL.
-function evalArrayFunc(func: ArrayFuncName, vals: Value[]): Value {
+export function evalArrayFunc(func: ArrayFuncName, vals: Value[]): Value {
   switch (func) {
     case "array_ndims": {
       const a = vals[0]!;
@@ -27309,7 +27311,7 @@ function evalArrayFunc(func: ArrayFuncName, vals: Value[]): Value {
 // _inc/_inf readers + isempty yield boolean. For the empty range every reader but isempty is
 // false/NULL; for an infinite bound the _inf reader is true and the _inc reader false. The resolver
 // guarantees the operand is a range or NULL.
-function evalRangeFunc(func: RangeFuncName, vals: Value[]): Value {
+export function evalRangeFunc(func: RangeFuncName, vals: Value[]): Value {
   const rv = vals[0]!;
   if (rv.kind === "null") return nullValue();
   if (rv.kind !== "range") throw new Error("range accessor: range operand");
@@ -27340,7 +27342,7 @@ function evalRangeFunc(func: RangeFuncName, vals: Value[]): Value {
 // the bounds flags are read (default `[)`; a NULL 3-arg flags → 22000; an invalid flags string →
 // 42601), and finalizeRange produces the canonical value (order-check 22000, canonicalize,
 // empty-normalize).
-function evalRangeCtor(elem: ScalarType, vals: Value[]): Value {
+export function evalRangeCtor(elem: ScalarType, vals: Value[]): Value {
   const desc = rangeForElement(elem);
   if (desc === undefined) throw new Error("a range constructor's elem has a range");
   const lower = coerceRangeBound(vals[0]!, elem);
@@ -27366,13 +27368,13 @@ function evalRangeCtor(elem: ScalarType, vals: Value[]): Value {
 // for a NULL bound (an infinite bound). Reuses storeValue (the INSERT/UPDATE assignment coercion):
 // an integer range-checks into the element (22003), an int→decimal widens, a text→temporal parses,
 // and a non-assignable value is 42804 (the resolver already screened the common 42883 cases).
-function coerceRangeBound(v: Value, elem: ScalarType): Value | null {
+export function coerceRangeBound(v: Value, elem: ScalarType): Value | null {
   const stored = storeValue(v, elem, null, null, false, "range bound");
   return stored.kind === "null" ? null : stored;
 }
 
 // expectRange extracts the range value the resolver guaranteed is a (non-NULL) range operand.
-function expectRange(v: Value): Value & { kind: "range" } {
+export function expectRange(v: Value): Value & { kind: "range" } {
   if (v.kind !== "range")
     throw new Error("the range-operator resolver guarantees a range operand here");
   return v;
@@ -27383,7 +27385,7 @@ function expectRange(v: Value): Value & { kind: "range" } {
 // operators both operands are ranges; for the element overloads (containsElem/elemContainedBy) the
 // non-range operand is coerced to the range's element type `elem` (assignment-style, matching the
 // resolver's hint). The boolean kernels live in range.ts.
-function evalRangeOp(op: RangeOpName, l: Value, r: Value, elem: ScalarType): Value {
+export function evalRangeOp(op: RangeOpName, l: Value, r: Value, elem: ScalarType): Value {
   if (l.kind === "null" || r.kind === "null") return nullValue();
   let result: boolean;
   switch (op) {
@@ -27430,7 +27432,7 @@ function evalRangeOp(op: RangeOpName, l: Value, r: Value, elem: ScalarType): Val
 // evalRangeSetOp evaluates a range SET operator (range-functions.md §4, RF4) over two already-evaluated
 // operand values. STRICT: a NULL operand → NULL. "union"/"difference" raise 22000 on a non-contiguous
 // result; "intersect"/"merge" never error. The kernels live in range.ts.
-function evalRangeSetOp(op: RangeSetOpName, l: Value, r: Value): Value {
+export function evalRangeSetOp(op: RangeSetOpName, l: Value, r: Value): Value {
   if (l.kind === "null" || r.kind === "null") return nullValue();
   const a = expectRange(l);
   const b = expectRange(r);
@@ -27448,21 +27450,21 @@ function evalRangeSetOp(op: RangeSetOpName, l: Value, r: Value): Value {
 
 // notDistinct is IS NOT DISTINCT FROM at the value level (array-functions.md §5 #10): jed's total
 // element comparator, so NULL equals NULL and a non-NULL never equals NULL.
-function notDistinct(a: Value, b: Value): boolean {
+export function notDistinct(a: Value, b: Value): boolean {
   return valueCmp(a, b) === 0;
 }
 
 // strictElemEq is STRICT element equality for the containment/overlap operators (array-functions.md
 // §10): a NULL element equals NOTHING — including another NULL — the deliberate inverse of notDistinct
 // (§5 #10). For two non-NULL values it is jed's total element comparator (valueCmp === 0).
-function strictElemEq(a: Value, b: Value): boolean {
+export function strictElemEq(a: Value, b: Value): boolean {
   return a.kind !== "null" && b.kind !== "null" && valueCmp(a, b) === 0;
 }
 
 // arrayContainsValue is a @> b (array-functions.md §10): does a CONTAIN b — is every element of b
 // present in a under STRICT equality, over the flattened element multiset (any dimensionality)? A NULL
 // whole-array operand → NULL. The empty array is contained by anything (a @> {} is true).
-function arrayContainsValue(a: Value, b: Value): Value {
+export function arrayContainsValue(a: Value, b: Value): Value {
   if (a.kind !== "array" || b.kind !== "array") return nullValue();
   const contained = b.elements.every((eb) => a.elements.some((ea) => strictElemEq(ea, eb)));
   return boolValue(contained);
@@ -27471,7 +27473,7 @@ function arrayContainsValue(a: Value, b: Value): Value {
 // arrayOverlapsValue is a && b (array-functions.md §10): do a and b OVERLAP — share at least one
 // element under STRICT equality, over the flattened element multiset (any dimensionality)? A NULL
 // whole-array operand → NULL. The empty array overlaps nothing.
-function arrayOverlapsValue(a: Value, b: Value): Value {
+export function arrayOverlapsValue(a: Value, b: Value): Value {
   if (a.kind !== "array" || b.kind !== "array") return nullValue();
   const overlaps = a.elements.some((ea) => b.elements.some((eb) => strictElemEq(ea, eb)));
   return boolValue(overlaps);
@@ -27480,7 +27482,7 @@ function arrayOverlapsValue(a: Value, b: Value): Value {
 // arrayRemoveValue is array_remove(a, e) (array-functions.md §8): drop every element NOT DISTINCT
 // FROM e. NULL array → NULL; 1-D/empty only (a multidimensional array is 0A000); the lower bound is
 // preserved and an all-removed result is the empty array {}.
-function arrayRemoveValue(arr: Value, elem: Value): Value {
+export function arrayRemoveValue(arr: Value, elem: Value): Value {
   if (arr.kind !== "array") return nullValue();
   if (arr.dims.length > 1) {
     throw engineError(
@@ -27497,7 +27499,7 @@ function arrayRemoveValue(arr: Value, elem: Value): Value {
 // arrayReplaceValue is array_replace(a, from, to) (array-functions.md §8): substitute every element
 // NOT DISTINCT FROM `from` with `to`. Works on any dimensionality (the shape is preserved). NULL
 // array → NULL.
-function arrayReplaceValue(arr: Value, from: Value, to: Value): Value {
+export function arrayReplaceValue(arr: Value, from: Value, to: Value): Value {
   if (arr.kind !== "array") return nullValue();
   const elements = arr.elements.map((e) => (notDistinct(e, from) ? to : e));
   return {
@@ -27512,7 +27514,7 @@ function arrayReplaceValue(arr: Value, from: Value, to: Value): Value {
 // array's lower-bound space) of the first element NOT DISTINCT FROM e, NULL if absent. 1-D/empty only
 // (a multidimensional array is 0A000); the optional start is a subscript to begin at, and a NULL
 // start is 22004.
-function arrayPositionValue(arr: Value, elem: Value, start: Value | null): Value {
+export function arrayPositionValue(arr: Value, elem: Value, start: Value | null): Value {
   if (arr.kind !== "array") return nullValue();
   if (arr.dims.length > 1) {
     throw engineError(
@@ -27537,7 +27539,7 @@ function arrayPositionValue(arr: Value, elem: Value, start: Value | null): Value
 // arrayPositionsValue is array_positions(a, e) (array-functions.md §8): the i32[] of every match's
 // subscript (in the array's lower-bound space), the empty array {} if none. NULL array → NULL;
 // 1-D/empty only (a multidimensional array is 0A000).
-function arrayPositionsValue(arr: Value, elem: Value): Value {
+export function arrayPositionsValue(arr: Value, elem: Value): Value {
   if (arr.kind !== "array") return nullValue();
   if (arr.dims.length > 1) {
     throw engineError(
@@ -27555,7 +27557,7 @@ function arrayPositionsValue(arr: Value, elem: Value): Value {
 
 // arrayDimsText is the array_dims text form `[l1:u1][l2:u2]…` (no trailing `=`, unlike array_out's
 // prefix — array-functions.md §3.1).
-function arrayDimsText(a: { dims: number[]; lbounds: number[] }): string {
+export function arrayDimsText(a: { dims: number[]; lbounds: number[] }): string {
   let s = "";
   for (let d = 0; d < a.dims.length; d++) s += "[" + a.lbounds[d] + ":" + arrayUbound(a, d) + "]";
   return s;
@@ -27564,7 +27566,7 @@ function arrayDimsText(a: { dims: number[]; lbounds: number[] }): string {
 // arrayExtend is array_append (atEnd=true) / array_prepend (array-functions.md §3.2). The array side
 // is non-strict: a NULL or empty array yields the 1-D singleton {elem} (lower bound 1). A 1-D array
 // grows by one element, preserving its lower bound; a multidimensional array is 22000.
-function arrayExtend(arr: Value, elem: Value, atEnd: boolean): Value {
+export function arrayExtend(arr: Value, elem: Value, atEnd: boolean): Value {
   if (arr.kind !== "array" || arr.dims.length === 0) return arrayValue([elem]);
   if (arr.dims.length !== 1) {
     throw engineError("data_exception", "argument must be empty or one-dimensional array");
@@ -27583,7 +27585,7 @@ function arrayExtend(arr: Value, elem: Value, atEnd: boolean): Value {
 // inner dims match; an off-by-one dimensionality appends/prepends the lower one as an outer slice; any
 // other pairing — or an inner-dim mismatch — is 2202E. The flattened element list is always a ++ b
 // (row-major, outer-first); the result lower bounds come from the higher-dim operand.
-function arrayCatValues(a: Value, b: Value): Value {
+export function arrayCatValues(a: Value, b: Value): Value {
   if (a.kind === "null" && b.kind === "null") return nullValue();
   if (a.kind === "null") return b;
   if (b.kind === "null") return a;
@@ -27622,7 +27624,7 @@ function arrayCatValues(a: Value, b: Value): Value {
 // one higher dimension (spec/design/array.md §4). The resolver guarantees every item is an array; a
 // NULL sub-array or a sub-array of differing shape is a 2202E. Stacking empty sub-arrays yields the
 // empty array (PG: ARRAY['{}'::int[]] → {}).
-function buildNestedArray(subs: Value[]): Value {
+export function buildNestedArray(subs: Value[]): Value {
   const mismatch = "multidimensional arrays must have array expressions with matching dimensions";
   const arrs = subs.map((sv) => {
     if (sv.kind === "array") return sv;
@@ -27650,7 +27652,7 @@ function buildNestedArray(subs: Value[]): Value {
 // evalSubscript evaluates an array subscript `base[..][..]` (spec/design/array.md §6). A NULL array
 // or any NULL subscript bound yields NULL; element access returns the element (or NULL), slice
 // access a (renumbered) sub-array.
-function evalSubscript(
+export function evalSubscript(
   e: { base: RExpr; subscripts: RSubscript[]; isSlice: boolean },
   row: Row,
   env: EvalEnv,
@@ -27696,7 +27698,7 @@ function evalSubscript(
 
 // evalOptBound evaluates an optional slice-bound expression: null expr → null (defer to the array
 // bound); a NULL value → "null" (the whole result is NULL); an integer → its bigint.
-function evalOptBound(e: RExpr | null, row: Row, env: EvalEnv, m: Meter): bigint | null | "null" {
+export function evalOptBound(e: RExpr | null, row: Row, env: EvalEnv, m: Meter): bigint | null | "null" {
   if (e === null) return null;
   const v = evalExpr(e, row, env, m);
   if (v.kind === "null") return "null";
@@ -27707,7 +27709,7 @@ function evalOptBound(e: RExpr | null, row: Row, env: EvalEnv, m: Meter): bigint
 // arrayGetElement reads a single array element by idxs (1-based per dimension, using the value's
 // lower bounds) — spec/design/array.md §6. NULL when the subscript count ≠ ndim or any index is out
 // of range.
-function arrayGetElement(
+export function arrayGetElement(
   a: { dims: number[]; lbounds: number[]; elements: Value[] },
   idxs: bigint[],
 ): Value {
@@ -27730,7 +27732,7 @@ function arrayGetElement(
 // subscripts, an empty source, or any empty clamped dimension yields the empty array; fewer
 // subscripts than ndim leave the trailing dimensions at full range. The result is renumbered to lower
 // bound 1 on every dimension (PG array_get_slice).
-function arrayGetSlice(
+export function arrayGetSlice(
   a: { dims: number[]; lbounds: number[]; elements: Value[] },
   los: (bigint | null)[],
   his: (bigint | null)[],
@@ -27786,7 +27788,7 @@ function arrayGetSlice(
 // numeric unify to decimal if any is decimal, else the widest integer (the promotion tower);
 // otherwise they must all be the same non-numeric family (text/boolean/bytea). A cross-family mix
 // is 42804.
-function unifyCaseTypes(arms: ResolvedType[]): ResolvedType {
+export function unifyCaseTypes(arms: ResolvedType[]): ResolvedType {
   const nonNull = arms.filter((t) => t.kind !== "null");
   if (nonNull.length === 0) return { kind: "text" }; // every arm NULL/untyped → text
   let allNumeric = true;
@@ -27823,13 +27825,13 @@ function unifyCaseTypes(arms: ResolvedType[]): ResolvedType {
 // coercion needed is widening an integer result to decimal when the unified type is decimal —
 // integer-width unification needs none (all integers are bigint), and an all-NULL CASE is text but
 // every arm evaluates to NULL anyway.
-function coerceCaseValue(v: Value, toDecimal: boolean): Value {
+export function coerceCaseValue(v: Value, toDecimal: boolean): Value {
   if (toDecimal && v.kind === "int") return decimalValue(Decimal.fromBigInt(v.int));
   return v;
 }
 
 // setopName is the operator's name for an error message (PostgreSQL phrasing).
-function setopName(op: SetOpKind): string {
+export function setopName(op: SetOpKind): string {
   return op === "union" ? "UNION" : op === "intersect" ? "INTERSECT" : "EXCEPT";
 }
 
@@ -27846,7 +27848,7 @@ function setopName(op: SetOpKind): string {
 // including a composite or array column across rows (a deferred edge) — is 42804. Enumerated
 // EXPLICITLY (not a generic same-kind passthrough) so all three cores compute byte-identical
 // results (CLAUDE.md §8).
-function unifyValuesColumn(a: ResolvedType, b: ResolvedType): ResolvedType {
+export function unifyValuesColumn(a: ResolvedType, b: ResolvedType): ResolvedType {
   if (a.kind === "null" && b.kind === "null") return { kind: "null" };
   if (a.kind === "null") return b;
   if (b.kind === "null") return a;
@@ -27878,7 +27880,7 @@ function unifyValuesColumn(a: ResolvedType, b: ResolvedType): ResolvedType {
 // unified type (spec/design/grammar.md §42). A scalar type flows through; a NULL / composite / array
 // column has no scalar parameter type, so null is returned and the parameter stays untyped (42P18 at
 // finalize).
-function scalarForParamHint(rt: ResolvedType): ScalarType | null {
+export function scalarForParamHint(rt: ResolvedType): ScalarType | null {
   switch (rt.kind) {
     case "int":
     case "float":
@@ -27912,7 +27914,7 @@ function scalarForParamHint(rt: ResolvedType): ScalarType | null {
   }
 }
 
-function unifySetopColumn(a: ResolvedType, b: ResolvedType, op: SetOpKind): ResolvedType {
+export function unifySetopColumn(a: ResolvedType, b: ResolvedType, op: SetOpKind): ResolvedType {
   if (a.kind === "null" && b.kind === "null") return { kind: "null" };
   if (a.kind === "null") return b;
   if (b.kind === "null") return a;
@@ -27935,7 +27937,7 @@ function unifySetopColumn(a: ResolvedType, b: ResolvedType, op: SetOpKind): Reso
 // coerceSetopRows converts each row's values in place to the unified set-operation column types —
 // the only runtime change is integer -> decimal (a NULL stays NULL; integer-width promotion is a
 // value no-op since every integer is bigint). Same conversion coerceCaseValue uses for CASE.
-function coerceSetopRows(rows: Value[][], from: ResolvedType[], to: ResolvedType[]): void {
+export function coerceSetopRows(rows: Value[][], from: ResolvedType[], to: ResolvedType[]): void {
   for (let i = 0; i < to.length; i++) {
     if (from[i]!.kind === "int" && to[i]!.kind === "decimal") {
       for (const row of rows) {
@@ -27961,7 +27963,7 @@ function coerceSetopRows(rows: Value[][], from: ResolvedType[], to: ResolvedType
 // key is its FIRST occurrence scanning the LEFT operand then the right, and emitted rows keep that
 // left-then-right scan order — deterministic and identical across cores. (A later ORDER BY
 // re-sorts; without one, output order is unspecified and the corpus compares rowsort.)
-function combineSetop(op: SetOpKind, all: boolean, left: Value[][], right: Value[][]): Value[][] {
+export function combineSetop(op: SetOpKind, all: boolean, left: Value[][], right: Value[][]): Value[][] {
   if (op === "union" && all) return left.concat(right);
   if (op === "union") {
     const seen = new Set<string>();
@@ -28039,7 +28041,7 @@ function combineSetop(op: SetOpKind, all: boolean, left: Value[][], right: Value
 // resolveSetopOrderKey resolves a trailing ORDER BY key for a set operation against the OUTPUT
 // column names (the left operand's). A qualified key is 42P01 (no relation scope after a set
 // operation); an unknown name is 42703. Returns the output column index.
-function resolveSetopOrderKey(key: OrderKey, names: string[]): number {
+export function resolveSetopOrderKey(key: OrderKey, names: string[]): number {
   // A set-operation ORDER BY accepts only an output column name or ordinal — a general expression key
   // (after the inputs are unified) is 0A000, matching PostgreSQL's "invalid UNION/INTERSECT/EXCEPT
   // ORDER BY clause" (grammar.md §10).
@@ -28072,11 +28074,11 @@ function resolveSetopOrderKey(key: OrderKey, names: string[]): number {
 // sort key matches a select-list expression. The AST carries no source positions, so textually-
 // identical fragments (`a + b` here and there) compare equal; the recursion descends arrays and the
 // discriminated-union nodes, comparing primitives (incl. bigint and a Decimal's fields) by value.
-function exprEqual(a: Expr, b: Expr): boolean {
+export function exprEqual(a: Expr, b: Expr): boolean {
   return astDeepEqual(a, b);
 }
 
-function astDeepEqual(a: unknown, b: unknown): boolean {
+export function astDeepEqual(a: unknown, b: unknown): boolean {
   if (a === b) return true; // identical primitives (incl. equal bigints) and the same reference
   if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
   const aArr = Array.isArray(a);
@@ -28105,7 +28107,7 @@ function astDeepEqual(a: unknown, b: unknown): boolean {
 // (or NULL). A decimal value into an integer column is NOT assignable (decimal→int is
 // explicit-CAST only). Any cross-family pair is a 42804 type error. Mirrors the INSERT literal
 // type-check, generalized to expressions.
-function requireAssignable(t: ResolvedType, colTy: ScalarType, col: string): void {
+export function requireAssignable(t: ResolvedType, colTy: ScalarType, col: string): void {
   let ok: boolean;
   if (isInteger(colTy)) ok = t.kind === "int" || t.kind === "null";
   else if (isDecimal(colTy)) ok = t.kind === "int" || t.kind === "decimal" || t.kind === "null";
@@ -28134,13 +28136,13 @@ function requireAssignable(t: ResolvedType, colTy: ScalarType, col: string): voi
 // (a text/boolean/decimal PRIMARY KEY, a CAST to text/boolean) are enforced at the call site.
 // MAX_VARCHAR_LEN is PostgreSQL's varchar(n) ceiling (spec/design/types.md §15); stored on disk
 // as a u32.
-const MAX_VARCHAR_LEN = 10485760;
+export const MAX_VARCHAR_LEN = 10485760;
 
 // resolveTypeAndTypmod resolves a scalar type name + optional type modifier, returning the type,
 // the decimal typmod (decimal), and the varchar(n) max length (text — spec/design/types.md §15).
 // At most one typmod is ever non-null (they belong to different types); a typmod on any other type
 // is 0A000.
-function resolveTypeAndTypmod(
+export function resolveTypeAndTypmod(
   name: string,
   typeMod: TypeMod | null,
 ): [ScalarType, DecimalTypmod | null, number | null] {
@@ -28160,7 +28162,7 @@ function resolveTypeAndTypmod(
 // validateVarcharTypmod validates a varchar(n) type modifier: 1 <= n <= 10485760 (PostgreSQL's
 // varchar ceiling), else trap 22023 (spec/design/types.md §15). A scale (varchar(n,m)) is a syntax
 // error — varchar takes a single length argument.
-function validateVarcharTypmod(tm: TypeMod): number {
+export function validateVarcharTypmod(tm: TypeMod): number {
   if (tm.scale !== null) {
     throw engineError("syntax_error", "varchar takes exactly one type modifier (a length)");
   }
@@ -28179,7 +28181,7 @@ function validateVarcharTypmod(tm: TypeMod): number {
 
 // validateDecimalTypmod validates a decimal numeric(p[,s]) type modifier: 1 <= p <= 1000,
 // 0 <= s <= p; else trap 22023 (spec/design/decimal.md §2). numeric(p) means scale 0.
-function validateDecimalTypmod(tm: TypeMod): DecimalTypmod {
+export function validateDecimalTypmod(tm: TypeMod): DecimalTypmod {
   const p = tm.precision;
   if (p < 1n || p > BigInt(MAX_PRECISION)) {
     throw engineError(
@@ -28202,7 +28204,7 @@ function validateDecimalTypmod(tm: TypeMod): DecimalTypmod {
 // integer into a decimal column widens (int→decimal) then coerces to the typmod; a decimal into
 // a decimal column coerces to the typmod (rounds, precision-checks → 22003); a boolean into a
 // boolean column is accepted as-is; a cross-family value (decimal→int, text→int, etc.) is 42804.
-function storeValue(
+export function storeValue(
   v: Value,
   colTy: ScalarType,
   typmod: DecimalTypmod | null,
@@ -28339,14 +28341,14 @@ function storeValue(
 
 // coerceDecimal coerces a decimal into a column's typmod: round to the declared scale and
 // precision-check (22003) for numeric(p,s); for an unconstrained numeric column just cap-check.
-function coerceDecimal(d: Decimal, typmod: DecimalTypmod | null): Decimal {
+export function coerceDecimal(d: Decimal, typmod: DecimalTypmod | null): Decimal {
   return typmod !== null ? d.coerceToTypmod(typmod.precision, typmod.scale) : d.checkCap();
 }
 
 // truncateToChars truncates a text value to at most n code points (the explicit varchar(n) cast
 // rule — spec/design/types.md §15). JS strings are UTF-16, so the [...s] code-point iterator is
 // used, NOT s.slice, which would split astral characters mid-surrogate.
-function truncateToChars(s: string, n: number): string {
+export function truncateToChars(s: string, n: number): string {
   const cps = [...s];
   return cps.length <= n ? s : cps.slice(0, n).join("");
 }
@@ -28356,7 +28358,7 @@ function truncateToChars(s: string, n: number): string {
 // UNLESS every excess code point is a space (U+0020), in which case it is silently truncated to n
 // (the SQL-standard trailing-space exception PostgreSQL implements). A null varcharLen (an
 // unbounded text column) passes the value through unchanged.
-function coerceVarcharStore(s: string, varcharLen: number | null, colName: string): string {
+export function coerceVarcharStore(s: string, varcharLen: number | null, colName: string): string {
   if (varcharLen === null) return s;
   const cps = [...s];
   if (cps.length <= varcharLen) return s;
@@ -28372,7 +28374,7 @@ function coerceVarcharStore(s: string, varcharLen: number | null, colName: strin
 }
 
 // literalToValue wraps a parsed literal as a runtime value (type-check/coercion is storeValue).
-function literalToValue(lit: Literal): Value {
+export function literalToValue(lit: Literal): Value {
   switch (lit.kind) {
     case "null":
       return nullValue();
@@ -28390,7 +28392,7 @@ function literalToValue(lit: Literal): Value {
 // coerceForStore coerces a value into a column of resolved ColType (spec/design/composite.md §4):
 // a scalar dispatches to storeValue; a composite to storeComposite. The single store-coercion seam
 // the INSERT/UPDATE paths use.
-function coerceForStore(
+export function coerceForStore(
   v: Value,
   ty: ColType,
   typmod: DecimalTypmod | null,
@@ -28411,7 +28413,7 @@ function coerceForStore(
 // the value passes through; any other value is a 42804. An infinite bound is null and skipped;
 // bounds are never NULL here (a null bound is infinite, not NULL), so the element store is never
 // NOT NULL.
-function storeRange(v: Value, elem: ColType, notNull: boolean, colName: string): Value {
+export function storeRange(v: Value, elem: ColType, notNull: boolean, colName: string): Value {
   if (v.kind === "null") {
     if (notNull) {
       throw engineError(
@@ -28433,7 +28435,7 @@ function storeRange(v: Value, elem: ColType, notNull: boolean, colName: string):
 // storeArray coerces a value into an ARRAY column (spec/design/array.md §4): NULL honours NOT NULL
 // (23502); an array value coerces each element to the declared element type via coerceForStore (a
 // NULL element is allowed — array elements are nullable). Any other value is a 42804.
-function storeArray(v: Value, elem: ColType, notNull: boolean, colName: string): Value {
+export function storeArray(v: Value, elem: ColType, notNull: boolean, colName: string): Value {
   if (v.kind === "null") {
     if (notNull) {
       throw engineError(
@@ -28456,7 +28458,7 @@ function storeArray(v: Value, elem: ColType, notNull: boolean, colName: string):
 // NOT NULL (23502); a composite value must have exactly the declared field count (42804) and each
 // field is coerced to its declared field type via coerceForStore (recursing); any other value is a
 // 42804. A NULL field of a NOT NULL composite field traps 23502.
-function storeComposite(
+export function storeComposite(
   v: Value,
   typeName: string,
   fields: ColField[],
@@ -28500,7 +28502,7 @@ function storeComposite(
 // composite slot is a ROW(…) whose fields recurse against the composite's field types, or a bound
 // $N. The result is then fully coerced/range-checked by coerceForStore. DEFAULT is handled by the
 // caller at the top level (it is not a valid field inside a ROW(…)).
-function materializeInsertValue(iv: InsertValue, ty: ColType, bound: Value[]): Value {
+export function materializeInsertValue(iv: InsertValue, ty: ColType, bound: Value[]): Value {
   if (ty.kind === "array") {
     switch (iv.kind) {
       case "array": {
@@ -28599,7 +28601,7 @@ function materializeInsertValue(iv: InsertValue, ty: ColType, bound: Value[]): V
 // coerceStringToArray parses a text array literal into an array Value against the element ColType
 // via array_in (spec/design/array.md §7): each token is coerced to the element type (an unquoted
 // NULL token → NULL element). A malformed literal is 22P02.
-function coerceStringToArray(s: string, elem: ColType): Value {
+export function coerceStringToArray(s: string, elem: ColType): Value {
   const parsed: ArrayInResult = parseArrayLiteral(s);
   if (!parsed.ok) {
     if (parsed.err === "boundflip")
@@ -28625,7 +28627,7 @@ function coerceStringToArray(s: string, elem: ColType): Value {
 // composite via record_in (recursive — the array-of-composite quoting nests, §12 AC1). Self-contained
 // over the resolved ColType (no catalog re-walk). A nested-array element would recurse, but
 // array-of-array is not a jed type, so it is unreachable in v1.
-function coerceArrayElementText(tok: string, elem: ColType): Value {
+export function coerceArrayElementText(tok: string, elem: ColType): Value {
   if (elem.kind === "composite") return coerceRecordTextToValue(tok, elem);
   if (elem.kind === "array") return coerceStringToArray(tok, elem.elem);
   // A range element is unreachable: array-of-range is not a storable jed type (R2), so an array
@@ -28641,7 +28643,7 @@ function coerceArrayElementText(tok: string, elem: ColType): Value {
 // parseRecordTokens and recursively coerced per field (a scalar field respects its decimal typmod).
 // Mirrors coerceStringToComposite but produces a Value directly and walks ColType (no Engine). A
 // bad shape / field count is 22P02.
-function coerceRecordTextToValue(
+export function coerceRecordTextToValue(
   text: string,
   ct: { kind: "composite"; name: string; fields: ColField[] },
 ): Value {
@@ -28668,7 +28670,7 @@ function coerceRecordTextToValue(
 
 // rexprConstToValue extracts the Value from a constant RExpr (the const nodes coerceStringLiteral
 // produces).
-function rexprConstToValue(e: RExpr): Value {
+export function rexprConstToValue(e: RExpr): Value {
   switch (e.kind) {
     case "constNull":
       return nullValue();
@@ -28705,18 +28707,18 @@ function rexprConstToValue(e: RExpr): Value {
   }
 }
 
-function overflow(ty: ScalarType): Error {
+export function overflow(ty: ScalarType): Error {
   return engineError(
     "numeric_value_out_of_range",
     "value out of range for type " + canonicalName(ty),
   );
 }
 
-function typeError(msg: string): Error {
+export function typeError(msg: string): Error {
   return engineError("datatype_mismatch", msg);
 }
 
-const I64_MIN = -9223372036854775808n;
+export const I64_MIN = -9223372036854775808n;
 
 // evalExpr evaluates against a row, accruing cost into m, and returns a Value (a boolean
 // for comparisons / connectives). Arithmetic throws 22003 on overflow and 22012 on a zero
@@ -28732,7 +28734,7 @@ const I64_MIN = -9223372036854775808n;
 // = TRUE) independent of lv. Otherwise: a positive match -> TRUE; else a NULL element (or NULL lv)
 // -> NULL; else FALSE. NOT IN is the Kleene negation. Shared by the folded "inValues" node and the
 // correlated "subquery"/in eval.
-function inMembership(lv: Value, list: Value[], negated: boolean, m: Meter): Value {
+export function inMembership(lv: Value, list: Value[], negated: boolean, m: Meter): Value {
   if (list.length === 0) return { kind: "bool", value: negated };
   let anyMatch = false;
   let anyNull = false;
@@ -28759,7 +28761,7 @@ function inMembership(lv: Value, list: Value[], negated: boolean, m: Meter): Val
 // range traps 22008 (jed's date range is wider than the timestamp range — date.md §1). bigint
 // never overflows, so the i64 range is checked explicitly (mirroring Rust's checked_mul / Go's
 // mul64); a finite day count cannot equal a sentinel (i64 min/max are not multiples of a day).
-function dateMidnightMicros(d: bigint): bigint {
+export function dateMidnightMicros(d: bigint): bigint {
   const MICROS_PER_DAY = 86_400n * 1_000_000n;
   if (d === DATE_POS_INFINITY) return POS_INFINITY;
   if (d === DATE_NEG_INFINITY) return NEG_INFINITY;
@@ -28775,7 +28777,7 @@ function dateMidnightMicros(d: bigint): bigint {
 // 22008; a difference beyond i32 traps 22008), and date ± interval → timestamp (the date widens to
 // midnight, then the timestamp ± interval calendar shift). The resolver guarantees a Date operand
 // is present and settled `result`. Day counts are bigint (the uniform-integer discipline).
-function evalDateArith(op: BinaryOp, a: Value, b: Value, result: ScalarType): Value {
+export function evalDateArith(op: BinaryOp, a: Value, b: Value, result: ScalarType): Value {
   // date ± interval → timestamp: widen the date to midnight micros, then the calendar shift.
   if (isTimestamp(result)) {
     const d = a.kind === "date" ? a.days : (b as { days: bigint }).days;
@@ -28812,7 +28814,7 @@ function evalDateArith(op: BinaryOp, a: Value, b: Value, result: ScalarType): Va
 // to `to` (timestamp/timestamptz/date). The casts crossing the timestamptz boundary consult the
 // session zone (charging timezone); the others are zone-free. ±infinity maps to the target's own
 // sentinel. The (source family, to) pair is guaranteed cross-family by the resolver.
-function evalDateConvert(v: Value, to: ScalarType, env: EvalEnv, m: Meter): Value {
+export function evalDateConvert(v: Value, to: ScalarType, env: EvalEnv, m: Meter): Value {
   const MICROS_PER_DAY = 86_400n * 1_000_000n;
   const microsToDate = (mc: bigint): Value => {
     if (mc === POS_INFINITY) return dateValue(DATE_POS_INFINITY);
@@ -28854,7 +28856,7 @@ function evalDateConvert(v: Value, to: ScalarType, env: EvalEnv, m: Meter): Valu
   throw new Error("unreachable: resolver restricts dateConvert to cross-family datetime casts");
 }
 
-function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
+export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
   // Enforce the cost ceiling before evaluating this node (CLAUDE.md §13). evalExpr recurses once
   // per expression node, so guarding here bounds a pathological expression to ~O(1) overshoot; it
   // is a no-op when no ceiling is set (spec/design/cost.md §6).
@@ -30560,7 +30562,7 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
 // FALSE) and ALL (all=true) the AND-fold (FALSE if any is FALSE, else NULL if any is NULL, else TRUE;
 // empty -> TRUE). Each element comparison charges one operator_eval (+ size-scaled decimal_work),
 // exactly like inMembership, so max_cost bounds the walk (54P01).
-function quantifiedMembership(op: BinaryOp, all: boolean, lv: Value, av: Value, m: Meter): Value {
+export function quantifiedMembership(op: BinaryOp, all: boolean, lv: Value, av: Value, m: Meter): Value {
   if (av.kind === "null") return nullValue();
   if (av.kind !== "array") throw new Error("BUG: the resolver requires an array right operand");
   let anyNull = false;
@@ -30596,7 +30598,7 @@ function quantifiedMembership(op: BinaryOp, all: boolean, lv: Value, av: Value, 
 // composite elements (array.md §5). A whole-element NULL is still UNKNOWN — the operator stays strict
 // at the value level — so the resolver-guaranteed same-type pair is composite-vs-composite or
 // composite-vs-NULL.
-function quantifiedCmp3(op: BinaryOp, x: Value, e: Value): ThreeValued {
+export function quantifiedCmp3(op: BinaryOp, x: Value, e: Value): ThreeValued {
   if (x.kind === "composite" || e.kind === "composite") {
     if (x.kind === "null" || e.kind === "null") return "unknown";
     const ord = valueCmp(x, e);
@@ -30648,7 +30650,7 @@ function quantifiedCmp3(op: BinaryOp, x: Value, e: Value): ThreeValued {
 // the escape character is the LAST pattern character reached during matching (PostgreSQL's "LIKE
 // pattern must not end with escape character") — data-dependent, since an earlier mismatch
 // returns false first.
-function likeMatch(subject: string, pattern: string): boolean {
+export function likeMatch(subject: string, pattern: string): boolean {
   const s = Array.from(subject);
   const p = Array.from(pattern);
   let si = 0;
@@ -30704,7 +30706,7 @@ function likeMatch(subject: string, pattern: string): boolean {
 // and 22003 if the result falls outside the declared result type (the i16+i16 →
 // i16 boundary — spec/design/functions.md §7). The MinInt64/-1 cases trap to match the
 // Rust/Go checked-op behaviour (bigint would not overflow on its own).
-function evalArith(op: BinaryOp, x: bigint, y: bigint, result: ScalarType): Value {
+export function evalArith(op: BinaryOp, x: bigint, y: bigint, result: ScalarType): Value {
   let v: bigint;
   switch (op) {
     case "add":
@@ -30742,7 +30744,7 @@ function evalArith(op: BinaryOp, x: bigint, y: bigint, result: ScalarType): Valu
 // the overflow check is then re-applied because fround can push a finite double past binary32 range.
 // `%` is IEEE remainder via JS `%` (which is fmod — truncated, dividend's sign), exact, never
 // overflows.
-function evalFloatArith(op: BinaryOp, x: number, y: number, result: ScalarType): Value {
+export function evalFloatArith(op: BinaryOp, x: number, y: number, result: ScalarType): Value {
   const f32 = result === "f32";
   const finiteInputs = Number.isFinite(x) && Number.isFinite(y);
   let r: number;
@@ -30781,8 +30783,8 @@ function evalFloatArith(op: BinaryOp, x: number, y: number, result: ScalarType):
 //   sqrt(neg) → 22003; ln(0)/ln(neg) → 22003; exp overflow → 22003; sin/cos/tan never trap.
 // PG's exact RADIANS_PER_DEGREE literal (float.c) — shared by radians/degrees so the single IEEE
 // multiply/divide is byte-identical cross-core and matches PG (in-contract).
-const RADIANS_PER_DEGREE = 0.0174532925199432957692;
-function evalFloatFunc(func: ScalarFuncName, x: number, places: number, result: ScalarType): Value {
+export const RADIANS_PER_DEGREE = 0.0174532925199432957692;
+export function evalFloatFunc(func: ScalarFuncName, x: number, places: number, result: ScalarType): Value {
   const out = (r: number): Value => {
     // result is f64 for all but abs; abs's result is the operand width, so fround for f32.
     if (result === "f32") {
@@ -30899,7 +30901,7 @@ function evalFloatFunc(func: ScalarFuncName, x: number, places: number, result: 
 // evalFloatPow evaluates pow(x, y) → f64 (float.md §8): native Math.pow (transcendental,
 // exempted), trapping 22003 on a finite-input overflow to ±Inf (e.g. pow(10, 400)); a NaN/±Inf
 // operand propagates per IEEE. result is f64 (the catalog), so no fround.
-function evalFloatPow(x: number, y: number, result: ScalarType): Value {
+export function evalFloatPow(x: number, y: number, result: ScalarType): Value {
   const r = x ** y;
   if (Number.isFinite(x) && Number.isFinite(y) && !Number.isFinite(r)) throw overflow(result);
   return result === "f32" ? float32Value(Math.fround(r)) : float64Value(r);
@@ -30911,7 +30913,7 @@ function evalFloatPow(x: number, y: number, result: ScalarType): Value {
 // unscales. Done in binary64; the caller frounds for a f32 result of round (catalog result is
 // f64, so in practice no fround). Note: this is approximate at the binary level (the scale
 // factor is not exactly representable) — acceptable since float rounding is in the R-tag surface.
-function roundFloatHalfAway(x: number, places: number): number {
+export function roundFloatHalfAway(x: number, places: number): number {
   if (!Number.isFinite(x)) return x;
   const f = 10 ** places;
   const scaled = x * f;
@@ -30922,7 +30924,7 @@ function roundFloatHalfAway(x: number, places: number): number {
 // evalCast evaluates a (non-NULL) CAST to target. int→int range-checks (22003); int→decimal
 // widens then coerces to the typmod; decimal→int rounds half-away to scale 0 then range-checks
 // (22003); decimal→decimal re-scales to the typmod (spec/design/decimal.md §6).
-function evalCast(v: Value, target: ScalarType, typmod: DecimalTypmod | null): Value {
+export function evalCast(v: Value, target: ScalarType, typmod: DecimalTypmod | null): Value {
   // The JSON cast matrix (spec/design/json.md §6.1). text → json/jsonb is the only runtime text
   // cast (every other text cast target is resolver-rejected): json validates + stores verbatim
   // (22P02 on malformed); jsonb parses + canonicalizes.
@@ -31050,7 +31052,7 @@ function evalCast(v: Value, target: ScalarType, typmod: DecimalTypmod | null): V
 // makeFloat builds a float Value at `ty`, trapping 22003 if a finite-source value rounds to ±Inf
 // (the finite-overflow rule; the source here is already finite — only f32 rounding can push a
 // finite double beyond binary32 range). Used by int/decimal → float.
-function makeFloat(ty: ScalarType, n: number): Value {
+export function makeFloat(ty: ScalarType, n: number): Value {
   const r = ty === "f32" ? Math.fround(n) : n;
   if (!Number.isFinite(r)) throw overflow(ty);
   return ty === "f32" ? float32Value(r) : float64Value(r);
@@ -31059,7 +31061,7 @@ function makeFloat(ty: ScalarType, n: number): Value {
 // makeFloatCast builds a float Value at `ty` from a float SOURCE value, where a NaN/±Inf source is
 // preserved (it propagates — float→float is not a finite operation). Only a FINITE double that
 // frounds past binary32 range traps 22003. Used by float → float casts.
-function makeFloatCast(ty: ScalarType, n: number): Value {
+export function makeFloatCast(ty: ScalarType, n: number): Value {
   if (ty === "f64") return float64Value(n);
   const r = Math.fround(n);
   // A finite double beyond binary32 range frounds to ±Inf → trap; a NaN/±Inf source stays as-is.
@@ -31071,13 +31073,13 @@ function makeFloatCast(ty: ScalarType, n: number): Value {
 // mode — decimal.md §3; float.md §6). Math.round rounds half UP (toward +Inf), which differs for
 // negative ties (Math.round(-2.5) = -2, want -3), so negatives are handled by magnitude. BigInt of
 // a non-integer JS number throws, so the rounded (integral) double is converted.
-function floatToIntHalfAway(v: number): bigint {
+export function floatToIntHalfAway(v: number): bigint {
   const r = v < 0 ? -Math.round(-v) : Math.round(v);
   return BigInt(r);
 }
 
 // toDecimal widens a numeric value to Decimal (an integer operand of decimal arithmetic).
-function toDecimal(v: Value): Decimal {
+export function toDecimal(v: Value): Decimal {
   if (v.kind === "decimal") return v.dec;
   if (v.kind === "int") return Decimal.fromBigInt(v.int);
   throw typeError("internal: non-numeric decimal operand");
@@ -31086,7 +31088,7 @@ function toDecimal(v: Value): Decimal {
 // decimalArithWork is the decimal_work W of an arithmetic node — which group-count formula
 // applies per op (spec/design/cost.md §3 "decimal_work"). The evaluator charges W − 1 before
 // the op runs.
-function decimalArithWork(op: BinaryOp, a: Decimal, b: Decimal): number {
+export function decimalArithWork(op: BinaryOp, a: Decimal, b: Decimal): number {
   switch (op) {
     case "add":
     case "sub":
@@ -31103,7 +31105,7 @@ function decimalArithWork(op: BinaryOp, a: Decimal, b: Decimal): number {
 // decimalCmpWork is the decimal_work W of a comparison over a decimal(-promotable) pair — the
 // aligned linear formula after int→decimal promotion; 1 (no charge) for any other pair,
 // including a NULL side, where no decimal compare runs (spec/design/cost.md §3 "decimal_work").
-function decimalCmpWork(a: Value, b: Value): number {
+export function decimalCmpWork(a: Value, b: Value): number {
   if (a.kind === "decimal" && b.kind === "decimal") return workLinear(a.dec, b.dec);
   if (a.kind === "decimal" && b.kind === "int") return workLinear(a.dec, Decimal.fromBigInt(b.int));
   if (a.kind === "int" && b.kind === "decimal") return workLinear(Decimal.fromBigInt(a.int), b.dec);
@@ -31116,7 +31118,7 @@ function decimalCmpWork(a: Value, b: Value): number {
 // so min is a true upper bound on the work (spec/design/cost.md §3 "varlen_compare"). Any other
 // pair — including a NULL side or a non-varlen type — returns 1 (no charge). [...s] counts code
 // points (NOT s.length — the UTF-16 trap, CLAUDE.md §8).
-function varlenCompareWork(a: Value, b: Value): number {
+export function varlenCompareWork(a: Value, b: Value): number {
   let n: number;
   if (a.kind === "text" && b.kind === "text") {
     n = Math.min([...a.text].length, [...b.text].length);
@@ -31132,7 +31134,7 @@ function varlenCompareWork(a: Value, b: Value): number {
 // catalog cost is non-default (functions.md §8). Empty while every built-in uses the uniform
 // operatorEval; authoring a cost in catalog.toml populates it (a pure data change, no code). The
 // cost === 0 sentinel means "use operatorEval". Built once at module load from the generated table.
-const opCostOverrides: Map<string, bigint> = new Map(
+export const opCostOverrides: Map<string, bigint> = new Map(
   OPERATORS.filter((o) => o.cost !== 0).map((o) => [o.name, BigInt(o.cost)]),
 );
 
@@ -31147,7 +31149,7 @@ export function operatorCost(name: string): bigint {
 
 // evalDecimalArith evaluates decimal arithmetic with PG's result-scale rules
 // (spec/design/decimal.md §4), throwing 22003 at the cap and 22012 on a zero divisor/modulus.
-function evalDecimalArith(op: BinaryOp, a: Decimal, b: Decimal): Decimal {
+export function evalDecimalArith(op: BinaryOp, a: Decimal, b: Decimal): Decimal {
   switch (op) {
     case "add":
       return a.add(b);
@@ -31160,1108 +31162,4 @@ function evalDecimalArith(op: BinaryOp, a: Decimal, b: Decimal): Decimal {
     default: // "mod"
       return a.rem(b);
   }
-}
-
-// or3 is three-valued OR (Kleene): used to build <= / >= from < / > and =, so a NULL
-// operand yields UNKNOWN rather than a wrong FALSE (CLAUDE.md §4).
-function or3(
-  a: "true" | "false" | "unknown",
-  b: "true" | "false" | "unknown",
-): "true" | "false" | "unknown" {
-  if (a === "true" || b === "true") return "true";
-  if (a === "unknown" || b === "unknown") return "unknown";
-  return "false";
-}
-
-// not3 is three-valued NOT (Kleene): true<->false, unknown stays unknown. Used to build `<>`
-// as the negation of `=`, so a NULL operand still yields UNKNOWN (`NULL <> NULL`), not a wrong TRUE.
-function not3(a: ThreeValued): ThreeValued {
-  if (a === "true") return "false";
-  if (a === "false") return "true";
-  return "unknown";
-}
-
-// offsetCount is the integer count of a ROWS/GROUPS offset bound (an int Value by construction),
-// clamped to [0, np] so a huge literal offset cannot overflow — any offset >= np already saturates
-// the bound to the partition edge. Mirrors Rust's i128 widening.
-function offsetCount(v: Value, np: number): number {
-  if (v.kind === "int") return v.int > BigInt(np) ? np : Number(v.int);
-  return 0;
-}
-
-// rangeVVsBound returns the sign of v - (cur ∓ off) for a RANGE value offset (window.md §6),
-// computed exactly: integer keys use bigint so the bound cannot overflow (matching Rust's i128);
-// decimal keys use exact decimal arithmetic; float keys widen to f64 and compute the bound with the
-// in-contract correctly-rounded +/- kernel (float.md §5 — bit-identical cross-core), comparing with
-// the PG float total order (floatTotalCmp). The total order reproduces PG's in_range NaN handling for
-// free: a NaN current key makes the bound NaN (NaN ∓ finite = NaN), so a NaN row equals it and any
-// non-NaN row is below it, while a NaN row against a non-NaN bound sorts above. The offset is always
-// finite (an int offset, or a decimal one that would otherwise overflow already trapped at resolve),
-// so cur ∓ off never produces NaN itself. subtract chooses cur - off vs cur + off. Mirrors Rust's
-// range_v_vs_bound.
-function rangeVVsBound(v: Value, cur: Value, off: Value, subtract: boolean): number {
-  if (cur.kind === "int" && off.kind === "int" && v.kind === "int") {
-    const b = subtract ? cur.int - off.int : cur.int + off.int;
-    return v.int < b ? -1 : v.int > b ? 1 : 0;
-  }
-  if (cur.kind === "decimal" && off.kind === "decimal" && v.kind === "decimal") {
-    const b = subtract ? cur.dec.sub(off.dec) : cur.dec.add(off.dec);
-    return v.dec.cmpValue(b);
-  }
-  // Float key: f32 values are already Math.fround'd, so `.value` is the exact f64 widening (PG
-  // computes in_range_float*_float8's sum in float8 even for an f32 key).
-  if (
-    (cur.kind === "f32" || cur.kind === "f64") &&
-    off.kind === "f64" &&
-    (v.kind === "f32" || v.kind === "f64")
-  ) {
-    const b = subtract ? cur.value - off.value : cur.value + off.value;
-    return floatTotalCmp(v.value, b);
-  }
-  throw new Error("range offset resolved to a matching numeric type");
-}
-
-// FrameCtx holds one partition's peer-group structure (window.md §3/§6), shared across every row's
-// frame lookup. Peers are rows equal on the window ORDER BY keys; peerStart/peerEnd bracket each
-// row's peer group, groupOf is its peer-group ordinal, and groupSpans lists every group's [start,
-// end). Mirrors Rust's FrameCtx.
-class FrameCtx {
-  readonly np: number;
-  private readonly ordered: number[];
-  private readonly rows: Row[];
-  private readonly order: OrderSlot[];
-  private readonly peerStart: number[];
-  private readonly peerEnd: number[];
-  private readonly groupOf: number[];
-  private readonly groupSpans: Array<[number, number]>;
-
-  constructor(
-    ordered: number[],
-    rows: Row[],
-    order: OrderSlot[],
-    collKeys: (Uint8Array | null)[][] | null,
-  ) {
-    this.ordered = ordered;
-    this.rows = rows;
-    this.order = order;
-    const np = ordered.length;
-    this.np = np;
-    const groupSpans: Array<[number, number]> = [];
-    let s = 0;
-    for (let pos = 1; pos < np; pos++) {
-      if (cmpWindowRows(ordered[pos]!, ordered[s]!, rows, order, collKeys) !== 0) {
-        groupSpans.push([s, pos]);
-        s = pos;
-      }
-    }
-    if (np > 0) groupSpans.push([s, np]);
-    const peerStart = new Array<number>(np).fill(0);
-    const peerEnd = new Array<number>(np).fill(0);
-    const groupOf = new Array<number>(np).fill(0);
-    for (let gi = 0; gi < groupSpans.length; gi++) {
-      const [a, b] = groupSpans[gi]!;
-      for (let p = a; p < b; p++) {
-        peerStart[p] = a;
-        peerEnd[p] = b;
-        groupOf[p] = gi;
-      }
-    }
-    this.peerStart = peerStart;
-    this.peerEnd = peerEnd;
-    this.groupOf = groupOf;
-    this.groupSpans = groupSpans;
-  }
-
-  // bounds returns the [lo, hi) frame for the row at sorted position pos (window.md §6). A
-  // null/undefined frame ⇒ the default frame (RANGE UNBOUNDED PRECEDING TO CURRENT ROW = [0, peerEnd)).
-  bounds(pos: number, frame: ResolvedFrame | null | undefined): [number, number] {
-    if (frame === null || frame === undefined) return [0, this.peerEnd[pos]!];
-    switch (frame.mode) {
-      case "rows":
-        return this.rowsBounds(pos, frame);
-      case "groups":
-        return this.groupsBounds(pos, frame);
-      default: // "range"
-        return this.rangeBounds(pos, frame);
-    }
-  }
-
-  // isExcluded reports whether sorted position k is dropped from the current row pos's frame by
-  // EXCLUDE (window.md §6): currentRow drops the row itself, group its whole peer group, ties the
-  // peers but not the row, noOthers nothing. Exclusion removes only rows already in [lo, hi).
-  isExcluded(pos: number, k: number, exclude: FrameExclusion): boolean {
-    switch (exclude) {
-      case "currentRow":
-        return k === pos;
-      case "group":
-        return this.peerStart[pos]! <= k && k < this.peerEnd[pos]!;
-      case "ties":
-        return k !== pos && this.peerStart[pos]! <= k && k < this.peerEnd[pos]!;
-      default: // "noOthers"
-        return false;
-    }
-  }
-
-  // ROWS: physical row offsets in the partition sequence; bounds clamp to [0, np].
-  private rowsBounds(pos: number, f: ResolvedFrame): [number, number] {
-    const np = this.np;
-    const idx = (b: ResolvedBound, isEnd: boolean): number => {
-      switch (b.kind) {
-        case "unboundedPreceding":
-          return 0;
-        case "preceding":
-          return pos - offsetCount(b.offset, np) + (isEnd ? 1 : 0);
-        case "currentRow":
-          return pos + (isEnd ? 1 : 0);
-        case "following":
-          return pos + offsetCount(b.offset, np) + (isEnd ? 1 : 0);
-        case "unboundedFollowing":
-          return np;
-      }
-    };
-    const clamp = (x: number): number => (x < 0 ? 0 : x > np ? np : x);
-    const lo = clamp(idx(f.start, false));
-    const hi = clamp(idx(f.end, true));
-    return [lo, Math.max(hi, lo)];
-  }
-
-  // GROUPS: peer-group offsets — a bound g PRECEDING/FOLLOWING lands on the cg ∓ g-th peer group's
-  // start (a start bound) or end (an end bound); a group index below 0 clamps to the partition
-  // start, at or above the group count to the partition end.
-  private groupsBounds(pos: number, f: ResolvedFrame): [number, number] {
-    const np = this.np;
-    const cg = this.groupOf[pos]!;
-    const g = this.groupSpans.length;
-    const startAt = (j: number): number => (j < 0 ? 0 : j >= g ? np : this.groupSpans[j]![0]);
-    const endAt = (j: number): number => (j < 0 ? 0 : j >= g ? np : this.groupSpans[j]![1]);
-    const loFor = (b: ResolvedBound): number => {
-      switch (b.kind) {
-        case "unboundedPreceding":
-          return 0;
-        case "preceding":
-          return startAt(cg - offsetCount(b.offset, np));
-        case "currentRow":
-          return startAt(cg);
-        case "following":
-          return startAt(cg + offsetCount(b.offset, np));
-        case "unboundedFollowing":
-          return np;
-      }
-    };
-    const hiFor = (b: ResolvedBound): number => {
-      switch (b.kind) {
-        case "unboundedPreceding":
-          return 0;
-        case "preceding":
-          return endAt(cg - offsetCount(b.offset, np));
-        case "currentRow":
-          return endAt(cg);
-        case "following":
-          return endAt(cg + offsetCount(b.offset, np));
-        case "unboundedFollowing":
-          return np;
-      }
-    };
-    const lo = loFor(f.start);
-    const hi = hiFor(f.end);
-    return [lo, Math.max(hi, lo)];
-  }
-
-  // RANGE: logical offsets on the single ordering-key value (window.md §6). A bound with no offset
-  // (UNBOUNDED / CURRENT ROW) is peer/edge based and needs no key arithmetic. With a value offset,
-  // the frame spans the rows whose key is within the offset of the current key; a NULL current key
-  // has only its NULL peers (offset/CURRENT bounds collapse to the peer group, the PG rule), while
-  // UNBOUNDED bounds still reach the partition edge.
-  private rangeBounds(pos: number, f: ResolvedFrame): [number, number] {
-    const np = this.np;
-    const startOff = f.start.kind === "preceding" || f.start.kind === "following";
-    const endOff = f.end.kind === "preceding" || f.end.kind === "following";
-    if (!startOff && !endOff) {
-      const lo = f.start.kind === "unboundedPreceding" ? 0 : this.peerStart[pos]!;
-      const hi = f.end.kind === "unboundedFollowing" ? np : this.peerEnd[pos]!;
-      return [lo, Math.max(hi, lo)];
-    }
-    // Offset present ⇒ exactly one ORDER BY key (validated at resolve).
-    const col = this.order[0]!.idx;
-    const desc = this.order[0]!.descending;
-    const cur = this.rows[this.ordered[pos]!]![col]!;
-    if (cur.kind === "null") {
-      const lo = f.start.kind === "unboundedPreceding" ? 0 : this.peerStart[pos]!;
-      const hi = f.end.kind === "unboundedFollowing" ? np : this.peerEnd[pos]!;
-      return [lo, Math.max(hi, lo)];
-    }
-    let lo: number;
-    switch (f.start.kind) {
-      case "unboundedPreceding":
-        lo = 0;
-        break;
-      case "currentRow":
-        lo = this.peerStart[pos]!;
-        break;
-      case "preceding":
-        lo = this.rangeStart(col, cur, f.start.offset, true, desc);
-        break;
-      case "following":
-        lo = this.rangeStart(col, cur, f.start.offset, false, desc);
-        break;
-      case "unboundedFollowing":
-        lo = np;
-        break;
-    }
-    let hi: number;
-    switch (f.end.kind) {
-      case "unboundedFollowing":
-        hi = np;
-        break;
-      case "currentRow":
-        hi = this.peerEnd[pos]!;
-        break;
-      case "preceding":
-        hi = this.rangeEnd(col, cur, f.end.offset, true, desc, lo);
-        break;
-      case "following":
-        hi = this.rangeEnd(col, cur, f.end.offset, false, desc, lo);
-        break;
-      case "unboundedPreceding":
-        hi = 0;
-        break;
-    }
-    return [lo, Math.max(hi, lo)];
-  }
-
-  // The first sorted position whose key satisfies a RANGE start bound (NULL keys never qualify for a
-  // non-NULL current row). subtract = isPreceding XOR descending chooses the bound side.
-  private rangeStart(
-    col: number,
-    cur: Value,
-    off: Value,
-    isPreceding: boolean,
-    desc: boolean,
-  ): number {
-    const subtract = isPreceding !== desc;
-    for (let i = 0; i < this.np; i++) {
-      const v = this.rows[this.ordered[i]!]![col]!;
-      if (v.kind === "null") continue;
-      const ord = rangeVVsBound(v, cur, off, subtract);
-      // ascending frame: v >= bound; descending frame: v <= bound.
-      const include = desc ? ord <= 0 : ord >= 0;
-      if (include) return i;
-    }
-    return this.np;
-  }
-
-  // The exclusive end of a RANGE end bound, scanning forward from lo while the key stays in frame
-  // (the in-frame keys form a contiguous run over the sorted partition).
-  private rangeEnd(
-    col: number,
-    cur: Value,
-    off: Value,
-    isPreceding: boolean,
-    desc: boolean,
-    lo: number,
-  ): number {
-    const subtract = isPreceding !== desc;
-    let hi = lo;
-    for (let i = lo; i < this.np; i++) {
-      const v = this.rows[this.ordered[i]!]![col]!;
-      if (v.kind === "null") break;
-      const ord = rangeVVsBound(v, cur, off, subtract);
-      // ascending frame: v <= bound; descending frame: v >= bound.
-      const include = desc ? ord >= 0 : ord <= 0;
-      if (include) hi = i + 1;
-      else break;
-    }
-    return hi;
-  }
-}
-
-// applyWindowStage is the WINDOW stage (spec/design/window.md §5.2): for each window function,
-// partition the rows, sort each partition by the window ORDER BY (stable → PK tie-break, as `rows`
-// arrives in PK scan order), compute the per-row result, and APPEND it to every row (so window
-// result i lands at flat slot inputWidth + i, where the projection reads it). The partition + sort
-// are unmetered (like ORDER BY / GROUP BY); each computed result charges windowResult and guards
-// the ceiling. S0: row_number() only; partitions bucket value-canonically via an insertion-ordered
-// list keyed by the value-canonical distinctRowKey (the aggregate-grouping discipline), so no
-// hash-map iteration order leaks (CLAUDE.md §8/§10).
-//
-// The frame-sensitive plans (aggregate windows, first/last/nth_value) use a FrameCtx, which
-// precomputes the partition's peer-group structure once and maps each row to its [lo, hi) frame.
-// spec/design/window.md §6.
-
-// groupWindowSpecs groups window specs that share an identical PARTITION BY + ORDER BY (column
-// slots + direction / NULLS / collation; collations are interned so the reference compares equal),
-// returning the spec indices per group. One partition + per-partition sort then serves every spec in
-// a group (window.md §5.2 — the shared partition/sort pass). Grouping is stable and the per-spec slot
-// mapping is preserved (each spec still writes its result column in spec order), so the optimization
-// is purely a wall-clock win — the cost is unchanged (§8).
-function groupWindowSpecs(specs: WindowSpec[]): number[][] {
-  const groups: number[][] = [];
-  const orderEq = (a: OrderSlot[], b: OrderSlot[]): boolean =>
-    a.length === b.length &&
-    a.every(
-      (s, i) =>
-        s.idx === b[i]!.idx &&
-        s.descending === b[i]!.descending &&
-        s.nullsFirst === b[i]!.nullsFirst &&
-        s.collation === b[i]!.collation,
-    );
-  const partEq = (a: number[], b: number[]): boolean =>
-    a.length === b.length && a.every((p, i) => p === b[i]);
-  outer: for (let i = 0; i < specs.length; i++) {
-    for (const g of groups) {
-      const rep = specs[g[0]!]!;
-      if (partEq(rep.partition, specs[i]!.partition) && orderEq(rep.order, specs[i]!.order)) {
-        g.push(i);
-        continue outer;
-      }
-    }
-    groups.push([i]);
-  }
-  return groups;
-}
-
-// materializeOrderExprs materializes the general-expression ORDER BY keys before the sort
-// (spec/design/grammar.md §10): for each row evaluate every orderExprs[k] and append the value, so its
-// sort slot finalWidth+k reads the appended column and the slot-based comparator stays unchanged — the
-// exact mechanism a non-column window key uses (window.md §5.1, applyWindowStage). Runs over every
-// pre-sort row (before LIMIT, since the sort needs them all); the per-row evaluation is metered like a
-// projection (operator_eval per node, charged inside evalExpr). A no-op — and zero added cost — when
-// orderExprs is empty (a column/ordinal-only ORDER BY, byte-identical to before).
-function materializeOrderExprs(rows: Row[], orderExprs: RExpr[], env: EvalEnv, meter: Meter): void {
-  if (orderExprs.length === 0) return;
-  for (let i = 0; i < rows.length; i++) {
-    // Detach from the (possibly shared) stored row before appending, exactly as the window stage does
-    // — the scan yields references to the page store's own arrays, so appending in place would corrupt
-    // them across statements. A synthetic group row is already private; the extra copy is harmless.
-    const row = rows[i]!.slice();
-    const vals: Value[] = [];
-    for (const oe of orderExprs) vals.push(evalExpr(oe, row, env, meter));
-    for (const v of vals) row.push(v);
-    rows[i] = row;
-  }
-}
-
-function applyWindowStage(
-  rows: Row[],
-  specs: WindowSpec[],
-  windowKeys: RExpr[],
-  env: EvalEnv,
-  meter: Meter,
-): void {
-  const n = rows.length;
-  if (n === 0) return;
-  // Copy each input row to a fresh array BEFORE appending: the scan yields references to the stored
-  // table rows (the page store's own arrays), so appending in place would corrupt them across
-  // statements. The window stage owns its row buffer (Rust holds owned Rows; the TS scan shares
-  // them), so detach here, then push the per-row results onto these private copies.
-  for (let i = 0; i < n; i++) rows[i] = rows[i]!.slice();
-  // Materialize the non-column PARTITION BY / ORDER BY key expressions (window.md §5.1): evaluate
-  // each against the row and append it, so a materialized key's slot inputWidth+k reads the appended
-  // column and the partition / sort / frame machinery below (all slot-based) is unchanged. The window
-  // results are appended AFTER these, so a result slot is inputWidth+windowKeys.length+w (the rebased
-  // projection slot). Empty for a column-only window — no appended columns, the result slot stays
-  // inputWidth+w, byte-identical to before. The key evaluation is metered like any expression
-  // (operator_eval per node): new, deterministic, cross-core-identical work that exists only for an
-  // expression key (a bare-column key is not in windowKeys).
-  if (windowKeys.length > 0) {
-    for (let i = 0; i < n; i++) {
-      const row = rows[i]!;
-      const kv: Value[] = [];
-      for (const ke of windowKeys) kv.push(evalExpr(ke, row, env, meter));
-      for (const v of kv) row.push(v);
-    }
-  }
-  // The shared partition/sort pass (window.md §5.2): specs that share an identical PARTITION BY +
-  // ORDER BY are partitioned and sorted ONCE (the expensive step), then each computes its own
-  // results over the shared sorted partitions. The partition + sort are unmetered (§8), so this is
-  // purely a wall-clock win — the per-spec result/frame metering, and thus the cost, are unchanged.
-  const groups = groupWindowSpecs(specs);
-  const specGroup = new Array<number>(specs.length).fill(0);
-  const cache: Array<{ partitions: number[][]; collKeys: (Uint8Array | null)[][] | null }> = [];
-  for (let gi = 0; gi < groups.length; gi++) {
-    const group = groups[gi]!;
-    const rep = specs[group[0]!]!;
-    for (const si of group) specGroup[si] = gi;
-    // Partition the row indices by the partition-key values. The Map is an index only (never
-    // iterated); output comes from the insertion-ordered `partitions` (no hash-order leak).
-    const index = new Map<string, number>();
-    const partitions: number[][] = [];
-    for (let i = 0; i < n; i++) {
-      const keyVals = rep.partition.map((p) => rows[i]![p]!);
-      const k = distinctRowKey(keyVals);
-      let pi = index.get(k);
-      if (pi === undefined) {
-        pi = partitions.length;
-        index.set(k, pi);
-        partitions.push([]);
-      }
-      partitions[pi]!.push(i);
-    }
-    // Collated UCA sort-key bytes for the shared order's collated slots (window.md §3/§5); null
-    // when no key is collated, an unmapped code point throws 0A000 here.
-    const collKeys = windowCollKeys(rows, rep.order);
-    // Sort each partition by the shared window ORDER BY. Array#sort is stable, so a full tie keeps
-    // ascending original index = PK scan order (the §3 PK tie-break).
-    if (rep.order.length > 0) {
-      for (const part of partitions) {
-        part.sort((a, b) => cmpWindowRows(a, b, rows, rep.order, collKeys));
-      }
-    }
-    cache.push({ partitions, collKeys });
-  }
-  for (let si = 0; si < specs.length; si++) {
-    const spec = specs[si]!;
-    const shared = cache[specGroup[si]!]!;
-    const collKeys = shared.collKeys;
-    // Compute each row's result into a per-row slot, then append in input order.
-    const results: Value[] = new Array(n).fill(nullValue());
-    for (const ordered of shared.partitions) {
-      switch (spec.plan) {
-        case "rowNumber":
-          for (let pos = 0; pos < ordered.length; pos++) {
-            meter.guard(); // enforce the cost ceiling per result (CLAUDE.md §13)
-            meter.charge(COSTS.windowResult);
-            results[ordered[pos]!] = intValue(BigInt(pos + 1));
-          }
-          break;
-        case "rank":
-        case "denseRank":
-        case "percentRank":
-        case "cumeDist": {
-          // Peer-aware ranking (window.md §3/§4): peers are rows EQUAL on the window ORDER BY keys
-          // only. A single pass identifies peer-group spans [start, end) over the sorted partition;
-          // an empty ORDER BY makes the whole partition one peer group. rank = start+1, dense_rank =
-          // group ordinal, percent_rank = start/(N-1) (0 if N=1), cume_dist = end/N. The ratios are
-          // f64 (PG's float8, window.md §4): one IEEE correctly-rounded division of small integers
-          // that convert exactly to binary64, so the value is bit-identical across cores and to PG
-          // (the in-contract kernel, float.md §5).
-          const np = ordered.length;
-          const groups: Array<[number, number]> = []; // peer-group spans [start, end)
-          let s = 0;
-          for (let pos = 1; pos < np; pos++) {
-            if (cmpWindowRows(ordered[pos]!, ordered[s]!, rows, spec.order, collKeys) !== 0) {
-              groups.push([s, pos]);
-              s = pos;
-            }
-          }
-          if (np > 0) groups.push([s, np]);
-          for (let gi = 0; gi < groups.length; gi++) {
-            const [start, end] = groups[gi]!;
-            for (let k = start; k < end; k++) {
-              const ri = ordered[k]!;
-              meter.guard();
-              meter.charge(COSTS.windowResult);
-              if (spec.plan === "rank") {
-                results[ri] = intValue(BigInt(start + 1));
-              } else if (spec.plan === "denseRank") {
-                results[ri] = intValue(BigInt(gi + 1));
-              } else if (spec.plan === "percentRank") {
-                results[ri] = np <= 1 ? float64Value(0.0) : float64Value(start / (np - 1));
-              } else {
-                results[ri] = float64Value(end / np);
-              }
-            }
-          }
-          break;
-        }
-        // ntile(n): distribute the partition into n ranked buckets, larger buckets first
-        // (window.md §4). n is evaluated once (the first sorted row); NULL n → NULL for all;
-        // n ≤ 0 → 22014. Position-based: bucket boundaries are by sorted position, not peers.
-        case "ntile": {
-          const np = ordered.length;
-          const nval = evalExpr(spec.args[0]!, rows[ordered[0]!]!, env, meter);
-          if (nval.kind === "null") {
-            // NULL bucket count → NULL for every row (PG).
-            for (const ri of ordered) {
-              meter.guard();
-              meter.charge(COSTS.windowResult);
-              results[ri] = nullValue();
-            }
-          } else if (nval.kind === "int") {
-            if (nval.int <= 0n) {
-              throw engineError(
-                "invalid_argument_for_ntile",
-                "argument of ntile must be greater than zero",
-              );
-            }
-            // np is a safe number; nbuckets is an i64 bigint. base = floor(np/nbuckets),
-            // rem = np % nbuckets, big = rem*(base+1) — computed in bigint to avoid any
-            // precision loss for a huge nbuckets, then narrowed to number (all ≤ np, safe).
-            const npb = BigInt(np);
-            const base = Number(npb / nval.int); // floor rows per bucket
-            const rem = Number(npb % nval.int); // the first `rem` buckets get one extra row
-            const big = rem * (base + 1); // rows in the larger (base+1) buckets
-            for (let pos = 0; pos < ordered.length; pos++) {
-              const ri = ordered[pos]!;
-              meter.guard();
-              meter.charge(COSTS.windowResult);
-              // Larger buckets first: positions [0, big) → (base+1)-sized buckets, the rest →
-              // base-sized buckets. `base` is 0 only when nbuckets > np, and then every pos < big
-              // so the else branch never divides by 0.
-              const bucket =
-                pos < big
-                  ? Math.floor(pos / (base + 1)) + 1
-                  : rem + Math.floor((pos - big) / base) + 1;
-              results[ri] = intValue(BigInt(bucket));
-            }
-          }
-          break;
-        }
-        // lag/lead (window.md §4): the value `offset` positions back (lag) / forward (lead) in the
-        // partition, else the default (or NULL). Frame-insensitive — offset is by sorted position.
-        // The value is evaluated for every row; offset once (NULL → all NULL); the default per
-        // out-of-range row.
-        case "lag":
-        case "lead": {
-          const np = ordered.length;
-          const vals: Value[] = new Array(np);
-          for (let i = 0; i < np; i++) {
-            vals[i] = evalExpr(spec.args[0]!, rows[ordered[i]!]!, env, meter);
-          }
-          // offset: evaluated once from the first sorted row. NULL → NULL for every row (PG);
-          // absent → 1. A small offset, but compared in number space (a huge offset just lands
-          // out of range → default/NULL).
-          let offset: number | null;
-          if (spec.args.length >= 2) {
-            const ov = evalExpr(spec.args[1]!, rows[ordered[0]!]!, env, meter);
-            offset = ov.kind === "null" ? null : Number((ov as { int: bigint }).int);
-          } else {
-            offset = 1;
-          }
-          const dir = spec.plan === "lead" ? 1 : -1;
-          for (let pos = 0; pos < np; pos++) {
-            const ri = ordered[pos]!;
-            meter.guard();
-            meter.charge(COSTS.windowResult);
-            if (offset === null) {
-              results[ri] = nullValue();
-            } else {
-              const target = pos + dir * offset;
-              if (target >= 0 && target < np) {
-                results[ri] = vals[target]!;
-              } else if (spec.args.length === 3) {
-                results[ri] = evalExpr(spec.args[2]!, rows[ri]!, env, meter);
-              } else {
-                results[ri] = nullValue();
-              }
-            }
-          }
-          break;
-        }
-        // An aggregate over the default frame (window.md §6): RANGE UNBOUNDED PRECEDING TO CURRENT
-        // ROW with a window ORDER BY (a RUNNING aggregate — CURRENT ROW spans the current peer
-        // group), or the WHOLE partition with no ORDER BY. Both reduce to the same shape: fold rows
-        // in sorted order, snapshotting the running Acc at each peer-group boundary (no ORDER BY →
-        // one peer group → one whole-partition value).
-        case "agg": {
-          const np = ordered.length;
-          const hasOperand = spec.args.length > 0; // COUNT(*) has no operand
-          // FILTER (WHERE cond): a frame row whose filter is not TRUE does not fold into the window
-          // aggregate (aggregates.md §20). Evaluated per visited frame row (charging its
-          // operatorEvals); a null filter keeps every row. A FILTER forces the naive re-fold path for
-          // explicit frames (a filtered row cannot be cleanly un-folded).
-          const filterPass = (k: number): boolean =>
-            spec.filter == null ? true : isTrue(evalExpr(spec.filter, rows[ordered[k]!]!, env, meter));
-          if (spec.frame === null || spec.frame === undefined) {
-            // DEFAULT frame: a single running pass, snapshotting the accumulator at each peer-group
-            // boundary (window.md §6) — O(n).
-            const groups: Array<[number, number]> = []; // peer-group spans [start, end)
-            let s = 0;
-            for (let pos = 1; pos < np; pos++) {
-              if (cmpWindowRows(ordered[pos]!, ordered[s]!, rows, spec.order, collKeys) !== 0) {
-                groups.push([s, pos]);
-                s = pos;
-              }
-            }
-            if (np > 0) groups.push([s, np]);
-            const acc = newAcc(
-              spec.aggPlan!,
-              spec.aggFloatWidth ?? "f64",
-              spec.aggJsonAsJson ?? false,
-              spec.aggJsonStrict ?? false,
-            );
-            for (const [start, end] of groups) {
-              for (let k = start; k < end; k++) {
-                // The frame fold work (window.md §8) — metered so a running aggregate over a large
-                // partition stays cost-bounded.
-                meter.charge(COSTS.windowFrameStep);
-                if (!filterPass(k)) continue; // FILTER excludes this row from the running fold
-                const v = hasOperand
-                  ? evalExpr(spec.args[0]!, rows[ordered[k]!]!, env, meter)
-                  : nullValue();
-                foldAcc(acc, v, meter);
-              }
-              // Snapshot the running accumulator for this peer group's frame [0, end).
-              const out = finalizeAcc(cloneAcc(acc));
-              for (let k = start; k < end; k++) {
-                const ri = ordered[k]!;
-                meter.guard();
-                meter.charge(COSTS.windowResult);
-                results[ri] = out;
-              }
-            }
-          } else {
-            // EXPLICIT frame (window.md §5.2/§6). The sorted partition makes the frame bounds
-            // [lo, hi) monotonic non-decreasing in pos, so a NO-EXCLUDE aggregate CARRIES one
-            // accumulator across rows rather than re-folding each frame from scratch (the
-            // sliding-window optimization):
-            //   • an EXPANDING frame (start UNBOUNDED PRECEDING ⇒ lo ≡ 0) folds each entering row
-            //     once as hi advances — byte-identical for EVERY aggregate (fold order is the
-            //     sorted-prefix order the naive path uses) — O(n);
-            //   • a MOVING frame additionally UN-folds the rows leaving on the left, but only for
-            //     the exactly-invertible COUNT / COUNT(*) — O(n);
-            //   • a MOVING frame over SUM/AVG/MIN/MAX/float (not safely invertible) and ANY frame
-            //     with EXCLUDE re-fold from scratch (the naive O(partition²)).
-            // windowFrameStep is charged per folded AND per un-folded row, so it only LOWERS; each
-            // row's operand is evaluated at most once (cached in vals), so operator_eval never rises.
-            const ctx = new FrameCtx(ordered, rows, spec.order, collKeys);
-            const exclude = spec.frame?.exclude ?? "noOthers";
-            const vals: Value[] = new Array(np);
-            const valSet: boolean[] = new Array(np).fill(false);
-            const evalAt = (k: number): Value => {
-              if (!hasOperand) return nullValue();
-              if (!valSet[k]) {
-                vals[k] = evalExpr(spec.args[0]!, rows[ordered[k]!]!, env, meter);
-                valSet[k] = true;
-              }
-              return vals[k]!;
-            };
-            if (exclude !== "noOthers" || spec.filter != null) {
-              // EXCLUDE or FILTER breaks the clean add/remove model → naive per-row re-fold (dropped
-              // rows are neither metered nor counted), over the cached operand. A FILTER additionally
-              // skips a non-TRUE frame row.
-              for (let pos = 0; pos < np; pos++) {
-                const [lo, hi] = ctx.bounds(pos, spec.frame);
-                const acc = newAcc(
-                  spec.aggPlan!,
-                  spec.aggFloatWidth ?? "f64",
-                  spec.aggJsonAsJson ?? false,
-                  spec.aggJsonStrict ?? false,
-                );
-                for (let k = lo; k < hi; k++) {
-                  if (ctx.isExcluded(pos, k, exclude)) continue;
-                  meter.charge(COSTS.windowFrameStep);
-                  if (!filterPass(k)) continue;
-                  foldAcc(acc, evalAt(k), meter);
-                }
-                meter.guard();
-                meter.charge(COSTS.windowResult);
-                results[ordered[pos]!] = finalizeAcc(acc);
-              }
-            } else {
-              // SLIDING (monotone carry). removable aggregates un-fold the left edge; the rest
-              // rebuild when lo advances (an expanding frame never advances lo, so it only adds).
-              const removable = spec.aggPlan === "countStar" || spec.aggPlan === "count";
-              let acc = newAcc(
-                spec.aggPlan!,
-                spec.aggFloatWidth ?? "f64",
-                spec.aggJsonAsJson ?? false,
-                spec.aggJsonStrict ?? false,
-              );
-              let curLo = 0;
-              let curHi = 0;
-              for (let pos = 0; pos < np; pos++) {
-                const [lo, hi] = ctx.bounds(pos, spec.frame);
-                if (!removable && lo > curLo) {
-                  // Left edge advanced over a non-invertible aggregate ⇒ rebuild over [lo, hi).
-                  acc = newAcc(
-                    spec.aggPlan!,
-                    spec.aggFloatWidth ?? "f64",
-                    spec.aggJsonAsJson ?? false,
-                    spec.aggJsonStrict ?? false,
-                  );
-                  for (let k = lo; k < hi; k++) {
-                    meter.charge(COSTS.windowFrameStep);
-                    foldAcc(acc, evalAt(k), meter);
-                  }
-                } else {
-                  // Un-fold rows leaving on the left (invertible only; empty when lo === curLo) …
-                  const remHi = Math.min(lo, curHi);
-                  for (let k = curLo; k < remHi; k++) {
-                    meter.charge(COSTS.windowFrameStep);
-                    unfoldAcc(acc, evalAt(k), meter);
-                  }
-                  // … and fold rows entering on the right.
-                  const addLo = Math.max(curHi, lo);
-                  for (let k = addLo; k < hi; k++) {
-                    meter.charge(COSTS.windowFrameStep);
-                    foldAcc(acc, evalAt(k), meter);
-                  }
-                }
-                curLo = lo;
-                curHi = hi;
-                meter.guard();
-                meter.charge(COSTS.windowResult);
-                results[ordered[pos]!] = finalizeAcc(cloneAcc(acc));
-              }
-            }
-          }
-          break;
-        }
-        // Frame-sensitive value pickers (S4, window.md §4): first/last/nth row of the frame.
-        case "firstValue":
-        case "lastValue":
-        case "nthValue": {
-          const np = ordered.length;
-          // The value expression, evaluated once per row (sorted order).
-          const vals: Value[] = new Array(np);
-          for (let i = 0; i < np; i++) {
-            vals[i] = evalExpr(spec.args[0]!, rows[ordered[i]!]!, env, meter);
-          }
-          // nth_value's position — evaluated once; NULL → NULL for all; < 1 → 22016.
-          let nth: number | null = 0; // unused for first/last
-          if (spec.plan === "nthValue") {
-            const nv = evalExpr(spec.args[1]!, rows[ordered[0]!]!, env, meter);
-            if (nv.kind === "null") {
-              nth = null;
-            } else if (nv.kind === "int") {
-              if (nv.int >= 1n) {
-                nth = Number(nv.int);
-              } else {
-                throw engineError(
-                  "invalid_argument_for_nth_value",
-                  "argument of nth_value must be greater than zero",
-                );
-              }
-            }
-          }
-          const ctx = new FrameCtx(ordered, rows, spec.order, collKeys);
-          const exclude = spec.frame?.exclude ?? "noOthers";
-          for (let pos = 0; pos < np; pos++) {
-            meter.guard();
-            meter.charge(COSTS.windowResult);
-            const [lo, hi] = ctx.bounds(pos, spec.frame);
-            // first/last/nth pick over the frame's NON-excluded rows (window.md §6); the noOthers
-            // fast path breaks on the first row, so it stays O(1).
-            let out: Value = nullValue();
-            if (spec.plan === "firstValue") {
-              for (let k = lo; k < hi; k++) {
-                if (!ctx.isExcluded(pos, k, exclude)) {
-                  out = vals[k]!;
-                  break;
-                }
-              }
-            } else if (spec.plan === "lastValue") {
-              for (let k = hi - 1; k >= lo; k--) {
-                if (!ctx.isExcluded(pos, k, exclude)) {
-                  out = vals[k]!;
-                  break;
-                }
-              }
-            } else if (nth !== null) {
-              // nth_value: the nth survivor; NULL if fewer than n survive (or NULL n).
-              let count = 0;
-              for (let k = lo; k < hi; k++) {
-                if (ctx.isExcluded(pos, k, exclude)) continue;
-                count++;
-                if (count === nth) {
-                  out = vals[k]!;
-                  break;
-                }
-              }
-            }
-            results[ordered[pos]!] = out;
-          }
-          break;
-        }
-      }
-    }
-    for (let i = 0; i < n; i++) rows[i]!.push(results[i]!);
-  }
-}
-
-// sortRows sorts rows by the ORDER BY keys (spec/design/grammar.md §10). The all-C fast path is a
-// stable sort over the value comparator; if ANY key carries a collation, the collation-aware
-// sortRowsCollated decorate sorter runs instead (it can throw — an unmapped code point is 0A000).
-// (Array.prototype.sort is stable in modern engines — the runtime jed targets, spill.md §6.)
-function sortRows(rows: Row[], order: OrderSlot[]): void {
-  if (order.some((k) => k.collation !== null)) {
-    sortRowsCollated(rows, order);
-    return;
-  }
-  rows.sort((a, b) => cmpRowsByOrder(a, b, order));
-}
-
-// cmpRowsByOrder compares two rows by the (all-C) ORDER BY keys — the first non-equal key decides; a
-// full tie is 0 (the stable sort then keeps input order). Only used when no key is collated.
-function cmpRowsByOrder(a: Row, b: Row, order: OrderSlot[]): number {
-  for (const k of order) {
-    const c = keyCmp(a[k.idx]!, b[k.idx]!, k.descending, k.nullsFirst);
-    if (c !== 0) return c;
-  }
-  return 0;
-}
-
-// windowCollKeys precomputes each row's collated UCA sort-key bytes for the spec's collated ORDER BY
-// slots (if any), indexed in parallel with rows, so the partition sort AND peer determination
-// (ranking, frame peer groups) honor the collation identically (window.md §3/§5). Returns null when no
-// key is collated. An unmapped code point throws 0A000 here, at this deterministic per-row point.
-function windowCollKeys(rows: Row[], order: OrderSlot[]): (Uint8Array | null)[][] | null {
-  if (!order.some((k) => k.collation !== null)) return null;
-  return rows.map((row) => {
-    const keys: (Uint8Array | null)[] = [];
-    for (const k of order) {
-      if (k.collation === null) continue;
-      const v = row[k.idx]!;
-      keys.push(v.kind === "text" ? collationSortKey(k.collation, v.text) : null);
-    }
-    return keys;
-  });
-}
-
-// cmpWindowRows compares two rows of the window buffer (by their index a/b into the full row array) by
-// the window ORDER BY keys, honoring collation. A collated slot compares the precomputed UCA sort-key
-// bytes in collKeys (indexed in parallel with the rows; a null entry ⇒ a NULL value, NULL placement +
-// the descending flip applied here, mirroring cmpDecorated); a non-collated slot compares the row
-// values via keyCmp. This one comparator drives the partition sort AND every peer determination
-// (ranking, the aggregate default frame, FrameCtx's peer groups), so a collated window orders, ranks,
-// and frames identically (window.md §3/§5). With no collated key, collKeys is null and this is
-// cmpRowsByOrder by index.
-function cmpWindowRows(
-  a: number,
-  b: number,
-  rows: Row[],
-  order: OrderSlot[],
-  collKeys: (Uint8Array | null)[][] | null,
-): number {
-  let ci = 0; // advances once per collated slot (keys stored in slot order)
-  for (const k of order) {
-    let c: number;
-    if (k.collation !== null) {
-      const ak = collKeys![a]![ci] ?? null;
-      const bk = collKeys![b]![ci] ?? null;
-      ci++;
-      if (ak === null && bk === null) c = 0;
-      else if (ak === null) c = k.nullsFirst ? -1 : 1;
-      else if (bk === null) c = k.nullsFirst ? 1 : -1;
-      else {
-        c = cmpBytes(ak, bk);
-        if (k.descending) c = -c;
-      }
-    } else {
-      c = keyCmp(rows[a]![k.idx]!, rows[b]![k.idx]!, k.descending, k.nullsFirst);
-    }
-    if (c !== 0) return c;
-  }
-  return 0;
-}
-
-// sortRowsCollated sorts rows when at least one ORDER BY key is collated (spec/design/collation.md
-// §6/§8). Decorate-sort-undecorate: each collated key's UCA sort key is built ONCE per row up front
-// (propagating a sortKey failure — e.g. 0A000 for an unmapped code point — at this deterministic
-// per-row point, not inside the comparator), then the rows are sorted by the precomputed key bytes
-// for collated slots and the value comparator for the rest. The sort is UNMETERED like every sort
-// (cost.md §3); the collate cost is charged at the comparison evaluator (collation.md §11). A
-// collated ORDER BY is in-memory only this slice, so this never spills (collated keys are slice 1e).
-function sortRowsCollated(rows: Row[], order: OrderSlot[]): void {
-  // (keys[i], row) per row; a keys entry is null for a NULL value, the sort-key bytes otherwise.
-  const deco: { keys: (Uint8Array | null)[]; row: Row }[] = rows.map((row) => {
-    const keys: (Uint8Array | null)[] = [];
-    for (const k of order) {
-      if (k.collation === null) continue;
-      const v = row[k.idx]!;
-      keys.push(v.kind === "text" ? collationSortKey(k.collation, v.text) : null);
-    }
-    return { keys, row };
-  });
-  deco.sort((a, b) => cmpDecorated(a.keys, a.row, b.keys, b.row, order));
-  for (let i = 0; i < deco.length; i++) rows[i] = deco[i]!.row;
-}
-
-// cmpDecorated compares two decorated rows (precomputed collated-key bytes + the row) by the ORDER BY
-// keys. A collated slot compares its precomputed sort-key bytes (NULL placement + the descending flip
-// applied here, mirroring keyCmp); a non-collated slot compares the row values via keyCmp.
-function cmpDecorated(
-  akeys: (Uint8Array | null)[],
-  arow: Row,
-  bkeys: (Uint8Array | null)[],
-  brow: Row,
-  order: OrderSlot[],
-): number {
-  let ci = 0; // advances once per collated slot (keys stored in slot order)
-  for (const k of order) {
-    let c: number;
-    if (k.collation !== null) {
-      const ak = akeys[ci] ?? null;
-      const bk = bkeys[ci] ?? null;
-      ci++;
-      if (ak === null && bk === null) c = 0;
-      else if (ak === null) c = k.nullsFirst ? -1 : 1;
-      else if (bk === null) c = k.nullsFirst ? 1 : -1;
-      else {
-        c = cmpBytes(ak, bk);
-        if (k.descending) c = -c;
-      }
-    } else {
-      c = keyCmp(arow[k.idx]!, brow[k.idx]!, k.descending, k.nullsFirst);
-    }
-    if (c !== 0) return c;
-  }
-  return 0;
-}
-
-// keyCmp is one ORDER BY key's total-order comparison, returning <0, 0, >0. NULL placement
-// is governed by nullsFirst and applied INDEPENDENTLY of the value-direction flip
-// (descending), so an explicit NULLS FIRST|LAST overrides the direction default
-// (spec/design/grammar.md §10). The physical key order ratifies NULL as the largest value
-// (the PostgreSQL model), which surfaces as the parse-time default nullsFirst = descending.
-function keyCmp(a: Value, b: Value, descending: boolean, nullsFirst: boolean): number {
-  if (a.kind === "null" && b.kind === "null") return 0;
-  if (a.kind === "null") return nullsFirst ? -1 : 1;
-  if (b.kind === "null") return nullsFirst ? 1 : -1;
-  const base = valueCmp(a, b);
-  return descending ? -base : base;
-}
-
-// valueCmp is the total order over NON-NULL values: signed-integer ascending, text by
-// the C collation — UTF-8 byte / code-point order (compareTextC, NOT JS `<` — the §8 trap;
-// spec/design/types.md §11) — and boolean by value, false < true (orderKey maps false→0,
-// true→1; types.md §9). The cross-family arms are defined only for totality — ORDER BY is
-// over a single typed column, so a mixed pair is unreachable from SELECT. NULLs are handled
-// by keyCmp before this is reached. Returns <0, 0, >0.
-function valueCmp(a: Value, b: Value): number {
-  if (a.kind === "int" && b.kind === "int") return a.int < b.int ? -1 : a.int > b.int ? 1 : 0;
-  if (a.kind === "decimal" && b.kind === "decimal") return a.dec.cmpValue(b.dec);
-  // Floats by the TOTAL order (-0 == +0, NaN == NaN, NaN largest — float.md §3). ORDER BY / MIN /
-  // MAX / DISTINCT over a float column reach here with same-width values (one typed column).
-  if (a.kind === "f32" && b.kind === "f32") return floatTotalCmp(a.value, b.value);
-  if (a.kind === "f64" && b.kind === "f64") return floatTotalCmp(a.value, b.value);
-  if (a.kind === "text" && b.kind === "text") return compareTextC(a.text, b.text);
-  if (a.kind === "bytea" && b.kind === "bytea") return compareBytea(a.bytes, b.bytes);
-  if (a.kind === "uuid" && b.kind === "uuid") return compareBytea(a.bytes, b.bytes);
-  if (a.kind === "bool" && b.kind === "bool") {
-    return a.value === b.value ? 0 : a.value ? 1 : -1;
-  }
-  // Timestamps order by the i64 instant (-infinity < finite < infinity).
-  if (a.kind === "timestamp" && b.kind === "timestamp") {
-    return a.micros < b.micros ? -1 : a.micros > b.micros ? 1 : 0;
-  }
-  if (a.kind === "timestamptz" && b.kind === "timestamptz") {
-    return a.micros < b.micros ? -1 : a.micros > b.micros ? 1 : 0;
-  }
-  if (a.kind === "date" && b.kind === "date") {
-    return a.days < b.days ? -1 : a.days > b.days ? 1 : 0;
-  }
-  // Intervals order by the canonical 128-bit span (spec/design/interval.md §2).
-  if (a.kind === "interval" && b.kind === "interval") return intervalCmp(a.iv, b.iv);
-  // A composite sorts lexicographically, NULLs-last per field (the composite sort key —
-  // spec/design/composite.md §5): the first non-equal field decides, recursing through keyCmp so
-  // per-field NULL placement and nested composites are handled uniformly. The caller's descending
-  // flip in keyCmp reverses the whole tuple. A row-size tie-break keeps it total (same-type rows
-  // have equal arity, so it is only reached for safety).
-  if (a.kind === "composite" && b.kind === "composite") {
-    const n = Math.min(a.fields.length, b.fields.length);
-    for (let i = 0; i < n; i++) {
-      const c = keyCmp(a.fields[i]!, b.fields[i]!, false, false);
-      if (c !== 0) return c;
-    }
-    return a.fields.length < b.fields.length ? -1 : a.fields.length > b.fields.length ? 1 : 0;
-  }
-  // An array sorts by the PG array_cmp total order (spec/design/array.md §5): element-wise over the
-  // flattened elements (NULLs-last per element, recursing through keyCmp), then fewer elements first,
-  // then smaller ndim, then per dimension (length, then lower bound).
-  if (a.kind === "array" && b.kind === "array") {
-    const n = Math.min(a.elements.length, b.elements.length);
-    for (let i = 0; i < n; i++) {
-      const c = keyCmp(a.elements[i]!, b.elements[i]!, false, false);
-      if (c !== 0) return c;
-    }
-    if (a.elements.length !== b.elements.length)
-      return a.elements.length < b.elements.length ? -1 : 1;
-    if (a.dims.length !== b.dims.length) return a.dims.length < b.dims.length ? -1 : 1;
-    for (let d = 0; d < a.dims.length; d++) {
-      if (a.dims[d] !== b.dims[d]) return a.dims[d]! < b.dims[d]! ? -1 : 1;
-      if (a.lbounds[d] !== b.lbounds[d]) return a.lbounds[d]! < b.lbounds[d]! ? -1 : 1;
-    }
-    return 0;
-  }
-  // A range sorts by the PG range_cmp total order (spec/design/ranges.md §6): `empty` below every
-  // non-empty, then lower bound, then upper bound (accounting for infinity/inclusivity). Kept
-  // identical to value's lt3/gt3 range arm so `<` and ORDER BY never disagree.
-  if (a.kind === "range" && b.kind === "range") return rangeTotalCmp(a, b);
-  // jsonb sorts by PG's total btree order (spec/design/json.md §5); kept identical to value's
-  // lt3/gt3 jsonb arm so `<` and ORDER BY never disagree. (json never sorts — the resolver rejects
-  // it 42883.)
-  if (a.kind === "jsonb" && b.kind === "jsonb") return jsonNodeCmp(a.node, b.node);
-  // Cross-family arms exist only for totality — ORDER BY is over a single typed column, so a
-  // mixed pair is unreachable. A fixed family order keeps the comparator total.
-  const fr = familyRank(a) - familyRank(b);
-  return fr < 0 ? -1 : fr > 0 ? 1 : 0;
-}
-
-// familyRank is a fixed total order across value families, for the unreachable cross-family
-// case of valueCmp (ORDER BY is single-column-typed).
-function familyRank(v: Value): number {
-  switch (v.kind) {
-    case "null":
-      return 0;
-    case "bool":
-      return 1;
-    case "int":
-      return 2;
-    case "decimal":
-      return 3;
-    case "f32":
-      return 4;
-    case "f64":
-      return 5;
-    case "text":
-      return 6;
-    case "bytea":
-      return 7;
-    case "uuid":
-      return 8;
-    case "timestamp":
-      return 9;
-    case "timestamptz":
-      return 10;
-    case "interval":
-      return 11;
-    case "date":
-      return 13;
-    // A composite sorts only against composites of its own type (ORDER BY is single-typed), so this
-    // cross-family rank is only for totality; it sits after the scalar families.
-    case "composite":
-      return 12;
-    // json never sorts (42883 at resolve); jsonb sorts only against jsonb. Cross-family ranks for
-    // totality only — they sit after the scalar/container families.
-    case "json":
-      return 15;
-    case "jsonb":
-      return 16;
-    case "jsonpath":
-      return 17;
-    default:
-      return 13;
-  }
-}
-
-// AssignPlan is a resolved UPDATE assignment: target column index, its type and
-// nullability for re-checking, and the resolved RHS expression (evaluated against the
-// old row).
-type AssignPlan = {
-  idx: number;
-  name: string;
-  target: ScalarType;
-  decimal: DecimalTypmod | null;
-  // The varchar(n) length for a text column (spec/design/types.md §15) — UPDATE re-checks the new
-  // value's length exactly like INSERT (over-length 22001, trailing-space truncate).
-  varcharLen: number | null;
-  notNull: boolean;
-  source: RExpr;
-  // The resolved ColType for a NON-scalar (range / array) column — when set, checkAssign stores
-  // through coerceForStore (the container codec, ranges.md §4 / array.md §4); null for a scalar
-  // column, which stays on the storeValue fast path. Composite columns are deferred (0A000) at
-  // resolution, so they never reach here.
-  colType?: ColType;
-};
-
-// checkAssign type-checks + coerces a candidate value against a column — the same store path
-// INSERT uses (NULL into NOT NULL → 23502; an integer out of range → 22003; a decimal rounds to
-// scale; a boolean into a boolean column is accepted as-is; a range/array re-coerces its
-// elements). The resolver proved the value's family is assignable.
-function checkAssign(p: AssignPlan, v: Value): Value {
-  if (p.colType !== undefined)
-    return coerceForStore(v, p.colType, p.decimal, p.varcharLen, p.notNull, p.name);
-  return storeValue(v, p.target, p.decimal, p.varcharLen, p.notNull, p.name);
 }
