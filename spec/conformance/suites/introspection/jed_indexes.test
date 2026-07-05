@@ -1,0 +1,198 @@
+# The jed_indexes catalog relation (spec/design/introspection.md §5.1, slice I2): a read-only
+# COMPUTED relation — one row per SECONDARY INDEX of every USER table of the qualified database:
+# name / table_name / columns (text[], the indexed column names in index-key order, duplicates
+# included) / is_unique / method ('btree' | 'gin' | 'gist'). Lists every entry in a table's index
+# list — a plain CREATE INDEX, a CREATE UNIQUE INDEX, the unique index backing a UNIQUE constraint,
+# and the GiST index backing an EXCLUDE constraint (so a constraint-backing index appears in BOTH
+# jed_indexes and jed_constraints under the same name — the join key). The PRIMARY KEY owns no index
+# object (its <table>_pkey name is not persisted), so it is NOT a row here — it is surfaced by
+# jed_columns.pk_ordinal. Resolution / qualifier scoping / read-only rejection / privileges / cost
+# are the same model as jed_tables (pinned there). jed-specific, so CROSS-CORE-checked, NOT
+# PostgreSQL-oracle-checked.
+# requires: introspect.indexes, introspect.tables, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.unique, ddl.exclusion_constraint, ddl.drop_table, dml.insert, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.cte, query.join_inner, query.qualified_table, query.explain, query.aggregates, session.privileges, resource.cost_metering, types.i32, types.text, types.range
+
+# --- an empty database lists no indexes (catalog relations are not themselves indexes) ------------
+
+query T rowsort
+SELECT name FROM jed_indexes
+----
+
+# --- one row per secondary index; columns is the key-order text[] ---------------------------------
+
+statement ok
+CREATE TABLE t (a i32 PRIMARY KEY, b i32, c i32, d text)
+
+statement ok
+CREATE INDEX ix_b ON t (b)
+
+statement ok
+CREATE INDEX ix_bc ON t (b, c)
+
+statement ok
+CREATE UNIQUE INDEX ux_c ON t (c)
+
+# a table with a UNIQUE constraint (its backing unique index) and an EXCLUDE (its GiST index)
+statement ok
+CREATE TABLE u (id i32 PRIMARY KEY, code i32, CONSTRAINT u_code_uq UNIQUE (code))
+
+statement ok
+CREATE TABLE r (id i32 PRIMARY KEY, span i32range, EXCLUDE USING gist (span WITH &&))
+
+# every secondary index across the three tables — the PK (t.a / u.id / r.id) owns NO index object,
+# so it is absent; a UNIQUE constraint and an EXCLUDE constraint each contribute their backing index
+query TTTBT nosort
+SELECT name, table_name, columns, is_unique, method FROM jed_indexes ORDER BY table_name, name
+----
+r_span_excl
+r
+{span}
+false
+gist
+ix_b
+t
+{b}
+false
+btree
+ix_bc
+t
+{b,c}
+false
+btree
+ux_c
+t
+{c}
+true
+btree
+u_code_uq
+u
+{code}
+true
+btree
+
+# a duplicated key column is preserved in the columns array (PG allows it)
+statement ok
+CREATE INDEX ix_bb ON t (b, b)
+
+query TT nosort
+SELECT name, columns FROM jed_indexes WHERE name = 'ix_bb'
+----
+ix_bb
+{b,b}
+
+statement ok
+DROP INDEX ix_bb
+
+# --- resolution: case-insensitive, alias renames the relation, qualifier scoping ------------------
+
+query T nosort
+SELECT name FROM JED_Indexes ORDER BY name
+----
+ix_b
+ix_bc
+r_span_excl
+u_code_uq
+ux_c
+
+query T nosort
+SELECT ji.name FROM jed_indexes AS ji WHERE ji.is_unique ORDER BY ji.name
+----
+u_code_uq
+ux_c
+
+query T nosort
+SELECT name FROM main.jed_indexes ORDER BY name
+----
+ix_b
+ix_bc
+r_span_excl
+u_code_uq
+ux_c
+
+statement error 42P01
+SELECT name FROM nope.jed_indexes
+
+# a statement-local CTE SHADOWS the catalog relation (PG-matching resolution order)
+query I nosort
+WITH jed_indexes AS (SELECT 1 AS x) SELECT x FROM jed_indexes
+----
+1
+
+# DROP INDEX is reflected immediately (rows derive from the pinned snapshot at execution)
+statement ok
+DROP INDEX ix_b
+
+query I nosort
+SELECT count(*) FROM jed_indexes
+----
+4
+
+# --- composes with the other catalog relations: join jed_indexes to jed_tables -------------------
+
+query TI nosort
+SELECT t.name, count(*) FROM jed_tables t JOIN jed_indexes i ON i.table_name = t.name GROUP BY t.name ORDER BY t.name
+----
+r
+1
+t
+2
+u
+1
+
+# --- read-only: every mutation / DDL target naming the relation is 42809 ------------------------
+
+statement error 42809
+INSERT INTO jed_indexes VALUES ('x', 't', '{a}', false, 'btree')
+
+statement error 42809
+UPDATE jed_indexes SET name = 'x'
+
+statement error 42809
+DELETE FROM jed_indexes
+
+statement error 42809
+DROP TABLE jed_indexes
+
+# IF EXISTS does not suppress a kind rejection (the relation exists)
+statement error 42809
+DROP TABLE IF EXISTS jed_indexes
+
+statement error 42809
+CREATE INDEX i ON jed_indexes (name)
+
+# CREATE of any jed_-prefixed name stays the I0 reservation (42939), not 42809
+statement error 42939
+CREATE TABLE jed_indexes (a i32)
+
+# --- cost: one generated_row per produced row, zero page_read / storage_row_read ----------------
+
+# 4 indexes: 4 generated_row + 4 row_produced = 8. No page is read — the catalog is resident.
+# cost: 8
+query T rowsort
+SELECT name FROM jed_indexes
+----
+ix_bc
+r_span_excl
+u_code_uq
+ux_c
+
+# --- EXPLAIN: a Catalog Scan leaf carrying its database scope ------------------------------------
+
+query ITT nosort
+EXPLAIN SELECT name FROM jed_indexes
+----
+0
+Catalog Scan jed_indexes
+db=main
+
+# --- privileges: gated exactly like a user table (per-table SELECT under the envelope) -----------
+
+# default_privileges: NONE
+statement error 42501
+SELECT name FROM jed_indexes
+
+# default_privileges: NONE
+# grant: SELECT ON jed_indexes
+query I nosort
+SELECT count(*) FROM jed_indexes
+----
+4

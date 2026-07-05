@@ -854,6 +854,13 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // the jed_columns catalog relation (I1): one row per column of every user table — ordinal,
     // canonical type text, not_null, pk_ordinal (introspection.md §5).
     "introspect.columns",
+    // the jed_indexes catalog relation (I2, introspection.md §5.1): one row per secondary index —
+    // name, table_name, columns (text[]), is_unique, method (btree/gin/gist).
+    "introspect.indexes",
+    // the jed_constraints catalog relation (I2): one row per CHECK / UNIQUE / FK / EXCLUDE
+    // constraint — name, table_name, type, columns (text[]), expression, ref_table, ref_columns
+    // (text[]) (introspection.md §5.1).
+    "introspect.constraints",
 ];
 
 /// Parse and execute one SQL statement against a low-level [`Engine`] (no bind parameters).

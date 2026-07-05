@@ -4037,6 +4037,12 @@ function renderToken(t: Token): string {
       return "%";
     case "eq":
       return "=";
+    case "ne":
+      // The canonical not-equal spelling `<>` (its `!=` alias re-lexes to the same `ne` token —
+      // lexer.ts; grammar.md §4). Missing this case previously rendered `<>` as empty in the
+      // persisted check/default expression text — a cross-core divergence surfaced by
+      // jed_constraints.expression (introspection.md §5.1).
+      return "<>";
     case "lt":
       return "<";
     case "gt":

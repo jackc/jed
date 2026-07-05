@@ -3,8 +3,9 @@
 > How a query (and through it, a host) discovers what a database contains: the decision —
 > **`jed_`-prefixed virtual catalog relations**, scoped per database by the existing qualifier —
 > plus the **`jed_` name reservation** that keeps their namespace clear (§4, **implemented**).
-> The first two relations, **`jed_tables` + `jed_columns`, are implemented** (slice I1 — §5, §8);
-> `jed_indexes` / `jed_constraints` / `jed_sequences` / `jed_types` remain designed-only.
+> Four relations are implemented — **`jed_tables` + `jed_columns`** (slice I1 — §5) and
+> **`jed_indexes` + `jed_constraints`** (slice I2 — §5.1); `jed_sequences` / `jed_types` remain
+> designed-only (I3).
 > [attached-databases.md](attached-databases.md) §3 owns the qualifier model the scoping rides;
 > [session.md](session.md) owns the privilege gating; [api.md](api.md) §7 owns `table_names`,
 > the one host-level introspection call that predates this doc; [grammar.md](grammar.md) §3 owns
@@ -243,10 +244,81 @@ expression-text form; deferred to a later column addition). **Growth is by addin
 consumers should select columns by name, not `SELECT *` positionally — documented at the
 relation, PG's own catalog posture.
 
-**Later relations** (same model, own slices): `jed_indexes` (name, table, columns, unique,
-method), `jed_constraints` (CHECK / UNIQUE / FK / EXCLUDE, per constraints.md), `jed_sequences`
-(the six definition fields + ownership), `jed_types` (composite types + fields). Capability ids
-`introspect.tables`, `introspect.columns`, … — one per relation.
+## 5.1 `jed_indexes` + `jed_constraints` (I2) — implemented
+
+The same model as §5 (read-only computed relations, scoped by the qualifier, riding the SRF-plan
+shape, self-excluding, `SELECT`-gated, `42809` on a write target, one `generated_row` per produced
+row): two more relations that describe a table's **indexes** and its **constraints**. Both are
+resolved and gated by the identical `jed_`-name funnel as `jed_tables` / `jed_columns` — adding
+them was adding two entries to the built-in-name classifier plus two row generators, so every
+"computed, not scanned" gate holds by construction.
+
+The I1 sketch listed these as `jed_indexes (name, table, columns, unique, method)` and
+`jed_constraints (…)`; the formal column sets below **refine** that sketch — `table` →
+`table_name` (consistent with `jed_columns`), `unique` → `is_unique` (a self-documenting boolean,
+DuckDB's `duckdb_indexes` spelling), and `columns` is a **`text[]`** of column names (jed has
+first-class arrays, so the member list is a queryable array, not a delimited string). Every column
+name and value below is a **compatibility surface** from the moment it ships — pinned by
+`suites/introspection/jed_indexes.test` and `jed_constraints.test`.
+
+```
+jed_indexes(
+  name        text NOT NULL,     -- the index name (relation namespace, original case)
+  table_name  text NOT NULL,     -- the canonical owning-table name
+  columns     text[] NOT NULL,   -- the indexed column names in index-key order (duplicates included)
+  is_unique   boolean NOT NULL,  -- whether the index enforces uniqueness (indexes.md §8)
+  method      text NOT NULL      -- the access method: 'btree' | 'gin' | 'gist'
+)
+
+jed_constraints(
+  name        text NOT NULL,     -- the constraint name (constraints.md naming)
+  table_name  text NOT NULL,     -- the canonical owning-table name
+  type        text NOT NULL,     -- 'check' | 'unique' | 'foreign_key' | 'exclude'
+  columns     text[],            -- member/local column names: UNIQUE members, FK local columns,
+                                 --   or EXCLUDE columns (constraint order); NULL for a CHECK
+  expression  text,              -- the CHECK expression text (the persisted canonical token form,
+                                 --   constraints.md §4.5 — cross-core byte-identical); NULL otherwise
+  ref_table   text,              -- FOREIGN KEY: the referenced (parent) table name; NULL otherwise
+  ref_columns text[]             -- FOREIGN KEY: the referenced parent column names (list order);
+                                 --   NULL otherwise
+)
+```
+
+**`jed_indexes` lists every secondary index** in `table.indexes` — a plain `CREATE INDEX`, a
+`CREATE UNIQUE INDEX`, the unique index that *backs* a `UNIQUE` constraint (constraints.md §5), and
+the GiST index that *backs* an `EXCLUDE` constraint (gist.md §7). A constraint-backing index
+therefore appears in **both** `jed_indexes` and `jed_constraints` under the same name — the same
+parallel PostgreSQL keeps between `pg_indexes` and `pg_constraint`, and the join key between the two
+relations. `is_unique` is the catalog's `unique` flag; `method` renders the index kind. The primary
+key owns no index object (its `<table>_pkey` name is not persisted — constraints.md §5.4), so it is
+**not** a row here; it is surfaced by `jed_columns.pk_ordinal`.
+
+**`jed_constraints` covers the four kinds the design doc enumerates — CHECK, UNIQUE, FK, EXCLUDE —
+and *only* those.** The `PRIMARY KEY` and `NOT NULL` constraints are deliberately absent: they own
+no named catalog object (constraints.md §1/§3, §5.4) and are already fully described by
+`jed_columns` (`pk_ordinal`, `not_null`). Because a jed **`UNIQUE` constraint *is* its backing
+unique index** (constraints.md §5 — there is no separate constraint object, and the catalog cannot
+distinguish a `UNIQUE` table constraint from a bare `CREATE UNIQUE INDEX`), `type = 'unique'` lists
+**every unique b-tree index**; this is honest to jed's model (a unique index *is* a uniqueness
+constraint) and gives a consumer the complete uniqueness picture in one relation. `type =
+'exclude'` lists the exclusion constraints (columns = the excluded columns in element order — the
+`&&`/`=` operators are a deferred column addition, the §5 "growth by adding columns" rule).
+`expression` is populated for `type = 'check'` only, from the persisted canonical expression text
+(constraints.md §4.5), which is already cross-core byte-identical, so it needs no new
+canonical-form work (contrast the deferred `DEFAULT` rendering of §5).
+
+**Generation order** (deterministic, no map-iteration leak — CLAUDE.md §8; the observable contract
+is the multiset, row order without `ORDER BY` unspecified). `jed_indexes`: tables in ascending
+lowercased-name order, then each table's indexes in the catalog's ascending lowercased-name order.
+`jed_constraints`: tables in ascending lowercased-name order, then per table by **kind** (check,
+unique, foreign_key, exclude), each kind already held in ascending lowercased-name order — a fixed
+kind order because an FK and a UNIQUE index may share a name within one table (FK names are checked
+only against the constraint namespace, constraints.md §6.2), so a global name sort is not a total
+order.
+
+**Later relations** (same model, own slices — I3): `jed_sequences` (the six definition fields +
+ownership), `jed_types` (composite types + fields). Capability ids `introspect.tables`,
+`introspect.columns`, `introspect.indexes`, `introspect.constraints`, … — one per relation.
 
 ## 6. What stays on the host API
 
@@ -264,7 +336,7 @@ relation a pure function of one database's snapshot.
 | Code | Name | Raised |
 |---|---|---|
 | `42939` | `reserved_name` | a user-supplied relation/type name beginning `jed_` (§4) — **registered and implemented now** |
-| `42809` | `wrong_object_type` | a mutation / `CREATE INDEX` / `DROP TABLE` target naming a catalog relation (§5 — read-only; an existing registered code, this use pinned by I1) |
+| `42809` | `wrong_object_type` | a mutation / `CREATE INDEX` / `DROP TABLE` target naming a catalog relation (§5 — read-only; an existing registered code, this use pinned by I1, extended to the I2 relations by construction) |
 | `42501` | `insufficient_privilege` | `SELECT` on a catalog relation without a grant under an explicit-grant session envelope (§5; the ordinary session.md gate) |
 
 The later relations' own errors (if any new arise) are pinned by their implementing slices.
@@ -274,7 +346,7 @@ The later relations' own errors (if any new arise) are pinned by their implement
 | Slice | Contents | Status |
 |---|---|---|
 | **I0** | this doc; `42939` in the error registry; the `jed_` reservation in all three cores; `suites/ddl/reserved_names.test` | ✅ landed |
-| **I1** | `jed_tables` + `jed_columns`: resolution funnel interception (CTE-shadow / built-in-first / qualifier scoping), computed-relation execution riding the SRF plan shape, privilege gating, the 42809 read-only rejections, `generated_row` cost pinning (cost.md), `EXPLAIN` `Catalog Scan`, capabilities `introspect.tables`/`introspect.columns`, the canonical-type-text corpus (`suites/introspection/`, 4 files incl. temp + attachment scoping), `/web` docs | ✅ **this change** |
-| I2 | `jed_indexes`, `jed_constraints` | not started |
+| **I1** | `jed_tables` + `jed_columns`: resolution funnel interception (CTE-shadow / built-in-first / qualifier scoping), computed-relation execution riding the SRF plan shape, privilege gating, the 42809 read-only rejections, `generated_row` cost pinning (cost.md), `EXPLAIN` `Catalog Scan`, capabilities `introspect.tables`/`introspect.columns`, the canonical-type-text corpus (`suites/introspection/`, 4 files incl. temp + attachment scoping), `/web` docs | ✅ landed |
+| **I2** | `jed_indexes` + `jed_constraints` (§5.1): two more built-in-name-classifier entries + two row generators (every gate inherited from I1), the `text[]` member-list columns, the CHECK `expression` from the persisted canonical text, capabilities `introspect.indexes`/`introspect.constraints`, corpus (`suites/introspection/jed_indexes.test` + `jed_constraints.test`), cost.md worked examples, `/web` docs | ✅ **this change** |
 | I3 | `jed_sequences`, `jed_types` | not started |
 | — | `information_schema` compat views over the `jed_` relations | door open, **not planned** |

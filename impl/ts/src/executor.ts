@@ -4129,7 +4129,12 @@ export class Engine {
     if (rel.srf !== undefined) {
       // A catalog relation (introspection.md §5) is computed, not scanned — its own node name (it
       // is a relation, not a function) plus the database scope it reads.
-      if (rel.srf.kind === "jed_tables" || rel.srf.kind === "jed_columns") {
+      if (
+        rel.srf.kind === "jed_tables" ||
+        rel.srf.kind === "jed_columns" ||
+        rel.srf.kind === "jed_indexes" ||
+        rel.srf.kind === "jed_constraints"
+      ) {
         r.emit(
           depth,
           "Catalog Scan " + rel.tableName,
@@ -10707,6 +10712,115 @@ export class Engine {
     return out;
   }
 
+  // jedIndexesRows generates the rows of the jed_indexes catalog relation (introspection.md §5.1):
+  // one row per secondary index of every user table of the scope's snapshot, in (lowercased table
+  // name, then the catalog's ascending index-name order) order. columns is the text[] of indexed
+  // column names in index-key order (duplicates included); is_unique the catalog flag; method the
+  // access-method name (btree/gin/gist). Cost mirrors jedTablesRows.
+  private jedIndexesRows(srf: SrfPlan, meter: Meter): Row[] {
+    const snap = this.snapForScope(srf.introspectScope!);
+    if (snap === undefined) {
+      throw engineError("undefined_table", `database "${srf.introspectScope}" is not attached`);
+    }
+    const out: Row[] = [];
+    for (const t of snap.tablesSorted()) {
+      for (const idx of t.indexes) {
+        meter.guard();
+        meter.charge(COSTS.generatedRow);
+        out.push([
+          textValue(idx.name),
+          textValue(t.name),
+          arrayValue(idx.columns.map((ord) => textValue(t.columns[ord]!.name))),
+          boolValue(idx.unique),
+          textValue(idx.kind),
+        ]);
+      }
+    }
+    return out;
+  }
+
+  // jedConstraintsRows generates the rows of the jed_constraints catalog relation (introspection.md
+  // §5.1): one row per CHECK / UNIQUE / FK / EXCLUDE constraint of every user table of the scope's
+  // snapshot, in (lowercased table name, then a fixed KIND order — check, unique, foreign_key,
+  // exclude — each already held in ascending lowercased-name order). PRIMARY KEY / NOT NULL are
+  // deliberately absent (they own no named object and are described by jed_columns). A UNIQUE
+  // constraint IS its backing unique b-tree index (constraints.md §5), so type='unique' lists every
+  // unique index; expression is the persisted canonical CHECK text (constraints.md §4.5). Cost
+  // mirrors jedTablesRows.
+  private jedConstraintsRows(srf: SrfPlan, meter: Meter): Row[] {
+    const snap = this.snapForScope(srf.introspectScope!);
+    if (snap === undefined) {
+      throw engineError("undefined_table", `database "${srf.introspectScope}" is not attached`);
+    }
+    const textArr = (names: string[]): Value => arrayValue(names.map((n) => textValue(n)));
+    const out: Row[] = [];
+    for (const t of snap.tablesSorted()) {
+      // CHECK: name / table / 'check' / NULL columns / expression text / NULL ref_*.
+      for (const ck of t.checks) {
+        meter.guard();
+        meter.charge(COSTS.generatedRow);
+        out.push([
+          textValue(ck.name),
+          textValue(t.name),
+          textValue("check"),
+          nullValue(),
+          textValue(ck.exprText),
+          nullValue(),
+          nullValue(),
+        ]);
+      }
+      // UNIQUE: every unique b-tree index (a UNIQUE constraint IS its unique index).
+      for (const idx of t.indexes) {
+        if (!idx.unique) continue;
+        meter.guard();
+        meter.charge(COSTS.generatedRow);
+        out.push([
+          textValue(idx.name),
+          textValue(t.name),
+          textValue("unique"),
+          textArr(idx.columns.map((ord) => t.columns[ord]!.name)),
+          nullValue(),
+          nullValue(),
+          nullValue(),
+        ]);
+      }
+      // FOREIGN KEY: local columns / referenced (parent) table + columns (rendered from the
+      // parent's canonical names — the parent always exists, it cannot be dropped while referenced,
+      // constraints.md §6.10).
+      for (const fk of t.fks) {
+        meter.guard();
+        meter.charge(COSTS.generatedRow);
+        const parent = snap.table(fk.refTable);
+        const refTable = parent !== undefined ? parent.name : fk.refTable;
+        out.push([
+          textValue(fk.name),
+          textValue(t.name),
+          textValue("foreign_key"),
+          textArr(fk.columns.map((ord) => t.columns[ord]!.name)),
+          nullValue(),
+          textValue(refTable),
+          textArr(fk.refColumns.map((ord) => parent?.columns[ord]?.name ?? "")),
+        ]);
+      }
+      // EXCLUDE: the excluded columns in element order (the &&/= operators are a deferred column
+      // addition — introspection.md §5.1).
+      for (const exc of t.exclusions) {
+        meter.guard();
+        meter.charge(COSTS.generatedRow);
+        out.push([
+          textValue(exc.name),
+          textValue(t.name),
+          textValue("exclude"),
+          textArr(exc.elements.map((el) => t.columns[el.column]!.name)),
+          nullValue(),
+          nullValue(),
+          nullValue(),
+        ]);
+      }
+    }
+    return out;
+  }
+
   private generateSeriesRows(srf: SrfPlan, env: EvalEnv, meter: Meter): Row[] {
     const evalInt = (e: RExpr): bigint | null => {
       const v = evalExpr(e, [], env, meter);
@@ -11621,6 +11735,10 @@ export class Engine {
           return this.jedTablesRows(rel.srf, meter);
         case "jed_columns":
           return this.jedColumnsRows(rel.srf, meter);
+        case "jed_indexes":
+          return this.jedIndexesRows(rel.srf, meter);
+        case "jed_constraints":
+          return this.jedConstraintsRows(rel.srf, meter);
       }
     }
     // A CTE reference delivers its rows from the per-statement context (cte.md §3/§5): a MATERIALIZED
@@ -16474,7 +16592,13 @@ type SrfKind =
   | "jed_tables"
   // The jed_columns catalog relation (introspection.md §5) — one row per column of every user
   // table of the qualified database, in (table, ordinal) order.
-  | "jed_columns";
+  | "jed_columns"
+  // The jed_indexes catalog relation (introspection.md §5.1, slice I2) — one row per secondary
+  // index of every user table (name, table, columns, is_unique, method).
+  | "jed_indexes"
+  // The jed_constraints catalog relation (introspection.md §5.1, slice I2) — one row per CHECK /
+  // UNIQUE / FK / EXCLUDE constraint of every user table.
+  | "jed_constraints";
 
 // SrfPlan is a resolved set-returning-function row source (spec/design/functions.md §10,
 // array-functions.md §9). kind selects the generator: generate_series(start, stop[, step]) (args =
@@ -16504,9 +16628,18 @@ type SrfPlan = {
 // AFTER a statement-local CTE (a CTE shadows a catalog relation — PG-matching, oracle-checked) and
 // BEFORE the user catalog (post-I0 the two can never collide; for a pre-reservation legacy file the
 // built-in wins and the user relation is unreachable by name — §5).
-function catalogRelKind(name: string): "jed_tables" | "jed_columns" | undefined {
+type CatalogRelKind = "jed_tables" | "jed_columns" | "jed_indexes" | "jed_constraints";
+
+function catalogRelKind(name: string): CatalogRelKind | undefined {
   const lname = name.toLowerCase();
-  if (lname === "jed_tables" || lname === "jed_columns") return lname;
+  if (
+    lname === "jed_tables" ||
+    lname === "jed_columns" ||
+    lname === "jed_indexes" ||
+    lname === "jed_constraints"
+  ) {
+    return lname;
+  }
   return undefined;
 }
 
@@ -16536,10 +16669,10 @@ function checkCatalogRelWrite(name: string): void {
 // Unlike an SRF's single-column alias rule, a FROM alias renames the RELATION only — the column
 // names are part of the introspection surface. Growth is by ADDING columns (consumers select by
 // name, not position — §5).
-function catalogRelTable(kind: "jed_tables" | "jed_columns"): Table {
-  const col = (name: string, ty: ScalarType, notNull: boolean): Column => ({
+function catalogRelTable(kind: CatalogRelKind): Table {
+  const mkCol = (name: string, ty: Type, notNull: boolean): Column => ({
     name,
-    type: scalarT(ty),
+    type: ty,
     decimal: null,
     varcharLen: null,
     primaryKey: false,
@@ -16549,33 +16682,51 @@ function catalogRelTable(kind: "jed_tables" | "jed_columns"): Table {
     identity: null,
     collation: null,
   });
-  if (kind === "jed_tables") {
-    return {
-      name: "jed_tables",
-      columns: [col("name", "text", true)],
-      pk: [],
-      checks: [],
-      indexes: [],
-      fks: [],
-      exclusions: [],
-    };
-  }
-  return {
-    name: "jed_columns",
-    columns: [
-      col("table_name", "text", true),
-      col("name", "text", true),
-      col("ordinal", "i32", true),
-      col("type", "text", true),
-      col("not_null", "boolean", true),
-      col("pk_ordinal", "i32", false),
-    ],
+  const col = (name: string, ty: ScalarType, notNull: boolean): Column =>
+    mkCol(name, scalarT(ty), notNull);
+  // A text[] member-list column (introspection.md §5.1 — the indexed / member column names).
+  const textArr = (name: string, notNull: boolean): Column =>
+    mkCol(name, arrayT(scalarT("text")), notNull);
+  const table = (name: string, columns: Column[]): Table => ({
+    name,
+    columns,
     pk: [],
     checks: [],
     indexes: [],
     fks: [],
     exclusions: [],
-  };
+  });
+  switch (kind) {
+    case "jed_tables":
+      return table("jed_tables", [col("name", "text", true)]);
+    case "jed_columns":
+      return table("jed_columns", [
+        col("table_name", "text", true),
+        col("name", "text", true),
+        col("ordinal", "i32", true),
+        col("type", "text", true),
+        col("not_null", "boolean", true),
+        col("pk_ordinal", "i32", false),
+      ]);
+    case "jed_indexes":
+      return table("jed_indexes", [
+        col("name", "text", true),
+        col("table_name", "text", true),
+        textArr("columns", true),
+        col("is_unique", "boolean", true),
+        col("method", "text", true),
+      ]);
+    default: // "jed_constraints"
+      return table("jed_constraints", [
+        col("name", "text", true),
+        col("table_name", "text", true),
+        col("type", "text", true),
+        textArr("columns", false),
+        col("expression", "text", false),
+        col("ref_table", "text", false),
+        textArr("ref_columns", false),
+      ]);
+  }
 }
 
 // catalogTypeText renders a column's declared type in the CANONICAL introspection form

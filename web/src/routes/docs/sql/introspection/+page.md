@@ -5,14 +5,18 @@
 CREATE TABLE customer (
   id    i32 PRIMARY KEY,
   name  text NOT NULL,
-  email varchar(80),
-  home  addr
+  email varchar(80) CONSTRAINT customer_email_uq UNIQUE,
+  home  addr,
+  age   i32 CHECK (age >= 0)
 );
+CREATE INDEX customer_name_idx ON customer (name);
 CREATE TABLE booking (
-  room   i32,
-  during i32range,
-  price  decimal(8,2),
-  PRIMARY KEY (room, during)
+  room     i32,
+  during   i32range,
+  customer i32 REFERENCES customer (id),
+  price    decimal(8,2),
+  PRIMARY KEY (room, during),
+  EXCLUDE USING gist (during WITH &&)
 );`;
 
 	const query = `SELECT table_name, name, ordinal, type, not_null, pk_ordinal
@@ -22,7 +26,7 @@ ORDER BY table_name, ordinal;`;
 
 <svelte:head>
 	<title>Introspection — jed</title>
-	<meta name="description" content="The jed_tables and jed_columns catalog relations: discover tables and columns from SQL — queryable, joinable, per attached database." />
+	<meta name="description" content="The jed_ catalog relations — jed_tables, jed_columns, jed_indexes, jed_constraints: discover tables, columns, indexes, and constraints from SQL, queryable and joinable, per attached database." />
 </svelte:head>
 
 # Introspection
@@ -31,7 +35,7 @@ The `jed_` catalog relations describe a database *from SQL*. They are ordinary r
 relations — select from them, filter them, join them — whose rows are computed on the fly from
 the database's catalog. Nothing is stored, so they are always current.
 
-Two relations ship today:
+Four relations ship today:
 
 - **`jed_tables`** — one row per user table: `name` (the table name as written in `CREATE TABLE`).
 - **`jed_columns`** — one row per column of every user table: `table_name`, `name`, `ordinal`
@@ -39,6 +43,14 @@ Two relations ship today:
   `decimal(8,2)`, `i32[]`, `i32range`, a composite's name, …), `not_null` (declared `NOT NULL`
   or a `PRIMARY KEY` member), and `pk_ordinal` (the column's 1-based position in the primary
   key, in **key** order; `NULL` for a non-member).
+- **`jed_indexes`** — one row per secondary index: `name`, `table_name`, `columns` (a `text[]` of
+  the indexed column names in key order), `is_unique`, and `method` (`btree` / `gin` / `gist`).
+  The primary key owns no index object, so it is not listed here — see `jed_columns.pk_ordinal`.
+- **`jed_constraints`** — one row per `CHECK` / `UNIQUE` / `FOREIGN KEY` / `EXCLUDE` constraint:
+  `name`, `table_name`, `type`, `columns` (a `text[]` of the member/local columns; `NULL` for a
+  `CHECK`), `expression` (the `CHECK` text; `NULL` otherwise), and `ref_table` / `ref_columns`
+  (the foreign-key parent; `NULL` otherwise). A `UNIQUE` constraint *is* its backing unique index,
+  so it appears in both `jed_indexes` and `jed_constraints` under the same name.
 
 <LiveSql {seed} {query} rows={10} />
 
@@ -46,8 +58,11 @@ Things to try in the panel above:
 
 - List the tables — `SELECT name FROM jed_tables ORDER BY name;`
 - Reconstruct a key — `SELECT name FROM jed_columns WHERE table_name = 'booking' AND pk_ordinal IS NOT NULL ORDER BY pk_ordinal;`
+- List the indexes — `SELECT name, table_name, columns, is_unique, method FROM jed_indexes ORDER BY table_name, name;`
+- List the constraints — `SELECT name, table_name, type, columns, expression, ref_table, ref_columns FROM jed_constraints ORDER BY table_name, type, name;`
+- Find every foreign key and its parent — `SELECT table_name, columns, ref_table, ref_columns FROM jed_constraints WHERE type = 'foreign_key';`
 - Count columns per table — `SELECT table_name, count(*) FROM jed_columns GROUP BY table_name;`
-- Create a table, then re-run the query — the new rows appear immediately.
+- Create a table or index, then re-run the query — the new rows appear immediately.
 
 ## Scoping — one catalog per database
 
@@ -64,7 +79,7 @@ with `jed_` is rejected (`42939`): the prefix is reserved for the engine.
 
 Under a restricted [session](../../api/authorization/), a catalog relation is authorized exactly
 like a user table: a session with explicit grants sees the schema only if the host granted
-`SELECT` on `jed_tables` / `jed_columns`. Schema visibility is a policy decision, not a default.
+`SELECT` on that relation. Schema visibility is a policy decision, not a default.
 
 Two practical notes:
 
@@ -72,4 +87,4 @@ Two practical notes:
   `SELECT *` positionally is not a stable contract.
 - The relations list **user objects only** — they do not list themselves.
 
-Coming later: `jed_indexes`, `jed_constraints`, `jed_sequences`, and `jed_types`.
+Coming later: `jed_sequences` and `jed_types`.

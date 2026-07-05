@@ -718,6 +718,13 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // The jed_columns catalog relation (I1): one row per column of every user table — ordinal,
   // canonical type text, not_null, pk_ordinal (introspection.md §5).
   "introspect.columns",
+  // The jed_indexes catalog relation (I2, introspection.md §5.1): one row per secondary index —
+  // name, table_name, columns (text[]), is_unique, method (btree/gin/gist).
+  "introspect.indexes",
+  // The jed_constraints catalog relation (I2): one row per CHECK / UNIQUE / FK / EXCLUDE
+  // constraint — name, table_name, type, columns (text[]), expression, ref_table, ref_columns
+  // (text[]) (introspection.md §5.1).
+  "introspect.constraints",
 ];
 
 // THIS FILE IS THE PUBLIC API of the TS core (CLAUDE.md §2 — the embedding surface): the converged

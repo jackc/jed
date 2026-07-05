@@ -12255,8 +12255,25 @@ func catalogRelKind(name string) (srfKind, bool) {
 		return srfJedTables, true
 	case "jed_columns":
 		return srfJedColumns, true
+	case "jed_indexes":
+		return srfJedIndexes, true
+	case "jed_constraints":
+		return srfJedConstraints, true
 	}
 	return 0, false
+}
+
+// indexMethodName is the access-method name rendered by jed_indexes.method (introspection.md §5.1):
+// the PostgreSQL amname spelling of the index kind.
+func indexMethodName(kind indexKind) string {
+	switch kind {
+	case indexGin:
+		return "gin"
+	case indexGist:
+		return "gist"
+	default:
+		return "btree"
+	}
 }
 
 // isCatalogRelName reports whether name is a built-in catalog relation (jed_tables / jed_columns).
@@ -12283,12 +12300,13 @@ func checkCatalogRelWrite(name string) error {
 // names are part of the introspection surface. Growth is by ADDING columns (consumers select by
 // name, not position — §5).
 func catalogRelTable(kind srfKind) *catTable {
+	textArr := arrayT(scalarT(scalarText)) // a text[] member-list column (introspection.md §5.1)
 	switch kind {
 	case srfJedTables:
 		return &catTable{Name: "jed_tables", Columns: []catColumn{
 			{Name: "name", Type: scalarT(scalarText), NotNull: true},
 		}}
-	default: // srfJedColumns
+	case srfJedColumns:
 		return &catTable{Name: "jed_columns", Columns: []catColumn{
 			{Name: "table_name", Type: scalarT(scalarText), NotNull: true},
 			{Name: "name", Type: scalarT(scalarText), NotNull: true},
@@ -12296,6 +12314,24 @@ func catalogRelTable(kind srfKind) *catTable {
 			{Name: "type", Type: scalarT(scalarText), NotNull: true},
 			{Name: "not_null", Type: scalarT(scalarBool), NotNull: true},
 			{Name: "pk_ordinal", Type: scalarT(scalarInt32)},
+		}}
+	case srfJedIndexes:
+		return &catTable{Name: "jed_indexes", Columns: []catColumn{
+			{Name: "name", Type: scalarT(scalarText), NotNull: true},
+			{Name: "table_name", Type: scalarT(scalarText), NotNull: true},
+			{Name: "columns", Type: textArr, NotNull: true},
+			{Name: "is_unique", Type: scalarT(scalarBool), NotNull: true},
+			{Name: "method", Type: scalarT(scalarText), NotNull: true},
+		}}
+	default: // srfJedConstraints
+		return &catTable{Name: "jed_constraints", Columns: []catColumn{
+			{Name: "name", Type: scalarT(scalarText), NotNull: true},
+			{Name: "table_name", Type: scalarT(scalarText), NotNull: true},
+			{Name: "type", Type: scalarT(scalarText), NotNull: true},
+			{Name: "columns", Type: textArr},
+			{Name: "expression", Type: scalarT(scalarText)},
+			{Name: "ref_table", Type: scalarT(scalarText)},
+			{Name: "ref_columns", Type: textArr},
 		}}
 	}
 }
@@ -12399,6 +12435,158 @@ func (db *engine) jedColumnsRows(sp *srfPlan, m *costMeter) ([]storedRow, error)
 				TextValue(catalogTypeText(c.Type, c.Decimal, c.VarcharLen)),
 				BoolValue(c.NotNull || c.PrimaryKey),
 				pkOrdinal,
+			})
+		}
+	}
+	return out, nil
+}
+
+// jedIndexesRows generates the rows of the jed_indexes catalog relation (introspection.md §5.1):
+// one row per secondary index of every user table of the scope's snapshot, in (lowercased table
+// name, then the catalog's ascending index-name order) order. columns is the text[] of indexed
+// column names in index-key order (duplicates included); is_unique the catalog flag; method the
+// access-method name (btree/gin/gist). Cost mirrors jedTablesRows.
+func (db *engine) jedIndexesRows(sp *srfPlan, m *costMeter) ([]storedRow, error) {
+	snap := db.snapForScope(sp.introspectScope)
+	if snap == nil {
+		return nil, newError(UndefinedTable, `database "`+sp.introspectScope+`" is not attached`)
+	}
+	var out []storedRow
+	for _, t := range snap.tablesSorted() {
+		for _, idx := range t.Indexes {
+			if err := m.Guard(); err != nil {
+				return nil, err
+			}
+			m.Charge(costs.GeneratedRow)
+			cols := make([]Value, len(idx.Columns))
+			for j, ord := range idx.Columns {
+				cols[j] = TextValue(t.Columns[ord].Name)
+			}
+			out = append(out, storedRow{
+				TextValue(idx.Name),
+				TextValue(t.Name),
+				ArrayValue(cols),
+				BoolValue(idx.Unique),
+				TextValue(indexMethodName(idx.Kind)),
+			})
+		}
+	}
+	return out, nil
+}
+
+// jedConstraintsRows generates the rows of the jed_constraints catalog relation (introspection.md
+// §5.1): one row per CHECK / UNIQUE / FK / EXCLUDE constraint of every user table of the scope's
+// snapshot, in (lowercased table name, then a fixed KIND order — check, unique, foreign_key,
+// exclude — each already held in ascending lowercased-name order). PRIMARY KEY / NOT NULL are
+// deliberately absent (they own no named object and are described by jed_columns). A UNIQUE
+// constraint IS its backing unique b-tree index (constraints.md §5), so type='unique' lists every
+// unique index; expression is the persisted canonical CHECK text (constraints.md §4.5). Cost
+// mirrors jedTablesRows.
+func (db *engine) jedConstraintsRows(sp *srfPlan, m *costMeter) ([]storedRow, error) {
+	snap := db.snapForScope(sp.introspectScope)
+	if snap == nil {
+		return nil, newError(UndefinedTable, `database "`+sp.introspectScope+`" is not attached`)
+	}
+	textArr := func(names []string) Value {
+		vals := make([]Value, len(names))
+		for i, n := range names {
+			vals[i] = TextValue(n)
+		}
+		return ArrayValue(vals)
+	}
+	var out []storedRow
+	for _, t := range snap.tablesSorted() {
+		// CHECK: name / table / 'check' / NULL columns / expression text / NULL ref_*.
+		for _, ck := range t.Checks {
+			if err := m.Guard(); err != nil {
+				return nil, err
+			}
+			m.Charge(costs.GeneratedRow)
+			out = append(out, storedRow{
+				TextValue(ck.Name),
+				TextValue(t.Name),
+				TextValue("check"),
+				NullValue(),
+				TextValue(ck.ExprText),
+				NullValue(),
+				NullValue(),
+			})
+		}
+		// UNIQUE: every unique b-tree index (a UNIQUE constraint IS its unique index).
+		for _, idx := range t.Indexes {
+			if !idx.Unique {
+				continue
+			}
+			if err := m.Guard(); err != nil {
+				return nil, err
+			}
+			m.Charge(costs.GeneratedRow)
+			cols := make([]string, len(idx.Columns))
+			for j, ord := range idx.Columns {
+				cols[j] = t.Columns[ord].Name
+			}
+			out = append(out, storedRow{
+				TextValue(idx.Name),
+				TextValue(t.Name),
+				TextValue("unique"),
+				textArr(cols),
+				NullValue(),
+				NullValue(),
+				NullValue(),
+			})
+		}
+		// FOREIGN KEY: local columns / referenced (parent) table + columns (rendered from the
+		// parent's canonical names — the parent always exists, it cannot be dropped while referenced,
+		// constraints.md §6.10).
+		for _, fk := range t.ForeignKeys {
+			if err := m.Guard(); err != nil {
+				return nil, err
+			}
+			m.Charge(costs.GeneratedRow)
+			local := make([]string, len(fk.Columns))
+			for j, ord := range fk.Columns {
+				local[j] = t.Columns[ord].Name
+			}
+			parent, _ := snap.table(fk.RefTable)
+			refTable := fk.RefTable
+			if parent != nil {
+				refTable = parent.Name
+			}
+			refCols := make([]string, len(fk.RefColumns))
+			for j, ord := range fk.RefColumns {
+				if parent != nil && ord < len(parent.Columns) {
+					refCols[j] = parent.Columns[ord].Name
+				}
+			}
+			out = append(out, storedRow{
+				TextValue(fk.Name),
+				TextValue(t.Name),
+				TextValue("foreign_key"),
+				textArr(local),
+				NullValue(),
+				TextValue(refTable),
+				textArr(refCols),
+			})
+		}
+		// EXCLUDE: the excluded columns in element order (the &&/= operators are a deferred column
+		// addition — introspection.md §5.1).
+		for _, exc := range t.Exclusions {
+			if err := m.Guard(); err != nil {
+				return nil, err
+			}
+			m.Charge(costs.GeneratedRow)
+			cols := make([]string, len(exc.Elements))
+			for j, el := range exc.Elements {
+				cols[j] = t.Columns[el.Column].Name
+			}
+			out = append(out, storedRow{
+				TextValue(exc.Name),
+				TextValue(t.Name),
+				TextValue("exclude"),
+				textArr(cols),
+				NullValue(),
+				NullValue(),
+				NullValue(),
 			})
 		}
 	}
@@ -16040,6 +16228,10 @@ func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 			return db.jedTablesRows(rel.srf, meter)
 		case srfJedColumns:
 			return db.jedColumnsRows(rel.srf, meter)
+		case srfJedIndexes:
+			return db.jedIndexesRows(rel.srf, meter)
+		case srfJedConstraints:
+			return db.jedConstraintsRows(rel.srf, meter)
 		}
 		return nil, nil
 	}
@@ -19451,6 +19643,12 @@ const (
 	// srfJedColumns is the jed_columns catalog relation (introspection.md §5) — one row per column of
 	// every user table of the qualified database, in (table, ordinal) order.
 	srfJedColumns
+	// srfJedIndexes is the jed_indexes catalog relation (introspection.md §5.1, slice I2) — one row
+	// per secondary index of every user table (name, table, columns, is_unique, method).
+	srfJedIndexes
+	// srfJedConstraints is the jed_constraints catalog relation (introspection.md §5.1, slice I2) —
+	// one row per CHECK / UNIQUE / FK / EXCLUDE constraint of every user table.
+	srfJedConstraints
 )
 
 // srfPlan is a resolved set-returning-function row source (spec/design/functions.md §10,

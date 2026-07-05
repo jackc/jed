@@ -11487,6 +11487,155 @@ impl Engine {
         Ok(out)
     }
 
+    /// Generate the rows of the `jed_indexes` catalog relation (introspection.md §5.1): one row per
+    /// secondary index of every user table of the scope's snapshot, in (lowercased table name, then
+    /// the catalog's ascending index-name order) order. `columns` is the `text[]` of indexed column
+    /// names in index-key order (duplicates included); `is_unique` the catalog flag; `method` the
+    /// access-method name (`btree` / `gin` / `gist`). Cost mirrors jed_tables_rows (one
+    /// `generated_row` per row at the source, guarded; zero page_read / storage_row_read).
+    fn jed_indexes_rows(&self, srf: &SrfPlan, meter: &mut Meter) -> Result<Vec<Row>> {
+        let Some(snap) = self.snap_for_scope(&srf.introspect_scope) else {
+            return Err(EngineError::new(
+                SqlState::UndefinedTable,
+                format!("database \"{}\" is not attached", srf.introspect_scope),
+            ));
+        };
+        let mut out: Vec<Row> = Vec::new();
+        for t in snap.tables_sorted() {
+            for idx in &t.indexes {
+                meter.guard()?;
+                meter.charge(COSTS.generated_row);
+                let cols: Vec<Value> = idx
+                    .columns
+                    .iter()
+                    .map(|&ord| Value::Text(t.columns[ord].name.clone()))
+                    .collect();
+                out.push(vec![
+                    Value::Text(idx.name.clone()),
+                    Value::Text(t.name.clone()),
+                    Value::Array(ArrayVal::one_dim(cols)),
+                    Value::Bool(idx.unique),
+                    Value::Text(index_method_name(idx.kind).to_string()),
+                ]);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Generate the rows of the `jed_constraints` catalog relation (introspection.md §5.1): one row
+    /// per CHECK / UNIQUE / FK / EXCLUDE constraint of every user table of the scope's snapshot, in
+    /// (lowercased table name, then a fixed KIND order — check, unique, foreign_key, exclude — each
+    /// already held in ascending lowercased-name order). PRIMARY KEY / NOT NULL are deliberately
+    /// absent (they own no named object and are described by jed_columns). A `UNIQUE` constraint IS
+    /// its backing unique b-tree index (constraints.md §5), so `type = 'unique'` lists every unique
+    /// index; `expression` is the persisted canonical CHECK text (constraints.md §4.5). Cost mirrors
+    /// jed_tables_rows.
+    fn jed_constraints_rows(&self, srf: &SrfPlan, meter: &mut Meter) -> Result<Vec<Row>> {
+        let Some(snap) = self.snap_for_scope(&srf.introspect_scope) else {
+            return Err(EngineError::new(
+                SqlState::UndefinedTable,
+                format!("database \"{}\" is not attached", srf.introspect_scope),
+            ));
+        };
+        let text_arr = |names: Vec<String>| {
+            Value::Array(ArrayVal::one_dim(
+                names.into_iter().map(Value::Text).collect(),
+            ))
+        };
+        let mut out: Vec<Row> = Vec::new();
+        for t in snap.tables_sorted() {
+            // CHECK: name / table / 'check' / NULL columns / expression text / NULL ref_*.
+            for ck in &t.checks {
+                meter.guard()?;
+                meter.charge(COSTS.generated_row);
+                out.push(vec![
+                    Value::Text(ck.name.clone()),
+                    Value::Text(t.name.clone()),
+                    Value::Text("check".to_string()),
+                    Value::Null,
+                    Value::Text(ck.expr_text.clone()),
+                    Value::Null,
+                    Value::Null,
+                ]);
+            }
+            // UNIQUE: every unique b-tree index (a UNIQUE constraint IS its unique index).
+            for idx in t.indexes.iter().filter(|i| i.unique) {
+                meter.guard()?;
+                meter.charge(COSTS.generated_row);
+                let cols: Vec<String> = idx
+                    .columns
+                    .iter()
+                    .map(|&ord| t.columns[ord].name.clone())
+                    .collect();
+                out.push(vec![
+                    Value::Text(idx.name.clone()),
+                    Value::Text(t.name.clone()),
+                    Value::Text("unique".to_string()),
+                    text_arr(cols),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                ]);
+            }
+            // FOREIGN KEY: local columns / referenced (parent) table + columns (rendered from the
+            // parent's canonical names — the parent always exists, it cannot be dropped while
+            // referenced, constraints.md §6.10).
+            for fk in &t.foreign_keys {
+                meter.guard()?;
+                meter.charge(COSTS.generated_row);
+                let local: Vec<String> = fk
+                    .columns
+                    .iter()
+                    .map(|&ord| t.columns[ord].name.clone())
+                    .collect();
+                let parent = snap.table(&fk.ref_table);
+                let ref_table = parent
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| fk.ref_table.clone());
+                let ref_cols: Vec<String> = fk
+                    .ref_columns
+                    .iter()
+                    .map(|&ord| {
+                        parent
+                            .and_then(|p| p.columns.get(ord))
+                            .map(|c| c.name.clone())
+                            .unwrap_or_default()
+                    })
+                    .collect();
+                out.push(vec![
+                    Value::Text(fk.name.clone()),
+                    Value::Text(t.name.clone()),
+                    Value::Text("foreign_key".to_string()),
+                    text_arr(local),
+                    Value::Null,
+                    Value::Text(ref_table),
+                    text_arr(ref_cols),
+                ]);
+            }
+            // EXCLUDE: the excluded columns in element order (the &&/= operators are a deferred
+            // column addition — introspection.md §5.1).
+            for exc in &t.exclusions {
+                meter.guard()?;
+                meter.charge(COSTS.generated_row);
+                let cols: Vec<String> = exc
+                    .elements
+                    .iter()
+                    .map(|el| t.columns[el.column].name.clone())
+                    .collect();
+                out.push(vec![
+                    Value::Text(exc.name.clone()),
+                    Value::Text(t.name.clone()),
+                    Value::Text("exclude".to_string()),
+                    text_arr(cols),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                ]);
+            }
+        }
+        Ok(out)
+    }
+
     fn generate_series_rows(
         &self,
         srf: &SrfPlan,
@@ -12671,6 +12820,8 @@ impl Engine {
                 SrfKind::JsonTable => self.json_table_rows(srf, &env, meter),
                 SrfKind::JedTables => self.jed_tables_rows(srf, meter),
                 SrfKind::JedColumns => self.jed_columns_rows(srf, meter),
+                SrfKind::JedIndexes => self.jed_indexes_rows(srf, meter),
+                SrfKind::JedConstraints => self.jed_constraints_rows(srf, meter),
             };
         }
         // A CTE reference delivers its rows from the per-statement context (cte.md §3/§5): a
@@ -17339,6 +17490,13 @@ enum SrfKind {
     /// The `jed_columns` catalog relation (introspection.md §5) — one row per column of every user
     /// table of the qualified database, in (table, ordinal) order.
     JedColumns,
+    /// The `jed_indexes` catalog relation (introspection.md §5.1, slice I2) — one row per secondary
+    /// index of every user table of the qualified database (name, table, columns, is_unique,
+    /// method), in (table, index-name) order.
+    JedIndexes,
+    /// The `jed_constraints` catalog relation (introspection.md §5.1, slice I2) — one row per
+    /// CHECK / UNIQUE / FK / EXCLUDE constraint of every user table, in (table, kind, name) order.
+    JedConstraints,
 }
 
 /// A resolved `JSON_TABLE` plan (T1, json-table.md §3) — the compiled root path + the column tree.
@@ -17411,6 +17569,8 @@ fn catalog_rel_kind(name: &str) -> Option<SrfKind> {
     match name.to_ascii_lowercase().as_str() {
         "jed_tables" => Some(SrfKind::JedTables),
         "jed_columns" => Some(SrfKind::JedColumns),
+        "jed_indexes" => Some(SrfKind::JedIndexes),
+        "jed_constraints" => Some(SrfKind::JedConstraints),
         _ => None,
     }
 }
@@ -17421,6 +17581,16 @@ fn catalog_rel_kind(name: &str) -> Option<SrfKind> {
 /// exactly like a user table under an explicit-grant session envelope.
 fn is_catalog_rel_name(name: &str) -> bool {
     catalog_rel_kind(name).is_some()
+}
+
+/// The access-method name rendered by `jed_indexes.method` (introspection.md §5.1): the PostgreSQL
+/// `amname` spelling of the index kind.
+fn index_method_name(kind: IndexKind) -> &'static str {
+    match kind {
+        IndexKind::Btree => "btree",
+        IndexKind::Gin => "gin",
+        IndexKind::Gist => "gist",
+    }
 }
 
 /// Reject a mutation target (INSERT / UPDATE / DELETE / CREATE INDEX ON) naming a built-in catalog
@@ -17446,9 +17616,9 @@ fn check_catalog_rel_write(name: &str) -> Result<()> {
 /// the introspection surface. Growth is by ADDING columns (consumers select by name, not position
 /// — §5).
 fn catalog_rel_table(kind: SrfKind) -> Box<Table> {
-    let col = |name: &str, ty: ScalarType, not_null: bool| Column {
+    let mk_col = |name: &str, ty: Type, not_null: bool| Column {
         name: name.to_string(),
-        ty: Type::Scalar(ty),
+        ty,
         decimal: None,
         varchar_len: None,
         primary_key: false,
@@ -17458,19 +17628,31 @@ fn catalog_rel_table(kind: SrfKind) -> Box<Table> {
         identity: None,
         collation: None,
     };
-    match kind {
-        SrfKind::JedTables => Box::new(Table {
-            name: "jed_tables".to_string(),
-            columns: vec![col("name", ScalarType::Text, true)],
+    let col = |name: &str, ty: ScalarType, not_null: bool| mk_col(name, Type::Scalar(ty), not_null);
+    // A `text[]` member-list column (introspection.md §5.1 — the indexed / member column names).
+    let text_arr = |name: &str, not_null: bool| {
+        mk_col(
+            name,
+            Type::Array(Box::new(Type::Scalar(ScalarType::Text))),
+            not_null,
+        )
+    };
+    let table = |name: &str, columns: Vec<Column>| {
+        Box::new(Table {
+            name: name.to_string(),
+            columns,
             pk: Vec::new(),
             checks: Vec::new(),
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
             exclusions: Vec::new(),
-        }),
-        _ => Box::new(Table {
-            name: "jed_columns".to_string(),
-            columns: vec![
+        })
+    };
+    match kind {
+        SrfKind::JedTables => table("jed_tables", vec![col("name", ScalarType::Text, true)]),
+        SrfKind::JedColumns => table(
+            "jed_columns",
+            vec![
                 col("table_name", ScalarType::Text, true),
                 col("name", ScalarType::Text, true),
                 col("ordinal", ScalarType::Int32, true),
@@ -17478,12 +17660,30 @@ fn catalog_rel_table(kind: SrfKind) -> Box<Table> {
                 col("not_null", ScalarType::Bool, true),
                 col("pk_ordinal", ScalarType::Int32, false),
             ],
-            pk: Vec::new(),
-            checks: Vec::new(),
-            indexes: Vec::new(),
-            foreign_keys: Vec::new(),
-            exclusions: Vec::new(),
-        }),
+        ),
+        SrfKind::JedIndexes => table(
+            "jed_indexes",
+            vec![
+                col("name", ScalarType::Text, true),
+                col("table_name", ScalarType::Text, true),
+                text_arr("columns", true),
+                col("is_unique", ScalarType::Bool, true),
+                col("method", ScalarType::Text, true),
+            ],
+        ),
+        // SrfKind::JedConstraints
+        _ => table(
+            "jed_constraints",
+            vec![
+                col("name", ScalarType::Text, true),
+                col("table_name", ScalarType::Text, true),
+                col("type", ScalarType::Text, true),
+                text_arr("columns", false),
+                col("expression", ScalarType::Text, false),
+                col("ref_table", ScalarType::Text, false),
+                text_arr("ref_columns", false),
+            ],
+        ),
     }
 }
 
@@ -27612,7 +27812,13 @@ impl Engine {
         if let Some(srf) = &rel.srf {
             // A catalog relation (introspection.md §5) is computed, not scanned — its own node name
             // (it is a relation, not a function) plus the database scope it reads.
-            if matches!(srf.kind, SrfKind::JedTables | SrfKind::JedColumns) {
+            if matches!(
+                srf.kind,
+                SrfKind::JedTables
+                    | SrfKind::JedColumns
+                    | SrfKind::JedIndexes
+                    | SrfKind::JedConstraints
+            ) {
                 r.emit(
                     depth,
                     format!("Catalog Scan {}", rel.table_name),

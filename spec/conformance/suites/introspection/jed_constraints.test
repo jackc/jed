@@ -1,0 +1,220 @@
+# The jed_constraints catalog relation (spec/design/introspection.md §5.1, slice I2): a read-only
+# COMPUTED relation — one row per CHECK / UNIQUE / FOREIGN KEY / EXCLUDE constraint of every USER
+# table: name / table_name / type ('check' | 'unique' | 'foreign_key' | 'exclude') / columns
+# (text[], member/local columns; NULL for a CHECK) / expression (the persisted canonical CHECK text,
+# constraints.md §4.5 — cross-core byte-identical; NULL otherwise) / ref_table + ref_columns (FK
+# parent, NULL otherwise). It covers those FOUR kinds only: the PRIMARY KEY and NOT NULL constraints
+# own no named catalog object and are described by jed_columns (pk_ordinal, not_null). A jed UNIQUE
+# constraint IS its backing unique index (constraints.md §5 — the catalog cannot distinguish a
+# UNIQUE table constraint from a bare CREATE UNIQUE INDEX), so type='unique' lists every unique
+# b-tree index; a constraint-backing index appears in both jed_constraints and jed_indexes under the
+# same name. Resolution / scoping / read-only / privileges / cost are the jed_tables model.
+# jed-specific, so CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
+# requires: introspect.constraints, introspect.indexes, introspect.tables, ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.check, ddl.unique, ddl.foreign_key, ddl.exclusion_constraint, ddl.not_null, ddl.drop_table, dml.insert, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.cte, query.join_inner, query.qualified_table, query.explain, query.aggregates, session.privileges, resource.cost_metering, types.i32, types.text, types.range
+
+# --- an empty database lists no constraints -------------------------------------------------------
+
+query T rowsort
+SELECT name FROM jed_constraints
+----
+
+# --- the four kinds: CHECK / UNIQUE / FOREIGN KEY / EXCLUDE --------------------------------------
+
+statement ok
+CREATE TABLE parent (id i32, code i32, PRIMARY KEY (code, id), CONSTRAINT parent_id_uq UNIQUE (id))
+
+statement ok
+CREATE TABLE child (
+  x i32 PRIMARY KEY,
+  pid i32,
+  amt i32 CHECK (amt >= 0),
+  note text,
+  span i32range,
+  CONSTRAINT child_pid_fk FOREIGN KEY (pid) REFERENCES parent (id),
+  CONSTRAINT chk_note CHECK (note <> ''),
+  EXCLUDE USING gist (span WITH &&)
+)
+
+# every constraint across both tables — the PRIMARY KEY (parent's (code, id), child's x) is ABSENT
+# (owns no named object; described by jed_columns.pk_ordinal), so is NOT NULL. Per-table generation
+# order is by KIND (check, unique, foreign_key, exclude), then name.
+query TTTTTTT nosort
+SELECT name, table_name, type, columns, expression, ref_table, ref_columns
+  FROM jed_constraints ORDER BY table_name, type, name
+----
+child_amt_check
+child
+check
+NULL
+amt >= 0
+NULL
+NULL
+chk_note
+child
+check
+NULL
+note <> ''
+NULL
+NULL
+child_span_excl
+child
+exclude
+{span}
+NULL
+NULL
+NULL
+child_pid_fk
+child
+foreign_key
+{pid}
+NULL
+parent
+{id}
+parent_id_uq
+parent
+unique
+{id}
+NULL
+NULL
+NULL
+
+# --- CHECK: the canonical expression text is a compatibility surface (constraints.md §4.5) --------
+
+# multi-operator, multi-column expressions re-render to the persisted canonical token form (the <>
+# not-equal operator renders canonically; a != alias folds to it)
+statement ok
+CREATE TABLE checked (a i32 PRIMARY KEY, b i32, c i32, CONSTRAINT ck CHECK (a + b < 100 AND c != 5))
+
+query TT nosort
+SELECT type, expression FROM jed_constraints WHERE table_name = 'checked' ORDER BY name
+----
+check
+a + b < 100 AND c <> 5
+
+# --- UNIQUE: a bare CREATE UNIQUE INDEX is a uniqueness constraint too (jed's model) --------------
+
+statement ok
+CREATE TABLE uix (id i32 PRIMARY KEY, k i32)
+
+statement ok
+CREATE UNIQUE INDEX uix_k ON uix (k)
+
+query TTT nosort
+SELECT name, type, columns FROM jed_constraints WHERE table_name = 'uix'
+----
+uix_k
+unique
+{k}
+
+# a constraint-backing index appears in BOTH catalog relations under the same name (the join key)
+query TTT nosort
+SELECT c.name, c.type, i.method
+  FROM jed_constraints c JOIN jed_indexes i ON i.name = c.name AND i.table_name = c.table_name
+  WHERE c.table_name = 'uix'
+----
+uix_k
+unique
+btree
+
+# --- FOREIGN KEY: local + referenced columns preserve LIST order (key-order mapping, §6.8) --------
+
+statement ok
+CREATE TABLE p2 (a i32, b i32, PRIMARY KEY (a, b))
+
+statement ok
+CREATE TABLE c2 (x i32 PRIMARY KEY, fa i32, fb i32, FOREIGN KEY (fb, fa) REFERENCES p2 (b, a))
+
+# columns is the LOCAL list order (fb, fa); ref_columns the referenced list order (b, a) — the
+# names, not ordinals, resolved against the parent's canonical columns
+query TTTT nosort
+SELECT type, columns, ref_table, ref_columns FROM jed_constraints WHERE table_name = 'c2'
+----
+foreign_key
+{fb,fa}
+p2
+{b,a}
+
+# --- resolution: case-insensitive, alias, qualifier scoping, CTE shadow --------------------------
+
+query T nosort
+SELECT name FROM JED_Constraints WHERE table_name = 'parent'
+----
+parent_id_uq
+
+query T nosort
+SELECT jc.name FROM main.jed_constraints AS jc WHERE jc.type = 'foreign_key' ORDER BY jc.name
+----
+c2_fb_fa_fkey
+child_pid_fk
+
+statement error 42P01
+SELECT name FROM nope.jed_constraints
+
+query I nosort
+WITH jed_constraints AS (SELECT 1 AS x) SELECT x FROM jed_constraints
+----
+1
+
+# DROP TABLE removes its constraints (child depends on parent, so drop child first)
+statement ok
+DROP TABLE child
+
+query I nosort
+SELECT count(*) FROM jed_constraints WHERE table_name = 'child'
+----
+0
+
+# --- read-only: every mutation / DDL target naming the relation is 42809 ------------------------
+
+statement error 42809
+INSERT INTO jed_constraints VALUES ('x', 't', 'check', NULL, 'a > 0', NULL, NULL)
+
+statement error 42809
+UPDATE jed_constraints SET name = 'x'
+
+statement error 42809
+DELETE FROM jed_constraints
+
+statement error 42809
+DROP TABLE jed_constraints
+
+statement error 42809
+DROP TABLE IF EXISTS jed_constraints
+
+statement error 42939
+CREATE TABLE jed_constraints (a i32)
+
+# --- cost: one generated_row per produced row, zero page_read / storage_row_read ----------------
+
+# after DROP TABLE child, the constraints are: parent_id_uq, ck (checked), uix_k, c2_fb_fa_fkey = 4.
+# 4 generated_row + 4 row_produced = 8. No page is read — the catalog is resident.
+# cost: 8
+query T rowsort
+SELECT name FROM jed_constraints
+----
+c2_fb_fa_fkey
+ck
+parent_id_uq
+uix_k
+
+# --- EXPLAIN: a Catalog Scan leaf carrying its database scope ------------------------------------
+
+query ITT nosort
+EXPLAIN SELECT name FROM jed_constraints
+----
+0
+Catalog Scan jed_constraints
+db=main
+
+# --- privileges: gated exactly like a user table (per-table SELECT under the envelope) -----------
+
+# default_privileges: NONE
+statement error 42501
+SELECT name FROM jed_constraints
+
+# default_privileges: NONE
+# grant: SELECT ON jed_constraints
+query I nosort
+SELECT count(*) FROM jed_constraints
+----
+4

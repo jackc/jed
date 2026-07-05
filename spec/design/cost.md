@@ -977,16 +977,21 @@ but charges no `row_produced`. Worked examples (all asserted in the corpus):
   (`page_read` + 3 `storage_row_read`) **+ 3 `generated_row`** (the series is materialized once,
   like any join operand) + 9 `row_produced` for the product.
 
-**The catalog relations ride the same unit** ([introspection.md](introspection.md) §5, slice I1):
-`jed_tables` / `jed_columns` are computed relations — rows derived at execution from the qualified
-database's pinned catalog snapshot, which is **resident by construction** ([pager.md](pager.md)'s
-catalog residency) — so a catalog scan charges one `generated_row` per produced row (guarded, at
-the source) and **zero** `page_read` / `storage_row_read`. Everything downstream meters as usual:
-`row_produced` per emitted row, `operator_eval` (+ `varlen_compare` for a text comparison) per
-`WHERE` evaluation, `aggregate_accumulate` per folded row. Worked examples (asserted in
+**The catalog relations ride the same unit** ([introspection.md](introspection.md) §5, slices I1 +
+I2): `jed_tables` / `jed_columns` / `jed_indexes` / `jed_constraints` are computed relations — rows
+derived at execution from the qualified database's pinned catalog snapshot, which is **resident by
+construction** ([pager.md](pager.md)'s catalog residency) — so a catalog scan charges one
+`generated_row` per produced row (guarded, at the source) and **zero** `page_read` /
+`storage_row_read`. This holds regardless of a row's shape: a `jed_indexes` / `jed_constraints` row
+carries a `text[]` member-list column, but building that array is part of generating the row (like
+the `text` columns) and adds nothing beyond the one `generated_row`. Everything downstream meters as
+usual: `row_produced` per emitted row, `operator_eval` (+ `varlen_compare` for a text comparison)
+per `WHERE` evaluation, `aggregate_accumulate` per folded row. Worked examples (asserted in
 `suites/introspection/`): `SELECT name FROM jed_tables` over 2 tables — 2 `generated_row` + 2
 `row_produced` = **4**; `SELECT count(*) FROM jed_columns` over 37 columns — 37 `generated_row` +
-37 `aggregate_accumulate` + 1 `row_produced` = **75**.
+37 `aggregate_accumulate` + 1 `row_produced` = **75**; `SELECT name FROM jed_indexes` over 4
+indexes — 4 `generated_row` + 4 `row_produced` = **8** (the same for a 4-constraint
+`jed_constraints` scan).
 
 ### `sequence_advance` — a sequence mutation
 
