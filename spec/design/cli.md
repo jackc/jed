@@ -233,8 +233,10 @@ tui-textarea) · **results grid** (bottom right) · **status bar** (bottom) · a
   End); header row pinned; cells via `Value::render()`, NULL dimmed. Footer:
   `N rows · cost C` (wall time may appear here, clearly cosmetic — it never appears in
   script output).
-- **Schema sidebar**: built from `db.table_names()` + `db.table(name)` (api.md §6) —
-  table → columns (`name type`, PK / NOT NULL markers), indexes (UNIQUE flag), CHECK
+- **Schema sidebar**: built from the `#[doc(hidden)]` `tooling` catalog accessors
+  `db.table_names()` + `db.table(name)` (api.md §6 — the CLI is a privileged in-repo consumer, not a
+  host: it reads the full catalog `Table` the SQL `jed_` relations don't yet expose, e.g. column
+  DEFAULTs) — table → columns (`name type`, PK / NOT NULL markers), indexes (UNIQUE flag), CHECK
   names. Refreshed after any successful statement batch. Enter on a table name inserts it
   into the editor.
 - **Status bar**: db file path or `memory` · transaction state from `db.in_transaction()`

@@ -27,6 +27,18 @@ fn count(db: &Database, sql: &str) -> i64 {
         .expect("one row")
 }
 
+/// The database's user tables via SQL — the `jed_` catalog relations are the introspection surface
+/// (introspection.md §6); a host reads the schema through them, there is no host-API convenience.
+/// `ORDER BY name` (byte order == the old lowercased order for these lowercase names).
+fn table_names(db: &Database) -> Vec<String> {
+    let mut s = db.session(SessionOptions::default());
+    s.query_rows("SELECT name FROM jed_tables ORDER BY name", ())
+        .expect("query jed_tables")
+        .iter()
+        .map(|row| row.get::<String>(0).expect("read jed_tables.name"))
+        .collect()
+}
+
 // ───────────────────────────── loading ─────────────────────────────
 
 #[test]
@@ -104,19 +116,19 @@ fn migrate_up_then_down_round_trips() {
     let mut m = Migrator::new(&db, migrations, Options::default()).unwrap();
 
     assert_eq!(m.current_version().unwrap(), 0);
-    assert_eq!(db.table_names(), vec!["schema_version"]);
+    assert_eq!(table_names(&db), vec!["schema_version"]);
 
     m.migrate().unwrap();
     assert_eq!(m.current_version().unwrap(), 3);
-    assert_eq!(db.table_names(), vec!["posts", "schema_version", "users"]);
+    assert_eq!(table_names(&db), vec!["posts", "schema_version", "users"]);
 
     m.migrate_to(0).unwrap();
     assert_eq!(m.current_version().unwrap(), 0);
-    assert_eq!(db.table_names(), vec!["schema_version"]);
+    assert_eq!(table_names(&db), vec!["schema_version"]);
 
     // Back up again — proves the down halves truly reversed the schema.
     m.migrate().unwrap();
-    assert_eq!(db.table_names(), vec!["posts", "schema_version", "users"]);
+    assert_eq!(table_names(&db), vec!["posts", "schema_version", "users"]);
 }
 
 #[test]
@@ -195,7 +207,7 @@ fn migration_error_carries_context() {
     }
     assert_eq!(err.sql_state(), Some("42P01")); // undefined table
     assert_eq!(m.current_version().unwrap(), 0, "rolled back");
-    assert!(!db.table_names().iter().any(|n| n == "ok"));
+    assert!(!table_names(&db).iter().any(|n| n == "ok"));
 }
 
 #[test]
@@ -233,7 +245,7 @@ fn custom_version_table() {
     )
     .unwrap();
     m.migrate_to(1).unwrap();
-    let names = db.table_names();
+    let names = table_names(&db);
     assert!(names.iter().any(|n| n == "migration_state"));
     assert!(!names.iter().any(|n| n == "schema_version"));
 }

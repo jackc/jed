@@ -7,18 +7,20 @@
 > **`jed_indexes` + `jed_constraints`** (slice I2 — §5.1); `jed_sequences` / `jed_types` remain
 > designed-only (I3).
 > [attached-databases.md](attached-databases.md) §3 owns the qualifier model the scoping rides;
-> [session.md](session.md) owns the privilege gating; [api.md](api.md) §7 owns `table_names`,
-> the one host-level introspection call that predates this doc; [grammar.md](grammar.md) §3 owns
-> the identifier rules the reservation leans on. When a decision here changes, update
-> [TODO.md](../../TODO.md) and those docs in the same edit.
+> [session.md](session.md) owns the privilege gating; [api.md](api.md) §7 owns the host handle —
+> which deliberately exposes **no** introspection convenience (the old `table_names()` was removed
+> once these relations landed; §6); [grammar.md](grammar.md) §3 owns the identifier rules the
+> reservation leans on. When a decision here changes, update [TODO.md](../../TODO.md) and those docs
+> in the same edit.
 
 ## 1. The problem, and the decision
 
-The engine's only schema introspection today is the host-API `table_names()` (api.md §7) — a
-sorted list of table names, nothing more. A host cannot ask *from SQL* what tables exist, what
+The engine's only schema introspection *was* the host-API `table_names()` (api.md §7) — a
+sorted list of table names, nothing more. A host could not ask *from SQL* what tables exist, what
 columns a table has, or what type a column is; a generic tool (a REPL, a migration checker, an
-admin UI over an untrusted session) has no surface at all. CLAUDE.md §1 sets the bar: SQL is the
-primary surface and **everything must be reachable through it** — introspection included.
+admin UI over an untrusted session) had no surface at all. CLAUDE.md §1 sets the bar: SQL is the
+primary surface and **everything must be reachable through it** — introspection included. With the
+relations below shipped, `table_names()` was **removed** (§6): SQL is now the whole surface.
 
 **Decision (2026-07-04): introspection is a family of `jed_`-prefixed, read-only, computed
 catalog relations in the ordinary relation namespace** — `jed_tables` and `jed_columns` first,
@@ -193,7 +195,8 @@ missing name). `CREATE` of any `jed_`-prefixed name stays the §4 reservation (`
 catalog relation has no key to reference).
 
 **Self-exclusion.** Catalog relations list **user objects only** — they do not list themselves
-or each other, matching what `table_names()` returns today (api.md §7 stays user-objects-only).
+or each other (the doc-hidden `tooling` catalog accessors the CLI reaches, api.md §6, are likewise
+user-objects-only).
 
 **Privileges** (implemented). A catalog relation is gated exactly like a user table: per-table
 `SELECT` under the session envelope (session.md), no special case — the privilege gate treats the
@@ -320,11 +323,32 @@ order.
 ownership), `jed_types` (composite types + fields). Capability ids `introspect.tables`,
 `introspect.columns`, `introspect.indexes`, `introspect.constraints`, … — one per relation.
 
-## 6. What stays on the host API
+## 6. The host API carries no introspection convenience
 
-`table_names()` remains as-is (api.md §7): a thin convenience, and the precedent that host
-metadata surfaces stay **wrappers over** (or trivially consistent with) the SQL relations —
-never a second source of truth. Future per-language conveniences follow the JDBC layering.
+**Decision (2026-07-04): the host handle exposes no schema-introspection convenience — introspection
+is SQL, full stop.** With the `jed_` relations shipped, the pre-existing `table_names()` catalog read
+(api.md §7) is **removed** from the public `Database`/`Session` surface in every core: a host that
+wants the table list runs `SELECT name FROM jed_tables`, and everything richer is `jed_columns` /
+`jed_indexes` / `jed_constraints`. This is the CLAUDE.md §1 rule taken to its conclusion — a second,
+per-language, per-binding metadata surface (reimplemented N ways outside the conformance corpus's
+differential net) is exactly the drift §5 exists to prevent, and it gave untrusted-session tooling
+(which sees only SQL) nothing anyway. The earlier framing ("`table_names()` stays as a thin
+convenience wrapping the relations") is superseded: there is no wrapper, because there is no second
+surface to keep consistent.
+
+**What remains is not a convenience but a doc-hidden tooling seam.** `table()` (and
+`composite_type()`) survive as the `#[doc(hidden)]` `tooling` introspection accessors the **in-repo
+CLI and white-box tests** reach for (api.md §6) — the CLI's `.dump` reconstructs `CREATE TABLE` from
+the full catalog `Table`, which the `jed_` relations do not yet fully expose (column DEFAULTs are
+still un-rendered in `jed_columns`, §5). These are internal machinery, explicitly not the embedding
+API, and a host is never pointed at them. Per core the seam differs by necessity (api.md §6): Rust
+keeps `table`/`table_names` as `#[doc(hidden)]` handle accessors because its CLI is a separate crate;
+Go drops the `TableNames` wrappers entirely; TS's tools reach `Engine.tableNames()` directly.
+
+**Attachment listing is host-API-only, by design.** Which databases are attached is *handle*
+state created by host-API acts (attached-databases.md §2), not database state — so there is no
+`jed_databases` relation; the host already holds what it attached. This also keeps every catalog
+relation a pure function of one database's snapshot.
 
 **Attachment listing is host-API-only, by design.** Which databases are attached is *handle*
 state created by host-API acts (attached-databases.md §2), not database state — so there is no

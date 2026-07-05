@@ -111,8 +111,9 @@ pub use value::Value;
 /// and the `cli/` REPL). NOT part of the stable embedding API — `#[doc(hidden)]`, and only those
 /// in-repo crates use it. It exposes a few catalog / type introspection types the façade deliberately
 /// keeps out of the embedding surface — the CLI dumps schema and renders values with them, reaching
-/// them off the public [`Database`] / [`Session`] handles (`table_names`/`table`), never a low-level
-/// `Engine` (which is fully internal).
+/// them off the `#[doc(hidden)]` [`Database`] / [`Session`] accessors (`table_names`/`table`), never a
+/// low-level `Engine` (which is fully internal). Hosts introspect through SQL — the `jed_` catalog
+/// relations (introspection.md) — never these accessors.
 #[doc(hidden)]
 pub mod tooling {
     // The CLI renders query results + dumps schema using these internal types (returned by

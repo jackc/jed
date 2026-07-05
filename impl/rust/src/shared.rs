@@ -839,6 +839,11 @@ impl Database {
     /// CLAUDE.md §8). Secondary indexes are not tables and are excluded (api.md §6). Reads a pinned
     /// snapshot lock-free; session-local temp tables are not visible here (use
     /// [`Session::table_names`] for a session's view).
+    ///
+    /// Not the embedding API — SQL is the introspection surface (`SELECT name FROM jed_tables`,
+    /// introspection.md). This is the `#[doc(hidden)]` `tooling` accessor the in-repo CLI / white-box
+    /// tests reach for, the same seam as [`table`](Database::table).
+    #[doc(hidden)]
     pub fn table_names(&self) -> Vec<String> {
         let snap = self.0.pin();
         snap.table_names()
@@ -847,8 +852,8 @@ impl Database {
     /// The definition of persistent table `name` (case-insensitive) in the latest committed snapshot,
     /// or `None` if there is no such table. Returns an owned clone (the pinned snapshot is transient).
     /// The [`Table`] type is part of the doc-hidden `tooling` introspection seam, not the embedding
-    /// API — hosts use [`table_names`](Database::table_names); white-box tests / the CLI reach the
-    /// catalog detail through `tooling::Table`.
+    /// API — SQL is the introspection surface (`jed_columns`, introspection.md); white-box tests / the
+    /// CLI reach the catalog detail through `tooling::Table`.
     pub fn table(&self, name: &str) -> Option<Table> {
         let snap = self.0.pin();
         snap.table(name).cloned()
@@ -1643,6 +1648,11 @@ impl Session {
     /// name (CLAUDE.md §8). Unlike [`Database::table_names`], this sees the session's view — the open
     /// transaction's working set if any, else the session's pinned committed snapshot. (Temp tables
     /// are excluded, matching the persistent catalog listing.)
+    ///
+    /// Not the embedding API — SQL is the introspection surface (`SELECT name FROM jed_tables`,
+    /// introspection.md). This is the `#[doc(hidden)]` `tooling` accessor the in-repo CLI / white-box
+    /// tests reach for, the same seam as [`table`](Session::table).
+    #[doc(hidden)]
     pub fn table_names(&self) -> Vec<String> {
         self.engine.table_names()
     }

@@ -21,6 +21,31 @@ func memDB(t *testing.T) *jed.Database {
 	return db
 }
 
+// tableNames lists the database's user tables via SQL — the jed_ catalog relations are the
+// introspection surface (introspection.md §6); a host reads the schema through them, there is no
+// host-API convenience. Names come back ORDER BY name (byte order == the old lowercased order for
+// these lowercase names).
+func tableNames(t *testing.T, db *jed.Database) []string {
+	t.Helper()
+	rows, err := db.Query(context.Background(), "SELECT name FROM jed_tables ORDER BY name")
+	if err != nil {
+		t.Fatalf("SELECT FROM jed_tables: %v", err)
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		name, err := rows.Text(0)
+		if err != nil {
+			t.Fatalf("read jed_tables.name: %v", err)
+		}
+		names = append(names, name)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate jed_tables: %v", err)
+	}
+	return names
+}
+
 func newBlogMigrator(t *testing.T, db *jed.Database) *Migrator {
 	t.Helper()
 	migrations, err := LoadMigrations(blogDir)
@@ -43,7 +68,7 @@ func TestMigrateUpThenDownRoundTrips(t *testing.T) {
 	if v, err := m.CurrentVersion(); err != nil || v != 0 {
 		t.Fatalf("initial version = %d, %v; want 0, nil", v, err)
 	}
-	if got := db.TableNames(); !reflect.DeepEqual(got, []string{"schema_version"}) {
+	if got := tableNames(t, db); !reflect.DeepEqual(got, []string{"schema_version"}) {
 		t.Fatalf("after ensure, tables = %v; want [schema_version]", got)
 	}
 
@@ -55,7 +80,7 @@ func TestMigrateUpThenDownRoundTrips(t *testing.T) {
 		t.Fatalf("version after up = %d, %v; want 3, nil", v, err)
 	}
 	want := []string{"posts", "schema_version", "users"}
-	if got := db.TableNames(); !reflect.DeepEqual(got, want) {
+	if got := tableNames(t, db); !reflect.DeepEqual(got, want) {
 		t.Fatalf("tables after up = %v; want %v", got, want)
 	}
 
@@ -66,7 +91,7 @@ func TestMigrateUpThenDownRoundTrips(t *testing.T) {
 	if v, err := m.CurrentVersion(); err != nil || v != 0 {
 		t.Fatalf("version after down = %d, %v; want 0, nil", v, err)
 	}
-	if got := db.TableNames(); !reflect.DeepEqual(got, []string{"schema_version"}) {
+	if got := tableNames(t, db); !reflect.DeepEqual(got, []string{"schema_version"}) {
 		t.Fatalf("tables after down = %v; want [schema_version]", got)
 	}
 
@@ -74,7 +99,7 @@ func TestMigrateUpThenDownRoundTrips(t *testing.T) {
 	if err := m.Migrate(); err != nil {
 		t.Fatalf("Migrate up again: %v", err)
 	}
-	if got := db.TableNames(); !reflect.DeepEqual(got, want) {
+	if got := tableNames(t, db); !reflect.DeepEqual(got, want) {
 		t.Fatalf("tables after second up = %v; want %v", got, want)
 	}
 }
@@ -190,7 +215,7 @@ func TestMigrationErrorCarriesContext(t *testing.T) {
 	if v, _ := m.CurrentVersion(); v != 0 {
 		t.Errorf("version after failed migration = %d, want 0 (rolled back)", v)
 	}
-	for _, name := range db.TableNames() {
+	for _, name := range tableNames(t, db) {
 		if name == "ok" {
 			t.Errorf("table 'ok' persisted; the failed step should have rolled back")
 		}
@@ -253,7 +278,7 @@ func TestCustomVersionTable(t *testing.T) {
 		t.Fatalf("MigrateTo(1): %v", err)
 	}
 	// The custom table exists and holds the version; the default one does not.
-	names := db.TableNames()
+	names := tableNames(t, db)
 	var hasCustom, hasDefault bool
 	for _, n := range names {
 		if n == "migration_state" {

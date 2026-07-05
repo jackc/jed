@@ -707,13 +707,10 @@ func (s *Database) committedEngine() *engine {
 	}
 }
 
-// TableNames is the canonical name of every persistent table in the latest committed snapshot, sorted
-// ascending by lowercased name (CLAUDE.md §8). Secondary indexes are excluded (api.md §6).
-func (s *Database) TableNames() []string { return s.committedEngine().TableNames() }
-
 // Table is the definition of persistent table name (case-insensitive) in the latest committed
-// snapshot. The *catTable is the doc-hidden introspection type, not the embedding API — hosts use
-// TableNames; white-box tests reach the detail through it.
+// snapshot. The *catTable is the doc-hidden introspection type, not the embedding API — hosts
+// introspect through SQL (the jed_ catalog relations, introspection.md); white-box tests reach the
+// detail through it.
 func (s *Database) Table(name string) (*catTable, bool) { return s.committedEngine().Table(name) }
 
 // CompositeType is the definition of composite type name in the latest committed snapshot, or nil.
@@ -1282,10 +1279,6 @@ func (s *Session) InTransaction() bool { return s.engine.session.tx != nil }
 // session's engine (its visible snapshot — the open block's working set if any, else the pinned
 // committed); file-storage reads go through the shared core (the authoritative state, reflecting every
 // committed write). The *catTable / *compositeType returns are the doc-hidden introspection types. ---
-
-// TableNames is the canonical name of every table visible to this session, sorted ascending by
-// lowercased name (CLAUDE.md §8). Temp tables are excluded, matching the persistent listing.
-func (s *Session) TableNames() []string { return s.engine.TableNames() }
 
 // Table is the definition of table name (case-insensitive) as this session sees it, or false.
 func (s *Session) Table(name string) (*catTable, bool) { return s.engine.Table(name) }

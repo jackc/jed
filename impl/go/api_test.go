@@ -10,7 +10,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"slices"
 	"testing"
 )
 
@@ -246,35 +245,6 @@ func TestCommitOnInMemoryIsNoopSuccess(t *testing.T) {
 	}
 	if db.Txid() != before || db.Path() != "" {
 		t.Fatalf("txid=%d (want %d) path=%q want empty", db.Txid(), before, db.Path())
-	}
-}
-
-func TestTableNamesListsTablesSortedExcludingIndexes(t *testing.T) {
-	// The catalog-read surface (api.md §6): canonical names, sorted ascending by
-	// lowercased name; secondary indexes are relations but not tables. Uses a single Session so the
-	// open BEGIN block is visible across calls (the bare Database conveniences mint a fresh session
-	// per call and would not share the block).
-	db := memDB().Session(SessionOptions{})
-	if got := db.TableNames(); len(got) != 0 {
-		t.Fatalf("empty catalog: got %v", got)
-	}
-	mustCreate(t, db, "CREATE TABLE Zed (id i32 PRIMARY KEY, v i32)")
-	mustCreate(t, db, "CREATE TABLE apple (id i32 PRIMARY KEY)")
-	mustCreate(t, db, "CREATE INDEX zed_v_idx ON Zed (v)")
-	// Sorted by LOWERCASED name (apple < zed), returning the canonical spelling (`Zed`).
-	want := []string{"apple", "Zed"}
-	if got := db.TableNames(); !slices.Equal(got, want) {
-		t.Fatalf("TableNames() = %v, want %v", got, want)
-	}
-	// The visible snapshot includes an open transaction's working set.
-	mustCreate(t, db, "BEGIN")
-	mustCreate(t, db, "CREATE TABLE mid (id i32 PRIMARY KEY)")
-	if got := db.TableNames(); !slices.Equal(got, []string{"apple", "mid", "Zed"}) {
-		t.Fatalf("in-tx TableNames() = %v", got)
-	}
-	mustCreate(t, db, "ROLLBACK")
-	if got := db.TableNames(); !slices.Equal(got, want) {
-		t.Fatalf("post-rollback TableNames() = %v, want %v", got, want)
 	}
 }
 

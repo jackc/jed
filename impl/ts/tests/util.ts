@@ -27,7 +27,6 @@ export type Handle = Pick<
   | "execute"
   | "query"
   | "executeScript"
-  | "tableNames"
   | "table"
   | "compositeType"
   | "rowsInKeyOrder"

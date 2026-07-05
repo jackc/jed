@@ -12,7 +12,6 @@ package jed
 // Execute/Outcome public API — a statement is observably a *Rows with no output columns).
 type dbHandle interface {
 	queryValues(sql string, params []Value) (*Rows, error)
-	TableNames() []string
 	Table(name string) (*catTable, bool)
 	CompositeType(name string) *compositeType
 	RowsInKeyOrder(name string) []storedRow

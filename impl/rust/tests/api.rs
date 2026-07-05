@@ -472,31 +472,3 @@ fn rows_affected_reports_dml_counts() {
         _ => panic!("RETURNING must yield a query outcome"),
     }
 }
-
-#[test]
-fn table_names_lists_tables_sorted_excluding_indexes() {
-    // The catalog-read surface (api.md §6): canonical names, sorted ascending by
-    // lowercased name; secondary indexes are relations but not tables.
-    let mut db = Database::create(CreateOptions::default())
-        .unwrap()
-        .session(SessionOptions::default());
-    assert_eq!(db.table_names(), Vec::<String>::new());
-    db.query_outcome("CREATE TABLE Zed (id i32 PRIMARY KEY, v i32)", &[])
-        .unwrap();
-    db.query_outcome("CREATE TABLE apple (id i32 PRIMARY KEY)", &[])
-        .unwrap();
-    db.query_outcome("CREATE INDEX zed_v_idx ON Zed (v)", &[])
-        .unwrap();
-    // Sorted by LOWERCASED name (apple < zed), returning the canonical spelling (`Zed`).
-    assert_eq!(
-        db.table_names(),
-        vec!["apple".to_string(), "Zed".to_string()]
-    );
-    // The visible snapshot includes an open transaction's working set.
-    db.query_outcome("BEGIN", &[]).unwrap();
-    db.query_outcome("CREATE TABLE mid (id i32 PRIMARY KEY)", &[])
-        .unwrap();
-    assert_eq!(db.table_names(), vec!["apple", "mid", "Zed"]);
-    db.query_outcome("ROLLBACK", &[]).unwrap();
-    assert_eq!(db.table_names(), vec!["apple", "Zed"]);
-}

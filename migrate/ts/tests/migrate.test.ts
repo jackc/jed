@@ -32,6 +32,16 @@ function count(db: Database, sql: string): number {
   return Number(Object.values(row)[0]);
 }
 
+// tableNames lists the database's user tables via SQL — the jed_ catalog relations are the
+// introspection surface (introspection.md §6); a host reads the schema through them, there is no
+// host-API convenience. ORDER BY name (byte order == the old lowercased order for these lowercase
+// names).
+function tableNames(db: Database): string[] {
+  return db
+    .all("SELECT name FROM jed_tables ORDER BY name")
+    .map((row) => String(Object.values(row)[0]));
+}
+
 // ───────────────────────────── loading ─────────────────────────────
 
 test("loads the blog set", () => {
@@ -94,19 +104,19 @@ test("migrate up then down round-trips", () => {
   const m = new Migrator(db, loadMigrations(testdata("blog")));
   try {
     assert.equal(m.currentVersion(), 0);
-    assert.deepEqual(db.tableNames(), ["schema_version"]);
+    assert.deepEqual(tableNames(db), ["schema_version"]);
 
     m.migrate();
     assert.equal(m.currentVersion(), 3);
-    assert.deepEqual(db.tableNames(), ["posts", "schema_version", "users"]);
+    assert.deepEqual(tableNames(db), ["posts", "schema_version", "users"]);
 
     m.migrateTo(0);
     assert.equal(m.currentVersion(), 0);
-    assert.deepEqual(db.tableNames(), ["schema_version"]);
+    assert.deepEqual(tableNames(db), ["schema_version"]);
 
     // Back up again — proves the down halves truly reversed the schema.
     m.migrate();
-    assert.deepEqual(db.tableNames(), ["posts", "schema_version", "users"]);
+    assert.deepEqual(tableNames(db), ["posts", "schema_version", "users"]);
   } finally {
     m.close();
   }
@@ -187,7 +197,7 @@ test("a migration error carries context and rolls back", () => {
     assert.notEqual((caught as MigrationError).statement, "");
     assert.equal((caught as MigrationError).sqlState(), "42P01"); // undefined table
     assert.equal(m.currentVersion(), 0); // rolled back
-    assert.ok(!db.tableNames().includes("ok"));
+    assert.ok(!tableNames(db).includes("ok"));
   } finally {
     m.close();
   }
@@ -228,7 +238,7 @@ test("custom version table", () => {
   const m = new Migrator(db, loadMigrations(testdata("blog")), { versionTable: "migration_state" });
   try {
     m.migrateTo(1);
-    const names = db.tableNames();
+    const names = tableNames(db);
     assert.ok(names.includes("migration_state"));
     assert.ok(!names.includes("schema_version"));
   } finally {

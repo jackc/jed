@@ -508,8 +508,7 @@ only and the engine has no wire protocol).
 | attach a database (attached-databases.md §4) | `db.attach(name, source, read_only) -> Result<()>` | `db.Attach(name, source, readOnly) error` | `db.attach(name, source, readOnly): void` |
 | detach a database | `db.detach(name) -> Result<()>` | `db.Detach(name) error` | `db.detach(name): void` |
 | attach source (memory now, file = Slice 2) | `AttachSource::memory()` / `AttachSource::file(path)` | `AttachMemory()` / `AttachFile(path)` | `attachMemory()` / `attachFile(path)` |
-| table lookup (catalog) | `db.table(name) -> Option<&Table>` | `db.Table(name) (*Table, bool)` | `db.table(name): Table \| undefined` |
-| table names (catalog) | `db.table_names() -> Vec<String>` | `db.TableNames() []string` | `db.tableNames(): string[]` |
+| table lookup (catalog — doc-hidden tooling, §6) | `db.table(name) -> Option<&Table>` | `db.Table(name) (*catTable, bool)` | `db.table(name): Table \| undefined` |
 
 **Per-language divergences, deliberate and documented:**
 
@@ -531,16 +530,24 @@ only and the engine has no wire protocol).
   synchronous; only the OPFS acquisition edge and the worker RPC are async. No Rust/Go equivalent
   (browser-only).
 
-**Catalog reads** (the last two rows) are the host's introspection surface until an SQL-level
-one exists (an `information_schema`-like layer is a possible later feature): both read the
-**currently-visible snapshot** (an open transaction's working set, else the committed state).
-`table` returns the full definition — columns (name, type, typmod, NOT NULL, PK membership,
-default), the primary key's ordinals in key order, CHECK constraints, and secondary indexes.
-`table_names` returns every table's **canonical** (CREATE TABLE-spelled) name, sorted
-ascending by **lowercased** name — the catalog's standing order, so no hash-map iteration
-order leaks (CLAUDE.md §8). Secondary indexes are relations but not tables; they are excluded.
+**Catalog reads — introspection is SQL, not the host API.** The introspection surface is the
+`jed_` catalog relations reached through ordinary SQL (`SELECT * FROM jed_tables` / `jed_columns` /
+`jed_indexes` / `jed_constraints` — [introspection.md](introspection.md)); a host discovers schema by
+querying them, and there is deliberately **no host-API introspection convenience**. The old
+`table_names()` catalog read is **removed** in favor of `SELECT name FROM jed_tables`. What remains is
+`table` (the last row), a **`#[doc(hidden)]` `tooling` accessor, not the embedding API**: the in-repo
+CLI and white-box tests reach the full catalog definition — columns (name, type, typmod, NOT NULL, PK
+membership, default), the primary key's ordinals in key order, CHECK constraints, and secondary
+indexes — through it, richer than the `jed_` relations expose today (e.g. column DEFAULTs, still
+un-rendered in `jed_columns`). It reads the **currently-visible snapshot** (an open transaction's
+working set, else the committed state) and returns the **canonical** (CREATE TABLE-spelled) names,
+sorted ascending by **lowercased** name so no hash-map iteration order leaks (CLAUDE.md §8);
+secondary indexes are relations but not tables and are excluded. Per core the tooling seam differs
+by necessity: Rust keeps `table`/`table_names` as `#[doc(hidden)]` handle accessors (the CLI is a
+separate crate); Go drops the `TableNames` wrappers outright; TS's tools reach `Engine.tableNames()`
+directly.
 
-These catalog reads live on **both `Database` and `Session`** (a bare `Database` reads the
+This catalog read lives on **both `Database` and `Session`** (a bare `Database` reads the
 committed snapshot; a `Session` reads its currently-visible state). The **low-level single-threaded
 core is an internal concern** — Rust `Engine` is `pub(crate)`, Go `engine` is unexported, TS `Engine`
 lives only in the internal `tooling.ts` barrel, never the public `lib.ts`. Every host consumer — the

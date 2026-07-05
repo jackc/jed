@@ -541,16 +541,12 @@ export class Database {
   }
 
   // --- Catalog / storage introspection (spec/design/api.md §6): reads the latest committed snapshot.
-  // The public host surface is tableNames(); table()/compositeType()/rowsInKeyOrder() return the
-  // doc-hidden introspection detail white-box tests reach for (CLAUDE.md §10). ---
+  // Not the embedding API — hosts introspect through SQL (the jed_ catalog relations,
+  // introspection.md). table()/compositeType()/rowsInKeyOrder() return the doc-hidden introspection
+  // detail white-box tests + the in-repo tools reach for (CLAUDE.md §10). ---
 
   private committedEngine(): Engine {
     return databaseFromSnapshot(this.core.committed, this.core.pageSize);
-  }
-  // tableNames is every persistent table in the committed snapshot, sorted ascending by lowercased
-  // name (CLAUDE.md §8); secondary indexes are excluded (api.md §6).
-  tableNames(): string[] {
-    return this.committedEngine().tableNames();
   }
   table(name: string): Table | undefined {
     return this.committedEngine().table(name);
@@ -1109,11 +1105,10 @@ export class Session {
   }
 
   // --- Catalog / storage introspection (spec/design/api.md §6): reads this session's engine (its
-  // working set inside a block, else its last-pinned committed snapshot). ---
+  // working set inside a block, else its last-pinned committed snapshot). Not the embedding API —
+  // hosts introspect through SQL (the jed_ catalog relations, introspection.md); these return the
+  // doc-hidden detail white-box tests + the in-repo tools reach for. ---
 
-  tableNames(): string[] {
-    return this.engine.tableNames();
-  }
   table(name: string): Table | undefined {
     return this.engine.table(name);
   }

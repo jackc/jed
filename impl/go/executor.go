@@ -2160,23 +2160,6 @@ func (db *engine) CompositeType(name string) *compositeType {
 	return db.readSnap().compositeType(name)
 }
 
-// TableNames is the canonical name of every table in the visible snapshot, sorted ascending
-// by lowercased name (the catalog's standing order — no map-iteration order may leak,
-// CLAUDE.md §8). Secondary indexes are not tables and are excluded (api.md §6).
-func (db *engine) TableNames() []string {
-	snap := db.readSnap()
-	keys := make([]string, 0, len(snap.tables))
-	for k := range snap.tables {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	names := make([]string, len(keys))
-	for i, k := range keys {
-		names[i] = snap.tables[k].Name
-	}
-	return names
-}
-
 // putTable registers a new table and its empty store in the working snapshot (DDL is
 // transactional — transactions.md §4.5).
 func (db *engine) putTable(t *catTable) {
