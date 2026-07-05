@@ -179,5 +179,7 @@ mod values_body;
 mod variables;
 #[path = "../tests/window_persisted.rs"]
 mod window_persisted;
+#[path = "../tests/work_mem_options.rs"]
+mod work_mem_options;
 #[path = "../tests/writable_cte.rs"]
 mod writable_cte;

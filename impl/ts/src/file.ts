@@ -103,7 +103,9 @@ function writeFullImage(db: Engine, noSync: boolean): void {
 // workMem is the work-memory budget in bytes for a blocking operator before it spills to disk
 // (spec/design/spill.md §3, api.md §2.1): the ORDER BY external merge sort holds at most roughly this
 // many bytes of rows resident, then spills sorted runs. Like cacheBytes it is a handle setting that
-// never changes what a query observes (spill.md §6). Default DEFAULT_WORK_MEM (256 MiB).
+// never changes what a query observes (spill.md §6). 0 (or unset) ⇒ the default (256 MiB), NOT
+// unlimited — the zero value stays a safe finite budget (matching Go/Rust); an unbounded/never-spill
+// budget is a runtime-only mode via setWorkMem(0). Default DEFAULT_WORK_MEM (256 MiB).
 // noFsync turns off the per-commit fsync (the fsync=off host setting, api.md §2.1): a commit still writes
 // the same bytes in the same order but the fdatasync barrier becomes a no-op — much faster. DEV/TESTING
 // ONLY: the data survives a process crash (the OS page cache still flushes) but NOT an OS crash / power
@@ -148,7 +150,9 @@ export function open(path: string, opts: OpenOptions = {}): Engine {
     db.persistHook = persistImpl; // autocommit each later write (transactions.md §4.1)
     db.readOnly = readOnly;
     db.spillSink = new FileSpillSink(dirname(path)); // ORDER BY spills next to the database file (spill.md §4)
-    if (opts.workMem !== undefined) db.session.workMem = opts.workMem;
+    // 0 (or unset) means "the default budget", not "unlimited" — the zero value stays a safe finite
+    // budget (matching Go/Rust). Unbounded/never-spill is a runtime-only mode via setWorkMem(0).
+    if (opts.workMem) db.session.workMem = opts.workMem;
     return db;
   } catch (e) {
     closeSync(fd); // a malformed file / read failure must not leak the fd

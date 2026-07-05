@@ -161,8 +161,13 @@ query over larger-than-RAM data never materializes its whole input in the execut
 `cache_bytes` / `max_cost` it is a **handle** setting (not stored in the file) that **never changes
 what a query observes** — results and cost are invariant to it (spill.md §6), it only changes *when*
 an operator spills. `db.set_work_mem(bytes)` / `SetWorkMem` / `setWorkMem` sets it on an open handle
-(mirroring `set_max_cost`); `0` means **unlimited** (never spill). An **in-memory** database ignores
-it — it has nowhere to spill, so a blocking operator stays fully resident regardless (spill.md §2,
+(mirroring `set_max_cost`), where **`0` means unlimited** (never spill). As an **`open` / `session`
+option**, however, `work_mem = 0` (or unset) means **the default** (256 MiB), *not* unlimited — the
+zero value stays a safe finite budget so a bare options struct never silently disables spill; the
+unbounded/never-spill budget is the deliberate **setter-only** mode. This options-`0`-is-default rule
+is uniform across all three cores (it distinguishes `work_mem` from its `max_cost` / `lifetime_max_cost`
+siblings, whose option default genuinely *is* `0` ⇒ unlimited). An **in-memory** database ignores it
+— it has nowhere to spill, so a blocking operator stays fully resident regardless (spill.md §2,
 mirroring the buffer pool's in-memory residency). Same shape across cores; the bare `open(path)`
 form uses the default.
 

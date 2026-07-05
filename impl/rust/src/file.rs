@@ -72,9 +72,12 @@ pub struct OpenOptions {
     pub read_only: bool,
     /// The work-memory budget **in bytes** for a blocking operator before it spills to disk
     /// (spec/design/spill.md §3, api.md §2.1): the `ORDER BY` external merge sort holds at most
-    /// roughly this many bytes of rows resident, then spills sorted runs. `0` ⇒ unlimited (never
-    /// spill). Like `cache_bytes` it is a handle setting that never changes what a query observes
-    /// (spill.md §6). Default [`DEFAULT_WORK_MEM`](crate::spill::DEFAULT_WORK_MEM) (256 MiB).
+    /// roughly this many bytes of rows resident, then spills sorted runs. `0` ⇒ **the default**
+    /// (256 MiB), identical to leaving it unset — an unbounded/never-spill budget is a *runtime*
+    /// mode reached via [`set_work_mem`](crate::Database::set_work_mem)`(0)`, never a bare-options
+    /// value, so the zero value stays a safe finite budget (matching Go/TS — api.md §2.1). Like
+    /// `cache_bytes` it is a handle setting that never changes what a query observes (spill.md §6).
+    /// Default [`DEFAULT_WORK_MEM`](crate::spill::DEFAULT_WORK_MEM) (256 MiB).
     pub work_mem: usize,
     /// Turn off the per-commit fsync (the `fsync=off` host setting, api.md §2.1). A commit still writes
     /// the same bytes in the same order, but the `fdatasync` barrier becomes a no-op — much faster.
@@ -172,7 +175,11 @@ impl Engine {
         let mut db = Engine::open_paged(pager, capacity)?;
         db.path = Some(path.to_path_buf());
         db.read_only = opts.read_only;
-        db.session.work_mem = opts.work_mem;
+        // `0` means "the default budget", not "unlimited" — the zero value is a safe finite budget
+        // (matching Go/TS). Unbounded/never-spill is a runtime-only mode via `set_work_mem(0)`.
+        if opts.work_mem != 0 {
+            db.session.work_mem = opts.work_mem;
+        }
         Ok(db)
     }
 

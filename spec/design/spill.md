@@ -58,9 +58,12 @@ Two scope refinements, both mirroring the buffer pool ([pager.md](pager.md) §1)
 (api.md §2.1/§8): an **open-time** option plus a setter, a handle setting that the executor reads.
 
 - `open(path, { cache_bytes / work_mem })` carries it (Rust `OpenOptions { work_mem }` / Go
-  `OpenOptions { WorkMem }` / TS `{ workMem }`), default `DEFAULT_WORK_MEM`.
+  `OpenOptions { WorkMem }` / TS `{ workMem }`), default `DEFAULT_WORK_MEM`. As an **option**,
+  `work_mem = 0` (or unset) means **the default** budget, *not* unlimited — the zero value stays a
+  safe finite budget; the unbounded/never-spill mode is reached only via the setter below (uniform
+  across cores, api.md §2.1).
 - `db.set_work_mem(bytes)` / `SetWorkMem` / `setWorkMem` sets it on an open handle (the test hook,
-  and the runtime knob), mirroring `set_max_cost`. `0` means **unlimited** (never spill — the
+  and the runtime knob), mirroring `set_max_cost`. Here `0` means **unlimited** (never spill — the
   whole operator stays resident, the pre-spill behavior).
 - It is **not** a create-time parameter (unlike `page_size`): it belongs to the caller's memory,
   so any handle on the file may choose its own, like `cache_bytes` and `max_cost`.

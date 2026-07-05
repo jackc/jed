@@ -1605,6 +1605,9 @@ export type SessionOptions = {
   // admission). Sibling to maxCost, which bounds one statement.
   lifetimeMaxCost?: bigint;
   maxSqlLength?: number;
+  // The work-memory budget in bytes before a blocking operator spills (spill.md §3). 0 (or absent) ⇒
+  // the default (256 MiB), same as unset — use setWorkMem(0) for the 0 ⇒ unlimited (never-spill) form.
+  // Unlike maxCost/lifetimeMaxCost, whose default genuinely is 0 ⇒ unlimited (api.md §2.1).
   workMem?: number;
   // The table-privilege set granted to every table — the GRANT … ON ALL TABLES default
   // (spec/design/session.md §5.3). Absent ⇒ all four (the default), so a fresh session is
@@ -1743,7 +1746,10 @@ export class SessionState {
     this.maxCost = opts.maxCost ?? 0n;
     this.lifetime = new LifetimeBudget(opts.lifetimeMaxCost ?? 0n);
     this.maxSqlLength = opts.maxSqlLength ?? DEFAULT_MAX_SQL_LENGTH;
-    this.workMem = opts.workMem ?? DEFAULT_WORK_MEM;
+    // 0 (or unset) ⇒ the default budget, not unlimited — the zero value stays a safe finite budget
+    // (unlike maxCost/lifetimeMaxCost, whose default genuinely is 0 ⇒ unlimited). Unbounded/never-spill
+    // is reached at runtime via setWorkMem(0). Matches Go/Rust (api.md §2.1).
+    this.workMem = opts.workMem ? opts.workMem : DEFAULT_WORK_MEM;
     this.seam = new Seam();
     this.sessionSeq = new Map();
     this.sessionLastName = null;

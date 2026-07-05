@@ -1258,7 +1258,10 @@ pub struct SessionOptions {
     pub lifetime_max_cost: i64,
     /// Maximum input SQL length in bytes; `0` ⇒ unlimited. Default [`DEFAULT_MAX_SQL_LENGTH`].
     pub max_sql_length: usize,
-    /// Work-memory budget in bytes; `0` ⇒ unlimited (never spill). Default [`DEFAULT_WORK_MEM`].
+    /// Work-memory budget in bytes; `0` ⇒ **the default** (256 MiB), same as unset (unlike its
+    /// `max_cost`/`lifetime_max_cost` siblings, whose default genuinely is `0` ⇒ unlimited). An
+    /// unbounded/never-spill budget is a runtime-only mode via [`set_work_mem`](SessionState::set_work_mem)`(0)`,
+    /// never a bare-options value. Default [`DEFAULT_WORK_MEM`].
     pub work_mem: usize,
     /// The table-privilege set granted to **every** table — the `GRANT … ON ALL TABLES` default
     /// (spec/design/session.md §5.3). Default: all four (`SELECT`/`INSERT`/`UPDATE`/`DELETE`), so a
@@ -1481,7 +1484,13 @@ impl SessionState {
             lifetime_total: std::rc::Rc::new(std::cell::Cell::new(0)),
             cancel: None,
             max_sql_length: opts.max_sql_length,
-            work_mem: opts.work_mem,
+            // `0` means "the default budget", not "unlimited" — the zero value stays a safe finite
+            // budget (matching Go/TS). Unbounded/never-spill is reached via `set_work_mem(0)`.
+            work_mem: if opts.work_mem == 0 {
+                crate::spill::DEFAULT_WORK_MEM
+            } else {
+                opts.work_mem
+            },
             seam: std::rc::Rc::new(crate::seam::Seam::default()),
             session_seq: HashMap::new(),
             session_last_name: None,

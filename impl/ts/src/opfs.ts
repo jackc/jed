@@ -75,7 +75,8 @@ export function openOpfsWithHandle(handle: SyncAccessHandle, opts: OpenOptions =
   const db = loadEnginePaged(new SharedPaging(pager, cacheLeaves(cacheBytes, pager.pageSize)));
   db.persistHook = persistImpl; // autocommit each later write (transactions.md §4.1)
   db.readOnly = readOnly;
-  if (opts.workMem !== undefined) db.session.workMem = opts.workMem;
+  // 0 (or unset) ⇒ the default budget, not unlimited (matching Go/Rust); unbounded is setWorkMem(0).
+  if (opts.workMem) db.session.workMem = opts.workMem;
   return db;
 }
 
