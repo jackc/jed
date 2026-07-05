@@ -251,6 +251,15 @@ pub const MAX_COMPOSITE_DEPTH: usize = 32;
 /// prior state is provably unchanged — pmap.rs / §3). A reader holds a `Snapshot` and is thereby
 /// stable for its life: a later commit produces a *new* `Snapshot` and never mutates this one.
 /// (P5.3a is single-handle; sharing a `Snapshot` across threads is P5.3b.)
+// The catalog-metadata maps below are each `Arc<HashMap<..>>` so `#[derive(Clone)]` on `Snapshot`
+// is a handful of `Arc` bumps — O(1), NOT O(catalog size). This matters because the read path clones
+// a snapshot PER QUERY (`snapshot_engine`, to hand the cursor a frozen owned view), so a deep catalog
+// clone made a point lookup's cost scale with the number of unrelated tables/types/sequences in the
+// database (each `Table` deep-copies its column/index/constraint `Vec`s + owned name `String`s). The
+// heavy per-store data was already shared (`PMap` is a persistent map, `TableStore`'s pager/col-types
+// are `Arc`); this extends that O(1)-clone discipline to the catalog metadata itself. Writers mutate
+// copy-on-write via `Arc::make_mut` (below), so a schema change clones only the map it touches, once,
+// on the rare write path — never on a read.
 #[derive(Clone, Default)]
 pub struct Snapshot {
     /// The snapshot's version — the commit counter (transactions.md §8; the watermark unit).
@@ -263,29 +272,29 @@ pub struct Snapshot {
     /// NOT bumped by sequence `nextval` (a data write on the nextval path), only by sequence DDL — a
     /// SELECT plan binds no sequence.
     pub(crate) cat_gen: u64,
-    tables: HashMap<String, Table>,
+    tables: std::sync::Arc<HashMap<String, Table>>,
     /// User-defined composite (row) types, keyed by lowercased name (spec/design/composite.md).
     /// A database-level object set, separate from `tables`; serialized into the catalog's
     /// composite-type entries (spec/fileformat/format.md). Sorted by key when serialized so
     /// hash-map iteration order never leaks (CLAUDE.md §8).
-    types: HashMap<String, CompositeType>,
-    stores: HashMap<String, TableStore>,
+    types: std::sync::Arc<HashMap<String, CompositeType>>,
+    stores: std::sync::Arc<HashMap<String, TableStore>>,
     /// Each secondary index's B-tree (spec/design/indexes.md §3): a `TableStore` with ZERO
     /// value columns (entry keys only — the on-disk empty-payload record), keyed by the
     /// lowercased index name (index names live in the relation namespace, globally unique).
     /// Which table owns an index is recorded in that table's `Table::indexes`.
-    index_stores: HashMap<String, TableStore>,
+    index_stores: std::sync::Arc<HashMap<String, TableStore>>,
     /// Sequences, keyed by lowercased name (spec/design/sequences.md). A database-level object set
     /// separate from `tables`/`types`; serialized into the catalog's sequence entries
     /// (spec/fileformat/format.md, `entry_kind = 2`). The mutable counter (`last_value`/`is_called`)
     /// lives here, so `nextval` advances the working snapshot and rolls back with it (sequences.md §5).
-    sequences: HashMap<String, SequenceDef>,
+    sequences: std::sync::Arc<HashMap<String, SequenceDef>>,
     /// Loaded collations, keyed by their exact (CASE-SENSITIVE) name — collation names are quoted
     /// identifiers (`"en-US"`, spec/design/collation.md §1). `C` is never stored (table-free, built
     /// in). Imported by the host `db.import_collation`. `Arc` so a resolved comparison / sort key can
     /// hold a cheap reference. Persisted as catalog `entry_kind = 3` baked snapshots
     /// (`format_version` 17, slice 1d — spec/fileformat/format.md, spec/design/collation.md §5).
-    collations: HashMap<String, std::sync::Arc<Collation>>,
+    collations: std::sync::Arc<HashMap<String, std::sync::Arc<Collation>>>,
     /// The per-database default collation name, or `None` for `C` (spec/design/collation.md §1/§5).
     /// An un-annotated `text` column inherits this at CREATE TABLE. Settable to any loaded collation
     /// (`db.set_default_collation`); persisted as the `is_default` flag bit on that collation's
@@ -300,7 +309,7 @@ pub struct Snapshot {
     /// descend lock-free (the immutable-snapshot read path, §3). `Arc` so a snapshot clone stays O(1)
     /// (the tree is replaced wholesale on rebuild, never mutated in place). The on-disk form is the
     /// persisted R-tree (page types 5/6); this in-memory tree is rebuilt from the loaded leaf store.
-    gist_trees: HashMap<String, std::sync::Arc<crate::gist::GistTree>>,
+    gist_trees: std::sync::Arc<HashMap<String, std::sync::Arc<crate::gist::GistTree>>>,
     /// This snapshot's domain paging context — the pager a store created IN-SESSION
     /// (`put_table_resolved` / `put_index_store` / `put_index`) binds at creation, so it joins the
     /// post-commit residency flip (`demote_clean_leaves`) instead of staying a fully-resident decoded
@@ -384,13 +393,13 @@ impl Snapshot {
     /// already resolved field types and checked for a duplicate.
     pub(crate) fn put_type(&mut self, ty: CompositeType) {
         self.bump_cat_gen();
-        self.types.insert(ty.name.to_ascii_lowercase(), ty);
+        std::sync::Arc::make_mut(&mut self.types).insert(ty.name.to_ascii_lowercase(), ty);
     }
 
     /// Remove a composite type (DROP TYPE). The caller has checked there are no dependents.
     pub(crate) fn remove_type(&mut self, key: &str) {
         self.bump_cat_gen();
-        self.types.remove(key);
+        std::sync::Arc::make_mut(&mut self.types).remove(key);
     }
 
     /// All composite types in ascending lowercased-name order — the on-disk emission order
@@ -409,12 +418,12 @@ impl Snapshot {
     /// Register a sequence (CREATE SEQUENCE). Lower-cased name is the key. The caller has already
     /// validated the option set and checked the relation namespace for a collision.
     pub(crate) fn put_sequence(&mut self, seq: SequenceDef) {
-        self.sequences.insert(seq.name.to_ascii_lowercase(), seq);
+        std::sync::Arc::make_mut(&mut self.sequences).insert(seq.name.to_ascii_lowercase(), seq);
     }
 
     /// Remove a sequence (DROP SEQUENCE). The caller has checked it exists.
     pub(crate) fn remove_sequence(&mut self, key: &str) {
-        self.sequences.remove(key);
+        std::sync::Arc::make_mut(&mut self.sequences).remove(key);
     }
 
     /// Resolve a collation name for USE — query resolution and key encoding (spec/design/collation.md
@@ -433,7 +442,7 @@ impl Snapshot {
     /// Record a collation resolved from a file reference entry on open (its file metadata + the
     /// vendored table), keyed by name, so later resolution preserves the file's version pin.
     pub(crate) fn put_collation(&mut self, coll: std::sync::Arc<Collation>) {
-        self.collations.insert(coll.name.clone(), coll);
+        std::sync::Arc::make_mut(&mut self.collations).insert(coll.name.clone(), coll);
     }
 
     /// The slice-2d version-skew verdict for a referenced collation (spec/design/collation.md §12):
@@ -731,7 +740,7 @@ impl Snapshot {
     /// drop (spec/design/grammar.md §13). Only the catalog `foreign_keys` list changes; an FK
     /// owns no B-tree (constraints.md §6), so there is nothing else to remove.
     pub(crate) fn remove_foreign_key(&mut self, table_key: &str, fk_name: &str) {
-        if let Some(table) = self.tables.get_mut(table_key) {
+        if let Some(table) = std::sync::Arc::make_mut(&mut self.tables).get_mut(table_key) {
             self.cat_gen += 1;
             table
                 .foreign_keys
@@ -874,7 +883,7 @@ impl Snapshot {
 
     /// The store for a table, mutable (panics if absent).
     pub(crate) fn store_mut(&mut self, name: &str) -> &mut TableStore {
-        self.stores
+        std::sync::Arc::make_mut(&mut self.stores)
             .get_mut(&name.to_ascii_lowercase())
             .expect("store exists for a resolved table")
     }
@@ -934,8 +943,8 @@ impl Snapshot {
         if let Some(paging) = &self.store_paging {
             st.attach_paging(paging.clone());
         }
-        self.stores.insert(key.clone(), st);
-        self.tables.insert(key, table);
+        std::sync::Arc::make_mut(&mut self.stores).insert(key.clone(), st);
+        std::sync::Arc::make_mut(&mut self.tables).insert(key, table);
     }
 
     /// Remove a table's definition, its store, and its indexes' stores (DROP TABLE — the
@@ -943,12 +952,14 @@ impl Snapshot {
     fn remove_table(&mut self, key: &str) {
         self.bump_cat_gen();
         if let Some(t) = self.tables.get(key) {
+            // Disjoint field borrows: `t` reads `self.tables` while we mutate `self.index_stores`.
+            let index_stores = std::sync::Arc::make_mut(&mut self.index_stores);
             for idx in &t.indexes {
-                self.index_stores.remove(&idx.name.to_ascii_lowercase());
+                index_stores.remove(&idx.name.to_ascii_lowercase());
             }
         }
-        self.tables.remove(key);
-        self.stores.remove(key);
+        std::sync::Arc::make_mut(&mut self.tables).remove(key);
+        std::sync::Arc::make_mut(&mut self.stores).remove(key);
     }
 
     /// The store of a secondary index (panics if absent — callers resolve the index first).
@@ -960,7 +971,7 @@ impl Snapshot {
 
     /// The store of a secondary index, mutable (panics if absent).
     pub(crate) fn index_store_mut(&mut self, name_key: &str) -> &mut TableStore {
-        self.index_stores
+        std::sync::Arc::make_mut(&mut self.index_stores)
             .get_mut(name_key)
             .expect("store exists for a resolved index")
     }
@@ -992,8 +1003,10 @@ impl Snapshot {
             // Bind the domain pager, like put_table_resolved / put_index_store.
             fresh.attach_paging(paging.clone());
         }
-        self.index_stores.insert(name_key.clone(), fresh);
-        let table = self.tables.get_mut(table_key).expect("table exists");
+        std::sync::Arc::make_mut(&mut self.index_stores).insert(name_key.clone(), fresh);
+        let table = std::sync::Arc::make_mut(&mut self.tables)
+            .get_mut(table_key)
+            .expect("table exists");
         let pos = table
             .indexes
             .iter()
@@ -1012,7 +1025,7 @@ impl Snapshot {
         column: usize,
         default_expr: DefaultExpr,
     ) {
-        if let Some(table) = self.tables.get_mut(table_key) {
+        if let Some(table) = std::sync::Arc::make_mut(&mut self.tables).get_mut(table_key) {
             if let Some(col) = table.columns.get_mut(column) {
                 col.default_expr = Some(default_expr);
                 self.cat_gen += 1;
@@ -1032,7 +1045,7 @@ impl Snapshot {
                 store.attach_paging(paging.clone());
             }
         }
-        self.index_stores.insert(name_key, store);
+        std::sync::Arc::make_mut(&mut self.index_stores).insert(name_key, store);
     }
 
     /// Iterate every table data store — the store-page reachability walk (format.rs `reachable_pages`,
@@ -1085,15 +1098,16 @@ impl Snapshot {
             }
         }
         let live: std::collections::HashSet<&str> = specs.iter().map(|(k, _)| k.as_str()).collect();
-        self.gist_trees.retain(|k, _| live.contains(k.as_str()));
+        // Disjoint field borrows: hold the mutable `gist_trees` while reading `self.index_stores`.
+        let gist_trees = std::sync::Arc::make_mut(&mut self.gist_trees);
+        gist_trees.retain(|k, _| live.contains(k.as_str()));
         for (name_key, ops) in &specs {
             let keys: Vec<Vec<u8>> = match self.index_stores.get(name_key) {
                 Some(store) => store.iter_entries()?.into_iter().map(|(k, _)| k).collect(),
                 None => Vec::new(),
             };
             let tree = crate::gist::build_from_leaf_keys(ops, keys.iter().map(|k| k.as_slice()))?;
-            self.gist_trees
-                .insert(name_key.clone(), std::sync::Arc::new(tree));
+            gist_trees.insert(name_key.clone(), std::sync::Arc::new(tree));
         }
         Ok(())
     }
@@ -1102,11 +1116,11 @@ impl Snapshot {
     /// its store.
     fn remove_index(&mut self, table_key: &str, name_key: &str) {
         self.bump_cat_gen();
-        if let Some(t) = self.tables.get_mut(table_key) {
+        if let Some(t) = std::sync::Arc::make_mut(&mut self.tables).get_mut(table_key) {
             t.indexes
                 .retain(|i| i.name.to_ascii_lowercase() != name_key);
         }
-        self.index_stores.remove(name_key);
+        std::sync::Arc::make_mut(&mut self.index_stores).remove(name_key);
     }
 
     /// Find the table owning the named index (case-insensitive): `(table_key, &IndexDef)`.
@@ -1129,10 +1143,10 @@ impl Snapshot {
     /// leaves` shape on every host. Table stores and btree/GIN index stores flip; a GiST leaf-key
     /// store's nodes are never persisted (its on-disk form is the R-tree), so it no-ops naturally.
     pub(crate) fn demote_clean_leaves(&mut self) {
-        for store in self.stores.values_mut() {
+        for store in std::sync::Arc::make_mut(&mut self.stores).values_mut() {
             store.demote_clean_leaves();
         }
-        for store in self.index_stores.values_mut() {
+        for store in std::sync::Arc::make_mut(&mut self.index_stores).values_mut() {
             store.demote_clean_leaves();
         }
     }
