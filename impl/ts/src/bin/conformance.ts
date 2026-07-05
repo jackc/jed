@@ -542,7 +542,7 @@ function runFile(text: string, disk: boolean): void {
   // the on-disk faulted read path — durability across an OS crash is irrelevant, so skip the per-commit
   // fdatasync (the ~20x cost) while keeping the identical on-disk bytes + read path.
   let dbHandle: Database | null =
-    tmpPath === null ? null : createDatabase({ path: tmpPath, noFsync: true });
+    tmpPath === null ? null : createDatabase({ path: tmpPath, skipFsync: true });
   let onTemp = disk;
   // The Database the current session was minted from, held so a `# attach:` directive (memory-mode only
   // — # skip: disk) can attach a fresh in-memory database into it. In disk mode it is the reopenable file
@@ -693,7 +693,7 @@ function runFile(text: string, disk: boolean): void {
       // resolve-and-rewrite path. No-op in memory mode or after a fixture swap (which is `# skip: disk`).
       if (disk && onTemp) {
         dbHandle!.close();
-        dbHandle = openDatabase(tmpPath!, { noFsync: true }); // fsync=off (throwaway image)
+        dbHandle = openDatabase(tmpPath!, { skipFsync: true }); // fsync=off (throwaway image)
         attachDb = dbHandle;
         db = dbHandle.session();
       }

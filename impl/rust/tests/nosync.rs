@@ -22,15 +22,15 @@ fn int(v: &Value) -> i64 {
     }
 }
 
-/// Build a file database at `path` with the given `no_fsync` setting, run a fixed deterministic
+/// Build a file database at `path` with the given `skip_fsync` setting, run a fixed deterministic
 /// workload (DDL + inserts + an update + a delete, autocommitted across many commits), and close it.
-/// Deterministic (no clock/entropy), so two runs differing only in `no_fsync` must produce
+/// Deterministic (no clock/entropy), so two runs differing only in `skip_fsync` must produce
 /// byte-identical files.
-fn build_sample_db(path: &PathBuf, no_fsync: bool) {
+fn build_sample_db(path: &PathBuf, skip_fsync: bool) {
     let _ = std::fs::remove_file(path);
     let mut db = Database::create(CreateOptions {
         path: Some(path.clone()),
-        no_fsync,
+        skip_fsync,
         ..Default::default()
     })
     .unwrap()
@@ -55,13 +55,13 @@ fn build_sample_db(path: &PathBuf, no_fsync: bool) {
 /// writes) with its committed state fully intact — fsync=off forfeits durability only across an OS
 /// crash, not a clean close + reopen.
 #[test]
-fn no_fsync_round_trips() {
+fn skip_fsync_round_trips() {
     let path = tmp("nosync_roundtrip.jed");
     build_sample_db(&path, true);
     let mut db = Database::open_with_options(
         &path,
         OpenOptions {
-            no_fsync: true,
+            skip_fsync: true,
             ..Default::default()
         },
     )
@@ -84,7 +84,7 @@ fn no_fsync_round_trips() {
 /// The same deterministic workload built with fsync on and off yields byte-identical files (so no
 /// golden churn, no format bump, cross-core byte-identity preserved).
 #[test]
-fn no_fsync_byte_identical() {
+fn skip_fsync_byte_identical() {
     let on = tmp("nosync_on.jed");
     let off = tmp("nosync_off.jed");
     build_sample_db(&on, false);

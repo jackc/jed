@@ -47,7 +47,7 @@ test("fsync=off round-trips (a same-process reopen sees the committed state)", (
     buildSampleDb(path, true);
     // The OS page cache holds the un-synced writes, so a same-process reopen sees the committed state —
     // fsync=off forfeits durability only across an OS crash, not a clean close + reopen.
-    const db: Engine = open(path, { noFsync: true });
+    const db: Engine = open(path, { skipFsync: true });
     const o = execute(db, "SELECT id, v FROM t ORDER BY id");
     assert.equal(o.kind, "query");
     if (o.kind !== "query") throw new Error("expected a query");

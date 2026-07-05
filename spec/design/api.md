@@ -171,19 +171,21 @@ siblings, whose option default genuinely *is* `0` ⇒ unlimited). An **in-memory
 mirroring the buffer pool's in-memory residency). Same shape across cores; the bare `open(path)`
 form uses the default.
 
-**Fsync off — a dev/testing handle setting.** `create`/`open`'s `no_fsync` (Rust/Go
-`CreateOptions.no_fsync` + `OpenOptions.no_fsync` / TS `{ noFsync }`; default **off**) turns the
-per-commit `fdatasync` barrier into a **no-op**. A commit still writes the **identical bytes in the
-same order** — the setting is byte/cost/result-neutral and **never changes what a query observes** —
-only the flush-to-platter is skipped, so a steady-state commit pays no I/O barrier (the fsync-per-commit
-that dominates disk-mode wall time; the conformance disk harness runs with `no_fsync`). **DEV/TESTING
-ONLY.** The data is still durable across a **process** crash — the OS page cache survives the process
-and flushes lazily — but **NOT across an OS crash / power loss**: this is the standard SQLite `PRAGMA
-synchronous=OFF` trade, meant for throwaway/rebuildable databases and bulk loads, never a production
-store that must not lose a commit. It is a **handle** setting (not stored in the file); an **in-memory**
-database ignores it (it never fsyncs). Distinct from `synchronous` (§2.2): `synchronous=off` would
-*defer/batch* the fsync while keeping the file crash-safe (never corrupts — a designed, not-yet-built
-mode); `no_fsync` *skips* it outright and forfeits OS-crash durability. Same shape across cores.
+**Fsync off — a dev/testing handle setting.** `create`/`open`'s `skip_fsync` (Rust
+`CreateOptions.skip_fsync` + `OpenOptions.skip_fsync` / Go `.SkipFsync` / TS `{ skipFsync }`; default
+**off**) turns the per-commit `fdatasync` barrier into a **no-op**. A commit still writes the
+**identical bytes in the same order** — the setting is byte/cost/result-neutral and **never changes
+what a query observes** — only the flush-to-platter is skipped, so a steady-state commit pays no I/O
+barrier (the fsync-per-commit that dominates disk-mode wall time; the conformance disk harness runs
+with `skip_fsync`). **DEV/TESTING ONLY.** The data is still durable across a **process** crash — the
+OS page cache survives the process and flushes lazily — but **NOT across an OS crash / power loss**:
+this is the standard SQLite `PRAGMA synchronous=OFF` trade, meant for throwaway/rebuildable databases
+and bulk loads, never a production store that must not lose a commit. It is a **handle** setting (not
+stored in the file); an **in-memory** database ignores it (it never fsyncs). Distinct from
+`synchronous` (§2.2): `synchronous=off` would *defer/batch* the fsync while keeping the file crash-safe
+(never corrupts — a designed, not-yet-built mode); `skip_fsync` *skips* it outright and forfeits
+OS-crash durability. Same shape across cores. (The positively-oriented name `skip_fsync` reads as the
+action it performs, in the stdlib `SkipVerify` tradition — the safe default is the zero value.)
 
 #### 2.1.1 One create, no in-memory constructor
 
@@ -264,13 +266,13 @@ transactions.md §1). The commit boundary and durability are **decoupled** (tran
   commit minus `fsync`, whose memory-host `sync` is a no-op); the observable result is the same
   success it always was. Rollback discards the working set. **File-backed** → commit publishes +
   makes durable per the **`synchronous`** setting (below).
-- **Durability — `synchronous` (default `on`) vs. `no_fsync`.** `synchronous=on` makes a commit
+- **Durability — `synchronous` (default `on`) vs. `skip_fsync`.** `synchronous=on` makes a commit
   durable **before it returns** (the §3 crash-safe recipe). `synchronous=off`/relaxed makes the
   commit visible immediately and **batches/defers** the fsync — faster, may lose the last few
   commits on a crash, **never corrupts** (the on-disk image is always a valid older snapshot); it is
   a **designed but not-yet-built** mode (transactions.md §9), because a copy-on-write engine must gate
   page-reuse on a durable watermark to keep that guarantee. The **implemented** durability knob is
-  **`no_fsync`** (§2.1) — a create/open handle setting that *skips* the fsync outright: the full
+  **`skip_fsync`** (§2.1) — a create/open handle setting that *skips* the fsync outright: the full
   speedup, but **DEV/TESTING ONLY** (durable across a process crash, not an OS crash). Production that
   cannot lose a commit uses the default `synchronous=on`.
 

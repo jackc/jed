@@ -712,7 +712,7 @@ func runFile(text string, disk bool) error {
 		// fsync=off (api.md §2.1): the disk pass reopens a throwaway temp image before every record to
 		// exercise the on-disk faulted read path — durability across an OS crash is irrelevant, so skip
 		// the per-commit fdatasync (the ~20x cost) while keeping the identical on-disk bytes + read path.
-		db, err = jed.CreateDatabase(jed.CreateOptions{Path: tmpPath, NoFsync: true})
+		db, err = jed.CreateDatabase(jed.CreateOptions{Path: tmpPath, SkipFsync: true})
 		if err != nil {
 			os.Remove(tmpPath)
 			return fmt.Errorf("disk mode: create %s: %w", tmpPath, err)
@@ -742,7 +742,7 @@ func runFile(text string, disk bool) error {
 		if err := db.Close(); err != nil {
 			return fmt.Errorf("disk reopen: close: %w", err)
 		}
-		reDB, err := jed.OpenDatabaseWithOptions(tmpPath, jed.OpenOptions{NoFsync: true}) // fsync=off (throwaway image)
+		reDB, err := jed.OpenDatabaseWithOptions(tmpPath, jed.OpenOptions{SkipFsync: true}) // fsync=off (throwaway image)
 		if err != nil {
 			return fmt.Errorf("disk reopen: open %s: %w", tmpPath, err)
 		}

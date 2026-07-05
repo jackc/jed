@@ -497,11 +497,11 @@ func AttachFile(path string) AttachSource { return AttachSource{file: true, path
 type CreateOptions struct {
 	Path     string
 	PageSize uint32
-	// NoFsync turns off the per-commit fsync for this handle (the fsync=off host setting, api.md §2.1):
+	// SkipFsync turns off the per-commit fsync for this handle (the fsync=off host setting, api.md §2.1):
 	// commits write identical bytes in the same order but skip the fdatasync barrier. DEV/TESTING ONLY —
 	// durable across a process crash, not an OS crash / power loss. Ignored for an in-memory database
 	// (opts.Path == "") which never fsyncs. Byte/cost/result-neutral; default false.
-	NoFsync bool
+	SkipFsync bool
 }
 
 // CreateDatabase makes a fresh database — in-memory (opts.Path == "") or file-backed (opts.Path set)
@@ -517,7 +517,7 @@ func CreateDatabase(opts CreateOptions) (*Database, error) {
 	if opts.Path == "" {
 		return newInMemoryWithPageSize(pageSize), nil
 	}
-	e, err := create(opts.Path, databaseOptions{PageSize: pageSize, noSync: opts.NoFsync})
+	e, err := create(opts.Path, databaseOptions{PageSize: pageSize, noSync: opts.SkipFsync})
 	if err != nil {
 		return nil, err
 	}

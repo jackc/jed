@@ -574,7 +574,7 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
         // the per-commit fdatasync (the ~20x cost) while keeping the identical on-disk bytes + read path.
         Some(p) => Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(p)),
-            no_fsync: true,
+            skip_fsync: true,
             ..Default::default()
         })
         .map_err(|e| format!("disk mode: create {}: {}", p.display(), e.message))?,
@@ -711,7 +711,7 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
             db = Database::open_with_options(
                 p,
                 jed::OpenOptions {
-                    no_fsync: true, // fsync=off (throwaway image)
+                    skip_fsync: true, // fsync=off (throwaway image)
                     ..Default::default()
                 },
             )

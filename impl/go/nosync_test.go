@@ -37,13 +37,13 @@ func buildSampleDB(t *testing.T, path string, noSync bool) {
 	}
 }
 
-// TestNoFsyncRoundTrips builds a database with fsync=off, then reopens it in the same process. The OS
+// TestSkipFsyncRoundTrips builds a database with fsync=off, then reopens it in the same process. The OS
 // page cache holds the un-synced writes, so the committed state is fully readable — fsync=off forfeits
 // durability only across an OS crash, not a clean close + reopen.
-func TestNoFsyncRoundTrips(t *testing.T) {
+func TestSkipFsyncRoundTrips(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nosync.jed")
 	buildSampleDB(t, path, true) // fsync=off
-	db, err := openWithOptions(path, OpenOptions{NoFsync: true})
+	db, err := openWithOptions(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,10 +61,10 @@ func TestNoFsyncRoundTrips(t *testing.T) {
 	}
 }
 
-// TestNoFsyncByteIdentical is the load-bearing guarantee: fsync=off changes only *when* bytes are
+// TestSkipFsyncByteIdentical is the load-bearing guarantee: fsync=off changes only *when* bytes are
 // flushed, never *which* bytes. The same deterministic workload built with fsync on and off must yield
 // byte-identical files (so no golden churn, no format bump, cross-core byte-identity preserved).
-func TestNoFsyncByteIdentical(t *testing.T) {
+func TestSkipFsyncByteIdentical(t *testing.T) {
 	dir := t.TempDir()
 	on := filepath.Join(dir, "on.jed")
 	off := filepath.Join(dir, "off.jed")

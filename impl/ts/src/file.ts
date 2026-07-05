@@ -39,11 +39,11 @@ export type DatabaseOptions = { pageSize?: number; noSync?: boolean };
 // empty-string sentinel (api.md §2.1). pageSize (absent/0 → DEFAULT_PAGE_SIZE) is locked into a file's
 // meta at creation and fixes an in-memory database's tree fan-out (the page-backed B-tree's fan-out
 // tracks the page size), so it is meaningful for both backings.
-// noFsync turns off the per-commit fsync for this handle (the fsync=off host setting, api.md §2.1):
+// skipFsync turns off the per-commit fsync for this handle (the fsync=off host setting, api.md §2.1):
 // commits write identical bytes in the same order but skip the fdatasync barrier. DEV/TESTING ONLY —
 // durable across a process crash, not an OS crash / power loss. Ignored for an in-memory database (no
 // path) which never fsyncs. Byte/cost/result-neutral; default false.
-export type CreateOptions = { path?: string; pageSize?: number; noFsync?: boolean };
+export type CreateOptions = { path?: string; pageSize?: number; skipFsync?: boolean };
 
 // create makes a new file-backed database at path with opts (the page size is locked into the
 // file). The path must not already exist — 58P02 otherwise. An initial empty image is written
@@ -106,7 +106,7 @@ function writeFullImage(db: Engine, noSync: boolean): void {
 // never changes what a query observes (spill.md §6). 0 (or unset) ⇒ the default (256 MiB), NOT
 // unlimited — the zero value stays a safe finite budget (matching Go/Rust); an unbounded/never-spill
 // budget is a runtime-only mode via setWorkMem(0). Default DEFAULT_WORK_MEM (256 MiB).
-// noFsync turns off the per-commit fsync (the fsync=off host setting, api.md §2.1): a commit still writes
+// skipFsync turns off the per-commit fsync (the fsync=off host setting, api.md §2.1): a commit still writes
 // the same bytes in the same order but the fdatasync barrier becomes a no-op — much faster. DEV/TESTING
 // ONLY: the data survives a process crash (the OS page cache still flushes) but NOT an OS crash / power
 // loss. Never changes what a query observes or the on-disk bytes; default false.
@@ -114,7 +114,7 @@ export type OpenOptions = {
   cacheBytes?: number;
   readOnly?: boolean;
   workMem?: number;
-  noFsync?: boolean;
+  skipFsync?: boolean;
 };
 
 // open opens an existing file-backed database at path with optional open settings (the memory budget,
@@ -144,7 +144,7 @@ export function open(path: string, opts: OpenOptions = {}): Engine {
     // Read the file's page size first, then convert the byte budget to a leaf-page capacity; the loader
     // rejects an out-of-range page size as corrupt (cacheLeaves clamps the divisor so a malformed
     // page_size = 0 cannot divide by zero before that check runs).
-    const pager = Pager.fromStore(new FileBlockStore(fd, opts.noFsync ?? false));
+    const pager = Pager.fromStore(new FileBlockStore(fd, opts.skipFsync ?? false));
     const db = loadEnginePaged(new SharedPaging(pager, cacheLeaves(cacheBytes, pager.pageSize)));
     db.path = path;
     db.persistHook = persistImpl; // autocommit each later write (transactions.md §4.1)
@@ -175,9 +175,9 @@ registerFileAttachOpener((path, readOnly) => open(path, { readOnly }));
 export function createDatabase(opts: CreateOptions = {}): Database {
   const pageSize = opts.pageSize || DEFAULT_PAGE_SIZE;
   if (opts.path !== undefined) {
-    return Database.fromEngine(create(opts.path, { pageSize, noSync: opts.noFsync }));
+    return Database.fromEngine(create(opts.path, { pageSize, noSync: opts.skipFsync }));
   }
-  return buildInMemory(pageSize); // in-memory never fsyncs; noFsync is a no-op
+  return buildInMemory(pageSize); // in-memory never fsyncs; skipFsync is a no-op
 }
 
 // openDatabase opens an existing file-backed database at path with optional open settings and returns

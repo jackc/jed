@@ -50,7 +50,7 @@ pub struct CreateOptions {
     /// commits write identical bytes in the same order but skip the `fdatasync` barrier. DEV/TESTING
     /// ONLY — durable across a process crash, not an OS crash / power loss. Ignored for an in-memory
     /// database (`path: None`) which never fsyncs. Byte/cost/result-neutral; default `false`.
-    pub no_fsync: bool,
+    pub skip_fsync: bool,
 }
 
 /// Open-time settings for a file-backed database (spec/design/api.md §2.1). Unlike
@@ -83,7 +83,7 @@ pub struct OpenOptions {
     /// the same bytes in the same order, but the `fdatasync` barrier becomes a no-op — much faster.
     /// DEV/TESTING ONLY: the data survives a process crash (the OS page cache still flushes) but NOT an
     /// OS crash / power loss. Never changes what a query observes or the on-disk bytes; default `false`.
-    pub no_fsync: bool,
+    pub skip_fsync: bool,
 }
 
 impl Default for OpenOptions {
@@ -92,7 +92,7 @@ impl Default for OpenOptions {
             cache_bytes: DEFAULT_CACHE_BYTES,
             read_only: false,
             work_mem: crate::spill::DEFAULT_WORK_MEM,
-            no_fsync: false,
+            skip_fsync: false,
         }
     }
 }
@@ -167,7 +167,7 @@ impl Engine {
             }
             Err(e) => return Err(io_error(e)),
         };
-        let pager = Pager::from_store(Box::new(FileBlockStore::new(file, opts.no_fsync)))?;
+        let pager = Pager::from_store(Box::new(FileBlockStore::new(file, opts.skip_fsync)))?;
         // Convert the byte budget to a leaf-page capacity by the file's page size; `open_paged`
         // rejects an out-of-range page size as corrupt (`cache_leaves` clamps the divisor so a
         // malformed `page_size = 0` cannot divide by zero before that check runs).

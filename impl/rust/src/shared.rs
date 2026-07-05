@@ -916,10 +916,10 @@ impl Database {
                 path,
                 DatabaseOptions {
                     page_size,
-                    no_sync: opts.no_fsync,
+                    no_sync: opts.skip_fsync,
                 },
             )?)),
-            None => Ok(Database::in_memory(page_size)), // in-memory never fsyncs; no_fsync is a no-op
+            None => Ok(Database::in_memory(page_size)), // in-memory never fsyncs; skip_fsync is a no-op
         }
     }
 

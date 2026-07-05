@@ -85,11 +85,11 @@ type OpenOptions struct {
 	// this many bytes of rows resident, then spills sorted runs. Like CacheBytes it is a handle
 	// setting that never changes what a query observes (spill.md §6). 0 → DefaultWorkMem (256 MiB).
 	WorkMem int
-	// NoFsync turns off the per-commit fsync (the fsync=off host setting, api.md §2.1). A commit still
+	// SkipFsync turns off the per-commit fsync (the fsync=off host setting, api.md §2.1). A commit still
 	// writes the same bytes in the same order, but the fdatasync barrier becomes a no-op — much faster.
 	// DEV/TESTING ONLY: the data survives a process crash (the OS page cache still flushes) but NOT an
 	// OS crash / power loss. Never changes what a query observes or the on-disk bytes; default false.
-	NoFsync bool
+	SkipFsync bool
 }
 
 // Open opens an existing file-backed database at path with default open settings — the buffer-pool
@@ -125,7 +125,7 @@ func openWithOptions(path string, opts OpenOptions) (*engine, error) {
 		}
 		return nil, ioError(err)
 	}
-	p, err := pagerFromStore(&fileBlockStore{f: f, noSync: opts.NoFsync})
+	p, err := pagerFromStore(&fileBlockStore{f: f, noSync: opts.SkipFsync})
 	if err != nil {
 		_ = f.Close()
 		return nil, err
