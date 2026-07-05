@@ -4,8 +4,8 @@
 //! feature-by-feature (Phases B–E). The result of running a statement is an
 //! `Outcome`: either a bare success (DDL/DML) or a query result set.
 
-use crate::api::Rows;
-use crate::ast::{
+pub(crate) use crate::api::Rows;
+pub(crate) use crate::ast::{
     AlterSeqAction, AlterSequence, BinaryOp, ConflictAction, ConflictTarget, CreateIndex,
     CreateSequence, CreateTable, CreateType, Cte, CteBody, Delete, DropIndex, DropSequence,
     DropTable, DropType, Expr, GroupItem, Insert, InsertSource, InsertValue, JoinKind,
@@ -14,32 +14,39 @@ use crate::ast::{
     Statement, SubscriptSpec, TableRef, TypeFieldDef, TypeMod, UnaryOp, Update, WindowDef,
     WithExpr, WithQuery,
 };
-use crate::catalog::{
+pub(crate) use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
     ExclusionConstraint, ExclusionElement, ExclusionOp, FkAction, ForeignKeyConstraint,
     IdentityKind, IndexDef, IndexKind, SeqDataType, SeqOwner, SequenceDef, Table, resolve_col_type,
 };
-use crate::collation::{self, Collation};
-use crate::cost::{Lifetime, Meter};
-use crate::costs::COSTS;
-use crate::date::parse_date;
-use crate::decimal::{self, Decimal, MAX_PRECISION, MAX_SCALE};
-use crate::encoding::{encode_bool, encode_int, encode_terminated};
-use crate::error::{EngineError, Result, SqlState};
-use crate::interval::{self, Interval, parse_interval};
-use crate::json::{self, JsonNode};
-use crate::operators::{AGGREGATES, AggregateDesc, OPERATORS, OperatorDesc, WINDOWS};
-use crate::pmap::KeyBound;
-use crate::privileges::{Privilege, PrivilegeSet};
-use crate::storage::{Row, TableStore};
-use crate::timestamp::{parse_timestamp, parse_timestamptz};
-use crate::types::{DecimalTypmod, ScalarType, Type};
-use crate::value::{
+pub(crate) use crate::collation::{self, Collation};
+pub(crate) use crate::cost::{Lifetime, Meter};
+pub(crate) use crate::costs::COSTS;
+pub(crate) use crate::date::parse_date;
+pub(crate) use crate::decimal::{self, Decimal, MAX_PRECISION, MAX_SCALE};
+pub(crate) use crate::encoding::{encode_bool, encode_int, encode_terminated};
+pub(crate) use crate::error::{EngineError, Result, SqlState};
+pub(crate) use crate::interval::{self, Interval, parse_interval};
+pub(crate) use crate::json::{self, JsonNode};
+pub(crate) use crate::operators::{AGGREGATES, AggregateDesc, OPERATORS, OperatorDesc, WINDOWS};
+pub(crate) use crate::pmap::KeyBound;
+pub(crate) use crate::privileges::{Privilege, PrivilegeSet};
+pub(crate) use crate::storage::{Row, TableStore};
+pub(crate) use crate::timestamp::{parse_timestamp, parse_timestamptz};
+pub(crate) use crate::types::{DecimalTypmod, ScalarType, Type};
+pub(crate) use crate::value::{
     ArrayVal, RangeVal, ThreeValued, Value, and3, from3, not3, or3, parse_bytea_hex, parse_uuid,
     render_uuid,
 };
-use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::LazyLock;
+pub(crate) use std::collections::{BTreeSet, HashMap, HashSet};
+pub(crate) use std::sync::LazyLock;
+
+// Submodules split out of the original single-file executor. Each is a plain physical partition of
+// this module: it does `use super::*;`, and its items are re-exported here so intra-executor
+// references stay unqualified, exactly as when this was one file.
+mod window;
+pub(crate) use window::*;
+// __SUBMODULES__
 
 /// The outcome of executing one statement. Both variants carry the deterministic
 /// execution `cost` accrued while running the statement (CLAUDE.md §13) — a DML
@@ -144,7 +151,7 @@ pub struct ScriptSummary {
 /// resolved types, the rows in result order, and the accrued cost. Internal to the executor —
 /// `execute_select` drops the types into the public `Outcome::Query`, while `INSERT ... SELECT`
 /// uses the types to gate assignability up front (spec/design/grammar.md §24).
-struct SelectResult {
+pub(crate) struct SelectResult {
     column_names: Vec<String>,
     column_types: Vec<ResolvedType>,
     rows: Vec<Vec<Value>>,
@@ -159,7 +166,7 @@ struct SelectResult {
 /// bounding output memory and short-circuiting a caller's early exit). Both drives charge the
 /// identical units at the identical sites, so a fully-drained query observes the same rows + total
 /// cost (streaming.md §6).
-enum Emitter {
+pub(crate) enum Emitter {
     /// The general blocking path's intermediate buffer, windowed to `[start, end)`. Each emitted
     /// row charges `row_produced`; in [`EmitMode::Project`] it additionally evaluates the projection
     /// list (charging its `operator_eval`s), and in [`EmitMode::Identity`] the buffer rows are
@@ -206,7 +213,7 @@ enum Emitter {
 
 /// Whether an [`Emitter::Buffer`] row still needs projecting on emission (spec/design/streaming.md §4).
 #[derive(Clone, Copy)]
-enum EmitMode {
+pub(crate) enum EmitMode {
     /// Evaluate the projection list against the buffer row (charging projection `operator_eval`s).
     Project,
     /// The buffer row is already the projected output (DISTINCT pre-projected for its dedup key).
@@ -15150,7 +15157,7 @@ impl Engine {
 /// RETURNING `old`/`new` row-version pseudo-relations (grammar.md §32): bare-column
 /// resolution skips it (no new ambiguity), every other statement never builds one.
 #[derive(Clone)]
-struct ScopeRel<'a> {
+pub(crate) struct ScopeRel<'a> {
     label: String,
     table: &'a Table,
     offset: usize,
@@ -15218,7 +15225,7 @@ fn is_attachment_scope(q: Option<&str>) -> bool {
 /// `synthetic` vec — never a borrow — so a record can outlive a later push into that vec, which is
 /// what lets a LATERAL item resolve against the earlier synthetic tables while later ones grow.
 #[derive(Clone, Copy)]
-enum RelSrc<'a> {
+pub(crate) enum RelSrc<'a> {
     Base(&'a Table),
     Cte(&'a Table, usize),
     Synthetic(usize),
@@ -15227,7 +15234,7 @@ enum RelSrc<'a> {
 /// A FROM relation finalized during the §44 LATERAL-aware build: its label, flat column offset, and
 /// table source. Held in FROM order so the prefix `parent` scope a later LATERAL item resolves
 /// against (the relations to its left) can be rebuilt, and the persistent scope assembled afterward.
-struct FinalRel<'a> {
+pub(crate) struct FinalRel<'a> {
     label: String,
     offset: usize,
     src: RelSrc<'a>,
@@ -15295,7 +15302,7 @@ fn build_prefix_scope<'s>(
 /// term** (its column types fix the synthetic relation's) and `recursive` carries the recursive
 /// term + the `UNION ALL` flag; the binding is in scope inside its own recursive term, so the
 /// self-reference resolves to it (`refs` then counts the self-reference too).
-struct CteBinding {
+pub(crate) struct CteBinding {
     name: String,
     table: Box<Table>,
     source: CteSource,
@@ -15308,7 +15315,7 @@ struct CteBinding {
 /// planned query body; a **data-modifying** CTE holds the statement to execute (for its effect +
 /// `RETURNING` buffer). A data-modifying CTE is always materialized (writable-cte.md §3), so the
 /// inline-execution path never touches a `Dml` source.
-enum CteSource {
+pub(crate) enum CteSource {
     Query(QueryPlan),
     Dml(DmCte),
 }
@@ -15316,13 +15323,13 @@ enum CteSource {
 /// A data-modifying CTE's body (spec/design/writable-cte.md): the `INSERT`/`UPDATE`/`DELETE` to run
 /// (cloned from the AST, executed with the statement's CTE context threaded in) and whether it has
 /// no `RETURNING` clause — in which case a FROM reference to it is `0A000` (§5).
-struct DmCte {
+pub(crate) struct DmCte {
     stmt: DmStmt,
     no_returning: bool,
 }
 
 /// A data-modifying statement in a writable-CTE position (a CTE body or the `WITH` primary).
-enum DmStmt {
+pub(crate) enum DmStmt {
     Insert(Box<Insert>),
     Update(Box<Update>),
     Delete(Box<Delete>),
@@ -15331,7 +15338,7 @@ enum DmStmt {
 /// The recursive half of a `WITH RECURSIVE` CTE (spec/design/recursive-cte.md §4): the planned
 /// recursive term (the `UNION`'s right operand, which references the CTE once) and whether the body
 /// is `UNION ALL` (keep every row) versus `UNION` (drop rows duplicating any already emitted).
-struct RecursiveTerm {
+pub(crate) struct RecursiveTerm {
     plan: QueryPlan,
     union_all: bool,
 }
@@ -15341,7 +15348,7 @@ struct RecursiveTerm {
 /// row); `Outer` is a correlated reference to an enclosing query — `level` hops outward
 /// (1 = immediate parent) and `index` is the flat column index within that ancestor's row.
 #[derive(Clone, Copy)]
-enum Resolved {
+pub(crate) enum Resolved {
     Local(usize),
     Outer { level: usize, index: usize },
 }
@@ -15352,7 +15359,7 @@ enum Resolved {
 /// whose merge is `COALESCE(left, right)` and so is not a single column, is a deferred `0A000`
 /// narrowing.) Both underlying copies are recorded in the scope's `hidden` set.
 #[derive(Clone)]
-struct MergeCol {
+pub(crate) struct MergeCol {
     name: String,
     index: usize,
 }
@@ -15360,7 +15367,7 @@ struct MergeCol {
 /// The relations a query's FROM clause puts in scope, in FROM order, plus the enclosing
 /// scope chain (for correlated references — grammar.md §26) and the catalog (so resolving a
 /// subquery can look up its own FROM tables).
-struct Scope<'a> {
+pub(crate) struct Scope<'a> {
     rels: Vec<ScopeRel<'a>>,
     /// The enclosing query's scope, for correlated-reference resolution (None at top level).
     parent: Option<&'a Scope<'a>>,
@@ -15637,7 +15644,7 @@ fn outer_of(r: Resolved) -> Resolved {
 /// Not `Copy`: the `Composite` arm owns a heap shape (open types — CLAUDE.md §4), so the type
 /// is cloned/borrowed rather than copied. Every other arm is still a trivial tag/scalar.
 #[derive(Clone, PartialEq, Eq)]
-enum ResolvedType {
+pub(crate) enum ResolvedType {
     Int(ScalarType),
     Bool,
     Text,
@@ -15689,7 +15696,7 @@ enum ResolvedType {
 /// The resolved shape of a composite type — its (optional) name and resolved field list. The
 /// `name` is `None` for an anonymous `ROW(...)` result, `Some` for a named catalog type.
 #[derive(Clone, PartialEq, Eq)]
-struct CompositeRType {
+pub(crate) struct CompositeRType {
     name: Option<String>,
     fields: Vec<(String, ResolvedType)>,
 }
@@ -15784,7 +15791,7 @@ fn type_names(types: &[ResolvedType]) -> Vec<String> {
 }
 
 #[derive(Clone, Copy)]
-enum ArithOp {
+pub(crate) enum ArithOp {
     Add,
     Sub,
     Mul,
@@ -15807,7 +15814,7 @@ impl ArithOp {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum CmpOp {
+pub(crate) enum CmpOp {
     Eq,
     Ne,
     Lt,
@@ -15835,7 +15842,7 @@ impl CmpOp {
 /// name (case-insensitive). Evaluated per row; the overload (integer vs decimal) is recovered
 /// at eval from the argument's runtime value.
 #[derive(Clone, Copy)]
-enum ScalarFunc {
+pub(crate) enum ScalarFunc {
     Abs,
     Round,
     // Float functions (spec/design/float.md §8). EXACT / correctly-rounded (in-contract):
@@ -16054,7 +16061,7 @@ enum ScalarFunc {
 /// the builders return an *array* type (not a `ScalarType`), so they get their own resolved node
 /// ([`RExpr::ArrayFunc`]). The kernel id is the function name; the eval recovers everything else
 /// from the operand values (the array's own shape header), so the node carries no result type.
-enum ArrayFunc {
+pub(crate) enum ArrayFunc {
     /// array_ndims(anyarray) → i32 — the dimension count; NULL for the empty array.
     ArrayNdims,
     /// array_length(anyarray, integer) → i32 — length of a dimension; NULL if empty / out of range.
@@ -16109,7 +16116,7 @@ enum ArrayFunc {
 /// operand range value (self-describing). All are STRICT (a NULL range → NULL). `lower`/`upper`
 /// return the bound value (ELEM) or NULL when empty/unbounded; the rest return boolean.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RangeFunc {
+pub(crate) enum RangeFunc {
     /// lower(anyrange) → anyelement — the lower bound value; NULL if the range is empty or
     /// unbounded below.
     Lower,
@@ -16132,7 +16139,7 @@ enum RangeFunc {
 /// The regular-expression scalar functions (spec/design/regex.md §8). The kernel id; the eval
 /// recovers the arg shape (3/4 for replace, 2/3 for match) from `args.len()`. Kernels in `regex.rs`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RegexFunc {
+pub(crate) enum RegexFunc {
     /// regexp_replace(source, pattern, replacement [, flags]) → text.
     Replace,
     /// regexp_match(source, pattern [, flags]) → text[].
@@ -16154,7 +16161,7 @@ enum RegexFunc {
 /// `@>`/`<@` (the other operand is a bare element coerced to the range's element type); the rest are
 /// range-against-range. The kernels live in `range.rs`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RangeOp {
+pub(crate) enum RangeOp {
     /// `a @> b` — range `a` contains range `b`.
     Contains,
     /// `r @> e` — range `r` contains element `e` (the element overload of `@>`).
@@ -16181,7 +16188,7 @@ enum RangeOp {
 /// common element type into a new range (`RExpr::RangeSetOp`). `Union`/`Difference` raise `22000` on a
 /// non-contiguous result; `Intersect`/`Merge` never error. The kernels live in `range.rs`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RangeSetOp {
+pub(crate) enum RangeSetOp {
     /// `a + b` — union: the smallest single range covering both (22000 if they leave a gap).
     Union,
     /// `a * b` — intersection: the overlap (empty when the ranges are disjoint).
@@ -16196,7 +16203,7 @@ enum RangeSetOp {
 /// [`ScalarFunc`] because they are non-strict (`null = "none"`, like [`ArrayFunc`]) and take either
 /// a spread of arguments or a single array via the `VARIADIC` keyword — the call form is carried on
 /// the [`RExpr::Variadic`] node. Both return `i32`.
-enum VariadicFunc {
+pub(crate) enum VariadicFunc {
     /// num_nulls(VARIADIC "any") → i32 — the count of NULL arguments (spread form), or of NULL
     /// flattened elements (VARIADIC-array form; a NULL whole-array operand → NULL). Never NULL in
     /// spread form.
@@ -16207,7 +16214,7 @@ enum VariadicFunc {
 
 /// Which scalar jsonpath query function an [`RExpr::JsonPathFn`] node is (jsonpath.md §5).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum JsonPathFnKind {
+pub(crate) enum JsonPathFnKind {
     /// `jsonb_path_exists` → boolean (the sequence is non-empty).
     Exists,
     /// `jsonb_path_query_first` → the first sequence item, or NULL if empty.
@@ -16221,7 +16228,7 @@ enum JsonPathFnKind {
 
 /// Which SQL/JSON query function an [`RExpr::JsonSqlFn`] node is (json-sql-functions.md §5).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum JsonSqlKind {
+pub(crate) enum JsonSqlKind {
     /// `JSON_EXISTS` → boolean (non-empty sequence); errors honor ON ERROR (default FALSE).
     Exists,
     /// `JSON_VALUE` → a single scalar coerced to the RETURNING type (default text).
@@ -16232,7 +16239,7 @@ enum JsonSqlKind {
 
 /// Which json/jsonb builder an [`RExpr::JsonBuild`] node is (json-sql-functions.md §2).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum JsonBuildKind {
+pub(crate) enum JsonBuildKind {
     /// json[b]_build_array — every argument is one array element (NULL → JSON null).
     Array,
     /// json[b]_build_object — alternating key/value arguments (odd count / NULL key → 22023).
@@ -16241,7 +16248,7 @@ enum JsonBuildKind {
 
 /// One resolved subscript spec in an [`RExpr::Subscript`] (spec/design/array.md §6): a single
 /// index `a[i]`, or a slice `a[m:n]` whose bounds may be omitted (`a[:n]`, `a[m:]`, `a[:]`).
-enum RSubscript {
+pub(crate) enum RSubscript {
     Index(Box<RExpr>),
     Slice {
         lower: Option<Box<RExpr>>,
@@ -16254,7 +16261,7 @@ enum RSubscript {
 /// value can be range-checked against it (the i16+i16 → i16 boundary).
 /// Which jsonb delete form a [`RExpr::JsonDelete`] applies (json-sql-functions.md §1, J6).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum DeleteKind {
+pub(crate) enum DeleteKind {
     /// `jsonb - text` — delete a key (object) or matching string elements (array).
     Key,
     /// `jsonb - int` — delete the array element at an index.
@@ -16267,7 +16274,7 @@ enum DeleteKind {
 
 /// Which jsonb key-existence operator a [`RExpr::JsonHasKey`] applies (json-sql-functions.md §1).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum HasKeyKind {
+pub(crate) enum HasKeyKind {
     /// `?` — a single key (text) exists.
     One,
     /// `?|` — any key of a `text[]` exists.
@@ -16278,7 +16285,7 @@ enum HasKeyKind {
 
 /// Which jsonb accessor operator a [`RExpr::JsonGet`] applies (spec/design/json-sql-functions.md §1).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum JsonGetOp {
+pub(crate) enum JsonGetOp {
     /// `->` — field by key (text arg) or element by index (integer arg); result jsonb.
     Arrow,
     /// `->>` — same access, rendered as text.
@@ -16289,7 +16296,7 @@ enum JsonGetOp {
     HashArrowText,
 }
 
-enum RExpr {
+pub(crate) enum RExpr {
     Column(usize),
     ConstInt(i64),
     ConstBool(bool),
@@ -16727,7 +16734,7 @@ enum RExpr {
 
 /// Which subquery form an `RExpr::Subquery` is (spec/design/grammar.md §26).
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum SubqueryKind {
+pub(crate) enum SubqueryKind {
     Scalar,
     Exists,
     In,
@@ -16751,7 +16758,7 @@ enum SubqueryKind {
 // ============================================================================
 
 /// A resolved query expression: a SELECT plan or a set-operation plan (mirrors `QueryExpr`).
-enum QueryPlan {
+pub(crate) enum QueryPlan {
     Select(SelectPlan),
     SetOp(Box<SetOpPlan>),
     /// A VALUES-body relation — `FROM (VALUES …) AS v` (spec/design/grammar.md §42): a computed
@@ -16770,7 +16777,7 @@ enum QueryPlan {
 /// (planned against each other only — not the enclosing scope), `modes` their per-binding
 /// inline/materialize decision ([`cte_modes`]), and `body` the inner query that references them.
 /// At execution the bindings are materialized once and `body` runs against a fresh CTE context.
-struct WithPlan {
+pub(crate) struct WithPlan {
     bindings: Vec<CteBinding>,
     modes: Vec<CteMode>,
     body: QueryPlan,
@@ -16806,7 +16813,7 @@ impl QueryPlan {
 /// `column_types` is the per-column type unified across the rows like a set operation (§25), and
 /// `column_names` is `column1, column2, …` (PostgreSQL; the derived table's optional column-rename
 /// list overrides them at the synthetic relation). All rows have `column_types.len()` values.
-struct ValuesPlan {
+pub(crate) struct ValuesPlan {
     rows: Vec<Vec<RExpr>>,
     column_types: Vec<ResolvedType>,
     column_names: Vec<String>,
@@ -16823,7 +16830,7 @@ struct ValuesPlan {
 /// The recursiveness of a CTE in a `WITH RECURSIVE` list. `NonRecursive` = the body does not
 /// reference the CTE (an ordinary CTE, even under `RECURSIVE`). `Recursive` = the validated
 /// fixpoint shape, carrying the `UNION ALL` flag.
-enum CteShape {
+pub(crate) enum CteShape {
     NonRecursive,
     Recursive { union_all: bool },
 }
@@ -17413,7 +17420,7 @@ fn resolved_range_element_scalar(elem: &ResolvedType) -> Option<ScalarType> {
 /// `srf` is `Some`, the relation is a COMPUTED set-returning function (generate_series) rather
 /// than a base table: `table_name` is then the function name (never looked up in the store) and
 /// the executor generates the rows instead of scanning (spec/design/functions.md §10).
-struct PlanRel {
+pub(crate) struct PlanRel {
     table_name: String,
     /// The relation's explicit database qualifier (attached-databases.md §3), passed to the scope-aware
     /// store funnels at exec (`store_scoped` etc.). `None` for a bare implicit-scope name → the funnels
@@ -17445,7 +17452,7 @@ struct PlanRel {
 /// reference count and `[NOT] MATERIALIZED` hint: a single-reference CTE is `Inline`, a
 /// multi-reference (or `MATERIALIZED`) one is `Materialize`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum CteMode {
+pub(crate) enum CteMode {
     /// Run the body in place at each reference (re-evaluates per outer row under correlation,
     /// matching PostgreSQL); charges the body's intrinsic cost, no `cte_scan_row`.
     Inline,
@@ -17462,7 +17469,7 @@ enum CteMode {
 /// `bindings` also serves a data-modifying CTE's own inner queries, which resolve against the
 /// earlier bindings when the writable-CTE orchestrator executes them (writable-cte.md §2).
 #[derive(Clone, Copy)]
-struct CteCtx<'a> {
+pub(crate) struct CteCtx<'a> {
     modes: &'a [CteMode],
     bindings: &'a [CteBinding],
     buffers: &'a [Vec<Row>],
@@ -17483,7 +17490,7 @@ impl CteCtx<'_> {
 /// (spec/design/functions.md §10, array-functions.md §9). The dispatch is hand-written per core;
 /// the resolution narrows the catalog name to one of these.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum SrfKind {
+pub(crate) enum SrfKind {
     /// `generate_series(start, stop[, step])` — an integer series (functions.md §10).
     GenerateSeries,
     /// `unnest(anyarray)` — one row per array element, flattened row-major (array-functions.md §9).
@@ -17533,7 +17540,7 @@ enum SrfKind {
 
 /// A resolved `JSON_TABLE` plan (T1, json-table.md §3) — the compiled root path + the column tree.
 #[derive(Clone, PartialEq, Eq, Debug)]
-struct JtPlan {
+pub(crate) struct JtPlan {
     /// The compiled root jsonpath (its evaluation over `ctx` yields the row items).
     root_path: String,
     /// The total number of flattened output columns.
@@ -17544,7 +17551,7 @@ struct JtPlan {
 
 /// One resolved `JSON_TABLE` column (json-table.md §3.3). Leaf columns carry their flat output index.
 #[derive(Clone, PartialEq, Eq, Debug)]
-enum JtCol {
+pub(crate) enum JtCol {
     /// `FOR ORDINALITY` — the level's 1-based row counter.
     Ordinality { idx: usize },
     /// A regular column: evaluate `path` over the row item, apply JSON_VALUE (scalar) or JSON_QUERY
@@ -17577,7 +17584,7 @@ enum JtCol {
 /// arg evaluates against the params/outer environment with no local row. The produced column's
 /// type lives on the synthetic relation (built in `resolve_srf`), so the plan needs only the
 /// resolved arg expressions here.
-struct SrfPlan {
+pub(crate) struct SrfPlan {
     kind: SrfKind,
     args: Vec<RExpr>,
     /// The declared output columns for a record-returning SRF (`JsonRecord`) — the C0 col-def list,
@@ -18094,7 +18101,7 @@ fn coerce_json_member(
 
 /// A sparse assignment of a `JSON_TABLE` row — `(flat column index, value)` pairs; unassigned
 /// columns are NULL (the LEFT-OUTER / sibling-UNION fill).
-type JtAssign = Vec<(usize, Value)>;
+pub(crate) type JtAssign = Vec<(usize, Value)>;
 
 /// Build a synthetic `JSON_TABLE` output column.
 fn jt_column(name: &str, ty: ScalarType, decimal: Option<DecimalTypmod>) -> Column {
@@ -18332,7 +18339,7 @@ fn srf_table_cols(func_name: &str, alias: Option<&str>, cols: Vec<(&str, Type)>)
 
 /// One join in a SELECT plan: its kind and resolved ON predicate (`None` for CROSS). The right
 /// relation is `rels[k+1]`.
-struct PlanJoin {
+pub(crate) struct PlanJoin {
     kind: JoinKind,
     on: Option<RExpr>,
 }
@@ -18344,7 +18351,7 @@ struct PlanJoin {
 /// independently over the post-`WHERE` rows and its groups projected into the shared synthetic row,
 /// whose first `group_keys.len()` slots are the *master* grouping columns (the ordered union of all
 /// sets' columns).
-struct GroupSetPlan {
+pub(crate) struct GroupSetPlan {
     /// The flat input-row indices this set buckets on (its key, in key order). Empty = one grand-total
     /// group (always emits one row, even over an empty input — the `()` / whole-table case).
     key_cols: Vec<usize>,
@@ -18357,7 +18364,7 @@ struct GroupSetPlan {
     mask: i64,
 }
 
-struct SelectPlan {
+pub(crate) struct SelectPlan {
     rels: Vec<PlanRel>,
     joins: Vec<PlanJoin>,
     filter: Option<RExpr>,
@@ -18475,7 +18482,7 @@ struct SelectPlan {
 /// instead of full-scanning for every outer row (index-nested-loop join, cost.md §3 "JOIN"). The
 /// `Sibling` source is the join analog of `Outer`: the same per-outer-row bound, resolved from the
 /// sibling row rather than an enclosing query's row.
-enum BoundSrc {
+pub(crate) enum BoundSrc {
     Int(i64),
     Bool(bool),
     Uuid([u8; 16]),
@@ -18500,14 +18507,14 @@ enum BoundSrc {
 
 /// One `pk <op> const-source` from a WHERE AND-chain, normalized so the PK is the LEFT side (a
 /// `5 < pk` flips to `pk > 5`).
-struct BoundTerm {
+pub(crate) struct BoundTerm {
     op: CmpOp,
     src: BoundSrc,
 }
 
 /// The plan-time result of PK analysis: the PK's storage type + the bound terms. The concrete key
 /// range is built per execution by `build_key_bound`.
-struct PkBound {
+pub(crate) struct PkBound {
     pk_type: ScalarType,
     terms: Vec<BoundTerm>,
     /// The key column's resolved collation when it is collated AND `Full` (loaded version matches
@@ -18526,7 +18533,7 @@ struct PkBound {
 /// sorted, and each becomes a point probe `[k, k]`. The whole WHERE stays the residual filter (the
 /// union is a superset), so the result is unchanged. `coll` is the PK's key collation (`None` for a
 /// `C` key), as in [`PkBound`].
-struct PkKeySet {
+pub(crate) struct PkKeySet {
     pk_type: ScalarType,
     coll: Option<std::sync::Arc<Collation>>,
     srcs: Vec<BoundSrc>,
@@ -18536,7 +18543,7 @@ struct PkKeySet {
 /// distinct encoded value becomes an index point probe (prefix scan + per-entry row lookup), and
 /// the rows are gathered in ascending value order. `tail_types` is the remaining key components'
 /// types (as in [`IndexBound`]) — the per-entry key-suffix skip.
-struct IndexKeySet {
+pub(crate) struct IndexKeySet {
     name_key: String,
     col_type: ScalarType,
     coll: Option<std::sync::Arc<Collation>>,
@@ -18552,7 +18559,7 @@ struct IndexKeySet {
 /// the ordered-index equality bound wins over GIN (the deterministic precedence, gin.md §6). The
 /// point-set bounds (`PkSet`/`IndexSet`) are a LAST-RESORT access path, chosen only when no
 /// contiguous PK/index/GIN/GiST bound applies, so they never displace an existing plan.
-enum ScanBound {
+pub(crate) enum ScanBound {
     Pk(PkBound),
     Index(IndexBound),
     Gin(GinBound),
@@ -18587,7 +18594,7 @@ impl ScanBound {
 /// strategy, and the column's global scope index. Like [`GinBound`], the constant query operand is
 /// NOT stored (re-found in `plan.filter` at exec time by `gist_match`). No element type is carried:
 /// the gather descends the resident R-tree (gist.md §4.1), whose bounds are already decoded.
-struct GistBound {
+pub(crate) struct GistBound {
     /// The index store's key — the lowercased index name (its resident R-tree lives under this key).
     name_key: String,
     strategy: crate::gist::GistStrategy,
@@ -18604,7 +18611,7 @@ struct GistBound {
 /// `= ANY` (membership — `c = ANY(col)`, the single-term `@>` reduction: one scalar term, mode
 /// ALL → its lone posting list).
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum GinStrategy {
+pub(crate) enum GinStrategy {
     Contains,
     Overlaps,
     /// `c = ANY(col)` — `c` is a constant SCALAR (not an array); its single term is gathered like
@@ -18623,7 +18630,7 @@ enum GinStrategy {
 /// **element** type (for `encode_element` — the term bytes), the operator strategy, and the
 /// column's global scope index. The constant query `Q` is NOT stored (`RExpr` is not `Clone`); it
 /// is re-found in `plan.filter` at exec time by `gin_match` and evaluated there.
-struct GinBound {
+pub(crate) struct GinBound {
     /// The index store's key — the lowercased index name.
     name_key: String,
     /// The array element type, whose key encoding produces each term's bytes.
@@ -18638,7 +18645,7 @@ struct GinBound {
 /// equality const-source bound to it. At exec time the sources must agree on one value (else the
 /// bound is provably empty). A collated column encodes its probe via the UCA sort key
 /// (encoding.md §2.12) to match the index's stored key form (collation.md §8).
-struct IndexEqCol {
+pub(crate) struct IndexEqCol {
     col_type: ScalarType,
     coll: Option<std::sync::Arc<Collation>>,
     srcs: Vec<BoundSrc>,
@@ -18646,7 +18653,7 @@ struct IndexEqCol {
 
 /// The optional trailing range of an index access predicate (indexes.md §5.1): a range on the key
 /// column immediately after the equality prefix. Its column is fixed-width (never collated).
-struct IndexRange {
+pub(crate) struct IndexRange {
     col_type: ScalarType,
     terms: Vec<BoundTerm>,
 }
@@ -18659,7 +18666,7 @@ struct IndexRange {
 /// `suffix_types` are the types of the index columns AFTER the equality prefix (`columns[eq..]`) —
 /// the range column (if any) plus every trailing column — each FIXED-WIDTH so an admitted entry's
 /// row-key suffix is recovered by width-skipping them past P.
-struct IndexBound {
+pub(crate) struct IndexBound {
     /// The index store's key — the lowercased index name.
     name_key: String,
     eq_cols: Vec<IndexEqCol>,
@@ -18668,7 +18675,7 @@ struct IndexBound {
 }
 
 /// The outcome of encoding a const-source into the PK key space.
-enum BoundKey {
+pub(crate) enum BoundKey {
     /// A NULL const — the comparison is 3VL-unknown, so the range is provably empty.
     Null,
     /// An integer value outside the PK type's range — no key can equal it, so drop this half-bound.
@@ -19177,7 +19184,7 @@ fn pk_storage_width(table: &Table) -> Option<usize> {
 
 /// The secondary-index-order plan: walk a B-tree index in key order to satisfy an `ORDER BY` without
 /// a sort, point-looking-up each row by its primary key (cost.md §3 "secondary-index order").
-struct IndexOrder {
+pub(crate) struct IndexOrder {
     /// The index store's key — the lowercased index name.
     name_key: String,
     /// The fixed byte width of the PK suffix to peel off the END of each index entry key
@@ -20016,7 +20023,7 @@ fn encode_array_key(elem_ty: &Type, a: &ArrayVal) -> Result<Vec<u8>> {
 
 /// A built foreign-key probe (spec/design/constraints.md §6.4/§6.8): the bytes to look up in the
 /// parent, tagged with which physical tree to probe.
-enum FkProbe {
+pub(crate) enum FkProbe {
     /// The parent's PK storage key (bare member encodings concatenated, in PK key order).
     Pk(Vec<u8>),
     /// A parent unique index's prefix (0x00-tagged slots, in index-key order) + the lowercased
@@ -20531,7 +20538,7 @@ fn bound_empty(b: &KeyBound) -> bool {
 /// A resolved set operation (spec/design/grammar.md §25): both operands planned with the same
 /// parent scope (so a correlated set-op subquery works), the unified output types, and the
 /// trailing ORDER BY / LIMIT / OFFSET resolved by output column.
-struct SetOpPlan {
+pub(crate) struct SetOpPlan {
     op: SetOpKind,
     all: bool,
     lhs: QueryPlan,
@@ -20560,7 +20567,7 @@ struct SetOpPlan {
 /// block fires on the first `next` even for an empty table (node_count 0 ⇒ a no-op charge), so
 /// the accrued total never moves. `next` returns `Result` so the later lazy walk's leaf-fault
 /// error has a home; the eager form never errors.
-struct ScanSource {
+pub(crate) struct ScanSource {
     rows: std::vec::IntoIter<Row>,
     node_count: i64,
     charged_block: bool,
@@ -20606,7 +20613,7 @@ impl ScanSource {
 // ============================================================================
 
 /// The aggregate-resolution context threaded through `resolve`.
-enum AggCtx {
+pub(crate) enum AggCtx {
     /// Aggregates are not allowed here (a FuncCall is 42803); columns resolve normally.
     Forbidden,
     /// An aggregate query's projection: a FuncCall collects into `specs` and resolves to a
@@ -20674,13 +20681,13 @@ enum AggCtx {
 /// them to `input_width + window_keys.len() + w` (spec/design/window.md §5.1). Far above any real
 /// column/synthetic-slot count, and below 2³¹ so it is valid on a 32-bit `usize` (the wasm32 build)
 /// as well as f64-exact in the TS core's `number`. Kept identical across the three cores.
-const WINDOW_RESULT_BASE: usize = 1 << 28;
+pub(crate) const WINDOW_RESULT_BASE: usize = 1 << 28;
 
 /// The placeholder base a materialized window-key expression (a non-column PARTITION BY / ORDER BY
 /// key — `PARTITION BY a + b`) carries until the rebase pass rewrites it to its real synthetic slot
 /// `input_width + k` (spec/design/window.md §5.1). Disjoint from `WINDOW_RESULT_BASE`'s range, and
 /// below 2³¹ (32-bit-`usize` / wasm32 safe). A bare-column key is NOT materialized — it keeps its real row slot.
-const WINDOW_KEY_BASE: usize = 1 << 29;
+pub(crate) const WINDOW_KEY_BASE: usize = 1 << 29;
 
 /// The placeholder base a `GROUPING(...)` call carries until the rebase pass rewrites it to its real
 /// trailing synthetic slot `group_keys.len() + agg_specs.len() + grouping_index` (the GROUPING
@@ -20688,25 +20695,25 @@ const WINDOW_KEY_BASE: usize = 1 << 29;
 /// spec/design/aggregates.md §12). Disjoint from the window bases, below 2³¹ (32-bit-`usize` / wasm32 safe).
 /// GROUPING is mutually exclusive with window functions, so its placeholders never coexist with the
 /// window ones in a projection.
-const GROUPING_GS_BASE: usize = 1 << 30;
+pub(crate) const GROUPING_GS_BASE: usize = 1 << 30;
 
 /// The placeholder base a materialized `ORDER BY` **expression** key's sort slot carries until it is
 /// rebased to its real trailing slot `final_row_width + k` (the materialized order values are appended
 /// after the input / window / grouped columns — grammar.md §10). Used only in the `SortKey` slot field
 /// (a different namespace from the `RExpr::Column` bases above), but kept disjoint and below 2³¹
 /// (32-bit-`usize` / wasm32 safe) for the same reasons. A column / ordinal key keeps its real slot.
-const ORDER_EXPR_BASE: usize = 1 << 27;
+pub(crate) const ORDER_EXPR_BASE: usize = 1 << 27;
 
 /// The maximum number of grouping sets a `GROUP BY` may expand to (`CUBE` of n columns alone is
 /// 2ⁿ). Beyond this the statement is aborted `54001` (statement_too_complex) — jed's structural-
 /// complexity gate (a deliberate divergence from PostgreSQL's per-construct "CUBE is limited to 12
 /// elements" / 54011; jed bounds the total expansion instead). spec/design/aggregates.md §12.
-const MAX_GROUPING_SETS: usize = 4096;
+pub(crate) const MAX_GROUPING_SETS: usize = 4096;
 
 /// One resolved window function (spec/design/window.md §5.1): its plan, the resolved PARTITION BY
 /// key column slots (flat input-row indices), and the resolved within-partition ORDER BY (sort
 /// keys over the input row, PK tie-break applied by the stable sort over the PK-ordered scan).
-struct WindowSpec {
+pub(crate) struct WindowSpec {
     plan: WindowPlan,
     partition: Vec<usize>,
     order: Vec<crate::spill::SortKey>,
@@ -20726,7 +20733,7 @@ struct WindowSpec {
 
 /// A resolved window frame (spec/design/window.md §6). `ROWS` physical offsets, `GROUPS` peer-group
 /// offsets (both integer counts), and `RANGE` value offsets over the single ordering key.
-struct ResolvedFrame {
+pub(crate) struct ResolvedFrame {
     mode: crate::ast::FrameMode,
     start: ResolvedBound,
     end: ResolvedBound,
@@ -20737,7 +20744,7 @@ struct ResolvedFrame {
 /// A resolved frame boundary. `Preceding`/`Following` carry the offset as a value: `Value::Int(n)`
 /// (the row/group count) for `ROWS`/`GROUPS`, and the numeric `Value` (`Int` over an integer key,
 /// `Decimal` over a decimal key) added to / subtracted from the ordering key for `RANGE`.
-enum ResolvedBound {
+pub(crate) enum ResolvedBound {
     UnboundedPreceding,
     Preceding(Value),
     CurrentRow,
@@ -20748,7 +20755,7 @@ enum ResolvedBound {
 /// The runtime plan for one window function (spec/design/window.md §4). S0: `row_number` only;
 /// ranking / offset / aggregate-window / frame plans land in S1–S4.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum WindowPlan {
+pub(crate) enum WindowPlan {
     /// `ROW_NUMBER()` — the 1-based sequence position within the partition (frame-insensitive).
     RowNumber,
     /// `RANK()` — 1 + the number of rows in earlier peer groups (ties share a rank, then a gap).
@@ -20782,7 +20789,7 @@ enum WindowPlan {
 /// The runtime plan for one aggregate, fixed at resolve from the function + operand type
 /// (the PG widening — spec/design/aggregates.md §3).
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum AggPlan {
+pub(crate) enum AggPlan {
     /// COUNT(*) — count every row (NULLs included).
     CountStar,
     /// COUNT(expr) — count non-NULL inputs.
@@ -20847,7 +20854,7 @@ enum AggPlan {
 /// references grouping columns by their synthetic key slots (a non-grouped column is `42803`,
 /// matching PG's *"direct arguments … must use only grouped columns"*) and is evaluated **per group**
 /// at finalize against the synthetic row. `None` for `mode` (no direct argument).
-struct OsaParams {
+pub(crate) struct OsaParams {
     desc: bool,
     frac: Option<RExpr>,
     /// The `WITHIN GROUP` key's collation — `Some` for an explicit `COLLATE` or a column's frozen
@@ -20864,7 +20871,7 @@ struct OsaParams {
 /// for which it is TRUE are folded (so the filter applies before the DISTINCT dedup). Both are
 /// only set in the aggregation stage; a window aggregate is never DISTINCT or FILTERed (0A000,
 /// rejected at resolve).
-struct AggSpec {
+pub(crate) struct AggSpec {
     plan: AggPlan,
     operand: Option<RExpr>,
     distinct: bool,
@@ -20881,7 +20888,7 @@ struct AggSpec {
 
 /// A single `WITHIN GROUP` ordering-key sort spec (aggregates.md §13/§19): direction, NULL
 /// placement, and optional collation (text keys only).
-struct KeySort {
+pub(crate) struct KeySort {
     desc: bool,
     nulls_first: bool,
     collation: Option<std::sync::Arc<Collation>>,
@@ -20892,7 +20899,7 @@ struct KeySort {
 /// they may reference grouping columns); `keys` are the `WITHIN GROUP` key operands (evaluated **per
 /// row** during the fold and buffered as a tuple); `sorts` is the per-key ordering spec. The three
 /// vectors have equal length (the arity check at resolve).
-struct HypoParams {
+pub(crate) struct HypoParams {
     args: Vec<RExpr>,
     keys: Vec<RExpr>,
     sorts: Vec<KeySort>,
@@ -20902,7 +20909,7 @@ struct HypoParams {
 /// `Clone` so the window stage can snapshot a running accumulator at each peer-group boundary
 /// (a running aggregate window's default frame — spec/design/window.md §6) without consuming it.
 #[derive(Clone)]
-enum Acc {
+pub(crate) enum Acc {
     CountStar(i64),
     Count(i64),
     SumInt {
@@ -22498,7 +22505,7 @@ fn check_referenced_columns(e: &Expr, columns: &[Column]) -> Vec<usize> {
 /// enclosing rows (innermost LAST) a correlated reference reads. `outer` is empty at the top
 /// level; a correlated subquery pushes the current row before running its inner plan, so an
 /// `OuterColumn { level, index }` reads `outer[outer.len() - level][index]`.
-struct EvalEnv<'a> {
+pub(crate) struct EvalEnv<'a> {
     exec: &'a Engine,
     params: &'a [Value],
     outer: &'a [&'a [Value]],
@@ -22656,7 +22663,7 @@ fn operand_col(spec: &AggSpec) -> Option<usize> {
 /// (a `Vec<Row>` of full rows) and the columnar path (dense per-column lanes + an optional A3 selection
 /// vector). `at(j, col)` reads survivor `j`'s value in column `col`, so the fold kernels below are
 /// written once and run either way. Cost is unaffected: both feed the same values in scan order.
-enum LaneSrc<'a> {
+pub(crate) enum LaneSrc<'a> {
     /// The row path: survivors are full rows; `at(j, col)` is `rows[j][col]`.
     Rows(&'a [Row]),
     /// The columnar path: `cols[col]` is a dense lane; `sel` (A3) maps survivor `j` to lane index
@@ -22812,7 +22819,7 @@ pub(crate) struct CachedPlan {
 /// project for ONE output row, accruing the identical cost units at the identical sites as the eager
 /// path — so a fully-drained streaming query observes the same rows + total cost (streaming.md §6),
 /// while a caller that stops early reads (and charges) less.
-struct StreamingScan {
+pub(crate) struct StreamingScan {
     engine: Engine,
     /// The resolved plan, shared (`Rc`) so a prepared statement's plan cache and this cursor hold the
     /// same allocation — a cache hit rebinds params + rebuilds the cursor but re-plans nothing
@@ -22937,7 +22944,7 @@ impl crate::cursor::RowStream for StreamingScan {
 /// out (already projected). So peak *output* memory is one row, a caller's early exit skips the
 /// projection of the rows it never pulls, and a fully-drained query observes the same rows + total cost
 /// as the eager path (streaming.md §6).
-struct BufferedScan {
+pub(crate) struct BufferedScan {
     engine: Engine,
     /// The resolved plan, shared (`Rc`) with a prepared statement's plan cache (see [`StreamingScan`]).
     plan: std::rc::Rc<SelectPlan>,
@@ -22948,7 +22955,7 @@ struct BufferedScan {
 }
 
 /// The lazy emission state of a [`BufferedScan`] (spec/design/streaming.md §4).
-enum BufState {
+pub(crate) enum BufState {
     /// The blocking part has not run yet — the first `next_row` runs it (streaming.md §4).
     Pending,
     /// The general blocking buffer, windowed to `[idx, end)`. Each emission charges `row_produced`;
@@ -23144,7 +23151,7 @@ impl crate::cursor::RowStream for BufferedScan {
 /// cursor's only job is to run the whole query on the FIRST pull and yield the result one row at a
 /// time. Owned by a [`DeferredResult`]; run via the eager `run_set_op` / `run_with` verbatim so the
 /// rows + cost match `execute()` exactly (§6).
-enum DeferredQuery {
+pub(crate) enum DeferredQuery {
     SetOp(SetOp),
     With(WithQuery),
 }
@@ -23159,7 +23166,7 @@ enum DeferredQuery {
 /// lazy-yield: the work is deferred to the first pull and the result rows are handed out incrementally
 /// rather than wrapped in an eager `Outcome`. Under full drain the rows + total cost are byte-identical
 /// to the eager path (it drives the SAME `run_*`, §6).
-struct DeferredResult {
+pub(crate) struct DeferredResult {
     engine: Engine,
     /// The query to run, taken on the first pull (`None` afterwards).
     query: Option<DeferredQuery>,
@@ -23170,7 +23177,7 @@ struct DeferredResult {
 }
 
 /// The lazy emission state of a [`DeferredResult`] (spec/design/streaming.md §7).
-enum DeferredState {
+pub(crate) enum DeferredState {
     /// The query has not run yet — the first `next_row` runs it (streaming.md §7).
     Pending,
     /// The materialized result, walked one row at a time.
@@ -23662,7 +23669,7 @@ fn expand_group_by(items: &[GroupItem]) -> Result<Vec<Vec<&Expr>>> {
 
 /// The resolution of one `GROUP BY` grouping term (aggregates.md §15): either an input COLUMN at a
 /// flat row index, or a general EXPRESSION to materialize (its resolved node + type + canonical AST).
-enum GroupKeyResolved {
+pub(crate) enum GroupKeyResolved {
     Column(usize),
     Expr(RExpr, ResolvedType, Expr),
 }
@@ -27315,7 +27322,7 @@ fn resolve_boolean_filter(scope: &Scope, e: &Expr, params: &mut ParamTypes) -> R
 /// parameter referenced before any context fixed its type. Shared across every clause of a
 /// statement (so a `$1` used in both WHERE and the select list unifies), then `finalize`d.
 #[derive(Default)]
-struct ParamTypes {
+pub(crate) struct ParamTypes {
     types: Vec<Option<ScalarType>>,
     /// Set during resolution when a node is created that makes the resolved plan un-reusable across
     /// executions: an `RExpr::Subquery` (the uncorrelated-subquery fold rewrites it to a constant
@@ -27440,7 +27447,7 @@ fn reject_params_for_ddl(params: &[Value]) -> Result<()> {
 
 /// Accumulates the rendered plan rows.
 #[derive(Default)]
-struct ExplainRender {
+pub(crate) struct ExplainRender {
     rows: Vec<Vec<Value>>,
 }
 
@@ -28609,7 +28616,7 @@ fn expr_calls_seq_mutator(e: &Expr) -> bool {
 /// DDL (gated by `allow_ddl`). Collected by an exhaustive AST walk (the `Expr` arm is compiler-
 /// enforced exhaustive, mirroring [`expr_calls_seq_mutator`]).
 #[derive(Default)]
-struct PrivReq {
+pub(crate) struct PrivReq {
     /// `(table name, required privilege)` in source-walk order; deduplication is unnecessary (the
     /// check is idempotent and a fully-permissive session never reaches the walk).
     tables: Vec<(String, Privilege)>,
@@ -30712,7 +30719,7 @@ fn resolve_collation_name(
 /// `Indeterminate` ⇒ two different implicit collations met with no explicit override — an error only
 /// when the collation is consumed (42P22, at `resolve_deriv`).
 #[derive(Clone, PartialEq, Eq)]
-enum Deriv {
+pub(crate) enum Deriv {
     None,
     Implicit(String),
     Explicit(String),
@@ -32886,7 +32893,7 @@ fn build_nested_array(subs: Vec<Value>) -> Result<Value> {
 
 /// An evaluated slice bound: omitted (defer to the array's own bound), a NULL bound, or an integer.
 #[derive(Clone, Copy)]
-enum Bound {
+pub(crate) enum Bound {
     Omitted,
     Null,
     Val(i64),
@@ -33956,7 +33963,7 @@ fn missing_from_entry(qualifier: &str) -> EngineError {
 /// call site, not here.
 /// The maximum `varchar(n)` length — PostgreSQL's `varchar` ceiling (spec/design/types.md §15).
 /// Stored on disk as a `u32`, so it fits comfortably.
-const MAX_VARCHAR_LEN: u32 = 10485760;
+pub(crate) const MAX_VARCHAR_LEN: u32 = 10485760;
 
 /// Resolve a scalar type name + optional type modifier, returning the type, the decimal typmod
 /// (when the type is `decimal`), and the `varchar(n)` max length (when the type is `text` —
@@ -34543,7 +34550,7 @@ fn parse_bool_literal(s: &str) -> Result<bool> {
 }
 
 /// A resolved `ON CONFLICT` clause (spec/design/upsert.md), built by `resolve_on_conflict`.
-struct ConflictPlan {
+pub(crate) struct ConflictPlan {
     /// The arbiter constraint whose violation triggers the action. `None` only with
     /// `DoNothing` (any uniqueness conflict is then skipped).
     arbiter: Option<Arbiter>,
@@ -34551,7 +34558,7 @@ struct ConflictPlan {
 }
 
 /// Which uniqueness constraint an `ON CONFLICT` arbitrates (spec/design/upsert.md §2).
-enum Arbiter {
+pub(crate) enum Arbiter {
     /// The primary key — the arbiter key is the storage key.
     PrimaryKey,
     /// A unique index, by position in the table's `indexes` list.
@@ -34559,7 +34566,7 @@ enum Arbiter {
 }
 
 /// The resolved `ON CONFLICT` action (spec/design/upsert.md §5).
-enum ConflictActionPlan {
+pub(crate) enum ConflictActionPlan {
     DoNothing,
     DoUpdate {
         assignments: Vec<AssignPlan>,
@@ -34649,7 +34656,7 @@ fn arbiter_key(
 /// A resolved UPDATE assignment: which column to write, the target type/nullability so
 /// the new value is re-checked exactly like INSERT, and the resolved RHS expression
 /// (evaluated against the *old* row).
-struct AssignPlan {
+pub(crate) struct AssignPlan {
     idx: usize,
     name: String,
     target: ScalarType,
@@ -38863,7 +38870,7 @@ fn to_decimal(v: Value) -> Decimal {
 /// The character-count cap for the result-amplifying string functions (lpad / rpad / repeat):
 /// PostgreSQL's `MaxAllocSize` (0x3FFFFFFF). A requested length above it traps `54000`
 /// (program_limit_exceeded), bounding the allocation an untrusted query can request (CLAUDE.md §13).
-const MAX_RESULT_CHARS: i64 = 0x3FFF_FFFF;
+pub(crate) const MAX_RESULT_CHARS: i64 = 0x3FFF_FFFF;
 
 /// The i64 of an integer Value (every int width is stored as `Value::Int`). For the string
 /// functions' integer arguments (start / count / pad length / field number).
@@ -39029,7 +39036,7 @@ fn chr_text(n: i64) -> Result<String> {
 }
 
 /// The standard RFC 4648 base64 alphabet (string-functions.md §3, shared by encode/decode).
-const BASE64_ALPHABET: &[u8; 64] =
+pub(crate) const BASE64_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// `encode(bytes, format)` (string-functions.md §3): render binary as text. `hex` = two lowercase
@@ -39374,7 +39381,7 @@ fn decimal_cmp_work(a: &Value, b: &Value) -> u64 {
 /// `cost` is non-default (functions.md §8). Empty while every built-in uses the uniform
 /// `operator_eval`; authoring a `cost` in catalog.toml populates it (a pure data change, no code).
 /// The `cost == 0` sentinel means "use operator_eval". Built once from the generated table.
-static OP_COST_OVERRIDES: LazyLock<HashMap<&'static str, i64>> = LazyLock::new(|| {
+pub(crate) static OP_COST_OVERRIDES: LazyLock<HashMap<&'static str, i64>> = LazyLock::new(|| {
     OPERATORS
         .iter()
         .filter(|o| o.cost != 0)
@@ -39420,1525 +39427,4 @@ fn eval_decimal_arith(op: ArithOp, a: Decimal, b: Decimal) -> Result<Value> {
         ArithOp::Mod => a.rem(&b)?,
     };
     Ok(Value::Decimal(r))
-}
-
-/// Sort `rows` by the ORDER BY `order` keys (spec/design/grammar.md §10). The all-`C` fast path is a
-/// stable `sort_by` over the value comparator; if ANY key carries a collation, the collation-aware
-/// `sort_rows_collated` decorate-sorter runs instead (it can fail — an unmapped code point is 0A000).
-fn sort_rows(rows: &mut Vec<Row>, order: &[crate::spill::SortKey]) -> Result<()> {
-    if order.iter().any(|(_, _, _, c)| c.is_some()) {
-        return sort_rows_collated(rows, order);
-    }
-    rows.sort_by(|a, b| cmp_rows_by_order(a, b, order));
-    Ok(())
-}
-
-/// Materialize the general-expression ORDER BY keys before the sort (spec/design/grammar.md §10): for
-/// each row evaluate every `order_exprs[k]` and append the value, so its sort slot `final_width + k`
-/// reads the appended column and the slot-based comparator stays unchanged — the exact mechanism a
-/// non-column window key uses (window.md §5.1, `apply_window_stage`). Runs over every pre-sort row
-/// (before `LIMIT`, since the sort needs them all); the per-row evaluation is metered like a
-/// projection (an `operator_eval` per node, charged inside `eval`). A no-op — and zero added cost —
-/// when `order_exprs` is empty (a column/ordinal-only ORDER BY, byte-identical to before).
-fn materialize_order_exprs(
-    rows: &mut [Row],
-    order_exprs: &[RExpr],
-    env: &EvalEnv,
-    meter: &mut Meter,
-) -> Result<()> {
-    if order_exprs.is_empty() {
-        return Ok(());
-    }
-    for row in rows.iter_mut() {
-        let mut vals = Vec::with_capacity(order_exprs.len());
-        for oe in order_exprs {
-            vals.push(oe.eval(row, env, meter)?);
-        }
-        row.extend(vals);
-    }
-    Ok(())
-}
-
-/// The WINDOW stage (spec/design/window.md §5.2): for each window function, partition the rows,
-/// sort each partition by the window ORDER BY (stable → PK tie-break, as `rows` arrives in PK scan
-/// order), compute the per-row result, and APPEND it to every row (so window result `i` lands at
-/// flat slot `input_width + i`, where the projection reads it). The partition + sort are unmetered
-/// (like ORDER BY / GROUP BY); each computed result charges `window_result` and guards the ceiling.
-/// S0: `row_number()` only; partitions bucket value-canonically via an insertion-ordered list, so
-/// no hash-map iteration order leaks (CLAUDE.md §8/§10).
-///
-/// The frame-sensitive plans (aggregate windows, first/last/nth_value) use a `FrameCtx`, which
-/// precomputes the partition's peer-group structure once and maps each row to its `[lo, hi)` frame.
-/// spec/design/window.md §6.
-
-/// The integer count of a `ROWS`/`GROUPS` offset bound (widened to `i128` so the index arithmetic
-/// cannot overflow). The offset is `Value::Int` by construction (resolve_int_bound).
-fn offset_count(v: &Value) -> i128 {
-    match v {
-        Value::Int(k) => *k as i128,
-        _ => unreachable!("ROWS/GROUPS offset is an integer count"),
-    }
-}
-
-/// The sign of `v − (cur ∓ off)` for a `RANGE` value offset (window.md §6), computed in a wide
-/// enough type to avoid overflow: integer keys compute the bound in `i128`; decimal keys use exact
-/// decimal arithmetic; **float** keys widen to `f64` and compute the bound with the in-contract
-/// correctly-rounded `+`/`-` kernel (float.md §5 — bit-identical cross-core), then compare with the
-/// PG float total order (`total_cmp_f64`). The total order reproduces PG's `in_range` NaN handling
-/// for free: a NaN current key makes the bound NaN (NaN ∓ finite = NaN), so a NaN row equals it and
-/// any non-NaN row is below it, while a NaN row against a non-NaN bound sorts above — exactly PG's
-/// "NaN sorts after non-NaN" rule. The offset is always finite (an int offset, or a decimal one that
-/// would otherwise overflow already trapped at resolve), so `cur ∓ off` never produces NaN itself.
-/// `subtract` chooses `cur − off` vs `cur + off`.
-fn range_v_vs_bound(
-    v: &Value,
-    cur: &Value,
-    off: &Value,
-    subtract: bool,
-) -> Result<std::cmp::Ordering> {
-    match (cur, off) {
-        (Value::Int(c), Value::Int(o)) => {
-            let b = if subtract {
-                *c as i128 - *o as i128
-            } else {
-                *c as i128 + *o as i128
-            };
-            let x = match v {
-                Value::Int(x) => *x as i128,
-                _ => unreachable!("RANGE integer-key value is Int"),
-            };
-            Ok(x.cmp(&b))
-        }
-        (Value::Decimal(c), Value::Decimal(o)) => {
-            let b = if subtract { c.sub(o)? } else { c.add(o)? };
-            Ok(value_cmp(v, &Value::Decimal(b)))
-        }
-        // Float key: widen to f64 (PG computes `in_range_float*_float8`'s sum in float8 even for an
-        // f32 key) and compare in the float total order.
-        (Value::Float32(_) | Value::Float64(_), Value::Float64(o)) => {
-            let c = match cur {
-                Value::Float32(c) => *c as f64,
-                Value::Float64(c) => *c,
-                _ => unreachable!(),
-            };
-            let x = match v {
-                Value::Float32(x) => *x as f64,
-                Value::Float64(x) => *x,
-                _ => unreachable!("RANGE float-key value is a float"),
-            };
-            let b = if subtract { c - *o } else { c + *o };
-            Ok(crate::value::total_cmp_f64(x, b))
-        }
-        _ => unreachable!("RANGE offset resolved to a matching numeric type"),
-    }
-}
-
-/// One partition's peer-group structure (window.md §3/§6), shared across every row's frame lookup.
-/// Peers are rows equal on the window ORDER BY keys; `peer_start`/`peer_end` bracket each row's peer
-/// group, `group_of` is its peer-group ordinal, and `group_spans` lists every group's `[start, end)`.
-struct FrameCtx<'a> {
-    ordered: &'a [usize],
-    rows: &'a [Row],
-    order: &'a [crate::spill::SortKey],
-    np: usize,
-    peer_start: Vec<usize>,
-    peer_end: Vec<usize>,
-    group_of: Vec<usize>,
-    group_spans: Vec<(usize, usize)>,
-}
-
-impl<'a> FrameCtx<'a> {
-    fn new(
-        ordered: &'a [usize],
-        rows: &'a [Row],
-        order: &'a [crate::spill::SortKey],
-        coll_keys: &'a [Vec<Option<Vec<u8>>>],
-    ) -> Self {
-        let np = ordered.len();
-        let mut group_spans: Vec<(usize, usize)> = Vec::new();
-        let mut s = 0usize;
-        for pos in 1..np {
-            if cmp_window_rows(ordered[pos], ordered[s], rows, order, coll_keys)
-                != std::cmp::Ordering::Equal
-            {
-                group_spans.push((s, pos));
-                s = pos;
-            }
-        }
-        if np > 0 {
-            group_spans.push((s, np));
-        }
-        let mut peer_start = vec![0usize; np];
-        let mut peer_end = vec![0usize; np];
-        let mut group_of = vec![0usize; np];
-        for (gi, &(a, b)) in group_spans.iter().enumerate() {
-            for p in a..b {
-                peer_start[p] = a;
-                peer_end[p] = b;
-                group_of[p] = gi;
-            }
-        }
-        FrameCtx {
-            ordered,
-            rows,
-            order,
-            np,
-            peer_start,
-            peer_end,
-            group_of,
-            group_spans,
-        }
-    }
-
-    /// The `[lo, hi)` frame for the row at sorted position `pos` (window.md §6). `None` ⇒ the
-    /// default frame (RANGE UNBOUNDED PRECEDING TO CURRENT ROW = `[0, peer_end)`).
-    fn bounds(&self, pos: usize, frame: &Option<ResolvedFrame>) -> Result<(usize, usize)> {
-        use crate::ast::FrameMode;
-        match frame {
-            None => Ok((0, self.peer_end[pos])),
-            Some(f) => match f.mode {
-                FrameMode::Rows => Ok(self.rows_bounds(pos, f)),
-                FrameMode::Groups => Ok(self.groups_bounds(pos, f)),
-                FrameMode::Range => self.range_bounds(pos, f),
-            },
-        }
-    }
-
-    /// Whether sorted position `k` is dropped from the current row `pos`'s frame by `EXCLUDE`
-    /// (window.md §6): `CURRENT ROW` drops the row itself, `GROUP` its whole peer group, `TIES` the
-    /// peers but not the row, `NO OTHERS` nothing. Exclusion removes only rows already in `[lo, hi)`.
-    fn is_excluded(&self, pos: usize, k: usize, exclude: crate::ast::FrameExclusion) -> bool {
-        use crate::ast::FrameExclusion;
-        match exclude {
-            FrameExclusion::NoOthers => false,
-            FrameExclusion::CurrentRow => k == pos,
-            FrameExclusion::Group => self.peer_start[pos] <= k && k < self.peer_end[pos],
-            FrameExclusion::Ties => k != pos && self.peer_start[pos] <= k && k < self.peer_end[pos],
-        }
-    }
-
-    /// ROWS: physical row offsets in the partition sequence; bounds clamp to `[0, np]`.
-    fn rows_bounds(&self, pos: usize, f: &ResolvedFrame) -> (usize, usize) {
-        let p = pos as i128;
-        let n = self.np as i128;
-        let lo = match &f.start {
-            ResolvedBound::UnboundedPreceding => 0,
-            ResolvedBound::Preceding(k) => p - offset_count(k),
-            ResolvedBound::CurrentRow => p,
-            ResolvedBound::Following(k) => p + offset_count(k),
-            ResolvedBound::UnboundedFollowing => n,
-        };
-        let hi = match &f.end {
-            ResolvedBound::UnboundedPreceding => 0,
-            ResolvedBound::Preceding(k) => p - offset_count(k) + 1,
-            ResolvedBound::CurrentRow => p + 1,
-            ResolvedBound::Following(k) => p + offset_count(k) + 1,
-            ResolvedBound::UnboundedFollowing => n,
-        };
-        let lo = lo.clamp(0, n) as usize;
-        let hi = hi.clamp(0, n) as usize;
-        (lo, hi.max(lo))
-    }
-
-    /// GROUPS: peer-group offsets — a bound `g PRECEDING`/`FOLLOWING` lands on the `cg ∓ g`-th peer
-    /// group's start (a start bound) or end (an end bound); a group index below 0 clamps to the
-    /// partition start, at or above the group count to the partition end.
-    fn groups_bounds(&self, pos: usize, f: &ResolvedFrame) -> (usize, usize) {
-        let cg = self.group_of[pos] as i128;
-        let g = self.group_spans.len() as i128;
-        let np = self.np;
-        let start_at = |j: i128| -> usize {
-            if j < 0 {
-                0
-            } else if j >= g {
-                np
-            } else {
-                self.group_spans[j as usize].0
-            }
-        };
-        let end_at = |j: i128| -> usize {
-            if j < 0 {
-                0
-            } else if j >= g {
-                np
-            } else {
-                self.group_spans[j as usize].1
-            }
-        };
-        let lo = match &f.start {
-            ResolvedBound::UnboundedPreceding => 0,
-            ResolvedBound::Preceding(k) => start_at(cg - offset_count(k)),
-            ResolvedBound::CurrentRow => start_at(cg),
-            ResolvedBound::Following(k) => start_at(cg + offset_count(k)),
-            ResolvedBound::UnboundedFollowing => np,
-        };
-        let hi = match &f.end {
-            ResolvedBound::UnboundedPreceding => 0,
-            ResolvedBound::Preceding(k) => end_at(cg - offset_count(k)),
-            ResolvedBound::CurrentRow => end_at(cg),
-            ResolvedBound::Following(k) => end_at(cg + offset_count(k)),
-            ResolvedBound::UnboundedFollowing => np,
-        };
-        (lo, hi.max(lo))
-    }
-
-    /// RANGE: logical offsets on the single ordering-key value (window.md §6). A bound with no
-    /// offset (UNBOUNDED / CURRENT ROW) is peer/edge based and needs no key arithmetic. With a
-    /// value offset, the frame spans the rows whose key is within the offset of the current key;
-    /// a NULL current key has only its NULL peers (offset bounds collapse to the peer group, the
-    /// PG rule), while UNBOUNDED bounds still reach the partition edge.
-    fn range_bounds(&self, pos: usize, f: &ResolvedFrame) -> Result<(usize, usize)> {
-        let np = self.np;
-        let start_off = matches!(
-            f.start,
-            ResolvedBound::Preceding(_) | ResolvedBound::Following(_)
-        );
-        let end_off = matches!(
-            f.end,
-            ResolvedBound::Preceding(_) | ResolvedBound::Following(_)
-        );
-        if !start_off && !end_off {
-            // Only UNBOUNDED / CURRENT ROW — peer/edge based (any number of ORDER BY keys).
-            let lo = match &f.start {
-                ResolvedBound::UnboundedPreceding => 0,
-                _ => self.peer_start[pos], // CurrentRow
-            };
-            let hi = match &f.end {
-                ResolvedBound::UnboundedFollowing => np,
-                _ => self.peer_end[pos], // CurrentRow
-            };
-            return Ok((lo, hi.max(lo)));
-        }
-        // Offset present ⇒ exactly one ORDER BY key (validated at resolve).
-        let (col, desc, _, _) = self.order[0];
-        let cur = &self.rows[self.ordered[pos]][col];
-        if matches!(cur, Value::Null) {
-            let lo = match &f.start {
-                ResolvedBound::UnboundedPreceding => 0,
-                _ => self.peer_start[pos],
-            };
-            let hi = match &f.end {
-                ResolvedBound::UnboundedFollowing => np,
-                _ => self.peer_end[pos],
-            };
-            return Ok((lo, hi.max(lo)));
-        }
-        let lo = match &f.start {
-            ResolvedBound::UnboundedPreceding => 0,
-            ResolvedBound::CurrentRow => self.peer_start[pos],
-            ResolvedBound::Preceding(off) => self.range_start(col, cur, off, true, desc)?,
-            ResolvedBound::Following(off) => self.range_start(col, cur, off, false, desc)?,
-            ResolvedBound::UnboundedFollowing => np,
-        };
-        let hi = match &f.end {
-            ResolvedBound::UnboundedFollowing => np,
-            ResolvedBound::CurrentRow => self.peer_end[pos],
-            ResolvedBound::Preceding(off) => self.range_end(col, cur, off, true, desc, lo)?,
-            ResolvedBound::Following(off) => self.range_end(col, cur, off, false, desc, lo)?,
-            ResolvedBound::UnboundedPreceding => 0,
-        };
-        Ok((lo, hi.max(lo)))
-    }
-
-    /// The first sorted position whose key satisfies a RANGE start bound (NULL keys never qualify
-    /// for a non-NULL current row). `subtract = is_preceding XOR descending` chooses the bound side.
-    fn range_start(
-        &self,
-        col: usize,
-        cur: &Value,
-        off: &Value,
-        is_preceding: bool,
-        desc: bool,
-    ) -> Result<usize> {
-        let subtract = is_preceding != desc;
-        for i in 0..self.np {
-            let v = &self.rows[self.ordered[i]][col];
-            if matches!(v, Value::Null) {
-                continue;
-            }
-            let ord = range_v_vs_bound(v, cur, off, subtract)?;
-            // ascending frame: v ≥ bound; descending frame: v ≤ bound.
-            let include = if desc {
-                ord != std::cmp::Ordering::Greater
-            } else {
-                ord != std::cmp::Ordering::Less
-            };
-            if include {
-                return Ok(i);
-            }
-        }
-        Ok(self.np)
-    }
-
-    /// The exclusive end of a RANGE end bound, scanning forward from `lo` while the key stays in
-    /// frame (the in-frame keys form a contiguous run over the sorted partition).
-    fn range_end(
-        &self,
-        col: usize,
-        cur: &Value,
-        off: &Value,
-        is_preceding: bool,
-        desc: bool,
-        lo: usize,
-    ) -> Result<usize> {
-        let subtract = is_preceding != desc;
-        let mut hi = lo;
-        for i in lo..self.np {
-            let v = &self.rows[self.ordered[i]][col];
-            if matches!(v, Value::Null) {
-                break;
-            }
-            let ord = range_v_vs_bound(v, cur, off, subtract)?;
-            // ascending frame: v ≤ bound; descending frame: v ≥ bound.
-            let include = if desc {
-                ord != std::cmp::Ordering::Less
-            } else {
-                ord != std::cmp::Ordering::Greater
-            };
-            if include {
-                hi = i + 1;
-            } else {
-                break;
-            }
-        }
-        Ok(hi)
-    }
-}
-
-/// Group window specs that share an identical PARTITION BY + ORDER BY (column slots + direction /
-/// NULLS / collation), returning the spec indices per group. One partition + per-partition sort
-/// then serves every spec in a group (window.md §5.2 — the shared partition/sort pass). Grouping is
-/// stable and the per-spec slot mapping is preserved (each spec still writes its result column in
-/// spec order), so the optimization is purely a wall-clock win — the cost is unchanged (§8).
-fn group_window_specs(specs: &[WindowSpec]) -> Vec<Vec<usize>> {
-    let mut groups: Vec<Vec<usize>> = Vec::new();
-    'spec: for (i, spec) in specs.iter().enumerate() {
-        for g in groups.iter_mut() {
-            let rep = &specs[g[0]];
-            if rep.partition == spec.partition && rep.order == spec.order {
-                g.push(i);
-                continue 'spec;
-            }
-        }
-        groups.push(vec![i]);
-    }
-    groups
-}
-
-/// Precompute each row's collated UCA sort-key bytes for `order`'s collated slots (window.md §3/§5),
-/// indexed in parallel with `rows`, so the partition sort AND peer determination (ranking, frame
-/// peer groups) honor the collation identically. Built once per group (the decorate pattern); an
-/// unmapped code point fails 0A000 at this deterministic per-row point. Empty when no key is
-/// collated, and the comparator stays on raw bytes.
-fn window_coll_keys(
-    rows: &[Row],
-    order: &[crate::spill::SortKey],
-) -> Result<Vec<Vec<Option<Vec<u8>>>>> {
-    if !order.iter().any(|(_, _, _, c)| c.is_some()) {
-        return Ok(Vec::new());
-    }
-    let mut all = Vec::with_capacity(rows.len());
-    for row in rows.iter() {
-        let mut keys = Vec::new();
-        for (idx, _, _, coll) in order {
-            if let Some(c) = coll {
-                keys.push(match &row[*idx] {
-                    Value::Text(s) => Some(collation::sort_key(c, s)?),
-                    _ => None, // NULL (a collated slot is text) — handled by NULL placement
-                });
-            }
-        }
-        all.push(keys);
-    }
-    Ok(all)
-}
-
-fn apply_window_stage(
-    rows: &mut [Row],
-    specs: &[WindowSpec],
-    window_keys: &[RExpr],
-    env: &EvalEnv,
-    meter: &mut Meter,
-) -> Result<()> {
-    let n = rows.len();
-    if n == 0 {
-        return Ok(());
-    }
-    // Materialize the non-column PARTITION BY / ORDER BY key expressions (window.md §5.1): evaluate
-    // each against the row and append it, so a materialized key's slot `input_width + k` reads the
-    // appended column and the partition / sort / frame machinery below (all slot-based) is unchanged.
-    // The window results are appended AFTER these, so a result slot is `input_width + window_keys.len()
-    // + w` (the rebased projection slot). Empty for a column-only window — no appended columns, the
-    // result slot stays `input_width + w`, byte-identical to before. The key evaluation is metered
-    // like any expression (operator_eval per node): new, deterministic, cross-core-identical work that
-    // exists only for an expression key (a bare-column key is not in `window_keys`).
-    if !window_keys.is_empty() {
-        for row in rows.iter_mut() {
-            let mut kv = Vec::with_capacity(window_keys.len());
-            for ke in window_keys {
-                kv.push(ke.eval(row, env, meter)?);
-            }
-            row.extend(kv);
-        }
-    }
-    // The shared partition/sort pass (window.md §5.2): specs that share an identical PARTITION BY +
-    // ORDER BY are partitioned and sorted ONCE (the expensive step), then each computes its own
-    // results over the shared sorted partitions. The partition + sort are unmetered (§8), so this is
-    // purely a wall-clock win — the per-spec result/frame metering, and thus the cost, are unchanged.
-    let groups = group_window_specs(specs);
-    let mut spec_group = vec![0usize; specs.len()];
-    let mut group_cache: Vec<(Vec<Vec<usize>>, Vec<Vec<Option<Vec<u8>>>>)> =
-        Vec::with_capacity(groups.len());
-    for (gi, group) in groups.iter().enumerate() {
-        let rep = &specs[group[0]];
-        for &si in group {
-            spec_group[si] = gi;
-        }
-        // Partition the row indices by the partition-key values. The map is an index only (never
-        // iterated); output comes from the insertion-ordered `partitions` (no hash-order leak).
-        let mut index: HashMap<Vec<Value>, usize> = HashMap::new();
-        let mut partitions: Vec<Vec<usize>> = Vec::new();
-        for (i, row) in rows.iter().enumerate() {
-            let key: Vec<Value> = rep.partition.iter().map(|&p| row[p].clone()).collect();
-            let pi = match index.get(&key) {
-                Some(&p) => p,
-                None => {
-                    let p = partitions.len();
-                    index.insert(key, p);
-                    partitions.push(Vec::new());
-                    p
-                }
-            };
-            partitions[pi].push(i);
-        }
-        // Collated UCA sort-key bytes for the shared order's collated slots (window.md §3/§5), built
-        // once per group; an unmapped code point fails 0A000 here. Empty when no key is collated.
-        let coll_keys = window_coll_keys(rows, &rep.order)?;
-        // Sort each partition by the shared window ORDER BY. `slice::sort_by` is stable, so a full
-        // tie keeps ascending original index = PK scan order (the §3 PK tie-break).
-        for part in &mut partitions {
-            if !rep.order.is_empty() {
-                part.sort_by(|&a, &b| cmp_window_rows(a, b, rows, &rep.order, &coll_keys));
-            }
-        }
-        group_cache.push((partitions, coll_keys));
-    }
-    for (si, spec) in specs.iter().enumerate() {
-        // Reuse this spec's group's shared sorted partitions + collation keys (computed once above).
-        // `ordered` is cloned per partition (a cheap index vector; the costly sort is shared) and
-        // `coll_keys` per spec, so the per-plan computation below reads them by value, unchanged.
-        let (sorted_partitions, coll_keys) = &group_cache[spec_group[si]];
-        let coll_keys = coll_keys.clone();
-        let mut results: Vec<Value> = vec![Value::Null; n];
-        for ordered in sorted_partitions.iter().cloned() {
-            match spec.plan {
-                WindowPlan::RowNumber => {
-                    for (pos, &ri) in ordered.iter().enumerate() {
-                        meter.guard()?; // enforce the cost ceiling per result (CLAUDE.md §13)
-                        meter.charge(COSTS.window_result);
-                        results[ri] = Value::Int(pos as i64 + 1);
-                    }
-                }
-                // Peer-aware ranking (window.md §3/§4): peers are rows EQUAL on the window ORDER BY
-                // keys only (the PK tie-break sequences peers but does not split a peer group). A
-                // single pass identifies peer-group spans [start, end) over the sorted partition; an
-                // empty ORDER BY makes the whole partition one peer group. From each row's span:
-                // rank = start+1, dense_rank = group ordinal, percent_rank = start/(N-1) (0 if N=1),
-                // cume_dist = end/N. The ratios are f64 (PG's float8, window.md §4): one IEEE
-                // correctly-rounded division of small integers that convert exactly to binary64, so
-                // the value is bit-identical across cores and to PG (the in-contract kernel, float.md §5).
-                WindowPlan::Rank
-                | WindowPlan::DenseRank
-                | WindowPlan::PercentRank
-                | WindowPlan::CumeDist => {
-                    let np = ordered.len();
-                    let mut groups: Vec<(usize, usize)> = Vec::new(); // peer-group spans [start, end)
-                    let mut s = 0usize;
-                    for pos in 1..np {
-                        if cmp_window_rows(ordered[pos], ordered[s], rows, &spec.order, &coll_keys)
-                            != std::cmp::Ordering::Equal
-                        {
-                            groups.push((s, pos));
-                            s = pos;
-                        }
-                    }
-                    if np > 0 {
-                        groups.push((s, np));
-                    }
-                    for (gi, &(start, end)) in groups.iter().enumerate() {
-                        for &ri in &ordered[start..end] {
-                            meter.guard()?;
-                            meter.charge(COSTS.window_result);
-                            results[ri] = match spec.plan {
-                                WindowPlan::Rank => Value::Int(start as i64 + 1),
-                                WindowPlan::DenseRank => Value::Int(gi as i64 + 1),
-                                WindowPlan::PercentRank => {
-                                    if np <= 1 {
-                                        Value::Float64(0.0)
-                                    } else {
-                                        Value::Float64(start as f64 / (np - 1) as f64)
-                                    }
-                                }
-                                // cume_dist: rows through the current peer group / N.
-                                _ => Value::Float64(end as f64 / np as f64),
-                            };
-                        }
-                    }
-                }
-                // ntile(n): distribute the partition into n ranked buckets, larger buckets first
-                // (window.md §4). n is evaluated once (the first sorted row); NULL n → NULL for all;
-                // n ≤ 0 → 22014. Position-based: bucket boundaries are by sorted position, not peers.
-                WindowPlan::Ntile => {
-                    let np = ordered.len();
-                    match spec.args[0].eval(&rows[ordered[0]], env, meter)? {
-                        // NULL bucket count → NULL for every row (PG).
-                        Value::Null => {
-                            for &ri in &ordered {
-                                meter.guard()?;
-                                meter.charge(COSTS.window_result);
-                                results[ri] = Value::Null;
-                            }
-                        }
-                        Value::Int(nbuckets) => {
-                            if nbuckets <= 0 {
-                                return Err(EngineError::new(
-                                    SqlState::InvalidArgumentForNtile,
-                                    "argument of ntile must be greater than zero",
-                                ));
-                            }
-                            let nbuckets = nbuckets as usize;
-                            let base = np / nbuckets; // floor rows per bucket
-                            let rem = np % nbuckets; // the first `rem` buckets get one extra row
-                            let big = rem * (base + 1); // rows in the larger (base+1) buckets
-                            for (pos, &ri) in ordered.iter().enumerate() {
-                                meter.guard()?;
-                                meter.charge(COSTS.window_result);
-                                // Larger buckets first: positions [0, big) → (base+1)-sized buckets,
-                                // the rest → base-sized buckets. `base` is 0 only when nbuckets > np,
-                                // and then every pos < big so the else branch never divides by 0.
-                                let bucket = if pos < big {
-                                    pos / (base + 1) + 1
-                                } else {
-                                    rem + (pos - big) / base + 1
-                                };
-                                results[ri] = Value::Int(bucket as i64);
-                            }
-                        }
-                        _ => unreachable!("ntile argument resolved to integer"),
-                    }
-                }
-                // lag/lead (window.md §4): the value `offset` positions back (lag) / forward (lead)
-                // in the partition, else the default (or NULL). Frame-insensitive — offset is by
-                // sorted position. The value is evaluated for every row; offset once (NULL → all
-                // NULL); the default per out-of-range row.
-                WindowPlan::Lag | WindowPlan::Lead => {
-                    let np = ordered.len();
-                    let mut vals: Vec<Value> = Vec::with_capacity(np);
-                    for &ri in &ordered {
-                        vals.push(spec.args[0].eval(&rows[ri], env, meter)?);
-                    }
-                    let offset = if spec.args.len() >= 2 {
-                        match spec.args[1].eval(&rows[ordered[0]], env, meter)? {
-                            Value::Null => None, // NULL offset → NULL for every row (PG)
-                            Value::Int(o) => Some(o),
-                            _ => unreachable!("lag/lead offset resolved to integer"),
-                        }
-                    } else {
-                        Some(1)
-                    };
-                    let dir: i64 = if matches!(spec.plan, WindowPlan::Lead) {
-                        1
-                    } else {
-                        -1
-                    };
-                    for (pos, &ri) in ordered.iter().enumerate() {
-                        meter.guard()?;
-                        meter.charge(COSTS.window_result);
-                        results[ri] = match offset {
-                            None => Value::Null,
-                            Some(o) => {
-                                let target = pos as i64 + dir * o;
-                                if target >= 0 && (target as usize) < np {
-                                    vals[target as usize].clone()
-                                } else if spec.args.len() == 3 {
-                                    spec.args[2].eval(&rows[ri], env, meter)?
-                                } else {
-                                    Value::Null
-                                }
-                            }
-                        };
-                    }
-                }
-                // An aggregate over the default frame (window.md §6): RANGE UNBOUNDED PRECEDING TO
-                // CURRENT ROW with a window ORDER BY (a RUNNING aggregate — CURRENT ROW spans the
-                // current peer group), or the WHOLE partition with no ORDER BY. Both reduce to the
-                // same shape: fold rows in sorted order, snapshotting the running `Acc` at each
-                // peer-group boundary (no ORDER BY → one peer group → one whole-partition value).
-                WindowPlan::Agg(aggplan) => {
-                    let np = ordered.len();
-                    let has_operand = !spec.args.is_empty(); // COUNT(*) has no operand
-                    let opval = |k: usize, m: &mut Meter| -> Result<Value> {
-                        if has_operand {
-                            spec.args[0].eval(&rows[ordered[k]], env, m)
-                        } else {
-                            Ok(Value::Null)
-                        }
-                    };
-                    // FILTER (WHERE cond): a frame row whose filter is not TRUE does not fold into the
-                    // window aggregate (aggregates.md §20). Evaluated per visited frame row (charging
-                    // its operator_evals); `None` keeps every row. A FILTER forces the naive re-fold
-                    // path for explicit frames (a filtered row cannot be cleanly un-folded).
-                    let filter_pass = |k: usize, m: &mut Meter| -> Result<bool> {
-                        match &spec.filter {
-                            Some(f) => Ok(f.eval(&rows[ordered[k]], env, m)?.is_true()),
-                            None => Ok(true),
-                        }
-                    };
-                    if spec.frame.is_none() {
-                        // DEFAULT frame: a single running pass, snapshotting the accumulator at each
-                        // peer-group boundary (window.md §6) — O(n).
-                        let mut groups: Vec<(usize, usize)> = Vec::new();
-                        let mut s = 0usize;
-                        for pos in 1..np {
-                            if cmp_window_rows(
-                                ordered[pos],
-                                ordered[s],
-                                rows,
-                                &spec.order,
-                                &coll_keys,
-                            ) != std::cmp::Ordering::Equal
-                            {
-                                groups.push((s, pos));
-                                s = pos;
-                            }
-                        }
-                        if np > 0 {
-                            groups.push((s, np));
-                        }
-                        let mut acc = Acc::new(aggplan);
-                        for &(start, end) in &groups {
-                            for k in start..end {
-                                meter.charge(COSTS.window_frame_step);
-                                if !filter_pass(k, meter)? {
-                                    continue; // FILTER excludes this row from the running fold
-                                }
-                                let v = opval(k, meter)?;
-                                acc.fold(v, meter)?;
-                            }
-                            let out = acc.clone().finalize()?;
-                            for &ri in &ordered[start..end] {
-                                meter.guard()?;
-                                meter.charge(COSTS.window_result);
-                                results[ri] = out.clone();
-                            }
-                        }
-                    } else {
-                        // EXPLICIT frame (window.md §5.2/§6). The sorted partition makes the frame
-                        // bounds [lo, hi) monotonic non-decreasing in `pos`, so a NO-EXCLUDE
-                        // aggregate CARRIES one accumulator across rows rather than re-folding each
-                        // frame from scratch (the sliding-window optimization):
-                        //   • an EXPANDING frame (start UNBOUNDED PRECEDING ⇒ lo ≡ 0) folds each
-                        //     entering row once as `hi` advances — byte-identical for EVERY
-                        //     aggregate, since the fold order is the sorted-prefix order the naive
-                        //     path uses (overflow traps / canonical float fold / decimal scale all
-                        //     match) — O(n);
-                        //   • a MOVING frame additionally UN-folds the rows leaving on the left, but
-                        //     only for the exactly-invertible COUNT / COUNT(*) — O(n);
-                        //   • a MOVING frame over SUM/AVG/MIN/MAX/float (not safely invertible) and
-                        //     ANY frame with EXCLUDE re-fold from scratch (the naive O(partition²)).
-                        // `window_frame_step` is charged per folded AND per un-folded row, so it only
-                        // LOWERS; each row's operand is evaluated at most once (cached in `vals`), so
-                        // `operator_eval` never rises.
-                        let ctx = FrameCtx::new(&ordered, rows, &spec.order, &coll_keys);
-                        let exclude = spec
-                            .frame
-                            .as_ref()
-                            .map_or(crate::ast::FrameExclusion::NoOthers, |f| f.exclude);
-                        let mut vals: Vec<Option<Value>> = vec![None; np];
-                        let eval_at = |k: usize,
-                                       m: &mut Meter,
-                                       vals: &mut Vec<Option<Value>>|
-                         -> Result<Value> {
-                            if !has_operand {
-                                return Ok(Value::Null);
-                            }
-                            if vals[k].is_none() {
-                                vals[k] = Some(spec.args[0].eval(&rows[ordered[k]], env, m)?);
-                            }
-                            Ok(vals[k].as_ref().unwrap().clone())
-                        };
-                        if exclude != crate::ast::FrameExclusion::NoOthers || spec.filter.is_some()
-                        {
-                            // EXCLUDE or FILTER breaks the clean add/remove model → naive per-row
-                            // re-fold (the dropped rows are neither metered nor counted), over the
-                            // cached operand. A FILTER additionally skips a non-TRUE frame row.
-                            for pos in 0..np {
-                                let (lo, hi) = ctx.bounds(pos, &spec.frame)?;
-                                let mut acc = Acc::new(aggplan);
-                                for k in lo..hi {
-                                    if ctx.is_excluded(pos, k, exclude) {
-                                        continue;
-                                    }
-                                    meter.charge(COSTS.window_frame_step);
-                                    if !filter_pass(k, meter)? {
-                                        continue;
-                                    }
-                                    let v = eval_at(k, meter, &mut vals)?;
-                                    acc.fold(v, meter)?;
-                                }
-                                meter.guard()?;
-                                meter.charge(COSTS.window_result);
-                                results[ordered[pos]] = acc.finalize()?;
-                            }
-                        } else {
-                            // SLIDING (monotone carry). `removable` aggregates un-fold the left edge;
-                            // the rest rebuild when `lo` advances (an expanding frame never advances
-                            // `lo`, so it only ever adds — the universal byte-identical case).
-                            let removable = matches!(aggplan, AggPlan::CountStar | AggPlan::Count);
-                            let mut acc = Acc::new(aggplan);
-                            let mut cur_lo = 0usize;
-                            let mut cur_hi = 0usize;
-                            for pos in 0..np {
-                                let (lo, hi) = ctx.bounds(pos, &spec.frame)?;
-                                if !removable && lo > cur_lo {
-                                    // Left edge advanced over a non-invertible aggregate ⇒ rebuild.
-                                    acc = Acc::new(aggplan);
-                                    for k in lo..hi {
-                                        meter.charge(COSTS.window_frame_step);
-                                        let v = eval_at(k, meter, &mut vals)?;
-                                        acc.fold(v, meter)?;
-                                    }
-                                } else {
-                                    // Un-fold rows leaving on the left (invertible only; empty when
-                                    // `lo == cur_lo`) …
-                                    let rem_hi = lo.min(cur_hi);
-                                    for k in cur_lo..rem_hi {
-                                        meter.charge(COSTS.window_frame_step);
-                                        let v = eval_at(k, meter, &mut vals)?;
-                                        acc.unfold(v, meter)?;
-                                    }
-                                    // … and fold rows entering on the right.
-                                    let add_lo = cur_hi.max(lo);
-                                    for k in add_lo..hi {
-                                        meter.charge(COSTS.window_frame_step);
-                                        let v = eval_at(k, meter, &mut vals)?;
-                                        acc.fold(v, meter)?;
-                                    }
-                                }
-                                cur_lo = lo;
-                                cur_hi = hi;
-                                meter.guard()?;
-                                meter.charge(COSTS.window_result);
-                                results[ordered[pos]] = acc.clone().finalize()?;
-                            }
-                        }
-                    }
-                }
-                // Frame-sensitive value pickers (S4, window.md §4): first/last/nth row of the frame.
-                WindowPlan::FirstValue | WindowPlan::LastValue | WindowPlan::NthValue => {
-                    let np = ordered.len();
-                    // The value expression, evaluated once per row (sorted order).
-                    let mut vals: Vec<Value> = Vec::with_capacity(np);
-                    for &ri in &ordered {
-                        vals.push(spec.args[0].eval(&rows[ri], env, meter)?);
-                    }
-                    // nth_value's position — evaluated once; NULL → NULL for all; < 1 → 22016.
-                    let nth = if matches!(spec.plan, WindowPlan::NthValue) {
-                        match spec.args[1].eval(&rows[ordered[0]], env, meter)? {
-                            Value::Null => None,
-                            Value::Int(n) if n >= 1 => Some(n as usize),
-                            Value::Int(_) => {
-                                return Err(EngineError::new(
-                                    SqlState::InvalidArgumentForNthValue,
-                                    "argument of nth_value must be greater than zero",
-                                ));
-                            }
-                            _ => unreachable!("nth_value position resolved to integer"),
-                        }
-                    } else {
-                        Some(0) // unused for first/last
-                    };
-                    let ctx = FrameCtx::new(&ordered, rows, &spec.order, &coll_keys);
-                    let exclude = spec
-                        .frame
-                        .as_ref()
-                        .map_or(crate::ast::FrameExclusion::NoOthers, |f| f.exclude);
-                    for pos in 0..np {
-                        meter.guard()?;
-                        meter.charge(COSTS.window_result);
-                        let (lo, hi) = ctx.bounds(pos, &spec.frame)?;
-                        // first/last/nth pick over the frame's NON-excluded rows (window.md §6); the
-                        // `NoOthers` fast path breaks on the first row, so it stays O(1).
-                        results[ordered[pos]] = match spec.plan {
-                            WindowPlan::FirstValue => (lo..hi)
-                                .find(|&k| !ctx.is_excluded(pos, k, exclude))
-                                .map_or(Value::Null, |k| vals[k].clone()),
-                            WindowPlan::LastValue => (lo..hi)
-                                .rev()
-                                .find(|&k| !ctx.is_excluded(pos, k, exclude))
-                                .map_or(Value::Null, |k| vals[k].clone()),
-                            WindowPlan::NthValue => match nth {
-                                Some(n) => (lo..hi)
-                                    .filter(|&k| !ctx.is_excluded(pos, k, exclude))
-                                    .nth(n - 1)
-                                    .map_or(Value::Null, |k| vals[k].clone()),
-                                None => Value::Null, // NULL n
-                            },
-                            _ => Value::Null,
-                        };
-                    }
-                }
-            }
-        }
-        for (i, row) in rows.iter_mut().enumerate() {
-            row.push(std::mem::replace(&mut results[i], Value::Null));
-        }
-    }
-    Ok(())
-}
-
-/// Compare two rows by the (all-`C`) ORDER BY keys — the first non-equal key decides; a full tie is
-/// Equal (the stable sort then keeps input order). Only used when no key is collated.
-fn cmp_rows_by_order(a: &Row, b: &Row, order: &[crate::spill::SortKey]) -> std::cmp::Ordering {
-    for (idx, descending, nulls_first, _coll) in order {
-        let ord = key_cmp(&a[*idx], &b[*idx], *descending, *nulls_first);
-        if ord != std::cmp::Ordering::Equal {
-            return ord;
-        }
-    }
-    std::cmp::Ordering::Equal
-}
-
-/// Compare two rows of the window buffer (by their index `a`/`b` into the full row slice) by the
-/// window ORDER BY keys, honoring collation. A collated slot compares the precomputed UCA sort-key
-/// bytes in `coll_keys` (indexed in parallel with the rows; NULL placement + the descending flip
-/// applied here, mirroring `cmp_decorated`); a non-collated slot compares the row values via
-/// `key_cmp`. This one comparator drives the partition sort AND every peer determination (ranking,
-/// the aggregate default frame, `FrameCtx`'s peer groups), so a collated window orders, ranks, and
-/// frames identically (window.md §3/§5). With no collated key, `coll_keys` is unused and this is
-/// `cmp_rows_by_order` by index.
-fn cmp_window_rows(
-    a: usize,
-    b: usize,
-    rows: &[Row],
-    order: &[crate::spill::SortKey],
-    coll_keys: &[Vec<Option<Vec<u8>>>],
-) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    let mut ci = 0usize; // advances once per collated slot (keys stored in slot order)
-    for (idx, descending, nulls_first, coll) in order {
-        let ord = if coll.is_some() {
-            let ak = &coll_keys[a][ci];
-            let bk = &coll_keys[b][ci];
-            ci += 1;
-            match (ak, bk) {
-                (None, None) => Ordering::Equal,
-                (None, Some(_)) => {
-                    if *nulls_first {
-                        Ordering::Less
-                    } else {
-                        Ordering::Greater
-                    }
-                }
-                (Some(_), None) => {
-                    if *nulls_first {
-                        Ordering::Greater
-                    } else {
-                        Ordering::Less
-                    }
-                }
-                (Some(x), Some(y)) => {
-                    let base = x.cmp(y);
-                    if *descending { base.reverse() } else { base }
-                }
-            }
-        } else {
-            key_cmp(&rows[a][*idx], &rows[b][*idx], *descending, *nulls_first)
-        };
-        if ord != Ordering::Equal {
-            return ord;
-        }
-    }
-    Ordering::Equal
-}
-
-/// Sort `rows` when at least one ORDER BY key is collated (spec/design/collation.md §6/§8).
-/// Decorate-sort-undecorate: each collated key's UCA sort key is built ONCE per row up front
-/// (propagating a `sort_key` failure — e.g. 0A000 for an unmapped code point — at this deterministic
-/// per-row point, not inside the comparator), then the rows are sorted by the precomputed key bytes
-/// for collated slots and the value comparator for the rest. The sort is UNMETERED like every sort
-/// (cost.md §3); the `collate` cost is charged at the comparison evaluator (collation.md §11). A
-/// collated ORDER BY is in-memory only this slice, so this never spills (collated keys are slice 1e).
-fn sort_rows_collated(rows: &mut Vec<Row>, order: &[crate::spill::SortKey]) -> Result<()> {
-    let mut decorated: Vec<(Vec<Option<Vec<u8>>>, Row)> = Vec::with_capacity(rows.len());
-    for row in rows.drain(..) {
-        let mut keys: Vec<Option<Vec<u8>>> = Vec::new();
-        for (idx, _, _, coll) in order {
-            if let Some(c) = coll {
-                let k = match &row[*idx] {
-                    Value::Text(s) => Some(collation::sort_key(c, s)?),
-                    _ => None, // NULL (a collated slot is text) — handled by NULL placement
-                };
-                keys.push(k);
-            }
-        }
-        decorated.push((keys, row));
-    }
-    decorated.sort_by(|a, b| cmp_decorated(a, b, order));
-    rows.extend(decorated.into_iter().map(|(_, row)| row));
-    Ok(())
-}
-
-/// Compare two decorated rows (precomputed collated-key bytes + the row) by the ORDER BY keys. A
-/// collated slot compares its precomputed sort-key bytes (NULL placement + the descending flip
-/// applied here, mirroring `key_cmp`); a non-collated slot compares the row values via `key_cmp`.
-fn cmp_decorated(
-    a: &(Vec<Option<Vec<u8>>>, Row),
-    b: &(Vec<Option<Vec<u8>>>, Row),
-    order: &[crate::spill::SortKey],
-) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    let (akeys, arow) = a;
-    let (bkeys, brow) = b;
-    let mut ci = 0usize; // advances once per collated slot (keys stored in slot order)
-    for (idx, descending, nulls_first, coll) in order {
-        let ord = if coll.is_some() {
-            let ak = &akeys[ci];
-            let bk = &bkeys[ci];
-            ci += 1;
-            match (ak, bk) {
-                (None, None) => Ordering::Equal,
-                (None, Some(_)) => {
-                    if *nulls_first {
-                        Ordering::Less
-                    } else {
-                        Ordering::Greater
-                    }
-                }
-                (Some(_), None) => {
-                    if *nulls_first {
-                        Ordering::Greater
-                    } else {
-                        Ordering::Less
-                    }
-                }
-                (Some(x), Some(y)) => {
-                    let base = x.cmp(y);
-                    if *descending { base.reverse() } else { base }
-                }
-            }
-        } else {
-            key_cmp(&arow[*idx], &brow[*idx], *descending, *nulls_first)
-        };
-        if ord != Ordering::Equal {
-            return ord;
-        }
-    }
-    Ordering::Equal
-}
-
-/// One ORDER BY key's total-order comparison. NULL placement is governed by `nulls_first`
-/// and applied INDEPENDENTLY of the value-direction flip (`descending`), so an explicit
-/// `NULLS FIRST|LAST` overrides the direction default (spec/design/grammar.md §10). The
-/// physical key order ratifies NULL as the largest value (the PostgreSQL model), which
-/// surfaces as the parse-time default `nulls_first = descending` (ASC → last, DESC → first).
-pub(crate) fn key_cmp(
-    a: &Value,
-    b: &Value,
-    descending: bool,
-    nulls_first: bool,
-) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    match (a, b) {
-        (Value::Null, Value::Null) => Ordering::Equal,
-        (Value::Null, _) => {
-            if nulls_first {
-                Ordering::Less
-            } else {
-                Ordering::Greater
-            }
-        }
-        (_, Value::Null) => {
-            if nulls_first {
-                Ordering::Greater
-            } else {
-                Ordering::Less
-            }
-        }
-        _ => {
-            let base = value_cmp(a, b);
-            if descending { base.reverse() } else { base }
-        }
-    }
-}
-
-/// Total order over NON-NULL values: signed-integer ascending, text by the `C`
-/// collation — raw UTF-8 bytes, which for UTF-8 equals code-point order
-/// (spec/design/types.md §11) — and boolean by value, false < true (types.md §9). The
-/// cross-family arms (a fixed `bool < int < text` order) are kept only for totality —
-/// ORDER BY is over a single typed column, so they are unreachable from SELECT. NULLs are
-/// handled by `key_cmp` before this is reached.
-fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    match (a, b) {
-        (Value::Int(x), Value::Int(y)) => x.cmp(y),
-        (Value::Decimal(x), Value::Decimal(y)) => x.cmp_value(y),
-        (Value::Text(x), Value::Text(y)) => x.as_bytes().cmp(y.as_bytes()),
-        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
-        // Floats order by the PG total order (NaN largest, -0 = +0; spec/design/float.md §3).
-        (Value::Float32(x), Value::Float32(y)) => crate::value::total_cmp_f32(*x, *y),
-        (Value::Float64(x), Value::Float64(y)) => crate::value::total_cmp_f64(*x, *y),
-        (Value::Bytea(x), Value::Bytea(y)) => x.cmp(y),
-        (Value::Uuid(x), Value::Uuid(y)) => x.cmp(y),
-        // Timestamps order by the i64 instant (-infinity < finite < infinity).
-        (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
-        (Value::Timestamptz(x), Value::Timestamptz(y)) => x.cmp(y),
-        (Value::Date(x), Value::Date(y)) => x.cmp(y),
-        // Intervals order by the canonical 128-bit span (spec/design/interval.md §2).
-        (Value::Interval(x), Value::Interval(y)) => x.cmp(y),
-        // A composite sorts lexicographically, NULLs-last per field (the composite sort key —
-        // spec/design/composite.md §5): the first non-equal field decides, recursing through
-        // `key_cmp` so per-field NULL placement and nested composites are handled uniformly. The
-        // caller's `descending` flip in `key_cmp` reverses the whole tuple. A row-size tie-break
-        // keeps it total (same-type rows have equal arity, so it is only reached for safety).
-        (Value::Composite(x), Value::Composite(y)) => {
-            for (xf, yf) in x.iter().zip(y.iter()) {
-                let c = key_cmp(xf, yf, false, false);
-                if c != Ordering::Equal {
-                    return c;
-                }
-            }
-            x.len().cmp(&y.len())
-        }
-        // An array sorts by the PG `array_cmp` total order (spec/design/array.md §5): element-wise
-        // over the flattened elements (NULLs-last per element, recursing through `key_cmp`), then
-        // fewer elements first, then smaller ndim, then per dimension (length, then lower bound).
-        (Value::Array(x), Value::Array(y)) => {
-            for (xe, ye) in x.elements.iter().zip(y.elements.iter()) {
-                let c = key_cmp(xe, ye, false, false);
-                if c != Ordering::Equal {
-                    return c;
-                }
-            }
-            let mut c = x.elements.len().cmp(&y.elements.len());
-            if c != Ordering::Equal {
-                return c;
-            }
-            c = x.dims.len().cmp(&y.dims.len());
-            if c != Ordering::Equal {
-                return c;
-            }
-            for d in 0..x.dims.len() {
-                c = x.dims[d]
-                    .cmp(&y.dims[d])
-                    .then(x.lbounds[d].cmp(&y.lbounds[d]));
-                if c != Ordering::Equal {
-                    return c;
-                }
-            }
-            Ordering::Equal
-        }
-        // A range sorts by the PG `range_cmp` total order (spec/design/ranges.md §6): `empty` below
-        // every non-empty, then lower bound, then upper bound (accounting for infinity/inclusivity).
-        // Kept identical to `value::lt3`/`gt3`'s range arm so `<` and `ORDER BY` never disagree.
-        (Value::Range(x), Value::Range(y)) => crate::range::range_total_cmp(x, y),
-        // jsonb sorts by PG's total btree order (spec/design/json.md §5); kept identical to
-        // `value::lt3`/`gt3`'s jsonb arm so `<` and `ORDER BY` never disagree. (json never sorts —
-        // the resolver rejects it 42883.)
-        (Value::Jsonb(x), Value::Jsonb(y)) => x.cmp(y),
-        (Value::Null, Value::Null) => Ordering::Equal,
-        // Cross-family arms exist only for totality — ORDER BY is over a single typed column,
-        // so a mixed pair is unreachable. A fixed family order keeps the comparator total.
-        _ => family_rank(a).cmp(&family_rank(b)),
-    }
-}
-
-/// A fixed total order across value families, used only to keep `value_cmp` total for the
-/// unreachable cross-family case (ORDER BY is single-column-typed).
-fn family_rank(v: &Value) -> u8 {
-    match v {
-        Value::Null => 0,
-        Value::Bool(_) => 1,
-        Value::Int(_) => 2,
-        Value::Decimal(_) => 3,
-        Value::Text(_) => 4,
-        Value::Bytea(_) => 5,
-        Value::Uuid(_) => 6,
-        Value::Timestamp(_) => 6,
-        Value::Timestamptz(_) => 7,
-        Value::Interval(_) => 8,
-        Value::Float32(_) => 9,
-        Value::Float64(_) => 10,
-        Value::Date(_) => 13,
-        // A composite sorts only against composites of its own type (ORDER BY is single-typed), so
-        // this cross-family rank is only for totality; it sits after the scalar families.
-        Value::Composite(_) => 11,
-        // An array sorts only against arrays of its own element type (ORDER BY is single-typed), so
-        // this cross-family rank is only for totality; it sits after composite.
-        Value::Array(_) => 12,
-        // A range sorts only against ranges of its own element type (ORDER BY is single-typed), so
-        // this cross-family rank is only for totality; it sits after array.
-        Value::Range(_) => 14,
-        // json never sorts (42883 at resolve); jsonb sorts only against jsonb. Cross-family ranks
-        // for totality only — they sit after the scalar/container families.
-        Value::Json(_) => 15,
-        Value::Jsonb(_) => 16,
-        Value::JsonPath(_) => 17,
-        // Poisoned (large-values.md §14): ORDER BY slots are in the touched set, so a sort
-        // key is always resolved before it reaches the comparator.
-        Value::Unfetched(_) => panic!("BUG: unfetched large value escaped the storage layer"),
-    }
-}
-
-#[cfg(test)]
-mod registry_tests {
-    use super::*;
-
-    // The function registry (extensibility.md §5) is data-driven over the generated catalog
-    // tables, but two halves stay hand-written per core: the scalar kernel id (`scalar_func_id`)
-    // and the result-code / plan interpreters. This guards against drift — a catalog row added
-    // without a matching kernel id or with a result code no interpreter handles fails here, not
-    // silently at some query's resolve.
-    #[test]
-    fn registry_covers_catalog() {
-        for o in OPERATORS.iter().filter(|o| o.kind == "function") {
-            if is_array_func_name(o.name) {
-                // A polymorphic array function (array-functions.md §2): its kernel id comes from
-                // `array_func_id` and its result is a reserved poly code or a scalar id.
-                let _ = array_func_id(o.name);
-                let concrete_array = o
-                    .result
-                    .strip_suffix("[]")
-                    .is_some_and(|base| ScalarType::from_name(base).is_some());
-                assert!(
-                    o.result == "anyarray"
-                        || o.result == "anyelement"
-                        || concrete_array
-                        || ScalarType::from_name(o.result).is_some(),
-                    "array function {} has unhandled result code {}",
-                    o.name,
-                    o.result
-                );
-                continue;
-            }
-            if is_range_func_name(o.name) {
-                // range_merge is the SET range function (range-functions.md §4): result `anyrange`,
-                // and NO scalar accessor kernel (the resolver emits a RangeSetOp node, evaluated by
-                // `eval_range_set_op`), so it skips `range_func_id` and the accessor result check.
-                if o.name == "range_merge" {
-                    assert_eq!(o.result, "anyrange", "range_merge result code");
-                    continue;
-                }
-                // A polymorphic range accessor (range-functions.md §1): its kernel id comes from
-                // `range_func_id` and its result is `anyelement` (the bound value) or `boolean`.
-                let _ = range_func_id(o.name);
-                assert!(
-                    o.result == "anyelement" || ScalarType::from_name(o.result).is_some(),
-                    "range function {} has unhandled result code {}",
-                    o.name,
-                    o.result
-                );
-                continue;
-            }
-            if is_range_ctor_name(o.name) {
-                // A range constructor (range-functions.md §2): no scalar kernel id — the kernel is
-                // `eval_range_ctor`, reached from the resolver. Its result is a concrete range id.
-                assert!(
-                    crate::range::range_by_name(o.result).is_some(),
-                    "range constructor {} has non-range result code {}",
-                    o.name,
-                    o.result
-                );
-                continue;
-            }
-            if is_variadic_func_name(o.name) {
-                // A VARIADIC function (array-functions.md §12): the count functions (num_nulls/
-                // num_nonnulls) reach their kernel via `variadic_func_id`; the json builders
-                // (json[b]_build_array/_object) reach theirs via `json_build_classify`. Either way
-                // the result is a concrete scalar id (i32 / json / jsonb).
-                if json_build_classify(o.name).is_none() {
-                    let _ = variadic_func_id(o.name);
-                }
-                assert!(
-                    ScalarType::from_name(o.result).is_some(),
-                    "variadic function {} has unhandled result code {}",
-                    o.name,
-                    o.result
-                );
-                continue;
-            }
-            if matches!(
-                o.name,
-                "regexp_replace"
-                    | "regexp_match"
-                    | "regexp_like"
-                    | "regexp_count"
-                    | "regexp_substr"
-                    | "regexp_instr"
-            ) {
-                // A regex scalar function (regex.md §8 / §8b): no scalar kernel id — the kernel is the
-                // `RExpr::RegexFunc` eval, reached from `resolve_regex_func`. Its result is a scalar
-                // (text / boolean / i32) or a concrete text[] code.
-                let concrete_array = o
-                    .result
-                    .strip_suffix("[]")
-                    .is_some_and(|b| ScalarType::from_name(b).is_some());
-                assert!(
-                    ScalarType::from_name(o.result).is_some() || concrete_array,
-                    "regex function {} has unhandled result code {}",
-                    o.name,
-                    o.result
-                );
-                continue;
-            }
-            // Every function name maps to a kernel id (panics via unreachable! if not).
-            let _ = scalar_func_id(o.name);
-            // Every function result code is one the interpreter understands: "promoted" or a
-            // literal scalar-type id.
-            assert!(
-                o.result == "promoted" || ScalarType::from_name(o.result).is_some(),
-                "function {} has unhandled result code {}",
-                o.name,
-                o.result
-            );
-        }
-        for a in AGGREGATES.iter() {
-            assert!(
-                matches!(
-                    a.result,
-                    "i64" | "decimal" | "sum_widen" | "same_as_input" | "jsonb" | "json"
-                ),
-                "aggregate {} has unhandled result code {}",
-                a.name,
-                a.result
-            );
-            // Every overload is reachable: a star row via `aggregate_has_star`, an expr row via
-            // `lookup_aggregate_overload` over a representative operand of its declared family.
-            if a.arg == "star" {
-                assert!(aggregate_has_star(a.surface), "{} star overload", a.surface);
-            } else {
-                let probe = match a.arg_families.first().copied() {
-                    Some("integer") => ResolvedType::Int(ScalarType::Int32),
-                    Some("decimal") => ResolvedType::Decimal,
-                    Some("float") => ResolvedType::Float(ScalarType::Float64),
-                    _ => ResolvedType::Int(ScalarType::Int32), // "any"
-                };
-                let found = lookup_aggregate_overload(a.surface, &probe)
-                    .expect("expr overload resolves for its declared family");
-                // And its plan/result selection is total (panics via unreachable! otherwise).
-                let lname = a.surface.to_ascii_lowercase();
-                let _ = aggregate_plan(&lname, found.result, &probe);
-            }
-        }
-    }
-
-    /// The evaluator's per-operator cost base (functions.md §8): `operator_cost` returns each
-    /// operator's catalog `cost` if authored, else the uniform `operator_eval`. Cross-checking
-    /// against the generated `OPERATORS` table proves the lookup is data-driven — authoring a
-    /// `cost` in catalog.toml is automatically honored, with no evaluator change. (The corpus
-    /// cannot observe this while every weight is the uniform default — CLAUDE.md §10.)
-    #[test]
-    fn operator_cost_reflects_catalog() {
-        for o in OPERATORS {
-            let want = if o.cost == 0 {
-                COSTS.operator_eval
-            } else {
-                o.cost
-            };
-            assert_eq!(operator_cost(o.name), want, "operator_cost({:?})", o.name);
-        }
-        // An unknown name falls back to the uniform operator_eval.
-        assert_eq!(
-            operator_cost("definitely_not_an_operator"),
-            COSTS.operator_eval
-        );
-    }
-
-    /// Every operator-enum → catalog-name mapping the evaluator charges through must resolve to a
-    /// real catalog operator, so a typo in `op_name` / a wired literal is caught here, not silently
-    /// masked by the uniform-weight fallback.
-    #[test]
-    fn wired_operator_names_exist_in_catalog() {
-        let names = [
-            CmpOp::Eq.op_name(),
-            CmpOp::Ne.op_name(),
-            CmpOp::Lt.op_name(),
-            CmpOp::Gt.op_name(),
-            CmpOp::Le.op_name(),
-            CmpOp::Ge.op_name(),
-            ArithOp::Add.op_name(),
-            ArithOp::Sub.op_name(),
-            ArithOp::Mul.op_name(),
-            ArithOp::Div.op_name(),
-            ArithOp::Mod.op_name(),
-            "neg",
-            "not",
-            "and",
-            "or",
-        ];
-        for name in names {
-            assert!(
-                OPERATORS.iter().any(|o| o.name == name),
-                "wired operator name {name:?} is not in the catalog"
-            );
-        }
-    }
-}
-
-#[cfg(test)]
-mod skew_tests {
-    // The slice-2d collation version-skew verdict (spec/design/collation.md §12/§14): the open-time
-    // comparison + the read-only write-block. Skew has NO PostgreSQL analog (PG's collversion is the
-    // opposite, host-OS-drift, §15), so it is a documented PG divergence verified by per-core unit
-    // tests, not the oracle corpus (CLAUDE.md §10). White-box (it injects a file-pin/loaded-version
-    // mismatch a public API cannot manufacture — a fresh file pins the loaded version). Mirrored by
-    // impl/go/collation_host_test.go and impl/ts/tests/collation_host.test.ts.
-    use super::*;
-    use std::sync::Arc;
-
-    fn load_bundle() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../spec/collation/fixtures/unicode.jucd");
-        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read unicode.jucd: {e}"));
-        crate::load_unicode_data(&bytes).expect("load unicode.jucd");
-    }
-
-    /// The pure verdict (`collation::version_skew`) — the cross-core contract (every core computes
-    /// the identical result): same version as the loaded bundle ⇒ `None` (Full); a different pin ⇒
-    /// `Some(loaded versions)` (Skewed); an unloaded name ⇒ `None` (the absent case is refused at
-    /// open, not a skew verdict).
-    #[test]
-    fn version_skew_pure_verdict() {
-        load_bundle();
-        let loaded = crate::collation::loaded_collation("unicode").expect("unicode loaded");
-        assert_eq!(
-            crate::collation::version_skew(
-                "unicode",
-                &loaded.unicode_version,
-                &loaded.cldr_version
-            ),
-            None,
-            "same version is Full"
-        );
-        assert_eq!(
-            crate::collation::version_skew("unicode", "0.0.0", "0"),
-            Some((loaded.unicode_version.clone(), loaded.cldr_version.clone())),
-            "a different pin is Skewed and reports the loaded version"
-        );
-        assert_eq!(
-            crate::collation::version_skew("zz-not-loaded", "1", "1"),
-            None,
-            "an unloaded name yields no skew verdict (absent ⇒ refused at open)"
-        );
-    }
-
-    /// A `unicode`-collated PK table is read-write while Full; once its `unicode` reference is pinned
-    /// to a different version than the loaded bundle (the open-time state of a file built under an
-    /// older bundle), the table degrades to **read-only**: reads still return the rows (the heap-scan
-    /// fallback recomputes against the loaded table), every write raises `XX002`, and the skew is
-    /// legible via `db.collations()`.
-    #[test]
-    fn skewed_collation_blocks_writes_reads_ok() {
-        load_bundle();
-        let mut db = Engine::new();
-        crate::execute(
-            &mut db,
-            "CREATE TABLE t (x text COLLATE \"unicode\" PRIMARY KEY)",
-        )
-        .unwrap();
-        crate::execute(&mut db, "INSERT INTO t VALUES ('b'), ('a')").unwrap();
-        // Full so far: a write succeeds and every referenced collation reports Full.
-        crate::execute(&mut db, "INSERT INTO t VALUES ('c')").unwrap();
-        assert!(
-            db.collations()
-                .iter()
-                .all(|c| c.verdict == CollationVerdict::Full),
-            "all Full before skew injection"
-        );
-
-        // Inject skew: the file pinned `unicode` to an older version than the loaded bundle. This is
-        // exactly the catalog state `Engine::open` produces for a file built under a prior bundle —
-        // a catalog-local collation whose pin differs from the loaded set (collation.md §5/§12).
-        let loaded = crate::collation::loaded_collation("unicode").unwrap();
-        let mut skewed = (*loaded).clone();
-        skewed.unicode_version = "0.0.0".to_string();
-        db.committed.put_collation(Arc::new(skewed));
-
-        // The verdict is now Skewed and visible via introspection (the file's pin is reported).
-        let info = db.collations();
-        let uni = info
-            .iter()
-            .find(|c| c.name == "unicode")
-            .expect("unicode referenced");
-        assert_eq!(uni.verdict, CollationVerdict::Skewed);
-        assert_eq!(uni.unicode_version, "0.0.0");
-
-        // Reads still work — all three rows come back (values are version-independent §4.1).
-        match crate::execute(&mut db, "SELECT x FROM t ORDER BY x COLLATE \"unicode\"").unwrap() {
-            Outcome::Query { rows, .. } => assert_eq!(rows.len(), 3),
-            other => panic!("expected rows, got {other:?}"),
-        }
-
-        // Every write is refused with XX002.
-        for sql in [
-            "INSERT INTO t VALUES ('d')",
-            "UPDATE t SET x = 'z' WHERE x = 'a'",
-            "DELETE FROM t WHERE x = 'a'",
-            "CREATE INDEX t_x ON t (x)",
-        ] {
-            let err = crate::execute(&mut db, sql).expect_err(sql);
-            assert_eq!(err.code(), "XX002", "{sql} must be XX002");
-        }
-    }
-
-    /// The COLLATION UPGRADE migration (`db.upgrade_collations`, collation.md §12) clears the skew:
-    /// after it the collation's pin is the loaded version, `db.collations()` reports Full, and the
-    /// table is read-write again. Asserts the internal state the shared corpus
-    /// (`suites/collation/collation_upgrade.test`) cannot read — the verdict-flip + the re-pin count —
-    /// plus idempotence (a second upgrade re-pins nothing). The skew injection mirrors the test above.
-    #[test]
-    fn upgrade_clears_skew() {
-        load_bundle();
-        let mut db = Engine::new();
-        crate::execute(
-            &mut db,
-            "CREATE TABLE t (x text COLLATE \"unicode\" PRIMARY KEY)",
-        )
-        .unwrap();
-        crate::execute(&mut db, "INSERT INTO t VALUES ('b'), ('a')").unwrap();
-        // Inject skew (a file built under a prior bundle), as in the test above.
-        let loaded = crate::collation::loaded_collation("unicode").unwrap();
-        let mut skewed = (*loaded).clone();
-        skewed.unicode_version = "0.0.0".to_string();
-        db.committed.put_collation(Arc::new(skewed));
-        assert_eq!(
-            db.collations()
-                .iter()
-                .find(|c| c.name == "unicode")
-                .unwrap()
-                .verdict,
-            CollationVerdict::Skewed,
-            "skewed before upgrade"
-        );
-
-        // The migration re-pins the one skewed collation and rebuilds its (collated PK) table.
-        assert_eq!(
-            db.upgrade_collations().unwrap(),
-            1,
-            "one collation re-pinned"
-        );
-
-        // The verdict is now Full, the pin advanced to the loaded version, and writes succeed again.
-        let uni = db
-            .collations()
-            .into_iter()
-            .find(|c| c.name == "unicode")
-            .expect("unicode referenced");
-        assert_eq!(uni.verdict, CollationVerdict::Full, "Full after upgrade");
-        assert_eq!(uni.unicode_version, loaded.unicode_version);
-        crate::execute(&mut db, "INSERT INTO t VALUES ('c')").expect("writable after upgrade");
-
-        // Idempotent: nothing is skewed now, so a second upgrade re-pins zero collations.
-        assert_eq!(db.upgrade_collations().unwrap(), 0, "idempotent no-op");
-    }
 }
