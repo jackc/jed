@@ -95,22 +95,25 @@ func (e *engine) Prepare(sql string) (bench.Stmt, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &jedStmt{stmt: stmt}, nil
+	// A PreparedStatement is a standalone value; the session passed at each execute supplies the
+	// run's envelope (impl/go QueryPrepared), so the bench statement pairs it with the bench session.
+	return &jedStmt{sess: e.sess, stmt: stmt}, nil
 }
 
 type jedStmt struct {
+	sess *jed.Session
 	stmt *jed.PreparedStatement
 }
 
 func (s *jedStmt) Exec(args []any) error {
-	return drainExec(s.stmt.Query(context.Background(), args...))
+	return drainExec(s.sess.QueryPrepared(context.Background(), s.stmt, args...))
 }
 
 func (s *jedStmt) Query(args []any, sum *bench.Checksum) (int, error) {
-	// The ergonomic Query(ctx, args...) is the sole query surface (impl/go/ergonomic.go): it converts
-	// the native args to []Value and, with a background context, arms no cancellation — the same work
-	// the old raw QueryValues path did, since args is already []any.
-	rows, err := s.stmt.Query(context.Background(), args...)
+	// The ergonomic QueryPrepared(ctx, stmt, args...) is the sole prepared query surface
+	// (impl/go/ergonomic.go): it converts the native args to []Value and, with a background context,
+	// arms no cancellation — the same work the old raw QueryValues path did, since args is already []any.
+	rows, err := s.sess.QueryPrepared(context.Background(), s.stmt, args...)
 	if err != nil {
 		return 0, err
 	}
@@ -169,8 +172,8 @@ func (p *jedPool) Close() error {
 	return p.db.Close()
 }
 
-// jedReader runs one query through a reader Session, re-parsing the SQL each call — the
-// host session API has no prepared-statement form (benchmarks.md §8.1).
+// jedReader runs one query through a reader Session, re-parsing the SQL each call — deliberate
+// (benchmarks.md §8.1): a constant per-query parse cost is included, uniform across the jed cores.
 type jedReader struct{ s *jed.Session }
 
 func (r jedReader) Query(sql string, args []any, sum *bench.Checksum) (int, error) {

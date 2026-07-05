@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"unicode/utf8"
 )
 
@@ -15074,19 +15075,33 @@ func (db *engine) snapshotEngine() *engine {
 	}
 }
 
-// scanCache memoizes a prepared statement's resolved scan plan + finalized param types so a repeated
-// execute skips planning entirely (spec/design/api.md §2.4) — the biggest lever for the point-lookup
-// / high-frequency class (planning is ~⅔ of a point lookup's latency and ~88% of its allocations, and
-// the resulting GC inflates the tail). Valid only while catGen still equals the committed catalog
-// generation the plan was built against; any DDL bumps catGen and the next execute re-plans. Filled
-// only from committed state and only for a reusable plan (planCacheable + !paramTypes.uncacheable),
-// so reusing it is result/cost-identical to a fresh plan. Zero value (valid=false) is "empty". Not
-// safe for concurrent use — a prepared statement runs on one handle at a time.
+// scanCache is one immutable filled entry of a prepared statement's plan cache (stmtCache): the
+// resolved scan plan + finalized param types, stamped with the Database (sharedCore) and committed
+// catalog generation they were resolved against. Built once, published via stmtCache.p, and never
+// mutated after — so a concurrent reader sees a complete entry or none.
 type scanCache struct {
-	valid  bool
+	// core identifies the Database the plan was resolved against. catGen is only monotonic within
+	// one core — two Databases can share a generation number with different schemas — so a hit
+	// requires the same core AND the same generation (spec/design/api.md §2.4).
+	core   *sharedCore
 	catGen uint64
 	sp     *selectPlan
 	ptys   []scalarType
+}
+
+// stmtCache memoizes a prepared statement's resolved scan plan + finalized param types so a repeated
+// execute skips planning entirely (spec/design/api.md §2.4) — the biggest lever for the point-lookup
+// / high-frequency class (planning is ~⅔ of a point lookup's latency and ~88% of its allocations, and
+// the resulting GC inflates the tail). An entry is valid only for the Database it was resolved
+// against and only while catGen still equals that core's committed catalog generation; any DDL bumps
+// catGen and the next execute re-plans. Filled only from committed state and only for a reusable plan
+// (planCacheable + !paramTypes.uncacheable), so reusing it is result/cost-identical to a fresh plan.
+// Zero value is "empty". The slot is a lock-free atomic pointer: a prepared statement is a standalone
+// value shared across sessions — and goroutines — so concurrent executes may race to fill it; the
+// entry itself is immutable and last-writer-wins (both candidates are correct for their core+catGen;
+// a statement bounced between databases or a pinned-vs-current session merely re-plans).
+type stmtCache struct {
+	p atomic.Pointer[scanCache]
 }
 
 // planCacheable reports whether a resolved scan plan may be memoized on a prepared statement. The
@@ -15102,11 +15117,23 @@ func (db *engine) planCacheable(sp *selectPlan) bool {
 		if r.srf != nil || r.cte != nil || r.derived != nil {
 			return false
 		}
-		if db.isTempTable(r.tableName) {
-			return false
+	}
+	return !db.planTouchesTemp(sp)
+}
+
+// planTouchesTemp reports whether any of the plan's relations currently resolves to a SESSION-LOCAL
+// temporary table in THIS session's visible temp domain. Checked at cache fill (a temp plan is never
+// cached) and re-checked on every cache HIT: a statement is shared across sessions, and a plan cached
+// where a name was persistent must not be served on a session whose temp table shadows that name —
+// the temp domain is session-local, so the committed catGen the cache is keyed on cannot see it.
+// Cheap: one map lookup per relation, against a usually-empty temp catalog.
+func (db *engine) planTouchesTemp(sp *selectPlan) bool {
+	for i := range sp.rels {
+		if db.isTempTable(sp.rels[i].tableName) {
+			return true
 		}
 	}
-	return true
+	return false
 }
 
 // tryScanQuery serves stmt as a lazy STREAMING or BUFFERED query (spec/design/streaming.md §3/§4),
@@ -15120,17 +15147,22 @@ func (db *engine) planCacheable(sp *selectPlan) bool {
 // plan exactly once. The conformance corpus drives this lazy lane for every read (the harness routes
 // through queryValues), cross-checked to yield identical rows + total cost as the materialized drive
 // under full drain (streaming.md §6).
-func (db *engine) tryScanQuery(stmt statement, params []Value, sc *scanCache) (*Rows, bool, error) {
+func (db *engine) tryScanQuery(stmt statement, params []Value, sc *stmtCache) (*Rows, bool, error) {
 	if stmt.Select == nil || stmtIsWrite(stmt) {
 		return nil, false, nil
 	}
-	// Cache HIT: the read snapshot's catalog is unchanged since the plan was cached (its catGen still
-	// matches), so reuse the resolved plan + finalized param types — no planQuery, no fold, no
-	// param-type walk. A cached plan carries no subquery to fold (planCacheable rejected any), so the
-	// shared plan is never mutated; params are still bound per execute inside buildScanRows.
+	// Cache HIT: the plan was resolved against THIS Database (same core — catGen is only monotonic
+	// within one core) and the read snapshot's catalog is unchanged since (its catGen still matches),
+	// and no relation name is shadowed by a session-local temp table the committed generation cannot
+	// see (planTouchesTemp — the statement may have been filled on a different session). Reuse the
+	// resolved plan + finalized param types — no planQuery, no fold, no param-type walk. A cached plan
+	// carries no subquery to fold (planCacheable rejected any), so the shared plan is never mutated;
+	// params are still bound per execute inside buildScanRows.
 	rsnap := db.readSnap()
-	if sc != nil && sc.valid && sc.catGen == rsnap.catGen {
-		return db.buildScanRows(sc.sp, sc.ptys, params, false)
+	if sc != nil {
+		if c := sc.p.Load(); c != nil && c.core == db.core && c.catGen == rsnap.catGen && !db.planTouchesTemp(c.sp) {
+			return db.buildScanRows(c.sp, c.ptys, params, false)
+		}
 	}
 	// MISS: plan once.
 	ptypes := &paramTypes{}
@@ -15147,11 +15179,12 @@ func (db *engine) tryScanQuery(stmt statement, params []Value, sc *scanCache) (*
 		return nil, false, err
 	}
 	// Fill the cache only from committed state — so committed.catGen is strictly increasing over the
-	// engine's life and never aliases a rolled-back working generation, making the catGen equality on
+	// core's life and never aliases a rolled-back working generation, making the catGen equality on
 	// a later HIT a sound "same catalog" identity check (a statement first executed inside an open
-	// transaction re-plans until the tx commits) — and only for a reusable plan.
-	if sc != nil && rsnap == db.committed && !ptypes.uncacheable && db.planCacheable(sp) {
-		*sc = scanCache{valid: true, catGen: rsnap.catGen, sp: sp, ptys: ptys}
+	// transaction re-plans until the tx commits) — and only for a reusable plan, and only when this
+	// engine belongs to a core (the entry's identity key; a core-less engine never fills).
+	if sc != nil && db.core != nil && rsnap == db.committed && !ptypes.uncacheable && db.planCacheable(sp) {
+		sc.p.Store(&scanCache{core: db.core, catGen: rsnap.catGen, sp: sp, ptys: ptys})
 	}
 	return db.buildScanRows(sp, ptys, params, true)
 }

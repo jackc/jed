@@ -27,7 +27,16 @@ export { Engine } from "./executor.ts";
 export { loadEngine, toImage } from "./format.ts";
 export { create, open, commit, rollback, close } from "./file.ts";
 import { query } from "./api.ts";
-export { begin, prepare, query, querySql, update, view } from "./api.ts";
+export {
+  begin,
+  executePrepared,
+  prepare,
+  query,
+  queryPrepared,
+  querySql,
+  update,
+  view,
+} from "./api.ts";
 
 // drainOutcome pulls a total-`query` cursor to exhaustion and packages the result set + command tag as
 // an Outcome — the shape the removed `execute -> Outcome` API returned, but built over the seam callers

@@ -11,10 +11,12 @@ import {
   type Session,
   create,
   executeParams,
+  executePrepared,
   open,
   openDatabase,
   prepare,
   query,
+  queryPrepared,
 } from "../../../impl/ts/src/tooling.ts";
 import { intValue, textValue, type Value } from "../../../impl/ts/src/value.ts";
 
@@ -50,7 +52,7 @@ class JedEngine implements Engine {
   }
 
   async queryPrepared(args: Arg[], sum: Checksum | null): Promise<number> {
-    const rows = this.stmt!.query(bindArgs(args));
+    const rows = queryPrepared(this.db, this.stmt!, bindArgs(args));
     let n = 0;
     for (const row of rows) {
       n++;
@@ -76,7 +78,7 @@ class JedEngine implements Engine {
   }
 
   async execPrepared(args: Arg[]): Promise<void> {
-    this.stmt!.execute(bindArgs(args));
+    executePrepared(this.db, this.stmt!, bindArgs(args));
   }
 
   async queryInt(sql: string): Promise<bigint> {
@@ -147,8 +149,9 @@ function bindArgs(args: Arg[]): Value[] {
   return args.map((a) => (typeof a === "bigint" ? intValue(a) : textValue(a)));
 }
 
-// runReaderQuery runs one query through a reader Session, re-parsing the SQL each call (the
-// host session API has no prepared-statement form; benchmarks.md §8.1), folding rows into sum.
+// runReaderQuery runs one query through a reader Session, re-parsing the SQL each call — deliberate
+// (benchmarks.md §8.1): a constant per-query parse cost is included, uniform across the jed cores —
+// folding rows into sum.
 function runReaderQuery(sess: Session, sql: string, args: Arg[], sum: Checksum | null): number {
   const rows = sess.query(sql, bindArgs(args));
   let n = 0;

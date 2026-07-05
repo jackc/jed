@@ -8,8 +8,9 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Engine, execute, intValue, prepare } from "../src/tooling.ts";
+import { Engine, execute, intValue, prepare, queryPrepared } from "../src/tooling.ts";
 import type { Value } from "../src/value.ts";
+import { memDb } from "./mem_db.ts";
 
 type PreparedLike = ReturnType<typeof prepare>;
 
@@ -19,8 +20,12 @@ function cacheOf(stmt: PreparedLike): { catGen: bigint; sp: unknown } | null {
     .scHolder.cache;
 }
 
-function drain(stmt: PreparedLike, params: Value[] = []): { rows: Value[][]; cost: bigint } {
-  const cursor = stmt.query(params);
+function drain(
+  db: Engine,
+  stmt: PreparedLike,
+  params: Value[] = [],
+): { rows: Value[][]; cost: bigint } {
+  const cursor = queryPrepared(db, stmt, params);
   const rows: Value[][] = [];
   for (const r of cursor) rows.push(r);
   const cost = cursor.cost;
@@ -40,24 +45,24 @@ test("plan cache: point lookup reuses the plan, cost-identical", () => {
   seedOrders(db, 5);
   const stmt = prepare(db, "SELECT id, amount FROM orders WHERE id = $1");
 
-  const r1 = drain(stmt, [intValue(3n)]);
+  const r1 = drain(db, stmt, [intValue(3n)]);
   assert.deepEqual(r1.rows, [[intValue(3n), intValue(300n)]]);
   const cached = cacheOf(stmt);
   assert.notEqual(cached, null, "cache should fill on the first cacheable execute");
   const sp = cached!.sp;
 
-  const r2 = drain(stmt, [intValue(3n)]);
+  const r2 = drain(db, stmt, [intValue(3n)]);
   assert.deepEqual(r2.rows, [[intValue(3n), intValue(300n)]]);
   assert.equal(cacheOf(stmt)!.sp, sp, "the cached plan object changed — statement re-planned");
   assert.equal(r2.cost, r1.cost, "reusing the cached plan must be cost-identical");
 
   // Different param binds against the same cached plan.
-  const r3 = drain(stmt, [intValue(5n)]);
+  const r3 = drain(db, stmt, [intValue(5n)]);
   assert.deepEqual(r3.rows, [[intValue(5n), intValue(500n)]]);
   assert.equal(cacheOf(stmt)!.sp, sp, "plan object changed on a param-only change");
 
   // A no-match param.
-  assert.deepEqual(drain(stmt, [intValue(999n)]).rows, []);
+  assert.deepEqual(drain(db, stmt, [intValue(999n)]).rows, []);
 });
 
 // DROP + re-CREATE with a different shape bumps the catalog generation, so the next execute re-plans
@@ -68,7 +73,7 @@ test("plan cache: DROP/CREATE invalidates", () => {
   execute(db, "INSERT INTO t VALUES (1, 10)");
   const stmt = prepare(db, "SELECT * FROM t WHERE id = $1");
 
-  const r1 = drain(stmt, [intValue(1n)]);
+  const r1 = drain(db, stmt, [intValue(1n)]);
   assert.deepEqual(r1.rows, [[intValue(1n), intValue(10n)]]);
   const gen1 = cacheOf(stmt)!.catGen;
 
@@ -76,7 +81,7 @@ test("plan cache: DROP/CREATE invalidates", () => {
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, a i32, c i32)");
   execute(db, "INSERT INTO t VALUES (1, 10, 20)");
 
-  const r2 = drain(stmt, [intValue(1n)]);
+  const r2 = drain(db, stmt, [intValue(1n)]);
   assert.deepEqual(
     r2.rows,
     [[intValue(1n), intValue(10n), intValue(20n)]],
@@ -93,11 +98,11 @@ test("plan cache: index DDL invalidates", () => {
   for (let i = 1; i <= 50; i++) execute(db, `INSERT INTO t VALUES (${i}, ${i})`);
   const stmt = prepare(db, "SELECT id FROM t WHERE a = $1");
 
-  const scan = drain(stmt, [intValue(25n)]);
+  const scan = drain(db, stmt, [intValue(25n)]);
   assert.deepEqual(scan.rows, [[intValue(25n)]]);
 
   execute(db, "CREATE INDEX t_a ON t (a)");
-  const idx = drain(stmt, [intValue(25n)]);
+  const idx = drain(db, stmt, [intValue(25n)]);
   assert.deepEqual(idx.rows, [[intValue(25n)]]);
   assert.ok(
     idx.cost < scan.cost,
@@ -105,7 +110,7 @@ test("plan cache: index DDL invalidates", () => {
   );
 
   execute(db, "DROP INDEX t_a");
-  const scan2 = drain(stmt, [intValue(25n)]);
+  const scan2 = drain(db, stmt, [intValue(25n)]);
   assert.deepEqual(scan2.rows, [[intValue(25n)]]);
   assert.ok(
     scan2.cost > idx.cost,
@@ -121,10 +126,10 @@ test("plan cache: precompiled-regex plan is not cached", () => {
   execute(db, "INSERT INTO t VALUES (1, 'abc'), (2, 'xyz'), (3, 'abd')");
   const stmt = prepare(db, "SELECT id FROM t WHERE note ~ 'ab'");
 
-  const r1 = drain(stmt);
+  const r1 = drain(db, stmt);
   assert.deepEqual(r1.rows, [[intValue(1n)], [intValue(3n)]]);
   assert.equal(cacheOf(stmt), null, "a precompiled-regex plan must not be cached");
-  const r2 = drain(stmt);
+  const r2 = drain(db, stmt);
   assert.equal(r2.cost, r1.cost, "regex cost drifted across executes (regex plan wrongly cached?)");
 });
 
@@ -135,9 +140,132 @@ test("plan cache: subquery plan is not cached, stays correct", () => {
   execute(db, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)");
   const stmt = prepare(db, "SELECT id FROM t WHERE id = (SELECT max(id) FROM t)");
 
-  assert.deepEqual(drain(stmt).rows, [[intValue(3n)]]);
+  assert.deepEqual(drain(db, stmt).rows, [[intValue(3n)]]);
   assert.equal(cacheOf(stmt), null, "a subquery plan must not be cached");
   // Insert a larger id; the (uncached, re-planned + re-evaluated) subquery must reflect it.
   execute(db, "INSERT INTO t VALUES (4, 40)");
-  assert.deepEqual(drain(stmt).rows, [[intValue(4n)]]);
+  assert.deepEqual(drain(db, stmt).rows, [[intValue(4n)]]);
+});
+
+// --- The converged shared-core surface (spec/design/api.md §2.4): a statement is a standalone value
+// run via the handles' prepareStatement / queryPrepared / executePrepared, shared across sessions. ---
+
+// A statement is a standalone value: a plan filled on one session is reused (same plan object, same
+// cost) by a different session over the same Database.
+test("plan cache: statement shared across sessions", () => {
+  const db = memDb();
+  const a = db.session({});
+  a.execute("CREATE TABLE orders (id i32 PRIMARY KEY, amount i32)");
+  for (let i = 1; i <= 5; i++) a.execute(`INSERT INTO orders VALUES (${i}, ${i * 100})`);
+  const stmt = db.prepareStatement("SELECT id, amount FROM orders WHERE id = $1");
+
+  const drainOn = (s: typeof a, params: Value[]) => {
+    const cursor = s.queryPrepared(stmt, params);
+    const rows: Value[][] = [];
+    for (const r of cursor) rows.push(r);
+    const cost = cursor.cost;
+    cursor.close();
+    return { rows, cost };
+  };
+
+  const ra = drainOn(a, [intValue(3n)]);
+  assert.deepEqual(ra.rows, [[intValue(3n), intValue(300n)]]);
+  const cached = cacheOf(stmt);
+  assert.notEqual(cached, null, "cache should fill on session A");
+
+  const b = db.session({});
+  const rb = drainOn(b, [intValue(3n)]);
+  assert.deepEqual(rb.rows, [[intValue(3n), intValue(300n)]]);
+  assert.equal(cacheOf(stmt)!.sp, cached!.sp, "session B re-planned — the plan must be shared");
+  assert.equal(rb.cost, ra.cost, "cross-session reuse must be cost-identical");
+  a.close();
+  b.close();
+});
+
+// A statement executed against a DIFFERENT Database must not falsely hit: catGen is only monotonic
+// within one core, so two databases can sit at the same generation with different schemas. The
+// entry's core identity forces a re-plan against the other database.
+test("plan cache: distinct databases never false-hit", () => {
+  const db1 = memDb();
+  const db2 = memDb();
+  // One CREATE each → both cores sit at the SAME catalog generation with different table shapes.
+  db1.execute("CREATE TABLE t (id i32 PRIMARY KEY, a i32)");
+  db2.execute("CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32)");
+  db1.execute("INSERT INTO t VALUES (1, 10)");
+  db2.execute("INSERT INTO t VALUES (1, 10, 20)");
+
+  const stmt = db1.prepareStatement("SELECT * FROM t WHERE id = $1");
+  const r1 = db1.queryPrepared(stmt, [intValue(1n)]);
+  assert.deepEqual([...r1], [[intValue(1n), intValue(10n)]]);
+  r1.close();
+
+  // Same catGen, different core: a false hit would serve db1's 2-column plan against db2.
+  const r2 = db2.queryPrepared(stmt, [intValue(1n)]);
+  assert.deepEqual(
+    [...r2],
+    [[intValue(1n), intValue(10n), intValue(20n)]],
+    "stale cross-database plan served?",
+  );
+  r2.close();
+});
+
+// A plan cached where a relation name is persistent must not be served on a session whose
+// session-local temp table shadows that name — the hit path re-checks the plan's relations against
+// the executing session's temp domain and re-plans.
+test("plan cache: temp shadow re-plans", () => {
+  const db = memDb();
+  // Session B creates its temp table FIRST (a temp name may not shadow an existing persistent table,
+  // but a later persistent CREATE in another session cannot see B's temp domain).
+  const b = db.session({});
+  b.execute("CREATE TEMP TABLE t (id i32 PRIMARY KEY, v i32)");
+  b.execute("INSERT INTO t VALUES (1, 111)");
+
+  const a = db.session({});
+  a.execute("CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32)");
+  a.execute("INSERT INTO t VALUES (1, 10, 20)");
+
+  const stmt = db.prepareStatement("SELECT * FROM t WHERE id = $1");
+  const ra = a.queryPrepared(stmt, [intValue(1n)]);
+  assert.deepEqual([...ra], [[intValue(1n), intValue(10n), intValue(20n)]]);
+  ra.close();
+  assert.notEqual(cacheOf(stmt), null, "cache should fill on the persistent session");
+
+  // Session B: same core, same catGen — but t resolves temp-first there. The cached persistent plan
+  // must not be served (and B's temp plan is never cached).
+  const rb = b.queryPrepared(stmt, [intValue(1n)]);
+  assert.deepEqual(
+    [...rb],
+    [[intValue(1n), intValue(111n)]],
+    "stale persistent plan served on a temp-shadowed session?",
+  );
+  rb.close();
+
+  // Back on A the persistent plan still serves (B's run did not poison the cache).
+  const ra2 = a.queryPrepared(stmt, [intValue(1n)]);
+  assert.deepEqual([...ra2], [[intValue(1n), intValue(10n), intValue(20n)]]);
+  ra2.close();
+  a.close();
+  b.close();
+});
+
+// The Transaction handle runs prepared statements too (the converged trio): read-your-writes inside
+// the block, and the same statement value works before, during, and after.
+test("plan cache: transaction runs prepared statements", () => {
+  const db = memDb();
+  db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
+  const insert = db.prepareStatement("INSERT INTO t VALUES ($1, $2)");
+  const select = db.prepareStatement("SELECT v FROM t WHERE id = $1");
+
+  assert.equal(db.executePrepared(insert, [intValue(1n), intValue(100n)]).changes, 1);
+  const s = db.session({});
+  s.update((tx) => {
+    assert.equal(tx.executePrepared(insert, [intValue(2n), intValue(200n)]).changes, 1);
+    const rows = tx.queryPrepared(select, [intValue(2n)]);
+    assert.deepEqual([...rows], [[intValue(200n)]], "in-tx prepared read-your-writes");
+    rows.close();
+  });
+  const after = s.queryPrepared(select, [intValue(2n)]);
+  assert.deepEqual([...after], [[intValue(200n)]], "the block committed");
+  after.close();
+  s.close();
 });

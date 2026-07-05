@@ -440,8 +440,8 @@ into `readers` contiguous blocks, and hands them to the driver's concurrency hoo
    clock** of the timed phase.
 
 `total_ns` is that wall clock, so `ns_per_op = wall / iterations` is throughput latency.
-The checksum is partition-folded (§6). Readers re-parse the SQL each call — the host session
-API has no prepared-statement form — so a constant per-query parse cost is *included*
+The checksum is partition-folded (§6). Readers re-parse the SQL each call — deliberately, not
+via the session prepared-statement form — so a constant per-query parse cost is *included*
 (uniform across the jed cores, so it does not distort the scaling).
 
 **Dataset choice.** The benches use the **resident** `small` dataset deliberately: with the

@@ -16,37 +16,50 @@ import {
 import { type Engine, type Outcome, type ScanCacheHolder, stmtIsWrite } from "./executor.ts";
 import type { Value } from "./value.ts";
 
-// PreparedStatement is a parsed, reusable statement (spec/design/api.md §2.4). It holds the
-// parsed AST and a reference to the database it was prepared against (JS is GC'd, so binding the
-// database at prepare is safe — unlike Rust's borrow model, api.md §6).
+// PreparedStatement is a parsed, reusable statement (spec/design/api.md §2.4): a standalone value
+// holding only the parsed AST and its plan cache — no session or database reference (the converged
+// cross-core shape; Rust arrived here via the borrow checker, api.md §6). It is run by handing it to
+// a handle's queryPrepared / executePrepared (Database, Session, Transaction — or the low-level free
+// functions over a bare Engine): the handle chosen at each call supplies the session the execute
+// observes (privilege envelope, pinned snapshot, temp domain), so one statement outlives any session
+// and may be shared across sessions. The cached plan is keyed to the database + committed catalog
+// generation it was resolved against, so DDL, a different database, or a temp-shadowed name re-plans
+// rather than serving a stale plan.
 export class PreparedStatement {
-  private readonly db: Engine;
-  private readonly ast: Statement;
-  // scHolder memoizes the resolved scan plan across query() calls so a repeated execute skips
-  // planning (the plan cache, spec/design/api.md §2.4). Populated lazily on the first cacheable query
-  // execute and invalidated automatically when the catalog generation moves (ScanCache.catGen).
-  // Query-only — execute() (writes / materialized shapes) never touches it.
-  private readonly scHolder: ScanCacheHolder = { cache: null };
+  /** @internal The parsed AST — reached by the handle queryPrepared paths, never a public field. */
+  readonly ast: Statement;
+  /**
+   * @internal The plan-cache slot: memoizes the resolved scan plan across executes so a repeated
+   * query skips planning (spec/design/api.md §2.4). Populated lazily on the first cacheable query
+   * execute; invalidated automatically when the catalog generation moves (ScanCache). Query-only —
+   * a write / materialized shape never touches it.
+   */
+  readonly scHolder: ScanCacheHolder = { cache: null };
 
-  constructor(db: Engine, ast: Statement) {
-    this.db = db;
+  constructor(ast: Statement) {
     this.ast = ast;
   }
+}
 
-  // execute runs this statement, binding params to its $N placeholders (empty when it has none), and
-  // returns its command tag — exec-side sugar over the total query seam (drain-and-discard the rows,
-  // keep the tag). Use query() to read a result set.
-  execute(params: Value[] = []): RunResult {
-    return drainRun(this.query(params));
-  }
+// executePrepared runs a prepared statement on a bare Engine handle, binding params to its $N
+// placeholders, and returns its command tag — exec-side sugar over the total queryPrepared seam
+// (drain-and-discard the rows, keep the tag). The shared-core surface is
+// Database/Session/Transaction.executePrepared (spec/design/api.md §2.4).
+export function executePrepared(
+  db: Engine,
+  stmt: PreparedStatement,
+  params: Value[] = [],
+): RunResult {
+  return drainRun(queryPrepared(db, stmt, params));
+}
 
-  // query runs this query statement, returning a row cursor. The prepared AST routes through the same
-  // lazy scan (streaming/buffered) then deferred lanes as the ad-hoc query (spec/design/streaming.md
-  // §3/§4/§7) — so a prepared query streams exactly like a one-shot one — but reuses its cached plan
-  // across executes (spec/design/api.md §2.4). A non-query statement is a 42601 (use execute).
-  query(params: Value[] = []): Rows {
-    return queryStmt(this.db, this.ast, params, this.scHolder);
-  }
+// queryPrepared runs a prepared query on a bare Engine handle, returning a row cursor. The prepared
+// AST routes through the same lazy scan (streaming/buffered) then deferred lanes as the ad-hoc query
+// (spec/design/streaming.md §3/§4/§7) — so a prepared query streams exactly like a one-shot one —
+// but reuses its cached plan across executes (spec/design/api.md §2.4). The shared-core surface is
+// Database/Session/Transaction.queryPrepared.
+export function queryPrepared(db: Engine, stmt: PreparedStatement, params: Value[] = []): Rows {
+  return queryStmt(db, stmt.ast, params, stmt.scHolder);
 }
 
 // Rows is a cursor over a query's rows (spec/design/api.md §4). It is a thin wrapper over a Cursor
@@ -174,10 +187,11 @@ export function rowsFromOutcome(out: Outcome): Rows {
   return new Rows([], [], Cursor.buffered([], out.cost), out.rowsAffected);
 }
 
-// prepare parses sql once into a reusable prepared statement (spec/design/api.md §2.4). Parse
-// errors (42601, …) surface here.
+// prepare parses sql once into a reusable prepared statement (spec/design/api.md §2.4): a standalone
+// value bound to no handle — db only supplies the parse (its 54000 input-size limit). Run it with
+// queryPrepared / executePrepared on any handle. Parse errors (42601, …) surface here.
 export function prepare(db: Engine, sql: string): PreparedStatement {
-  return new PreparedStatement(db, db.parse(sql));
+  return new PreparedStatement(db.parse(sql));
 }
 
 // query is a one-shot: parse + run a query sql, binding params, returning a row cursor. A single-table
@@ -280,6 +294,28 @@ export class Transaction {
   // non-query statement is a Rows with no output columns, carrying the command tag).
   query(sql: string, params: Value[] = []): Rows {
     return rowsFromOutcome(this.db.executeStmtParams(this.db.parse(sql), params));
+  }
+
+  // prepareStatement parses sql once into a reusable PreparedStatement (spec/design/api.md §2.4): a
+  // standalone value bound to no handle — run it with queryPrepared / executePrepared on any handle
+  // over this database. (Named prepareStatement because prepare() is the better-sqlite3-style
+  // ergonomic Statement, api.md §11 — a TS-only naming divergence, api.md §6.)
+  prepareStatement(sql: string): PreparedStatement {
+    return new PreparedStatement(this.db.parse(sql));
+  }
+
+  // executePrepared runs a prepared statement within this transaction, binding params, and returns
+  // its command tag — the prepared analogue of execute (spec/design/api.md §2.4).
+  executePrepared(stmt: PreparedStatement, params: Value[] = []): RunResult {
+    return drainRun(this.queryPrepared(stmt, params));
+  }
+
+  // queryPrepared runs a prepared query within this transaction (against its working set), returning
+  // a row cursor — the prepared analogue of query. Like query, the transaction path is materialized
+  // (no lazy lane), so the plan cache is neither consulted nor filled here — an in-block execute is
+  // correct but unmemoized, matching fill-only-from-committed (api.md §2.4).
+  queryPrepared(stmt: PreparedStatement, params: Value[] = []): Rows {
+    return rowsFromOutcome(this.db.executeStmtParams(stmt.ast, params));
   }
 
   // executeCancelable runs a statement within this transaction under an AbortSignal (spec/design/

@@ -22,9 +22,10 @@ func queryOutcome(q valueQuerier, sql string, params []Value) (outcome, error) {
 	return drainOutcome(rows)
 }
 
-// prepOutcome is queryOutcome for a prepared statement (its queryValues binds only params).
-func prepOutcome(p *PreparedStatement, params []Value) (outcome, error) {
-	rows, err := p.queryValues(params)
+// prepOutcome is queryOutcome for a prepared statement, run on s — a statement is a standalone
+// value; the handle passed at each execute supplies the session (spec/design/api.md §2.4).
+func prepOutcome(s *Session, p *PreparedStatement, params []Value) (outcome, error) {
+	rows, err := s.queryStmt(p.ast, params, &p.sc)
 	if err != nil {
 		return outcome{}, err
 	}

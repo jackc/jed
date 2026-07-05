@@ -76,44 +76,22 @@ func (db *engine) withTx(writable bool, fn func(tx *Transaction) error) error {
 	return tx.Commit()
 }
 
-// PreparedStatement is a parsed, reusable statement (spec/design/api.md §2.4). It holds the
-// parsed AST and a back-pointer to the handle it was prepared against (Go is GC'd, so binding
-// the handle at prepare is safe — unlike Rust's borrow model, api.md §6). When prepared on a
-// Session/Database (sess set) Execute routes through the session's dispatch — the lazy writer
-// gate for writes, the pinned snapshot for reads — so it observes the converged §2.4 semantics.
+// PreparedStatement is a parsed, reusable statement (spec/design/api.md §2.4): a standalone value
+// holding only the parsed AST and its plan cache — no session or database reference (the converged
+// cross-core shape; Rust arrived here via the borrow checker, api.md §6). It is run by handing it to
+// a handle's QueryPrepared / ExecPrepared / QueryRowPrepared (Database, Session, or Transaction —
+// ergonomic.go): the handle chosen at each call supplies the session the execute observes (privilege
+// envelope, pinned snapshot, temp domain, writer gate), so one statement outlives any session and may
+// be shared across sessions — and across goroutines (the plan cache is a lock-free atomic slot; the
+// executing handle itself keeps its own single-goroutine contract).
 type PreparedStatement struct {
-	db   *engine
-	sess *Session
-	ast  statement
-	// sc memoizes the resolved scan plan across queryValues calls so a repeated execute skips
-	// planning (the plan cache, spec/design/api.md §2.4). Populated lazily on the first cacheable
-	// query execute and invalidated automatically when the catalog changes (scanCache.catGen). Zero
-	// value is empty. Query-only — a write / materialized shape never touches it.
-	sc scanCache
-}
-
-// Prepare parses sql once into a reusable prepared statement (spec/design/api.md §2.4). Parse
-// errors (42601, …) surface here.
-func (db *engine) Prepare(sql string) (*PreparedStatement, error) {
-	stmt, err := db.parse(sql)
-	if err != nil {
-		return nil, err
-	}
-	return &PreparedStatement{db: db, ast: stmt}, nil
-}
-
-// queryValues is the unexported raw ([]Value) -> *Rows seam the prepared statement's ergonomic
-// Query/Exec/QueryRow (ergonomic.go) build on. The prepared AST routes through the same lazy streaming /
-// buffered / deferred lanes as an ad-hoc queryValues (spec/design/streaming.md §3/§4/§7) — so a prepared
-// query streams exactly like a one-shot one. When prepared on a Session (sess set) it routes through the
-// session (the pinned snapshot + watermark, the converged §2.4 semantics); a bare engine prepared
-// statement routes through the engine. Total: a non-query statement returns a no-column cursor carrying
-// the command tag.
-func (s *PreparedStatement) queryValues(params []Value) (*Rows, error) {
-	if s.sess != nil {
-		return s.sess.queryStmt(s.ast, params, &s.sc)
-	}
-	return s.db.queryStmt(s.ast, params, &s.sc)
+	ast statement
+	// sc memoizes the resolved scan plan across executes so a repeated query skips planning (the
+	// plan cache, spec/design/api.md §2.4). Populated lazily on the first cacheable query execute;
+	// an entry is keyed to the Database (core) + committed catalog generation it was resolved
+	// against, so DDL — or executing on a different database — re-plans. Zero value is empty.
+	// Query-only — a write / materialized shape never touches it.
+	sc stmtCache
 }
 
 // queryValues is a one-shot: parse + run a statement, binding params, returning a row cursor. A
@@ -137,10 +115,10 @@ func (db *engine) queryValues(sql string, params []Value) (*Rows, error) {
 // deferred lanes, planning a scan-shaped SELECT exactly once (tryScanQuery), and falling back to the
 // materialized ExecuteStmtParams for a shape no lazy lane covers (a write, a nextval/setval SELECT, a
 // data-modifying WITH). Shared by queryValues (parse-then-route, sc nil) and a prepared query
-// (PreparedStatement.queryValues passes its scanCache), so a prepared query streams identically to an
-// ad-hoc one but reuses its cached plan across executes. (This is the bare single-handle engine; the
-// watermark pin lives on the shared-core Session.queryValues path.)
-func (db *engine) queryStmt(stmt statement, params []Value, sc *scanCache) (*Rows, error) {
+// (the *Prepared methods pass the statement's stmtCache), so a prepared query streams identically to
+// an ad-hoc one but reuses its cached plan across executes. (This is the bare single-handle engine;
+// the watermark pin lives on the shared-core Session.queryValues path.)
+func (db *engine) queryStmt(stmt statement, params []Value, sc *stmtCache) (*Rows, error) {
 	// A read served by a lazy lane skips the materialized dispatch, so enforce the read-path admission
 	// gates (25P02 / 54P02 / 42501) up front — reads only (transaction control must work in a failed
 	// block; a write is gated inside dispatch on the fall-through). Keeps the bare-engine queryValues a

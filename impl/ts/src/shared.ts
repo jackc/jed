@@ -55,10 +55,11 @@ import {
   Snapshot,
   stmtIsWrite,
   type Outcome,
+  type ScanCacheHolder,
   type SessionOptions,
   type TxStatus,
 } from "./executor.ts";
-import { Rows, rowsFromOutcome, Transaction } from "./api.ts";
+import { PreparedStatement, Rows, rowsFromOutcome, Transaction } from "./api.ts";
 import { loadEngine, newAttachedStorage, toImage as toImageBytes } from "./format.ts";
 import type { CompositeType, Table } from "./catalog.ts";
 import type { Row } from "./storage.ts";
@@ -467,6 +468,43 @@ export class Database {
     }
   }
 
+  // prepareStatement parses sql once into a reusable PreparedStatement (spec/design/api.md §2.4): a
+  // standalone value bound to no session — run it with queryPrepared / executePrepared on any handle
+  // over this database (the statement outlives the transient session used to parse it). (Named
+  // prepareStatement because prepare() is the better-sqlite3-style ergonomic Statement below — a
+  // TS-only naming divergence, api.md §6.)
+  prepareStatement(sql: string): PreparedStatement {
+    const s = this.session({});
+    try {
+      return s.prepareStatement(sql);
+    } finally {
+      s.close();
+    }
+  }
+
+  // executePrepared runs a prepared statement on a fresh autocommit session, binding $N params, and
+  // returns its command tag — the prepared analogue of execute (spec/design/api.md §2.4).
+  executePrepared(stmt: PreparedStatement, params: Value[] = []): RunResult {
+    const s = this.session({});
+    try {
+      return s.executePrepared(stmt, params);
+    } finally {
+      s.close();
+    }
+  }
+
+  // queryPrepared runs a prepared query on a fresh autocommit session, returning a row cursor — the
+  // prepared analogue of query (the streaming cursor owns its snapshot, so it stays valid after the
+  // transient session is closed).
+  queryPrepared(stmt: PreparedStatement, params: Value[] = []): Rows {
+    const s = this.session({});
+    try {
+      return s.queryPrepared(stmt, params);
+    } finally {
+      s.close();
+    }
+  }
+
   // --- better-sqlite3-style ergonomic methods (spec/design/api.md §11): a reusable prepared
   // Statement, or one-shot run/get/all over native JS params + rows-as-objects. Like execute/query
   // above, each one-shot mints a fresh autocommit session under the hood (via the Statement). ---
@@ -687,7 +725,16 @@ export class Session {
   // DEFERRED cursor (streaming.md §7) that defers the whole run to the first pull and yields the result
   // one row at a time; a data-modifying WITH (a write) still falls back to the materialized dispatch path.
   query(sql: string, params: Value[] = []): Rows {
-    const stmt = this.engine.parse(sql);
+    return this.queryStmt(this.engine.parse(sql), params, null); // one-shot: no cross-call plan cache (still plans once)
+  }
+
+  // queryStmt routes an already-parsed query AST through the session's lazy lanes — the autocommit
+  // re-pin, the plan-once scan (streaming/buffered) then deferred cursors, and the reader-liveness
+  // watermark pin — falling back to the materialized dispatch for a shape no lazy lane covers (a
+  // write, a data-modifying WITH). Shared by query (parse-then-route, holder null) and a prepared
+  // query (queryPrepared passes the statement's ScanCacheHolder), so a prepared query streams and
+  // pins its snapshot exactly like an ad-hoc one but reuses its cached plan across executes.
+  private queryStmt(stmt: Statement, params: Value[], holder: ScanCacheHolder | null): Rows {
     // Route the read before building the lazy cursor: an autocommit (non-block, writable access) read
     // re-pins the latest committed so the snapshot is current; a read-only session uses its existing
     // pin, and an open block uses its working set.
@@ -727,9 +774,10 @@ export class Session {
     };
     try {
       if (isRead) this.engine.gateReadLanes(stmt);
-      // One plan-once scan lane serves both streaming and buffered shapes (this ad-hoc path plans once
-      // per call, holder null). Both are live readers and pin their snapshot in the watermark.
-      const scanned = this.engine.tryScanQuery(stmt, params, null);
+      // One plan-once scan lane serves both streaming and buffered shapes (an ad-hoc call plans once,
+      // holder null; a prepared statement reuses its cached plan). Both are live readers and pin their
+      // snapshot in the watermark.
+      const scanned = this.engine.tryScanQuery(stmt, params, holder);
       if (scanned !== null) return pin(scanned);
       // A top-level set operation / pure-query WITH is served by a lazy DEFERRED cursor (streaming.md
       // §7): it defers the whole run to the first pull and yields the result one row at a time; it is a
@@ -762,6 +810,30 @@ export class Session {
   queryCancelable(sql: string, params: Value[] = [], signal?: AbortSignal): Rows {
     throwIfAborted(signal);
     return this.query(sql, params);
+  }
+
+  // prepareStatement parses sql once into a reusable PreparedStatement (spec/design/api.md §2.4): a
+  // standalone value bound to no session — this session only supplies the parse (its 54000 input-size
+  // limit). Run it with queryPrepared / executePrepared on any handle over this database; the
+  // executing handle supplies the session each run observes (privileges, snapshot, temp domain).
+  // (Named prepareStatement because prepare() is the better-sqlite3-style ergonomic Statement below —
+  // a TS-only naming divergence, api.md §6.)
+  prepareStatement(sql: string): PreparedStatement {
+    return new PreparedStatement(this.engine.parse(sql));
+  }
+
+  // executePrepared runs a prepared statement on this session, binding $N params, and returns its
+  // command tag — the prepared analogue of execute (spec/design/api.md §2.4).
+  executePrepared(stmt: PreparedStatement, params: Value[] = []): RunResult {
+    return drainRun(this.queryPrepared(stmt, params));
+  }
+
+  // queryPrepared runs a prepared query on this session (its pinned snapshot, privileges, temp
+  // domain), returning a row cursor. The prepared AST routes through the same lazy lanes as the
+  // ad-hoc query — so a prepared query streams and pins its snapshot identically — but reuses its
+  // cached plan across executes (and across sessions of one database, spec/design/api.md §2.4).
+  queryPrepared(stmt: PreparedStatement, params: Value[] = []): Rows {
+    return this.queryStmt(stmt.ast, params, stmt.scHolder);
   }
 
   // --- better-sqlite3-style ergonomic methods (spec/design/api.md §11): a reusable prepared

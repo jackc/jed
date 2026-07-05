@@ -11,25 +11,29 @@ use crate::parser::Parser;
 use crate::value::Value;
 use std::cell::RefCell;
 
-/// A parsed, reusable statement (spec/design/api.md §2.4). It owns the parsed AST — the database is
-/// supplied at execute/query time, so a `PreparedStatement` never holds a `Engine` borrow
-/// (sidestepping the `&Engine` / `&mut Engine` aliasing problem; api.md §6) — plus a lazily-populated
-/// **plan cache**: a scan-shaped query reuses its resolved plan across executes, re-planning only when
-/// the catalog changes. Because the cached plan is `Rc<SelectPlan>` (the plan holds a regex `Cell`, so
-/// `Arc` buys nothing), a `PreparedStatement` is `!Send` — a non-regression, since the whole
-/// query/cursor path is already thread-affine; a host that wants a statement on another thread
-/// re-prepares there (a cheap re-parse).
+/// A parsed, reusable statement (spec/design/api.md §2.4): a standalone value holding only the
+/// parsed AST and its plan cache — never a handle borrow (which also sidesteps the `&Engine` /
+/// `&mut Engine` aliasing problem; api.md §6). It is run by handing it to a handle's
+/// `execute_prepared` / `query_prepared` ([`Database`](crate::Database), [`Session`](crate::Session),
+/// or [`Transaction`]): the handle chosen at each call supplies the session the execute observes
+/// (privilege envelope, pinned snapshot, temp domain), so one statement outlives any session and may
+/// be reused across sessions — the cached plan is keyed to the database + committed catalog
+/// generation it was resolved against, so DDL, a different database, or a temp-shadowed name re-plans
+/// rather than serving a stale plan. Because the cached plan is `Rc<SelectPlan>` (the plan holds a
+/// regex `Cell`, so `Arc` buys nothing), a `PreparedStatement` is `!Send` — a non-regression, since
+/// the whole query/cursor path is already thread-affine; a host that wants a statement on another
+/// thread re-prepares there (a cheap re-parse).
 pub struct PreparedStatement {
     ast: Statement,
-    /// The resolved-plan cache (`RefCell` for interior mutability — `query` takes `&self`). Empty
-    /// until the first cacheable query execute fills it; invalidated automatically when the catalog
-    /// generation moves (spec/design/api.md §2.4).
+    /// The resolved-plan cache (`RefCell` for interior mutability — the statement is passed `&`).
+    /// Empty until the first cacheable query execute fills it; invalidated automatically when the
+    /// catalog generation moves (spec/design/api.md §2.4).
     cache: RefCell<Option<CachedPlan>>,
 }
 
 impl PreparedStatement {
     /// The parsed statement. The public prepared-execution path is on
-    /// [`Database`](crate::Database) / [`Session`](crate::Session)
+    /// [`Database`](crate::Database) / [`Session`](crate::Session) / [`Transaction`]
     /// (`prepare` + `execute_prepared` / `query_prepared`), which dispatch this AST through the
     /// session's lazy-gate lifecycle (spec/design/session.md §2.4); this accessor lets that layer
     /// reach the AST.
@@ -37,20 +41,10 @@ impl PreparedStatement {
         &self.ast
     }
 
-    /// The plan cache — reached by the shared-core `query_prepared` path so a prepared query on a
-    /// [`Session`](crate::Session) also reuses its plan across executes.
+    /// The plan cache — reached by the handle `query_prepared` paths so a prepared query reuses its
+    /// plan across executes (and across sessions of one database).
     pub(crate) fn cache(&self) -> &RefCell<Option<CachedPlan>> {
         &self.cache
-    }
-
-    /// Run this **query** statement against a low-level [`Engine`] handle, routing the parsed AST
-    /// through the same lazy streaming / buffered / deferred lanes as the ad-hoc
-    /// [`Engine::query`](Engine::query) (spec/design/streaming.md §3/§4/§7) — so a prepared query
-    /// streams exactly like a one-shot one (a single-table read pulls row-at-a-time; a blocking read
-    /// buffers its input but yields its output lazily). Internal: the public path is
-    /// [`Database::query_prepared`](crate::Database::query_prepared).
-    pub(crate) fn query(&self, db: &mut Engine, params: &[Value]) -> Result<Rows> {
-        db.query_ast_cached(&self.ast, params, Some(&self.cache))
     }
 }
 
@@ -272,6 +266,21 @@ impl Transaction<'_> {
     /// Run a query within this transaction, returning a row cursor.
     pub fn query(&mut self, sql: &str, params: &[Value]) -> Result<Rows> {
         self.db.query(sql, params)
+    }
+
+    /// Run a [`PreparedStatement`] within this transaction, binding `params` — the prepared analogue
+    /// of [`execute`](Transaction::execute) (spec/design/api.md §2.4). The statement is a standalone
+    /// value: this transaction supplies the session the execute observes.
+    pub fn execute_prepared(&mut self, stmt: &PreparedStatement, params: &[Value]) -> Result<u64> {
+        drain_affected(self.query_prepared(stmt, params)?)
+    }
+
+    /// Run a prepared **query** within this transaction (against its working set), returning a row
+    /// cursor — the prepared analogue of [`query`](Transaction::query). Reuses the statement's cached
+    /// plan when this database + committed catalog still match it (spec/design/api.md §2.4).
+    pub fn query_prepared(&mut self, stmt: &PreparedStatement, params: &[Value]) -> Result<Rows> {
+        self.db
+            .query_ast_cached(stmt.ast(), params, Some(stmt.cache()))
     }
 
     /// Run a statement within this transaction under a [`CancellationToken`] (spec/design/api.md

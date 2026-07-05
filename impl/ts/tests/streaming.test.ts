@@ -15,7 +15,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { createDatabase, type Database, EngineError, type Session } from "../src/lib.ts";
-import { Engine, execute, intValue, prepare, query, queryOutcome } from "../src/tooling.ts";
+import {
+  Engine,
+  execute,
+  intValue,
+  prepare,
+  query,
+  queryOutcome,
+  queryPrepared,
+} from "../src/tooling.ts";
 import type { Value } from "../src/value.ts";
 import { memDb } from "./mem_db.ts";
 
@@ -635,7 +643,7 @@ function drainPrepared(
   sql: string,
   params: Value[] = [],
 ): { rows: Value[][]; cost: bigint } {
-  const cursor = prepare(db, sql).query(params);
+  const cursor = queryPrepared(db, prepare(db, sql), params);
   const rows: Value[][] = [];
   for (const r of cursor) rows.push(r);
   const cost = cursor.cost;
@@ -702,7 +710,7 @@ test("prepared query early exit charges less", () => {
   const full = drainPrepared(db, "SELECT id FROM t ORDER BY id");
   assert.equal(full.rows.length, 1000);
 
-  const cursor = prepare(db, "SELECT id FROM t ORDER BY id").query();
+  const cursor = queryPrepared(db, prepare(db, "SELECT id FROM t ORDER BY id"));
   const prefix: bigint[] = [];
   for (const r of cursor) {
     const v = r[0]!;
@@ -725,7 +733,7 @@ test("prepared query mid-drain cost abort surfaces", () => {
   const db = seededEngine(1000);
   db.setMaxCost(50n);
   // Building the cursor is fine; the per-row meter guard aborts during the drain.
-  const cursor = prepare(db, "SELECT id FROM t ORDER BY id").query();
+  const cursor = queryPrepared(db, prepare(db, "SELECT id FROM t ORDER BY id"));
   let code = "";
   try {
     let n = 0;

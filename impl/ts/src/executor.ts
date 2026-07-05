@@ -11045,11 +11045,24 @@ export class Engine {
     if (stmt.kind !== "select" || stmtIsWrite(stmt)) return null;
     const snap = this.readSnap();
     const gen = snap.catGen;
-    // Cache HIT: the read snapshot's catalog is unchanged since the plan was cached (its catGen still
-    // matches), so reuse the resolved plan + finalized param types — no planQuery, no fold, no
-    // param-type walk. A cached plan carries no subquery to fold (planCacheable rejected any), so the
-    // shared plan is never mutated; params are still bound per execute.
-    if (holder !== null && holder.cache !== null && holder.cache.catGen === gen) {
+    // The cache entry's identity key: the shared core when this engine belongs to one, else the bare
+    // Engine itself (the low-level tooling path — object identity is GC-safe in JS, so a bare engine
+    // caches without aliasing another).
+    const ident = this.core ?? this;
+    // Cache HIT: the plan was resolved against THIS database (same core — catGen is only monotonic
+    // within one core) and the read snapshot's catalog is unchanged since (its catGen still matches),
+    // and no relation name is shadowed by a session-local temp table the committed generation cannot
+    // see (planTouchesTemp — the statement may have been filled on a different session). Reuse the
+    // resolved plan + finalized param types — no planQuery, no fold, no param-type walk. A cached plan
+    // carries no subquery to fold (planCacheable rejected any), so the shared plan is never mutated;
+    // params are still bound per execute.
+    if (
+      holder !== null &&
+      holder.cache !== null &&
+      holder.cache.core === ident &&
+      holder.cache.catGen === gen &&
+      !this.planTouchesTemp(holder.cache.sp)
+    ) {
       const c = holder.cache;
       return this.buildScanRows(c.sp, bindParams(params, c.ptys), 0n);
     }
@@ -11068,11 +11081,11 @@ export class Engine {
     const subqueryCost = { value: 0n };
     this.foldUncorrelatedInSelect(sp, bound, EMPTY_CTE_CTX, subqueryCost);
     // Fill the cache only from committed state — so committed.catGen is strictly increasing over the
-    // engine's life and never aliases a rolled-back working generation, making the catGen equality on
+    // core's life and never aliases a rolled-back working generation, making the catGen equality on
     // a later HIT a sound "same catalog" identity check (a statement first executed inside an open
     // transaction re-plans until the tx commits) — and only for a reusable plan.
     if (holder !== null && snap === this.committed && !ptypes.uncacheable && this.planCacheable(sp)) {
-      holder.cache = { catGen: gen, sp, ptys };
+      holder.cache = { core: ident, catGen: gen, sp, ptys };
     }
     return this.buildScanRows(sp, bound, subqueryCost.value);
   }
@@ -11172,9 +11185,21 @@ export class Engine {
   planCacheable(sp: SelectPlan): boolean {
     for (const r of sp.rels) {
       if (r.srf !== undefined || r.cte !== undefined || r.derived !== undefined) return false;
-      if (this.isTempTable(r.tableName)) return false;
     }
-    return true;
+    return !this.planTouchesTemp(sp);
+  }
+
+  // planTouchesTemp reports whether any of the plan's relations currently resolves to a SESSION-LOCAL
+  // temporary table in THIS session's visible temp domain. Checked at cache fill (a temp plan is never
+  // cached) and re-checked on every cache HIT: a statement is shared across sessions, and a plan
+  // cached where a name was persistent must not be served on a session whose temp table shadows that
+  // name — the temp domain is session-local, so the committed catGen the cache is keyed on cannot see
+  // it. Cheap: one map lookup per relation, against a usually-empty temp catalog.
+  planTouchesTemp(sp: SelectPlan): boolean {
+    for (const r of sp.rels) {
+      if (this.isTempTable(r.tableName)) return true;
+    }
+    return false;
   }
 
   // tryDeferredQuery tries to serve stmt as a lazy DEFERRED query (spec/design/streaming.md §4/§7) — the
@@ -17392,10 +17417,20 @@ type QueryPlan = SelectPlan | SetOpPlan | ValuesPlan | WithPlan;
 
 // ScanCache is a prepared statement's memoized scan plan (spec/design/api.md §2.4): the resolved
 // SelectPlan (shared by reference, so a cache hit rebuilds the cursor around the SAME plan object and
-// re-plans nothing) plus the finalized $N param types, stamped with the committed catalog generation
-// (catGen) it was built against. Valid only while that generation still matches; a DDL bumps catGen
-// and the next execute re-plans. Filled only for a reusable plan read from committed state.
-export type ScanCache = { catGen: bigint; sp: SelectPlan; ptys: ScalarType[] };
+// re-plans nothing) plus the finalized $N param types, stamped with the database identity (core) and
+// committed catalog generation (catGen) they were resolved against. A statement is a standalone value
+// shared across sessions, so a hit requires the same core — catGen is only monotonic within one core;
+// two databases can share a generation number with different schemas — AND the same generation (any
+// DDL bumps it and the next execute re-plans), and re-checks that no plan relation is shadowed by the
+// executing session's temp domain (planTouchesTemp). Filled only for a reusable plan read from
+// committed state. core is the engine's shared core when it has one, else the bare Engine itself
+// (object identity is GC-safe in JS) — so the low-level tooling path caches too, without aliasing.
+export type ScanCache = {
+  core: AttachmentCore | Engine;
+  catGen: bigint;
+  sp: SelectPlan;
+  ptys: ScalarType[];
+};
 // ScanCacheHolder is the mutable slot the executor reads/writes. A PreparedStatement owns one and
 // threads it through queryStmt → tryScanQuery (executor.ts is import-cycle-free of api.ts, so the
 // holder — not the PreparedStatement — crosses the seam). null cache = empty.

@@ -15,10 +15,12 @@ import {
   Engine,
   EngineError,
   execute,
+  executePrepared,
   intValue,
   open,
   prepare,
   query,
+  queryPrepared,
   rollback,
   update,
   view,
@@ -142,11 +144,11 @@ test("prepare → execute → query with params, iterating rows", () => {
   const db = new Engine();
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
   const insert = prepare(db, "INSERT INTO t VALUES ($1, $2)");
-  insert.execute([intValue(1n), intValue(100n)]);
-  insert.execute([intValue(2n), intValue(200n)]);
+  executePrepared(db, insert, [intValue(1n), intValue(100n)]);
+  executePrepared(db, insert, [intValue(2n), intValue(200n)]);
 
   const sel = prepare(db, "SELECT id, v FROM t WHERE v = $1");
-  const r = sel.query([intValue(200n)]);
+  const r = queryPrepared(db, sel, [intValue(200n)]);
   assert.deepStrictEqual(r.columnNames, ["id", "v"]);
   const collected: Value[][] = [];
   for (const row of r) collected.push(row);

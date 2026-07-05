@@ -12,6 +12,7 @@ package jed
 // aggregate, window, join) whose input buffers but whose OUTPUT is yielded one row at a time.
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -733,9 +734,10 @@ func TestDeferredSkipsDataModifyingWith(t *testing.T) {
 
 // ---- prepared-statement streaming (the prepared query path; streaming.md §7) ----------------------
 //
-// A prepared query (Prepare + queryValues) routes its parsed AST through the SAME lazy lanes as the
-// ad-hoc Query — so a prepared SELECT streams (single-table pull / blocking-buffer / deferred set-op),
-// pins its snapshot in the watermark, and offers the early-exit win, all identical to a one-shot query.
+// A prepared query (Prepare + the handle's QueryPrepared seam) routes its parsed AST through the SAME
+// lazy lanes as the ad-hoc Query — so a prepared SELECT streams (single-table pull / blocking-buffer /
+// deferred set-op), pins its snapshot in the watermark, and offers the early-exit win, all identical
+// to a one-shot query.
 
 // preparedStreamResult: a prepared query's rows, fully drained, + final cost.
 func preparedStreamResult(t *testing.T, s *Session, sql string, params []Value) ([][]Value, int64) {
@@ -744,7 +746,7 @@ func preparedStreamResult(t *testing.T, s *Session, sql string, params []Value) 
 	if err != nil {
 		t.Fatalf("prepare %q: %v", sql, err)
 	}
-	rows, err := stmt.queryValues(params)
+	rows, err := s.queryStmt(stmt.ast, params, &stmt.sc)
 	if err != nil {
 		t.Fatalf("query prepared %q: %v", sql, err)
 	}
@@ -820,7 +822,7 @@ func TestPreparedQueryEarlyExitChargesLess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	full, err := stmt.queryValues(nil)
+	full, err := s.queryStmt(stmt.ast, nil, &stmt.sc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -832,7 +834,7 @@ func TestPreparedQueryEarlyExitChargesLess(t *testing.T) {
 	fullCost := full.Cost()
 	_ = full.Close()
 
-	rows, err := stmt.queryValues(nil)
+	rows, err := s.queryStmt(stmt.ast, nil, &stmt.sc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -863,7 +865,7 @@ func TestPreparedQueryPinsSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rows, err := stmt.queryValues(nil)
+	rows, err := reader.queryStmt(stmt.ast, nil, &stmt.sc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -911,7 +913,7 @@ func TestPreparedQueryMidDrainCostAbort(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rows, err := stmt.queryValues(nil)
+	rows, err := s.queryStmt(stmt.ast, nil, &stmt.sc)
 	if err != nil {
 		t.Fatalf("query (build) must not abort: %v", err)
 	}
@@ -929,15 +931,16 @@ func TestPreparedQueryMidDrainCostAbort(t *testing.T) {
 	_ = rows.Close()
 }
 
-// The bare Database.Prepare convenience streams too (it mints a transient session that the prepared
-// statement owns; the cursor pins its snapshot, so it is not stranded).
+// The bare Database.Prepare + Database.QueryPrepared convenience streams too (QueryPrepared mints a
+// transient autocommit session per call; the cursor pins its snapshot, so it is not stranded when
+// that session closes).
 func TestDatabaseQueryPreparedConvenienceStreams(t *testing.T) {
 	db := seededKV(t, 50)
 	stmt, err := db.Prepare("SELECT id, v FROM t ORDER BY id LIMIT 4")
 	if err != nil {
 		t.Fatal(err)
 	}
-	rows, err := stmt.queryValues(nil)
+	rows, err := db.QueryPrepared(context.Background(), stmt)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -851,11 +851,14 @@ func (db *Database) Update(fn func(tx *Transaction) error) error {
 	return s.Update(fn)
 }
 
-// Prepare parses sql once into a reusable prepared statement (spec/design/api.md §2.4). The statement
-// is bound to its own fresh session that it owns for its lifetime (a prepared statement is a held,
-// connection-bound resource); drop it to release the session.
+// Prepare parses sql once into a reusable prepared statement (spec/design/api.md §2.4): a standalone
+// value bound to no session — run it with QueryPrepared / ExecPrepared / QueryRowPrepared on any
+// handle over this database (the statement outlives the transient session used to parse it). Parse
+// errors (42601, …) and the 54000 input-size limit surface here.
 func (db *Database) Prepare(sql string) (*PreparedStatement, error) {
-	return db.Session(SessionOptions{}).Prepare(sql)
+	s := db.Session(SessionOptions{})
+	defer s.Close()
+	return s.Prepare(sql)
 }
 
 // UpgradeCollations runs the COLLATION UPGRADE migration on the live database (collation.md §12),
@@ -930,9 +933,9 @@ func (s *Session) queryValues(sql string, params []Value) (*Rows, error) {
 // re-pin, the plan-once scan (streaming/buffered) then deferred cursors, and the reader-liveness
 // watermark pin — falling back to the materialized dispatch for a shape no lazy lane covers (a write,
 // a data-modifying WITH). Shared by Query (parse-then-route, sc nil) and a prepared query
-// (PreparedStatement.queryValues passes its scanCache), so a prepared query streams and pins its
+// (the *Prepared methods pass the statement's stmtCache), so a prepared query streams and pins its
 // snapshot exactly like an ad-hoc one but reuses its cached plan across executes.
-func (s *Session) queryStmt(stmt statement, params []Value, sc *scanCache) (*Rows, error) {
+func (s *Session) queryStmt(stmt statement, params []Value, sc *stmtCache) (*Rows, error) {
 	// Route the read before building the streaming cursor (spec/design/streaming.md §4): an autocommit
 	// (non-block, writable access) read re-pins the latest committed so the snapshot is current
 	// (PG-faithful); a read-only session uses its existing pin, and an open block uses its working set.
@@ -999,15 +1002,17 @@ func (s *Session) queryStmt(stmt statement, params []Value, sc *scanCache) (*Row
 	return rowsFromOutcome(out), nil
 }
 
-// Prepare parses sql once into a reusable prepared statement bound to this session (spec/design/api.md
-// §2.4); subsequent Execute/Query route through the session — the lazy writer gate for writes, the
-// pinned snapshot for reads. Parse errors (42601, …) surface here.
+// Prepare parses sql once into a reusable prepared statement (spec/design/api.md §2.4): a standalone
+// value bound to no session — this session only supplies the parse (its 54000 input-size limit).
+// Run it with QueryPrepared / ExecPrepared / QueryRowPrepared on any handle over this database; the
+// executing handle supplies the session each run observes (privileges, snapshot, temp domain).
+// Parse errors (42601, …) surface here.
 func (s *Session) Prepare(sql string) (*PreparedStatement, error) {
 	stmt, err := s.engine.parse(sql)
 	if err != nil {
 		return nil, err
 	}
-	return &PreparedStatement{sess: s, ast: stmt}, nil
+	return &PreparedStatement{ast: stmt}, nil
 }
 
 // dispatch is the lazy-gate dispatch (spec/design/session.md §2.4). A read-only session rejects

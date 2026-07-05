@@ -23,7 +23,7 @@
 //                        (render) — lossless and predictable; the raw `query` path stays for the
 //                        engine Value itself. A richer structured mapping is a documented follow-up.
 
-import type { Rows } from "./api.ts";
+import type { PreparedStatement, Rows } from "./api.ts";
 import { engineError } from "./errors.ts";
 import { Decimal } from "./decimal.ts";
 import {
@@ -83,10 +83,13 @@ export function drainRun(rows: Rows): RunResult {
 }
 
 // ErgonomicHandle is the raw surface a Statement runs on — satisfied structurally by Database,
-// Session, and Transaction (all expose the total `query` seam over Value[]). run/get/all/iterate all
-// route through `query` (run drains-and-discards for its command tag), the one internal exec/query seam.
+// Session, and Transaction (all expose the total query seam over Value[], plus the prepared trio,
+// api.md §2.4). run/get/all/iterate all route through queryPrepared (run drains-and-discards for its
+// command tag), so an ergonomic Statement parses once and reuses its cached plan across calls.
 export interface ErgonomicHandle {
   query(sql: string, params: Value[]): Rows;
+  prepareStatement(sql: string): PreparedStatement;
+  queryPrepared(stmt: PreparedStatement, params: Value[]): Rows;
 }
 
 // toValue converts one native JS bind value to an engine Value (the param mapping above).
@@ -150,16 +153,27 @@ function rowObject(values: Value[], names: string[]): Row {
   return out;
 }
 
-// Statement is a prepared statement bound to a handle (better-sqlite3's Statement). The SQL is held
-// and re-parsed per call (jed's parser is cheap; parse caching is a future optimization), so every
-// run routes through the handle's full session envelope — privileges, cost, transaction state.
+// Statement is a prepared statement bound to a handle (better-sqlite3's Statement). The SQL is
+// parsed once — lazily, at the first call, so a parse error (42601) surfaces at the first
+// run/get/all/iterate rather than at prepare() — into an inner PreparedStatement whose resolved plan
+// is cached across calls (spec/design/api.md §2.4); every run still routes through the handle's full
+// session envelope — privileges, cost, transaction state.
 export class Statement {
   private readonly handle: ErgonomicHandle;
   readonly source: string;
+  private stmt: PreparedStatement | null = null;
 
   constructor(handle: ErgonomicHandle, sql: string) {
     this.handle = handle;
     this.source = sql;
+  }
+
+  // prepared parses the source on first use (42601 surfaces at the first run/get/all/iterate) and
+  // memoizes the standalone PreparedStatement — the parse-once + plan-cache seam every call routes
+  // through.
+  private prepared(): PreparedStatement {
+    this.stmt ??= this.handle.prepareStatement(this.source);
+    return this.stmt;
   }
 
   // run executes a statement, binding native params, and returns its command tag — exec-side sugar over
@@ -170,20 +184,20 @@ export class Statement {
   // iterator does not auto-close — so its reader-liveness pin is released in `finally` (api.md §11,
   // streaming.md §5); this is stricter than get/all/iterate, which drain without closing.
   run(...params: JsParam[]): RunResult {
-    return drainRun(this.handle.query(this.source, bindParams(params)));
+    return drainRun(this.handle.queryPrepared(this.prepared(), bindParams(params)));
   }
 
   // get runs a query, binding native params, and returns its FIRST row as an object — or undefined
   // when the query produced no rows. Extra rows are not materialized beyond the first.
   get(...params: JsParam[]): Row | undefined {
-    const rows = this.handle.query(this.source, bindParams(params));
+    const rows = this.handle.queryPrepared(this.prepared(), bindParams(params));
     for (const values of rows) return rowObject(values, rows.columnNames);
     return undefined;
   }
 
   // all runs a query, binding native params, and returns every row as an object.
   all(...params: JsParam[]): Row[] {
-    const rows = this.handle.query(this.source, bindParams(params));
+    const rows = this.handle.queryPrepared(this.prepared(), bindParams(params));
     const out: Row[] = [];
     for (const values of rows) out.push(rowObject(values, rows.columnNames));
     return out;
@@ -192,7 +206,7 @@ export class Statement {
   // iterate runs a query, binding native params, and yields each row object lazily (over the
   // materialized result — true streaming is deferred per CLAUDE.md §9, but the contract is the seam).
   *iterate(...params: JsParam[]): IterableIterator<Row> {
-    const rows = this.handle.query(this.source, bindParams(params));
+    const rows = this.handle.queryPrepared(this.prepared(), bindParams(params));
     for (const values of rows) yield rowObject(values, rows.columnNames);
   }
 }

@@ -68,3 +68,27 @@ raw path stays available for full fidelity: a rich type with no clean native cou
 language (a `range`, a `jsonb`, a composite) round-trips losslessly as a `Value`, where the ergonomic
 layer renders it to its canonical text. Reach for the raw `Value` when you need the engine value
 itself; reach for the native ergonomic form — the recommended default — for everything else.
+
+## Prepared statements
+
+For a hot statement — a point lookup run thousands of times — jed offers an explicit **prepared
+statement**: the SQL is parsed once, and its **resolved query plan is cached** and reused across
+executes (planning dominates the latency of a trivial lookup, so this is the single biggest win for
+high-frequency queries). A prepared statement is a **standalone value bound to no session**: you run
+it by handing it to whichever handle should execute it — a `Database`, a durable `Session`, or an
+open `Transaction` — and that handle supplies the privileges, snapshot, and transaction state the
+run observes. Prepare once at startup, run it from every request:
+
+- **Rust** — `db.prepare(sql)` → `session.query_prepared(&stmt, &params)` /
+  `session.execute_prepared(&stmt, &params)` (also on `Database` and `Transaction`).
+- **Go** — `db.Prepare(sql)` → `session.QueryPrepared(ctx, stmt, args...)` /
+  `ExecPrepared` / `QueryRowPrepared` (also on `Database` and `Transaction`; the statement is safe
+  to share across goroutines, each running it on its own session).
+- **TypeScript** — `db.prepareStatement(sql)` → `session.queryPrepared(stmt, params)` /
+  `executePrepared(stmt, params)` (also on `Database` and `Transaction`). The better-sqlite3-style
+  `db.prepare(sql)` `Statement` above uses the same machinery internally — its plan is cached too.
+
+The cache is transparent and always correct: a schema change (`CREATE`/`DROP`/`ALTER`) invalidates
+it and the next execute re-plans; reusing a cached plan is by construction result- and
+cost-identical to planning fresh, so a prepared statement never changes what a query returns — only
+how fast it gets there.

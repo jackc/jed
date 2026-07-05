@@ -12222,15 +12222,22 @@ impl Engine {
             let snap = self.read_snap();
             (snap.cat_gen, std::ptr::eq(snap, &self.committed))
         };
-        // Cache HIT: the read snapshot's catalog is unchanged since the plan was cached (its `cat_gen`
-        // still matches), so reuse the resolved plan + finalized param types — no `plan_query`, no
+        // Cache HIT: the plan was resolved against THIS database (same core — `cat_gen` is only
+        // monotonic within one core) and the read snapshot's catalog is unchanged since (its `cat_gen`
+        // still matches), and no relation name is shadowed by a session-local temp table the committed
+        // generation cannot see (`plan_touches_temp` — the statement may have been filled on a
+        // different session). Reuse the resolved plan + finalized param types — no `plan_query`, no
         // fold, no param-type walk. A cached plan carries no subquery to fold (`plan_cacheable`
         // rejected any), so the shared `Rc` plan is never mutated; params are still bound per execute.
-        if let Some(cell) = cache {
+        if let (Some(cell), Some(core)) = (cache, &self.core) {
             let hit = cell
                 .borrow()
                 .as_ref()
-                .filter(|cp| cp.cat_gen == cur_gen)
+                .filter(|cp| {
+                    cp.cat_gen == cur_gen
+                        && std::sync::Weak::ptr_eq(&cp.core, &std::sync::Arc::downgrade(core))
+                        && !self.plan_touches_temp(&cp.plan)
+                })
                 .map(|cp| (std::rc::Rc::clone(&cp.plan), cp.param_types.clone()));
             if let Some((plan, ptys)) = hit {
                 let bound_params = bind_params(params, &ptys)?;
@@ -12261,13 +12268,16 @@ impl Engine {
             &mut subquery_cost,
         )?;
         // Fill the cache only from committed state — so `committed.cat_gen` is strictly increasing over
-        // the engine's life and never aliases a rolled-back working generation, making the `cat_gen`
+        // the core's life and never aliases a rolled-back working generation, making the `cat_gen`
         // equality on a later HIT a sound "same catalog" identity check (a statement first executed
-        // inside an open transaction re-plans until the tx commits) — and only for a reusable plan.
+        // inside an open transaction re-plans until the tx commits) — and only for a reusable plan,
+        // and only when this engine belongs to a core (the entry's identity key; a bare/transient
+        // engine never fills).
         let cacheable = from_committed && !uncacheable && self.plan_cacheable(&sp);
         let plan = std::rc::Rc::new(sp);
-        if let (Some(cell), true) = (cache, cacheable) {
+        if let (Some(cell), true, Some(core)) = (cache, cacheable, &self.core) {
             *cell.borrow_mut() = Some(CachedPlan {
+                core: std::sync::Arc::downgrade(core),
                 cat_gen: cur_gen,
                 plan: std::rc::Rc::clone(&plan),
                 param_types: ptys,
@@ -12373,12 +12383,20 @@ impl Engine {
     /// snapshot the cache key (`committed.cat_gen`) does not track — so a plan referencing any of those
     /// is never cached (a point lookup / plain join over persistent base tables has none).
     fn plan_cacheable(&self, sp: &SelectPlan) -> bool {
-        sp.rels.iter().all(|r| {
-            r.srf.is_none()
-                && r.cte.is_none()
-                && r.derived.is_none()
-                && !self.is_temp_table(&r.table_name)
-        })
+        sp.rels
+            .iter()
+            .all(|r| r.srf.is_none() && r.cte.is_none() && r.derived.is_none())
+            && !self.plan_touches_temp(sp)
+    }
+
+    /// Whether any of the plan's relations currently resolves to a SESSION-LOCAL temporary table in
+    /// THIS session's visible temp domain. Checked at cache fill (a temp plan is never cached) and
+    /// re-checked on every cache HIT: a statement is shared across sessions, and a plan cached where
+    /// a name was persistent must not be served on a session whose temp table shadows that name — the
+    /// temp domain is session-local, so the committed `cat_gen` the cache is keyed on cannot see it.
+    /// Cheap: one map lookup per relation, against a usually-empty temp catalog.
+    fn plan_touches_temp(&self, sp: &SelectPlan) -> bool {
+        sp.rels.iter().any(|r| self.is_temp_table(&r.table_name))
     }
 
     /// Try to serve `ast` as a lazy **deferred** query (spec/design/streaming.md §4/§7) — the
@@ -22747,15 +22765,24 @@ fn group_by_int_key(
 
 /// A prepared statement's memoized scan plan (spec/design/api.md §2.4): the resolved [`SelectPlan`]
 /// (shared `Rc`, so a cache hit rebuilds the cursor around the SAME plan allocation and re-plans
-/// nothing) plus the finalized `$N` param types, stamped with the committed catalog generation
-/// (`cat_gen`) it was built against. Valid only while that generation still matches; a DDL bumps
-/// `cat_gen` and the next execute re-plans. Filled only for a reusable plan read from committed state
-/// ([`Engine::try_scan_query`]). The plan is `!Send` (it holds a regex `Cell`), so a `PreparedStatement`
-/// carrying one is `!Send` too — a non-regression, the whole query/cursor path is already thread-affine.
+/// nothing) plus the finalized `$N` param types, stamped with the [`Database`](crate::Database)
+/// (shared core) and committed catalog generation they were resolved against. A statement is a
+/// standalone value shared across sessions, so a hit requires the same core — `cat_gen` is only
+/// monotonic within one core; two databases can share a generation number with different schemas —
+/// AND the same generation (any DDL bumps it and the next execute re-plans), and re-checks that no
+/// plan relation is shadowed by the executing session's temp domain ([`Engine::plan_touches_temp`]).
+/// Filled only for a reusable plan read from committed state ([`Engine::try_scan_query`]). The plan
+/// is `!Send` (it holds a regex `Cell`), so a `PreparedStatement` carrying one is `!Send` too — a
+/// non-regression, the whole query/cursor path is already thread-affine.
 pub(crate) struct CachedPlan {
     // Fields are private to the executor: api.rs / shared.rs only name the type (to hold the
     // `RefCell<Option<CachedPlan>>` cache and thread it), never touch the fields — which keeps the
     // more-private `SelectPlan` out of a pub(crate) field.
+    //
+    // `core` is a `Weak` so a statement outliving its `Database` does not keep the core's storage
+    // alive — and the weak count keeps the allocation address from being reused, so the `ptr_eq`
+    // identity check cannot alias a later database (no ABA).
+    core: std::sync::Weak<crate::shared::Shared>,
     cat_gen: u64,
     plan: std::rc::Rc<SelectPlan>,
     param_types: Vec<ScalarType>,

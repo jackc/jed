@@ -186,3 +186,121 @@ fn subquery_plan_correct_across_executes() {
     let (r2, _) = drain(&mut s, &stmt, &[]);
     assert_eq!(r2, vec![vec![Value::Int(4)]]);
 }
+
+/// A statement is a standalone value: a plan filled on one session is reused by a different session
+/// over the same Database (the cache is keyed on the shared core's committed catalog generation, not
+/// the filling session), and reuse stays result- and cost-identical.
+#[test]
+fn statement_shared_across_sessions() {
+    let db = Database::create(CreateOptions::default()).unwrap();
+    let mut a = db.session(SessionOptions::default());
+    seed_orders(&mut a, 5);
+    let stmt = db
+        .prepare("SELECT id, amount FROM orders WHERE id = $1")
+        .unwrap();
+
+    let (ra, ca) = drain(&mut a, &stmt, &[Value::Int(3)]);
+    assert_eq!(ra, vec![vec![Value::Int(3), Value::Int(300)]]);
+
+    let mut b = db.session(SessionOptions::default());
+    let (rb, cb) = drain(&mut b, &stmt, &[Value::Int(3)]);
+    assert_eq!(rb, vec![vec![Value::Int(3), Value::Int(300)]]);
+    assert_eq!(cb, ca, "cross-session reuse must be cost-identical");
+}
+
+/// A statement executed against a DIFFERENT Database must not falsely hit: `cat_gen` is only
+/// monotonic within one core, so two databases can sit at the same generation with different schemas.
+/// The entry's core identity forces a re-plan against the other database.
+#[test]
+fn distinct_databases_no_false_hit() {
+    let db1 = Database::create(CreateOptions::default()).unwrap();
+    let db2 = Database::create(CreateOptions::default()).unwrap();
+    let mut s1 = db1.session(SessionOptions::default());
+    let mut s2 = db2.session(SessionOptions::default());
+    // One CREATE each → both cores sit at the SAME catalog generation with different table shapes.
+    exec(&mut s1, "CREATE TABLE t (id i32 PRIMARY KEY, a i32)");
+    exec(&mut s2, "CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32)");
+    exec(&mut s1, "INSERT INTO t VALUES (1, 10)");
+    exec(&mut s2, "INSERT INTO t VALUES (1, 10, 20)");
+
+    let stmt = db1.prepare("SELECT * FROM t WHERE id = $1").unwrap();
+    let (r1, _) = drain(&mut s1, &stmt, &[Value::Int(1)]);
+    assert_eq!(r1, vec![vec![Value::Int(1), Value::Int(10)]]);
+
+    // Same cat_gen, different core: a false hit would serve db1's 2-column plan against db2.
+    let (r2, _) = drain(&mut s2, &stmt, &[Value::Int(1)]);
+    assert_eq!(
+        r2,
+        vec![vec![Value::Int(1), Value::Int(10), Value::Int(20)]],
+        "stale cross-database plan served?"
+    );
+}
+
+/// A plan cached where a relation name is persistent must not be served on a session whose
+/// session-local temp table shadows that name — the hit path re-checks the plan's relations against
+/// the executing session's temp domain and re-plans.
+#[test]
+fn temp_shadow_replans() {
+    let db = Database::create(CreateOptions::default()).unwrap();
+    // Session B creates its temp table FIRST (a temp name may not shadow an existing persistent
+    // table, but a later persistent CREATE in another session cannot see B's temp domain).
+    let mut b = db.session(SessionOptions::default());
+    exec(&mut b, "CREATE TEMP TABLE t (id i32 PRIMARY KEY, v i32)");
+    exec(&mut b, "INSERT INTO t VALUES (1, 111)");
+
+    let mut a = db.session(SessionOptions::default());
+    exec(&mut a, "CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32)");
+    exec(&mut a, "INSERT INTO t VALUES (1, 10, 20)");
+
+    let stmt = db.prepare("SELECT * FROM t WHERE id = $1").unwrap();
+    let (ra, _) = drain(&mut a, &stmt, &[Value::Int(1)]);
+    assert_eq!(
+        ra,
+        vec![vec![Value::Int(1), Value::Int(10), Value::Int(20)]]
+    );
+
+    // Session B: same core, same cat_gen — but t resolves temp-first there. The cached persistent
+    // plan must not be served (and B's temp plan is never cached).
+    let (rb, _) = drain(&mut b, &stmt, &[Value::Int(1)]);
+    assert_eq!(
+        rb,
+        vec![vec![Value::Int(1), Value::Int(111)]],
+        "stale persistent plan served on a temp-shadowed session?"
+    );
+
+    // Back on A the persistent plan still serves (B's run did not poison the cache).
+    let (ra2, _) = drain(&mut a, &stmt, &[Value::Int(1)]);
+    assert_eq!(
+        ra2,
+        vec![vec![Value::Int(1), Value::Int(10), Value::Int(20)]]
+    );
+}
+
+/// The Transaction handle runs prepared statements too (the converged trio, api.md §2.4):
+/// read-your-writes inside the block, and the same statement value works before and after.
+#[test]
+fn transaction_runs_prepared() {
+    let db = Database::create(CreateOptions::default()).unwrap();
+    let mut s = db.session(SessionOptions::default());
+    exec(&mut s, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
+    let insert = db.prepare("INSERT INTO t VALUES ($1, $2)").unwrap();
+    let select = db.prepare("SELECT v FROM t WHERE id = $1").unwrap();
+
+    s.execute_prepared(&insert, &[Value::Int(1), Value::Int(100)])
+        .unwrap();
+    s.update(|tx| {
+        assert_eq!(
+            tx.execute_prepared(&insert, &[Value::Int(2), Value::Int(200)])?,
+            1
+        );
+        let mut rows = tx.query_prepared(&select, &[Value::Int(2)])?;
+        let row = (&mut rows).next().expect("in-tx prepared read");
+        assert_eq!(row, vec![Value::Int(200)]);
+        rows.error()?;
+        Ok(())
+    })
+    .unwrap();
+
+    let (r, _) = drain(&mut s, &select, &[Value::Int(2)]);
+    assert_eq!(r, vec![vec![Value::Int(200)]], "the block committed");
+}

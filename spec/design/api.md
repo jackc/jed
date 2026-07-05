@@ -291,44 +291,64 @@ commit. `close` is idempotent.
 
 ### 2.4 Prepare / execute / query
 
-- **`prepare(sql) -> PreparedStatement`** parses the SQL once (errors like `42601` surface
-  here) and returns a reusable handle. (Introspecting a statement's inferred parameter count
-  before binding is deferred — the count is enforced at execute time via the `42601`
-  count-mismatch check.)
-- **`statement.query(params) -> Rows`** runs a (possibly mutating) statement over the one total
-  seam and returns a cursor (a non-query statement yields a no-column `Rows` carrying its command
-  tag). **`statement.execute(params)`** is the exec-side sibling: it runs the same seam, drains the
-  cursor, and returns just the command tag (the affected-row count — Rust `u64`, TS `RunResult`;
-  Go's `Exec` returns a `Result`). `params` is empty when the statement has no placeholders. A
-  prepared statement runs **within a transaction** — an explicit one (on a `Transaction`) or, on
-  the handle directly, the autocommit single-statement transaction of §2.2.
+- **`prepare(sql) -> PreparedStatement`** (on `Database` and `Session`) parses the SQL once
+  (errors like `42601` and the `54000` input-size limit surface here) and returns a **standalone
+  value**: the parsed AST plus a plan-cache slot, holding **no session or database reference**.
+  The preparing handle only supplies the parse; the statement outlives it. (Introspecting a
+  statement's inferred parameter count before binding is deferred — the count is enforced at
+  execute time via the `42601` count-mismatch check.)
+- **`handle.query_prepared(stmt, params) -> Rows`** runs a prepared (possibly mutating)
+  statement over the one total seam and returns a cursor (a non-query statement yields a
+  no-column `Rows` carrying its command tag). **`handle.execute_prepared(stmt, params)`** is the
+  exec-side sibling: it runs the same seam, drains the cursor, and returns just the command tag
+  (the affected-row count — Rust `u64`, TS `RunResult`; Go's `ExecPrepared` returns a `Result`).
+  `params` is empty when the statement has no placeholders. The trio sits on **`Database`** (a
+  fresh autocommit session per call), **`Session`** (the durable connection), and
+  **`Transaction`** (inside the open block): the statement itself carries **no query methods** —
+  the handle chosen at each call is what determines the session the run observes (privilege
+  envelope, pinned snapshot, temp domain, transaction state), so one statement may be prepared
+  once and run from many short-lived sessions. In Go the statement is also safe to share across
+  **goroutines** (the cache slot is a lock-free atomic pointer); each goroutine still runs it on
+  its own handle.
 - One-shot convenience: `db.execute(sql, params)` (command tag) / `db.query(sql, params)` (cursor)
   are sugar for prepare-then-run (autocommit). The internal free function `execute(db, sql)` (zero
   parameters, kept for the conformance harnesses / white-box tests) drains the same `query` seam.
-- **Plan cache.** A `PreparedStatement.query` caches its **resolved plan** (not just the parsed
-  AST) and reuses it across executes, so a repeated query skips planning entirely — the dominant
+- **Plan cache.** A prepared query caches its **resolved plan** (not just the parsed AST) and
+  reuses it across executes, so a repeated query skips planning entirely — the dominant
   cost of a trivial-plan / high-frequency lookup (planning is ~⅔ of a point lookup's latency and
-  ~88% of its allocations). The cache is keyed on a **catalog generation** counter bumped by every
-  schema-changing DDL (`CREATE`/`DROP`/`ALTER` of a table, type, or index): a DDL between executes
-  invalidates the cached plan and the next execute re-plans (PostgreSQL invalidates prepared plans
-  on schema change the same way). To stay collision-free across a rolled-back in-transaction DDL,
-  the cache is **filled only from committed state**, making the committed generation strictly
-  monotonic; a statement first executed *inside* an open transaction re-plans until it commits. A
-  plan is cached only when reusing it is result/cost-**identical** to a fresh plan — so a plan with
-  an uncorrelated subquery (whose per-execution constant-fold bakes in one execution's params), a
-  precompiled-regex node (whose one-shot compile-cost flag mutates during eval), or a temp / SRF /
-  CTE / derived relation is **never** cached and re-plans each execute. The routing was also unified
-  to plan a scan-shaped query **once** (streaming and buffered were formerly two separate plans),
-  which speeds the ad-hoc `query()`/`Session.query` path too. The behavior is result/cost/byte-
-  neutral (planning is unmetered) — no on-disk format change, no conformance-corpus change.
+  ~88% of its allocations). The cache entry is keyed on the **database identity** (the shared
+  core) **plus its catalog generation** counter bumped by every schema-changing DDL
+  (`CREATE`/`DROP`/`ALTER` of a table, type, or index): a DDL between executes invalidates the
+  cached plan and the next execute re-plans (PostgreSQL invalidates prepared plans on schema
+  change the same way), and a statement handed to a *different* database never falsely hits (the
+  generation counter is only monotonic within one core — two databases can share a generation
+  number with different schemas), it just re-plans and re-keys. Because a statement may be filled
+  on one session and run on another, a hit also **re-checks the plan's relations against the
+  executing session's temp domain** (`plan_touches_temp`): a plan cached where a name was
+  persistent is never served on a session whose session-local temp table shadows that name (the
+  committed generation cannot see temp domains). To stay collision-free across a rolled-back
+  in-transaction DDL, the cache is **filled only from committed state**, making the committed
+  generation strictly monotonic; a statement first executed *inside* an open transaction re-plans
+  until it commits. A plan is cached only when reusing it is result/cost-**identical** to a fresh
+  plan — so a plan with an uncorrelated subquery (whose per-execution constant-fold bakes in one
+  execution's params), a precompiled-regex node (whose one-shot compile-cost flag mutates during
+  eval), or a temp / SRF / CTE / derived relation is **never** cached and re-plans each execute.
+  The routing was also unified to plan a scan-shaped query **once** (streaming and buffered were
+  formerly two separate plans), which speeds the ad-hoc `query()`/`Session.query` path too. The
+  behavior is result/cost/byte-neutral (planning is unmetered) — no on-disk format change, no
+  conformance-corpus change. Concurrent fills (Go) are last-writer-wins: both candidates are
+  correct for their key, so a statement bounced between a pinned reader and current sessions (or
+  between two databases) merely re-plans, never misbehaves.
   - **Rust note:** the cached plan is held behind an `Rc` (the plan is `!Sync` via a regex `Cell`,
     so `Arc` buys nothing), which makes the Rust `PreparedStatement` `!Send` (it was `Send + Sync`).
     This is a non-regression in practice — the whole Rust query/cursor path is already thread-affine
     (`Engine`/`Session`/`Rows` hold `Rc`s) — but it *is* an observable capability change: a host that
     wants a prepared statement on another thread re-prepares there (a cheap re-parse). `Database`
-    stays `Send + Sync` (it mints a session per thread). Go and TS are unaffected (Go is GC'd; TS is
-    single-threaded), so this is the one place the cores' host-API auto-traits differ — recorded in
-    [cores.md](cores.md).
+    stays `Send + Sync` (it mints a session per thread). TS is single-threaded; in Go the statement
+    is shareable across goroutines (above) — so this is the one place the cores' host-API
+    auto-traits differ — recorded in [cores.md](cores.md). The Rust cache entry holds the core
+    identity as a `Weak` (the weak count keeps the allocation address alive, so the pointer-equality
+    identity check cannot alias a later database).
 
 ### 2.5 Concurrent sessions: parallel readers + a single writer
 
@@ -488,9 +508,9 @@ only and the engine has no wire protocol).
 | view / update (closures) | `db.view(\|tx\| …)` / `db.update(\|tx\| …)` | `db.View(fn) error` / `db.Update(fn) error` | `view(db, fn)` / `update(db, fn)` |
 | tx commit / rollback | `tx.commit()` / `tx.rollback()` | `tx.Commit()` / `tx.Rollback() error` | `tx.commit()` / `tx.rollback()` |
 | close | `db.close()` + `Drop` | `db.Close() error` | `close(db): void` |
-| prepare | `db.prepare(sql) -> Result<PreparedStatement>` | `db.Prepare(sql) (*PreparedStatement, error)` | `prepare(db, sql): PreparedStatement` |
-| stmt execute (tag) | `db.execute_prepared(&stmt, &params) -> Result<u64>` | `stmt.Exec(ctx, args…) (Result, error)` | `stmt.execute(params): RunResult` |
-| stmt query (cursor) | `db.query_prepared(&stmt, &params) -> Result<Rows>` | `stmt.QueryValues(params) (*Rows, error)` | `stmt.query(params): Rows` |
+| prepare | `db.prepare(sql) -> Result<PreparedStatement>` | `db.Prepare(sql) (*PreparedStatement, error)` | `db.prepareStatement(sql): PreparedStatement` |
+| stmt execute (tag) | `db.execute_prepared(&stmt, &params) -> Result<u64>` | `db.ExecPrepared(ctx, stmt, args…) (Result, error)` | `db.executePrepared(stmt, params): RunResult` |
+| stmt query (cursor) | `db.query_prepared(&stmt, &params) -> Result<Rows>` | `db.QueryPrepared(ctx, stmt, args…) (*Rows, error)` | `db.queryPrepared(stmt, params): Rows` |
 | one-shot execute (tag) | `db.execute(sql, &params) -> Result<u64>` | `db.Exec(ctx, sql, args…) (Result, error)` | `db.execute(sql, params): RunResult` |
 | one-shot query (cursor) | `db.query(sql, &params) -> Result<Rows>` | `db.QueryValues(sql, params) (*Rows, error)` | `db.query(sql, params): Rows` |
 | rows iterate | `impl Iterator<Item = Vec<Value>>` | `for rows.Next() { rows.Row() }` | `for (const row of rows)` |
@@ -512,11 +532,16 @@ only and the engine has no wire protocol).
 
 **Per-language divergences, deliberate and documented:**
 
-- **Rust** passes `&mut Database` to `PreparedStatement::execute`/`query` (the statement owns
-  only the parsed AST, never a `Database` borrow — this sidesteps the aliasing problem of a
-  statement holding `&Database` while execution needs `&mut Database`). Go/TS bind the
-  database at `prepare` (GC, no borrow checker), so `Execute`/`query` take no database
-  argument. The **shape** — prepare → execute/query → rows — is identical.
+- **Prepared statements are handle-run in all three cores** (§2.4): the statement is a standalone
+  value passed to `execute_prepared`/`query_prepared` on `Database`/`Session`/`Transaction`. Rust
+  arrived at this shape via the borrow checker (a statement holding `&Database` while execution
+  needs `&mut Database` cannot work); Go and TS **converged on it deliberately** — it is also the
+  shape that lets one statement serve many short-lived sessions. Per-language wrinkles: Go's trio
+  is `QueryPrepared`/`ExecPrepared`/`QueryRowPrepared` taking `(ctx, stmt, args…)`; TS names the
+  mint `prepareStatement` because `prepare` is its better-sqlite3-style ergonomic `Statement`
+  (which now parses once and rides the same plan cache internally); TS also keeps low-level free
+  functions `prepare(db, sql)`/`queryPrepared(db, stmt, params)` over the bare `Engine` for the
+  harness/bench tooling.
 - The public prepared handle is named **`PreparedStatement`** in all three (in Go it would
   otherwise collide with the AST `Statement` the executor consumes).
 - Method names avoid collisions with the kept free functions: Go `ExecuteSQL` (vs package
@@ -801,8 +826,10 @@ work (and thus cancellation) happens.
 ### 11.5 Status and naming
 
 **Landed (Go, `impl/go/ergonomic.go`):** the arg/scan conversion, `Query`/`Exec`/`QueryRow` on
-**`Database`, `Transaction`, *and* `PreparedStatement`** (the latter with no `sql` parameter — its
-SQL is fixed at `Prepare`), `Result` command tag, `Scan`/`Values`/`Err`/`Close`, the typed
+**`Database`, `Session`, *and* `Transaction`** — each with a `QueryPrepared`/`ExecPrepared`/
+`QueryRowPrepared` sibling taking a `*PreparedStatement` in place of `sql` (the statement itself
+carries no query methods; the handle supplies the session, §2.4), `Result` command tag,
+`Scan`/`Values`/`Err`/`Close`, the typed
 accessors, `All()`/`Collect`, `RowTo`/`RowToStructByName`, `Null[T]`, `Valuer`/`Scanner`. The
 conversion + cancellation logic lives once (`ergoQuery`/`ergoExec`); the per-type methods are
 one-liners over the raw `[]Value` primitives. **Cancellation is wired through the cost meter:** each
@@ -813,9 +840,10 @@ registered **`57014 query_canceled`** at the next metering point, not only at th
 boundary (`ctxErr`). The poll is `nil` (zero-overhead, untouched hot path, the §8 cost determinism
 intact) unless a cancelable ctx is active; a non-cancelable background ctx (nil `Done`) arms
 nothing. Verified by `impl/go/cancellation_test.go` (the meter-`Guard` unit test, the boundary
-abort, and a white-box mid-execution abort). The **`Queryer`** interface (`Query`/`QueryRow`/`Exec`)
-is satisfied by `Database` and `Transaction`, so a data-access function written against it runs
-unchanged on a handle or inside a transaction (pgx's `Querier`). The raw `[]Value` query method on
+abort, and a white-box mid-execution abort). The **`Queryer`** interface
+(`Query`/`QueryRow`/`Exec` + the `*Prepared` trio) is satisfied by `Database`, `Session`, and
+`Transaction`, so a data-access function written against it runs unchanged on a handle, a durable
+session, or inside a transaction (pgx's `Querier`). The raw `[]Value` query method on
 each type was renamed **`QueryValues`** so the ergonomic `Query` owns the name (the raw-path
 `*Values` convention; `Execute([]Value)` keeps its name since `Exec` doesn't collide).
 **Landed (Rust, cancellation — `impl/rust/src/cancel.rs`):** the cancellation half of the mirror.

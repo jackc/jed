@@ -10,15 +10,18 @@ package jed
 // (CLAUDE.md §10).
 
 import (
+	"context"
 	"fmt"
+	"sync"
 	"testing"
 )
 
-// drainQ runs a prepared query with params, fully drains it, and returns the rows as an int matrix
+// drainQ runs a prepared query with params on session s (a statement is standalone — the handle
+// supplies the session, api.md §2.4), fully drains it, and returns the rows as an int matrix
 // (every column read via Value.Int — the tests use integer columns) plus the final accrued cost.
-func drainQ(t *testing.T, stmt *PreparedStatement, params ...Value) ([][]int64, int64) {
+func drainQ(t *testing.T, s *Session, stmt *PreparedStatement, params ...Value) ([][]int64, int64) {
 	t.Helper()
-	rows, err := stmt.queryValues(params)
+	rows, err := s.queryStmt(stmt.ast, params, &stmt.sc)
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}
@@ -74,19 +77,20 @@ func TestPlanCachePointLookupReuses(t *testing.T) {
 	}
 
 	// Execute 1 (MISS): plans and fills the cache.
-	r1, cost1 := drainQ(t, stmt, IntValue(3))
-	if !stmt.sc.valid {
+	r1, cost1 := drainQ(t, db, stmt, IntValue(3))
+	entry := stmt.sc.p.Load()
+	if entry == nil {
 		t.Fatal("expected the cache to fill on the first cacheable execute")
 	}
-	sp := stmt.sc.sp
+	sp := entry.sp
 	if !planCacheRowsEq(r1, [][]int64{{3, 300}}) {
 		t.Fatalf("execute 1 rows = %v", r1)
 	}
 
 	// Execute 2 (HIT, same param): the exact cached plan is reused (pointer unchanged) and cost is
 	// identical to the fresh plan.
-	r2, cost2 := drainQ(t, stmt, IntValue(3))
-	if stmt.sc.sp != sp {
+	r2, cost2 := drainQ(t, db, stmt, IntValue(3))
+	if c := stmt.sc.p.Load(); c == nil || c.sp != sp {
 		t.Fatal("plan pointer changed on a cache hit — statement re-planned")
 	}
 	if cost2 != cost1 {
@@ -97,8 +101,8 @@ func TestPlanCachePointLookupReuses(t *testing.T) {
 	}
 
 	// Execute 3 (HIT, different param): plan still reused, params still bound per execute.
-	r3, _ := drainQ(t, stmt, IntValue(5))
-	if stmt.sc.sp != sp {
+	r3, _ := drainQ(t, db, stmt, IntValue(5))
+	if c := stmt.sc.p.Load(); c == nil || c.sp != sp {
 		t.Fatal("plan pointer changed on a param-only change")
 	}
 	if !planCacheRowsEq(r3, [][]int64{{5, 500}}) {
@@ -106,7 +110,7 @@ func TestPlanCachePointLookupReuses(t *testing.T) {
 	}
 
 	// A no-match param still binds correctly against the cached plan.
-	r4, _ := drainQ(t, stmt, IntValue(999))
+	r4, _ := drainQ(t, db, stmt, IntValue(999))
 	if len(r4) != 0 {
 		t.Fatalf("execute 4 (no match) rows = %v", r4)
 	}
@@ -127,17 +131,18 @@ func TestPlanCacheDropIndexInvalidation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rIdx, costIdx := drainQ(t, stmt, IntValue(25)) // index lookup
+	rIdx, costIdx := drainQ(t, db, stmt, IntValue(25)) // index lookup
 	if !planCacheRowsEq(rIdx, [][]int64{{25}}) {
 		t.Fatalf("index rows = %v", rIdx)
 	}
-	if !stmt.sc.valid {
+	entry := stmt.sc.p.Load()
+	if entry == nil {
 		t.Fatal("expected fill")
 	}
-	gen1 := stmt.sc.catGen
+	gen1 := entry.catGen
 
 	mustExec(t, db, "DROP INDEX t_a")
-	rScan, costScan := drainQ(t, stmt, IntValue(25)) // re-plan → full scan
+	rScan, costScan := drainQ(t, db, stmt, IntValue(25)) // re-plan → full scan
 	if !planCacheRowsEq(rScan, [][]int64{{25}}) {
 		t.Fatalf("rows after DROP INDEX = %v", rScan)
 	}
@@ -145,7 +150,7 @@ func TestPlanCacheDropIndexInvalidation(t *testing.T) {
 		t.Fatalf("expected full scan costlier than index after DROP INDEX: scan=%d idx=%d "+
 			"(stale index plan served?)", costScan, costIdx)
 	}
-	if stmt.sc.catGen == gen1 {
+	if c := stmt.sc.p.Load(); c != nil && c.catGen == gen1 {
 		t.Fatal("catGen did not advance after DROP INDEX — plan cache would serve a stale plan")
 	}
 }
@@ -161,7 +166,7 @@ func TestPlanCacheDropCreateInvalidation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	r1, _ := drainQ(t, stmt, IntValue(1))
+	r1, _ := drainQ(t, db, stmt, IntValue(1))
 	if len(r1[0]) != 2 {
 		t.Fatalf("before = %v", r1)
 	}
@@ -170,7 +175,7 @@ func TestPlanCacheDropCreateInvalidation(t *testing.T) {
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, a i32, c i32)")
 	mustExec(t, db, "INSERT INTO t VALUES (1, 10, 20)")
 
-	r2, _ := drainQ(t, stmt, IntValue(1))
+	r2, _ := drainQ(t, db, stmt, IntValue(1))
 	if len(r2) != 1 || len(r2[0]) != 3 || r2[0][2] != 20 {
 		t.Fatalf("after DROP/CREATE = %v, want one 3-column row {1,10,20}", r2)
 	}
@@ -189,13 +194,13 @@ func TestPlanCacheIndexInvalidation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rScan, costScan := drainQ(t, stmt, IntValue(25))
+	rScan, costScan := drainQ(t, db, stmt, IntValue(25))
 	if !planCacheRowsEq(rScan, [][]int64{{25}}) {
 		t.Fatalf("full-scan rows = %v", rScan)
 	}
 
 	mustExec(t, db, "CREATE INDEX t_a ON t (a)")
-	rIdx, costIdx := drainQ(t, stmt, IntValue(25))
+	rIdx, costIdx := drainQ(t, db, stmt, IntValue(25))
 	if !planCacheRowsEq(rIdx, [][]int64{{25}}) {
 		t.Fatalf("index rows = %v", rIdx)
 	}
@@ -219,14 +224,14 @@ func TestPlanCacheNonCacheable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, c1 := drainQ(t, rx)
-	if rx.sc.valid {
+	got, c1 := drainQ(t, db, rx)
+	if rx.sc.p.Load() != nil {
 		t.Fatal("a precompiled-regex plan must not be cached")
 	}
 	if !planCacheRowsEq(got, [][]int64{{1}, {3}}) {
 		t.Fatalf("regex rows = %v", got)
 	}
-	_, c2 := drainQ(t, rx)
+	_, c2 := drainQ(t, db, rx)
 	if c1 != c2 {
 		t.Fatalf("regex cost drift across executes: %d vs %d (regex plan wrongly cached?)", c1, c2)
 	}
@@ -236,8 +241,8 @@ func TestPlanCacheNonCacheable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sr, _ := drainQ(t, sq)
-	if sq.sc.valid {
+	sr, _ := drainQ(t, db, sq)
+	if sq.sc.p.Load() != nil {
 		t.Fatal("a subquery plan must not be cached")
 	}
 	if !planCacheRowsEq(sr, [][]int64{{3}}) {
@@ -261,11 +266,11 @@ func TestPlanCacheFillOnlyFromCommitted(t *testing.T) {
 	if err := db.Begin(true); err != nil {
 		t.Fatal(err)
 	}
-	inTx, _ := drainQ(t, stmt, IntValue(1))
+	inTx, _ := drainQ(t, db, stmt, IntValue(1))
 	if !planCacheRowsEq(inTx, [][]int64{{1, 10}}) {
 		t.Fatalf("in-tx rows = %v", inTx)
 	}
-	if stmt.sc.valid {
+	if stmt.sc.p.Load() != nil {
 		t.Fatal("a plan first executed inside a transaction must not be cached (fill-only-from-committed)")
 	}
 	if err := db.Commit(); err != nil {
@@ -273,7 +278,162 @@ func TestPlanCacheFillOnlyFromCommitted(t *testing.T) {
 	}
 
 	// Now autocommit (reads committed) fills the cache.
-	if _, _ = drainQ(t, stmt, IntValue(1)); !stmt.sc.valid {
+	if _, _ = drainQ(t, db, stmt, IntValue(1)); stmt.sc.p.Load() == nil {
 		t.Fatal("expected the cache to fill on a committed-state execute after the transaction")
+	}
+}
+
+// A statement is a standalone value: a plan filled on one session is REUSED (same plan pointer, same
+// cost) by a different session over the same Database — the cache is keyed on the shared core's
+// committed catalog generation, not on the session that happened to fill it.
+func TestPlanCacheSharedAcrossSessions(t *testing.T) {
+	base := memDB()
+	sA := base.Session(SessionOptions{})
+	defer sA.Close()
+	seedOrders(t, sA, 5)
+	stmt, err := base.Prepare("SELECT id, amount FROM orders WHERE id = $1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rA, costA := drainQ(t, sA, stmt, IntValue(3))
+	entry := stmt.sc.p.Load()
+	if entry == nil {
+		t.Fatal("expected fill on session A")
+	}
+	if !planCacheRowsEq(rA, [][]int64{{3, 300}}) {
+		t.Fatalf("session A rows = %v", rA)
+	}
+
+	sB := base.Session(SessionOptions{})
+	defer sB.Close()
+	rB, costB := drainQ(t, sB, stmt, IntValue(3))
+	if c := stmt.sc.p.Load(); c == nil || c.sp != entry.sp {
+		t.Fatal("session B re-planned — the cached plan must be shared across sessions of one Database")
+	}
+	if costB != costA {
+		t.Fatalf("cross-session cache-hit cost = %d, want %d (reuse must be cost-identical)", costB, costA)
+	}
+	if !planCacheRowsEq(rB, [][]int64{{3, 300}}) {
+		t.Fatalf("session B rows = %v", rB)
+	}
+}
+
+// A statement executed against a DIFFERENT Database must not falsely hit: catGen is only monotonic
+// within one core, so two databases can share a generation number with different schemas. The entry's
+// core identity forces a re-plan against the other database (and the refill re-keys to it).
+func TestPlanCacheDistinctDatabasesNoFalseHit(t *testing.T) {
+	db1 := memDB().Session(SessionOptions{})
+	db2 := memDB().Session(SessionOptions{})
+	// One CREATE each → both cores sit at the SAME catalog generation with different table shapes.
+	mustExec(t, db1, "CREATE TABLE t (id i32 PRIMARY KEY, a i32)")
+	mustExec(t, db2, "CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32)")
+	mustExec(t, db1, "INSERT INTO t VALUES (1, 10)")
+	mustExec(t, db2, "INSERT INTO t VALUES (1, 10, 20)")
+
+	stmt, err := db1.Prepare("SELECT * FROM t WHERE id = $1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r1, _ := drainQ(t, db1, stmt, IntValue(1))
+	if len(r1) != 1 || len(r1[0]) != 2 {
+		t.Fatalf("db1 rows = %v, want one 2-column row", r1)
+	}
+	if stmt.sc.p.Load() == nil {
+		t.Fatal("expected fill on db1")
+	}
+
+	// Same catGen, different core: a false hit would serve db1's 2-column plan against db2.
+	r2, _ := drainQ(t, db2, stmt, IntValue(1))
+	if len(r2) != 1 || len(r2[0]) != 3 || r2[0][2] != 20 {
+		t.Fatalf("db2 rows = %v, want one 3-column row {1,10,20} (stale cross-database plan served?)", r2)
+	}
+}
+
+// A plan cached where a relation name is persistent must not be served on a session whose
+// session-local temp table shadows that name — the temp domain is invisible to the committed catGen
+// the cache is keyed on, so the hit path re-checks the plan's relations against the executing
+// session's temp catalog (planTouchesTemp) and re-plans.
+func TestPlanCacheTempShadowReplans(t *testing.T) {
+	base := memDB()
+	// Session B creates its temp table FIRST (a temp name may not shadow an existing persistent
+	// table, but a later persistent CREATE in another session cannot see B's temp domain).
+	sB := base.Session(SessionOptions{})
+	defer sB.Close()
+	mustExec(t, sB, "CREATE TEMP TABLE t (id i32 PRIMARY KEY, v i32)")
+	mustExec(t, sB, "INSERT INTO t VALUES (1, 111)")
+
+	sA := base.Session(SessionOptions{})
+	defer sA.Close()
+	mustExec(t, sA, "CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32)")
+	mustExec(t, sA, "INSERT INTO t VALUES (1, 10, 20)")
+
+	stmt, err := base.Prepare("SELECT * FROM t WHERE id = $1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rA, _ := drainQ(t, sA, stmt, IntValue(1))
+	if len(rA) != 1 || len(rA[0]) != 3 {
+		t.Fatalf("persistent rows = %v, want one 3-column row", rA)
+	}
+	if stmt.sc.p.Load() == nil {
+		t.Fatal("expected fill on the persistent session")
+	}
+
+	// Session B: same core, same catGen — but t resolves temp-first there. The cached persistent
+	// plan must not be served; the re-plan reads B's temp table (and is not cached: temp plans never
+	// fill).
+	rB, _ := drainQ(t, sB, stmt, IntValue(1))
+	if len(rB) != 1 || len(rB[0]) != 2 || rB[0][1] != 111 {
+		t.Fatalf("temp-shadowed rows = %v, want one 2-column row {1,111} (stale persistent plan served?)", rB)
+	}
+
+	// And back on A the persistent plan still serves (B's run did not poison the cache).
+	rA2, _ := drainQ(t, sA, stmt, IntValue(1))
+	if len(rA2) != 1 || len(rA2[0]) != 3 {
+		t.Fatalf("persistent rows after temp run = %v", rA2)
+	}
+}
+
+// One statement, many goroutines, each on its own session: the atomic cache slot makes concurrent
+// fill/hit safe (run under -race in CI), and every execute sees correct rows.
+func TestPlanCacheConcurrentSessions(t *testing.T) {
+	base := memDB()
+	seed := base.Session(SessionOptions{})
+	seedOrders(t, seed, 10)
+	seed.Close()
+	stmt, err := base.Prepare("SELECT id, amount FROM orders WHERE id = $1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const goroutines, iters = 8, 100
+	errs := make(chan error, goroutines)
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s := base.Session(SessionOptions{})
+			defer s.Close()
+			for i := 0; i < iters; i++ {
+				id := int64(i%10) + 1
+				var gotID, gotAmount int64
+				row := s.QueryRowPrepared(context.Background(), stmt, id)
+				if err := row.Scan(&gotID, &gotAmount); err != nil {
+					errs <- fmt.Errorf("scan: %w", err)
+					return
+				}
+				if gotID != id || gotAmount != id*100 {
+					errs <- fmt.Errorf("row = (%d,%d), want (%d,%d)", gotID, gotAmount, id, id*100)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
 	}
 }

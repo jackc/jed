@@ -7,7 +7,9 @@ package jed
 
 import (
 	"bytes"
+	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -143,10 +145,10 @@ func TestPrepareExecuteAndQueryWithParams(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := prepOutcome(insert, []Value{IntValue(1), IntValue(100)}); err != nil {
+	if _, err := prepOutcome(db, insert, []Value{IntValue(1), IntValue(100)}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := prepOutcome(insert, []Value{IntValue(2), IntValue(200)}); err != nil {
+	if _, err := prepOutcome(db, insert, []Value{IntValue(2), IntValue(200)}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -154,7 +156,7 @@ func TestPrepareExecuteAndQueryWithParams(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rows, err := sel.queryValues([]Value{IntValue(200)})
+	rows, err := db.queryStmt(sel.ast, []Value{IntValue(200)}, &sel.sc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,6 +172,88 @@ func TestPrepareExecuteAndQueryWithParams(t *testing.T) {
 	}
 	if rows.Cost() < 0 {
 		t.Fatalf("cost = %d", rows.Cost())
+	}
+}
+
+// The public *Prepared trio (spec/design/api.md §2.4/§11): the same statement value runs on a
+// Database (fresh autocommit session per call), a Session, and a Transaction — the handle passed at
+// each call supplies the session, and the statement itself carries no query methods.
+func TestPreparedHandleMethods(t *testing.T) {
+	ctx := context.Background()
+	base := memDB()
+	if _, err := base.Exec(ctx, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)"); err != nil {
+		t.Fatal(err)
+	}
+	insert, err := base.Prepare("INSERT INTO t VALUES ($1, $2)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sel, err := base.Prepare("SELECT v FROM t WHERE id = $1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Database: ExecPrepared / QueryRowPrepared on fresh autocommit sessions.
+	res, err := base.ExecPrepared(ctx, insert, 1, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, ok := res.RowsAffected(); !ok || n != 1 {
+		t.Fatalf("Database.ExecPrepared affected = (%d,%v), want (1,true)", n, ok)
+	}
+	var v int64
+	if err := base.QueryRowPrepared(ctx, sel, 1).Scan(&v); err != nil || v != 100 {
+		t.Fatalf("Database.QueryRowPrepared = (%d, %v), want 100", v, err)
+	}
+
+	// Session: the durable-connection form.
+	s := base.Session(SessionOptions{})
+	defer s.Close()
+	if _, err := s.ExecPrepared(ctx, insert, 2, 200); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.QueryRowPrepared(ctx, sel, 2).Scan(&v); err != nil || v != 200 {
+		t.Fatalf("Session.QueryRowPrepared = (%d, %v), want 200", v, err)
+	}
+
+	// Transaction: the same statement inside an explicit block, read-your-writes, rolled back.
+	err = s.Update(func(tx *Transaction) error {
+		if _, err := tx.ExecPrepared(ctx, insert, 3, 300); err != nil {
+			return err
+		}
+		if err := tx.QueryRowPrepared(ctx, sel, 3).Scan(&v); err != nil {
+			return err
+		}
+		if v != 300 {
+			t.Fatalf("in-tx prepared read = %d, want 300", v)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// QueryPrepared cursor form drains the full set.
+	all, err := base.Prepare("SELECT id, v FROM t ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := s.QueryPrepared(ctx, all)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var got [][]int64
+	for rows.Next() {
+		r := rows.Row()
+		got = append(got, []int64{r[0].Int, r[1].Int})
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	want := "[[1 100] [2 200] [3 300]]"
+	if fmt.Sprint(got) != want {
+		t.Fatalf("drained = %v, want %s", got, want)
 	}
 }
 

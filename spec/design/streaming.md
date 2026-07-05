@@ -395,11 +395,12 @@ independently — the P6.4 precedent):
   `execute()` already exercises), so the corpus stays green by construction; it is per-core unit-tested
   only (`prepared_query_*` / `TestPreparedQuery*` / `"prepared query …"`: matches-eager across every
   lane, binds `$N` params, the early-exit-charges-less win, the session-path snapshot pin + watermark,
-  and the mid-drain cost abort). **Cross-core shape note:** Rust/Go expose a low-level prepared query on
-  *both* the bare `Engine` and the shared-core `Session` (the latter pins); TS's low-level
-  `PreparedStatement` binds only to a bare `Engine` (its session-bound prepared path is the ergonomic
-  `Statement`, which already re-parsed + routed through `Session.query`, so it streamed before this
-  slice). The **WASM C-ABI** `jed_stmt_query` drains the now-streaming cursor through a new `ok_rows`
+  and the mid-drain cost abort). **Cross-core shape note (since converged, api.md §2.4):** a
+  `PreparedStatement` is now a standalone value in all three cores, run via the handles'
+  `query_prepared`/`QueryPrepared`/`queryPrepared` — on a `Session` the prepared query pins its
+  snapshot like an ad-hoc one; TS additionally keeps low-level free functions over the bare `Engine`
+  for the harness/bench tooling, and its ergonomic `Statement` now parses once and rides the same
+  plan-cached prepared seam. The **WASM C-ABI** `jed_stmt_query` drains the now-streaming cursor through a new `ok_rows`
   helper that surfaces a mid-drain error as an `ERROR` buffer instead of a silently truncated result
   (the one correctness obligation the streaming change introduces at that boundary); the Ruby native
   extension exposes only `jed_execute` (materialized), so it is unaffected. No `format_version` bump.

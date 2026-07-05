@@ -164,9 +164,10 @@ language inherits or re-proves it.
 **One host-API auto-trait divergence: the prepared-statement plan cache.** The prepared-statement
 plan cache ([api.md §2.4](api.md)) makes the **Rust** `PreparedStatement` `!Send` — it caches an
 `Rc<SelectPlan>` (the plan is `!Sync` via a regex `Cell`, so `Arc` buys nothing). This is the one
-place the cores' host-API thread-affinity differs: Go's is fine to share (GC'd), TS's is
-single-threaded, but a Rust `PreparedStatement` can no longer be moved across threads (re-prepare
-per thread — a cheap re-parse). It is a **non-regression** in practice: the whole Rust query/cursor
+place the cores' host-API thread-affinity differs: Go's is explicitly safe to share across
+goroutines (its cache slot is a lock-free atomic pointer — api.md §2.4), TS's is single-threaded,
+but a Rust `PreparedStatement` can no longer be moved across threads (re-prepare per thread — a
+cheap re-parse). It is a **non-regression** in practice: the whole Rust query/cursor
 path (`Engine`/`Session`/`Rows`) is *already* `!Send` (holds `Rc`s), so a `PreparedStatement` that
 was `Send` could not have produced thread-portable rows anyway. `Database` stays `Send + Sync` (it
 mints a session per thread). A compile-time guard in the Rust core asserts the `!Send` intent so the

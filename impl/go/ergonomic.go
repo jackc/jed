@@ -50,28 +50,33 @@ type Valuer interface{ JedValue() (Value, error) }
 type Scanner interface{ ScanJed(v Value) error }
 
 // Queryer is satisfied by *Database, *Session, and *Transaction so a data-access helper can take a
-// bare handle, a durable connection, or an open transaction interchangeably (api.md §11).
+// bare handle, a durable connection, or an open transaction interchangeably (api.md §11). The
+// *Prepared methods run a PreparedStatement — a standalone parsed value bound to no session — on
+// the handle, which supplies the session that execute observes; a *PreparedStatement itself carries
+// no query methods (the handle chosen at each call is what determines the session, api.md §2.4).
 type Queryer interface {
 	Query(ctx context.Context, sql string, args ...any) (*Rows, error)
 	QueryRow(ctx context.Context, sql string, args ...any) *Row
 	Exec(ctx context.Context, sql string, args ...any) (Result, error)
+	QueryPrepared(ctx context.Context, stmt *PreparedStatement, args ...any) (*Rows, error)
+	QueryRowPrepared(ctx context.Context, stmt *PreparedStatement, args ...any) *Row
+	ExecPrepared(ctx context.Context, stmt *PreparedStatement, args ...any) (Result, error)
 }
 
 var (
 	_ Queryer = (*Database)(nil)
 	_ Queryer = (*Session)(nil)
 	_ Queryer = (*Transaction)(nil)
-	// *PreparedStatement deliberately does NOT satisfy Queryer: its SQL is fixed at Prepare, so
-	// its ergonomic methods take (ctx, args...) with no sql parameter.
 )
 
 // ───────────────────────────── Query / Exec / QueryRow ─────────────────────────────
 //
-// The same three ergonomic methods sit on *Database (autocommit), *Transaction (inside an explicit
-// block), and *PreparedStatement (fixed SQL). Each converts native args and arms cancellation on
-// the engine that runs the statement, so the conversion + cancellation logic lives once, in
-// ergoQuery/ergoExec; the per-type methods are one-liners that supply the right engine + raw
-// []Value primitive. armCancel threads ctx into the statement's cost meter (api.md §11.4), so a
+// The same three ergonomic methods sit on *Database (autocommit), *Session (durable), and
+// *Transaction (inside an explicit block), with *Prepared siblings taking a PreparedStatement in
+// place of sql. Each converts native args and arms cancellation on the engine that runs the
+// statement, so the conversion + cancellation logic lives once, in ergoQuery/ergoExec; the per-type
+// methods are one-liners that supply the right engine + raw []Value primitive. armCancel threads ctx
+// into the statement's cost meter (api.md §11.4), so a
 // flipped context aborts a long-running statement at the executor's Guard() checkpoint — not only
 // at the cursor boundary (ctxErr, the cheap pre-exec / cursor poll).
 
@@ -156,19 +161,62 @@ func (tx *Transaction) QueryRow(ctx context.Context, sql string, args ...any) *R
 	return &Row{rows: rows, err: err}
 }
 
-// Query / Exec / QueryRow on a prepared statement — SQL is fixed at Prepare, so there is no sql
-// argument. The raw queryValues method matches the helper closure directly; the statement
-// runs on execEngine (the bound session's engine, else the statement's own).
-func (s *PreparedStatement) Query(ctx context.Context, args ...any) (*Rows, error) {
-	return ergoQuery(ctx, s.execEngine(), args, s.queryValues)
+// QueryPrepared / ExecPrepared / QueryRowPrepared run a PreparedStatement — SQL fixed at Prepare, so
+// there is no sql argument. The same trio sits on *Database (fresh autocommit session per call),
+// *Session (this durable session), and *Transaction (inside the open block): the handle supplies the
+// session the execute observes, so one statement may be reused across sessions — and goroutines —
+// while its cached plan is reused whenever the executing handle's database + committed catalog still
+// match the cache (spec/design/api.md §2.4).
+
+// QueryPrepared runs a prepared query on a fresh autocommit session, binding native args.
+func (db *Database) QueryPrepared(ctx context.Context, stmt *PreparedStatement, args ...any) (*Rows, error) {
+	s := db.Session(SessionOptions{})
+	defer s.Close()
+	return ergoQuery(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.queryStmt(stmt.ast, p, &stmt.sc) })
 }
 
-func (s *PreparedStatement) Exec(ctx context.Context, args ...any) (Result, error) {
-	return ergoExec(ctx, s.execEngine(), args, s.queryValues)
+// ExecPrepared runs a prepared statement on a fresh autocommit session and returns its command tag.
+func (db *Database) ExecPrepared(ctx context.Context, stmt *PreparedStatement, args ...any) (Result, error) {
+	s := db.Session(SessionOptions{})
+	defer s.Close()
+	return ergoExec(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.queryStmt(stmt.ast, p, &stmt.sc) })
 }
 
-func (s *PreparedStatement) QueryRow(ctx context.Context, args ...any) *Row {
-	rows, err := s.Query(ctx, args...)
+// QueryRowPrepared runs a prepared query and returns a one-row handle; a setup error defers to Row.Scan.
+func (db *Database) QueryRowPrepared(ctx context.Context, stmt *PreparedStatement, args ...any) *Row {
+	rows, err := db.QueryPrepared(ctx, stmt, args...)
+	return &Row{rows: rows, err: err}
+}
+
+// QueryPrepared runs a prepared query on this session (its pinned snapshot, privileges, temp domain).
+func (s *Session) QueryPrepared(ctx context.Context, stmt *PreparedStatement, args ...any) (*Rows, error) {
+	return ergoQuery(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.queryStmt(stmt.ast, p, &stmt.sc) })
+}
+
+// ExecPrepared runs a prepared statement on this session and returns its command tag.
+func (s *Session) ExecPrepared(ctx context.Context, stmt *PreparedStatement, args ...any) (Result, error) {
+	return ergoExec(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.queryStmt(stmt.ast, p, &stmt.sc) })
+}
+
+// QueryRowPrepared runs a prepared query and returns a one-row handle; a setup error defers to Row.Scan.
+func (s *Session) QueryRowPrepared(ctx context.Context, stmt *PreparedStatement, args ...any) *Row {
+	rows, err := s.QueryPrepared(ctx, stmt, args...)
+	return &Row{rows: rows, err: err}
+}
+
+// QueryPrepared runs a prepared query within this transaction (against its working set).
+func (tx *Transaction) QueryPrepared(ctx context.Context, stmt *PreparedStatement, args ...any) (*Rows, error) {
+	return ergoQuery(ctx, tx.db, args, func(p []Value) (*Rows, error) { return tx.db.queryStmt(stmt.ast, p, &stmt.sc) })
+}
+
+// ExecPrepared runs a prepared statement within this transaction and returns its command tag.
+func (tx *Transaction) ExecPrepared(ctx context.Context, stmt *PreparedStatement, args ...any) (Result, error) {
+	return ergoExec(ctx, tx.db, args, func(p []Value) (*Rows, error) { return tx.db.queryStmt(stmt.ast, p, &stmt.sc) })
+}
+
+// QueryRowPrepared runs a prepared query and returns a one-row handle; a setup error defers to Row.Scan.
+func (tx *Transaction) QueryRowPrepared(ctx context.Context, stmt *PreparedStatement, args ...any) *Row {
+	rows, err := tx.QueryPrepared(ctx, stmt, args...)
 	return &Row{rows: rows, err: err}
 }
 
@@ -840,13 +888,4 @@ func (e *engine) armCancel(ctx context.Context) func() {
 		close(done)
 		e.session.cancel = nil
 	}
-}
-
-// execEngine is the engine a prepared statement's run dispatches on: the bound session's engine
-// when prepared on a Session, else the statement's own engine.
-func (s *PreparedStatement) execEngine() *engine {
-	if s.sess != nil {
-		return s.sess.engine
-	}
-	return s.db
 }
