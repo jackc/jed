@@ -21,6 +21,7 @@ func tzBundleBytes(t *testing.T) []byte {
 }
 
 func TestTimezoneReaderMatchesVectors(t *testing.T) {
+	t.Parallel()
 	if err := LoadTimeZoneData(tzBundleBytes(t)); err != nil {
 		t.Fatalf("load tzdata.jtz: %v", err)
 	}
@@ -49,6 +50,7 @@ func TestTimezoneReaderMatchesVectors(t *testing.T) {
 }
 
 func TestTimezoneBundleMatchesVectors(t *testing.T) {
+	t.Parallel()
 	data := tzBundleBytes(t)
 	parsed, err := openTzBundle(data)
 	if err != nil {

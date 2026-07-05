@@ -133,6 +133,7 @@ func pmCheckInvariants(t *testing.T, pm *pMap) {
 }
 
 func TestPMapInsertGetRemoveVsReference(t *testing.T) {
+	t.Parallel()
 	var pm pMap
 	ref := map[string]storedRow{}
 	const n = 4000
@@ -202,6 +203,7 @@ func TestPMapInsertGetRemoveVsReference(t *testing.T) {
 }
 
 func TestPMapCloneIsIndependentSnapshot(t *testing.T) {
+	t.Parallel()
 	var base pMap
 	for k := uint64(0); k < 2000; k++ {
 		base.Insert(pmKey(k), pmRow(int64(k)), pmW, pmCap, pmShape, nil)
@@ -250,6 +252,7 @@ func TestPMapCloneIsIndependentSnapshot(t *testing.T) {
 // two-record leaf (2·100 + leafOverhead(2, {fixed:1}) = 218 ≤ 240) fits but a third record
 // overflows, so a node holds ~2 entries.
 func TestPMapWideValuesKeepNodesValid(t *testing.T) {
+	t.Parallel()
 	var pm pMap
 	for _, k := range pmShuffled(300) {
 		pm.Insert(pmKey(k), pmRow(int64(k)), 100, pmCap, pmShape, nil)
@@ -269,6 +272,7 @@ func TestPMapWideValuesKeepNodesValid(t *testing.T) {
 // split and legal 0-key interiors. The map must stay correct through inserts, scans, and removes
 // (a looser invariant check — 0-key interiors are legal here).
 func TestPMapNearCapKeysDegenerateInterior(t *testing.T) {
+	t.Parallel()
 	// Index-tree shape: zero value columns, record = key alone. RECORD_MAX(0) = (240−12)/2 = 114;
 	// keys of 110 bytes keep records under the cap while two separators (2·110 + 20) overflow an
 	// interior.
@@ -335,6 +339,7 @@ func TestPMapNearCapKeysDegenerateInterior(t *testing.T) {
 // one windowed walk match overlapNodeCount's second counting descent (the page_read contract,
 // cost.md §3).
 func TestPMapBoundedScanCountsAgree(t *testing.T) {
+	t.Parallel()
 	var pm pMap
 	for _, k := range pmShuffled(2000) {
 		pm.Insert(pmKey(k), pmRow(int64(k)), pmW, pmCap, pmShape, nil)
@@ -366,6 +371,7 @@ func TestPMapBoundedScanCountsAgree(t *testing.T) {
 }
 
 func TestPMapEmptyAndSingle(t *testing.T) {
+	t.Parallel()
 	var pm pMap
 	if pmLen(t, &pm) != 0 {
 		t.Fatal("fresh map not empty")
@@ -395,6 +401,7 @@ func TestPMapEmptyAndSingle(t *testing.T) {
 // single-leaf conformance tables (the DESC-LIMIT corpus cases) cannot exercise. 200 entries at
 // pmCap build several levels.
 func TestPMapReverseScanIsForwardReversed(t *testing.T) {
+	t.Parallel()
 	var pm pMap
 	for n := uint64(0); n < 200; n++ {
 		pm.Insert(pmKey(n), pmRow(int64(n)), pmW, pmCap, pmShape, nil)
@@ -449,6 +456,7 @@ func TestPMapReverseScanIsForwardReversed(t *testing.T) {
 // streaming pipeline (S3) rests on. Internal machinery, not corpus-expressible (CLAUDE.md §10), so it
 // is unit-tested per core against the existing push scan.
 func TestPMapRangeCursorMatchesScanRange(t *testing.T) {
+	t.Parallel()
 	var pm pMap
 	for n := uint64(0); n < 200; n++ {
 		pm.Insert(pmKey(n), pmRow(int64(n)), pmW, pmCap, pmShape, nil)

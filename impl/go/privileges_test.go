@@ -16,6 +16,7 @@ func privCode(t *testing.T, db dbHandle, sql string) string {
 }
 
 func TestDefaultSessionIsFullyPermissive(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	if !db.AllowDDL() {
 		t.Fatal("default session should allow DDL")
@@ -30,6 +31,7 @@ func TestDefaultSessionIsFullyPermissive(t *testing.T) {
 }
 
 func TestSetDefaultPrivilegesMakesAReadOnlySession(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	sessExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 	sessExec(t, db, "INSERT INTO t VALUES (1, 10)")
@@ -52,6 +54,7 @@ func TestSetDefaultPrivilegesMakesAReadOnlySession(t *testing.T) {
 // lives — so a restricted session could read a table it held no SELECT on through the ergonomic Query
 // path. The corpus drives this via the harness's Query re-plumb; this pins it at the Go host surface.
 func TestQueryPathEnforcesSelectPrivilege(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	sessExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 	sessExec(t, db, "INSERT INTO t VALUES (1, 10)")
@@ -67,6 +70,7 @@ func TestQueryPathEnforcesSelectPrivilege(t *testing.T) {
 }
 
 func TestGrantAddsAndRevokeWins(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	sessExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 
@@ -85,6 +89,7 @@ func TestGrantAddsAndRevokeWins(t *testing.T) {
 }
 
 func TestAllowDDLGateIsIndependentOfTablePrivileges(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	sessExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 	db.SetAllowDDL(false)
@@ -98,6 +103,7 @@ func TestAllowDDLGateIsIndependentOfTablePrivileges(t *testing.T) {
 }
 
 func TestFunctionExecuteIsRevocable(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	if !db.Privileges().AllowsFunction("abs") {
 		t.Fatal("functions should default to EXECUTE on all")
@@ -114,6 +120,7 @@ func TestFunctionExecuteIsRevocable(t *testing.T) {
 }
 
 func TestAnAdditionalSessionCarriesItsOwnEnvelope(t *testing.T) {
+	t.Parallel()
 	// db.Session(opts) mints an independent session over a shared Database core (§2.4): a restricted
 	// one rejects a write a permissive session still allows, and they share committed storage through
 	// the core (§2.1/§5.3) — each owns its envelope, no swap.
@@ -145,6 +152,7 @@ func TestAnAdditionalSessionCarriesItsOwnEnvelope(t *testing.T) {
 }
 
 func TestMissingObjectIs42P01NotAuthorization(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	db.SetDefaultPrivileges(PrivSetEmpty)
 	if got := privCode(t, db, "SELECT * FROM does_not_exist"); got != "42P01" {

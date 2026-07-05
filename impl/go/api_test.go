@@ -23,6 +23,7 @@ func mustExec(t *testing.T, db dbHandle, sql string) {
 }
 
 func TestCreateCommitReopenRoundTrips(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "round_trip.jed")
 	db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
 	if err != nil {
@@ -53,6 +54,7 @@ func TestCreateCommitReopenRoundTrips(t *testing.T) {
 }
 
 func TestOpenMissingFileIs58P01(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "nope.jed")
 	if _, err := OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true}); err == nil {
 		t.Fatal("expected error")
@@ -62,6 +64,7 @@ func TestOpenMissingFileIs58P01(t *testing.T) {
 }
 
 func TestCreateOverExistingFileIs58P02(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "here.jed")
 	db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
 	if err != nil {
@@ -78,6 +81,7 @@ func TestCreateOverExistingFileIs58P02(t *testing.T) {
 }
 
 func TestCreateWithCustomPageSizeRoundTrips(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "page256.jed")
 	db, err := CreateDatabase(CreateOptions{Path: path, PageSize: 256, SkipFsync: true})
 	if err != nil {
@@ -98,6 +102,7 @@ func TestCreateWithCustomPageSizeRoundTrips(t *testing.T) {
 }
 
 func TestAutocommitPersistsEachWriteAcrossClose(t *testing.T) {
+	t.Parallel()
 	// jed autocommits (spec/design/transactions.md §4.1): a write is durable as soon as it
 	// succeeds, so it survives a Close with no explicit Commit — the opposite of the original
 	// "no autocommit" model this test used to assert.
@@ -122,6 +127,7 @@ func TestAutocommitPersistsEachWriteAcrossClose(t *testing.T) {
 }
 
 func TestCommitAndRollbackAreNoopsUnderAutocommit(t *testing.T) {
+	t.Parallel()
 	// With no explicit transaction open, both are lenient no-op successes (transactions.md §4.2).
 	db := memDB().Session(SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
@@ -139,6 +145,7 @@ func TestCommitAndRollbackAreNoopsUnderAutocommit(t *testing.T) {
 }
 
 func TestPrepareExecuteAndQueryWithParams(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 	insert, err := db.Prepare("INSERT INTO t VALUES ($1, $2)")
@@ -262,6 +269,7 @@ func TestPreparedHandleMethods(t *testing.T) {
 // command tag, and (the effect-then-error bug this fixed) the statement's effect actually lands. A
 // write run through Query used to commit and THEN return 42601; now it just succeeds.
 func TestQueryOnNonQueryStatementIsTotal(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 
 	// DDL through Query: no columns, no rows, no error, and the table is really created.
@@ -312,6 +320,7 @@ func TestQueryOnNonQueryStatementIsTotal(t *testing.T) {
 }
 
 func TestErrorsSurfaceWithSQLState(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	if _, err := db.Prepare("SELCT 1"); err == nil {
 		t.Fatal("expected error")
@@ -321,6 +330,7 @@ func TestErrorsSurfaceWithSQLState(t *testing.T) {
 }
 
 func TestCommitOnInMemoryIsNoopSuccess(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	before := db.Txid()
@@ -333,6 +343,7 @@ func TestCommitOnInMemoryIsNoopSuccess(t *testing.T) {
 }
 
 func TestRowsAffectedReportsDMLCounts(t *testing.T) {
+	t.Parallel()
 	// The affected-row count (api.md §4): INSERT/UPDATE/DELETE without RETURNING report
 	// how many rows they touched (PostgreSQL's command-tag count); a DML statement that
 	// matched nothing reports (0, true); DDL and transaction control report (0, false);
@@ -387,6 +398,7 @@ func TestRowsAffectedReportsDMLCounts(t *testing.T) {
 }
 
 func TestOpenReadOnlyBlocksWritesAndNeverTouchesTheFile(t *testing.T) {
+	t.Parallel()
 	// Read-only open (api.md §2.1): the handle behaves like PostgreSQL hot standby — every
 	// transaction defaults to READ ONLY, an explicit READ WRITE request and any write are
 	// 25006, and the file bytes are never touched.

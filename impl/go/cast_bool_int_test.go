@@ -38,6 +38,7 @@ func castOne(t *testing.T, db dbHandle, sql string) Value {
 
 // bool → i16 and bool → i64 are forbidden (PG has only bool → int4): jed 42804, PG 42846.
 func TestBoolToNonI32Forbidden(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	for _, sql := range []string{
 		"SELECT CAST(TRUE AS i16)",
@@ -54,6 +55,7 @@ func TestBoolToNonI32Forbidden(t *testing.T) {
 // i16 → boolean and i64 → boolean are forbidden (PG has only int4 → bool): jed 42804, PG 42846.
 // A column carries the width unambiguously (a bare literal would adapt to i32).
 func TestNonI32ToBoolForbidden(t *testing.T) {
+	t.Parallel()
 	db := dbWith(
 		t,
 		"CREATE TABLE t (id i32 PRIMARY KEY, s i16, b i64)",
@@ -72,6 +74,7 @@ func TestNonI32ToBoolForbidden(t *testing.T) {
 // An integer literal operand of a boolean target adapts to i32, so a magnitude beyond i32 range
 // traps 22003 (PG reports 42846 — it types the literal as int8 first). A documented divergence.
 func TestLiteralBeyondI32ToBoolOverflows(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	for _, sql := range []string{
 		"SELECT CAST(5000000000 AS boolean)",
@@ -86,6 +89,7 @@ func TestLiteralBeyondI32ToBoolOverflows(t *testing.T) {
 // The headline directions still work here (a quick per-core smoke check alongside the divergences;
 // the exhaustive behavior is in the corpus). true→1, false→0, 0→false, nonzero→true, NULL→NULL.
 func TestBoolI32RoundTripSmoke(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	if v := castOne(t, db, "SELECT CAST(TRUE AS i32)"); v.Kind != ValInt || v.Int != 1 {
 		t.Fatalf("CAST(TRUE AS i32) = %v, want 1", v)

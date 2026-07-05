@@ -22,10 +22,12 @@ func setupUpdate(t *testing.T) *Session {
 }
 
 func TestUpdateMissingTable(t *testing.T) {
+	t.Parallel()
 	wantErr(t, memDB().Session(SessionOptions{}), "UPDATE nope SET a = 1", "42P01")
 }
 
 func TestUpdateUnknownColumn(t *testing.T) {
+	t.Parallel()
 	wantErr(t, setupUpdate(t), "UPDATE t SET nope = 1", "42703")
 }
 
@@ -44,6 +46,7 @@ func idsABC(db dbHandle) []string {
 // swap of two primary keys keeps both keys present, so jed accepts it — where PostgreSQL's
 // per-row check fails on the transient collision. Each row's non-key columns move with it.
 func TestUpdatePkSwapIsEndStateValid(t *testing.T) {
+	t.Parallel()
 	db := setupUpdate(t)
 	if _, err := queryOutcome(db, "UPDATE t SET id = 3 - id WHERE id <= 2", nil); err != nil {
 		t.Fatalf("swap: %v", err)
@@ -58,6 +61,7 @@ func TestUpdatePkSwapIsEndStateValid(t *testing.T) {
 // A cascade that shifts every key up by one is likewise end-state-valid, so jed re-keys all
 // three rows — where PostgreSQL rejects the per-row transient (id 1 → 2 while 2 still exists).
 func TestUpdatePkIncrementCascadeSucceeds(t *testing.T) {
+	t.Parallel()
 	db := setupUpdate(t)
 	if _, err := queryOutcome(db, "UPDATE t SET id = id + 1", nil); err != nil {
 		t.Fatalf("cascade: %v", err)
@@ -71,6 +75,7 @@ func TestUpdatePkIncrementCascadeSucceeds(t *testing.T) {
 
 // Re-keying onto a DISTINCT existing (non-updated) row's key collides — 23505, all-or-nothing.
 func TestUpdatePkCollisionWithExisting(t *testing.T) {
+	t.Parallel()
 	db := setupUpdate(t)
 	wantErr(t, db, "UPDATE t SET id = 3 WHERE id = 1", "23505")
 	got := idsABC(db)

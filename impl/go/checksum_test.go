@@ -83,6 +83,7 @@ func seedChecksum(t *testing.T, path string) {
 }
 
 func TestCorruptingAnyBodyPageIsCaughtOrInertNeverSilent(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "seed.jed")
 	cpath := filepath.Join(dir, "corrupt.jed")

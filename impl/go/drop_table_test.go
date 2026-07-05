@@ -12,6 +12,7 @@ package jed
 import "testing"
 
 func TestDropRemovesTableAndRows(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	mustCreate(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i16)")
 	mustCreate(t, db, "INSERT INTO t VALUES (1, 10), (2, 20)")
@@ -28,6 +29,7 @@ func TestDropRemovesTableAndRows(t *testing.T) {
 }
 
 func TestNameIsFreeToRecreateAfterDrop(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	mustCreate(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i16)")
 	mustCreate(t, db, "INSERT INTO t VALUES (1, 10)")
@@ -44,6 +46,7 @@ func TestNameIsFreeToRecreateAfterDrop(t *testing.T) {
 }
 
 func TestDropIsCaseInsensitive(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	mustCreate(t, db, "create table T (id i32 primary key)")
 	mustCreate(t, db, "DROP TABLE t")
@@ -53,6 +56,7 @@ func TestDropIsCaseInsensitive(t *testing.T) {
 }
 
 func TestDropLeavesOtherTablesIntact(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	mustCreate(t, db, "CREATE TABLE a (id i32 PRIMARY KEY)")
 	mustCreate(t, db, "CREATE TABLE b (id i32 PRIMARY KEY)")
@@ -70,6 +74,7 @@ func TestDropLeavesOtherTablesIntact(t *testing.T) {
 }
 
 func TestDropTableSyntaxErrors(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	wantErr(t, db, "DROP TABLE", "42601") // no table name
 	mustCreate(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")

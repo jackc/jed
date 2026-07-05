@@ -27,6 +27,7 @@ func splitPairs(sql string) []StatementSpan {
 }
 
 func TestSplitBasicAndOffsets(t *testing.T) {
+	t.Parallel()
 	got := splitPairs("SELECT 1; SELECT 2")
 	want := []StatementSpan{{Text: "SELECT 1", Offset: 0}, {Text: "SELECT 2", Offset: 10}}
 	if !reflect.DeepEqual(got, want) {
@@ -35,6 +36,7 @@ func TestSplitBasicAndOffsets(t *testing.T) {
 }
 
 func TestSplitEmptySpansSkipped(t *testing.T) {
+	t.Parallel()
 	cases := map[string][]string{
 		"SELECT 1;":           {"SELECT 1"},
 		";;; SELECT 1 ;;;":    {"SELECT 1"},
@@ -52,6 +54,7 @@ func TestSplitEmptySpansSkipped(t *testing.T) {
 }
 
 func TestSplitSemicolonInStringIsNotABoundary(t *testing.T) {
+	t.Parallel()
 	if got := splitTexts("INSERT INTO t VALUES ('a;b'); SELECT 1"); !reflect.DeepEqual(
 		got, []string{"INSERT INTO t VALUES ('a;b')", "SELECT 1"},
 	) {
@@ -63,6 +66,7 @@ func TestSplitSemicolonInStringIsNotABoundary(t *testing.T) {
 }
 
 func TestSplitSemicolonInCommentIsNotABoundary(t *testing.T) {
+	t.Parallel()
 	if got := splitTexts("SELECT 1 -- a; b\n; SELECT 2"); !reflect.DeepEqual(
 		got, []string{"SELECT 1", "SELECT 2"},
 	) {
@@ -81,6 +85,7 @@ func TestSplitSemicolonInCommentIsNotABoundary(t *testing.T) {
 }
 
 func TestSplitDollarQuoteSemicolonIsNotABoundary(t *testing.T) {
+	t.Parallel()
 	if got := splitTexts("SELECT $$a;b$$; SELECT 2"); !reflect.DeepEqual(
 		got, []string{"SELECT $$a;b$$", "SELECT 2"},
 	) {
@@ -98,6 +103,7 @@ func TestSplitDollarQuoteSemicolonIsNotABoundary(t *testing.T) {
 }
 
 func TestSplitTrailingWhitespaceAndInteriorComment(t *testing.T) {
+	t.Parallel()
 	got := splitPairs("  SELECT 1  ;  SELECT /* x */ 2  ")
 	if got[0] != (StatementSpan{Text: "SELECT 1", Offset: 2}) {
 		t.Fatalf("first: got %+v", got[0])
@@ -108,6 +114,7 @@ func TestSplitTrailingWhitespaceAndInteriorComment(t *testing.T) {
 }
 
 func TestSplitNoTrailingSemicolonStillYieldsLast(t *testing.T) {
+	t.Parallel()
 	if got := splitTexts("SELECT 1; SELECT 2; SELECT 3"); !reflect.DeepEqual(
 		got, []string{"SELECT 1", "SELECT 2", "SELECT 3"},
 	) {

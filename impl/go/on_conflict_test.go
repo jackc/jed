@@ -44,6 +44,7 @@ func ocAffected(t *testing.T, db dbHandle, sql string) (int64, bool) {
 // deferred follow-on. The standalone UPDATE re-keying has landed (§11 step 6); extending it to
 // the upsert conflict path is separate. PostgreSQL allows it.
 func TestOnConflictDoUpdatePKColumnUnsupported(t *testing.T) {
+	t.Parallel()
 	db := ocDB(t, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)", "INSERT INTO t VALUES (1, 10)")
 	if got := ocErr(t, db, "INSERT INTO t VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET id = excluded.id + 100"); got != "0A000" {
 		t.Fatalf("got %s, want 0A000", got)
@@ -54,6 +55,7 @@ func TestOnConflictDoUpdatePKColumnUnsupported(t *testing.T) {
 // DEFAULT is not reserved (§3), so a bare DEFAULT resolves as a column reference → 42703. PostgreSQL
 // supports SET col = DEFAULT.
 func TestOnConflictDoUpdateSetDefaultUnsupported(t *testing.T) {
+	t.Parallel()
 	db := ocDB(t, "CREATE TABLE t (id i32 PRIMARY KEY, v i32 DEFAULT 7)", "INSERT INTO t VALUES (1, 10)")
 	if got := ocErr(t, db, "INSERT INTO t VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET v = DEFAULT"); got != "42703" {
 		t.Fatalf("got %s, want 42703", got)
@@ -63,6 +65,7 @@ func TestOnConflictDoUpdateSetDefaultUnsupported(t *testing.T) {
 // DIVERGENCE: a GENERATED ALWAYS identity column can only be set to DEFAULT (jed has no
 // SET = DEFAULT), so any DO UPDATE assignment to one is 428C9 — the standing UPDATE rule.
 func TestOnConflictDoUpdateGeneratedAlwaysRejected(t *testing.T) {
+	t.Parallel()
 	db := ocDB(t,
 		"CREATE TABLE t (id i32 GENERATED ALWAYS AS IDENTITY, k i32 PRIMARY KEY, v i32)",
 		"INSERT INTO t (k, v) VALUES (1, 10)")
@@ -75,6 +78,7 @@ func TestOnConflictDoUpdateGeneratedAlwaysRejected(t *testing.T) {
 // counts the inserted + updated rows; rows skipped by DO NOTHING (or a DO UPDATE WHERE that is
 // false) are not counted.
 func TestOnConflictAffectedRowCounts(t *testing.T) {
+	t.Parallel()
 	db := ocDB(t, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)", "INSERT INTO t VALUES (1, 10), (2, 20)")
 	check := func(sql string, want int64) {
 		t.Helper()

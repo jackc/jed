@@ -39,6 +39,7 @@ func setupT(t *testing.T) *Session {
 }
 
 func TestUnknownColumnTraps(t *testing.T) {
+	t.Parallel()
 	db := setupT(t)
 	wantErr(t, db, "SELECT nope FROM t", "42703")
 	wantErr(t, db, "SELECT id FROM t WHERE nope = 1", "42703")
@@ -57,6 +58,7 @@ func limitDB(t *testing.T) *Session {
 }
 
 func TestLimitOffsetWindowReducesProducedCost(t *testing.T) {
+	t.Parallel()
 	// ORDER BY on a NON-primary-key column (`v`) is a blocking sort the scan does not satisfy, so it
 	// reads every row before windowing; the slice runs before projection, so only windowed rows
 	// charge row_produced: 1 page_read (t is one leaf) + 5 scanned + 2 produced = 8

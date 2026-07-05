@@ -50,6 +50,7 @@ func firstInts(rows [][]Value) []int64 {
 }
 
 func TestWherePkEqParamPointLookup(t *testing.T) {
+	t.Parallel()
 	db := dbWith(t,
 		"CREATE TABLE t (id i32 PRIMARY KEY, v i32)",
 		"INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
@@ -60,6 +61,7 @@ func TestWherePkEqParamPointLookup(t *testing.T) {
 }
 
 func TestParamAdoptsNarrowColumnTypeAndTrapsOverflow(t *testing.T) {
+	t.Parallel()
 	db := dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY, s i16)",
 		"INSERT INTO t VALUES (1, 100)")
 	if c := paramErrCode(t, db, "SELECT id FROM t WHERE s = $1", IntValue(100000)); c != "22003" {
@@ -72,6 +74,7 @@ func TestParamAdoptsNarrowColumnTypeAndTrapsOverflow(t *testing.T) {
 }
 
 func TestInsertValuesParamsRoundTrip(t *testing.T) {
+	t.Parallel()
 	db := dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY, name text)")
 	if _, err := queryOutcome(db, "INSERT INTO t VALUES ($1, $2)", []Value{IntValue(7), TextValue("alice")}); err != nil {
 		t.Fatal(err)
@@ -83,6 +86,7 @@ func TestInsertValuesParamsRoundTrip(t *testing.T) {
 }
 
 func TestInsertParamNullIntoNotNullTraps23502(t *testing.T) {
+	t.Parallel()
 	db := dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY, name text NOT NULL)")
 	if c := paramErrCode(t, db, "INSERT INTO t VALUES ($1, $2)", IntValue(1), NullValue()); c != "23502" {
 		t.Fatalf("code = %s want 23502", c)
@@ -90,6 +94,7 @@ func TestInsertParamNullIntoNotNullTraps23502(t *testing.T) {
 }
 
 func TestInsertParamWrongFamilyTraps42804(t *testing.T) {
+	t.Parallel()
 	db := dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY, n i32)")
 	if c := paramErrCode(t, db, "INSERT INTO t VALUES ($1, $2)", IntValue(1), TextValue("x")); c != "42804" {
 		t.Fatalf("code = %s want 42804", c)
@@ -97,6 +102,7 @@ func TestInsertParamWrongFamilyTraps42804(t *testing.T) {
 }
 
 func TestUpdateSetAndWhereParams(t *testing.T) {
+	t.Parallel()
 	db := dbWith(t,
 		"CREATE TABLE t (id i32 PRIMARY KEY, v i32)",
 		"INSERT INTO t VALUES (1, 10), (2, 20)")
@@ -110,6 +116,7 @@ func TestUpdateSetAndWhereParams(t *testing.T) {
 }
 
 func TestDeleteWhereParam(t *testing.T) {
+	t.Parallel()
 	db := dbWith(t,
 		"CREATE TABLE t (id i32 PRIMARY KEY)",
 		"INSERT INTO t VALUES (1), (2), (3)")
@@ -123,6 +130,7 @@ func TestDeleteWhereParam(t *testing.T) {
 }
 
 func TestTextParamInference(t *testing.T) {
+	t.Parallel()
 	db := dbWith(t,
 		"CREATE TABLE t (id i32 PRIMARY KEY, name text)",
 		"INSERT INTO t VALUES (1, 'alice'), (2, 'bob')")
@@ -133,6 +141,7 @@ func TestTextParamInference(t *testing.T) {
 }
 
 func TestBareSelectParamIsIndeterminate42P18(t *testing.T) {
+	t.Parallel()
 	db := dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	if c := paramErrCode(t, db, "SELECT $1 FROM t", IntValue(1)); c != "42P18" {
 		t.Fatalf("code = %s want 42P18", c)
@@ -140,6 +149,7 @@ func TestBareSelectParamIsIndeterminate42P18(t *testing.T) {
 }
 
 func TestGapInParamIndicesIs42P18(t *testing.T) {
+	t.Parallel()
 	db := dbWith(t, "CREATE TABLE t (a i32 PRIMARY KEY, b i32)")
 	c := paramErrCode(t, db, "SELECT a FROM t WHERE a = $1 OR b = $3", IntValue(1), IntValue(2), IntValue(3))
 	if c != "42P18" {
@@ -148,6 +158,7 @@ func TestGapInParamIndicesIs42P18(t *testing.T) {
 }
 
 func TestConflictingInferenceIs42804(t *testing.T) {
+	t.Parallel()
 	db := dbWith(t, "CREATE TABLE t (a i32 PRIMARY KEY, name text)")
 	if c := paramErrCode(t, db, "SELECT a FROM t WHERE a = $1 OR name = $1", IntValue(1)); c != "42804" {
 		t.Fatalf("code = %s want 42804", c)
@@ -155,6 +166,7 @@ func TestConflictingInferenceIs42804(t *testing.T) {
 }
 
 func TestCountMismatchIs42601(t *testing.T) {
+	t.Parallel()
 	db := dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY)", "INSERT INTO t VALUES (1)")
 	if c := paramErrCode(t, db, "SELECT id FROM t WHERE id = $1"); c != "42601" {
 		t.Fatalf("none: code = %s want 42601", c)
@@ -165,6 +177,7 @@ func TestCountMismatchIs42601(t *testing.T) {
 }
 
 func TestNullParamThreeValued(t *testing.T) {
+	t.Parallel()
 	db := dbWith(t,
 		"CREATE TABLE t (id i32 PRIMARY KEY, v i32)",
 		"INSERT INTO t VALUES (1, 10)")
@@ -175,6 +188,7 @@ func TestNullParamThreeValued(t *testing.T) {
 }
 
 func TestParamInInList(t *testing.T) {
+	t.Parallel()
 	db := dbWith(t,
 		"CREATE TABLE t (id i32 PRIMARY KEY)",
 		"INSERT INTO t VALUES (1), (2), (3)")
@@ -185,6 +199,7 @@ func TestParamInInList(t *testing.T) {
 }
 
 func TestDDLWithParamsTraps42601(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	if c := paramErrCode(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)", IntValue(1)); c != "42601" {
 		t.Fatalf("code = %s want 42601", c)
@@ -192,6 +207,7 @@ func TestDDLWithParamsTraps42601(t *testing.T) {
 }
 
 func TestParamTypedByCastOperator(t *testing.T) {
+	t.Parallel()
 	// `$1::int` declares `$1` as int — PostgreSQL types a parameter by its cast target
 	// (api.md §5, grammar.md §37). No surrounding context is needed, so this is NOT 42P18.
 	db := dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY)")
@@ -207,6 +223,7 @@ func TestParamTypedByCastOperator(t *testing.T) {
 }
 
 func TestParamCastOperatorNarrowsAndTraps22003(t *testing.T) {
+	t.Parallel()
 	// `$1::smallint` declares `$1` as i16; a bound value out of i16 range traps 22003 at
 	// bind, before any scan.
 	db := dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY)")
@@ -216,6 +233,7 @@ func TestParamCastOperatorNarrowsAndTraps22003(t *testing.T) {
 }
 
 func TestParamCastToDeferredTargetIs0A000(t *testing.T) {
+	t.Parallel()
 	// Casting a parameter to a deferred target (text) is 0A000, like any non-string-literal
 	// cast to text.
 	db := dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY)")
@@ -225,6 +243,7 @@ func TestParamCastToDeferredTargetIs0A000(t *testing.T) {
 }
 
 func TestCastOperatorInheritsDeferralsAndRejectsLoneColon(t *testing.T) {
+	t.Parallel()
 	// `::` desugars to CAST, so casting a non-string-literal value to text is the same deferred
 	// 0A000 narrowing the CAST spelling carries. The boolean cast has since landed — `5::boolean`
 	// is now valid (→ true; cast_bool_int_test.go).
@@ -239,6 +258,7 @@ func TestCastOperatorInheritsDeferralsAndRejectsLoneColon(t *testing.T) {
 }
 
 func TestLexerRejectsBadParamTokens(t *testing.T) {
+	t.Parallel()
 	db := dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	for _, sql := range []string{
 		"SELECT id FROM t WHERE id = $0",

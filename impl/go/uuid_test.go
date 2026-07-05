@@ -12,6 +12,7 @@ func mustUUID(t *testing.T, s string) []byte {
 }
 
 func TestUUIDExtractVersion(t *testing.T) {
+	t.Parallel()
 	// PG 18 oracle (spec/design/functions.md §12).
 	cases := []struct {
 		s    string
@@ -36,6 +37,7 @@ func TestUUIDExtractVersion(t *testing.T) {
 }
 
 func TestUUIDExtractTimestamp(t *testing.T) {
+	t.Parallel()
 	// micros oracle-verified against PG 18; v1/v7 only (v6/v4/non-RFC → NULL).
 	cases := []struct {
 		s    string

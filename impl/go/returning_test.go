@@ -78,6 +78,7 @@ func retSetup(t *testing.T) *Session {
 }
 
 func TestInsertValuesReturningRowsAndVariant(t *testing.T) {
+	t.Parallel()
 	db := retSetup(t)
 	// Without RETURNING an INSERT stays a bare statement outcome.
 	if o := retRun(t, db, "INSERT INTO t VALUES (10, 1, 2)"); o.Kind != outcomeStatement {
@@ -94,6 +95,7 @@ func TestInsertValuesReturningRowsAndVariant(t *testing.T) {
 }
 
 func TestReturningOutputNamesAndExpressions(t *testing.T) {
+	t.Parallel()
 	db := retSetup(t)
 	// §8 naming: ?column? for an expression, the AS label, the canonical name for a
 	// bare/qualified column. Expressions evaluate against the stored row.
@@ -107,6 +109,7 @@ func TestReturningOutputNamesAndExpressions(t *testing.T) {
 }
 
 func TestInsertSelectReturning(t *testing.T) {
+	t.Parallel()
 	db := retSetup(t)
 	retRun(t, db, "CREATE TABLE src (a i32)")
 	retRun(t, db, "INSERT INTO src VALUES (40), (41)")
@@ -122,6 +125,7 @@ func TestInsertSelectReturning(t *testing.T) {
 }
 
 func TestUpdateReturningNewValues(t *testing.T) {
+	t.Parallel()
 	db := retSetup(t)
 	if g := retGrid(retRows(t, db, "UPDATE t SET v = v + 1 WHERE id <= 2 RETURNING id, v")); g != "1,11|2,21" {
 		t.Fatalf("got %s", g)
@@ -134,6 +138,7 @@ func TestUpdateReturningNewValues(t *testing.T) {
 }
 
 func TestDeleteReturningOldValues(t *testing.T) {
+	t.Parallel()
 	db := retSetup(t)
 	if g := retGrid(retRows(t, db, "DELETE FROM t WHERE w = 200 RETURNING id, v, w")); g != "2,20,200" {
 		t.Fatalf("got %s", g)
@@ -144,6 +149,7 @@ func TestDeleteReturningOldValues(t *testing.T) {
 }
 
 func TestReturningErrorCodes(t *testing.T) {
+	t.Parallel()
 	db := retSetup(t)
 	cases := []struct{ sql, code string }{
 		// Resolution precedes execution: the unknown column beats the would-be PK duplicate.
@@ -177,6 +183,7 @@ func TestReturningErrorCodes(t *testing.T) {
 }
 
 func TestReturningSubqueriesPreStatementSnapshot(t *testing.T) {
+	t.Parallel()
 	db := retSetup(t)
 	// Uncorrelated subqueries fold once and read the PRE-statement snapshot (probed
 	// against PG 18): the count excludes the two rows being inserted...
@@ -203,6 +210,7 @@ func TestReturningSubqueriesPreStatementSnapshot(t *testing.T) {
 }
 
 func TestReturningCosts(t *testing.T) {
+	t.Parallel()
 	db := retSetup(t)
 	// A plain VALUES insert still costs zero; RETURNING adds row_produced per stored row
 	// plus the items' metered evaluation (bare columns are leaves).
@@ -228,6 +236,7 @@ func TestReturningCosts(t *testing.T) {
 }
 
 func TestReturningSubqueryCosts(t *testing.T) {
+	t.Parallel()
 	// Fresh 3-row table: an uncorrelated RETURNING subquery folds ONCE.
 	// Inner `SELECT max(v) FROM t`: page_read 1 + 3 row reads + 3 accumulates +
 	// 1 row_produced = 8. Two returned rows add 2 x row_produced (the folded constant is
@@ -248,6 +257,7 @@ func TestReturningSubqueryCosts(t *testing.T) {
 }
 
 func TestReturningCeilingAbortIsAllOrNothing(t *testing.T) {
+	t.Parallel()
 	db := retSetup(t)
 	// The two-row insert with RETURNING costs 4 (pinned above). A ceiling of 2 aborts
 	// during the projection pass — BEFORE phase 2 — so nothing is inserted.
@@ -262,6 +272,7 @@ func TestReturningCeilingAbortIsAllOrNothing(t *testing.T) {
 }
 
 func TestReturningBindParams(t *testing.T) {
+	t.Parallel()
 	db := retSetup(t)
 	// A $N in the RETURNING list types from context like anywhere else (api.md §5).
 	o, err := queryOutcome(db, "INSERT INTO t VALUES (80, 3, 0) RETURNING v + $1", []Value{IntValue(5)})
@@ -280,6 +291,7 @@ func TestReturningBindParams(t *testing.T) {
 }
 
 func TestReturningGrowsTheTouchedSet(t *testing.T) {
+	t.Parallel()
 	// A compressed large value charges value_decompress only when RETURNING reads it
 	// (the §32 touched-set rule). 100_000 raw bytes at page_size 8192 (C = 8180):
 	// ceil(100000/8180) = 13 slabs.
@@ -317,6 +329,7 @@ func TestReturningGrowsTheTouchedSet(t *testing.T) {
 }
 
 func TestReturningInTransactions(t *testing.T) {
+	t.Parallel()
 	db := retSetup(t)
 	retRun(t, db, "BEGIN")
 	if g := retGrid(retRows(t, db, "INSERT INTO t VALUES (95, 1, 1) RETURNING id")); g != "95" {
@@ -335,6 +348,7 @@ func TestReturningInTransactions(t *testing.T) {
 }
 
 func TestOldNewQualifiersPerStatement(t *testing.T) {
+	t.Parallel()
 	db := retSetup(t)
 	// INSERT: old is the all-NULL row (the key included); new = bare = the stored row.
 	if g := retGrid(retRows(t, db, "INSERT INTO t VALUES (40, 4, 44) RETURNING old.v, new.v, v, old.id")); g != "NULL,4,4,NULL" {
@@ -362,6 +376,7 @@ func TestOldNewQualifiersPerStatement(t *testing.T) {
 }
 
 func TestOldNewNamingAndStar(t *testing.T) {
+	t.Parallel()
 	db := retSetup(t)
 	// §8: the qualifier never leaks into the output name (old.v is named v, like PG).
 	o := retRun(t, db, "UPDATE t SET v = 1 WHERE id = 1 RETURNING old.v, new.w")
@@ -376,6 +391,7 @@ func TestOldNewNamingAndStar(t *testing.T) {
 }
 
 func TestOldNewShadowedByTableName(t *testing.T) {
+	t.Parallel()
 	// A target table literally named old (or new) keeps the ordinary table-qualified
 	// meaning — the row-version pseudo-relation is suppressed (PG-probed).
 	db := memDB().Session(SessionOptions{})
@@ -403,6 +419,7 @@ func TestOldNewShadowedByTableName(t *testing.T) {
 }
 
 func TestOldNewInSubqueries(t *testing.T) {
+	t.Parallel()
 	db := retSetup(t)
 	retRun(t, db, "CREATE TABLE s2 (a i32, b i32)")
 	retRun(t, db, "INSERT INTO s2 VALUES (1, 500)")
@@ -419,6 +436,7 @@ func TestOldNewInSubqueries(t *testing.T) {
 }
 
 func TestOldNewTouchedSet(t *testing.T) {
+	t.Parallel()
 	// The touched-set sides (cost.md §3): old.col is ALWAYS a storage read — even when the
 	// column is assigned; a DELETE's new.col is the constant NULL row and reads nothing.
 	// Compressed 100k text at page_size 8192 = 13 slabs.

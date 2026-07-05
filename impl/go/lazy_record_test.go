@@ -13,6 +13,7 @@ import (
 // on. A construct decode of those same bytes must also still re-encode to the original (the eager
 // path is unchanged).
 func TestInlineBodySpanMatchesDecode(t *testing.T) {
+	t.Parallel()
 	i32 := scalarColType(scalarInt32)
 	text := scalarColType(scalarText)
 	field := func(name string, ty colType) colField {

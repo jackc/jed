@@ -101,6 +101,7 @@ func rowsEqual(a, b [][]Value) bool {
 }
 
 func TestSpillingSortMatchesInMemory(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "spill_match.jed")
 
 	// The source of truth: the same data + queries against a pure in-memory database, which never
@@ -142,6 +143,7 @@ func TestSpillingSortMatchesInMemory(t *testing.T) {
 }
 
 func TestSpillLeavesNoTempFiles(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "spill_cleanup.jed")
 
@@ -175,6 +177,7 @@ func TestSpillLeavesNoTempFiles(t *testing.T) {
 }
 
 func TestSpillingSortIsStableOnTies(t *testing.T) {
+	t.Parallel()
 	// Every row shares the same key, so the whole result is one big tie: a stable sort keeps the
 	// scan order (primary key = id ascending). The external sort reproduces it only if the merge
 	// tie-breaks by (run, position) = input order (spill.md §6).

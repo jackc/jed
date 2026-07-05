@@ -37,6 +37,7 @@ func attachErrCode(t *testing.T, s *Session, sql string) string {
 // TestAttachLifecycle drives the whole single-handle arc: attach an in-memory database, create +
 // populate a table in it by qualifier, read it back, then detach it (making it unreachable again).
 func TestAttachLifecycle(t *testing.T) {
+	t.Parallel()
 	db := memDB()
 	if err := db.Attach("mydb", AttachMemory(), false); err != nil {
 		t.Fatalf("attach: %v", err)
@@ -88,6 +89,7 @@ func TestAttachLifecycle(t *testing.T) {
 // TestAttachReadOnlyRejectsWrites — a read-only attachment rejects every write (DML + DDL) with 25006
 // before any I/O (attached-databases.md §4), while a bare/main write is unaffected.
 func TestAttachReadOnlyRejectsWrites(t *testing.T) {
+	t.Parallel()
 	db := memDB()
 	if err := db.Attach("ro", AttachMemory(), true); err != nil {
 		t.Fatalf("attach read-only: %v", err)
@@ -112,6 +114,7 @@ func TestAttachReadOnlyRejectsWrites(t *testing.T) {
 // (object_in_use); once the reader closes, the detach succeeds (attached-databases.md §4/§5, the
 // reader-liveness watermark — a reader pins the whole roots, so it pins every attachment).
 func TestDetachInUseIs55006(t *testing.T) {
+	t.Parallel()
 	db := memDB()
 	if err := db.Attach("mydb", AttachMemory(), false); err != nil {
 		t.Fatalf("attach: %v", err)
@@ -131,6 +134,7 @@ func TestDetachInUseIs55006(t *testing.T) {
 // TestAttachNameErrors — a reserved name (main/temp) or an already-attached name is 42710; detaching
 // an unknown / reserved database is 42704.
 func TestAttachNameErrors(t *testing.T) {
+	t.Parallel()
 	db := memDB()
 	if err := db.Attach("mydb", AttachMemory(), false); err != nil {
 		t.Fatalf("attach: %v", err)
@@ -176,6 +180,7 @@ func makeFileDB(t *testing.T, dir, name string, pageSize uint32, stmts ...string
 // against it, and confirm every write to it is 25006 (the natural reference-database mode,
 // attached-databases.md §4, Slice 2). Reads fault the attached file's pages through its own pager.
 func TestAttachFileReadOnlyCrossRead(t *testing.T) {
+	t.Parallel()
 	ref := makeFileDB(t, t.TempDir(), "ref.jed", 0,
 		"CREATE TABLE city (id i32 PRIMARY KEY, name text)",
 		"INSERT INTO city VALUES (1, 'Ada'), (2, 'Bos')")
@@ -224,6 +229,7 @@ func TestAttachFileReadOnlyCrossRead(t *testing.T) {
 // writes are durable (attached-databases.md §5 — a file attachment commits durably through its own
 // pager + alternating meta slot + fsync).
 func TestAttachFileReadWritePersistsAcrossReopen(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	work := makeFileDB(t, dir, "work.jed", 0) // an empty writable file to attach
 
@@ -261,6 +267,7 @@ func TestAttachFileReadWritePersistsAcrossReopen(t *testing.T) {
 // a FILE main and a read-write FILE attachment, a block that writes BOTH is 0A000 at COMMIT and commits
 // nothing; writing either one alone succeeds. In-memory attachments never count against the slot.
 func TestAttachFileOneDurableWriter(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	mainPath := makeFileDB(t, dir, "main.jed", 0, "CREATE TABLE m (id i32 PRIMARY KEY)")
 	extra := makeFileDB(t, dir, "extra.jed", 0, "CREATE TABLE e (id i32 PRIMARY KEY)")
@@ -309,6 +316,7 @@ func TestAttachFileOneDurableWriter(t *testing.T) {
 // TestAttachFileWithMemoryMainMultiWrite — the slot counts only FILE databases: an IN-MEMORY main plus
 // a read-write FILE attachment is ONE durable writer, so a block writing both commits cleanly (§5).
 func TestAttachFileWithMemoryMainMultiWrite(t *testing.T) {
+	t.Parallel()
 	work := makeFileDB(t, t.TempDir(), "work.jed", 0, "CREATE TABLE w (id i32 PRIMARY KEY)")
 	db := memDB() // in-memory main — not durable
 	if err := db.Attach("work", AttachFile(work), false); err != nil {
@@ -335,6 +343,7 @@ func TestAttachFileWithMemoryMainMultiWrite(t *testing.T) {
 // created at a non-default page size and writing into it serializes at THAT page size, verified by a
 // standalone reopen. Guards the CREATE TABLE / CREATE INDEX page-size routing (attachPageSize).
 func TestAttachFilePageSizeIndependent(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	small := makeFileDB(t, dir, "small.jed", 256) // a 256-byte-page file, unlike the 4096 default main
 	db := memDB()
@@ -370,6 +379,7 @@ func TestAttachFilePageSizeIndependent(t *testing.T) {
 // TestAttachFileReattach — detaching a file releases its OS handle, so the same file can be attached
 // again (a leaked descriptor would not prevent this, but a re-attach also proves the registry cleared).
 func TestAttachFileReattach(t *testing.T) {
+	t.Parallel()
 	ref := makeFileDB(t, t.TempDir(), "ref.jed", 0,
 		"CREATE TABLE t (id i32 PRIMARY KEY)", "INSERT INTO t VALUES (1)")
 	db := memDB()
@@ -393,6 +403,7 @@ func TestAttachFileReattach(t *testing.T) {
 // TestAttachFileMissingIs58P01 — attaching a nonexistent file surfaces the same host/file code as
 // opening main (attached-databases.md §11 / hosts.md §4).
 func TestAttachFileMissingIs58P01(t *testing.T) {
+	t.Parallel()
 	db := memDB()
 	defer db.Close()
 	path := filepath.Join(t.TempDir(), "nope.jed")
@@ -410,6 +421,7 @@ func TestAttachFileMissingIs58P01(t *testing.T) {
 // TestAttachCaseInsensitiveQualifier — an attachment is reached case-insensitively by its qualifier
 // (unquoted identifiers fold to lower case), matching how main/temp resolve.
 func TestAttachCaseInsensitiveQualifier(t *testing.T) {
+	t.Parallel()
 	db := memDB()
 	if err := db.Attach("Reports", AttachMemory(), false); err != nil {
 		t.Fatalf("attach: %v", err)

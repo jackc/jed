@@ -3,6 +3,7 @@ package jed
 import "testing"
 
 func TestMemoryBlockStoreGrowsWithZeroFillAndCopiesReads(t *testing.T) {
+	t.Parallel()
 	store := newMemoryBlockStore([]byte{1, 2, 3})
 
 	if err := store.setSize(6); err != nil {
@@ -52,6 +53,7 @@ func TestMemoryBlockStoreGrowsWithZeroFillAndCopiesReads(t *testing.T) {
 }
 
 func TestMemoryBlockStoreShortReadIsIoError(t *testing.T) {
+	t.Parallel()
 	store := newMemoryBlockStore([]byte{1, 2, 3})
 	if _, err := store.readAt(2, 2); err == nil {
 		t.Fatal("expected short read error")

@@ -39,6 +39,7 @@ func seedPersistedWindow(t *testing.T) *engine {
 }
 
 func TestWindowRunningAggregateOverPersistedColumn(t *testing.T) {
+	t.Parallel()
 	db := seedPersistedWindow(t)
 	defer db.Close()
 
@@ -62,6 +63,7 @@ func TestWindowRunningAggregateOverPersistedColumn(t *testing.T) {
 // read-path check the in-memory corpus (window/topn.test) cannot express — the window_running_sum
 // benchmark's regression twin.
 func TestWindowTopNOverPersistedColumn(t *testing.T) {
+	t.Parallel()
 	db := seedPersistedWindow(t)
 	defer db.Close()
 
@@ -79,6 +81,7 @@ func TestWindowTopNOverPersistedColumn(t *testing.T) {
 }
 
 func TestWindowAggregateFilterAndOffsetOverPersistedColumn(t *testing.T) {
+	t.Parallel()
 	db := seedPersistedWindow(t)
 	defer db.Close()
 

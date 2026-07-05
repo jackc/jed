@@ -11,6 +11,7 @@ package jed
 import "testing"
 
 func TestContainsBasic(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	cases := map[string]string{
 		"SELECT ARRAY[1,2,3] @> ARRAY[2]":         "true",
@@ -30,6 +31,7 @@ func TestContainsBasic(t *testing.T) {
 }
 
 func TestContainedByAndOverlaps(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	cases := map[string]string{
 		"SELECT ARRAY[2] <@ ARRAY[1,2,3]":   "true",
@@ -47,6 +49,7 @@ func TestContainedByAndOverlaps(t *testing.T) {
 }
 
 func TestContainmentStrictNullElement(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	// STRICT equality — a NULL element matches NOTHING, including another NULL (the inverse of the
 	// search/edit functions' NOT DISTINCT FROM). All of these are FALSE, never NULL.
@@ -66,6 +69,7 @@ func TestContainmentStrictNullElement(t *testing.T) {
 }
 
 func TestContainmentNullWholeArrayPropagates(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	cases := map[string]string{
 		"SELECT NULL::i64[] @> ARRAY[1]": "NULL",
@@ -81,6 +85,7 @@ func TestContainmentNullWholeArrayPropagates(t *testing.T) {
 }
 
 func TestContainmentPrecedenceAndAdaptation(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	cases := map[string]string{
 		// @> shares ||'s precedence rung (left-assoc): `a || b @> c` is `(a||b) @> c`.
@@ -99,6 +104,7 @@ func TestContainmentPrecedenceAndAdaptation(t *testing.T) {
 }
 
 func TestContainmentErrors(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	errs := map[string]string{
 		"SELECT 5 @> ARRAY[1]":                "42883", // non-array operand

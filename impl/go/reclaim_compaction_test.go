@@ -36,6 +36,7 @@ func churnInMemory(t *testing.T, reclaim bool, rounds int) (uint32, *Database) {
 }
 
 func TestWithinSessionCompactionBoundsInMemoryChurn(t *testing.T) {
+	t.Parallel()
 	const rounds = 300
 
 	// Control: reclaim OFF is the pre-Phase-A behavior — a never-reopened in-memory store leaks a page
@@ -70,6 +71,7 @@ func TestWithinSessionCompactionBoundsInMemoryChurn(t *testing.T) {
 }
 
 func TestCompactionDefersWhileOlderReaderPinned(t *testing.T) {
+	t.Parallel()
 	db := newInMemoryWithPageSize(256)
 	db.core.storage.reclaimWithinSession = true
 	sess := db.Session(SessionOptions{})

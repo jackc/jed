@@ -42,6 +42,7 @@ func checkNames(t *testing.T, db dbHandle, table string) []string {
 // collision; names assigned in textual definition order, then the catalog holds them in
 // evaluation (name) order.
 func TestCheckAutoNamingMatchesPostgres(t *testing.T) {
+	t.Parallel()
 	db := dbWith(
 		t,
 		"CREATE TABLE t (a int CHECK (a > 0), b int, CHECK (b > a), CHECK (1 < 2), CHECK (b < 100))",
@@ -77,6 +78,7 @@ func TestCheckAutoNamingMatchesPostgres(t *testing.T) {
 
 // The DDL-time rejections, codes and check order all oracle-probed against PostgreSQL.
 func TestCheckDDLErrorsMatchPostgres(t *testing.T) {
+	t.Parallel()
 	db := dbWith(t)
 	if code, _ := checkErr(t, db, "CREATE TABLE x (a int CHECK (a + 1))"); code != "42804" {
 		t.Fatalf("non-boolean = %s, want 42804", code)
@@ -155,6 +157,7 @@ func mustExecCheck(t *testing.T, db dbHandle, sql string) {
 // in NAME order (not definition order); NOT NULL fires before CHECK; CHECK fires before
 // the duplicate-key check.
 func TestCheckViolationsMatchPostgresOrder(t *testing.T) {
+	t.Parallel()
 	db := dbWith(
 		t,
 		"CREATE TABLE t (a int CHECK (a > 0), b int, CHECK (b > a))",
@@ -199,6 +202,7 @@ func TestCheckViolationsMatchPostgresOrder(t *testing.T) {
 // batch (INSERT multi-row, INSERT ... SELECT, UPDATE) leaves the table untouched, and a
 // defaulted value goes through the same per-row evaluation.
 func TestCheckTwoPhaseAndDefaults(t *testing.T) {
+	t.Parallel()
 	db := dbWith(
 		t,
 		"CREATE TABLE t (a int CHECK (a > 0))",
@@ -242,6 +246,7 @@ func TestCheckTwoPhaseAndDefaults(t *testing.T) {
 // The full expression surface works inside a check: CASE, BETWEEN, IN, LIKE, IS NULL,
 // scalar functions, casts, booleans, decimals, text.
 func TestCheckExpressionSurface(t *testing.T) {
+	t.Parallel()
 	db := dbWith(
 		t,
 		"CREATE TABLE e (n int, flag boolean, note text, price numeric(8,2), "+
@@ -270,6 +275,7 @@ func TestCheckExpressionSurface(t *testing.T) {
 // per candidate row (constraints.md §4.4) — the documented exception to "VALUES inserts
 // cost zero".
 func TestCheckEvaluationIsMetered(t *testing.T) {
+	t.Parallel()
 	db := dbWith(t, "CREATE TABLE c (a int CHECK (a > 0))")
 	// One interior node (>) × one row.
 	out, err := queryOutcome(db, "INSERT INTO c VALUES (1)", nil)
@@ -302,6 +308,7 @@ func TestCheckEvaluationIsMetered(t *testing.T) {
 // reloaded table enforces its checks identically, and a corrupted stored expression is
 // XX001 at open.
 func TestCheckRoundTripsThroughOnDiskImage(t *testing.T) {
+	t.Parallel()
 	db := dbWith(
 		t,
 		"CREATE TABLE t (a int PRIMARY KEY, b int CHECK (b > 0), price numeric(8,2), "+

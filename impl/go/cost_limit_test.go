@@ -48,6 +48,7 @@ func assertAborts(t *testing.T, db dbHandle, sql string) {
 }
 
 func TestCostLimitUnlimitedByDefault(t *testing.T) {
+	t.Parallel()
 	db := rowTable(t, 100)
 	if db.MaxCost() != 0 {
 		t.Fatalf("default max_cost = %d, want 0 (unlimited)", db.MaxCost())
@@ -56,6 +57,7 @@ func TestCostLimitUnlimitedByDefault(t *testing.T) {
 }
 
 func TestCostLimitAboveSucceedsBelowAborts(t *testing.T) {
+	t.Parallel()
 	db := rowTable(t, 50)
 	full := mustCost(t, db, "SELECT v FROM t")
 	if full <= 10 {
@@ -77,6 +79,7 @@ func TestCostLimitAboveSucceedsBelowAborts(t *testing.T) {
 }
 
 func TestCostLimitExactBoundaryAborts(t *testing.T) {
+	t.Parallel()
 	db := rowTable(t, 20)
 	full := mustCost(t, db, "SELECT v FROM t")
 	// The ceiling is the first DISALLOWED value: accrued reaching it aborts (CLAUDE.md §13).
@@ -89,6 +92,7 @@ func TestCostLimitExactBoundaryAborts(t *testing.T) {
 }
 
 func TestCostLimitPointLookupSurvivesScanCeiling(t *testing.T) {
+	t.Parallel()
 	db := rowTable(t, 200)
 	full := mustCost(t, db, "SELECT v FROM t")
 	lookup := mustCost(t, db, "SELECT v FROM t WHERE id = 100")
@@ -105,6 +109,7 @@ func TestCostLimitPointLookupSurvivesScanCeiling(t *testing.T) {
 }
 
 func TestCostLimitThreadsThroughDeleteAndUpdate(t *testing.T) {
+	t.Parallel()
 	db := rowTable(t, 50)
 	scanCost := mustCost(t, db, "SELECT v FROM t")
 	db.SetMaxCost(scanCost / 2)
@@ -124,6 +129,7 @@ func TestCostLimitThreadsThroughDeleteAndUpdate(t *testing.T) {
 }
 
 func TestCostLimitPathologicalExpressionAbortsOnOneRow(t *testing.T) {
+	t.Parallel()
 	db := rowTable(t, 1)
 	// 1 + 1 + ... (many Adds) over the one row: the per-node eval guard stops it (cost.md §6).
 	parts := make([]string, 80)
@@ -137,6 +143,7 @@ func TestCostLimitPathologicalExpressionAbortsOnOneRow(t *testing.T) {
 }
 
 func TestCostLimitEmptyBoundUnderTinyCeiling(t *testing.T) {
+	t.Parallel()
 	// A provably-empty primary-key bound reads no page and no row, so it accrues 0 and survives even
 	// a ceiling of 1 (a point-lookup MISS differs — it still visits a leaf, charging one page_read).
 	db := rowTable(t, 10)

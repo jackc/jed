@@ -43,6 +43,7 @@ func compressedTables(t *testing.T) *Session {
 }
 
 func TestCompressedCostScanChargesDecompressSlabs(t *testing.T) {
+	t.Parallel()
 	db := compressedTables(t)
 	comp := mustCost(t, db, "SELECT * FROM comp")
 	control := mustCost(t, db, "SELECT * FROM control")
@@ -54,6 +55,7 @@ func TestCompressedCostScanChargesDecompressSlabs(t *testing.T) {
 }
 
 func TestCompressedCostExternalCompressedChargesChainPlusSlabs(t *testing.T) {
+	t.Parallel()
 	// A 400-char half-filler/half-run text compresses to ~212 B — smaller than plain but still
 	// over RECORD_MAX → 0x04 external-compressed: ceil(212/240) = 1 chain page_read PLUS
 	// ceil(400/240) = 2 value_decompress slabs.
@@ -71,6 +73,7 @@ func TestCompressedCostExternalCompressedChargesChainPlusSlabs(t *testing.T) {
 }
 
 func TestCompressedCostBoundedScanAndLimit(t *testing.T) {
+	t.Parallel()
 	db := compressedTables(t)
 	// The point lookup that admits the compressed record pays its slabs ...
 	if d := mustCost(t, db, "SELECT * FROM comp WHERE id = 1") - mustCost(t, db, "SELECT * FROM control WHERE id = 1"); d != slabs600 {
@@ -87,6 +90,7 @@ func TestCompressedCostBoundedScanAndLimit(t *testing.T) {
 }
 
 func TestCompressedCostInsertMetersAttemptsAdoptedOrRejected(t *testing.T) {
+	t.Parallel()
 	db := newInMemoryWithPageSize(compressedPageSize).Session(SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, body text)")
 	// A fully-inline row attempts nothing: INSERT stays zero-cost.
@@ -105,6 +109,7 @@ func TestCompressedCostInsertMetersAttemptsAdoptedOrRejected(t *testing.T) {
 }
 
 func TestCompressedCostUpdateMetersAttemptsPerRewrittenRow(t *testing.T) {
+	t.Parallel()
 	db := compressedTables(t)
 	// Same bounded scan and evals both times; the only delta is the new value's compress
 	// attempt: 3 slabs vs 0 (see the Rust mirror for the full reasoning).
@@ -117,6 +122,7 @@ func TestCompressedCostUpdateMetersAttemptsPerRewrittenRow(t *testing.T) {
 }
 
 func TestCompressedCostDecimalPayloadsCompressToo(t *testing.T) {
+	t.Parallel()
 	// A long-coefficient decimal's body is a spillable payload like text/bytea
 	// (large-values.md §12/§13): 801 digits → 201 base-10⁴ groups → a 407-byte payload,
 	// ceil(407/240) = 2 slabs both ways.
@@ -136,6 +142,7 @@ func TestCompressedCostDecimalPayloadsCompressToo(t *testing.T) {
 }
 
 func TestCompressedCostUntouchedColumnsChargeNoSlabs(t *testing.T) {
+	t.Parallel()
 	// The touched set (cost.md §3 "The touched set"): a query that never references the
 	// compressed column pays no decompress slabs; an aggregate's ARGUMENT is a touch.
 	db := compressedTables(t)
@@ -153,6 +160,7 @@ func TestCompressedCostUntouchedColumnsChargeNoSlabs(t *testing.T) {
 }
 
 func TestCompressedCostCorrelatedOuterReferenceIsATouch(t *testing.T) {
+	t.Parallel()
 	// A nested subquery's outer reference back into the scanned relation counts as a touch
 	// (collected depth-aware — cost.md §3). `probe` holds the one value that matches both
 	// tables' row 2, so the two queries emit identical row counts and differ only in the

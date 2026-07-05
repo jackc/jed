@@ -12,6 +12,7 @@ func seededSeam(seed uint64, clock int64) seam {
 }
 
 func TestSplitmix64PinnedVectors(t *testing.T) {
+	t.Parallel()
 	// The provided seeded source must fill bytes from the spec'd byte-exact stream (entropy.md §2).
 	// seed 1 → 910a2dec89025cc1, beeb8da1658eec67, f893a2eefb32555e (big-endian).
 	src := SeededRandomSource(1)
@@ -28,6 +29,7 @@ func TestSplitmix64PinnedVectors(t *testing.T) {
 }
 
 func TestUUIDv4DeterministicAndWellFormed(t *testing.T) {
+	t.Parallel()
 	seam := seededSeam(1, 0)
 	r := newStmtRng()
 	b, err := r.uuidV4(&seam)
@@ -44,6 +46,7 @@ func TestUUIDv4DeterministicAndWellFormed(t *testing.T) {
 }
 
 func TestUUIDv7EmbedsClockAndIsMonotonic(t *testing.T) {
+	t.Parallel()
 	clock := int64(1_721_056_591_872_000)
 	seam := seededSeam(42, clock)
 	r := newStmtRng()
@@ -67,6 +70,7 @@ func TestUUIDv7EmbedsClockAndIsMonotonic(t *testing.T) {
 }
 
 func TestUnseededPathUsesOSEntropyAndWallClock(t *testing.T) {
+	t.Parallel()
 	// The PRODUCTION path: a default seam (no injected source) → crypto/rand per draw + the wall
 	// clock. Assert only STRUCTURAL invariants so the outcome is deterministic.
 	var seam seam
@@ -88,6 +92,7 @@ func TestUnseededPathUsesOSEntropyAndWallClock(t *testing.T) {
 }
 
 func TestUUIDv7RejectsOutOfRange(t *testing.T) {
+	t.Parallel()
 	seam := seededSeam(1, 0)
 	r := newStmtRng()
 	if _, err := r.uuidV7(&seam, -1000000); err == nil {
@@ -96,6 +101,7 @@ func TestUUIDv7RejectsOutOfRange(t *testing.T) {
 }
 
 func TestAdvancingClockStepsPerReadAndNowCaches(t *testing.T) {
+	t.Parallel()
 	// The advancing clock yields start, start+step, … one increment per read (entropy.md §6).
 	clk := AdvancingClock(1000, 1)
 	for i, want := range []int64{1000, 1001, 1002} {

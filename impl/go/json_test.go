@@ -32,6 +32,7 @@ func errJSON(t *testing.T, db dbHandle, sql string) string {
 // text/decimal/bytea/array carried). PG ALLOWS a jsonb PK (it has a jsonb btree opclass), so this
 // is a documented divergence.
 func TestJsonbPrimaryKeyIsUnsupported(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	if got := errJSON(t, db, "CREATE TABLE t (k jsonb PRIMARY KEY)"); got != "0A000" {
 		t.Errorf("jsonb PRIMARY KEY: got %s, want 0A000", got)
@@ -42,6 +43,7 @@ func TestJsonbPrimaryKeyIsUnsupported(t *testing.T) {
 // even comparable; PG ships no json opclass at all, so PG rejects it too, but with its own
 // undefined-function shape).
 func TestJsonPrimaryKeyIsUnsupported(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	if got := errJSON(t, db, "CREATE TABLE t (k json PRIMARY KEY)"); got != "0A000" {
 		t.Errorf("json PRIMARY KEY: got %s, want 0A000", got)
@@ -51,6 +53,7 @@ func TestJsonPrimaryKeyIsUnsupported(t *testing.T) {
 // TestJsonbIndexAndUniqueAreUnsupported: a jsonb secondary index / UNIQUE is likewise 0A000 (no key
 // encoding exercised yet).
 func TestJsonbIndexAndUniqueAreUnsupported(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, j jsonb)")
 	if got := errJSON(t, db, "CREATE INDEX i ON t (j)"); got != "0A000" {
@@ -67,6 +70,7 @@ func TestJsonbIndexAndUniqueAreUnsupported(t *testing.T) {
 // reports 42883 (operator does not exist: jsonb = integer). The agreeing json-non-comparable
 // behavior (always 42883) and jsonb × jsonb ordering live in suites/json/json_compare.test.
 func TestJsonbCrossFamilyComparisonIs42804(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, b jsonb)")
 	// jsonb vs an integer / a real text value (not an adaptable string literal): 42804.
@@ -84,6 +88,7 @@ func TestJsonbCrossFamilyComparisonIs42804(t *testing.T) {
 // JSON cast matrix (json↔jsonb, json/jsonb→text, text→json/jsonb) is oracle-clean in
 // suites/json/json_casts.test.
 func TestInvalidJSONCastSourceIs42804(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	if got := errJSON(t, db, "SELECT 5::jsonb"); got != "42804" {
 		t.Errorf("5::jsonb: got %s, want 42804", got)
@@ -102,6 +107,7 @@ func TestInvalidJSONCastSourceIs42804(t *testing.T) {
 // PostgreSQL supports them, so this is a documented divergence (the jsonb operators are oracle-clean
 // in suites/json/json_access.test). Mirrors impl/rust/tests/json.rs.
 func TestJSONAccessorOperatorsAreDeferred(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, j json)")
 	run(t, db, `INSERT INTO t VALUES (1, '{"a":1}')`)
@@ -121,6 +127,7 @@ func TestJSONAccessorOperatorsAreDeferred(t *testing.T) {
 // — exercising the jsonb body's spill/value_payload/value_from_payload (the tree decoded from a
 // fresh cursor off the gathered chain). The rendered canonical form is preserved exactly.
 func TestLargeJsonbSpillsAndRoundTrips(t *testing.T) {
+	t.Parallel()
 	db := newInMemoryWithPageSize(4096).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, j jsonb)")
 	// A ~6000-byte string node — far above RECORD_MAX (~2034 at page 4096) — forces a spill.
@@ -154,6 +161,7 @@ func TestLargeJsonbSpillsAndRoundTrips(t *testing.T) {
 // TestLargeJsonSpillsVerbatim: a large verbatim json document spills and round-trips, preserving the
 // input bytes EXACTLY (insignificant whitespace included — the json verbatim contract, §4).
 func TestLargeJsonSpillsVerbatim(t *testing.T) {
+	t.Parallel()
 	db := newInMemoryWithPageSize(4096).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, j json)")
 	// Verbatim text with irregular internal spacing, padded past RECORD_MAX.
@@ -179,6 +187,7 @@ func TestLargeJsonSpillsVerbatim(t *testing.T) {
 // (object/array/number/string/bool/null) through a serialize + reload, confirming the tagged-node
 // value codec decodes back to the canonical render.
 func TestJsonbAllNodeKindsRoundTrip(t *testing.T) {
+	t.Parallel()
 	db := newInMemoryWithPageSize(4096).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, j jsonb)")
 	run(t, db, "INSERT INTO t VALUES (1, '{\"a\": 1, \"b\": [true, false, null], \"c\": \"x\"}')")
@@ -201,6 +210,7 @@ func TestJsonbAllNodeKindsRoundTrip(t *testing.T) {
 // against the postgres:18 oracle; the multi-line output can't live in the line-based corpus.
 // Mirrors impl/rust/tests/json.rs jsonb_pretty_matches_pg.
 func TestJsonbPrettyMatchesPG(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	q := func(sql string) string {
 		t.Helper()
@@ -225,6 +235,7 @@ func TestJsonbPrettyMatchesPG(t *testing.T) {
 // element sub-text — json.md §4); the jsonb variants + `json_object_keys` are oracle-clean in
 // suites/json/json_srf.test. Mirrors impl/rust/tests/json.rs.
 func TestJSONArrayElementsSrfIsDeferred(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	if got := errJSON(t, db, "SELECT * FROM json_array_elements('[1,2]'::json)"); got != "0A000" {
 		t.Errorf("json_array_elements: got %s, want 0A000", got)
@@ -238,6 +249,7 @@ func TestJSONArrayElementsSrfIsDeferred(t *testing.T) {
 // deferred 0A000 follow-on (verbatim sub-text — json.md §4); the jsonb variants jsonb_each /
 // jsonb_each_text are oracle-clean in suites/json/json_each.test. Mirrors impl/rust/tests/json.rs.
 func TestJSONEachSrfIsDeferred(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	if got := errJSON(t, db, `SELECT * FROM json_each('{"a":1}'::json)`); got != "0A000" {
 		t.Errorf("json_each: got %s, want 0A000", got)
@@ -252,6 +264,7 @@ func TestJSONEachSrfIsDeferred(t *testing.T) {
 // follow-on; the supported set (scalars/jsonb/json/1-D arrays) is oracle-clean in
 // suites/json/json_to_jsonb.test. Mirrors impl/rust/tests/json.rs.
 func TestToJsonbUnsupportedSourcesAreDeferred(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	if got := errJSON(t, db, "SELECT to_jsonb(1.5::f64)"); got != "0A000" {
 		t.Errorf("to_jsonb(float): got %s, want 0A000", got)
@@ -270,6 +283,7 @@ func TestToJsonbUnsupportedSourcesAreDeferred(t *testing.T) {
 // (json-sql-functions.md §4). The supported element types are oracle-clean in
 // suites/json/json_agg.test. Mirrors impl/rust/tests/json.rs json_agg_deferred_element_source_is_0a000.
 func TestJsonAggDeferredElementSourceIs0A000(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	run(t, db, "CREATE TABLE f (id i32 PRIMARY KEY, x f64)")
 	run(t, db, "INSERT INTO f VALUES (1, 1.5)")
@@ -287,6 +301,7 @@ func TestJsonAggDeferredElementSourceIs0A000(t *testing.T) {
 // oracle-clean in suites/json/json_object_agg.test. Mirrors impl/rust/tests/json.rs
 // json_object_agg_deferred_value_source_is_0a000.
 func TestJsonObjectAggDeferredValueSourceIs0A000(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	run(t, db, "CREATE TABLE f (id i32 PRIMARY KEY, k text, x f64)")
 	run(t, db, "INSERT INTO f VALUES (1, 'a', 1.5)")
@@ -304,6 +319,7 @@ func TestJsonObjectAggDeferredValueSourceIs0A000(t *testing.T) {
 // (json-sql-functions.md §2). The supported element types are oracle-clean in
 // suites/json/json_builders.test. Mirrors impl/rust/tests/json.rs.
 func TestJsonBuildersDeferredElementSourceIs0A000(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	if got := errJSON(t, db, "SELECT to_json(1.5::f64)"); got != "0A000" {
 		t.Errorf("to_json(float): got %s, want 0A000", got)
@@ -324,6 +340,7 @@ func TestJsonBuildersDeferredElementSourceIs0A000(t *testing.T) {
 // NULL key (22023) and the supported key coercions (text/int/decimal/bool) live in the PG-clean
 // suites/json/json_builders.test. Mirrors impl/rust/tests/json.rs.
 func TestJsonBuildObjectNonScalarKeyIs0A000(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	if got := errJSON(t, db, "SELECT jsonb_build_object('2020-01-01'::date, 1)"); got != "0A000" {
 		t.Errorf("jsonb_build_object(date key): got %s, want 0A000", got)
@@ -336,6 +353,7 @@ func TestJsonBuildObjectNonScalarKeyIs0A000(t *testing.T) {
 // This is the same verbatim divergence the json SRFs / accessor operators carry (json.md §4); it
 // can't live in the PG-clean corpus. Mirrors impl/rust/tests/json.rs json_agg_canonicalizes_json_elements.
 func TestJsonAggCanonicalizesJsonElements(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	run(t, db, "CREATE TABLE j (id i32 PRIMARY KEY, doc json)")
 	run(t, db, "INSERT INTO j VALUES (1, '{ \"a\" : 1 }')")
@@ -351,6 +369,7 @@ func TestJsonAggCanonicalizesJsonElements(t *testing.T) {
 // operator's text[] handling. The agreeing behavior (set/insert/no-op/22023/22P02) is oracle-clean in
 // suites/json/json_set.test. Mirrors impl/rust/tests/json.rs jsonb_set_null_path_element_propagates_null.
 func TestJsonbSetNullPathElementPropagatesNull(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	if got := queryRendered(t, db, "SELECT jsonb_set('{\"a\":1}', ARRAY['a', NULL], '99')")[0][0]; got != "NULL" {
 		t.Errorf("jsonb_set(NULL path element) = %q, want NULL", got)
@@ -365,6 +384,7 @@ func TestJsonbSetNullPathElementPropagatesNull(t *testing.T) {
 // The 1-D case is oracle-clean in suites/json/json_builders.test. Mirrors impl/rust/tests/json.rs
 // array_to_json_multidim_is_0a000.
 func TestArrayToJsonMultidimIs0A000(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	if got := errJSON(t, db, "SELECT array_to_json(ARRAY[ARRAY[1,2],ARRAY[3,4]])"); got != "0A000" {
 		t.Errorf("array_to_json(multidim): got %s, want 0A000", got)
@@ -376,6 +396,7 @@ func TestArrayToJsonMultidimIs0A000(t *testing.T) {
 // only json input serializes). The json-input behavior is oracle-clean in suites/json/json_ctor.test.
 // Mirrors impl/rust/tests/json.rs json_serialize_jsonb_diverges_from_pg.
 func TestJsonSerializeJsonbDivergesFromPG(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	if got, want := queryRendered(t, db, `SELECT JSON_SERIALIZE('{"b":2,"a":1}'::jsonb)`)[0][0],
 		`{"a": 1, "b": 2}`; got != want { // jed: the jsonb canonical text; PG 18: NULL
@@ -389,6 +410,7 @@ func TestJsonSerializeJsonbDivergesFromPG(t *testing.T) {
 // oracle-clean in suites/json/json_ctor.test). Mirrors impl/rust/tests/json.rs
 // json_scalar_deferred_types_are_0a000.
 func TestJsonScalarDeferredTypesAre0A000(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	if got := errJSON(t, db, "SELECT JSON_SCALAR('2020-01-01'::date)"); got != "0A000" {
 		t.Errorf("JSON_SCALAR(date): got %s, want 0A000", got)
@@ -404,6 +426,7 @@ func TestJsonScalarDeferredTypesAre0A000(t *testing.T) {
 // in suites/json/json_record.test. Mirrors impl/rust/tests/json.rs
 // json_record_composite_array_column_is_0a000.
 func TestJsonRecordCompositeArrayColumnIs0A000(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	run(t, db, "CREATE TYPE addr AS (street text, zip i32)")
 	if got := errJSON(t, db, `SELECT * FROM jsonb_to_record('{"a":1}') AS t(a addr)`); got != "0A000" {
@@ -421,6 +444,7 @@ func TestJsonRecordCompositeArrayColumnIs0A000(t *testing.T) {
 // scalar-field cases are oracle-clean in suites/json/json_populate.test. Mirrors
 // impl/rust/tests/json.rs json_populate_non_composite_and_complex_field_divergences.
 func TestJsonPopulateNonCompositeAndComplexFieldDivergences(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	run(t, db, "CREATE TYPE addr AS (street text, zip i32)")
 	run(t, db, "CREATE TYPE poly AS (name text, pts i32[])")
@@ -437,6 +461,7 @@ func TestJsonPopulateNonCompositeAndComplexFieldDivergences(t *testing.T) {
 // is parsed). PostgreSQL accepts a rename list on an SRF, so this is a documented divergence. Mirrors
 // impl/rust/tests/json.rs srf_rename_only_column_list_is_deferred.
 func TestSrfRenameOnlyColumnListIsDeferred(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	if got := errJSON(t, db, `SELECT * FROM jsonb_to_recordset('[{"a":1}]') AS t(a, b)`); got != "0A000" {
 		t.Errorf("rename-only column list: got %s, want 0A000", got)
@@ -449,6 +474,7 @@ func TestSrfRenameOnlyColumnListIsDeferred(t *testing.T) {
 // PG-clean, so a jed-defers case cannot live there). Mirrors impl/rust/tests/json.rs
 // json_query_fn_deferred_clauses_are_0a000.
 func TestJSONQueryFnDeferredClausesAre0A000(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	for _, sql := range []string{
 		`SELECT JSON_VALUE('{"a":1}', '$.a' PASSING 1 AS x)`,
@@ -468,6 +494,7 @@ func TestJSONQueryFnDeferredClausesAre0A000(t *testing.T) {
 // supported subset is oracle-clean in suites/json/json_table.test. Mirrors impl/rust/tests/json.rs
 // json_table_deferred_features_are_0a000.
 func TestJSONTableDeferredFeaturesAre0A000(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	for _, sql := range []string{
 		`SELECT * FROM JSON_TABLE('{}', '$' COLUMNS (x i32 PATH '$.x') PLAN DEFAULT (x))`,

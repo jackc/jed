@@ -49,6 +49,7 @@ func mustIds(t *testing.T, db dbHandle, sql string) []int64 {
 }
 
 func TestCorrelatedExistsSeekIsSublinear(t *testing.T) {
+	t.Parallel()
 	const n = 1000
 	db := correlatedTables(t, n)
 
@@ -77,6 +78,7 @@ func TestCorrelatedExistsSeekIsSublinear(t *testing.T) {
 }
 
 func TestCorrelatedScalarSeekMatchesUnboundedRows(t *testing.T) {
+	t.Parallel()
 	const n = 1000
 	db := correlatedTables(t, n)
 
@@ -96,6 +98,7 @@ func TestCorrelatedScalarSeekMatchesUnboundedRows(t *testing.T) {
 }
 
 func TestCorrelatedMissAndNullOuterSeekNothing(t *testing.T) {
+	t.Parallel()
 	const n = 1000
 	db := correlatedTables(t, n)
 

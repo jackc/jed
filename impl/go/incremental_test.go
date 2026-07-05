@@ -34,6 +34,7 @@ func selectIDs(t *testing.T, db *engine) []int64 {
 }
 
 func TestSingleRowCommitAppendsOnlyTheDirtyPath(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "incremental_small_growth.jed")
 	const ps = int64(256)
 	db, err := create(path, databaseOptions{PageSize: 256, noSync: true})
@@ -99,6 +100,7 @@ func TestSingleRowCommitAppendsOnlyTheDirtyPath(t *testing.T) {
 }
 
 func TestDeleteHeavyHistoryReopensCorrectly(t *testing.T) {
+	t.Parallel()
 	// Deletes commit through the same incremental path but rebalance the tree (merge-then-split),
 	// dirtying a different node set than inserts. Across many autocommitted inserts and deletes — each
 	// leaking pages — the live snapshot must still reopen exactly (spec/fileformat/format.md).
@@ -138,6 +140,7 @@ func TestDeleteHeavyHistoryReopensCorrectly(t *testing.T) {
 }
 
 func TestMetaSlotsAlternateAcrossCommits(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "incremental_alternation.jed")
 	opts := defaultDatabaseOptions()
 	opts.noSync = true
@@ -177,6 +180,7 @@ func TestMetaSlotsAlternateAcrossCommits(t *testing.T) {
 }
 
 func TestTornLatestCommitFallsBackToPriorSnapshot(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "incremental_torn_meta.jed")
 	opts := defaultDatabaseOptions()
 	opts.noSync = true
@@ -224,6 +228,7 @@ func TestTornLatestCommitFallsBackToPriorSnapshot(t *testing.T) {
 // commit that fits within it does not grow the file at all (the steady-state metadata-free path). The
 // logical pageCount is the real high-water — independent of the physical size.
 func TestCommitPreallocatesFileGrowthGeometrically(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "prealloc_chunks.jed")
 
 	// A from-scratch image is just the empty catalog (Create writes exactly pageCount pages, no
@@ -299,6 +304,7 @@ func TestCommitPreallocatesFileGrowthGeometrically(t *testing.T) {
 // with geometric growth the file stays proportional — bounded by ≈2× the committed image plus the
 // 16 KiB floor. Mirrors the Rust/TS small-database tests.
 func TestSmallDatabaseFileStaysProportional(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "small.jed")
 	db, err := create(path, databaseOptions{PageSize: 256, noSync: true})
 	if err != nil {

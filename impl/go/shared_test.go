@@ -50,6 +50,7 @@ func seeded(t *testing.T, ids ...int64) *Database {
 }
 
 func TestSharedWriteThenReadSeesCommittedRows(t *testing.T) {
+	t.Parallel()
 	db := seeded(t, 1, 2, 3)
 	if db.Version() != 1 {
 		t.Fatalf("version = %d, want 1", db.Version())
@@ -62,6 +63,7 @@ func TestSharedWriteThenReadSeesCommittedRows(t *testing.T) {
 }
 
 func TestSharedReadHandleRejectsWrites(t *testing.T) {
+	t.Parallel()
 	db := seeded(t, 1)
 	r := db.ReadSession()
 	defer r.Close()
@@ -78,6 +80,7 @@ func TestSharedReadHandleRejectsWrites(t *testing.T) {
 }
 
 func TestSharedReaderDoesNotBlockOnOpenWriter(t *testing.T) {
+	t.Parallel()
 	// A reader running while a writer holds an open, uncommitted transaction must not block and
 	// must see the pre-commit (committed) state — the core "readers parallel with a writer" claim.
 	db := seeded(t, 1)
@@ -104,6 +107,7 @@ func TestSharedReaderDoesNotBlockOnOpenWriter(t *testing.T) {
 }
 
 func TestSharedPinnedReaderIsolatedFromConcurrentWriter(t *testing.T) {
+	t.Parallel()
 	db := seeded(t, 1)
 	pinned := db.ReadSession() // pins version 1 (one row)
 	defer pinned.Close()
@@ -136,6 +140,7 @@ func TestSharedPinnedReaderIsolatedFromConcurrentWriter(t *testing.T) {
 }
 
 func TestSharedManyReadersParallelWithWriter(t *testing.T) {
+	t.Parallel()
 	// Fan out reader goroutines while a writer goroutine commits repeatedly. Each reader pins a
 	// consistent snapshot (a count that never changes mid-read) and never blocks. Run under -race;
 	// the assertion is that every reader observes an internally-consistent snapshot.
@@ -190,6 +195,7 @@ func TestSharedManyReadersParallelWithWriter(t *testing.T) {
 }
 
 func TestSharedOldestLiveTxidTracksPinnedReaders(t *testing.T) {
+	t.Parallel()
 	db := seeded(t, 1) // version 1
 	if db.Version() != 1 {
 		t.Fatalf("version = %d, want 1", db.Version())
@@ -234,6 +240,7 @@ func TestSharedOldestLiveTxidTracksPinnedReaders(t *testing.T) {
 }
 
 func TestSharedRolledBackWriterPublishesNothing(t *testing.T) {
+	t.Parallel()
 	db := seeded(t, 1)
 	w := db.WriteSession()
 	if _, err := queryOutcome(w, "INSERT INTO t VALUES (2)", nil); err != nil {

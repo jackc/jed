@@ -37,6 +37,7 @@ func eqInts(a []int64, b ...int64) bool {
 }
 
 func TestNegativeKeysSortBeforePositive(t *testing.T) {
+	t.Parallel()
 	// Exercises the sign-flip in the order-preserving key encoding.
 	db := dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	for _, s := range []string{"INSERT INTO t VALUES (1)", "INSERT INTO t VALUES (-1)", "INSERT INTO t VALUES (0)"} {
@@ -48,6 +49,7 @@ func TestNegativeKeysSortBeforePositive(t *testing.T) {
 }
 
 func TestBoundaryValuesRoundTrip(t *testing.T) {
+	t.Parallel()
 	db := dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY, s i16, b i64)")
 	mustCreate(t, db, "INSERT INTO t VALUES (1, 32767, 9223372036854775807)")
 	mustCreate(t, db, "INSERT INTO t VALUES (2, -32768, -9223372036854775808)")
@@ -61,6 +63,7 @@ func TestBoundaryValuesRoundTrip(t *testing.T) {
 }
 
 func TestInsertIntoMissingTableTraps(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	wantErr(t, db, "INSERT INTO nope VALUES (1)", "42P01")
 }
@@ -68,6 +71,7 @@ func TestInsertIntoMissingTableTraps(t *testing.T) {
 // --- multi-row INSERT (spec/design/grammar.md §12) --------------------------------
 
 func TestNoPKMultiRowInsertKeepsInsertionOrder(t *testing.T) {
+	t.Parallel()
 	db := dbWith(t, "CREATE TABLE log (a i32)")
 	// No PK ⇒ monotonic synthetic rowids, allocated left-to-right; key order = insertion order.
 	mustCreate(t, db, "INSERT INTO log VALUES (30), (10), (20)")
@@ -77,6 +81,7 @@ func TestNoPKMultiRowInsertKeepsInsertionOrder(t *testing.T) {
 }
 
 func TestNoPKMultiRowInsertIsAllOrNothing(t *testing.T) {
+	t.Parallel()
 	db := dbWith(t, "CREATE TABLE log (a i16)")
 	mustCreate(t, db, "INSERT INTO log VALUES (1)")
 	// The batch fails validation (second row overflows), so its first row (2) is not stored.
@@ -92,6 +97,7 @@ func TestNoPKMultiRowInsertIsAllOrNothing(t *testing.T) {
 // the param-in-source case (the corpus is literal-only) and assert the cost number directly.
 
 func TestInsertSelectParamInSourceWhere(t *testing.T) {
+	t.Parallel()
 	db := dbWith(
 		t,
 		"CREATE TABLE src (id i32 PRIMARY KEY, a i16)",
@@ -108,6 +114,7 @@ func TestInsertSelectParamInSourceWhere(t *testing.T) {
 }
 
 func TestInsertSelectCostIsEmbeddedSelectCost(t *testing.T) {
+	t.Parallel()
 	db := dbWith(
 		t,
 		"CREATE TABLE src (id i32 PRIMARY KEY, a i16, b i64)",

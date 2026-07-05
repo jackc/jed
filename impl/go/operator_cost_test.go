@@ -11,6 +11,7 @@ import "testing"
 // operatorCost must reflect the generated Operators table for EVERY operator — proving the lookup
 // is data-driven, so authoring a Cost in catalog.toml is honored with no evaluator change.
 func TestOperatorCostReflectsCatalog(t *testing.T) {
+	t.Parallel()
 	for _, o := range operators {
 		want := costs.OperatorEval
 		if o.Cost != 0 {
@@ -30,6 +31,7 @@ func TestOperatorCostReflectsCatalog(t *testing.T) {
 // catalog operator, so a typo in catalogName / a wired literal is caught here, not silently masked
 // by the uniform-weight fallback.
 func TestWiredOperatorNamesExistInCatalog(t *testing.T) {
+	t.Parallel()
 	var names []string
 	for _, op := range []binaryOp{opAdd, opSub, opMul, opDiv, opMod, opEq, opNe, opLt, opGt, opLe, opGe} {
 		names = append(names, op.catalogName())

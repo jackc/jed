@@ -26,6 +26,7 @@ func cancelCode(t *testing.T, err error) string {
 // The meter's Guard aborts with 57014 the instant the cancel poll returns true, independently of
 // the cost ceilings (a zero-limit meter never aborts on cost).
 func TestMeterGuardCancel(t *testing.T) {
+	t.Parallel()
 	m := newMeter()
 	if err := m.Guard(); err != nil {
 		t.Fatalf("no cancel set: Guard should pass, got %v", err)
@@ -45,6 +46,7 @@ func TestMeterGuardCancel(t *testing.T) {
 // A context already canceled at the API entry aborts with 57014 before any work (the cheap
 // boundary poll).
 func TestCancelBeforeRun(t *testing.T) {
+	t.Parallel()
 	db := memDB()
 	if _, err := db.Exec(context.Background(), "CREATE TABLE t (id i32 PRIMARY KEY)"); err != nil {
 		t.Fatal(err)
@@ -64,6 +66,7 @@ func TestCancelBeforeRun(t *testing.T) {
 // the cursor boundary. Proven white-box: session.cancel is set directly (bypassing ctx), so only
 // the in-statement Guard can produce the 57014.
 func TestCancelDuringExecution(t *testing.T) {
+	t.Parallel()
 	db := memDB()
 	if _, err := db.Exec(context.Background(), "CREATE TABLE t (id i32 PRIMARY KEY)"); err != nil {
 		t.Fatal(err)

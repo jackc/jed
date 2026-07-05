@@ -41,6 +41,7 @@ func mustText(t *testing.T, v Value, want string) {
 }
 
 func TestVarHostSetAndReadRoundTrip(t *testing.T) {
+	t.Parallel()
 	// SetVar stores; Var reads it back through the host API; current_setting reads it in SQL.
 	db := memDB().Session(SessionOptions{})
 	if _, ok := db.Var("myapp.tenant"); ok {
@@ -56,6 +57,7 @@ func TestVarHostSetAndReadRoundTrip(t *testing.T) {
 }
 
 func TestVarSetAndResetRejectANonDottedName(t *testing.T) {
+	t.Parallel()
 	// A variable must be namespaced (dotted) — a non-dotted name is a built-in setting name, and v1
 	// exposes none through this map (the time_zone built-in is its own slice), so it is 42704.
 	db := memDB().Session(SessionOptions{})
@@ -72,6 +74,7 @@ func TestVarSetAndResetRejectANonDottedName(t *testing.T) {
 }
 
 func TestVarResetRemovesAndIsIdempotent(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	if err := db.SetVar("myapp.k", "v"); err != nil {
 		t.Fatal(err)
@@ -92,6 +95,7 @@ func TestVarResetRemovesAndIsIdempotent(t *testing.T) {
 }
 
 func TestVarNamesAreCaseInsensitiveButValuesAreVerbatim(t *testing.T) {
+	t.Parallel()
 	// The NAME folds to lowercase (PG GUC names are case-insensitive); the VALUE is preserved exactly.
 	db := memDB().Session(SessionOptions{})
 	if err := db.SetVar("myApp.Tenant", "AcmeCorp"); err != nil {
@@ -106,6 +110,7 @@ func TestVarNamesAreCaseInsensitiveButValuesAreVerbatim(t *testing.T) {
 }
 
 func TestVarMissingOkTurnsTheUnsetErrorIntoNull(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	if got := varErrCode(t, db, "SELECT current_setting('myapp.unset')"); got != "42704" {
 		t.Fatalf("one-arg unset: want 42704, got %s", got)
@@ -120,6 +125,7 @@ func TestVarMissingOkTurnsTheUnsetErrorIntoNull(t *testing.T) {
 }
 
 func TestVarNullNamePropagatesToNull(t *testing.T) {
+	t.Parallel()
 	// null = "propagates": a NULL name short-circuits to NULL before the lookup. A text column holding
 	// a NULL is the typed-NULL the corpus cannot write (jed defers text casts, so no NULL::text yet).
 	db := memDB().Session(SessionOptions{})
@@ -134,6 +140,7 @@ func TestVarNullNamePropagatesToNull(t *testing.T) {
 }
 
 func TestVarsAreSessionStateNotSnapshotState(t *testing.T) {
+	t.Parallel()
 	// Variables are SESSION state, not snapshot state (§6.1): a ROLLBACK undoes DATA but never a
 	// session variable (PG SET SESSION). Set one outside, one inside a block, roll back — both survive.
 	db := memDB().Session(SessionOptions{})
@@ -155,6 +162,7 @@ func TestVarsAreSessionStateNotSnapshotState(t *testing.T) {
 }
 
 func TestVarAdditionalSessionHasIndependentVariables(t *testing.T) {
+	t.Parallel()
 	// db.Session(opts) mints an independent session over a shared core (§2.1/§2.4): its variable map
 	// is its own — a variable set on it is invisible to another session and vice versa.
 	db := memDB()
@@ -187,6 +195,7 @@ func TestVarAdditionalSessionHasIndependentVariables(t *testing.T) {
 }
 
 func TestVarResetVarsClearsEveryVariable(t *testing.T) {
+	t.Parallel()
 	// ResetVars is PG RESET ALL for the variable map.
 	db := memDB().Session(SessionOptions{})
 	if err := db.SetVar("myapp.a", "1"); err != nil {

@@ -81,6 +81,7 @@ func tsRender(typ string, m int64) string {
 }
 
 func TestTimestampVectors(t *testing.T) {
+	t.Parallel()
 	cases := readTimestampCases(t, specPath(t, "encoding/timestamps.toml"))
 	if len(cases) == 0 {
 		t.Fatal("no timestamp vectors parsed")

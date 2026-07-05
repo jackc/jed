@@ -25,6 +25,7 @@ func sessCode(t *testing.T, err error) string {
 }
 
 func TestDefaultSessionIsStatefulAcrossCalls(t *testing.T) {
+	t.Parallel()
 	// The Engine-owned default session holds an open BEGIN block across *separate* calls (the
 	// PG/SQLite connection model, §2.1); db.Status() exposes the explicit state machine.
 	db := memDB().Session(SessionOptions{})
@@ -47,6 +48,7 @@ func TestDefaultSessionIsStatefulAcrossCalls(t *testing.T) {
 }
 
 func TestFailedBlockIsTheFailedState(t *testing.T) {
+	t.Parallel()
 	// A statement error inside a block poisons it: status is Failed, every later statement but
 	// ROLLBACK/COMMIT is 25P02 (§2.2 / transactions.md §6), and ROLLBACK returns to Idle.
 	db := memDB().Session(SessionOptions{})
@@ -69,6 +71,7 @@ func TestFailedBlockIsTheFailedState(t *testing.T) {
 }
 
 func TestAdditionalSessionSharesStorageWithIndependentSettings(t *testing.T) {
+	t.Parallel()
 	// Two sessions over one shared Database core: each owns its private Engine, but committed storage
 	// is shared through the core (§2.4) — no swap. Settings (the cost ceiling) are independent.
 	db := memDB()
@@ -117,6 +120,7 @@ func TestAdditionalSessionSharesStorageWithIndependentSettings(t *testing.T) {
 }
 
 func TestAdditionalSessionCostCeilingEnforced(t *testing.T) {
+	t.Parallel()
 	// The session's settings drive the execution path: a tiny ceiling aborts the scan with 54P01,
 	// while an unlimited session runs it fine — both over the same shared core.
 	db := memDB()
@@ -146,6 +150,7 @@ func TestAdditionalSessionCostCeilingEnforced(t *testing.T) {
 }
 
 func TestAdditionalSessionUpdateClosureCommitsToSharedStorage(t *testing.T) {
+	t.Parallel()
 	db := memDB()
 	a := db.Session(SessionOptions{})
 	if _, err := queryOutcome(a, "CREATE TABLE t (id i32 PRIMARY KEY)", nil); err != nil {

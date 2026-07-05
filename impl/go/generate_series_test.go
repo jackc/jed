@@ -51,6 +51,7 @@ func eqGenInts(t *testing.T, got, want []int64, ctx string) {
 }
 
 func TestGenerateSeriesZeroStep(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	_, err := queryOutcome(db, "SELECT * FROM generate_series(1, 5, 0)", nil)
 	ee, ok := err.(*EngineError)
@@ -66,6 +67,7 @@ func TestGenerateSeriesZeroStep(t *testing.T) {
 }
 
 func TestGenerateSeriesAliasAndQualified(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	// PG's single-column function-alias rule: `AS g` (or implicit `g`) renames the column to `g`.
 	eqGenInts(t, genInts(t, db, "SELECT * FROM generate_series(1, 3) g"), []int64{1, 2, 3}, "implicit alias")
@@ -81,6 +83,7 @@ func TestGenerateSeriesAliasAndQualified(t *testing.T) {
 }
 
 func TestGenerateSeriesParam(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	out, err := queryOutcome(db, "SELECT * FROM generate_series(1, $1)", []Value{IntValue(3)})
 	if err != nil {
@@ -94,6 +97,7 @@ func TestGenerateSeriesParam(t *testing.T) {
 }
 
 func TestGenerateSeriesCostCeiling(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	if c := costOf(t, db, "SELECT * FROM generate_series(1, 4)"); c != 8 {
 		t.Errorf("cost = %d, want 8", c)
@@ -107,6 +111,7 @@ func TestGenerateSeriesCostCeiling(t *testing.T) {
 }
 
 func TestGenerateSeriesMixedWidthPromotion(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	out, err := queryOutcome(db, "SELECT * FROM generate_series(CAST(1 AS i16), CAST(5 AS i32))", nil)
 	if err != nil {
@@ -118,6 +123,7 @@ func TestGenerateSeriesMixedWidthPromotion(t *testing.T) {
 }
 
 func TestGenerateSeriesI64OverflowStopsCleanly(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	// Stepping past i64::MAX must STOP, not trap: only the last representable element is emitted.
 	eqGenInts(t, genInts(t, db,
@@ -126,6 +132,7 @@ func TestGenerateSeriesI64OverflowStopsCleanly(t *testing.T) {
 }
 
 func TestGenerateSeriesDeferredAndBadCalls(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	cases := []struct {
 		sql, code string

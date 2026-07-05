@@ -20,6 +20,7 @@ func lifeCode(t *testing.T, db dbHandle, sql string) string {
 }
 
 func TestDefaultSessionHasNoBudgetButTracksTheCumulative(t *testing.T) {
+	t.Parallel()
 	// A fresh session is unlimited (budget 0) yet still TRACKS the cumulative cost — the gauge is
 	// always readable (§5.4), it just never aborts.
 	db := memDB().Session(SessionOptions{})
@@ -40,6 +41,7 @@ func TestDefaultSessionHasNoBudgetButTracksTheCumulative(t *testing.T) {
 }
 
 func TestBudgetAbortsInFlightThenRejectsAtAdmission(t *testing.T) {
+	t.Parallel()
 	// Set a budget of 3. The cumulative builds across statements; the one that drives it to the budget
 	// aborts 54P02 mid-flight, and every further statement is then rejected 54P02 at admission.
 	db := memDB().Session(SessionOptions{})
@@ -67,6 +69,7 @@ func TestBudgetAbortsInFlightThenRejectsAtAdmission(t *testing.T) {
 }
 
 func TestPartialCostOfAnAbortedStatementCounts(t *testing.T) {
+	t.Parallel()
 	// A single statement larger than the whole budget aborts mid-flight, and the partial work it did
 	// (up to the budget) still counts — the cumulative lands exactly at the budget (unit charges are 1).
 	db := memDB().Session(SessionOptions{})
@@ -80,6 +83,7 @@ func TestPartialCostOfAnAbortedStatementCounts(t *testing.T) {
 }
 
 func TestTheCumulativeIsSessionStateAndDoesNotRollBack(t *testing.T) {
+	t.Parallel()
 	// The cumulative is SESSION state, not snapshot state (§5.4): a ROLLBACK undoes a statement's DATA
 	// effects but NOT the compute it spent. Run work inside an explicit block, roll it back, and the
 	// cumulative still reflects every statement's cost.
@@ -108,6 +112,7 @@ func TestTheCumulativeIsSessionStateAndDoesNotRollBack(t *testing.T) {
 }
 
 func TestAStatementAbortsAtWhicheverCeilingItReachesFirst(t *testing.T) {
+	t.Parallel()
 	// max_cost (54P01) and lifetime_max_cost (54P02) compose: a statement aborts at whichever it
 	// reaches first. With the per-statement ceiling tight and the budget far, the per-statement ceiling
 	// wins (54P01) — and its partial cost still counts toward the session budget.
@@ -131,6 +136,7 @@ func TestAStatementAbortsAtWhicheverCeilingItReachesFirst(t *testing.T) {
 }
 
 func TestAnExactTieBreaksToThePerStatementCeiling(t *testing.T) {
+	t.Parallel()
 	// When both ceilings are reached at the very same accrued value, the inner per-statement ceiling
 	// wins the tie (54P01) — the documented, deterministic, cross-core tie rule (§5.4, cost.go Guard).
 	db := memDB().Session(SessionOptions{})
@@ -142,6 +148,7 @@ func TestAnExactTieBreaksToThePerStatementCeiling(t *testing.T) {
 }
 
 func TestAnAdditionalSessionCarriesItsOwnBudget(t *testing.T) {
+	t.Parallel()
 	// db.Session(opts) mints an independent session with its own cumulative + budget (§2.1/§2.4/§5.4):
 	// a budgeted additional session aborts at its budget while a permissive one keeps running, and the
 	// two cumulatives are independent (each session owns its envelope).
@@ -177,6 +184,7 @@ func TestAnAdditionalSessionCarriesItsOwnBudget(t *testing.T) {
 }
 
 func TestAdmissionIsCheckedBeforeExistenceAndPrivileges(t *testing.T) {
+	t.Parallel()
 	// The budget admission check runs ahead of privileges AND existence (§5.4): once a session is
 	// exhausted, even a query naming a missing table is 54P02, not 42P01 — nothing runs.
 	db := memDB().Session(SessionOptions{})

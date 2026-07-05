@@ -29,6 +29,7 @@ func i32rangeVal(lo, hi *int64) *RangeVal {
 }
 
 func TestEncodeRangeKeyI32ByteExact(t *testing.T) {
+	t.Parallel()
 	p := func(n int64) *int64 { return &n }
 	enc := func(rv *RangeVal) string { return hex.EncodeToString(encodeRangeKey(scalarInt32, rv)) }
 	if got := enc(emptyRangeVal()); got != "00" {
@@ -51,6 +52,7 @@ func TestEncodeRangeKeyI32ByteExact(t *testing.T) {
 }
 
 func TestEncodeRangeKeyOrderPreserving(t *testing.T) {
+	t.Parallel()
 	p := func(n int64) *int64 { return &n }
 	// a strictly ascending sequence under rangeTotalCmp
 	ranges := []*RangeVal{
@@ -72,6 +74,7 @@ func TestEncodeRangeKeyOrderPreserving(t *testing.T) {
 }
 
 func TestEncodeRangeKeyInclusivityAndScale(t *testing.T) {
+	t.Parallel()
 	dec := func(digits string, scale uint32) *Value {
 		v := DecimalValue(decimalFromDigitsScale(false, digits, scale))
 		return &v

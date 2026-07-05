@@ -26,6 +26,7 @@ func castErr(t *testing.T, db dbHandle, sql string) string {
 // --- (a) array → text is EXPLICIT-only -----------------------------------------------------------
 
 func TestArrayToTextIsExplicitOnly(t *testing.T) {
+	t.Parallel()
 	db := dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY, label text)")
 	// Assignment context: an array value into a text column is a datatype mismatch, NOT a silent
 	// array_out (PG would assignment-cast it).
@@ -48,6 +49,7 @@ func TestArrayToTextIsExplicitOnly(t *testing.T) {
 // --- (b) the jed-only element casts uuid ⇄ bytea (succeed where PG errors) ------------------------
 
 func TestUuidArrayToByteaArrayAndBack(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	round := castScalar(t, db,
 		"((ARRAY['00000000-0000-0000-0000-000000000001']::uuid[])::bytea[])::uuid[] = "+
@@ -64,6 +66,7 @@ func TestUuidArrayToByteaArrayAndBack(t *testing.T) {
 // --- (c) forbidden scalar element pair (42804) + composite-element array cast (0A000) -------------
 
 func TestArrayForbiddenElementPairs(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	// A scalar element pair with no cast → 42804 (PG reports 42846). i32 → timestamp has no cast.
 	if got := castErr(t, db, "SELECT (ARRAY[1,2,3]::i32[])::timestamp[]"); got != "42804" {
@@ -85,6 +88,7 @@ func TestArrayForbiddenElementPairs(t *testing.T) {
 // --- (d) runtime text → f32[] / f64[] element casts (float renderer is determinism-exempt) -------
 
 func TestRuntimeTextToFloatArrays(t *testing.T) {
+	t.Parallel()
 	db := dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY, s text)")
 	if _, err := queryOutcome(db, "INSERT INTO t VALUES (1, '{0.5,0.25,-1.5}')", nil); err != nil {
 		t.Fatal(err)

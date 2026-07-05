@@ -14,6 +14,7 @@ import "testing"
 // TestMultidimAndLowerBoundKeyOrder pins jed's array_cmp PK order for multidim / custom-lower-bound
 // values, which diverges from PG's ORDER BY (so it is not oracle-checked).
 func TestMultidimAndLowerBoundKeyOrder(t *testing.T) {
+	t.Parallel()
 	db := dbWith(t, "CREATE TABLE m (k i32[] PRIMARY KEY)")
 	for _, v := range []string{"{1,2,3,4}", "{{1,2},{3,4}}", "{1,2,3}", "[2:4]={1,2,3}"} {
 		if _, err := queryOutcome(db, "INSERT INTO m VALUES ('"+v+"')", nil); err != nil {
@@ -54,6 +55,7 @@ func firstColRows(t *testing.T, db dbHandle, sql string) []string {
 // the store iterates in array_cmp order over the float total order (-0=+0, NaN largest, shorter-prefix
 // first). The '{…}' literal coerces the specials (NaN/Infinity) without an INSERT ... SELECT.
 func TestFloatElementArrayKeyIsKeyable(t *testing.T) {
+	t.Parallel()
 	db := dbWith(t, "CREATE TABLE m (k f64[] PRIMARY KEY)")
 	for _, v := range []string{"{1.5,2.5}", "{1.5}", "{-Infinity}", "{NaN}", "{1.5,2.0}"} {
 		if _, err := queryOutcome(db, "INSERT INTO m VALUES ('"+v+"')", nil); err != nil {
@@ -73,6 +75,7 @@ func TestFloatElementArrayKeyIsKeyable(t *testing.T) {
 // (jed's array_cmp, NOT PG's ORDER BY — the abbreviated-key artifact §2.14), the float analogue of
 // TestMultidimAndLowerBoundKeyOrder.
 func TestFloatElementArrayMultidimKeyOrder(t *testing.T) {
+	t.Parallel()
 	db := dbWith(t, "CREATE TABLE m (k f64[] PRIMARY KEY)")
 	for _, v := range []string{"{1.5,2.5,3.5,4.5}", "{{1.5,2.5},{3.5,4.5}}", "{1.5,2.5,3.5}", "[2:4]={1.5,2.5,3.5}"} {
 		if _, err := queryOutcome(db, "INSERT INTO m VALUES ('"+v+"')", nil); err != nil {
@@ -91,6 +94,7 @@ func TestFloatElementArrayMultidimKeyOrder(t *testing.T) {
 // TestCompositeElementArrayKeysRejected: a composite-element array key is still 0A000 (composite not
 // yet keyable), while float-element arrays are accepted everywhere a key is taken.
 func TestCompositeElementArrayKeysRejected(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	if _, err := queryOutcome(db, "CREATE TYPE addr AS (street text, zip i32)", nil); err != nil {
 		t.Fatal(err)

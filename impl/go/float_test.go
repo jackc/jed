@@ -13,6 +13,7 @@ import (
 // --- value codec round-trip (both widths, incl -0 / NaN / ±Inf) ---------------------------
 
 func TestFloatValueCodecRoundTrip(t *testing.T) {
+	t.Parallel()
 	cases64 := []float64{
 		0, math.Copysign(0, -1), 1, -1, 1.5, -2.25, 1e308, -1e-308,
 		math.MaxFloat64, math.SmallestNonzeroFloat64,
@@ -63,6 +64,7 @@ func TestFloatValueCodecRoundTrip(t *testing.T) {
 }
 
 func TestFloatImageRoundTrip(t *testing.T) {
+	t.Parallel()
 	// The on-disk single-file image (the §8 cross-core round-trip contract) preserves float bits
 	// verbatim — incl -0 / ±Inf — across a serialize + reload (a NaN canonicalizes to one quiet
 	// pattern but stays a NaN; float.md §10).
@@ -97,6 +99,7 @@ func TestFloatImageRoundTrip(t *testing.T) {
 }
 
 func TestFloatStoredNegZeroPreservesBits(t *testing.T) {
+	t.Parallel()
 	db := dbWith(
 		t,
 		"CREATE TABLE f (id i32 PRIMARY KEY, x f64)",
@@ -115,6 +118,7 @@ func TestFloatStoredNegZeroPreservesBits(t *testing.T) {
 // --- the total order (NaN largest, -0 == +0, NaN = NaN TRUE) -------------------------------
 
 func TestFloatTotalOrderComparator(t *testing.T) {
+	t.Parallel()
 	nan := math.NaN()
 	ninf, pinf := math.Inf(-1), math.Inf(1)
 	negz, posz := math.Copysign(0, -1), 0.0
@@ -139,6 +143,7 @@ func TestFloatTotalOrderComparator(t *testing.T) {
 }
 
 func TestFloatDistinctCollapsesNaNAndZeroSigns(t *testing.T) {
+	t.Parallel()
 	db := dbWith(
 		t,
 		"CREATE TABLE f (id i32 PRIMARY KEY, x f64)",
@@ -157,6 +162,7 @@ func TestFloatDistinctCollapsesNaNAndZeroSigns(t *testing.T) {
 // --- the promotion tower: f32 + f64 → f64 -------------------------------------
 
 func TestFloatMixedWidthArithmeticPromotes(t *testing.T) {
+	t.Parallel()
 	db := dbWith(
 		t,
 		"CREATE TABLE f (id i32 PRIMARY KEY, a f32, b f64)",
@@ -175,6 +181,7 @@ func TestFloatMixedWidthArithmeticPromotes(t *testing.T) {
 }
 
 func TestFloat32ImplicitWidenStoresIntoFloat64Column(t *testing.T) {
+	t.Parallel()
 	// f32 → f64 is the implicit, lossless widen (the tower): a f32 VALUE stores into a
 	// f64 column (storeValue widens), and assignableTo permits the family pairing.
 	got, err := storeValue(Float32Value(1.5), scalarFloat64, nil, nil, false, "x")
@@ -199,6 +206,7 @@ func TestFloat32ImplicitWidenStoresIntoFloat64Column(t *testing.T) {
 // --- casts: int/decimal→float exact-decimal expansion (value-level) -----------------------
 
 func TestExactDecimalFromFloatMatchesParseRoundTrip(t *testing.T) {
+	t.Parallel()
 	// The exact decimal of a binary64 must re-parse to the same binary64 (it is the EXACT value).
 	for _, f := range []float64{0.1, 0.5, 1.0 / 3.0, 123456.789, -2.25, 1e-10} {
 		d := exactDecimalFromFloat64(f)
@@ -219,6 +227,7 @@ func TestExactDecimalFromFloatMatchesParseRoundTrip(t *testing.T) {
 // lives per-core because it asserts that deliberate divergence (the corpus, PG-clean, cannot).
 
 func TestFloatSumStreamingScanOrder(t *testing.T) {
+	t.Parallel()
 	// The running total equals a plain left-fold in add order (streaming, not sorted).
 	xs := []float64{1e16, 1, -1e16, 2.5, -0.5, 3e-8}
 	acc := newFloatSumAcc(false)
@@ -259,6 +268,7 @@ func TestFloatSumStreamingScanOrder(t *testing.T) {
 }
 
 func TestFloatSumSpecialValues(t *testing.T) {
+	t.Parallel()
 	// Any NaN → NaN; both ±Inf → NaN; +Inf alone → +Inf.
 	withNaN := newFloatSumAcc(false)
 	withNaN.add(Float64Value(1))
@@ -283,6 +293,7 @@ func TestFloatSumSpecialValues(t *testing.T) {
 // --- literal parsing + rendering spellings ------------------------------------------------
 
 func TestFloatLiteralParsing(t *testing.T) {
+	t.Parallel()
 	db := dbWith(t)
 	good := map[string]float64{
 		"f64 '1.5'":       1.5,
@@ -314,6 +325,7 @@ func TestFloatLiteralParsing(t *testing.T) {
 }
 
 func TestFloatRenderSpellings(t *testing.T) {
+	t.Parallel()
 	cases := map[float64]string{
 		math.Inf(1):          "Infinity",
 		math.Inf(-1):         "-Infinity",

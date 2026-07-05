@@ -42,6 +42,7 @@ func valuesCost(t *testing.T, db dbHandle, sql string) int64 {
 }
 
 func TestValuesBodyBasicShape(t *testing.T) {
+	t.Parallel()
 	db := dbWith(t)
 	if got := queryIDs(t, db, "SELECT column1 FROM (VALUES (1), (2), (3)) AS v ORDER BY column1"); !eqInts(got, 1, 2, 3) {
 		t.Errorf("basic VALUES body got %v", got)
@@ -52,6 +53,7 @@ func TestValuesBodyBasicShape(t *testing.T) {
 }
 
 func TestValuesBodyMultiColumnAndRename(t *testing.T) {
+	t.Parallel()
 	db := dbWith(t)
 	if got := valuesNames(t, db, "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS v"); !eqStrs(got, "column1", "column2") {
 		t.Errorf("two-column default names got %v", got)
@@ -69,6 +71,7 @@ func TestValuesBodyMultiColumnAndRename(t *testing.T) {
 }
 
 func TestValuesBodyColumnTypeUnification(t *testing.T) {
+	t.Parallel()
 	db := dbWith(t)
 	// int + int -> int (all bare integer literals are i64 in jed).
 	if got := valuesTypes(t, db, "SELECT column1 FROM (VALUES (1), (2)) AS v"); !eqStrs(got, "i64") {
@@ -93,6 +96,7 @@ func TestValuesBodyColumnTypeUnification(t *testing.T) {
 }
 
 func TestValuesBodyParamTypedBySibling(t *testing.T) {
+	t.Parallel()
 	db := dbWith(t)
 	rows := queryRows(t, db, "SELECT column1 FROM (VALUES (1), ($1)) AS v ORDER BY column1", IntValue(7))
 	if len(rows) != 2 || rows[0][0].Int != 1 || rows[1][0].Int != 7 {
@@ -101,6 +105,7 @@ func TestValuesBodyParamTypedBySibling(t *testing.T) {
 }
 
 func TestValuesBodyIntrinsicCost(t *testing.T) {
+	t.Parallel()
 	db := dbWith(t)
 	// VALUES body: row_produced per row (3) + outer SELECT row_produced (3) = 6.
 	if got := valuesCost(t, db, "SELECT column1 FROM (VALUES (1), (2), (3)) AS v"); got != 6 {
@@ -113,6 +118,7 @@ func TestValuesBodyIntrinsicCost(t *testing.T) {
 }
 
 func TestValuesBodyErrors(t *testing.T) {
+	t.Parallel()
 	db := dbWith(t)
 	cases := []struct{ sql, code string }{
 		{"SELECT * FROM (VALUES (1), (2, 3)) AS v", "42601"},         // differing arity

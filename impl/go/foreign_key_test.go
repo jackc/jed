@@ -49,6 +49,7 @@ func fkNames(t *testing.T, db dbHandle, table string) []string {
 // Auto-naming follows PostgreSQL's <table>_<localcols>_fkey; an explicit CONSTRAINT name is used as
 // written; the catalog holds FKs in ascending lowercased-name order.
 func TestForeignKeyNamingAndOrder(t *testing.T) {
+	t.Parallel()
 	db := fkSetup(
 		t,
 		"CREATE TABLE p (a i32, b i32, code i32 UNIQUE, PRIMARY KEY (a, b))",
@@ -73,6 +74,7 @@ func TestForeignKeyNamingAndOrder(t *testing.T) {
 // jed is STRICTER than PostgreSQL on type pairing: corresponding columns must be the SAME scalar
 // type (42804), where PG allows any comparable pair (e.g. i32 ↔ i64) — constraints.md §6.7.
 func TestForeignKeyStrictTypePairing(t *testing.T) {
+	t.Parallel()
 	db := fkSetup(t, "CREATE TABLE p (id i32 PRIMARY KEY)")
 	if got := fkErr(t, db, "CREATE TABLE c1 (x i64 REFERENCES p)"); got != "42804" {
 		t.Fatalf("i64→i32 pk: got %s, want 42804", got)
@@ -88,6 +90,7 @@ func TestForeignKeyStrictTypePairing(t *testing.T) {
 // CASCADE / SET NULL / SET DEFAULT parse but are rejected at CREATE TABLE (0A000); NO ACTION and
 // RESTRICT are accepted (constraints.md §6.6).
 func TestForeignKeyReferentialActionsNarrowed(t *testing.T) {
+	t.Parallel()
 	db := fkSetup(t, "CREATE TABLE p (id i32 PRIMARY KEY)")
 	for _, sql := range []string{
 		"CREATE TABLE c1 (x i32 REFERENCES p ON DELETE CASCADE)",
@@ -107,6 +110,7 @@ func TestForeignKeyReferentialActionsNarrowed(t *testing.T) {
 // values keeps every referenced tuple present, so the UPDATE succeeds where PG fails on the
 // transient — a documented divergence (constraints.md §6.7).
 func TestForeignKeyParentUpdateEndStateSwap(t *testing.T) {
+	t.Parallel()
 	db := fkSetup(
 		t,
 		"CREATE TABLE p (id i32 PRIMARY KEY, code i32 UNIQUE)",

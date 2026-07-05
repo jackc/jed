@@ -69,6 +69,7 @@ func seedOrders(t *testing.T, db *Session, n int) {
 // later executes — no re-plan — and reuse is cost-identical (the regex-cost-drift guard: if a plan
 // with per-execution mutable cost state were cached, the 2nd execute would report a different cost).
 func TestPlanCachePointLookupReuses(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	seedOrders(t, db, 5)
 	stmt, err := db.Prepare("SELECT id, amount FROM orders WHERE id = $1")
@@ -120,6 +121,7 @@ func TestPlanCachePointLookupReuses(t *testing.T) {
 // falls back from the (now-gone) index lookup to a full scan — a stale cached index plan would try to
 // use a dropped index. Exercises the removeIndex catGen bump.
 func TestPlanCacheDropIndexInvalidation(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, a i32)")
 	for i := 1; i <= 50; i++ {
@@ -158,6 +160,7 @@ func TestPlanCacheDropIndexInvalidation(t *testing.T) {
 // DROP + re-CREATE with a different shape must re-plan (the rollback-collision guard's positive case:
 // under fill-only-from-committed the new committed generation differs).
 func TestPlanCacheDropCreateInvalidation(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, a i32)")
 	mustExec(t, db, "INSERT INTO t VALUES (1, 10)")
@@ -184,6 +187,7 @@ func TestPlanCacheDropCreateInvalidation(t *testing.T) {
 // CREATE INDEX between executes invalidates the cached full-scan plan; the re-plan picks up the new
 // secondary index (cheaper cost), proving the invalidation actually forces a fresh plan.
 func TestPlanCacheIndexInvalidation(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, a i32)")
 	for i := 1; i <= 50; i++ {
@@ -213,6 +217,7 @@ func TestPlanCacheIndexInvalidation(t *testing.T) {
 // A plan containing an uncorrelated subquery or a precompiled (constant-pattern) regex is never
 // cached — reusing it would bake in one execution's folded params / under-charge the regex compile.
 func TestPlanCacheNonCacheable(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, note text)")
 	mustExec(t, db, "INSERT INTO t VALUES (1, 'abc'), (2, 'xyz'), (3, 'abd')")
@@ -255,6 +260,7 @@ func TestPlanCacheNonCacheable(t *testing.T) {
 // different committed catalog). After the transaction commits, the autocommit execute reads committed
 // and caches normally.
 func TestPlanCacheFillOnlyFromCommitted(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, a i32)")
 	mustExec(t, db, "INSERT INTO t VALUES (1, 10)")

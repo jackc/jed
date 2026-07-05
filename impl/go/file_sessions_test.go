@@ -25,6 +25,7 @@ func countVia(t *testing.T, db *Database) int64 {
 }
 
 func TestFileBackedRoundtripAndReopen(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "file_sessions_roundtrip.jed")
 	func() {
 		db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
@@ -65,6 +66,7 @@ func TestFileBackedRoundtripAndReopen(t *testing.T) {
 }
 
 func TestFileBackedExplicitTransactionPersistsThenRollsBack(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "file_sessions_explicit_tx.jed")
 	func() {
 		db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
@@ -121,6 +123,7 @@ func TestFileBackedExplicitTransactionPersistsThenRollsBack(t *testing.T) {
 }
 
 func TestFileBackedExecuteScriptIsAllOrNothing(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "file_sessions_script.jed")
 	func() {
 		db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
@@ -153,6 +156,7 @@ func TestFileBackedExecuteScriptIsAllOrNothing(t *testing.T) {
 }
 
 func TestFileBackedReadOnlyOpenRejectsWrites(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "file_sessions_read_only.jed")
 	func() {
 		db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
@@ -184,6 +188,7 @@ func TestFileBackedReadOnlyOpenRejectsWrites(t *testing.T) {
 }
 
 func TestFileBackedReadersRunConcurrentlyWithAWriter(t *testing.T) {
+	t.Parallel()
 	// The deep 7c requirement: file-backed read sessions fault clean pages through the shared,
 	// mutex-guarded buffer pool concurrently with a writer committing (and persisting dirty pages) on
 	// another goroutine. Each reader pins a snapshot and must see an internally consistent count;

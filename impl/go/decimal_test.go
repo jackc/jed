@@ -29,6 +29,7 @@ func mustRender(d Decimal, err error) string {
 }
 
 func TestDecimalRenderPreservesScale(t *testing.T) {
+	t.Parallel()
 	cases := map[string]string{
 		"1.50": "1.50", "1.5": "1.5", "0.00": "0.00", "0": "0",
 		"-0.013": "-0.013", "123": "123", ".5": "0.5", "100": "100",
@@ -41,6 +42,7 @@ func TestDecimalRenderPreservesScale(t *testing.T) {
 }
 
 func TestDecimalNoNegativeZero(t *testing.T) {
+	t.Parallel()
 	for _, s := range []string{"0", "-0", "-0.00"} {
 		if dec(s).Neg {
 			t.Errorf("dec(%q) should not be negative", s)
@@ -53,6 +55,7 @@ func TestDecimalNoNegativeZero(t *testing.T) {
 }
 
 func TestDecimalValueEqualityIgnoresScale(t *testing.T) {
+	t.Parallel()
 	if dec("1.5").CmpValue(dec("1.50")) != 0 {
 		t.Error("1.5 should equal 1.50 by value")
 	}
@@ -65,6 +68,7 @@ func TestDecimalValueEqualityIgnoresScale(t *testing.T) {
 }
 
 func TestDecimalOrdering(t *testing.T) {
+	t.Parallel()
 	asc := []string{"-10", "-1", "0", "0.5", "1", "10"}
 	for i := 0; i+1 < len(asc); i++ {
 		if dec(asc[i]).CmpValue(dec(asc[i+1])) >= 0 {
@@ -77,6 +81,7 @@ func TestDecimalOrdering(t *testing.T) {
 }
 
 func TestDecimalAddSubMul(t *testing.T) {
+	t.Parallel()
 	check := func(got, want string) {
 		t.Helper()
 		if got != want {
@@ -90,6 +95,7 @@ func TestDecimalAddSubMul(t *testing.T) {
 }
 
 func TestDecimalDivisionScaleAndRounding(t *testing.T) {
+	t.Parallel()
 	cases := []struct{ a, b, want string }{
 		{"1", "3", "0.33333333333333333333"},
 		{"2", "3", "0.66666666666666666667"},
@@ -106,6 +112,7 @@ func TestDecimalDivisionScaleAndRounding(t *testing.T) {
 }
 
 func TestDecimalModulo(t *testing.T) {
+	t.Parallel()
 	cases := []struct{ a, b, want string }{
 		{"5.5", "2", "1.5"},
 		{"-5.5", "2", "-1.5"},
@@ -119,6 +126,7 @@ func TestDecimalModulo(t *testing.T) {
 }
 
 func TestDecimalRoundingHalfAway(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		in     string
 		scale  uint32
@@ -139,6 +147,7 @@ func TestDecimalRoundingHalfAway(t *testing.T) {
 }
 
 func TestDecimalDivZeroTraps(t *testing.T) {
+	t.Parallel()
 	if _, err := dec("1").Div(dec("0")); err == nil || err.(*EngineError).Code() != "22012" {
 		t.Errorf("1/0 should trap 22012, got %v", err)
 	}
@@ -148,6 +157,7 @@ func TestDecimalDivZeroTraps(t *testing.T) {
 }
 
 func TestDecimalToInt64Round(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		in   string
 		want int64
@@ -168,6 +178,7 @@ func TestDecimalToInt64Round(t *testing.T) {
 }
 
 func TestDecimalCodecRoundTrip(t *testing.T) {
+	t.Parallel()
 	for _, s := range []string{"0", "1.50", "-12345.6789", "100000000.000001", "999999999999"} {
 		d := dec(s)
 		neg, scale, groups := d.ToCodec()
@@ -182,6 +193,7 @@ func TestDecimalCodecRoundTrip(t *testing.T) {
 }
 
 func TestDecimalBigMultiplicationExact(t *testing.T) {
+	t.Parallel()
 	// 38-digit * 38-digit (76 digits) fits no int128; the limb path is exact.
 	a := dec("12345678901234567890123456789012345678")
 	b := dec("99999999999999999999999999999999999999")
@@ -220,6 +232,7 @@ func decOne(t *testing.T, db dbHandle, sql string) string {
 }
 
 func TestDecimalOnDiskRoundTripEndToEnd(t *testing.T) {
+	t.Parallel()
 	db := decDB(
 		t,
 		"CREATE TABLE t (id i32 PRIMARY KEY, money numeric(10,2), free numeric)",
@@ -253,6 +266,7 @@ func TestDecimalOnDiskRoundTripEndToEnd(t *testing.T) {
 // fix. Too large to reach through SQL literals (a 131072-digit value is ~74 KB), so pinned here.
 // a is exactly at the cap (131072 nines); a + a is one digit over it.
 func TestSumAccumulatorChecksOnlyFinalCap(t *testing.T) {
+	t.Parallel()
 	a := decimalFromDigitsScale(false, strings.Repeat("9", decimalMaxIntDigits), 0)
 	if _, err := a.CheckCap(); err != nil {
 		t.Fatalf("a should be exactly at the cap, got %v", err)
@@ -281,6 +295,7 @@ func TestSumAccumulatorChecksOnlyFinalCap(t *testing.T) {
 // exceeds max_scale (16383) ROUNDS to it, half away from zero, instead of trapping
 // (spec/design/decimal.md §2).
 func TestDecimalMulRoundsAtMaxScale(t *testing.T) {
+	t.Parallel()
 	db := decDB(t, "CREATE TABLE t (id i32 PRIMARY KEY)", "INSERT INTO t VALUES (1)")
 	tiny1 := "0." + strings.Repeat("0", 8191) + "1" // 1e-8192 (scale 8192)
 	tiny5 := "0." + strings.Repeat("0", 8191) + "5" // 5e-8192
@@ -298,6 +313,7 @@ func TestDecimalMulRoundsAtMaxScale(t *testing.T) {
 // the limb work runs (spec/design/cost.md §3/§6), so a ceiling aborts a pathological multiply
 // up front (CLAUDE.md §13). ~20000 digits is ~5000 groups; the mul W is ~25,000,000.
 func TestDecimalCostCeilingAbortsAheadOfBigMultiply(t *testing.T) {
+	t.Parallel()
 	db := decDB(t, "CREATE TABLE t (id i32 PRIMARY KEY)", "INSERT INTO t VALUES (1)")
 	big := strings.Repeat("9", 20000) + ".5"
 	db.SetMaxCost(1000)
@@ -314,6 +330,7 @@ func TestDecimalCostCeilingAbortsAheadOfBigMultiply(t *testing.T) {
 // (byte-comparable order == numeric order) and is scale-independent (1.5 and 1.50 coincide).
 // A per-core byte-level test — the corpus cannot assert encoded key bytes (encoding.md §2.5).
 func TestDecimalEncodeKeyOrderPreserving(t *testing.T) {
+	t.Parallel()
 	ss := []string{
 		"-12345.6789", "-100", "-10", "-1.5", "-1", "-0.5", "-0.05", "-0.001",
 		"0", "0.001", "0.05", "0.5", "1", "1.5", "1.50", "5", "10", "12", "50",
@@ -380,6 +397,7 @@ func bytesCompare(a, b []byte) int {
 // TestDecimalEncodeKeyExactBytes pins the exact key bytes — the cross-core contract (the same
 // literals are asserted in Rust and re-derived by spec/encoding/verify.rb).
 func TestDecimalEncodeKeyExactBytes(t *testing.T) {
+	t.Parallel()
 	want := map[string][]byte{
 		"0":    {0x04},
 		"1.5":  {0x05, 0x80, 0x00, 0x00, 0x01, 0x02, 0x33, 0x00},

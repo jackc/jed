@@ -70,6 +70,7 @@ func wcSetup(t *testing.T) *Session {
 // --- the command tag of a data-modifying primary (the result is the PRIMARY's, §4) ------------
 
 func TestWithOnInsertPrimaryNoReturningReportsAffectedCount(t *testing.T) {
+	t.Parallel()
 	db := wcSetup(t)
 	wcRun(t, db, "CREATE TABLE dst (x i32)")
 	// A WITH feeding an INSERT primary with no RETURNING is a STATEMENT whose count is the primary's
@@ -84,6 +85,7 @@ func TestWithOnInsertPrimaryNoReturningReportsAffectedCount(t *testing.T) {
 }
 
 func TestWithOnDeletePrimaryNoReturningReportsAffectedCount(t *testing.T) {
+	t.Parallel()
 	db := wcSetup(t)
 	if n := wcAffected(t, db,
 		"WITH old AS (SELECT id FROM t WHERE id >= 2) DELETE FROM t WHERE id IN (SELECT id FROM old)"); n != 2 {
@@ -95,6 +97,7 @@ func TestWithOnDeletePrimaryNoReturningReportsAffectedCount(t *testing.T) {
 }
 
 func TestWithOnUpdatePrimaryNoReturningReportsAffectedCount(t *testing.T) {
+	t.Parallel()
 	db := wcSetup(t)
 	if n := wcAffected(t, db,
 		"WITH hi AS (SELECT id FROM t WHERE v >= 20) UPDATE t SET v = v + 1 WHERE id IN (SELECT id FROM hi)"); n != 2 {
@@ -103,6 +106,7 @@ func TestWithOnUpdatePrimaryNoReturningReportsAffectedCount(t *testing.T) {
 }
 
 func TestDataModifyingCteCountNotSurfacedUnderSelectPrimary(t *testing.T) {
+	t.Parallel()
 	db := wcSetup(t)
 	// The data-modifying CTE inserts 1 row, but the SELECT primary's result is what is returned — and
 	// it reads the PRE-statement table (the pin, §2), so count is 3, not 4.
@@ -121,6 +125,7 @@ func TestDataModifyingCteCountNotSurfacedUnderSelectPrimary(t *testing.T) {
 // --- jed's deterministic last-write-wins on a same-row conflict (PG-unspecified, §7) ----------
 
 func TestSameRowTwoUpdatesLastWriteWins(t *testing.T) {
+	t.Parallel()
 	db := wcSetup(t)
 	// Two CTEs update id=1. Each reads the PIN (pre-statement v=10) and returns its own new value, so
 	// BOTH return a row; the writes apply in lexical order, last-write-wins, so the table ends at the
@@ -141,6 +146,7 @@ func TestSameRowTwoUpdatesLastWriteWins(t *testing.T) {
 }
 
 func TestSameRowUpdateThenDeleteDeleteWins(t *testing.T) {
+	t.Parallel()
 	db := wcSetup(t)
 	// CTE a updates id=1 to 100; CTE b deletes id=1. Both read the pin (the pre-statement row), so a
 	// returns 100 and b returns the pre-statement old value 10; b's delete applies after a's update,

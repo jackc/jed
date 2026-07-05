@@ -18,6 +18,7 @@ func tomlGroupsWithCases(t *testing.T, section string) []tomlRow {
 // test reader handles arrays of *tables* only at the [[section]] level, so for the
 // encoding fixtures we read the cases with a dedicated line scanner.
 func TestEncodingVectors(t *testing.T) {
+	t.Parallel()
 	cases := readEncodingCases(t, specPath(t, "encoding/integers.toml"))
 	checked := 0
 	for _, c := range cases {

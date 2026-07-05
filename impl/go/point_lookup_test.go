@@ -27,6 +27,7 @@ func bigTable(t *testing.T, n int) *Session {
 }
 
 func TestPointLookupMultiLeaf(t *testing.T) {
+	t.Parallel()
 	const n = 1000
 	db := bigTable(t, n)
 
@@ -81,6 +82,7 @@ func TestPointLookupMultiLeaf(t *testing.T) {
 }
 
 func TestRangeScanCrossesLeafBoundaries(t *testing.T) {
+	t.Parallel()
 	const n = 1000
 	db := bigTable(t, n)
 
@@ -113,6 +115,7 @@ func TestRangeScanCrossesLeafBoundaries(t *testing.T) {
 }
 
 func TestLimitShortCircuitMultiLeaf(t *testing.T) {
+	t.Parallel()
 	const n = 1000
 	db := bigTable(t, n) // id 1..1000, v == id
 
@@ -162,6 +165,7 @@ func TestLimitShortCircuitMultiLeaf(t *testing.T) {
 }
 
 func TestMutationPushdownMultiLeaf(t *testing.T) {
+	t.Parallel()
 	const n = 1000
 	db := bigTable(t, n)
 

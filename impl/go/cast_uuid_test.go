@@ -16,6 +16,7 @@ var uuid16 = string([]byte{
 
 // uuid → bytea is the 16 raw bytes (PG: 42846 — jed adds this cast).
 func TestUuidToByteaIsThe16Bytes(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	v := castOne(t, db, "SELECT '550e8400-e29b-41d4-a716-446655440000'::uuid::bytea")
 	if v.Kind != ValBytea || v.str() != uuid16 {
@@ -25,6 +26,7 @@ func TestUuidToByteaIsThe16Bytes(t *testing.T) {
 
 // bytea → uuid takes the 16 raw bytes (PG: 42846 — jed adds this cast).
 func TestByteaToUuidIsThe16Bytes(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	v := castOne(t, db, "SELECT '\\x550e8400e29b41d4a716446655440000'::bytea::uuid")
 	if v.Kind != ValUuid || v.str() != uuid16 {
@@ -35,6 +37,7 @@ func TestByteaToUuidIsThe16Bytes(t *testing.T) {
 // bytea → uuid requires EXACTLY 16 bytes; any other length traps 22P02 (the wrong-width body —
 // there is no PG code to match, so jed reuses invalid_text_representation).
 func TestByteaToUuidWrongLengthTraps22P02(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	for _, sql := range []string{
 		"SELECT '\\xabcd'::bytea::uuid",                               // 2 bytes
@@ -49,6 +52,7 @@ func TestByteaToUuidWrongLengthTraps22P02(t *testing.T) {
 
 // The casts round-trip through real columns (the runtime, non-constant path); NULL adapts.
 func TestUuidByteaRoundTripThroughColumns(t *testing.T) {
+	t.Parallel()
 	db := dbWith(
 		t,
 		"CREATE TABLE t (id i32 PRIMARY KEY, u uuid, b bytea)",
@@ -71,6 +75,7 @@ func TestUuidByteaRoundTripThroughColumns(t *testing.T) {
 
 // text → uuid / uuid → text smoke check (the oracle-corpus behavior, run here per core too).
 func TestTextUuidSmoke(t *testing.T) {
+	t.Parallel()
 	db := dbWith(
 		t,
 		"CREATE TABLE t (id i32 PRIMARY KEY, s text, u uuid)",

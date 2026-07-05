@@ -38,6 +38,7 @@ func bigValueDB(t *testing.T) (dbHandle, string) {
 }
 
 func TestExternalValueSpansOverflowChainAndRoundTrips(t *testing.T) {
+	t.Parallel()
 	db, big := bigValueDB(t)
 	image, err := db.ToImage(256, 1)
 	if err != nil {
@@ -65,6 +66,7 @@ func TestExternalValueSpansOverflowChainAndRoundTrips(t *testing.T) {
 }
 
 func TestSmallValuesNeverSpill(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i16)")
 	mustExec(t, db, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
@@ -78,6 +80,7 @@ func TestSmallValuesNeverSpill(t *testing.T) {
 }
 
 func TestLoadReclaimsOnlyDeadOverflowPages(t *testing.T) {
+	t.Parallel()
 	db, _ := bigValueDB(t)
 	image, err := db.ToImage(256, 1)
 	if err != nil {
@@ -99,6 +102,7 @@ func TestLoadReclaimsOnlyDeadOverflowPages(t *testing.T) {
 }
 
 func TestExternalValueThroughPagedFileAndReclaims(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "large_values.jed")
 	big := fillerText(1500) // incompressible ≫ RECORD_MAX at ps 256 ⇒ a multi-page overflow chain
 

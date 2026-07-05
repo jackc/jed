@@ -12,6 +12,7 @@ func counting(loads *int, page uint32) func() (*pnode, error) {
 }
 
 func TestBufferPoolHitReturnsCachedWithoutReloading(t *testing.T) {
+	t.Parallel()
 	pool := newBufferPool(4)
 	loads := 0
 	if n, _ := pool.getOrLoad(7, counting(&loads, 70)); n.page != 70 {
@@ -29,6 +30,7 @@ func TestBufferPoolHitReturnsCachedWithoutReloading(t *testing.T) {
 }
 
 func TestBufferPoolResidentSetNeverExceedsCapacity(t *testing.T) {
+	t.Parallel()
 	pool := newBufferPool(3)
 	loads := 0
 	for p := uint32(0); p < 100; p++ {
@@ -43,6 +45,7 @@ func TestBufferPoolResidentSetNeverExceedsCapacity(t *testing.T) {
 }
 
 func TestBufferPoolClockGivesReferencedPageSecondChance(t *testing.T) {
+	t.Parallel()
 	// Fill {0,1,2}; touch 0 (sets its ref bit); inserting 3 should evict 1 (the first unreferenced
 	// under the hand), sparing the recently-touched 0.
 	pool := newBufferPool(3)
@@ -67,6 +70,7 @@ func TestBufferPoolClockGivesReferencedPageSecondChance(t *testing.T) {
 }
 
 func TestBufferPoolCapacityOneEvictsEveryTime(t *testing.T) {
+	t.Parallel()
 	pool := newBufferPool(1)
 	loads := 0
 	pool.getOrLoad(1, counting(&loads, 1))

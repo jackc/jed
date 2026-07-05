@@ -8,6 +8,7 @@ package jed
 import "testing"
 
 func TestQuantifiedAnyEqualityIsIn(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	cases := map[string]string{
 		"SELECT 1 = ANY(ARRAY[1,2,3])":     "true",
@@ -26,6 +27,7 @@ func TestQuantifiedAnyEqualityIsIn(t *testing.T) {
 }
 
 func TestQuantifiedAll(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	cases := map[string]string{
 		"SELECT 3 = ALL(ARRAY[3,3,3])":        "true",
@@ -44,6 +46,7 @@ func TestQuantifiedAll(t *testing.T) {
 }
 
 func TestQuantifiedOrderingAndShape(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	cases := map[string]string{
 		"SELECT 5 < ANY(ARRAY[1,2,10])": "true",
@@ -67,6 +70,7 @@ func TestQuantifiedOrderingAndShape(t *testing.T) {
 }
 
 func TestQuantifiedColumnLiteralAdaptation(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, xs i32[])")
 	mustExec(t, db, "INSERT INTO t VALUES (1, ARRAY[10,20,30]), (2, ARRAY[40,50])")
@@ -83,6 +87,7 @@ func TestQuantifiedColumnLiteralAdaptation(t *testing.T) {
 }
 
 func TestQuantifiedErrors(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	cases := map[string]string{
 		"SELECT 1 = ANY(5)":              "42809", // a non-array right side

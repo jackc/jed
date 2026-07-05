@@ -37,6 +37,7 @@ func wideFixedSeed(t *testing.T, db dbHandle) {
 }
 
 func TestMaskedWideFixedWidthMatchesResident(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "masked_wide_fixed.jed")
 	db, err := create(path, databaseOptions{PageSize: DefaultPageSize, noSync: true})
 	if err != nil {
@@ -139,6 +140,7 @@ func TestMaskedWideFixedWidthMatchesResident(t *testing.T) {
 // only the selected lane positions — so a mis-indexed selection vector against the interior-separator
 // gather would diverge from the resident row path here.
 func TestMaskedColumnarMultiLevelMatchesResident(t *testing.T) {
+	t.Parallel()
 	seed := func(t *testing.T, db dbHandle) {
 		t.Helper()
 		mustExec(t, db, "CREATE TABLE m (id i32 PRIMARY KEY, k i32, a i32, b i16)")

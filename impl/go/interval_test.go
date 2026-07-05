@@ -44,6 +44,7 @@ func readIntervalCases(t *testing.T, path string) []ivCase {
 }
 
 func TestIntervalVectors(t *testing.T) {
+	t.Parallel()
 	cases := readIntervalCases(t, specPath(t, "encoding/intervals.toml"))
 	if len(cases) == 0 {
 		t.Fatal("no interval vectors parsed")
@@ -87,6 +88,7 @@ func TestIntervalVectors(t *testing.T) {
 }
 
 func TestIntervalSpanCanonical(t *testing.T) {
+	t.Parallel()
 	oneMonth, _ := parseInterval("1 mon")
 	thirtyDays, _ := parseInterval("30 days")
 	hours, _ := parseInterval("720:00:00")
@@ -109,6 +111,7 @@ func TestIntervalSpanCanonical(t *testing.T) {
 // equal span order; span-equal intervals share a key (the "equal but not identical" UNIQUE
 // wrinkle, decimal's 1.5/1.50); byte-exact against the canonical vectors (interval.toml).
 func TestIntervalEncodeKey(t *testing.T) {
+	t.Parallel()
 	iv := func(m, d int32, u int64) Interval { return Interval{Months: m, Days: d, Micros: u} }
 	// Ascending by span — sorting by key must reproduce this order (sign boundary, zero, ±µs).
 	ordered := []Interval{

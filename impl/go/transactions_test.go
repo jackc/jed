@@ -20,6 +20,7 @@ func txCount(t *testing.T, db dbHandle, table string) int {
 }
 
 func TestBeginExecuteCommitIsVisible(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	if err := db.Begin(true); err != nil {
@@ -55,6 +56,7 @@ func TestBeginExecuteCommitIsVisible(t *testing.T) {
 }
 
 func TestBeginExecuteRollbackDiscards(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	mustExec(t, db, "INSERT INTO t VALUES (1)")
@@ -76,6 +78,7 @@ func TestBeginExecuteRollbackDiscards(t *testing.T) {
 }
 
 func TestDroppingASessionWithAnOpenBlockRollsBack(t *testing.T) {
+	t.Parallel()
 	// The bbolt safety net: an unfinished transaction never silently commits. Closing a session that
 	// left a block open rolls the block back, so a fresh session over the same shared core sees only
 	// the pre-block committed state.
@@ -112,6 +115,7 @@ func TestDroppingASessionWithAnOpenBlockRollsBack(t *testing.T) {
 }
 
 func TestUpdateClosureCommitsOnNil(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	err := db.Update(func(tx *Transaction) error {
@@ -133,6 +137,7 @@ func TestUpdateClosureCommitsOnNil(t *testing.T) {
 }
 
 func TestUpdateClosureRollsBackOnErr(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	mustExec(t, db, "INSERT INTO t VALUES (1)")
@@ -157,6 +162,7 @@ func TestUpdateClosureRollsBackOnErr(t *testing.T) {
 }
 
 func TestViewIsReadOnly(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	mustExec(t, db, "INSERT INTO t VALUES (1), (2)")
@@ -191,6 +197,7 @@ func TestViewIsReadOnly(t *testing.T) {
 }
 
 func TestNestedBeginIs25001(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	if err := db.Begin(true); err != nil {
@@ -212,6 +219,7 @@ func TestNestedBeginIs25001(t *testing.T) {
 }
 
 func TestCommitRollbackAreNoopsInAutocommit(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	// no open transaction: both are lenient no-op successes (transactions.md §4.2)

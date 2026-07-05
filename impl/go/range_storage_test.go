@@ -38,6 +38,7 @@ func errRange(t *testing.T, db dbHandle, sql string) string {
 // range, the canonical [) storage). The on-disk byte layout is pinned cross-core by range_table.jed;
 // this is the behavioral round-trip.
 func TestRangeImageRoundtrip(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, r i32range, br i64range)")
 	run(t, db, "INSERT INTO t VALUES (1, '[1,5)', '[10,20)')")
@@ -72,6 +73,7 @@ func TestRangeImageRoundtrip(t *testing.T) {
 // declares a column whose stored value renders identically to the canonical spelling, and the
 // canonical name (not the PG int4range) appears in a jed message.
 func TestRangeCanonicalNameAndAliases(t *testing.T) {
+	t.Parallel()
 	// The PG alias is accepted on the column; the value renders the same as the canonical spelling.
 	db := memDB().Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, r int4range)")
@@ -116,6 +118,7 @@ func TestRangeCanonicalNameAndAliases(t *testing.T) {
 // (oracle-clean, types/range.test) — PG also allows them via its range btree opclass. These remaining
 // cases are jed-stricter, so they cannot live in the oracle-clean corpus.
 func TestRangeNarrowingsAre0A000(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	if got := errRange(t, db, "CREATE TABLE b (id i32 PRIMARY KEY, r i32range DEFAULT '[1,5)')"); got != "0A000" {
 		t.Errorf("range DEFAULT: got %s, want 0A000", got)
@@ -138,6 +141,7 @@ func TestRangeNarrowingsAre0A000(t *testing.T) {
 // conflict-action path, and a composite column (a separate slice). The happy-path forms (literal /
 // cast / constructor / set-op / NULL / re-key) and the 42804 type errors live in types/range.test.
 func TestRangeUpdateDeferrals(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, r i32range)")
 	run(t, db, "INSERT INTO t VALUES (1, '[1,5)')")
@@ -165,6 +169,7 @@ func TestRangeUpdateDeferrals(t *testing.T) {
 // cannot live in the oracle corpus. The agreeing same-element comparison (=/</ORDER BY) is covered by
 // types/range.test.
 func TestRangeCrossElementComparisonIs42804(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	// A range over i32 vs a range over i64 — different element types, no implicit cross-range cast.
 	if got := errRange(t, db, "SELECT '[1,5)'::i32range = '[1,5)'::i64range"); got != "42804" {
@@ -183,6 +188,7 @@ func TestRangeCrossElementComparisonIs42804(t *testing.T) {
 // *columns* are storable this slice. The type name IS known, so it is 0A000, not the 42704 an unknown
 // type would give.
 func TestRangeCompositeFieldIs0A000(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	if got := errRange(t, db, "CREATE TYPE rec AS (lo i32, span i32range)"); got != "0A000" {
 		t.Errorf("range composite field: got %s, want 0A000", got)
@@ -196,6 +202,7 @@ func TestRangeCompositeFieldIs0A000(t *testing.T) {
 // 22000/42601/22003 — lives in expr/range_constructors.test. Mirrors range_constructor_divergences in
 // impl/rust/tests/range_storage.rs.
 func TestRangeConstructorDivergences(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	// (1) jed ACCEPTS the i/f-prefix spellings i32range/i64range as constructor names (PG ships only
 	// int4range/int8range). The result is identical to the PG-spelled alias.
@@ -237,6 +244,7 @@ func TestRangeConstructorDivergences(t *testing.T) {
 // (spec/design/range-functions.md §3). The agreeing value behavior of all eight operators lives in
 // expr/range_operators.test. Mirrors range_operator_divergences in impl/rust/tests/range_storage.rs.
 func TestRangeOperatorDivergences(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	// THE divergence: jed has no integer bit-shift, so the `<<` / `>>` tokens are RANGE-only. An
 	// integer `<<` / `>>` is "operator does not exist" (42883) — PostgreSQL would compute a bit shift

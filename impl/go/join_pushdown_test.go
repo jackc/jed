@@ -35,6 +35,7 @@ func joinTables(t *testing.T, n int) *Session {
 }
 
 func TestJoinPushdownBoundsOneSideSublinear(t *testing.T) {
+	t.Parallel()
 	const n = 1000
 	db := joinTables(t, n)
 
@@ -61,6 +62,7 @@ func TestJoinPushdownBoundsOneSideSublinear(t *testing.T) {
 }
 
 func TestJoinPushdownMissCollapsesToEmpty(t *testing.T) {
+	t.Parallel()
 	const n = 1000
 	db := joinTables(t, n)
 
@@ -76,6 +78,7 @@ func TestJoinPushdownMissCollapsesToEmpty(t *testing.T) {
 }
 
 func TestJoinPushdownBothSidesBounded(t *testing.T) {
+	t.Parallel()
 	const n = 1000
 	db := joinTables(t, n)
 

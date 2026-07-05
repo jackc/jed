@@ -28,6 +28,7 @@ func bigTableAV(t *testing.T, n int) *Session {
 }
 
 func TestOrInPointSetMultiLeaf(t *testing.T) {
+	t.Parallel()
 	const n = 1000
 	db := bigTableAV(t, n)
 
@@ -86,6 +87,7 @@ func TestOrInPointSetMultiLeaf(t *testing.T) {
 // Bind parameters and a correlated outer column flow through the point-set encode path (encodeKeySet
 // resolves reParam / reOuterColumn per the same rules as the single point-lookup bound).
 func TestOrInPointSetParamsAndCorrelated(t *testing.T) {
+	t.Parallel()
 	db := dbWith(t,
 		"CREATE TABLE t (id i32 PRIMARY KEY, a i32)",
 		"INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40)")
@@ -122,6 +124,7 @@ func TestOrInPointSetParamsAndCorrelated(t *testing.T) {
 // path (the vectorized-aggregate fast path declines a point-set bound), so the answer and the
 // sublinear cost are both correct.
 func TestOrInPointSetAggregate(t *testing.T) {
+	t.Parallel()
 	const n = 1000
 	db := bigTableAV(t, n)
 	full, err := queryOutcome(db, "SELECT count(*) FROM t", nil)
@@ -143,6 +146,7 @@ func TestOrInPointSetAggregate(t *testing.T) {
 // UPDATE / DELETE bound by the PK point set seek the listed rows at sublinear cost and leave the rest
 // intact (the mutation analog of the SELECT bound).
 func TestOrInPointSetMutation(t *testing.T) {
+	t.Parallel()
 	const n = 1000
 	db := bigTableAV(t, n)
 
@@ -176,6 +180,7 @@ func TestOrInPointSetMutation(t *testing.T) {
 // EXPLAIN surfaces the point-set access path (the label the corpus pins on single-leaf, re-asserted
 // here as the introspection contract; also the secondary-index variant).
 func TestOrInPointSetExplain(t *testing.T) {
+	t.Parallel()
 	db := dbWith(t,
 		"CREATE TABLE t (id i32 PRIMARY KEY, a i32)",
 		"INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)",

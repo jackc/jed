@@ -78,6 +78,7 @@ func uqNames(t *testing.T, db dbHandle, table string) []string {
 // relation namespace and the table's check names; an explicit CONSTRAINT name is the
 // index name as written.
 func TestUniqueConstraintNamingMatchesPostgres(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	uqRun(t, db, "CREATE TABLE other (x i32)")
 	uqRun(t, db, "CREATE INDEX walk_a_key ON other (x)") // occupies the derived base
@@ -97,6 +98,7 @@ func TestUniqueConstraintNamingMatchesPostgres(t *testing.T) {
 // member lists fold into one (the first explicitly-named one's name wins); a list
 // identical to the primary key's folds away entirely; a differing ORDER is distinct.
 func TestUniqueDedupAndPKFoldMatchPostgres(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	uqRun(t, db, "CREATE TABLE e3 (a i32 UNIQUE UNIQUE, UNIQUE (a))")
 	if got := uqNames(t, db, "e3"); !slices.Equal(got, []string{"e3_a_key!"}) {
@@ -137,6 +139,7 @@ func TestUniqueDedupAndPKFoldMatchPostgres(t *testing.T) {
 // 42P07 (relation namespace, including the table being created) before 42710 (the
 // table's constraint names).
 func TestUniqueDDLErrorsMatchPostgres(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	uqRun(t, db, "CREATE TABLE other (x i32)")
 	if code, _ := uqErr(t, db, "CREATE TABLE e2 (a i32, UNIQUE (nosuch))"); code != "42703" {
@@ -188,6 +191,7 @@ func TestUniqueDDLErrorsMatchPostgres(t *testing.T) {
 // the violation precedence is CHECK before PK before UNIQUE, and among unique indexes
 // the catalog (name) order.
 func TestUniqueInsertEnforcement(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	uqRun(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32 UNIQUE, w i32, "+
 		"CONSTRAINT wv UNIQUE (w, v), CHECK (id < 100))")
@@ -239,6 +243,7 @@ func TestUniqueInsertEnforcement(t *testing.T) {
 // documented PG divergence): self-resolving rewrites succeed; genuine conflicts with
 // untouched rows and in-batch collisions trap 23505; nothing is written on failure.
 func TestUniqueUpdateEnforcementEndState(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	uqRun(t, db, "CREATE TABLE m (id i32 PRIMARY KEY, v i32 UNIQUE)")
 	uqRun(t, db, "INSERT INTO m VALUES (1, 1), (2, 2), (3, 30)")
@@ -276,6 +281,7 @@ func TestUniqueUpdateEnforcementEndState(t *testing.T) {
 // duplicate traps 23505 and creates nothing (the name stays free); NULLs are exempt;
 // thereafter it enforces like a constraint-backed index. The auto-name keeps _idx.
 func TestCreateUniqueIndexBuild(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	uqRun(t, db, "CREATE TABLE d (id i32 PRIMARY KEY, a i32, n i32)")
 	uqRun(t, db, "INSERT INTO d VALUES (1, 7, NULL), (2, 7, NULL), (3, 8, 5)")
@@ -305,6 +311,7 @@ func TestCreateUniqueIndexBuild(t *testing.T) {
 // (the documented PG divergence — indexes.md §7: jed has no ALTER TABLE, so the index
 // name is the constraint's only handle).
 func TestDropIndexDropsTheConstraint(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	uqRun(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32 UNIQUE)")
 	uqRun(t, db, "INSERT INTO t VALUES (1, 10)")
@@ -322,6 +329,7 @@ func TestDropIndexDropsTheConstraint(t *testing.T) {
 // table still costs 0, and a CREATE UNIQUE INDEX build charges exactly the plain build's
 // scan. The planner treats a unique index like any other (the bounded-scan cost).
 func TestUniqueCostsAreUnchanged(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	uqRun(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32)")
 	for i := 1; i <= 20; i++ {
@@ -345,6 +353,7 @@ func TestUniqueCostsAreUnchanged(t *testing.T) {
 // The v6 round-trip: the unique flag survives serialize -> load (and the reloaded
 // database still enforces), and the image is byte-stable across a second serialize.
 func TestUniqueRoundTrip(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	uqRun(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32 UNIQUE, w i32)")
 	uqRun(t, db, "CREATE INDEX plain ON t (w)")
@@ -376,6 +385,7 @@ func TestUniqueRoundTrip(t *testing.T) {
 // Transactional DDL: a UNIQUE created inside a rolled-back block leaves no trace — no
 // definition, no store, no enforcement (the §3 snapshot model).
 func TestUniqueTransactionalDDLRollsBack(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	uqRun(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 	uqRun(t, db, "INSERT INTO t VALUES (1, 10)")

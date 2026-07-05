@@ -37,6 +37,7 @@ func errCode(t *testing.T, db dbHandle, sql string) string {
 }
 
 func TestSubqueryCostAddedOnce(t *testing.T) {
+	t.Parallel()
 	db := subqueryAB(t)
 	base, _ := queryOutcome(db, "SELECT id FROM a WHERE k = 999", nil)
 	withSub, _ := queryOutcome(db, "SELECT id FROM a WHERE k = (SELECT max(k) FROM b)", nil)
@@ -50,6 +51,7 @@ func TestSubqueryCostAddedOnce(t *testing.T) {
 // ---- a correlated subquery's structural error is raised at plan time (kept per review) ------
 
 func TestCorrelatedInnerErrorOverEmptyOuter(t *testing.T) {
+	t.Parallel()
 	// The subquery is PLANNED once, so a structural error (here >1 column) is raised even when the
 	// outer query is empty and the subquery never executes (PostgreSQL parity). The corpus pins the
 	// same guarantee via an empty inner filter, not an empty outer — so this trigger shape is kept.
@@ -71,6 +73,7 @@ func TestCorrelatedInnerErrorOverEmptyOuter(t *testing.T) {
 // subquery reads the pre-statement snapshot (DELETE collects keys first; UPDATE writes in phase 2).
 
 func TestDeleteCorrelatedSubqueryCostIsPerRow(t *testing.T) {
+	t.Parallel()
 	// A correlated DELETE subquery re-runs per scanned row; an uncorrelated one folds once. The
 	// correlated cost therefore exceeds the uncorrelated baseline on the same data — proving the
 	// per-row execution. Both are deterministic + cross-core identical (CLAUDE.md §13).
@@ -87,6 +90,7 @@ func TestDeleteCorrelatedSubqueryCostIsPerRow(t *testing.T) {
 // inside and outside, and a correlated subquery may compare a $N against the outer row.
 
 func TestParamInsideSubqueryInnerContext(t *testing.T) {
+	t.Parallel()
 	db := subqueryAB(t)
 	// $1 typed by `b.k = $1` (inner) AND correlated to the outer a.k: survive iff some b.k equals
 	// both $1 and a.k. a.k ∈ {10,20,30}, b.k ∈ {20,30,40}; with $1=20 only a.id=2 survives.
@@ -104,6 +108,7 @@ func TestParamInsideSubqueryInnerContext(t *testing.T) {
 }
 
 func TestParamInsideSubqueryUninferableIs42P18(t *testing.T) {
+	t.Parallel()
 	// A $N whose only position is a context-free select-list slot can't be typed -> 42P18, even
 	// with a value bound (the type, not the value, is missing). PG diverges (defaults to text).
 	db := subqueryAB(t)

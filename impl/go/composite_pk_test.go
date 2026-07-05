@@ -25,6 +25,7 @@ func compositeErrCode(t *testing.T, db dbHandle, sql string) string {
 // tuple's lexicographic order (the concatenated key — first component, then the second
 // breaking its ties), independent of insertion order.
 func TestCompositeKeyOrdersByTuple(t *testing.T) {
+	t.Parallel()
 	db := dbWith(t, "CREATE TABLE t (a i32, b i32, v i16, PRIMARY KEY (a, b))")
 	tab, _ := db.Table("t")
 	if got := tab.PKIndices(); !slices.Equal(got, []int{0, 1}) {
@@ -70,6 +71,7 @@ func TestCompositeKeyOrdersByTuple(t *testing.T) {
 // Uniqueness is over the WHOLE tuple: a shared prefix is fine, a duplicate tuple traps
 // 23505 — both against the store and within one INSERT's batch (two-phase, nothing stored).
 func TestCompositeUniquenessIsTheWholeTuple(t *testing.T) {
+	t.Parallel()
 	db := dbWith(
 		t,
 		"CREATE TABLE t (a i32, b i32, PRIMARY KEY (a, b))",
@@ -94,6 +96,7 @@ func TestCompositeUniquenessIsTheWholeTuple(t *testing.T) {
 // 42701, more than one primary key across both forms 42P16 — plus the jed narrowings
 // (0A000): out-of-declaration-order list, non-keyable member type.
 func TestCompositeDDLErrorsMatchPostgresAndNarrowings(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	if _, err := queryOutcome(db, "CREATE TYPE addr AS (street text, zip i32)", nil); err != nil {
 		t.Fatal(err)
@@ -155,6 +158,7 @@ func TestCompositeDDLErrorsMatchPostgresAndNarrowings(t *testing.T) {
 // re-keys the row (§11 step 6 — the narrowing is lifted) instead of trapping 0A000; a
 // non-member updates in place.
 func TestCompositeMembersNotNullAndRekey(t *testing.T) {
+	t.Parallel()
 	db := dbWith(
 		t,
 		"CREATE TABLE t (a i32, b i32, v i16, PRIMARY KEY (a, b))",
@@ -181,6 +185,7 @@ func TestCompositeMembersNotNullAndRekey(t *testing.T) {
 // Mixed fixed-width components (uuid first, i32 second) concatenate per encoding.md
 // §2.3 and iterate in tuple order — uuid bytes compare first, the int breaks ties.
 func TestCompositeMixedUuidIntComponentsOrder(t *testing.T) {
+	t.Parallel()
 	db := dbWith(t, "CREATE TABLE t (u uuid, n i32, PRIMARY KEY (u, n))")
 	for _, stmt := range []string{
 		"INSERT INTO t VALUES ('ffffffff-ffff-ffff-ffff-ffffffffffff', -5)",
@@ -205,6 +210,7 @@ func TestCompositeMixedUuidIntComponentsOrder(t *testing.T) {
 // 23505 after the reload. Guards the format.go hasPK seam — a composite-PK table must
 // not be mistaken for a rowid table on load.
 func TestCompositeRoundTripsThroughTheOnDiskImage(t *testing.T) {
+	t.Parallel()
 	db := dbWith(
 		t,
 		"CREATE TABLE t (a i32, b i32, v i16, PRIMARY KEY (a, b))",

@@ -15,6 +15,7 @@ import (
 )
 
 func TestLZ4EncoderMatchesThePinnedVectors(t *testing.T) {
+	t.Parallel()
 	rows := readTomlTables(t, specPath(t, "fileformat/lz4_vectors.toml"), "vector")
 	if len(rows) < 10 {
 		t.Fatalf("vector corpus unexpectedly small: %d", len(rows))
@@ -40,6 +41,7 @@ func TestLZ4EncoderMatchesThePinnedVectors(t *testing.T) {
 }
 
 func TestLZ4MalformedBlocksAreDataCorrupted(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name   string
 		comp   []byte

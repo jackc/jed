@@ -30,6 +30,7 @@ func specPath(t *testing.T, rel string) string {
 }
 
 func TestScalarTypesMatchSpec(t *testing.T) {
+	t.Parallel()
 	tables := readTomlTables(t, specPath(t, "types/scalars.toml"), "type")
 
 	// The storable scalar types are exactly the three integers; each maps to a
@@ -183,6 +184,7 @@ func mustType(t *testing.T, name string) scalarType {
 }
 
 func TestErrorCodesAreRegistered(t *testing.T) {
+	t.Parallel()
 	// The generated SqlState table (codegen middle path, CLAUDE.md §5) must match the canonical
 	// registry. The drift gate (`rake verify`) pins the generated file; this test additionally
 	// compiles the generated Errors slice in and asserts it matches registry.toml row-for-row
@@ -213,6 +215,7 @@ func TestErrorCodesAreRegistered(t *testing.T) {
 }
 
 func TestOperatorsMatchSpec(t *testing.T) {
+	t.Parallel()
 	// The generated operator descriptor table (codegen middle path, CLAUDE.md §5) must
 	// match the canonical catalog field-for-field.
 	rows := readTomlTables(t, specPath(t, "functions/catalog.toml"), "operator")
@@ -281,6 +284,7 @@ func TestOperatorsMatchSpec(t *testing.T) {
 }
 
 func TestAggregatesMatchSpec(t *testing.T) {
+	t.Parallel()
 	// The generated aggregate descriptor table must match the canonical catalog's
 	// [[aggregate]] rows field-for-field (codegen middle path, CLAUDE.md §5). Aggregates are
 	// overloaded across operand families (one row per (name, arg_families)), like operators.
@@ -324,6 +328,7 @@ func TestAggregatesMatchSpec(t *testing.T) {
 }
 
 func TestSetReturningMatchSpec(t *testing.T) {
+	t.Parallel()
 	// The generated set-returning descriptor table must match the canonical catalog's
 	// [[set_returning]] rows field-for-field (codegen middle path, CLAUDE.md §5). SRFs are
 	// overloaded across ARITY (one row per (name, arity)) — functions.md §10.
@@ -374,6 +379,7 @@ func TestSetReturningMatchSpec(t *testing.T) {
 }
 
 func TestCostScheduleMatchesSpec(t *testing.T) {
+	t.Parallel()
 	// The generated cost schedule (codegen middle path, CLAUDE.md §5/§13) must match the
 	// canonical schedule.toml weight-for-weight. Cost is a cross-core contract (§8):
 	// every core reads these weights.
@@ -441,6 +447,7 @@ func TestCostScheduleMatchesSpec(t *testing.T) {
 // matching kernel id, or with a result code no interpreter handles, fails here — not silently at
 // some query's resolve.
 func TestRegistryCoversCatalog(t *testing.T) {
+	t.Parallel()
 	probe := func(fam string) resolvedType {
 		switch fam {
 		case "decimal":
@@ -588,6 +595,7 @@ func TestRegistryCoversCatalog(t *testing.T) {
 // (the latent gap this guards against — a mis-parsed key on a multi-column index with a
 // text/decimal/bytea/interval trailing key column under an equality on the leading column).
 func TestIsFixedWidthPartitionsWidthBytes(t *testing.T) {
+	t.Parallel()
 	for _, st := range allScalarTypes() {
 		if got, want := st.IsFixedWidth(), st.WidthBytes() != 0; got != want {
 			t.Errorf("%v: IsFixedWidth=%v but WidthBytes=%d", st, got, st.WidthBytes())

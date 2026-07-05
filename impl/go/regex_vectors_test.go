@@ -116,6 +116,7 @@ func parsePairs(val string) []int64 {
 }
 
 func TestRegexProgramVectors(t *testing.T) {
+	t.Parallel()
 	blocks := parseCaseBlocks(t, specPath(t, "regex/program_vectors.toml"))
 	if len(blocks) < 25 {
 		t.Fatalf("expected the full vector set, got %d", len(blocks))
@@ -150,6 +151,7 @@ func TestRegexProgramVectors(t *testing.T) {
 }
 
 func TestRegexMatchVectors(t *testing.T) {
+	t.Parallel()
 	blocks := parseCaseBlocks(t, specPath(t, "regex/match_vectors.toml"))
 	if len(blocks) < 25 {
 		t.Fatalf("expected the full vector set, got %d", len(blocks))

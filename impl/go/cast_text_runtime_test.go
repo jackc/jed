@@ -51,6 +51,7 @@ func castErrAt(t *testing.T, db dbHandle, expr string, id int) string {
 // --- (a) jed-stricter grammar divergences on the RUNTIME path -------------------------------------
 
 func TestRuntimeTextCastGrammarDivergences(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		s, expr string
 	}{
@@ -69,6 +70,7 @@ func TestRuntimeTextCastGrammarDivergences(t *testing.T) {
 // --- (b) runtime text → f32/f64 (out of the corpus: float render is determinism-exempt) ----------
 
 func TestRuntimeTextToF64Finite(t *testing.T) {
+	t.Parallel()
 	db := seededText(t, "1.5", "-0.25", "100", "1e3")
 	for id, want := range map[int]float64{1: 1.5, 2: -0.25, 3: 100, 4: 1000} {
 		v := castAt(t, db, "s :: float8", id)
@@ -79,6 +81,7 @@ func TestRuntimeTextToF64Finite(t *testing.T) {
 }
 
 func TestRuntimeTextToF32Frounds(t *testing.T) {
+	t.Parallel()
 	db := seededText(t, "0.5", "3.14")
 	if v := castAt(t, db, "s :: float4", 1); v.Kind != ValFloat32 || v.F32() != 0.5 {
 		t.Fatalf("0.5::float4 = %v", v)
@@ -89,6 +92,7 @@ func TestRuntimeTextToF32Frounds(t *testing.T) {
 }
 
 func TestRuntimeTextToFloatSpecialWords(t *testing.T) {
+	t.Parallel()
 	db := seededText(t, "NaN", "Infinity", "-inf")
 	if v := castAt(t, db, "s :: float8", 1); v.Kind != ValFloat64 || !math.IsNaN(v.F64()) {
 		t.Fatalf("NaN::float8 = %v", v)
@@ -102,6 +106,7 @@ func TestRuntimeTextToFloatSpecialWords(t *testing.T) {
 }
 
 func TestRuntimeTextToFloatOverflowAndMalformed(t *testing.T) {
+	t.Parallel()
 	db := seededText(t, "1e400", "abc")
 	// a FINITE literal beyond binary64 range traps 22003 (not ±Inf — the finite-overflow rule)
 	if code := castErrAt(t, db, "s :: float8", 1); code != "22003" {
@@ -113,6 +118,7 @@ func TestRuntimeTextToFloatOverflowAndMalformed(t *testing.T) {
 }
 
 func TestRuntimeTextToFloatNullPropagates(t *testing.T) {
+	t.Parallel()
 	db := dbWith(t,
 		"CREATE TABLE t (id i32 PRIMARY KEY, s text)",
 		"INSERT INTO t VALUES (1, NULL)")

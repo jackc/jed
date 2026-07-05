@@ -68,6 +68,7 @@ func corruptOverflowPayloads(t *testing.T, path string) {
 // walk reads headers only), untouching queries succeed (no chain read, no decompression), and
 // touching the spilled column fails XX001 — read-on-touch, physically.
 func TestLazyChainsAreReadOnlyWhenTouched(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "lazy_touch.jed")
 	db, err := create(path, databaseOptions{PageSize: lazyPageSize, noSync: true})
 	if err != nil {
@@ -117,6 +118,7 @@ func TestLazyChainsAreReadOnlyWhenTouched(t *testing.T) {
 
 // All three lazy forms materialize exactly through the paged path (resolution correctness).
 func TestLazyValuesRoundTripExactly(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "lazy_roundtrip.jed")
 	db, err := create(path, databaseOptions{PageSize: lazyPageSize, noSync: true})
 	if err != nil {
@@ -150,6 +152,7 @@ func TestLazyValuesRoundTripExactly(t *testing.T) {
 // rows resolve at commit, and a reopen reads everything back exactly (large-values.md §14 —
 // resolve-at-commit; chain sharing stays the deferred follow-on).
 func TestLazyUpdateOfOtherColumnsPreservesSpilledValues(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "lazy_update.jed")
 	big := fillerText(600)
 	db, err := create(path, databaseOptions{PageSize: lazyPageSize, noSync: true})
@@ -191,6 +194,7 @@ func TestLazyUpdateOfOtherColumnsPreservesSpilledValues(t *testing.T) {
 // in-memory database charge identical costs for the same queries — the unfetched-reference
 // units equal the resident disposition plan's by construction.
 func TestLazyPagedAndResidentCostsMatch(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "lazy_cost.jed")
 	mem := newInMemoryWithPageSize(lazyPageSize).Session(SessionOptions{})
 	lazySeed(t, mem)

@@ -10,6 +10,7 @@ import (
 )
 
 func TestDateVectors(t *testing.T) {
+	t.Parallel()
 	cases := readTimestampCases(t, specPath(t, "encoding/dates.toml"))
 	if len(cases) == 0 {
 		t.Fatal("no date vectors parsed")

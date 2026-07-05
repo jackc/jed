@@ -52,6 +52,7 @@ func reclaimSetup(t *testing.T, path string, rows int) *engine {
 }
 
 func TestWithinSessionChurnStaysBoundedAndReopensFromPersistedFreeList(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "reclaim_reuse.jed")
 	db := reclaimSetup(t, path, 30) // a multi-level tree at page 256
 	pad := strings.Repeat("y", 40)
@@ -147,6 +148,7 @@ func countFreelistPages(b []byte) int {
 // file stays bounded — the persisted-free-list byte contract a static golden cannot pin (it depends on
 // commit history; format.md *Free-list page*).
 func TestPersistedFreeListHeadsAPageType7Chain(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "reclaim_persisted.jed")
 	db := reclaimSetup(t, path, 40)
 	big := strings.Repeat("z", 40)
@@ -186,6 +188,7 @@ func TestPersistedFreeListHeadsAPageType7Chain(t *testing.T) {
 }
 
 func TestHeavyInsertDeleteChurnReopensWithReuse(t *testing.T) {
+	t.Parallel()
 	// Insert/delete churn dirties a different node set than updates (split/merge rebalance) and, across
 	// a reopen, exercises reuse over both. The live snapshot must reopen exactly.
 	path := filepath.Join(t.TempDir(), "reclaim_churn.jed")
@@ -221,6 +224,7 @@ func TestHeavyInsertDeleteChurnReopensWithReuse(t *testing.T) {
 }
 
 func TestTornCommitAfterReuseFallsBackToPriorSnapshot(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "reclaim_torn.jed")
 	db := reclaimSetup(t, path, 20)
 	pad := strings.Repeat("w", 40)
@@ -307,6 +311,7 @@ func (s *countingStore) readAt(off int64, length int) ([]byte, error) {
 // spine). The block-read count must stay well below the leaf count, and above all must not scale with
 // it. A counting blockStore is the only way to see this (it is not SQL-observable).
 func TestOpenReadsInteriorSpineNotEveryLeaf(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "open_spine_only.jed")
 	// A many-leaf table (page 256, ~4 rows/leaf) so "every leaf" is a large, distinctive number.
 	db := reclaimSetup(t, path, 400)

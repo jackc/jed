@@ -26,6 +26,7 @@ func wantErr(t *testing.T, db dbHandle, sql, code string) {
 }
 
 func TestCreatesTableWithResolvedTypesAndPK(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	out := mustCreate(t, db, "CREATE TABLE nums (id i32 PRIMARY KEY, small i16, big i64)")
 	if out.Kind != outcomeStatement {
@@ -54,6 +55,7 @@ func TestCreatesTableWithResolvedTypesAndPK(t *testing.T) {
 }
 
 func TestSQLStandardTypeAliasesResolve(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	mustCreate(t, db, "CREATE TABLE t (a smallint, b integer, c int, d bigint)")
 	tbl, _ := db.Table("t")
@@ -66,6 +68,7 @@ func TestSQLStandardTypeAliasesResolve(t *testing.T) {
 }
 
 func TestTableAndTypeNamesAreCaseInsensitive(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	mustCreate(t, db, "create table T (Id I32 primary key)")
 	if _, ok := db.Table("t"); !ok {
@@ -77,17 +80,20 @@ func TestTableAndTypeNamesAreCaseInsensitive(t *testing.T) {
 }
 
 func TestDuplicateTableIsRejected(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	mustCreate(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	wantErr(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)", "42P07")
 }
 
 func TestDuplicateColumnIsRejected(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	wantErr(t, db, "CREATE TABLE t (a i32, a i16)", "42701")
 }
 
 func TestUnknownTypeIsRejected(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	wantErr(t, db, "CREATE TABLE t (a int128)", "42704")
 	// The old jed bit-names are a CLEAN BREAK — replaced by the i/f prefix, no longer
@@ -97,6 +103,7 @@ func TestUnknownTypeIsRejected(t *testing.T) {
 }
 
 func TestPGByteShorthandTypeNamesAreAccepted(t *testing.T) {
+	t.Parallel()
 	// The i/f prefix makes jed's bit-namespace (i8…i64) lexically disjoint from PG's
 	// byte-namespace, so PG's byte-shorthand is accepted as aliases (CLAUDE.md §1/§4;
 	// types.md §11): int2→i16, int4→i32, int8→i64, float4→f32, float8→f64. There is no
@@ -113,11 +120,13 @@ func TestPGByteShorthandTypeNamesAreAccepted(t *testing.T) {
 }
 
 func TestMultiplePrimaryKeysAreRejected(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	wantErr(t, db, "CREATE TABLE t (a i32 PRIMARY KEY, b i32 PRIMARY KEY)", "42P16")
 }
 
 func TestSyntaxErrorsAreReported(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	wantErr(t, db, "CREATE TABLE t", "42601")
 	wantErr(t, db, "CREATE TABLE t (a i32,)", "42601")

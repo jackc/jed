@@ -72,6 +72,7 @@ func siDB20(t *testing.T) *Session {
 // allowed and named through; an explicit name round-trips as written. The catalog holds
 // indexes in ascending lowercased-name order.
 func TestIndexAutoNamingMatchesPostgres(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	siRun(t, db, "CREATE TABLE T (A i32 PRIMARY KEY, B i32)")
 	siRun(t, db, "CREATE INDEX ON T (B)")    // t_b_idx
@@ -101,6 +102,7 @@ func TestIndexAutoNamingMatchesPostgres(t *testing.T) {
 // table → columns (list order) → name collision; the relation namespace is shared with
 // tables; DROP mismatches are 42704/42809.
 func TestIndexDDLErrorsMatchPostgres(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	siRun(t, db, "CREATE TABLE t (a i32 PRIMARY KEY, s f64)")
 	if got := siErr(t, db, "CREATE INDEX i ON nosuch (nope)"); got != "42P01" {
@@ -160,6 +162,7 @@ func TestIndexDDLErrorsMatchPostgres(t *testing.T) {
 // index-bounded form (cost.md §3 "index-bounded scan"); a provably-empty bound reads
 // nothing; the PK bound wins over an index; the lowest-named index breaks ties.
 func TestIndexPlannerCostsArePinned(t *testing.T) {
+	t.Parallel()
 	db := siDB20(t)
 	pin := func(sql string, want int64) {
 		t.Helper()
@@ -194,6 +197,7 @@ func TestIndexPlannerCostsArePinned(t *testing.T) {
 // list, and a second-generation serialize are byte-stable; a reloaded database still
 // uses (and maintains) its indexes.
 func TestIndexRoundTripsThroughTheImage(t *testing.T) {
+	t.Parallel()
 	db := siDB20(t)
 	siRun(t, db, "CREATE INDEX t_v_idx ON t (v)")
 	siRun(t, db, "INSERT INTO t VALUES (100, NULL, 0)")
@@ -228,6 +232,7 @@ func TestIndexRoundTripsThroughTheImage(t *testing.T) {
 // Index DDL is transactional (transactions.md §4.5): a CREATE INDEX inside a rolled-back
 // block vanishes (definition and store), and one inside a committed block persists.
 func TestIndexDDLIsTransactional(t *testing.T) {
+	t.Parallel()
 	db := siDB20(t)
 	siRun(t, db, "BEGIN")
 	siRun(t, db, "CREATE INDEX t_v_idx ON t (v)")
@@ -255,6 +260,7 @@ func TestIndexDDLIsTransactional(t *testing.T) {
 // cost (page_read is logical — buffer-pool-invisible), and stays maintainable across
 // commits.
 func TestIndexFileBackedPagedReopen(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "secondary_index_paged.jed")
 	db, err := create(path, databaseOptions{PageSize: 256, noSync: true})
 	if err != nil {
@@ -301,6 +307,7 @@ func TestIndexFileBackedPagedReopen(t *testing.T) {
 // The CREATE INDEX build scan honors the cost ceiling (CLAUDE.md §13): a ceiling below
 // the build cost aborts deterministically with 54P01 and registers nothing.
 func TestCreateIndexHonorsTheCostCeiling(t *testing.T) {
+	t.Parallel()
 	db := siDB20(t)
 	db.SetMaxCost(10) // the build scan costs 21
 	if got := siErr(t, db, "CREATE INDEX t_v_idx ON t (v)"); got != "54P01" {

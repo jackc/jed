@@ -37,6 +37,7 @@ func splitShapeDB(t *testing.T, shuffled bool) *engine {
 }
 
 func TestSplitShapeCostsArePinned(t *testing.T) {
+	t.Parallel()
 	pin := func(db *engine, sql string, want int64) {
 		t.Helper()
 		if got := siCost(t, db, sql); got != want {

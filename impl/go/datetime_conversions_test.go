@@ -24,6 +24,7 @@ func dtErrCode(t *testing.T, db dbHandle, sql string) string {
 }
 
 func TestExtractJulianIsDeferred(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	if c := dtErrCode(t, db, "SELECT EXTRACT(julian FROM timestamp '2024-03-15 00:00:00')"); c != "0A000" {
 		t.Fatalf("julian/timestamp: got %s, want 0A000", c)
@@ -34,6 +35,7 @@ func TestExtractJulianIsDeferred(t *testing.T) {
 }
 
 func TestDatePartIsDeferred(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	if c := dtErrCode(t, db, "SELECT date_part('hour', timestamp '2024-03-15 13:00:00')"); c != "42883" {
 		t.Fatalf("date_part: got %s, want 42883", c)
@@ -41,6 +43,7 @@ func TestDatePartIsDeferred(t *testing.T) {
 }
 
 func TestExtractFromInfinityTraps(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	if c := dtErrCode(t, db, "SELECT EXTRACT(year FROM timestamp 'infinity')"); c != "22003" {
 		t.Fatalf("extract year/infinity: got %s, want 22003", c)
@@ -51,6 +54,7 @@ func TestExtractFromInfinityTraps(t *testing.T) {
 }
 
 func TestNonDatetimeSourceToDatetimeIsDeferred(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	if c := dtErrCode(t, db, "SELECT CAST(1 + 1 AS timestamp)"); c != "0A000" {
 		t.Fatalf("int->timestamp: got %s, want 0A000", c)

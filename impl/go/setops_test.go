@@ -17,6 +17,7 @@ func setopAB(t *testing.T) *Session {
 }
 
 func TestSetOpDispatchReturnsQuery(t *testing.T) {
+	t.Parallel()
 	db := setopAB(t)
 	out, err := queryOutcome(db, "SELECT k FROM a UNION SELECT k FROM b", nil)
 	if err != nil {

@@ -63,6 +63,7 @@ func rowsSorted(t *testing.T, db dbHandle, sql string) []string {
 // aggregate, join, subquery, correlated, index, window, CTE, container element/field access). For
 // each, a paged reopen and an in-memory seed must agree on both rows and cost.
 func TestLazyInlineValuesMatchResidentAcrossQueryShapes(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "l2_shapes.jed")
 	db, err := create(path, databaseOptions{PageSize: DefaultPageSize, noSync: true})
 	if err != nil {
@@ -136,6 +137,7 @@ func TestLazyInlineValuesMatchResidentAcrossQueryShapes(t *testing.T) {
 // generalized to inline values). Applying the identical sequence to a resident database must reach
 // the identical final state.
 func TestLazyInlineMutationsPreserveUntouchedValues(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "l2_mutations.jed")
 	db, err := create(path, databaseOptions{PageSize: DefaultPageSize, noSync: true})
 	if err != nil {
@@ -192,6 +194,7 @@ func TestLazyInlineMutationsPreserveUntouchedValues(t *testing.T) {
 // open and untouching queries succeed — while touching the column runs the real decode and surfaces
 // XX001. The inline analogue of TestLazyChainsAreReadOnlyWhenTouched.
 func TestLazyUntouchedCorruptInlineBodyDefersError(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "l2_corrupt.jed")
 	marker := "Zq7Zq7Zq7Zq7Zq7Zq7Zq7Zq7Zq7Zq7Zq" // 32 chars, no overlap with catalog text
 	db, err := create(path, databaseOptions{PageSize: DefaultPageSize, noSync: true})
@@ -264,6 +267,7 @@ func TestLazyUntouchedCorruptInlineBodyDefersError(t *testing.T) {
 // inline pass-through, tag 21). Under a tiny work_mem the sort spills many runs; the result must
 // still equal the in-memory sort.
 func TestLazyUntouchedDeferredColumnRidesSpillingSort(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "l2_spill.jed")
 	mem := memDB().Session(SessionOptions{})
 	db, err := create(path, databaseOptions{PageSize: DefaultPageSize, noSync: true})
@@ -314,6 +318,7 @@ func TestLazyUntouchedDeferredColumnRidesSpillingSort(t *testing.T) {
 // cap == len. Mirrors the Rust faulted_leaf_shares_one_block_across_deferred_values and the TS
 // equivalent.
 func TestLazyInlineFaultedLeafSharesPageBlock(t *testing.T) {
+	t.Parallel()
 	i32 := scalarColType(scalarInt32)
 	// Variable-length / structured columns so every present value defers (§6); the i32 column stays
 	// eagerly decoded (deferring a fixed-width scalar buys nothing).
@@ -413,6 +418,7 @@ func TestLazyInlineFaultedLeafSharesPageBlock(t *testing.T) {
 // evaluator's column access takes when the static touched set missed. Mirrors the Rust
 // packed_leaf_reconstructs_only_touched_columns.
 func TestPackedLeafTouchedColumnsAndSelfResolution(t *testing.T) {
+	t.Parallel()
 	colTypes := []colType{
 		scalarColType(scalarInt32),
 		scalarColType(scalarText),

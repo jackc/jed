@@ -38,6 +38,7 @@ func depthChain(n int) string {
 }
 
 func TestDepthLimitIsGenerous(t *testing.T) {
+	t.Parallel()
 	// Far above any realistic query, so ordinary SQL is never rejected (spec/design/cost.md §7).
 	if maxExprDepth != 256 {
 		t.Fatalf("maxExprDepth = %d, want 256", maxExprDepth)
@@ -45,6 +46,7 @@ func TestDepthLimitIsGenerous(t *testing.T) {
 }
 
 func TestDepthDeepOperatorChainAborts(t *testing.T) {
+	t.Parallel()
 	db := depthDB(t)
 	// One level past the limit aborts at parse time (the additive loop's counter, O(1) stack).
 	if c := codeOf(db, depthChain(maxExprDepth)); c != "54001" {
@@ -60,6 +62,7 @@ func TestDepthDeepOperatorChainAborts(t *testing.T) {
 }
 
 func TestDepthExactBoundary(t *testing.T) {
+	t.Parallel()
 	// Pin the precise accept/reject boundary at the parser (where the 54001 is raised): a `1+1+…`
 	// chain parses with O(1) parser stack, so maxExprDepth-1 levels parse fine and maxExprDepth is
 	// the first rejected depth. This is the cross-core contract the corpus mirrors.
@@ -73,6 +76,7 @@ func TestDepthExactBoundary(t *testing.T) {
 }
 
 func TestDepthAbortIndependentOfMaxCost(t *testing.T) {
+	t.Parallel()
 	// The overflow this guards strikes during PARSE, before the meter runs — so even an unlimited
 	// (or tiny) ceiling cannot let a stack-busting statement through (CLAUDE.md §13).
 	db := depthDB(t)
@@ -87,6 +91,7 @@ func TestDepthAbortIndependentOfMaxCost(t *testing.T) {
 }
 
 func TestDepthEveryVectorAbortsNotCrashes(t *testing.T) {
+	t.Parallel()
 	// Each recursion vector — nested parens, ARRAY, NOT, unary minus, scalar subqueries, postfix
 	// casts, and UNION chains — is bounded by the same counter and returns 54001 deterministically
 	// rather than overflowing the native stack. n well past the limit for each.
@@ -109,6 +114,7 @@ func TestDepthEveryVectorAbortsNotCrashes(t *testing.T) {
 }
 
 func TestDepthNestingInWhereAndCheckIsBounded(t *testing.T) {
+	t.Parallel()
 	// The guard sits in the parser, so it protects every clause holding an expression — WHERE and a
 	// CHECK constraint included (these reach the pre-resolve structural walks, which the parser
 	// bound keeps shallow).

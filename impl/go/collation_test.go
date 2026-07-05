@@ -49,6 +49,7 @@ func collDefinition(t *testing.T, files []string) string {
 }
 
 func TestCollationCompilerMatchesVectors(t *testing.T) {
+	t.Parallel()
 	rows := readTomlTables(t, specPath(t, "collation/vectors/compiler.toml"), "compiler")
 	if len(rows) == 0 {
 		t.Fatal("no compiler vectors")
@@ -81,6 +82,7 @@ func TestCollationCompilerMatchesVectors(t *testing.T) {
 }
 
 func TestCollationSortKeyMatchesVectorsAndIsAscending(t *testing.T) {
+	t.Parallel()
 	loadFixtureBundle(t)
 	rows := readTomlTables(t, specPath(t, "collation/vectors/sortkey.toml"), "sortkey")
 	if len(rows) == 0 {
@@ -124,6 +126,7 @@ func TestCollationSortKeyMatchesVectorsAndIsAscending(t *testing.T) {
 }
 
 func TestCollationBundleVectorsRoundTripAndMerge(t *testing.T) {
+	t.Parallel()
 	rows := readTomlTables(t, specPath(t, "collation/vectors/bundle.toml"), "bundle")
 	if len(rows) == 0 {
 		t.Fatal("no bundle vectors")
@@ -189,6 +192,7 @@ func TestCollationBundleVectorsRoundTripAndMerge(t *testing.T) {
 }
 
 func TestCollationOpenRejectsTamperedArtifact(t *testing.T) {
+	t.Parallel()
 	coll, err := compileCollation("dev-root", collDefinition(t, []string{"collation/fixtures/dev-root.allkeys"}))
 	if err != nil {
 		t.Fatal(err)
@@ -209,6 +213,7 @@ func TestCollationOpenRejectsTamperedArtifact(t *testing.T) {
 // and full SpecialCasing (ß→SS). The kernels take an EXPLICIT property table, so the un-loaded (ASCII)
 // regime is deterministic regardless of the engine-global loaded set. Mirrors collation.rs casing_tests.
 func TestCasingKernels(t *testing.T) {
+	t.Parallel()
 	p := &propertyTable{
 		Simple: []simpleCase{
 			{0x41, 0x41, 0x61, 0x41}, // A

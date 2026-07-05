@@ -29,6 +29,7 @@ func gistRangesDB(t *testing.T) *Session {
 }
 
 func TestGistCreateAndQuery(t *testing.T) {
+	t.Parallel()
 	db := gistRangesDB(t)
 	// && (overlap) [4,6): [1,5) and [3,8) overlap; the rest / empty / NULL do not.
 	if got := gistIDs(queryRows(t, db, "SELECT id FROM t WHERE r && i32range(4,6) ORDER BY id")); !eqInts(got, 1, 3) {
@@ -54,6 +55,7 @@ func TestGistCreateAndQuery(t *testing.T) {
 }
 
 func TestGistDivergences(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, r i32range, s i32range, f f64, txt text)")
 	// A GiST index on a non-keyable, non-range type (float) → 42704 (no GiST opclass at all, §6).
@@ -86,6 +88,7 @@ func TestGistDivergences(t *testing.T) {
 // fixed-width keyable scalar accelerates `=` — the planner descends the resident R-tree and re-applies
 // `=` as the residual, identical rows to a full scan (duplicates and all) across INSERT/UPDATE/DELETE.
 func TestScalarGistEqualGather(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, room i32)")
 	run(t, db, "CREATE INDEX t_room_gist ON t USING gist (room)")
@@ -121,6 +124,7 @@ func TestScalarGistEqualGather(t *testing.T) {
 // TestScalarGistFileRoundTrip: a scalar `=` GiST index persists (page-5/6 R-tree, v20 — the bound is a
 // [min,max] key blob, distinguished from a range bound by the column's catalog type) and reloads.
 func TestScalarGistFileRoundTrip(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "gist_scalar_round_trip.jed")
 	db, err := create(path, databaseOptions{PageSize: 256, noSync: true})
 	if err != nil {
@@ -153,6 +157,7 @@ func TestScalarGistFileRoundTrip(t *testing.T) {
 // TestGistFileRoundTrip: a GiST index persists to the page-5/6 R-tree (v20) and reloads correctly —
 // the index survives a close/reopen and still accelerates &&/@> to the same rows.
 func TestGistFileRoundTrip(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "gist_round_trip.jed")
 	db, err := create(path, databaseOptions{PageSize: 256, noSync: true})
 	if err != nil {
@@ -199,6 +204,7 @@ func bookingDB(t *testing.T) *Session {
 // TestExcludeRejectsConflict: the canonical no-double-booking constraint — no two rows may share a
 // room AND have overlapping during. Needs the scalar `=` opclass (room) + range_ops (during).
 func TestExcludeRejectsConflict(t *testing.T) {
+	t.Parallel()
 	db := bookingDB(t)
 	run(t, db, "INSERT INTO booking VALUES (1, 101, '[10,20)')")
 	if got := errCode(t, db, "INSERT INTO booking VALUES (2, 101, '[15,25)')"); got != "23P01" {
@@ -214,6 +220,7 @@ func TestExcludeRejectsConflict(t *testing.T) {
 // TestExcludeNullAndEmptyExempt: a NULL excluded column (the NULL rule) or an empty range (empty &&
 // anything is FALSE) makes a row exempt — it never conflicts.
 func TestExcludeNullAndEmptyExempt(t *testing.T) {
+	t.Parallel()
 	db := bookingDB(t)
 	run(t, db, "INSERT INTO booking VALUES (1, 101, '[10,20)')")
 	run(t, db, "INSERT INTO booking VALUES (2, NULL, '[10,20)')") // NULL room → exempt
@@ -227,6 +234,7 @@ func TestExcludeNullAndEmptyExempt(t *testing.T) {
 
 // TestExcludeInBatchConflict: two rows in the SAME insert batch that conflict with each other → 23P01.
 func TestExcludeInBatchConflict(t *testing.T) {
+	t.Parallel()
 	db := bookingDB(t)
 	if got := errCode(t, db, "INSERT INTO booking VALUES (1, 101, '[10,20)'), (2, 101, '[15,25)')"); got != "23P01" {
 		t.Errorf("in-batch conflict: got %s, want 23P01", got)
@@ -239,6 +247,7 @@ func TestExcludeInBatchConflict(t *testing.T) {
 // TestExcludeUpdateEndStateSwap: a swap of rooms succeeds (the per-row transient collides but the END
 // STATE is conflict-free); an UPDATE that creates a genuine conflict traps 23P01.
 func TestExcludeUpdateEndStateSwap(t *testing.T) {
+	t.Parallel()
 	db := bookingDB(t)
 	run(t, db, "INSERT INTO booking VALUES (1, 101, '[10,20)')")
 	run(t, db, "INSERT INTO booking VALUES (2, 102, '[10,20)')")
@@ -254,6 +263,7 @@ func TestExcludeUpdateEndStateSwap(t *testing.T) {
 
 // TestSingleColumnRangeExclude: a single-column range exclusion needs only GX1.
 func TestSingleColumnRangeExclude(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	run(t, db, "CREATE TABLE rsv (id i32 PRIMARY KEY, during i32range, EXCLUDE USING gist (during WITH &&))")
 	run(t, db, "INSERT INTO rsv VALUES (1, '[1,5)')")
@@ -272,6 +282,7 @@ func TestSingleColumnRangeExclude(t *testing.T) {
 // moving to a different room clears the conflict. Needs the multi-column GiST index, so it lives here
 // rather than the oracle corpus (PG needs btree_gist for the scalar `=` member).
 func TestExcludeRescheduleViaUpdate(t *testing.T) {
+	t.Parallel()
 	db := bookingDB(t)
 	run(t, db, "INSERT INTO booking VALUES (1, 101, '[10,20)'), (2, 101, '[30,40)')")
 	// reschedule booking 1 to a free slot → ok
@@ -289,6 +300,7 @@ func TestExcludeRescheduleViaUpdate(t *testing.T) {
 
 // TestExcludeTypeErrors: the WITH operator must pair with the column's GiST opclass.
 func TestExcludeTypeErrors(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	if got := errCode(t, db, "CREATE TABLE a (id i32 PRIMARY KEY, n i32, EXCLUDE USING gist (n WITH &&))"); got != "42704" {
 		t.Errorf("&& on non-range: got %s, want 42704", got)
@@ -309,6 +321,7 @@ func TestExcludeTypeErrors(t *testing.T) {
 
 // TestExcludeBackingIndexCannotBeDropped: the backing GiST index is owned by the constraint → 2BP01.
 func TestExcludeBackingIndexCannotBeDropped(t *testing.T) {
+	t.Parallel()
 	db := bookingDB(t)
 	if got := errCode(t, db, "DROP INDEX booking_room_during_excl"); got != "2BP01" {
 		t.Errorf("drop backing index: got %s, want 2BP01", got)
@@ -318,6 +331,7 @@ func TestExcludeBackingIndexCannotBeDropped(t *testing.T) {
 // TestExcludeFileRoundTrip: the backing multi-column GiST index persists (v21) and reloads, still
 // enforcing the conjunction across a close/reopen.
 func TestExcludeFileRoundTrip(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "gist_exclude_round_trip.jed")
 	db, err := create(path, databaseOptions{PageSize: 256, noSync: true})
 	if err != nil {

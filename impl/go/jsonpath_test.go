@@ -23,6 +23,7 @@ func jpErr(t *testing.T, db dbHandle, sql string) string {
 // PostgreSQL compiles them, so each is a documented divergence; the supported subset is oracle-clean
 // in suites/json/jsonpath_literal.test and jsonpath_query.test.
 func TestJsonpathP1bConstructsAre0A000(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	for _, path := range []string{
 		"$.a.size()",          // item method
@@ -41,6 +42,7 @@ func TestJsonpathP1bConstructsAre0A000(t *testing.T) {
 // A jsonpath value is NOT comparable — every comparison / ORDER BY is 42883 (PG ships no opclass).
 // A documented contract (jsonpath.md §1); only IS [NOT] NULL applies.
 func TestJsonpathIsNotComparable(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	if got := jpErr(t, db, "SELECT '$.a'::jsonpath = '$.a'::jsonpath"); got != "42883" {
 		t.Errorf("jsonpath = jsonpath should be 42883, got %s", got)
@@ -53,6 +55,7 @@ func TestJsonpathIsNotComparable(t *testing.T) {
 // A jsonpath COLUMN is 0A000 — jsonpath is literal-only this slice (P1a, like a J0-stage json
 // column). PostgreSQL allows a jsonpath column, so this is a documented divergence.
 func TestJsonpathColumnIsUnsupported(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	if got := jpErr(t, db, "CREATE TABLE t (p jsonpath)"); got != "0A000" {
 		t.Errorf("a jsonpath column should be 0A000, got %s", got)
@@ -65,6 +68,7 @@ func TestJsonpathColumnIsUnsupported(t *testing.T) {
 // like_regex are a follow-on. PostgreSQL evaluates all of these, so each is a documented divergence;
 // the supported filter + query + match behavior is oracle-clean in suites/json/jsonpath_query.test.
 func TestJsonpathDeferredConstructsAre0A000(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	// An item method.
 	if got := jpErr(t, db, "SELECT jsonb_path_query_array('[1,2,3]', '$[*].double()')"); got != "0A000" {
@@ -84,6 +88,7 @@ func TestJsonpathDeferredConstructsAre0A000(t *testing.T) {
 // valid-but-unsupported construct. (The agreeing 42601 cases live in the corpus; this pins the
 // distinction against the 0A000 ones above.)
 func TestMalformedJsonpathIs42601(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	for _, path := range []string{"$.", "$[", "$[1 to"} {
 		if got := jpErr(t, db, "SELECT '"+path+"'::jsonpath"); got != "42601" {

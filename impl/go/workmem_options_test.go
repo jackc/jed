@@ -14,6 +14,7 @@ import (
 )
 
 func TestOpenOptionsWorkMemZeroIsDefaultBudget(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "wm.jed")
 	seed, err := create(path, databaseOptions{PageSize: DefaultPageSize, noSync: true})
 	if err != nil {

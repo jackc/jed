@@ -33,6 +33,7 @@ func errComposite(t *testing.T, db dbHandle, sql string) string {
 }
 
 func TestCreateTypeRegistersFields(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	runComposite(t, db, "CREATE TYPE addr AS (street text NOT NULL, zip i32)")
 	ct := db.CompositeType("addr")
@@ -58,6 +59,7 @@ func TestCreateTypeRegistersFields(t *testing.T) {
 }
 
 func TestDropTypeRemovesIt(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	runComposite(t, db, "CREATE TYPE addr AS (a i32)")
 	runComposite(t, db, "DROP TYPE addr")
@@ -84,6 +86,7 @@ func queryRendered(t *testing.T, db dbHandle, sql string) [][]string {
 // TestNestedCompositeValueRoundtrip: a nested composite value round-trips and renders with the inner
 // record quoted.
 func TestNestedCompositeValueRoundtrip(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	runComposite(t, db, "CREATE TYPE point AS (x i32, y i32)")
 	runComposite(t, db, "CREATE TYPE seg AS (a point, b point)")
@@ -99,6 +102,7 @@ func TestNestedCompositeValueRoundtrip(t *testing.T) {
 // TestCompositeValuesPersistThroughImage: composite values survive a serialize → load round-trip
 // (the v9 recursive value codec).
 func TestCompositeValuesPersistThroughImage(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	runComposite(t, db, "CREATE TYPE addr AS (street text, zip i32)")
 	runComposite(t, db, "CREATE TABLE p (id i32 PRIMARY KEY, home addr)")
@@ -122,6 +126,7 @@ func TestCompositeValuesPersistThroughImage(t *testing.T) {
 // TestFieldAccessSelectsField (S4): `(expr).field` selects one field; the output column is named
 // after the field. Works on a parenthesized column and a ROW(...) literal.
 func TestFieldAccessSelectsField(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	runComposite(t, db, "CREATE TYPE addr AS (street text, zip i32)")
 	runComposite(t, db, "CREATE TABLE person (id i32 PRIMARY KEY, home addr)")
@@ -141,6 +146,7 @@ func TestFieldAccessSelectsField(t *testing.T) {
 }
 
 func TestNestedTypeSelfOrForwardReferenceIs42704(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	// Forward reference (point not yet defined) — and self-reference — are unknown types.
 	if code := errComposite(t, db, "CREATE TYPE line AS (a point)"); code != "42704" {
@@ -154,6 +160,7 @@ func TestNestedTypeSelfOrForwardReferenceIs42704(t *testing.T) {
 // TestTypesPersistThroughImage round-trips a composite type (and a nested one) through the on-disk
 // image: it survives serialize → load, byte-backed by the v9 catalog type-definition section.
 func TestTypesPersistThroughImage(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	runComposite(t, db, "CREATE TYPE point AS (x i32 NOT NULL, y i32 NOT NULL)")
 	runComposite(t, db, "CREATE TYPE line AS (a point, b point)")
@@ -198,6 +205,7 @@ func TestTypesPersistThroughImage(t *testing.T) {
 // composite_equality_3vl (S5): composite equality is element-wise 3VL (PG row comparison). `=` is
 // FALSE if any field is FALSE; else UNKNOWN if any field is UNKNOWN; else TRUE.
 func TestCompositeEquality3VL(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	runComposite(t, db, "CREATE TYPE rec AS (a i32, b i32)")
 	// Equal rows.
@@ -221,6 +229,7 @@ func TestCompositeEquality3VL(t *testing.T) {
 // composite_column_compare_and_order (S5): a composite column compares against a ROW(…) value in
 // WHERE (element-wise), and ORDER BY over the composite column sorts lexicographically.
 func TestCompositeColumnCompareAndOrder(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	runComposite(t, db, "CREATE TYPE addr AS (street text, zip i32)")
 	runComposite(t, db, "CREATE TABLE p (id i32 PRIMARY KEY, home addr)")
@@ -241,6 +250,7 @@ func TestCompositeColumnCompareAndOrder(t *testing.T) {
 // (the empirically-probed PG behavior). A composite-valued field is a non-NULL value, so it counts
 // as PRESENT: a nested all-NULL row is therefore IS NULL = FALSE and IS NOT NULL = TRUE.
 func TestCompositeIsNullNonRecursive(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	runComposite(t, db, "CREATE TYPE point AS (x i32, y i32)")
 	runComposite(t, db, "CREATE TYPE seg AS (a point, b point)")
@@ -266,6 +276,7 @@ func TestCompositeIsNullNonRecursive(t *testing.T) {
 
 // TestCreateTypeWithArrayFieldRegisters: `CREATE TYPE t AS (xs i32[])` registers an array field.
 func TestCreateTypeWithArrayFieldRegisters(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	runComposite(t, db, "CREATE TYPE poly AS (name text, pts i32[])")
 	ct := db.CompositeType("poly")
@@ -281,6 +292,7 @@ func TestCreateTypeWithArrayFieldRegisters(t *testing.T) {
 // TestCompositeWithArrayFieldImageRoundtrip: the array field survives the on-disk image round-trip
 // (the catalog code-15 field entry + the recursive value codec).
 func TestCompositeWithArrayFieldImageRoundtrip(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	runComposite(t, db, "CREATE TYPE poly AS (name text, pts i32[])")
 	runComposite(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, p poly)")
@@ -308,6 +320,7 @@ func TestCompositeWithArrayFieldImageRoundtrip(t *testing.T) {
 // TestCompositeWithArrayOfCompositeField: the doubly-nested case (homes addr[]) — the field carries
 // element code 14 + name; the value codec nests array-over-composite; it survives the image round-trip.
 func TestCompositeWithArrayOfCompositeField(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	runComposite(t, db, "CREATE TYPE addr AS (street text, zip i32)")
 	runComposite(t, db, "CREATE TYPE person AS (name text, homes addr[])")
@@ -329,6 +342,7 @@ func TestCompositeWithArrayOfCompositeField(t *testing.T) {
 // TestDropTypeBlockedByArrayFieldDependent: DROP TYPE addr is 2BP01 while a composite type has an
 // addr[] field; dropping the dependent first frees it.
 func TestDropTypeBlockedByArrayFieldDependent(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	runComposite(t, db, "CREATE TYPE addr AS (street text, zip i32)")
 	runComposite(t, db, "CREATE TYPE person AS (name text, homes addr[])")
@@ -341,6 +355,7 @@ func TestDropTypeBlockedByArrayFieldDependent(t *testing.T) {
 
 // TestDropTypeBlockedByArrayColumnDependent: DROP TYPE addr is 2BP01 while a table column is addr[].
 func TestDropTypeBlockedByArrayColumnDependent(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	runComposite(t, db, "CREATE TYPE addr AS (street text, zip i32)")
 	runComposite(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, items addr[])")
@@ -352,6 +367,7 @@ func TestDropTypeBlockedByArrayColumnDependent(t *testing.T) {
 // TestArrayFieldTypeModifierIs0A000 / unknown element 42704: the array field's element gates match
 // an array column's.
 func TestArrayFieldErrors(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	if got := errComposite(t, db, "CREATE TYPE t AS (xs decimal(10,2)[])"); got != "0A000" {
 		t.Errorf("array field typmod: got %q, want 0A000", got)

@@ -18,6 +18,7 @@ func scalar(t *testing.T, db dbHandle, sql string) Value {
 }
 
 func TestComparisonsProjectBooleans(t *testing.T) {
+	t.Parallel()
 	db := dbWith(
 		t,
 		"CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32)",

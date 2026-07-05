@@ -48,6 +48,7 @@ func eq(t *testing.T, got, want, what string) {
 }
 
 func TestAF7IntrospectorsOverComposite(t *testing.T) {
+	t.Parallel()
 	db := addrDB(t)
 	eq(t, val1(t, db, `SELECT array_length('{"(a,1)","(b,2)"}'::addr[], 1)`), "2", "array_length")
 	eq(t, val1(t, db, `SELECT cardinality('{"(a,1)"}'::addr[])`), "1", "cardinality")
@@ -58,6 +59,7 @@ func TestAF7IntrospectorsOverComposite(t *testing.T) {
 }
 
 func TestAF7ContainmentOverComposite(t *testing.T) {
+	t.Parallel()
 	db := addrDB(t)
 	// A composite element with a NULL FIELD is comparable (record_eq) — @> matches it...
 	eq(t, val1(t, db, `SELECT '{"(a,)"}'::addr[] @> '{"(a,)"}'::addr[]`), "true", "@> NULL-field match")
@@ -70,6 +72,7 @@ func TestAF7ContainmentOverComposite(t *testing.T) {
 
 // The AF7 code change #2: x op ANY/ALL(composite[]) uses the composite TOTAL ORDER, not bare-ROW 3VL.
 func TestAF7QuantifiedOverCompositeTotalOrder(t *testing.T) {
+	t.Parallel()
 	db := addrDB(t)
 	eq(t, val1(t, db, `SELECT '(b,2)'::addr = ANY('{"(a,1)","(b,2)"}'::addr[])`), "true", "= ANY present")
 	// THE FIX: a composite NULL FIELD is comparable (PG record_eq), so = ANY is TRUE (not bare-ROW NULL).
@@ -89,6 +92,7 @@ func TestAF7QuantifiedOverCompositeTotalOrder(t *testing.T) {
 
 // The AF7 code change #1: unnest(composite[]).
 func TestAF7UnnestComposite(t *testing.T) {
+	t.Parallel()
 	db := addrDB(t)
 	out, err := queryOutcome(db, `SELECT * FROM unnest('{"(a,1)","(b,2)"}'::addr[])`, nil)
 	if err != nil {
@@ -125,6 +129,7 @@ func TestAF7UnnestComposite(t *testing.T) {
 
 // The jed extension: ARRAY[ROW(…)] under a composite-column context (not in the PG corpus).
 func TestAF7ArrayRowConstructorUnderColumnContext(t *testing.T) {
+	t.Parallel()
 	db := addrDB(t)
 	runArray(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, items addr[])")
 	// The ARRAY[ROW(…)] constructor takes the column's composite element type as context (no ::addr).

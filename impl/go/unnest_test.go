@@ -27,6 +27,7 @@ func unnestInts(t *testing.T, db dbHandle, sql string) []int64 {
 }
 
 func TestUnnestNamesAndElementType(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	// An untyped ARRAY[…] literal is i64[] (jed's literal typing).
 	out, err := queryOutcome(db, "SELECT * FROM unnest(ARRAY[10,20,30])", nil)
@@ -52,6 +53,7 @@ func TestUnnestNamesAndElementType(t *testing.T) {
 }
 
 func TestUnnestEmptyAndNullArraysYieldZeroRows(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	for _, sql := range []string{
 		"SELECT * FROM unnest('{}'::i32[])",
@@ -71,6 +73,7 @@ func TestUnnestEmptyAndNullArraysYieldZeroRows(t *testing.T) {
 }
 
 func TestUnnestAliasRenamesColumn(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	got := unnestInts(t, db, "SELECT g.g FROM unnest(ARRAY[7,8]) AS g ORDER BY g.g")
 	eqGenInts(t, got, []int64{7, 8}, "alias")
@@ -80,6 +83,7 @@ func TestUnnestAliasRenamesColumn(t *testing.T) {
 }
 
 func TestUnnestCorrelatedOuterArg(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, xs i32[])")
 	mustExec(t, db, "INSERT INTO t VALUES (1, ARRAY[10,20]), (2, '{30}'), (3, NULL), (4, '{}')")
@@ -108,6 +112,7 @@ func TestUnnestCorrelatedOuterArg(t *testing.T) {
 }
 
 func TestUnnestStrictnessAndDeferredErrors(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	// A non-array argument has no anyarray overload; unnest is single-arity.
 	for _, sql := range []string{
@@ -130,6 +135,7 @@ func TestUnnestStrictnessAndDeferredErrors(t *testing.T) {
 }
 
 func TestUnnestGeneratedRowCostAndCeiling(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	// '{…}'::i32[] is a const (no operator_eval): 3 generated_row + 3 row_produced.
 	out, _ := queryOutcome(db, "SELECT * FROM unnest('{1,2,3}'::i32[])", nil)

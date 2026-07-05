@@ -74,6 +74,7 @@ func streamResult(t *testing.T, s *Session, sql string) ([][]Value, int64) {
 // Every streamable shape: Query (lazy) must equal Execute (eager) on rows AND total cost.
 // (rowsEqual / valueEqual are shared test helpers — value-canonical, NULL-safe — from spill_test.go.)
 func TestStreamingMatchesEager(t *testing.T) {
+	t.Parallel()
 	db := seededKV(t, 100)
 	s := db.Session(SessionOptions{})
 	defer s.Close()
@@ -102,6 +103,7 @@ func TestStreamingMatchesEager(t *testing.T) {
 
 // A non-streamable shape still works through Query — it falls back to the buffered cursor.
 func TestNonStreamableFallsBack(t *testing.T) {
+	t.Parallel()
 	db := seededKV(t, 20)
 	s := db.Session(SessionOptions{})
 	defer s.Close()
@@ -124,6 +126,7 @@ func TestNonStreamableFallsBack(t *testing.T) {
 
 // Early exit (§6): pulling only a prefix does LESS work than draining — fewer storage_row_read charges.
 func TestStreamingEarlyExitChargesLess(t *testing.T) {
+	t.Parallel()
 	db := seededKV(t, 1000)
 	s := db.Session(SessionOptions{})
 	defer s.Close()
@@ -152,6 +155,7 @@ func TestStreamingEarlyExitChargesLess(t *testing.T) {
 // Snapshot pinning (§5): a streaming cursor reads the snapshot it opened on even as a concurrent writer
 // commits, and the watermark holds at its version until it is closed.
 func TestStreamingCursorPinsSnapshot(t *testing.T) {
+	t.Parallel()
 	db := seededKV(t, 3) // version 1, ids 1..=3
 	if db.Version() != 1 || db.OldestLiveTxid() != 1 {
 		t.Fatalf("seed: version=%d oldest=%d", db.Version(), db.OldestLiveTxid())
@@ -209,6 +213,7 @@ func TestStreamingCursorPinsSnapshot(t *testing.T) {
 
 // A mid-drain cost-ceiling abort (§6): the 54P01 surfaces during iteration via Err(), not at Query().
 func TestStreamingMidDrainCostAbort(t *testing.T) {
+	t.Parallel()
 	db := seededKV(t, 1000)
 	s := db.Session(SessionOptions{MaxCost: 50})
 	defer s.Close()
@@ -236,6 +241,7 @@ func TestStreamingMidDrainCostAbort(t *testing.T) {
 // The bare Database.queryValues convenience streams too: the transient mint-a-session does not strand
 // the cursor (it owns its snapshot).
 func TestDatabaseQueryConvenienceStreams(t *testing.T) {
+	t.Parallel()
 	db := seededKV(t, 50)
 	rows, err := db.queryValues("SELECT id, v FROM t ORDER BY id LIMIT 4", nil)
 	if err != nil {
@@ -262,6 +268,7 @@ func TestDatabaseQueryConvenienceStreams(t *testing.T) {
 // lazy buffered cursor) must equal Execute (eager) on rows AND total cost under full drain (§6). These
 // all route through tryBufferedQuery → bufferedScanCursor, not the streaming fast lane.
 func TestBufferedMatchesEager(t *testing.T) {
+	t.Parallel()
 	db := seededKV(t, 40)
 	s := db.Session(SessionOptions{})
 	defer s.Close()
@@ -291,6 +298,7 @@ func TestBufferedMatchesEager(t *testing.T) {
 // in full on the first pull, but a caller that stops after a prefix skips the PROJECTION of every row it
 // never pulls — so it charges LESS than a full drain. The top-N-over-the-buffer win.
 func TestBufferedEarlyExitChargesLess(t *testing.T) {
+	t.Parallel()
 	db := seededKV(t, 1000)
 	s := db.Session(SessionOptions{})
 	defer s.Close()
@@ -326,6 +334,7 @@ func TestBufferedEarlyExitChargesLess(t *testing.T) {
 // part materializes from THAT snapshot on first pull), so a concurrent writer's rows never appear; the
 // watermark holds at the cursor's version until it is closed.
 func TestBufferedCursorPinsSnapshot(t *testing.T) {
+	t.Parallel()
 	db := seededKV(t, 3) // version 1, ids 1..=3
 	if db.OldestLiveTxid() != 1 {
 		t.Fatalf("seed: oldest=%d", db.OldestLiveTxid())
@@ -378,6 +387,7 @@ func TestBufferedCursorPinsSnapshot(t *testing.T) {
 // A mid-drain cost-ceiling abort (§6) for the buffered cursor: building the cursor does NOT run the
 // blocking part (deferred to the first pull), so Query succeeds and the 54P01 surfaces during iteration.
 func TestBufferedMidDrainCostAbort(t *testing.T) {
+	t.Parallel()
 	db := seededKV(t, 1000)
 	s := db.Session(SessionOptions{MaxCost: 50})
 	defer s.Close()
@@ -408,6 +418,7 @@ func TestBufferedMidDrainCostAbort(t *testing.T) {
 // drive — pulling the sortedRows iterator one row at a time) must equal Execute (the eager drive of the
 // SAME emitter) on rows AND total cost under full drain (§6).
 func TestSortedMatchesEager(t *testing.T) {
+	t.Parallel()
 	db := seededKV(t, 40)
 	s := db.Session(SessionOptions{})
 	defer s.Close()
@@ -439,6 +450,7 @@ func TestSortedMatchesEager(t *testing.T) {
 // slice the sort output was an emitFinal, fully built + charged on the first pull, so an early exit
 // charged the SAME — this test is what distinguishes the new behavior.)
 func TestSortedEarlyExitChargesLess(t *testing.T) {
+	t.Parallel()
 	db := seededKV(t, 1000)
 	s := db.Session(SessionOptions{})
 	defer s.Close()
@@ -474,6 +486,7 @@ func TestSortedEarlyExitChargesLess(t *testing.T) {
 // while leaving NO spill temp file behind (the cursor's close releases undrained runs — Go has no
 // destructor, §5).
 func TestSortedSpillMergeStreamsLazily(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sorted_spill_lazy.jed")
 
@@ -559,6 +572,7 @@ func TestSortedSpillMergeStreamsLazily(t *testing.T) {
 // reuses the eager runSetOp / runWith verbatim, so the rows + cost are identical by construction (the
 // unordered shapes are deterministic here — same snapshot, same code path).
 func TestDeferredMatchesEager(t *testing.T) {
+	t.Parallel()
 	db := seededKV(t, 20)
 	s := db.Session(SessionOptions{})
 	defer s.Close()
@@ -594,6 +608,7 @@ func TestDeferredMatchesEager(t *testing.T) {
 // full drain (the only win is lazy-yield, not early-exit). This pins that the cost after one pull is
 // already final.
 func TestDeferredRunsFullyOnFirstPull(t *testing.T) {
+	t.Parallel()
 	db := seededKV(t, 100)
 	s := db.Session(SessionOptions{})
 	defer s.Close()
@@ -625,6 +640,7 @@ func TestDeferredRunsFullyOnFirstPull(t *testing.T) {
 // set op on the first pull over THAT snapshot, so a concurrent writer's rows never appear; the
 // watermark holds at the cursor's version until it is closed.
 func TestDeferredCursorPinsSnapshot(t *testing.T) {
+	t.Parallel()
 	db := seededKV(t, 3) // version 1, ids 1..=3
 	if db.OldestLiveTxid() != 1 {
 		t.Fatalf("seed: oldest=%d", db.OldestLiveTxid())
@@ -677,6 +693,7 @@ func TestDeferredCursorPinsSnapshot(t *testing.T) {
 // A mid-drain cost-ceiling abort (§6) for the deferred cursor: building the cursor does NOT run the
 // query (deferred to the first pull), so Query succeeds and the 54P01 surfaces during iteration.
 func TestDeferredMidDrainCostAbort(t *testing.T) {
+	t.Parallel()
 	db := seededKV(t, 1000)
 	s := db.Session(SessionOptions{MaxCost: 50})
 	defer s.Close()
@@ -705,6 +722,7 @@ func TestDeferredMidDrainCostAbort(t *testing.T) {
 // materialized dispatch (it takes the write gate and commits). Routed through Query, it still returns
 // the primary's RETURNING rows correctly.
 func TestDeferredSkipsDataModifyingWith(t *testing.T) {
+	t.Parallel()
 	db := seededKV(t, 5)
 	s := db.Session(SessionOptions{})
 	defer s.Close()
@@ -765,6 +783,7 @@ func preparedStreamResult(t *testing.T, s *Session, sql string, params []Value) 
 // A fully-drained prepared query yields the IDENTICAL rows + total cost as the ad-hoc Query (and thus
 // Execute, §6), across every lane — streaming, buffered, and deferred.
 func TestPreparedQueryMatchesStreamed(t *testing.T) {
+	t.Parallel()
 	db := seededKV(t, 100)
 	s := db.Session(SessionOptions{})
 	defer s.Close()
@@ -791,6 +810,7 @@ func TestPreparedQueryMatchesStreamed(t *testing.T) {
 // A prepared query binds $N params and streams: the bound prepared run matches the ad-hoc bound Query
 // on rows + cost, and the statement is reusable across runs with different params.
 func TestPreparedQueryBindsParamsAndStreams(t *testing.T) {
+	t.Parallel()
 	db := seededKV(t, 100)
 	s := db.Session(SessionOptions{})
 	defer s.Close()
@@ -815,6 +835,7 @@ func TestPreparedQueryBindsParamsAndStreams(t *testing.T) {
 // Early exit (§6) on the prepared path: pulling only a prefix charges LESS than a full drain — the
 // streaming win now reaches prepared queries.
 func TestPreparedQueryEarlyExitChargesLess(t *testing.T) {
+	t.Parallel()
 	db := seededKV(t, 1000)
 	s := db.Session(SessionOptions{})
 	defer s.Close()
@@ -855,6 +876,7 @@ func TestPreparedQueryEarlyExitChargesLess(t *testing.T) {
 // Snapshot pinning (§5) on the prepared path: an open prepared cursor pins its version in the
 // watermark, sees only its open-time snapshot as a writer commits, and releases on close.
 func TestPreparedQueryPinsSnapshot(t *testing.T) {
+	t.Parallel()
 	db := seededKV(t, 3)
 	if db.OldestLiveTxid() != 1 {
 		t.Fatalf("seed oldest=%d", db.OldestLiveTxid())
@@ -906,6 +928,7 @@ func TestPreparedQueryPinsSnapshot(t *testing.T) {
 // A mid-drain cost abort (§6) on the prepared path: the 54P01 surfaces during iteration via Err(),
 // not at queryValues() — the prepared cursor defers its work like the ad-hoc one.
 func TestPreparedQueryMidDrainCostAbort(t *testing.T) {
+	t.Parallel()
 	db := seededKV(t, 1000)
 	s := db.Session(SessionOptions{MaxCost: 50})
 	defer s.Close()
@@ -935,6 +958,7 @@ func TestPreparedQueryMidDrainCostAbort(t *testing.T) {
 // transient autocommit session per call; the cursor pins its snapshot, so it is not stranded when
 // that session closes).
 func TestDatabaseQueryPreparedConvenienceStreams(t *testing.T) {
+	t.Parallel()
 	db := seededKV(t, 50)
 	stmt, err := db.Prepare("SELECT id, v FROM t ORDER BY id LIMIT 4")
 	if err != nil {

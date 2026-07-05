@@ -23,6 +23,7 @@ func boolKeyErrCode(t *testing.T, db dbHandle, sql string) string {
 
 // A boolean PRIMARY KEY is accepted (the gate lifted) and CRUD works.
 func TestBooleanPrimaryKeyCRUD(t *testing.T) {
+	t.Parallel()
 	db := dbWith(
 		t,
 		"CREATE TABLE t (k boolean PRIMARY KEY, v i32)",
@@ -54,6 +55,7 @@ func TestBooleanPrimaryKeyCRUD(t *testing.T) {
 
 // A boolean member of a COMPOSITE primary key concatenates with the other component.
 func TestBooleanCompositePrimaryKey(t *testing.T) {
+	t.Parallel()
 	db := dbWith(
 		t,
 		"CREATE TABLE t (a i32, b boolean, v i32, PRIMARY KEY (a, b))",
@@ -82,6 +84,7 @@ func TestBooleanCompositePrimaryKey(t *testing.T) {
 
 // A secondary index on a (nullable) boolean column is accepted and serves equality.
 func TestBooleanSecondaryIndex(t *testing.T) {
+	t.Parallel()
 	db := dbWith(
 		t,
 		"CREATE TABLE t (id i32 PRIMARY KEY, flag boolean)",

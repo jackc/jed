@@ -14,6 +14,7 @@ import (
 // scans and mutates correctly while keeping only a bounded number of leaves resident — the residency
 // win.
 func TestDemandPagingScansCorrectlyWithBoundedResidency(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "paging.jed")
 	const n = 600
 	const cap = 3
@@ -125,6 +126,7 @@ func TestDemandPagingScansCorrectlyWithBoundedResidency(t *testing.T) {
 // opens via the public API, and a repeated point-query workload keeps ResidentLeaves() within the
 // budget throughout (each scan faults leaves through the pool, which evicts under CLOCK).
 func TestMemoryBudgetBoundsResidencyUnderLookups(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "budget.jed")
 	const n = 2000
 	const cap = 4
@@ -186,6 +188,7 @@ func TestMemoryBudgetBoundsResidencyUnderLookups(t *testing.T) {
 // budget smaller than a single page still keeps one leaf resident — the max(1, CacheBytes/pageSize)
 // floor — and still scans correctly. This is the pageSize > CacheBytes case.
 func TestTinyBudgetKeepsOneLeafResident(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "tiny.jed")
 	const n = 400
 
@@ -237,6 +240,7 @@ func TestTinyBudgetKeepsOneLeafResident(t *testing.T) {
 // Create rejects a page size above maxPageSize (64 KiB) — without the cap a huge page size forces a
 // multi-gigabyte allocation.
 func TestCreateRejectsOversizedPageSize(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "huge.jed")
 	_, err := create(path, databaseOptions{PageSize: 1 << 20, noSync: true})
 	ee, ok := err.(*EngineError)
@@ -253,6 +257,7 @@ func TestCreateRejectsOversizedPageSize(t *testing.T) {
 // runs before any allocation against that size, so a hostile file cannot force a giant allocation
 // (CLAUDE.md §13).
 func TestReadRejectsOversizedPageSize(t *testing.T) {
+	t.Parallel()
 	// A crafted meta header recording page_size = 70000 (> maxPageSize) in big-endian at offset 8.
 	image := make([]byte, 200)
 	copy(image[0:4], "JEDB")
@@ -268,6 +273,7 @@ func TestReadRejectsOversizedPageSize(t *testing.T) {
 // size in range but not a power of two is rejected — 0A000 on Create, XX001 on the read path.
 // Power-of-two keeps page boundaries sector-aligned (CLAUDE.md §9) and collapses the legal set.
 func TestRejectsNonPowerOfTwoPageSize(t *testing.T) {
+	t.Parallel()
 	// Create: 1000 is within [256, 65536] but not a power of two.
 	path := filepath.Join(t.TempDir(), "pow2.jed")
 	_, err := create(path, databaseOptions{PageSize: 1000, noSync: true})
@@ -293,6 +299,7 @@ func TestRejectsNonPowerOfTwoPageSize(t *testing.T) {
 // TestRejectsPageSizeBelowFloor exercises the new 256 floor (format.md *Page model*): 128 — a power
 // of two but below minPageSize — is rejected on Create.
 func TestRejectsPageSizeBelowFloor(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "tiny.jed")
 	_, err := create(path, databaseOptions{PageSize: 128, noSync: true})
 	ee, ok := err.(*EngineError)
@@ -337,6 +344,7 @@ func countLeafForms(st *tableStore) (decoded, packed, ondisk int) {
 // keep every table fully-resident decoded for the handle's lifetime, and a file-backed database must
 // take the same shape in its creating session as after a reopen.
 func TestInSessionTableJoinsResidencyFlip(t *testing.T) {
+	t.Parallel()
 	run := func(t *testing.T, db *Database) {
 		if _, err := db.ExecuteScript("CREATE TABLE t (k i32 PRIMARY KEY, v i32)"); err != nil {
 			t.Fatal(err)

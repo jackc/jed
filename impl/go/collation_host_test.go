@@ -44,6 +44,7 @@ func eqStrings(a, b []string) bool {
 // ---- the loaded set (the engine-global property a bundle provides) ----
 
 func TestLoadedCollationsIsTheRealSet(t *testing.T) {
+	t.Parallel()
 	// db.LoadedCollations reports what a loaded bundle PROVIDES — after loading jed's pinned production
 	// bundle, the real version-pinned set (es, unicode), ascending by name, no IsDefault (an engine
 	// property, not a per-db one). C is built in and never listed. The pin is UCA/UCD 17.0.0.
@@ -74,6 +75,7 @@ func TestLoadedCollationsIsTheRealSet(t *testing.T) {
 // ---- using a loaded collation needs NO import ----
 
 func TestLoadedCollationUsedInAnExpression(t *testing.T) {
+	t.Parallel()
 	// COLLATE "unicode" resolves from the engine's loaded set with no import: 'ä' < 'z' is true under
 	// the root (ä near a), the opposite of the C byte order where it is false. A transient query COLLATE
 	// does not make the database REFERENCE the collation, so db.Collations() stays empty.
@@ -89,6 +91,7 @@ func TestLoadedCollationUsedInAnExpression(t *testing.T) {
 }
 
 func TestEsOrdersEnyeAsADistinctLetter(t *testing.T) {
+	t.Parallel()
 	// The es tailoring (&N<ñ<<<Ñ) makes ñ a distinct PRIMARY letter after n: 'nz' < 'ña' (n < ñ),
 	// whereas under the untailored root ñ is n+accent so 'ña' < 'nz'. The Spanish-collation headline.
 	loadFixtureBundle(t)
@@ -102,6 +105,7 @@ func TestEsOrdersEnyeAsADistinctLetter(t *testing.T) {
 }
 
 func TestUnknownCollationIs42704(t *testing.T) {
+	t.Parallel()
 	// A collation neither loaded nor referenced is 42704 (the loaded-set fallback must not mask it).
 	loadFixtureBundle(t)
 	db := memDB().Session(SessionOptions{})
@@ -111,6 +115,7 @@ func TestUnknownCollationIs42704(t *testing.T) {
 }
 
 func TestPerColumnCollationOrdersImplicitlyAndIsReferenced(t *testing.T) {
+	t.Parallel()
 	// A column declared COLLATE "unicode" (loaded, no import) sorts by that collation with no explicit
 	// COLLATE on the query — unicode puts ä next to a. Because the SCHEMA now references unicode,
 	// db.Collations() (the per-file view) lists exactly it.
@@ -132,6 +137,7 @@ func TestPerColumnCollationOrdersImplicitlyAndIsReferenced(t *testing.T) {
 }
 
 func TestImplicitConflictIs42P22(t *testing.T) {
+	t.Parallel()
 	// Two columns with DIFFERENT implicit (loaded) collations compared with no explicit COLLATE →
 	// 42P22 (PG-matching). C counts as a distinct implicit collation, so unicode vs C also conflicts.
 	loadFixtureBundle(t)
@@ -159,6 +165,7 @@ func TestImplicitConflictIs42P22(t *testing.T) {
 }
 
 func TestNonTextCollateIs42804UnknownName42704(t *testing.T) {
+	t.Parallel()
 	loadFixtureBundle(t)
 	db := memDB().Session(SessionOptions{})
 	if _, err := queryOutcome(db, `CREATE TABLE t (a i32 COLLATE "unicode")`, nil); err == nil || err.(*EngineError).Code() != "42804" {
@@ -172,6 +179,7 @@ func TestNonTextCollateIs42804UnknownName42704(t *testing.T) {
 // ---- the per-database default (over the loaded set, no import) ----
 
 func TestDefaultCollationInheritedByUnannotatedColumn(t *testing.T) {
+	t.Parallel()
 	// SetDefaultCollation moves the per-database default to a LOADED collation (no import); an
 	// un-annotated text column created AFTER inherits it (frozen), one created BEFORE keeps C.
 	loadFixtureBundle(t)
@@ -205,6 +213,7 @@ func TestDefaultCollationInheritedByUnannotatedColumn(t *testing.T) {
 }
 
 func TestSetDefaultUnknownIs42704(t *testing.T) {
+	t.Parallel()
 	loadFixtureBundle(t)
 	db := memDB().Session(SessionOptions{})
 	if err := db.SetDefaultCollation("nope"); err == nil || err.(*EngineError).Code() != "42704" {
@@ -218,6 +227,7 @@ func TestSetDefaultUnknownIs42704(t *testing.T) {
 // ---- collated keys (slice 1e, on-disk/internal — the corpus cannot express it) ----
 
 func TestCollatedPrimaryKeyStoredInCollationOrder(t *testing.T) {
+	t.Parallel()
 	// A collated text PRIMARY KEY's storage key is the UCA sort key (encoding.md §2.12), so the B-tree
 	// physically iterates in COLLATION order. unicode (loaded, no import): a < A < b < Z; C bytes:
 	// A < Z < a < b. A no-ORDER-BY single-table scan returns jed's stored (key) order.
@@ -236,6 +246,7 @@ func TestCollatedPrimaryKeyStoredInCollationOrder(t *testing.T) {
 }
 
 func TestCollatedUniqueDedupsByByteIdentity(t *testing.T) {
+	t.Parallel()
 	// A collated UNIQUE key dedups by byte-identity (a deterministic collation: 'a' and 'A' are
 	// DISTINCT, both admitted — collation.md §7), like a C unique key; only a byte-duplicate violates.
 	loadFixtureBundle(t)
@@ -253,6 +264,7 @@ func TestCollatedUniqueDedupsByByteIdentity(t *testing.T) {
 // ---- reference-only file round-trip (format_version 18) ----
 
 func TestReferenceOnlyFileRoundTrip(t *testing.T) {
+	t.Parallel()
 	// A collated table + the per-database default survive a close + paged reopen. The file stores only a
 	// metadata REFERENCE entry (no table); on reopen the table is resolved from a loaded bundle (the host
 	// must have loaded one providing it BEFORE open — collation.md §4/§9).
@@ -305,6 +317,7 @@ func TestReferenceOnlyFileRoundTrip(t *testing.T) {
 // loaded version). Mirrors impl/rust skew_tests and impl/ts/tests/collation_host.test.ts.
 
 func TestCollationVersionSkewVerdict(t *testing.T) {
+	t.Parallel()
 	// The pure verdict (VersionSkew) — the cross-core contract (every core computes the identical
 	// result): same version ⇒ Full; a different pin ⇒ Skewed (reporting the loaded version); an
 	// unloaded name ⇒ no skew verdict (the absent case is refused at open, not a skew).
@@ -326,6 +339,7 @@ func TestCollationVersionSkewVerdict(t *testing.T) {
 }
 
 func TestSkewedCollationBlocksWrites(t *testing.T) {
+	t.Parallel()
 	// A unicode-collated PK table is read-write while Full; once its unicode reference is pinned to a
 	// different version than the loaded bundle (the open-time state of a file built under an older
 	// bundle), the table degrades to read-only: reads still return the rows (the heap-scan fallback),
@@ -394,6 +408,7 @@ func TestSkewedCollationBlocksWrites(t *testing.T) {
 }
 
 func TestUpgradeCollationsClearsSkew(t *testing.T) {
+	t.Parallel()
 	// The COLLATION UPGRADE migration (db.UpgradeCollations, collation.md §12) clears the skew: after
 	// it the collation's pin is the loaded version, db.Collations reports Full, and the table is
 	// read-write again. Asserts the internal state the shared corpus
@@ -440,6 +455,7 @@ func TestUpgradeCollationsClearsSkew(t *testing.T) {
 }
 
 func TestCollationOpenRefusesAbsent(t *testing.T) {
+	t.Parallel()
 	// A file that references a collation NO loaded bundle provides is the graded verdict's legible
 	// refusal (collation.md §12, slice 2d): decoding the reference entry fails with XX002 naming it +
 	// its version, rather than the old bare 42704. "zz-absent-collation" is never in any bundle, so

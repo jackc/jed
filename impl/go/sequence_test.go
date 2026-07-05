@@ -59,6 +59,7 @@ func seqErrCode(t *testing.T, db dbHandle, sql string) string {
 // THE headline divergence (§5): a nextval advance inside a transaction is discarded by ROLLBACK
 // (PostgreSQL keeps it — its sequences are non-transactional). jed is deterministic instead.
 func TestSequenceNextvalRollsBack(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	if _, err := queryOutcome(db, "CREATE SEQUENCE s", nil); err != nil {
 		t.Fatal(err)
@@ -91,6 +92,7 @@ func TestSequenceNextvalRollsBack(t *testing.T) {
 
 // A failed autocommit statement does not advance the sequence either (the per-statement rollback).
 func TestSequenceFailedStatementDoesNotAdvance(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	// A two-value [1, 2] sequence (MINVALUE == MAXVALUE is rejected, matching PG — §15.2).
 	if _, err := queryOutcome(db, "CREATE SEQUENCE s MAXVALUE 2", nil); err != nil {
@@ -111,6 +113,7 @@ func TestSequenceFailedStatementDoesNotAdvance(t *testing.T) {
 // nextval is a write, so a READ ONLY transaction rejects it with 25006; currval (a pure read) is
 // allowed there (spec/design/sequences.md §4/§6).
 func TestSequenceNextvalInReadOnlyIs25006(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	if _, err := queryOutcome(db, "CREATE SEQUENCE s", nil); err != nil {
 		t.Fatal(err)
@@ -140,6 +143,7 @@ func TestSequenceNextvalInReadOnlyIs25006(t *testing.T) {
 
 // currval is session-local and 55000 before the first nextval.
 func TestSequenceCurrvalSessionState(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	if _, err := queryOutcome(db, "CREATE SEQUENCE s", nil); err != nil {
 		t.Fatal(err)
@@ -159,6 +163,7 @@ func TestSequenceCurrvalSessionState(t *testing.T) {
 // A setval is transactional too (the §5 divergence): an advance inside a rolled-back transaction is
 // discarded — PostgreSQL would keep it.
 func TestSequenceSetvalRollsBack(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	mustExec(t, db, "CREATE SEQUENCE s START 1")
 	seqMustInt(t, db, "SELECT nextval('s')", 1) // committed last_value 1
@@ -173,6 +178,7 @@ func TestSequenceSetvalRollsBack(t *testing.T) {
 
 // An ALTER SEQUENCE … RESTART is transactional as well (the same §5 divergence).
 func TestSequenceAlterRestartRollsBack(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	mustExec(t, db, "CREATE SEQUENCE s START 10")
 	seqMustInt(t, db, "SELECT nextval('s')", 10)
@@ -191,6 +197,7 @@ func TestSequenceAlterRestartRollsBack(t *testing.T) {
 // — tracking the most recent nextval, reflecting a setval on that same sequence — live in the oracle
 // corpus; this asserts only the rollback, which the corpus cannot.)
 func TestSequenceLastvalRollsBack(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	mustExec(t, db, "CREATE SEQUENCE a START 100")
 	mustExec(t, db, "CREATE SEQUENCE b START 200")
@@ -211,6 +218,7 @@ func TestSequenceLastvalRollsBack(t *testing.T) {
 // value type is not persisted (§14.4); OWNED BY / OWNER TO / SET … have no jed concept. (The option
 // set INCREMENT/MINVALUE/… and RENAME TO are now supported — see ddl/alter_sequence.test.)
 func TestSequenceAlterUnsupportedActionsAre0A000(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	mustExec(t, db, "CREATE SEQUENCE s")
 	for _, sql := range []string{
@@ -233,6 +241,7 @@ func TestSequenceAlterUnsupportedActionsAre0A000(t *testing.T) {
 // (the §5 divergence applies to every ALTER action, not just RESTART). A jed-vs-PG divergence, so a
 // per-core unit test, not corpus.
 func TestSequenceAlterOptionsRollBack(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	mustExec(t, db, "CREATE SEQUENCE s INCREMENT 1")
 	mustExec(t, db, "BEGIN")
@@ -246,6 +255,7 @@ func TestSequenceAlterOptionsRollBack(t *testing.T) {
 // setval/ALTER … RESTART are writes — a READ ONLY transaction rejects each with 25006 (each in its
 // own block, since the error poisons the block). lastval/currval (pure reads) are allowed.
 func TestSequenceSetvalAlterInReadOnlyIs25006(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	mustExec(t, db, "CREATE SEQUENCE s")
 	seqMustInt(t, db, "SELECT nextval('s')", 1) // 1, defines session state
@@ -301,6 +311,7 @@ func seqQueryRows(t *testing.T, db dbHandle, sql string) [][]int64 {
 // A serial column desugars to an integer column, NOT NULL, with a DEFAULT nextval backed by an
 // auto-created OWNED sequence named <table>_<col>_seq. Inserts auto-number from 1.
 func TestSerialDesugarsToOwnedSequence(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id serial PRIMARY KEY, b bigserial, s smallserial, v text)")
 	rows := seqQueryRows(t, db, "INSERT INTO t (v) VALUES ('a'), ('b') RETURNING id, b, s")
@@ -317,6 +328,7 @@ func TestSerialDesugarsToOwnedSequence(t *testing.T) {
 // A NULL into a serial column violates the implied NOT NULL (23502); an explicit value overrides the
 // default and does NOT advance the sequence (PG).
 func TestSerialNotNullAndExplicitOverride(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id serial PRIMARY KEY, v text)")
 	if code := seqErrCode(t, db, "INSERT INTO t (id, v) VALUES (NULL, 'x')"); code != "23502" {
@@ -331,6 +343,7 @@ func TestSerialNotNullAndExplicitOverride(t *testing.T) {
 
 // An explicit DEFAULT on a serial column conflicts with the synthesized one — 42601 (PG).
 func TestSerialWithExplicitDefaultIs42601(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	if code := seqErrCode(t, db, "CREATE TABLE t (id serial DEFAULT 5)"); code != "42601" {
 		t.Fatalf("expected 42601, got %s", code)
@@ -339,6 +352,7 @@ func TestSerialWithExplicitDefaultIs42601(t *testing.T) {
 
 // The auto-name collision-resolves with a numeric suffix when <table>_<col>_seq is taken (PG).
 func TestSerialSeqNameCollisionResolves(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	mustExec(t, db, "CREATE SEQUENCE t_id_seq")
 	mustExec(t, db, "CREATE TABLE t (id serial)")
@@ -350,6 +364,7 @@ func TestSerialSeqNameCollisionResolves(t *testing.T) {
 
 // DROP SEQUENCE of an OWNED (serial) sequence is 2BP01; DROP TABLE auto-drops it.
 func TestSerialOwnedSequenceDropRules(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	mustExec(t, db, "CREATE TABLE t (id serial PRIMARY KEY)")
 	if code := seqErrCode(t, db, "DROP SEQUENCE t_id_seq"); code != "2BP01" {
@@ -365,6 +380,7 @@ func TestSerialOwnedSequenceDropRules(t *testing.T) {
 // The OWNED BY link persists (format_version 13): after create + commit + reopen, DROP TABLE still
 // auto-drops the owned sequence, and DROP SEQUENCE of it is still 2BP01.
 func TestSerialOwnedLinkSurvivesReopen(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "serial_owned_reopen.jed")
 	db, err := create(path, databaseOptions{PageSize: 4096, noSync: true})
 	if err != nil {
@@ -394,6 +410,7 @@ func TestSerialOwnedLinkSurvivesReopen(t *testing.T) {
 
 // serial is recognized only in a column-type position — a CAST to it is an undefined type.
 func TestSerialIsNotACastableType(t *testing.T) {
+	t.Parallel()
 	db := memDB().Session(SessionOptions{})
 	if code := seqErrCode(t, db, "SELECT 1::serial"); code != "42704" {
 		t.Fatalf("expected 42704, got %s", code)

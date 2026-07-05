@@ -39,6 +39,7 @@ func overflowTables(t *testing.T) *Session {
 }
 
 func TestOverflowCostFullScanChargesChainPages(t *testing.T) {
+	t.Parallel()
 	db := overflowTables(t)
 	spill := mustCost(t, db, "SELECT * FROM spill")
 	control := mustCost(t, db, "SELECT * FROM control")
@@ -49,6 +50,7 @@ func TestOverflowCostFullScanChargesChainPages(t *testing.T) {
 }
 
 func TestOverflowCostBoundedScanChargesOnlyAdmittedChains(t *testing.T) {
+	t.Parallel()
 	db := overflowTables(t)
 	// The point lookup that admits the spilled record pays its chain ...
 	spillHit := mustCost(t, db, "SELECT * FROM spill WHERE id = 1")
@@ -65,6 +67,7 @@ func TestOverflowCostBoundedScanChargesOnlyAdmittedChains(t *testing.T) {
 }
 
 func TestOverflowCostLimitDoesNotLowerTheBlock(t *testing.T) {
+	t.Parallel()
 	// The spilled record is row 2, so LIMIT 1 emits only the inline row 1 — yet the page_read
 	// block (which never short-circuits — cost.md §3 "LIMIT short-circuit") still counts the
 	// bound's chain pages.
@@ -82,6 +85,7 @@ func TestOverflowCostLimitDoesNotLowerTheBlock(t *testing.T) {
 }
 
 func TestOverflowCostMutationScansChargeOnlyTouchedChains(t *testing.T) {
+	t.Parallel()
 	// A DELETE whose filter READS the spilled column pays its chain (the touched set —
 	// cost.md §3); a bare DELETE reads no column, so dropping the rows charges nothing extra.
 	db := overflowTables(t)
@@ -98,6 +102,7 @@ func TestOverflowCostMutationScansChargeOnlyTouchedChains(t *testing.T) {
 }
 
 func TestOverflowCostUntouchedColumnsChargeNothing(t *testing.T) {
+	t.Parallel()
 	// The touched set (cost.md §3 "The touched set"): a query that never references the spilled
 	// column pays neither its chain pages nor anything else for it — the large-values.md §7
 	// headline case — while one that does still pays.
@@ -126,6 +131,7 @@ func TestOverflowCostUntouchedColumnsChargeNothing(t *testing.T) {
 }
 
 func TestOverflowCostMultipleChainsSum(t *testing.T) {
+	t.Parallel()
 	// One record with two externalized values charges the sum of both chains: 3 + 2 = 5.
 	db := newInMemoryWithPageSize(overflowPageSize).Session(SessionOptions{})
 	bigText := fillerText(overflowBodyLength)

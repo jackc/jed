@@ -28,6 +28,7 @@ func oneValue(t *testing.T, db dbHandle, sql string) string {
 }
 
 func TestLineCommentsRunToEndOfLine(t *testing.T) {
+	t.Parallel()
 	db := commentsSetup(t)
 	// Trailing comment; the statement continues on the next line.
 	if got := oneValue(t, db, "SELECT v -- trailing\nFROM t WHERE id = 1"); got != "10" {
@@ -44,6 +45,7 @@ func TestLineCommentsRunToEndOfLine(t *testing.T) {
 }
 
 func TestTwoHyphensStartACommentEvenAbuttingAToken(t *testing.T) {
+	t.Parallel()
 	db := commentsSetup(t)
 	// `v--1` is `v` then a comment (PG) — NOT `v - (-1)`.
 	if got := oneValue(t, db, "SELECT v--1\nFROM t WHERE id = 1"); got != "10" {
@@ -56,6 +58,7 @@ func TestTwoHyphensStartACommentEvenAbuttingAToken(t *testing.T) {
 }
 
 func TestBlockCommentsSeparateTokensAndNest(t *testing.T) {
+	t.Parallel()
 	db := commentsSetup(t)
 	// A block comment is a token separator.
 	if got := oneValue(t, db, "SELECT/*c*/v/*c*/FROM t WHERE id = 1"); got != "10" {
@@ -72,6 +75,7 @@ func TestBlockCommentsSeparateTokensAndNest(t *testing.T) {
 }
 
 func TestCommentOpenersInsideAStringAreText(t *testing.T) {
+	t.Parallel()
 	db := commentsSetup(t)
 	if got := oneValue(t, db, "SELECT s FROM t WHERE id = 1"); got != "--x /*y*/" {
 		t.Errorf("string content: got %q", got)
@@ -79,6 +83,7 @@ func TestCommentOpenersInsideAStringAreText(t *testing.T) {
 }
 
 func TestUnterminatedBlockCommentIs42601(t *testing.T) {
+	t.Parallel()
 	db := commentsSetup(t)
 	for _, sql := range []string{
 		"SELECT v FROM t /* unterminated",
@@ -90,12 +95,14 @@ func TestUnterminatedBlockCommentIs42601(t *testing.T) {
 }
 
 func TestStrayCloseIsNotCommentSyntax(t *testing.T) {
+	t.Parallel()
 	db := commentsSetup(t)
 	// `*/` with no opener lexes as `*` `/` and fails at parse.
 	wantErr(t, db, "SELECT v */ 1 FROM t", "42601")
 }
 
 func TestCommentOnlyInputIsNoStatement(t *testing.T) {
+	t.Parallel()
 	db := commentsSetup(t)
 	for _, sql := range []string{"-- nothing here", "/* nothing here */", "  /* a */ -- b"} {
 		wantErr(t, db, sql, "42601")
