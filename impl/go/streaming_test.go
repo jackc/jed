@@ -490,7 +490,7 @@ func TestSortedSpillMergeStreamsLazily(t *testing.T) {
 		return n
 	}
 
-	db, err := CreateDatabase(CreateOptions{Path: path, PageSize: DefaultPageSize})
+	db, err := CreateDatabase(CreateOptions{Path: path, PageSize: DefaultPageSize, SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}

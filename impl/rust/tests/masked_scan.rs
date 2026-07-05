@@ -21,7 +21,7 @@
 //! scalar group machinery on rows AND cost (the conformance corpus proves the in-memory row path; this
 //! battery proves the paged columnar path against the resident oracle).
 
-use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, OpenOptions, Outcome, Session, SessionOptions};
 
 fn tmp(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(name)
@@ -113,6 +113,7 @@ fn paged_masked_scan_matches_resident_across_query_shapes() {
     {
         let mut db = Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(&path)),
+            skip_fsync: true,
             page_size: jed::DEFAULT_PAGE_SIZE,
             ..Default::default()
         })
@@ -128,9 +129,15 @@ fn paged_masked_scan_matches_resident_across_query_shapes() {
     .unwrap()
     .session(SessionOptions::default());
     seed(&mut mem);
-    let mut paged = Database::open(&path)
-        .unwrap()
-        .session(SessionOptions::default());
+    let mut paged = Database::open_with_options(
+        &path,
+        OpenOptions {
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap()
+    .session(SessionOptions::default());
 
     let queries = [
         // Whole-row and single/multi-column projections.
@@ -257,6 +264,7 @@ fn paged_columnar_multilevel_matches_resident() {
     {
         let mut db = Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(&path)),
+            skip_fsync: true,
             page_size: jed::DEFAULT_PAGE_SIZE,
             ..Default::default()
         })
@@ -272,9 +280,15 @@ fn paged_columnar_multilevel_matches_resident() {
     .unwrap()
     .session(SessionOptions::default());
     seed_multilevel(&mut mem);
-    let mut paged = Database::open(&path)
-        .unwrap()
-        .session(SessionOptions::default());
+    let mut paged = Database::open_with_options(
+        &path,
+        OpenOptions {
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap()
+    .session(SessionOptions::default());
 
     let queries = [
         // Bare-column projections — the columnar projection path (interior + leaf a/k/b values gathered).

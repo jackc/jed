@@ -270,12 +270,12 @@ test("the owned-by link persists (format_version 13) — auto-drop survives a re
   const dir = mkdtempSync(join(tmpdir(), "jed-serial-"));
   const path = join(dir, "serial_owned_reopen.jed");
   try {
-    const db = createDatabase({ path });
+    const db = createDatabase({ path, skipFsync: true });
     db.execute("CREATE TABLE t (id serial PRIMARY KEY, v text)");
     db.execute("INSERT INTO t (v) VALUES ('a')");
     db.close();
 
-    const db2 = openDatabase(path);
+    const db2 = openDatabase(path, { skipFsync: true });
     // The owner link round-tripped: still 2BP01 to drop the sequence directly.
     assert.equal(errCode(db2, "DROP SEQUENCE t_id_seq"), "2BP01");
     db2.execute("DROP TABLE t");

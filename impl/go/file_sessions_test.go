@@ -27,7 +27,7 @@ func countVia(t *testing.T, db *Database) int64 {
 func TestFileBackedRoundtripAndReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "file_sessions_roundtrip.jed")
 	func() {
-		db, err := CreateDatabase(CreateOptions{Path: path})
+		db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
 		if err != nil {
 			t.Fatalf("create: %v", err)
 		}
@@ -51,7 +51,7 @@ func TestFileBackedRoundtripAndReopen(t *testing.T) {
 		}
 	}()
 
-	db, err := OpenDatabase(path)
+	db, err := OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -67,7 +67,7 @@ func TestFileBackedRoundtripAndReopen(t *testing.T) {
 func TestFileBackedExplicitTransactionPersistsThenRollsBack(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "file_sessions_explicit_tx.jed")
 	func() {
-		db, err := CreateDatabase(CreateOptions{Path: path})
+		db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
 		if err != nil {
 			t.Fatalf("create: %v", err)
 		}
@@ -110,7 +110,7 @@ func TestFileBackedExplicitTransactionPersistsThenRollsBack(t *testing.T) {
 		}
 	}()
 
-	db, err := OpenDatabase(path)
+	db, err := OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -123,7 +123,7 @@ func TestFileBackedExplicitTransactionPersistsThenRollsBack(t *testing.T) {
 func TestFileBackedExecuteScriptIsAllOrNothing(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "file_sessions_script.jed")
 	func() {
-		db, err := CreateDatabase(CreateOptions{Path: path})
+		db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
 		if err != nil {
 			t.Fatalf("create: %v", err)
 		}
@@ -142,7 +142,7 @@ func TestFileBackedExecuteScriptIsAllOrNothing(t *testing.T) {
 		}
 	}()
 
-	db, err := OpenDatabase(path)
+	db, err := OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -155,7 +155,7 @@ func TestFileBackedExecuteScriptIsAllOrNothing(t *testing.T) {
 func TestFileBackedReadOnlyOpenRejectsWrites(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "file_sessions_read_only.jed")
 	func() {
-		db, err := CreateDatabase(CreateOptions{Path: path})
+		db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
 		if err != nil {
 			t.Fatalf("create: %v", err)
 		}
@@ -164,7 +164,7 @@ func TestFileBackedReadOnlyOpenRejectsWrites(t *testing.T) {
 		execDB(t, db, "INSERT INTO t VALUES (1)")
 	}()
 
-	db, err := OpenDatabaseWithOptions(path, OpenOptions{ReadOnly: true})
+	db, err := OpenDatabaseWithOptions(path, OpenOptions{ReadOnly: true, SkipFsync: true})
 	if err != nil {
 		t.Fatalf("open read-only: %v", err)
 	}
@@ -192,7 +192,7 @@ func TestFileBackedReadersRunConcurrentlyWithAWriter(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "file_sessions_concurrent.jed")
 	func() {
 		// Small pages so the table spans several leaves (real faults).
-		db, err := CreateDatabase(CreateOptions{Path: path, PageSize: 256})
+		db, err := CreateDatabase(CreateOptions{Path: path, PageSize: 256, SkipFsync: true})
 		if err != nil {
 			t.Fatalf("create: %v", err)
 		}
@@ -201,7 +201,7 @@ func TestFileBackedReadersRunConcurrentlyWithAWriter(t *testing.T) {
 		execDB(t, db, "INSERT INTO t VALUES (1)")
 	}()
 
-	db, err := OpenDatabaseWithOptions(path, OpenOptions{CacheBytes: 4 * 256}) // a handful of resident leaves
+	db, err := OpenDatabaseWithOptions(path, OpenOptions{CacheBytes: 4 * 256, SkipFsync: true}) // a handful of resident leaves
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -253,7 +253,7 @@ func TestFileBackedReadersRunConcurrentlyWithAWriter(t *testing.T) {
 
 	// Reopen from scratch: every committed row is durable on disk.
 	db.Close()
-	reopened, err := OpenDatabase(path)
+	reopened, err := OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}

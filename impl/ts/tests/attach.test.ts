@@ -35,7 +35,9 @@ function tmpDir(): string {
 // tests (a self-describing jed file another handle can attach). Returns the path.
 function makeFileDb(dir: string, name: string, pageSize: number, stmts: string[]): string {
   const path = join(dir, name);
-  const db = createDatabase(pageSize === 0 ? { path } : { path, pageSize });
+  const db = createDatabase(
+    pageSize === 0 ? { path, skipFsync: true } : { path, pageSize, skipFsync: true },
+  );
   const s = db.session();
   for (const sql of stmts) s.execute(sql);
   s.close();
@@ -233,7 +235,7 @@ test("file attach read-write persists across a standalone reopen", () => {
     db.close();
 
     // Reopen the attached file on its own — the rows + index must be there (durable + self-describing).
-    const reopened = openDatabase(work);
+    const reopened = openDatabase(work, { skipFsync: true });
     const rs = reopened.session();
     assert.deepEqual(intCol(rs, "SELECT bal FROM acct ORDER BY id"), [100n, 200n]);
     rs.close();
@@ -255,7 +257,7 @@ test("file attach: one durable writer per transaction (0A000)", () => {
     const mainPath = makeFileDb(dir, "main.jed", 0, ["CREATE TABLE m (id i32 PRIMARY KEY)"]);
     const extra = makeFileDb(dir, "extra.jed", 0, ["CREATE TABLE e (id i32 PRIMARY KEY)"]);
 
-    const db = openDatabase(mainPath);
+    const db = openDatabase(mainPath, { skipFsync: true });
     db.attach("extra", attachFile(extra), false);
     const s = db.session();
     s.begin(true);
@@ -322,7 +324,7 @@ test("file attach: attachment keeps its own page size", () => {
     db.detach("small");
     db.close();
 
-    const reopened = openDatabase(small);
+    const reopened = openDatabase(small, { skipFsync: true });
     assert.equal(reopened.pageSize, 256);
     const rs = reopened.session();
     // sum of i*i for i in 1..=40 = 22140.

@@ -11,7 +11,7 @@
 //! Mirrored by impl/go/collation_host_test.go and impl/ts/tests/collation_host.test.ts.
 
 use jed::value::Value;
-use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, OpenOptions, Outcome, Session, SessionOptions};
 
 use std::path::{Path, PathBuf};
 
@@ -334,6 +334,7 @@ fn reference_only_file_round_trip() {
     let _ = std::fs::remove_file(&path);
     let mut db = Database::create(CreateOptions {
         path: Some(std::path::PathBuf::from(&path)),
+        skip_fsync: true,
         page_size: 256,
         ..Default::default()
     })
@@ -353,9 +354,15 @@ fn reference_only_file_round_trip() {
     db.commit().unwrap();
     drop(db);
 
-    let mut re = Database::open(&path)
-        .unwrap()
-        .session(SessionOptions::default());
+    let mut re = Database::open_with_options(
+        &path,
+        OpenOptions {
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap()
+    .session(SessionOptions::default());
     assert_eq!(re.default_collation(), "unicode");
     // The database still references unicode (per-file view) — resolved from the vendored set.
     let refs = re.collations();

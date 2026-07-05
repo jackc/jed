@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 use jed::value::Value;
-use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, OpenOptions, Outcome, Session, SessionOptions};
 
 fn run(db: &mut Session, sql: &str) -> Outcome {
     db.query_outcome(sql, &[])
@@ -214,6 +214,7 @@ fn scalar_gist_file_backed_round_trip() {
     {
         let mut db = Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(&path)),
+            skip_fsync: true,
             page_size: 256,
             ..Default::default()
         })
@@ -230,9 +231,15 @@ fn scalar_gist_file_backed_round_trip() {
         );
     }
     {
-        let mut db = Database::open(&path)
-            .unwrap()
-            .session(SessionOptions::default());
+        let mut db = Database::open_with_options(
+            &path,
+            OpenOptions {
+                skip_fsync: true,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap()
+        .session(SessionOptions::default());
         assert_eq!(
             ids(&mut db, "SELECT id FROM t WHERE room = 20 ORDER BY id"),
             vec![2, 5]
@@ -244,9 +251,15 @@ fn scalar_gist_file_backed_round_trip() {
         );
     }
     {
-        let mut db = Database::open(&path)
-            .unwrap()
-            .session(SessionOptions::default());
+        let mut db = Database::open_with_options(
+            &path,
+            OpenOptions {
+                skip_fsync: true,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap()
+        .session(SessionOptions::default());
         assert_eq!(
             ids(&mut db, "SELECT id FROM t WHERE room = 20 ORDER BY id"),
             vec![2, 5, 7]
@@ -314,6 +327,7 @@ fn gist_file_backed_round_trip() {
     {
         let mut db = Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(&path)),
+            skip_fsync: true,
             page_size: 256,
             ..Default::default()
         })
@@ -342,9 +356,15 @@ fn gist_file_backed_round_trip() {
     }
     // Reopen: the persisted R-tree loads, the resident tree is rebuilt, the query still works.
     {
-        let mut db = Database::open(&path)
-            .unwrap()
-            .session(SessionOptions::default());
+        let mut db = Database::open_with_options(
+            &path,
+            OpenOptions {
+                skip_fsync: true,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap()
+        .session(SessionOptions::default());
         assert_eq!(
             ids(
                 &mut db,
@@ -371,9 +391,15 @@ fn gist_file_backed_round_trip() {
     }
     // And once more, after the maintenance commit, to prove the rewritten tree persists.
     {
-        let mut db = Database::open(&path)
-            .unwrap()
-            .session(SessionOptions::default());
+        let mut db = Database::open_with_options(
+            &path,
+            OpenOptions {
+                skip_fsync: true,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap()
+        .session(SessionOptions::default());
         assert_eq!(
             ids(
                 &mut db,
@@ -596,6 +622,7 @@ fn exclude_file_backed_round_trip() {
     {
         let mut db = Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(&path)),
+            skip_fsync: true,
             page_size: 256,
             ..Default::default()
         })
@@ -619,9 +646,15 @@ fn exclude_file_backed_round_trip() {
         db.commit().unwrap();
     }
     {
-        let mut db = Database::open(&path)
-            .unwrap()
-            .session(SessionOptions::default());
+        let mut db = Database::open_with_options(
+            &path,
+            OpenOptions {
+                skip_fsync: true,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap()
+        .session(SessionOptions::default());
         // The persisted constraint still rejects a conflict after reopen.
         assert_eq!(
             err_code(&mut db, "INSERT INTO booking VALUES (4, 101, '[15,25)')"),

@@ -97,7 +97,7 @@ test("external value through the default demand-paged file path, with reclamatio
   const path = join(dir, "large_values.jed");
   const big = fillerText(1500); // incompressible ≫ RECORD_MAX at ps 256 ⇒ a multi-page overflow chain
   try {
-    let db = createDatabase({ path, pageSize: 256 });
+    let db = createDatabase({ path, pageSize: 256, skipFsync: true });
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY, body text)");
     db.execute(`INSERT INTO t VALUES (1, '${big}')`);
     db.execute("INSERT INTO t VALUES (2, 'small')");
@@ -105,7 +105,7 @@ test("external value through the default demand-paged file path, with reclamatio
 
     // Reopen demand-paged (the default open): the big value reconstructs exactly through the
     // pager-backed chain read.
-    db = openDatabase(path);
+    db = openDatabase(path, { skipFsync: true });
     let rows = rowsOf(db, "SELECT id, body FROM t ORDER BY id");
     assert.equal(rows.length, 2);
     assert.equal(textOf(rows[0]![1]), big);
@@ -113,14 +113,14 @@ test("external value through the default demand-paged file path, with reclamatio
     db.close();
 
     // Delete the big row; its chain is orphaned (leaked this session).
-    db = openDatabase(path);
+    db = openDatabase(path, { skipFsync: true });
     db.execute("DELETE FROM t WHERE id = 1");
     db.close();
 
     // Reopen: the free-list reconstruction collects only live chains, so the dead chain's pages are
     // now free. Re-inserting a large value reuses them — the high-water grows by a handful of pages,
     // not by a whole fresh chain (~7 pages).
-    db = openDatabase(path);
+    db = openDatabase(path, { skipFsync: true });
     const before = db.pageCount;
     db.execute(`INSERT INTO t VALUES (3, '${big}')`);
     const after = db.pageCount;
@@ -131,7 +131,7 @@ test("external value through the default demand-paged file path, with reclamatio
     );
 
     // Final correctness through the paged path.
-    db = openDatabase(path);
+    db = openDatabase(path, { skipFsync: true });
     rows = rowsOf(db, "SELECT body FROM t WHERE id = 3");
     assert.equal(rows.length, 1);
     assert.equal(textOf(rows[0]![0]), big);

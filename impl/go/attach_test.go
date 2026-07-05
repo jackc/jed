@@ -157,7 +157,7 @@ func TestAttachNameErrors(t *testing.T) {
 func makeFileDB(t *testing.T, dir, name string, pageSize uint32, stmts ...string) string {
 	t.Helper()
 	path := filepath.Join(dir, name)
-	db, err := CreateDatabase(CreateOptions{Path: path, PageSize: pageSize})
+	db, err := CreateDatabase(CreateOptions{Path: path, PageSize: pageSize, SkipFsync: true})
 	if err != nil {
 		t.Fatalf("create %s: %v", name, err)
 	}
@@ -242,7 +242,7 @@ func TestAttachFileReadWritePersistsAcrossReopen(t *testing.T) {
 	db.Close()
 
 	// Reopen the attached file on its own — the rows must be there (durable + self-describing).
-	reopened, err := OpenDatabase(work)
+	reopened, err := OpenDatabaseWithOptions(work, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatalf("reopen attached file standalone: %v", err)
 	}
@@ -265,7 +265,7 @@ func TestAttachFileOneDurableWriter(t *testing.T) {
 	mainPath := makeFileDB(t, dir, "main.jed", 0, "CREATE TABLE m (id i32 PRIMARY KEY)")
 	extra := makeFileDB(t, dir, "extra.jed", 0, "CREATE TABLE e (id i32 PRIMARY KEY)")
 
-	db, err := OpenDatabase(mainPath)
+	db, err := OpenDatabaseWithOptions(mainPath, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatalf("open file main: %v", err)
 	}
@@ -353,7 +353,7 @@ func TestAttachFilePageSizeIndependent(t *testing.T) {
 	}
 	db.Close()
 
-	reopened, err := OpenDatabase(small)
+	reopened, err := OpenDatabaseWithOptions(small, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatalf("reopen small-page file: %v", err)
 	}

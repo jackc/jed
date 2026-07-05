@@ -38,6 +38,7 @@ fn create_default_session_persists_and_reopens() {
     {
         let mut db = Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(&path)),
+            skip_fsync: true,
             ..Default::default()
         })
         .unwrap();
@@ -54,7 +55,14 @@ fn create_default_session_persists_and_reopens() {
 
     // A fresh handle over the same file sees every committed row (the default-session bridge over a
     // demand-paged reopen).
-    let mut db = Database::open(&path).unwrap();
+    let mut db = Database::open_with_options(
+        &path,
+        OpenOptions {
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap();
     assert_eq!(count_via(&mut db), 5);
     assert_eq!(db.version(), 7); // 1 (create) + 1 (CREATE TABLE) + 5 (inserts)
     let _ = std::fs::remove_file(&path);
@@ -67,6 +75,7 @@ fn explicit_transaction_on_a_session_persists_then_rolls_back() {
     {
         let mut db = Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(&path)),
+            skip_fsync: true,
             ..Default::default()
         })
         .unwrap();
@@ -87,7 +96,14 @@ fn explicit_transaction_on_a_session_persists_then_rolls_back() {
         s.rollback().unwrap();
         assert_eq!(count_session(&mut s), 2);
     }
-    let mut db = Database::open(&path).unwrap();
+    let mut db = Database::open_with_options(
+        &path,
+        OpenOptions {
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap();
     assert_eq!(count_via(&mut db), 2); // only the committed block survived the reopen
     let _ = std::fs::remove_file(&path);
 }
@@ -99,6 +115,7 @@ fn execute_script_on_a_file_backed_default_session_is_all_or_nothing() {
     {
         let mut db = Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(&path)),
+            skip_fsync: true,
             ..Default::default()
         })
         .unwrap();
@@ -110,7 +127,14 @@ fn execute_script_on_a_file_backed_default_session_is_all_or_nothing() {
         assert_eq!(summary.statements_run, 3);
         assert_eq!(count_via(&mut db), 2);
     }
-    let mut db = Database::open(&path).unwrap();
+    let mut db = Database::open_with_options(
+        &path,
+        OpenOptions {
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap();
     assert_eq!(count_via(&mut db), 2);
     let _ = std::fs::remove_file(&path);
 }
@@ -122,6 +146,7 @@ fn read_only_open_rejects_writes() {
     {
         let mut db = Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(&path)),
+            skip_fsync: true,
             ..Default::default()
         })
         .unwrap();
@@ -133,6 +158,7 @@ fn read_only_open_rejects_writes() {
         &path,
         OpenOptions {
             read_only: true,
+            skip_fsync: true,
             ..OpenOptions::default()
         },
     )
@@ -168,6 +194,7 @@ fn file_backed_readers_run_concurrently_with_a_committing_writer() {
         // cache so reads genuinely fault from disk rather than staying fully resident.
         let mut db = Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(&path)),
+            skip_fsync: true,
             page_size: 256,
             ..Default::default()
         })
@@ -181,6 +208,7 @@ fn file_backed_readers_run_concurrently_with_a_committing_writer() {
         &path,
         OpenOptions {
             cache_bytes: 4 * 256, // only a handful of resident leaves
+            skip_fsync: true,
             ..OpenOptions::default()
         },
     )
@@ -237,7 +265,14 @@ fn file_backed_readers_run_concurrently_with_a_committing_writer() {
 
     // Reopen from scratch: every committed row is durable on disk.
     drop(db);
-    let mut reopened = Database::open(&path).unwrap();
+    let mut reopened = Database::open_with_options(
+        &path,
+        OpenOptions {
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap();
     assert_eq!(count_via(&mut reopened), 40);
     let _ = std::fs::remove_file(&path);
 }

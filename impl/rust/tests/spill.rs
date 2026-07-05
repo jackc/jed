@@ -69,6 +69,7 @@ fn spilling_sort_matches_in_memory_rows_and_cost() {
     // A file-backed database with a tiny work_mem so every shape spills many runs and k-way-merges.
     let mut db = Database::create(CreateOptions {
         path: Some(std::path::PathBuf::from(&path)),
+        skip_fsync: true,
         ..Default::default()
     })
     .unwrap()
@@ -120,6 +121,7 @@ fn spill_leaves_no_temp_files() {
 
     let mut db = Database::create(CreateOptions {
         path: Some(std::path::PathBuf::from(&path)),
+        skip_fsync: true,
         ..Default::default()
     })
     .unwrap()
@@ -150,6 +152,7 @@ fn spilling_sort_is_stable_on_ties() {
 
     let mut db = Database::create(CreateOptions {
         path: Some(std::path::PathBuf::from(&path)),
+        skip_fsync: true,
         ..Default::default()
     })
     .unwrap()

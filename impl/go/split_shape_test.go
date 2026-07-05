@@ -21,7 +21,7 @@ import (
 // permutation (i*37) mod 121 — deterministic, identical in every core.
 func splitShapeDB(t *testing.T, shuffled bool) *engine {
 	t.Helper()
-	db, err := create(filepath.Join(t.TempDir(), "t.jed"), databaseOptions{PageSize: 256})
+	db, err := create(filepath.Join(t.TempDir(), "t.jed"), databaseOptions{PageSize: 256, noSync: true})
 	if err != nil {
 		t.Fatal(err)
 	}

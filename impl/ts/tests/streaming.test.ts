@@ -407,7 +407,7 @@ test("sorted output early exit charges less", () => {
 test("sorted output spilling merge streams lazily", () => {
   const dir = mkdtempSync(join(tmpdir(), "jed-sorted-lazy-"));
   try {
-    const db = createDatabase({ path: join(dir, "db.jed") });
+    const db = createDatabase({ path: join(dir, "db.jed"), skipFsync: true });
     const w = db.writeSession();
     w.execute("CREATE TABLE t (id i32 PRIMARY KEY, k i32)");
     for (let id = 0; id < 200; id++) {

@@ -87,7 +87,7 @@ test("spilling sort matches the in-memory rows and cost", () => {
     seedSpill(mem, 200);
 
     // A file-backed database with a tiny workMem so every shape spills many runs and k-way-merges.
-    const db = createDatabase({ path: join(dir, "spill_match.jed") }).session();
+    const db = createDatabase({ path: join(dir, "spill_match.jed"), skipFsync: true }).session();
     seedSpill(db, 200);
     db.setWorkMem(128); // ~2-3 rows per run → dozens of runs, deep merge
 
@@ -114,7 +114,7 @@ test("spilling sort matches the in-memory rows and cost", () => {
 test("spill leaves no temp files", () => {
   const dir = mkdtempSync(join(tmpdir(), "jed-spill-clean-"));
   try {
-    const db = createDatabase({ path: join(dir, "spill_cleanup.jed") }).session();
+    const db = createDatabase({ path: join(dir, "spill_cleanup.jed"), skipFsync: true }).session();
     seedSpill(db, 150);
     db.setWorkMem(64); // force heavy spilling
 
@@ -133,7 +133,7 @@ test("spilling sort is stable on ties", () => {
   // by (run, position) = input order (spill.md §6).
   const dir = mkdtempSync(join(tmpdir(), "jed-spill-stable-"));
   try {
-    const db = createDatabase({ path: join(dir, "spill_stable.jed") }).session();
+    const db = createDatabase({ path: join(dir, "spill_stable.jed"), skipFsync: true }).session();
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY, k i32)");
     for (let id = 0; id < 100; id++) db.execute(`INSERT INTO t VALUES (${id}, 5)`);
     db.setWorkMem(96); // force spilling so the merge tie-break is exercised

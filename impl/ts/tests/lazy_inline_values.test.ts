@@ -81,13 +81,13 @@ test("paged inline values match resident across query shapes", () => {
   const dir = mkdtempSync(join(tmpdir(), "jed-l2-shapes-"));
   try {
     const path = join(dir, "shapes.jed");
-    const filedb = createDatabase({ path });
+    const filedb = createDatabase({ path, skipFsync: true });
     seed(filedb);
     filedb.close();
 
     const mem = memDb().session();
     seed(mem);
-    const paged = openDatabase(path);
+    const paged = openDatabase(path, { skipFsync: true });
 
     const queries = [
       "SELECT * FROM t",
@@ -151,7 +151,7 @@ test("mutations preserve untouched inline values", () => {
   const dir = mkdtempSync(join(tmpdir(), "jed-l2-mut-"));
   try {
     const path = join(dir, "mut.jed");
-    const filedb = createDatabase({ path });
+    const filedb = createDatabase({ path, skipFsync: true });
     seed(filedb);
     filedb.close();
 
@@ -168,11 +168,11 @@ test("mutations preserve untouched inline values", () => {
     ];
     for (const m of mutations) mem.execute(m);
     {
-      const paged = openDatabase(path);
+      const paged = openDatabase(path, { skipFsync: true });
       for (const m of mutations) paged.execute(m);
       paged.close();
     }
-    const paged = openDatabase(path);
+    const paged = openDatabase(path, { skipFsync: true });
     for (const sql of [
       "SELECT * FROM t",
       "SELECT id, name, amount, doc, tags, home, span, data FROM t ORDER BY id",
@@ -207,7 +207,7 @@ test("untouched corrupt inline body defers its error (read-on-touch)", () => {
   try {
     const path = join(dir, "corrupt.jed");
     const marker = "Zq7Zq7Zq7Zq7Zq7Zq7Zq7Zq7Zq7Zq7Zq"; // 32 chars, not in catalog text
-    const filedb = createDatabase({ path });
+    const filedb = createDatabase({ path, skipFsync: true });
     filedb.execute("CREATE TABLE t (id i32 PRIMARY KEY, body text, n i32)");
     filedb.execute(`INSERT INTO t VALUES (1, '${marker}', 42), (2, 'clean', 7)`);
     filedb.close();
@@ -227,7 +227,7 @@ test("untouched corrupt inline body defers its error (read-on-touch)", () => {
     new DataView(page.buffer, page.byteOffset, page.byteLength).setUint32(12, pageCrc(page), false);
     writeFileSync(path, bytes);
 
-    const db = openDatabase(path);
+    const db = openDatabase(path, { skipFsync: true });
     // Open faulted the leaf (skip-walk only); untouching queries never construct the body.
     assert.equal(rowsSorted(db, "SELECT id FROM t").length, 2);
     assert.deepEqual(rowsSorted(db, "SELECT id, n FROM t WHERE n = 42"), ["1\x1f42"]);
@@ -253,7 +253,7 @@ test("untouched deferred column rides a spilling sort", () => {
   try {
     const path = join(dir, "spill.jed");
     const mem = memDb().session();
-    const filedb = createDatabase({ path });
+    const filedb = createDatabase({ path, skipFsync: true });
     for (const db of [mem, filedb]) {
       db.execute("CREATE TABLE t (id i32 PRIMARY KEY, k i32, label text, doc jsonb)");
     }
@@ -265,7 +265,7 @@ test("untouched deferred column rides a spilling sort", () => {
     }
     filedb.close();
 
-    const paged = openDatabase(path).session();
+    const paged = openDatabase(path, { skipFsync: true }).session();
     paged.setWorkMem(128); // ~2-3 rows per run → dozens of spilled runs + a deep k-way merge
     for (const sql of [
       "SELECT id FROM t ORDER BY k, id",

@@ -448,6 +448,7 @@ fn sorted_spill_merge_streams_lazily() {
 
     let db = Database::create(CreateOptions {
         path: Some(std::path::PathBuf::from(&path)),
+        skip_fsync: true,
         ..Default::default()
     })
     .unwrap();

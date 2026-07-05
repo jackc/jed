@@ -40,7 +40,7 @@ test("create + default session persists and reopens", () => {
   const path = join(dir, "roundtrip.jed");
   try {
     {
-      const db = createDatabase({ path });
+      const db = createDatabase({ path, skipFsync: true });
       assert.equal(db.version, 1n); // the initial empty image is committed as version 1
       db.execute("CREATE TABLE t (id i64 PRIMARY KEY)");
       assert.equal(db.version, 2n); // the autocommit CREATE published version 2
@@ -48,7 +48,7 @@ test("create + default session persists and reopens", () => {
       assert.equal(countDB(db), 5n);
       db.close();
     }
-    const db = openDatabase(path);
+    const db = openDatabase(path, { skipFsync: true });
     try {
       assert.equal(countDB(db), 5n);
       assert.equal(db.version, 7n); // 1 (create) + 1 (CREATE TABLE) + 5 (inserts)
@@ -65,7 +65,7 @@ test("explicit transaction on a session persists then rolls back", () => {
   const path = join(dir, "explicit_tx.jed");
   try {
     {
-      const db = createDatabase({ path });
+      const db = createDatabase({ path, skipFsync: true });
       // Explicit transactions live on a Session (the persistent default-session bridge was removed
       // from Database): mint one over the file-backed core and drive begin/commit/rollback on it.
       const s = db.session({});
@@ -84,7 +84,7 @@ test("explicit transaction on a session persists then rolls back", () => {
       s.close();
       db.close();
     }
-    const db = openDatabase(path);
+    const db = openDatabase(path, { skipFsync: true });
     try {
       assert.equal(countDB(db), 2n); // only the committed block survived the reopen
     } finally {
@@ -100,7 +100,7 @@ test("executeScript on a file-backed default session is all-or-nothing", () => {
   const path = join(dir, "script.jed");
   try {
     {
-      const db = createDatabase({ path });
+      const db = createDatabase({ path, skipFsync: true });
       const summary = db.executeScript(
         "CREATE TABLE t (id i64 PRIMARY KEY); INSERT INTO t VALUES (1); INSERT INTO t VALUES (2);",
       );
@@ -108,7 +108,7 @@ test("executeScript on a file-backed default session is all-or-nothing", () => {
       assert.equal(countDB(db), 2n);
       db.close();
     }
-    const db = openDatabase(path);
+    const db = openDatabase(path, { skipFsync: true });
     try {
       assert.equal(countDB(db), 2n);
     } finally {
@@ -124,12 +124,12 @@ test("a read-only open rejects writes (25006)", () => {
   const path = join(dir, "read_only.jed");
   try {
     {
-      const db = createDatabase({ path });
+      const db = createDatabase({ path, skipFsync: true });
       db.execute("CREATE TABLE t (id i64 PRIMARY KEY)");
       db.execute("INSERT INTO t VALUES (1)");
       db.close();
     }
-    const db = openDatabase(path, { readOnly: true });
+    const db = openDatabase(path, { readOnly: true, skipFsync: true });
     try {
       assert.equal(countDB(db), 1n);
       assert.throws(
@@ -161,7 +161,7 @@ test("a file-backed read session stays isolated as the default session commits",
   const dir = tmpDir();
   const path = join(dir, "isolation.jed");
   try {
-    const db = createDatabase({ path, pageSize: 256 }); // small pages so the table spans leaves
+    const db = createDatabase({ path, pageSize: 256, skipFsync: true }); // small pages so the table spans leaves
     db.execute("CREATE TABLE t (id i64 PRIMARY KEY)");
     db.execute("INSERT INTO t VALUES (1)");
 
@@ -180,7 +180,7 @@ test("a file-backed read session stays isolated as the default session commits",
     }
     db.close();
 
-    const reopened = openDatabase(path);
+    const reopened = openDatabase(path, { skipFsync: true });
     try {
       assert.equal(countDB(reopened), 20n); // durable on disk
     } finally {

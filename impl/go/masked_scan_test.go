@@ -38,7 +38,7 @@ func wideFixedSeed(t *testing.T, db dbHandle) {
 
 func TestMaskedWideFixedWidthMatchesResident(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "masked_wide_fixed.jed")
-	db, err := create(path, databaseOptions{PageSize: DefaultPageSize})
+	db, err := create(path, databaseOptions{PageSize: DefaultPageSize, noSync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +48,7 @@ func TestMaskedWideFixedWidthMatchesResident(t *testing.T) {
 	}
 	mem := memDB().Session(SessionOptions{})
 	wideFixedSeed(t, mem)
-	paged, err := open(path)
+	paged, err := openWithOptions(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,7 +164,7 @@ func TestMaskedColumnarMultiLevelMatchesResident(t *testing.T) {
 		}
 	}
 	path := filepath.Join(t.TempDir(), "masked_multilevel.jed")
-	db, err := create(path, databaseOptions{PageSize: DefaultPageSize})
+	db, err := create(path, databaseOptions{PageSize: DefaultPageSize, noSync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,7 +174,7 @@ func TestMaskedColumnarMultiLevelMatchesResident(t *testing.T) {
 	}
 	mem := memDB().Session(SessionOptions{})
 	seed(t, mem)
-	paged, err := open(path)
+	paged, err := openWithOptions(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}

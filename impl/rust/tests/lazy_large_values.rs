@@ -8,7 +8,7 @@
 //! spilled column is touched. Mirrored in Go (lazy_large_values_test.go) and TS
 //! (tests/lazy_large_values.test.ts).
 
-use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, OpenOptions, Outcome, Session, SessionOptions};
 
 const PAGE_SIZE: u32 = 256;
 
@@ -112,6 +112,7 @@ fn chains_are_read_only_when_touched() {
     {
         let mut db = Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(&path)),
+            skip_fsync: true,
             page_size: PAGE_SIZE,
             ..Default::default()
         })
@@ -123,9 +124,15 @@ fn chains_are_read_only_when_touched() {
     corrupt_overflow_payloads(&path);
 
     // Open walks live chains by headers only — corrupt payloads are invisible.
-    let mut db = Database::open(&path)
-        .unwrap()
-        .session(SessionOptions::default());
+    let mut db = Database::open_with_options(
+        &path,
+        OpenOptions {
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap()
+    .session(SessionOptions::default());
 
     // Untouching queries never read a chain or decompress a block.
     let ids = query_rows(&mut db, "SELECT id FROM t");
@@ -160,6 +167,7 @@ fn lazy_values_round_trip_exactly() {
     {
         let mut db = Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(&path)),
+            skip_fsync: true,
             page_size: PAGE_SIZE,
             ..Default::default()
         })
@@ -168,9 +176,15 @@ fn lazy_values_round_trip_exactly() {
         seed(&mut db);
         drop(db);
     }
-    let mut db = Database::open(&path)
-        .unwrap()
-        .session(SessionOptions::default());
+    let mut db = Database::open_with_options(
+        &path,
+        OpenOptions {
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap()
+    .session(SessionOptions::default());
     let rows = query_rows(&mut db, "SELECT body FROM t");
     let got: Vec<String> = rows.iter().map(|r| r[0].render()).collect();
     assert_eq!(
@@ -198,6 +212,7 @@ fn update_of_other_columns_preserves_spilled_values() {
     {
         let mut db = Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(&path)),
+            skip_fsync: true,
             page_size: PAGE_SIZE,
             ..Default::default()
         })
@@ -213,9 +228,15 @@ fn update_of_other_columns_preserves_spilled_values() {
         drop(db);
     }
     {
-        let mut db = Database::open(&path)
-            .unwrap()
-            .session(SessionOptions::default());
+        let mut db = Database::open_with_options(
+            &path,
+            OpenOptions {
+                skip_fsync: true,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap()
+        .session(SessionOptions::default());
         // Dirties the leaf carrying row 1's unfetched body without touching it: row 2's
         // rewrite resolves nothing, row 1 resolves at commit.
         db.query_outcome("UPDATE t SET n = 99 WHERE id = 2", &[])
@@ -225,9 +246,15 @@ fn update_of_other_columns_preserves_spilled_values() {
             .unwrap();
         drop(db);
     }
-    let mut db = Database::open(&path)
-        .unwrap()
-        .session(SessionOptions::default());
+    let mut db = Database::open_with_options(
+        &path,
+        OpenOptions {
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap()
+    .session(SessionOptions::default());
     let rows = query_rows(&mut db, "SELECT body, n FROM t");
     assert_eq!(rows[0][0].render(), big);
     assert_eq!(rows[0][1].render(), "11");
@@ -254,6 +281,7 @@ fn paged_and_resident_costs_match() {
     {
         let mut db = Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(&path)),
+            skip_fsync: true,
             page_size: PAGE_SIZE,
             ..Default::default()
         })
@@ -262,9 +290,15 @@ fn paged_and_resident_costs_match() {
         seed(&mut db);
         drop(db);
     }
-    let mut paged = Database::open(&path)
-        .unwrap()
-        .session(SessionOptions::default());
+    let mut paged = Database::open_with_options(
+        &path,
+        OpenOptions {
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap()
+    .session(SessionOptions::default());
     for sql in [
         "SELECT * FROM t",
         "SELECT id FROM t",

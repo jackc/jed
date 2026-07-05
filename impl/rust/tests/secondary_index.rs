@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 use jed::value::Value;
-use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, OpenOptions, Outcome, Session, SessionOptions};
 
 fn tmp(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name)
@@ -239,6 +239,7 @@ fn file_backed_paged_reopen_uses_the_index() {
     let _ = std::fs::remove_file(&path);
     let mut db = Database::create(CreateOptions {
         path: Some(std::path::PathBuf::from(&path)),
+        skip_fsync: true,
         page_size: 256,
         ..Default::default()
     })
@@ -255,9 +256,15 @@ fn file_backed_paged_reopen_uses_the_index() {
     let in_memory_cost = cost(&mut db, "SELECT id FROM t WHERE v = 3");
     drop(db);
 
-    let mut reopened = Database::open(&path)
-        .unwrap()
-        .session(SessionOptions::default());
+    let mut reopened = Database::open_with_options(
+        &path,
+        OpenOptions {
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap()
+    .session(SessionOptions::default());
     // The paged open reads the index tree as a skeleton; the logical cost is unchanged.
     assert_eq!(
         cost(&mut reopened, "SELECT id FROM t WHERE v = 3"),
@@ -271,9 +278,15 @@ fn file_backed_paged_reopen_uses_the_index() {
     run(&mut reopened, "UPDATE t SET v = 3 WHERE id = 4");
     run(&mut reopened, "DELETE FROM t WHERE id = 13");
     drop(reopened);
-    let mut again = Database::open(&path)
-        .unwrap()
-        .session(SessionOptions::default());
+    let mut again = Database::open_with_options(
+        &path,
+        OpenOptions {
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap()
+    .session(SessionOptions::default());
     assert_eq!(
         ids(&mut again, "SELECT id FROM t WHERE v = 3 ORDER BY id"),
         vec![3, 4, 8, 18]

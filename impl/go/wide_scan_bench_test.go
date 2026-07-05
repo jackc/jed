@@ -30,7 +30,7 @@ const trackARows = 50_000
 func buildWideTable(b *testing.B, w int) string {
 	b.Helper()
 	path := filepath.Join(b.TempDir(), fmt.Sprintf("wide_w%d.jed", w))
-	db, err := CreateDatabase(CreateOptions{Path: path})
+	db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -87,7 +87,7 @@ func BenchmarkTrackAWideScan(b *testing.B) {
 
 	for _, w := range widths {
 		path := buildWideTable(b, w)
-		db, err := OpenDatabase(path)
+		db, err := OpenDatabaseWithOptions(path, OpenOptions{SkipFsync: true})
 		if err != nil {
 			b.Fatal(err)
 		}

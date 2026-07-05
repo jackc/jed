@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 
 use jed::value::Value;
-use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, OpenOptions, Outcome, Session, SessionOptions};
 
 fn tmp(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name)
@@ -72,6 +72,7 @@ fn identity_kind_survives_reopen() {
     {
         let mut db = Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(&path)),
+            skip_fsync: true,
             ..Default::default()
         })
         .unwrap()
@@ -87,9 +88,15 @@ fn identity_kind_survives_reopen() {
         db.commit().unwrap();
     }
     {
-        let mut db = Database::open(&path)
-            .unwrap()
-            .session(SessionOptions::default());
+        let mut db = Database::open_with_options(
+            &path,
+            OpenOptions {
+                skip_fsync: true,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap()
+        .session(SessionOptions::default());
         // ALWAYS still rejects an explicit value (the bit round-tripped).
         assert_eq!(
             err_code(&mut db, "INSERT INTO t (id, v) VALUES (5, 'x')"),

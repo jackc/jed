@@ -102,7 +102,7 @@ func TestExternalValueThroughPagedFileAndReclaims(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "large_values.jed")
 	big := fillerText(1500) // incompressible ≫ RECORD_MAX at ps 256 ⇒ a multi-page overflow chain
 
-	db, err := create(path, databaseOptions{PageSize: 256})
+	db, err := create(path, databaseOptions{PageSize: 256, noSync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +115,7 @@ func TestExternalValueThroughPagedFileAndReclaims(t *testing.T) {
 
 	// Reopen demand-paged (the default Open): the big value reconstructs exactly through the
 	// pager-backed chain read.
-	db, err = open(path)
+	db, err = openWithOptions(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +128,7 @@ func TestExternalValueThroughPagedFileAndReclaims(t *testing.T) {
 	}
 
 	// Delete the big row; its chain is orphaned (leaked this session).
-	db, err = open(path)
+	db, err = openWithOptions(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +140,7 @@ func TestExternalValueThroughPagedFileAndReclaims(t *testing.T) {
 	// Reopen: the free-list reconstruction collects only live chains, so the dead chain's pages are
 	// now free. Re-inserting a large value reuses them — the high-water grows by a handful of pages,
 	// not by a whole fresh chain (~7 pages).
-	db, err = open(path)
+	db, err = openWithOptions(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +155,7 @@ func TestExternalValueThroughPagedFileAndReclaims(t *testing.T) {
 	}
 
 	// Final correctness through the paged path.
-	db, err = open(path)
+	db, err = openWithOptions(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 
 use jed::value::Value;
-use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, OpenOptions, Outcome, Session, SessionOptions};
 
 fn tmp(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name)
@@ -49,6 +49,7 @@ fn a_single_row_commit_appends_only_the_dirty_path() {
     let ps = 256u64;
     let mut db = Database::create(CreateOptions {
         path: Some(std::path::PathBuf::from(&path)),
+        skip_fsync: true,
         page_size: 256,
         ..Default::default()
     })
@@ -99,9 +100,15 @@ fn a_single_row_commit_appends_only_the_dirty_path() {
 
     // And it reopens to the full, correct contents (leaked pages and all).
     drop(db);
-    let mut db = Database::open(&path)
-        .unwrap()
-        .session(SessionOptions::default());
+    let mut db = Database::open_with_options(
+        &path,
+        OpenOptions {
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap()
+    .session(SessionOptions::default());
     assert_eq!(ids(&mut db), (1..=31).collect::<Vec<_>>());
 }
 
@@ -115,6 +122,7 @@ fn delete_heavy_history_reopens_correctly() {
     let pad = "x".repeat(48);
     let mut db = Database::create(CreateOptions {
         path: Some(std::path::PathBuf::from(&path)),
+        skip_fsync: true,
         page_size: 256,
         ..Default::default()
     })
@@ -135,9 +143,15 @@ fn delete_heavy_history_reopens_correctly() {
     }
     drop(db);
 
-    let mut db = Database::open(&path)
-        .unwrap()
-        .session(SessionOptions::default());
+    let mut db = Database::open_with_options(
+        &path,
+        OpenOptions {
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap()
+    .session(SessionOptions::default());
     assert_eq!(ids(&mut db), (21..=30).collect::<Vec<_>>());
 }
 
@@ -147,6 +161,7 @@ fn meta_slots_alternate_across_commits() {
     let _ = std::fs::remove_file(&path);
     let mut db = Database::create(CreateOptions {
         path: Some(std::path::PathBuf::from(&path)),
+        skip_fsync: true,
         ..Default::default()
     })
     .unwrap()
@@ -167,9 +182,15 @@ fn meta_slots_alternate_across_commits() {
     assert_eq!(slot_txid(&img, 0), 2, "even txid lands in slot 0");
     assert_eq!(slot_txid(&img, 1), 3, "odd txid lands in slot 1");
 
-    let db = Database::open(&path)
-        .unwrap()
-        .session(SessionOptions::default());
+    let db = Database::open_with_options(
+        &path,
+        OpenOptions {
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap()
+    .session(SessionOptions::default());
     assert_eq!(db.txid(), 3, "open adopts the highest valid txid");
 }
 
@@ -179,6 +200,7 @@ fn torn_latest_commit_falls_back_to_prior_snapshot() {
     let _ = std::fs::remove_file(&path);
     let mut db = Database::create(CreateOptions {
         path: Some(std::path::PathBuf::from(&path)),
+        skip_fsync: true,
         ..Default::default()
     })
     .unwrap()
@@ -197,9 +219,15 @@ fn torn_latest_commit_falls_back_to_prior_snapshot() {
     img[32] ^= 0xFF; // flip a CRC byte of slot 0's meta header
     std::fs::write(&path, &img).unwrap();
 
-    let mut db = Database::open(&path)
-        .unwrap()
-        .session(SessionOptions::default());
+    let mut db = Database::open_with_options(
+        &path,
+        OpenOptions {
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap()
+    .session(SessionOptions::default());
     assert_eq!(db.txid(), 3, "fell back to the prior committed snapshot");
     assert_eq!(
         ids(&mut db),
@@ -218,6 +246,7 @@ fn small_database_file_stays_proportional() {
     let _ = std::fs::remove_file(&path);
     let mut db = Database::create(CreateOptions {
         path: Some(std::path::PathBuf::from(&path)),
+        skip_fsync: true,
         page_size: 256,
         ..Default::default()
     })

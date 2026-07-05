@@ -304,7 +304,7 @@ test("float column round-trips through the spill-to-disk sort (per-core codec)",
   try {
     // In-memory (never spills) is the source of truth; a file-backed DB with a tiny workMem spills.
     const mem = memDb().session();
-    const db = createDatabase({ path: join(dir, "float_spill.jed") }).session();
+    const db = createDatabase({ path: join(dir, "float_spill.jed"), skipFsync: true }).session();
     for (const d of [mem, db]) {
       d.execute("CREATE TABLE t (id int PRIMARY KEY, a f64, b f32)");
       for (let i = 0; i < 60; i++) {

@@ -93,7 +93,7 @@ test("in-memory: an in-session-created table joins the residency flip", () => {
 test("file create-session: an in-session-created table joins the residency flip", () => {
   const dir = mkdtempSync(join(tmpdir(), "jed-flip-"));
   try {
-    const db = createDatabase({ path: join(dir, "flip.jed"), pageSize: 256 });
+    const db = createDatabase({ path: join(dir, "flip.jed"), pageSize: 256, skipFsync: true });
     try {
       run(db);
     } finally {

@@ -6,7 +6,7 @@
 //! only surfaced through the window_running_sum benchmark, which reads a committed file. Mirrored in
 //! Go (window_persisted_test.go) and TS (tests/window_persisted.test.ts).
 
-use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, OpenOptions, Outcome, Session, SessionOptions};
 
 const PAGE_SIZE: u32 = 256;
 
@@ -25,6 +25,7 @@ fn seed_persisted_window(path: &std::path::Path) -> Session {
     {
         let mut db = Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(path)),
+            skip_fsync: true,
             page_size: PAGE_SIZE,
             ..Default::default()
         })
@@ -44,9 +45,15 @@ fn seed_persisted_window(path: &std::path::Path) -> Session {
         }
         drop(db);
     }
-    Database::open(path)
-        .unwrap()
-        .session(SessionOptions::default())
+    Database::open_with_options(
+        path,
+        OpenOptions {
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap()
+    .session(SessionOptions::default())
 }
 
 #[test]

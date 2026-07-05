@@ -366,7 +366,7 @@ func TestSerialOwnedSequenceDropRules(t *testing.T) {
 // auto-drops the owned sequence, and DROP SEQUENCE of it is still 2BP01.
 func TestSerialOwnedLinkSurvivesReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "serial_owned_reopen.jed")
-	db, err := create(path, databaseOptions{PageSize: 4096})
+	db, err := create(path, databaseOptions{PageSize: 4096, noSync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -379,7 +379,7 @@ func TestSerialOwnedLinkSurvivesReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db, err = open(path)
+	db, err = openWithOptions(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}

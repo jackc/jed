@@ -44,7 +44,7 @@ func TestIdentityDesugarsToOwnedSequences(t *testing.T) {
 // DEFAULT column still accepts one — proving the bits round-tripped through the catalog bytes.
 func TestIdentityKindSurvivesReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "identity_reopen.jed")
-	db, err := create(path, databaseOptions{PageSize: 4096})
+	db, err := create(path, databaseOptions{PageSize: 4096, noSync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +58,7 @@ func TestIdentityKindSurvivesReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db, err = open(path)
+	db, err = openWithOptions(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}

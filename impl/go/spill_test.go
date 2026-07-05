@@ -109,7 +109,7 @@ func TestSpillingSortMatchesInMemory(t *testing.T) {
 	seedSpill(t, mem, 200)
 
 	// A file-backed database with a tiny workMem so every shape spills many runs and k-way-merges.
-	db, err := create(path, databaseOptions{PageSize: DefaultPageSize})
+	db, err := create(path, databaseOptions{PageSize: DefaultPageSize, noSync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,7 +159,7 @@ func TestSpillLeavesNoTempFiles(t *testing.T) {
 		return n
 	}
 
-	db, err := create(path, databaseOptions{PageSize: DefaultPageSize})
+	db, err := create(path, databaseOptions{PageSize: DefaultPageSize, noSync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +179,7 @@ func TestSpillingSortIsStableOnTies(t *testing.T) {
 	// scan order (primary key = id ascending). The external sort reproduces it only if the merge
 	// tie-breaks by (run, position) = input order (spill.md §6).
 	path := filepath.Join(t.TempDir(), "spill_stable.jed")
-	db, err := create(path, databaseOptions{PageSize: DefaultPageSize})
+	db, err := create(path, databaseOptions{PageSize: DefaultPageSize, noSync: true})
 	if err != nil {
 		t.Fatal(err)
 	}

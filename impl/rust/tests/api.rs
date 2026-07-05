@@ -18,6 +18,7 @@ fn create_commit_reopen_round_trips() {
 
     let mut db = Database::create(CreateOptions {
         path: Some(std::path::PathBuf::from(&path)),
+        skip_fsync: true,
         ..Default::default()
     })
     .unwrap()
@@ -31,9 +32,15 @@ fn create_commit_reopen_round_trips() {
     let after_commit = db.txid();
     drop(db);
 
-    let mut db = Database::open(&path)
-        .unwrap()
-        .session(SessionOptions::default());
+    let mut db = Database::open_with_options(
+        &path,
+        OpenOptions {
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap()
+    .session(SessionOptions::default());
     assert_eq!(db.txid(), after_commit);
     match db.query_outcome("SELECT id, v FROM t", &[]).unwrap() {
         Outcome::Query { rows, .. } => assert_eq!(
@@ -60,6 +67,7 @@ fn create_over_existing_file_is_58p02() {
     let _ = std::fs::remove_file(&path);
     Database::create(CreateOptions {
         path: Some(std::path::PathBuf::from(&path)),
+        skip_fsync: true,
         ..Default::default()
     })
     .unwrap()
@@ -67,6 +75,7 @@ fn create_over_existing_file_is_58p02() {
     assert_eq!(
         Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(&path)),
+            skip_fsync: true,
             ..Default::default()
         })
         .err()
@@ -82,6 +91,7 @@ fn create_with_custom_page_size_round_trips() {
     let _ = std::fs::remove_file(&path);
     let db = Database::create(CreateOptions {
         path: Some(std::path::PathBuf::from(&path)),
+        skip_fsync: true,
         page_size: 256,
         ..Default::default()
     })
@@ -93,9 +103,15 @@ fn create_with_custom_page_size_round_trips() {
     // The file's recorded page size survives reopen, and the on-disk u32 at offset 8 is 256.
     let bytes = std::fs::read(&path).unwrap();
     assert_eq!(u32::from_be_bytes(bytes[8..12].try_into().unwrap()), 256);
-    let db = Database::open(&path)
-        .unwrap()
-        .session(SessionOptions::default());
+    let db = Database::open_with_options(
+        &path,
+        OpenOptions {
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap()
+    .session(SessionOptions::default());
     assert_eq!(db.page_size(), 256);
 }
 
@@ -108,6 +124,7 @@ fn autocommit_persists_each_write_across_close() {
     let _ = std::fs::remove_file(&path);
     let mut db = Database::create(CreateOptions {
         path: Some(std::path::PathBuf::from(&path)),
+        skip_fsync: true,
         ..Default::default()
     })
     .unwrap()
@@ -117,9 +134,15 @@ fn autocommit_persists_each_write_across_close() {
     db.query_outcome("INSERT INTO t VALUES (1)", &[]).unwrap(); // autocommitted, no explicit commit
     drop(db);
 
-    let mut db = Database::open(&path)
-        .unwrap()
-        .session(SessionOptions::default());
+    let mut db = Database::open_with_options(
+        &path,
+        OpenOptions {
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap()
+    .session(SessionOptions::default());
     match db.query_outcome("SELECT id FROM t", &[]).unwrap() {
         Outcome::Query { rows, .. } => {
             assert_eq!(
@@ -269,6 +292,7 @@ fn incremental_commit_round_trips_to_canonical_image() {
     let _ = std::fs::remove_file(&path);
     let mut db = Database::create(CreateOptions {
         path: Some(std::path::PathBuf::from(&path)),
+        skip_fsync: true,
         ..Default::default()
     })
     .unwrap()
@@ -281,9 +305,15 @@ fn incremental_commit_round_trips_to_canonical_image() {
     let canonical = db.to_image(db.page_size(), db.txid()).unwrap();
     drop(db);
 
-    let reopened = Database::open(&path)
-        .unwrap()
-        .session(SessionOptions::default());
+    let reopened = Database::open_with_options(
+        &path,
+        OpenOptions {
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap()
+    .session(SessionOptions::default());
     assert_eq!(
         reopened
             .to_image(reopened.page_size(), reopened.txid())
@@ -302,6 +332,7 @@ fn open_read_only_blocks_writes_and_never_touches_the_file() {
     let _ = std::fs::remove_file(&path);
     let mut db = Database::create(CreateOptions {
         path: Some(std::path::PathBuf::from(&path)),
+        skip_fsync: true,
         ..Default::default()
     })
     .unwrap()
@@ -316,6 +347,7 @@ fn open_read_only_blocks_writes_and_never_touches_the_file() {
         &path,
         OpenOptions {
             read_only: true,
+            skip_fsync: true,
             ..OpenOptions::default()
         },
     )
@@ -375,9 +407,15 @@ fn open_read_only_blocks_writes_and_never_touches_the_file() {
     assert_eq!(std::fs::read(&path).unwrap(), before);
 
     // A normal reopen is writable again.
-    let mut db = Database::open(&path)
-        .unwrap()
-        .session(SessionOptions::default());
+    let mut db = Database::open_with_options(
+        &path,
+        OpenOptions {
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap()
+    .session(SessionOptions::default());
     assert!(!db.read_only());
     db.query_outcome("INSERT INTO t VALUES (2)", &[]).unwrap();
 }

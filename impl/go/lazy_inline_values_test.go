@@ -64,7 +64,7 @@ func rowsSorted(t *testing.T, db dbHandle, sql string) []string {
 // each, a paged reopen and an in-memory seed must agree on both rows and cost.
 func TestLazyInlineValuesMatchResidentAcrossQueryShapes(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "l2_shapes.jed")
-	db, err := create(path, databaseOptions{PageSize: DefaultPageSize})
+	db, err := create(path, databaseOptions{PageSize: DefaultPageSize, noSync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +74,7 @@ func TestLazyInlineValuesMatchResidentAcrossQueryShapes(t *testing.T) {
 	}
 	mem := memDB().Session(SessionOptions{})
 	inlineSeed(t, mem)
-	paged, err := open(path)
+	paged, err := openWithOptions(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +137,7 @@ func TestLazyInlineValuesMatchResidentAcrossQueryShapes(t *testing.T) {
 // the identical final state.
 func TestLazyInlineMutationsPreserveUntouchedValues(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "l2_mutations.jed")
-	db, err := create(path, databaseOptions{PageSize: DefaultPageSize})
+	db, err := create(path, databaseOptions{PageSize: DefaultPageSize, noSync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,7 +159,7 @@ func TestLazyInlineMutationsPreserveUntouchedValues(t *testing.T) {
 	for _, m := range mutations {
 		mustExec(t, mem, m)
 	}
-	paged, err := open(path)
+	paged, err := openWithOptions(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,7 +170,7 @@ func TestLazyInlineMutationsPreserveUntouchedValues(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	paged, err = open(path)
+	paged, err = openWithOptions(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +194,7 @@ func TestLazyInlineMutationsPreserveUntouchedValues(t *testing.T) {
 func TestLazyUntouchedCorruptInlineBodyDefersError(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "l2_corrupt.jed")
 	marker := "Zq7Zq7Zq7Zq7Zq7Zq7Zq7Zq7Zq7Zq7Zq" // 32 chars, no overlap with catalog text
-	db, err := create(path, databaseOptions{PageSize: DefaultPageSize})
+	db, err := create(path, databaseOptions{PageSize: DefaultPageSize, noSync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,7 +234,7 @@ func TestLazyUntouchedCorruptInlineBodyDefersError(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db, err = open(path)
+	db, err = openWithOptions(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,7 +266,7 @@ func TestLazyUntouchedCorruptInlineBodyDefersError(t *testing.T) {
 func TestLazyUntouchedDeferredColumnRidesSpillingSort(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "l2_spill.jed")
 	mem := memDB().Session(SessionOptions{})
-	db, err := create(path, databaseOptions{PageSize: DefaultPageSize})
+	db, err := create(path, databaseOptions{PageSize: DefaultPageSize, noSync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -283,7 +283,7 @@ func TestLazyUntouchedDeferredColumnRidesSpillingSort(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	paged, err := open(path)
+	paged, err := openWithOptions(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}

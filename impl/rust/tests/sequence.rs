@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 use jed::value::Value;
-use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, OpenOptions, Outcome, Session, SessionOptions};
 
 fn tmp(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name)
@@ -357,6 +357,7 @@ fn owned_link_survives_reopen() {
     {
         let mut db = Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(&path)),
+            skip_fsync: true,
             ..Default::default()
         })
         .unwrap()
@@ -368,9 +369,15 @@ fn owned_link_survives_reopen() {
         db.commit().unwrap();
     }
     {
-        let mut db = Database::open(&path)
-            .unwrap()
-            .session(SessionOptions::default());
+        let mut db = Database::open_with_options(
+            &path,
+            OpenOptions {
+                skip_fsync: true,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap()
+        .session(SessionOptions::default());
         // The owner link round-tripped: still 2BP01 to drop the sequence directly.
         assert_eq!(err_code(&mut db, "DROP SEQUENCE t_id_seq"), "2BP01");
         // And DROP TABLE still auto-drops it.

@@ -15,7 +15,7 @@ import (
 
 func TestOpenOptionsWorkMemZeroIsDefaultBudget(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "wm.jed")
-	seed, err := create(path, databaseOptions{PageSize: DefaultPageSize})
+	seed, err := create(path, databaseOptions{PageSize: DefaultPageSize, noSync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +48,7 @@ func TestOpenOptionsWorkMemZeroIsDefaultBudget(t *testing.T) {
 	// The unbounded/never-spill budget is still reachable — just at runtime, via the setter (0 ⇒
 	// unlimited, the runtime convention its MaxCost/TempBuffers siblings share), never as a bare-options
 	// zero value. This is the boundary the remap draws: options 0 ⇒ default, runtime 0 ⇒ unlimited.
-	db, err := openWithOptions(path, OpenOptions{})
+	db, err := openWithOptions(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -16,6 +16,7 @@ fn seed(name: &str) -> PathBuf {
     // `create` writes the initial durable image immediately; the temporary handle drops → file closed.
     Database::create(CreateOptions {
         path: Some(path.clone()),
+        skip_fsync: true,
         ..Default::default()
     })
     .unwrap();

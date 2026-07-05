@@ -9,7 +9,7 @@
 //! layer as a loud poison panic, never silent NULL). Mirrored in Go (lazy_inline_values_test.go)
 //! and TS (tests/lazy_inline_values.test.ts).
 
-use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, OpenOptions, Outcome, Session, SessionOptions};
 
 fn tmp(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(name)
@@ -91,6 +91,7 @@ fn paged_inline_values_match_resident_across_query_shapes() {
     {
         let mut db = Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(&path)),
+            skip_fsync: true,
             page_size: jed::DEFAULT_PAGE_SIZE,
             ..Default::default()
         })
@@ -106,9 +107,15 @@ fn paged_inline_values_match_resident_across_query_shapes() {
     .unwrap()
     .session(SessionOptions::default());
     seed(&mut mem);
-    let mut paged = Database::open(&path)
-        .unwrap()
-        .session(SessionOptions::default());
+    let mut paged = Database::open_with_options(
+        &path,
+        OpenOptions {
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap()
+    .session(SessionOptions::default());
 
     let queries = [
         // Whole-row and per-column projection (every deferred type resolves).
@@ -191,6 +198,7 @@ fn mutations_preserve_untouched_inline_values() {
     {
         let mut db = Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(&path)),
+            skip_fsync: true,
             page_size: jed::DEFAULT_PAGE_SIZE,
             ..Default::default()
         })
@@ -230,9 +238,15 @@ fn mutations_preserve_untouched_inline_values() {
     }
     // Apply to the paged store across a reopen so each mutation runs against lazily-faulted rows.
     {
-        let mut paged = Database::open(&path)
-            .unwrap()
-            .session(SessionOptions::default());
+        let mut paged = Database::open_with_options(
+            &path,
+            OpenOptions {
+                skip_fsync: true,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap()
+        .session(SessionOptions::default());
         for m in mutations {
             paged.query_outcome(m, &[]).unwrap();
         }
@@ -240,9 +254,15 @@ fn mutations_preserve_untouched_inline_values() {
     }
 
     // A fresh paged reopen must read back exactly the resident final state.
-    let mut paged = Database::open(&path)
-        .unwrap()
-        .session(SessionOptions::default());
+    let mut paged = Database::open_with_options(
+        &path,
+        OpenOptions {
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap()
+    .session(SessionOptions::default());
     for sql in [
         "SELECT * FROM t",
         "SELECT id, name, amount, doc, tags, home, span, data FROM t ORDER BY id",
@@ -286,6 +306,7 @@ fn untouched_corrupt_inline_body_defers_its_error() {
     {
         let mut db = Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(&path)),
+            skip_fsync: true,
             page_size: jed::DEFAULT_PAGE_SIZE,
             ..Default::default()
         })
@@ -321,9 +342,15 @@ fn untouched_corrupt_inline_body_defers_its_error() {
         std::fs::write(&path, &bytes).unwrap();
     }
 
-    let mut db = Database::open(&path)
-        .unwrap()
-        .session(SessionOptions::default());
+    let mut db = Database::open_with_options(
+        &path,
+        OpenOptions {
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap()
+    .session(SessionOptions::default());
     // Open faulted the leaf (skip-walk only); untouching queries never construct the body.
     assert_eq!(rows_sorted(&mut db, "SELECT id FROM t").len(), 2);
     assert_eq!(
@@ -366,6 +393,7 @@ fn untouched_deferred_column_rides_a_spilling_sort() {
     {
         let mut db = Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(&path)),
+            skip_fsync: true,
             ..Default::default()
         })
         .unwrap()
@@ -390,9 +418,15 @@ fn untouched_deferred_column_rides_a_spilling_sort() {
         drop(db);
     }
 
-    let mut paged = Database::open(&path)
-        .unwrap()
-        .session(SessionOptions::default());
+    let mut paged = Database::open_with_options(
+        &path,
+        OpenOptions {
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap()
+    .session(SessionOptions::default());
     paged.set_work_mem(128); // ~2-3 rows per run → dozens of spilled runs + a deep k-way merge
 
     for sql in [

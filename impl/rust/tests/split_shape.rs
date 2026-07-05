@@ -36,6 +36,7 @@ fn split_shape_db(name: &str, shuffled: bool) -> Session {
     let _ = std::fs::remove_file(&path);
     let mut db = Database::create(CreateOptions {
         path: Some(std::path::PathBuf::from(&path)),
+        skip_fsync: true,
         page_size: 256,
         ..Default::default()
     })

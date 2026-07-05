@@ -26,6 +26,7 @@ fn tmp(name: &str) -> PathBuf {
 fn make_file_db(path: PathBuf, page_size: u32, stmts: &[&str]) -> PathBuf {
     let db = Database::create(CreateOptions {
         path: Some(path.clone()),
+        skip_fsync: true,
         page_size,
         ..Default::default()
     })
@@ -240,7 +241,14 @@ fn attach_file_read_write_persists_across_reopen() {
     db.close().expect("close");
 
     // Reopen the attached file on its own — the rows must be there (durable + self-describing).
-    let reopened = Database::open(&work).expect("reopen attached file standalone");
+    let reopened = Database::open_with_options(
+        &work,
+        OpenOptions {
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .expect("reopen attached file standalone");
     let mut rs = reopened.session(SessionOptions::default());
     assert_eq!(
         query_ints(&mut rs, "SELECT bal FROM acct ORDER BY id"),
@@ -268,7 +276,14 @@ fn attach_file_one_durable_writer() {
         &["CREATE TABLE e (id i32 PRIMARY KEY)"],
     );
 
-    let db = Database::open(&main_path).expect("open file main");
+    let db = Database::open_with_options(
+        &main_path,
+        OpenOptions {
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .expect("open file main");
     db.attach("extra", AttachSource::file(&extra), false)
         .expect("attach extra file");
     let mut s = db.session(SessionOptions::default());
@@ -343,7 +358,14 @@ fn attach_file_page_size_independent() {
     db.detach("small").expect("detach");
     db.close().expect("close");
 
-    let reopened = Database::open(&small).expect("reopen small-page file");
+    let reopened = Database::open_with_options(
+        &small,
+        OpenOptions {
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .expect("reopen small-page file");
     assert_eq!(reopened.page_size(), 256);
     let mut rs = reopened.session(SessionOptions::default());
     // sum of i*i for i in 1..=40 = 22140.

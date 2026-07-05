@@ -27,13 +27,13 @@ function rowsOf(db: Handle, sql: string) {
 // test, committed + reopened so its rows fault in lazily. 40 rows over 256-byte pages span several
 // leaves, so the masked scan is genuinely exercised.
 function seedPersistedWindow(path: string): Database {
-  let db = createDatabase({ path, pageSize: PAGE_SIZE });
+  let db = createDatabase({ path, pageSize: PAGE_SIZE, skipFsync: true });
   db.execute("CREATE TABLE t (id i32 PRIMARY KEY, grp i32, amount i32)");
   for (let i = 1; i <= 40; i++) {
     db.execute(`INSERT INTO t VALUES (${i}, ${i % 3}, ${i * 10})`);
   }
   db.close();
-  db = openDatabase(path);
+  db = openDatabase(path, { skipFsync: true });
   return db;
 }
 

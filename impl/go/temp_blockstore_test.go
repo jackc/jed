@@ -85,7 +85,7 @@ func TestSessionLocalTempPageBudgetBoundsMultiLeaf(t *testing.T) {
 // file's committed version and page high-water are unchanged across a burst of temp DDL/DML.
 func TestSessionLocalTempZeroFileWrites(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ztemp.jed")
-	db, err := create(path, databaseOptions{PageSize: 256})
+	db, err := create(path, databaseOptions{PageSize: 256, noSync: true})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -82,13 +82,13 @@ test("paged masked scan matches resident across query shapes", () => {
   const dir = mkdtempSync(join(tmpdir(), "jed-masked-wide-"));
   try {
     const path = join(dir, "wide.jed");
-    const filedb = createDatabase({ path });
+    const filedb = createDatabase({ path, skipFsync: true });
     seed(filedb);
     filedb.close();
 
     const mem = memDb().session();
     seed(mem);
-    const paged = openDatabase(path);
+    const paged = openDatabase(path, { skipFsync: true });
 
     const queries = [
       // Whole-row and single/multi-column projections.
@@ -196,13 +196,13 @@ test("paged columnar multilevel matches resident", () => {
   const dir = mkdtempSync(join(tmpdir(), "jed-masked-multilevel-"));
   try {
     const path = join(dir, "multilevel.jed");
-    const filedb = createDatabase({ path });
+    const filedb = createDatabase({ path, skipFsync: true });
     seedMultilevel(filedb);
     filedb.close();
 
     const mem = memDb().session();
     seedMultilevel(mem);
-    const paged = openDatabase(path);
+    const paged = openDatabase(path, { skipFsync: true });
 
     const queries = [
       // Bare-column projections — the columnar projection path (a/k/b values gathered from the leaves).

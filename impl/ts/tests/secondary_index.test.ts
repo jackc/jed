@@ -215,7 +215,7 @@ test("file-backed paged reopen uses the index", () => {
   // (page_read is logical — buffer-pool-invisible), and stays maintainable.
   const dir = mkdtempSync(join(tmpdir(), "jed-"));
   const path = join(dir, "secondary_index_paged.jed");
-  const db = createDatabase({ path, pageSize: 256 });
+  const db = createDatabase({ path, pageSize: 256, skipFsync: true });
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32)");
   for (let i = 1; i <= 20; i++) {
     run(db, `INSERT INTO t VALUES (${i}, ${i % 5}, ${i})`);
@@ -224,13 +224,13 @@ test("file-backed paged reopen uses the index", () => {
   const inMemoryCost = cost(db, "SELECT id FROM t WHERE v = 3");
   db.close();
 
-  const reopened = openDatabase(path);
+  const reopened = openDatabase(path, { skipFsync: true });
   assert.equal(cost(reopened, "SELECT id FROM t WHERE v = 3"), inMemoryCost);
   assert.deepEqual(ids(reopened, "SELECT id FROM t WHERE v = 3 ORDER BY id"), [3n, 8n, 13n, 18n]);
   run(reopened, "UPDATE t SET v = 3 WHERE id = 4");
   run(reopened, "DELETE FROM t WHERE id = 13");
   reopened.close();
-  const again = openDatabase(path);
+  const again = openDatabase(path, { skipFsync: true });
   assert.deepEqual(ids(again, "SELECT id FROM t WHERE v = 3 ORDER BY id"), [3n, 4n, 8n, 18n]);
   again.close();
   rmSync(dir, { recursive: true, force: true });

@@ -258,7 +258,7 @@ func TestReferenceOnlyFileRoundTrip(t *testing.T) {
 	// must have loaded one providing it BEFORE open — collation.md §4/§9).
 	loadFixtureBundle(t)
 	path := t.TempDir() + "/collation_refonly_roundtrip.jed"
-	db, err := create(path, databaseOptions{PageSize: 256})
+	db, err := create(path, databaseOptions{PageSize: 256, noSync: true})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -274,7 +274,7 @@ func TestReferenceOnlyFileRoundTrip(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	re, err := open(path)
+	re, err := openWithOptions(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

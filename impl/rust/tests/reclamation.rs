@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use jed::blockstore::{BlockStore, FileBlockStore};
 use jed::pager::Pager;
 use jed::value::Value;
-use jed::{CreateOptions, Database, Engine, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, Engine, OpenOptions, Outcome, Session, SessionOptions};
 
 const PS: u64 = 256;
 
@@ -102,9 +102,15 @@ fn persisted_free_list_heads_a_page_type_7_chain() {
 
     // Reopen (reads the persisted free-list, no reconstruction) and confirm the data round-trips and
     // the file is bounded (within-session reclamation, not monotonic churn growth).
-    let mut db = Database::open(&path)
-        .unwrap()
-        .session(SessionOptions::default());
+    let mut db = Database::open_with_options(
+        &path,
+        OpenOptions {
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap()
+    .session(SessionOptions::default());
     assert_eq!(ids(&mut db), (1..=40).collect::<Vec<_>>());
     assert!(
         db.page_count() < 200,
@@ -150,6 +156,7 @@ fn setup(path: &PathBuf, rows: i64) -> Session {
     let _ = std::fs::remove_file(path);
     let mut db = Database::create(CreateOptions {
         path: Some(std::path::PathBuf::from(path)),
+        skip_fsync: true,
         page_size: PS as u32,
         ..Default::default()
     })
@@ -196,9 +203,15 @@ fn within_session_churn_stays_bounded_and_reopens_from_the_persisted_free_list()
 
     // Reopen: the free-list is read directly from the persisted chain (no reconstruction walk); the
     // high-water is whatever the last commit recorded.
-    let mut db = Database::open(&path)
-        .unwrap()
-        .session(SessionOptions::default());
+    let mut db = Database::open_with_options(
+        &path,
+        OpenOptions {
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap()
+    .session(SessionOptions::default());
     assert_eq!(
         db.page_count(),
         pc_after_churn1,
@@ -236,9 +249,15 @@ fn within_session_churn_stays_bounded_and_reopens_from_the_persisted_free_list()
     );
     assert_eq!(ids(&mut db), (1..=30).collect::<Vec<_>>());
     drop(db);
-    let mut db = Database::open(&path)
-        .unwrap()
-        .session(SessionOptions::default());
+    let mut db = Database::open_with_options(
+        &path,
+        OpenOptions {
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap()
+    .session(SessionOptions::default());
     assert_eq!(
         pad_of(&mut db, 15).as_deref(),
         Some(&format!("b39-{pad}")[..])
@@ -263,9 +282,15 @@ fn heavy_insert_delete_churn_reopens_correctly_with_reuse() {
     drop(db);
 
     // Reopen (free-list reconstructed) and churn again, now reusing reclaimed pages.
-    let mut db = Database::open(&path)
-        .unwrap()
-        .session(SessionOptions::default());
+    let mut db = Database::open_with_options(
+        &path,
+        OpenOptions {
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap()
+    .session(SessionOptions::default());
     for k in 0..40 {
         db.query_outcome(&format!("INSERT INTO t VALUES (2000, 'm{k}-{pad}')"), &[])
             .unwrap();
@@ -279,9 +304,15 @@ fn heavy_insert_delete_churn_reopens_correctly_with_reuse() {
         .unwrap();
     drop(db);
 
-    let mut db = Database::open(&path)
-        .unwrap()
-        .session(SessionOptions::default());
+    let mut db = Database::open_with_options(
+        &path,
+        OpenOptions {
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap()
+    .session(SessionOptions::default());
     assert_eq!(ids(&mut db), (1..=27).collect::<Vec<_>>());
 }
 
@@ -300,9 +331,15 @@ fn torn_commit_after_reuse_falls_back_to_the_intact_prior_snapshot() {
     drop(db);
 
     // Reopen so the free-list holds the churn's dead pages, then do two commits that *reuse* them.
-    let mut db = Database::open(&path)
-        .unwrap()
-        .session(SessionOptions::default());
+    let mut db = Database::open_with_options(
+        &path,
+        OpenOptions {
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap()
+    .session(SessionOptions::default());
     db.query_outcome(&format!("UPDATE t SET pad = 'A-{pad}' WHERE id = 10"), &[])
         .unwrap(); // prior snapshot
     let orig11 = pad_of(&mut db, 11).expect("row 11 exists");
@@ -325,9 +362,15 @@ fn torn_commit_after_reuse_falls_back_to_the_intact_prior_snapshot() {
     // The loader falls back to the prior snapshot — intact even though the torn commit reused
     // (overwrote) free pages, because those pages were dead and the prior snapshot never referenced
     // them. Row 11's update vanishes; row 10's prior-commit value and every row survive.
-    let mut db = Database::open(&path)
-        .unwrap()
-        .session(SessionOptions::default());
+    let mut db = Database::open_with_options(
+        &path,
+        OpenOptions {
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap()
+    .session(SessionOptions::default());
     assert_eq!(
         db.txid(),
         prior_txid,

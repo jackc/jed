@@ -11,7 +11,7 @@
 //! `XX001` or the byte-identical correct result — corruption is **caught or inert, never silent**.
 //! Mirrored in Go (checksum_test.go) and TS (tests/checksum.test.ts).
 
-use jed::{CreateOptions, Database, Outcome, Result, SessionOptions};
+use jed::{CreateOptions, Database, OpenOptions, Outcome, Result, SessionOptions};
 
 const PAGE_SIZE: u32 = 256;
 
@@ -37,7 +37,14 @@ fn tmp(name: &str) -> std::path::PathBuf {
 
 /// The full scan result as rendered strings, or the error if any page read failed.
 fn scan(path: &std::path::Path) -> Result<Vec<Vec<String>>> {
-    let mut db = Database::open(path)?.session(SessionOptions::default());
+    let mut db = Database::open_with_options(
+        path,
+        OpenOptions {
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )?
+    .session(SessionOptions::default());
     let out = match db.query_outcome("SELECT id, body FROM t ORDER BY id", &[])? {
         Outcome::Query { rows, .. } => rows
             .iter()
@@ -54,6 +61,7 @@ fn scan(path: &std::path::Path) -> Result<Vec<Vec<String>>> {
 fn seed(path: &std::path::Path) {
     let mut db = Database::create(CreateOptions {
         path: Some(std::path::PathBuf::from(path)),
+        skip_fsync: true,
         page_size: PAGE_SIZE,
         ..Default::default()
     })

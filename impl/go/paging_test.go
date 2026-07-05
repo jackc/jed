@@ -19,7 +19,7 @@ func TestDemandPagingScansCorrectlyWithBoundedResidency(t *testing.T) {
 	const cap = 3
 
 	// Build a multi-level tree at a small page size, so a few hundred rows span many pages.
-	db, err := create(path, databaseOptions{PageSize: 256})
+	db, err := create(path, databaseOptions{PageSize: 256, noSync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,7 +42,7 @@ func TestDemandPagingScansCorrectlyWithBoundedResidency(t *testing.T) {
 	}
 
 	// Reopen demand-paged with a 3-leaf budget.
-	db, err = openWithOptions(path, OpenOptions{CacheBytes: cap * 256})
+	db, err = openWithOptions(path, OpenOptions{CacheBytes: cap * 256, SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +73,7 @@ func TestDemandPagingScansCorrectlyWithBoundedResidency(t *testing.T) {
 	}
 
 	// Mutate through the pool (each statement faults the leaf it touches), reopen, verify.
-	db, err = openWithOptions(path, OpenOptions{CacheBytes: cap * 256})
+	db, err = openWithOptions(path, OpenOptions{CacheBytes: cap * 256, SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +93,7 @@ func TestDemandPagingScansCorrectlyWithBoundedResidency(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db, err = openWithOptions(path, OpenOptions{CacheBytes: cap * 256})
+	db, err = openWithOptions(path, OpenOptions{CacheBytes: cap * 256, SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +129,7 @@ func TestMemoryBudgetBoundsResidencyUnderLookups(t *testing.T) {
 	const n = 2000
 	const cap = 4
 
-	db, err := create(path, databaseOptions{PageSize: 256})
+	db, err := create(path, databaseOptions{PageSize: 256, noSync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +151,7 @@ func TestMemoryBudgetBoundsResidencyUnderLookups(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db, err = openWithOptions(path, OpenOptions{CacheBytes: cap * 256})
+	db, err = openWithOptions(path, OpenOptions{CacheBytes: cap * 256, SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,7 +189,7 @@ func TestTinyBudgetKeepsOneLeafResident(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "tiny.jed")
 	const n = 400
 
-	db, err := create(path, databaseOptions{PageSize: 256})
+	db, err := create(path, databaseOptions{PageSize: 256, noSync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,7 +212,7 @@ func TestTinyBudgetKeepsOneLeafResident(t *testing.T) {
 	}
 
 	// A 1-byte budget is far below the 256-byte page size: it must clamp to one resident leaf, not zero.
-	db, err = openWithOptions(path, OpenOptions{CacheBytes: 1})
+	db, err = openWithOptions(path, OpenOptions{CacheBytes: 1, SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,7 +238,7 @@ func TestTinyBudgetKeepsOneLeafResident(t *testing.T) {
 // multi-gigabyte allocation.
 func TestCreateRejectsOversizedPageSize(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "huge.jed")
-	_, err := create(path, databaseOptions{PageSize: 1 << 20})
+	_, err := create(path, databaseOptions{PageSize: 1 << 20, noSync: true})
 	ee, ok := err.(*EngineError)
 	if !ok || ee.Code() != "0A000" {
 		t.Fatalf("want 0A000 feature_not_supported, got %v", err)
@@ -270,7 +270,7 @@ func TestReadRejectsOversizedPageSize(t *testing.T) {
 func TestRejectsNonPowerOfTwoPageSize(t *testing.T) {
 	// Create: 1000 is within [256, 65536] but not a power of two.
 	path := filepath.Join(t.TempDir(), "pow2.jed")
-	_, err := create(path, databaseOptions{PageSize: 1000})
+	_, err := create(path, databaseOptions{PageSize: 1000, noSync: true})
 	ee, ok := err.(*EngineError)
 	if !ok || ee.Code() != "0A000" {
 		t.Fatalf("want 0A000 feature_not_supported, got %v", err)
@@ -294,7 +294,7 @@ func TestRejectsNonPowerOfTwoPageSize(t *testing.T) {
 // of two but below minPageSize — is rejected on Create.
 func TestRejectsPageSizeBelowFloor(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "tiny.jed")
-	_, err := create(path, databaseOptions{PageSize: 128})
+	_, err := create(path, databaseOptions{PageSize: 128, noSync: true})
 	ee, ok := err.(*EngineError)
 	if !ok || ee.Code() != "0A000" {
 		t.Fatalf("want 0A000 feature_not_supported, got %v", err)
@@ -395,7 +395,7 @@ func TestInSessionTableJoinsResidencyFlip(t *testing.T) {
 		run(t, db)
 	})
 	t.Run("file-create-session", func(t *testing.T) {
-		db, err := CreateDatabase(CreateOptions{Path: filepath.Join(t.TempDir(), "flip.jed"), PageSize: 256})
+		db, err := CreateDatabase(CreateOptions{Path: filepath.Join(t.TempDir(), "flip.jed"), PageSize: 256, SkipFsync: true})
 		if err != nil {
 			t.Fatal(err)
 		}

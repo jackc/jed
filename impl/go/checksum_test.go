@@ -22,7 +22,7 @@ import (
 
 // scanChecksum opens path and returns the rendered "SELECT id, body" rows, or the read error.
 func scanChecksum(path string) ([][]string, error) {
-	db, err := open(path)
+	db, err := openWithOptions(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		return nil, err
 	}
@@ -63,7 +63,7 @@ func equalRows(a, b [][]string) bool {
 // B-tree (interior root) of ~30 rows, with row 1 a 600-char incompressible body that spills.
 func seedChecksum(t *testing.T, path string) {
 	t.Helper()
-	db, err := create(path, databaseOptions{PageSize: 256})
+	db, err := create(path, databaseOptions{PageSize: 256, noSync: true})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -87,13 +87,13 @@ test("lazy: chains are read only when touched", () => {
   const dir = mkdtempSync(join(tmpdir(), "jed-lazy-"));
   const path = join(dir, "touch.jed");
   try {
-    let db = createDatabase({ path, pageSize: PAGE_SIZE });
+    let db = createDatabase({ path, pageSize: PAGE_SIZE, skipFsync: true });
     seed(db);
     db.close();
     corruptOverflowPayloads(path);
 
     // Open walks live chains by headers only — corrupt payloads are invisible.
-    db = openDatabase(path);
+    db = openDatabase(path, { skipFsync: true });
 
     // Untouching queries never read a chain or decompress a block.
     assert.equal(rowsOf(db, "SELECT id FROM t").length, 4);
@@ -122,10 +122,10 @@ test("lazy: values round-trip exactly through the paged path", () => {
   const dir = mkdtempSync(join(tmpdir(), "jed-lazy-"));
   const path = join(dir, "roundtrip.jed");
   try {
-    let db = createDatabase({ path, pageSize: PAGE_SIZE });
+    let db = createDatabase({ path, pageSize: PAGE_SIZE, skipFsync: true });
     seed(db);
     db.close();
-    db = openDatabase(path);
+    db = openDatabase(path, { skipFsync: true });
     const got = rowsOf(db, "SELECT body FROM t").map((r) => render(r[0]));
     assert.deepEqual(got, [
       fillerText(600),
@@ -144,12 +144,12 @@ test("lazy: UPDATE of other columns preserves spilled values", () => {
   const path = join(dir, "update.jed");
   const big = fillerText(600);
   try {
-    let db = createDatabase({ path, pageSize: PAGE_SIZE });
+    let db = createDatabase({ path, pageSize: PAGE_SIZE, skipFsync: true });
     db.execute("CREATE TABLE t (id i32 PRIMARY KEY, body text, n i32)");
     db.execute(`INSERT INTO t VALUES (1, '${big}', 10), (2, 'small', 20)`);
     db.close();
 
-    db = openDatabase(path);
+    db = openDatabase(path, { skipFsync: true });
     // Dirties the leaf carrying row 1's unfetched body without touching it: row 2's rewrite
     // resolves nothing, row 1 resolves at commit (large-values.md §14 — resolve-at-commit;
     // chain sharing stays the deferred follow-on).
@@ -158,7 +158,7 @@ test("lazy: UPDATE of other columns preserves spilled values", () => {
     db.execute("UPDATE t SET n = 11 WHERE id = 1");
     db.close();
 
-    db = openDatabase(path);
+    db = openDatabase(path, { skipFsync: true });
     const rows = rowsOf(db, "SELECT body, n FROM t");
     assert.equal(render(rows[0]![0]), big);
     assert.equal(render(rows[0]![1]), "11");
@@ -179,10 +179,10 @@ test("lazy: paged and resident costs match", () => {
   try {
     const mem = memDb(PAGE_SIZE).session();
     seed(mem);
-    const filedb = createDatabase({ path, pageSize: PAGE_SIZE });
+    const filedb = createDatabase({ path, pageSize: PAGE_SIZE, skipFsync: true });
     seed(filedb);
     filedb.close();
-    const paged = openDatabase(path);
+    const paged = openDatabase(path, { skipFsync: true });
     for (const sql of [
       "SELECT * FROM t",
       "SELECT id FROM t",

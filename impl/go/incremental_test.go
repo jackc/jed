@@ -36,7 +36,7 @@ func selectIDs(t *testing.T, db *engine) []int64 {
 func TestSingleRowCommitAppendsOnlyTheDirtyPath(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "incremental_small_growth.jed")
 	const ps = int64(256)
-	db, err := create(path, databaseOptions{PageSize: 256})
+	db, err := create(path, databaseOptions{PageSize: 256, noSync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +83,7 @@ func TestSingleRowCommitAppendsOnlyTheDirtyPath(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	db, err = open(path)
+	db, err = openWithOptions(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +103,7 @@ func TestDeleteHeavyHistoryReopensCorrectly(t *testing.T) {
 	// dirtying a different node set than inserts. Across many autocommitted inserts and deletes — each
 	// leaking pages — the live snapshot must still reopen exactly (spec/fileformat/format.md).
 	path := filepath.Join(t.TempDir(), "incremental_deletes.jed")
-	db, err := create(path, databaseOptions{PageSize: 256})
+	db, err := create(path, databaseOptions{PageSize: 256, noSync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +122,7 @@ func TestDeleteHeavyHistoryReopensCorrectly(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db, err = open(path)
+	db, err = openWithOptions(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +139,9 @@ func TestDeleteHeavyHistoryReopensCorrectly(t *testing.T) {
 
 func TestMetaSlotsAlternateAcrossCommits(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "incremental_alternation.jed")
-	db, err := create(path, defaultDatabaseOptions())
+	opts := defaultDatabaseOptions()
+	opts.noSync = true
+	db, err := create(path, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +167,7 @@ func TestMetaSlotsAlternateAcrossCommits(t *testing.T) {
 		t.Fatalf("odd txid lands in slot 1, got %d", slotTxid(img, 1))
 	}
 
-	db, err = open(path)
+	db, err = openWithOptions(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +178,9 @@ func TestMetaSlotsAlternateAcrossCommits(t *testing.T) {
 
 func TestTornLatestCommitFallsBackToPriorSnapshot(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "incremental_torn_meta.jed")
-	db, err := create(path, defaultDatabaseOptions())
+	opts := defaultDatabaseOptions()
+	opts.noSync = true
+	db, err := create(path, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,7 +203,7 @@ func TestTornLatestCommitFallsBackToPriorSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db, err = open(path)
+	db, err = openWithOptions(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +228,9 @@ func TestCommitPreallocatesFileGrowthGeometrically(t *testing.T) {
 
 	// A from-scratch image is just the empty catalog (Create writes exactly pageCount pages, no
 	// preallocation).
-	db, err := create(path, defaultDatabaseOptions())
+	opts := defaultDatabaseOptions()
+	opts.noSync = true
+	db, err := create(path, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -258,7 +264,7 @@ func TestCommitPreallocatesFileGrowthGeometrically(t *testing.T) {
 
 	// The committed image round-trips exactly through the preallocated file (trailing slack is inert
 	// zeros past the high-water).
-	db, err = open(path)
+	db, err = openWithOptions(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -278,7 +284,7 @@ func TestCommitPreallocatesFileGrowthGeometrically(t *testing.T) {
 	}
 
 	// And the extra row is durable.
-	db, err = open(path)
+	db, err = openWithOptions(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -294,7 +300,7 @@ func TestCommitPreallocatesFileGrowthGeometrically(t *testing.T) {
 // 16 KiB floor. Mirrors the Rust/TS small-database tests.
 func TestSmallDatabaseFileStaysProportional(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "small.jed")
-	db, err := create(path, databaseOptions{PageSize: 256})
+	db, err := create(path, databaseOptions{PageSize: 256, noSync: true})
 	if err != nil {
 		t.Fatal(err)
 	}

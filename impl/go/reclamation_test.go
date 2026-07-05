@@ -39,7 +39,7 @@ func padOf(t *testing.T, db *engine, id int64) (string, bool) {
 }
 
 func reclaimSetup(t *testing.T, path string, rows int) *engine {
-	db, err := create(path, databaseOptions{PageSize: uint32(reclaimPS)})
+	db, err := create(path, databaseOptions{PageSize: uint32(reclaimPS), noSync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +73,7 @@ func TestWithinSessionChurnStaysBoundedAndReopensFromPersistedFreeList(t *testin
 
 	// Reopen: the free-list is read directly from the persisted chain (no reconstruction walk); the
 	// high-water is whatever the last commit recorded.
-	db, err := open(path)
+	db, err := openWithOptions(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +105,7 @@ func TestWithinSessionChurnStaysBoundedAndReopensFromPersistedFreeList(t *testin
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	db, err = open(path)
+	db, err = openWithOptions(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +175,7 @@ func TestPersistedFreeListHeadsAPageType7Chain(t *testing.T) {
 		t.Fatal("the file should carry at least one persisted free-list page")
 	}
 
-	db, err = open(path)
+	db, err = openWithOptions(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,7 +199,7 @@ func TestHeavyInsertDeleteChurnReopensWithReuse(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db, err := open(path)
+	db, err := openWithOptions(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,7 +213,7 @@ func TestHeavyInsertDeleteChurnReopensWithReuse(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db, err = open(path)
+	db, err = openWithOptions(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,7 +232,7 @@ func TestTornCommitAfterReuseFallsBackToPriorSnapshot(t *testing.T) {
 	}
 
 	// Reopen so the free-list holds the churn's dead pages, then do two commits that reuse them.
-	db, err := open(path)
+	db, err := openWithOptions(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -259,7 +259,7 @@ func TestTornCommitAfterReuseFallsBackToPriorSnapshot(t *testing.T) {
 	// The loader falls back to the prior snapshot — intact even though the torn commit reused
 	// (overwrote) free pages, because those pages were dead and the prior snapshot never referenced
 	// them. Row 11's update vanishes; row 10's prior-commit value and every row survive.
-	db, err = open(path)
+	db, err = openWithOptions(path, OpenOptions{SkipFsync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
