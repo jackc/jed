@@ -45,7 +45,7 @@ func TestAttachLifecycle(t *testing.T) {
 	attachExec(t, s, "CREATE TABLE mydb.t (id i32 PRIMARY KEY, v i32)")
 	attachExec(t, s, "INSERT INTO mydb.t VALUES (1, 10), (2, 20)")
 
-	rows, err := s.QueryValues("SELECT v FROM mydb.t ORDER BY id", nil)
+	rows, err := s.queryValues("SELECT v FROM mydb.t ORDER BY id", nil)
 	if err != nil {
 		t.Fatalf("select: %v", err)
 	}
@@ -63,7 +63,7 @@ func TestAttachLifecycle(t *testing.T) {
 	// cursor fully so it releases its reader pin (an undrained streaming cursor would hold the roots
 	// and make the detach below 55006).
 	s2 := db.Session(SessionOptions{})
-	r2, err := s2.QueryValues("SELECT v FROM mydb.t WHERE id = 1", nil)
+	r2, err := s2.queryValues("SELECT v FROM mydb.t WHERE id = 1", nil)
 	if err != nil {
 		t.Fatalf("second session cannot see attachment: %v", err)
 	}
@@ -191,7 +191,7 @@ func TestAttachFileReadOnlyCrossRead(t *testing.T) {
 	attachExec(t, s, "INSERT INTO visit VALUES (1, 7), (2, 9)")
 
 	// A cross-FILE join: local `visit` against the read-only attached file's `city`.
-	rows, err := s.QueryValues(
+	rows, err := s.queryValues(
 		"SELECT c.name, v.n FROM visit v JOIN ref.city c ON c.id = v.city_id ORDER BY c.id", nil,
 	)
 	if err != nil {
@@ -417,7 +417,7 @@ func TestAttachCaseInsensitiveQualifier(t *testing.T) {
 	s := db.Session(SessionOptions{})
 	attachExec(t, s, "CREATE TABLE reports.sales (id i32 PRIMARY KEY)")
 	attachExec(t, s, "INSERT INTO REPORTS.sales VALUES (1)")
-	if _, err := s.QueryValues("SELECT id FROM Reports.sales", nil); err != nil {
+	if _, err := s.queryValues("SELECT id FROM Reports.sales", nil); err != nil {
 		t.Fatalf("case-insensitive qualifier: %v", err)
 	}
 }

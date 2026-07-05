@@ -821,15 +821,14 @@ func (s *Database) Session(opts SessionOptions) *Session {
 // core; session-local state (an open block, session variables, currval, session-local temp tables)
 // does NOT carry to the next call — for durable connection state mint an explicit Session. ---
 
-// QueryValues runs a statement on a fresh autocommit session, returning a row cursor (the rows are
-// materialized, so the cursor stays valid after the session is closed). This is the raw []Value
-// path; the ergonomic Query/Exec(ctx, sql, args...) (ergonomic.go, spec/design/api.md §11) is the
-// preferred surface and owns the Query name. Total: a non-query statement returns a no-column cursor
-// carrying the command tag.
-func (db *Database) QueryValues(sql string, params []Value) (*Rows, error) {
+// queryValues is the unexported raw (sql, []Value) -> *Rows seam the bare-handle ergonomic
+// Query/Exec/QueryRow (ergonomic.go, spec/design/api.md §11) build on: it runs a statement on a fresh
+// autocommit session (the rows are materialized, so the cursor stays valid after the session is
+// closed). Total: a non-query statement returns a no-column cursor carrying the command tag.
+func (db *Database) queryValues(sql string, params []Value) (*Rows, error) {
 	s := db.Session(SessionOptions{})
 	defer s.Close()
-	return s.QueryValues(sql, params)
+	return s.queryValues(sql, params)
 }
 
 // ExecuteScript runs a multi-statement script on a fresh autocommit session (spec/design/session.md
@@ -918,11 +917,11 @@ type Session struct {
 	baseVersion uint64
 }
 
-// QueryValues runs a statement on this session, returning a row cursor (the raw []Value path — the
-// ergonomic Query(ctx, sql, args...) in ergonomic.go owns the Query name, api.md §11). Total: a
-// non-query statement (CREATE/INSERT/…) returns a cursor with no output columns carrying the command
-// tag (RowsAffected/Cost) — Exec is just this drained-and-discarded.
-func (s *Session) QueryValues(sql string, params []Value) (*Rows, error) {
+// queryValues is the unexported raw (sql, []Value) -> *Rows seam this session's ergonomic
+// Query/Exec/QueryRow (ergonomic.go, api.md §11) build on. Total: a non-query statement
+// (CREATE/INSERT/…) returns a cursor with no output columns carrying the command tag
+// (RowsAffected/Cost) — Exec is just this drained-and-discarded.
+func (s *Session) queryValues(sql string, params []Value) (*Rows, error) {
 	stmt, err := s.engine.parse(sql)
 	if err != nil {
 		return nil, err
@@ -934,7 +933,7 @@ func (s *Session) QueryValues(sql string, params []Value) (*Rows, error) {
 // re-pin, the plan-once scan (streaming/buffered) then deferred cursors, and the reader-liveness
 // watermark pin — falling back to the materialized dispatch for a shape no lazy lane covers (a write,
 // a data-modifying WITH). Shared by Query (parse-then-route, sc nil) and a prepared query
-// (PreparedStatement.QueryValues passes its scanCache), so a prepared query streams and pins its
+// (PreparedStatement.queryValues passes its scanCache), so a prepared query streams and pins its
 // snapshot exactly like an ad-hoc one but reuses its cached plan across executes.
 func (s *Session) queryStmt(stmt statement, params []Value, sc *scanCache) (*Rows, error) {
 	// Route the read before building the streaming cursor (spec/design/streaming.md §4): an autocommit

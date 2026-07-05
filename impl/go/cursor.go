@@ -4,7 +4,7 @@ package jed
 //
 // Four shapes, chosen by the plan (streaming.md §4/§7):
 //   - bufCursor — a fully materialized result, walked one row at a time. The executor ran the
-//     statement to completion (the materialized drive); cost is final. The QueryValues fallback for the
+//     statement to completion (the materialized drive); cost is final. The queryValues fallback for the
 //     shapes no lazy cursor covers yet (a write, a data-modifying WITH).
 //   - streamingCursor (S3, executor.go) — a lazy pull pipeline for the single-table no-blocking-op
 //     scan: scan → resolve → WHERE → project, ONE row per nextRow over a pinned snapshot, accruing

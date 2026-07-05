@@ -1995,7 +1995,7 @@ func (db *engine) MaxSQLLength() int { return db.session.maxSQLLength }
 // (CLAUDE.md §13; spec/design/api.md §8, cost.md §7). The §13 input-size gate: an over-limit
 // statement is rejected with 54000 before lexing, so unbounded untrusted input cannot exhaust
 // parse memory/CPU (the cost meter cannot catch this — parsing precedes metering). maxSQLLength
-// == 0 is unlimited. Every handle-bound parse path routes through here (QueryValues/Exec/
+// == 0 is unlimited. Every handle-bound parse path routes through here (queryValues/Exec/
 // Prepare/the session handles), so the per-handle limit has no hole. The byte length is
 // len(sql) (Go strings are UTF-8).
 func (db *engine) parse(sql string) (statement, error) {
@@ -15068,7 +15068,7 @@ func frameBackwardSafe(frame *resolvedFrame, unique bool) bool {
 // still counts against LifetimeMaxCost), the cancel poll, the entropy/clock seam, session vars, the
 // time zone, and the currval/lastval session state. The cursor evaluates its filter/projection against
 // this engine, so the streaming Rows is self-contained (it does not reference the live handle, so it
-// survives Database.QueryValues's transient session, streaming.md §5).
+// survives Database.queryValues's transient session, streaming.md §5).
 func (db *engine) snapshotEngine() *engine {
 	s := db.session // struct copy: shares the seam (func fields), the lifetime gauge (pointer), and the
 	// read-only maps (vars/sessionSeq); reset the per-statement / transaction state below.
@@ -15135,7 +15135,7 @@ func (db *engine) planCacheable(sp *selectPlan) bool {
 // materialized paths. When sc is non-nil (a prepared statement) a repeated execute over an unchanged
 // catalog reuses the cached plan and skips planning + the fold; ad-hoc callers pass nil and still
 // plan exactly once. The conformance corpus drives this lazy lane for every read (the harness routes
-// through QueryValues), cross-checked to yield identical rows + total cost as the materialized drive
+// through queryValues), cross-checked to yield identical rows + total cost as the materialized drive
 // under full drain (streaming.md §6).
 func (db *engine) tryScanQuery(stmt statement, params []Value, sc *scanCache) (*Rows, bool, error) {
 	if stmt.Select == nil || stmtIsWrite(stmt) {
@@ -15533,7 +15533,7 @@ func (c *bufferedScanCursor) close() {
 // non-set-op/WITH statement, or a write-classified one (a data-modifying WITH, a nextval/setval call —
 // stmtIsWrite), which falls back to the materialized dispatch path. Under full drain the rows + total
 // cost are byte-identical to the materialized drive (it drives the SAME runSetOp / runWith, §6), so the
-// corpus — which drives the total QueryValues seam — stays green by construction; per-core unit tests
+// corpus — which drives the total queryValues seam — stays green by construction; per-core unit tests
 // pin the lazy drive == the materialized drive.
 func (db *engine) tryDeferredQuery(stmt statement, params []Value) (*Rows, bool, error) {
 	// A write-classified statement (a data-modifying WITH, a sequence mutator) must take the write gate
@@ -16397,7 +16397,7 @@ func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 
 func (db *engine) execSelectPlan(plan *selectPlan, outer []storedRow, params []Value, ctes cteCtx) (selectResult, error) {
 	// Run the blocking part to an emitter, then drive the emission EAGERLY into a slice (the
-	// materialized drive). The lazy QueryValues drive walks the SAME emitter row by row via
+	// materialized drive). The lazy queryValues drive walks the SAME emitter row by row via
 	// bufferedCursor (streaming.md §4); both charge the identical units at the identical sites, so the
 	// totals agree (streaming.md §6).
 	rng := newStmtRng()
@@ -16446,7 +16446,7 @@ const (
 // emitter describes how a selectPlan's output rows are emitted (spec/design/streaming.md §4, S4): a
 // SELECT runs its blocking part (scan/join/WHERE/window/sort/GROUP BY/DISTINCT) into a buffer, then
 // emits a row at a time. execSelectEmit returns this so the emission can be driven EAGERLY (the
-// materialized drive — execSelectPlan's drainEager builds a slice) or LAZILY (the QueryValues drive —
+// materialized drive — execSelectPlan's drainEager builds a slice) or LAZILY (the queryValues drive —
 // bufferedCursor yields it row by row, bounding output memory and short-circuiting a caller's early
 // exit). Both drives charge the identical units at the identical sites (streaming.md §6).
 //   - emitProject: `src` holds the UNPROJECTED rows, windowed to [start, end) — emission evaluates the
@@ -16474,7 +16474,7 @@ type emitter struct {
 }
 
 // drainEager builds the full output slice from the emitter — the materialized drive
-// (spec/design/streaming.md §4). The lazy QueryValues drive (bufferedCursor) emits the same rows one at
+// (spec/design/streaming.md §4). The lazy queryValues drive (bufferedCursor) emits the same rows one at
 // a time instead; both charge the identical units in the identical order, so totals agree (§6).
 func (em emitter) drainEager(db *engine, plan *selectPlan, outer []storedRow, params []Value, ctes cteCtx, rng *stmtRng, meter *costMeter) ([][]Value, error) {
 	switch em.mode {

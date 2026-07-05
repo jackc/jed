@@ -32,7 +32,7 @@ func TestBeginExecuteCommitIsVisible(t *testing.T) {
 		t.Fatal(err)
 	}
 	// read-your-writes within the transaction
-	rows, err := db.QueryValues("SELECT id FROM t", nil)
+	rows, err := db.queryValues("SELECT id FROM t", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,7 +163,7 @@ func TestViewIsReadOnly(t *testing.T) {
 	// a read inside a View works
 	got := 0
 	if err := db.View(func(tx *Transaction) error {
-		rows, e := tx.QueryValues("SELECT id FROM t", nil)
+		rows, e := tx.queryValues("SELECT id FROM t", nil)
 		if e != nil {
 			return e
 		}

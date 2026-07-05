@@ -97,7 +97,7 @@ func BenchmarkTrackAWideScan(b *testing.B) {
 			b.Run(fmt.Sprintf("w%02d/%s", w, q.name), func(b *testing.B) {
 				b.ReportAllocs()
 				for i := 0; i < b.N; i++ {
-					rows, err := sess.QueryValues(q.sql, nil)
+					rows, err := sess.queryValues(q.sql, nil)
 					if err != nil {
 						b.Fatal(err)
 					}

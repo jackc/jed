@@ -1,6 +1,7 @@
 package migrate
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"regexp"
@@ -210,7 +211,7 @@ func (m *Migrator) ensureVersionTable() error {
 
 // readVersion reads the single high-water-mark row from the version table.
 func (m *Migrator) readVersion() (int, error) {
-	rows, err := m.session.QueryValues(fmt.Sprintf("select version from %s", m.versionTable), nil)
+	rows, err := m.session.Query(context.Background(), fmt.Sprintf("select version from %s", m.versionTable))
 	if err != nil {
 		return 0, err
 	}

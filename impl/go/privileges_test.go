@@ -56,7 +56,7 @@ func TestQueryPathEnforcesSelectPrivilege(t *testing.T) {
 	sessExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 	sessExec(t, db, "INSERT INTO t VALUES (1, 10)")
 	db.SetDefaultPrivileges(PrivSetEmpty) // no SELECT
-	rows, err := db.QueryValues("SELECT v FROM t WHERE id = 1", nil)
+	rows, err := db.queryValues("SELECT v FROM t WHERE id = 1", nil)
 	if err == nil {
 		_ = rows.Close()
 		t.Fatal("SELECT via the streaming Query path without SELECT privilege should be 42501, got rows")

@@ -60,8 +60,11 @@ be read into one of these.
 ## The raw `Value` path is still there
 
 These ergonomic methods are **additive** — a thin, idiomatic layer over the lower-level path that
-speaks jed `Value`s directly: `execute` / `query` taking `&[Value]` in Rust and `Value[]` in
-TypeScript, and `QueryValues` taking `[]Value` in Go. That raw path stays available for full fidelity: a rich type with no clean native
-counterpart in your language (a `range`, a `jsonb`, a composite) round-trips losslessly as a `Value`,
-where the ergonomic layer renders it to its canonical text. Reach for the raw path when you need the
-engine value itself; reach for the ergonomic layer — the recommended default — for everything else.
+speaks jed `Value`s directly. Rust and TypeScript expose that path as dedicated methods: `execute` /
+`query` taking `&[Value]` in Rust and `Value[]` in TypeScript. Go needs no separate method — a raw
+`jed.Value` passes straight through the same variadic `Query` / `Exec` / `QueryRow` args (mixed freely
+with native Go values), and `Rows.Value(i)` reads a column back as its engine `Value`. Either way the
+raw path stays available for full fidelity: a rich type with no clean native counterpart in your
+language (a `range`, a `jsonb`, a composite) round-trips losslessly as a `Value`, where the ergonomic
+layer renders it to its canonical text. Reach for the raw `Value` when you need the engine value
+itself; reach for the native ergonomic form — the recommended default — for everything else.

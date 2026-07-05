@@ -21,6 +21,7 @@ package main
 // sequential runner (main.go) — only the session control + state assertions are new.
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strconv"
@@ -119,12 +120,12 @@ type cSession struct {
 
 // execute runs sql against the session's handle through the TOTAL query seam, returning the cursor. A
 // read session's writes are rejected with 25006 by the session itself (without poisoning it). Routing
-// through QueryValues (not a separate Execute) keeps the concurrency runner on the one production seam
-// — and is watermark-neutral: a read session is pinned READ ONLY (its snapshot never re-pins), and a
-// streaming cursor's transient reader-liveness pin is opened and released inside runRecord's drain,
-// before the next `expect` step observes the watermark.
+// through the ergonomic Query (not a separate Execute) keeps the concurrency runner on the one
+// production seam — and is watermark-neutral: a read session is pinned READ ONLY (its snapshot never
+// re-pins), and a streaming cursor's transient reader-liveness pin is opened and released inside
+// runRecord's drain, before the next `expect` step observes the watermark.
 func (s *cSession) execute(sql string) (*jed.Rows, error) {
-	return s.h.QueryValues(sql, nil)
+	return s.h.Query(context.Background(), sql)
 }
 
 // --- parsing (shared by both modes) ----------------------------------------------------------
@@ -270,7 +271,7 @@ func parseSchedule(text string) ([]cStep, error) {
 	return steps, nil
 }
 
-// runRecord runs one `on <sid>` record against exec (a session's QueryValues seam), returning the
+// runRecord runs one `on <sid>` record against exec (a session's ergonomic Query seam), returning the
 // first mismatch as an error. exec is a function so the same logic drives both the sequential map and a
 // worker goroutine's handle. The cursor is always fully drained + closed here (before this returns), so
 // any streaming reader-liveness pin is released before the schedule's next step observes the watermark.

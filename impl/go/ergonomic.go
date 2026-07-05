@@ -1,12 +1,18 @@
 package jed
 
 // Ergonomic host bindings (spec/design/api.md §11) — a pgx-style layer over the typed Value
-// surface. Three layers, one []Value currency underneath:
+// surface. Query / Exec / QueryRow are the sole public query surface across every handle
+// (*Database, *Session, *Transaction, *PreparedStatement); the raw (sql, []Value) seam is the
+// unexported queryValues they build on. Layers of increasing fidelity, one []Value currency
+// underneath:
 //
 //   - Query / Exec / QueryRow take plain Go args (...any) and a context.Context, and return a
 //     cursor whose Scan converts into Go-native destinations. This is the default surface.
 //   - Typed accessors (Rows.Int/Text/...) skip the Scan type switch for hot loops.
-//   - Rows.Value / the raw []Value path (api.go) stay for full fidelity.
+//   - Full fidelity needs no separate method: a raw jed.Value arg passes straight through the args
+//     (toValue's Value case), and Rows.Value returns a column as its raw engine Value — so a rich
+//     type with no clean native counterpart (a range, a jsonb, a composite) round-trips losslessly
+//     without leaving the Query/Exec/QueryRow surface.
 //
 // Cancellation is wired through the cost meter: each Query/Exec/QueryRow arms a poll on the engine
 // that runs the statement (armCancel), and the meter's Guard() checkpoint consults it, so a flipped
@@ -43,8 +49,8 @@ type Valuer interface{ JedValue() (Value, error) }
 // Scanner lets a host type receive a Value during Scan (the scan-target escape hatch).
 type Scanner interface{ ScanJed(v Value) error }
 
-// Queryer is satisfied by *Database (and, once the raw []Value methods are renamed to *SQL,
-// *Transaction — api.md §11) so helpers can take either a handle or a transaction.
+// Queryer is satisfied by *Database, *Session, and *Transaction so a data-access helper can take a
+// bare handle, a durable connection, or an open transaction interchangeably (api.md §11).
 type Queryer interface {
 	Query(ctx context.Context, sql string, args ...any) (*Rows, error)
 	QueryRow(ctx context.Context, sql string, args ...any) *Row
@@ -53,6 +59,7 @@ type Queryer interface {
 
 var (
 	_ Queryer = (*Database)(nil)
+	_ Queryer = (*Session)(nil)
 	_ Queryer = (*Transaction)(nil)
 	// *PreparedStatement deliberately does NOT satisfy Queryer: its SQL is fixed at Prepare, so
 	// its ergonomic methods take (ctx, args...) with no sql parameter.
@@ -110,12 +117,12 @@ func ergoExec(ctx context.Context, eng *engine, args []any, raw func([]Value) (*
 }
 
 // Query runs a query on the autocommit handle, binding native args. It mints the fresh autocommit
-// session explicitly (rather than via QueryValues) so cancellation arms on the engine that runs
+// session explicitly (rather than via queryValues) so cancellation arms on the engine that runs
 // the statement.
 func (db *Database) Query(ctx context.Context, sql string, args ...any) (*Rows, error) {
 	s := db.Session(SessionOptions{})
 	defer s.Close()
-	return ergoQuery(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.QueryValues(sql, p) })
+	return ergoQuery(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.queryValues(sql, p) })
 }
 
 // Exec runs a non-query statement on the autocommit handle and returns its command tag. It routes
@@ -124,7 +131,7 @@ func (db *Database) Query(ctx context.Context, sql string, args ...any) (*Rows, 
 func (db *Database) Exec(ctx context.Context, sql string, args ...any) (Result, error) {
 	s := db.Session(SessionOptions{})
 	defer s.Close()
-	return ergoExec(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.QueryValues(sql, p) })
+	return ergoExec(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.queryValues(sql, p) })
 }
 
 // QueryRow runs a query and returns a one-row handle; a setup error defers to Row.Scan.
@@ -137,11 +144,11 @@ func (db *Database) QueryRow(ctx context.Context, sql string, args ...any) *Row 
 // data-access function written against Queryer runs on either a handle or a transaction. The
 // statement runs on tx.db, so cancellation arms there.
 func (tx *Transaction) Query(ctx context.Context, sql string, args ...any) (*Rows, error) {
-	return ergoQuery(ctx, tx.db, args, func(p []Value) (*Rows, error) { return tx.QueryValues(sql, p) })
+	return ergoQuery(ctx, tx.db, args, func(p []Value) (*Rows, error) { return tx.queryValues(sql, p) })
 }
 
 func (tx *Transaction) Exec(ctx context.Context, sql string, args ...any) (Result, error) {
-	return ergoExec(ctx, tx.db, args, func(p []Value) (*Rows, error) { return tx.QueryValues(sql, p) })
+	return ergoExec(ctx, tx.db, args, func(p []Value) (*Rows, error) { return tx.queryValues(sql, p) })
 }
 
 func (tx *Transaction) QueryRow(ctx context.Context, sql string, args ...any) *Row {
@@ -150,14 +157,14 @@ func (tx *Transaction) QueryRow(ctx context.Context, sql string, args ...any) *R
 }
 
 // Query / Exec / QueryRow on a prepared statement — SQL is fixed at Prepare, so there is no sql
-// argument. The raw QueryValues method matches the helper closure directly; the statement
+// argument. The raw queryValues method matches the helper closure directly; the statement
 // runs on execEngine (the bound session's engine, else the statement's own).
 func (s *PreparedStatement) Query(ctx context.Context, args ...any) (*Rows, error) {
-	return ergoQuery(ctx, s.execEngine(), args, s.QueryValues)
+	return ergoQuery(ctx, s.execEngine(), args, s.queryValues)
 }
 
 func (s *PreparedStatement) Exec(ctx context.Context, args ...any) (Result, error) {
-	return ergoExec(ctx, s.execEngine(), args, s.QueryValues)
+	return ergoExec(ctx, s.execEngine(), args, s.queryValues)
 }
 
 func (s *PreparedStatement) QueryRow(ctx context.Context, args ...any) *Row {
@@ -165,13 +172,23 @@ func (s *PreparedStatement) QueryRow(ctx context.Context, args ...any) *Row {
 	return &Row{rows: rows, err: err}
 }
 
-// Exec runs a non-query statement on this session and returns its command tag — the ergonomic exec
-// surface, Session's analogue of Database.Exec. Unlike the autocommit Database.Exec, session state (an
-// open block, session variables, session-local temp) persists across calls. Sugar over the same total
-// query seam (drain-and-discard the raw Session.QueryValues); a SELECT run through it streams and is
+// Query / Exec / QueryRow on a durable session — identical shape to *Database, but unlike the
+// autocommit *Database (which mints a fresh session per call) session state (an open block, session
+// variables, currval, session-local temp) persists across calls. Each runs on the session's own
+// engine, so cancellation arms on the engine that runs the statement. Sugar over the same total query
+// seam (the raw s.queryValues); Exec drains-and-discards, so a SELECT run through it streams and is
 // discarded (spec/design/api.md §11).
+func (s *Session) Query(ctx context.Context, sql string, args ...any) (*Rows, error) {
+	return ergoQuery(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.queryValues(sql, p) })
+}
+
 func (s *Session) Exec(ctx context.Context, sql string, args ...any) (Result, error) {
-	return ergoExec(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.QueryValues(sql, p) })
+	return ergoExec(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.queryValues(sql, p) })
+}
+
+func (s *Session) QueryRow(ctx context.Context, sql string, args ...any) *Row {
+	rows, err := s.Query(ctx, sql, args...)
+	return &Row{rows: rows, err: err}
 }
 
 // ───────────────────────────── Result (command tag) ─────────────────────────────

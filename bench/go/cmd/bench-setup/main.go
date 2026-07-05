@@ -111,13 +111,10 @@ func setupJed(dataDir string, ds *bench.Dataset, fingerprint string, force bool)
 		return err
 	}
 	exec := func(sql string) error {
-		// Database.Execute is gone; run the DDL/write through the raw QueryValues seam and release the
-		// (row-less) cursor — a write materializes at the call.
-		rows, err := db.QueryValues(sql, nil)
-		if err != nil {
-			return err
-		}
-		return rows.Close()
+		// The ergonomic Exec drains-and-discards the (row-less) cursor for us — like db.QueryValues+Close
+		// before it, it mints a fresh autocommit session per call, so the loop's semantics are unchanged.
+		_, err := db.Exec(context.Background(), sql)
+		return err
 	}
 	for _, t := range ds.Table {
 		if !t.AppliesTo("jed") {

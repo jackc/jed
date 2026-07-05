@@ -2,6 +2,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	jed "github.com/jackc/jed/impl/go"
 	"os"
@@ -48,8 +49,8 @@ func open(dataDir, dataset string) (bench.Engine, error) {
 	return e, nil
 }
 
-// drainExec runs a statement through the raw QueryValues seam to completion, discarding any rows — the
-// bench equivalent of the removed Execute (a write materializes at the call; Close releases the cursor).
+// drainExec runs a statement through the ergonomic Query seam to completion, discarding any rows — the
+// bench equivalent of Exec (a write materializes at the call; Close releases the cursor).
 func drainExec(rows *jed.Rows, err error) error {
 	if err != nil {
 		return err
@@ -61,11 +62,11 @@ func drainExec(rows *jed.Rows, err error) error {
 }
 
 func (e *engine) Exec(sql string) error {
-	return drainExec(e.sess.QueryValues(sql, nil))
+	return drainExec(e.sess.Query(context.Background(), sql))
 }
 
 func (e *engine) QueryInt(sql string) (int64, error) {
-	rows, err := e.sess.QueryValues(sql, nil)
+	rows, err := e.sess.Query(context.Background(), sql)
 	if err != nil {
 		return 0, err
 	}
@@ -101,32 +102,15 @@ type jedStmt struct {
 	stmt *jed.PreparedStatement
 }
 
-func bindArgs(args []any) []jed.Value {
-	if len(args) == 0 {
-		return nil
-	}
-	params := make([]jed.Value, len(args))
-	for i, a := range args {
-		switch x := a.(type) {
-		case int64:
-			params[i] = jed.IntValue(x)
-		case string:
-			params[i] = jed.TextValue(x)
-		default:
-			panic(fmt.Sprintf("unsupported arg type %T", a))
-		}
-	}
-	return params
-}
-
 func (s *jedStmt) Exec(args []any) error {
-	return drainExec(s.stmt.QueryValues(bindArgs(args)))
+	return drainExec(s.stmt.Query(context.Background(), args...))
 }
 
 func (s *jedStmt) Query(args []any, sum *bench.Checksum) (int, error) {
-	// QueryValues is the raw []Value prepared-statement path; the bare `Query` name is now the
-	// ergonomic ctx/variadic form (impl/go/ergonomic.go, the cancellation work).
-	rows, err := s.stmt.QueryValues(bindArgs(args))
+	// The ergonomic Query(ctx, args...) is the sole query surface (impl/go/ergonomic.go): it converts
+	// the native args to []Value and, with a background context, arms no cancellation — the same work
+	// the old raw QueryValues path did, since args is already []any.
+	rows, err := s.stmt.Query(context.Background(), args...)
 	if err != nil {
 		return 0, err
 	}
@@ -190,7 +174,7 @@ func (p *jedPool) Close() error {
 type jedReader struct{ s *jed.Session }
 
 func (r jedReader) Query(sql string, args []any, sum *bench.Checksum) (int, error) {
-	rows, err := r.s.QueryValues(sql, bindArgs(args))
+	rows, err := r.s.Query(context.Background(), sql, args...)
 	if err != nil {
 		return 0, err
 	}

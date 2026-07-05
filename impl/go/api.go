@@ -5,20 +5,20 @@ package jed
 // parser + executor — the conformance contract still binds (the executor is unchanged).
 
 // Transaction is an open explicit transaction (spec/design/api.md §2.2, transactions.md §4.4).
-// Statements run through Execute/Query; Commit/Rollback end it. Go has no destructor, so a raw
-// Begin caller must end it explicitly — View/Update do that automatically (and are preferred).
+// Statements run through the ergonomic Query/Exec/QueryRow (ergonomic.go); Commit/Rollback end it. Go
+// has no destructor, so a raw Begin caller must end it explicitly — View/Update do that automatically
+// (and are preferred).
 type Transaction struct {
 	db   *engine
 	done bool
 }
 
-// QueryValues runs a statement within this transaction, returning a row cursor (the raw []Value
-// path; the ergonomic Query/Exec(ctx, sql, args...) in ergonomic.go owns the Query name — api.md §11).
-// Total: a non-query statement (a write in a READ ONLY transaction is 25006; a statement error aborts
-// the block, every later statement but commit/rollback then 25P02) returns a no-column cursor carrying
-// the command tag.
-func (tx *Transaction) QueryValues(sql string, params []Value) (*Rows, error) {
-	return tx.db.QueryValues(sql, params)
+// queryValues is the unexported raw (sql, []Value) -> *Rows seam the ergonomic Query/Exec/QueryRow
+// (ergonomic.go) build on within this transaction. Total: a non-query statement (a write in a READ
+// ONLY transaction is 25006; a statement error aborts the block, every later statement but
+// commit/rollback then 25P02) returns a no-column cursor carrying the command tag.
+func (tx *Transaction) queryValues(sql string, params []Value) (*Rows, error) {
+	return tx.db.queryValues(sql, params)
 }
 
 // Commit publishes the transaction durably (per synchronous). Idempotent after the transaction
@@ -85,10 +85,10 @@ type PreparedStatement struct {
 	db   *engine
 	sess *Session
 	ast  statement
-	// sc memoizes the resolved scan plan across QueryValues calls so a repeated execute skips
+	// sc memoizes the resolved scan plan across queryValues calls so a repeated execute skips
 	// planning (the plan cache, spec/design/api.md §2.4). Populated lazily on the first cacheable
 	// query execute and invalidated automatically when the catalog changes (scanCache.catGen). Zero
-	// value is empty. Query-only — Execute (writes / materialized shapes) never touches it.
+	// value is empty. Query-only — a write / materialized shape never touches it.
 	sc scanCache
 }
 
@@ -102,21 +102,21 @@ func (db *engine) Prepare(sql string) (*PreparedStatement, error) {
 	return &PreparedStatement{db: db, ast: stmt}, nil
 }
 
-// QueryValues runs this prepared statement, returning a row cursor. The prepared AST routes through the
-// same lazy streaming / buffered / deferred lanes as the ad-hoc QueryValues (spec/design/streaming.md §3/§4/§7)
-// — so a prepared query streams exactly like a one-shot one. When prepared on a Session (sess set) it
-// routes through the session (the pinned snapshot + watermark, the converged §2.4 semantics); a bare
-// engine prepared statement routes through the engine. Total: a non-query statement returns a no-column
-// cursor carrying the command tag. This is the raw []Value path; the ergonomic Query/Exec(ctx, args...)
-// in ergonomic.go owns the Query name (api.md §11).
-func (s *PreparedStatement) QueryValues(params []Value) (*Rows, error) {
+// queryValues is the unexported raw ([]Value) -> *Rows seam the prepared statement's ergonomic
+// Query/Exec/QueryRow (ergonomic.go) build on. The prepared AST routes through the same lazy streaming /
+// buffered / deferred lanes as an ad-hoc queryValues (spec/design/streaming.md §3/§4/§7) — so a prepared
+// query streams exactly like a one-shot one. When prepared on a Session (sess set) it routes through the
+// session (the pinned snapshot + watermark, the converged §2.4 semantics); a bare engine prepared
+// statement routes through the engine. Total: a non-query statement returns a no-column cursor carrying
+// the command tag.
+func (s *PreparedStatement) queryValues(params []Value) (*Rows, error) {
 	if s.sess != nil {
 		return s.sess.queryStmt(s.ast, params, &s.sc)
 	}
 	return s.db.queryStmt(s.ast, params, &s.sc)
 }
 
-// QueryValues is a one-shot: parse + run a statement, binding params, returning a row cursor. A
+// queryValues is a one-shot: parse + run a statement, binding params, returning a row cursor. A
 // single-table no-blocking-operator read is served by a lazy STREAMING cursor (spec/design/streaming.md
 // §4, S3); a blocking read (ORDER BY/DISTINCT/aggregate/window/join) by a lazy BUFFERED cursor (S4)
 // that buffers the input but yields the output one row at a time. Both pull over a pinned snapshot with
@@ -124,8 +124,8 @@ func (s *PreparedStatement) QueryValues(params []Value) (*Rows, error) {
 // served by a lazy DEFERRED cursor (streaming.md §7) that defers the run to the first pull and yields
 // the result one row at a time. Total: a non-query statement returns a no-column cursor carrying the
 // command tag. (This is the bare single-handle engine; the watermark pin lives on the shared-core
-// Session.QueryValues path.)
-func (db *engine) QueryValues(sql string, params []Value) (*Rows, error) {
+// Session.queryValues path.)
+func (db *engine) queryValues(sql string, params []Value) (*Rows, error) {
 	stmt, err := db.parse(sql)
 	if err != nil {
 		return nil, err
@@ -136,15 +136,15 @@ func (db *engine) QueryValues(sql string, params []Value) (*Rows, error) {
 // queryStmt routes an already-parsed query AST through the lazy scan (streaming/buffered) then
 // deferred lanes, planning a scan-shaped SELECT exactly once (tryScanQuery), and falling back to the
 // materialized ExecuteStmtParams for a shape no lazy lane covers (a write, a nextval/setval SELECT, a
-// data-modifying WITH). Shared by QueryValues (parse-then-route, sc nil) and a prepared query
-// (PreparedStatement.QueryValues passes its scanCache), so a prepared query streams identically to an
+// data-modifying WITH). Shared by queryValues (parse-then-route, sc nil) and a prepared query
+// (PreparedStatement.queryValues passes its scanCache), so a prepared query streams identically to an
 // ad-hoc one but reuses its cached plan across executes. (This is the bare single-handle engine; the
-// watermark pin lives on the shared-core Session.QueryValues path.)
+// watermark pin lives on the shared-core Session.queryValues path.)
 func (db *engine) queryStmt(stmt statement, params []Value, sc *scanCache) (*Rows, error) {
 	// A read served by a lazy lane skips the materialized dispatch, so enforce the read-path admission
 	// gates (25P02 / 54P02 / 42501) up front — reads only (transaction control must work in a failed
-	// block; a write is gated inside dispatch on the fall-through). Keeps the bare-engine QueryValues a
-	// safe total seam like the shared-core Session.QueryValues (executor.go gateReadLanes, CLAUDE.md §13).
+	// block; a write is gated inside dispatch on the fall-through). Keeps the bare-engine queryValues a
+	// safe total seam like the shared-core Session.queryValues (executor.go gateReadLanes, CLAUDE.md §13).
 	if stmt.Begin == nil && stmt.Commit == nil && stmt.Rollback == nil && !stmtIsWrite(stmt) {
 		if err := db.gateReadLanes(stmt); err != nil {
 			return nil, db.poisonOnLaneErr(err)
@@ -174,7 +174,7 @@ func (db *engine) queryStmt(stmt statement, params []Value, sc *scanCache) (*Row
 // one row at a time, exposing the column names, command tag, and accrued execution cost. The source is
 // buffered for the materialized drive (a write / a shape no lazy lane covers) and a lazy streaming pull
 // pipeline (S3, streaming.md §4) for a single-table no-blocking-op read — the seam is the same either
-// way, so callers are unchanged. It is the one result type of the total QueryValues seam: a non-query
+// way, so callers are unchanged. It is the one result type of the total queryValues seam: a non-query
 // statement is a Rows with no output columns, carrying its command tag (rowsAffected).
 type Rows struct {
 	columnNames []string
@@ -190,7 +190,7 @@ type Rows struct {
 	// snapshot (streaming.md §4).
 	cursor cursor
 	// onClose is the reader-liveness pin's deregister (the watermark, streaming.md §5) — set by
-	// Session.QueryValues for a streaming cursor, called by Close (Go has no destructor; the ergonomic
+	// Session.queryValues for a streaming cursor, called by Close (Go has no destructor; the ergonomic
 	// iterators close on loop exit). nil for a buffered cursor or a bare single-handle stream.
 	onClose func()
 	// current is the row the last successful Next produced; valid reports whether there is one.

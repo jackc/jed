@@ -1,7 +1,7 @@
 package jed
 
 // Phase 7: the formal host API (spec/design/api.md) — open/create/commit/close a database file,
-// Prepare/QueryValues/Exec, the Rows cursor, and the structured-error surface. Files are written
+// Prepare/queryValues/Exec, the Rows cursor, and the structured-error surface. Files are written
 // under t.TempDir(), never the repo tree. Everything runs through the public Database/Session
 // surface; the low-level engine is internal.
 
@@ -155,7 +155,7 @@ func TestPrepareExecuteAndQueryWithParams(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rows, err := sel.QueryValues([]Value{IntValue(200)})
+	rows, err := sel.queryValues([]Value{IntValue(200)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,7 +182,7 @@ func TestQueryOnNonQueryStatementIsTotal(t *testing.T) {
 	db := memDB().Session(SessionOptions{})
 
 	// DDL through Query: no columns, no rows, no error, and the table is really created.
-	rows, err := db.QueryValues("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", nil)
+	rows, err := db.queryValues("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", nil)
 	if err != nil {
 		t.Fatalf("Query(CREATE TABLE) errored: %v", err)
 	}
@@ -198,7 +198,7 @@ func TestQueryOnNonQueryStatementIsTotal(t *testing.T) {
 	_ = rows.Close()
 
 	// A write through Query commits AND carries the affected count on the Rows (no 42601).
-	wr, err := db.QueryValues("INSERT INTO t VALUES (1, 100), (2, 200)", nil)
+	wr, err := db.queryValues("INSERT INTO t VALUES (1, 100), (2, 200)", nil)
 	if err != nil {
 		t.Fatalf("Query(INSERT) errored: %v", err)
 	}
@@ -211,7 +211,7 @@ func TestQueryOnNonQueryStatementIsTotal(t *testing.T) {
 	_ = wr.Close()
 
 	// The insert really landed (proves the write committed, not merely reported).
-	sel, err := db.QueryValues("SELECT v FROM t ORDER BY id", nil)
+	sel, err := db.queryValues("SELECT v FROM t ORDER BY id", nil)
 	if err != nil {
 		t.Fatalf("Query(SELECT) errored: %v", err)
 	}
@@ -391,7 +391,7 @@ func TestOpenReadOnlyBlocksWritesAndNeverTouchesTheFile(t *testing.T) {
 	if err := s.Begin(true); !errors.As(err, &ee) || ee.Code() != "25006" {
 		t.Fatalf("Begin(true) on a read-only handle: %v", err)
 	}
-	if err := rodb.View(func(tx *Transaction) error { _, err := tx.QueryValues("SELECT id FROM t", nil); return err }); err != nil {
+	if err := rodb.View(func(tx *Transaction) error { _, err := tx.queryValues("SELECT id FROM t", nil); return err }); err != nil {
 		t.Fatalf("View on a read-only handle: %v", err)
 	}
 	err = rodb.Update(func(tx *Transaction) error { _, err := queryOutcome(tx, "DELETE FROM t", nil); return err })

@@ -81,7 +81,7 @@ func TestCancelDuringExecution(t *testing.T) {
 	// returns a LAZY cursor — a bare scan buffers its input on the first pull — so building the cursor
 	// no longer runs the scan; the meter Guard trips during the drain and the 57014 surfaces via Err().
 	s.engine.session.cancel = func() bool { return true }
-	rows, err := s.QueryValues("SELECT id FROM t", nil)
+	rows, err := s.queryValues("SELECT id FROM t", nil)
 	if err != nil {
 		t.Fatalf("building the lazy cursor should not error, got %v", err)
 	}
@@ -93,7 +93,7 @@ func TestCancelDuringExecution(t *testing.T) {
 
 	// Cleared: the same query completes normally.
 	s.engine.session.cancel = nil
-	rows, err = s.QueryValues("SELECT id FROM t", nil)
+	rows, err = s.queryValues("SELECT id FROM t", nil)
 	if err != nil {
 		t.Fatalf("uncanceled query should succeed, got %v", err)
 	}

@@ -19,6 +19,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -124,18 +125,16 @@ func parseOp(op string) []string {
 // canonical string (Value.Render — the same deterministic rendering the conformance harness uses, so
 // e.g. the decimal `sum(bigint)` result `1000` renders identically across cores). The invariant is a
 // string comparison against `invariant_expect`, not folded into the cross-core checksum.
-// execWrite runs a write statement through the raw QueryValues seam (Session.Execute is gone), draining
-// and releasing the row-less cursor — a write materializes at the call, so this returns its error.
+// execWrite runs a write statement through the ergonomic Exec, which drains and releases the row-less
+// cursor for us — a write materializes at the call, so this returns its error. The session persists
+// across calls (setup drives one WriteSession through many writes then Commit).
 func execWrite(sess *jed.Session, sql string) error {
-	rows, err := sess.QueryValues(sql, nil)
-	if err != nil {
-		return err
-	}
-	return rows.Close()
+	_, err := sess.Exec(context.Background(), sql)
+	return err
 }
 
 func queryScalar(r *jed.Session, sql string) (string, error) {
-	rows, err := r.QueryValues(sql, nil)
+	rows, err := r.Query(context.Background(), sql)
 	if err != nil {
 		return "", err
 	}
@@ -167,7 +166,7 @@ func checkFinal(db *jed.Database, fin *stressFinal) (checksum string, ok bool, e
 	}
 	r := db.ReadSession()
 	defer r.Close()
-	rows, err := r.QueryValues(fin.Query, nil)
+	rows, err := r.Query(context.Background(), fin.Query)
 	if err != nil {
 		return "", false, err
 	}

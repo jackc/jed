@@ -1,6 +1,6 @@
 package jed
 
-// White-box test helpers that materialize the production QueryValues seam. The public API has one
+// White-box test helpers that materialize the production queryValues seam. The public API has one
 // result type — *Rows (a statement is a *Rows with no output columns, carrying the command tag). These
 // helpers drain that cursor into an outcome so a test can assert on the full result set + tag at once,
 // exactly the shape the removed Execute→Outcome API returned, but built over the seam callers actually
@@ -10,21 +10,21 @@ package jed
 // valueQuerier is the raw production seam (sql, []Value) -> *Rows. *Session, *Database, *engine, and
 // *Transaction all expose it.
 type valueQuerier interface {
-	QueryValues(sql string, params []Value) (*Rows, error)
+	queryValues(sql string, params []Value) (*Rows, error)
 }
 
-// queryOutcome runs sql through the real QueryValues seam and materializes the cursor into an outcome.
+// queryOutcome runs sql through the real queryValues seam and materializes the cursor into an outcome.
 func queryOutcome(q valueQuerier, sql string, params []Value) (outcome, error) {
-	rows, err := q.QueryValues(sql, params)
+	rows, err := q.queryValues(sql, params)
 	if err != nil {
 		return outcome{}, err
 	}
 	return drainOutcome(rows)
 }
 
-// prepOutcome is queryOutcome for a prepared statement (its QueryValues binds only params).
+// prepOutcome is queryOutcome for a prepared statement (its queryValues binds only params).
 func prepOutcome(p *PreparedStatement, params []Value) (outcome, error) {
-	rows, err := p.QueryValues(params)
+	rows, err := p.queryValues(params)
 	if err != nil {
 		return outcome{}, err
 	}
@@ -47,7 +47,7 @@ func drainOutcome(rows *Rows) (outcome, error) {
 	}
 	out.Cost = rows.Cost()
 	out.RowsAffected, out.HasRowsAffected = rows.RowsAffected()
-	// A result carrying output columns is a query; otherwise a bare statement (the total-QueryValues
+	// A result carrying output columns is a query; otherwise a bare statement (the total-queryValues
 	// contract — a no-column cursor IS the statement outcome).
 	if len(out.ColumnNames) > 0 {
 		out.Kind = outcomeQuery

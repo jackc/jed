@@ -1,6 +1,7 @@
 package migrate
 
 import (
+	"context"
 	"errors"
 	"reflect"
 	"testing"
@@ -91,7 +92,7 @@ func TestMigrateStepwise(t *testing.T) {
 		}
 	}
 	// Data seeded by 001 is present (the multi-statement up half ran).
-	rows, err := db.QueryValues("select count(*) from users", nil)
+	rows, err := db.Query(context.Background(), "select count(*) from users")
 	if err != nil {
 		t.Fatalf("query users: %v", err)
 	}

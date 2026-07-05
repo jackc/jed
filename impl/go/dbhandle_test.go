@@ -6,12 +6,12 @@ package jed
 // satisfy it, so a helper like queryOutcome/mustExec works from either world without a per-partition
 // copy. It is test-only; production code never sees it.
 //
-// The surface is the real production seam — QueryValues (sql, []Value) -> *Rows, the one total
+// The surface is the real production seam — queryValues (sql, []Value) -> *Rows, the one total
 // exec/query path callers use. White-box tests drain it through queryOutcome (helpers_test.go) into a
 // materialized outcome for assertions; there is no test-only Execute path any more (the removed
 // Execute/Outcome public API — a statement is observably a *Rows with no output columns).
 type dbHandle interface {
-	QueryValues(sql string, params []Value) (*Rows, error)
+	queryValues(sql string, params []Value) (*Rows, error)
 	TableNames() []string
 	Table(name string) (*catTable, bool)
 	CompositeType(name string) *compositeType

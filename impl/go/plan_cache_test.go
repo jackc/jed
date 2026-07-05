@@ -18,7 +18,7 @@ import (
 // (every column read via Value.Int — the tests use integer columns) plus the final accrued cost.
 func drainQ(t *testing.T, stmt *PreparedStatement, params ...Value) ([][]int64, int64) {
 	t.Helper()
-	rows, err := stmt.QueryValues(params)
+	rows, err := stmt.queryValues(params)
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}

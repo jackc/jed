@@ -54,7 +54,7 @@ func eagerResult(t *testing.T, s *Session, sql string) ([][]Value, int64) {
 // streamResult: the streaming (Query) rows, fully drained, + final cost.
 func streamResult(t *testing.T, s *Session, sql string) ([][]Value, int64) {
 	t.Helper()
-	rows, err := s.QueryValues(sql, nil)
+	rows, err := s.queryValues(sql, nil)
 	if err != nil {
 		t.Fatalf("query %q: %v", sql, err)
 	}
@@ -129,7 +129,7 @@ func TestStreamingEarlyExitChargesLess(t *testing.T) {
 
 	_, fullCost := streamResult(t, s, "SELECT id FROM t ORDER BY id")
 
-	rows, err := s.QueryValues("SELECT id FROM t ORDER BY id", nil)
+	rows, err := s.queryValues("SELECT id FROM t ORDER BY id", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,7 +158,7 @@ func TestStreamingCursorPinsSnapshot(t *testing.T) {
 	reader := db.Session(SessionOptions{})
 	defer reader.Close()
 
-	rows, err := reader.QueryValues("SELECT id FROM t ORDER BY id", nil)
+	rows, err := reader.queryValues("SELECT id FROM t ORDER BY id", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +211,7 @@ func TestStreamingMidDrainCostAbort(t *testing.T) {
 	db := seededKV(t, 1000)
 	s := db.Session(SessionOptions{MaxCost: 50})
 	defer s.Close()
-	rows, err := s.QueryValues("SELECT id FROM t ORDER BY id", nil)
+	rows, err := s.queryValues("SELECT id FROM t ORDER BY id", nil)
 	if err != nil {
 		t.Fatalf("query (build) must not abort: %v", err)
 	}
@@ -232,11 +232,11 @@ func TestStreamingMidDrainCostAbort(t *testing.T) {
 	_ = rows.Close()
 }
 
-// The bare Database.QueryValues convenience streams too: the transient mint-a-session does not strand
+// The bare Database.queryValues convenience streams too: the transient mint-a-session does not strand
 // the cursor (it owns its snapshot).
 func TestDatabaseQueryConvenienceStreams(t *testing.T) {
 	db := seededKV(t, 50)
-	rows, err := db.QueryValues("SELECT id, v FROM t ORDER BY id LIMIT 4", nil)
+	rows, err := db.queryValues("SELECT id, v FROM t ORDER BY id LIMIT 4", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -300,7 +300,7 @@ func TestBufferedEarlyExitChargesLess(t *testing.T) {
 		t.Fatalf("full drain = %d rows, want 1000", len(fullRows))
 	}
 
-	rows, err := s.QueryValues(sql, nil)
+	rows, err := s.queryValues(sql, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -334,7 +334,7 @@ func TestBufferedCursorPinsSnapshot(t *testing.T) {
 
 	// A blocking query (ORDER BY v — not PK order) → the buffered cursor. Pull one row (runs the
 	// blocking part over the v1 snapshot), keep the cursor live.
-	rows, err := reader.QueryValues("SELECT v FROM t ORDER BY v", nil)
+	rows, err := reader.queryValues("SELECT v FROM t ORDER BY v", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -380,7 +380,7 @@ func TestBufferedMidDrainCostAbort(t *testing.T) {
 	db := seededKV(t, 1000)
 	s := db.Session(SessionOptions{MaxCost: 50})
 	defer s.Close()
-	rows, err := s.QueryValues("SELECT v FROM t ORDER BY v", nil)
+	rows, err := s.queryValues("SELECT v FROM t ORDER BY v", nil)
 	if err != nil {
 		t.Fatalf("query (build) must not abort: %v", err)
 	}
@@ -448,7 +448,7 @@ func TestSortedEarlyExitChargesLess(t *testing.T) {
 		t.Fatalf("full drain = %d rows, want 1000", len(fullRows))
 	}
 
-	rows, err := s.QueryValues(sql, nil)
+	rows, err := s.queryValues(sql, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -533,7 +533,7 @@ func TestSortedSpillMergeStreamsLazily(t *testing.T) {
 	// merge's run files, so none leak.
 	s2 := db.Session(SessionOptions{})
 	s2.SetWorkMem(128)
-	rows, err := s2.QueryValues(sql, nil)
+	rows, err := s2.queryValues(sql, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -603,7 +603,7 @@ func TestDeferredRunsFullyOnFirstPull(t *testing.T) {
 		t.Fatalf("full drain = %d rows, want 200", len(fullRows))
 	}
 
-	rows, err := s.QueryValues(sql, nil)
+	rows, err := s.queryValues(sql, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -633,7 +633,7 @@ func TestDeferredCursorPinsSnapshot(t *testing.T) {
 
 	// A top-level UNION → the deferred cursor. Pull one row (runs the set op over the v1 snapshot),
 	// keep the cursor live.
-	rows, err := reader.QueryValues("SELECT v FROM t WHERE id <= 2 UNION SELECT v FROM t WHERE id = 3 ORDER BY v", nil)
+	rows, err := reader.queryValues("SELECT v FROM t WHERE id <= 2 UNION SELECT v FROM t WHERE id = 3 ORDER BY v", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -679,7 +679,7 @@ func TestDeferredMidDrainCostAbort(t *testing.T) {
 	db := seededKV(t, 1000)
 	s := db.Session(SessionOptions{MaxCost: 50})
 	defer s.Close()
-	rows, err := s.QueryValues("SELECT id FROM t UNION ALL SELECT id FROM t ORDER BY id", nil)
+	rows, err := s.queryValues("SELECT id FROM t UNION ALL SELECT id FROM t ORDER BY id", nil)
 	if err != nil {
 		t.Fatalf("query (build) must not abort: %v", err)
 	}
@@ -709,7 +709,7 @@ func TestDeferredSkipsDataModifyingWith(t *testing.T) {
 	defer s.Close()
 	// A writable CTE: INSERT … RETURNING fed to the primary. This is stmtIsWrite, so it bypasses
 	// tryDeferredQuery and runs through the write path — but Query still surfaces its rows.
-	rows, err := s.QueryValues("WITH ins AS (INSERT INTO t VALUES (6, 60), (7, 70) RETURNING id) SELECT id FROM ins ORDER BY id", nil)
+	rows, err := s.queryValues("WITH ins AS (INSERT INTO t VALUES (6, 60), (7, 70) RETURNING id) SELECT id FROM ins ORDER BY id", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -733,7 +733,7 @@ func TestDeferredSkipsDataModifyingWith(t *testing.T) {
 
 // ---- prepared-statement streaming (the prepared query path; streaming.md §7) ----------------------
 //
-// A prepared query (Prepare + QueryValues) routes its parsed AST through the SAME lazy lanes as the
+// A prepared query (Prepare + queryValues) routes its parsed AST through the SAME lazy lanes as the
 // ad-hoc Query — so a prepared SELECT streams (single-table pull / blocking-buffer / deferred set-op),
 // pins its snapshot in the watermark, and offers the early-exit win, all identical to a one-shot query.
 
@@ -744,7 +744,7 @@ func preparedStreamResult(t *testing.T, s *Session, sql string, params []Value) 
 	if err != nil {
 		t.Fatalf("prepare %q: %v", sql, err)
 	}
-	rows, err := stmt.QueryValues(params)
+	rows, err := stmt.queryValues(params)
 	if err != nil {
 		t.Fatalf("query prepared %q: %v", sql, err)
 	}
@@ -820,7 +820,7 @@ func TestPreparedQueryEarlyExitChargesLess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	full, err := stmt.QueryValues(nil)
+	full, err := stmt.queryValues(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -832,7 +832,7 @@ func TestPreparedQueryEarlyExitChargesLess(t *testing.T) {
 	fullCost := full.Cost()
 	_ = full.Close()
 
-	rows, err := stmt.QueryValues(nil)
+	rows, err := stmt.queryValues(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -863,7 +863,7 @@ func TestPreparedQueryPinsSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rows, err := stmt.QueryValues(nil)
+	rows, err := stmt.queryValues(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -902,7 +902,7 @@ func TestPreparedQueryPinsSnapshot(t *testing.T) {
 }
 
 // A mid-drain cost abort (§6) on the prepared path: the 54P01 surfaces during iteration via Err(),
-// not at QueryValues() — the prepared cursor defers its work like the ad-hoc one.
+// not at queryValues() — the prepared cursor defers its work like the ad-hoc one.
 func TestPreparedQueryMidDrainCostAbort(t *testing.T) {
 	db := seededKV(t, 1000)
 	s := db.Session(SessionOptions{MaxCost: 50})
@@ -911,7 +911,7 @@ func TestPreparedQueryMidDrainCostAbort(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rows, err := stmt.QueryValues(nil)
+	rows, err := stmt.queryValues(nil)
 	if err != nil {
 		t.Fatalf("query (build) must not abort: %v", err)
 	}
@@ -937,7 +937,7 @@ func TestDatabaseQueryPreparedConvenienceStreams(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rows, err := stmt.QueryValues(nil)
+	rows, err := stmt.queryValues(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -959,7 +959,7 @@ func TestDatabaseQueryPreparedConvenienceStreams(t *testing.T) {
 // streamResultParams: the streaming (Query) rows + cost for a parameterized query, fully drained.
 func streamResultParams(t *testing.T, s *Session, sql string, params []Value) ([][]Value, int64) {
 	t.Helper()
-	rows, err := s.QueryValues(sql, params)
+	rows, err := s.queryValues(sql, params)
 	if err != nil {
 		t.Fatalf("query %q: %v", sql, err)
 	}

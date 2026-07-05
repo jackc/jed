@@ -12,6 +12,7 @@ package main
 
 import (
 	"cmp"
+	"context"
 	"fmt"
 	"math"
 	"os"
@@ -1110,13 +1111,13 @@ func takeSQLUntilSeparator(lines []string, i *int) string {
 
 // drainQuery runs sql through the session's TOTAL query seam and fully drains it, returning the
 // flattened+sorted result cells, the column metadata, and the final accrued cost. Routing BOTH
-// statement and query directives through QueryValues (there is no raw Execute/Outcome primitive any
-// more) is the harness's standing proof that the seam is total: a statement that returns no rows is a
-// valid query with an empty column list (spec/design/api.md §11). The cursor is always Closed (releasing
-// any streaming reader-liveness pin), and Cost is read after the full drain — a streaming query's cost
-// is final only at exhaustion.
+// statement and query directives through the ergonomic Query (there is no raw Execute/Outcome
+// primitive any more) is the harness's standing proof that the seam is total: a statement that returns
+// no rows is a valid query with an empty column list (spec/design/api.md §11). The cursor is always
+// Closed (releasing any streaming reader-liveness pin), and Cost is read after the full drain — a
+// streaming query's cost is final only at exhaustion.
 func drainQuery(sess *jed.Session, sql, sortmode string, cols int) (cells, names, types []string, cost int64, err error) {
-	rows, qerr := sess.QueryValues(sql, nil)
+	rows, qerr := sess.Query(context.Background(), sql)
 	if qerr != nil {
 		return nil, nil, nil, 0, qerr
 	}

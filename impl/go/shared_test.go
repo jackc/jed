@@ -16,7 +16,7 @@ import (
 // readCount runs SELECT count(*) FROM t against a read handle and returns the count.
 func readCount(t *testing.T, r *Session) int64 {
 	t.Helper()
-	rows, err := r.QueryValues("SELECT count(*) FROM t", nil)
+	rows, err := r.queryValues("SELECT count(*) FROM t", nil)
 	if err != nil {
 		t.Fatalf("count query: %v", err)
 	}
