@@ -75,10 +75,12 @@ ORDER BY score DESC;`;
       >Open the database tool</a
     >
   </div>
-  <p class="mx-auto mt-5 max-w-2xl text-sm text-jed-muted">
-    <span class="font-semibold text-jed-ink">0.x preview.</span> Heavily tested, but not yet proven
-    by real-world use — and the on-disk format may still change.
-    <a class="text-jed-accent hover:underline" href="{base}/docs/status/"
+  <p
+    class="mx-auto mt-5 max-w-2xl rounded-md border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-800"
+  >
+    <span class="font-semibold text-red-900">0.x preview — not ready for production use.</span>
+    Heavily tested, but not yet proven by real-world use, and the on-disk format may still change.
+    <a class="font-medium text-red-900 underline hover:text-red-700" href="{base}/docs/status/"
       >Read the preview status →</a
     >
   </p>

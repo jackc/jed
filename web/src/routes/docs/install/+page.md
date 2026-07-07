@@ -8,8 +8,9 @@
 
 # Installing & running jed
 
-> ⚠️ jed is a **0.x preview**. Expect changes to behavior and to the on-disk file format between
-> releases — see [Preview status](../status/) before you store anything you can't reproduce.
+> ⚠️ jed is a **0.x preview and is not ready for production use.** Expect changes to behavior and to
+> the on-disk file format between releases — see [Preview status](../status/) before you store
+> anything you can't reproduce.
 
 ## Try it without installing anything
 
