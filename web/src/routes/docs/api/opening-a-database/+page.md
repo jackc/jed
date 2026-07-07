@@ -17,8 +17,8 @@ Opening or creating returns a **`Database`** — the handle you run SQL through.
 `executeScript`, and the `update` / `view` transaction helpers each run on a **fresh session** and
 commit it, so a bare statement autocommits. For durable per-connection state — a transaction spanning
 several calls, session variables, or a configured/untrusted caller — mint a separate **session** from
-the same handle (see [Authorization](/docs/api/authorization) and
-[Resource limits](/docs/api/resource-limits)).
+the same handle (see [Authorization](../authorization/) and
+[Resource limits](../resource-limits/)).
 
 Use the **language selector** in the top bar to switch this example between Rust, Go, and
 TypeScript.
