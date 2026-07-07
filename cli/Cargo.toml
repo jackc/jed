@@ -6,7 +6,7 @@
 
 [package]
 name = "jed-cli"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 publish = false
 description = "The jed terminal client: a full-screen TUI + plain script mode (spec/design/cli.md)."

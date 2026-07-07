@@ -15,7 +15,7 @@
 
 [package]
 name = "jed-wasm"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 publish = false
 description = "C ABI over the safe Rust core, compiled to wasm32-wasip1 (CLAUDE.md §2; the Rust→WASM wrap)."

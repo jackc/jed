@@ -11,7 +11,7 @@
 
 [package]
 name = "jed-ruby-ext"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 publish = false
 description = "C ABI over the safe Rust core for the jed Ruby gem (spec/design/ruby.md)."
