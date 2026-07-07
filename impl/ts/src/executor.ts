@@ -10530,6 +10530,7 @@ export class Engine {
     const out: Value[][] = [];
     if (limit !== 0n) {
       let passed = 0n;
+      // biome-ignore lint/suspicious/noLabelVar: `outer` is a loop label for the nested-join break/continue, not a variable.
       outer: for (const left of leftRows) {
         for (const right of rightRows) {
           const combined = [...left, ...right];

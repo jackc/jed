@@ -2113,6 +2113,7 @@ export function evalFloatArith(op: BinaryOp, x: number, y: number, result: Scala
 //   sqrt(neg) → 22003; ln(0)/ln(neg) → 22003; exp overflow → 22003; sin/cos/tan never trap.
 // PG's exact RADIANS_PER_DEGREE literal (float.c) — shared by radians/degrees so the single IEEE
 // multiply/divide is byte-identical cross-core and matches PG (in-contract).
+// biome-ignore lint/correctness/noPrecisionLoss: PG's float.c RADIANS_PER_DEGREE literal, kept verbatim so the f64 rounding is byte-identical cross-core and matches PG; trimming digits would diverge.
 export const RADIANS_PER_DEGREE = 0.0174532925199432957692;
 export function evalFloatFunc(
   func: ScalarFuncName,
