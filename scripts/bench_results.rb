@@ -28,9 +28,19 @@ module BenchResults
        .sort
   end
 
+  # True when a run dir holds at least one result line — i.e. load_dir would succeed.
+  # A stray empty dir (an aborted `rake bench:run` leaves one behind) has no non-empty
+  # *.jsonl, so it reads as false. Used to keep such a dir from being auto-picked as a
+  # baseline (File.size? is nil for 0-byte/missing).
+  def results?(dir)
+    Dir.glob(File.join(dir, "*.jsonl")).any? { |p| File.size?(p) }
+  end
+
   # Resolve the reporters' shared [run_dir, baseline_dir] CLI shape: the run defaults
   # to the newest dir under bench/results/, the baseline to the run immediately before
-  # it (nil when there is none, or when suppressed via baseline: false).
+  # it (nil when there is none, when it holds no results, or when suppressed via
+  # baseline: false). An empty immediate predecessor — a stray dir from an aborted run —
+  # is treated as no baseline rather than a hard failure, so it can't break the diff.
   def resolve_dirs(run_dir, baseline_dir, baseline: true)
     runs = run_dirs
     if run_dir.nil?
@@ -39,7 +49,8 @@ module BenchResults
     end
     if baseline_dir.nil? && baseline
       idx = runs.index { |d| File.expand_path(d) == File.expand_path(run_dir) }
-      baseline_dir = runs[idx - 1] if idx&.positive?
+      cand = runs[idx - 1] if idx&.positive?
+      baseline_dir = cand if cand && results?(cand)
     end
     [run_dir, baseline_dir]
   end
