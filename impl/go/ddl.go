@@ -753,7 +753,7 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 			}
 		}
 		// Insert in catalog (ascending lowercased-name) order — indexes.md §6.
-		def := indexDef{Name: name, Columns: ru.cols, Unique: true, Kind: indexBtree}
+		def := indexDef{Name: name, Keys: columnKeys(ru.cols), Unique: true, Kind: indexBtree}
 		nameKey := strings.ToLower(name)
 		pos := len(table.Indexes)
 		for i, ix := range table.Indexes {
@@ -906,7 +906,7 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 		matchesUnique := len(parent.PK) > 0 && slices.Equal(sortedUnique(parent.PK), refSet)
 		if !matchesUnique {
 			for _, ix := range parent.Indexes {
-				if ix.Unique && slices.Equal(sortedUnique(ix.Columns), refSet) {
+				if cols := ix.columnOrdinals(); ix.Unique && cols != nil && slices.Equal(sortedUnique(cols), refSet) {
 					matchesUnique = true
 					break
 				}
@@ -1060,7 +1060,7 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 			}
 		}
 		// Insert the backing GiST index in catalog (ascending lowercased-name) order.
-		def := indexDef{Name: name, Columns: indices, Unique: false, Kind: indexGist}
+		def := indexDef{Name: name, Keys: columnKeys(indices), Unique: false, Kind: indexGist}
 		nameKey := strings.ToLower(name)
 		pos := len(table.Indexes)
 		for i, ix := range table.Indexes {
@@ -1216,6 +1216,82 @@ func (db *engine) resolveDefaultExprs(table *catTable) ([]*rExpr, error) {
 		out[i] = node
 	}
 	return out, nil
+}
+
+// resolveIndex resolves an index's key elements for one statement's maintenance
+// (spec/design/indexes.md §4), modeled on resolveChecks: a column key keeps its ordinal; an
+// expression key resolves against the table's columns to an rExpr + its encoding Type + collation.
+// The expression was validated (immutable, indexable result) at CREATE INDEX, so resolution here
+// cannot newly fail (an aggregate/window/subquery/param was rejected then, and re-resolving with a
+// non-collecting aggCtx is inert). Returns an owned resolvedIndex.
+func (db *engine) resolveIndex(table *catTable, def indexDef) (resolvedIndex, error) {
+	keys := make([]resolvedKey, 0, len(def.Keys))
+	for _, k := range def.Keys {
+		if k.Expr == nil {
+			keys = append(keys, resolvedKey{Col: k.Col})
+			continue
+		}
+		s := singleScope(db, table)
+		node, rtype, err := resolve(s, k.Expr.Expr, nil, &aggCtx{collecting: false}, &paramTypes{})
+		if err != nil {
+			return resolvedIndex{}, err
+		}
+		ty, ok := resolvedToKeyType(rtype)
+		if !ok {
+			panic("index expression result type validated indexable at CREATE INDEX")
+		}
+		d, err := deriveCollation(s, k.Expr.Expr)
+		if err != nil {
+			return resolvedIndex{}, err
+		}
+		coll, err := resolveDeriv(db, d)
+		if err != nil {
+			return resolvedIndex{}, err
+		}
+		keys = append(keys, resolvedKey{Expr: node, Ty: ty, Coll: coll})
+	}
+	return resolvedIndex{Name: def.Name, Unique: def.Unique, Kind: def.Kind, Keys: keys}, nil
+}
+
+// resolveTableIndexes resolves every index of a table once per statement (the maintenance driver —
+// INSERT / UPDATE / DELETE build their resolvedIndex list up front, parallel to table.Indexes).
+func (db *engine) resolveTableIndexes(table *catTable) ([]resolvedIndex, error) {
+	out := make([]resolvedIndex, 0, len(table.Indexes))
+	for _, def := range table.Indexes {
+		ri, err := db.resolveIndex(table, def)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ri)
+	}
+	return out, nil
+}
+
+// indexMaintEnv builds the unmetered eval env for phase-1 index-expression evaluation: params/CTEs
+// are empty (an index expression cannot reference them) and the fresh statement rng is never read
+// (an index expression is immutable). Used by the index-entries / index-prefix / arbiter helpers.
+func (db *engine) indexMaintEnv() *evalEnv {
+	return &evalEnv{exec: db, rng: newStmtRng()}
+}
+
+// indexEntries computes a row's secondary-index entry keys for maintenance (spec/design/indexes.md
+// §4), building the unmetered eval env internally. Returns owned bytes, so callers compute all
+// entries through this &engine call BEFORE the store-mutating writes.
+func (db *engine) indexEntries(columns []catColumn, colls []*Collation, rindex *resolvedIndex, storageKey []byte, row storedRow) ([][]byte, error) {
+	return indexEntryKeys(columns, colls, rindex, storageKey, row, db.indexMaintEnv())
+}
+
+// indexPrefix computes a row's uniqueness-probe prefix for one index (spec/design/indexes.md §8),
+// building the unmetered eval env internally (as indexEntries).
+func (db *engine) indexPrefix(columns []catColumn, colls []*Collation, rindex *resolvedIndex, row storedRow) ([]byte, bool, error) {
+	return indexPrefixKey(columns, colls, rindex, row, db.indexMaintEnv())
+}
+
+// arbiterProbeKey computes a candidate row's arbiter key for ON CONFLICT (spec/design/upsert.md §3),
+// building the unmetered eval env internally (an expression-index arbiter evaluates its keys — as
+// indexPrefix).
+func (db *engine) arbiterProbeKey(arb *arbiter, table *catTable, pk []int, colls []*Collation, rindexes []resolvedIndex, row storedRow) ([]byte, bool, error) {
+	return arbiterKey(arb, table, pk, colls, rindexes, row, db.indexMaintEnv())
 }
 
 // evalDefault is the value an omitted column or a DEFAULT value slot takes (constraints.md §2):
@@ -1708,8 +1784,54 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 	default:
 		return outcome{}, newError(UndefinedObject, "access method does not exist: "+ci.Using)
 	}
-	cols := make([]int, 0, len(ci.Columns))
-	for _, name := range ci.Columns {
+	ciKeys := make([]indexKey, 0, len(ci.Keys))
+	for _, elem := range ci.Keys {
+		// An EXPRESSION key element (spec/design/indexes.md §1/§2): resolve it against the table's
+		// columns, validate it is immutable + indexable-typed, and store its canonical text
+		// (persisted, format_version 26). Expression keys are B-tree only this slice — GIN/GiST take
+		// a single plain column.
+		if elem.isExpr() {
+			if kind != indexBtree {
+				return outcome{}, newError(FeatureNotSupported,
+					"an expression key on a "+ci.Using+" index is not supported yet")
+			}
+			// A subquery is not a deterministic function of the row — 0A000 (the resolver admits an
+			// uncorrelated one, so it is rejected here, before resolution).
+			if indexExprHasSubquery(*elem.Expr) {
+				return outcome{}, newError(FeatureNotSupported, "cannot use subquery in index expression")
+			}
+			// Resolve against the table (an aggregate 42803 / window 42P20 / bind parameter 42P02
+			// fall out of the resolver, as for a CHECK).
+			s := singleScope(db, table)
+			_, rtype, rerr := resolve(s, *elem.Expr, nil, &aggCtx{collecting: false}, &paramTypes{})
+			if rerr != nil {
+				return outcome{}, rerr
+			}
+			// Immutability (§2): a non-immutable seam/sequence/current_setting call, or a session-
+			// timezone-dependent expression (one that reads or produces a timestamptz — conservatively
+			// fail-closed), is 42P17.
+			tzHazard := rtype.kind == rtTimestamptz
+			if !tzHazard {
+				for _, ref := range checkReferencedColumns(*elem.Expr, columns) {
+					if s, ok := columns[ref].Type.AsScalar(); ok && s == scalarTimestamptz {
+						tzHazard = true
+						break
+					}
+				}
+			}
+			if indexExprNonimmutableCall(*elem.Expr) || tzHazard {
+				return outcome{}, newError(InvalidObjectDefinition,
+					"functions in index expression must be marked IMMUTABLE")
+			}
+			// The result type must be key-encodable (a composite result is 0A000).
+			if _, ok := resolvedToKeyType(rtype); !ok {
+				return outcome{}, newError(FeatureNotSupported,
+					"an index on an expression of this result type is not supported yet")
+			}
+			ciKeys = append(ciKeys, indexKey{Expr: &indexKeyExpr{ExprText: elem.Text, Expr: *elem.Expr}})
+			continue
+		}
+		name := elem.Column
 		idx := table.ColumnIndex(name)
 		if idx < 0 {
 			return outcome{}, newError(UndefinedColumn, "column does not exist: "+name)
@@ -1757,7 +1879,7 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 			}
 		}
 		// A duplicate column in the list is ALLOWED (PostgreSQL allows it — indexes.md §1).
-		cols = append(cols, idx)
+		ciKeys = append(ciKeys, indexKey{Col: idx})
 	}
 	// GIN narrowings this slice (spec/design/gin.md §3): no uniqueness (undefined for an inverted
 	// index) and a single column only — both deferred 0A000.
@@ -1765,7 +1887,7 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 		if ci.Unique {
 			return outcome{}, newError(FeatureNotSupported, "access method gin does not support unique indexes")
 		}
-		if len(cols) != 1 {
+		if len(ciKeys) != 1 {
 			return outcome{}, newError(FeatureNotSupported, "a multi-column gin index is not supported yet")
 		}
 	}
@@ -1777,7 +1899,7 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 		if ci.Unique {
 			return outcome{}, newError(FeatureNotSupported, "access method gist does not support unique indexes")
 		}
-		if len(cols) != 1 {
+		if len(ciKeys) != 1 {
 			return outcome{}, newError(FeatureNotSupported, "a multi-column gist index is not supported yet")
 		}
 		if db.isTempTable(ci.Table) {
@@ -1812,11 +1934,13 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 			return outcome{}, newError(DuplicateTable, "relation already exists: "+name)
 		}
 	} else {
-		// PG's ChooseIndexName (probed): lowercased table + every listed column name
-		// (list order, duplicates included) + "idx", then the smallest free suffix.
+		// PG's ChooseIndexName / ChooseIndexColumnNames (probed): lowercased table + one name part
+		// per key element (list order, duplicates included) + "idx", then the smallest free suffix.
+		// A column key's part is the column name; a bare-function-call expression's is the function
+		// name (lower(email) → lower); any other expression's is the literal expr (indexes.md §2).
 		base := tableKey
-		for _, cn := range ci.Columns {
-			base += "_" + strings.ToLower(cn)
+		for _, elem := range ci.Keys {
+			base += "_" + indexNamePart(elem)
 		}
 		base += "_idx"
 		name = base
@@ -1825,16 +1949,31 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 		}
 	}
 
-	// The build scan (cost.md §3): page_read per table-tree node + storage_row_read per
-	// row, with the indexed columns as the touched set (fixed-width — the chain/decompress
-	// terms are structurally zero). An empty table charges 0. The entries are computed
-	// here, against the pre-index store; the writes below are unmetered.
+	def := indexDef{Name: name, Keys: ciKeys, Unique: ci.Unique, Kind: kind}
+	// The build scan (cost.md §3): page_read per table-tree node + storage_row_read per row. The
+	// touched set is the columns the key elements read — an index column for a column key, or every
+	// column an expression key references (which may be variable-width, so a spilled value adds its
+	// value_decompress slabs — indexes.md §5). An empty table charges 0. Entries are computed here
+	// against the pre-index store; the writes below are unmetered. An expression key evaluating with
+	// an error aborts the build (nothing is registered — indexes.md §4), preserving all-or-nothing.
 	meter := db.session.newMeter()
 	mask := make([]bool, len(columns))
-	for _, c := range cols {
-		mask[c] = true
+	for _, k := range def.Keys {
+		if k.Expr == nil {
+			mask[k.Col] = true
+			continue
+		}
+		for _, c := range checkReferencedColumns(k.Expr.Expr, columns) {
+			mask[c] = true
+		}
 	}
-	def := indexDef{Name: name, Columns: cols, Unique: ci.Unique, Kind: kind}
+	// Resolve the index once (column ordinals + resolved expression keys); the maintenance helpers
+	// build the unmetered eval env for any expression key (index expressions are immutable, so the
+	// rng is never read).
+	rindex, err := db.resolveIndex(table, def)
+	if err != nil {
+		return outcome{}, err
+	}
 	store := db.lkpStoreScoped(ci.DB, ci.Table)
 	stored, nodes, slabs, err := store.ScanWithUnits(mask)
 	if err != nil {
@@ -1851,14 +1990,15 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 			return outcome{}, err
 		}
 		meter.Charge(costs.StorageRowRead)
-		// The build reads the indexed key columns directly; resolve a faulted row's inline-deferred
-		// values (lazy-record.md §5b — always inline for a key column, so cost-free) before encoding.
+		// The build reads the referenced columns; resolve a faulted row's touched columns before
+		// encoding (an expression key may read a spilled value; the evaluator's Unfetched backstop
+		// also handles it).
 		row, err := store.resolveInlineColumns(e.Row)
 		if err != nil {
 			return outcome{}, err
 		}
 		if def.Unique {
-			prefix, ok, err := indexPrefixKey(columns, colls, def, row)
+			prefix, ok, err := db.indexPrefix(columns, colls, &rindex, row)
 			if err != nil {
 				return outcome{}, err
 			}
@@ -1870,7 +2010,7 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 				seenPrefixes[string(prefix)] = true
 			}
 		}
-		eks, err := indexEntryKeys(columns, colls, def, e.Key, row)
+		eks, err := db.indexEntries(columns, colls, &rindex, e.Key, row)
 		if err != nil {
 			return outcome{}, err
 		}

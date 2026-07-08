@@ -40,6 +40,9 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // and used to bound SELECT scans (spec/design/indexes.md, grammar.md §30).
   "ddl.secondary_index",
   "ddl.unique",
+  // Expression index keys — CREATE [UNIQUE] INDEX ON t (expr); validated immutable at create,
+  // maintained per row, enforced for UNIQUE, matched by the planner (spec/design/indexes.md §1).
+  "ddl.index_expr",
   // GIN inverted indexes — CREATE INDEX ... USING gin over an integer-element array column;
   // built + maintained on every write, persisted (format_version 13). The query-side planner
   // bound is query.gin_scan. spec/design/gin.md
@@ -285,6 +288,9 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // Index range scans + multi-column prefix bounds (spec/design/indexes.md §5.1).
   "query.index_range",
   "query.index_prefix",
+  // Index expression bound — the planner structurally matches a WHERE conjunct against an
+  // expression index key (lower(email) = $1 seeks) (spec/design/indexes.md §5).
+  "query.index_expr",
   // EXPLAIN — render the planner's chosen plan as a deterministic depth/node/detail result set,
   // without executing the inner statement (spec/design/explain.md).
   "query.explain",

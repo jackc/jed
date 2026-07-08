@@ -267,9 +267,13 @@ func (s *snapshot) upgradeCollations(pageSize uint32) (int, error) {
 		var indexes []indexDef
 		for _, idx := range table.Indexes {
 			affected := pkSkewed
-			for _, c := range idx.Columns {
-				if isSkewed(table.Columns[c].Collation) {
-					affected = true
+			// An expression index is C-collated (its keys never change on a collation upgrade); it is
+			// affected only by a pk_skewed re-key (which moves its suffix), handled fail-closed below.
+			if cols := idx.columnOrdinals(); cols != nil {
+				for _, c := range cols {
+					if isSkewed(table.Columns[c].Collation) {
+						affected = true
+					}
 				}
 			}
 			if affected {
@@ -318,9 +322,17 @@ func (s *snapshot) upgradeCollations(pageSize uint32) (int, error) {
 		// Rebuild each affected index store from the (re-keyed) rows.
 		c := pagePayload(pageSize)
 		for _, def := range indexes {
+			// The realign runs on a snapshot with no engine to evaluate an expression key; an
+			// expression index is C-collated so its keys never change on a collation upgrade, but a
+			// pkSkewed re-key moves its suffix — that (rare) rebuild is unsupported here (0A000; drop
+			// the expression index, upgrade, recreate — indexes.md §7). Column-only builder below.
+			if def.columnOrdinals() == nil {
+				return 0, newError(FeatureNotSupported,
+					"collation upgrade of a table with an expression index is not supported yet")
+			}
 			var ekeys [][]byte
 			for _, e := range entries {
-				eks, err := indexEntryKeys(table.Columns, colls, def, e.Key, e.Row)
+				eks, err := indexEntryKeysColumns(table.Columns, colls, def, e.Key, e.Row)
 				if err != nil {
 					return 0, err
 				}
@@ -837,7 +849,7 @@ func (s *snapshot) rebuildGistTrees() error {
 			}
 			// One opclass per indexed column (gist.md §7): single for a GX1/GX2 index, one per
 			// WITH column for an EXCLUDE backing index.
-			specs = append(specs, spec{nameKey: strings.ToLower(idx.Name), ops: gistOpclassesFor(idx.Columns, t.Columns)})
+			specs = append(specs, spec{nameKey: strings.ToLower(idx.Name), ops: gistOpclassesFor(idx.columnOrdinals(), t.Columns)})
 		}
 	}
 	live := make(map[string]bool, len(specs))

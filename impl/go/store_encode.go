@@ -944,10 +944,12 @@ func buildFkProbe(fk *foreignKey, parent *catTable, parentColls []*Collation, ro
 		return fkProbe{kind: fkProbePk, bytes: k}, true, nil
 	}
 	var idx *indexDef
+	var idxCols []int
 	for i := range parent.Indexes {
 		ix := &parent.Indexes[i]
-		if ix.Unique && slices.Equal(sortedUnique(ix.Columns), refSet) {
+		if cols := ix.columnOrdinals(); ix.Unique && cols != nil && slices.Equal(sortedUnique(cols), refSet) {
 			idx = ix
+			idxCols = cols
 			break
 		}
 	}
@@ -955,7 +957,7 @@ func buildFkProbe(fk *foreignKey, parent *catTable, parentColls []*Collation, ro
 		panic("referenced columns matched a unique key at CREATE TABLE §6.2")
 	}
 	var prefix []byte
-	for _, pcol := range idx.Columns {
+	for _, pcol := range idxCols {
 		b, err := encodeTypedKey(parent.Columns[pcol].Type, valueFor(pcol), parentColls[pcol])
 		if err != nil {
 			return fkProbe{}, false, err

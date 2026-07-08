@@ -36,6 +36,26 @@ gen = "int_uniform"
 min = 1
 max = 100000
 
+# Expression-index equality lookup (spec/design/indexes.md §5, query.index_expr): a case-insensitive
+# text lookup `WHERE lower(note) = $1` seeks the orders_note_lower_idx expression index instead of
+# full-scanning the 1M-row table + evaluating lower(note) per row. The `text` param is drawn from the
+# same distribution as the note column, so it seeks the index tree (finding few/no matches) — the
+# perf story is index seek vs. full scan, the expression-index analogue of secondary_lookup.
+[[bench]]
+name = "expr_lookup"
+description = "Expression-index equality lookup on 1M rows — lower(note) = $1 seeks vs. a full scan"
+dataset = "large"
+kind = "query"
+sql = "SELECT id, amount FROM orders WHERE lower(note) = $1 ORDER BY id"
+warmup = 2000
+iterations = 20000
+seed = 4207
+
+[[bench.param]]
+gen = "text"
+min_len = 8
+max_len = 32
+
 # OR / IN-list merged point lookups (spec/design/cost.md §3 "OR / IN-list", query.or_in_point_lookup):
 # a 10-value IN-list on the PRIMARY KEY lowers to 10 point probes over the 1M-row B-tree instead of a
 # full scan — the win this benchmark demonstrates (a handful of root→leaf seeks vs. a walk of every

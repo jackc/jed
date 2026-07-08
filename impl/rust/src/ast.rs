@@ -192,17 +192,28 @@ pub struct DropTable {
 }
 
 /// `CREATE [UNIQUE] INDEX [name] ON <table> ( col [, col]* )` — a secondary index
+/// One key element of a `CREATE INDEX` key list (spec/design/indexes.md §1, grammar.md §30).
+/// Either a bare column name, or an expression over the table's columns (`lower(email)`,
+/// `(a + b)`) carrying its canonical text (the *Check-expression text* form, for persistence
+/// and structural planner matching — indexes.md §6) alongside the parsed AST.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum IndexKeyElem {
+    Column(String),
+    Expr { text: String, expr: Expr },
+}
+
 /// (spec/design/indexes.md, grammar.md §30). `name: None` is the unnamed form; the
-/// executor derives PostgreSQL's auto-name. Key columns are bare names (no expression /
-/// ordered / partial keys this slice); a column may repeat (PG allows it). Execution
-/// validates in PG's order: table 42P01, columns 42703/0A000, name collision 42P07. A
-/// `unique` index additionally verifies the existing rows at build (23505) and enforces
-/// uniqueness thereafter (spec/design/indexes.md §8).
+/// executor derives PostgreSQL's auto-name. A key element is a bare column, a bare function
+/// call, or a parenthesized expression (`index_elem`); a column may repeat (PG allows it).
+/// Execution validates in PG's order: table 42P01, per element 42703/0A000 (a column key) or
+/// the expression-validity codes (42803/42P20/0A000/42P02/42P17/0A000, indexes.md §2), name
+/// collision 42P07. A `unique` index additionally verifies the existing rows at build (23505)
+/// and enforces uniqueness thereafter (spec/design/indexes.md §8).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct CreateIndex {
     pub name: Option<String>,
     pub table: String,
-    pub columns: Vec<String>,
+    pub keys: Vec<IndexKeyElem>,
     pub unique: bool,
     /// The `USING <method>` access method as written, or `None` for the default ordered B-tree.
     /// Resolved at execution: `None`/`btree` → B-tree, `gin` → GIN, else 42704 (gin.md §3).

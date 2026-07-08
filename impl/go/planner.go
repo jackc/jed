@@ -1251,7 +1251,13 @@ func (db *engine) orderSatisfiedByIndex(table *catTable, offset int, order []ord
 		if idx.Kind != indexBtree {
 			continue // only an ordered B-tree realizes the column order (GIN/GiST do not)
 		}
-		if len(order) != len(idx.Columns) {
+		// ORDER-BY skip-sort is column-only this slice (matching ORDER BY against an expression
+		// index key is a follow-on — indexes.md §5).
+		cols := idx.columnOrdinals()
+		if cols == nil {
+			continue
+		}
+		if len(order) != len(cols) {
 			continue // the ORDER BY must be EXACTLY the index columns (see the doc — tie-break)
 		}
 		matches := true
@@ -1260,11 +1266,11 @@ func (db *engine) orderSatisfiedByIndex(table *catTable, offset int, order []ord
 				matches = false // ASC + NULLS LAST only — the order a forward index walk realizes
 				break
 			}
-			if o.idx != offset+idx.Columns[i] {
+			if o.idx != offset+cols[i] {
 				matches = false
 				break
 			}
-			coll, push := db.keyCollationCtx(table.Columns[idx.Columns[i]])
+			coll, push := db.keyCollationCtx(table.Columns[cols[i]])
 			if !push { // Skewed / unresolvable — never walked for order (§12)
 				matches = false
 				break

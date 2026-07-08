@@ -1,0 +1,191 @@
+# Expression index keys (spec/design/indexes.md §1/§2/§5/§6): a CREATE [UNIQUE] INDEX key
+# element may be a bare column, a bare function call (lower(email)), or a parenthesized
+# expression ((a + b)) — PostgreSQL's index_elem. The expression is validated immutable at
+# CREATE INDEX, maintained per row on every write, enforced for UNIQUE, and matched by the
+# planner access predicate (WHERE lower(email) = $1 seeks the index). The ROWS never change
+# with or without the pushdown (the WHERE stays the residual filter) — only cost does; the
+# `# cost:` lines pin the cross-core index-bound usage (query.index_expr). Rows + error codes
+# AGREE with PostgreSQL (oracle-checked); the jed-specific pieces (canonical text in
+# jed_indexes, the conservative timestamptz-expression 42P17, C-collation keys) live in the
+# per-core tests. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.unique, ddl.index_expr, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.point_lookup, query.index_expr, query.explain, query.aggregates, query.window_ranking, query.subquery_scalar, types.i32, types.text, types.timestamptz, resource.cost_metering
+
+# --- a plain expression index accelerates a WHERE on the same expression -------------------------
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32)
+
+statement ok
+INSERT INTO t VALUES (1, 1, 9), (2, 2, 2), (3, 3, 7), (4, 4, 4), (5, 5, 5), (6, 6, 1), (7, 7, 7), (8, 8, 8), (9, 9, 9), (10, 0, 0)
+
+# a+b = 10 matches ids 1, 3, 5 (full-scan baseline)
+# cost: 34
+query I nosort
+SELECT id FROM t WHERE a + b = 10 ORDER BY id
+----
+1
+3
+5
+
+statement ok
+CREATE INDEX ON t ((a + b))
+
+# the same query now index-bounds the scan — identical rows, LOWER cost (query.index_expr);
+# a core that ignored the expression index would compute the higher full-scan cost above
+# cost: 16
+query I nosort
+SELECT id FROM t WHERE a + b = 10 ORDER BY id
+----
+1
+3
+5
+
+# a re-associated expression does NOT match the index (PG's syntactic matching) — full scan,
+# same rows
+query I nosort
+SELECT id FROM t WHERE b + a = 10 ORDER BY id
+----
+1
+3
+5
+
+# maintenance keeps the index exact across UPDATE / DELETE / INSERT
+statement ok
+UPDATE t SET a = 100 WHERE id = 3
+
+statement ok
+DELETE FROM t WHERE id = 5
+
+statement ok
+INSERT INTO t VALUES (11, 4, 6)
+
+query I nosort
+SELECT id FROM t WHERE a + b = 10 ORDER BY id
+----
+1
+11
+
+# --- a UNIQUE expression index enforces case-insensitive uniqueness (lower(email)) ---------------
+
+statement ok
+CREATE TABLE u (id i32 PRIMARY KEY, email text)
+
+statement ok
+CREATE UNIQUE INDEX ON u (lower(email))
+
+statement ok
+INSERT INTO u VALUES (1, 'Alice@Example.com')
+
+# a case-different value collides on lower(email)
+statement error 23505
+INSERT INTO u VALUES (2, 'ALICE@EXAMPLE.COM')
+
+# a distinct value inserts fine
+statement ok
+INSERT INTO u VALUES (2, 'bob@example.com')
+
+# the accelerated case-insensitive lookup
+query I nosort
+SELECT id FROM u WHERE lower(email) = 'alice@example.com'
+----
+1
+
+# a NULL expression value never conflicts (NULLS DISTINCT) — two NULL emails coexist
+statement ok
+INSERT INTO u VALUES (3, NULL), (4, NULL)
+
+query I nosort
+SELECT id FROM u ORDER BY id
+----
+1
+2
+3
+4
+
+# --- a lower(x) expression index accelerates a case-insensitive lookup (the headline shape) ------
+# lower(x)/upper(x) resolve to a dedicated casing node, NOT the generic scalar-function node, so the
+# planner access-predicate match must recognize that node kind specifically. If it does not, the seek
+# silently degrades to a full scan with the SAME rows but full-scan cost — invisible to a rows-only
+# test. These `# cost:` lines pin the pushdown: the indexed lookup MUST be cheaper than the full scan
+# (query.index_expr). Rows AGREE with PostgreSQL (oracle-checked).
+
+statement ok
+CREATE TABLE c (id i32 PRIMARY KEY, email text)
+
+statement ok
+INSERT INTO c VALUES (1, 'Alice@Example.com'), (2, 'Bob@Example.com'), (3, 'carol@example.com'), (4, 'Dave@Example.com'), (5, 'eve@example.com')
+
+# full-scan baseline (no index yet)
+# cost: 87
+query I nosort
+SELECT id FROM c WHERE lower(email) = 'bob@example.com' ORDER BY id
+----
+2
+
+statement ok
+CREATE INDEX ON c (lower(email))
+
+# the same case-insensitive lookup now seeks the expression index — identical row, LOWER cost; a core
+# that failed to match the casing node against the key would recompute the higher full-scan cost above
+# cost: 20
+query I nosort
+SELECT id FROM c WHERE lower(email) = 'bob@example.com' ORDER BY id
+----
+2
+
+# upper(x) resolves to the same casing node (direction flipped) and seeks its own index the same way
+statement ok
+CREATE INDEX ON c (upper(email))
+
+# cost: 20
+query I nosort
+SELECT id FROM c WHERE upper(email) = 'BOB@EXAMPLE.COM' ORDER BY id
+----
+2
+
+# --- an index may MIX a plain column and an expression key ---------------------------------------
+
+statement ok
+CREATE TABLE m (id i32 PRIMARY KEY, name text, kind i32)
+
+statement ok
+CREATE INDEX ON m (kind, lower(name))
+
+statement ok
+INSERT INTO m VALUES (1, 'Zed', 5), (2, 'alice', 5), (3, 'Bob', 7)
+
+# the equality prefix on the leading column + the expression seeks; rows unchanged
+query I nosort
+SELECT id FROM m WHERE kind = 5 AND lower(name) = 'alice'
+----
+2
+
+# --- CREATE INDEX expression validation (codes AGREE with PostgreSQL) ----------------------------
+
+statement ok
+CREATE TABLE v (id i32 PRIMARY KEY, a i32, ts timestamptz)
+
+# an aggregate in an index expression
+statement error 42803
+CREATE INDEX ON v ((sum(a)))
+
+# a window function
+statement error 42P20
+CREATE INDEX ON v ((row_number() OVER ()))
+
+# a subquery
+statement error 0A000
+CREATE INDEX ON v ((a + (SELECT count(*) FROM v)))
+
+# a non-immutable (seam) function — must be marked IMMUTABLE
+statement error 42P17
+CREATE INDEX ON v ((ts > now()))
+
+# --- grammar: a general operator expression MUST be parenthesized (bare a + b is a syntax error) --
+
+statement error 42601
+CREATE INDEX ON v (a + a)
+
+# a parenthesized bare column normalizes to a plain column key (not an expression) — succeeds
+statement ok
+CREATE INDEX ON v ((a))

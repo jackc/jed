@@ -12,12 +12,18 @@ import type {
   SequenceDef,
   Table,
 } from "./catalog.ts";
+import { indexColumnOrdinals } from "./catalog.ts";
 import { TableStore } from "./storage.ts";
 import type { Collation } from "./collation.ts";
 import type { GistOpclass, GistTree } from "./gist.ts";
 import type { SharedPaging } from "./paging.ts";
 import { cloneStores } from "./scope.ts";
-import { MAX_COMPOSITE_DEPTH, encodePkKey, gistOpclassFor, indexEntryKeys } from "./executor.ts";
+import {
+  MAX_COMPOSITE_DEPTH,
+  encodePkKey,
+  gistOpclassFor,
+  indexEntryKeysColumns,
+} from "./executor.ts";
 import { buildGistFromLeafKeys } from "./gist.ts";
 import { loadedCollation, versionSkew } from "./collation.ts";
 import { engineError } from "./errors.ts";
@@ -158,7 +164,7 @@ export class Snapshot {
         // column for an EXCLUDE backing index.
         specs.push({
           nameKey: idx.name.toLowerCase(),
-          ops: idx.columns.map((ci) => gistOpclassFor(t.columns[ci]!.type)),
+          ops: indexColumnOrdinals(idx)!.map((ci) => gistOpclassFor(t.columns[ci]!.type)),
         });
       }
     }
@@ -321,9 +327,11 @@ export class Snapshot {
       // carries the storage key as its suffix (indexes.md §3) ⇒ every index of the table is rebuilt.
       // Else only the indexes whose own key columns use a skewed collation are rebuilt.
       const pkSkewed = table.pk.some((i) => isSkewed(table.columns[i]!.collation));
-      const indexes = table.indexes.filter(
-        (idx) => pkSkewed || idx.columns.some((c) => isSkewed(table.columns[c]!.collation)),
-      );
+      const indexes = table.indexes.filter((idx) => {
+        if (pkSkewed) return true;
+        const cols = indexColumnOrdinals(idx);
+        return cols !== null && cols.some((c) => isSkewed(table.columns[c]!.collation));
+      });
       if (!pkSkewed && indexes.length === 0) continue;
       const colls: (Collation | null)[] = table.columns.map((c) =>
         c.collation !== null ? (this.resolveCollation(c.collation) ?? null) : null,
@@ -342,11 +350,21 @@ export class Snapshot {
         const fresh = this.store(table.name);
         for (const e of entries) fresh.insert(e.key, e.row);
       }
-      // Rebuild each affected index store from the (re-keyed) rows.
+      // Rebuild each affected index store from the (re-keyed) rows. The realign runs on a Snapshot
+      // with no Engine to evaluate an expression key; an expression index is C-collated so its keys
+      // never change on a collation upgrade, but a pkSkewed re-key moves its suffix — that (rare)
+      // rebuild is unsupported here (0A000; drop the expression index, upgrade, recreate —
+      // indexes.md §7). Uses the column-only entry builder.
       for (const def of indexes) {
+        if (indexColumnOrdinals(def) === null) {
+          throw engineError(
+            "feature_not_supported",
+            "collation upgrade of a table with an expression index is not supported yet",
+          );
+        }
         const ekeys: Uint8Array[] = [];
         for (const e of entries)
-          ekeys.push(...indexEntryKeys(table.columns, colls, def, e.key, e.row));
+          ekeys.push(...indexEntryKeysColumns(table.columns, colls, def, e.key, e.row));
         ekeys.sort(compareBytes);
         const fresh = new TableStore(pagePayload(pageSize), []);
         for (const ek of ekeys) fresh.insert(ek, []);

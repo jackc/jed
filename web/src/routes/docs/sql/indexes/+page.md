@@ -16,6 +16,17 @@ INSERT INTO city VALUES
 
 	const orderedQuery = `SELECT name FROM city WHERE region = 1 ORDER BY name;`;
 
+	const exprSeed = `CREATE TABLE account (
+  id    i32 PRIMARY KEY,
+  email text NOT NULL
+);
+CREATE UNIQUE INDEX ON account (lower(email));
+INSERT INTO account VALUES
+  (1, 'Ada@Example.com'),
+  (2, 'grace@example.com');`;
+
+	const exprQuery = `SELECT id FROM account WHERE lower(email) = 'ada@example.com';`;
+
 	const ginSeed = `CREATE TABLE post (
   id    i32 PRIMARY KEY,
   title text NOT NULL,
@@ -76,6 +87,27 @@ edit the `WHERE` to `region = 2` — the index narrows the scan to the matching 
 is the same set you'd get without it:
 
 <LiveSql seed={orderedSeed} query={orderedQuery} rows={6} />
+
+## Expression indexes
+
+A key element can be an **expression** over the table's columns instead of a bare column — a bare
+function call like `lower(email)`, or a parenthesized expression like `(a + b)`. jed then accelerates
+a query whose `WHERE` uses that **same expression**: `WHERE lower(email) = …` seeks an index on
+`lower(email)`. An index may mix column and expression keys — `CREATE INDEX ON t (kind, lower(name))`.
+
+The canonical use is **case-insensitive uniqueness**: a `UNIQUE` index on `lower(email)` forbids two
+rows whose emails differ only in case. Insert a second row with `'ADA@EXAMPLE.COM'` below to see the
+`23505` unique violation, then run the case-insensitive lookup:
+
+<LiveSql seed={exprSeed} query={exprQuery} rows={4} />
+
+The expression must be **immutable** — a deterministic function of the row. jed rejects, at
+`CREATE INDEX`, an expression that calls a non-immutable function (`now()`, `uuidv4()`, `nextval(…)`)
+with `42P17`, an aggregate with `42803`, a window function with `42P20`, or a subquery with `0A000`.
+A general operator expression must be parenthesized (`(a + b)`); a bare `a + b` is a syntax error, and
+a parenthesized bare column `(a)` is just a column key. The expression's result must be a
+key-encodable type. Matching is **syntactic**, as in PostgreSQL: an index on `(a + b)` accelerates
+`WHERE a + b = …` but not the re-associated `WHERE b + a = …`.
 
 ## GIN indexes for arrays (`USING gin`)
 

@@ -8,16 +8,17 @@ pub(crate) use crate::api::Rows;
 pub(crate) use crate::ast::{
     AlterSeqAction, AlterSequence, BinaryOp, ConflictAction, ConflictTarget, CreateIndex,
     CreateSequence, CreateTable, CreateType, Cte, CteBody, Delete, DropIndex, DropSequence,
-    DropTable, DropType, Expr, GroupItem, Insert, InsertSource, InsertValue, JoinKind,
-    JsonOnBehavior, JsonPredicateKind, JsonTable, JsonWrapper, JtColumn, Literal, OnConflict,
-    OrderKey, Overriding, QueryExpr, RefAction, Select, SelectItems, SeqOptions, SetOp, SetOpKind,
-    Statement, SubscriptSpec, TableRef, TypeFieldDef, TypeMod, UnaryOp, Update, WindowDef,
-    WithExpr, WithQuery,
+    DropTable, DropType, Expr, GroupItem, IndexKeyElem, Insert, InsertSource, InsertValue,
+    JoinKind, JsonOnBehavior, JsonPredicateKind, JsonTable, JsonWrapper, JtColumn, Literal,
+    OnConflict, OrderKey, Overriding, QueryExpr, RefAction, Select, SelectItems, SeqOptions, SetOp,
+    SetOpKind, Statement, SubscriptSpec, TableRef, TypeFieldDef, TypeMod, UnaryOp, Update,
+    WindowDef, WithExpr, WithQuery,
 };
 pub(crate) use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
     ExclusionConstraint, ExclusionElement, ExclusionOp, FkAction, ForeignKeyConstraint,
-    IdentityKind, IndexDef, IndexKind, SeqDataType, SeqOwner, SequenceDef, Table, resolve_col_type,
+    IdentityKind, IndexDef, IndexKey, IndexKeyExpr, IndexKind, SeqDataType, SeqOwner, SequenceDef,
+    Table, resolve_col_type,
 };
 pub(crate) use crate::collation::{self, Collation};
 pub(crate) use crate::cost::{Lifetime, Meter};
@@ -1637,7 +1638,7 @@ fn type_names(types: &[ResolvedType]) -> Vec<String> {
     types.iter().map(|t| t.type_name().to_string()).collect()
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ArithOp {
     Add,
     Sub,
@@ -1688,7 +1689,7 @@ impl CmpOp {
 /// The scalar functions (kind = "function", spec/design/functions.md §9), parsed from a call
 /// name (case-insensitive). Evaluated per row; the overload (integer vs decimal) is recovered
 /// at eval from the argument's runtime value.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScalarFunc {
     Abs,
     Round,

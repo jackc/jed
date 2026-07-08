@@ -1723,13 +1723,12 @@ pub(crate) fn resolve_arbiter(
                 return Ok(Some(Arbiter::PrimaryKey));
             }
             for (i, def) in tdef.indexes.iter().enumerate() {
+                // A conflict-target COLUMN list matches only a plain-column unique index (an
+                // expression unique index is arbitrated by `ON CONSTRAINT <name>` — upsert.md §3).
                 if def.unique
-                    && def
-                        .columns
-                        .iter()
-                        .copied()
-                        .collect::<std::collections::BTreeSet<_>>()
-                        == want
+                    && def.column_ordinals().is_some_and(|c| {
+                        c.into_iter().collect::<std::collections::BTreeSet<_>>() == want
+                    })
                 {
                     return Ok(Some(Arbiter::Index(i)));
                 }
@@ -1767,12 +1766,13 @@ pub(crate) fn arbiter_key(
     pk: &[(usize, Type)],
     colls: &[Option<std::sync::Arc<Collation>>],
     columns: &[Column],
-    indexes: &[IndexDef],
+    rindexes: &[ResolvedIndex],
     row: &Row,
+    env: &EvalEnv,
 ) -> Result<Option<Vec<u8>>> {
     match arb {
         Arbiter::PrimaryKey => Ok(Some(encode_pk_key(pk, colls, row)?)),
-        Arbiter::Index(i) => index_prefix_key(columns, colls, &indexes[*i], row),
+        Arbiter::Index(i) => index_prefix_key(columns, colls, &rindexes[*i], row, env),
     }
 }
 

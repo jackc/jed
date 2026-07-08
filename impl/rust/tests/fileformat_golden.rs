@@ -177,6 +177,23 @@ fn unique_table_db() -> Session {
     db
 }
 
+/// A table with an EXPRESSION index key (v26 — the per-index `0xFFFF` sentinel + canonical text,
+/// indexes.md §6): a plain column index `t_email_idx` beside the UNIQUE expression index
+/// `t_lower_idx` over `lower(email)`. The table is EMPTY (both index trees empty, root 0), so the
+/// fixture isolates the v26 catalog change. Must match verify.rb's EXPR_INDEX_TABLE.
+fn expr_index_table_db() -> Session {
+    let mut db = Database::create(CreateOptions {
+        page_size: GOLDEN_PAGE_SIZE,
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
+    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, email text)");
+    run(&mut db, "CREATE INDEX ON t (email)");
+    run(&mut db, "CREATE UNIQUE INDEX ON t (lower(email))");
+    db
+}
+
 /// Tables with FOREIGN KEY constraints (v11 — spec/design/constraints.md §6): pins the catalog
 /// foreign-key list. Parent `p` (a PK + two UNIQUE constraints, the FK targets); child `c` with
 /// four FKs covering every shape — a named FK to the UNIQUE column (`c_code_fk`), a self-reference
@@ -1340,6 +1357,7 @@ fn write_matches_goldens() {
         ("check_table.jed", check_table_db),
         ("index_table.jed", index_table_db),
         ("unique_table.jed", unique_table_db),
+        ("expr_index_table.jed", expr_index_table_db),
         ("gin_array_table.jed", gin_array_table_db),
         ("gin_uuid_table.jed", gin_uuid_table_db),
         ("fk_table.jed", fk_table_db),
@@ -1408,6 +1426,7 @@ fn read_goldens_reproduces_rows() {
         ("check_table.jed", check_table_db, "t"),
         ("index_table.jed", index_table_db, "t"),
         ("unique_table.jed", unique_table_db, "t"),
+        ("expr_index_table.jed", expr_index_table_db, "t"),
         ("gin_array_table.jed", gin_array_table_db, "t"),
         ("gin_uuid_table.jed", gin_uuid_table_db, "t"),
         ("fk_table.jed", fk_table_db, "c"),

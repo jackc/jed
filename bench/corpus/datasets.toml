@@ -10,7 +10,7 @@ schema_version = 1
 # split-rule fix) even if the shapes below do not.
 # 4: the on-disk format bumped 21 → 22 (varchar(n) length limits), which reshapes every
 #    generated .jed; the v21 datasets are unreadable by the current core, so invalidate them.
-generator_version = 4
+generator_version = 5
 
 [[dataset]]
 name = "small"
@@ -89,6 +89,13 @@ max_len = 32
 [[dataset.table.index]]
 name = "orders_customer_idx"
 columns = ["customer_id"]
+
+# An EXPRESSION index over lower(note) (spec/design/indexes.md §1) — backs the expr_lookup
+# benchmark's case-insensitive text lookup. The harness emits CREATE INDEX ... (lower(note)),
+# a bare-function-call expression key.
+[[dataset.table.index]]
+name = "orders_note_lower_idx"
+columns = ["lower(note)"]
 
 # GIN dataset — a single array-column table behind a GIN inverted index (spec/design/gin.md).
 # jed + PostgreSQL only: SQLite has neither an array type nor GIN, so the table carries a

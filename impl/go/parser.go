@@ -1072,13 +1072,13 @@ func (p *parser) parseCreateIndex() (*createIndex, error) {
 	if err := p.expect(tokLParen); err != nil {
 		return nil, err
 	}
-	var columns []string
+	var keys []indexKeyElem
 	for {
-		col, err := p.expectIdentifier()
+		key, err := p.parseIndexElement()
 		if err != nil {
 			return nil, err
 		}
-		columns = append(columns, col)
+		keys = append(keys, key)
 		tok := p.advance()
 		if tok.Kind == tokComma {
 			continue
@@ -1088,7 +1088,58 @@ func (p *parser) parseCreateIndex() (*createIndex, error) {
 		}
 		return nil, newError(SyntaxError, fmt.Sprintf("expected ',' or ')', found %v", tok))
 	}
-	return &createIndex{Name: name, Table: table, DB: dbQualifier, Columns: columns, Unique: unique, Using: using}, nil
+	return &createIndex{Name: name, Table: table, DB: dbQualifier, Keys: keys, Unique: unique, Using: using}, nil
+}
+
+// parseIndexElement parses one index_element (grammar.md §30, indexes.md §1): a bare column, a
+// bare function call (`lower(email)`), or a parenthesized expression (`(a + b)`). PostgreSQL's
+// index_elem: a general operator expression must be parenthesized (a bare `a + b` errors —
+// parsePrimary stops before the operator, so the element loop then sees an unexpected token); a
+// parenthesized bare column `(a)` normalizes to a column key.
+func (p *parser) parseIndexElement() (indexKeyElem, error) {
+	switch {
+	case p.peek().Kind == tokLParen:
+		// `( expr )` — any parenthesized expression.
+		p.advance()
+		start := p.pos
+		expr, err := p.parseExpr()
+		if err != nil {
+			return indexKeyElem{}, err
+		}
+		end := p.pos
+		if err := p.expect(tokRParen); err != nil {
+			return indexKeyElem{}, err
+		}
+		return p.indexKeyFromExpr(expr, start, end), nil
+	case p.peek().Kind == tokWord && p.peekKindAt(1) == tokLParen:
+		// A bare function call `f(args)` — parse ONLY the primary, so a trailing operator
+		// (`lower(x) + 1`) leaves `+` for the element loop to reject (PG requires parens).
+		start := p.pos
+		expr, err := p.parsePrimary()
+		if err != nil {
+			return indexKeyElem{}, err
+		}
+		end := p.pos
+		return p.indexKeyFromExpr(expr, start, end), nil
+	default:
+		// A bare column name.
+		col, err := p.expectIdentifier()
+		if err != nil {
+			return indexKeyElem{}, err
+		}
+		return indexKeyElem{Column: col}, nil
+	}
+}
+
+// indexKeyFromExpr classifies a parsed index-element expression: a bare column reference (`a`,
+// `(a)`, `((a))`) becomes a column key (PG-matched), anything else an expression key carrying its
+// canonical text (rendered from the captured token span, like CHECK/DEFAULT).
+func (p *parser) indexKeyFromExpr(expr exprNode, start, end int) indexKeyElem {
+	if expr.Kind == exprColumn {
+		return indexKeyElem{Column: expr.Column}
+	}
+	e := expr
+	return indexKeyElem{Expr: &e, Text: renderTokens(p.tokens[start:end])}
 }
 
 // parseDropIndex parses `DROP INDEX <name>` (spec/design/grammar.md §30). A missing index

@@ -22,6 +22,7 @@ import type {
   Explain,
   Expr,
   GroupItem,
+  IndexKeyElem,
   Insert,
   InsertValue,
   JoinKind,
@@ -76,11 +77,15 @@ import {
   type ForeignKey,
   type IdentityKind,
   type IndexDef,
+  type IndexKey,
   type SeqDataType,
   type SeqOwner,
   type SequenceDef,
   type Table,
   columnIndex,
+  indexAllColumns,
+  indexColumnOrdinals,
+  indexFirstColumn,
   pkIndices,
   seqDataTypeDefaultBounds,
   seqDataTypeForScalar,
@@ -3658,7 +3663,7 @@ export class Engine {
       if (pos < 0) pos = table.indexes.length;
       table.indexes.splice(pos, 0, {
         name,
-        columns: ru.cols,
+        keys: ru.cols.map((c) => ({ kind: "column", column: c })),
         unique: true,
         kind: "btree",
       });
@@ -3768,7 +3773,10 @@ export class Engine {
       const refSet = sortedUnique(refs);
       const matchesUnique =
         (parent.pk.length > 0 && sameSet(sortedUnique(parent.pk), refSet)) ||
-        parent.indexes.some((i) => i.unique && sameSet(sortedUnique(i.columns), refSet));
+        parent.indexes.some((i) => {
+          const cols = indexColumnOrdinals(i);
+          return i.unique && cols !== null && sameSet(sortedUnique(cols), refSet);
+        });
       if (!matchesUnique) {
         throw engineError(
           "invalid_foreign_key",
@@ -3923,7 +3931,12 @@ export class Engine {
       const nameKey = name.toLowerCase();
       let pos = table.indexes.findIndex((ix) => ix.name.toLowerCase() > nameKey);
       if (pos < 0) pos = table.indexes.length;
-      table.indexes.splice(pos, 0, { name, columns: indices, unique: false, kind: "gist" });
+      table.indexes.splice(pos, 0, {
+        name,
+        keys: indices.map((c) => ({ kind: "column", column: c })),
+        unique: false,
+        kind: "gist",
+      });
       table.exclusions.push({ name, index: name, elements });
     }
     // Held in ascending lowercased-name order (the catalog's on-disk order — gist.md §8).
@@ -4071,6 +4084,100 @@ export class Engine {
         new ParamTypes(),
       ).node,
     }));
+  }
+
+  // maintenanceEnv builds the unmetered eval env for phase-1 index-expression / CHECK evaluation
+  // (spec/design/indexes.md §4): params/CTEs are empty (an index expression cannot reference them) and
+  // the seam rng is shared/threaded (an immutable index expression never reads it). Used by the index
+  // maintenance helpers and CREATE INDEX build.
+  private maintenanceEnv(rng: StmtRng): EvalEnv {
+    return {
+      params: [],
+      outer: [],
+      runSubquery: (p, o) => this.execQueryPlan(p, o, [], EMPTY_CTE_CTX),
+      seam: this.session.seam,
+      rng,
+      ctes: EMPTY_CTE_CTX,
+      exec: this,
+    };
+  }
+
+  // resolveIndex resolves an index's key elements for one statement's maintenance
+  // (spec/design/indexes.md §4), modeled on resolveChecks: a column key keeps its ordinal; an
+  // expression key resolves against the table's columns to an RExpr + its encoding Type + collation.
+  // The expression was validated (immutable, indexable result) at CREATE INDEX, so resolution here
+  // cannot newly fail (an aggregate/window/subquery/param was rejected then, and re-resolving under
+  // the Forbidden agg mode is inert). Returns an owned ResolvedIndex, so the write paths can hold it
+  // while mutating stores.
+  resolveIndex(table: Table, def: IndexDef): ResolvedIndex {
+    const keys: ResolvedKey[] = def.keys.map((k) => {
+      if (k.kind === "column") return { kind: "column", column: k.column };
+      const scope = Scope.single(this, table);
+      const { node, type } = resolve(
+        scope,
+        k.expr,
+        null,
+        { collecting: false, groupKeys: [], specs: [] },
+        new ParamTypes(),
+      );
+      const ty = resolvedToKeyType(type);
+      if (ty === null) {
+        throw new Error("index expression result type validated indexable at CREATE INDEX");
+      }
+      const coll = resolveDeriv(scope.catalog, deriveCollation(scope, k.expr));
+      return { kind: "expr", expr: node, type: ty, coll };
+    });
+    return { name: def.name, unique: def.unique, kind: def.kind, keys };
+  }
+
+  // resolveTableIndexes resolves every index of a table once per statement (the maintenance driver —
+  // INSERT / UPDATE / DELETE build their ResolvedIndex list up front, parallel to table.indexes).
+  resolveTableIndexes(table: Table): ResolvedIndex[] {
+    return table.indexes.map((d) => this.resolveIndex(table, d));
+  }
+
+  // indexEntries is a row's secondary-index entry keys for maintenance (spec/design/indexes.md §4),
+  // building the unmetered eval env internally (an index expression is immutable). Callers compute all
+  // entries through this before mutating a store.
+  private indexEntries(
+    columns: Column[],
+    colls: (Collation | null)[],
+    rindex: ResolvedIndex,
+    storageKey: Uint8Array,
+    row: Row,
+  ): Uint8Array[] {
+    return indexEntryKeys(
+      columns,
+      colls,
+      rindex,
+      storageKey,
+      row,
+      this.maintenanceEnv(new StmtRng()),
+    );
+  }
+
+  // indexPrefix is a row's uniqueness-probe prefix for one index (spec/design/indexes.md §8), building
+  // the unmetered eval env internally (as indexEntries).
+  private indexPrefix(
+    columns: Column[],
+    colls: (Collation | null)[],
+    rindex: ResolvedIndex,
+    row: Row,
+  ): Uint8Array | null {
+    return indexPrefixKey(columns, colls, rindex, row, this.maintenanceEnv(new StmtRng()));
+  }
+
+  // arbiterProbeKey is a candidate row's arbiter key for ON CONFLICT (spec/design/upsert.md §3),
+  // building the unmetered eval env internally (an expression-index arbiter evaluates its keys).
+  private arbiterProbeKey(
+    arb: Arbiter,
+    table: Table,
+    pk: number[],
+    colls: (Collation | null)[],
+    rindexes: ResolvedIndex[],
+    row: Row,
+  ): Uint8Array | null {
+    return arbiterKey(arb, table, pk, colls, rindexes, row, this.maintenanceEnv(new StmtRng()));
   }
 
   // resolveDefaultExprs resolves each column's EXPRESSION default (constraints.md §2) to an
@@ -4332,8 +4439,57 @@ export class Engine {
     else if (method === "gin") kind = "gin";
     else if (method === "gist") kind = "gist";
     else throw engineError("undefined_object", "access method does not exist: " + ci.using);
-    const cols: number[] = [];
-    for (const name of ci.columns) {
+    const ciKeys: IndexKey[] = [];
+    for (const elem of ci.keys) {
+      // An EXPRESSION key element (spec/design/indexes.md §1/§2): resolve it against the table's
+      // columns, validate it is immutable + indexable-typed, and store its canonical text (persisted,
+      // format_version 26). Expression keys are B-tree only this slice — GIN/GiST take a single plain
+      // column.
+      if (elem.kind === "expr") {
+        if (kind !== "btree") {
+          throw engineError(
+            "feature_not_supported",
+            `an expression key on a ${ci.using ?? ""} index is not supported yet`,
+          );
+        }
+        // A subquery is not a deterministic function of the row — 0A000 (the resolver admits an
+        // uncorrelated one, so it is rejected here, before resolution).
+        if (indexExprHasSubquery(elem.expr)) {
+          throw engineError("feature_not_supported", "cannot use subquery in index expression");
+        }
+        // Resolve against the table (an aggregate 42803 / window 42P20 / bind parameter 42P02 fall
+        // out of the resolver, as for a CHECK).
+        const scope = Scope.single(this, table);
+        const { type: rtype } = resolve(
+          scope,
+          elem.expr,
+          null,
+          { collecting: false, groupKeys: [], specs: [] },
+          new ParamTypes(),
+        );
+        // Immutability (§2): a non-immutable seam/sequence/current_setting call, or a
+        // session-timezone-dependent expression (one that reads or produces a timestamptz —
+        // conservatively fail-closed), is 42P17.
+        const refs = checkReferencedColumns(elem.expr, columns);
+        const tzHazard =
+          rtype.kind === "timestamptz" || refs.some((i) => typeIsTimestamptz(columns[i]!.type));
+        if (indexExprNonimmutableCall(elem.expr) || tzHazard) {
+          throw engineError(
+            "invalid_object_definition",
+            "functions in index expression must be marked IMMUTABLE",
+          );
+        }
+        // The result type must be key-encodable (a composite result is 0A000).
+        if (resolvedToKeyType(rtype) === null) {
+          throw engineError(
+            "feature_not_supported",
+            "an index on an expression of this result type is not supported yet",
+          );
+        }
+        ciKeys.push({ kind: "expr", exprText: elem.text, expr: elem.expr });
+        continue;
+      }
+      const name = elem.name;
       const idx = columnIndex(table, name);
       if (idx < 0) {
         throw engineError("undefined_column", "column does not exist: " + name);
@@ -4404,7 +4560,7 @@ export class Engine {
         );
       }
       // A duplicate column in the list is ALLOWED (PostgreSQL allows it — indexes.md §1).
-      cols.push(idx);
+      ciKeys.push({ kind: "column", column: idx });
     }
     // GIN narrowings this slice (spec/design/gin.md §3): no uniqueness (undefined for an inverted
     // index) and a single column only — both deferred 0A000.
@@ -4415,7 +4571,7 @@ export class Engine {
           "access method gin does not support unique indexes",
         );
       }
-      if (cols.length !== 1) {
+      if (ciKeys.length !== 1) {
         throw engineError("feature_not_supported", "a multi-column gin index is not supported yet");
       }
     }
@@ -4429,7 +4585,7 @@ export class Engine {
           "access method gist does not support unique indexes",
         );
       }
-      if (cols.length !== 1) {
+      if (ciKeys.length !== 1) {
         throw engineError(
           "feature_not_supported",
           "a multi-column gist index is not supported yet",
@@ -4468,23 +4624,34 @@ export class Engine {
       }
       name = ci.name;
     } else {
-      // PG's ChooseIndexName (probed): lowercased table + every listed column name
-      // (list order, duplicates included) + "idx", then the smallest free suffix.
+      // PG's ChooseIndexName / ChooseIndexColumnNames (probed): lowercased table + one name part per
+      // key element (list order, duplicates included) + "idx", then the smallest free suffix. A
+      // column key's part is the column name; a bare-function-call expression's is the function name
+      // (`lower(email)` → `lower`); any other expression's is the literal `expr` (indexes.md §2).
       let base = tableKey;
-      for (const cn of ci.columns) base += "_" + cn.toLowerCase();
+      for (const elem of ci.keys) base += "_" + indexNamePart(elem);
       base += "_idx";
       name = base;
       for (let suffix = 1; relationTaken(name); suffix++) name = base + suffix.toString();
     }
 
-    // The build scan (cost.md §3): page_read per table-tree node + storage_row_read per
-    // row, with the indexed columns as the touched set (fixed-width — the chain/decompress
-    // terms are structurally zero). An empty table charges 0. The entries are computed
-    // here, against the pre-index store; the writes below are unmetered.
+    // The build scan (cost.md §3): page_read per table-tree node + storage_row_read per row. The
+    // touched set is the columns the key elements read — an index column for a column key, or every
+    // column an expression key references (which may be variable-width, so a spilled value adds its
+    // value_decompress slabs — indexes.md §5). An empty table charges 0. Entries are computed here
+    // against the pre-index store; the writes below are unmetered. An expression key evaluating with
+    // an error aborts the build (nothing is registered — indexes.md §4), preserving all-or-nothing.
     const meter = this.session.newMeter();
     const mask = columns.map(() => false);
-    for (const c of cols) mask[c] = true;
-    const def: IndexDef = { name, columns: cols, unique: ci.unique, kind };
+    for (const k of ciKeys) {
+      if (k.kind === "column") mask[k.column] = true;
+      else for (const c of checkReferencedColumns(k.expr, columns)) mask[c] = true;
+    }
+    const def: IndexDef = { name, keys: ciKeys, unique: ci.unique, kind };
+    // Resolve the index once (column ordinals + resolved expression keys); an env for any expression
+    // key (a fresh statement rng — index expressions are immutable, so it is never read).
+    const rindex = this.resolveIndex(table, def);
+    const env = this.maintenanceEnv(new StmtRng());
     const store = this.lkpStoreScoped(ci.db, ci.table);
     const { entries: stored, pages: nodes, slabs } = store.scanWithUnits(mask);
     meter.charge(COSTS.pageRead * BigInt(nodes) + COSTS.valueDecompress * BigInt(slabs));
@@ -4496,11 +4663,11 @@ export class Engine {
     for (const e of stored) {
       meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
       meter.charge(COSTS.storageRowRead);
-      // The build reads the indexed key columns directly; resolve a faulted row's inline-deferred
-      // values (lazy-record.md §5b — always inline for a key column, so cost-free) before encoding.
+      // Resolve a faulted row's touched columns before encoding (an expression key may read a spilled
+      // value; the evaluator's Unfetched backstop also handles it).
       const row = store.resolveInlineColumns(e.row);
       if (def.unique) {
-        const prefix = indexPrefixKey(columns, colls, def, row);
+        const prefix = indexPrefixKey(columns, colls, rindex, row, env);
         if (prefix !== null) {
           const k = prefix.join(",");
           if (seenPrefixes.has(k)) {
@@ -4512,7 +4679,7 @@ export class Engine {
           seenPrefixes.add(k);
         }
       }
-      entries.push(...indexEntryKeys(columns, colls, def, e.key, row));
+      entries.push(...indexEntryKeys(columns, colls, rindex, e.key, row, env));
     }
     meter.guard();
 
@@ -5511,10 +5678,23 @@ export class Engine {
     const readStore = this.lkpStoreScoped(dbScope, table.name);
     const prepared: { key: Uint8Array | null; row: Row }[] = [];
     const seenKeys = new Set<string>();
+    // Resolve the table's indexes once for this statement (column ordinals + resolved expression keys
+    // — spec/design/indexes.md §4), parallel to table.indexes. An expression key is evaluated per row
+    // (unmetered) to build its entry; done in phase 1 (below) so a failing expression aborts before any
+    // write (all-or-nothing).
+    const rindexes = this.resolveTableIndexes(table);
+    // The eval env for phase-1 index-expression evaluation (unmetered; params/CTEs empty — an index
+    // expression cannot reference them). Reuses the statement rng (an immutable index expr never reads it).
+    const env = this.maintenanceEnv(rng);
     // Per UNIQUE index (catalog/name order), the prefixes earlier rows of this batch
     // claimed — an in-batch duplicate traps 23505 like a stored one (indexes.md §8).
-    const uniqDefs = table.indexes.filter((d) => d.unique);
+    const uniqDefs = rindexes.filter((d) => d.unique);
     const seenPrefixes = uniqDefs.map(() => new Set<string>());
+    // Per prepared row, the secondary-index entry keys WITHOUT the storage-key suffix — one sub-array
+    // per index (rindexes order), computed in phase 1 (so expression eval errors abort before any
+    // write). Phase 2 appends the row's final storage key (the rowid, allocated there) to each —
+    // entry = prefix ‖ key is byte-identical to building it with the key directly (indexes.md §3/§4).
+    const entryPrefixes: Uint8Array[][][] = [];
     let cunits = 0n;
     for (const values of rows) {
       const row: Row = new Array(n);
@@ -5580,7 +5760,7 @@ export class Engine {
       // PK duplicate check (cost.md §3).
       for (let u = 0; u < uniqDefs.length; u++) {
         const def = uniqDefs[u]!;
-        const prefix = indexPrefixKey(table.columns, colls, def, row);
+        const prefix = indexPrefixKey(table.columns, colls, def, row, env);
         if (prefix === null) continue;
         const istore = this.lkpIndexStoreScoped(dbScope, def.name.toLowerCase());
         const stored = istore.rangeEntries(uniqueProbeBound(prefix));
@@ -5597,6 +5777,14 @@ export class Engine {
       // For a no-PK table the synthetic rowid is allocated in phase 2; only the key LENGTH
       // feeds the plan, so an 8-byte placeholder stands in deterministically.
       cunits += BigInt(store.writeCompressUnits(key ?? new Uint8Array(8), row));
+      // Compute this row's per-index entry keys WITHOUT the suffix (phase 1 — evaluates every
+      // expression key, so an eval error aborts here before any write; unmetered). Phase 2 appends the
+      // final storage key.
+      entryPrefixes.push(
+        rindexes.map((rindex) =>
+          indexEntryKeys(table.columns, colls, rindex, new Uint8Array(0), row, env),
+        ),
+      );
       prepared.push({ key, row });
     }
 
@@ -5699,12 +5887,15 @@ export class Engine {
     // the rows (indexes.md §4 — an index write cannot fail, so all-or-nothing is
     // unchanged).
     const indexInserts: Uint8Array[][] = table.indexes.map(() => []);
-    for (const pr of prepared) {
+    for (let ri = 0; ri < prepared.length; ri++) {
+      const pr = prepared[ri]!;
       const key = pr.key ?? encodeInt("i64", store.allocRowid());
+      // Append the final storage key to each phase-1 entry prefix (byte-identical to building the
+      // entry with the key directly — indexes.md §3/§4).
       for (let k = 0; k < table.indexes.length; k++) {
-        indexInserts[k]!.push(
-          ...indexEntryKeys(table.columns, colls, table.indexes[k]!, key, pr.row),
-        );
+        for (const p of entryPrefixes[ri]![k]!) {
+          indexInserts[k]!.push(concatBytes([p, key]));
+        }
       }
       if (!store.insert(key, pr.row)) {
         // A collision here can only happen under the writable-CTE read pin (writable-cte.md §7): an
@@ -5848,15 +6039,16 @@ export class Engine {
     table: Table,
     pk: number[],
     colls: (Collation | null)[],
+    rindexes: ResolvedIndex[],
     row: Row,
   ): boolean {
     if (pk.length > 0 && store.get(encodePkKey(table, pk, colls, row)) !== undefined) return true;
-    for (const def of table.indexes) {
-      if (!def.unique) continue;
-      const prefix = indexPrefixKey(table.columns, colls, def, row);
+    for (const rindex of rindexes) {
+      if (!rindex.unique) continue;
+      const prefix = this.indexPrefix(table.columns, colls, rindex, row);
       if (prefix === null) continue;
       if (
-        this.readSnap().indexStore(def.name.toLowerCase()).rangeEntries(uniqueProbeBound(prefix))
+        this.readSnap().indexStore(rindex.name.toLowerCase()).rangeEntries(uniqueProbeBound(prefix))
           .length > 0
       ) {
         return true;
@@ -5971,6 +6163,10 @@ export class Engine {
     // Per-column frozen collations for the collated text key form (§2.12); null everywhere for a
     // C-only / non-text table (the fast path).
     const colls = this.columnCollations(table.columns);
+    // Resolve the table's indexes once (column ordinals + resolved expression keys — indexes.md §4),
+    // parallel to table.indexes; every uniqueness probe / arbiter / entry build below evaluates any
+    // expression key through it (unmetered, via the index-maintenance helpers).
+    const rindexes = this.resolveTableIndexes(table);
     // The unique-index positions in table.indexes (no-target skip test + end-state pass).
     const uniqIdx: number[] = [];
     for (let i = 0; i < table.indexes.length; i++) if (table.indexes[i]!.unique) uniqIdx.push(i);
@@ -6021,11 +6217,11 @@ export class Engine {
         // No-target DO NOTHING: skip on ANY uniqueness conflict (committed OR an earlier planned
         // insert); else insert (upsert.md §2/§3).
         const pkk = pk.length > 0 ? encodePkKey(table, pk, colls, row) : null;
-        let conflictHit = this.rowConflictsCommitted(store, table, pk, colls, row);
+        let conflictHit = this.rowConflictsCommitted(store, table, pk, colls, rindexes, row);
         if (!conflictHit && pkk !== null && insPk.has(pkk.join(","))) conflictHit = true;
         if (!conflictHit) {
           for (let u = 0; u < uniqIdx.length; u++) {
-            const prefix = indexPrefixKey(table.columns, colls, table.indexes[uniqIdx[u]!]!, row);
+            const prefix = this.indexPrefix(table.columns, colls, rindexes[uniqIdx[u]!]!, row);
             if (prefix !== null && insPrefixes[u]!.has(prefix.join(","))) {
               conflictHit = true;
               break;
@@ -6035,7 +6231,7 @@ export class Engine {
         if (conflictHit) continue; // skip
         if (pkk !== null) insPk.add(pkk.join(","));
         for (let u = 0; u < uniqIdx.length; u++) {
-          const prefix = indexPrefixKey(table.columns, colls, table.indexes[uniqIdx[u]!]!, row);
+          const prefix = this.indexPrefix(table.columns, colls, rindexes[uniqIdx[u]!]!, row);
           if (prefix !== null) insPrefixes[u]!.add(prefix.join(","));
         }
         inserts.push(row);
@@ -6043,7 +6239,7 @@ export class Engine {
       }
 
       // Arbiter present (DO UPDATE always; DO NOTHING with a target).
-      const ak = arbiterKey(plan.arb, table, pk, colls, row);
+      const ak = this.arbiterProbeKey(plan.arb, table, pk, colls, rindexes, row);
       if (ak === null) {
         // A NULL-bearing arbiter key never conflicts (NULLS DISTINCT) — plain insert.
         inserts.push(row);
@@ -6119,7 +6315,7 @@ export class Engine {
         const istore = this.lkpIndexStore(def.name.toLowerCase());
         const batch = new Set<string>();
         for (const newRow of newRows) {
-          const prefix = indexPrefixKey(table.columns, colls, def, newRow);
+          const prefix = this.indexPrefix(table.columns, colls, rindexes[ix]!, newRow);
           if (prefix === null) continue;
           const k = prefix.join(",");
           const conflict =
@@ -6242,30 +6438,39 @@ export class Engine {
 
     const affected = inserts.length + updates.length;
 
-    // Phase 2 — every row validated. Insert the new rows (rowid alloc for a no-PK table, index
-    // entries added), then replace the updated rows (index entries moved).
-    const indexAdds: Uint8Array[][] = table.indexes.map(() => []);
-    for (const row of inserts) {
-      const key =
-        pk.length > 0 ? encodePkKey(table, pk, colls, row) : encodeInt("i64", store.allocRowid());
-      for (let k = 0; k < table.indexes.length; k++) {
-        indexAdds[k]!.push(...indexEntryKeys(table.columns, colls, table.indexes[k]!, key, row));
-      }
-      if (!store.insert(key, row)) throw new Error("pre-validated INSERT key must be unique");
-    }
+    // Precompute all secondary-index entries in a pass BEFORE any write (evaluating every expression
+    // key — an error aborts before any write): each inserted row's entry PREFIXES (empty suffix; phase
+    // 2 appends its storage key — the rowid is allocated there) and each updated row's old/new entry
+    // sets (keys already known).
+    const insertPrefixes: Uint8Array[][][] = inserts.map((row) =>
+      rindexes.map((rindex) =>
+        this.indexEntries(table.columns, colls, rindex, new Uint8Array(0), row),
+      ),
+    );
     const indexMoves: { removals: Uint8Array[]; insertions: Uint8Array[] }[][] = table.indexes.map(
       () => [],
     );
     for (const u of updates) {
       for (let k = 0; k < table.indexes.length; k++) {
-        const def = table.indexes[k]!;
-        const oldEks = indexEntryKeys(table.columns, colls, def, u.key, u.oldRow);
-        const newEks = indexEntryKeys(table.columns, colls, def, u.key, u.newRow);
+        const oldEks = this.indexEntries(table.columns, colls, rindexes[k]!, u.key, u.oldRow);
+        const newEks = this.indexEntries(table.columns, colls, rindexes[k]!, u.key, u.newRow);
         const removals = bytesDiff(oldEks, newEks);
         const insertions = bytesDiff(newEks, oldEks);
         if (removals.length > 0 || insertions.length > 0)
           indexMoves[k]!.push({ removals, insertions });
       }
+    }
+    // Phase 2 — every row validated. Insert the new rows (rowid alloc for a no-PK table; append each
+    // row's storage key to its precomputed entry prefixes), then replace the updated rows (entries moved).
+    const indexAdds: Uint8Array[][] = table.indexes.map(() => []);
+    for (let ri = 0; ri < inserts.length; ri++) {
+      const row = inserts[ri]!;
+      const key =
+        pk.length > 0 ? encodePkKey(table, pk, colls, row) : encodeInt("i64", store.allocRowid());
+      for (let k = 0; k < table.indexes.length; k++) {
+        for (const p of insertPrefixes[ri]![k]!) indexAdds[k]!.push(concatBytes([p, key]));
+      }
+      if (!store.insert(key, row)) throw new Error("pre-validated INSERT key must be unique");
     }
     for (const u of updates) store.replace(u.key, u.newRow);
     for (let k = 0; k < table.indexes.length; k++) {
@@ -6546,15 +6751,24 @@ export class Engine {
             meter,
           )
         : null;
+    // Precompute the entries to remove for each index in a pass (evaluating any expression key
+    // against the stored row) BEFORE the removals below. Resolve the table's indexes once;
+    // toRemove[kx] is index kx's entries (rindexes order = indexes order).
+    const rindexes = this.resolveTableIndexes(table);
+    const toRemove: Uint8Array[][] = rindexes.map((rindex) => {
+      const acc: Uint8Array[] = [];
+      for (const m of matched)
+        acc.push(...this.indexEntries(table.columns, colls, rindex, m.key, m.row));
+      return acc;
+    });
     // Phase 2: remove the rows, then their secondary-index entries (indexes.md §4 —
     // unmetered write work; an index removal cannot fail).
     const writeStore = this.writeStoreScoped(del.db, del.table);
     for (const m of matched) writeStore.remove(m.key);
-    for (const def of table.indexes) {
+    for (let kx = 0; kx < table.indexes.length; kx++) {
+      const def = table.indexes[kx]!;
       const istore = this.writeIndexStoreScoped(del.db, def.name.toLowerCase());
-      for (const m of matched) {
-        for (const ek of indexEntryKeys(table.columns, colls, def, m.key, m.row)) istore.remove(ek);
-      }
+      for (const ek of toRemove[kx]!) istore.remove(ek);
     }
     return dmlOutcome(
       ret?.names ?? null,
@@ -6590,6 +6804,10 @@ export class Engine {
     // Per-column frozen collations for the collated text key form (§2.12) — indexes both the FK
     // probe and the index-entry move path.
     const colls = this.columnCollations(table.columns);
+    // Resolve the table's indexes once (column ordinals + resolved expression keys — indexes.md §4),
+    // parallel to table.indexes; the unique end-state validation and the entry-move computation below
+    // evaluate any expression key through it (unmetered).
+    const rindexes = this.resolveTableIndexes(table);
 
     // UPDATE is single-table; the RHS / WHERE resolve against a one-relation scope so the
     // shared resolver serves it too (a qualified `WHERE t.a` against the sole table is fine).
@@ -6865,12 +7083,12 @@ export class Engine {
     // cannot conflict). Unmetered validation, phase 1.
     if (updates.length > 0 && table.indexes.some((d) => d.unique)) {
       const rewritten = new Set<string>(updates.map((u) => u.key.join(",")));
-      for (const def of table.indexes) {
-        if (!def.unique) continue;
-        const istore = this.lkpIndexStoreScoped(upd.db, def.name.toLowerCase());
+      for (const rindex of rindexes) {
+        if (!rindex.unique) continue;
+        const istore = this.lkpIndexStoreScoped(upd.db, rindex.name.toLowerCase());
         const batch = new Set<string>();
         for (const u of updates) {
-          const prefix = indexPrefixKey(table.columns, colls, def, u.row);
+          const prefix = this.indexPrefix(table.columns, colls, rindex, u.row);
           if (prefix === null) continue;
           const k = prefix.join(",");
           const conflict =
@@ -6881,7 +7099,7 @@ export class Engine {
           if (conflict) {
             throw engineError(
               "unique_violation",
-              "duplicate key value violates unique constraint: " + def.name,
+              "duplicate key value violates unique constraint: " + rindex.name,
             );
           }
           batch.add(k);
@@ -7059,12 +7277,12 @@ export class Engine {
     );
     for (const u of updates) {
       for (let k = 0; k < table.indexes.length; k++) {
-        const def = table.indexes[k]!;
         // The row's old and new entry SETS (one entry for an ordered index, one per term for GIN —
         // gin.md §5). Remove old−new, insert new−old: a shared entry is left untouched, keeping the
-        // copy-on-write dirty set byte-identical across cores.
-        const oldEks = indexEntryKeys(table.columns, colls, def, u.key, u.oldRow);
-        const newEks = indexEntryKeys(table.columns, colls, def, u.newKey, u.row);
+        // copy-on-write dirty set byte-identical across cores. Computed (evaluating any expression
+        // key) before the phase-2 writes.
+        const oldEks = this.indexEntries(table.columns, colls, rindexes[k]!, u.key, u.oldRow);
+        const newEks = this.indexEntries(table.columns, colls, rindexes[k]!, u.newKey, u.row);
         const removals = bytesDiff(oldEks, newEks);
         const insertions = bytesDiff(newEks, oldEks);
         if (removals.length > 0 || insertions.length > 0) {
@@ -8706,7 +8924,7 @@ export class Engine {
       rel.cte !== undefined ||
       derivedPlans[i] !== undefined
         ? null
-        : detectScanBound(filter, rel, this.readSnap()),
+        : detectScanBound(filter, rel, this.readSnap(), this),
     );
     // Index-nested-loop pushdown (cost.md §3 "JOIN"): a join inner relation whose primary key / indexed
     // column is compared to a SIBLING column of an earlier relation (`a JOIN b ON b.pk = a.x`) is
@@ -9573,7 +9791,7 @@ export class Engine {
         out.push([
           textValue(idx.name),
           textValue(t.name),
-          arrayValue(idx.columns.map((ord) => textValue(t.columns[ord]!.name))),
+          arrayValue(idx.keys.map((k) => textValue(indexKeyLabel(k, t)))),
           boolValue(idx.unique),
           textValue(idx.kind),
         ]);
@@ -9621,7 +9839,7 @@ export class Engine {
           textValue(idx.name),
           textValue(t.name),
           textValue("unique"),
-          textArr(idx.columns.map((ord) => t.columns[ord]!.name)),
+          textArr(idx.keys.map((k) => indexKeyLabel(k, t))),
           nullValue(),
           nullValue(),
           nullValue(),
@@ -11988,20 +12206,48 @@ export function buildIndexAccessPredicate(
   idx: IndexDef,
   siblingCutoff: number,
   snap: Snapshot,
+  engine: Engine,
 ): IndexBound | null {
   if (idx.kind !== "btree") return null;
+  // Resolve the index's key elements (column ordinals + resolved expression keys). A resolution
+  // failure yields no bound (a full scan — always sound). indexes.md §5.
+  let rindex: ResolvedIndex;
+  try {
+    rindex = engine.resolveIndex(rel.table, idx);
+  } catch {
+    return null;
+  }
   const eqCols: IndexEqCol[] = [];
   let range: IndexRange | null = null;
-  for (const ci of idx.columns) {
-    // A non-scalar (range/array/composite) column cannot be seeked here — stop the prefix.
-    const ty = typeAsScalar(rel.table.columns[ci]!.type);
-    if (ty === undefined) break;
-    // The column's key collation form (collation.md §8/§12): a Skewed collated column refuses the
-    // bound (its stored keys are wrong for the loaded bundle) — stop the prefix here (the column then
-    // falls into the fixed-width suffix check below and rejects the whole index if it is text).
-    const ctx = keyCollationCtx(snap, rel.table.columns[ci]!);
-    if (ctx === null) break;
-    const colColl = ctx.coll !== null ? ctx.coll.name : null;
+  for (const key of rindex.keys) {
+    // Each key element yields (its scalar key type, its key collation, the matcher against a WHERE
+    // conjunct operand). A non-scalar / skewed element stops the prefix.
+    let ty: ScalarType;
+    let coll: Collation | null;
+    let matcher: KeyMatch;
+    if (key.kind === "column") {
+      const ci = key.column;
+      const s = typeAsScalar(rel.table.columns[ci]!.type);
+      if (s === undefined) break; // a range/array/composite column cannot be seeked
+      // Collation.md §8/§12: a Skewed collated column refuses the bound (its stored keys are wrong
+      // for the loaded bundle) — stop the prefix. C/Full admissible.
+      const ctx = keyCollationCtx(snap, rel.table.columns[ci]!);
+      if (ctx === null) break;
+      ty = s;
+      coll = ctx.coll;
+      matcher = { kind: "column", index: rel.offset + ci };
+    } else {
+      // An expression key seeks only when its result is a scalar and its collation is C (the common
+      // `lower(email)` shape). A collated-expression bound is a deferred follow-on (§5). Match a
+      // WHERE operand structurally against the key.
+      const s = typeAsScalar(key.type);
+      if (s === undefined) break;
+      if (key.coll !== null) break;
+      ty = s;
+      coll = null;
+      matcher = { kind: "expr", expr: key.expr, offset: rel.offset };
+    }
+    const colColl = coll !== null ? coll.name : null;
     const eqs: RExpr[] = [];
     const ranges: BoundTerm[] = [];
     const walk = (e: RExpr): void => {
@@ -12010,7 +12256,7 @@ export function buildIndexAccessPredicate(
         walk(e.rhs);
         return;
       }
-      const t = asBoundTerm(e, rel.offset + ci, ty, colColl, siblingCutoff);
+      const t = asBoundTerm(e, matcher, ty, colColl, siblingCutoff);
       if (t !== null) {
         if (t.op === "eq") eqs.push(t.src);
         else ranges.push(t);
@@ -12018,19 +12264,23 @@ export function buildIndexAccessPredicate(
     };
     walk(filter);
     if (eqs.length > 0) {
-      eqCols.push({ colType: ty, coll: ctx.coll, srcs: eqs });
+      eqCols.push({ colType: ty, coll, srcs: eqs });
       continue; // extend the equality prefix
     }
     if (ranges.length > 0) range = { colType: ty, terms: ranges };
-    break; // first non-equality column ends the prefix (with or without a trailing range)
+    break; // first non-equality element ends the prefix (with or without a trailing range)
   }
   if (eqCols.length === 0 && range === null) return null; // nothing bound
-  // Eligibility: every index column from the range column onward (columns[eqCols.length..]) is
-  // width-skipped past the known equality prefix, so each must be a fixed-width scalar. The
-  // equality-prefix columns may be any width — their slots are matched as the known prefix bytes.
+  // Eligibility: every key element from the range element onward (keys[eqCols.length..]) is
+  // width-skipped past the known equality prefix to recover the storage key, so each must be a
+  // fixed-width scalar (a column's type, or an expression's result type). The equality-prefix
+  // elements may be any width — their slots are matched as the known prefix bytes.
   const suffixTypes: ScalarType[] = [];
-  for (const c of idx.columns.slice(eqCols.length)) {
-    const s = typeAsScalar(rel.table.columns[c]!.type);
+  for (const key of rindex.keys.slice(eqCols.length)) {
+    const s =
+      key.kind === "column"
+        ? typeAsScalar(rel.table.columns[key.column]!.type)
+        : typeAsScalar(key.type);
     if (s === undefined || !isFixedWidth(s)) return null;
     suffixTypes.push(s);
   }
@@ -12041,7 +12291,12 @@ export function buildIndexAccessPredicate(
 // single-column PK bound first; else, among the relation's indexes (held in ascending
 // lowercased-name order — the deterministic tie-break), the first that yields a non-empty
 // access predicate (buildIndexAccessPredicate); else null (full scan).
-export function detectScanBound(filter: RExpr, rel: ScopeRel, snap: Snapshot): ScanBound | null {
+export function detectScanBound(
+  filter: RExpr,
+  rel: ScopeRel,
+  snap: Snapshot,
+  engine: Engine,
+): ScanBound | null {
   // A host-attached relation full-scans this slice (attached-databases.md §8): the bounded-scan exec
   // path resolves index stores unscoped, so no PK/index/GiST/GIN bound may apply to an attachment.
   if (isAttachmentScope(rel.db)) return null;
@@ -12066,7 +12321,7 @@ export function detectScanBound(filter: RExpr, rel: ScopeRel, snap: Snapshot): S
     // over a B-tree index's leading key columns. null for a GIN/GiST index (handled by the passes
     // below), an ineligible suffix, or no bound. Indexes are held in ascending lowercased-name order,
     // so the first non-null wins — the deterministic tie-break.
-    const ib = buildIndexAccessPredicate(filter, rel, idx, -1, snap);
+    const ib = buildIndexAccessPredicate(filter, rel, idx, -1, snap, engine);
     if (ib !== null) return { kind: "index", index: ib };
   }
   // GiST bound (gist.md §5) — a `col && const` / `col @> const` over a range column; the ordered loop
@@ -12092,11 +12347,15 @@ export function detectScanBound(filter: RExpr, rel: ScopeRel, snap: Snapshot): S
   }
   for (const idx of rel.table.indexes) {
     if (idx.kind !== "btree") continue;
-    const ci = idx.columns[0]!;
+    // The OR/IN merged-point-lookup bound is column-only this slice (an expression index takes the
+    // access-predicate path — indexes.md §5; OR/IN over an expression key is a follow-on).
+    const cols = indexColumnOrdinals(idx);
+    if (cols === null) continue;
+    const ci = cols[0]!;
     const ty = typeAsScalar(rel.table.columns[ci]!.type);
     if (ty === undefined) continue;
     if (
-      idx.columns.slice(1).some((c) => {
+      cols.slice(1).some((c) => {
         const ts = typeAsScalar(rel.table.columns[c]!.type);
         return ts === undefined || !isFixedWidth(ts);
       })
@@ -12107,7 +12366,7 @@ export function detectScanBound(filter: RExpr, rel: ScopeRel, snap: Snapshot): S
     if (ctx === null) continue;
     const srcs = detectKeySet(filter, rel.offset + ci, ty, ctx.coll);
     if (srcs !== null) {
-      const tailTypes = idx.columns.slice(1).map((c) => typeScalar(rel.table.columns[c]!.type));
+      const tailTypes = cols.slice(1).map((c) => typeScalar(rel.table.columns[c]!.type));
       return {
         kind: "indexSet",
         indexSet: { nameKey: idx.name.toLowerCase(), colType: ty, coll: ctx.coll, tailTypes, srcs },
@@ -12166,7 +12425,7 @@ export function reduceKeySet(
     if (r === null) return null;
     return l.concat(r);
   }
-  const t = asBoundTerm(e, keyIdx, keyType, colColl, -1);
+  const t = asBoundTerm(e, { kind: "column", index: keyIdx }, keyType, colColl, -1);
   if (t !== null && t.op === "eq") return [t.src];
   return null;
 }
@@ -12204,7 +12463,7 @@ export function detectINLBound(
         walk(e.rhs);
         return;
       }
-      const t = asBoundTerm(e, keyIdx, ty, colColl, cutoff);
+      const t = asBoundTerm(e, { kind: "column", index: keyIdx }, ty, colColl, cutoff);
       if (t !== null) terms.push(t);
     };
     walk(on);
@@ -12228,11 +12487,15 @@ export function detectINLBound(
   // order — the deterministic tie-break, matching detectScanBound).
   for (const idx of rel.table.indexes) {
     if (idx.kind !== "btree") continue;
-    const ci = idx.columns[0]!;
+    // The index-nested-loop sibling bound is column-only this slice (an expression index takes the
+    // access-predicate path — indexes.md §5; an INL bound over an expression key is a follow-on).
+    const cols = indexColumnOrdinals(idx);
+    if (cols === null) continue;
+    const ci = cols[0]!;
     const ty = typeAsScalar(rel.table.columns[ci]!.type);
     if (ty === undefined) continue;
     if (
-      idx.columns.slice(1).some((c) => {
+      cols.slice(1).some((c) => {
         const ts = typeAsScalar(rel.table.columns[c]!.type);
         return ts === undefined || !isFixedWidth(ts);
       })
@@ -12255,7 +12518,7 @@ export function detectINLBound(
       // bound to a sibling); a multi-column / range INL bound is a follow-on (cost.md §3
       // "index-nested-loop"). suffixTypes are the trailing columns (columns[1..], fixed-width by the
       // check above), width-skipped past the single equality slot.
-      const suffixTypes = idx.columns.slice(1).map((c) => typeScalar(rel.table.columns[c]!.type));
+      const suffixTypes = cols.slice(1).map((c) => typeScalar(rel.table.columns[c]!.type));
       return {
         kind: "index",
         index: {
@@ -12373,7 +12636,11 @@ export function orderSatisfiedByIndex(
   if (pkWidth === null) return null;
   for (const idx of table.indexes) {
     if (idx.kind !== "btree") continue; // only an ordered B-tree realizes the column order
-    if (order.length !== idx.columns.length) continue; // ORDER BY must be EXACTLY the index columns
+    // ORDER-BY skip-sort is column-only this slice (matching ORDER BY against an expression index key
+    // is a follow-on — indexes.md §5).
+    const cols = indexColumnOrdinals(idx);
+    if (cols === null) continue;
+    if (order.length !== cols.length) continue; // ORDER BY must be EXACTLY the index columns
     let matches = true;
     for (let i = 0; i < order.length; i++) {
       const o = order[i]!;
@@ -12381,11 +12648,11 @@ export function orderSatisfiedByIndex(
         matches = false; // ASC + NULLS LAST only — the order a forward index walk realizes
         break;
       }
-      if (o.idx !== offset + idx.columns[i]!) {
+      if (o.idx !== offset + cols[i]!) {
         matches = false;
         break;
       }
-      const ctx = keyCollationCtx(snap, table.columns[idx.columns[i]!]!);
+      const ctx = keyCollationCtx(snap, table.columns[cols[i]!]!);
       if (ctx === null) {
         matches = false; // Skewed / unresolvable — never walked for order (§12)
         break;
@@ -12419,7 +12686,7 @@ export function detectGinBound(
   if (filter === null) return null;
   for (const idx of indexes) {
     if (idx.kind !== "gin") continue;
-    const ci = idx.columns[0]!;
+    const ci = indexFirstColumn(idx);
     const colGlobal = offset + ci;
     const colType = columns[ci]!.type;
     if (colType.kind !== "array") continue; // a GIN column is always an array (the gate); defensive
@@ -12506,8 +12773,8 @@ export function detectGistBound(
     // The planner gather is single-operator: only a single-column GiST index accelerates a
     // `col && Q` / `col @> Q` / `col = Q` conjunct. A multi-column GiST index (an EXCLUDE backing
     // structure, gist.md §7) is probed only by the constraint, never the planner.
-    if (idx.columns.length !== 1) continue;
-    const ci = idx.columns[0]!;
+    if (idx.keys.length !== 1) continue;
+    const ci = indexFirstColumn(idx);
     const colGlobal = offset + ci;
     const colType = columns[ci]!.type;
     if (colType.kind === "range") {
@@ -12675,82 +12942,166 @@ export function rexprIsConstant(e: RExpr): boolean {
   }
 }
 
-// indexEntryKey builds a secondary-index entry key (spec/design/indexes.md §3): each
-// indexed column as the encoding.md §2.2 nullable slot — 0x00 + the type's bare
-// order-preserving key bytes when present, the lone 0x01 for NULL (always tagged, even
-// for a NOT NULL column) — then the row's storage key as the suffix. Indexable types are
-// fixed-width and never spill, so the values are always resident (never unfetched).
+// ResolvedKey is one key element of an index resolved for a statement's maintenance
+// (spec/design/indexes.md §4): a plain column (by ordinal — encoded from columns[ord].type +
+// colls[ord]), or a resolved expression carrying its RExpr, its encoding Type (the result type
+// from resolvedToKeyType), and its collation (evaluated against each row, unmetered, to yield the
+// key value). Built once per statement by Engine.resolveIndex from an IndexDef.
+export type ResolvedKey =
+  | { kind: "column"; column: number }
+  | { kind: "expr"; expr: RExpr; type: Type; coll: Collation | null };
+
+// ResolvedIndex is an index resolved for one statement's maintenance: the def's identity
+// (name / unique / kind) plus its per-element ResolvedKeys. Owned (no borrow of the catalog) so the
+// write paths can mutate stores while holding it. GIN/GiST indexes are always plain-column (this
+// slice), so their entry builders read the ordinals back via resolvedIndexColumnOrdinals.
+export type ResolvedIndex = {
+  name: string;
+  unique: boolean;
+  kind: "btree" | "gin" | "gist";
+  keys: ResolvedKey[];
+};
+
+// resolvedIndexColumnOrdinals are the plain-column ordinals of a GIN/GiST index (always all columns,
+// this slice) — throws if a resolved key is an expression (structurally impossible for GIN/GiST).
+export function resolvedIndexColumnOrdinals(rindex: ResolvedIndex): number[] {
+  return rindex.keys.map((k) => {
+    if (k.kind !== "column") throw new Error("GIN/GiST index keys are plain columns");
+    return k.column;
+  });
+}
+
+// resolvedToKeyType is the order-preserving key Type an index-expression result encodes under, or
+// null when the result type is not key-encodable (a composite / json / unknown result — 0A000 at
+// CREATE INDEX). Every scalar is keyable (encoding.md §2); a keyable-scalar-element array/range is too.
+export function resolvedToKeyType(rt: ResolvedType): Type | null {
+  switch (rt.kind) {
+    case "int":
+    case "float":
+      return scalarT(rt.ty);
+    case "bool":
+      return scalarT("boolean");
+    case "text":
+      return scalarT("text");
+    case "decimal":
+      return scalarT("decimal");
+    case "bytea":
+      return scalarT("bytea");
+    case "uuid":
+      return scalarT("uuid");
+    case "timestamp":
+      return scalarT("timestamp");
+    case "timestamptz":
+      return scalarT("timestamptz");
+    case "interval":
+      return scalarT("interval");
+    case "date":
+      return scalarT("date");
+    case "array": {
+      const et = resolvedToKeyType(rt.elem);
+      if (et === null || !typeIsKeyableScalar(et)) return null; // a composite-element array is not keyable
+      return { kind: "array", elem: et };
+    }
+    case "range": {
+      const et = resolvedToKeyType(rt.elem);
+      if (et === null) return null;
+      return { kind: "range", elem: et };
+    }
+    default: // null, composite, json, jsonb, jsonpath
+      return null;
+  }
+}
+
+// indexKeySlot returns one key element's (value, encoding type, collation) for a row: the column
+// value (a column key) or the evaluated expression (an expression key — unmetered, env for the
+// immutable eval). Index maintenance is unmetered (cost.md §3), so a throwaway Meter absorbs the
+// eval charge.
+export function indexKeySlot(
+  key: ResolvedKey,
+  columns: Column[],
+  colls: (Collation | null)[],
+  row: Row,
+  env: EvalEnv,
+): { value: Value; type: Type; coll: Collation | null } {
+  if (key.kind === "column") {
+    return { value: row[key.column]!, type: columns[key.column]!.type, coll: colls[key.column]! };
+  }
+  return { value: evalExpr(key.expr, row, env, new Meter()), type: key.type, coll: key.coll };
+}
+
+// indexEntryKey builds a secondary-index entry key (spec/design/indexes.md §3): each key element as
+// the encoding.md §2.2 nullable slot — 0x00 + the type's bare order-preserving key bytes when
+// present, the lone 0x01 for NULL (always tagged, even for a NOT NULL column) — then the row's
+// storage key as the suffix. A column key's value is always resident (never unfetched: an indexable
+// fixed-width type never spills, and a large text/bytea would over-RECORD_MAX the entry, rejected
+// 0A000 at insert). An expression key evaluates against the row (§4); a referenced spilled value
+// faults in through the evaluator's Unfetched backstop.
 export function indexEntryKey(
   columns: Column[],
   colls: (Collation | null)[],
-  def: IndexDef,
+  rindex: ResolvedIndex,
   storageKey: Uint8Array,
   row: Row,
+  env: EvalEnv,
 ): Uint8Array {
   const parts: Uint8Array[] = [];
-  for (const ci of def.columns) {
-    const v = row[ci]!;
-    if (v.kind === "null") {
+  for (const key of rindex.keys) {
+    const { value, type, coll } = indexKeySlot(key, columns, colls, row, env);
+    if (value.kind === "null") {
       parts.push(Uint8Array.of(0x01));
-    } else if (v.kind === "int") {
-      parts.push(Uint8Array.of(0x00), encodeInt(typeScalar(columns[ci]!.type), v.int));
-    } else if (v.kind === "bool") {
-      parts.push(Uint8Array.of(0x00), encodeBool(v.value));
-    } else if (v.kind === "uuid") {
-      parts.push(Uint8Array.of(0x00), v.bytes);
-    } else if (v.kind === "timestamp" || v.kind === "timestamptz") {
-      parts.push(Uint8Array.of(0x00), encodeInt(typeScalar(columns[ci]!.type), v.micros));
-    } else if (v.kind === "date") {
-      parts.push(Uint8Array.of(0x00), encodeInt(typeScalar(columns[ci]!.type), v.days));
-    } else if (v.kind === "text") {
-      // text: C terminated-escape (§2.4) or the collated UCA sort key (§2.12).
-      parts.push(Uint8Array.of(0x00), collatedTextKey(colls[ci]!, v.text));
-    } else if (v.kind === "bytea") {
-      parts.push(Uint8Array.of(0x00), encodeTerminated(v.bytes));
-    } else if (v.kind === "decimal") {
-      parts.push(Uint8Array.of(0x00), v.dec.encodeKey());
-    } else if (v.kind === "interval") {
-      parts.push(Uint8Array.of(0x00), intervalEncodeKey(v.iv));
-    } else if (v.kind === "f64") {
-      // float: the fixed-width float-order-preserving key (encoding.md §2.8).
-      parts.push(Uint8Array.of(0x00), encodeFloat64Key(v.value));
-    } else if (v.kind === "f32") {
-      parts.push(Uint8Array.of(0x00), encodeFloat32Key(v.value));
-    } else if (v.kind === "range") {
-      // the recursive range-bounds container key (encoding.md §2.11)
-      parts.push(Uint8Array.of(0x00), encodeTypedKey(columns[ci]!.type, v, null));
-    } else if (v.kind === "array") {
-      // the recursive array-elements-terminated container key (encoding.md §2.14)
-      parts.push(Uint8Array.of(0x00), encodeTypedKey(columns[ci]!.type, v, null));
     } else {
-      throw new Error("an index column is a key-encodable type (CREATE INDEX gate)");
+      // present tag, then the type's order-preserving key (range-aware §2.11, collated-text-aware §2.12)
+      parts.push(Uint8Array.of(0x00), encodeTypedKey(type, value, coll));
     }
   }
   parts.push(storageKey);
-  const total = parts.reduce((acc, b) => acc + b.length, 0);
-  const out = new Uint8Array(total);
-  let off = 0;
-  for (const b of parts) {
-    out.set(b, off);
-    off += b.length;
-  }
-  return out;
+  return concatBytes(parts);
 }
 
 // indexEntryKeys returns the index entries a row contributes (spec/design/gin.md §4/§5): exactly
 // one for an ordered (B-tree) index — the §3 nullable-slot entry key — or one per DISTINCT non-NULL
 // element for a GIN index. Every write path (build, INSERT, DELETE, UPDATE) treats an index
-// uniformly as "a row maps to a set of entries."
+// uniformly as "a row maps to a set of entries." env evaluates any expression key element (B-tree
+// only — GIN/GiST are plain-column, this slice).
 export function indexEntryKeys(
+  columns: Column[],
+  colls: (Collation | null)[],
+  rindex: ResolvedIndex,
+  storageKey: Uint8Array,
+  row: Row,
+  env: EvalEnv,
+): Uint8Array[] {
+  if (rindex.kind === "gin")
+    return ginEntries(columns, resolvedIndexColumnOrdinals(rindex), storageKey, row);
+  if (rindex.kind === "gist")
+    return gistEntries(columns, resolvedIndexColumnOrdinals(rindex), storageKey, row);
+  return [indexEntryKey(columns, colls, rindex, storageKey, row, env)];
+}
+
+// indexEntryKeysColumns returns the entry keys for a COLUMN-ONLY index, WITHOUT an eval env
+// (spec/design/indexes.md §4) — the collation-realign rebuild path, which runs on a Snapshot with no
+// Engine to evaluate an expression key. An expression index is C-collated (its keys never change on
+// a collation upgrade — indexes.md §1), so it is rebuilt at the Engine level instead; this asserts
+// the index is plain-column.
+export function indexEntryKeysColumns(
   columns: Column[],
   colls: (Collation | null)[],
   def: IndexDef,
   storageKey: Uint8Array,
   row: Row,
 ): Uint8Array[] {
-  if (def.kind === "gin") return ginEntries(columns, def, storageKey, row);
-  if (def.kind === "gist") return gistEntries(columns, def, storageKey, row);
-  return [indexEntryKey(columns, colls, def, storageKey, row)];
+  const cols = indexColumnOrdinals(def);
+  if (cols === null) throw new Error("indexEntryKeysColumns called on an expression index");
+  if (def.kind === "gin") return ginEntries(columns, cols, storageKey, row);
+  if (def.kind === "gist") return gistEntries(columns, cols, storageKey, row);
+  const parts: Uint8Array[] = [];
+  for (const ci of cols) {
+    const v = row[ci]!;
+    if (v.kind === "null") parts.push(Uint8Array.of(0x01));
+    else parts.push(Uint8Array.of(0x00), encodeTypedKey(columns[ci]!.type, v, colls[ci]!));
+  }
+  parts.push(storageKey);
+  return [concatBytes(parts)];
 }
 
 // gistOpclassFor is the opclass for a GiST index over a column of type colType (gist.md §5/§6):
@@ -12772,12 +13123,12 @@ export function gistOpclassFor(colType: Type): GistOpclass {
 // column never conflicts and is left out of the tree). The empty range is a real value and IS indexed.
 export function gistEntries(
   columns: Column[],
-  def: IndexDef,
+  cols: number[],
   storageKey: Uint8Array,
   row: Row,
 ): Uint8Array[] {
   const inputs: GistLeafInput[] = [];
-  for (const ci of def.columns) {
+  for (const ci of cols) {
     const colType = columns[ci]!.type;
     const v = row[ci]!;
     if (v.kind === "null") return []; // any NULL excluded column → row not indexed (NULL rule)
@@ -12898,11 +13249,11 @@ export function isGistDeferredScalarType(ty: Type): boolean {
 
 export function ginEntries(
   columns: Column[],
-  def: IndexDef,
+  cols: number[],
   storageKey: Uint8Array,
   row: Row,
 ): Uint8Array[] {
-  const ci = def.columns[0]!;
+  const ci = cols[0]!;
   const colType = columns[ci]!.type;
   if (colType.kind !== "array")
     throw new Error("a GIN index column is an array (CREATE INDEX gate)");
@@ -13086,7 +13437,11 @@ export function resolveArbiter(table: Table, target: ConflictTarget | null): Arb
     if (pk.length > 0 && sameIntSet(pk, want)) return { isPK: true };
     for (let i = 0; i < table.indexes.length; i++) {
       const def = table.indexes[i]!;
-      if (def.unique && sameIntSet(def.columns, want)) return { isPK: false, indexPos: i };
+      // A conflict-target COLUMN list matches only a plain-column unique index (an expression unique
+      // index is arbitrated by ON CONSTRAINT <name> — upsert.md §3).
+      const cols = indexColumnOrdinals(def);
+      if (def.unique && cols !== null && sameIntSet(cols, want))
+        return { isPK: false, indexPos: i };
     }
     throw engineError(
       "invalid_column_reference",
@@ -13116,75 +13471,41 @@ export function sameIntSet(arr: number[], set: Set<number>): boolean {
 
 // arbiterKey is the arbiter key of a candidate row (spec/design/upsert.md §3): the storage key for
 // a PK arbiter (never NULL), or the unique-index prefix for an index arbiter (null when a nullable
-// arbiter column is NULL — NULLS DISTINCT, so the row never conflicts).
+// arbiter column is NULL — NULLS DISTINCT, so the row never conflicts). An expression-index arbiter
+// evaluates its key expressions through env (Engine.arbiterProbeKey builds it).
 export function arbiterKey(
   arb: Arbiter,
   table: Table,
   pk: number[],
   colls: (Collation | null)[],
+  rindexes: ResolvedIndex[],
   row: Row,
+  env: EvalEnv,
 ): Uint8Array | null {
   if (arb.isPK) return encodePkKey(table, pk, colls, row);
-  return indexPrefixKey(table.columns, colls, table.indexes[arb.indexPos]!, row);
+  return indexPrefixKey(table.columns, colls, rindexes[arb.indexPos]!, row, env);
 }
 
 // indexPrefixKey builds a row's UNIQUENESS PROBE KEY for one unique index
 // (spec/design/indexes.md §8): the §3 entry key's slot prefix — without the storage-key
 // suffix — or null when any component is NULL (NULLS DISTINCT: such a tuple never
-// conflicts). Two rows conflict iff they yield the same non-null prefix.
+// conflicts). Two rows conflict iff they yield the same non-null prefix. An expression key's value
+// enters the probe exactly like a column value (evaluated against the row through env).
 export function indexPrefixKey(
   columns: Column[],
   colls: (Collation | null)[],
-  def: IndexDef,
+  rindex: ResolvedIndex,
   row: Row,
+  env: EvalEnv,
 ): Uint8Array | null {
   const parts: Uint8Array[] = [];
-  for (const ci of def.columns) {
-    const v = row[ci]!;
-    if (v.kind === "null") {
-      return null;
-    } else if (v.kind === "int") {
-      parts.push(Uint8Array.of(0x00), encodeInt(typeScalar(columns[ci]!.type), v.int));
-    } else if (v.kind === "bool") {
-      parts.push(Uint8Array.of(0x00), encodeBool(v.value));
-    } else if (v.kind === "uuid") {
-      parts.push(Uint8Array.of(0x00), v.bytes);
-    } else if (v.kind === "timestamp" || v.kind === "timestamptz") {
-      parts.push(Uint8Array.of(0x00), encodeInt(typeScalar(columns[ci]!.type), v.micros));
-    } else if (v.kind === "date") {
-      parts.push(Uint8Array.of(0x00), encodeInt(typeScalar(columns[ci]!.type), v.days));
-    } else if (v.kind === "text") {
-      // text: C terminated-escape (§2.4) or the collated UCA sort key (§2.12).
-      parts.push(Uint8Array.of(0x00), collatedTextKey(colls[ci]!, v.text));
-    } else if (v.kind === "bytea") {
-      parts.push(Uint8Array.of(0x00), encodeTerminated(v.bytes));
-    } else if (v.kind === "decimal") {
-      parts.push(Uint8Array.of(0x00), v.dec.encodeKey());
-    } else if (v.kind === "interval") {
-      parts.push(Uint8Array.of(0x00), intervalEncodeKey(v.iv));
-    } else if (v.kind === "f64") {
-      // float: the fixed-width float-order-preserving key (encoding.md §2.8).
-      parts.push(Uint8Array.of(0x00), encodeFloat64Key(v.value));
-    } else if (v.kind === "f32") {
-      parts.push(Uint8Array.of(0x00), encodeFloat32Key(v.value));
-    } else if (v.kind === "range") {
-      // the recursive range-bounds container key (encoding.md §2.11)
-      parts.push(Uint8Array.of(0x00), encodeTypedKey(columns[ci]!.type, v, null));
-    } else if (v.kind === "array") {
-      // the recursive array-elements-terminated container key (encoding.md §2.14)
-      parts.push(Uint8Array.of(0x00), encodeTypedKey(columns[ci]!.type, v, null));
-    } else {
-      throw new Error("an index column is a key-encodable type (CREATE INDEX gate)");
-    }
+  for (const key of rindex.keys) {
+    const { value, type, coll } = indexKeySlot(key, columns, colls, row, env);
+    if (value.kind === "null") return null;
+    // present tag, then the type's order-preserving key (range-aware §2.11, collated-text-aware §2.12)
+    parts.push(Uint8Array.of(0x00), encodeTypedKey(type, value, coll));
   }
-  const total = parts.reduce((acc, b) => acc + b.length, 0);
-  const out = new Uint8Array(total);
-  let off = 0;
-  for (const b of parts) {
-    out.set(b, off);
-    off += b.length;
-  }
-  return out;
+  return concatBytes(parts);
 }
 
 // uniqueProbeBound is the half-open byte range [prefix, byte-successor(prefix)) — every
@@ -13357,9 +13678,13 @@ export function fkProbe(
     }
     return { kind: "pk", bytes: concatBytes(parts) };
   }
-  const idx = parent.indexes.find((i) => i.unique && sameSet(sortedUnique(i.columns), refSet))!;
+  const idx = parent.indexes.find((i) => {
+    const cols = indexColumnOrdinals(i);
+    return i.unique && cols !== null && sameSet(sortedUnique(cols), refSet);
+  })!;
+  const idxCols = indexColumnOrdinals(idx)!; // an FK target is a plain-column unique index
   const parts: Uint8Array[] = [];
-  for (const pcol of idx.columns) {
+  for (const pcol of idxCols) {
     parts.push(Uint8Array.of(0x00));
     parts.push(encodeTypedKey(parent.columns[pcol]!.type, valueFor(pcol), parentColls[pcol]!));
   }
@@ -13465,20 +13790,93 @@ export function detectPkBound(
       walk(e.rhs);
       return;
     }
-    const t = asBoundTerm(e, pkIdx, pkType, colColl, -1);
+    const t = asBoundTerm(e, { kind: "column", index: pkIdx }, pkType, colColl, -1);
     if (t !== null) terms.push(t);
   };
   walk(filter);
   return terms.length === 0 ? null : { pkType, terms, coll };
 }
 
-// asBoundTerm recognizes a single PK comparison conjunct: a comparison (=,<,<=,>,>=) with the bare LOCAL
-// PK column ("column" at pkIdx — a correlated "outerColumn" is a different kind, so it never matches) on
-// one side and a const-source of the PK's own type on the other (a promoted comparison — e.g. intpk = 2.5
-// → a constDecimal — does not match, so it stays residual). The op is flipped when the PK is on the right.
+// KeyMatch is what a bound's key operand is (spec/design/indexes.md §5): a plain column at a global
+// ordinal (the PK bound and a column index key), or a resolved index EXPRESSION matched structurally
+// against a WHERE conjunct operand (an expression index key). For the expression form, the key's
+// Column(i) is table-local and matches a WHERE Column(i + offset).
+export type KeyMatch =
+  | { kind: "column"; index: number }
+  | { kind: "expr"; expr: RExpr; offset: number };
+
+// keyMatches reports whether the WHERE operand x is the bound's key operand.
+export function keyMatches(km: KeyMatch, x: RExpr): boolean {
+  if (km.kind === "column") return x.kind === "column" && x.index === km.index;
+  return rexprEqShifted(x, km.expr, km.offset);
+}
+
+// rexprEqShifted is a SOUND-if-incomplete structural equality for index-expression matching
+// (spec/design/indexes.md §5): does the WHERE conjunct operand `a` (GLOBAL column indices) equal the
+// resolved index key expression `b` (table-local Column(i), matched as Column(i + offset))? Covers the
+// common index-expression shapes; any unrecognized / typmod-bearing shape returns false — a missed
+// bound is always sound (a full scan + residual filter), matching PostgreSQL's syntactic (not semantic)
+// index-expression matching.
+export function rexprEqShifted(a: RExpr, b: RExpr, offset: number): boolean {
+  switch (a.kind) {
+    case "column":
+      return b.kind === "column" && a.index === b.index + offset;
+    case "constInt":
+      return b.kind === "constInt" && a.value === b.value;
+    case "constBool":
+      return b.kind === "constBool" && a.value === b.value;
+    case "constText":
+      return b.kind === "constText" && a.value === b.value;
+    case "constNull":
+      return b.kind === "constNull";
+    case "scalarFunc":
+      return (
+        b.kind === "scalarFunc" &&
+        a.func === b.func &&
+        a.args.length === b.args.length &&
+        a.args.every((x, i) => rexprEqShifted(x, b.args[i]!, offset))
+      );
+    case "arith":
+      return (
+        b.kind === "arith" &&
+        a.op === b.op &&
+        rexprEqShifted(a.lhs, b.lhs, offset) &&
+        rexprEqShifted(a.rhs, b.rhs, offset)
+      );
+    case "cast":
+      return (
+        b.kind === "cast" &&
+        a.target === b.target &&
+        a.typmod === null &&
+        b.typmod === null &&
+        a.varcharLen === null &&
+        b.varcharLen === null &&
+        rexprEqShifted(a.operand, b.operand, offset)
+      );
+    case "neg":
+      return b.kind === "neg" && rexprEqShifted(a.operand, b.operand, offset);
+    case "not":
+      return b.kind === "not" && rexprEqShifted(a.operand, b.operand, offset);
+    case "casing":
+      // lower(x)/upper(x) (spec/design/collation.md §16) resolve to a dedicated "casing" node —
+      // NOT "scalarFunc" — so an index on lower(email) (the headline expression-index shape)
+      // matches ONLY if this arm is present. The fold is deterministic (engine-global casing
+      // regime, identical at index-build and query-eval), so the match is sound: same direction
+      // + a matching argument.
+      return b.kind === "casing" && a.upper === b.upper && rexprEqShifted(a.arg, b.arg, offset);
+    default:
+      return false;
+  }
+}
+
+// asBoundTerm recognizes a single comparison conjunct: a comparison (=,<,<=,>,>=) with the bound's
+// key operand (a bare LOCAL column, or an index EXPRESSION matched structurally — a correlated
+// "outerColumn" is a different kind, so it never matches) on one side and a const-source of the key's
+// own type on the other (a promoted comparison — e.g. intpk = 2.5 → a constDecimal — does not match,
+// so it stays residual). The op is flipped when the key is on the right.
 export function asBoundTerm(
   e: RExpr,
-  pkIdx: number,
+  km: KeyMatch,
   pkType: ScalarType,
   colColl: string | null,
   siblingCutoff: number,
@@ -13497,7 +13895,7 @@ export function asBoundTerm(
   if (cmpColl !== colColl) return null;
   if (e.op !== "eq" && e.op !== "lt" && e.op !== "le" && e.op !== "gt" && e.op !== "ge")
     return null;
-  const isPk = (x: RExpr): boolean => x.kind === "column" && x.index === pkIdx;
+  const isPk = (x: RExpr): boolean => keyMatches(km, x);
   if (isPk(e.lhs) && isConstSource(e.rhs, pkType, siblingCutoff)) return { op: e.op, src: e.rhs };
   if (isPk(e.rhs) && isConstSource(e.lhs, pkType, siblingCutoff))
     return { op: flipCmp(e.op), src: e.lhs };
@@ -17898,6 +18296,168 @@ export function rejectDefaultStructure(e: Expr): void {
       return rejectDefaultStructure(e.array);
     default: // literal, typedLiteral
       return;
+  }
+}
+
+// indexNamePart is the auto-name part for one index key element (spec/design/indexes.md §2, PG's
+// ChooseIndexColumnNames): a column key contributes its (lowercased) column name; a bare-function-call
+// expression its function name (`lower(email)` → `lower`); any other expression the literal `expr`.
+export function indexNamePart(elem: IndexKeyElem): string {
+  if (elem.kind === "column") return elem.name.toLowerCase();
+  if (elem.expr.kind === "funcCall") return elem.expr.name.toLowerCase();
+  return "expr";
+}
+
+// indexKeyLabel is one index key element's introspection label (introspection.md §5.1): a column
+// key shows its column name, an expression key its canonical text — the same `columns text[]` cell.
+export function indexKeyLabel(k: IndexKey, t: Table): string {
+  return k.kind === "column" ? t.columns[k.column]!.name : k.exprText;
+}
+
+// indexExprNonimmutableCall reports whether an index-key expression calls a NON-IMMUTABLE built-in
+// (spec/design/indexes.md §2): the entropy/clock seam (`uuidv4`/`uuidv7`/`now`/`clock_timestamp` —
+// `current_timestamp` desugars to `now`) or the sequence functions
+// (`nextval`/`currval`/`setval`/`lastval`) / `current_setting`. Such a function would let the index
+// drift from the table, so it is 42P17 at CREATE INDEX. The walk mirrors checkReferencedColumns
+// (subqueries are already rejected by resolution). The session-timezone hazard (an expression over
+// timestamptz) is handled separately by the caller, so this covers only calls.
+export function indexExprNonimmutableCall(e: Expr): boolean {
+  const isNonimmutable = (name: string): boolean => {
+    switch (name.toLowerCase()) {
+      case "uuidv4":
+      case "uuidv7":
+      case "now":
+      case "clock_timestamp":
+      case "nextval":
+      case "currval":
+      case "setval":
+      case "lastval":
+      case "current_setting":
+        return true;
+      default:
+        return false;
+    }
+  };
+  switch (e.kind) {
+    case "funcCall":
+      return isNonimmutable(e.name) || e.args.some(indexExprNonimmutableCall);
+    case "cast":
+    case "collate":
+      return indexExprNonimmutableCall(e.inner);
+    case "extract":
+      return indexExprNonimmutableCall(e.source);
+    case "unary":
+    case "isNull":
+    case "isJson":
+    case "jsonCtor":
+      return indexExprNonimmutableCall(e.operand);
+    case "jsonExists":
+    case "jsonValue":
+    case "jsonQuery":
+      return indexExprNonimmutableCall(e.ctx) || indexExprNonimmutableCall(e.path);
+    case "binary":
+    case "isDistinct":
+    case "like":
+    case "regex":
+      return indexExprNonimmutableCall(e.lhs) || indexExprNonimmutableCall(e.rhs);
+    case "in":
+      return indexExprNonimmutableCall(e.lhs) || e.list.some(indexExprNonimmutableCall);
+    case "between":
+      return (
+        indexExprNonimmutableCall(e.lhs) ||
+        indexExprNonimmutableCall(e.lo) ||
+        indexExprNonimmutableCall(e.hi)
+      );
+    case "case":
+      return (
+        (e.operand !== null && indexExprNonimmutableCall(e.operand)) ||
+        e.whens.some(
+          (w) => indexExprNonimmutableCall(w.cond) || indexExprNonimmutableCall(w.result),
+        ) ||
+        (e.els !== null && indexExprNonimmutableCall(e.els))
+      );
+    case "row":
+      return e.fields.some(indexExprNonimmutableCall);
+    case "array":
+      return e.elements.some(indexExprNonimmutableCall);
+    case "fieldAccess":
+    case "fieldStar":
+      return indexExprNonimmutableCall(e.base);
+    case "subscript":
+      return (
+        indexExprNonimmutableCall(e.base) ||
+        astSubscriptExprs(e.subscripts).some(indexExprNonimmutableCall)
+      );
+    case "quantified":
+      return indexExprNonimmutableCall(e.lhs) || indexExprNonimmutableCall(e.array);
+    default:
+      // column / qualifiedColumn / literal / typedLiteral / param, and any subquery form (rejected by
+      // resolution before this walk).
+      return false;
+  }
+}
+
+// indexExprHasSubquery reports whether an index-key expression contains a SUBQUERY
+// (spec/design/indexes.md §2): a scalar subquery, EXISTS, IN (subquery), or a quantified subquery.
+// A subquery reads other rows, so it is not a deterministic function of this row — 0A000 at CREATE
+// INDEX (PostgreSQL: "cannot use subquery in index expression"). Unlike an aggregate/window
+// (rejected by resolution), the resolver admits an uncorrelated subquery, so it is caught here.
+export function indexExprHasSubquery(e: Expr): boolean {
+  switch (e.kind) {
+    case "scalarSubquery":
+    case "exists":
+    case "inSubquery":
+    case "quantifiedSubquery":
+      return true;
+    case "cast":
+    case "collate":
+      return indexExprHasSubquery(e.inner);
+    case "extract":
+      return indexExprHasSubquery(e.source);
+    case "unary":
+    case "isNull":
+    case "isJson":
+    case "jsonCtor":
+      return indexExprHasSubquery(e.operand);
+    case "fieldAccess":
+    case "fieldStar":
+      return indexExprHasSubquery(e.base);
+    case "jsonExists":
+    case "jsonValue":
+    case "jsonQuery":
+      return indexExprHasSubquery(e.ctx) || indexExprHasSubquery(e.path);
+    case "binary":
+    case "isDistinct":
+    case "like":
+    case "regex":
+      return indexExprHasSubquery(e.lhs) || indexExprHasSubquery(e.rhs);
+    case "in":
+      return indexExprHasSubquery(e.lhs) || e.list.some(indexExprHasSubquery);
+    case "quantified":
+      return indexExprHasSubquery(e.lhs) || indexExprHasSubquery(e.array);
+    case "between":
+      return (
+        indexExprHasSubquery(e.lhs) || indexExprHasSubquery(e.lo) || indexExprHasSubquery(e.hi)
+      );
+    case "case":
+      return (
+        (e.operand !== null && indexExprHasSubquery(e.operand)) ||
+        e.whens.some((w) => indexExprHasSubquery(w.cond) || indexExprHasSubquery(w.result)) ||
+        (e.els !== null && indexExprHasSubquery(e.els))
+      );
+    case "funcCall":
+      return e.args.some(indexExprHasSubquery);
+    case "row":
+      return e.fields.some(indexExprHasSubquery);
+    case "array":
+      return e.elements.some(indexExprHasSubquery);
+    case "subscript":
+      return (
+        indexExprHasSubquery(e.base) || astSubscriptExprs(e.subscripts).some(indexExprHasSubquery)
+      );
+    default:
+      // column / qualifiedColumn / literal / typedLiteral / param / qualifiedStar — no subquery.
+      return false;
   }
 }
 

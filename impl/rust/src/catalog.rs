@@ -101,19 +101,71 @@ pub enum IndexKind {
     Gist = 2,
 }
 
+/// One index key element (spec/design/indexes.md §1): a bare column (by ordinal into the
+/// table's columns) or an **expression** over the table's columns (`lower(email)`), carrying
+/// its persisted canonical text and the re-parsed (unresolved) AST — the write/plan paths
+/// re-resolve it against the table per statement, exactly as a CHECK is re-resolved. Only a
+/// B-tree index may carry an expression element (GIN/GiST are single column, this slice).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum IndexKey {
+    Column(usize),
+    Expr(IndexKeyExpr),
+}
+
+/// An index expression key's persisted text + parsed AST (modeled on `CheckConstraint`).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct IndexKeyExpr {
+    pub expr_text: String,
+    pub expr: Expr,
+}
+
+impl IndexKey {
+    /// The column ordinal if this is a plain column key, else `None` (an expression key).
+    pub fn as_column(&self) -> Option<usize> {
+        match self {
+            IndexKey::Column(c) => Some(*c),
+            IndexKey::Expr(_) => None,
+        }
+    }
+}
+
 /// One secondary index of a table (spec/design/indexes.md): its (relation-namespace) name
-/// and the indexed column ordinals in index-key order (duplicates allowed — PG). The index's
-/// B-tree lives in the snapshot's index-store map, keyed by the lowercased name. A
-/// `unique` index enforces uniqueness over its key tuple (NULLS DISTINCT —
+/// and its key elements in index-key order (columns and/or expressions, duplicates allowed —
+/// PG). The index's B-tree lives in the snapshot's index-store map, keyed by the lowercased
+/// name. A `unique` index enforces uniqueness over its key tuple (NULLS DISTINCT —
 /// spec/design/indexes.md §8); it is what backs a `UNIQUE` constraint
 /// (spec/design/constraints.md §5). `kind` selects ordered-B-tree vs GIN
 /// (spec/design/gin.md); a GIN index is never `unique`.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct IndexDef {
     pub name: String,
-    pub columns: Vec<usize>,
+    pub keys: Vec<IndexKey>,
     pub unique: bool,
     pub kind: IndexKind,
+}
+
+impl IndexDef {
+    /// Whether every key element is a plain column (no expression key) — the common case, and
+    /// the GIN/GiST invariant. Lets column-only code paths fast-check.
+    pub fn all_columns(&self) -> bool {
+        self.keys.iter().all(|k| matches!(k, IndexKey::Column(_)))
+    }
+
+    /// The key elements' column ordinals if every element is a plain column, else `None` (the
+    /// index has at least one expression key). The many column-only consumers — the GIN/GiST
+    /// entry builders, FK-target matching, introspection — use this; an expression key makes the
+    /// index ineligible for those (an FK cannot target an expression index, etc.).
+    pub fn column_ordinals(&self) -> Option<Vec<usize>> {
+        self.keys.iter().map(IndexKey::as_column).collect()
+    }
+
+    /// The column ordinal of the first key element, assuming a single-column index — used by the
+    /// GIN/GiST paths, which are always single-column plain-column indexes (this slice).
+    pub fn first_column(&self) -> usize {
+        self.keys[0]
+            .as_column()
+            .expect("GIN/GiST index key is a plain column")
+    }
 }
 
 /// The persisted referential action for a foreign key's `ON DELETE` / `ON UPDATE`

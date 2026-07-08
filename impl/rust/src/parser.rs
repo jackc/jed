@@ -8,7 +8,7 @@ use crate::ast::{
     AlterSeqAction, AlterSequence, Assignment, BinaryOp, CheckDef, ColumnDef, ConflictAction,
     ConflictTarget, CreateIndex, CreateSequence, CreateTable, CreateType, Cte, CteBody, DefaultDef,
     Delete, DropIndex, DropSequence, DropTable, DropType, ExcludeDef, Expr, ForeignKeyDef,
-    GroupItem, IdentitySpec, Insert, InsertSource, InsertValue, JoinClause, JoinKind,
+    GroupItem, IdentitySpec, IndexKeyElem, Insert, InsertSource, InsertValue, JoinClause, JoinKind,
     JsonOnBehavior, JsonPredicateKind, JsonTable, JsonWrapper, JtColumn, Literal, OnConflict,
     OrderKey, Overriding, QueryExpr, RefAction, Select, SelectItem, SelectItems, SeqOptions, SetOp,
     SetOpKind, Statement, SubscriptSpec, TableRef, TypeFieldDef, TypeMod, UnaryOp, UniqueDef,
@@ -875,9 +875,9 @@ impl Parser {
             None
         };
         self.expect(&Token::LParen)?;
-        let mut columns = Vec::new();
+        let mut keys = Vec::new();
         loop {
-            columns.push(self.expect_identifier()?);
+            keys.push(self.parse_index_element()?);
             match self.advance() {
                 Token::Comma => continue,
                 Token::RParen => break,
@@ -887,11 +887,50 @@ impl Parser {
         Ok(CreateIndex {
             name,
             table,
-            columns,
+            keys,
             unique,
             using,
             db,
         })
+    }
+
+    /// One `index_element` (grammar.md §30, indexes.md §1): a bare column, a bare function
+    /// call (`lower(email)`), or a parenthesized expression (`(a + b)`). PostgreSQL's
+    /// `index_elem`: a general operator expression must be parenthesized (a bare `a + b`
+    /// errors — `parse_primary` stops before the operator, so the element loop then sees an
+    /// unexpected token); a parenthesized bare column `(a)` normalizes to a column key.
+    fn parse_index_element(&mut self) -> Result<IndexKeyElem> {
+        if matches!(self.peek(), Token::LParen) {
+            // `( expr )` — any parenthesized expression.
+            self.advance();
+            let start = self.pos;
+            let expr = self.parse_expr()?;
+            let end = self.pos;
+            self.expect(&Token::RParen)?;
+            Ok(Self::index_key_from_expr(&self.tokens, expr, start, end))
+        } else if matches!(self.peek(), Token::Word(_)) && matches!(self.peek_at(1), Token::LParen)
+        {
+            // A bare function call `f(args)` — parse ONLY the primary, so a trailing operator
+            // (`lower(x) + 1`) leaves `+` for the element loop to reject (PG requires parens).
+            let start = self.pos;
+            let expr = self.parse_primary()?;
+            let end = self.pos;
+            Ok(Self::index_key_from_expr(&self.tokens, expr, start, end))
+        } else {
+            // A bare column name.
+            Ok(IndexKeyElem::Column(self.expect_identifier()?))
+        }
+    }
+
+    /// Classify a parsed index-element expression: a bare column reference (`a`, `(a)`,
+    /// `((a))`) becomes a column key (PG-matched), anything else an expression key carrying
+    /// its canonical text (rendered from the captured token span, like CHECK/DEFAULT).
+    fn index_key_from_expr(tokens: &[Token], expr: Expr, start: usize, end: usize) -> IndexKeyElem {
+        if let Expr::Column(name) = &expr {
+            return IndexKeyElem::Column(name.clone());
+        }
+        let text = render_tokens(&tokens[start..end]);
+        IndexKeyElem::Expr { text, expr }
     }
 
     /// `DROP INDEX <name>` (spec/design/grammar.md §30). A missing index (42704) or a

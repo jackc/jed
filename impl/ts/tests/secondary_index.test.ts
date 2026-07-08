@@ -17,7 +17,7 @@ import {
   openDatabase,
 } from "../src/tooling.ts";
 import { type Handle, queryOutcome } from "./util.ts";
-import { pkIndices } from "../src/catalog.ts";
+import { indexColumnOrdinals, pkIndices } from "../src/catalog.ts";
 import { memDb } from "./mem_db.ts";
 
 function run(db: Handle, sql: string) {
@@ -75,8 +75,8 @@ test("auto-naming matches PostgreSQL", () => {
     t.indexes.map((i) => i.name),
     ["Mine", "t_a_b_idx", "t_b_b_idx", "t_b_idx", "t_b_idx1", "t_b_idx2"],
   );
-  assert.deepEqual(t.indexes[1]!.columns, [0, 1]);
-  assert.deepEqual(t.indexes[2]!.columns, [1, 1]);
+  assert.deepEqual(indexColumnOrdinals(t.indexes[1]!), [0, 1]);
+  assert.deepEqual(indexColumnOrdinals(t.indexes[2]!), [1, 1]);
   assert.deepEqual(pkIndices(t), [0]);
 });
 
@@ -181,7 +181,7 @@ test("round-trips through the on-disk image", () => {
   const t = loaded.table("t")!;
   assert.equal(t.indexes.length, 1);
   assert.equal(t.indexes[0]!.name, "t_v_idx");
-  assert.deepEqual(t.indexes[0]!.columns, [1]);
+  assert.deepEqual(indexColumnOrdinals(t.indexes[0]!), [1]);
   assert.equal(cost(loaded, "SELECT id FROM t WHERE v = 3"), 17n);
   run(loaded, "UPDATE t SET v = 3 WHERE id = 100");
   assert.deepEqual(ids(loaded, "SELECT id FROM t WHERE v = 3 ORDER BY id"), [

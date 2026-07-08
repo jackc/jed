@@ -443,6 +443,18 @@ class = "syntax error or access rule violation"
 template = "there is no parameter ${index}"
 
 [[error]]
+code = "42P17"
+name = "invalid_object_definition"
+class = "syntax error or access rule violation"
+# An object definition that is structurally invalid. jed's one use is an INDEX EXPRESSION that
+# calls a non-immutable function — the entropy/clock seam uuidv4/uuidv7/now/current_timestamp/
+# clock_timestamp (spec/design/indexes.md §2): an index must be a deterministic function of the
+# row, so a volatile/stable operand would let the index drift from the table. Matches PostgreSQL
+# (ComputeIndexAttrs, "functions in index expression must be marked IMMUTABLE"). Code matches;
+# jed's house message omits identifier quoting.
+template = "functions in index expression must be marked IMMUTABLE"
+
+[[error]]
 code = "42P20"
 name = "windowing_error"
 class = "syntax error or access rule violation"

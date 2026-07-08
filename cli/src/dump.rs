@@ -37,10 +37,16 @@ pub fn dump(db: &mut jed::Session, out: &mut dyn Write) -> io::Result<()> {
             let table = db.table(name).expect("listed table exists");
             let idx = &table.indexes[i];
             let unique = if idx.unique { "UNIQUE " } else { "" };
-            let cols: Vec<&str> = idx
-                .columns
+            // A column key dumps its column name; an EXPRESSION key its canonical text, wrapped in
+            // parentheses so the emitted CREATE INDEX re-parses (a bare operator expression is a
+            // syntax error — indexes.md §1).
+            let cols: Vec<String> = idx
+                .keys
                 .iter()
-                .map(|&c| table.columns[c].name.as_str())
+                .map(|k| match k {
+                    jed::tooling::IndexKey::Column(c) => table.columns[*c].name.clone(),
+                    jed::tooling::IndexKey::Expr(e) => format!("({})", e.expr_text),
+                })
                 .collect();
             writeln!(
                 out,

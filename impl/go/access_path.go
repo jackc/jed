@@ -235,21 +235,47 @@ func (db *engine) buildIndexAccessPredicate(filter *rExpr, rel scopeRel, idx ind
 	if idx.Kind != indexBtree {
 		return nil
 	}
+	// Resolve the index's key elements (column ordinals + resolved expression keys). A resolution
+	// failure yields no bound (a full scan — always sound). indexes.md §5.
+	rindex, err := db.resolveIndex(rel.table, idx)
+	if err != nil {
+		return nil
+	}
 	var eqCols []indexEqCol
 	var rangeType scalarType
 	var rangeTerms []boundTerm
-	for _, ci := range idx.Columns {
-		// A non-scalar (range/array/composite) column cannot be seeked here — stop the prefix.
-		ty, ok := rel.table.Columns[ci].Type.AsScalar()
-		if !ok {
-			break
-		}
-		// The column's key collation form (collation.md §8/§12): a Skewed collated column refuses the
-		// bound (its stored keys are wrong for the loaded bundle) — stop the prefix here (the column
-		// then falls into the fixed-width suffix check below and rejects the whole index if it is text).
-		coll, push := db.keyCollationCtx(rel.table.Columns[ci])
-		if !push {
-			break
+	for i := range rindex.Keys {
+		key := rindex.Keys[i]
+		// Each key element yields (its scalar key type, its key collation, the matcher against a
+		// WHERE conjunct operand). A non-scalar / skewed element stops the prefix.
+		var ty scalarType
+		var coll *Collation
+		var matcher keyMatch
+		if key.Expr == nil {
+			ci := key.Col
+			s, ok := rel.table.Columns[ci].Type.AsScalar()
+			if !ok {
+				break // a range/array/composite column cannot be seeked
+			}
+			// Collation.md §8/§12: a Skewed collated column refuses the bound (its stored keys are
+			// wrong for the loaded bundle) — stop the prefix. C/Full admissible.
+			c, push := db.keyCollationCtx(rel.table.Columns[ci])
+			if !push {
+				break
+			}
+			ty, coll, matcher = s, c, columnMatch(rel.offset+ci)
+		} else {
+			// An expression key seeks only when its result is a scalar and its collation is C (the
+			// common lower(email) shape). A collated-expression bound is a deferred follow-on (§5).
+			// Match a WHERE operand structurally against the key.
+			s, ok := key.Ty.AsScalar()
+			if !ok {
+				break
+			}
+			if key.Coll != nil {
+				break
+			}
+			ty, coll, matcher = s, nil, exprMatch(key.Expr, rel.offset)
 		}
 		colColl := ""
 		if coll != nil {
@@ -267,7 +293,7 @@ func (db *engine) buildIndexAccessPredicate(filter *rExpr, rel scopeRel, idx ind
 				walk(e.rhs)
 				return
 			}
-			if t, ok := asBoundTerm(e, rel.offset+ci, ty, colColl, siblingCutoff); ok {
+			if t, ok := asBoundTerm(e, matcher, ty, colColl, siblingCutoff); ok {
 				if t.op == opEq {
 					eqs = append(eqs, t.src)
 				} else {
@@ -284,17 +310,24 @@ func (db *engine) buildIndexAccessPredicate(filter *rExpr, rel scopeRel, idx ind
 			rangeType = ty
 			rangeTerms = ranges
 		}
-		break // first non-equality column ends the prefix (with or without a trailing range)
+		break // first non-equality element ends the prefix (with or without a trailing range)
 	}
 	if len(eqCols) == 0 && rangeTerms == nil {
 		return nil // nothing bound
 	}
-	// Eligibility: every index column from the range column onward (columns[len(eqCols):]) is
-	// width-skipped past the known equality prefix, so each must be a fixed-width scalar. The
-	// equality-prefix columns may be any width — their slots are matched as the known prefix bytes.
-	suffix := make([]scalarType, 0, len(idx.Columns)-len(eqCols))
-	for _, c := range idx.Columns[len(eqCols):] {
-		s, ok := rel.table.Columns[c].Type.AsScalar()
+	// Eligibility: every key element from the range element onward (keys[len(eqCols):]) is
+	// width-skipped past the known equality prefix to recover the storage key, so each must be a
+	// fixed-width scalar (a column's type, or an expression's result type). The equality-prefix
+	// elements may be any width — their slots are matched as the known prefix bytes.
+	suffix := make([]scalarType, 0, len(rindex.Keys)-len(eqCols))
+	for _, key := range rindex.Keys[len(eqCols):] {
+		var s scalarType
+		var ok bool
+		if key.Expr == nil {
+			s, ok = rel.table.Columns[key.Col].Type.AsScalar()
+		} else {
+			s, ok = key.Ty.AsScalar()
+		}
 		if !ok || !s.IsFixedWidth() {
 			return nil
 		}
@@ -365,13 +398,19 @@ func detectScanBound(filter *rExpr, rel scopeRel, db *engine) *scanBound {
 		if idx.Kind != indexBtree {
 			continue
 		}
-		ci := idx.Columns[0]
+		// The OR/IN merged-point-lookup bound is column-only this slice (an expression index takes
+		// the access-predicate path — indexes.md §5; OR/IN over an expression key is a follow-on).
+		cols := idx.columnOrdinals()
+		if cols == nil {
+			continue
+		}
+		ci := cols[0]
 		ty, ok := rel.table.Columns[ci].Type.AsScalar()
 		if !ok {
 			continue
 		}
 		unskippableTail := false
-		for _, c := range idx.Columns[1:] {
+		for _, c := range cols[1:] {
 			s, ok := rel.table.Columns[c].Type.AsScalar()
 			if !ok || !s.IsFixedWidth() {
 				unskippableTail = true
@@ -386,8 +425,8 @@ func detectScanBound(filter *rExpr, rel scopeRel, db *engine) *scanBound {
 			continue
 		}
 		if srcs := detectKeySet(filter, rel.offset+ci, ty, coll); srcs != nil {
-			tail := make([]scalarType, 0, len(idx.Columns)-1)
-			for _, c := range idx.Columns[1:] {
+			tail := make([]scalarType, 0, len(cols)-1)
+			for _, c := range cols[1:] {
 				tail = append(tail, rel.table.Columns[c].Type.ScalarTy())
 			}
 			return &scanBound{indexSet: &indexKeySetPlan{
@@ -455,7 +494,7 @@ func reduceKeySet(e *rExpr, keyIdx int, keyType scalarType, colColl string) ([]*
 		}
 		return append(l, r...), true
 	}
-	if t, ok := asBoundTerm(e, keyIdx, keyType, colColl, -1); ok && t.op == opEq {
+	if t, ok := asBoundTerm(e, columnMatch(keyIdx), keyType, colColl, -1); ok && t.op == opEq {
 		return []*rExpr{t.src}, true
 	}
 	return nil, false
@@ -498,7 +537,7 @@ func detectINLBound(on *rExpr, whereFilter *rExpr, rel scopeRel, db *engine) *sc
 				walk(e.rhs)
 				return
 			}
-			if t, ok := asBoundTerm(e, keyIdx, ty, colColl, cutoff); ok {
+			if t, ok := asBoundTerm(e, columnMatch(keyIdx), ty, colColl, cutoff); ok {
 				terms = append(terms, t)
 			}
 		}
@@ -531,13 +570,19 @@ func detectINLBound(on *rExpr, whereFilter *rExpr, rel scopeRel, db *engine) *sc
 		if idx.Kind != indexBtree {
 			continue
 		}
-		ci := idx.Columns[0]
+		// The index-nested-loop sibling bound is column-only this slice (an expression index takes
+		// the access-predicate path — indexes.md §5; an INL bound over an expression key is a follow-on).
+		cols := idx.columnOrdinals()
+		if cols == nil {
+			continue
+		}
+		ci := cols[0]
 		ty, ok := rel.table.Columns[ci].Type.AsScalar()
 		if !ok {
 			continue
 		}
 		unskippableTail := false
-		for _, c := range idx.Columns[1:] {
+		for _, c := range cols[1:] {
 			s, ok := rel.table.Columns[c].Type.AsScalar()
 			if !ok || !s.IsFixedWidth() {
 				unskippableTail = true
@@ -567,8 +612,8 @@ func detectINLBound(on *rExpr, whereFilter *rExpr, rel scopeRel, db *engine) *sc
 			// column bound to a sibling); a multi-column / range INL bound is a follow-on (cost.md
 			// §3 "index-nested-loop"). suffixTypes are the trailing columns (columns[1:], fixed-width
 			// by the unskippableTail check above), width-skipped past the single equality slot.
-			tail := make([]scalarType, 0, len(idx.Columns)-1)
-			for _, c := range idx.Columns[1:] {
+			tail := make([]scalarType, 0, len(cols)-1)
+			for _, c := range cols[1:] {
 				tail = append(tail, rel.table.Columns[c].Type.ScalarTy())
 			}
 			return &scanBound{index: &indexBoundPlan{
@@ -620,7 +665,7 @@ func detectGinBound(filter *rExpr, indexes []indexDef, columns []catColumn, offs
 		if idx.Kind != indexGin {
 			continue
 		}
-		ci := idx.Columns[0]
+		ci := idx.firstColumn()
 		colGlobal := offset + ci
 		at := columns[ci].Type
 		if at.Array == nil {
@@ -704,10 +749,10 @@ func detectGistBound(filter *rExpr, indexes []indexDef, columns []catColumn, off
 		// The planner gather is single-operator: only a single-column GiST index accelerates a
 		// `col && Q` / `col @> Q` / `col = Q` conjunct. A multi-column GiST index (an EXCLUDE backing
 		// structure, gist.md §7) is probed only by the constraint, never the planner.
-		if len(idx.Columns) != 1 {
+		if len(idx.Keys) != 1 {
 			continue
 		}
-		ci := idx.Columns[0]
+		ci := idx.firstColumn()
 		colGlobal := offset + ci
 		colTy := columns[ci].Type
 		if colTy.IsRange() {
@@ -1411,7 +1456,7 @@ func detectPKBound(filter *rExpr, pkIdx int, pkType scalarType, coll *Collation)
 			walk(e.rhs)
 			return
 		}
-		if t, ok := asBoundTerm(e, pkIdx, pkType, colColl, -1); ok {
+		if t, ok := asBoundTerm(e, columnMatch(pkIdx), pkType, colColl, -1); ok {
 			terms = append(terms, t)
 		}
 	}
@@ -1422,12 +1467,93 @@ func detectPKBound(filter *rExpr, pkIdx int, pkType scalarType, coll *Collation)
 	return &pkBoundPlan{pkType: pkType, terms: terms, coll: coll}
 }
 
-// asBoundTerm recognizes a single PK comparison conjunct: a comparison (=,<,<=,>,>=) with the bare
-// LOCAL PK column (reColumn at pkIdx — a correlated reOuterColumn is a different kind, so it never
-// matches) on one side and a const-source of the PK's own type on the other (a promoted comparison
-// — e.g. intpk = 2.5 → a reConstDecimal — does not match, so it stays residual). The op is flipped
-// when the PK is on the right.
-func asBoundTerm(e *rExpr, pkIdx int, pkType scalarType, colColl string, siblingCutoff int) (boundTerm, bool) {
+// keyMatch is what a bound's key operand is (spec/design/indexes.md §5): a plain column at a
+// global ordinal (the PK bound and a column index key), or a resolved index EXPRESSION matched
+// structurally against a WHERE conjunct operand (an expression index key). For the expression
+// form, the key's Column(i) is table-local and matches a WHERE Column(i + offset). Go has no sum
+// types: expr == nil discriminates the column form (read col) from the expression form.
+type keyMatch struct {
+	col    int
+	expr   *rExpr
+	offset int
+}
+
+func columnMatch(globalOrdinal int) keyMatch  { return keyMatch{col: globalOrdinal} }
+func exprMatch(e *rExpr, offset int) keyMatch { return keyMatch{expr: e, offset: offset} }
+
+// matches reports whether a WHERE conjunct operand x is this key's operand.
+func (k keyMatch) matches(x *rExpr) bool {
+	if k.expr == nil {
+		return x.kind == reColumn && x.index == k.col
+	}
+	return rexprEqShifted(x, k.expr, k.offset)
+}
+
+// rexprEqShifted is a SOUND-if-incomplete structural equality for index-expression matching
+// (spec/design/indexes.md §5): does the WHERE conjunct operand a (GLOBAL column indices) equal the
+// resolved index key expression b (table-local Column(i), matched as Column(i + offset))? Covers
+// the common index-expression shapes; any unrecognized / typmod-bearing shape returns false — a
+// missed bound is always sound (a full scan + residual filter), matching PostgreSQL's syntactic
+// (not semantic) index-expression matching.
+func rexprEqShifted(a, b *rExpr, offset int) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	if a.kind != b.kind {
+		return false
+	}
+	switch a.kind {
+	case reColumn:
+		return a.index == b.index+offset
+	case reConstInt:
+		return a.cInt == b.cInt
+	case reConstBool:
+		return a.cBool == b.cBool
+	case reConstText:
+		return a.cText == b.cText
+	case reConstNull:
+		return true
+	case reScalarFunc:
+		if a.sfunc != b.sfunc || len(a.sargs) != len(b.sargs) {
+			return false
+		}
+		for i := range a.sargs {
+			if !rexprEqShifted(a.sargs[i], b.sargs[i], offset) {
+				return false
+			}
+		}
+		return true
+	case reArith:
+		return a.op == b.op &&
+			rexprEqShifted(a.lhs, b.lhs, offset) &&
+			rexprEqShifted(a.rhs, b.rhs, offset)
+	case reCast:
+		// A scalar cast, no typmod / varchar(n) (those would change the value's byte form).
+		return a.typmod == nil && b.typmod == nil && a.varchar == nil && b.varchar == nil &&
+			a.result == b.result && rexprEqShifted(a.operand, b.operand, offset)
+	case reNeg:
+		return rexprEqShifted(a.operand, b.operand, offset)
+	case reNot:
+		return rexprEqShifted(a.operand, b.operand, offset)
+	case reCasing:
+		// lower(x)/upper(x) (spec/design/collation.md §16) resolve to a dedicated reCasing node —
+		// NOT reScalarFunc — so an index on lower(email) (the headline expression-index shape)
+		// matches ONLY if this arm is present. The fold is deterministic (engine-global casing
+		// regime, identical at index-build and query-eval), so the match is sound: same direction
+		// + a matching argument.
+		return a.casingUpper == b.casingUpper && rexprEqShifted(a.operand, b.operand, offset)
+	default:
+		return false
+	}
+}
+
+// asBoundTerm recognizes a single comparison conjunct: a comparison (=,<,<=,>,>=) whose one side
+// matches the bound's key operand (a bare LOCAL column at key.col, or the resolved index
+// expression — a correlated reOuterColumn is a different kind, so it never matches) and whose
+// other side is a const-source of the key's own type (a promoted comparison — e.g. intpk = 2.5 → a
+// reConstDecimal — does not match, so it stays residual). The op is flipped when the key is on the
+// right.
+func asBoundTerm(e *rExpr, key keyMatch, pkType scalarType, colColl string, siblingCutoff int) (boundTerm, bool) {
 	if e.kind != reCompare {
 		return boundTerm{}, false
 	}
@@ -1452,11 +1578,11 @@ func asBoundTerm(e *rExpr, pkIdx int, pkType scalarType, colColl string, sibling
 	default:
 		return boundTerm{}, false
 	}
-	isPK := func(x *rExpr) bool { return x.kind == reColumn && x.index == pkIdx }
+	isKey := func(x *rExpr) bool { return key.matches(x) }
 	switch {
-	case isPK(e.lhs) && isConstSource(e.rhs, pkType, siblingCutoff):
+	case isKey(e.lhs) && isConstSource(e.rhs, pkType, siblingCutoff):
 		return boundTerm{op: e.op, src: e.rhs}, true
-	case isPK(e.rhs) && isConstSource(e.lhs, pkType, siblingCutoff):
+	case isKey(e.rhs) && isConstSource(e.lhs, pkType, siblingCutoff):
 		return boundTerm{op: flipCompare(e.op), src: e.lhs}, true
 	}
 	return boundTerm{}, false

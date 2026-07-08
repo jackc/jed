@@ -222,10 +222,9 @@ impl Snapshot {
                 .iter()
                 .filter(|idx| {
                     pk_skewed
-                        || idx
-                            .columns
-                            .iter()
-                            .any(|&c| is_skewed(&table.columns[c].collation))
+                        || idx.column_ordinals().is_some_and(|cols| {
+                            cols.iter().any(|&c| is_skewed(&table.columns[c].collation))
+                        })
                 })
                 .cloned()
                 .collect();
@@ -272,9 +271,26 @@ impl Snapshot {
             // 2b. Rebuild each affected index store from the (re-keyed) rows.
             let cap = crate::format::page_payload(page_size);
             for def in &indexes {
+                // The realign runs on a Snapshot with no Engine to evaluate an expression key; an
+                // expression index is C-collated so its keys never change on a collation upgrade,
+                // but a pk_skewed re-key moves its suffix — that (rare) rebuild is unsupported here
+                // (0A000; drop the expression index, upgrade, recreate — indexes.md §7).
+                if def.column_ordinals().is_none() {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "collation upgrade of a table with an expression index is not supported yet"
+                            .to_string(),
+                    ));
+                }
                 let mut ekeys: Vec<Vec<u8>> = Vec::new();
                 for (k, row) in &entries {
-                    ekeys.extend(index_entry_keys(&table.columns, &colls, def, k, row)?);
+                    ekeys.extend(index_entry_keys_columns(
+                        &table.columns,
+                        &colls,
+                        def,
+                        k,
+                        row,
+                    )?);
                 }
                 ekeys.sort_unstable();
                 let mut fresh = TableStore::new(cap, Vec::new());
@@ -756,7 +772,8 @@ impl Snapshot {
                 // One opclass per indexed column (gist.md §7): a single-column GX1/GX2 index has
                 // one; an EXCLUDE backing index has one per `WITH` column.
                 let ops: Vec<crate::gist::GistOpclass> = idx
-                    .columns
+                    .column_ordinals()
+                    .expect("a GiST index is plain-column")
                     .iter()
                     .map(|&ci| crate::gist::opclass_for(&table.columns[ci].ty))
                     .collect();

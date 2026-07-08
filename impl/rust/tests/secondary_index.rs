@@ -91,8 +91,8 @@ fn auto_naming_matches_postgres() {
             "t_b_idx2"
         ]
     );
-    assert_eq!(t.indexes[1].columns, vec![0, 1]);
-    assert_eq!(t.indexes[2].columns, vec![1, 1]);
+    assert_eq!(t.indexes[1].column_ordinals().unwrap(), vec![0, 1]);
+    assert_eq!(t.indexes[2].column_ordinals().unwrap(), vec![1, 1]);
     // The PK list is independent of the indexes.
     assert_eq!(t.pk_indices(), vec![0]);
 }
@@ -202,7 +202,7 @@ fn round_trips_through_the_on_disk_image() {
     let t = loaded.table("t").unwrap();
     assert_eq!(t.indexes.len(), 1);
     assert_eq!(t.indexes[0].name, "t_v_idx");
-    assert_eq!(t.indexes[0].columns, vec![1]);
+    assert_eq!(t.indexes[0].column_ordinals().unwrap(), vec![1]);
     // The reloaded index serves scans at the same pinned cost and observes mutations.
     assert_eq!(cost(&mut loaded, "SELECT id FROM t WHERE v = 3"), 17);
     run(&mut loaded, "UPDATE t SET v = 3 WHERE id = 100");

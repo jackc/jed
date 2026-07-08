@@ -474,6 +474,61 @@ def gen_index_nested_loop(seed)
 end
 
 # --- scenario: secondary-index equality bound ---------------------------------------------------
+INDEX_EXPR_REQ = (INDEX_REQ + %w[ddl.index_expr query.index_expr]).freeze
+
+# --- scenario: EXPRESSION-index equality bound (expr index fetch vs full scan) ------------------
+# A secondary index on an EXPRESSION `(v + 1)` accelerates `WHERE v + 1 = K` (the planner matches the
+# WHERE operand structurally against the key expression — spec/design/indexes.md §5, query.index_expr);
+# the semantically-identical `(v + 1) + 0 = K` adds an extra `+ 0`, so it no longer structurally
+# matches the index expression and full-scans. Both MUST return identical rows — the metamorphic
+# relation the expression-index optimization must keep passing. NULL v never matches (3VL through the
+# expression). Mirrors gen_index, with an expression key in place of the bare column.
+def gen_index_expr(seed)
+  rng = Random.new(seed)
+  ids = (1..40).to_a.sample(12, random: rng).sort
+  null_id = ids.sample(random: rng)
+  rows = ids.map { |id| [id, id == null_id ? nil : rng.rand(0..4), rng.rand(-50..50)] }
+  flat = ->(rs) { rs.flat_map { |id, _v, w| [id.to_s, w.to_s] } }
+  # rows whose v + 1 == k (i.e. v == k - 1); a NULL v never matches.
+  with_expr = ->(k) { rows.select { |_id, v, _w| !v.nil? && v + 1 == k } }
+
+  present_v = rows.map { |_id, v, _w| v }.compact.sample(random: rng) || 0
+  present = present_v + 1
+  absent = 99 # v + 1 is at most 5, so 99 is always absent (empty result)
+
+  out = header(seed, INDEX_EXPR_REQ, "expression-index equality bound (expr index fetch vs full scan)")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32)")
+  stmt(out, "INSERT INTO t VALUES #{rows.map { |id, v, w| "(#{id}, #{v.nil? ? 'NULL' : v}, #{w})" }.join(', ')}")
+  stmt(out, "CREATE INDEX t_expr_idx ON t ((v + 1))")
+
+  epair = lambda do |title, k, exp|
+    out << "# #{title}"
+    out << "# expression-index bound (v + 1 matches the key expression -> index fetch)"
+    q(out, "II", "SELECT id, w FROM t WHERE v + 1 = #{k} ORDER BY id", exp)
+    out << "# full scan ((v + 1) + 0 no longer matches the key expression) — MUST match"
+    q(out, "II", "SELECT id, w FROM t WHERE (v + 1) + 0 = #{k} ORDER BY id", exp)
+  end
+
+  epair.call("v + 1 = #{present} (present)", present, flat.call(with_expr.call(present)))
+  epair.call("v + 1 = #{absent} (absent -> empty)", absent, flat.call(with_expr.call(absent)))
+
+  # Maintenance: an UPDATE moves rows across the expression equality, a DELETE removes one — the
+  # expression-index fetch and the full scan must keep agreeing (indexes.md §4).
+  moved = rows.reject { |_id, v, _w| v.nil? }.sample(2, random: rng).map(&:first).sort
+  rows = rows.map { |id, v, w| moved.include?(id) ? [id, present_v, w] : [id, v, w] }
+  stmt(out, "UPDATE t SET v = #{present_v} WHERE id = #{moved[0]} OR id = #{moved[1]}")
+  epair.call("v + 1 = #{present} after UPDATE moved ids #{moved.join(', ')} in", present,
+             flat.call(with_expr.call(present)))
+
+  victim = with_expr.call(present).first.first
+  rows = rows.reject { |id, _v, _w| id == victim }
+  stmt(out, "DELETE FROM t WHERE id = #{victim}")
+  epair.call("v + 1 = #{present} after DELETE removed id #{victim}", present,
+             flat.call(with_expr.call(present)))
+
+  out.join("\n") + "\n"
+end
+
 def gen_index(seed)
   rng = Random.new(seed)
   ids = (1..40).to_a.sample(12, random: rng).sort
@@ -1483,6 +1538,7 @@ SCENARIOS = {
   "correlated" => method(:gen_correlated),
   "index_nested_loop" => method(:gen_index_nested_loop),
   "index" => method(:gen_index),
+  "index_expr" => method(:gen_index_expr),
   "index_range" => method(:gen_index_range),
   "index_prefix" => method(:gen_index_prefix),
   "or_in" => method(:gen_or_in),

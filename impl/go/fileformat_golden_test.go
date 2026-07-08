@@ -118,6 +118,18 @@ func indexTableDB(t *testing.T) *Session {
 	return db
 }
 
+// exprIndexTableDB has an EXPRESSION index key (v26 — the per-index 0xFFFF sentinel + canonical
+// text, indexes.md §6): a plain column index t_email_idx beside the UNIQUE expression index
+// t_lower_idx over lower(email). The table is EMPTY (both index trees empty, root 0), so the
+// fixture isolates the v26 catalog change. Must match verify.rb's EXPR_INDEX_TABLE.
+func exprIndexTableDB(t *testing.T) *Session {
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, email text)")
+	run(t, db, "CREATE INDEX ON t (email)")
+	run(t, db, "CREATE UNIQUE INDEX ON t (lower(email))")
+	return db
+}
+
 // uniqueTableDB has UNIQUE indexes (v6 — the per-index flags byte, indexes.md §8):
 // t_v_key (a UNIQUE constraint's auto-name) over a nullable column holding two NULLs
 // (NULLS DISTINCT — both stored), the named two-column constraint wv, a CREATE UNIQUE
@@ -904,6 +916,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"check_table.jed", checkTableDB},
 		{"index_table.jed", indexTableDB},
 		{"unique_table.jed", uniqueTableDB},
+		{"expr_index_table.jed", exprIndexTableDB},
 		{"gin_array_table.jed", ginArrayTableDB},
 		{"gin_uuid_table.jed", ginUuidTableDB},
 		{"fk_table.jed", fkTableDB},
@@ -977,6 +990,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"check_table.jed", checkTableDB, "t"},
 		{"index_table.jed", indexTableDB, "t"},
 		{"unique_table.jed", uniqueTableDB, "t"},
+		{"expr_index_table.jed", exprIndexTableDB, "t"},
 		{"gin_array_table.jed", ginArrayTableDB, "t"},
 		{"gin_uuid_table.jed", ginUuidTableDB, "t"},
 		{"fk_table.jed", fkTableDB, "c"},

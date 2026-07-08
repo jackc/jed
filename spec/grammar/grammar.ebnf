@@ -234,9 +234,16 @@ drop_table     ::= "DROP" "TABLE" ("IF" "EXISTS")? identifier ("," identifier)*
  * named "using"; the unnamed-form lookahead (§30) extends to `ON <table> USING …`. An unknown
  * method is 42704 ("access method does not exist"); USING gin on a non-array column is 42704
  * (no GIN operator class), and on a non-integer-element array / as a multi-column / as UNIQUE
- * is 0A000 (deferred — gin.md §3). Narrowings this slice (each 0A000-free — simply not in the
- * grammar): no expression/ordered/partial keys (a key is a bare column name), no IF NOT EXISTS,
- * no NULLS NOT DISTINCT.
+ * is 0A000 (deferred — gin.md §3).
+ *   Each key element is a bare COLUMN, a bare FUNCTION CALL, or a parenthesized EXPRESSION
+ * (PostgreSQL's index_elem — indexes.md §1). A parenthesized bare column "(a)" normalizes to a
+ * column key; a general operator expression must be parenthesized ("(a + b)"; a bare "a + b" is a
+ * syntax error, as in PG). An expression key resolves against the table's columns (unknown column
+ * 42703) and must be immutable and indexable-typed: an aggregate is 42803, a window 42P20, a
+ * subquery 0A000, a bind parameter 42P02, a non-immutable seam function 42P17, a composite result
+ * 0A000 (indexes.md §2). Narrowings this slice (each 0A000-free — simply not in the grammar): no
+ * per-key ASC/DESC/NULLS or COLLATE, no partial (WHERE) keys, no IF NOT EXISTS, no NULLS NOT
+ * DISTINCT.
  *
  * DROP INDEX removes one index by name: 42704 if it does not exist, 42809 if the name is
  * a table ("is not an index"); symmetrically DROP TABLE of an index name is 42809 ("is
@@ -245,7 +252,10 @@ drop_table     ::= "DROP" "TABLE" ("IF" "EXISTS")? identifier ("," identifier)*
  * divergence — jed has no ALTER TABLE ... DROP CONSTRAINT, so the index name is the
  * constraint's only handle; indexes.md §8). */
 create_index   ::= "CREATE" "UNIQUE"? "INDEX" identifier? "ON" qualified_table
-                   using_clause? "(" identifier ("," identifier)* ")"
+                   using_clause? "(" index_element ("," index_element)* ")"
+index_element  ::= column_ref                    /* a bare column name */
+                 | function_call                 /* a bare function call, e.g. lower(email) */
+                 | "(" expr ")"                  /* any parenthesized expression; "(col)" normalizes to a column key */
 using_clause   ::= "USING" identifier
 drop_index     ::= "DROP" "INDEX" identifier
 

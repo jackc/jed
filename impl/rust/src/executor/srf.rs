@@ -780,10 +780,15 @@ impl Engine {
             for idx in &t.indexes {
                 meter.guard()?;
                 meter.charge(COSTS.generated_row);
+                // A column key shows its column name; an expression key its canonical text
+                // (introspection.md §5.1) — the same `columns text[]` cell.
                 let cols: Vec<Value> = idx
-                    .columns
+                    .keys
                     .iter()
-                    .map(|&ord| Value::Text(t.columns[ord].name.clone()))
+                    .map(|k| match k {
+                        IndexKey::Column(ord) => Value::Text(t.columns[*ord].name.clone()),
+                        IndexKey::Expr(e) => Value::Text(e.expr_text.clone()),
+                    })
                     .collect();
                 out.push(vec![
                     Value::Text(idx.name.clone()),
@@ -842,9 +847,12 @@ impl Engine {
                 meter.guard()?;
                 meter.charge(COSTS.generated_row);
                 let cols: Vec<String> = idx
-                    .columns
+                    .keys
                     .iter()
-                    .map(|&ord| t.columns[ord].name.clone())
+                    .map(|k| match k {
+                        IndexKey::Column(ord) => t.columns[*ord].name.clone(),
+                        IndexKey::Expr(e) => e.expr_text.clone(),
+                    })
                     .collect();
                 out.push(vec![
                     Value::Text(idx.name.clone()),

@@ -389,3 +389,232 @@ func checkReferencedColumns(e exprNode, columns []catColumn) []int {
 	walk(e)
 	return out
 }
+
+// indexExprHasSubquery reports whether an index-key expression contains a SUBQUERY
+// (spec/design/indexes.md §2): a scalar subquery, EXISTS, IN (subquery), or a quantified subquery.
+// A subquery reads other rows, so it is not a deterministic function of this row — 0A000 at CREATE
+// INDEX (PostgreSQL: "cannot use subquery in index expression"). Unlike an aggregate/window
+// (rejected by resolution), the resolver admits an uncorrelated subquery, so it is caught here.
+func indexExprHasSubquery(e exprNode) bool {
+	var walk func(e exprNode) bool
+	walk = func(e exprNode) bool {
+		switch e.Kind {
+		case exprScalarSubquery, exprExists, exprInSubquery, exprQuantifiedSubquery:
+			return true
+		case exprCast:
+			return walk(e.Cast.Inner)
+		case exprExtract:
+			return walk(e.Extract.Source)
+		case exprCollate:
+			return walk(e.Collate.Inner)
+		case exprUnary:
+			return walk(e.Unary.Operand)
+		case exprIsNull:
+			return walk(e.IsNullOf.Operand)
+		case exprIsJson:
+			return walk(e.IsJsonOf.Operand)
+		case exprJsonCtor:
+			return walk(e.JsonCtorOf.Operand)
+		case exprJsonExists:
+			return walk(e.JsonExists.Ctx) || walk(e.JsonExists.Path)
+		case exprJsonValue:
+			return walk(e.JsonValue.Ctx) || walk(e.JsonValue.Path)
+		case exprJsonQuery:
+			return walk(e.JsonQuery.Ctx) || walk(e.JsonQuery.Path)
+		case exprBinary:
+			return walk(e.Binary.Lhs) || walk(e.Binary.Rhs)
+		case exprIsDistinct:
+			return walk(e.IsDistinct.Lhs) || walk(e.IsDistinct.Rhs)
+		case exprLike:
+			return walk(e.Like.Lhs) || walk(e.Like.Rhs)
+		case exprRegex:
+			return walk(e.Regex.Lhs) || walk(e.Regex.Rhs)
+		case exprIn:
+			if walk(e.In.Lhs) {
+				return true
+			}
+			for _, elem := range e.In.List {
+				if walk(elem) {
+					return true
+				}
+			}
+			return false
+		case exprQuantified:
+			return walk(e.Quantified.Lhs) || walk(e.Quantified.Array)
+		case exprBetween:
+			return walk(e.Between.Lhs) || walk(e.Between.Lo) || walk(e.Between.Hi)
+		case exprCase:
+			if e.Case.Operand != nil && walk(*e.Case.Operand) {
+				return true
+			}
+			for _, w := range e.Case.Whens {
+				if walk(w.Cond) || walk(w.Result) {
+					return true
+				}
+			}
+			if e.Case.Els != nil && walk(*e.Case.Els) {
+				return true
+			}
+			return false
+		case exprFuncCall:
+			for _, a := range e.FuncCall.Args {
+				if walk(*a) {
+					return true
+				}
+			}
+			return false
+		case exprRow, exprArray:
+			for _, it := range e.RowItems {
+				if walk(it) {
+					return true
+				}
+			}
+			return false
+		case exprFieldAccess, exprFieldStar:
+			return walk(*e.Base)
+		case exprSubscript:
+			if walk(*e.Base) {
+				return true
+			}
+			for _, s := range e.Subscripts {
+				for _, x := range subscriptSpecExprs(s) {
+					if walk(*x) {
+						return true
+					}
+				}
+			}
+			return false
+		default:
+			return false
+		}
+	}
+	return walk(e)
+}
+
+// indexNamePart is the auto-name part for one index key element (spec/design/indexes.md §2, PG's
+// ChooseIndexColumnNames): a column key contributes its (lowercased) column name; a bare-function-
+// call expression its function name (`lower(email)` → `lower`); any other expression the literal
+// `expr`.
+func indexNamePart(elem indexKeyElem) string {
+	if elem.Expr == nil {
+		return strings.ToLower(elem.Column)
+	}
+	if elem.Expr.Kind == exprFuncCall {
+		return strings.ToLower(elem.Expr.FuncCall.Name)
+	}
+	return "expr"
+}
+
+// indexExprNonimmutableCall reports whether an index-key expression calls a non-immutable built-in
+// (spec/design/indexes.md §2): the entropy/clock seam (uuidv4/uuidv7/now/clock_timestamp —
+// current_timestamp desugars to now) or the sequence functions (nextval/currval/setval/lastval) /
+// current_setting. Such a function would let the index drift from the table, so it is 42P17 at
+// CREATE INDEX. The walk mirrors checkReferencedColumns (subqueries are already rejected by
+// resolution). The session-timezone hazard (an expression over timestamptz) is handled separately
+// by the caller, so this covers only calls.
+func indexExprNonimmutableCall(e exprNode) bool {
+	isNonimmutable := func(name string) bool {
+		switch strings.ToLower(name) {
+		case "uuidv4", "uuidv7", "now", "clock_timestamp",
+			"nextval", "currval", "setval", "lastval", "current_setting":
+			return true
+		}
+		return false
+	}
+	var walk func(e exprNode) bool
+	walk = func(e exprNode) bool {
+		switch e.Kind {
+		case exprFuncCall:
+			if isNonimmutable(e.FuncCall.Name) {
+				return true
+			}
+			for _, a := range e.FuncCall.Args {
+				if walk(*a) {
+					return true
+				}
+			}
+			return false
+		case exprCast:
+			return walk(e.Cast.Inner)
+		case exprExtract:
+			return walk(e.Extract.Source)
+		case exprCollate:
+			return walk(e.Collate.Inner)
+		case exprUnary:
+			return walk(e.Unary.Operand)
+		case exprIsNull:
+			return walk(e.IsNullOf.Operand)
+		case exprIsJson:
+			return walk(e.IsJsonOf.Operand)
+		case exprJsonCtor:
+			return walk(e.JsonCtorOf.Operand)
+		case exprJsonExists:
+			return walk(e.JsonExists.Ctx) || walk(e.JsonExists.Path)
+		case exprJsonValue:
+			return walk(e.JsonValue.Ctx) || walk(e.JsonValue.Path)
+		case exprJsonQuery:
+			return walk(e.JsonQuery.Ctx) || walk(e.JsonQuery.Path)
+		case exprBinary:
+			return walk(e.Binary.Lhs) || walk(e.Binary.Rhs)
+		case exprIsDistinct:
+			return walk(e.IsDistinct.Lhs) || walk(e.IsDistinct.Rhs)
+		case exprLike:
+			return walk(e.Like.Lhs) || walk(e.Like.Rhs)
+		case exprRegex:
+			return walk(e.Regex.Lhs) || walk(e.Regex.Rhs)
+		case exprIn:
+			if walk(e.In.Lhs) {
+				return true
+			}
+			for _, elem := range e.In.List {
+				if walk(elem) {
+					return true
+				}
+			}
+			return false
+		case exprBetween:
+			return walk(e.Between.Lhs) || walk(e.Between.Lo) || walk(e.Between.Hi)
+		case exprQuantified:
+			return walk(e.Quantified.Lhs) || walk(e.Quantified.Array)
+		case exprCase:
+			if e.Case.Operand != nil && walk(*e.Case.Operand) {
+				return true
+			}
+			for _, w := range e.Case.Whens {
+				if walk(w.Cond) || walk(w.Result) {
+					return true
+				}
+			}
+			if e.Case.Els != nil && walk(*e.Case.Els) {
+				return true
+			}
+			return false
+		case exprRow, exprArray:
+			for _, it := range e.RowItems {
+				if walk(it) {
+					return true
+				}
+			}
+			return false
+		case exprFieldAccess, exprFieldStar:
+			return walk(*e.Base)
+		case exprSubscript:
+			if walk(*e.Base) {
+				return true
+			}
+			for _, s := range e.Subscripts {
+				for _, x := range subscriptSpecExprs(s) {
+					if walk(*x) {
+						return true
+					}
+				}
+			}
+			return false
+		default:
+			// exprColumn / exprQualifiedColumn / exprLiteral / exprTypedLiteral / exprParam and the
+			// resolution-rejected subquery/star forms carry no non-immutable call.
+			return false
+		}
+	}
+	return walk(e)
+}

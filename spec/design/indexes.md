@@ -7,37 +7,62 @@
 > three cores implement in lockstep (CLAUDE.md §2); the grammar is in
 > [../grammar/grammar.ebnf](../grammar/grammar.ebnf) +
 > [grammar.md §30/§31](grammar.md), the byte layout in
-> [../fileformat/format.md](../fileformat/format.md) (`format_version` 6), the entry-key
-> encoding in [encoding.md](encoding.md), and the cost contract in [cost.md §3](cost.md).
+> [../fileformat/format.md](../fileformat/format.md) (`format_version` 6; **expression keys
+> `format_version` 26**, §6), the entry-key encoding in [encoding.md](encoding.md), and the
+> cost contract in [cost.md §3](cost.md).
 > PostgreSQL semantics were pinned against the live `postgres:18` oracle (CLAUDE.md §1).
 
 ## 1. Surface
 
 ```sql
-CREATE [UNIQUE] INDEX [name] ON table (col [, col ...])
+CREATE [UNIQUE] INDEX [name] ON table (key [, key ...])
 DROP INDEX name
 ```
+
+Each **key element** is one of three forms, matching PostgreSQL's `index_elem` (oracle-probed):
+
+- a **bare column** — `email`;
+- a **bare function call** — `lower(email)` (no extra parentheses needed);
+- a **parenthesized expression** — `(a + b)`, `(email || '@x')`.
+
+A general operator expression must be parenthesized (`CREATE INDEX ON t (a + b)` is a
+**syntax error**, as in PG; `(a + b)` is accepted). A parenthesized bare column `(a)`
+normalizes to a **column** key, not an expression (PG-matched). An index may **mix** the
+three forms in one key list (`CREATE INDEX ON t (lower(email), a, (b + 1))`).
 
 - **Non-unique by default.** Duplicate indexed values are expected and handled by the
   entry-key suffix (§3). The `UNIQUE` flag adds the §8 enforcement — the tree, the entry
   keys, the maintenance, and the planner treatment are otherwise identical.
-- **Plain column keys only.** Each key is a bare column name. Expression keys
-  (`(a + 1)`), per-key `ASC`/`DESC`/`NULLS`, partial (`WHERE`) indexes, `USING`,
-  `IF NOT EXISTS`, and `CONCURRENTLY` are not in the grammar this slice (all are
-  PostgreSQL features; each is a relaxable narrowing).
-- **A column may be listed more than once** (`CREATE INDEX i ON t (a, a)`) — PostgreSQL
+- **Column keys may be listed more than once** (`CREATE INDEX i ON t (a, a)`) — PostgreSQL
   allows it (oracle-probed), and rejecting it would be a gratuitous divergence. (Contrast
   the composite `PRIMARY KEY`, where PG itself rejects a duplicate member, 42701 —
-  [constraints.md §3](constraints.md).)
-- **Indexable types = key-encodable types**: the integer widths, `boolean`, `uuid`,
-  `timestamp`, `timestamptz` — exactly the types a `PRIMARY KEY` accepts today. A `text` /
-  `decimal` / `bytea` / `interval` / `float` key column is rejected `0A000` (the same documented
-  narrowing as for PK, lifted per type when its order-preserving key encoding is exercised —
-  [encoding.md §2.4–§2.6](encoding.md); `boolean`'s `bool-byte` key, §2.9, has since lifted).
-  **Unlike a PK member, an indexed column may be nullable** — this is the first exercise of the
-  encoding.md §2.2 presence tag (§3); for a nullable boolean index the slot is `00 00`/`00 01`
-  present, `01` NULL.
-- **Indexing the PK column is legal** (pointless but harmless, as in PG).
+  [constraints.md §3](constraints.md).) Expression keys are likewise unconstrained by
+  duplication.
+- **Indexable types = key-encodable types.** A column key's type — or an **expression
+  key's *result* type** — must be a key-encodable scalar or keyable array: every scalar is
+  keyable today (the integer widths, `boolean`, `uuid`, `timestamp`, `timestamptz`, `text`,
+  `decimal`, `bytea`, `interval`, `float`, `json`-family excluded — [encoding.md §2](encoding.md)),
+  so the lone rejection is a **composite** result type — **`0A000`** (the same narrowing a
+  composite `PRIMARY KEY` / column key carries). This is why an expression producing `text`
+  (`lower(email)`) is a valid key: `text` keys landed ([encoding.md §2.4](encoding.md)).
+  **An indexed column or expression may be nullable** — the slot carries the encoding.md §2.2
+  presence tag (§3); NULL sorts after every present value (ascending).
+- **Indexing the PK column (or a constant-over-it expression) is legal** (pointless but
+  harmless, as in PG).
+- **Expression keys must be immutable and self-contained.** An index expression may
+  reference **only the table's own columns**, and must be a pure, deterministic function of
+  them — the same purity the built-in surface guarantees (CLAUDE.md §13). At `CREATE INDEX`
+  the expression is resolved and rejected if it (§2): calls a non-immutable function (the
+  entropy/clock seam `uuidv4`/`uuidv7`/`now`/`current_timestamp`/`clock_timestamp` — **`42P17`**),
+  contains an **aggregate** (`42803`), a **window function** (`42P20`), a **subquery**
+  (`0A000`), or a **bind parameter** `$N` (`42P02`). An immutable expression is a
+  deterministic function of the row, so the index stays consistent with the table under the
+  §8/§10 contract.
+- **Still deferred** (each a relaxable narrowing, PostgreSQL features): per-key
+  `ASC`/`DESC`/`NULLS`, partial (`WHERE`) indexes, `IF NOT EXISTS`, `CONCURRENTLY`, and an
+  explicit operator class / `COLLATE` on a key element. An expression key's text result uses
+  the expression's own effective collation (jed's ordinary text-collation resolution), not a
+  per-key `COLLATE`.
 
 ## 2. DDL semantics (PG-matched, oracle-probed)
 
@@ -53,19 +78,37 @@ code — [../errors/registry.toml](../errors/registry.toml)).
 
 1. The table must exist — **42P01** (`CREATE INDEX i ON nosuch (nope)` reports the
    table, not the column).
-2. Each key column, in **list order**: it must exist in the table — **42703** — and be of
-   an indexable type — **0A000**. (Column validation precedes the name-collision check:
-   PG reports 42703 for `CREATE INDEX dup_name ON t (nope)`.)
+2. Each key element, in **list order**:
+   - a **column key** must exist in the table — **42703** — and be of an indexable type —
+     **0A000**. (Column validation precedes the name-collision check: PG reports 42703 for
+     `CREATE INDEX dup_name ON t (nope)`.)
+   - an **expression key** is resolved against the table's columns (an unknown column →
+     **42703**), then checked for validity in this order: an **aggregate** → **42803**, a
+     **window function** → **42P20**, a **subquery** → **0A000**, a **bind parameter** `$N`
+     → **42P02**, a **non-immutable** function call (the entropy/clock seam) → **42P17**
+     (`invalid_object_definition`, *functions in index expression must be marked IMMUTABLE*).
+     Finally its **result type** must be indexable — **0A000** for a composite result.
+     (Aggregate/window/subquery/param rejections ride the ordinary resolver, exactly as a
+     `CHECK` expression does; the immutability walk is index-specific.)
 3. The **explicit name**, if any, is checked against the relation namespace — **42P07**.
 4. An **omitted name** is derived (below) — derivation always finds a free name, so it
    cannot collide.
 
-**Auto-naming** (PostgreSQL's `ChooseIndexName`, probed): the base is the **lowercased**
-`<table>_<col>_<col>..._idx` — every listed column name in list order (duplicates
-included), joined with `_`. If the base is taken (case-insensitive), try `<base>1`,
-`<base>2`, … and take the smallest free suffix: `t_a_idx`, `t_a_idx1`, `t_a_idx2`.
-An explicit name is stored **as written** (original case round-trips; comparisons are
-case-insensitive) — same rule as table and CHECK-constraint names.
+**Auto-naming** (PostgreSQL's `ChooseIndexName` / `ChooseIndexColumnNames`, probed): the
+base is the **lowercased** `<table>_<part>_<part>..._idx` — one **name part** per key
+element in list order, joined with `_`, where the part is:
+
+- a **column key** → the **column name** (`lower(email), a` → parts `lower`, `a`);
+- a **bare-function-call** expression → the **function name** (`lower(email)` → `lower`,
+  `abs(a)` → `abs`);
+- any **other expression** → the literal `expr` (`(a + b)` → `expr`, `(email || 'x')` →
+  `expr`).
+
+If the base is taken (case-insensitive), try `<base>1`, `<base>2`, … and take the smallest
+free suffix — so `CREATE INDEX ON t (lower(email))` then `CREATE UNIQUE INDEX ON t (lower(email))`
+yield `t_lower_idx`, `t_lower_idx1` (probed). An explicit name is stored **as written**
+(original case round-trips; comparisons are case-insensitive) — same rule as table and
+CHECK-constraint names.
 
 **`CREATE UNIQUE INDEX`** validates identically; its auto-name keeps the `_idx` suffix
 (the `_key` spelling belongs to the `UNIQUE` *constraint* — constraints.md §5.3). Before
@@ -87,15 +130,19 @@ An index is a B-tree of **entries** whose byte-ordered keys realize the index or
 entry carries **no payload** (its record is the key alone — format.md). The entry key is:
 
 ```
-entry_key = nullable-slot(col_1) ‖ nullable-slot(col_2) ‖ … ‖ row_storage_key
+entry_key = nullable-slot(key_1) ‖ nullable-slot(key_2) ‖ … ‖ row_storage_key
 ```
 
-- Each indexed column value is encoded as the **encoding.md §2.2 nullable slot**: a
-  1-byte presence tag (`0x00` present ‖ the type's order-preserving key bytes, `0x01`
-  NULL) — **always**, even for a NOT NULL column (one uniform rule; a column's
-  nullability never changes the byte layout). This is the first place §2.2 is exercised
-  in stored bytes: NULL sorts **after** every present value (ascending), the PostgreSQL
-  model.
+- Each key element's **value** for a row is its indexed column's value (a column key) or
+  the **result of evaluating the key expression against the row** (an expression key —
+  §4). That value is encoded as the **encoding.md §2.2 nullable slot**: a 1-byte presence
+  tag (`0x00` present ‖ the type's order-preserving key bytes, `0x01` NULL) — **always**,
+  even for a NOT NULL column or a NOT-NULL-typed expression (one uniform rule; nullability
+  never changes the byte layout). This is the first place §2.2 is exercised in stored
+  bytes: NULL sorts **after** every present value (ascending), the PostgreSQL model. An
+  expression key encodes under the **expression's resolved result type and collation**
+  (e.g. `lower(email)` → the `text` order-preserving key under the expression's effective
+  collation).
 - The **row's storage key** (the encoded PK, or the synthetic-rowid key of a no-PK
   table) is appended as the **suffix**. It makes every entry key unique (a non-unique
   index needs no duplicate handling in the tree), defines a deterministic order among
@@ -109,9 +156,15 @@ Composition and `memcmp` order follow [encoding.md §2.3](encoding.md) unchanged
 ## 4. Maintenance (every write path, phase 2)
 
 Indexes are maintained **inside the same statement** that mutates the table, in the
-write phase of the existing two-phase / all-or-nothing model — validation (coercion, NOT
-NULL, CHECK, duplicate-key) only *reads* an index (the §8 uniqueness probes), never
-writes one, and an index write cannot fail, so atomicity is unchanged:
+write phase of the existing two-phase / all-or-nothing model. The **entry keys are
+computed in phase 1** (validation, alongside coercion / NOT NULL / CHECK / duplicate-key)
+and the tree edits applied in phase 2. For a **plain column index** this is a bookkeeping
+detail; for an **expression index** it is load-bearing: evaluating a key expression *can
+fail* (overflow `22003`, division by zero `22012`, a domain error), and computing every
+row's entry keys in phase 1 means such a failure aborts the statement **before any write**,
+so all-or-nothing atomicity is preserved exactly as for CHECK. Because an index expression
+is immutable (a deterministic function of the row, §1), a key that computed successfully in
+phase 1 recomputes identically, so phase 2's tree edits still cannot fail:
 
 - **INSERT** (both forms): after a row is stored, insert its entry into every index of
   the table.
@@ -124,7 +177,9 @@ writes one, and an index write cannot fail, so atomicity is unchanged:
   (CLAUDE.md §8). The row's storage key cannot change (the PK-assignment narrowing,
   CLAUDE.md §11 step 6), so the suffix is stable.
 - **CREATE INDEX on a non-empty table** builds the index by scanning the table once in
-  key order (cost: §5), then inserting the computed entries **sorted by entry key** —
+  key order (cost: §5), **evaluating each expression key per row** (a failure aborts the
+  build before the index is registered — nothing is created, matching PG), then inserting
+  the computed entries **sorted by entry key** —
   ascending inserts take the B+tree's right-edge append split every time
   (spec/fileformat/format.md "Split point"), so the built tree packs leaves ~full instead
   of the few-percent fill that storage-key-order (random in entry-key space) insertion
@@ -132,11 +187,21 @@ writes one, and an index write cannot fail, so atomicity is unchanged:
   and therefore the committed pages, across cores (CLAUDE.md §8).
 
 Maintenance work is **unmetered** (like sort and the commit itself — cost.md §3 "What is
-NOT metered"); the *scan* side of CREATE INDEX is metered.
+NOT metered"); the *scan* side of CREATE INDEX is metered. **Expression-key evaluation is
+part of that unmetered maintenance work** — an INSERT/UPDATE/DELETE into an
+expression-indexed table accrues exactly the cost of the same statement into a
+plain-indexed one (the eval runs against an unmetered meter). The one place expression keys
+touch metered cost is the **CREATE INDEX build scan**: its touched-column set is the
+columns the expressions *reference* (not the fixed-width indexed columns of a plain index),
+so if a referenced value is a spilled/compressed large value the build charges its
+`value_decompress` slabs (large-values.md §14) — deterministic and cross-core identical.
 
-Indexed column values are always resident when maintenance reads them: the indexable
-types are fixed-width and never spill or compress (large-values.md), so maintenance
-cannot fault an `Unfetched` reference.
+A **plain** column index reads only fixed-width, never-spilling indexable columns, so its
+maintenance cannot fault. An **expression** index may reference a variable-width column
+(`lower(bigtext)`) whose value spilled to an overflow chain; evaluating the expression
+faults it in on demand through the ordinary evaluator backstop (the lazy-record
+`Unfetched` resolution), so maintenance transparently materializes what a key expression
+reads.
 
 ## 5. The planner: index-bounded scans (SELECT)
 
@@ -159,20 +224,28 @@ base table, or a correlated subquery's inner table), the plan picks, in order:
 
 #### 5.1 The access predicate — equality prefix + optional trailing range
 
-A B-tree keyed on `(c₁, c₂, …, c_k)` can seek any predicate of the form "an equality on
-a *prefix* of the key columns, then at most one *range* on the next column" — the
-classic B-tree **access predicate**. The plan builds it by walking the index's key
-columns **in key order** against the WHERE AND-chain (indexes.md §5's `const-source`
-rule per column, an `=`/`<`/`<=`/`>`/`>=` conjunct with the column on either side,
-`BETWEEN` desugared):
+A B-tree keyed on `(k₁, k₂, …, k_k)` — each `kᵢ` a **column or an expression** — can seek
+any predicate of the form "an equality on a *prefix* of the key elements, then at most one
+*range* on the next element" — the classic B-tree **access predicate**. The plan builds it
+by walking the index's key elements **in key order** against the WHERE AND-chain
+(indexes.md §5's `const-source` rule per element, an `=`/`<`/`<=`/`>`/`>=` conjunct with the
+key operand on either side, `BETWEEN` desugared):
 
-- While column `cᵢ` has an **equality** conjunct `cᵢ = const-source`, consume it into the
-  **equality prefix** and advance. (Several equalities on one column must agree at exec
-  time; a co-present range on a prefix column stays purely residual.)
-- At the first column `c_{p}` with **no** equality but **one or more range** conjuncts
-  (`<`/`<=`/`>`/`>=`), take those as the **range** and **stop** (no key column past a
+- **Matching a key element to a conjunct operand.** For a **column** key, the operand must
+  be a reference to that column (as today). For an **expression** key, the operand must be
+  **structurally equal** to the index's resolved key expression — the same operator/function
+  tree over the same table columns and constants (so `WHERE lower(email) = $1` matches an
+  index on `lower(email)`, but `WHERE upper(email) = …` or a re-associated `b + a` against
+  `a + b` does not — this is PostgreSQL's syntactic index-expression matching, not a
+  semantic prover). The comparison is on the **resolved** expression tree, so bind-param /
+  correlated `const-source` operands on the *other* side are gated by the ordinary rule.
+- While element `kᵢ` has an **equality** conjunct `kᵢ = const-source`, consume it into the
+  **equality prefix** and advance. (Several equalities on one element must agree at exec
+  time; a co-present range on a prefix element stays purely residual.)
+- At the first element `k_{p}` with **no** equality but **one or more range** conjuncts
+  (`<`/`<=`/`>`/`>=`), take those as the **range** and **stop** (no key element past a
   range can be seeked).
-- Stop at the first column with no usable term.
+- Stop at the first element with no usable term.
 
 The bound is used iff it is **non-empty** — at least one leading equality, or a leading
 range. The chosen index is the lowest-lowercased-name index that produces one.
@@ -214,21 +287,22 @@ PK pushdown but do **not** use indexes, and the **LIMIT streaming short-circuit 
 combine** with an index bound (an index-bounded scan with LIMIT takes the eager path —
 its cost reads the full admitted set).
 
-An index is **eligible for the bound only when every key column from the range column
-onward** — i.e. all columns **after the equality prefix** — is a **fixed-width scalar**.
-The suffix-skip above recovers the row's storage key by advancing over each such
-component by its type's *fixed* width, which a **non-scalar** (range/array/composite) or
-a **variable-width scalar** (`text` / `decimal` / `bytea` / `interval`) does not have.
-The **equality-prefix columns may be any width** (including collated `text`) — their
-slots are matched as the known encoded prefix `P`, skipped by `len(P)`, never by width;
-so a multi-column index whose leading columns are variable-width is now usable **when the
-WHERE pins them by equality** (`a = 'x' AND b > 3` over `(a text, b i32)` seeks; a bare
-`b > 3` there does not, because `a`'s slot is then unknown and variable-width). An index
-whose range column or a trailing unbounded column is variable-width is **not used for the
-bound**: the query takes the full scan + residual filter (rows identical, only the cost
-differs — `query/index_scan_vartail.test` pins this the cost way). Lifting the
-fixed-width tail requirement is a follow-on: skip a variable-width component by its
-self-delimiting length, not a fixed width.
+An index is **eligible for the bound only when every key element from the range element
+onward** — i.e. all elements **after the equality prefix** — has a **fixed-width scalar**
+type (a column key's column type, or an expression key's *result* type). The suffix-skip
+above recovers the row's storage key by advancing over each such component by its type's
+*fixed* width, which a **non-scalar** (range/array/composite) or a **variable-width scalar**
+(`text` / `decimal` / `bytea` / `interval`) does not have. The **equality-prefix elements
+may be any width** (including collated `text`, and an expression producing `text` such as
+`lower(email)`) — their slots are matched as the known encoded prefix `P`, skipped by
+`len(P)`, never by width; so an index whose leading elements are variable-width is usable
+**when the WHERE pins them by equality** (`lower(email) = 'x' AND b > 3` over
+`(lower(email), b i32)` seeks; a bare `b > 3` there does not, because the leading slot is
+then unknown and variable-width). An index whose range element or a trailing unbounded
+element is variable-width is **not used for the bound**: the query takes the full scan +
+residual filter (rows identical, only the cost differs). Lifting the fixed-width tail
+requirement is a follow-on: skip a variable-width component by its self-delimiting length,
+not a fixed width.
 
 ### Cost (the cross-core contract — cost.md §3)
 
@@ -248,7 +322,7 @@ the table's node count + `storage_row_read` per row (its touched set — the ind
 columns — is fixed-width, so the chain/decompress terms are structurally zero); an empty
 table charges 0. `DROP INDEX` charges 0.
 
-## 6. Persistence (`format_version` 6)
+## 6. Persistence (`format_version` 6, expression keys `format_version` 26)
 
 The catalog reshape (v5) + the unique flag (v6)
 ([../fileformat/format.md](../fileformat/format.md)):
@@ -258,12 +332,22 @@ The catalog reshape (v5) + the unique flag (v6)
   and **lifts the composite-PK order narrowing**: `PRIMARY KEY (b, a)` is now legal —
   list order is key order, persisted independently of declaration order
   ([constraints.md §3](constraints.md)).
-- The table entry gains its **index list**: per index, the name (original case) +
-  column ordinals (key order, duplicates allowed) + a **flags byte** (`bit0 unique` —
+- The table entry gains its **index list**: per index, the name (original case) + a
+  **key-element list** (key order, duplicates allowed) + a **flags byte** (`bit0 unique` —
   added in v6; the remaining bits are reserved, written 0 and read-validated) + the
   index tree's **root page**. Indexes are stored and held in **ascending
   lowercased-name order** (the catalog's deterministic order, like checks; also the §5
   tie-break order and the §8 violation-report order).
+- **Each key element** is a `u16`: a **column ordinal** (`< col_count`) for a column key,
+  or the sentinel **`0xFFFF`** — which cannot be a valid ordinal (`col_count ≤ 65535` ⇒
+  max ordinal `65534`) — for an **expression key** (**new in `format_version` 26**),
+  followed by a `u16 expr_len` and `expr_len` UTF-8 bytes of the expression's **canonical
+  text** (the *Check-expression text* form format.md defines, exactly as a `CHECK` / column
+  `DEFAULT` stores). On load an expression element re-parses that text with the ordinary
+  expression parser (`XX001` if it fails, like a stored CHECK); its result type and
+  collation are re-derived by resolving it against the loaded table's columns per statement
+  (never persisted — a deterministic function of column types that are themselves
+  cross-core-identical). A plain column index's on-disk bytes are unchanged from v6.
 - Each index is an ordinary on-disk **B-tree of empty-payload records** — the same
   leaf/interior pages, split/merge rules, copy-on-write incremental commit, free-list
   reclamation, and demand-paged open as a table tree. A record is `key_len ‖ key` with
@@ -272,8 +356,12 @@ The catalog reshape (v5) + the unique flag (v6)
 ## 7. Divergences from PostgreSQL (documented per CLAUDE.md §1)
 
 - **No system catalog surface**: PG exposes indexes via `pg_indexes`; jed has no catalog
-  tables (auto-chosen names are observable via `DROP INDEX` / collision errors, and via
-  the host API's catalog in per-core tests).
+  tables (auto-chosen names are observable via `DROP INDEX` / collision errors, via the
+  `jed_indexes` introspection relation — an expression key shows as its canonical text in
+  the `columns` array — and via the host API's catalog in per-core tests).
+- **Expression-index matching is syntactic** (as in PG): the planner uses an expression
+  index only when a WHERE operand is structurally equal to the key expression, not
+  whenever they are semantically equivalent (`b + a` does not match an index on `a + b`).
 - PG's index machinery (btree opclasses, `USING`, collations, opfamilies) is owned
   surface jed does not implement — we own our surface (CLAUDE.md §1).
 - Error **messages** differ in jed's house style (no identifier quoting); codes match.
@@ -294,9 +382,13 @@ The catalog reshape (v5) + the unique flag (v6)
 ## 8. UNIQUE indexes (the enforcement)
 
 A **unique** index (`unique = true` in the catalog — set by `CREATE UNIQUE INDEX` or by a
-`UNIQUE` constraint, constraints.md §5) forbids two rows from sharing its **key-column
-value tuple**. Everything else about it — entry keys (§3), maintenance (§4), planner
-treatment (§5), persistence (§6) — is exactly a plain index's. Enforcement:
+`UNIQUE` constraint, constraints.md §5) forbids two rows from sharing its **key value
+tuple** — a tuple of column values and/or **evaluated expression values** (`CREATE UNIQUE
+INDEX ON t (lower(email))` forbids two rows with the same `lower(email)`, the canonical
+case-insensitive-unique idiom). Everything else about it — entry keys (§3), maintenance
+(§4), planner treatment (§5), persistence (§6) — is exactly a plain index's; the
+uniqueness *probe key* is the entry-key prefix built the same way, so an expression key's
+value enters the probe exactly like a column value. Enforcement:
 
 - **The rule (*NULLS DISTINCT* — PostgreSQL's default).** Two rows conflict iff their
   indexed tuples are equal **and every component is non-NULL**. A tuple with *any* NULL

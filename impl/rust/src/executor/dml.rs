@@ -497,18 +497,42 @@ impl Engine {
             .table_scoped(db_scope, table)
             .map(|t| (t.name.clone(), t.indexes.clone()))
             .unwrap_or_else(|| (table.to_string(), Vec::new()));
+        // Resolve the table's indexes once for this statement (column ordinals + resolved
+        // expression keys — spec/design/indexes.md §4), parallel to `indexes`. An expression key
+        // is evaluated per row (unmetered) to build its entry; done in phase 1 (below) so a failing
+        // expression aborts before any write (all-or-nothing).
+        let rindexes: Vec<ResolvedIndex> = match self.table_scoped(db_scope, table) {
+            Some(t) => self.resolve_table_indexes(t)?,
+            None => Vec::new(),
+        };
         // The columns' resolved `ColType`s, for composite-aware store coercion (composite.md §4).
         let col_types: Vec<ColType> = self.store_scoped(db_scope, table).col_types().to_vec();
         // Per-column frozen collations for the collated text key form (§2.12), resolved once before
         // any mutation; `None` everywhere for a C-only / non-text table (the fast path).
         let colls = self.column_collations(columns);
         let mut prepared: Vec<(Option<Vec<u8>>, Row)> = Vec::with_capacity(rows.len());
+        // Per prepared row, the secondary-index entry keys WITHOUT the storage-key suffix — one
+        // sub-vec per index (rindexes order), computed with the eval env in phase 1 (so expression
+        // eval errors abort before any write). Phase 2 appends the row's final storage key (the
+        // rowid, allocated there) to each — `entry = prefix ‖ key` is byte-identical to building it
+        // with the key directly (the suffix is always the tail — indexes.md §3).
+        let mut entry_prefixes: Vec<Vec<Vec<Vec<u8>>>> = Vec::with_capacity(rows.len());
         let mut seen_keys: HashSet<Vec<u8>> = HashSet::new();
         // Per UNIQUE index (catalog/name order), the prefixes earlier rows of this batch
         // claimed — an in-batch duplicate traps 23505 like a stored one (indexes.md §8).
-        let uniq_defs: Vec<&IndexDef> = indexes.iter().filter(|d| d.unique).collect();
-        let mut seen_prefixes: Vec<HashSet<Vec<u8>>> = vec![HashSet::new(); uniq_defs.len()];
+        let uniq: Vec<&ResolvedIndex> = rindexes.iter().filter(|d| d.unique).collect();
+        let mut seen_prefixes: Vec<HashSet<Vec<u8>>> = vec![HashSet::new(); uniq.len()];
         let mut cunits: i64 = 0;
+        // The eval env for phase-1 index-expression / CHECK evaluation (index eval is unmetered;
+        // params/CTEs are empty — an index expression cannot reference them). Scoped so its `&self`
+        // borrow is released before phase 2's `&mut self` writes.
+        let env = EvalEnv {
+            exec: self,
+            params: &[],
+            outer: &[],
+            rng,
+            ctes: CteCtx::empty(),
+        };
         for values in &rows {
             let mut row = Vec::with_capacity(n);
             for (i, col) in columns.iter().enumerate() {
@@ -538,13 +562,6 @@ impl Engine {
             // per-statement `rng` is shared with the default evaluation above (one `StmtRng`).
             if !checks.is_empty() {
                 meter.guard()?;
-                let env = EvalEnv {
-                    exec: self,
-                    params: &[],
-                    outer: &[],
-                    rng,
-                    ctes: CteCtx::empty(),
-                };
                 for (name, rexpr) in checks {
                     if matches!(rexpr.eval(&row, &env, meter)?, Value::Bool(false)) {
                         return Err(EngineError::new(
@@ -584,11 +601,11 @@ impl Engine {
             // in catalog (name) order, a fully-non-NULL key tuple (its slot prefix) must
             // match no existing entry and no earlier row of this batch. Unmetered
             // validation, like the PK duplicate check (cost.md §3).
-            for (u, def) in uniq_defs.iter().enumerate() {
-                let Some(prefix) = index_prefix_key(columns, &colls, def, &row)? else {
+            for (u, rindex) in uniq.iter().enumerate() {
+                let Some(prefix) = index_prefix_key(columns, &colls, rindex, &row, &env)? else {
                     continue;
                 };
-                let istore = self.index_store_scoped(db_scope, &def.name.to_ascii_lowercase());
+                let istore = self.index_store_scoped(db_scope, &rindex.name.to_ascii_lowercase());
                 let stored = !istore
                     .range_entries(&unique_probe_bound(&prefix))?
                     .is_empty();
@@ -597,7 +614,7 @@ impl Engine {
                         SqlState::UniqueViolation,
                         format!(
                             "duplicate key value violates unique constraint: {}",
-                            def.name
+                            rindex.name
                         ),
                     ));
                 }
@@ -611,6 +628,14 @@ impl Engine {
                 let kb: &[u8] = key.as_deref().unwrap_or(&placeholder);
                 cunits += store.write_compress_units(kb, &row) as i64;
             }
+            // Compute this row's per-index entry keys WITHOUT the suffix (phase 1 — evaluates every
+            // expression key, so an eval error aborts here before any write; unmetered). Phase 2
+            // appends the final storage key.
+            let mut row_prefixes: Vec<Vec<Vec<u8>>> = Vec::with_capacity(rindexes.len());
+            for rindex in &rindexes {
+                row_prefixes.push(index_entry_keys(columns, &colls, rindex, &[], &row, &env)?);
+            }
+            entry_prefixes.push(row_prefixes);
             prepared.push((key, row));
         }
 
@@ -737,10 +762,16 @@ impl Engine {
         // all-or-nothing is unchanged).
         let store = self.store_mut_scoped(db_scope, table);
         let mut index_inserts: Vec<Vec<Vec<u8>>> = vec![Vec::new(); indexes.len()];
-        for (key, row) in prepared {
+        for (ri, (key, row)) in prepared.into_iter().enumerate() {
             let key = key.unwrap_or_else(|| encode_int(ScalarType::Int64, store.alloc_rowid()));
-            for (k, def) in indexes.iter().enumerate() {
-                index_inserts[k].extend(index_entry_keys(columns, &colls, def, &key, &row)?);
+            // Append the final storage key to each phase-1 entry prefix (byte-identical to
+            // building the entry with the key directly — indexes.md §3/§4).
+            for (k, prefixes) in entry_prefixes[ri].iter().enumerate() {
+                for p in prefixes {
+                    let mut ek = p.clone();
+                    ek.extend_from_slice(&key);
+                    index_inserts[k].push(ek);
+                }
             }
             if !store.insert(key, row)? {
                 // A collision here can only happen under the writable-CTE read pin
@@ -953,6 +984,13 @@ impl Engine {
             .table(table)
             .map(|t| (t.name.clone(), t.indexes.clone()))
             .unwrap_or_else(|| (table.to_string(), Vec::new()));
+        // Resolve the indexes once (column ordinals + resolved expression keys — indexes.md §4),
+        // parallel to `indexes`; every uniqueness probe / entry build below evaluates any
+        // expression key through it (unmetered, via the `self.index_prefix`/`index_entries` helpers).
+        let rindexes: Vec<ResolvedIndex> = match self.table(table) {
+            Some(t) => self.resolve_table_indexes(t)?,
+            None => Vec::new(),
+        };
         let col_types: Vec<ColType> = self.store(table).col_types().to_vec();
         // Per-column frozen collations for the collated text key form (§2.12), resolved before any
         // mutation; `None` everywhere for a C-only / non-text table (the fast path).
@@ -1002,11 +1040,12 @@ impl Engine {
                         .then(|| encode_pk_key(pk, &colls, &row))
                         .transpose()?;
                     let committed =
-                        self.row_conflicts_committed(table, columns, &colls, pk, &indexes, &row)?;
+                        self.row_conflicts_committed(table, columns, &colls, pk, &rindexes, &row)?;
                     let mut in_batch = pkk.as_ref().is_some_and(|k| ins_pk.contains(k));
                     for (u, &ix) in uniq_idx.iter().enumerate() {
                         if !in_batch
-                            && let Some(p) = index_prefix_key(columns, &colls, &indexes[ix], &row)?
+                            && let Some(p) =
+                                self.index_prefix(columns, &colls, &rindexes[ix], &row)?
                         {
                             in_batch = ins_prefixes[u].contains(&p);
                         }
@@ -1018,7 +1057,7 @@ impl Engine {
                         ins_pk.insert(k);
                     }
                     for (u, &ix) in uniq_idx.iter().enumerate() {
-                        if let Some(p) = index_prefix_key(columns, &colls, &indexes[ix], &row)? {
+                        if let Some(p) = self.index_prefix(columns, &colls, &rindexes[ix], &row)? {
                             ins_prefixes[u].insert(p);
                         }
                     }
@@ -1026,7 +1065,9 @@ impl Engine {
                 }
                 // Arbiter present (DO UPDATE always; DO NOTHING with a target).
                 Some(arb) => {
-                    let Some(ak) = arbiter_key(arb, pk, &colls, columns, &indexes, &row)? else {
+                    let Some(ak) =
+                        self.arbiter_probe_key(arb, pk, &colls, columns, &rindexes, &row)?
+                    else {
                         // A NULL-bearing arbiter key never conflicts (NULLS DISTINCT) — plain insert.
                         inserts.push(row);
                         continue;
@@ -1112,11 +1153,11 @@ impl Engine {
         if !uniq_idx.is_empty() && (!inserts.is_empty() || !updates.is_empty()) {
             let rewritten: HashSet<&[u8]> = updates.iter().map(|(k, _, _)| k.as_slice()).collect();
             for &ix in &uniq_idx {
-                let def = &indexes[ix];
-                let istore = self.index_store(&def.name.to_ascii_lowercase());
+                let rindex = &rindexes[ix];
+                let istore = self.index_store(&rindex.name.to_ascii_lowercase());
                 let mut batch: HashSet<Vec<u8>> = HashSet::new();
                 for new_row in updates.iter().map(|(_, nr, _)| nr).chain(inserts.iter()) {
-                    let Some(prefix) = index_prefix_key(columns, &colls, def, new_row)? else {
+                    let Some(prefix) = self.index_prefix(columns, &colls, rindex, new_row)? else {
                         continue;
                     };
                     let conflict = !batch.insert(prefix.clone())
@@ -1129,7 +1170,7 @@ impl Engine {
                             SqlState::UniqueViolation,
                             format!(
                                 "duplicate key value violates unique constraint: {}",
-                                def.name
+                                rindex.name
                             ),
                         ));
                     }
@@ -1292,30 +1333,24 @@ impl Engine {
 
         let affected = (inserts.len() + updates.len()) as i64;
 
-        // Phase 2 — every row validated. Insert the new rows (rowid alloc for a no-PK table,
-        // index entries added), then replace the updated rows (index entries moved).
-        let store = self.store_mut(table);
-        let mut index_adds: Vec<Vec<Vec<u8>>> = vec![Vec::new(); indexes.len()];
-        for row in inserts {
-            let key = if pk.is_empty() {
-                encode_int(ScalarType::Int64, store.alloc_rowid())
-            } else {
-                encode_pk_key(pk, &colls, &row)?
-            };
-            for (k, def) in indexes.iter().enumerate() {
-                index_adds[k].extend(index_entry_keys(columns, &colls, def, &key, &row)?);
+        // Precompute all secondary-index entries in a `&self` pass BEFORE the `&mut` writes
+        // (evaluating every expression key — an error aborts before any write): each inserted
+        // row's entry PREFIXES (empty suffix; phase 2 appends its storage key — the rowid is
+        // allocated there) and each updated row's old/new entry sets (keys already known).
+        let mut insert_prefixes: Vec<Vec<Vec<Vec<u8>>>> = Vec::with_capacity(inserts.len());
+        for row in &inserts {
+            let mut rp = Vec::with_capacity(rindexes.len());
+            for rindex in &rindexes {
+                rp.push(self.index_entries(columns, &colls, rindex, &[], row)?);
             }
-            assert!(
-                store.insert(key, row)?,
-                "pre-validated INSERT key must be unique"
-            );
+            insert_prefixes.push(rp);
         }
         let mut index_moves: Vec<Vec<(Vec<Vec<u8>>, Vec<Vec<u8>>)>> =
             vec![Vec::new(); indexes.len()];
         for (key, new_row, old_row) in &updates {
-            for (k, def) in indexes.iter().enumerate() {
-                let old_eks = index_entry_keys(columns, &colls, def, key, old_row)?;
-                let new_eks = index_entry_keys(columns, &colls, def, key, new_row)?;
+            for (k, rindex) in rindexes.iter().enumerate() {
+                let old_eks = self.index_entries(columns, &colls, rindex, key, old_row)?;
+                let new_eks = self.index_entries(columns, &colls, rindex, key, new_row)?;
                 let removals: Vec<Vec<u8>> = old_eks
                     .iter()
                     .filter(|e| !new_eks.contains(*e))
@@ -1331,7 +1366,29 @@ impl Engine {
                 }
             }
         }
+        // Phase 2 — every row validated. Insert the new rows (rowid alloc for a no-PK table;
+        // append each row's storage key to its precomputed entry prefixes), then replace the
+        // updated rows (index entries moved).
         let store = self.store_mut(table);
+        let mut index_adds: Vec<Vec<Vec<u8>>> = vec![Vec::new(); indexes.len()];
+        for (ri, row) in inserts.into_iter().enumerate() {
+            let key = if pk.is_empty() {
+                encode_int(ScalarType::Int64, store.alloc_rowid())
+            } else {
+                encode_pk_key(pk, &colls, &row)?
+            };
+            for (k, prefixes) in insert_prefixes[ri].iter().enumerate() {
+                for p in prefixes {
+                    let mut ek = p.clone();
+                    ek.extend_from_slice(&key);
+                    index_adds[k].push(ek);
+                }
+            }
+            assert!(
+                store.insert(key, row)?,
+                "pre-validated INSERT key must be unique"
+            );
+        }
         for (key, new_row, _) in updates {
             store.replace(&key, new_row)?;
         }
@@ -1400,7 +1457,7 @@ impl Engine {
         columns: &[Column],
         colls: &[Option<std::sync::Arc<Collation>>],
         pk: &[(usize, Type)],
-        indexes: &[IndexDef],
+        rindexes: &[ResolvedIndex],
         row: &Row,
     ) -> Result<bool> {
         if !pk.is_empty()
@@ -1411,12 +1468,12 @@ impl Engine {
         {
             return Ok(true);
         }
-        for def in indexes.iter().filter(|d| d.unique) {
-            let Some(prefix) = index_prefix_key(columns, colls, def, row)? else {
+        for rindex in rindexes.iter().filter(|d| d.unique) {
+            let Some(prefix) = self.index_prefix(columns, colls, rindex, row)? else {
                 continue;
             };
             if !self
-                .index_store(&def.name.to_ascii_lowercase())
+                .index_store(&rindex.name.to_ascii_lowercase())
                 .range_entries(&unique_probe_bound(&prefix))?
                 .is_empty()
             {
@@ -1856,19 +1913,30 @@ impl Engine {
             None => None,
         };
 
+        // Precompute the entries to remove for each index in a `&self` pass (evaluating any
+        // expression key against the stored row), BEFORE the `&mut` removals below. Resolve the
+        // table's indexes once. `to_remove[k]` is index k's entries (rindexes order = indexes order).
+        let rindexes: Vec<ResolvedIndex> = match self.table_scoped(del.db.as_deref(), &del.table) {
+            Some(t) => self.resolve_table_indexes(t)?,
+            None => Vec::new(),
+        };
+        let mut to_remove: Vec<Vec<Vec<u8>>> = vec![Vec::new(); rindexes.len()];
+        for (kx, rindex) in rindexes.iter().enumerate() {
+            for (k, row) in &matched {
+                to_remove[kx].extend(self.index_entries(&tcolumns, &colls, rindex, k, row)?);
+            }
+        }
         // Phase 2: remove the rows, then their secondary-index entries (indexes.md §4 —
         // unmetered write work; an index removal cannot fail).
         let store = self.store_mut_scoped(del.db.as_deref(), &del.table);
         for (k, _) in &matched {
             store.remove(k)?;
         }
-        for def in &indexes {
+        for (kx, def) in indexes.iter().enumerate() {
             let istore =
                 self.index_store_mut_scoped(del.db.as_deref(), &def.name.to_ascii_lowercase());
-            for (k, row) in &matched {
-                for ek in index_entry_keys(&tcolumns, &colls, def, k, row)? {
-                    istore.remove(&ek)?;
-                }
+            for ek in &to_remove[kx] {
+                istore.remove(ek)?;
             }
         }
         Ok(match (ret, returned) {
@@ -1949,6 +2017,10 @@ impl Engine {
         // The index definitions (and the columns their entry keys read) feed phase 2's
         // maintenance (indexes.md §4): an entry moves only when its key actually changed.
         let indexes = table.indexes.clone();
+        // Resolve the indexes once (column ordinals + resolved expression keys — indexes.md §4),
+        // parallel to `indexes`; the unique end-state validation and the entry-move computation
+        // below evaluate any expression key through it (unmetered).
+        let rindexes: Vec<ResolvedIndex> = self.resolve_table_indexes(table)?;
         let tcolumns: Vec<Column> = if indexes.is_empty() {
             Vec::new()
         } else {
@@ -2298,12 +2370,13 @@ impl Engine {
         if indexes.iter().any(|d| d.unique) && !updates.is_empty() {
             let rewritten: HashSet<&[u8]> =
                 updates.iter().map(|(k, _, _, _)| k.as_slice()).collect();
-            for def in indexes.iter().filter(|d| d.unique) {
+            for rindex in rindexes.iter().filter(|d| d.unique) {
                 let istore =
-                    self.index_store_scoped(upd.db.as_deref(), &def.name.to_ascii_lowercase());
+                    self.index_store_scoped(upd.db.as_deref(), &rindex.name.to_ascii_lowercase());
                 let mut batch: HashSet<Vec<u8>> = HashSet::new();
                 for (_, _, new_row, _) in &updates {
-                    let Some(prefix) = index_prefix_key(&tcolumns, &colls, def, new_row)? else {
+                    let Some(prefix) = self.index_prefix(&tcolumns, &colls, rindex, new_row)?
+                    else {
                         continue;
                     };
                     let conflict = !batch.insert(prefix.clone())
@@ -2316,7 +2389,7 @@ impl Engine {
                             SqlState::UniqueViolation,
                             format!(
                                 "duplicate key value violates unique constraint: {}",
-                                def.name
+                                rindex.name
                             ),
                         ));
                     }
@@ -2543,13 +2616,14 @@ impl Engine {
         let mut index_moves: Vec<Vec<(Vec<Vec<u8>>, Vec<Vec<u8>>)>> =
             vec![Vec::new(); indexes.len()];
         for (old_key, new_key, new_row, old_row) in &updates {
-            for (k, def) in indexes.iter().enumerate() {
+            for (k, rindex) in rindexes.iter().enumerate() {
                 // The row's old and new entry SETS (one entry for an ordered index, one per term
                 // for GIN — gin.md §5). Remove old−new, insert new−old: a shared entry (an ordered
                 // key that did not change, or a GIN term present in both) is left untouched,
-                // keeping the copy-on-write dirty set byte-identical across cores.
-                let old_eks = index_entry_keys(&tcolumns, &colls, def, old_key, old_row)?;
-                let new_eks = index_entry_keys(&tcolumns, &colls, def, new_key, new_row)?;
+                // keeping the copy-on-write dirty set byte-identical across cores. Computed via a
+                // `&self` pass (evaluating any expression key), before the phase-2 writes.
+                let old_eks = self.index_entries(&tcolumns, &colls, rindex, old_key, old_row)?;
+                let new_eks = self.index_entries(&tcolumns, &colls, rindex, new_key, new_row)?;
                 let removals: Vec<Vec<u8>> = old_eks
                     .iter()
                     .filter(|e| !new_eks.contains(*e))

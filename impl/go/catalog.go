@@ -161,17 +161,91 @@ type foreignKey struct {
 	OnUpdate   fkAction
 }
 
+// IndexKey is one index key element (spec/design/indexes.md §1): a bare column (by ordinal into
+// the table's columns) or an expression over the table's columns (`lower(email)`), carrying its
+// persisted canonical text and the re-parsed (unresolved) AST — the write/plan paths re-resolve it
+// against the table per statement, exactly as a CHECK is re-resolved. Go has no sum types: Expr ==
+// nil discriminates a column key (read Col) from an expression key (read Expr). Only a B-tree index
+// may carry an expression element (GIN/GiST are single column, this slice).
+type indexKey struct {
+	Col  int
+	Expr *indexKeyExpr
+}
+
+// indexKeyExpr is an index expression key's persisted text + parsed AST (modeled on
+// checkConstraint / defaultExprDef).
+type indexKeyExpr struct {
+	ExprText string
+	Expr     exprNode
+}
+
+// columnKeys wraps a plain column-ordinal list as index key elements (the common case — a
+// column-only index built from a UNIQUE / GiST / auto-derived column list).
+func columnKeys(cols []int) []indexKey {
+	keys := make([]indexKey, len(cols))
+	for i, c := range cols {
+		keys[i] = indexKey{Col: c}
+	}
+	return keys
+}
+
+// asColumn returns the column ordinal if this is a plain column key, else (0, false) for an
+// expression key.
+func (k indexKey) asColumn() (int, bool) {
+	if k.Expr != nil {
+		return 0, false
+	}
+	return k.Col, true
+}
+
 // IndexDef is one secondary index of a table (spec/design/indexes.md): its
-// (relation-namespace) name and the indexed column ordinals in index-key order
-// (duplicates allowed — PG). The index's B-tree lives in the snapshot's index-store map,
-// keyed by the lowercased name. A Unique index enforces uniqueness over its key tuple
-// (NULLS DISTINCT — spec/design/indexes.md §8); it is what backs a UNIQUE constraint
+// (relation-namespace) name and its key elements in index-key order (columns and/or
+// expressions, duplicates allowed — PG). The index's B-tree lives in the snapshot's
+// index-store map, keyed by the lowercased name. A Unique index enforces uniqueness over its
+// key tuple (NULLS DISTINCT — spec/design/indexes.md §8); it is what backs a UNIQUE constraint
 // (spec/design/constraints.md §5).
 type indexDef struct {
-	Name    string
-	Columns []int
-	Unique  bool
-	Kind    indexKind
+	Name   string
+	Keys   []indexKey
+	Unique bool
+	Kind   indexKind
+}
+
+// allColumns reports whether every key element is a plain column (no expression key) — the common
+// case, and the GIN/GiST invariant. Lets column-only code paths fast-check.
+func (d *indexDef) allColumns() bool {
+	for _, k := range d.Keys {
+		if k.Expr != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// columnOrdinals returns the key elements' column ordinals if every element is a plain column, else
+// nil (the index has at least one expression key). The many column-only consumers — the GIN/GiST
+// entry builders, FK-target matching, introspection — use this; an expression key makes the index
+// ineligible for those (an FK cannot target an expression index, etc.).
+func (d *indexDef) columnOrdinals() []int {
+	out := make([]int, 0, len(d.Keys))
+	for _, k := range d.Keys {
+		c, ok := k.asColumn()
+		if !ok {
+			return nil
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// firstColumn returns the column ordinal of the first key element, assuming a single-column index —
+// used by the GIN/GiST paths, which are always single-column plain-column indexes (this slice).
+func (d *indexDef) firstColumn() int {
+	c, ok := d.Keys[0].asColumn()
+	if !ok {
+		panic("GIN/GiST index key is a plain column")
+	}
+	return c
 }
 
 // SequenceDef is a sequence (spec/design/sequences.md): a named, persisted, monotonic i64

@@ -25,7 +25,11 @@
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 25 # format_version 25: on-disk free-list persistence (format.md; storage.md §6) — meta
+VERSION = 26 # format_version 26: expression index keys (indexes.md §1/§6) — a per-index key element
+# is a u16 column ordinal OR the 0xFFFF sentinel + u16 length + canonical expression text (a fixture
+# writes it as `{ expr: "<text>" }`). Only the index-list changes; a plain column index is byte-identical
+# to v6, so a file with no expression index moves to v26 only by its version byte + meta CRC.
+# format_version 25: on-disk free-list persistence (format.md; storage.md §6) — meta
 # offset 28 becomes free_list_head (0 = empty), and a page_type 7 free-list page persists the
 # unconsumed free-list so open reads it directly instead of reconstructing it by walking every leaf.
 # A from-scratch image (build_image) has an EMPTY free-list, so free_list_head = 0 and no page_type 7
@@ -678,6 +682,24 @@ UNIQUE_TABLE = {
   rows: [[1, 10, 100], [2, nil, 200], [3, nil, 300]]
 }.freeze
 
+# A table with EXPRESSION index keys (v26 — indexes.md §1/§6): pins the per-index key-element
+# encoding — a plain column ordinal (`t_email_idx`, cols [1]) beside an expression element (the
+# 0xFFFF sentinel + the canonical text "lower ( email )" for the UNIQUE `t_lower_idx`). The table
+# is EMPTY (no rows), so both index trees are empty (root 0) and no per-row evaluation is needed —
+# the fixture isolates the v26 catalog change (the entry bytes are covered by text_pk/collation
+# fixtures). Indexes in ascending lowercased-name order. The cores build this via
+#   CREATE TABLE t (id i32 PRIMARY KEY, email text);
+#   CREATE INDEX ON t (email);  CREATE UNIQUE INDEX ON t (lower(email));
+EXPR_INDEX_TABLE = {
+  name: "t",
+  columns: [col("id", "i32", pk: true), col("email", "text")],
+  indexes: [
+    { name: "t_email_idx", cols: [1] },
+    { name: "t_lower_idx", cols: [{ expr: "lower ( email )" }], unique: true }
+  ],
+  rows: []
+}.freeze
+
 # A table with ARRAY (T[]) columns (v10 — spec/design/array.md): pins the catalog array-column
 # entry (type_code 15 + the element-type descriptor, §3) and the compact value body (§4). Two
 # array columns — an i32[] (fixed-width elements: NO per-element length prefix) and a text[]
@@ -1150,6 +1172,7 @@ FIXTURES = [
   { file: "check_table.jed", page_size: 256, tables: [CHECK_TABLE] },
   { file: "index_table.jed", page_size: 256, tables: [INDEX_TABLE] },
   { file: "unique_table.jed", page_size: 256, tables: [UNIQUE_TABLE] },
+  { file: "expr_index_table.jed", page_size: 256, tables: [EXPR_INDEX_TABLE] },
   { file: "gin_array_table.jed", page_size: 256, tables: [GIN_ARRAY_TABLE] },
   { file: "gin_uuid_table.jed", page_size: 256, tables: [GIN_UUID_TABLE] },
   { file: "fk_table.jed", page_size: 256, tables: FK_TABLE[:tables] },
@@ -1772,7 +1795,17 @@ def table_entry_bytes(table, root_data_page, index_roots)
   indexes.each_with_index do |ix, k|
     out << u16(ix[:name].bytesize) << ix[:name].b
     out << u16(ix[:cols].size)
-    ix[:cols].each { |i| out << u16(i) }
+    # Each key element is a column ordinal (u16) OR, for an EXPRESSION key (v26 — indexes.md §6),
+    # the 0xFFFF sentinel + u16 length + canonical text. A fixture writes an expression element as
+    # a Hash `{ expr: "<canonical text>" }`.
+    ix[:cols].each do |c|
+      if c.is_a?(Hash)
+        out << u16(0xFFFF)
+        out << u16(c[:expr].bytesize) << c[:expr].b
+      else
+        out << u16(c)
+      end
+    end
     out << [ix[:unique] ? 1 : 0].pack("C")
     # v13: index_kind byte (0 = btree, 1 = GIN); v20: 2 = GiST (gist.md §8).
     out << [{ "gin" => 1, "gist" => 2 }.fetch(ix[:kind], 0)].pack("C")
@@ -2949,7 +2982,15 @@ def decode_table_entry(buf, pos)
     cols = []
     kc.unpack1("n").times do
       ob, pos = take(buf, pos, 2)
-      cols << ob.unpack1("n")
+      ord = ob.unpack1("n")
+      if ord == 0xFFFF
+        # An expression key element (v26): the sentinel + u16 length + canonical text.
+        el, pos = take(buf, pos, 2)
+        et, pos = take(buf, pos, el.unpack1("n"))
+        cols << { expr: et }
+      else
+        cols << ord
+      end
     end
     fb, pos = take(buf, pos, 1)
     raise "reserved index flag set (only bit0 unique is defined — v6)" if (fb.getbyte(0) & ~0b01) != 0

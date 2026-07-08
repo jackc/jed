@@ -856,7 +856,7 @@ impl Engine {
                 pos,
                 IndexDef {
                     name,
-                    columns: cols,
+                    keys: cols.into_iter().map(IndexKey::Column).collect(),
                     unique: true,
                     kind: IndexKind::Btree,
                 },
@@ -1001,10 +1001,11 @@ impl Engine {
             // 7. The referenced columns must be the parent's PK or a UNIQUE set (§6.2).
             let ref_set = sorted_unique(&refs);
             let matches_unique = (!parent.pk.is_empty() && sorted_unique(&parent.pk) == ref_set)
-                || parent
-                    .indexes
-                    .iter()
-                    .any(|i| i.unique && sorted_unique(&i.columns) == ref_set);
+                || parent.indexes.iter().any(|i| {
+                    i.unique
+                        && i.column_ordinals()
+                            .is_some_and(|c| sorted_unique(&c) == ref_set)
+                });
             if !matches_unique {
                 return Err(EngineError::new(
                     SqlState::InvalidForeignKey,
@@ -1189,7 +1190,7 @@ impl Engine {
                 pos,
                 IndexDef {
                     name: name.clone(),
-                    columns: indices,
+                    keys: indices.into_iter().map(IndexKey::Column).collect(),
                     unique: false,
                     kind: IndexKind::Gist,
                 },
@@ -1370,6 +1371,118 @@ impl Engine {
             out.push((c.name.clone(), node));
         }
         Ok(out)
+    }
+
+    /// Resolve an index's key elements for one statement's maintenance (spec/design/indexes.md §4),
+    /// modeled on [`resolve_checks`](Self::resolve_checks): a column key keeps its ordinal; an
+    /// expression key resolves against the table's columns to an `RExpr` + its encoding `Type` +
+    /// collation. The expression was validated (immutable, indexable result) at CREATE INDEX, so
+    /// resolution here cannot newly fail (an aggregate/window/subquery/param was rejected then, and
+    /// re-resolving with `AggCtx::Forbidden` is inert). Returns an owned [`ResolvedIndex`], so the
+    /// write paths can hold it while mutating stores.
+    pub(crate) fn resolve_index(&self, table: &Table, def: &IndexDef) -> Result<ResolvedIndex> {
+        let mut keys = Vec::with_capacity(def.keys.len());
+        for k in &def.keys {
+            match k {
+                IndexKey::Column(ord) => keys.push(ResolvedKey::Column(*ord)),
+                IndexKey::Expr(e) => {
+                    let scope = Scope::single(self, table);
+                    let (rexpr, rtype) = resolve(
+                        &scope,
+                        &e.expr,
+                        None,
+                        &mut AggCtx::Forbidden,
+                        &mut ParamTypes::default(),
+                    )?;
+                    let ty = resolved_to_key_type(&rtype)
+                        .expect("index expression result type validated indexable at CREATE INDEX");
+                    let coll = resolve_deriv(scope.catalog, derive_collation(&scope, &e.expr)?)?;
+                    keys.push(ResolvedKey::Expr(rexpr, ty, coll));
+                }
+            }
+        }
+        Ok(ResolvedIndex {
+            name: def.name.clone(),
+            unique: def.unique,
+            kind: def.kind,
+            keys,
+        })
+    }
+
+    /// Resolve every index of a table once per statement (the maintenance driver — INSERT / UPDATE
+    /// / DELETE build their `ResolvedIndex` list up front, parallel to `table.indexes`).
+    pub(crate) fn resolve_table_indexes(&self, table: &Table) -> Result<Vec<ResolvedIndex>> {
+        table
+            .indexes
+            .iter()
+            .map(|d| self.resolve_index(table, d))
+            .collect()
+    }
+
+    /// A row's secondary-index entry keys for maintenance (spec/design/indexes.md §4), building the
+    /// unmetered eval env internally (an index expression is immutable — no params/CTE/seam, so the
+    /// fresh statement rng is never read). Returns owned bytes, so callers compute all entries
+    /// through this `&self` call BEFORE taking a `&mut` store borrow to write them.
+    pub(crate) fn index_entries(
+        &self,
+        columns: &[Column],
+        colls: &[Option<std::sync::Arc<Collation>>],
+        rindex: &ResolvedIndex,
+        storage_key: &[u8],
+        row: &Row,
+    ) -> Result<Vec<Vec<u8>>> {
+        let rng = std::cell::Cell::new(crate::seam::StmtRng::new());
+        let env = EvalEnv {
+            exec: self,
+            params: &[],
+            outer: &[],
+            rng: &rng,
+            ctes: CteCtx::empty(),
+        };
+        index_entry_keys(columns, colls, rindex, storage_key, row, &env)
+    }
+
+    /// A row's uniqueness-probe prefix for one index (spec/design/indexes.md §8), building the
+    /// unmetered eval env internally (as [`index_entries`](Self::index_entries)).
+    pub(crate) fn index_prefix(
+        &self,
+        columns: &[Column],
+        colls: &[Option<std::sync::Arc<Collation>>],
+        rindex: &ResolvedIndex,
+        row: &Row,
+    ) -> Result<Option<Vec<u8>>> {
+        let rng = std::cell::Cell::new(crate::seam::StmtRng::new());
+        let env = EvalEnv {
+            exec: self,
+            params: &[],
+            outer: &[],
+            rng: &rng,
+            ctes: CteCtx::empty(),
+        };
+        index_prefix_key(columns, colls, rindex, row, &env)
+    }
+
+    /// A candidate row's arbiter key for `ON CONFLICT` (spec/design/upsert.md §3), building the
+    /// unmetered eval env internally (an expression-index arbiter evaluates its keys — as
+    /// [`index_prefix`](Self::index_prefix)).
+    pub(crate) fn arbiter_probe_key(
+        &self,
+        arb: &Arbiter,
+        pk: &[(usize, Type)],
+        colls: &[Option<std::sync::Arc<Collation>>],
+        columns: &[Column],
+        rindexes: &[ResolvedIndex],
+        row: &Row,
+    ) -> Result<Option<Vec<u8>>> {
+        let rng = std::cell::Cell::new(crate::seam::StmtRng::new());
+        let env = EvalEnv {
+            exec: self,
+            params: &[],
+            outer: &[],
+            rng: &rng,
+            ctes: CteCtx::empty(),
+        };
+        arbiter_key(arb, pk, colls, columns, rindexes, row, &env)
     }
 
     /// Resolve each column's **expression** `DEFAULT` (constraints.md §2) to an `RExpr`, once
@@ -1608,8 +1721,71 @@ impl Engine {
                 ));
             }
         };
-        let mut cols: Vec<usize> = Vec::with_capacity(ci.columns.len());
-        for name in &ci.columns {
+        let mut ci_keys: Vec<IndexKey> = Vec::with_capacity(ci.keys.len());
+        for elem in &ci.keys {
+            // An EXPRESSION key element (spec/design/indexes.md §1/§2): resolve it against the
+            // table's columns, validate it is immutable + indexable-typed, and store its canonical
+            // text (persisted, format_version 26). Expression keys are B-tree only this slice —
+            // GIN/GiST take a single plain column.
+            let name = match elem {
+                IndexKeyElem::Expr { text, expr } => {
+                    if kind != IndexKind::Btree {
+                        return Err(EngineError::new(
+                            SqlState::FeatureNotSupported,
+                            format!(
+                                "an expression key on a {} index is not supported yet",
+                                ci.using.as_deref().unwrap_or("")
+                            ),
+                        ));
+                    }
+                    // A subquery is not a deterministic function of the row — 0A000 (the resolver
+                    // admits an uncorrelated one, so it is rejected here, before resolution).
+                    if index_expr_has_subquery(expr) {
+                        return Err(EngineError::new(
+                            SqlState::FeatureNotSupported,
+                            "cannot use subquery in index expression".to_string(),
+                        ));
+                    }
+                    // Resolve against the table (an aggregate 42803 / window 42P20 / bind parameter
+                    // 42P02 fall out of the resolver, as for a CHECK).
+                    let scope = Scope::single(self, table);
+                    let (_node, rtype) = resolve(
+                        &scope,
+                        expr,
+                        None,
+                        &mut AggCtx::Forbidden,
+                        &mut ParamTypes::default(),
+                    )?;
+                    // Immutability (§2): a non-immutable seam/sequence/current_setting call, or a
+                    // session-timezone-dependent expression (one that reads or produces a
+                    // `timestamptz` — conservatively fail-closed), is 42P17.
+                    let refs = check_referenced_columns(expr, &columns);
+                    let tz_hazard = matches!(rtype, ResolvedType::Timestamptz)
+                        || refs
+                            .iter()
+                            .any(|&i| columns[i].ty.as_scalar() == Some(ScalarType::Timestamptz));
+                    if index_expr_nonimmutable_call(expr) || tz_hazard {
+                        return Err(EngineError::new(
+                            SqlState::InvalidObjectDefinition,
+                            "functions in index expression must be marked IMMUTABLE".to_string(),
+                        ));
+                    }
+                    // The result type must be key-encodable (a composite result is 0A000).
+                    if resolved_to_key_type(&rtype).is_none() {
+                        return Err(EngineError::new(
+                            SqlState::FeatureNotSupported,
+                            "an index on an expression of this result type is not supported yet"
+                                .to_string(),
+                        ));
+                    }
+                    ci_keys.push(IndexKey::Expr(IndexKeyExpr {
+                        expr_text: text.clone(),
+                        expr: expr.clone(),
+                    }));
+                    continue;
+                }
+                IndexKeyElem::Column(name) => name,
+            };
             let idx = table.column_index(name).ok_or_else(|| {
                 EngineError::new(
                     SqlState::UndefinedColumn,
@@ -1703,7 +1879,7 @@ impl Engine {
                 }
             }
             // A duplicate column in the list is ALLOWED (PostgreSQL allows it — indexes.md §1).
-            cols.push(idx);
+            ci_keys.push(IndexKey::Column(idx));
         }
         // GIN narrowings this slice (spec/design/gin.md §3): no uniqueness (undefined for an
         // inverted index) and a single column only — both deferred 0A000.
@@ -1714,7 +1890,7 @@ impl Engine {
                     "access method gin does not support unique indexes".to_string(),
                 ));
             }
-            if cols.len() != 1 {
+            if ci_keys.len() != 1 {
                 return Err(EngineError::new(
                     SqlState::FeatureNotSupported,
                     "a multi-column gin index is not supported yet".to_string(),
@@ -1734,7 +1910,7 @@ impl Engine {
                     "access method gist does not support unique indexes".to_string(),
                 ));
             }
-            if cols.len() != 1 {
+            if ci_keys.len() != 1 {
                 return Err(EngineError::new(
                     SqlState::FeatureNotSupported,
                     "a multi-column gist index is not supported yet".to_string(),
@@ -1784,12 +1960,15 @@ impl Engine {
                 n.clone()
             }
             None => {
-                // PG's ChooseIndexName (probed): lowercased table + every listed column name
-                // (list order, duplicates included) + "idx", then the smallest free suffix.
+                // PG's ChooseIndexName / ChooseIndexColumnNames (probed): lowercased table + one
+                // name part per key element (list order, duplicates included) + "idx", then the
+                // smallest free suffix. A column key's part is the column name; a bare-function-call
+                // expression's is the function name (`lower(email)` → `lower`); any other
+                // expression's is the literal `expr` (indexes.md §2).
                 let mut base = table_key.clone();
-                for name in &ci.columns {
+                for elem in &ci.keys {
                     base.push('_');
-                    base.push_str(&name.to_ascii_lowercase());
+                    base.push_str(&index_name_part(elem));
                 }
                 base.push_str("_idx");
                 let mut candidate = base.clone();
@@ -1802,49 +1981,75 @@ impl Engine {
             }
         };
 
-        // The build scan (cost.md §3): page_read per table-tree node + storage_row_read per
-        // row, with the indexed columns as the touched set (fixed-width — the chain/decompress
-        // terms are structurally zero). An empty table charges 0. The entries are computed
-        // here, against the pre-index store; the writes below are unmetered.
-        let mut meter = self.session.new_meter();
-        let mut mask = vec![false; columns.len()];
-        for &c in &cols {
-            mask[c] = true;
-        }
         let def = IndexDef {
             name,
-            columns: cols,
+            keys: ci_keys,
             unique: ci.unique,
             kind,
         };
-        let store = self.store_scoped(ci.db.as_deref(), &ci.table);
-        let (table_entries, nodes, slabs) = store.scan_with_units(&mask)?;
-        meter.charge(COSTS.page_read * nodes as i64 + COSTS.value_decompress * slabs as i64);
-        let mut entries: Vec<Vec<u8>> = Vec::with_capacity(table_entries.len());
+        // The build scan (cost.md §3): page_read per table-tree node + storage_row_read per
+        // row. The touched set is the columns the key elements read — an index column for a
+        // column key, or every column an expression key references (which may be variable-width,
+        // so a spilled value adds its `value_decompress` slabs — indexes.md §5). An empty table
+        // charges 0. Entries are computed here against the pre-index store; the writes below are
+        // unmetered. An expression key evaluating with an error aborts the build (nothing is
+        // registered — indexes.md §4), preserving all-or-nothing.
+        let mut meter = self.session.new_meter();
+        let mut mask = vec![false; columns.len()];
+        for k in &def.keys {
+            match k {
+                IndexKey::Column(c) => mask[*c] = true,
+                IndexKey::Expr(e) => {
+                    for c in check_referenced_columns(&e.expr, &columns) {
+                        mask[c] = true;
+                    }
+                }
+            }
+        }
+        // Resolve the index once (column ordinals + resolved expression keys); the eval env for any
+        // expression key (a fresh statement rng — index expressions are immutable, so it is never
+        // read). Built before the `&mut self` writes below, so the `&self` borrow is released first.
+        let rindex = self.resolve_index(table, &def)?;
+        let rng = std::cell::Cell::new(crate::seam::StmtRng::new());
+        let mut entries: Vec<Vec<u8>> = Vec::new();
         // A UNIQUE build verifies the existing rows before the index is registered
         // (indexes.md §8): two rows sharing a fully-non-NULL key tuple — i.e. an exempt-free
         // prefix — trap 23505 and create nothing. Unmetered validation (cost.md §3).
         let mut seen_prefixes: HashSet<Vec<u8>> = HashSet::new();
-        for (key, mut row) in table_entries {
-            meter.guard()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
-            meter.charge(COSTS.storage_row_read);
-            // The build reads the indexed *key* columns directly; resolve a faulted row's inline
-            // values (lazy-record.md §5b — always inline for a key column, so cost-free) before
-            // encoding its entry keys.
-            store.resolve_inline_columns(&mut row)?;
-            if def.unique
-                && let Some(prefix) = index_prefix_key(&columns, &colls, &def, &row)?
-                && !seen_prefixes.insert(prefix)
-            {
-                return Err(EngineError::new(
-                    SqlState::UniqueViolation,
-                    format!(
-                        "duplicate key value violates unique constraint: {}",
-                        def.name
-                    ),
-                ));
+        {
+            let env = EvalEnv {
+                exec: self,
+                params: &[],
+                outer: &[],
+                rng: &rng,
+                ctes: CteCtx::empty(),
+            };
+            let store = self.store_scoped(ci.db.as_deref(), &ci.table);
+            let (table_entries, nodes, slabs) = store.scan_with_units(&mask)?;
+            meter.charge(COSTS.page_read * nodes as i64 + COSTS.value_decompress * slabs as i64);
+            entries.reserve(table_entries.len());
+            for (key, mut row) in table_entries {
+                meter.guard()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
+                meter.charge(COSTS.storage_row_read);
+                // Resolve a faulted row's touched columns before encoding (an expression key may
+                // read a spilled value; the evaluator's `Unfetched` backstop also handles it).
+                store.resolve_inline_columns(&mut row)?;
+                if def.unique
+                    && let Some(prefix) = index_prefix_key(&columns, &colls, &rindex, &row, &env)?
+                    && !seen_prefixes.insert(prefix)
+                {
+                    return Err(EngineError::new(
+                        SqlState::UniqueViolation,
+                        format!(
+                            "duplicate key value violates unique constraint: {}",
+                            def.name
+                        ),
+                    ));
+                }
+                entries.extend(index_entry_keys(
+                    &columns, &colls, &rindex, &key, &row, &env,
+                )?);
             }
-            entries.extend(index_entry_keys(&columns, &colls, &def, &key, &row)?);
         }
         meter.guard()?;
 
@@ -2273,5 +2478,124 @@ impl Engine {
         w.remove_sequence(&old_key);
         w.put_sequence(def);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod expr_index_tests {
+    //! Expression-index behaviors the shared corpus cannot express (a PG divergence — jed's
+    //! text-key collation is C, not the oracle's; on-disk byte round-trip; catalog introspection).
+    //! The PG-agreeing behavior (23505, error codes, planner rows) lives in the corpus.
+    use crate::{Engine, Outcome, execute};
+
+    fn rows(db: &mut Engine, sql: &str) -> Vec<Vec<crate::Value>> {
+        match execute(db, sql).expect(sql) {
+            Outcome::Query { rows, .. } => rows,
+            other => panic!("expected a query, got {other:?} for {sql}"),
+        }
+    }
+
+    // A UNIQUE expression index enforces `lower(email)` uniqueness across INSERTs, and survives a
+    // serialize→load round trip (format_version 26): the reloaded index still enforces + accelerates.
+    #[test]
+    fn unique_lower_email_enforced_and_persisted() {
+        let mut db = Engine::new();
+        execute(&mut db, "CREATE TABLE u (id i32 PRIMARY KEY, email text)").unwrap();
+        execute(&mut db, "CREATE UNIQUE INDEX ON u (lower(email))").unwrap();
+        execute(&mut db, "INSERT INTO u VALUES (1, 'Alice@X')").unwrap();
+        // A case-different duplicate collides on lower(email) (23505).
+        let e = execute(&mut db, "INSERT INTO u VALUES (2, 'ALICE@x')").unwrap_err();
+        assert_eq!(e.code(), "23505", "case-insensitive uniqueness");
+        // A distinct value inserts fine.
+        execute(&mut db, "INSERT INTO u VALUES (2, 'bob@x')").unwrap();
+
+        // Round-trip: the v26 catalog re-parses the index expression, and it still enforces.
+        let image = db.to_image(256, 1).unwrap();
+        let mut re = Engine::from_image(&image).unwrap();
+        let dup = execute(&mut re, "INSERT INTO u VALUES (3, 'aLICE@x')").unwrap_err();
+        assert_eq!(dup.code(), "23505", "uniqueness survives reload");
+        // And the accelerated lookup returns the row.
+        let r = rows(&mut re, "SELECT id FROM u WHERE lower(email) = 'alice@x'");
+        assert_eq!(r.len(), 1, "one row matches lower(email)='alice@x'");
+    }
+
+    // A plain expression index is used by the planner (EXPLAIN names it) and updated across
+    // INSERT/UPDATE/DELETE so the accelerated query stays correct.
+    #[test]
+    fn plain_expr_index_planner_and_maintenance() {
+        let mut db = Engine::new();
+        execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32)").unwrap();
+        execute(&mut db, "CREATE INDEX ON t ((a + b))").unwrap();
+        // ids 2 and 3 both have a+b = 10 (4+6, 5+5); id 1 has a+b = 5.
+        execute(
+            &mut db,
+            "INSERT INTO t VALUES (1, 2, 3), (2, 4, 6), (3, 5, 5)",
+        )
+        .unwrap();
+        // The access-predicate bound names the auto-named expression index (a+b → `t_expr_idx`).
+        // The EXPLAIN plan's `detail` column (r[2]) carries "Index bound: using <name>".
+        let plan = match execute(&mut db, "EXPLAIN SELECT id FROM t WHERE a + b = 10").unwrap() {
+            Outcome::Query { rows, .. } => rows
+                .iter()
+                .map(|r| format!("{:?}", r[2]))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => unreachable!(),
+        };
+        assert!(
+            plan.contains("t_expr_idx"),
+            "plan should name the expr index:\n{plan}"
+        );
+        // The query returns the two rows whose a+b = 10 (ids 2 and 3), regardless of pushdown.
+        let mut ids: Vec<i64> = rows(&mut db, "SELECT id FROM t WHERE a + b = 10")
+            .iter()
+            .map(|r| match r[0] {
+                crate::Value::Int(n) => n,
+                _ => panic!(),
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![2, 3]);
+        // UPDATE moves an entry; DELETE removes one — the index stays consistent.
+        execute(&mut db, "UPDATE t SET a = 100 WHERE id = 2").unwrap(); // a+b now 110
+        execute(&mut db, "DELETE FROM t WHERE id = 3").unwrap();
+        let after = rows(&mut db, "SELECT id FROM t WHERE a + b = 10");
+        assert!(after.is_empty(), "no rows with a+b=10 after update/delete");
+    }
+
+    // Non-immutable / non-indexable expression keys are rejected at CREATE INDEX (the exact codes
+    // are corpus-checked against PG; here we pin the jed-specific 42P17 immutability rule).
+    #[test]
+    fn nonimmutable_expression_rejected() {
+        let mut db = Engine::new();
+        execute(
+            &mut db,
+            "CREATE TABLE t (id i32 PRIMARY KEY, ts timestamptz, a i32)",
+        )
+        .unwrap();
+        let e = execute(&mut db, "CREATE INDEX ON t ((uuidv4()))").unwrap_err();
+        assert_eq!(e.code(), "42P17", "seam function rejected");
+        // A timestamptz-dependent EXPRESSION is also non-immutable (its value depends on the
+        // session time zone) — conservatively fail-closed (indexes.md §2).
+        let e2 = execute(&mut db, "CREATE INDEX ON t ((ts + interval '1 hour'))").unwrap_err();
+        assert_eq!(e2.code(), "42P17", "timestamptz expression rejected");
+        // A bare `(ts)` normalizes to a plain column key — a timestamptz COLUMN is indexable.
+        execute(&mut db, "CREATE INDEX ON t ((ts))").expect("bare (ts) is a column key");
+    }
+
+    // jed_indexes shows an expression key as its canonical text in the `columns` array.
+    #[test]
+    fn introspection_shows_expression_text() {
+        let mut db = Engine::new();
+        execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, email text)").unwrap();
+        execute(&mut db, "CREATE INDEX ix ON t (lower(email))").unwrap();
+        let r = rows(&mut db, "SELECT columns FROM jed_indexes WHERE name = 'ix'");
+        assert_eq!(r.len(), 1);
+        // columns is text[] = {'lower ( email )'} (the canonical Check-expression text form).
+        let s = format!("{:?}", r[0][0]);
+        assert!(
+            s.contains("lower"),
+            "columns should carry the expression text: {s}"
+        );
     }
 }

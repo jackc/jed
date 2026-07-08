@@ -138,6 +138,18 @@ function uniqueTableDB(): Engine {
   return db;
 }
 
+// exprIndexTableDB has an EXPRESSION index key (v26 — the per-index 0xFFFF sentinel + canonical
+// text, indexes.md §6): a plain column index t_email_idx beside the UNIQUE expression index
+// t_lower_idx over lower(email). The table is EMPTY (both index trees empty, root 0), so the
+// fixture isolates the v26 catalog change. Must match verify.rb's EXPR_INDEX_TABLE.
+function exprIndexTableDB(): Engine {
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, email text)");
+  run(db, "CREATE INDEX ON t (email)");
+  run(db, "CREATE UNIQUE INDEX ON t (lower(email))");
+  return db;
+}
+
 // fkTableDB has FOREIGN KEY constraints (v11 — spec/design/constraints.md §6): pins the catalog
 // foreign-key list. Parent `p` (a PK + two UNIQUE constraints, the FK targets); child `c` with
 // four FKs covering every shape — a named FK to the UNIQUE column (c_code_fk), a self-reference to
@@ -914,6 +926,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "check_table.jed", build: checkTableDB },
     { name: "index_table.jed", build: indexTableDB },
     { name: "unique_table.jed", build: uniqueTableDB },
+    { name: "expr_index_table.jed", build: exprIndexTableDB },
     { name: "gin_array_table.jed", build: ginArrayTableDB },
     { name: "gin_uuid_table.jed", build: ginUuidTableDB },
     { name: "fk_table.jed", build: fkTableDB },
@@ -983,6 +996,7 @@ test("read goldens reproduces rows", () => {
     { name: "check_table.jed", build: checkTableDB, table: "t" },
     { name: "index_table.jed", build: indexTableDB, table: "t" },
     { name: "unique_table.jed", build: uniqueTableDB, table: "t" },
+    { name: "expr_index_table.jed", build: exprIndexTableDB, table: "t" },
     { name: "gin_array_table.jed", build: ginArrayTableDB, table: "t" },
     { name: "gin_uuid_table.jed", build: ginUuidTableDB, table: "t" },
     { name: "fk_table.jed", build: fkTableDB, table: "c" },

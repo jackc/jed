@@ -1625,9 +1625,10 @@ duplicate name `42710` (constraints.md §4.1–§4.3). The parser knows no catal
 Two new top-level statements ([indexes.md](indexes.md)):
 
 ```
-create_index ::= "CREATE" "UNIQUE"? "INDEX" identifier? "ON" identifier
-                 "(" identifier ("," identifier)* ")"
-drop_index   ::= "DROP" "INDEX" identifier
+create_index  ::= "CREATE" "UNIQUE"? "INDEX" identifier? "ON" identifier using_clause?
+                  "(" index_element ("," index_element)* ")"
+index_element ::= column_ref | function_call | "(" expr ")"
+drop_index    ::= "DROP" "INDEX" identifier
 ```
 
 **`UNIQUE` needs no lookahead of its own**: after `CREATE`, the next word being `UNIQUE`
@@ -1647,15 +1648,31 @@ form over a table named `on`. PostgreSQL reserves `ON` so the ambiguity cannot a
 there; the lookahead is jed's standing no-reserved-words mechanism (the same move as
 `DISTINCT`'s and `CHECK`'s).
 
-**Key columns are bare identifiers.** A `(` in key position is a `42601` syntax error
-(no expression keys — a documented narrowing, indexes.md §1), as are `ASC` / `DESC` /
-`NULLS` after a key (they parse as an unexpected token; PostgreSQL accepts them).
+**Key elements: column, function call, or parenthesized expression** ([indexes.md §1](indexes.md),
+PostgreSQL's `index_elem`). Each parser reads one element by peeking:
 
-**Where the errors fire.** The parser knows no catalog; CREATE INDEX's execution
-validates in PostgreSQL's order — table `42P01`, then each key column in list order
-(`42703` unknown / `0A000` unindexable type), then the explicit name against the shared
-relation namespace (`42P07`) — and DROP INDEX raises `42704` (missing) / `42809` (names
-a table). Semantics: [indexes.md §2](indexes.md).
+- `(` → a **parenthesized expression** `( expr )`. If the inner expression is structurally
+  a bare column reference (`(a)`, `((a))`), it **normalizes to a column key** — PG treats
+  `(a)` as the column `a`.
+- an identifier **followed by `(`** → a **function-call** expression (`lower(email)`),
+  parsed by the ordinary function-call path; the element must then end (`,` or `)`) — a
+  trailing operator (`lower(x) + 1`) is a syntax error, so a general expression must be
+  parenthesized.
+- an identifier **not** followed by `(` → a **bare column** key (as before).
+
+A bare operator expression `a + b` is therefore a `42601` syntax error (the identifier `a`
+is a column key, and the following `+` is unexpected) — matching PostgreSQL, which requires
+`(a + b)`. `ASC` / `DESC` / `NULLS` / `COLLATE` after an element are likewise unexpected
+tokens (deferred narrowings; PostgreSQL accepts them). The `USING method` clause is
+recognized positionally after the table name (as for the plain-column form).
+
+**Where the errors fire.** The parser knows no catalog; CREATE INDEX's execution validates
+in PostgreSQL's order — table `42P01`, then each key element in list order (a column key:
+`42703` unknown / `0A000` unindexable; an expression key: resolve against the table
+[unknown column `42703`], then `42803` aggregate / `42P20` window / `0A000` subquery /
+`42P02` param / `42P17` non-immutable, then `0A000` for a composite result type), then the
+explicit name against the shared relation namespace (`42P07`) — and DROP INDEX raises
+`42704` (missing) / `42809` (names a table). Semantics: [indexes.md §2](indexes.md).
 
 ## 31. `UNIQUE` constraints (`[CONSTRAINT name] UNIQUE [( cols )]`)
 

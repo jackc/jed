@@ -133,21 +133,62 @@ export type ForeignKey = {
   onUpdate: FkAction;
 };
 
+// IndexKey is one index key element (spec/design/indexes.md §1): a bare column (by ordinal into the
+// table's columns) or an expression over the table's columns (`lower(email)`), carrying its persisted
+// canonical text and the re-parsed (unresolved) AST — the write/plan paths re-resolve it against the
+// table per statement, exactly as a CHECK is re-resolved. Only a B-tree index may carry an expression
+// element (GIN/GiST are single column, this slice).
+export type IndexKey =
+  | { kind: "column"; column: number }
+  | { kind: "expr"; exprText: string; expr: Expr };
+
 // IndexDef is one secondary index of a table (spec/design/indexes.md): its
-// (relation-namespace) name and the indexed column ordinals in index-key order
-// (duplicates allowed — PG). The index's B-tree lives in the snapshot's index-store map,
-// keyed by the lowercased name. A unique index enforces uniqueness over its key tuple
-// (NULLS DISTINCT — spec/design/indexes.md §8); it is what backs a UNIQUE constraint
-// (spec/design/constraints.md §5).
+// (relation-namespace) name and its key elements in index-key order (columns and/or
+// expressions, duplicates allowed — PG). The index's B-tree lives in the snapshot's
+// index-store map, keyed by the lowercased name. A unique index enforces uniqueness over
+// its key tuple (NULLS DISTINCT — spec/design/indexes.md §8); it is what backs a UNIQUE
+// constraint (spec/design/constraints.md §5).
 export type IndexDef = {
   name: string;
-  columns: number[];
+  keys: IndexKey[];
   unique: boolean;
   // kind selects an ordered B-tree (the default), a GIN inverted index (spec/design/gin.md), or a
   // GiST R-tree (spec/design/gist.md). Persisted as the per-index index_kind byte (v13 GIN, v20
   // GiST); a GIN/GiST index is never unique.
   kind: "btree" | "gin" | "gist";
 };
+
+// indexKeyColumn is the column ordinal of a plain column key element, else null (an expression key).
+export function indexKeyColumn(k: IndexKey): number | null {
+  return k.kind === "column" ? k.column : null;
+}
+
+// indexAllColumns reports whether every key element is a plain column (no expression key) — the
+// common case, and the GIN/GiST invariant. Lets column-only code paths fast-check.
+export function indexAllColumns(def: IndexDef): boolean {
+  return def.keys.every((k) => k.kind === "column");
+}
+
+// indexColumnOrdinals returns the key elements' column ordinals if every element is a plain column,
+// else null (the index has at least one expression key). The many column-only consumers — the
+// GIN/GiST entry builders, FK-target matching, introspection — use this; an expression key makes the
+// index ineligible for those (an FK cannot target an expression index, etc.).
+export function indexColumnOrdinals(def: IndexDef): number[] | null {
+  const out: number[] = [];
+  for (const k of def.keys) {
+    if (k.kind !== "column") return null;
+    out.push(k.column);
+  }
+  return out;
+}
+
+// indexFirstColumn is the column ordinal of the first key element, assuming a single-column index —
+// used by the GIN/GiST paths, which are always single-column plain-column indexes (this slice).
+export function indexFirstColumn(def: IndexDef): number {
+  const c = indexKeyColumn(def.keys[0]!);
+  if (c === null) throw new Error("GIN/GiST index key is a plain column");
+  return c;
+}
 
 // CheckConstraint is one CHECK constraint: its (resolved, unique-per-table) name, its
 // persisted expression text — written back verbatim at every commit so the catalog bytes

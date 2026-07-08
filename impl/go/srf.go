@@ -703,9 +703,15 @@ func (db *engine) jedIndexesRows(sp *srfPlan, m *costMeter) ([]storedRow, error)
 				return nil, err
 			}
 			m.Charge(costs.GeneratedRow)
-			cols := make([]Value, len(idx.Columns))
-			for j, ord := range idx.Columns {
-				cols[j] = TextValue(t.Columns[ord].Name)
+			// A column key shows its column name; an expression key its canonical text
+			// (introspection.md §5.1) — the same columns text[] cell.
+			cols := make([]Value, len(idx.Keys))
+			for j, k := range idx.Keys {
+				if k.Expr != nil {
+					cols[j] = TextValue(k.Expr.ExprText)
+				} else {
+					cols[j] = TextValue(t.Columns[k.Col].Name)
+				}
 			}
 			out = append(out, storedRow{
 				TextValue(idx.Name),
@@ -766,9 +772,14 @@ func (db *engine) jedConstraintsRows(sp *srfPlan, m *costMeter) ([]storedRow, er
 				return nil, err
 			}
 			m.Charge(costs.GeneratedRow)
-			cols := make([]string, len(idx.Columns))
-			for j, ord := range idx.Columns {
-				cols[j] = t.Columns[ord].Name
+			// A column key shows its column name; an expression key its canonical text.
+			cols := make([]string, len(idx.Keys))
+			for j, k := range idx.Keys {
+				if k.Expr != nil {
+					cols[j] = k.Expr.ExprText
+				} else {
+					cols[j] = t.Columns[k.Col].Name
+				}
 			}
 			out = append(out, storedRow{
 				TextValue(idx.Name),

@@ -15,7 +15,21 @@ and (b) write the same logical database to bytes that equal the golden *exactly*
 other's output. A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 25)
+## Version scope (`format_version` 26)
+
+`format_version` **26** — **expression index keys** ([../design/indexes.md §1/§6](../design/indexes.md)).
+An index key element was a `u16` column ordinal; it may now be an **expression** over the table's
+columns (`CREATE INDEX ON t (lower(email))`, plain or `UNIQUE`). The **only** on-disk change is in the
+per-index **key-element list** (*Each table entry* below): each element is a `u16` that is a column
+ordinal (`< col_count`) for a column key, **or** the sentinel **`0xFFFF`** — which can never be a valid
+ordinal (`col_count ≤ 65535` ⇒ max ordinal `65534`) — for an **expression key**, immediately followed
+by a `u16 expr_len` + `expr_len` UTF-8 bytes of the expression's canonical text (the *Check-expression
+text* form, exactly as a `CHECK` / column `DEFAULT` stores). On load an expression element re-parses
+that text with the ordinary expression parser (`XX001` on failure, like a stored CHECK); its result
+type/collation are re-derived by resolving against the table's columns, never persisted. A plain
+column index's bytes are **unchanged** from v6, so a file with no expression index moves to v26 only
+by its version byte + meta CRC (every existing golden's sole v26 change). No value-codec change, no
+new page type.
 
 `format_version` **25** — **on-disk free-list persistence** ([../design/storage.md §6](../design/storage.md),
 CLAUDE.md §9). Through v24 the free-list was **reconstructed on open** — a full walk of the committed
@@ -423,7 +437,7 @@ and slot selection):
 | offset | size | field |
 |---|---|---|
 | 0  | 4 | `magic` = `4A 45 44 42` (ASCII `JEDB`, for the engine `jed`) |
-| 4  | 2 | `format_version` (u16) — current = **`25`** |
+| 4  | 2 | `format_version` (u16) — current = **`26`** |
 | 6  | 2 | reserved (0) |
 | 8  | 4 | `page_size` (u32) |
 | 12 | 8 | `txid` (u64) — commit counter; the highest valid slot wins on open |
@@ -452,7 +466,7 @@ present (copy-on-write never overwrote them). `create` seeds **both** slots with
 `txid = 1` meta, so two valid slots exist from the first moment (the first even-`txid` commit
 then overwrites slot 0).
 
-**Opening (slot selection).** Validate each slot independently (magic, `format_version == 25`,
+**Opening (slot selection).** Validate each slot independently (magic, `format_version == 26`,
 offsets 6–7 reserved == 0, `free_list_head` == 0 or in `[2, page_count)`, `crc32`). Choose the
 **valid** slot with the **highest `txid`**; on a tie, slot 0. Exactly one valid → use it (torn-write
 fallback). Neither valid → `data_corrupted`. The chosen meta's `free_list_head` is followed to load
@@ -546,8 +560,8 @@ columns and the index list after the checks, and retires column-flag bit0):
 | per index (×`index_count`): | |
 | &nbsp;&nbsp;`index_name_len` | u16 |
 | &nbsp;&nbsp;`index_name` | UTF-8 (original case) |
-| &nbsp;&nbsp;`key_col_count` | u16 — ≥ 1; per index key column: |
-| &nbsp;&nbsp;`key_ordinal` ×`key_col_count` | u16 each — column ordinals in **index-key order**; each must be `< col_count` (duplicates allowed — indexes.md §1; else `XX001`) |
+| &nbsp;&nbsp;`key_col_count` | u16 — ≥ 1; per index key **element** (a column or, **v26**, an expression): |
+| &nbsp;&nbsp;`key_element` ×`key_col_count` | per element a `u16` in **index-key order**: a **column ordinal** (`< col_count`; duplicates allowed — indexes.md §1; an out-of-range non-sentinel ordinal is `XX001`), **or** the sentinel **`0xFFFF`** (**new in v26**) marking an **expression key**, immediately followed by a `u16 expr_len` + `expr_len` UTF-8 bytes of the expression's canonical text (*Check-expression text* below). An expression element re-parses at load (`XX001` on failure) and re-resolves against this table's columns to recover its result type; a plain column index writes no `0xFFFF` and is byte-identical to v6 |
 | &nbsp;&nbsp;`index_flags` | u8 — bit0 `unique` (**new in v6** — indexes.md §8); bits 1–7 reserved, written 0 (a set reserved bit is `XX001`) |
 | &nbsp;&nbsp;`index_kind` | u8 — **new in v13**: `0` = ordered B-tree, `1` = GIN ([../design/gin.md](../design/gin.md)); `2` = GiST (**new in v20** — a persisted R-tree, `index_root_page` points at its root, pages 5/6 above, [../design/gist.md](../design/gist.md)); `3…` reserved. At v20 a value `> 2` is `XX001`. A GIN/GiST index always has `index_flags` bit0 (`unique`) clear |
 | &nbsp;&nbsp;`index_root_page` | u32 — the root B-tree node of this index, or 0 if the table has no rows |

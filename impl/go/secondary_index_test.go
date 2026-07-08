@@ -90,8 +90,8 @@ func TestIndexAutoNamingMatchesPostgres(t *testing.T) {
 	if !slices.Equal(names, want) {
 		t.Fatalf("index names = %v, want %v", names, want)
 	}
-	if !slices.Equal(tab.Indexes[1].Columns, []int{0, 1}) || !slices.Equal(tab.Indexes[2].Columns, []int{1, 1}) {
-		t.Fatalf("index columns wrong: %v / %v", tab.Indexes[1].Columns, tab.Indexes[2].Columns)
+	if !slices.Equal(tab.Indexes[1].columnOrdinals(), []int{0, 1}) || !slices.Equal(tab.Indexes[2].columnOrdinals(), []int{1, 1}) {
+		t.Fatalf("index columns wrong: %v / %v", tab.Indexes[1].columnOrdinals(), tab.Indexes[2].columnOrdinals())
 	}
 	if !slices.Equal(tab.PKIndices(), []int{0}) {
 		t.Fatalf("pk = %v, want [0]", tab.PKIndices())
@@ -217,7 +217,7 @@ func TestIndexRoundTripsThroughTheImage(t *testing.T) {
 		t.Fatal("reload is not byte-stable")
 	}
 	tab, _ := loaded.Table("t")
-	if len(tab.Indexes) != 1 || tab.Indexes[0].Name != "t_v_idx" || !slices.Equal(tab.Indexes[0].Columns, []int{1}) {
+	if len(tab.Indexes) != 1 || tab.Indexes[0].Name != "t_v_idx" || !slices.Equal(tab.Indexes[0].columnOrdinals(), []int{1}) {
 		t.Fatalf("reloaded indexes = %+v", tab.Indexes)
 	}
 	if got := siCost(t, loaded, "SELECT id FROM t WHERE v = 3"); got != 17 {

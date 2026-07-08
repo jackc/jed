@@ -18,6 +18,7 @@ import type {
   Expr,
   GroupItem,
   IdentitySpec,
+  IndexKeyElem,
   ConflictTarget,
   Insert,
   InsertValue,
@@ -946,15 +947,51 @@ class Parser {
       using = this.expectIdentifier();
     }
     this.expect("lparen");
-    const columns: string[] = [];
+    const keys: IndexKeyElem[] = [];
     for (;;) {
-      columns.push(this.expectIdentifier());
+      keys.push(this.parseIndexElement());
       const tok = this.advance();
       if (tok.kind === "comma") continue;
       if (tok.kind === "rparen") break;
       throw engineError("syntax_error", `expected ',' or ')', found ${tok.kind}`);
     }
-    return { kind: "createIndex", name, table, db, columns, unique, using };
+    return { kind: "createIndex", name, table, db, keys, unique, using };
+  }
+
+  // parseIndexElement parses one `index_element` (grammar.md §30, indexes.md §1): a bare column,
+  // a bare function call (`lower(email)`), or a parenthesized expression (`(a + b)`). PostgreSQL's
+  // `index_elem`: a general operator expression must be parenthesized (a bare `a + b` errors —
+  // parsePrimary stops before the operator, so the element loop then sees an unexpected token); a
+  // parenthesized bare column `(a)` normalizes to a column key. The token span between the delimiters
+  // is re-rendered as the persisted canonical text (format.md "Check-expression text"), like CHECK.
+  private parseIndexElement(): IndexKeyElem {
+    if (this.peek().kind === "lparen") {
+      // `( expr )` — any parenthesized expression.
+      this.advance();
+      const start = this.pos;
+      const expr = this.parseExpr();
+      const text = renderTokens(this.tokens.slice(start, this.pos));
+      this.expect("rparen");
+      return this.indexKeyFromExpr(expr, text);
+    }
+    if (this.peek().kind === "word" && this.peekKindAt(1) === "lparen") {
+      // A bare function call `f(args)` — parse ONLY the primary, so a trailing operator
+      // (`lower(x) + 1`) leaves `+` for the element loop to reject (PG requires parens).
+      const start = this.pos;
+      const expr = this.parsePrimary();
+      const text = renderTokens(this.tokens.slice(start, this.pos));
+      return this.indexKeyFromExpr(expr, text);
+    }
+    // A bare column name.
+    return { kind: "column", name: this.expectIdentifier() };
+  }
+
+  // indexKeyFromExpr classifies a parsed index-element expression: a bare column reference (`a`,
+  // `(a)`, `((a))`) becomes a column key (PG-matched), anything else an expression key carrying its
+  // canonical text (rendered from the captured token span, like CHECK/DEFAULT).
+  private indexKeyFromExpr(expr: Expr, text: string): IndexKeyElem {
+    if (expr.kind === "column") return { kind: "column", name: expr.name };
+    return { kind: "expr", text, expr };
   }
 
   // parseDropIndex parses `DROP INDEX <name>` (spec/design/grammar.md §30). A missing

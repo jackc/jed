@@ -141,24 +141,42 @@ pub(crate) fn build_index_access_predicate(
     if idx.kind != IndexKind::Btree {
         return None;
     }
+    // Resolve the index's key elements (column ordinals + resolved expression keys). A resolution
+    // failure yields no bound (a full scan — always sound). indexes.md §5.
+    let rindex = catalog.resolve_index(rel.table, idx).ok()?;
     let mut eq_cols: Vec<IndexEqCol> = Vec::new();
     let mut range: Option<IndexRange> = None;
-    for &ci in &idx.columns {
-        // A non-scalar (range/array/composite) column cannot be seeked here — stop the prefix.
-        let Some(ty) = rel.table.columns[ci].ty.as_scalar() else {
-            break;
-        };
-        // The column's key collation form (collation.md §8/§12): a `Skewed` collated column refuses
-        // the bound (its stored keys are wrong for the loaded bundle) — stop the prefix here (the
-        // column then falls into the fixed-width suffix check below and rejects the whole index if it
-        // is text). A `C` or `Full`-collated column is admissible.
-        let Some(coll) = key_collation_ctx(catalog, &rel.table.columns[ci]) else {
-            break;
-        };
+    for key in &rindex.keys {
+        // Each key element yields (its scalar key type, its key collation, the matcher against a
+        // WHERE conjunct operand). A non-scalar / skewed element stops the prefix.
+        let (ty, coll, matcher): (ScalarType, Option<std::sync::Arc<Collation>>, KeyMatch) =
+            match key {
+                ResolvedKey::Column(ci) => {
+                    let Some(ty) = rel.table.columns[*ci].ty.as_scalar() else {
+                        break; // a range/array/composite column cannot be seeked
+                    };
+                    // Collation.md §8/§12: a `Skewed` collated column refuses the bound (its stored
+                    // keys are wrong for the loaded bundle) — stop the prefix. `C`/`Full` admissible.
+                    let Some(coll) = key_collation_ctx(catalog, &rel.table.columns[*ci]) else {
+                        break;
+                    };
+                    (ty, coll, KeyMatch::Column(rel.offset + *ci))
+                }
+                ResolvedKey::Expr(rexpr, ety, ecoll) => {
+                    // An expression key seeks only when its result is a scalar and its collation is
+                    // `C` (the common `lower(email)` shape). A collated-expression bound is a
+                    // deferred follow-on (§5). Match a WHERE operand structurally against the key.
+                    let Some(ty) = ety.as_scalar() else { break };
+                    if ecoll.is_some() {
+                        break;
+                    }
+                    (ty, None, KeyMatch::Expr(rexpr, rel.offset))
+                }
+            };
         let mut terms = Vec::new();
         collect_bound_terms(
             filter,
-            rel.offset + ci,
+            &matcher,
             ty,
             coll.as_ref().map(|c| c.name.as_str()),
             sibling_cutoff,
@@ -180,17 +198,21 @@ pub(crate) fn build_index_access_predicate(
                 terms: ranges,
             });
         }
-        break; // first non-equality column ends the prefix (with or without a trailing range)
+        break; // first non-equality element ends the prefix (with or without a trailing range)
     }
     if eq_cols.is_empty() && range.is_none() {
         return None; // nothing bound
     }
-    // Eligibility: every index column from the range column onward (`columns[eq_cols.len()..]`) is
-    // width-skipped past the known equality prefix, so each must be a fixed-width scalar. The
-    // equality-prefix columns may be any width — their slots are matched as the known prefix bytes.
-    let mut suffix_types = Vec::with_capacity(idx.columns.len() - eq_cols.len());
-    for &c in &idx.columns[eq_cols.len()..] {
-        let s = rel.table.columns[c].ty.as_scalar()?;
+    // Eligibility: every key element from the range element onward (`keys[eq_cols.len()..]`) is
+    // width-skipped past the known equality prefix to recover the storage key, so each must be a
+    // fixed-width scalar (a column's type, or an expression's result type). The equality-prefix
+    // elements may be any width — their slots are matched as the known prefix bytes.
+    let mut suffix_types = Vec::with_capacity(rindex.keys.len() - eq_cols.len());
+    for key in &rindex.keys[eq_cols.len()..] {
+        let s = match key {
+            ResolvedKey::Column(ci) => rel.table.columns[*ci].ty.as_scalar()?,
+            ResolvedKey::Expr(_, ety, _) => ety.as_scalar()?,
+        };
         if !s.is_fixed_width() {
             return None;
         }
@@ -270,11 +292,16 @@ pub(crate) fn detect_scan_bound(
         if idx.kind != IndexKind::Btree {
             continue;
         }
-        let ci = idx.columns[0];
+        // The OR/IN merged-point-lookup bound is column-only this slice (an expression index takes
+        // the access-predicate path — indexes.md §5; OR/IN over an expression key is a follow-on).
+        let Some(cols) = idx.column_ordinals() else {
+            continue;
+        };
+        let ci = cols[0];
         let Some(ty) = rel.table.columns[ci].ty.as_scalar() else {
             continue;
         };
-        if idx.columns[1..].iter().any(|&c| {
+        if cols[1..].iter().any(|&c| {
             rel.table.columns[c]
                 .ty
                 .as_scalar()
@@ -290,7 +317,7 @@ pub(crate) fn detect_scan_bound(
                 name_key: idx.name.to_ascii_lowercase(),
                 col_type: ty,
                 coll,
-                tail_types: idx.columns[1..]
+                tail_types: cols[1..]
                     .iter()
                     .map(|&c| rel.table.columns[c].ty.scalar())
                     .collect(),
@@ -408,11 +435,12 @@ pub(crate) fn detect_inl_bound(
     // none), with sibling columns admitted.
     let collect = |key_idx: usize, ty: ScalarType, ccoll: Option<&str>| -> Vec<BoundTerm> {
         let mut terms = Vec::new();
+        let km = KeyMatch::Column(key_idx);
         if let Some(f) = on {
-            collect_bound_terms(f, key_idx, ty, ccoll, cutoff, &mut terms);
+            collect_bound_terms(f, &km, ty, ccoll, cutoff, &mut terms);
         }
         if let Some(f) = where_filter {
-            collect_bound_terms(f, key_idx, ty, ccoll, cutoff, &mut terms);
+            collect_bound_terms(f, &km, ty, ccoll, cutoff, &mut terms);
         }
         terms
     };
@@ -444,11 +472,16 @@ pub(crate) fn detect_inl_bound(
         if idx.kind != IndexKind::Btree {
             continue;
         }
-        let ci = idx.columns[0];
+        // The index-nested-loop sibling bound is column-only this slice (an expression index takes
+        // the access-predicate path — indexes.md §5; an INL bound over an expression key is a follow-on).
+        let Some(cols) = idx.column_ordinals() else {
+            continue;
+        };
+        let ci = cols[0];
         let Some(ty) = rel.table.columns[ci].ty.as_scalar() else {
             continue;
         };
-        if idx.columns[1..].iter().any(|&c| {
+        if cols[1..].iter().any(|&c| {
             rel.table.columns[c]
                 .ty
                 .as_scalar()
@@ -478,7 +511,7 @@ pub(crate) fn detect_inl_bound(
                     srcs: eqs,
                 }],
                 range: None,
-                suffix_types: idx.columns[1..]
+                suffix_types: cols[1..]
                     .iter()
                     .map(|&c| rel.table.columns[c].ty.scalar())
                     .collect(),
@@ -662,7 +695,12 @@ pub(crate) fn order_satisfied_by_index(
         if idx.kind != IndexKind::Btree {
             continue; // only an ordered B-tree realizes the column order (GIN/GiST do not)
         }
-        if order.len() != idx.columns.len() {
+        // ORDER-BY skip-sort is column-only this slice (matching ORDER BY against an expression
+        // index key is a follow-on — indexes.md §5).
+        let Some(cols) = idx.column_ordinals() else {
+            continue;
+        };
+        if order.len() != cols.len() {
             continue; // the ORDER BY must be EXACTLY the index columns (see the doc — tie-break)
         }
         let matches = order
@@ -672,10 +710,10 @@ pub(crate) fn order_satisfied_by_index(
                 if *descending || *nulls_first {
                     return false; // ASC + NULLS LAST only — the order a forward index walk realizes
                 }
-                if *slot != offset + idx.columns[i] {
+                if *slot != offset + cols[i] {
                     return false; // the i-th index column, in key order
                 }
-                match key_collation_ctx(catalog, &table.columns[idx.columns[i]]) {
+                match key_collation_ctx(catalog, &table.columns[cols[i]]) {
                     None => false, // Skewed / unresolvable — never walked for order (§12)
                     Some(None) => coll.is_none(),
                     Some(Some(c)) => matches!(coll, Some(c2) if c2.name == c.name),
@@ -706,7 +744,7 @@ pub(crate) fn detect_gin_bound(
         if idx.kind != IndexKind::Gin {
             continue;
         }
-        let ci = idx.columns[0];
+        let ci = idx.first_column();
         let col_global = offset + ci;
         let Some(elem_ty) = columns[ci].ty.array_element().map(|t| t.scalar()) else {
             continue; // a GIN column is always an array (the CREATE INDEX gate); defensive
@@ -741,10 +779,10 @@ pub(crate) fn detect_gist_bound(
         // The planner gather is single-operator: only a single-column GiST index accelerates a
         // `col && Q` / `col @> Q` / `col = Q` conjunct. A multi-column GiST index (an EXCLUDE
         // backing structure, gist.md §7) is probed only by the constraint, never the planner.
-        if idx.columns.len() != 1 {
+        if idx.keys.len() != 1 {
             continue;
         }
-        let ci = idx.columns[0];
+        let ci = idx.first_column();
         let col_global = offset + ci;
         let col_ty = &columns[ci].ty;
         if col_ty.range_element().is_some() {
@@ -1017,28 +1055,115 @@ pub(crate) fn rexpr_is_constant(e: &RExpr) -> bool {
 }
 
 /// A secondary-index entry key (spec/design/indexes.md §3): each indexed column as the
+/// One key element of an index resolved for a statement's maintenance (spec/design/indexes.md §4):
+/// a plain column (by ordinal — encoded from `columns[ord].ty` + `colls[ord]`), or a resolved
+/// **expression** carrying its `RExpr`, its encoding [`Type`], and its collation (evaluated against
+/// each row, unmetered, to yield the key value). Built once per statement by
+/// [`Engine::resolve_index`](super::Engine) from an [`IndexDef`].
+pub(crate) enum ResolvedKey {
+    Column(usize),
+    Expr(RExpr, Type, Option<std::sync::Arc<Collation>>),
+}
+
+/// An index resolved for one statement's maintenance: the def's identity (name / unique / kind)
+/// plus its per-element [`ResolvedKey`]s. Owned (no borrow of the catalog) so the write paths can
+/// mutate stores while holding it. GIN/GiST indexes are always plain-column (this slice), so their
+/// entry builders read the ordinals back via [`ResolvedKey::Column`].
+pub(crate) struct ResolvedIndex {
+    pub name: String,
+    pub unique: bool,
+    pub kind: IndexKind,
+    pub keys: Vec<ResolvedKey>,
+}
+
+impl ResolvedIndex {
+    /// The plain-column ordinals of a GIN/GiST index (always all columns, this slice).
+    fn column_ordinals(&self) -> Vec<usize> {
+        self.keys
+            .iter()
+            .map(|k| match k {
+                ResolvedKey::Column(c) => *c,
+                ResolvedKey::Expr(..) => unreachable!("GIN/GiST index keys are plain columns"),
+            })
+            .collect()
+    }
+}
+
+/// The order-preserving key [`Type`] an index-expression result encodes under, or `None` when the
+/// result type is not key-encodable (a composite / json / unknown result — `0A000` at CREATE INDEX).
+/// Every scalar is keyable (encoding.md §2); a keyable-scalar-element array/range is too.
+pub(crate) fn resolved_to_key_type(rt: &ResolvedType) -> Option<Type> {
+    Some(match rt {
+        ResolvedType::Int(st) | ResolvedType::Float(st) => Type::Scalar(*st),
+        ResolvedType::Bool => Type::Scalar(ScalarType::Bool),
+        ResolvedType::Text => Type::Scalar(ScalarType::Text),
+        ResolvedType::Decimal => Type::Scalar(ScalarType::Decimal),
+        ResolvedType::Bytea => Type::Scalar(ScalarType::Bytea),
+        ResolvedType::Uuid => Type::Scalar(ScalarType::Uuid),
+        ResolvedType::Timestamp => Type::Scalar(ScalarType::Timestamp),
+        ResolvedType::Timestamptz => Type::Scalar(ScalarType::Timestamptz),
+        ResolvedType::Interval => Type::Scalar(ScalarType::Interval),
+        ResolvedType::Date => Type::Scalar(ScalarType::Date),
+        ResolvedType::Array(elem) => {
+            let et = resolved_to_key_type(elem)?;
+            if !is_keyable_scalar(&et) {
+                return None; // a composite-element array is not keyable
+            }
+            Type::Array(Box::new(et))
+        }
+        ResolvedType::Range(elem) => Type::Range(Box::new(resolved_to_key_type(elem)?)),
+        ResolvedType::Null
+        | ResolvedType::Composite(_)
+        | ResolvedType::Json
+        | ResolvedType::Jsonb
+        | ResolvedType::JsonPath => return None,
+    })
+}
+
+/// One key element's value + encoding type + collation for a row: the column value (a column key)
+/// or the evaluated expression (an expression key — unmetered, `env` for the immutable eval).
+/// Index maintenance is unmetered (cost.md §3), so a throwaway [`Meter`] absorbs the eval charge.
+fn index_key_slot<'a>(
+    key: &'a ResolvedKey,
+    columns: &'a [Column],
+    colls: &'a [Option<std::sync::Arc<Collation>>],
+    row: &Row,
+    env: &EvalEnv,
+) -> Result<(Value, &'a Type, Option<&'a Collation>)> {
+    Ok(match key {
+        ResolvedKey::Column(ci) => (row[*ci].clone(), &columns[*ci].ty, colls[*ci].as_deref()),
+        ResolvedKey::Expr(rx, ty, coll) => {
+            let mut m = Meter::new(); // maintenance eval is unmetered (cost.md §3)
+            (rx.eval(row, env, &mut m)?, ty, coll.as_deref())
+        }
+    })
+}
+
 /// encoding.md §2.2 nullable slot — `0x00` + the type's bare order-preserving key bytes when
 /// present, the lone `0x01` for NULL (always tagged, even for a NOT NULL column) — then the
-/// row's storage key as the suffix. The indexed value is always resident (never `Unfetched`):
+/// row's storage key as the suffix. A column key's value is always resident (never `Unfetched`):
 /// a fixed-width type never spills, and a `text`/`bytea` value large enough to spill would
-/// produce an over-`RECORD_MAX` entry key, rejected `0A000` at the insert that stored it — so
-/// any value that actually reached the index is small enough to stay inline.
+/// produce an over-`RECORD_MAX` entry key, rejected `0A000` at the insert that stored it. An
+/// expression key evaluates against the row (spec/design/indexes.md §4); a referenced spilled
+/// value faults in through the evaluator's `Unfetched` backstop.
 pub(crate) fn index_entry_key(
     columns: &[Column],
     colls: &[Option<std::sync::Arc<Collation>>],
-    def: &IndexDef,
+    rindex: &ResolvedIndex,
     storage_key: &[u8],
     row: &Row,
+    env: &EvalEnv,
 ) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    for &ci in &def.columns {
-        match &row[ci] {
+    for key in &rindex.keys {
+        let (val, ty, coll) = index_key_slot(key, columns, colls, row, env)?;
+        match val {
             Value::Null => out.push(0x01),
             v => {
-                // present tag, then the column type's order-preserving key (range-aware §2.11,
+                // present tag, then the type's order-preserving key (range-aware §2.11,
                 // collated-text-aware §2.12)
                 out.push(0x00);
-                out.extend_from_slice(&encode_typed_key(&columns[ci].ty, v, colls[ci].as_deref())?);
+                out.extend_from_slice(&encode_typed_key(ty, &v, coll)?);
             }
         }
     }
@@ -1050,18 +1175,66 @@ pub(crate) fn index_entry_key(
 /// (B-tree) index — the §3 nullable-slot entry key — or one per DISTINCT non-NULL element for a
 /// GIN index. Every write path (build, INSERT, DELETE, UPDATE) treats an index uniformly as "a
 /// row maps to a set of entries." `colls` (column-ordinal-indexed) selects each text key column's
-/// collated form (§2.12); GIN elements are fixed-width, so a GIN index never collates.
+/// collated form (§2.12); GIN elements are fixed-width, so a GIN index never collates. `env`
+/// evaluates any expression key element (B-tree only — GIN/GiST are plain-column, this slice).
 pub(crate) fn index_entry_keys(
+    columns: &[Column],
+    colls: &[Option<std::sync::Arc<Collation>>],
+    rindex: &ResolvedIndex,
+    storage_key: &[u8],
+    row: &Row,
+    env: &EvalEnv,
+) -> Result<Vec<Vec<u8>>> {
+    Ok(match rindex.kind {
+        IndexKind::Btree => vec![index_entry_key(
+            columns,
+            colls,
+            rindex,
+            storage_key,
+            row,
+            env,
+        )?],
+        IndexKind::Gin => gin_entries(columns, &rindex.column_ordinals(), storage_key, row),
+        IndexKind::Gist => gist_entries(columns, &rindex.column_ordinals(), storage_key, row),
+    })
+}
+
+/// Entry keys for a COLUMN-ONLY index, without an eval env (spec/design/indexes.md §4) — the
+/// collation-realign rebuild path, which runs on a `Snapshot` with no `Engine` to evaluate an
+/// expression key. An expression index is C-collated (its keys never change on a collation
+/// upgrade — indexes.md §1), so it is rebuilt at the Engine level instead; this asserts the
+/// index is plain-column.
+pub(crate) fn index_entry_keys_columns(
     columns: &[Column],
     colls: &[Option<std::sync::Arc<Collation>>],
     def: &IndexDef,
     storage_key: &[u8],
     row: &Row,
 ) -> Result<Vec<Vec<u8>>> {
+    let cols = def
+        .column_ordinals()
+        .expect("index_entry_keys_columns called on an expression index");
     Ok(match def.kind {
-        IndexKind::Btree => vec![index_entry_key(columns, colls, def, storage_key, row)?],
-        IndexKind::Gin => gin_entries(columns, def, storage_key, row),
-        IndexKind::Gist => gist_entries(columns, def, storage_key, row),
+        IndexKind::Btree => {
+            let mut out = Vec::new();
+            for &ci in &cols {
+                match &row[ci] {
+                    Value::Null => out.push(0x01),
+                    v => {
+                        out.push(0x00);
+                        out.extend_from_slice(&encode_typed_key(
+                            &columns[ci].ty,
+                            v,
+                            colls[ci].as_deref(),
+                        )?);
+                    }
+                }
+            }
+            out.extend_from_slice(storage_key);
+            vec![out]
+        }
+        IndexKind::Gin => gin_entries(columns, &cols, storage_key, row),
+        IndexKind::Gist => gist_entries(columns, &cols, storage_key, row),
     })
 }
 
@@ -1074,13 +1247,13 @@ pub(crate) fn index_entry_keys(
 /// precedent). The empty range is a real value and IS indexed.
 pub(crate) fn gist_entries(
     columns: &[Column],
-    def: &IndexDef,
+    cols: &[usize],
     storage_key: &[u8],
     row: &Row,
 ) -> Vec<Vec<u8>> {
     // Pre-encode scalar key bytes so the borrowed `GistLeafComp::Scalar(&[u8])` outlives the build.
     let mut scalar_keys: Vec<Vec<u8>> = Vec::new();
-    for &ci in &def.columns {
+    for &ci in cols {
         let col = &columns[ci];
         if matches!(row[ci], Value::Null) {
             return Vec::new(); // any NULL excluded column → row not indexed (NULL rule)
@@ -1093,9 +1266,9 @@ pub(crate) fn gist_entries(
             scalar_keys.push(k);
         }
     }
-    let mut comps: Vec<crate::gist::GistLeafComp> = Vec::with_capacity(def.columns.len());
+    let mut comps: Vec<crate::gist::GistLeafComp> = Vec::with_capacity(cols.len());
     let mut next_scalar = 0usize;
-    for &ci in &def.columns {
+    for &ci in cols {
         let col = &columns[ci];
         match col.ty.range_element() {
             Some(elem) => match &row[ci] {
@@ -1233,11 +1406,11 @@ pub(crate) fn is_gist_deferred_scalar_type(ty: &Type) -> bool {
 /// the per-row order is deterministic. `array_ops` over any fixed-width key-encodable element type.
 pub(crate) fn gin_entries(
     columns: &[Column],
-    def: &IndexDef,
+    cols: &[usize],
     storage_key: &[u8],
     row: &Row,
 ) -> Vec<Vec<u8>> {
-    let ci = def.columns[0];
+    let ci = cols[0];
     let elem_ty = columns[ci]
         .ty
         .array_element()
@@ -1301,18 +1474,20 @@ pub(crate) fn encode_pk_key(
 pub(crate) fn index_prefix_key(
     columns: &[Column],
     colls: &[Option<std::sync::Arc<Collation>>],
-    def: &IndexDef,
+    rindex: &ResolvedIndex,
     row: &Row,
+    env: &EvalEnv,
 ) -> Result<Option<Vec<u8>>> {
     let mut out = Vec::new();
-    for &ci in &def.columns {
-        match &row[ci] {
+    for key in &rindex.keys {
+        let (val, ty, coll) = index_key_slot(key, columns, colls, row, env)?;
+        match val {
             Value::Null => return Ok(None),
             v => {
-                // present tag, then the column type's order-preserving key (range-aware §2.11,
+                // present tag, then the type's order-preserving key (range-aware §2.11,
                 // collated-text-aware §2.12)
                 out.push(0x00);
-                out.extend_from_slice(&encode_typed_key(&columns[ci].ty, v, colls[ci].as_deref())?);
+                out.extend_from_slice(&encode_typed_key(ty, &v, coll)?);
             }
         }
     }
@@ -1552,10 +1727,17 @@ pub(crate) fn fk_probe(
         let idx = parent
             .indexes
             .iter()
-            .find(|i| i.unique && sorted_unique(&i.columns) == ref_set)
+            .find(|i| {
+                i.unique
+                    && i.column_ordinals()
+                        .is_some_and(|c| sorted_unique(&c) == ref_set)
+            })
             .expect("referenced columns matched a unique key at CREATE TABLE §6.2");
+        let idx_cols = idx
+            .column_ordinals()
+            .expect("FK target is a plain-column unique index");
         let mut prefix = Vec::new();
-        for &pcol in &idx.columns {
+        for &pcol in &idx_cols {
             prefix.push(0x00);
             prefix.extend_from_slice(&encode_typed_key(
                 &parent.columns[pcol].ty,
@@ -1583,7 +1765,7 @@ pub(crate) fn detect_pk_bound(
     let mut terms = Vec::new();
     collect_bound_terms(
         filter,
-        pk_idx,
+        &KeyMatch::Column(pk_idx),
         pk_type,
         coll.as_ref().map(|c| c.name.as_str()),
         None,
@@ -1604,9 +1786,98 @@ pub(crate) fn detect_pk_bound(
 /// reference whose GLOBAL index is `< cut` — an EARLIER join relation's column — is a valid bound
 /// source (`BoundSrc::Sibling`), resolved per outer row from the combined left-hand row. `None`
 /// (the ordinary once-materialized bound) accepts only literals/params/outer references.
+/// What a bound's key operand is (spec/design/indexes.md §5): a plain column at a global ordinal
+/// (the PK bound and a column index key), or a resolved index EXPRESSION matched structurally
+/// against a WHERE conjunct operand (an expression index key). For the expression form, the key's
+/// `Column(i)` is table-local and matches a WHERE `Column(i + offset)`.
+pub(crate) enum KeyMatch<'a> {
+    Column(usize),
+    Expr(&'a RExpr, usize),
+}
+
+impl KeyMatch<'_> {
+    fn matches(&self, x: &RExpr) -> bool {
+        match self {
+            KeyMatch::Column(idx) => matches!(x, RExpr::Column(i) if *i == *idx),
+            KeyMatch::Expr(e, offset) => rexpr_eq_shifted(x, e, *offset),
+        }
+    }
+}
+
+/// A SOUND-if-incomplete structural equality for index-expression matching (spec/design/indexes.md
+/// §5): does the WHERE conjunct operand `a` (GLOBAL column indices) equal the resolved index key
+/// expression `b` (table-local `Column(i)`, matched as `Column(i + offset)`)? Covers the common
+/// index-expression shapes; any unrecognized / typmod-bearing shape returns `false` — a missed
+/// bound is always sound (a full scan + residual filter), matching PostgreSQL's syntactic (not
+/// semantic) index-expression matching.
+pub(crate) fn rexpr_eq_shifted(a: &RExpr, b: &RExpr, offset: usize) -> bool {
+    use RExpr::*;
+    match (a, b) {
+        (Column(x), Column(y)) => *x == *y + offset,
+        (ConstInt(x), ConstInt(y)) => x == y,
+        (ConstBool(x), ConstBool(y)) => x == y,
+        (ConstText(x), ConstText(y)) => x == y,
+        (ConstNull, ConstNull) => true,
+        (
+            ScalarFunc {
+                func: fa, args: aa, ..
+            },
+            ScalarFunc {
+                func: fb, args: ab, ..
+            },
+        ) => {
+            fa == fb
+                && aa.len() == ab.len()
+                && aa
+                    .iter()
+                    .zip(ab)
+                    .all(|(x, y)| rexpr_eq_shifted(x, y, offset))
+        }
+        (
+            Arith {
+                op: oa,
+                lhs: la,
+                rhs: ra,
+                ..
+            },
+            Arith {
+                op: ob,
+                lhs: lb,
+                rhs: rb,
+                ..
+            },
+        ) => oa == ob && rexpr_eq_shifted(la, lb, offset) && rexpr_eq_shifted(ra, rb, offset),
+        (
+            Cast {
+                inner: ia,
+                target: ta,
+                typmod: None,
+                varchar_len: None,
+            },
+            Cast {
+                inner: ib,
+                target: tb,
+                typmod: None,
+                varchar_len: None,
+            },
+        ) => ta == tb && rexpr_eq_shifted(ia, ib, offset),
+        (Neg { operand: x, .. }, Neg { operand: y, .. }) => rexpr_eq_shifted(x, y, offset),
+        (Not(x), Not(y)) => rexpr_eq_shifted(x, y, offset),
+        // `lower(x)` / `upper(x)` (spec/design/collation.md §16) resolve to a dedicated `Casing`
+        // node — NOT `ScalarFunc` — so an index on `lower(email)` (the headline expression-index
+        // shape) matches ONLY if this arm is present. The fold is deterministic (engine-global
+        // casing regime, identical at index-build and query-eval), so the match is sound: same
+        // `upper` direction + a matching argument.
+        (Casing { upper: ua, arg: aa }, Casing { upper: ub, arg: ab }) => {
+            ua == ub && rexpr_eq_shifted(aa, ab, offset)
+        }
+        _ => false,
+    }
+}
+
 pub(crate) fn collect_bound_terms(
     e: &RExpr,
-    pk_idx: usize,
+    key: &KeyMatch,
     pk_type: ScalarType,
     col_coll: Option<&str>,
     sibling_cutoff: Option<usize>,
@@ -1614,8 +1885,8 @@ pub(crate) fn collect_bound_terms(
 ) {
     match e {
         RExpr::And(l, r) => {
-            collect_bound_terms(l, pk_idx, pk_type, col_coll, sibling_cutoff, terms);
-            collect_bound_terms(r, pk_idx, pk_type, col_coll, sibling_cutoff, terms);
+            collect_bound_terms(l, key, pk_type, col_coll, sibling_cutoff, terms);
+            collect_bound_terms(r, key, pk_type, col_coll, sibling_cutoff, terms);
         }
         // `<>` is not a contiguous range, so it never seeds an index/PK bound — it stays in the
         // residual filter (a full scan + filter). Skipping it here keeps the deterministic cost
@@ -1638,8 +1909,8 @@ pub(crate) fn collect_bound_terms(
         } if !matches!(op, CmpOp::Ne)
             && collation.as_ref().map(|c| c.name.as_str()) == col_coll =>
         {
-            let is_pk = |x: &RExpr| matches!(x, RExpr::Column(i) if *i == pk_idx);
-            // The PK on either side (op flipped when it is on the right); the other side a
+            let is_pk = |x: &RExpr| key.matches(x);
+            // The key operand on either side (op flipped when it is on the right); the other side a
             // matching-type const-source. Anything else contributes no term.
             let term = if is_pk(lhs) {
                 const_source(rhs, pk_type, sibling_cutoff).map(|src| BoundTerm { op: *op, src })
@@ -3562,6 +3833,184 @@ pub(crate) fn check_referenced_columns(e: &Expr, columns: &[Column]) -> Vec<usiz
     let mut out = Vec::new();
     walk(e, columns, &mut out);
     out
+}
+
+/// Whether an index-key expression contains a SUBQUERY (spec/design/indexes.md §2): a scalar
+/// subquery, `EXISTS`, `IN (subquery)`, or a quantified subquery. A subquery reads other rows, so
+/// it is not a deterministic function of this row — `0A000` at CREATE INDEX (PostgreSQL: "cannot
+/// use subquery in index expression"). Unlike an aggregate/window (rejected by resolution), the
+/// resolver admits an uncorrelated subquery, so it is caught here.
+pub(crate) fn index_expr_has_subquery(e: &Expr) -> bool {
+    match e {
+        Expr::ScalarSubquery(_)
+        | Expr::Exists(_)
+        | Expr::InSubquery { .. }
+        | Expr::QuantifiedSubquery { .. } => true,
+        Expr::Column(_)
+        | Expr::QualifiedColumn { .. }
+        | Expr::Literal(_)
+        | Expr::TypedLiteral { .. }
+        | Expr::Param(_)
+        | Expr::QualifiedStar { .. } => false,
+        Expr::Cast { inner, .. }
+        | Expr::Collate { inner, .. }
+        | Expr::Extract { source: inner, .. }
+        | Expr::Unary { operand: inner, .. }
+        | Expr::IsNull { operand: inner, .. }
+        | Expr::IsJson { operand: inner, .. }
+        | Expr::JsonCtor { operand: inner, .. }
+        | Expr::FieldAccess { base: inner, .. }
+        | Expr::FieldStar { base: inner } => index_expr_has_subquery(inner),
+        Expr::JsonExists { ctx, path, .. }
+        | Expr::JsonValue { ctx, path, .. }
+        | Expr::JsonQuery { ctx, path, .. } => {
+            index_expr_has_subquery(ctx) || index_expr_has_subquery(path)
+        }
+        Expr::Binary { lhs, rhs, .. }
+        | Expr::IsDistinctFrom { lhs, rhs, .. }
+        | Expr::Like { lhs, rhs, .. }
+        | Expr::Regex { lhs, rhs, .. } => {
+            index_expr_has_subquery(lhs) || index_expr_has_subquery(rhs)
+        }
+        Expr::In { lhs, list, .. } => {
+            index_expr_has_subquery(lhs) || list.iter().any(index_expr_has_subquery)
+        }
+        Expr::Quantified { lhs, array, .. } => {
+            index_expr_has_subquery(lhs) || index_expr_has_subquery(array)
+        }
+        Expr::Between { lhs, lo, hi, .. } => {
+            index_expr_has_subquery(lhs)
+                || index_expr_has_subquery(lo)
+                || index_expr_has_subquery(hi)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            els,
+        } => {
+            operand.as_deref().is_some_and(index_expr_has_subquery)
+                || whens
+                    .iter()
+                    .any(|(c, r)| index_expr_has_subquery(c) || index_expr_has_subquery(r))
+                || els.as_deref().is_some_and(index_expr_has_subquery)
+        }
+        Expr::FuncCall { args, .. } => args.iter().any(index_expr_has_subquery),
+        Expr::Row(items) | Expr::Array(items) => items.iter().any(index_expr_has_subquery),
+        Expr::Subscript { base, subscripts } => {
+            index_expr_has_subquery(base)
+                || subscripts
+                    .iter()
+                    .flat_map(subscript_spec_exprs)
+                    .any(index_expr_has_subquery)
+        }
+    }
+}
+
+/// The auto-name part for one index key element (spec/design/indexes.md §2, PG's
+/// `ChooseIndexColumnNames`): a column key contributes its (lowercased) column name; a
+/// bare-function-call expression its function name (`lower(email)` → `lower`); any other
+/// expression the literal `expr`.
+pub(crate) fn index_name_part(elem: &crate::ast::IndexKeyElem) -> String {
+    use crate::ast::IndexKeyElem;
+    match elem {
+        IndexKeyElem::Column(name) => name.to_ascii_lowercase(),
+        IndexKeyElem::Expr {
+            expr: Expr::FuncCall { name, .. },
+            ..
+        } => name.to_ascii_lowercase(),
+        IndexKeyElem::Expr { .. } => "expr".to_string(),
+    }
+}
+
+/// Whether an index-key expression calls a **non-immutable** built-in (spec/design/indexes.md §2):
+/// the entropy/clock seam (`uuidv4`/`uuidv7`/`now`/`clock_timestamp` — `current_timestamp` desugars
+/// to `now`) or the sequence functions (`nextval`/`currval`/`setval`/`lastval`) / `current_setting`.
+/// Such a function would let the index drift from the table, so it is `42P17` at CREATE INDEX. The
+/// walk mirrors [`check_referenced_columns`] (subqueries are already rejected by resolution). The
+/// session-timezone hazard (an expression over `timestamptz`) is handled separately by the caller
+/// (a referenced-`timestamptz`-column / `timestamptz`-result check), so this covers only calls.
+pub(crate) fn index_expr_nonimmutable_call(e: &Expr) -> bool {
+    fn is_nonimmutable(name: &str) -> bool {
+        matches!(
+            name.to_ascii_lowercase().as_str(),
+            "uuidv4"
+                | "uuidv7"
+                | "now"
+                | "clock_timestamp"
+                | "nextval"
+                | "currval"
+                | "setval"
+                | "lastval"
+                | "current_setting"
+        )
+    }
+    match e {
+        Expr::FuncCall { name, args, .. } => {
+            is_nonimmutable(name) || args.iter().any(index_expr_nonimmutable_call)
+        }
+        Expr::Column(_)
+        | Expr::QualifiedColumn { .. }
+        | Expr::Literal(_)
+        | Expr::TypedLiteral { .. }
+        | Expr::Param(_) => false,
+        Expr::Cast { inner, .. }
+        | Expr::Collate { inner, .. }
+        | Expr::Extract { source: inner, .. }
+        | Expr::Unary { operand: inner, .. }
+        | Expr::IsNull { operand: inner, .. }
+        | Expr::IsJson { operand: inner, .. }
+        | Expr::JsonCtor { operand: inner, .. } => index_expr_nonimmutable_call(inner),
+        Expr::JsonExists { ctx, path, .. }
+        | Expr::JsonValue { ctx, path, .. }
+        | Expr::JsonQuery { ctx, path, .. } => {
+            index_expr_nonimmutable_call(ctx) || index_expr_nonimmutable_call(path)
+        }
+        Expr::Binary { lhs, rhs, .. }
+        | Expr::IsDistinctFrom { lhs, rhs, .. }
+        | Expr::Like { lhs, rhs, .. }
+        | Expr::Regex { lhs, rhs, .. } => {
+            index_expr_nonimmutable_call(lhs) || index_expr_nonimmutable_call(rhs)
+        }
+        Expr::In { lhs, list, .. } => {
+            index_expr_nonimmutable_call(lhs) || list.iter().any(index_expr_nonimmutable_call)
+        }
+        Expr::Quantified { lhs, array, .. } => {
+            index_expr_nonimmutable_call(lhs) || index_expr_nonimmutable_call(array)
+        }
+        Expr::Between { lhs, lo, hi, .. } => {
+            index_expr_nonimmutable_call(lhs)
+                || index_expr_nonimmutable_call(lo)
+                || index_expr_nonimmutable_call(hi)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            els,
+        } => {
+            operand.as_deref().is_some_and(index_expr_nonimmutable_call)
+                || whens.iter().any(|(c, r)| {
+                    index_expr_nonimmutable_call(c) || index_expr_nonimmutable_call(r)
+                })
+                || els.as_deref().is_some_and(index_expr_nonimmutable_call)
+        }
+        Expr::Row(items) | Expr::Array(items) => items.iter().any(index_expr_nonimmutable_call),
+        Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => {
+            index_expr_nonimmutable_call(base)
+        }
+        Expr::Subscript { base, subscripts } => {
+            index_expr_nonimmutable_call(base)
+                || subscripts
+                    .iter()
+                    .flat_map(subscript_spec_exprs)
+                    .any(index_expr_nonimmutable_call)
+        }
+        // Rejected by resolution before this walk (0A000 subquery / select-item-only star).
+        Expr::QualifiedStar { .. }
+        | Expr::ScalarSubquery(_)
+        | Expr::Exists(_)
+        | Expr::InSubquery { .. }
+        | Expr::QuantifiedSubquery { .. } => false,
+    }
 }
 
 /// The environment threaded into the per-row evaluator (spec/design/grammar.md §26): the

@@ -19,7 +19,7 @@ use std::sync::atomic::Ordering;
 use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
     ExclusionConstraint, ExclusionElement, ExclusionOp, FkAction, ForeignKeyConstraint,
-    IdentityKind, IndexDef, IndexKind, SequenceDef, Table,
+    IdentityKind, IndexDef, IndexKey, IndexKeyExpr, IndexKind, SequenceDef, Table,
 };
 use crate::collation::Collation;
 use crate::decimal::Decimal;
@@ -81,7 +81,7 @@ const MAGIC: [u8; 4] = *b"JEDB";
 /// `bound_len u16 ‖ encode_range_body(union) ‖ child_page u32`. The catalog index entry is unchanged
 /// (the `index_root_page` slot points at the R-tree root, `0` for an empty index); only the node
 /// pages it reaches differ. A file with no GiST index still moves to v20 only by its version byte.
-const FORMAT_VERSION: u16 = 25;
+const FORMAT_VERSION: u16 = 26;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
 /// (`page_type`, `item_count`, `next_page`) plus a 4-byte per-page `crc32` (offset 12).
 pub(crate) const PAGE_HEADER: usize = 16;
@@ -2268,7 +2268,8 @@ fn serialize_gist_index<A: FnMut() -> u32>(
     // One opclass per indexed column (gist.md §7): single for a GX1/GX2 index, one per `WITH`
     // column for an EXCLUDE backing index.
     let ops: Vec<crate::gist::GistOpclass> = idx
-        .columns
+        .column_ordinals()
+        .expect("a GiST index is plain-column")
         .iter()
         .map(|&ci| crate::gist::opclass_for(&table.columns[ci].ty))
         .collect();
@@ -2666,9 +2667,20 @@ fn table_entry_bytes(table: &Table, root_data_page: u32, index_roots: &[u32]) ->
         let inm = idx.name.as_bytes();
         out.extend_from_slice(&(inm.len() as u16).to_be_bytes());
         out.extend_from_slice(inm);
-        out.extend_from_slice(&(idx.columns.len() as u16).to_be_bytes());
-        for &c in &idx.columns {
-            out.extend_from_slice(&(c as u16).to_be_bytes());
+        out.extend_from_slice(&(idx.keys.len() as u16).to_be_bytes());
+        for k in &idx.keys {
+            match k {
+                // A column key: its ordinal (< col_count, so never 0xFFFF).
+                IndexKey::Column(c) => out.extend_from_slice(&(*c as u16).to_be_bytes()),
+                // An expression key (v26): the 0xFFFF sentinel, then the canonical text
+                // (u16 len + UTF-8) — spec/design/indexes.md §6, format.md.
+                IndexKey::Expr(e) => {
+                    out.extend_from_slice(&0xFFFFu16.to_be_bytes());
+                    let t = e.expr_text.as_bytes();
+                    out.extend_from_slice(&(t.len() as u16).to_be_bytes());
+                    out.extend_from_slice(t);
+                }
+            }
         }
         out.push(if idx.unique { 1 } else { 0 });
         // v13: index_kind byte (0 = ordered B-tree, 1 = GIN — spec/design/gin.md §7).
@@ -3683,13 +3695,26 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u3
         if kc == 0 {
             return Err(corrupt("index with no key columns"));
         }
-        let mut cols = Vec::with_capacity(kc);
+        let mut keys = Vec::with_capacity(kc);
         for _ in 0..kc {
-            let ord = read_u16(buf, pos)? as usize;
-            if ord >= columns.len() {
-                return Err(corrupt("invalid index column ordinal"));
+            let ord = read_u16(buf, pos)?;
+            if ord == 0xFFFF {
+                // An expression key (v26): the sentinel, then the canonical text; re-parse it
+                // (XX001 on failure, like a stored CHECK — spec/design/indexes.md §6).
+                let text = read_string(buf, pos)?;
+                let expr = crate::parser::parse_expression(&text)
+                    .map_err(|_| corrupt("unparseable index expression"))?;
+                keys.push(IndexKey::Expr(IndexKeyExpr {
+                    expr_text: text,
+                    expr,
+                }));
+            } else {
+                let ord = ord as usize;
+                if ord >= columns.len() {
+                    return Err(corrupt("invalid index column ordinal"));
+                }
+                keys.push(IndexKey::Column(ord));
             }
-            cols.push(ord);
         }
         let iflags = read_u8(buf, pos)?;
         if iflags & !0b01 != 0 {
@@ -3703,10 +3728,15 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u3
             2 => IndexKind::Gist,
             _ => return Err(corrupt("unsupported index kind")),
         };
+        // A GIN/GiST index is single-column plain (this slice): an expression key on either is
+        // structurally impossible in a valid file.
+        if kind != IndexKind::Btree && !keys.iter().all(|k| matches!(k, IndexKey::Column(_))) {
+            return Err(corrupt("a non-btree index cannot have an expression key"));
+        }
         index_roots.push(read_u32(buf, pos)?);
         indexes.push(IndexDef {
             name: iname,
-            columns: cols,
+            keys,
             unique: iflags & 0b01 != 0,
             kind,
         });
