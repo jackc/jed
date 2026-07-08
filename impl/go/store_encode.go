@@ -59,8 +59,7 @@ func storeValue(v Value, colTy scalarType, typmod *decimalTypmod, varcharLen *ui
 	switch v.Kind {
 	case ValNull:
 		if notNull {
-			return Value{}, newError(NotNullViolation,
-				"null value in column "+colName+" violates not-null constraint")
+			return Value{}, newNotNullViolation(colName)
 		}
 		return NullValue(), nil
 	case ValInt:
@@ -294,8 +293,7 @@ func storeRange(v Value, elem colType, notNull bool, colName string) (Value, err
 	switch v.Kind {
 	case ValNull:
 		if notNull {
-			return Value{}, newError(NotNullViolation,
-				"null value in column "+colName+" violates not-null constraint")
+			return Value{}, newNotNullViolation(colName)
 		}
 		return NullValue(), nil
 	case ValRange:
@@ -343,8 +341,7 @@ func storeArray(v Value, elem colType, notNull bool, colName string) (Value, err
 	switch v.Kind {
 	case ValNull:
 		if notNull {
-			return Value{}, newError(NotNullViolation,
-				"null value in column "+colName+" violates not-null constraint")
+			return Value{}, newNotNullViolation(colName)
 		}
 		return NullValue(), nil
 	case ValArray:
@@ -373,8 +370,7 @@ func storeComposite(v Value, typeName string, fields []colField, notNull bool, c
 	switch v.Kind {
 	case ValNull:
 		if notNull {
-			return Value{}, newError(NotNullViolation,
-				"null value in column "+colName+" violates not-null constraint")
+			return Value{}, newNotNullViolation(colName)
 		}
 		return NullValue(), nil
 	case ValComposite:
@@ -448,8 +444,7 @@ func coerceVarcharStore(s string, varcharLen *uint32, colName string) (string, e
 	}
 	for _, c := range s[cut:] {
 		if c != ' ' {
-			return "", newError(StringDataRightTruncation,
-				fmt.Sprintf("value too long for type varchar(%d) in column %s", n, colName))
+			return "", newError(StringDataRightTruncation, fmt.Sprintf("value too long for type varchar(%d) in column %s", n, colName)).withDataType(fmt.Sprintf("varchar(%d)", n)).withColumn(colName)
 		}
 	}
 	return s[:cut], nil

@@ -66,7 +66,10 @@ export function decimalFromParts(
 }
 
 function overflow(): EngineError {
-  return engineError("numeric_value_out_of_range", "value out of range for type decimal");
+  return engineError(
+    "numeric_value_out_of_range",
+    "value out of range for type decimal",
+  ).withDataType("decimal");
 }
 
 function divByZero(): EngineError {

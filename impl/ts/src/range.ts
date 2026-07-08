@@ -165,7 +165,10 @@ function incrementDiscrete(v: Value, elem: ScalarType): Value {
   const max = ELEM_MAX_FINITE[elem] ?? 9223372036854775807n;
   const cur = boundInt(v);
   if (cur >= max) {
-    throw engineError("numeric_value_out_of_range", `value out of range for type ${elem}`);
+    throw engineError(
+      "numeric_value_out_of_range",
+      `value out of range for type ${elem}`,
+    ).withDataType(`${elem}`);
   }
   if (v.kind === "date") return { kind: "date", days: cur + 1n };
   return { kind: "int", int: cur + 1n };

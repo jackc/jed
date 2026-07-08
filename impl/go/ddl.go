@@ -1328,8 +1328,7 @@ func evalChecks(checks []namedCheck, relation string, row storedRow, env *evalEn
 			return err
 		}
 		if v.Kind == ValBool && !v.boolVal() {
-			return newError(CheckViolation,
-				"new row for relation "+relation+" violates check constraint "+c.name)
+			return newCheckViolation(relation, c.name)
 		}
 	}
 	return nil
@@ -2004,8 +2003,7 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 			}
 			if ok {
 				if seenPrefixes[string(prefix)] {
-					return outcome{}, newError(UniqueViolation,
-						"duplicate key value violates unique constraint: "+def.Name)
+					return outcome{}, newUniqueViolation(ci.Table, def.Name)
 				}
 				seenPrefixes[string(prefix)] = true
 			}

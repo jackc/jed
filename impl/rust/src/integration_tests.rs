@@ -73,6 +73,8 @@ mod drop_table;
 mod encoding;
 #[path = "../tests/ergonomic.rs"]
 mod ergonomic;
+#[path = "../tests/error_fields.rs"]
+mod error_fields;
 #[path = "../tests/execute_script.rs"]
 mod execute_script;
 #[path = "../tests/explain.rs"]

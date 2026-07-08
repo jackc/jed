@@ -207,6 +207,7 @@ fn increment(v: &Value, elem: ScalarType) -> Result<Value> {
             SqlState::NumericValueOutOfRange,
             format!("value out of range for type {}", elem.canonical_name()),
         )
+        .with_data_type(elem.canonical_name())
     };
     match (v, elem) {
         (Value::Int(n), ScalarType::Int16 | ScalarType::Int32 | ScalarType::Int64) => n

@@ -1141,7 +1141,9 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 			// for composite-aware store coercion (spec/design/composite.md §4).
 			v, err := coerceForStore(candidate, store.colTypes[i], col.Decimal, col.VarcharLen, col.NotNull, col.Name)
 			if err != nil {
-				return nil, err
+				// Stamp the target relation onto a column-store failure (23502/22003/22001) —
+				// in scope here, not inside the coercion (spec/design/error-fields.md §4).
+				return nil, stampTable(err, table.Name)
 			}
 			row[i] = v
 		}
@@ -1175,8 +1177,7 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 			// The PK's 23505 reports PostgreSQL's derived auto-name for the PK index,
 			// `<table>_pkey` — jed persists/reserves no such relation (constraints.md §5.4).
 			if _, dup := seenKeys[string(key)]; dup {
-				return nil, newError(UniqueViolation,
-					"duplicate key value violates unique constraint: "+strings.ToLower(table.Name)+"_pkey")
+				return nil, newUniqueViolation(table.Name, pkeyName(table.Name))
 			}
 			// The duplicate probe reads the pin (readSnap) — under the writable-CTE read pin
 			// (writable-cte.md §2) it sees the PRE-statement table, not an earlier sub-statement's
@@ -1185,8 +1186,7 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 			if _, exists, err := db.lkpStoreScoped(dbScope, table.Name).Get(key); err != nil {
 				return nil, err
 			} else if exists {
-				return nil, newError(UniqueViolation,
-					"duplicate key value violates unique constraint: "+strings.ToLower(table.Name)+"_pkey")
+				return nil, newUniqueViolation(table.Name, pkeyName(table.Name))
 			}
 			seenKeys[string(key)] = struct{}{}
 		}
@@ -1209,8 +1209,7 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 				return nil, err
 			}
 			if _, dup := seenPrefixes[u][string(prefix)]; dup || len(stored) > 0 {
-				return nil, newError(UniqueViolation,
-					"duplicate key value violates unique constraint: "+rindex.Name)
+				return nil, newUniqueViolation(table.Name, rindex.Name)
 			}
 			seenPrefixes[u][string(prefix)] = struct{}{}
 		}
@@ -1283,8 +1282,7 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 				return nil, err
 			}
 			if !hit {
-				return nil, newError(ForeignKeyViolation,
-					"insert or update on table "+relation+" violates foreign key constraint "+fk.Name)
+				return nil, newFKViolationInsert(relation, fk.Name)
 			}
 		}
 	}
@@ -1309,15 +1307,13 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 					conflict = len(hits) > 0
 				}
 				if conflict {
-					return nil, newError(ExclusionViolation,
-						"conflicting key value violates exclusion constraint: "+exc.Name)
+					return nil, newExclusionViolation(table.Name, exc.Name)
 				}
 			}
 			for i := range prepared {
 				for j := 0; j < i; j++ {
 					if exclusionPairConflicts(tcols, exc, prepared[i].row, prepared[j].row) {
-						return nil, newError(ExclusionViolation,
-							"conflicting key value violates exclusion constraint: "+exc.Name)
+						return nil, newExclusionViolation(table.Name, exc.Name)
 					}
 				}
 			}
@@ -1373,8 +1369,7 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 			// (reading the pin) did not see. Matches PostgreSQL's unique violation; the whole statement
 			// aborts all-or-nothing. For a single statement, phase 1 already caught every duplicate, so
 			// this is never reached.
-			return nil, newError(UniqueViolation,
-				"duplicate key value violates unique constraint: "+strings.ToLower(table.Name)+"_pkey")
+			return nil, newUniqueViolation(table.Name, pkeyName(table.Name))
 		}
 	}
 	for k, def := range table.Indexes {
@@ -1386,8 +1381,7 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 			}
 			if !inserted {
 				// A cross-sub-statement unique-index collision under the read pin (as above).
-				return nil, newError(UniqueViolation,
-					"duplicate key value violates unique constraint: "+def.Name)
+				return nil, newUniqueViolation(table.Name, def.Name)
 			}
 		}
 	}
@@ -1491,7 +1485,7 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, pk []
 			}
 			v, err := coerceForStore(candidate, store.colTypes[i], col.Decimal, col.VarcharLen, col.NotNull, col.Name)
 			if err != nil {
-				return 0, nil, err
+				return 0, nil, stampTable(err, relation)
 			}
 			row[i] = v
 		}
@@ -1616,7 +1610,7 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, pk []
 			}
 			checked, err := ap.check(raw)
 			if err != nil {
-				return 0, nil, err
+				return 0, nil, stampTable(err, relation)
 			}
 			newRow[ap.idx] = checked
 		}
@@ -1642,12 +1636,10 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, pk []
 			if _, exists, err := store.Get(k); err != nil {
 				return 0, nil, err
 			} else if exists {
-				return 0, nil, newError(UniqueViolation,
-					"duplicate key value violates unique constraint: "+strings.ToLower(relation)+"_pkey")
+				return 0, nil, newUniqueViolation(relation, pkeyName(relation))
 			}
 			if _, dup := seen[string(k)]; dup {
-				return 0, nil, newError(UniqueViolation,
-					"duplicate key value violates unique constraint: "+strings.ToLower(relation)+"_pkey")
+				return 0, nil, newUniqueViolation(relation, pkeyName(relation))
 			}
 			seen[string(k)] = struct{}{}
 		}
@@ -1694,8 +1686,7 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, pk []
 					}
 				}
 				if conflict {
-					return 0, nil, newError(UniqueViolation,
-						"duplicate key value violates unique constraint: "+def.Name)
+					return 0, nil, newUniqueViolation(table.Name, def.Name)
 				}
 				batch[string(prefix)] = struct{}{}
 			}
@@ -1772,8 +1763,7 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, pk []
 				return 0, nil, err
 			}
 			if !hit {
-				return 0, nil, newError(ForeignKeyViolation,
-					"insert or update on table "+relation+" violates foreign key constraint "+fk.Name)
+				return 0, nil, newFKViolationInsert(relation, fk.Name)
 			}
 		}
 	}
@@ -1825,8 +1815,7 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, pk []
 					return 0, nil, err
 				}
 				if referenced {
-					return 0, nil, newError(ForeignKeyViolation,
-						"update or delete on table "+parent.Name+" violates foreign key constraint "+r.fk.Name+" on table "+r.childTable)
+					return 0, nil, newFKViolationDelete(parent.Name, r.fk.Name, r.childTable)
 				}
 			}
 		}
@@ -2290,8 +2279,7 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (ou
 					return outcome{}, err
 				}
 				if referenced {
-					return outcome{}, newError(ForeignKeyViolation,
-						"update or delete on table "+parent.Name+" violates foreign key constraint "+r.fk.Name+" on table "+r.childTable)
+					return outcome{}, newFKViolationDelete(parent.Name, r.fk.Name, r.childTable)
 				}
 			}
 		}
@@ -2653,7 +2641,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 			}
 			checked, err := p.check(raw)
 			if err != nil {
-				return outcome{}, err
+				return outcome{}, stampTable(err, table.Name)
 			}
 			newRow[p.idx] = checked
 		}
@@ -2704,8 +2692,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 				collides = true
 			}
 			if collides {
-				return outcome{}, newError(UniqueViolation,
-					"duplicate key value violates unique constraint: "+strings.ToLower(table.Name)+"_pkey")
+				return outcome{}, newUniqueViolation(table.Name, pkeyName(table.Name))
 			}
 			batch[string(u.newKey)] = struct{}{}
 		}
@@ -2755,8 +2742,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 					}
 				}
 				if conflict {
-					return outcome{}, newError(UniqueViolation,
-						"duplicate key value violates unique constraint: "+def.Name)
+					return outcome{}, newUniqueViolation(table.Name, def.Name)
 				}
 				batch[string(prefix)] = struct{}{}
 			}
@@ -2792,15 +2778,13 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 					}
 				}
 				if conflict {
-					return outcome{}, newError(ExclusionViolation,
-						"conflicting key value violates exclusion constraint: "+exc.Name)
+					return outcome{}, newExclusionViolation(table.Name, exc.Name)
 				}
 			}
 			for i := range updates {
 				for j := 0; j < i; j++ {
 					if exclusionPairConflicts(table.Columns, exc, updates[i].row, updates[j].row) {
-						return outcome{}, newError(ExclusionViolation,
-							"conflicting key value violates exclusion constraint: "+exc.Name)
+						return outcome{}, newExclusionViolation(table.Name, exc.Name)
 					}
 				}
 			}
@@ -2864,8 +2848,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 				return outcome{}, err
 			}
 			if !hit {
-				return outcome{}, newError(ForeignKeyViolation,
-					"insert or update on table "+relation+" violates foreign key constraint "+fk.Name)
+				return outcome{}, newFKViolationInsert(relation, fk.Name)
 			}
 		}
 	}
@@ -2948,8 +2931,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 					return outcome{}, err
 				}
 				if _, dangles := newChildRefs[string(oldProbe.bytes)]; referenced || dangles {
-					return outcome{}, newError(ForeignKeyViolation,
-						"update or delete on table "+parent.Name+" violates foreign key constraint "+r.fk.Name+" on table "+r.childTable)
+					return outcome{}, newFKViolationDelete(parent.Name, r.fk.Name, r.childTable)
 				}
 			}
 		}
@@ -3036,8 +3018,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 				// Reachable only under the writable-CTE read pin (writable-cte.md §7): an earlier
 				// sub-statement staged this key, unseen by phase 1. Aborts all-or-nothing, matching
 				// INSERT. For a single statement, phase 1's end-state check caught every duplicate.
-				return outcome{}, newError(UniqueViolation,
-					"duplicate key value violates unique constraint: "+strings.ToLower(table.Name)+"_pkey")
+				return outcome{}, newUniqueViolation(table.Name, pkeyName(table.Name))
 			}
 		}
 		for k, def := range table.Indexes {
@@ -3057,8 +3038,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 					}
 					if !inserted {
 						// A cross-sub-statement collision under the read pin (as above).
-						return outcome{}, newError(UniqueViolation,
-							"duplicate key value violates unique constraint: "+def.Name)
+						return outcome{}, newUniqueViolation(table.Name, def.Name)
 					}
 				}
 			}

@@ -49,10 +49,7 @@ pub(crate) fn store_value(
     match v {
         Value::Null => {
             if not_null {
-                return Err(EngineError::new(
-                    SqlState::NotNullViolation,
-                    format!("null value in column {col_name} violates not-null constraint"),
-                ));
+                return Err(EngineError::not_null_violation(col_name));
             }
             Ok(Value::Null)
         }
@@ -305,10 +302,7 @@ pub(crate) fn store_range(
     match v {
         Value::Null => {
             if not_null {
-                return Err(EngineError::new(
-                    SqlState::NotNullViolation,
-                    format!("null value in column {col_name} violates not-null constraint"),
-                ));
+                return Err(EngineError::not_null_violation(col_name));
             }
             Ok(Value::Null)
         }
@@ -354,10 +348,7 @@ pub(crate) fn store_array(
     match v {
         Value::Null => {
             if not_null {
-                return Err(EngineError::new(
-                    SqlState::NotNullViolation,
-                    format!("null value in column {col_name} violates not-null constraint"),
-                ));
+                return Err(EngineError::not_null_violation(col_name));
             }
             Ok(Value::Null)
         }
@@ -394,10 +385,7 @@ pub(crate) fn store_composite(
     match v {
         Value::Null => {
             if not_null {
-                return Err(EngineError::new(
-                    SqlState::NotNullViolation,
-                    format!("null value in column {col_name} violates not-null constraint"),
-                ));
+                return Err(EngineError::not_null_violation(col_name));
             }
             Ok(Value::Null)
         }
@@ -473,7 +461,9 @@ pub(crate) fn coerce_varchar_store(
         Err(EngineError::new(
             SqlState::StringDataRightTruncation,
             format!("value too long for type varchar({n}) in column {col_name}"),
-        ))
+        )
+        .with_data_type(format!("varchar({n})"))
+        .with_column(col_name))
     }
 }
 

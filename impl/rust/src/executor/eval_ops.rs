@@ -1172,6 +1172,7 @@ pub(crate) fn overflow(ty: ScalarType) -> EngineError {
         SqlState::NumericValueOutOfRange,
         format!("value out of range for type {}", ty.canonical_name()),
     )
+    .with_data_type(ty.canonical_name())
 }
 
 pub(crate) fn type_error(msg: impl Into<String>) -> EngineError {

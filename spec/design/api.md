@@ -592,6 +592,14 @@ their existing codes; the API adds the host-filesystem class-58 codes (`58P01`/`
 SQLSTATE class (first two chars) is a stable category (`22` data, `23` integrity, `25`
 transaction state, `42` syntax/access, `57` operator intervention, `58` system, `XX` internal).
 
+`EngineError` also carries four **optional structured diagnostic fields** modeled on pgx's
+`pgconn.PgError` ([error-fields.md](error-fields.md)) — `constraint_name` / `table_name` /
+`column_name` / `data_type_name` (Rust `Option<String>`; Go `string`; TS optional) — so a host can
+identify *which* constraint fired without parsing the (non-contractual) message text. They are set
+on the integrity violations (23505/23514/23503/23P01 → constraint + table; 23502 → table + column)
+and the type errors (22003/22001 → data type). Absent fields are `None`/`""`/`undefined`. Additive:
+`.code()` and the rendered message format are unchanged.
+
 ## 8. Cost ceiling (`max_cost`)
 
 A first-class use case is **safely evaluating untrusted, user-supplied queries** (CLAUDE.md

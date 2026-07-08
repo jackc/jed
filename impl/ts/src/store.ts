@@ -5,7 +5,7 @@
 // boolean column is accepted as-is; a cross-family value (decimal→int, text→int, etc.) is 42804.
 import type { ArrayInResult, Value } from "./value.ts";
 import type { DecimalTypmod, ScalarType } from "./types.ts";
-import { engineError } from "./errors.ts";
+import { engineError, notNullViolation } from "./errors.ts";
 import {
   arrayValue,
   boolNot,
@@ -82,10 +82,7 @@ export function storeValue(
   switch (v.kind) {
     case "null":
       if (notNull) {
-        throw engineError(
-          "not_null_violation",
-          "null value in column " + colName + " violates not-null constraint",
-        );
+        throw notNullViolation(colName);
       }
       return nullValue();
     case "int":
@@ -234,7 +231,9 @@ export function coerceVarcharStore(s: string, varcharLen: number | null, colName
       throw engineError(
         "string_data_right_truncation",
         `value too long for type varchar(${varcharLen}) in column ${colName}`,
-      );
+      )
+        .withDataType(`varchar(${varcharLen})`)
+        .withColumn(colName);
     }
   }
   return cps.slice(0, varcharLen).join("");
@@ -283,10 +282,7 @@ export function coerceForStore(
 export function storeRange(v: Value, elem: ColType, notNull: boolean, colName: string): Value {
   if (v.kind === "null") {
     if (notNull) {
-      throw engineError(
-        "not_null_violation",
-        "null value in column " + colName + " violates not-null constraint",
-      );
+      throw notNullViolation(colName);
     }
     return nullValue();
   }
@@ -305,10 +301,7 @@ export function storeRange(v: Value, elem: ColType, notNull: boolean, colName: s
 export function storeArray(v: Value, elem: ColType, notNull: boolean, colName: string): Value {
   if (v.kind === "null") {
     if (notNull) {
-      throw engineError(
-        "not_null_violation",
-        "null value in column " + colName + " violates not-null constraint",
-      );
+      throw notNullViolation(colName);
     }
     return nullValue();
   }
@@ -334,10 +327,7 @@ export function storeComposite(
 ): Value {
   if (v.kind === "null") {
     if (notNull) {
-      throw engineError(
-        "not_null_violation",
-        "null value in column " + colName + " violates not-null constraint",
-      );
+      throw notNullViolation(colName);
     }
     return nullValue();
   }
@@ -578,7 +568,7 @@ export function overflow(ty: ScalarType): Error {
   return engineError(
     "numeric_value_out_of_range",
     "value out of range for type " + canonicalName(ty),
-  );
+  ).withDataType(canonicalName(ty));
 }
 
 export function typeError(msg: string): Error {

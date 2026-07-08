@@ -57,6 +57,49 @@ target: Rust's **`Option<T>`** (a bare `T` rejects `NULL` with `22004`), Go's **
 `*any`), and TypeScript's **`null`** in the result object. A column you expect to be nullable should
 be read into one of these.
 
+## Handling constraint errors
+
+A failed statement raises an **`EngineError`** carrying a stable 5-char SQLSTATE (`.code()`) — never
+match on the message text, which is informational. When the failure is a constraint or type
+violation, the error also carries **structured diagnostic fields** (modeled on pgx's `PgError`) so you
+can tell _which_ constraint fired without parsing the message: `constraint_name`, `table_name`,
+`column_name`, and `data_type_name`. A field is absent (`None` / `""` / `undefined`) when it does not
+apply. They are set on the integrity violations — `23505` unique, `23514` check, `23503` foreign key,
+`23P01` exclusion (→ constraint + table); `23502` not-null (→ table + column) — and the type errors
+`22003` / `22001` (→ data type).
+
+```rust
+// Rust — fields are `Option<String>` on the returned EngineError
+if let Err(e) = session.run("INSERT INTO users (email) VALUES ($1)", ("a@b.com",)) {
+    if e.code() == "23505" {
+        // e.g. route the failure back to the offending form field
+        eprintln!("duplicate on {:?}", e.constraint_name.as_deref()); // Some("users_email_key")
+    }
+}
+```
+
+```go
+// Go — fields are strings ("" when unset); assert the *jed.EngineError
+_, err := session.Exec(ctx, "INSERT INTO users (email) VALUES ($1)", "a@b.com")
+var ee *jed.EngineError
+if errors.As(err, &ee) && ee.Code() == "23505" {
+    fmt.Println("duplicate on", ee.ConstraintName) // users_email_key
+}
+```
+
+```ts
+// TypeScript — fields are optional string properties on EngineError
+try {
+  session.execute("INSERT INTO users (email) VALUES ($1)", ["a@b.com"]);
+} catch (e) {
+  if (e instanceof EngineError && e.code() === "23505") {
+    console.log("duplicate on", e.constraintName); // users_email_key
+  }
+}
+```
+
+The rendered error message is unchanged — these fields are additive metadata alongside it.
+
 ## The raw `Value` path is still there
 
 These ergonomic methods are **additive** — a thin, idiomatic layer over the lower-level path that

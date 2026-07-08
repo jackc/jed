@@ -47,7 +47,7 @@ type Decimal struct {
 }
 
 func decimalOverflow() error {
-	return newError(NumericValueOutOfRange, "value out of range for type decimal")
+	return newError(NumericValueOutOfRange, "value out of range for type decimal").withDataType("decimal")
 }
 
 func decimalDivByZero() error {

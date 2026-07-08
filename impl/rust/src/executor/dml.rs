@@ -544,14 +544,20 @@ impl Engine {
                     // expression default; a constant (or no default → NULL) is free.
                     None => self.eval_default(col, default_exprs[i].as_ref(), rng, meter)?,
                 };
-                row.push(coerce_for_store(
-                    candidate,
-                    &col_types[i],
-                    col.decimal,
-                    col.varchar_len,
-                    col.not_null,
-                    &col.name,
-                )?);
+                row.push(
+                    coerce_for_store(
+                        candidate,
+                        &col_types[i],
+                        col.decimal,
+                        col.varchar_len,
+                        col.not_null,
+                        &col.name,
+                    )
+                    // Stamp the target relation onto a column-store failure (23502/22003/
+                    // 22001) — the relation name is in scope here, not inside the coercion
+                    // (spec/design/error-fields.md §4).
+                    .map_err(|e| e.with_table(&relation))?,
+                );
             }
 
             // CHECK constraints, in name order, on the fully-coerced candidate row — after
@@ -564,12 +570,7 @@ impl Engine {
                 meter.guard()?;
                 for (name, rexpr) in checks {
                     if matches!(rexpr.eval(&row, &env, meter)?, Value::Bool(false)) {
-                        return Err(EngineError::new(
-                            SqlState::CheckViolation,
-                            format!(
-                                "new row for relation {relation} violates check constraint {name}"
-                            ),
-                        ));
+                        return Err(EngineError::check_violation(&relation, name));
                     }
                 }
             }
@@ -585,12 +586,9 @@ impl Engine {
                     // The PK's 23505 reports PostgreSQL's derived auto-name for the PK
                     // index, `<table>_pkey` — jed persists/reserves no such relation
                     // (constraints.md §5.4).
-                    return Err(EngineError::new(
-                        SqlState::UniqueViolation,
-                        format!(
-                            "duplicate key value violates unique constraint: {}_pkey",
-                            relation.to_ascii_lowercase()
-                        ),
+                    return Err(EngineError::unique_violation(
+                        &relation,
+                        format!("{}_pkey", relation.to_ascii_lowercase()),
                     ));
                 }
                 seen_keys.insert(k.clone());
@@ -610,13 +608,7 @@ impl Engine {
                     .range_entries(&unique_probe_bound(&prefix))?
                     .is_empty();
                 if stored || !seen_prefixes[u].insert(prefix) {
-                    return Err(EngineError::new(
-                        SqlState::UniqueViolation,
-                        format!(
-                            "duplicate key value violates unique constraint: {}",
-                            rindex.name
-                        ),
-                    ));
+                    return Err(EngineError::unique_violation(&relation, &rindex.name));
                 }
             }
             // Meter the row's disposition-plan compression attempts (value_compress, cost.md
@@ -678,13 +670,7 @@ impl Engine {
                     continue;
                 }
                 if !self.fk_probe_hits(&probe, &fk.ref_table)? {
-                    return Err(EngineError::new(
-                        SqlState::ForeignKeyViolation,
-                        format!(
-                            "insert or update on table {relation} violates foreign key constraint {}",
-                            fk.name
-                        ),
-                    ));
+                    return Err(EngineError::fk_violation_insert(&relation, &fk.name));
                 }
             }
         }
@@ -714,25 +700,13 @@ impl Engine {
                         None => false,
                     };
                     if conflict {
-                        return Err(EngineError::new(
-                            SqlState::ExclusionViolation,
-                            format!(
-                                "conflicting key value violates exclusion constraint: {}",
-                                exc.name
-                            ),
-                        ));
+                        return Err(EngineError::exclusion_violation(&relation, &exc.name));
                     }
                 }
                 for i in 0..prepared.len() {
                     for j in 0..i {
                         if exclusion_pair_conflicts(&tcols, exc, &prepared[i].1, &prepared[j].1) {
-                            return Err(EngineError::new(
-                                SqlState::ExclusionViolation,
-                                format!(
-                                    "conflicting key value violates exclusion constraint: {}",
-                                    exc.name
-                                ),
-                            ));
+                            return Err(EngineError::exclusion_violation(&relation, &exc.name));
                         }
                     }
                 }
@@ -779,12 +753,9 @@ impl Engine {
                 // staged this key, which phase 1 (reading the pin) did not see. Matches
                 // PostgreSQL's unique violation; the whole statement aborts all-or-nothing. For a
                 // single statement, phase 1 already caught every duplicate, so this is never reached.
-                return Err(EngineError::new(
-                    SqlState::UniqueViolation,
-                    format!(
-                        "duplicate key value violates unique constraint: {}_pkey",
-                        relation.to_ascii_lowercase()
-                    ),
+                return Err(EngineError::unique_violation(
+                    &relation,
+                    format!("{}_pkey", relation.to_ascii_lowercase()),
                 ));
             }
         }
@@ -793,13 +764,7 @@ impl Engine {
             for ek in index_inserts[k].drain(..) {
                 if !istore.insert(ek, Vec::new())? {
                     // A cross-sub-statement unique-index collision under the read pin (as above).
-                    return Err(EngineError::new(
-                        SqlState::UniqueViolation,
-                        format!(
-                            "duplicate key value violates unique constraint: {}",
-                            def.name
-                        ),
-                    ));
+                    return Err(EngineError::unique_violation(&relation, &def.name));
                 }
             }
         }
@@ -1021,14 +986,20 @@ impl Engine {
                     Some(p) => values[p].clone(),
                     None => self.eval_default(col, default_exprs[i].as_ref(), rng, meter)?,
                 };
-                row.push(coerce_for_store(
-                    candidate,
-                    &col_types[i],
-                    col.decimal,
-                    col.varchar_len,
-                    col.not_null,
-                    &col.name,
-                )?);
+                row.push(
+                    coerce_for_store(
+                        candidate,
+                        &col_types[i],
+                        col.decimal,
+                        col.varchar_len,
+                        col.not_null,
+                        &col.name,
+                    )
+                    // Stamp the target relation onto a column-store failure (23502/22003/
+                    // 22001) — the relation name is in scope here, not inside the coercion
+                    // (spec/design/error-fields.md §4).
+                    .map_err(|e| e.with_table(&relation))?,
+                );
             }
             self.eval_checks(checks, &row, rng, &relation, meter)?;
 
@@ -1117,7 +1088,8 @@ impl Engine {
                                 let mut new_row = erow.clone();
                                 for ap in assignments {
                                     let raw = ap.source.eval(&combined, &env, meter)?;
-                                    new_row[ap.idx] = ap.check(raw)?;
+                                    new_row[ap.idx] =
+                                        ap.check(raw).map_err(|e| e.with_table(&relation))?;
                                 }
                                 self.eval_checks(checks, &new_row, rng, &relation, meter)?;
                                 updates.push((ekey, new_row, erow));
@@ -1136,12 +1108,9 @@ impl Engine {
             for row in &inserts {
                 let k = encode_pk_key(pk, &colls, row)?;
                 if self.store(table).get(&k)?.is_some() || !seen.insert(k) {
-                    return Err(EngineError::new(
-                        SqlState::UniqueViolation,
-                        format!(
-                            "duplicate key value violates unique constraint: {}_pkey",
-                            relation.to_ascii_lowercase()
-                        ),
+                    return Err(EngineError::unique_violation(
+                        &relation,
+                        format!("{}_pkey", relation.to_ascii_lowercase()),
                     ));
                 }
             }
@@ -1166,13 +1135,7 @@ impl Engine {
                             .iter()
                             .any(|(ekey, _)| !rewritten.contains(&ekey[prefix.len()..]));
                     if conflict {
-                        return Err(EngineError::new(
-                            SqlState::UniqueViolation,
-                            format!(
-                                "duplicate key value violates unique constraint: {}",
-                                rindex.name
-                            ),
-                        ));
+                        return Err(EngineError::unique_violation(&relation, &rindex.name));
                     }
                 }
             }
@@ -1226,13 +1189,7 @@ impl Engine {
                     continue;
                 }
                 if !self.fk_probe_hits(&probe, &fk.ref_table)? {
-                    return Err(EngineError::new(
-                        SqlState::ForeignKeyViolation,
-                        format!(
-                            "insert or update on table {relation} violates foreign key constraint {}",
-                            fk.name
-                        ),
-                    ));
+                    return Err(EngineError::fk_violation_insert(&relation, &fk.name));
                 }
             }
         }
@@ -1276,12 +1233,10 @@ impl Engine {
                         old_probe.bytes(),
                         &updated_keys,
                     )? {
-                        return Err(EngineError::new(
-                            SqlState::ForeignKeyViolation,
-                            format!(
-                                "update or delete on table {} violates foreign key constraint {} on table {}",
-                                parent.name, fk.name, child_table
-                            ),
+                        return Err(EngineError::fk_violation_delete(
+                            &parent.name,
+                            &fk.name,
+                            child_table,
                         ));
                     }
                 }
@@ -1439,10 +1394,7 @@ impl Engine {
         };
         for (name, rexpr) in checks {
             if matches!(rexpr.eval(row, &env, meter)?, Value::Bool(false)) {
-                return Err(EngineError::new(
-                    SqlState::CheckViolation,
-                    format!("new row for relation {relation} violates check constraint {name}"),
-                ));
+                return Err(EngineError::check_violation(relation, name));
             }
         }
         Ok(())
@@ -1890,12 +1842,10 @@ impl Engine {
                         continue; // a NULL referenced value cannot be referenced (MATCH SIMPLE)
                     };
                     if self.fk_child_references(child_table, fk, &parent, probe.bytes(), exclude)? {
-                        return Err(EngineError::new(
-                            SqlState::ForeignKeyViolation,
-                            format!(
-                                "update or delete on table {} violates foreign key constraint {} on table {}",
-                                parent.name, fk.name, child_table
-                            ),
+                        return Err(EngineError::fk_violation_delete(
+                            &parent.name,
+                            &fk.name,
+                            child_table,
                         ));
                     }
                 }
@@ -2305,7 +2255,7 @@ impl Engine {
             let mut new_row = row.clone();
             for plan in &plans {
                 let raw = plan.source.eval(&row, &env, &mut meter)?;
-                new_row[plan.idx] = plan.check(raw)?;
+                new_row[plan.idx] = plan.check(raw).map_err(|e| e.with_table(&relation))?;
             }
             // The rewritten row is stored fully resident: resolve any still-unfetched (untouched)
             // columns so its weight/disposition re-plan exactly as an eager writer's would —
@@ -2318,10 +2268,7 @@ impl Engine {
             // (phase 1 — nothing has been written).
             for (name, rexpr) in &checks {
                 if matches!(rexpr.eval(&new_row, &env, &mut meter)?, Value::Bool(false)) {
-                    return Err(EngineError::new(
-                        SqlState::CheckViolation,
-                        format!("new row for relation {relation} violates check constraint {name}"),
-                    ));
+                    return Err(EngineError::check_violation(&relation, name));
                 }
             }
             // The row's NEW storage key: recomputed from the post-assignment row when a key
@@ -2349,12 +2296,9 @@ impl Engine {
                 let collides = !batch.insert(new_key.as_slice())
                     || (store.get(new_key)?.is_some() && !rewritten.contains(new_key.as_slice()));
                 if collides {
-                    return Err(EngineError::new(
-                        SqlState::UniqueViolation,
-                        format!(
-                            "duplicate key value violates unique constraint: {}_pkey",
-                            relation.to_ascii_lowercase()
-                        ),
+                    return Err(EngineError::unique_violation(
+                        &relation,
+                        format!("{}_pkey", relation.to_ascii_lowercase()),
                     ));
                 }
             }
@@ -2385,13 +2329,7 @@ impl Engine {
                             .iter()
                             .any(|(ekey, _)| !rewritten.contains(&ekey[prefix.len()..]));
                     if conflict {
-                        return Err(EngineError::new(
-                            SqlState::UniqueViolation,
-                            format!(
-                                "duplicate key value violates unique constraint: {}",
-                                rindex.name
-                            ),
-                        ));
+                        return Err(EngineError::unique_violation(&relation, &rindex.name));
                     }
                 }
             }
@@ -2424,26 +2362,14 @@ impl Engine {
                             None => false,
                         };
                         if conflict {
-                            return Err(EngineError::new(
-                                SqlState::ExclusionViolation,
-                                format!(
-                                    "conflicting key value violates exclusion constraint: {}",
-                                    exc.name
-                                ),
-                            ));
+                            return Err(EngineError::exclusion_violation(&relation, &exc.name));
                         }
                     }
                 }
                 for i in 0..updates.len() {
                     for j in 0..i {
                         if exclusion_pair_conflicts(&tcolumns, exc, &updates[i].2, &updates[j].2) {
-                            return Err(EngineError::new(
-                                SqlState::ExclusionViolation,
-                                format!(
-                                    "conflicting key value violates exclusion constraint: {}",
-                                    exc.name
-                                ),
-                            ));
+                            return Err(EngineError::exclusion_violation(&relation, &exc.name));
                         }
                     }
                 }
@@ -2490,13 +2416,7 @@ impl Engine {
                     continue;
                 }
                 if !self.fk_probe_hits(&probe, &fk.ref_table)? {
-                    return Err(EngineError::new(
-                        SqlState::ForeignKeyViolation,
-                        format!(
-                            "insert or update on table {relation} violates foreign key constraint {}",
-                            fk.name
-                        ),
-                    ));
+                    return Err(EngineError::fk_violation_insert(&relation, &fk.name));
                 }
             }
         }
@@ -2570,12 +2490,10 @@ impl Engine {
                         exclude,
                     )? || new_child_refs.contains(old_probe.bytes())
                     {
-                        return Err(EngineError::new(
-                            SqlState::ForeignKeyViolation,
-                            format!(
-                                "update or delete on table {} violates foreign key constraint {} on table {}",
-                                parent.name, fk.name, child_table
-                            ),
+                        return Err(EngineError::fk_violation_delete(
+                            &parent.name,
+                            &fk.name,
+                            child_table,
                         ));
                     }
                 }
@@ -2660,11 +2578,9 @@ impl Engine {
                     // earlier sub-statement staged this key, unseen by phase 1. Aborts
                     // all-or-nothing, matching INSERT. For a single statement, phase 1's
                     // end-state check already caught every duplicate.
-                    return Err(EngineError::new(
-                        SqlState::UniqueViolation,
-                        format!(
-                            "duplicate key value violates unique constraint: {relation_lc}_pkey"
-                        ),
+                    return Err(EngineError::unique_violation(
+                        &relation,
+                        format!("{relation_lc}_pkey"),
                     ));
                 }
             }
@@ -2680,13 +2596,7 @@ impl Engine {
                     for new_ek in insertions {
                         if !istore.insert(new_ek.clone(), Vec::new())? {
                             // A cross-sub-statement collision under the read pin (as above).
-                            return Err(EngineError::new(
-                                SqlState::UniqueViolation,
-                                format!(
-                                    "duplicate key value violates unique constraint: {}",
-                                    def.name
-                                ),
-                            ));
+                            return Err(EngineError::unique_violation(&relation, &def.name));
                         }
                     }
                 }

@@ -75,6 +75,7 @@ fn overflow() -> EngineError {
         SqlState::NumericValueOutOfRange,
         "value out of range for type decimal",
     )
+    .with_data_type("decimal")
 }
 
 fn div_by_zero() -> EngineError {

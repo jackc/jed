@@ -973,7 +973,7 @@ func validateDecimalTypmod(tm *typeMod) (*decimalTypmod, error) {
 }
 
 func overflowErr(ty scalarType) error {
-	return newError(NumericValueOutOfRange, "value out of range for type "+ty.CanonicalName())
+	return newError(NumericValueOutOfRange, "value out of range for type "+ty.CanonicalName()).withDataType(ty.CanonicalName())
 }
 
 func typeError(msg string) error { return newError(DatatypeMismatch, msg) }

@@ -142,7 +142,17 @@ import {
   workMul,
 } from "./decimal.ts";
 import { encodeBool, encodeInt, encodeTerminated } from "./encoding.ts";
-import { EngineError, engineError } from "./errors.ts";
+import {
+  checkViolation,
+  EngineError,
+  engineError,
+  exclusionViolation,
+  fkViolationDelete,
+  fkViolationInsert,
+  pkeyName,
+  stampTable,
+  uniqueViolation,
+} from "./errors.ts";
 import { type Privilege, type PrivilegeSet, Privileges } from "./privileges.ts";
 import { type ScriptSummary, splitStatements } from "./split.ts";
 import type { SharedPaging } from "./paging.ts";
@@ -4671,10 +4681,7 @@ export class Engine {
         if (prefix !== null) {
           const k = prefix.join(",");
           if (seenPrefixes.has(k)) {
-            throw engineError(
-              "unique_violation",
-              "duplicate key value violates unique constraint: " + def.name,
-            );
+            throw uniqueViolation(ci.table, def.name);
           }
           seenPrefixes.add(k);
         }
@@ -5707,14 +5714,20 @@ export class Engine {
         // free.
         const candidate: Value =
           p >= 0 ? values[p]! : this.evalDefault(col, defaultExprs[i]!, rng, meter);
-        row[i] = coerceForStore(
-          candidate,
-          colTypes[i]!,
-          col.decimal,
-          col.varcharLen,
-          col.notNull,
-          col.name,
-        );
+        try {
+          row[i] = coerceForStore(
+            candidate,
+            colTypes[i]!,
+            col.decimal,
+            col.varcharLen,
+            col.notNull,
+            col.name,
+          );
+        } catch (e) {
+          // Stamp the target relation onto a column-store failure (23502/22003/22001) — the
+          // relation is in scope here, not inside the coercion (spec/design/error-fields.md §4).
+          throw stampTable(e, table.name);
+        }
       }
 
       // CHECK constraints, in name order, on the fully-coerced candidate row — after NOT
@@ -5746,10 +5759,7 @@ export class Engine {
         // `<table>_pkey` — jed persists/reserves no such relation (constraints.md §5.4).
         const seen = key.join(",");
         if (seenKeys.has(seen) || readStore.get(key) !== undefined) {
-          throw engineError(
-            "unique_violation",
-            "duplicate key value violates unique constraint: " + table.name.toLowerCase() + "_pkey",
-          );
+          throw uniqueViolation(table.name, pkeyName(table.name));
         }
         seenKeys.add(seen);
       }
@@ -5766,10 +5776,7 @@ export class Engine {
         const stored = istore.rangeEntries(uniqueProbeBound(prefix));
         const k = prefix.join(",");
         if (stored.length > 0 || seenPrefixes[u]!.has(k)) {
-          throw engineError(
-            "unique_violation",
-            "duplicate key value violates unique constraint: " + def.name,
-          );
+          throw uniqueViolation(table.name, def.name);
         }
         seenPrefixes[u]!.add(k);
       }
@@ -5817,10 +5824,7 @@ export class Engine {
         if (probe === null) continue; // a NULL local column → exempt (MATCH SIMPLE)
         if (batch.has(fkProbeBytes(probe).join(","))) continue;
         if (!this.fkProbeHits(probe, fk.refTable)) {
-          throw engineError(
-            "foreign_key_violation",
-            "insert or update on table " + relation + " violates foreign key constraint " + fk.name,
-          );
+          throw fkViolationInsert(relation, fk.name);
         }
       }
     }
@@ -5842,19 +5846,13 @@ export class Engine {
           const conflict =
             tree !== undefined && gistSearch(tree, probe.query, probe.strats).keys.length > 0;
           if (conflict) {
-            throw engineError(
-              "exclusion_violation",
-              "conflicting key value violates exclusion constraint: " + exc.name,
-            );
+            throw exclusionViolation(table.name, exc.name);
           }
         }
         for (let i = 0; i < prepared.length; i++) {
           for (let j = 0; j < i; j++) {
             if (exclusionPairConflicts(tcols, exc, prepared[i]!.row, prepared[j]!.row)) {
-              throw engineError(
-                "exclusion_violation",
-                "conflicting key value violates exclusion constraint: " + exc.name,
-              );
+              throw exclusionViolation(table.name, exc.name);
             }
           }
         }
@@ -5903,10 +5901,7 @@ export class Engine {
         // (reading the pin) did not see. Matches PostgreSQL's unique violation; the whole statement
         // aborts all-or-nothing. For a single statement, phase 1 already caught every duplicate, so
         // this is never reached.
-        throw engineError(
-          "unique_violation",
-          `duplicate key value violates unique constraint: ${relation.toLowerCase()}_pkey`,
-        );
+        throw uniqueViolation(table.name, pkeyName(table.name));
       }
     }
     for (let k = 0; k < table.indexes.length; k++) {
@@ -5915,10 +5910,7 @@ export class Engine {
       for (const ek of indexInserts[k]!) {
         if (!istore.insert(ek, [])) {
           // A cross-sub-statement unique-index collision under the read pin (as above).
-          throw engineError(
-            "unique_violation",
-            `duplicate key value violates unique constraint: ${def.name}`,
-          );
+          throw uniqueViolation(table.name, def.name);
         }
       }
     }
@@ -6199,14 +6191,20 @@ export class Engine {
         const p = provided[i]!;
         const candidate: Value =
           p >= 0 ? values[p]! : this.evalDefault(col, defaultExprs[i]!, rng, meter);
-        row[i] = coerceForStore(
-          candidate,
-          colTypes[i]!,
-          col.decimal,
-          col.varcharLen,
-          col.notNull,
-          col.name,
-        );
+        try {
+          row[i] = coerceForStore(
+            candidate,
+            colTypes[i]!,
+            col.decimal,
+            col.varcharLen,
+            col.notNull,
+            col.name,
+          );
+        } catch (e) {
+          // Stamp the target relation onto a column-store failure (23502/22003/22001) — the
+          // relation is in scope here, not inside the coercion (spec/design/error-fields.md §4).
+          throw stampTable(e, table.name);
+        }
       }
       if (checks.length > 0) {
         meter.guard();
@@ -6281,7 +6279,11 @@ export class Engine {
       if (plan.filter !== null && !isTrue(evalExpr(plan.filter, combined, env, meter))) continue;
       const newRow = existing.row.slice();
       for (const ap of plan.assignments) {
-        newRow[ap.idx] = checkAssign(ap, evalExpr(ap.source, combined, env, meter));
+        try {
+          newRow[ap.idx] = checkAssign(ap, evalExpr(ap.source, combined, env, meter));
+        } catch (e) {
+          throw stampTable(e, table.name);
+        }
       }
       if (checks.length > 0) evalChecks(checks, relation, newRow, checkEnv(), meter);
       updates.push({ key: existing.key, newRow, oldRow: existing.row });
@@ -6296,10 +6298,7 @@ export class Engine {
         const k = encodePkKey(table, pk, colls, row);
         const ks = k.join(",");
         if (readStore.get(k) !== undefined || seen.has(ks)) {
-          throw engineError(
-            "unique_violation",
-            "duplicate key value violates unique constraint: " + relation.toLowerCase() + "_pkey",
-          );
+          throw uniqueViolation(table.name, pkeyName(table.name));
         }
         seen.add(ks);
       }
@@ -6324,10 +6323,7 @@ export class Engine {
               .rangeEntries(uniqueProbeBound(prefix))
               .some((e) => !rewritten.has(e.key.slice(prefix.length).join(",")));
           if (conflict) {
-            throw engineError(
-              "unique_violation",
-              "duplicate key value violates unique constraint: " + def.name,
-            );
+            throw uniqueViolation(table.name, def.name);
           }
           batch.add(k);
         }
@@ -6363,10 +6359,7 @@ export class Engine {
         if (probe === null) continue; // a NULL local column → exempt (MATCH SIMPLE)
         if (batch.has(fkProbeBytes(probe).join(","))) continue;
         if (!this.fkProbeHits(probe, fk.refTable)) {
-          throw engineError(
-            "foreign_key_violation",
-            "insert or update on table " + relation + " violates foreign key constraint " + fk.name,
-          );
+          throw fkViolationInsert(relation, fk.name);
         }
       }
     }
@@ -6392,15 +6385,7 @@ export class Engine {
             continue;
           if (newPresent.has(fkProbeBytes(oldProbe).join(","))) continue;
           if (this.fkChildReferences(childTable, fk, parent, fkProbeBytes(oldProbe), updatedKeys)) {
-            throw engineError(
-              "foreign_key_violation",
-              "update or delete on table " +
-                parent.name +
-                " violates foreign key constraint " +
-                fk.name +
-                " on table " +
-                childTable,
-            );
+            throw fkViolationDelete(parent.name, fk.name, childTable);
           }
         }
       }
@@ -6723,15 +6708,7 @@ export class Engine {
           const probe = fkProbe(fk, parent, colls, m.row, fk.refColumns);
           if (probe === null) continue; // a NULL referenced value cannot be referenced (MATCH SIMPLE)
           if (this.fkChildReferences(childTable, fk, parent, fkProbeBytes(probe), exclude)) {
-            throw engineError(
-              "foreign_key_violation",
-              "update or delete on table " +
-                parent.name +
-                " violates foreign key constraint " +
-                fk.name +
-                " on table " +
-                childTable,
-            );
+            throw fkViolationDelete(parent.name, fk.name, childTable);
           }
         }
       }
@@ -7034,7 +7011,11 @@ export class Engine {
       const row = store.resolveInlineColumns(filtered);
       const newRow = row.slice();
       for (const p of plans) {
-        newRow[p.idx] = checkAssign(p, evalExpr(p.source, row, env, meter));
+        try {
+          newRow[p.idx] = checkAssign(p, evalExpr(p.source, row, env, meter));
+        } catch (e) {
+          throw stampTable(e, table.name);
+        }
       }
       // The rewritten row is stored fully resident: resolve any still-unfetched (untouched)
       // columns so its weight/disposition re-plan exactly as an eager writer's would —
@@ -7065,10 +7046,7 @@ export class Engine {
         const nk = u.newKey.join(",");
         const collides = batch.has(nk) || (store.get(u.newKey) !== undefined && !rewritten.has(nk));
         if (collides) {
-          throw engineError(
-            "unique_violation",
-            "duplicate key value violates unique constraint: " + table.name.toLowerCase() + "_pkey",
-          );
+          throw uniqueViolation(table.name, pkeyName(table.name));
         }
         batch.add(nk);
       }
@@ -7097,10 +7075,7 @@ export class Engine {
               .rangeEntries(uniqueProbeBound(prefix))
               .some((e) => !rewritten.has(e.key.slice(prefix.length).join(",")));
           if (conflict) {
-            throw engineError(
-              "unique_violation",
-              "duplicate key value violates unique constraint: " + rindex.name,
-            );
+            throw uniqueViolation(table.name, rindex.name);
           }
           batch.add(k);
         }
@@ -7127,19 +7102,13 @@ export class Engine {
               (h) => !rewritten.has(h.join(",")),
             );
           if (conflict) {
-            throw engineError(
-              "exclusion_violation",
-              "conflicting key value violates exclusion constraint: " + exc.name,
-            );
+            throw exclusionViolation(table.name, exc.name);
           }
         }
         for (let i = 0; i < updates.length; i++) {
           for (let j = 0; j < i; j++) {
             if (exclusionPairConflicts(table.columns, exc, updates[i]!.row, updates[j]!.row)) {
-              throw engineError(
-                "exclusion_violation",
-                "conflicting key value violates exclusion constraint: " + exc.name,
-              );
+              throw exclusionViolation(table.name, exc.name);
             }
           }
         }
@@ -7173,10 +7142,7 @@ export class Engine {
         if (probe === null) continue; // a NULL local column → exempt (MATCH SIMPLE)
         if (batch.has(fkProbeBytes(probe).join(","))) continue;
         if (!this.fkProbeHits(probe, fk.refTable)) {
-          throw engineError(
-            "foreign_key_violation",
-            "insert or update on table " + relation + " violates foreign key constraint " + fk.name,
-          );
+          throw fkViolationInsert(relation, fk.name);
         }
       }
     }
@@ -7228,15 +7194,7 @@ export class Engine {
             this.fkChildReferences(childTable, fk, parent, fkProbeBytes(oldProbe), exclude) ||
             newChildRefs.has(fkProbeBytes(oldProbe).join(","))
           ) {
-            throw engineError(
-              "foreign_key_violation",
-              "update or delete on table " +
-                parent.name +
-                " violates foreign key constraint " +
-                fk.name +
-                " on table " +
-                childTable,
-            );
+            throw fkViolationDelete(parent.name, fk.name, childTable);
           }
         }
       }
@@ -7306,10 +7264,7 @@ export class Engine {
           // Reachable only under the writable-CTE read pin (writable-cte.md §7): an earlier
           // sub-statement staged this key, unseen by phase 1. Aborts all-or-nothing, matching
           // INSERT. For a single statement, phase 1's end-state check caught every duplicate.
-          throw engineError(
-            "unique_violation",
-            "duplicate key value violates unique constraint: " + table.name.toLowerCase() + "_pkey",
-          );
+          throw uniqueViolation(table.name, pkeyName(table.name));
         }
       }
       for (let k = 0; k < table.indexes.length; k++) {
@@ -7319,10 +7274,7 @@ export class Engine {
           for (const newEk of mv.insertions) {
             if (!istore.insert(newEk, [])) {
               // A cross-sub-statement collision under the read pin (as above).
-              throw engineError(
-                "unique_violation",
-                "duplicate key value violates unique constraint: " + table.indexes[k]!.name,
-              );
+              throw uniqueViolation(table.name, table.indexes[k]!.name);
             }
           }
       }
@@ -18114,10 +18066,7 @@ export function evalChecks(
   for (const c of checks) {
     const v = evalExpr(c.node, row, env, meter);
     if (v.kind === "bool" && !v.value) {
-      throw engineError(
-        "check_violation",
-        "new row for relation " + relation + " violates check constraint " + c.name,
-      );
+      throw checkViolation(relation, c.name);
     }
   }
 }

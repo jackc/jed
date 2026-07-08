@@ -2038,13 +2038,7 @@ impl Engine {
                     && let Some(prefix) = index_prefix_key(&columns, &colls, &rindex, &row, &env)?
                     && !seen_prefixes.insert(prefix)
                 {
-                    return Err(EngineError::new(
-                        SqlState::UniqueViolation,
-                        format!(
-                            "duplicate key value violates unique constraint: {}",
-                            def.name
-                        ),
-                    ));
+                    return Err(EngineError::unique_violation(&ci.table, &def.name));
                 }
                 entries.extend(index_entry_keys(
                     &columns, &colls, &rindex, &key, &row, &env,

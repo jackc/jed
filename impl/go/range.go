@@ -220,7 +220,7 @@ func incrementDiscrete(v Value, elem scalarType) (Value, error) {
 	max := elemMaxFinite(elem)
 	if v.Int >= max {
 		return Value{}, newError(NumericValueOutOfRange,
-			"value out of range for type "+elem.CanonicalName())
+			"value out of range for type "+elem.CanonicalName()).withDataType(elem.CanonicalName())
 	}
 	out := v
 	out.Int = v.Int + 1
