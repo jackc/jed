@@ -61,9 +61,10 @@ runs in linear time here. `SIMILAR TO`, backreferences, and lookaround are inten
 <LiveSql {seed} query={regexOp} rows={3} />
 
 The pattern surface: literals, `.` (any code point except newline), character classes
-`[...]` / `[^...]`, the shorthands `\d` `\w` `\s` (and `\D` `\W` `\S`), anchors `^` `$`,
-alternation `|`, groups `(...)` / `(?:...)`, and the quantifiers `* + ? {n} {n,} {n,m}` (each
-with a lazy `?`-suffixed form). Matching is greedy and leftmost-first.
+`[...]` / `[^...]`, the shorthands `\d` `\w` `\s` (and `\D` `\W` `\S`), anchors `^` `$` and
+the string-boundary escapes `\A` (start) / `\z` (absolute end), alternation `|`, groups
+`(...)` / `(?:...)`, and the quantifiers `* + ? {n} {n,} {n,m}` (each with a lazy `?`-suffixed
+form). Matching is greedy and leftmost-first.
 
 Case-insensitive matching:
 

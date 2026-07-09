@@ -37,6 +37,14 @@ pattern = "^a$"
 prog = ["split 3 1", "any", "jmp 0", "save 0", "assertstart", "char 97", "assertend", "save 1", "match"]
 count = 9
 
+# `\A` (start) and `\z` (absolute end) are the string-boundary anchor spellings (regex.md §2). With
+# no multiline mode they lower to the SAME assertstart/assertend as `^`/`$` — this vector pins that
+# `\Aa\z` and `^a$` are byte-identical programs.
+[[case]]
+pattern = "\\Aa\\z"
+prog = ["split 3 1", "any", "jmp 0", "save 0", "assertstart", "char 97", "assertend", "save 1", "match"]
+count = 9
+
 # --- alternation (right-associative binary fold) -----------------------------
 [[case]]
 pattern = "a|b"

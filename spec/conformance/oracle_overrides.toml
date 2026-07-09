@@ -991,6 +991,38 @@ file = "expr/regex.test"
 sql = "SELECT 5 ~ '5' FROM one"
 reason = "jed: a non-text operand to the `~` regex operator is a 42804 datatype mismatch (regex.md §7, compare.toml lists only text×text — the SAME 42804 jed gives `5 LIKE '5'`). PostgreSQL resolves `~` through its operator catalog and reports 42883 (no `integer ~ unknown` operator). Both reject; a documented error-class divergence, the same shape as the interval ± non-interval cases above."
 
+# --- regex `\z` end-of-string anchor: jed's RE2-able flavor spells the absolute-end anchor `\z`
+# (regex.md §1/§2). PostgreSQL uses `\Z` for that condition and rejects lowercase `\z` as an invalid
+# escape, so these rows (jed returns a boolean) diverge from the oracle, which errors. `\A` (start)
+# agrees with PG and is NOT overridden.
+[[override]]
+file = "expr/regex.test"
+sql = "SELECT 'abc' ~ 'abc\\z' FROM one"
+reason = "jed: `\\z` is jed's RE2/PCRE spelling of the absolute end-of-string anchor (regex.md §2); with no multiline mode it behaves like `$`, so this matches (true). PostgreSQL spells that anchor `\\Z` and rejects lowercase `\\z` with 'invalid regular expression: invalid escape \\ sequence'. A deliberate flavor divergence (jed's regex surface is RE2-based, not PG-tracking — regex.md §1)."
+
+[[override]]
+file = "expr/regex.test"
+sql = "SELECT 'abcx' ~ 'abc\\z' FROM one"
+reason = "jed: `\\z` is jed's absolute end-of-string anchor (regex.md §2); 'abc' is not at the subject end in 'abcx', so no match (false). PostgreSQL rejects lowercase `\\z` (it uses `\\Z`). A deliberate flavor divergence (regex.md §1)."
+
+[[override]]
+file = "expr/regex.test"
+sql = "SELECT 'abc' ~ '\\Aabc\\z' FROM one"
+reason = "jed: `\\A`/`\\z` are jed's start/absolute-end anchors (regex.md §2), so this is a whole-string match (true). PostgreSQL rejects lowercase `\\z` (it uses `\\Z`). A deliberate flavor divergence (regex.md §1)."
+
+[[override]]
+file = "expr/regex.test"
+sql = "SELECT 'abcd' ~ '\\Aabc\\z' FROM one"
+reason = "jed: `\\A`/`\\z` anchor the whole subject (regex.md §2); 'abcd' != 'abc', so no match (false). PostgreSQL rejects lowercase `\\z` (it uses `\\Z`). A deliberate flavor divergence (regex.md §1)."
+
+# --- regex `\Z` (uppercase): jed does NOT accept `\Z` (regex.md §2). Its only distinguishing PCRE
+# behavior is trailing-newline leniency, which jed does nowhere, so it stays an invalid escape
+# (2201B). PostgreSQL accepts `\Z` as end-of-string and returns a row.
+[[override]]
+file = "expr/regex.test"
+sql = "SELECT 'abc' ~ 'abc\\Z' FROM one"
+reason = "jed: `\\Z` (uppercase) is NOT a jed anchor (regex.md §2) — its only distinguishing PCRE behavior is trailing-newline leniency jed does nowhere, so it is an invalid escape (2201B). PostgreSQL accepts `\\Z` as an end-of-string anchor and returns true. A deliberate flavor narrowing; jed spells the absolute-end anchor `\\z` (regex.md §1/§2)."
+
 # --- date_trunc on a date argument: jed has no implicit date->timestamp cast, so there is no
 # matching overload (42883). PostgreSQL implicitly casts the date to timestamptz and the call
 # succeeds (returning a timestamptz). A deliberate jed-stricter divergence (timezones.md §9.1).

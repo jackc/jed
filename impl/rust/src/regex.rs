@@ -379,6 +379,16 @@ impl Parser {
         let Some(c) = self.bump() else {
             return Err(invalid("trailing backslash"));
         };
+        // String-boundary anchors (regex.md §2): `\A` = start of subject, `\z` = absolute end of
+        // subject. jed has no multiline mode, so these are exactly `^`/`$` today; they are spelled
+        // separately so they stay string-anchored once a line mode lands. PCRE's `\Z` (end, or
+        // before a trailing newline) is deliberately NOT accepted — its only distinguishing
+        // behavior is trailing-newline leniency jed does nowhere, so it stays an invalid escape.
+        match c {
+            'A' => return Ok(Node::AnchorStart),
+            'z' => return Ok(Node::AnchorEnd),
+            _ => {}
+        }
         if let Some((ranges, negated)) = predef_class(c) {
             return Ok(Node::Class(CharClass { negated, ranges }));
         }

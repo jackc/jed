@@ -73,6 +73,48 @@ SELECT 'fish' ~ '^(cat|dog)$' FROM one
 ----
 false
 
+# String-boundary anchor escapes (regex.md §2): `\A` = start of subject, `\z` = absolute end of
+# subject. jed has no multiline mode, so `\A`/`\z` behave exactly like `^`/`$`. `\A` matches
+# PostgreSQL; `\z` is jed's RE2/PCRE spelling (PG uses `\Z` for it and rejects lowercase `\z`), so
+# the `\z` rows are oracle-overridden.
+query B nosort
+SELECT 'abc' ~ '\Aabc' FROM one
+----
+true
+
+# `\A` binds the match to position 0 — the unanchored prefix cannot start it later.
+query B nosort
+SELECT 'xabc' ~ '\Aabc' FROM one
+----
+false
+
+query B nosort
+SELECT 'abc' ~ 'abc\z' FROM one
+----
+true
+
+query B nosort
+SELECT 'abcx' ~ 'abc\z' FROM one
+----
+false
+
+# Both together == whole-string match, equivalent to `^abc$`.
+query B nosort
+SELECT 'abc' ~ '\Aabc\z' FROM one
+----
+true
+
+query B nosort
+SELECT 'abcd' ~ '\Aabc\z' FROM one
+----
+false
+
+# `\Z` (uppercase) is deliberately NOT a jed anchor (regex.md §2): its only distinguishing PCRE
+# behavior is trailing-newline leniency, which jed does nowhere, so it stays an invalid escape
+# (2201B). PostgreSQL accepts `\Z` as end-of-string, so this row is oracle-overridden.
+statement error 2201B
+SELECT 'abc' ~ 'abc\Z' FROM one
+
 # Greedy quantifiers.
 query B nosort
 SELECT 'aaa' ~ '^a+$' FROM one

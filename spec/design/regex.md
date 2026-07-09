@@ -78,6 +78,7 @@ to tightest: **alternation** `|` → **concatenation** → **quantifier** (`* + 
 | `(...)` | capturing group (group index = its `(` order, 1-based) |
 | `(?:...)` | non-capturing group |
 | `^` `$` | zero-width anchors: start / end of the whole subject (no multiline) |
+| `\A` `\z` | zero-width string-boundary anchors: start / **absolute** end of the whole subject — identical to `^`/`$` while there is no multiline mode, spelled separately so they stay string-anchored once one lands. `\z` is jed's RE2/PCRE spelling (PostgreSQL uses `\Z` for it) |
 
 **Quantifiers** apply to the immediately preceding atom; each has a **greedy** and a **lazy**
 (`?`-suffixed) form:
@@ -101,7 +102,12 @@ intervals + a `negated` flag (the canonical form the fixtures pin).
 PCRE would also read it literally): backreferences `\1`, lookaround `(?=)`/`(?!)`/`(?<=)`/`(?<!)`,
 named groups `(?<name>)`, inline flag groups `(?i)`, the `s`/`m`/`x` flags, `\b` word boundary,
 POSIX `[[:alpha:]]` classes, `\xHH`/`\x{…}`/`\uHHHH` numeric escapes, Unicode property escapes
-`\p{…}`. These are §10 follow-ons or permanently out (backtracking-forcing).
+`\p{…}`, and **`\Z`** (the PCRE end-anchor that also matches *before a trailing newline*). `\Z` is
+excluded on purpose: its **only** behavior distinct from `\z` is that trailing-newline leniency,
+which jed does nowhere — `$` itself is strict end-of-subject — so admitting `\Z` would either
+duplicate `\z` under a false-friend name or import a newline special-case jed rejects. (PostgreSQL
+accepts `\Z`, as end-of-string only, so `s ~ 'p\Z'` is an oracle divergence recorded in the ledger.)
+These are §10 follow-ons or permanently out (backtracking-forcing).
 
 **Lenient `{`** (the PCRE rule, for ergonomics + determinism): a `{` begins a quantifier **only**
 when it matches `{\d+}`, `{\d+,}`, or `{\d+,\d+}`; otherwise it is a **literal `{`**. So `'a{b}'`

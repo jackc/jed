@@ -61,6 +61,22 @@ matched = false
 caps = []
 steps = 16
 
+# `\Aa\z` compiles to the identical program as `^a$`, so its match result, captures, and step cost
+# are identical too (regex.md §2 string-boundary anchors).
+[[case]]
+pattern = "\\Aa\\z"
+input = "a"
+matched = true
+caps = [[0, 1]]
+steps = 13
+
+[[case]]
+pattern = "\\Aa\\z"
+input = "ab"
+matched = false
+caps = []
+steps = 16
+
 [[case]]
 pattern = "a|b"
 input = "b"
