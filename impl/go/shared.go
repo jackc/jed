@@ -181,8 +181,8 @@ type storage struct {
 	// older version (single-handle, reconstruct-on-open, all readers current) the gate always passes, so the
 	// on-disk byte layout is byte-for-byte unchanged.
 	freeGenTxid uint64
-	readOnly         bool   // opened read-only (api.md §2.1): every session is then read-only, a write is 25006. Always false in-memory.
-	path             string // the backing file path; "" for an in-memory database (surfaced by Database.Path / Session.Path)
+	readOnly    bool   // opened read-only (api.md §2.1): every session is then read-only, a write is 25006. Always false in-memory.
+	path        string // the backing file path; "" for an in-memory database (surfaced by Database.Path / Session.Path)
 }
 
 // persist durably publishes snap to the backing store via an incremental copy-on-write commit
