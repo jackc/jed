@@ -225,10 +225,13 @@ impl Engine {
         let ps = self.page_size as usize;
         let cap = ps - crate::format::PAGE_HEADER;
         let free = self.free_pages.clone();
+        // A bare single-handle engine has no cross-session reader registry (oldest_live == committed), so
+        // reuse is always safe (transactions.md §8): the shared-core path is the one that gates reuse.
         let write = snap.incremental_image(
             self.page_size,
             self.page_count,
             &free,
+            true,
             self.paging.as_deref(),
         )?;
         // v25: write the dirty tree + catalog first (unsynced), so the in-commit reachability walk can
@@ -248,18 +251,21 @@ impl Engine {
         // `plan_free_list`. A file is never reopened concurrently by this bare-`Engine` handle.
         let can_reclaim = self.open_streams.load(std::sync::atomic::Ordering::Relaxed) == 0;
         let paging = self.paging.clone().expect("paging present");
-        let (fl_pages, head, persisted, new_page_count, new_live) = crate::format::plan_free_list(
-            snap,
-            &paging,
-            write.root_page,
-            &write.pages,
-            &write.free_remaining,
-            write.page_count,
-            self.live_at_compaction,
-            cap,
-            ps,
-            can_reclaim,
-        )?;
+        let (fl_pages, head, persisted, new_page_count, new_live, new_gen) =
+            crate::format::plan_free_list(
+                snap,
+                &paging,
+                write.root_page,
+                &write.pages,
+                &write.free_remaining,
+                write.page_count,
+                self.live_at_compaction,
+                self.free_gen_txid,
+                cap,
+                ps,
+                can_reclaim,
+                true,
+            )?;
         let meta = crate::format::meta_page(
             self.page_size,
             snap.txid,
@@ -285,6 +291,7 @@ impl Engine {
         self.page_count = new_page_count;
         self.free_pages = persisted;
         self.live_at_compaction = new_live;
+        self.free_gen_txid = new_gen;
         Ok(())
     }
 

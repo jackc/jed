@@ -60,6 +60,14 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
+/// A test-only seam (compiled out of production entirely): fires in [`Session::publish`] AFTER the
+/// durable persist but BEFORE the roots swap — the window in which the just-committed version is durable
+/// yet not yet published, so a reader that pins here still gets the PRIOR committed version (the
+/// reuse-gate fallback-reader race, transactions.md §8). The deterministic pin-registration regression
+/// test installs a closure; the fault-injection seam (pager.rs) is the precedent.
+#[cfg(test)]
+pub(crate) static AFTER_PERSIST_HOOK: Mutex<Option<Box<dyn Fn() + Send>>> = Mutex::new(None);
+
 use crate::api::{PreparedStatement, Rows, Transaction};
 use crate::ast::Statement;
 use crate::cancel::CancellationToken;
@@ -216,6 +224,14 @@ pub(crate) struct Storage {
     /// The reachable page count recorded at the last compaction — the cheap trigger basis: compaction
     /// re-runs only once the high-water passes ~2× it (periodic ~2× bound, no per-commit walk).
     live_at_compaction: u32,
+    /// The version the current `free_pages` list is "as of" — the last compaction's txid, or the
+    /// committed version at open. It gates within-session reuse under the reader-liveness watermark
+    /// (transactions.md §8): a page dead at generation G is safe to reuse only once no live reader pins a
+    /// version older than G. `commit_durable` reuses the free-list only when `oldest_live ≥ free_gen_txid`;
+    /// otherwise it allocates from the high-water and the free-list waits (still persisted). With no reader
+    /// pinning an older version (single-handle, reconstruct-on-open, all readers current) the gate always
+    /// passes, so the on-disk byte layout is byte-for-byte unchanged.
+    free_gen_txid: u64,
 }
 
 impl Storage {
@@ -245,6 +261,7 @@ impl Storage {
             path: None,
             reclaim_within_session: true,
             live_at_compaction: 0,
+            free_gen_txid: 0,
         }
     }
 
@@ -269,10 +286,14 @@ impl Storage {
     pub(crate) fn persist_temp(&mut self, snap: &mut Snapshot, can_reclaim: bool) -> Result<()> {
         // A temp/in-memory store keeps its free-list in RAM (no meta), so it persists no free-list
         // pages; within-session reclamation is the post-commit RAM rebuild (`maybe_compact`).
+        // A temp domain (and an in-memory attachment) is session-local / driven by one caller, so its only
+        // reader is the session's own streaming cursor — gated synchronously by `can_reclaim` (open_streams).
+        // There is no cross-thread pin-registration race, so reuse is always safe here (transactions.md §8).
         let write = snap.incremental_image(
             self.page_size,
             self.page_count,
             &self.free_pages,
+            true,
             Some(&self.paging),
         )?;
         {
@@ -305,15 +326,21 @@ impl Storage {
     /// the caller's writer gate. `can_reclaim` gates within-session compaction (v25: on for the
     /// file/main domain — it persists the free-list and reclaims within-session rather than
     /// reconstructing on open).
-    pub(crate) fn commit_durable(&mut self, snap: &Snapshot, can_reclaim: bool) -> Result<()> {
+    pub(crate) fn commit_durable(
+        &mut self,
+        snap: &Snapshot,
+        can_reclaim: bool,
+        can_reuse: bool,
+    ) -> Result<()> {
         let write = snap.incremental_image(
             self.page_size,
             self.page_count,
             &self.free_pages,
+            can_reuse,
             Some(&self.paging),
         )?;
         if self.path.is_some() {
-            self.commit_file(snap, write, can_reclaim)
+            self.commit_file(snap, write, can_reclaim, can_reuse)
         } else {
             self.commit_in_memory(snap, write, can_reclaim)
         }
@@ -332,6 +359,7 @@ impl Storage {
         snap: &Snapshot,
         write: crate::format::IncrementalWrite,
         can_reclaim: bool,
+        can_reuse: bool,
     ) -> Result<()> {
         let ps = self.page_size as usize;
         let cap = ps - crate::format::PAGE_HEADER;
@@ -345,18 +373,21 @@ impl Storage {
                 pager.write_block(*index, bytes)?;
             }
         }
-        let (fl_pages, head, persisted, new_page_count, new_live) = crate::format::plan_free_list(
-            snap,
-            &self.paging,
-            write.root_page,
-            &write.pages,
-            &write.free_remaining,
-            write.page_count,
-            self.live_at_compaction,
-            cap,
-            ps,
-            can_reclaim,
-        )?;
+        let (fl_pages, head, persisted, new_page_count, new_live, new_gen) =
+            crate::format::plan_free_list(
+                snap,
+                &self.paging,
+                write.root_page,
+                &write.pages,
+                &write.free_remaining,
+                write.page_count,
+                self.live_at_compaction,
+                self.free_gen_txid,
+                cap,
+                ps,
+                can_reclaim,
+                can_reuse,
+            )?;
         let meta = crate::format::meta_page(
             self.page_size,
             snap.txid,
@@ -382,6 +413,7 @@ impl Storage {
         self.page_count = new_page_count;
         self.free_pages = persisted;
         self.live_at_compaction = new_live;
+        self.free_gen_txid = new_gen;
         Ok(())
     }
 
@@ -454,6 +486,7 @@ impl Storage {
             .filter(|p| !reached.contains(p))
             .collect();
         self.live_at_compaction = reached.len() as u32;
+        self.free_gen_txid = snap.txid; // the recomputed list is proven dead at snap.txid (the §8 gate)
         Ok(())
     }
 }
@@ -519,6 +552,22 @@ impl Shared {
         (r.committed.clone(), r.attached.clone())
     }
 
+    /// Atomically pin the committed roots AND register a reader pin on the committed version — the load
+    /// and the registration happen while holding the `live` lock, so the writer's reclamation watermark
+    /// ([`oldest_live_version`], also under `live`) can never observe a version chosen by a reader that
+    /// has not yet registered (transactions.md §8). Closing this load→register window is what makes the
+    /// free-list reuse gate sound: without it a reader could pin a version the watermark had already
+    /// judged free to reclaim. Lock order is `live` THEN `roots` — [`publish`] takes the same order, so a
+    /// reader either sees the new committed and pins it, or is counted at the old version. The caller
+    /// deregisters (`Session::finish_block` / a cursor's [`ReaderPin`] drop).
+    fn pin_latest(&self) -> (Arc<Snapshot>, HashMap<String, Arc<Snapshot>>, u64) {
+        let mut live = self.live.lock().expect("live lock not poisoned");
+        let r = self.roots.read().expect("roots lock not poisoned");
+        let version = r.committed.txid;
+        live.register(version);
+        (r.committed.clone(), r.attached.clone(), version)
+    }
+
     /// Whether any cross-session reader currently pins a committed snapshot (the live registry,
     /// transactions.md §8). The within-session compaction watermark for a host attachment
     /// (attached-databases.md §5): the committing writer holds the write gate but is not itself in
@@ -565,7 +614,9 @@ impl Shared {
         if let Some(att) = atts.get_mut(name) {
             if att.storage.path.is_some() {
                 snap.txid = base_txid + 1;
-                att.storage.commit_durable(snap, can_reclaim)?;
+                // An attachment commit passes can_reuse = true (its reuse is gated at this call site by
+                // has_live_readers — attached-databases.md §5), matching the Go/TS cores.
+                att.storage.commit_durable(snap, can_reclaim, true)?;
                 snap.demote_clean_leaves(); // post-commit residency flip (bplus-reshape.md B4)
             } else {
                 att.storage.persist_temp(snap, can_reclaim)?;
@@ -598,6 +649,16 @@ impl Shared {
         })
     }
 
+    /// A deregistering RAII guard for a pin ALREADY registered (by [`pin_latest`]) — used for the
+    /// autocommit read's provisional pin, whose registration was done atomically with the snapshot load,
+    /// so this only wraps the drop-time deregister (it does NOT register again).
+    fn reader_pin_for(self: &Arc<Self>, version: u64) -> Box<dyn std::any::Any> {
+        Box::new(ReaderPin {
+            shared: self.clone(),
+            version,
+        })
+    }
+
     /// Publish the new committed root TOGETHER with the current attached roots (the §3 commit window +
     /// the N-root commit, attached-databases.md §5) — one pointer/map swap under a single write lock, so
     /// a reader pins a consistent cross-database snapshot. `attached` is the committing session's pinned
@@ -605,6 +666,10 @@ impl Shared {
     /// freshly-adopted root). An empty map (nothing attached) is byte-for-byte the pre-attachment
     /// single-root publish.
     fn publish(&self, committed: Arc<Snapshot>, attached: HashMap<String, Arc<Snapshot>>) {
+        // Take `live` THEN `roots` (the same order as `pin_latest`), so a reader registering a pin is
+        // serialized against this publish (transactions.md §8): it either sees the old committed and is
+        // counted at that version, or sees the new one — never a version the reclamation watermark misses.
+        let _live = self.live.lock().expect("live lock not poisoned");
         let mut r = self.roots.write().expect("roots lock not poisoned");
         r.committed = committed;
         r.attached = attached;
@@ -659,12 +724,19 @@ impl Shared {
     /// `free_pages` advance only after both syncs succeed, so a write failure leaves the file's prior
     /// meta and this accounting untouched (the working snapshot is then discarded by the caller).
     fn persist(&self, snap: &Snapshot) -> Result<()> {
-        // The main domain reclaims within-session only when enabled (off by default) and no reader pins
-        // an older version (the file/in-memory watermark, temp-tables.md §6 Phase A). Compute the
-        // watermark BEFORE the storage lock so the `live` lock is never held under it (a clean order).
-        let can_reclaim = self.oldest_live_version(snap.txid) == snap.txid;
+        // The reader-liveness watermark (transactions.md §8) gates two things at the main-domain commit:
+        //   - can_reclaim (oldest_live == the new version, i.e. no reader live at an older version) lets the
+        //     periodic COMPACT recompute the free-list (freeing this commit's fresh orphans);
+        //   - can_reuse (oldest_live ≥ the free-list's generation) lets this commit REUSE the free-list — a
+        //     page dead at generation G is only safe to overwrite once no reader pins a version older than G.
+        // Both consult the SAME registry; single-handle / all-readers-current keeps oldest_live == committed,
+        // so both hold and behavior (and on-disk bytes) are identical to an ungated commit. The watermark is
+        // computed BEFORE the storage lock so the `live` lock is never held under it (a clean lock order).
+        let oldest = self.oldest_live_version(snap.txid);
+        let can_reclaim = oldest == snap.txid;
         let mut st = self.storage.lock().expect("storage lock not poisoned");
-        st.commit_durable(snap, can_reclaim)
+        let can_reuse = oldest >= st.free_gen_txid;
+        st.commit_durable(snap, can_reclaim, can_reuse)
     }
 
     /// Whether MAIN is file-backed (durable) rather than in-memory — the input to the one-durable-writer
@@ -798,6 +870,7 @@ impl Database {
             // be returned at each commit or they would leak permanently (format.md *Reclamation*).
             reclaim_within_session: true,
             live_at_compaction: engine.live_at_compaction,
+            free_gen_txid: engine.free_gen_txid,
         };
         Database(Arc::new(Shared {
             roots: RwLock::new(Roots {
@@ -1002,6 +1075,7 @@ impl Database {
                 // v25: a file attachment persists + reclaims like the main file domain (above).
                 reclaim_within_session: true,
                 live_at_compaction: engine.live_at_compaction,
+                free_gen_txid: engine.free_gen_txid,
             };
             Some((storage, engine.committed))
         } else {
@@ -1107,13 +1181,7 @@ impl Database {
     /// never blocking a writer — and `close`/`Drop` deregisters. A write through it is `25006`.
     /// (The old `SharedDb::read()` → `ReadHandle`.)
     pub fn read_session(&self) -> Session {
-        let (snap, attached) = self.0.pin_roots();
-        let version = snap.txid;
-        self.0
-            .live
-            .lock()
-            .expect("live lock not poisoned")
-            .register(version);
+        let (snap, attached, version) = self.0.pin_latest(); // atomic load+register (§8): no gap
         let mut engine = Engine::from_snapshot((*snap).clone());
         engine.page_size = self.0.page_size(); // serialize/split at the file's page size (§8)
         engine.read_only = true; // the executor rejects writes (25006) / poisons a read-only block
@@ -1169,30 +1237,28 @@ impl Database {
     /// explicit block. (The old `Engine::session(opts)` swap → an independent owns-its-`Engine`
     /// session.)
     pub fn session(&self, opts: SessionOptions) -> Session {
-        let (snap, attached) = self.0.pin_roots();
-        let version = snap.txid;
+        // A read-only file-backed core mints read-only sessions (a write is `25006`); it pins the
+        // committed version in the watermark ATOMICALLY like a read session (§8). A writable core mints
+        // the autocommit lazy-gate session — no persistent pin (each autocommit read pins per statement).
+        let (snap, attached, version, access, pinned) = if self.0.read_only() {
+            let (snap, attached, version) = self.0.pin_latest();
+            (snap, attached, version, Access::ReadOnly, Some(version))
+        } else {
+            let (snap, attached) = self.0.pin_roots();
+            let version = snap.txid;
+            (snap, attached, version, Access::ReadWrite, None)
+        };
         let mut engine = Engine::from_snapshot((*snap).clone());
         engine.page_size = self.0.page_size(); // serialize/split at the file's page size (§8)
         engine.core = Some(self.0.clone()); // route to the attachment registry (§5)
         engine.attached_committed = attached; // pin the attached roots together (§5)
         engine.session = SessionState::with_options(opts);
-        // A read-only file-backed core mints read-only sessions (a write is `25006`); it pins the
-        // committed version in the watermark like a read session. A writable core mints the autocommit
-        // lazy-gate session.
-        let (access, pinned) = if self.0.read_only() {
+        if pinned.is_some() {
             // The engine enforces read-only too, so `begin_tx` rejects an explicit `BEGIN READ WRITE`
             // (25006) and downgrades a plain `BEGIN` to a read-only block (the access check above only
             // catches direct writes).
             engine.read_only = true;
-            self.0
-                .live
-                .lock()
-                .expect("live lock not poisoned")
-                .register(version);
-            (Access::ReadOnly, Some(version))
-        } else {
-            (Access::ReadWrite, None)
-        };
+        }
         Session {
             shared: self.0.clone(),
             engine,
@@ -1282,9 +1348,18 @@ impl Session {
     ) -> Result<Rows> {
         // Route the read before building the streaming cursor: an autocommit (non-block, writable
         // access) read re-pins the latest committed so the snapshot is current (PG-faithful); a
-        // read-only session uses its existing pin, and an open block uses its working set.
+        // read-only session uses its existing pin, and an open block uses its working set. The re-pin is
+        // ATOMIC (load committed + register the watermark pin under one `live` lock, §8): the read's
+        // version can then never be reclaimed in a load→register gap. The pin is PROVISIONAL — a cursor
+        // adopts it (its drop deregisters), else it drops here (a materialized dispatch / an early return),
+        // so a read that pins no long-lived cursor leaks nothing.
+        let mut provisional: Option<Box<dyn std::any::Any>> = None;
         if self.access != Access::ReadOnly && !self.engine.in_transaction() && !stmt_is_write(ast) {
-            self.refresh_committed();
+            let (snap, attached, version) = self.shared.pin_latest();
+            self.base_version = version;
+            self.engine.committed = (*snap).clone();
+            self.engine.attached_committed = attached;
+            provisional = Some(self.shared.reader_pin_for(version));
         }
         // A read served by a lazy lane never reaches the materialized `dispatch`, so enforce the
         // read-path admission gates (25P02 / 54P02 / 42501) here — after refreshing so privilege
@@ -1308,11 +1383,15 @@ impl Session {
             Ok(Some(mut rows)) => {
                 // Bundle the reader-liveness pin with an open-stream guard: the guard increments the
                 // engine's open_streams so a session-local temp compaction defers while this cursor may
-                // still fault its pinned temp tree (temp-tables.md §6); both release on close/drop.
-                rows.attach_pin(Box::new((
-                    self.shared.reader_pin(self.base_version),
-                    self.engine.open_stream_guard(),
-                )));
+                // still fault its pinned temp tree (temp-tables.md §6); both release on close/drop. An
+                // autocommit read transfers its already-registered provisional pin; a read-only session
+                // registers a per-cursor pin on its already-mint-protected version.
+                let pin = match provisional.take() {
+                    Some(p) => p,
+                    None => self.shared.reader_pin(self.base_version),
+                };
+                let open_stream = self.engine.open_stream_guard();
+                rows.attach_pin(Box::new((pin, open_stream)));
                 // A drain-time fault inside an open block aborts it (the open-time lane errors are
                 // poisoned at the returns above); a no-op for an autocommit read.
                 self.engine.attach_block_poison(&mut rows);
@@ -1326,10 +1405,12 @@ impl Session {
                 // A lazy deferred set-op / WITH cursor (streaming.md §7) is a live reader too — pin its
                 // snapshot version in the watermark, released on cursor close/drop (bundled with the
                 // open-stream guard, as above).
-                rows.attach_pin(Box::new((
-                    self.shared.reader_pin(self.base_version),
-                    self.engine.open_stream_guard(),
-                )));
+                let pin = match provisional.take() {
+                    Some(p) => p,
+                    None => self.shared.reader_pin(self.base_version),
+                };
+                let open_stream = self.engine.open_stream_guard();
+                rows.attach_pin(Box::new((pin, open_stream)));
                 self.engine.attach_block_poison(&mut rows);
                 return Ok(rows);
             }
@@ -1406,9 +1487,11 @@ impl Session {
             return self.engine.execute_stmt_params(ast, params);
         }
         if !stmt_is_write(&ast) {
-            // Autocommit read: pin the latest committed for this one statement (PG-faithful — each
-            // autocommit statement sees the newest committed state); no gate.
-            self.refresh_committed();
+            // Autocommit read: the snapshot was already pinned + committed set upstream (query_ast_cached's
+            // atomic autocommit-read pin for a writable session; the mint pin for a read-only session), and
+            // that pin is held across this synchronous materialize (transactions.md §8) — so the read's
+            // version is visible to the reclamation watermark for the whole fault. Re-loading committed here
+            // would both double-work and (on a read-only session) break snapshot stability.
             return self.engine.execute_stmt_params(ast, params);
         }
         // Autocommit write — the lazy gate (§2.4): take it, capture the latest committed as the
@@ -1444,13 +1527,13 @@ impl Session {
             self.gate_held = true;
             self.refresh_committed();
         } else {
-            self.refresh_committed();
-            self.shared
-                .live
-                .lock()
-                .expect("live lock not poisoned")
-                .register(self.base_version);
-            self.pinned = Some(self.base_version);
+            // A READ ONLY block pins its snapshot atomically (load+register under one lock, §8), so the
+            // version it reads can never be reclaimed in a load→register gap.
+            let (snap, attached, version) = self.shared.pin_latest();
+            self.base_version = version;
+            self.engine.committed = (*snap).clone();
+            self.engine.attached_committed = attached;
+            self.pinned = Some(version);
         }
         match self.engine.begin_tx(writable) {
             Ok(outcome) => Ok(outcome),
@@ -1523,6 +1606,10 @@ impl Session {
         let mut snap = self.engine.committed.clone();
         snap.txid = self.base_version + 1; // advance the shared version on every commit
         self.shared.persist(&snap)?; // durable before publish (packs into the byte store, any host)
+        #[cfg(test)]
+        if let Some(hook) = AFTER_PERSIST_HOOK.lock().expect("hook lock").as_ref() {
+            hook(); // the persist→publish window (test seam; §8 fallback-reader race point)
+        }
         // The post-commit residency flip (bplus-reshape.md B4): the persist above assigned page ids
         // to every dirty node it wrote, so the committed tree can shed its leaf payloads — clean
         // leaves demote to `OnDisk` references faulted back through the pool on next touch. The
@@ -2471,6 +2558,131 @@ mod residency_flip_tests {
         })
         .unwrap();
         run(&mut db);
+        db.close().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod reclaim_watermark_tests {
+    //! Deterministic regression for the reader-liveness watermark gating within-session free-list reuse
+    //! (transactions.md §8) — the concurrency case the corpus cannot express (CLAUDE.md §10). A
+    //! file-backed reader that pins the committed snapshot in the persist→publish window (the "fallback
+    //! reader") must never observe rows from a later commit, even though continuous within-session
+    //! reclamation is recycling pages. It reproduced a snapshot-isolation violation before the free-list
+    //! generation gate + atomic pin registration landed. Uses the AFTER_PERSIST_HOOK seam to make the
+    //! race deterministic. Mirrors the Go TestFallbackReaderSnapshotIsolationUnderReclamation.
+
+    use super::*;
+    use crate::value::Value;
+    use crate::{CreateOptions, OpenOptions};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+
+    fn count(s: &mut Session) -> i64 {
+        let rows: Vec<_> = s.query("SELECT count(*) FROM t", &[]).unwrap().collect();
+        match &rows[0][0] {
+            Value::Int(n) => *n,
+            v => panic!("expected an int count, got {v:?}"),
+        }
+    }
+
+    #[test]
+    fn fallback_reader_snapshot_isolation_under_reclamation() {
+        let path = std::env::temp_dir().join("jed_fallback_reader_isolation.jed");
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut db = Database::create(CreateOptions {
+                path: Some(path.clone()),
+                page_size: 256,
+                skip_fsync: true,
+                ..Default::default()
+            })
+            .unwrap();
+            db.query_outcome("CREATE TABLE t (id i64 PRIMARY KEY)", &[])
+                .unwrap();
+            // A multi-leaf tree so within-session compaction runs and a free-list accumulates.
+            for i in 1..=120 {
+                db.query_outcome(&format!("INSERT INTO t VALUES ({i})"), &[])
+                    .unwrap();
+            }
+        }
+        let mut db = Database::open_with_options(
+            &path,
+            OpenOptions {
+                cache_bytes: 4 * 256,
+                skip_fsync: true,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+
+        let (ready_tx, ready_rx) = mpsc::channel::<()>(); // hook → reader: "pin now"
+        let (pinned_tx, pinned_rx) = mpsc::channel::<()>(); // reader → hook: "pinned"
+        let (done_tx, done_rx) = mpsc::channel::<()>(); // main → reader: "reuse-commits done"
+        let fired = Arc::new(AtomicBool::new(false));
+
+        // The reader thread: pin the fallback version, read its count, hold the pin across the
+        // reuse-commits, then re-read — snapshot isolation demands the count is unchanged.
+        let reader_db = db.clone();
+        let reader = std::thread::spawn(move || {
+            ready_rx.recv().unwrap();
+            let mut rd = reader_db.read_session();
+            let pinned_count = count(&mut rd);
+            pinned_tx.send(()).unwrap();
+            done_rx.recv().unwrap();
+            let got = count(&mut rd);
+            assert_eq!(
+                got, pinned_count,
+                "SNAPSHOT ISOLATION VIOLATED: fallback reader pinned count={pinned_count} but now sees {got} (its pages were reclaimed and overwritten)"
+            );
+        });
+
+        // The hook fires in the persist→publish window; it acts ONLY on a commit that compacted (advanced
+        // free_gen_txid past the still-published version) — the case that just placed a page reachable at
+        // the fallback version into the reusable free-list.
+        {
+            let shared = db.0.clone();
+            let fired = fired.clone();
+            let ready = Mutex::new(Some(ready_tx));
+            let pinned = Mutex::new(Some(pinned_rx));
+            *AFTER_PERSIST_HOOK.lock().unwrap() = Some(Box::new(move || {
+                if fired.load(Ordering::SeqCst) {
+                    return;
+                }
+                let published = shared.committed_version();
+                let generation = shared.storage.lock().unwrap().free_gen_txid;
+                if generation <= published {
+                    return; // not a compacting commit — nothing fresh in the reusable free-list yet
+                }
+                fired.store(true, Ordering::SeqCst);
+                ready.lock().unwrap().take().unwrap().send(()).unwrap();
+                pinned.lock().unwrap().take().unwrap().recv().unwrap();
+            }));
+        }
+
+        // Drive commits until one compacts and fires the hook (the writer blocks in the hook while the
+        // reader pins the fallback version, then the commit publishes).
+        let mut i = 121;
+        while !fired.load(Ordering::SeqCst) && i <= 4000 {
+            db.query_outcome(&format!("INSERT INTO t VALUES ({i})"), &[])
+                .unwrap();
+            i += 1;
+        }
+        *AFTER_PERSIST_HOOK.lock().unwrap() = None;
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "no compacting commit occurred — test did not exercise the reuse path"
+        );
+
+        // Hammer reuse-commits while the reader is pinned at the fallback version: on the buggy path these
+        // recycle a page the reader still references and overwrite it; the gate must defer that reuse.
+        for j in 4001..=4200 {
+            db.query_outcome(&format!("INSERT INTO t VALUES ({j})"), &[])
+                .unwrap();
+        }
+        done_tx.send(()).unwrap();
+        reader.join().unwrap();
         db.close().unwrap();
         let _ = std::fs::remove_file(&path);
     }

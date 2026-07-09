@@ -1452,11 +1452,18 @@ struct PageAlloc<'a> {
     free: &'a [u32],
     cursor: usize,
     next: u32,
+    /// Whether this commit draws from the free-list. `false` ⇒ allocate high-water only, leaving the
+    /// whole free-list unconsumed (`cursor` stays 0, so `free_remaining` carries it all through for
+    /// persistence): the reader-liveness watermark defers reusing a page a still-open reader on an older
+    /// snapshot could observe (transactions.md §8 — the free-list generation gate). Reconstruct-on-open
+    /// and the single-handle case leave it `true` (oldest_live == committed ⇒ no page is still observed),
+    /// so the on-disk byte layout is unchanged whenever no reader pins an older version.
+    reuse: bool,
 }
 
 impl PageAlloc<'_> {
     fn take(&mut self) -> u32 {
-        if self.cursor < self.free.len() {
+        if self.reuse && self.cursor < self.free.len() {
             let p = self.free[self.cursor];
             self.cursor += 1;
             p
@@ -1484,6 +1491,7 @@ impl Snapshot {
         page_size: u32,
         start_page: u32,
         free: &[u32],
+        reuse: bool,
         paging: Option<&SharedPaging>,
     ) -> Result<IncrementalWrite> {
         let ps = page_size as usize;
@@ -1492,11 +1500,14 @@ impl Snapshot {
         let mut tables = self.catalog_and_stores();
         tables.sort_by(|a, b| a.0.cmp(b.0));
 
-        // Allocate from the free-list first (reclaiming dead pages), then extend the file.
+        // Allocate from the free-list first (reclaiming dead pages), then extend the file — unless the
+        // watermark defers reuse (`reuse` false), in which case only the high-water is drawn and the whole
+        // free-list carries through unconsumed for persistence (`PageAlloc::reuse`, transactions.md §8).
         let mut alloc = PageAlloc {
             free,
             cursor: 0,
             next: start_page,
+            reuse,
         };
 
         let mut pages: Vec<(u32, Vec<u8>)> = Vec::new();
@@ -1963,6 +1974,10 @@ impl Engine {
         // v25: load the free-list directly from the persisted chain (meta offset 28) — no
         // reachability walk (spec/fileformat/format.md *Reclamation*).
         db.free_pages = read_free_list(&paging, meta.free_list_head)?;
+        // Every persisted free page is dead at the committed version (the free-list is "as of" meta.txid),
+        // so its reuse generation is meta.txid: at open oldest_live == committed and any later reader pins
+        // ≥ the committed version, so reuse is safe (transactions.md §8, the free-list generation gate).
+        db.free_gen_txid = meta.txid;
         // Seed the within-session compaction trigger with the live estimate (`page_count` minus the
         // free-list), so the first commit after open does not compact spuriously (format.rs
         // `compacted_free_list`).
@@ -2111,6 +2126,7 @@ pub(crate) fn reachable_pages(
 /// fallback snapshot too), so persisting never grows the file (`serialize_free_list`). Returns the
 /// chain pages, its head, the list to keep as the new free-list, the new high-water, and the live
 /// count to remember (unchanged when not compacting). The caller has gated on the reader watermark.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn plan_free_list(
     snap: &Snapshot,
     paging: &SharedPaging,
@@ -2119,15 +2135,17 @@ pub(crate) fn plan_free_list(
     free_remaining: &[u32],
     page_count: u32,
     live_at_compaction: u32,
+    gen_txid: u64,
     cap: usize,
     ps: usize,
     can_reclaim: bool,
-) -> Result<(Vec<(u32, Vec<u8>)>, u32, Vec<u32>, u32, u32)> {
+    can_reuse: bool,
+) -> Result<(Vec<(u32, Vec<u8>)>, u32, Vec<u32>, u32, u32, u64)> {
     const MIN_COMPACT_PAGES: u32 = 16; // don't churn a tiny store
     let compact = can_reclaim
         && page_count > MIN_COMPACT_PAGES
         && (page_count as u64) > 2 * live_at_compaction as u64;
-    let (persist_list, new_live) = if compact {
+    let (persist_list, new_live, new_gen) = if compact {
         let mut reached = reachable_pages(snap, paging, cat_root)?;
         for (index, _) in written {
             reached.insert(*index);
@@ -2136,13 +2154,20 @@ pub(crate) fn plan_free_list(
             .filter(|p| !reached.contains(p))
             .collect();
         let live = reached.len() as u32;
-        (free, live)
+        // The recomputed list is proven dead at snap.txid — its reuse generation (the §8 gate).
+        (free, live, snap.txid)
     } else {
-        (free_remaining.to_vec(), live_at_compaction)
+        (free_remaining.to_vec(), live_at_compaction, gen_txid)
     };
+    // The free-list CHAIN pages overwrite in place, so they may only land on pages no live reader can
+    // observe. `free_remaining` is dead at the FALLBACK snapshot (torn-write-safe), but a reader pinned
+    // OLDER than the free-list generation may still reference one of those pages (transactions.md §8) —
+    // the same hazard as data-page reuse. When the watermark defers reuse the chain must grow the
+    // high-water instead (empty `safe`), exactly as the data allocator does.
+    let safe: &[u32] = if can_reuse { free_remaining } else { &[] };
     let (pages, head, persisted, new_pc) =
-        serialize_free_list(&persist_list, free_remaining, cap, ps, page_count);
-    Ok((pages, head, persisted, new_pc, new_live))
+        serialize_free_list(&persist_list, safe, cap, ps, page_count);
+    Ok((pages, head, persisted, new_pc, new_live, new_gen))
 }
 
 /// Add every node page of a resident B+tree to `reached`: an interior/leaf node's own set-once page,

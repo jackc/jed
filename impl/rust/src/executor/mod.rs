@@ -417,6 +417,12 @@ pub struct Engine {
     /// only once the high-water passes ~2× it, mirroring [`crate::shared::Storage`]. `0` for an
     /// in-memory database (no persistence).
     pub(crate) live_at_compaction: u32,
+    /// The version the current `free_pages` list is "as of" — the last compaction's txid, or the
+    /// committed version at open. It gates within-session reuse under the reader-liveness watermark
+    /// (transactions.md §8): a page dead at generation G is reusable only once no reader pins a version
+    /// older than G. A bare single-handle `Engine` has no live registry (oldest_live == committed), so the
+    /// gate always passes and the byte layout is unchanged.
+    pub(crate) free_gen_txid: u64,
     /// The shared paging context for a file-backed database (spec/design/pager.md): the open pager
     /// (kept for the handle's life) + the bounded leaf buffer pool, shared (`Arc`) with every table
     /// store so reads fault `OnDisk` leaves through the one pool. The load reads pages through it and
