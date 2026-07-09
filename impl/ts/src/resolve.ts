@@ -3,9 +3,9 @@
 // column name (spec/design/grammar.md §8). `*` expands across ALL relations in FROM order,
 // each relation's columns in catalog order (§15).
 import {
-  Engine,
-  ParamTypes,
-  Scope,
+  type Engine,
+  type ParamTypes,
+  type Scope,
   cmpBytes,
   collectColumn,
   elemScalarHint,
@@ -58,7 +58,7 @@ import type {
   Resolved,
   ResolvedType,
 } from "./executor.ts";
-import { EngineError, engineError } from "./errors.ts";
+import { type EngineError, engineError } from "./errors.ts";
 import { exprEqual, resolveTypeAndTypmod, unifyCaseTypes } from "./eval_ops.ts";
 import { coerceStringToArray, overflow, typeError } from "./store.ts";
 import type { ScalarType } from "./types.ts";

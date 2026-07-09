@@ -2125,14 +2125,6 @@ class Parser {
     return [this.parseExpr()];
   }
 
-  // columnRefExpr parses a column_ref into a bare or qualified column-reference Expr.
-  private columnRefExpr(): Expr {
-    const [qualifier, name] = this.parseColumnRef();
-    return qualifier !== null
-      ? { kind: "qualifiedColumn", qualifier, name }
-      : { kind: "column", name };
-  }
-
   // parseFromClause parses `from_clause ::= table_ref join_clause*` (grammar.md §15): the first
   // table reference followed by a left-deep chain of zero or more joins. The join keywords are
   // not reserved (§3); the loop recognizes a join only by a leading join keyword, so any other

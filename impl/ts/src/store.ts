@@ -66,7 +66,7 @@ import type { BinaryOp, InsertValue, Literal } from "./ast.ts";
 import type { ColField, ColType } from "./catalog.ts";
 import { rangeForElement } from "./range.ts";
 import type { EvalEnv, RExpr } from "./executor.ts";
-import { Meter } from "./cost.ts";
+import type { Meter } from "./cost.ts";
 import { COSTS } from "./costs.ts";
 import type { Interval } from "./interval.ts";
 import type { ZoneRef } from "./timezone.ts";

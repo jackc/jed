@@ -96,7 +96,7 @@ test("inlineBodySpan matches the construct decode advance", () => {
     { ty: sc("timestamptz"), v: timestamptzValue(-42n) },
     { ty: sc("date"), v: dateValue(-19000n) },
     { ty: sc("interval"), v: intervalValue({ months: 14, days: -3, micros: 123456n }) },
-    { ty: sc("f64"), v: float64Value(3.141592653589793) },
+    { ty: sc("f64"), v: float64Value(Math.PI) },
     { ty: sc("f32"), v: float32Value(-2.5) },
     { ty: sc("json"), v: jsonValue('{"k": 1}') },
     { ty: sc("jsonb"), v: jsonbValue(doc) },

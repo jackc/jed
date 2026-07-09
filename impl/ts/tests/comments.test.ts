@@ -5,7 +5,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, Session, type Engine } from "../src/tooling.ts";
+import type { Session } from "../src/tooling.ts";
 import { type Handle, dbWith, errCode, query } from "./util.ts";
 
 function setup(): Session {

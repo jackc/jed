@@ -8,7 +8,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { EngineError, Session } from "../src/tooling.ts";
+import { EngineError, type Session } from "../src/tooling.ts";
 import type { Handle } from "./util.ts";
 import { MAX_EXPR_DEPTH, parseSQL } from "../src/parser.ts";
 import { memDb } from "./mem_db.ts";

@@ -16,7 +16,7 @@ import type {
   SelectPlan,
 } from "./executor.ts";
 import {
-  Engine,
+  type Engine,
   astSubscriptExprs,
   exprHasAggregate,
   itemsHaveAggregate,
@@ -30,7 +30,7 @@ import {
   seqDataTypePgName,
   seqDataTypeRange,
 } from "./catalog.ts";
-import { EngineError, engineError } from "./errors.ts";
+import { type EngineError, engineError } from "./errors.ts";
 import type { ScalarType, Type } from "./types.ts";
 import {
   arrayT,
@@ -78,7 +78,7 @@ import { unifySetopColumn } from "./eval_ops.ts";
 import type { Value } from "./value.ts";
 import { storeValue } from "./store.ts";
 import type { Privilege } from "./privileges.ts";
-import { TableStore } from "./storage.ts";
+import type { TableStore } from "./storage.ts";
 export function relOfIndex(rels: ScopeRel[], idx: number): [string, string] {
   for (const r of rels) {
     const n = r.table.columns.length;

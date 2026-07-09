@@ -49,7 +49,7 @@ import { engineError } from "./errors.ts";
 import { storeValue, typeError } from "./store.ts";
 import { valueCmp } from "./window.ts";
 import type { Row } from "./storage.ts";
-import { Meter } from "./cost.ts";
+import type { Meter } from "./cost.ts";
 import { evalExpr } from "./eval.ts";
 import {
   canonicalName,
@@ -929,7 +929,7 @@ export function astDeepEqual(a: unknown, b: unknown): boolean {
   const ak = Object.keys(ao);
   if (ak.length !== Object.keys(bo).length) return false;
   for (const k of ak) {
-    if (!Object.prototype.hasOwnProperty.call(bo, k)) return false;
+    if (!Object.hasOwn(bo, k)) return false;
     if (!astDeepEqual(ao[k], bo[k])) return false;
   }
   return true;

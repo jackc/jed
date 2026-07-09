@@ -9,7 +9,6 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { pkIndices, primaryKeyIndex } from "../src/catalog.ts";
 import { Database } from "../src/tooling.ts";
-import { loadEngine, toImage } from "../src/format.ts";
 import { type Handle, dbWith, errCode } from "./util.ts";
 import { memDb } from "./mem_db.ts";
 

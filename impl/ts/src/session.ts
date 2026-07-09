@@ -8,7 +8,7 @@ import type { ZoneRef } from "./timezone.ts";
 import {
   DEFAULT_MAX_SQL_LENGTH,
   DEFAULT_TEMP_BUFFERS,
-  Engine,
+  type Engine,
   distinctRowKey,
   finalizeAcc,
   foldAcc,
@@ -26,7 +26,7 @@ import type { Row } from "./storage.ts";
 import { isTrue, nullValue } from "./value.ts";
 import { evalExpr } from "./eval.ts";
 import { COSTS } from "./costs.ts";
-import { TableStore } from "./storage.ts";
+import type { TableStore } from "./storage.ts";
 import type { KeyBound } from "./pmap.ts";
 export class SessionState {
   // The open transaction, or null under autocommit (transactions.md §4.1); the Idle/Open/Failed

@@ -330,7 +330,7 @@ export class Snapshot {
       const indexes = table.indexes.filter((idx) => {
         if (pkSkewed) return true;
         const cols = indexColumnOrdinals(idx);
-        return cols !== null && cols.some((c) => isSkewed(table.columns[c]!.collation));
+        return cols?.some((c) => isSkewed(table.columns[c]!.collation));
       });
       if (!pkSkewed && indexes.length === 0) continue;
       const colls: (Collation | null)[] = table.columns.map((c) =>

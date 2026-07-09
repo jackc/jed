@@ -4,9 +4,9 @@
 // caller range-checks it to int4). count > 0 is checked by the caller.
 import { Decimal, EXP_LIMIT, decimalFromParts } from "./decimal.ts";
 import {
-  Engine,
-  ParamTypes,
-  Scope,
+  type Engine,
+  type ParamTypes,
+  type Scope,
   resolve,
   resolvedTypeEqual,
   resolvedTypeOf,

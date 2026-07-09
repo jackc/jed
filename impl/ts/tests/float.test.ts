@@ -11,8 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { Decimal } from "../src/decimal.ts";
-import { loadEngine, toImage } from "../src/format.ts";
-import { Database, createDatabase, openDatabase } from "../src/tooling.ts";
+import { Database, createDatabase } from "../src/tooling.ts";
 import {
   canonFloat,
   float32Value,

@@ -24,29 +24,23 @@ import type {
   GroupItem,
   IndexKeyElem,
   Insert,
-  InsertValue,
   JoinKind,
   JsonOnBehavior,
   JsonPredicateKind,
   JsonTable,
   JsonWrapper,
   JtColumn,
-  Literal,
   OnConflict,
   OrderKey,
   QueryExpr,
   RefAction,
-  SeqOptions,
-  SeqRestart,
   Select,
   SelectItems,
   SetOp,
   SetOpKind,
   Statement,
   SubscriptSpec,
-  TableRef,
   TypeFieldDef,
-  TypeMod,
   Update,
   WindowDef,
   WindowFrame,
@@ -56,15 +50,9 @@ import type {
   WithExpr,
   WithQuery,
 } from "./ast.ts";
-import {
-  cteBodyAsQuery,
-  cteBodyIsDataModifying,
-  emptySeqOptions,
-  forEachGroupExpr,
-} from "./ast.ts";
+import { cteBodyAsQuery, cteBodyIsDataModifying, emptySeqOptions } from "./ast.ts";
 import {
   type CheckConstraint,
-  type ColField,
   type ColType,
   type Column,
   type CompositeField,
@@ -78,69 +66,39 @@ import {
   type IdentityKind,
   type IndexDef,
   type IndexKey,
-  type SeqDataType,
   type SeqOwner,
   type SequenceDef,
   type Table,
   columnIndex,
-  indexAllColumns,
   indexColumnOrdinals,
   indexFirstColumn,
   pkIndices,
-  seqDataTypeDefaultBounds,
   seqDataTypeForScalar,
-  seqDataTypeFromName,
-  seqDataTypePgName,
-  seqDataTypeRange,
   primaryKeyIndex,
   resolveColType,
 } from "./catalog.ts";
-import { LifetimeBudget, Meter } from "./cost.ts";
+import { Meter } from "./cost.ts";
 import {
   type Collation,
-  foldCase,
   foldLowerSimple,
-  loadedCollation,
   loadedCollationTables,
   loadedProperty,
   loadUnicodeData as loadUnicodeDataGlobal,
   serializeTable,
   sortKey as collationSortKey,
-  versionSkew,
 } from "./collation.ts";
 import { COSTS } from "./costs.ts";
 import { Cursor, type RowSource } from "./cursor.ts";
 // Type-only (erased) — no runtime cycle: the executor↔api value edge stays one-directional.
 import type { RunResult } from "./ergonomic.ts";
 import {
-  instantToLocalMicros,
   loadTimeZoneData as loadTimeZoneDataGlobal,
   loadedTimeZones as loadedTimeZonesGlobal,
-  localToInstantMicros,
-  offsetAtRef,
-  resolveZone,
   type TimeZoneInfo,
-  type ZoneRef,
 } from "./timezone.ts";
-import {
-  dateTruncInterval,
-  dateTruncMicros,
-  type ExtractSrc,
-  extractField,
-} from "./datetime_fn.ts";
-import { crc32Ieee, newTempStorage, pagePayload, resolveUnfetchedSelf } from "./format.ts";
+import { crc32Ieee, newTempStorage, pagePayload } from "./format.ts";
 import { commitDurableAttachment, persistTemp } from "./persist.ts";
-import {
-  Decimal,
-  decimalFromParts,
-  EXP_LIMIT,
-  MAX_PRECISION,
-  MAX_SCALE,
-  workDiv,
-  workLinear,
-  workMod,
-  workMul,
-} from "./decimal.ts";
+import { Decimal, workLinear } from "./decimal.ts";
 import { encodeBool, encodeInt, encodeTerminated } from "./encoding.ts";
 import {
   checkViolation,
@@ -153,12 +111,12 @@ import {
   stampTable,
   uniqueViolation,
 } from "./errors.ts";
-import { type Privilege, type PrivilegeSet, Privileges } from "./privileges.ts";
+import { type PrivilegeSet, Privileges } from "./privileges.ts";
 import { type ScriptSummary, splitStatements } from "./split.ts";
 import type { SharedPaging } from "./paging.ts";
 import { parseExpression, parseSQL } from "./parser.ts";
 import { type KeyBound, type PNode, colAt, compareBytes, unboundedBound } from "./pmap.ts";
-import { DEFAULT_WORK_MEM, type RowCompare, SortedRows, type SpillSink, Sorter } from "./spill.ts";
+import { type RowCompare, SortedRows, type SpillSink, Sorter } from "./spill.ts";
 import { type Entry, type Row, TableStore } from "./storage.ts";
 import {
   type DecimalTypmod,
@@ -166,7 +124,6 @@ import {
   type Type,
   canonicalName,
   arrayT,
-  compositeRefName,
   compositeT,
   inRange,
   isBool,
@@ -180,13 +137,9 @@ import {
   isTimestamptz,
   isInterval,
   isDate,
-  isJson,
-  isJsonb,
-  isJsonPath,
   promoteFloat,
   rangeT,
   rank,
-  roundToWidth,
   scalarT,
   scalarTypeFromName,
   typeCanonicalName,
@@ -208,32 +161,8 @@ import {
   widthBytes,
   isFixedWidth,
 } from "./types.ts";
-import {
-  makeTimestamp,
-  NEG_INFINITY,
-  parseTimestamp,
-  parseTimestamptz,
-  POS_INFINITY,
-} from "./timestamp.ts";
-import { DATE_NEG_INFINITY, DATE_POS_INFINITY, parseDate } from "./date.ts";
-import { uuidExtractTimestampMicros, uuidExtractVersion } from "./uuid.ts";
-import { type ClockFunc, type RandomFill, Seam, StmtRng } from "./seam.ts";
-import {
-  type Interval,
-  intervalAdd,
-  intervalCmp,
-  intervalEncodeKey,
-  intervalLerp,
-  intervalNeg,
-  intervalSpan,
-  intervalSub,
-  makeInterval,
-  mulByFraction,
-  parseFactorDecimal,
-  parseInterval,
-  tsDiff,
-  tsShift,
-} from "./interval.ts";
+import { type ClockFunc, type RandomFill, type Seam, StmtRng } from "./seam.ts";
+import { type Interval, intervalEncodeKey, intervalLerp, intervalSpan } from "./interval.ts";
 import {
   AGGREGATES,
   type AggregateDesc,
@@ -243,55 +172,25 @@ import {
 } from "./operators.ts";
 import {
   type Value,
-  type ArrayInResult,
-  type ThreeValued,
-  boolAnd,
-  boolNot,
   arrayValue,
-  arrayOut,
-  emptyArray,
-  emptyRangeValue,
-  rangeValue,
-  arrayNdim,
-  arrayUbound,
-  boolOr,
   boolValue,
-  byteaValue,
   canonFloat,
-  compareBytea,
-  compareTextC,
-  compositeValue,
-  parseArrayLiteral,
   decimalValue,
-  eq3,
   encodeFloat32Key,
   encodeFloat64Key,
   float32Value,
   float64Value,
   floatTotalCmp,
-  from3,
-  gt3,
   intValue,
-  isNullTest,
   isTrue,
-  lt3,
-  notDistinctFrom,
   nullValue,
-  parseByteaHex,
-  parseRecordTokens,
-  parseUuid,
   renderByteaHex,
   renderFloat,
   renderUuid,
   textValue,
-  uuidValue,
-  timestampValue,
-  timestamptzValue,
   intervalValue,
-  dateValue,
   jsonValue,
   jsonbValue,
-  jsonPathValue,
 } from "./value.ts";
 import {
   compile as jsonPathCompile,
@@ -302,56 +201,13 @@ import {
   type JsonMember,
   type JsonNode,
   type PathSetMode,
-  arrayLength as jsonArrayLength,
-  concat as jsonConcatKernel,
-  contains as jsonContainsKernel,
-  deleteIndex as jsonDeleteIndex,
-  deleteKey as jsonDeleteKey,
-  deleteKeys as jsonDeleteKeys,
-  deletePath as jsonDeletePathKernel,
-  getField,
-  getIndex,
-  getPath,
-  hasDuplicateKeys as jsonHasDuplicateKeys,
-  hasKey as jsonHasKeyKernel,
-  insertPath as jsonInsertPathKernel,
   jsonCompactOut,
-  jsonNodeCmp,
-  jsonbIn,
   jsonbOut,
   makeObject as jsonMakeObject,
   nodeToText,
-  parsePreservingJson,
-  pretty as jsonPretty,
-  setPath as jsonSetPathKernel,
-  stripNulls as jsonStripNulls,
-  typeofName as jsonTypeofName,
-  validateJson,
 } from "./json.ts";
+import { elementScalar, encodeRangeKey, rangeByName, rangeOverlaps } from "./range.ts";
 import {
-  elementScalar,
-  finalizeRange,
-  encodeRangeKey,
-  parseBoundFlags,
-  parseRangeText,
-  rangeAdjacent,
-  rangeAfter,
-  rangeBefore,
-  rangeByName,
-  rangeContains,
-  rangeContainsElem,
-  rangeForElement,
-  rangeIntersect,
-  rangeMinus,
-  rangeNameForElement,
-  rangeOverlaps,
-  rangeOverleft,
-  rangeOverright,
-  rangeTotalCmp,
-  rangeUnion,
-} from "./range.ts";
-import {
-  buildGistFromLeafKeys,
   GIST_SCALAR_OPCLASS,
   type GistLeafInput,
   gistLeafKeyMulti,
@@ -359,20 +215,9 @@ import {
   gistRangeOpclass,
   type GistQuery,
   type GistStrategy,
-  type GistTree,
   gistSearch,
 } from "./gist.ts";
-import type { RangeDesc } from "./ranges_gen.ts";
-import {
-  compileRegex,
-  type RegexProgram,
-  regexIsMatch,
-  regexNinst,
-  regexpMatch,
-  regexpReplace,
-  regexpCount,
-  regexpNthMatch,
-} from "./regex.ts";
+import { compileRegex, type RegexProgram } from "./regex.ts";
 
 // Outcome is the result of executing one statement: a bare statement (CREATE, INSERT,
 // UPDATE, DELETE) or a query result set. cost is the deterministic execution cost accrued
@@ -386,16 +231,13 @@ import {
 // column. The resolved SCALAR type — for decimal the unconstrained "decimal", not the
 // numeric(p,s) typmod (spec/design/conformance.md §7).
 import type { AssignPlan } from "./window.ts";
-import { decimalCmpWork, evalExpr, floatToIntHalfAway, makeFloat, toDecimal } from "./eval.ts";
+import { evalExpr, floatToIntHalfAway, toDecimal } from "./eval.ts";
 import {
   coerceForStore,
-  coerceStringToArray,
   literalToValue,
   materializeInsertValue,
   overflow,
-  rexprConstToValue,
   storeValue,
-  truncateToChars,
   typeError,
 } from "./store.ts";
 import {
@@ -407,30 +249,14 @@ import {
   resolveTypeAndTypmod,
   scalarForParamHint,
   setopName,
-  unifyCaseTypes,
   unifySetopColumn,
   unifyValuesColumn,
 } from "./eval_ops.ts";
 import {
-  classifyComparable,
   coerceStringLiteral,
-  coerceStringToComposite,
-  coerceStringToRangeExpr,
-  ctxOf,
-  dateArithResult,
-  decodeByteaLiteral,
-  decodeUuidLiteral,
-  floatFromDecimalLiteral,
-  intervalScaleResult,
-  isAdaptableOperand,
-  promote,
-  requireBool,
-  requireNumericOperand,
   requireTextOrNull,
   resolveContainerAssign,
   resolveOperandPair,
-  temporalArithResult,
-  unifyArrayElementTypes,
   widenFloatTo,
 } from "./kernels.ts";
 import {
@@ -465,7 +291,6 @@ import {
   bindParams,
   buildSequenceDef,
   checkRecursiveColumnTypes,
-  cloneStores,
   collectStmtPrivs,
   conjunctCount,
   countCteRefsDml,
@@ -495,8 +320,8 @@ import {
   withNote,
 } from "./scope.ts";
 import type { ExplainRow, PrivReq } from "./scope.ts";
-import type { ActiveTx, SessionOptions, TxStatus } from "./snapshot.ts";
-import { Snapshot, requireCustomVarName, txStatusOf } from "./snapshot.ts";
+import type { ActiveTx, TxStatus } from "./snapshot.ts";
+import { Snapshot, txStatusOf } from "./snapshot.ts";
 import type { AttachmentCore, LaneAt } from "./session.ts";
 import {
   SessionState,
@@ -518,8 +343,6 @@ import {
   checkAssign,
   keyCmp,
   materializeOrderExprs,
-  not3,
-  or3,
   sortRows,
   valueCmp,
 } from "./window.ts";
@@ -1441,7 +1264,7 @@ export class Engine {
     const name = scope.toLowerCase();
     if (name === "main" || name === "temp") return;
     const att = this.core.attachments.get(name);
-    if (att !== undefined && att.readOnly) {
+    if (att?.readOnly) {
       throw engineError(
         "read_only_sql_transaction",
         `cannot write to read-only database "${scope}"`,
@@ -2532,7 +2355,7 @@ export class Engine {
   // pure, so a read that falls through to the materialized path re-running them is harmless (identical
   // result). (CLAUDE.md §13 — the safe-total-query contract.)
   gateReadLanes(stmt: Statement): void {
-    if (this.session.tx !== null && this.session.tx.failed) {
+    if (this.session.tx?.failed) {
       throw engineError(
         "in_failed_sql_transaction",
         "current transaction is aborted, commands ignored until end of transaction block",
@@ -2576,7 +2399,7 @@ export class Engine {
     // temp-no-file-write invariant. GiST on a temp table is 0A000, so only the main snapshot is
     // refreshed.
     const tx = this.session.tx;
-    if (tx !== null && tx.mainDirty) tx.working.rebuildGistTrees();
+    if (tx?.mainDirty) tx.working.rebuildGistTrees();
     return out;
   }
 
@@ -4793,7 +4616,7 @@ export class Engine {
       // (the UNIQUE-backing precedent; jed has no ALTER TABLE … DROP CONSTRAINT yet). 2BP01, matching
       // PG's "cannot drop index … because constraint … requires it" (gist.md §7).
       const owner = this.table(found[0]);
-      if (owner !== undefined && owner.exclusions.some((e) => e.index.toLowerCase() === nameKey)) {
+      if (owner?.exclusions.some((e) => e.index.toLowerCase() === nameKey)) {
         throw engineError(
           "dependent_objects_still_exist",
           "cannot drop index " +
@@ -8746,8 +8569,6 @@ export class Engine {
       // lacks is allowed); a window query collects window specs/keys; a grouped+window query does both
       // (query.order_by_grouped_window); a plain query forbids aggregates (42803) and window functions
       // (42P20).
-      let node: RExpr;
-      let type: ResolvedType;
       const octx: AggCtx = hasWindowSyntax
         ? {
             collecting: isAgg,
@@ -8758,7 +8579,7 @@ export class Engine {
             window: { base: WINDOW_RESULT_BASE, windowSpecs, windowKeys },
           }
         : { collecting: isAgg, groupKeys, groupKeyExprs, specs: aggSpecs, groupingSpecs };
-      ({ node, type } = resolve(scope, orderExpr, null, octx, ptypes));
+      const { node, type } = resolve(scope, orderExpr, null, octx, ptypes);
       aggSpecs = octx.specs;
       groupingSpecs = octx.groupingSpecs ?? groupingSpecs;
       // A correlated ORDER BY expression (one referencing an enclosing query) is allowed
@@ -9133,7 +8954,7 @@ export class Engine {
       limit: sel.limit,
       offset: sel.offset,
       pkOrdered: pkDir !== null,
-      pkReverse: pkDir !== null && pkDir.reverse,
+      pkReverse: pkDir?.reverse ?? false,
       indexOrder,
       joinPkOrdered,
       relBounds,

@@ -13,7 +13,6 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database } from "../src/tooling.ts";
 import { dbWith, errCode, query } from "./util.ts";
 
 // bool → i16 and bool → i64 are forbidden (PG has only bool → int4): jed 42804, PG 42846.

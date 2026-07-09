@@ -1,6 +1,6 @@
 import type { EvalEnv, RExpr, ScalarFuncName } from "./executor.ts";
 import type { Row } from "./storage.ts";
-import { Meter } from "./cost.ts";
+import type { Meter } from "./cost.ts";
 import type { ThreeValued, Value } from "./value.ts";
 import { resolveUnfetchedSelf } from "./format.ts";
 import {
@@ -123,7 +123,7 @@ import {
 } from "./interval.ts";
 import { Decimal, workDiv, workLinear, workMod, workMul } from "./decimal.ts";
 import type { Interval } from "./interval.ts";
-import { EngineError, engineError } from "./errors.ts";
+import { type EngineError, engineError } from "./errors.ts";
 import { not3, or3, valueCmp } from "./window.ts";
 import type { JsonMember, JsonNode } from "./json.ts";
 import {

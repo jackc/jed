@@ -9,7 +9,6 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database } from "../src/tooling.ts";
 import { dbWith, errCode, query } from "./util.ts";
 
 // Build t(id i32 pk, s text) with one row per string (id = 1..).

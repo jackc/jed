@@ -8,7 +8,6 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, type Engine } from "../src/tooling.ts";
 import { type Handle, dbWith, errCode } from "./util.ts";
 
 function fkNames(db: Handle, table: string): string[] {

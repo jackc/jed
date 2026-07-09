@@ -3,7 +3,6 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database } from "../src/tooling.ts";
 import { dbWith, errCode } from "./util.ts";
 
 function seed() {

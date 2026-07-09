@@ -284,8 +284,10 @@ task fmt: "fmt:check"
 
 # lint — the Biome linter for the TS cores, kept deliberately SEPARATE from fmt (above) so a lint
 # finding never blocks the formatter and vice versa. The tailored ruleset lives in biome.json;
-# `biome lint` exits non-zero only on ERRORS, so the few advisory warnings (currently 5
-# useOptionalChain suggestions, left as a matter of taste) are surfaced without failing the gate.
+# `biome lint` exits non-zero only on ERRORS, so any advisory warnings are surfaced without
+# failing the gate. The tree is currently warning-clean: the deliberate cross-core float literals
+# Biome flags (log10(e) in decimal.ts) are suppressed inline with justified biome-ignore comments,
+# since the suggested Math.LOG10E is a different f64 that would break the §8 byte-identity.
 # Scope is the TS cores only: web is prettier-only here, with its own `npm run check` (svelte-check)
 # as the web type gate (outside rake ci); the @generated files stay excluded via biome.json.
 namespace :lint do

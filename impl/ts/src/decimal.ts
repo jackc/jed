@@ -500,6 +500,7 @@ export class Decimal {
       if (val > 0) throw overflow();
       return Decimal.zero(Math.max(rscale, 0));
     }
+    // biome-ignore lint/suspicious/noApproximativeNumericConstant: log10(e) truncated to match the Rust+Go cores' literal (decimal.rs/decimal.go) so the ln/log/exp result-scale pick is byte-identical cross-core; Math.LOG10E is a different f64.
     const dweight = Math.trunc(val * 0.434294481903252);
     let ndiv2 = 0;
     if (Math.abs(val) > 0.01) {
@@ -535,6 +536,7 @@ export class Decimal {
 
   // decExp is exp(numeric) (PG numeric_exp): choose rscale, then expVar.
   decExp(): Decimal {
+    // biome-ignore lint/suspicious/noApproximativeNumericConstant: log10(e) truncated to match the Rust+Go cores' literal (decimal.rs/decimal.go) so the ln/log/exp result-scale pick is byte-identical cross-core; Math.LOG10E is a different f64.
     let val = this.toF64Estimate() * 0.434294481903252;
     val = Math.max(-MAX_RESULT_SCALE, Math.min(MAX_RESULT_SCALE, val));
     let rscale = MIN_SIG_DIGITS - Math.trunc(val);
@@ -733,6 +735,7 @@ export class Decimal {
       if (val > 0) throw overflow();
       return Decimal.zero(MAX_DISPLAY_SCALE);
     }
+    // biome-ignore lint/suspicious/noApproximativeNumericConstant: log10(e) truncated to match the Rust+Go cores' literal (decimal.rs/decimal.go) so the ln/log/exp result-scale pick is byte-identical cross-core; Math.LOG10E is a different f64.
     val *= 0.434294481903252;
     const vi = Math.trunc(val);
     let rscale = MIN_SIG_DIGITS - vi;

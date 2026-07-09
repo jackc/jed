@@ -20,7 +20,7 @@ import type {
   WindowSpec,
 } from "./executor.ts";
 import type { FrameExclusion } from "./ast.ts";
-import { Meter } from "./cost.ts";
+import type { Meter } from "./cost.ts";
 import {
   cloneAcc,
   cmpBytes,
