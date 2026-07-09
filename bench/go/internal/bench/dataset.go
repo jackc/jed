@@ -57,6 +57,7 @@ type Index struct {
 	Name    string   `toml:"name"`
 	Columns []string `toml:"columns"`
 	Method  string   `toml:"method"`  // "" (btree) | "gin"
+	Where   string   `toml:"where"`   // "" (full) | a partial-index predicate (indexes.md §9)
 	Engines []string `toml:"engines"` // empty = all
 }
 
@@ -150,7 +151,11 @@ func (t *Table) DDL(engine string) []string {
 		if ix.Method != "" {
 			using = " USING " + ix.Method
 		}
-		stmts = append(stmts, fmt.Sprintf("CREATE INDEX %s ON %s%s (%s)", ix.Name, t.Name, using, strings.Join(ix.Columns, ", ")))
+		where := ""
+		if ix.Where != "" {
+			where = " WHERE " + ix.Where // a partial index (indexes.md §9)
+		}
+		stmts = append(stmts, fmt.Sprintf("CREATE INDEX %s ON %s%s (%s)%s", ix.Name, t.Name, using, strings.Join(ix.Columns, ", "), where))
 	}
 	return stmts
 }

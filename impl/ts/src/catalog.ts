@@ -156,6 +156,11 @@ export type IndexDef = {
   // GiST R-tree (spec/design/gist.md). Persisted as the per-index index_kind byte (v13 GIN, v20
   // GiST); a GIN/GiST index is never unique.
   kind: "btree" | "gin" | "gist";
+  // predicate is a PARTIAL index's WHERE predicate (spec/design/indexes.md §9): only rows whose
+  // predicate is TRUE are indexed / constrained. undefined for an ordinary (full) index. Carries the
+  // persisted canonical text + the re-parsed (unresolved) AST — re-resolved against the table per
+  // statement, like an expression key. Partial indexes are B-tree only (format_version 27).
+  predicate?: { exprText: string; expr: Expr };
 };
 
 // indexKeyColumn is the column ordinal of a plain column key element, else null (an expression key).

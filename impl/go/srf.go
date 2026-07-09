@@ -567,6 +567,8 @@ func catalogRelTable(kind srfKind) *catTable {
 			{Name: "columns", Type: textArr, NotNull: true},
 			{Name: "is_unique", Type: scalarT(scalarBool), NotNull: true},
 			{Name: "method", Type: scalarT(scalarText), NotNull: true},
+			// A partial index's predicate canonical text; NULL for a non-partial index (indexes.md §9).
+			{Name: "predicate", Type: scalarT(scalarText)},
 		}}
 	default: // srfJedConstraints
 		return &catTable{Name: "jed_constraints", Columns: []catColumn{
@@ -713,12 +715,18 @@ func (db *engine) jedIndexesRows(sp *srfPlan, m *costMeter) ([]storedRow, error)
 					cols[j] = TextValue(t.Columns[k.Col].Name)
 				}
 			}
+			// A partial index's predicate canonical text; NULL for a non-partial index (indexes.md §9).
+			predicate := NullValue()
+			if idx.Predicate != nil {
+				predicate = TextValue(idx.Predicate.ExprText)
+			}
 			out = append(out, storedRow{
 				TextValue(idx.Name),
 				TextValue(t.Name),
 				ArrayValue(cols),
 				BoolValue(idx.Unique),
 				TextValue(indexMethodName(idx.Kind)),
+				predicate,
 			})
 		}
 	}

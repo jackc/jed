@@ -491,6 +491,157 @@ func indexExprHasSubquery(e exprNode) bool {
 	return walk(e)
 }
 
+// rejectIndexPredicateStructure applies the structural rejections for a PARTIAL-index predicate
+// (spec/design/indexes.md §9) before resolution: a subquery is 0A000 (cannot use subquery in index
+// predicate) and a bind parameter $N is 42P02 (there is no parameter $N) — both admitted by the
+// ordinary resolver, so caught here (the aggregate 42803 / window 42P20 / non-boolean 42804
+// rejections then fall out of the Forbidden-context boolean resolve). Reuses indexExprHasSubquery
+// for the subquery walk, then finds the first param.
+func rejectIndexPredicateStructure(e exprNode) error {
+	if indexExprHasSubquery(e) {
+		return newError(FeatureNotSupported, "cannot use subquery in index predicate")
+	}
+	if n, ok := indexExprFirstParam(e); ok {
+		return newError(UndefinedParameter, "there is no parameter $"+strconv.FormatUint(n, 10))
+	}
+	return nil
+}
+
+// indexExprFirstParam returns the 1-based index of the first bind parameter $N in an expression, or
+// ok=false if it has none (used by rejectIndexPredicateStructure). Mirrors indexExprHasSubquery's walk.
+func indexExprFirstParam(e exprNode) (uint64, bool) {
+	var walk func(e exprNode) (uint64, bool)
+	walk = func(e exprNode) (uint64, bool) {
+		switch e.Kind {
+		case exprParam:
+			return e.Param, true
+		case exprCast:
+			return walk(e.Cast.Inner)
+		case exprExtract:
+			return walk(e.Extract.Source)
+		case exprCollate:
+			return walk(e.Collate.Inner)
+		case exprUnary:
+			return walk(e.Unary.Operand)
+		case exprIsNull:
+			return walk(e.IsNullOf.Operand)
+		case exprIsJson:
+			return walk(e.IsJsonOf.Operand)
+		case exprJsonCtor:
+			return walk(e.JsonCtorOf.Operand)
+		case exprJsonExists:
+			if n, ok := walk(e.JsonExists.Ctx); ok {
+				return n, true
+			}
+			return walk(e.JsonExists.Path)
+		case exprJsonValue:
+			if n, ok := walk(e.JsonValue.Ctx); ok {
+				return n, true
+			}
+			return walk(e.JsonValue.Path)
+		case exprJsonQuery:
+			if n, ok := walk(e.JsonQuery.Ctx); ok {
+				return n, true
+			}
+			return walk(e.JsonQuery.Path)
+		case exprBinary:
+			if n, ok := walk(e.Binary.Lhs); ok {
+				return n, true
+			}
+			return walk(e.Binary.Rhs)
+		case exprIsDistinct:
+			if n, ok := walk(e.IsDistinct.Lhs); ok {
+				return n, true
+			}
+			return walk(e.IsDistinct.Rhs)
+		case exprLike:
+			if n, ok := walk(e.Like.Lhs); ok {
+				return n, true
+			}
+			return walk(e.Like.Rhs)
+		case exprRegex:
+			if n, ok := walk(e.Regex.Lhs); ok {
+				return n, true
+			}
+			return walk(e.Regex.Rhs)
+		case exprIn:
+			if n, ok := walk(e.In.Lhs); ok {
+				return n, true
+			}
+			for _, elem := range e.In.List {
+				if n, ok := walk(elem); ok {
+					return n, true
+				}
+			}
+			return 0, false
+		case exprQuantified:
+			if n, ok := walk(e.Quantified.Lhs); ok {
+				return n, true
+			}
+			return walk(e.Quantified.Array)
+		case exprBetween:
+			if n, ok := walk(e.Between.Lhs); ok {
+				return n, true
+			}
+			if n, ok := walk(e.Between.Lo); ok {
+				return n, true
+			}
+			return walk(e.Between.Hi)
+		case exprCase:
+			if e.Case.Operand != nil {
+				if n, ok := walk(*e.Case.Operand); ok {
+					return n, true
+				}
+			}
+			for _, w := range e.Case.Whens {
+				if n, ok := walk(w.Cond); ok {
+					return n, true
+				}
+				if n, ok := walk(w.Result); ok {
+					return n, true
+				}
+			}
+			if e.Case.Els != nil {
+				if n, ok := walk(*e.Case.Els); ok {
+					return n, true
+				}
+			}
+			return 0, false
+		case exprFuncCall:
+			for _, a := range e.FuncCall.Args {
+				if n, ok := walk(*a); ok {
+					return n, true
+				}
+			}
+			return 0, false
+		case exprRow, exprArray:
+			for _, it := range e.RowItems {
+				if n, ok := walk(it); ok {
+					return n, true
+				}
+			}
+			return 0, false
+		case exprFieldAccess, exprFieldStar:
+			return walk(*e.Base)
+		case exprSubscript:
+			if n, ok := walk(*e.Base); ok {
+				return n, true
+			}
+			for _, s := range e.Subscripts {
+				for _, x := range subscriptSpecExprs(s) {
+					if n, ok := walk(*x); ok {
+						return n, true
+					}
+				}
+			}
+			return 0, false
+		default:
+			return 0, false
+		}
+	}
+	return walk(e)
+}
+
 // indexNamePart is the auto-name part for one index key element (spec/design/indexes.md §2, PG's
 // ChooseIndexColumnNames): a column key contributes its (lowercased) column name; a bare-function-
 // call expression its function name (`lower(email)` → `lower`); any other expression the literal

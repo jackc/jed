@@ -43,6 +43,9 @@ var SupportedCapabilities = []string{
 	// Expression index keys — CREATE [UNIQUE] INDEX ON t (expr); validated immutable at create,
 	// maintained per row, enforced for UNIQUE, matched by the planner (spec/design/indexes.md §1).
 	"ddl.index_expr",
+	// Partial indexes — CREATE [UNIQUE] INDEX ON t (keys) WHERE predicate; only qualifying rows
+	// indexed/constrained, persisted (format_version 27) (spec/design/indexes.md §9).
+	"ddl.index_partial",
 	// GIN inverted indexes — CREATE INDEX ... USING gin over an integer-element array column;
 	// built + maintained on every write, persisted (format_version 13). The query-side planner
 	// bound is query.gin_scan. spec/design/gin.md
@@ -204,6 +207,9 @@ var SupportedCapabilities = []string{
 	// Index expression bound — the planner structurally matches a WHERE conjunct against an
 	// expression index key (lower(email) = $1 seeks) (spec/design/indexes.md §5).
 	"query.index_expr",
+	// Partial-index bound — the planner uses a partial index only when the WHERE contains a
+	// conjunct structurally equal to the index predicate (spec/design/indexes.md §9).
+	"query.index_partial",
 	// EXPLAIN — render the planner's chosen plan as a deterministic depth/node/detail result set,
 	// without executing the inner statement (spec/design/explain.md).
 	"query.explain",

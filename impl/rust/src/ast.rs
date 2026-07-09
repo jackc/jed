@@ -223,6 +223,20 @@ pub struct CreateIndex {
     /// database (`main` / `temp` / a host attachment), and its store is registered into the owning
     /// snapshot. `None` for a bare (implicit-scope) table name.
     pub db: Option<String>,
+    /// The optional `WHERE predicate` making the index **partial** (spec/design/indexes.md §9):
+    /// only rows whose predicate is TRUE are indexed. `None` for an ordinary (full) index. The
+    /// predicate carries its canonical text (persisted, format_version 27) and the parsed AST the
+    /// executor re-resolves against the table's columns, as a `CHECK` / expression key does.
+    pub predicate: Option<IndexPredicate>,
+}
+
+/// A partial-index predicate (spec/design/indexes.md §9): its persisted canonical text + parsed
+/// (unresolved) AST — the write/plan paths re-resolve it against the table per statement, exactly
+/// as a `CHECK` is re-resolved (modeled on [`CheckDef`]).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct IndexPredicate {
+    pub text: String,
+    pub expr: Expr,
 }
 
 /// `DROP INDEX <name>` — remove one secondary index (spec/design/indexes.md §2).

@@ -142,6 +142,12 @@ pub struct IndexDef {
     pub keys: Vec<IndexKey>,
     pub unique: bool,
     pub kind: IndexKind,
+    /// A **partial** index's `WHERE predicate` (spec/design/indexes.md §9): only rows whose
+    /// predicate is TRUE are indexed / constrained. `None` for an ordinary (full) index. Carries
+    /// the persisted canonical text + the re-parsed (unresolved) AST — re-resolved against the
+    /// table per statement, like an expression key ([`IndexKeyExpr`]). Partial indexes are B-tree
+    /// only (a GIN/GiST index never carries one).
+    pub predicate: Option<IndexKeyExpr>,
 }
 
 impl IndexDef {

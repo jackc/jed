@@ -97,6 +97,16 @@ columns = ["customer_id"]
 name = "orders_note_lower_idx"
 columns = ["lower(note)"]
 
+# A PARTIAL index over the "big-amount" subset (spec/design/indexes.md §9) — backs the partial_lookup
+# benchmark. The predicate amount >= 90000 keeps only ~10% of the 1M rows, so this narrow index is
+# maintained (and seeked) for that hot subset. The name sorts BEFORE orders_customer_idx, so the
+# planner's lowest-name tie-break picks the partial index for the gated query (WHERE amount >= 90000
+# AND customer_id = $1). The harness emits CREATE INDEX ... (customer_id) WHERE amount >= 90000.
+[[dataset.table.index]]
+name = "orders_active_idx"
+columns = ["customer_id"]
+where = "amount >= 90000"
+
 # GIN dataset — a single array-column table behind a GIN inverted index (spec/design/gin.md).
 # jed + PostgreSQL only: SQLite has neither an array type nor GIN, so the table carries a
 # table-level `engines` allowlist and bench-setup skips it for SQLite entirely. The `tags`

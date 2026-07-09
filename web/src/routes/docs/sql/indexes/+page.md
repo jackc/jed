@@ -27,6 +27,24 @@ INSERT INTO account VALUES
 
 	const exprQuery = `SELECT id FROM account WHERE lower(email) = 'ada@example.com';`;
 
+	const partialSeed = `CREATE TABLE orders (
+  id       i32 PRIMARY KEY,
+  status   text NOT NULL,
+  customer i32  NOT NULL
+);
+CREATE INDEX orders_active ON orders (customer)
+  WHERE status = 'active';
+INSERT INTO orders VALUES
+  (1, 'active',    10),
+  (2, 'shipped',   10),
+  (3, 'active',    20),
+  (4, 'active',    10),
+  (5, 'cancelled', 20);`;
+
+	const partialQuery = `SELECT id FROM orders
+WHERE status = 'active' AND customer = 10
+ORDER BY id;`;
+
 	const ginSeed = `CREATE TABLE post (
   id    i32 PRIMARY KEY,
   title text NOT NULL,
@@ -59,7 +77,7 @@ ORDER BY id;`;
 
 <svelte:head>
 	<title>Indexes — jed</title>
-	<meta name="description" content="CREATE INDEX in jed — ordered B-tree indexes, and GIN inverted indexes that accelerate array containment, overlap, membership, and exact equality, run live." />
+	<meta name="description" content="CREATE INDEX in jed — ordered B-tree indexes, expression and partial (WHERE) indexes, and GIN inverted indexes that accelerate array containment, overlap, membership, and exact equality, run live." />
 </svelte:head>
 
 # Indexes
@@ -108,6 +126,33 @@ A general operator expression must be parenthesized (`(a + b)`); a bare `a + b` 
 a parenthesized bare column `(a)` is just a column key. The expression's result must be a
 key-encodable type. Matching is **syntactic**, as in PostgreSQL: an index on `(a + b)` accelerates
 `WHERE a + b = …` but not the re-associated `WHERE b + a = …`.
+
+## Partial indexes (`WHERE`)
+
+A trailing `WHERE predicate` makes the index **partial** — it holds an entry only for the rows
+whose predicate is **true**, so a narrow index over a hot subset stays small and is maintained only
+for the rows that matter:
+
+```sql
+CREATE INDEX orders_active ON orders (customer) WHERE status = 'active';
+```
+
+jed uses a partial index to accelerate a query **only when the query's `WHERE` contains the index
+predicate** — that is what guarantees every row the query wants is in the index. So
+`WHERE status = 'active' AND customer = 10` seeks `orders_active`, while a bare `WHERE customer = 10`
+takes a full scan (it can't assume all `customer = 10` rows are active). Run the gated query below,
+then edit it to drop `status = 'active'` and watch the plan fall back to a full scan — the rows are
+identical either way, because the `WHERE` stays the residual filter.
+
+<LiveSql seed={partialSeed} query={partialQuery} rows={4} />
+
+A **`UNIQUE`** partial index constrains only the qualifying rows: `CREATE UNIQUE INDEX ON orders
+(customer) WHERE status = 'active'` forbids two *active* orders from sharing a customer, while a
+`cancelled` order may still reuse that customer freely. The predicate is a boolean expression over
+the table's own columns and must be **immutable** — jed rejects a non-boolean predicate with
+`42804`, and an aggregate / window / subquery / bind-parameter / non-immutable predicate with the
+same codes an expression key uses. Implication matching is **syntactic** (as in PostgreSQL): jed
+uses the index when the `WHERE` restates the predicate, not when it merely implies it.
 
 ## GIN indexes for arrays (`USING gin`)
 

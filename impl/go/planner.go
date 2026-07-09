@@ -1251,6 +1251,13 @@ func (db *engine) orderSatisfiedByIndex(table *catTable, offset int, order []ord
 		if idx.Kind != indexBtree {
 			continue // only an ordered B-tree realizes the column order (GIN/GiST do not)
 		}
+		// A PARTIAL index is not used for ORDER-BY skip-sort this slice (indexes.md §9): it holds
+		// only its qualifying rows, so walking it would drop rows unless the query implies the
+		// predicate — that gate lives only on the access-predicate bound. Stays non-partial (a
+		// follow-on); falling through leaves a correct full-scan + sort.
+		if idx.Predicate != nil {
+			continue
+		}
 		// ORDER-BY skip-sort is column-only this slice (matching ORDER BY against an expression
 		// index key is a follow-on — indexes.md §5).
 		cols := idx.columnOrdinals()

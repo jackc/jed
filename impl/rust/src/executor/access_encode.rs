@@ -144,6 +144,16 @@ pub(crate) fn build_index_access_predicate(
     // Resolve the index's key elements (column ordinals + resolved expression keys). A resolution
     // failure yields no bound (a full scan — always sound). indexes.md §5.
     let rindex = catalog.resolve_index(rel.table, idx).ok()?;
+    // A PARTIAL index holds only its qualifying rows (indexes.md §9), so it is usable ONLY when the
+    // query's WHERE implies the index predicate. jed's test is syntactic (PG's, not a prover): the
+    // WHERE AND-chain must contain a conjunct STRUCTURALLY EQUAL to the resolved predicate. A miss
+    // yields no bound — a correct full scan. (The resolved predicate is in table-local column coords;
+    // a WHERE conjunct is global, so it is matched shifted by `rel.offset`.)
+    if let Some(pred) = &rindex.predicate {
+        if !filter_implies_predicate(filter, pred, rel.offset) {
+            return None;
+        }
+    }
     let mut eq_cols: Vec<IndexEqCol> = Vec::new();
     let mut range: Option<IndexRange> = None;
     for key in &rindex.keys {
@@ -290,6 +300,12 @@ pub(crate) fn detect_scan_bound(
     }
     for idx in &rel.table.indexes {
         if idx.kind != IndexKind::Btree {
+            continue;
+        }
+        // A PARTIAL index is not used for the OR/IN point-set this slice (indexes.md §9): the merged
+        // point-lookup path carries no predicate-implication gate, so it stays non-partial (a
+        // follow-on) — falling through leaves a correct full scan.
+        if idx.predicate.is_some() {
             continue;
         }
         // The OR/IN merged-point-lookup bound is column-only this slice (an expression index takes
@@ -695,6 +711,13 @@ pub(crate) fn order_satisfied_by_index(
         if idx.kind != IndexKind::Btree {
             continue; // only an ordered B-tree realizes the column order (GIN/GiST do not)
         }
+        // A PARTIAL index is not used for ORDER-BY skip-sort this slice (indexes.md §9): it holds
+        // only its qualifying rows, so walking it would drop rows unless the query implies the
+        // predicate — the predicate-implication gate lives only on the access-predicate bound. Stays
+        // non-partial (a follow-on); falling through leaves a correct full-scan + sort.
+        if idx.predicate.is_some() {
+            continue;
+        }
         // ORDER-BY skip-sort is column-only this slice (matching ORDER BY against an expression
         // index key is a follow-on — indexes.md §5).
         let Some(cols) = idx.column_ordinals() else {
@@ -1074,6 +1097,10 @@ pub(crate) struct ResolvedIndex {
     pub unique: bool,
     pub kind: IndexKind,
     pub keys: Vec<ResolvedKey>,
+    /// A **partial** index's resolved `WHERE predicate` (spec/design/indexes.md §9): evaluated
+    /// against each row (unmetered, like a key expression), a row is indexed / constrained **only**
+    /// when it is TRUE. `None` for an ordinary (full) index — every row is indexed.
+    pub predicate: Option<RExpr>,
 }
 
 impl ResolvedIndex {
@@ -1171,12 +1198,29 @@ pub(crate) fn index_entry_key(
     Ok(out)
 }
 
+/// Whether a row is indexed by `rindex` (spec/design/indexes.md §9): always for an ordinary index,
+/// and for a **partial** index iff its `WHERE predicate` evaluates to **TRUE** (the 3VL WHERE rule —
+/// FALSE and NULL are excluded). The predicate eval is unmetered maintenance work (like a key
+/// expression's — cost.md §3), so a throwaway [`Meter`] absorbs its charge.
+fn index_row_qualifies(rindex: &ResolvedIndex, row: &Row, env: &EvalEnv) -> Result<bool> {
+    match &rindex.predicate {
+        None => Ok(true),
+        Some(pred) => {
+            let mut m = Meter::new(); // maintenance eval is unmetered (cost.md §3)
+            Ok(matches!(pred.eval(row, env, &mut m)?, Value::Bool(true)))
+        }
+    }
+}
+
 /// The index entries a row contributes (spec/design/gin.md §4/§5): exactly one for an ordered
 /// (B-tree) index — the §3 nullable-slot entry key — or one per DISTINCT non-NULL element for a
 /// GIN index. Every write path (build, INSERT, DELETE, UPDATE) treats an index uniformly as "a
-/// row maps to a set of entries." `colls` (column-ordinal-indexed) selects each text key column's
-/// collated form (§2.12); GIN elements are fixed-width, so a GIN index never collates. `env`
-/// evaluates any expression key element (B-tree only — GIN/GiST are plain-column, this slice).
+/// row maps to a set of entries." A **partial** index contributes the **empty** set for a row whose
+/// predicate is not TRUE (spec/design/indexes.md §9), which is what makes INSERT/DELETE/UPDATE
+/// maintenance uniform (the UPDATE old-set/new-set diff handles a row entering/leaving/moving for
+/// free). `colls` (column-ordinal-indexed) selects each text key column's collated form (§2.12);
+/// GIN elements are fixed-width, so a GIN index never collates. `env` evaluates any expression key
+/// element or the partial predicate (B-tree only — GIN/GiST are plain-column, this slice).
 pub(crate) fn index_entry_keys(
     columns: &[Column],
     colls: &[Option<std::sync::Arc<Collation>>],
@@ -1185,6 +1229,9 @@ pub(crate) fn index_entry_keys(
     row: &Row,
     env: &EvalEnv,
 ) -> Result<Vec<Vec<u8>>> {
+    if !index_row_qualifies(rindex, row, env)? {
+        return Ok(Vec::new()); // partial index: a non-qualifying row contributes no entry
+    }
     Ok(match rindex.kind {
         IndexKind::Btree => vec![index_entry_key(
             columns,
@@ -1478,6 +1525,11 @@ pub(crate) fn index_prefix_key(
     row: &Row,
     env: &EvalEnv,
 ) -> Result<Option<Vec<u8>>> {
+    // A partial index constrains only its qualifying rows (indexes.md §9): a non-qualifying row is
+    // exempt from uniqueness, exactly like a NULL-bearing prefix (returns `None`).
+    if !index_row_qualifies(rindex, row, env)? {
+        return Ok(None);
+    }
     let mut out = Vec::new();
     for key in &rindex.keys {
         let (val, ty, coll) = index_key_slot(key, columns, colls, row, env)?;
@@ -1804,6 +1856,32 @@ impl KeyMatch<'_> {
     }
 }
 
+/// Does the WHERE `filter` imply a PARTIAL index's predicate (spec/design/indexes.md §9)? jed's
+/// syntactic test (PG's, not a prover): the filter's top-level AND-chain must contain a conjunct
+/// STRUCTURALLY EQUAL to the resolved predicate. `pred` is in table-local column coords; a `filter`
+/// conjunct is global, so it is matched shifted by `offset` (the relation's global column base).
+/// Sound-if-conservative: a miss means the index is not used (a correct full scan + residual filter).
+pub(crate) fn filter_implies_predicate(filter: &RExpr, pred: &RExpr, offset: usize) -> bool {
+    // The filter contains a top-level conjunct structurally equal to `target`.
+    fn contains_conjunct(filter: &RExpr, target: &RExpr, offset: usize) -> bool {
+        match filter {
+            RExpr::And(l, r) => {
+                contains_conjunct(l, target, offset) || contains_conjunct(r, target, offset)
+            }
+            conjunct => rexpr_eq_shifted(conjunct, target, offset),
+        }
+    }
+    // Every top-level conjunct of `pred` must be present as a conjunct of `filter` (so a conjunctive
+    // predicate `a AND b` is implied by a WHERE that lists both `a` and `b`, not only the whole `a AND b`).
+    match pred {
+        RExpr::And(l, r) => {
+            filter_implies_predicate(filter, l, offset)
+                && filter_implies_predicate(filter, r, offset)
+        }
+        single => contains_conjunct(filter, single, offset),
+    }
+}
+
 /// A SOUND-if-incomplete structural equality for index-expression matching (spec/design/indexes.md
 /// §5): does the WHERE conjunct operand `a` (GLOBAL column indices) equal the resolved index key
 /// expression `b` (table-local `Column(i)`, matched as `Column(i + offset)`)? Covers the common
@@ -1863,6 +1941,40 @@ pub(crate) fn rexpr_eq_shifted(a: &RExpr, b: &RExpr, offset: usize) -> bool {
         ) => ta == tb && rexpr_eq_shifted(ia, ib, offset),
         (Neg { operand: x, .. }, Neg { operand: y, .. }) => rexpr_eq_shifted(x, y, offset),
         (Not(x), Not(y)) => rexpr_eq_shifted(x, y, offset),
+        // A comparison (`status = 'active'`, `amt > 0`) is the canonical partial-index predicate
+        // shape (indexes.md §9): same operator + same derived collation + structurally-equal operands.
+        (
+            Compare {
+                op: oa,
+                lhs: la,
+                rhs: ra,
+                collation: ca,
+            },
+            Compare {
+                op: ob,
+                lhs: lb,
+                rhs: rb,
+                collation: cb,
+            },
+        ) => {
+            oa == ob
+                && ca.as_ref().map(|c| c.name.as_str()) == cb.as_ref().map(|c| c.name.as_str())
+                && rexpr_eq_shifted(la, lb, offset)
+                && rexpr_eq_shifted(ra, rb, offset)
+        }
+        (And(la, ra), And(lb, rb)) | (Or(la, ra), Or(lb, rb)) => {
+            rexpr_eq_shifted(la, lb, offset) && rexpr_eq_shifted(ra, rb, offset)
+        }
+        (
+            IsNull {
+                operand: x,
+                negated: na,
+            },
+            IsNull {
+                operand: y,
+                negated: nb,
+            },
+        ) => na == nb && rexpr_eq_shifted(x, y, offset),
         // `lower(x)` / `upper(x)` (spec/design/collation.md §16) resolve to a dedicated `Casing`
         // node — NOT `ScalarFunc` — so an index on `lower(email)` (the headline expression-index
         // shape) matches ONLY if this arm is present. The fold is deterministic (engine-global
@@ -3833,6 +3945,96 @@ pub(crate) fn check_referenced_columns(e: &Expr, columns: &[Column]) -> Vec<usiz
     let mut out = Vec::new();
     walk(e, columns, &mut out);
     out
+}
+
+/// The structural rejections for a PARTIAL-index predicate (spec/design/indexes.md §9), applied
+/// before resolution: a **subquery** is `0A000` (`cannot use subquery in index predicate`) and a
+/// **bind parameter** `$N` is `42P02` (`there is no parameter $N`) — both admitted by the ordinary
+/// resolver, so they are caught here (the aggregate `42803` / window `42P20` / non-boolean `42804`
+/// rejections then fall out of the `Forbidden`-context boolean resolve). Reuses
+/// [`index_expr_has_subquery`] for the subquery walk, then finds the first param.
+pub(crate) fn reject_index_predicate_structure(e: &Expr) -> Result<()> {
+    if index_expr_has_subquery(e) {
+        return Err(EngineError::new(
+            SqlState::FeatureNotSupported,
+            "cannot use subquery in index predicate",
+        ));
+    }
+    if let Some(n) = index_expr_first_param(e) {
+        return Err(EngineError::new(
+            SqlState::UndefinedParameter,
+            format!("there is no parameter ${n}"),
+        ));
+    }
+    Ok(())
+}
+
+/// The 1-based index of the first bind parameter `$N` in an expression, or `None` if it has none
+/// (used by [`reject_index_predicate_structure`]). A depth-first pre-order walk mirroring
+/// [`index_expr_has_subquery`]'s traversal.
+pub(crate) fn index_expr_first_param(e: &Expr) -> Option<u32> {
+    match e {
+        Expr::Param(n) => Some(*n),
+        Expr::Column(_)
+        | Expr::QualifiedColumn { .. }
+        | Expr::Literal(_)
+        | Expr::TypedLiteral { .. }
+        | Expr::QualifiedStar { .. } => None,
+        Expr::ScalarSubquery(_)
+        | Expr::Exists(_)
+        | Expr::InSubquery { .. }
+        | Expr::QuantifiedSubquery { .. } => None,
+        Expr::Cast { inner, .. }
+        | Expr::Collate { inner, .. }
+        | Expr::Extract { source: inner, .. }
+        | Expr::Unary { operand: inner, .. }
+        | Expr::IsNull { operand: inner, .. }
+        | Expr::IsJson { operand: inner, .. }
+        | Expr::JsonCtor { operand: inner, .. }
+        | Expr::FieldAccess { base: inner, .. }
+        | Expr::FieldStar { base: inner } => index_expr_first_param(inner),
+        Expr::JsonExists { ctx, path, .. }
+        | Expr::JsonValue { ctx, path, .. }
+        | Expr::JsonQuery { ctx, path, .. } => {
+            index_expr_first_param(ctx).or_else(|| index_expr_first_param(path))
+        }
+        Expr::Binary { lhs, rhs, .. }
+        | Expr::IsDistinctFrom { lhs, rhs, .. }
+        | Expr::Like { lhs, rhs, .. }
+        | Expr::Regex { lhs, rhs, .. } => {
+            index_expr_first_param(lhs).or_else(|| index_expr_first_param(rhs))
+        }
+        Expr::In { lhs, list, .. } => {
+            index_expr_first_param(lhs).or_else(|| list.iter().find_map(index_expr_first_param))
+        }
+        Expr::Quantified { lhs, array, .. } => {
+            index_expr_first_param(lhs).or_else(|| index_expr_first_param(array))
+        }
+        Expr::Between { lhs, lo, hi, .. } => index_expr_first_param(lhs)
+            .or_else(|| index_expr_first_param(lo))
+            .or_else(|| index_expr_first_param(hi)),
+        Expr::Case {
+            operand,
+            whens,
+            els,
+        } => operand
+            .as_deref()
+            .and_then(index_expr_first_param)
+            .or_else(|| {
+                whens.iter().find_map(|(c, r)| {
+                    index_expr_first_param(c).or_else(|| index_expr_first_param(r))
+                })
+            })
+            .or_else(|| els.as_deref().and_then(index_expr_first_param)),
+        Expr::FuncCall { args, .. } => args.iter().find_map(index_expr_first_param),
+        Expr::Row(items) | Expr::Array(items) => items.iter().find_map(index_expr_first_param),
+        Expr::Subscript { base, subscripts } => index_expr_first_param(base).or_else(|| {
+            subscripts
+                .iter()
+                .flat_map(subscript_spec_exprs)
+                .find_map(index_expr_first_param)
+        }),
+    }
 }
 
 /// Whether an index-key expression contains a SUBQUERY (spec/design/indexes.md §2): a scalar

@@ -1250,7 +1250,18 @@ func (db *engine) resolveIndex(table *catTable, def indexDef) (resolvedIndex, er
 		}
 		keys = append(keys, resolvedKey{Expr: node, Ty: ty, Coll: coll})
 	}
-	return resolvedIndex{Name: def.Name, Unique: def.Unique, Kind: def.Kind, Keys: keys}, nil
+	// A partial index's predicate (indexes.md §9), re-resolved against the table's columns — it was
+	// validated boolean + immutable at CREATE INDEX, so this cannot newly fail.
+	var predicate *rExpr
+	if def.Predicate != nil {
+		s := singleScope(db, table)
+		node, err := resolveBooleanFilter(s, &def.Predicate.Expr, &paramTypes{})
+		if err != nil {
+			return resolvedIndex{}, err
+		}
+		predicate = node
+	}
+	return resolvedIndex{Name: def.Name, Unique: def.Unique, Kind: def.Kind, Keys: keys, Predicate: predicate}, nil
 }
 
 // resolveTableIndexes resolves every index of a table once per statement (the maintenance driver —
@@ -1910,6 +1921,41 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 	if attachName != "" && kind != indexBtree {
 		return outcome{}, newError(FeatureNotSupported, "a "+ci.Using+" index on an attached-database table is not supported yet")
 	}
+	// The optional `WHERE predicate` making the index PARTIAL (spec/design/indexes.md §9): a boolean
+	// expression over the table's own columns, validated with PG-agreeing codes. B-tree only this
+	// slice. Validated after the key elements and stored as canonical text (format_version 27).
+	var predicate *indexKeyExpr
+	if ci.Predicate != nil {
+		if kind != indexBtree {
+			return outcome{}, newError(FeatureNotSupported,
+				"a partial (WHERE) "+ci.Using+" index is not supported yet")
+		}
+		// Structural pre-walk: a subquery is 0A000 and a bind parameter 42P02 (both admitted by the
+		// resolver). The aggregate 42803 / window 42P20 / non-boolean 42804 rejections then fall out of
+		// the Forbidden-context boolean resolve below.
+		if err := rejectIndexPredicateStructure(ci.Predicate.Expr); err != nil {
+			return outcome{}, err
+		}
+		s := singleScope(db, table)
+		if _, err := resolveBooleanFilter(s, &ci.Predicate.Expr, &paramTypes{}); err != nil {
+			return outcome{}, err
+		}
+		// Immutability (§9), the same rule an expression key carries: a non-immutable seam/clock/
+		// sequence call, or a timestamptz-dependent subexpression (references a timestamptz column —
+		// conservatively fail-closed), is 42P17.
+		tzHazard := false
+		for _, ref := range checkReferencedColumns(ci.Predicate.Expr, columns) {
+			if sc, ok := columns[ref].Type.AsScalar(); ok && sc == scalarTimestamptz {
+				tzHazard = true
+				break
+			}
+		}
+		if indexExprNonimmutableCall(ci.Predicate.Expr) || tzHazard {
+			return outcome{}, newError(InvalidObjectDefinition,
+				"functions in index predicate must be marked IMMUTABLE")
+		}
+		predicate = &indexKeyExpr{ExprText: ci.Predicate.Text, Expr: ci.Predicate.Expr}
+	}
 	// relationExistsScoped checks the namespace of the target scope: an attachment's OWN snapshot for an
 	// attached table (each attached database is an independent namespace, §3), else the temp-aware
 	// implicit namespace.
@@ -1948,7 +1994,7 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 		}
 	}
 
-	def := indexDef{Name: name, Keys: ciKeys, Unique: ci.Unique, Kind: kind}
+	def := indexDef{Name: name, Keys: ciKeys, Unique: ci.Unique, Kind: kind, Predicate: predicate}
 	// The build scan (cost.md §3): page_read per table-tree node + storage_row_read per row. The
 	// touched set is the columns the key elements read — an index column for a column key, or every
 	// column an expression key references (which may be variable-width, so a spilled value adds its
@@ -1963,6 +2009,13 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 			continue
 		}
 		for _, c := range checkReferencedColumns(k.Expr.Expr, columns) {
+			mask[c] = true
+		}
+	}
+	// A partial index's predicate is evaluated per row during the build (indexes.md §9), so the
+	// columns it references join the touched set — keeping the build cost deterministic + cross-core.
+	if def.Predicate != nil {
+		for _, c := range checkReferencedColumns(def.Predicate.Expr, columns) {
 			mask[c] = true
 		}
 	}

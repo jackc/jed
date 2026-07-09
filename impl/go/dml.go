@@ -34,6 +34,10 @@ type resolvedIndex struct {
 	Unique bool
 	Kind   indexKind
 	Keys   []resolvedKey
+	// Predicate is a PARTIAL index's resolved WHERE predicate (spec/design/indexes.md §9): evaluated
+	// against each row (unmetered, like a key expression), a row is indexed / constrained ONLY when it
+	// is TRUE. nil for an ordinary (full) index — every row is indexed.
+	Predicate *rExpr
 }
 
 // columnOrdinals returns the plain-column ordinals of a GIN/GiST index (always all columns, this
@@ -141,12 +145,35 @@ func indexEntryKey(columns []catColumn, colls []*Collation, rindex *resolvedInde
 	return out, nil
 }
 
+// indexRowQualifies reports whether a row is indexed by rindex (spec/design/indexes.md §9): always
+// for an ordinary index, and for a PARTIAL index iff its WHERE predicate evaluates to TRUE (the 3VL
+// WHERE rule — FALSE and NULL are excluded). The predicate eval is unmetered maintenance work (like
+// a key expression's — cost.md §3), so a throwaway meter absorbs its charge.
+func indexRowQualifies(rindex *resolvedIndex, row storedRow, env *evalEnv) (bool, error) {
+	if rindex.Predicate == nil {
+		return true, nil
+	}
+	v, err := rindex.Predicate.eval(row, env, newMeter())
+	if err != nil {
+		return false, err
+	}
+	return v.IsTrue(), nil
+}
+
 // indexEntryKeys returns the index entries a row contributes (spec/design/gin.md §4/§5): exactly
 // one for an ordered (B-tree) index — the §3 nullable-slot entry key — or one per DISTINCT non-NULL
 // element for a GIN index. Every write path (build, INSERT, DELETE, UPDATE) treats an index
-// uniformly as "a row maps to a set of entries." colls (column-ordinal-indexed) selects each text
-// key column's collated form (§2.12); GIN elements are fixed-width, so a GIN index never collates.
+// uniformly as "a row maps to a set of entries." A PARTIAL index contributes the EMPTY set for a row
+// whose predicate is not TRUE (spec/design/indexes.md §9), which is what makes INSERT/DELETE/UPDATE
+// maintenance uniform (the UPDATE old-set/new-set diff handles a row entering/leaving/moving for
+// free). colls (column-ordinal-indexed) selects each text key column's collated form (§2.12); GIN
+// elements are fixed-width, so a GIN index never collates.
 func indexEntryKeys(columns []catColumn, colls []*Collation, rindex *resolvedIndex, storageKey []byte, row storedRow, env *evalEnv) ([][]byte, error) {
+	if ok, err := indexRowQualifies(rindex, row, env); err != nil {
+		return nil, err
+	} else if !ok {
+		return nil, nil // partial index: a non-qualifying row contributes no entry
+	}
 	if rindex.Kind == indexGin {
 		return ginEntries(columns, rindex.columnOrdinals(), storageKey, row), nil
 	}
@@ -370,6 +397,13 @@ func bytesDiff(a, b [][]byte) [][]byte {
 // suffix — or ok=false when any component is NULL (NULLS DISTINCT: such a tuple never
 // conflicts). Two rows conflict iff they yield the same prefix.
 func indexPrefixKey(columns []catColumn, colls []*Collation, rindex *resolvedIndex, row storedRow, env *evalEnv) ([]byte, bool, error) {
+	// A partial index constrains only its qualifying rows (indexes.md §9): a non-qualifying row is
+	// exempt from uniqueness, exactly like a NULL-bearing prefix (ok=false).
+	if ok, err := indexRowQualifies(rindex, row, env); err != nil {
+		return nil, false, err
+	} else if !ok {
+		return nil, false, nil
+	}
 	var out []byte
 	for _, key := range rindex.Keys {
 		val, ty, coll, err := indexKeySlot(key, columns, colls, row, env)
@@ -511,8 +545,11 @@ func resolveArbiter(table *catTable, target *conflictTarget) (*arbiter, error) {
 		}
 		for i, def := range table.Indexes {
 			// A conflict-target COLUMN list matches only a plain-column unique index (an expression
-			// unique index is arbitrated by ON CONSTRAINT <name> — upsert.md §3).
-			if def.Unique {
+			// unique index is arbitrated by ON CONSTRAINT <name> — upsert.md §3). A PARTIAL unique
+			// index is NOT matched by a bare column list (PostgreSQL requires the predicate to be
+			// restated — a deferred upsert follow-on, indexes.md §9): so a column target that only a
+			// partial index covers reports "no matching arbiter", agreeing with PG.
+			if def.Unique && def.Predicate == nil {
 				if cols := def.columnOrdinals(); cols != nil && sameIntSet(cols, want) {
 					return &arbiter{indexPos: i}, nil
 				}

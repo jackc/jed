@@ -330,6 +330,12 @@ func (s *snapshot) upgradeCollations(pageSize uint32) (int, error) {
 				return 0, newError(FeatureNotSupported,
 					"collation upgrade of a table with an expression index is not supported yet")
 			}
+			// A PARTIAL index likewise needs the engine to evaluate its predicate per row, so the
+			// realign bails the same way (indexes.md §9).
+			if def.Predicate != nil {
+				return 0, newError(FeatureNotSupported,
+					"collation upgrade of a table with a partial index is not supported yet")
+			}
 			var ekeys [][]byte
 			for _, e := range entries {
 				eks, err := indexEntryKeysColumns(table.Columns, colls, def, e.Key, e.Row)

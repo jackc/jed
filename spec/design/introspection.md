@@ -270,7 +270,9 @@ jed_indexes(
   table_name  text NOT NULL,     -- the canonical owning-table name
   columns     text[] NOT NULL,   -- the indexed column names in index-key order (duplicates included)
   is_unique   boolean NOT NULL,  -- whether the index enforces uniqueness (indexes.md §8)
-  method      text NOT NULL      -- the access method: 'btree' | 'gin' | 'gist'
+  method      text NOT NULL,     -- the access method: 'btree' | 'gin' | 'gist'
+  predicate   text               -- a partial index's predicate text (canonical, indexes.md §9);
+                                 --   NULL for a non-partial index (PG's pg_index.indpred analog)
 )
 
 jed_constraints(
@@ -292,9 +294,10 @@ jed_constraints(
 the GiST index that *backs* an `EXCLUDE` constraint (gist.md §7). A constraint-backing index
 therefore appears in **both** `jed_indexes` and `jed_constraints` under the same name — the same
 parallel PostgreSQL keeps between `pg_indexes` and `pg_constraint`, and the join key between the two
-relations. `is_unique` is the catalog's `unique` flag; `method` renders the index kind. The primary
-key owns no index object (its `<table>_pkey` name is not persisted — constraints.md §5.4), so it is
-**not** a row here; it is surfaced by `jed_columns.pk_ordinal`.
+relations. `is_unique` is the catalog's `unique` flag; `method` renders the index kind;
+`predicate` renders a **partial index's** predicate canonical text (indexes.md §9), NULL for a
+non-partial index. The primary key owns no index object (its `<table>_pkey` name is not persisted —
+constraints.md §5.4), so it is **not** a row here; it is surfaced by `jed_columns.pk_ordinal`.
 
 **`jed_constraints` covers the four kinds the design doc enumerates — CHECK, UNIQUE, FK, EXCLUDE —
 and *only* those.** The `PRIMARY KEY` and `NOT NULL` constraints are deliberately absent: they own

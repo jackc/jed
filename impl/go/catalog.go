@@ -209,6 +209,11 @@ type indexDef struct {
 	Keys   []indexKey
 	Unique bool
 	Kind   indexKind
+	// Predicate is a PARTIAL index's WHERE predicate (spec/design/indexes.md §9): only rows whose
+	// predicate is TRUE are indexed / constrained. nil for an ordinary (full) index. Carries the
+	// persisted canonical text + the re-parsed (unresolved) AST — re-resolved against the table per
+	// statement, like an expression key (indexKeyExpr). Partial indexes are B-tree only.
+	Predicate *indexKeyExpr
 }
 
 // allColumns reports whether every key element is a plain column (no expression key) — the common

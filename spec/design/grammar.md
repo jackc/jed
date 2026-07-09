@@ -1626,10 +1626,16 @@ Two new top-level statements ([indexes.md](indexes.md)):
 
 ```
 create_index  ::= "CREATE" "UNIQUE"? "INDEX" identifier? "ON" identifier using_clause?
-                  "(" index_element ("," index_element)* ")"
+                  "(" index_element ("," index_element)* ")" ( "WHERE" expr )?
 index_element ::= column_ref | function_call | "(" expr ")"
 drop_index    ::= "DROP" "INDEX" identifier
 ```
+
+**The optional trailing `WHERE predicate`** makes the index **partial** — only rows whose
+predicate is TRUE are indexed ([indexes.md §9](indexes.md)). `WHERE` is recognized
+positionally after the closing `)` (it stays non-reserved — a column may be named `where`);
+the predicate is an ordinary boolean `expr` over the table's columns. B-tree only this
+slice (a `WHERE` on `USING gin`/`gist` is `0A000`).
 
 **`UNIQUE` needs no lookahead of its own**: after `CREATE`, the next word being `UNIQUE`
 can only be this form (`CREATE TABLE`/`CREATE INDEX` are the only `CREATE` statements, and

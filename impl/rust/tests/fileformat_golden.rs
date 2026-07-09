@@ -194,6 +194,31 @@ fn expr_index_table_db() -> Session {
     db
 }
 
+/// A table with PARTIAL index predicates (v27 — the `index_flags` bit1 + the canonical predicate
+/// text after `index_root_page`, indexes.md §9): a plain partial index `t_amt_idx` and a UNIQUE
+/// partial index `t_uact` (both `WHERE status = 'active'`) beside a non-partial `t_status_idx`
+/// (bit1 clear, byte-identical to v26). The table is EMPTY (all three trees empty, root 0), so the
+/// fixture isolates the v27 catalog change. Must match verify.rb's PARTIAL_INDEX_TABLE.
+fn partial_index_table_db() -> Session {
+    let mut db = Database::create(CreateOptions {
+        page_size: GOLDEN_PAGE_SIZE,
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
+    run(
+        &mut db,
+        "CREATE TABLE t (id i32 PRIMARY KEY, status text, amt i32)",
+    );
+    run(&mut db, "CREATE INDEX ON t (amt) WHERE status = 'active'");
+    run(
+        &mut db,
+        "CREATE UNIQUE INDEX t_uact ON t (amt) WHERE status = 'active'",
+    );
+    run(&mut db, "CREATE INDEX ON t (status)");
+    db
+}
+
 /// Tables with FOREIGN KEY constraints (v11 — spec/design/constraints.md §6): pins the catalog
 /// foreign-key list. Parent `p` (a PK + two UNIQUE constraints, the FK targets); child `c` with
 /// four FKs covering every shape — a named FK to the UNIQUE column (`c_code_fk`), a self-reference
@@ -1358,6 +1383,7 @@ fn write_matches_goldens() {
         ("index_table.jed", index_table_db),
         ("unique_table.jed", unique_table_db),
         ("expr_index_table.jed", expr_index_table_db),
+        ("partial_index_table.jed", partial_index_table_db),
         ("gin_array_table.jed", gin_array_table_db),
         ("gin_uuid_table.jed", gin_uuid_table_db),
         ("fk_table.jed", fk_table_db),
@@ -1427,6 +1453,7 @@ fn read_goldens_reproduces_rows() {
         ("index_table.jed", index_table_db, "t"),
         ("unique_table.jed", unique_table_db, "t"),
         ("expr_index_table.jed", expr_index_table_db, "t"),
+        ("partial_index_table.jed", partial_index_table_db, "t"),
         ("gin_array_table.jed", gin_array_table_db, "t"),
         ("gin_uuid_table.jed", gin_uuid_table_db, "t"),
         ("fk_table.jed", fk_table_db, "c"),

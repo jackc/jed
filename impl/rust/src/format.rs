@@ -81,7 +81,15 @@ const MAGIC: [u8; 4] = *b"JEDB";
 /// `bound_len u16 ‖ encode_range_body(union) ‖ child_page u32`. The catalog index entry is unchanged
 /// (the `index_root_page` slot points at the R-tree root, `0` for an empty index); only the node
 /// pages it reaches differ. A file with no GiST index still moves to v20 only by its version byte.
-const FORMAT_VERSION: u16 = 26;
+///
+/// v26 = **expression index keys** (spec/design/indexes.md §1/§6): a per-index key element is a `u16`
+/// column ordinal OR the `0xFFFF` sentinel + a `u16` length + the canonical expression text.
+///
+/// v27 = **partial-index predicates** (spec/design/indexes.md §9): the per-index `index_flags` byte
+/// gains bit1 `has_predicate`, and — only when set — a `u16 pred_len` + `pred_len` UTF-8 bytes of the
+/// predicate's canonical text follow `index_root_page`. B-tree only. A non-partial index is
+/// byte-identical to v26, so a file with no partial index moves to v27 only by its version byte + CRC.
+const FORMAT_VERSION: u16 = 27;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
 /// (`page_type`, `item_count`, `next_page`) plus a 4-byte per-page `crc32` (offset 12).
 pub(crate) const PAGE_HEADER: usize = 16;
@@ -2682,10 +2690,18 @@ fn table_entry_bytes(table: &Table, root_data_page: u32, index_roots: &[u32]) ->
                 }
             }
         }
-        out.push(if idx.unique { 1 } else { 0 });
+        // index_flags: bit0 unique (v6), bit1 has_predicate (v27 — a partial index, indexes.md §9).
+        out.push((if idx.unique { 1 } else { 0 }) | (if idx.predicate.is_some() { 2 } else { 0 }));
         // v13: index_kind byte (0 = ordered B-tree, 1 = GIN — spec/design/gin.md §7).
         out.push(idx.kind as u8);
         out.extend_from_slice(&root.to_be_bytes());
+        // v27: a partial index's predicate canonical text (u16 len + UTF-8), after index_root_page —
+        // only when bit1 is set (indexes.md §9, format.md).
+        if let Some(p) = &idx.predicate {
+            let t = p.expr_text.as_bytes();
+            out.extend_from_slice(&(t.len() as u16).to_be_bytes());
+            out.extend_from_slice(t);
+        }
     }
     // Foreign keys (v11): count, then per FK the name, the local-column ordinals (into THIS
     // table, list order), the referenced table name, the referenced-column ordinals (into the
@@ -3717,7 +3733,8 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u3
             }
         }
         let iflags = read_u8(buf, pos)?;
-        if iflags & !0b01 != 0 {
+        // bit0 unique (v6), bit1 has_predicate (v27 — a partial index, indexes.md §9); the rest reserved.
+        if iflags & !0b11 != 0 {
             return Err(corrupt("reserved index flag set"));
         }
         // v13: index_kind byte (0 = ordered B-tree, 1 = GIN — spec/design/gin.md §7);
@@ -3733,12 +3750,31 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u3
         if kind != IndexKind::Btree && !keys.iter().all(|k| matches!(k, IndexKey::Column(_))) {
             return Err(corrupt("a non-btree index cannot have an expression key"));
         }
+        let has_predicate = iflags & 0b10 != 0;
+        // A partial index is B-tree only (indexes.md §9): bit1 with a GIN/GiST kind is corrupt.
+        if has_predicate && kind != IndexKind::Btree {
+            return Err(corrupt("a non-btree index cannot be partial"));
+        }
         index_roots.push(read_u32(buf, pos)?);
+        // v27: the partial-index predicate canonical text follows index_root_page (bit1 set) — re-parse
+        // it (XX001 on failure, like a stored CHECK — spec/design/indexes.md §9).
+        let predicate = if has_predicate {
+            let text = read_string(buf, pos)?;
+            let expr = crate::parser::parse_expression(&text)
+                .map_err(|_| corrupt("unparseable index predicate"))?;
+            Some(IndexKeyExpr {
+                expr_text: text,
+                expr,
+            })
+        } else {
+            None
+        };
         indexes.push(IndexDef {
             name: iname,
             keys,
             unique: iflags & 0b01 != 0,
             kind,
+            predicate,
         });
     }
     // Foreign keys (v11): name + local ordinals + referenced table + referenced ordinals + the

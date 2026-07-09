@@ -4137,7 +4137,17 @@ export class Engine {
       const coll = resolveDeriv(scope.catalog, deriveCollation(scope, k.expr));
       return { kind: "expr", expr: node, type: ty, coll };
     });
-    return { name: def.name, unique: def.unique, kind: def.kind, keys };
+    // A partial index's predicate (indexes.md §9), re-resolved against the table's columns — it was
+    // validated boolean + immutable at CREATE INDEX, so this cannot newly fail.
+    let predicate: RExpr | undefined;
+    if (def.predicate) {
+      predicate = resolveBooleanFilter(
+        Scope.single(this, table),
+        def.predicate.expr,
+        new ParamTypes(),
+      );
+    }
+    return { name: def.name, unique: def.unique, kind: def.kind, keys, predicate };
   }
 
   // resolveTableIndexes resolves every index of a table once per statement (the maintenance driver —
@@ -4616,6 +4626,41 @@ export class Engine {
         `a ${ci.using} index on an attached-database table is not supported yet`,
       );
     }
+    // The optional `WHERE predicate` making the index PARTIAL (spec/design/indexes.md §9): a boolean
+    // expression over the table's own columns, validated with PG-agreeing codes. B-tree only this slice.
+    // Validated after the key elements and stored as canonical text (format_version 27).
+    let predicate: { exprText: string; expr: Expr } | undefined;
+    if (ci.predicate) {
+      if (kind !== "btree") {
+        throw engineError(
+          "feature_not_supported",
+          `a partial (WHERE) ${ci.using} index is not supported yet`,
+        );
+      }
+      // Structural pre-walk: a subquery is 0A000 and a bind parameter 42P02 (both admitted by the
+      // resolver). The aggregate 42803 / window 42P20 / non-boolean 42804 rejections then fall out of
+      // the Forbidden-context boolean resolve below.
+      rejectIndexPredicateStructure(ci.predicate.expr);
+      resolveBooleanFilter(Scope.single(this, table), ci.predicate.expr, new ParamTypes());
+      // Immutability (§9), the same rule an expression key carries: a non-immutable seam/clock/sequence
+      // call, or a timestamptz-dependent subexpression (references a timestamptz column — conservatively
+      // fail-closed), is 42P17.
+      let tzHazard = false;
+      for (const ref of checkReferencedColumns(ci.predicate.expr, columns)) {
+        const sc = typeAsScalar(columns[ref]!.type);
+        if (sc === "timestamptz") {
+          tzHazard = true;
+          break;
+        }
+      }
+      if (indexExprNonimmutableCall(ci.predicate.expr) || tzHazard) {
+        throw engineError(
+          "invalid_object_definition",
+          "functions in index predicate must be marked IMMUTABLE",
+        );
+      }
+      predicate = { exprText: ci.predicate.text, expr: ci.predicate.expr };
+    }
     // relationTaken checks the namespace of the target scope: an attachment's OWN snapshot for an
     // attached table (each attached database is an independent namespace, §3), else the temp-aware
     // implicit namespace.
@@ -4657,7 +4702,10 @@ export class Engine {
       if (k.kind === "column") mask[k.column] = true;
       else for (const c of checkReferencedColumns(k.expr, columns)) mask[c] = true;
     }
-    const def: IndexDef = { name, keys: ciKeys, unique: ci.unique, kind };
+    // A partial index's predicate is evaluated per row during the build (indexes.md §9), so the columns
+    // it references join the touched set — keeping the build cost deterministic + cross-core identical.
+    if (predicate) for (const c of checkReferencedColumns(predicate.expr, columns)) mask[c] = true;
+    const def: IndexDef = { name, keys: ciKeys, unique: ci.unique, kind, predicate };
     // Resolve the index once (column ordinals + resolved expression keys); an env for any expression
     // key (a fresh statement rng — index expressions are immutable, so it is never read).
     const rindex = this.resolveIndex(table, def);
@@ -9746,6 +9794,8 @@ export class Engine {
           arrayValue(idx.keys.map((k) => textValue(indexKeyLabel(k, t)))),
           boolValue(idx.unique),
           textValue(idx.kind),
+          // A partial index's predicate canonical text; NULL for a non-partial index (indexes.md §9).
+          idx.predicate ? textValue(idx.predicate.exprText) : nullValue(),
         ]);
       }
     }
@@ -12169,6 +12219,17 @@ export function buildIndexAccessPredicate(
   } catch {
     return null;
   }
+  // A PARTIAL index holds only its qualifying rows (indexes.md §9), so it is usable ONLY when the
+  // query's WHERE implies the index predicate. jed's test is syntactic (PG's, not a prover): the WHERE
+  // AND-chain must contain a conjunct STRUCTURALLY EQUAL to the resolved predicate. A miss yields no
+  // bound — a correct full scan. (The resolved predicate is in table-local column coords; a WHERE
+  // conjunct is global, so it is matched shifted by rel.offset.)
+  if (
+    rindex.predicate !== undefined &&
+    !filterImpliesPredicate(filter, rindex.predicate, rel.offset)
+  ) {
+    return null;
+  }
   const eqCols: IndexEqCol[] = [];
   let range: IndexRange | null = null;
   for (const key of rindex.keys) {
@@ -12299,6 +12360,10 @@ export function detectScanBound(
   }
   for (const idx of rel.table.indexes) {
     if (idx.kind !== "btree") continue;
+    // A PARTIAL index is not used for the OR/IN point-set this slice (indexes.md §9): the merged
+    // point-lookup path carries no predicate-implication gate, so it stays non-partial (a follow-on) —
+    // falling through leaves a correct full scan.
+    if (idx.predicate !== undefined) continue;
     // The OR/IN merged-point-lookup bound is column-only this slice (an expression index takes the
     // access-predicate path — indexes.md §5; OR/IN over an expression key is a follow-on).
     const cols = indexColumnOrdinals(idx);
@@ -12588,6 +12653,10 @@ export function orderSatisfiedByIndex(
   if (pkWidth === null) return null;
   for (const idx of table.indexes) {
     if (idx.kind !== "btree") continue; // only an ordered B-tree realizes the column order
+    // A PARTIAL index is not used for ORDER-BY skip-sort this slice (indexes.md §9): it holds only its
+    // qualifying rows, so walking it would drop rows unless the query implies the predicate — that gate
+    // lives only on the access-predicate bound. Stays non-partial (a follow-on); full-scan + sort.
+    if (idx.predicate !== undefined) continue;
     // ORDER-BY skip-sort is column-only this slice (matching ORDER BY against an expression index key
     // is a follow-on — indexes.md §5).
     const cols = indexColumnOrdinals(idx);
@@ -12912,6 +12981,10 @@ export type ResolvedIndex = {
   unique: boolean;
   kind: "btree" | "gin" | "gist";
   keys: ResolvedKey[];
+  // predicate is a PARTIAL index's resolved WHERE predicate (spec/design/indexes.md §9): evaluated
+  // against each row (unmetered, like a key expression), a row is indexed / constrained ONLY when it
+  // is TRUE. undefined for an ordinary (full) index — every row is indexed.
+  predicate?: RExpr;
 };
 
 // resolvedIndexColumnOrdinals are the plain-column ordinals of a GIN/GiST index (always all columns,
@@ -13010,11 +13083,23 @@ export function indexEntryKey(
   return concatBytes(parts);
 }
 
+// indexRowQualifies reports whether a row is indexed by rindex (spec/design/indexes.md §9): always
+// for an ordinary index, and for a PARTIAL index iff its WHERE predicate evaluates to TRUE (the 3VL
+// WHERE rule — FALSE and NULL are excluded). The predicate eval is unmetered maintenance work (like a
+// key expression's — cost.md §3), so a throwaway Meter absorbs its charge.
+export function indexRowQualifies(rindex: ResolvedIndex, row: Row, env: EvalEnv): boolean {
+  if (rindex.predicate === undefined) return true;
+  return isTrue(evalExpr(rindex.predicate, row, env, new Meter()));
+}
+
 // indexEntryKeys returns the index entries a row contributes (spec/design/gin.md §4/§5): exactly
 // one for an ordered (B-tree) index — the §3 nullable-slot entry key — or one per DISTINCT non-NULL
 // element for a GIN index. Every write path (build, INSERT, DELETE, UPDATE) treats an index
-// uniformly as "a row maps to a set of entries." env evaluates any expression key element (B-tree
-// only — GIN/GiST are plain-column, this slice).
+// uniformly as "a row maps to a set of entries." A PARTIAL index contributes the EMPTY set for a row
+// whose predicate is not TRUE (spec/design/indexes.md §9), which is what makes INSERT/DELETE/UPDATE
+// maintenance uniform (the UPDATE old-set/new-set diff handles a row entering/leaving/moving for
+// free). env evaluates any expression key element or the partial predicate (B-tree only — GIN/GiST
+// are plain-column, this slice).
 export function indexEntryKeys(
   columns: Column[],
   colls: (Collation | null)[],
@@ -13023,6 +13108,7 @@ export function indexEntryKeys(
   row: Row,
   env: EvalEnv,
 ): Uint8Array[] {
+  if (!indexRowQualifies(rindex, row, env)) return []; // partial index: a non-qualifying row → no entry
   if (rindex.kind === "gin")
     return ginEntries(columns, resolvedIndexColumnOrdinals(rindex), storageKey, row);
   if (rindex.kind === "gist")
@@ -13390,9 +13476,12 @@ export function resolveArbiter(table: Table, target: ConflictTarget | null): Arb
     for (let i = 0; i < table.indexes.length; i++) {
       const def = table.indexes[i]!;
       // A conflict-target COLUMN list matches only a plain-column unique index (an expression unique
-      // index is arbitrated by ON CONSTRAINT <name> — upsert.md §3).
+      // index is arbitrated by ON CONSTRAINT <name> — upsert.md §3). A PARTIAL unique index is NOT
+      // matched by a bare column list (PostgreSQL requires the predicate to be restated — a deferred
+      // upsert follow-on, indexes.md §9): a column target that only a partial index covers reports
+      // "no matching arbiter", agreeing with PG.
       const cols = indexColumnOrdinals(def);
-      if (def.unique && cols !== null && sameIntSet(cols, want))
+      if (def.unique && def.predicate === undefined && cols !== null && sameIntSet(cols, want))
         return { isPK: false, indexPos: i };
     }
     throw engineError(
@@ -13450,6 +13539,9 @@ export function indexPrefixKey(
   row: Row,
   env: EvalEnv,
 ): Uint8Array | null {
+  // A partial index constrains only its qualifying rows (indexes.md §9): a non-qualifying row is
+  // exempt from uniqueness, exactly like a NULL-bearing prefix (returns null).
+  if (!indexRowQualifies(rindex, row, env)) return null;
   const parts: Uint8Array[] = [];
   for (const key of rindex.keys) {
     const { value, type, coll } = indexKeySlot(key, columns, colls, row, env);
@@ -13816,9 +13908,55 @@ export function rexprEqShifted(a: RExpr, b: RExpr, offset: number): boolean {
       // regime, identical at index-build and query-eval), so the match is sound: same direction
       // + a matching argument.
       return b.kind === "casing" && a.upper === b.upper && rexprEqShifted(a.arg, b.arg, offset);
+    case "compare":
+      // A comparison (status = 'active', amt > 0) is the canonical partial-index predicate shape
+      // (indexes.md §9): same operator + same derived collation + structurally-equal operands.
+      return (
+        b.kind === "compare" &&
+        a.op === b.op &&
+        (a.collation?.name ?? null) === (b.collation?.name ?? null) &&
+        rexprEqShifted(a.lhs, b.lhs, offset) &&
+        rexprEqShifted(a.rhs, b.rhs, offset)
+      );
+    case "and":
+      return (
+        b.kind === "and" &&
+        rexprEqShifted(a.lhs, b.lhs, offset) &&
+        rexprEqShifted(a.rhs, b.rhs, offset)
+      );
+    case "or":
+      return (
+        b.kind === "or" &&
+        rexprEqShifted(a.lhs, b.lhs, offset) &&
+        rexprEqShifted(a.rhs, b.rhs, offset)
+      );
+    case "isNull":
+      return (
+        b.kind === "isNull" &&
+        a.negated === b.negated &&
+        rexprEqShifted(a.operand, b.operand, offset)
+      );
     default:
       return false;
   }
+}
+
+// filterImpliesPredicate reports whether the WHERE filter implies a PARTIAL index's predicate
+// (spec/design/indexes.md §9). jed's syntactic test (PG's, not a prover): every top-level conjunct of
+// pred must be present as a top-level conjunct of filter (so a conjunctive predicate a AND b is
+// implied by a WHERE that lists both a and b). pred is in table-local column coords; a filter conjunct
+// is global, so it is matched shifted by offset. Sound-if-conservative: a miss means the index is not
+// used (a correct full scan + residual filter).
+export function filterImpliesPredicate(filter: RExpr, pred: RExpr, offset: number): boolean {
+  if (pred.kind === "and") {
+    return (
+      filterImpliesPredicate(filter, pred.lhs, offset) &&
+      filterImpliesPredicate(filter, pred.rhs, offset)
+    );
+  }
+  const contains = (f: RExpr): boolean =>
+    f.kind === "and" ? contains(f.lhs) || contains(f.rhs) : rexprEqShifted(f, pred, offset);
+  return contains(filter);
 }
 
 // asBoundTerm recognizes a single comparison conjunct: a comparison (=,<,<=,>,>=) with the bound's
@@ -15966,6 +16104,8 @@ export function catalogRelTable(kind: CatalogRelKind): Table {
         textArr("columns", true),
         col("is_unique", "boolean", true),
         col("method", "text", true),
+        // A partial index's predicate canonical text; NULL for a non-partial index (indexes.md §9).
+        col("predicate", "text", false),
       ]);
     default: // "jed_constraints"
       return table("jed_constraints", [
@@ -18407,6 +18547,110 @@ export function indexExprHasSubquery(e: Expr): boolean {
     default:
       // column / qualifiedColumn / literal / typedLiteral / param / qualifiedStar — no subquery.
       return false;
+  }
+}
+
+// rejectIndexPredicateStructure applies the structural rejections for a PARTIAL-index predicate
+// (spec/design/indexes.md §9) before resolution: a subquery is 0A000 (cannot use subquery in index
+// predicate) and a bind parameter $N is 42P02 (there is no parameter $N) — both admitted by the
+// ordinary resolver, so caught here (the aggregate 42803 / window 42P20 / non-boolean 42804
+// rejections then fall out of the Forbidden-context boolean resolve). Reuses indexExprHasSubquery for
+// the subquery walk, then finds the first param.
+export function rejectIndexPredicateStructure(e: Expr): void {
+  if (indexExprHasSubquery(e)) {
+    throw engineError("feature_not_supported", "cannot use subquery in index predicate");
+  }
+  const n = indexExprFirstParam(e);
+  if (n !== null) {
+    throw engineError("undefined_parameter", "there is no parameter $" + n.toString());
+  }
+}
+
+// indexExprFirstParam returns the 1-based index of the first bind parameter $N in an expression, or
+// null if it has none (used by rejectIndexPredicateStructure). Mirrors indexExprHasSubquery's walk.
+export function indexExprFirstParam(e: Expr): number | null {
+  switch (e.kind) {
+    case "param":
+      return e.index;
+    case "cast":
+    case "collate":
+      return indexExprFirstParam(e.inner);
+    case "extract":
+      return indexExprFirstParam(e.source);
+    case "unary":
+    case "isNull":
+    case "isJson":
+    case "jsonCtor":
+      return indexExprFirstParam(e.operand);
+    case "fieldAccess":
+    case "fieldStar":
+      return indexExprFirstParam(e.base);
+    case "jsonExists":
+    case "jsonValue":
+    case "jsonQuery":
+      return indexExprFirstParam(e.ctx) ?? indexExprFirstParam(e.path);
+    case "binary":
+    case "isDistinct":
+    case "like":
+    case "regex":
+      return indexExprFirstParam(e.lhs) ?? indexExprFirstParam(e.rhs);
+    case "in": {
+      const l = indexExprFirstParam(e.lhs);
+      if (l !== null) return l;
+      for (const x of e.list) {
+        const p = indexExprFirstParam(x);
+        if (p !== null) return p;
+      }
+      return null;
+    }
+    case "quantified":
+      return indexExprFirstParam(e.lhs) ?? indexExprFirstParam(e.array);
+    case "between":
+      return indexExprFirstParam(e.lhs) ?? indexExprFirstParam(e.lo) ?? indexExprFirstParam(e.hi);
+    case "case": {
+      if (e.operand !== null) {
+        const o = indexExprFirstParam(e.operand);
+        if (o !== null) return o;
+      }
+      for (const w of e.whens) {
+        const c = indexExprFirstParam(w.cond) ?? indexExprFirstParam(w.result);
+        if (c !== null) return c;
+      }
+      return e.els !== null ? indexExprFirstParam(e.els) : null;
+    }
+    case "funcCall": {
+      for (const a of e.args) {
+        const p = indexExprFirstParam(a);
+        if (p !== null) return p;
+      }
+      return null;
+    }
+    case "row": {
+      for (const f of e.fields) {
+        const p = indexExprFirstParam(f);
+        if (p !== null) return p;
+      }
+      return null;
+    }
+    case "array": {
+      for (const x of e.elements) {
+        const p = indexExprFirstParam(x);
+        if (p !== null) return p;
+      }
+      return null;
+    }
+    case "subscript": {
+      const b = indexExprFirstParam(e.base);
+      if (b !== null) return b;
+      for (const x of astSubscriptExprs(e.subscripts)) {
+        const p = indexExprFirstParam(x);
+        if (p !== null) return p;
+      }
+      return null;
+    }
+    default:
+      // column / qualifiedColumn / literal / typedLiteral / qualifiedStar — no param.
+      return null;
   }
 }
 

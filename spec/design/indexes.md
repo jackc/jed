@@ -8,16 +8,22 @@
 > [../grammar/grammar.ebnf](../grammar/grammar.ebnf) +
 > [grammar.md §30/§31](grammar.md), the byte layout in
 > [../fileformat/format.md](../fileformat/format.md) (`format_version` 6; **expression keys
-> `format_version` 26**, §6), the entry-key encoding in [encoding.md](encoding.md), and the
+> `format_version` 26**; **partial-index predicates `format_version` 27**, §6/§9), the
+> entry-key encoding in [encoding.md](encoding.md), and the
 > cost contract in [cost.md §3](cost.md).
 > PostgreSQL semantics were pinned against the live `postgres:18` oracle (CLAUDE.md §1).
 
 ## 1. Surface
 
 ```sql
-CREATE [UNIQUE] INDEX [name] ON table (key [, key ...])
+CREATE [UNIQUE] INDEX [name] ON table (key [, key ...]) [WHERE predicate]
 DROP INDEX name
 ```
+
+The optional **`WHERE predicate`** makes the index **partial** (§9): only rows for which the
+predicate evaluates to **TRUE** are indexed (and, for a `UNIQUE` partial index, only those rows
+are constrained). A partial index is **B-tree only** this slice; a `WHERE` clause on a
+`USING gin` / `USING gist` index is `0A000`.
 
 Each **key element** is one of three forms, matching PostgreSQL's `index_elem` (oracle-probed):
 
@@ -59,10 +65,10 @@ three forms in one key list (`CREATE INDEX ON t (lower(email), a, (b + 1))`).
   deterministic function of the row, so the index stays consistent with the table under the
   §8/§10 contract.
 - **Still deferred** (each a relaxable narrowing, PostgreSQL features): per-key
-  `ASC`/`DESC`/`NULLS`, partial (`WHERE`) indexes, `IF NOT EXISTS`, `CONCURRENTLY`, and an
-  explicit operator class / `COLLATE` on a key element. An expression key's text result uses
-  the expression's own effective collation (jed's ordinary text-collation resolution), not a
-  per-key `COLLATE`.
+  `ASC`/`DESC`/`NULLS`, `IF NOT EXISTS`, `CONCURRENTLY`, and an explicit operator class /
+  `COLLATE` on a key element. An expression key's text result uses the expression's own
+  effective collation (jed's ordinary text-collation resolution), not a per-key `COLLATE`.
+  (Partial (`WHERE`) indexes have **landed** for B-tree — §9.)
 
 ## 2. DDL semantics (PG-matched, oracle-probed)
 
@@ -322,7 +328,7 @@ the table's node count + `storage_row_read` per row (its touched set — the ind
 columns — is fixed-width, so the chain/decompress terms are structurally zero); an empty
 table charges 0. `DROP INDEX` charges 0.
 
-## 6. Persistence (`format_version` 6, expression keys `format_version` 26)
+## 6. Persistence (`format_version` 6, expression keys `format_version` 26, partial predicates `format_version` 27)
 
 The catalog reshape (v5) + the unique flag (v6)
 ([../fileformat/format.md](../fileformat/format.md)):
@@ -334,10 +340,16 @@ The catalog reshape (v5) + the unique flag (v6)
   ([constraints.md §3](constraints.md)).
 - The table entry gains its **index list**: per index, the name (original case) + a
   **key-element list** (key order, duplicates allowed) + a **flags byte** (`bit0 unique` —
-  added in v6; the remaining bits are reserved, written 0 and read-validated) + the
-  index tree's **root page**. Indexes are stored and held in **ascending
-  lowercased-name order** (the catalog's deterministic order, like checks; also the §5
-  tie-break order and the §8 violation-report order).
+  added in v6; **`bit1 has_predicate`** — added in v27, §9; the remaining bits are reserved,
+  written 0 and read-validated) + the index tree's **root page**, then — **only when `bit1`
+  is set** (`format_version` 27) — a `u16 pred_len` + `pred_len` UTF-8 bytes of the partial
+  index's **predicate canonical text** (the *Check-expression text* form). On load a partial
+  predicate re-parses (`XX001` on failure, like a stored CHECK) and re-resolves against the
+  loaded table's columns per statement (never persisted-resolved — a deterministic function of
+  the column types). A non-partial index writes no `bit1` and no predicate bytes and is
+  byte-identical to v26. Indexes are stored and held in **ascending lowercased-name order**
+  (the catalog's deterministic order, like checks; also the §5 tie-break order and the §8
+  violation-report order).
 - **Each key element** is a `u16`: a **column ordinal** (`< col_count`) for a column key,
   or the sentinel **`0xFFFF`** — which cannot be a valid ordinal (`col_count ≤ 65535` ⇒
   max ordinal `65534`) — for an **expression key** (**new in `format_version` 26**),
@@ -362,6 +374,13 @@ The catalog reshape (v5) + the unique flag (v6)
 - **Expression-index matching is syntactic** (as in PG): the planner uses an expression
   index only when a WHERE operand is structurally equal to the key expression, not
   whenever they are semantically equivalent (`b + a` does not match an index on `a + b`).
+- **Partial-index implication is syntactic** (§9): jed uses a partial index only when the
+  WHERE AND-chain **contains a conjunct structurally equal to the index predicate**, where
+  PG's planner also matches a query predicate that *implies* the index predicate
+  (`amt > 50 ⟹ amt > 0`). A jed miss is a correct full scan. A partial-index predicate
+  that references a `timestamptz` column/value is conservatively `42P17` (the expression-key
+  hazard); and a partial index is used only via the access-predicate bound (no full
+  partial-index scan, and no partial OR/IN / ORDER-BY-skip / UPDATE-DELETE index path this slice).
 - PG's index machinery (btree opclasses, `USING`, collations, opfamilies) is owned
   surface jed does not implement — we own our surface (CLAUDE.md §1).
 - Error **messages** differ in jed's house style (no identifier quoting); codes match.
@@ -425,3 +444,80 @@ duplicate check and the index maintenance itself ([cost.md §3](cost.md) "What i
 metered") — an INSERT into a uniquely-indexed table accrues the same cost as into a
 plainly-indexed one. The `CREATE UNIQUE INDEX` build charges exactly the plain build's
 scan (§5); its verification adds nothing.
+
+## 9. Partial indexes (`CREATE INDEX … WHERE predicate`)
+
+A **partial index** indexes only the rows for which its `WHERE predicate` is **TRUE**
+(the ordinary 3VL WHERE rule — a row whose predicate is FALSE *or* NULL is left out).
+`CREATE INDEX pt_amt_active ON pt (amt) WHERE status = 'active'` builds a B-tree over
+`amt` holding an entry only for the `status = 'active'` rows — the canonical shape (a
+narrow index over a hot subset). B-tree only this slice (a `WHERE` on a GIN / GiST index
+is `0A000`); the `EXCLUDE … WHERE (predicate)` partial form is a separate GiST follow-on
+([gist.md §7](gist.md)).
+
+**The predicate.** A boolean expression over the table's own columns, immutable and
+self-contained — the same purity an expression *key* guarantees (§1). At `CREATE INDEX`
+the predicate is validated in this order (PG-agreeing, oracle-probed):
+
+1. a **subquery** → **`0A000`** (`cannot use subquery in index predicate`) — the resolver
+   admits an uncorrelated subquery, so this is a pre-resolution structural reject;
+2. a **bind parameter** `$N` → **`42P02`** (`there is no parameter $N`) — likewise pre-resolution;
+3. resolve against the table's columns (an unknown column → **`42703`**), requiring the result
+   be **boolean** — a non-boolean predicate is **`42804`** (`argument of WHERE must be type
+   boolean, not type <t>`); an **aggregate** in the predicate is **`42803`**, a **window
+   function** **`42P20`** (both from the ordinary `Forbidden`-context resolver, as for a WHERE);
+4. a **non-immutable** call (the entropy/clock/sequence seam — `now`/`clock_timestamp`/
+   `uuidv4`/`uuidv7`/`nextval`/…) **or** a **`timestamptz`-dependent** subexpression (one that
+   references a `timestamptz` column or produces a `timestamptz` value — the same conservative
+   session-timezone hazard an expression key carries, §1) → **`42P17`** (`functions in index
+   predicate must be marked IMMUTABLE`).
+
+The predicate is stored as its **canonical text** (the *Check-expression text* form, exactly as
+a `CHECK` / expression key — `format_version` 27, §6) and re-parsed + re-resolved against the
+loaded table's columns per statement (never persisted-resolved — a deterministic function of the
+column types, which are themselves cross-core-identical). The auto-name (§2) is **unaffected** by
+the `WHERE` clause: `CREATE INDEX ON pt (amt) WHERE …` derives `pt_amt_idx` exactly as a
+non-partial index would (PG-matched).
+
+**Maintenance (§4) is uniform.** A partial index is still "a row maps to a *set* of entries" —
+the set is **empty** when the predicate is not TRUE. So INSERT inserts an entry only for a
+qualifying row; DELETE removes one only for a formerly-qualifying row; UPDATE's old-set/new-set
+diff handles every case for free (row enters the index, leaves it, moves within it, or is
+untouched — no special code). The predicate evaluation is **unmetered** maintenance work (like an
+expression key's — §4), so a partial-indexed write accrues the same cost as a plain-indexed one.
+The **build** scans the table once and indexes only qualifying rows; a `UNIQUE` partial build
+verifies uniqueness only among them (a duplicate among the qualifying rows traps `23505` and
+creates nothing).
+
+**Uniqueness (§8) is restricted to qualifying rows.** A `UNIQUE` partial index forbids two
+*qualifying* rows from sharing a fully-non-NULL key tuple; a row whose predicate is not TRUE is
+**exempt** (its uniqueness probe prefix is treated exactly like a NULL-bearing prefix — never
+conflicts). So `CREATE UNIQUE INDEX ON pt (amt) WHERE status = 'active'` allows an `inactive`
+row to duplicate an `active` row's `amt`, but forbids two `active` rows from sharing it.
+
+**Planner (§5) — sound-if-conservative implication.** The partial index holds *only* the
+qualifying rows, so a bounded scan of it plus the residual WHERE returns the query's rows **iff
+every row the query wants is a qualifying row** — i.e. the query's WHERE implies the index
+predicate. jed uses a **syntactic** test (PG's, not a semantic prover): a partial B-tree index is
+eligible for an access-predicate bound (§5.1) **only when the WHERE AND-chain contains a conjunct
+structurally equal to the index's predicate** (the §5.1 `rexpr_eq_shifted` structural match). So
+`SELECT … WHERE status = 'active' AND amt = 100` seeks `pt_amt_active` (the `amt = 100`
+access predicate, gated by the present `status = 'active'` conjunct); `SELECT … WHERE amt = 100`
+(no predicate conjunct) takes the full scan. The full WHERE — including the predicate conjunct —
+stays the residual filter (harmless: it is TRUE for every indexed row). Partial indexes are used
+**only** through the ordinary access-predicate bound: the OR/IN merged-point-lookup, the
+ORDER-BY-skip-sort walk, and the index-nested-loop / UPDATE/DELETE index paths all keep
+non-partial indexes only this slice (each a documented follow-on).
+
+**Divergences from PostgreSQL** (§7): (a) the implication test is **syntactic** — jed uses a
+partial index only when the WHERE literally contains the predicate conjunct, where PG's prover
+also matches an implying predicate (`amt > 50` query ⟹ `amt > 0` index); a jed miss is a correct
+full scan. (b) A predicate that references a `timestamptz` column or value is conservatively
+**`42P17`** (the expression-key hazard, extended to predicates) — so `WHERE deleted_at IS NULL`
+over a `timestamptz deleted_at` is rejected this slice (relaxable; a `timestamp`/`boolean`
+soft-delete marker works). (c) There is no full partial-index scan without a leading equality/range
+access predicate (a follow-on). Each is a relaxable narrowing, recorded here.
+
+**Introspection.** `jed_indexes` gains a `predicate text` column carrying the canonical predicate
+text (NULL for a non-partial index) — the analog of PostgreSQL's `pg_index.indpred`
+([introspection.md §5.1](introspection.md)).

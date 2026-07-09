@@ -796,6 +796,12 @@ impl Engine {
                     Value::Array(ArrayVal::one_dim(cols)),
                     Value::Bool(idx.unique),
                     Value::Text(index_method_name(idx.kind).to_string()),
+                    // A partial index's predicate canonical text; NULL for a non-partial index
+                    // (indexes.md §9).
+                    match &idx.predicate {
+                        Some(p) => Value::Text(p.expr_text.clone()),
+                        None => Value::Null,
+                    },
                 ]);
             }
         }

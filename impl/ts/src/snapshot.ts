@@ -362,6 +362,14 @@ export class Snapshot {
             "collation upgrade of a table with an expression index is not supported yet",
           );
         }
+        // A PARTIAL index likewise needs the Engine to evaluate its predicate per row, so the realign
+        // bails the same way (indexes.md §9).
+        if (def.predicate !== undefined) {
+          throw engineError(
+            "feature_not_supported",
+            "collation upgrade of a table with a partial index is not supported yet",
+          );
+        }
         const ekeys: Uint8Array[] = [];
         for (const e of entries)
           ekeys.push(...indexEntryKeysColumns(table.columns, colls, def, e.key, e.row));

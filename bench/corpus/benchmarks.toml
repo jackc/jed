@@ -56,6 +56,27 @@ gen = "text"
 min_len = 8
 max_len = 32
 
+# Partial-index gated lookup (spec/design/indexes.md §9, query.index_partial): the query restates the
+# index predicate (amount >= 90000) and adds an equality on the partial index's key column
+# (customer_id = $1), so the planner seeks the PARTIAL index orders_active_idx — which holds only the
+# ~10% big-amount rows — instead of full-scanning the 1M-row table. A core that ignored the predicate
+# implication would full-scan. The `int_uniform` param spans the customer_id domain, so most seeks find
+# few/no matching big-amount rows for that customer (the index-seek sweet spot).
+[[bench]]
+name = "partial_lookup"
+description = "Partial-index gated lookup on 1M rows — customer_id = $1 gated by the restated predicate amount >= 90000 seeks the partial index vs. a full scan (indexes.md §9)"
+dataset = "large"
+kind = "query"
+sql = "SELECT id, amount FROM orders WHERE amount >= 90000 AND customer_id = $1 ORDER BY id"
+warmup = 2000
+iterations = 20000
+seed = 4231
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 100000
+
 # OR / IN-list merged point lookups (spec/design/cost.md §3 "OR / IN-list", query.or_in_point_lookup):
 # a 10-value IN-list on the PRIMARY KEY lowers to 10 point probes over the 1M-row B-tree instead of a
 # full scan — the win this benchmark demonstrates (a handful of root→leaf seeks vs. a walk of every

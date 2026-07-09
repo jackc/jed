@@ -8,11 +8,11 @@ use crate::ast::{
     AlterSeqAction, AlterSequence, Assignment, BinaryOp, CheckDef, ColumnDef, ConflictAction,
     ConflictTarget, CreateIndex, CreateSequence, CreateTable, CreateType, Cte, CteBody, DefaultDef,
     Delete, DropIndex, DropSequence, DropTable, DropType, ExcludeDef, Expr, ForeignKeyDef,
-    GroupItem, IdentitySpec, IndexKeyElem, Insert, InsertSource, InsertValue, JoinClause, JoinKind,
-    JsonOnBehavior, JsonPredicateKind, JsonTable, JsonWrapper, JtColumn, Literal, OnConflict,
-    OrderKey, Overriding, QueryExpr, RefAction, Select, SelectItem, SelectItems, SeqOptions, SetOp,
-    SetOpKind, Statement, SubscriptSpec, TableRef, TypeFieldDef, TypeMod, UnaryOp, UniqueDef,
-    Update, WindowDef, WithExpr, WithQuery,
+    GroupItem, IdentitySpec, IndexKeyElem, IndexPredicate, Insert, InsertSource, InsertValue,
+    JoinClause, JoinKind, JsonOnBehavior, JsonPredicateKind, JsonTable, JsonWrapper, JtColumn,
+    Literal, OnConflict, OrderKey, Overriding, QueryExpr, RefAction, Select, SelectItem,
+    SelectItems, SeqOptions, SetOp, SetOpKind, Statement, SubscriptSpec, TableRef, TypeFieldDef,
+    TypeMod, UnaryOp, UniqueDef, Update, WindowDef, WithExpr, WithQuery,
 };
 use crate::ast::{FrameBound, FrameExclusion, FrameMode, WindowFrame, WindowOrderKey};
 use crate::decimal::Decimal;
@@ -884,6 +884,18 @@ impl Parser {
                 other => return Err(syntax(format!("expected ',' or ')', found {other:?}"))),
             }
         }
+        // An optional trailing `WHERE predicate` makes the index PARTIAL (indexes.md §9). `where`
+        // is recognized positionally after the closing `)` (non-reserved — a column may be named
+        // `where`); its text is captured for the canonical persisted form (like CHECK/DEFAULT).
+        let predicate = if self.peek_keyword().as_deref() == Some("where") {
+            self.advance();
+            let start = self.pos;
+            let expr = self.parse_expr()?;
+            let text = render_tokens(&self.tokens[start..self.pos]);
+            Some(IndexPredicate { text, expr })
+        } else {
+            None
+        };
         Ok(CreateIndex {
             name,
             table,
@@ -891,6 +903,7 @@ impl Parser {
             unique,
             using,
             db,
+            predicate,
         })
     }
 

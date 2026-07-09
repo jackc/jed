@@ -1,0 +1,184 @@
+# Partial indexes (spec/design/indexes.md §9): CREATE [UNIQUE] INDEX ON t (keys) WHERE predicate
+# indexes only the rows whose predicate is TRUE (the 3VL WHERE rule — FALSE and NULL are excluded),
+# and for UNIQUE constrains only those rows. B-tree only this slice. Maintenance is uniform (a row
+# maps to a set of entries, empty when the predicate is not TRUE), so INSERT/UPDATE/DELETE need no
+# special code; the planner uses the index ONLY when the WHERE contains a conjunct structurally equal
+# to the predicate (the syntactic implication gate). The ROWS never change with or without the
+# pushdown (the WHERE stays the residual filter) — only cost does; the `# cost:` lines pin the
+# cross-core index-bound usage (query.index_partial). Rows + error codes AGREE with PostgreSQL
+# (oracle-checked); the jed-specific pieces (the predicate column in jed_indexes, the conservative
+# timestamptz-predicate 42P17, the partial-GIN 0A000, the collation-upgrade 0A000) live in the
+# per-core tests. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.unique, ddl.index_partial, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.point_lookup, query.index_partial, query.aggregates, query.subquery_scalar, types.i32, types.text, resource.cost_metering
+
+# --- a partial index accelerates a query that implies its predicate ------------------------------
+
+statement ok
+CREATE TABLE pt (id i32 PRIMARY KEY, status text, amt i32)
+
+statement ok
+INSERT INTO pt VALUES (1,'active',10),(2,'inactive',20),(3,'active',30),(4,'active',10),(5,'inactive',30),(6,'active',50),(7,'active',30),(8,'inactive',30),(9,'active',70),(10,'active',30)
+
+# full-scan baseline: active rows with amt=30 are ids 3, 7, 10
+# cost: 94
+query I nosort
+SELECT id FROM pt WHERE status = 'active' AND amt = 30 ORDER BY id
+----
+3
+7
+10
+
+statement ok
+CREATE INDEX pt_amt_active ON pt (amt) WHERE status = 'active'
+
+# GATED — the WHERE contains status = 'active' (the index predicate), so the amt = 30 access
+# predicate seeks the partial index: identical rows, LOWER cost (query.index_partial). A core that
+# ignored the partial index would compute the higher full-scan cost above.
+# cost: 34
+query I nosort
+SELECT id FROM pt WHERE status = 'active' AND amt = 30 ORDER BY id
+----
+3
+7
+10
+
+# UNGATED — no predicate conjunct in the WHERE, so the partial index is NOT usable (it holds only
+# active rows): full scan, same full-scan cost as the baseline. amt = 30 across all statuses is
+# ids 3, 5, 7, 8, 10.
+# cost: 26
+query I nosort
+SELECT id FROM pt WHERE amt = 30 ORDER BY id
+----
+3
+5
+7
+8
+10
+
+# --- maintenance: only qualifying rows are indexed; a row enters/leaves as its predicate flips ----
+
+# INSERT a new active row with amt = 30 — it joins the index and the gated query.
+statement ok
+INSERT INTO pt VALUES (11,'active',30)
+
+# cost: 45
+query I nosort
+SELECT id FROM pt WHERE status = 'active' AND amt = 30 ORDER BY id
+----
+3
+7
+10
+11
+
+# UPDATE flips id 8 (inactive, amt 30) to active — it now ENTERS the index.
+statement ok
+UPDATE pt SET status = 'active' WHERE id = 8
+
+# cost: 56
+query I nosort
+SELECT id FROM pt WHERE status = 'active' AND amt = 30 ORDER BY id
+----
+3
+7
+8
+10
+11
+
+# UPDATE flips id 3 (active) to inactive — it LEAVES the index. Its amt is unchanged.
+statement ok
+UPDATE pt SET status = 'inactive' WHERE id = 3
+
+# cost: 45
+query I nosort
+SELECT id FROM pt WHERE status = 'active' AND amt = 30 ORDER BY id
+----
+7
+8
+10
+11
+
+# DELETE an active amt=30 row — it leaves the index.
+statement ok
+DELETE FROM pt WHERE id = 7
+
+# cost: 34
+query I nosort
+SELECT id FROM pt WHERE status = 'active' AND amt = 30 ORDER BY id
+----
+8
+10
+11
+
+# --- UNIQUE partial index: uniqueness restricted to the qualifying rows --------------------------
+
+statement ok
+CREATE TABLE u (id i32 PRIMARY KEY, status text, amt i32)
+
+statement ok
+INSERT INTO u VALUES (1,'active',10),(2,'inactive',20)
+
+statement ok
+CREATE UNIQUE INDEX u_uact ON u (amt) WHERE status = 'active'
+
+# an INACTIVE row may duplicate an active row's amt (it is not in the index).
+statement ok
+INSERT INTO u VALUES (3,'inactive',10)
+
+# a second ACTIVE row with amt = 10 conflicts (23505).
+statement error 23505
+INSERT INTO u VALUES (4,'active',10)
+
+# flipping the inactive amt=10 row to active would collide with the active amt=10 row (23505).
+statement error 23505
+UPDATE u SET status = 'active' WHERE id = 3
+
+# an active row may still take a fresh amt.
+statement ok
+INSERT INTO u VALUES (5,'active',99)
+
+# --- CREATE UNIQUE INDEX over existing duplicates: only qualifying rows are checked --------------
+
+statement ok
+CREATE TABLE v (id i32 PRIMARY KEY, status text, amt i32)
+
+# two ACTIVE rows share amt = 5, plus an inactive one — the build must fail (23505).
+statement ok
+INSERT INTO v VALUES (1,'active',5),(2,'active',5),(3,'inactive',5)
+
+statement error 23505
+CREATE UNIQUE INDEX ON v (amt) WHERE status = 'active'
+
+# with only ONE active row sharing amt = 5 (the rest inactive), the build succeeds.
+statement ok
+CREATE TABLE v2 (id i32 PRIMARY KEY, status text, amt i32)
+
+statement ok
+INSERT INTO v2 VALUES (1,'active',5),(2,'inactive',5),(3,'inactive',5)
+
+statement ok
+CREATE UNIQUE INDEX ON v2 (amt) WHERE status = 'active'
+
+# --- validation (codes AGREE with PostgreSQL, oracle-probed) -------------------------------------
+
+statement ok
+CREATE TABLE w (id i32 PRIMARY KEY, status text, amt i32)
+
+# an unknown column in the predicate → 42703
+statement error 42703
+CREATE INDEX ON w (amt) WHERE nope = 1
+
+# a non-boolean predicate → 42804
+statement error 42804
+CREATE INDEX ON w (amt) WHERE amt
+
+# an aggregate in the predicate → 42803
+statement error 42803
+CREATE INDEX ON w (amt) WHERE sum(amt) > 0
+
+# a subquery in the predicate → 0A000
+statement error 0A000
+CREATE INDEX ON w (amt) WHERE amt IN (SELECT id FROM w)
+
+# a bind parameter in the predicate → 42P02
+statement error 42P02
+CREATE INDEX ON w (amt) WHERE amt = $1

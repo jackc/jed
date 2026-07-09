@@ -1088,7 +1088,20 @@ func (p *parser) parseCreateIndex() (*createIndex, error) {
 		}
 		return nil, newError(SyntaxError, fmt.Sprintf("expected ',' or ')', found %v", tok))
 	}
-	return &createIndex{Name: name, Table: table, DB: dbQualifier, Keys: keys, Unique: unique, Using: using}, nil
+	// An optional trailing `WHERE predicate` makes the index PARTIAL (indexes.md §9). `where` is
+	// recognized positionally after the closing `)` (non-reserved); its text is captured for the
+	// canonical persisted form (like CHECK/DEFAULT).
+	var predicate *indexPredicate
+	if p.peekKeyword() == "where" {
+		p.advance()
+		start := p.pos
+		expr, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		predicate = &indexPredicate{Text: renderTokens(p.tokens[start:p.pos]), Expr: expr}
+	}
+	return &createIndex{Name: name, Table: table, DB: dbQualifier, Keys: keys, Unique: unique, Using: using, Predicate: predicate}, nil
 }
 
 // parseIndexElement parses one index_element (grammar.md §30, indexes.md §1): a bare column, a

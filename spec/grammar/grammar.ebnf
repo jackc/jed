@@ -241,9 +241,14 @@ drop_table     ::= "DROP" "TABLE" ("IF" "EXISTS")? identifier ("," identifier)*
  * syntax error, as in PG). An expression key resolves against the table's columns (unknown column
  * 42703) and must be immutable and indexable-typed: an aggregate is 42803, a window 42P20, a
  * subquery 0A000, a bind parameter 42P02, a non-immutable seam function 42P17, a composite result
- * 0A000 (indexes.md §2). Narrowings this slice (each 0A000-free — simply not in the grammar): no
- * per-key ASC/DESC/NULLS or COLLATE, no partial (WHERE) keys, no IF NOT EXISTS, no NULLS NOT
- * DISTINCT.
+ * 0A000 (indexes.md §2).
+ *   The optional trailing "WHERE predicate" makes the index PARTIAL (indexes.md §9): only rows
+ * whose predicate is TRUE are indexed (and, for UNIQUE, constrained). B-tree only — a WHERE on a
+ * gin/gist index is 0A000. The predicate is a boolean expression over the table's own columns,
+ * immutable and self-contained: a subquery is 0A000, a bind parameter 42P02, an aggregate 42803, a
+ * window 42P20, a non-boolean result 42804, a non-immutable / timestamptz-dependent expression 42P17.
+ * Narrowings this slice (each 0A000-free — simply not in the grammar): no per-key ASC/DESC/NULLS or
+ * COLLATE, no IF NOT EXISTS, no NULLS NOT DISTINCT.
  *
  * DROP INDEX removes one index by name: 42704 if it does not exist, 42809 if the name is
  * a table ("is not an index"); symmetrically DROP TABLE of an index name is 42809 ("is
@@ -253,6 +258,7 @@ drop_table     ::= "DROP" "TABLE" ("IF" "EXISTS")? identifier ("," identifier)*
  * constraint's only handle; indexes.md §8). */
 create_index   ::= "CREATE" "UNIQUE"? "INDEX" identifier? "ON" qualified_table
                    using_clause? "(" index_element ("," index_element)* ")"
+                   ( "WHERE" expr )?               /* an optional partial-index predicate (indexes.md §9) */
 index_element  ::= column_ref                    /* a bare column name */
                  | function_call                 /* a bare function call, e.g. lower(email) */
                  | "(" expr ")"                  /* any parenthesized expression; "(col)" normalizes to a column key */

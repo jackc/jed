@@ -955,7 +955,17 @@ class Parser {
       if (tok.kind === "rparen") break;
       throw engineError("syntax_error", `expected ',' or ')', found ${tok.kind}`);
     }
-    return { kind: "createIndex", name, table, db, keys, unique, using };
+    // An optional trailing `WHERE predicate` makes the index PARTIAL (indexes.md §9). `where` is
+    // recognized positionally after the closing `)` (non-reserved); its text is captured for the
+    // canonical persisted form (like CHECK/DEFAULT).
+    let predicate: { text: string; expr: Expr } | undefined;
+    if (this.peekKeyword() === "where") {
+      this.advance();
+      const start = this.pos;
+      const expr = this.parseExpr();
+      predicate = { text: renderTokens(this.tokens.slice(start, this.pos)), expr };
+    }
+    return { kind: "createIndex", name, table, db, keys, unique, using, predicate };
   }
 
   // parseIndexElement parses one `index_element` (grammar.md §30, indexes.md §1): a bare column,

@@ -3556,6 +3556,9 @@ fn catalog_rel_table(kind: SrfKind) -> Box<Table> {
                 text_arr("columns", true),
                 col("is_unique", ScalarType::Bool, true),
                 col("method", ScalarType::Text, true),
+                // A partial index's predicate canonical text; NULL for a non-partial index
+                // (indexes.md §9, introspection.md §5.1).
+                col("predicate", ScalarType::Text, false),
             ],
         ),
         // SrfKind::JedConstraints

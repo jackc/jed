@@ -241,6 +241,14 @@ func (db *engine) buildIndexAccessPredicate(filter *rExpr, rel scopeRel, idx ind
 	if err != nil {
 		return nil
 	}
+	// A PARTIAL index holds only its qualifying rows (indexes.md §9), so it is usable ONLY when the
+	// query's WHERE implies the index predicate. jed's test is syntactic (PG's, not a prover): the
+	// WHERE AND-chain must contain a conjunct STRUCTURALLY EQUAL to the resolved predicate. A miss
+	// yields no bound — a correct full scan. (The resolved predicate is in table-local column coords;
+	// a WHERE conjunct is global, so it is matched shifted by rel.offset.)
+	if rindex.Predicate != nil && !filterImpliesPredicate(filter, rindex.Predicate, rel.offset) {
+		return nil
+	}
 	var eqCols []indexEqCol
 	var rangeType scalarType
 	var rangeTerms []boundTerm
@@ -396,6 +404,12 @@ func detectScanBound(filter *rExpr, rel scopeRel, db *engine) *scanBound {
 	}
 	for _, idx := range rel.table.Indexes {
 		if idx.Kind != indexBtree {
+			continue
+		}
+		// A PARTIAL index is not used for the OR/IN point-set this slice (indexes.md §9): the merged
+		// point-lookup path carries no predicate-implication gate, so it stays non-partial (a
+		// follow-on) — falling through leaves a correct full scan.
+		if idx.Predicate != nil {
 			continue
 		}
 		// The OR/IN merged-point-lookup bound is column-only this slice (an expression index takes
@@ -1542,9 +1556,49 @@ func rexprEqShifted(a, b *rExpr, offset int) bool {
 		// regime, identical at index-build and query-eval), so the match is sound: same direction
 		// + a matching argument.
 		return a.casingUpper == b.casingUpper && rexprEqShifted(a.operand, b.operand, offset)
+	case reCompare:
+		// A comparison (status = 'active', amt > 0) is the canonical partial-index predicate shape
+		// (indexes.md §9): same operator + same derived collation + structurally-equal operands.
+		return a.op == b.op && collationsEqual(a.collation, b.collation) &&
+			rexprEqShifted(a.lhs, b.lhs, offset) && rexprEqShifted(a.rhs, b.rhs, offset)
+	case reAnd, reOr:
+		return rexprEqShifted(a.lhs, b.lhs, offset) && rexprEqShifted(a.rhs, b.rhs, offset)
+	case reIsNull:
+		return a.negated == b.negated && rexprEqShifted(a.operand, b.operand, offset)
 	default:
 		return false
 	}
+}
+
+// collationsEqual reports whether two derived collations are the same (both nil / C, or both a
+// loaded collation of the same name) — used to compare comparison nodes in rexprEqShifted.
+func collationsEqual(a, b *Collation) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Name == b.Name
+}
+
+// filterImpliesPredicate reports whether the WHERE filter implies a PARTIAL index's predicate
+// (spec/design/indexes.md §9). jed's syntactic test (PG's, not a prover): every top-level conjunct
+// of pred must be present as a top-level conjunct of filter (so a conjunctive predicate a AND b is
+// implied by a WHERE that lists both a and b). pred is in table-local column coords; a filter
+// conjunct is global, so it is matched shifted by offset. Sound-if-conservative: a miss means the
+// index is not used (a correct full scan + residual filter).
+func filterImpliesPredicate(filter, pred *rExpr, offset int) bool {
+	if pred.kind == reAnd {
+		return filterImpliesPredicate(filter, pred.lhs, offset) &&
+			filterImpliesPredicate(filter, pred.rhs, offset)
+	}
+	// filter contains a top-level conjunct structurally equal to pred.
+	var contains func(f *rExpr) bool
+	contains = func(f *rExpr) bool {
+		if f.kind == reAnd {
+			return contains(f.lhs) || contains(f.rhs)
+		}
+		return rexprEqShifted(f, pred, offset)
+	}
+	return contains(filter)
 }
 
 // asBoundTerm recognizes a single comparison conjunct: a comparison (=,<,<=,>,>=) whose one side

@@ -245,6 +245,18 @@ type createIndex struct {
 	// database (`main` / `temp` / a host attachment), and its store is registered into the owning
 	// snapshot. nil for a bare (implicit-scope) table name.
 	DB *string
+	// Predicate is the optional `WHERE predicate` making the index PARTIAL (spec/design/indexes.md
+	// §9): only rows whose predicate is TRUE are indexed. nil for an ordinary (full) index. It
+	// carries the predicate's canonical text + parsed AST the executor re-resolves against the
+	// table's columns, as a CHECK / expression key does.
+	Predicate *indexPredicate
+}
+
+// indexPredicate is a partial-index predicate (spec/design/indexes.md §9): its persisted canonical
+// text + parsed (unresolved) AST — re-resolved against the table per statement, like a CHECK.
+type indexPredicate struct {
+	Text string
+	Expr exprNode
 }
 
 // DropIndex is a DROP INDEX <name> statement — remove one secondary index

@@ -1726,7 +1726,12 @@ pub(crate) fn resolve_arbiter(
             for (i, def) in tdef.indexes.iter().enumerate() {
                 // A conflict-target COLUMN list matches only a plain-column unique index (an
                 // expression unique index is arbitrated by `ON CONSTRAINT <name>` — upsert.md §3).
+                // A PARTIAL unique index is NOT matched by a bare column list (PostgreSQL requires
+                // the predicate to be restated — `ON CONFLICT (amt) WHERE …`, a deferred upsert
+                // follow-on, indexes.md §9): so a column target that only a partial index covers
+                // reports "no matching arbiter", agreeing with PG.
                 if def.unique
+                    && def.predicate.is_none()
                     && def.column_ordinals().is_some_and(|c| {
                         c.into_iter().collect::<std::collections::BTreeSet<_>>() == want
                     })

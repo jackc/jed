@@ -274,11 +274,20 @@ impl Snapshot {
                 // The realign runs on a Snapshot with no Engine to evaluate an expression key; an
                 // expression index is C-collated so its keys never change on a collation upgrade,
                 // but a pk_skewed re-key moves its suffix — that (rare) rebuild is unsupported here
-                // (0A000; drop the expression index, upgrade, recreate — indexes.md §7).
+                // (0A000; drop the expression index, upgrade, recreate — indexes.md §7). A PARTIAL
+                // index likewise needs the Engine to evaluate its predicate per row, so the realign
+                // bails the same way (indexes.md §9).
                 if def.column_ordinals().is_none() {
                     return Err(EngineError::new(
                         SqlState::FeatureNotSupported,
                         "collation upgrade of a table with an expression index is not supported yet"
+                            .to_string(),
+                    ));
+                }
+                if def.predicate.is_some() {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "collation upgrade of a table with a partial index is not supported yet"
                             .to_string(),
                     ));
                 }

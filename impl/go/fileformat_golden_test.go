@@ -130,6 +130,20 @@ func exprIndexTableDB(t *testing.T) *Session {
 	return db
 }
 
+// partialIndexTableDB has PARTIAL index predicates (v27 — the index_flags bit1 + the canonical
+// predicate text after index_root_page, indexes.md §9): a plain partial index t_amt_idx and a
+// UNIQUE partial index t_uact (both WHERE status = 'active') beside a non-partial t_status_idx
+// (bit1 clear, byte-identical to v26). The table is EMPTY (all three trees empty, root 0). Must
+// match verify.rb's PARTIAL_INDEX_TABLE.
+func partialIndexTableDB(t *testing.T) *Session {
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, status text, amt i32)")
+	run(t, db, "CREATE INDEX ON t (amt) WHERE status = 'active'")
+	run(t, db, "CREATE UNIQUE INDEX t_uact ON t (amt) WHERE status = 'active'")
+	run(t, db, "CREATE INDEX ON t (status)")
+	return db
+}
+
 // uniqueTableDB has UNIQUE indexes (v6 — the per-index flags byte, indexes.md §8):
 // t_v_key (a UNIQUE constraint's auto-name) over a nullable column holding two NULLs
 // (NULLS DISTINCT — both stored), the named two-column constraint wv, a CREATE UNIQUE
@@ -917,6 +931,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"index_table.jed", indexTableDB},
 		{"unique_table.jed", uniqueTableDB},
 		{"expr_index_table.jed", exprIndexTableDB},
+		{"partial_index_table.jed", partialIndexTableDB},
 		{"gin_array_table.jed", ginArrayTableDB},
 		{"gin_uuid_table.jed", ginUuidTableDB},
 		{"fk_table.jed", fkTableDB},
@@ -991,6 +1006,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"index_table.jed", indexTableDB, "t"},
 		{"unique_table.jed", uniqueTableDB, "t"},
 		{"expr_index_table.jed", exprIndexTableDB, "t"},
+		{"partial_index_table.jed", partialIndexTableDB, "t"},
 		{"gin_array_table.jed", ginArrayTableDB, "t"},
 		{"gin_uuid_table.jed", ginUuidTableDB, "t"},
 		{"fk_table.jed", fkTableDB, "c"},

@@ -150,6 +150,20 @@ function exprIndexTableDB(): Engine {
   return db;
 }
 
+// partialIndexTableDB has PARTIAL index predicates (v27 — the index_flags bit1 + the canonical
+// predicate text after index_root_page, indexes.md §9): a plain partial index t_amt_idx and a UNIQUE
+// partial index t_uact (both WHERE status = 'active') beside a non-partial t_status_idx (bit1 clear,
+// byte-identical to v26). The table is EMPTY (all three trees empty, root 0). Must match verify.rb's
+// PARTIAL_INDEX_TABLE.
+function partialIndexTableDB(): Engine {
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, status text, amt i32)");
+  run(db, "CREATE INDEX ON t (amt) WHERE status = 'active'");
+  run(db, "CREATE UNIQUE INDEX t_uact ON t (amt) WHERE status = 'active'");
+  run(db, "CREATE INDEX ON t (status)");
+  return db;
+}
+
 // fkTableDB has FOREIGN KEY constraints (v11 — spec/design/constraints.md §6): pins the catalog
 // foreign-key list. Parent `p` (a PK + two UNIQUE constraints, the FK targets); child `c` with
 // four FKs covering every shape — a named FK to the UNIQUE column (c_code_fk), a self-reference to
@@ -927,6 +941,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "index_table.jed", build: indexTableDB },
     { name: "unique_table.jed", build: uniqueTableDB },
     { name: "expr_index_table.jed", build: exprIndexTableDB },
+    { name: "partial_index_table.jed", build: partialIndexTableDB },
     { name: "gin_array_table.jed", build: ginArrayTableDB },
     { name: "gin_uuid_table.jed", build: ginUuidTableDB },
     { name: "fk_table.jed", build: fkTableDB },
@@ -997,6 +1012,7 @@ test("read goldens reproduces rows", () => {
     { name: "index_table.jed", build: indexTableDB, table: "t" },
     { name: "unique_table.jed", build: uniqueTableDB, table: "t" },
     { name: "expr_index_table.jed", build: exprIndexTableDB, table: "t" },
+    { name: "partial_index_table.jed", build: partialIndexTableDB, table: "t" },
     { name: "gin_array_table.jed", build: ginArrayTableDB, table: "t" },
     { name: "gin_uuid_table.jed", build: ginUuidTableDB, table: "t" },
     { name: "fk_table.jed", build: fkTableDB, table: "c" },

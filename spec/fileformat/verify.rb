@@ -25,7 +25,11 @@
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 26 # format_version 26: expression index keys (indexes.md §1/§6) — a per-index key element
+VERSION = 27 # format_version 27: partial-index predicates (indexes.md §9) — the per-index index_flags
+# byte gains bit1 has_predicate, and (only when set) a u16 length + canonical predicate text follows
+# index_root_page (a fixture writes it as `predicate: "<text>"`). B-tree only. A non-partial index is
+# byte-identical to v26, so a file with no partial index moves to v27 only by its version byte + meta CRC.
+# format_version 26: expression index keys (indexes.md §1/§6) — a per-index key element
 # is a u16 column ordinal OR the 0xFFFF sentinel + u16 length + canonical expression text (a fixture
 # writes it as `{ expr: "<text>" }`). Only the index-list changes; a plain column index is byte-identical
 # to v6, so a file with no expression index moves to v26 only by its version byte + meta CRC.
@@ -700,6 +704,27 @@ EXPR_INDEX_TABLE = {
   rows: []
 }.freeze
 
+# A table with PARTIAL index predicates (v27 — indexes.md §9): pins the index_flags bit1 + the
+# canonical predicate text after index_root_page. A plain partial index (`t_amt_idx`, cols [2],
+# WHERE status = 'active') beside a UNIQUE partial index (`t_uact`, cols [2], unique, same predicate)
+# and a NON-partial index (`t_status_idx`, cols [1], bit1 clear — byte-identical to v26). The table is
+# EMPTY (no rows), so all three trees are empty (root 0) — the fixture isolates the v27 catalog change.
+# Indexes in ascending lowercased-name order (t_amt_idx < t_status_idx < t_uact). The cores build this via
+#   CREATE TABLE t (id i32 PRIMARY KEY, status text, amt i32);
+#   CREATE INDEX ON t (amt) WHERE status = 'active';
+#   CREATE UNIQUE INDEX t_uact ON t (amt) WHERE status = 'active';
+#   CREATE INDEX ON t (status);
+PARTIAL_INDEX_TABLE = {
+  name: "t",
+  columns: [col("id", "i32", pk: true), col("status", "text"), col("amt", "i32")],
+  indexes: [
+    { name: "t_amt_idx", cols: [2], predicate: "status = 'active'" },
+    { name: "t_status_idx", cols: [1] },
+    { name: "t_uact", cols: [2], unique: true, predicate: "status = 'active'" }
+  ],
+  rows: []
+}.freeze
+
 # A table with ARRAY (T[]) columns (v10 — spec/design/array.md): pins the catalog array-column
 # entry (type_code 15 + the element-type descriptor, §3) and the compact value body (§4). Two
 # array columns — an i32[] (fixed-width elements: NO per-element length prefix) and a text[]
@@ -1173,6 +1198,7 @@ FIXTURES = [
   { file: "index_table.jed", page_size: 256, tables: [INDEX_TABLE] },
   { file: "unique_table.jed", page_size: 256, tables: [UNIQUE_TABLE] },
   { file: "expr_index_table.jed", page_size: 256, tables: [EXPR_INDEX_TABLE] },
+  { file: "partial_index_table.jed", page_size: 256, tables: [PARTIAL_INDEX_TABLE] },
   { file: "gin_array_table.jed", page_size: 256, tables: [GIN_ARRAY_TABLE] },
   { file: "gin_uuid_table.jed", page_size: 256, tables: [GIN_UUID_TABLE] },
   { file: "fk_table.jed", page_size: 256, tables: FK_TABLE[:tables] },
@@ -1806,10 +1832,13 @@ def table_entry_bytes(table, root_data_page, index_roots)
         out << u16(c)
       end
     end
-    out << [ix[:unique] ? 1 : 0].pack("C")
+    # index_flags: bit0 unique (v6), bit1 has_predicate (v27 — a partial index, indexes.md §9).
+    out << [(ix[:unique] ? 1 : 0) | (ix[:predicate] ? 2 : 0)].pack("C")
     # v13: index_kind byte (0 = btree, 1 = GIN); v20: 2 = GiST (gist.md §8).
     out << [{ "gin" => 1, "gist" => 2 }.fetch(ix[:kind], 0)].pack("C")
     out << u32(index_roots[k])
+    # v27: a partial index's predicate canonical text (u16 len + UTF-8) after index_root_page.
+    out << u16(ix[:predicate].bytesize) << ix[:predicate].b if ix[:predicate]
   end
   # Foreign keys (v11): count, then per FK the name, the local-column ordinals (into THIS table,
   # list order), the referenced table name, the referenced-column ordinals (into the PARENT
@@ -2993,13 +3022,22 @@ def decode_table_entry(buf, pos)
       end
     end
     fb, pos = take(buf, pos, 1)
-    raise "reserved index flag set (only bit0 unique is defined — v6)" if (fb.getbyte(0) & ~0b01) != 0
+    # bit0 unique (v6), bit1 has_predicate (v27 — a partial index, indexes.md §9).
+    raise "reserved index flag set (only bit0 unique / bit1 has_predicate defined)" if (fb.getbyte(0) & ~0b11) != 0
     kb, pos = take(buf, pos, 1) # v13: index_kind byte (0 = btree, 1 = GIN); v20: 2 = GiST
     raise "reserved index kind (only 0=btree, 1=gin, 2=gist defined — v20)" if kb.getbyte(0) > 2
+    has_predicate = (fb.getbyte(0) & 0b10) != 0
+    raise "a non-btree index cannot be partial (v27)" if has_predicate && kb.getbyte(0) != 0
     rb, pos = take(buf, pos, 4)
+    # v27: the partial-index predicate canonical text follows index_root_page when bit1 is set.
+    predicate = nil
+    if has_predicate
+      pl, pos = take(buf, pos, 2)
+      predicate, pos = take(buf, pos, pl.unpack1("n"))
+    end
     indexes << { name: iname, cols: cols, unique: (fb.getbyte(0) & 1) != 0,
                  kind: { 1 => "gin", 2 => "gist" }.fetch(kb.getbyte(0), "btree"),
-                 root_page: rb.unpack1("N") }
+                 root_page: rb.unpack1("N"), predicate: predicate }
   end
   # Foreign keys (v11): name + local ordinals + referenced table + referenced ordinals + the
   # actions byte, in name order. An FK owns no B-tree (no root page).

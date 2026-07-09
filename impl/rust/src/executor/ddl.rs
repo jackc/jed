@@ -859,6 +859,7 @@ impl Engine {
                     keys: cols.into_iter().map(IndexKey::Column).collect(),
                     unique: true,
                     kind: IndexKind::Btree,
+                    predicate: None,
                 },
             );
         }
@@ -1193,6 +1194,7 @@ impl Engine {
                     keys: indices.into_iter().map(IndexKey::Column).collect(),
                     unique: false,
                     kind: IndexKind::Gist,
+                    predicate: None,
                 },
             );
             table.exclusions.push(ExclusionConstraint {
@@ -1401,11 +1403,26 @@ impl Engine {
                 }
             }
         }
+        // A partial index's predicate (indexes.md §9), re-resolved against the table's columns — it
+        // was validated boolean + immutable at CREATE INDEX, so this cannot newly fail (a
+        // `Forbidden` re-resolve of an aggregate/window/param/subquery-free boolean is inert).
+        let predicate = match &def.predicate {
+            None => None,
+            Some(p) => {
+                let scope = Scope::single(self, table);
+                Some(resolve_boolean_filter(
+                    &scope,
+                    &p.expr,
+                    &mut ParamTypes::default(),
+                )?)
+            }
+        };
         Ok(ResolvedIndex {
             name: def.name.clone(),
             unique: def.unique,
             kind: def.kind,
             keys,
+            predicate,
         })
     }
 
@@ -1935,6 +1952,48 @@ impl Engine {
                 ),
             ));
         }
+        // The optional `WHERE predicate` making the index PARTIAL (spec/design/indexes.md §9): a
+        // boolean expression over the table's own columns, validated with PG-agreeing codes. B-tree
+        // only this slice (a partial GIN/GiST index is a follow-on). Validated after the key elements
+        // (PG resolves the key list first) and stored as canonical text (format_version 27).
+        let predicate: Option<IndexKeyExpr> = match &ci.predicate {
+            None => None,
+            Some(pred) => {
+                if kind != IndexKind::Btree {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        format!(
+                            "a partial (WHERE) {} index is not supported yet",
+                            ci.using.as_deref().unwrap_or("")
+                        ),
+                    ));
+                }
+                // Structural pre-walk: a subquery is 0A000 and a bind parameter 42P02 (both admitted
+                // by the resolver, so caught here). The aggregate 42803 / window 42P20 / non-boolean
+                // 42804 rejections then fall out of the Forbidden-context boolean resolve below.
+                reject_index_predicate_structure(&pred.expr)?;
+                let scope = Scope::single(self, table);
+                let _node = resolve_boolean_filter(&scope, &pred.expr, &mut ParamTypes::default())?;
+                // Immutability (§9), the same rule an expression key carries: a non-immutable
+                // seam/clock/sequence call, or a session-timezone-dependent subexpression (one that
+                // references a `timestamptz` column or produces a `timestamptz` value — conservatively
+                // fail-closed), is 42P17.
+                let refs = check_referenced_columns(&pred.expr, &columns);
+                let tz_hazard = refs
+                    .iter()
+                    .any(|&i| columns[i].ty.as_scalar() == Some(ScalarType::Timestamptz));
+                if index_expr_nonimmutable_call(&pred.expr) || tz_hazard {
+                    return Err(EngineError::new(
+                        SqlState::InvalidObjectDefinition,
+                        "functions in index predicate must be marked IMMUTABLE".to_string(),
+                    ));
+                }
+                Some(IndexKeyExpr {
+                    expr_text: pred.text.clone(),
+                    expr: pred.expr.clone(),
+                })
+            }
+        };
         // `relation_taken` checks the namespace of the target scope: an attachment's OWN snapshot for an
         // attached table (each attached database is an independent namespace, §3), else the temp-aware
         // implicit namespace.
@@ -1986,6 +2045,7 @@ impl Engine {
             keys: ci_keys,
             unique: ci.unique,
             kind,
+            predicate,
         };
         // The build scan (cost.md §3): page_read per table-tree node + storage_row_read per
         // row. The touched set is the columns the key elements read — an index column for a
@@ -2004,6 +2064,14 @@ impl Engine {
                         mask[c] = true;
                     }
                 }
+            }
+        }
+        // A partial index's predicate is evaluated per row during the build (indexes.md §9), so the
+        // columns it references join the touched set — the scan reads (and, if spilled, decompresses)
+        // them, keeping the build cost deterministic and cross-core identical.
+        if let Some(pred) = &def.predicate {
+            for c in check_referenced_columns(&pred.expr, &columns) {
+                mask[c] = true;
             }
         }
         // Resolve the index once (column ordinals + resolved expression keys); the eval env for any
@@ -2590,6 +2658,156 @@ mod expr_index_tests {
         assert!(
             s.contains("lower"),
             "columns should carry the expression text: {s}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod partial_index_tests {
+    //! Partial-index behaviors the shared corpus cannot express (a PG divergence — jed's syntactic
+    //! implication + timestamptz hazard; on-disk byte round-trip; catalog introspection). The
+    //! PG-agreeing behavior (23505 among qualifying rows, error codes, planner rows) lives in the
+    //! corpus (spec/conformance/suites/ddl/partial_index.test).
+    use crate::{Engine, Outcome, execute};
+
+    fn rows(db: &mut Engine, sql: &str) -> Vec<Vec<crate::Value>> {
+        match execute(db, sql).expect(sql) {
+            Outcome::Query { rows, .. } => rows,
+            other => panic!("expected a query, got {other:?} for {sql}"),
+        }
+    }
+
+    // A UNIQUE partial index constrains ONLY its qualifying rows (indexes.md §9): two `active` rows
+    // may not share `amt`, but an `inactive` row may duplicate an `active` one. Survives reload (v27).
+    #[test]
+    fn partial_unique_constrains_only_qualifying_and_persists() {
+        let mut db = Engine::new();
+        execute(
+            &mut db,
+            "CREATE TABLE pt (id i32 PRIMARY KEY, status text, amt i32)",
+        )
+        .unwrap();
+        execute(&mut db, "INSERT INTO pt VALUES (1, 'active', 10)").unwrap();
+        execute(
+            &mut db,
+            "CREATE UNIQUE INDEX pt_uact ON pt (amt) WHERE status = 'active'",
+        )
+        .unwrap();
+        // An inactive row may duplicate the active amt=10 (it is not in the index).
+        execute(&mut db, "INSERT INTO pt VALUES (2, 'inactive', 10)").unwrap();
+        // A second active amt=10 collides (23505 names the partial index).
+        let e = execute(&mut db, "INSERT INTO pt VALUES (3, 'active', 10)").unwrap_err();
+        assert_eq!(e.code(), "23505", "two active rows may not share amt");
+        // Round-trip: the v27 catalog re-parses the predicate, and it still enforces + exempts.
+        let image = db.to_image(256, 1).unwrap();
+        let mut re = Engine::from_image(&image).unwrap();
+        execute(&mut re, "INSERT INTO pt VALUES (4, 'inactive', 10)")
+            .expect("inactive dup still allowed after reload");
+        let dup = execute(&mut re, "INSERT INTO pt VALUES (5, 'active', 10)").unwrap_err();
+        assert_eq!(dup.code(), "23505", "partial uniqueness survives reload");
+    }
+
+    // The planner uses a partial index ONLY when the WHERE contains the predicate conjunct
+    // (indexes.md §9) — the syntactic implication gate. EXPLAIN names it when gated, not otherwise.
+    #[test]
+    fn planner_gates_on_predicate_conjunct() {
+        let mut db = Engine::new();
+        execute(
+            &mut db,
+            "CREATE TABLE pt (id i32 PRIMARY KEY, status text, amt i32)",
+        )
+        .unwrap();
+        execute(
+            &mut db,
+            "INSERT INTO pt VALUES (1,'active',10),(2,'inactive',10),(3,'active',30)",
+        )
+        .unwrap();
+        execute(
+            &mut db,
+            "CREATE INDEX pt_amt_active ON pt (amt) WHERE status = 'active'",
+        )
+        .unwrap();
+        let plan = |db: &mut Engine, sql: &str| match execute(db, sql).unwrap() {
+            Outcome::Query { rows, .. } => rows
+                .iter()
+                .map(|r| format!("{:?}", r[2]))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => unreachable!(),
+        };
+        // Gated: the WHERE contains `status = 'active'` (the predicate), so the index is used.
+        let gated = plan(
+            &mut db,
+            "EXPLAIN SELECT id FROM pt WHERE status = 'active' AND amt = 10",
+        );
+        assert!(
+            gated.contains("pt_amt_active"),
+            "gated plan should use the partial index:\n{gated}"
+        );
+        // Ungated: no predicate conjunct → full scan (the index is NOT named).
+        let ungated = plan(&mut db, "EXPLAIN SELECT id FROM pt WHERE amt = 10");
+        assert!(
+            !ungated.contains("pt_amt_active"),
+            "ungated plan must NOT use the partial index:\n{ungated}"
+        );
+        // Rows are correct either way (the residual filter re-applies the full WHERE).
+        let ids: Vec<i64> = rows(
+            &mut db,
+            "SELECT id FROM pt WHERE status = 'active' AND amt = 10",
+        )
+        .iter()
+        .map(|r| match r[0] {
+            crate::Value::Int(n) => n,
+            _ => panic!(),
+        })
+        .collect();
+        assert_eq!(ids, vec![1], "only the active amt=10 row");
+    }
+
+    // A timestamptz-referencing predicate is conservatively 42P17 (the session-tz hazard, extended
+    // from expression keys — a documented jed divergence, indexes.md §9). A non-boolean predicate is
+    // 42804; a partial GIN index is 0A000.
+    #[test]
+    fn predicate_rejections() {
+        let mut db = Engine::new();
+        execute(
+            &mut db,
+            "CREATE TABLE t (id i32 PRIMARY KEY, ts timestamptz, a i32, arr i32[])",
+        )
+        .unwrap();
+        let tz = execute(&mut db, "CREATE INDEX ON t (a) WHERE ts IS NULL").unwrap_err();
+        assert_eq!(tz.code(), "42P17", "timestamptz predicate rejected");
+        let nb = execute(&mut db, "CREATE INDEX ON t (a) WHERE a").unwrap_err();
+        assert_eq!(nb.code(), "42804", "non-boolean predicate rejected");
+        let gin = execute(&mut db, "CREATE INDEX ON t USING gin (arr) WHERE a > 0").unwrap_err();
+        assert_eq!(gin.code(), "0A000", "partial gin index rejected");
+    }
+
+    // jed_indexes surfaces a partial index's predicate canonical text; NULL for a non-partial index.
+    #[test]
+    fn introspection_shows_predicate() {
+        let mut db = Engine::new();
+        execute(
+            &mut db,
+            "CREATE TABLE t (id i32 PRIMARY KEY, s text, a i32)",
+        )
+        .unwrap();
+        execute(&mut db, "CREATE INDEX ipart ON t (a) WHERE s = 'x'").unwrap();
+        execute(&mut db, "CREATE INDEX ifull ON t (a)").unwrap();
+        let r = rows(
+            &mut db,
+            "SELECT predicate FROM jed_indexes WHERE name = 'ipart'",
+        );
+        assert_eq!(r.len(), 1);
+        let s = format!("{:?}", r[0][0]);
+        assert!(s.contains('x'), "predicate should carry the text: {s}");
+        let f = rows(
+            &mut db,
+            "SELECT predicate FROM jed_indexes WHERE name = 'ifull'",
+        );
+        assert!(
+            matches!(f[0][0], crate::Value::Null),
+            "a non-partial index has NULL predicate"
         );
     }
 }

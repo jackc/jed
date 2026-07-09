@@ -9,7 +9,7 @@
 # jed_columns.pk_ordinal. Resolution / qualifier scoping / read-only rejection / privileges / cost
 # are the same model as jed_tables (pinned there). jed-specific, so CROSS-CORE-checked, NOT
 # PostgreSQL-oracle-checked.
-# requires: introspect.indexes, introspect.tables, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.unique, ddl.exclusion_constraint, ddl.drop_table, dml.insert, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.cte, query.join_inner, query.qualified_table, query.explain, query.aggregates, session.privileges, resource.cost_metering, types.i32, types.text, types.range
+# requires: introspect.indexes, introspect.tables, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.unique, ddl.index_partial, ddl.exclusion_constraint, ddl.drop_table, dml.insert, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.cte, query.join_inner, query.qualified_table, query.explain, query.aggregates, session.privileges, resource.cost_metering, types.i32, types.text, types.range
 
 # --- an empty database lists no indexes (catalog relations are not themselves indexes) ------------
 
@@ -137,6 +137,37 @@ t
 2
 u
 1
+
+# --- the predicate column: a partial index shows its canonical text, else NULL (indexes.md §9) ----
+
+statement ok
+CREATE TABLE p (id i32 PRIMARY KEY, status text, amt i32)
+
+statement ok
+CREATE INDEX p_amt_active ON p (amt) WHERE status = 'active'
+
+statement ok
+CREATE UNIQUE INDEX p_amt_uact ON p (amt) WHERE status = 'inactive'
+
+# a partial index renders its predicate text; a non-partial index (ix_bc on t) is NULL
+query TTB nosort
+SELECT name, predicate, is_unique FROM jed_indexes WHERE table_name = 'p' ORDER BY name
+----
+p_amt_active
+status = 'active'
+false
+p_amt_uact
+status = 'inactive'
+true
+
+query TT nosort
+SELECT name, predicate FROM jed_indexes WHERE name = 'ix_bc'
+----
+ix_bc
+NULL
+
+statement ok
+DROP TABLE p
 
 # --- read-only: every mutation / DDL target naming the relation is 42809 ------------------------
 

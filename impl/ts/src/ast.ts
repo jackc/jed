@@ -614,6 +614,10 @@ export type CreateIndex = {
   // The `USING <method>` access method as written, or undefined for the default ordered B-tree.
   // Resolved at execution: undefined/"btree" → B-tree, "gin" → GIN, else 42704 (gin.md §3).
   using: string | undefined;
+  // The optional `WHERE predicate` making the index PARTIAL (spec/design/indexes.md §9): only rows
+  // whose predicate is TRUE are indexed. undefined for an ordinary (full) index. It carries the
+  // predicate's canonical text + parsed AST the executor re-resolves against the table's columns.
+  predicate?: { text: string; expr: Expr };
 };
 
 // DropIndex is a DROP INDEX <name> statement — remove one secondary index

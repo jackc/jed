@@ -48,9 +48,15 @@ pub fn dump(db: &mut jed::Session, out: &mut dyn Write) -> io::Result<()> {
                     jed::tooling::IndexKey::Expr(e) => format!("({})", e.expr_text),
                 })
                 .collect();
+            // A PARTIAL index appends its WHERE predicate (canonical text, indexes.md §9) so a
+            // replay rebuilds the same partial index; a full index has none.
+            let where_clause = match &idx.predicate {
+                Some(p) => format!(" WHERE {}", p.expr_text),
+                None => String::new(),
+            };
             writeln!(
                 out,
-                "CREATE {unique}INDEX {} ON {} ({});",
+                "CREATE {unique}INDEX {} ON {} ({}){where_clause};",
                 idx.name,
                 table.name,
                 cols.join(", ")
@@ -153,6 +159,7 @@ mod tests {
                 CONSTRAINT score_pos CHECK (score >= 0)
              )",
             "CREATE INDEX users_age_idx ON users (age)",
+            "CREATE INDEX users_ok_idx ON users (age) WHERE ok",
             "INSERT INTO users (id, age, name, blob) VALUES (2, 30, 'it''s bob', '\\x6869')",
             "INSERT INTO users (id, age, name, score) VALUES (1, 40, 'alice', 9.50)",
             "CREATE TABLE nopk (v i64)",
@@ -187,6 +194,7 @@ mod tests {
              INSERT INTO users VALUES (2, 30, 'it''s bob', 0.50, true, 2, '\\x6869');\n\
              CREATE INDEX users_age_idx ON users (age);\n\
              CREATE UNIQUE INDEX users_age_key ON users (age);\n\
+             CREATE INDEX users_ok_idx ON users (age) WHERE ok;\n\
              COMMIT;\n"
         );
     }
