@@ -295,10 +295,10 @@ still-open reader on an older snapshot would observe a recycled page. P6.2's fir
 **reconstructs the free-list on open** (the file's dead pages = `[2, page_count)` minus the
 committed root's reachable set) and reuses them during the session; every such page was already
 dead at the opened committed version, and a single file-backed handle has
-`oldest_live_txid == committed.txid`, so the gate holds **trivially**. It becomes load-bearing in
-the deferred follow-on — *continuous* within-session reclamation paired with file-backed reader
-sharing — where a just-orphaned page (last referenced by version `T`) must stay out of the
-free-list until `oldest_live_txid > T`.
+`oldest_live_txid == committed.txid`, so the gate holds **trivially**. It became load-bearing when
+*continuous* within-session reclamation paired with file-backed reader sharing landed — a just-orphaned
+page (reachable at version `T`) must stay out of reuse until `oldest_live_txid ≥ T+1` — and is now
+enforced by the free-list generation gate (below).
 
 **Within-session reclamation has landed for temp domains (the watermark is now load-bearing there).**
 The temp-blockstore slice ([temp-tables.md §6](temp-tables.md)) routes session-local temp stores onto a
@@ -307,9 +307,10 @@ the free-list *within the session* at commit (`maybe_compact`), and that reuse i
 watermark: `oldest_live_version(new_txid) == new_txid` (no live reader or streaming cursor pins an older
 version), deferring compaction while a pin is held. This is the same coupling the general file
 follow-on will need, exercised first on a surface with **no cross-core byte contract** (a temp store is
-never serialized, so its physical page layout is per-core). The **file/in-memory main** domain keeps
-reconstruct-on-open only (`reclaim_within_session` false); the mechanism is built generically so it can
-opt in later.
+never serialized, so its physical page layout is per-core). The **file/in-memory main** domain **has since
+opted in** — continuous within-session reclamation landed with on-disk free-list persistence
+(`format_version` 25): the file main reclaims **in-commit** (`plan_free_list`), the in-memory main
+**post-commit** (`maybe_compact`), and both **reuse** the free-list under the watermark gate below.
 
 **The watermark lives on the `Database` core (§10).** A lone `Engine` (the single-threaded handle a
 session owns privately) has only one live snapshot at a time (`committed`, or an open tx's
@@ -322,18 +323,40 @@ order-independent, so no hash-map iteration order leaks into it (CLAUDE.md §8).
 assert it tracks pinned readers (a reader pinning an old version holds the watermark back; closing it
 lets the watermark advance).
 
-**The convergence keeps the gate trivially satisfied; active gating waits for continuous reclamation**
-([session.md §2.4](session.md), §10 slice 7c — ✅ landed). Slice 7c shipped concurrent file-backed
-sessions, but the commit allocator still reuses **only the reconstruct-on-open free-list** (it does
-not re-add a page orphaned mid-session). Every reconstruct-on-open page was already dead at the opened
-committed version, which is **older than any live reader's pin** (a reader pins ≥ the version it
-opened at), so reuse can never recycle a page a live reader observes — the gate holds **trivially**,
-with concurrent readers or without. The watermark becomes *load-bearing* only in the still-deferred
-follow-on — **continuous within-session reclamation**, where a page orphaned at commit `T` re-enters
-the free-list and must stay out until `oldest_live_txid > T`; there the commit allocator will consult
-this registry before reusing such a page. (The watermark is tracked and asserted now — the per-core
-tests show it tracking pinned readers — so the follow-on is a free-list-allocator change, not a
-retrofit of liveness tracking.)
+**The watermark is now load-bearing: the free-list reuse gate (✅ landed).** With continuous
+within-session reclamation, the commit allocator DOES re-add mid-session orphans, so the gate is no
+longer trivially satisfied — a page reachable at a live reader's pinned version can enter the reusable
+free-list, and reusing it would recycle a page that reader still observes (a snapshot-isolation
+violation). Two mechanisms, in every core (`shared`/`format`/`persist` — Go/Rust/TS), close it:
+
+- **Free-list generation gate (the reuse check).** Each storage tracks `free_gen_txid` — the version
+  the current free-list is "as of" (the last compaction's `txid`, or the committed version at open;
+  every page in the list is dead at that version). A commit **reuses** the free-list only when
+  `oldest_live_txid ≥ free_gen_txid` — no live reader pins a version older than the generation, so no
+  reader references any page in it. When the gate defers reuse, the commit allocates from the
+  high-water and the free-list waits (still persisted), reused as soon as the pins drain. The gate
+  covers **both** data-page reuse **and** the free-list **chain** pages (which overwrite in place: they
+  are torn-write-safe at the fallback snapshot but not reader-safe, so a deferred commit grows the
+  high-water for them too). With no reader pinning an older version (single-handle, reconstruct-on-open,
+  all readers current) `oldest_live_txid == committed`, the gate always passes, and the **on-disk byte
+  layout is byte-for-byte unchanged** — the gate only *defers* reuse under an older-pinning reader; it
+  never changes *which* pages a single-handle commit picks. So no `format_version` bump, and every
+  golden is identical.
+
+- **Atomic pin registration (the watermark can't be fooled).** A reader must not be invisible to the
+  gate in the window between reading the committed root and registering its pin: were it, a writer could
+  reclaim a version the reader is about to pin. So the load and the registration happen under one
+  acquisition of the live-registry lock (`pin_latest`), and **publish takes the same lock**, so a
+  reader either sees the new committed and pins it, or is counted at the old version — never missed.
+  (In the single-threaded TS core this is automatic — no thread can interleave mid-registration — so
+  only the reuse gate is needed there; Go and Rust make it explicit.)
+
+The **fallback reader** is the case that motivates both: a reader that loads the committed root in a
+writer's persist→publish window pins the *prior* version just as that commit's compaction places one of
+its pages into the reusable free-list. The generation gate defers reuse of that page while the reader is
+live; atomic registration guarantees the reader is counted. Each core has a deterministic regression
+test (a `AFTER_PERSIST_HOOK`-style seam pins the fallback reader, then reuse-commits hammer the pool)
+that fails "snapshot isolation violated" with the gate disabled and passes with it.
 
 ## 9. Durability: the `synchronous` setting, this slice vs. Phase 6
 

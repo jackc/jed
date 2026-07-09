@@ -37,9 +37,10 @@
 // host-independent incremental copy-on-write recipe (persistImpl), a no-op in-memory. Isolation comes
 // for free from the persistent (copy-on-write) stores (pmap.ts): a pinned snapshot is immutable and
 // shares structure with later versions, so pinning is a reference copy, faulting clean pages through
-// SharedPaging. Page reclamation stays watermark-safe trivially: the free-list is reconstruct-on-open
-// only (every reusable page was dead at the opened version); continuous within-session reclamation is
-// the deferred follow-on (transactions.md §8). No threads, so no concurrent-fault hazard (CLAUDE.md §2).
+// SharedPaging. Continuous within-session reclamation (v25) makes the watermark gate load-bearing:
+// free-list reuse is gated by freeGenTxid (a page dead at the list's generation is reused only once
+// oldest_live ≥ generation, transactions.md §8). No threads, so pin registration is already atomic — no
+// concurrent-fault hazard (CLAUDE.md §2); only the reuse gate is needed here.
 //
 // The host-facing single handle is Database (the back-compat bridge — §2.1): the shared core PLUS one
 // long-lived default Session, whose delegators (execute/query/begin/.../executeScript) drive that

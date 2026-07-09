@@ -44,11 +44,12 @@
 //! snapshot isolation comes for free from the persistent (copy-on-write) stores ([`crate::pmap`]):
 //! a pinned snapshot shares structure with later versions and is never mutated, so pinning is an
 //! `Arc` clone, not a deep copy, and a file-backed reader faults clean pages through the
-//! `Mutex`-guarded [`crate::paging::SharedPaging`] concurrently with the committing writer. Page
-//! reclamation stays watermark-safe **trivially**: the free-list is reconstruct-on-open only (every
-//! reusable page was already dead at the opened version, so it is older than any live reader's
-//! pinned version) — *continuous* within-session reclamation, where the watermark gate becomes
-//! load-bearing, is the deferred follow-on (transactions.md §8).
+//! `Mutex`-guarded [`crate::paging::SharedPaging`] concurrently with the committing writer.
+//! *Continuous* within-session reclamation (v25) makes the watermark gate **load-bearing**: free-list
+//! reuse is gated by `free_gen_txid` (a page dead at the list's generation is reused only once
+//! `oldest_live ≥ generation`), and reader pin registration is atomic with the snapshot load
+//! (`pin_latest`) with publish under the same lock, so the watermark can never miss a reader
+//! mid-registration (transactions.md §8).
 //!
 //! The host-facing single handle is [`Database`] (the back-compat bridge — §2.1): a `!Send` owned
 //! handle = the [`Database`] + one long-lived default [`Session`], whose delegators
@@ -204,10 +205,10 @@ pub(crate) struct Storage {
     page_size: u32,
     /// The on-disk high-water (page count) — advances as the file grows; persisted in the meta slot.
     page_count: u32,
-    /// The reconstruct-on-open free-list (P6.2, transactions.md §8): pages that were dead at the
-    /// opened committed version, reused lowest-first by the incremental commit allocator. Every entry
-    /// predates any live reader's pinned version, so reuse is trivially watermark-safe. A reclaim
-    /// domain (temp) additionally rebuilds this within-session ([`Storage::maybe_compact`]).
+    /// The free-list (P6.2 + v25, transactions.md §8): pages dead at the list's generation, reused
+    /// lowest-first by the incremental commit allocator. Reuse is gated on the reader-liveness watermark
+    /// by `free_gen_txid` — a page is reused only once no reader pins a version older than the generation.
+    /// The main file/in-memory domain rebuilds this within-session (v25 continuous reclamation); temp too.
     free_pages: Vec<u32>,
     /// The shared pager + bounded leaf buffer pool — one per file, shared by every store/snapshot.
     paging: Arc<crate::paging::SharedPaging>,
@@ -218,8 +219,8 @@ pub(crate) struct Storage {
     path: Option<std::path::PathBuf>,
     /// Turns on within-session free-list compaction ([`Storage::maybe_compact`]): the never-reopened
     /// in-RAM temp domains set it (temp-tables.md §6, bplus-reshape.md), so their copy-on-write orphans
-    /// are reclaimed rather than leaked. The main file/in-memory domain leaves it `false`
-    /// (reconstruct-on-open only).
+    /// are reclaimed rather than leaked. The main file/in-memory domain ALSO sets it (v25 — continuous
+    /// within-session reclamation); its within-session reuse is watermark-gated by `free_gen_txid` (§8).
     reclaim_within_session: bool,
     /// The reachable page count recorded at the last compaction — the cheap trigger basis: compaction
     /// re-runs only once the high-water passes ~2× it (periodic ~2× bound, no per-commit walk).

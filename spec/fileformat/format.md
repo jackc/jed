@@ -1299,13 +1299,20 @@ the new one no longer does. Two mechanisms recover them; through v24 only the fi
   without bound across sessions. A pure in-memory database (no meta, never reopened) gets this
   reclamation with no persistence.
 
-**The watermark (transactions.md §8).** A page freed at `txid T` is reusable only once
-`oldest_live_txid > T`. The within-session rebuild is **gated** on it: a page unreachable from the
-committed root may still be observed by a live reader (a streaming cursor) pinned to an older
-snapshot, so the rebuild is deferred while any reader pins a version older than the committed one
-(on an otherwise-idle single writer `oldest_live_txid == committed.txid` and the gate is a no-op).
-This is what makes the watermark load-bearing (through v24 the reconstruct-on-open list held only
-pages already dead at open, so the gate held trivially).
+**The watermark (transactions.md §8).** A page reachable at a live reader's pinned version must not be
+recycled, so **reuse** of the free-list is gated on the reader-liveness watermark. Each storage tracks
+`free_gen_txid` — the version the current free-list is "as of" (the last rebuild's `txid`, or the
+committed version at open); every page in the list is dead at that version. A commit reuses the list
+only when `oldest_live_txid ≥ free_gen_txid`; otherwise it allocates from the high-water and the list
+waits (still persisted). The gate covers **both** the data-page allocator **and** the free-list
+**chain** pages (which overwrite in place — torn-write-safe at the fallback snapshot, but not
+reader-safe). On an otherwise-idle single writer `oldest_live_txid == committed.txid ≥ free_gen_txid`,
+so the gate always passes and the on-disk bytes a single-handle commit writes are **unchanged** — the
+gate only *defers* reuse under an older-pinning reader, never changes *which* pages a commit picks.
+This is what makes the watermark load-bearing (through v24 the reconstruct-on-open list held only pages
+already dead at open, so the gate held trivially). Paired with **atomic pin registration** (a reader
+loads the committed root and registers its pin under one lock, and publish takes the same lock) so the
+watermark can never miss a reader mid-registration.
 
 **From-scratch image (`to_image`).** A clean, garbage-free image of a snapshot — used by
 `create`'s initial write and by the **golden tests / Ruby reference** — is the special case

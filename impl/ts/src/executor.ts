@@ -948,8 +948,9 @@ export class Engine {
   spillSink: SpillSink | null;
   // reclaimWithinSession turns on within-session free-list compaction (persist.ts maybeCompact): the
   // never-reopened in-RAM temp domains set it (temp-tables.md §6, bplus-reshape.md), so their
-  // copy-on-write orphans are reclaimed rather than leaked. The main file/in-memory domain leaves it
-  // false (reconstruct-on-open only). When TS models a "storage" it is an Engine, so this rides here.
+  // copy-on-write orphans are reclaimed rather than leaked. The main file/in-memory domain ALSO sets it
+  // (v25 continuous reclamation); its within-session reuse is watermark-gated by freeGenTxid (§8). When
+  // TS models a "storage" it is an Engine, so this rides here.
   reclaimWithinSession: boolean;
   // liveAtCompaction is the reachable page count recorded at the last compaction — the cheap trigger
   // basis: compaction re-runs only once the high-water passes ~2× it (periodic ~2× bound, no per-commit

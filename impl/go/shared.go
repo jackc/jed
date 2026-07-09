@@ -39,10 +39,11 @@ package jed
 // core packs the same dirty pages into its memoryBlockStore — one commit path). Readers' snapshot isolation comes for free from the persistent (copy-on-write)
 // stores (pmap.go): a pinned snapshot is immutable and shares structure with later versions, so
 // pinning is a pointer Load and readers concurrently reading it race-free, faulting clean pages
-// through the mutex-guarded sharedPaging alongside the committing writer. Page reclamation stays
-// watermark-safe trivially: the free-list is reconstruct-on-open only (every reusable page was dead
-// at the opened version, older than any live reader's pin); continuous within-session reclamation,
-// where the watermark gate becomes load-bearing, is the deferred follow-on (transactions.md §8).
+// through the mutex-guarded sharedPaging alongside the committing writer. Continuous within-session
+// reclamation (v25) makes the watermark gate LOAD-BEARING: the free-list reuse is gated by freeGenTxid
+// (a page dead at the list's generation is reused only once oldest_live ≥ generation), and reader pin
+// registration is atomic with the snapshot load (pinLatest) with publish under the same lock, so the
+// watermark can never miss a reader mid-registration (transactions.md §8).
 //
 // The host-facing single handle is *Database (the back-compat bridge — §2.1): the shared core PLUS
 // one long-lived default *Session, whose delegators (Execute/Query/Begin/.../ExecuteScript) drive
@@ -166,7 +167,8 @@ type storage struct {
 	paging *sharedPaging
 	// reclaimWithinSession turns on within-session free-list compaction (maybeCompact): the never-reopened
 	// in-RAM temp domains set it (temp-tables.md §6, bplus-reshape.md), so their copy-on-write orphans are
-	// reclaimed rather than leaked. The main file/in-memory domain leaves it false (reconstruct-on-open only).
+	// reclaimed rather than leaked. The main file/in-memory domain ALSO sets it (v25 — continuous
+	// within-session reclamation): its within-session reuse is watermark-gated by freeGenTxid (§8).
 	reclaimWithinSession bool
 	// liveAtCompaction is the reachable page count recorded at the last compaction — the cheap trigger basis:
 	// compaction re-runs only once the high-water passes ~2× it (periodic ~2× bound, no per-commit walk).
