@@ -243,7 +243,7 @@ func (db *engine) commitTx() (outcome, error) {
 			if att.isFile() {
 				// Advance the version for the alternating meta slot + reopen (like the main file commit).
 				ws.txid = db.attachedCommitted[name].txid + 1
-				if err := att.storage.commitDurable(ws, canReclaim); err != nil {
+				if err := att.storage.commitDurable(ws, canReclaim, true); err != nil {
 					return outcome{}, err
 				}
 				ws.demoteCleanLeaves() // post-commit residency flip (bplus-reshape.md B4), like Session.publish

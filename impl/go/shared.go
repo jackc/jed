@@ -56,6 +56,13 @@ import (
 	"sync/atomic"
 )
 
+// afterPersistHook is a test-only seam (nil in production, a single nil-check per commit): it fires in
+// publish() AFTER the durable persist but BEFORE the roots.Store, the window in which the just-committed
+// version is durable yet not yet published — so a reader that pins here still gets the PRIOR committed
+// version (the reuse-gate fallback-reader race, transactions.md §8). Used by the deterministic
+// pin-registration regression test; the fault-injection seam (pager.go) is the precedent.
+var afterPersistHook func()
+
 // roots is the published committed root (spec/design/transactions.md §2): the file Snapshot. Held in
 // an atomic.Pointer so a reader pins it with a lock-free Load and a writer publishes a new one with a
 // single Store — the §3 short commit window. A published snapshot is immutable, so concurrent readers
@@ -164,6 +171,14 @@ type storage struct {
 	// liveAtCompaction is the reachable page count recorded at the last compaction — the cheap trigger basis:
 	// compaction re-runs only once the high-water passes ~2× it (periodic ~2× bound, no per-commit walk).
 	liveAtCompaction uint32
+	// freeGenTxid is the version the current freePages list is "as of" — the last compaction's txid, or the
+	// committed version at open. It gates within-session reuse under the reader-liveness watermark
+	// (transactions.md §8): a page dead at generation G is safe to reuse only once no live reader pins a
+	// version older than G. commitDurable reuses the free-list only when oldest_live ≥ freeGenTxid; otherwise
+	// it allocates from the high-water and the free-list waits (still persisted). With no reader pinning an
+	// older version (single-handle, reconstruct-on-open, all readers current) the gate always passes, so the
+	// on-disk byte layout is byte-for-byte unchanged.
+	freeGenTxid uint64
 	readOnly         bool   // opened read-only (api.md §2.1): every session is then read-only, a write is 25006. Always false in-memory.
 	path             string // the backing file path; "" for an in-memory database (surfaced by Database.Path / Session.Path)
 }
@@ -178,8 +193,17 @@ type storage struct {
 // crash between the two syncs leaves the prior meta intact (copy-on-write: reused pages are reachable
 // from no live snapshot). pageCount/freePages advance only after both syncs succeed.
 func (c *sharedCore) persist(snap *snapshot) error {
-	// The main domain reclaims when no reader pins an older version (the file/in-memory watermark).
-	return c.storage.commitDurable(snap, c.oldestLiveVersion(snap.txid) == snap.txid)
+	// The reader-liveness watermark (transactions.md §8) gates two things at the main-domain commit:
+	//   - canReclaim (oldest_live == the new version, i.e. no reader live at an older version) lets the
+	//     periodic COMPACT recompute the free-list (freeing this commit's fresh orphans);
+	//   - canReuse (oldest_live ≥ the free-list's generation) lets this commit REUSE the free-list — a
+	//     page dead at generation G is only safe to overwrite once no reader pins a version older than G.
+	// Both consult the SAME registry; single-handle / all-readers-current keeps oldest_live == committed, so
+	// both hold and the behavior (and on-disk bytes) are identical to an ungated commit.
+	oldest := c.oldestLiveVersion(snap.txid)
+	canReclaim := oldest == snap.txid
+	canReuse := oldest >= c.storage.freeGenTxid
+	return c.storage.commitDurable(snap, canReclaim, canReuse)
 }
 
 // commitDurable durably publishes snap into this storage via an incremental copy-on-write commit
@@ -191,17 +215,21 @@ func (c *sharedCore) persist(snap *snapshot) error {
 // snapshot). pageCount/freePages advance only after both syncs succeed. For an IN-MEMORY store the
 // meta write + Sync are byte-store operations whose sync is a no-op — the file commit minus
 // durability (bplus-reshape.md B3). Runs under the caller's writer gate (single-writer page
-// accounting). canReclaim gates within-session compaction (a no-op for a file/main domain, whose
-// reclaimWithinSession is false — it reconstructs its free-list on open instead).
-func (st *storage) commitDurable(snap *snapshot, canReclaim bool) error {
+// accounting). canReclaim gates within-session compaction (recomputing the free-list); canReuse gates
+// whether THIS commit draws from the existing free-list — the reader-liveness watermark defers reuse of a
+// page a still-open reader on an older snapshot could observe (transactions.md §8). When canReuse is
+// false the free-list is left untouched (allocate from the high-water) but still persisted, so it is
+// reused as soon as the pins drain. An attached-database commit passes canReuse = true (its reuse is gated
+// at its own call site by hasLiveReaders — attached-databases.md §5).
+func (st *storage) commitDurable(snap *snapshot, canReclaim, canReuse bool) error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	write, err := snap.incrementalImage(st.pageSize, st.pageCount, st.freePages, st.paging)
+	write, err := snap.incrementalImage(st.pageSize, st.pageCount, st.freePages, canReuse, st.paging)
 	if err != nil {
 		return err
 	}
 	if st.path != "" {
-		return st.commitFile(snap, write, canReclaim)
+		return st.commitFile(snap, write, canReclaim, canReuse)
 	}
 	return st.commitInMemory(snap, write, canReclaim)
 }
@@ -213,7 +241,7 @@ func (st *storage) commitDurable(snap *snapshot, canReclaim bool) error {
 // body blocks under one sync (the body barrier), then the meta under a second sync — the same
 // crash-recovery ordering the fault-injection matrix asserts (storage.md §7). A crash between the syncs
 // leaves the prior meta intact (reused pages are dead at the fallback snapshot). Caller holds st.mu.
-func (st *storage) commitFile(snap *snapshot, write incrementalWrite, canReclaim bool) error {
+func (st *storage) commitFile(snap *snapshot, write incrementalWrite, canReclaim, canReuse bool) error {
 	ps := int(st.pageSize)
 	cap := ps - pageHeader
 	// Write the dirty tree + catalog first (unsynced) so the reachability walk can read the new catalog
@@ -233,8 +261,8 @@ func (st *storage) commitFile(snap *snapshot, write incrementalWrite, canReclaim
 	}); err != nil {
 		return err
 	}
-	flPages, head, persisted, newPC, newLive, err := planFreeList(
-		snap, st.paging, write.rootPage, write.pages, write.freeRemaining, write.pageCount, st.liveAtCompaction, cap, ps, canReclaim,
+	flPages, head, persisted, newPC, newLive, newGen, err := planFreeList(
+		snap, st.paging, write.rootPage, write.pages, write.freeRemaining, write.pageCount, st.liveAtCompaction, st.freeGenTxid, cap, ps, canReclaim, canReuse,
 	)
 	if err != nil {
 		return err
@@ -263,6 +291,7 @@ func (st *storage) commitFile(snap *snapshot, write incrementalWrite, canReclaim
 	st.pageCount = newPC
 	st.freePages = persisted
 	st.liveAtCompaction = newLive
+	st.freeGenTxid = newGen
 	return nil
 }
 
@@ -333,6 +362,33 @@ func (c *sharedCore) oldestLiveVersion(newTxid uint64) uint64 {
 	return oldest
 }
 
+// pinLatest atomically loads the published roots and registers a reader pin on the committed version,
+// returning the roots and the pinned version — the load and the registration happen under one liveMu
+// acquisition, so the writer's reclamation watermark (oldestLiveVersion, also under liveMu) can never
+// observe a version chosen by a reader that has not yet registered (transactions.md §8). Closing this
+// load→register window is what makes the free-list reuse gate sound: without it a reader could pin a
+// version the writer's watermark had already judged free to reclaim. The caller deregisters via
+// deregisterPin (idiomatically on Session.Close / cursor Close). Publish (roots.Store) takes the same
+// lock, so a reader either sees the new committed and pins it, or is counted at the old version.
+func (c *sharedCore) pinLatest() (*roots, uint64) {
+	c.liveMu.Lock()
+	defer c.liveMu.Unlock()
+	rt := c.roots.Load()
+	v := rt.committed.txid
+	c.live[v]++
+	return rt, v
+}
+
+// deregisterPin drops one reader pin on version v (the inverse of pinLatest / the per-query pin),
+// advancing the watermark when the last pin at v closes.
+func (c *sharedCore) deregisterPin(v uint64) {
+	c.liveMu.Lock()
+	defer c.liveMu.Unlock()
+	if c.live[v]--; c.live[v] <= 0 {
+		delete(c.live, v)
+	}
+}
+
 // maybeCompact reclaims within-session copy-on-write orphans IN RAM by rebuilding the free-list from the
 // live (reachable) set — the POST-commit form used by never-reopened stores (session temp, in-memory
 // attachments, in-memory main), which need no persisted free-list. (A file-backed store instead reclaims
@@ -370,6 +426,7 @@ func (st *storage) maybeCompact(snap *snapshot, catRoot uint32, written []dirtyP
 	}
 	st.freePages = free
 	st.liveAtCompaction = uint32(len(reached))
+	st.freeGenTxid = snap.txid // the recomputed list is proven dead at snap.txid (the reuse generation gate, §8)
 	return nil
 }
 
@@ -385,7 +442,10 @@ func (st *storage) maybeCompact(snap *snapshot, catRoot uint32, written []dirtyP
 func (st *storage) persistTemp(snap *snapshot, canReclaim bool) error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	write, err := snap.incrementalImage(st.pageSize, st.pageCount, st.freePages, st.paging)
+	// A temp domain (and an in-memory attachment) is session-local / driven by one goroutine, so its only
+	// reader is the session's own streaming cursor — gated synchronously by canReclaim (openStreams). There
+	// is no cross-thread pin-registration race, so reuse is always safe here (transactions.md §8).
+	write, err := snap.incrementalImage(st.pageSize, st.pageCount, st.freePages, true, st.paging)
 	if err != nil {
 		return err
 	}
@@ -454,6 +514,7 @@ func sharedCoreFromEngine(e *engine) *sharedCore {
 		// each commit or they would leak permanently (format.md *Reclamation*).
 		reclaimWithinSession: true,
 		liveAtCompaction:     e.liveAtCompaction,
+		freeGenTxid:          e.freeGenTxid, // the loaded free-list is "as of" the committed version (§8 reuse gate)
 	}
 	return c
 }
@@ -622,6 +683,7 @@ func (db *Database) Attach(name string, source AttachSource, readOnly bool) erro
 			// v25: a file attachment persists + reclaims like the main file domain.
 			reclaimWithinSession: true,
 			liveAtCompaction:     e.liveAtCompaction,
+			freeGenTxid:          e.freeGenTxid,
 		}
 		root = e.committed // its stores fault through st.paging; loadEnginePaged bound storePaging too
 	}
@@ -656,7 +718,9 @@ func (db *Database) Attach(name string, source AttachSource, readOnly bool) erro
 		na[k] = v
 	}
 	na[lname] = root
+	c.liveMu.Lock() // publish under the pin lock (§8), like Session.publish
 	c.roots.Store(&roots{committed: old.committed, attached: na})
+	c.liveMu.Unlock()
 	return nil
 }
 
@@ -689,7 +753,9 @@ func (db *Database) Detach(name string) error {
 			na[k] = v
 		}
 	}
+	c.liveMu.Lock() // publish under the pin lock (§8), like Session.publish
 	c.roots.Store(&roots{committed: old.committed, attached: na})
+	c.liveMu.Unlock()
 	// Release a file attachment's OS handle once it is unpublished and unreferenced (a no-op for an
 	// in-memory attachment). No live reader can still fault it — detach-in-use was rejected above.
 	return att.storage.close()
@@ -752,18 +818,15 @@ func (s *Database) ReadOnly() bool { return s.core.readOnlyMode() }
 // by and never blocking a writer — and a write through it is 25006. The caller must Close it to
 // deregister (advancing the watermark), idiomatically `defer s.Close()`. (The old SharedDB.Read().)
 func (s *Database) ReadSession() *Session {
-	rt := s.core.roots.Load()
+	rt, v := s.core.pinLatest() // atomic load+register (transactions.md §8): no load→register gap
 	snap := rt.committed
-	s.core.liveMu.Lock()
-	s.core.live[snap.txid]++
-	s.core.liveMu.Unlock()
 	// Reads never mutate the snapshot (a write is rejected before dispatch), so the engine shares the
 	// immutable pinned snapshot directly — no clone. The attached roots are pinned together (§5).
 	engine := &engine{committed: snap, pageSize: s.core.pageSize(), session: newSession()}
 	engine.core = s.core
 	engine.attachedCommitted = rt.attached
 	engine.readOnly = true // the executor rejects writes (25006) / poisons a read-only block
-	return &Session{core: s.core, engine: engine, access: accessReadOnly, pinned: true, pinVersion: snap.txid, baseVersion: snap.txid}
+	return &Session{core: s.core, engine: engine, access: accessReadOnly, pinned: true, pinVersion: v, baseVersion: v}
 }
 
 // WriteSession opens a READ WRITE session with an eager open write block (spec/design/session.md
@@ -796,20 +859,22 @@ func (s *Database) WriteSession() *Session {
 // publishes, and releases it; BEGIN/COMMIT/ROLLBACK open and end an explicit block. (The old
 // Engine.NewSession swap → an independent owns-its-Engine session.)
 func (s *Database) Session(opts SessionOptions) *Session {
+	// A read-only file-backed core mints read-only sessions (a write is 25006); it pins the committed
+	// version in the watermark like a read session (atomic load+register, §8). A writable core mints the
+	// autocommit lazy-gate one — no persistent pin (each autocommit read pins per statement).
+	if s.core.readOnlyMode() {
+		rt, v := s.core.pinLatest()
+		engine := &engine{committed: rt.committed, pageSize: s.core.pageSize(), session: newSessionWithOptions(opts)}
+		engine.core = s.core
+		engine.attachedCommitted = rt.attached
+		engine.readOnly = true // the executor enforces read-only too (rejects BEGIN READ WRITE, poisons a read-only block)
+		return &Session{core: s.core, engine: engine, access: accessReadOnly, pinned: true, pinVersion: v, baseVersion: v}
+	}
 	rt := s.core.roots.Load()
 	snap := rt.committed
 	engine := &engine{committed: snap, pageSize: s.core.pageSize(), session: newSessionWithOptions(opts)}
 	engine.core = s.core
 	engine.attachedCommitted = rt.attached
-	// A read-only file-backed core mints read-only sessions (a write is 25006); it pins the committed
-	// version in the watermark like a read session. A writable core mints the autocommit lazy-gate one.
-	if s.core.readOnlyMode() {
-		engine.readOnly = true // the executor enforces read-only too (rejects BEGIN READ WRITE, poisons a read-only block)
-		s.core.liveMu.Lock()
-		s.core.live[snap.txid]++
-		s.core.liveMu.Unlock()
-		return &Session{core: s.core, engine: engine, access: accessReadOnly, pinned: true, pinVersion: snap.txid, baseVersion: snap.txid}
-	}
 	return &Session{core: s.core, engine: engine, access: accessReadWrite, baseVersion: snap.txid}
 }
 
@@ -939,8 +1004,27 @@ func (s *Session) queryStmt(stmt statement, params []Value, sc *stmtCache) (*Row
 	// Route the read before building the streaming cursor (spec/design/streaming.md §4): an autocommit
 	// (non-block, writable access) read re-pins the latest committed so the snapshot is current
 	// (PG-faithful); a read-only session uses its existing pin, and an open block uses its working set.
+	// The re-pin is ATOMIC (load committed + register the watermark pin under one liveMu, §8): the read's
+	// version can then never be reclaimed in a load→register gap. The pin is PROVISIONAL — a cursor adopts
+	// it (its Close deregisters), else the defer releases it (a materialized dispatch / an error return),
+	// so a read that pins no long-lived snapshot leaks nothing.
+	autoPin := false
+	var autoPinVer uint64
 	if s.access != accessReadOnly && s.engine.session.tx == nil && !stmtIsWrite(stmt) {
-		s.refreshCommitted()
+		s.core.liveMu.Lock()
+		rt := s.core.roots.Load()
+		s.baseVersion = rt.committed.txid
+		s.engine.committed = rt.committed
+		s.engine.attachedCommitted = rt.attached
+		autoPinVer = s.baseVersion
+		s.core.live[autoPinVer]++
+		s.core.liveMu.Unlock()
+		autoPin = true
+		defer func() {
+			if autoPin { // no cursor adopted the provisional pin — release it
+				s.core.deregisterPin(autoPinVer)
+			}
+		}()
 	}
 	// A read served by a lazy lane never reaches the materialized dispatch, so enforce the read-path
 	// admission gates (failed-block 25P02 / lifetime 54P02 / privilege 42501) here — after refreshing so
@@ -956,20 +1040,25 @@ func (s *Session) queryStmt(stmt statement, params []Value, sc *stmtCache) (*Row
 	// the deregister runs on cursor Close (Go has no destructor), advancing oldestLiveTxid.
 	pin := func(rows *Rows) *Rows {
 		version := s.baseVersion
-		s.core.liveMu.Lock()
-		s.core.live[version]++
-		s.core.liveMu.Unlock()
+		if autoPin {
+			// The autocommit read's provisional pin (registered atomically above) transfers to this cursor;
+			// its Close deregisters it, so the defer must not (autoPin cleared).
+			version = autoPinVer
+			autoPin = false
+		} else {
+			// A read-only session / open read-only block already holds its snapshot pin (registered
+			// atomically at mint / begin), so this per-cursor pin is on an already-protected version.
+			s.core.liveMu.Lock()
+			s.core.live[version]++
+			s.core.liveMu.Unlock()
+		}
 		// A live streaming cursor also blocks within-session temp compaction: it faults its pinned temp
 		// tree lazily, so a temp commit must not reclaim a page it may still read (temp-tables.md §6). The
 		// counter is on the session's engine (single-threaded per session, like the write path it gates).
 		s.engine.openStreams++
 		rows.attachPin(func() {
 			s.engine.openStreams--
-			s.core.liveMu.Lock()
-			if s.core.live[version]--; s.core.live[version] <= 0 {
-				delete(s.core.live, version)
-			}
-			s.core.liveMu.Unlock()
+			s.core.deregisterPin(version)
 		})
 		// A drain-time fault inside an open block aborts it (the open-time lane errors are poisoned at the
 		// returns below); a no-op for an autocommit read.
@@ -1042,8 +1131,11 @@ func (s *Session) dispatch(stmt statement, params []Value) (outcome, error) {
 		return s.engine.ExecuteStmtParams(stmt, params)
 	}
 	if !stmtIsWrite(stmt) {
-		// Autocommit read: pin the latest committed for this one statement (PG-faithful); no gate.
-		s.refreshCommitted()
+		// Autocommit read: the snapshot was already pinned + committed set upstream (queryStmt's atomic
+		// autocommit-read pin for a writable session; the mint pin for a read-only session), and that pin
+		// is held across this synchronous materialize (transactions.md §8) — so the read's version is
+		// visible to the reclamation watermark for the whole fault. Re-loading committed here would both
+		// double-work and (on a read-only session) break snapshot stability, so we run on the pinned base.
 		return s.engine.ExecuteStmtParams(stmt, params)
 	}
 	// Autocommit write — the lazy gate (§2.4): take it, capture the latest committed as the working
@@ -1082,12 +1174,14 @@ func (s *Session) beginBlock(writable, modeSet bool) (outcome, error) {
 		s.gateHeld = true
 		s.refreshCommitted()
 	} else {
-		s.refreshCommitted()
-		s.core.liveMu.Lock()
-		s.core.live[s.baseVersion]++
-		s.core.liveMu.Unlock()
+		// A READ ONLY block pins its snapshot atomically (load+register under one lock, §8), so the
+		// version it reads can never be reclaimed in a load→register gap.
+		rt, v := s.core.pinLatest()
+		s.baseVersion = v
+		s.engine.committed = rt.committed
+		s.engine.attachedCommitted = rt.attached
 		s.pinned = true
-		s.pinVersion = s.baseVersion
+		s.pinVersion = v
 	}
 	out, err := s.engine.beginTx(writable, modeSet)
 	if err != nil && s.gateHeld {
@@ -1128,11 +1222,7 @@ func (s *Session) finishBlock() {
 		s.gateHeld = false
 	}
 	if s.pinned {
-		s.core.liveMu.Lock()
-		if s.core.live[s.pinVersion]--; s.core.live[s.pinVersion] <= 0 {
-			delete(s.core.live, s.pinVersion)
-		}
-		s.core.liveMu.Unlock()
+		s.core.deregisterPin(s.pinVersion)
 		s.pinned = false
 	}
 }
@@ -1159,6 +1249,9 @@ func (s *Session) publish() error {
 	if err := s.core.persist(snap); err != nil {
 		return err // durable before publish; nothing is stored on failure
 	}
+	if afterPersistHook != nil { // test seam (nil in production): the persist→publish window, where a
+		afterPersistHook() // reader can still pin the prior committed version — the reuse-gate race point (§8).
+	}
 	// The post-commit residency flip (bplus-reshape.md B4): the persist above assigned page ids to
 	// every dirty node it wrote, so the committed tree can shed its leaf payloads — clean leaves
 	// demote to OnDisk references faulted back through the pool on next touch. The session's own
@@ -1172,7 +1265,12 @@ func (s *Session) publish() error {
 	// already adopted each dirtied attachment's working root into engine.attachedCommitted (and packed it
 	// into the attachment's in-RAM store); an unchanged attachment carries its prior root through
 	// unchanged. A nil map (nothing attached) is byte-for-byte the pre-attachment single-root publish.
+	// The Store takes liveMu — the same lock pinLatest registers under (transactions.md §8) — so a reader
+	// pins EITHER the old committed (and is counted at that version) OR the new one, never a version the
+	// reclamation watermark could miss.
+	s.core.liveMu.Lock()
 	s.core.roots.Store(&roots{committed: snap, attached: s.engine.attachedCommitted})
+	s.core.liveMu.Unlock()
 	s.baseVersion++
 	return nil
 }

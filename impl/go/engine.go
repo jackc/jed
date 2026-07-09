@@ -47,6 +47,12 @@ type engine struct {
 	// reclamation walk only once the high-water passes ~2× it, mirroring storage (shared.go). 0 for an
 	// in-memory database (no persistence).
 	liveAtCompaction uint32
+	// freeGenTxid is the version the current freePages list is "as of" — the last compaction's txid, or
+	// the committed version at open (every persisted free page is dead at the committed version). It gates
+	// reuse under the reader-liveness watermark (transactions.md §8): a page dead at generation G is safe
+	// to reuse only once no reader pins a version older than G. A bare single-handle engine has no live
+	// registry (oldest_live == committed), so the gate always passes and the byte layout is unchanged.
+	freeGenTxid uint64
 	// paging is the shared paging context for a file-backed database (spec/design/pager.md): the open
 	// pager (kept for the handle's life) + the bounded leaf buffer pool, shared with every table store
 	// so reads fault OnDisk leaves through the one pool. The load reads pages through it and every

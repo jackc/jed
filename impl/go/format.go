@@ -1046,10 +1046,17 @@ type pageAlloc struct {
 	free   []uint32
 	cursor int
 	next   uint32
+	// reuse gates whether this commit draws from the free-list. false ⇒ allocate high-water only,
+	// leaving the whole free-list unconsumed (cursor stays 0, so freeRemaining carries it all through
+	// for persistence): the reader-liveness watermark defers reusing a page a still-open reader on an
+	// older snapshot could observe (transactions.md §8 — the free-list generation gate). Reconstruct-on-open
+	// and the single-handle case leave it true (oldest_live == committed ⇒ no page is still observed),
+	// so the on-disk byte layout is unchanged whenever no reader pins an older version.
+	reuse bool
 }
 
 func (a *pageAlloc) take() uint32 {
-	if a.cursor < len(a.free) {
+	if a.reuse && a.cursor < len(a.free) {
 		p := a.free[a.cursor]
 		a.cursor++
 		return p
@@ -1066,7 +1073,7 @@ func (a *pageAlloc) take() uint32 {
 // catalog chain is always rewritten (it carries each table's possibly-moved root). The dirty nodes'
 // set-once page ids are assigned here. The page size was validated at file creation, so no size check
 // is repeated.
-func (s *snapshot) incrementalImage(pageSize, startPage uint32, free []uint32, paging *sharedPaging) (incrementalWrite, error) {
+func (s *snapshot) incrementalImage(pageSize, startPage uint32, free []uint32, reuse bool, paging *sharedPaging) (incrementalWrite, error) {
 	ps := int(pageSize)
 	capacity := ps - pageHeader
 
@@ -1076,8 +1083,10 @@ func (s *snapshot) incrementalImage(pageSize, startPage uint32, free []uint32, p
 	}
 	sort.Strings(keys)
 
-	// Allocate from the free-list first (reclaiming dead pages), then extend the file.
-	alloc := &pageAlloc{free: free, next: startPage}
+	// Allocate from the free-list first (reclaiming dead pages), then extend the file — unless the
+	// watermark defers reuse (reuse false), in which case only the high-water is drawn and the whole
+	// free-list carries through unconsumed for persistence (pageAlloc.reuse, transactions.md §8).
+	alloc := &pageAlloc{free: free, next: startPage, reuse: reuse}
 
 	var pages []dirtyPage
 	rootDataPage := make([]uint32, len(keys))
@@ -1513,6 +1522,10 @@ func loadEnginePaged(pgr *pager, capacity int) (*engine, error) {
 		return nil, err
 	}
 	db.freePages = free
+	// Every persisted free page is dead at the committed version (the free-list is "as of" mt.txid), so
+	// its reuse generation is mt.txid: at open oldest_live == committed and any later reader pins ≥ the
+	// committed version, so reuse is safe (transactions.md §8, the free-list generation gate).
+	db.freeGenTxid = mt.txid
 	// Seed the within-session compaction trigger with the live estimate (page_count minus the
 	// free-list), so the first commit after open does not compact spuriously (planFreeList).
 	if live := int(mt.pageCount) - len(db.freePages); live > 0 {
@@ -1806,17 +1819,22 @@ func serializeFreeList(persist, safe []uint32, cap, ps int, next uint32) ([]dirt
 // (written unioned in so a wholesale-rewritten GiST R-tree is never freed; the catalog + new overflow
 // are covered by reading the just-written pages back). CARRY (otherwise): the persisted list is
 // freeRemaining (this commit's orphans wait for the next compaction). Either way the chain pages come
-// from freeRemaining. Returns the chain pages, head, the new free-list, the new high-water, and the
-// live count to remember (unchanged when not compacting).
-func planFreeList(snap *snapshot, paging *sharedPaging, catRoot uint32, written []dirtyPage, freeRemaining []uint32, pageCount, liveAtCompaction uint32, cap, ps int, canReclaim bool) ([]dirtyPage, uint32, []uint32, uint32, uint32, error) {
+// from freeRemaining. Returns the chain pages, head, the new free-list, the new high-water, the
+// live count to remember (unchanged when not compacting), and the free-list GENERATION txid — the
+// version the persisted free-list is "as of". On a COMPACT the generation becomes snap.txid (the pages
+// are proven dead at snap.txid); on a CARRY it is unchanged (the list only shrank). The generation gates
+// reuse (transactions.md §8): the pages are dead at their generation, so reusing them is safe only once
+// no reader pins a version older than it — commitDurable checks oldest_live ≥ generation before reuse.
+func planFreeList(snap *snapshot, paging *sharedPaging, catRoot uint32, written []dirtyPage, freeRemaining []uint32, pageCount, liveAtCompaction uint32, genTxid uint64, cap, ps int, canReclaim, canReuse bool) ([]dirtyPage, uint32, []uint32, uint32, uint32, uint64, error) {
 	const minCompactPages = 16 // don't churn a tiny store
 	compact := canReclaim && pageCount > minCompactPages && uint64(pageCount) > 2*uint64(liveAtCompaction)
 	persistList := freeRemaining
 	newLive := liveAtCompaction
+	newGen := genTxid
 	if compact {
 		reached, err := snap.reachablePages(paging, catRoot)
 		if err != nil {
-			return nil, 0, nil, 0, 0, err
+			return nil, 0, nil, 0, 0, 0, err
 		}
 		for _, w := range written {
 			reached[w.index] = true
@@ -1829,9 +1847,20 @@ func planFreeList(snap *snapshot, paging *sharedPaging, catRoot uint32, written 
 		}
 		persistList = free
 		newLive = uint32(len(reached))
+		newGen = snap.txid // the recomputed list is proven dead at snap.txid (the generation gate)
 	}
-	pages, head, persisted, newPC := serializeFreeList(persistList, freeRemaining, cap, ps, pageCount)
-	return pages, head, persisted, newPC, newLive, nil
+	// The free-list CHAIN pages overwrite in place, so they may only land on pages no live reader can
+	// observe. freeRemaining is dead at the FALLBACK snapshot (torn-write-safe), but a reader pinned OLDER
+	// than the free-list generation may still reference one of those pages (transactions.md §8) — the same
+	// hazard as data-page reuse. When the watermark defers reuse (canReuse false) the chain must therefore
+	// grow the high-water instead (safe empty), exactly as the data allocator does; when reuse is allowed,
+	// freeRemaining is reader-safe (oldest_live ≥ generation) and reused as before.
+	safe := freeRemaining
+	if !canReuse {
+		safe = nil
+	}
+	pages, head, persisted, newPC := serializeFreeList(persistList, safe, cap, ps, pageCount)
+	return pages, head, persisted, newPC, newLive, newGen, nil
 }
 
 // readSkeleton reads a table's on-disk B+tree (rooted at rootPage) into a demand-paged skeleton:

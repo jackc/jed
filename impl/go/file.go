@@ -181,7 +181,9 @@ func (db *engine) persist(snap *snapshot) error {
 	}
 	ps := int(db.pageSize)
 	cap := ps - pageHeader
-	write, err := snap.incrementalImage(db.pageSize, db.pageCount, db.freePages, db.paging)
+	// A bare single-handle engine has no cross-session reader registry (oldest_live == committed), so
+	// reuse is always safe (transactions.md §8): the shared-core path is the one that gates reuse.
+	write, err := snap.incrementalImage(db.pageSize, db.pageCount, db.freePages, true, db.paging)
 	if err != nil {
 		return err
 	}
@@ -206,8 +208,8 @@ func (db *engine) persist(snap *snapshot) error {
 	}
 	// Watermark-gated by this handle's live streaming cursors; periodic (~2×-live) inside planFreeList.
 	canReclaim := db.openStreams == 0
-	flPages, head, persisted, newPC, newLive, err := planFreeList(
-		snap, db.paging, write.rootPage, write.pages, write.freeRemaining, write.pageCount, db.liveAtCompaction, cap, ps, canReclaim,
+	flPages, head, persisted, newPC, newLive, newGen, err := planFreeList(
+		snap, db.paging, write.rootPage, write.pages, write.freeRemaining, write.pageCount, db.liveAtCompaction, db.freeGenTxid, cap, ps, canReclaim, true,
 	)
 	if err != nil {
 		return err
@@ -236,6 +238,7 @@ func (db *engine) persist(snap *snapshot) error {
 	db.pageCount = newPC
 	db.freePages = persisted
 	db.liveAtCompaction = newLive
+	db.freeGenTxid = newGen
 	return nil
 }
 
