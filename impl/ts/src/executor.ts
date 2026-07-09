@@ -955,6 +955,14 @@ export class Engine {
   // basis: compaction re-runs only once the high-water passes ~2× it (periodic ~2× bound, no per-commit
   // walk).
   liveAtCompaction: number;
+  // freeGenTxid is the version the current freePages list is "as of" — the last compaction's txid, or the
+  // committed version at open. It gates within-session reuse under the reader-liveness watermark
+  // (transactions.md §8): a page dead at generation G is safe to reuse only once no live reader pins a
+  // version older than G. persistImpl reuses the free-list only when oldest_live ≥ freeGenTxid; otherwise
+  // it allocates from the high-water and the free-list waits (still persisted). With no reader pinning an
+  // older version (single-handle, reconstruct-on-open, all readers current) the gate always passes, so the
+  // on-disk byte layout is byte-for-byte unchanged.
+  freeGenTxid: bigint;
   // tempStorage is the SESSION-LOCAL temp domain's storage Engine (temp-tables.md §6): the private in-RAM
   // MemoryBlockStore + pager + pinned pool its temp tables ride, with within-session compaction on.
   // Created lazily on the first session-local temp DDL (newTempStorage); null until then. Its pageCount
@@ -979,6 +987,7 @@ export class Engine {
     this.spillSink = null;
     this.reclaimWithinSession = false;
     this.liveAtCompaction = 0;
+    this.freeGenTxid = 0n;
     this.tempStorage = null;
     this.openStreams = 0;
   }

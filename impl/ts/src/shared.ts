@@ -75,6 +75,20 @@ import {
 import { engineError } from "./errors.ts";
 import { persistImpl } from "./persist.ts";
 import type { Statement } from "./ast.ts";
+
+// afterPersistHook is a test-only seam (null in production, a single null-check per commit): it fires in
+// Session.publish AFTER the durable persist but BEFORE the committed-root swap — the window in which the
+// just-committed version is durable yet not yet published, so a reader that pins here still gets the PRIOR
+// committed version (the reuse-gate fallback-reader race, transactions.md §8). It receives the still-
+// published committed txid and the storage's new free-list generation, so a test can detect a compacting
+// commit and pin a fallback reader synchronously (JS is single-threaded — no thread coordination needed).
+// The deterministic pin-registration regression test installs a closure.
+export let afterPersistHook: ((committedTxid: bigint, freeGenTxid: bigint) => void) | null = null;
+export function setAfterPersistHook(
+  h: ((committedTxid: bigint, freeGenTxid: bigint) => void) | null,
+): void {
+  afterPersistHook = h;
+}
 import type { ScriptSummary } from "./split.ts";
 import type { Privileges, PrivilegeSet } from "./privileges.ts";
 import type { ClockFunc, RandomFill } from "./seam.ts";
@@ -149,9 +163,15 @@ class SharedCore {
   // engine advance only after both syncs succeed, so a write failure leaves the file's prior meta
   // untouched.
   persist(snap: Snapshot): void {
-    // v25: persistImpl reclaims within-session itself (in-commit for a file store, post-commit for an
-    // in-memory one), gated on the reader watermark — no reader pins a version older than this commit.
-    persistImpl(this.storage, snap, this.oldestLiveVersion(snap.txid) === snap.txid);
+    // The reader-liveness watermark (transactions.md §8) gates two things at the main-domain commit:
+    //   - canReclaim (oldest_live == the new version, i.e. no reader live at an older version) lets the
+    //     periodic COMPACT recompute the free-list (freeing this commit's fresh orphans);
+    //   - canReuse (oldest_live ≥ the free-list's generation) lets this commit REUSE the free-list — a
+    //     page dead at generation G is only safe to overwrite once no reader pins a version older than G.
+    // Both consult the SAME registry; single-handle / all-readers-current keeps oldest_live == committed,
+    // so both hold and behavior (and on-disk bytes) are identical to an ungated commit.
+    const oldest = this.oldestLiveVersion(snap.txid);
+    persistImpl(this.storage, snap, oldest === snap.txid, oldest >= this.storage.freeGenTxid);
   }
 
   // hasLiveReaders reports whether any cross-session reader currently pins a committed snapshot (the
@@ -975,6 +995,11 @@ export class Session {
     const snap = this.engine.committed;
     snap.txid = this.baseVersion + 1n; // advance the shared version on every commit
     this.core.persist(snap); // durable before publish (packs into the byte store, any host)
+    if (afterPersistHook !== null) {
+      // The persist→publish window (test seam; §8 fallback-reader race point). core.committed is still the
+      // PRIOR published root here — a reader pinned inside the hook gets that fallback version.
+      afterPersistHook(this.core.committed.txid, this.core.storage.freeGenTxid);
+    }
     // The post-commit residency flip (bplus-reshape.md B4): the persist above assigned page ids to
     // every dirty node it wrote, so the committed tree can shed its leaf payloads — clean leaves
     // demote to OnDisk references faulted back through the pool on next touch. The session's own

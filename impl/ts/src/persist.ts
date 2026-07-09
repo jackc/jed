@@ -27,14 +27,26 @@ import {
 // need not be in-commit. A crash between the syncs leaves the prior meta intact (reused pages are dead
 // at the fallback snapshot). `canReclaim` is the caller's watermark decision; when omitted (the bare
 // persistHook), it defaults to "no open streaming cursor" (db.openStreams === 0).
-export function persistImpl(db: Engine, snap: Snapshot, canReclaim?: boolean): IncrementalWrite {
-  const write = incrementalImage(snap, db.pageSize, db.pageCount, db.freePages, db.paging);
+export function persistImpl(
+  db: Engine,
+  snap: Snapshot,
+  canReclaim?: boolean,
+  canReuse = true,
+): IncrementalWrite {
+  const write = incrementalImage(
+    snap,
+    db.pageSize,
+    db.pageCount,
+    db.freePages,
+    db.paging,
+    canReuse,
+  );
   if (db.paging === null) return write; // a bare engine with no byte store: nothing to write
   const reclaim = canReclaim ?? db.openStreams === 0;
   // DURABLE (file or OPFS — both reopened, both set a persistHook; the OPFS host leaves `path` null, so
   // durability is keyed on persistHook, not path) persists the free-list in-commit; an IN-MEMORY main
   // store (persistHook null) keeps its free-list in RAM.
-  if (db.persistHook !== null) commitFile(db, snap, write, reclaim);
+  if (db.persistHook !== null) commitFile(db, snap, write, reclaim, canReuse);
   else commitInMemory(db, snap, write, reclaim);
   return write;
 }
@@ -49,6 +61,7 @@ function commitFile(
   snap: Snapshot,
   write: IncrementalWrite,
   canReclaim: boolean,
+  canReuse: boolean,
 ): void {
   const paging = db.paging!;
   // Preallocate ahead of the high-water so the body sync carries no file-growth journaling (pager.md §7).
@@ -65,8 +78,10 @@ function commitFile(
     write.freeRemaining,
     write.pageCount,
     db.liveAtCompaction,
+    db.freeGenTxid,
     db.pageSize,
     canReclaim,
+    canReuse,
   );
   paging.reserve(plan.newPageCount);
   for (const pg of plan.pages) {
@@ -80,6 +95,7 @@ function commitFile(
   db.pageCount = plan.newPageCount;
   db.freePages = plan.persisted;
   db.liveAtCompaction = plan.newLive;
+  db.freeGenTxid = plan.newGen;
 }
 
 // commitInMemory is the IN-MEMORY branch of persistImpl: a MemoryBlockStore is never reopened, so it
@@ -147,6 +163,7 @@ export function maybeCompact(
   }
   db.freePages = free;
   db.liveAtCompaction = reached.size;
+  db.freeGenTxid = snap.txid; // the recomputed list is proven dead at snap.txid (the §8 reuse gate)
 }
 
 // persistTemp materializes a TEMP snapshot's dirty pages into the domain's in-RAM MemoryBlockStore

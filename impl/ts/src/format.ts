@@ -2020,14 +2020,22 @@ class PageAlloc {
   private free: number[];
   cursor = 0;
   next: number;
+  // reuse gates whether this commit draws from the free-list. false ⇒ allocate high-water only, leaving
+  // the whole free-list unconsumed (cursor stays 0, so remaining() carries it all through for
+  // persistence): the reader-liveness watermark defers reusing a page a still-open reader on an older
+  // snapshot could observe (transactions.md §8 — the free-list generation gate). Reconstruct-on-open and
+  // the single-handle case leave it true (oldest_live == committed ⇒ no page is still observed), so the
+  // on-disk byte layout is unchanged whenever no reader pins an older version.
+  private reuse: boolean;
 
-  constructor(free: number[], next: number) {
+  constructor(free: number[], next: number, reuse = true) {
     this.free = free;
     this.next = next;
+    this.reuse = reuse;
   }
 
   take(): number {
-    if (this.cursor < this.free.length) return this.free[this.cursor++]!;
+    if (this.reuse && this.cursor < this.free.length) return this.free[this.cursor++]!;
     return this.next++;
   }
 
@@ -2049,14 +2057,17 @@ export function incrementalImage(
   startPage: number,
   free: number[],
   paging: SharedPaging | null,
+  reuse = true,
 ): IncrementalWrite {
   const ps = pageSize;
   const capacity = ps - PAGE_HEADER;
 
   const keys = [...snap.tables.keys()].sort();
 
-  // Allocate from the free-list first (reclaiming dead pages), then extend the file.
-  const alloc = new PageAlloc(free, startPage);
+  // Allocate from the free-list first (reclaiming dead pages), then extend the file — unless the
+  // watermark defers reuse (reuse false), in which case only the high-water is drawn and the whole
+  // free-list carries through unconsumed for persistence (PageAlloc.reuse, transactions.md §8).
+  const alloc = new PageAlloc(free, startPage, reuse);
 
   const pages: { index: number; bytes: Uint8Array }[] = [];
   const rootDataPage: number[] = new Array(keys.length).fill(0);
@@ -2473,19 +2484,23 @@ export function planFreeList(
   freeRemaining: number[],
   pageCount: number,
   liveAtCompaction: number,
+  genTxid: bigint,
   ps: number,
   canReclaim: boolean,
+  canReuse: boolean,
 ): {
   pages: { index: number; bytes: Uint8Array }[];
   head: number;
   persisted: number[];
   newPageCount: number;
   newLive: number;
+  newGen: bigint;
 } {
   const MIN_COMPACT_PAGES = 16; // don't churn a tiny store
   const compact = canReclaim && pageCount > MIN_COMPACT_PAGES && pageCount > 2 * liveAtCompaction;
   let persistList = freeRemaining;
   let newLive = liveAtCompaction;
+  let newGen = genTxid;
   if (compact) {
     const reached = reachablePages(snap, paging, catRoot);
     for (const w of written) reached.add(w.index);
@@ -2493,9 +2508,23 @@ export function planFreeList(
     for (let p = ROOT_PAGE; p < pageCount; p++) if (!reached.has(p)) free.push(p);
     persistList = free;
     newLive = reached.size;
+    newGen = snap.txid; // the recomputed list is proven dead at snap.txid (the §8 reuse gate)
   }
-  const s = serializeFreeList(persistList, freeRemaining, ps - PAGE_HEADER, ps, pageCount);
-  return { pages: s.pages, head: s.head, persisted: s.persisted, newPageCount: s.newNext, newLive };
+  // The free-list CHAIN pages overwrite in place, so they may only land on pages no live reader can
+  // observe. freeRemaining is dead at the FALLBACK snapshot (torn-write-safe), but a reader pinned OLDER
+  // than the free-list generation may still reference one of those pages (transactions.md §8) — the same
+  // hazard as data-page reuse. When the watermark defers reuse the chain must grow the high-water instead
+  // (empty `safe`), exactly as the data allocator does.
+  const safe = canReuse ? freeRemaining : [];
+  const s = serializeFreeList(persistList, safe, ps - PAGE_HEADER, ps, pageCount);
+  return {
+    pages: s.pages,
+    head: s.head,
+    persisted: s.persisted,
+    newPageCount: s.newNext,
+    newLive,
+    newGen,
+  };
 }
 
 // loadEnginePaged opens a file-backed database demand-paged (spec/design/pager.md, P6.4b): it loads
@@ -2611,6 +2640,10 @@ export function loadEnginePaged(paging: SharedPaging): Engine {
   // v25: load the free-list directly from the persisted chain (meta offset 28) — no reachability walk
   // (spec/fileformat/format.md *Reclamation*).
   db.freePages = readFreeList(paging, mt.freeListHead);
+  // Every persisted free page is dead at the committed version (the free-list is "as of" mt.txid), so its
+  // reuse generation is mt.txid: at open oldest_live == committed and any later reader pins ≥ the committed
+  // version, so reuse is safe (transactions.md §8, the free-list generation gate).
+  db.freeGenTxid = mt.txid;
   // Seed the within-session compaction trigger with the live estimate (pageCount minus the free-list),
   // so the first commit after open does not compact spuriously (planFreeList).
   const live = mt.pageCount - db.freePages.length;
