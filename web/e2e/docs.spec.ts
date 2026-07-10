@@ -220,18 +220,37 @@ test('the select page runs the date demo live', async ({ page }) => {
 
 test('the indexes page runs an ordered-index lookup live', async ({ page }) => {
   await page.goto('/docs/sql/indexes/');
-  // First panel = the ordered city_country index: WHERE country = 'JP' ORDER BY name →
+  // First panel = the ordered city_region index: WHERE region = 1 ORDER BY name →
   // Kyoto, Osaka, Tokyo (the index narrows the scan; the result set is unchanged).
   const panel = page.getByTestId('live-sql').first();
   await expect(panel.getByTestId('result-rows')).toContainText('Kyoto');
   await expect(panel.getByTestId('result-rows')).not.toContainText('Paris');
 });
 
+test('the indexes page runs the expression-index lookup live', async ({ page }) => {
+  await page.goto('/docs/sql/indexes/');
+  // Second panel = the UNIQUE index on lower(email): WHERE lower(email) = 'ada@example.com'
+  // seeks the expression index to Ada's row (id 1); grace's row (id 2) is excluded.
+  const panel = page.getByTestId('live-sql').nth(1);
+  await expect(panel.getByTestId('result-rows')).toContainText('1');
+  await expect(panel.getByTestId('result-rows')).not.toContainText('2');
+});
+
+test('the indexes page runs the partial-index lookup live', async ({ page }) => {
+  await page.goto('/docs/sql/indexes/');
+  // Third panel = the partial orders_active index: WHERE status = 'active' AND customer = 10 →
+  // orders 1 and 4; the shipped order 2 and the cancelled order 5 are excluded.
+  const panel = page.getByTestId('live-sql').nth(2);
+  await expect(panel.getByTestId('result-rows')).toContainText('1');
+  await expect(panel.getByTestId('result-rows')).toContainText('4');
+  await expect(panel.getByTestId('result-rows')).not.toContainText('2');
+});
+
 test('the indexes page runs the GIN @> contains scan live', async ({ page }) => {
   await page.goto('/docs/sql/indexes/');
-  // Second panel = the GIN containment scan: tags @> ARRAY[10,20] → intro and gin (both hold
+  // Fourth panel = the GIN containment scan: tags @> ARRAY[10,20] → intro and gin (both hold
   // {10,20}); arrays/storage/empty do not — the posting-list intersection of the index.
-  const panel = page.getByTestId('live-sql').nth(1);
+  const panel = page.getByTestId('live-sql').nth(3);
   await expect(panel.getByTestId('result-rows')).toContainText('intro');
   await expect(panel.getByTestId('result-rows')).toContainText('gin');
   await expect(panel.getByTestId('result-rows')).not.toContainText('arrays');
@@ -239,18 +258,18 @@ test('the indexes page runs the GIN @> contains scan live', async ({ page }) => 
 
 test('the indexes page runs the GIN && overlaps scan live', async ({ page }) => {
   await page.goto('/docs/sql/indexes/');
-  // Third panel = the GIN overlap scan: tags && ARRAY[30,40] → intro (30), arrays (40),
+  // Fifth panel = the GIN overlap scan: tags && ARRAY[30,40] → intro (30), arrays (40),
   // storage (40) — the posting-list union; empty shares nothing and is excluded.
-  const panel = page.getByTestId('live-sql').nth(2);
+  const panel = page.getByTestId('live-sql').nth(4);
   await expect(panel.getByTestId('result-rows')).toContainText('storage');
   await expect(panel.getByTestId('result-rows')).not.toContainText('empty');
 });
 
 test('the indexes page runs the GIN = ANY membership scan live', async ({ page }) => {
   await page.goto('/docs/sql/indexes/');
-  // Fourth panel = the GIN membership scan: 20 = ANY(tags) → intro, arrays, gin (all hold 20)
+  // Sixth panel = the GIN membership scan: 20 = ANY(tags) → intro, arrays, gin (all hold 20)
   // — the single term's posting list; storage ({40,50}) and empty do not and are excluded.
-  const panel = page.getByTestId('live-sql').nth(3);
+  const panel = page.getByTestId('live-sql').nth(5);
   await expect(panel.getByTestId('result-rows')).toContainText('intro');
   await expect(panel.getByTestId('result-rows')).toContainText('arrays');
   await expect(panel.getByTestId('result-rows')).not.toContainText('storage');
@@ -258,9 +277,9 @@ test('the indexes page runs the GIN = ANY membership scan live', async ({ page }
 
 test('the indexes page runs the GIN = array-equality scan live', async ({ page }) => {
   await page.goto('/docs/sql/indexes/');
-  // Fifth panel = the GIN equality scan: tags = ARRAY[10,20] → gin ONLY (its tags ARE {10,20});
+  // Seventh panel = the GIN equality scan: tags = ARRAY[10,20] → gin ONLY (its tags ARE {10,20});
   // intro ({10,20,30}) merely contains them, so the residual = excludes it — stricter than @>.
-  const panel = page.getByTestId('live-sql').nth(4);
+  const panel = page.getByTestId('live-sql').nth(6);
   await expect(panel.getByTestId('result-rows')).toContainText('gin');
   await expect(panel.getByTestId('result-rows')).not.toContainText('intro');
 });
