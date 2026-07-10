@@ -1,0 +1,106 @@
+# make_date(year, month, day) → date (spec/design/functions.md §11) — PostgreSQL's date builder,
+# the make_timestamp sibling: every parameter NAMED (PG's year/month/day), none defaulted;
+# callable positionally, by named notation, or mixed. All three are the integer family. A negative
+# year is BC (PG); year ZERO traps 22008 (no year zero), as does an invalid month / day-for-month.
+# Built on the same days_from_civil calendar core as the date literal, so the two cannot drift.
+# Immutable — usable in an index expression. Oracle-checked against postgres:18.
+# Format + the `requires` gate: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.index_expr, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.order_by, types.i32, types.date, func.make_date, func.named_arguments, resource.cost_metering
+
+# --- positional, named, mixed ------------------------------------------------
+# cost: 2
+query T nosort
+SELECT make_date(2024, 1, 15)
+----
+2024-01-15
+
+# cost: 2
+query T nosort
+SELECT make_date(year => 2024, month => 2, day => 29)
+----
+2024-02-29
+
+# mixed positional-then-named
+query T nosort
+SELECT make_date(2024, month => 12, day => 31)
+----
+2024-12-31
+
+# named notation in any order
+query T nosort
+SELECT make_date(day => 1, year => 2000, month => 1)
+----
+2000-01-01
+
+# --- a negative year is BC (no year zero) ------------------------------------
+query T nosort
+SELECT make_date(-44, 3, 15)
+----
+0044-03-15 BC
+
+query T nosort
+SELECT make_date(-1, 12, 31)
+----
+0001-12-31 BC
+
+# --- the result is a real date value: arithmetic and comparison compose ------
+query T nosort
+SELECT make_date(2024, 1, 15) + 30
+----
+2024-02-14
+
+query B nosort
+SELECT make_date(2024, 1, 15) = DATE '2024-01-15'
+----
+true
+
+# --- NULL propagates ----------------------------------------------------------
+query T nosort
+SELECT make_date(NULL, 1, 15)
+----
+NULL
+
+# --- field validation traps 22008 ---------------------------------------------
+# year zero has no AD/BC representation
+statement error 22008
+SELECT make_date(0, 1, 1)
+
+# month 13
+statement error 22008
+SELECT make_date(2024, 13, 1)
+
+# Feb 30 never exists; 2023 is not a leap year
+statement error 22008
+SELECT make_date(2024, 2, 30)
+
+statement error 22008
+SELECT make_date(2023, 2, 29)
+
+# day zero
+statement error 22008
+SELECT make_date(2024, 1, 0)
+
+# --- named-notation errors ----------------------------------------------------
+# an unknown parameter name is 42883
+statement error 42883
+SELECT make_date(2024, 1, mday => 15)
+
+# a positional argument after a named one is 42601
+statement error 42601
+SELECT make_date(year => 2024, 1, 15)
+
+# --- immutable: usable in an index expression (unlike the clock readers) -------
+statement ok
+CREATE TABLE t (id integer PRIMARY KEY, y i32, m i32, d i32)
+
+statement ok
+CREATE INDEX t_md_idx ON t ((make_date(y, m, d)))
+
+statement ok
+INSERT INTO t VALUES (1, 2024, 1, 15), (2, 2023, 6, 1)
+
+query T nosort
+SELECT make_date(y, m, d) FROM t ORDER BY id
+----
+2024-01-15
+2023-06-01

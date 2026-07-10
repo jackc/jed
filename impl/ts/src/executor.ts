@@ -15586,6 +15586,9 @@ export type ScalarFuncName =
   // make_timestamp/make_timestamptz — the make_interval siblings (named, un-defaulted) §11.
   | "make_timestamp"
   | "make_timestamptz"
+  | "make_date"
+  | "current_date"
+  | "date_part"
   // uuid extractors (spec/design/functions.md §12): pure inspectors of a uuid's bits.
   // uuid_extract_version → i16 (NULL off-RFC-variant); uuid_extract_timestamp → timestamptz
   // (the embedded instant for v1/v7, else NULL).
@@ -18297,6 +18300,7 @@ export function indexExprNonimmutableCall(e: Expr): boolean {
       case "uuidv7":
       case "now":
       case "clock_timestamp":
+      case "current_date":
       case "nextval":
       case "currval":
       case "setval":
@@ -19808,7 +19812,7 @@ export function resolveFuncCall(
   // make_timestamp / make_timestamptz are its named (un-defaulted) siblings (§11); make_timestamptz
   // is overloaded on arity (a session-zone 6-arg form + an explicit-zone 7-arg form). Their own
   // resolver picks the overload and normalizes named notation.
-  if (lname === "make_timestamp" || lname === "make_timestamptz") {
+  if (lname === "make_timestamp" || lname === "make_timestamptz" || lname === "make_date") {
     return resolveMakeTimestamp(scope, lname, e, ag, params);
   }
   // lower/upper are overloaded across the range accessors (range → element) and the text casing
@@ -20231,7 +20235,7 @@ export function resolveMakeInterval(
 // timezone slot); a wrong family in a slot is 42883.
 export function resolveMakeTimestamp(
   scope: Scope,
-  name: string, // "make_timestamp" | "make_timestamptz"
+  name: string, // "make_timestamp" | "make_timestamptz" | "make_date"
   e: { name: string; args: Expr[]; argNames: (string | null)[]; star: boolean },
   ag: AggCtx,
   params: ParamTypes,
@@ -20239,8 +20243,9 @@ export function resolveMakeTimestamp(
   if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
   const isTz = name === "make_timestamptz";
   // Pick the overload: the 7-arg explicit-zone form is selected by a 7th positional argument or a
-  // named timezone; otherwise the 6-arg form. make_timestamp has only the 6-arg form.
-  let arity = 6;
+  // named timezone; otherwise the 6-arg form. make_timestamp has only the 6-arg form and
+  // make_date only its 3-arg (year, month, day) form.
+  let arity = name === "make_date" ? 3 : 6;
   if (isTz) {
     const namesEmpty = e.argNames.length === 0;
     let positional = 0;
@@ -20269,6 +20274,7 @@ export function resolveMakeTimestamp(
     if (!ok) throw noFuncOverload(name);
     rargs.push(r.node);
   }
+  if (name === "make_date") return scalarFuncNode("make_date", rargs, "date", undefined);
   return isTz
     ? scalarFuncNode("make_timestamptz", rargs, "timestamptz", undefined)
     : scalarFuncNode("make_timestamp", rargs, "timestamp", undefined);

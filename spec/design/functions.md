@@ -477,6 +477,12 @@ The 6-arg form's session-zone dependence makes it `stable` (PG's class); `make_t
 against an arity-selected catalog row — the 7th positional argument or a named `timezone` selects
 the 7-arg overload.)
 
+**`make_date` (landed).** The date constructor completes the family: three **named** integer
+parameters (PG's exact `year`/`month`/`day`), none defaulted, the same shared resolver. A negative
+`year` is BC; year zero / a bad month / a bad day-for-month / a day count beyond the finite i32
+window traps `22008`. Built on the same `days_from_civil` core as the date literal
+([date.md §6](date.md)); `immutable` — legal in an index expression.
+
 **Deferred (sequenced follow-ons).** General DEFAULT values for *arbitrary* (non-integer)
 literals and user-defined functions are not built (jed has no UDFs; built-ins use overloads or
 `make_interval`-style 0-defaults). **`VARIADIC`** was blocked
@@ -558,9 +564,17 @@ differs), so they are NOT oracle-imported; the corpus pins them under an injecte
   The reads follow expression-evaluation order. Tested with an injected **advancing** clock
   (the `# clock_advance: start,step` directive, [entropy.md](entropy.md) §6) so the per-call advance
   is deterministic and distinguishable from `now()` cross-core.
+- **`current_date`** — the fourth clock reader, returning **`date`**: the statement clock's day in
+  the **session zone** — the `'today'` clock-relative literal as a function ([date.md §6](date.md)).
+  **STABLE**, sharing `now()`'s once-per-statement clock read, plus one `timezone` unit for the
+  zone decomposition. Unlike `current_timestamp` it desugars to its **own** catalog function
+  (`current_date()`, default label `current_date`), so the explicit call spelling also resolves —
+  where PG rejects it as a syntax error (a documented jed-lenient divergence). Un-indexable
+  (`42P17`), like every clock reader.
 
-Each charges the uniform one `operator_eval` per call (independent of the clock value). The clock
-reads are class-**B** determinism-ledger entries (`now-clock`, `clock-timestamp-clock`).
+Each charges the uniform one `operator_eval` per call (independent of the clock value; the
+session-zone decomposers add their `timezone` unit). The clock reads are class-**B**
+determinism-ledger entries (`now-clock`, `clock-timestamp-clock`, `date-clock-literal`).
 
 ## 13. Purity — the built-in surface is safe for untrusted queries
 

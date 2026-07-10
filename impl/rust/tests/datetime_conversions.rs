@@ -40,18 +40,20 @@ fn extract_julian_is_deferred() {
     );
 }
 
-/// date_part is deferred — it returns double precision and jed has no float type: jed 42883.
+/// date_part has LANDED (suites/expr/date_part.test); `julian` stays EXTRACT's deferred field on
+/// it too — 0A000 where PG computes a value (the documented divergence the oracle_overrides
+/// ledger records; the timestamp overload cannot live in the PG-clean corpus).
 #[test]
-fn date_part_is_deferred() {
+fn date_part_julian_is_deferred() {
     let mut db = Database::create(CreateOptions::default())
         .unwrap()
         .session(SessionOptions::default());
     assert_eq!(
         err_code(
             &mut db,
-            "SELECT date_part('hour', timestamp '2024-03-15 13:00:00')"
+            "SELECT date_part('julian', timestamp '2024-03-15 13:00:00')"
         ),
-        "42883"
+        "0A000"
     );
 }
 

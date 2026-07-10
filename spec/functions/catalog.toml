@@ -2726,6 +2726,105 @@ null           = "propagates"
 errors         = ["22008", "22023"]
 volatility     = "stable"
 
+# --- date constructor (make_date) ---------------------------------------------
+# PostgreSQL's date builder, the make_timestamp sibling (../design/functions.md §11) — every
+# parameter NAMED (year, month, day — PG's exact names), none defaulted; callable positionally,
+# by named notation (make_date(year => 2024, month => 1, day => 15)), or mixed. All three are the
+# `integer` family. A negative year is BC; year ZERO traps 22008 (no year zero — PG "date field
+# value out of range"), as does an invalid month/day-for-month or a day count beyond the finite
+# i32 window (../design/date.md §1). Built on the same days_from_civil calendar core as the date
+# literal. volatility = immutable (indexable).
+[[operator]]
+name           = "make_date"
+kind           = "function"
+arity          = 3
+arg_families   = ["integer", "integer", "integer"]
+arg_names      = ["year", "month", "day"]
+arg_resolution = "none"
+result         = "date"
+null           = "propagates"
+errors         = ["22008"]
+volatility     = "immutable"
+
+# --- current_date --------------------------------------------------------------
+# The SQL-standard niladic current-date: the STATEMENT clock's day in the SESSION zone — exactly
+# the 'today' clock-relative literal as a function (../design/date.md §6; one timezone cost unit
+# beyond the call's operator_eval). STABLE like now(): the clock is read once per statement and
+# reused. Normally spelled as the bare keyword CURRENT_DATE (the parser desugars it to this call,
+# like CURRENT_TIMESTAMP → now()); jed also resolves the explicit call form current_date(), which
+# PostgreSQL rejects as a syntax error (CURRENT_DATE is a reserved token there) — a documented
+# jed-lenient divergence. Un-indexable (42P17), like every clock reader.
+[[operator]]
+name           = "current_date"
+kind           = "function"
+arity          = 0
+arg_families   = []
+arg_resolution = "none"
+result         = "date"
+null           = "propagates"
+errors         = []
+volatility     = "stable"
+
+# --- date_part -------------------------------------------------------------------
+# PostgreSQL's float8-returning EXTRACT twin (../design/timezones.md §9.2): date_part(field,
+# source) computes the SAME field value as EXTRACT (the shared extract kernel, exact decimal) and
+# converts it to f64 (the landed decimal→float conversion — one correctly-rounded parse of the
+# decimal's text, ../design/float.md). Unlike EXTRACT's syntactic field, `field` is a RUNTIME text
+# value (a column works), validated per row at eval — case-insensitive; an unrecognized unit is
+# 22023 ("unit X not recognized"), a recognized-but-unsupported unit for the source type 0A000
+# ("unit X not supported for type Y") — raised AT EVALUATION like date_trunc's unit (so zero rows
+# raise nothing). The (text, date) overload follows PG's own definition — the date WIDENS TO
+# MIDNIGHT and the TIMESTAMP field matrix applies (PG defines date_part(text, date) as a SQL
+# wrapper over ::timestamp) — so date_part('hour', a_date) is 0 where EXTRACT(hour FROM a_date)
+# is 0A000, matching PG exactly; a date beyond the timestamp range traps 22008 on the widen.
+# `julian` stays the deferred 0A000 EXTRACT carries (PG computes it — the same documented
+# divergence). The timestamptz overload decomposes in the SESSION zone (stable; the
+# zone-consulting fields charge one timezone unit, `epoch` does not — exactly EXTRACT's charging);
+# the other overloads are immutable, matching PG's catalog. NULL propagates.
+[[operator]]
+name           = "date_part"
+kind           = "function"
+arity          = 2
+arg_families   = ["text", "date"]
+arg_resolution = "none"
+result         = "f64"
+null           = "propagates"
+errors         = ["22023", "0A000", "22008"]
+volatility     = "immutable"
+
+[[operator]]
+name           = "date_part"
+kind           = "function"
+arity          = 2
+arg_families   = ["text", "timestamp"]
+arg_resolution = "none"
+result         = "f64"
+null           = "propagates"
+errors         = ["22023", "0A000"]
+volatility     = "immutable"
+
+[[operator]]
+name           = "date_part"
+kind           = "function"
+arity          = 2
+arg_families   = ["text", "timestamptz"]
+arg_resolution = "none"
+result         = "f64"
+null           = "propagates"
+errors         = ["22023", "0A000"]
+volatility     = "stable"
+
+[[operator]]
+name           = "date_part"
+kind           = "function"
+arity          = 2
+arg_families   = ["text", "interval"]
+arg_resolution = "none"
+result         = "f64"
+null           = "propagates"
+errors         = ["22023", "0A000"]
+volatility     = "immutable"
+
 # --- uuid functions (extractors) ---------------------------------------------
 # PURE inspectors of a uuid's bits (../design/functions.md §12), oracle-checked against
 # PostgreSQL 18. Both gate on the RFC 4122 variant ((b[8] & 0xC0) == 0x80) and return NULL on

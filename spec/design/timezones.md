@@ -343,11 +343,12 @@ exactly as PostgreSQL does. Each is oracle-checked against `postgres:18` (CLAUDE
 
 **Still deferred** (each oracle-checked against PG when it lands, CLAUDE.md §7): the `text`↔datetime
 casts for `timestamp`/`timestamptz` — the runtime **`text → date`** cast has since **landed**
-([date.md §6](date.md): the literal's `parse_date` per row, STABLE and un-indexable `42P17`) —
+([date.md §6](date.md): the literal's `parse_date` per row, STABLE and un-indexable `42P17`), and so
+has **`date_part`** (§9.2 — `float` landed and unblocked its `double precision` result) —
 and `to_char` / `to_timestamp` (a parsing/formatting surface, a different axis from "in a zone"),
-`make_timestamptz`, `date_part` (it returns `double precision`; deferred while jed had no binary
-`float` type — `float` has since landed, so this is now unblocked — §9.2), `age`, and the
-**session-zone-driven rendering of `timestamptz` → `text`** (§9.5). All remain
+`age`, and the
+**session-zone-driven rendering of `timestamptz` → `text`** (§9.5). (`make_timestamptz` also landed —
+the make_timestamp slice, [functions.md §11](functions.md).) All remain
 **pure given the tz seam** (CLAUDE.md §13) — they read only the loaded tz data + the instant, never host
 state — so they stay inside the untrusted-query safety guarantee. The IMMUTABLE-vs-STABLE label of each
 is the §8 indexability decision, made when expression indexes land.
@@ -378,8 +379,17 @@ cast; a documented divergence, cast explicitly with `::timestamp`). The session-
 `EXTRACT(field FROM source)` returns the requested `field` of `source` as **`numeric`** (PG 14+ —
 matchable exactly; jed has exact `decimal`). The `field` is **syntactic** (an identifier or a string
 literal, case-insensitive — [grammar.md §50](grammar.md)), so it is validated at **resolve** time, not
-per row. `date_part('field', source)` is **deferred**: PG defines it to return `double precision`, and
-jed has no binary `float` type — supporting it would force a divergent return type.
+per row. **`date_part('field', source)` has since landed** (`float` unblocked its `double precision`
+result): the SAME field values via the shared extract kernel, converted decimal→f64 (one
+correctly-rounded parse — the `R` tolerant render applies). Its `field` is a **runtime text value**
+(a column works), case-insensitive, validated per row **at eval** like `date_trunc`'s unit (`22023`
+unrecognized / `0A000` unsupported, zero rows raise nothing). Its **`date` overload widens to
+midnight** and uses the *timestamp* matrix below — PG's own catalog definition (`date_part(text,
+date)` is a SQL wrapper over `::timestamp`), so `date_part('hour', d)` is `0` where `EXTRACT(hour
+FROM d)` is `0A000` and the `0A000` message names the widened type; `julian` stays the deferred
+`0A000` below (ledgered — PG computes it). Its `timestamptz` overload decomposes in the session
+zone (volatility **stable**, matching PG; EXTRACT's selective `timezone` charge); the
+date/timestamp/interval overloads are **immutable** (suites/expr/date_part.test, oracle-checked).
 
 `source` may be `timestamp`, `timestamptz`, `date`, or `interval`. For `timestamptz` every field is
 computed **in the session zone** (so `hour`/`day`/… shift with it) **except `epoch`** (zone-independent
@@ -544,9 +554,10 @@ the tz database, the load seam, the TZif reader, `AT TIME ZONE`, and the convers
   per-zone RFC 8536 TZif sections + links, parallel to `JUCD`, no custom compiled-table payload and no
   merge step (§4).
 - **Plumbing + consumers.** Slice 1 shipped `AT TIME ZONE` (both directions, §6); Slice 2 shipped
-  `date_trunc` / `EXTRACT` / the cross-family casts (§9); the runtime `text → date` cast has since
-  landed ([date.md §6](date.md)). Still deferred: `text`↔`timestamp`/`timestamptz` casts,
-  `make_timestamptz`, `to_char`, `date_part` (float8), and session-zone rendering (§9, §9.5).
+  `date_trunc` / `EXTRACT` / the cross-family casts (§9); the runtime `text → date` cast and
+  `date_part` (§9.2) have since landed ([date.md §6](date.md)). Still deferred:
+  `text`↔`timestamp`/`timestamptz` casts, `to_char`, `age`, and session-zone rendering (§9, §9.5).
+  (`make_timestamptz` landed with the make_timestamp slice — [functions.md §11](functions.md).)
 - **No on-disk change.** No `format_version` bump, no reference entry, no skew verdict (§2); the
   collation-style version-skew machinery is latent until tz-derived stored keys exist (§8).
 - **Session zone drives computation, not rendering (Slice 2).** The session `TimeZone` is the zone a

@@ -28,11 +28,14 @@ test("EXTRACT(julian …) is a deferred field (0A000)", () => {
   }
 });
 
-test("date_part is deferred (42883 — returns float8, jed has no float)", () => {
+test("date_part('julian', …) stays the deferred EXTRACT field (0A000)", () => {
+  // date_part has LANDED (suites/expr/date_part.test); julian stays EXTRACT's deferred field on
+  // it too — 0A000 where PG computes a value (the documented divergence the oracle_overrides
+  // ledger records; the timestamp overload cannot live in the PG-clean corpus).
   const db = dbWith([]);
   assert.equal(
-    errCode(() => db.execute("SELECT date_part('hour', timestamp '2024-03-15 13:00:00')")),
-    "42883",
+    errCode(() => db.execute("SELECT date_part('julian', timestamp '2024-03-15 13:00:00')")),
+    "0A000",
   );
 });
 

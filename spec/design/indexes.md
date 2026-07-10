@@ -59,9 +59,11 @@ three forms in one key list (`CREATE INDEX ON t (lower(email), a, (b + 1))`).
   reference **only the table's own columns**, and must be a pure, deterministic function of
   them — the same purity the built-in surface guarantees (CLAUDE.md §13). At `CREATE INDEX`
   the expression is resolved and rejected if it (§2): calls a non-immutable function (the
-  entropy/clock seam `uuidv4`/`uuidv7`/`now`/`current_timestamp`/`clock_timestamp` — **`42P17`**),
+  entropy/clock seam `uuidv4`/`uuidv7`/`now`/`current_timestamp`/`clock_timestamp`/`current_date` —
+  **`42P17`**),
   resolves a **STABLE node** (the runtime `text → date` cast, whose input grammar admits the
-  clock-relative specials — **`42P17`**, agreeing with PG's stable `date_in`; [date.md §6](date.md)),
+  clock-relative specials, or a clock-relative date literal `'today'`/`'now'`/… — **`42P17`**,
+  agreeing with PG's stable `date_in`; [date.md §6](date.md)),
   contains an **aggregate** (`42803`), a **window function** (`42P20`), a **subquery**
   (`0A000`), or a **bind parameter** `$N` (`42P02`). An immutable expression is a
   deterministic function of the row, so the index stays consistent with the table under the
@@ -93,8 +95,9 @@ code — [../errors/registry.toml](../errors/registry.toml)).
    - an **expression key** is resolved against the table's columns (an unknown column →
      **42703**), then checked for validity in this order: an **aggregate** → **42803**, a
      **window function** → **42P20**, a **subquery** → **0A000**, a **bind parameter** `$N`
-     → **42P02**, a **non-immutable** function call (the entropy/clock seam) or a resolved
-     **STABLE node** (the runtime `text → date` cast, flagged at its birth via the resolver's
+     → **42P02**, a **non-immutable** function call (the entropy/clock seam, incl.
+     `current_date`) or a resolved **STABLE node** (the runtime `text → date` cast or a
+     clock-relative date literal, flagged at their birth via the resolver's
      `nonimmutable` channel) → **42P17**
      (`invalid_object_definition`, *functions in index expression must be marked IMMUTABLE*).
      Finally its **result type** must be indexable — **0A000** for a composite result.
@@ -471,7 +474,8 @@ the predicate is validated in this order (PG-agreeing, oracle-probed):
    boolean, not type <t>`); an **aggregate** in the predicate is **`42803`**, a **window
    function** **`42P20`** (both from the ordinary `Forbidden`-context resolver, as for a WHERE);
 4. a **non-immutable** call (the entropy/clock/sequence seam — `now`/`clock_timestamp`/
-   `uuidv4`/`uuidv7`/`nextval`/…), a resolved **STABLE node** (the runtime `text → date` cast,
+   `current_date`/`uuidv4`/`uuidv7`/`nextval`/…), a resolved **STABLE node** (the runtime
+   `text → date` cast or a clock-relative date literal,
    §1), **or** a **`timestamptz`-dependent** subexpression (one that
    references a `timestamptz` column or produces a `timestamptz` value — the same conservative
    session-timezone hazard an expression key carries, §1) → **`42P17`** (`functions in index

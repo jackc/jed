@@ -18,9 +18,10 @@
 comparison/ordering, rendering, the `±infinity` sentinels, and a `date` PRIMARY KEY — mirroring
 the original timestamp slice. **Date arithmetic** (`date ± int`, `date - date`, `date ± interval`)
 has since **landed** (§6); so have the cross-family `date ↔ timestamp`/`timestamptz` **casts**
-(timezones.md §9.3), the **runtime `text → date` cast** (§6 — STABLE, un-indexable), and the
+(timezones.md §9.3), the **runtime `text → date` cast** (§6 — STABLE, un-indexable), the
 **clock-relative literals** (`today`/`now`/`tomorrow`/`yesterday` as a STABLE node, `epoch` as a
-constant — §6). The non-goal is wire/`pg_catalog` fidelity
+constant — §6), and the **date functions** `make_date` / `date_part` / `current_date` (§6).
+The non-goal is wire/`pg_catalog` fidelity
 (CLAUDE.md §1); the goal is PG's *observable* date behavior on the surface we implement.
 
 ## 1. Representation — i32 days since the Unix epoch
@@ -307,6 +308,31 @@ cannot set a session zone). The determinism ledger carries the clock read as the
 `date-clock-literal` entry ([determinism.md](determinism.md)); the timestamp family's own `now`
 literal stays deferred (`22007`), its own follow-on.
 
+### Date functions — landed
+
+The three remaining date functions (each oracle-checked / corpus-pinned; the caps
+`func.make_date` / `func.current_date` / `func.date_part`):
+
+- **`make_date(year, month, day) → date`** — PG's date builder, the `make_timestamp` sibling
+  ([functions.md §11](functions.md)): named parameters (PG's exact names), positional / named /
+  mixed notation; a negative year is BC, year zero / a bad field / an out-of-range day count
+  traps `22008`. The same `days_from_civil` core as the literal. **Immutable** — legal in an
+  index expression, unlike the clock readers.
+- **`current_date → date`** — the SQL-standard bare keyword, desugared by the parser to the
+  `current_date()` catalog function (the `CURRENT_TIMESTAMP → now()` precedent): exactly the
+  `'today'` literal as a function — the same STABLE statement-clock read, session-zone
+  decomposition (one `timezone` unit), never-folds semantics, and `42P17` un-indexability (the
+  name joins the non-immutable call blacklist). jed also resolves the explicit `current_date()`
+  spelling, which PG rejects as a syntax error (a documented jed-lenient divergence).
+- **`date_part(field, source) → f64`** — EXTRACT's float8-returning twin
+  ([timezones.md §9.2](timezones.md)): the shared extract kernel, then the landed decimal→f64
+  conversion. The `field` is a **runtime text value** validated per row at eval (`22023` /
+  `0A000`, like `date_trunc`'s unit). The `date` overload **widens to midnight** and uses the
+  *timestamp* field matrix — PG's own catalog definition — so `date_part('hour', d)` is `0`
+  where `EXTRACT(hour FROM d)` is `0A000`; `julian` stays EXTRACT's deferred `0A000` (ledgered —
+  PG computes it). The `timestamptz` overload decomposes in the session zone (stable); the
+  others are immutable.
+
 ### Still deferred
 
 Scoped out (each its own future slice), matching the timestamp/interval precedent:
@@ -314,9 +340,6 @@ Scoped out (each its own future slice), matching the timestamp/interval preceden
 - **Casts** — `date(p)`-style typmods (there are none) and the implicit `date → timestamp`
   coercion that would make `date < timestamp` well-typed (§4) — `date` stays a strict comparison
   island.
-- **Date functions** — `make_date`, `date_part` (float8 — needs `float`), `current_date`.
-  (`EXTRACT(field FROM date)` and `date_trunc` over the datetime family have **landed** with the tz
-  conversion slice — timezones.md §9 / datetime_fn.)
 
 ## 7. Determinism traps (the cross-core checklist)
 

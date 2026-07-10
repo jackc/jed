@@ -4733,6 +4733,14 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		// `(` (a precision typmod, deferred) so that form resolves normally (42883).
 		p.advance()
 		return exprNode{Kind: exprFuncCall, FuncCall: &funcCallExpr{Name: "now"}}, nil
+	case t.Kind == tokWord && toLowerASCII(t.Word) == "current_date" &&
+		!(p.pos+1 < len(p.tokens) && p.tokens[p.pos+1].Kind == tokLParen):
+		// `current_date` — the SQL-standard bare keyword, desugared to the current_date() catalog
+		// function (functions.md §12, date.md §6). Unlike current_timestamp there is no typmod
+		// form; a following `(` is the explicit call spelling, which jed also resolves (PG rejects
+		// it as a syntax error — a documented jed-lenient divergence, catalog.toml).
+		p.advance()
+		return exprNode{Kind: exprFuncCall, FuncCall: &funcCallExpr{Name: "current_date"}}, nil
 	case t.Kind == tokWord:
 		// Function call: a BARE identifier IMMEDIATELY followed by "(" is a call (the engine's
 		// first call syntax — grammar.md §17). The one-token lookahead keeps function names

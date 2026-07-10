@@ -1924,6 +1924,81 @@ impl RExpr {
                         };
                         Ok(Value::Timestamptz(instant))
                     }
+                    ScalarFunc::MakeDate => {
+                        // make_date(year, month, day) — the make_timestamp sibling (functions.md
+                        // §11): a negative year is BC; year zero / a bad field / an out-of-range
+                        // day count traps 22008.
+                        let geti = |k: usize| match &vals[k] {
+                            Value::Int(n) => *n,
+                            _ => unreachable!("resolver restricts make_date's fields to integers"),
+                        };
+                        Ok(Value::Date(crate::date::make_date(
+                            geti(0),
+                            geti(1),
+                            geti(2),
+                        )?))
+                    }
+                    ScalarFunc::CurrentDate => {
+                        // CURRENT_DATE (functions.md §12, date.md §6): the statement clock's day
+                        // in the session zone — the 'today' literal as a function. STABLE;
+                        // date_clock_value charges the timezone unit.
+                        date_clock_value(env.exec, env.rng, m, 0)
+                    }
+                    ScalarFunc::DatePart => {
+                        // date_part(field, source) — the float8-returning EXTRACT twin
+                        // (timezones.md §9.2): the shared extract kernel, then decimal → f64. The
+                        // field is a RUNTIME text value (case-insensitive, validated here — 22023
+                        // unrecognized / 0A000 unsupported-for-type, like date_trunc's unit). A
+                        // date source WIDENS TO MIDNIGHT and the timestamp matrix applies (PG
+                        // defines date_part(text, date) over ::timestamp — so 'hour' is 0 where
+                        // EXTRACT over a date is 0A000); the widen traps 22008 past the timestamp
+                        // range. A timestamptz source decomposes in the session zone with
+                        // EXTRACT's exact selective timezone charge. NULL propagation is the
+                        // blanket case above.
+                        use crate::datetime_fn::ExtractSrc;
+                        let field = match &vals[0] {
+                            Value::Text(s) => s.to_ascii_lowercase(),
+                            _ => unreachable!("resolver restricts date_part's field to text"),
+                        };
+                        let src = match &vals[1] {
+                            Value::Date(d) => ExtractSrc::Timestamp(date_midnight_micros(*d)?),
+                            Value::Timestamp(mc) => ExtractSrc::Timestamp(*mc),
+                            Value::Interval(iv) => ExtractSrc::Interval(*iv),
+                            Value::Timestamptz(mc) => {
+                                let mc = *mc;
+                                if field == "epoch"
+                                    || mc == crate::timestamp::POS_INFINITY
+                                    || mc == crate::timestamp::NEG_INFINITY
+                                {
+                                    ExtractSrc::Timestamptz {
+                                        instant: mc,
+                                        local: mc,
+                                        offset_secs: 0,
+                                    }
+                                } else {
+                                    let zr = env.exec.session.time_zone.clone();
+                                    m.charge(COSTS.timezone);
+                                    m.guard()?;
+                                    let local = crate::timezone::instant_to_local_micros(&zr, mc);
+                                    let off = crate::timezone::offset_at_ref(
+                                        &zr,
+                                        mc.div_euclid(1_000_000),
+                                    )
+                                    .utoff;
+                                    ExtractSrc::Timestamptz {
+                                        instant: mc,
+                                        local,
+                                        offset_secs: off as i64,
+                                    }
+                                }
+                            }
+                            _ => unreachable!(
+                                "resolver restricts date_part to date/ts/tstz/interval"
+                            ),
+                        };
+                        let d = crate::datetime_fn::extract_field(&field, src)?;
+                        decimal_to_float(&d, ScalarType::Float64)
+                    }
                     // uuid extractors (spec/design/functions.md §12): pure bit inspection. Both
                     // return NULL (Value::Null) for a non-RFC variant; the timestamp also for any
                     // version other than 1/7. The NULL-input case is already handled above.

@@ -1,0 +1,132 @@
+# date_part(field, source) → double precision (spec/design/timezones.md §9.2) — PostgreSQL's
+# float8-returning EXTRACT twin over date / timestamp / timestamptz / interval: the SAME field
+# values as EXTRACT (the shared extract kernel, exact decimal), converted to f64 (the `R` render
+# tag — compared by parsed value at tolerance, conformance.md §1). Unlike EXTRACT's syntactic
+# field, `field` is a RUNTIME text value (a text column works), validated per row AT EVALUATION
+# like date_trunc's unit — so zero rows raise nothing: 22023 unrecognized, 0A000
+# recognized-but-unsupported for the source type. The (field, date) overload follows PG's own
+# definition — the date WIDENS TO MIDNIGHT and the TIMESTAMP field matrix applies (PG defines
+# date_part(text, date) as a SQL wrapper over ::timestamp), so date_part('hour', a_date) is 0
+# where EXTRACT(hour FROM a_date) is 0A000 — matching PG exactly. The timestamptz overload
+# decomposes in the SESSION zone (here the default UTC). Oracle-checked against postgres:18;
+# `julian` (0A000, the deferred EXTRACT field — PG computes it) is a documented divergence kept
+# OUT of this oracle file (per-core date_part tests).
+# Format + the `requires` gate: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.order_by, types.i32, types.f64, types.date, types.timestamp, types.timestamptz, types.interval, types.text, func.date_part, resource.cost_metering
+
+# --- over a timestamp ----------------------------------------------------------
+# cost: 2
+query R nosort
+SELECT date_part('year', TIMESTAMP '2024-01-15 12:34:56.789')
+----
+2024
+
+query R nosort
+SELECT date_part('second', TIMESTAMP '2024-01-15 12:34:56.789')
+----
+56.789
+
+query R nosort
+SELECT date_part('epoch', TIMESTAMP '2024-01-15 12:34:56.789')
+----
+1705322096.789
+
+# the field is case-insensitive
+query R nosort
+SELECT date_part('DOW', TIMESTAMP '2024-01-15 12:00:00')
+----
+1
+
+# --- over a date: WIDENS TO MIDNIGHT, the timestamp matrix applies --------------
+query R nosort
+SELECT date_part('year', DATE '2024-01-15')
+----
+2024
+
+# the time fields exist (and are zero) — where EXTRACT over a date is 0A000
+query R nosort
+SELECT date_part('hour', DATE '2024-01-15')
+----
+0
+
+query R nosort
+SELECT date_part('epoch', DATE '2024-01-15')
+----
+1705276800
+
+# --- over a timestamptz: decomposed in the session zone (UTC here); epoch is the instant ---------
+query R nosort
+SELECT date_part('day', TIMESTAMPTZ '2024-01-15 12:00:00+00')
+----
+15
+
+query R nosort
+SELECT date_part('epoch', TIMESTAMPTZ '2024-01-15 12:00:00+05')
+----
+1705302000
+
+# --- over an interval -----------------------------------------------------------
+query R nosort
+SELECT date_part('day', INTERVAL '40 days 5 hours')
+----
+40
+
+query R nosort
+SELECT date_part('month', INTERVAL '1 year 7 months')
+----
+7
+
+# --- the field is a RUNTIME text value: a column works, validated per row --------
+statement ok
+CREATE TABLE t (id integer PRIMARY KEY, f text)
+
+statement ok
+INSERT INTO t VALUES (1, 'year'), (2, 'month'), (3, 'day'), (4, NULL)
+
+# ... and a NULL field (row 4) propagates, like a NULL source
+query IR nosort
+SELECT id, date_part(f, DATE '2024-06-09') FROM t ORDER BY id
+----
+1
+2024
+2
+6
+3
+9
+4
+NULL
+
+query R nosort
+SELECT date_part('year', NULL::date)
+----
+NULL
+
+# --- errors raised AT EVALUATION, like date_trunc's unit --------------------------
+# an unrecognized unit is 22023
+statement error 22023
+SELECT date_part('nosuch', DATE '2024-01-15')
+
+# a recognized unit the (widened) type does not support is 0A000 — and the message names the
+# WIDENED type (timestamp), matching PG's own date_part-over-::timestamp definition
+statement error 0A000
+SELECT date_part('timezone', DATE '2024-01-15')
+
+statement error 0A000
+SELECT date_part('timezone', TIMESTAMP '2024-01-15 12:00:00')
+
+# dow is a datetime field, not an interval's
+statement error 0A000
+SELECT date_part('dow', INTERVAL '1 day')
+
+# julian stays EXTRACT's deferred field (0A000 — PG computes it; the documented divergence the
+# oracle_overrides ledger records)
+statement error 0A000
+SELECT date_part('julian', DATE '2024-01-15')
+
+# ... and over zero rows the per-row validation never fires
+statement ok
+CREATE TABLE z (id integer PRIMARY KEY, d date)
+
+query R rowsort
+SELECT date_part('nosuch', d) FROM z
+----

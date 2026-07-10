@@ -702,6 +702,18 @@ const (
 	// sfMakeTimestamptz builds a timestamptz: as sfMakeTimestamp, then interprets the wall clock in
 	// the session zone (6-arg) or the explicit timezone text (7-arg), charging one timezone unit (§11).
 	sfMakeTimestamptz
+	// sfMakeDate builds a date from (year, month, day) — the make_timestamp sibling
+	// (spec/design/functions.md §11); a negative year is BC, year zero / bad fields trap 22008.
+	sfMakeDate
+	// sfCurrentDate is the SQL-standard niladic CURRENT_DATE (parser-desugared, also callable):
+	// the statement clock's day in the session zone — the 'today' literal as a function
+	// (spec/design/date.md §6). STABLE; charges one timezone unit beyond operator_eval.
+	sfCurrentDate
+	// sfDatePart is date_part(field, source) — the float8-returning EXTRACT twin
+	// (spec/design/timezones.md §9.2): the shared extract kernel, then decimal → f64. The field is
+	// a RUNTIME text value validated per row; a date source WIDENS TO MIDNIGHT (the timestamp
+	// matrix applies — PG's own definition); a timestamptz source decomposes in the session zone.
+	sfDatePart
 	// uuid extractors (spec/design/functions.md §12): pure inspectors of a uuid's bits.
 	// sfUuidExtractVersion → i16 (NULL off-RFC-variant); sfUuidExtractTimestamp → timestamptz
 	// (the embedded instant for v1/v7, else NULL).

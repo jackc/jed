@@ -214,12 +214,18 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfTrimScale
 	case "make_interval":
 		return sfMakeInterval
-	// make_timestamp / make_timestamptz resolve on their own named/un-defaulted path (§11), like
-	// make_interval; the name→kernel mapping is kept for the registry-coverage invariant.
+	// make_timestamp / make_timestamptz / make_date resolve on their own named/un-defaulted path
+	// (§11), like make_interval; the name→kernel mapping is kept for the registry-coverage invariant.
 	case "make_timestamp":
 		return sfMakeTimestamp
 	case "make_timestamptz":
 		return sfMakeTimestamptz
+	case "make_date":
+		return sfMakeDate
+	case "current_date":
+		return sfCurrentDate
+	case "date_part":
+		return sfDatePart
 	// uuid extractors + generators (functions.md §12, entropy.md §3). The generators are volatile
 	// (drawn from the entropy seam at eval); the kernel id is still the name.
 	case "uuid_extract_version":
@@ -2351,10 +2357,10 @@ func resolveFuncCall(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes)
 	if name == "make_interval" {
 		return resolveMakeInterval(s, fc, ag, params)
 	}
-	// make_timestamp / make_timestamptz are its named (un-defaulted) siblings (§11); make_timestamptz
-	// is overloaded on arity (a session-zone 6-arg form + an explicit-zone 7-arg form). Their own
-	// resolver picks the overload and normalizes named notation.
-	if name == "make_timestamp" || name == "make_timestamptz" {
+	// make_timestamp / make_timestamptz / make_date are its named (un-defaulted) siblings (§11);
+	// make_timestamptz is overloaded on arity (a session-zone 6-arg form + an explicit-zone 7-arg
+	// form). Their own resolver picks the overload and normalizes named notation.
+	if name == "make_timestamp" || name == "make_timestamptz" || name == "make_date" {
 		return resolveMakeTimestamp(s, name, fc, ag, params)
 	}
 	// lower/upper are overloaded across the range accessors (range → element) and the text casing
@@ -2767,8 +2773,12 @@ func resolveMakeTimestamp(s *scope, name string, fc *funcCallExpr, ag *aggCtx, p
 	}
 	isTz := name == "make_timestamptz"
 	// Pick the overload: the 7-arg explicit-zone form is selected by a 7th positional argument or a
-	// named timezone; otherwise the 6-arg form. make_timestamp has only the 6-arg form.
+	// named timezone; otherwise the 6-arg form. make_timestamp has only the 6-arg form and
+	// make_date only its 3-arg (year, month, day) form.
 	arity := 6
+	if name == "make_date" {
+		arity = 3
+	}
 	if isTz {
 		positional := 0
 		namesTimezone := false
@@ -2816,6 +2826,9 @@ func resolveMakeTimestamp(s *scope, name string, fc *funcCallExpr, ag *aggCtx, p
 	sf, result := sfMakeTimestamp, scalarTimestamp
 	if isTz {
 		sf, result = sfMakeTimestamptz, scalarTimestamptz
+	}
+	if name == "make_date" {
+		sf, result = sfMakeDate, scalarDate
 	}
 	return &rExpr{kind: reScalarFunc, sfunc: sf, sargs: rargs, result: result},
 		resolvedTypeOf(result), nil

@@ -1137,3 +1137,10 @@ reason = "jed: a USING column whose two sides have different types reaches jed's
 file = "joins/natural.test"
 sql = "SELECT * FROM a NATURAL FULL JOIN b"
 reason = "jed: NATURAL FULL JOIN with a common column is 0A000 — its merged column is COALESCE(left, right), which jed's single-flat-index merge model does not carry (the same deferral as FULL JOIN USING, grammar.md §15). PostgreSQL supports it and returns the coalesced merge. A deliberate, relaxable narrowing."
+
+# --- date_part('julian', …): jed defers the julian field wholesale (0A000), on date_part exactly
+# as on EXTRACT. PostgreSQL computes it (2460325 for this date via the date→timestamp widening).
+[[override]]
+file = "expr/date_part.test"
+sql = "SELECT date_part('julian', DATE '2024-01-15')"
+reason = "jed: `julian` is a DEFERRED extract field on every source type (0A000 — timezones.md §9.2: for a timestamp it is a non-terminating decimal whose exact scale is PG-internal), and date_part inherits EXTRACT's field matrix verbatim after the date→timestamp widening. PostgreSQL computes it (2460325). The same documented divergence EXTRACT carries."

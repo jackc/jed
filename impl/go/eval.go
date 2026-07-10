@@ -2407,6 +2407,67 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 				zr = env.exec.session.timeZone
 			}
 			return TimestamptzValue(localToInstantMicros(zr, wall)), nil
+		case sfMakeDate:
+			// make_date(year, month, day) — the make_timestamp sibling (functions.md §11): a
+			// negative year is BC; year zero / a bad field / an out-of-range day count traps 22008.
+			d, err := makeDate(vals[0].Int, vals[1].Int, vals[2].Int)
+			if err != nil {
+				return Value{}, err
+			}
+			return DateValue(d), nil
+		case sfCurrentDate:
+			// CURRENT_DATE (functions.md §12, date.md §6): the statement clock's day in the
+			// session zone — the 'today' literal as a function. STABLE; dateClockValue charges the
+			// timezone unit.
+			return dateClockValue(env.exec, env.rng, m, 0)
+		case sfDatePart:
+			// date_part(field, source) — the float8-returning EXTRACT twin (timezones.md §9.2):
+			// the shared extract kernel, then decimal → f64. The field is a RUNTIME text value
+			// (case-insensitive, validated here — 22023 unrecognized / 0A000 unsupported-for-type,
+			// like date_trunc's unit). A date source WIDENS TO MIDNIGHT and the timestamp matrix
+			// applies (PG defines date_part(text, date) over ::timestamp — so 'hour' is 0 where
+			// EXTRACT over a date is 0A000); the widen traps 22008 past the timestamp range. A
+			// timestamptz source decomposes in the session zone with EXTRACT's exact selective
+			// timezone charge. NULL propagation is the blanket case above.
+			field := toLowerASCII(vals[0].str())
+			var src extractSrc
+			switch vals[1].Kind {
+			case ValDate:
+				mid, err := dateMidnightMicros(int32(vals[1].Int))
+				if err != nil {
+					return Value{}, err
+				}
+				src = extractSrc{kind: srcTs, local: mid}
+			case ValTimestamp:
+				src = extractSrc{kind: srcTs, local: vals[1].Int}
+			case ValInterval:
+				src = extractSrc{kind: srcIv, iv: vals[1].interval()}
+			case ValTimestamptz:
+				mc := vals[1].Int
+				if field == "epoch" || mc == posInfinity || mc == negInfinity {
+					src = extractSrc{kind: srcTstz, instant: mc, local: mc, offsetSecs: 0}
+				} else {
+					zr := env.exec.session.timeZone
+					m.Charge(costs.Timezone)
+					if err := m.Guard(); err != nil {
+						return Value{}, err
+					}
+					local := instantToLocalMicros(zr, mc)
+					off := int64(offsetAtRef(zr, floorDiv(mc, 1_000_000)).Utoff)
+					src = extractSrc{kind: srcTstz, instant: mc, local: local, offsetSecs: off}
+				}
+			default:
+				panic("resolver restricts date_part to date/ts/tstz/interval")
+			}
+			d, err := extractField(field, src)
+			if err != nil {
+				return Value{}, err
+			}
+			f, err := decimalToFloat64(d)
+			if err != nil {
+				return Value{}, err
+			}
+			return Float64Value(f), nil
 		case sfUuidExtractVersion:
 			// uuid extractors (spec/design/functions.md §12): pure bit inspection; NULL for a
 			// non-RFC variant (and, for the timestamp, any version other than 1/7). The

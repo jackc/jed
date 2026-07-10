@@ -931,6 +931,7 @@ primary        ::= number
                  | "TRUE" | "FALSE"
                  | "NULL"
                  | "CURRENT_TIMESTAMP"
+                 | "CURRENT_DATE"
                  | parameter
                  | typed_literal
                  | "CAST" "(" expr "AS" type_name ")"
@@ -946,7 +947,11 @@ primary        ::= number
  * so it shares now()'s resolution / execution / cost / STABLE volatility / default `now` column
  * label. Reserved as a primary like TRUE/FALSE/NULL (recognized only when NOT followed by "(" — the
  * precision-typmod form current_timestamp(p) is deferred, so a "(" falls through to ordinary
- * resolution, 42883). now() and clock_timestamp() are ordinary function_calls, not keywords. */
+ * resolution, 42883). now() and clock_timestamp() are ordinary function_calls, not keywords.
+ * CURRENT_DATE desugars the same way, to the current_date() catalog function (functions.md §12,
+ * date.md §6 — the statement clock's day in the session zone); unlike current_timestamp the
+ * fall-through call spelling current_date() RESOLVES (its own catalog row), where PostgreSQL
+ * rejects it as a syntax error — a documented jed-lenient divergence. */
 
 /* A typed string literal (../design/grammar.md §36): ANY type name IMMEDIATELY followed by a
  * single-quoted string, naming the literal's type so it is CONTEXT-FREE (carries that type in

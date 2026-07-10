@@ -48,6 +48,41 @@ func dateClockSpecial(input string) (offsetDays int32, epoch, ok bool) {
 	return 0, false, false
 }
 
+// makeDate builds a date from its (year, month, day) fields — PostgreSQL's make_date, the
+// makeTimestamp sibling (spec/design/functions.md §11). A negative year is BC; year zero, a bad
+// month/day-for-month, or a day count beyond the finite i32 window traps 22008 (PG "date field
+// value out of range"). The same daysFromCivil calendar core as parseDate, so the two cannot drift.
+func makeDate(year, month, day int64) (int32, error) {
+	if year == 0 {
+		return 0, datetimeFieldOverflow("date field value out of range")
+	}
+	bc := year < 0
+	mag := year
+	if bc {
+		mag = -year
+	}
+	if mag > 9_999_999 {
+		// Only an i64-overflow guard for daysFromCivil (like parseDate's year cap); the real
+		// bound is the finite-i32 day-range check below.
+		return 0, datetimeFieldOverflow("date field value out of range")
+	}
+	if month < 1 || month > 12 {
+		return 0, datetimeFieldOverflow("date field value out of range")
+	}
+	astro := mag
+	if bc {
+		astro = 1 - mag
+	}
+	if day < 1 || day > daysInMonth(astro, month) {
+		return 0, datetimeFieldOverflow("date field value out of range")
+	}
+	days := daysFromCivil(astro, month, day)
+	if days < dateMinFinite || days > dateMaxFinite {
+		return 0, datetimeFieldOverflow("date field value out of range")
+	}
+	return int32(days), nil
+}
+
 // dateClockIsRelative reports whether input names a CLOCK-RELATIVE special — 'today' / 'now' /
 // 'tomorrow' / 'yesterday', but not 'epoch' (a foldable constant).
 func dateClockIsRelative(input string) bool {

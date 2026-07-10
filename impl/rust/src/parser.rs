@@ -4105,6 +4105,28 @@ impl Parser {
                     within_group: None,
                 })
             }
+            // `current_date` — the SQL-standard bare keyword, desugared to the current_date()
+            // catalog function (functions.md §12, date.md §6). Unlike current_timestamp there is
+            // no typmod form; a following `(` is the explicit call spelling, which jed also
+            // resolves (PG rejects it as a syntax error — a documented jed-lenient divergence).
+            Token::Word(w)
+                if w.eq_ignore_ascii_case("current_date")
+                    && !matches!(self.tokens.get(self.pos + 1), Some(Token::LParen)) =>
+            {
+                self.advance();
+                Ok(Expr::FuncCall {
+                    name: "current_date".to_string(),
+                    args: Vec::new(),
+                    arg_names: None,
+                    star: false,
+                    distinct: false,
+                    filter: None,
+                    variadic: false,
+                    over: None,
+                    over_name: None,
+                    within_group: None,
+                })
+            }
             Token::Str(_) => {
                 if let Token::Str(s) = self.advance() {
                     Ok(Expr::Literal(Literal::Text(s)))

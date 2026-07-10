@@ -59,7 +59,7 @@ pub(crate) fn resolve_func_call(
     // make_timestamp / make_timestamptz are its named (un-defaulted) siblings (§11); make_timestamptz
     // is overloaded on arity (a session-zone 6-arg form + an explicit-zone 7-arg form). Their own
     // resolver picks the overload and normalizes named notation.
-    if lname == "make_timestamp" || lname == "make_timestamptz" {
+    if lname == "make_timestamp" || lname == "make_timestamptz" || lname == "make_date" {
         return resolve_make_timestamp(scope, &lname, args, arg_names, star, agg, params);
     }
     // lower/upper are overloaded across TWO families: the range accessors (range → element,
@@ -633,7 +633,7 @@ pub(crate) fn resolve_make_interval(
 /// string to the `text` `timezone` slot); a wrong family in a slot is 42883.
 pub(crate) fn resolve_make_timestamp(
     scope: &Scope,
-    name: &str, // "make_timestamp" | "make_timestamptz" (already lowercased)
+    name: &str, // "make_timestamp" | "make_timestamptz" | "make_date" (already lowercased)
     args: &[Expr],
     arg_names: Option<&[Option<String>]>,
     star: bool,
@@ -648,8 +648,11 @@ pub(crate) fn resolve_make_timestamp(
     }
     let is_tz = name == "make_timestamptz";
     // Pick the overload: the 7-arg explicit-zone form is selected by a 7th positional argument or a
-    // named `timezone`; otherwise the 6-arg form. make_timestamp has only the 6-arg form.
-    let arity = if is_tz {
+    // named `timezone`; otherwise the 6-arg form. make_timestamp has only the 6-arg form and
+    // make_date only its 3-arg (year, month, day) form.
+    let arity = if name == "make_date" {
+        3
+    } else if is_tz {
         let positional = args
             .iter()
             .enumerate()
@@ -686,7 +689,9 @@ pub(crate) fn resolve_make_timestamp(
         }
         rargs.push(r);
     }
-    let (func, result) = if is_tz {
+    let (func, result) = if name == "make_date" {
+        (ScalarFunc::MakeDate, ScalarType::Date)
+    } else if is_tz {
         (ScalarFunc::MakeTimestamptz, ScalarType::Timestamptz)
     } else {
         (ScalarFunc::MakeTimestamp, ScalarType::Timestamp)

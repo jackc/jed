@@ -547,6 +547,26 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // and a cached plan tracks the clock (both documented divergences from PG's parse-time
   // fold), and an index expression containing one is 42P17.
   "types.date_clock_literal",
+  // make_date(year, month, day) → date (functions.md §11, the make_timestamp sibling): every
+  // parameter named (PG's year/month/day), callable positionally / by named notation / mixed.
+  // A negative year is BC; year zero / a bad field / an out-of-range day count traps 22008.
+  // Immutable (indexable). Builds on func.named_arguments.
+  "func.make_date",
+  // The SQL-standard bare keyword CURRENT_DATE → the current_date() catalog function
+  // (functions.md §12, date.md §6): the statement clock's day in the SESSION zone — the 'today'
+  // literal as a function. STABLE (one timezone unit beyond operator_eval); un-indexable 42P17.
+  // jed also resolves the explicit call form current_date(), which PG rejects as a syntax
+  // error — a documented jed-lenient divergence (per-core tested).
+  "func.current_date",
+  // date_part(field, source) → f64 (timezones.md §9.2, EXTRACT's float8-returning twin) over
+  // date / timestamp / timestamptz / interval: the shared extract kernel, then decimal → f64.
+  // The field is a RUNTIME text value validated per row (22023 unrecognized / 0A000
+  // unsupported-for-type, at evaluation like date_trunc's unit). The date overload widens to
+  // midnight and uses the TIMESTAMP matrix (PG's own definition — 'hour' is 0 where EXTRACT
+  // over a date is 0A000); julian stays EXTRACT's deferred 0A000 (a documented divergence —
+  // PG computes it). The timestamptz overload decomposes in the session zone (stable; EXTRACT's
+  // selective timezone charge); the others are immutable.
+  "func.date_part",
   // The COLLATE expression operator + ORDER BY … COLLATE over a VENDORED collation (collation slice
   // 1c, spec/design/collation.md §14): a vendored collation orders text by its UCA sort key in the
   // ordering comparisons (< <= > >=) and ORDER BY; explicit-conflict 42P21, unknown 42704, non-text

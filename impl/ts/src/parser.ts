@@ -3484,6 +3484,22 @@ class Parser {
           variadic: false,
         };
       }
+      // `current_date` — the SQL-standard bare keyword, desugared to the current_date() catalog
+      // function (functions.md §12, date.md §6). Unlike current_timestamp there is no typmod form;
+      // a following `(` is the explicit call spelling, which jed also resolves (PG rejects it as a
+      // syntax error — a documented jed-lenient divergence).
+      if (w === "current_date" && this.tokens[this.pos + 1]?.kind !== "lparen") {
+        this.advance();
+        return {
+          kind: "funcCall",
+          name: "current_date",
+          args: [],
+          argNames: [],
+          star: false,
+          distinct: false,
+          variadic: false,
+        };
+      }
       // Function call: a BARE identifier IMMEDIATELY followed by "(" is a call (the engine's
       // first call syntax — grammar.md §17). The one-token lookahead keeps function names
       // non-reserved (a column may be named `count`); a qualified name is never a call. Only

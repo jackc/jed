@@ -48,6 +48,37 @@ pub fn date_clock_is_relative(input: &str) -> bool {
     matches!(date_clock_special(input), Some((_, false)))
 }
 
+/// Build a date from its `(year, month, day)` fields — PostgreSQL's `make_date`, the
+/// `make_timestamp` sibling (spec/design/functions.md §11). A negative year is BC; year zero, a
+/// bad month/day-for-month, or a day count beyond the finite i32 window traps `22008` (PG "date
+/// field value out of range"). The same `days_from_civil` calendar core as `parse_date`, so the
+/// two cannot drift.
+pub fn make_date(year: i64, month: i64, day: i64) -> Result<i32> {
+    let err = || field_overflow("date field value out of range");
+    if year == 0 {
+        return Err(err());
+    }
+    let bc = year < 0;
+    let mag = year.abs();
+    if mag > 9_999_999 {
+        // Only an i64-overflow guard for `days_from_civil` (like parse_date's year cap); the real
+        // bound is the finite-i32 day-range check below.
+        return Err(err());
+    }
+    if !(1..=12).contains(&month) {
+        return Err(err());
+    }
+    let astro = if bc { 1 - mag } else { mag };
+    if day < 1 || day > days_in_month(astro, month as u32) as i64 {
+        return Err(err());
+    }
+    let days = days_from_civil(astro, month, day);
+    if !(MIN_FINITE..=MAX_FINITE).contains(&days) {
+        return Err(err());
+    }
+    Ok(days as i32)
+}
+
 /// Parse a `date` literal to its i32 day count since 1970-01-01. The grammar is the full
 /// timestamp literal grammar (spec/design/timestamp.md §3), but only the date portion is kept:
 /// a trailing time and/or offset is validated then discarded, and `24:00:00` does not advance

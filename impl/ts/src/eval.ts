@@ -35,6 +35,7 @@ import {
   uuidValue,
 } from "./value.ts";
 import { COSTS } from "./costs.ts";
+import { makeDate } from "./date.ts";
 import {
   I64_MIN,
   applyJsonBehavior,
@@ -50,6 +51,7 @@ import {
   elemJsonText,
   encodeBytea,
   dateClockValue,
+  dateMidnightMicros,
   evalArrayFunc,
   evalDateArith,
   evalDateConvert,
@@ -1098,6 +1100,57 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
           return timestamptzValue(localToInstantMicros(z, wall));
         }
         return timestamptzValue(localToInstantMicros(env.exec.session.timeZone, wall));
+      }
+      if (e.func === "make_date") {
+        // make_date(year, month, day) — the make_timestamp sibling (functions.md §11): a negative
+        // year is BC; year zero / a bad field / an out-of-range day count traps 22008.
+        const geti = (k: number): bigint => (vals[k] as { int: bigint }).int;
+        return dateValue(makeDate(geti(0), geti(1), geti(2)));
+      }
+      if (e.func === "current_date") {
+        // CURRENT_DATE (functions.md §12, date.md §6): the statement clock's day in the session
+        // zone — the 'today' literal as a function. STABLE; dateClockValue charges the timezone
+        // unit.
+        return dateClockValue(env.exec, env.rng, env.seam, m, 0n);
+      }
+      if (e.func === "date_part") {
+        // date_part(field, source) — the float8-returning EXTRACT twin (timezones.md §9.2): the
+        // shared extract kernel, then decimal → f64. The field is a RUNTIME text value
+        // (case-insensitive, validated here — 22023 unrecognized / 0A000 unsupported-for-type,
+        // like date_trunc's unit). A date source WIDENS TO MIDNIGHT and the timestamp matrix
+        // applies (PG defines date_part(text, date) over ::timestamp — so 'hour' is 0 where
+        // EXTRACT over a date is 0A000); the widen traps 22008 past the timestamp range. A
+        // timestamptz source decomposes in the session zone with EXTRACT's exact selective
+        // timezone charge. NULL propagation is the blanket case above.
+        const field = (vals[0] as { text: string }).text.toLowerCase();
+        const sv = vals[1]!;
+        let src: ExtractSrc;
+        if (sv.kind === "date") {
+          src = { kind: "ts", micros: dateMidnightMicros(sv.days) };
+        } else if (sv.kind === "timestamp") {
+          src = { kind: "ts", micros: sv.micros };
+        } else if (sv.kind === "interval") {
+          src = { kind: "interval", iv: sv.iv };
+        } else if (sv.kind === "timestamptz") {
+          const mc = sv.micros;
+          if (field === "epoch" || mc === POS_INFINITY || mc === NEG_INFINITY) {
+            src = { kind: "tstz", instant: mc, local: mc, offsetSecs: 0n };
+          } else {
+            const zr = env.exec.session.timeZone;
+            m.charge(COSTS.timezone);
+            m.guard();
+            const local = instantToLocalMicros(zr, mc);
+            const secs = mc >= 0n ? mc / 1_000_000n : -((-mc + 999_999n) / 1_000_000n);
+            const off = BigInt(offsetAtRef(zr, secs).utoff);
+            src = { kind: "tstz", instant: mc, local, offsetSecs: off };
+          }
+        } else {
+          throw new Error("unreachable: resolver restricts date_part to date/ts/tstz/interval");
+        }
+        const d = extractField(field, src);
+        const f = Number(d.render());
+        if (!Number.isFinite(f)) throw overflow("f64");
+        return float64Value(f);
       }
       // uuid extractors (spec/design/functions.md §12): pure bit inspection; NULL for a non-RFC
       // variant (and, for the timestamp, any version other than 1/7). The NULL-input case is

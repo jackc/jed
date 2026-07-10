@@ -34,11 +34,14 @@ func TestExtractJulianIsDeferred(t *testing.T) {
 	}
 }
 
-func TestDatePartIsDeferred(t *testing.T) {
+func TestDatePartJulianIsDeferred(t *testing.T) {
 	t.Parallel()
+	// date_part has LANDED (suites/expr/date_part.test); julian stays EXTRACT's deferred field on
+	// it too — 0A000 where PG computes a value (the documented divergence the oracle_overrides
+	// ledger records; the timestamp overload cannot live in the PG-clean corpus).
 	db := memDB().Session(SessionOptions{})
-	if c := dtErrCode(t, db, "SELECT date_part('hour', timestamp '2024-03-15 13:00:00')"); c != "42883" {
-		t.Fatalf("date_part: got %s, want 42883", c)
+	if c := dtErrCode(t, db, "SELECT date_part('julian', timestamp '2024-03-15 13:00:00')"); c != "0A000" {
+		t.Fatalf("date_part julian: got %s, want 0A000", c)
 	}
 }
 

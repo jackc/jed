@@ -70,10 +70,11 @@
   date '2024-01-15' - interval '12 hours'   AS midnight_minus;`;
 
 	const dateClockDemo = `SELECT
-  'today'::date                 AS today,
+  current_date                  AS today,
   date 'tomorrow'               AS tomorrow,
   'yesterday'::date             AS yesterday,
   'epoch'::date                 AS epoch,
+  make_date(2024, 2, 29)        AS built,
   'tomorrow'::date - 'today'    AS one_day;`;
 </script>
 
@@ -226,8 +227,11 @@ explicit zone:
 
 <LiveSql query={convDemo} rows={1} />
 
-(`date_part` is deferred, as are the `text`↔`timestamp`/`timestamptz` casts — cast a string with the
-`timestamp '…'` literal form instead. A runtime `text` value **does** cast to `date`.)
+`date_part(field, source)` is the `double precision` twin of `EXTRACT` — same fields, but the field
+name is a runtime string, and over a `date` the timestamp fields exist (`date_part('hour', d)` is
+`0`), exactly as in PostgreSQL. (The `text`↔`timestamp`/`timestamptz` casts are deferred — cast a
+string with the `timestamp '…'` literal form instead. A runtime `text` value **does** cast to
+`date`.)
 
 ### Date arithmetic
 
@@ -241,10 +245,11 @@ year). The `±infinity` dates absorb any shift, and an out-of-range result raise
 
 A date literal also accepts PostgreSQL's special words: `'epoch'` (1970-01-01) and the
 **clock-relative** `'today'` / `'now'` / `'tomorrow'` / `'yesterday'` — the current day in the
-session time zone. Unlike PostgreSQL, jed **never freezes** a clock-relative word into a constant:
+session time zone, also reachable as the SQL-standard `current_date` keyword. Unlike PostgreSQL,
+jed **never freezes** a clock-relative word into a constant:
 `DEFAULT 'today'` re-evaluates on every INSERT (PostgreSQL locks in the table-creation day), a
 prepared statement tracks the clock, and an index expression containing one is rejected rather
-than silently frozen:
+than silently frozen. `make_date(year, month, day)` builds a date from parts:
 
 <LiveSql query={dateClockDemo} rows={1} />
 

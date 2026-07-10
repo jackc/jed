@@ -658,15 +658,15 @@ func indexNamePart(elem indexKeyElem) string {
 
 // indexExprNonimmutableCall reports whether an index-key expression calls a non-immutable built-in
 // (spec/design/indexes.md §2): the entropy/clock seam (uuidv4/uuidv7/now/clock_timestamp —
-// current_timestamp desugars to now) or the sequence functions (nextval/currval/setval/lastval) /
-// current_setting. Such a function would let the index drift from the table, so it is 42P17 at
-// CREATE INDEX. The walk mirrors checkReferencedColumns (subqueries are already rejected by
+// current_timestamp desugars to now — and current_date, the bare keyword's own catalog function)
+// or the sequence functions (nextval/currval/setval/lastval) / current_setting. Such a function
+// would let the index drift from the table, so it is 42P17 at CREATE INDEX. The walk mirrors checkReferencedColumns (subqueries are already rejected by
 // resolution). The session-timezone hazard (an expression over timestamptz) is handled separately
 // by the caller, so this covers only calls.
 func indexExprNonimmutableCall(e exprNode) bool {
 	isNonimmutable := func(name string) bool {
 		switch strings.ToLower(name) {
-		case "uuidv4", "uuidv7", "now", "clock_timestamp",
+		case "uuidv4", "uuidv7", "now", "clock_timestamp", "current_date",
 			"nextval", "currval", "setval", "lastval", "current_setting":
 			return true
 		}

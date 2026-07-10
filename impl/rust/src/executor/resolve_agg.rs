@@ -552,6 +552,9 @@ pub(crate) fn scalar_func_id(name: &str) -> ScalarFunc {
         // make_interval; the name→kernel mapping is kept for the registry-coverage invariant.
         "make_timestamp" => ScalarFunc::MakeTimestamp,
         "make_timestamptz" => ScalarFunc::MakeTimestamptz,
+        "make_date" => ScalarFunc::MakeDate,
+        "current_date" => ScalarFunc::CurrentDate,
+        "date_part" => ScalarFunc::DatePart,
         // uuid extractors + generators (functions.md §12, entropy.md §3). The generators are
         // volatile (drawn from the entropy seam at eval); the kernel id is still the name.
         "uuid_extract_version" => ScalarFunc::UuidExtractVersion,

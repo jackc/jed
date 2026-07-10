@@ -54,6 +54,26 @@ export function dateClockSpecial(input: string): { offsetDays: bigint; epoch: bo
   }
 }
 
+// makeDate builds a date from its (year, month, day) fields — PostgreSQL's make_date, the
+// makeTimestamp sibling (spec/design/functions.md §11). A negative year is BC; year zero, a bad
+// month/day-for-month, or a day count beyond the finite i32 window traps 22008 (PG "date field
+// value out of range"). The same daysFromCivil calendar core as parseDate, so the two cannot drift.
+export function makeDate(year: bigint, month: bigint, day: bigint): bigint {
+  const err = (): EngineError => fieldOverflow("date field value out of range");
+  if (year === 0n) throw err();
+  const bc = year < 0n;
+  const mag = bc ? -year : year;
+  // Only an i64-overflow guard for daysFromCivil (like parseDate's year cap); the real bound is
+  // the finite-i32 day-range check below.
+  if (mag > 9_999_999n) throw err();
+  if (month < 1n || month > 12n) throw err();
+  const astro = bc ? 1n - mag : mag;
+  if (day < 1n || day > daysInMonth(astro, month)) throw err();
+  const days = daysFromCivil(astro, month, day);
+  if (days < DATE_MIN_FINITE || days > DATE_MAX_FINITE) throw err();
+  return days;
+}
+
 // dateClockIsRelative reports whether input names a CLOCK-RELATIVE special — 'today' / 'now' /
 // 'tomorrow' / 'yesterday', but not 'epoch' (a foldable constant).
 export function dateClockIsRelative(input: string): boolean {

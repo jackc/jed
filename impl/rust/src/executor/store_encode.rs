@@ -1654,6 +1654,9 @@ pub(crate) fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) ->
         | ScalarFunc::MakeInterval
         | ScalarFunc::MakeTimestamp
         | ScalarFunc::MakeTimestamptz
+        | ScalarFunc::MakeDate
+        | ScalarFunc::CurrentDate
+        | ScalarFunc::DatePart
         | ScalarFunc::UuidExtractVersion
         | ScalarFunc::UuidExtractTimestamp
         | ScalarFunc::Uuidv4

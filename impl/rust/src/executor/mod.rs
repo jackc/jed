@@ -1794,6 +1794,18 @@ pub(crate) enum ScalarFunc {
     /// make_timestamp, then interprets the wall clock in the session zone (6-arg) or the explicit
     /// `timezone` text (7-arg), charging one `timezone` unit.
     MakeTimestamptz,
+    /// make_date(year, month, day) → date — the MakeTimestamp sibling (functions.md §11); a
+    /// negative year is BC, year zero / bad fields trap 22008.
+    MakeDate,
+    /// CURRENT_DATE (parser-desugared, also callable — functions.md §12, date.md §6): the
+    /// statement clock's day in the session zone — the 'today' literal as a function. STABLE;
+    /// charges one timezone unit beyond operator_eval.
+    CurrentDate,
+    /// date_part(field, source) → f64 — the float8-returning EXTRACT twin (timezones.md §9.2):
+    /// the shared extract kernel, then decimal → f64. The field is a RUNTIME text value validated
+    /// per row; a date source WIDENS TO MIDNIGHT (the timestamp matrix applies — PG's own
+    /// definition); a timestamptz source decomposes in the session zone.
+    DatePart,
     /// uuid_extract_version(uuid) → i16 — the version nibble, NULL off-RFC-variant (§12).
     UuidExtractVersion,
     /// uuid_extract_timestamp(uuid) → timestamptz — the embedded instant for v1/v7, else NULL (§12).

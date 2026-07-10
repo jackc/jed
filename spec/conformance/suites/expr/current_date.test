@@ -1,0 +1,57 @@
+# CURRENT_DATE (spec/design/functions.md §12, date.md §6) — the SQL-standard niladic current-date:
+# the STATEMENT clock's day in the SESSION zone (here the default UTC) — exactly the 'today'
+# clock-relative literal as a function, sharing its STABLE statement-clock read and its one
+# timezone cost unit. The parser desugars the bare keyword to the current_date() catalog function
+# (like CURRENT_TIMESTAMP → now()); jed ALSO resolves the explicit call form current_date(), which
+# PostgreSQL rejects as a syntax error — a documented jed-lenient divergence, which is why this
+# file is NOT oracle-imported (that, PG's differing wall clock, and PG's parse-time fold). The
+# `# clock:` directive pins the statement clock (1721056591872000 µs = 2024-07-15 15:16:31.872
+# UTC), so values are exact and byte-identical across Rust/Go/TS.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.index_expr, dml.insert, query.select, query.select_no_from, types.i32, types.date, types.boolean, types.date_clock_literal, func.current_date, cast.string_literal, cast.operator, expr.date_arithmetic, resource.cost_metering
+
+# --- the bare keyword: one STABLE node (operator_eval + timezone), labeled current_date ----------
+# clock: 1721056591872000
+# types: date
+# names: current_date
+# cost: 3
+query T nosort
+SELECT current_date
+----
+2024-07-15
+
+# the explicit call form also resolves (PG rejects it as a syntax error — jed-lenient)
+# clock: 1721056591872000
+# cost: 3
+query T nosort
+SELECT current_date()
+----
+2024-07-15
+
+# --- CURRENT_DATE is the 'today' literal as a function: same clock, same day ---------------------
+# clock: 1721056591872000
+query B nosort
+SELECT current_date = 'today'::date
+----
+true
+
+# STABLE under an advancing clock: the statement clock is read once and shared
+# clock_advance: 1721056591872000,86400000000
+query B nosort
+SELECT current_date = 'today'::date
+----
+true
+
+# --- composes as a date value --------------------------------------------------------------------
+# clock: 1721056591872000
+query T nosort
+SELECT current_date + 30
+----
+2024-08-14
+
+# --- un-indexable (42P17), like every clock reader ------------------------------------------------
+statement ok
+CREATE TABLE t (id integer PRIMARY KEY, d date)
+
+statement error 42P17
+CREATE INDEX bad_cd_idx ON t ((d - current_date))

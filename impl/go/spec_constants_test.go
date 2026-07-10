@@ -458,6 +458,12 @@ func TestRegistryCoversCatalog(t *testing.T) {
 			return resolvedType{kind: rtUuid}
 		case "interval":
 			return resolvedType{kind: rtInterval}
+		case "date":
+			return resolvedType{kind: rtDate}
+		case "timestamp":
+			return resolvedType{kind: rtTimestamp}
+		case "timestamptz":
+			return resolvedType{kind: rtTimestamptz}
 		case "text":
 			return resolvedType{kind: rtText}
 		case "bytea":
@@ -556,9 +562,10 @@ func TestRegistryCoversCatalog(t *testing.T) {
 		if _, ok := scalarTypeFromName(o.Result); o.Result != "promoted" && !ok {
 			t.Fatalf("function %s has unhandled result code %s", o.Name, o.Result)
 		}
-		// make_interval / make_timestamp / make_timestamptz resolve on their own named path (§11);
-		// the rest match via the registry.
+		// make_interval / make_timestamp / make_timestamptz / make_date resolve on their own named
+		// path (§11); the rest match via the registry.
 		if o.Name != "make_interval" && o.Name != "make_timestamp" && o.Name != "make_timestamptz" &&
+			o.Name != "make_date" &&
 			lookupScalarOverload(o.Name, tys) == nil {
 			t.Fatalf("function %s %v has no registry overload", o.Name, o.ArgFamilies)
 		}

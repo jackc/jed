@@ -4130,7 +4130,8 @@ pub(crate) fn index_name_part(elem: &crate::ast::IndexKeyElem) -> String {
 
 /// Whether an index-key expression calls a **non-immutable** built-in (spec/design/indexes.md §2):
 /// the entropy/clock seam (`uuidv4`/`uuidv7`/`now`/`clock_timestamp` — `current_timestamp` desugars
-/// to `now`) or the sequence functions (`nextval`/`currval`/`setval`/`lastval`) / `current_setting`.
+/// to `now` — and `current_date`, the bare keyword's own catalog function) or the sequence
+/// functions (`nextval`/`currval`/`setval`/`lastval`) / `current_setting`.
 /// Such a function would let the index drift from the table, so it is `42P17` at CREATE INDEX. The
 /// walk mirrors [`check_referenced_columns`] (subqueries are already rejected by resolution). The
 /// session-timezone hazard (an expression over `timestamptz`) is handled separately by the caller
@@ -4143,6 +4144,7 @@ pub(crate) fn index_expr_nonimmutable_call(e: &Expr) -> bool {
                 | "uuidv7"
                 | "now"
                 | "clock_timestamp"
+                | "current_date"
                 | "nextval"
                 | "currval"
                 | "setval"
