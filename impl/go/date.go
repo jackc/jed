@@ -27,6 +27,41 @@ const (
 	dateMaxFinite int64 = 2147483646
 )
 
+// dateClockSpecial classifies a date-input string as one of PostgreSQL's special values beyond
+// ±infinity (spec/design/date.md §6): 'epoch' (the constant 1970-01-01 — epoch=true), and the
+// CLOCK-RELATIVE words 'today' / 'now' (offset 0), 'tomorrow' (+1), 'yesterday' (−1) — the
+// statement-clock day in the session zone, shifted by offset days. Case-insensitive, whitespace
+// trimmed (like parseDate's own specials). ok=false for every other string; parseDate itself
+// stays pure and continues to reject these words (its callers classify first where the specials
+// are admitted — literal adaptation and the explicit casts, never the assignment coercions).
+func dateClockSpecial(input string) (offsetDays int32, epoch, ok bool) {
+	switch strings.ToLower(trimASCIIWS(input)) {
+	case "epoch":
+		return 0, true, true
+	case "now", "today":
+		return 0, false, true
+	case "tomorrow":
+		return 1, false, true
+	case "yesterday":
+		return -1, false, true
+	}
+	return 0, false, false
+}
+
+// dateClockIsRelative reports whether input names a CLOCK-RELATIVE special — 'today' / 'now' /
+// 'tomorrow' / 'yesterday', but not 'epoch' (a foldable constant).
+func dateClockIsRelative(input string) bool {
+	_, epoch, ok := dateClockSpecial(input)
+	return ok && !epoch
+}
+
+// dateClockIsSpecial reports whether input names ANY date special beyond ±infinity —
+// clock-relative or the constant 'epoch'.
+func dateClockIsSpecial(input string) bool {
+	_, _, ok := dateClockSpecial(input)
+	return ok
+}
+
 // ParseDate parses a date literal to its i32 day count since 1970-01-01. The grammar is the
 // full timestamp literal grammar (spec/design/timestamp.md §3), but only the date portion is
 // kept: a trailing time and/or offset is validated then discarded, and 24:00:00 does not advance
@@ -41,6 +76,11 @@ func parseDate(input string) (int32, error) {
 		return datePosInfinity, nil
 	case "-infinity":
 		return dateNegInfinity, nil
+	case "epoch":
+		// PG's constant special: 1970-01-01 (day 0). The CLOCK-relative specials (today/now/…)
+		// are deliberately NOT parseDate's — it stays a pure function; they resolve a level
+		// above (dateClockSpecial → the STABLE node / literal adaptation, date.md §6).
+		return 0, nil
 	}
 
 	bc := false

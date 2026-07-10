@@ -252,6 +252,26 @@ impl Engine {
                                     &stmt_rng,
                                     &mut meter,
                                 )?,
+                                // A date-special string in a VALUES slot is LITERAL adaptation
+                                // (date.md §6): 'epoch' is the constant 1970-01-01, and a
+                                // clock-relative word ('today'/'now'/…) names the statement-clock
+                                // day in the session zone, computed here through the shared
+                                // stmt_rng — never a stored constant. An ordinary date string
+                                // takes the normal materialize path (parse to a value);
+                                // non-literal text DATA (INSERT … SELECT, a $N bind) stays strict —
+                                // the specials are literal/cast syntax, not an assignment coercion.
+                                InsertValue::Lit(Literal::Text(s))
+                                    if matches!(&col_types[i], ColType::Scalar(sc) if sc.is_date())
+                                        && crate::date::date_clock_special(s).is_some() =>
+                                {
+                                    let (offset_days, epoch) = crate::date::date_clock_special(s)
+                                        .expect("guard matched a special");
+                                    if epoch {
+                                        Value::Date(0)
+                                    } else {
+                                        date_clock_value(self, &stmt_rng, &mut meter, offset_days)?
+                                    }
+                                }
                                 other => materialize_insert_value(other, &col_types[i], &bound)?,
                             };
                         }

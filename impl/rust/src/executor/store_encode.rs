@@ -873,8 +873,18 @@ pub(crate) fn eval_date_convert(
     match (v, to) {
         // text -> date (the runtime text → date cast, date.md §6): the per-row string runs the
         // SAME parse_date the literal form folds at resolve — 22007 malformed / 22008 out of
-        // range, per row. Zone-free (the node's operator_eval meters it).
-        (Value::Text(s), ScalarType::Date) => Ok(Value::Date(crate::date::parse_date(&s)?)),
+        // range, per row. Zone-free (the node's operator_eval meters it) — EXCEPT a
+        // clock-relative special ('today'/'now'/…), which names the statement-clock day in the
+        // session zone (a zone consult, charging timezone) — the reason this cast is STABLE.
+        (Value::Text(s), ScalarType::Date) => {
+            if let Some((offset_days, epoch)) = crate::date::date_clock_special(&s) {
+                if epoch {
+                    return Ok(Value::Date(0));
+                }
+                return date_clock_value(env.exec, env.rng, m, offset_days);
+            }
+            Ok(Value::Date(crate::date::parse_date(&s)?))
+        }
         // timestamp -> date (zone-free): the date part.
         (Value::Timestamp(mc), ScalarType::Date) => Ok(micros_to_date(mc)),
         // date -> timestamp (zone-free): midnight.
@@ -932,6 +942,38 @@ pub(crate) fn eval_date_convert(
             "resolver restricts DateConvert to cross-family datetime casts and text → date"
         ),
     }
+}
+
+/// Compute a clock-relative date (date.md §6): the STATEMENT clock's day in the SESSION zone,
+/// shifted by `offset_days` (`'today'`/`'now'` 0, `'tomorrow'` +1, `'yesterday'` −1). STABLE —
+/// the statement clock is read once per statement and reused (entropy.md §5), so every row and
+/// every clock-relative literal in a statement see the same day. The zone consultation charges
+/// one `timezone` unit, like every session-zone consumer (timezones.md §10); the caller's node
+/// charges its own `operator_eval`. Shared by the `DateClock` eval, the runtime text→date cast's
+/// special path, and the INSERT VALUES literal-adaptation site (env-less, hence the split args).
+pub(crate) fn date_clock_value(
+    exec: &Engine,
+    rng: &std::cell::Cell<crate::seam::StmtRng>,
+    m: &mut Meter,
+    offset_days: i32,
+) -> Result<Value> {
+    const MICROS_PER_DAY: i64 = 86_400 * 1_000_000;
+    let zr = exec.session.time_zone.clone();
+    m.charge(COSTS.timezone);
+    m.guard()?;
+    let mut r = rng.get();
+    let clock = r.statement_clock_micros(&exec.session.seam);
+    rng.set(r);
+    let days = crate::timezone::instant_to_local_micros(&zr, clock).div_euclid(MICROS_PER_DAY)
+        + offset_days as i64;
+    if !((i32::MIN as i64 + 1)..=(i32::MAX as i64 - 1)).contains(&days) {
+        // Unreachable from a real clock; an injected extreme clock still traps deterministically.
+        return Err(EngineError::new(
+            SqlState::DatetimeFieldOverflow,
+            "date out of range",
+        ));
+    }
+    Ok(Value::Date(days as i32))
 }
 
 /// Midnight (00:00:00) of a `date` as timestamp microseconds, preserving the ±infinity sentinels.

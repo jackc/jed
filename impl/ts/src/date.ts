@@ -31,6 +31,36 @@ export const DATE_POS_INFINITY = 2147483647n;
 const DATE_MIN_FINITE = -2147483647n;
 const DATE_MAX_FINITE = 2147483646n;
 
+// dateClockSpecial classifies a date-input string as one of PostgreSQL's special values beyond
+// ±infinity (spec/design/date.md §6): 'epoch' (the constant 1970-01-01 — epoch=true), and the
+// CLOCK-RELATIVE words 'today' / 'now' (offset 0), 'tomorrow' (+1), 'yesterday' (−1) — the
+// statement-clock day in the session zone, shifted by offset days. Case-insensitive, whitespace
+// trimmed (like parseDate's own specials). null for every other string; parseDate itself stays
+// pure and continues to reject these words (its callers classify first where the specials are
+// admitted — literal adaptation and the explicit casts, never the assignment coercions).
+export function dateClockSpecial(input: string): { offsetDays: bigint; epoch: boolean } | null {
+  switch (trimASCIIWS(input).toLowerCase()) {
+    case "epoch":
+      return { offsetDays: 0n, epoch: true };
+    case "now":
+    case "today":
+      return { offsetDays: 0n, epoch: false };
+    case "tomorrow":
+      return { offsetDays: 1n, epoch: false };
+    case "yesterday":
+      return { offsetDays: -1n, epoch: false };
+    default:
+      return null;
+  }
+}
+
+// dateClockIsRelative reports whether input names a CLOCK-RELATIVE special — 'today' / 'now' /
+// 'tomorrow' / 'yesterday', but not 'epoch' (a foldable constant).
+export function dateClockIsRelative(input: string): boolean {
+  const sp = dateClockSpecial(input);
+  return sp !== null && !sp.epoch;
+}
+
 // parseDate parses a date literal to its i32 day count (a bigint in [DATE_MIN_FINITE,
 // DATE_MAX_FINITE], or a ±infinity sentinel) since 1970-01-01. The grammar is the full timestamp
 // literal grammar (spec/design/timestamp.md §3), but only the date portion is kept: a trailing
@@ -42,6 +72,10 @@ export function parseDate(input: string): bigint {
 
   if (low === "infinity" || low === "+infinity") return DATE_POS_INFINITY;
   if (low === "-infinity") return DATE_NEG_INFINITY;
+  // PG's constant special: 1970-01-01 (day 0). The CLOCK-relative specials (today/now/…) are
+  // deliberately NOT parseDate's — it stays a pure function; they resolve a level above
+  // (dateClockSpecial → the STABLE node / literal adaptation, date.md §6).
+  if (low === "epoch") return 0n;
 
   let bc = false;
   let body = s;

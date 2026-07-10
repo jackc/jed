@@ -994,6 +994,10 @@ pub(crate) fn is_column(e: &RExpr, col_global: usize) -> bool {
 pub(crate) fn rexpr_is_constant(e: &RExpr) -> bool {
     match e {
         RExpr::Column(_) | RExpr::OuterColumn { .. } | RExpr::Subquery { .. } => false,
+        // A DateClock is row-independent but EXECUTION-scoped (the statement clock + session
+        // zone) — conservatively not a "constant", so no plan-time consumer ever evaluates it
+        // without a live statement environment (date.md §6).
+        RExpr::DateClock { .. } => false,
         RExpr::ConstInt(_)
         | RExpr::ConstBool(_)
         | RExpr::ConstText(_)

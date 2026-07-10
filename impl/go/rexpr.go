@@ -404,9 +404,16 @@ const (
 	// computed in the session zone (charging timezone).
 	reExtract
 	// reDateConvert is a cross-family datetime cast (timezones.md §9.3): operand cast to `result`
-	// (timestamp/timestamptz/date) from another datetime family. The casts crossing the timestamptz
-	// boundary consult the session zone (charging timezone); ±infinity and NULL pass through.
+	// (timestamp/timestamptz/date) from another datetime family — or the runtime text → date cast
+	// (date.md §6). The casts crossing the timestamptz boundary consult the session zone (charging
+	// timezone); ±infinity and NULL pass through.
 	reDateConvert
+	// reDateClock is a clock-relative date literal — 'today' / 'now' (0), 'tomorrow' (+1),
+	// 'yesterday' (−1) — resolved to a STABLE node, never folded (date.md §6): at eval it reads the
+	// STATEMENT clock (once per statement, like now()) and takes its day in the SESSION zone
+	// (charging timezone), shifted by cInt days. Flagged non-immutable at birth (42P17 in an index
+	// expression). 'epoch' is not this node — it folds to the constant 1970-01-01.
+	reDateClock
 	reCase
 	// reScalarFunc is a scalar-function call (abs/round, spec/design/functions.md §9),
 	// evaluated per row in any context.

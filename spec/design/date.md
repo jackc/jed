@@ -17,10 +17,10 @@
 `timestamp`/`timestamptz`. This slice implements the **core type** — storage, ISO literals,
 comparison/ordering, rendering, the `±infinity` sentinels, and a `date` PRIMARY KEY — mirroring
 the original timestamp slice. **Date arithmetic** (`date ± int`, `date - date`, `date ± interval`)
-has since **landed** (§6); the cross-family `date ↔ timestamp`/`timestamptz` **casts** have landed
-too (timezones.md §9.3), and so has the **runtime `text → date` cast** (§6 — STABLE, un-indexable),
-while the clock-relative literals stay **deferred follow-ons** (§6), exactly as the timestamp slice
-deferred its own. The non-goal is wire/`pg_catalog` fidelity
+has since **landed** (§6); so have the cross-family `date ↔ timestamp`/`timestamptz` **casts**
+(timezones.md §9.3), the **runtime `text → date` cast** (§6 — STABLE, un-indexable), and the
+**clock-relative literals** (`today`/`now`/`tomorrow`/`yesterday` as a STABLE node, `epoch` as a
+constant — §6). The non-goal is wire/`pg_catalog` fidelity
 (CLAUDE.md §1); the goal is PG's *observable* date behavior on the surface we implement.
 
 ## 1. Representation — i32 days since the Unix epoch
@@ -83,9 +83,12 @@ offset   := 'Z' | ('+'|'-') HH [ ':' MM [ ':' SS ] ]
 Rules (all identical to timestamp §3 unless noted):
 
 - **Special values (checked first).** `infinity` / `-infinity` (case-insensitive, optional
-  leading `+` on `infinity`) parse directly to the `i32::MAX` / `i32::MIN` sentinels. The
-  clock-relative specials (`today`, `tomorrow`, `yesterday`, `now`) and the `epoch` alias are
-  **not** accepted this slice (deferred); they trap `22007`.
+  leading `+` on `infinity`) parse directly to the `i32::MAX` / `i32::MIN` sentinels, and
+  **`epoch`** parses to the constant day 0 (1970-01-01) — a pure constant, so it belongs to
+  `parse_date` itself (PG's `date_in` special). The **clock-relative** specials (`today`,
+  `tomorrow`, `yesterday`, `now`) are deliberately **not** `parse_date`'s — they need the
+  statement clock + session zone, so they resolve a **level above** it (the STABLE date-clock
+  node, §6); `parse_date` stays a pure function and traps them `22007`.
 - **Date is required; time/offset are optional and discarded.** `'2024-01-01'`,
   `'2024-01-01 12:34:56'`, `'2024-01-01T12:34:56.789+05'` all parse to the **same** date
   `2024-01-01`. The time and offset are still **parsed and validated** (a malformed or
@@ -256,6 +259,54 @@ The accepted grammar agrees with PostgreSQL and is oracle-checked
 `:60`) are per-core tested, identical to the literal path. `text → timestamp`/`timestamptz`,
 `datetime → text`, and `text → interval`/`bytea` stay deferred, each its own follow-on.
 
+### Clock-relative literals — landed, as a STABLE node
+
+The special date-input words beyond `±infinity` (PG's `date_in` set): **`epoch`** is the
+constant 1970-01-01 and folds like any date literal (it lives in `parse_date` itself, §2). The
+**clock-relative** words — **`today`** / **`now`** (offset 0), **`tomorrow`** (+1),
+**`yesterday`** (−1) — name the **statement clock's day in the session zone**, shifted by the
+offset. Case-insensitive, whitespace-trimmed.
+
+**The design decision: a STABLE runtime node, never a fold.** A clock-relative word resolves to
+a dedicated node (`DateClock`/`reDateClock`/`dateClock`) that reads, **at eval**, the
+once-per-statement statement clock ([entropy.md §5](entropy.md) — the same read `now()` caches)
+and decomposes it in the **session `TimeZone`** ([timezones.md §9.4](timezones.md), one
+`timezone` cost unit per evaluation beyond the node's `operator_eval`; `epoch` is a plain
+constant — no clock read, no node cost). PostgreSQL instead **folds the literal at parse time**
+— the famous frozen-`'today'` footgun — which produces three deliberate, documented divergences,
+each falling on jed's side of "honest to the clock":
+
+1. **`DEFAULT 'today'` re-evaluates per INSERT.** It routes to the expression-DEFAULT path
+   (constraints.md §2) instead of the CREATE-TABLE constant fold; PG freezes the
+   table-creation day (probed: `pg_get_expr` shows `'2026-07-10'::date`).
+2. **A cached plan tracks the clock.** The node is re-evaluated per execution, so a prepared
+   statement's plan cache (api.md §2.4) stays valid — the node flags `nonimmutable`, *not*
+   `uncacheable`. PG binds the day at prepare time.
+3. **Un-indexable — `42P17`.** An index expression or predicate containing a clock-relative
+   literal is rejected at `CREATE INDEX` (via the same `ParamTypes.nonimmutable` birth-flag the
+   runtime text→date cast uses, indexes.md §2); PG silently folds the literal into the index
+   definition (probed: `((d - 'tomorrow'::date))` becomes `((d - '2026-07-11'::date))`).
+
+**Where the specials are recognized — literal/cast syntax, not data.** They are evaluated by
+(a) **literal adaptation** — a string literal in a date context, including an `INSERT VALUES`
+slot and an `UPDATE SET`; (b) the **`DATE '…'` typed literal**; (c) the **cast of a literal**
+(`'today'::date`); and (d) the **runtime `text → date` cast** — per row, against the statement
+clock (the reason that cast is STABLE, above). They are deliberately **not** evaluated by the
+**assignment coercion of non-literal text data** — `INSERT … SELECT` of a text projection, a
+`$N` bind value, array/range/composite text input — which stays strict (`22007`, where PG's
+`date_in` evaluates them anywhere): a clock read hiding inside row *data* is the footgun, and an
+explicit `::date` cast is the opt-in. (`epoch`, being a constant in `parse_date`, works on every
+input path, exactly like PG.)
+
+STABLE means statement-stable: the clock is read **once per statement**, so every row and every
+clock-relative literal in one statement see the same day — pinned by the corpus under an
+advancing injected clock (`suites/types/date_clock.test`, the `# clock:`/`# clock_advance:`
+directives; not oracle-imported, since PG's wall clock differs and PG folds). The session-zone
+interaction and the never-folds property are per-core tested (`date_clock` tests — the corpus
+cannot set a session zone). The determinism ledger carries the clock read as the class-B
+`date-clock-literal` entry ([determinism.md](determinism.md)); the timestamp family's own `now`
+literal stays deferred (`22007`), its own follow-on.
+
 ### Still deferred
 
 Scoped out (each its own future slice), matching the timestamp/interval precedent:
@@ -263,8 +314,6 @@ Scoped out (each its own future slice), matching the timestamp/interval preceden
 - **Casts** — `date(p)`-style typmods (there are none) and the implicit `date → timestamp`
   coercion that would make `date < timestamp` well-typed (§4) — `date` stays a strict comparison
   island.
-- **Clock-relative literals** — `today` / `tomorrow` / `yesterday` / `now` / `epoch` (on the
-  entropy/clock seam, [entropy.md](entropy.md), like the deferred timestamp `now` literal).
 - **Date functions** — `make_date`, `date_part` (float8 — needs `float`), `current_date`.
   (`EXTRACT(field FROM date)` and `date_trunc` over the datetime family have **landed** with the tz
   conversion slice — timezones.md §9 / datetime_fn.)
@@ -290,3 +339,9 @@ Scoped out (each its own future slice), matching the timestamp/interval preceden
 8. **Own family** — a distinct `Value` variant and type code (16); never collapse to the i32
    variant (results render via the value's own `render()`, which needs the type). `date ×
    timestamp` is `42804`.
+9. **Clock specials split by layer** — `epoch` is `parse_date`'s (a constant, every input path);
+   the clock-relative words are the resolver's / the explicit casts' (the STABLE node), never
+   `parse_date`'s and never the assignment-coercion paths' (§6). The node computes
+   `floor_div(instant_to_local_micros(session_zone, statement_clock), 86 400e6) + offset` —
+   floored division (a pre-epoch instant must round toward −∞), one `timezone` charge, and the
+   statement clock read through the same cached `StmtRng` read `now()` uses.

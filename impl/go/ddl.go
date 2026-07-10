@@ -468,7 +468,15 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 			}
 		} else if def.Default != nil {
 			ty := colType.Scalar
-			if def.Default.Expr.Kind == exprLiteral {
+			// A clock-relative date string DEFAULT ('today'/'now'/…) must NOT fold at CREATE
+			// TABLE: it routes to the EXPRESSION path below, re-resolved to the STABLE
+			// reDateClock node and evaluated per INSERT — where PostgreSQL folds the literal to
+			// the table-creation day, the documented fold-footgun divergence (date.md §6).
+			// 'epoch' and every ordinary date string stay foldable constants.
+			clockDefault := ty == scalarDate && def.Default.Expr.Kind == exprLiteral &&
+				def.Default.Expr.Literal.Kind == literalText &&
+				dateClockIsRelative(def.Default.Expr.Literal.Str)
+			if def.Default.Expr.Kind == exprLiteral && !clockDefault {
 				dv, err := storeValue(literalToValue(*def.Default.Expr.Literal), ty, decimal, varcharLen, false, def.Name)
 				if err != nil {
 					return outcome{}, err

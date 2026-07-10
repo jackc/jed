@@ -970,10 +970,11 @@ export class ParamTypes {
   uncacheable = false;
   // nonimmutable is set during resolution when a node is created whose value depends on
   // statement-execution context rather than its inputs alone: the runtime text→date cast (STABLE —
-  // its input grammar admits the clock-relative specials, date.md §6). The expression-index gate
-  // consults it to reject such an expression 42P17 (indexes.md §2), the same way PostgreSQL's
-  // stable date_in is unindexable. Orthogonal to uncacheable: these nodes re-evaluate per
-  // execution, so the resolved plan stays cacheable.
+  // its input grammar admits the clock-relative specials) and the dateClock clock-relative date
+  // literal ('today'/'now'/…, date.md §6). The expression-index gate consults it to reject such an
+  // expression 42P17 (indexes.md §2), the same way PostgreSQL's stable date_in is unindexable.
+  // Orthogonal to uncacheable: these nodes re-evaluate per execution, so the resolved plan stays
+  // cacheable.
   nonimmutable = false;
 
   // note records that $(idx0+1) appears with context type ty (null = no context here). It unifies

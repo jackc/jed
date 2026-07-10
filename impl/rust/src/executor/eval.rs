@@ -1465,6 +1465,14 @@ impl RExpr {
                 }
                 eval_date_convert(v, *to, env, m)
             }
+            RExpr::DateClock { offset_days } => {
+                // A clock-relative date literal ('today'/'now'/'tomorrow'/'yesterday' —
+                // date.md §6): the statement clock's day in the session zone + offset_days.
+                // STABLE — the clock is read once per statement, so every evaluation in the
+                // statement yields the same day.
+                m.charge(COSTS.operator_eval);
+                date_clock_value(env.exec, env.rng, m, *offset_days)
+            }
             RExpr::Case {
                 arms,
                 els,

@@ -68,6 +68,13 @@
   date '2024-03-01' - date '2024-01-15'     AS days_between,
   date '2024-01-31' + interval '1 month'    AS month_clamped,
   date '2024-01-15' - interval '12 hours'   AS midnight_minus;`;
+
+	const dateClockDemo = `SELECT
+  'today'::date                 AS today,
+  date 'tomorrow'               AS tomorrow,
+  'yesterday'::date             AS yesterday,
+  'epoch'::date                 AS epoch,
+  'tomorrow'::date - 'today'    AS one_day;`;
 </script>
 
 <svelte:head>
@@ -231,6 +238,15 @@ returns a `timestamp` (month steps clamp the day-of-month, so Jan 31 + 1 month i
 year). The `±infinity` dates absorb any shift, and an out-of-range result raises `22008`:
 
 <LiveSql query={dateArithDemo} rows={1} />
+
+A date literal also accepts PostgreSQL's special words: `'epoch'` (1970-01-01) and the
+**clock-relative** `'today'` / `'now'` / `'tomorrow'` / `'yesterday'` — the current day in the
+session time zone. Unlike PostgreSQL, jed **never freezes** a clock-relative word into a constant:
+`DEFAULT 'today'` re-evaluates on every INSERT (PostgreSQL locks in the table-creation day), a
+prepared statement tracks the clock, and an index expression containing one is rejected rather
+than silently frozen:
+
+<LiveSql query={dateClockDemo} rows={1} />
 
 
 See the full [type reference](../../reference/types/) for every scalar type and its range.

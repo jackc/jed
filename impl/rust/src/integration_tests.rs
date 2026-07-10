@@ -61,6 +61,8 @@ mod create_table;
 mod cte;
 #[path = "../tests/date.rs"]
 mod date;
+#[path = "../tests/date_clock.rs"]
+mod date_clock;
 #[path = "../tests/datetime_conversions.rs"]
 mod datetime_conversions;
 #[path = "../tests/decimal.rs"]

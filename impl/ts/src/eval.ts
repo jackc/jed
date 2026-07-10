@@ -49,6 +49,7 @@ import {
   decodeUuidLiteral,
   elemJsonText,
   encodeBytea,
+  dateClockValue,
   evalArrayFunc,
   evalDateArith,
   evalDateConvert,
@@ -1015,6 +1016,13 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       const v = evalExpr(e.inner, row, env, m);
       if (v.kind === "null") return nullValue();
       return evalDateConvert(v, e.to, env, m);
+    }
+    case "dateClock": {
+      // A clock-relative date literal ('today'/'now'/'tomorrow'/'yesterday' — date.md §6): the
+      // statement clock's day in the session zone + offsetDays. STABLE — the clock is read once
+      // per statement, so every evaluation in the statement yields the same day.
+      m.charge(COSTS.operatorEval);
+      return dateClockValue(env.exec, env.rng, env.seam, m, e.offsetDays);
     }
     case "case": {
       // CASE is the ONE deliberate exception to "no short-circuit" (cost.md §3): conditions are

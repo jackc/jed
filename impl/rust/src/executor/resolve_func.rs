@@ -1136,11 +1136,30 @@ pub(crate) struct ParamTypes {
     pub(crate) uncacheable: bool,
     /// Set during resolution when a node is created whose value depends on statement-execution
     /// context rather than its inputs alone: the runtime text→date cast (STABLE — its input
-    /// grammar admits the clock-relative specials, date.md §6). The expression-index gate consults
-    /// it to reject such an expression 42P17 (indexes.md §2), the same way PostgreSQL's stable
-    /// `date_in` is unindexable. Orthogonal to `uncacheable`: these nodes re-evaluate per
-    /// execution, so the resolved plan stays cacheable.
+    /// grammar admits the clock-relative specials) and the `DateClock` clock-relative date
+    /// literal (`'today'`/`'now'`/…, date.md §6). The expression-index gate consults it to reject
+    /// such an expression 42P17 (indexes.md §2), the same way PostgreSQL's stable `date_in` is
+    /// unindexable. Orthogonal to `uncacheable`: these nodes re-evaluate per execution, so the
+    /// resolved plan stays cacheable.
     pub(crate) nonimmutable: bool,
+}
+
+/// Resolve a date-context string literal naming one of the special values beyond ±infinity
+/// (date.md §6): `'epoch'` folds to the constant 1970-01-01 like any date literal, while the
+/// CLOCK-RELATIVE words `'today'` / `'now'` / `'tomorrow'` / `'yesterday'` become the STABLE
+/// `DateClock` node — the statement clock's day in the session zone, computed at EVAL and never
+/// folded at resolve. (PostgreSQL folds the literal at parse — the frozen-'today'
+/// DEFAULT/index/prepared-statement footgun — a documented divergence; jed's node re-evaluates
+/// per execution, so a cached plan tracks the clock.) The node flags the plan non-immutable,
+/// exactly like the runtime text→date cast (42P17 in an index expression). `None` for an
+/// ordinary date string, which takes the caller's normal parse-to-constant path.
+fn date_clock_literal(s: &str, params: &mut ParamTypes) -> Option<(RExpr, ResolvedType)> {
+    let (offset_days, epoch) = crate::date::date_clock_special(s)?;
+    if epoch {
+        return Some((RExpr::ConstDate(0), ResolvedType::Date));
+    }
+    params.nonimmutable = true;
+    Some((RExpr::DateClock { offset_days }, ResolvedType::Date))
 }
 
 impl ParamTypes {
@@ -2805,8 +2824,13 @@ pub(crate) fn resolve(
                     ResolvedType::Timestamptz,
                 )),
                 // A string adapts to a DATE context (parse the ISO date, dropping any time/offset;
-                // 22007/22008 — spec/design/date.md §2), exactly like timestamp adaptation.
+                // 22007/22008 — spec/design/date.md §2), exactly like timestamp adaptation. A
+                // clock-relative special ('today'/'now'/…) becomes the STABLE DateClock node
+                // instead of a constant (date.md §6).
                 Some(t) if t.is_date() => {
+                    if let Some((node, rt)) = date_clock_literal(s, params) {
+                        return Ok((node, rt));
+                    }
                     Ok((RExpr::ConstDate(parse_date(s)?), ResolvedType::Date))
                 }
                 // A string adapts to an INTERVAL context (parse the "unit + time" subset,
@@ -2868,6 +2892,13 @@ pub(crate) fn resolve(
                 return coerce_string_to_range_expr(text, desc);
             }
             let (target, _, _) = resolve_type_and_typmod(type_name, &None)?;
+            // DATE 'today' / DATE 'now' / … — the clock-relative specials become the STABLE
+            // DateClock node, exactly like the ctx-adaptation form (date.md §6).
+            if target.is_date() {
+                if let Some((node, rt)) = date_clock_literal(text, params) {
+                    return Ok((node, rt));
+                }
+            }
             coerce_string_literal(text, target, None, None)
         }
         // A subquery in expression position (spec/design/grammar.md §26): PLANNED ONCE against the
@@ -3169,6 +3200,13 @@ pub(crate) fn resolve(
             // text operand still falls through to the deferred 0A000 below. A `varchar(n)` target
             // truncates the literal to n code points (types.md §15).
             if let Expr::Literal(Literal::Text(s)) = inner.as_ref() {
+                // 'today'::date / CAST('now' AS date) — the clock-relative specials become the
+                // STABLE DateClock node, exactly like the ctx-adaptation form (date.md §6).
+                if target.is_date() {
+                    if let Some((node, rt)) = date_clock_literal(s, params) {
+                        return Ok((node, rt));
+                    }
+                }
                 return coerce_string_literal(s, target, typmod, varchar_len);
             }
             // Cross-family datetime casts (timezones.md §9.3): a `timestamp`/`timestamptz`/`date`

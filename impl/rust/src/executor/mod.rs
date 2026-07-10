@@ -2434,12 +2434,21 @@ pub(crate) enum RExpr {
         value: Box<RExpr>,
     },
     /// A cross-family datetime cast (timezones.md §9.3) to `to` (`timestamp`/`timestamptz`/`date`)
-    /// from another datetime family — the runtime `Value` carries the source family. Casts crossing
-    /// the `timestamptz` boundary consult the session zone (charging `timezone`); `±infinity` and
-    /// NULL pass through. `to` is one of `Timestamp` / `Timestamptz` / `Date`.
+    /// from another datetime family — the runtime `Value` carries the source family — or the
+    /// runtime text → date cast (date.md §6). Casts crossing the `timestamptz` boundary consult
+    /// the session zone (charging `timezone`); `±infinity` and NULL pass through. `to` is one of
+    /// `Timestamp` / `Timestamptz` / `Date`.
     DateConvert {
         inner: Box<RExpr>,
         to: ScalarType,
+    },
+    /// A clock-relative date literal — `'today'` / `'now'` (0), `'tomorrow'` (+1), `'yesterday'`
+    /// (−1) — resolved to a STABLE node, never folded (date.md §6): at eval it reads the
+    /// STATEMENT clock (once per statement, like `now()`) and takes its day in the SESSION zone
+    /// (charging `timezone`), shifted by `offset_days`. Flagged non-immutable at birth (42P17 in
+    /// an index expression). `'epoch'` is not this node — it folds to the constant 1970-01-01.
+    DateClock {
+        offset_days: i32,
     },
     /// A resolved `CASE` (grammar.md §23). `arms` is `(condition, result)` pairs — the condition
     /// is the searched boolean predicate, or the simple form's resolved `operand = value`

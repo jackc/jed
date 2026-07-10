@@ -757,6 +757,8 @@ pub(crate) fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
         | RExpr::ConstInterval(_)
         | RExpr::ConstArray(_)
         | RExpr::ConstRange(_)
+        // A DateClock leaf references no outer column.
+        | RExpr::DateClock { .. }
         | RExpr::ConstNull => false,
     }
 }
@@ -914,6 +916,8 @@ pub(crate) fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
         | RExpr::ConstInterval(_)
         | RExpr::ConstArray(_)
         | RExpr::ConstRange(_)
+        // A DateClock leaf touches no stored column.
+        | RExpr::DateClock { .. }
         | RExpr::ConstNull => {}
     }
 }

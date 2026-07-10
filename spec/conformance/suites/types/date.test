@@ -156,9 +156,8 @@ INSERT INTO t VALUES (8, 123)
 statement error 22007
 INSERT INTO t VALUES (9, 'not a date')
 
-# a clock-relative special (today/now/...) is deferred this slice: 22007
-statement error 22007
-INSERT INTO t VALUES (10, 'today')
+# (the clock-relative specials — today/now/tomorrow/yesterday/epoch — have since LANDED; they are
+# exercised with an injected statement clock in types/date_clock.test)
 
 # an out-of-range field traps 22008: month 13 ...
 statement error 22008

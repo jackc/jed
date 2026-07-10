@@ -276,6 +276,8 @@ pub(crate) fn rebase_placeholder_cols(e: &mut RExpr, from: usize, target: usize)
         | RExpr::ConstInterval(_)
         | RExpr::ConstArray(_)
         | RExpr::ConstRange(_)
+        // A DateClock leaf carries no column slots.
+        | RExpr::DateClock { .. }
         | RExpr::ConstNull => {}
     }
 }

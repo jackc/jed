@@ -360,10 +360,11 @@ type paramTypes struct {
 	uncacheable bool
 	// nonimmutable is set during resolution when a node is created whose value depends on
 	// statement-execution context rather than its inputs alone: the runtime text→date cast
-	// (STABLE — its input grammar admits the clock-relative specials, date.md §6). The
-	// expression-index gate consults it to reject such an expression 42P17 (indexes.md §2), the
-	// same way PostgreSQL's stable date_in is unindexable. Orthogonal to uncacheable: these
-	// nodes re-evaluate per execution, so the resolved plan stays cacheable.
+	// (STABLE — its input grammar admits the clock-relative specials) and the reDateClock
+	// clock-relative date literal ('today'/'now'/…, date.md §6). The expression-index gate
+	// consults it to reject such an expression 42P17 (indexes.md §2), the same way PostgreSQL's
+	// stable date_in is unindexable. Orthogonal to uncacheable: these nodes re-evaluate per
+	// execution, so the resolved plan stays cacheable.
 	nonimmutable bool
 }
 
@@ -419,6 +420,27 @@ func unifyParamType(a, b scalarType, idx0 int) (scalarType, error) {
 	var zero scalarType
 	return zero, newError(DatatypeMismatch,
 		fmt.Sprintf("inconsistent types inferred for parameter $%d", idx0+1))
+}
+
+// dateClockLiteral resolves a date-context string literal naming one of the special values beyond
+// ±infinity (date.md §6): 'epoch' folds to the constant 1970-01-01 like any date literal, while
+// the CLOCK-RELATIVE words 'today' / 'now' / 'tomorrow' / 'yesterday' become the STABLE
+// reDateClock node — the statement clock's day in the session zone, computed at EVAL and never
+// folded at resolve. (PostgreSQL folds the literal at parse — the frozen-'today'
+// DEFAULT/index/prepared-statement footgun — a documented divergence; jed's node re-evaluates per
+// execution, so a cached plan tracks the clock.) The node flags the plan non-immutable, exactly
+// like the runtime text→date cast (42P17 in an index expression). ok=false for an ordinary date
+// string, which takes the caller's normal parse-to-constant path.
+func dateClockLiteral(s string, params *paramTypes) (*rExpr, resolvedType, bool) {
+	off, epoch, ok := dateClockSpecial(s)
+	if !ok {
+		return nil, resolvedType{}, false
+	}
+	if epoch {
+		return &rExpr{kind: reConstDate, cInt: 0}, resolvedType{kind: rtDate}, true
+	}
+	params.nonimmutable = true
+	return &rExpr{kind: reDateClock, cInt: int64(off)}, resolvedType{kind: rtDate}, true
 }
 
 // bindParams coerces each supplied bind value to its inferred parameter type, two-phase /
@@ -1013,7 +1035,12 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 				return &rExpr{kind: reConstTimestamptz, cInt: m}, resolvedType{kind: rtTimestamptz}, nil
 			case ctx != nil && ctx.IsDate():
 				// A string adapts to a DATE context (parse the ISO date, dropping any time/offset;
-				// 22007/22008 — spec/design/date.md §2), like timestamp adaptation.
+				// 22007/22008 — spec/design/date.md §2), like timestamp adaptation. A clock-relative
+				// special ('today'/'now'/…) becomes the STABLE reDateClock node instead of a
+				// constant (date.md §6).
+				if node, rt, ok := dateClockLiteral(e.Literal.Str, params); ok {
+					return node, rt, nil
+				}
 				m, err := parseDate(e.Literal.Str)
 				if err != nil {
 					return nil, resolvedType{}, err
@@ -1108,6 +1135,13 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 		target, _, _, err := resolveTypeAndTypmod(e.TypeLitName, nil)
 		if err != nil {
 			return nil, resolvedType{}, err
+		}
+		// DATE 'today' / DATE 'now' / … — the clock-relative specials become the STABLE
+		// reDateClock node, exactly like the ctx-adaptation form (date.md §6).
+		if target.IsDate() {
+			if node, rt, ok := dateClockLiteral(e.TypeLitText, params); ok {
+				return node, rt, nil
+			}
 		}
 		return coerceStringLiteral(e.TypeLitText, target, nil, nil)
 	case exprScalarSubquery:
@@ -1334,6 +1368,13 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 		// still falls through to the deferred 0A000 below. A varchar(n) target truncates the literal
 		// to n code points (types.md §15).
 		if in := e.Cast.Inner; in.Kind == exprLiteral && in.Literal != nil && in.Literal.Kind == literalText {
+			// 'today'::date / CAST('now' AS date) — the clock-relative specials become the STABLE
+			// reDateClock node, exactly like the ctx-adaptation form (date.md §6).
+			if target.IsDate() {
+				if node, rt, ok := dateClockLiteral(in.Literal.Str, params); ok {
+					return node, rt, nil
+				}
+			}
 			return coerceStringLiteral(in.Literal.Str, target, typmod, varcharLen)
 		}
 		// The JSON cast matrix (spec/design/json.md §6.1): casting TO json/jsonb from a runtime

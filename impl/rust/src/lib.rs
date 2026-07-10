@@ -606,6 +606,16 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // PostgreSQL, whose date_in is stable. The strict-ISO accepted grammar agrees with PG and is
     // oracle-checked; the jed-stricter rejections (DateStyle spellings) are per-core tested.
     "cast.text_date",
+    // Clock-relative date literals (date.md §6): 'today' / 'now' (0), 'tomorrow' (+1),
+    // 'yesterday' (−1) — the STATEMENT clock's day in the SESSION zone (one timezone unit) —
+    // plus the constant 'epoch' (1970-01-01, folds like any literal). Accepted by LITERAL
+    // adaptation (a date context, an INSERT VALUES slot), the DATE '…' typed literal, the
+    // cast-of-literal, and the runtime text→date cast; NOT by the assignment coercion of
+    // non-literal text data (INSERT…SELECT, $N binds, array/range/composite input — use an
+    // explicit ::date). A STABLE node, never folded: a DEFAULT 'today' re-evaluates per INSERT
+    // and a cached plan tracks the clock (both documented divergences from PG's parse-time
+    // fold), and an index expression containing one is 42P17.
+    "types.date_clock_literal",
     // The COLLATE expression operator + ORDER BY … COLLATE + db.ImportCollation (collation slice
     // 1c, spec/design/collation.md §14): a host-loaded collation orders text by its UCA sort key in
     // the ordering comparisons (< <= > >=) and ORDER BY; explicit-conflict 42P21, unknown 42704,

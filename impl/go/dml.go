@@ -1072,6 +1072,26 @@ func (db *engine) executeInsert(ins *insert, params []Value, ctx cteCtx) (outcom
 						return outcome{}, err
 					}
 					rv[p] = dv
+				} else if ct := store.colTypes[i]; ct.Elem == nil && ct.RangeElem == nil && !ct.Composite &&
+					ct.Scalar == scalarDate && !iv.IsParam && !iv.IsArray && !iv.IsRow &&
+					iv.Lit.Kind == literalText && dateClockIsSpecial(iv.Lit.Str) {
+					// A date-special string in a VALUES slot is LITERAL adaptation (date.md §6):
+					// 'epoch' is the constant 1970-01-01, and a clock-relative word
+					// ('today'/'now'/…) names the statement-clock day in the session zone,
+					// computed here through the shared stmtRng — never a stored constant. An
+					// ordinary date string takes the normal materialize path (parse to a value);
+					// non-literal text DATA (INSERT … SELECT, a $N bind) stays strict — the
+					// specials are literal/cast syntax, not an assignment coercion.
+					off, epoch, _ := dateClockSpecial(iv.Lit.Str)
+					if epoch {
+						rv[p] = DateValue(0)
+					} else {
+						dv, err := dateClockValue(db, stmtRng, meter, int64(off))
+						if err != nil {
+							return outcome{}, err
+						}
+						rv[p] = dv
+					}
 				} else {
 					// A ROW(...) / literal / $N slot is materialized against the column's resolved type
 					// (composite-aware — spec/design/composite.md §1/§4).

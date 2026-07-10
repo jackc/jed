@@ -472,10 +472,19 @@ impl Engine {
                 (None, None, None)
             } else {
                 let sty = ty.scalar();
+                // A clock-relative date string DEFAULT ('today'/'now'/…) must NOT fold at CREATE
+                // TABLE: it routes to the EXPRESSION path below, re-resolved to the STABLE
+                // DateClock node and evaluated per INSERT — where PostgreSQL folds the literal to
+                // the table-creation day, the documented fold-footgun divergence (date.md §6).
+                // 'epoch' and every ordinary date string stay foldable constants.
+                let clock_default = sty.is_date()
+                    && matches!(&def.default, Some(d)
+                        if matches!(&d.expr, Expr::Literal(Literal::Text(s))
+                            if crate::date::date_clock_is_relative(s)));
                 match &def.default {
                     None => (None, None, None),
                     Some(d) => match &d.expr {
-                        Expr::Literal(lit) => (
+                        Expr::Literal(lit) if !clock_default => (
                             Some(store_value(
                                 literal_to_value_for(lit, sty)?,
                                 sty,

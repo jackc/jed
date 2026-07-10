@@ -175,6 +175,7 @@ import {
   arrayValue,
   boolValue,
   canonFloat,
+  dateValue,
   decimalValue,
   encodeFloat32Key,
   encodeFloat64Key,
@@ -234,12 +235,14 @@ import type { AssignPlan } from "./window.ts";
 import { evalExpr, floatToIntHalfAway, toDecimal } from "./eval.ts";
 import {
   coerceForStore,
+  dateClockValue,
   literalToValue,
   materializeInsertValue,
   overflow,
   storeValue,
   typeError,
 } from "./store.ts";
+import { dateClockIsRelative, dateClockSpecial } from "./date.ts";
 import {
   coerceSetopRows,
   combineSetop,
@@ -3213,7 +3216,17 @@ export class Engine {
         }
       } else if (def.default !== null) {
         const sty = colType.scalar;
-        if (def.default.expr.kind === "literal") {
+        // A clock-relative date string DEFAULT ('today'/'now'/…) must NOT fold at CREATE TABLE:
+        // it routes to the EXPRESSION path below, re-resolved to the STABLE dateClock node and
+        // evaluated per INSERT — where PostgreSQL folds the literal to the table-creation day,
+        // the documented fold-footgun divergence (date.md §6). 'epoch' and every ordinary date
+        // string stay foldable constants.
+        const clockDefault =
+          sty === "date" &&
+          def.default.expr.kind === "literal" &&
+          def.default.expr.literal.kind === "text" &&
+          dateClockIsRelative(def.default.expr.literal.text);
+        if (def.default.expr.kind === "literal" && !clockDefault) {
           def_default = storeValue(
             literalToValue(def.default.expr.literal),
             sty,
@@ -5492,9 +5505,29 @@ export class Engine {
           // DEFAULT at the top level → the column's default (constant or per-row expression). A
           // ROW(…) / literal / $N slot is materialized against the column's resolved ColType
           // (composite-aware — composite.md §1/§4); coerceForStore in insertRows then range-checks.
-          if (iv.kind === "default")
+          const ct = store.columnTypes()[i]!;
+          if (iv.kind === "default") {
             rv[p] = this.evalDefault(col, defaultExprs[i]!, stmtRng, meter);
-          else rv[p] = materializeInsertValue(iv, store.columnTypes()[i]!, bound);
+          } else if (
+            ct.kind === "scalar" &&
+            ct.scalar === "date" &&
+            iv.kind === "lit" &&
+            iv.lit.kind === "text" &&
+            dateClockSpecial(iv.lit.text) !== null
+          ) {
+            // A date-special string in a VALUES slot is LITERAL adaptation (date.md §6): 'epoch'
+            // is the constant 1970-01-01, and a clock-relative word ('today'/'now'/…) names the
+            // statement-clock day in the session zone, computed here through the shared stmtRng —
+            // never a stored constant. An ordinary date string takes the normal materialize path
+            // (parse to a value); non-literal text DATA (INSERT … SELECT, a $N bind) stays
+            // strict — the specials are literal/cast syntax, not an assignment coercion.
+            const sp = dateClockSpecial(iv.lit.text)!;
+            rv[p] = sp.epoch
+              ? dateValue(0n)
+              : dateClockValue(this, stmtRng, this.session.seam, meter, sp.offsetDays);
+          } else {
+            rv[p] = materializeInsertValue(iv, ct, bound);
+          }
         }
       }
       rows.push(rv);
@@ -12725,6 +12758,11 @@ export function rexprIsConstant(e: RExpr): boolean {
     case "outerColumn":
     case "subquery":
       return false;
+    case "dateClock":
+      // Row-independent but EXECUTION-scoped (the statement clock + session zone) —
+      // conservatively not a "constant", so no plan-time consumer ever evaluates it without a
+      // live statement environment (date.md §6).
+      return false;
     case "row":
       return e.fields.every(rexprIsConstant);
     case "array":
@@ -15268,8 +15306,15 @@ export type RExpr =
   // at resolve). For a timestamptz value every field but `epoch` is computed in the session zone.
   | { kind: "extract"; field: string; value: RExpr }
   // A cross-family datetime cast (timezones.md §9.3) to `to` (timestamp/timestamptz/date) from
-  // another datetime family. The casts crossing the timestamptz boundary consult the session zone.
+  // another datetime family — or the runtime text → date cast (date.md §6). The casts crossing
+  // the timestamptz boundary consult the session zone.
   | { kind: "dateConvert"; inner: RExpr; to: ScalarType }
+  // A clock-relative date literal — 'today'/'now' (0), 'tomorrow' (+1), 'yesterday' (−1) —
+  // resolved to a STABLE node, never folded (date.md §6): at eval it reads the STATEMENT clock
+  // (once per statement, like now()) and takes its day in the SESSION zone (charging timezone),
+  // shifted by offsetDays. Flagged non-immutable at birth (42P17 in an index expression).
+  // 'epoch' is not this node — it folds to the constant 1970-01-01.
+  | { kind: "dateClock"; offsetDays: bigint }
   | {
       kind: "case";
       arms: { cond: RExpr; result: RExpr }[];

@@ -59,13 +59,14 @@ import {
   decodeUuidLiteral,
 } from "./executor.ts";
 import { NEG_INFINITY, POS_INFINITY, parseTimestamp, parseTimestamptz } from "./timestamp.ts";
-import { DATE_NEG_INFINITY, DATE_POS_INFINITY, parseDate } from "./date.ts";
+import { DATE_NEG_INFINITY, DATE_POS_INFINITY, dateClockSpecial, parseDate } from "./date.ts";
 import { parseInterval, tsShift } from "./interval.ts";
 import { jsonbIn, validateJson } from "./json.ts";
 import type { BinaryOp, InsertValue, Literal } from "./ast.ts";
 import type { ColField, ColType } from "./catalog.ts";
 import { rangeForElement } from "./range.ts";
-import type { EvalEnv, RExpr } from "./executor.ts";
+import type { Engine, EvalEnv, RExpr } from "./executor.ts";
+import type { Seam, StmtRng } from "./seam.ts";
 import type { Meter } from "./cost.ts";
 import { COSTS } from "./costs.ts";
 import type { Interval } from "./interval.ts";
@@ -695,7 +696,14 @@ export function evalDateConvert(v: Value, to: ScalarType, env: EvalEnv, m: Meter
   if (v.kind === "text" && to === "date") {
     // The runtime text → date cast (date.md §6): the per-row string runs the SAME parseDate the
     // literal form folds at resolve — 22007 malformed / 22008 out of range, per row. Zone-free
-    // (no timezone charge; the node's operator_eval meters it).
+    // (no timezone charge; the node's operator_eval meters it) — EXCEPT a clock-relative special
+    // ('today'/'now'/…), which names the statement-clock day in the session zone (a zone
+    // consult, charging timezone) — the reason this cast is STABLE.
+    const sp = dateClockSpecial(v.text);
+    if (sp !== null) {
+      if (sp.epoch) return dateValue(0n);
+      return dateClockValue(env.exec, env.rng, env.seam, m, sp.offsetDays);
+    }
     return dateValue(parseDate(v.text));
   }
   if (v.kind === "timestamp" && to === "date") return microsToDate(v.micros);
@@ -720,4 +728,34 @@ export function evalDateConvert(v: Value, to: ScalarType, env: EvalEnv, m: Meter
   throw new Error(
     "unreachable: resolver restricts dateConvert to cross-family datetime casts and text → date",
   );
+}
+
+// dateClockValue computes a clock-relative date (date.md §6): the STATEMENT clock's day in the
+// SESSION zone, shifted by offsetDays ('today'/'now' 0, 'tomorrow' +1, 'yesterday' −1). STABLE —
+// the statement clock is read once per statement and reused (entropy.md §5), so every row and
+// every clock-relative literal in a statement see the same day. The zone consultation charges one
+// timezone unit, like every session-zone consumer (timezones.md §10); the caller's node charges
+// its own operator_eval. Shared by the dateClock eval, the runtime text→date cast's special path,
+// and the INSERT VALUES literal-adaptation site (env-less, hence the split args).
+export function dateClockValue(
+  exec: Engine,
+  rng: StmtRng,
+  seam: Seam,
+  m: Meter,
+  offsetDays: bigint,
+): Value {
+  const MICROS_PER_DAY = 86_400_000_000n;
+  const zr = exec.session.timeZone;
+  m.charge(COSTS.timezone);
+  m.guard();
+  const clock = rng.statementClockMicros(seam);
+  const local = instantToLocalMicros(zr, clock);
+  const floored =
+    local >= 0n ? local / MICROS_PER_DAY : -((-local + (MICROS_PER_DAY - 1n)) / MICROS_PER_DAY);
+  const days = floored + offsetDays;
+  if (days <= -2147483648n || days >= 2147483647n) {
+    // Unreachable from a real clock; an injected extreme clock still traps deterministically.
+    throw engineError("datetime_field_overflow", "date out of range");
+  }
+  return dateValue(days);
 }

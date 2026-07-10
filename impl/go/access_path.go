@@ -873,6 +873,11 @@ func rexprIsConstant(e *rExpr) bool {
 	switch e.kind {
 	case reColumn, reOuterColumn, reSubquery:
 		return false
+	case reDateClock:
+		// Row-independent but EXECUTION-scoped (the statement clock + session zone) —
+		// conservatively not a "constant", so no plan-time consumer ever evaluates it without a
+		// live statement environment (date.md §6).
+		return false
 	}
 	if e.operand != nil && !rexprIsConstant(e.operand) {
 		return false

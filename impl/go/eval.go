@@ -1027,7 +1027,15 @@ func evalDateConvert(v Value, to scalarType, env *evalEnv, m *costMeter) (Value,
 	case v.Kind == ValText && to == scalarDate:
 		// The runtime text → date cast (date.md §6): the per-row string runs the SAME parseDate
 		// the literal form folds at resolve — 22007 malformed / 22008 out of range, per row.
-		// Zone-free (no timezone charge; the node's operator_eval meters it).
+		// Zone-free (no timezone charge; the node's operator_eval meters it) — EXCEPT a
+		// clock-relative special ('today'/'now'/…), which names the statement-clock day in the
+		// session zone (a zone consult, charging timezone) — the reason this cast is STABLE.
+		if off, epoch, ok := dateClockSpecial(v.str()); ok {
+			if epoch {
+				return DateValue(0), nil
+			}
+			return dateClockValue(env.exec, env.rng, m, int64(off))
+		}
 		d, err := parseDate(v.str())
 		if err != nil {
 			return Value{}, err
@@ -1077,6 +1085,29 @@ func evalDateConvert(v Value, to scalarType, env *evalEnv, m *costMeter) (Value,
 	default:
 		panic("resolver restricts DateConvert to cross-family datetime casts and text → date")
 	}
+}
+
+// dateClockValue computes a clock-relative date (date.md §6): the STATEMENT clock's day in the
+// SESSION zone, shifted by offsetDays ('today'/'now' 0, 'tomorrow' +1, 'yesterday' −1). STABLE —
+// the statement clock is read once per statement and reused (entropy.md §5), so every row and
+// every clock-relative literal in a statement see the same day. The zone consultation charges one
+// timezone unit, like every session-zone consumer (timezones.md §10); the caller's node charges
+// its own operator_eval. Shared by the reDateClock eval, the runtime text→date cast's special
+// path, and the INSERT VALUES literal-adaptation site (dml.go — env-less, hence the split args).
+func dateClockValue(exec *engine, rng *stmtRng, m *costMeter, offsetDays int64) (Value, error) {
+	const microsPerDay int64 = 86_400 * 1_000_000
+	zr := exec.session.timeZone
+	m.Charge(costs.Timezone)
+	if err := m.Guard(); err != nil {
+		return Value{}, err
+	}
+	clock := rng.statementClockMicros(&exec.session.seam)
+	days := floorDiv(instantToLocalMicros(zr, clock), microsPerDay) + offsetDays
+	if days < dateMinFinite || days > dateMaxFinite {
+		// Unreachable from a real clock; an injected extreme clock still traps deterministically.
+		return Value{}, newError(DatetimeFieldOverflow, "date out of range")
+	}
+	return DateValue(int32(days)), nil
 }
 
 func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
@@ -2240,6 +2271,12 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return NullValue(), nil
 		}
 		return evalDateConvert(v, e.result, env, m)
+	case reDateClock:
+		// A clock-relative date literal ('today'/'now'/'tomorrow'/'yesterday' — date.md §6): the
+		// statement clock's day in the session zone + cInt days. STABLE — the clock is read once
+		// per statement, so every evaluation in the statement yields the same day.
+		m.Charge(costs.OperatorEval)
+		return dateClockValue(env.exec, env.rng, m, e.cInt)
 	case reCase:
 		// CASE is the ONE deliberate exception to "no short-circuit" (cost.md §3): conditions are
 		// evaluated in order and evaluation STOPS at the first TRUE — a FALSE or NULL/UNKNOWN

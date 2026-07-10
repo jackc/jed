@@ -24,6 +24,30 @@ pub const POS_INFINITY: i32 = i32::MAX;
 const MIN_FINITE: i64 = (i32::MIN + 1) as i64;
 const MAX_FINITE: i64 = (i32::MAX - 1) as i64;
 
+/// Classify a date-input string as one of PostgreSQL's special values beyond ±infinity
+/// (spec/design/date.md §6): `'epoch'` (the constant 1970-01-01 — `epoch = true`), and the
+/// CLOCK-RELATIVE words `'today'` / `'now'` (offset 0), `'tomorrow'` (+1), `'yesterday'` (−1) —
+/// the statement-clock day in the session zone, shifted by offset days. Case-insensitive,
+/// whitespace trimmed (like `parse_date`'s own specials). `None` for every other string;
+/// `parse_date` itself stays pure and continues to reject these words (its callers classify
+/// first where the specials are admitted — literal adaptation and the explicit casts, never the
+/// assignment coercions).
+pub fn date_clock_special(input: &str) -> Option<(i32, bool)> {
+    match trim_ascii_ws(input).to_ascii_lowercase().as_str() {
+        "epoch" => Some((0, true)),
+        "now" | "today" => Some((0, false)),
+        "tomorrow" => Some((1, false)),
+        "yesterday" => Some((-1, false)),
+        _ => None,
+    }
+}
+
+/// Whether `input` names a CLOCK-RELATIVE special — `'today'`/`'now'`/`'tomorrow'`/`'yesterday'`,
+/// but not `'epoch'` (a foldable constant).
+pub fn date_clock_is_relative(input: &str) -> bool {
+    matches!(date_clock_special(input), Some((_, false)))
+}
+
 /// Parse a `date` literal to its i32 day count since 1970-01-01. The grammar is the full
 /// timestamp literal grammar (spec/design/timestamp.md §3), but only the date portion is kept:
 /// a trailing time and/or offset is validated then discarded, and `24:00:00` does not advance
@@ -39,6 +63,12 @@ pub fn parse_date(input: &str) -> Result<i32> {
     }
     if low == "-infinity" {
         return Ok(NEG_INFINITY);
+    }
+    if low == "epoch" {
+        // PG's constant special: 1970-01-01 (day 0). The CLOCK-relative specials (today/now/…)
+        // are deliberately NOT parse_date's — it stays a pure function; they resolve a level
+        // above (date_clock_special → the STABLE node / literal adaptation, date.md §6).
+        return Ok(0);
     }
 
     // Trailing era ` BC` / ` AD` (case-insensitive); BC maps displayed year to astronomical.

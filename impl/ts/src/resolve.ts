@@ -108,7 +108,7 @@ import {
   typeIsText,
 } from "./types.ts";
 import { parseTimestamp, parseTimestamptz } from "./timestamp.ts";
-import { parseDate } from "./date.ts";
+import { dateClockSpecial, parseDate } from "./date.ts";
 import { parseInterval } from "./interval.ts";
 import { jsonCompactOut, jsonbIn, jsonbOut, parsePreservingJson, validateJson } from "./json.ts";
 import {
@@ -364,6 +364,26 @@ export function planSubquery(scope: Scope, inner: QueryExpr, params: ParamTypes)
   return scope.catalog.planQuery(inner, scope, scope.ctes, params);
 }
 
+// dateClockLiteral resolves a date-context string literal naming one of the special values beyond
+// ±infinity (date.md §6): 'epoch' folds to the constant 1970-01-01 like any date literal, while
+// the CLOCK-RELATIVE words 'today' / 'now' / 'tomorrow' / 'yesterday' become the STABLE dateClock
+// node — the statement clock's day in the session zone, computed at EVAL and never folded at
+// resolve. (PostgreSQL folds the literal at parse — the frozen-'today'
+// DEFAULT/index/prepared-statement footgun — a documented divergence; jed's node re-evaluates per
+// execution, so a cached plan tracks the clock.) The node flags the plan non-immutable, exactly
+// like the runtime text→date cast (42P17 in an index expression). null for an ordinary date
+// string, which takes the caller's normal parse-to-constant path.
+function dateClockLiteral(
+  s: string,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } | null {
+  const sp = dateClockSpecial(s);
+  if (sp === null) return null;
+  if (sp.epoch) return { node: { kind: "constDate", value: 0n }, type: { kind: "date" } };
+  params.nonimmutable = true;
+  return { node: { kind: "dateClock", offsetDays: sp.offsetDays }, type: { kind: "date" } };
+}
+
 // resolve resolves one Expr into an RExpr plus its static type. ctx (non-null) is the
 // type an untyped integer literal should adapt to (spec/design/types.md §6); null
 // defaults a bare literal to i64.
@@ -611,6 +631,12 @@ export function resolve(
       const rdesc = rangeByName(e.typeName);
       if (rdesc !== undefined) return coerceStringToRangeExpr(e.text, rdesc);
       const [target] = resolveTypeAndTypmod(e.typeName, null);
+      // DATE 'today' / DATE 'now' / … — the clock-relative specials become the STABLE dateClock
+      // node, exactly like the ctx-adaptation form (date.md §6).
+      if (isDate(target)) {
+        const clock = dateClockLiteral(e.text, params);
+        if (clock !== null) return clock;
+      }
       return coerceStringLiteral(e.text, target, null, null);
     }
     case "literal":
@@ -666,7 +692,11 @@ export function resolve(
             };
           }
           if (ctx !== null && isDate(ctx)) {
-            // A string adapts to a DATE context (the ISO date, dropping any time/offset; date.md §2).
+            // A string adapts to a DATE context (the ISO date, dropping any time/offset; date.md
+            // §2). A clock-relative special ('today'/'now'/…) becomes the STABLE dateClock node
+            // instead of a constant (date.md §6).
+            const clock = dateClockLiteral(e.literal.text, params);
+            if (clock !== null) return clock;
             return {
               node: { kind: "constDate", value: parseDate(e.literal.text) },
               type: { kind: "date" },
@@ -1050,6 +1080,12 @@ export function resolve(
       // falls through to the deferred 0A000 below. A varchar(n) target truncates the literal to n
       // code points (types.md §15).
       if (e.inner.kind === "literal" && e.inner.literal.kind === "text") {
+        // 'today'::date / CAST('now' AS date) — the clock-relative specials become the STABLE
+        // dateClock node, exactly like the ctx-adaptation form (date.md §6).
+        if (isDate(target)) {
+          const clock = dateClockLiteral(e.inner.literal.text, params);
+          if (clock !== null) return clock;
+        }
         return coerceStringLiteral(e.inner.literal.text, target, typmod, varcharLen);
       }
       // Text casts are deferred (not in the cast matrix — spec/design/types.md §5/§11), EXCEPT

@@ -43,7 +43,9 @@ bare-keyword sugar `current_timestamp`) is **STABLE**: it reads the once-resolve
 above and reuses it for every row. `clock_timestamp()` is **VOLATILE**: it reads the seam on **every**
 call (a fresh read that does *not* touch the statement-clock cache), so it may advance within a
 statement — the draws follow expression-evaluation order, exactly like the random source's. They take
-no entropy.
+no entropy. The **clock-relative date literals** (`'today'`/`'now'`/`'tomorrow'`/`'yesterday'` —
+[date.md §6](date.md)) are a further STABLE consumer: the same once-resolved statement clock,
+decomposed into a day in the session zone.
 
 ## 2. The provided deterministic source — splitmix64, byte-exact shared data
 

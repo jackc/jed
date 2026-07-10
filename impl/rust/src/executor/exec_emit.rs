@@ -965,6 +965,8 @@ impl Engine {
             | RExpr::ConstInterval(_)
             | RExpr::ConstArray(_)
             | RExpr::ConstRange(_)
+            // A DateClock leaf reads only the statement clock/session zone — nothing to fold.
+            | RExpr::DateClock { .. }
             | RExpr::ConstNull => Ok(()),
         }
     }

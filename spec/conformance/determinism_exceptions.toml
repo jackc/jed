@@ -83,6 +83,17 @@ test         = "injected-advancing-clock-exact: the `# clock_advance:` directive
 status       = "ratified"
 reason       = "The wall clock is intrinsic to clock_timestamp(), read per call by definition. It is pushed to the host clock seam (determinism.md §5): with an advancing clock injected the engine is a deterministic function of it, so the only irreducible production non-determinism is the raw per-call clock reads — G1+G2 hold on the injected/test path. A DISTINCT ledger entry from now() (per-call, not statement-stable). NOT oracle-imported (PG's wall clock differs)."
 
+# --- clock-relative date literals: STABLE clock seam (statement clock + session zone) --------
+[[exception]]
+id           = "date-clock-literal"
+surface      = "the clock-relative date literals 'today' / 'now' / 'tomorrow' / 'yesterday' (../design/date.md §6) — the STATEMENT clock's day in the SESSION zone, as a STABLE node (never folded); reachable via literal adaptation, the DATE '…' typed literal, the cast-of-literal, and the runtime text→date cast"
+class        = "B"
+drops        = []
+blast_radius = "the date result column (or the stored date, for an INSERT VALUES slot / a DEFAULT 'today' application); promotes to the row multiset ONLY if the day flows through a WHERE / ORDER BY...LIMIT / a key. STABLE: the node reads the SAME once-per-statement statement clock now() caches, so every row and every clock-relative literal in one statement see the same day. On the INJECTED path (`# clock:` / `# clock_advance:`) NOTHING is dropped: the day is a deterministic function of the injected clock + the session zone (UTC in the corpus; the zone interaction is per-core tested — the session TimeZone is host-API-only). In PRODUCTION the single read is the wall clock — the only non-determinism. ('epoch' is NOT this entry: a pure constant in parse_date, fully deterministic.)"
+test         = "injected-clock-exact: the `# clock:` / `# clock_advance:` directives inject the statement clock, so each special is asserted byte-for-byte across all cores (suites/types/date_clock.test — the five specials, statement-stability under an advancing clock, INSERT/UPDATE/DEFAULT applications, the 42P17 index rejections). # cost: is exact (one operator_eval + one timezone per evaluation) and clock-independent."
+status       = "ratified"
+reason       = "The wall clock is intrinsic to a 'current day' literal. It is pushed to the SAME host clock seam as now() (determinism.md §5) and decomposed in the session zone through the loaded tz reader (timezones.md §10 — zone use is itself deterministic): with a clock injected the engine is a deterministic function of it, so the only irreducible production non-determinism is the single raw clock read — G1+G2 hold on the injected/test path. A DISTINCT ledger entry from now-clock: a different surface (a date literal, not a function call) with a zone-dependent decomposition, and jed deliberately DIVERGES from PG here by never folding (PG's parse-time fold makes PG's own behavior clock-dependent at DDL/prepare time instead). NOT oracle-imported."
+
 # --- f64: control-flow promotion of an exempted value --------------------
 [[exception]]
 id           = "float-control-flow"

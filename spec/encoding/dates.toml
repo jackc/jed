@@ -45,6 +45,8 @@ cases = [
   { input = "+infinity",                  days = 2147483647 },  # optional leading +
   { input = "INFINITY",                   days = 2147483647 },  # case-insensitive
   { input = "-infinity",                  days = -2147483648 },
+  { input = "epoch",                      days = 0 },           # PG's constant special (1970-01-01)
+  { input = "  EPOCH  ",                  days = 0 },           # case-insensitive, ws trimmed
 ]
 
 # --- parse_error: 22007 malformed syntax / 22008 field-or-range overflow ------
@@ -72,9 +74,12 @@ cases = [
   { input = "20240115",                  error = "22007" },  # no separators
   { input = "Jan 15, 2024",              error = "22007" },  # month name
   { input = "01/15/2024",                error = "22007" },  # slash / DateStyle form
-  { input = "now",                       error = "22007" },  # clock-relative special: deferred
-  { input = "today",                     error = "22007" },  # deferred
-  { input = "epoch",                     error = "22007" },  # deferred alias
+  # The CLOCK-RELATIVE specials (today/now/tomorrow/yesterday) are deliberately NOT parse_date's:
+  # they need the statement clock + session zone, so they resolve a LEVEL ABOVE parse_date (the
+  # STABLE date-clock node / literal adaptation — ../design/date.md §6); parse_date itself stays a
+  # pure function and rejects them. ('epoch' IS parse_date's — a pure constant, above.)
+  { input = "now",                       error = "22007" },  # clock-relative: not parse_date's
+  { input = "today",                     error = "22007" },  # clock-relative: not parse_date's
   { input = "2024-01-15 12:00:00 XY",    error = "22007" },  # unknown era token
 ]
 

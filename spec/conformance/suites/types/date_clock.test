@@ -1,0 +1,190 @@
+# Clock-relative date literals (spec/design/date.md §6) — 'today' / 'now' (offset 0),
+# 'tomorrow' (+1), 'yesterday' (−1): the STATEMENT clock's day in the SESSION zone (here the
+# default UTC), plus the constant 'epoch' (1970-01-01, folds like any date literal). A
+# clock-relative word resolves to a STABLE node, NEVER folded: the `# clock:` directive pins the
+# statement clock (entropy.md §6), so the values are exact and byte-identical across Rust/Go/TS.
+# NOT oracle-imported — PG's wall clock differs, and PG FOLDS the literal at parse where jed
+# re-evaluates per statement (the DEFAULT / index / prepared-statement fold-footgun divergences,
+# date.md §6). The specials ride literal adaptation (a date context, an INSERT VALUES slot), the
+# DATE '…' typed literal, the cast-of-literal, and the runtime text→date cast; the assignment
+# coercion of non-literal text DATA (INSERT … SELECT) deliberately stays strict.
+# The pinned clock 1721056591872000 µs = 2024-07-15 15:16:31.872 UTC.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.index_expr, ddl.index_partial, ddl.column_default, ddl.column_default_expr, dml.insert, dml.insert_multi_row, dml.insert_column_list, dml.insert_select, dml.update, query.select, query.select_no_from, query.where_eq, query.order_by, types.i32, types.date, types.timestamp, types.text, types.boolean, types.date_clock_literal, cast.explicit, cast.operator, cast.string_literal, cast.runtime_text, cast.text_date, expr.date_arithmetic, resource.cost_metering
+
+# --- the five specials, in the cast-of-literal form (one STABLE node: operator_eval + timezone) --
+# clock: 1721056591872000
+# types: date
+# cost: 3
+query T nosort
+SELECT 'today'::date
+----
+2024-07-15
+
+# clock: 1721056591872000
+# cost: 3
+query T nosort
+SELECT 'tomorrow'::date
+----
+2024-07-16
+
+# clock: 1721056591872000
+# cost: 3
+query T nosort
+SELECT 'yesterday'::date
+----
+2024-07-14
+
+# 'now' is the same day as 'today' (a date has no time to differ by)
+# clock: 1721056591872000
+# cost: 3
+query T nosort
+SELECT 'now'::date
+----
+2024-07-15
+
+# 'epoch' is a CONSTANT (1970-01-01) — it folds like any date literal, no clock read, no node cost
+# cost: 1
+query T nosort
+SELECT 'epoch'::date
+----
+1970-01-01
+
+# --- the DATE '…' typed-literal spelling is identical --------------------------------------------
+# clock: 1721056591872000
+# cost: 3
+query T nosort
+SELECT DATE 'tomorrow'
+----
+2024-07-16
+
+# case-insensitive, whitespace-trimmed — like the ±infinity specials
+# clock: 1721056591872000
+# cost: 3
+query T nosort
+SELECT '  TODAY  '::date
+----
+2024-07-15
+
+# --- STABLE: the statement clock is read ONCE, so every clock-relative literal in a statement
+# sees the same day, even under an ADVANCING clock (one tick per read) ----------------------------
+# clock_advance: 1721056591872000,86400000000
+query B nosort
+SELECT 'today'::date = 'now'::date
+----
+true
+
+# --- literal adaptation in a date context (comparison sibling), and arithmetic -------------------
+# clock: 1721056591872000
+query B nosort
+SELECT DATE '2024-07-14' < 'today'
+----
+true
+
+# date arithmetic over the node: ('today' + 1) = 'tomorrow'
+# clock: 1721056591872000
+query T nosort
+SELECT 'today'::date + 1
+----
+2024-07-16
+
+# clock: 1721056591872000
+query I nosort
+SELECT 'today'::date - 'yesterday'::date
+----
+1
+
+# --- INSERT: a VALUES string-literal slot is literal adaptation, so the specials work -------------
+statement ok
+CREATE TABLE t (id integer PRIMARY KEY, d date)
+
+# clock: 1721056591872000
+statement ok
+INSERT INTO t VALUES (1, 'today'), (2, 'tomorrow'), (3, 'yesterday'), (4, 'epoch'), (5, '2024-01-15')
+
+query IT nosort
+SELECT id, d FROM t ORDER BY id
+----
+1
+2024-07-15
+2
+2024-07-16
+3
+2024-07-14
+4
+1970-01-01
+5
+2024-01-15
+
+# an UPDATE assignment adapts the same way
+# clock: 1721142991872000
+statement ok
+UPDATE t SET d = 'today' WHERE id = 5
+
+query T nosort
+SELECT d FROM t WHERE id = 5
+----
+2024-07-16
+
+# --- but non-literal text DATA does NOT evaluate the specials (they are literal/cast syntax, not
+# an assignment coercion — date.md §6): INSERT … SELECT of a text value traps 22007. PG diverges
+# here (its date_in evaluates specials on any input path); use an explicit ::date to opt in. -----
+statement error 22007
+INSERT INTO t (id, d) SELECT 6, 'today'
+
+# ... and the explicit runtime cast DOES evaluate them, per row against the statement clock
+statement ok
+CREATE TABLE s (id integer PRIMARY KEY, w text)
+
+statement ok
+INSERT INTO s VALUES (1, 'Today'), (2, 'epoch'), (3, '2024-02-29')
+
+# clock: 1721056591872000
+query IT nosort
+SELECT id, w :: date FROM s ORDER BY id
+----
+1
+2024-07-15
+2
+1970-01-01
+3
+2024-02-29
+
+# --- DEFAULT 'today' is an EXPRESSION default, evaluated per INSERT — never folded at CREATE
+# TABLE (PostgreSQL folds it to the table-creation day; a documented jed divergence) --------------
+statement ok
+CREATE TABLE dft (id integer PRIMARY KEY, d date DEFAULT 'today', e date DEFAULT 'epoch')
+
+# clock: 1721056591872000
+statement ok
+INSERT INTO dft (id) VALUES (1)
+
+# a day later, the SAME default yields the new day (a folded constant could not)
+# clock: 1721142991872000
+statement ok
+INSERT INTO dft (id) VALUES (2)
+
+query ITT nosort
+SELECT id, d, e FROM dft ORDER BY id
+----
+1
+2024-07-15
+1970-01-01
+2
+2024-07-16
+1970-01-01
+
+# --- un-indexable: an index expression or predicate containing a clock-relative literal is 42P17
+# (PostgreSQL instead FOLDS the literal silently into the index definition — jed rejects) ---------
+statement error 42P17
+CREATE INDEX bad_clock_idx ON t ((d - 'today'))
+
+statement error 42P17
+CREATE INDEX bad_clock_pred ON t (id) WHERE d > 'today'
+
+# --- the timestamp family still rejects the specials (its own deferred follow-on) ----------------
+statement error 22007
+SELECT TIMESTAMP 'today'
+
+statement error 22007
+SELECT 'now'::timestamp
