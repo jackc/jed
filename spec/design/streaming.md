@@ -18,30 +18,31 @@ the prepared-statement slice. The cursor contract was *designed* streaming-ready
 A database serves a result one of two ways: **materialize** (run the whole query, build the full
 result, then let the caller walk it) or **stream** (yield each row as the caller pulls, doing the
 work incrementally). PostgreSQL and SQLite both stream — and both lazily decode at every level
-below the row (§2). jed materializes the result, but has **already** closed the lower lazy-decode
-gaps:
+below the row (§2). jed originally materialized the result; this doc's ladder (S1–S8, §7) closed
+that last gap, after the lower lazy-decode gaps landed as independent slices:
 
 | Level | jed status | Where |
 |---|---|---|
 | **Pages** | ✅ lazy (demand-paged) | bounded CLOCK buffer pool ([pager.md](pager.md), P6.4); leaves faulted on access, only the interior skeleton resident. |
 | **Large / spilled values** | ✅ lazy (per touched column) | `Unfetched` references resolved only for the statically-touched columns ([large-values.md §14](large-values.md), `resolve_columns`/`resolveColumns`). An unread large column reads zero overflow pages. |
-| **Small inline columns** | ❌ eager | a leaf decode (`decode_leaf_node`) materializes every inline value of a record into the `Row`; only *large* untouched values stay `Unfetched`. The one remaining lazy-decode gap vs. PG/SQLite — a separate, cost-neutral follow-on (§8). |
-| **The result rows** | ❌ eager — **this doc** | `exec_select_plan` returns `SelectResult { rows: Vec<Vec<Value>> }`; `Rows` is an iterator over that detached, fully-built slice. `query()` runs the whole query *before* the caller sees a row. |
+| **Small inline columns** | ✅ lazy (since the [lazy-record.md](lazy-record.md) reshape, which superseded the "S5" specced here — §8) | a faulted leaf stays its compact on-disk bytes; a variable-length/structured inline value defers as `Unfetched::Inline` (a zero-copy view of the shared page block) and decodes on touch; fixed-width scalars stay deliberately eager. |
+| **The result rows** | ✅ streams — **this doc** (S1–S8, §7) | `query()` → `Rows` is a lazy pull cursor across every read shape (streaming / buffered / sorted / deferred lanes, ad-hoc and prepared); `execute()` stays deliberately materialized (the corpus drives it). Historically: `exec_select_plan` returned a full `Vec<Vec<Value>>` and `query()` ran the whole query before the caller saw a row. |
 
-The lazy-decode foundations (pages, large values) landed as **independent** slices, decoupled from
-streaming by the *static touched-set* cost contract ([cost.md](cost.md) "The touched set"). They do
-**not** need to be redone here. Streaming is the orthogonal remaining piece; it *benefits* from the
-existing laziness (a cursor that stops early never faults the leaves or decompresses the values it
-never reaches) but does not depend on extending it.
+The lazy-decode foundations (pages, large values, and later the whole lazy-record reshape) landed as
+**independent** slices, decoupled from streaming by the *static touched-set* cost contract
+([cost.md](cost.md) "The touched set"). They did **not** need to be redone here. Streaming was the
+orthogonal remaining piece; it *benefits* from the existing laziness (a cursor that stops early
+never faults the leaves or decompresses the values it never reaches) but never depended on
+extending it.
 
-### What "streams" today is the *input*, not the *output*
+### What "streamed" pre-ladder was the *input*, not the *output*
 
-The executor already has four input-streaming paths — the LIMIT short-circuit, ORDER-BY-satisfied-
+The executor already had four input-streaming paths — the LIMIT short-circuit, ORDER-BY-satisfied-
 by-PK-scan, ORDER-BY-satisfied-by-secondary-index, and the external-merge-sort streaming feed
 ([cost.md](cost.md) "LIMIT short-circuit" / "ORDER BY satisfied by …", [spill.md §5](spill.md)).
-Each avoids materializing the scan *input* — but every one still builds the full **output** `Vec`
-before returning it to the cursor. The `Sorter` / `SortedRows` (`SortedRows::next()`) is the one
-genuine pull abstraction already in the tree, and it is the model the blocking operators generalize
+Each avoided materializing the scan *input* — but every one still built the full **output** `Vec`
+before returning it to the cursor. The `Sorter` / `SortedRows` (`SortedRows::next()`) was the one
+genuine pull abstraction already in the tree, and it is the model the blocking operators generalized
 to (§4).
 
 ## 2. What PostgreSQL and SQLite do (the reference behavior)
@@ -434,8 +435,8 @@ already computes the per-relation **touched-column mask** at plan time ([cost.md
 touched set") and already skips resolving untouched *large* values, so skipping the *decode* of
 untouched small inline values reads like a localized codec change behind the existing mask.
 
-**Implementing it surfaced a finding that promoted it from a tweak to a reshape, now specced in
-[lazy-record.md](lazy-record.md).** PG and SQLite decode lazily **in the shared page buffer** — the
+**Implementing it surfaced a finding that promoted it from a tweak to a reshape, specced — and since
+built, L0–L3 in all three cores — in [lazy-record.md](lazy-record.md).** PG and SQLite decode lazily **in the shared page buffer** — the
 tuple stays resident and a column is deformed in place, so deferral is free. jed's decoded `Row` is
 instead **detached and owned**, and **every scan deep-clones the row out of the resident node**
 (`pmap` `Step::Emit(… vals[p].clone())`). So a decode-in-place S5 has nothing to decode in place;
