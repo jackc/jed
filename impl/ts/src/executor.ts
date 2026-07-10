@@ -4313,20 +4313,22 @@ export class Engine {
         // Resolve against the table (an aggregate 42803 / window 42P20 / bind parameter 42P02 fall
         // out of the resolver, as for a CHECK).
         const scope = Scope.single(this, table);
+        const pt = new ParamTypes();
         const { type: rtype } = resolve(
           scope,
           elem.expr,
           null,
           { collecting: false, groupKeys: [], specs: [] },
-          new ParamTypes(),
+          pt,
         );
-        // Immutability (§2): a non-immutable seam/sequence/current_setting call, or a
+        // Immutability (§2): a non-immutable seam/sequence/current_setting call, a
         // session-timezone-dependent expression (one that reads or produces a timestamptz —
-        // conservatively fail-closed), is 42P17.
+        // conservatively fail-closed), or a resolved STABLE node (the runtime text→date cast,
+        // flagged at its birth — ParamTypes.nonimmutable), is 42P17.
         const refs = checkReferencedColumns(elem.expr, columns);
         const tzHazard =
           rtype.kind === "timestamptz" || refs.some((i) => typeIsTimestamptz(columns[i]!.type));
-        if (indexExprNonimmutableCall(elem.expr) || tzHazard) {
+        if (indexExprNonimmutableCall(elem.expr) || tzHazard || pt.nonimmutable) {
           throw engineError(
             "invalid_object_definition",
             "functions in index expression must be marked IMMUTABLE",
@@ -4474,10 +4476,12 @@ export class Engine {
       // resolver). The aggregate 42803 / window 42P20 / non-boolean 42804 rejections then fall out of
       // the Forbidden-context boolean resolve below.
       rejectIndexPredicateStructure(ci.predicate.expr);
-      resolveBooleanFilter(Scope.single(this, table), ci.predicate.expr, new ParamTypes());
+      const predPt = new ParamTypes();
+      resolveBooleanFilter(Scope.single(this, table), ci.predicate.expr, predPt);
       // Immutability (§9), the same rule an expression key carries: a non-immutable seam/clock/sequence
-      // call, or a timestamptz-dependent subexpression (references a timestamptz column — conservatively
-      // fail-closed), is 42P17.
+      // call, a timestamptz-dependent subexpression (references a timestamptz column — conservatively
+      // fail-closed), or a resolved STABLE node (the runtime text→date cast, ParamTypes.nonimmutable),
+      // is 42P17.
       let tzHazard = false;
       for (const ref of checkReferencedColumns(ci.predicate.expr, columns)) {
         const sc = typeAsScalar(columns[ref]!.type);
@@ -4486,7 +4490,7 @@ export class Engine {
           break;
         }
       }
-      if (indexExprNonimmutableCall(ci.predicate.expr) || tzHazard) {
+      if (indexExprNonimmutableCall(ci.predicate.expr) || tzHazard || predPt.nonimmutable) {
         throw engineError(
           "invalid_object_definition",
           "functions in index predicate must be marked IMMUTABLE",

@@ -1134,6 +1134,13 @@ pub(crate) struct ParamTypes {
     /// when this stayed false — flagging at the node's birth is complete regardless of where in the
     /// plan tree it lands (spec/design/api.md §2.4).
     pub(crate) uncacheable: bool,
+    /// Set during resolution when a node is created whose value depends on statement-execution
+    /// context rather than its inputs alone: the runtime text→date cast (STABLE — its input
+    /// grammar admits the clock-relative specials, date.md §6). The expression-index gate consults
+    /// it to reject such an expression 42P17 (indexes.md §2), the same way PostgreSQL's stable
+    /// `date_in` is unindexable. Orthogonal to `uncacheable`: these nodes re-evaluate per
+    /// execution, so the resolved plan stays cacheable.
+    pub(crate) nonimmutable: bool,
 }
 
 impl ParamTypes {
@@ -3184,6 +3191,22 @@ pub(crate) fn resolve(
                     ResolvedType::Timestamptz if target.is_timestamptz() => Ok((rinner, ity)),
                     ResolvedType::Date if target.is_date() => Ok((rinner, ity)),
                     ResolvedType::Timestamp | ResolvedType::Timestamptz | ResolvedType::Date => {
+                        Ok((
+                            RExpr::DateConvert {
+                                inner: Box::new(rinner),
+                                to: target,
+                            },
+                            to_rt,
+                        ))
+                    }
+                    ResolvedType::Text if target.is_date() => {
+                        // The runtime text → date cast (date.md §6): a NON-literal text source (a
+                        // string LITERAL operand was folded by `coerce_string_literal` above) parses
+                        // per row via the same `parse_date` the literal uses (22007/22008 per row).
+                        // STABLE, not immutable — the input grammar admits the clock-relative
+                        // specials — so it flags the plan non-immutable (42P17 in an index
+                        // expression, as in PG). text → timestamp/timestamptz stays deferred.
+                        params.nonimmutable = true;
                         Ok((
                             RExpr::DateConvert {
                                 inner: Box::new(rinner),

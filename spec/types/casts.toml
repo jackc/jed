@@ -50,8 +50,10 @@
 # (timestamp<->date) are pure calendar arithmetic. All are EXPLICIT (PG makes the lossy/zone ones
 # explicit). A single-quoted string still lands in a timestamp/timestamptz/date column by LITERAL
 # ADAPTATION (the `TIMESTAMP '…'` / `DATE '…'` keyword literal / resolve-time coercion), NOT a (text,
-# T) cast pair. STILL DEFERRED: text<->{timestamp,timestamptz,date} (a formatting surface — to_char),
-# and timestamp/timestamptz/date <-> interval (interval is a span, not an instant).
+# T) cast pair — but the RUNTIME text -> date cast has since LANDED as a real (text, date) pair
+# (the runtime text→date section below, ../design/date.md §6). STILL DEFERRED: text -> timestamp /
+# timestamptz, datetime -> text (a formatting surface — to_char / session-zone rendering), and
+# timestamp/timestamptz/date <-> interval (interval is a span, not an instant).
 #
 # interval (scalars.toml) is likewise STORABLE with NO cast rules here. A single-quoted string
 # lands in an interval column by LITERAL ADAPTATION (parsed in an interval context), and the
@@ -420,10 +422,11 @@ overflow_error = "22P02"
 # string traps 22P02; an out-of-range integer/decimal traps 22003 (the decimal target re-scales to
 # its numeric(p,s) typmod first). jed's OWN literal grammar governs — hex / digit-underscore /
 # NaN / +-Infinity trap 22P02 where PostgreSQL accepts them (the documented grammar.md §36
-# divergences, identical to the literal path; per-core tested). text -> uuid is the row above; the
-# string-native targets (date/timestamp/timestamptz/interval/bytea) stay deferred (0A000), each its
-# own follow-on. NULL -> NULL throughout. These AGREE with PostgreSQL for jed's accepted grammar
-# and are oracle-checked (suites/cast/text_to_scalar.test, postgres:18).
+# divergences, identical to the literal path; per-core tested). text -> uuid is the row above;
+# text -> date is the runtime text→date section below; the remaining string-native targets
+# (timestamp/timestamptz/interval/bytea) stay deferred (0A000), each its own follow-on. NULL ->
+# NULL throughout. These AGREE with PostgreSQL for jed's accepted grammar and are oracle-checked
+# (suites/cast/text_to_scalar.test, postgres:18).
 [[cast]]
 from = "text"
 to = "i16"
@@ -470,3 +473,20 @@ overflow_error = "22003"
 from = "text"
 to = "boolean"
 mode = "explicit"
+
+# --- runtime text -> date (the text→date cast follow-on — ../design/date.md §6) ---------------
+# CAST(text_expr AS date) / text_expr :: date on a NON-LITERAL text expression runs the SAME
+# parse_date the date literal folds at resolve, per row: strict-ISO grammar (any time/offset
+# validated then discarded), 22007 malformed / 22008 out-of-range field or day count. STABLE, not
+# immutable — the input grammar admits the clock-relative specials (date.md §6) — so an index
+# expression containing it is 42P17 (indexes.md §2), exactly as PostgreSQL's stable date_in is
+# unindexable. The strict-ISO accepted grammar AGREES with PostgreSQL and is oracle-checked
+# (suites/cast/text_to_date.test, postgres:18); the jed-stricter rejections (DateStyle-dependent
+# spellings, `:60` seconds) are per-core tested, identical to the literal path. text -> timestamp
+# / timestamptz / interval / bytea stay deferred (0A000), each its own follow-on.
+[[cast]]
+from = "text"
+to = "date"
+mode = "explicit"
+on_overflow = "trap"
+overflow_error = "22008"

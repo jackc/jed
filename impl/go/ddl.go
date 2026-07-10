@@ -1813,13 +1813,15 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 			// Resolve against the table (an aggregate 42803 / window 42P20 / bind parameter 42P02
 			// fall out of the resolver, as for a CHECK).
 			s := singleScope(db, table)
-			_, rtype, rerr := resolve(s, *elem.Expr, nil, &aggCtx{collecting: false}, &paramTypes{})
+			pt := &paramTypes{}
+			_, rtype, rerr := resolve(s, *elem.Expr, nil, &aggCtx{collecting: false}, pt)
 			if rerr != nil {
 				return outcome{}, rerr
 			}
-			// Immutability (§2): a non-immutable seam/sequence/current_setting call, or a session-
+			// Immutability (§2): a non-immutable seam/sequence/current_setting call, a session-
 			// timezone-dependent expression (one that reads or produces a timestamptz — conservatively
-			// fail-closed), is 42P17.
+			// fail-closed), or a resolved STABLE node (the runtime text→date cast, flagged at its
+			// birth — resolve.go paramTypes.nonimmutable), is 42P17.
 			tzHazard := rtype.kind == rtTimestamptz
 			if !tzHazard {
 				for _, ref := range checkReferencedColumns(*elem.Expr, columns) {
@@ -1829,7 +1831,7 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 					}
 				}
 			}
-			if indexExprNonimmutableCall(*elem.Expr) || tzHazard {
+			if indexExprNonimmutableCall(*elem.Expr) || tzHazard || pt.nonimmutable {
 				return outcome{}, newError(InvalidObjectDefinition,
 					"functions in index expression must be marked IMMUTABLE")
 			}
@@ -1937,12 +1939,14 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 			return outcome{}, err
 		}
 		s := singleScope(db, table)
-		if _, err := resolveBooleanFilter(s, &ci.Predicate.Expr, &paramTypes{}); err != nil {
+		pt := &paramTypes{}
+		if _, err := resolveBooleanFilter(s, &ci.Predicate.Expr, pt); err != nil {
 			return outcome{}, err
 		}
 		// Immutability (§9), the same rule an expression key carries: a non-immutable seam/clock/
-		// sequence call, or a timestamptz-dependent subexpression (references a timestamptz column —
-		// conservatively fail-closed), is 42P17.
+		// sequence call, a timestamptz-dependent subexpression (references a timestamptz column —
+		// conservatively fail-closed), or a resolved STABLE node (the runtime text→date cast,
+		// paramTypes.nonimmutable), is 42P17.
 		tzHazard := false
 		for _, ref := range checkReferencedColumns(ci.Predicate.Expr, columns) {
 			if sc, ok := columns[ref].Type.AsScalar(); ok && sc == scalarTimestamptz {
@@ -1950,7 +1954,7 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 				break
 			}
 		}
-		if indexExprNonimmutableCall(ci.Predicate.Expr) || tzHazard {
+		if indexExprNonimmutableCall(ci.Predicate.Expr) || tzHazard || pt.nonimmutable {
 			return outcome{}, newError(InvalidObjectDefinition,
 				"functions in index predicate must be marked IMMUTABLE")
 		}

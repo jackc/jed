@@ -1972,10 +1972,11 @@ runtime path calls the identical `parse_int_literal` / `parse_decimal_literal` /
 `NaN` / `±Infinity` trap `22P02`, the same documented PG divergences as the literal form), the cast
 node's existing `operator_eval` charge meters it, and a malformed / out-of-range value traps
 `22P02` / `22003` **per row** during the scan rather than at plan time. The runtime text→`T` cast to
-the **string-native** targets stays deferred to each type's own follow-on — text→`date` /
-`timestamp` / `timestamptz` ([timezones.md](timezones.md) §9, [date.md](date.md) §6), text→`interval`
-([interval.md](interval.md) §6), text→`bytea` ([types.md](types.md) §13) are `0A000`; text→`uuid`
-already landed (the uuid cast slice, [types.md](types.md) §14). A **bare** string still does **not**
+the **string-native** targets lands per type: text→`date` has **landed** (the same rule — the
+literal's `parse_date` per row, `22007`/`22008`; STABLE and un-indexable, [date.md](date.md) §6);
+text→`timestamp` / `timestamptz` ([timezones.md](timezones.md) §9), text→`interval`
+([interval.md](interval.md) §6), and text→`bytea` ([types.md](types.md) §13) stay deferred `0A000`;
+text→`uuid` already landed (the uuid cast slice, [types.md](types.md) §14). A **bare** string still does **not**
 silently become a number/bool in a numeric context (`WHERE int_col = '42'` is `42804`, the strict
 rule — [types.md](types.md) §4): the type must be *named* for the string→number coercion to
 happen. So strictness is preserved; only the *explicit* spelling is admitted.

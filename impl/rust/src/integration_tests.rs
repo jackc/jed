@@ -29,6 +29,8 @@ mod cancellation;
 mod cast_array_runtime;
 #[path = "../tests/cast_bool_int.rs"]
 mod cast_bool_int;
+#[path = "../tests/cast_text_date.rs"]
+mod cast_text_date;
 #[path = "../tests/cast_text_runtime.rs"]
 mod cast_text_runtime;
 #[path = "../tests/cast_uuid.rs"]

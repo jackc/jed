@@ -1766,22 +1766,20 @@ impl Engine {
                     // Resolve against the table (an aggregate 42803 / window 42P20 / bind parameter
                     // 42P02 fall out of the resolver, as for a CHECK).
                     let scope = Scope::single(self, table);
-                    let (_node, rtype) = resolve(
-                        &scope,
-                        expr,
-                        None,
-                        &mut AggCtx::Forbidden,
-                        &mut ParamTypes::default(),
-                    )?;
-                    // Immutability (§2): a non-immutable seam/sequence/current_setting call, or a
+                    let mut pt = ParamTypes::default();
+                    let (_node, rtype) =
+                        resolve(&scope, expr, None, &mut AggCtx::Forbidden, &mut pt)?;
+                    // Immutability (§2): a non-immutable seam/sequence/current_setting call, a
                     // session-timezone-dependent expression (one that reads or produces a
-                    // `timestamptz` — conservatively fail-closed), is 42P17.
+                    // `timestamptz` — conservatively fail-closed), or a resolved STABLE node (the
+                    // runtime text→date cast, flagged at its birth — `ParamTypes::nonimmutable`),
+                    // is 42P17.
                     let refs = check_referenced_columns(expr, &columns);
                     let tz_hazard = matches!(rtype, ResolvedType::Timestamptz)
                         || refs
                             .iter()
                             .any(|&i| columns[i].ty.as_scalar() == Some(ScalarType::Timestamptz));
-                    if index_expr_nonimmutable_call(expr) || tz_hazard {
+                    if index_expr_nonimmutable_call(expr) || tz_hazard || pt.nonimmutable {
                         return Err(EngineError::new(
                             SqlState::InvalidObjectDefinition,
                             "functions in index expression must be marked IMMUTABLE".to_string(),
@@ -1973,16 +1971,18 @@ impl Engine {
                 // 42804 rejections then fall out of the Forbidden-context boolean resolve below.
                 reject_index_predicate_structure(&pred.expr)?;
                 let scope = Scope::single(self, table);
-                let _node = resolve_boolean_filter(&scope, &pred.expr, &mut ParamTypes::default())?;
+                let mut pt = ParamTypes::default();
+                let _node = resolve_boolean_filter(&scope, &pred.expr, &mut pt)?;
                 // Immutability (§9), the same rule an expression key carries: a non-immutable
-                // seam/clock/sequence call, or a session-timezone-dependent subexpression (one that
+                // seam/clock/sequence call, a session-timezone-dependent subexpression (one that
                 // references a `timestamptz` column or produces a `timestamptz` value — conservatively
-                // fail-closed), is 42P17.
+                // fail-closed), or a resolved STABLE node (the runtime text→date cast,
+                // `ParamTypes::nonimmutable`), is 42P17.
                 let refs = check_referenced_columns(&pred.expr, &columns);
                 let tz_hazard = refs
                     .iter()
                     .any(|&i| columns[i].ty.as_scalar() == Some(ScalarType::Timestamptz));
-                if index_expr_nonimmutable_call(&pred.expr) || tz_hazard {
+                if index_expr_nonimmutable_call(&pred.expr) || tz_hazard || pt.nonimmutable {
                     return Err(EngineError::new(
                         SqlState::InvalidObjectDefinition,
                         "functions in index predicate must be marked IMMUTABLE".to_string(),

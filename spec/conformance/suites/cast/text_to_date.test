@@ -1,0 +1,121 @@
+# Runtime text → date cast (the text→date cast follow-on — spec/design/date.md §6,
+# spec/types/casts.toml). CAST(text_expr AS date) / text_expr :: date on a NON-LITERAL text
+# expression (here a text COLUMN) runs the SAME parse_date the date literal folds at resolve
+# (cast.string_literal / literal adaptation), but per ROW in the evaluator: the strict-ISO date
+# grammar with optional BC/AD era and ±infinity, any trailing time/offset validated then DISCARDED
+# (24:00:00 does not advance the day), 22007 malformed / 22008 out of range, PER ROW during the
+# scan. The cast is STABLE, not immutable — its input grammar admits the clock-relative specials
+# (the date.md §6 follow-on) — so an index expression or predicate containing it is 42P17 at
+# CREATE INDEX, AGREEING with PostgreSQL (whose date_in is stable).
+#
+# OUT of this corpus (cannot live in the PG-clean oracle): the jed-stricter grammar divergences
+# (DateStyle-dependent spellings like 01/15/2024 / Jan 15 2024 and :60 seconds — accepted by PG,
+# 22007/22008 in jed — identical to the literal path), covered by the per-core unit tests
+# (cast_text_date). text → timestamp/timestamptz/interval/bytea stay deferred (0A000).
+# Format + the `requires` gate: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.index_expr, ddl.index_partial, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, types.i32, types.date, types.text, cast.explicit, cast.operator, cast.string_literal, cast.runtime_text, cast.text_date, expr.date_arithmetic
+
+statement ok
+CREATE TABLE t (id integer PRIMARY KEY, s text)
+
+# Every s here is well-formed for the strict-ISO date grammar jed and PG share — whitespace
+# trimmed, optional era, a trailing time/offset validated then discarded — so a full-table cast
+# never traps.
+statement ok
+INSERT INTO t VALUES
+  (1, '2024-01-15'),
+  (2, '  2024-02-29  '),
+  (3, '2024-01-01 12:34:56.789'),
+  (4, '2024-12-31 23:59:59+14'),
+  (5, '2024-01-01 24:00:00'),
+  (6, '0001-01-01 BC'),
+  (7, 'infinity'),
+  (8, '-infinity'),
+  (9, NULL)
+
+# --- text → date (RUNTIME, on a text column): the strict-ISO literal grammar per row ----------
+# The time is discarded (id 3), the offset is never applied so the day cannot shift (id 4),
+# 24:00:00 does NOT roll into the next day (id 5 — unlike timestamp), the era maps BC years
+# (id 6), and the ±infinity sentinels parse (ids 7/8). NULL → NULL.
+query IT nosort
+SELECT id, s :: date FROM t ORDER BY id
+----
+1
+2024-01-15
+2
+2024-02-29
+3
+2024-01-01
+4
+2024-12-31
+5
+2024-01-01
+6
+0001-01-01 BC
+7
+infinity
+8
+-infinity
+9
+NULL
+
+# the CAST(...) spelling is identical to ::date
+query T nosort
+SELECT CAST(s AS date) FROM t WHERE id = 1
+----
+2024-01-15
+
+# the runtime cast composes in a larger expression (cast, then date arithmetic)
+query T nosort
+SELECT s :: date + 5 FROM t WHERE id = 1
+----
+2024-01-20
+
+query I nosort
+SELECT s :: date - DATE '2024-01-01' FROM t WHERE id = 1
+----
+14
+
+# a cast date compares like any date value
+query I nosort
+SELECT id FROM t WHERE s :: date > DATE '2024-01-31' ORDER BY id
+----
+2
+4
+7
+
+# --- RUNTIME per-row errors that AGREE with PostgreSQL ----------------------------------------
+statement ok
+CREATE TABLE bad (id integer PRIMARY KEY, s text)
+
+statement ok
+INSERT INTO bad VALUES (1, 'not-a-date'), (2, '2024-13-01'), (3, '2024-02-30'), (4, '2024-01-01 25:00:00')
+
+# malformed syntax traps 22007 mid-scan (not at plan time)
+statement error 22007
+SELECT s :: date FROM bad WHERE id = 1
+
+# month 13 is out of range → 22008
+statement error 22008
+SELECT s :: date FROM bad WHERE id = 2
+
+# Feb 30 does not exist → 22008
+statement error 22008
+SELECT s :: date FROM bad WHERE id = 3
+
+# the discarded time is still VALIDATED: hour 25 → 22008
+statement error 22008
+SELECT s :: date FROM bad WHERE id = 4
+
+# --- the cast is STABLE → un-indexable (42P17, agreeing with PG's stable date_in) --------------
+# an expression key containing the cast
+statement error 42P17
+CREATE INDEX bad_expr_idx ON t ((s :: date))
+
+# ... under composition too
+statement error 42P17
+CREATE INDEX bad_expr_idx2 ON t ((s :: date + 1))
+
+# a partial-index PREDICATE containing the cast
+statement error 42P17
+CREATE INDEX bad_pred_idx ON t (id) WHERE s :: date > DATE '2024-01-01'

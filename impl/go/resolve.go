@@ -358,6 +358,13 @@ type paramTypes struct {
 	// execute). A prepared statement's plan cache fills only when this stayed false — flagging at the
 	// node's birth is complete regardless of where in the plan tree it lands (spec/design/api.md §2.4).
 	uncacheable bool
+	// nonimmutable is set during resolution when a node is created whose value depends on
+	// statement-execution context rather than its inputs alone: the runtime text→date cast
+	// (STABLE — its input grammar admits the clock-relative specials, date.md §6). The
+	// expression-index gate consults it to reject such an expression 42P17 (indexes.md §2), the
+	// same way PostgreSQL's stable date_in is unindexable. Orthogonal to uncacheable: these
+	// nodes re-evaluate per execution, so the resolved plan stays cacheable.
+	nonimmutable bool
 }
 
 // note records that $(idx0+1) appears with context type ty (nil = no context here). It unifies
@@ -1481,6 +1488,15 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 				ity.kind == rtDate && target.IsDate():
 				return inner, ity, nil
 			case ity.kind == rtTimestamp || ity.kind == rtTimestamptz || ity.kind == rtDate:
+				return &rExpr{kind: reDateConvert, operand: inner, result: target}, toRt, nil
+			case ity.kind == rtText && target.IsDate():
+				// The runtime text → date cast (date.md §6): a NON-literal text source (a string
+				// LITERAL operand was already folded by the literal-adaptation path above) parses
+				// per row via the same parseDate the literal uses (22007/22008 per row). STABLE,
+				// not immutable — the input grammar admits the clock-relative specials — so it
+				// flags the plan non-immutable (42P17 in an index expression, as in PG).
+				// text → timestamp / timestamptz stays deferred (the default arm).
+				params.nonimmutable = true
 				return &rExpr{kind: reDateConvert, operand: inner, result: target}, toRt, nil
 			default:
 				return nil, resolvedType{}, newError(FeatureNotSupported,

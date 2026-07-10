@@ -836,10 +836,11 @@ pub(crate) fn rexpr_const_to_value(node: &RExpr) -> Result<Value> {
     })
 }
 
-/// Evaluate a cross-family datetime cast (timezones.md §9.3) of the non-NULL value `v` to `to`
-/// (`Timestamp`/`Timestamptz`/`Date`). The casts crossing the `timestamptz` boundary consult the
-/// session zone (charging `timezone`); the others are zone-free. `±infinity` maps to the target's
-/// own sentinel. The `(source family, to)` pair is guaranteed cross-family by the resolver.
+/// Evaluate a cross-family datetime cast (timezones.md §9.3) — or the runtime text → date cast
+/// (date.md §6) — of the non-NULL value `v` to `to` (`Timestamp`/`Timestamptz`/`Date`). The casts
+/// crossing the `timestamptz` boundary consult the session zone (charging `timezone`); the others
+/// are zone-free. `±infinity` maps to the target's own sentinel. The `(source, to)` pair is
+/// guaranteed by the resolver: cross-family datetime, or text → date.
 pub(crate) fn eval_date_convert(
     v: Value,
     to: ScalarType,
@@ -870,6 +871,10 @@ pub(crate) fn eval_date_convert(
     };
     let is_inf = |mc: i64| mc == TS_POS || mc == TS_NEG;
     match (v, to) {
+        // text -> date (the runtime text → date cast, date.md §6): the per-row string runs the
+        // SAME parse_date the literal form folds at resolve — 22007 malformed / 22008 out of
+        // range, per row. Zone-free (the node's operator_eval meters it).
+        (Value::Text(s), ScalarType::Date) => Ok(Value::Date(crate::date::parse_date(&s)?)),
         // timestamp -> date (zone-free): the date part.
         (Value::Timestamp(mc), ScalarType::Date) => Ok(micros_to_date(mc)),
         // date -> timestamp (zone-free): midnight.
@@ -923,7 +928,9 @@ pub(crate) fn eval_date_convert(
                 crate::timezone::local_to_instant_micros(&zr, mid),
             ))
         }
-        _ => unreachable!("resolver restricts DateConvert to cross-family datetime casts"),
+        _ => unreachable!(
+            "resolver restricts DateConvert to cross-family datetime casts and text → date"
+        ),
     }
 }
 

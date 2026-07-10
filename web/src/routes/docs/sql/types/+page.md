@@ -120,8 +120,11 @@ is trimmed, a leading sign is accepted, and a `boolean` follows PostgreSQL's spe
 
 The type must be **named** — a bare string never silently becomes a number, so `int_col = '42'` stays
 a type error (`42804`). jed uses its own literal grammar, so hex, digit underscores, and `NaN` are
-rejected (`22P02`) where PostgreSQL accepts them. (Parsing a string into a `date` / `timestamp` /
-`interval` / `bytea` is a separate feature — use that type's literal form, e.g. `date '2024-01-15'`.)
+rejected (`22P02`) where PostgreSQL accepts them. A runtime `text` value also casts to **`date`**
+(the strict ISO form, `22007`/`22008` on a bad string) — but because a date string may name the
+current day (`'today'`), an index expression containing `::date` from text is rejected, exactly as
+in PostgreSQL. (Parsing a string into a `timestamp` /
+`interval` / `bytea` is a separate feature — use that type's literal form, e.g. `timestamp '2024-01-15 10:00'`.)
 
 ## varchar(n) length limits
 
@@ -216,8 +219,8 @@ explicit zone:
 
 <LiveSql query={convDemo} rows={1} />
 
-(`date_part` is deferred — it returns `double precision`, and jed has no binary float type — as are
-the `text`↔datetime casts; cast a string with the `timestamp '…'` / `date '…'` literal form instead.)
+(`date_part` is deferred, as are the `text`↔`timestamp`/`timestamptz` casts — cast a string with the
+`timestamp '…'` literal form instead. A runtime `text` value **does** cast to `date`.)
 
 ### Date arithmetic
 

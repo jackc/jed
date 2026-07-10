@@ -667,10 +667,11 @@ export function evalDateArith(op: BinaryOp, a: Value, b: Value, result: ScalarTy
   return dateValue(shifted);
 }
 
-// evalDateConvert evaluates a cross-family datetime cast (timezones.md §9.3) of the non-NULL value v
-// to `to` (timestamp/timestamptz/date). The casts crossing the timestamptz boundary consult the
-// session zone (charging timezone); the others are zone-free. ±infinity maps to the target's own
-// sentinel. The (source family, to) pair is guaranteed cross-family by the resolver.
+// evalDateConvert evaluates a cross-family datetime cast (timezones.md §9.3) — or the runtime
+// text → date cast (date.md §6) — of the non-NULL value v to `to` (timestamp/timestamptz/date).
+// The casts crossing the timestamptz boundary consult the session zone (charging timezone); the
+// others are zone-free. ±infinity maps to the target's own sentinel. The (source, to) pair is
+// guaranteed by the resolver: cross-family datetime, or text → date.
 export function evalDateConvert(v: Value, to: ScalarType, env: EvalEnv, m: Meter): Value {
   const MICROS_PER_DAY = 86_400n * 1_000_000n;
   const microsToDate = (mc: bigint): Value => {
@@ -691,6 +692,12 @@ export function evalDateConvert(v: Value, to: ScalarType, env: EvalEnv, m: Meter
     m.guard();
     return zr;
   };
+  if (v.kind === "text" && to === "date") {
+    // The runtime text → date cast (date.md §6): the per-row string runs the SAME parseDate the
+    // literal form folds at resolve — 22007 malformed / 22008 out of range, per row. Zone-free
+    // (no timezone charge; the node's operator_eval meters it).
+    return dateValue(parseDate(v.text));
+  }
   if (v.kind === "timestamp" && to === "date") return microsToDate(v.micros);
   if (v.kind === "date" && to === "timestamp") return timestampValue(dateToMicros(v.days));
   if (v.kind === "timestamptz" && to === "timestamp") {
@@ -710,5 +717,7 @@ export function evalDateConvert(v: Value, to: ScalarType, env: EvalEnv, m: Meter
     if (isInf(mid)) return timestamptzValue(mid);
     return timestamptzValue(localToInstantMicros(zoneCharge(), mid));
   }
-  throw new Error("unreachable: resolver restricts dateConvert to cross-family datetime casts");
+  throw new Error(
+    "unreachable: resolver restricts dateConvert to cross-family datetime casts and text → date",
+  );
 }

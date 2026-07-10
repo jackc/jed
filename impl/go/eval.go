@@ -987,10 +987,11 @@ func typeError(msg string) error { return newError(DatatypeMismatch, msg) }
 // operands LHS-before-RHS); leaf nodes (column/constants) charge nothing. Both operands
 // are always evaluated — there is no short-circuit, so the count never depends on operand
 // values (spec/design/cost.md §3).
-// evalDateConvert evaluates a cross-family datetime cast (timezones.md §9.3) of the non-NULL value v
-// to `to` (Timestamp/Timestamptz/Date). The casts crossing the timestamptz boundary consult the
-// session zone (charging timezone); the others are zone-free. ±infinity maps to the target's own
-// sentinel. The (source family, to) pair is guaranteed cross-family by the resolver.
+// evalDateConvert evaluates a cross-family datetime cast (timezones.md §9.3) — or the runtime
+// text → date cast (date.md §6) — of the non-NULL value v to `to` (Timestamp/Timestamptz/Date).
+// The casts crossing the timestamptz boundary consult the session zone (charging timezone); the
+// others are zone-free. ±infinity maps to the target's own sentinel. The (source, to) pair is
+// guaranteed by the resolver: cross-family datetime, or text → date.
 func evalDateConvert(v Value, to scalarType, env *evalEnv, m *costMeter) (Value, error) {
 	const microsPerDay int64 = 86_400 * 1_000_000
 	microsToDate := func(mc int64) Value {
@@ -1023,6 +1024,15 @@ func evalDateConvert(v Value, to scalarType, env *evalEnv, m *costMeter) (Value,
 		return zr, nil
 	}
 	switch {
+	case v.Kind == ValText && to == scalarDate:
+		// The runtime text → date cast (date.md §6): the per-row string runs the SAME parseDate
+		// the literal form folds at resolve — 22007 malformed / 22008 out of range, per row.
+		// Zone-free (no timezone charge; the node's operator_eval meters it).
+		d, err := parseDate(v.str())
+		if err != nil {
+			return Value{}, err
+		}
+		return DateValue(d), nil
 	case v.Kind == ValTimestamp && to == scalarDate:
 		return microsToDate(v.Int), nil
 	case v.Kind == ValDate && to == scalarTimestamp:
@@ -1065,7 +1075,7 @@ func evalDateConvert(v Value, to scalarType, env *evalEnv, m *costMeter) (Value,
 		}
 		return TimestamptzValue(localToInstantMicros(zr, mid)), nil
 	default:
-		panic("resolver restricts DateConvert to cross-family datetime casts")
+		panic("resolver restricts DateConvert to cross-family datetime casts and text → date")
 	}
 }
 

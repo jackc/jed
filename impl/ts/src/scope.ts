@@ -968,6 +968,13 @@ export class ParamTypes {
   // execute). A prepared statement's plan cache fills only when this stayed false — flagging at the
   // node's birth is complete regardless of where in the plan tree it lands (spec/design/api.md §2.4).
   uncacheable = false;
+  // nonimmutable is set during resolution when a node is created whose value depends on
+  // statement-execution context rather than its inputs alone: the runtime text→date cast (STABLE —
+  // its input grammar admits the clock-relative specials, date.md §6). The expression-index gate
+  // consults it to reject such an expression 42P17 (indexes.md §2), the same way PostgreSQL's
+  // stable date_in is unindexable. Orthogonal to uncacheable: these nodes re-evaluate per
+  // execution, so the resolved plan stays cacheable.
+  nonimmutable = false;
 
   // note records that $(idx0+1) appears with context type ty (null = no context here). It unifies
   // with any prior inference: equal types agree, two integer widths widen to the wider, an

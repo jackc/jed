@@ -1170,6 +1170,16 @@ export function resolve(
         if (ik === "timestamp" || ik === "timestamptz" || ik === "date") {
           return { node: { kind: "dateConvert", inner: inner.node, to: target }, type: toRt };
         }
+        if (ik === "text" && isDate(target)) {
+          // The runtime text → date cast (date.md §6): a NON-literal text source (a string
+          // LITERAL operand was already folded by the literal-adaptation path above) parses per
+          // row via the same parseDate the literal uses (22007/22008 per row). STABLE, not
+          // immutable — the input grammar admits the clock-relative specials — so it flags the
+          // plan non-immutable (42P17 in an index expression, as in PG). text → timestamp /
+          // timestamptz stays deferred (the throw below).
+          params.nonimmutable = true;
+          return { node: { kind: "dateConvert", inner: inner.node, to: target }, type: toRt };
+        }
         throw engineError(
           "feature_not_supported",
           `cannot cast ${rtName(inner.type)} to ${canonicalName(target)}`,

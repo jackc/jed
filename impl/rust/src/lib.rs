@@ -597,8 +597,15 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // coercion the LITERAL form folds at resolve, but per row in evalCast. Malformed → 22P02,
     // out of range → 22003. jed's own grammar (hex/underscore/NaN trap 22P02 — per-core tested);
     // the accepted-grammar cases agree with PG and are oracle-checked. text → uuid is cast.uuid;
-    // text → date/timestamp/interval/bytea stay deferred.
+    // text → timestamp/timestamptz/interval/bytea stay deferred; text → date is cast.text_date.
     "cast.runtime_text",
+    // Runtime text → date cast (date.md §6): CAST(text_expr AS date) / s :: date on a NON-LITERAL
+    // text expression runs the same parse_date the literal form folds at resolve, per row — 22007
+    // malformed / 22008 out of range. STABLE, not immutable (its input grammar admits the
+    // clock-relative specials), so an index expression containing it is 42P17 — agreeing with
+    // PostgreSQL, whose date_in is stable. The strict-ISO accepted grammar agrees with PG and is
+    // oracle-checked; the jed-stricter rejections (DateStyle spellings) are per-core tested.
+    "cast.text_date",
     // The COLLATE expression operator + ORDER BY … COLLATE + db.ImportCollation (collation slice
     // 1c, spec/design/collation.md §14): a host-loaded collation orders text by its UCA sort key in
     // the ordering comparisons (< <= > >=) and ORDER BY; explicit-conflict 42P21, unknown 42704,

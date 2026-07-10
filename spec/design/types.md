@@ -223,8 +223,10 @@ listed).
   reusing the identical parse functions as the literal form (so jed's own grammar still governs: hex
   / underscore / `NaN` trap `22P02`), metered by the cast node's `operator_eval`, trapping
   `22P02` / `22003` **per row**. The runtime `text → uuid` cast also landed (the uuid cast slice,
-  §14: `uuid_in` at eval). The runtime text→`T` cast to the **string-native** scalars `date` /
-  `timestamp` / `timestamptz` / `interval` / `bytea` stays **deferred** (`0A000`), each its own
+  §14: `uuid_in` at eval), and so did `text → date` (the literal's `parse_date` per row,
+  `22007`/`22008` — STABLE and un-indexable, [date.md](date.md) §6). The runtime text→`T` cast to
+  the remaining **string-native** scalars `timestamp` / `timestamptz` / `interval` / `bytea` stays
+  **deferred** (`0A000`), each its own
   follow-on. `CAST(1 AS text)` (casting *to* text) is likewise deferred, **except** `uuid → text`
   (§14) and `json`/`jsonb → text`. The `text → text` identity is implicit, like any identity cast.
 - **Strictness is preserved.** The string→number/bool coercion fires only when the type is

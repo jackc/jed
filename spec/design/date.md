@@ -18,8 +18,9 @@
 comparison/ordering, rendering, the `±infinity` sentinels, and a `date` PRIMARY KEY — mirroring
 the original timestamp slice. **Date arithmetic** (`date ± int`, `date - date`, `date ± interval`)
 has since **landed** (§6); the cross-family `date ↔ timestamp`/`timestamptz` **casts** have landed
-too (timezones.md §9.3), while the runtime `text ↔ date` cast and the clock-relative literals stay
-**deferred follow-ons** (§6), exactly as the timestamp slice deferred its own. The non-goal is wire/`pg_catalog` fidelity
+too (timezones.md §9.3), and so has the **runtime `text → date` cast** (§6 — STABLE, un-indexable),
+while the clock-relative literals stay **deferred follow-ons** (§6), exactly as the timestamp slice
+deferred its own. The non-goal is wire/`pg_catalog` fidelity
 (CLAUDE.md §1); the goal is PG's *observable* date behavior on the surface we implement.
 
 ## 1. Representation — i32 days since the Unix epoch
@@ -167,10 +168,13 @@ coercion to the cast follow-on (§6).
   `TIMESTAMP '…'` / `INTERVAL '…'`); the string is parsed by the **same** `parse_date` as §2, so
   the `22007` / `22008` codes and every field rule are identical. jed uses the canonical one-word
   keyword only; a `(` after the name (a typmod) is not a typed literal (no `date(p)`).
-- **Casts** ([casts.toml](../types/casts.toml)): **deferred**, exactly like timestamp.
-  `CAST(x AS date)`, text↔date, and the date↔timestamp/timestamptz conversions are all later
-  work. (The string-literal coercion of §2/§5 is **literal adaptation**, not a `(text, date)`
-  CAST.)
+- **Casts** ([casts.toml](../types/casts.toml)): the cross-family `date ↔ timestamp`/`timestamptz`
+  conversions have **landed** (timezones.md §9.3), and so has the **runtime `text → date` cast**
+  (§6): `CAST(text_expr AS date)` / `s :: date` on a *non-literal* text expression runs the same
+  `parse_date` per row (`22007`/`22008` per row). It is **STABLE, not immutable** — its input
+  grammar admits the clock-relative specials — so an index expression containing it is **`42P17`**
+  ([indexes.md §2](indexes.md)), exactly as PostgreSQL's stable `date_in` is unindexable. (The
+  string-literal coercion of §2/§5 remains **literal adaptation**, not the cast pair.)
 - **Key encoding** ([encoding.md](encoding.md) §2.1, the i32 codec): `date` reuses the
   fixed-width `int-be-signflip` integer key encoding (width 4) **verbatim** — and, like
   timestamp (and unlike text/decimal/bytea/interval), it is **exercised** this slice, so a
@@ -227,13 +231,38 @@ separate `time` type yet (timezones.md §9); it lands with that type.
 
 ### Still deferred
 
+### Runtime `text → date` cast — landed
+
+`CAST(text_expr AS date)` / `text_expr :: date` on a **non-literal** text expression (a text
+column, a function result) is a real runtime cast ([casts.toml](../types/casts.toml)): the per-row
+string runs the **same `parse_date`** the literal form folds at resolve — one coercion, literal or
+runtime (the runtime-text-cast precedent, grammar.md §36) — so the strict-ISO grammar, the
+discarded time/offset, and the `22007`/`22008` codes are identical, raised **per row** during the
+scan. The cast node's existing `operator_eval` charge meters it (zone-free — no `timezone` unit).
+
+Two deliberate properties:
+
+- **STABLE, not immutable.** The cast's input grammar admits the **clock-relative specials**
+  (`today`/`now`/…, the follow-on below), so its result is a function of the statement clock, not
+  of its input alone. PostgreSQL marks `date_in` stable for the same reason.
+- **Un-indexable.** An index **expression or predicate** containing the cast is rejected
+  **`42P17`** (*functions in index expression must be marked IMMUTABLE*) at `CREATE INDEX` —
+  agreeing with PostgreSQL. Mechanically the resolver flags the plan at the cast node's birth
+  (the `ParamTypes.nonimmutable` channel) and the two index-DDL sites consult the flag
+  ([indexes.md §2](indexes.md)).
+
+The accepted grammar agrees with PostgreSQL and is oracle-checked
+(`suites/cast/text_to_date.test`); the jed-stricter rejections (DateStyle-dependent spellings,
+`:60`) are per-core tested, identical to the literal path. `text → timestamp`/`timestamptz`,
+`datetime → text`, and `text → interval`/`bytea` stay deferred, each its own follow-on.
+
+### Still deferred
+
 Scoped out (each its own future slice), matching the timestamp/interval precedent:
 
-- **Casts** — the runtime `text → date` cast on a non-literal text expression (text→date is
-  reachable today only as **literal adaptation**, §2/§5) and `date(p)`-style typmods (there are
-  none). The cross-family `date ↔ timestamp` / `timestamptz` casts have **landed** (timezones.md
-  §9.3); the implicit `date → timestamp` coercion that would make `date < timestamp` well-typed
-  (§4) is still deferred — `date` stays a strict comparison island.
+- **Casts** — `date(p)`-style typmods (there are none) and the implicit `date → timestamp`
+  coercion that would make `date < timestamp` well-typed (§4) — `date` stays a strict comparison
+  island.
 - **Clock-relative literals** — `today` / `tomorrow` / `yesterday` / `now` / `epoch` (on the
   entropy/clock seam, [entropy.md](entropy.md), like the deferred timestamp `now` literal).
 - **Date functions** — `make_date`, `date_part` (float8 — needs `float`), `current_date`.

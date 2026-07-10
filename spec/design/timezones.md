@@ -342,9 +342,12 @@ exactly as PostgreSQL does. Each is oracle-checked against `postgres:18` (CLAUDE
 `clock_timestamp()` (VOLATILE) → `timestamptz`.
 
 **Still deferred** (each oracle-checked against PG when it lands, CLAUDE.md §7): the `text`↔datetime
-casts and `to_char` / `to_timestamp` (a parsing/formatting surface, a different axis from "in a zone"),
-`make_timestamptz`, `date_part` (it returns `double precision`, and jed has no binary `float` type —
-§9.2), `age`, and the **session-zone-driven rendering of `timestamptz` → `text`** (§9.5). All remain
+casts for `timestamp`/`timestamptz` — the runtime **`text → date`** cast has since **landed**
+([date.md §6](date.md): the literal's `parse_date` per row, STABLE and un-indexable `42P17`) —
+and `to_char` / `to_timestamp` (a parsing/formatting surface, a different axis from "in a zone"),
+`make_timestamptz`, `date_part` (it returns `double precision`; deferred while jed had no binary
+`float` type — `float` has since landed, so this is now unblocked — §9.2), `age`, and the
+**session-zone-driven rendering of `timestamptz` → `text`** (§9.5). All remain
 **pure given the tz seam** (CLAUDE.md §13) — they read only the loaded tz data + the instant, never host
 state — so they stay inside the untrusted-query safety guarantee. The IMMUTABLE-vs-STABLE label of each
 is the §8 indexability decision, made when expression indexes land.
@@ -419,7 +422,8 @@ the others are zone-free:
 
 These reuse the §5 reader kernels (`instant_to_local_micros` / `local_to_instant_micros`) with the
 session zone, so they inherit `AT TIME ZONE`'s oracle-clean DST behavior. A session-zone-consulting cast
-charges the `timezone` unit. The **`text`↔datetime** casts stay deferred (§9, above). A string *literal*
+charges the `timezone` unit. The **`text`↔datetime** casts stay deferred for `timestamp`/`timestamptz`
+(§9, above); the runtime **`text → date`** cast has landed ([date.md §6](date.md)). A string *literal*
 still adapts to a datetime context (`'2024-01-01'::timestamp`) by literal adaptation, unchanged.
 
 ### 9.4 Where the session zone is read — eval, not render
@@ -540,7 +544,8 @@ the tz database, the load seam, the TZif reader, `AT TIME ZONE`, and the convers
   per-zone RFC 8536 TZif sections + links, parallel to `JUCD`, no custom compiled-table payload and no
   merge step (§4).
 - **Plumbing + consumers.** Slice 1 shipped `AT TIME ZONE` (both directions, §6); Slice 2 shipped
-  `date_trunc` / `EXTRACT` / the cross-family casts (§9). Still deferred: `text`↔datetime casts,
+  `date_trunc` / `EXTRACT` / the cross-family casts (§9); the runtime `text → date` cast has since
+  landed ([date.md §6](date.md)). Still deferred: `text`↔`timestamp`/`timestamptz` casts,
   `make_timestamptz`, `to_char`, `date_part` (float8), and session-zone rendering (§9, §9.5).
 - **No on-disk change.** No `format_version` bump, no reference entry, no skew verdict (§2); the
   collation-style version-skew machinery is latent until tz-derived stored keys exist (§8).
