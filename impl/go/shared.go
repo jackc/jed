@@ -887,8 +887,9 @@ func (s *Database) Session(opts SessionOptions) *Session {
 
 // queryValues is the unexported raw (sql, []Value) -> *Rows seam the bare-handle ergonomic
 // Query/Exec/QueryRow (ergonomic.go, spec/design/api.md §11) build on: it runs a statement on a fresh
-// autocommit session (the rows are materialized, so the cursor stays valid after the session is
-// closed). Total: a non-query statement returns a no-column cursor carrying the command tag.
+// autocommit session. A streaming cursor owns its snapshot (streaming.md §5), so it stays valid after
+// the transient session is closed; its watermark pin is held by the Rows (released on its Close), not
+// by the session. Total: a non-query statement returns a no-column cursor carrying the command tag.
 func (db *Database) queryValues(sql string, params []Value) (*Rows, error) {
 	s := db.Session(SessionOptions{})
 	defer s.Close()

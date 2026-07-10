@@ -229,6 +229,79 @@ fn database_query_convenience_streams() {
     );
 }
 
+/// The bare-handle `Database::query` path pins the reader-liveness watermark exactly like a `Session`
+/// query (streaming.md §7 closing note): the fresh per-call session's provisional pin transfers to
+/// the `Rows`, so a held bare-handle cursor holds `oldest_live_txid`, keeps within-session
+/// reclamation (v25) from recycling its snapshot's pages under compacting commit churn, and releases
+/// the watermark on close. File-backed with a tiny page size so the churn actually orphans pages
+/// (an in-memory db cannot exercise the persisted-free-list reuse path). The workload is the same
+/// deterministic one the Go/TS twins run with white-box free-list-generation instrumentation — the
+/// §8 cross-core byte-identity makes their "the churn compacts once unpinned" proof carry here.
+#[test]
+fn bare_handle_query_pins_watermark_under_reclamation() {
+    let path =
+        std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("bare_handle_watermark.jed");
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::create(CreateOptions {
+        path: Some(path.clone()),
+        page_size: 256,
+        skip_fsync: true,
+    })
+    .unwrap();
+    db.execute("CREATE TABLE t (id i64 PRIMARY KEY, v i64)", &[])
+        .unwrap();
+    // A multi-leaf tree; every churn commit below rewrites all of it (whole-table UPDATE), orphaning
+    // the prior tree so unpinned within-session compaction would reclaim + reuse its pages.
+    for i in 1..=120 {
+        db.execute(&format!("INSERT INTO t VALUES ({i}, {})", i * 10), &[])
+            .unwrap();
+    }
+    let v0 = db.version();
+    assert_eq!(db.oldest_live_txid(), v0, "idle watermark = committed");
+
+    // Open a bare-handle streaming cursor (the transient session closes before `query` returns; the
+    // pin rides the `Rows`) and pull ONE row so the scan is live mid-tree.
+    let mut rows = db.query("SELECT id, v FROM t ORDER BY id", &[]).unwrap();
+    let first = (&mut rows).next().unwrap();
+    assert_eq!(first, vec![Value::Int(1), Value::Int(10)]);
+    assert_eq!(
+        db.oldest_live_txid(),
+        v0,
+        "open bare-handle cursor pins its version"
+    );
+
+    // Churn: whole-table UPDATE commits through the same bare handle — each orphans every leaf plus
+    // the spine, so on an ungated path reuse would recycle the cursor's pinned pages.
+    for _ in 0..150 {
+        db.execute("UPDATE t SET v = v + 1", &[]).unwrap();
+    }
+    assert_eq!(
+        db.oldest_live_txid(),
+        v0,
+        "watermark held at the cursor's pin through the churn"
+    );
+
+    // Drain: the cursor must see EXACTLY its frozen snapshot (v = id * 10), untouched by the churn.
+    let mut want = 2i64;
+    for r in &mut rows {
+        assert_eq!(
+            r,
+            vec![Value::Int(want), Value::Int(want * 10)],
+            "SNAPSHOT ISOLATION VIOLATED: the cursor's pages were reclaimed and overwritten"
+        );
+        want += 1;
+    }
+    rows.error().unwrap();
+    assert_eq!(want, 121, "drained the full pinned snapshot 2..=120");
+    rows.close();
+    drop(rows);
+    assert_eq!(
+        db.oldest_live_txid(),
+        db.version(),
+        "closed cursor releases its pin"
+    );
+}
+
 // ---- S4: the lazy BUFFERED cursor (a blocking plan; streaming.md §4) ------------------------------
 
 /// Every blocking shape (aggregate / non-PK `ORDER BY` / `DISTINCT` / window / join / `GROUP BY`):

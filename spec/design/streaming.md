@@ -179,9 +179,10 @@ life"; streaming makes that promise *load-bearing* rather than a free consequenc
   pinned version in the `Database`'s live-reader registry ([transactions.md §8](transactions.md)),
   and `close()` / drain-to-exhaustion deregisters it, advancing `oldest_live_txid`. This is the
   exact machinery the concurrent-reader sessions already use; a streaming cursor is just an
-  additional pin on it. (Today's reclamation is reconstruct-on-open only, so a long-lived cursor is
-  already safe trivially; registration is what keeps the *continuous-reclamation* follow-on
-  ([transactions.md §8](transactions.md)) safe without a retrofit.)
+  additional pin on it. (Since v25 this registration is **load-bearing**, not future-proofing:
+  reclamation is *continuous within-session*, and the free-list generation gate defers reuse of any
+  page freed past `oldest_live_txid` ([transactions.md §8](transactions.md)) — the pin is what keeps
+  a held cursor's pages from being recycled and overwritten under it.)
 - **Close obligation.** Rust releases on `Drop`; **Go and TS need an explicit `close()`** (no
   destructor). The ergonomic iterators already close on loop exit — Go `All()`/`Collect`, TS
   `*iterate` (api.md §11.3) — so they are covered; the raw `Rows` cursor gains a documented `close`
@@ -215,8 +216,10 @@ life"; streaming makes that promise *load-bearing* rather than a free consequenc
   `close` can end the transaction; here the transaction's end closes the cursor. Because jed has no
   `WITH HOLD`, no cursor outlives its block. (Under autocommit there is no enclosing block, so the
   cursor lives until drained or `close`d — the *Autocommit interaction* bullet.)
-- **In-memory vs file-backed.** Identical model both ways; an in-memory database has no free-list to
-  gate, so the pin is bookkeeping only. The single-writer gate is untouched — a streaming read
+- **In-memory vs file-backed.** Identical model both ways; since v25 both reclaim continuously
+  within-session (an in-memory main store compacts its copy-on-write orphans post-commit —
+  [storage.md §6](storage.md)), and both gate that reclamation on the watermark / open-cursor count,
+  so the pin is load-bearing in both modes. The single-writer gate is untouched — a streaming read
   cursor never holds the write gate.
 
 ## 6. Determinism & cost — invariant under full drain (the contract)
@@ -301,8 +304,9 @@ independently — the P6.4 precedent):
   iteration (Rust stashes it for `Rows::error()`; Go sets `Rows.Err()`; TS throws out of the iterator).
   Verified per core by unit tests: `query()` == `execute()` rows + total cost under full drain, early
   exit charges less, the snapshot pin + watermark, and the mid-drain abort. Prepared-statement streaming
-  and a `Database::query` watermark on the bare single-handle path are follow-ons (the bare path streams
-  but pins nothing — the single-handle reclamation is reconstruct-on-open-safe, §5).
+  later landed as S8; the `Database::query` watermark on the bare single-handle path — named here as a
+  follow-on when the bare path streamed but pinned nothing — has since been **resolved by construction**
+  (see the closing note after S8).
 - **S4 — lazy output from the blocking operators.** ✅ **Landed (all three cores).** The `query()` →
   `Rows` path now serves a **blocking** read — a non-PK-ordered `ORDER BY`, `DISTINCT`, aggregate /
   `GROUP BY`, window, or a join — through a lazy **`Buffered`** cursor (`BufferedScan` in Rust,
@@ -376,9 +380,9 @@ independently — the P6.4 precedent):
   generator's `finally`). Verified per core by unit tests (`query()` == `execute()` rows + cost across a
   battery of sort shapes incl. `OFFSET`/`LIMIT`/projection-expr/filter/empty; the early-exit-charges-less
   win; and the spilling-merge path streaming lazily + leaving no temp file on early exit). This was the
-  last `exec_select_emit`-path output-laziness follow-on; the remaining streaming follow-on is a
-  `Database::query` watermark on the bare single-handle path (§3/§5) — **prepared-statement streaming
-  landed in S8 (below).**
+  last `exec_select_emit`-path output-laziness follow-on — **prepared-statement streaming landed in S8
+  (below)**, and the bare-handle `Database::query` watermark follow-on has since been resolved by
+  construction (see the closing note after S8).
 - **S8 — prepared-statement streaming.** ✅ **Landed (all three cores).** A **prepared** query
   (`prepare` + `query_prepared` / `QueryValues` / `PreparedStatement.query`) used to **materialize** —
   it ran the eager `execute`/`dispatch` path and wrapped the resulting `Outcome` in a buffered `Rows`,
@@ -404,6 +408,20 @@ independently — the P6.4 precedent):
   helper that surfaces a mid-drain error as an `ERROR` buffer instead of a silently truncated result
   (the one correctness obligation the streaming change introduces at that boundary); the Ruby native
   extension exposes only `jed_execute` (materialized), so it is unaffected. No `format_version` bump.
+
+**The ladder is complete** — S1–S8 landed in all three cores, plus the lazy-record reshape
+([lazy-record.md](lazy-record.md)) that superseded the old S5. The one follow-on named along the way —
+a `Database::query` watermark on the bare single-handle path — was **resolved by construction** when
+the bare `Database` conveniences became mint-a-fresh-`Session`-per-call ([api.md §2.4](api.md)): the
+session query path registers the cursor's snapshot pin atomically ([transactions.md
+§8](transactions.md)), the pin is held by the returned `Rows` itself (so it survives the transient
+session's close), and the residual truly-bare `Engine` path (internal; TS keeps tooling free
+functions over it) defers within-session reclamation while any cursor is open (the `open_streams ==
+0` gate at the persist seam). Verified by the per-core bare-handle test
+(`bare_handle_query_pins_watermark_under_reclamation` / `TestBareHandleQueryPinsWatermarkUnderReclamation`
+/ `"bare-handle query pins its watermark under reclamation"`): a held bare-handle cursor holds
+`oldest_live_txid`, drains its frozen snapshot intact under compacting commit churn, and releases the
+watermark on close.
 
 Built Rust-first, then Go/TS in lockstep; the streaming loop structure is mirrored across cores (§6).
 

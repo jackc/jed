@@ -262,6 +262,91 @@ func TestDatabaseQueryConvenienceStreams(t *testing.T) {
 	}
 }
 
+// The bare-handle Database.Query path pins the reader-liveness watermark exactly like a Session query
+// (streaming.md §7 closing note): the fresh per-call session's provisional pin transfers to the Rows,
+// so a held bare-handle cursor holds oldestLiveTxid, keeps within-session reclamation (v25) from
+// recycling its snapshot's pages under compacting commit churn, and releases the watermark on Close.
+// File-backed with a tiny page size so the churn actually orphans pages and accumulates a reusable
+// free-list (an in-memory db cannot exercise the persisted-free-list reuse path).
+func TestBareHandleQueryPinsWatermarkUnderReclamation(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "barehandle.jed")
+	db, err := CreateDatabase(CreateOptions{Path: path, PageSize: 256, SkipFsync: true})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	defer db.Close()
+	execDB(t, db, "CREATE TABLE t (id i64 PRIMARY KEY, v i64)")
+	// A multi-leaf tree; every churn commit below rewrites all of it (whole-table UPDATE), orphaning
+	// the prior tree so within-session compaction accumulates a reusable free-list.
+	for i := 1; i <= 120; i++ {
+		execDB(t, db, fmt.Sprintf("INSERT INTO t VALUES (%d, %d)", i, i*10))
+	}
+	v0 := db.Version()
+	if got := db.OldestLiveTxid(); got != v0 {
+		t.Fatalf("idle watermark = %d, want the committed version %d", got, v0)
+	}
+
+	// Open a bare-handle streaming cursor (the transient session closes before Query returns; the
+	// pin rides the Rows) and pull ONE row so the scan is live mid-tree.
+	rows, err := db.queryValues("SELECT id, v FROM t ORDER BY id", nil)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if !rows.Next() {
+		t.Fatalf("no first row (rows.Err=%v)", rows.Err())
+	}
+	if r := rows.Row(); r[0].Int != 1 || r[1].Int != 10 {
+		t.Fatalf("first row = (%d, %d), want (1, 10)", r[0].Int, r[1].Int)
+	}
+	if got := db.OldestLiveTxid(); got != v0 {
+		t.Fatalf("open bare-handle cursor: watermark = %d, want its pin %d", got, v0)
+	}
+
+	// Churn: whole-table UPDATE commits through the same bare handle — each orphans every leaf plus
+	// the spine, so on an ungated path reuse would recycle the cursor's pinned pages.
+	for i := 0; i < 150; i++ {
+		execDB(t, db, "UPDATE t SET v = v + 1")
+	}
+	if got := db.OldestLiveTxid(); got != v0 {
+		t.Fatalf("watermark advanced to %d under churn despite the held cursor pin %d", got, v0)
+	}
+	// The gate's observable contract: with the pin held, compaction defers wholesale (canReclaim needs
+	// oldest_live == the new version), so the free-list generation must never pass the pin.
+	if gen := db.core.storage.freeGenTxid; gen > v0 {
+		t.Fatalf("free-list generation %d advanced past the held pin %d — reclamation ran under a live reader", gen, v0)
+	}
+
+	// Drain: the cursor must see EXACTLY its frozen snapshot (v = id * 10), untouched by the churn.
+	want := int64(2)
+	for rows.Next() {
+		r := rows.Row()
+		if r[0].Int != want || r[1].Int != want*10 {
+			t.Fatalf("SNAPSHOT ISOLATION VIOLATED: drained (%d, %d), want (%d, %d) (the cursor's pages were reclaimed and overwritten)",
+				r[0].Int, r[1].Int, want, want*10)
+		}
+		want++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if want != 121 {
+		t.Fatalf("drained through id %d, want the full pinned snapshot 2..=120", want-1)
+	}
+	_ = rows.Close()
+	if got, v := db.OldestLiveTxid(), db.Version(); got != v {
+		t.Fatalf("closed cursor: watermark = %d, want the committed version %d", got, v)
+	}
+
+	// Self-validation (not vacuous): the first commit after the pin releases compacts the deferred
+	// churn garbage — the generation advances past v0, proving the churn produced real orphans and
+	// the hold above was the gate at work, not a lack of garbage.
+	execDB(t, db, "UPDATE t SET v = v + 1")
+	if gen := db.core.storage.freeGenTxid; gen <= v0 {
+		t.Fatalf("post-close commit did not compact (freeGenTxid=%d <= %d) — the churn never produced gated garbage", gen, v0)
+	}
+}
+
 // ---- S4: the lazy BUFFERED cursor (a blocking plan; streaming.md §4) ------------------------------
 
 // Every blocking shape (aggregate / non-PK ORDER BY / DISTINCT / window / join / GROUP BY): Query (the

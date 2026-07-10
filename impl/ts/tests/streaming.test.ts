@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { createDatabase, type Database, EngineError, type Session } from "../src/lib.ts";
+import { setAfterPersistHook } from "../src/shared.ts";
 import {
   Engine,
   execute,
@@ -214,6 +215,89 @@ test("database query convenience streams", () => {
     [3n, 30n],
     [4n, 40n],
   ]);
+});
+
+// The bare-handle db.query() path pins the reader-liveness watermark exactly like a session query
+// (streaming.md §7 closing note): the fresh per-call session's provisional pin transfers to the Rows,
+// so a held bare-handle cursor holds oldestLiveTxid, keeps within-session reclamation (v25) from
+// recycling its snapshot's pages under compacting commit churn, and releases the watermark on close.
+// File-backed with a tiny page size so the churn actually orphans pages (an in-memory db cannot
+// exercise the persisted-free-list reuse path). The afterPersistHook watches the free-list generation:
+// it must never pass the pin while the cursor is open (reclamation deferred), and must pass it on the
+// first commit after close (the churn produced real gated garbage — the test is not vacuous).
+test("bare-handle query pins its watermark under reclamation", () => {
+  const dir = mkdtempSync(join(tmpdir(), "jed-bare-"));
+  const path = join(dir, "bare.jed");
+  try {
+    const db = createDatabase({ path, pageSize: 256, skipFsync: true });
+    try {
+      db.execute("CREATE TABLE t (id i64 PRIMARY KEY, v i64)");
+      // A multi-leaf tree; every churn commit below rewrites all of it (whole-table UPDATE),
+      // orphaning the prior tree so unpinned compaction would reclaim + reuse its pages.
+      for (let i = 1; i <= 120; i++) db.execute(`INSERT INTO t VALUES (${i}, ${i * 10})`);
+      const v0 = db.version;
+      assert.equal(db.oldestLiveTxid(), v0, "idle watermark = committed");
+
+      // Open a bare-handle streaming cursor (the transient session closes before query() returns;
+      // the pin rides the Rows) and pull ONE row so the scan is live mid-tree.
+      const cursor = db.query("SELECT id, v FROM t ORDER BY id");
+      const it = cursor[Symbol.iterator]();
+      const first = it.next();
+      assert.equal(first.done, false);
+      const f0 = first.value[0]!;
+      const f1 = first.value[1]!;
+      assert.equal(f0.kind === "int" ? f0.int : -1n, 1n);
+      assert.equal(f1.kind === "int" ? f1.int : -1n, 10n);
+      assert.equal(db.oldestLiveTxid(), v0, "open bare-handle cursor pins its version");
+
+      // Churn: whole-table UPDATE commits through the same bare handle — each orphans every leaf
+      // plus the spine, so on an ungated path reuse would recycle the cursor's pinned pages.
+      let lastFreeGen = 0n;
+      setAfterPersistHook((_committed, freeGen) => {
+        lastFreeGen = freeGen;
+      });
+      for (let i = 0; i < 150; i++) db.execute("UPDATE t SET v = v + 1");
+      assert.equal(db.oldestLiveTxid(), v0, "watermark held at the cursor's pin through the churn");
+      assert.ok(
+        lastFreeGen <= v0,
+        `free-list generation ${lastFreeGen} advanced past the held pin ${v0} — reclamation ran under a live reader`,
+      );
+
+      // Drain: the cursor must see EXACTLY its frozen snapshot (v = id * 10), untouched by the churn.
+      let want = 2n;
+      for (let r = it.next(); !r.done; r = it.next()) {
+        const id = r.value[0]!;
+        const v = r.value[1]!;
+        assert.equal(
+          id.kind === "int" ? id.int : -1n,
+          want,
+          "SNAPSHOT ISOLATION VIOLATED: the cursor's pages were reclaimed and overwritten",
+        );
+        assert.equal(
+          v.kind === "int" ? v.int : -1n,
+          want * 10n,
+          "SNAPSHOT ISOLATION VIOLATED: the cursor's pages were reclaimed and overwritten",
+        );
+        want++;
+      }
+      assert.equal(want, 121n, "drained the full pinned snapshot 2..=120");
+      cursor.close();
+      assert.equal(db.oldestLiveTxid(), db.version, "closed cursor releases its pin");
+
+      // Self-validation (not vacuous): the first commit after the pin releases compacts the deferred
+      // churn garbage — the generation advances past v0, proving the hold above was the gate at work.
+      db.execute("UPDATE t SET v = v + 1");
+      assert.ok(
+        lastFreeGen > v0,
+        `post-close commit did not compact (freeGenTxid=${lastFreeGen} <= ${v0}) — the churn never produced gated garbage`,
+      );
+    } finally {
+      setAfterPersistHook(null);
+      db.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // ---- S4: the lazy BUFFERED cursor (a blocking plan; streaming.md §4) ------------------------------
