@@ -1542,6 +1542,18 @@ func rexprEqShifted(a, b *rExpr, offset int) bool {
 			}
 		}
 		return true
+	case reCoalesce:
+		// COALESCE(a, b, …) is a legal (immutable-iff-args-are) index expression (grammar.md
+		// §51), so an index on COALESCE(x, 0) must match the same spelling in a query.
+		if a.caseDecimal != b.caseDecimal || len(a.sargs) != len(b.sargs) {
+			return false
+		}
+		for i := range a.sargs {
+			if !rexprEqShifted(a.sargs[i], b.sargs[i], offset) {
+				return false
+			}
+		}
+		return true
 	case reArith:
 		return a.op == b.op &&
 			rexprEqShifted(a.lhs, b.lhs, offset) &&

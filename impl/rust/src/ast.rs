@@ -1097,6 +1097,10 @@ pub enum Expr {
         whens: Vec<(Expr, Expr)>,
         els: Option<Box<Expr>>,
     },
+    /// `COALESCE(a, b, …)` — the first non-NULL argument, lazily evaluated left to right like
+    /// CASE (grammar.md §51). The argument list has ≥1 entries (an empty list is 42601 at
+    /// parse); argument types unify exactly like CASE result arms.
+    Coalesce(Vec<Expr>),
     /// A function call — the shared aggregate/scalar call syntax (grammar.md §17). `name` is
     /// the spelling as written, resolved case-insensitively: an aggregate (COUNT/SUM/MIN/MAX/
     /// AVG, kind = "aggregate"), a scalar function (abs/round, kind = "function",

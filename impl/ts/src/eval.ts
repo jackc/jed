@@ -1041,6 +1041,20 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       }
       return coerceCaseValue(evalExpr(e.els, row, env, m), e.coerceDecimal);
     }
+    case "coalesce": {
+      // COALESCE shares CASE's sanctioned short-circuit (cost.md §3): charge the node, then
+      // evaluate arguments left to right — each at most ONCE — stopping at the first non-NULL,
+      // which is the result. All-NULL → NULL. Later arguments are never evaluated, so an error
+      // (or cost) in an unreached argument does not surface (grammar.md §51).
+      m.charge(COSTS.operatorEval);
+      for (const a of e.args) {
+        const v = evalExpr(a, row, env, m);
+        if (v.kind !== "null") {
+          return coerceCaseValue(v, e.coerceDecimal);
+        }
+      }
+      return nullValue();
+    }
     case "scalarFunc": {
       // One operator_eval per call (the uniform weight); arguments charge their own.
       m.charge(COSTS.operatorEval);

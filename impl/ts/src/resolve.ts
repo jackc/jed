@@ -246,6 +246,8 @@ export function outputName(scope: Scope, e: Expr): string {
   // An un-aliased aggregate call is named by its lowercased function name (PG; §8). A field
   // selection takes the FIELD name lowercased (PG names the output column after the field).
   if (e.kind === "funcCall") return e.name.toLowerCase();
+  // The fixed keyword lowercased (PG; grammar.md §51) — no expression printer needed.
+  if (e.kind === "coalesce") return "coalesce";
   if (e.kind === "fieldAccess") return e.field.toLowerCase();
   // A subscript takes the base array's name (PG names `a[1]` after `a`); `a[1][2]` recurses to the
   // same base. A non-column base falls through to `?column?`.
@@ -1638,12 +1640,33 @@ export function resolve(
         els = { kind: "constNull" };
         resultTypes.push({ kind: "null" });
       }
-      const unified = unifyCaseTypes(resultTypes);
+      const unified = unifyCaseTypes(resultTypes, "CASE result types must be compatible");
       return {
         node: {
           kind: "case",
           arms,
           els,
+          coerceDecimal: unified.kind === "decimal",
+        },
+        type: unified,
+      };
+    }
+    case "coalesce": {
+      // COALESCE(a, b, …) (grammar.md §51): each argument resolves in the same agg context (an
+      // aggregate argument is legal wherever an aggregate is), and the argument types unify to
+      // one common type exactly like CASE's result arms.
+      const args: RExpr[] = [];
+      const argTypes: ResolvedType[] = [];
+      for (const a of e.args) {
+        const ra = resolve(scope, a, null, ag, params);
+        args.push(ra.node);
+        argTypes.push(ra.type);
+      }
+      const unified = unifyCaseTypes(argTypes, "COALESCE types must be compatible");
+      return {
+        node: {
+          kind: "coalesce",
+          args,
           coerceDecimal: unified.kind === "decimal",
         },
         type: unified,

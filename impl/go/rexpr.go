@@ -415,6 +415,11 @@ const (
 	// expression). 'epoch' is not this node — it folds to the constant 1970-01-01.
 	reDateClock
 	reCase
+	// reCoalesce is COALESCE(a, b, …) (spec/design/grammar.md §51) — lazy like reCase: arguments
+	// (in `sargs`) are evaluated left to right, each at most once, stopping at the first non-NULL
+	// (the second sanctioned short-circuit, cost.md §3). Argument types unify exactly like CASE
+	// result arms; `caseDecimal` is reused for the widen-to-decimal flag.
+	reCoalesce
 	// reScalarFunc is a scalar-function call (abs/round, spec/design/functions.md §9),
 	// evaluated per row in any context.
 	reScalarFunc
@@ -1000,6 +1005,7 @@ type rExpr struct {
 
 	// reCase: (condition, result) arms, the ELSE result (constNull for an implicit ELSE), and
 	// whether the unified result type is decimal (so integer results widen to decimal at eval).
+	// reCoalesce reuses caseDecimal (its arguments live in `sargs`).
 	caseArms    []rCaseArm
 	caseEls     *rExpr
 	caseDecimal bool

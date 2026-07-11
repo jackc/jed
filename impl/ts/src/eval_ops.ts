@@ -612,12 +612,13 @@ export function arrayGetSlice(
 }
 
 // unifyCaseTypes unifies a CASE's result-arm types (the THEN results + the ELSE, or "null" for an
-// implicit ELSE) into one common type (spec/design/grammar.md §23): NULL-typed arms are dropped
-// (they adapt); an all-NULL CASE is text (PostgreSQL). The non-NULL arms must share a family — all
-// numeric unify to decimal if any is decimal, else the widest integer (the promotion tower);
+// implicit ELSE) — or a COALESCE's argument types (spec/design/grammar.md §51, the identical
+// rule) — into one common type (spec/design/grammar.md §23): NULL-typed arms are dropped (they
+// adapt); an all-NULL CASE/COALESCE is text (PostgreSQL). The non-NULL arms must share a family —
+// all numeric unify to decimal if any is decimal, else the widest integer (the promotion tower);
 // otherwise they must all be the same non-numeric family (text/boolean/bytea). A cross-family mix
-// is 42804.
-export function unifyCaseTypes(arms: ResolvedType[]): ResolvedType {
+// is 42804, with the caller's form-specific message.
+export function unifyCaseTypes(arms: ResolvedType[], mismatch: string): ResolvedType {
   const nonNull = arms.filter((t) => t.kind !== "null");
   if (nonNull.length === 0) return { kind: "text" }; // every arm NULL/untyped → text
   let allNumeric = true;
@@ -645,7 +646,7 @@ export function unifyCaseTypes(arms: ResolvedType[]): ResolvedType {
   // Non-numeric: every arm must be the same family as the first (cross-family is 42804).
   const first = nonNull[0]!;
   for (const t of nonNull.slice(1)) {
-    if (t.kind !== first.kind) throw typeError("CASE result types must be compatible");
+    if (t.kind !== first.kind) throw typeError(mismatch);
   }
   return first;
 }

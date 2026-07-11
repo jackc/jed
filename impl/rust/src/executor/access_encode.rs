@@ -1063,7 +1063,8 @@ pub(crate) fn rexpr_is_constant(e: &RExpr) -> bool {
                 .all(|(c, r)| rexpr_is_constant(c) && rexpr_is_constant(r))
                 && rexpr_is_constant(els)
         }
-        RExpr::ScalarFunc { args, .. }
+        RExpr::Coalesce { args, .. }
+        | RExpr::ScalarFunc { args, .. }
         | RExpr::ArrayFunc { args, .. }
         | RExpr::RangeFunc { args, .. }
         | RExpr::RegexFunc { args, .. }
@@ -1909,6 +1910,25 @@ pub(crate) fn rexpr_eq_shifted(a: &RExpr, b: &RExpr, offset: usize) -> bool {
             },
         ) => {
             fa == fb
+                && aa.len() == ab.len()
+                && aa
+                    .iter()
+                    .zip(ab)
+                    .all(|(x, y)| rexpr_eq_shifted(x, y, offset))
+        }
+        // COALESCE(a, b, …) is a legal (immutable-iff-args-are) index expression (grammar.md
+        // §51), so an index on COALESCE(x, 0) must match the same spelling in a query.
+        (
+            Coalesce {
+                args: aa,
+                coerce_decimal: da,
+            },
+            Coalesce {
+                args: ab,
+                coerce_decimal: db,
+            },
+        ) => {
+            da == db
                 && aa.len() == ab.len()
                 && aa
                     .iter()
@@ -3373,6 +3393,7 @@ pub(crate) fn expr_has_aggregate(e: &Expr) -> bool {
                     .any(|(c, r)| expr_has_aggregate(c) || expr_has_aggregate(r))
                 || els.as_deref().is_some_and(expr_has_aggregate)
         }
+        Expr::Coalesce(args) => args.iter().any(expr_has_aggregate),
         // A subquery is an independent query: an aggregate INSIDE it does not make the OUTER query
         // an aggregate query (the outer reference, if any, is just a constant to the subquery).
         Expr::ScalarSubquery(_)
@@ -3457,6 +3478,7 @@ pub(crate) fn expr_has_window(e: &Expr) -> bool {
                     .any(|(c, r)| expr_has_window(c) || expr_has_window(r))
                 || els.as_deref().is_some_and(expr_has_window)
         }
+        Expr::Coalesce(args) => args.iter().any(expr_has_window),
         // A subquery is an independent query: a window function inside it is the subquery's own.
         Expr::ScalarSubquery(_)
         | Expr::Exists(_)
@@ -3647,6 +3669,11 @@ pub(crate) fn desugar_named_windows(e: &mut Expr, windows: &[(String, WindowDef)
                 desugar_named_windows(x, windows)?;
             }
         }
+        Expr::Coalesce(args) => {
+            for a in args.iter_mut() {
+                desugar_named_windows(a, windows)?;
+            }
+        }
         // Leaves, subscripts, and subqueries (independent) carry no top-level window ref to rewrite.
         _ => {}
     }
@@ -3745,6 +3772,12 @@ pub(crate) fn reject_check_structure(e: &Expr) -> Result<()> {
                 Some(e) => reject_check_structure(e),
                 None => Ok(()),
             }
+        }
+        Expr::Coalesce(args) => {
+            for a in args {
+                reject_check_structure(a)?;
+            }
+            Ok(())
         }
     }
 }
@@ -3847,6 +3880,12 @@ pub(crate) fn reject_default_structure(e: &Expr) -> Result<()> {
                 None => Ok(()),
             }
         }
+        Expr::Coalesce(args) => {
+            for a in args {
+                reject_default_structure(a)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -3918,6 +3957,11 @@ pub(crate) fn check_referenced_columns(e: &Expr, columns: &[Column]) -> Vec<usiz
                 }
                 if let Some(e) = els {
                     walk(e, columns, out);
+                }
+            }
+            Expr::Coalesce(args) => {
+                for a in args {
+                    walk(a, columns, out);
                 }
             }
             Expr::FuncCall { args, .. } => {
@@ -4030,6 +4074,7 @@ pub(crate) fn index_expr_first_param(e: &Expr) -> Option<u32> {
                 })
             })
             .or_else(|| els.as_deref().and_then(index_expr_first_param)),
+        Expr::Coalesce(args) => args.iter().find_map(index_expr_first_param),
         Expr::FuncCall { args, .. } => args.iter().find_map(index_expr_first_param),
         Expr::Row(items) | Expr::Array(items) => items.iter().find_map(index_expr_first_param),
         Expr::Subscript { base, subscripts } => index_expr_first_param(base).or_else(|| {
@@ -4100,6 +4145,7 @@ pub(crate) fn index_expr_has_subquery(e: &Expr) -> bool {
                     .any(|(c, r)| index_expr_has_subquery(c) || index_expr_has_subquery(r))
                 || els.as_deref().is_some_and(index_expr_has_subquery)
         }
+        Expr::Coalesce(args) => args.iter().any(index_expr_has_subquery),
         Expr::FuncCall { args, .. } => args.iter().any(index_expr_has_subquery),
         Expr::Row(items) | Expr::Array(items) => items.iter().any(index_expr_has_subquery),
         Expr::Subscript { base, subscripts } => {
@@ -4201,6 +4247,8 @@ pub(crate) fn index_expr_nonimmutable_call(e: &Expr) -> bool {
                 })
                 || els.as_deref().is_some_and(index_expr_nonimmutable_call)
         }
+        // COALESCE is a pure combinator — immutable iff its arguments are (grammar.md §51).
+        Expr::Coalesce(args) => args.iter().any(index_expr_nonimmutable_call),
         Expr::Row(items) | Expr::Array(items) => items.iter().any(index_expr_nonimmutable_call),
         Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => {
             index_expr_nonimmutable_call(base)

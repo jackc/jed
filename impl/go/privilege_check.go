@@ -253,6 +253,13 @@ func exprCallsSeqMutator(e *exprNode) bool {
 			return true
 		}
 		return false
+	case exprCoalesce:
+		for i := range e.Coalesce {
+			if exprCallsSeqMutator(&e.Coalesce[i]) {
+				return true
+			}
+		}
+		return false
 	case exprScalarSubquery, exprExists:
 		return queryCallsSeqMutator(e.Subquery)
 	case exprInSubquery:
@@ -745,6 +752,10 @@ func collectExprPrivs(e *exprNode, req *privReq, locals map[string]bool) {
 		if e.Case.Els != nil {
 			collectExprPrivs(e.Case.Els, req, locals)
 		}
+	case exprCoalesce:
+		for i := range e.Coalesce {
+			collectExprPrivs(&e.Coalesce[i], req, locals)
+		}
 	case exprScalarSubquery, exprExists:
 		collectQueryPrivs(e.Subquery, req, locals)
 	case exprInSubquery:
@@ -857,6 +868,13 @@ func exprReadsColumns(e *exprNode) bool {
 		}
 		if e.Case.Els != nil && exprReadsColumns(e.Case.Els) {
 			return true
+		}
+		return false
+	case exprCoalesce:
+		for i := range e.Coalesce {
+			if exprReadsColumns(&e.Coalesce[i]) {
+				return true
+			}
 		}
 		return false
 	case exprQuantified:

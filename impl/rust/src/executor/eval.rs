@@ -1492,6 +1492,24 @@ impl RExpr {
                 }
                 Ok(coerce_case(els.eval(row, env, m)?, *coerce_decimal))
             }
+            RExpr::Coalesce {
+                args,
+                coerce_decimal,
+            } => {
+                // COALESCE shares CASE's sanctioned short-circuit (cost.md §3): charge the node,
+                // then evaluate arguments left to right — each at most ONCE — stopping at the
+                // first non-NULL, which is the result. All-NULL → NULL. Later arguments are never
+                // evaluated, so an error (or cost) in an unreached argument does not surface
+                // (grammar.md §51).
+                m.charge(COSTS.operator_eval);
+                for a in args {
+                    let v = a.eval(row, env, m)?;
+                    if !matches!(v, Value::Null) {
+                        return Ok(coerce_case(v, *coerce_decimal));
+                    }
+                }
+                Ok(Value::Null)
+            }
             RExpr::ScalarFunc { func, args, result } => {
                 // One operator_eval per call (the uniform weight); arguments charge their own.
                 m.charge(COSTS.operator_eval);

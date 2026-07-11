@@ -720,6 +720,8 @@ export function countSelfRefsExpr(e: Expr, name: string): number {
         ) +
         (e.els !== null ? countSelfRefsExpr(e.els, name) : 0)
       );
+    case "coalesce":
+      return e.args.reduce((a, x) => a + countSelfRefsExpr(x, name), 0);
     case "funcCall":
       return e.args.reduce((a, x) => a + countSelfRefsExpr(x, name), 0);
     case "row":
@@ -1398,6 +1400,8 @@ export function exprCallsSeqMutator(e: Expr): boolean {
         e.whens.some((w) => exprCallsSeqMutator(w.cond) || exprCallsSeqMutator(w.result)) ||
         (e.els !== null && exprCallsSeqMutator(e.els))
       );
+    case "coalesce":
+      return e.args.some(exprCallsSeqMutator);
     case "scalarSubquery":
     case "exists":
       return queryCallsSeqMutator(e.query);
@@ -1675,6 +1679,9 @@ export function collectExprPrivs(e: Expr, req: PrivReq, locals: Set<string>): vo
       }
       if (e.els !== null) collectExprPrivs(e.els, req, locals);
       break;
+    case "coalesce":
+      for (const a of e.args) collectExprPrivs(a, req, locals);
+      break;
     case "scalarSubquery":
     case "exists":
       collectQueryPrivs(e.query, req, locals);
@@ -1758,6 +1765,8 @@ export function exprReadsColumns(e: Expr): boolean {
         e.whens.some((w) => exprReadsColumns(w.cond) || exprReadsColumns(w.result)) ||
         (e.els !== null && exprReadsColumns(e.els))
       );
+    case "coalesce":
+      return e.args.some(exprReadsColumns);
     case "quantified":
       return exprReadsColumns(e.lhs) || exprReadsColumns(e.array);
   }

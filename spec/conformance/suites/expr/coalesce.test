@@ -1,0 +1,256 @@
+# COALESCE(a, b, …) — the first-non-NULL conditional (spec/design/grammar.md §51). Lazy left to
+# right: evaluation stops at the first non-NULL and each evaluated argument is evaluated exactly
+# ONCE (the second sanctioned short-circuit after CASE, cost.md §3) — a `1/0` in an unreached
+# argument does not trap (and costs nothing). Argument types unify exactly like CASE result arms
+# (numeric promote; cross-family 42804; all-NULL → text). At least one argument (empty is 42601);
+# `coalesce` stays usable as a column name (the one-token `(` lookahead); output name `coalesce`.
+# Verified against PostgreSQL 18.
+# Format + `requires`: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.check, ddl.column_default_expr, ddl.secondary_index, ddl.index_expr, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.order_by_expr, query.index_expr, query.aggregates, query.group_by, query.group_by_expr, expr.coalesce, expr.comparison_value, expr.arithmetic, error.division_by_zero, types.i32, types.text, types.decimal, null.three_valued, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, a i32, s text)
+
+statement ok
+INSERT INTO t VALUES (1, 10, 'x'), (2, NULL, 'y'), (3, 20, NULL), (4, NULL, NULL)
+
+# First non-NULL, left to right; a leaf argument (column / literal) charges nothing, so the
+# whole COALESCE is 1 per row (the node) + 4 scan + 4 produced + 1 page = 13. Output name is
+# `coalesce` (PostgreSQL — the fixed keyword lowercased, grammar.md §51/§8).
+# names: coalesce
+# cost: 13
+query I nosort
+SELECT COALESCE(a, 0) FROM t ORDER BY id
+----
+10
+0
+20
+0
+
+# Text arguments; the NULL `s` rows take the default.
+# names: coalesce
+# cost: 13
+query T nosort
+SELECT COALESCE(s, 'none') FROM t ORDER BY id
+----
+x
+y
+none
+none
+
+# Three arguments: the first non-NULL wins per row (id is never NULL, 0 is never reached).
+query I nosort
+SELECT COALESCE(a, id, 0) FROM t ORDER BY id
+----
+10
+2
+20
+4
+
+# All arguments NULL for a row → NULL (a NULL literal argument is dropped at unification, so
+# the result type is the column's i32).
+query I nosort
+SELECT COALESCE(a, NULL) FROM t ORDER BY id
+----
+10
+NULL
+20
+NULL
+
+# All-NULL arguments unify to text (the PostgreSQL rule, like an all-NULL CASE).
+query T nosort
+SELECT COALESCE(NULL, NULL) FROM t ORDER BY id
+----
+NULL
+NULL
+NULL
+NULL
+
+# Numeric unification: an integer argument and a decimal argument unify to decimal; the integer
+# widens at eval (renders '10', not '10.0'), the decimal keeps its scale ('1.5').
+query D nosort
+SELECT COALESCE(a, 1.5) FROM t ORDER BY id
+----
+10
+1.5
+20
+1.5
+
+# Each argument is evaluated at most ONCE — the arithmetic first argument charges exactly one
+# Add per row whether it wins (rows 1/3) or is NULL and falls through (rows 2/4): per row
+# 1 node + 1 add = 2 (the CASE rewrite `CASE WHEN a+1 IS NOT NULL THEN a+1 …` would evaluate
+# the Add twice on the winning rows). 4×2 + 4 scan + 4 produced + 1 page = 17.
+# names: coalesce
+# cost: 17
+query I nosort
+SELECT COALESCE(a + 1, 0) FROM t ORDER BY id
+----
+11
+0
+21
+0
+
+# Lazy and data-dependent, like CASE's first-match cost: on the non-NULL rows the second
+# argument is never evaluated (1 per row); on the NULL rows `1 / a` is evaluated — NULL divisor,
+# NULL result, no trap — and charges its Div (2 per row). 1+2+1+2 = 6; + 4 scan + 4 produced +
+# 1 page = 15.
+# names: coalesce
+# cost: 15
+query I nosort
+SELECT COALESCE(a, 1 / a) FROM t ORDER BY id
+----
+10
+NULL
+20
+NULL
+
+# COALESCE in WHERE: the NULL-a rows coalesce to 0 and match. Per scanned row 1 node + 1
+# compare = 2 → 8; + 4 scan + 2 produced + 1 page = 15.
+# cost: 15
+query I nosort
+SELECT id FROM t WHERE COALESCE(a, 0) = 0 ORDER BY id
+----
+2
+4
+
+# COALESCE as an ORDER BY expression: the NULL-a rows sort under 999, after the real values.
+query I nosort
+SELECT id FROM t ORDER BY COALESCE(a, 999), id
+----
+1
+3
+2
+4
+
+# COALESCE of an aggregate — the empty-input default (the aggregate-partitioning shape,
+# conformance.md §5): SUM over no rows is NULL, coalesced to 0.
+# names: coalesce
+query I nosort
+SELECT COALESCE(SUM(a), 0) FROM t WHERE a > 100
+----
+0
+
+query I nosort
+SELECT COALESCE(SUM(a), 0) FROM t
+----
+30
+
+# COALESCE as a GROUP BY key expression.
+query II nosort
+SELECT COALESCE(a, 0), COUNT(*) FROM t GROUP BY COALESCE(a, 0) ORDER BY 1
+----
+0
+2
+10
+1
+20
+1
+
+# A one-row table to prove laziness directly: the first argument is non-NULL, so the `1/0`
+# second argument is never evaluated — the query succeeds, and costs only the node (leaf
+# first argument): 1 + 1 scan + 1 produced + 1 page = 4.
+statement ok
+CREATE TABLE one (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO one VALUES (1)
+
+# names: coalesce
+# cost: 4
+query I nosort
+SELECT COALESCE(1, 1 / 0) FROM one
+----
+1
+
+# …and the flip side: a NULL first argument DOES evaluate the second, which traps.
+statement error 22012
+SELECT COALESCE(NULL, 1 / 0) FROM one
+
+# Nested COALESCE: the inner one is just another argument expression.
+query I nosort
+SELECT COALESCE(COALESCE(a, NULL), 42) FROM t ORDER BY id
+----
+10
+42
+20
+42
+
+# …but an all-NULL inner COALESCE is typed `text` (the all-NULL rule) BEFORE the outer
+# unification sees it, so text meets integer — 42804, exactly PostgreSQL ("COALESCE types
+# text and integer cannot be matched").
+statement error 42804
+SELECT COALESCE(COALESCE(NULL, NULL), 42) FROM one
+
+# Cross-family argument types (an integer column and a text column) cannot be unified — 42804.
+statement error 42804
+SELECT COALESCE(a, s) FROM t
+
+# COALESCE() with no arguments is a syntax error (PostgreSQL's grammar has no empty form).
+statement error 42601
+SELECT COALESCE() FROM one
+
+# `coalesce` is NOT reserved: recognized as the conditional only when immediately followed by
+# `(`, so it works as a column name — and the form can wrap the column of the same name.
+statement ok
+CREATE TABLE kw (id i32 PRIMARY KEY, coalesce i32)
+
+statement ok
+INSERT INTO kw VALUES (1, 7), (2, NULL)
+
+query I nosort
+SELECT coalesce FROM kw ORDER BY id
+----
+7
+NULL
+
+query I nosort
+SELECT COALESCE(coalesce, 0) FROM kw ORDER BY id
+----
+7
+0
+
+# COALESCE in a CHECK constraint and an expression DEFAULT (a pure combinator — immutable
+# iff its arguments are, grammar.md §51).
+statement ok
+CREATE TABLE ck (id i32 PRIMARY KEY, a i32, b i32 DEFAULT COALESCE(NULL, 5), CHECK (COALESCE(a, 0) >= 0))
+
+statement ok
+INSERT INTO ck (id, a) VALUES (1, NULL)
+
+query II nosort
+SELECT a, b FROM ck
+----
+NULL
+5
+
+statement error 23514
+INSERT INTO ck (id, a) VALUES (2, -1)
+
+# --- an expression index on COALESCE matches the same expression in a WHERE -----------------
+
+statement ok
+CREATE TABLE ei (id i32 PRIMARY KEY, a i32)
+
+statement ok
+INSERT INTO ei VALUES (1, 1), (2, NULL), (3, 3), (4, NULL), (5, 5), (6, 6), (7, 7), (8, 8), (9, 9), (10, 10)
+
+# Full scan first: every row evaluates the WHERE (1 node + 1 compare = 2 per row).
+# cost: 33
+query I rowsort
+SELECT id FROM ei WHERE COALESCE(a, 0) = 0
+----
+2
+4
+
+statement ok
+CREATE INDEX ei_coalesce_idx ON ei ((COALESCE(a, 0)))
+
+# The same query now seeks the index (query.index_expr): the pinned cost MUST be lower than
+# the full scan's 33 — the pushdown is the point (a silently unmatched index would full-scan
+# at identical rows, which only this pin catches).
+# cost: 11
+query I rowsort
+SELECT id FROM ei WHERE COALESCE(a, 0) = 0
+----
+2
+4

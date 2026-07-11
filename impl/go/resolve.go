@@ -653,6 +653,9 @@ func outputName(s *scope, e exprNode) string {
 	case exprFuncCall:
 		// An un-aliased aggregate call is named by its lowercased function name (PG; §8).
 		return toLowerASCII(e.FuncCall.Name)
+	case exprCoalesce:
+		// The fixed keyword lowercased (PG; grammar.md §51) — no expression printer needed.
+		return "coalesce"
 	case exprFieldAccess:
 		// A field selection takes the FIELD name (PG names the output column after the selected
 		// field, lowercased — spec/design/composite.md §S4).
@@ -1884,11 +1887,31 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 			rels = &rExpr{kind: reConstNull}
 			resultTypes = append(resultTypes, resolvedType{kind: rtNull})
 		}
-		unified, err := unifyCaseTypes(resultTypes)
+		unified, err := unifyCaseTypes(resultTypes, "CASE result types must be compatible")
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
 		return &rExpr{kind: reCase, caseArms: arms, caseEls: rels, caseDecimal: unified.kind == rtDecimal},
+			unified, nil
+	case exprCoalesce:
+		// COALESCE(a, b, …) (grammar.md §51): each argument resolves in the same agg context (an
+		// aggregate argument is legal wherever an aggregate is), and the argument types unify to
+		// one common type exactly like CASE's result arms.
+		args := make([]*rExpr, 0, len(e.Coalesce))
+		argTypes := make([]resolvedType, 0, len(e.Coalesce))
+		for _, a := range e.Coalesce {
+			ra, aty, err := resolve(s, a, nil, ag, params)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			args = append(args, ra)
+			argTypes = append(argTypes, aty)
+		}
+		unified, err := unifyCaseTypes(argTypes, "COALESCE types must be compatible")
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		return &rExpr{kind: reCoalesce, sargs: args, caseDecimal: unified.kind == rtDecimal},
 			unified, nil
 	case exprQuantified:
 		return resolveQuantified(s, e.Quantified, ag, params)

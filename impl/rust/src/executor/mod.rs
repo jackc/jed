@@ -2472,6 +2472,14 @@ pub(crate) enum RExpr {
         els: Box<RExpr>,
         coerce_decimal: bool,
     },
+    /// A resolved `COALESCE(a, b, …)` (grammar.md §51) — lazy like `Case`: arguments are
+    /// evaluated left to right, each at most once, stopping at the first non-NULL (the second
+    /// sanctioned short-circuit, cost.md §3). Argument types unify exactly like CASE result
+    /// arms; `coerce_decimal` widens integer arguments when the unified type is decimal.
+    Coalesce {
+        args: Vec<RExpr>,
+        coerce_decimal: bool,
+    },
     /// A scalar-function call (abs/round, spec/design/functions.md §9), evaluated per row in
     /// any context. `result` is the static result type — for `abs` over an integer it is the
     /// operand's integer type, so the magnitude is range-checked at that boundary (the same
@@ -2976,6 +2984,7 @@ fn count_self_refs_expr(e: &Expr, name: &str) -> usize {
                 + whens.iter().map(|(c, r)| sub(c) + sub(r)).sum::<usize>()
                 + els.as_deref().map_or(0, sub)
         }
+        Expr::Coalesce(args) => args.iter().map(sub).sum(),
         Expr::FuncCall { args, .. } => args.iter().map(sub).sum(),
     }
 }

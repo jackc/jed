@@ -800,12 +800,13 @@ func arrayGetSlice(a *ArrayVal, los, his []*int64) Value {
 }
 
 // unifyCaseTypes unifies a CASE's result-arm types (the THEN results + the ELSE, or rtNull for an
-// implicit ELSE) into one common type (spec/design/grammar.md §23): NULL-typed arms are dropped
-// (they adapt); an all-NULL CASE is text (PostgreSQL). The non-NULL arms must share a family — all
-// numeric unify to decimal if any is decimal, else the widest integer (the promotion tower);
+// implicit ELSE) — or a COALESCE's argument types (spec/design/grammar.md §51, the identical
+// rule) — into one common type (spec/design/grammar.md §23): NULL-typed arms are dropped (they
+// adapt); an all-NULL CASE/COALESCE is text (PostgreSQL). The non-NULL arms must share a family —
+// all numeric unify to decimal if any is decimal, else the widest integer (the promotion tower);
 // otherwise they must all be the same non-numeric family (text/boolean/bytea). A cross-family mix
-// is 42804.
-func unifyCaseTypes(arms []resolvedType) (resolvedType, error) {
+// is 42804, with the caller's form-specific message.
+func unifyCaseTypes(arms []resolvedType, mismatch string) (resolvedType, error) {
 	nonNull := make([]resolvedType, 0, len(arms))
 	for _, t := range arms {
 		if t.kind != rtNull {
@@ -841,7 +842,7 @@ func unifyCaseTypes(arms []resolvedType) (resolvedType, error) {
 	first := nonNull[0]
 	for _, t := range nonNull[1:] {
 		if t.kind != first.kind {
-			return resolvedType{}, typeError("CASE result types must be compatible")
+			return resolvedType{}, typeError(mismatch)
 		}
 	}
 	return first, nil
@@ -2302,6 +2303,22 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return Value{}, err
 		}
 		return coerceCase(ev, e.caseDecimal), nil
+	case reCoalesce:
+		// COALESCE shares CASE's sanctioned short-circuit (cost.md §3): charge the node, then
+		// evaluate arguments left to right — each at most ONCE — stopping at the first non-NULL,
+		// which is the result. All-NULL → NULL. Later arguments are never evaluated, so an error
+		// (or cost) in an unreached argument does not surface (grammar.md §51).
+		m.Charge(costs.OperatorEval)
+		for _, a := range e.sargs {
+			v, err := a.eval(row, env, m)
+			if err != nil {
+				return Value{}, err
+			}
+			if v.Kind != ValNull {
+				return coerceCase(v, e.caseDecimal), nil
+			}
+		}
+		return NullValue(), nil
 	case reScalarFunc:
 		// One operator_eval per call (the uniform weight); arguments charge their own.
 		m.Charge(costs.OperatorEval)

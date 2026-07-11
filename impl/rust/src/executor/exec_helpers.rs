@@ -710,7 +710,8 @@ pub(crate) fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
                 .any(|(c, r)| rexpr_references_outer(c, depth) || rexpr_references_outer(r, depth))
                 || rexpr_references_outer(els, depth)
         }
-        RExpr::ScalarFunc { args, .. }
+        RExpr::Coalesce { args, .. }
+        | RExpr::ScalarFunc { args, .. }
         | RExpr::ArrayFunc { args, .. }
         | RExpr::RangeFunc { args, .. }
         | RExpr::RegexFunc { args, .. }
@@ -864,7 +865,8 @@ pub(crate) fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
             }
             collect_touched(els, depth, touched);
         }
-        RExpr::ScalarFunc { args, .. }
+        RExpr::Coalesce { args, .. }
+        | RExpr::ScalarFunc { args, .. }
         | RExpr::ArrayFunc { args, .. }
         | RExpr::RangeFunc { args, .. }
         | RExpr::RegexFunc { args, .. }

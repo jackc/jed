@@ -937,6 +937,7 @@ primary        ::= number
                  | "CAST" "(" expr "AS" type_name ")"
                  | extract_expr
                  | case_expr
+                 | coalesce_expr
                  | function_call
                  | "EXISTS" "(" subquery_expr ")"
                  | "(" ( subquery_expr | expr ) ")"
@@ -983,11 +984,25 @@ parameter      ::= "$" digit+
  * form has an operand and each WHEN takes a value compared for equality to it (`CASE x WHEN v
  * ...` is `x = v`). At least one WHEN is required (zero is a 42601 syntax error). With no
  * matching branch and no ELSE the result is NULL. The result-arm types (the THENs and ELSE)
- * unify to one common type (42804 if incompatible); an all-NULL CASE is text. CASE is the one
- * deliberately LAZY expression: the first TRUE branch wins and later arms are not evaluated
- * (../design/cost.md §3). CASE/WHEN/THEN/ELSE/END are not reserved (§3), disambiguated
- * positionally. */
+ * unify to one common type (42804 if incompatible); an all-NULL CASE is text. CASE is a
+ * deliberately LAZY expression (COALESCE below is the other): the first TRUE branch wins and
+ * later arms are not evaluated (../design/cost.md §3). CASE/WHEN/THEN/ELSE/END are not
+ * reserved (§3), disambiguated positionally. */
 case_expr      ::= "CASE" expr? ( "WHEN" expr "THEN" expr )+ ( "ELSE" expr )? "END"
+
+/* COALESCE(a, b, …) (../design/grammar.md §51) — the SQL conditional that returns its first
+ * non-NULL argument, NULL if every argument is NULL. At least one argument (an empty list is a
+ * 42601, PostgreSQL's shape). Argument types unify to one common type exactly like CASE's
+ * result arms (42804 cross-family; an all-NULL COALESCE is text). LAZY like CASE — arguments
+ * are evaluated left to right, each at most ONCE, and evaluation stops at the first non-NULL
+ * (the second sanctioned short-circuit, ../design/cost.md §3) — which is why this is a grammar
+ * form with its own node, not a catalog function (a catalog call is eager and fixed-arity).
+ * "COALESCE" stays non-reserved: the form is recognized ONLY when the next token is "(" (the
+ * EXTRACT/JSON one-token lookahead, §8), so `coalesce` remains usable as a column name —
+ * observably PostgreSQL's col_name_keyword classification. Un-aliased output name: `coalesce`
+ * (PostgreSQL; the fixed keyword lowercased — no expression printer needed, the §8 rule-4
+ * rationale). */
+coalesce_expr  ::= "COALESCE" "(" expr ( "," expr )* ")"
 
 /* EXTRACT(field FROM source) (../design/timezones.md §9.2, ../design/grammar.md §50) — the SQL
  * special form for a single datetime field, equal to PostgreSQL's `extract(text, value)` but with

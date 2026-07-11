@@ -4650,6 +4650,33 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		}
 		return exprNode{Kind: exprJsonCtor, JsonCtorOf: &jsonCtorExpr{Operand: operand, UniqueKeys: uniqueKeys}}, nil
 	}
+	// `COALESCE(a, b, …)` — the first-non-NULL conditional (grammar.md §51). Recognized only when
+	// COALESCE is immediately followed by `(` (the JSON(/EXTRACT( one-token lookahead), so the
+	// word stays usable as a column name. At least one argument (an empty list is 42601 —
+	// PostgreSQL's grammar has no empty form).
+	if p.peekKeyword() == "coalesce" && p.peekKindAt(1) == tokLParen {
+		p.advance() // COALESCE
+		p.advance() // (
+		if p.peek().Kind == tokRParen {
+			return exprNode{}, newError(SyntaxError, "COALESCE requires at least one argument")
+		}
+		var args []exprNode
+		for {
+			arg, err := p.parseExpr()
+			if err != nil {
+				return exprNode{}, err
+			}
+			args = append(args, arg)
+			if p.peek().Kind != tokComma {
+				break
+			}
+			p.advance() // ,
+		}
+		if err := p.expect(tokRParen); err != nil {
+			return exprNode{}, err
+		}
+		return exprNode{Kind: exprCoalesce, Coalesce: args}, nil
+	}
 	if p.peekKeyword() == "case" {
 		p.advance()
 		// Simple form has an operand between CASE and the first WHEN; the searched form starts

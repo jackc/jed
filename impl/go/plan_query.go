@@ -700,6 +700,12 @@ func countSelfRefsExpr(e exprNode, name string) int {
 			n += countSelfRefsExpr(*e.Case.Els, name)
 		}
 		return n
+	case exprCoalesce:
+		n := 0
+		for _, a := range e.Coalesce {
+			n += countSelfRefsExpr(a, name)
+		}
+		return n
 	case exprFuncCall:
 		n := 0
 		for _, a := range e.FuncCall.Args {

@@ -1356,6 +1356,13 @@ func exprHasAggregate(e exprNode) bool {
 			}
 		}
 		return e.Case.Els != nil && exprHasAggregate(*e.Case.Els)
+	case exprCoalesce:
+		for _, a := range e.Coalesce {
+			if exprHasAggregate(a) {
+				return true
+			}
+		}
+		return false
 	case exprFieldAccess, exprFieldStar:
 		// Field selection `(expr).field` / `(expr).*` recurses into the composite base
 		// (spec/design/composite.md §S4) — an aggregate hidden in the base must surface.
@@ -1483,6 +1490,13 @@ func exprHasWindow(e exprNode) bool {
 			}
 		}
 		return e.Case.Els != nil && exprHasWindow(*e.Case.Els)
+	case exprCoalesce:
+		for _, a := range e.Coalesce {
+			if exprHasWindow(a) {
+				return true
+			}
+		}
+		return false
 	case exprFieldAccess, exprFieldStar:
 		return exprHasWindow(*e.Base)
 	case exprQualifiedStar:
@@ -1922,6 +1936,18 @@ func desugarNamedWindows(e exprNode, windows []namedWindow) (exprNode, error) {
 		}
 		ne := e
 		ne.Case = &nc
+		return ne, nil
+	case exprCoalesce:
+		args := make([]exprNode, len(e.Coalesce))
+		for i, a := range e.Coalesce {
+			na, err := desugarNamedWindows(a, windows)
+			if err != nil {
+				return exprNode{}, err
+			}
+			args[i] = na
+		}
+		ne := e
+		ne.Coalesce = args
 		return ne, nil
 	default:
 		// Leaves, subscripts, and subqueries (independent) carry no top-level window ref to rewrite.

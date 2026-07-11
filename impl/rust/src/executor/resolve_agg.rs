@@ -200,7 +200,8 @@ pub(crate) fn rebase_placeholder_cols(e: &mut RExpr, from: usize, target: usize)
             }
             rebase_placeholder_cols(els, from, target);
         }
-        RExpr::ScalarFunc { args, .. }
+        RExpr::Coalesce { args, .. }
+        | RExpr::ScalarFunc { args, .. }
         | RExpr::ArrayFunc { args, .. }
         | RExpr::RangeFunc { args, .. }
         | RExpr::RegexFunc { args, .. }

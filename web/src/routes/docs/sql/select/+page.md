@@ -69,6 +69,12 @@ CROSS JOIN LATERAL (
 ) AS top
 ORDER BY c.category;`;
 
+	const conditional = `SELECT name,
+       CASE WHEN price > 5 THEN 'premium' ELSE 'basic' END AS tier,
+       coalesce(nickname, name) AS display
+FROM (SELECT name, price, CASE WHEN id = 3 THEN 'Joe' END AS nickname FROM product) AS p
+ORDER BY name;`;
+
 	const unnestExample = `SELECT u AS tag
 FROM unnest(ARRAY['red', 'green', 'blue']) AS u
 ORDER BY u;`;
@@ -291,6 +297,19 @@ not yet supported.
 `NATURAL JOIN` is the shorthand: `a NATURAL JOIN b` joins on **every column the two tables share by
 name** (merging each, like `USING`). With no shared column it is a `CROSS JOIN`. It composes with
 `LEFT`/`RIGHT` (`a NATURAL LEFT JOIN b`); `NATURAL FULL JOIN` is not yet supported.
+
+## Conditional expressions (`CASE`, `COALESCE`)
+
+`CASE` is the SQL conditional: the searched form `CASE WHEN cond THEN r … [ELSE e] END` returns
+the first `WHEN` whose condition is true (an unmatched `CASE` with no `ELSE` is `NULL`), and the
+simple form `CASE x WHEN v THEN r … END` compares an operand for equality per branch.
+`COALESCE(a, b, …)` returns its first non-`NULL` argument, or `NULL` when all are — the usual
+way to substitute a default (`coalesce(nickname, name)`) or make an empty aggregate count as zero
+(`coalesce(sum(x), 0)`). Both evaluate lazily, left to right, exactly as far as needed — a `1/0`
+in an unreached branch or argument never runs — and the branch/argument types must unify to one
+common type (numerics promote; mixing, say, an integer and a text branch is an error):
+
+<LiveSql {seed} query={conditional} rows={4} />
 
 ## Set-returning functions in `FROM`
 

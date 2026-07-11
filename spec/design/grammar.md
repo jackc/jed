@@ -1211,7 +1211,8 @@ two forms and is the **first deliberately lazy** expression in the engine.
   `x = v` at resolve, reusing the `=` operand pairing and comparability check (the value `v`
   adapts to `x`'s type; an incomparable `v` is `42804`). At least one `WHEN` is required (a
   `CASE … END` with none is a `42601` syntax error).
-- **Lazy first-match evaluation — the one short-circuit.** Conditions are evaluated in source
+- **Lazy first-match evaluation — the first sanctioned short-circuit (`COALESCE`, §51, is the
+  other).** Conditions are evaluated in source
   order and evaluation **stops at the first TRUE** branch, returning that `THEN`. A FALSE or
   NULL/UNKNOWN condition falls through (a NULL `WHEN` is *not* true — like `WHERE`). With no
   matching branch, the `ELSE` result is returned, or **NULL** if there is no `ELSE` (an implicit
@@ -2651,3 +2652,46 @@ SELECT (tstz)::date                                          -- cross-family cas
 - **Session zone & cost.** The session zone drives *computation*, not yet *rendering*
   ([timezones.md §9.5](timezones.md)). A zone consultation charges the `timezone` cost unit; the
   zone-free forms charge only `operator_eval`.
+
+## 51. `COALESCE`
+
+`COALESCE(a, b, …)` returns its **first non-NULL argument**, or NULL when every argument is
+NULL (`coalesce_expr ::= "COALESCE" "(" expr ( "," expr )* ")"`). It is the second deliberately
+**lazy** expression after `CASE` (§23) — `COALESCE(a, b)` behaves exactly like
+`CASE WHEN a IS NOT NULL THEN a ELSE b END`, except each argument is evaluated **at most once**
+(no separate test-then-reuse evaluation), which is also why it is a grammar form with its own
+node rather than a catalog function: a catalog call is eager and fixed-arity, and the
+double-evaluation of the CASE rewrite would change the deterministic cost.
+
+```sql
+SELECT COALESCE(nickname, name, '(anonymous)') FROM u   -- first non-NULL, left to right
+SELECT COALESCE(SUM(amount), 0) FROM sales               -- the empty-input aggregate default
+SELECT COALESCE(a, 1 / a) FROM t                          -- a ≠ NULL ⇒ 1/a is never evaluated
+```
+
+- **Grammar.** At least one argument (`COALESCE()` is a `42601`, PostgreSQL's shape — its
+  grammar has no empty form). `COALESCE` stays **non-reserved**: the form is recognized only
+  when the keyword is immediately followed by `(` (the `EXTRACT`/`JSON(` one-token lookahead,
+  §8), so `coalesce` remains usable as a column name — observably PostgreSQL's
+  `col_name_keyword` classification (a column name, never a function name).
+- **Lazy left-to-right evaluation — the second sanctioned short-circuit** ([cost.md](cost.md)
+  §3). Arguments are evaluated in source order and evaluation **stops at the first non-NULL**
+  value, which is returned; later arguments are **never evaluated** — `COALESCE(1, 1/0)` is `1`,
+  no `22012` — and each evaluated argument is evaluated exactly once. Required by PostgreSQL
+  semantics, deterministic because the order is fixed.
+- **Argument type unification — exactly CASE's result-arm rule** (§23). NULL-typed arguments
+  are dropped (they adapt); an **all-NULL COALESCE is `text`**; the rest must share a family —
+  numerics promote (decimal if any arm is decimal, else the widest integer; an integer result
+  widens to decimal at eval when the common type is decimal), a non-numeric family must be
+  homogeneous. A cross-family mix is **`42804`** (`COALESCE types must be compatible`).
+- **Where it is legal**: anywhere an expression is — projections, `WHERE`, `GROUP BY`/`HAVING`,
+  `ORDER BY`, `CHECK` constraints, expression `DEFAULT`s, and **index expressions**
+  ([indexes.md](indexes.md) §9 — immutable iff its arguments are, like any pure combinator;
+  an index on `COALESCE(a, 0)` matches the same expression in a query and pushes down).
+  Aggregates nest as in any expression (`COALESCE(SUM(x), 0)` — the empty-input default that
+  aggregate partitioning needs, [conformance.md](conformance.md) §5).
+- **Cost** ([cost.md](cost.md) §3): one `operator_eval` for the COALESCE node, plus the
+  `operator_eval`s of the arguments evaluated **up to and including the first non-NULL** (each
+  argument charges its own; a leaf argument — column or literal — charges nothing). Output name
+  for a bare `SELECT COALESCE(…)` is **`coalesce`** (PostgreSQL) — the fixed keyword lowercased,
+  the same no-expression-printer rationale as the §8 rule-4 function names.

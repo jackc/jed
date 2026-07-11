@@ -4018,6 +4018,29 @@ impl Parser {
             self.expect(&Token::RParen)?;
             return Ok(expr);
         }
+        // `COALESCE(a, b, …)` — the first-non-NULL conditional (grammar.md §51). Recognized only
+        // when COALESCE is immediately followed by `(` (the JSON(/EXTRACT( one-token lookahead),
+        // so the word stays usable as a column name. At least one argument (an empty list is
+        // 42601 — PostgreSQL's grammar has no empty form).
+        if self.peek_keyword().as_deref() == Some("coalesce")
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
+        {
+            self.advance(); // COALESCE
+            self.advance(); // (
+            if matches!(self.peek(), Token::RParen) {
+                return Err(syntax("COALESCE requires at least one argument"));
+            }
+            let mut args = Vec::new();
+            loop {
+                args.push(self.parse_expr()?);
+                if !matches!(self.peek(), Token::Comma) {
+                    break;
+                }
+                self.advance(); // ,
+            }
+            self.expect(&Token::RParen)?;
+            return Ok(Expr::Coalesce(args));
+        }
         if self.peek_keyword().as_deref() == Some("case") {
             self.advance();
             // Simple form has an operand between CASE and the first WHEN; the searched form

@@ -988,7 +988,11 @@ description = "text ~* pattern / text !~* pattern — case-insensitive regular-e
 
 [[capability]]
 id = "expr.case"
-description = "CASE expression (searched + simple forms): lazy first-match evaluation (later arms not evaluated — the one short-circuit exception); searched WHEN must be boolean (42804); result-arm types unify to a common type (numeric promote; cross-family 42804; all-NULL → text); no match + no ELSE → NULL; output name ?column? (spec/design/grammar.md §23)"
+description = "CASE expression (searched + simple forms): lazy first-match evaluation (later arms not evaluated — a sanctioned short-circuit exception, with expr.coalesce); searched WHEN must be boolean (42804); result-arm types unify to a common type (numeric promote; cross-family 42804; all-NULL → text); no match + no ELSE → NULL; output name ?column? (spec/design/grammar.md §23)"
+
+[[capability]]
+id = "expr.coalesce"
+description = "COALESCE(a, b, …) — first non-NULL argument, NULL when all are NULL. Lazy left-to-right: evaluation stops at the first non-NULL, each evaluated argument evaluated exactly once, later arguments never (COALESCE(1, 1/0) is 1 — the second sanctioned short-circuit, with expr.case); at least one argument (empty is 42601); argument types unify exactly like CASE result arms (numeric promote; cross-family 42804; all-NULL → text); recognized only when COALESCE is immediately followed by ( so the word stays usable as a column name; output name coalesce (spec/design/grammar.md §51)"
 
 # Scalar functions (kind = "function", spec/design/functions.md §9) — named f(args) calls
 # evaluated per row, valid anywhere an expression is (unlike aggregates). One capability per

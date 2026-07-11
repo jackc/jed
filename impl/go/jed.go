@@ -586,6 +586,7 @@ var SupportedCapabilities = []string{
 	"expr.regex_match",
 	"expr.regex_imatch",
 	"expr.case",
+	"expr.coalesce",
 	// Cost-accounting seam — the harness asserts the deterministic, cross-core-identical
 	// accrued cost via the `# cost:` directive (CLAUDE.md §13).
 	"resource.cost_metering",

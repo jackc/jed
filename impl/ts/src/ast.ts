@@ -229,6 +229,10 @@ export type Expr =
       whens: { cond: Expr; result: Expr }[];
       els: Expr | null;
     }
+  // COALESCE(a, b, …) — the first non-NULL argument, lazily evaluated left to right like CASE
+  // (spec/design/grammar.md §51). `args` has ≥1 entries (an empty list is 42601 at parse);
+  // argument types unify exactly like CASE result arms.
+  | { kind: "coalesce"; args: Expr[] }
   // A function call — the shared aggregate/scalar call syntax (grammar.md §17). `name` is the
   // spelling as written, resolved case-insensitively: an aggregate (COUNT/SUM/MIN/MAX/AVG), a
   // scalar function (abs/round, kind = "function", spec/design/functions.md §9), or 42883. `star`

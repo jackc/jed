@@ -3406,6 +3406,25 @@ class Parser {
       this.expect("rparen");
       return { kind: "extract", field: field.toLowerCase(), source };
     }
+    // `COALESCE(a, b, …)` — the first-non-NULL conditional (grammar.md §51). Recognized only
+    // when COALESCE is immediately followed by `(` (the JSON(/EXTRACT( one-token lookahead), so
+    // the word stays usable as a column name. At least one argument (an empty list is 42601 —
+    // PostgreSQL's grammar has no empty form).
+    if (this.peekKeyword() === "coalesce" && this.peekKindAt(1) === "lparen") {
+      this.advance(); // COALESCE
+      this.advance(); // (
+      if (this.peekKindAt(0) === "rparen") {
+        throw engineError("syntax_error", "COALESCE requires at least one argument");
+      }
+      const args: Expr[] = [];
+      for (;;) {
+        args.push(this.parseExpr());
+        if (this.peekKindAt(0) !== "comma") break;
+        this.advance(); // ,
+      }
+      this.expect("rparen");
+      return { kind: "coalesce", args };
+    }
     if (this.peekKeyword() === "case") {
       this.advance();
       // Simple form has an operand between CASE and the first WHEN; the searched form starts

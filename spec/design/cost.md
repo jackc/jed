@@ -98,7 +98,7 @@ TS; any deviation diverges the count and fails the corpus.
   are pure functions over already-computed operand values, never control flow. The seam
   **must not introduce** a short-circuit: skipping the RHS in one core when the LHS is
   FALSE/NULL would drop that core's operand evals and diverge the count.
-- **`CASE` is the one deliberate exception to no-short-circuit.** A `CASE`
+- **`CASE` and `COALESCE` are the two deliberate exceptions to no-short-circuit.** A `CASE`
   ([grammar.md](grammar.md) §23) charges its own `operator_eval` for the node, then evaluates
   its `WHEN` conditions **in source order, stopping at the first one that is TRUE** — a FALSE
   or NULL/UNKNOWN condition falls through. Only the conditions tested **up to and including the
@@ -111,7 +111,12 @@ TS; any deviation diverges the count and fails the corpus.
   deterministic. (A consequence, like `DISTINCT`'s, is observable: `CASE WHEN true THEN 0 ELSE
   1/0 END` succeeds and costs *less* than the eager form would, because the `1/0` arm is never
   reached. The simple form `CASE x WHEN v …` desugars each branch to `x = v`, so the operand is
-  evaluated once per tested branch — the same per-branch model as `IN`'s LHS.)
+  evaluated once per tested branch — the same per-branch model as `IN`'s LHS.) `COALESCE`
+  ([grammar.md](grammar.md) §51) is the same sanctioned exception in argument form: one
+  `operator_eval` for the node, then its arguments **in source order, stopping at the first
+  non-NULL** value — each evaluated argument charges its own evals exactly once, and later
+  arguments charge nothing (`COALESCE(1, 1/0)` succeeds). The same fixed left-to-right order
+  keeps which arguments accrue deterministic.
 - **Pre-order, LHS-before-RHS.** A node charges itself, then evaluates its left operand,
   then its right. The order does not change the **total** (a sum is order-independent),
   but it fixes the deterministic **abort point** for the cost ceiling (§6) identically

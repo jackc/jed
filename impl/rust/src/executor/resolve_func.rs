@@ -1045,6 +1045,8 @@ pub(crate) fn output_name(scope: &Scope, e: &Expr) -> String {
         // spec/design/grammar.md §8). A field selection takes the FIELD name (PG names the
         // output column after the selected field). Any other expression takes `?column?`.
         Expr::FuncCall { name, .. } => name.to_ascii_lowercase(),
+        // The fixed keyword lowercased (PG; grammar.md §51) — no expression printer needed.
+        Expr::Coalesce(_) => "coalesce".to_string(),
         Expr::FieldAccess { field, .. } => field.to_ascii_lowercase(),
         // A subscript takes the base array's name (PG names `a[1]` after `a`); a chained subscript
         // `a[1][2]` recurses to the same base name. A non-column base falls through to `?column?`.
@@ -1890,6 +1892,7 @@ pub(crate) fn expr_calls_seq_mutator(e: &Expr) -> bool {
                     .any(|(c, r)| expr_calls_seq_mutator(c) || expr_calls_seq_mutator(r))
                 || els.as_ref().is_some_and(|x| expr_calls_seq_mutator(x))
         }
+        Expr::Coalesce(args) => args.iter().any(expr_calls_seq_mutator),
         Expr::ScalarSubquery(q) | Expr::Exists(q) => query_calls_seq_mutator(q),
         Expr::InSubquery { lhs, query, .. } | Expr::QuantifiedSubquery { lhs, query, .. } => {
             expr_calls_seq_mutator(lhs) || query_calls_seq_mutator(query)
@@ -2209,6 +2212,11 @@ pub(crate) fn collect_expr_privs(e: &Expr, req: &mut PrivReq, locals: &HashSet<S
                 collect_expr_privs(x, req, locals);
             }
         }
+        Expr::Coalesce(args) => {
+            for a in args {
+                collect_expr_privs(a, req, locals);
+            }
+        }
         Expr::ScalarSubquery(q) | Expr::Exists(q) => collect_query_privs(q, req, locals),
         Expr::InSubquery { lhs, query, .. } | Expr::QuantifiedSubquery { lhs, query, .. } => {
             collect_expr_privs(lhs, req, locals);
@@ -2276,6 +2284,7 @@ pub(crate) fn expr_reads_columns(e: &Expr) -> bool {
                     .any(|(c, r)| expr_reads_columns(c) || expr_reads_columns(r))
                 || els.as_ref().is_some_and(|x| expr_reads_columns(x))
         }
+        Expr::Coalesce(args) => args.iter().any(expr_reads_columns),
         Expr::InSubquery { .. } | Expr::QuantifiedSubquery { .. } => true,
         Expr::Quantified { lhs, array, .. } => expr_reads_columns(lhs) || expr_reads_columns(array),
     }
@@ -4012,11 +4021,31 @@ pub(crate) fn resolve(
             };
             result_types.push(ety);
             // Unify the THEN/ELSE result types into the CASE's common type (the render type).
-            let unified = unify_case_types(&result_types)?;
+            let unified = unify_case_types(&result_types, "CASE result types must be compatible")?;
             Ok((
                 RExpr::Case {
                     arms,
                     els: Box::new(rels),
+                    coerce_decimal: unified == ResolvedType::Decimal,
+                },
+                unified,
+            ))
+        }
+        Expr::Coalesce(args) => {
+            // COALESCE(a, b, …) (grammar.md §51): each argument resolves in the same agg context
+            // (an aggregate argument is legal wherever an aggregate is), and the argument types
+            // unify to one common type exactly like CASE's result arms.
+            let mut rargs: Vec<RExpr> = Vec::with_capacity(args.len());
+            let mut arg_types: Vec<ResolvedType> = Vec::with_capacity(args.len());
+            for a in args {
+                let (ra, aty) = resolve(scope, a, None, agg, params)?;
+                rargs.push(ra);
+                arg_types.push(aty);
+            }
+            let unified = unify_case_types(&arg_types, "COALESCE types must be compatible")?;
+            Ok((
+                RExpr::Coalesce {
+                    args: rargs,
                     coerce_decimal: unified == ResolvedType::Decimal,
                 },
                 unified,

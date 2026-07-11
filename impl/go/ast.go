@@ -943,6 +943,9 @@ const (
 	// ExprCase is a CASE expression (searched or simple form), lazily evaluated
 	// (spec/design/grammar.md §23).
 	exprCase
+	// ExprCoalesce is COALESCE(a, b, …) — the first non-NULL argument, lazily evaluated left to
+	// right like CASE (spec/design/grammar.md §51).
+	exprCoalesce
 	// ExprScalarSubquery is a scalar subquery `( query_expr )` in expression position
 	// (spec/design/grammar.md §26). resolve plans it once against the scope chain; an uncorrelated
 	// one is then folded to a constant, a correlated one is re-executed per outer row.
@@ -1135,6 +1138,7 @@ type exprNode struct {
 	Like        *likeExpr       // ExprLike
 	Regex       *regexExpr      // ExprRegex
 	Case        *caseExpr       // ExprCase
+	Coalesce    []exprNode      // ExprCoalesce (the argument list, ≥1, in source order)
 	Subquery    *queryExpr      // ExprScalarSubquery, ExprExists (the inner query)
 	InSubquery  *inSubqueryExpr // ExprInSubquery
 	Quantified  *quantifiedExpr // ExprQuantified

@@ -673,7 +673,10 @@ pub(crate) fn array_get_slice(a: &ArrayVal, bounds: &[(Option<i64>, Option<i64>)
     })
 }
 
-pub(crate) fn unify_case_types(arms: &[ResolvedType]) -> Result<ResolvedType> {
+/// Unify a CASE's result-arm types — or a COALESCE's argument types (grammar.md §51, the
+/// identical rule) — into one common type; a cross-family mix is 42804 with the caller's
+/// form-specific `mismatch` message.
+pub(crate) fn unify_case_types(arms: &[ResolvedType], mismatch: &str) -> Result<ResolvedType> {
     let non_null: Vec<&ResolvedType> = arms.iter().filter(|t| **t != ResolvedType::Null).collect();
     let Some(&first) = non_null.first() else {
         // Every arm is NULL/untyped — PostgreSQL types the CASE as text.
@@ -697,7 +700,7 @@ pub(crate) fn unify_case_types(arms: &[ResolvedType]) -> Result<ResolvedType> {
     // Non-numeric: every arm must be the same family as the first (cross-family is 42804).
     for t in &non_null[1..] {
         if std::mem::discriminant(*t) != std::mem::discriminant(first) {
-            return Err(type_error("CASE result types must be compatible"));
+            return Err(type_error(mismatch));
         }
     }
     Ok(first.clone())

@@ -11854,6 +11854,7 @@ export class Engine {
         }));
         e.els = this.foldUncorrelatedInRExpr(e.els, bound, ctes, cost);
         return e;
+      case "coalesce":
       case "scalarFunc":
       case "arrayFunc":
       case "regexFunc":
@@ -12811,6 +12812,7 @@ export function rexprIsConstant(e: RExpr): boolean {
         e.arms.every((a) => rexprIsConstant(a.cond) && rexprIsConstant(a.result)) &&
         rexprIsConstant(e.els)
       );
+    case "coalesce":
     case "scalarFunc":
     case "arrayFunc":
     case "regexFunc":
@@ -13753,6 +13755,15 @@ export function rexprEqShifted(a: RExpr, b: RExpr, offset: number): boolean {
         a.args.length === b.args.length &&
         a.args.every((x, i) => rexprEqShifted(x, b.args[i]!, offset))
       );
+    // COALESCE(a, b, …) is a legal (immutable-iff-args-are) index expression (grammar.md §51),
+    // so an index on COALESCE(x, 0) must match the same spelling in a query.
+    case "coalesce":
+      return (
+        b.kind === "coalesce" &&
+        a.coerceDecimal === b.coerceDecimal &&
+        a.args.length === b.args.length &&
+        a.args.every((x, i) => rexprEqShifted(x, b.args[i]!, offset))
+      );
     case "arith":
       return (
         b.kind === "arith" &&
@@ -14367,6 +14378,7 @@ export function rexprReferencesOuter(e: RExpr, depth: number): boolean {
           (arm) => rexprReferencesOuter(arm.cond, depth) || rexprReferencesOuter(arm.result, depth),
         ) || rexprReferencesOuter(e.els, depth)
       );
+    case "coalesce":
     case "scalarFunc":
     case "arrayFunc":
     case "regexFunc":
@@ -14499,6 +14511,7 @@ export function collectTouched(e: RExpr, depth: number, touched: boolean[]): voi
       }
       collectTouched(e.els, depth, touched);
       return;
+    case "coalesce":
     case "scalarFunc":
     case "arrayFunc":
     case "regexFunc":
@@ -14896,6 +14909,7 @@ export function rebasePlaceholderCols(e: RExpr, from: number, target: number): v
       }
       rebasePlaceholderCols(e.els, from, target);
       return;
+    case "coalesce":
     case "scalarFunc":
     case "arrayFunc":
     case "regexFunc":
@@ -15321,6 +15335,11 @@ export type RExpr =
       els: RExpr;
       coerceDecimal: boolean;
     }
+  // A resolved COALESCE(a, b, …) (grammar.md §51) — lazy like `case`: arguments are evaluated
+  // left to right, each at most once, stopping at the first non-NULL (the second sanctioned
+  // short-circuit, cost.md §3). Argument types unify exactly like CASE result arms;
+  // `coerceDecimal` widens integer arguments when the unified type is decimal.
+  | { kind: "coalesce"; args: RExpr[]; coerceDecimal: boolean }
   // A scalar-function call (spec/design/functions.md §9, float.md §8), evaluated per row in any
   // context. `result` is the static result type — for abs over an integer/float it is the
   // operand's own type (range-checked / fround'd at that width), for round over int/decimal it is
@@ -17819,6 +17838,8 @@ export function exprHasAggregate(e: Expr): boolean {
         e.whens.some((w) => exprHasAggregate(w.cond) || exprHasAggregate(w.result)) ||
         (e.els !== null && exprHasAggregate(e.els))
       );
+    case "coalesce":
+      return e.args.some(exprHasAggregate);
     case "row":
       return e.fields.some(exprHasAggregate);
     case "array":
@@ -17892,6 +17913,8 @@ export function exprHasWindow(e: Expr): boolean {
         e.whens.some((w) => exprHasWindow(w.cond) || exprHasWindow(w.result)) ||
         (e.els !== null && exprHasWindow(e.els))
       );
+    case "coalesce":
+      return e.args.some(exprHasWindow);
     case "row":
       return e.fields.some(exprHasWindow);
     case "array":
@@ -18066,6 +18089,9 @@ export function desugarNamedWindows(e: Expr, windows: [string, WindowDef][]): vo
       }
       if (e.els !== null) desugarNamedWindows(e.els, windows);
       return;
+    case "coalesce":
+      for (const a of e.args) desugarNamedWindows(a, windows);
+      return;
     // Leaves, subscripts, and subqueries (independent) carry no top-level window ref to rewrite.
     default:
       return;
@@ -18155,6 +18181,9 @@ export function rejectCheckStructure(e: Expr): void {
         rejectCheckStructure(w.result);
       }
       if (e.els !== null) rejectCheckStructure(e.els);
+      return;
+    case "coalesce":
+      for (const a of e.args) rejectCheckStructure(a);
       return;
     case "row":
       for (const f of e.fields) rejectCheckStructure(f);
@@ -18247,6 +18276,9 @@ export function rejectDefaultStructure(e: Expr): void {
         rejectDefaultStructure(w.result);
       }
       if (e.els !== null) rejectDefaultStructure(e.els);
+      return;
+    case "coalesce":
+      for (const a of e.args) rejectDefaultStructure(a);
       return;
     case "row":
       for (const f of e.fields) rejectDefaultStructure(f);
@@ -18349,6 +18381,9 @@ export function indexExprNonimmutableCall(e: Expr): boolean {
         ) ||
         (e.els !== null && indexExprNonimmutableCall(e.els))
       );
+    // COALESCE is a pure combinator — immutable iff its arguments are (grammar.md §51).
+    case "coalesce":
+      return e.args.some(indexExprNonimmutableCall);
     case "row":
       return e.fields.some(indexExprNonimmutableCall);
     case "array":
@@ -18418,6 +18453,8 @@ export function indexExprHasSubquery(e: Expr): boolean {
         e.whens.some((w) => indexExprHasSubquery(w.cond) || indexExprHasSubquery(w.result)) ||
         (e.els !== null && indexExprHasSubquery(e.els))
       );
+    case "coalesce":
+      return e.args.some(indexExprHasSubquery);
     case "funcCall":
       return e.args.some(indexExprHasSubquery);
     case "row":
@@ -18501,6 +18538,13 @@ export function indexExprFirstParam(e: Expr): number | null {
         if (c !== null) return c;
       }
       return e.els !== null ? indexExprFirstParam(e.els) : null;
+    }
+    case "coalesce": {
+      for (const a of e.args) {
+        const p = indexExprFirstParam(a);
+        if (p !== null) return p;
+      }
+      return null;
     }
     case "funcCall": {
       for (const a of e.args) {
@@ -18594,6 +18638,9 @@ export function checkReferencedColumns(e: Expr, columns: Column[]): number[] {
           walk(w.result);
         }
         if (e.els !== null) walk(e.els);
+        return;
+      case "coalesce":
+        for (const a of e.args) walk(a);
         return;
       case "funcCall":
         for (const a of e.args) walk(a);
