@@ -389,10 +389,16 @@ in the `rake ci` gate. Two families of relation are generated:
   NULL surface. The generator computes the partition by construction with the same Kleene rules jed
   must implement; a bug shows up as a partition that fails to reconstruct the whole. The `tlp`
   scenario covers comparison / equality / Kleene-`AND` / Kleene-`OR` / arithmetic-NULL predicates and
-  the `COUNT(*)` / `COUNT(expr)` aggregate forms; `SUM`/`MIN`/`MAX`/`AVG` aggregate-TLP is **deferred**
-  as a generator addition (combining per-partition results needs `COALESCE` — landed,
-  [grammar.md](grammar.md) §51, unblocking the `SUM`/`AVG` forms — and `LEAST`/`GREATEST` — now also
-  landed, [grammar.md](grammar.md) §52, unblocking the `MIN`/`MAX` forms; both prerequisites are in).
+  the **aggregate-TLP** forms: the whole-table aggregate reconstructed from the same aggregate over the
+  three partitions — `COUNT` (parts add directly), `SUM` (`COALESCE(part, 0)` supplies the additive
+  identity an empty partition lacks, [grammar.md](grammar.md) §51), and `MIN`/`MAX` (`LEAST`/`GREATEST`
+  combine the parts, dropping an empty partition's NULL, [grammar.md](grammar.md) §52) — both **ungrouped**
+  (via scalar-subquery combination) and **grouped** (`GROUP BY`-level: each partition aggregated per group,
+  `UNION ALL`'d in a derived table, then re-aggregated per group — the super-aggregate identity, with the
+  `SUM`/`COUNT` re-aggregation cast back to `i64` to match the direct type). `AVG` aggregate-TLP is
+  **deferred**: it reconstructs as total-`SUM` / total-`COUNT`, so its by-construction expected is an
+  exact-`decimal` division whose scale/rounding ([decimal.md](decimal.md) §3-4) the generator would have
+  to replicate — a future generator addition.
 
 **Why this catches what the differential cores cannot.** Running every `.test` on Rust/Go/TS
 catches the cores *disagreeing*; it is blind to a bug **all three share**. A metamorphic
@@ -427,7 +433,8 @@ only yesterday's optimizations is false confidence (CLAUDE.md §10 "no silent ca
   frames coincide — and the moving `COUNT(*)`/`SUM` forms (the un-fold / partial-rebuild paths)
   match the by-construction rows; **tlp** —
   ternary-logic partitioning (above), an independent oracle for 3-valued NULL logic rather than an
-  optimization pair. Three further relations are **algebraic-equivalence oracles** — like `tlp`, they
+  optimization pair, including the aggregate-TLP forms (`COUNT`/`SUM`/`MIN`/`MAX` reconstructed from
+  the three partitions, ungrouped and per-`GROUP BY`-group). Three further relations are **algebraic-equivalence oracles** — like `tlp`, they
   assert that equivalent *spellings* agree rather than an optimized-vs-unoptimized pair: **predicate**
   — one predicate written many logically-equivalent ways (AND/OR commutativity, Kleene De Morgan,
   double negation, `IN`↔OR-chain, `BETWEEN`↔`>= AND <=`) must return identical rows under 3VL,
@@ -440,9 +447,8 @@ only yesterday's optimizations is false confidence (CLAUDE.md §10 "no silent ca
   same projected pairs through different execution shapes.
 - **NOT yet covered (needs a new relation):** any future index *range* / multi-column-prefix
   bound, DISTINCT / aggregate pushdown, or other optimization added later; on the TLP side,
-  `SUM`/`MIN`/`MAX`/`AVG` aggregate partitioning (all four now unblocked — `SUM`/`AVG` by `COALESCE`,
-  [grammar.md](grammar.md) §51, and `MIN`/`MAX` by `LEAST`/`GREATEST`, [grammar.md](grammar.md) §52 —
-  so these are pure metamorphic-generator additions) and a `GROUP BY`-level TLP. Each is a future relation the sweep does **not** yet exercise — add a
+  `AVG` aggregate partitioning (deferred — its by-construction expected is an exact-`decimal`
+  `SUM`/`COUNT` division, above). Each is a future relation the sweep does **not** yet exercise — add a
   scenario when it lands.
 
 **Reducing a discovered failure.** Generation is seeded, so a failure reproduces deterministically

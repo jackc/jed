@@ -157,8 +157,9 @@ JOIN_ORDER_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi
                     query.offset query.order_by_join_scan types.i32].freeze
 TLP_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
              query.where_eq query.comparison_order query.order_by query.is_null
-             query.logical_connectives query.union query.aggregates query.subquery_scalar
-             expr.arithmetic expr.comparison_value types.i32 null.three_valued].freeze
+             query.logical_connectives query.union query.aggregates query.group_by
+             query.derived_table query.subquery_scalar expr.arithmetic expr.comparison_value
+             expr.coalesce expr.greatest_least cast.explicit types.i32 null.three_valued].freeze
 CTE_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
              query.where_eq query.comparison_order query.order_by query.cte expr.arithmetic
              expr.between expr.comparison_value types.i32].freeze
@@ -1244,24 +1245,101 @@ def gen_tlp(seed)
       flat.call(whole))
   end
 
-  # Aggregate TLP: COUNT over the whole equals the three partition counts summed. COUNT never
-  # returns NULL, so the sub-counts add directly (SUM/MIN/MAX TLP would need a NULL-coalesce for an
-  # empty partition — jed has no COALESCE yet, so that arm is deferred, conformance.md §8). Uses the
-  # AND predicate (the richest 3VL shape); the combined form is three uncorrelated scalar subqueries.
+  # Aggregate TLP (SQLancer): an aggregate over the whole table is RECONSTRUCTED from the SAME
+  # aggregate over the three 3VL partitions — a metamorphic oracle independent of the row-level
+  # reconstruction above, and the one that stresses the aggregate + NULL-combination paths. The
+  # AND predicate (the richest 3VL shape) partitions the rows; the reconstructed value does not
+  # depend on the predicate (that is the invariant), so every expected value is computed BY
+  # CONSTRUCTION from the base data — no oracle. Two families:
   ap, = preds[2]
-  total = rows.size
-  count_b = rows.count { |_id, _a, b| !b.nil? }
+  agg_lit = ->(v) { v.nil? ? "NULL" : v.to_s }
+  bs_all = rows.map { |_id, _a, b| b }.compact # the non-NULL b values over the whole table
+
+  # (1) UNGROUPED, via scalar-subquery combination over the three partitions. COUNT never returns
+  # NULL so the parts add directly; SUM needs COALESCE(part, 0) to turn an empty/all-NULL partition's
+  # NULL into the additive identity; MIN/MAX have no additive identity, so they COMBINE with LEAST /
+  # GREATEST, which drop the NULL an empty partition yields (COALESCE grammar.md §51, LEAST/GREATEST
+  # §52 — the functions that unblocked the SUM/COUNT and MIN/MAX forms; conformance.md §8).
   out << "# aggregate TLP: COUNT over the whole = the three partition counts summed (p = #{ap})"
-  q(out, "I", "SELECT count(*) FROM t", [total.to_s])
+  q(out, "I", "SELECT count(*) FROM t", [rows.size.to_s])
   q(out, "I",
     "SELECT (SELECT count(*) FROM t WHERE #{ap}) + (SELECT count(*) FROM t WHERE NOT (#{ap})) " \
     "+ (SELECT count(*) FROM t WHERE (#{ap}) IS NULL)",
-    [total.to_s])
-  q(out, "I", "SELECT count(b) FROM t", [count_b.to_s])
+    [rows.size.to_s])
+  q(out, "I", "SELECT count(b) FROM t", [bs_all.size.to_s])
   q(out, "I",
     "SELECT (SELECT count(b) FROM t WHERE #{ap}) + (SELECT count(b) FROM t WHERE NOT (#{ap})) " \
     "+ (SELECT count(b) FROM t WHERE (#{ap}) IS NULL)",
-    [count_b.to_s])
+    [bs_all.size.to_s])
+
+  # SUM — COALESCE each partition's sum to 0 (an empty/all-NULL partition sums to NULL); the whole
+  # is COALESCEd too so an all-NULL b column reconstructs as 0 on both sides.
+  out << "# aggregate TLP: SUM over the whole = COALESCE(partition sum, 0) summed (COALESCE grammar.md §51)"
+  q(out, "I", "SELECT COALESCE(sum(b), 0) FROM t", [bs_all.sum.to_s])
+  q(out, "I",
+    "SELECT COALESCE((SELECT sum(b) FROM t WHERE #{ap}), 0) " \
+    "+ COALESCE((SELECT sum(b) FROM t WHERE NOT (#{ap})), 0) " \
+    "+ COALESCE((SELECT sum(b) FROM t WHERE (#{ap}) IS NULL), 0)",
+    [bs_all.sum.to_s])
+
+  # MIN / MAX — no additive identity; LEAST / GREATEST combine the parts, dropping the NULL an empty
+  # partition yields (and returning NULL only when every partition is empty/all-NULL).
+  out << "# aggregate TLP: MIN over the whole = LEAST of the partition mins (LEAST grammar.md §52)"
+  q(out, "I", "SELECT min(b) FROM t", [agg_lit.call(bs_all.min)])
+  q(out, "I",
+    "SELECT LEAST((SELECT min(b) FROM t WHERE #{ap}), (SELECT min(b) FROM t WHERE NOT (#{ap})), " \
+    "(SELECT min(b) FROM t WHERE (#{ap}) IS NULL))",
+    [agg_lit.call(bs_all.min)])
+  out << "# aggregate TLP: MAX over the whole = GREATEST of the partition maxes (GREATEST grammar.md §52)"
+  q(out, "I", "SELECT max(b) FROM t", [agg_lit.call(bs_all.max)])
+  q(out, "I",
+    "SELECT GREATEST((SELECT max(b) FROM t WHERE #{ap}), (SELECT max(b) FROM t WHERE NOT (#{ap})), " \
+    "(SELECT max(b) FROM t WHERE (#{ap}) IS NULL))",
+    [agg_lit.call(bs_all.max)])
+
+  # (2) GROUPED (GROUP BY a), the aggregate-GROUP-BY-TLP super-aggregate: each partition is
+  # aggregated PER GROUP, the three partials are UNION ALL'd in a derived table (grammar.md §42),
+  # then re-aggregated per group (sum-of-sums, sum-of-counts, min-of-mins, max-of-maxes). p
+  # partitions each group's rows across the arms, so an empty group-partition contributes no row and
+  # the outer aggregate skips it. SUM/COUNT widen (i32->i64->decimal) under re-aggregation, so the
+  # recombined value is cast back to i64 to match the direct aggregate's type; MIN/MAX keep i32.
+  # a is nullable, so one group is the NULL group (jed sorts it last, matching PG — encoding.md).
+  groups = rows.group_by { |_id, a, _b| a }
+  gkeys = groups.keys.compact.sort + (groups.key?(nil) ? [nil] : [])
+  grp_bs = ->(ga) { groups[ga].map { |_id, _a, b| b }.compact }
+  # the three partitions of t, each aggregated per group; only the first arm needs the alias.
+  part_arms = lambda do |agg, al|
+    "(SELECT a, #{agg} AS #{al} FROM t WHERE #{ap} GROUP BY a " \
+    "UNION ALL SELECT a, #{agg} FROM t WHERE NOT (#{ap}) GROUP BY a " \
+    "UNION ALL SELECT a, #{agg} FROM t WHERE (#{ap}) IS NULL GROUP BY a) x"
+  end
+  flat_grp = ->(val) { gkeys.flat_map { |ga| [agg_lit.call(ga), val.call(ga)] } }
+
+  out << "# aggregate GROUP BY TLP: per-group aggregate = the partition partials re-aggregated per group"
+  out << "# COUNT -> sum-of-counts (::i64: count(*) widens under re-aggregation)"
+  count_g = ->(ga) { groups[ga].size.to_s }
+  q(out, "II", "SELECT a, count(*) FROM t GROUP BY a ORDER BY a", flat_grp.call(count_g))
+  q(out, "II",
+    "SELECT a, sum(c)::i64 FROM #{part_arms.call('count(*)', 'c')} GROUP BY a ORDER BY a",
+    flat_grp.call(count_g))
+  out << "# SUM -> sum-of-sums (::i64: sum widens i32->i64->decimal under re-aggregation)"
+  sum_g = ->(ga) { (b = grp_bs.call(ga)).empty? ? "NULL" : b.sum.to_s }
+  q(out, "II", "SELECT a, sum(b) FROM t GROUP BY a ORDER BY a", flat_grp.call(sum_g))
+  q(out, "II",
+    "SELECT a, sum(s)::i64 FROM #{part_arms.call('sum(b)', 's')} GROUP BY a ORDER BY a",
+    flat_grp.call(sum_g))
+  out << "# MIN -> min-of-mins (element type preserved, no cast)"
+  min_g = ->(ga) { (b = grp_bs.call(ga)).empty? ? "NULL" : b.min.to_s }
+  q(out, "II", "SELECT a, min(b) FROM t GROUP BY a ORDER BY a", flat_grp.call(min_g))
+  q(out, "II",
+    "SELECT a, min(m) FROM #{part_arms.call('min(b)', 'm')} GROUP BY a ORDER BY a",
+    flat_grp.call(min_g))
+  out << "# MAX -> max-of-maxes (element type preserved, no cast)"
+  max_g = ->(ga) { (b = grp_bs.call(ga)).empty? ? "NULL" : b.max.to_s }
+  q(out, "II", "SELECT a, max(b) FROM t GROUP BY a ORDER BY a", flat_grp.call(max_g))
+  q(out, "II",
+    "SELECT a, max(m) FROM #{part_arms.call('max(b)', 'm')} GROUP BY a ORDER BY a",
+    flat_grp.call(max_g))
 
   out.join("\n") + "\n"
 end
