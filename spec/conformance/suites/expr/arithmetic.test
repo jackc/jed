@@ -106,8 +106,9 @@ SELECT CAST(a AS i64) + b FROM edge WHERE id = 1
 # --- INT_MIN / -1 overflow: the negation of the most-negative value has no positive ----
 # counterpart, so the division overflows at the result type and traps 22003 (matching PG,
 # which raises "out of range" — and the hardware IDIV trap a naive core would hit). Pinned
-# for all three widths; values staged via columns (the bare literal -9223372036854775808
-# cannot be written directly — it lexes as unary minus of an out-of-range magnitude).
+# for all three widths; values staged via columns so the trap fires in the runtime
+# evaluator over stored operands. (The literal -9223372036854775808 is itself writable —
+# the unary-minus fold reaches i64's minimum; unary_minus.test pins that boundary.)
 statement ok
 CREATE TABLE divmin (id i32 PRIMARY KEY, i16 i16, i32 i32, i64 i64, neg1 i64)
 
