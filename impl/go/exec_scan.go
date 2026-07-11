@@ -186,8 +186,8 @@ func (db *engine) buildScanRows(sp *selectPlan, ptys []scalarType, params []Valu
 		// (e.g. pk = NULL) admits no row.
 		b := unboundedBound()
 		empty := false
-		if sp.relBounds[0] != nil && sp.relBounds[0].pk != nil {
-			b, empty = db.buildKeyBound(sp.relBounds[0].pk, bound, nil, nil)
+		if sp.phys.relBounds[0] != nil && sp.phys.relBounds[0].pk != nil {
+			b, empty = db.buildKeyBound(sp.phys.relBounds[0].pk, bound, nil, nil)
 		}
 		snap := db.snapshotEngine()
 		store := snap.lkpStoreScoped(sp.rels[0].db, sp.rels[0].tableName)
@@ -217,7 +217,7 @@ func (db *engine) buildScanRows(sp *selectPlan, ptys []scalarType, params []Valu
 			done:     empty || (sp.limit != nil && *sp.limit == 0),
 		}
 		if !cur.done {
-			cur.scan = store.storeScan(b, sp.pkReverse)
+			cur.scan = store.storeScan(b, sp.phys.pkReverse)
 		}
 		return &Rows{columnNames: sp.columnNames, columnTypes: typeNames(sp.columnTypes), cursor: cur}, true, nil
 	}
@@ -656,8 +656,8 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 	b := unboundedBound()
 	empty := false
 	overlap, slabs := 0, 0
-	if plan.relBounds[0] != nil && plan.relBounds[0].pk != nil {
-		b, empty = db.buildKeyBound(plan.relBounds[0].pk, params, env.outer, nil)
+	if plan.phys.relBounds[0] != nil && plan.phys.relBounds[0].pk != nil {
+		b, empty = db.buildKeyBound(plan.phys.relBounds[0].pk, params, env.outer, nil)
 	}
 	if !empty {
 		var err error
@@ -750,7 +750,7 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 			return true, nil
 		}
 		var err error
-		if plan.pkReverse {
+		if plan.phys.pkReverse {
 			err = store.ScanRangeRev(b, visit)
 		} else {
 			err = store.ScanRange(b, visit)
@@ -779,8 +779,8 @@ func (db *engine) execWindowTopN(plan *selectPlan, env *evalEnv, meter *costMete
 	b := unboundedBound()
 	empty := false
 	overlap, slabs := 0, 0
-	if plan.relBounds[0] != nil && plan.relBounds[0].pk != nil {
-		b, empty = db.buildKeyBound(plan.relBounds[0].pk, params, env.outer, nil)
+	if plan.phys.relBounds[0] != nil && plan.phys.relBounds[0].pk != nil {
+		b, empty = db.buildKeyBound(plan.phys.relBounds[0].pk, params, env.outer, nil)
 	}
 	if !empty {
 		var err error
@@ -828,7 +828,7 @@ func (db *engine) execWindowTopN(plan *selectPlan, env *evalEnv, meter *costMete
 			return int64(len(rows)) < capN, nil // stop once the OFFSET+LIMIT window is filled
 		}
 		var err error
-		if plan.pkReverse {
+		if plan.phys.pkReverse {
 			err = store.ScanRangeRev(b, visit)
 		} else {
 			err = store.ScanRange(b, visit)
@@ -955,8 +955,8 @@ func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costM
 	b := unboundedBound()
 	empty := false
 	overlap, slabs := 0, 0
-	if plan.relBounds[0] != nil && plan.relBounds[0].pk != nil {
-		b, empty = db.buildKeyBound(plan.relBounds[0].pk, params, env.outer, nil)
+	if plan.phys.relBounds[0] != nil && plan.phys.relBounds[0].pk != nil {
+		b, empty = db.buildKeyBound(plan.phys.relBounds[0].pk, params, env.outer, nil)
 	}
 	if !empty {
 		var err error
@@ -1266,9 +1266,9 @@ func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 	// bound and resolves its sibling source from the current left row (cost.md §3 "JOIN"); else the
 	// once-materialized relBounds.
 	store := db.lkpStoreScoped(rel.db, rel.tableName)
-	sb := plan.relINLBounds[ri]
+	sb := plan.phys.relINLBounds[ri]
 	if sb == nil {
-		sb = plan.relBounds[ri]
+		sb = plan.phys.relBounds[ri]
 	}
 	var rows []storedRow
 	var nodeCount, slabs int

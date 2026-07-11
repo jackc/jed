@@ -1146,7 +1146,8 @@ func (db *engine) planSelect(sel *selectStmt, parent *scope, ctes []*cteBinding,
 		aggSpecs: aggSpecs, hasWindow: hasWindow, windowSpecs: windowSpecs, windowKeys: windowKeys, having: having,
 		order: order, orderExprs: orderExprs, projections: projections,
 		columnNames: columnNames, columnTypes: columnTypes, distinct: sel.Distinct,
-		limit: sel.Limit, offset: sel.Offset, pkOrdered: pkOrdered, pkReverse: pkReverse, indexOrder: indexOrder, joinPkOrdered: joinPkOrdered, relBounds: relBounds, relINLBounds: relINLBounds, relMasks: relMasks,
+		limit: sel.Limit, offset: sel.Offset, relMasks: relMasks,
+		phys: physicalPlan{pkOrdered: pkOrdered, pkReverse: pkReverse, indexOrder: indexOrder, joinPkOrdered: joinPkOrdered, relBounds: relBounds, relINLBounds: relINLBounds},
 	}, nil
 }
 

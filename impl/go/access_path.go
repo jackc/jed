@@ -1948,8 +1948,8 @@ func boundEmpty(b keyBound) bool {
 func streamingScanEligible(plan *selectPlan) bool {
 	return len(plan.rels) == 1 && len(plan.joins) == 0 &&
 		!plan.isAgg && !plan.hasWindow &&
-		(plan.pkOrdered || (!plan.distinct && len(plan.order) == 0 && plan.limit != nil)) &&
-		!plan.relBounds[0].needsEagerScan() &&
+		(plan.phys.pkOrdered || (!plan.distinct && len(plan.order) == 0 && plan.limit != nil)) &&
+		!plan.phys.relBounds[0].needsEagerScan() &&
 		plan.rels[0].srf == nil &&
 		plan.rels[0].cte == nil &&
 		plan.rels[0].derived == nil
@@ -1972,7 +1972,7 @@ func streamingScanEligible(plan *selectPlan) bool {
 // the accrued cost drops (fewer rows scanned/folded), the deliberate cost change (like the streaming
 // LIMIT short-circuit — cross-core identical because every core caps at the same OFFSET+LIMIT).
 func (db *engine) windowTopNEligible(plan *selectPlan) bool {
-	if !plan.hasWindow || plan.isAgg || plan.distinct || plan.limit == nil || !plan.pkOrdered {
+	if !plan.hasWindow || plan.isAgg || plan.distinct || plan.limit == nil || !plan.phys.pkOrdered {
 		return false
 	}
 	if len(plan.rels) != 1 || len(plan.joins) != 0 {
@@ -1982,7 +1982,7 @@ func (db *engine) windowTopNEligible(plan *selectPlan) bool {
 	if rel.srf != nil || rel.cte != nil || rel.derived != nil {
 		return false
 	}
-	if plan.relBounds[0].needsEagerScan() {
+	if plan.phys.relBounds[0].needsEagerScan() {
 		return false
 	}
 	if len(plan.windowKeys) != 0 || len(plan.orderExprs) != 0 {
@@ -2020,7 +2020,7 @@ func (db *engine) windowSpecPrefixSafe(spec *windowSpec, plan *selectPlan, table
 		return false
 	}
 	ok, rev := db.orderSatisfiedByPK(table, offset, spec.order)
-	if !ok || rev != plan.pkReverse {
+	if !ok || rev != plan.phys.pkReverse {
 		return false
 	}
 	unique := len(spec.order) >= len(table.PKIndices()) // order covers the full (unique) PK ⇒ singleton peer groups

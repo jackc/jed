@@ -1500,6 +1500,24 @@ type selectPlan struct {
 	distinct    bool
 	limit       *int64
 	offset      *int64
+	// relMasks is the TOUCHED SET per relation (cost.md §3 "The touched set"; large-values.md
+	// §14): which of its columns this query statically references. Drives the chain-page_read /
+	// value_decompress portion of the scan's up-front cost block — an untouched spilled or
+	// compressed column charges nothing, however many records the bound admits. An ANNOTATION of
+	// the logical plan, not an optimization: a wrong mask is a disk-mode NULL-folding correctness
+	// bug, not a slow plan — so it is computed by the resolve half (computeRelMasks), never by a
+	// physical rule (spec/design/planner.md §2).
+	relMasks [][]bool
+	// phys is the plan's physical / access-path decisions — set ONLY by the optimizeSelect pass
+	// (optimize.go); zero-valued when resolve hands the plan over (spec/design/planner.md §4).
+	phys physicalPlan
+}
+
+// physicalPlan is the physical/access-path half of a selectPlan: every field is the output of one
+// discrete rule of the optimizeSelect pass (spec/design/planner.md §4), applied in a fixed order
+// after the resolve half has built the logical plan. A zero-valued physicalPlan is always correct —
+// the executor then full-scans and eager-sorts.
+type physicalPlan struct {
 	// pkOrdered reports that ORDER BY is satisfied by the single base relation's PRIMARY-KEY scan
 	// order — the table tree already yields rows in this order, so the sort is elided (and with a
 	// LIMIT the scan short-circuits a top-N). True iff the query is a single-table, non-aggregate,
@@ -1536,11 +1554,6 @@ type selectPlan struct {
 	// full-scanning — O(N·M) → O(N·log M). nil ⇒ the ordinary once-materialized relBounds path. A
 	// non-nil entry takes precedence over relBounds for that relation.
 	relINLBounds []*scanBound
-	// relMasks is the TOUCHED SET per relation (cost.md §3 "The touched set"; large-values.md
-	// §14): which of its columns this query statically references. Drives the chain-page_read /
-	// value_decompress portion of the scan's up-front cost block — an untouched spilled or
-	// compressed column charges nothing, however many records the bound admits.
-	relMasks [][]bool
 }
 
 // setOpPlan is a resolved set operation: both operands planned with the same parent scope, the

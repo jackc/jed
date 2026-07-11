@@ -115,7 +115,7 @@ func (db *engine) vectorizedAggEligible(plan *selectPlan) bool {
 	}
 	// Full scan or a primary-key bound only — an index / GIN / GiST / point-set (OR/IN) bound changes
 	// the scan mechanics and residual filter, so it keeps the scalar / eager path (cost.md §3).
-	if len(plan.relBounds) > 0 && plan.relBounds[0].needsEagerScan() {
+	if len(plan.phys.relBounds) > 0 && plan.phys.relBounds[0].needsEagerScan() {
 		return false
 	}
 	// Exactly one grouping set (ROLLUP/CUBE/GROUPING SETS produce several — deferred), no materialized
@@ -347,7 +347,7 @@ func (db *engine) aggColumnar(plan *selectPlan, gset *groupSetPlan, env *evalEnv
 	// matching materializeRel's `if !empty` guard.
 	scan := true
 	b := unboundedBound()
-	if sb := plan.relBounds[0]; sb != nil && sb.pk != nil {
+	if sb := plan.phys.relBounds[0]; sb != nil && sb.pk != nil {
 		var empty bool
 		if b, empty = db.buildKeyBound(sb.pk, env.params, env.outer, nil); empty {
 			scan = false
@@ -533,7 +533,7 @@ func (db *engine) vectorizedProjectEligible(plan *selectPlan) bool {
 	}
 	// Full scan or a primary-key bound only — an index / GIN / GiST / point-set (OR/IN) bound changes
 	// the scan mechanics and residual filter, so it keeps the eager path (cost.md §3).
-	if len(plan.relBounds) > 0 && plan.relBounds[0].needsEagerScan() {
+	if len(plan.phys.relBounds) > 0 && plan.phys.relBounds[0].needsEagerScan() {
 		return false
 	}
 	// Every projection must be a bare column reference: a bare reColumn evaluates to row[index] with zero
@@ -599,8 +599,8 @@ func (db *engine) projectColumnar(plan *selectPlan, env *evalEnv, meter *costMet
 	rowCount, pages, slabs := 0, 0, 0
 	scan := true
 	b := unboundedBound()
-	if len(plan.relBounds) > 0 {
-		if sb := plan.relBounds[0]; sb != nil && sb.pk != nil {
+	if len(plan.phys.relBounds) > 0 {
+		if sb := plan.phys.relBounds[0]; sb != nil && sb.pk != nil {
 			var empty bool
 			if b, empty = db.buildKeyBound(sb.pk, env.params, env.outer, nil); empty {
 				scan = false

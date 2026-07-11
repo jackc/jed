@@ -283,14 +283,14 @@ func (db *engine) renderSelectPlan(r *explainRender, sp *selectPlan, depth int) 
 	orderNote := ""
 	if len(sp.order) > 0 {
 		switch {
-		case sp.pkOrdered:
+		case sp.phys.pkOrdered:
 			orderNote = "pk ordered"
-			if sp.pkReverse {
+			if sp.phys.pkReverse {
 				orderNote += " (reverse)"
 			}
-		case sp.indexOrder != nil:
-			orderNote = "index order: " + sp.indexOrder.nameKey
-		case sp.joinPkOrdered:
+		case sp.phys.indexOrder != nil:
+			orderNote = "index order: " + sp.phys.indexOrder.nameKey
+		case sp.phys.joinPkOrdered:
 			orderNote = "join pk ordered"
 		default:
 			r.emit(d, "Sort", fmt.Sprintf("keys=%d", len(sp.order)))
@@ -367,9 +367,9 @@ func (db *engine) renderRelLeaf(r *explainRender, sp *selectPlan, i, depth int, 
 	default:
 		// An index-nested-loop bound (per-outer-row seek) takes precedence over the once-materialized
 		// bound in the access-path label (cost.md §3 "JOIN").
-		bound, inl := sp.relBounds[i], false
-		if sp.relINLBounds[i] != nil {
-			bound, inl = sp.relINLBounds[i], true
+		bound, inl := sp.phys.relBounds[i], false
+		if sp.phys.relINLBounds[i] != nil {
+			bound, inl = sp.phys.relINLBounds[i], true
 		}
 		r.emit(depth, "Scan "+rel.tableName, withNote(db.scanDetail(rel.tableName, bound, inl, sp.relMasks[i]), note))
 		return nil

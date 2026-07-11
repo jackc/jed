@@ -229,8 +229,8 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 	// indexOrder only for a single-table, non-aggregate/window/DISTINCT, no-bound, LIMITed query
 	// whose ORDER BY a B-tree index satisfies (and the PK scan does not). Walk the index +
 	// point-lookup; the eager sort is elided.
-	if plan.indexOrder != nil {
-		res, err := db.execIndexOrderScan(plan, plan.indexOrder, env, meter)
+	if plan.phys.indexOrder != nil {
+		res, err := db.execIndexOrderScan(plan, plan.phys.indexOrder, env, meter)
 		if err != nil {
 			return emitter{}, err
 		}
@@ -244,9 +244,9 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 	// join take the eager path below, and an index bound does not stream (like the LIMIT
 	// short-circuit). Results + cost are identical to the eager sort (the sort is unmetered —
 	// cost.md §3; spill.md §6).
-	if len(plan.order) > 0 && !plan.pkOrdered && len(plan.orderExprs) == 0 && len(plan.rels) == 1 && len(plan.joins) == 0 &&
+	if len(plan.order) > 0 && !plan.phys.pkOrdered && len(plan.orderExprs) == 0 && len(plan.rels) == 1 && len(plan.joins) == 0 &&
 		!plan.isAgg && !plan.hasWindow && !plan.distinct &&
-		!plan.relBounds[0].needsEagerScan() &&
+		!plan.phys.relBounds[0].needsEagerScan() &&
 		plan.rels[0].srf == nil &&
 		// A CTE reference takes the eager path (cte.md §5).
 		plan.rels[0].cte == nil &&
@@ -262,7 +262,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 	// INNER/CROSS join whose ORDER BY the OUTER relation's PK scan order satisfies, with a LIMIT. The
 	// nested loop drives the outer in PK order so the output is already ordered — the sort is elided
 	// and the loop short-circuits a top-N.
-	if plan.joinPkOrdered {
+	if plan.phys.joinPkOrdered {
 		res, err := db.execStreamingJoin(plan, env, meter, params, outer, env.rng)
 		if err != nil {
 			return emitter{}, err
@@ -288,7 +288,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 	// holds its slot and the join loop re-materializes it per left row.
 	materialized := make([][]storedRow, len(plan.rels))
 	for ri, rel := range plan.rels {
-		if rel.lateral || plan.relINLBounds[ri] != nil {
+		if rel.lateral || plan.phys.relINLBounds[ri] != nil {
 			continue
 		}
 		rows, err := db.materializeRel(plan, ri, params, outer, nil, env.rng, env.ctes, meter)
@@ -372,7 +372,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 		// side of an INNER/CROSS/LEFT join, so there is never an unmatched-RIGHT emission (RIGHT/FULL
 		// are excluded — a preserved side cannot be bounded per outer row). The whole ON/WHERE stays
 		// applied (the ON here, the WHERE below), so rows are unchanged.
-		if plan.relINLBounds[k+1] != nil {
+		if plan.phys.relINLBounds[k+1] != nil {
 			for _, left := range running {
 				rightRows, err := db.materializeRel(plan, k+1, params, outer, left, env.rng, env.ctes, meter)
 				if err != nil {
