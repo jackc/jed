@@ -582,43 +582,6 @@ func (db *engine) planSelect(sel *selectStmt, parent *scope, ctes []*cteBinding,
 			return nil, err
 		}
 	}
-	// Scan-bound pushdown, per base relation: detect WHERE conjuncts that bound that relation's
-	// scan — a PK range, else a secondary-index equality — so it seeks/ranges instead of walking
-	// the whole B-tree (cost.md §3 "bounded scan" / "index-bounded scan"; indexes.md §5). The
-	// filter is resolved against the full FROM scope, so a relation's column is the GLOBAL index
-	// rel.offset+local; isConstSource only accepts a literal/param/outer const (never a sibling
-	// column), so a JOIN base table is bounded only by a CONSTANT predicate on its own columns —
-	// `b.pk = a.x` (index-nested-loop) stays a full scan, a follow-on. Sound for outer joins too:
-	// a non-NULL conjunct in WHERE eliminates that relation's NULL-extended rows, so bounding it
-	// cannot drop a surviving row.
-	relBounds := make([]*scanBound, len(rels))
-	if filter != nil {
-		for i, rel := range rels {
-			// A set-returning relation or a derived table is a computed row source with no
-			// PK/index — it never bounds (functions.md §10, §42), so skip detection for it.
-			if srfPlans[i] != nil || derivedPlans[i] != nil {
-				continue
-			}
-			relBounds[i] = detectScanBound(filter, rel, db)
-		}
-	}
-	// Index-nested-loop pushdown (cost.md §3 "JOIN"): a join inner relation whose primary key /
-	// indexed column is compared to a SIBLING column of an earlier relation (`a JOIN b ON b.pk = a.x`)
-	// is re-materialized per outer row, seeking instead of full-scanning — O(N·M) → O(N·log M).
-	// Detected from the join's ON and the WHERE. Gated to a base table (an SRF / derived table / CTE /
-	// lateral item has no store to seek) that is the RIGHT/nullable side of an INNER/CROSS/LEFT join
-	// (a RIGHT/FULL preserved side cannot be bounded per outer row). rels[0] has no earlier relation;
-	// its join is sel.Joins[i-1]. A non-nil entry takes precedence over the once-materialized relBounds.
-	relINLBounds := make([]*scanBound, len(rels))
-	for i, rel := range rels {
-		if i == 0 || srfPlans[i] != nil || derivedPlans[i] != nil || rel.cte != nil || lateralFlags[i] {
-			continue
-		}
-		if k := sel.Joins[i-1].Kind; k != joinInner && k != joinCross && k != joinLeft {
-			continue
-		}
-		relINLBounds[i] = detectINLBound(joinPreds[i-1], filter, rel, db)
-	}
 	// ORDER BY resolution. In an aggregate query a key resolves against the GROUP KEYS — a
 	// grouping column gives its synthetic-row slot, a non-grouping column is 42803 (the
 	// grouping-error rule, grammar.md §18); the sort runs on the group rows. In a plain query
@@ -1097,6 +1060,43 @@ func (db *engine) planSelect(sel *selectStmt, parent *scope, ctes []*cteBinding,
 	relMasks := make([][]bool, len(planRels))
 	for i, rel := range planRels {
 		relMasks[i] = touched[rel.offset : rel.offset+rel.colCount]
+	}
+	// Scan-bound pushdown, per base relation: detect WHERE conjuncts that bound that relation's
+	// scan — a PK range, else a secondary-index equality — so it seeks/ranges instead of walking
+	// the whole B-tree (cost.md §3 "bounded scan" / "index-bounded scan"; indexes.md §5). The
+	// filter is resolved against the full FROM scope, so a relation's column is the GLOBAL index
+	// rel.offset+local; isConstSource only accepts a literal/param/outer const (never a sibling
+	// column), so a JOIN base table is bounded only by a CONSTANT predicate on its own columns —
+	// `b.pk = a.x` (index-nested-loop) stays a full scan, a follow-on. Sound for outer joins too:
+	// a non-NULL conjunct in WHERE eliminates that relation's NULL-extended rows, so bounding it
+	// cannot drop a surviving row.
+	relBounds := make([]*scanBound, len(rels))
+	if filter != nil {
+		for i, rel := range rels {
+			// A set-returning relation or a derived table is a computed row source with no
+			// PK/index — it never bounds (functions.md §10, §42), so skip detection for it.
+			if srfPlans[i] != nil || derivedPlans[i] != nil {
+				continue
+			}
+			relBounds[i] = detectScanBound(filter, rel, db)
+		}
+	}
+	// Index-nested-loop pushdown (cost.md §3 "JOIN"): a join inner relation whose primary key /
+	// indexed column is compared to a SIBLING column of an earlier relation (`a JOIN b ON b.pk = a.x`)
+	// is re-materialized per outer row, seeking instead of full-scanning — O(N·M) → O(N·log M).
+	// Detected from the join's ON and the WHERE. Gated to a base table (an SRF / derived table / CTE /
+	// lateral item has no store to seek) that is the RIGHT/nullable side of an INNER/CROSS/LEFT join
+	// (a RIGHT/FULL preserved side cannot be bounded per outer row). rels[0] has no earlier relation;
+	// its join is sel.Joins[i-1]. A non-nil entry takes precedence over the once-materialized relBounds.
+	relINLBounds := make([]*scanBound, len(rels))
+	for i, rel := range rels {
+		if i == 0 || srfPlans[i] != nil || derivedPlans[i] != nil || rel.cte != nil || lateralFlags[i] {
+			continue
+		}
+		if k := sel.Joins[i-1].Kind; k != joinInner && k != joinCross && k != joinLeft {
+			continue
+		}
+		relINLBounds[i] = detectINLBound(joinPreds[i-1], filter, rel, db)
 	}
 	// ORDER BY satisfied by primary-key scan order (spec/design/cost.md §3): a single base table,
 	// non-aggregate, non-DISTINCT SELECT whose ORDER BY keys are a prefix of the relation's PRIMARY
