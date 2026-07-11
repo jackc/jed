@@ -1703,7 +1703,8 @@ func (p *parser) parseDropSequence() (*dropSequence, error) {
 	return &dropSequence{Names: names, IfExists: ifExists}, nil
 }
 
-// parseAlterTable parses the catalog-only first ALTER TABLE slice (alter.md §1/§2).
+// parseAlterTable parses ALTER TABLE's authoritative grammar frame (alter.md §1). Slice 1 executes
+// only RENAME and catalog-only ALTER COLUMN edits; later ADD/DROP/TYPE forms report 0A000.
 func (p *parser) parseAlterTable() (*alterTable, error) {
 	if err := p.expectKeyword("alter"); err != nil {
 		return nil, err
@@ -1767,6 +1768,12 @@ func (p *parser) parseAlterTable() (*alterTable, error) {
 		return at, nil
 	}
 	for {
+		switch p.peekKeyword() {
+		case "add":
+			return nil, newError(FeatureNotSupported, "ALTER TABLE ... ADD is not supported yet")
+		case "drop":
+			return nil, newError(FeatureNotSupported, "ALTER TABLE ... DROP is not supported yet")
+		}
 		if err := p.expectKeyword("alter"); err != nil {
 			return nil, err
 		}
@@ -1790,6 +1797,8 @@ func (p *parser) parseAlterTable() (*alterTable, error) {
 				}
 				a.Kind = alterSetDefault
 				a.Default = &defaultDef{Expr: e, Text: renderTokens(p.tokens[start:p.pos])}
+			} else if p.peekKeyword() == "data" {
+				return nil, newError(FeatureNotSupported, "ALTER COLUMN ... TYPE is not supported yet")
 			} else {
 				if err := p.expectKeyword("not"); err != nil {
 					return nil, err
@@ -1813,6 +1822,8 @@ func (p *parser) parseAlterTable() (*alterTable, error) {
 				}
 				a.Kind = alterDropNotNull
 			}
+		case "type":
+			return nil, newError(FeatureNotSupported, "ALTER COLUMN ... TYPE is not supported yet")
 		default:
 			return nil, newError(SyntaxError, "ALTER COLUMN requires SET or DROP")
 		}

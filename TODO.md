@@ -131,7 +131,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   its own vertical slice + oracle/NoREC obligation)_
   - [x] _slice 1:_ grammar (`alter_table` production) + the multi-action all-or-nothing frame +
     `RENAME {TO | COLUMN | CONSTRAINT}` + `ALTER COLUMN SET/DROP DEFAULT` + `SET/DROP NOT NULL`
-    (catalog-only; `RENAME COLUMN` rewrites this table's stored expression text — alter.md §2.2). _(size: M)_
+    (catalog-only; `RENAME COLUMN` rewrites this table's stored expression text — alter.md §2.2).
+    Later-slice ADD/DROP/TYPE forms are recognized as `0A000`; PK-constraint rename is `42704`
+    because jed has no named PK catalog object (alter.md §2.3/§7). _(size: M)_
   - [ ] _slice 2:_ `ADD` / `DROP CONSTRAINT` (`CHECK`/`UNIQUE`/`FOREIGN KEY`/`EXCLUDE`) with the
     validating end-state scan — **retires** the `ALTER TABLE … ADD/DROP CONSTRAINT` follow-ons noted under
     the FOREIGN KEY and GiST/EXCLUDE items above (alter.md §2.6/§2.7). _(size: M)_
@@ -250,6 +252,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   Remaining: **multi-file atomic write** — 2PC via a super-journal, lifting the one-durable-writer
   rule. → [attached-databases.md](spec/design/attached-databases.md) _(size: L; deps: N-root commit
   (done); §9/§13)_
+  - [ ] _bug:_ Go read resolution ignores an explicit attachment qualifier when a same-named temp
+    table exists (`SELECT v FROM work.t` reads `temp.t`); Rust resolves the attachment correctly.
+    Add a three-core collision corpus and fix the Go scope funnel. _(size: S)_
 - [ ] **Streaming + spill-to-disk operators** — bound blocking operators (`ORDER BY`, hash `JOIN`, `GROUP BY`/aggregate, `DISTINCT`) by a memory budget and **spill to disk** when exceeded, so a query over larger-than-RAM data never materializes its whole input/output in memory. **Landed:** the **external merge sort for `ORDER BY`** (a `Sorter` bounded by `work_mem`, spills sorted runs + k-way merges, byte-for-byte identical to the in-memory sort). → [spill.md](spec/design/spill.md) _(size: XL; deps: paged storage; §9/§13)_
   - [ ] **Spilling hash aggregate / `DISTINCT` / hash JOIN** — the remaining blocking operators (spill.md §7). Each needs a *different* algorithm: a partitioned (grace) hash that preserves first-occurrence order for aggregate/DISTINCT, and — for hash JOIN — a hash-join operator first (jed joins are nested-loop today), then grace-hash spill to bound the build side. _(size: L–XL each)_
 - [ ] **Bench-driven perf follow-ons** — the measured gaps remaining after the `perf-point-lookup` work (which took `point_lookup_pk` past same-language PG clients in all 3 cores):

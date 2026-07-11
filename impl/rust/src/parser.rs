@@ -1445,8 +1445,8 @@ impl Parser {
         })
     }
 
-    /// Parse ALTER TABLE slice 1 (spec/design/alter.md §1/§2). `RENAME` is standalone; the
-    /// ordinary form is a comma-separated list of `ALTER [COLUMN]` actions.
+    /// Parse ALTER TABLE's authoritative grammar frame (alter.md §1). Slice 1 executes RENAME and
+    /// catalog-only ALTER COLUMN edits; later ADD/DROP/TYPE forms report 0A000.
     fn parse_alter_table(&mut self) -> Result<AlterTable> {
         self.expect_keyword("alter")?;
         self.expect_keyword("table")?;
@@ -1483,6 +1483,21 @@ impl Parser {
         } else {
             let mut actions = Vec::new();
             loop {
+                match self.peek_keyword().as_deref() {
+                    Some("add") => {
+                        return Err(EngineError::new(
+                            SqlState::FeatureNotSupported,
+                            "ALTER TABLE ... ADD is not supported yet".to_string(),
+                        ));
+                    }
+                    Some("drop") => {
+                        return Err(EngineError::new(
+                            SqlState::FeatureNotSupported,
+                            "ALTER TABLE ... DROP is not supported yet".to_string(),
+                        ));
+                    }
+                    _ => {}
+                }
                 self.expect_keyword("alter")?;
                 if self.peek_keyword().as_deref() == Some("column") {
                     self.advance();
@@ -1497,6 +1512,11 @@ impl Parser {
                             let expr = self.parse_expr()?;
                             let text = render_tokens(&self.tokens[start..self.pos]);
                             AlterColumnKind::SetDefault(DefaultDef { expr, text })
+                        } else if self.peek_keyword().as_deref() == Some("data") {
+                            return Err(EngineError::new(
+                                SqlState::FeatureNotSupported,
+                                "ALTER COLUMN ... TYPE is not supported yet".to_string(),
+                            ));
                         } else {
                             self.expect_keyword("not")?;
                             self.expect_keyword("null")?;
@@ -1513,6 +1533,12 @@ impl Parser {
                             self.expect_keyword("null")?;
                             AlterColumnKind::DropNotNull
                         }
+                    }
+                    Some("type") => {
+                        return Err(EngineError::new(
+                            SqlState::FeatureNotSupported,
+                            "ALTER COLUMN ... TYPE is not supported yet".to_string(),
+                        ));
                     }
                     other => return Err(syntax(format!("expected SET or DROP, found {other:?}"))),
                 };

@@ -991,7 +991,10 @@ impl Engine {
                 || matches!(stmt, Statement::CreateIndex(ci) if self.is_temp_table(&ci.table))
                 || matches!(stmt, Statement::DropIndex(di) if self.is_temp_index(&di.name))
                 || matches!(stmt, Statement::DropSequence(ds) if ds.names.iter().any(|n| self.is_temp_sequence(n)))
-                || matches!(stmt, Statement::AlterTable(at) if self.is_temp_table(&at.name))
+                || matches!(stmt, Statement::AlterTable(at) if match at.db.as_deref() {
+                    Some(q) => q.eq_ignore_ascii_case("temp"),
+                    None => self.is_temp_table(&at.name),
+                })
                 || matches!(stmt, Statement::AlterSequence(als) if self.is_temp_sequence(&als.name))
             {
                 self.session.allow_temp_ddl

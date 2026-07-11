@@ -1511,11 +1511,14 @@ impl Engine {
                         index_rename = Some((old.clone(), new.clone()));
                     }
                 }
-                if index_rename.is_some() && relation_taken(&new) {
-                    return Err(EngineError::new(
-                        SqlState::DuplicateTable,
-                        format!("relation already exists: {new}"),
-                    ));
+                if index_rename.is_some() {
+                    check_reserved_name("constraint", &new)?;
+                    if relation_taken(&new) {
+                        return Err(EngineError::new(
+                            SqlState::DuplicateTable,
+                            format!("relation already exists: {new}"),
+                        ));
+                    }
                 }
                 table.checks.sort_by_key(|x| x.name.to_ascii_lowercase());
                 table.indexes.sort_by_key(|x| x.name.to_ascii_lowercase());

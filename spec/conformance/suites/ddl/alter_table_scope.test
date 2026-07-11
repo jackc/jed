@@ -1,0 +1,41 @@
+# skip: disk — the host-attached in-memory database is handle-local and does not survive the disk
+# runner's per-record reopen.
+# ALTER TABLE must classify the DDL capability from the resolved qualifier, not only the bare table
+# name. A same-named temp table must never let allow_temp_ddl authorize a persistent attachment edit.
+# attach: work
+# requires: ddl.alter_table, ddl.create_table, ddl.temp_table, ddl.primary_key, attach.in_memory, harness.attach, session.allow_ddl, session.allow_temp_ddl, dml.insert, query.select, query.qualified_table, types.i32
+
+statement ok
+CREATE TABLE work.scope_target (id i32 PRIMARY KEY, v i32)
+
+statement ok
+CREATE TEMP TABLE scope_target (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO work.scope_target VALUES (1, 10)
+
+statement ok
+INSERT INTO temp.scope_target VALUES (1, 20)
+
+# The attachment is persistent DDL even though a temp table shares its unqualified name.
+# allow_ddl: off
+# allow_temp_ddl: on
+statement error 42501
+ALTER TABLE work.scope_target RENAME COLUMN v TO attached_changed
+
+# Conversely, an explicitly temp-qualified target is governed by allow_temp_ddl.
+# allow_ddl: on
+# allow_temp_ddl: off
+statement error 42501
+ALTER TABLE temp.scope_target RENAME COLUMN v TO temp_changed
+
+# The untrusted-scratch configuration permits only the temp edit.
+# allow_ddl: off
+# allow_temp_ddl: on
+statement ok
+ALTER TABLE temp.scope_target RENAME COLUMN v TO temp_changed
+
+query I nosort
+SELECT temp_changed FROM temp.scope_target WHERE id = 1
+----
+20

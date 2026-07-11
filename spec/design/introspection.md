@@ -110,6 +110,7 @@ message `{kind} name {name} is reserved (the jed_ prefix is reserved for system 
 | `CREATE TYPE … AS (…)` | the type name |
 | `ALTER SEQUENCE … RENAME TO` | the **new** name |
 | named `UNIQUE` / `EXCLUDE` constraint (`CONSTRAINT n UNIQUE (…)`, table- or column-level) | the constraint name — the constraint **is** its backing index (constraints.md §5, gist.md), so the user-written name enters the relation namespace |
+| `ALTER TABLE … RENAME CONSTRAINT … TO n` | the new name **only when** the target is `UNIQUE` / `EXCLUDE`; CHECK / FK remain table-local and exempt |
 
 **Engine-generated names are exempt.** A serial column's owned sequence `<table>_<col>_seq`
 (sequences.md §12.2) and an unnamed index's auto-name `<table>_<cols>_idx` (indexes.md §2) are

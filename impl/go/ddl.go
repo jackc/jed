@@ -1618,6 +1618,9 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 			}
 		}
 		if indexOld != "" {
+			if err := checkReservedName("constraint", next); err != nil {
+				return outcome{}, err
+			}
 			if relationTaken(next) {
 				return outcome{}, newError(DuplicateTable, "relation already exists: "+next)
 			}

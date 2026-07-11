@@ -380,7 +380,7 @@ func (db *engine) checkPrivileges(stmt statement) error {
 			(stmt.CreateIndex != nil && db.isTempTable(stmt.CreateIndex.Table)) ||
 			(stmt.DropIndex != nil && db.isTempIndex(stmt.DropIndex.Name)) ||
 			(stmt.DropSequence != nil && db.anyTempSequence(stmt.DropSequence.Names)) ||
-			(stmt.AlterTable != nil && db.isTempTable(stmt.AlterTable.Name)) ||
+			(stmt.AlterTable != nil && db.alterTableTargetsTemp(stmt.AlterTable)) ||
 			(stmt.AlterSequence != nil && db.isTempSequence(stmt.AlterSequence.Name)):
 			allowed = db.session.allowTempDDL
 		default:
@@ -413,6 +413,16 @@ func (db *engine) checkPrivileges(stmt statement) error {
 		}
 	}
 	return nil
+}
+
+// alterTableTargetsTemp classifies ALTER TABLE for the split DDL capability gate. An explicit
+// qualifier is authoritative: temp.t is temp DDL, while main.t and attachment.t are persistent DDL
+// even when a same-named temp table exists. A bare name follows the normal temp-first resolution.
+func (db *engine) alterTableTargetsTemp(at *alterTable) bool {
+	if at.DB != nil {
+		return strings.EqualFold(*at.DB, "temp")
+	}
+	return db.isTempTable(at.Name)
 }
 
 // gateReadLanes runs the admission gates that the lazy read lanes (tryScanQuery / tryDeferredQuery)

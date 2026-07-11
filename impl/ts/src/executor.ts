@@ -2333,7 +2333,8 @@ export class Engine {
         (stmt.kind === "createIndex" && this.isTempTable(stmt.table)) ||
         (stmt.kind === "dropIndex" && this.isTempIndex(stmt.name)) ||
         (stmt.kind === "dropSequence" && stmt.names.some((n) => this.isTempSequence(n))) ||
-        (stmt.kind === "alterTable" && this.isTempTable(stmt.name)) ||
+        (stmt.kind === "alterTable" &&
+          (stmt.db !== null ? stmt.db.toLowerCase() === "temp" : this.isTempTable(stmt.name))) ||
         (stmt.kind === "alterSequence" && this.isTempSequence(stmt.name))
       ) {
         allowed = this.session.allowTempDdl;
@@ -4340,8 +4341,11 @@ export class Engine {
           indexRename = { oldName: old, newName: next };
           return { ...i, name: next };
         });
-        if (indexRename && relationTaken(next))
-          throw engineError("duplicate_table", `relation already exists: ${next}`);
+        if (indexRename) {
+          checkReservedName("constraint", next);
+          if (relationTaken(next))
+            throw engineError("duplicate_table", `relation already exists: ${next}`);
+        }
         const byName = <T extends { name: string }>(a: T, b: T) =>
           a.name.toLowerCase() < b.name.toLowerCase()
             ? -1

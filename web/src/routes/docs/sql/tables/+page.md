@@ -4,7 +4,8 @@
 	const seed = `CREATE TABLE account (
   id      i32 PRIMARY KEY,
   owner   text NOT NULL,
-  balance numeric(12,2) NOT NULL CHECK (balance >= 0)
+  balance numeric(12,2) NOT NULL,
+  CONSTRAINT balance_nonnegative CHECK (balance >= 0)
 );
 INSERT INTO account VALUES (1, 'Ada', 100.00), (2, 'Grace', 50.00);
 CREATE TABLE txn (
@@ -55,7 +56,7 @@ Each is rejected before anything is written — a statement is all-or-nothing. S
 ALTER TABLE account RENAME COLUMN balance TO available_balance;
 ALTER TABLE account ALTER COLUMN available_balance SET DEFAULT 0;
 ALTER TABLE account ALTER COLUMN available_balance SET NOT NULL;
-ALTER TABLE account RENAME CONSTRAINT account_pkey TO account_id_key;
+ALTER TABLE account RENAME CONSTRAINT balance_nonnegative TO nonnegative_balance;
 ALTER TABLE account RENAME TO ledger_account;
 ```
 
@@ -75,7 +76,9 @@ table.
 
 This first ALTER TABLE slice does not yet add or drop columns or constraints, change column types,
 or manage identity properties. Identity-column defaults and nullability must be managed through the
-future identity-specific syntax rather than the generic column actions.
+future identity-specific syntax rather than the generic column actions. PRIMARY KEY has no persisted
+constraint object yet, so renaming the derived `account_pkey` handle reports `42704`; that form is
+deferred with primary-key alteration.
 
 ## Exclusion constraints — `EXCLUDE`
 

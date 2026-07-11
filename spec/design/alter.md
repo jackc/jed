@@ -12,7 +12,7 @@
 > **Status: Slice 1 landed.** The canonical grammar and all three native cores implement the
 > catalog-only frame: `RENAME {TO | COLUMN | CONSTRAINT}`, `ALTER COLUMN SET/DROP DEFAULT`, and
 > `SET/DROP NOT NULL`, including comma-action atomicity and the validating NOT NULL scan. Slices
-> 2–5 below remain designed but unimplemented.
+> 2–5 below remain designed but unimplemented; their grammar is recognized and reports `0A000`.
 
 `ALTER TABLE` mutates a table's definition in place — its columns, its constraints, its
 name. It is the last major DDL gap: `CREATE TABLE` / `DROP TABLE` / `CREATE INDEX` /
@@ -115,9 +115,18 @@ is its own slice.)
 
 ### 2.3 `RENAME CONSTRAINT … TO …`
 
-Change a constraint's catalog name. `42704` if unknown. For a UNIQUE / PK / EXCLUDE
+Change a constraint's catalog name. `42704` if unknown, `42710` if the new name already names
+a constraint of the table (rename-to-self included, PG-faithful). For a UNIQUE / EXCLUDE
 constraint the backing index shares the name; renaming the constraint renames the backing
-index with it (they are one object — [indexes.md §8](indexes.md)).
+index and its store with it (they are one object — [indexes.md §8](indexes.md)). Because that
+name also lives in the relation namespace, a relation collision is `42P07` and the reserved
+`jed_` prefix is `42939`; CHECK / FK names remain exempt because they own no relation
+([introspection.md §4](introspection.md)).
+
+**Deliberate PG divergence (ledgered §7):** jed persists/reserves no PRIMARY KEY constraint
+object — the `<t>_pkey` name is derived for introspection. Therefore `RENAME CONSTRAINT
+<t>_pkey TO …` is `42704`, where PostgreSQL renames it. Persisting a custom PK name needs a
+new catalog field, so it is deferred with the PK re-key slice (§3.4).
 
 ### 2.4 `ALTER COLUMN … SET DEFAULT expr` / `DROP DEFAULT`
 
@@ -255,6 +264,8 @@ already exist — a small follow-on, not scheduled.
 | Dropped column | Physically removed; ordinals compacted; name/position reusable (§3.2) | Tombstoned (`attisdropped`); dead bytes retained; ordinal never reused | Dense-ordinal format has no tombstone slot; rewrite keeps the file clean (§0.1, CLAUDE.md §10) |
 | Validation timing | End-state (§4) | Per-row transient | jed's standing end-state model (constraints.md §6.5); a finally-valid re-key succeeds |
 | Column rename | Rewrites this table's stored expression text (§2.2) | Same effect via dependency graph | jed stores expression *text*, not a resolved node tree (§0.2) |
+| Rename PK constraint | `<t>_pkey` is `42704` — no named PK object (§2.3) | Renames the auto-named `<t>_pkey` | jed persists no PK/NOT NULL constraint object; a custom PK name needs a format field — deferred with §3.4 |
+| ALTER TABLE on a non-table | `42809` for an index or sequence | Lenient for some relation kinds | jed's ALTER TABLE owns only the table surface; object-specific ALTER statements remain separate |
 
 ## 8. Slicing
 

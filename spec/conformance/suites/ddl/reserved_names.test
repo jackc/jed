@@ -9,7 +9,7 @@
 # and engine-GENERATED names — a serial's <table>_<col>_seq and an index auto-name both stay legal
 # for a table named jed. IF NOT EXISTS does not suppress the error (a reservation is not a
 # collision).
-# requires: ddl.create_table, ddl.primary_key, ddl.temp_table, session.allow_temp_ddl, ddl.secondary_index, ddl.unique, ddl.exclusion_constraint, ddl.check, ddl.sequence, ddl.alter_sequence, ddl.serial, func.sequence, types.composite, types.range, dml.insert, dml.insert_column_list, query.select, types.i32
+# requires: ddl.create_table, ddl.primary_key, ddl.temp_table, session.allow_temp_ddl, ddl.secondary_index, ddl.unique, ddl.exclusion_constraint, ddl.check, ddl.sequence, ddl.alter_sequence, ddl.alter_table, ddl.serial, func.sequence, types.composite, types.range, dml.insert, dml.insert_column_list, query.select, types.i32
 
 # --- the relation namespace: tables (persistent + TEMP), case-insensitively ------------------------
 
@@ -100,3 +100,30 @@ SELECT id, v FROM jed
 # the unnamed index auto-names itself jed_v_idx (indexes.md §2) — legal
 statement ok
 CREATE INDEX ON jed (v)
+
+# --- ALTER TABLE RENAME CONSTRAINT preserves the same namespace boundary ------------------------
+
+# CHECK owns no relation, so jed_ remains legal in its table-local constraint namespace.
+statement ok
+CREATE TABLE alter_check_reserved (id i32 PRIMARY KEY, v i32, CONSTRAINT ck CHECK (v > 0))
+
+statement ok
+ALTER TABLE alter_check_reserved RENAME CONSTRAINT ck TO jed_check
+
+# UNIQUE owns a B-tree relation, so renaming it into the reserved relation namespace is 42939.
+statement ok
+CREATE TABLE alter_unique_reserved (id i32 PRIMARY KEY, v i32, CONSTRAINT uq UNIQUE (v))
+
+statement error 42939
+ALTER TABLE alter_unique_reserved RENAME CONSTRAINT uq TO jed_unique
+
+# The failed rename is atomic: the original constraint handle remains usable.
+statement ok
+ALTER TABLE alter_unique_reserved RENAME CONSTRAINT uq TO uq2
+
+# EXCLUDE likewise owns a GiST relation and must reject a reserved new name.
+statement ok
+CREATE TABLE alter_exclude_reserved (id i32 PRIMARY KEY, span int4range, CONSTRAINT ex EXCLUDE USING gist (span WITH &&))
+
+statement error 42939
+ALTER TABLE alter_exclude_reserved RENAME CONSTRAINT ex TO jed_exclude

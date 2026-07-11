@@ -1253,7 +1253,8 @@ class Parser {
     return { kind: "dropSequence", names, ifExists };
   }
 
-  // parseAlterTable parses the catalog-only first ALTER TABLE slice (alter.md §1/§2).
+  // Parse ALTER TABLE's authoritative grammar frame (alter.md §1). Slice 1 executes RENAME and
+  // catalog-only ALTER COLUMN edits; later ADD/DROP/TYPE forms report 0A000.
   private parseAlterTable(): Statement {
     this.expectKeyword("alter");
     this.expectKeyword("table");
@@ -1301,6 +1302,10 @@ class Parser {
     }
     const actions: AlterColumnAction[] = [];
     for (;;) {
+      if (this.peekKeyword() === "add")
+        throw engineError("feature_not_supported", "ALTER TABLE ... ADD is not supported yet");
+      if (this.peekKeyword() === "drop")
+        throw engineError("feature_not_supported", "ALTER TABLE ... DROP is not supported yet");
       this.expectKeyword("alter");
       if (this.peekKeyword() === "column") this.advance();
       const column = this.expectIdentifier();
@@ -1317,6 +1322,8 @@ class Parser {
               default: { expr, text: renderTokens(this.tokens.slice(start, this.pos)) },
             },
           });
+        } else if (this.peekKeyword() === "data") {
+          throw engineError("feature_not_supported", "ALTER COLUMN ... TYPE is not supported yet");
         } else {
           this.expectKeyword("not");
           this.expectKeyword("null");
@@ -1332,6 +1339,8 @@ class Parser {
           this.expectKeyword("null");
           actions.push({ column, action: { kind: "dropNotNull" } });
         }
+      } else if (this.peekKeyword() === "type") {
+        throw engineError("feature_not_supported", "ALTER COLUMN ... TYPE is not supported yet");
       } else {
         throw engineError("syntax_error", "ALTER COLUMN requires SET or DROP");
       }
