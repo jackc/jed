@@ -121,6 +121,30 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ the `WITH (OLD AS o, NEW AS n)` aliasing form; `old.*`/`new.*`.
 - [x] **`UPSERT` / `ON CONFLICT`** — `INSERT … ON CONFLICT [target] { DO NOTHING | DO UPDATE SET … [WHERE …] }`; the `excluded` pseudo-relation; column-SET or `ON CONSTRAINT name` arbiter; two-phase / all-or-nothing. → [upsert.md](spec/design/upsert.md), [grammar.md §46](spec/design/grammar.md)
   - [ ] _follow-on:_ `DO UPDATE SET col = DEFAULT` (with the `UPDATE` `SET = DEFAULT` follow-on); `INSERT INTO t AS alias`; the partial-index `WHERE index_predicate` / `COLLATE`/opclass inference decorations; relaxing the DO UPDATE PK-column assignment (`0A000`) — the standalone UPDATE re-keying has landed, but the conflict-path re-key is still deferred. → [upsert.md §10](spec/design/upsert.md)
+- [ ] **`ALTER TABLE`** — the last major DDL gap (a created table's shape is currently frozen).
+  Designed spec-first in [alter.md](spec/design/alter.md); sliced lowest-risk → highest. Two mechanical
+  facts drive it (alter.md §0): columns are identified by **dense 0-based ordinal** referenced
+  positionally everywhere (PK/index/FK/EXCLUDE), and `CHECK`/`DEFAULT`/index/predicate expressions are
+  stored as **re-resolved text** — so a rename must rewrite that text and a drop must renumber ordinals.
+  This splits into catalog-only edits (no `format_version` bump) and table rewrites (rebuild the B-tree,
+  but still emit an ordinary current-format table — also no bump). _(size: L overall; each slice below is
+  its own vertical slice + oracle/NoREC obligation)_
+  - [ ] _slice 1:_ grammar (`alter_table` production) + the multi-action all-or-nothing frame +
+    `RENAME {TO | COLUMN | CONSTRAINT}` + `ALTER COLUMN SET/DROP DEFAULT` + `SET/DROP NOT NULL`
+    (catalog-only; `RENAME COLUMN` rewrites this table's stored expression text — alter.md §2.2). _(size: M)_
+  - [ ] _slice 2:_ `ADD` / `DROP CONSTRAINT` (`CHECK`/`UNIQUE`/`FOREIGN KEY`/`EXCLUDE`) with the
+    validating end-state scan — **retires** the `ALTER TABLE … ADD/DROP CONSTRAINT` follow-ons noted under
+    the FOREIGN KEY and GiST/EXCLUDE items above (alter.md §2.6/§2.7). _(size: M)_
+  - [ ] _slice 3:_ `ADD COLUMN [constraints]` — the first rewrite; per-row `DEFAULT` evaluation through
+    the entropy/clock seam (alter.md §3.1). _(size: L)_
+  - [ ] _slice 4:_ `DROP COLUMN` — the ordinal renumber + `RESTRICT`/`CASCADE` dependency handling
+    (non-PK columns); ledgered PG divergence: jed physically removes, no `attisdropped` tombstone
+    (alter.md §3.2). _(size: L)_
+  - [ ] _slice 5:_ `ALTER COLUMN … TYPE … [USING]` + `ADD`/`DROP PRIMARY KEY` — the re-encode/re-key
+    rewrites (the PK forms reuse the existing UPDATE-of-PK re-keying path — alter.md §3.3/§3.4). _(size: L)_
+  - [ ] _deferred:_ identity management (`ALTER COLUMN … ADD/DROP/SET GENERATED …`) — plausible once
+    scheduled; the rest of PG's menu (OWNER/RLS/triggers/partitions/tablespaces/schemas/storage knobs) is
+    deliberately out of scope, `0A000` (alter.md §6).
 - [ ] **Temporary tables — slice 3: spill-to-disk** — the rest of the feature is landed: session-local
   temp relations with zero writes to the database file, each domain a per-session in-RAM
   `MemoryBlockStore` + pinned pager with within-session compaction and a page-based `54P03` budget;
