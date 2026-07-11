@@ -9,10 +9,10 @@
 > reproduce identically (CLAUDE.md §2, §8). When a decision here changes, change the
 > data/grammar and here in the same edit.
 >
-> **Status: Slice 1 landed.** The canonical grammar and all three native cores implement the
-> catalog-only frame: `RENAME {TO | COLUMN | CONSTRAINT}`, `ALTER COLUMN SET/DROP DEFAULT`, and
-> `SET/DROP NOT NULL`, including comma-action atomicity and the validating NOT NULL scan. Slices
-> 2–5 below remain designed but unimplemented; their grammar is recognized and reports `0A000`.
+> **Status: Slices 1–2 landed.** The canonical grammar and all three native cores implement the
+> catalog-only frame: renames, column defaults/nullability, and `ADD`/`DROP CONSTRAINT` for CHECK,
+> UNIQUE, FOREIGN KEY, and EXCLUDE, including comma-action atomicity and validating scans. Slices
+> 3–5 remain designed but unimplemented; their grammar is recognized and reports `0A000`.
 
 `ALTER TABLE` mutates a table's definition in place — its columns, its constraints, its
 name. It is the last major DDL gap: `CREATE TABLE` / `DROP TABLE` / `CREATE INDEX` /
@@ -274,7 +274,7 @@ Ordered lowest-risk → highest, each a vertical slice (CLAUDE.md §10):
 1. **✅ Grammar + `RENAME` + the catalog-only column edits** — `alter_table` production, the
    multi-action all-or-nothing frame, `RENAME {TO | COLUMN | CONSTRAINT}`, `SET/DROP DEFAULT`,
    `SET/DROP NOT NULL`. Zero format risk; establishes the whole scaffold.
-2. **`ADD` / `DROP CONSTRAINT`** — `CHECK` / `UNIQUE` / `FOREIGN KEY` / `EXCLUDE` with the
+2. **✅ `ADD` / `DROP CONSTRAINT`** — `CHECK` / `UNIQUE` / `FOREIGN KEY` / `EXCLUDE` with the
    validating scan (retires the FK/EXCLUDE `ADD CONSTRAINT` follow-ons in TODO).
 3. **`ADD COLUMN`** — the first rewrite; per-row default evaluation.
 4. **`DROP COLUMN`** — the ordinal renumber + dependency cascade (non-PK columns).

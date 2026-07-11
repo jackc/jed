@@ -4,6 +4,19 @@
 
 use super::*;
 
+fn constraint_name_taken(t: &Table, name: &str) -> bool {
+    t.checks.iter().any(|c| c.name.eq_ignore_ascii_case(name))
+        || t.indexes
+            .iter()
+            .any(|i| i.unique && i.name.eq_ignore_ascii_case(name))
+        || t.foreign_keys
+            .iter()
+            .any(|f| f.name.eq_ignore_ascii_case(name))
+        || t.exclusions
+            .iter()
+            .any(|e| e.name.eq_ignore_ascii_case(name))
+}
+
 impl Engine {
     /// Dispatch one parsed statement to its executor. The autocommit transaction handling
     /// (capture / durable commit / rollback-on-error) lives in `execute_stmt_params`.
@@ -1365,7 +1378,7 @@ impl Engine {
         })
     }
 
-    /// Execute ALTER TABLE slice 1 (alter.md §1/§2): catalog-only renames/defaults/nullability.
+    /// Execute ALTER TABLE slices 1-2 (alter.md §1/§2): catalog-only edits and constraints.
     pub(crate) fn execute_alter_table(&mut self, at: AlterTable) -> Result<Outcome> {
         check_catalog_rel_write(&at.name)?;
         self.check_attachment_writable(at.db.as_deref())?;
@@ -1412,6 +1425,8 @@ impl Engine {
         let mut table = original.clone();
         let mut rename_table = false;
         let mut index_rename: Option<(String, String)> = None;
+        let mut added_constraints = std::collections::HashSet::<String>::new();
+        let mut cascade_unique_cols = Vec::<Vec<usize>>::new();
         let attachment_scope = at
             .db
             .as_deref()
@@ -1529,8 +1544,425 @@ impl Engine {
                     .exclusions
                     .sort_by_key(|x| x.name.to_ascii_lowercase());
             }
-            AlterTableAction::AlterColumns(actions) => {
-                for edit in actions {
+            AlterTableAction::Actions(actions) => {
+                for action in actions {
+                    if let AlterTableEdit::AddConstraint(def) = action {
+                        match def {
+                            AlterConstraintDef::Check(d) => {
+                                reject_check_structure(&d.expr)?;
+                                let (_, ty) = resolve(
+                                    &Scope::single(self, &table),
+                                    &d.expr,
+                                    None,
+                                    &mut AggCtx::Forbidden,
+                                    &mut ParamTypes::default(),
+                                )?;
+                                if !matches!(ty, ResolvedType::Bool | ResolvedType::Null) {
+                                    return Err(type_error("argument of CHECK must be boolean"));
+                                }
+                                let mut name = d.name.clone().unwrap_or_else(|| {
+                                    format!("{}_check", table.name.to_ascii_lowercase())
+                                });
+                                if d.name.is_none() {
+                                    let rs = check_referenced_columns(&d.expr, &table.columns);
+                                    if rs.len() == 1 {
+                                        name = format!(
+                                            "{}_{}_check",
+                                            table.name.to_ascii_lowercase(),
+                                            table.columns[rs[0]].name.to_ascii_lowercase()
+                                        );
+                                    }
+                                }
+                                if constraint_name_taken(&table, &name) {
+                                    return Err(EngineError::new(
+                                        SqlState::DuplicateObject,
+                                        format!(
+                                            "constraint {name} for relation {} already exists",
+                                            table.name
+                                        ),
+                                    ));
+                                }
+                                table.checks.push(CheckConstraint {
+                                    name: name.clone(),
+                                    expr_text: d.text,
+                                    expr: d.expr,
+                                });
+                                table.checks.sort_by_key(|x| x.name.to_ascii_lowercase());
+                                added_constraints.insert(name.to_ascii_lowercase());
+                            }
+                            AlterConstraintDef::Unique(d) => {
+                                let mut cols = Vec::new();
+                                for n in d.columns {
+                                    let Some(ci) = table
+                                        .columns
+                                        .iter()
+                                        .position(|c| c.name.eq_ignore_ascii_case(&n))
+                                    else {
+                                        return Err(EngineError::new(
+                                            SqlState::UndefinedColumn,
+                                            format!("column {n} named in key does not exist"),
+                                        ));
+                                    };
+                                    if cols.contains(&ci) {
+                                        return Err(EngineError::new(
+                                            SqlState::DuplicateColumn,
+                                            format!(
+                                                "column {n} appears twice in unique constraint"
+                                            ),
+                                        ));
+                                    }
+                                    cols.push(ci)
+                                }
+                                for &ci in &cols {
+                                    let ty = &table.columns[ci].ty;
+                                    if !ty.is_integer()
+                                        && !ty.is_bool()
+                                        && !ty.is_text()
+                                        && !ty.is_bytea()
+                                        && !ty.is_decimal()
+                                        && !ty.is_uuid()
+                                        && !ty.is_timestamp()
+                                        && !ty.is_timestamptz()
+                                        && !ty.is_date()
+                                        && !ty.is_interval()
+                                        && !ty.is_float()
+                                        && !ty.is_range()
+                                        && !is_array_keyable(ty)
+                                    {
+                                        return Err(EngineError::new(
+                                            SqlState::FeatureNotSupported,
+                                            format!(
+                                                "a {} unique constraint member is not supported yet",
+                                                ty.canonical_name()
+                                            ),
+                                        ));
+                                    }
+                                }
+                                let name = d.name.unwrap_or_else(|| {
+                                    format!(
+                                        "{}_{}_key",
+                                        table.name.to_ascii_lowercase(),
+                                        cols.iter()
+                                            .map(|i| table.columns[*i].name.to_ascii_lowercase())
+                                            .collect::<Vec<_>>()
+                                            .join("_")
+                                    )
+                                });
+                                check_reserved_name("constraint", &name)?;
+                                if relation_taken(&name) {
+                                    return Err(EngineError::new(
+                                        SqlState::DuplicateTable,
+                                        format!("relation already exists: {name}"),
+                                    ));
+                                }
+                                if constraint_name_taken(&table, &name) {
+                                    return Err(EngineError::new(
+                                        SqlState::DuplicateObject,
+                                        format!(
+                                            "constraint {name} for relation {} already exists",
+                                            table.name
+                                        ),
+                                    ));
+                                }
+                                table.indexes.push(IndexDef {
+                                    name: name.clone(),
+                                    keys: cols.into_iter().map(IndexKey::Column).collect(),
+                                    unique: true,
+                                    kind: IndexKind::Btree,
+                                    predicate: None,
+                                });
+                                table.indexes.sort_by_key(|x| x.name.to_ascii_lowercase());
+                                added_constraints.insert(name.to_ascii_lowercase());
+                            }
+                            AlterConstraintDef::ForeignKey(d) => {
+                                let mut local = Vec::new();
+                                for n in d.columns {
+                                    let Some(ci) = table
+                                        .columns
+                                        .iter()
+                                        .position(|c| c.name.eq_ignore_ascii_case(&n))
+                                    else {
+                                        return Err(EngineError::new(
+                                            SqlState::UndefinedColumn,
+                                            format!("column {n} named in key does not exist"),
+                                        ));
+                                    };
+                                    if local.contains(&ci) {
+                                        return Err(EngineError::new(
+                                            SqlState::DuplicateColumn,
+                                            format!(
+                                                "column {n} appears twice in foreign key constraint"
+                                            ),
+                                        ));
+                                    }
+                                    local.push(ci)
+                                }
+                                let parent = if d.ref_table.eq_ignore_ascii_case(&table.name) {
+                                    table.clone()
+                                } else {
+                                    snap.table(&d.ref_table).cloned().ok_or_else(|| {
+                                        EngineError::new(
+                                            SqlState::UndefinedTable,
+                                            format!("table does not exist: {}", d.ref_table),
+                                        )
+                                    })?
+                                };
+                                let refs = if let Some(ns) = d.ref_columns {
+                                    let mut r = Vec::new();
+                                    for n in ns {
+                                        let Some(i) = parent
+                                            .columns
+                                            .iter()
+                                            .position(|c| c.name.eq_ignore_ascii_case(&n))
+                                        else {
+                                            return Err(EngineError::new(
+                                                SqlState::UndefinedColumn,
+                                                format!("column {n} named in key does not exist"),
+                                            ));
+                                        };
+                                        r.push(i)
+                                    }
+                                    r
+                                } else {
+                                    if parent.pk.is_empty() {
+                                        return Err(EngineError::new(
+                                            SqlState::UndefinedObject,
+                                            format!(
+                                                "there is no primary key for referenced table {}",
+                                                parent.name
+                                            ),
+                                        ));
+                                    }
+                                    parent.pk.clone()
+                                };
+                                if local.len() != refs.len() {
+                                    return Err(EngineError::new(
+                                        SqlState::InvalidForeignKey,
+                                        "number of referencing and referenced columns for foreign key disagree",
+                                    ));
+                                }
+                                let rs = sorted_unique(&refs);
+                                if !(sorted_unique(&parent.pk) == rs
+                                    || parent.indexes.iter().any(|i| {
+                                        i.unique
+                                            && i.column_ordinals()
+                                                .is_some_and(|x| sorted_unique(&x) == rs)
+                                    }))
+                                {
+                                    return Err(EngineError::new(
+                                        SqlState::InvalidForeignKey,
+                                        format!(
+                                            "there is no unique constraint matching given keys for referenced table {}",
+                                            parent.name
+                                        ),
+                                    ));
+                                }
+                                let name = d.name.unwrap_or_else(|| {
+                                    format!(
+                                        "{}_{}_fkey",
+                                        table.name.to_ascii_lowercase(),
+                                        local
+                                            .iter()
+                                            .map(|i| table.columns[*i].name.to_ascii_lowercase())
+                                            .collect::<Vec<_>>()
+                                            .join("_")
+                                    )
+                                });
+                                if constraint_name_taken(&table, &name) {
+                                    return Err(EngineError::new(
+                                        SqlState::DuplicateObject,
+                                        format!(
+                                            "constraint {name} for relation {} already exists",
+                                            table.name
+                                        ),
+                                    ));
+                                }
+                                for (&li, &ri) in local.iter().zip(&refs) {
+                                    if table.columns[li].ty != parent.columns[ri].ty {
+                                        return Err(EngineError::new(
+                                            SqlState::DatatypeMismatch,
+                                            format!(
+                                                "foreign key constraint {name} cannot be implemented: key columns {} and {} are of incompatible types: {} and {}",
+                                                table.columns[li].name,
+                                                parent.columns[ri].name,
+                                                table.columns[li].ty.canonical_name(),
+                                                parent.columns[ri].ty.canonical_name()
+                                            ),
+                                        ));
+                                    }
+                                }
+                                table.foreign_keys.push(ForeignKeyConstraint {
+                                    name: name.clone(),
+                                    columns: local,
+                                    ref_table: parent.name,
+                                    ref_columns: refs,
+                                    on_delete: fk_action(d.on_delete, "DELETE")?,
+                                    on_update: fk_action(d.on_update, "UPDATE")?,
+                                });
+                                table
+                                    .foreign_keys
+                                    .sort_by_key(|x| x.name.to_ascii_lowercase());
+                                added_constraints.insert(name.to_ascii_lowercase());
+                            }
+                            AlterConstraintDef::Exclude(d) => {
+                                if d.using
+                                    .as_deref()
+                                    .is_some_and(|x| !x.eq_ignore_ascii_case("gist"))
+                                {
+                                    return Err(EngineError::new(
+                                        SqlState::UndefinedObject,
+                                        format!(
+                                            "access method {} does not support exclusion constraints",
+                                            d.using.unwrap()
+                                        ),
+                                    ));
+                                }
+                                let mut cols = Vec::new();
+                                let mut els = Vec::new();
+                                for (n, op) in d.elements {
+                                    let Some(ci) = table
+                                        .columns
+                                        .iter()
+                                        .position(|c| c.name.eq_ignore_ascii_case(&n))
+                                    else {
+                                        return Err(EngineError::new(
+                                            SqlState::UndefinedColumn,
+                                            format!("column {n} named in key does not exist"),
+                                        ));
+                                    };
+                                    let eop = if op == "&&" {
+                                        if !matches!(table.columns[ci].ty, Type::Range(_)) {
+                                            return Err(EngineError::new(
+                                                SqlState::UndefinedObject,
+                                                "data type has no default operator class for access method gist",
+                                            ));
+                                        }
+                                        ExclusionOp::Overlaps
+                                    } else {
+                                        ExclusionOp::Equal
+                                    };
+                                    cols.push(ci);
+                                    els.push(ExclusionElement {
+                                        column: ci,
+                                        op: eop,
+                                    })
+                                }
+                                let name = d.name.unwrap_or_else(|| {
+                                    format!(
+                                        "{}_{}_excl",
+                                        table.name.to_ascii_lowercase(),
+                                        cols.iter()
+                                            .map(|i| table.columns[*i].name.to_ascii_lowercase())
+                                            .collect::<Vec<_>>()
+                                            .join("_")
+                                    )
+                                });
+                                check_reserved_name("constraint", &name)?;
+                                if relation_taken(&name) {
+                                    return Err(EngineError::new(
+                                        SqlState::DuplicateTable,
+                                        format!("relation already exists: {name}"),
+                                    ));
+                                }
+                                table.indexes.push(IndexDef {
+                                    name: name.clone(),
+                                    keys: cols.into_iter().map(IndexKey::Column).collect(),
+                                    unique: false,
+                                    kind: IndexKind::Gist,
+                                    predicate: None,
+                                });
+                                table.exclusions.push(ExclusionConstraint {
+                                    name: name.clone(),
+                                    index: name.clone(),
+                                    elements: els,
+                                });
+                                table.indexes.sort_by_key(|x| x.name.to_ascii_lowercase());
+                                table
+                                    .exclusions
+                                    .sort_by_key(|x| x.name.to_ascii_lowercase());
+                                added_constraints.insert(name.to_ascii_lowercase());
+                            }
+                        }
+                        continue;
+                    }
+                    if let AlterTableEdit::DropConstraint {
+                        name,
+                        if_exists,
+                        cascade,
+                    } = action
+                    {
+                        let k = name.to_ascii_lowercase();
+                        let mut found = false;
+                        let n = table.checks.len();
+                        table.checks.retain(|x| !x.name.eq_ignore_ascii_case(&name));
+                        found |= n != table.checks.len();
+                        let n = table.foreign_keys.len();
+                        table
+                            .foreign_keys
+                            .retain(|x| !x.name.eq_ignore_ascii_case(&name));
+                        found |= n != table.foreign_keys.len();
+                        if let Some(e) = table
+                            .exclusions
+                            .iter()
+                            .find(|x| x.name.eq_ignore_ascii_case(&name))
+                            .cloned()
+                        {
+                            table
+                                .exclusions
+                                .retain(|x| !x.name.eq_ignore_ascii_case(&name));
+                            table
+                                .indexes
+                                .retain(|x| !x.name.eq_ignore_ascii_case(&e.index));
+                            found = true;
+                        }
+                        if let Some(ix) = table
+                            .indexes
+                            .iter()
+                            .find(|x| x.unique && x.name.eq_ignore_ascii_case(&name))
+                            .cloned()
+                        {
+                            let cols = sorted_unique(&ix.column_ordinals().unwrap());
+                            let deps = table
+                                .foreign_keys
+                                .iter()
+                                .chain(snap.tables.values().flat_map(|t| t.foreign_keys.iter()))
+                                .filter(|f| {
+                                    f.ref_table.eq_ignore_ascii_case(&table.name)
+                                        && sorted_unique(&f.ref_columns) == cols
+                                })
+                                .count();
+                            if deps > 0 && !cascade {
+                                return Err(EngineError::new(
+                                    SqlState::DependentObjectsStillExist,
+                                    format!(
+                                        "cannot drop constraint {name} because other objects depend on it"
+                                    ),
+                                ));
+                            }
+                            if cascade {
+                                cascade_unique_cols.push(cols.clone());
+                                table.foreign_keys.retain(|f| {
+                                    !(f.ref_table.eq_ignore_ascii_case(&table.name)
+                                        && sorted_unique(&f.ref_columns) == cols)
+                                });
+                            }
+                            table
+                                .indexes
+                                .retain(|x| !x.name.eq_ignore_ascii_case(&name));
+                            found = true;
+                        }
+                        if !found && !if_exists {
+                            return Err(EngineError::new(
+                                SqlState::UndefinedObject,
+                                format!("constraint does not exist: {name}"),
+                            ));
+                        }
+                        added_constraints.remove(&k);
+                        continue;
+                    }
+                    let AlterTableEdit::AlterColumn(edit) = action else {
+                        unreachable!()
+                    };
                     let Some(ci) = table
                         .columns
                         .iter()
@@ -1607,27 +2039,123 @@ impl Engine {
                 }
             }
         }
-        let ir = index_rename.as_ref().map(|(a, b)| (a.as_str(), b.as_str()));
-        match at.db.as_deref().map(str::to_ascii_lowercase) {
-            None if self.is_temp_table(&original.name) => self
-                .temp_working_mut()
-                .alter_table_catalog(&old_key, table, rename_table, ir),
-            None => self
-                .working_mut()
-                .alter_table_catalog(&old_key, table, rename_table, ir),
-            Some(q) if q == "temp" => {
-                self.temp_working_mut()
-                    .alter_table_catalog(&old_key, table, rename_table, ir)
+        let mut constraint_entries = std::collections::HashMap::<String, Vec<Vec<u8>>>::new();
+        if !added_constraints.is_empty() {
+            let all_mask = vec![true; table.columns.len()];
+            let store = self.store_scoped(at.db.as_deref(), &original.name);
+            let (rows, pages, slabs) = store.scan_with_units(&all_mask)?;
+            meter.charge(COSTS.page_read * pages as i64 + COSTS.value_decompress * slabs as i64);
+            let checks = self.resolve_checks(&table)?;
+            let colls = self.column_collations(&table.columns);
+            let mut seen =
+                std::collections::HashMap::<String, std::collections::HashSet<Vec<u8>>>::new();
+            let rng = std::cell::Cell::new(crate::seam::StmtRng::new());
+            for (key, mut row) in rows.iter().cloned() {
+                meter.guard()?;
+                meter.charge(COSTS.storage_row_read);
+                store.resolve_inline_columns(&mut row)?;
+                for ck in checks
+                    .iter()
+                    .filter(|(n, _)| added_constraints.contains(&n.to_ascii_lowercase()))
+                {
+                    self.eval_checks(
+                        std::slice::from_ref(ck),
+                        &row,
+                        &rng,
+                        &table.name,
+                        &mut meter,
+                    )?;
+                }
+                for ix in table
+                    .indexes
+                    .iter()
+                    .filter(|i| added_constraints.contains(&i.name.to_ascii_lowercase()))
+                {
+                    let ri = self.resolve_index(&table, ix)?;
+                    if ix.unique {
+                        if let Some(p) = self.index_prefix(&table.columns, &colls, &ri, &row)? {
+                            let s = seen.entry(ix.name.to_ascii_lowercase()).or_default();
+                            if !s.insert(p) {
+                                return Err(EngineError::unique_violation(&table.name, &ix.name));
+                            }
+                        }
+                    }
+                    constraint_entries
+                        .entry(ix.name.to_ascii_lowercase())
+                        .or_default()
+                        .extend(self.index_entries(&table.columns, &colls, &ri, &key, &row)?);
+                }
             }
-            Some(q) if q == "main" => {
-                self.working_mut()
-                    .alter_table_catalog(&old_key, table, rename_table, ir)
+            for fk in table
+                .foreign_keys
+                .iter()
+                .filter(|f| added_constraints.contains(&f.name.to_ascii_lowercase()))
+            {
+                let parent = if fk.ref_table.eq_ignore_ascii_case(&table.name) {
+                    &table
+                } else {
+                    snap.table(&fk.ref_table).unwrap()
+                };
+                let pc = self.column_collations(&parent.columns);
+                for (_, mut row) in rows.iter().cloned() {
+                    store.resolve_inline_columns(&mut row)?;
+                    if let Some(p) = fk_probe(fk, parent, &pc, &row, &fk.columns)? {
+                        let hit = if std::ptr::eq(parent, &table) {
+                            let mut found = false;
+                            for (_, mut candidate) in rows.iter().cloned() {
+                                store.resolve_inline_columns(&mut candidate)?;
+                                if let Some(pp) =
+                                    fk_probe(fk, parent, &pc, &candidate, &fk.ref_columns)?
+                                {
+                                    if p.bytes() == pp.bytes() {
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            found
+                        } else {
+                            self.fk_probe_hits(&p, &parent.name)?
+                        };
+                        if !hit {
+                            return Err(EngineError::fk_violation_insert(&table.name, &fk.name));
+                        }
+                    }
+                }
             }
-            Some(q) => {
-                self.attach_write_snap(&q)
-                    .alter_table_catalog(&old_key, table, rename_table, ir)
+            for ex in table
+                .exclusions
+                .iter()
+                .filter(|e| added_constraints.contains(&e.name.to_ascii_lowercase()))
+            {
+                for i in 0..rows.len() {
+                    let mut a = rows[i].1.clone();
+                    store.resolve_inline_columns(&mut a)?;
+                    for j in 0..i {
+                        let mut b = rows[j].1.clone();
+                        store.resolve_inline_columns(&mut b)?;
+                        if exclusion_pair_conflicts(&table.columns, ex, &a, &b) {
+                            return Err(EngineError::exclusion_violation(&table.name, &ex.name));
+                        }
+                    }
+                }
+            }
+            for es in constraint_entries.values_mut() {
+                es.sort();
             }
         }
+        let ir = index_rename.as_ref().map(|(a, b)| (a.as_str(), b.as_str()));
+        let page_size = self.page_size;
+        let ws = match at.db.as_deref().map(str::to_ascii_lowercase) {
+            None if self.is_temp_table(&original.name) => self.temp_working_mut(),
+            None => self.working_mut(),
+            Some(q) if q == "temp" => self.temp_working_mut(),
+            Some(q) if q == "main" => self.working_mut(),
+            Some(q) => self.attach_write_snap(&q),
+        };
+        ws.alter_table_catalog(&old_key, table.clone(), rename_table, ir);
+        ws.sync_alter_constraint_indexes(&original, &table, &constraint_entries, page_size)?;
+        ws.cascade_dropped_unique_fks(&table.name, &cascade_unique_cols);
         Ok(Outcome::Statement {
             cost: meter.accrued,
             rows_affected: None,

@@ -6,13 +6,14 @@
 
 pub(crate) use crate::api::Rows;
 pub(crate) use crate::ast::{
-    AlterColumnKind, AlterSeqAction, AlterSequence, AlterTable, AlterTableAction, BinaryOp,
-    ConflictAction, ConflictTarget, CreateIndex, CreateSequence, CreateTable, CreateType, Cte,
-    CteBody, DefaultDef, Delete, DropIndex, DropSequence, DropTable, DropType, Expr, GroupItem,
-    IndexKeyElem, Insert, InsertSource, InsertValue, JoinKind, JsonOnBehavior, JsonPredicateKind,
-    JsonTable, JsonWrapper, JtColumn, Literal, OnConflict, OrderKey, Overriding, QueryExpr,
-    RefAction, Select, SelectItems, SeqOptions, SetOp, SetOpKind, Statement, SubscriptSpec,
-    TableRef, TypeFieldDef, TypeMod, UnaryOp, Update, WindowDef, WithExpr, WithQuery,
+    AlterColumnKind, AlterConstraintDef, AlterSeqAction, AlterSequence, AlterTable,
+    AlterTableAction, AlterTableEdit, BinaryOp, ConflictAction, ConflictTarget, CreateIndex,
+    CreateSequence, CreateTable, CreateType, Cte, CteBody, DefaultDef, Delete, DropIndex,
+    DropSequence, DropTable, DropType, Expr, GroupItem, IndexKeyElem, Insert, InsertSource,
+    InsertValue, JoinKind, JsonOnBehavior, JsonPredicateKind, JsonTable, JsonWrapper, JtColumn,
+    Literal, OnConflict, OrderKey, Overriding, QueryExpr, RefAction, Select, SelectItems,
+    SeqOptions, SetOp, SetOpKind, Statement, SubscriptSpec, TableRef, TypeFieldDef, TypeMod,
+    UnaryOp, Update, WindowDef, WithExpr, WithQuery,
 };
 pub(crate) use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,

@@ -724,7 +724,7 @@ impl Snapshot {
         }
     }
 
-    /// Publish one validated ALTER TABLE slice-1 catalog entry without touching row bytes.
+    /// Publish one validated ALTER TABLE catalog entry without touching row bytes.
     pub(crate) fn alter_table_catalog(
         &mut self,
         old_key: &str,
@@ -793,6 +793,62 @@ impl Snapshot {
             let mut changed = seq.clone();
             changed.owned_by.as_mut().unwrap().table = table.name.clone();
             std::sync::Arc::make_mut(&mut self.sequences).insert(key, changed);
+        }
+    }
+
+    pub(crate) fn sync_alter_constraint_indexes(
+        &mut self,
+        old: &Table,
+        next: &Table,
+        entries: &std::collections::HashMap<String, Vec<Vec<u8>>>,
+        page_size: u32,
+    ) -> Result<()> {
+        let live: std::collections::HashSet<String> = next
+            .indexes
+            .iter()
+            .map(|i| i.name.to_ascii_lowercase())
+            .collect();
+        for i in &old.indexes {
+            let k = i.name.to_ascii_lowercase();
+            if !live.contains(&k) {
+                std::sync::Arc::make_mut(&mut self.index_stores).remove(&k);
+                std::sync::Arc::make_mut(&mut self.gist_trees).remove(&k);
+            }
+        }
+        let prior: std::collections::HashSet<String> = old
+            .indexes
+            .iter()
+            .map(|i| i.name.to_ascii_lowercase())
+            .collect();
+        for i in &next.indexes {
+            let k = i.name.to_ascii_lowercase();
+            if prior.contains(&k) {
+                continue;
+            }
+            let mut s = TableStore::new(crate::format::page_payload(page_size), Vec::new());
+            if let Some(p) = &self.store_paging {
+                s.attach_paging(p.clone());
+            }
+            for e in entries.get(&k).into_iter().flatten() {
+                s.insert(e.clone(), Vec::new())?;
+            }
+            std::sync::Arc::make_mut(&mut self.index_stores).insert(k, s);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn cascade_dropped_unique_fks(&mut self, parent: &str, dropped: &[Vec<usize>]) {
+        if dropped.is_empty() {
+            return;
+        }
+        for child in std::sync::Arc::make_mut(&mut self.tables).values_mut() {
+            if child.name.eq_ignore_ascii_case(parent) {
+                continue;
+            }
+            child.foreign_keys.retain(|fk| {
+                !fk.ref_table.eq_ignore_ascii_case(parent)
+                    || !dropped.iter().any(|c| *c == sorted_unique(&fk.ref_columns))
+            });
         }
     }
 

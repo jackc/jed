@@ -1472,7 +1472,7 @@ func (db *engine) executeDropTable(dt *dropTable) (outcome, error) {
 	return outcome{Kind: outcomeStatement, Cost: 0}, nil
 }
 
-// executeAlterTable implements the catalog-only first ALTER TABLE slice (alter.md §1/§2).
+// executeAlterTable implements the catalog-only ALTER TABLE slices 1-2 (alter.md §1/§2).
 // It edits one private table copy, validates the final state, and publishes one catalog mutation.
 func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 	if err := checkCatalogRelWrite(at.Name); err != nil {
@@ -1521,6 +1521,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 	table.Indexes = append([]indexDef(nil), original.Indexes...)
 	table.ForeignKeys = append([]foreignKey(nil), original.ForeignKeys...)
 	table.Exclusions = append([]exclusionConstraint(nil), original.Exclusions...)
+	constraintState := newAlterConstraintState()
 	indexOld, indexNew := "", ""
 	renameTable := ""
 	relationTaken := func(name string) bool {
@@ -1639,22 +1640,41 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 		})
 	} else {
 		for _, a := range at.Actions {
+			if a.Add != nil {
+				if (snap == db.tempSnap()) && (a.Add.Foreign != nil || a.Add.Exclude != nil) {
+					return outcome{}, newError(FeatureNotSupported, "this constraint is not supported on a temporary table")
+				}
+				if isAttachmentScope(at.DB) && (a.Add.Foreign != nil || a.Add.Exclude != nil) {
+					return outcome{}, newError(FeatureNotSupported, "this constraint is not supported on an attached-database table")
+				}
+				if err := db.addAlterConstraint(&table, a.Add, snap, relationTaken, constraintState); err != nil {
+					return outcome{}, err
+				}
+				continue
+			}
+			if a.Drop != nil {
+				if err := db.dropAlterConstraint(&table, a.Drop, snap, constraintState); err != nil {
+					return outcome{}, err
+				}
+				continue
+			}
+			edit := a.Column
 			ci := -1
 			for i := range table.Columns {
-				if strings.EqualFold(table.Columns[i].Name, a.Column) {
+				if strings.EqualFold(table.Columns[i].Name, edit.Column) {
 					ci = i
 					break
 				}
 			}
 			if ci < 0 {
-				return outcome{}, newError(UndefinedColumn, "column does not exist: "+a.Column)
+				return outcome{}, newError(UndefinedColumn, "column does not exist: "+edit.Column)
 			}
-			switch a.Kind {
+			switch edit.Kind {
 			case alterSetDefault:
 				if table.Columns[ci].Identity != nil {
 					return outcome{}, newError(SyntaxError, "identity column cannot have a default")
 				}
-				dv, de, err := db.buildAlterDefault(table.Columns[ci], a.Default)
+				dv, de, err := db.buildAlterDefault(table.Columns[ci], edit.Default)
 				if err != nil {
 					return outcome{}, err
 				}
@@ -1706,6 +1726,10 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 			}
 		}
 	}
+	constraintEntries, err := db.validateAlterConstraints(original, &table, at.DB, snap, constraintState, meter)
+	if err != nil {
+		return outcome{}, err
+	}
 	var ws *snapshot
 	if at.DB == nil {
 		if db.isTempTable(original.Name) {
@@ -1726,6 +1750,12 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 		}
 	}
 	ws.alterTableCatalog(oldKey, &table, renameTable, indexOld, indexNew)
+	if err := ws.syncAlterConstraintIndexes(original, &table, constraintEntries, db.pageSize); err != nil {
+		return outcome{}, err
+	}
+	for key, changed := range constraintState.other {
+		ws.tables[key] = changed
+	}
 	return outcome{Kind: outcomeStatement, Cost: meter.Accrued}, nil
 }
 

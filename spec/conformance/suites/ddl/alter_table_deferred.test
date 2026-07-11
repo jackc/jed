@@ -15,13 +15,7 @@ statement error 0A000
 ALTER TABLE deferred_alter ADD COLUMN extra i32
 
 statement error 0A000
-ALTER TABLE deferred_alter ADD CONSTRAINT v_positive CHECK (v > 0)
-
-statement error 0A000
 ALTER TABLE deferred_alter DROP COLUMN v
-
-statement error 0A000
-ALTER TABLE deferred_alter DROP CONSTRAINT deferred_alter_pkey
 
 statement error 0A000
 ALTER TABLE deferred_alter ALTER COLUMN v TYPE i64

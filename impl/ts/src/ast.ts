@@ -749,8 +749,8 @@ export type AlterSequence = {
     | { kind: "rename"; newName: string };
 };
 
-// ALTER TABLE slice 1 (spec/design/alter.md): one standalone rename or a comma-separated list of
-// catalog-only column actions. The parser guarantees rename/actions are never mixed.
+// ALTER TABLE slices 1-2 (spec/design/alter.md): one standalone rename or a comma-separated mixed
+// action list. The parser guarantees rename/actions are never mixed.
 export type AlterTable = {
   kind: "alterTable";
   name: string;
@@ -760,8 +760,19 @@ export type AlterTable = {
     | { kind: "renameTable"; newName: string }
     | { kind: "renameColumn"; oldName: string; newName: string }
     | { kind: "renameConstraint"; oldName: string; newName: string }
-    | { kind: "alterColumns"; actions: AlterColumnAction[] };
+    | { kind: "actions"; actions: AlterTableEdit[] };
 };
+
+export type AlterTableEdit =
+  | { kind: "alterColumn"; edit: AlterColumnAction }
+  | { kind: "addConstraint"; constraint: AlterConstraintDef }
+  | { kind: "dropConstraint"; name: string; ifExists: boolean; cascade: boolean };
+
+export type AlterConstraintDef =
+  | { kind: "check"; def: CheckDef }
+  | { kind: "unique"; def: UniqueDef }
+  | { kind: "foreignKey"; def: ForeignKeyDef }
+  | { kind: "exclude"; def: ExcludeDef };
 
 export type AlterColumnAction = {
   column: string;

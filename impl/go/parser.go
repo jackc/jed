@@ -1703,8 +1703,9 @@ func (p *parser) parseDropSequence() (*dropSequence, error) {
 	return &dropSequence{Names: names, IfExists: ifExists}, nil
 }
 
-// parseAlterTable parses ALTER TABLE's authoritative grammar frame (alter.md §1). Slice 1 executes
-// only RENAME and catalog-only ALTER COLUMN edits; later ADD/DROP/TYPE forms report 0A000.
+// parseAlterTable parses ALTER TABLE's authoritative grammar frame (alter.md §1). Slices 1-2 execute
+// RENAME, catalog-only ALTER COLUMN edits, and ADD/DROP non-PK constraints. Column-shape and TYPE
+// forms remain recognized 0A000 deferrals.
 func (p *parser) parseAlterTable() (*alterTable, error) {
 	if err := p.expectKeyword("alter"); err != nil {
 		return nil, err
@@ -1770,64 +1771,122 @@ func (p *parser) parseAlterTable() (*alterTable, error) {
 	for {
 		switch p.peekKeyword() {
 		case "add":
-			return nil, newError(FeatureNotSupported, "ALTER TABLE ... ADD is not supported yet")
-		case "drop":
-			return nil, newError(FeatureNotSupported, "ALTER TABLE ... DROP is not supported yet")
-		}
-		if err := p.expectKeyword("alter"); err != nil {
-			return nil, err
-		}
-		if p.peekKeyword() == "column" {
 			p.advance()
-		}
-		column, err := p.expectIdentifier()
-		if err != nil {
-			return nil, err
-		}
-		a := alterColumnAction{Column: column}
-		switch p.peekKeyword() {
-		case "set":
-			p.advance()
-			if p.peekKeyword() == "default" {
-				p.advance()
-				start := p.pos
-				e, er := p.parseExpr()
-				if er != nil {
-					return nil, er
-				}
-				a.Kind = alterSetDefault
-				a.Default = &defaultDef{Expr: e, Text: renderTokens(p.tokens[start:p.pos])}
-			} else if p.peekKeyword() == "data" {
-				return nil, newError(FeatureNotSupported, "ALTER COLUMN ... TYPE is not supported yet")
-			} else {
-				if err := p.expectKeyword("not"); err != nil {
-					return nil, err
-				}
-				if err := p.expectKeyword("null"); err != nil {
-					return nil, err
-				}
-				a.Kind = alterSetNotNull
+			if p.peekKeyword() == "column" {
+				return nil, newError(FeatureNotSupported, "ALTER TABLE ... ADD COLUMN is not supported yet")
 			}
+			var add alterConstraintDef
+			switch {
+			case p.atCheckConstraint():
+				v, e := p.parseCheckConstraint()
+				if e != nil {
+					return nil, e
+				}
+				add.Check = &v
+			case p.atUniqueTableConstraint():
+				v, e := p.parseUniqueTableConstraint()
+				if e != nil {
+					return nil, e
+				}
+				add.Unique = &v
+			case p.atForeignKeyTableConstraint():
+				v, e := p.parseForeignKeyTableConstraint()
+				if e != nil {
+					return nil, e
+				}
+				add.Foreign = &v
+			case p.atExclusionTableConstraint():
+				v, e := p.parseExclusionTableConstraint()
+				if e != nil {
+					return nil, e
+				}
+				add.Exclude = &v
+			default:
+				return nil, newError(FeatureNotSupported, "ALTER TABLE ... ADD COLUMN or PRIMARY KEY is not supported yet")
+			}
+			at.Actions = append(at.Actions, alterTableEdit{Add: &add})
 		case "drop":
 			p.advance()
-			if p.peekKeyword() == "default" {
-				p.advance()
-				a.Kind = alterDropDefault
-			} else {
-				if err := p.expectKeyword("not"); err != nil {
-					return nil, err
-				}
-				if err := p.expectKeyword("null"); err != nil {
-					return nil, err
-				}
-				a.Kind = alterDropNotNull
+			if p.peekKeyword() != "constraint" {
+				return nil, newError(FeatureNotSupported, "ALTER TABLE ... DROP COLUMN is not supported yet")
 			}
-		case "type":
-			return nil, newError(FeatureNotSupported, "ALTER COLUMN ... TYPE is not supported yet")
+			p.advance()
+			ifExists := false
+			if p.peekKeyword() == "if" {
+				p.advance()
+				if err := p.expectKeyword("exists"); err != nil {
+					return nil, err
+				}
+				ifExists = true
+			}
+			name, err := p.expectIdentifier()
+			if err != nil {
+				return nil, err
+			}
+			cascade := false
+			if p.peekKeyword() == "cascade" {
+				p.advance()
+				cascade = true
+			} else if p.peekKeyword() == "restrict" {
+				p.advance()
+			}
+			at.Actions = append(at.Actions, alterTableEdit{Drop: &dropConstraintDef{Name: name, IfExists: ifExists, Cascade: cascade}})
 		default:
-			return nil, newError(SyntaxError, "ALTER COLUMN requires SET or DROP")
+			if err := p.expectKeyword("alter"); err != nil {
+				return nil, err
+			}
+			if p.peekKeyword() == "column" {
+				p.advance()
+			}
+			column, err := p.expectIdentifier()
+			if err != nil {
+				return nil, err
+			}
+			a := alterColumnAction{Column: column}
+			switch p.peekKeyword() {
+			case "set":
+				p.advance()
+				if p.peekKeyword() == "default" {
+					p.advance()
+					start := p.pos
+					e, er := p.parseExpr()
+					if er != nil {
+						return nil, er
+					}
+					a.Kind = alterSetDefault
+					a.Default = &defaultDef{Expr: e, Text: renderTokens(p.tokens[start:p.pos])}
+				} else if p.peekKeyword() == "data" {
+					return nil, newError(FeatureNotSupported, "ALTER COLUMN ... TYPE is not supported yet")
+				} else {
+					if err := p.expectKeyword("not"); err != nil {
+						return nil, err
+					}
+					if err := p.expectKeyword("null"); err != nil {
+						return nil, err
+					}
+					a.Kind = alterSetNotNull
+				}
+			case "drop":
+				p.advance()
+				if p.peekKeyword() == "default" {
+					p.advance()
+					a.Kind = alterDropDefault
+				} else {
+					if err := p.expectKeyword("not"); err != nil {
+						return nil, err
+					}
+					if err := p.expectKeyword("null"); err != nil {
+						return nil, err
+					}
+					a.Kind = alterDropNotNull
+				}
+			case "type":
+				return nil, newError(FeatureNotSupported, "ALTER COLUMN ... TYPE is not supported yet")
+			default:
+				return nil, newError(SyntaxError, "ALTER COLUMN requires SET or DROP")
+			}
+			at.Actions = append(at.Actions, alterTableEdit{Column: &a})
 		}
-		at.Actions = append(at.Actions, a)
 		if p.peek().Kind != tokComma {
 			break
 		}

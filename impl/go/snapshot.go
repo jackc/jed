@@ -816,7 +816,7 @@ func (s *snapshot) setColumnDefaultExpr(tableKey string, column int, de *default
 	s.tables[tableKey] = &t
 }
 
-// alterTableCatalog publishes one already-validated ALTER TABLE slice-1 catalog entry without
+// alterTableCatalog publishes one already-validated ALTER TABLE catalog entry without
 // touching row bytes. renameTable moves the table/store key and repairs same-database FK + owned
 // sequence metadata; indexRename moves a UNIQUE/EXCLUDE backing store with its catalog name.
 func (s *snapshot) alterTableCatalog(oldKey string, t *catTable, renameTable, indexOld, indexNew string) {
@@ -870,6 +870,47 @@ func (s *snapshot) alterTableCatalog(oldKey string, t *catTable, renameTable, in
 			s.sequences[key] = &cp
 		}
 	}
+}
+
+// syncAlterConstraintIndexes applies the backing-store delta for ALTER TABLE slice 2 after the
+// final catalog and row validation have succeeded. Entries are already sorted by raw key bytes.
+func (s *snapshot) syncAlterConstraintIndexes(old, next *catTable, entries map[string][][]byte, pageSize uint32) error {
+	live := make(map[string]bool, len(next.Indexes))
+	for _, ix := range next.Indexes {
+		live[strings.ToLower(ix.Name)] = true
+	}
+	for _, ix := range old.Indexes {
+		key := strings.ToLower(ix.Name)
+		if !live[key] {
+			delete(s.indexStores, key)
+			delete(s.gistTrees, key)
+		}
+	}
+	oldNames := make(map[string]bool, len(old.Indexes))
+	for _, ix := range old.Indexes {
+		oldNames[strings.ToLower(ix.Name)] = true
+	}
+	for _, ix := range next.Indexes {
+		key := strings.ToLower(ix.Name)
+		if oldNames[key] {
+			continue
+		}
+		fresh := newTableStore(pagePayload(pageSize), nil)
+		if s.storePaging != nil {
+			fresh.attachPaging(s.storePaging)
+		}
+		for _, entry := range entries[key] {
+			inserted, err := fresh.Insert(entry, nil)
+			if err != nil {
+				return err
+			}
+			if !inserted {
+				panic("constraint index entries include the storage-key suffix")
+			}
+		}
+		s.indexStores[key] = fresh
+	}
+	return nil
 }
 
 // putIndexStore registers a loaded index store under its (lowercased) name — the file

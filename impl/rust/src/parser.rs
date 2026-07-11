@@ -5,15 +5,15 @@
 //! error rather than panicking, so the harness reports "not yet" cleanly.
 
 use crate::ast::{
-    AlterColumnAction, AlterColumnKind, AlterSeqAction, AlterSequence, AlterTable,
-    AlterTableAction, Assignment, BinaryOp, CheckDef, ColumnDef, ConflictAction, ConflictTarget,
-    CreateIndex, CreateSequence, CreateTable, CreateType, Cte, CteBody, DefaultDef, Delete,
-    DropIndex, DropSequence, DropTable, DropType, ExcludeDef, Expr, ForeignKeyDef, GroupItem,
-    IdentitySpec, IndexKeyElem, IndexPredicate, Insert, InsertSource, InsertValue, JoinClause,
-    JoinKind, JsonOnBehavior, JsonPredicateKind, JsonTable, JsonWrapper, JtColumn, Literal,
-    OnConflict, OrderKey, Overriding, QueryExpr, RefAction, Select, SelectItem, SelectItems,
-    SeqOptions, SetOp, SetOpKind, Statement, SubscriptSpec, TableRef, TypeFieldDef, TypeMod,
-    UnaryOp, UniqueDef, Update, WindowDef, WithExpr, WithQuery,
+    AlterColumnAction, AlterColumnKind, AlterConstraintDef, AlterSeqAction, AlterSequence,
+    AlterTable, AlterTableAction, AlterTableEdit, Assignment, BinaryOp, CheckDef, ColumnDef,
+    ConflictAction, ConflictTarget, CreateIndex, CreateSequence, CreateTable, CreateType, Cte,
+    CteBody, DefaultDef, Delete, DropIndex, DropSequence, DropTable, DropType, ExcludeDef, Expr,
+    ForeignKeyDef, GroupItem, IdentitySpec, IndexKeyElem, IndexPredicate, Insert, InsertSource,
+    InsertValue, JoinClause, JoinKind, JsonOnBehavior, JsonPredicateKind, JsonTable, JsonWrapper,
+    JtColumn, Literal, OnConflict, OrderKey, Overriding, QueryExpr, RefAction, Select, SelectItem,
+    SelectItems, SeqOptions, SetOp, SetOpKind, Statement, SubscriptSpec, TableRef, TypeFieldDef,
+    TypeMod, UnaryOp, UniqueDef, Update, WindowDef, WithExpr, WithQuery,
 };
 use crate::ast::{FrameBound, FrameExclusion, FrameMode, WindowFrame, WindowOrderKey};
 use crate::decimal::Decimal;
@@ -1445,8 +1445,8 @@ impl Parser {
         })
     }
 
-    /// Parse ALTER TABLE's authoritative grammar frame (alter.md §1). Slice 1 executes RENAME and
-    /// catalog-only ALTER COLUMN edits; later ADD/DROP/TYPE forms report 0A000.
+    /// Parse ALTER TABLE's authoritative grammar frame (alter.md §1). Slices 1-2 execute RENAME,
+    /// catalog-only ALTER COLUMN edits, and ADD/DROP non-PK constraints.
     fn parse_alter_table(&mut self) -> Result<AlterTable> {
         self.expect_keyword("alter")?;
         self.expect_keyword("table")?;
@@ -1485,73 +1485,125 @@ impl Parser {
             loop {
                 match self.peek_keyword().as_deref() {
                     Some("add") => {
-                        return Err(EngineError::new(
-                            SqlState::FeatureNotSupported,
-                            "ALTER TABLE ... ADD is not supported yet".to_string(),
-                        ));
-                    }
-                    Some("drop") => {
-                        return Err(EngineError::new(
-                            SqlState::FeatureNotSupported,
-                            "ALTER TABLE ... DROP is not supported yet".to_string(),
-                        ));
-                    }
-                    _ => {}
-                }
-                self.expect_keyword("alter")?;
-                if self.peek_keyword().as_deref() == Some("column") {
-                    self.advance();
-                }
-                let column = self.expect_identifier()?;
-                let kind = match self.peek_keyword().as_deref() {
-                    Some("set") => {
                         self.advance();
-                        if self.peek_keyword().as_deref() == Some("default") {
-                            self.advance();
-                            let start = self.pos;
-                            let expr = self.parse_expr()?;
-                            let text = render_tokens(&self.tokens[start..self.pos]);
-                            AlterColumnKind::SetDefault(DefaultDef { expr, text })
-                        } else if self.peek_keyword().as_deref() == Some("data") {
+                        if self.peek_keyword().as_deref() == Some("column") {
                             return Err(EngineError::new(
                                 SqlState::FeatureNotSupported,
-                                "ALTER COLUMN ... TYPE is not supported yet".to_string(),
+                                "ALTER TABLE ... ADD COLUMN is not supported yet".to_string(),
                             ));
-                        } else {
-                            self.expect_keyword("not")?;
-                            self.expect_keyword("null")?;
-                            AlterColumnKind::SetNotNull
                         }
+                        let def = if self.at_check_constraint() {
+                            AlterConstraintDef::Check(self.parse_check_constraint()?)
+                        } else if self.at_unique_table_constraint() {
+                            AlterConstraintDef::Unique(self.parse_unique_table_constraint()?)
+                        } else if self.at_foreign_key_table_constraint() {
+                            AlterConstraintDef::ForeignKey(
+                                self.parse_foreign_key_table_constraint()?,
+                            )
+                        } else if self.at_exclusion_table_constraint() {
+                            AlterConstraintDef::Exclude(self.parse_exclusion_table_constraint()?)
+                        } else {
+                            return Err(EngineError::new(
+                                SqlState::FeatureNotSupported,
+                                "ALTER TABLE ... ADD COLUMN or PRIMARY KEY is not supported yet"
+                                    .to_string(),
+                            ));
+                        };
+                        actions.push(AlterTableEdit::AddConstraint(def));
                     }
                     Some("drop") => {
                         self.advance();
-                        if self.peek_keyword().as_deref() == Some("default") {
-                            self.advance();
-                            AlterColumnKind::DropDefault
-                        } else {
-                            self.expect_keyword("not")?;
-                            self.expect_keyword("null")?;
-                            AlterColumnKind::DropNotNull
+                        if self.peek_keyword().as_deref() != Some("constraint") {
+                            return Err(EngineError::new(
+                                SqlState::FeatureNotSupported,
+                                "ALTER TABLE ... DROP COLUMN is not supported yet".to_string(),
+                            ));
                         }
+                        self.advance();
+                        let if_exists = if self.peek_keyword().as_deref() == Some("if") {
+                            self.advance();
+                            self.expect_keyword("exists")?;
+                            true
+                        } else {
+                            false
+                        };
+                        let name = self.expect_identifier()?;
+                        let cascade = if self.peek_keyword().as_deref() == Some("cascade") {
+                            self.advance();
+                            true
+                        } else {
+                            if self.peek_keyword().as_deref() == Some("restrict") {
+                                self.advance();
+                            }
+                            false
+                        };
+                        actions.push(AlterTableEdit::DropConstraint {
+                            name,
+                            if_exists,
+                            cascade,
+                        });
                     }
-                    Some("type") => {
-                        return Err(EngineError::new(
-                            SqlState::FeatureNotSupported,
-                            "ALTER COLUMN ... TYPE is not supported yet".to_string(),
-                        ));
+                    _ => {
+                        self.expect_keyword("alter")?;
+                        if self.peek_keyword().as_deref() == Some("column") {
+                            self.advance();
+                        }
+                        let column = self.expect_identifier()?;
+                        let kind = match self.peek_keyword().as_deref() {
+                            Some("set") => {
+                                self.advance();
+                                if self.peek_keyword().as_deref() == Some("default") {
+                                    self.advance();
+                                    let start = self.pos;
+                                    let expr = self.parse_expr()?;
+                                    let text = render_tokens(&self.tokens[start..self.pos]);
+                                    AlterColumnKind::SetDefault(DefaultDef { expr, text })
+                                } else if self.peek_keyword().as_deref() == Some("data") {
+                                    return Err(EngineError::new(
+                                        SqlState::FeatureNotSupported,
+                                        "ALTER COLUMN ... TYPE is not supported yet".to_string(),
+                                    ));
+                                } else {
+                                    self.expect_keyword("not")?;
+                                    self.expect_keyword("null")?;
+                                    AlterColumnKind::SetNotNull
+                                }
+                            }
+                            Some("drop") => {
+                                self.advance();
+                                if self.peek_keyword().as_deref() == Some("default") {
+                                    self.advance();
+                                    AlterColumnKind::DropDefault
+                                } else {
+                                    self.expect_keyword("not")?;
+                                    self.expect_keyword("null")?;
+                                    AlterColumnKind::DropNotNull
+                                }
+                            }
+                            Some("type") => {
+                                return Err(EngineError::new(
+                                    SqlState::FeatureNotSupported,
+                                    "ALTER COLUMN ... TYPE is not supported yet".to_string(),
+                                ));
+                            }
+                            other => {
+                                return Err(syntax(format!(
+                                    "expected SET or DROP, found {other:?}"
+                                )));
+                            }
+                        };
+                        actions.push(AlterTableEdit::AlterColumn(AlterColumnAction {
+                            column,
+                            action: kind,
+                        }));
                     }
-                    other => return Err(syntax(format!("expected SET or DROP, found {other:?}"))),
-                };
-                actions.push(AlterColumnAction {
-                    column,
-                    action: kind,
-                });
+                }
                 if !matches!(self.peek(), Token::Comma) {
                     break;
                 }
                 self.advance();
             }
-            AlterTableAction::AlterColumns(actions)
+            AlterTableAction::Actions(actions)
         };
         Ok(AlterTable {
             name,

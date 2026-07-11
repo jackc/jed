@@ -663,7 +663,7 @@ export class Snapshot {
     this.tables.set(tableKey, { ...old, columns });
   }
 
-  // Publish one validated ALTER TABLE slice-1 catalog entry without touching row bytes.
+  // Publish one validated ALTER TABLE catalog entry without touching row bytes.
   alterTableCatalog(
     oldKey: string,
     table: Table,
@@ -709,6 +709,29 @@ export class Snapshot {
       if (seq.ownedBy?.table.toLowerCase() === oldKey) {
         this.sequences.set(key, { ...seq, ownedBy: { ...seq.ownedBy, table: table.name } });
       }
+    }
+  }
+
+  syncAlterConstraintIndexes(
+    old: Table,
+    next: Table,
+    entries: Map<string, Uint8Array[]>,
+    pageSize: number,
+  ): void {
+    const live = new Set(next.indexes.map((i) => i.name.toLowerCase()));
+    for (const i of old.indexes)
+      if (!live.has(i.name.toLowerCase())) {
+        this.indexStores.delete(i.name.toLowerCase());
+        this.gistTrees.delete(i.name.toLowerCase());
+      }
+    const prior = new Set(old.indexes.map((i) => i.name.toLowerCase()));
+    for (const i of next.indexes) {
+      const k = i.name.toLowerCase();
+      if (prior.has(k)) continue;
+      const s = new TableStore(pagePayload(pageSize), []);
+      if (this.storePaging !== null) s.attachPaging(this.storePaging);
+      for (const e of entries.get(k) ?? []) s.insert(e, []);
+      this.indexStores.set(k, s);
     }
   }
 

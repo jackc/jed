@@ -2334,7 +2334,9 @@ export class Engine {
         (stmt.kind === "dropIndex" && this.isTempIndex(stmt.name)) ||
         (stmt.kind === "dropSequence" && stmt.names.some((n) => this.isTempSequence(n))) ||
         (stmt.kind === "alterTable" &&
-          (stmt.db !== null ? stmt.db.toLowerCase() === "temp" : this.isTempTable(stmt.name))) ||
+          (stmt.db !== undefined
+            ? stmt.db.toLowerCase() === "temp"
+            : this.isTempTable(stmt.name))) ||
         (stmt.kind === "alterSequence" && this.isTempSequence(stmt.name))
       ) {
         allowed = this.session.allowTempDdl;
@@ -4194,7 +4196,7 @@ export class Engine {
     return { kind: "statement", cost: 0n, rowsAffected: null };
   }
 
-  // executeAlterTable implements the catalog-only first ALTER TABLE slice (alter.md §1/§2).
+  // executeAlterTable implements the catalog-only ALTER TABLE slices 1-2 (alter.md §1/§2).
   private executeAlterTable(at: AlterTable): Outcome {
     checkCatalogRelWrite(at.name);
     this.checkAttachmentWritable(at.db);
@@ -4245,6 +4247,8 @@ export class Engine {
           snap.findIndex(name) !== null ||
           snap.sequence(name) !== undefined
         : this.relationExists(name);
+    const addedConstraints = new Set<string>();
+    const cascadeUniqueCols: number[][] = [];
     const rewriteExprs = (
       column?: { oldName: string; newName: string },
       tableRename?: string,
@@ -4358,8 +4362,293 @@ export class Engine {
         table.exclusions.sort(byName);
         break;
       }
-      case "alterColumns":
-        for (const edit of at.action.actions) {
+      case "actions": {
+        const added = addedConstraints;
+        const taken = (n: string) =>
+          table.checks.some((c) => c.name.toLowerCase() === n.toLowerCase()) ||
+          table.indexes.some((i) => i.unique && i.name.toLowerCase() === n.toLowerCase()) ||
+          table.fks.some((f) => f.name.toLowerCase() === n.toLowerCase()) ||
+          table.exclusions.some((e) => e.name.toLowerCase() === n.toLowerCase());
+        for (const action of at.action.actions) {
+          if (action.kind === "addConstraint") {
+            const c = action.constraint;
+            if (c.kind === "check") {
+              const d = c.def;
+              rejectCheckStructure(d.expr);
+              const rt = resolve(
+                Scope.single(this, table),
+                d.expr,
+                null,
+                { collecting: false, groupKeys: [], specs: [] },
+                new ParamTypes(),
+              ).type;
+              if (rt.kind !== "bool" && rt.kind !== "null")
+                throw typeError("argument of CHECK must be boolean");
+              let name = d.name ?? `${table.name.toLowerCase()}_check`;
+              if (d.name === null) {
+                const rs = checkReferencedColumns(d.expr, table.columns);
+                if (rs.length === 1)
+                  name = `${table.name.toLowerCase()}_${table.columns[rs[0]!]!.name.toLowerCase()}_check`;
+                for (let n = 1; taken(name); n++) name = name.replace(/\d+$/, "") + n;
+              } else if (taken(name))
+                throw engineError(
+                  "duplicate_object",
+                  `constraint ${name} for relation ${table.name} already exists`,
+                );
+              table.checks.push({ name, exprText: d.text, expr: d.expr });
+              table.checks.sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
+              added.add(name.toLowerCase());
+            } else if (c.kind === "unique") {
+              const d = c.def,
+                cols: number[] = [];
+              for (const n of d.columns) {
+                const ci = columnIndex(table, n);
+                if (ci < 0)
+                  throw engineError("undefined_column", `column ${n} named in key does not exist`);
+                if (cols.includes(ci))
+                  throw engineError(
+                    "duplicate_column",
+                    `column ${n} appears twice in unique constraint`,
+                  );
+                cols.push(ci);
+              }
+              for (const ci of cols) {
+                const ty = table.columns[ci]!.type;
+                if (
+                  !typeIsInteger(ty) &&
+                  !typeIsBoolean(ty) &&
+                  !typeIsText(ty) &&
+                  !typeIsBytea(ty) &&
+                  !typeIsDecimal(ty) &&
+                  !typeIsUuid(ty) &&
+                  !typeIsTimestamp(ty) &&
+                  !typeIsTimestamptz(ty) &&
+                  !typeIsDate(ty) &&
+                  !typeIsInterval(ty) &&
+                  !typeIsFloat(ty) &&
+                  !typeIsRange(ty) &&
+                  !typeIsArrayKeyable(ty)
+                )
+                  throw engineError(
+                    "feature_not_supported",
+                    `a ${typeCanonicalName(ty)} unique constraint member is not supported yet`,
+                  );
+              }
+              const name =
+                d.name ??
+                `${table.name.toLowerCase()}_${cols.map((i) => table.columns[i]!.name.toLowerCase()).join("_")}_key`;
+              if (d.name !== null) {
+                checkReservedName("constraint", name);
+                if (relationTaken(name))
+                  throw engineError("duplicate_table", `relation already exists: ${name}`);
+                if (taken(name))
+                  throw engineError(
+                    "duplicate_object",
+                    `constraint ${name} for relation ${table.name} already exists`,
+                  );
+              }
+              table.indexes.push({
+                name,
+                keys: cols.map((column) => ({ kind: "column", column })),
+                unique: true,
+                kind: "btree",
+              });
+              table.indexes.sort((a, b) =>
+                a.name.toLowerCase().localeCompare(b.name.toLowerCase()),
+              );
+              added.add(name.toLowerCase());
+            } else if (c.kind === "foreignKey") {
+              const d = c.def,
+                local: number[] = [];
+              for (const n of d.columns) {
+                const ci = columnIndex(table, n);
+                if (ci < 0)
+                  throw engineError("undefined_column", `column ${n} named in key does not exist`);
+                if (local.includes(ci))
+                  throw engineError(
+                    "duplicate_column",
+                    `column ${n} appears twice in foreign key constraint`,
+                  );
+                local.push(ci);
+              }
+              const parent =
+                d.refTable.toLowerCase() === table.name.toLowerCase()
+                  ? table
+                  : snap.table(d.refTable);
+              if (!parent)
+                throw engineError("undefined_table", `table does not exist: ${d.refTable}`);
+              const refs =
+                d.refColumns === null
+                  ? [...parent.pk]
+                  : d.refColumns.map((n) => {
+                      const i = columnIndex(parent, n);
+                      if (i < 0)
+                        throw engineError(
+                          "undefined_column",
+                          `column ${n} named in key does not exist`,
+                        );
+                      return i;
+                    });
+              if (refs.length === 0)
+                throw engineError(
+                  "undefined_object",
+                  `there is no primary key for referenced table ${parent.name}`,
+                );
+              if (local.length !== refs.length)
+                throw engineError(
+                  "invalid_foreign_key",
+                  "number of referencing and referenced columns for foreign key disagree",
+                );
+              const rs = sortedUnique(refs);
+              if (
+                !(
+                  sameSet(sortedUnique(parent.pk), rs) ||
+                  parent.indexes.some((i) => {
+                    const x = indexColumnOrdinals(i);
+                    return i.unique && x !== null && sameSet(sortedUnique(x), rs);
+                  })
+                )
+              )
+                throw engineError(
+                  "invalid_foreign_key",
+                  `there is no unique constraint matching given keys for referenced table ${parent.name}`,
+                );
+              const name =
+                d.name ??
+                `${table.name.toLowerCase()}_${local.map((i) => table.columns[i]!.name.toLowerCase()).join("_")}_fkey`;
+              if (taken(name))
+                throw engineError(
+                  "duplicate_object",
+                  `constraint ${name} for relation ${table.name} already exists`,
+                );
+              for (let p = 0; p < local.length; p++) {
+                const li = local[p]!,
+                  ri = refs[p]!;
+                if (!fkTypesEqual(table.columns[li]!.type, parent.columns[ri]!.type))
+                  throw engineError(
+                    "datatype_mismatch",
+                    `foreign key constraint ${name} cannot be implemented: key columns ${table.columns[li]!.name} and ${parent.columns[ri]!.name} are of incompatible types: ${typeCanonicalName(table.columns[li]!.type)} and ${typeCanonicalName(parent.columns[ri]!.type)}`,
+                  );
+              }
+              table.fks.push({
+                name,
+                columns: local,
+                refTable: parent.name,
+                refColumns: refs,
+                onDelete: fkAction(d.onDelete, "DELETE"),
+                onUpdate: fkAction(d.onUpdate, "UPDATE"),
+              });
+              table.fks.sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
+              added.add(name.toLowerCase());
+            } else {
+              const d = c.def;
+              if (d.using !== null && d.using.toLowerCase() !== "gist")
+                throw engineError(
+                  "undefined_object",
+                  `access method ${d.using} does not support exclusion constraints`,
+                );
+              const cols: number[] = [],
+                elements: ExclusionElement[] = [];
+              for (const el of d.elements) {
+                const ci = columnIndex(table, el.column);
+                if (ci < 0)
+                  throw engineError(
+                    "undefined_column",
+                    `column ${el.column} named in key does not exist`,
+                  );
+                if (cols.includes(ci))
+                  throw engineError(
+                    "duplicate_column",
+                    `column ${el.column} appears twice in exclusion constraint`,
+                  );
+                if (el.op === "&&" && table.columns[ci]!.type.kind !== "range")
+                  throw engineError(
+                    "undefined_object",
+                    `data type ${typeCanonicalName(table.columns[ci]!.type)} has no default operator class for access method gist that accepts operator &&`,
+                  );
+                cols.push(ci);
+                elements.push({ column: ci, op: el.op === "&&" ? "overlaps" : "equal" });
+              }
+              const name =
+                d.name ??
+                `${table.name.toLowerCase()}_${cols.map((i) => table.columns[i]!.name.toLowerCase()).join("_")}_excl`;
+              if (d.name !== null) {
+                checkReservedName("constraint", name);
+                if (relationTaken(name))
+                  throw engineError("duplicate_table", `relation already exists: ${name}`);
+              }
+              table.indexes.push({
+                name,
+                keys: cols.map((column) => ({ kind: "column", column })),
+                unique: false,
+                kind: "gist",
+              });
+              table.exclusions.push({ name, index: name, elements });
+              table.indexes.sort((a, b) =>
+                a.name.toLowerCase().localeCompare(b.name.toLowerCase()),
+              );
+              table.exclusions.sort((a, b) =>
+                a.name.toLowerCase().localeCompare(b.name.toLowerCase()),
+              );
+              added.add(name.toLowerCase());
+            }
+            continue;
+          }
+          if (action.kind === "dropConstraint") {
+            const k = action.name.toLowerCase();
+            let found = false;
+            const before = table.checks.length;
+            table.checks = table.checks.filter((c) => c.name.toLowerCase() !== k);
+            found = table.checks.length !== before || found;
+            const bf = table.fks.length;
+            table.fks = table.fks.filter((f) => f.name.toLowerCase() !== k);
+            found = table.fks.length !== bf || found;
+            const ex = table.exclusions.find((e) => e.name.toLowerCase() === k);
+            if (ex) {
+              table.exclusions = table.exclusions.filter((e) => e !== ex);
+              table.indexes = table.indexes.filter(
+                (i) => i.name.toLowerCase() !== ex.index.toLowerCase(),
+              );
+              found = true;
+            }
+            const ux = table.indexes.find((i) => i.unique && i.name.toLowerCase() === k);
+            if (ux) {
+              const cols = sortedUnique(indexColumnOrdinals(ux)!);
+              const deps = [
+                ...table.fks.filter(
+                  (f) =>
+                    f.refTable.toLowerCase() === table.name.toLowerCase() &&
+                    sameSet(sortedUnique(f.refColumns), cols),
+                ),
+              ];
+              for (const ot of snap.tables.values())
+                if (ot.name.toLowerCase() !== table.name.toLowerCase())
+                  deps.push(
+                    ...ot.fks.filter(
+                      (f) =>
+                        f.refTable.toLowerCase() === table.name.toLowerCase() &&
+                        sameSet(sortedUnique(f.refColumns), cols),
+                    ),
+                  );
+              if (deps.length && !action.cascade)
+                throw engineError(
+                  "dependent_objects_still_exist",
+                  `cannot drop constraint ${action.name} because other objects depend on it`,
+                );
+              if (action.cascade) cascadeUniqueCols.push(cols);
+              if (action.cascade)
+                table.fks = table.fks.filter(
+                  (f) => !deps.some((d) => d.name.toLowerCase() === f.name.toLowerCase()),
+                );
+              table.indexes = table.indexes.filter((i) => i !== ux);
+              found = true;
+            }
+            if (!found && !action.ifExists)
+              throw engineError("undefined_object", `constraint does not exist: ${action.name}`);
+            added.delete(k);
+            continue;
+          }
+          const edit = action.edit;
           const ci = columnIndex(table, edit.column);
           if (ci < 0)
             throw engineError("undefined_column", `column does not exist: ${edit.column}`);
@@ -4388,6 +4677,7 @@ export class Engine {
           }
         }
         break;
+      }
     }
 
     const meter = this.session.newMeter();
@@ -4403,6 +4693,86 @@ export class Engine {
         for (let i = 0; i < mask.length; i++)
           if (mask[i] && row[i]!.kind === "null") throw notNullViolation(table.columns[i]!.name);
       }
+    }
+    const constraintEntries = new Map<string, Uint8Array[]>();
+    if (addedConstraints.size > 0) {
+      const store = this.lkpStoreScoped(at.db, original.name),
+        all = store.scanWithUnits(table.columns.map(() => true));
+      meter.charge(COSTS.pageRead * BigInt(all.pages) + COSTS.valueDecompress * BigInt(all.slabs));
+      const checks = this.resolveChecks(table),
+        colls = this.columnCollations(table.columns),
+        seen = new Map<string, Set<string>>();
+      for (const entry of all.entries) {
+        meter.guard();
+        meter.charge(COSTS.storageRowRead);
+        const row = store.resolveInlineColumns(entry.row);
+        for (const ck of checks)
+          if (addedConstraints.has(ck.name.toLowerCase()))
+            evalChecks([ck], table.name, row, this.maintenanceEnv(new StmtRng()), meter);
+        for (const ix of table.indexes) {
+          const k = ix.name.toLowerCase();
+          if (!addedConstraints.has(k)) continue;
+          const ri = this.resolveIndex(table, ix);
+          if (ix.unique) {
+            const p = this.indexPrefix(table.columns, colls, ri, row);
+            if (p) {
+              let s = seen.get(k);
+              if (!s) {
+                s = new Set();
+                seen.set(k, s);
+              }
+              const h = Array.from(p).join(",");
+              if (s.has(h)) throw uniqueViolation(table.name, ix.name);
+              s.add(h);
+            }
+          }
+          const es = constraintEntries.get(k) ?? [];
+          es.push(...this.indexEntries(table.columns, colls, ri, entry.key, row));
+          constraintEntries.set(k, es);
+        }
+      }
+      for (const fk of table.fks)
+        if (addedConstraints.has(fk.name.toLowerCase())) {
+          const parent =
+            fk.refTable.toLowerCase() === table.name.toLowerCase()
+              ? table
+              : snap.table(fk.refTable)!;
+          const pc = this.columnCollations(parent.columns);
+          for (const entry of all.entries) {
+            const row = store.resolveInlineColumns(entry.row),
+              p = fkProbe(fk, parent, pc, row, fk.columns);
+            if (p !== null) {
+              let hit: boolean;
+              if (parent === table) {
+                hit = all.entries.some((candidate) => {
+                  const pp = fkProbe(
+                    fk,
+                    parent,
+                    pc,
+                    store.resolveInlineColumns(candidate.row),
+                    fk.refColumns,
+                  );
+                  return pp !== null && compareBytes(fkProbeBytes(p), fkProbeBytes(pp)) === 0;
+                });
+              } else hit = this.fkProbeHits(p, parent.name);
+              if (!hit) throw fkViolationInsert(table.name, fk.name);
+            }
+          }
+        }
+      for (const ex of table.exclusions)
+        if (addedConstraints.has(ex.name.toLowerCase()))
+          for (let i = 0; i < all.entries.length; i++)
+            for (let j = 0; j < i; j++)
+              if (
+                exclusionPairConflicts(
+                  table.columns,
+                  ex,
+                  store.resolveInlineColumns(all.entries[i]!.row),
+                  store.resolveInlineColumns(all.entries[j]!.row),
+                )
+              )
+                throw exclusionViolation(table.name, ex.name);
+      for (const es of constraintEntries.values()) es.sort(compareBytes);
     }
     let ws: Snapshot;
     if (at.db === undefined) {
@@ -4423,12 +4793,24 @@ export class Engine {
           ws = this.attachWriteSnap(at.db.toLowerCase())!;
       }
     ws.alterTableCatalog(oldKey, table, renameTable, indexRename);
+    ws.syncAlterConstraintIndexes(original, table, constraintEntries, this.pageSize);
+    for (const cols of cascadeUniqueCols) {
+      for (const [key, child] of [...ws.tables]) {
+        if (child.name.toLowerCase() === table.name.toLowerCase()) continue;
+        const fks = child.fks.filter(
+          (fk) =>
+            fk.refTable.toLowerCase() !== table.name.toLowerCase() ||
+            !sameSet(sortedUnique(fk.refColumns), cols),
+        );
+        if (fks.length !== child.fks.length) ws.tables.set(key, { ...child, fks });
+      }
+    }
     return { kind: "statement", cost: meter.accrued, rowsAffected: null };
   }
 
   private buildAlterDefault(col: Column, def: DefaultDef): Column {
     const sty = typeAsScalar(col.type);
-    if (sty === null)
+    if (sty === undefined)
       throw engineError(
         "feature_not_supported",
         "a DEFAULT on this container type is not supported yet",

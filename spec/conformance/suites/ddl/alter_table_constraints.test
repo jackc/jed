@@ -1,0 +1,136 @@
+# ALTER TABLE slice 2: ADD/DROP CHECK, UNIQUE, FOREIGN KEY, and EXCLUDE constraints.
+# Existing rows validate against the final catalog state; backing indexes are created/dropped with
+# UNIQUE/EXCLUDE; a comma action list publishes all-or-nothing (spec/design/alter.md §2.6/§2.7).
+# requires: ddl.alter_table, ddl.create_table, ddl.primary_key, ddl.check, ddl.unique, ddl.foreign_key, ddl.exclusion_constraint, types.i32, types.range, dml.insert, query.select, query.order_by, resource.cost_metering
+
+statement ok
+CREATE TABLE alter_parent (id i32 PRIMARY KEY, code i32, span int4range)
+
+statement ok
+INSERT INTO alter_parent VALUES (1, 10, '[1,3)'), (2, 20, '[4,6)')
+
+# CHECK validates old rows and governs future writes.
+# cost: 5
+statement ok
+ALTER TABLE alter_parent ADD CONSTRAINT code_positive CHECK (code > 0)
+
+statement error 23514
+INSERT INTO alter_parent VALUES (3, -1, '[7,9)')
+
+statement error 23514
+ALTER TABLE alter_parent ADD CONSTRAINT code_too_large CHECK (code > 100)
+
+# A failed validation installs nothing, so the handle remains available.
+# cost: 5
+statement ok
+ALTER TABLE alter_parent ADD CONSTRAINT code_too_large CHECK (code < 100)
+
+# UNIQUE validates and builds its backing B-tree.
+# cost: 3
+statement ok
+ALTER TABLE alter_parent ADD CONSTRAINT alter_code_key UNIQUE (code)
+
+statement error 23505
+INSERT INTO alter_parent VALUES (3, 10, '[7,9)')
+
+statement ok
+CREATE TABLE alter_dup (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO alter_dup VALUES (1, 7), (2, 7)
+
+statement error 23505
+ALTER TABLE alter_dup ADD CONSTRAINT alter_dup_v_key UNIQUE (v)
+
+# FOREIGN KEY validates existing children and then participates in ordinary enforcement.
+statement ok
+CREATE TABLE alter_child (id i32 PRIMARY KEY, parent_code i32)
+
+statement ok
+INSERT INTO alter_child VALUES (1, 10), (2, NULL)
+
+# cost: 3
+statement ok
+ALTER TABLE alter_child ADD CONSTRAINT alter_child_code_fkey FOREIGN KEY (parent_code) REFERENCES alter_parent (code)
+
+statement error 23503
+INSERT INTO alter_child VALUES (3, 999)
+
+statement ok
+CREATE TABLE alter_orphan (id i32 PRIMARY KEY, parent_code i32)
+
+statement ok
+INSERT INTO alter_orphan VALUES (1, 999)
+
+statement error 23503
+ALTER TABLE alter_orphan ADD FOREIGN KEY (parent_code) REFERENCES alter_parent (code)
+
+# Later actions resolve against earlier ones and validation sees the final self-referential state.
+statement ok
+CREATE TABLE alter_self (id i32 PRIMARY KEY, code i32, parent_code i32)
+
+statement ok
+INSERT INTO alter_self VALUES (1, 10, NULL), (2, 20, 10)
+
+statement ok
+ALTER TABLE alter_self ADD CONSTRAINT alter_self_code_key UNIQUE (code), ADD CONSTRAINT alter_self_parent_fkey FOREIGN KEY (parent_code) REFERENCES alter_self (code)
+
+statement error 23503
+INSERT INTO alter_self VALUES (3, 30, 999)
+
+# EXCLUDE validates every existing pair and builds its backing GiST index.
+# cost: 3
+statement ok
+ALTER TABLE alter_parent ADD CONSTRAINT alter_span_excl EXCLUDE USING gist (span WITH &&)
+
+statement error 23P01
+INSERT INTO alter_parent VALUES (3, 30, '[2,5)')
+
+statement ok
+CREATE TABLE alter_overlap (id i32 PRIMARY KEY, span int4range)
+
+statement ok
+INSERT INTO alter_overlap VALUES (1, '[1,5)'), (2, '[4,8)')
+
+statement error 23P01
+ALTER TABLE alter_overlap ADD CONSTRAINT overlap_excl EXCLUDE USING gist (span WITH &&)
+
+# DROP CHECK removes enforcement; IF EXISTS is an action-local no-op.
+statement ok
+ALTER TABLE alter_parent DROP CONSTRAINT code_positive, DROP CONSTRAINT IF EXISTS missing_check
+
+statement ok
+INSERT INTO alter_parent VALUES (3, -1, '[7,9)')
+
+# Referenced UNIQUE constraints default to RESTRICT; CASCADE removes dependent FKs.
+statement error 2BP01
+ALTER TABLE alter_parent DROP CONSTRAINT alter_code_key
+
+statement ok
+ALTER TABLE alter_parent DROP CONSTRAINT alter_code_key CASCADE
+
+statement ok
+INSERT INTO alter_child VALUES (3, 999)
+
+# Dropping EXCLUDE removes the constraint and its backing index/relation name.
+statement ok
+ALTER TABLE alter_parent DROP CONSTRAINT alter_span_excl
+
+statement ok
+INSERT INTO alter_parent VALUES (4, 30, '[2,5)')
+
+# The released relation name can be reused; validation now reaches the conflicting rows (23P01,
+# rather than a stale 42P07 relation collision).
+statement error 23P01
+ALTER TABLE alter_parent ADD CONSTRAINT alter_span_excl EXCLUDE USING gist (span WITH &&)
+
+# Mixed actions see prior edits, but publish only if the final validation succeeds.
+statement error 23514
+ALTER TABLE alter_parent DROP CONSTRAINT code_too_large, ADD CONSTRAINT code_too_large CHECK (code > 1000)
+
+# The failed list kept the old CHECK and did not install the new one.
+statement error 23514
+INSERT INTO alter_parent VALUES (5, 500, '[20,21)')
+
+statement error 42710
+ALTER TABLE alter_parent ADD CONSTRAINT code_too_large CHECK (code < 1000)

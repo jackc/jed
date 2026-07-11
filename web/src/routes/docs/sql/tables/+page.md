@@ -49,14 +49,16 @@ Each is rejected before anything is written — a statement is all-or-nothing. S
 
 ## Altering a table
 
-`ALTER TABLE` can rename a table, column, or constraint, and can change a column's default or
-`NOT NULL` status. Try these statements in the panel above, one at a time:
+`ALTER TABLE` can rename a table, column, or constraint; change a column's default or `NOT NULL`
+status; and add or drop CHECK, UNIQUE, FOREIGN KEY, and EXCLUDE constraints. Try these statements:
 
 ```sql
 ALTER TABLE account RENAME COLUMN balance TO available_balance;
 ALTER TABLE account ALTER COLUMN available_balance SET DEFAULT 0;
 ALTER TABLE account ALTER COLUMN available_balance SET NOT NULL;
 ALTER TABLE account RENAME CONSTRAINT balance_nonnegative TO nonnegative_balance;
+ALTER TABLE account ADD CONSTRAINT owner_unique UNIQUE (owner);
+ALTER TABLE account DROP CONSTRAINT owner_unique;
 ALTER TABLE account RENAME TO ledger_account;
 ```
 
@@ -74,7 +76,9 @@ reports `23502` if any value is null. Renaming a column also updates its stored 
 expressions, plus expression and partial-index definitions. `IF EXISTS` is supported for a missing
 table.
 
-This first ALTER TABLE slice does not yet add or drop columns or constraints, change column types,
+Adding a constraint validates existing rows before publishing it and builds the backing index for
+UNIQUE or EXCLUDE. Dropping a referenced UNIQUE constraint defaults to `RESTRICT`; `CASCADE` also
+removes dependent foreign keys. ALTER TABLE does not yet add or drop columns, change column types,
 or manage identity properties. Identity-column defaults and nullability must be managed through the
 future identity-specific syntax rather than the generic column actions. PRIMARY KEY has no persisted
 constraint object yet, so renaming the derived `account_pkey` handle reports `42704`; that form is

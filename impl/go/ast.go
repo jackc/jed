@@ -40,8 +40,8 @@ type statement struct {
 	Rollback *rollback
 }
 
-// alterTable is ALTER TABLE slice 1 (spec/design/alter.md): one standalone rename or a
-// comma-separated action list. Exactly one Rename* field or Actions is populated.
+// alterTable is ALTER TABLE slices 1-2 (spec/design/alter.md): one standalone rename or a
+// comma-separated mixed action list. Exactly one Rename* field or Actions is populated.
 type alterTable struct {
 	Name             string
 	DB               *string
@@ -49,10 +49,29 @@ type alterTable struct {
 	RenameTable      string
 	RenameColumn     *renamePair
 	RenameConstraint *renamePair
-	Actions          []alterColumnAction
+	Actions          []alterTableEdit
 }
 
 type renamePair struct{ Old, New string }
+
+type alterTableEdit struct {
+	Column *alterColumnAction
+	Add    *alterConstraintDef
+	Drop   *dropConstraintDef
+}
+
+type alterConstraintDef struct {
+	Check   *checkDef
+	Unique  *uniqueDef
+	Foreign *foreignKeyDef
+	Exclude *excludeDef
+}
+
+type dropConstraintDef struct {
+	Name     string
+	IfExists bool
+	Cascade  bool
+}
 
 type alterColumnAction struct {
 	Column  string
