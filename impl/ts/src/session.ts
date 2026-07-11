@@ -263,8 +263,8 @@ export function streamingScanEligible(plan: SelectPlan): boolean {
     plan.joins.length === 0 &&
     !plan.isAgg &&
     !plan.hasWindow &&
-    (plan.pkOrdered || (!plan.distinct && plan.order.length === 0 && plan.limit !== null)) &&
-    !needsEagerScan(plan.relBounds[0]) &&
+    (plan.phys.pkOrdered || (!plan.distinct && plan.order.length === 0 && plan.limit !== null)) &&
+    !needsEagerScan(plan.phys.relBounds[0]) &&
     plan.rels[0]!.srf === undefined &&
     plan.rels[0]!.cte === undefined &&
     plan.rels[0]!.derived === undefined
@@ -319,7 +319,7 @@ export function vectorizedProjectEligible(plan: SelectPlan): boolean {
   if (plan.order.length !== 0 || plan.limit !== null || plan.offset !== null) return false;
   // Full scan or a primary-key bound only — an index / GIN / GiST / point-set bound changes the scan
   // mechanics (needsEagerScan), so it keeps the general materialize path.
-  if (needsEagerScan(plan.relBounds[0])) return false;
+  if (needsEagerScan(plan.phys.relBounds[0])) return false;
   // Every projection must be a bare column reference: a bare "column" evaluates to row[index] with zero
   // operator_eval, so gathering it from a dense lane is cost-identical. An expression projection
   // (`c0 + 1`, a function call) charges operator_eval and needs a row — it keeps the row path.
@@ -491,7 +491,7 @@ export function* streamRows(
   let passed = 0n;
   let produced = 0n;
   // A pkReverse plan (ORDER BY the full PK all-DESC) walks the tree backward; everything else forward.
-  for (const [, rawRow] of store.scanIter(bound, sp.pkReverse)) {
+  for (const [, rawRow] of store.scanIter(bound, sp.phys.pkReverse)) {
     meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
     meter.charge(COSTS.storageRowRead);
     // Materialize the touched columns left unfetched by the lazy load (large-values.md §14); the chain

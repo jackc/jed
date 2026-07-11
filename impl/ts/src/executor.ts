@@ -2696,12 +2696,12 @@ export class Engine {
     }
     let orderNote = "";
     if (sp.order.length > 0) {
-      if (sp.pkOrdered) {
+      if (sp.phys.pkOrdered) {
         orderNote = "pk ordered";
-        if (sp.pkReverse) orderNote += " (reverse)";
-      } else if (sp.indexOrder !== null) {
-        orderNote = "index order: " + sp.indexOrder.nameKey;
-      } else if (sp.joinPkOrdered) {
+        if (sp.phys.pkReverse) orderNote += " (reverse)";
+      } else if (sp.phys.indexOrder !== null) {
+        orderNote = "index order: " + sp.phys.indexOrder.nameKey;
+      } else if (sp.phys.joinPkOrdered) {
         orderNote = "join pk ordered";
       } else {
         r.emit(d, "Sort", `keys=${sp.order.length}`);
@@ -2800,8 +2800,8 @@ export class Engine {
     }
     // An index-nested-loop bound (per-outer-row seek) takes precedence over the once-materialized
     // bound in the access-path label (cost.md §3 "JOIN").
-    const inl = sp.relINLBounds[i] !== null;
-    const bound = inl ? sp.relINLBounds[i]! : sp.relBounds[i]!;
+    const inl = sp.phys.relINLBounds[i] !== null;
+    const bound = inl ? sp.phys.relINLBounds[i]! : sp.phys.relBounds[i]!;
     r.emit(
       depth,
       "Scan " + rel.tableName,
@@ -9000,13 +9000,15 @@ export class Engine {
       distinct: sel.distinct,
       limit: sel.limit,
       offset: sel.offset,
-      pkOrdered: pkDir !== null,
-      pkReverse: pkDir?.reverse ?? false,
-      indexOrder,
-      joinPkOrdered,
-      relBounds,
-      relINLBounds,
       relMasks,
+      phys: {
+        pkOrdered: pkDir !== null,
+        pkReverse: pkDir?.reverse ?? false,
+        indexOrder,
+        joinPkOrdered,
+        relBounds,
+        relINLBounds,
+      },
     };
   }
 
@@ -9915,7 +9917,7 @@ export class Engine {
   // execStreamingScan executes the streaming primary-key-ordered scan path (spec/design/cost.md §3):
   // a single-table, no-blocking-operator query whose output order is already the table's primary-key
   // scan order — either no ORDER BY (the LIMIT short-circuit) or an ORDER BY satisfied by PK order
-  // (plan.pkOrdered, set by orderSatisfiedByPK) — streams scan→filter→project with NO sort, and (when
+  // (plan.phys.pkOrdered, set by orderSatisfiedByPK) — streams scan→filter→project with NO sort, and (when
   // there is a LIMIT) stops the scan the instant the LIMIT/OFFSET window is filled, charging
   // storageRowRead only for the rows actually read. With no LIMIT it emits every survivor after
   // OFFSET (the sort is simply elided — same rows, same cost as the eager/sort path).
@@ -10041,7 +10043,7 @@ export class Engine {
       // (e.g. pk = NULL) admits no row.
       let keyB: KeyBound = unboundedBound();
       let empty = false;
-      const sb = sp.relBounds[0]!;
+      const sb = sp.phys.relBounds[0]!;
       if (sb !== null && sb.kind === "pk") {
         const b = buildKeyBound(sb.pk, bound, [], []);
         if (b === null) empty = true;
@@ -10233,7 +10235,7 @@ export class Engine {
     // (cost.md §3 "LIMIT short-circuit").
     let bound: KeyBound = unboundedBound();
     let empty = false;
-    const sb = plan.relBounds[0]!;
+    const sb = plan.phys.relBounds[0]!;
     if (sb !== null) {
       if (sb.kind !== "pk") throw new Error("the streaming path is gated to PK/full scans");
       const b = buildKeyBound(sb.pk, params, env.outer, []);
@@ -10289,7 +10291,7 @@ export class Engine {
       };
       // A pkReverse plan (ORDER BY the full PK all-DESC) walks the tree backward; everything else
       // (forward pkOrdered, or the no-ORDER-BY LIMIT short-circuit) walks forward.
-      if (plan.pkReverse) store.scanRangeRev(bound, visit);
+      if (plan.phys.pkReverse) store.scanRangeRev(bound, visit);
       else store.scanRange(bound, visit);
     }
     return {
@@ -10317,13 +10319,19 @@ export class Engine {
   // cost drops (fewer rows scanned/folded), the deliberate cost change (like the streaming LIMIT
   // short-circuit — cross-core identical because every core caps at the same OFFSET+LIMIT).
   private windowTopNEligible(plan: SelectPlan): boolean {
-    if (!plan.hasWindow || plan.isAgg || plan.distinct || plan.limit === null || !plan.pkOrdered) {
+    if (
+      !plan.hasWindow ||
+      plan.isAgg ||
+      plan.distinct ||
+      plan.limit === null ||
+      !plan.phys.pkOrdered
+    ) {
       return false;
     }
     if (plan.rels.length !== 1 || plan.joins.length !== 0) return false;
     const rel = plan.rels[0]!;
     if (rel.srf !== undefined || rel.cte !== undefined || rel.derived !== undefined) return false;
-    if (needsEagerScan(plan.relBounds[0])) return false;
+    if (needsEagerScan(plan.phys.relBounds[0])) return false;
     if (plan.windowKeys.length !== 0 || plan.orderExprs.length !== 0) return false;
     const table = this.lkpTableScoped(rel.db, rel.tableName);
     if (table === undefined) return false;
@@ -10352,7 +10360,7 @@ export class Engine {
   ): boolean {
     if (spec.partition.length !== 0 || spec.order.length === 0) return false;
     const dir = orderSatisfiedByPK(this.readSnap(), table, offset, spec.order);
-    if (dir === null || dir.reverse !== plan.pkReverse) return false;
+    if (dir === null || dir.reverse !== plan.phys.pkReverse) return false;
     // The order covers the full (unique) PK ⇒ singleton peer groups (needed for a RANGE/GROUPS
     // CURRENT-ROW frame end, which otherwise spans forward peers).
     const unique = spec.order.length >= pkIndices(table).length;
@@ -10389,7 +10397,7 @@ export class Engine {
     // The scan bound (the PK pushdown, if any) + its pageRead block, exactly as execStreamingScan.
     let bound: KeyBound = unboundedBound();
     let empty = false;
-    const sb = plan.relBounds[0]!;
+    const sb = plan.phys.relBounds[0]!;
     if (sb !== null) {
       if (sb.kind !== "pk") throw new Error("the windowed top-N path is gated to PK/full scans");
       const b = buildKeyBound(sb.pk, params, env.outer, []);
@@ -10417,7 +10425,7 @@ export class Engine {
         rows.push(row);
         return BigInt(rows.length) < cap; // stop once the OFFSET+LIMIT window is filled
       };
-      if (plan.pkReverse) store.scanRangeRev(bound, visit);
+      if (plan.phys.pkReverse) store.scanRangeRev(bound, visit);
       else store.scanRange(bound, visit);
     }
 
@@ -10435,7 +10443,7 @@ export class Engine {
 
   // execIndexOrderScan is the streaming secondary-index-order scan (cost.md §3 "secondary-index
   // order"): an ORDER BY the PK scan does NOT satisfy but a B-tree index does, with a LIMIT (the gate
-  // — plan.indexOrder non-null). It walks the index store forward in key order, peels the fixed-width
+  // — plan.phys.indexOrder non-null). It walks the index store forward in key order, peels the fixed-width
   // PK suffix off the END of each entry key (the "key-suffix skip"), point-looks-up the row, applies
   // the residual filter, and STOPS once the LIMIT/OFFSET window is filled — a top-N that elides the
   // blocking sort (and, for a collated index, the collate units). The index-tree pageRead is charged
@@ -10514,7 +10522,7 @@ export class Engine {
     // up front — identical to the eager scan (cost.md §3). An INDEX bound never reaches here.
     let bound: KeyBound = unboundedBound();
     let empty = false;
-    const sb = plan.relBounds[0]!;
+    const sb = plan.phys.relBounds[0]!;
     if (sb !== null) {
       if (sb.kind !== "pk") throw new Error("the streaming sort path is gated to PK/full scans");
       const b = buildKeyBound(sb.pk, params, env.outer, []);
@@ -10599,7 +10607,7 @@ export class Engine {
   // combined rows in (outer PK, inner key) order — which IS the requested order — so the sort is
   // elided, and with a LIMIT the loop STOPS once the window is filled. Both tables are still
   // materialized in full (storageRowRead = the sum of cardinalities, the join contract); only the
-  // ON/WHERE operator_evals and rowProduced short-circuit. Gated (by the caller / plan.joinPkOrdered)
+  // ON/WHERE operator_evals and rowProduced short-circuit. Gated (by the caller / plan.phys.joinPkOrdered)
   // to exactly two non-lateral base relations, an INNER/CROSS join, a LIMIT, and a forward outer-PK
   // ORDER BY.
   private execStreamingJoin(
@@ -10748,7 +10756,7 @@ export class Engine {
     // An index-nested-loop bound (per-outer-row seek) takes precedence over the once-materialized bound
     // and resolves its sibling source from the current left row (cost.md §3 "JOIN"); else the
     // once-materialized relBounds.
-    const relBound = plan.relINLBounds[ri] ?? plan.relBounds[ri]!;
+    const relBound = plan.phys.relINLBounds[ri] ?? plan.phys.relBounds[ri]!;
     if (relBound !== null && relBound.kind === "index") {
       const r = this.indexBoundRows(
         rel.tableName,
@@ -10965,7 +10973,7 @@ export class Engine {
     const slabs = 0;
     let doScan = true;
     let b = unboundedBound();
-    const relBound = plan.relBounds[0];
+    const relBound = plan.phys.relBounds[0];
     if (relBound !== null && relBound !== undefined && relBound.kind === "pk") {
       const bb = buildKeyBound(relBound.pk, params, env.outer, []);
       if (bb === null) doScan = false;
@@ -11019,7 +11027,7 @@ export class Engine {
     }
     // Full scan or a primary-key bound only — an index / GIN / GiST / point-set bound changes the scan
     // mechanics and residual filter (needsEagerScan), so it keeps the scalar path.
-    if (needsEagerScan(plan.relBounds[0])) return false;
+    if (needsEagerScan(plan.phys.relBounds[0])) return false;
     // Exactly one grouping set (ROLLUP/CUBE/GROUPING SETS produce several — deferred), no materialized
     // expression keys (`GROUP BY a + b`), and no GROUPING() calls.
     if (
@@ -11142,7 +11150,7 @@ export class Engine {
     // empty bound (a contradictory PK predicate) admits no rows — skip the scan entirely.
     let doScan = true;
     let b = unboundedBound();
-    const relBound = plan.relBounds[0];
+    const relBound = plan.phys.relBounds[0];
     if (relBound !== null && relBound !== undefined && relBound.kind === "pk") {
       const bb = buildKeyBound(relBound.pk, params, env.outer, []);
       if (bb === null) doScan = false;
@@ -11246,7 +11254,7 @@ export class Engine {
     // Streaming primary-key-ordered scan (spec/design/cost.md §3): a single-table query with no
     // blocking operator beyond an ORDER BY the scan already satisfies — either no ORDER BY with a
     // LIMIT (the LIMIT short-circuit), or an ORDER BY satisfied by the table's primary-key scan order
-    // (plan.pkOrdered) — streams scan→filter→project with NO sort, and with a LIMIT STOPS the scan
+    // (plan.phys.pkOrdered) — streams scan→filter→project with NO sort, and with a LIMIT STOPS the scan
     // once the window is filled, so storageRowRead counts only the rows actually read. A pkOrdered
     // DISTINCT streams too: the dedup runs in scan order (the sort elided), so it short-circuits a
     // top-N like the non-DISTINCT case. A non-PK-ordered ORDER BY, a no-ORDER-BY DISTINCT, aggregate,
@@ -11259,12 +11267,12 @@ export class Engine {
     // indexOrder only for a single-table, non-aggregate/window/DISTINCT, no-bound, LIMITed query
     // whose ORDER BY a B-tree index satisfies (and the PK scan does not). Walk the index +
     // point-lookup; the eager sort is elided.
-    if (plan.indexOrder !== null) {
-      return finalEmitter(this.execIndexOrderScan(plan, plan.indexOrder, env, meter).rows);
+    if (plan.phys.indexOrder !== null) {
+      return finalEmitter(this.execIndexOrderScan(plan, plan.phys.indexOrder, env, meter).rows);
     }
 
     // Streaming external sort (spec/design/spill.md §5): a single-table, no-join, non-aggregate,
-    // non-DISTINCT query with an ORDER BY the scan does NOT already satisfy (!plan.pkOrdered — caught
+    // non-DISTINCT query with an ORDER BY the scan does NOT already satisfy (!plan.phys.pkOrdered — caught
     // above) streams scan→filter→sorter, so the input is never materialized in the executor heap and
     // the sort spills sorted runs to disk under workMem (file-backed databases). DISTINCT/aggregate/
     // join take the eager path below, and an index bound does not stream (like the LIMIT
@@ -11272,14 +11280,14 @@ export class Engine {
     // cost.md §3; spill.md §6).
     if (
       plan.order.length > 0 &&
-      !plan.pkOrdered &&
+      !plan.phys.pkOrdered &&
       plan.orderExprs.length === 0 && // a materialized expression key takes the eager path below
       plan.rels.length === 1 &&
       plan.joins.length === 0 &&
       !plan.isAgg &&
       !plan.hasWindow &&
       !plan.distinct &&
-      !needsEagerScan(plan.relBounds[0]) &&
+      !needsEagerScan(plan.phys.relBounds[0]) &&
       // A set-returning relation takes the eager path (functions.md §10).
       plan.rels[0]!.srf === undefined &&
       // A CTE reference takes the eager path (cte.md §5).
@@ -11297,7 +11305,7 @@ export class Engine {
     // INNER/CROSS join whose ORDER BY the OUTER relation's PK scan order satisfies, with a LIMIT. The
     // nested loop drives the outer in PK order so the output is already ordered — the sort is elided
     // and the loop short-circuits a top-N.
-    if (plan.joinPkOrdered) {
+    if (plan.phys.joinPkOrdered) {
       return finalEmitter(this.execStreamingJoin(plan, env, meter, params, env.outer).rows);
     }
 
@@ -11331,7 +11339,7 @@ export class Engine {
     // bound seeks per outer row), so it is not materialized up front either — an empty placeholder
     // holds its slot and the join loop re-materializes it per left row.
     const materialized: Row[][] = plan.rels.map((rel, ri) =>
-      rel.lateral === true || plan.relINLBounds[ri] !== null
+      rel.lateral === true || plan.phys.relINLBounds[ri] !== null
         ? []
         : this.materializeRel(plan, ri, env.outer, [], env, params, meter),
     );
@@ -11394,7 +11402,7 @@ export class Engine {
       // of an INNER/CROSS/LEFT join, so there is never an unmatched-RIGHT emission (RIGHT/FULL are
       // excluded — a preserved side cannot be bounded per outer row). The whole ON/WHERE stays applied
       // (the ON here, the WHERE below), so rows are unchanged.
-      if (plan.relINLBounds[k + 1] !== null) {
+      if (plan.phys.relINLBounds[k + 1] !== null) {
         for (const left of running) {
           const rightRows = this.materializeRel(plan, k + 1, env.outer, left, env, params, meter);
           let leftMatched = false;
@@ -16632,6 +16640,24 @@ export type SelectPlan = {
   distinct: boolean;
   limit: bigint | null;
   offset: bigint | null;
+  // relMasks is the TOUCHED SET per relation (cost.md §3 "The touched set"; large-values.md §14):
+  // which of its columns this query statically references. Drives the chain-pageRead /
+  // valueDecompress portion of the scan's up-front cost block — an untouched spilled or
+  // compressed column charges nothing, however many records the bound admits. An ANNOTATION of the
+  // logical plan, not an optimization: a wrong mask is a disk-mode NULL-folding correctness bug,
+  // not a slow plan — so it is computed by the resolve half (computeRelMasks), never by a physical
+  // rule (spec/design/planner.md §2).
+  relMasks: boolean[][];
+  // phys is the plan's physical / access-path decisions — set ONLY by the optimizeSelect pass
+  // (optimize.ts); zero-valued when resolve hands the plan over (spec/design/planner.md §4).
+  phys: PhysicalPlan;
+};
+
+// PhysicalPlan is the physical/access-path half of a SelectPlan: every field is the output of one
+// discrete rule of the optimizeSelect pass (spec/design/planner.md §4), applied in a fixed order
+// after the resolve half has built the logical plan. A zero-valued PhysicalPlan is always correct —
+// the executor then full-scans and eager-sorts.
+export type PhysicalPlan = {
   // pkOrdered reports that ORDER BY is satisfied by the single base relation's PRIMARY-KEY scan
   // order — the table tree already yields rows in this order, so the sort is elided (and with a
   // LIMIT the scan short-circuits a top-N). True iff the query is a single-table, non-aggregate,
@@ -16667,11 +16693,6 @@ export type SelectPlan = {
   // O(N·M) → O(N·log M). null ⇒ the ordinary once-materialized relBounds path. A non-null entry takes
   // precedence over relBounds for that relation.
   relINLBounds: (ScanBound | null)[];
-  // relMasks is the TOUCHED SET per relation (cost.md §3 "The touched set"; large-values.md §14):
-  // which of its columns this query statically references. Drives the chain-pageRead /
-  // valueDecompress portion of the scan's up-front cost block — an untouched spilled or
-  // compressed column charges nothing, however many records the bound admits.
-  relMasks: boolean[][];
 };
 
 // SetOpPlan is a resolved set operation: both operands planned with the same parent scope, the
