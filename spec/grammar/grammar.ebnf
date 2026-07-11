@@ -44,6 +44,7 @@
 
 sql_statement  ::= create_table
                  | drop_table
+                 | alter_table
                  | create_index
                  | drop_index
                  | create_sequence
@@ -212,6 +213,23 @@ referential_action ::= "NO" "ACTION" | "RESTRICT" | "CASCADE" | "SET" "NULL" | "
  * stays an identifier and "DROP TABLE if" drops a table named "if" (PG-faithful). */
 drop_table     ::= "DROP" "TABLE" ("IF" "EXISTS")? identifier ("," identifier)*
                    ("CASCADE" | "RESTRICT")?
+
+/* ALTER TABLE slice 1 (../design/alter.md): catalog-only renames, defaults, and nullability.
+ * RENAME is a standalone form, matching PostgreSQL; ALTER COLUMN actions may be comma-combined and
+ * are validated against one left-to-right working catalog entry before it is published. COLUMN is a
+ * noise word. SET NOT NULL validates existing rows (23502); DROP NOT NULL is forbidden for a primary
+ * key member (42P16). A column rename rewrites this table's persisted CHECK/default/index-expression
+ * text. No form changes row bytes or the on-disk format version. */
+alter_table    ::= "ALTER" "TABLE" ("IF" "EXISTS")? qualified_table
+                   ( "RENAME" ( "COLUMN"? identifier "TO" identifier
+                                | "CONSTRAINT" identifier "TO" identifier
+                                | "TO" identifier )
+                   | alter_table_action ("," alter_table_action)* )
+alter_table_action ::= "ALTER" "COLUMN"? identifier alter_column_action
+alter_column_action ::= "SET" "DEFAULT" expr
+                      | "DROP" "DEFAULT"
+                      | "SET" "NOT" "NULL"
+                      | "DROP" "NOT" "NULL"
 
 /* CREATE INDEX declares a secondary index over one or more named columns of one table
  * (../design/indexes.md). "CREATE UNIQUE INDEX" makes it a UNIQUE index: building it over

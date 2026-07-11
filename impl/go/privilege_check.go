@@ -22,7 +22,7 @@ func stmtIsWrite(stmt statement) bool {
 	if stmt.Explain != nil {
 		return stmt.Explain.Analyze && stmtIsWrite(*stmt.Explain.Inner)
 	}
-	if stmt.CreateTable != nil || stmt.DropTable != nil ||
+	if stmt.CreateTable != nil || stmt.DropTable != nil || stmt.AlterTable != nil ||
 		stmt.CreateIndex != nil || stmt.DropIndex != nil ||
 		stmt.CreateType != nil || stmt.DropType != nil ||
 		stmt.CreateSequence != nil || stmt.AlterSequence != nil || stmt.DropSequence != nil ||
@@ -380,6 +380,7 @@ func (db *engine) checkPrivileges(stmt statement) error {
 			(stmt.CreateIndex != nil && db.isTempTable(stmt.CreateIndex.Table)) ||
 			(stmt.DropIndex != nil && db.isTempIndex(stmt.DropIndex.Name)) ||
 			(stmt.DropSequence != nil && db.anyTempSequence(stmt.DropSequence.Names)) ||
+			(stmt.AlterTable != nil && db.isTempTable(stmt.AlterTable.Name)) ||
 			(stmt.AlterSequence != nil && db.isTempSequence(stmt.AlterSequence.Name)):
 			allowed = db.session.allowTempDDL
 		default:
@@ -481,7 +482,7 @@ func collectStmtPrivs(stmt statement, req *privReq) {
 		// A temp table's DDL is gated by the temp-scoped split of allowDDL (temp-tables.md §5):
 		// allowTempDDL for a session-local temp table.
 		req.isTempDDL = stmt.CreateTable.Temp
-	case stmt.DropTable != nil, stmt.CreateIndex != nil, stmt.DropIndex != nil,
+	case stmt.DropTable != nil, stmt.AlterTable != nil, stmt.CreateIndex != nil, stmt.DropIndex != nil,
 		stmt.CreateType != nil, stmt.DropType != nil, stmt.CreateSequence != nil, stmt.DropSequence != nil,
 		stmt.AlterSequence != nil:
 		req.isDDL = true

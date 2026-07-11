@@ -49,6 +49,10 @@ impl Engine {
                 reject_params_for_ddl(params)?;
                 self.execute_drop_table(dt)
             }
+            Statement::AlterTable(at) => {
+                reject_params_for_ddl(params)?;
+                self.execute_alter_table(at)
+            }
             Statement::CreateIndex(ci) => {
                 reject_params_for_ddl(params)?;
                 self.execute_create_index(ci)
@@ -1359,6 +1363,369 @@ impl Engine {
             cost: 0,
             rows_affected: None,
         })
+    }
+
+    /// Execute ALTER TABLE slice 1 (alter.md §1/§2): catalog-only renames/defaults/nullability.
+    pub(crate) fn execute_alter_table(&mut self, at: AlterTable) -> Result<Outcome> {
+        check_catalog_rel_write(&at.name)?;
+        self.check_attachment_writable(at.db.as_deref())?;
+        let snap = match at.db.as_deref().map(str::to_ascii_lowercase) {
+            None => {
+                if self.is_temp_table(&at.name)
+                    || self.temp_read_snap().find_index(&at.name).is_some()
+                    || self.temp_read_snap().sequence(&at.name).is_some()
+                {
+                    self.temp_read_snap()
+                } else {
+                    self.read_snap()
+                }
+            }
+            Some(q) if q == "temp" => self.temp_read_snap(),
+            Some(q) if q == "main" => self.read_snap(),
+            Some(q) => self.attach_read_snap(&q).ok_or_else(|| {
+                EngineError::new(
+                    SqlState::UndefinedTable,
+                    format!("database \"{}\" is not attached", at.db.as_deref().unwrap()),
+                )
+            })?,
+        };
+        let Some(original_ref) = snap.table(&at.name) else {
+            if snap.find_index(&at.name).is_some() || snap.sequence(&at.name).is_some() {
+                return Err(EngineError::new(
+                    SqlState::WrongObjectType,
+                    format!("{} is not a table", at.name),
+                ));
+            }
+            if at.if_exists {
+                return Ok(Outcome::Statement {
+                    cost: 0,
+                    rows_affected: None,
+                });
+            }
+            return Err(EngineError::new(
+                SqlState::UndefinedTable,
+                format!("table does not exist: {}", at.name),
+            ));
+        };
+        let original = original_ref.clone();
+        let old_key = original.name.to_ascii_lowercase();
+        let mut table = original.clone();
+        let mut rename_table = false;
+        let mut index_rename: Option<(String, String)> = None;
+        let attachment_scope = at
+            .db
+            .as_deref()
+            .is_some_and(|q| !matches!(q.to_ascii_lowercase().as_str(), "main" | "temp"));
+        let relation_taken = |name: &str| {
+            if attachment_scope {
+                snap.table(name).is_some()
+                    || snap.find_index(name).is_some()
+                    || snap.sequence(name).is_some()
+            } else {
+                self.relation_exists(name)
+            }
+        };
+
+        match at.action {
+            AlterTableAction::RenameTable(new_name) => {
+                check_reserved_name("table", &new_name)?;
+                if relation_taken(&new_name) {
+                    return Err(EngineError::new(
+                        SqlState::DuplicateTable,
+                        format!("relation already exists: {new_name}"),
+                    ));
+                }
+                self.rewrite_table_expressions(&mut table, None, Some(&new_name))?;
+                table.name = new_name;
+                rename_table = true;
+            }
+            AlterTableAction::RenameColumn { old, new } => {
+                let Some(ci) = table
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(&old))
+                else {
+                    return Err(EngineError::new(
+                        SqlState::UndefinedColumn,
+                        format!("column does not exist: {old}"),
+                    ));
+                };
+                if table
+                    .columns
+                    .iter()
+                    .any(|c| c.name.eq_ignore_ascii_case(&new))
+                {
+                    return Err(EngineError::new(
+                        SqlState::DuplicateColumn,
+                        format!("column already exists: {new}"),
+                    ));
+                }
+                self.rewrite_table_expressions(&mut table, Some((&old, &new)), None)?;
+                table.columns[ci].name = new;
+            }
+            AlterTableAction::RenameConstraint { old, new } => {
+                let exists = |name: &str, t: &Table| {
+                    t.checks.iter().any(|c| c.name.eq_ignore_ascii_case(name))
+                        || t.indexes
+                            .iter()
+                            .any(|i| i.unique && i.name.eq_ignore_ascii_case(name))
+                        || t.foreign_keys
+                            .iter()
+                            .any(|f| f.name.eq_ignore_ascii_case(name))
+                        || t.exclusions
+                            .iter()
+                            .any(|e| e.name.eq_ignore_ascii_case(name))
+                };
+                if !exists(&old, &table) {
+                    return Err(EngineError::new(
+                        SqlState::UndefinedObject,
+                        format!("constraint does not exist: {old}"),
+                    ));
+                }
+                if exists(&new, &table) {
+                    return Err(EngineError::new(
+                        SqlState::DuplicateObject,
+                        format!("constraint already exists: {new}"),
+                    ));
+                }
+                for c in &mut table.checks {
+                    if c.name.eq_ignore_ascii_case(&old) {
+                        c.name = new.clone();
+                    }
+                }
+                for f in &mut table.foreign_keys {
+                    if f.name.eq_ignore_ascii_case(&old) {
+                        f.name = new.clone();
+                    }
+                }
+                for e in &mut table.exclusions {
+                    if e.name.eq_ignore_ascii_case(&old) {
+                        e.name = new.clone();
+                        e.index = new.clone();
+                        index_rename = Some((old.clone(), new.clone()));
+                    }
+                }
+                for i in &mut table.indexes {
+                    if (i.unique || index_rename.is_some()) && i.name.eq_ignore_ascii_case(&old) {
+                        i.name = new.clone();
+                        index_rename = Some((old.clone(), new.clone()));
+                    }
+                }
+                if index_rename.is_some() && relation_taken(&new) {
+                    return Err(EngineError::new(
+                        SqlState::DuplicateTable,
+                        format!("relation already exists: {new}"),
+                    ));
+                }
+                table.checks.sort_by_key(|x| x.name.to_ascii_lowercase());
+                table.indexes.sort_by_key(|x| x.name.to_ascii_lowercase());
+                table
+                    .foreign_keys
+                    .sort_by_key(|x| x.name.to_ascii_lowercase());
+                table
+                    .exclusions
+                    .sort_by_key(|x| x.name.to_ascii_lowercase());
+            }
+            AlterTableAction::AlterColumns(actions) => {
+                for edit in actions {
+                    let Some(ci) = table
+                        .columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(&edit.column))
+                    else {
+                        return Err(EngineError::new(
+                            SqlState::UndefinedColumn,
+                            format!("column does not exist: {}", edit.column),
+                        ));
+                    };
+                    match edit.action {
+                        AlterColumnKind::SetDefault(def) => {
+                            if table.columns[ci].identity.is_some() {
+                                return Err(EngineError::new(
+                                    SqlState::SyntaxError,
+                                    "identity column cannot have a default".to_string(),
+                                ));
+                            }
+                            let (value, expr) =
+                                self.build_alter_default(&table.columns[ci], &def)?;
+                            table.columns[ci].default = value;
+                            table.columns[ci].default_expr = expr;
+                        }
+                        AlterColumnKind::DropDefault => {
+                            if table.columns[ci].identity.is_some() {
+                                return Err(EngineError::new(
+                                    SqlState::SyntaxError,
+                                    "identity column cannot drop its default".to_string(),
+                                ));
+                            }
+                            table.columns[ci].default = None;
+                            table.columns[ci].default_expr = None;
+                        }
+                        AlterColumnKind::SetNotNull => table.columns[ci].not_null = true,
+                        AlterColumnKind::DropNotNull => {
+                            if table.columns[ci].identity.is_some() {
+                                return Err(EngineError::new(
+                                    SqlState::SyntaxError,
+                                    "identity column cannot drop not null".to_string(),
+                                ));
+                            }
+                            if table.columns[ci].primary_key {
+                                return Err(EngineError::new(
+                                    SqlState::InvalidTableDefinition,
+                                    "column is in a primary key".to_string(),
+                                ));
+                            }
+                            table.columns[ci].not_null = false;
+                        }
+                    }
+                }
+            }
+        }
+
+        let mask: Vec<bool> = table
+            .columns
+            .iter()
+            .zip(&original.columns)
+            .map(|(n, o)| !o.not_null && n.not_null)
+            .collect();
+        let mut meter = self.session.new_meter();
+        if mask.iter().any(|x| *x) {
+            let store = self.store_scoped(at.db.as_deref(), &original.name);
+            let (entries, pages, slabs) = store.scan_with_units(&mask)?;
+            meter.charge(COSTS.page_read * pages as i64 + COSTS.value_decompress * slabs as i64);
+            for (_, mut row) in entries {
+                meter.guard()?;
+                meter.charge(COSTS.storage_row_read);
+                store.resolve_inline_columns(&mut row)?;
+                for (i, check) in mask.iter().enumerate() {
+                    if *check && matches!(row[i], Value::Null) {
+                        return Err(EngineError::not_null_violation(&table.columns[i].name));
+                    }
+                }
+            }
+        }
+        let ir = index_rename.as_ref().map(|(a, b)| (a.as_str(), b.as_str()));
+        match at.db.as_deref().map(str::to_ascii_lowercase) {
+            None if self.is_temp_table(&original.name) => self
+                .temp_working_mut()
+                .alter_table_catalog(&old_key, table, rename_table, ir),
+            None => self
+                .working_mut()
+                .alter_table_catalog(&old_key, table, rename_table, ir),
+            Some(q) if q == "temp" => {
+                self.temp_working_mut()
+                    .alter_table_catalog(&old_key, table, rename_table, ir)
+            }
+            Some(q) if q == "main" => {
+                self.working_mut()
+                    .alter_table_catalog(&old_key, table, rename_table, ir)
+            }
+            Some(q) => {
+                self.attach_write_snap(&q)
+                    .alter_table_catalog(&old_key, table, rename_table, ir)
+            }
+        }
+        Ok(Outcome::Statement {
+            cost: meter.accrued,
+            rows_affected: None,
+        })
+    }
+
+    fn rewrite_table_expressions(
+        &self,
+        table: &mut Table,
+        column: Option<(&str, &str)>,
+        rename: Option<&str>,
+    ) -> Result<()> {
+        let table_name = table.name.clone();
+        let rewrite = |text: &str| match column {
+            Some((old, new)) => {
+                crate::parser::rewrite_column_identifier(text, &table_name, old, new)
+            }
+            None => crate::parser::rewrite_table_qualifier(text, &table_name, rename.unwrap()),
+        };
+        for c in &mut table.checks {
+            let (text, expr) = rewrite(&c.expr_text)?;
+            c.expr_text = text;
+            c.expr = expr;
+        }
+        for c in &mut table.columns {
+            if let Some(d) = &mut c.default_expr {
+                let (text, expr) = rewrite(&d.expr_text)?;
+                d.expr_text = text;
+                d.expr = expr;
+            }
+        }
+        for i in &mut table.indexes {
+            for k in &mut i.keys {
+                if let IndexKey::Expr(e) = k {
+                    let (text, expr) = rewrite(&e.expr_text)?;
+                    e.expr_text = text;
+                    e.expr = expr;
+                }
+            }
+            if let Some(p) = &mut i.predicate {
+                let (text, expr) = rewrite(&p.expr_text)?;
+                p.expr_text = text;
+                p.expr = expr;
+            }
+        }
+        Ok(())
+    }
+
+    fn build_alter_default(
+        &self,
+        col: &Column,
+        def: &DefaultDef,
+    ) -> Result<(Option<Value>, Option<DefaultExpr>)> {
+        let Type::Scalar(sty) = &col.ty else {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "a DEFAULT on this container type is not supported yet".to_string(),
+            ));
+        };
+        let sty = *sty;
+        let clock_default = sty.is_date()
+            && matches!(&def.expr, Expr::Literal(Literal::Text(s)) if crate::date::date_clock_is_relative(s));
+        if let Expr::Literal(lit) = &def.expr
+            && !clock_default
+        {
+            return Ok((
+                Some(store_value(
+                    literal_to_value_for(lit, sty)?,
+                    sty,
+                    col.decimal,
+                    col.varchar_len,
+                    false,
+                    &col.name,
+                )?),
+                None,
+            ));
+        }
+        reject_default_structure(&def.expr)?;
+        let scope = Scope::empty(self);
+        let (_, rt) = resolve(
+            &scope,
+            &def.expr,
+            Some(sty),
+            &mut AggCtx::Forbidden,
+            &mut ParamTypes::default(),
+        )?;
+        if !rt.assignable_to(sty) {
+            return Err(type_error(format!(
+                "column {} is of type {} but default expression is of type {}",
+                col.name,
+                sty.canonical_name(),
+                rt.type_name()
+            )));
+        }
+        Ok((
+            None,
+            Some(DefaultExpr {
+                expr_text: def.text.clone(),
+                expr: def.expr.clone(),
+            }),
+        ))
     }
 
     /// Resolve a table's CHECK constraints for a write statement: each stored expression

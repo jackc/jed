@@ -184,6 +184,13 @@ func (p *parser) parseStatement() (statement, error) {
 			}
 			return statement{AlterSequence: as}, nil
 		}
+		if p.peekKeywordAt(1) == "table" {
+			at, err := p.parseAlterTable()
+			if err != nil {
+				return statement{}, err
+			}
+			return statement{AlterTable: at}, nil
+		}
 		return statement{}, newError(SyntaxError, "unexpected keyword 'alter'")
 	case "insert":
 		ins, err := p.parseInsert()
@@ -1694,6 +1701,128 @@ func (p *parser) parseDropSequence() (*dropSequence, error) {
 		return nil, newError(FeatureNotSupported, "DROP SEQUENCE ... CASCADE is not supported")
 	}
 	return &dropSequence{Names: names, IfExists: ifExists}, nil
+}
+
+// parseAlterTable parses the catalog-only first ALTER TABLE slice (alter.md §1/§2).
+func (p *parser) parseAlterTable() (*alterTable, error) {
+	if err := p.expectKeyword("alter"); err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("table"); err != nil {
+		return nil, err
+	}
+	ifExists := false
+	if p.peekKeyword() == "if" {
+		p.advance()
+		if err := p.expectKeyword("exists"); err != nil {
+			return nil, err
+		}
+		ifExists = true
+	}
+	db, name, err := p.parseQualifiedTableName()
+	if err != nil {
+		return nil, err
+	}
+	at := &alterTable{Name: name, DB: db, IfExists: ifExists}
+	if p.peekKeyword() == "rename" {
+		p.advance()
+		switch p.peekKeyword() {
+		case "to":
+			p.advance()
+			at.RenameTable, err = p.expectIdentifier()
+		case "constraint":
+			p.advance()
+			old, e := p.expectIdentifier()
+			if e != nil {
+				return nil, e
+			}
+			if e = p.expectKeyword("to"); e != nil {
+				return nil, e
+			}
+			next, e := p.expectIdentifier()
+			if e != nil {
+				return nil, e
+			}
+			at.RenameConstraint = &renamePair{Old: old, New: next}
+		default:
+			if p.peekKeyword() == "column" {
+				p.advance()
+			}
+			old, e := p.expectIdentifier()
+			if e != nil {
+				return nil, e
+			}
+			if e = p.expectKeyword("to"); e != nil {
+				return nil, e
+			}
+			next, e := p.expectIdentifier()
+			if e != nil {
+				return nil, e
+			}
+			at.RenameColumn = &renamePair{Old: old, New: next}
+		}
+		if err != nil {
+			return nil, err
+		}
+		return at, nil
+	}
+	for {
+		if err := p.expectKeyword("alter"); err != nil {
+			return nil, err
+		}
+		if p.peekKeyword() == "column" {
+			p.advance()
+		}
+		column, err := p.expectIdentifier()
+		if err != nil {
+			return nil, err
+		}
+		a := alterColumnAction{Column: column}
+		switch p.peekKeyword() {
+		case "set":
+			p.advance()
+			if p.peekKeyword() == "default" {
+				p.advance()
+				start := p.pos
+				e, er := p.parseExpr()
+				if er != nil {
+					return nil, er
+				}
+				a.Kind = alterSetDefault
+				a.Default = &defaultDef{Expr: e, Text: renderTokens(p.tokens[start:p.pos])}
+			} else {
+				if err := p.expectKeyword("not"); err != nil {
+					return nil, err
+				}
+				if err := p.expectKeyword("null"); err != nil {
+					return nil, err
+				}
+				a.Kind = alterSetNotNull
+			}
+		case "drop":
+			p.advance()
+			if p.peekKeyword() == "default" {
+				p.advance()
+				a.Kind = alterDropDefault
+			} else {
+				if err := p.expectKeyword("not"); err != nil {
+					return nil, err
+				}
+				if err := p.expectKeyword("null"); err != nil {
+					return nil, err
+				}
+				a.Kind = alterDropNotNull
+			}
+		default:
+			return nil, newError(SyntaxError, "ALTER COLUMN requires SET or DROP")
+		}
+		at.Actions = append(at.Actions, a)
+		if p.peek().Kind != tokComma {
+			break
+		}
+		p.advance()
+	}
+	return at, nil
 }
 
 // parseAlterSequence parses `ALTER SEQUENCE [IF EXISTS] <name> <action>` (spec/design/sequences.md
@@ -5367,6 +5496,61 @@ func renderTokens(tokens []token) string {
 		parts[i] = renderToken(t)
 	}
 	return strings.Join(parts, " ")
+}
+
+// rewriteColumnIdentifier rewrites references to one table column in persisted expression text,
+// leaving function/type/named-argument identifiers and unrelated composite fields untouched.
+func rewriteColumnIdentifier(text, table, old, next string) (string, exprNode, error) {
+	tokens, err := lex(text)
+	if err != nil {
+		return "", exprNode{}, err
+	}
+	for i := range tokens {
+		if tokens[i].Kind != tokWord || !strings.EqualFold(tokens[i].Word, old) {
+			continue
+		}
+		var prev, prev2, after token
+		if i > 0 {
+			prev = tokens[i-1]
+		}
+		if i > 1 {
+			prev2 = tokens[i-2]
+		}
+		if i+1 < len(tokens) {
+			after = tokens[i+1]
+		}
+		skip := after.Kind == tokLParen || after.Kind == tokFatArrow || after.Kind == tokStr ||
+			prev.Kind == tokDoubleColon || (prev.Kind == tokWord && strings.EqualFold(prev.Word, "as")) ||
+			(prev.Kind == tokDot && !(prev2.Kind == tokWord && strings.EqualFold(prev2.Word, table))) ||
+			(after.Kind == tokDot && strings.EqualFold(old, table))
+		if !skip {
+			tokens[i].Word = next
+		}
+	}
+	if len(tokens) > 0 && tokens[len(tokens)-1].Kind == tokEof {
+		tokens = tokens[:len(tokens)-1]
+	}
+	rewritten := renderTokens(tokens)
+	expr, err := parseExpression(rewritten)
+	return rewritten, expr, err
+}
+
+func rewriteTableQualifier(text, old, next string) (string, exprNode, error) {
+	tokens, err := lex(text)
+	if err != nil {
+		return "", exprNode{}, err
+	}
+	for i := 0; i+1 < len(tokens); i++ {
+		if tokens[i].Kind == tokWord && strings.EqualFold(tokens[i].Word, old) && tokens[i+1].Kind == tokDot {
+			tokens[i].Word = next
+		}
+	}
+	if len(tokens) > 0 && tokens[len(tokens)-1].Kind == tokEof {
+		tokens = tokens[:len(tokens)-1]
+	}
+	rewritten := renderTokens(tokens)
+	expr, err := parseExpression(rewritten)
+	return rewritten, expr, err
 }
 
 func renderToken(t token) string {

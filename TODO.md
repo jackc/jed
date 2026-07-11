@@ -129,7 +129,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   This splits into catalog-only edits (no `format_version` bump) and table rewrites (rebuild the B-tree,
   but still emit an ordinary current-format table — also no bump). _(size: L overall; each slice below is
   its own vertical slice + oracle/NoREC obligation)_
-  - [ ] _slice 1:_ grammar (`alter_table` production) + the multi-action all-or-nothing frame +
+  - [x] _slice 1:_ grammar (`alter_table` production) + the multi-action all-or-nothing frame +
     `RENAME {TO | COLUMN | CONSTRAINT}` + `ALTER COLUMN SET/DROP DEFAULT` + `SET/DROP NOT NULL`
     (catalog-only; `RENAME COLUMN` rewrites this table's stored expression text — alter.md §2.2). _(size: M)_
   - [ ] _slice 2:_ `ADD` / `DROP CONSTRAINT` (`CHECK`/`UNIQUE`/`FOREIGN KEY`/`EXCLUDE`) with the

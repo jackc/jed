@@ -1247,6 +1247,7 @@ export function stmtIsWrite(stmt: Statement): boolean {
   return (
     stmt.kind === "createTable" ||
     stmt.kind === "dropTable" ||
+    stmt.kind === "alterTable" ||
     stmt.kind === "createIndex" ||
     stmt.kind === "dropIndex" ||
     stmt.kind === "createType" ||
@@ -1441,6 +1442,7 @@ export function collectStmtPrivs(stmt: Statement, req: PrivReq): void {
       req.isTempDdl = stmt.temp;
       break;
     case "dropTable":
+    case "alterTable":
     case "createIndex":
     case "dropIndex":
     case "createType":
@@ -1784,6 +1786,8 @@ export function stmtKind(stmt: Statement): string {
       return "CREATE TABLE";
     case "dropTable":
       return "DROP TABLE";
+    case "alterTable":
+      return "ALTER TABLE";
     case "createIndex":
       return "CREATE INDEX";
     case "dropIndex":

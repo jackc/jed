@@ -3,6 +3,7 @@
 // reserved-keyword table), so keywords are matched case-insensitively here.
 
 import type {
+  AlterColumnAction,
   Assignment,
   BinaryOp,
   CheckDef,
@@ -294,6 +295,7 @@ class Parser {
       // and falls through to the generic unknown-keyword 42601 (the no-escape-hatch surface).
       case "alter":
         if (this.peekKeywordAt(1) === "sequence") return this.parseAlterSequence();
+        if (this.peekKeywordAt(1) === "table") return this.parseAlterTable();
         throw engineError("syntax_error", "unexpected keyword 'alter'");
       case "insert":
         return this.parseInsert();
@@ -1249,6 +1251,94 @@ class Parser {
       throw engineError("feature_not_supported", "DROP SEQUENCE ... CASCADE is not supported");
     }
     return { kind: "dropSequence", names, ifExists };
+  }
+
+  // parseAlterTable parses the catalog-only first ALTER TABLE slice (alter.md §1/§2).
+  private parseAlterTable(): Statement {
+    this.expectKeyword("alter");
+    this.expectKeyword("table");
+    let ifExists = false;
+    if (this.peekKeyword() === "if") {
+      this.advance();
+      this.expectKeyword("exists");
+      ifExists = true;
+    }
+    const [db, name] = this.parseQualifiedTableName();
+    if (this.peekKeyword() === "rename") {
+      this.advance();
+      if (this.peekKeyword() === "to") {
+        this.advance();
+        return {
+          kind: "alterTable",
+          name,
+          db,
+          ifExists,
+          action: { kind: "renameTable", newName: this.expectIdentifier() },
+        };
+      }
+      if (this.peekKeyword() === "constraint") {
+        this.advance();
+        const oldName = this.expectIdentifier();
+        this.expectKeyword("to");
+        return {
+          kind: "alterTable",
+          name,
+          db,
+          ifExists,
+          action: { kind: "renameConstraint", oldName, newName: this.expectIdentifier() },
+        };
+      }
+      if (this.peekKeyword() === "column") this.advance();
+      const oldName = this.expectIdentifier();
+      this.expectKeyword("to");
+      return {
+        kind: "alterTable",
+        name,
+        db,
+        ifExists,
+        action: { kind: "renameColumn", oldName, newName: this.expectIdentifier() },
+      };
+    }
+    const actions: AlterColumnAction[] = [];
+    for (;;) {
+      this.expectKeyword("alter");
+      if (this.peekKeyword() === "column") this.advance();
+      const column = this.expectIdentifier();
+      if (this.peekKeyword() === "set") {
+        this.advance();
+        if (this.peekKeyword() === "default") {
+          this.advance();
+          const start = this.pos;
+          const expr = this.parseExpr();
+          actions.push({
+            column,
+            action: {
+              kind: "setDefault",
+              default: { expr, text: renderTokens(this.tokens.slice(start, this.pos)) },
+            },
+          });
+        } else {
+          this.expectKeyword("not");
+          this.expectKeyword("null");
+          actions.push({ column, action: { kind: "setNotNull" } });
+        }
+      } else if (this.peekKeyword() === "drop") {
+        this.advance();
+        if (this.peekKeyword() === "default") {
+          this.advance();
+          actions.push({ column, action: { kind: "dropDefault" } });
+        } else {
+          this.expectKeyword("not");
+          this.expectKeyword("null");
+          actions.push({ column, action: { kind: "dropNotNull" } });
+        }
+      } else {
+        throw engineError("syntax_error", "ALTER COLUMN requires SET or DROP");
+      }
+      if (this.peek().kind !== "comma") break;
+      this.advance();
+    }
+    return { kind: "alterTable", name, db, ifExists, action: { kind: "alterColumns", actions } };
   }
 
   // parseAlterSequence parses `ALTER SEQUENCE [IF EXISTS] <name> <action>` (spec/design/sequences.md
@@ -4088,6 +4178,53 @@ export function parseExpression(text: string): Expr {
 // joined with single spaces. A byte contract — identical across every core (CLAUDE.md §8).
 export function renderTokens(tokens: Token[]): string {
   return tokens.map(renderToken).join(" ");
+}
+
+// Rewrite one column identifier in persisted expression text (alter.md §2.2). Canonical tokens let
+// us distinguish bare/table-qualified columns from function/type/named-argument names and unrelated
+// composite fields; the result is reparsed before entering the catalog.
+export function rewriteColumnIdentifier(
+  text: string,
+  table: string,
+  oldName: string,
+  newName: string,
+): { text: string; expr: Expr } {
+  const tokens = lex(text);
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i]!;
+    if (t.kind !== "word" || lower(t.word!) !== lower(oldName)) continue;
+    const prev = tokens[i - 1];
+    const prev2 = tokens[i - 2];
+    const next = tokens[i + 1];
+    const skip =
+      next?.kind === "lparen" ||
+      next?.kind === "fatArrow" ||
+      next?.kind === "str" ||
+      prev?.kind === "doubleColon" ||
+      (prev?.kind === "word" && lower(prev.word!) === "as") ||
+      (prev?.kind === "dot" && !(prev2?.kind === "word" && lower(prev2.word!) === lower(table))) ||
+      (next?.kind === "dot" && lower(oldName) === lower(table));
+    if (!skip) t.word = newName;
+  }
+  if (tokens.at(-1)?.kind === "eof") tokens.pop();
+  const rewritten = renderTokens(tokens);
+  return { text: rewritten, expr: parseExpression(rewritten) };
+}
+
+export function rewriteTableQualifier(
+  text: string,
+  oldName: string,
+  newName: string,
+): { text: string; expr: Expr } {
+  const tokens = lex(text);
+  for (let i = 0; i + 1 < tokens.length; i++) {
+    const t = tokens[i]!;
+    if (t.kind === "word" && lower(t.word!) === lower(oldName) && tokens[i + 1]!.kind === "dot")
+      t.word = newName;
+  }
+  if (tokens.at(-1)?.kind === "eof") tokens.pop();
+  const rewritten = renderTokens(tokens);
+  return { text: rewritten, expr: parseExpression(rewritten) };
 }
 
 function renderToken(t: Token): string {

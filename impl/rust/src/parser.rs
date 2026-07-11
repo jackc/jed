@@ -5,14 +5,15 @@
 //! error rather than panicking, so the harness reports "not yet" cleanly.
 
 use crate::ast::{
-    AlterSeqAction, AlterSequence, Assignment, BinaryOp, CheckDef, ColumnDef, ConflictAction,
-    ConflictTarget, CreateIndex, CreateSequence, CreateTable, CreateType, Cte, CteBody, DefaultDef,
-    Delete, DropIndex, DropSequence, DropTable, DropType, ExcludeDef, Expr, ForeignKeyDef,
-    GroupItem, IdentitySpec, IndexKeyElem, IndexPredicate, Insert, InsertSource, InsertValue,
-    JoinClause, JoinKind, JsonOnBehavior, JsonPredicateKind, JsonTable, JsonWrapper, JtColumn,
-    Literal, OnConflict, OrderKey, Overriding, QueryExpr, RefAction, Select, SelectItem,
-    SelectItems, SeqOptions, SetOp, SetOpKind, Statement, SubscriptSpec, TableRef, TypeFieldDef,
-    TypeMod, UnaryOp, UniqueDef, Update, WindowDef, WithExpr, WithQuery,
+    AlterColumnAction, AlterColumnKind, AlterSeqAction, AlterSequence, AlterTable,
+    AlterTableAction, Assignment, BinaryOp, CheckDef, ColumnDef, ConflictAction, ConflictTarget,
+    CreateIndex, CreateSequence, CreateTable, CreateType, Cte, CteBody, DefaultDef, Delete,
+    DropIndex, DropSequence, DropTable, DropType, ExcludeDef, Expr, ForeignKeyDef, GroupItem,
+    IdentitySpec, IndexKeyElem, IndexPredicate, Insert, InsertSource, InsertValue, JoinClause,
+    JoinKind, JsonOnBehavior, JsonPredicateKind, JsonTable, JsonWrapper, JtColumn, Literal,
+    OnConflict, OrderKey, Overriding, QueryExpr, RefAction, Select, SelectItem, SelectItems,
+    SeqOptions, SetOp, SetOpKind, Statement, SubscriptSpec, TableRef, TypeFieldDef, TypeMod,
+    UnaryOp, UniqueDef, Update, WindowDef, WithExpr, WithQuery,
 };
 use crate::ast::{FrameBound, FrameExclusion, FrameMode, WindowFrame, WindowOrderKey};
 use crate::decimal::Decimal;
@@ -132,6 +133,9 @@ impl Parser {
             // (the no-escape-hatch surface — resource/no_escape_hatch.test).
             Some("alter") if self.peek_keyword_at(1).as_deref() == Some("sequence") => {
                 Ok(Statement::AlterSequence(self.parse_alter_sequence()?))
+            }
+            Some("alter") if self.peek_keyword_at(1).as_deref() == Some("table") => {
+                Ok(Statement::AlterTable(self.parse_alter_table()?))
             }
             Some("insert") => Ok(Statement::Insert(self.parse_insert()?)),
             Some("select") => self.parse_query_expr(),
@@ -1436,6 +1440,96 @@ impl Parser {
         };
         Ok(AlterSequence {
             name,
+            if_exists,
+            action,
+        })
+    }
+
+    /// Parse ALTER TABLE slice 1 (spec/design/alter.md §1/§2). `RENAME` is standalone; the
+    /// ordinary form is a comma-separated list of `ALTER [COLUMN]` actions.
+    fn parse_alter_table(&mut self) -> Result<AlterTable> {
+        self.expect_keyword("alter")?;
+        self.expect_keyword("table")?;
+        let if_exists = self.peek_keyword().as_deref() == Some("if");
+        if if_exists {
+            self.advance();
+            self.expect_keyword("exists")?;
+        }
+        let (db, name) = self.parse_qualified_table_name()?;
+        let action = if self.peek_keyword().as_deref() == Some("rename") {
+            self.advance();
+            match self.peek_keyword().as_deref() {
+                Some("to") => {
+                    self.advance();
+                    AlterTableAction::RenameTable(self.expect_identifier()?)
+                }
+                Some("constraint") => {
+                    self.advance();
+                    let old = self.expect_identifier()?;
+                    self.expect_keyword("to")?;
+                    let new = self.expect_identifier()?;
+                    AlterTableAction::RenameConstraint { old, new }
+                }
+                _ => {
+                    if self.peek_keyword().as_deref() == Some("column") {
+                        self.advance();
+                    }
+                    let old = self.expect_identifier()?;
+                    self.expect_keyword("to")?;
+                    let new = self.expect_identifier()?;
+                    AlterTableAction::RenameColumn { old, new }
+                }
+            }
+        } else {
+            let mut actions = Vec::new();
+            loop {
+                self.expect_keyword("alter")?;
+                if self.peek_keyword().as_deref() == Some("column") {
+                    self.advance();
+                }
+                let column = self.expect_identifier()?;
+                let kind = match self.peek_keyword().as_deref() {
+                    Some("set") => {
+                        self.advance();
+                        if self.peek_keyword().as_deref() == Some("default") {
+                            self.advance();
+                            let start = self.pos;
+                            let expr = self.parse_expr()?;
+                            let text = render_tokens(&self.tokens[start..self.pos]);
+                            AlterColumnKind::SetDefault(DefaultDef { expr, text })
+                        } else {
+                            self.expect_keyword("not")?;
+                            self.expect_keyword("null")?;
+                            AlterColumnKind::SetNotNull
+                        }
+                    }
+                    Some("drop") => {
+                        self.advance();
+                        if self.peek_keyword().as_deref() == Some("default") {
+                            self.advance();
+                            AlterColumnKind::DropDefault
+                        } else {
+                            self.expect_keyword("not")?;
+                            self.expect_keyword("null")?;
+                            AlterColumnKind::DropNotNull
+                        }
+                    }
+                    other => return Err(syntax(format!("expected SET or DROP, found {other:?}"))),
+                };
+                actions.push(AlterColumnAction {
+                    column,
+                    action: kind,
+                });
+                if !matches!(self.peek(), Token::Comma) {
+                    break;
+                }
+                self.advance();
+            }
+            AlterTableAction::AlterColumns(actions)
+        };
+        Ok(AlterTable {
+            name,
+            db,
             if_exists,
             action,
         })
@@ -4629,6 +4723,61 @@ pub fn parse_expression(text: &str) -> Result<Expr> {
 pub fn render_tokens(tokens: &[Token]) -> String {
     let parts: Vec<String> = tokens.iter().map(render_token).collect();
     parts.join(" ")
+}
+
+/// Rewrite references to one table column in persisted expression text, then reparse the result.
+/// Stored expressions have no source positions, so this walks the canonical token stream: bare
+/// identifiers and `table.column` names are columns; function/type/named-argument identifiers and
+/// composite-field names are not (alter.md §2.2).
+pub(crate) fn rewrite_column_identifier(
+    text: &str,
+    table: &str,
+    old: &str,
+    new: &str,
+) -> Result<(String, Expr)> {
+    let mut tokens = lex(text)?;
+    for i in 0..tokens.len() {
+        let is_old = matches!(&tokens[i], Token::Word(w) if w.eq_ignore_ascii_case(old));
+        if !is_old {
+            continue;
+        }
+        let prev = i.checked_sub(1).and_then(|j| tokens.get(j));
+        let prev2 = i.checked_sub(2).and_then(|j| tokens.get(j));
+        let next = tokens.get(i + 1);
+        let skip = matches!(next, Some(Token::LParen | Token::FatArrow | Token::Str(_)))
+            || matches!(prev, Some(Token::DoubleColon))
+            || matches!(prev, Some(Token::Word(w)) if w.eq_ignore_ascii_case("as"))
+            || (matches!(prev, Some(Token::Dot))
+                && !matches!(prev2, Some(Token::Word(w)) if w.eq_ignore_ascii_case(table)))
+            || (matches!(next, Some(Token::Dot)) && old.eq_ignore_ascii_case(table));
+        if !skip {
+            tokens[i] = Token::Word(new.to_string());
+        }
+    }
+    if matches!(tokens.last(), Some(Token::Eof)) {
+        tokens.pop();
+    }
+    let rewritten = render_tokens(&tokens);
+    let expr = parse_expression(&rewritten)?;
+    Ok((rewritten, expr))
+}
+
+/// Rewrite a persisted qualified reference's table label during `RENAME TO`.
+pub(crate) fn rewrite_table_qualifier(text: &str, old: &str, new: &str) -> Result<(String, Expr)> {
+    let mut tokens = lex(text)?;
+    for i in 0..tokens.len().saturating_sub(1) {
+        if matches!(&tokens[i], Token::Word(w) if w.eq_ignore_ascii_case(old))
+            && matches!(tokens.get(i + 1), Some(Token::Dot))
+        {
+            tokens[i] = Token::Word(new.to_string());
+        }
+    }
+    if matches!(tokens.last(), Some(Token::Eof)) {
+        tokens.pop();
+    }
+    let rewritten = render_tokens(&tokens);
+    let expr = parse_expression(&rewritten)?;
+    Ok((rewritten, expr))
 }
 
 fn render_token(t: &Token) -> String {

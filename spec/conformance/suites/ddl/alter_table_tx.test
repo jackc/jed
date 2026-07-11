@@ -1,0 +1,47 @@
+# skip: disk — explicit transactions span records, while disk mode reopens after every record.
+# ALTER TABLE slice 1 participates in ordinary transactional rollback and READ ONLY admission.
+# requires: ddl.alter_table, ddl.create_table, ddl.primary_key, dml.insert, query.select, txn.explicit, txn.read_only, types.i32
+
+statement ok
+CREATE TABLE alter_tx (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO alter_tx VALUES (1, 2)
+
+statement ok
+BEGIN
+
+statement ok
+ALTER TABLE alter_tx RENAME COLUMN v TO changed
+
+statement ok
+ROLLBACK
+
+query II nosort
+SELECT id, v FROM alter_tx
+----
+1
+2
+
+statement error 42703
+SELECT changed FROM alter_tx
+
+statement ok
+BEGIN READ ONLY
+
+statement error 25006
+ALTER TABLE alter_tx ALTER v SET DEFAULT 9
+
+statement ok
+ROLLBACK
+
+statement ok
+INSERT INTO alter_tx (id) VALUES (2)
+
+query II nosort
+SELECT id, v FROM alter_tx ORDER BY id
+----
+1
+2
+2
+NULL

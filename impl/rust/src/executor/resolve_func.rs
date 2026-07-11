@@ -1739,6 +1739,7 @@ pub(crate) fn stmt_is_write(stmt: &Statement) -> bool {
         stmt,
         Statement::CreateTable(_)
             | Statement::DropTable(_)
+            | Statement::AlterTable(_)
             | Statement::CreateIndex(_)
             | Statement::DropIndex(_)
             | Statement::CreateType(_)
@@ -1954,7 +1955,8 @@ pub(crate) fn collect_stmt_privs(stmt: &Statement, req: &mut PrivReq) {
         | Statement::DropType(_)
         | Statement::CreateSequence(_)
         | Statement::DropSequence(_)
-        | Statement::AlterSequence(_) => req.is_ddl = true,
+        | Statement::AlterSequence(_)
+        | Statement::AlterTable(_) => req.is_ddl = true,
         Statement::Insert(ins) => collect_insert_privs(ins, req, &locals),
         Statement::Select(sel) => collect_select_privs(sel, req, &locals),
         Statement::SetOp(so) => collect_setop_privs(so, req, &locals),
@@ -2307,6 +2309,7 @@ pub(crate) fn stmt_kind(stmt: &Statement) -> &'static str {
     match stmt {
         Statement::CreateTable(_) => "CREATE TABLE",
         Statement::DropTable(_) => "DROP TABLE",
+        Statement::AlterTable(_) => "ALTER TABLE",
         Statement::CreateIndex(_) => "CREATE INDEX",
         Statement::DropIndex(_) => "DROP INDEX",
         Statement::CreateType(_) => "CREATE TYPE",

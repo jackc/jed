@@ -7,6 +7,7 @@ package jed
 type statement struct {
 	CreateTable *createTable
 	DropTable   *dropTable
+	AlterTable  *alterTable
 	CreateIndex *createIndex
 	DropIndex   *dropIndex
 	CreateType  *createType
@@ -38,6 +39,35 @@ type statement struct {
 	Commit   *commit
 	Rollback *rollback
 }
+
+// alterTable is ALTER TABLE slice 1 (spec/design/alter.md): one standalone rename or a
+// comma-separated action list. Exactly one Rename* field or Actions is populated.
+type alterTable struct {
+	Name             string
+	DB               *string
+	IfExists         bool
+	RenameTable      string
+	RenameColumn     *renamePair
+	RenameConstraint *renamePair
+	Actions          []alterColumnAction
+}
+
+type renamePair struct{ Old, New string }
+
+type alterColumnAction struct {
+	Column  string
+	Kind    alterColumnKind
+	Default *defaultDef
+}
+
+type alterColumnKind int
+
+const (
+	alterSetDefault alterColumnKind = iota
+	alterDropDefault
+	alterSetNotNull
+	alterDropNotNull
+)
 
 // explain is a parsed `EXPLAIN [ANALYZE] <statement>` (spec/design/explain.md). Inner is the wrapped
 // statement (restricted to a query or DML by the parser — never DDL, transaction control, or a nested

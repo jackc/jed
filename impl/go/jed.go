@@ -147,6 +147,7 @@ var SupportedCapabilities = []string{
 	// or move the catalog key (rewriting an owned sequence's nextval default); no format change
 	// (sequences.md §15).
 	"ddl.alter_sequence",
+	"ddl.alter_table",
 	// NOT NULL column constraint — storing NULL traps 23502 (spec/design/constraints.md §1).
 	"ddl.not_null",
 	// DEFAULT <literal> column constraint, evaluated + coerced at CREATE (constraints.md §2).

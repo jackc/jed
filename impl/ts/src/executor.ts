@@ -5,6 +5,7 @@
 // row), stable ORDER BY with NULLs last (the PostgreSQL model).
 
 import type {
+  AlterTable,
   AlterSequence,
   BinaryOp,
   CreateIndex,
@@ -15,6 +16,7 @@ import type {
   Cte,
   CteBody,
   Delete,
+  DefaultDef,
   DropIndex,
   DropSequence,
   DropTable,
@@ -108,6 +110,7 @@ import {
   exclusionViolation,
   fkViolationDelete,
   fkViolationInsert,
+  notNullViolation,
   pkeyName,
   stampTable,
   uniqueViolation,
@@ -115,7 +118,12 @@ import {
 import { type PrivilegeSet, Privileges } from "./privileges.ts";
 import { type ScriptSummary, splitStatements } from "./split.ts";
 import type { SharedPaging } from "./paging.ts";
-import { parseExpression, parseSQL } from "./parser.ts";
+import {
+  parseExpression,
+  parseSQL,
+  rewriteColumnIdentifier,
+  rewriteTableQualifier,
+} from "./parser.ts";
 import { type KeyBound, type PNode, colAt, compareBytes, unboundedBound } from "./pmap.ts";
 import { type RowCompare, SortedRows, type SpillSink, Sorter } from "./spill.ts";
 import { type Entry, type Row, TableStore } from "./storage.ts";
@@ -2325,6 +2333,7 @@ export class Engine {
         (stmt.kind === "createIndex" && this.isTempTable(stmt.table)) ||
         (stmt.kind === "dropIndex" && this.isTempIndex(stmt.name)) ||
         (stmt.kind === "dropSequence" && stmt.names.some((n) => this.isTempSequence(n))) ||
+        (stmt.kind === "alterTable" && this.isTempTable(stmt.name)) ||
         (stmt.kind === "alterSequence" && this.isTempSequence(stmt.name))
       ) {
         allowed = this.session.allowTempDdl;
@@ -2425,6 +2434,9 @@ export class Engine {
       case "dropTable":
         rejectParamsForDDL(params);
         return this.executeDropTable(stmt);
+      case "alterTable":
+        rejectParamsForDDL(params);
+        return this.executeAlterTable(stmt);
       case "createIndex":
         rejectParamsForDDL(params);
         return this.executeCreateIndex(stmt);
@@ -4179,6 +4191,276 @@ export class Engine {
       }
     }
     return { kind: "statement", cost: 0n, rowsAffected: null };
+  }
+
+  // executeAlterTable implements the catalog-only first ALTER TABLE slice (alter.md §1/§2).
+  private executeAlterTable(at: AlterTable): Outcome {
+    checkCatalogRelWrite(at.name);
+    this.checkAttachmentWritable(at.db);
+    let snap: Snapshot | undefined;
+    if (at.db === undefined)
+      snap =
+        this.isTempTable(at.name) ||
+        this.tempSnap().findIndex(at.name) !== null ||
+        this.tempSnap().sequence(at.name) !== undefined
+          ? this.tempSnap()
+          : this.readSnap();
+    else
+      switch (at.db.toLowerCase()) {
+        case "temp":
+          snap = this.tempSnap();
+          break;
+        case "main":
+          snap = this.readSnap();
+          break;
+        default:
+          snap = this.attachReadSnap(at.db.toLowerCase());
+          if (snap === undefined)
+            throw engineError("undefined_table", `database "${at.db}" is not attached`);
+      }
+    const original = snap.table(at.name);
+    if (original === undefined) {
+      if (snap.findIndex(at.name) !== null || snap.sequence(at.name) !== undefined)
+        throw engineError("wrong_object_type", `${at.name} is not a table`);
+      if (at.ifExists) return { kind: "statement", cost: 0n, rowsAffected: null };
+      throw engineError("undefined_table", `table does not exist: ${at.name}`);
+    }
+    const oldKey = original.name.toLowerCase();
+    let table: Table = {
+      ...original,
+      columns: original.columns.map((c) => ({ ...c })),
+      checks: original.checks.map((c) => ({ ...c })),
+      indexes: original.indexes.map((i) => ({ ...i, keys: i.keys.map((k) => ({ ...k })) })),
+      fks: original.fks.map((f) => ({ ...f })),
+      exclusions: original.exclusions.map((e) => ({ ...e })),
+    };
+    let renameTable = false;
+    let indexRename: { oldName: string; newName: string } | undefined;
+    const attachmentScope =
+      at.db !== undefined && at.db.toLowerCase() !== "main" && at.db.toLowerCase() !== "temp";
+    const relationTaken = (name: string) =>
+      attachmentScope
+        ? snap.table(name) !== undefined ||
+          snap.findIndex(name) !== null ||
+          snap.sequence(name) !== undefined
+        : this.relationExists(name);
+    const rewriteExprs = (
+      column?: { oldName: string; newName: string },
+      tableRename?: string,
+    ): void => {
+      const rw = (text: string) =>
+        column
+          ? rewriteColumnIdentifier(text, table.name, column.oldName, column.newName)
+          : rewriteTableQualifier(text, table.name, tableRename!);
+      table.checks = table.checks.map((c) => ({
+        ...c,
+        ...(() => {
+          const x = rw(c.exprText);
+          return { exprText: x.text, expr: x.expr };
+        })(),
+      }));
+      table.columns = table.columns.map((c) =>
+        c.defaultExpr === null
+          ? c
+          : (() => {
+              const x = rw(c.defaultExpr!.exprText);
+              return { ...c, defaultExpr: { exprText: x.text, expr: x.expr } };
+            })(),
+      );
+      table.indexes = table.indexes.map((idx) => ({
+        ...idx,
+        keys: idx.keys.map((k) =>
+          k.kind === "column"
+            ? k
+            : (() => {
+                const x = rw(k.exprText);
+                return { ...k, exprText: x.text, expr: x.expr };
+              })(),
+        ),
+        predicate:
+          idx.predicate === undefined
+            ? undefined
+            : (() => {
+                const x = rw(idx.predicate!.exprText);
+                return { exprText: x.text, expr: x.expr };
+              })(),
+      }));
+    };
+
+    switch (at.action.kind) {
+      case "renameTable": {
+        checkReservedName("table", at.action.newName);
+        if (relationTaken(at.action.newName)) {
+          throw engineError("duplicate_table", `relation already exists: ${at.action.newName}`);
+        }
+        rewriteExprs(undefined, at.action.newName);
+        table = { ...table, name: at.action.newName };
+        renameTable = true;
+        break;
+      }
+      case "renameColumn": {
+        const ci = columnIndex(table, at.action.oldName);
+        if (ci < 0)
+          throw engineError("undefined_column", `column does not exist: ${at.action.oldName}`);
+        if (columnIndex(table, at.action.newName) >= 0)
+          throw engineError("duplicate_column", `column already exists: ${at.action.newName}`);
+        rewriteExprs({ oldName: at.action.oldName, newName: at.action.newName });
+        table.columns[ci] = { ...table.columns[ci]!, name: at.action.newName };
+        break;
+      }
+      case "renameConstraint": {
+        const old = at.action.oldName,
+          next = at.action.newName;
+        const exists = (name: string) =>
+          table.checks.some((c) => c.name.toLowerCase() === name.toLowerCase()) ||
+          table.indexes.some((i) => i.unique && i.name.toLowerCase() === name.toLowerCase()) ||
+          table.fks.some((f) => f.name.toLowerCase() === name.toLowerCase()) ||
+          table.exclusions.some((e) => e.name.toLowerCase() === name.toLowerCase());
+        if (!exists(old))
+          throw engineError("undefined_object", `constraint does not exist: ${old}`);
+        if (exists(next))
+          throw engineError("duplicate_object", `constraint already exists: ${next}`);
+        table.checks = table.checks.map((c) =>
+          c.name.toLowerCase() === old.toLowerCase() ? { ...c, name: next } : c,
+        );
+        table.fks = table.fks.map((f) =>
+          f.name.toLowerCase() === old.toLowerCase() ? { ...f, name: next } : f,
+        );
+        table.exclusions = table.exclusions.map((e) => {
+          if (e.name.toLowerCase() !== old.toLowerCase()) return e;
+          indexRename = { oldName: old, newName: next };
+          return { ...e, name: next, index: next };
+        });
+        table.indexes = table.indexes.map((i) => {
+          if (
+            (!i.unique && indexRename === undefined) ||
+            i.name.toLowerCase() !== old.toLowerCase()
+          )
+            return i;
+          indexRename = { oldName: old, newName: next };
+          return { ...i, name: next };
+        });
+        if (indexRename && relationTaken(next))
+          throw engineError("duplicate_table", `relation already exists: ${next}`);
+        const byName = <T extends { name: string }>(a: T, b: T) =>
+          a.name.toLowerCase() < b.name.toLowerCase()
+            ? -1
+            : a.name.toLowerCase() > b.name.toLowerCase()
+              ? 1
+              : 0;
+        table.checks.sort(byName);
+        table.indexes.sort(byName);
+        table.fks.sort(byName);
+        table.exclusions.sort(byName);
+        break;
+      }
+      case "alterColumns":
+        for (const edit of at.action.actions) {
+          const ci = columnIndex(table, edit.column);
+          if (ci < 0)
+            throw engineError("undefined_column", `column does not exist: ${edit.column}`);
+          const col = table.columns[ci]!;
+          switch (edit.action.kind) {
+            case "setDefault":
+              if (col.identity !== null)
+                throw engineError("syntax_error", "identity column cannot have a default");
+              table.columns[ci] = this.buildAlterDefault(col, edit.action.default);
+              break;
+            case "dropDefault":
+              if (col.identity !== null)
+                throw engineError("syntax_error", "identity column cannot drop its default");
+              table.columns[ci] = { ...col, default: null, defaultExpr: null };
+              break;
+            case "setNotNull":
+              table.columns[ci] = { ...col, notNull: true };
+              break;
+            case "dropNotNull":
+              if (col.identity !== null)
+                throw engineError("syntax_error", "identity column cannot drop not null");
+              if (col.primaryKey)
+                throw engineError("invalid_table_definition", "column is in a primary key");
+              table.columns[ci] = { ...col, notNull: false };
+              break;
+          }
+        }
+        break;
+    }
+
+    const meter = this.session.newMeter();
+    const mask = table.columns.map((c, i) => !original.columns[i]!.notNull && c.notNull);
+    if (mask.some(Boolean)) {
+      const store = this.lkpStoreScoped(at.db, original.name);
+      const { entries, pages, slabs } = store.scanWithUnits(mask);
+      meter.charge(COSTS.pageRead * BigInt(pages) + COSTS.valueDecompress * BigInt(slabs));
+      for (const entry of entries) {
+        meter.guard();
+        meter.charge(COSTS.storageRowRead);
+        const row = store.resolveInlineColumns(entry.row);
+        for (let i = 0; i < mask.length; i++)
+          if (mask[i] && row[i]!.kind === "null") throw notNullViolation(table.columns[i]!.name);
+      }
+    }
+    let ws: Snapshot;
+    if (at.db === undefined) {
+      if (this.isTempTable(original.name)) {
+        this.session.tx!.tempDirty = true;
+        ws = this.session.tx!.tempWorking;
+      } else ws = this.working();
+    } else
+      switch (at.db.toLowerCase()) {
+        case "temp":
+          this.session.tx!.tempDirty = true;
+          ws = this.session.tx!.tempWorking;
+          break;
+        case "main":
+          ws = this.working();
+          break;
+        default:
+          ws = this.attachWriteSnap(at.db.toLowerCase())!;
+      }
+    ws.alterTableCatalog(oldKey, table, renameTable, indexRename);
+    return { kind: "statement", cost: meter.accrued, rowsAffected: null };
+  }
+
+  private buildAlterDefault(col: Column, def: DefaultDef): Column {
+    const sty = typeAsScalar(col.type);
+    if (sty === null)
+      throw engineError(
+        "feature_not_supported",
+        "a DEFAULT on this container type is not supported yet",
+      );
+    const clockDefault =
+      sty === "date" &&
+      def.expr.kind === "literal" &&
+      def.expr.literal.kind === "text" &&
+      dateClockIsRelative(def.expr.literal.text);
+    if (def.expr.kind === "literal" && !clockDefault) {
+      return {
+        ...col,
+        default: storeValue(
+          literalToValue(def.expr.literal),
+          sty,
+          col.decimal,
+          col.varcharLen,
+          false,
+          col.name,
+        ),
+        defaultExpr: null,
+      };
+    }
+    rejectDefaultStructure(def.expr);
+    const { type: rt } = resolve(
+      Scope.empty(this),
+      def.expr,
+      sty,
+      { collecting: false, groupKeys: [], specs: [] },
+      new ParamTypes(),
+    );
+    if (!assignableTo(rt, sty))
+      throw typeError(
+        `column ${col.name} is of type ${canonicalName(sty)} but default expression is of type ${rtName(rt)}`,
+      );
+    return { ...col, default: null, defaultExpr: { exprText: def.text, expr: def.expr } };
   }
 
   // findIndex finds the table owning the named index in the visible snapshot

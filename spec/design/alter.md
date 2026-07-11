@@ -9,9 +9,10 @@
 > reproduce identically (CLAUDE.md §2, §8). When a decision here changes, change the
 > data/grammar and here in the same edit.
 >
-> **Status: designed, not yet built.** No `alter_table` production exists in the grammar
-> today. This doc is the plan the slices in §8 build against; nothing here is implemented
-> until a slice lands it.
+> **Status: Slice 1 landed.** The canonical grammar and all three native cores implement the
+> catalog-only frame: `RENAME {TO | COLUMN | CONSTRAINT}`, `ALTER COLUMN SET/DROP DEFAULT`, and
+> `SET/DROP NOT NULL`, including comma-action atomicity and the validating NOT NULL scan. Slices
+> 2–5 below remain designed but unimplemented.
 
 `ALTER TABLE` mutates a table's definition in place — its columns, its constraints, its
 name. It is the last major DDL gap: `CREATE TABLE` / `DROP TABLE` / `CREATE INDEX` /
@@ -127,11 +128,16 @@ constant is coerced once and stored as value bytes (flag bit2); a non-constant e
 that does not coerce to the column type is `42804`. Existing rows are **not** rewritten — a
 default only affects future inserts (PG-faithful).
 
+An IDENTITY column rejects both forms with `42601` (PG-faithful): its synthesized default is part
+of identity management, which remains in the deferred identity-specific ALTER surface (§6).
+
 ### 2.5 `ALTER COLUMN … SET NOT NULL` / `DROP NOT NULL`
 
 Flip flag bit1. `DROP NOT NULL` is pure catalog (a PK member cannot drop NOT NULL — `42P16`).
 `SET NOT NULL` needs a **validating full scan**: any existing NULL in the column traps
 `23502` and aborts, leaving the catalog unchanged. The scan is metered like any read.
+An IDENTITY column cannot `DROP NOT NULL` (`42601`, PG-faithful); that invariant belongs to the
+deferred `DROP IDENTITY` form rather than this generic nullability edit.
 
 ### 2.6 `ADD table_constraint`
 
@@ -254,7 +260,7 @@ already exist — a small follow-on, not scheduled.
 
 Ordered lowest-risk → highest, each a vertical slice (CLAUDE.md §10):
 
-1. **Grammar + `RENAME` + the catalog-only column edits** — `alter_table` production, the
+1. **✅ Grammar + `RENAME` + the catalog-only column edits** — `alter_table` production, the
    multi-action all-or-nothing frame, `RENAME {TO | COLUMN | CONSTRAINT}`, `SET/DROP DEFAULT`,
    `SET/DROP NOT NULL`. Zero format risk; establishes the whole scaffold.
 2. **`ADD` / `DROP CONSTRAINT`** — `CHECK` / `UNIQUE` / `FOREIGN KEY` / `EXCLUDE` with the

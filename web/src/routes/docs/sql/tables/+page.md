@@ -19,7 +19,7 @@ INSERT INTO txn VALUES (1, 1, 25.00), (2, 2, 10.00);`;
 
 <svelte:head>
 	<title>Tables &amp; constraints — jed</title>
-	<meta name="description" content="CREATE TABLE with typed columns, serial and GENERATED AS IDENTITY auto-numbering, PRIMARY KEY, NOT NULL, CHECK, UNIQUE and FOREIGN KEY constraints — enforced live." />
+	<meta name="description" content="Create and alter typed tables with serial and identity auto-numbering, defaults, and enforced PRIMARY KEY, NOT NULL, CHECK, UNIQUE and FOREIGN KEY constraints." />
 </svelte:head>
 
 # Tables & constraints
@@ -45,6 +45,37 @@ Things to try in the panel above:
 
 Each is rejected before anything is written — a statement is all-or-nothing. See the
 [error reference](../../reference/errors/) for every code.
+
+## Altering a table
+
+`ALTER TABLE` can rename a table, column, or constraint, and can change a column's default or
+`NOT NULL` status. Try these statements in the panel above, one at a time:
+
+```sql
+ALTER TABLE account RENAME COLUMN balance TO available_balance;
+ALTER TABLE account ALTER COLUMN available_balance SET DEFAULT 0;
+ALTER TABLE account ALTER COLUMN available_balance SET NOT NULL;
+ALTER TABLE account RENAME CONSTRAINT account_pkey TO account_id_key;
+ALTER TABLE account RENAME TO ledger_account;
+```
+
+Column actions can be combined with commas. They run from left to right and publish only if every
+action succeeds:
+
+```sql
+ALTER TABLE account
+  ALTER COLUMN balance SET DEFAULT 0,
+  ALTER COLUMN balance SET NOT NULL;
+```
+
+`SET DEFAULT` affects future inserts, while `SET NOT NULL` first checks every existing row and
+reports `23502` if any value is null. Renaming a column also updates its stored `CHECK` and default
+expressions, plus expression and partial-index definitions. `IF EXISTS` is supported for a missing
+table.
+
+This first ALTER TABLE slice does not yet add or drop columns or constraints, change column types,
+or manage identity properties. Identity-column defaults and nullability must be managed through the
+future identity-specific syntax rather than the generic column actions.
 
 ## Exclusion constraints — `EXCLUDE`
 

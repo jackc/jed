@@ -663,6 +663,55 @@ export class Snapshot {
     this.tables.set(tableKey, { ...old, columns });
   }
 
+  // Publish one validated ALTER TABLE slice-1 catalog entry without touching row bytes.
+  alterTableCatalog(
+    oldKey: string,
+    table: Table,
+    renameTable: boolean,
+    indexRename?: { oldName: string; newName: string },
+  ): void {
+    this.bumpCatGen();
+    const newKey = renameTable ? table.name.toLowerCase() : oldKey;
+    if (renameTable) {
+      this.tables.delete(oldKey);
+      const store = this.stores.get(oldKey);
+      if (store) {
+        this.stores.delete(oldKey);
+        this.stores.set(newKey, store);
+      }
+    }
+    this.tables.set(newKey, table);
+    if (indexRename) {
+      const old = indexRename.oldName.toLowerCase();
+      const next = indexRename.newName.toLowerCase();
+      const store = this.indexStores.get(old);
+      if (store) {
+        this.indexStores.delete(old);
+        this.indexStores.set(next, store);
+      }
+      const tree = this.gistTrees.get(old);
+      if (tree) {
+        this.gistTrees.delete(old);
+        this.gistTrees.set(next, tree);
+      }
+    }
+    if (!renameTable) return;
+    for (const [key, old] of [...this.tables]) {
+      if (!old.fks.some((fk) => fk.refTable.toLowerCase() === oldKey)) continue;
+      this.tables.set(key, {
+        ...old,
+        fks: old.fks.map((fk) =>
+          fk.refTable.toLowerCase() === oldKey ? { ...fk, refTable: table.name } : fk,
+        ),
+      });
+    }
+    for (const [key, seq] of [...this.sequences]) {
+      if (seq.ownedBy?.table.toLowerCase() === oldKey) {
+        this.sequences.set(key, { ...seq, ownedBy: { ...seq.ownedBy, table: table.name } });
+      }
+    }
+  }
+
   // putIndexStore registers a loaded index store under its (lowercased) name — the file
   // loader's hook (format.ts): the owning table's indexes list came from its catalog
   // entry, so only the store is registered here.

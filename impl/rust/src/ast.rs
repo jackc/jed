@@ -8,6 +8,7 @@ use crate::decimal::Decimal;
 pub enum Statement {
     CreateTable(CreateTable),
     DropTable(DropTable),
+    AlterTable(AlterTable),
     CreateIndex(CreateIndex),
     DropIndex(DropIndex),
     CreateType(CreateType),
@@ -54,6 +55,38 @@ pub enum Statement {
     /// `ROLLBACK [TRANSACTION|WORK]` — discard the open block's working set and return to
     /// autocommit; a `ROLLBACK` with no open block is a no-op success (transactions.md §4.2).
     Rollback,
+}
+
+/// `ALTER TABLE` slice 1 (spec/design/alter.md): one standalone rename or a comma-separated list
+/// of catalog-only column actions. The parser guarantees rename/actions are never mixed.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct AlterTable {
+    pub name: String,
+    pub db: Option<String>,
+    pub if_exists: bool,
+    pub action: AlterTableAction,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum AlterTableAction {
+    RenameTable(String),
+    RenameColumn { old: String, new: String },
+    RenameConstraint { old: String, new: String },
+    AlterColumns(Vec<AlterColumnAction>),
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct AlterColumnAction {
+    pub column: String,
+    pub action: AlterColumnKind,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum AlterColumnKind {
+    SetDefault(DefaultDef),
+    DropDefault,
+    SetNotNull,
+    DropNotNull,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]

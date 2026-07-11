@@ -1,0 +1,214 @@
+# ALTER TABLE slice 1: catalog-only renames, defaults, nullability, and the comma-action atomic frame
+# (spec/design/alter.md §1/§2). PostgreSQL-clean rows/errors; catalog text rewrites are asserted via
+# behavior so this suite remains oracle-checkable.
+# requires: ddl.alter_table, ddl.create_table, ddl.drop_table, ddl.primary_key, ddl.not_null, ddl.column_default, ddl.column_default_expr, ddl.check, ddl.unique, ddl.foreign_key, ddl.secondary_index, ddl.index_expr, ddl.index_partial, ddl.exclusion_constraint, ddl.serial, ddl.identity, ddl.sequence, func.sequence, func.casing, dml.insert, dml.insert_column_list, dml.update, query.select, query.order_by, query.is_null, types.i32, types.text, types.range, expr.arithmetic, resource.cost_metering
+
+statement ok
+CREATE TABLE parent (id i32 PRIMARY KEY, v i32 DEFAULT 5, note text, CONSTRAINT parent_v_check CHECK (v > 0), CONSTRAINT parent_v_key UNIQUE (v))
+
+statement ok
+CREATE INDEX parent_expr_idx ON parent ((v + 1)) WHERE v > 0
+
+statement ok
+CREATE TABLE child (id i32 PRIMARY KEY, parent_v i32, CONSTRAINT child_parent_fkey FOREIGN KEY (parent_v) REFERENCES parent (v))
+
+statement ok
+INSERT INTO parent VALUES (1, 6, 'a'), (2, 7, 'b')
+
+# Table rename preserves rows and inbound FK metadata.
+statement ok
+ALTER TABLE parent RENAME TO renamed_parent
+
+statement ok
+INSERT INTO child VALUES (1, 6)
+
+query II nosort
+SELECT id, v FROM renamed_parent ORDER BY id
+----
+1
+6
+2
+7
+
+statement error 42P01
+SELECT id FROM parent
+
+# Column rename preserves CHECK/default/expression-index/partial-predicate behavior.
+statement ok
+ALTER TABLE renamed_parent RENAME COLUMN v TO amount
+
+statement ok
+INSERT INTO renamed_parent (id, note) VALUES (3, 'c')
+
+statement error 23514
+INSERT INTO renamed_parent VALUES (4, -1, 'bad')
+
+query II nosort
+SELECT id, amount FROM renamed_parent ORDER BY id
+----
+1
+6
+2
+7
+3
+5
+
+# The token rewrite changes column references, not a same-spelled function identifier.
+statement ok
+CREATE TABLE rewrite_names (id i32 PRIMARY KEY, lower text, CONSTRAINT lower_check CHECK (lower(lower) = lower))
+
+statement ok
+CREATE INDEX rewrite_lower_idx ON rewrite_names (lower(lower)) WHERE lower(lower) = lower
+
+statement ok
+ALTER TABLE rewrite_names RENAME COLUMN lower TO label
+
+statement ok
+INSERT INTO rewrite_names VALUES (1, 'abc')
+
+# Constraint renames are visible handles; UNIQUE moves its backing index too.
+statement ok
+ALTER TABLE renamed_parent RENAME CONSTRAINT parent_v_check TO amount_check
+
+statement ok
+ALTER TABLE renamed_parent RENAME CONSTRAINT parent_v_key TO amount_key
+
+statement ok
+ALTER TABLE child RENAME CONSTRAINT child_parent_fkey TO renamed_parent_fkey
+
+statement error 42704
+ALTER TABLE renamed_parent RENAME CONSTRAINT parent_v_check TO another_check
+
+statement error 42704
+ALTER TABLE renamed_parent RENAME CONSTRAINT parent_v_key TO another_key
+
+statement error 42704
+ALTER TABLE child RENAME CONSTRAINT child_parent_fkey TO another_fkey
+
+# EXCLUDE constraint rename moves the non-unique GiST backing index too.
+statement ok
+CREATE TABLE bookings (id i32 PRIMARY KEY, span int4range, CONSTRAINT no_overlap EXCLUDE USING gist (span WITH &&))
+
+statement ok
+ALTER TABLE bookings RENAME CONSTRAINT no_overlap TO span_excl
+
+statement error 42704
+ALTER TABLE bookings RENAME CONSTRAINT no_overlap TO another_excl
+
+statement ok
+INSERT INTO bookings VALUES (1, '[1,5)')
+
+statement error 23P01
+INSERT INTO bookings VALUES (2, '[4,8)')
+
+# SET/DROP DEFAULT affect only future rows. COLUMN is optional noise.
+statement ok
+ALTER TABLE renamed_parent ALTER COLUMN amount SET DEFAULT 9 + 0
+
+statement ok
+INSERT INTO renamed_parent (id, note) VALUES (5, 'new')
+
+statement ok
+ALTER TABLE renamed_parent ALTER amount DROP DEFAULT
+
+statement ok
+INSERT INTO renamed_parent (id, note) VALUES (6, 'none')
+
+query II nosort
+SELECT id, amount FROM renamed_parent WHERE id >= 5 ORDER BY id
+----
+5
+9
+6
+NULL
+
+# Multi-action is left-to-right and all-or-nothing. The final SET NOT NULL validates existing rows.
+statement ok
+ALTER TABLE renamed_parent ALTER amount SET DEFAULT 11, ALTER amount DROP NOT NULL
+
+statement error 23502
+ALTER TABLE renamed_parent ALTER amount SET NOT NULL, ALTER note SET DEFAULT 'changed'
+
+# Failed second action leaves the first catalog edit unapplied.
+statement ok
+INSERT INTO renamed_parent (id) VALUES (7)
+
+query IT nosort
+SELECT amount, note FROM renamed_parent WHERE id = 7
+----
+11
+NULL
+
+statement ok
+UPDATE renamed_parent SET amount = 1 WHERE amount IS NULL
+
+# cost: 7
+statement ok
+ALTER TABLE renamed_parent ALTER amount SET NOT NULL
+
+statement error 23502
+INSERT INTO renamed_parent VALUES (8, NULL, 'bad')
+
+statement ok
+ALTER TABLE renamed_parent ALTER amount DROP NOT NULL
+
+statement ok
+INSERT INTO renamed_parent VALUES (8, NULL, 'ok')
+
+# A primary-key member cannot DROP NOT NULL.
+statement error 42P16
+ALTER TABLE renamed_parent ALTER id DROP NOT NULL
+
+# Identity's default/nullability are managed only by the deferred identity-specific ALTER forms.
+statement ok
+CREATE TABLE identity_alter (id i32 GENERATED BY DEFAULT AS IDENTITY)
+
+statement error 42601
+ALTER TABLE identity_alter ALTER id SET DEFAULT 1
+
+statement error 42601
+ALTER TABLE identity_alter ALTER id DROP DEFAULT
+
+statement error 42601
+ALTER TABLE identity_alter ALTER id DROP NOT NULL
+
+# Missing objects and IF EXISTS.
+statement error 42P01
+ALTER TABLE missing ALTER x DROP DEFAULT
+
+statement ok
+ALTER TABLE IF EXISTS missing ALTER x DROP DEFAULT
+
+statement error 42703
+ALTER TABLE renamed_parent ALTER missing DROP DEFAULT
+
+statement error 42701
+ALTER TABLE renamed_parent RENAME COLUMN amount TO note
+
+statement error 42704
+ALTER TABLE renamed_parent RENAME CONSTRAINT missing TO other
+
+statement error 42P07
+ALTER TABLE renamed_parent RENAME TO child
+
+statement error 42809
+ALTER TABLE parent_expr_idx ALTER anything DROP DEFAULT
+
+statement ok
+CREATE SEQUENCE not_a_table
+
+statement error 42809
+ALTER TABLE not_a_table ALTER anything DROP DEFAULT
+
+# Table rename repairs an OWNED sequence's owner metadata; dropping the renamed table removes it.
+statement ok
+CREATE TABLE owned (id serial PRIMARY KEY)
+
+statement ok
+ALTER TABLE owned RENAME TO renamed_owned
+
+statement ok
+DROP TABLE renamed_owned
+
+statement error 42P01
+SELECT nextval('owned_id_seq')

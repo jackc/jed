@@ -749,6 +749,29 @@ export type AlterSequence = {
     | { kind: "rename"; newName: string };
 };
 
+// ALTER TABLE slice 1 (spec/design/alter.md): one standalone rename or a comma-separated list of
+// catalog-only column actions. The parser guarantees rename/actions are never mixed.
+export type AlterTable = {
+  kind: "alterTable";
+  name: string;
+  db?: string;
+  ifExists: boolean;
+  action:
+    | { kind: "renameTable"; newName: string }
+    | { kind: "renameColumn"; oldName: string; newName: string }
+    | { kind: "renameConstraint"; oldName: string; newName: string }
+    | { kind: "alterColumns"; actions: AlterColumnAction[] };
+};
+
+export type AlterColumnAction = {
+  column: string;
+  action:
+    | { kind: "setDefault"; default: DefaultDef }
+    | { kind: "dropDefault" }
+    | { kind: "setNotNull" }
+    | { kind: "dropNotNull" };
+};
+
 // Insert is an INSERT ... [(col, ..)] whose rows come from EITHER a VALUES list (each value a
 // literal or the DEFAULT keyword) OR a SELECT (INSERT ... SELECT — spec/design/grammar.md §24).
 // An INSERT is two-phase / all-or-nothing — every row is validated before any is stored
@@ -1141,6 +1164,7 @@ export type Statement =
   | DropType
   | CreateSequence
   | AlterSequence
+  | AlterTable
   | DropSequence
   | Insert
   | Select

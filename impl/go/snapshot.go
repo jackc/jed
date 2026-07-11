@@ -816,6 +816,62 @@ func (s *snapshot) setColumnDefaultExpr(tableKey string, column int, de *default
 	s.tables[tableKey] = &t
 }
 
+// alterTableCatalog publishes one already-validated ALTER TABLE slice-1 catalog entry without
+// touching row bytes. renameTable moves the table/store key and repairs same-database FK + owned
+// sequence metadata; indexRename moves a UNIQUE/EXCLUDE backing store with its catalog name.
+func (s *snapshot) alterTableCatalog(oldKey string, t *catTable, renameTable, indexOld, indexNew string) {
+	s.bumpCatGen()
+	newKey := oldKey
+	if renameTable != "" {
+		newKey = strings.ToLower(renameTable)
+		delete(s.tables, oldKey)
+		if st, ok := s.stores[oldKey]; ok {
+			delete(s.stores, oldKey)
+			s.stores[newKey] = st
+		}
+	}
+	s.tables[newKey] = t
+	if indexOld != "" {
+		ok, nk := strings.ToLower(indexOld), strings.ToLower(indexNew)
+		if st, found := s.indexStores[ok]; found {
+			delete(s.indexStores, ok)
+			s.indexStores[nk] = st
+		}
+		if gt, found := s.gistTrees[ok]; found {
+			delete(s.gistTrees, ok)
+			s.gistTrees[nk] = gt
+		}
+	}
+	if renameTable == "" {
+		return
+	}
+	for key, old := range s.tables {
+		changed := false
+		fks := make([]foreignKey, len(old.ForeignKeys))
+		copy(fks, old.ForeignKeys)
+		for i := range fks {
+			if strings.EqualFold(fks[i].RefTable, oldKey) {
+				fks[i].RefTable = t.Name
+				changed = true
+			}
+		}
+		if changed {
+			cp := *old
+			cp.ForeignKeys = fks
+			s.tables[key] = &cp
+		}
+	}
+	for key, seq := range s.sequences {
+		if seq.OwnedBy != nil && strings.EqualFold(seq.OwnedBy.Table, oldKey) {
+			cp := *seq
+			owner := *seq.OwnedBy
+			owner.Table = t.Name
+			cp.OwnedBy = &owner
+			s.sequences[key] = &cp
+		}
+	}
+}
+
 // putIndexStore registers a loaded index store under its (lowercased) name — the file
 // loader's hook (format.go): the owning table's Indexes list came from its catalog entry,
 // so only the store is registered here.

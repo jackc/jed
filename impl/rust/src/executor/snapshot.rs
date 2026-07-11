@@ -724,6 +724,78 @@ impl Snapshot {
         }
     }
 
+    /// Publish one validated ALTER TABLE slice-1 catalog entry without touching row bytes.
+    pub(crate) fn alter_table_catalog(
+        &mut self,
+        old_key: &str,
+        table: Table,
+        rename_table: bool,
+        index_rename: Option<(&str, &str)>,
+    ) {
+        self.bump_cat_gen();
+        let new_key = if rename_table {
+            table.name.to_ascii_lowercase()
+        } else {
+            old_key.to_string()
+        };
+        if rename_table {
+            std::sync::Arc::make_mut(&mut self.tables).remove(old_key);
+            if let Some(store) = std::sync::Arc::make_mut(&mut self.stores).remove(old_key) {
+                std::sync::Arc::make_mut(&mut self.stores).insert(new_key.clone(), store);
+            }
+        }
+        std::sync::Arc::make_mut(&mut self.tables).insert(new_key.clone(), table.clone());
+        if let Some((old, new)) = index_rename {
+            let old = old.to_ascii_lowercase();
+            let new = new.to_ascii_lowercase();
+            if let Some(store) = std::sync::Arc::make_mut(&mut self.index_stores).remove(&old) {
+                std::sync::Arc::make_mut(&mut self.index_stores).insert(new.clone(), store);
+            }
+            if let Some(tree) = std::sync::Arc::make_mut(&mut self.gist_trees).remove(&old) {
+                std::sync::Arc::make_mut(&mut self.gist_trees).insert(new, tree);
+            }
+        }
+        if !rename_table {
+            return;
+        }
+        let keys: Vec<String> = self.tables.keys().cloned().collect();
+        for key in keys {
+            let Some(old) = self.tables.get(&key) else {
+                continue;
+            };
+            if !old
+                .foreign_keys
+                .iter()
+                .any(|fk| fk.ref_table.eq_ignore_ascii_case(old_key))
+            {
+                continue;
+            }
+            let mut changed = old.clone();
+            for fk in &mut changed.foreign_keys {
+                if fk.ref_table.eq_ignore_ascii_case(old_key) {
+                    fk.ref_table = table.name.clone();
+                }
+            }
+            std::sync::Arc::make_mut(&mut self.tables).insert(key, changed);
+        }
+        let seq_keys: Vec<String> = self.sequences.keys().cloned().collect();
+        for key in seq_keys {
+            let Some(seq) = self.sequences.get(&key) else {
+                continue;
+            };
+            if !seq
+                .owned_by
+                .as_ref()
+                .is_some_and(|o| o.table.eq_ignore_ascii_case(old_key))
+            {
+                continue;
+            }
+            let mut changed = seq.clone();
+            changed.owned_by.as_mut().unwrap().table = table.name.clone();
+            std::sync::Arc::make_mut(&mut self.sequences).insert(key, changed);
+        }
+    }
+
     /// Register a loaded index store under its (lowercased) name — the file loader's hook
     /// (format.rs): the owning table's `indexes` list came from its catalog entry, so only
     /// the store is registered here.

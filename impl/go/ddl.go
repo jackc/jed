@@ -23,6 +23,8 @@ func stmtKind(stmt statement) string {
 		return "CREATE TABLE"
 	case stmt.DropTable != nil:
 		return "DROP TABLE"
+	case stmt.AlterTable != nil:
+		return "ALTER TABLE"
 	case stmt.CreateIndex != nil:
 		return "CREATE INDEX"
 	case stmt.DropIndex != nil:
@@ -105,6 +107,11 @@ func (db *engine) dispatchStmtBody(stmt statement, params []Value) (outcome, err
 			return outcome{}, err
 		}
 		return db.executeDropTable(stmt.DropTable)
+	case stmt.AlterTable != nil:
+		if err := rejectParamsForDDL(params); err != nil {
+			return outcome{}, err
+		}
+		return db.executeAlterTable(stmt.AlterTable)
 	case stmt.CreateIndex != nil:
 		if err := rejectParamsForDDL(params); err != nil {
 			return outcome{}, err
@@ -1463,6 +1470,339 @@ func (db *engine) executeDropTable(dt *dropTable) (outcome, error) {
 		}
 	}
 	return outcome{Kind: outcomeStatement, Cost: 0}, nil
+}
+
+// executeAlterTable implements the catalog-only first ALTER TABLE slice (alter.md §1/§2).
+// It edits one private table copy, validates the final state, and publishes one catalog mutation.
+func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
+	if err := checkCatalogRelWrite(at.Name); err != nil {
+		return outcome{}, err
+	}
+	if err := db.checkAttachmentWritable(at.DB); err != nil {
+		return outcome{}, err
+	}
+	// Resolve the database separately from the relation so IF EXISTS suppresses a missing table but
+	// never an unknown attachment/database qualifier.
+	var snap *snapshot
+	if at.DB == nil {
+		_, _, tempIndex := db.tempSnap().findIndex(at.Name)
+		if db.isTempTable(at.Name) || tempIndex || db.tempSnap().sequence(at.Name) != nil {
+			snap = db.tempSnap()
+		} else {
+			snap = db.readSnap()
+		}
+	} else {
+		switch strings.ToLower(*at.DB) {
+		case "temp":
+			snap = db.tempSnap()
+		case "main":
+			snap = db.readSnap()
+		default:
+			snap = db.attachReadSnap(strings.ToLower(*at.DB))
+			if snap == nil {
+				return outcome{}, newError(UndefinedTable, `database "`+*at.DB+`" is not attached`)
+			}
+		}
+	}
+	original, ok := snap.table(at.Name)
+	if !ok {
+		if _, _, found := snap.findIndex(at.Name); found || snap.sequence(at.Name) != nil {
+			return outcome{}, newError(WrongObjectType, at.Name+" is not a table")
+		}
+		if at.IfExists {
+			return outcome{Kind: outcomeStatement}, nil
+		}
+		return outcome{}, newError(UndefinedTable, "table does not exist: "+at.Name)
+	}
+	oldKey := strings.ToLower(original.Name)
+	table := *original
+	table.Columns = append([]catColumn(nil), original.Columns...)
+	table.Checks = append([]checkConstraint(nil), original.Checks...)
+	table.Indexes = append([]indexDef(nil), original.Indexes...)
+	table.ForeignKeys = append([]foreignKey(nil), original.ForeignKeys...)
+	table.Exclusions = append([]exclusionConstraint(nil), original.Exclusions...)
+	indexOld, indexNew := "", ""
+	renameTable := ""
+	relationTaken := func(name string) bool {
+		if isAttachmentScope(at.DB) {
+			_, _, found := snap.findIndex(name)
+			_, tableFound := snap.table(name)
+			return tableFound || found || snap.sequence(name) != nil
+		}
+		return db.relationExists(name)
+	}
+
+	if at.RenameTable != "" {
+		if err := checkReservedName("table", at.RenameTable); err != nil {
+			return outcome{}, err
+		}
+		if relationTaken(at.RenameTable) {
+			return outcome{}, newError(DuplicateTable, "relation already exists: "+at.RenameTable)
+		}
+		renameTable = at.RenameTable
+		if err := rewriteAlterTableExpressions(&table, table.Name, renameTable, true); err != nil {
+			return outcome{}, err
+		}
+		table.Name = renameTable
+	} else if at.RenameColumn != nil {
+		old, next := at.RenameColumn.Old, at.RenameColumn.New
+		ci := -1
+		for i := range table.Columns {
+			if strings.EqualFold(table.Columns[i].Name, old) {
+				ci = i
+			}
+		}
+		if ci < 0 {
+			return outcome{}, newError(UndefinedColumn, "column does not exist: "+old)
+		}
+		for i := range table.Columns {
+			if strings.EqualFold(table.Columns[i].Name, next) {
+				return outcome{}, newError(DuplicateColumn, "column already exists: "+next)
+			}
+		}
+		if err := rewriteAlterTableExpressions(&table, old, next, false); err != nil {
+			return outcome{}, err
+		}
+		table.Columns[ci].Name = next
+	} else if at.RenameConstraint != nil {
+		old, next := at.RenameConstraint.Old, at.RenameConstraint.New
+		constraintExists := func(name string) bool {
+			for _, c := range table.Checks {
+				if strings.EqualFold(c.Name, name) {
+					return true
+				}
+			}
+			for _, i := range table.Indexes {
+				if i.Unique && strings.EqualFold(i.Name, name) {
+					return true
+				}
+			}
+			for _, f := range table.ForeignKeys {
+				if strings.EqualFold(f.Name, name) {
+					return true
+				}
+			}
+			for _, e := range table.Exclusions {
+				if strings.EqualFold(e.Name, name) {
+					return true
+				}
+			}
+			return false
+		}
+		if !constraintExists(old) {
+			return outcome{}, newError(UndefinedObject, "constraint does not exist: "+old)
+		}
+		if constraintExists(next) {
+			return outcome{}, newError(DuplicateObject, "constraint already exists: "+next)
+		}
+		for i := range table.Checks {
+			if strings.EqualFold(table.Checks[i].Name, old) {
+				table.Checks[i].Name = next
+			}
+		}
+		for i := range table.ForeignKeys {
+			if strings.EqualFold(table.ForeignKeys[i].Name, old) {
+				table.ForeignKeys[i].Name = next
+			}
+		}
+		for i := range table.Exclusions {
+			if strings.EqualFold(table.Exclusions[i].Name, old) {
+				table.Exclusions[i].Name, table.Exclusions[i].Index = next, next
+				indexOld, indexNew = old, next
+			}
+		}
+		for i := range table.Indexes {
+			if (table.Indexes[i].Unique || indexOld != "") && strings.EqualFold(table.Indexes[i].Name, old) {
+				table.Indexes[i].Name = next
+				indexOld, indexNew = old, next
+			}
+		}
+		if indexOld != "" {
+			if relationTaken(next) {
+				return outcome{}, newError(DuplicateTable, "relation already exists: "+next)
+			}
+		}
+		sort.Slice(table.Checks, func(i, j int) bool {
+			return strings.ToLower(table.Checks[i].Name) < strings.ToLower(table.Checks[j].Name)
+		})
+		sort.Slice(table.Indexes, func(i, j int) bool {
+			return strings.ToLower(table.Indexes[i].Name) < strings.ToLower(table.Indexes[j].Name)
+		})
+		sort.Slice(table.ForeignKeys, func(i, j int) bool {
+			return strings.ToLower(table.ForeignKeys[i].Name) < strings.ToLower(table.ForeignKeys[j].Name)
+		})
+		sort.Slice(table.Exclusions, func(i, j int) bool {
+			return strings.ToLower(table.Exclusions[i].Name) < strings.ToLower(table.Exclusions[j].Name)
+		})
+	} else {
+		for _, a := range at.Actions {
+			ci := -1
+			for i := range table.Columns {
+				if strings.EqualFold(table.Columns[i].Name, a.Column) {
+					ci = i
+					break
+				}
+			}
+			if ci < 0 {
+				return outcome{}, newError(UndefinedColumn, "column does not exist: "+a.Column)
+			}
+			switch a.Kind {
+			case alterSetDefault:
+				if table.Columns[ci].Identity != nil {
+					return outcome{}, newError(SyntaxError, "identity column cannot have a default")
+				}
+				dv, de, err := db.buildAlterDefault(table.Columns[ci], a.Default)
+				if err != nil {
+					return outcome{}, err
+				}
+				table.Columns[ci].Default, table.Columns[ci].DefaultExpr = dv, de
+			case alterDropDefault:
+				if table.Columns[ci].Identity != nil {
+					return outcome{}, newError(SyntaxError, "identity column cannot drop its default")
+				}
+				table.Columns[ci].Default, table.Columns[ci].DefaultExpr = nil, nil
+			case alterSetNotNull:
+				table.Columns[ci].NotNull = true
+			case alterDropNotNull:
+				if table.Columns[ci].Identity != nil {
+					return outcome{}, newError(SyntaxError, "identity column cannot drop not null")
+				}
+				if table.Columns[ci].PrimaryKey {
+					return outcome{}, newError(InvalidTableDefinition, "column is in a primary key")
+				}
+				table.Columns[ci].NotNull = false
+			}
+		}
+	}
+
+	meter := db.session.newMeter()
+	mask := make([]bool, len(table.Columns))
+	for i := range table.Columns {
+		mask[i] = !original.Columns[i].NotNull && table.Columns[i].NotNull
+	}
+	if slices.Contains(mask, true) {
+		store := db.lkpStoreScoped(at.DB, original.Name)
+		entries, pages, slabs, err := store.ScanWithUnits(mask)
+		if err != nil {
+			return outcome{}, err
+		}
+		meter.Charge(costs.PageRead*int64(pages) + costs.ValueDecompress*int64(slabs))
+		for _, e := range entries {
+			if err := meter.Guard(); err != nil {
+				return outcome{}, err
+			}
+			meter.Charge(costs.StorageRowRead)
+			row, err := store.resolveInlineColumns(e.Row)
+			if err != nil {
+				return outcome{}, err
+			}
+			for i, check := range mask {
+				if check && row[i].IsNull() {
+					return outcome{}, newNotNullViolation(table.Columns[i].Name)
+				}
+			}
+		}
+	}
+	var ws *snapshot
+	if at.DB == nil {
+		if db.isTempTable(original.Name) {
+			db.session.tx.tempDirty = true
+			ws = db.session.tx.tempWorking
+		} else {
+			ws = db.working()
+		}
+	} else {
+		switch strings.ToLower(*at.DB) {
+		case "temp":
+			db.session.tx.tempDirty = true
+			ws = db.session.tx.tempWorking
+		case "main":
+			ws = db.working()
+		default:
+			ws = db.attachWriteSnap(strings.ToLower(*at.DB))
+		}
+	}
+	ws.alterTableCatalog(oldKey, &table, renameTable, indexOld, indexNew)
+	return outcome{Kind: outcomeStatement, Cost: meter.Accrued}, nil
+}
+
+func (db *engine) buildAlterDefault(col catColumn, def *defaultDef) (*Value, *defaultExprDef, error) {
+	if !col.Type.isScalar() {
+		return nil, nil, newError(FeatureNotSupported, "a DEFAULT on this container type is not supported yet")
+	}
+	ty := col.Type.Scalar
+	clockDefault := ty == scalarDate && def.Expr.Kind == exprLiteral && def.Expr.Literal.Kind == literalText && dateClockIsRelative(def.Expr.Literal.Str)
+	if def.Expr.Kind == exprLiteral && !clockDefault {
+		v, err := storeValue(literalToValue(*def.Expr.Literal), ty, col.Decimal, col.VarcharLen, false, col.Name)
+		if err != nil {
+			return nil, nil, err
+		}
+		return &v, nil, nil
+	}
+	if err := rejectDefaultStructure(def.Expr); err != nil {
+		return nil, nil, err
+	}
+	_, rt, err := resolve(emptyScope(db), def.Expr, &ty, &aggCtx{collecting: false}, &paramTypes{})
+	if err != nil {
+		return nil, nil, err
+	}
+	if !assignableTo(rt, ty) {
+		return nil, nil, typeError(fmt.Sprintf("column %s is of type %s but default expression is of type %s", col.Name, ty.CanonicalName(), rtName(rt)))
+	}
+	return nil, &defaultExprDef{ExprText: def.Text, Expr: def.Expr}, nil
+}
+
+func rewriteAlterTableExpressions(table *catTable, old, next string, tableRename bool) error {
+	rewrite := func(text string) (string, exprNode, error) {
+		if tableRename {
+			return rewriteTableQualifier(text, old, next)
+		}
+		return rewriteColumnIdentifier(text, table.Name, old, next)
+	}
+	for i := range table.Checks {
+		text, expr, err := rewrite(table.Checks[i].ExprText)
+		if err != nil {
+			return err
+		}
+		table.Checks[i].ExprText, table.Checks[i].Expr = text, expr
+	}
+	for i := range table.Columns {
+		if table.Columns[i].DefaultExpr == nil {
+			continue
+		}
+		de := *table.Columns[i].DefaultExpr
+		text, expr, err := rewrite(de.ExprText)
+		if err != nil {
+			return err
+		}
+		de.ExprText, de.Expr = text, expr
+		table.Columns[i].DefaultExpr = &de
+	}
+	for i := range table.Indexes {
+		table.Indexes[i].Keys = append([]indexKey(nil), table.Indexes[i].Keys...)
+		for j := range table.Indexes[i].Keys {
+			if table.Indexes[i].Keys[j].Expr == nil {
+				continue
+			}
+			e := *table.Indexes[i].Keys[j].Expr
+			text, expr, err := rewrite(e.ExprText)
+			if err != nil {
+				return err
+			}
+			e.ExprText, e.Expr = text, expr
+			table.Indexes[i].Keys[j].Expr = &e
+		}
+		if table.Indexes[i].Predicate != nil {
+			e := *table.Indexes[i].Predicate
+			text, expr, err := rewrite(e.ExprText)
+			if err != nil {
+				return err
+			}
+			e.ExprText, e.Expr = text, expr
+			table.Indexes[i].Predicate = &e
+		}
+	}
+	return nil
 }
 
 // chooseSerialSeqName chooses the auto-generated name for a serial column's OWNED sequence
