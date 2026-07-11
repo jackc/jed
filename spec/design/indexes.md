@@ -218,6 +218,9 @@ reads.
 
 ## 5. The planner: index-bounded scans (SELECT)
 
+(This is one arm of the planner's access-path precedence — the pass structure and full
+rule inventory are in [planner.md](planner.md) §4/§5.)
+
 The existing per-relation pushdown seam ([cost.md §3](cost.md) "bounded scan") gains a
 second bound kind. For each **base relation of a SELECT scan** (single-table, a JOIN
 base table, or a correlated subquery's inner table), the plan picks, in order:
