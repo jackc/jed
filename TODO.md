@@ -192,10 +192,14 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 
 ### Planner infrastructure
 
-- [ ] **Explicit optimizer-pass structure** — the planner is fused pattern-matching in `planSelect`
-  today. Split it into logical-plan → rewrite-rules → physical/access-path selection so each
-  optimization is a discrete, testable rule (the "boring, explicit, small modules" stance, §10). A
-  refactor across all three cores; do it once ≥2–3 rules would share it. _(size: L; ×3 cores)_
+- [x] **Explicit optimizer-pass structure** — ✅ landed, all three cores: `planSelect` is now Stage 1
+  (resolve → the logical plan + the `computeRelMasks` touched-set annotation), a documented empty
+  Stage-2 rewrite seam, and Stage 3 — `optimizeSelect` (optimize.go / executor/optimize.rs /
+  optimize.ts) applying each optimization as a discrete rule owning its gate + action
+  (ruleScanBounds → ruleIndexNestedLoop → ruleOrderByPkScan → ruleOrderByIndexScan →
+  ruleJoinPkOrdered, fixed order), writing into the type-visible `SelectPlan.phys` sub-struct. A
+  pure restructure — plan choice, cost, and EXPLAIN unchanged (zero corpus re-pins).
+  → [planner.md](spec/design/planner.md)
 - [ ] **Predicate pushdown + simplification** — push WHERE conjuncts into derived tables / CTEs /
   through joins to the earliest relation, and detect contradictions (`x > 5 AND x < 3` → a provably
   empty scan). **Caveat:** plan-time **constant folding** / CSE removes `operator_eval` charges and so
