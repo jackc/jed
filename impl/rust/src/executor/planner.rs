@@ -1,6 +1,8 @@
-//! SELECT planning — the plan_select pass that resolves a parsed SELECT into a select plan (FROM
-//! relations, join tree, WHERE/GROUP/HAVING, projections, ORDER BY, LIMIT) plus its ORDER BY elision
-//! analysis (mirrors impl/go planner.go) — as Engine methods.
+//! SELECT planning, Stage 1 — the RESOLVE half (spec/design/planner.md §2): plan_select resolves a
+//! parsed SELECT into the logical SelectPlan (FROM relations, join tree, WHERE/GROUP/HAVING,
+//! projections, ORDER BY, LIMIT) plus the touched-set annotation (compute_rel_masks), then hands
+//! it to the physical/access-path selection pass (optimize_select, optimize.rs) — resolve decides
+//! names/types/errors, never an access path. Mirrors impl/go planner.go.
 
 use super::*;
 
@@ -1147,64 +1149,6 @@ impl Engine {
             }
         }
 
-        // Scan-bound pushdown, per base relation: detect WHERE conjuncts that bound that
-        // relation's scan — a PK range, else a secondary-index equality — so it seeks/ranges
-        // instead of walking the whole B-tree (cost.md §3 "bounded scan" / "index-bounded
-        // scan"; indexes.md §5). The filter is resolved against the full FROM scope, so a
-        // relation's column is the GLOBAL index `rel.offset + local`; `const_source` only
-        // accepts a literal/param/outer const (never a sibling column), so a JOIN base table is
-        // bounded only by a CONSTANT predicate on its own columns — `b.pk = a.x` (the
-        // index-nested-loop case) stays a full scan, a follow-on. Sound for outer joins too: a
-        // non-NULL conjunct in WHERE eliminates that relation's NULL-extended rows, so bounding
-        // it cannot drop a surviving row.
-        // A set-returning relation is a computed row source with no PK/index — it never bounds
-        // (functions.md §10), so skip detection for it (the synthetic table would return None
-        // anyway, but gate it explicitly).
-        let rel_bounds: Vec<Option<ScanBound>> = scope
-            .rels
-            .iter()
-            .enumerate()
-            .map(|(i, rel)| match (&filter, &srf_meta[i], &derived_meta[i]) {
-                // A scan bound applies only to a base table — a set-returning function or a derived
-                // table is a computed source with no store to seek (functions.md §10, §42).
-                (Some(f), None, None) => detect_scan_bound(f, rel, scope.catalog),
-                _ => None,
-            })
-            .collect();
-        // Index-nested-loop pushdown (cost.md §3 "JOIN"): a join inner relation whose primary key /
-        // indexed column is compared to a SIBLING column of an earlier relation (`a JOIN b ON b.pk =
-        // a.x`) is re-materialized per outer row, seeking instead of full-scanning — O(N·M) →
-        // O(N·log M). Detected from the join's ON and the WHERE. Gated to a base table (a set-returning
-        // function / derived table / CTE / lateral item has no store to seek) that is the RIGHT/nullable
-        // side of an INNER/CROSS/LEFT join (a RIGHT/FULL preserved side cannot be bounded per outer
-        // row). rels[0] has no earlier relation; its join is `sel.joins[i - 1]`. A `Some` entry takes
-        // precedence over the once-materialized `rel_bounds` for that relation.
-        let rel_inl_bounds: Vec<Option<ScanBound>> = scope
-            .rels
-            .iter()
-            .enumerate()
-            .map(|(i, rel)| {
-                if i == 0
-                    || srf_meta[i].is_some()
-                    || derived_meta[i].is_some()
-                    || rel.cte.is_some()
-                    || lateral_flags[i]
-                    || !matches!(
-                        sel.joins[i - 1].kind,
-                        JoinKind::Inner | JoinKind::Cross | JoinKind::Left
-                    )
-                {
-                    return None;
-                }
-                detect_inl_bound(
-                    join_preds[i - 1].as_ref(),
-                    filter.as_ref(),
-                    rel,
-                    scope.catalog,
-                )
-            })
-            .collect();
-
         // The join predicates were resolved above (alongside the USING/NATURAL merges, which the
         // scope now carries). Pair each with its join kind — the kind only changes how unmatched
         // rows are handled in the executor loop, not the predicate (spec/design/grammar.md §15).
@@ -1252,226 +1196,7 @@ impl Engine {
                 lateral: lateral_flags[i],
             })
             .collect();
-        // The touched set per relation (cost.md §3 "The touched set"; large-values.md §14):
-        // the columns this query statically references, collected depth-aware so a correlated
-        // subquery's outer reference back into this scope counts. An aggregate query's
-        // projections / HAVING / ORDER BY index the synthetic group row, whose inputs are
-        // exactly the group keys + aggregate arguments collected here; a plain query's
-        // projections and ORDER BY keys index the combined row directly.
-        let total_cols: usize = rels.iter().map(|r| r.col_count).sum();
-        let mut touched = vec![false; total_cols];
-        if let Some(f) = &filter {
-            collect_touched(f, 0, &mut touched);
-        }
-        for j in &joins {
-            if let Some(on) = &j.on {
-                collect_touched(on, 0, &mut touched);
-            }
-        }
-        if is_agg {
-            // A column grouping key is a real input column (mark it); an expression grouping key has a
-            // SYNTHETIC index (`input_width + k`, out of `touched`'s range) — its real input columns
-            // are reached through its materialized `group_exprs` node instead (aggregates.md §15).
-            for &k in &group_keys {
-                if k < total_cols {
-                    touched[k] = true;
-                }
-            }
-            for ge in &group_exprs {
-                collect_touched(ge, 0, &mut touched);
-            }
-            for s in &agg_specs {
-                if let Some(op) = &s.operand {
-                    collect_touched(op, 0, &mut touched);
-                }
-                // An aggregate reads real input columns beyond its operand: the FILTER predicate
-                // (agg(x) FILTER (WHERE cond) — aggregates.md §11), an ordered-set direct argument, and a
-                // hypothetical-set's WITHIN GROUP key operands / direct args (aggregates.md §13/§19).
-                // Without these the referenced column is left unfetched by the lazy/masked scan
-                // (large-values.md §14) and folds as NULL — a memory-vs-disk divergence (count(*) FILTER,
-                // rank() WITHIN GROUP).
-                if let Some(f) = &s.filter {
-                    collect_touched(f, 0, &mut touched);
-                }
-                if let Some(osa) = &s.osa {
-                    if let Some(frac) = &osa.frac {
-                        collect_touched(frac, 0, &mut touched);
-                    }
-                }
-                if let Some(hypo) = &s.hypo {
-                    for k in &hypo.keys {
-                        collect_touched(k, 0, &mut touched);
-                    }
-                    for a in &hypo.args {
-                        collect_touched(a, 0, &mut touched);
-                    }
-                }
-            }
-        } else {
-            for p in &projections {
-                collect_touched(p, 0, &mut touched);
-            }
-            // A column-key ORDER BY slot is a real input column (`< total_cols`) — mark it; a
-            // materialized expression-key slot is synthetic (`>= total_cols`, after rebase) whose input
-            // columns are reached through its `order_exprs` expression instead (collected below).
-            for (slot, ..) in &order {
-                if *slot < total_cols {
-                    touched[*slot] = true;
-                }
-            }
-            // Each materialized ORDER BY expression key reads real input columns (a plain query resolves
-            // it against the FROM scope; a grouped query reaches them through its group keys / aggregate
-            // arguments, already marked above).
-            for oe in &order_exprs {
-                collect_touched(oe, 0, &mut touched);
-            }
-            // A window query also reads each window function's PARTITION BY + ORDER BY keys, beyond
-            // what the projection's window-result slots reference. A bare-column key is a real input
-            // slot (`< total_cols`) — mark it; a materialized expression key is a synthetic slot
-            // (`>= total_cols`, after rebase) whose input columns are reached through its `window_keys`
-            // expression instead (collected below).
-            for spec in &window_specs {
-                for &pk in &spec.partition {
-                    if pk < total_cols {
-                        touched[pk] = true;
-                    }
-                }
-                for (slot, ..) in &spec.order {
-                    if *slot < total_cols {
-                        touched[*slot] = true;
-                    }
-                }
-                // The window function's ARGUMENT operands (sum(amount)'s amount, lag(v, off, def)'s
-                // value/offset/default) and its FILTER read real input columns too — the row-based
-                // window stage evaluates them per frame row (window.md §5.2). Without this the operand
-                // column is left unfetched by the lazy/masked scan (large-values.md §14) and folds as
-                // NULL. Mirrors the aggregate branch's collect_touched(agg operand) above.
-                for a in &spec.args {
-                    collect_touched(a, 0, &mut touched);
-                }
-                if let Some(f) = &spec.filter {
-                    collect_touched(f, 0, &mut touched);
-                }
-            }
-            // Each materialized window-key expression reads real input columns (a plain window query
-            // resolves its keys against the FROM scope).
-            for ke in &window_keys {
-                collect_touched(ke, 0, &mut touched);
-            }
-        }
-        // A set-returning relation's arguments and a LATERAL derived table's body read real input
-        // columns too — an implicitly-lateral SRF arg / lateral body sees an earlier sibling relation
-        // (functions.md §10, grammar.md §44). Applies to aggregate and plain queries alike. Without this
-        // the referenced column is left unfetched by the lazy/masked scan (large-values.md §14) and the
-        // SRF/body reads NULL — a memory-vs-disk divergence.
-        for r in &rels {
-            if let Some(srf) = &r.srf {
-                // A LATERAL SRF (any SRF at position i>0) resolves its sibling columns as OuterColumn at
-                // level 1 (the same frame the runtime pushes) — so collect at depth 1, not 0. An i==0
-                // SRF has no sibling correlation, so depth 1 marks nothing there.
-                for a in &srf.args {
-                    collect_touched(a, 1, &mut touched);
-                }
-            }
-            if let Some(derived) = &r.derived {
-                collect_touched_plan(derived, 1, &mut touched);
-            }
-        }
-        let rel_masks: Vec<Vec<bool>> = rels
-            .iter()
-            .map(|r| touched[r.offset..r.offset + r.col_count].to_vec())
-            .collect();
-
-        // ORDER BY satisfied by primary-key scan order (spec/design/cost.md §3): a single base
-        // table, non-aggregate, non-DISTINCT SELECT whose ORDER BY keys are a prefix of the
-        // relation's PRIMARY KEY columns — collation-matching the column's stored key form, all in
-        // one direction (ASC ⇒ forward scan, DESC ⇒ a reverse scan over the full PK) — needs no
-        // sort, since the table scan already yields rows in that order. The streaming scan then
-        // elides the sort (and, with a LIMIT, short-circuits a top-N).
-        // (DISTINCT is allowed: when the scan already yields ORDER BY order, the dedup runs streaming
-        // — keeping first occurrence in scan order — and the sort is elided, cost.md §3 "DISTINCT".)
-        let pk_dir = if !is_agg
-            && !order.is_empty()
-            && order_exprs.is_empty() // a materialized expression key always takes the blocking sort
-            && rels.len() == 1
-            && rels[0].srf.is_none()
-            && rels[0].cte.is_none()
-            && rels[0].derived.is_none()
-        {
-            order_satisfied_by_pk(scope.rels[0].table, rels[0].offset, &order, self)
-        } else {
-            None
-        };
-        let pk_ordered = pk_dir.is_some();
-        let pk_reverse = pk_dir == Some(true);
-
-        // ORDER BY satisfied by SECONDARY-INDEX scan order (cost.md §3 "secondary-index order"): when
-        // the PK scan does NOT satisfy the order but a B-tree index's columns do, and there is a
-        // LIMIT, walk that index in key order and point-look-up each row — a top-N that avoids the
-        // blocking sort (and, for a collated index, the collate units). Gated to a LIMIT because
-        // without one the index walk + N point lookups costs more than a full scan + sort. A WHERE
-        // pushdown bound (combining the two) is a follow-on, so it requires no rel bound.
-        let index_order = if !is_agg
-            && !has_window
-            && !sel.distinct
-            && !pk_ordered
-            && sel.limit.is_some()
-            && !order.is_empty()
-            && order_exprs.is_empty()
-            && rels.len() == 1
-            && rels[0].srf.is_none()
-            && rels[0].cte.is_none()
-            && rels[0].derived.is_none()
-            && rel_bounds[0].is_none()
-            // A host-attached relation full-scans this slice (attached-databases.md §8): the
-            // index-order exec resolves its index store UNSCOPED, so gate it off (perf follow-on).
-            && !scope.rels[0].is_attachment()
-        {
-            order_satisfied_by_index(scope.rels[0].table, rels[0].offset, &order, self)
-        } else {
-            None
-        };
-
-        // ORDER BY satisfied by the OUTER relation's PK scan order in a two-table INNER/CROSS join
-        // (cost.md §3 "JOIN"): the nested loop drives the outer (rels[0]) in PK order, so the join
-        // output is already in `(outer PK, inner key)` order — the sort is elided, and with a LIMIT
-        // the loop short-circuits a top-N. Gated to exactly two non-lateral base relations, an
-        // INNER/CROSS join, a LIMIT, and a FORWARD outer-PK order (the eager stable sort ties in input
-        // order, which a reverse outer scan would invert — reverse join is a follow-on). The outer
-        // must carry no non-PK bound (a PK bound / no bound keeps it in PK order).
-        let join_pk_ordered = !is_agg
-            && !has_window
-            && !sel.distinct
-            && !order.is_empty()
-            && order_exprs.is_empty()
-            && sel.limit.is_some()
-            && rels.len() == 2
-            && joins.len() == 1
-            && matches!(joins[0].kind, JoinKind::Inner | JoinKind::Cross)
-            && rels.iter().all(|r| {
-                !r.lateral && r.srf.is_none() && r.cte.is_none() && r.derived.is_none()
-            })
-            && !matches!(
-                rel_bounds[0],
-                Some(ScanBound::Index(_))
-                | Some(ScanBound::Gin(_))
-                | Some(ScanBound::Gist(_))
-                | Some(ScanBound::PkSet(_))
-                | Some(ScanBound::IndexSet(_))
-            )
-            // The inner relation must not be an index-nested-loop relation — it is re-materialized
-            // per outer row, so the two-table streaming loop (both materialized once) does not apply
-            // (combining the top-N loop with INL is a follow-on).
-            && rel_inl_bounds.iter().all(|b| b.is_none())
-            // No ORDER BY key beyond the outer PK: the outer PK is unique over the OUTER table but
-            // NOT over the join output (one outer row fans out to many), so an extra key (`ORDER BY
-            // a.id, b.x`) is a real tie-break the outer scan order does not satisfy — unlike the
-            // single-table case where a past-the-PK key is genuinely redundant. So require the order
-            // to be a pure prefix of the outer PK (no trailing keys).
-            && order.len() <= scope.rels[0].table.pk_indices().len()
-            && order_satisfied_by_pk(scope.rels[0].table, rels[0].offset, &order, self) == Some(false);
-
-        Ok(SelectPlan {
+        let mut plan = SelectPlan {
             rels,
             joins,
             filter,
@@ -1493,15 +1218,153 @@ impl Engine {
             distinct: sel.distinct,
             limit: sel.limit,
             offset: sel.offset,
-            rel_masks,
-            phys: PhysicalPlan {
-                pk_ordered,
-                pk_reverse,
-                index_order,
-                join_pk_ordered,
-                rel_bounds,
-                rel_inl_bounds,
-            },
-        })
+            rel_masks: Vec::new(),
+            phys: PhysicalPlan::default(),
+        };
+        plan.rel_masks = compute_rel_masks(&plan);
+        // ——— Stage 2: logical rewrite rules (spec/design/planner.md §3) ———
+        // No rewrite rules exist yet; the first (predicate pushdown / simplification, TODO.md)
+        // lands here as pure plan→plan transforms. fold_uncorrelated_in_plan is NOT a planner
+        // rewrite — it executes subqueries and needs bound params, so it stays post-bind in
+        // run_query_expr.
+        //
+        // ——— Stage 3: physical/access-path selection (spec/design/planner.md §4) ———
+        self.optimize_select(&mut plan, &scope);
+        Ok(plan)
     }
+}
+
+/// Compute the TOUCHED SET per relation (cost.md §3 "The touched set"; large-values.md §14):
+/// the columns this query statically references, collected depth-aware so a correlated
+/// subquery's outer reference back into this scope counts. An aggregate query's projections /
+/// HAVING / ORDER BY index the synthetic group row, whose inputs are exactly the group keys +
+/// aggregate arguments collected here; a plain query's projections and ORDER BY keys index the
+/// combined row directly. An ANNOTATION of the logical plan, not an optimization
+/// (spec/design/planner.md §2): the mask is a correctness input to the lazy/masked scan — a
+/// wrong mask is a disk-mode NULL-folding bug, not a slow plan — so it is computed by the
+/// resolve half, before any physical rule runs.
+fn compute_rel_masks(plan: &SelectPlan) -> Vec<Vec<bool>> {
+    let total_cols: usize = plan.rels.iter().map(|r| r.col_count).sum();
+    let mut touched = vec![false; total_cols];
+    if let Some(f) = &plan.filter {
+        collect_touched(f, 0, &mut touched);
+    }
+    for j in &plan.joins {
+        if let Some(on) = &j.on {
+            collect_touched(on, 0, &mut touched);
+        }
+    }
+    if plan.is_agg {
+        // A column grouping key is a real input column (mark it); an expression grouping key has a
+        // SYNTHETIC index (`input_width + k`, out of `touched`'s range) — its real input columns
+        // are reached through its materialized `group_exprs` node instead (aggregates.md §15).
+        for &k in &plan.group_keys {
+            if k < total_cols {
+                touched[k] = true;
+            }
+        }
+        for ge in &plan.group_exprs {
+            collect_touched(ge, 0, &mut touched);
+        }
+        for s in &plan.agg_specs {
+            if let Some(op) = &s.operand {
+                collect_touched(op, 0, &mut touched);
+            }
+            // An aggregate reads real input columns beyond its operand: the FILTER predicate
+            // (agg(x) FILTER (WHERE cond) — aggregates.md §11), an ordered-set direct argument, and a
+            // hypothetical-set's WITHIN GROUP key operands / direct args (aggregates.md §13/§19).
+            // Without these the referenced column is left unfetched by the lazy/masked scan
+            // (large-values.md §14) and folds as NULL — a memory-vs-disk divergence (count(*) FILTER,
+            // rank() WITHIN GROUP).
+            if let Some(f) = &s.filter {
+                collect_touched(f, 0, &mut touched);
+            }
+            if let Some(osa) = &s.osa {
+                if let Some(frac) = &osa.frac {
+                    collect_touched(frac, 0, &mut touched);
+                }
+            }
+            if let Some(hypo) = &s.hypo {
+                for k in &hypo.keys {
+                    collect_touched(k, 0, &mut touched);
+                }
+                for a in &hypo.args {
+                    collect_touched(a, 0, &mut touched);
+                }
+            }
+        }
+    } else {
+        for p in &plan.projections {
+            collect_touched(p, 0, &mut touched);
+        }
+        // A column-key ORDER BY slot is a real input column (`< total_cols`) — mark it; a
+        // materialized expression-key slot is synthetic (`>= total_cols`, after rebase) whose input
+        // columns are reached through its `order_exprs` expression instead (collected below).
+        for (slot, ..) in &plan.order {
+            if *slot < total_cols {
+                touched[*slot] = true;
+            }
+        }
+        // Each materialized ORDER BY expression key reads real input columns (a plain query resolves
+        // it against the FROM scope; a grouped query reaches them through its group keys / aggregate
+        // arguments, already marked above).
+        for oe in &plan.order_exprs {
+            collect_touched(oe, 0, &mut touched);
+        }
+        // A window query also reads each window function's PARTITION BY + ORDER BY keys, beyond
+        // what the projection's window-result slots reference. A bare-column key is a real input
+        // slot (`< total_cols`) — mark it; a materialized expression key is a synthetic slot
+        // (`>= total_cols`, after rebase) whose input columns are reached through its `window_keys`
+        // expression instead (collected below).
+        for spec in &plan.window_specs {
+            for &pk in &spec.partition {
+                if pk < total_cols {
+                    touched[pk] = true;
+                }
+            }
+            for (slot, ..) in &spec.order {
+                if *slot < total_cols {
+                    touched[*slot] = true;
+                }
+            }
+            // The window function's ARGUMENT operands (sum(amount)'s amount, lag(v, off, def)'s
+            // value/offset/default) and its FILTER read real input columns too — the row-based
+            // window stage evaluates them per frame row (window.md §5.2). Without this the operand
+            // column is left unfetched by the lazy/masked scan (large-values.md §14) and folds as
+            // NULL. Mirrors the aggregate branch's collect_touched(agg operand) above.
+            for a in &spec.args {
+                collect_touched(a, 0, &mut touched);
+            }
+            if let Some(f) = &spec.filter {
+                collect_touched(f, 0, &mut touched);
+            }
+        }
+        // Each materialized window-key expression reads real input columns (a plain window query
+        // resolves its keys against the FROM scope).
+        for ke in &plan.window_keys {
+            collect_touched(ke, 0, &mut touched);
+        }
+    }
+    // A set-returning relation's arguments and a LATERAL derived table's body read real input
+    // columns too — an implicitly-lateral SRF arg / lateral body sees an earlier sibling relation
+    // (functions.md §10, grammar.md §44). Applies to aggregate and plain queries alike. Without this
+    // the referenced column is left unfetched by the lazy/masked scan (large-values.md §14) and the
+    // SRF/body reads NULL — a memory-vs-disk divergence.
+    for r in &plan.rels {
+        if let Some(srf) = &r.srf {
+            // A LATERAL SRF (any SRF at position i>0) resolves its sibling columns as OuterColumn at
+            // level 1 (the same frame the runtime pushes) — so collect at depth 1, not 0. An i==0
+            // SRF has no sibling correlation, so depth 1 marks nothing there.
+            for a in &srf.args {
+                collect_touched(a, 1, &mut touched);
+            }
+        }
+        if let Some(derived) = &r.derived {
+            collect_touched_plan(derived, 1, &mut touched);
+        }
+    }
+    plan.rels
+        .iter()
+        .map(|r| touched[r.offset..r.offset + r.col_count].to_vec())
+        .collect()
 }

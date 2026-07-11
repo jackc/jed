@@ -57,6 +57,7 @@ mod exec_scan;
 mod execute;
 mod explain_exec;
 mod kernels;
+mod optimize;
 mod plan_query;
 mod planner;
 mod srf;
