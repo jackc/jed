@@ -4356,9 +4356,10 @@ pub(crate) fn streaming_scan_eligible(plan: &SelectPlan) -> bool {
         && plan.joins.is_empty()
         && !plan.is_agg
         && !plan.has_window
-        && (plan.pk_ordered || (!plan.distinct && plan.order.is_empty() && plan.limit.is_some()))
+        && (plan.phys.pk_ordered
+            || (!plan.distinct && plan.order.is_empty() && plan.limit.is_some()))
         && !matches!(
-            plan.rel_bounds[0],
+            plan.phys.rel_bounds[0],
             Some(ScanBound::Index(_))
                 | Some(ScanBound::Gin(_))
                 | Some(ScanBound::Gist(_))
@@ -4397,7 +4398,7 @@ pub(crate) fn vectorized_project_eligible(plan: &SelectPlan) -> bool {
     }
     // Full scan or a primary-key bound only — an index / GIN / GiST bound changes the scan mechanics.
     if matches!(
-        plan.rel_bounds[0],
+        plan.phys.rel_bounds[0],
         Some(ScanBound::Index(_))
             | Some(ScanBound::Gin(_))
             | Some(ScanBound::Gist(_))

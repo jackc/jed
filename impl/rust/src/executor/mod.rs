@@ -4318,6 +4318,26 @@ pub(crate) struct SelectPlan {
     distinct: bool,
     limit: Option<i64>,
     offset: Option<i64>,
+    /// The **touched set** per relation (cost.md §3 "The touched set"; large-values.md §14): which
+    /// of its columns this query statically references. Drives the chain-`page_read` /
+    /// `value_decompress` portion of the scan's up-front cost block — an untouched spilled or
+    /// compressed column charges nothing, however many records the bound admits. An ANNOTATION of
+    /// the logical plan, not an optimization: a wrong mask is a disk-mode NULL-folding correctness
+    /// bug, not a slow plan — so it is computed by the resolve half (`compute_rel_masks`), never by
+    /// a physical rule (spec/design/planner.md §2).
+    rel_masks: Vec<Vec<bool>>,
+    /// The plan's physical / access-path decisions — set ONLY by the `optimize_select` pass
+    /// (optimize.rs); default (zero-valued) when resolve hands the plan over
+    /// (spec/design/planner.md §4).
+    phys: PhysicalPlan,
+}
+
+/// The physical/access-path half of a [`SelectPlan`]: every field is the output of one discrete
+/// rule of the `optimize_select` pass (spec/design/planner.md §4), applied in a fixed order after
+/// the resolve half has built the logical plan. A defaulted `PhysicalPlan` is always correct — the
+/// executor then full-scans and eager-sorts.
+#[derive(Default)]
+pub(crate) struct PhysicalPlan {
     /// `ORDER BY` is satisfied by the single base relation's **primary-key scan order** — the
     /// table tree already yields rows in this order, so the sort is elided (and with a `LIMIT`
     /// the scan short-circuits a top-N). True iff the query is a single-table, non-aggregate,
@@ -4356,11 +4376,6 @@ pub(crate) struct SelectPlan {
     /// instead of full-scanning — O(N·M) → O(N·log M). `None` ⇒ the ordinary once-materialized
     /// `rel_bounds` path. A set entry takes precedence over `rel_bounds` for that relation.
     rel_inl_bounds: Vec<Option<ScanBound>>,
-    /// The **touched set** per relation (cost.md §3 "The touched set"; large-values.md §14): which
-    /// of its columns this query statically references. Drives the chain-`page_read` /
-    /// `value_decompress` portion of the scan's up-front cost block — an untouched spilled or
-    /// compressed column charges nothing, however many records the bound admits.
-    rel_masks: Vec<Vec<bool>>,
 }
 
 // ---- Primary-key predicate pushdown (spec/design/cost.md §3 "bounded scan / point lookup") ----

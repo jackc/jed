@@ -48,7 +48,7 @@ impl Engine {
         // Streaming primary-key-ordered scan (spec/design/cost.md §3): a single-table query with no
         // blocking operator beyond an ORDER BY the scan already satisfies — either no ORDER BY with
         // a LIMIT (the LIMIT short-circuit), or an ORDER BY satisfied by the table's primary-key
-        // scan order (`plan.pk_ordered`) — streams scan→filter→project with NO sort, and with a
+        // scan order (`plan.phys.pk_ordered`) — streams scan→filter→project with NO sort, and with a
         // LIMIT STOPS the scan once the window is filled (so storage_row_read counts only the rows
         // actually read). A `pk_ordered` DISTINCT streams too: the dedup runs in scan order (the sort
         // elided), so it short-circuits a top-N like the non-DISTINCT case. A non-PK-ordered ORDER BY,
@@ -67,7 +67,7 @@ impl Engine {
         // `index_order` only for a single-table, non-aggregate/window/DISTINCT, no-bound, LIMITed
         // query whose ORDER BY a B-tree index satisfies (and the PK scan does not). Walk the index +
         // point-lookup; the eager sort is elided.
-        if let Some(io) = &plan.index_order {
+        if let Some(io) = &plan.phys.index_order {
             return Ok(Emitter::Final {
                 rows: self.exec_index_order_scan(plan, io, &env, meter)?.rows,
             });
@@ -75,13 +75,13 @@ impl Engine {
 
         // Streaming external sort (spec/design/spill.md §5): a single-table, no-join,
         // non-aggregate, non-DISTINCT query with an ORDER BY the scan does NOT already satisfy
-        // (`!plan.pk_ordered` — caught above) streams scan→filter→Sorter, so the input is never
+        // (`!plan.phys.pk_ordered` — caught above) streams scan→filter→Sorter, so the input is never
         // materialized in the executor heap and the sort spills sorted runs to disk under work_mem
         // (file-backed databases). DISTINCT/aggregate/join take the eager path below, and an index
         // bound does not stream (like the LIMIT short-circuit). Results + cost are identical to the
         // eager sort (the sort is unmetered — cost.md §3; spill.md §6).
         if !plan.order.is_empty()
-            && !plan.pk_ordered
+            && !plan.phys.pk_ordered
             && plan.order_exprs.is_empty() // a materialized expression key takes the eager path below
             && plan.rels.len() == 1
             && plan.joins.is_empty()
@@ -89,7 +89,7 @@ impl Engine {
             && !plan.has_window
             && !plan.distinct
             && !matches!(
-                plan.rel_bounds[0],
+                plan.phys.rel_bounds[0],
                 Some(ScanBound::Index(_))
                 | Some(ScanBound::Gin(_))
                 | Some(ScanBound::Gist(_))
@@ -113,7 +113,7 @@ impl Engine {
         // two-table INNER/CROSS join whose ORDER BY the OUTER relation's PK scan order satisfies, with
         // a LIMIT. The nested loop drives the outer in PK order so the output is already ordered — the
         // sort is elided and the loop short-circuits a top-N.
-        if plan.join_pk_ordered {
+        if plan.phys.join_pk_ordered {
             return Ok(Emitter::Final {
                 rows: self
                     .exec_streaming_join(plan, &env, meter, params, outer, stmt_rng)?
@@ -154,7 +154,7 @@ impl Engine {
         // holds its slot and the join loop re-materializes it per left row.
         let mut materialized: Vec<Vec<Row>> = Vec::with_capacity(plan.rels.len());
         for (ri, rel) in plan.rels.iter().enumerate() {
-            if rel.lateral || plan.rel_inl_bounds[ri].is_some() {
+            if rel.lateral || plan.phys.rel_inl_bounds[ri].is_some() {
                 materialized.push(Vec::new());
                 continue;
             }
@@ -243,7 +243,7 @@ impl Engine {
             // RIGHT/nullable side of an INNER/CROSS/LEFT join, so there is never an unmatched-RIGHT
             // emission (RIGHT/FULL are excluded — a preserved side cannot be bounded per outer row).
             // The whole ON/WHERE stays applied (the ON here, the WHERE below), so rows are unchanged.
-            if plan.rel_inl_bounds[k + 1].is_some() {
+            if plan.phys.rel_inl_bounds[k + 1].is_some() {
                 debug_assert!(!emit_right, "index-nested-loop excludes RIGHT/FULL joins");
                 for left in &running {
                     let right_rows = self.materialize_rel(

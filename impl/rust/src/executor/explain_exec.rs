@@ -354,14 +354,14 @@ impl Engine {
         }
         let mut order_note = String::new();
         if !sp.order.is_empty() {
-            if sp.pk_ordered {
+            if sp.phys.pk_ordered {
                 order_note = "pk ordered".to_string();
-                if sp.pk_reverse {
+                if sp.phys.pk_reverse {
                     order_note.push_str(" (reverse)");
                 }
-            } else if let Some(io) = &sp.index_order {
+            } else if let Some(io) = &sp.phys.index_order {
                 order_note = format!("index order: {}", io.name_key);
-            } else if sp.join_pk_ordered {
+            } else if sp.phys.join_pk_ordered {
                 order_note = "join pk ordered".to_string();
             } else {
                 r.emit(d, "Sort", format!("keys={}", sp.order.len()));
@@ -477,9 +477,9 @@ impl Engine {
         } else {
             // An index-nested-loop bound (per-outer-row seek) takes precedence over the
             // once-materialized bound in the access-path label (cost.md §3 "JOIN").
-            let (bound, inl) = match sp.rel_inl_bounds[i].as_ref() {
+            let (bound, inl) = match sp.phys.rel_inl_bounds[i].as_ref() {
                 Some(b) => (Some(b), true),
-                None => (sp.rel_bounds[i].as_ref(), false),
+                None => (sp.phys.rel_bounds[i].as_ref(), false),
             };
             let detail = self.scan_detail(&rel.table_name, bound, inl, &sp.rel_masks[i]);
             r.emit(

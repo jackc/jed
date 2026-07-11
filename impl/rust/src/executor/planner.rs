@@ -1493,13 +1493,15 @@ impl Engine {
             distinct: sel.distinct,
             limit: sel.limit,
             offset: sel.offset,
-            pk_ordered,
-            pk_reverse,
-            index_order,
-            join_pk_ordered,
-            rel_bounds,
-            rel_inl_bounds,
             rel_masks,
+            phys: PhysicalPlan {
+                pk_ordered,
+                pk_reverse,
+                index_order,
+                join_pk_ordered,
+                rel_bounds,
+                rel_inl_bounds,
+            },
         })
     }
 }

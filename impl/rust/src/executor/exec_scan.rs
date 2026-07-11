@@ -8,7 +8,7 @@ impl Engine {
     /// The streaming primary-key-ordered scan path (spec/design/cost.md §3): a single-table,
     /// no-blocking-operator query whose output order is already the table's primary-key scan order
     /// — either no ORDER BY (the LIMIT short-circuit) or an ORDER BY satisfied by PK order
-    /// (`plan.pk_ordered`, set by `order_satisfied_by_pk`) — streams scan→filter→project with NO
+    /// (`plan.phys.pk_ordered`, set by `order_satisfied_by_pk`) — streams scan→filter→project with NO
     /// sort, and (when there is a LIMIT) stops the scan the instant the LIMIT/OFFSET window is
     /// filled, charging storage_row_read only for the rows actually read. With no LIMIT it emits
     /// every survivor after OFFSET (the sort is simply elided — same rows, same cost as the eager/
@@ -27,13 +27,13 @@ impl Engine {
         let store = self.store_scoped(plan.rels[0].db.as_deref(), &plan.rels[0].table_name);
         // A `pk_reverse` plan (ORDER BY the full PK all-DESC) walks the tree backward; everything
         // else (forward `pk_ordered`, or the no-ORDER-BY LIMIT short-circuit) walks forward.
-        let reverse = plan.pk_reverse;
+        let reverse = plan.phys.pk_reverse;
 
         // Resolve the scan bound (the PK pushdown, if any) and charge the page_read block. This path
         // is single-table (gated below), so the only relation is `rel_bounds[0]`. A correlated bound
         // resolves against `env.outer` (the enclosing rows). An INDEX bound never streams — the
         // dispatch gate routes it to the eager path (cost.md §3 "LIMIT short-circuit").
-        let (bound, empty) = match &plan.rel_bounds[0] {
+        let (bound, empty) = match &plan.phys.rel_bounds[0] {
             Some(ScanBound::Pk(bp)) => match build_key_bound(bp, params, env.outer, &[]) {
                 Some(b) => (b, false),
                 None => (KeyBound::unbounded(), true),
@@ -160,7 +160,7 @@ impl Engine {
             || plan.is_agg
             || plan.distinct
             || plan.limit.is_none()
-            || !plan.pk_ordered
+            || !plan.phys.pk_ordered
         {
             return false;
         }
@@ -172,7 +172,7 @@ impl Engine {
             return false;
         }
         if matches!(
-            plan.rel_bounds[0],
+            plan.phys.rel_bounds[0],
             Some(ScanBound::Index(_))
                 | Some(ScanBound::Gin(_))
                 | Some(ScanBound::Gist(_))
@@ -216,7 +216,7 @@ impl Engine {
             return false;
         }
         match order_satisfied_by_pk(table, offset, &spec.order, self) {
-            Some(rev) if rev == plan.pk_reverse => {}
+            Some(rev) if rev == plan.phys.pk_reverse => {}
             _ => return false,
         }
         // The order covers the full (unique) PK ⇒ singleton peer groups (needed for a RANGE/GROUPS
@@ -253,9 +253,9 @@ impl Engine {
         params: &[Value],
     ) -> Result<Emitter> {
         let store = self.store_scoped(plan.rels[0].db.as_deref(), &plan.rels[0].table_name);
-        let reverse = plan.pk_reverse;
+        let reverse = plan.phys.pk_reverse;
 
-        let (bound, empty) = match &plan.rel_bounds[0] {
+        let (bound, empty) = match &plan.phys.rel_bounds[0] {
             Some(ScanBound::Pk(bp)) => match build_key_bound(bp, params, env.outer, &[]) {
                 Some(b) => (b, false),
                 None => (KeyBound::unbounded(), true),
@@ -483,8 +483,8 @@ impl Engine {
         if streaming_scan_eligible(&plan) {
             // Resolve the scan bound (the PK pushdown, if any) and the up-front cost block — identical
             // to `exec_streaming_scan`. An empty bound (e.g. `pk = NULL`) admits no row.
-            let reverse = plan.pk_reverse;
-            let (bound, empty) = match &plan.rel_bounds[0] {
+            let reverse = plan.phys.pk_reverse;
+            let (bound, empty) = match &plan.phys.rel_bounds[0] {
                 Some(ScanBound::Pk(bp)) => match build_key_bound(bp, &bound_params, &[], &[]) {
                     Some(b) => (b, false),
                     None => (KeyBound::unbounded(), true),
@@ -665,7 +665,7 @@ impl Engine {
 
     /// Streaming secondary-index-order scan (spec/design/cost.md §3 "secondary-index order"): an
     /// `ORDER BY` the PK scan does NOT satisfy but a B-tree index does, with a `LIMIT` (the gate —
-    /// `plan.index_order` is `Some`). Walks the index store forward in key order (the indexed
+    /// `plan.phys.index_order` is `Some`). Walks the index store forward in key order (the indexed
     /// columns' order), peels the fixed-width PK suffix off the END of each entry key (the
     /// "key-suffix skip" — sound because `pk_storage_width` confirmed the suffix length), point-looks-
     /// up the row, applies the residual filter, and STOPS once the LIMIT/OFFSET window is filled — a
@@ -767,7 +767,7 @@ impl Engine {
         // Resolve the scan bound (the PK pushdown, if any) and charge the page_read +
         // value_decompress block up front — identical to the eager scan (cost.md §3). An INDEX
         // bound never reaches here (the dispatch gate routes it to the eager path).
-        let (bound, empty) = match &plan.rel_bounds[0] {
+        let (bound, empty) = match &plan.phys.rel_bounds[0] {
             Some(ScanBound::Pk(bp)) => match build_key_bound(bp, params, env.outer, &[]) {
                 Some(b) => (b, false),
                 None => (KeyBound::unbounded(), true),
@@ -886,7 +886,7 @@ impl Engine {
     /// elided, and with a `LIMIT` the loop STOPS once the window is filled. Both tables are still
     /// materialized in full (`storage_row_read` = the sum of cardinalities, the join contract), but the
     /// `ON`/`WHERE` `operator_eval`s and `row_produced` drop to the combinations actually examined —
-    /// the cost-visible win. Gated (by the caller / `plan.join_pk_ordered`) to exactly two non-lateral
+    /// the cost-visible win. Gated (by the caller / `plan.phys.join_pk_ordered`) to exactly two non-lateral
     /// base relations, an INNER or CROSS join, a `LIMIT`, and an `ORDER BY` the outer PK satisfies.
     pub(crate) fn exec_streaming_join(
         &self,
@@ -1066,9 +1066,9 @@ impl Engine {
         // takes precedence and resolves its `Sibling` source from the current left row (cost.md §3
         // "JOIN"); else the once-materialized `rel_bounds`.
         let store = self.store_scoped(rel.db.as_deref(), &rel.table_name);
-        let bound = plan.rel_inl_bounds[ri]
+        let bound = plan.phys.rel_inl_bounds[ri]
             .as_ref()
-            .or(plan.rel_bounds[ri].as_ref());
+            .or(plan.phys.rel_bounds[ri].as_ref());
         let (mut rows, (node_count, slabs)) = match bound {
             Some(ScanBound::Pk(bp)) => match build_key_bound(bp, params, outer, left) {
                 Some(b) => {
@@ -1355,7 +1355,7 @@ impl Engine {
         let slabs = 0usize;
         let mut do_scan = true;
         let mut b = KeyBound::unbounded();
-        if let Some(ScanBound::Pk(bp)) = &plan.rel_bounds[0] {
+        if let Some(ScanBound::Pk(bp)) = &plan.phys.rel_bounds[0] {
             match build_key_bound(bp, params, outer, &[]) {
                 Some(bb) => b = bb,
                 None => do_scan = false,
@@ -1418,7 +1418,7 @@ impl Engine {
         // Full scan or a primary-key bound only — an index / GIN / GiST bound changes the scan
         // mechanics and residual filter, so it keeps the scalar path.
         if matches!(
-            plan.rel_bounds[0],
+            plan.phys.rel_bounds[0],
             Some(ScanBound::Index(_))
                 | Some(ScanBound::Gin(_))
                 | Some(ScanBound::Gist(_))
@@ -1616,7 +1616,7 @@ impl Engine {
         // An empty bound (a contradictory PK predicate) admits no rows — skip the scan entirely.
         let mut do_scan = true;
         let mut b = KeyBound::unbounded();
-        if let Some(ScanBound::Pk(bp)) = &plan.rel_bounds[0] {
+        if let Some(ScanBound::Pk(bp)) = &plan.phys.rel_bounds[0] {
             match build_key_bound(bp, env.params, env.outer, &[]) {
                 Some(bb) => b = bb,
                 None => do_scan = false,
