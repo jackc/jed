@@ -438,7 +438,7 @@ func resolvedTypeEqual(a, b resolvedType) bool {
 	switch a.kind {
 	case rtInt:
 		return a.intTy == b.intTy
-	case rtArray:
+	case rtArray, rtRange:
 		return resolvedTypeEqual(*a.elem, *b.elem)
 	case rtComposite:
 		if a.comp.named != b.comp.named || a.comp.name != b.comp.name || len(a.comp.fields) != len(b.comp.fields) {

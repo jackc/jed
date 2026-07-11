@@ -1937,21 +1937,26 @@ pub(crate) fn rexpr_eq_shifted(a: &RExpr, b: &RExpr, offset: usize) -> bool {
                     .all(|(x, y)| rexpr_eq_shifted(x, y, offset))
         }
         // GREATEST/LEAST(a, b, …) is likewise a legal index expression (grammar.md §52); a
-        // GREATEST index must not match a LEAST query, so the `greatest` discriminant is compared.
+        // GREATEST index must not match a LEAST query (the `greatest` discriminant is compared),
+        // nor an index built under a different text collation (compared by name — a collation-X
+        // index must not answer a collation-Y query).
         (
             GreatestLeast {
                 args: aa,
                 coerce_decimal: da,
                 greatest: ga,
+                collation: ca,
             },
             GreatestLeast {
                 args: ab,
                 coerce_decimal: db,
                 greatest: gb,
+                collation: cb,
             },
         ) => {
             ga == gb
                 && da == db
+                && ca.as_ref().map(|c| &c.name) == cb.as_ref().map(|c| &c.name)
                 && aa.len() == ab.len()
                 && aa
                     .iter()

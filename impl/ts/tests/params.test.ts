@@ -98,6 +98,14 @@ test("text param inference", () => {
   assert.deepStrictEqual(ints(rows(db, "SELECT id FROM t WHERE name = $1", [text("bob")])), [2n]);
 });
 
+test("LEAST infers a param from its common type", () => {
+  // GREATEST/LEAST note a bare parameter at their unified scalar type, like a comparison operand
+  // (grammar.md §52). Source branch A skipped this, so LEAST($1, 10) failed 42P18. A per-core test
+  // because param binding is a host-API surface (not the shared corpus).
+  const db = dbWith(["CREATE TABLE t (id i32 PRIMARY KEY)"]);
+  assert.deepStrictEqual(ints(rows(db, "SELECT LEAST($1, 10)", [intValue(7n)])), [7n]);
+});
+
 test("bare SELECT $1 is indeterminate 42P18", () => {
   const db = dbWith(["CREATE TABLE t (id i32 PRIMARY KEY)"]);
   assert.equal(paramErrCode(db, "SELECT $1 FROM t", [intValue(1n)]), "42P18");

@@ -140,6 +140,18 @@ func TestTextParamInference(t *testing.T) {
 	}
 }
 
+func TestLeastInfersParamFromCommonType(t *testing.T) {
+	// GREATEST/LEAST note a bare parameter at their unified scalar type, like a comparison operand
+	// (grammar.md §52). Source branch A skipped this, so LEAST($1, 10) failed 42P18. A per-core
+	// test because param binding is a host-API surface (not the shared corpus).
+	t.Parallel()
+	db := dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY)")
+	rows := queryRows(t, db, "SELECT LEAST($1, 10)", IntValue(7))
+	if len(rows) != 1 || rows[0][0].Int != 7 {
+		t.Fatalf("got %v want [[7]]", rows)
+	}
+}
+
 func TestBareSelectParamIsIndeterminate42P18(t *testing.T) {
 	t.Parallel()
 	db := dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY)")

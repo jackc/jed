@@ -1,13 +1,17 @@
 # GREATEST(a, b, …) / LEAST(a, b, …) — the variadic max/min (spec/design/grammar.md §52). NULL
 # arguments are IGNORED (unlike COALESCE's stop-at-non-NULL); the result is NULL only when EVERY
 # argument is NULL. EAGER — every argument is evaluated (GREATEST(1, 1/0) traps 22012), so unlike
-# CASE/COALESCE they are NOT a short-circuit exception (cost.md §3). Argument types unify exactly
-# like CASE result arms / COALESCE (numeric promote; cross-family 42804; all-NULL → text), and the
-# winner is chosen by that type's total order (the same order ORDER BY / MIN / MAX use). At least
-# one argument (empty is 42601); `greatest` / `least` stay usable as column names (the one-token
-# `(` lookahead); output names `greatest` / `least`. Verified against PostgreSQL 18.
-# Format + `requires`: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, ddl.check, ddl.column_default_expr, ddl.secondary_index, ddl.index_expr, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.order_by_expr, query.index_expr, query.aggregates, query.group_by, query.group_by_expr, expr.greatest_least, expr.comparison_value, expr.arithmetic, error.division_by_zero, types.i32, types.text, types.decimal, null.three_valued, resource.cost_metering
+# CASE/COALESCE they are NOT a short-circuit exception (cost.md §3). Argument types unify to one
+# common ORDERABLE type (numeric promote; float widths widen to f64; other families structural;
+# all-NULL → text): a non-orderable json/jsonpath is 42883, a cross-family / structurally-mismatched
+# pair is 42804, and the winner is chosen by that type's total order (the same order ORDER BY / MIN /
+# MAX use, text under a derived collation). Each comparison after the first non-NULL argument is
+# metered its size-scaled work (cost.md §3), so integer folds add no extra charge but larger values
+# do. At least one argument (empty is 42601, as are the DISTINCT/FILTER/VARIADIC/named/OVER modifier
+# forms); a distinct grammar node — not a catalog function — so `greatest` / `least` stay usable as
+# column names and carry no EXECUTE privilege. Output names `greatest` / `least`. Oracle-checked
+# against PostgreSQL 18. Format + `requires`: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.check, ddl.column_default_expr, ddl.secondary_index, ddl.index_expr, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.comparison_order, query.order_by, query.order_by_expr, query.index_expr, query.aggregates, query.group_by, query.group_by_expr, expr.greatest_least, expr.comparison_value, expr.arithmetic, cast.explicit, error.division_by_zero, types.i16, types.i32, types.i64, types.text, types.decimal, types.f32, types.f64, types.boolean, types.bytea, types.uuid, types.timestamp, types.timestamptz, types.date, types.interval, types.array, types.range, func.range_constructors, types.composite, types.jsonb_compare, types.json, types.jsonpath, null.three_valued, resource.cost_metering
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32, s text)
@@ -16,9 +20,10 @@ statement ok
 INSERT INTO t VALUES (1, 10, 5, 'x'), (2, NULL, 7, 'y'), (3, 20, NULL, NULL), (4, NULL, NULL, NULL)
 
 # The variadic maximum across two columns. A NULL argument is IGNORED (row 2: GREATEST(NULL, 7) is
-# 7; row 3: GREATEST(20, NULL) is 20); a leaf argument (column) charges nothing, so the whole
-# GREATEST is 1 per row (the node) + 4 scan + 4 produced + 1 page = 13. Output name is `greatest`
-# (PostgreSQL — the fixed keyword lowercased, grammar.md §52/§8).
+# 7; row 3: GREATEST(20, NULL) is 20); a leaf argument (column) charges nothing and an integer
+# comparison is metered zero (base work 1), so the whole GREATEST is 1 per row (the node) + 4 scan +
+# 4 produced + 1 page = 13. Output name is `greatest` (PostgreSQL — the fixed keyword lowercased,
+# grammar.md §52/§8).
 # names: greatest
 # cost: 13
 query I nosort
@@ -62,7 +67,6 @@ NULL
 # widens at eval (renders '10', not '10.0'). Row 4's `a` is NULL, so the decimal 1.5 is the only
 # non-NULL argument and wins — NULLs drop out, they do not propagate.
 # names: greatest
-# cost: 13
 query D nosort
 SELECT GREATEST(a, 1.5) FROM t ORDER BY id
 ----
@@ -82,8 +86,8 @@ w
 
 # EAGER — the contrast with COALESCE. EVERY argument is evaluated (both must be, to be compared),
 # so both `+ 1` arguments charge their Add on every row whether they win or not: per row 1 node +
-# 2 adds = 3. 4×3 + 4 scan + 4 produced + 1 page = 21. (COALESCE's lazy form would skip the second
-# argument on the rows where the first is non-NULL.)
+# 2 adds = 3 (the integer comparison is metered zero). 4×3 + 4 scan + 4 produced + 1 page = 21.
+# (COALESCE's lazy form would skip the second argument on the rows where the first is non-NULL.)
 # names: greatest
 # cost: 21
 query I nosort
@@ -137,6 +141,102 @@ SELECT LEAST(MIN(a), MIN(b)) FROM t
 ----
 5
 
+# --- type unification across the scalar/container surface (oracle-checked vs PostgreSQL 18) ------
+
+# One argument is valid; the output name is the lowercased keyword.
+# names: least
+query I nosort
+SELECT LEAST(7)
+----
+7
+
+# Integer widths promote to the widest input type (the value is unchanged; width is unobservable).
+query I nosort
+SELECT LEAST(3::smallint, 2::integer, 1::bigint)
+----
+1
+
+# Integer plus decimal promotes to decimal; scale belongs to the selected value.
+query DD nosort
+SELECT LEAST(3, 2.50, 4.0), GREATEST(3, 2.50, 4.0)
+----
+2.50
+4.0
+
+# Float widths promote to f64 and use the PostgreSQL total float order (NaN is largest). This is the
+# case both source branches got WRONG before consolidation (returning by declared width, not value).
+query RR nosort
+SELECT LEAST(CAST(2.5 AS float4), CAST(1.5 AS float8)),
+       GREATEST(CAST(9.5 AS float4), CAST(1.5 AS float8))
+----
+1.5
+9.5
+
+query R nosort
+SELECT GREATEST(CAST(2.5 AS float4), CAST('NaN' AS float8))
+----
+NaN
+
+# NULLs are ignored rather than propagated.
+query II nosort
+SELECT LEAST(NULL, 2, 1), GREATEST(NULL, 2, 1)
+----
+1
+2
+
+query TT nosort
+SELECT LEAST('beta', NULL, 'alpha'), GREATEST('beta', NULL, 'alpha')
+----
+alpha
+beta
+
+query BB nosort
+SELECT LEAST(true, false), GREATEST(true, false)
+----
+false
+true
+
+# Existing scalar orders are reused (bytea, uuid, the datetimes, interval).
+query TT nosort
+SELECT LEAST(bytea '\x62', bytea '\x61'),
+       GREATEST(uuid '00000000-0000-0000-0000-000000000001',
+                uuid '00000000-0000-0000-0000-000000000002')
+----
+\x61
+00000000-0000-0000-0000-000000000002
+
+query TTTT nosort
+SELECT LEAST(timestamp '2024-01-02 00:00:00', timestamp '2024-01-01 00:00:00'),
+       GREATEST(timestamptz '2024-01-01 00:00:00+00', timestamptz '2024-01-02 00:00:00+00'),
+       LEAST(date '2024-01-02', date '2024-01-01'),
+       LEAST(interval '2 days', interval '1 day')
+----
+2024-01-01 00:00:00
+2024-01-02 00:00:00+00
+2024-01-01
+1 day
+
+# Container and jsonb values use their existing total orders (array_cmp, range_cmp, jsonb btree).
+query TTT nosort
+SELECT LEAST(ARRAY[2,1], ARRAY[1,9]),
+       LEAST(int4range(2,3), int4range(1,4)),
+       LEAST('2'::jsonb, '1'::jsonb)
+----
+{1,9}
+[1,4)
+1
+
+statement ok
+CREATE TYPE least_greatest_pair AS (a i32, b text)
+
+query T nosort
+SELECT LEAST('(2,b)'::least_greatest_pair, '(1,z)'::least_greatest_pair)
+----
+(1,z)
+
+statement ok
+DROP TYPE least_greatest_pair
+
 # --- EAGER evaluation: a `1/0` in ANY argument traps, even when another argument would "win" -----
 
 statement ok
@@ -146,7 +246,7 @@ statement ok
 INSERT INTO one VALUES (1)
 
 # Both arguments are evaluated (eager), so the `1 + 1` and `2 + 2` each charge their Add: 1 node +
-# 2 adds + 1 scan + 1 produced + 1 page = 6.
+# 2 adds + 1 scan + 1 produced + 1 page = 6 (the integer comparison is metered zero).
 # names: greatest
 # cost: 6
 query I nosort
@@ -162,24 +262,66 @@ SELECT GREATEST(5, 1 / 0) FROM one
 statement error 22012
 SELECT LEAST(5, 1 / 0) FROM one
 
-# --- type / arity errors ----------------------------------------------------------------------
+# --- orderability gate: a non-orderable or structurally-mismatched argument set is rejected at
+# resolve, NOT silently mis-ordered by the comparator's totality fallback (the consolidation's core
+# correctness fix) --------------------------------------------------------------------------------
+
+# json ships no ordering operator, so a json comparison is 42883 (operator does not exist) — never a
+# silent "return the first argument". Source branch A returned the first json silently.
+statement error 42883
+SELECT GREATEST('2'::json, '1'::json) FROM one
+
+# jsonpath is likewise non-orderable — 42883.
+statement error 42883
+SELECT LEAST('$.a'::jsonpath, '$.b'::jsonpath) FROM one
 
 # Cross-family argument types (an integer column and a text column) cannot be unified — 42804.
 statement error 42804
 SELECT GREATEST(a, s) FROM t
 
+# The float island: a float never implicitly mixes with an integer/decimal — 42804.
+statement error 42804
+SELECT GREATEST(CAST(1.5 AS float8), 2) FROM one
+
+# Arrays of incomparable element types do not unify — 42804 (not a silent element-wise mis-compare).
+statement error 42804
+SELECT LEAST(ARRAY[1], ARRAY['x']) FROM one
+
+# Ranges of different element types do not unify — 42804 (i32range and i64range are distinct).
+statement error 42804
+SELECT LEAST(int4range(1,5), int8range(1,5)) FROM one
+
 # A nested all-NULL GREATEST is typed `text` (the all-NULL rule) BEFORE the outer unification sees
-# it, so text meets integer — 42804, exactly PostgreSQL ("GREATEST types text and integer cannot
-# be matched").
+# it, so text meets integer — 42804, exactly PostgreSQL.
 statement error 42804
 SELECT GREATEST(GREATEST(NULL, NULL), 42) FROM one
 
-# GREATEST() / LEAST() with no arguments is a syntax error (PostgreSQL's grammar has no empty form).
+# --- arity / modifier errors: a distinct grammar node accepts none of the function-call modifiers,
+# so every one is a 42601 syntax error at parse (PostgreSQL's shape) -------------------------------
+
 statement error 42601
 SELECT GREATEST() FROM one
 
 statement error 42601
 SELECT LEAST() FROM one
+
+statement error 42601
+SELECT LEAST(VARIADIC ARRAY[2, 1]) FROM one
+
+statement error 42601
+SELECT LEAST(value => 1, 2) FROM one
+
+statement error 42601
+SELECT GREATEST(DISTINCT a) FROM t
+
+statement error 42601
+SELECT GREATEST(1, 2) FILTER (WHERE true) FROM one
+
+# LEAST/GREATEST are conditional expressions, never window functions — an OVER clause is 42601 in
+# every core (a distinct grammar node can carry no OVER; this is where source branch B's cores
+# disagreed — Go/Rust 42883 vs TS 42601 — the consolidation makes it uniformly 42601).
+statement error 42601
+SELECT LEAST(1, 2) OVER () FROM one
 
 # --- `greatest` / `least` are NOT reserved: usable as column names ------------------------------
 
@@ -233,8 +375,9 @@ CREATE TABLE ei (id i32 PRIMARY KEY, a i32)
 statement ok
 INSERT INTO ei VALUES (1, 1), (2, NULL), (3, 3), (4, NULL), (5, 5), (6, 6), (7, 7), (8, 8), (9, 9), (10, 10)
 
-# Full scan first: every row evaluates the WHERE (1 node + 1 compare = 2 per row). GREATEST(a, 0)
-# is 0 only where `a` is NULL (NULL ignored → GREATEST(0) = 0), so rows 2 and 4 match.
+# Full scan first: every row evaluates the WHERE (1 node + 1 compare = 2 per row; the internal
+# integer GREATEST comparison is metered zero). GREATEST(a, 0) is 0 only where `a` is NULL (NULL
+# ignored → GREATEST(0) = 0), so rows 2 and 4 match.
 # cost: 33
 query I rowsort
 SELECT id FROM ei WHERE GREATEST(a, 0) = 0

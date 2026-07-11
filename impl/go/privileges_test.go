@@ -119,6 +119,24 @@ func TestFunctionExecuteIsRevocable(t *testing.T) {
 	sessExec(t, db, "SELECT 1 + 2") // the + operator is not a named function — never gated
 }
 
+func TestLeastGreatestCarryNoExecutePrivilege(t *testing.T) {
+	// LEAST/GREATEST are grammar conditional expressions, not catalog functions (grammar.md §52),
+	// so they carry NO EXECUTE privilege: a session that has revoked every function's EXECUTE still
+	// runs them, exactly like the `+` operator above. Source branch B routed them through the
+	// function-call AST, so revoking made SELECT LEAST(…) wrongly fail 42501 — this guards it.
+	t.Parallel()
+	db := memDB().Session(SessionOptions{})
+	db.Revoke(PrivSetEmpty.With(PrivExecute), "least")
+	db.Revoke(PrivSetEmpty.With(PrivExecute), "greatest")
+	out, err := queryOutcome(db, "SELECT LEAST(3, 1, 2), GREATEST(3, 1, 2)", nil)
+	if err != nil {
+		t.Fatalf("LEAST/GREATEST must not require function EXECUTE: %v", err)
+	}
+	if out.Rows[0][0].Int != 1 || out.Rows[0][1].Int != 3 {
+		t.Fatalf("got %v want [[1 3]]", out.Rows)
+	}
+}
+
 func TestAnAdditionalSessionCarriesItsOwnEnvelope(t *testing.T) {
 	t.Parallel()
 	// db.Session(opts) mints an independent session over a shared Database core (§2.4): a restricted

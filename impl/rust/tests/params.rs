@@ -149,6 +149,16 @@ fn text_param_inference() {
 }
 
 #[test]
+fn least_infers_param_from_common_type() {
+    // GREATEST/LEAST note a bare parameter at their unified scalar type, like a comparison operand
+    // (grammar.md §52). Source branch A skipped this, so LEAST($1, 10) failed 42P18. A per-core
+    // test because param binding is a host-API surface (not the shared corpus).
+    let mut db = db_with(&["CREATE TABLE t (id i32 PRIMARY KEY)"]);
+    let got = rows(&mut db, "SELECT LEAST($1, 10)", &[Value::Int(7)]);
+    assert_eq!(got, vec![vec![Value::Int(7)]]);
+}
+
+#[test]
 fn bare_select_param_is_indeterminate_42p18() {
     let mut db = db_with(&["CREATE TABLE t (id i32 PRIMARY KEY)"]);
     assert_eq!(

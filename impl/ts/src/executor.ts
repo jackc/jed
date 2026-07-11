@@ -13767,12 +13767,14 @@ export function rexprEqShifted(a: RExpr, b: RExpr, offset: number): boolean {
         a.args.every((x, i) => rexprEqShifted(x, b.args[i]!, offset))
       );
     // GREATEST/LEAST(a, b, …) is likewise a legal index expression (grammar.md §52); a GREATEST
-    // index must not match a LEAST query, so the `greatest` discriminant is compared.
+    // index must not match a LEAST query (the `greatest` discriminant is compared), nor an index
+    // built under a different text collation (compared by name).
     case "greatestLeast":
       return (
         b.kind === "greatestLeast" &&
         a.greatest === b.greatest &&
         a.coerceDecimal === b.coerceDecimal &&
+        (a.collation?.name ?? null) === (b.collation?.name ?? null) &&
         a.args.length === b.args.length &&
         a.args.every((x, i) => rexprEqShifted(x, b.args[i]!, offset))
       );
@@ -15360,7 +15362,13 @@ export type RExpr =
   // NULL only when every argument is NULL. `greatest` selects max vs min; the winner is chosen by
   // the unified type's total order (valueCmp). `coerceDecimal` widens integer arguments when the
   // unified type is decimal.
-  | { kind: "greatestLeast"; args: RExpr[]; coerceDecimal: boolean; greatest: boolean }
+  | {
+      kind: "greatestLeast";
+      args: RExpr[];
+      coerceDecimal: boolean;
+      greatest: boolean;
+      collation: Collation | null;
+    }
   // A scalar-function call (spec/design/functions.md §9, float.md §8), evaluated per row in any
   // context. `result` is the static result type — for abs over an integer/float it is the
   // operand's own type (range-checked / fround'd at that width), for round over int/decimal it is

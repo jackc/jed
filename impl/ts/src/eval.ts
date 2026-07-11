@@ -1059,19 +1059,32 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       // GREATEST/LEAST is EAGER (grammar.md §52): charge the node, then evaluate EVERY argument
       // (all must be, to be compared — GREATEST(1, 1/0) traps). NULL arguments are ignored; the
       // running winner is the max (greatest) or min (least) under the unified type's total order
-      // (valueCmp). All-NULL → NULL. Non-NULL values are coerced to the unified type (integer →
-      // decimal) before comparison so the comparator sees a single type.
+      // (valueCmp, or collation for text). All-NULL → NULL. Non-NULL values are coerced to the
+      // unified type (integer → decimal) before comparison so the comparator sees a single type.
+      // Each comparison after the first charges its size-scaled work (decimalWork / varlenCompare /
+      // collate), the same metering an explicit `<` chain would — the untrusted-query bound (§13).
       m.charge(COSTS.operatorEval);
       let best: Value | null = null;
       for (const a of e.args) {
-        const v = evalExpr(a, row, env, m);
-        if (v.kind === "null") continue;
-        const cv = coerceCaseValue(v, e.coerceDecimal);
+        const cv = coerceCaseValue(evalExpr(a, row, env, m), e.coerceDecimal);
+        if (cv.kind === "null") continue;
         if (best === null) {
           best = cv;
           continue;
         }
-        const c = valueCmp(cv, best);
+        let c: number;
+        if (e.collation !== null && cv.kind === "text" && best.kind === "text") {
+          m.charge(
+            COSTS.collate * BigInt(Array.from(cv.text).length + Array.from(best.text).length),
+          );
+          m.guard();
+          c = collatedCmp(e.collation, cv.text, best.text);
+        } else {
+          m.charge(COSTS.decimalWork * BigInt(decimalCmpWork(cv, best) - 1));
+          m.charge(COSTS.varlenCompare * BigInt(varlenCompareWork(cv, best) - 1));
+          m.guard();
+          c = valueCmp(cv, best);
+        }
         if ((e.greatest && c > 0) || (!e.greatest && c < 0)) {
           best = cv;
         }

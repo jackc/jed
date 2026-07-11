@@ -2495,6 +2495,50 @@ pub(crate) fn resolve_subscript_int(
     Ok(node)
 }
 
+/// Find GREATEST/LEAST's common type (grammar.md §52). Unlike the CASE unifier this must yield a
+/// type the fold can actually ORDER, so it (a) promotes numerics like CASE (integer widths widen,
+/// int + decimal → decimal), (b) promotes float widths to the widest (the float island — a float
+/// never mixes with int/decimal), and (c) requires structural equality for every other family
+/// (text, bytea, uuid, the datetimes, arrays/ranges/composites/jsonb). The caller gates the result
+/// through `classify_comparable`, so a non-orderable common type (json/jsonpath) still fails there.
+fn unify_minmax_types(types: &[ResolvedType], name: &str) -> Result<ResolvedType> {
+    let non_null: Vec<&ResolvedType> = types.iter().filter(|t| **t != ResolvedType::Null).collect();
+    let Some(&first) = non_null.first() else {
+        // Every argument is NULL/untyped — PostgreSQL types an all-unknown GREATEST/LEAST as text.
+        return Ok(ResolvedType::Text);
+    };
+    if non_null
+        .iter()
+        .all(|t| matches!(t, ResolvedType::Int(_) | ResolvedType::Decimal))
+    {
+        if non_null.iter().any(|t| **t == ResolvedType::Decimal) {
+            return Ok(ResolvedType::Decimal);
+        }
+        let mut acc = first.clone();
+        for t in &non_null[1..] {
+            acc = ResolvedType::Int(promote(&acc, t));
+        }
+        return Ok(acc);
+    }
+    if non_null.iter().all(|t| matches!(t, ResolvedType::Float(_))) {
+        let wide = non_null
+            .iter()
+            .any(|t| matches!(**t, ResolvedType::Float(ScalarType::Float64)));
+        return Ok(ResolvedType::Float(if wide {
+            ScalarType::Float64
+        } else {
+            ScalarType::Float32
+        }));
+    }
+    if non_null[1..].iter().any(|t| **t != *first) {
+        return Err(type_error(format!(
+            "{} types must be compatible",
+            name.to_ascii_uppercase()
+        )));
+    }
+    Ok(first.clone())
+}
+
 pub(crate) fn resolve(
     scope: &Scope,
     e: &Expr,
@@ -4064,8 +4108,12 @@ pub(crate) fn resolve(
         }
         Expr::GreatestLeast { args, greatest } => {
             // GREATEST/LEAST(a, b, …) (grammar.md §52): each argument resolves in the same agg
-            // context, and the argument types unify to one common type exactly like CASE's result
-            // arms (the shared unifier). The winner is chosen by that type's total order at eval.
+            // context, and the argument types unify to one common ORDERABLE type. The winner is
+            // chosen by that type's total order at eval, so — unlike CASE/COALESCE, which never
+            // compare — the common type must actually be comparable and floats of mixed width
+            // must be widened; this is why the unifier is `unify_minmax_types` (not the CASE
+            // unifier) and why `classify_comparable` gates the result.
+            let name = if *greatest { "greatest" } else { "least" };
             let mut rargs: Vec<RExpr> = Vec::with_capacity(args.len());
             let mut arg_types: Vec<ResolvedType> = Vec::with_capacity(args.len());
             for a in args {
@@ -4073,12 +4121,43 @@ pub(crate) fn resolve(
                 rargs.push(ra);
                 arg_types.push(aty);
             }
-            let unified = unify_case_types(&arg_types, "GREATEST/LEAST types must be compatible")?;
+            let unified = unify_minmax_types(&arg_types, name)?;
+            // The winner is chosen by the unified type's total order, so a non-orderable type
+            // (json/jsonpath) or an incomparable pair is `42883`/`42804` HERE — never silently
+            // mis-ordered by `value_cmp`'s cross-family totality fallback.
+            classify_comparable(&unified, &unified)?;
+            // A bare parameter takes the unified scalar type (like CASE/COALESCE — grammar.md §42).
+            let hint = scalar_for_param_hint(&unified);
+            for a in args {
+                if let Expr::Param(n) = a {
+                    params.note((*n as usize) - 1, hint)?;
+                }
+            }
+            // A mixed-width float set unifies to f64; widen the f32 arguments so the comparator
+            // sees a single width (the float island never mixes with int/decimal — §52).
+            if unified == ResolvedType::Float(ScalarType::Float64) {
+                rargs = rargs
+                    .into_iter()
+                    .zip(&arg_types)
+                    .map(|(node, ty)| widen_float_to_f64(node, ty))
+                    .collect();
+            }
+            // Text arguments derive one comparison collation (42P21/42P22 on conflict — §52).
+            let collation = if unified == ResolvedType::Text {
+                let mut deriv = Deriv::None;
+                for a in args {
+                    deriv = combine_deriv(deriv, derive_collation(scope, a)?)?;
+                }
+                resolve_deriv(scope.catalog, deriv)?
+            } else {
+                None
+            };
             Ok((
                 RExpr::GreatestLeast {
                     args: rargs,
                     coerce_decimal: unified == ResolvedType::Decimal,
                     greatest: *greatest,
+                    collation,
                 },
                 unified,
             ))

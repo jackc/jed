@@ -103,6 +103,20 @@ fn function_execute_is_revocable() {
 }
 
 #[test]
+fn least_greatest_carry_no_execute_privilege() {
+    // LEAST/GREATEST are grammar conditional expressions, not catalog functions (grammar.md §52),
+    // so they carry NO EXECUTE privilege: a session that has revoked every function's EXECUTE still
+    // runs them, exactly like the `+` operator above. Source branch B routed them through the
+    // function-call AST, so revoking made `SELECT LEAST(…)` wrongly fail 42501 — this guards it.
+    let mut db = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
+    db.revoke(PrivilegeSet::EMPTY.with(Privilege::Execute), "least");
+    db.revoke(PrivilegeSet::EMPTY.with(Privilege::Execute), "greatest");
+    ok(&mut db, "SELECT LEAST(3, 1, 2), GREATEST(3, 1, 2)");
+}
+
+#[test]
 fn an_additional_session_carries_its_own_envelope() {
     // db.session(opts) mints an independent session over a shared Database core (§2.4): a restricted
     // one rejects a write a permissive session still allows, and they share committed storage

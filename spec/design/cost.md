@@ -119,8 +119,10 @@ TS; any deviation diverges the count and fails the corpus.
   keeps which arguments accrue deterministic. (`GREATEST`/`LEAST` ([grammar.md](grammar.md) §52),
   by contrast, are the variadic min/max but are **eager**, *not* a short-circuit exception: one
   `operator_eval` for the node, then **every** argument is evaluated and charged — all must be, to
-  be compared — so `GREATEST(1, 1/0)` traps. Their internal min/max comparisons add no charge, the
-  same single-node weight as a scalar function.)
+  be compared — so `GREATEST(1, 1/0)` traps. Their internal min/max comparisons are **metered like
+  an explicit `<` chain**: each comparison after the first non-NULL argument charges the same
+  size-scaled `decimal_work` / `varlen_compare` / `collate` a binary comparison would, so a fold
+  over many large values cannot do unbounded comparison work under the ceiling — §6/§13.)
 - **Pre-order, LHS-before-RHS.** A node charges itself, then evaluates its left operand,
   then its right. The order does not change the **total** (a sum is order-independent),
   but it fixes the deterministic **abort point** for the cost ceiling (§6) identically

@@ -59,7 +59,7 @@ import type {
   ResolvedType,
 } from "./executor.ts";
 import { type EngineError, engineError } from "./errors.ts";
-import { exprEqual, resolveTypeAndTypmod, unifyCaseTypes } from "./eval_ops.ts";
+import { exprEqual, resolveTypeAndTypmod, scalarForParamHint, unifyCaseTypes } from "./eval_ops.ts";
 import { coerceStringToArray, overflow, typeError } from "./store.ts";
 import type { ScalarType } from "./types.ts";
 import {
@@ -103,6 +103,7 @@ import {
   isTimestamptz,
   isUuid,
   promoteFloat,
+  rank,
   roundToWidth,
   scalarTypeFromName,
   typeIsText,
@@ -1676,22 +1677,71 @@ export function resolve(
     }
     case "greatestLeast": {
       // GREATEST/LEAST(a, b, …) (grammar.md §52): each argument resolves in the same agg context,
-      // and the argument types unify to one common type exactly like CASE's result arms (the
-      // shared unifier). The winner is chosen by that type's total order at eval.
-      const args: RExpr[] = [];
-      const argTypes: ResolvedType[] = [];
-      for (const a of e.args) {
-        const ra = resolve(scope, a, null, ag, params);
-        args.push(ra.node);
-        argTypes.push(ra.type);
+      // and the argument types unify to one common ORDERABLE type. The winner is chosen by that
+      // type's total order at eval, so — unlike CASE/COALESCE, which never compare — the common
+      // type must actually be comparable and mixed-width floats must be widened (numeric promote,
+      // float widths to the widest, other families structural); a non-orderable common type
+      // (json/jsonpath) or an incomparable pair is rejected by classifyComparable HERE, never
+      // silently mis-ordered by valueCmp's cross-family totality fallback.
+      const name = e.greatest ? "greatest" : "least";
+      const resolved = e.args.map((a) => resolve(scope, a, null, ag, params));
+      const types = resolved.map((r) => r.type);
+      const nonNull = types.filter((t) => t.kind !== "null");
+      let unified: ResolvedType;
+      if (nonNull.length === 0) {
+        unified = { kind: "text" };
+      } else if (nonNull.every((t) => t.kind === "int" || t.kind === "decimal")) {
+        if (nonNull.some((t) => t.kind === "decimal")) {
+          unified = { kind: "decimal" };
+        } else {
+          let ty = (nonNull[0] as { kind: "int"; ty: ScalarType }).ty;
+          for (const t of nonNull.slice(1)) {
+            const next = (t as { kind: "int"; ty: ScalarType }).ty;
+            if (rank(next) > rank(ty)) ty = next;
+          }
+          unified = { kind: "int", ty };
+        }
+      } else if (nonNull.every((t) => t.kind === "float")) {
+        let ty = (nonNull[0] as { kind: "float"; ty: ScalarType }).ty;
+        for (const t of nonNull.slice(1)) {
+          ty = promoteFloat(ty, (t as { kind: "float"; ty: ScalarType }).ty);
+        }
+        unified = { kind: "float", ty };
+      } else {
+        unified = nonNull[0]!;
+        for (const t of nonNull.slice(1)) {
+          if (!resolvedTypeEqual(unified, t)) {
+            throw typeError(`${name.toUpperCase()} types must be compatible`);
+          }
+        }
       }
-      const unified = unifyCaseTypes(argTypes, "GREATEST/LEAST types must be compatible");
+      classifyComparable(unified, unified);
+      // A bare parameter takes the unified scalar type (like CASE/COALESCE — grammar.md §42).
+      const hint = scalarForParamHint(unified);
+      for (const a of e.args) {
+        if (a.kind === "param") params.note(a.index - 1, hint);
+      }
+      // A mixed-width float set unifies to f64; widen the f32 arguments (an ordinary cast, whose
+      // cost stays observable) so the comparator sees one width.
+      const args = resolved.map((r) =>
+        unified.kind === "float" && r.type.kind === "float"
+          ? widenFloatTo(r.node, r.type.ty, unified.ty)
+          : r.node,
+      );
+      // Text arguments derive one comparison collation (42P21/42P22 on conflict — §52).
+      let collation: Collation | null = null;
+      if (unified.kind === "text") {
+        let deriv: Deriv = { kind: "none" };
+        for (const a of e.args) deriv = combineDeriv(deriv, deriveCollation(scope, a));
+        collation = resolveDeriv(scope.catalog, deriv);
+      }
       return {
         node: {
           kind: "greatestLeast",
           args,
           coerceDecimal: unified.kind === "decimal",
           greatest: e.greatest,
+          collation,
         },
         type: unified,
       };

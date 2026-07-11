@@ -1556,8 +1556,11 @@ func rexprEqShifted(a, b *rExpr, offset int) bool {
 		return true
 	case reGreatestLeast:
 		// GREATEST/LEAST(a, b, …) is likewise a legal index expression (grammar.md §52); a
-		// GREATEST index must not match a LEAST query, so the `greatest` discriminant is compared.
-		if a.greatest != b.greatest || a.caseDecimal != b.caseDecimal || len(a.sargs) != len(b.sargs) {
+		// GREATEST index must not match a LEAST query (the `greatest` discriminant is compared),
+		// nor an index built under a different text collation (collationsEqual — a collation-X
+		// index must not answer a collation-Y query).
+		if a.greatest != b.greatest || a.caseDecimal != b.caseDecimal ||
+			!collationsEqual(a.collation, b.collation) || len(a.sargs) != len(b.sargs) {
 			return false
 		}
 		for i := range a.sargs {

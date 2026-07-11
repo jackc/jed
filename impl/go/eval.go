@@ -848,6 +848,66 @@ func unifyCaseTypes(arms []resolvedType, mismatch string) (resolvedType, error) 
 	return first, nil
 }
 
+// unifyMinmaxTypes finds GREATEST/LEAST's common type (grammar.md §52). Unlike unifyCaseTypes this
+// must yield a type the fold can ORDER, so it (a) promotes numerics like CASE, (b) promotes float
+// widths to the widest (the float island — never mixes with int/decimal), and (c) requires
+// STRUCTURAL equality for every other family (so i32range and i64range do not unify). The caller
+// gates the result through classifyComparable, so a non-orderable common type (json/jsonpath)
+// still fails there.
+func unifyMinmaxTypes(types []resolvedType, name string) (resolvedType, error) {
+	nonNull := make([]resolvedType, 0, len(types))
+	for _, t := range types {
+		if t.kind != rtNull {
+			nonNull = append(nonNull, t)
+		}
+	}
+	if len(nonNull) == 0 {
+		// Every argument is NULL/untyped — an all-unknown GREATEST/LEAST is text (PostgreSQL).
+		return resolvedType{kind: rtText}, nil
+	}
+	allNumeric, anyDecimal := true, false
+	for _, t := range nonNull {
+		if t.kind != rtInt && t.kind != rtDecimal {
+			allNumeric = false
+		}
+		if t.kind == rtDecimal {
+			anyDecimal = true
+		}
+	}
+	if allNumeric {
+		if anyDecimal {
+			return resolvedType{kind: rtDecimal}, nil
+		}
+		acc := nonNull[0]
+		for _, t := range nonNull[1:] {
+			acc = resolvedType{kind: rtInt, intTy: promote(acc, t)}
+		}
+		return acc, nil
+	}
+	allFloat := true
+	for _, t := range nonNull {
+		if !isFloatKind(t.kind) {
+			allFloat = false
+		}
+	}
+	if allFloat {
+		kind := nonNull[0].kind
+		for _, t := range nonNull[1:] {
+			if t.kind == rtFloat64 {
+				kind = rtFloat64
+			}
+		}
+		return resolvedType{kind: kind}, nil
+	}
+	first := nonNull[0]
+	for _, t := range nonNull[1:] {
+		if !resolvedTypeEqual(first, t) {
+			return resolvedType{}, typeError(strings.ToUpper(name) + " types must be compatible")
+		}
+	}
+	return first, nil
+}
+
 // coerceCase coerces a CASE arm's value to the unified result type. The only runtime coercion
 // needed is widening an integer result to decimal when the unified type is decimal — integer-width
 // unification needs none (all integers are i64), and an all-NULL CASE is text but every arm
@@ -2323,8 +2383,11 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 		// GREATEST/LEAST is EAGER (grammar.md §52): charge the node, then evaluate EVERY argument
 		// (all must be, to be compared — GREATEST(1, 1/0) traps). NULL arguments are ignored; the
 		// running winner is the max (greatest) or min (least) under the unified type's total order
-		// (valueCmp). All-NULL → NULL. Non-NULL values are coerced to the unified type (integer →
-		// decimal) before comparison so the comparator sees a single type.
+		// (valueCmp, or collation for text). All-NULL → NULL. Non-NULL values are coerced to the
+		// unified type (integer → decimal) before comparison so the comparator sees a single type.
+		// Each comparison after the first charges its size-scaled work (decimal_work /
+		// varlen_compare / collate), the same metering an explicit `<` chain would — the
+		// untrusted-query cost bound (§13).
 		m.Charge(costs.OperatorEval)
 		var best Value
 		haveBest := false
@@ -2333,15 +2396,31 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			if err != nil {
 				return Value{}, err
 			}
+			v = coerceCase(v, e.caseDecimal)
 			if v.Kind == ValNull {
 				continue
 			}
-			v = coerceCase(v, e.caseDecimal)
 			if !haveBest {
 				best, haveBest = v, true
 				continue
 			}
-			c := valueCmp(v, best)
+			var c int
+			if e.collation != nil && v.Kind == ValText {
+				m.Charge(costs.Collate * int64(utf8.RuneCountInString(v.str())+utf8.RuneCountInString(best.str())))
+				if err := m.Guard(); err != nil {
+					return Value{}, err
+				}
+				if c, err = collatedCmp(e.collation, v.str(), best.str()); err != nil {
+					return Value{}, err
+				}
+			} else {
+				m.Charge(costs.DecimalWork * (decimalCmpWork(v, best) - 1))
+				m.Charge(costs.VarlenCompare * (varlenCompareWork(v, best) - 1))
+				if err := m.Guard(); err != nil {
+					return Value{}, err
+				}
+				c = valueCmp(v, best)
+			}
 			if (e.greatest && c > 0) || (!e.greatest && c < 0) {
 				best = v
 			}

@@ -2700,9 +2700,11 @@ SELECT COALESCE(a, 1 / a) FROM t                          -- a ≠ NULL ⇒ 1/a 
 
 `GREATEST(a, b, …)` returns the **largest** of its arguments and `LEAST(a, b, …)` the **smallest**
 (`greatest_least_expr ::= ( "GREATEST" | "LEAST" ) "(" expr ( "," expr )* ")"`). They are the
-variadic min/max — a single-node grammar form like `COALESCE` (§51), sharing its argument-type
-unification and non-reserved lookahead, but with two deliberate differences: NULL arguments are
-**ignored** (not stop-at-non-NULL), and evaluation is **eager** (every argument is evaluated).
+variadic min/max — a single-node grammar form like `COALESCE` (§51), sharing its non-reserved
+lookahead, but with three deliberate differences: NULL arguments are **ignored** (not
+stop-at-non-NULL), evaluation is **eager** (every argument is evaluated), and — because the fold
+actually **compares** its arguments (COALESCE never does) — the common type must be **orderable**
+and the comparisons are **metered** (below).
 
 ```sql
 SELECT GREATEST(a, b, c) FROM t                  -- the row-wise maximum across three columns
@@ -2723,22 +2725,42 @@ SELECT GREATEST(low, NULL, high)                 -- NULLs are skipped; = GREATES
   be, to be compared): `GREATEST(1, 1/0)` **traps `22012`**, unlike the lazy `COALESCE(1, 1/0)`.
   So `GREATEST`/`LEAST` are *not* on the sanctioned short-circuit list; they are eager like an
   ordinary scalar function.
-- **Argument type unification — exactly CASE's result-arm rule** (§23), the same shared unifier as
-  `COALESCE`: NULL-typed arguments are dropped; an **all-NULL `GREATEST`/`LEAST` is `text`**; the
-  rest must share a family — numerics promote (decimal if any argument is decimal, else the widest
-  integer; an integer winner widens to decimal at eval when the common type is decimal), a
-  non-numeric family must be homogeneous. A cross-family mix is **`42804`** (`GREATEST/LEAST types
-  must be compatible`). The winner is the max (`GREATEST`) or min (`LEAST`) under the unified
-  type's **total order** — the same order `ORDER BY` and `MIN`/`MAX` use, so the three never
-  disagree.
+- **Argument type unification — CASE's result-arm rule, plus an orderability gate.** NULL-typed
+  arguments are dropped; an **all-NULL `GREATEST`/`LEAST` is `text`** (PostgreSQL's all-unknown
+  rule); the rest unify to one common type — numerics promote (decimal if any argument is decimal,
+  else the widest integer; an integer winner widens to decimal at eval), **float widths promote to
+  the widest** (the mixed-width `f32`/`f64` set widens to `f64` so the comparator sees one width),
+  and any other family must be **structurally equal** (same element type for `array`/`range`, same
+  shape for `composite`). This is like CASE (§23) but is **not** the CASE unifier: because the fold
+  compares its winner, the common type must actually be **orderable**, so the resolved type is
+  gated through the comparability matrix — a **non-orderable** type (`json`/`jsonpath`, which ship
+  no ordering operator) is **`42883`**, and a cross-family or structurally-mismatched pair
+  (including `i32range` × `i64range`, or `float` × `int`/`decimal` — the float island) is
+  **`42804`** (`GREATEST/LEAST types must be compatible`). The winner is the max (`GREATEST`) or
+  min (`LEAST`) under the unified type's **total order** — the same order `ORDER BY` and `MIN`/`MAX`
+  use, so the three never disagree.
+- **Collation.** When the common type is `text`, one comparison collation is derived from the
+  arguments by the ordinary PostgreSQL rules (`spec/design/collation.md` §1/§7): an explicit
+  `COLLATE` dominates, conflicting explicit collations are **`42P21`**, and an indeterminate
+  implicit pair is **`42P22`**. The fold then orders text under that collation (byte order when
+  none is derived), so `GREATEST`/`LEAST` agree with `ORDER BY` under the same collation.
 - **Where it is legal**: anywhere an expression is — projections, `WHERE`, `GROUP BY`/`HAVING`,
   `ORDER BY`, `CHECK` constraints, expression `DEFAULT`s, and **index expressions**
   ([indexes.md](indexes.md) §9 — immutable iff its arguments are, like any pure combinator; an
-  index on `GREATEST(a, 0)` matches the same expression in a query and pushes down). Aggregates
-  nest as in any expression.
-- **Cost** ([cost.md](cost.md) §3): one `operator_eval` for the node, plus the `operator_eval`s of
-  **all** arguments (each charges its own; a leaf argument — column or literal — charges nothing) —
-  eager, so no argument is skipped and the internal comparisons add no charge (like a scalar
-  function's single node weight). Output name for a bare `SELECT GREATEST(…)` / `SELECT LEAST(…)`
-  is **`greatest`** / **`least`** (PostgreSQL) — the fixed keyword lowercased, the same
-  no-expression-printer rationale as the §8 rule-4 function names.
+  index on `GREATEST(a, 0)` matches the same expression in a query and pushes down, and a
+  `GREATEST` index never answers a `LEAST` query nor one resolved under a different collation).
+  Aggregates nest as in any expression. Because they are a distinct grammar node (not a function
+  call), the modifier forms have no place to attach: `GREATEST(*)`, `GREATEST(DISTINCT …)`,
+  `GREATEST(…) FILTER (…)`, `GREATEST(VARIADIC …)`, named-argument notation, and `GREATEST(…) OVER
+  (…)` are all `42601` at parse — and, not being catalog functions, they carry **no** `EXECUTE`
+  privilege (a session that has revoked function `EXECUTE` still runs them, matching PostgreSQL,
+  which has no such grantable object).
+- **Cost** ([cost.md](cost.md) §3): one `operator_eval` for the node, plus the cost of **all**
+  arguments (each charges its own; a leaf — column or literal — charges nothing), plus, for **each
+  comparison after the first** non-NULL argument, the same **size-scaled** work an explicit `<`
+  charges — `decimal_work` for wide decimals, `varlen_compare` for `text`/`bytea`/containers, or
+  `collate` (proportional to the two operands' code-point lengths) under a derived collation. The
+  comparisons are metered — not free — so a `GREATEST` over many large values cannot do unbounded
+  comparison work under the cost ceiling (§13). Output name for a bare `SELECT GREATEST(…)` /
+  `SELECT LEAST(…)` is **`greatest`** / **`least`** (PostgreSQL) — the fixed keyword lowercased, the
+  same no-expression-printer rationale as the §8 rule-4 function names.

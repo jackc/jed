@@ -2483,13 +2483,16 @@ pub(crate) enum RExpr {
     /// A resolved `GREATEST(a, b, …)` / `LEAST(a, b, …)` (grammar.md §52) — the variadic max/min.
     /// EAGER (unlike `Coalesce`): every argument is evaluated. NULL arguments are ignored; the
     /// result is NULL only when every argument is NULL. `greatest` selects max vs min; the winner
-    /// is chosen by the unified type's total order (`value_cmp`). Argument types unify exactly
-    /// like CASE result arms; `coerce_decimal` widens integer arguments when the unified type is
-    /// decimal.
+    /// is chosen by the unified type's total order (`value_cmp`, or `collation` for text).
+    /// Argument types unify to one common ORDERABLE type (grammar.md §52 — numeric promote, float
+    /// widths widen to f64, other families structural; a non-orderable type such as json/jsonpath
+    /// is rejected at resolve). `coerce_decimal` widens integer arguments when the unified type is
+    /// decimal; `collation` is the derived text comparison collation (None ⇒ byte order).
     GreatestLeast {
         args: Vec<RExpr>,
         coerce_decimal: bool,
         greatest: bool,
+        collation: Option<std::sync::Arc<Collation>>,
     },
     /// A scalar-function call (abs/round, spec/design/functions.md §9), evaluated per row in
     /// any context. `result` is the static result type — for `abs` over an integer it is the

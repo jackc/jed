@@ -1514,30 +1514,43 @@ impl RExpr {
                 args,
                 coerce_decimal,
                 greatest,
+                collation,
             } => {
                 // GREATEST/LEAST is EAGER (grammar.md §52): charge the node, then evaluate EVERY
                 // argument (all must be, to be compared — GREATEST(1, 1/0) traps). NULL arguments
                 // are ignored; the running winner is the max (greatest) or min (least) under the
-                // unified type's total order (value_cmp). All-NULL → NULL. Non-NULL values are
-                // coerced to the unified type (integer → decimal) before comparison so the
-                // comparator sees a single type.
+                // unified type's total order (`value_cmp`, or `collation` for text). All-NULL →
+                // NULL. Non-NULL values are coerced to the unified type (integer → decimal) before
+                // comparison so the comparator sees a single type. Each comparison after the first
+                // charges its size-scaled work (decimal_work / varlen_compare / collate), the same
+                // metering an explicit `<` chain would — the untrusted-query cost bound (§13).
                 m.charge(COSTS.operator_eval);
                 let mut best: Option<Value> = None;
                 for a in args {
-                    let v = a.eval(row, env, m)?;
+                    let v = coerce_case(a.eval(row, env, m)?, *coerce_decimal);
                     if matches!(v, Value::Null) {
                         continue;
                     }
-                    let v = coerce_case(v, *coerce_decimal);
                     match &best {
                         None => best = Some(v),
                         Some(cur) => {
-                            let ord = value_cmp(&v, cur);
-                            let take = if *greatest {
-                                ord == std::cmp::Ordering::Greater
+                            let ord = if let (Some(coll), Value::Text(a), Value::Text(b)) =
+                                (collation, &v, cur)
+                            {
+                                m.charge(
+                                    COSTS.collate * (a.chars().count() + b.chars().count()) as i64,
+                                );
+                                m.guard()?;
+                                collated_cmp(coll, a, b)?
                             } else {
-                                ord == std::cmp::Ordering::Less
+                                m.charge(
+                                    COSTS.decimal_work * (decimal_cmp_work(&v, cur) - 1) as i64,
+                                );
+                                m.charge(COSTS.varlen_compare * (varlen_compare_work(&v, cur) - 1));
+                                m.guard()?;
+                                value_cmp(&v, cur)
                             };
+                            let take = if *greatest { ord.is_gt() } else { ord.is_lt() };
                             if take {
                                 best = Some(v);
                             }

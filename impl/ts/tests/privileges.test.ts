@@ -95,6 +95,17 @@ test("function EXECUTE is revocable", () => {
   db.execute("SELECT 1 + 2"); // the + operator is not a named function — never gated
 });
 
+test("LEAST/GREATEST carry no EXECUTE privilege", () => {
+  // LEAST/GREATEST are grammar conditional expressions, not catalog functions (grammar.md §52), so
+  // they carry NO EXECUTE privilege: a session that has revoked every function's EXECUTE still runs
+  // them, exactly like the `+` operator above. Source branch B routed them through the function-call
+  // AST, so revoking made SELECT LEAST(…) wrongly fail 42501 — this guards it.
+  const db = memDb().session();
+  db.revoke(PrivilegeSet.empty().with("execute"), "least");
+  db.revoke(PrivilegeSet.empty().with("execute"), "greatest");
+  db.execute("SELECT LEAST(3, 1, 2), GREATEST(3, 1, 2)"); // must not throw 42501
+});
+
 test("an additional session carries its own envelope", () => {
   // db.session(opts) mints an independent session over a shared Database core (§2.4): a restricted
   // one rejects a write a permissive session still allows, and they share committed storage through

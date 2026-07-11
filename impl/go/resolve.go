@@ -1921,8 +1921,14 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 			unified, nil
 	case exprGreatestLeast:
 		// GREATEST/LEAST(a, b, …) (grammar.md §52): each argument resolves in the same agg context,
-		// and the argument types unify to one common type exactly like CASE's result arms (the
-		// shared unifier). The winner is chosen by that type's total order at eval.
+		// and the argument types unify to one common ORDERABLE type. The winner is chosen by that
+		// type's total order at eval, so — unlike CASE/COALESCE, which never compare — the common
+		// type must actually be comparable and mixed-width floats must be widened; hence
+		// unifyMinmaxTypes (not the CASE unifier) plus the classifyComparable gate.
+		name := "least"
+		if e.Greatest {
+			name = "greatest"
+		}
 		args := make([]*rExpr, 0, len(e.GreatestLeast))
 		argTypes := make([]resolvedType, 0, len(e.GreatestLeast))
 		for _, a := range e.GreatestLeast {
@@ -1933,11 +1939,53 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 			args = append(args, ra)
 			argTypes = append(argTypes, aty)
 		}
-		unified, err := unifyCaseTypes(argTypes, "GREATEST/LEAST types must be compatible")
+		unified, err := unifyMinmaxTypes(argTypes, name)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
-		return &rExpr{kind: reGreatestLeast, sargs: args, caseDecimal: unified.kind == rtDecimal, greatest: e.Greatest},
+		// The winner is chosen by the unified type's total order, so a non-orderable type
+		// (json/jsonpath) or an incomparable pair is 42883/42804 HERE — never silently mis-ordered
+		// by valueCmp's cross-family totality fallback.
+		if err := classifyComparable(unified, unified); err != nil {
+			return nil, resolvedType{}, err
+		}
+		// A bare parameter takes the unified scalar type (like CASE/COALESCE — grammar.md §42).
+		hint := scalarForParamHint(unified)
+		for _, a := range e.GreatestLeast {
+			if a.Kind == exprParam {
+				if err := params.note(int(a.Param)-1, hint); err != nil {
+					return nil, resolvedType{}, err
+				}
+			}
+		}
+		// A mixed-width float set unifies to f64; widen the f32 arguments (an ordinary cast, whose
+		// cost stays observable) so the comparator sees one width.
+		if unified.kind == rtFloat64 {
+			for i, t := range argTypes {
+				if t.kind == rtFloat32 {
+					args[i] = &rExpr{kind: reCast, operand: args[i], result: scalarFloat64}
+				}
+			}
+		}
+		// Text arguments derive one comparison collation (42P21/42P22 on conflict — §52).
+		var coll *Collation
+		if unified.kind == rtText {
+			d := deriv{}
+			for _, a := range e.GreatestLeast {
+				ad, e2 := deriveCollation(s, a)
+				if e2 != nil {
+					return nil, resolvedType{}, e2
+				}
+				d, e2 = combineDeriv(d, ad)
+				if e2 != nil {
+					return nil, resolvedType{}, e2
+				}
+			}
+			if coll, err = resolveDeriv(s.catalog, d); err != nil {
+				return nil, resolvedType{}, err
+			}
+		}
+		return &rExpr{kind: reGreatestLeast, sargs: args, caseDecimal: unified.kind == rtDecimal, greatest: e.Greatest, collation: coll},
 			unified, nil
 	case exprQuantified:
 		return resolveQuantified(s, e.Quantified, ag, params)
