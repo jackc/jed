@@ -2695,3 +2695,50 @@ SELECT COALESCE(a, 1 / a) FROM t                          -- a ≠ NULL ⇒ 1/a 
   argument charges its own; a leaf argument — column or literal — charges nothing). Output name
   for a bare `SELECT COALESCE(…)` is **`coalesce`** (PostgreSQL) — the fixed keyword lowercased,
   the same no-expression-printer rationale as the §8 rule-4 function names.
+
+## 52. `GREATEST` / `LEAST`
+
+`GREATEST(a, b, …)` returns the **largest** of its arguments and `LEAST(a, b, …)` the **smallest**
+(`greatest_least_expr ::= ( "GREATEST" | "LEAST" ) "(" expr ( "," expr )* ")"`). They are the
+variadic min/max — a single-node grammar form like `COALESCE` (§51), sharing its argument-type
+unification and non-reserved lookahead, but with two deliberate differences: NULL arguments are
+**ignored** (not stop-at-non-NULL), and evaluation is **eager** (every argument is evaluated).
+
+```sql
+SELECT GREATEST(a, b, c) FROM t                  -- the row-wise maximum across three columns
+SELECT LEAST(price, ceiling) FROM item           -- clamp price down to a ceiling
+SELECT GREATEST(low, NULL, high)                 -- NULLs are skipped; = GREATEST(low, high)
+```
+
+- **Grammar.** At least one argument (`GREATEST()` / `LEAST()` is a `42601`, PostgreSQL's shape —
+  the grammar has no empty form). Both stay **non-reserved**: each form is recognized only when
+  the keyword is immediately followed by `(` (the `EXTRACT`/`JSON(` one-token lookahead, §8), so
+  `greatest` / `least` remain usable as column names — observably PostgreSQL's `col_name_keyword`
+  classification (a column name, never a function name).
+- **NULL arguments are ignored** (the PostgreSQL rule, unlike most other systems and unlike a
+  plain comparison). The result is `NULL` **only when every argument is NULL** — `GREATEST(1,
+  NULL, 2)` is `2`, `LEAST(NULL, NULL)` is `NULL`. This is the opposite of a NULL-propagating
+  operator: NULLs do not poison, they drop out of the min/max.
+- **Eager — NOT a short-circuit** ([cost.md](cost.md) §3). Every argument is evaluated (all must
+  be, to be compared): `GREATEST(1, 1/0)` **traps `22012`**, unlike the lazy `COALESCE(1, 1/0)`.
+  So `GREATEST`/`LEAST` are *not* on the sanctioned short-circuit list; they are eager like an
+  ordinary scalar function.
+- **Argument type unification — exactly CASE's result-arm rule** (§23), the same shared unifier as
+  `COALESCE`: NULL-typed arguments are dropped; an **all-NULL `GREATEST`/`LEAST` is `text`**; the
+  rest must share a family — numerics promote (decimal if any argument is decimal, else the widest
+  integer; an integer winner widens to decimal at eval when the common type is decimal), a
+  non-numeric family must be homogeneous. A cross-family mix is **`42804`** (`GREATEST/LEAST types
+  must be compatible`). The winner is the max (`GREATEST`) or min (`LEAST`) under the unified
+  type's **total order** — the same order `ORDER BY` and `MIN`/`MAX` use, so the three never
+  disagree.
+- **Where it is legal**: anywhere an expression is — projections, `WHERE`, `GROUP BY`/`HAVING`,
+  `ORDER BY`, `CHECK` constraints, expression `DEFAULT`s, and **index expressions**
+  ([indexes.md](indexes.md) §9 — immutable iff its arguments are, like any pure combinator; an
+  index on `GREATEST(a, 0)` matches the same expression in a query and pushes down). Aggregates
+  nest as in any expression.
+- **Cost** ([cost.md](cost.md) §3): one `operator_eval` for the node, plus the `operator_eval`s of
+  **all** arguments (each charges its own; a leaf argument — column or literal — charges nothing) —
+  eager, so no argument is skipped and the internal comparisons add no charge (like a scalar
+  function's single node weight). Output name for a bare `SELECT GREATEST(…)` / `SELECT LEAST(…)`
+  is **`greatest`** / **`least`** (PostgreSQL) — the fixed keyword lowercased, the same
+  no-expression-printer rationale as the §8 rule-4 function names.

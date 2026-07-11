@@ -1101,6 +1101,15 @@ pub enum Expr {
     /// CASE (grammar.md §51). The argument list has ≥1 entries (an empty list is 42601 at
     /// parse); argument types unify exactly like CASE result arms.
     Coalesce(Vec<Expr>),
+    /// `GREATEST(a, b, …)` / `LEAST(a, b, …)` — the variadic max/min (grammar.md §52). NULL
+    /// arguments are ignored; the result is NULL only when every argument is NULL. Unlike
+    /// COALESCE this is EAGER — every argument is evaluated. `greatest` selects max (true) vs
+    /// min (false). The argument list has ≥1 entries (empty is 42601 at parse); argument types
+    /// unify exactly like CASE result arms.
+    GreatestLeast {
+        args: Vec<Expr>,
+        greatest: bool,
+    },
     /// A function call — the shared aggregate/scalar call syntax (grammar.md §17). `name` is
     /// the spelling as written, resolved case-insensitively: an aggregate (COUNT/SUM/MIN/MAX/
     /// AVG, kind = "aggregate"), a scalar function (abs/round, kind = "function",

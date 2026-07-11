@@ -390,8 +390,9 @@ in the `rake ci` gate. Two families of relation are generated:
   must implement; a bug shows up as a partition that fails to reconstruct the whole. The `tlp`
   scenario covers comparison / equality / Kleene-`AND` / Kleene-`OR` / arithmetic-NULL predicates and
   the `COUNT(*)` / `COUNT(expr)` aggregate forms; `SUM`/`MIN`/`MAX`/`AVG` aggregate-TLP is **deferred**
-  (combining per-partition results needs `COALESCE` — now landed, [grammar.md](grammar.md) §51, so
-  the `SUM` form is unblocked — and a `LEAST`/`GREATEST` jed does not have yet for `MIN`/`MAX`).
+  as a generator addition (combining per-partition results needs `COALESCE` — landed,
+  [grammar.md](grammar.md) §51, unblocking the `SUM`/`AVG` forms — and `LEAST`/`GREATEST` — now also
+  landed, [grammar.md](grammar.md) §52, unblocking the `MIN`/`MAX` forms; both prerequisites are in).
 
 **Why this catches what the differential cores cannot.** Running every `.test` on Rust/Go/TS
 catches the cores *disagreeing*; it is blind to a bug **all three share**. A metamorphic
@@ -439,9 +440,9 @@ only yesterday's optimizations is false confidence (CLAUDE.md §10 "no silent ca
   same projected pairs through different execution shapes.
 - **NOT yet covered (needs a new relation):** any future index *range* / multi-column-prefix
   bound, DISTINCT / aggregate pushdown, or other optimization added later; on the TLP side,
-  `SUM`/`MIN`/`MAX`/`AVG` aggregate partitioning (`SUM`/`AVG` unblocked now `COALESCE` has landed,
-  [grammar.md](grammar.md) §51; `MIN`/`MAX` still blocked on `LEAST`/`GREATEST`) and a
-  `GROUP BY`-level TLP. Each is a future relation the sweep does **not** yet exercise — add a
+  `SUM`/`MIN`/`MAX`/`AVG` aggregate partitioning (all four now unblocked — `SUM`/`AVG` by `COALESCE`,
+  [grammar.md](grammar.md) §51, and `MIN`/`MAX` by `LEAST`/`GREATEST`, [grammar.md](grammar.md) §52 —
+  so these are pure metamorphic-generator additions) and a `GROUP BY`-level TLP. Each is a future relation the sweep does **not** yet exercise — add a
   scenario when it lands.
 
 **Reducing a discovered failure.** Generation is seeded, so a failure reproduces deterministically

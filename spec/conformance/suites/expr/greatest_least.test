@@ -1,0 +1,256 @@
+# GREATEST(a, b, …) / LEAST(a, b, …) — the variadic max/min (spec/design/grammar.md §52). NULL
+# arguments are IGNORED (unlike COALESCE's stop-at-non-NULL); the result is NULL only when EVERY
+# argument is NULL. EAGER — every argument is evaluated (GREATEST(1, 1/0) traps 22012), so unlike
+# CASE/COALESCE they are NOT a short-circuit exception (cost.md §3). Argument types unify exactly
+# like CASE result arms / COALESCE (numeric promote; cross-family 42804; all-NULL → text), and the
+# winner is chosen by that type's total order (the same order ORDER BY / MIN / MAX use). At least
+# one argument (empty is 42601); `greatest` / `least` stay usable as column names (the one-token
+# `(` lookahead); output names `greatest` / `least`. Verified against PostgreSQL 18.
+# Format + `requires`: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.check, ddl.column_default_expr, ddl.secondary_index, ddl.index_expr, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.order_by_expr, query.index_expr, query.aggregates, query.group_by, query.group_by_expr, expr.greatest_least, expr.comparison_value, expr.arithmetic, error.division_by_zero, types.i32, types.text, types.decimal, null.three_valued, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32, s text)
+
+statement ok
+INSERT INTO t VALUES (1, 10, 5, 'x'), (2, NULL, 7, 'y'), (3, 20, NULL, NULL), (4, NULL, NULL, NULL)
+
+# The variadic maximum across two columns. A NULL argument is IGNORED (row 2: GREATEST(NULL, 7) is
+# 7; row 3: GREATEST(20, NULL) is 20); a leaf argument (column) charges nothing, so the whole
+# GREATEST is 1 per row (the node) + 4 scan + 4 produced + 1 page = 13. Output name is `greatest`
+# (PostgreSQL — the fixed keyword lowercased, grammar.md §52/§8).
+# names: greatest
+# cost: 13
+query I nosort
+SELECT GREATEST(a, b) FROM t ORDER BY id
+----
+10
+7
+20
+NULL
+
+# The variadic minimum; NULLs ignored the same way (row 2: LEAST(NULL, 7) is 7).
+# names: least
+# cost: 13
+query I nosort
+SELECT LEAST(a, b) FROM t ORDER BY id
+----
+5
+7
+20
+NULL
+
+# Every argument NULL for a row → NULL (row 4); a single non-NULL argument is that value.
+query I nosort
+SELECT GREATEST(a, b, NULL) FROM t ORDER BY id
+----
+10
+7
+20
+NULL
+
+# All-NULL arguments unify to text (the PostgreSQL rule, like an all-NULL CASE/COALESCE).
+query T nosort
+SELECT GREATEST(NULL, NULL) FROM t ORDER BY id
+----
+NULL
+NULL
+NULL
+NULL
+
+# Numeric unification: an integer argument and a decimal argument unify to decimal; the integer
+# widens at eval (renders '10', not '10.0'). Row 4's `a` is NULL, so the decimal 1.5 is the only
+# non-NULL argument and wins — NULLs drop out, they do not propagate.
+# names: greatest
+# cost: 13
+query D nosort
+SELECT GREATEST(a, 1.5) FROM t ORDER BY id
+----
+10
+1.5
+20
+1.5
+
+# Text arguments compare by the C collation (code-point order); a NULL `s` takes the literal.
+query T nosort
+SELECT GREATEST(s, 'w') FROM t ORDER BY id
+----
+x
+y
+w
+w
+
+# EAGER — the contrast with COALESCE. EVERY argument is evaluated (both must be, to be compared),
+# so both `+ 1` arguments charge their Add on every row whether they win or not: per row 1 node +
+# 2 adds = 3. 4×3 + 4 scan + 4 produced + 1 page = 21. (COALESCE's lazy form would skip the second
+# argument on the rows where the first is non-NULL.)
+# names: greatest
+# cost: 21
+query I nosort
+SELECT GREATEST(a + 1, b + 1) FROM t ORDER BY id
+----
+11
+8
+21
+NULL
+
+# GREATEST/LEAST in WHERE: rows whose max-of-two exceeds 6 (the NULL-max row 4 fails, `NULL > 6`
+# is UNKNOWN). Per scanned row 1 node + 1 compare = 2 → 8; + 4 scan + 3 produced + 1 page = 16.
+# cost: 16
+query I nosort
+SELECT id FROM t WHERE GREATEST(a, b) > 6 ORDER BY id
+----
+1
+2
+3
+
+# GREATEST as an ORDER BY expression: the NULL-max row sorts last (NULL is the largest value).
+query I nosort
+SELECT id FROM t ORDER BY GREATEST(a, b), id
+----
+2
+1
+3
+4
+
+# GREATEST as a GROUP BY key expression.
+query II nosort
+SELECT GREATEST(a, b), COUNT(*) FROM t GROUP BY GREATEST(a, b) ORDER BY 1
+----
+7
+1
+10
+1
+20
+1
+NULL
+1
+
+# Aggregates nest as in any expression: the greater of two column maxima, the lesser of two minima.
+query I nosort
+SELECT GREATEST(MAX(a), MAX(b)) FROM t
+----
+20
+
+query I nosort
+SELECT LEAST(MIN(a), MIN(b)) FROM t
+----
+5
+
+# --- EAGER evaluation: a `1/0` in ANY argument traps, even when another argument would "win" -----
+
+statement ok
+CREATE TABLE one (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO one VALUES (1)
+
+# Both arguments are evaluated (eager), so the `1 + 1` and `2 + 2` each charge their Add: 1 node +
+# 2 adds + 1 scan + 1 produced + 1 page = 6.
+# names: greatest
+# cost: 6
+query I nosort
+SELECT GREATEST(1 + 1, 2 + 2) FROM one
+----
+4
+
+# Unlike COALESCE(5, 1/0) (which is 5), GREATEST/LEAST evaluate EVERY argument, so the `1/0` traps
+# 22012 even though an earlier argument would win — the defining eager contrast (grammar.md §52).
+statement error 22012
+SELECT GREATEST(5, 1 / 0) FROM one
+
+statement error 22012
+SELECT LEAST(5, 1 / 0) FROM one
+
+# --- type / arity errors ----------------------------------------------------------------------
+
+# Cross-family argument types (an integer column and a text column) cannot be unified — 42804.
+statement error 42804
+SELECT GREATEST(a, s) FROM t
+
+# A nested all-NULL GREATEST is typed `text` (the all-NULL rule) BEFORE the outer unification sees
+# it, so text meets integer — 42804, exactly PostgreSQL ("GREATEST types text and integer cannot
+# be matched").
+statement error 42804
+SELECT GREATEST(GREATEST(NULL, NULL), 42) FROM one
+
+# GREATEST() / LEAST() with no arguments is a syntax error (PostgreSQL's grammar has no empty form).
+statement error 42601
+SELECT GREATEST() FROM one
+
+statement error 42601
+SELECT LEAST() FROM one
+
+# --- `greatest` / `least` are NOT reserved: usable as column names ------------------------------
+
+# Recognized as the variadic min/max only when immediately followed by `(`, so the bare words are
+# ordinary column names — and the forms can wrap the columns of the same name.
+statement ok
+CREATE TABLE kw (id i32 PRIMARY KEY, greatest i32, least i32)
+
+statement ok
+INSERT INTO kw VALUES (1, 7, 9), (2, NULL, NULL)
+
+query II nosort
+SELECT least, greatest FROM kw ORDER BY id
+----
+9
+7
+NULL
+NULL
+
+query II nosort
+SELECT GREATEST(greatest, 100), LEAST(least, 0) FROM kw ORDER BY id
+----
+100
+0
+100
+0
+
+# --- GREATEST/LEAST in a CHECK constraint and an expression DEFAULT (a pure combinator — immutable
+# iff its arguments are, grammar.md §52) ------------------------------------------------------
+
+statement ok
+CREATE TABLE ck (id i32 PRIMARY KEY, a i32, b i32 DEFAULT GREATEST(2, 5), CHECK (GREATEST(a, 0) <= 100))
+
+statement ok
+INSERT INTO ck (id, a) VALUES (1, NULL)
+
+query II nosort
+SELECT a, b FROM ck
+----
+NULL
+5
+
+statement error 23514
+INSERT INTO ck (id, a) VALUES (2, 200)
+
+# --- an expression index on GREATEST matches the same expression in a WHERE ---------------------
+
+statement ok
+CREATE TABLE ei (id i32 PRIMARY KEY, a i32)
+
+statement ok
+INSERT INTO ei VALUES (1, 1), (2, NULL), (3, 3), (4, NULL), (5, 5), (6, 6), (7, 7), (8, 8), (9, 9), (10, 10)
+
+# Full scan first: every row evaluates the WHERE (1 node + 1 compare = 2 per row). GREATEST(a, 0)
+# is 0 only where `a` is NULL (NULL ignored → GREATEST(0) = 0), so rows 2 and 4 match.
+# cost: 33
+query I rowsort
+SELECT id FROM ei WHERE GREATEST(a, 0) = 0
+----
+2
+4
+
+statement ok
+CREATE INDEX ei_greatest_idx ON ei ((GREATEST(a, 0)))
+
+# The same query now seeks the index (query.index_expr): the pinned cost MUST be lower than the
+# full scan's 33 — the pushdown is the point (a silently unmatched index would full-scan at
+# identical rows, which only this pin catches — a GREATEST index must not match a LEAST query).
+# cost: 11
+query I rowsort
+SELECT id FROM ei WHERE GREATEST(a, 0) = 0
+----
+2
+4

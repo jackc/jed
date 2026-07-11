@@ -420,6 +420,12 @@ const (
 	// (the second sanctioned short-circuit, cost.md §3). Argument types unify exactly like CASE
 	// result arms; `caseDecimal` is reused for the widen-to-decimal flag.
 	reCoalesce
+	// reGreatestLeast is GREATEST(a, b, …) / LEAST(a, b, …) (spec/design/grammar.md §52) — the
+	// variadic max/min. EAGER (unlike reCoalesce): every argument (in `sargs`) is evaluated. NULL
+	// arguments are ignored; the result is NULL only when every argument is NULL. `greatest`
+	// selects max vs min; the winner is chosen by the unified type's total order (valueCmp).
+	// `caseDecimal` is reused for the widen-to-decimal flag.
+	reGreatestLeast
 	// reScalarFunc is a scalar-function call (abs/round, spec/design/functions.md §9),
 	// evaluated per row in any context.
 	reScalarFunc
@@ -1005,10 +1011,12 @@ type rExpr struct {
 
 	// reCase: (condition, result) arms, the ELSE result (constNull for an implicit ELSE), and
 	// whether the unified result type is decimal (so integer results widen to decimal at eval).
-	// reCoalesce reuses caseDecimal (its arguments live in `sargs`).
+	// reCoalesce and reGreatestLeast reuse caseDecimal (their arguments live in `sargs`).
 	caseArms    []rCaseArm
 	caseEls     *rExpr
 	caseDecimal bool
+	// reGreatestLeast: true for GREATEST (max), false for LEAST (min).
+	greatest bool
 
 	// reScalarFunc: the scalar function (abs/round) and its argument nodes. `result` holds the
 	// static result type — for abs over an integer it is the operand's integer type, so the

@@ -4677,6 +4677,37 @@ func (p *parser) parsePrimary() (exprNode, error) {
 		}
 		return exprNode{Kind: exprCoalesce, Coalesce: args}, nil
 	}
+	// `GREATEST(a, b, …)` / `LEAST(a, b, …)` — the variadic max/min (grammar.md §52). Recognized
+	// only when the keyword is immediately followed by `(` (the same one-token lookahead), so the
+	// words stay usable as column names. At least one argument (an empty list is 42601 —
+	// PostgreSQL's grammar has no empty form).
+	if kw := p.peekKeyword(); (kw == "greatest" || kw == "least") && p.peekKindAt(1) == tokLParen {
+		greatest := kw == "greatest"
+		p.advance() // GREATEST / LEAST
+		p.advance() // (
+		if p.peek().Kind == tokRParen {
+			if greatest {
+				return exprNode{}, newError(SyntaxError, "GREATEST requires at least one argument")
+			}
+			return exprNode{}, newError(SyntaxError, "LEAST requires at least one argument")
+		}
+		var args []exprNode
+		for {
+			arg, err := p.parseExpr()
+			if err != nil {
+				return exprNode{}, err
+			}
+			args = append(args, arg)
+			if p.peek().Kind != tokComma {
+				break
+			}
+			p.advance() // ,
+		}
+		if err := p.expect(tokRParen); err != nil {
+			return exprNode{}, err
+		}
+		return exprNode{Kind: exprGreatestLeast, GreatestLeast: args, Greatest: greatest}, nil
+	}
 	if p.peekKeyword() == "case" {
 		p.advance()
 		// Simple form has an operand between CASE and the first WHEN; the searched form starts

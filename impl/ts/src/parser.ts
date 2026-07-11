@@ -3425,6 +3425,32 @@ class Parser {
       this.expect("rparen");
       return { kind: "coalesce", args };
     }
+    // `GREATEST(a, b, …)` / `LEAST(a, b, …)` — the variadic max/min (grammar.md §52). Recognized
+    // only when the keyword is immediately followed by `(` (the same one-token lookahead), so the
+    // words stay usable as column names. At least one argument (an empty list is 42601 —
+    // PostgreSQL's grammar has no empty form).
+    {
+      const kw = this.peekKeyword();
+      if ((kw === "greatest" || kw === "least") && this.peekKindAt(1) === "lparen") {
+        const greatest = kw === "greatest";
+        this.advance(); // GREATEST / LEAST
+        this.advance(); // (
+        if (this.peekKindAt(0) === "rparen") {
+          throw engineError(
+            "syntax_error",
+            `${greatest ? "GREATEST" : "LEAST"} requires at least one argument`,
+          );
+        }
+        const args: Expr[] = [];
+        for (;;) {
+          args.push(this.parseExpr());
+          if (this.peekKindAt(0) !== "comma") break;
+          this.advance(); // ,
+        }
+        this.expect("rparen");
+        return { kind: "greatestLeast", args, greatest };
+      }
+    }
     if (this.peekKeyword() === "case") {
       this.advance();
       // Simple form has an operand between CASE and the first WHEN; the searched form starts

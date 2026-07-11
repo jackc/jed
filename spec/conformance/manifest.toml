@@ -994,6 +994,10 @@ description = "CASE expression (searched + simple forms): lazy first-match evalu
 id = "expr.coalesce"
 description = "COALESCE(a, b, …) — first non-NULL argument, NULL when all are NULL. Lazy left-to-right: evaluation stops at the first non-NULL, each evaluated argument evaluated exactly once, later arguments never (COALESCE(1, 1/0) is 1 — the second sanctioned short-circuit, with expr.case); at least one argument (empty is 42601); argument types unify exactly like CASE result arms (numeric promote; cross-family 42804; all-NULL → text); recognized only when COALESCE is immediately followed by ( so the word stays usable as a column name; output name coalesce (spec/design/grammar.md §51)"
 
+[[capability]]
+id = "expr.greatest_least"
+description = "GREATEST(a, b, …) / LEAST(a, b, …) — the variadic maximum / minimum. NULL arguments are IGNORED (result is NULL only when every argument is NULL — GREATEST(1, NULL, 2) is 2); EAGER, not a short-circuit — every argument is evaluated so GREATEST(1, 1/0) traps 22012 (the contrast with expr.coalesce); at least one argument (empty is 42601); argument types unify exactly like CASE result arms / COALESCE (numeric promote; cross-family 42804; all-NULL → text), and the winner is chosen by that type's total order (the same order ORDER BY / MIN / MAX use); recognized only when the keyword is immediately followed by ( so greatest / least stay usable as column names; output names greatest / least (spec/design/grammar.md §52)"
+
 # Scalar functions (kind = "function", spec/design/functions.md §9) — named f(args) calls
 # evaluated per row, valid anywhere an expression is (unlike aggregates). One capability per
 # function so a core can land them independently.

@@ -938,6 +938,7 @@ primary        ::= number
                  | extract_expr
                  | case_expr
                  | coalesce_expr
+                 | greatest_least_expr
                  | function_call
                  | "EXISTS" "(" subquery_expr ")"
                  | "(" ( subquery_expr | expr ) ")"
@@ -1003,6 +1004,20 @@ case_expr      ::= "CASE" expr? ( "WHEN" expr "THEN" expr )+ ( "ELSE" expr )? "E
  * (PostgreSQL; the fixed keyword lowercased — no expression printer needed, the §8 rule-4
  * rationale). */
 coalesce_expr  ::= "COALESCE" "(" expr ( "," expr )* ")"
+
+/* GREATEST(a, b, …) / LEAST(a, b, …) (../design/grammar.md §52) — the variadic maximum / minimum
+ * over the argument list. NULL arguments are IGNORED (unlike COALESCE's stop-at-non-NULL); the
+ * result is NULL only when EVERY argument is NULL. At least one argument (an empty list is 42601,
+ * PostgreSQL's shape). Argument types unify to one common type exactly like CASE's result arms
+ * and COALESCE (42804 cross-family; an all-NULL GREATEST/LEAST is text), and the winner is the
+ * max (GREATEST) or min (LEAST) under that type's total order. Unlike CASE/COALESCE these are
+ * EAGER — every argument is evaluated (GREATEST(1, 1/0) traps 22012), so they are NOT a
+ * short-circuit exception (../design/cost.md §3). "GREATEST"/"LEAST" stay non-reserved: each form
+ * is recognized ONLY when the keyword is immediately followed by "(" (the EXTRACT/JSON one-token
+ * lookahead, §8), so the words remain usable as column names — observably PostgreSQL's
+ * col_name_keyword classification. Un-aliased output name: `greatest` / `least` (PostgreSQL; the
+ * fixed keyword lowercased — no expression printer needed, the §8 rule-4 rationale). */
+greatest_least_expr ::= ( "GREATEST" | "LEAST" ) "(" expr ( "," expr )* ")"
 
 /* EXTRACT(field FROM source) (../design/timezones.md §9.2, ../design/grammar.md §50) — the SQL
  * special form for a single datetime field, equal to PostgreSQL's `extract(text, value)` but with

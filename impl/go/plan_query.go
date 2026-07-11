@@ -706,6 +706,12 @@ func countSelfRefsExpr(e exprNode, name string) int {
 			n += countSelfRefsExpr(a, name)
 		}
 		return n
+	case exprGreatestLeast:
+		n := 0
+		for _, a := range e.GreatestLeast {
+			n += countSelfRefsExpr(a, name)
+		}
+		return n
 	case exprFuncCall:
 		n := 0
 		for _, a := range e.FuncCall.Args {

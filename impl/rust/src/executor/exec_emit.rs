@@ -889,6 +889,7 @@ impl Engine {
                 self.fold_uncorrelated_in_rexpr(els, bound, ctes, cost)
             }
             RExpr::Coalesce { args, .. }
+            | RExpr::GreatestLeast { args, .. }
             | RExpr::ScalarFunc { args, .. }
             | RExpr::ArrayFunc { args, .. }
             | RExpr::RangeFunc { args, .. }

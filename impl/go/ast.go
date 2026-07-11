@@ -946,6 +946,10 @@ const (
 	// ExprCoalesce is COALESCE(a, b, …) — the first non-NULL argument, lazily evaluated left to
 	// right like CASE (spec/design/grammar.md §51).
 	exprCoalesce
+	// ExprGreatestLeast is GREATEST(a, b, …) / LEAST(a, b, …) — the variadic max/min
+	// (spec/design/grammar.md §52). NULL arguments are ignored; the result is NULL only when
+	// every argument is NULL. Unlike COALESCE it is EAGER — every argument is evaluated.
+	exprGreatestLeast
 	// ExprScalarSubquery is a scalar subquery `( query_expr )` in expression position
 	// (spec/design/grammar.md §26). resolve plans it once against the scope chain; an uncorrelated
 	// one is then folded to a constant, a correlated one is re-executed per outer row.
@@ -1139,9 +1143,13 @@ type exprNode struct {
 	Regex       *regexExpr      // ExprRegex
 	Case        *caseExpr       // ExprCase
 	Coalesce    []exprNode      // ExprCoalesce (the argument list, ≥1, in source order)
-	Subquery    *queryExpr      // ExprScalarSubquery, ExprExists (the inner query)
-	InSubquery  *inSubqueryExpr // ExprInSubquery
-	Quantified  *quantifiedExpr // ExprQuantified
+	// GreatestLeast is the argument list (≥1, in source order) of an ExprGreatestLeast; Greatest
+	// distinguishes GREATEST (true, max) from LEAST (false, min).
+	GreatestLeast []exprNode
+	Greatest      bool
+	Subquery      *queryExpr      // ExprScalarSubquery, ExprExists (the inner query)
+	InSubquery    *inSubqueryExpr // ExprInSubquery
+	Quantified    *quantifiedExpr // ExprQuantified
 
 	QuantifiedSubquery *quantifiedSubqueryExpr // ExprQuantifiedSubquery
 	RowItems           []exprNode              // ExprRow (the ROW(...) field expressions, in order)

@@ -116,7 +116,11 @@ TS; any deviation diverges the count and fails the corpus.
   `operator_eval` for the node, then its arguments **in source order, stopping at the first
   non-NULL** value — each evaluated argument charges its own evals exactly once, and later
   arguments charge nothing (`COALESCE(1, 1/0)` succeeds). The same fixed left-to-right order
-  keeps which arguments accrue deterministic.
+  keeps which arguments accrue deterministic. (`GREATEST`/`LEAST` ([grammar.md](grammar.md) §52),
+  by contrast, are the variadic min/max but are **eager**, *not* a short-circuit exception: one
+  `operator_eval` for the node, then **every** argument is evaluated and charged — all must be, to
+  be compared — so `GREATEST(1, 1/0)` traps. Their internal min/max comparisons add no charge, the
+  same single-node weight as a scalar function.)
 - **Pre-order, LHS-before-RHS.** A node charges itself, then evaluates its left operand,
   then its right. The order does not change the **total** (a sum is order-independent),
   but it fixes the deterministic **abort point** for the cost ceiling (§6) identically

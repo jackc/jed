@@ -2480,6 +2480,17 @@ pub(crate) enum RExpr {
         args: Vec<RExpr>,
         coerce_decimal: bool,
     },
+    /// A resolved `GREATEST(a, b, …)` / `LEAST(a, b, …)` (grammar.md §52) — the variadic max/min.
+    /// EAGER (unlike `Coalesce`): every argument is evaluated. NULL arguments are ignored; the
+    /// result is NULL only when every argument is NULL. `greatest` selects max vs min; the winner
+    /// is chosen by the unified type's total order (`value_cmp`). Argument types unify exactly
+    /// like CASE result arms; `coerce_decimal` widens integer arguments when the unified type is
+    /// decimal.
+    GreatestLeast {
+        args: Vec<RExpr>,
+        coerce_decimal: bool,
+        greatest: bool,
+    },
     /// A scalar-function call (abs/round, spec/design/functions.md §9), evaluated per row in
     /// any context. `result` is the static result type — for `abs` over an integer it is the
     /// operand's integer type, so the magnitude is range-checked at that boundary (the same
@@ -2985,6 +2996,7 @@ fn count_self_refs_expr(e: &Expr, name: &str) -> usize {
                 + els.as_deref().map_or(0, sub)
         }
         Expr::Coalesce(args) => args.iter().map(sub).sum(),
+        Expr::GreatestLeast { args, .. } => args.iter().map(sub).sum(),
         Expr::FuncCall { args, .. } => args.iter().map(sub).sum(),
     }
 }

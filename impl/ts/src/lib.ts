@@ -672,6 +672,7 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "expr.regex_imatch",
   "expr.case",
   "expr.coalesce",
+  "expr.greatest_least",
   // Cost-accounting seam — the harness asserts the deterministic, cross-core-identical
   // accrued cost via the `# cost:` directive (CLAUDE.md §13).
   "resource.cost_metering",

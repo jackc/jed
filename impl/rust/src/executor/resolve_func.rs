@@ -1047,6 +1047,10 @@ pub(crate) fn output_name(scope: &Scope, e: &Expr) -> String {
         Expr::FuncCall { name, .. } => name.to_ascii_lowercase(),
         // The fixed keyword lowercased (PG; grammar.md §51) — no expression printer needed.
         Expr::Coalesce(_) => "coalesce".to_string(),
+        // The fixed keyword lowercased (PG; grammar.md §52).
+        Expr::GreatestLeast { greatest, .. } => {
+            if *greatest { "greatest" } else { "least" }.to_string()
+        }
         Expr::FieldAccess { field, .. } => field.to_ascii_lowercase(),
         // A subscript takes the base array's name (PG names `a[1]` after `a`); a chained subscript
         // `a[1][2]` recurses to the same base name. A non-column base falls through to `?column?`.
@@ -1893,6 +1897,7 @@ pub(crate) fn expr_calls_seq_mutator(e: &Expr) -> bool {
                 || els.as_ref().is_some_and(|x| expr_calls_seq_mutator(x))
         }
         Expr::Coalesce(args) => args.iter().any(expr_calls_seq_mutator),
+        Expr::GreatestLeast { args, .. } => args.iter().any(expr_calls_seq_mutator),
         Expr::ScalarSubquery(q) | Expr::Exists(q) => query_calls_seq_mutator(q),
         Expr::InSubquery { lhs, query, .. } | Expr::QuantifiedSubquery { lhs, query, .. } => {
             expr_calls_seq_mutator(lhs) || query_calls_seq_mutator(query)
@@ -2217,6 +2222,11 @@ pub(crate) fn collect_expr_privs(e: &Expr, req: &mut PrivReq, locals: &HashSet<S
                 collect_expr_privs(a, req, locals);
             }
         }
+        Expr::GreatestLeast { args, .. } => {
+            for a in args {
+                collect_expr_privs(a, req, locals);
+            }
+        }
         Expr::ScalarSubquery(q) | Expr::Exists(q) => collect_query_privs(q, req, locals),
         Expr::InSubquery { lhs, query, .. } | Expr::QuantifiedSubquery { lhs, query, .. } => {
             collect_expr_privs(lhs, req, locals);
@@ -2285,6 +2295,7 @@ pub(crate) fn expr_reads_columns(e: &Expr) -> bool {
                 || els.as_ref().is_some_and(|x| expr_reads_columns(x))
         }
         Expr::Coalesce(args) => args.iter().any(expr_reads_columns),
+        Expr::GreatestLeast { args, .. } => args.iter().any(expr_reads_columns),
         Expr::InSubquery { .. } | Expr::QuantifiedSubquery { .. } => true,
         Expr::Quantified { lhs, array, .. } => expr_reads_columns(lhs) || expr_reads_columns(array),
     }
@@ -4047,6 +4058,27 @@ pub(crate) fn resolve(
                 RExpr::Coalesce {
                     args: rargs,
                     coerce_decimal: unified == ResolvedType::Decimal,
+                },
+                unified,
+            ))
+        }
+        Expr::GreatestLeast { args, greatest } => {
+            // GREATEST/LEAST(a, b, …) (grammar.md §52): each argument resolves in the same agg
+            // context, and the argument types unify to one common type exactly like CASE's result
+            // arms (the shared unifier). The winner is chosen by that type's total order at eval.
+            let mut rargs: Vec<RExpr> = Vec::with_capacity(args.len());
+            let mut arg_types: Vec<ResolvedType> = Vec::with_capacity(args.len());
+            for a in args {
+                let (ra, aty) = resolve(scope, a, None, agg, params)?;
+                rargs.push(ra);
+                arg_types.push(aty);
+            }
+            let unified = unify_case_types(&arg_types, "GREATEST/LEAST types must be compatible")?;
+            Ok((
+                RExpr::GreatestLeast {
+                    args: rargs,
+                    coerce_decimal: unified == ResolvedType::Decimal,
+                    greatest: *greatest,
                 },
                 unified,
             ))

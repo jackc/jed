@@ -248,6 +248,8 @@ export function outputName(scope: Scope, e: Expr): string {
   if (e.kind === "funcCall") return e.name.toLowerCase();
   // The fixed keyword lowercased (PG; grammar.md §51) — no expression printer needed.
   if (e.kind === "coalesce") return "coalesce";
+  // The fixed keyword lowercased (PG; grammar.md §52).
+  if (e.kind === "greatestLeast") return e.greatest ? "greatest" : "least";
   if (e.kind === "fieldAccess") return e.field.toLowerCase();
   // A subscript takes the base array's name (PG names `a[1]` after `a`); `a[1][2]` recurses to the
   // same base. A non-column base falls through to `?column?`.
@@ -1668,6 +1670,28 @@ export function resolve(
           kind: "coalesce",
           args,
           coerceDecimal: unified.kind === "decimal",
+        },
+        type: unified,
+      };
+    }
+    case "greatestLeast": {
+      // GREATEST/LEAST(a, b, …) (grammar.md §52): each argument resolves in the same agg context,
+      // and the argument types unify to one common type exactly like CASE's result arms (the
+      // shared unifier). The winner is chosen by that type's total order at eval.
+      const args: RExpr[] = [];
+      const argTypes: ResolvedType[] = [];
+      for (const a of e.args) {
+        const ra = resolve(scope, a, null, ag, params);
+        args.push(ra.node);
+        argTypes.push(ra.type);
+      }
+      const unified = unifyCaseTypes(argTypes, "GREATEST/LEAST types must be compatible");
+      return {
+        node: {
+          kind: "greatestLeast",
+          args,
+          coerceDecimal: unified.kind === "decimal",
+          greatest: e.greatest,
         },
         type: unified,
       };

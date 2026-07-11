@@ -11854,6 +11854,7 @@ export class Engine {
         }));
         e.els = this.foldUncorrelatedInRExpr(e.els, bound, ctes, cost);
         return e;
+      case "greatestLeast":
       case "coalesce":
       case "scalarFunc":
       case "arrayFunc":
@@ -12812,6 +12813,7 @@ export function rexprIsConstant(e: RExpr): boolean {
         e.arms.every((a) => rexprIsConstant(a.cond) && rexprIsConstant(a.result)) &&
         rexprIsConstant(e.els)
       );
+    case "greatestLeast":
     case "coalesce":
     case "scalarFunc":
     case "arrayFunc":
@@ -13764,6 +13766,16 @@ export function rexprEqShifted(a: RExpr, b: RExpr, offset: number): boolean {
         a.args.length === b.args.length &&
         a.args.every((x, i) => rexprEqShifted(x, b.args[i]!, offset))
       );
+    // GREATEST/LEAST(a, b, …) is likewise a legal index expression (grammar.md §52); a GREATEST
+    // index must not match a LEAST query, so the `greatest` discriminant is compared.
+    case "greatestLeast":
+      return (
+        b.kind === "greatestLeast" &&
+        a.greatest === b.greatest &&
+        a.coerceDecimal === b.coerceDecimal &&
+        a.args.length === b.args.length &&
+        a.args.every((x, i) => rexprEqShifted(x, b.args[i]!, offset))
+      );
     case "arith":
       return (
         b.kind === "arith" &&
@@ -14378,6 +14390,7 @@ export function rexprReferencesOuter(e: RExpr, depth: number): boolean {
           (arm) => rexprReferencesOuter(arm.cond, depth) || rexprReferencesOuter(arm.result, depth),
         ) || rexprReferencesOuter(e.els, depth)
       );
+    case "greatestLeast":
     case "coalesce":
     case "scalarFunc":
     case "arrayFunc":
@@ -14511,6 +14524,7 @@ export function collectTouched(e: RExpr, depth: number, touched: boolean[]): voi
       }
       collectTouched(e.els, depth, touched);
       return;
+    case "greatestLeast":
     case "coalesce":
     case "scalarFunc":
     case "arrayFunc":
@@ -14909,6 +14923,7 @@ export function rebasePlaceholderCols(e: RExpr, from: number, target: number): v
       }
       rebasePlaceholderCols(e.els, from, target);
       return;
+    case "greatestLeast":
     case "coalesce":
     case "scalarFunc":
     case "arrayFunc":
@@ -15340,6 +15355,12 @@ export type RExpr =
   // short-circuit, cost.md §3). Argument types unify exactly like CASE result arms;
   // `coerceDecimal` widens integer arguments when the unified type is decimal.
   | { kind: "coalesce"; args: RExpr[]; coerceDecimal: boolean }
+  // A resolved GREATEST(a, b, …) / LEAST(a, b, …) (grammar.md §52) — the variadic max/min. EAGER
+  // (unlike `coalesce`): every argument is evaluated. NULL arguments are ignored; the result is
+  // NULL only when every argument is NULL. `greatest` selects max vs min; the winner is chosen by
+  // the unified type's total order (valueCmp). `coerceDecimal` widens integer arguments when the
+  // unified type is decimal.
+  | { kind: "greatestLeast"; args: RExpr[]; coerceDecimal: boolean; greatest: boolean }
   // A scalar-function call (spec/design/functions.md §9, float.md §8), evaluated per row in any
   // context. `result` is the static result type — for abs over an integer/float it is the
   // operand's own type (range-checked / fround'd at that width), for round over int/decimal it is
@@ -17839,6 +17860,7 @@ export function exprHasAggregate(e: Expr): boolean {
         (e.els !== null && exprHasAggregate(e.els))
       );
     case "coalesce":
+    case "greatestLeast":
       return e.args.some(exprHasAggregate);
     case "row":
       return e.fields.some(exprHasAggregate);
@@ -17914,6 +17936,7 @@ export function exprHasWindow(e: Expr): boolean {
         (e.els !== null && exprHasWindow(e.els))
       );
     case "coalesce":
+    case "greatestLeast":
       return e.args.some(exprHasWindow);
     case "row":
       return e.fields.some(exprHasWindow);
@@ -18090,6 +18113,7 @@ export function desugarNamedWindows(e: Expr, windows: [string, WindowDef][]): vo
       if (e.els !== null) desugarNamedWindows(e.els, windows);
       return;
     case "coalesce":
+    case "greatestLeast":
       for (const a of e.args) desugarNamedWindows(a, windows);
       return;
     // Leaves, subscripts, and subqueries (independent) carry no top-level window ref to rewrite.
@@ -18183,6 +18207,7 @@ export function rejectCheckStructure(e: Expr): void {
       if (e.els !== null) rejectCheckStructure(e.els);
       return;
     case "coalesce":
+    case "greatestLeast":
       for (const a of e.args) rejectCheckStructure(a);
       return;
     case "row":
@@ -18278,6 +18303,7 @@ export function rejectDefaultStructure(e: Expr): void {
       if (e.els !== null) rejectDefaultStructure(e.els);
       return;
     case "coalesce":
+    case "greatestLeast":
       for (const a of e.args) rejectDefaultStructure(a);
       return;
     case "row":
@@ -18383,6 +18409,7 @@ export function indexExprNonimmutableCall(e: Expr): boolean {
       );
     // COALESCE is a pure combinator — immutable iff its arguments are (grammar.md §51).
     case "coalesce":
+    case "greatestLeast":
       return e.args.some(indexExprNonimmutableCall);
     case "row":
       return e.fields.some(indexExprNonimmutableCall);
@@ -18454,6 +18481,7 @@ export function indexExprHasSubquery(e: Expr): boolean {
         (e.els !== null && indexExprHasSubquery(e.els))
       );
     case "coalesce":
+    case "greatestLeast":
       return e.args.some(indexExprHasSubquery);
     case "funcCall":
       return e.args.some(indexExprHasSubquery);
@@ -18539,7 +18567,8 @@ export function indexExprFirstParam(e: Expr): number | null {
       }
       return e.els !== null ? indexExprFirstParam(e.els) : null;
     }
-    case "coalesce": {
+    case "coalesce":
+    case "greatestLeast": {
       for (const a of e.args) {
         const p = indexExprFirstParam(a);
         if (p !== null) return p;
@@ -18640,6 +18669,7 @@ export function checkReferencedColumns(e: Expr, columns: Column[]): number[] {
         if (e.els !== null) walk(e.els);
         return;
       case "coalesce":
+      case "greatestLeast":
         for (const a of e.args) walk(a);
         return;
       case "funcCall":

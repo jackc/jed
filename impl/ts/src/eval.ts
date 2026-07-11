@@ -1055,6 +1055,29 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       }
       return nullValue();
     }
+    case "greatestLeast": {
+      // GREATEST/LEAST is EAGER (grammar.md §52): charge the node, then evaluate EVERY argument
+      // (all must be, to be compared — GREATEST(1, 1/0) traps). NULL arguments are ignored; the
+      // running winner is the max (greatest) or min (least) under the unified type's total order
+      // (valueCmp). All-NULL → NULL. Non-NULL values are coerced to the unified type (integer →
+      // decimal) before comparison so the comparator sees a single type.
+      m.charge(COSTS.operatorEval);
+      let best: Value | null = null;
+      for (const a of e.args) {
+        const v = evalExpr(a, row, env, m);
+        if (v.kind === "null") continue;
+        const cv = coerceCaseValue(v, e.coerceDecimal);
+        if (best === null) {
+          best = cv;
+          continue;
+        }
+        const c = valueCmp(cv, best);
+        if ((e.greatest && c > 0) || (!e.greatest && c < 0)) {
+          best = cv;
+        }
+      }
+      return best ?? nullValue();
+    }
     case "scalarFunc": {
       // One operator_eval per call (the uniform weight); arguments charge their own.
       m.charge(COSTS.operatorEval);

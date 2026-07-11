@@ -721,6 +721,7 @@ export function countSelfRefsExpr(e: Expr, name: string): number {
         (e.els !== null ? countSelfRefsExpr(e.els, name) : 0)
       );
     case "coalesce":
+    case "greatestLeast":
       return e.args.reduce((a, x) => a + countSelfRefsExpr(x, name), 0);
     case "funcCall":
       return e.args.reduce((a, x) => a + countSelfRefsExpr(x, name), 0);
@@ -1401,6 +1402,7 @@ export function exprCallsSeqMutator(e: Expr): boolean {
         (e.els !== null && exprCallsSeqMutator(e.els))
       );
     case "coalesce":
+    case "greatestLeast":
       return e.args.some(exprCallsSeqMutator);
     case "scalarSubquery":
     case "exists":
@@ -1680,6 +1682,7 @@ export function collectExprPrivs(e: Expr, req: PrivReq, locals: Set<string>): vo
       if (e.els !== null) collectExprPrivs(e.els, req, locals);
       break;
     case "coalesce":
+    case "greatestLeast":
       for (const a of e.args) collectExprPrivs(a, req, locals);
       break;
     case "scalarSubquery":
@@ -1766,6 +1769,7 @@ export function exprReadsColumns(e: Expr): boolean {
         (e.els !== null && exprReadsColumns(e.els))
       );
     case "coalesce":
+    case "greatestLeast":
       return e.args.some(exprReadsColumns);
     case "quantified":
       return exprReadsColumns(e.lhs) || exprReadsColumns(e.array);

@@ -2319,6 +2319,37 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 		}
 		return NullValue(), nil
+	case reGreatestLeast:
+		// GREATEST/LEAST is EAGER (grammar.md §52): charge the node, then evaluate EVERY argument
+		// (all must be, to be compared — GREATEST(1, 1/0) traps). NULL arguments are ignored; the
+		// running winner is the max (greatest) or min (least) under the unified type's total order
+		// (valueCmp). All-NULL → NULL. Non-NULL values are coerced to the unified type (integer →
+		// decimal) before comparison so the comparator sees a single type.
+		m.Charge(costs.OperatorEval)
+		var best Value
+		haveBest := false
+		for _, a := range e.sargs {
+			v, err := a.eval(row, env, m)
+			if err != nil {
+				return Value{}, err
+			}
+			if v.Kind == ValNull {
+				continue
+			}
+			v = coerceCase(v, e.caseDecimal)
+			if !haveBest {
+				best, haveBest = v, true
+				continue
+			}
+			c := valueCmp(v, best)
+			if (e.greatest && c > 0) || (!e.greatest && c < 0) {
+				best = v
+			}
+		}
+		if !haveBest {
+			return NullValue(), nil
+		}
+		return best, nil
 	case reScalarFunc:
 		// One operator_eval per call (the uniform weight); arguments charge their own.
 		m.Charge(costs.OperatorEval)

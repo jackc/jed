@@ -1064,6 +1064,7 @@ pub(crate) fn rexpr_is_constant(e: &RExpr) -> bool {
                 && rexpr_is_constant(els)
         }
         RExpr::Coalesce { args, .. }
+        | RExpr::GreatestLeast { args, .. }
         | RExpr::ScalarFunc { args, .. }
         | RExpr::ArrayFunc { args, .. }
         | RExpr::RangeFunc { args, .. }
@@ -1929,6 +1930,28 @@ pub(crate) fn rexpr_eq_shifted(a: &RExpr, b: &RExpr, offset: usize) -> bool {
             },
         ) => {
             da == db
+                && aa.len() == ab.len()
+                && aa
+                    .iter()
+                    .zip(ab)
+                    .all(|(x, y)| rexpr_eq_shifted(x, y, offset))
+        }
+        // GREATEST/LEAST(a, b, …) is likewise a legal index expression (grammar.md §52); a
+        // GREATEST index must not match a LEAST query, so the `greatest` discriminant is compared.
+        (
+            GreatestLeast {
+                args: aa,
+                coerce_decimal: da,
+                greatest: ga,
+            },
+            GreatestLeast {
+                args: ab,
+                coerce_decimal: db,
+                greatest: gb,
+            },
+        ) => {
+            ga == gb
+                && da == db
                 && aa.len() == ab.len()
                 && aa
                     .iter()
@@ -3394,6 +3417,7 @@ pub(crate) fn expr_has_aggregate(e: &Expr) -> bool {
                 || els.as_deref().is_some_and(expr_has_aggregate)
         }
         Expr::Coalesce(args) => args.iter().any(expr_has_aggregate),
+        Expr::GreatestLeast { args, .. } => args.iter().any(expr_has_aggregate),
         // A subquery is an independent query: an aggregate INSIDE it does not make the OUTER query
         // an aggregate query (the outer reference, if any, is just a constant to the subquery).
         Expr::ScalarSubquery(_)
@@ -3479,6 +3503,7 @@ pub(crate) fn expr_has_window(e: &Expr) -> bool {
                 || els.as_deref().is_some_and(expr_has_window)
         }
         Expr::Coalesce(args) => args.iter().any(expr_has_window),
+        Expr::GreatestLeast { args, .. } => args.iter().any(expr_has_window),
         // A subquery is an independent query: a window function inside it is the subquery's own.
         Expr::ScalarSubquery(_)
         | Expr::Exists(_)
@@ -3674,6 +3699,11 @@ pub(crate) fn desugar_named_windows(e: &mut Expr, windows: &[(String, WindowDef)
                 desugar_named_windows(a, windows)?;
             }
         }
+        Expr::GreatestLeast { args, .. } => {
+            for a in args.iter_mut() {
+                desugar_named_windows(a, windows)?;
+            }
+        }
         // Leaves, subscripts, and subqueries (independent) carry no top-level window ref to rewrite.
         _ => {}
     }
@@ -3774,6 +3804,12 @@ pub(crate) fn reject_check_structure(e: &Expr) -> Result<()> {
             }
         }
         Expr::Coalesce(args) => {
+            for a in args {
+                reject_check_structure(a)?;
+            }
+            Ok(())
+        }
+        Expr::GreatestLeast { args, .. } => {
             for a in args {
                 reject_check_structure(a)?;
             }
@@ -3886,6 +3922,12 @@ pub(crate) fn reject_default_structure(e: &Expr) -> Result<()> {
             }
             Ok(())
         }
+        Expr::GreatestLeast { args, .. } => {
+            for a in args {
+                reject_default_structure(a)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -3960,6 +4002,11 @@ pub(crate) fn check_referenced_columns(e: &Expr, columns: &[Column]) -> Vec<usiz
                 }
             }
             Expr::Coalesce(args) => {
+                for a in args {
+                    walk(a, columns, out);
+                }
+            }
+            Expr::GreatestLeast { args, .. } => {
                 for a in args {
                     walk(a, columns, out);
                 }
@@ -4075,6 +4122,7 @@ pub(crate) fn index_expr_first_param(e: &Expr) -> Option<u32> {
             })
             .or_else(|| els.as_deref().and_then(index_expr_first_param)),
         Expr::Coalesce(args) => args.iter().find_map(index_expr_first_param),
+        Expr::GreatestLeast { args, .. } => args.iter().find_map(index_expr_first_param),
         Expr::FuncCall { args, .. } => args.iter().find_map(index_expr_first_param),
         Expr::Row(items) | Expr::Array(items) => items.iter().find_map(index_expr_first_param),
         Expr::Subscript { base, subscripts } => index_expr_first_param(base).or_else(|| {
@@ -4146,6 +4194,7 @@ pub(crate) fn index_expr_has_subquery(e: &Expr) -> bool {
                 || els.as_deref().is_some_and(index_expr_has_subquery)
         }
         Expr::Coalesce(args) => args.iter().any(index_expr_has_subquery),
+        Expr::GreatestLeast { args, .. } => args.iter().any(index_expr_has_subquery),
         Expr::FuncCall { args, .. } => args.iter().any(index_expr_has_subquery),
         Expr::Row(items) | Expr::Array(items) => items.iter().any(index_expr_has_subquery),
         Expr::Subscript { base, subscripts } => {
@@ -4249,6 +4298,8 @@ pub(crate) fn index_expr_nonimmutable_call(e: &Expr) -> bool {
         }
         // COALESCE is a pure combinator — immutable iff its arguments are (grammar.md §51).
         Expr::Coalesce(args) => args.iter().any(index_expr_nonimmutable_call),
+        // GREATEST/LEAST is likewise a pure combinator — immutable iff its arguments are (§52).
+        Expr::GreatestLeast { args, .. } => args.iter().any(index_expr_nonimmutable_call),
         Expr::Row(items) | Expr::Array(items) => items.iter().any(index_expr_nonimmutable_call),
         Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => {
             index_expr_nonimmutable_call(base)

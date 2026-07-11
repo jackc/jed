@@ -233,6 +233,11 @@ export type Expr =
   // (spec/design/grammar.md §51). `args` has ≥1 entries (an empty list is 42601 at parse);
   // argument types unify exactly like CASE result arms.
   | { kind: "coalesce"; args: Expr[] }
+  // GREATEST(a, b, …) / LEAST(a, b, …) — the variadic max/min (spec/design/grammar.md §52). NULL
+  // arguments are ignored; the result is NULL only when every argument is NULL. Unlike COALESCE it
+  // is EAGER — every argument is evaluated. `greatest` selects max (true) vs min (false). `args`
+  // has ≥1 entries (empty is 42601 at parse); argument types unify exactly like CASE result arms.
+  | { kind: "greatestLeast"; args: Expr[]; greatest: boolean }
   // A function call — the shared aggregate/scalar call syntax (grammar.md §17). `name` is the
   // spelling as written, resolved case-insensitively: an aggregate (COUNT/SUM/MIN/MAX/AVG), a
   // scalar function (abs/round, kind = "function", spec/design/functions.md §9), or 42883. `star`

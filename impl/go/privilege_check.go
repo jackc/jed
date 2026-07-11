@@ -260,6 +260,13 @@ func exprCallsSeqMutator(e *exprNode) bool {
 			}
 		}
 		return false
+	case exprGreatestLeast:
+		for i := range e.GreatestLeast {
+			if exprCallsSeqMutator(&e.GreatestLeast[i]) {
+				return true
+			}
+		}
+		return false
 	case exprScalarSubquery, exprExists:
 		return queryCallsSeqMutator(e.Subquery)
 	case exprInSubquery:
@@ -756,6 +763,10 @@ func collectExprPrivs(e *exprNode, req *privReq, locals map[string]bool) {
 		for i := range e.Coalesce {
 			collectExprPrivs(&e.Coalesce[i], req, locals)
 		}
+	case exprGreatestLeast:
+		for i := range e.GreatestLeast {
+			collectExprPrivs(&e.GreatestLeast[i], req, locals)
+		}
 	case exprScalarSubquery, exprExists:
 		collectQueryPrivs(e.Subquery, req, locals)
 	case exprInSubquery:
@@ -873,6 +884,13 @@ func exprReadsColumns(e *exprNode) bool {
 	case exprCoalesce:
 		for i := range e.Coalesce {
 			if exprReadsColumns(&e.Coalesce[i]) {
+				return true
+			}
+		}
+		return false
+	case exprGreatestLeast:
+		for i := range e.GreatestLeast {
+			if exprReadsColumns(&e.GreatestLeast[i]) {
 				return true
 			}
 		}

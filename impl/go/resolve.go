@@ -656,6 +656,12 @@ func outputName(s *scope, e exprNode) string {
 	case exprCoalesce:
 		// The fixed keyword lowercased (PG; grammar.md §51) — no expression printer needed.
 		return "coalesce"
+	case exprGreatestLeast:
+		// The fixed keyword lowercased (PG; grammar.md §52).
+		if e.Greatest {
+			return "greatest"
+		}
+		return "least"
 	case exprFieldAccess:
 		// A field selection takes the FIELD name (PG names the output column after the selected
 		// field, lowercased — spec/design/composite.md §S4).
@@ -1912,6 +1918,26 @@ func resolve(s *scope, e exprNode, ctx *scalarType, ag *aggCtx, params *paramTyp
 			return nil, resolvedType{}, err
 		}
 		return &rExpr{kind: reCoalesce, sargs: args, caseDecimal: unified.kind == rtDecimal},
+			unified, nil
+	case exprGreatestLeast:
+		// GREATEST/LEAST(a, b, …) (grammar.md §52): each argument resolves in the same agg context,
+		// and the argument types unify to one common type exactly like CASE's result arms (the
+		// shared unifier). The winner is chosen by that type's total order at eval.
+		args := make([]*rExpr, 0, len(e.GreatestLeast))
+		argTypes := make([]resolvedType, 0, len(e.GreatestLeast))
+		for _, a := range e.GreatestLeast {
+			ra, aty, err := resolve(s, a, nil, ag, params)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			args = append(args, ra)
+			argTypes = append(argTypes, aty)
+		}
+		unified, err := unifyCaseTypes(argTypes, "GREATEST/LEAST types must be compatible")
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		return &rExpr{kind: reGreatestLeast, sargs: args, caseDecimal: unified.kind == rtDecimal, greatest: e.Greatest},
 			unified, nil
 	case exprQuantified:
 		return resolveQuantified(s, e.Quantified, ag, params)
