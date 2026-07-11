@@ -766,63 +766,6 @@ impl Engine {
             Some(p) => Some(resolve_boolean_filter(&scope, p, ptypes)?),
             None => None,
         };
-        // Scan-bound pushdown, per base relation: detect WHERE conjuncts that bound that
-        // relation's scan — a PK range, else a secondary-index equality — so it seeks/ranges
-        // instead of walking the whole B-tree (cost.md §3 "bounded scan" / "index-bounded
-        // scan"; indexes.md §5). The filter is resolved against the full FROM scope, so a
-        // relation's column is the GLOBAL index `rel.offset + local`; `const_source` only
-        // accepts a literal/param/outer const (never a sibling column), so a JOIN base table is
-        // bounded only by a CONSTANT predicate on its own columns — `b.pk = a.x` (the
-        // index-nested-loop case) stays a full scan, a follow-on. Sound for outer joins too: a
-        // non-NULL conjunct in WHERE eliminates that relation's NULL-extended rows, so bounding
-        // it cannot drop a surviving row.
-        // A set-returning relation is a computed row source with no PK/index — it never bounds
-        // (functions.md §10), so skip detection for it (the synthetic table would return None
-        // anyway, but gate it explicitly).
-        let rel_bounds: Vec<Option<ScanBound>> = scope
-            .rels
-            .iter()
-            .enumerate()
-            .map(|(i, rel)| match (&filter, &srf_meta[i], &derived_meta[i]) {
-                // A scan bound applies only to a base table — a set-returning function or a derived
-                // table is a computed source with no store to seek (functions.md §10, §42).
-                (Some(f), None, None) => detect_scan_bound(f, rel, scope.catalog),
-                _ => None,
-            })
-            .collect();
-        // Index-nested-loop pushdown (cost.md §3 "JOIN"): a join inner relation whose primary key /
-        // indexed column is compared to a SIBLING column of an earlier relation (`a JOIN b ON b.pk =
-        // a.x`) is re-materialized per outer row, seeking instead of full-scanning — O(N·M) →
-        // O(N·log M). Detected from the join's ON and the WHERE. Gated to a base table (a set-returning
-        // function / derived table / CTE / lateral item has no store to seek) that is the RIGHT/nullable
-        // side of an INNER/CROSS/LEFT join (a RIGHT/FULL preserved side cannot be bounded per outer
-        // row). rels[0] has no earlier relation; its join is `sel.joins[i - 1]`. A `Some` entry takes
-        // precedence over the once-materialized `rel_bounds` for that relation.
-        let rel_inl_bounds: Vec<Option<ScanBound>> = scope
-            .rels
-            .iter()
-            .enumerate()
-            .map(|(i, rel)| {
-                if i == 0
-                    || srf_meta[i].is_some()
-                    || derived_meta[i].is_some()
-                    || rel.cte.is_some()
-                    || lateral_flags[i]
-                    || !matches!(
-                        sel.joins[i - 1].kind,
-                        JoinKind::Inner | JoinKind::Cross | JoinKind::Left
-                    )
-                {
-                    return None;
-                }
-                detect_inl_bound(
-                    join_preds[i - 1].as_ref(),
-                    filter.as_ref(),
-                    rel,
-                    scope.catalog,
-                )
-            })
-            .collect();
         // ORDER BY resolution (spec/design/grammar.md §10). Each key is one of three modes (set at
         // parse): an output-column ORDINAL, a COLUMN reference, or a general EXPRESSION. A column /
         // ordinal-to-column key resolves to a real row slot — against the GROUP KEYS in an aggregate
@@ -1203,6 +1146,64 @@ impl Engine {
                 }
             }
         }
+
+        // Scan-bound pushdown, per base relation: detect WHERE conjuncts that bound that
+        // relation's scan — a PK range, else a secondary-index equality — so it seeks/ranges
+        // instead of walking the whole B-tree (cost.md §3 "bounded scan" / "index-bounded
+        // scan"; indexes.md §5). The filter is resolved against the full FROM scope, so a
+        // relation's column is the GLOBAL index `rel.offset + local`; `const_source` only
+        // accepts a literal/param/outer const (never a sibling column), so a JOIN base table is
+        // bounded only by a CONSTANT predicate on its own columns — `b.pk = a.x` (the
+        // index-nested-loop case) stays a full scan, a follow-on. Sound for outer joins too: a
+        // non-NULL conjunct in WHERE eliminates that relation's NULL-extended rows, so bounding
+        // it cannot drop a surviving row.
+        // A set-returning relation is a computed row source with no PK/index — it never bounds
+        // (functions.md §10), so skip detection for it (the synthetic table would return None
+        // anyway, but gate it explicitly).
+        let rel_bounds: Vec<Option<ScanBound>> = scope
+            .rels
+            .iter()
+            .enumerate()
+            .map(|(i, rel)| match (&filter, &srf_meta[i], &derived_meta[i]) {
+                // A scan bound applies only to a base table — a set-returning function or a derived
+                // table is a computed source with no store to seek (functions.md §10, §42).
+                (Some(f), None, None) => detect_scan_bound(f, rel, scope.catalog),
+                _ => None,
+            })
+            .collect();
+        // Index-nested-loop pushdown (cost.md §3 "JOIN"): a join inner relation whose primary key /
+        // indexed column is compared to a SIBLING column of an earlier relation (`a JOIN b ON b.pk =
+        // a.x`) is re-materialized per outer row, seeking instead of full-scanning — O(N·M) →
+        // O(N·log M). Detected from the join's ON and the WHERE. Gated to a base table (a set-returning
+        // function / derived table / CTE / lateral item has no store to seek) that is the RIGHT/nullable
+        // side of an INNER/CROSS/LEFT join (a RIGHT/FULL preserved side cannot be bounded per outer
+        // row). rels[0] has no earlier relation; its join is `sel.joins[i - 1]`. A `Some` entry takes
+        // precedence over the once-materialized `rel_bounds` for that relation.
+        let rel_inl_bounds: Vec<Option<ScanBound>> = scope
+            .rels
+            .iter()
+            .enumerate()
+            .map(|(i, rel)| {
+                if i == 0
+                    || srf_meta[i].is_some()
+                    || derived_meta[i].is_some()
+                    || rel.cte.is_some()
+                    || lateral_flags[i]
+                    || !matches!(
+                        sel.joins[i - 1].kind,
+                        JoinKind::Inner | JoinKind::Cross | JoinKind::Left
+                    )
+                {
+                    return None;
+                }
+                detect_inl_bound(
+                    join_preds[i - 1].as_ref(),
+                    filter.as_ref(),
+                    rel,
+                    scope.catalog,
+                )
+            })
+            .collect();
 
         // The join predicates were resolved above (alongside the USING/NATURAL merges, which the
         // scope now carries). Pair each with its join kind — the kind only changes how unmatched
