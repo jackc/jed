@@ -6,11 +6,12 @@ import (
 	"strings"
 )
 
-// SELECT planning — the planSelect pass that resolves a parsed SELECT into a selectPlan (FROM
-// relations, join tree, WHERE/GROUP/HAVING, projections, ORDER BY, LIMIT/OFFSET) and the ORDER BY
-// elision analysis that recognises when a primary-key or index scan already yields the requested order
-// (orderSatisfiedByPK/orderSatisfiedByIndex). Query-level orchestration (SELECT/setop/CTE) is in
-// plan_query.go; access-path selection is in access_path.go; SRFs are in srf.go.
+// SELECT planning, Stage 1 — the RESOLVE half (spec/design/planner.md §2): planSelect resolves a
+// parsed SELECT into the logical selectPlan (FROM relations, join tree, WHERE/GROUP/HAVING,
+// projections, ORDER BY, LIMIT/OFFSET) plus the touched-set annotation (computeRelMasks), then
+// hands it to the physical/access-path selection pass (optimizeSelect, optimize.go) — resolve
+// decides names/types/errors, never an access path. Query-level orchestration (SELECT/setop/CTE)
+// is in plan_query.go; the access-path mechanisms are in access_path.go; SRFs are in srf.go.
 
 // runSelect analyzes and runs a SELECT: resolve projected columns and the WHERE/ORDER BY columns
 // against the catalog, scan the table in primary-key order, filter by the predicate (three-valued
@@ -938,65 +939,91 @@ func (db *engine) planSelect(sel *selectStmt, parent *scope, ctes []*cteBinding,
 		joins[k] = planJoin{kind: j.Kind, on: joinPreds[k]}
 	}
 
-	// Assemble the owned plan (table NAMES + offsets/widths replace the scope's *Table, so the
-	// plan outlives the scope and a correlated subquery can re-execute it per row).
+	// Assemble the owned LOGICAL plan (table NAMES + offsets/widths replace the scope's *Table, so
+	// the plan outlives the scope and a correlated subquery can re-execute it per row). Resolve
+	// decides names, types, and errors — never an access path: plan.phys is zero-valued here, and
+	// only the optimizeSelect pass below writes it (spec/design/planner.md §2).
 	planRels := make([]planRel, len(s.rels))
 	for i, rel := range s.rels {
 		planRels[i] = planRel{tableName: rel.table.Name, db: rel.db, offset: rel.offset, colCount: len(rel.table.Columns), srf: srfPlans[i], cte: rel.cte, derived: derivedPlans[i], lateral: lateralFlags[i]}
 	}
-	// The touched set per relation (cost.md §3 "The touched set"; large-values.md §14): the
-	// columns this query statically references, collected depth-aware so a correlated
-	// subquery's outer reference back into this scope counts. An aggregate query's projections
-	// / HAVING / ORDER BY index the synthetic group row, whose inputs are exactly the group
-	// keys + aggregate arguments collected here; a plain query's projections and ORDER BY keys
-	// index the combined row directly.
+	plan := &selectPlan{
+		rels: planRels, joins: joins, filter: filter, isAgg: isAgg, groupKeys: groupKeys,
+		groupExprs: groupExprs,
+		groupSets:  groupSets, groupingSpecs: groupingSpecs,
+		aggSpecs: aggSpecs, hasWindow: hasWindow, windowSpecs: windowSpecs, windowKeys: windowKeys, having: having,
+		order: order, orderExprs: orderExprs, projections: projections,
+		columnNames: columnNames, columnTypes: columnTypes, distinct: sel.Distinct,
+		limit: sel.Limit, offset: sel.Offset,
+	}
+	plan.relMasks = computeRelMasks(plan)
+	// ——— Stage 2: logical rewrite rules (spec/design/planner.md §3) ———
+	// No rewrite rules exist yet; the first (predicate pushdown / simplification, TODO.md) lands
+	// here as pure plan→plan transforms. foldUncorrelatedInPlan is NOT a planner rewrite — it
+	// executes subqueries and needs bound params, so it stays post-bind in runQueryExpr.
+	//
+	// ——— Stage 3: physical/access-path selection (spec/design/planner.md §4) ———
+	db.optimizeSelect(plan, s.rels)
+	return plan, nil
+}
+
+// computeRelMasks computes the TOUCHED SET per relation (cost.md §3 "The touched set";
+// large-values.md §14): the columns this query statically references, collected depth-aware so a
+// correlated subquery's outer reference back into this scope counts. An aggregate query's
+// projections / HAVING / ORDER BY index the synthetic group row, whose inputs are exactly the
+// group keys + aggregate arguments collected here; a plain query's projections and ORDER BY keys
+// index the combined row directly. An ANNOTATION of the logical plan, not an optimization
+// (spec/design/planner.md §2): the mask is a correctness input to the lazy/masked scan — a wrong
+// mask is a disk-mode NULL-folding bug, not a slow plan — so it is computed by the resolve half,
+// before any physical rule runs.
+func computeRelMasks(plan *selectPlan) [][]bool {
 	totalCols := 0
-	for _, rel := range planRels {
+	for _, rel := range plan.rels {
 		totalCols += rel.colCount
 	}
 	touched := make([]bool, totalCols)
-	collectTouched(filter, 0, touched)
-	for k := range joins {
-		collectTouched(joins[k].on, 0, touched)
+	collectTouched(plan.filter, 0, touched)
+	for k := range plan.joins {
+		collectTouched(plan.joins[k].on, 0, touched)
 	}
-	if isAgg {
+	if plan.isAgg {
 		// A column grouping key is a real input column (mark it); an expression grouping key has a
 		// SYNTHETIC index (inputWidth+k, out of touched's range) — its real input columns are reached
 		// through its materialized groupExprs node instead (aggregates.md §15).
-		for _, gk := range groupKeys {
+		for _, gk := range plan.groupKeys {
 			if gk < totalCols {
 				touched[gk] = true
 			}
 		}
-		for _, ge := range groupExprs {
+		for _, ge := range plan.groupExprs {
 			collectTouched(ge, 0, touched)
 		}
-		for i := range aggSpecs {
-			collectTouched(aggSpecs[i].operand, 0, touched)
+		for i := range plan.aggSpecs {
+			collectTouched(plan.aggSpecs[i].operand, 0, touched)
 			// An aggregate reads real input columns beyond its operand: the FILTER predicate
 			// (agg(x) FILTER (WHERE cond) — aggregates.md §11), an ordered-set direct argument, and a
 			// hypothetical-set's WITHIN GROUP key operands / direct args (aggregates.md §13/§19). Without
 			// these the referenced column is left unfetched by the lazy/masked scan (large-values.md §14)
 			// and folds as NULL — a memory-vs-disk divergence (count(*) FILTER, rank() WITHIN GROUP).
-			collectTouched(aggSpecs[i].filter, 0, touched)
-			collectTouched(aggSpecs[i].osaFrac, 0, touched)
-			if aggSpecs[i].hypo != nil {
-				for _, k := range aggSpecs[i].hypo.keys {
+			collectTouched(plan.aggSpecs[i].filter, 0, touched)
+			collectTouched(plan.aggSpecs[i].osaFrac, 0, touched)
+			if plan.aggSpecs[i].hypo != nil {
+				for _, k := range plan.aggSpecs[i].hypo.keys {
 					collectTouched(k, 0, touched)
 				}
-				for _, a := range aggSpecs[i].hypo.args {
+				for _, a := range plan.aggSpecs[i].hypo.args {
 					collectTouched(a, 0, touched)
 				}
 			}
 		}
 	} else {
-		for _, p := range projections {
+		for _, p := range plan.projections {
 			collectTouched(p, 0, touched)
 		}
 		// A column-key ORDER BY slot is a real input column (< totalCols) — mark it; a materialized
 		// expression-key slot is synthetic (>= totalCols, after rebase) whose input columns are reached
 		// through its orderExprs expression instead (collected below).
-		for _, o := range order {
+		for _, o := range plan.order {
 			if o.idx < totalCols {
 				touched[o.idx] = true
 			}
@@ -1004,14 +1031,14 @@ func (db *engine) planSelect(sel *selectStmt, parent *scope, ctes []*cteBinding,
 		// Each materialized ORDER BY expression key reads real input columns (a plain query resolves it
 		// against the FROM scope; a grouped query reaches them through its group keys / aggregate
 		// arguments, already marked above).
-		for _, oe := range orderExprs {
+		for _, oe := range plan.orderExprs {
 			collectTouched(oe, 0, touched)
 		}
 		// A window query also reads each window function's PARTITION BY + ORDER BY keys, beyond what
 		// the projection's window-result slots reference. A bare-column key is a real input slot
 		// (< totalCols) — mark it; a materialized expression key is a synthetic slot (>= totalCols,
 		// after rebase) whose input columns are reached through its windowKeys expression (below).
-		for _, spec := range windowSpecs {
+		for _, spec := range plan.windowSpecs {
 			for _, pk := range spec.partition {
 				if pk < totalCols {
 					touched[pk] = true
@@ -1034,7 +1061,7 @@ func (db *engine) planSelect(sel *selectStmt, parent *scope, ctes []*cteBinding,
 		}
 		// Each materialized window-key expression reads real input columns (a plain window query
 		// resolves its keys against the FROM scope).
-		for _, ke := range windowKeys {
+		for _, ke := range plan.windowKeys {
 			collectTouched(ke, 0, touched)
 		}
 	}
@@ -1043,259 +1070,23 @@ func (db *engine) planSelect(sel *selectStmt, parent *scope, ctes []*cteBinding,
 	// §10, grammar.md §44). Applies to aggregate and plain queries alike (an aggregate query can carry a
 	// lateral SRF). Without this the referenced column is left unfetched by the lazy/masked scan
 	// (large-values.md §14) and the SRF/body reads NULL — a memory-vs-disk divergence.
-	for i := range planRels {
-		if planRels[i].srf != nil {
+	for i := range plan.rels {
+		if plan.rels[i].srf != nil {
 			// A LATERAL SRF (any SRF at position i>0) resolves its sibling columns as reOuterColumn at
 			// level 1 (resolveSRF's lateralParent, the same frame the runtime pushes) — so collect at
 			// depth 1, not 0. An i==0 SRF has no sibling correlation (constant/param args), so depth 1
 			// marks nothing there. functions.md §10, grammar.md §44.
-			for _, a := range planRels[i].srf.args {
+			for _, a := range plan.rels[i].srf.args {
 				collectTouched(a, 1, touched)
 			}
 		}
-		if planRels[i].derived != nil {
-			collectTouchedPlan(planRels[i].derived, 1, touched)
+		if plan.rels[i].derived != nil {
+			collectTouchedPlan(plan.rels[i].derived, 1, touched)
 		}
 	}
-	relMasks := make([][]bool, len(planRels))
-	for i, rel := range planRels {
+	relMasks := make([][]bool, len(plan.rels))
+	for i, rel := range plan.rels {
 		relMasks[i] = touched[rel.offset : rel.offset+rel.colCount]
 	}
-	// Scan-bound pushdown, per base relation: detect WHERE conjuncts that bound that relation's
-	// scan — a PK range, else a secondary-index equality — so it seeks/ranges instead of walking
-	// the whole B-tree (cost.md §3 "bounded scan" / "index-bounded scan"; indexes.md §5). The
-	// filter is resolved against the full FROM scope, so a relation's column is the GLOBAL index
-	// rel.offset+local; isConstSource only accepts a literal/param/outer const (never a sibling
-	// column), so a JOIN base table is bounded only by a CONSTANT predicate on its own columns —
-	// `b.pk = a.x` (index-nested-loop) stays a full scan, a follow-on. Sound for outer joins too:
-	// a non-NULL conjunct in WHERE eliminates that relation's NULL-extended rows, so bounding it
-	// cannot drop a surviving row.
-	relBounds := make([]*scanBound, len(rels))
-	if filter != nil {
-		for i, rel := range rels {
-			// A set-returning relation or a derived table is a computed row source with no
-			// PK/index — it never bounds (functions.md §10, §42), so skip detection for it.
-			if srfPlans[i] != nil || derivedPlans[i] != nil {
-				continue
-			}
-			relBounds[i] = detectScanBound(filter, rel, db)
-		}
-	}
-	// Index-nested-loop pushdown (cost.md §3 "JOIN"): a join inner relation whose primary key /
-	// indexed column is compared to a SIBLING column of an earlier relation (`a JOIN b ON b.pk = a.x`)
-	// is re-materialized per outer row, seeking instead of full-scanning — O(N·M) → O(N·log M).
-	// Detected from the join's ON and the WHERE. Gated to a base table (an SRF / derived table / CTE /
-	// lateral item has no store to seek) that is the RIGHT/nullable side of an INNER/CROSS/LEFT join
-	// (a RIGHT/FULL preserved side cannot be bounded per outer row). rels[0] has no earlier relation;
-	// its join is sel.Joins[i-1]. A non-nil entry takes precedence over the once-materialized relBounds.
-	relINLBounds := make([]*scanBound, len(rels))
-	for i, rel := range rels {
-		if i == 0 || srfPlans[i] != nil || derivedPlans[i] != nil || rel.cte != nil || lateralFlags[i] {
-			continue
-		}
-		if k := sel.Joins[i-1].Kind; k != joinInner && k != joinCross && k != joinLeft {
-			continue
-		}
-		relINLBounds[i] = detectINLBound(joinPreds[i-1], filter, rel, db)
-	}
-	// ORDER BY satisfied by primary-key scan order (spec/design/cost.md §3): a single base table,
-	// non-aggregate, non-DISTINCT SELECT whose ORDER BY keys are a prefix of the relation's PRIMARY
-	// KEY columns — collation-matching the column's stored key form, all in one direction (ASC ⇒
-	// forward scan, DESC ⇒ a reverse scan over the full PK) — needs no sort, since the table scan
-	// already yields rows in that order. The streaming scan then elides the sort (and, with a LIMIT,
-	// short-circuits a top-N).
-	// (DISTINCT is allowed: when the scan already yields ORDER BY order, the dedup runs streaming —
-	// keeping first occurrence in scan order — and the sort is elided, cost.md §3 "DISTINCT".)
-	pkOrdered, pkReverse := false, false
-	if !isAgg && len(order) > 0 && len(orderExprs) == 0 && len(planRels) == 1 &&
-		planRels[0].srf == nil && planRels[0].cte == nil && planRels[0].derived == nil {
-		pkOrdered, pkReverse = db.orderSatisfiedByPK(s.rels[0].table, planRels[0].offset, order)
-	}
-	// ORDER BY satisfied by SECONDARY-INDEX scan order (cost.md §3): when the PK scan does NOT
-	// satisfy the order but a B-tree index's columns do, and there is a LIMIT, walk that index and
-	// point-look-up each row — a top-N that avoids the blocking sort. Gated to a LIMIT and to no
-	// WHERE pushdown bound (combining them is a follow-on); mutually exclusive with pkOrdered.
-	var indexOrder *indexOrderPlan
-	if !isAgg && !hasWindow && !sel.Distinct && !pkOrdered && sel.Limit != nil && len(order) > 0 &&
-		len(orderExprs) == 0 && len(planRels) == 1 && planRels[0].srf == nil && planRels[0].cte == nil &&
-		planRels[0].derived == nil && relBounds[0] == nil {
-		indexOrder = db.orderSatisfiedByIndex(s.rels[0].table, planRels[0].offset, order)
-	}
-	// ORDER BY satisfied by the OUTER relation's PK scan order in a two-table INNER/CROSS join
-	// (cost.md §3 "JOIN"): the nested loop drives the outer (rels[0]) in PK order, so the join output
-	// is already in (outer PK, inner key) order — the sort is elided, and with a LIMIT the loop
-	// short-circuits a top-N. Gated to exactly two non-lateral base relations, an INNER/CROSS join, a
-	// LIMIT, and a FORWARD outer-PK order with NO key beyond the outer PK (an extra key is a real
-	// tie-break the outer scan order does not satisfy — the outer PK is not unique over the join
-	// output). The outer must carry no non-PK bound (a PK bound / no bound keeps it in PK order).
-	joinPkOrdered := false
-	if !isAgg && !hasWindow && !sel.Distinct && len(order) > 0 && len(orderExprs) == 0 && sel.Limit != nil &&
-		len(planRels) == 2 && len(joins) == 1 && (joins[0].kind == joinInner || joins[0].kind == joinCross) &&
-		!planRels[0].lateral && planRels[0].srf == nil && planRels[0].cte == nil && planRels[0].derived == nil &&
-		!planRels[1].lateral && planRels[1].srf == nil && planRels[1].cte == nil && planRels[1].derived == nil &&
-		!relBounds[0].needsEagerScan() &&
-		relINLBounds[0] == nil && relINLBounds[1] == nil &&
-		len(order) <= len(s.rels[0].table.PKIndices()) {
-		ok, reverse := db.orderSatisfiedByPK(s.rels[0].table, planRels[0].offset, order)
-		joinPkOrdered = ok && !reverse
-	}
-	return &selectPlan{
-		rels: planRels, joins: joins, filter: filter, isAgg: isAgg, groupKeys: groupKeys,
-		groupExprs: groupExprs,
-		groupSets:  groupSets, groupingSpecs: groupingSpecs,
-		aggSpecs: aggSpecs, hasWindow: hasWindow, windowSpecs: windowSpecs, windowKeys: windowKeys, having: having,
-		order: order, orderExprs: orderExprs, projections: projections,
-		columnNames: columnNames, columnTypes: columnTypes, distinct: sel.Distinct,
-		limit: sel.Limit, offset: sel.Offset, relMasks: relMasks,
-		phys: physicalPlan{pkOrdered: pkOrdered, pkReverse: pkReverse, indexOrder: indexOrder, joinPkOrdered: joinPkOrdered, relBounds: relBounds, relINLBounds: relINLBounds},
-	}, nil
-}
-
-// orderSatisfiedByPK reports whether a single base relation's ORDER BY is satisfied by its
-// PRIMARY-KEY scan order (spec/design/cost.md §3), and in which DIRECTION: it returns
-// (satisfied, reverse) where reverse=true means the order is all-DESC over the full PK, served by a
-// REVERSE scan, and reverse=false means all-ASC (forward). The direction comes from the first ORDER
-// BY key; every PK-prefix key must share it (no mixed ASC/DESC). Two asymmetric coverage rules,
-// both grounded in the eager sort being a STABLE sort that breaks ties in input = PK-ascending
-// order: forward (ASC) allows a strict PREFIX of the PK (the remaining columns tie-break ascending,
-// exactly the input order the stable sort preserves); reverse (DESC) requires the FULL PK
-// (len(order) >= len(pk)) because a strict DESC prefix of a composite PK would have the eager sort
-// break ties in PK-ascending input order, which a reverse scan inverts — so reverse is restricted
-// to the unique full key, where no ties remain.
-func (db *engine) orderSatisfiedByPK(table *catTable, offset int, order []orderSlot) (bool, bool) {
-	pk := table.PKIndices()
-	if len(pk) == 0 {
-		return false, false // no PK (synthetic rowid order is not a user-visible column)
-	}
-	reverse := order[0].descending // direction comes from the first ORDER BY key
-	if reverse && len(order) < len(pk) {
-		return false, false // a reverse scan needs the full (unique) PK so no ties remain
-	}
-	m := len(order)
-	if len(pk) < m {
-		m = len(pk)
-	}
-	for i := 0; i < m; i++ {
-		o := order[i]
-		if o.descending != reverse {
-			return false, false // every PK-prefix key must share the scan direction (no mixed ASC/DESC)
-		}
-		if o.idx != offset+pk[i] {
-			return false, false // must be the i-th PK column, in key order
-		}
-		// The ORDER BY key must sort by the SAME order the stored PK key realizes. A raw-byte
-		// (C/non-text) key matches a key with no collation; a Full-collated key matches the SAME
-		// collation; a Skewed/unresolvable collation never matches (its stored keys are at the
-		// file's pinned version, so the scan order would be wrong for the loaded one — §12).
-		coll, push := db.keyCollationCtx(table.Columns[pk[i]])
-		if !push {
-			return false, false // Skewed / unresolvable
-		}
-		if coll == nil {
-			if o.collation != nil {
-				return false, false // raw-byte key, but the ORDER BY key carries a collation
-			}
-		} else {
-			if o.collation == nil || o.collation.Name != coll.Name {
-				return false, false
-			}
-		}
-	}
-	return true, reverse
-}
-
-// pkStorageWidth returns the fixed byte width of a table's stored primary key (encodePKKey = the
-// bare per-column order-preserving keys concatenated, no NULL tags — a PK is NOT NULL) and true, or
-// (0, false) when ANY PK column is variable-width (text/decimal/bytea/interval) or non-scalar
-// (range/composite), or the table has no PK. Used by the secondary-index-order scan to peel the PK
-// suffix off the END of each index entry key (the "key-suffix skip", cost.md §3) — sound only when
-// that suffix is a known fixed length.
-func pkStorageWidth(table *catTable) (int, bool) {
-	pk := table.PKIndices()
-	if len(pk) == 0 {
-		return 0, false // a no-PK table keys on a synthetic rowid — not handled this slice
-	}
-	w := 0
-	for _, ci := range pk {
-		s, ok := table.Columns[ci].Type.AsScalar()
-		if !ok || !s.IsFixedWidth() {
-			return 0, false // a non-scalar / variable-width PK suffix is not a fixed peel
-		}
-		w += s.WidthBytes()
-	}
-	return w, true
-}
-
-// indexOrderPlan is the secondary-index-order plan: walk a B-tree index in key order to satisfy an
-// ORDER BY without a sort, point-looking-up each row by its primary key (cost.md §3).
-type indexOrderPlan struct {
-	nameKey string // the index store's key — the lowercased index name
-	pkWidth int    // the fixed PK-suffix byte width to peel off the END of each index entry key
-}
-
-// orderSatisfiedByIndex reports whether a single base relation's ORDER BY is satisfied by walking one
-// of its B-tree SECONDARY indexes in key order (cost.md §3 "secondary-index order"), and which index.
-// The index store holds its entries in (indexed columns, storage key) order, so a forward walk
-// delivers rows in ORDER BY <indexed columns> ASC NULLS LAST order, ties broken by the PK — exactly
-// the eager stable sort's tie-break. Returns non-nil iff the ORDER BY keys are EXACTLY a B-tree
-// index's columns (same count, same columns in key order), each ASC with default NULLS LAST (the
-// index stores NULL as 0x01 after a present 0x00 → NULLS LAST; an explicit NULLS FIRST does not
-// match) and sorting by the column's stored key collation (Skewed/unresolvable → refuse, §12), AND
-// the table's PK is fixed-width. The exact-match requirement is load-bearing: a strict prefix of a
-// multi-column index would tie-break by the remaining index columns, not the PK.
-func (db *engine) orderSatisfiedByIndex(table *catTable, offset int, order []orderSlot) *indexOrderPlan {
-	pkWidth, ok := pkStorageWidth(table)
-	if !ok {
-		return nil
-	}
-	for _, idx := range table.Indexes {
-		if idx.Kind != indexBtree {
-			continue // only an ordered B-tree realizes the column order (GIN/GiST do not)
-		}
-		// A PARTIAL index is not used for ORDER-BY skip-sort this slice (indexes.md §9): it holds
-		// only its qualifying rows, so walking it would drop rows unless the query implies the
-		// predicate — that gate lives only on the access-predicate bound. Stays non-partial (a
-		// follow-on); falling through leaves a correct full-scan + sort.
-		if idx.Predicate != nil {
-			continue
-		}
-		// ORDER-BY skip-sort is column-only this slice (matching ORDER BY against an expression
-		// index key is a follow-on — indexes.md §5).
-		cols := idx.columnOrdinals()
-		if cols == nil {
-			continue
-		}
-		if len(order) != len(cols) {
-			continue // the ORDER BY must be EXACTLY the index columns (see the doc — tie-break)
-		}
-		matches := true
-		for i, o := range order {
-			if o.descending || o.nullsFirst {
-				matches = false // ASC + NULLS LAST only — the order a forward index walk realizes
-				break
-			}
-			if o.idx != offset+cols[i] {
-				matches = false
-				break
-			}
-			coll, push := db.keyCollationCtx(table.Columns[cols[i]])
-			if !push { // Skewed / unresolvable — never walked for order (§12)
-				matches = false
-				break
-			}
-			if coll == nil {
-				if o.collation != nil {
-					matches = false
-					break
-				}
-			} else if o.collation == nil || o.collation.Name != coll.Name {
-				matches = false
-				break
-			}
-		}
-		if matches {
-			return &indexOrderPlan{nameKey: strings.ToLower(idx.Name), pkWidth: pkWidth}
-		}
-	}
-	return nil
+	return relMasks
 }

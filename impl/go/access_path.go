@@ -7,11 +7,14 @@ import (
 	"strings"
 )
 
-// Access-path selection — turning a WHERE filter into a bounded scan (spec/design/cost.md §3). This
-// file holds the row-source scan interface (rowSource/scanSource), the access-plan shapes
+// Access-path MECHANISMS — turning a WHERE filter into a bounded scan (spec/design/cost.md §3;
+// planner.md §4 — the machinery the optimize.go rules call, not the rules themselves: it also
+// serves UPDATE/DELETE planning and exec-time eligibility). This file holds the row-source scan
+// interface (rowSource/scanSource), the access-plan shapes
 // (pkBoundPlan/scanBound/indexBoundPlan/gistBoundPlan/ginBoundPlan/keySet plans), the predicate
 // analysis that detects a point lookup / range / index / GIN / GiST bound from a filter
 // (detectPKBound/detectScanBound/detectKeySet/detectGinBound/detectGistBound, buildIndexAccessPredicate),
+// the ORDER-BY-via-scan-order analysis (orderSatisfiedByPK/orderSatisfiedByIndex),
 // the order-preserving key-bound encoding (buildKeyBound/encodeBoundKey/encodeTextBound), and the
 // streaming/window-top-N eligibility checks.
 
@@ -2052,4 +2055,153 @@ func frameBackwardSafe(frame *resolvedFrame, unique bool) bool {
 	default:
 		return false // boundFollowing / boundUnboundedFollowing look forward
 	}
+}
+
+// orderSatisfiedByPK reports whether a single base relation's ORDER BY is satisfied by its
+// PRIMARY-KEY scan order (spec/design/cost.md §3), and in which DIRECTION: it returns
+// (satisfied, reverse) where reverse=true means the order is all-DESC over the full PK, served by a
+// REVERSE scan, and reverse=false means all-ASC (forward). The direction comes from the first ORDER
+// BY key; every PK-prefix key must share it (no mixed ASC/DESC). Two asymmetric coverage rules,
+// both grounded in the eager sort being a STABLE sort that breaks ties in input = PK-ascending
+// order: forward (ASC) allows a strict PREFIX of the PK (the remaining columns tie-break ascending,
+// exactly the input order the stable sort preserves); reverse (DESC) requires the FULL PK
+// (len(order) >= len(pk)) because a strict DESC prefix of a composite PK would have the eager sort
+// break ties in PK-ascending input order, which a reverse scan inverts — so reverse is restricted
+// to the unique full key, where no ties remain.
+func (db *engine) orderSatisfiedByPK(table *catTable, offset int, order []orderSlot) (bool, bool) {
+	pk := table.PKIndices()
+	if len(pk) == 0 {
+		return false, false // no PK (synthetic rowid order is not a user-visible column)
+	}
+	reverse := order[0].descending // direction comes from the first ORDER BY key
+	if reverse && len(order) < len(pk) {
+		return false, false // a reverse scan needs the full (unique) PK so no ties remain
+	}
+	m := len(order)
+	if len(pk) < m {
+		m = len(pk)
+	}
+	for i := 0; i < m; i++ {
+		o := order[i]
+		if o.descending != reverse {
+			return false, false // every PK-prefix key must share the scan direction (no mixed ASC/DESC)
+		}
+		if o.idx != offset+pk[i] {
+			return false, false // must be the i-th PK column, in key order
+		}
+		// The ORDER BY key must sort by the SAME order the stored PK key realizes. A raw-byte
+		// (C/non-text) key matches a key with no collation; a Full-collated key matches the SAME
+		// collation; a Skewed/unresolvable collation never matches (its stored keys are at the
+		// file's pinned version, so the scan order would be wrong for the loaded one — §12).
+		coll, push := db.keyCollationCtx(table.Columns[pk[i]])
+		if !push {
+			return false, false // Skewed / unresolvable
+		}
+		if coll == nil {
+			if o.collation != nil {
+				return false, false // raw-byte key, but the ORDER BY key carries a collation
+			}
+		} else {
+			if o.collation == nil || o.collation.Name != coll.Name {
+				return false, false
+			}
+		}
+	}
+	return true, reverse
+}
+
+// pkStorageWidth returns the fixed byte width of a table's stored primary key (encodePKKey = the
+// bare per-column order-preserving keys concatenated, no NULL tags — a PK is NOT NULL) and true, or
+// (0, false) when ANY PK column is variable-width (text/decimal/bytea/interval) or non-scalar
+// (range/composite), or the table has no PK. Used by the secondary-index-order scan to peel the PK
+// suffix off the END of each index entry key (the "key-suffix skip", cost.md §3) — sound only when
+// that suffix is a known fixed length.
+func pkStorageWidth(table *catTable) (int, bool) {
+	pk := table.PKIndices()
+	if len(pk) == 0 {
+		return 0, false // a no-PK table keys on a synthetic rowid — not handled this slice
+	}
+	w := 0
+	for _, ci := range pk {
+		s, ok := table.Columns[ci].Type.AsScalar()
+		if !ok || !s.IsFixedWidth() {
+			return 0, false // a non-scalar / variable-width PK suffix is not a fixed peel
+		}
+		w += s.WidthBytes()
+	}
+	return w, true
+}
+
+// indexOrderPlan is the secondary-index-order plan: walk a B-tree index in key order to satisfy an
+// ORDER BY without a sort, point-looking-up each row by its primary key (cost.md §3).
+type indexOrderPlan struct {
+	nameKey string // the index store's key — the lowercased index name
+	pkWidth int    // the fixed PK-suffix byte width to peel off the END of each index entry key
+}
+
+// orderSatisfiedByIndex reports whether a single base relation's ORDER BY is satisfied by walking one
+// of its B-tree SECONDARY indexes in key order (cost.md §3 "secondary-index order"), and which index.
+// The index store holds its entries in (indexed columns, storage key) order, so a forward walk
+// delivers rows in ORDER BY <indexed columns> ASC NULLS LAST order, ties broken by the PK — exactly
+// the eager stable sort's tie-break. Returns non-nil iff the ORDER BY keys are EXACTLY a B-tree
+// index's columns (same count, same columns in key order), each ASC with default NULLS LAST (the
+// index stores NULL as 0x01 after a present 0x00 → NULLS LAST; an explicit NULLS FIRST does not
+// match) and sorting by the column's stored key collation (Skewed/unresolvable → refuse, §12), AND
+// the table's PK is fixed-width. The exact-match requirement is load-bearing: a strict prefix of a
+// multi-column index would tie-break by the remaining index columns, not the PK.
+func (db *engine) orderSatisfiedByIndex(table *catTable, offset int, order []orderSlot) *indexOrderPlan {
+	pkWidth, ok := pkStorageWidth(table)
+	if !ok {
+		return nil
+	}
+	for _, idx := range table.Indexes {
+		if idx.Kind != indexBtree {
+			continue // only an ordered B-tree realizes the column order (GIN/GiST do not)
+		}
+		// A PARTIAL index is not used for ORDER-BY skip-sort this slice (indexes.md §9): it holds
+		// only its qualifying rows, so walking it would drop rows unless the query implies the
+		// predicate — that gate lives only on the access-predicate bound. Stays non-partial (a
+		// follow-on); falling through leaves a correct full-scan + sort.
+		if idx.Predicate != nil {
+			continue
+		}
+		// ORDER-BY skip-sort is column-only this slice (matching ORDER BY against an expression
+		// index key is a follow-on — indexes.md §5).
+		cols := idx.columnOrdinals()
+		if cols == nil {
+			continue
+		}
+		if len(order) != len(cols) {
+			continue // the ORDER BY must be EXACTLY the index columns (see the doc — tie-break)
+		}
+		matches := true
+		for i, o := range order {
+			if o.descending || o.nullsFirst {
+				matches = false // ASC + NULLS LAST only — the order a forward index walk realizes
+				break
+			}
+			if o.idx != offset+cols[i] {
+				matches = false
+				break
+			}
+			coll, push := db.keyCollationCtx(table.Columns[cols[i]])
+			if !push { // Skewed / unresolvable — never walked for order (§12)
+				matches = false
+				break
+			}
+			if coll == nil {
+				if o.collation != nil {
+					matches = false
+					break
+				}
+			} else if o.collation == nil || o.collation.Name != coll.Name {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			return &indexOrderPlan{nameKey: strings.ToLower(idx.Name), pkWidth: pkWidth}
+		}
+	}
+	return nil
 }
