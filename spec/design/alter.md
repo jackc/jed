@@ -158,7 +158,14 @@ is `23505` (and the scan **builds the backing index**); a `FOREIGN KEY` with an 
 row is `23503`; an `EXCLUDE` with a conflicting pair is `23P01`. Validation uses the same
 **end-state** semantics as everything else (§4). This retires the standing
 `ALTER TABLE … ADD CONSTRAINT` follow-ons noted under the FK and EXCLUDE items in
-[TODO.md](../../TODO.md).
+[TODO.md](../../TODO.md). The scan charges its ordinary page/row/evaluation units; additionally,
+each candidate tuple in a self-referential FK search and each unordered EXCLUDE row pair charges
+`constraint_check` and guards immediately, bounding the otherwise quadratic validation work
+deterministically ([cost.md](cost.md) §3).
+
+The standing CREATE TABLE scope narrowings also apply here: adding a `FOREIGN KEY` or `EXCLUDE`
+constraint to a session-local temporary table or an attached-database table is `0A000`. The scope
+gate runs before resolving the constraint so an unsupported catalog cannot be partially constructed.
 
 ### 2.7 `DROP CONSTRAINT`
 

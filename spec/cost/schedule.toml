@@ -60,6 +60,17 @@ event  = "one B-tree node (page) touched while scanning a table store"
 # the node count as before.
 
 [[unit]]
+id     = "constraint_check"
+weight = 1
+event  = "one candidate tuple or row-pair checked during ALTER TABLE constraint validation"
+# ALTER TABLE ... ADD CONSTRAINT scans an existing table before publishing its edited catalog.
+# A self-referential FK may compare one child probe with many candidate parent tuples, and EXCLUDE
+# validates every unordered row pair. Those loops charge before each candidate check and guard
+# immediately, so max_cost bounds their potentially quadratic CPU work deterministically across
+# cores (../design/alter.md §2.6, ../design/cost.md §3 "constraint_check"). Ordinary write-time
+# constraint probes remain unmetered as specified below.
+
+[[unit]]
 id     = "value_compress"
 weight = 1
 event  = "one C-byte slab of raw payload fed through the LZ4 encoder at a statement's write site"

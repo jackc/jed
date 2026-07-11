@@ -214,6 +214,8 @@ test("cost schedule matches spec/cost/schedule.toml", () => {
         return COSTS.storageRowRead;
       case "page_read":
         return COSTS.pageRead;
+      case "constraint_check":
+        return COSTS.constraintCheck;
       case "value_compress":
         return COSTS.valueCompress;
       case "value_decompress":

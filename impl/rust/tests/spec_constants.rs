@@ -463,6 +463,7 @@ fn cost_schedule_matches_spec() {
         match id {
             "storage_row_read" => COSTS.storage_row_read,
             "page_read" => COSTS.page_read,
+            "constraint_check" => COSTS.constraint_check,
             "value_compress" => COSTS.value_compress,
             "value_decompress" => COSTS.value_decompress,
             "decimal_work" => COSTS.decimal_work,

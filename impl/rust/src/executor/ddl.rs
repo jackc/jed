@@ -17,6 +17,89 @@ fn constraint_name_taken(t: &Table, name: &str) -> bool {
             .any(|e| e.name.eq_ignore_ascii_case(name))
 }
 
+/// Resolve the parts of an EXCLUDE definition that are independent of naming. CREATE TABLE and
+/// ALTER TABLE must share this path so their operator/opclass and duplicate-column gates cannot
+/// drift (spec/design/gist.md §7).
+fn resolve_exclusion_definition(
+    table: &Table,
+    using: Option<&str>,
+    elements: &[(String, String)],
+) -> Result<(Vec<usize>, Vec<ExclusionElement>)> {
+    if let Some(method) = using {
+        if !method.eq_ignore_ascii_case("gist") {
+            return Err(EngineError::new(
+                SqlState::UndefinedObject,
+                format!("access method {method} does not support exclusion constraints"),
+            ));
+        }
+    }
+    let mut columns = Vec::with_capacity(elements.len());
+    let mut resolved = Vec::with_capacity(elements.len());
+    for (column_name, operator) in elements {
+        let column = table
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(column_name))
+            .ok_or_else(|| {
+                EngineError::new(
+                    SqlState::UndefinedColumn,
+                    format!("column {column_name} named in key does not exist"),
+                )
+            })?;
+        if columns.contains(&column) {
+            return Err(EngineError::new(
+                SqlState::DuplicateColumn,
+                format!("column {column_name} appears twice in exclusion constraint"),
+            ));
+        }
+        let ty = &table.columns[column].ty;
+        let op = match operator.as_str() {
+            "&&" => {
+                if ty.range_element().is_none() {
+                    return Err(EngineError::new(
+                        SqlState::UndefinedObject,
+                        format!(
+                            "data type {} has no default operator class for access method gist that accepts operator &&",
+                            ty.canonical_name()
+                        ),
+                    ));
+                }
+                ExclusionOp::Overlaps
+            }
+            "=" => {
+                if is_gist_scalar_type(ty) {
+                    ExclusionOp::Equal
+                } else if is_gist_deferred_scalar_type(ty) {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        format!(
+                            "an exclusion constraint with = over {} is not supported yet",
+                            ty.canonical_name()
+                        ),
+                    ));
+                } else {
+                    return Err(EngineError::new(
+                        SqlState::UndefinedObject,
+                        format!(
+                            "data type {} has no default operator class for access method gist",
+                            ty.canonical_name()
+                        ),
+                    ));
+                }
+            }
+            other => {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    format!("exclusion constraint operator {other} is not supported yet"),
+                ));
+            }
+        };
+        columns.push(column);
+        resolved.push(ExclusionElement { column, op });
+    }
+    Ok((columns, resolved))
+}
+
 impl Engine {
     /// Dispatch one parsed statement to its executor. The autocommit transaction handling
     /// (capture / durable commit / rollback-on-error) lives in `execute_stmt_params`.
@@ -1079,83 +1162,8 @@ impl Engine {
         // name; 42P07/42710 across the relation + constraint namespaces), and build the
         // **multi-column** GiST index that enforces it. The probe + `23P01` live in INSERT/UPDATE.
         for exc in &ct.excludes {
-            // Only the GiST access method (the default) backs an exclusion constraint.
-            if let Some(m) = &exc.using {
-                if !m.eq_ignore_ascii_case("gist") {
-                    return Err(EngineError::new(
-                        SqlState::UndefinedObject,
-                        format!("access method {m} does not support exclusion constraints"),
-                    ));
-                }
-            }
-            let mut indices: Vec<usize> = Vec::with_capacity(exc.elements.len());
-            let mut elements: Vec<ExclusionElement> = Vec::with_capacity(exc.elements.len());
-            for (cname, optext) in &exc.elements {
-                let ci = table
-                    .columns
-                    .iter()
-                    .position(|c| c.name.eq_ignore_ascii_case(cname))
-                    .ok_or_else(|| {
-                        EngineError::new(
-                            SqlState::UndefinedColumn,
-                            format!("column {cname} named in key does not exist"),
-                        )
-                    })?;
-                if indices.contains(&ci) {
-                    return Err(EngineError::new(
-                        SqlState::DuplicateColumn,
-                        format!("column {cname} appears twice in exclusion constraint"),
-                    ));
-                }
-                let ty = &table.columns[ci].ty;
-                // The `WITH` operator must pair with the column's GiST opclass (gist.md §7): `&&`
-                // over a range column (`range_ops`), `=` over a fixed-width keyable scalar (the
-                // in-core `btree_gist`). A deferred keyable scalar with `=` is 0A000; a no-opclass
-                // type, or `&&` on a non-range column, is 42704; any other operator is 0A000.
-                let op = match optext.as_str() {
-                    "&&" => {
-                        if ty.range_element().is_none() {
-                            return Err(EngineError::new(
-                                SqlState::UndefinedObject,
-                                format!(
-                                    "data type {} has no default operator class for access method gist that accepts operator &&",
-                                    ty.canonical_name()
-                                ),
-                            ));
-                        }
-                        ExclusionOp::Overlaps
-                    }
-                    "=" => {
-                        if is_gist_scalar_type(ty) {
-                            ExclusionOp::Equal
-                        } else if is_gist_deferred_scalar_type(ty) {
-                            return Err(EngineError::new(
-                                SqlState::FeatureNotSupported,
-                                format!(
-                                    "an exclusion constraint with = over {} is not supported yet",
-                                    ty.canonical_name()
-                                ),
-                            ));
-                        } else {
-                            return Err(EngineError::new(
-                                SqlState::UndefinedObject,
-                                format!(
-                                    "data type {} has no default operator class for access method gist",
-                                    ty.canonical_name()
-                                ),
-                            ));
-                        }
-                    }
-                    other => {
-                        return Err(EngineError::new(
-                            SqlState::FeatureNotSupported,
-                            format!("exclusion constraint operator {other} is not supported yet"),
-                        ));
-                    }
-                };
-                indices.push(ci);
-                elements.push(ExclusionElement { column: ci, op });
-            }
+            let (indices, elements) =
+                resolve_exclusion_definition(&table, exc.using.as_deref(), &exc.elements)?;
             // Name the constraint (= its backing index name). An explicit name checks the relation
             // namespace (42P07) then the table's constraint names (42710); a derived
             // `<table>_<cols>_excl` suffix-walks both.
@@ -1382,6 +1390,10 @@ impl Engine {
     pub(crate) fn execute_alter_table(&mut self, at: AlterTable) -> Result<Outcome> {
         check_catalog_rel_write(&at.name)?;
         self.check_attachment_writable(at.db.as_deref())?;
+        let temp_scope = match at.db.as_deref() {
+            Some(q) => q.eq_ignore_ascii_case("temp"),
+            None => self.is_temp_table(&at.name),
+        };
         let snap = match at.db.as_deref().map(str::to_ascii_lowercase) {
             None => {
                 if self.is_temp_table(&at.name)
@@ -1438,6 +1450,25 @@ impl Engine {
                     || snap.sequence(name).is_some()
             } else {
                 self.relation_exists(name)
+            }
+        };
+        // ADD/DROP actions edit `table` left-to-right. A dropped index owned by this table has
+        // released its relation name, while an earlier ADD has already occupied its new one.
+        let working_relation_taken = |working: &Table, name: &str| {
+            if working
+                .indexes
+                .iter()
+                .any(|i| i.name.eq_ignore_ascii_case(name))
+            {
+                true
+            } else if original
+                .indexes
+                .iter()
+                .any(|i| i.name.eq_ignore_ascii_case(name))
+            {
+                false
+            } else {
+                relation_taken(name)
             }
         };
 
@@ -1547,6 +1578,23 @@ impl Engine {
             AlterTableAction::Actions(actions) => {
                 for action in actions {
                     if let AlterTableEdit::AddConstraint(def) = action {
+                        if matches!(
+                            &def,
+                            AlterConstraintDef::ForeignKey(_) | AlterConstraintDef::Exclude(_)
+                        ) {
+                            if temp_scope {
+                                return Err(EngineError::new(
+                                    SqlState::FeatureNotSupported,
+                                    "this constraint is not supported on a temporary table",
+                                ));
+                            }
+                            if attachment_scope {
+                                return Err(EngineError::new(
+                                    SqlState::FeatureNotSupported,
+                                    "this constraint is not supported on an attached-database table",
+                                ));
+                            }
+                        }
                         match def {
                             AlterConstraintDef::Check(d) => {
                                 reject_check_structure(&d.expr)?;
@@ -1572,8 +1620,13 @@ impl Engine {
                                             table.columns[rs[0]].name.to_ascii_lowercase()
                                         );
                                     }
-                                }
-                                if constraint_name_taken(&table, &name) {
+                                    let base = name.clone();
+                                    let mut suffix = 0u32;
+                                    while constraint_name_taken(&table, &name) {
+                                        suffix += 1;
+                                        name = format!("{base}{suffix}");
+                                    }
+                                } else if constraint_name_taken(&table, &name) {
                                     return Err(EngineError::new(
                                         SqlState::DuplicateObject,
                                         format!(
@@ -1638,32 +1691,43 @@ impl Engine {
                                         ));
                                     }
                                 }
-                                let name = d.name.unwrap_or_else(|| {
-                                    format!(
+                                let name = if let Some(name) = d.name {
+                                    check_reserved_name("constraint", &name)?;
+                                    if working_relation_taken(&table, &name) {
+                                        return Err(EngineError::new(
+                                            SqlState::DuplicateTable,
+                                            format!("relation already exists: {name}"),
+                                        ));
+                                    }
+                                    if constraint_name_taken(&table, &name) {
+                                        return Err(EngineError::new(
+                                            SqlState::DuplicateObject,
+                                            format!(
+                                                "constraint {name} for relation {} already exists",
+                                                table.name
+                                            ),
+                                        ));
+                                    }
+                                    name
+                                } else {
+                                    let base = format!(
                                         "{}_{}_key",
                                         table.name.to_ascii_lowercase(),
                                         cols.iter()
                                             .map(|i| table.columns[*i].name.to_ascii_lowercase())
                                             .collect::<Vec<_>>()
                                             .join("_")
-                                    )
-                                });
-                                check_reserved_name("constraint", &name)?;
-                                if relation_taken(&name) {
-                                    return Err(EngineError::new(
-                                        SqlState::DuplicateTable,
-                                        format!("relation already exists: {name}"),
-                                    ));
-                                }
-                                if constraint_name_taken(&table, &name) {
-                                    return Err(EngineError::new(
-                                        SqlState::DuplicateObject,
-                                        format!(
-                                            "constraint {name} for relation {} already exists",
-                                            table.name
-                                        ),
-                                    ));
-                                }
+                                    );
+                                    let mut name = base.clone();
+                                    let mut suffix = 0u32;
+                                    while working_relation_taken(&table, &name)
+                                        || constraint_name_taken(&table, &name)
+                                    {
+                                        suffix += 1;
+                                        name = format!("{base}{suffix}");
+                                    }
+                                    name
+                                };
                                 table.indexes.push(IndexDef {
                                     name: name.clone(),
                                     keys: cols.into_iter().map(IndexKey::Column).collect(),
@@ -1720,6 +1784,14 @@ impl Engine {
                                                 format!("column {n} named in key does not exist"),
                                             ));
                                         };
+                                        if r.contains(&i) {
+                                            return Err(EngineError::new(
+                                                SqlState::DuplicateColumn,
+                                                format!(
+                                                    "column {n} appears twice in foreign key constraint"
+                                                ),
+                                            ));
+                                        }
                                         r.push(i)
                                     }
                                     r
@@ -1757,8 +1829,19 @@ impl Engine {
                                         ),
                                     ));
                                 }
-                                let name = d.name.unwrap_or_else(|| {
-                                    format!(
+                                let name = if let Some(name) = d.name {
+                                    if constraint_name_taken(&table, &name) {
+                                        return Err(EngineError::new(
+                                            SqlState::DuplicateObject,
+                                            format!(
+                                                "constraint {name} for relation {} already exists",
+                                                table.name
+                                            ),
+                                        ));
+                                    }
+                                    name
+                                } else {
+                                    let base = format!(
                                         "{}_{}_fkey",
                                         table.name.to_ascii_lowercase(),
                                         local
@@ -1766,17 +1849,15 @@ impl Engine {
                                             .map(|i| table.columns[*i].name.to_ascii_lowercase())
                                             .collect::<Vec<_>>()
                                             .join("_")
-                                    )
-                                });
-                                if constraint_name_taken(&table, &name) {
-                                    return Err(EngineError::new(
-                                        SqlState::DuplicateObject,
-                                        format!(
-                                            "constraint {name} for relation {} already exists",
-                                            table.name
-                                        ),
-                                    ));
-                                }
+                                    );
+                                    let mut name = base.clone();
+                                    let mut suffix = 0u32;
+                                    while constraint_name_taken(&table, &name) {
+                                        suffix += 1;
+                                        name = format!("{base}{suffix}");
+                                    }
+                                    name
+                                };
                                 for (&li, &ri) in local.iter().zip(&refs) {
                                     if table.columns[li].ty != parent.columns[ri].ty {
                                         return Err(EngineError::new(
@@ -1805,65 +1886,48 @@ impl Engine {
                                 added_constraints.insert(name.to_ascii_lowercase());
                             }
                             AlterConstraintDef::Exclude(d) => {
-                                if d.using
-                                    .as_deref()
-                                    .is_some_and(|x| !x.eq_ignore_ascii_case("gist"))
-                                {
-                                    return Err(EngineError::new(
-                                        SqlState::UndefinedObject,
-                                        format!(
-                                            "access method {} does not support exclusion constraints",
-                                            d.using.unwrap()
-                                        ),
-                                    ));
-                                }
-                                let mut cols = Vec::new();
-                                let mut els = Vec::new();
-                                for (n, op) in d.elements {
-                                    let Some(ci) = table
-                                        .columns
-                                        .iter()
-                                        .position(|c| c.name.eq_ignore_ascii_case(&n))
-                                    else {
+                                let (cols, els) = resolve_exclusion_definition(
+                                    &table,
+                                    d.using.as_deref(),
+                                    &d.elements,
+                                )?;
+                                let name = if let Some(name) = d.name {
+                                    check_reserved_name("constraint", &name)?;
+                                    if working_relation_taken(&table, &name) {
                                         return Err(EngineError::new(
-                                            SqlState::UndefinedColumn,
-                                            format!("column {n} named in key does not exist"),
+                                            SqlState::DuplicateTable,
+                                            format!("relation already exists: {name}"),
                                         ));
-                                    };
-                                    let eop = if op == "&&" {
-                                        if !matches!(table.columns[ci].ty, Type::Range(_)) {
-                                            return Err(EngineError::new(
-                                                SqlState::UndefinedObject,
-                                                "data type has no default operator class for access method gist",
-                                            ));
-                                        }
-                                        ExclusionOp::Overlaps
-                                    } else {
-                                        ExclusionOp::Equal
-                                    };
-                                    cols.push(ci);
-                                    els.push(ExclusionElement {
-                                        column: ci,
-                                        op: eop,
-                                    })
-                                }
-                                let name = d.name.unwrap_or_else(|| {
-                                    format!(
+                                    }
+                                    if constraint_name_taken(&table, &name) {
+                                        return Err(EngineError::new(
+                                            SqlState::DuplicateObject,
+                                            format!(
+                                                "constraint {name} for relation {} already exists",
+                                                table.name
+                                            ),
+                                        ));
+                                    }
+                                    name
+                                } else {
+                                    let base = format!(
                                         "{}_{}_excl",
                                         table.name.to_ascii_lowercase(),
                                         cols.iter()
                                             .map(|i| table.columns[*i].name.to_ascii_lowercase())
                                             .collect::<Vec<_>>()
                                             .join("_")
-                                    )
-                                });
-                                check_reserved_name("constraint", &name)?;
-                                if relation_taken(&name) {
-                                    return Err(EngineError::new(
-                                        SqlState::DuplicateTable,
-                                        format!("relation already exists: {name}"),
-                                    ));
-                                }
+                                    );
+                                    let mut name = base.clone();
+                                    let mut suffix = 0u32;
+                                    while working_relation_taken(&table, &name)
+                                        || constraint_name_taken(&table, &name)
+                                    {
+                                        suffix += 1;
+                                        name = format!("{base}{suffix}");
+                                    }
+                                    name
+                                };
                                 table.indexes.push(IndexDef {
                                     name: name.clone(),
                                     keys: cols.into_iter().map(IndexKey::Column).collect(),
@@ -2103,6 +2167,8 @@ impl Engine {
                         let hit = if std::ptr::eq(parent, &table) {
                             let mut found = false;
                             for (_, mut candidate) in rows.iter().cloned() {
+                                meter.charge(COSTS.constraint_check);
+                                meter.guard()?;
                                 store.resolve_inline_columns(&mut candidate)?;
                                 if let Some(pp) =
                                     fk_probe(fk, parent, &pc, &candidate, &fk.ref_columns)?
@@ -2132,6 +2198,8 @@ impl Engine {
                     let mut a = rows[i].1.clone();
                     store.resolve_inline_columns(&mut a)?;
                     for j in 0..i {
+                        meter.charge(COSTS.constraint_check);
+                        meter.guard()?;
                         let mut b = rows[j].1.clone();
                         store.resolve_inline_columns(&mut b)?;
                         if exclusion_pair_conflicts(&table.columns, ex, &a, &b) {

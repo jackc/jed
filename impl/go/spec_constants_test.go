@@ -392,6 +392,8 @@ func TestCostScheduleMatchesSpec(t *testing.T) {
 			return costs.StorageRowRead
 		case "page_read":
 			return costs.PageRead
+		case "constraint_check":
+			return costs.ConstraintCheck
 		case "value_compress":
 			return costs.ValueCompress
 		case "value_decompress":

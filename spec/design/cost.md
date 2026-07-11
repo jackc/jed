@@ -44,6 +44,7 @@ The core seam units, all weight `1`:
 |---|---|
 | `storage_row_read` | one row is read from a table store during a scan |
 | `page_read` | one B-tree node (page) is touched while scanning a store |
+| `constraint_check` | one candidate tuple or row pair tested by ALTER constraint validation |
 | `row_produced` | one row is emitted into a query result set |
 | `operator_eval` | one interior expression node is evaluated |
 
@@ -531,9 +532,14 @@ in-memory tree rebuild after each mutating statement is unmetered structure main
 (trusted) write path inside the two-phase INSERT/UPDATE pass and is **unmetered** — like the
 UNIQUE/FK duplicate-and-existence probes (the descent over the backing multi-column tree, the leaf
 recheck, and the in-batch pairwise check accrue no cost), since a write is not the untrusted
-surface. **DDL cost:** `CREATE INDEX … USING gist` charges its build scan (`page_read` × the table node
-count + `storage_row_read` per row + the bounding-key work); an empty table charges 0, `DROP INDEX`
-charges 0.
+surface. `ALTER TABLE … ADD CONSTRAINT` is different: its validation scan can be driven over an
+arbitrarily large existing table by one DDL statement. Its self-referential FK candidate loop and
+EXCLUDE unordered-pair loop charge one **`constraint_check`** before each candidate comparison and
+guard immediately. Thus the reported cost includes the actual potentially quadratic work and
+`max_cost` bounds it before the comparison runs. Non-self FK validation retains the existing bounded
+index probe. **DDL cost:** `CREATE INDEX … USING gist` charges its build scan (`page_read` × the table
+node count + `storage_row_read` per row + the bounding-key work); an empty table charges 0,
+`DROP INDEX` charges 0.
 
 ### `collate` — a non-`C` collation's per-code-point sort-key work
 

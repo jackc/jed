@@ -1532,6 +1532,22 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 		}
 		return db.relationExists(name)
 	}
+	// ADD/DROP actions apply left-to-right. Only relations outside this table remain fixed in the
+	// snapshot: an owned index removed from `table` has released its name, while an earlier ADD has
+	// already occupied its new name.
+	workingRelationTaken := func(name string) bool {
+		for _, ix := range table.Indexes {
+			if strings.EqualFold(ix.Name, name) {
+				return true
+			}
+		}
+		for _, ix := range original.Indexes {
+			if strings.EqualFold(ix.Name, name) {
+				return false
+			}
+		}
+		return relationTaken(name)
+	}
 
 	if at.RenameTable != "" {
 		if err := checkReservedName("table", at.RenameTable); err != nil {
@@ -1647,7 +1663,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 				if isAttachmentScope(at.DB) && (a.Add.Foreign != nil || a.Add.Exclude != nil) {
 					return outcome{}, newError(FeatureNotSupported, "this constraint is not supported on an attached-database table")
 				}
-				if err := db.addAlterConstraint(&table, a.Add, snap, relationTaken, constraintState); err != nil {
+				if err := db.addAlterConstraint(&table, a.Add, snap, workingRelationTaken, constraintState); err != nil {
 					return outcome{}, err
 				}
 				continue

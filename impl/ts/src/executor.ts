@@ -21,6 +21,7 @@ import type {
   DropSequence,
   DropTable,
   DropType,
+  ExcludeDef,
   Explain,
   Expr,
   GroupItem,
@@ -477,6 +478,16 @@ export const MAX_COMPOSITE_DEPTH = 32;
 // identically across cores (§8). A TextEncoder is available in Node and the browser (the OPFS
 // host), so this stays host-agnostic.
 export const SQL_BYTE_ENCODER = new TextEncoder();
+
+// Catalog names are ordered by the UTF-8 bytes of their lowercased form, matching Rust/Go raw
+// string ordering. String#localeCompare is locale/ICU-sensitive and JavaScript's native UTF-16
+// ordering differs from UTF-8 for supplementary code points.
+export function compareLowerName(a: { name: string }, b: { name: string }): number {
+  return compareBytes(
+    SQL_BYTE_ENCODER.encode(a.name.toLowerCase()),
+    SQL_BYTE_ENCODER.encode(b.name.toLowerCase()),
+  );
+}
 // checkReservedName rejects a USER-written catalog object name beginning jed_ — the prefix is
 // reserved for the engine's own catalog relations (spec/design/introspection.md §4). Case-insensitive
 // (resolution folds case and there is no quoted-identifier escape — grammar.md §3). Engine-GENERATED
@@ -3470,11 +3481,7 @@ export class Engine {
     }
     // Evaluation (and on-disk) order: ascending byte order of the lowercased name
     // (constraints.md §4.4 — PG evaluates checks sorted by name, oracle-probed).
-    checks.sort((a, b) => {
-      const an = a.name.toLowerCase();
-      const bn = b.name.toLowerCase();
-      return an < bn ? -1 : an > bn ? 1 : 0;
-    });
+    checks.sort(compareLowerName);
     table.checks = checks;
 
     // UNIQUE fold + naming (constraints.md §5.2/§5.3, PG-probed). Fold first: a
@@ -3530,8 +3537,7 @@ export class Engine {
         }
       }
       // Insert in catalog (ascending lowercased-name) order — indexes.md §6.
-      const nameKey = name.toLowerCase();
-      let pos = table.indexes.findIndex((ix) => ix.name.toLowerCase() > nameKey);
+      let pos = table.indexes.findIndex((ix) => compareLowerName(ix, { name }) > 0);
       if (pos < 0) pos = table.indexes.length;
       table.indexes.splice(pos, 0, {
         name,
@@ -3687,11 +3693,7 @@ export class Engine {
       });
     }
     // Held in ascending lowercased-name order (the catalog's on-disk + evaluation order, §6.9).
-    resolvedFks.sort((a, b) => {
-      const an = a.name.toLowerCase();
-      const bn = b.name.toLowerCase();
-      return an < bn ? -1 : an > bn ? 1 : 0;
-    });
+    resolvedFks.sort(compareLowerName);
     table.fks = resolvedFks;
 
     // EXCLUDE constraints (spec/design/gist.md §7). Resolved AFTER the PK / UNIQUE / CHECK / FK
@@ -3701,69 +3703,7 @@ export class Engine {
     // 42P07/42710 across the relation + constraint namespaces), and build the MULTI-COLUMN GiST index
     // that enforces it. The probe + 23P01 live in INSERT/UPDATE.
     for (const exc of ct.excludes) {
-      if (exc.using !== null && exc.using.toLowerCase() !== "gist") {
-        throw engineError(
-          "undefined_object",
-          "access method " + exc.using + " does not support exclusion constraints",
-        );
-      }
-      const indices: number[] = [];
-      const elements: ExclusionElement[] = [];
-      for (const el of exc.elements) {
-        const ci = table.columns.findIndex((c) => c.name.toLowerCase() === el.column.toLowerCase());
-        if (ci < 0) {
-          throw engineError(
-            "undefined_column",
-            "column " + el.column + " named in key does not exist",
-          );
-        }
-        if (indices.includes(ci)) {
-          throw engineError(
-            "duplicate_column",
-            "column " + el.column + " appears twice in exclusion constraint",
-          );
-        }
-        const ty = table.columns[ci]!.type;
-        // The WITH operator must pair with the column's GiST opclass (gist.md §7): && over a range
-        // column (range_ops), = over a fixed-width keyable scalar (the in-core btree_gist).
-        let op: ExclusionOp;
-        if (el.op === "&&") {
-          if (ty.kind !== "range") {
-            throw engineError(
-              "undefined_object",
-              "data type " +
-                typeCanonicalName(ty) +
-                " has no default operator class for access method gist that accepts operator &&",
-            );
-          }
-          op = "overlaps";
-        } else if (el.op === "=") {
-          if (isGistScalarType(ty)) {
-            op = "equal";
-          } else if (isGistDeferredScalarType(ty)) {
-            throw engineError(
-              "feature_not_supported",
-              "an exclusion constraint with = over " +
-                typeCanonicalName(ty) +
-                " is not supported yet",
-            );
-          } else {
-            throw engineError(
-              "undefined_object",
-              "data type " +
-                typeCanonicalName(ty) +
-                " has no default operator class for access method gist",
-            );
-          }
-        } else {
-          throw engineError(
-            "feature_not_supported",
-            "exclusion constraint operator " + el.op + " is not supported yet",
-          );
-        }
-        indices.push(ci);
-        elements.push({ column: ci, op });
-      }
+      const { columns: indices, elements } = resolveExclusionDefinition(table, exc);
       // Name the constraint (= its backing index name). An explicit name checks the relation
       // namespace (42P07) then the table's constraint names (42710); a derived `<table>_<cols>_excl`
       // suffix-walks both.
@@ -3800,8 +3740,7 @@ export class Engine {
         }
       }
       // Insert the backing GiST index in catalog (ascending lowercased-name) order.
-      const nameKey = name.toLowerCase();
-      let pos = table.indexes.findIndex((ix) => ix.name.toLowerCase() > nameKey);
+      let pos = table.indexes.findIndex((ix) => compareLowerName(ix, { name }) > 0);
       if (pos < 0) pos = table.indexes.length;
       table.indexes.splice(pos, 0, {
         name,
@@ -3812,11 +3751,7 @@ export class Engine {
       table.exclusions.push({ name, index: name, elements });
     }
     // Held in ascending lowercased-name order (the catalog's on-disk order — gist.md §8).
-    table.exclusions.sort((a, b) => {
-      const an = a.name.toLowerCase();
-      const bn = b.name.toLowerCase();
-      return an < bn ? -1 : an > bn ? 1 : 0;
-    });
+    table.exclusions.sort(compareLowerName);
 
     if (attachName !== "") {
       // Deferred narrowings on an attached-database table this slice (attached-databases.md §8), each a
@@ -4239,6 +4174,8 @@ export class Engine {
     };
     let renameTable = false;
     let indexRename: { oldName: string; newName: string } | undefined;
+    const tempScope =
+      at.db === undefined ? this.isTempTable(at.name) : at.db.toLowerCase() === "temp";
     const attachmentScope =
       at.db !== undefined && at.db.toLowerCase() !== "main" && at.db.toLowerCase() !== "temp";
     const relationTaken = (name: string) =>
@@ -4247,6 +4184,11 @@ export class Engine {
           snap.findIndex(name) !== null ||
           snap.sequence(name) !== undefined
         : this.relationExists(name);
+    const workingRelationTaken = (name: string): boolean => {
+      if (table.indexes.some((i) => i.name.toLowerCase() === name.toLowerCase())) return true;
+      if (original.indexes.some((i) => i.name.toLowerCase() === name.toLowerCase())) return false;
+      return relationTaken(name);
+    };
     const addedConstraints = new Set<string>();
     const cascadeUniqueCols: number[][] = [];
     const rewriteExprs = (
@@ -4350,16 +4292,10 @@ export class Engine {
           if (relationTaken(next))
             throw engineError("duplicate_table", `relation already exists: ${next}`);
         }
-        const byName = <T extends { name: string }>(a: T, b: T) =>
-          a.name.toLowerCase() < b.name.toLowerCase()
-            ? -1
-            : a.name.toLowerCase() > b.name.toLowerCase()
-              ? 1
-              : 0;
-        table.checks.sort(byName);
-        table.indexes.sort(byName);
-        table.fks.sort(byName);
-        table.exclusions.sort(byName);
+        table.checks.sort(compareLowerName);
+        table.indexes.sort(compareLowerName);
+        table.fks.sort(compareLowerName);
+        table.exclusions.sort(compareLowerName);
         break;
       }
       case "actions": {
@@ -4372,6 +4308,18 @@ export class Engine {
         for (const action of at.action.actions) {
           if (action.kind === "addConstraint") {
             const c = action.constraint;
+            if (c.kind === "foreignKey" || c.kind === "exclude") {
+              if (tempScope)
+                throw engineError(
+                  "feature_not_supported",
+                  "this constraint is not supported on a temporary table",
+                );
+              if (attachmentScope)
+                throw engineError(
+                  "feature_not_supported",
+                  "this constraint is not supported on an attached-database table",
+                );
+            }
             if (c.kind === "check") {
               const d = c.def;
               rejectCheckStructure(d.expr);
@@ -4396,7 +4344,7 @@ export class Engine {
                   `constraint ${name} for relation ${table.name} already exists`,
                 );
               table.checks.push({ name, exprText: d.text, expr: d.expr });
-              table.checks.sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
+              table.checks.sort(compareLowerName);
               added.add(name.toLowerCase());
             } else if (c.kind === "unique") {
               const d = c.def,
@@ -4434,18 +4382,22 @@ export class Engine {
                     `a ${typeCanonicalName(ty)} unique constraint member is not supported yet`,
                   );
               }
-              const name =
-                d.name ??
-                `${table.name.toLowerCase()}_${cols.map((i) => table.columns[i]!.name.toLowerCase()).join("_")}_key`;
+              let name: string;
               if (d.name !== null) {
+                name = d.name;
                 checkReservedName("constraint", name);
-                if (relationTaken(name))
+                if (workingRelationTaken(name))
                   throw engineError("duplicate_table", `relation already exists: ${name}`);
                 if (taken(name))
                   throw engineError(
                     "duplicate_object",
                     `constraint ${name} for relation ${table.name} already exists`,
                   );
+              } else {
+                const base = `${table.name.toLowerCase()}_${cols.map((i) => table.columns[i]!.name.toLowerCase()).join("_")}_key`;
+                name = base;
+                for (let suffix = 1; workingRelationTaken(name) || taken(name); suffix++)
+                  name = base + suffix.toString();
               }
               table.indexes.push({
                 name,
@@ -4453,9 +4405,7 @@ export class Engine {
                 unique: true,
                 kind: "btree",
               });
-              table.indexes.sort((a, b) =>
-                a.name.toLowerCase().localeCompare(b.name.toLowerCase()),
-              );
+              table.indexes.sort(compareLowerName);
               added.add(name.toLowerCase());
             } else if (c.kind === "foreignKey") {
               const d = c.def,
@@ -4477,18 +4427,25 @@ export class Engine {
                   : snap.table(d.refTable);
               if (!parent)
                 throw engineError("undefined_table", `table does not exist: ${d.refTable}`);
-              const refs =
-                d.refColumns === null
-                  ? [...parent.pk]
-                  : d.refColumns.map((n) => {
-                      const i = columnIndex(parent, n);
-                      if (i < 0)
-                        throw engineError(
-                          "undefined_column",
-                          `column ${n} named in key does not exist`,
-                        );
-                      return i;
-                    });
+              let refs: number[];
+              if (d.refColumns === null) refs = [...parent.pk];
+              else {
+                refs = [];
+                for (const n of d.refColumns) {
+                  const i = columnIndex(parent, n);
+                  if (i < 0)
+                    throw engineError(
+                      "undefined_column",
+                      `column ${n} named in key does not exist`,
+                    );
+                  if (refs.includes(i))
+                    throw engineError(
+                      "duplicate_column",
+                      `column ${n} appears twice in foreign key constraint`,
+                    );
+                  refs.push(i);
+                }
+              }
               if (refs.length === 0)
                 throw engineError(
                   "undefined_object",
@@ -4513,14 +4470,19 @@ export class Engine {
                   "invalid_foreign_key",
                   `there is no unique constraint matching given keys for referenced table ${parent.name}`,
                 );
-              const name =
-                d.name ??
-                `${table.name.toLowerCase()}_${local.map((i) => table.columns[i]!.name.toLowerCase()).join("_")}_fkey`;
-              if (taken(name))
-                throw engineError(
-                  "duplicate_object",
-                  `constraint ${name} for relation ${table.name} already exists`,
-                );
+              let name: string;
+              if (d.name !== null) {
+                name = d.name;
+                if (taken(name))
+                  throw engineError(
+                    "duplicate_object",
+                    `constraint ${name} for relation ${table.name} already exists`,
+                  );
+              } else {
+                const base = `${table.name.toLowerCase()}_${local.map((i) => table.columns[i]!.name.toLowerCase()).join("_")}_fkey`;
+                name = base;
+                for (let suffix = 1; taken(name); suffix++) name = base + suffix.toString();
+              }
               for (let p = 0; p < local.length; p++) {
                 const li = local[p]!,
                   ri = refs[p]!;
@@ -4538,44 +4500,27 @@ export class Engine {
                 onDelete: fkAction(d.onDelete, "DELETE"),
                 onUpdate: fkAction(d.onUpdate, "UPDATE"),
               });
-              table.fks.sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
+              table.fks.sort(compareLowerName);
               added.add(name.toLowerCase());
             } else {
               const d = c.def;
-              if (d.using !== null && d.using.toLowerCase() !== "gist")
-                throw engineError(
-                  "undefined_object",
-                  `access method ${d.using} does not support exclusion constraints`,
-                );
-              const cols: number[] = [],
-                elements: ExclusionElement[] = [];
-              for (const el of d.elements) {
-                const ci = columnIndex(table, el.column);
-                if (ci < 0)
-                  throw engineError(
-                    "undefined_column",
-                    `column ${el.column} named in key does not exist`,
-                  );
-                if (cols.includes(ci))
-                  throw engineError(
-                    "duplicate_column",
-                    `column ${el.column} appears twice in exclusion constraint`,
-                  );
-                if (el.op === "&&" && table.columns[ci]!.type.kind !== "range")
-                  throw engineError(
-                    "undefined_object",
-                    `data type ${typeCanonicalName(table.columns[ci]!.type)} has no default operator class for access method gist that accepts operator &&`,
-                  );
-                cols.push(ci);
-                elements.push({ column: ci, op: el.op === "&&" ? "overlaps" : "equal" });
-              }
-              const name =
-                d.name ??
-                `${table.name.toLowerCase()}_${cols.map((i) => table.columns[i]!.name.toLowerCase()).join("_")}_excl`;
+              const { columns: cols, elements } = resolveExclusionDefinition(table, d);
+              let name: string;
               if (d.name !== null) {
+                name = d.name;
                 checkReservedName("constraint", name);
-                if (relationTaken(name))
+                if (workingRelationTaken(name))
                   throw engineError("duplicate_table", `relation already exists: ${name}`);
+                if (taken(name))
+                  throw engineError(
+                    "duplicate_object",
+                    `constraint ${name} for relation ${table.name} already exists`,
+                  );
+              } else {
+                const base = `${table.name.toLowerCase()}_${cols.map((i) => table.columns[i]!.name.toLowerCase()).join("_")}_excl`;
+                name = base;
+                for (let suffix = 1; workingRelationTaken(name) || taken(name); suffix++)
+                  name = base + suffix.toString();
               }
               table.indexes.push({
                 name,
@@ -4584,12 +4529,8 @@ export class Engine {
                 kind: "gist",
               });
               table.exclusions.push({ name, index: name, elements });
-              table.indexes.sort((a, b) =>
-                a.name.toLowerCase().localeCompare(b.name.toLowerCase()),
-              );
-              table.exclusions.sort((a, b) =>
-                a.name.toLowerCase().localeCompare(b.name.toLowerCase()),
-              );
+              table.indexes.sort(compareLowerName);
+              table.exclusions.sort(compareLowerName);
               added.add(name.toLowerCase());
             }
             continue;
@@ -4745,6 +4686,8 @@ export class Engine {
               let hit: boolean;
               if (parent === table) {
                 hit = all.entries.some((candidate) => {
+                  meter.charge(COSTS.constraintCheck);
+                  meter.guard();
                   const pp = fkProbe(
                     fk,
                     parent,
@@ -4762,7 +4705,9 @@ export class Engine {
       for (const ex of table.exclusions)
         if (addedConstraints.has(ex.name.toLowerCase()))
           for (let i = 0; i < all.entries.length; i++)
-            for (let j = 0; j < i; j++)
+            for (let j = 0; j < i; j++) {
+              meter.charge(COSTS.constraintCheck);
+              meter.guard();
               if (
                 exclusionPairConflicts(
                   table.columns,
@@ -4772,6 +4717,7 @@ export class Engine {
                 )
               )
                 throw exclusionViolation(table.name, ex.name);
+            }
       for (const es of constraintEntries.values()) es.sort(compareBytes);
     }
     let ws: Snapshot;
@@ -13639,6 +13585,60 @@ export function isGinElementType(elem: Type): boolean {
     typeIsTimestamptz(elem) ||
     typeIsDate(elem)
   );
+}
+
+// Resolve the EXCLUDE access method, element columns, duplicate-column rule, and operator/opclass
+// pairing once for both CREATE TABLE and ALTER TABLE (spec/design/gist.md §7).
+function resolveExclusionDefinition(
+  table: Table,
+  def: ExcludeDef,
+): { columns: number[]; elements: ExclusionElement[] } {
+  if (def.using !== null && def.using.toLowerCase() !== "gist")
+    throw engineError(
+      "undefined_object",
+      `access method ${def.using} does not support exclusion constraints`,
+    );
+  const columns: number[] = [];
+  const elements: ExclusionElement[] = [];
+  for (const el of def.elements) {
+    const column = columnIndex(table, el.column);
+    if (column < 0)
+      throw engineError("undefined_column", `column ${el.column} named in key does not exist`);
+    if (columns.includes(column))
+      throw engineError(
+        "duplicate_column",
+        `column ${el.column} appears twice in exclusion constraint`,
+      );
+    const ty = table.columns[column]!.type;
+    let op: ExclusionOp;
+    if (el.op === "&&") {
+      if (ty.kind !== "range")
+        throw engineError(
+          "undefined_object",
+          `data type ${typeCanonicalName(ty)} has no default operator class for access method gist that accepts operator &&`,
+        );
+      op = "overlaps";
+    } else if (el.op === "=") {
+      if (isGistScalarType(ty)) op = "equal";
+      else if (isGistDeferredScalarType(ty))
+        throw engineError(
+          "feature_not_supported",
+          `an exclusion constraint with = over ${typeCanonicalName(ty)} is not supported yet`,
+        );
+      else
+        throw engineError(
+          "undefined_object",
+          `data type ${typeCanonicalName(ty)} has no default operator class for access method gist`,
+        );
+    } else
+      throw engineError(
+        "feature_not_supported",
+        `exclusion constraint operator ${el.op} is not supported yet`,
+      );
+    columns.push(column);
+    elements.push({ column, op });
+  }
+  return { columns, elements };
 }
 
 // isGistScalarType reports whether the scalar `=` GiST opclass admits this column type (gist.md §6):

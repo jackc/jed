@@ -7,6 +7,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { compareLowerName } from "../src/executor.ts";
 import { Database, EngineError } from "../src/tooling.ts";
 import { type Handle, queryOutcome } from "./util.ts";
 import { memDb } from "./mem_db.ts";
@@ -62,6 +63,18 @@ test("constraint naming matches PostgreSQL", () => {
   // A derived name walks past a CHECK name too (PG-probed: w1_a_key -> w1_a_key1).
   run(db, "CREATE TABLE w1 (a i32, CONSTRAINT w1_a_key CHECK (a > 0), UNIQUE (a))");
   assert.deepEqual(names(db, "w1"), ["w1_a_key1!"]);
+});
+
+// Catalog ordering is lowercased UTF-8 byte order, not host-locale order. ICU commonly places é
+// beside e, while raw UTF-8 places ASCII z before é; persisted bytes and violation precedence use
+// the latter in every core.
+test("ALTER constraint catalog order is locale-independent", () => {
+  const names = [{ name: "😀" }, { name: "é" }, { name: "z" }, { name: "\uE000" }];
+  names.sort(compareLowerName);
+  assert.deepEqual(
+    names.map((x) => x.name),
+    ["z", "é", "\uE000", "😀"],
+  );
 });
 
 // The dedup/fold rules match PostgreSQL (oracle-probed, constraints.md §5.2): identical

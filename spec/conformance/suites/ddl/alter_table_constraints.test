@@ -72,6 +72,7 @@ CREATE TABLE alter_self (id i32 PRIMARY KEY, code i32, parent_code i32)
 statement ok
 INSERT INTO alter_self VALUES (1, 10, NULL), (2, 20, 10)
 
+# cost: 4
 statement ok
 ALTER TABLE alter_self ADD CONSTRAINT alter_self_code_key UNIQUE (code), ADD CONSTRAINT alter_self_parent_fkey FOREIGN KEY (parent_code) REFERENCES alter_self (code)
 
@@ -79,7 +80,7 @@ statement error 23503
 INSERT INTO alter_self VALUES (3, 30, 999)
 
 # EXCLUDE validates every existing pair and builds its backing GiST index.
-# cost: 3
+# cost: 4
 statement ok
 ALTER TABLE alter_parent ADD CONSTRAINT alter_span_excl EXCLUDE USING gist (span WITH &&)
 
@@ -94,6 +95,71 @@ INSERT INTO alter_overlap VALUES (1, '[1,5)'), (2, '[4,8)')
 
 statement error 23P01
 ALTER TABLE alter_overlap ADD CONSTRAINT overlap_excl EXCLUDE USING gist (span WITH &&)
+
+# ALTER reuses CREATE's complete EXCLUDE resolver: unsupported operators do not silently map to =,
+# duplicate columns are rejected, and = still requires a supported scalar GiST opclass.
+statement error 0A000
+ALTER TABLE alter_parent ADD EXCLUDE USING gist (span WITH <>)
+
+statement error 42701
+ALTER TABLE alter_parent ADD EXCLUDE USING gist (span WITH &&, span WITH &&)
+
+statement error 42704
+ALTER TABLE alter_parent ADD EXCLUDE USING gist (span WITH =)
+
+# Explicit referenced FK columns must be distinct before the unique-set check.
+statement error 42701
+ALTER TABLE alter_child ADD FOREIGN KEY (id, parent_code) REFERENCES alter_parent (id, id)
+
+# Every self-FK candidate probe and EXCLUDE row pair is metered, so max_cost bounds the quadratic
+# validation loops and the successful total is deterministic across cores.
+statement ok
+CREATE TABLE alter_self_meter (id i32 PRIMARY KEY, code i32, parent_code i32)
+
+statement ok
+INSERT INTO alter_self_meter VALUES (1, 10, 40), (2, 20, 40), (3, 30, 40), (4, 40, NULL)
+
+# max_cost: 10
+statement error 54P01
+ALTER TABLE alter_self_meter ADD UNIQUE (code), ADD FOREIGN KEY (parent_code) REFERENCES alter_self_meter (code)
+
+# cost: 17
+statement ok
+ALTER TABLE alter_self_meter ADD UNIQUE (code), ADD FOREIGN KEY (parent_code) REFERENCES alter_self_meter (code)
+
+statement ok
+CREATE TABLE alter_exclude_meter (id i32 PRIMARY KEY, span int4range)
+
+statement ok
+INSERT INTO alter_exclude_meter VALUES (1, '[1,2)'), (2, '[2,3)'), (3, '[3,4)'), (4, '[4,5)')
+
+# max_cost: 9
+statement error 54P01
+ALTER TABLE alter_exclude_meter ADD EXCLUDE USING gist (span WITH &&)
+
+# cost: 11
+statement ok
+ALTER TABLE alter_exclude_meter ADD EXCLUDE USING gist (span WITH &&)
+
+# Unnamed UNIQUE/EXCLUDE additions suffix-walk both namespaces within the working action list.
+statement ok
+CREATE TABLE alter_implicit_names (id i32 PRIMARY KEY, v i32, span int4range)
+
+statement ok
+ALTER TABLE alter_implicit_names ADD UNIQUE (v), ADD UNIQUE (v), ADD EXCLUDE (span WITH &&), ADD EXCLUDE (span WITH &&)
+
+statement ok
+ALTER TABLE alter_implicit_names DROP CONSTRAINT alter_implicit_names_v_key1, DROP CONSTRAINT alter_implicit_names_span_excl1
+
+# A dropped backing index releases its relation name for a later action in the same statement.
+statement ok
+CREATE TABLE alter_replace (id i32 PRIMARY KEY, v i32, CONSTRAINT alter_replace_v_key UNIQUE (v))
+
+statement ok
+ALTER TABLE alter_replace DROP CONSTRAINT alter_replace_v_key, ADD CONSTRAINT alter_replace_v_key UNIQUE (v)
+
+statement error 23505
+INSERT INTO alter_replace VALUES (1, 7), (2, 7)
 
 # DROP CHECK removes enforcement; IF EXISTS is an action-local no-op.
 statement ok

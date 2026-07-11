@@ -11,6 +11,7 @@ package jed
 type costSchedule struct {
 	StorageRowRead      int64
 	PageRead            int64
+	ConstraintCheck     int64
 	ValueCompress       int64
 	ValueDecompress     int64
 	DecimalWork         int64
@@ -35,6 +36,7 @@ type costSchedule struct {
 var costs = costSchedule{
 	StorageRowRead:      1,
 	PageRead:            1,
+	ConstraintCheck:     1,
 	ValueCompress:       1,
 	ValueDecompress:     1,
 	DecimalWork:         1,

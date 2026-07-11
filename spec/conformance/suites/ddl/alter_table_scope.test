@@ -3,7 +3,7 @@
 # ALTER TABLE must classify the DDL capability from the resolved qualifier, not only the bare table
 # name. A same-named temp table must never let allow_temp_ddl authorize a persistent attachment edit.
 # attach: work
-# requires: ddl.alter_table, ddl.create_table, ddl.temp_table, ddl.primary_key, attach.in_memory, harness.attach, session.allow_ddl, session.allow_temp_ddl, dml.insert, query.select, query.qualified_table, types.i32
+# requires: ddl.alter_table, ddl.create_table, ddl.temp_table, ddl.primary_key, ddl.foreign_key, ddl.exclusion_constraint, attach.in_memory, harness.attach, session.allow_ddl, session.allow_temp_ddl, dml.insert, query.select, query.qualified_table, types.i32
 
 statement ok
 CREATE TABLE work.scope_target (id i32 PRIMARY KEY, v i32)
@@ -16,6 +16,19 @@ INSERT INTO work.scope_target VALUES (1, 10)
 
 statement ok
 INSERT INTO temp.scope_target VALUES (1, 20)
+
+# CREATE's unsupported-scope boundary also applies to ALTER, before constraint resolution.
+statement error 0A000
+ALTER TABLE temp.scope_target ADD FOREIGN KEY (v) REFERENCES scope_target (id)
+
+statement error 0A000
+ALTER TABLE temp.scope_target ADD EXCLUDE USING gist (v WITH =)
+
+statement error 0A000
+ALTER TABLE work.scope_target ADD FOREIGN KEY (v) REFERENCES scope_target (id)
+
+statement error 0A000
+ALTER TABLE work.scope_target ADD EXCLUDE USING gist (v WITH =)
 
 # The attachment is persistent DDL even though a temp table shares its unqualified name.
 # allow_ddl: off
