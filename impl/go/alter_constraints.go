@@ -54,12 +54,16 @@ func dropAlterColumn(t *catTable, d *alterDropColumn, snap *snapshot, original *
 	for _, ix := range t.Indexes {
 		indexDep = indexDep || indexUses(ix)
 	}
-	fkUses := func(fk foreignKey) bool {
-		return slices.Contains(fk.Columns, ci) || (strings.EqualFold(fk.RefTable, t.Name) && slices.Contains(fk.RefColumns, ci))
+	// PostgreSQL owns an FK through its local (referencing) columns. Dropping one of those
+	// columns removes the whole FK even under RESTRICT. A self-referential FK that uses the
+	// column only on its referenced side is still a dependency, like an FK from another table.
+	fkUsesLocalColumn := func(fk foreignKey) bool { return slices.Contains(fk.Columns, ci) }
+	fkUsesSelfRefColumn := func(fk foreignKey) bool {
+		return strings.EqualFold(fk.RefTable, t.Name) && slices.Contains(fk.RefColumns, ci)
 	}
-	fkDep := false
+	selfRefFkDep := false
 	for _, fk := range t.ForeignKeys {
-		fkDep = fkDep || fkUses(fk)
+		selfRefFkDep = selfRefFkDep || (fkUsesSelfRefColumn(fk) && !fkUsesLocalColumn(fk))
 	}
 	exclusionDep := false
 	for _, ex := range t.Exclusions {
@@ -84,7 +88,7 @@ func dropAlterColumn(t *catTable, d *alterDropColumn, snap *snapshot, original *
 			}
 		}
 	}
-	if !d.Cascade && (checkDep || indexDep || fkDep || exclusionDep || incomingDep) {
+	if !d.Cascade && (checkDep || indexDep || selfRefFkDep || exclusionDep || incomingDep) {
 		return newError(DependentObjectsStillExist, "cannot drop column "+d.Name+" because other objects depend on it")
 	}
 	if d.Cascade && (*sources)[ci].original >= 0 {
@@ -130,15 +134,6 @@ func dropAlterColumn(t *catTable, d *alterDropColumn, snap *snapshot, original *
 			}
 		}
 		t.Indexes = indexes
-		fks := t.ForeignKeys[:0]
-		for _, fk := range t.ForeignKeys {
-			if fkUses(fk) {
-				delete(st.added, strings.ToLower(fk.Name))
-			} else {
-				fks = append(fks, fk)
-			}
-		}
-		t.ForeignKeys = fks
 		exclusions := t.Exclusions[:0]
 		for _, ex := range t.Exclusions {
 			uses := false
@@ -153,6 +148,17 @@ func dropAlterColumn(t *catTable, d *alterDropColumn, snap *snapshot, original *
 		}
 		t.Exclusions = exclusions
 	}
+	// Local-side FKs are internally owned by the dropped column and disappear without CASCADE.
+	// CASCADE additionally removes a self-reference that depends only on the referenced side.
+	fks := t.ForeignKeys[:0]
+	for _, fk := range t.ForeignKeys {
+		if fkUsesLocalColumn(fk) || (d.Cascade && fkUsesSelfRefColumn(fk)) {
+			delete(st.added, strings.ToLower(fk.Name))
+		} else {
+			fks = append(fks, fk)
+		}
+	}
+	t.ForeignKeys = fks
 	t.Columns = slices.Delete(t.Columns, ci, ci+1)
 	*sources = slices.Delete(*sources, ci, ci+1)
 	for i := range t.PK {

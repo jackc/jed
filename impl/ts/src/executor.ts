@@ -4465,11 +4465,16 @@ export class Engine {
                 key.kind === "column" ? key.column === ci : usesExpr(key.expr),
               ) || (index.predicate !== undefined && usesExpr(index.predicate.expr));
             const indexDep = table.indexes.some(indexUses);
-            const fkUses = (fk: ForeignKey) =>
-              fk.columns.includes(ci) ||
-              (fk.refTable.toLowerCase() === table.name.toLowerCase() &&
-                fk.refColumns.includes(ci));
-            const fkDep = table.fks.some(fkUses);
+            // PostgreSQL owns an FK through its local (referencing) columns. Dropping one removes
+            // the whole FK under RESTRICT. A self-FK that uses the column only on the referenced
+            // side remains a dependency.
+            const fkUsesLocalColumn = (fk: ForeignKey) => fk.columns.includes(ci);
+            const fkUsesSelfRefColumn = (fk: ForeignKey) =>
+              fk.refTable.toLowerCase() === table.name.toLowerCase() &&
+              fk.refColumns.includes(ci);
+            const selfRefFkDep = table.fks.some(
+              (fk) => fkUsesSelfRefColumn(fk) && !fkUsesLocalColumn(fk),
+            );
             const exclusionDep = table.exclusions.some((ex) =>
               ex.elements.some((el) => el.column === ci),
             );
@@ -4489,7 +4494,7 @@ export class Engine {
               );
             if (
               !action.cascade &&
-              (checkDep || indexDep || fkDep || exclusionDep || incomingDep)
+              (checkDep || indexDep || selfRefFkDep || exclusionDep || incomingDep)
             )
               throw engineError(
                 "dependent_objects_still_exist",
@@ -4517,17 +4522,20 @@ export class Engine {
                 if (!keep) added.delete(index.name.toLowerCase());
                 return keep;
               });
-              table.fks = table.fks.filter((fk) => {
-                const keep = !fkUses(fk);
-                if (!keep) added.delete(fk.name.toLowerCase());
-                return keep;
-              });
               table.exclusions = table.exclusions.filter((ex) => {
                 const keep = !ex.elements.some((el) => el.column === ci);
                 if (!keep) added.delete(ex.name.toLowerCase());
                 return keep;
               });
             }
+            // A local-side FK is internally owned by the dropped column and disappears without
+            // CASCADE. CASCADE also removes referenced-side-only self-FKs.
+            table.fks = table.fks.filter((fk) => {
+              const keep =
+                !fkUsesLocalColumn(fk) && !(action.cascade && fkUsesSelfRefColumn(fk));
+              if (!keep) added.delete(fk.name.toLowerCase());
+              return keep;
+            });
             table.columns.splice(ci, 1);
             columnSources.splice(ci, 1);
             typeChangedColumns.splice(ci, 1);

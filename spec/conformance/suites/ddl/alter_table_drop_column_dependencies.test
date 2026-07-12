@@ -1,5 +1,5 @@
-# DROP COLUMN dependency behavior that is deliberately stricter than PostgreSQL for same-table
-# objects (alter.md §3.2/§7): RESTRICT blocks local indexes/constraints; CASCADE removes them.
+# DROP COLUMN dependency behavior that remains deliberately stricter than PostgreSQL for same-table
+# CHECK/index/EXCLUDE objects (alter.md §3.2/§7): RESTRICT blocks them; CASCADE removes them.
 # jed-specific; do not PostgreSQL-oracle-check.
 # requires: ddl.alter_table, ddl.create_table, ddl.primary_key, ddl.column_default, ddl.check, ddl.unique, ddl.foreign_key, ddl.secondary_index, ddl.index_expr, ddl.index_partial, ddl.exclusion_constraint, dml.insert, query.select, query.order_by, introspect.columns, types.i32, types.range, expr.arithmetic
 
@@ -61,16 +61,6 @@ INSERT INTO alter_drop_fk_child VALUES (2, 999, 20)
 
 statement error 23503
 INSERT INTO alter_drop_fk_child VALUES (3, 999, 999)
-
-# A local FK that uses the dropped referencing column follows the same explicit dependency rule.
-statement ok
-CREATE TABLE alter_drop_local_fk (id i32 PRIMARY KEY, parent_id i32 REFERENCES alter_drop_fk_parent (keep))
-
-statement error 2BP01
-ALTER TABLE alter_drop_local_fk DROP parent_id
-
-statement ok
-ALTER TABLE alter_drop_local_fk DROP parent_id CASCADE
 
 # Dependency state is left-to-right: the first CASCADE removes a composite incoming FK, so a later
 # RESTRICT action in the same statement does not rediscover that already-dropped dependent.

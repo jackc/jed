@@ -1803,11 +1803,20 @@ impl Engine {
                                 IndexKey::Expr(e) => expr_uses(&e.expr),
                             }) || ix.predicate.as_ref().is_some_and(|p| expr_uses(&p.expr))
                         });
-                        let fk_dep = table.foreign_keys.iter().any(|fk| {
-                            fk.columns.contains(&ci)
-                                || (fk.ref_table.eq_ignore_ascii_case(&table.name)
-                                    && fk.ref_columns.contains(&ci))
-                        });
+                        // PostgreSQL owns an FK through its local (referencing) columns. Dropping
+                        // one removes the whole FK under RESTRICT. A self-FK that uses the column
+                        // only on the referenced side remains a dependency.
+                        let table_name = table.name.clone();
+                        let fk_uses_local_column =
+                            |fk: &ForeignKeyConstraint| fk.columns.contains(&ci);
+                        let fk_uses_self_ref_column = |fk: &ForeignKeyConstraint| {
+                            fk.ref_table.eq_ignore_ascii_case(&table_name)
+                                && fk.ref_columns.contains(&ci)
+                        };
+                        let self_ref_fk_dep = table
+                            .foreign_keys
+                            .iter()
+                            .any(|fk| fk_uses_self_ref_column(fk) && !fk_uses_local_column(fk));
                         let exclusion_dep = table
                             .exclusions
                             .iter()
@@ -1830,7 +1839,11 @@ impl Engine {
                             ColumnSource::Added => false,
                         };
                         if !cascade
-                            && (check_dep || index_dep || fk_dep || exclusion_dep || incoming_dep)
+                            && (check_dep
+                                || index_dep
+                                || self_ref_fk_dep
+                                || exclusion_dep
+                                || incoming_dep)
                         {
                             return Err(EngineError::new(
                                 SqlState::DependentObjectsStillExist,
@@ -1881,15 +1894,6 @@ impl Engine {
                                 }
                                 !uses
                             });
-                            table.foreign_keys.retain(|fk| {
-                                let uses = fk.columns.contains(&ci)
-                                    || (fk.ref_table.eq_ignore_ascii_case(&table.name)
-                                        && fk.ref_columns.contains(&ci));
-                                if uses {
-                                    removed.push(fk.name.to_ascii_lowercase());
-                                }
-                                !uses
-                            });
                             table.exclusions.retain(|e| {
                                 let uses = e.elements.iter().any(|x| x.column == ci);
                                 if uses {
@@ -1900,6 +1904,20 @@ impl Engine {
                             for name in removed {
                                 added_constraints.remove(&name);
                             }
+                        }
+                        // A local-side FK is internally owned by the dropped column and disappears
+                        // without CASCADE. CASCADE also removes referenced-side-only self-FKs.
+                        let mut removed_fks = Vec::<String>::new();
+                        table.foreign_keys.retain(|fk| {
+                            let remove = fk_uses_local_column(fk)
+                                || (cascade && fk_uses_self_ref_column(fk));
+                            if remove {
+                                removed_fks.push(fk.name.to_ascii_lowercase());
+                            }
+                            !remove
+                        });
+                        for name in removed_fks {
+                            added_constraints.remove(&name);
                         }
                         table.columns.remove(ci);
                         column_sources.remove(ci);

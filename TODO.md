@@ -140,7 +140,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [x] _slice 3:_ `ADD COLUMN [constraints]` — the first rewrite; per-row `DEFAULT` evaluation through
     the entropy/clock seam (alter.md §3.1). _(size: L)_
   - [x] _slice 4:_ `DROP COLUMN` — the ordinal renumber + `RESTRICT`/`CASCADE` dependency handling
-    (non-PK columns); ledgered PG divergence: jed physically removes, no `attisdropped` tombstone
+    (non-PK columns), including PG-matched automatic removal of an FK owned by a dropped local column;
+    ledgered PG divergence: jed physically removes, no `attisdropped` tombstone
     (alter.md §3.2). _(size: L)_
   - [x] _slice 5:_ `ALTER COLUMN … TYPE … [USING]` + `ADD`/`DROP PRIMARY KEY` — the re-encode/re-key
     rewrites (the PK forms reuse the existing UPDATE-of-PK re-keying path — alter.md §3.3/§3.4). _(size: L)_
