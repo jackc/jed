@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { Checksum, Prng } from "../src/lib.ts";
+import { Checksum, Prng, writeTable } from "../src/lib.ts";
 
 test("splitmix64 pinned vectors", () => {
   const cases: [bigint, bigint[]][] = [
@@ -51,4 +51,10 @@ test("text draw stays in contract", () => {
   const s = p.text(8n, 32n);
   assert.ok(s.length >= 8 && s.length <= 32);
   assert.match(s, /^[a-z]+$/);
+});
+
+test("write target extraction covers INSERT, UPDATE, and DELETE", () => {
+  assert.equal(writeTable("INSERT INTO orders VALUES ($1)"), "orders");
+  assert.equal(writeTable("UPDATE orders SET v = $1"), "orders");
+  assert.equal(writeTable("DELETE FROM orders WHERE id=$1"), "orders");
 });

@@ -192,6 +192,7 @@ var SupportedCapabilities = []string{
 	"query.comparison_order",
 	"query.point_lookup",
 	"query.or_in_point_lookup",
+	"query.index_mutation",
 	"query.limit_short_circuit",
 	"query.order_by_pk_scan",
 	"query.order_by_index_scan",
@@ -243,8 +244,7 @@ var SupportedCapabilities = []string{
 	// a GIN-indexed array column (spec/design/gin.md §6); same rows as the full scan.
 	"query.gin_array_eq",
 	// GIN-bounded UPDATE/DELETE — a mutation whose WHERE has a GIN-accelerable conjunct bounds its
-	// target-row scan through the GIN index (PK-then-GIN-then-full), same end state as the full
-	// scan (spec/design/gin.md §6); the ordered-index bound stays SELECT-only.
+	// target-row scan through the GIN index, same end state as the full scan (spec/design/gin.md §6).
 	"query.gin_mutation",
 	// GIN over non-integer fixed-width key-encodable element types (uuid/date/timestamp/
 	// timestamptz/boolean) — the gate lift + the shared key-value term encoder (gin.md §3/§4).

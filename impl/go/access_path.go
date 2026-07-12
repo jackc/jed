@@ -371,10 +371,9 @@ func (db *engine) buildIndexAccessPredicate(filter *rExpr, rel scopeRel, idx ind
 }
 
 // scanBoundPolicy is the consumer-specific eligibility/precedence part of access-path selection.
-// SELECT and mutation scans share one inventory below but deliberately do not enable the same
-// candidates yet: ordered B-tree/index-set mutation scans are Phase 1 follow-ons, and the already
-// shipped mutation contract tries GIN before GiST while SELECT tries GiST before GIN. Keeping those
-// differences as data here prevents EXPLAIN and execution from growing separate detector ladders.
+// SELECT and mutation scans share one inventory below. Their candidate sets now differ only in the
+// established GiST/GIN precedence: mutations try GIN before GiST while SELECT tries GiST before GIN.
+// Keeping that difference as data here prevents EXPLAIN and execution from growing separate ladders.
 type scanBoundPolicy struct {
 	orderedIndex  bool
 	indexSet      bool
@@ -383,7 +382,7 @@ type scanBoundPolicy struct {
 
 var (
 	selectScanBoundPolicy   = scanBoundPolicy{orderedIndex: true, indexSet: true, gistBeforeGin: true}
-	mutationScanBoundPolicy = scanBoundPolicy{}
+	mutationScanBoundPolicy = scanBoundPolicy{orderedIndex: true, indexSet: true}
 )
 
 // detectScanBound picks one SELECT relation's scan bound (cost.md §3; indexes.md §5). It is the
@@ -1280,7 +1279,22 @@ func (db *engine) executeMutationScan(plan mutationScanPlan, tableName string, p
 	}
 	if b.indexSet != nil {
 		entries, pages, slabs, err := db.indexKeySetEntries(tableName, b.indexSet, params, nil, mask, nil)
-		return mutationScanBatch{entries: entries, pages: pages, slabs: slabs}, err
+		if err != nil {
+			return mutationScanBatch{}, err
+		}
+		// Retain first-probe order while guaranteeing that phase 2 can never receive the same row
+		// twice if a future index-key generalization makes point-probe result sets overlap.
+		seen := make(map[string]struct{}, len(entries))
+		out := entries[:0]
+		for _, e := range entries {
+			key := string(e.Key)
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			out = append(out, e)
+		}
+		return mutationScanBatch{entries: out, pages: pages, slabs: slabs}, nil
 	}
 	entries, pages, slabs, err := store.ScanWithUnits(mask)
 	return mutationScanBatch{entries: entries, pages: pages, slabs: slabs}, err

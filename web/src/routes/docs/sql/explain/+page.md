@@ -77,6 +77,8 @@ jed range-scans the index leaves instead of the whole table:
 On a **composite** index over `(a, b, …)` the bound extends to a **multi-column prefix**: an equality
 on the leading columns, optionally followed by a range on the next (`a = 1 AND b > 3`). The `WHERE`
 always stays the residual filter, so the rows are identical to a full scan — only the work drops.
+The same `Index bound` detail appears below an `Update` or `Delete` root when a write's target scan
+uses that index; an indexed `IN` list appears as `Index point set`.
 
 ## An OR / IN-list of keys
 

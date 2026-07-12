@@ -150,11 +150,10 @@ extensions: it makes later eligibility changes one policy edit while preserving 
 
 - **SELECT** admits PK, ordered B-tree, GiST, GIN, PK point-set, and ordered-index point-set
   candidates in the §5 order.
-- **UPDATE/DELETE** currently admit PK, GIN, GiST, and PK point-set only. Their established
-  GIN-before-GiST order is preserved (unlike SELECT's GiST-before-GIN order); ordered B-tree and
-  ordered-index point-set candidates are present in the inventory but policy-disabled until the
-  indexed-mutation slice. A host-attached target policy-disables every bound and full-scans through
-  its scoped store, unchanged.
+- **UPDATE/DELETE** admit PK, ordered B-tree, GIN, GiST, PK point-set, and ordered-index point-set.
+  Their established GIN-before-GiST order is preserved (unlike SELECT's GiST-before-GIN order), and
+  point sets remain the last resort after every contiguous/opclass bound. A host-attached target
+  policy-disables every bound and full-scans through its scoped store, unchanged.
 - **DML EXPLAIN** renders the same typed mutation physical plan execution consumes. It does not run
   a parallel detector.
 
@@ -192,6 +191,6 @@ contiguous-PK scan may realize the same contract as a pull source rather than an
   precedence and the FROM-order join tree *inside* stage 3, once the estimator + table
   statistics exist; re-pins the affected `# cost:` entries and forces the class-P decision
   (§6).
-- **New physical rules** (index scans for UPDATE/DELETE, LIMIT + index-bound streaming,
-  composite-PK prefix pushdown, hash join, top-k heap — each tracked in TODO.md) land as
+- **New physical rules** (LIMIT + index-bound streaming, composite-PK prefix pushdown, hash join,
+  top-k heap — each tracked in TODO.md) land as
   discrete rule functions in the §4 inventory, each with its NoREC relation.

@@ -192,7 +192,7 @@ func TestOrInPointSetExplain(t *testing.T) {
 		{"EXPLAIN SELECT a FROM t WHERE id IN (3, 1)", "PK point set: id in (3, 1)"},
 		{"EXPLAIN SELECT a FROM t WHERE id = 1 OR id = 2", "PK point set: id in (1, 2)"},
 		{"EXPLAIN SELECT id FROM s WHERE x IN (10, 20)", "Index point set: using sx"},
-		// DML lowers the PK point set too (a secondary-index point set for DML is a follow-on).
+		// DML lowers the PK point set too; secondary-index mutation point sets are covered by corpus.
 		{"EXPLAIN DELETE FROM t WHERE id IN (1, 3)", "PK point set: id in (1, 3)"},
 		{"EXPLAIN UPDATE t SET a = 0 WHERE id = 2 OR id = 3", "PK point set: id in (2, 3)"},
 	}

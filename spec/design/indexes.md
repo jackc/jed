@@ -297,11 +297,12 @@ WHERE stays the **residual filter**, re-applied to every fetched row: the bound 
 narrows which rows are scanned, so the result is always correct even where the bound is a
 superset.
 
-**Narrowings this slice** (documented, relaxable, each a follow-on optimization slice
-with its own NoREC obligation — conformance.md §8): `UPDATE` / `DELETE` scans keep their
-PK pushdown but do **not** use indexes, and the **LIMIT streaming short-circuit does not
-combine** with an index bound (an index-bounded scan with LIMIT takes the eager path —
-its cost reads the full admitted set).
+An `UPDATE` / `DELETE` target scan uses the same eligible access predicate as SELECT. It gathers
+every admitted `(storage key, old row)` from the pre-mutation index state, rechecks the complete
+WHERE, finishes validation for the whole batch, and only then changes table/index storage. Thus an
+indexed-column update, a PK-rekeying update, and a partial/expression-index bound cannot perturb the
+candidate walk in progress. The **LIMIT streaming short-circuit does not combine** with an index
+bound (an index-bounded scan with LIMIT takes the eager path — its cost reads the full admitted set).
 
 An index is **eligible for the bound only when every key element from the range element
 onward** — i.e. all elements **after the equality prefix** — has a **fixed-width scalar**
@@ -390,7 +391,7 @@ The catalog reshape (v5) + the unique flag (v6)
   (`amt > 50 ⟹ amt > 0`). A jed miss is a correct full scan. A partial-index predicate
   that references a `timestamptz` column/value is conservatively `42P17` (the expression-key
   hazard); and a partial index is used only via the access-predicate bound (no full
-  partial-index scan, and no partial OR/IN / ORDER-BY-skip / UPDATE-DELETE index path this slice).
+  partial-index scan, and no partial OR/IN / ORDER-BY-skip / INL path this slice).
 - PG's index machinery (btree opclasses, `USING`, collations, opfamilies) is owned
   surface jed does not implement — we own our surface (CLAUDE.md §1).
 - Error **messages** differ in jed's house style (no identifier quoting); codes match.
@@ -517,9 +518,9 @@ structurally equal to the index's predicate** (the §5.1 `rexpr_eq_shifted` stru
 access predicate, gated by the present `status = 'active'` conjunct); `SELECT … WHERE amt = 100`
 (no predicate conjunct) takes the full scan. The full WHERE — including the predicate conjunct —
 stays the residual filter (harmless: it is TRUE for every indexed row). Partial indexes are used
-**only** through the ordinary access-predicate bound: the OR/IN merged-point-lookup, the
-ORDER-BY-skip-sort walk, and the index-nested-loop / UPDATE/DELETE index paths all keep
-non-partial indexes only this slice (each a documented follow-on).
+**only** through the ordinary access-predicate bound, including UPDATE/DELETE when the mutation
+WHERE contains the predicate conjunct. The OR/IN merged-point-lookup, ORDER-BY-skip-sort walk, and
+index-nested-loop paths keep non-partial indexes only this slice (each a documented follow-on).
 
 **Divergences from PostgreSQL** (§7): (a) the implication test is **syntactic** — jed uses a
 partial index only when the WHERE literally contains the predicate conjunct, where PG's prover

@@ -106,6 +106,13 @@ is the same set you'd get without it:
 
 <LiveSql seed={orderedSeed} query={orderedQuery} rows={6} />
 
+The same ordered bound narrows an **`UPDATE` or `DELETE` target scan**. Equality, range, composite
+prefix, expression-index, and eligible partial-index predicates gather every matching old row and
+its storage key before jed begins the two-phase write, so changing the indexed column or even the
+primary key cannot disturb the scan. An `IN` list on an indexed leading column uses a de-duplicated
+set of index point probes. The complete `WHERE` is still rechecked for every candidate; only the
+work changes, never which rows are updated or deleted.
+
 ## Expression indexes
 
 A key element can be an **expression** over the table's columns instead of a bare column — a bare

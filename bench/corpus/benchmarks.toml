@@ -36,6 +36,60 @@ gen = "int_uniform"
 min = 1
 max = 100000
 
+# Ordered-B-tree-bounded UPDATE (spec/design/indexes.md §5.1; query.index_mutation): each iteration
+# gathers the ~10 rows for one customer through orders_customer_idx, rewrites them, then rolls back
+# so every iteration sees the same million-row dataset. Before the mutation-bound slice jed
+# full-scanned all 1M rows for this predicate.
+[[bench]]
+name = "secondary_update"
+description = "Secondary-index-bounded UPDATE on 1M rows (~10 rows per customer), rolled back each iteration"
+dataset = "large"
+kind = "write_rollback"
+sql = "UPDATE orders SET amount = amount + 1 WHERE customer_id = $1"
+warmup = 100
+iterations = 1000
+seed = 4251
+batch = 1
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 100000
+
+# Secondary-index point-set DELETE (query.index_mutation + query.or_in_point_lookup): four distinct
+# customer ids become four index probes, their keyed rows are removed in phase 2, and the transaction
+# rolls back. This continuously covers the second Phase-1 access path at realistic tree depth.
+[[bench]]
+name = "secondary_pointset_delete"
+description = "Secondary-index IN-list DELETE on 1M rows (four point probes), rolled back each iteration"
+dataset = "large"
+kind = "write_rollback"
+sql = "DELETE FROM orders WHERE customer_id IN ($1, $2, $3, $4)"
+warmup = 100
+iterations = 1000
+seed = 4252
+batch = 1
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 100000
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 100000
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 100000
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 100000
+
 # Expression-index equality lookup (spec/design/indexes.md §5, query.index_expr): a case-insensitive
 # text lookup `WHERE lower(note) = $1` seeks the orders_note_lower_idx expression index instead of
 # full-scanning the 1M-row table + evaluating lower(note) per row. The `text` param is drawn from the

@@ -383,8 +383,10 @@ capability.
   the result is unchanged.
 - **Last resort.** The merged point-set is chosen **only** where no contiguous PK / index / GIN /
   GiST bound already applies, so it never displaces an existing plan and no already-bounded cost
-  moves. For an **UPDATE / DELETE** it lowers only on the **primary key** (a secondary-index point-set
-  for DML is the separate index-scans-for-DML follow-on).
+  moves. UPDATE/DELETE admit both PK and secondary-index point sets through the same final fallback.
+  Mutation execution retains each fetched storage key and defensively de-duplicates candidates in
+  first-probe order before residual evaluation, so one row can never be rewritten twice even if a
+  future index generalization makes probe result sets overlap.
 - **The cost is the SUM of the per-probe bounded scans.** Each distinct key is one point probe, and
   the probes' `page_read` (each probe's root→leaf path — for a secondary index, the index-tree path
   **plus** each admitted row's PK point lookup) and `storage_row_read` (the rows each probe admits)
@@ -410,8 +412,9 @@ pins these costs cross-core.
 
 A **secondary index** ([indexes.md](indexes.md)) gives a second bound kind at the same
 per-relation pushdown seam. For each base relation of a **SELECT** scan (single-table, a JOIN
-base table, or a correlated subquery's inner table), the plan picks the **single-column PK
-bound first** (it is the row's own key — no second tree, range-capable, strictly cheaper);
+base table, or a correlated subquery's inner table), and for an **UPDATE/DELETE target**, the plan
+picks the **single-column PK bound first** (it is the row's own key — no second tree, range-capable,
+strictly cheaper);
 else, among the relation's B-tree indexes, the **lowest lowercased name** one that yields a
 non-empty **access predicate** — a maximal **equality prefix** on the leading key columns
 plus an **optional range** on the next column (indexes.md §5.1; the same const-source rule as
@@ -438,10 +441,12 @@ The index-bounded scan accrues, in place of the full-scan block:
   contradictory equalities (`a = 1 AND a = 2`), a range against NULL, a contradictory range
   (`a > 5 AND a < 5`), or an out-of-range integer admit no entry — no page, no row.
 
-Deterministic and byte-identical across cores: the index tree shape, the entry-key encoding,
-and the overlap rule are all §8 contracts. **Narrowings this slice** (indexes.md §5): SELECT
-scans only (UPDATE/DELETE keep their PK pushdown), the range column and every trailing column
-**fixed-width** (indexes.md §5.1 — an equality-prefix column may be variable-width), and
+For UPDATE/DELETE this scan block replaces the full-scan block exactly: the bare mutation omits
+SELECT's final `row_produced`, while RETURNING adds its ordinary projection/production units;
+phase-2 row and index writes stay unmetered. Deterministic and byte-identical across cores: the
+index tree shape, the entry-key encoding, and the overlap rule are all §8 contracts. **Narrowings
+this slice** (indexes.md §5): the range column and every trailing column are **fixed-width**
+(indexes.md §5.1 — an equality-prefix column may be variable-width), and
 **no LIMIT-streaming combination** — an index-bounded scan with a LIMIT takes the eager path
 (reads the full admitted set; the short-circuit below stays PK/full-scan-only).
 
@@ -488,8 +493,8 @@ array `=` whose `Q` has no non-NULL element (`col = '{}'` / `col = ARRAY[NULL,�
 byte-identical across cores: the term extraction, the term encoding, the entry-tree shape, and the
 overlap rule are all §8 contracts (gin.md §8). **Narrowings this slice** (gin.md §6): constant query
 operand only, `@>`/`&&`/`= ANY`/`=` only, and no LIMIT-streaming combination. A **GIN-bounded
-`UPDATE`/`DELETE`** accrues this same scan block in place of its full-scan block (its target-row scan
-uses the **PK then GIN** bound — not the ordered-index bound, which stays SELECT-only); so a
+`UPDATE`/`DELETE`** accrues this same scan block in place of its full-scan block (after PK and any
+ordered B-tree bound, mutation precedence tries GIN before GiST); so a
 `DELETE … WHERE col @> Q` costs the matching `SELECT`'s scan minus the `row_produced` a bare mutation
 omits (a `RETURNING` clause restores it plus its projection units), and the phase-2 rewrite/remove +
 index maintenance are unmetered writes ("What is NOT metered" below).

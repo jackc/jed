@@ -222,9 +222,9 @@ constant** (`Q` a literal/`$N`-param array, `c` a literal/`$N`-param scalar — 
 correlated/array-column operand is a follow-on), the plan bounds the scan through the GIN
 index. **`UPDATE`/`DELETE` apply the identical bound to their target-row scan** (the gather +
 residual filter that finds the rows to rewrite/remove), so the same conjunct that bounds a
-`SELECT` bounds the mutation — only the precedence differs: a mutation prefers its own
-**PK bound** first, then the **GIN** bound, then a full scan (the *ordered-index* equality bound
-stays SELECT-only — a separate follow-on, §10). The bound is over the **pre-mutation** index
+`SELECT` bounds the mutation — only the GiST/GIN precedence differs: after PK and ordered B-tree,
+a mutation tries **GIN before GiST**, then the point-set fallbacks. The bound is over the
+**pre-mutation** index
 state (the `WHERE` evaluates against the old row), so the candidate set is exactly the rows the
 full scan would have matched; phase 2 then rewrites/removes them and maintains every index
 (the GIN entries among them) as before — the result and end state are identical to the full
@@ -270,8 +270,7 @@ PK/ordered/full choice stands.
 **Narrowings this slice** (documented, relaxable, each a follow-on with its own NoREC
 obligation — [conformance.md §8](conformance.md)): a **constant** query operand only (no
 correlated / array-column operand); **`@>`, `&&`, `= ANY`, and array `=` only** (no `<@` or
-`IN` over a scalar list); a mutation uses the **PK then GIN** bound but **not** the
-ordered-index equality bound (SELECT-only, a separate follow-on); and **no LIMIT-streaming
+`IN` over a scalar list); and **no LIMIT-streaming
 combination** — a GIN-bounded scan with a `LIMIT` takes the eager path, like the ordered-index
 bound (mutations have no `LIMIT`).
 
@@ -391,8 +390,8 @@ vertical slice with a NoREC obligation ([conformance.md §8](conformance.md)):
 - **More operators** — `<@` (contained-by, a broad scan + recheck), `IN` membership over a
   scalar list. (`const = ANY(col)` membership and array `=` have landed — §1/§6.)
 - **Multi-column GIN**, correlated / array-column query operands, and the LIMIT-streaming
-  combination. (GIN bounds for `UPDATE`/`DELETE` scans have landed — §6; the **ordered-index**
-  equality bound for mutations, still SELECT-only, is the remaining mutation-pushdown follow-on.)
+  combination. (GIN and ordered-index bounds for `UPDATE`/`DELETE` scans have landed — §6 and
+  [indexes.md §5.1](indexes.md).)
 - **Posting-list run compression** — a long contiguous run of one term's entries
   (a term present in very many rows) is stored as the raw entry sequence this slice; PG's
   posting-tree TID compression is a later storage optimization, byte-contract-pinned when it lands.

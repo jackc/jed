@@ -584,7 +584,7 @@ fn run_one(
 
     // Write kinds: the checksum is the post-run sanity count(*) (benchmarks.md §6).
     if b.kind != "query" {
-        let table = insert_table(&b.sql);
+        let table = write_table(&b.sql);
         let n = eng.query_int(&format!("SELECT count(*) FROM {table}"))?;
         let expect = match b.kind.as_str() {
             "write_rollback" => dataset_table_rows(corpus_dir, &b.dataset, &table)?,
@@ -686,18 +686,20 @@ fn run_concurrent(
     }))
 }
 
-// The target table of a write statement — the word after INTO (INSERT INTO <table>) or
-// FROM (DELETE FROM <table>) — for the post-run count.
-fn insert_table(sql: &str) -> String {
+// The target table of a write statement — the word after INTO (INSERT), UPDATE, or FROM (DELETE) —
+// for the post-run count.
+fn write_table(sql: &str) -> String {
     let fields: Vec<&str> = sql.split_whitespace().collect();
     for (i, f) in fields.iter().enumerate() {
-        if (f.eq_ignore_ascii_case("INTO") || f.eq_ignore_ascii_case("FROM"))
+        if (f.eq_ignore_ascii_case("INTO")
+            || f.eq_ignore_ascii_case("UPDATE")
+            || f.eq_ignore_ascii_case("FROM"))
             && i + 1 < fields.len()
         {
             return fields[i + 1].split('(').next().unwrap().to_string();
         }
     }
-    panic!("write bench SQL has no INSERT INTO / DELETE FROM table: {sql}");
+    panic!("write bench SQL has no INSERT / UPDATE / DELETE target table: {sql}");
 }
 
 /// Uniform binary entrypoint: bench-<engine> <corpus_dir> <data_dir> <out_path> [filter].
@@ -777,5 +779,12 @@ mod tests {
         c.int(-7);
         c.end_row();
         assert_eq!(c.hex(), "dd6e60407d30d28b");
+    }
+
+    #[test]
+    fn write_table_targets() {
+        assert_eq!(write_table("INSERT INTO orders VALUES ($1)"), "orders");
+        assert_eq!(write_table("UPDATE orders SET v = $1"), "orders");
+        assert_eq!(write_table("DELETE FROM orders WHERE id=$1"), "orders");
     }
 }

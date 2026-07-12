@@ -395,7 +395,8 @@ The artifact is an optimized release build (`opt-level=3`, full LTO, stripped); 
 
 Two write kinds:
 
-- **`write_rollback`** — per iteration: open a transaction, run `batch` bound inserts,
+- **`write_rollback`** — per iteration: open a transaction, run `batch` bound writes
+  (`INSERT`, `UPDATE`, or `DELETE`),
   roll back (jed `begin(writable)` … `rollback()`; PG/SQLite `BEGIN` … `ROLLBACK`).
   Measures executor/binding throughput without growing the database. The post-run sanity
   `count(*)` must equal the dataset's committed row count.

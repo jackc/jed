@@ -2,9 +2,9 @@
 # EXPLAIN of a DELETE deletes nothing, an EXPLAIN of an INSERT inserts nothing. The DML root is
 # Insert / Update / Delete; INSERT … VALUES has a Values child, INSERT … SELECT renders its source
 # subplan, and UPDATE/DELETE render the residual Filter + the target Scan. The scan access path is
-# chosen by the same detectors the executor uses (PK bound, then GIN/GiST — never a secondary B-tree
-# index for a mutation), so the reported path matches what the statement would run.
-# requires: ddl.create_table, ddl.primary_key, ddl.gin_index, ddl.gist_index, dml.insert, dml.insert_select, dml.insert_multi_row, dml.insert_on_conflict, dml.update, dml.delete, query.select, query.where_eq, query.point_lookup, query.gin_scan, query.gist_scan, query.explain, dml.explain, types.i32, types.text, types.array, types.range, func.array_containment, func.range_constructors, func.range_operators
+# chosen by the same policy-driven inventory the executor uses (PK, ordered B-tree, GIN/GiST, point
+# set), so the reported path matches what the statement would run.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.index_partial, ddl.gin_index, ddl.gist_index, dml.insert, dml.insert_select, dml.insert_multi_row, dml.insert_on_conflict, dml.update, dml.delete, query.select, query.where_eq, query.comparison_order, query.point_lookup, query.index_range, query.index_partial, query.or_in_point_lookup, query.index_mutation, query.gin_scan, query.gist_scan, query.explain, dml.explain, expr.arithmetic, expr.in_list, types.i32, types.text, types.array, types.range, func.array_containment, func.range_constructors, func.range_operators
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, v i32, s text)
@@ -111,7 +111,10 @@ Full scan
 # established consumer-specific precedence. With both predicates/index kinds usable, SELECT chooses
 # GiST before GIN, while UPDATE/DELETE choose GIN before GiST. This is plan-only and executes nothing.
 statement ok
-CREATE TABLE access_policy (id i32 PRIMARY KEY, tags i32[], span i32range)
+CREATE TABLE access_policy (id i32 PRIMARY KEY, score i32, tags i32[], span i32range)
+
+statement ok
+CREATE INDEX access_policy_score_idx ON access_policy (score)
 
 statement ok
 CREATE INDEX access_policy_tags_gin ON access_policy USING gin (tags)
@@ -142,6 +145,20 @@ conjuncts=2
 Scan access_policy
 GIN bound: using access_policy_tags_gin
 
+# Once an ordered B-tree predicate is present it precedes both opclass bounds for mutations.
+query ITT nosort
+EXPLAIN UPDATE access_policy SET score = score WHERE score = 7 AND tags @> ARRAY[1] AND span && i32range(1, 3)
+----
+0
+Update access_policy
+sets=1
+1
+Filter
+conjuncts=3
+2
+Scan access_policy
+Index bound: using access_policy_score_idx
+
 query ITT nosort
 EXPLAIN DELETE FROM access_policy WHERE tags @> ARRAY[1] AND span && i32range(1, 3)
 ----
@@ -154,6 +171,99 @@ conjuncts=2
 2
 Scan access_policy
 GIN bound: using access_policy_tags_gin
+
+# Ordered B-tree mutation bounds and their last-resort secondary-index point set share the same DML
+# plan rendered by EXPLAIN. A non-matching expression spelling retains the full-scan fallback.
+statement ok
+CREATE TABLE dml_index_plan (id i32 PRIMARY KEY, v i32, w i32)
+
+statement ok
+CREATE INDEX dml_index_plan_v_idx ON dml_index_plan (v)
+
+query ITT nosort
+EXPLAIN UPDATE dml_index_plan SET w = 1 WHERE v = 10
+----
+0
+Update dml_index_plan
+sets=1
+1
+Filter
+conjuncts=1
+2
+Scan dml_index_plan
+Index bound: using dml_index_plan_v_idx
+
+query ITT nosort
+EXPLAIN DELETE FROM dml_index_plan WHERE v >= 30
+----
+0
+Delete dml_index_plan
+-
+1
+Filter
+conjuncts=1
+2
+Scan dml_index_plan
+Index bound: using dml_index_plan_v_idx
+
+query ITT nosort
+EXPLAIN UPDATE dml_index_plan SET w = 2 WHERE v IN (10, 30)
+----
+0
+Update dml_index_plan
+sets=1
+1
+Filter
+conjuncts=1
+2
+Scan dml_index_plan
+Index point set: using dml_index_plan_v_idx
+
+query ITT nosort
+EXPLAIN DELETE FROM dml_index_plan WHERE v + 0 = 10
+----
+0
+Delete dml_index_plan
+-
+1
+Filter
+conjuncts=1
+2
+Scan dml_index_plan
+Full scan
+
+statement ok
+CREATE TABLE dml_partial_plan (id i32 PRIMARY KEY, v i32, active i32)
+
+statement ok
+CREATE INDEX dml_partial_plan_v_idx ON dml_partial_plan (v) WHERE active = 1
+
+query ITT nosort
+EXPLAIN DELETE FROM dml_partial_plan WHERE active = 1 AND v = 10
+----
+0
+Delete dml_partial_plan
+-
+1
+Filter
+conjuncts=2
+2
+Scan dml_partial_plan
+Index bound: using dml_partial_plan_v_idx
+
+# Without the implication conjunct, using the partial index would be unsound; it must full-scan.
+query ITT nosort
+EXPLAIN DELETE FROM dml_partial_plan WHERE v = 10
+----
+0
+Delete dml_partial_plan
+-
+1
+Filter
+conjuncts=1
+2
+Scan dml_partial_plan
+Full scan
 
 # The no-mutation proof: after all the EXPLAINs above, t still has exactly its two original rows.
 query I nosort

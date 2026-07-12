@@ -6624,7 +6624,16 @@ export class Engine {
       }
       case "indexSet": {
         const r = this.indexKeySetEntries(tableName, b.indexSet, params, [], mask, []);
-        return { ...r, empty: false };
+        // Retain first-probe order while guaranteeing that phase 2 can never receive the same row
+        // twice if a future index-key generalization makes point-probe result sets overlap.
+        const seen = new Set<string>();
+        const entries = r.entries.filter((entry) => {
+          const key = entry.key.join(",");
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        });
+        return { ...r, entries, empty: false };
       }
     }
   }
@@ -13564,9 +13573,8 @@ export function buildIndexAccessPredicate(
 }
 
 // ScanBoundPolicy is the consumer-specific eligibility/precedence part of access-path selection.
-// SELECT and mutation scans share one inventory below but deliberately enable different candidates
-// this slice: ordered B-tree/index-set mutation scans are Phase 1 follow-ons, and the established
-// mutation order is GIN before GiST while SELECT is GiST before GIN.
+// SELECT and mutation scans share one inventory below. Their remaining difference is the established
+// GIN/GiST order: mutation tries GIN first, while SELECT tries GiST first.
 export type ScanBoundPolicy = {
   orderedIndex: boolean;
   indexSet: boolean;
@@ -13580,8 +13588,8 @@ export const SELECT_SCAN_BOUND_POLICY: ScanBoundPolicy = {
 };
 
 export const MUTATION_SCAN_BOUND_POLICY: ScanBoundPolicy = {
-  orderedIndex: false,
-  indexSet: false,
+  orderedIndex: true,
+  indexSet: true,
   gistBeforeGin: false,
 };
 

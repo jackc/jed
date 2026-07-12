@@ -257,7 +257,13 @@ impl Engine {
                 self.pk_key_set_rows(store, ks, params, &[], mask, &[], false)?
             }
             Some(ScanBound::IndexSet(ks)) => {
-                self.index_key_set_entries(table_name, ks, params, &[], mask, &[])?
+                let (mut entries, units) =
+                    self.index_key_set_entries(table_name, ks, params, &[], mask, &[])?;
+                // Retain first-probe order while guaranteeing that phase 2 can never receive the
+                // same row twice if a future index-key generalization makes probe sets overlap.
+                let mut seen = HashSet::with_capacity(entries.len());
+                entries.retain(|(key, _)| seen.insert(key.clone()));
+                (entries, units)
             }
         };
         Ok(MutationScanBatch {

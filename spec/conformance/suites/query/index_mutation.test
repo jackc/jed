@@ -1,0 +1,203 @@
+# Secondary-index-bounded UPDATE/DELETE (indexes.md §5.1; cost.md §3): mutation planning admits the
+# same maximal equality-prefix + optional trailing-range access predicate as SELECT, gathers keyed
+# old rows from the pre-mutation index state, rechecks the complete WHERE, and only then performs the
+# two-phase write. A last-resort OR/IN bound on a leading secondary-index column likewise gathers the
+# de-duplicated union of point probes. Rows/errors are PostgreSQL-oracle-checked; exact costs are
+# jed's deterministic cross-core contract, and the companion dml/explain_dml.test pins plan text.
+# Format + `requires`: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.index_expr, ddl.index_partial, dml.insert, dml.insert_multi_row, dml.update, dml.delete, dml.returning, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.order_by, query.index_range, query.index_prefix, query.index_expr, query.index_partial, query.or_in_point_lookup, query.index_mutation, expr.arithmetic, expr.in_list, types.i32, resource.cost_metering
+
+# --- Contiguous equality/range bounds; indexed-column and PK-changing UPDATE --------------------
+
+statement ok
+CREATE TABLE idxmut_m (id i32 PRIMARY KEY, v i32, w i32)
+
+statement ok
+INSERT INTO idxmut_m VALUES (1,10,1),(2,10,2),(3,20,3),(4,30,4),(5,40,5),(6,NULL,6)
+
+statement ok
+CREATE INDEX idxmut_m_v_idx ON idxmut_m (v)
+
+# index leaf(1) + two table point lookups(2) + two row reads + two Eq residuals = 7.
+# cost: 7
+statement ok
+UPDATE idxmut_m SET w = 99 WHERE v = 10
+
+# The candidate key is retained while the PK changes. 2 pages + 1 row + Eq + Add + produced = 6.
+# cost: 6
+query I nosort
+UPDATE idxmut_m SET id = id + 100 WHERE v = 20 RETURNING id
+----
+103
+
+# Updating the indexed column itself is safe because both old candidates were gathered first.
+# cost: 7
+statement ok
+UPDATE idxmut_m SET v = 50 WHERE v = 10
+
+# The range admits v={30,40,50,50}: index(1) + four row lookups + four reads + four residuals = 13.
+# cost: 13
+statement ok
+DELETE FROM idxmut_m WHERE v >= 30
+
+query III nosort
+SELECT id, v, w FROM idxmut_m ORDER BY id
+----
+6
+NULL
+6
+103
+20
+3
+
+# The equivalent but non-matching expression spelling keeps the full-scan cost: one table page,
+# two row reads, and Add/Eq residual evaluation on both rows = 1+2+4=7.
+# cost: 7
+statement ok
+UPDATE idxmut_m SET w = 0 WHERE v + 0 = 20
+
+query I nosort
+SELECT w FROM idxmut_m WHERE id = 103
+----
+0
+
+# --- Multi-column prefix + range ---------------------------------------------------------------
+
+statement ok
+CREATE TABLE idxmut_c (id i32 PRIMARY KEY, a i32, b i32, w i32)
+
+statement ok
+INSERT INTO idxmut_c VALUES (1,1,1,0),(2,1,2,0),(3,1,3,0),(4,2,2,0)
+
+statement ok
+CREATE INDEX idxmut_c_ab_idx ON idxmut_c (a, b)
+
+# index(1) + two lookups + two reads + 2 × And(Eq,Ge)=6 = 11.
+# cost: 11
+statement ok
+UPDATE idxmut_c SET w = 9 WHERE a = 1 AND b >= 2
+
+query II nosort
+SELECT id, w FROM idxmut_c ORDER BY id
+----
+1
+0
+2
+9
+3
+9
+4
+0
+
+# --- Expression and partial access predicates use the same eligibility gates -------------------
+
+statement ok
+CREATE TABLE idxmut_e (id i32 PRIMARY KEY, v i32, w i32)
+
+statement ok
+INSERT INTO idxmut_e VALUES (1,0,1),(2,0,2),(3,0,3)
+
+statement ok
+CREATE INDEX idxmut_e_w_expr ON idxmut_e ((w + 1))
+
+# index(1) + one lookup + one read + Add/Eq residual = 5.
+# cost: 5
+statement ok
+UPDATE idxmut_e SET v = 9 WHERE w + 1 = 3
+
+query II nosort
+SELECT id, v FROM idxmut_e ORDER BY id
+----
+1
+0
+2
+9
+3
+0
+
+statement ok
+CREATE TABLE idxmut_p (id i32 PRIMARY KEY, v i32, w i32)
+
+statement ok
+INSERT INTO idxmut_p VALUES (1,10,1),(2,10,1),(3,10,-1),(4,20,1)
+
+statement ok
+CREATE INDEX idxmut_p_v_pos ON idxmut_p (v) WHERE w > 0
+
+# index(1) + two lookups + two reads + 2 × And(Gt,Eq)=6 = 11.
+# cost: 11
+statement ok
+DELETE FROM idxmut_p WHERE w > 0 AND v = 10
+
+query III nosort
+SELECT id, v, w FROM idxmut_p ORDER BY id
+----
+3
+10
+-1
+4
+20
+1
+
+# --- Secondary-index OR/IN point set -----------------------------------------------------------
+
+statement ok
+CREATE TABLE idxmut_s (id i32 PRIMARY KEY, x i32, w i32)
+
+statement ok
+INSERT INTO idxmut_s VALUES (1,10,1),(2,20,2),(3,30,3),(4,40,4),(5,10,5)
+
+statement ok
+CREATE INDEX idxmut_s_x_idx ON idxmut_s (x)
+
+# The second candidate traps; the first candidate was not written (two-phase all-or-nothing).
+statement error 22012
+UPDATE idxmut_s SET w = 100 / (id - 4) WHERE x IN (20, 40)
+
+query II nosort
+SELECT id, w FROM idxmut_s WHERE id IN (2, 4) ORDER BY id
+----
+2
+2
+4
+4
+
+# Duplicate 20 and NULL add no probes. Two probes cost 4 pages + 2 reads; the four-element IN
+# residual has 7 nodes per row, the PK assignment one, and RETURNING produces two: 4+2+14+2+2=24.
+# cost: 24
+query I rowsort
+UPDATE idxmut_s SET id = id + 100 WHERE x IN (20, 20, NULL, 40) RETURNING id
+----
+102
+104
+
+# Non-unique x=10 admits two rows, x=30 one: 5 pages + 3 reads + 3 residual nodes × 3 = 17.
+# cost: 17
+statement ok
+DELETE FROM idxmut_s WHERE x IN (10, 30)
+
+query III nosort
+SELECT id, x, w FROM idxmut_s ORDER BY id
+----
+102
+20
+2
+104
+40
+4
+
+# Keep the live PostgreSQL oracle reusable across repeated corpus:check runs.
+statement ok
+DROP TABLE idxmut_m
+
+statement ok
+DROP TABLE idxmut_c
+
+statement ok
+DROP TABLE idxmut_e
+
+statement ok
+DROP TABLE idxmut_p
+
+statement ok
+DROP TABLE idxmut_s

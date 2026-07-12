@@ -508,7 +508,7 @@ async function runOne(
 
     // Write kinds: the checksum is the post-run sanity count(*) (benchmarks.md §6).
     if (b.kind !== "query") {
-      const table = insertTable(b.sql);
+      const table = writeTable(b.sql);
       const n = await eng.queryInt(`SELECT count(*) FROM ${table}`);
       const expect =
         b.kind === "write_rollback"
@@ -548,17 +548,17 @@ async function runOne(
   }
 }
 
-// The target table of a write statement — the word after INTO (INSERT INTO <table>) or
-// FROM (DELETE FROM <table>) — for the post-run count.
-function insertTable(sql: string): string {
+// The target table of a write statement — the word after INTO (INSERT), UPDATE, or FROM (DELETE) —
+// for the post-run count.
+export function writeTable(sql: string): string {
   const fields = sql.split(/\s+/);
   for (let i = 0; i < fields.length - 1; i++) {
     const kw = fields[i].toUpperCase();
-    if (kw === "INTO" || kw === "FROM") {
+    if (kw === "INTO" || kw === "UPDATE" || kw === "FROM") {
       return fields[i + 1].split("(")[0];
     }
   }
-  throw new Error(`write bench SQL has no INSERT INTO / DELETE FROM table: ${sql}`);
+  throw new Error(`write bench SQL has no INSERT / UPDATE / DELETE target table: ${sql}`);
 }
 
 // Uniform binary entrypoint: bench-<engine> <corpus_dir> <data_dir> <out_path> [filter].

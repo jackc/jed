@@ -237,10 +237,8 @@ pub(crate) fn build_index_access_predicate(
 }
 
 /// Consumer-specific access-path eligibility/precedence. SELECT and mutation scans share the same
-/// inventory but deliberately enable different candidates this slice: ordered B-tree/index-set
-/// mutation scans are Phase 1 follow-ons, and the established mutation order is GIN before GiST
-/// while SELECT is GiST before GIN. Encoding that difference here keeps EXPLAIN and execution on one
-/// detector without changing any plan in this behavior-neutral phase.
+/// inventory; their remaining difference is the established GIN/GiST order (mutation tries GIN
+/// first, SELECT GiST first). Encoding it here keeps EXPLAIN and execution on one detector.
 #[derive(Clone, Copy)]
 pub(crate) struct ScanBoundPolicy {
     ordered_index: bool,
@@ -255,8 +253,8 @@ pub(crate) const SELECT_SCAN_BOUND_POLICY: ScanBoundPolicy = ScanBoundPolicy {
 };
 
 pub(crate) const MUTATION_SCAN_BOUND_POLICY: ScanBoundPolicy = ScanBoundPolicy {
-    ordered_index: false,
-    index_set: false,
+    ordered_index: true,
+    index_set: true,
     gist_before_gin: false,
 };
 

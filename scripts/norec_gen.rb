@@ -28,6 +28,10 @@
 #              lookups (spec/design/indexes.md §5); `v + 0 = K` is a `BinaryOp`, so the detector
 #              (bare column only) does NOT use the index and it full-scans. Both must return
 #              identical rows — including across UPDATE/DELETE maintenance and a NULL value (3VL).
+#   index_mut — UPDATE/DELETE target scans use a bare indexed equality/range or secondary-index
+#              IN-list; the equivalent `v + 0` predicates defeat the mutation bound. Applied to
+#              identically-seeded tables, both paths must reach the same by-construction end state,
+#              including an indexed-column update and a PK-rekeying update.
 #   or_in    — `pk IN (a,b,c)` / `pk = a OR pk = b` (and the secondary-index equivalent) lower to a
 #              UNION of point probes (cost.md §3 "OR / IN-list"); `pk + 0 IN (...)` wraps each
 #              disjunct's key in a `BinaryOp`, so no disjunct is a bare column and it full-scans. Both
@@ -135,6 +139,11 @@ INDEX_RANGE_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index dml.in
                      dml.insert_multi_row query.select query.comparison_order query.order_by
                      query.index_range expr.arithmetic expr.comparison_value types.i32
                      null.three_valued].freeze
+INDEX_MUT_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index dml.insert
+                   dml.insert_multi_row dml.update dml.delete query.select query.where_eq
+                   query.comparison_order query.order_by query.or_in_point_lookup
+                   query.index_mutation expr.arithmetic expr.in_list types.i32
+                   null.three_valued].freeze
 INDEX_PREFIX_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index dml.insert
                       dml.insert_multi_row query.select query.where_eq query.comparison_order
                       query.order_by query.index_prefix query.index_range expr.arithmetic
@@ -572,6 +581,56 @@ def gen_index(seed)
   stmt(out, "DELETE FROM t WHERE id = #{victim}")
   ipair.call("v = #{present} after DELETE removed id #{victim}", present,
              flat.call(with_v.call(present)))
+
+  out.join("\n") + "\n"
+end
+
+# --- scenario: secondary-index mutation bounds (bounded mutation vs full scan) ------------------
+def gen_index_mutation(seed)
+  rng = Random.new(seed)
+  ids = (1..40).to_a.sample(12, random: rng).sort
+  null_id = ids.sample(random: rng)
+  rows = ids.map { |id| [id, id == null_id ? nil : rng.rand(0..4), rng.rand(-50..50)] }
+  flat = ->(rs) { rs.flat_map { |id, v, w| [id.to_s, v.nil? ? "NULL" : v.to_s, w.to_s] } }
+
+  out = header(seed, INDEX_MUT_REQ,
+               "secondary-index mutation bounds (bounded UPDATE/DELETE vs full scan)")
+  %w[opt ref].each do |name|
+    stmt(out, "CREATE TABLE #{name} (id i32 PRIMARY KEY, v i32, w i32)")
+    stmt(out, "INSERT INTO #{name} VALUES #{rows.map { |id, v, w| "(#{id}, #{v.nil? ? 'NULL' : v}, #{w})" }.join(', ')}")
+    stmt(out, "CREATE INDEX #{name}_v_idx ON #{name} (v)")
+  end
+
+  # Equality-bound UPDATE changes the indexed value itself. Candidate gathering must finish before
+  # index maintenance; `v + 0` forces the reference table through the full-scan path.
+  present = rows.map { |_id, v, _w| v }.compact.sample(random: rng) || 0
+  stmt(out, "UPDATE opt SET v = 9, w = w + 100 WHERE v = #{present}")
+  stmt(out, "UPDATE ref SET v = 9, w = w + 100 WHERE v + 0 = #{present}")
+  rows = rows.map { |id, v, w| v == present ? [id, 9, w + 100] : [id, v, w] }
+  out << "# equality-bound indexed-column UPDATE and full scan reach the same state"
+  q(out, "III", "SELECT id, v, w FROM opt ORDER BY id", flat.call(rows))
+  q(out, "III", "SELECT id, v, w FROM ref ORDER BY id", flat.call(rows))
+
+  # Range-bound UPDATE rekeys every admitted row. +100 cannot collide with the initial 1..40 keys.
+  lo = rng.rand(1..3)
+  stmt(out, "UPDATE opt SET id = id + 100 WHERE v >= #{lo}")
+  stmt(out, "UPDATE ref SET id = id + 100 WHERE v + 0 >= #{lo}")
+  rows = rows.map { |id, v, w| v && v >= lo ? [id + 100, v, w] : [id, v, w] }.sort_by(&:first)
+  out << "# range-bound PK-rekeying UPDATE and full scan reach the same state"
+  q(out, "III", "SELECT id, v, w FROM opt ORDER BY id", flat.call(rows))
+  q(out, "III", "SELECT id, v, w FROM ref ORDER BY id", flat.call(rows))
+
+  # A secondary-index IN-list is the last-resort point-set mutation path. Duplicate one source and
+  # include NULL to exercise probe de-duplication/skipping; the residual remains unchanged.
+  vals = rows.map { |_id, v, _w| v }.compact.uniq.sample(2, random: rng)
+  vals = [9, 0] if vals.size < 2
+  list = "#{vals[0]}, #{vals[0]}, NULL, #{vals[1]}"
+  stmt(out, "DELETE FROM opt WHERE v IN (#{list})")
+  stmt(out, "DELETE FROM ref WHERE v + 0 IN (#{list})")
+  rows = rows.reject { |_id, v, _w| vals.include?(v) }
+  out << "# secondary-index point-set DELETE and full scan reach the same state"
+  q(out, "III", "SELECT id, v, w FROM opt ORDER BY id", flat.call(rows))
+  q(out, "III", "SELECT id, v, w FROM ref ORDER BY id", flat.call(rows))
 
   out.join("\n") + "\n"
 end
@@ -1616,6 +1675,7 @@ SCENARIOS = {
   "correlated" => method(:gen_correlated),
   "index_nested_loop" => method(:gen_index_nested_loop),
   "index" => method(:gen_index),
+  "index_mut" => method(:gen_index_mutation),
   "index_expr" => method(:gen_index_expr),
   "index_range" => method(:gen_index_range),
   "index_prefix" => method(:gen_index_prefix),

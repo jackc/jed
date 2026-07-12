@@ -242,7 +242,7 @@ func runOne(cfg Config, b *Bench, datasets *Datasets, dataDir, want string) (Res
 	// Write kinds: the checksum is the post-run sanity count(*) (§6) — rollbacks held /
 	// every durable commit landed — and it must also match the locally expected count.
 	if b.Kind != "query" {
-		table := insertTable(b.SQL)
+		table := writeTable(b.SQL)
 		n, err := eng.QueryInt("SELECT count(*) FROM " + table)
 		if err != nil {
 			return res, err
@@ -402,15 +402,15 @@ func partition[T any](items []T, n int) [][]T {
 	return blocks
 }
 
-// insertTable extracts the target table of a write statement — the word after INTO
-// (INSERT INTO <table>) or FROM (DELETE FROM <table>) — for the post-run count.
-func insertTable(sql string) string {
+// writeTable extracts the target table of a write statement — the word after INTO
+// (INSERT), UPDATE, or FROM (DELETE) — for the post-run count.
+func writeTable(sql string) string {
 	fields := strings.Fields(sql)
 	for i, f := range fields {
-		if (strings.EqualFold(f, "INTO") || strings.EqualFold(f, "FROM")) && i+1 < len(fields) {
+		if (strings.EqualFold(f, "INTO") || strings.EqualFold(f, "UPDATE") || strings.EqualFold(f, "FROM")) && i+1 < len(fields) {
 			name, _, _ := strings.Cut(fields[i+1], "(")
 			return name
 		}
 	}
-	panic("write bench SQL has no INSERT INTO / DELETE FROM table: " + sql)
+	panic("write bench SQL has no INSERT / UPDATE / DELETE target table: " + sql)
 }

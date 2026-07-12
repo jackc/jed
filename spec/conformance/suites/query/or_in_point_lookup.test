@@ -181,8 +181,8 @@ alice
 carol
 
 # --- UPDATE / DELETE bound by the PK point set ---
-# A mutation lowers the same merged PK bound (a secondary-index point set for DML is a separate
-# follow-on). DELETE {2,4}: 2 page + 2 storage_row_read + `Or(Eq,Eq)` (3) × 2 = 6 = 10. No rows
+# A mutation lowers the same merged PK bound. DELETE {2,4}: 2 page + 2 storage_row_read +
+# `Or(Eq,Eq)` (3) × 2 = 6 = 10. No rows
 # produced (a bare statement).
 # cost: 10
 statement ok
