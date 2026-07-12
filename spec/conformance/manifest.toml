@@ -118,7 +118,7 @@ description = "ALTER SEQUENCE [IF EXISTS] name — beyond RESTART (ddl.sequence)
 
 [[capability]]
 id = "ddl.alter_table"
-description = "ALTER TABLE slices 1-3 (spec/design/alter.md): qualified targeting; standalone table/column/constraint renames; comma-combinable column default/nullability edits; ADD/DROP CHECK/UNIQUE/FOREIGN KEY/EXCLUDE constraints; and ADD COLUMN [IF NOT EXISTS] with inline constraints. Multi-actions apply left-to-right and publish all-or-nothing. ADD COLUMN performs a format-neutral table rewrite, evaluates each old row's captured default through one statement entropy/clock seam, retains synthetic-rowid high-water, validates NOT NULL/inline constraints, creates owned serial/IDENTITY sequences, and re-keys/rebuilds index suffixes for an inline PRIMARY KEY. DROP COLUMN and ALTER COLUMN TYPE remain recognized 0A000 deferrals."
+description = "ALTER TABLE slices 1-4 (spec/design/alter.md): qualified targeting; standalone table/column/constraint renames; comma-combinable column default/nullability edits; ADD/DROP CHECK/UNIQUE/FOREIGN KEY/EXCLUDE constraints; and ADD COLUMN [IF NOT EXISTS] / DROP COLUMN [IF EXISTS] [RESTRICT|CASCADE]. Multi-actions apply left-to-right and publish all-or-nothing. ADD/DROP COLUMN perform one format-neutral table rewrite; ADD evaluates each old row's captured default through one statement entropy/clock seam and can create an inline PK, while DROP is limited to non-PK columns, physically removes the row slot, compacts every surviving ordinal, repairs incoming FKs/owned sequences, and drops column dependents under CASCADE (2BP01 under RESTRICT). ALTER COLUMN TYPE remains a recognized 0A000 deferral."
 
 [[capability]]
 id = "ddl.serial"

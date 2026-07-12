@@ -9,11 +9,12 @@
 > reproduce identically (CLAUDE.md §2, §8). When a decision here changes, change the
 > data/grammar and here in the same edit.
 >
-> **Status: Slices 1–3 landed.** The canonical grammar and all three native cores implement the
+> **Status: Slices 1–4 landed.** The canonical grammar and all three native cores implement the
 > catalog-only frame: renames, column defaults/nullability, and `ADD`/`DROP CONSTRAINT` for CHECK,
 > UNIQUE, FOREIGN KEY, and EXCLUDE, including comma-action atomicity and validating scans; `ADD
 > COLUMN` appends the catalog column and atomically rebuilds the table (and re-keys it for an inline
-> PRIMARY KEY). Slices 4–5 remain designed but unimplemented; their grammar is recognized and
+> PRIMARY KEY), and `DROP COLUMN` physically removes non-PK columns while compacting dependent
+> ordinals. Slice 5 remains designed but unimplemented; its grammar is recognized and
 > reports `0A000`.
 
 `ALTER TABLE` mutates a table's definition in place — its columns, its constraints, its
@@ -229,6 +230,19 @@ tombstone, and a full rewrite keeps the file clean — consistent with "boring, 
 `ADD COLUMN` may reuse the name/position; introspection ([introspection.md](introspection.md))
 never shows a dropped column.
 
+**Implemented slice-4 details.** Multiple DROP/ADD actions share one key-ordered rewrite scan. The
+executor carries each final column as either an original-row ordinal or an ADD action's captured
+default, so arbitrary left-to-right combinations publish one final dense row shape. Surviving local
+PK/index/FK/EXCLUDE ordinals, incoming FK referenced ordinals, and owned-sequence owner ordinals are
+compacted together; a dropped serial/IDENTITY column auto-drops its owned sequence. A non-PK drop
+does not re-key the table: PK values and storage-key bytes are unchanged even when their catalog
+ordinals shift. Existing unaffected index stores likewise remain valid; dependent stores are removed
+and newly-added constraint stores are built only after final-state validation. A dropped backing-index
+name reused by a later action identifies a new object, so its store is rebuilt even though the final
+catalog name matches the original. Dropping a serial/IDENTITY column removes its existing owned sequence
+from the action-visible relation namespace immediately: a later serial addition may reuse the released
+name, while a later default cannot resolve or advance the removed sequence.
+
 ### 3.3 `ALTER COLUMN … TYPE type [USING expr]`
 
 Re-encode every value of the column to the new type (via the identity cast, or the `USING`
@@ -286,6 +300,7 @@ already exist — a small follow-on, not scheduled.
 | Column rename | Rewrites this table's stored expression text (§2.2) | Same effect via dependency graph | jed stores expression *text*, not a resolved node tree (§0.2) |
 | Rename PK constraint | `<t>_pkey` is `42704` — no named PK object (§2.3) | Renames the auto-named `<t>_pkey` | jed persists no PK/NOT NULL constraint object; a custom PK name needs a format field — deferred with §3.4 |
 | ALTER TABLE on a non-table | `42809` for an index or sequence | Lenient for some relation kinds | jed's ALTER TABLE owns only the table surface; object-specific ALTER statements remain separate |
+| Local DROP COLUMN dependency under RESTRICT | Blocks a same-table CHECK/index/FK/EXCLUDE with `2BP01`; `CASCADE` removes it (§3.2) | Automatically removes internally-dependent same-table objects even without `CASCADE`; RESTRICT mainly blocks external dependents | One explicit dependency rule for every ordinal/expression consumer keeps the dense-catalog rewrite legible; CASCADE makes destructive intent explicit |
 
 ## 8. Slicing
 
@@ -298,7 +313,7 @@ Ordered lowest-risk → highest, each a vertical slice (CLAUDE.md §10):
    validating scan (retires the FK/EXCLUDE `ADD CONSTRAINT` follow-ons in TODO).
 3. **✅ `ADD COLUMN`** — the first rewrite; per-row default evaluation, inline constraints, and
    inline-PK re-keying.
-4. **`DROP COLUMN`** — the ordinal renumber + dependency cascade (non-PK columns).
+4. **✅ `DROP COLUMN`** — the ordinal renumber + dependency cascade (non-PK columns).
 5. **`ALTER COLUMN TYPE`** + **`ADD`/`DROP PRIMARY KEY`** — the re-encode/re-key rewrites.
 
 ## 9. `format_version` impact

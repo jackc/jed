@@ -908,8 +908,13 @@ func (s *snapshot) syncAlterConstraintIndexes(old, next *catTable, entries map[s
 	}
 	for _, ix := range next.Indexes {
 		key := strings.ToLower(ix.Name)
-		if oldNames[key] {
+		_, rebuild := entries[key]
+		if oldNames[key] && !rebuild {
 			continue
+		}
+		if rebuild {
+			delete(s.indexStores, key)
+			delete(s.gistTrees, key)
 		}
 		fresh := newTableStore(pagePayload(pageSize), nil)
 		if s.storePaging != nil {
@@ -949,6 +954,62 @@ func (s *snapshot) rebuildAlterIndexes(old, next *catTable, entries map[string][
 		s.indexStores[key] = fresh
 	}
 	return nil
+}
+
+// remapAlterColumnDependents repairs incoming FK ordinals and owned-sequence links after a DROP
+// COLUMN rewrite compacts the parent's dense ordinals. A -1 mapping means CASCADE removed the
+// referenced column and therefore removes that FK / owned sequence.
+func (s *snapshot) remapAlterColumnDependents(parent string, originalToNew []int, pending map[string]bool) {
+	for key, child := range s.tables {
+		if strings.EqualFold(child.Name, parent) {
+			continue
+		}
+		changed := false
+		fks := make([]foreignKey, 0, len(child.ForeignKeys))
+		for _, fk := range child.ForeignKeys {
+			if !strings.EqualFold(fk.RefTable, parent) {
+				fks = append(fks, fk)
+				continue
+			}
+			mapped := append([]int(nil), fk.RefColumns...)
+			keep := true
+			for i, old := range mapped {
+				if old < 0 || old >= len(originalToNew) || originalToNew[old] < 0 {
+					keep = false
+					break
+				}
+				changed = changed || mapped[i] != originalToNew[old]
+				mapped[i] = originalToNew[old]
+			}
+			if keep {
+				next := fk
+				next.RefColumns = mapped
+				fks = append(fks, next)
+			} else {
+				changed = true
+			}
+		}
+		if changed {
+			next := *child
+			next.ForeignKeys = fks
+			s.tables[key] = &next
+		}
+	}
+	for key, seq := range s.sequences {
+		if pending[key] || seq.OwnedBy == nil || !strings.EqualFold(seq.OwnedBy.Table, parent) {
+			continue
+		}
+		old := int(seq.OwnedBy.Column)
+		if old < 0 || old >= len(originalToNew) || originalToNew[old] < 0 {
+			delete(s.sequences, key)
+			continue
+		}
+		next := *seq
+		owner := *seq.OwnedBy
+		owner.Column = uint16(originalToNew[old])
+		next.OwnedBy = &owner
+		s.sequences[key] = &next
+	}
 }
 
 // putIndexStore registers a loaded index store under its (lowercased) name — the file

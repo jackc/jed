@@ -30,3 +30,33 @@ fn add_column_rewrite_matches_fresh_table_bytes() {
         fresh.to_image(8192, 1).unwrap()
     );
 }
+
+#[test]
+fn drop_column_rewrite_matches_fresh_table_bytes() {
+    let mut altered = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
+    run(
+        &mut altered,
+        "CREATE TABLE t (obsolete text, id i32 PRIMARY KEY, v i32 DEFAULT 7)",
+    );
+    run(
+        &mut altered,
+        "INSERT INTO t VALUES ('a', 1, 7), ('b', 2, 8)",
+    );
+    run(&mut altered, "ALTER TABLE t DROP obsolete");
+
+    let mut fresh = Database::create(CreateOptions::default())
+        .unwrap()
+        .session(SessionOptions::default());
+    run(
+        &mut fresh,
+        "CREATE TABLE t (id i32 PRIMARY KEY, v i32 DEFAULT 7)",
+    );
+    run(&mut fresh, "INSERT INTO t VALUES (1, 7), (2, 8)");
+
+    assert_eq!(
+        altered.to_image(8192, 1).unwrap(),
+        fresh.to_image(8192, 1).unwrap()
+    );
+}

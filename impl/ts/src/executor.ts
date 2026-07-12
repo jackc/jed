@@ -4144,7 +4144,7 @@ export class Engine {
     return { kind: "statement", cost: 0n, rowsAffected: null };
   }
 
-  // executeAlterTable implements ALTER TABLE slices 1-3 (alter.md §1-§3.1).
+  // executeAlterTable implements ALTER TABLE slices 1-4 (alter.md §1-§3.2).
   private executeAlterTable(at: AlterTable): Outcome {
     checkCatalogRelWrite(at.name);
     this.checkAttachmentWritable(at.db);
@@ -4205,8 +4205,13 @@ export class Engine {
       return relationTaken(name);
     };
     const addedConstraints = new Set<string>();
-    const addedColumns: Column[] = [];
+    type ColumnSource = { kind: "original"; column: number } | { kind: "added"; column: Column };
+    const columnSources: ColumnSource[] = original.columns.map((_, column) => ({
+      kind: "original",
+      column,
+    }));
     const cascadeUniqueCols: number[][] = [];
+    const cascadeDroppedColumnFks = new Set<string>();
     const rewriteExprs = (
       column?: { oldName: string; newName: string },
       tableRename?: string,
@@ -4355,7 +4360,7 @@ export class Engine {
             );
             table.columns.push(col);
             if (col.primaryKey) table.pk = [table.columns.length - 1];
-            addedColumns.push(col);
+            columnSources.push({ kind: "added", column: col });
             actions.unshift(
               ...action.checks.map(
                 (def) =>
@@ -4379,6 +4384,130 @@ export class Engine {
                   }) as const,
               ),
             );
+            continue;
+          }
+          if (action.kind === "dropColumn") {
+            const ci = columnIndex(table, action.name);
+            if (ci < 0) {
+              if (action.ifExists) continue;
+              throw engineError("undefined_column", `column does not exist: ${action.name}`);
+            }
+            if (table.pk.includes(ci))
+              throw engineError(
+                "feature_not_supported",
+                "dropping a primary-key column is not supported yet",
+              );
+            const usesExpr = (expr: Expr) => checkReferencedColumns(expr, table.columns).includes(ci);
+            const checkDep = table.checks.some((c) => usesExpr(c.expr));
+            const indexUses = (index: IndexDef) =>
+              index.keys.some((key) =>
+                key.kind === "column" ? key.column === ci : usesExpr(key.expr),
+              ) || (index.predicate !== undefined && usesExpr(index.predicate.expr));
+            const indexDep = table.indexes.some(indexUses);
+            const fkUses = (fk: ForeignKey) =>
+              fk.columns.includes(ci) ||
+              (fk.refTable.toLowerCase() === table.name.toLowerCase() &&
+                fk.refColumns.includes(ci));
+            const fkDep = table.fks.some(fkUses);
+            const exclusionDep = table.exclusions.some((ex) =>
+              ex.elements.some((el) => el.column === ci),
+            );
+            const source = columnSources[ci]!;
+            const incomingDep =
+              source.kind === "original" &&
+              [...snap.tables].some(
+                ([key, child]) =>
+                  key.toLowerCase() !== oldKey &&
+                  child.fks.some(
+                    (fk) =>
+                      fk.refTable.toLowerCase() === original.name.toLowerCase() &&
+                      fk.refColumns.includes(source.column) &&
+                      !cascadeDroppedColumnFks.has(`${key.toLowerCase()}\0${fk.name.toLowerCase()}`) &&
+                      !cascadeUniqueCols.some((cols) => sameSet(sortedUnique(fk.refColumns), cols)),
+                  ),
+              );
+            if (
+              !action.cascade &&
+              (checkDep || indexDep || fkDep || exclusionDep || incomingDep)
+            )
+              throw engineError(
+                "dependent_objects_still_exist",
+                `cannot drop column ${action.name} because other objects depend on it`,
+              );
+            if (action.cascade) {
+              if (source.kind === "original")
+                for (const [key, child] of snap.tables)
+                  if (key.toLowerCase() !== oldKey)
+                    for (const fk of child.fks)
+                      if (
+                        fk.refTable.toLowerCase() === original.name.toLowerCase() &&
+                        fk.refColumns.includes(source.column)
+                      )
+                        cascadeDroppedColumnFks.add(
+                          `${key.toLowerCase()}\0${fk.name.toLowerCase()}`,
+                        );
+              table.checks = table.checks.filter((check) => {
+                const keep = !usesExpr(check.expr);
+                if (!keep) added.delete(check.name.toLowerCase());
+                return keep;
+              });
+              table.indexes = table.indexes.filter((index) => {
+                const keep = !indexUses(index);
+                if (!keep) added.delete(index.name.toLowerCase());
+                return keep;
+              });
+              table.fks = table.fks.filter((fk) => {
+                const keep = !fkUses(fk);
+                if (!keep) added.delete(fk.name.toLowerCase());
+                return keep;
+              });
+              table.exclusions = table.exclusions.filter((ex) => {
+                const keep = !ex.elements.some((el) => el.column === ci);
+                if (!keep) added.delete(ex.name.toLowerCase());
+                return keep;
+              });
+            }
+            table.columns.splice(ci, 1);
+            columnSources.splice(ci, 1);
+            table.pk = table.pk.map((column) => (column > ci ? column - 1 : column));
+            table.indexes = table.indexes.map((index) => ({
+              ...index,
+              keys: index.keys.map((key) =>
+                key.kind === "column" && key.column > ci
+                  ? { ...key, column: key.column - 1 }
+                  : key,
+              ),
+            }));
+            table.fks = table.fks.map((fk) => ({
+              ...fk,
+              columns: fk.columns.map((column) => (column > ci ? column - 1 : column)),
+              refColumns:
+                fk.refTable.toLowerCase() === table.name.toLowerCase()
+                  ? fk.refColumns.map((column) => (column > ci ? column - 1 : column))
+                  : fk.refColumns,
+            }));
+            table.exclusions = table.exclusions.map((ex) => ({
+              ...ex,
+              elements: ex.elements.map((el) =>
+                el.column > ci ? { ...el, column: el.column - 1 } : el,
+              ),
+            }));
+            // The owned sequence is part of the dropped column. Release an existing one during action
+            // processing so later actions can reuse its name and cannot advance it through a later
+            // DEFAULT.
+            if (source.kind === "original")
+              for (const key of snap.sequencesOwnedBy(original.name)) {
+                const seq = snap.sequence(key);
+                if (seq?.ownedBy?.column === source.column) snap.removeSequence(key);
+              }
+            for (let i = pendingSerials.length - 1; i >= 0; i--) {
+              const seq = pendingSerials[i]!, owner = seq.ownedBy;
+              if (owner === undefined || owner.table.toLowerCase() !== table.name.toLowerCase())
+                continue;
+              if (owner.column === ci) pendingSerials.splice(i, 1);
+              else if (owner.column > ci)
+                pendingSerials[i] = { ...seq, ownedBy: { ...owner, column: owner.column - 1 } };
+            }
             continue;
           }
           if (action.kind === "addConstraint") {
@@ -4630,31 +4759,43 @@ export class Engine {
             const ux = table.indexes.find((i) => i.unique && i.name.toLowerCase() === k);
             if (ux) {
               const cols = sortedUnique(indexColumnOrdinals(ux)!);
-              const deps = [
-                ...table.fks.filter(
+              const originalCols = cols.flatMap((column) => {
+                const source = columnSources[column];
+                return source?.kind === "original" ? [source.column] : [];
+              });
+              const hasOriginalCols = originalCols.length === cols.length;
+              const localDeps = table.fks.filter(
                   (f) =>
                     f.refTable.toLowerCase() === table.name.toLowerCase() &&
                     sameSet(sortedUnique(f.refColumns), cols),
-                ),
-              ];
-              for (const ot of snap.tables.values())
-                if (ot.name.toLowerCase() !== table.name.toLowerCase())
-                  deps.push(
+                );
+              const externalDeps: ForeignKey[] = [];
+              for (const [key, ot] of snap.tables)
+                if (ot.name.toLowerCase() !== table.name.toLowerCase() && hasOriginalCols)
+                  externalDeps.push(
                     ...ot.fks.filter(
                       (f) =>
                         f.refTable.toLowerCase() === table.name.toLowerCase() &&
-                        sameSet(sortedUnique(f.refColumns), cols),
+                        sameSet(sortedUnique(f.refColumns), sortedUnique(originalCols)) &&
+                        !cascadeDroppedColumnFks.has(
+                          `${key.toLowerCase()}\0${f.name.toLowerCase()}`,
+                        ) &&
+                        !cascadeUniqueCols.some((prior) =>
+                          sameSet(prior, sortedUnique(f.refColumns)),
+                        ),
                     ),
                   );
+              const deps = [...localDeps, ...externalDeps];
               if (deps.length && !action.cascade)
                 throw engineError(
                   "dependent_objects_still_exist",
                   `cannot drop constraint ${action.name} because other objects depend on it`,
                 );
-              if (action.cascade) cascadeUniqueCols.push(cols);
+              if (action.cascade && hasOriginalCols)
+                cascadeUniqueCols.push(sortedUnique(originalCols));
               if (action.cascade)
                 table.fks = table.fks.filter(
-                  (f) => !deps.some((d) => d.name.toLowerCase() === f.name.toLowerCase()),
+                  (f) => !localDeps.some((d) => d.name.toLowerCase() === f.name.toLowerCase()),
                 );
               table.indexes = table.indexes.filter((i) => i !== ux);
               found = true;
@@ -4697,14 +4838,25 @@ export class Engine {
     }
 
     const alterPageSize = attachmentScope ? this.attachPageSize(at.db!.toLowerCase()) : this.pageSize;
+    const rewriteNeeded =
+      columnSources.length !== original.columns.length ||
+      columnSources.some(
+        (source, i) => source.kind !== "original" || source.column !== i,
+      );
+    const pkRekeyed =
+      table.pk.length !== original.pk.length ||
+      table.pk.some((column, i) => {
+        const source = columnSources[column];
+        return source?.kind !== "original" || source.column !== original.pk[i];
+      });
     const rewriteColTypes =
-      addedColumns.length === 0
+      !rewriteNeeded
         ? null
         : table.columns.map((c) => resolveColType(c.type, this.readSnap().types));
     const meter = this.session.newMeter();
     let rewriteRows: Entry[] | null = null;
     let rewriteNextRowid = 0n;
-    if (addedColumns.length > 0) {
+    if (rewriteNeeded) {
       for (const seq of pendingSerials) {
         let sw: Snapshot;
         if (at.db === undefined) {
@@ -4725,7 +4877,9 @@ export class Engine {
       meter.charge(COSTS.pageRead * BigInt(scan.pages) + COSTS.valueDecompress * BigInt(scan.slabs));
       const defaults = this.resolveDefaultExprs({
         ...table,
-        columns: addedColumns,
+        columns: columnSources.flatMap((source) =>
+          source.kind === "added" ? [source.column] : [],
+        ),
         pk: [],
         checks: [],
         indexes: [],
@@ -4733,30 +4887,25 @@ export class Engine {
         exclusions: [],
       });
       const rng = new StmtRng();
-      const rekey =
-        table.pk.length !== original.pk.length ||
-        table.pk.some((v, i) => v !== original.pk[i]);
       const colls = this.columnCollations(table.columns);
       const seenKeys = new Set<string>();
       let compressUnits = 0n;
       rewriteRows = scan.entries.map((entry) => {
         meter.guard();
         meter.charge(COSTS.storageRowRead);
-        const row = store.resolveAll(entry.row);
-        for (let i = original.columns.length; i < table.columns.length; i++) {
-          const added = addedColumns[i - original.columns.length]!;
-          const value = this.evalDefault(
-            added,
-            defaults[i - original.columns.length]!,
-            rng,
-            meter,
-          );
+        const oldRow = store.resolveAll(entry.row);
+        let generated = 0;
+        const row = columnSources.map((source, i) => {
+          const value =
+            source.kind === "original"
+              ? oldRow[source.column]!
+              : this.evalDefault(source.column, defaults[generated++]!, rng, meter);
           if (table.columns[i]!.notNull && value.kind === "null")
             throw notNullViolation(table.columns[i]!.name);
-          row.push(value);
-        }
-        const key = rekey ? encodePkKey(table, table.pk, colls, row) : entry.key;
-        if (rekey) {
+          return value;
+        });
+        const key = pkRekeyed ? encodePkKey(table, table.pk, colls, row) : entry.key;
+        if (pkRekeyed) {
           const hash = Array.from(key).join(",");
           if (seenKeys.has(hash)) throw uniqueViolation(table.name, pkeyName(table.name));
           seenKeys.add(hash);
@@ -4769,9 +4918,19 @@ export class Engine {
       meter.charge(COSTS.valueCompress * compressUnits);
       meter.guard();
     }
-    const mask = table.columns.map(
-      (c, i) => i < original.columns.length && !original.columns[i]!.notNull && c.notNull,
-    );
+    const mask = original.columns.map(() => false);
+    const notNullNames = original.columns.map(() => "");
+    for (let i = 0; i < columnSources.length; i++) {
+      const source = columnSources[i]!;
+      if (
+        source.kind === "original" &&
+        !original.columns[source.column]!.notNull &&
+        table.columns[i]!.notNull
+      ) {
+        mask[source.column] = true;
+        notNullNames[source.column] = table.columns[i]!.name;
+      }
+    }
     if (mask.some(Boolean)) {
       const store = this.lkpStoreScoped(at.db, original.name);
       const { entries, pages, slabs } = store.scanWithUnits(mask);
@@ -4781,11 +4940,16 @@ export class Engine {
         meter.charge(COSTS.storageRowRead);
         const row = store.resolveInlineColumns(entry.row);
         for (let i = 0; i < mask.length; i++)
-          if (mask[i] && row[i]!.kind === "null") throw notNullViolation(table.columns[i]!.name);
+          if (mask[i] && row[i]!.kind === "null") throw notNullViolation(notNullNames[i]!);
       }
     }
     const constraintEntries = new Map<string, Uint8Array[]>();
     if (addedConstraints.size > 0) {
+      // Presence in this map is also the publication-time identity marker for a newly-added backing
+      // index. Seed empty indexes so DROP+ADD name reuse cannot retain the old store.
+      for (const index of table.indexes)
+        if (addedConstraints.has(index.name.toLowerCase()))
+          constraintEntries.set(index.name.toLowerCase(), []);
       const store = this.lkpStoreScoped(at.db, original.name),
         all =
           rewriteRows === null
@@ -4873,9 +5037,7 @@ export class Engine {
             }
       for (const es of constraintEntries.values()) es.sort(compareBytes);
     }
-    const rekeyed =
-      rewriteRows !== null &&
-      (table.pk.length !== original.pk.length || table.pk.some((v, i) => v !== original.pk[i]));
+    const rekeyed = rewriteRows !== null && pkRekeyed;
     if (rekeyed) {
       constraintEntries.clear();
       const colls = this.columnCollations(table.columns);
@@ -4924,6 +5086,17 @@ export class Engine {
         );
         if (fks.length !== child.fks.length) ws.tables.set(key, { ...child, fks });
       }
+    }
+    if (rewriteNeeded) {
+      const originalToNew = original.columns.map(() => -1);
+      columnSources.forEach((source, next) => {
+        if (source.kind === "original") originalToNew[source.column] = next;
+      });
+      ws.remapAlterColumnDependents(
+        table.name,
+        originalToNew,
+        new Set(pendingSerials.map((seq) => seq.name.toLowerCase())),
+      );
     }
     return { kind: "statement", cost: meter.accrued, rowsAffected: null };
   }

@@ -742,7 +742,12 @@ export class Snapshot {
     const prior = new Set(old.indexes.map((i) => i.name.toLowerCase()));
     for (const i of next.indexes) {
       const k = i.name.toLowerCase();
-      if (prior.has(k)) continue;
+      const rebuild = entries.has(k);
+      if (prior.has(k) && !rebuild) continue;
+      if (rebuild) {
+        this.indexStores.delete(k);
+        this.gistTrees.delete(k);
+      }
       const s = new TableStore(pagePayload(pageSize), []);
       if (this.storePaging !== null) s.attachPaging(this.storePaging);
       for (const e of entries.get(k) ?? []) s.insert(e, []);
@@ -767,6 +772,41 @@ export class Snapshot {
       if (this.storePaging !== null) store.attachPaging(this.storePaging);
       for (const entry of entries.get(key) ?? []) store.insert(entry, []);
       this.indexStores.set(key, store);
+    }
+  }
+
+  // Repair incoming FK ordinals and owned-sequence links after DROP COLUMN compacts a table's
+  // dense ordinals. -1 means CASCADE removed the referenced column.
+  remapAlterColumnDependents(
+    parent: string,
+    originalToNew: number[],
+    pendingSequences: Set<string>,
+  ): void {
+    for (const [key, child] of [...this.tables]) {
+      if (child.name.toLowerCase() === parent.toLowerCase()) continue;
+      let changed = false;
+      const fks = child.fks.flatMap((fk) => {
+        if (fk.refTable.toLowerCase() !== parent.toLowerCase()) return [fk];
+        const mapped = fk.refColumns.map((old) => originalToNew[old] ?? -1);
+        if (mapped.some((column) => column < 0)) {
+          changed = true;
+          return [];
+        }
+        if (mapped.some((column, i) => column !== fk.refColumns[i])) changed = true;
+        return [{ ...fk, refColumns: mapped }];
+      });
+      if (changed) this.tables.set(key, { ...child, fks });
+    }
+    for (const [key, seq] of [...this.sequences]) {
+      if (
+        pendingSequences.has(key) ||
+        seq.ownedBy === undefined ||
+        seq.ownedBy.table.toLowerCase() !== parent.toLowerCase()
+      )
+        continue;
+      const column = originalToNew[seq.ownedBy.column] ?? -1;
+      if (column < 0) this.sequences.delete(key);
+      else this.sequences.set(key, { ...seq, ownedBy: { ...seq.ownedBy, column } });
     }
   }
 

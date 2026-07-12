@@ -59,7 +59,7 @@ SELECT temp_changed FROM temp.scope_target WHERE id = 1
 ----
 20
 
-# Rewrites route to the same qualified storage domain as catalog-only edits.
+# ADD/DROP rewrites route to the same qualified storage domain as catalog-only edits.
 statement ok
 ALTER TABLE temp.scope_target ADD local_added i32 DEFAULT 21
 
@@ -67,6 +67,12 @@ query I nosort
 SELECT local_added FROM temp.scope_target WHERE id = 1
 ----
 21
+
+statement ok
+ALTER TABLE temp.scope_target DROP local_added
+
+statement error 42703
+SELECT local_added FROM temp.scope_target
 
 # allow_ddl: on
 # allow_temp_ddl: off
@@ -77,3 +83,9 @@ query I nosort
 SELECT attached_added FROM work.add_target WHERE id = 1
 ----
 11
+
+statement ok
+ALTER TABLE work.add_target DROP attached_added
+
+statement error 42703
+SELECT attached_added FROM work.add_target

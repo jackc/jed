@@ -1456,8 +1456,8 @@ impl Parser {
         })
     }
 
-    /// Parse ALTER TABLE's authoritative grammar frame (alter.md §1). Slices 1-3 execute RENAME,
-    /// ADD COLUMN, catalog-only ALTER COLUMN edits, and ADD/DROP non-PK constraints.
+    /// Parse ALTER TABLE's authoritative grammar frame (alter.md §1). Slices 1-4 execute RENAME,
+    /// ADD/DROP COLUMN, catalog-only ALTER COLUMN edits, and ADD/DROP non-PK constraints.
     fn parse_alter_table(&mut self) -> Result<AlterTable> {
         self.expect_keyword("alter")?;
         self.expect_keyword("table")?;
@@ -1559,13 +1559,10 @@ impl Parser {
                     }
                     Some("drop") => {
                         self.advance();
-                        if self.peek_keyword().as_deref() != Some("constraint") {
-                            return Err(EngineError::new(
-                                SqlState::FeatureNotSupported,
-                                "ALTER TABLE ... DROP COLUMN is not supported yet".to_string(),
-                            ));
+                        let constraint = self.peek_keyword().as_deref() == Some("constraint");
+                        if constraint || self.peek_keyword().as_deref() == Some("column") {
+                            self.advance();
                         }
-                        self.advance();
                         let if_exists = if self.peek_keyword().as_deref() == Some("if") {
                             self.advance();
                             self.expect_keyword("exists")?;
@@ -1583,10 +1580,18 @@ impl Parser {
                             }
                             false
                         };
-                        actions.push(AlterTableEdit::DropConstraint {
-                            name,
-                            if_exists,
-                            cascade,
+                        actions.push(if constraint {
+                            AlterTableEdit::DropConstraint {
+                                name,
+                                if_exists,
+                                cascade,
+                            }
+                        } else {
+                            AlterTableEdit::DropColumn {
+                                name,
+                                if_exists,
+                                cascade,
+                            }
                         });
                     }
                     _ => {

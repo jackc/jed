@@ -1266,8 +1266,8 @@ class Parser {
     return { kind: "dropSequence", names, ifExists };
   }
 
-  // Parse ALTER TABLE's authoritative grammar frame (alter.md §1). Slices 1-3 execute RENAME,
-  // ADD COLUMN, catalog-only ALTER COLUMN edits, and ADD/DROP non-PK constraints.
+  // Parse ALTER TABLE's authoritative grammar frame (alter.md §1). Slices 1-4 execute RENAME,
+  // ADD/DROP COLUMN, catalog-only ALTER COLUMN edits, and ADD/DROP non-PK constraints.
   private parseAlterTable(): Statement {
     this.expectKeyword("alter");
     this.expectKeyword("table");
@@ -1370,12 +1370,8 @@ class Parser {
         actions.push({ kind: "addConstraint", constraint });
       } else if (this.peekKeyword() === "drop") {
         this.advance();
-        if (this.peekKeyword() !== "constraint")
-          throw engineError(
-            "feature_not_supported",
-            "ALTER TABLE ... DROP COLUMN is not supported yet",
-          );
-        this.advance();
+        const constraint = this.peekKeyword() === "constraint";
+        if (constraint || this.peekKeyword() === "column") this.advance();
         let dropIfExists = false;
         if (this.peekKeyword() === "if") {
           this.advance();
@@ -1388,7 +1384,11 @@ class Parser {
           this.advance();
           cascade = true;
         } else if (this.peekKeyword() === "restrict") this.advance();
-        actions.push({ kind: "dropConstraint", name, ifExists: dropIfExists, cascade });
+        actions.push(
+          constraint
+            ? { kind: "dropConstraint", name, ifExists: dropIfExists, cascade }
+            : { kind: "dropColumn", name, ifExists: dropIfExists, cascade },
+        );
       } else {
         this.expectKeyword("alter");
         if (this.peekKeyword() === "column") this.advance();

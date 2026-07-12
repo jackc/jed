@@ -1387,8 +1387,8 @@ impl Engine {
         })
     }
 
-    /// Execute ALTER TABLE slices 1-3 (alter.md §1-§3.1): catalog edits, constraints, and the
-    /// append-column table rewrite.
+    /// Execute ALTER TABLE slices 1-4 (alter.md §1-§3.2): catalog edits, constraints, and the
+    /// add/drop-column table rewrites.
     pub(crate) fn execute_alter_table(&mut self, at: AlterTable) -> Result<Outcome> {
         check_catalog_rel_write(&at.name)?;
         self.check_attachment_writable(at.db.as_deref())?;
@@ -1441,48 +1441,71 @@ impl Engine {
         let mut rename_table = false;
         let mut index_rename: Option<(String, String)> = None;
         let mut added_constraints = std::collections::HashSet::<String>::new();
-        let mut added_columns = Vec::<Column>::new();
+        #[derive(Clone)]
+        enum ColumnSource {
+            Original(usize),
+            Added(Column),
+        }
+        let mut column_sources: Vec<ColumnSource> = original
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, _)| ColumnSource::Original(i))
+            .collect();
         let mut pending_serials = Vec::<SequenceDef>::new();
         let mut cascade_unique_cols = Vec::<Vec<usize>>::new();
+        let mut cascade_dropped_column_fks = std::collections::HashSet::<(String, String)>::new();
         let attachment_scope = at
             .db
             .as_deref()
             .is_some_and(|q| !matches!(q.to_ascii_lowercase().as_str(), "main" | "temp"));
+        let main_namespace = self.read_snap().clone();
+        let temp_namespace = self.temp_read_snap().clone();
         let relation_taken = |name: &str| {
             if attachment_scope {
                 snap.table(name).is_some()
                     || snap.find_index(name).is_some()
                     || snap.sequence(name).is_some()
             } else {
-                self.relation_exists(name)
+                main_namespace.table(name).is_some()
+                    || main_namespace.find_index(name).is_some()
+                    || main_namespace.sequence(name).is_some()
+                    || temp_namespace.table(name).is_some()
+                    || temp_namespace.find_index(name).is_some()
+                    || temp_namespace.sequence(name).is_some()
             }
         };
+        let mut dropped_owned_sequences = std::collections::HashSet::<String>::new();
         // ADD/DROP actions edit `table` left-to-right. A dropped index owned by this table has
         // released its relation name, while an earlier ADD has already occupied its new one.
-        let working_relation_taken =
-            |working: &Table, pending_sequences: &[SequenceDef], name: &str| {
-                if pending_sequences
-                    .iter()
-                    .any(|s| s.name.eq_ignore_ascii_case(name))
-                {
-                    return true;
-                }
-                if working
-                    .indexes
-                    .iter()
-                    .any(|i| i.name.eq_ignore_ascii_case(name))
-                {
-                    true
-                } else if original
-                    .indexes
-                    .iter()
-                    .any(|i| i.name.eq_ignore_ascii_case(name))
-                {
-                    false
-                } else {
-                    relation_taken(name)
-                }
-            };
+        let working_relation_taken = |working: &Table,
+                                      pending_sequences: &[SequenceDef],
+                                      dropped_sequences: &std::collections::HashSet<String>,
+                                      name: &str| {
+            if pending_sequences
+                .iter()
+                .any(|s| s.name.eq_ignore_ascii_case(name))
+            {
+                return true;
+            }
+            if working
+                .indexes
+                .iter()
+                .any(|i| i.name.eq_ignore_ascii_case(name))
+            {
+                true
+            } else if original
+                .indexes
+                .iter()
+                .any(|i| i.name.eq_ignore_ascii_case(name))
+            {
+                false
+            } else if dropped_sequences.contains(&name.to_ascii_lowercase()) {
+                false
+            } else {
+                relation_taken(name)
+            }
+        };
 
         match at.action {
             AlterTableAction::RenameTable(new_name) => {
@@ -1641,7 +1664,7 @@ impl Engine {
                         if added_primary_key {
                             table.pk = vec![table.columns.len() - 1];
                         }
-                        added_columns.push(col);
+                        column_sources.push(ColumnSource::Added(col));
                         // Inline constraints are the same definitions as CREATE TABLE. Queue them
                         // immediately after the column so later comma-actions see their effects.
                         for fk in foreign_keys.into_iter().rev() {
@@ -1659,6 +1682,211 @@ impl Engine {
                                 AlterConstraintDef::Check(check),
                             ));
                         }
+                        continue;
+                    }
+                    if let AlterTableEdit::DropColumn {
+                        name,
+                        if_exists,
+                        cascade,
+                    } = action
+                    {
+                        let Some(ci) = table
+                            .columns
+                            .iter()
+                            .position(|c| c.name.eq_ignore_ascii_case(&name))
+                        else {
+                            if if_exists {
+                                continue;
+                            }
+                            return Err(EngineError::new(
+                                SqlState::UndefinedColumn,
+                                format!("column does not exist: {name}"),
+                            ));
+                        };
+                        if table.pk.contains(&ci) {
+                            return Err(EngineError::new(
+                                SqlState::FeatureNotSupported,
+                                "dropping a primary-key column is not supported yet".to_string(),
+                            ));
+                        }
+                        let dropped_source = column_sources[ci].clone();
+                        let expr_uses =
+                            |e: &Expr| check_referenced_columns(e, &table.columns).contains(&ci);
+                        let check_dep = table.checks.iter().any(|c| expr_uses(&c.expr));
+                        let index_dep = table.indexes.iter().any(|ix| {
+                            ix.keys.iter().any(|k| match k {
+                                IndexKey::Column(c) => *c == ci,
+                                IndexKey::Expr(e) => expr_uses(&e.expr),
+                            }) || ix.predicate.as_ref().is_some_and(|p| expr_uses(&p.expr))
+                        });
+                        let fk_dep = table.foreign_keys.iter().any(|fk| {
+                            fk.columns.contains(&ci)
+                                || (fk.ref_table.eq_ignore_ascii_case(&table.name)
+                                    && fk.ref_columns.contains(&ci))
+                        });
+                        let exclusion_dep = table
+                            .exclusions
+                            .iter()
+                            .any(|e| e.elements.iter().any(|x| x.column == ci));
+                        let incoming_dep = match column_sources[ci] {
+                            ColumnSource::Original(old_ci) => snap.tables.iter().any(|(key, t)| {
+                                !key.eq_ignore_ascii_case(&old_key)
+                                    && t.foreign_keys.iter().any(|fk| {
+                                        fk.ref_table.eq_ignore_ascii_case(&original.name)
+                                            && fk.ref_columns.contains(&old_ci)
+                                            && !cascade_dropped_column_fks.contains(&(
+                                                key.to_ascii_lowercase(),
+                                                fk.name.to_ascii_lowercase(),
+                                            ))
+                                            && !cascade_unique_cols
+                                                .iter()
+                                                .any(|cols| *cols == sorted_unique(&fk.ref_columns))
+                                    })
+                            }),
+                            ColumnSource::Added(_) => false,
+                        };
+                        if !cascade
+                            && (check_dep || index_dep || fk_dep || exclusion_dep || incoming_dep)
+                        {
+                            return Err(EngineError::new(
+                                SqlState::DependentObjectsStillExist,
+                                format!(
+                                    "cannot drop column {name} because other objects depend on it"
+                                ),
+                            ));
+                        }
+                        if cascade {
+                            if let ColumnSource::Original(old_ci) = column_sources[ci] {
+                                for (key, child) in snap.tables.iter() {
+                                    if key.eq_ignore_ascii_case(&old_key) {
+                                        continue;
+                                    }
+                                    for fk in &child.foreign_keys {
+                                        if fk.ref_table.eq_ignore_ascii_case(&original.name)
+                                            && fk.ref_columns.contains(&old_ci)
+                                        {
+                                            cascade_dropped_column_fks.insert((
+                                                key.to_ascii_lowercase(),
+                                                fk.name.to_ascii_lowercase(),
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            let mut removed = Vec::<String>::new();
+                            table.checks.retain(|c| {
+                                let keep = !check_referenced_columns(&c.expr, &table.columns)
+                                    .contains(&ci);
+                                if !keep {
+                                    removed.push(c.name.to_ascii_lowercase());
+                                }
+                                keep
+                            });
+                            table.indexes.retain(|ix| {
+                                let uses = ix.keys.iter().any(|k| match k {
+                                    IndexKey::Column(c) => *c == ci,
+                                    IndexKey::Expr(e) => {
+                                        check_referenced_columns(&e.expr, &table.columns)
+                                            .contains(&ci)
+                                    }
+                                }) || ix.predicate.as_ref().is_some_and(|p| {
+                                    check_referenced_columns(&p.expr, &table.columns).contains(&ci)
+                                });
+                                if uses {
+                                    removed.push(ix.name.to_ascii_lowercase());
+                                }
+                                !uses
+                            });
+                            table.foreign_keys.retain(|fk| {
+                                let uses = fk.columns.contains(&ci)
+                                    || (fk.ref_table.eq_ignore_ascii_case(&table.name)
+                                        && fk.ref_columns.contains(&ci));
+                                if uses {
+                                    removed.push(fk.name.to_ascii_lowercase());
+                                }
+                                !uses
+                            });
+                            table.exclusions.retain(|e| {
+                                let uses = e.elements.iter().any(|x| x.column == ci);
+                                if uses {
+                                    removed.push(e.name.to_ascii_lowercase());
+                                }
+                                !uses
+                            });
+                            for name in removed {
+                                added_constraints.remove(&name);
+                            }
+                        }
+                        table.columns.remove(ci);
+                        column_sources.remove(ci);
+                        for p in &mut table.pk {
+                            if *p > ci {
+                                *p -= 1;
+                            }
+                        }
+                        for ix in &mut table.indexes {
+                            for key in &mut ix.keys {
+                                if let IndexKey::Column(c) = key {
+                                    if *c > ci {
+                                        *c -= 1;
+                                    }
+                                }
+                            }
+                        }
+                        for fk in &mut table.foreign_keys {
+                            for c in &mut fk.columns {
+                                if *c > ci {
+                                    *c -= 1;
+                                }
+                            }
+                            if fk.ref_table.eq_ignore_ascii_case(&table.name) {
+                                for c in &mut fk.ref_columns {
+                                    if *c > ci {
+                                        *c -= 1;
+                                    }
+                                }
+                            }
+                        }
+                        for ex in &mut table.exclusions {
+                            for el in &mut ex.elements {
+                                if el.column > ci {
+                                    el.column -= 1;
+                                }
+                            }
+                        }
+                        // The owned sequence is part of the dropped column. Remove an existing one
+                        // during action processing so later actions see its relation name as free and
+                        // cannot advance it through a later DEFAULT before final ordinal remapping.
+                        if let ColumnSource::Original(old_ci) = dropped_source {
+                            let owned: Vec<String> = snap
+                                .sequences_owned_by(&original.name)
+                                .into_iter()
+                                .filter(|key| {
+                                    snap.sequence(key)
+                                        .and_then(|seq| seq.owned_by.as_ref())
+                                        .is_some_and(|owner| usize::from(owner.column) == old_ci)
+                                })
+                                .collect();
+                            for key in owned {
+                                dropped_owned_sequences.insert(key.clone());
+                                self.remove_sequence_routed(&key);
+                            }
+                        }
+                        pending_serials.retain_mut(|seq| {
+                            let Some(owner) = &mut seq.owned_by else {
+                                return true;
+                            };
+                            if !owner.table.eq_ignore_ascii_case(&table.name) {
+                                return true;
+                            }
+                            if usize::from(owner.column) == ci {
+                                return false;
+                            }
+                            if usize::from(owner.column) > ci {
+                                owner.column -= 1;
+                            }
+                            true
+                        });
                         continue;
                     }
                     if let AlterTableEdit::AddConstraint(def) = action {
@@ -1777,7 +2005,12 @@ impl Engine {
                                 }
                                 let name = if let Some(name) = d.name {
                                     check_reserved_name("constraint", &name)?;
-                                    if working_relation_taken(&table, &pending_serials, &name) {
+                                    if working_relation_taken(
+                                        &table,
+                                        &pending_serials,
+                                        &dropped_owned_sequences,
+                                        &name,
+                                    ) {
                                         return Err(EngineError::new(
                                             SqlState::DuplicateTable,
                                             format!("relation already exists: {name}"),
@@ -1804,8 +2037,12 @@ impl Engine {
                                     );
                                     let mut name = base.clone();
                                     let mut suffix = 0u32;
-                                    while working_relation_taken(&table, &pending_serials, &name)
-                                        || constraint_name_taken(&table, &name)
+                                    while working_relation_taken(
+                                        &table,
+                                        &pending_serials,
+                                        &dropped_owned_sequences,
+                                        &name,
+                                    ) || constraint_name_taken(&table, &name)
                                     {
                                         suffix += 1;
                                         name = format!("{base}{suffix}");
@@ -1977,7 +2214,12 @@ impl Engine {
                                 )?;
                                 let name = if let Some(name) = d.name {
                                     check_reserved_name("constraint", &name)?;
-                                    if working_relation_taken(&table, &pending_serials, &name) {
+                                    if working_relation_taken(
+                                        &table,
+                                        &pending_serials,
+                                        &dropped_owned_sequences,
+                                        &name,
+                                    ) {
                                         return Err(EngineError::new(
                                             SqlState::DuplicateTable,
                                             format!("relation already exists: {name}"),
@@ -2004,8 +2246,12 @@ impl Engine {
                                     );
                                     let mut name = base.clone();
                                     let mut suffix = 0u32;
-                                    while working_relation_taken(&table, &pending_serials, &name)
-                                        || constraint_name_taken(&table, &name)
+                                    while working_relation_taken(
+                                        &table,
+                                        &pending_serials,
+                                        &dropped_owned_sequences,
+                                        &name,
+                                    ) || constraint_name_taken(&table, &name)
                                     {
                                         suffix += 1;
                                         name = format!("{base}{suffix}");
@@ -2070,15 +2316,46 @@ impl Engine {
                             .cloned()
                         {
                             let cols = sorted_unique(&ix.column_ordinals().unwrap());
-                            let deps = table
+                            let original_cols: Option<Vec<usize>> = cols
+                                .iter()
+                                .map(|&col| match column_sources.get(col) {
+                                    Some(ColumnSource::Original(old)) => Some(*old),
+                                    _ => None,
+                                })
+                                .collect::<Option<Vec<_>>>()
+                                .map(|x| sorted_unique(&x));
+                            let local_deps = table
                                 .foreign_keys
                                 .iter()
-                                .chain(snap.tables.values().flat_map(|t| t.foreign_keys.iter()))
                                 .filter(|f| {
                                     f.ref_table.eq_ignore_ascii_case(&table.name)
                                         && sorted_unique(&f.ref_columns) == cols
                                 })
                                 .count();
+                            let mut external_deps = 0usize;
+                            if let Some(old_cols) = &original_cols {
+                                for (key, child) in snap.tables.iter() {
+                                    if key.eq_ignore_ascii_case(&old_key) {
+                                        continue;
+                                    }
+                                    for fk in &child.foreign_keys {
+                                        let fk_cols = sorted_unique(&fk.ref_columns);
+                                        if fk.ref_table.eq_ignore_ascii_case(&table.name)
+                                            && fk_cols == *old_cols
+                                            && !cascade_dropped_column_fks.contains(&(
+                                                key.to_ascii_lowercase(),
+                                                fk.name.to_ascii_lowercase(),
+                                            ))
+                                            && !cascade_unique_cols
+                                                .iter()
+                                                .any(|prior| *prior == fk_cols)
+                                        {
+                                            external_deps += 1;
+                                        }
+                                    }
+                                }
+                            }
+                            let deps = local_deps + external_deps;
                             if deps > 0 && !cascade {
                                 return Err(EngineError::new(
                                     SqlState::DependentObjectsStillExist,
@@ -2088,7 +2365,9 @@ impl Engine {
                                 ));
                             }
                             if cascade {
-                                cascade_unique_cols.push(cols.clone());
+                                if let Some(old_cols) = original_cols {
+                                    cascade_unique_cols.push(old_cols);
+                                }
                                 table.foreign_keys.retain(|f| {
                                     !(f.ref_table.eq_ignore_ascii_case(&table.name)
                                         && sorted_unique(&f.ref_columns) == cols)
@@ -2171,7 +2450,16 @@ impl Engine {
             .filter(|q| !matches!(q.to_ascii_lowercase().as_str(), "main" | "temp"))
             .map(|q| self.attach_page_size(&q.to_ascii_lowercase()))
             .unwrap_or(self.page_size);
-        let rewrite_col_types: Option<Vec<ColType>> = (!added_columns.is_empty()).then(|| {
+        let rewrite_needed = column_sources.len() != original.columns.len()
+            || column_sources
+                .iter()
+                .enumerate()
+                .any(|(i, source)| !matches!(source, ColumnSource::Original(old) if *old == i));
+        let pk_rekeyed = table.pk.len() != original.pk.len()
+            || table.pk.iter().zip(&original.pk).any(|(&next, &old)| {
+                !matches!(column_sources.get(next), Some(ColumnSource::Original(source)) if *source == old)
+            });
+        let rewrite_col_types: Option<Vec<ColType>> = rewrite_needed.then(|| {
             let main = self.read_snap();
             table
                 .columns
@@ -2182,7 +2470,7 @@ impl Engine {
         let mut meter = self.session.new_meter();
         let mut rewrite_entries: Option<Vec<(Vec<u8>, Row)>> = None;
         let mut rewrite_next_rowid = 0i64;
-        if !added_columns.is_empty() {
+        if rewrite_needed {
             // Make owned sequences visible to their synthesized nextval defaults. Statement-level
             // rollback restores the prior working root if any later validation fails.
             for seq in pending_serials.iter().cloned() {
@@ -2199,18 +2487,23 @@ impl Engine {
             let (mut rows, pages, slabs) = store.scan_with_units(&old_mask)?;
             rewrite_next_rowid = store.next_rowid();
             meter.charge(COSTS.page_read * pages as i64 + COSTS.value_decompress * slabs as i64);
+            let generated: Vec<Column> = column_sources
+                .iter()
+                .filter_map(|source| match source {
+                    ColumnSource::Added(c) => Some(c.clone()),
+                    ColumnSource::Original(_) => None,
+                })
+                .collect();
             let defaults = self.resolve_default_exprs(&Table {
                 name: table.name.clone(),
-                columns: added_columns.clone(),
+                columns: generated,
                 pk: Vec::new(),
                 checks: Vec::new(),
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
                 exclusions: Vec::new(),
             })?;
-            let first = original.columns.len();
             let rng = std::cell::Cell::new(crate::seam::StmtRng::new());
-            let rekey = table.pk != original.pk;
             let pk: Vec<(usize, Type)> = table
                 .pk
                 .iter()
@@ -2223,16 +2516,30 @@ impl Engine {
                 meter.guard()?;
                 meter.charge(COSTS.storage_row_read);
                 store.resolve_all(row)?;
-                for i in first..table.columns.len() {
-                    let added = &added_columns[i - first];
-                    let value =
-                        self.eval_default(added, defaults[i - first].as_ref(), &rng, &mut meter)?;
+                let old_row = std::mem::take(row);
+                let mut next_row = Vec::with_capacity(column_sources.len());
+                let mut generated_i = 0usize;
+                for (i, source) in column_sources.iter().enumerate() {
+                    let value = match source {
+                        ColumnSource::Original(old) => old_row[*old].clone(),
+                        ColumnSource::Added(added) => {
+                            let value = self.eval_default(
+                                added,
+                                defaults[generated_i].as_ref(),
+                                &rng,
+                                &mut meter,
+                            )?;
+                            generated_i += 1;
+                            value
+                        }
+                    };
                     if table.columns[i].not_null && matches!(value, Value::Null) {
                         return Err(EngineError::not_null_violation(&table.columns[i].name));
                     }
-                    row.push(value);
+                    next_row.push(value);
                 }
-                if rekey {
+                *row = next_row;
+                if pk_rekeyed {
                     *key = encode_pk_key(&pk, &colls, row)?;
                     if !seen_keys.insert(key.clone()) {
                         return Err(EngineError::unique_violation(
@@ -2253,12 +2560,16 @@ impl Engine {
             rewrite_entries = Some(rows);
         }
 
-        let mask: Vec<bool> = table
-            .columns
-            .iter()
-            .zip(&original.columns)
-            .map(|(n, o)| !o.not_null && n.not_null)
-            .collect();
+        let mut mask = vec![false; original.columns.len()];
+        let mut not_null_names = vec![None::<String>; original.columns.len()];
+        for (i, source) in column_sources.iter().enumerate() {
+            if let ColumnSource::Original(old) = source {
+                if !original.columns[*old].not_null && table.columns[i].not_null {
+                    mask[*old] = true;
+                    not_null_names[*old] = Some(table.columns[i].name.clone());
+                }
+            }
+        }
         if mask.iter().any(|x| *x) {
             let store = self.store_scoped(at.db.as_deref(), &original.name);
             let (entries, pages, slabs) = store.scan_with_units(&mask)?;
@@ -2269,13 +2580,24 @@ impl Engine {
                 store.resolve_inline_columns(&mut row)?;
                 for (i, check) in mask.iter().enumerate() {
                     if *check && matches!(row[i], Value::Null) {
-                        return Err(EngineError::not_null_violation(&table.columns[i].name));
+                        return Err(EngineError::not_null_violation(
+                            not_null_names[i].as_deref().unwrap(),
+                        ));
                     }
                 }
             }
         }
         let mut constraint_entries = std::collections::HashMap::<String, Vec<Vec<u8>>>::new();
         if !added_constraints.is_empty() {
+            // Presence in this map is also the publication-time identity marker for a newly-added
+            // backing index. Seed empty indexes so DROP+ADD name reuse cannot retain the old store.
+            for ix in table
+                .indexes
+                .iter()
+                .filter(|ix| added_constraints.contains(&ix.name.to_ascii_lowercase()))
+            {
+                constraint_entries.insert(ix.name.to_ascii_lowercase(), Vec::new());
+            }
             let store = self.store_scoped(at.db.as_deref(), &original.name);
             let rows = if let Some(rows) = &rewrite_entries {
                 rows.clone()
@@ -2391,7 +2713,7 @@ impl Engine {
                 es.sort();
             }
         }
-        let rekeyed = rewrite_entries.is_some() && table.pk != original.pk;
+        let rekeyed = rewrite_entries.is_some() && pk_rekeyed;
         if rekeyed {
             constraint_entries.clear();
             let colls = self.column_collations(&table.columns);
@@ -2431,6 +2753,19 @@ impl Engine {
             ws.sync_alter_constraint_indexes(&original, &table, &constraint_entries, page_size)?;
         }
         ws.cascade_dropped_unique_fks(&table.name, &cascade_unique_cols);
+        if rewrite_needed {
+            let mut original_to_new = vec![None; original.columns.len()];
+            for (next, source) in column_sources.iter().enumerate() {
+                if let ColumnSource::Original(old) = source {
+                    original_to_new[*old] = Some(next);
+                }
+            }
+            let pending: std::collections::HashSet<String> = pending_serials
+                .iter()
+                .map(|s| s.name.to_ascii_lowercase())
+                .collect();
+            ws.remap_alter_column_dependents(&table.name, &original_to_new, &pending);
+        }
         Ok(Outcome::Statement {
             cost: meter.accrued,
             rows_affected: None,

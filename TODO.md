@@ -139,7 +139,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     the FOREIGN KEY and GiST/EXCLUDE items above (alter.md §2.6/§2.7). _(size: M)_
   - [x] _slice 3:_ `ADD COLUMN [constraints]` — the first rewrite; per-row `DEFAULT` evaluation through
     the entropy/clock seam (alter.md §3.1). _(size: L)_
-  - [ ] _slice 4:_ `DROP COLUMN` — the ordinal renumber + `RESTRICT`/`CASCADE` dependency handling
+  - [x] _slice 4:_ `DROP COLUMN` — the ordinal renumber + `RESTRICT`/`CASCADE` dependency handling
     (non-PK columns); ledgered PG divergence: jed physically removes, no `attisdropped` tombstone
     (alter.md §3.2). _(size: L)_
   - [ ] _slice 5:_ `ALTER COLUMN … TYPE … [USING]` + `ADD`/`DROP PRIMARY KEY` — the re-encode/re-key

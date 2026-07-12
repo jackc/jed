@@ -179,6 +179,18 @@ fn alter_add_column_meters_compress_attempts_per_rewritten_row() {
 }
 
 #[test]
+fn alter_drop_column_meters_compress_attempts_per_rewritten_row() {
+    let mut db = two_tables();
+    cost(&mut db, "ALTER TABLE comp ADD extra i32");
+    cost(&mut db, "ALTER TABLE control ADD extra i32");
+    let read_delta = cost(&mut db, "SELECT * FROM comp") - cost(&mut db, "SELECT * FROM control");
+    let comp = cost(&mut db, "ALTER TABLE comp DROP extra");
+    let control = cost(&mut db, "ALTER TABLE control DROP extra");
+    assert_eq!(read_delta, SLABS_600);
+    assert_eq!(comp, control + read_delta + SLABS_600);
+}
+
+#[test]
 fn decimal_payloads_compress_too() {
     // A long-coefficient decimal's body (flags|scale|ndigits|groups) is a spillable payload
     // like text/bytea (large-values.md §12/§13). 801 digits (an "12"-run plus ".5" so the

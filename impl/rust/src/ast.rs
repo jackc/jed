@@ -57,7 +57,7 @@ pub enum Statement {
     Rollback,
 }
 
-/// `ALTER TABLE` slices 1-3 (spec/design/alter.md): one standalone rename or a comma-separated
+/// `ALTER TABLE` slices 1-4 (spec/design/alter.md): one standalone rename or a comma-separated
 /// mixed action list. The parser guarantees rename/actions are never mixed.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct AlterTable {
@@ -83,6 +83,11 @@ pub enum AlterTableEdit {
         uniques: Vec<UniqueDef>,
         foreign_keys: Vec<ForeignKeyDef>,
         if_not_exists: bool,
+    },
+    DropColumn {
+        name: String,
+        if_exists: bool,
+        cascade: bool,
     },
     AlterColumn(AlterColumnAction),
     AddConstraint(AlterConstraintDef),

@@ -215,9 +215,9 @@ drop_table     ::= "DROP" "TABLE" ("IF" "EXISTS")? identifier ("," identifier)*
                    ("CASCADE" | "RESTRICT")?
 
 /* ALTER TABLE (../design/alter.md §1). RENAME is standalone; every other action participates in the
- * comma-separated, left-to-right, all-or-nothing frame. Slices 1-3 implement RENAME, the catalog-
- * only DEFAULT / NOT NULL edits, ADD/DROP CONSTRAINT, and ADD COLUMN. DROP COLUMN and ALTER COLUMN
- * TYPE are authoritative grammar that report 0A000 until their later slices land. */
+ * comma-separated, left-to-right, all-or-nothing frame. Slices 1-4 implement RENAME, the catalog-
+ * only DEFAULT / NOT NULL edits, ADD/DROP CONSTRAINT, and ADD/DROP COLUMN. ALTER COLUMN TYPE is
+ * authoritative grammar that reports 0A000 until its later slice lands. */
 alter_table    ::= "ALTER" "TABLE" ("IF" "EXISTS")? qualified_table
                    ( "RENAME" ( "COLUMN"? identifier "TO" identifier
                                 | "CONSTRAINT" identifier "TO" identifier

@@ -845,8 +845,13 @@ impl Snapshot {
             .collect();
         for i in &next.indexes {
             let k = i.name.to_ascii_lowercase();
-            if prior.contains(&k) {
+            let rebuild = entries.contains_key(&k);
+            if prior.contains(&k) && !rebuild {
                 continue;
+            }
+            if rebuild {
+                std::sync::Arc::make_mut(&mut self.index_stores).remove(&k);
+                std::sync::Arc::make_mut(&mut self.gist_trees).remove(&k);
             }
             let mut s = TableStore::new(crate::format::page_payload(page_size), Vec::new());
             if let Some(p) = &self.store_paging {
@@ -899,6 +904,74 @@ impl Snapshot {
                 !fk.ref_table.eq_ignore_ascii_case(parent)
                     || !dropped.iter().any(|c| *c == sorted_unique(&fk.ref_columns))
             });
+        }
+    }
+
+    /// Repair cross-table FK ordinals and owned-sequence links after DROP COLUMN compacts a table's
+    /// dense ordinals. A referenced dropped column has already passed CASCADE validation, so its FK
+    /// is removed; every surviving reference is mapped to the compacted ordinal.
+    pub(crate) fn remap_alter_column_dependents(
+        &mut self,
+        parent: &str,
+        original_to_new: &[Option<usize>],
+        pending_sequences: &std::collections::HashSet<String>,
+    ) {
+        let parent_key = parent.to_ascii_lowercase();
+        for (key, child) in std::sync::Arc::make_mut(&mut self.tables) {
+            if key.eq_ignore_ascii_case(&parent_key) {
+                continue;
+            }
+            let mut changed = false;
+            let mut fks = Vec::with_capacity(child.foreign_keys.len());
+            for fk in &child.foreign_keys {
+                if !fk.ref_table.eq_ignore_ascii_case(parent) {
+                    fks.push(fk.clone());
+                    continue;
+                }
+                let mapped: Option<Vec<usize>> = fk
+                    .ref_columns
+                    .iter()
+                    .map(|&old| original_to_new.get(old).copied().flatten())
+                    .collect();
+                if let Some(ref_columns) = mapped {
+                    let mut next = fk.clone();
+                    changed |= next.ref_columns != ref_columns;
+                    next.ref_columns = ref_columns;
+                    fks.push(next);
+                } else {
+                    changed = true;
+                }
+            }
+            if changed {
+                child.foreign_keys = fks;
+            }
+        }
+        let sequences = std::sync::Arc::make_mut(&mut self.sequences);
+        let keys: Vec<String> = sequences.keys().cloned().collect();
+        for key in keys {
+            if pending_sequences.contains(&key) {
+                continue;
+            }
+            let Some(seq) = sequences.get(&key) else {
+                continue;
+            };
+            let Some(owner) = &seq.owned_by else {
+                continue;
+            };
+            if !owner.table.eq_ignore_ascii_case(parent) {
+                continue;
+            }
+            let mapped = original_to_new
+                .get(usize::from(owner.column))
+                .copied()
+                .flatten();
+            if let Some(column) = mapped {
+                let mut next = seq.clone();
+                next.owned_by.as_mut().unwrap().column = column as u16;
+                sequences.insert(key, next);
+            } else {
+                sequences.remove(&key);
+            }
         }
     }
 

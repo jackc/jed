@@ -1,5 +1,5 @@
 # skip: disk — explicit transactions span records, while disk mode reopens after every record.
-# ALTER TABLE slices 1-3 participate in ordinary transactional rollback and READ ONLY admission.
+# ALTER TABLE slices 1-4 participate in ordinary transactional rollback and READ ONLY admission.
 # requires: ddl.alter_table, ddl.create_table, ddl.primary_key, ddl.column_default, dml.insert, query.select, txn.explicit, txn.read_only, types.i32
 
 statement ok
@@ -39,11 +39,36 @@ ROLLBACK
 statement error 42703
 SELECT added FROM alter_tx
 
+# A DROP rewrite and its dense catalog compaction roll back together too.
+statement ok
+BEGIN
+
+statement ok
+ALTER TABLE alter_tx DROP v
+
+statement ok
+ROLLBACK
+
+query II nosort
+SELECT id, v FROM alter_tx
+----
+1
+2
+
 statement ok
 BEGIN READ ONLY
 
 statement error 25006
 ALTER TABLE alter_tx ALTER v SET DEFAULT 9
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN READ ONLY
+
+statement error 25006
+ALTER TABLE alter_tx DROP v
 
 statement ok
 ROLLBACK

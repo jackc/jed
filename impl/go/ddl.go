@@ -1472,7 +1472,7 @@ func (db *engine) executeDropTable(dt *dropTable) (outcome, error) {
 	return outcome{Kind: outcomeStatement, Cost: 0}, nil
 }
 
-// executeAlterTable implements ALTER TABLE slices 1-3 (alter.md §1-§3.1).
+// executeAlterTable implements ALTER TABLE slices 1-4 (alter.md §1-§3.2).
 // It edits one private table copy, validates the final state, and publishes one catalog mutation.
 func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 	if err := checkCatalogRelWrite(at.Name); err != nil {
@@ -1517,12 +1517,26 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 	oldKey := strings.ToLower(original.Name)
 	table := *original
 	table.Columns = append([]catColumn(nil), original.Columns...)
+	table.PK = append([]int(nil), original.PK...)
 	table.Checks = append([]checkConstraint(nil), original.Checks...)
 	table.Indexes = append([]indexDef(nil), original.Indexes...)
+	for i := range table.Indexes {
+		table.Indexes[i].Keys = append([]indexKey(nil), original.Indexes[i].Keys...)
+	}
 	table.ForeignKeys = append([]foreignKey(nil), original.ForeignKeys...)
+	for i := range table.ForeignKeys {
+		table.ForeignKeys[i].Columns = append([]int(nil), original.ForeignKeys[i].Columns...)
+		table.ForeignKeys[i].RefColumns = append([]int(nil), original.ForeignKeys[i].RefColumns...)
+	}
 	table.Exclusions = append([]exclusionConstraint(nil), original.Exclusions...)
+	for i := range table.Exclusions {
+		table.Exclusions[i].Elements = append([]exclusionElement(nil), original.Exclusions[i].Elements...)
+	}
 	constraintState := newAlterConstraintState()
-	var addedColumns []catColumn
+	columnSources := make([]alterColumnSource, len(original.Columns))
+	for i := range columnSources {
+		columnSources[i].original = i
+	}
 	var pendingSerials []*sequenceDef
 	indexOld, indexNew := "", ""
 	renameTable := ""
@@ -1699,7 +1713,8 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 				if col.PrimaryKey {
 					table.PK = []int{len(table.Columns) - 1}
 				}
-				addedColumns = append(addedColumns, col)
+				captured := col
+				columnSources = append(columnSources, alterColumnSource{original: -1, added: &captured})
 				var inline []alterTableEdit
 				for i := range add.Checks {
 					d := add.Checks[i]
@@ -1719,6 +1734,12 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 				actions = append(inline, actions...)
 				continue
 			}
+			if a.DropColumn != nil {
+				if err := dropAlterColumn(&table, a.DropColumn, snap, original, oldKey, &columnSources, &pendingSerials, constraintState); err != nil {
+					return outcome{}, err
+				}
+				continue
+			}
 			if a.Add != nil {
 				if (snap == db.tempSnap()) && (a.Add.Foreign != nil || a.Add.Exclude != nil) {
 					return outcome{}, newError(FeatureNotSupported, "this constraint is not supported on a temporary table")
@@ -1732,7 +1753,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 				continue
 			}
 			if a.Drop != nil {
-				if err := db.dropAlterConstraint(&table, a.Drop, snap, constraintState); err != nil {
+				if err := db.dropAlterConstraint(&table, a.Drop, snap, columnSources, constraintState); err != nil {
 					return outcome{}, err
 				}
 				continue
@@ -1781,8 +1802,26 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 	if isAttachmentScope(at.DB) {
 		alterPageSize = db.attachPageSize(strings.ToLower(*at.DB))
 	}
+	rewriteNeeded := len(columnSources) != len(original.Columns)
+	if !rewriteNeeded {
+		for i, source := range columnSources {
+			if source.original != i {
+				rewriteNeeded = true
+				break
+			}
+		}
+	}
+	pkRekeyed := len(table.PK) != len(original.PK)
+	if !pkRekeyed {
+		for i, next := range table.PK {
+			if next < 0 || next >= len(columnSources) || columnSources[next].original != original.PK[i] {
+				pkRekeyed = true
+				break
+			}
+		}
+	}
 	var rewriteColTypes []colType
-	if len(addedColumns) > 0 {
+	if rewriteNeeded {
 		rewriteColTypes = make([]colType, len(table.Columns))
 		for i, c := range table.Columns {
 			rewriteColTypes[i] = resolveColType(c.Type, db.readSnap().types)
@@ -1791,7 +1830,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 	meter := db.session.newMeter()
 	var rewriteRows []entry
 	rewriteNextRowid := int64(0)
-	if len(addedColumns) > 0 {
+	if rewriteNeeded {
 		for _, seq := range pendingSerials {
 			var sw *snapshot
 			if at.DB == nil {
@@ -1826,13 +1865,17 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 		rewriteNextRowid = store.nextRowid
 		meter.Charge(costs.PageRead*int64(pages) + costs.ValueDecompress*int64(slabs))
 		defaultTable := table
-		defaultTable.Columns = append([]catColumn(nil), addedColumns...)
+		defaultTable.Columns = nil
+		for _, source := range columnSources {
+			if source.added != nil {
+				defaultTable.Columns = append(defaultTable.Columns, *source.added)
+			}
+		}
 		defaults, err := db.resolveDefaultExprs(&defaultTable)
 		if err != nil {
 			return outcome{}, err
 		}
 		rng := newStmtRng()
-		rekey := !slices.Equal(table.PK, original.PK)
 		colls := db.columnCollations(table.Columns)
 		seenKeys := map[string]bool{}
 		compressUnits := int64(0)
@@ -1845,11 +1888,19 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 			if err != nil {
 				return outcome{}, err
 			}
-			for ci := len(original.Columns); ci < len(table.Columns); ci++ {
-				added := addedColumns[ci-len(original.Columns)]
-				v, err := db.evalDefault(added, defaults[ci-len(original.Columns)], rng, meter)
-				if err != nil {
-					return outcome{}, err
+			oldRow := row
+			row = make(storedRow, 0, len(columnSources))
+			generated := 0
+			for ci, source := range columnSources {
+				var v Value
+				if source.original >= 0 {
+					v = oldRow[source.original]
+				} else {
+					v, err = db.evalDefault(*source.added, defaults[generated], rng, meter)
+					if err != nil {
+						return outcome{}, err
+					}
+					generated++
 				}
 				if table.Columns[ci].NotNull && v.IsNull() {
 					return outcome{}, newNotNullViolation(table.Columns[ci].Name)
@@ -1857,7 +1908,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 				row = append(row, v)
 			}
 			rows[i].Row = row
-			if rekey {
+			if pkRekeyed {
 				key, err := encodePkKey(&table, table.PK, colls, row)
 				if err != nil {
 					return outcome{}, err
@@ -1876,9 +1927,13 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 		}
 		rewriteRows = rows
 	}
-	mask := make([]bool, len(table.Columns))
-	for i := range original.Columns {
-		mask[i] = !original.Columns[i].NotNull && table.Columns[i].NotNull
+	mask := make([]bool, len(original.Columns))
+	notNullNames := make([]string, len(original.Columns))
+	for i, source := range columnSources {
+		if source.original >= 0 && !original.Columns[source.original].NotNull && table.Columns[i].NotNull {
+			mask[source.original] = true
+			notNullNames[source.original] = table.Columns[i].Name
+		}
 	}
 	if slices.Contains(mask, true) {
 		store := db.lkpStoreScoped(at.DB, original.Name)
@@ -1898,7 +1953,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 			}
 			for i, check := range mask {
 				if check && row[i].IsNull() {
-					return outcome{}, newNotNullViolation(table.Columns[i].Name)
+					return outcome{}, newNotNullViolation(notNullNames[i])
 				}
 			}
 		}
@@ -1907,7 +1962,7 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 	if err != nil {
 		return outcome{}, err
 	}
-	rekeyed := rewriteRows != nil && !slices.Equal(table.PK, original.PK)
+	rekeyed := rewriteRows != nil && pkRekeyed
 	if rekeyed {
 		constraintEntries = map[string][][]byte{}
 		colls := db.columnCollations(table.Columns)
@@ -1963,6 +2018,22 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 	}
 	for key, changed := range constraintState.other {
 		ws.tables[key] = changed
+	}
+	if rewriteNeeded {
+		originalToNew := make([]int, len(original.Columns))
+		for i := range originalToNew {
+			originalToNew[i] = -1
+		}
+		for next, source := range columnSources {
+			if source.original >= 0 {
+				originalToNew[source.original] = next
+			}
+		}
+		pending := map[string]bool{}
+		for _, seq := range pendingSerials {
+			pending[strings.ToLower(seq.Name)] = true
+		}
+		ws.remapAlterColumnDependents(table.Name, originalToNew, pending)
 	}
 	return outcome{Kind: outcomeStatement, Cost: meter.Accrued}, nil
 }

@@ -1714,8 +1714,8 @@ func (p *parser) parseDropSequence() (*dropSequence, error) {
 	return &dropSequence{Names: names, IfExists: ifExists}, nil
 }
 
-// parseAlterTable parses ALTER TABLE's authoritative grammar frame (alter.md §1). Slices 1-3 execute
-// RENAME, ADD COLUMN, catalog-only ALTER COLUMN edits, and ADD/DROP non-PK constraints.
+// parseAlterTable parses ALTER TABLE's authoritative grammar frame (alter.md §1). Slices 1-4 execute
+// RENAME, ADD/DROP COLUMN, catalog-only ALTER COLUMN edits, and ADD/DROP non-PK constraints.
 func (p *parser) parseAlterTable() (*alterTable, error) {
 	if err := p.expectKeyword("alter"); err != nil {
 		return nil, err
@@ -1844,10 +1844,10 @@ func (p *parser) parseAlterTable() (*alterTable, error) {
 			at.Actions = append(at.Actions, alterTableEdit{Add: &add})
 		case "drop":
 			p.advance()
-			if p.peekKeyword() != "constraint" {
-				return nil, newError(FeatureNotSupported, "ALTER TABLE ... DROP COLUMN is not supported yet")
+			constraint := p.peekKeyword() == "constraint"
+			if constraint || p.peekKeyword() == "column" {
+				p.advance()
 			}
-			p.advance()
 			ifExists := false
 			if p.peekKeyword() == "if" {
 				p.advance()
@@ -1867,7 +1867,11 @@ func (p *parser) parseAlterTable() (*alterTable, error) {
 			} else if p.peekKeyword() == "restrict" {
 				p.advance()
 			}
-			at.Actions = append(at.Actions, alterTableEdit{Drop: &dropConstraintDef{Name: name, IfExists: ifExists, Cascade: cascade}})
+			if constraint {
+				at.Actions = append(at.Actions, alterTableEdit{Drop: &dropConstraintDef{Name: name, IfExists: ifExists, Cascade: cascade}})
+			} else {
+				at.Actions = append(at.Actions, alterTableEdit{DropColumn: &alterDropColumn{Name: name, IfExists: ifExists, Cascade: cascade}})
+			}
 		default:
 			if err := p.expectKeyword("alter"); err != nil {
 				return nil, err

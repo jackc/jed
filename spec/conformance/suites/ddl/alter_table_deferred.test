@@ -12,9 +12,6 @@ statement error 42704
 ALTER TABLE deferred_alter RENAME CONSTRAINT deferred_alter_pkey TO renamed_pkey
 
 statement error 0A000
-ALTER TABLE deferred_alter DROP COLUMN v
-
-statement error 0A000
 ALTER TABLE deferred_alter ADD PRIMARY KEY (v)
 
 statement error 0A000

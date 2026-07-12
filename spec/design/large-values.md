@@ -460,7 +460,7 @@ within `format_version` 3** (the `0x03`/`0x04` tags Slice A reserved), so no ver
   short-circuit under `LIMIT`, and a bound that misses charges nothing. **`value_compress`** fires
   `ceil(raw_len / C)` times per **pass-1 attempt** (adopted or not — the work is done either way),
   charged once per stored row version at the statement's write site (`INSERT` / `UPDATE` / a table
-  rewrite such as `ALTER TABLE … ADD COLUMN`), never for the B-tree's internal re-encodes. Both stay
+  rewrite such as `ALTER TABLE … ADD/DROP COLUMN`), never for the B-tree's internal re-encodes. Both stay
   logical and cross-core identical.
 
 - **Read = eager, like §12** (as Slice B shipped; **superseded by §14 phase 2** for the

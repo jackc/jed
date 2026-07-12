@@ -17,3 +17,16 @@ test("ADD COLUMN rewrite matches equivalent fresh-table bytes", () => {
 
   assert.deepEqual(altered.toImage(8192, 1n), fresh.toImage(8192, 1n));
 });
+
+test("DROP COLUMN rewrite matches equivalent fresh-table bytes", () => {
+  const altered = memDb().session();
+  queryOutcome(altered, "CREATE TABLE t (obsolete text, id i32 PRIMARY KEY, v i32 DEFAULT 7)");
+  queryOutcome(altered, "INSERT INTO t VALUES ('a', 1, 7), ('b', 2, 8)");
+  queryOutcome(altered, "ALTER TABLE t DROP obsolete");
+
+  const fresh = memDb().session();
+  queryOutcome(fresh, "CREATE TABLE t (id i32 PRIMARY KEY, v i32 DEFAULT 7)");
+  queryOutcome(fresh, "INSERT INTO t VALUES (1, 7), (2, 8)");
+
+  assert.deepEqual(altered.toImage(8192, 1n), fresh.toImage(8192, 1n));
+});

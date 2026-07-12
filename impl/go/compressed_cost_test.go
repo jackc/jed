@@ -137,6 +137,22 @@ func TestCompressedCostAlterAddColumnMetersAttemptsPerRewrittenRow(t *testing.T)
 	}
 }
 
+func TestCompressedCostAlterDropColumnMetersAttemptsPerRewrittenRow(t *testing.T) {
+	t.Parallel()
+	db := compressedTables(t)
+	mustCost(t, db, "ALTER TABLE comp ADD extra i32")
+	mustCost(t, db, "ALTER TABLE control ADD extra i32")
+	readDelta := mustCost(t, db, "SELECT * FROM comp") - mustCost(t, db, "SELECT * FROM control")
+	comp := mustCost(t, db, "ALTER TABLE comp DROP extra")
+	control := mustCost(t, db, "ALTER TABLE control DROP extra")
+	if readDelta != slabs600 {
+		t.Fatalf("read delta = %d, want %d", readDelta, slabs600)
+	}
+	if comp != control+readDelta+slabs600 {
+		t.Fatalf("ALTER DROP delta: comp %d, control %d, read %d (want another +%d)", comp, control, readDelta, slabs600)
+	}
+}
+
 func TestCompressedCostDecimalPayloadsCompressToo(t *testing.T) {
 	t.Parallel()
 	// A long-coefficient decimal's body is a spillable payload like text/bytea

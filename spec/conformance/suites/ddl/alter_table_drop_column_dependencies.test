@@ -1,0 +1,157 @@
+# DROP COLUMN dependency behavior that is deliberately stricter than PostgreSQL for same-table
+# objects (alter.md §3.2/§7): RESTRICT blocks local indexes/constraints; CASCADE removes them.
+# jed-specific; do not PostgreSQL-oracle-check.
+# requires: ddl.alter_table, ddl.create_table, ddl.primary_key, ddl.column_default, ddl.check, ddl.unique, ddl.foreign_key, ddl.secondary_index, ddl.index_expr, ddl.index_partial, ddl.exclusion_constraint, dml.insert, query.select, query.order_by, introspect.columns, types.i32, types.range, expr.arithmetic
+
+statement ok
+CREATE TABLE alter_drop_deps (id i32 PRIMARY KEY, doomed i32, keep i32, span i32range, CONSTRAINT doomed_check CHECK (doomed > 0), CONSTRAINT doomed_unique UNIQUE (doomed), CONSTRAINT doomed_excl EXCLUDE USING gist (span WITH &&))
+
+statement ok
+CREATE INDEX alter_drop_expr ON alter_drop_deps ((doomed + 1))
+
+statement ok
+CREATE INDEX alter_drop_partial ON alter_drop_deps (keep) WHERE doomed > 0
+
+statement ok
+INSERT INTO alter_drop_deps VALUES (1, 2, 7, '[1,5)')
+
+statement error 2BP01
+ALTER TABLE alter_drop_deps DROP doomed
+
+# RESTRICT failure is atomic.
+query III nosort
+SELECT id, doomed, keep FROM alter_drop_deps
+----
+1
+2
+7
+
+statement ok
+ALTER TABLE alter_drop_deps DROP doomed CASCADE
+
+# CHECK/UNIQUE/expression/partial dependents disappeared; unrelated EXCLUDE survived its ordinal
+# compaction and still rejects overlap.
+statement ok
+INSERT INTO alter_drop_deps VALUES (2, 7, '[6,9)')
+
+statement error 23P01
+INSERT INTO alter_drop_deps VALUES (3, 8, '[4,7)')
+
+statement ok
+CREATE TABLE alter_drop_fk_parent (id i32 PRIMARY KEY, doomed i32 UNIQUE, keep i32 UNIQUE)
+
+statement ok
+CREATE TABLE alter_drop_fk_child (id i32 PRIMARY KEY, doomed_ref i32 REFERENCES alter_drop_fk_parent (doomed), keep_ref i32 REFERENCES alter_drop_fk_parent (keep))
+
+statement ok
+INSERT INTO alter_drop_fk_parent VALUES (1, 10, 20)
+
+statement ok
+INSERT INTO alter_drop_fk_child VALUES (1, 10, 20)
+
+statement error 2BP01
+ALTER TABLE alter_drop_fk_parent DROP doomed
+
+statement ok
+ALTER TABLE alter_drop_fk_parent DROP doomed CASCADE
+
+# The dependent FK was dropped while the surviving FK's parent ordinal was compacted.
+statement ok
+INSERT INTO alter_drop_fk_child VALUES (2, 999, 20)
+
+statement error 23503
+INSERT INTO alter_drop_fk_child VALUES (3, 999, 999)
+
+# A local FK that uses the dropped referencing column follows the same explicit dependency rule.
+statement ok
+CREATE TABLE alter_drop_local_fk (id i32 PRIMARY KEY, parent_id i32 REFERENCES alter_drop_fk_parent (keep))
+
+statement error 2BP01
+ALTER TABLE alter_drop_local_fk DROP parent_id
+
+statement ok
+ALTER TABLE alter_drop_local_fk DROP parent_id CASCADE
+
+# Dependency state is left-to-right: the first CASCADE removes a composite incoming FK, so a later
+# RESTRICT action in the same statement does not rediscover that already-dropped dependent.
+statement ok
+CREATE TABLE alter_drop_composite_parent (id i32 PRIMARY KEY, a i32, b i32, UNIQUE (a, b))
+
+statement ok
+CREATE TABLE alter_drop_composite_child (id i32 PRIMARY KEY, a i32, b i32, FOREIGN KEY (a, b) REFERENCES alter_drop_composite_parent (a, b))
+
+statement ok
+ALTER TABLE alter_drop_composite_parent DROP a CASCADE, DROP b RESTRICT
+
+statement ok
+INSERT INTO alter_drop_composite_child VALUES (1, 9, 9)
+
+# A later DROP CONSTRAINT resolves its shifted unique-key columns back to the original incoming-FK
+# ordinals before applying CASCADE.
+statement ok
+CREATE TABLE alter_drop_then_constraint_parent (id i32 PRIMARY KEY, obsolete i32, keep i32 UNIQUE)
+
+statement ok
+CREATE TABLE alter_drop_then_constraint_child (id i32 PRIMARY KEY, keep i32 REFERENCES alter_drop_then_constraint_parent (keep))
+
+statement ok
+ALTER TABLE alter_drop_then_constraint_parent DROP obsolete, DROP CONSTRAINT alter_drop_then_constraint_parent_keep_key CASCADE
+
+statement ok
+INSERT INTO alter_drop_then_constraint_child VALUES (1, 999)
+
+# jed's end-state action frame lets a later action see (and cancel) an earlier ADD. With no net row
+# shape change, the statement publishes only its final catalog state.
+statement ok
+CREATE TABLE alter_drop_cancel_add (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO alter_drop_cancel_add VALUES (1)
+
+statement ok
+ALTER TABLE alter_drop_cancel_add ADD transient i32 DEFAULT 9, DROP transient
+
+query I nosort
+SELECT id FROM alter_drop_cancel_add
+----
+1
+
+# Reusing the name of a CASCADE-dropped UNIQUE backing index creates a fresh store for the rewritten
+# rows. The old store contains key 10; the replacement must instead contain the new default key 99.
+statement ok
+CREATE TABLE alter_drop_replace_index (id i32 PRIMARY KEY, value i32 UNIQUE)
+
+statement ok
+INSERT INTO alter_drop_replace_index VALUES (1, 10)
+
+statement ok
+ALTER TABLE alter_drop_replace_index DROP value CASCADE, ADD value i32 DEFAULT 99 UNIQUE
+
+statement error 23505
+INSERT INTO alter_drop_replace_index (id) VALUES (2)
+
+# EXCLUDE backing stores have the same object-identity rule when a dropped name is reused.
+statement ok
+CREATE TABLE alter_drop_replace_exclude (id i32 PRIMARY KEY, value i32, CONSTRAINT alter_drop_replace_exclude_value_excl EXCLUDE USING gist (value WITH =))
+
+statement ok
+INSERT INTO alter_drop_replace_exclude VALUES (1, 10)
+
+statement ok
+ALTER TABLE alter_drop_replace_exclude DROP value CASCADE, ADD value i32 DEFAULT 99, ADD CONSTRAINT alter_drop_replace_exclude_value_excl EXCLUDE USING gist (value WITH =)
+
+statement error 23P01
+INSERT INTO alter_drop_replace_exclude (id) VALUES (2)
+
+# Dense ordinals are physically compacted (PG hides a tombstone instead), and dropping a PK member
+# remains slice 5 because it must re-key the table.
+query II nosort
+SELECT ordinal, name FROM jed_columns WHERE table_name = 'alter_drop_fk_parent' ORDER BY ordinal
+----
+1
+id
+2
+keep
+
+statement error 0A000
+ALTER TABLE alter_drop_fk_parent DROP COLUMN id CASCADE

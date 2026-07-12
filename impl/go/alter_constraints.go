@@ -17,6 +17,205 @@ type alterConstraintState struct {
 	other map[string]*catTable
 }
 
+// alterColumnSource describes one final table column during an ALTER rewrite. original >= 0 copies
+// that old row slot; added captures the ADD action's default before later actions can edit it.
+type alterColumnSource struct {
+	original int
+	added    *catColumn
+}
+
+func dropAlterColumn(t *catTable, d *alterDropColumn, snap *snapshot, original *catTable, oldKey string, sources *[]alterColumnSource, pending *[]*sequenceDef, st *alterConstraintState) error {
+	ci := t.ColumnIndex(d.Name)
+	if ci < 0 {
+		if d.IfExists {
+			return nil
+		}
+		return newError(UndefinedColumn, "column does not exist: "+d.Name)
+	}
+	if slices.Contains(t.PK, ci) {
+		return newError(FeatureNotSupported, "dropping a primary-key column is not supported yet")
+	}
+	droppedSource := (*sources)[ci]
+	usesExpr := func(e exprNode) bool { return slices.Contains(checkReferencedColumns(e, t.Columns), ci) }
+	checkDep := false
+	for _, c := range t.Checks {
+		checkDep = checkDep || usesExpr(c.Expr)
+	}
+	indexUses := func(ix indexDef) bool {
+		for _, key := range ix.Keys {
+			if (key.Expr == nil && key.Col == ci) || (key.Expr != nil && usesExpr(key.Expr.Expr)) {
+				return true
+			}
+		}
+		return ix.Predicate != nil && usesExpr(ix.Predicate.Expr)
+	}
+	indexDep := false
+	for _, ix := range t.Indexes {
+		indexDep = indexDep || indexUses(ix)
+	}
+	fkUses := func(fk foreignKey) bool {
+		return slices.Contains(fk.Columns, ci) || (strings.EqualFold(fk.RefTable, t.Name) && slices.Contains(fk.RefColumns, ci))
+	}
+	fkDep := false
+	for _, fk := range t.ForeignKeys {
+		fkDep = fkDep || fkUses(fk)
+	}
+	exclusionDep := false
+	for _, ex := range t.Exclusions {
+		for _, el := range ex.Elements {
+			exclusionDep = exclusionDep || el.Column == ci
+		}
+	}
+	incomingDep := false
+	if source := droppedSource; source.original >= 0 {
+		for key, base := range snap.tables {
+			if strings.EqualFold(key, oldKey) {
+				continue
+			}
+			child := base
+			if changed := st.other[key]; changed != nil {
+				child = changed
+			}
+			for _, fk := range child.ForeignKeys {
+				if strings.EqualFold(fk.RefTable, original.Name) && slices.Contains(fk.RefColumns, source.original) {
+					incomingDep = true
+				}
+			}
+		}
+	}
+	if !d.Cascade && (checkDep || indexDep || fkDep || exclusionDep || incomingDep) {
+		return newError(DependentObjectsStillExist, "cannot drop column "+d.Name+" because other objects depend on it")
+	}
+	if d.Cascade && (*sources)[ci].original >= 0 {
+		oldColumn := (*sources)[ci].original
+		for key, base := range snap.tables {
+			if strings.EqualFold(key, oldKey) {
+				continue
+			}
+			child := base
+			if changed := st.other[key]; changed != nil {
+				child = changed
+			}
+			fks := make([]foreignKey, 0, len(child.ForeignKeys))
+			for _, fk := range child.ForeignKeys {
+				if strings.EqualFold(fk.RefTable, original.Name) && slices.Contains(fk.RefColumns, oldColumn) {
+					continue
+				}
+				fks = append(fks, fk)
+			}
+			if len(fks) != len(child.ForeignKeys) {
+				next := *child
+				next.ForeignKeys = fks
+				st.other[key] = &next
+			}
+		}
+	}
+	if d.Cascade {
+		checks := t.Checks[:0]
+		for _, c := range t.Checks {
+			if usesExpr(c.Expr) {
+				delete(st.added, strings.ToLower(c.Name))
+			} else {
+				checks = append(checks, c)
+			}
+		}
+		t.Checks = checks
+		indexes := t.Indexes[:0]
+		for _, ix := range t.Indexes {
+			if indexUses(ix) {
+				delete(st.added, strings.ToLower(ix.Name))
+			} else {
+				indexes = append(indexes, ix)
+			}
+		}
+		t.Indexes = indexes
+		fks := t.ForeignKeys[:0]
+		for _, fk := range t.ForeignKeys {
+			if fkUses(fk) {
+				delete(st.added, strings.ToLower(fk.Name))
+			} else {
+				fks = append(fks, fk)
+			}
+		}
+		t.ForeignKeys = fks
+		exclusions := t.Exclusions[:0]
+		for _, ex := range t.Exclusions {
+			uses := false
+			for _, el := range ex.Elements {
+				uses = uses || el.Column == ci
+			}
+			if uses {
+				delete(st.added, strings.ToLower(ex.Name))
+			} else {
+				exclusions = append(exclusions, ex)
+			}
+		}
+		t.Exclusions = exclusions
+	}
+	t.Columns = slices.Delete(t.Columns, ci, ci+1)
+	*sources = slices.Delete(*sources, ci, ci+1)
+	for i := range t.PK {
+		if t.PK[i] > ci {
+			t.PK[i]--
+		}
+	}
+	for i := range t.Indexes {
+		for j := range t.Indexes[i].Keys {
+			if t.Indexes[i].Keys[j].Expr == nil && t.Indexes[i].Keys[j].Col > ci {
+				t.Indexes[i].Keys[j].Col--
+			}
+		}
+	}
+	for i := range t.ForeignKeys {
+		for j := range t.ForeignKeys[i].Columns {
+			if t.ForeignKeys[i].Columns[j] > ci {
+				t.ForeignKeys[i].Columns[j]--
+			}
+		}
+		if strings.EqualFold(t.ForeignKeys[i].RefTable, t.Name) {
+			for j := range t.ForeignKeys[i].RefColumns {
+				if t.ForeignKeys[i].RefColumns[j] > ci {
+					t.ForeignKeys[i].RefColumns[j]--
+				}
+			}
+		}
+	}
+	for i := range t.Exclusions {
+		for j := range t.Exclusions[i].Elements {
+			if t.Exclusions[i].Elements[j].Column > ci {
+				t.Exclusions[i].Elements[j].Column--
+			}
+		}
+	}
+	// An owned sequence is part of the dropped column, so release an existing one now rather than
+	// waiting for final ordinal remapping. Later actions must see the name as free, and a later
+	// DEFAULT must not be able to advance the removed sequence and resurrect it during flush.
+	if source := droppedSource; source.original >= 0 {
+		for _, key := range snap.sequencesOwnedBy(original.Name) {
+			seq := snap.sequence(key)
+			if seq != nil && seq.OwnedBy != nil && int(seq.OwnedBy.Column) == source.original {
+				snap.removeSequence(key)
+			}
+		}
+	}
+	kept := (*pending)[:0]
+	for _, seq := range *pending {
+		if seq.OwnedBy == nil || !strings.EqualFold(seq.OwnedBy.Table, t.Name) {
+			kept = append(kept, seq)
+			continue
+		}
+		if int(seq.OwnedBy.Column) == ci {
+			continue
+		}
+		if int(seq.OwnedBy.Column) > ci {
+			seq.OwnedBy.Column--
+		}
+		kept = append(kept, seq)
+	}
+	*pending = kept
+	return nil
+}
+
 func newAlterConstraintState() *alterConstraintState {
 	return &alterConstraintState{added: map[string]bool{}, other: map[string]*catTable{}}
 }
@@ -283,7 +482,7 @@ func (db *engine) addAlterConstraint(t *catTable, def *alterConstraintDef, snap 
 	return nil
 }
 
-func (db *engine) dropAlterConstraint(t *catTable, d *dropConstraintDef, snap *snapshot, st *alterConstraintState) error {
+func (db *engine) dropAlterConstraint(t *catTable, d *dropConstraintDef, snap *snapshot, sources []alterColumnSource, st *alterConstraintState) error {
 	nameKey := strings.ToLower(d.Name)
 	for i, c := range t.Checks {
 		if strings.EqualFold(c.Name, d.Name) {
@@ -315,6 +514,17 @@ func (db *engine) dropAlterConstraint(t *catTable, d *dropConstraintDef, snap *s
 	for i, ix := range t.Indexes {
 		if ix.Unique && strings.EqualFold(ix.Name, d.Name) {
 			cols := sortedUnique(ix.columnOrdinals())
+			var originalCols []int
+			for _, col := range cols {
+				if col < 0 || col >= len(sources) || sources[col].original < 0 {
+					originalCols = nil
+					break
+				}
+				originalCols = append(originalCols, sources[col].original)
+			}
+			if originalCols != nil {
+				originalCols = sortedUnique(originalCols)
+			}
 			var deps []struct {
 				key string
 				fk  foreignKey
@@ -327,12 +537,16 @@ func (db *engine) dropAlterConstraint(t *catTable, d *dropConstraintDef, snap *s
 					}{strings.ToLower(t.Name), fk})
 				}
 			}
-			for key, ot := range snap.tables {
+			for key, base := range snap.tables {
 				if strings.EqualFold(key, t.Name) {
 					continue
 				}
+				ot := base
+				if changed := st.other[key]; changed != nil {
+					ot = changed
+				}
 				for _, fk := range ot.ForeignKeys {
-					if strings.EqualFold(fk.RefTable, t.Name) && slices.Equal(sortedUnique(fk.RefColumns), cols) {
+					if originalCols != nil && strings.EqualFold(fk.RefTable, t.Name) && slices.Equal(sortedUnique(fk.RefColumns), originalCols) {
 						deps = append(deps, struct {
 							key string
 							fk  foreignKey
@@ -407,6 +621,15 @@ func (db *engine) validateAlterConstraints(original, t *catTable, dbScope *strin
 	colls := db.columnCollations(t.Columns)
 	seen := map[string]map[string]bool{}
 	entries := map[string][][]byte{}
+	// Presence in entries, including an empty slice for an empty table, is the publication-time
+	// identity marker for a newly-added backing index. This distinguishes DROP+ADD reuse of an old
+	// name from an unchanged old index whose store may be retained.
+	for _, ix := range t.Indexes {
+		nk := strings.ToLower(ix.Name)
+		if st.added[nk] {
+			entries[nk] = nil
+		}
+	}
 	for _, e := range rows {
 		if err := meter.Guard(); err != nil {
 			return nil, err

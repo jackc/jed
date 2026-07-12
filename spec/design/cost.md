@@ -234,7 +234,7 @@ computable from the stored lengths alone, so the charge never requires re-runnin
   correlated re-scan, no `LIMIT` short-circuit, nothing for a missed bound, nothing for an
   untouched column, and a table with no compressed value charges nothing.
 - **`value_compress`** is the write side: an `INSERT`/`UPDATE` or table rewrite (for example `ALTER
-  TABLE … ADD COLUMN`) whose replacement record exceeds `RECORD_MAX` runs the disposition
+  TABLE … ADD/DROP COLUMN`) whose replacement record exceeds `RECORD_MAX` runs the disposition
   decision's compress pass, and **every attempt** (adopted or rejected by
   *store-smaller* — the encoder ran either way) charges `ceil(raw_len / C)`. Charged once per
   stored row version at the statement's write site, never for the B-tree's internal re-encodes.
