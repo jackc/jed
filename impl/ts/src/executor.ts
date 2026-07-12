@@ -309,6 +309,7 @@ import {
   bindParams,
   buildSequenceDef,
   checkRecursiveColumnTypes,
+  collectExprPrivs,
   collectStmtPrivs,
   conjunctCount,
   countCteRefsDml,
@@ -2372,6 +2373,10 @@ export class Engine {
       isTempDdl: false,
     };
     collectStmtPrivs(stmt, req);
+    // UPDATE's DEFAULT marker has no expression subtree. Add the selected catalog default's named
+    // functions during preflight so a revoked function cannot be invoked through
+    // `SET column = DEFAULT` (session.md §5.3).
+    this.collectUpdateDefaultPrivs(stmt, req);
     if (req.isDdl) {
       // DDL is gated by the kind of relation it targets (temp-tables.md §5): a session-local temp
       // table by allowTempDdl, everything else (persistent) by allowDdl. A CREATE TABLE is classified
@@ -2418,6 +2423,37 @@ export class Engine {
       const key = fn.toLowerCase();
       if (!this.session.privileges.allowsFunction(key)) {
         throw engineError("insufficient_privilege", "permission denied for function " + key);
+      }
+    }
+  }
+
+  // Add named functions reached through UPDATE SET column = DEFAULT. Ordinary assignment
+  // expressions are covered by collectStmtPrivs; this catalog-dependent walk includes top-level,
+  // writable-CTE, and EXPLAIN-contained UPDATEs. Missing targets are skipped so execution retains
+  // its existing 42P01/42703 error precedence.
+  private collectUpdateDefaultPrivs(stmt: Statement, req: PrivReq): void {
+    if (stmt.kind === "update") this.collectOneUpdateDefaultPrivs(stmt, req);
+    else if (stmt.kind === "with") {
+      for (const cte of stmt.ctes) this.collectCteDefaultPrivs(cte.body, req);
+      this.collectCteDefaultPrivs(stmt.body, req);
+    } else if (stmt.kind === "explain") this.collectUpdateDefaultPrivs(stmt.inner, req);
+  }
+
+  private collectCteDefaultPrivs(body: CteBody, req: PrivReq): void {
+    if (body.kind === "update") this.collectOneUpdateDefaultPrivs(body, req);
+  }
+
+  private collectOneUpdateDefaultPrivs(upd: Update, req: PrivReq): void {
+    const table = this.lkpTableScoped(upd.db, upd.table);
+    if (table === undefined) return;
+    const locals = new Set<string>();
+    for (const assignment of upd.assignments) {
+      if (!assignment.isDefault) continue;
+      const col = table.columns.find(
+        (candidate) => candidate.name.toLowerCase() === assignment.column.toLowerCase(),
+      );
+      if (col !== undefined && col.defaultExpr !== null) {
+        collectExprPrivs(col.defaultExpr.expr, req, locals);
       }
     }
   }
@@ -8168,6 +8204,12 @@ export class Engine {
     // Resolve assignments up front (fail fast, deterministic). Assigning a key member is
     // allowed and re-keys the row — the storage key is derived from the PK (constraints.md §3),
     // so a new key is recomputed and the row is moved in phase 2.
+    // UPDATE SET col = DEFAULT reuses INSERT's once-per-statement resolution of expression
+    // defaults. Constant/no defaults become constant RExpr nodes below, so applying them is free;
+    // expression defaults evaluate once per matched row through the UPDATE meter and statement RNG.
+    const defaultExprs = upd.assignments.some((a) => a.isDefault)
+      ? this.resolveDefaultExprs(table)
+      : [];
     const pkMembers = pkIndices(table);
     const plans: AssignPlan[] = [];
     for (const a of upd.assignments) {
@@ -8175,10 +8217,9 @@ export class Engine {
       if (idx < 0) {
         throw engineError("undefined_column", "column does not exist: " + a.column);
       }
-      // A GENERATED ALWAYS identity column can only be set to DEFAULT (sequences.md §13.4); jed's
-      // UPDATE has no `= DEFAULT` form, so any assignment is 428C9. Ordered before the PK-narrowing
-      // 0A000 so an ALWAYS identity PRIMARY KEY reports 428C9 (PG's code).
-      if (table.columns[idx]!.identity === "always") {
+      // A GENERATED ALWAYS identity column can only be set to DEFAULT (sequences.md §13.4).
+      // An ordinary assignment is 428C9; DEFAULT is allowed and advances the owned sequence.
+      if (table.columns[idx]!.identity === "always" && !a.isDefault) {
         throw engineError("generated_always", `column ${a.column} can only be updated to DEFAULT`);
       }
       for (const p of plans) {
@@ -8187,6 +8228,32 @@ export class Engine {
         }
       }
       const col = table.columns[idx]!;
+      if (a.isDefault) {
+        const source = defaultExprs[idx] ?? valueToRExpr(col.default ?? nullValue());
+        if (col.type.kind === "scalar") {
+          plans.push({
+            idx,
+            name: col.name,
+            target: col.type.scalar,
+            decimal: col.decimal,
+            varcharLen: col.varcharLen,
+            notNull: col.notNull,
+            source,
+          });
+        } else {
+          plans.push({
+            idx,
+            name: col.name,
+            target: "i32",
+            decimal: col.decimal,
+            varcharLen: col.varcharLen,
+            notNull: col.notNull,
+            source,
+            colType: scope.catalog.colTypeOf(col.type),
+          });
+        }
+        continue;
+      }
       // Updating a composite-typed column lands in a later slice (anonymous-record → named-composite
       // assignment coercion — composite.md §12); reject it for now (0A000). Range and array columns
       // ARE updatable (ranges.md §4 / array.md §4), via the container path below.
@@ -16396,6 +16463,10 @@ export function valueToRExpr(v: Value): RExpr {
   switch (v.kind) {
     case "int":
       return { kind: "constInt", value: v.int };
+    case "f32":
+      return { kind: "constFloat", ty: "f32", value: v.value };
+    case "f64":
+      return { kind: "constFloat", ty: "f64", value: v.value };
     case "bool":
       return { kind: "constBool", value: v.value };
     case "text":

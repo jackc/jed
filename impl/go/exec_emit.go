@@ -1725,6 +1725,10 @@ func valueToRExpr(v Value) *rExpr {
 	switch v.Kind {
 	case ValInt:
 		return &rExpr{kind: reConstInt, cInt: v.Int}
+	case ValFloat32:
+		return &rExpr{kind: reConstFloat32, cFloat: float64(v.F32())}
+	case ValFloat64:
+		return &rExpr{kind: reConstFloat64, cFloat: v.F64()}
 	case ValBool:
 		return &rExpr{kind: reConstBool, cBool: v.boolVal()}
 	case ValText:

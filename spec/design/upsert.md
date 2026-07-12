@@ -159,9 +159,9 @@ non-arbiter unique indexes (`23505`), and the FK child-side (`23503`).
 **`0A000`** — a deferred follow-on (the standalone `UPDATE` re-keying has landed, CLAUDE.md §11
 step 6, but extending it to the conflict path is separate); assigning a
 **`GENERATED ALWAYS AS IDENTITY`** column is **`428C9`** (the standing
-`UPDATE` rule, sequences.md §13); `SET col = DEFAULT` is not supported (the `UPDATE`
-`SET = DEFAULT` follow-on is deferred too — the RHS is a general expression, and `DEFAULT` is
-not reserved (grammar.md §3), so a bare `DEFAULT` there resolves as a column reference →
+`UPDATE` rule, sequences.md §13); `SET col = DEFAULT` is not supported on this conflict-action
+path (standalone UPDATE now supports it, but this RHS remains a general expression, and `DEFAULT`
+is not reserved (grammar.md §3), so a bare `DEFAULT` there resolves as a column reference →
 **`42703`**, a documented divergence from PG, which supports `SET col = DEFAULT`). An unknown
 `col` is also `42703`.
 
@@ -220,7 +220,7 @@ an `ON CONFLICT`-specific message needs no registry edit. The codes:
 
 ## 10. Deferred (each its own later slice)
 
-`SET col = DEFAULT` (with the `UPDATE` `SET = DEFAULT` follow-on); `INSERT INTO t AS alias`;
+`SET col = DEFAULT` on the conflict-action path; `INSERT INTO t AS alias`;
 the partial-index `WHERE index_predicate` in a conflict target (jed has no partial indexes)
 and `COLLATE`/opclass inference decorations; multi-column `SET (a,b) = (...)`; and the GIN /
 ordered-index acceleration of the arbiter probe (the probe reuses the unique-index point/range

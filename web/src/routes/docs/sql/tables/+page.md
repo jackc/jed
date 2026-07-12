@@ -47,6 +47,25 @@ Things to try in the panel above:
 Each is rejected before anything is written — a statement is all-or-nothing. See the
 [error reference](../../reference/errors/) for every code.
 
+## Applying defaults
+
+Omitting a column or using `DEFAULT` in a VALUES slot applies its declared default. To insert one
+row using defaults for every column, use `DEFAULT VALUES`; to reset an existing value, assign
+`DEFAULT` in an UPDATE:
+
+```sql
+CREATE TABLE job (
+  id i32 PRIMARY KEY DEFAULT 1,
+  state text NOT NULL DEFAULT 'queued',
+  attempts i32 DEFAULT 0
+);
+INSERT INTO job DEFAULT VALUES;
+UPDATE job SET state = DEFAULT, attempts = DEFAULT WHERE id = 1;
+```
+
+A column with no declared default takes `NULL`, so the ordinary `NOT NULL` check still applies.
+Expression defaults are evaluated separately for each inserted or updated row.
+
 ## Altering a table
 
 `ALTER TABLE` can add or drop columns, rename a table, column, or constraint; change a column's

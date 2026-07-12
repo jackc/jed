@@ -55,8 +55,8 @@ fn do_update_pk_column_assignment_is_unsupported() {
     );
 }
 
-/// DIVERGENCE: `DO UPDATE SET col = DEFAULT` is not supported — the UPDATE `SET = DEFAULT` follow-on
-/// is deferred too, so the assignment RHS is a general expression. `DEFAULT` is not reserved (§3),
+/// DIVERGENCE: `DO UPDATE SET col = DEFAULT` is not supported on the conflict-action path, so its
+/// assignment RHS remains a general expression. `DEFAULT` is not reserved (§3),
 /// so a bare `DEFAULT` there resolves as a column reference → `42703` (no column named `default`).
 /// PostgreSQL supports `SET col = DEFAULT` (probed: it resets the column to its default).
 #[test]
@@ -74,8 +74,8 @@ fn do_update_set_default_is_unsupported() {
     );
 }
 
-/// DIVERGENCE: a GENERATED ALWAYS identity column can only be set to DEFAULT (jed has no
-/// `SET = DEFAULT`), so any DO UPDATE assignment to one is `428C9` — the standing UPDATE rule.
+/// DIVERGENCE: a GENERATED ALWAYS identity column can only be set to DEFAULT, and the conflict-action
+/// path has no DEFAULT form yet, so any DO UPDATE assignment to one is `428C9`.
 #[test]
 fn do_update_generated_always_is_rejected() {
     let mut db = db_with(&[

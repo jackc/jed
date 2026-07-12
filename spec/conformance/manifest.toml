@@ -126,11 +126,15 @@ description = "serial / bigserial / smallserial (aliases serial4 / serial8 / ser
 
 [[capability]]
 id = "ddl.identity"
-description = "GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY column constraint (the SQL-standard identity surface) + the optional ( sequence_options ) + the INSERT OVERRIDING { SYSTEM | USER } VALUE clause. Desugars like serial — an OWNED sequence of the column type (named <table>_<column>_seq, suffix collision resolution — ddl.sequence_as_type) + a DEFAULT nextval(...) + NOT NULL — plus the persisted ALWAYS/BY DEFAULT distinction (format_version 15, two column flag bits). The column type must be smallint/integer/bigint (22023). ALWAYS rejects an explicit INSERT value without OVERRIDING SYSTEM VALUE (428C9) and any UPDATE assignment (428C9); OVERRIDING USER VALUE discards a supplied value and uses the sequence; BY DEFAULT uses an explicit value (not advancing the sequence). DEFAULT-and-identity / serial-and-identity / two identity specs / an AS clause in the identity ( … ) options are 42601 (spec/design/sequences.md §13)"
+description = "GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY column constraint (the SQL-standard identity surface) + the optional ( sequence_options ) + the INSERT OVERRIDING { SYSTEM | USER } VALUE clause. Desugars like serial — an OWNED sequence of the column type (named <table>_<column>_seq, suffix collision resolution — ddl.sequence_as_type) + a DEFAULT nextval(...) + NOT NULL — plus the persisted ALWAYS/BY DEFAULT distinction (format_version 15, two column flag bits). The column type must be smallint/integer/bigint (22023). ALWAYS rejects an explicit INSERT value without OVERRIDING SYSTEM VALUE and an ordinary UPDATE assignment (428C9), while UPDATE SET id = DEFAULT is accepted and advances the owned sequence; OVERRIDING USER VALUE discards a supplied value and uses the sequence; BY DEFAULT uses an explicit value (not advancing the sequence). DEFAULT-and-identity / serial-and-identity / two identity specs / an AS clause in the identity ( … ) options are 42601 (spec/design/sequences.md §13)"
 
 [[capability]]
 id = "dml.insert_column_list"
 description = "INSERT with an explicit column list `(a, c)` — unlisted columns take their default else NULL; the DEFAULT keyword in a value slot; unknown column 42703, duplicate 42701 (spec/design/grammar.md §12)"
+
+[[capability]]
+id = "dml.insert_default_values"
+description = "INSERT INTO t DEFAULT VALUES — insert exactly one row with every column omitted, so each column takes its declared constant/expression default else NULL, through the ordinary two-phase INSERT validation; supports ON CONFLICT and RETURNING. PostgreSQL syntax does not combine DEFAULT VALUES with an explicit column list or OVERRIDING (42601). Builds on ddl.column_default / ddl.column_default_expr and dml.insert (constraints.md §2, grammar.md §16)"
 
 [[capability]]
 id = "dml.insert"
@@ -147,6 +151,10 @@ description = "INSERT ... SELECT — insert the rows a query produces, through t
 [[capability]]
 id = "dml.update"
 description = "UPDATE ... SET ... [WHERE] (in-place value replacement)"
+
+[[capability]]
+id = "dml.update_default"
+description = "UPDATE ... SET col = DEFAULT — replace each matched row's column with its declared constant/expression default else NULL, using the same per-row evaluation, statement RNG/clock seam, storage coercion, NOT NULL/CHECK/uniqueness/FK validation, cost, index maintenance, and PK re-keying as ordinary UPDATE/INSERT default application. GENERATED ALWAYS identity columns accept this sole update form and advance their owned sequence. ON CONFLICT DO UPDATE SET col = DEFAULT remains its separate deferred follow-on (constraints.md §2, sequences.md §13.4)"
 
 [[capability]]
 id = "dml.update_container"
@@ -1337,7 +1345,10 @@ capabilities = [
   "ddl.column_default",
   "ddl.column_default_expr",
   "dml.insert_column_list",
+  "dml.insert_default_values",
   "dml.insert_select",
+  "dml.update",
+  "dml.update_default",
 ]
 
 [[profile]]

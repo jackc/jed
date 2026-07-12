@@ -244,6 +244,8 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "ddl.column_default_expr",
   // INSERT with an explicit column list + the DEFAULT keyword (grammar.md §12).
   "dml.insert_column_list",
+  // INSERT DEFAULT VALUES — one all-columns-omitted row (constraints.md §2).
+  "dml.insert_default_values",
   // INSERT ... VALUES with positional type-checking + overflow trap.
   "dml.insert",
   // Multi-row INSERT ... VALUES (..),(..) — two-phase / all-or-nothing (grammar.md §12).
@@ -254,6 +256,8 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "error.overflow_trap",
   // Row mutation: UPDATE (in-place) + DELETE.
   "dml.update",
+  // UPDATE SET col = DEFAULT — reset through the column's default/no-default path.
+  "dml.update_default",
   // Assigning a range/array (container) column in an UPDATE (ranges.md §4 / array.md §4).
   "dml.update_container",
   "dml.delete",

@@ -1,0 +1,120 @@
+# DEFAULT application follow-ons (spec/design/constraints.md §2): INSERT DEFAULT VALUES inserts
+# exactly one all-columns-omitted row; UPDATE SET col = DEFAULT resets a matched column to its
+# constant/expression default, or NULL when it has none. Both reuse ordinary INSERT/UPDATE
+# validation and per-statement default evaluation. PostgreSQL 18 was used as the oracle for the
+# rows, SQLSTATEs, RETURNING shape, and syntax restrictions below.
+# requires: ddl.create_table, ddl.primary_key, ddl.not_null, ddl.column_default, ddl.column_default_expr, dml.insert, dml.insert_default_values, dml.update, dml.update_default, dml.returning, dml.insert_on_conflict, query.select, query.where_eq, query.is_null, query.order_by, types.i32, types.text, types.f32, types.f64, expr.arithmetic, resource.cost_metering
+
+# INSERT DEFAULT VALUES applies every declared default and supports RETURNING.
+statement ok
+CREATE TABLE dv (id i32 PRIMARY KEY DEFAULT 10, n i32 DEFAULT 6 * 7, note text DEFAULT 'new')
+
+# One operator_eval for 6 * 7 plus one row_produced for RETURNING.
+# cost: 2
+query IIT nosort
+INSERT INTO dv DEFAULT VALUES RETURNING id, n, note
+----
+10
+42
+new
+
+# The source composes with ON CONFLICT like any other one-row INSERT.
+statement ok
+INSERT INTO dv DEFAULT VALUES ON CONFLICT DO NOTHING
+
+query IIT nosort
+SELECT id, n, note FROM dv
+----
+10
+42
+new
+
+# PostgreSQL does not allow a column list or OVERRIDING with DEFAULT VALUES.
+statement error 42601
+INSERT INTO dv (id) DEFAULT VALUES
+
+statement error 42601
+INSERT INTO dv OVERRIDING USER VALUE DEFAULT VALUES
+
+# A no-default column takes NULL; ordinary NOT NULL validation still applies atomically.
+statement ok
+CREATE TABLE nullable (a i32, b i32 DEFAULT 2)
+
+statement ok
+INSERT INTO nullable DEFAULT VALUES
+
+query I nosort
+SELECT b FROM nullable WHERE a IS NULL
+----
+2
+
+statement ok
+CREATE TABLE required (a i32 NOT NULL)
+
+statement error 23502
+INSERT INTO required DEFAULT VALUES
+
+# UPDATE resets selected rows. Constant and expression defaults follow their normal application
+# path, while a column with no default becomes NULL.
+statement ok
+CREATE TABLE u (id i32 PRIMARY KEY, n i32 DEFAULT 6 * 7, note text)
+
+statement ok
+INSERT INTO u VALUES (1, 5, 'keep'), (2, 6, 'clear'), (3, 7, 'stay')
+
+# PK point read + residual predicate + one default-expression node + RETURNING row = 5.
+# cost: 5
+query IIT nosort
+UPDATE u SET n = DEFAULT, note = DEFAULT WHERE id = 2 RETURNING id, n, note
+----
+2
+42
+NULL
+
+query IIT nosort
+SELECT id, n, note FROM u ORDER BY id
+----
+1
+5
+keep
+2
+42
+NULL
+3
+7
+stay
+
+# Constant float defaults preserve their width and value when materialized into an UPDATE plan.
+statement ok
+CREATE TABLE uf (id i32 PRIMARY KEY, r f32 DEFAULT 1.5, d f64 DEFAULT -2.25)
+
+statement ok
+INSERT INTO uf VALUES (1, 0.0, 0.0)
+
+statement ok
+UPDATE uf SET r = DEFAULT, d = DEFAULT
+
+query IRR nosort
+SELECT id, r, d FROM uf
+----
+1
+1.5
+-2.25
+
+# DEFAULT still passes through NOT NULL and the two-phase UPDATE pass leaves every row unchanged.
+statement ok
+CREATE TABLE un (id i32 PRIMARY KEY, n i32 NOT NULL DEFAULT NULL)
+
+statement ok
+INSERT INTO un VALUES (1, 10), (2, 20)
+
+statement error 23502
+UPDATE un SET n = DEFAULT
+
+query II nosort
+SELECT id, n FROM un ORDER BY id
+----
+1
+10
+2
+20

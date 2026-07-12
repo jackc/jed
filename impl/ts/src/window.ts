@@ -1133,10 +1133,9 @@ export type AssignPlan = {
   varcharLen: number | null;
   notNull: boolean;
   source: RExpr;
-  // The resolved ColType for a NON-scalar (range / array) column — when set, checkAssign stores
-  // through coerceForStore (the container codec, ranges.md §4 / array.md §4); null for a scalar
-  // column, which stays on the storeValue fast path. Composite columns are deferred (0A000) at
-  // resolution, so they never reach here.
+  // The resolved ColType for a NON-scalar column — when set, checkAssign stores through
+  // coerceForStore; absent for a scalar column, which stays on the storeValue fast path. Composite
+  // columns reach this only through SET col = DEFAULT; ordinary composite assignment is deferred.
   colType?: ColType;
 };
 

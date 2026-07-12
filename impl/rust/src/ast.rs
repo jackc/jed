@@ -460,8 +460,9 @@ pub struct TypeMod {
     pub scale: Option<u64>,
 }
 
-/// `INSERT INTO <table> [(col, ..)] ( VALUES (..)[, (..)]* | <select> )`. The rows come from
-/// either a `VALUES` list (each value a literal or the `DEFAULT` keyword) or a `SELECT`
+/// `INSERT INTO <table> [(col, ..)] ( DEFAULT VALUES | VALUES (..)[, (..)]* | <select> )`. The
+/// rows come from `DEFAULT VALUES`, a `VALUES` list (each value a literal or the `DEFAULT`
+/// keyword), or a `SELECT`
 /// (spec/design/grammar.md §24). An INSERT is two-phase / all-or-nothing — every row is
 /// validated before any is stored (spec/design/grammar.md §12).
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -479,6 +480,7 @@ pub struct Insert {
     /// governing IDENTITY columns. `None` is the default (no override).
     pub overriding: Option<Overriding>,
     /// Where the rows come from: a `VALUES` list or a `SELECT`.
+    /// `DEFAULT VALUES` is represented as one empty VALUES row plus `columns = Some([])`.
     pub source: InsertSource,
     /// The optional `ON CONFLICT` clause (UPSERT — spec/design/upsert.md), between the source
     /// and `RETURNING`. `None` = no clause (a conflict traps 23505 as usual).
@@ -582,6 +584,10 @@ pub struct Update {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Assignment {
     pub column: String,
+    /// `true` for the standalone UPDATE-only `SET column = DEFAULT` form. The `value` field is
+    /// a parser placeholder in that case and is never resolved; ON CONFLICT keeps parsing its RHS
+    /// as an ordinary expression until its separate DEFAULT follow-on lands.
+    pub is_default: bool,
     pub value: Expr,
 }
 

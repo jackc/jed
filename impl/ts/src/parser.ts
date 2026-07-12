@@ -1609,8 +1609,34 @@ class Parser {
       this.expectKeyword("value");
     }
 
-    // The source is EITHER a SELECT (INSERT ... SELECT — §24) OR a VALUES list. `VALUES` and
-    // `SELECT` are disjoint leading keywords, so a peek decides without lookahead.
+    // The source is DEFAULT VALUES, a SELECT (§24), or a VALUES list. DEFAULT VALUES is the
+    // all-columns-omitted form, represented through the existing column-list machinery as one empty
+    // row mapped by an empty synthetic list. PostgreSQL does not combine it with a column list or
+    // OVERRIDING.
+    if (this.peekKeyword() === "default") {
+      if (columns !== null || overriding !== null) {
+        throw engineError(
+          "syntax_error",
+          "DEFAULT VALUES cannot be combined with a column list or OVERRIDING",
+        );
+      }
+      this.advance();
+      this.expectKeyword("values");
+      const onConflict = this.parseOnConflict();
+      const returning = this.parseReturning();
+      return {
+        kind: "insert",
+        table,
+        db,
+        columns: [],
+        overriding: null,
+        source: { kind: "values", rows: [[]] },
+        onConflict,
+        returning,
+      };
+    }
+
+    // SELECT and VALUES are disjoint leading keywords, so a peek decides without lookahead.
     if (this.peekKeyword() === "select") {
       const select = this.parseSelect();
       const onConflict = this.parseOnConflict();
@@ -1696,7 +1722,7 @@ class Parser {
         const column = this.expectIdentifier();
         this.expect("eq");
         const value = this.parseExpr();
-        assignments.push({ column, value });
+        assignments.push({ column, isDefault: false, value });
         if (this.peek().kind === "comma") {
           this.advance();
           continue;
@@ -2890,8 +2916,25 @@ class Parser {
     for (;;) {
       const column = this.expectIdentifier();
       this.expect("eq");
-      const value = this.parseExpr();
-      assignments.push({ column, value });
+      // DEFAULT is special only when it is the complete assignment RHS. Keywords are legal
+      // identifiers, so `SET x = default + 1` must parse `default` as a column reference
+      // (grammar.md §16).
+      const nextKeyword = this.peekKeywordAt(1);
+      const nextKind = this.peekKindAt(1);
+      const isDefault =
+        this.peekKeyword() === "default" &&
+        (nextKind === "comma" ||
+          nextKind === "eof" ||
+          nextKeyword === "where" ||
+          nextKeyword === "returning");
+      let value: Expr;
+      if (isDefault) {
+        this.advance();
+        value = { kind: "literal", literal: { kind: "null" } };
+      } else {
+        value = this.parseExpr();
+      }
+      assignments.push({ column, isDefault, value });
       if (this.peek().kind === "comma") {
         this.advance();
         continue;

@@ -129,7 +129,8 @@ likewise not NULL-checked at CREATE — a default expression that evaluates to N
 `NOT NULL` column traps `23502` only when applied.
 
 **Applying a default.** At INSERT, the candidate value for each column is: the value the row
-provides; or, for a `DEFAULT` slot or an omitted column, the column's default — the stored
+provides; or, for a `DEFAULT` slot, an omitted column, or every column of an `INSERT ... DEFAULT
+VALUES` row, the column's default — the stored
 constant, or the **expression evaluated for that row**; or NULL when the column has no default.
 That candidate then goes through the one `store_value` chokepoint, which re-applies the column's
 real `NOT NULL` (so an applied `DEFAULT NULL`, or an omitted no-default `NOT NULL` column —
@@ -158,9 +159,23 @@ interior node (and the function's own units) — the same documented exception `
 "VALUES inserts cost zero" (§4.4, grammar.md §12, CLAUDE.md §13). The ceiling (`max_cost`) aborts
 mid-evaluation deterministically.
 
-**Out of scope (deferred).** `UPDATE ... SET x = DEFAULT` and `INSERT ... DEFAULT VALUES` are not
-supported (the grammar has neither); a default is reachable through column-list omission and the
-`DEFAULT` value keyword, both of which exist.
+**Explicit all-default INSERT.** `INSERT INTO t DEFAULT VALUES` inserts exactly one row with every
+column omitted. It is the direct spelling of the existing omitted-column path: constant defaults
+stay free, expression defaults evaluate once for the row through the statement seam, no-default
+columns take NULL, and the ordinary `23502`/CHECK/uniqueness/FK validations apply before the write.
+It composes with `ON CONFLICT` and `RETURNING`. Matching PostgreSQL's grammar, an explicit column
+list or `OVERRIDING` cannot precede this source (`42601`).
+
+**Resetting a column on UPDATE.** `UPDATE t SET x = DEFAULT [WHERE ...]` applies `x`'s declared
+default once per matched row, or NULL when the column has no default. It uses the same resolved
+constant/expression default and per-statement entropy/clock seam as INSERT; the resulting value goes
+through UPDATE's ordinary storage coercion, `NOT NULL`, CHECK, end-state uniqueness/FK validation,
+index maintenance, and primary-key re-keying. Multiple DEFAULT assignments share the statement RNG
+and every assignment still reads the old row, just like an ordinary multi-assignment UPDATE. A
+constant/no default adds no expression cost; an expression default accrues its ordinary per-row
+evaluation cost. Privilege preflight includes every named function in the selected default expression,
+so each still requires the session's ordinary `EXECUTE` privilege before any row is evaluated.
+`ON CONFLICT DO UPDATE SET x = DEFAULT` remains a separate deferred follow-on.
 
 ## 3. Composite `PRIMARY KEY` (the table constraint)
 

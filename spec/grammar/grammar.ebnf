@@ -361,7 +361,7 @@ type_name      ::= identifier ("(" integer ("," integer)? ")")?
 
 /* --- DML ----------------------------------------------------------------- */
 
-/* INSERT's source is EITHER a "VALUES" list of one or more parenthesized rows OR a `select`
+/* INSERT's source is `DEFAULT VALUES`, a "VALUES" list of one or more parenthesized rows, OR a `select`
  * (INSERT ... SELECT — ../design/grammar.md §24). An optional column list names the target
  * columns (`INSERT INTO t (a, c) VALUES ...` / `... SELECT ...`); with no list the values map
  * positionally to every column in declaration order. Each VALUES row's arity — or the SELECT's
@@ -380,14 +380,19 @@ type_name      ::= identifier ("(" integer ("," integer)? ")")?
  * SELECT's accrued cost (not zero).
  *   "DEFAULT" is NOT reserved (§3): a column may be named "default", disambiguated positionally
  * (it is a keyword only in a VALUES slot).
- *   The optional "OVERRIDING { SYSTEM | USER } VALUE" clause (after the column list, before the
+ *   `DEFAULT VALUES` inserts exactly one row with every column omitted; it therefore applies every
+ * column's default else NULL through the same validation path. Matching PostgreSQL, this source
+ * cannot be combined with an explicit column list or OVERRIDING, but ON CONFLICT and RETURNING may
+ * follow it. The optional "OVERRIDING { SYSTEM | USER } VALUE" clause (after the column list, before the
  * source) governs IDENTITY columns (../design/sequences.md §13): "OVERRIDING SYSTEM VALUE" lets an
  * explicit value land in a GENERATED ALWAYS column (otherwise 428C9); "OVERRIDING USER VALUE"
  * discards any supplied value and uses the column's identity sequence instead. It is accepted (a
  * no-op) on a statement with no identity target, matching PostgreSQL. */
-insert         ::= "INSERT" "INTO" qualified_table ("(" identifier ("," identifier)* ")")?
-                   ("OVERRIDING" ("SYSTEM" | "USER") "VALUE")?
-                   ( "VALUES" row ("," row)* | select )
+insert         ::= "INSERT" "INTO" qualified_table
+                   ( "DEFAULT" "VALUES"
+                   | ("(" identifier ("," identifier)* ")")?
+                     ("OVERRIDING" ("SYSTEM" | "USER") "VALUE")?
+                     ( "VALUES" row ("," row)* | select ) )
                    on_conflict?
                    returning_clause?
 
@@ -414,11 +419,17 @@ conflict_action ::= "DO" "NOTHING"
                   | "DO" "UPDATE" "SET" assignment ("," assignment)* where_clause?
 
 update         ::= "UPDATE" qualified_table "SET"
-                   assignment ("," assignment)*
+                   update_assignment ("," update_assignment)*
                    where_clause?
                    returning_clause?
 
 assignment     ::= identifier "=" expr
+
+/* Standalone UPDATE additionally accepts DEFAULT as a COMPLETE assignment source (constraints.md
+ * §2). If the RHS continues (`default + 1`), DEFAULT is an ordinary non-reserved identifier in
+ * `expr`. The special form applies the target column's declared default else NULL per matched row.
+ * ON CONFLICT keeps the general-expression-only `assignment` production until its follow-on. */
+update_assignment ::= identifier "=" (expr | "DEFAULT")
 
 delete         ::= "DELETE" "FROM" qualified_table where_clause? returning_clause?
 

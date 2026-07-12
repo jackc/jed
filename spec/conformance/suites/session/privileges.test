@@ -10,7 +10,7 @@
 # NONE / ALL accepted), `# grant: PRIVS ON object`, `# revoke: PRIVS ON object` (revoke wins), and
 # `# allow_ddl: on|off`. Effective privilege for OP on object X is OP ∈ (default ∪ grant[X]) \
 # revoke[X]. Format + the `requires` gate: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, ddl.drop_table, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.select_no_from, query.where_eq, query.cte, func.abs, types.i32, session.privileges, session.allow_ddl
+# requires: ddl.create_table, ddl.primary_key, ddl.column_default_expr, ddl.drop_table, dml.insert, dml.insert_multi_row, dml.update, dml.update_default, dml.delete, query.select, query.select_no_from, query.where_eq, query.cte, func.abs, types.i32, session.privileges, session.allow_ddl
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, v i32)
@@ -124,6 +124,22 @@ SELECT abs(-5)
 # revoke: EXECUTE ON abs
 statement error 42501
 SELECT abs(-5)
+
+# UPDATE DEFAULT preflights the selected catalog expression, not its AST marker placeholder.
+statement ok
+CREATE TABLE default_priv (id i32 PRIMARY KEY, v i32 DEFAULT abs(-7))
+
+statement ok
+INSERT INTO default_priv VALUES (1, 1)
+
+# revoke: EXECUTE ON abs
+statement error 42501
+UPDATE default_priv SET v = DEFAULT
+
+query I nosort
+SELECT v FROM default_priv WHERE id = 1
+----
+1
 
 # --- allow_ddl gates schema changes --------------------------------------------------------------
 

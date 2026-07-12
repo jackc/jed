@@ -1777,7 +1777,7 @@ impl Parser {
 
         // Optional column list `( col [, col]* )` before VALUES. An empty `()` is rejected
         // (the first `expect_identifier` errors 42601 on `)`).
-        let columns = if matches!(self.peek(), Token::LParen) {
+        let mut columns = if matches!(self.peek(), Token::LParen) {
             self.advance(); // '('
             let mut names = Vec::new();
             loop {
@@ -1814,9 +1814,21 @@ impl Parser {
             None
         };
 
-        // The source is EITHER a SELECT (INSERT ... SELECT — §24) OR a VALUES list. `VALUES`
-        // and `SELECT` are disjoint leading keywords, so a peek decides without lookahead.
-        let source = if self.peek_keyword().as_deref() == Some("select") {
+        // The source is DEFAULT VALUES, a SELECT (§24), or a VALUES list. DEFAULT VALUES is the
+        // all-columns-omitted form, represented through the existing column-list machinery as one
+        // empty row mapped by an empty synthetic list. PostgreSQL does not combine it with an
+        // explicit column list or OVERRIDING.
+        let source = if self.peek_keyword().as_deref() == Some("default") {
+            if columns.is_some() || overriding.is_some() {
+                return Err(syntax(
+                    "DEFAULT VALUES cannot be combined with a column list or OVERRIDING",
+                ));
+            }
+            self.advance();
+            self.expect_keyword("values")?;
+            columns = Some(Vec::new());
+            InsertSource::Values(vec![Vec::new()])
+        } else if self.peek_keyword().as_deref() == Some("select") {
             InsertSource::Select(Box::new(self.parse_select()?))
         } else {
             self.expect_keyword("values")?;
@@ -1892,7 +1904,11 @@ impl Parser {
                     let column = self.expect_identifier()?;
                     self.expect(&Token::Eq)?;
                     let value = self.parse_expr()?;
-                    assignments.push(Assignment { column, value });
+                    assignments.push(Assignment {
+                        column,
+                        is_default: false,
+                        value,
+                    });
                     if matches!(self.peek(), Token::Comma) {
                         self.advance();
                         continue;
@@ -3380,8 +3396,27 @@ impl Parser {
         loop {
             let column = self.expect_identifier()?;
             self.expect(&Token::Eq)?;
-            let value = self.parse_expr()?;
-            assignments.push(Assignment { column, value });
+            // `DEFAULT` is special only when it is the complete assignment RHS. Keywords are
+            // legal identifiers, so `SET x = default + 1` must parse `default` as a column
+            // reference (grammar.md §16).
+            let next_is_terminator = matches!(self.peek_at(1), Token::Comma | Token::Eof)
+                || matches!(
+                    self.peek_keyword_at(1).as_deref(),
+                    Some("where" | "returning")
+                );
+            let is_default =
+                self.peek_keyword().as_deref() == Some("default") && next_is_terminator;
+            let value = if is_default {
+                self.advance();
+                Expr::Literal(Literal::Null)
+            } else {
+                self.parse_expr()?
+            };
+            assignments.push(Assignment {
+                column,
+                is_default,
+                value,
+            });
             if matches!(self.peek(), Token::Comma) {
                 self.advance();
                 continue;
@@ -5078,5 +5113,27 @@ fn binary(op: BinaryOp, lhs: Expr, rhs: Expr) -> Expr {
         op,
         lhs: Box::new(lhs),
         rhs: Box::new(rhs),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Keywords are legal identifiers in jed (a deliberate PostgreSQL divergence). UPDATE's
+    // DEFAULT special form must yield to an ordinary expression when the RHS continues.
+    #[test]
+    fn update_default_keyword_with_continuing_rhs_is_column() {
+        let Statement::Update(upd) =
+            Parser::parse_sql("UPDATE t SET result = default + 1").unwrap()
+        else {
+            panic!("expected UPDATE");
+        };
+        let assignment = &upd.assignments[0];
+        assert!(!assignment.is_default);
+        let Expr::Binary { lhs, .. } = &assignment.value else {
+            panic!("expected binary RHS");
+        };
+        assert!(matches!(lhs.as_ref(), Expr::Column(name) if name == "default"));
     }
 }

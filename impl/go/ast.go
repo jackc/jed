@@ -479,8 +479,8 @@ type typeMod struct {
 	Scale     *uint64
 }
 
-// Insert is an INSERT ... [(col, ..)] whose rows come from EITHER a VALUES list (each value a
-// literal or the DEFAULT keyword) OR a SELECT (INSERT ... SELECT — spec/design/grammar.md §24).
+// Insert is an INSERT ... [(col, ..)] whose rows come from DEFAULT VALUES, a VALUES list (each
+// value a literal or the DEFAULT keyword), or a SELECT (INSERT ... SELECT — grammar.md §24).
 // An INSERT is two-phase / all-or-nothing — every row is validated before any is stored
 // (spec/design/grammar.md §12).
 type insert struct {
@@ -498,8 +498,8 @@ type insert struct {
 	Overriding *overridingKind
 	// EXACTLY ONE of Rows / Select is set (the parser guarantees it). Rows is the VALUES source:
 	// each inner slice is one row's values in the order of Columns (or column order when Columns
-	// is nil); non-empty when set, nil when Select is set. Select is the SELECT source: nil when
-	// Rows is set.
+	// is nil); non-empty when set, nil when Select is set. DEFAULT VALUES is one empty row plus an
+	// empty non-nil Columns slice. Select is the SELECT source: nil when Rows is set.
 	Rows   [][]insertValue
 	Select *selectStmt
 	// OnConflict is the optional ON CONFLICT clause (UPSERT — spec/design/upsert.md), between the
@@ -583,7 +583,11 @@ type update struct {
 // Assignment is one `SET <Column> = <Value>` clause; Value is a general expression.
 type assignment struct {
 	Column string
-	Value  exprNode
+	// IsDefault marks the standalone UPDATE-only `SET column = DEFAULT` form. Value is a parser
+	// placeholder in that case and is never resolved; ON CONFLICT keeps its ordinary-expression
+	// RHS until its separate DEFAULT follow-on lands.
+	IsDefault bool
+	Value     exprNode
 }
 
 // Delete is `DELETE FROM <table> [WHERE <expr>]`. No WHERE deletes every row; the

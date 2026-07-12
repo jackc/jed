@@ -478,7 +478,10 @@ export type ColumnDef = {
 
 // Assignment is one `SET <column> = <value>` clause; value is a general expression
 // evaluated against the pre-update row (so `SET a = b, b = a` swaps).
-export type Assignment = { column: string; value: Expr };
+// isDefault marks the standalone UPDATE-only `SET column = DEFAULT` form. `value` is a parser
+// placeholder in that case and is never resolved; ON CONFLICT keeps its ordinary-expression RHS
+// until its separate DEFAULT follow-on lands.
+export type Assignment = { column: string; isDefault: boolean; value: Expr };
 
 // CreateTable is a CREATE TABLE statement. tablePks is the table-level
 // `PRIMARY KEY (a, b, ...)` constraints, each a list of member column names in key order
@@ -795,8 +798,8 @@ export type AlterColumnAction = {
     | { kind: "setType"; typeName: string; typeMod: TypeMod | null; using: Expr | null };
 };
 
-// Insert is an INSERT ... [(col, ..)] whose rows come from EITHER a VALUES list (each value a
-// literal or the DEFAULT keyword) OR a SELECT (INSERT ... SELECT — spec/design/grammar.md §24).
+// Insert is an INSERT ... [(col, ..)] whose rows come from DEFAULT VALUES, a VALUES list (each
+// value a literal or the DEFAULT keyword), or a SELECT (INSERT ... SELECT — grammar.md §24).
 // An INSERT is two-phase / all-or-nothing — every row is validated before any is stored
 // (spec/design/grammar.md §12).
 // `columns` is the optional explicit column list (`INSERT INTO t (a, c) VALUES ...` /
@@ -814,6 +817,7 @@ export type Insert = {
   // The optional `OVERRIDING { SYSTEM | USER } VALUE` clause (spec/design/sequences.md §13),
   // governing IDENTITY columns. null is the default (no override).
   overriding: Overriding | null;
+  // DEFAULT VALUES is represented as one empty values row plus columns=[].
   source: { kind: "values"; rows: InsertValue[][] } | { kind: "select"; select: Select };
   // The optional ON CONFLICT clause (UPSERT — spec/design/upsert.md), between the source and
   // RETURNING. Null = no clause (a conflict traps 23505 as usual).

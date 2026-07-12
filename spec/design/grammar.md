@@ -832,6 +832,19 @@ target column's declared default in that position (or NULL, then `23502` if NOT 
 default). It works at any position, including under a reordering column list. `DEFAULT` is not
 reserved (§3) — a column may be named `default`; it is a keyword only in a value slot.
 
+**`DEFAULT VALUES`** is the all-columns-omitted INSERT source: `INSERT INTO t DEFAULT VALUES`
+inserts exactly one row, applying every column's default else NULL. It takes the same two-phase
+validation path as a one-row VALUES insert and may be followed by `ON CONFLICT` and `RETURNING`.
+Matching PostgreSQL, it cannot be combined with an explicit column list or `OVERRIDING` (`42601`).
+
+The standalone UPDATE assignment form likewise recognizes `UPDATE t SET x = DEFAULT`: the RHS is
+the target column's declared default else NULL, applied per matched row. `DEFAULT` is recognized
+positionally after `=` **only when it is the complete assignment RHS**; it remains non-reserved
+elsewhere, so `SET x = default + 1` is an ordinary expression referencing a column named `default`.
+The semantics and cost are in
+[constraints.md](constraints.md) §2. The shared ON CONFLICT `assignment` intentionally remains a
+general expression only; its `SET col = DEFAULT` form is still deferred ([upsert.md](upsert.md) §10).
+
 **Errors, resolved deterministically left-to-right.** Statement-level, once before the rows: an
 unknown column name in the list is `42703` (`undefined_column`), a column named twice is `42701`
 (`duplicate_column`). Per row: an arity that does not match the list length (or, with no list,

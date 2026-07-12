@@ -427,7 +427,10 @@ default-off + per-function `grant`"; a *deny-list* is "default-on + per-function
   `SELECT` on `t`; a bare `INSERT INTO t VALUES …` (no read) requires only `INSERT`.
 - **`EXECUTE`** on every **named function** the statement calls. Built-in *operators* are **not**
   gated — they are pure and unavoidable (CLAUDE.md §13); the function privilege is most useful for
-  pinning determinism (revoke `uuidv4`/`now()`) or disabling set-returning functions.
+  pinning determinism (revoke `uuidv4`/`now()`) or disabling set-returning functions. This includes
+  functions reached indirectly through a catalog expression selected by the statement, such as the
+  column default applied by `UPDATE t SET x = DEFAULT`; privilege preflight walks that selected
+  expression before any row is evaluated.
 
 **DDL** (CREATE / DROP / ALTER of tables, indexes, types, sequences) is **not** a per-table
 privilege — jed has no schema/owner model (§3) — so a session capability **`allow_ddl`**

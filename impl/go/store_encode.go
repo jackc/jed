@@ -31,10 +31,9 @@ type assignPlan struct {
 	varcharLen *uint32
 	notNull    bool
 	source     *rExpr
-	// colType is the resolved ColType for a NON-scalar (range / array) column — when set, check
-	// stores through coerceForStore (the container codec, ranges.md §4 / array.md §4); nil for a
-	// scalar column, which stays on the storeValue fast path. Composite columns are deferred
-	// (0A000) at resolution, so they never reach here.
+	// colType is the resolved ColType for a NON-scalar column — when set, check stores through
+	// coerceForStore; nil for a scalar column, which stays on the storeValue fast path. Composite
+	// columns reach this only through SET col = DEFAULT; ordinary composite assignment is deferred.
 	colType *colType
 }
 

@@ -2441,6 +2441,16 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 	// Resolve assignments up front (fail fast, deterministic). Assigning a key member is
 	// allowed and re-keys the row — the storage key is derived from the PK (constraints.md §3),
 	// so a new key is recomputed and the row is moved in phase 2.
+	// UPDATE SET col = DEFAULT reuses INSERT's once-per-statement resolution of expression
+	// defaults. Constant/no defaults become constant rExpr nodes below, so applying them is free;
+	// expression defaults evaluate once per matched row through the UPDATE meter and statement RNG.
+	var defaultExprs []*rExpr
+	if slices.ContainsFunc(upd.Assignments, func(a assignment) bool { return a.IsDefault }) {
+		defaultExprs, err = db.resolveDefaultExprs(table)
+		if err != nil {
+			return outcome{}, err
+		}
+	}
 	pkMembers := table.PKIndices()
 	plans := make([]assignPlan, 0, len(upd.Assignments))
 	for _, a := range upd.Assignments {
@@ -2448,10 +2458,9 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 		if idx < 0 {
 			return outcome{}, newError(UndefinedColumn, "column does not exist: "+a.Column)
 		}
-		// A GENERATED ALWAYS identity column can only be set to DEFAULT (sequences.md §13.4); jed's
-		// UPDATE has no `= DEFAULT` form, so any assignment is 428C9. Ordered before the PK-narrowing
-		// 0A000 so an ALWAYS identity PRIMARY KEY reports 428C9 (PG's code).
-		if c := table.Columns[idx].Identity; c != nil && *c == identityAlways {
+		// A GENERATED ALWAYS identity column can only be set to DEFAULT (sequences.md §13.4).
+		// An ordinary assignment is 428C9; DEFAULT is allowed and advances the owned sequence.
+		if c := table.Columns[idx].Identity; c != nil && *c == identityAlways && !a.IsDefault {
 			return outcome{}, newError(GeneratedAlways,
 				fmt.Sprintf("column %s can only be updated to DEFAULT", a.Column))
 		}
@@ -2462,6 +2471,24 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 			}
 		}
 		col := table.Columns[idx]
+		if a.IsDefault {
+			src := defaultExprs[idx]
+			if src == nil {
+				src = valueToRExpr(defaultOrNull(col))
+			}
+			plan := assignPlan{
+				idx: idx, name: col.Name, decimal: col.Decimal, varcharLen: col.VarcharLen,
+				notNull: col.NotNull, source: src,
+			}
+			if scalar, ok := col.Type.AsScalar(); ok {
+				plan.target = scalar
+			} else {
+				ct := resolveColType(col.Type, s.catalog.readSnap().types)
+				plan.colType = &ct
+			}
+			plans = append(plans, plan)
+			continue
+		}
 		// Updating a composite-typed column lands in a later slice (anonymous-record → named-composite
 		// assignment coercion — composite.md §12); reject it for now (0A000). Range and array columns
 		// ARE updatable (ranges.md §4 / array.md §4) through the container path below.

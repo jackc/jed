@@ -978,6 +978,10 @@ impl Engine {
         }
         let mut req = PrivReq::default();
         collect_stmt_privs(stmt, &mut req);
+        // The UPDATE DEFAULT marker has no expression subtree. Add the selected catalog default's
+        // named functions during preflight so a revoked function cannot be invoked through
+        // `SET column = DEFAULT` (session.md §5.3).
+        self.collect_update_default_privs(stmt, &mut req);
         if req.is_ddl {
             // DDL is gated by the kind of relation it targets (temp-tables.md §5): a session-local temp
             // table by `allow_temp_ddl`, everything else (persistent) by `allow_ddl`. The split lets a
@@ -1035,6 +1039,52 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// Add named functions reached through `UPDATE SET column = DEFAULT`. Ordinary assignment
+    /// expressions are covered by `collect_stmt_privs`; this catalog-dependent walk includes
+    /// top-level, writable-CTE, and EXPLAIN-contained UPDATEs. Missing targets are deliberately
+    /// skipped so execution retains its existing 42P01/42703 error precedence.
+    fn collect_update_default_privs(&self, stmt: &Statement, req: &mut PrivReq) {
+        match stmt {
+            Statement::Update(upd) => self.collect_one_update_default_privs(upd, req),
+            Statement::With(wq) => {
+                for cte in &wq.ctes {
+                    self.collect_cte_default_privs(&cte.body, req);
+                }
+                self.collect_cte_default_privs(&wq.body, req);
+            }
+            Statement::Explain { inner, .. } => self.collect_update_default_privs(inner, req),
+            _ => {}
+        }
+    }
+
+    fn collect_cte_default_privs(&self, body: &CteBody, req: &mut PrivReq) {
+        if let CteBody::Update(upd) = body {
+            self.collect_one_update_default_privs(upd, req);
+        }
+    }
+
+    fn collect_one_update_default_privs(&self, upd: &Update, req: &mut PrivReq) {
+        let Some(table) = self.table_scoped(upd.db.as_deref(), &upd.table) else {
+            return;
+        };
+        let locals = HashSet::new();
+        for assignment in &upd.assignments {
+            if !assignment.is_default {
+                continue;
+            }
+            let Some(col) = table
+                .columns
+                .iter()
+                .find(|col| col.name.eq_ignore_ascii_case(&assignment.column))
+            else {
+                continue;
+            };
+            if let Some(default) = &col.default_expr {
+                collect_expr_privs(&default.expr, req, &locals);
+            }
+        }
     }
 
     /// Enforce the read-path admission gates a lazy read lane bypasses (the safe-total-`query`

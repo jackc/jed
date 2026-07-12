@@ -368,6 +368,10 @@ func (db *engine) checkPrivileges(stmt statement) error {
 	}
 	var req privReq
 	collectStmtPrivs(stmt, &req)
+	// UPDATE's DEFAULT marker carries no expression tree of its own. Preflight must therefore walk
+	// the selected catalog default explicitly, before execution resolves/evaluates it, so a revoked
+	// function cannot be invoked through `SET column = DEFAULT` (session.md §5.3).
+	db.collectUpdateDefaultPrivs(stmt, &req)
 	if req.isDDL {
 		// DDL is gated by the kind of relation it targets (temp-tables.md §5): a session-local temp
 		// table by allowTempDDL, everything else (persistent) by allowDDL. A CREATE TABLE is classified
@@ -413,6 +417,52 @@ func (db *engine) checkPrivileges(stmt statement) error {
 		}
 	}
 	return nil
+}
+
+// collectUpdateDefaultPrivs adds named functions reached through UPDATE SET column = DEFAULT.
+// Ordinary assignment expressions are handled by collectStmtPrivs; this catalog-dependent second
+// walk covers top-level, writable-CTE, and EXPLAIN-contained UPDATEs without changing missing-table
+// or missing-column error precedence (an unresolved target is left to execution).
+func (db *engine) collectUpdateDefaultPrivs(stmt statement, req *privReq) {
+	if stmt.Update != nil {
+		db.collectOneUpdateDefaultPrivs(stmt.Update, req)
+	}
+	if stmt.With != nil {
+		for i := range stmt.With.Ctes {
+			db.collectCteDefaultPrivs(&stmt.With.Ctes[i].Body, req)
+		}
+		db.collectCteDefaultPrivs(&stmt.With.Body, req)
+	}
+	if stmt.Explain != nil {
+		db.collectUpdateDefaultPrivs(*stmt.Explain.Inner, req)
+	}
+}
+
+func (db *engine) collectCteDefaultPrivs(body *cteBody, req *privReq) {
+	if body.Update != nil {
+		db.collectOneUpdateDefaultPrivs(body.Update, req)
+	}
+}
+
+func (db *engine) collectOneUpdateDefaultPrivs(upd *update, req *privReq) {
+	table, ok := db.lkpTableScoped(upd.DB, upd.Table)
+	if !ok {
+		return
+	}
+	locals := map[string]bool{}
+	for i := range upd.Assignments {
+		a := &upd.Assignments[i]
+		if !a.IsDefault {
+			continue
+		}
+		for ci := range table.Columns {
+			col := &table.Columns[ci]
+			if strings.EqualFold(col.Name, a.Column) && col.DefaultExpr != nil {
+				collectExprPrivs(&col.DefaultExpr.Expr, req, locals)
+				break
+			}
+		}
+	}
 }
 
 // alterTableTargetsTemp classifies ALTER TABLE for the split DDL capability gate. An explicit

@@ -46,8 +46,8 @@ test("ON CONFLICT DO UPDATE SET col = DEFAULT is 42703", () => {
   );
 });
 
-// DIVERGENCE: a GENERATED ALWAYS identity column can only be set to DEFAULT (jed has no
-// SET = DEFAULT), so any DO UPDATE assignment to one is 428C9 — the standing UPDATE rule.
+// DIVERGENCE: a GENERATED ALWAYS identity column can only be set to DEFAULT, and the conflict-action
+// path has no DEFAULT form yet, so any DO UPDATE assignment to one is 428C9.
 test("ON CONFLICT DO UPDATE assigning a GENERATED ALWAYS column is 428C9", () => {
   const db = dbWith([
     "CREATE TABLE t (id i32 GENERATED ALWAYS AS IDENTITY, k i32 PRIMARY KEY, v i32)",

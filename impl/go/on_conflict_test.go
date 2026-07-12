@@ -62,8 +62,8 @@ func TestOnConflictDoUpdateSetDefaultUnsupported(t *testing.T) {
 	}
 }
 
-// DIVERGENCE: a GENERATED ALWAYS identity column can only be set to DEFAULT (jed has no
-// SET = DEFAULT), so any DO UPDATE assignment to one is 428C9 — the standing UPDATE rule.
+// DIVERGENCE: a GENERATED ALWAYS identity column can only be set to DEFAULT, and the conflict-action
+// path has no DEFAULT form yet, so any DO UPDATE assignment to one is 428C9.
 func TestOnConflictDoUpdateGeneratedAlwaysRejected(t *testing.T) {
 	t.Parallel()
 	db := ocDB(t,

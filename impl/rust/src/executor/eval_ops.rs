@@ -1798,9 +1798,9 @@ pub(crate) struct AssignPlan {
     pub(crate) varchar_len: Option<u32>,
     pub(crate) not_null: bool,
     pub(crate) source: RExpr,
-    /// The resolved `ColType` for a NON-scalar (range / array) column — `Some` ⇒ `check` stores
-    /// through `coerce_for_store` (the container codec, ranges.md §4 / array.md §4); `None` for a
-    /// scalar column, which stays on the `store_value` fast path. Composite columns are deferred
-    /// (0A000) at resolution, so they never reach here.
+    /// The resolved `ColType` for a NON-scalar column — `Some` ⇒ `check` stores through
+    /// `coerce_for_store`; `None` for a scalar column, which stays on the `store_value` fast path.
+    /// Composite columns reach this only through `SET col = DEFAULT`; ordinary composite
+    /// assignment remains deferred (0A000).
     pub(crate) col_type: Option<ColType>,
 }

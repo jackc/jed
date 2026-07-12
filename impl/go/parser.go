@@ -2172,8 +2172,28 @@ func (p *parser) parseInsert() (*insert, error) {
 		overriding = &mode
 	}
 
-	// The source is EITHER a SELECT (INSERT ... SELECT — §24) OR a VALUES list. `VALUES` and
-	// `SELECT` are disjoint leading keywords, so a peek decides without lookahead.
+	// The source is DEFAULT VALUES, a SELECT (§24), or a VALUES list. DEFAULT VALUES is the
+	// all-columns-omitted form, represented through the existing column-list machinery as one empty
+	// row mapped by an empty synthetic list. PostgreSQL does not combine it with a column list or
+	// OVERRIDING.
+	if p.peekKeyword() == "default" {
+		if columns != nil || overriding != nil {
+			return nil, newError(SyntaxError, "DEFAULT VALUES cannot be combined with a column list or OVERRIDING")
+		}
+		p.advance()
+		if err := p.expectKeyword("values"); err != nil {
+			return nil, err
+		}
+		onConflict, err := p.parseOnConflict()
+		if err != nil {
+			return nil, err
+		}
+		returning, err := p.parseReturning()
+		if err != nil {
+			return nil, err
+		}
+		return &insert{Table: table, DB: dbQualifier, Columns: []string{}, Rows: [][]insertValue{{}}, OnConflict: onConflict, Returning: returning}, nil
+	}
 	if p.peekKeyword() == "select" {
 		sel, err := p.parseSelect()
 		if err != nil {
@@ -3930,11 +3950,24 @@ func (p *parser) parseUpdate() (*update, error) {
 		if err := p.expect(tokEq); err != nil {
 			return nil, err
 		}
-		value, err := p.parseExpr()
-		if err != nil {
-			return nil, err
+		// DEFAULT is the assignment special form only when it is the complete RHS. Because
+		// keywords are legal identifiers, `SET x = default + 1` must keep parsing `default` as
+		// a column reference (grammar.md §16).
+		nextKeyword := p.peekKeywordAt(1)
+		nextKind := p.peekKindAt(1)
+		isDefault := p.peekKeyword() == "default" &&
+			(nextKind == tokComma || nextKind == tokEof || nextKeyword == "where" || nextKeyword == "returning")
+		var value exprNode
+		if isDefault {
+			p.advance()
+			value = exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalNull}}
+		} else {
+			value, err = p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
 		}
-		assignments = append(assignments, assignment{Column: column, Value: value})
+		assignments = append(assignments, assignment{Column: column, IsDefault: isDefault, Value: value})
 		if p.peek().Kind == tokComma {
 			p.advance()
 			continue

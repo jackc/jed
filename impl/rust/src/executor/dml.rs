@@ -827,7 +827,8 @@ impl Engine {
                 for a in assignments {
                     let idx = col_idx(tdef, &a.column)?;
                     // A GENERATED ALWAYS identity column can only be set to DEFAULT (sequences.md
-                    // §13.4); jed has no `= DEFAULT`, so any assignment is 428C9 (before the PK 0A000).
+                    // §13.4). This conflict-action path has no DEFAULT form yet, so any assignment
+                    // here is 428C9 (before the PK 0A000).
                     if tdef.columns[idx].identity == Some(IdentityKind::Always) {
                         return Err(EngineError::new(
                             SqlState::GeneratedAlways,
@@ -1999,14 +2000,23 @@ impl Engine {
         // Per-column frozen collations (over the FULL table columns) for the collated text key form
         // (§2.12) — indexes both the FK probe and the index-entry move path.
         let colls = self.column_collations(&table.columns);
+        // UPDATE SET col = DEFAULT reuses INSERT's once-per-statement resolution of expression
+        // defaults. Constant/no defaults become constant RExpr nodes below, so applying them is
+        // free; expression defaults are evaluated once per matched row through the UPDATE meter
+        // and statement RNG (constraints.md §2).
+        let mut default_exprs = if upd.assignments.iter().any(|a| a.is_default) {
+            self.resolve_default_exprs(table)?
+        } else {
+            Vec::new()
+        };
         let mut ptypes = ParamTypes::default();
         let mut plans: Vec<AssignPlan> = Vec::with_capacity(upd.assignments.len());
         for a in &upd.assignments {
             let idx = col_idx(table, &a.column)?;
-            // A GENERATED ALWAYS identity column can only be set to DEFAULT (sequences.md §13.4);
-            // jed's UPDATE has no `= DEFAULT` form, so any assignment is `428C9`. Ordered before the
-            // PK-narrowing 0A000 so an ALWAYS identity PRIMARY KEY reports 428C9 (PG's code).
-            if table.columns[idx].identity == Some(IdentityKind::Always) {
+            // A GENERATED ALWAYS identity column can only be set to DEFAULT (sequences.md §13.4).
+            // An ordinary assignment is 428C9; the DEFAULT form below is allowed and advances the
+            // owned sequence through its expression default.
+            if table.columns[idx].identity == Some(IdentityKind::Always) && !a.is_default {
                 return Err(EngineError::new(
                     SqlState::GeneratedAlways,
                     format!("column {} can only be updated to DEFAULT", a.column),
@@ -2019,6 +2029,29 @@ impl Engine {
                 ));
             }
             let col = &table.columns[idx];
+            if a.is_default {
+                let source = default_exprs[idx].take().unwrap_or_else(|| {
+                    value_to_rexpr(col.default.as_ref().unwrap_or(&Value::Null))
+                });
+                let (target, col_type) = match &col.ty {
+                    Type::Scalar(target) => (*target, None),
+                    Type::Composite(_) | Type::Range(_) | Type::Array(_) => (
+                        ScalarType::Int32,
+                        Some(resolve_col_type(&col.ty, &scope.catalog.read_snap().types)),
+                    ),
+                };
+                plans.push(AssignPlan {
+                    idx,
+                    name: col.name.clone(),
+                    target,
+                    decimal: col.decimal,
+                    varchar_len: col.varchar_len,
+                    not_null: col.not_null,
+                    source,
+                    col_type,
+                });
+                continue;
+            }
             match &col.ty {
                 // Updating a composite-typed column lands in a later slice (anonymous-record →
                 // named-composite assignment coercion — composite.md §12); reject it (0A000). Range
