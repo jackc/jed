@@ -111,6 +111,26 @@ type scanBound struct {
 	indexSet *indexKeySetPlan
 }
 
+// mutationScanPlan is the small physical plan shared by UPDATE/DELETE execution and DML EXPLAIN.
+// The resolved filter remains the residual predicate; bound is only the chosen candidate superset.
+// scope carries the target database qualifier so a full scan continues through the scoped store
+// funnel (attachments deliberately have no bound this slice).
+type mutationScanPlan struct {
+	bound  *scanBound
+	filter *rExpr
+	scope  *string
+}
+
+// mutationScanBatch is the normalized result of executing any mutation access path. Every path
+// returns storage keys with rows (SELECT may discard keys through its row wrappers), plus the exact
+// up-front page/decompression units its caller charges before per-row storage_row_read.
+type mutationScanBatch struct {
+	entries []entry
+	pages   int
+	slabs   int
+	empty   bool
+}
+
 // needsEagerScan reports whether a bound needs the general eager materialize path (materializeRel /
 // the DML scan) rather than a single-contiguous-range fast path (streaming scan, columnar project,
 // vectorized aggregate, streaming sort, join top-N). True for a second-tree gather (index / GIN /
@@ -350,11 +370,32 @@ func (db *engine) buildIndexAccessPredicate(filter *rExpr, rel scopeRel, idx ind
 	}
 }
 
-// detectScanBound picks one relation's scan bound (cost.md §3; indexes.md §5): the
-// single-column PK bound first; else, among the relation's indexes (held in ascending
-// lowercased-name order — the deterministic tie-break), the first that yields a non-empty
-// access predicate (buildIndexAccessPredicate); else nil (full scan).
+// scanBoundPolicy is the consumer-specific eligibility/precedence part of access-path selection.
+// SELECT and mutation scans share one inventory below but deliberately do not enable the same
+// candidates yet: ordered B-tree/index-set mutation scans are Phase 1 follow-ons, and the already
+// shipped mutation contract tries GIN before GiST while SELECT tries GiST before GIN. Keeping those
+// differences as data here prevents EXPLAIN and execution from growing separate detector ladders.
+type scanBoundPolicy struct {
+	orderedIndex  bool
+	indexSet      bool
+	gistBeforeGin bool
+}
+
+var (
+	selectScanBoundPolicy   = scanBoundPolicy{orderedIndex: true, indexSet: true, gistBeforeGin: true}
+	mutationScanBoundPolicy = scanBoundPolicy{}
+)
+
+// detectScanBound picks one SELECT relation's scan bound (cost.md §3; indexes.md §5). It is the
+// SELECT-policy wrapper over the shared inventory in detectScanBoundWithPolicy.
 func detectScanBound(filter *rExpr, rel scopeRel, db *engine) *scanBound {
+	return detectScanBoundWithPolicy(filter, rel, db, selectScanBoundPolicy)
+}
+
+// detectScanBoundWithPolicy inventories the structurally usable bounds for one base relation and
+// returns the first candidate admitted by policy. The whole WHERE remains the residual filter, so a
+// disabled candidate always falls through to another sound bound or a full scan.
+func detectScanBoundWithPolicy(filter *rExpr, rel scopeRel, db *engine, policy scanBoundPolicy) *scanBound {
 	// A host-attached relation full-scans this slice (attached-databases.md §8): the bounded-scan exec
 	// path resolves index stores unscoped, so no PK/index/GiST/GIN bound may apply to an attachment.
 	if rel.isAttachment() {
@@ -374,23 +415,33 @@ func detectScanBound(filter *rExpr, rel scopeRel, db *engine) *scanBound {
 			}
 		}
 	}
-	for _, idx := range rel.table.Indexes {
-		// An index access predicate (indexes.md §5.1): a maximal equality prefix + optional trailing
-		// range over a B-tree index's leading key columns. Returns nil for a GIN/GiST index (handled
-		// by the passes below), an ineligible tail, or no bound. Indexes are held in ascending
-		// lowercased-name order, so the first non-nil wins — the deterministic tie-break.
-		if ib := db.buildIndexAccessPredicate(filter, rel, idx, -1); ib != nil {
-			return &scanBound{index: ib}
+	if policy.orderedIndex {
+		for _, idx := range rel.table.Indexes {
+			// An index access predicate (indexes.md §5.1): a maximal equality prefix + optional trailing
+			// range over a B-tree index's leading key columns. Returns nil for a GIN/GiST index (handled
+			// by the passes below), an ineligible tail, or no bound. Indexes are held in ascending
+			// lowercased-name order, so the first non-nil wins — the deterministic tie-break.
+			if ib := db.buildIndexAccessPredicate(filter, rel, idx, -1); ib != nil {
+				return &scanBound{index: ib}
+			}
 		}
 	}
-	// GiST bound (gist.md §5) — a `col && const` / `col @> const` over a range column; the ordered
-	// loop above already skipped the GiST index (its leading column is a non-scalar range).
-	if gb := detectGistBound(filter, rel.table.Indexes, rel.table.Columns, rel.offset); gb != nil {
-		return &scanBound{gist: gb}
-	}
-	// GIN bound (gin.md §6) — after the PK and ordered-index equality bounds.
-	if gb := detectGinBound(filter, rel.table.Indexes, rel.table.Columns, rel.offset); gb != nil {
-		return &scanBound{gin: gb}
+	if policy.gistBeforeGin {
+		// SELECT's established order is GiST then GIN after PK/ordered B-tree.
+		if gb := detectGistBound(filter, rel.table.Indexes, rel.table.Columns, rel.offset); gb != nil {
+			return &scanBound{gist: gb}
+		}
+		if gb := detectGinBound(filter, rel.table.Indexes, rel.table.Columns, rel.offset); gb != nil {
+			return &scanBound{gin: gb}
+		}
+	} else {
+		// UPDATE/DELETE's established order is GIN then GiST after PK. Phase 0 preserves it.
+		if gb := detectGinBound(filter, rel.table.Indexes, rel.table.Columns, rel.offset); gb != nil {
+			return &scanBound{gin: gb}
+		}
+		if gb := detectGistBound(filter, rel.table.Indexes, rel.table.Columns, rel.offset); gb != nil {
+			return &scanBound{gist: gb}
+		}
 	}
 	// LAST RESORT — an OR / IN-list of key equalities lowered to merged point probes
 	// (cost.md §3 "OR / IN-list"). Reached only when no contiguous PK/index/GIN/GiST bound
@@ -404,6 +455,9 @@ func detectScanBound(filter *rExpr, rel scopeRel, db *engine) *scanBound {
 				}
 			}
 		}
+	}
+	if !policy.indexSet {
+		return nil
 	}
 	for _, idx := range rel.table.Indexes {
 		if idx.Kind != indexBtree {
@@ -452,6 +506,19 @@ func detectScanBound(filter *rExpr, rel scopeRel, db *engine) *scanBound {
 		}
 	}
 	return nil
+}
+
+// planMutationScan selects an UPDATE/DELETE target access path through the same inventory as SELECT,
+// using the mutation eligibility policy. It runs after uncorrelated filter folding, matching the old
+// inline executor timing. EXPLAIN calls the same function on its resolved (unfolded) filter.
+func (db *engine) planMutationScan(scope *string, table *catTable, filter *rExpr) mutationScanPlan {
+	plan := mutationScanPlan{filter: filter, scope: scope}
+	if filter == nil {
+		return plan
+	}
+	rel := scopeRel{label: strings.ToLower(table.Name), table: table, offset: 0, db: scope}
+	plan.bound = detectScanBoundWithPolicy(filter, rel, db, mutationScanBoundPolicy)
+	return plan
 }
 
 // detectKeySet finds an OR / IN-list disjunction of equalities on ONE key column (at global
@@ -921,11 +988,26 @@ func rexprIsConstant(e *rExpr) bool {
 // scanSource as any bounded scan. A provably empty bound (a NULL / contradictory equality, a
 // NULL / contradictory range, an out-of-range integer) returns nothing and charges nothing.
 func (db *engine) indexBoundRows(tableName string, ib *indexBoundPlan, params []Value, outer []storedRow, mask []bool, left storedRow) (rows []storedRow, pages, slabs int, err error) {
+	entries, pages, slabs, err := db.indexBoundEntries(tableName, ib, params, outer, mask, left)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	rows = make([]storedRow, len(entries))
+	for i := range entries {
+		rows[i] = entries[i].Row
+	}
+	return rows, pages, slabs, nil
+}
+
+// indexBoundEntries is the key-preserving form of indexBoundRows. Keeping the storage key beside
+// each fetched row gives SELECT and mutation consumers one access-path result contract; SELECT's
+// compatibility wrapper above discards the keys.
+func (db *engine) indexBoundEntries(tableName string, ib *indexBoundPlan, params []Value, outer []storedRow, mask []bool, left storedRow) (entries []entry, pages, slabs int, err error) {
 	b, prefixByteLen, empty := db.buildIndexBound(ib, params, outer, left)
 	if empty {
 		return nil, 0, 0, nil
 	}
-	return db.indexScanBound(tableName, ib.nameKey, ib.suffixTypes, b, prefixByteLen, mask)
+	return db.indexScanBoundEntries(tableName, ib.nameKey, ib.suffixTypes, b, prefixByteLen, mask)
 }
 
 // buildIndexBound turns an index access predicate into a concrete index-key range at exec time
@@ -1001,6 +1083,20 @@ func (db *engine) buildIndexBound(ib *indexBoundPlan, params []Value, outer []st
 // access-predicate bound (indexBoundRows) and the OR / IN-list point-set (indexPointRows) so both
 // drive the identical per-entry fetch — same cost by construction.
 func (db *engine) indexScanBound(tableName, nameKey string, suffixTypes []scalarType, b keyBound, prefixByteLen int, mask []bool) (rows []storedRow, pages, slabs int, err error) {
+	entries, pages, slabs, err := db.indexScanBoundEntries(tableName, nameKey, suffixTypes, b, prefixByteLen, mask)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	rows = make([]storedRow, len(entries))
+	for i := range entries {
+		rows[i] = entries[i].Row
+	}
+	return rows, pages, slabs, nil
+}
+
+// indexScanBoundEntries is the key-preserving core of the ordered-index gather. Candidate ordering
+// and units are identical to indexScanBound; only the already-recovered storage key is retained.
+func (db *engine) indexScanBoundEntries(tableName, nameKey string, suffixTypes []scalarType, b keyBound, prefixByteLen int, mask []bool) (out []entry, pages, slabs int, err error) {
 	istore := db.lkpIndexStore(nameKey)
 	// The index store has no payload columns, so its mask is empty and its fused scan contributes
 	// only the index-tree page_read count (no spill/compress units).
@@ -1031,9 +1127,9 @@ func (db *engine) indexScanBound(tableName, nameKey string, suffixTypes []scalar
 		if !ok {
 			panic("an index entry references a stored row")
 		}
-		rows = append(rows, row)
+		out = append(out, entry{Key: append([]byte(nil), rowKey...), Row: row})
 	}
-	return rows, pages, slabs, nil
+	return out, pages, slabs, nil
 }
 
 // indexPointRows fetches the rows a SINGLE already-encoded leading-column index value admits — the
@@ -1042,9 +1138,21 @@ func (db *engine) indexScanBound(tableName, nameKey string, suffixTypes []scalar
 // where each distinct list value is one such point probe. suffixTypes are the trailing key
 // components (columns[1:], fixed-width), width-skipped past the single leading slot.
 func (db *engine) indexPointRows(tableName, nameKey string, suffixTypes []scalarType, valueKey []byte, mask []bool) (rows []storedRow, pages, slabs int, err error) {
+	entries, pages, slabs, err := db.indexPointEntries(tableName, nameKey, suffixTypes, valueKey, mask)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	rows = make([]storedRow, len(entries))
+	for i := range entries {
+		rows[i] = entries[i].Row
+	}
+	return rows, pages, slabs, nil
+}
+
+func (db *engine) indexPointEntries(tableName, nameKey string, suffixTypes []scalarType, valueKey []byte, mask []bool) (entries []entry, pages, slabs int, err error) {
 	prefix := append([]byte{0x00}, valueKey...)
 	b := keyBound{lo: prefix, loInc: true, hi: prefixSuccessor(prefix), hiInc: false}
-	return db.indexScanBound(tableName, nameKey, suffixTypes, b, len(prefix), mask)
+	return db.indexScanBoundEntries(tableName, nameKey, suffixTypes, b, len(prefix), mask)
 }
 
 // encodeKeySet encodes an OR / IN-list's equality const-sources into the key space and returns
@@ -1104,16 +1212,78 @@ func (db *engine) pkKeySetRows(store *tableStore, ks *pkKeySetPlan, params []Val
 // column, distinct values probe disjoint row sets — no row is fetched twice. The per-probe
 // (pages, slabs) blocks sum, matching the PK point-set cost contract.
 func (db *engine) indexKeySetRows(tableName string, ks *indexKeySetPlan, params []Value, outer []storedRow, mask []bool, left storedRow) (rows []storedRow, pages, slabs int, err error) {
+	entries, pages, slabs, err := db.indexKeySetEntries(tableName, ks, params, outer, mask, left)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	rows = make([]storedRow, len(entries))
+	for i := range entries {
+		rows[i] = entries[i].Row
+	}
+	return rows, pages, slabs, nil
+}
+
+func (db *engine) indexKeySetEntries(tableName string, ks *indexKeySetPlan, params []Value, outer []storedRow, mask []bool, left storedRow) (entries []entry, pages, slabs int, err error) {
 	for _, k := range encodeKeySet(ks.colType, ks.srcs, params, outer, ks.coll, left) {
-		r, p, sl, err := db.indexPointRows(tableName, ks.nameKey, ks.tailTypes, k, mask)
+		r, p, sl, err := db.indexPointEntries(tableName, ks.nameKey, ks.tailTypes, k, mask)
 		if err != nil {
 			return nil, 0, 0, err
 		}
-		rows = append(rows, r...)
+		entries = append(entries, r...)
 		pages += p
 		slabs += sl
 	}
-	return rows, pages, slabs, nil
+	return entries, pages, slabs, nil
+}
+
+// executeMutationScan executes a planned UPDATE/DELETE access path into the normalized keyed-row
+// batch. It owns the access-method switch that used to be duplicated inline in both DML executors;
+// per-row guards, storage_row_read, residual evaluation, and the phase-2 writes stay with the caller.
+func (db *engine) executeMutationScan(plan mutationScanPlan, tableName string, params []Value, env *evalEnv, meter *costMeter, mask []bool) (mutationScanBatch, error) {
+	store := db.lkpStoreScoped(plan.scope, tableName)
+	b := plan.bound
+	if b == nil {
+		entries, pages, slabs, err := store.ScanWithUnits(mask)
+		return mutationScanBatch{entries: entries, pages: pages, slabs: slabs}, err
+	}
+	if b.pk != nil {
+		kb, empty := db.buildKeyBound(b.pk, params, nil, nil)
+		if empty {
+			return mutationScanBatch{empty: true}, nil
+		}
+		entries, pages, slabs, err := store.RangeScanWithUnits(kb, mask)
+		return mutationScanBatch{entries: entries, pages: pages, slabs: slabs}, err
+	}
+	if b.index != nil {
+		entries, pages, slabs, err := db.indexBoundEntries(tableName, b.index, params, nil, mask, nil)
+		return mutationScanBatch{entries: entries, pages: pages, slabs: slabs}, err
+	}
+	if b.gin != nil {
+		var query *rExpr
+		if _, q, ok := ginMatch(plan.filter, b.gin.colGlobal); ok {
+			query = q
+		}
+		entries, pages, slabs, err := db.ginBoundRows(tableName, b.gin, query, env, meter, mask)
+		return mutationScanBatch{entries: entries, pages: pages, slabs: slabs}, err
+	}
+	if b.gist != nil {
+		var query *rExpr
+		if q, ok := gistQueryOperand(plan.filter, b.gist); ok {
+			query = q
+		}
+		entries, pages, slabs, err := db.gistBoundRows(tableName, b.gist, query, env, meter, mask)
+		return mutationScanBatch{entries: entries, pages: pages, slabs: slabs}, err
+	}
+	if b.pkSet != nil {
+		entries, pages, slabs, err := db.pkKeySetRows(store, b.pkSet, params, nil, mask, nil, false)
+		return mutationScanBatch{entries: entries, pages: pages, slabs: slabs}, err
+	}
+	if b.indexSet != nil {
+		entries, pages, slabs, err := db.indexKeySetEntries(tableName, b.indexSet, params, nil, mask, nil)
+		return mutationScanBatch{entries: entries, pages: pages, slabs: slabs}, err
+	}
+	entries, pages, slabs, err := store.ScanWithUnits(mask)
+	return mutationScanBatch{entries: entries, pages: pages, slabs: slabs}, err
 }
 
 // ginBoundRows executes a GIN-bounded scan (spec/design/gin.md §6, cost.md §3). Evaluates the
@@ -1405,57 +1575,6 @@ func prefixSuccessor(p []byte) []byte {
 			s[len(s)-1]++
 			return s
 		}
-	}
-	return nil
-}
-
-// pkBoundFor detects a single-table mutation's (UPDATE/DELETE) PK pushdown bound; nil ⇒ full scan.
-func (db *engine) pkBoundFor(table *catTable, filter *rExpr) *pkBoundPlan {
-	if filter == nil {
-		return nil
-	}
-	pkIdx := table.PrimaryKeyIndex()
-	if pkIdx < 0 {
-		return nil
-	}
-	// Point-lookup pushdown is scalar-only; a non-scalar (range) PK skips it (deferred — ranges.md
-	// §10), so a range PK WHERE k = … full-scans + residual-filters.
-	sty, ok := table.Columns[pkIdx].Type.AsScalar()
-	if !ok {
-		return nil
-	}
-	// A collated Skewed PK refuses pushdown (push=false) — though a skewed table's write is already
-	// refused XX002 upstream (ensureCollationsWritable), so this is reached only for a C or
-	// Full-collated PK (collation.md §8/§12).
-	coll, push := db.keyCollationCtx(table.Columns[pkIdx])
-	if !push {
-		return nil
-	}
-	return detectPKBound(filter, pkIdx, sty, coll)
-}
-
-// pkSetFor is the pkBoundFor analog for an OR / IN-list of primary-key equalities — a merged
-// PK point-set bound for the UPDATE/DELETE scan (cost.md §3 "OR / IN-list"). Like pkBoundFor it
-// applies only to a scalar, non-Skewed-collated PK. A secondary-index point-set for DML is the
-// separate index-scans-for-DML follow-on, so mutations bound only by the primary key here.
-func (db *engine) pkSetFor(table *catTable, filter *rExpr) *pkKeySetPlan {
-	if filter == nil {
-		return nil
-	}
-	pkIdx := table.PrimaryKeyIndex()
-	if pkIdx < 0 {
-		return nil
-	}
-	sty, ok := table.Columns[pkIdx].Type.AsScalar()
-	if !ok {
-		return nil
-	}
-	coll, push := db.keyCollationCtx(table.Columns[pkIdx])
-	if !push {
-		return nil
-	}
-	if srcs := detectKeySet(filter, pkIdx, sty, coll); srcs != nil {
-		return &pkKeySetPlan{pkType: sty, coll: coll, srcs: srcs}
 	}
 	return nil
 }

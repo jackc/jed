@@ -2215,62 +2215,18 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (ou
 			mask[i] = mask[i] || retMask[i]
 		}
 	}
-	// A primary-key bound seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
-	// scan"); an empty bound deletes nothing. The whole WHERE stays the residual filter below.
-	// page_read per visited node (block, before the rows), then storage_row_read per scanned row.
-	var entries []entry
-	var overlap, slabs int
-	if isAttachmentScope(del.DB) {
-		// A host-attached target full-scans this slice (attached-databases.md §8) — a bounded scan would
-		// resolve its index store through the unscoped funnel. The whole WHERE stays the residual filter.
-		if entries, overlap, slabs, err = store.ScanWithUnits(mask); err != nil {
-			return outcome{}, err
-		}
-	} else if bp := db.pkBoundFor(table, filter); bp != nil {
-		// Top-level statement: no enclosing query, so the bound never has a correlated source.
-		kb, empty := db.buildKeyBound(bp, bound, nil, nil)
-		if empty {
-			// A provably-empty bound affects zero rows — with RETURNING that is still a
-			// query result (empty rows), never a bare statement (grammar.md §32).
-			return dmlOutcome(retNames, retTypes, nil, 0, meter.Accrued), nil
-		}
-		if entries, overlap, slabs, err = store.RangeScanWithUnits(kb, mask); err != nil {
-			return outcome{}, err
-		}
-	} else if gb := detectGinBound(filter, table.Indexes, table.Columns, 0); gb != nil {
-		// GIN-bounded delete (gin.md §6): when no PK bound applies, gather the candidate (key,row)
-		// Entry pairs through the index; the predicate stays the residual filter, re-applied per
-		// candidate below. GinEntry charged inside; the page_read/value_decompress block below.
-		// readSnap()==working() during a mutation (tx open), so this reads the read-your-writes state.
-		var query *rExpr
-		if _, q, ok := ginMatch(filter, gb.colGlobal); ok {
-			query = q
-		}
-		if entries, overlap, slabs, err = db.ginBoundRows(del.Table, gb, query, env, meter, mask); err != nil {
-			return outcome{}, err
-		}
-	} else if gb := detectGistBound(filter, table.Indexes, table.Columns, 0); gb != nil {
-		// GiST-bounded delete (gist.md §5): gather candidates by descending the resident R-tree; the
-		// &&/@> predicate stays the residual filter re-applied per candidate below.
-		var query *rExpr
-		if q, ok := gistQueryOperand(filter, gb); ok {
-			query = q
-		}
-		if entries, overlap, slabs, err = db.gistBoundRows(del.Table, gb, query, env, meter, mask); err != nil {
-			return outcome{}, err
-		}
-	} else if ks := db.pkSetFor(table, filter); ks != nil {
-		// Merged PK point-set delete (cost.md §3 "OR / IN-list"): a union of point probes over the
-		// distinct sorted keys; whole rows so index entries can be removed. The predicate stays the
-		// residual filter below.
-		if entries, overlap, slabs, err = db.pkKeySetRows(store, ks, bound, nil, mask, nil, false); err != nil {
-			return outcome{}, err
-		}
-	} else {
-		if entries, overlap, slabs, err = store.ScanWithUnits(mask); err != nil {
-			return outcome{}, err
-		}
+	// Plan and execute the target scan through the shared mutation access-path seam. The plan is
+	// selected after uncorrelated folding, matching the old inline detector timing; the batch keeps
+	// storage keys for phase 2 and reports the same up-front units as before.
+	scanPlan := db.planMutationScan(del.DB, table, filter)
+	batch, err := db.executeMutationScan(scanPlan, del.Table, bound, env, meter, mask)
+	if err != nil {
+		return outcome{}, err
 	}
+	if batch.empty {
+		return dmlOutcome(retNames, retTypes, nil, 0, meter.Accrued), nil
+	}
+	entries, overlap, slabs := batch.entries, batch.pages, batch.slabs
 	meter.Charge(costs.PageRead*int64(overlap) + costs.ValueDecompress*int64(slabs))
 	for _, e := range entries {
 		if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned row (CLAUDE.md §13)
@@ -2634,61 +2590,17 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 			}
 		}
 	}
-	// A primary-key bound seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
-	// scan"); an empty bound updates nothing. The whole WHERE stays the residual filter below.
-	// page_read per visited node (block, before the rows), then storage_row_read per scanned row.
-	var entries []entry
-	var overlap, slabs int
-	if isAttachmentScope(upd.DB) {
-		// A host-attached target full-scans this slice (attached-databases.md §8) — a bounded scan would
-		// resolve its index store through the unscoped funnel. The whole WHERE stays the residual filter.
-		if entries, overlap, slabs, err = store.ScanWithUnits(mask); err != nil {
-			return outcome{}, err
-		}
-	} else if bp := db.pkBoundFor(table, filter); bp != nil {
-		// Top-level statement: no enclosing query, so the bound never has a correlated source.
-		kb, empty := db.buildKeyBound(bp, bound, nil, nil)
-		if empty {
-			// A provably-empty bound affects zero rows — with RETURNING that is still a
-			// query result (empty rows), never a bare statement (grammar.md §32).
-			return dmlOutcome(retNames, retTypes, nil, 0, meter.Accrued), nil
-		}
-		if entries, overlap, slabs, err = store.RangeScanWithUnits(kb, mask); err != nil {
-			return outcome{}, err
-		}
-	} else if gb := detectGinBound(filter, table.Indexes, table.Columns, 0); gb != nil {
-		// GIN-bounded update (gin.md §6): when no PK bound applies, gather the candidate (key,row)
-		// Entry pairs through the index over the PRE-update state; the predicate stays the residual
-		// filter (re-applied per candidate below). GinEntry charged inside; the block below.
-		var query *rExpr
-		if _, q, ok := ginMatch(filter, gb.colGlobal); ok {
-			query = q
-		}
-		if entries, overlap, slabs, err = db.ginBoundRows(upd.Table, gb, query, env, meter, mask); err != nil {
-			return outcome{}, err
-		}
-	} else if gb := detectGistBound(filter, table.Indexes, table.Columns, 0); gb != nil {
-		// GiST-bounded update (gist.md §5): gather candidates by descending the resident R-tree over
-		// the PRE-update state; the &&/@> predicate stays the residual filter re-applied per candidate.
-		var query *rExpr
-		if q, ok := gistQueryOperand(filter, gb); ok {
-			query = q
-		}
-		if entries, overlap, slabs, err = db.gistBoundRows(upd.Table, gb, query, env, meter, mask); err != nil {
-			return outcome{}, err
-		}
-	} else if ks := db.pkSetFor(table, filter); ks != nil {
-		// Merged PK point-set update (cost.md §3 "OR / IN-list"): a union of point probes over the
-		// distinct sorted keys of the PRE-update state; whole rows. The predicate stays the residual
-		// filter below.
-		if entries, overlap, slabs, err = db.pkKeySetRows(store, ks, bound, nil, mask, nil, false); err != nil {
-			return outcome{}, err
-		}
-	} else {
-		if entries, overlap, slabs, err = store.ScanWithUnits(mask); err != nil {
-			return outcome{}, err
-		}
+	// Plan and execute the target scan through the shared mutation access-path seam. The keyed batch
+	// is over the pre-update state and feeds the unchanged two-phase rewrite below.
+	scanPlan := db.planMutationScan(upd.DB, table, filter)
+	batch, err := db.executeMutationScan(scanPlan, upd.Table, bound, env, meter, mask)
+	if err != nil {
+		return outcome{}, err
 	}
+	if batch.empty {
+		return dmlOutcome(retNames, retTypes, nil, 0, meter.Accrued), nil
+	}
+	entries, overlap, slabs := batch.entries, batch.pages, batch.slabs
 	meter.Charge(costs.PageRead*int64(overlap) + costs.ValueDecompress*int64(slabs))
 	for _, e := range entries {
 		if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned row (CLAUDE.md §13)

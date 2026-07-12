@@ -142,6 +142,29 @@ selection + execution spec; cost-based selection is a later concern, §7):
 Whatever the bound, the WHERE stays the **residual filter** — a bound only narrows which
 rows are scanned, so a superset bound is always sound.
 
+### 5.1 Consumer policies over one bound inventory
+
+The detector is one inventory with an explicit **consumer policy**, not separate SELECT,
+UPDATE, DELETE, and EXPLAIN ladders. This is behavior-neutral plumbing for the rule-based
+extensions: it makes later eligibility changes one policy edit while preserving today's choices.
+
+- **SELECT** admits PK, ordered B-tree, GiST, GIN, PK point-set, and ordered-index point-set
+  candidates in the §5 order.
+- **UPDATE/DELETE** currently admit PK, GIN, GiST, and PK point-set only. Their established
+  GIN-before-GiST order is preserved (unlike SELECT's GiST-before-GIN order); ordered B-tree and
+  ordered-index point-set candidates are present in the inventory but policy-disabled until the
+  indexed-mutation slice. A host-attached target policy-disables every bound and full-scans through
+  its scoped store, unchanged.
+- **DML EXPLAIN** renders the same typed mutation physical plan execution consumes. It does not run
+  a parallel detector.
+
+Access-path execution has a common key-preserving result: deterministic `(storage key, row)`
+candidates plus the exact up-front `page_read` / `value_decompress` / access-method work block.
+SELECT compatibility feeds may discard the storage keys; mutations retain them for their phase-2
+writes. Per-row `storage_row_read`, residual-filter evaluation, projection, and mutation validation
+remain downstream, so this normalization changes neither accrual order nor totals. A full or
+contiguous-PK scan may realize the same contract as a pull source rather than an eager vector.
+
 ## 6. Neutrality and determinism
 
 - **Same plan everywhere.** For a given (query, catalog) every core must choose the same

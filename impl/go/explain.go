@@ -206,22 +206,10 @@ func (db *engine) renderDmlScan(r *explainRender, table *catTable, name string, 
 	r.emit(d, "Scan "+name, db.scanDetail(name, db.dmlScanBound(table, filter), false, nil))
 }
 
-// dmlScanBound picks an UPDATE/DELETE target's scan bound with the executor's own detectors: the
-// single-column PK range bound first, then a GIN bound, then a GiST bound; else a full scan (nil).
+// dmlScanBound is EXPLAIN's compatibility wrapper over the typed mutation physical plan used by the
+// executors. The unqualified explain surface has a nil database scope.
 func (db *engine) dmlScanBound(table *catTable, filter *rExpr) *scanBound {
-	if bp := db.pkBoundFor(table, filter); bp != nil {
-		return &scanBound{pk: bp}
-	}
-	if gb := detectGinBound(filter, table.Indexes, table.Columns, 0); gb != nil {
-		return &scanBound{gin: gb}
-	}
-	if gp := detectGistBound(filter, table.Indexes, table.Columns, 0); gp != nil {
-		return &scanBound{gist: gp}
-	}
-	if ks := db.pkSetFor(table, filter); ks != nil {
-		return &scanBound{pkSet: ks}
-	}
-	return nil
+	return db.planMutationScan(nil, table, filter).bound
 }
 
 // planExplainInner resolves the inner statement into a queryPlan WITHOUT executing it. It handles the

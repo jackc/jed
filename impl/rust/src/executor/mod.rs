@@ -4489,3 +4489,19 @@ pub(crate) enum ScanBound {
     PkSet(PkKeySet),
     IndexSet(IndexKeySet),
 }
+
+/// Small physical plan shared by UPDATE/DELETE execution and DML EXPLAIN. The resolved filter stays
+/// outside as the residual predicate; `bound` is only the chosen candidate superset. `db` carries
+/// the target qualifier so a full scan continues through the scoped store funnel.
+pub(crate) struct MutationScanPlan {
+    bound: Option<ScanBound>,
+    db: Option<String>,
+}
+
+/// Normalized result of executing any mutation access path: keyed rows plus the exact up-front
+/// page/decompression units charged before per-row `storage_row_read`.
+pub(crate) struct MutationScanBatch {
+    entries: Vec<(Vec<u8>, Row)>,
+    pages: usize,
+    slabs: usize,
+}

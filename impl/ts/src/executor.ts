@@ -2720,18 +2720,36 @@ export class Engine {
     r.emit(d, "Scan " + name, this.scanDetail(name, this.dmlScanBound(table, filter), false, null));
   }
 
-  // dmlScanBound picks an UPDATE/DELETE target's scan bound with the executor's own detectors: the
-  // single-column PK range bound first, then a GIN bound, then a GiST bound; else a full scan (null).
+  // dmlScanBound is EXPLAIN's compatibility wrapper over the typed mutation physical plan used by
+  // execution. The unqualified explain surface has no database qualifier.
   private dmlScanBound(table: Table, filter: RExpr | null): ScanBound | null {
-    const bp = mutationPkBound(table, filter, this.readSnap());
-    if (bp !== null) return { kind: "pk", pk: bp };
-    const gb = detectGinBound(filter, table.indexes, table.columns, 0);
-    if (gb !== null) return { kind: "gin", gin: gb };
-    const gp = detectGistBound(filter, table.indexes, table.columns, 0);
-    if (gp !== null) return { kind: "gist", gist: gp };
-    const ks = pkSetFor(table, filter, this.readSnap());
-    if (ks !== null) return { kind: "pkSet", pkSet: ks };
-    return null;
+    return this.planMutationScan(undefined, table, filter).bound;
+  }
+
+  // Select an UPDATE/DELETE target access path through the same inventory as SELECT, using the
+  // mutation eligibility policy. Execution calls this after uncorrelated filter folding.
+  private planMutationScan(
+    db: string | undefined,
+    table: Table,
+    filter: RExpr | null,
+  ): MutationScanPlan {
+    if (filter === null) return { bound: null, db };
+    const rel: ScopeRel = {
+      label: table.name.toLowerCase(),
+      table,
+      offset: 0,
+      ...(db !== undefined ? { db } : {}),
+    };
+    return {
+      bound: detectScanBoundWithPolicy(
+        filter,
+        rel,
+        this.readSnap(),
+        this,
+        MUTATION_SCAN_BOUND_POLICY,
+      ),
+      db,
+    };
   }
 
   // planExplainInner resolves the inner statement into a QueryPlan WITHOUT executing it. It handles the
@@ -6386,9 +6404,22 @@ export class Engine {
     mask: boolean[],
     left: Row,
   ): { rows: Row[]; pages: number; slabs: number } {
+    const r = this.indexBoundEntries(tableName, ib, params, outer, mask, left);
+    return { rows: r.entries.map((e) => e.row), pages: r.pages, slabs: r.slabs };
+  }
+
+  // Key-preserving form of indexBoundRows. SELECT discards the keys; mutations retain them.
+  indexBoundEntries(
+    tableName: string,
+    ib: IndexBound,
+    params: Value[],
+    outer: Row[],
+    mask: boolean[],
+    left: Row,
+  ): { entries: Entry[]; pages: number; slabs: number } {
     const built = buildIndexBound(ib, params, outer, left);
-    if (built === null) return { rows: [], pages: 0, slabs: 0 }; // provably empty — charge nothing
-    return this.indexScanBound(
+    if (built === null) return { entries: [], pages: 0, slabs: 0 };
+    return this.indexScanBoundEntries(
       tableName,
       ib.nameKey,
       ib.suffixTypes,
@@ -6413,6 +6444,19 @@ export class Engine {
     prefixByteLen: number,
     mask: boolean[],
   ): { rows: Row[]; pages: number; slabs: number } {
+    const r = this.indexScanBoundEntries(tableName, nameKey, suffixTypes, b, prefixByteLen, mask);
+    return { rows: r.entries.map((e) => e.row), pages: r.pages, slabs: r.slabs };
+  }
+
+  // Key-preserving core of the ordered-index gather. Candidate order and units are unchanged.
+  indexScanBoundEntries(
+    tableName: string,
+    nameKey: string,
+    suffixTypes: ScalarType[],
+    b: KeyBound,
+    prefixByteLen: number,
+    mask: boolean[],
+  ): { entries: Entry[]; pages: number; slabs: number } {
     const istore = this.lkpIndexStore(nameKey);
     // The index store has no payload columns, so its mask is empty and its fused scan
     // contributes only the index-tree page_read count (no spill/compress units).
@@ -6420,7 +6464,7 @@ export class Engine {
     let pages = iscan.pages;
     const store = this.lkpStore(tableName);
     let slabs = 0;
-    const rows: Row[] = [];
+    const rows: Entry[] = [];
     for (const e of iscan.entries) {
       // Skip the equality prefix by its known byte length, then each remaining key component by width
       // (self-delimiting — a 0x01 NULL tag alone, or 0x00 + the fixed width, indexes.md §5.1); the
@@ -6434,9 +6478,9 @@ export class Engine {
       pages += u.pages;
       slabs += u.slabs;
       if (u.row === undefined) throw new Error("an index entry references a stored row");
-      rows.push(u.row);
+      rows.push({ key: rowKey, row: u.row });
     }
-    return { rows, pages, slabs };
+    return { entries: rows, pages, slabs };
   }
 
   // indexPointRows fetches the rows a SINGLE already-encoded leading-column index value admits — the
@@ -6451,12 +6495,23 @@ export class Engine {
     valueKey: Uint8Array,
     mask: boolean[],
   ): { rows: Row[]; pages: number; slabs: number } {
+    const r = this.indexPointEntries(tableName, nameKey, suffixTypes, valueKey, mask);
+    return { rows: r.entries.map((e) => e.row), pages: r.pages, slabs: r.slabs };
+  }
+
+  indexPointEntries(
+    tableName: string,
+    nameKey: string,
+    suffixTypes: ScalarType[],
+    valueKey: Uint8Array,
+    mask: boolean[],
+  ): { entries: Entry[]; pages: number; slabs: number } {
     // The entry-key prefix: the §2.2 present tag + the value's bare key bytes. The range
     // is every entry extending the prefix: [prefix, byte-successor(prefix)).
     const prefix = new Uint8Array(1 + valueKey.length);
     prefix.set(valueKey, 1);
     const b: KeyBound = { lo: prefix, loInc: true, hi: prefixSuccessor(prefix), hiInc: false };
-    return this.indexScanBound(tableName, nameKey, suffixTypes, b, prefix.length, mask);
+    return this.indexScanBoundEntries(tableName, nameKey, suffixTypes, b, prefix.length, mask);
   }
 
   // pkKeySetRows executes a primary-key OR / IN-list point-set bound (cost.md §3 "OR / IN-list"):
@@ -6502,16 +6557,76 @@ export class Engine {
     mask: boolean[],
     left: Row,
   ): { rows: Row[]; pages: number; slabs: number } {
-    const rows: Row[] = [];
+    const r = this.indexKeySetEntries(tableName, ks, params, outer, mask, left);
+    return { rows: r.entries.map((e) => e.row), pages: r.pages, slabs: r.slabs };
+  }
+
+  indexKeySetEntries(
+    tableName: string,
+    ks: IndexKeySet,
+    params: Value[],
+    outer: Row[],
+    mask: boolean[],
+    left: Row,
+  ): { entries: Entry[]; pages: number; slabs: number } {
+    const entries: Entry[] = [];
     let pages = 0;
     let slabs = 0;
     for (const k of encodeKeySet(ks.colType, ks.srcs, params, outer, ks.coll, left)) {
-      const r = this.indexPointRows(tableName, ks.nameKey, ks.tailTypes, k, mask);
-      for (const row of r.rows) rows.push(row);
+      const r = this.indexPointEntries(tableName, ks.nameKey, ks.tailTypes, k, mask);
+      for (const entry of r.entries) entries.push(entry);
       pages += r.pages;
       slabs += r.slabs;
     }
-    return { rows, pages, slabs };
+    return { entries, pages, slabs };
+  }
+
+  // Execute a planned UPDATE/DELETE access path into the normalized keyed-row batch. Per-row guards,
+  // storageRowRead, residual evaluation, and phase-2 writes remain with the caller.
+  private executeMutationScan(
+    plan: MutationScanPlan,
+    tableName: string,
+    filter: RExpr | null,
+    params: Value[],
+    env: EvalEnv,
+    meter: Meter,
+    mask: boolean[],
+  ): MutationScanBatch {
+    const store = this.lkpStoreScoped(plan.db, tableName);
+    const b = plan.bound;
+    if (b === null) {
+      const r = store.scanWithUnits(mask);
+      return { entries: r.entries, pages: r.pages, slabs: r.slabs, empty: false };
+    }
+    switch (b.kind) {
+      case "pk": {
+        const r = scanEntries(store, b.pk, params, mask);
+        if (r.entries === null) return { entries: [], pages: 0, slabs: 0, empty: true };
+        return { entries: r.entries, pages: r.overlap, slabs: r.slabs, empty: false };
+      }
+      case "index": {
+        const r = this.indexBoundEntries(tableName, b.index, params, [], mask, []);
+        return { ...r, empty: false };
+      }
+      case "gin": {
+        const m = filter !== null ? ginMatch(filter, b.gin.colGlobal) : null;
+        const r = this.ginBoundRows(tableName, b.gin, m?.query ?? null, env, meter, mask);
+        return { ...r, empty: false };
+      }
+      case "gist": {
+        const q = filter !== null ? gistQueryOperand(filter, b.gist) : null;
+        const r = this.gistBoundRows(tableName, b.gist, q, env, meter, mask);
+        return { ...r, empty: false };
+      }
+      case "pkSet": {
+        const r = this.pkKeySetRows(store, b.pkSet, params, [], mask, []);
+        return { ...r, empty: false };
+      }
+      case "indexSet": {
+        const r = this.indexKeySetEntries(tableName, b.indexSet, params, [], mask, []);
+        return { ...r, empty: false };
+      }
+    }
   }
 
   // ginBoundRows executes a GIN-bounded scan (spec/design/gin.md §6, cost.md §3). Evaluates the
@@ -8026,59 +8141,19 @@ export class Engine {
     // storageRowRead per scanned row.
     // A host-attached target full-scans this slice (attached-databases.md §8) — a bounded scan would
     // resolve its index store through the unscoped funnel. The whole WHERE stays the residual filter.
-    const attach = isAttachmentScope(del.db);
-    const mb = attach ? null : mutationPkBound(table, filter, this.readSnap());
-    let entries: Entry[] | null;
-    let overlap: number;
-    let slabs: number;
-    if (mb !== null) {
-      ({ entries, overlap, slabs } = scanEntries(store, mb, bound, mask));
-    } else if (attach) {
-      const u = store.scanWithUnits(mask);
-      entries = u.entries;
-      overlap = u.pages;
-      slabs = u.slabs;
-    } else {
-      // GIN bound (gin.md §6): when no PK bound applies, a GIN-accelerable WHERE conjunct bounds the
-      // delete's target-row scan through the index instead of a full scan (PK-then-GIN-then-full; the
-      // ordered-index bound stays SELECT-only). readSnap()==working() during a mutation (tx open), so
-      // this reads the read-your-writes state. ginEntry charged inside; the block below.
-      const gb = detectGinBound(filter, table.indexes, table.columns, 0);
-      const gtb = gb === null ? detectGistBound(filter, table.indexes, table.columns, 0) : null;
-      const ks = gb === null && gtb === null ? pkSetFor(table, filter, this.readSnap()) : null;
-      if (gb !== null) {
-        const m = filter !== null ? ginMatch(filter, gb.colGlobal) : null;
-        const r = this.ginBoundRows(del.table, gb, m?.query ?? null, env, meter, mask);
-        entries = r.entries;
-        overlap = r.pages;
-        slabs = r.slabs;
-      } else if (gtb !== null) {
-        // GiST-bounded delete (gist.md §5): gather candidates by descending the resident R-tree; the
-        // &&/@> predicate stays the residual filter re-applied per candidate below.
-        const q = filter !== null ? gistQueryOperand(filter, gtb) : null;
-        const r = this.gistBoundRows(del.table, gtb, q, env, meter, mask);
-        entries = r.entries;
-        overlap = r.pages;
-        slabs = r.slabs;
-      } else if (ks !== null) {
-        // Merged PK point-set delete (cost.md §3 "OR / IN-list"): a union of point probes over the
-        // distinct sorted keys; whole rows so index entries can be removed. The predicate stays the
-        // residual filter below.
-        const r = this.pkKeySetRows(store, ks, bound, [], mask, []);
-        entries = r.entries;
-        overlap = r.pages;
-        slabs = r.slabs;
-      } else {
-        const u = store.scanWithUnits(mask);
-        entries = u.entries;
-        overlap = u.pages;
-        slabs = u.slabs;
-      }
-    }
-    if (entries === null)
+    const scan = this.executeMutationScan(
+      this.planMutationScan(del.db, table, filter),
+      del.table,
+      filter,
+      bound,
+      env,
+      meter,
+      mask,
+    );
+    if (scan.empty)
       return dmlOutcome(ret?.names ?? null, ret?.types ?? null, null, 0, meter.accrued); // empty bound
-    meter.charge(COSTS.pageRead * BigInt(overlap) + COSTS.valueDecompress * BigInt(slabs));
-    for (const e of entries) {
+    meter.charge(COSTS.pageRead * BigInt(scan.pages) + COSTS.valueDecompress * BigInt(scan.slabs));
+    for (const e of scan.entries) {
       meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
       // A WHERE arithmetic can throw (22003/22012); the throw propagates naturally.
       meter.charge(COSTS.storageRowRead);
@@ -8380,58 +8455,19 @@ export class Engine {
     // storageRowRead per scanned row.
     // A host-attached target full-scans this slice (attached-databases.md §8) — a bounded scan would
     // resolve its index store through the unscoped funnel. The whole WHERE stays the residual filter.
-    const attach = isAttachmentScope(upd.db);
-    const mb = attach ? null : mutationPkBound(table, filter, this.readSnap());
-    let entries: Entry[] | null;
-    let overlap: number;
-    let slabs: number;
-    if (mb !== null) {
-      ({ entries, overlap, slabs } = scanEntries(store, mb, bound, mask));
-    } else if (attach) {
-      const u = store.scanWithUnits(mask);
-      entries = u.entries;
-      overlap = u.pages;
-      slabs = u.slabs;
-    } else {
-      // GIN bound (gin.md §6): when no PK bound applies, a GIN-accelerable WHERE conjunct bounds the
-      // update's target-row scan through the index over the PRE-update state (PK-then-GIN-then-full;
-      // the ordered-index bound stays SELECT-only). ginEntry charged inside; the block below.
-      const gb = detectGinBound(filter, table.indexes, table.columns, 0);
-      const gtb = gb === null ? detectGistBound(filter, table.indexes, table.columns, 0) : null;
-      const ks = gb === null && gtb === null ? pkSetFor(table, filter, this.readSnap()) : null;
-      if (gb !== null) {
-        const m = filter !== null ? ginMatch(filter, gb.colGlobal) : null;
-        const r = this.ginBoundRows(upd.table, gb, m?.query ?? null, env, meter, mask);
-        entries = r.entries;
-        overlap = r.pages;
-        slabs = r.slabs;
-      } else if (gtb !== null) {
-        // GiST-bounded update (gist.md §5): gather candidates by descending the resident R-tree over
-        // the PRE-update state; the &&/@> predicate stays the residual filter re-applied per candidate.
-        const q = filter !== null ? gistQueryOperand(filter, gtb) : null;
-        const r = this.gistBoundRows(upd.table, gtb, q, env, meter, mask);
-        entries = r.entries;
-        overlap = r.pages;
-        slabs = r.slabs;
-      } else if (ks !== null) {
-        // Merged PK point-set update (cost.md §3 "OR / IN-list"): a union of point probes over the
-        // distinct sorted keys of the PRE-update state; whole rows. The predicate stays the residual
-        // filter below.
-        const r = this.pkKeySetRows(store, ks, bound, [], mask, []);
-        entries = r.entries;
-        overlap = r.pages;
-        slabs = r.slabs;
-      } else {
-        const u = store.scanWithUnits(mask);
-        entries = u.entries;
-        overlap = u.pages;
-        slabs = u.slabs;
-      }
-    }
-    if (entries === null)
+    const scan = this.executeMutationScan(
+      this.planMutationScan(upd.db, table, filter),
+      upd.table,
+      filter,
+      bound,
+      env,
+      meter,
+      mask,
+    );
+    if (scan.empty)
       return dmlOutcome(ret?.names ?? null, ret?.types ?? null, null, 0, meter.accrued); // empty bound
-    meter.charge(COSTS.pageRead * BigInt(overlap) + COSTS.valueDecompress * BigInt(slabs));
-    for (const e of entries) {
+    meter.charge(COSTS.pageRead * BigInt(scan.pages) + COSTS.valueDecompress * BigInt(scan.slabs));
+    for (const e of scan.entries) {
       meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
       meter.charge(COSTS.storageRowRead);
       // Materialize the filter's + assignment sources' columns if the lazy load left them
@@ -13307,6 +13343,16 @@ export type ScanBound =
   | { kind: "pkSet"; pkSet: PkKeySet }
   | { kind: "indexSet"; indexSet: IndexKeySet };
 
+// A mutation plan carries the chosen access path and its relation scope. Execution normalizes every
+// access path into keyed entries so UPDATE/DELETE can preserve their two-phase write discipline.
+export type MutationScanPlan = { bound: ScanBound | null; db?: string };
+export type MutationScanBatch = {
+  entries: Entry[];
+  pages: number;
+  slabs: number;
+  empty: boolean;
+};
+
 // needsEagerScan reports whether a bound needs the general eager materialize path (materializeRel /
 // the DML scan) rather than a single-contiguous-range fast path (streaming scan, columnar project,
 // vectorized aggregate, streaming sort, join top-N). True for a second-tree gather (index / GIN /
@@ -13517,15 +13563,47 @@ export function buildIndexAccessPredicate(
   return { nameKey: idx.name.toLowerCase(), eqCols, range, suffixTypes };
 }
 
-// detectScanBound picks one relation's scan bound (cost.md §3; indexes.md §5): the
-// single-column PK bound first; else, among the relation's indexes (held in ascending
-// lowercased-name order — the deterministic tie-break), the first that yields a non-empty
-// access predicate (buildIndexAccessPredicate); else null (full scan).
+// ScanBoundPolicy is the consumer-specific eligibility/precedence part of access-path selection.
+// SELECT and mutation scans share one inventory below but deliberately enable different candidates
+// this slice: ordered B-tree/index-set mutation scans are Phase 1 follow-ons, and the established
+// mutation order is GIN before GiST while SELECT is GiST before GIN.
+export type ScanBoundPolicy = {
+  orderedIndex: boolean;
+  indexSet: boolean;
+  gistBeforeGin: boolean;
+};
+
+export const SELECT_SCAN_BOUND_POLICY: ScanBoundPolicy = {
+  orderedIndex: true,
+  indexSet: true,
+  gistBeforeGin: true,
+};
+
+export const MUTATION_SCAN_BOUND_POLICY: ScanBoundPolicy = {
+  orderedIndex: false,
+  indexSet: false,
+  gistBeforeGin: false,
+};
+
+// detectScanBound picks one SELECT relation's scan bound. It is the SELECT-policy wrapper over the
+// shared inventory in detectScanBoundWithPolicy.
 export function detectScanBound(
   filter: RExpr,
   rel: ScopeRel,
   snap: Snapshot,
   engine: Engine,
+): ScanBound | null {
+  return detectScanBoundWithPolicy(filter, rel, snap, engine, SELECT_SCAN_BOUND_POLICY);
+}
+
+// detectScanBoundWithPolicy inventories the structurally usable bounds for one base relation and
+// returns the first candidate admitted by policy. The whole WHERE remains the residual filter.
+export function detectScanBoundWithPolicy(
+  filter: RExpr,
+  rel: ScopeRel,
+  snap: Snapshot,
+  engine: Engine,
+  policy: ScanBoundPolicy,
 ): ScanBound | null {
   // A host-attached relation full-scans this slice (attached-databases.md §8): the bounded-scan exec
   // path resolves index stores unscoped, so no PK/index/GiST/GIN bound may apply to an attachment.
@@ -13546,21 +13624,26 @@ export function detectScanBound(
       }
     }
   }
-  for (const idx of rel.table.indexes) {
-    // An index access predicate (indexes.md §5.1): a maximal equality prefix + optional trailing range
-    // over a B-tree index's leading key columns. null for a GIN/GiST index (handled by the passes
-    // below), an ineligible suffix, or no bound. Indexes are held in ascending lowercased-name order,
-    // so the first non-null wins — the deterministic tie-break.
-    const ib = buildIndexAccessPredicate(filter, rel, idx, -1, snap, engine);
-    if (ib !== null) return { kind: "index", index: ib };
+  if (policy.orderedIndex) {
+    for (const idx of rel.table.indexes) {
+      // An index access predicate (indexes.md §5.1): a maximal equality prefix + optional trailing
+      // range over a B-tree index's leading key columns. Indexes are held in ascending lowercased-name
+      // order, so the first non-null wins.
+      const ib = buildIndexAccessPredicate(filter, rel, idx, -1, snap, engine);
+      if (ib !== null) return { kind: "index", index: ib };
+    }
   }
-  // GiST bound (gist.md §5) — a `col && const` / `col @> const` over a range column; the ordered loop
-  // above already skipped the GiST index (its leading column is a non-scalar range).
-  const gtb = detectGistBound(filter, rel.table.indexes, rel.table.columns, rel.offset);
-  if (gtb !== null) return { kind: "gist", gist: gtb };
-  // GIN bound (gin.md §6) — after the PK and ordered-index equality bounds.
-  const gb = detectGinBound(filter, rel.table.indexes, rel.table.columns, rel.offset);
-  if (gb !== null) return { kind: "gin", gin: gb };
+  if (policy.gistBeforeGin) {
+    const gtb = detectGistBound(filter, rel.table.indexes, rel.table.columns, rel.offset);
+    if (gtb !== null) return { kind: "gist", gist: gtb };
+    const gb = detectGinBound(filter, rel.table.indexes, rel.table.columns, rel.offset);
+    if (gb !== null) return { kind: "gin", gin: gb };
+  } else {
+    const gb = detectGinBound(filter, rel.table.indexes, rel.table.columns, rel.offset);
+    if (gb !== null) return { kind: "gin", gin: gb };
+    const gtb = detectGistBound(filter, rel.table.indexes, rel.table.columns, rel.offset);
+    if (gtb !== null) return { kind: "gist", gist: gtb };
+  }
   // LAST RESORT — an OR / IN-list of key equalities lowered to merged point probes (cost.md §3
   // "OR / IN-list"). Reached only when no contiguous PK/index/GIN/GiST bound applied above, so this
   // never displaces an existing plan. The primary key wins over a secondary index (its own key — no
@@ -13575,6 +13658,7 @@ export function detectScanBound(
       }
     }
   }
+  if (!policy.indexSet) return null;
   for (const idx of rel.table.indexes) {
     if (idx.kind !== "btree") continue;
     // A PARTIAL index is not used for the OR/IN point-set this slice (indexes.md §9): the merged
@@ -15630,44 +15714,6 @@ export function boundEmpty(b: KeyBound): boolean {
   if (c > 0) return true;
   if (c === 0) return !(b.loInc && b.hiInc);
   return false;
-}
-
-// mutationPkBound detects a single-table UPDATE/DELETE's PK pushdown bound; null ⇒ full scan.
-export function mutationPkBound(
-  table: Table,
-  filter: RExpr | null,
-  snap: Snapshot,
-): PkBound | null {
-  if (filter === null) return null;
-  const pkIdx = primaryKeyIndex(table);
-  if (pkIdx < 0) return null;
-  // Point-lookup pushdown is scalar-only; a non-scalar (range) PK skips it (deferred — ranges.md
-  // §10), so a range PK WHERE k = … full-scans + residual-filters.
-  const sty = typeAsScalar(table.columns[pkIdx]!.type);
-  if (sty === undefined) return null;
-  // A collated Skewed PK refuses pushdown (ctx === null) — though a skewed table's write is already
-  // refused XX002 upstream (ensureCollationsWritable), so this is reached only for a C or
-  // Full-collated PK (collation.md §8/§12).
-  const ctx = keyCollationCtx(snap, table.columns[pkIdx]!);
-  if (ctx === null) return null;
-  return detectPkBound(filter, pkIdx, sty, ctx.coll);
-}
-
-// pkSetFor is the mutationPkBound analog for an OR / IN-list of primary-key equalities — a merged PK
-// point-set bound for the UPDATE/DELETE scan (cost.md §3 "OR / IN-list"). Like mutationPkBound it
-// applies only to a scalar, non-Skewed-collated PK. A secondary-index point-set for DML is the
-// separate index-scans-for-DML follow-on, so mutations bound only by the primary key here.
-export function pkSetFor(table: Table, filter: RExpr | null, snap: Snapshot): PkKeySet | null {
-  if (filter === null) return null;
-  const pkIdx = primaryKeyIndex(table);
-  if (pkIdx < 0) return null;
-  const sty = typeAsScalar(table.columns[pkIdx]!.type);
-  if (sty === undefined) return null;
-  const ctx = keyCollationCtx(snap, table.columns[pkIdx]!);
-  if (ctx === null) return null;
-  const srcs = detectKeySet(filter, pkIdx, sty, ctx.coll);
-  if (srcs !== null) return { pkType: sty, coll: ctx.coll, srcs };
-  return null;
 }
 
 // scanEntries returns the (key,row) entries a mutation scans + the page_read node count: a primary-key

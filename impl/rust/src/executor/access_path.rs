@@ -22,10 +22,26 @@ impl Engine {
         mask: &[bool],
         left: &[Value],
     ) -> Result<(Vec<Row>, (usize, usize))> {
+        let (entries, units) =
+            self.index_bound_entries(table_name, ib, params, outer, mask, left)?;
+        Ok((entries.into_iter().map(|(_, row)| row).collect(), units))
+    }
+
+    /// Key-preserving form of [`Self::index_bound_rows`]. SELECT's wrapper drops the storage keys;
+    /// mutation consumers keep them for phase-2 writes.
+    pub(crate) fn index_bound_entries(
+        &self,
+        table_name: &str,
+        ib: &IndexBound,
+        params: &[Value],
+        outer: &[&[Value]],
+        mask: &[bool],
+        left: &[Value],
+    ) -> Result<(Vec<(Vec<u8>, Row)>, (usize, usize))> {
         let Some((bound, prefix_len)) = build_index_bound(ib, params, outer, left) else {
             return Ok((Vec::new(), (0, 0))); // provably empty — read nothing, charge nothing
         };
-        self.index_scan_bound(
+        self.index_scan_bound_entries(
             table_name,
             &ib.name_key,
             &ib.suffix_types,
@@ -35,15 +51,9 @@ impl Engine {
         )
     }
 
-    /// Range-scan the index B-tree over an already-built key bound and point-look-up each admitted
-    /// entry's row, returning them in index-entry order with the scan's up-front `(pages, slabs)`
-    /// block — the index-tree nodes overlapping the range plus, per entry, the row's point lookup.
-    /// `prefix_byte_len` is the equality-prefix byte length skipped before the fixed-width
-    /// suffix-skip that recovers each entry's row storage key (indexes.md §5.1). Shared by the
-    /// access-predicate bound ([`Self::index_bound_rows`]) and the OR / IN-list point-set
-    /// ([`Self::index_point_rows`]) so both drive the identical per-entry fetch — same cost by
-    /// construction (cost.md §3 "index-bounded scan" / "OR / IN-list").
-    pub(crate) fn index_scan_bound(
+    /// Key-preserving core of the ordered-index gather. Candidate order and units match the existing
+    /// SELECT contract; the already-recovered storage key is retained for mutation consumers.
+    pub(crate) fn index_scan_bound_entries(
         &self,
         table_name: &str,
         name_key: &str,
@@ -51,7 +61,7 @@ impl Engine {
         bound: &KeyBound,
         prefix_byte_len: usize,
         mask: &[bool],
-    ) -> Result<(Vec<Row>, (usize, usize))> {
+    ) -> Result<(Vec<(Vec<u8>, Row)>, (usize, usize))> {
         let istore = self.index_store(name_key);
         // The index store has no payload columns, so its mask is empty and its fused scan
         // contributes only the index-tree page_read count (no spill/compress units).
@@ -74,25 +84,26 @@ impl Engine {
             let (row, n, s) = store.get_with_units(row_key, mask)?;
             pages += n;
             slabs += s;
-            rows.push(row.expect("an index entry references a stored row"));
+            rows.push((
+                row_key.to_vec(),
+                row.expect("an index entry references a stored row"),
+            ));
         }
         Ok((rows, (pages, slabs)))
     }
 
     /// Fetch the rows a SINGLE already-encoded leading-column index value admits — the equality
     /// prefix scan `[0x00‖value, byte-successor)` over the index B-tree plus, per admitted entry, the
-    /// row's point lookup. Used by the OR / IN-list secondary-index point-set
-    /// ([`Self::index_key_set_rows`]), where each distinct list value is one such point probe.
-    /// `suffix_types` are the trailing key components (`columns[1..]`, fixed-width), width-skipped
-    /// past the single leading slot.
-    pub(crate) fn index_point_rows(
+    /// Fetch keyed rows for one encoded leading-column value. This is the point-probe primitive used
+    /// by secondary-index point sets.
+    pub(crate) fn index_point_entries(
         &self,
         table_name: &str,
         name_key: &str,
         suffix_types: &[ScalarType],
         value_key: &[u8],
         mask: &[bool],
-    ) -> Result<(Vec<Row>, (usize, usize))> {
+    ) -> Result<(Vec<(Vec<u8>, Row)>, (usize, usize))> {
         // The entry-key prefix: the §2.2 present tag + the value's bare key bytes. The range
         // is every entry extending the prefix: [prefix, byte-successor(prefix)).
         let mut prefix = vec![0x00u8];
@@ -104,7 +115,7 @@ impl Engine {
             hi_inc: false,
         };
         let plen = prefix.len();
-        self.index_scan_bound(table_name, name_key, suffix_types, &bound, plen, mask)
+        self.index_scan_bound_entries(table_name, name_key, suffix_types, &bound, plen, mask)
     }
 
     /// Execute a primary-key OR / IN-list point-set bound (cost.md §3 "OR / IN-list"): each distinct
@@ -170,7 +181,21 @@ impl Engine {
         mask: &[bool],
         left: &[Value],
     ) -> Result<(Vec<Row>, (usize, usize))> {
-        let mut rows: Vec<Row> = Vec::new();
+        let (entries, units) =
+            self.index_key_set_entries(table_name, ks, params, outer, mask, left)?;
+        Ok((entries.into_iter().map(|(_, row)| row).collect(), units))
+    }
+
+    pub(crate) fn index_key_set_entries(
+        &self,
+        table_name: &str,
+        ks: &IndexKeySet,
+        params: &[Value],
+        outer: &[&[Value]],
+        mask: &[bool],
+        left: &[Value],
+    ) -> Result<(Vec<(Vec<u8>, Row)>, (usize, usize))> {
+        let mut rows: Vec<(Vec<u8>, Row)> = Vec::new();
         let mut pages = 0usize;
         let mut slabs = 0usize;
         for k in encode_key_set(
@@ -182,12 +207,64 @@ impl Engine {
             left,
         ) {
             let (r, (p, s)) =
-                self.index_point_rows(table_name, &ks.name_key, &ks.tail_types, &k, mask)?;
+                self.index_point_entries(table_name, &ks.name_key, &ks.tail_types, &k, mask)?;
             rows.extend(r);
             pages += p;
             slabs += s;
         }
         Ok((rows, (pages, slabs)))
+    }
+
+    /// Execute a planned UPDATE/DELETE access path into the normalized keyed-row batch. This owns
+    /// the access-method switch that used to be duplicated inline in both DML executors; per-row
+    /// guards, residual evaluation, and phase-2 writes remain with the caller.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn execute_mutation_scan(
+        &self,
+        plan: &MutationScanPlan,
+        table_name: &str,
+        filter: Option<&RExpr>,
+        params: &[Value],
+        env: &EvalEnv,
+        meter: &mut Meter,
+        mask: &[bool],
+    ) -> Result<MutationScanBatch> {
+        let store = self.store_scoped(plan.db.as_deref(), table_name);
+        let (entries, (pages, slabs)) = match plan.bound.as_ref() {
+            None => {
+                let (entries, pages, slabs) = store.scan_with_units(mask)?;
+                (entries, (pages, slabs))
+            }
+            Some(ScanBound::Pk(bp)) => match build_key_bound(bp, params, &[], &[]) {
+                Some(bound) => {
+                    let (entries, pages, slabs) = store.range_scan_with_units(&bound, mask)?;
+                    (entries, (pages, slabs))
+                }
+                None => (Vec::new(), (0, 0)),
+            },
+            Some(ScanBound::Index(ib)) => {
+                self.index_bound_entries(table_name, ib, params, &[], mask, &[])?
+            }
+            Some(ScanBound::Gin(gb)) => {
+                let query = filter.and_then(|f| gin_match(f, gb.col_global).map(|(_, q)| q));
+                self.gin_bound_rows(table_name, gb, query, env, meter, mask)?
+            }
+            Some(ScanBound::Gist(gb)) => {
+                let query = filter.and_then(|f| gist_query_operand(f, gb));
+                self.gist_bound_rows(table_name, gb, query, env, meter, mask)?
+            }
+            Some(ScanBound::PkSet(ks)) => {
+                self.pk_key_set_rows(store, ks, params, &[], mask, &[], false)?
+            }
+            Some(ScanBound::IndexSet(ks)) => {
+                self.index_key_set_entries(table_name, ks, params, &[], mask, &[])?
+            }
+        };
+        Ok(MutationScanBatch {
+            entries,
+            pages,
+            slabs,
+        })
     }
 
     /// Execute a GIN-bounded scan (spec/design/gin.md §6, cost.md §3). Evaluates the constant

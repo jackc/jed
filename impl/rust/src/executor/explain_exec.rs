@@ -228,51 +228,14 @@ impl Engine {
         );
     }
 
-    /// Pick an UPDATE/DELETE target's scan bound with the executor's own detectors: the single-column
-    /// PK range bound first, then a GIN bound, then a GiST bound; else a full scan (`None`). Mirrors
-    /// the inline detection in [`Self::execute_delete`] / [`Self::execute_update`].
+    /// EXPLAIN compatibility wrapper over the typed mutation physical plan used by execution. The
+    /// unqualified explain surface has no database qualifier.
     pub(crate) fn dml_scan_bound(
         &self,
         table: &Table,
         filter: Option<&RExpr>,
     ) -> Option<ScanBound> {
-        let f = filter?;
-        if let Some(pk_idx) = table.primary_key_index() {
-            if let Some(pk_ty) = table.columns[pk_idx].ty.as_scalar() {
-                if let Some(coll) = key_collation_ctx(self, &table.columns[pk_idx]) {
-                    if let Some(pb) = detect_pk_bound(f, pk_idx, pk_ty, coll) {
-                        return Some(ScanBound::Pk(pb));
-                    }
-                }
-            }
-        }
-        if let Some(gb) = detect_gin_bound(f, &table.indexes, &table.columns, 0) {
-            return Some(ScanBound::Gin(gb));
-        }
-        if let Some(gp) = detect_gist_bound(f, &table.indexes, &table.columns, 0) {
-            return Some(ScanBound::Gist(gp));
-        }
-        if let Some(ks) = self.pk_set_for(table, Some(f)) {
-            return Some(ScanBound::PkSet(ks));
-        }
-        None
-    }
-
-    /// The [`Self::pk_bound_for`] analog for an OR / IN-list of primary-key equalities — a merged PK
-    /// point-set bound for the UPDATE/DELETE scan (cost.md §3 "OR / IN-list"). Like `pk_bound_for` it
-    /// applies only to a scalar, non-`Skewed`-collated PK. A secondary-index point-set for DML is the
-    /// separate index-scans-for-DML follow-on, so mutations bound only by the primary key here.
-    pub(crate) fn pk_set_for(&self, table: &Table, filter: Option<&RExpr>) -> Option<PkKeySet> {
-        let f = filter?;
-        let pk_idx = table.primary_key_index()?;
-        let pk_ty = table.columns[pk_idx].ty.as_scalar()?;
-        let coll = key_collation_ctx(self, &table.columns[pk_idx])?;
-        let srcs = detect_key_set(f, pk_idx, pk_ty, coll.as_deref())?;
-        Some(PkKeySet {
-            pk_type: pk_ty,
-            coll,
-            srcs,
-        })
+        self.plan_mutation_scan(None, table, filter).bound
     }
 
     /// Resolve the inner statement into a [`QueryPlan`] WITHOUT executing it — the read-query forms

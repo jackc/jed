@@ -236,15 +236,48 @@ pub(crate) fn build_index_access_predicate(
     })
 }
 
-/// Pick one relation's scan bound (cost.md §3; indexes.md §5): the single-column PK bound
-/// first (the row's own key — range-capable and strictly cheaper); else, among the
-/// relation's indexes (held in ascending lowercased-name order — the deterministic
-/// tie-break), the first that yields a non-empty access predicate
-/// ([`build_index_access_predicate`]); else `None` (full scan).
+/// Consumer-specific access-path eligibility/precedence. SELECT and mutation scans share the same
+/// inventory but deliberately enable different candidates this slice: ordered B-tree/index-set
+/// mutation scans are Phase 1 follow-ons, and the established mutation order is GIN before GiST
+/// while SELECT is GiST before GIN. Encoding that difference here keeps EXPLAIN and execution on one
+/// detector without changing any plan in this behavior-neutral phase.
+#[derive(Clone, Copy)]
+pub(crate) struct ScanBoundPolicy {
+    ordered_index: bool,
+    index_set: bool,
+    gist_before_gin: bool,
+}
+
+pub(crate) const SELECT_SCAN_BOUND_POLICY: ScanBoundPolicy = ScanBoundPolicy {
+    ordered_index: true,
+    index_set: true,
+    gist_before_gin: true,
+};
+
+pub(crate) const MUTATION_SCAN_BOUND_POLICY: ScanBoundPolicy = ScanBoundPolicy {
+    ordered_index: false,
+    index_set: false,
+    gist_before_gin: false,
+};
+
+/// Pick one SELECT relation's scan bound (cost.md §3; indexes.md §5). This is the SELECT-policy
+/// wrapper over the shared inventory in [`detect_scan_bound_with_policy`].
 pub(crate) fn detect_scan_bound(
     filter: &RExpr,
     rel: &ScopeRel,
     catalog: &Engine,
+) -> Option<ScanBound> {
+    detect_scan_bound_with_policy(filter, rel, catalog, SELECT_SCAN_BOUND_POLICY)
+}
+
+/// Inventory the structurally usable bounds for one base relation and return the first candidate
+/// admitted by `policy`. The whole WHERE remains the residual filter, so a disabled candidate always
+/// falls through to another sound bound or a full scan.
+pub(crate) fn detect_scan_bound_with_policy(
+    filter: &RExpr,
+    rel: &ScopeRel,
+    catalog: &Engine,
+    policy: ScanBoundPolicy,
 ) -> Option<ScanBound> {
     // A host-attached relation full-scans this slice (attached-databases.md §8): the bounded-scan exec
     // path resolves index stores UNSCOPED, so no PK/index/GiST/GIN bound may apply to an attachment.
@@ -263,24 +296,38 @@ pub(crate) fn detect_scan_bound(
     }) {
         return Some(ScanBound::Pk(b));
     }
-    for idx in &rel.table.indexes {
-        // An index access predicate (indexes.md §5.1): a maximal equality prefix + optional trailing
-        // range over a B-tree index's leading key columns. Returns `None` for a GIN/GiST index
-        // (handled by the passes below), an ineligible suffix, or no bound. Indexes are held in
-        // ascending lowercased-name order, so the first `Some` wins — the deterministic tie-break.
-        if let Some(ib) = build_index_access_predicate(filter, rel, idx, None, catalog) {
-            return Some(ScanBound::Index(ib));
+    if policy.ordered_index {
+        for idx in &rel.table.indexes {
+            // An index access predicate (indexes.md §5.1): a maximal equality prefix + optional
+            // trailing range over a B-tree index's leading key columns. Indexes are held in
+            // ascending lowercased-name order, so the first `Some` wins.
+            if let Some(ib) = build_index_access_predicate(filter, rel, idx, None, catalog) {
+                return Some(ScanBound::Index(ib));
+            }
         }
     }
-    // GiST bound (gist.md §5) — a `col && const` / `col @> const` over a range column; the ordered
-    // loop above already skipped the GiST index (its leading column is a non-scalar range).
-    if let Some(gb) = detect_gist_bound(filter, &rel.table.indexes, &rel.table.columns, rel.offset)
-    {
-        return Some(ScanBound::Gist(gb));
-    }
-    // GIN bound (gin.md §6) — after the PK and ordered-index equality bounds.
-    if let Some(gb) = detect_gin_bound(filter, &rel.table.indexes, &rel.table.columns, rel.offset) {
-        return Some(ScanBound::Gin(gb));
+    if policy.gist_before_gin {
+        if let Some(gb) =
+            detect_gist_bound(filter, &rel.table.indexes, &rel.table.columns, rel.offset)
+        {
+            return Some(ScanBound::Gist(gb));
+        }
+        if let Some(gb) =
+            detect_gin_bound(filter, &rel.table.indexes, &rel.table.columns, rel.offset)
+        {
+            return Some(ScanBound::Gin(gb));
+        }
+    } else {
+        if let Some(gb) =
+            detect_gin_bound(filter, &rel.table.indexes, &rel.table.columns, rel.offset)
+        {
+            return Some(ScanBound::Gin(gb));
+        }
+        if let Some(gb) =
+            detect_gist_bound(filter, &rel.table.indexes, &rel.table.columns, rel.offset)
+        {
+            return Some(ScanBound::Gist(gb));
+        }
     }
     // LAST RESORT — an OR / IN-list of key equalities lowered to merged point probes (cost.md §3
     // "OR / IN-list"). Reached only when no contiguous PK/index/GIN/GiST bound applied above, so
@@ -297,6 +344,9 @@ pub(crate) fn detect_scan_bound(
         }))
     }) {
         return Some(b);
+    }
+    if !policy.index_set {
+        return None;
     }
     for idx in &rel.table.indexes {
         if idx.kind != IndexKind::Btree {
@@ -342,6 +392,34 @@ pub(crate) fn detect_scan_bound(
         }
     }
     None
+}
+
+impl Engine {
+    /// Select an UPDATE/DELETE target access path through the same inventory as SELECT, using the
+    /// mutation eligibility policy. Execution calls this after uncorrelated filter folding, matching
+    /// the old inline detector timing; EXPLAIN calls it on its resolved, unfolded filter.
+    pub(crate) fn plan_mutation_scan(
+        &self,
+        db: Option<&str>,
+        table: &Table,
+        filter: Option<&RExpr>,
+    ) -> MutationScanPlan {
+        let bound = filter.and_then(|f| {
+            let rel = ScopeRel {
+                label: table.name.to_ascii_lowercase(),
+                table,
+                offset: 0,
+                qualifier_only: false,
+                cte: None,
+                db: db.map(str::to_owned),
+            };
+            detect_scan_bound_with_policy(f, &rel, self, MUTATION_SCAN_BOUND_POLICY)
+        });
+        MutationScanPlan {
+            bound,
+            db: db.map(str::to_owned),
+        }
+    }
 }
 
 /// Find an OR / IN-list disjunction of equalities on ONE key column (at global index `key_idx`) and

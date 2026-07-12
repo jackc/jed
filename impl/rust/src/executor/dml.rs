@@ -1628,9 +1628,6 @@ impl Engine {
         self.check_attachment_writable(del.db.as_deref())?;
         // Validate an optional database qualifier on the target (attached-databases.md §3).
         self.check_table_qualifier(del.db.as_deref(), &del.table)?;
-        // A host-attached target full-scans this slice (attached-databases.md §8) — a bounded scan
-        // would resolve its index store through the unscoped funnel. All bounds are gated off below.
-        let del_is_attach = is_attachment_scope(del.db.as_deref());
         let table = self
             .table_scoped(del.db.as_deref(), &del.table)
             .ok_or_else(|| {
@@ -1642,15 +1639,8 @@ impl Engine {
         // Refuse the write if any collated key is version-skewed (slice 2d, collation.md §12, XX002):
         // a DELETE must locate + remove a stored key, which a skewed encoding cannot match.
         self.ensure_collations_writable(&table.columns)?;
-        // Capture the PK (index, type) now, by value, so the primary-key pushdown can be detected
-        // after the `table` borrow ends (the mutate path takes `&mut self`). The index
-        // definitions (and the columns their entry keys read) feed phase 2's maintenance
+        // The index definitions (and the columns their entry keys read) feed phase 2's maintenance
         // (indexes.md §4).
-        let pk_info = table
-            .primary_key_index()
-            // Point-lookup pushdown is scalar-only; a non-scalar (range) PK skips it (deferred —
-            // ranges.md §10), so a range PK `WHERE k = …` full-scans + residual-filters.
-            .and_then(|i| table.columns[i].ty.as_scalar().map(|s| (i, s)));
         let ncols = table.columns.len();
         let indexes = table.indexes.clone();
         let tcolumns: Vec<Column> = if indexes.is_empty() {
@@ -1719,46 +1709,6 @@ impl Engine {
             rng: &stmt_rng,
             ctes: ctx,
         };
-        // A primary-key bound seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
-        // scan"); an empty bound deletes nothing. The whole WHERE stays the residual filter below.
-        // page_read per visited node (block, before the rows), then storage_row_read per scanned row.
-        // A host-attached target full-scans this slice (attached-databases.md §8): every index/PK bound
-        // is gated off, so the delete takes the full-scan arm below (the bounded exec would resolve its
-        // index store through the unscoped funnel — index accel for attachments is a perf follow-on).
-        let pk_bound = match (del_is_attach, &filter, pk_info) {
-            // A collated `Skewed` PK refuses pushdown (`key_collation_ctx` → `None`) — though a
-            // skewed table's write is already refused `XX002` upstream (`ensure_collations_writable`),
-            // so this is reached only for a `C` or `Full`-collated PK (collation.md §8/§12).
-            (false, Some(f), Some((pk_idx, pk_ty))) => {
-                match key_collation_ctx(self, &table.columns[pk_idx]) {
-                    Some(coll) => detect_pk_bound(f, pk_idx, pk_ty, coll),
-                    None => None,
-                }
-            }
-            _ => None,
-        };
-        // GIN bound (gin.md §6): when no PK bound applies, a GIN-accelerable WHERE conjunct
-        // (`@>`/`&&`/`= ANY`/`=`) over a GIN-indexed array column bounds the delete's target-row
-        // scan through the index instead of a full scan. A mutation uses PK-then-GIN-then-full —
-        // the ordered-index equality bound stays SELECT-only (a follow-on). `tcolumns` is the full
-        // column list whenever the table has any index, so it is populated when a GIN index exists.
-        let gin_bound = match (del_is_attach, &filter, &pk_bound) {
-            (false, Some(f), None) => detect_gin_bound(f, &indexes, &tcolumns, 0),
-            _ => None,
-        };
-        // GiST bound (gist.md §5): when neither a PK nor a GIN bound applies, a `&&`/`@>` conjunct
-        // over a GiST-indexed range column bounds the delete's target scan via the resident R-tree.
-        let gist_bound = match (del_is_attach, &filter, &pk_bound, &gin_bound) {
-            (false, Some(f), None, None) => detect_gist_bound(f, &indexes, &tcolumns, 0),
-            _ => None,
-        };
-        // Merged PK point-set (cost.md §3 "OR / IN-list") — LAST RESORT for a mutation, after
-        // PK/GIN/GiST. A secondary-index point-set for DML is a separate follow-on, so mutations
-        // bound only by the primary key here.
-        let pk_set = match (del_is_attach, &filter, &pk_bound, &gin_bound, &gist_bound) {
-            (false, Some(f), None, None, None) => self.pk_set_for(table, Some(f)),
-            _ => None,
-        };
         // DELETE's touched set (cost.md §3): the filter's columns plus the RETURNING items'
         // OLD-side references — a returned old value is a logical read of the dropped row,
         // while a `new.col` is the constant NULL row and reads nothing. The RETURNING mask
@@ -1777,49 +1727,23 @@ impl Engine {
                 *m |= ret_mask[i];
             }
         }
-        let (entries, (overlap, slabs)) = match (&pk_bound, &gin_bound, &gist_bound, &pk_set) {
-            // Top-level statement: no enclosing query, so the bound never has a correlated source.
-            (Some(bp), _, _, _) => match build_key_bound(bp, &bound, &[], &[]) {
-                Some(b) => {
-                    let (entries, pages, slabs) = self
-                        .store_scoped(del.db.as_deref(), &del.table)
-                        .range_scan_with_units(&b, &mask)?;
-                    (entries, (pages, slabs))
-                }
-                None => (Vec::new(), (0, 0)),
-            },
-            // GIN-bounded delete (gin.md §6): gather the candidate `(key, row)` pairs through the
-            // index; the predicate stays the residual filter, re-applied per candidate in the loop
-            // below. `gin_entry` is charged inside; the block (page_read/value_decompress) below.
-            (None, Some(gb), _, _) => {
-                let query = filter
-                    .as_ref()
-                    .and_then(|f| gin_match(f, gb.col_global).map(|(_, q)| q));
-                self.gin_bound_rows(&del.table, gb, query, &env, &mut meter, &mask)?
-            }
-            // GiST-bounded delete (gist.md §5): gather candidates by descending the resident R-tree;
-            // the `&&`/`@>` predicate stays the residual filter re-applied per candidate below.
-            (None, None, Some(gb), _) => {
-                let query = filter.as_ref().and_then(|f| gist_query_operand(f, gb));
-                self.gist_bound_rows(&del.table, gb, query, &env, &mut meter, &mask)?
-            }
-            // Merged PK point-set delete (cost.md §3 "OR / IN-list"): a union of point probes over
-            // the distinct sorted keys; whole rows so index entries can be removed. The predicate
-            // stays the residual filter below.
-            (None, None, None, Some(ks)) => {
-                let store = self.store_scoped(del.db.as_deref(), &del.table);
-                self.pk_key_set_rows(store, ks, &bound, &[], &mask, &[], false)?
-            }
-            (None, None, None, None) => {
-                let (entries, pages, slabs) = self
-                    .store_scoped(del.db.as_deref(), &del.table)
-                    .scan_with_units(&mask)?;
-                (entries, (pages, slabs))
-            }
-        };
-        meter.charge(COSTS.page_read * overlap as i64 + COSTS.value_decompress * slabs as i64);
+        // Select and execute the target scan through the shared mutation access-path seam. Planning
+        // happens after uncorrelated folding, matching the old inline detector timing.
+        let scan_plan = self.plan_mutation_scan(del.db.as_deref(), table, filter.as_ref());
+        let batch = self.execute_mutation_scan(
+            &scan_plan,
+            &del.table,
+            filter.as_ref(),
+            &bound,
+            &env,
+            &mut meter,
+            &mask,
+        )?;
+        meter.charge(
+            COSTS.page_read * batch.pages as i64 + COSTS.value_decompress * batch.slabs as i64,
+        );
         let store = self.store_scoped(del.db.as_deref(), &del.table);
-        for (k, mut row) in entries {
+        for (k, mut row) in batch.entries {
             meter.guard()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
             meter.charge(COSTS.storage_row_read);
             // Materialize the filter's columns if the lazy load left them unfetched — exactly
@@ -1945,8 +1869,6 @@ impl Engine {
         self.check_attachment_writable(upd.db.as_deref())?;
         // Validate an optional database qualifier on the target (attached-databases.md §3).
         self.check_table_qualifier(upd.db.as_deref(), &upd.table)?;
-        // A host-attached target full-scans this slice (attached-databases.md §8) — bounds gated below.
-        let upd_is_attach = is_attachment_scope(upd.db.as_deref());
         let table = self
             .table_scoped(upd.db.as_deref(), &upd.table)
             .ok_or_else(|| {
@@ -1976,14 +1898,6 @@ impl Engine {
             .iter()
             .map(|&i| (i, table.columns[i].ty.clone()))
             .collect();
-        // Capture the PK (index, type) by value for the primary-key pushdown (detected after the
-        // `table` borrow ends, since the mutate path takes `&mut self`). Pushdown recognizes
-        // single-column keys only (`primary_key_index`); a composite-PK table full-scans.
-        let pk_info = table
-            .primary_key_index()
-            // Point-lookup pushdown is scalar-only; a non-scalar (range) PK skips it (deferred —
-            // ranges.md §10), so a range PK `WHERE k = …` full-scans + residual-filters.
-            .and_then(|i| table.columns[i].ty.as_scalar().map(|s| (i, s)));
         let ncols = table.columns.len();
         // The index definitions (and the columns their entry keys read) feed phase 2's
         // maintenance (indexes.md §4): an entry moves only when its key actually changed.
@@ -2181,47 +2095,6 @@ impl Engine {
             rng: &stmt_rng,
             ctes: ctx,
         };
-        // A primary-key bound seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
-        // scan"); an empty bound updates nothing. The whole WHERE stays the residual filter below.
-        // page_read per visited node (block, before the rows), then storage_row_read per scanned row.
-        // A host-attached target full-scans this slice (attached-databases.md §8): every index/PK bound
-        // is gated off so the update takes the full-scan arm (the bounded exec would resolve its index
-        // store through the unscoped funnel — index accel for attachments is a perf follow-on).
-        let pk_bound = match (upd_is_attach, &filter, pk_info) {
-            // A collated `Skewed` PK refuses pushdown (`key_collation_ctx` → `None`); a skewed
-            // table's write is already refused `XX002` upstream, so this is a `C`/`Full`-collated PK.
-            (false, Some(f), Some((pk_i, pk_ty))) => {
-                match key_collation_ctx(self, &table.columns[pk_i]) {
-                    Some(coll) => detect_pk_bound(f, pk_i, pk_ty, coll),
-                    None => None,
-                }
-            }
-            _ => None,
-        };
-        // GIN bound (gin.md §6): when no PK bound applies, a GIN-accelerable WHERE conjunct
-        // (`@>`/`&&`/`= ANY`/`=`) over a GIN-indexed array column bounds the update's target-row
-        // scan through the index instead of a full scan (PK-then-GIN-then-full; the ordered-index
-        // bound stays SELECT-only). The bound is over the PRE-update index state (the WHERE reads
-        // the old row), so it admits exactly the rows the full scan would match.
-        let gin_bound = match (upd_is_attach, &filter, &pk_bound) {
-            (false, Some(f), None) => detect_gin_bound(f, &indexes, &tcolumns, 0),
-            _ => None,
-        };
-        // GiST bound (gist.md §5): when neither a PK nor a GIN bound applies, a `&&`/`@>` conjunct
-        // over a GiST-indexed range column bounds the update's target scan via the resident R-tree
-        // (over the pre-update index state — the WHERE reads the old row, so it admits exactly the
-        // rows the full scan would match).
-        let gist_bound = match (upd_is_attach, &filter, &pk_bound, &gin_bound) {
-            (false, Some(f), None, None) => detect_gist_bound(f, &indexes, &tcolumns, 0),
-            _ => None,
-        };
-        // Merged PK point-set (cost.md §3 "OR / IN-list") — LAST RESORT for a mutation, after
-        // PK/GIN/GiST. A secondary-index point-set for DML is a separate follow-on, so mutations
-        // bound only by the primary key here.
-        let pk_set = match (upd_is_attach, &filter, &pk_bound, &gin_bound, &gist_bound) {
-            (false, Some(f), None, None, None) => self.pk_set_for(table, Some(f)),
-            _ => None,
-        };
         // UPDATE's touched set (cost.md §3): the filter's columns, every assignment SOURCE's,
         // and the RETURNING items' — the NEW side minus the assigned columns (an assigned
         // column's returned value is the freshly computed one, not a storage read), plus the
@@ -2246,49 +2119,23 @@ impl Engine {
                 *m |= ret_mask[ncols + i]; // old side — always a storage read
             }
         }
-        let (entries, (overlap, slabs)) = match (&pk_bound, &gin_bound, &gist_bound, &pk_set) {
-            // Top-level statement: no enclosing query, so the bound never has a correlated source.
-            (Some(bp), _, _, _) => match build_key_bound(bp, &bound, &[], &[]) {
-                Some(b) => {
-                    let (entries, pages, slabs) = self
-                        .store_scoped(upd.db.as_deref(), &upd.table)
-                        .range_scan_with_units(&b, &mask)?;
-                    (entries, (pages, slabs))
-                }
-                None => (Vec::new(), (0, 0)),
-            },
-            // GIN-bounded update (gin.md §6): gather the candidate `(key, row)` pairs through the
-            // index; the predicate stays the residual filter (re-applied per candidate in the loop
-            // below). `gin_entry` charged inside; the page_read/value_decompress block below.
-            (None, Some(gb), _, _) => {
-                let query = filter
-                    .as_ref()
-                    .and_then(|f| gin_match(f, gb.col_global).map(|(_, q)| q));
-                self.gin_bound_rows(&upd.table, gb, query, &env, &mut meter, &mask)?
-            }
-            // GiST-bounded update (gist.md §5): gather candidates by descending the resident R-tree;
-            // the `&&`/`@>` predicate stays the residual filter re-applied per candidate below.
-            (None, None, Some(gb), _) => {
-                let query = filter.as_ref().and_then(|f| gist_query_operand(f, gb));
-                self.gist_bound_rows(&upd.table, gb, query, &env, &mut meter, &mask)?
-            }
-            // Merged PK point-set update (cost.md §3 "OR / IN-list"): a union of point probes over
-            // the distinct sorted keys; whole rows so the rewrite can re-key / update index entries.
-            // The predicate stays the residual filter below.
-            (None, None, None, Some(ks)) => {
-                let store = self.store_scoped(upd.db.as_deref(), &upd.table);
-                self.pk_key_set_rows(store, ks, &bound, &[], &mask, &[], false)?
-            }
-            (None, None, None, None) => {
-                let (entries, pages, slabs) = self
-                    .store_scoped(upd.db.as_deref(), &upd.table)
-                    .scan_with_units(&mask)?;
-                (entries, (pages, slabs))
-            }
-        };
-        meter.charge(COSTS.page_read * overlap as i64 + COSTS.value_decompress * slabs as i64);
+        // Select and execute the target scan through the shared mutation access-path seam. The
+        // keyed batch is over the pre-update state and feeds the unchanged two-phase rewrite.
+        let scan_plan = self.plan_mutation_scan(upd.db.as_deref(), table, filter.as_ref());
+        let batch = self.execute_mutation_scan(
+            &scan_plan,
+            &upd.table,
+            filter.as_ref(),
+            &bound,
+            &env,
+            &mut meter,
+            &mask,
+        )?;
+        meter.charge(
+            COSTS.page_read * batch.pages as i64 + COSTS.value_decompress * batch.slabs as i64,
+        );
         let store = self.store_scoped(upd.db.as_deref(), &upd.table);
-        for (key, mut row) in entries {
+        for (key, mut row) in batch.entries {
             meter.guard()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
             meter.charge(COSTS.storage_row_read);
             // Materialize the filter's + assignment sources' columns if the lazy load left them

@@ -4,7 +4,7 @@
 # subplan, and UPDATE/DELETE render the residual Filter + the target Scan. The scan access path is
 # chosen by the same detectors the executor uses (PK bound, then GIN/GiST — never a secondary B-tree
 # index for a mutation), so the reported path matches what the statement would run.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_select, dml.insert_multi_row, dml.insert_on_conflict, dml.update, dml.delete, query.select, query.where_eq, query.point_lookup, query.explain, dml.explain, types.i32, types.text
+# requires: ddl.create_table, ddl.primary_key, ddl.gin_index, ddl.gist_index, dml.insert, dml.insert_select, dml.insert_multi_row, dml.insert_on_conflict, dml.update, dml.delete, query.select, query.where_eq, query.point_lookup, query.gin_scan, query.gist_scan, query.explain, dml.explain, types.i32, types.text, types.array, types.range, func.array_containment, func.range_constructors, func.range_operators
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, v i32, s text)
@@ -106,6 +106,54 @@ conjuncts=1
 2
 Scan t
 Full scan
+
+# Phase-0 policy pin: SELECT and mutation planning share one bound inventory but preserve their
+# established consumer-specific precedence. With both predicates/index kinds usable, SELECT chooses
+# GiST before GIN, while UPDATE/DELETE choose GIN before GiST. This is plan-only and executes nothing.
+statement ok
+CREATE TABLE access_policy (id i32 PRIMARY KEY, tags i32[], span i32range)
+
+statement ok
+CREATE INDEX access_policy_tags_gin ON access_policy USING gin (tags)
+
+statement ok
+CREATE INDEX access_policy_span_gist ON access_policy USING gist (span)
+
+query ITT nosort
+EXPLAIN SELECT id FROM access_policy WHERE tags @> ARRAY[1] AND span && i32range(1, 3)
+----
+0
+Filter
+conjuncts=2
+1
+Scan access_policy
+GiST bound: using access_policy_span_gist; touched=3
+
+query ITT nosort
+EXPLAIN UPDATE access_policy SET id = id WHERE tags @> ARRAY[1] AND span && i32range(1, 3)
+----
+0
+Update access_policy
+sets=1
+1
+Filter
+conjuncts=2
+2
+Scan access_policy
+GIN bound: using access_policy_tags_gin
+
+query ITT nosort
+EXPLAIN DELETE FROM access_policy WHERE tags @> ARRAY[1] AND span && i32range(1, 3)
+----
+0
+Delete access_policy
+-
+1
+Filter
+conjuncts=2
+2
+Scan access_policy
+GIN bound: using access_policy_tags_gin
 
 # The no-mutation proof: after all the EXPLAINs above, t still has exactly its two original rows.
 query I nosort
