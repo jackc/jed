@@ -40,7 +40,7 @@ type statement struct {
 	Rollback *rollback
 }
 
-// alterTable is ALTER TABLE slices 1-4 (spec/design/alter.md): one standalone rename or a
+// alterTable is ALTER TABLE slices 1-5 (spec/design/alter.md): one standalone rename or a
 // comma-separated mixed action list. Exactly one Rename* field or Actions is populated.
 type alterTable struct {
 	Name             string
@@ -55,12 +55,16 @@ type alterTable struct {
 type renamePair struct{ Old, New string }
 
 type alterTableEdit struct {
-	Column     *alterColumnAction
-	AddColumn  *alterAddColumn
-	DropColumn *alterDropColumn
-	Add        *alterConstraintDef
-	Drop       *dropConstraintDef
+	Column         *alterColumnAction
+	AddColumn      *alterAddColumn
+	DropColumn     *alterDropColumn
+	AddPrimaryKey  []string
+	DropPrimaryKey *alterDropPrimaryKey
+	Add            *alterConstraintDef
+	Drop           *dropConstraintDef
 }
+
+type alterDropPrimaryKey struct{ Cascade bool }
 
 type alterDropColumn struct {
 	Name     string
@@ -90,9 +94,12 @@ type dropConstraintDef struct {
 }
 
 type alterColumnAction struct {
-	Column  string
-	Kind    alterColumnKind
-	Default *defaultDef
+	Column   string
+	Kind     alterColumnKind
+	Default  *defaultDef
+	TypeName string
+	TypeMod  *typeMod
+	Using    *exprNode
 }
 
 type alterColumnKind int
@@ -102,6 +109,7 @@ const (
 	alterDropDefault
 	alterSetNotNull
 	alterDropNotNull
+	alterSetType
 )
 
 // explain is a parsed `EXPLAIN [ANALYZE] <statement>` (spec/design/explain.md). Inner is the wrapped

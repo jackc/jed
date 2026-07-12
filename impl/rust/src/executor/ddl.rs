@@ -100,6 +100,58 @@ fn resolve_exclusion_definition(
     Ok((columns, resolved))
 }
 
+/// Retype an IDENTITY-owned sequence with PostgreSQL's `ALTER SEQUENCE AS` rules: bounds equal to
+/// the old type defaults become the new defaults, explicit bounds are preserved, and the start +
+/// current value must fit the new type and resulting bounds.
+fn retype_identity_sequence(
+    existing: &SequenceDef,
+    old_type: SeqDataType,
+    new_type: SeqDataType,
+) -> Result<SequenceDef> {
+    let mut def = existing.clone();
+    let (old_min, old_max) = old_type.default_bounds(def.increment);
+    let (new_min, new_max) = new_type.default_bounds(def.increment);
+    if def.min_value == old_min {
+        def.min_value = new_min;
+    }
+    if def.max_value == old_max {
+        def.max_value = new_max;
+    }
+    let (type_min, type_max) = new_type.range();
+    if def.max_value > type_max {
+        return Err(EngineError::new(
+            SqlState::InvalidParameterValue,
+            format!(
+                "MAXVALUE ({}) is out of range for sequence data type {}",
+                def.max_value,
+                new_type.pg_name()
+            ),
+        ));
+    }
+    if def.min_value < type_min {
+        return Err(EngineError::new(
+            SqlState::InvalidParameterValue,
+            format!(
+                "MINVALUE ({}) is out of range for sequence data type {}",
+                def.min_value,
+                new_type.pg_name()
+            ),
+        ));
+    }
+    if def.min_value >= def.max_value {
+        return Err(EngineError::new(
+            SqlState::InvalidParameterValue,
+            format!(
+                "MINVALUE ({}) must be less than MAXVALUE ({})",
+                def.min_value, def.max_value
+            ),
+        ));
+    }
+    seq_bound_check_start(def.start, def.min_value, def.max_value)?;
+    seq_bound_check_last(def.last_value, def.min_value, def.max_value)?;
+    Ok(def)
+}
+
 impl Engine {
     /// Dispatch one parsed statement to its executor. The autocommit transaction handling
     /// (capture / durable commit / rollback-on-error) lives in `execute_stmt_params`.
@@ -1387,8 +1439,7 @@ impl Engine {
         })
     }
 
-    /// Execute ALTER TABLE slices 1-4 (alter.md §1-§3.2): catalog edits, constraints, and the
-    /// add/drop-column table rewrites.
+    /// Execute ALTER TABLE slices 1-5 (alter.md §1-§3.4).
     pub(crate) fn execute_alter_table(&mut self, at: AlterTable) -> Result<Outcome> {
         check_catalog_rel_write(&at.name)?;
         self.check_attachment_writable(at.db.as_deref())?;
@@ -1444,7 +1495,18 @@ impl Engine {
         #[derive(Clone)]
         enum ColumnSource {
             Original(usize),
-            Added(Column),
+            Added,
+        }
+        enum RowStep {
+            Add {
+                column: Column,
+                default: Option<RExpr>,
+            },
+            Drop(usize),
+            SetType {
+                column: usize,
+                value: RExpr,
+            },
         }
         let mut column_sources: Vec<ColumnSource> = original
             .columns
@@ -1452,6 +1514,10 @@ impl Engine {
             .enumerate()
             .map(|(i, _)| ColumnSource::Original(i))
             .collect();
+        let mut type_changed_columns = vec![false; original.columns.len()];
+        let mut row_steps = Vec::<RowStep>::new();
+        let mut type_changed = false;
+        let mut prep_cost = 0i64;
         let mut pending_serials = Vec::<SequenceDef>::new();
         let mut cascade_unique_cols = Vec::<Vec<usize>>::new();
         let mut cascade_dropped_column_fks = std::collections::HashSet::<(String, String)>::new();
@@ -1664,7 +1730,25 @@ impl Engine {
                         if added_primary_key {
                             table.pk = vec![table.columns.len() - 1];
                         }
-                        column_sources.push(ColumnSource::Added(col));
+                        column_sources.push(ColumnSource::Added);
+                        type_changed_columns.push(false);
+                        let added = table.columns.last().unwrap().clone();
+                        let default = self
+                            .resolve_default_exprs(&Table {
+                                name: table.name.clone(),
+                                columns: vec![added.clone()],
+                                pk: Vec::new(),
+                                checks: Vec::new(),
+                                indexes: Vec::new(),
+                                foreign_keys: Vec::new(),
+                                exclusions: Vec::new(),
+                            })?
+                            .pop()
+                            .unwrap();
+                        row_steps.push(RowStep::Add {
+                            column: added,
+                            default,
+                        });
                         // Inline constraints are the same definitions as CREATE TABLE. Queue them
                         // immediately after the column so later comma-actions see their effects.
                         for fk in foreign_keys.into_iter().rev() {
@@ -1743,7 +1827,7 @@ impl Engine {
                                                 .any(|cols| *cols == sorted_unique(&fk.ref_columns))
                                     })
                             }),
-                            ColumnSource::Added(_) => false,
+                            ColumnSource::Added => false,
                         };
                         if !cascade
                             && (check_dep || index_dep || fk_dep || exclusion_dep || incoming_dep)
@@ -1819,6 +1903,8 @@ impl Engine {
                         }
                         table.columns.remove(ci);
                         column_sources.remove(ci);
+                        type_changed_columns.remove(ci);
+                        row_steps.push(RowStep::Drop(ci));
                         for p in &mut table.pk {
                             if *p > ci {
                                 *p -= 1;
@@ -1887,6 +1973,95 @@ impl Engine {
                             }
                             true
                         });
+                        continue;
+                    }
+                    if let AlterTableEdit::AddPrimaryKey(names) = action {
+                        if !table.pk.is_empty() {
+                            return Err(EngineError::new(
+                                SqlState::InvalidTableDefinition,
+                                format!(
+                                    "multiple primary keys for table {} are not allowed",
+                                    table.name
+                                ),
+                            ));
+                        }
+                        let mut pk = Vec::new();
+                        for name in names {
+                            let Some(ci) = table
+                                .columns
+                                .iter()
+                                .position(|c| c.name.eq_ignore_ascii_case(&name))
+                            else {
+                                return Err(EngineError::new(
+                                    SqlState::UndefinedColumn,
+                                    format!("column {name} named in key does not exist"),
+                                ));
+                            };
+                            if pk.contains(&ci) {
+                                return Err(EngineError::new(
+                                    SqlState::DuplicateColumn,
+                                    format!("column {name} appears twice in primary key"),
+                                ));
+                            }
+                            let ty = &table.columns[ci].ty;
+                            if ty.is_composite()
+                                || (ty.is_array() && !is_array_keyable(ty))
+                                || (!ty.is_array() && !ty.is_range() && !is_keyable_scalar(ty))
+                            {
+                                return Err(EngineError::new(
+                                    SqlState::FeatureNotSupported,
+                                    format!(
+                                        "a {} primary key is not supported yet",
+                                        ty.canonical_name()
+                                    ),
+                                ));
+                            }
+                            pk.push(ci);
+                        }
+                        for &ci in &pk {
+                            table.columns[ci].primary_key = true;
+                            table.columns[ci].not_null = true;
+                        }
+                        table.pk = pk;
+                        continue;
+                    }
+                    if let AlterTableEdit::DropPrimaryKey { cascade } = action {
+                        if table.pk.is_empty() {
+                            return Err(EngineError::new(
+                                SqlState::UndefinedObject,
+                                "primary key does not exist".to_string(),
+                            ));
+                        }
+                        let old_pk = sorted_unique(&table.pk);
+                        let local_deps = table.foreign_keys.iter().any(|fk| {
+                            fk.ref_table.eq_ignore_ascii_case(&table.name)
+                                && sorted_unique(&fk.ref_columns) == old_pk
+                        });
+                        let incoming_deps = snap.tables.iter().any(|(key, child)| {
+                            !key.eq_ignore_ascii_case(&old_key)
+                                && child.foreign_keys.iter().any(|fk| {
+                                    fk.ref_table.eq_ignore_ascii_case(&original.name)
+                                        && sorted_unique(&fk.ref_columns) == old_pk
+                                })
+                        });
+                        if !cascade && (local_deps || incoming_deps) {
+                            return Err(EngineError::new(
+                                SqlState::DependentObjectsStillExist,
+                                "cannot drop primary key because other objects depend on it"
+                                    .to_string(),
+                            ));
+                        }
+                        if cascade {
+                            table.foreign_keys.retain(|fk| {
+                                !(fk.ref_table.eq_ignore_ascii_case(&table.name)
+                                    && sorted_unique(&fk.ref_columns) == old_pk)
+                            });
+                            cascade_unique_cols.push(old_pk);
+                        }
+                        for &ci in &table.pk {
+                            table.columns[ci].primary_key = false;
+                        }
+                        table.pk.clear();
                         continue;
                     }
                     if let AlterTableEdit::AddConstraint(def) = action {
@@ -2439,6 +2614,253 @@ impl Engine {
                             }
                             table.columns[ci].not_null = false;
                         }
+                        AlterColumnKind::SetType {
+                            type_name,
+                            type_mod,
+                            using,
+                        } => {
+                            let old_column = table.columns[ci].clone();
+                            let mut target = self.build_alter_added_column(
+                                &table,
+                                &crate::ast::ColumnDef {
+                                    name: table.columns[ci].name.clone(),
+                                    type_name: type_name.clone(),
+                                    type_mod,
+                                    primary_key: false,
+                                    not_null: false,
+                                    default: None,
+                                    identity: None,
+                                    collation: None,
+                                },
+                                &mut Vec::new(),
+                                &[],
+                                temp_scope,
+                                attachment_scope,
+                            )?;
+                            if old_column.primary_key
+                                && (target.ty.is_composite()
+                                    || (target.ty.is_array() && !is_array_keyable(&target.ty))
+                                    || (!target.ty.is_array()
+                                        && !target.ty.is_range()
+                                        && !is_keyable_scalar(&target.ty)))
+                            {
+                                return Err(EngineError::new(
+                                    SqlState::FeatureNotSupported,
+                                    format!(
+                                        "a {} primary key is not supported yet",
+                                        target.ty.canonical_name()
+                                    ),
+                                ));
+                            }
+                            if table.columns[ci].identity.is_some() && !target.ty.is_integer() {
+                                return Err(EngineError::new(
+                                    SqlState::InvalidParameterValue,
+                                    "identity column type must be smallint, integer, or bigint"
+                                        .to_string(),
+                                ));
+                            }
+                            let source = using
+                                .unwrap_or_else(|| Expr::Column(table.columns[ci].name.clone()));
+                            let cast = Expr::Cast {
+                                inner: Box::new(source),
+                                type_name: type_name.clone(),
+                                type_mod,
+                            };
+                            let (value, ty) = resolve(
+                                &Scope::single(self, &table),
+                                &cast,
+                                None,
+                                &mut AggCtx::Forbidden,
+                                &mut ParamTypes::default(),
+                            )?;
+                            if ty != resolved_type_of_col(&target.ty, self) {
+                                return Err(type_error(format!(
+                                    "USING expression is not of type {}",
+                                    target.ty.canonical_name()
+                                )));
+                            }
+                            target.primary_key = table.columns[ci].primary_key;
+                            target.not_null = table.columns[ci].not_null;
+                            target.identity = table.columns[ci].identity;
+                            if let Some(default) = old_column.default.clone() {
+                                let default_table = Table {
+                                    name: table.name.clone(),
+                                    columns: vec![old_column.clone()],
+                                    pk: Vec::new(),
+                                    checks: Vec::new(),
+                                    indexes: Vec::new(),
+                                    foreign_keys: Vec::new(),
+                                    exclusions: Vec::new(),
+                                };
+                                let default_cast = Expr::Cast {
+                                    inner: Box::new(Expr::Column(old_column.name.clone())),
+                                    type_name: type_name.clone(),
+                                    type_mod,
+                                };
+                                let (node, _) = resolve(
+                                    &Scope::single(self, &default_table),
+                                    &default_cast,
+                                    None,
+                                    &mut AggCtx::Forbidden,
+                                    &mut ParamTypes::default(),
+                                )?;
+                                let rng = std::cell::Cell::new(crate::seam::StmtRng::new());
+                                let env = EvalEnv {
+                                    exec: self,
+                                    params: &[],
+                                    outer: &[],
+                                    rng: &rng,
+                                    ctes: CteCtx::empty(),
+                                };
+                                let mut default_meter = self.session.new_meter();
+                                target.default =
+                                    Some(node.eval(&[default], &env, &mut default_meter)?);
+                                prep_cost += default_meter.accrued;
+                            } else if let Some(default) = old_column.default_expr.clone() {
+                                let default_cast = Expr::Cast {
+                                    inner: Box::new(default.expr),
+                                    type_name: type_name.clone(),
+                                    type_mod,
+                                };
+                                resolve(
+                                    &Scope::empty(self),
+                                    &default_cast,
+                                    None,
+                                    &mut AggCtx::Forbidden,
+                                    &mut ParamTypes::default(),
+                                )?;
+                                let type_sql = match type_mod {
+                                    Some(m) => match m.scale {
+                                        Some(s) => format!("{type_name} ({}, {})", m.precision, s),
+                                        None => format!("{type_name} ({})", m.precision),
+                                    },
+                                    None => type_name.clone(),
+                                };
+                                target.default_expr = Some(DefaultExpr {
+                                    expr_text: format!(
+                                        "CAST ( {} AS {} )",
+                                        default.expr_text, type_sql
+                                    ),
+                                    expr: default_cast,
+                                });
+                            }
+                            if old_column.identity.is_some() {
+                                let old_dtype = SeqDataType::for_scalar(old_column.ty.scalar())
+                                    .expect("identity column is integer");
+                                let new_dtype = SeqDataType::for_scalar(target.ty.scalar())
+                                    .expect("identity column is integer");
+                                if let Some(si) = pending_serials.iter().position(|seq| {
+                                    seq.owned_by.as_ref().is_some_and(|owner| {
+                                        owner.table.eq_ignore_ascii_case(&table.name)
+                                            && usize::from(owner.column) == ci
+                                    })
+                                }) {
+                                    pending_serials[si] = retype_identity_sequence(
+                                        &pending_serials[si],
+                                        old_dtype,
+                                        new_dtype,
+                                    )?;
+                                } else {
+                                    let old_ci = match column_sources[ci] {
+                                        ColumnSource::Original(old) => old,
+                                        ColumnSource::Added => {
+                                            panic!("added identity column has pending sequence")
+                                        }
+                                    };
+                                    let key = snap
+                                        .sequences_owned_by(&original.name)
+                                        .into_iter()
+                                        .find(|key| {
+                                            snap.sequence(key)
+                                                .and_then(|seq| seq.owned_by.as_ref())
+                                                .is_some_and(|owner| {
+                                                    usize::from(owner.column) == old_ci
+                                                })
+                                        })
+                                        .expect("identity column has owned sequence");
+                                    let current = self
+                                        .sequence(&key)
+                                        .cloned()
+                                        .expect("identity owned sequence exists");
+                                    self.put_sequence_routed(retype_identity_sequence(
+                                        &current, old_dtype, new_dtype,
+                                    )?);
+                                }
+                            }
+                            table.columns[ci] = target;
+                            type_changed_columns[ci] = true;
+                            type_changed = true;
+                            row_steps.push(RowStep::SetType { column: ci, value });
+                            for c in &table.checks {
+                                added_constraints.insert(c.name.to_ascii_lowercase());
+                            }
+                            for i in &table.indexes {
+                                added_constraints.insert(i.name.to_ascii_lowercase());
+                            }
+                            for f in &table.foreign_keys {
+                                added_constraints.insert(f.name.to_ascii_lowercase());
+                            }
+                            for e in &table.exclusions {
+                                added_constraints.insert(e.name.to_ascii_lowercase());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if type_changed {
+            for fk in &table.foreign_keys {
+                let parent = if fk.ref_table.eq_ignore_ascii_case(&table.name) {
+                    &table
+                } else {
+                    snap.table(&fk.ref_table).expect("existing FK parent")
+                };
+                for (&local, &referenced) in fk.columns.iter().zip(&fk.ref_columns) {
+                    if table.columns[local].ty != parent.columns[referenced].ty {
+                        return Err(type_error(format!(
+                            "foreign key constraint {} cannot be implemented: key columns {} and {} are of incompatible types: {} and {}",
+                            fk.name,
+                            table.columns[local].name,
+                            parent.columns[referenced].name,
+                            table.columns[local].ty.canonical_name(),
+                            parent.columns[referenced].ty.canonical_name(),
+                        )));
+                    }
+                }
+            }
+            for (key, child) in snap.tables.iter() {
+                if key.eq_ignore_ascii_case(&old_key) {
+                    continue;
+                }
+                for fk in &child.foreign_keys {
+                    if !fk.ref_table.eq_ignore_ascii_case(&original.name) {
+                        continue;
+                    }
+                    if cascade_dropped_column_fks
+                        .contains(&(key.to_ascii_lowercase(), fk.name.to_ascii_lowercase()))
+                        || cascade_unique_cols
+                            .iter()
+                            .any(|cols| *cols == sorted_unique(&fk.ref_columns))
+                    {
+                        continue;
+                    }
+                    for (&local, &old_ref) in fk.columns.iter().zip(&fk.ref_columns) {
+                        let Some(new_ref) = column_sources.iter().position(
+                            |s| matches!(s, ColumnSource::Original(old) if *old == old_ref),
+                        ) else {
+                            continue;
+                        };
+                        if child.columns[local].ty != table.columns[new_ref].ty {
+                            return Err(type_error(format!(
+                                "foreign key constraint {} cannot be implemented: key columns {} and {} are of incompatible types: {} and {}",
+                                fk.name,
+                                child.columns[local].name,
+                                table.columns[new_ref].name,
+                                child.columns[local].ty.canonical_name(),
+                                table.columns[new_ref].ty.canonical_name(),
+                            )));
+                        }
                     }
                 }
             }
@@ -2458,8 +2880,13 @@ impl Engine {
         let pk_rekeyed = table.pk.len() != original.pk.len()
             || table.pk.iter().zip(&original.pk).any(|(&next, &old)| {
                 !matches!(column_sources.get(next), Some(ColumnSource::Original(source)) if *source == old)
-            });
-        let rewrite_col_types: Option<Vec<ColType>> = rewrite_needed.then(|| {
+			})
+			|| table
+				.pk
+				.iter()
+				.any(|&column| type_changed_columns[column]);
+        let table_rewrite_needed = rewrite_needed || !row_steps.is_empty() || pk_rekeyed;
+        let rewrite_col_types: Option<Vec<ColType>> = table_rewrite_needed.then(|| {
             let main = self.read_snap();
             table
                 .columns
@@ -2468,9 +2895,11 @@ impl Engine {
                 .collect()
         });
         let mut meter = self.session.new_meter();
+        meter.charge(prep_cost);
+        meter.guard()?;
         let mut rewrite_entries: Option<Vec<(Vec<u8>, Row)>> = None;
         let mut rewrite_next_rowid = 0i64;
-        if rewrite_needed {
+        if table_rewrite_needed {
             // Make owned sequences visible to their synthesized nextval defaults. Statement-level
             // rollback restores the prior working root if any later validation fails.
             for seq in pending_serials.iter().cloned() {
@@ -2486,24 +2915,18 @@ impl Engine {
             let store = self.store_scoped(at.db.as_deref(), &original.name);
             let (mut rows, pages, slabs) = store.scan_with_units(&old_mask)?;
             rewrite_next_rowid = store.next_rowid();
+            if pk_rekeyed && table.pk.is_empty() {
+                rewrite_next_rowid = 0;
+            }
             meter.charge(COSTS.page_read * pages as i64 + COSTS.value_decompress * slabs as i64);
-            let generated: Vec<Column> = column_sources
-                .iter()
-                .filter_map(|source| match source {
-                    ColumnSource::Added(c) => Some(c.clone()),
-                    ColumnSource::Original(_) => None,
-                })
-                .collect();
-            let defaults = self.resolve_default_exprs(&Table {
-                name: table.name.clone(),
-                columns: generated,
-                pk: Vec::new(),
-                checks: Vec::new(),
-                indexes: Vec::new(),
-                foreign_keys: Vec::new(),
-                exclusions: Vec::new(),
-            })?;
             let rng = std::cell::Cell::new(crate::seam::StmtRng::new());
+            let env = EvalEnv {
+                exec: self,
+                params: &[],
+                outer: &[],
+                rng: &rng,
+                ctes: CteCtx::empty(),
+            };
             let pk: Vec<(usize, Type)> = table
                 .pk
                 .iter()
@@ -2516,31 +2939,35 @@ impl Engine {
                 meter.guard()?;
                 meter.charge(COSTS.storage_row_read);
                 store.resolve_all(row)?;
-                let old_row = std::mem::take(row);
-                let mut next_row = Vec::with_capacity(column_sources.len());
-                let mut generated_i = 0usize;
-                for (i, source) in column_sources.iter().enumerate() {
-                    let value = match source {
-                        ColumnSource::Original(old) => old_row[*old].clone(),
-                        ColumnSource::Added(added) => {
-                            let value = self.eval_default(
-                                added,
-                                defaults[generated_i].as_ref(),
-                                &rng,
-                                &mut meter,
-                            )?;
-                            generated_i += 1;
-                            value
+                for step in &row_steps {
+                    match step {
+                        RowStep::Add { column, default } => {
+                            let value =
+                                self.eval_default(column, default.as_ref(), &rng, &mut meter)?;
+                            row.push(value);
                         }
-                    };
+                        RowStep::Drop(column) => {
+                            row.remove(*column);
+                        }
+                        RowStep::SetType { column, value } => {
+                            row[*column] = value.eval(row, &env, &mut meter)?;
+                        }
+                    }
+                }
+                let next_row = std::mem::take(row);
+                for (i, value) in next_row.iter().enumerate() {
                     if table.columns[i].not_null && matches!(value, Value::Null) {
                         return Err(EngineError::not_null_violation(&table.columns[i].name));
                     }
-                    next_row.push(value);
                 }
                 *row = next_row;
                 if pk_rekeyed {
-                    *key = encode_pk_key(&pk, &colls, row)?;
+                    if pk.is_empty() {
+                        *key = crate::encoding::encode_int(ScalarType::Int64, rewrite_next_rowid);
+                        rewrite_next_rowid += 1;
+                    } else {
+                        *key = encode_pk_key(&pk, &colls, row)?;
+                    }
                     if !seen_keys.insert(key.clone()) {
                         return Err(EngineError::unique_violation(
                             &table.name,

@@ -1456,8 +1456,8 @@ impl Parser {
         })
     }
 
-    /// Parse ALTER TABLE's authoritative grammar frame (alter.md §1). Slices 1-4 execute RENAME,
-    /// ADD/DROP COLUMN, catalog-only ALTER COLUMN edits, and ADD/DROP non-PK constraints.
+    /// Parse ALTER TABLE's authoritative grammar frame (alter.md §1). Slices 1-5 execute the
+    /// complete planned surface other than identity management.
     fn parse_alter_table(&mut self) -> Result<AlterTable> {
         self.expect_keyword("alter")?;
         self.expect_keyword("table")?;
@@ -1539,6 +1539,21 @@ impl Parser {
                             self.advance();
                             continue;
                         }
+                        if self.at_primary_key_table_constraint() {
+                            if self.peek_keyword().as_deref() == Some("constraint") {
+                                self.advance();
+                                self.expect_identifier()?; // jed derives the PK handle.
+                            }
+                            self.expect_keyword("primary")?;
+                            self.expect_keyword("key")?;
+                            actions
+                                .push(AlterTableEdit::AddPrimaryKey(self.parse_pk_column_list()?));
+                            if !matches!(self.peek(), Token::Comma) {
+                                break;
+                            }
+                            self.advance();
+                            continue;
+                        }
                         let def = if self.at_check_constraint() {
                             AlterConstraintDef::Check(self.parse_check_constraint()?)
                         } else if self.at_unique_table_constraint() {
@@ -1550,15 +1565,31 @@ impl Parser {
                         } else if self.at_exclusion_table_constraint() {
                             AlterConstraintDef::Exclude(self.parse_exclusion_table_constraint()?)
                         } else {
-                            return Err(EngineError::new(
-                                SqlState::FeatureNotSupported,
-                                "ALTER TABLE ... ADD PRIMARY KEY is not supported yet".to_string(),
-                            ));
+                            unreachable!("constraint lookahead")
                         };
                         actions.push(AlterTableEdit::AddConstraint(def));
                     }
                     Some("drop") => {
                         self.advance();
+                        if self.peek_keyword().as_deref() == Some("primary") {
+                            self.advance();
+                            self.expect_keyword("key")?;
+                            let cascade = if self.peek_keyword().as_deref() == Some("cascade") {
+                                self.advance();
+                                true
+                            } else {
+                                if self.peek_keyword().as_deref() == Some("restrict") {
+                                    self.advance();
+                                }
+                                false
+                            };
+                            actions.push(AlterTableEdit::DropPrimaryKey { cascade });
+                            if !matches!(self.peek(), Token::Comma) {
+                                break;
+                            }
+                            self.advance();
+                            continue;
+                        }
                         let constraint = self.peek_keyword().as_deref() == Some("constraint");
                         if constraint || self.peek_keyword().as_deref() == Some("column") {
                             self.advance();
@@ -1610,10 +1641,9 @@ impl Parser {
                                     let text = render_tokens(&self.tokens[start..self.pos]);
                                     AlterColumnKind::SetDefault(DefaultDef { expr, text })
                                 } else if self.peek_keyword().as_deref() == Some("data") {
-                                    return Err(EngineError::new(
-                                        SqlState::FeatureNotSupported,
-                                        "ALTER COLUMN ... TYPE is not supported yet".to_string(),
-                                    ));
+                                    self.advance();
+                                    self.expect_keyword("type")?;
+                                    self.parse_alter_column_type()?
                                 } else {
                                     self.expect_keyword("not")?;
                                     self.expect_keyword("null")?;
@@ -1632,10 +1662,8 @@ impl Parser {
                                 }
                             }
                             Some("type") => {
-                                return Err(EngineError::new(
-                                    SqlState::FeatureNotSupported,
-                                    "ALTER COLUMN ... TYPE is not supported yet".to_string(),
-                                ));
+                                self.advance();
+                                self.parse_alter_column_type()?
                             }
                             other => {
                                 return Err(syntax(format!(
@@ -1661,6 +1689,27 @@ impl Parser {
             db,
             if_exists,
             action,
+        })
+    }
+
+    fn parse_alter_column_type(&mut self) -> Result<AlterColumnKind> {
+        let base = self.expect_identifier()?;
+        let type_mod = self.parse_type_mod()?;
+        let type_name = if self.consume_array_brackets()? {
+            format!("{base}[]")
+        } else {
+            base
+        };
+        let using = if self.peek_keyword().as_deref() == Some("using") {
+            self.advance();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        Ok(AlterColumnKind::SetType {
+            type_name,
+            type_mod,
+            using,
         })
     }
 

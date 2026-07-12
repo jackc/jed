@@ -1472,7 +1472,7 @@ func (db *engine) executeDropTable(dt *dropTable) (outcome, error) {
 	return outcome{Kind: outcomeStatement, Cost: 0}, nil
 }
 
-// executeAlterTable implements ALTER TABLE slices 1-4 (alter.md §1-§3.2).
+// executeAlterTable implements ALTER TABLE slices 1-5 (alter.md §1-§3.4).
 // It edits one private table copy, validates the final state, and publishes one catalog mutation.
 func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 	if err := checkCatalogRelWrite(at.Name); err != nil {
@@ -1537,6 +1537,21 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 	for i := range columnSources {
 		columnSources[i].original = i
 	}
+	type alterRowStep struct {
+		kind        int
+		column      int
+		added       catColumn
+		defaultExpr *rExpr
+		value       *rExpr
+	}
+	const (
+		alterRowAdd = iota
+		alterRowDrop
+		alterRowType
+	)
+	var rowSteps []alterRowStep
+	typeChanged := false
+	prepCost := int64(0)
 	var pendingSerials []*sequenceDef
 	indexOld, indexNew := "", ""
 	renameTable := ""
@@ -1715,6 +1730,11 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 				}
 				captured := col
 				columnSources = append(columnSources, alterColumnSource{original: -1, added: &captured})
+				defaults, err := db.resolveDefaultExprs(&catTable{Name: table.Name, Columns: []catColumn{captured}})
+				if err != nil {
+					return outcome{}, err
+				}
+				rowSteps = append(rowSteps, alterRowStep{kind: alterRowAdd, added: captured, defaultExpr: defaults[0]})
 				var inline []alterTableEdit
 				for i := range add.Checks {
 					d := add.Checks[i]
@@ -1735,9 +1755,92 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 				continue
 			}
 			if a.DropColumn != nil {
+				ci := table.ColumnIndex(a.DropColumn.Name)
 				if err := dropAlterColumn(&table, a.DropColumn, snap, original, oldKey, &columnSources, &pendingSerials, constraintState); err != nil {
 					return outcome{}, err
 				}
+				if ci >= 0 {
+					rowSteps = append(rowSteps, alterRowStep{kind: alterRowDrop, column: ci})
+				}
+				continue
+			}
+			if a.AddPrimaryKey != nil {
+				if len(table.PK) > 0 {
+					return outcome{}, newError(InvalidTableDefinition, "multiple primary keys for table "+table.Name+" are not allowed")
+				}
+				var pk []int
+				for _, name := range a.AddPrimaryKey {
+					ci := table.ColumnIndex(name)
+					if ci < 0 {
+						return outcome{}, newError(UndefinedColumn, "column "+name+" named in key does not exist")
+					}
+					if slices.Contains(pk, ci) {
+						return outcome{}, newError(DuplicateColumn, "column "+name+" appears twice in primary key")
+					}
+					ty := table.Columns[ci].Type
+					if ty.IsComposite() || (ty.IsArray() && !isArrayKeyable(ty)) || (!ty.IsArray() && !ty.IsRange() && !isKeyableScalarType(ty.ScalarTy())) {
+						return outcome{}, newError(FeatureNotSupported, "a "+ty.CanonicalName()+" primary key is not supported yet")
+					}
+					pk = append(pk, ci)
+				}
+				for _, ci := range pk {
+					table.Columns[ci].PrimaryKey, table.Columns[ci].NotNull = true, true
+				}
+				table.PK = pk
+				continue
+			}
+			if a.DropPrimaryKey != nil {
+				if len(table.PK) == 0 {
+					return outcome{}, newError(UndefinedObject, "primary key does not exist")
+				}
+				oldPK := sortedUnique(table.PK)
+				localDeps := false
+				for _, fk := range table.ForeignKeys {
+					localDeps = localDeps || (strings.EqualFold(fk.RefTable, table.Name) && slices.Equal(sortedUnique(fk.RefColumns), oldPK))
+				}
+				incomingDeps := false
+				for key, child := range snap.tables {
+					if strings.EqualFold(key, oldKey) {
+						continue
+					}
+					for _, fk := range child.ForeignKeys {
+						incomingDeps = incomingDeps || (strings.EqualFold(fk.RefTable, original.Name) && slices.Equal(sortedUnique(fk.RefColumns), oldPK))
+					}
+				}
+				if !a.DropPrimaryKey.Cascade && (localDeps || incomingDeps) {
+					return outcome{}, newError(DependentObjectsStillExist, "cannot drop primary key because other objects depend on it")
+				}
+				if a.DropPrimaryKey.Cascade {
+					kept := table.ForeignKeys[:0]
+					for _, fk := range table.ForeignKeys {
+						if !(strings.EqualFold(fk.RefTable, table.Name) && slices.Equal(sortedUnique(fk.RefColumns), oldPK)) {
+							kept = append(kept, fk)
+						}
+					}
+					table.ForeignKeys = kept
+					for key, base := range snap.tables {
+						if strings.EqualFold(key, oldKey) {
+							continue
+						}
+						child := base
+						if changed := constraintState.other[key]; changed != nil {
+							child = changed
+						}
+						keptFKs := append([]foreignKey(nil), child.ForeignKeys...)
+						keptFKs = slices.DeleteFunc(keptFKs, func(fk foreignKey) bool {
+							return strings.EqualFold(fk.RefTable, original.Name) && slices.Equal(sortedUnique(fk.RefColumns), oldPK)
+						})
+						if len(keptFKs) != len(child.ForeignKeys) {
+							cp := *child
+							cp.ForeignKeys = keptFKs
+							constraintState.other[key] = &cp
+						}
+					}
+				}
+				for _, ci := range table.PK {
+					table.Columns[ci].PrimaryKey = false
+				}
+				table.PK = nil
 				continue
 			}
 			if a.Add != nil {
@@ -1794,6 +1897,121 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 					return outcome{}, newError(InvalidTableDefinition, "column is in a primary key")
 				}
 				table.Columns[ci].NotNull = false
+			case alterSetType:
+				oldColumn := table.Columns[ci]
+				target, err := db.buildAlterAddedColumn(&table, &columnDef{Name: table.Columns[ci].Name, TypeName: edit.TypeName, TypeMod: edit.TypeMod}, &[]*sequenceDef{}, nil, snap == db.tempSnap(), isAttachmentScope(at.DB))
+				if err != nil {
+					return outcome{}, err
+				}
+				if oldColumn.PrimaryKey && (target.Type.IsComposite() || (target.Type.IsArray() && !isArrayKeyable(target.Type)) || (!target.Type.IsArray() && !target.Type.IsRange() && !isKeyableScalarType(target.Type.ScalarTy()))) {
+					return outcome{}, newError(FeatureNotSupported, "a "+target.Type.CanonicalName()+" primary key is not supported yet")
+				}
+				if table.Columns[ci].Identity != nil && !target.Type.IsInteger() {
+					return outcome{}, newError(InvalidParameterValue, "identity column type must be smallint, integer, or bigint")
+				}
+				source := exprNode{Kind: exprColumn, Column: table.Columns[ci].Name}
+				if edit.Using != nil {
+					source = *edit.Using
+				}
+				cast := exprNode{Kind: exprCast, Cast: &castExpr{Inner: source, TypeName: edit.TypeName, TypeMod: edit.TypeMod}}
+				value, rt, err := resolve(singleScope(db, &table), cast, nil, &aggCtx{collecting: false}, &paramTypes{})
+				if err != nil {
+					return outcome{}, err
+				}
+				if !resolvedTypeEqual(rt, resolvedTypeOfCol(target.Type, db.readSnap())) {
+					return outcome{}, typeError("USING expression is not of type " + target.Type.CanonicalName())
+				}
+				target.PrimaryKey, target.NotNull, target.Identity = oldColumn.PrimaryKey, oldColumn.NotNull, oldColumn.Identity
+				if oldColumn.Default != nil {
+					defaultTable := catTable{Name: table.Name, Columns: []catColumn{oldColumn}}
+					defaultSource := exprNode{Kind: exprColumn, Column: oldColumn.Name}
+					defaultCast := exprNode{Kind: exprCast, Cast: &castExpr{Inner: defaultSource, TypeName: edit.TypeName, TypeMod: edit.TypeMod}}
+					node, _, err := resolve(singleScope(db, &defaultTable), defaultCast, nil, &aggCtx{collecting: false}, &paramTypes{})
+					if err != nil {
+						return outcome{}, err
+					}
+					m := db.session.newMeter()
+					v, err := node.eval(storedRow{*oldColumn.Default}, &evalEnv{exec: db, rng: newStmtRng()}, m)
+					if err != nil {
+						return outcome{}, err
+					}
+					target.Default, prepCost = &v, prepCost+m.Accrued
+				} else if oldColumn.DefaultExpr != nil {
+					defaultCast := exprNode{Kind: exprCast, Cast: &castExpr{Inner: oldColumn.DefaultExpr.Expr, TypeName: edit.TypeName, TypeMod: edit.TypeMod}}
+					if _, _, err := resolve(emptyScope(db), defaultCast, nil, &aggCtx{collecting: false}, &paramTypes{}); err != nil {
+						return outcome{}, err
+					}
+					typeSQL := edit.TypeName
+					if edit.TypeMod != nil {
+						if edit.TypeMod.Scale != nil {
+							typeSQL += fmt.Sprintf(" (%d, %d)", edit.TypeMod.Precision, *edit.TypeMod.Scale)
+						} else {
+							typeSQL += fmt.Sprintf(" (%d)", edit.TypeMod.Precision)
+						}
+					}
+					target.DefaultExpr = &defaultExprDef{ExprText: "CAST ( " + oldColumn.DefaultExpr.ExprText + " AS " + typeSQL + " )", Expr: defaultCast}
+				}
+				if oldColumn.Identity != nil {
+					if err := db.retypeAlterIdentitySequence(&table, original, ci, oldColumn.Type, target.Type, columnSources, pendingSerials, snap); err != nil {
+						return outcome{}, err
+					}
+				}
+				table.Columns[ci] = target
+				columnSources[ci].typeChanged = true
+				typeChanged = true
+				rowSteps = append(rowSteps, alterRowStep{kind: alterRowType, column: ci, value: value})
+				for _, c := range table.Checks {
+					constraintState.added[strings.ToLower(c.Name)] = true
+				}
+				for _, ix := range table.Indexes {
+					constraintState.added[strings.ToLower(ix.Name)] = true
+				}
+				for _, fk := range table.ForeignKeys {
+					constraintState.added[strings.ToLower(fk.Name)] = true
+				}
+				for _, ex := range table.Exclusions {
+					constraintState.added[strings.ToLower(ex.Name)] = true
+				}
+			}
+		}
+	}
+	if typeChanged {
+		for _, fk := range table.ForeignKeys {
+			parent := &table
+			if !strings.EqualFold(fk.RefTable, table.Name) {
+				parent, _ = snap.table(fk.RefTable)
+			}
+			for i, local := range fk.Columns {
+				ref := fk.RefColumns[i]
+				if !typesEqual(table.Columns[local].Type, parent.Columns[ref].Type) {
+					return outcome{}, typeError(fmt.Sprintf("foreign key constraint %s cannot be implemented: key columns %s and %s are of incompatible types: %s and %s", fk.Name, table.Columns[local].Name, parent.Columns[ref].Name, table.Columns[local].Type.CanonicalName(), parent.Columns[ref].Type.CanonicalName()))
+				}
+			}
+		}
+		for key, child := range snap.tables {
+			if strings.EqualFold(key, oldKey) {
+				continue
+			}
+			if changed := constraintState.other[key]; changed != nil {
+				child = changed
+			}
+			for _, fk := range child.ForeignKeys {
+				if !strings.EqualFold(fk.RefTable, original.Name) {
+					continue
+				}
+				for i, local := range fk.Columns {
+					oldRef := fk.RefColumns[i]
+					newRef := -1
+					for j, source := range columnSources {
+						if source.original == oldRef {
+							newRef = j
+							break
+						}
+					}
+					if newRef >= 0 && !typesEqual(child.Columns[local].Type, table.Columns[newRef].Type) {
+						return outcome{}, typeError(fmt.Sprintf("foreign key constraint %s cannot be implemented: key columns %s and %s are of incompatible types: %s and %s", fk.Name, child.Columns[local].Name, table.Columns[newRef].Name, child.Columns[local].Type.CanonicalName(), table.Columns[newRef].Type.CanonicalName()))
+					}
+				}
 			}
 		}
 	}
@@ -1814,23 +2032,28 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 	pkRekeyed := len(table.PK) != len(original.PK)
 	if !pkRekeyed {
 		for i, next := range table.PK {
-			if next < 0 || next >= len(columnSources) || columnSources[next].original != original.PK[i] {
+			if next < 0 || next >= len(columnSources) || columnSources[next].original != original.PK[i] || columnSources[next].typeChanged {
 				pkRekeyed = true
 				break
 			}
 		}
 	}
+	tableRewriteNeeded := rewriteNeeded || len(rowSteps) > 0 || pkRekeyed
 	var rewriteColTypes []colType
-	if rewriteNeeded {
+	if tableRewriteNeeded {
 		rewriteColTypes = make([]colType, len(table.Columns))
 		for i, c := range table.Columns {
 			rewriteColTypes[i] = resolveColType(c.Type, db.readSnap().types)
 		}
 	}
 	meter := db.session.newMeter()
+	meter.Charge(prepCost)
+	if err := meter.Guard(); err != nil {
+		return outcome{}, err
+	}
 	var rewriteRows []entry
 	rewriteNextRowid := int64(0)
-	if rewriteNeeded {
+	if tableRewriteNeeded {
 		for _, seq := range pendingSerials {
 			var sw *snapshot
 			if at.DB == nil {
@@ -1863,19 +2086,12 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 			return outcome{}, err
 		}
 		rewriteNextRowid = store.nextRowid
+		if pkRekeyed && len(table.PK) == 0 {
+			rewriteNextRowid = 0
+		}
 		meter.Charge(costs.PageRead*int64(pages) + costs.ValueDecompress*int64(slabs))
-		defaultTable := table
-		defaultTable.Columns = nil
-		for _, source := range columnSources {
-			if source.added != nil {
-				defaultTable.Columns = append(defaultTable.Columns, *source.added)
-			}
-		}
-		defaults, err := db.resolveDefaultExprs(&defaultTable)
-		if err != nil {
-			return outcome{}, err
-		}
 		rng := newStmtRng()
+		env := &evalEnv{exec: db, rng: rng}
 		colls := db.columnCollations(table.Columns)
 		seenKeys := map[string]bool{}
 		compressUnits := int64(0)
@@ -1888,28 +2104,39 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 			if err != nil {
 				return outcome{}, err
 			}
-			oldRow := row
-			row = make(storedRow, 0, len(columnSources))
-			generated := 0
-			for ci, source := range columnSources {
-				var v Value
-				if source.original >= 0 {
-					v = oldRow[source.original]
-				} else {
-					v, err = db.evalDefault(*source.added, defaults[generated], rng, meter)
+			row = append(storedRow(nil), row...)
+			for _, step := range rowSteps {
+				switch step.kind {
+				case alterRowAdd:
+					v, err := db.evalDefault(step.added, step.defaultExpr, rng, meter)
 					if err != nil {
 						return outcome{}, err
 					}
-					generated++
+					row = append(row, v)
+				case alterRowDrop:
+					row = slices.Delete(row, step.column, step.column+1)
+				case alterRowType:
+					v, err := step.value.eval(row, env, meter)
+					if err != nil {
+						return outcome{}, err
+					}
+					row[step.column] = v
 				}
+			}
+			for ci, v := range row {
 				if table.Columns[ci].NotNull && v.IsNull() {
 					return outcome{}, newNotNullViolation(table.Columns[ci].Name)
 				}
-				row = append(row, v)
 			}
 			rows[i].Row = row
 			if pkRekeyed {
-				key, err := encodePkKey(&table, table.PK, colls, row)
+				var key []byte
+				if len(table.PK) == 0 {
+					key = encodeInt(scalarInt64, rewriteNextRowid)
+					rewriteNextRowid++
+				} else {
+					key, err = encodePkKey(&table, table.PK, colls, row)
+				}
 				if err != nil {
 					return outcome{}, err
 				}
@@ -2036,6 +2263,75 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 		ws.remapAlterColumnDependents(table.Name, originalToNew, pending)
 	}
 	return outcome{Kind: outcomeStatement, Cost: meter.Accrued}, nil
+}
+
+// retypeAlterIdentitySequence keeps an IDENTITY column's owned sequence on the column's integer
+// type. PostgreSQL preserves explicit bounds while replacing bounds that equal the old type's
+// defaults, then validates the preserved START/current value against the new type and bounds.
+// Existing sequences are staged immediately so a USING/default expression that calls nextval sees
+// the final bounds; statement rollback restores the prior catalog root on any later failure.
+func (db *engine) retypeAlterIdentitySequence(table, original *catTable, ci int, oldType, newType dataType, sources []alterColumnSource, pending []*sequenceDef, snap *snapshot) error {
+	oldDtype, oldOK := seqDataTypeForScalar(oldType.ScalarTy())
+	newDtype, newOK := seqDataTypeForScalar(newType.ScalarTy())
+	if !oldOK || !newOK {
+		panic("identity column is integer")
+	}
+	for i, seq := range pending {
+		if seq.OwnedBy != nil && strings.EqualFold(seq.OwnedBy.Table, table.Name) && int(seq.OwnedBy.Column) == ci {
+			next, err := retypeIdentitySequence(seq, oldDtype, newDtype)
+			if err != nil {
+				return err
+			}
+			*pending[i] = *next
+			return nil
+		}
+	}
+	oldColumn := sources[ci].original
+	if oldColumn < 0 {
+		panic("added identity column has pending sequence")
+	}
+	for _, key := range snap.sequencesOwnedBy(original.Name) {
+		seq := snap.sequence(key)
+		if seq == nil || seq.OwnedBy == nil || int(seq.OwnedBy.Column) != oldColumn {
+			continue
+		}
+		next, err := retypeIdentitySequence(seq, oldDtype, newDtype)
+		if err != nil {
+			return err
+		}
+		db.putSequenceRouted(next)
+		return nil
+	}
+	panic("identity column has no owned sequence")
+}
+
+func retypeIdentitySequence(existing *sequenceDef, oldType, newType seqDataType) (*sequenceDef, error) {
+	def := *existing
+	oldMin, oldMax := oldType.DefaultBounds(def.Increment)
+	newMin, newMax := newType.DefaultBounds(def.Increment)
+	if def.MinValue == oldMin {
+		def.MinValue = newMin
+	}
+	if def.MaxValue == oldMax {
+		def.MaxValue = newMax
+	}
+	typeMin, typeMax := newType.Range()
+	if def.MaxValue > typeMax {
+		return nil, newError(InvalidParameterValue, fmt.Sprintf("MAXVALUE (%d) is out of range for sequence data type %s", def.MaxValue, newType.PgName()))
+	}
+	if def.MinValue < typeMin {
+		return nil, newError(InvalidParameterValue, fmt.Sprintf("MINVALUE (%d) is out of range for sequence data type %s", def.MinValue, newType.PgName()))
+	}
+	if def.MinValue >= def.MaxValue {
+		return nil, newError(InvalidParameterValue, fmt.Sprintf("MINVALUE (%d) must be less than MAXVALUE (%d)", def.MinValue, def.MaxValue))
+	}
+	if err := seqBoundCheckStart(def.Start, def.MinValue, def.MaxValue); err != nil {
+		return nil, err
+	}
+	if err := seqBoundCheckLast(def.LastValue, def.MinValue, def.MaxValue); err != nil {
+		return nil, err
+	}
+	return &def, nil
 }
 
 func (db *engine) buildAlterDefault(col catColumn, def *defaultDef) (*Value, *defaultExprDef, error) {

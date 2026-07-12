@@ -1,0 +1,77 @@
+# ALTER TABLE slice 5 PostgreSQL-comparable conversion and ADD PRIMARY KEY behavior.
+# requires: ddl.alter_table, ddl.create_table, ddl.primary_key, ddl.unique, ddl.column_default, dml.insert, dml.insert_column_list, query.select, query.order_by, types.i16, types.i32, types.i64, expr.arithmetic
+
+statement ok
+CREATE TABLE alter_type_oracle (id i32 PRIMARY KEY, v i32 DEFAULT 7, UNIQUE (v))
+
+statement ok
+INSERT INTO alter_type_oracle VALUES (1, 2), (2, 3)
+
+statement ok
+ALTER TABLE alter_type_oracle ALTER COLUMN v TYPE i64 USING v + 10
+
+statement ok
+INSERT INTO alter_type_oracle (id) VALUES (3)
+
+query II rowsort
+SELECT id, v FROM alter_type_oracle
+----
+1
+12
+2
+13
+3
+7
+
+statement ok
+ALTER TABLE alter_type_oracle ALTER id SET DATA TYPE i64 USING id + 100
+
+query II rowsort
+SELECT id, v FROM alter_type_oracle
+----
+101
+12
+102
+13
+103
+7
+
+statement error 22003
+ALTER TABLE alter_type_oracle ALTER v TYPE i16 USING v + 40000
+
+statement ok
+CREATE TABLE alter_add_pk_oracle (a i32, b i32)
+
+statement ok
+INSERT INTO alter_add_pk_oracle VALUES (2, 1), (1, 2)
+
+statement ok
+ALTER TABLE alter_add_pk_oracle ADD CONSTRAINT alter_add_pk_oracle_pkey PRIMARY KEY (a, b)
+
+query II rowsort
+SELECT a, b FROM alter_add_pk_oracle
+----
+1
+2
+2
+1
+
+statement error 42P16
+ALTER TABLE alter_add_pk_oracle ADD PRIMARY KEY (b)
+
+# Constant and expression defaults are converted through the same cast and retained.
+statement ok
+CREATE TABLE alter_type_default_oracle (a i64 DEFAULT 7, b i64 DEFAULT 1 + 1)
+
+statement ok
+ALTER TABLE alter_type_default_oracle ALTER a TYPE i16, ALTER b TYPE i16
+
+statement ok
+INSERT INTO alter_type_default_oracle (a) VALUES (DEFAULT)
+
+# types: i16, i16
+query II nosort
+SELECT a, b FROM alter_type_default_oracle
+----
+7
+2

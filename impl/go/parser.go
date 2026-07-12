@@ -1714,8 +1714,8 @@ func (p *parser) parseDropSequence() (*dropSequence, error) {
 	return &dropSequence{Names: names, IfExists: ifExists}, nil
 }
 
-// parseAlterTable parses ALTER TABLE's authoritative grammar frame (alter.md §1). Slices 1-4 execute
-// RENAME, ADD/DROP COLUMN, catalog-only ALTER COLUMN edits, and ADD/DROP non-PK constraints.
+// parseAlterTable parses ALTER TABLE's authoritative grammar frame (alter.md §1). Slices 1-5
+// execute the complete planned surface other than identity management.
 func (p *parser) parseAlterTable() (*alterTable, error) {
 	if err := p.expectKeyword("alter"); err != nil {
 		return nil, err
@@ -1812,6 +1812,26 @@ func (p *parser) parseAlterTable() (*alterTable, error) {
 				p.advance()
 				continue
 			}
+			if p.atPrimaryKeyTableConstraint() {
+				if p.peekKeyword() == "constraint" {
+					p.advance()
+					if _, e := p.expectIdentifier(); e != nil {
+						return nil, e
+					}
+				}
+				if e := p.expectKeyword("primary"); e != nil {
+					return nil, e
+				}
+				if e := p.expectKeyword("key"); e != nil {
+					return nil, e
+				}
+				cols, e := p.parsePKColumnList()
+				if e != nil {
+					return nil, e
+				}
+				at.Actions = append(at.Actions, alterTableEdit{AddPrimaryKey: cols})
+				break
+			}
 			var add alterConstraintDef
 			switch {
 			case p.atCheckConstraint():
@@ -1839,11 +1859,26 @@ func (p *parser) parseAlterTable() (*alterTable, error) {
 				}
 				add.Exclude = &v
 			default:
-				return nil, newError(FeatureNotSupported, "ALTER TABLE ... ADD PRIMARY KEY is not supported yet")
+				panic("constraint lookahead")
 			}
 			at.Actions = append(at.Actions, alterTableEdit{Add: &add})
 		case "drop":
 			p.advance()
+			if p.peekKeyword() == "primary" {
+				p.advance()
+				if err := p.expectKeyword("key"); err != nil {
+					return nil, err
+				}
+				cascade := false
+				if p.peekKeyword() == "cascade" {
+					p.advance()
+					cascade = true
+				} else if p.peekKeyword() == "restrict" {
+					p.advance()
+				}
+				at.Actions = append(at.Actions, alterTableEdit{DropPrimaryKey: &alterDropPrimaryKey{Cascade: cascade}})
+				break
+			}
 			constraint := p.peekKeyword() == "constraint"
 			if constraint || p.peekKeyword() == "column" {
 				p.advance()
@@ -1897,7 +1932,13 @@ func (p *parser) parseAlterTable() (*alterTable, error) {
 					a.Kind = alterSetDefault
 					a.Default = &defaultDef{Expr: e, Text: renderTokens(p.tokens[start:p.pos])}
 				} else if p.peekKeyword() == "data" {
-					return nil, newError(FeatureNotSupported, "ALTER COLUMN ... TYPE is not supported yet")
+					p.advance()
+					if err := p.expectKeyword("type"); err != nil {
+						return nil, err
+					}
+					if err := p.parseAlterColumnType(&a); err != nil {
+						return nil, err
+					}
 				} else {
 					if err := p.expectKeyword("not"); err != nil {
 						return nil, err
@@ -1922,7 +1963,10 @@ func (p *parser) parseAlterTable() (*alterTable, error) {
 					a.Kind = alterDropNotNull
 				}
 			case "type":
-				return nil, newError(FeatureNotSupported, "ALTER COLUMN ... TYPE is not supported yet")
+				p.advance()
+				if err := p.parseAlterColumnType(&a); err != nil {
+					return nil, err
+				}
 			default:
 				return nil, newError(SyntaxError, "ALTER COLUMN requires SET or DROP")
 			}
@@ -1934,6 +1978,34 @@ func (p *parser) parseAlterTable() (*alterTable, error) {
 		p.advance()
 	}
 	return at, nil
+}
+
+func (p *parser) parseAlterColumnType(a *alterColumnAction) error {
+	base, err := p.expectIdentifier()
+	if err != nil {
+		return err
+	}
+	tm, err := p.parseTypeMod()
+	if err != nil {
+		return err
+	}
+	isArray, err := p.consumeArrayBrackets()
+	if err != nil {
+		return err
+	}
+	if isArray {
+		base += "[]"
+	}
+	a.Kind, a.TypeName, a.TypeMod = alterSetType, base, tm
+	if p.peekKeyword() == "using" {
+		p.advance()
+		e, err := p.parseExpr()
+		if err != nil {
+			return err
+		}
+		a.Using = &e
+	}
+	return nil
 }
 
 // parseAlterSequence parses `ALTER SEQUENCE [IF EXISTS] <name> <action>` (spec/design/sequences.md

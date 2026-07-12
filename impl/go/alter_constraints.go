@@ -20,8 +20,9 @@ type alterConstraintState struct {
 // alterColumnSource describes one final table column during an ALTER rewrite. original >= 0 copies
 // that old row slot; added captures the ADD action's default before later actions can edit it.
 type alterColumnSource struct {
-	original int
-	added    *catColumn
+	original    int
+	added       *catColumn
+	typeChanged bool
 }
 
 func dropAlterColumn(t *catTable, d *alterDropColumn, snap *snapshot, original *catTable, oldKey string, sources *[]alterColumnSource, pending *[]*sequenceDef, st *alterConstraintState) error {

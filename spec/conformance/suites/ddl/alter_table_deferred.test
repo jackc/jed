@@ -1,6 +1,4 @@
-# ALTER TABLE's grammar is authoritative for the planned surface (alter.md §1), even before every
-# slice executes. Deferred ADD/DROP/TYPE forms therefore report 0A000 rather than leaking parser-
-# internal 42601 errors. Also pins the named-PK divergence (§2.3/§7). jed-specific; do not
+# ALTER TABLE's remaining deferred identity surface and named-PK divergence (§2.3/§7). jed-specific; do not
 # PostgreSQL-oracle-check.
 # requires: ddl.alter_table, ddl.create_table, ddl.primary_key, ddl.check, types.i32, types.i64
 
@@ -10,18 +8,6 @@ CREATE TABLE deferred_alter (id i32 PRIMARY KEY, v i32)
 # jed derives this introspection handle; it has no named PK object to rename (PG would succeed).
 statement error 42704
 ALTER TABLE deferred_alter RENAME CONSTRAINT deferred_alter_pkey TO renamed_pkey
-
-statement error 0A000
-ALTER TABLE deferred_alter ADD PRIMARY KEY (v)
-
-statement error 0A000
-ALTER TABLE deferred_alter ADD CONSTRAINT deferred_alter_v_pkey PRIMARY KEY (v)
-
-statement error 0A000
-ALTER TABLE deferred_alter ALTER COLUMN v TYPE i64
-
-statement error 0A000
-ALTER TABLE deferred_alter ALTER COLUMN v SET DATA TYPE i64
 
 # SET TYPE is not grammar; PostgreSQL's spellings are TYPE or SET DATA TYPE.
 statement error 42601

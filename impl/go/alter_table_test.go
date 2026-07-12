@@ -52,3 +52,30 @@ func TestAlterDropColumnRewriteMatchesFreshTableBytes(t *testing.T) {
 		t.Fatal("DROP COLUMN rewrite differs from an equivalent fresh table")
 	}
 }
+
+func TestAlterTypeAndPrimaryKeyRewritesMatchFreshTableBytes(t *testing.T) {
+	t.Parallel()
+	image := func(sqls ...string) []byte {
+		db := memDB().Session(SessionOptions{})
+		for _, sql := range sqls {
+			uqRun(t, db, sql)
+		}
+		out, err := db.ToImage(8192, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	if !bytes.Equal(
+		image("CREATE TABLE t (id i32 PRIMARY KEY, v i32)", "INSERT INTO t VALUES (1, 2), (2, 3)", "ALTER TABLE t ALTER v TYPE i64 USING v + 10"),
+		image("CREATE TABLE t (id i32 PRIMARY KEY, v i64)", "INSERT INTO t VALUES (1, 12), (2, 13)"),
+	) {
+		t.Fatal("ALTER TYPE rewrite differs from an equivalent fresh table")
+	}
+	if !bytes.Equal(
+		image("CREATE TABLE t (id i32 NOT NULL, v text)", "INSERT INTO t VALUES (2, 'b'), (1, 'a')", "ALTER TABLE t ADD PRIMARY KEY (id)", "ALTER TABLE t DROP PRIMARY KEY"),
+		image("CREATE TABLE t (id i32 NOT NULL, v text)", "INSERT INTO t VALUES (1, 'a'), (2, 'b')"),
+	) {
+		t.Fatal("ADD/DROP PRIMARY KEY rewrite differs from an equivalent fresh table")
+	}
+}

@@ -60,3 +60,39 @@ fn drop_column_rewrite_matches_fresh_table_bytes() {
         fresh.to_image(8192, 1).unwrap()
     );
 }
+
+#[test]
+fn type_and_primary_key_rewrites_match_fresh_table_bytes() {
+    let image = |setup: &[&str]| {
+        let mut db = Database::create(CreateOptions::default())
+            .unwrap()
+            .session(SessionOptions::default());
+        for sql in setup {
+            run(&mut db, sql);
+        }
+        db.to_image(8192, 1).unwrap()
+    };
+
+    assert_eq!(
+        image(&[
+            "CREATE TABLE t (id i32 PRIMARY KEY, v i32)",
+            "INSERT INTO t VALUES (1, 2), (2, 3)",
+            "ALTER TABLE t ALTER v TYPE i64 USING v + 10",
+        ]),
+        image(&[
+            "CREATE TABLE t (id i32 PRIMARY KEY, v i64)",
+            "INSERT INTO t VALUES (1, 12), (2, 13)",
+        ]),
+    );
+    let altered = image(&[
+        "CREATE TABLE t (id i32 NOT NULL, v text)",
+        "INSERT INTO t VALUES (2, 'b'), (1, 'a')",
+        "ALTER TABLE t ADD PRIMARY KEY (id)",
+        "ALTER TABLE t DROP PRIMARY KEY",
+    ]);
+    let fresh = image(&[
+        "CREATE TABLE t (id i32 NOT NULL, v text)",
+        "INSERT INTO t VALUES (1, 'a'), (2, 'b')",
+    ]);
+    assert_eq!(altered, fresh);
+}

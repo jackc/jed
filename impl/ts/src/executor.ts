@@ -70,6 +70,7 @@ import {
   type IdentityKind,
   type IndexDef,
   type IndexKey,
+  type SeqDataType,
   type SeqOwner,
   type SequenceDef,
   type Table,
@@ -77,7 +78,10 @@ import {
   indexColumnOrdinals,
   indexFirstColumn,
   pkIndices,
+  seqDataTypeDefaultBounds,
   seqDataTypeForScalar,
+  seqDataTypePgName,
+  seqDataTypeRange,
   primaryKeyIndex,
   resolveColType,
 } from "./catalog.ts";
@@ -318,6 +322,8 @@ import {
   joinDetail,
   limitDetail,
   rejectParamsForDDL,
+  seqBoundCheckLast,
+  seqBoundCheckStart,
   relOfIndex,
   renderBoundTerms,
   renderKeySet,
@@ -375,6 +381,39 @@ export type Outcome =
       rows: Value[][];
       cost: bigint;
     };
+
+// Retype an IDENTITY-owned sequence with PostgreSQL's ALTER SEQUENCE AS rules: old default bounds
+// become the new type defaults, explicit bounds are preserved, and START/current must fit.
+function retypeIdentitySequence(
+  existing: SequenceDef,
+  oldType: SeqDataType,
+  newType: SeqDataType,
+): SequenceDef {
+  const def = { ...existing };
+  const [oldMin, oldMax] = seqDataTypeDefaultBounds(oldType, def.increment);
+  const [newMin, newMax] = seqDataTypeDefaultBounds(newType, def.increment);
+  if (def.minValue === oldMin) def.minValue = newMin;
+  if (def.maxValue === oldMax) def.maxValue = newMax;
+  const [typeMin, typeMax] = seqDataTypeRange(newType);
+  if (def.maxValue > typeMax)
+    throw engineError(
+      "invalid_parameter_value",
+      `MAXVALUE (${def.maxValue}) is out of range for sequence data type ${seqDataTypePgName(newType)}`,
+    );
+  if (def.minValue < typeMin)
+    throw engineError(
+      "invalid_parameter_value",
+      `MINVALUE (${def.minValue}) is out of range for sequence data type ${seqDataTypePgName(newType)}`,
+    );
+  if (def.minValue >= def.maxValue)
+    throw engineError(
+      "invalid_parameter_value",
+      `MINVALUE (${def.minValue}) must be less than MAXVALUE (${def.maxValue})`,
+    );
+  seqBoundCheckStart(def.start, def.minValue, def.maxValue);
+  seqBoundCheckLast(def.lastValue, def.minValue, def.maxValue);
+  return def;
+}
 
 // SelectResult is the full result of running a SELECT (runSelect): the output column names and
 // their resolved types, the rows in result order, and the accrued cost. Internal — executeSelect
@@ -4144,7 +4183,7 @@ export class Engine {
     return { kind: "statement", cost: 0n, rowsAffected: null };
   }
 
-  // executeAlterTable implements ALTER TABLE slices 1-4 (alter.md §1-§3.2).
+  // executeAlterTable implements ALTER TABLE slices 1-5 (alter.md §1-§3.4).
   private executeAlterTable(at: AlterTable): Outcome {
     checkCatalogRelWrite(at.name);
     this.checkAttachmentWritable(at.db);
@@ -4210,6 +4249,14 @@ export class Engine {
       kind: "original",
       column,
     }));
+    const typeChangedColumns = original.columns.map(() => false);
+    type RowStep =
+      | { kind: "add"; column: Column; defaultExpr: RExpr | null }
+      | { kind: "drop"; column: number }
+      | { kind: "setType"; column: number; value: RExpr };
+    const rowSteps: RowStep[] = [];
+    let typeChanged = false;
+    let prepCost = 0n;
     const cascadeUniqueCols: number[][] = [];
     const cascadeDroppedColumnFks = new Set<string>();
     const rewriteExprs = (
@@ -4361,6 +4408,20 @@ export class Engine {
             table.columns.push(col);
             if (col.primaryKey) table.pk = [table.columns.length - 1];
             columnSources.push({ kind: "added", column: col });
+            typeChangedColumns.push(false);
+            rowSteps.push({
+              kind: "add",
+              column: col,
+              defaultExpr: this.resolveDefaultExprs({
+                ...table,
+                columns: [col],
+                pk: [],
+                checks: [],
+                indexes: [],
+                fks: [],
+                exclusions: [],
+              })[0]!,
+            });
             actions.unshift(
               ...action.checks.map(
                 (def) =>
@@ -4469,6 +4530,8 @@ export class Engine {
             }
             table.columns.splice(ci, 1);
             columnSources.splice(ci, 1);
+            typeChangedColumns.splice(ci, 1);
+            rowSteps.push({ kind: "drop", column: ci });
             table.pk = table.pk.map((column) => (column > ci ? column - 1 : column));
             table.indexes = table.indexes.map((index) => ({
               ...index,
@@ -4508,6 +4571,80 @@ export class Engine {
               else if (owner.column > ci)
                 pendingSerials[i] = { ...seq, ownedBy: { ...owner, column: owner.column - 1 } };
             }
+            continue;
+          }
+          if (action.kind === "addPrimaryKey") {
+            if (table.pk.length > 0)
+              throw engineError(
+                "invalid_table_definition",
+                `multiple primary keys for table ${table.name} are not allowed`,
+              );
+            const pk: number[] = [];
+            for (const name of action.columns) {
+              const ci = columnIndex(table, name);
+              if (ci < 0)
+                throw engineError(
+                  "undefined_column",
+                  `column ${name} named in key does not exist`,
+                );
+              if (pk.includes(ci))
+                throw engineError(
+                  "duplicate_column",
+                  `column ${name} appears twice in primary key`,
+                );
+              const type = table.columns[ci]!.type;
+              if (
+                type.kind === "composite" ||
+                (type.kind === "array" && !typeIsArrayKeyable(type)) ||
+                (type.kind !== "array" && type.kind !== "range" && !typeIsKeyableScalar(type))
+              )
+                throw engineError(
+                  "feature_not_supported",
+                  `a ${typeCanonicalName(type)} primary key is not supported yet`,
+                );
+              pk.push(ci);
+            }
+            table.columns = table.columns.map((column, ci) =>
+              pk.includes(ci) ? { ...column, primaryKey: true, notNull: true } : column,
+            );
+            table.pk = pk;
+            continue;
+          }
+          if (action.kind === "dropPrimaryKey") {
+            if (table.pk.length === 0)
+              throw engineError("undefined_object", "primary key does not exist");
+            const oldPk = sortedUnique(table.pk);
+            const localDeps = table.fks.some(
+              (fk) =>
+                fk.refTable.toLowerCase() === table.name.toLowerCase() &&
+                sameSet(sortedUnique(fk.refColumns), oldPk),
+            );
+            const incomingDeps = [...snap.tables].some(
+              ([key, child]) =>
+                key.toLowerCase() !== oldKey &&
+                child.fks.some(
+                  (fk) =>
+                    fk.refTable.toLowerCase() === original.name.toLowerCase() &&
+                    sameSet(sortedUnique(fk.refColumns), oldPk),
+                ),
+            );
+            if (!action.cascade && (localDeps || incomingDeps))
+              throw engineError(
+                "dependent_objects_still_exist",
+                "cannot drop primary key because other objects depend on it",
+              );
+            if (action.cascade) {
+              table.fks = table.fks.filter(
+                (fk) =>
+                  fk.refTable.toLowerCase() !== table.name.toLowerCase() ||
+                  !sameSet(sortedUnique(fk.refColumns), oldPk),
+              );
+              cascadeUniqueCols.push(oldPk);
+            }
+            table.columns = table.columns.map((column, ci) =>
+              table.pk.includes(ci) ? { ...column, primaryKey: false } : column,
+            );
+            table.pk = [];
             continue;
           }
           if (action.kind === "addConstraint") {
@@ -4831,9 +4968,185 @@ export class Engine {
                 throw engineError("invalid_table_definition", "column is in a primary key");
               table.columns[ci] = { ...col, notNull: false };
               break;
+            case "setType": {
+              const oldColumn = col;
+              let target = this.buildAlterAddedColumn(
+                table,
+                {
+                  name: col.name,
+                  typeName: edit.action.typeName,
+                  typeMod: edit.action.typeMod,
+                  primaryKey: false,
+                  notNull: false,
+                  default: null,
+                  identity: null,
+                  collation: null,
+                },
+                [],
+                [],
+                tempScope,
+                attachmentScope,
+              );
+              if (
+                oldColumn.primaryKey &&
+                (target.type.kind === "composite" ||
+                  (target.type.kind === "array" && !typeIsArrayKeyable(target.type)) ||
+                  (target.type.kind !== "array" &&
+                    target.type.kind !== "range" &&
+                    !typeIsKeyableScalar(target.type)))
+              )
+                throw engineError(
+                  "feature_not_supported",
+                  `a ${typeCanonicalName(target.type)} primary key is not supported yet`,
+                );
+              if (col.identity !== null && !typeIsInteger(target.type))
+                throw engineError(
+                  "invalid_parameter_value",
+                  "identity column type must be smallint, integer, or bigint",
+                );
+              const source: Expr = edit.action.using ?? { kind: "column", name: col.name };
+              const cast: Expr = {
+                kind: "cast",
+                inner: source,
+                typeName: edit.action.typeName,
+                typeMod: edit.action.typeMod,
+              };
+              const resolved = resolve(
+                Scope.single(this, table),
+                cast,
+                null,
+                { collecting: false, groupKeys: [], specs: [] },
+                new ParamTypes(),
+              );
+              if (!resolvedTypeEqual(resolved.type, resolvedTypeOfCol(target.type, this)))
+                throw typeError(`USING expression is not of type ${typeCanonicalName(target.type)}`);
+              target = {
+                ...target,
+                primaryKey: oldColumn.primaryKey,
+                notNull: oldColumn.notNull,
+                identity: oldColumn.identity,
+              };
+              if (oldColumn.default !== null) {
+                const defaultCast: Expr = {
+                  kind: "cast",
+                  inner: { kind: "column", name: oldColumn.name },
+                  typeName: edit.action.typeName,
+                  typeMod: edit.action.typeMod,
+                };
+                const node = resolve(
+                  Scope.single(this, { ...table, columns: [oldColumn], pk: [], checks: [], indexes: [], fks: [], exclusions: [] }),
+                  defaultCast,
+                  null,
+                  { collecting: false, groupKeys: [], specs: [] },
+                  new ParamTypes(),
+                ).node;
+                const m = this.session.newMeter();
+                target = { ...target, default: evalExpr(node, [oldColumn.default], this.maintenanceEnv(new StmtRng()), m) };
+                prepCost += m.accrued;
+              } else if (oldColumn.defaultExpr !== null) {
+                const defaultCast: Expr = {
+                  kind: "cast",
+                  inner: oldColumn.defaultExpr.expr,
+                  typeName: edit.action.typeName,
+                  typeMod: edit.action.typeMod,
+                };
+                resolve(Scope.empty(this), defaultCast, null, { collecting: false, groupKeys: [], specs: [] }, new ParamTypes());
+                const tm = edit.action.typeMod,
+                  typeSql =
+                    tm === null
+                      ? edit.action.typeName
+                      : `${edit.action.typeName} (${tm.precision}${tm.scale === null ? "" : `, ${tm.scale}`})`;
+                target = {
+                  ...target,
+                  defaultExpr: {
+                    exprText: `CAST ( ${oldColumn.defaultExpr.exprText} AS ${typeSql} )`,
+                    expr: defaultCast,
+                  },
+                };
+              }
+              if (oldColumn.identity !== null) {
+                const oldScalar = typeAsScalar(oldColumn.type),
+                  newScalar = typeAsScalar(target.type),
+                  oldDtype =
+                    oldScalar === undefined ? undefined : seqDataTypeForScalar(oldScalar),
+                  newDtype =
+                    newScalar === undefined ? undefined : seqDataTypeForScalar(newScalar);
+                if (oldDtype === undefined || newDtype === undefined)
+                  throw new Error("identity column is integer");
+                const pi = pendingSerials.findIndex(
+                  (seq) =>
+                    seq.ownedBy !== undefined &&
+                    seq.ownedBy.table.toLowerCase() === table.name.toLowerCase() &&
+                    seq.ownedBy.column === ci,
+                );
+                if (pi >= 0)
+                  pendingSerials[pi] = retypeIdentitySequence(
+                    pendingSerials[pi]!,
+                    oldDtype,
+                    newDtype,
+                  );
+                else {
+                  const source = columnSources[ci];
+                  if (source?.kind !== "original")
+                    throw new Error("added identity column has pending sequence");
+                  const key = snap
+                    .sequencesOwnedBy(original.name)
+                    .find((name) => snap.sequence(name)?.ownedBy?.column === source.column);
+                  if (key === undefined) throw new Error("identity column has owned sequence");
+                  this.putSequenceRouted(
+                    retypeIdentitySequence(snap.sequence(key)!, oldDtype, newDtype),
+                  );
+                }
+              }
+              table.columns[ci] = target;
+              typeChangedColumns[ci] = true;
+              typeChanged = true;
+              rowSteps.push({ kind: "setType", column: ci, value: resolved.node });
+              for (const check of table.checks) addedConstraints.add(check.name.toLowerCase());
+              for (const index of table.indexes) addedConstraints.add(index.name.toLowerCase());
+              for (const fk of table.fks) addedConstraints.add(fk.name.toLowerCase());
+              for (const exclusion of table.exclusions)
+                addedConstraints.add(exclusion.name.toLowerCase());
+              break;
+            }
           }
         }
         break;
+      }
+    }
+
+    if (typeChanged) {
+      for (const fk of table.fks) {
+        const parent =
+          fk.refTable.toLowerCase() === table.name.toLowerCase() ? table : snap.table(fk.refTable)!;
+        fk.columns.forEach((local, i) => {
+          const ref = fk.refColumns[i]!;
+          if (!fkTypesEqual(table.columns[local]!.type, parent.columns[ref]!.type))
+            throw typeError(
+              `foreign key constraint ${fk.name} cannot be implemented: key columns ${table.columns[local]!.name} and ${parent.columns[ref]!.name} are of incompatible types: ${typeCanonicalName(table.columns[local]!.type)} and ${typeCanonicalName(parent.columns[ref]!.type)}`,
+            );
+        });
+      }
+      for (const [key, child] of snap.tables) {
+        if (key.toLowerCase() === oldKey) continue;
+        for (const fk of child.fks) {
+          if (fk.refTable.toLowerCase() !== original.name.toLowerCase()) continue;
+          if (
+            cascadeDroppedColumnFks.has(`${key.toLowerCase()}\0${fk.name.toLowerCase()}`) ||
+            cascadeUniqueCols.some((cols) => sameSet(cols, sortedUnique(fk.refColumns)))
+          )
+            continue;
+          fk.columns.forEach((local, i) => {
+            const oldRef = fk.refColumns[i]!,
+              newRef = columnSources.findIndex(
+                (source) => source.kind === "original" && source.column === oldRef,
+              );
+            if (newRef >= 0 && !fkTypesEqual(child.columns[local]!.type, table.columns[newRef]!.type))
+              throw typeError(
+                `foreign key constraint ${fk.name} cannot be implemented: key columns ${child.columns[local]!.name} and ${table.columns[newRef]!.name} are of incompatible types: ${typeCanonicalName(child.columns[local]!.type)} and ${typeCanonicalName(table.columns[newRef]!.type)}`,
+              );
+          });
+        }
       }
     }
 
@@ -4848,15 +5161,19 @@ export class Engine {
       table.pk.some((column, i) => {
         const source = columnSources[column];
         return source?.kind !== "original" || source.column !== original.pk[i];
-      });
+      }) ||
+      table.pk.some((column) => typeChangedColumns[column]);
+    const tableRewriteNeeded = rewriteNeeded || rowSteps.length > 0 || pkRekeyed;
     const rewriteColTypes =
-      !rewriteNeeded
+      !tableRewriteNeeded
         ? null
         : table.columns.map((c) => resolveColType(c.type, this.readSnap().types));
     const meter = this.session.newMeter();
+    meter.charge(prepCost);
+    meter.guard();
     let rewriteRows: Entry[] | null = null;
     let rewriteNextRowid = 0n;
-    if (rewriteNeeded) {
+    if (tableRewriteNeeded) {
       for (const seq of pendingSerials) {
         let sw: Snapshot;
         if (at.db === undefined) {
@@ -4874,37 +5191,32 @@ export class Engine {
       const store = this.lkpStoreScoped(at.db, original.name);
       const scan = store.scanWithUnits(original.columns.map(() => true));
       rewriteNextRowid = store.nextSyntheticRowid();
+      if (pkRekeyed && table.pk.length === 0) rewriteNextRowid = 0n;
       meter.charge(COSTS.pageRead * BigInt(scan.pages) + COSTS.valueDecompress * BigInt(scan.slabs));
-      const defaults = this.resolveDefaultExprs({
-        ...table,
-        columns: columnSources.flatMap((source) =>
-          source.kind === "added" ? [source.column] : [],
-        ),
-        pk: [],
-        checks: [],
-        indexes: [],
-        fks: [],
-        exclusions: [],
-      });
       const rng = new StmtRng();
+      const env = this.maintenanceEnv(rng);
       const colls = this.columnCollations(table.columns);
       const seenKeys = new Set<string>();
       let compressUnits = 0n;
       rewriteRows = scan.entries.map((entry) => {
         meter.guard();
         meter.charge(COSTS.storageRowRead);
-        const oldRow = store.resolveAll(entry.row);
-        let generated = 0;
-        const row = columnSources.map((source, i) => {
-          const value =
-            source.kind === "original"
-              ? oldRow[source.column]!
-              : this.evalDefault(source.column, defaults[generated++]!, rng, meter);
+        const row = [...store.resolveAll(entry.row)];
+        for (const step of rowSteps) {
+          if (step.kind === "add")
+            row.push(this.evalDefault(step.column, step.defaultExpr, rng, meter));
+          else if (step.kind === "drop") row.splice(step.column, 1);
+          else row[step.column] = evalExpr(step.value, row, env, meter);
+        }
+        row.forEach((value, i) => {
           if (table.columns[i]!.notNull && value.kind === "null")
             throw notNullViolation(table.columns[i]!.name);
-          return value;
         });
-        const key = pkRekeyed ? encodePkKey(table, table.pk, colls, row) : entry.key;
+        const key = pkRekeyed
+          ? table.pk.length === 0
+            ? encodeInt("i64", rewriteNextRowid++)
+            : encodePkKey(table, table.pk, colls, row)
+          : entry.key;
         if (pkRekeyed) {
           const hash = Array.from(key).join(",");
           if (seenKeys.has(hash)) throw uniqueViolation(table.name, pkeyName(table.name));

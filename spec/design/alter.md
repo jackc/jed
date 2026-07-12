@@ -9,13 +9,13 @@
 > reproduce identically (CLAUDE.md §2, §8). When a decision here changes, change the
 > data/grammar and here in the same edit.
 >
-> **Status: Slices 1–4 landed.** The canonical grammar and all three native cores implement the
+> **Status: Slices 1–5 landed.** The canonical grammar and all three native cores implement the
 > catalog-only frame: renames, column defaults/nullability, and `ADD`/`DROP CONSTRAINT` for CHECK,
 > UNIQUE, FOREIGN KEY, and EXCLUDE, including comma-action atomicity and validating scans; `ADD
 > COLUMN` appends the catalog column and atomically rebuilds the table (and re-keys it for an inline
-> PRIMARY KEY), and `DROP COLUMN` physically removes non-PK columns while compacting dependent
-> ordinals. Slice 5 remains designed but unimplemented; its grammar is recognized and
-> reports `0A000`.
+> PRIMARY KEY), `DROP COLUMN` physically removes non-PK columns while compacting dependent
+> ordinals, `ALTER COLUMN TYPE` converts each row, and standalone `ADD`/`DROP PRIMARY KEY` re-key
+> between declared keys and synthetic rowids.
 
 `ALTER TABLE` mutates a table's definition in place — its columns, its constraints, its
 name. It is the last major DDL gap: `CREATE TABLE` / `DROP TABLE` / `CREATE INDEX` /
@@ -53,6 +53,7 @@ alter_table_action  ::= "ADD" "COLUMN"? ("IF" "NOT" "EXISTS")? column_def
                       | "ADD" table_constraint
                       | "DROP" "COLUMN"? ("IF" "EXISTS")? identifier ("CASCADE" | "RESTRICT")?
                       | "DROP" "CONSTRAINT" ("IF" "EXISTS")? identifier ("CASCADE" | "RESTRICT")?
+                      | "DROP" "PRIMARY" "KEY" ("CASCADE" | "RESTRICT")?
                       | "ALTER" "COLUMN"? identifier alter_column_action
 alter_column_action ::= "SET" "DEFAULT" expr
                       | "DROP" "DEFAULT"
@@ -250,15 +251,33 @@ expression evaluated per row), re-validate against the column's constraints, and
 index/constraint that touches it. The hardest form: a failed cast is the cast's own error
 (`22003` overflow, `22P02` malformed, etc.); a `USING` expression is a general per-row
 expression over the row's columns. If the column is a key member, its key encoding changes, so
-the table (and dependent indexes) re-key — a full rebuild.
+the table (and dependent indexes) re-key — a full rebuild with final-key uniqueness validation.
+The target type must be key-encodable before PRIMARY KEY metadata is retained (`0A000` otherwise).
+
+The conversion uses jed's explicit cast matrix: without `USING`, the old column value is cast to
+the named target; with `USING`, the expression result is cast to it. Actions apply left-to-right,
+so a `USING` expression sees the row shape and types produced by earlier actions in the same
+statement. Existing defaults are converted and retained; an incompatible default aborts the ALTER.
+Every surviving CHECK, UNIQUE, FK, EXCLUDE, expression index, and partial predicate is re-resolved
+and validated against the end state, and all secondary indexes are rebuilt because an expression
+may reference the changed column indirectly.
+
+An IDENTITY column's owned sequence changes integer type atomically with the column, including a
+sequence pending from an earlier `ADD COLUMN` action in the same statement. Matching PostgreSQL,
+bounds equal to the old type defaults become the new type defaults, explicit bounds are preserved,
+and the sequence START/current value must fit the resulting type and bounds (`22023` otherwise).
 
 ### 3.4 `ADD` / `DROP PRIMARY KEY`
 
-Not catalog-only: the PK **is** the row key. `ADD PRIMARY KEY (…)` over a table currently on
+Not catalog-only: the PK **is** the row key. `ADD [CONSTRAINT name] PRIMARY KEY (…)` over a table currently on
 synthetic rowids re-keys every row onto the new key (validating uniqueness → `23505`, and
 NOT-NULL on each member → `23502`) — a full B-tree rebuild that **reuses the existing
 UPDATE-of-PK re-keying path** ([constraints.md §6.5/§6.7](constraints.md)). `DROP PRIMARY KEY`
-re-keys back to synthetic rowids. Both are rewrites; sequenced after §3.1–§3.3.
+re-keys back to fresh dense synthetic rowids in old-key scan order and retains the members' NOT NULL
+status (PostgreSQL also retains it). `RESTRICT` is the default and blocks a referenced PK with
+`2BP01`; `CASCADE` removes the dependent FKs. Both are rewrites; sequenced after §3.1–§3.3. jed
+still derives `<table>_pkey` rather than persisting a custom PK name; a name in the ADD spelling is
+accepted consistently with CREATE TABLE but does not create a renameable constraint object.
 
 ## 4. Validation semantics — end-state, two-phase
 
@@ -268,6 +287,8 @@ so a re-key or swap that is transiently invalid but finally valid **succeeds** w
 the intermediate step — the same documented divergence UNIQUE and UPDATE-PK re-keying already
 carry ([constraints.md §6.5](constraints.md)). The two-phase pass (validate the entire end
 state, then write) gives per-statement atomicity without cross-statement transactions.
+Incoming-FK validation reads this final cascade-adjusted state, so an FK removed by an earlier
+`DROP PRIMARY KEY CASCADE` or dependent-column cascade cannot reject a later type action.
 
 ## 5. Conformance and cost obligations
 
@@ -298,7 +319,9 @@ already exist — a small follow-on, not scheduled.
 | Dropped column | Physically removed; ordinals compacted; name/position reusable (§3.2) | Tombstoned (`attisdropped`); dead bytes retained; ordinal never reused | Dense-ordinal format has no tombstone slot; rewrite keeps the file clean (§0.1, CLAUDE.md §10) |
 | Validation timing | End-state (§4) | Per-row transient | jed's standing end-state model (constraints.md §6.5); a finally-valid re-key succeeds |
 | Column rename | Rewrites this table's stored expression text (§2.2) | Same effect via dependency graph | jed stores expression *text*, not a resolved node tree (§0.2) |
-| Rename PK constraint | `<t>_pkey` is `42704` — no named PK object (§2.3) | Renames the auto-named `<t>_pkey` | jed persists no PK/NOT NULL constraint object; a custom PK name needs a format field — deferred with §3.4 |
+| Rename PK constraint | `<t>_pkey` is `42704` — no named PK object (§2.3); an ADD-supplied name is not persisted (§3.4) | Renames the auto-named or explicit PK constraint | jed persists no PK/NOT NULL constraint object; keeping the derived handle avoids a format field |
+| Type conversion without `USING` | Uses jed's explicit `CAST` matrix (§3.3) | Requires an implicit/assignment cast | One canonical strict conversion matrix; potentially lossy conversions remain visibly bounded to DDL rather than relaxing assignment |
+| Drop-primary-key spelling | `DROP PRIMARY KEY [CASCADE\|RESTRICT]` (§3.4) | `DROP CONSTRAINT <name>` | jed has no persisted PK constraint object/name to address |
 | ALTER TABLE on a non-table | `42809` for an index or sequence | Lenient for some relation kinds | jed's ALTER TABLE owns only the table surface; object-specific ALTER statements remain separate |
 | Local DROP COLUMN dependency under RESTRICT | Blocks a same-table CHECK/index/FK/EXCLUDE with `2BP01`; `CASCADE` removes it (§3.2) | Automatically removes internally-dependent same-table objects even without `CASCADE`; RESTRICT mainly blocks external dependents | One explicit dependency rule for every ordinal/expression consumer keeps the dense-catalog rewrite legible; CASCADE makes destructive intent explicit |
 
@@ -314,7 +337,7 @@ Ordered lowest-risk → highest, each a vertical slice (CLAUDE.md §10):
 3. **✅ `ADD COLUMN`** — the first rewrite; per-row default evaluation, inline constraints, and
    inline-PK re-keying.
 4. **✅ `DROP COLUMN`** — the ordinal renumber + dependency cascade (non-PK columns).
-5. **`ALTER COLUMN TYPE`** + **`ADD`/`DROP PRIMARY KEY`** — the re-encode/re-key rewrites.
+5. **✅ `ALTER COLUMN TYPE`** + **`ADD`/`DROP PRIMARY KEY`** — the re-encode/re-key rewrites.
 
 ## 9. `format_version` impact
 

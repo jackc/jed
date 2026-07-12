@@ -1266,8 +1266,8 @@ class Parser {
     return { kind: "dropSequence", names, ifExists };
   }
 
-  // Parse ALTER TABLE's authoritative grammar frame (alter.md §1). Slices 1-4 execute RENAME,
-  // ADD/DROP COLUMN, catalog-only ALTER COLUMN edits, and ADD/DROP non-PK constraints.
+  // Parse ALTER TABLE's authoritative grammar frame (alter.md §1). Slices 1-5 execute the
+  // complete planned surface other than identity management.
   private parseAlterTable(): Statement {
     this.expectKeyword("alter");
     this.expectKeyword("table");
@@ -1353,6 +1353,18 @@ class Parser {
           this.advance();
           continue;
         }
+        if (this.atPrimaryKeyTableConstraint()) {
+          if (this.peekKeyword() === "constraint") {
+            this.advance();
+            this.expectIdentifier(); // jed derives the PK handle.
+          }
+          this.expectKeyword("primary");
+          this.expectKeyword("key");
+          actions.push({ kind: "addPrimaryKey", columns: this.parsePkColumnList() });
+          if (this.peek().kind !== "comma") break;
+          this.advance();
+          continue;
+        }
         const constraint = this.atCheckConstraint()
           ? { kind: "check" as const, def: this.parseCheckConstraint() }
           : this.atUniqueTableConstraint()
@@ -1362,14 +1374,23 @@ class Parser {
               : this.atExclusionTableConstraint()
                 ? { kind: "exclude" as const, def: this.parseExclusionTableConstraint() }
                 : null;
-        if (constraint === null)
-          throw engineError(
-            "feature_not_supported",
-            "ALTER TABLE ... ADD PRIMARY KEY is not supported yet",
-          );
+        if (constraint === null) throw new Error("constraint lookahead");
         actions.push({ kind: "addConstraint", constraint });
       } else if (this.peekKeyword() === "drop") {
         this.advance();
+        if (this.peekKeyword() === "primary") {
+          this.advance();
+          this.expectKeyword("key");
+          let cascade = false;
+          if (this.peekKeyword() === "cascade") {
+            this.advance();
+            cascade = true;
+          } else if (this.peekKeyword() === "restrict") this.advance();
+          actions.push({ kind: "dropPrimaryKey", cascade });
+          if (this.peek().kind !== "comma") break;
+          this.advance();
+          continue;
+        }
         const constraint = this.peekKeyword() === "constraint";
         if (constraint || this.peekKeyword() === "column") this.advance();
         let dropIfExists = false;
@@ -1407,12 +1428,11 @@ class Parser {
                 default: { expr, text: renderTokens(this.tokens.slice(start, this.pos)) },
               },
             };
-          } else if (this.peekKeyword() === "data")
-            throw engineError(
-              "feature_not_supported",
-              "ALTER COLUMN ... TYPE is not supported yet",
-            );
-          else {
+          } else if (this.peekKeyword() === "data") {
+            this.advance();
+            this.expectKeyword("type");
+            edit = { column, action: this.parseAlterColumnType() };
+          } else {
             this.expectKeyword("not");
             this.expectKeyword("null");
             edit = { column, action: { kind: "setNotNull" } };
@@ -1427,15 +1447,28 @@ class Parser {
             this.expectKeyword("null");
             edit = { column, action: { kind: "dropNotNull" } };
           }
-        } else if (this.peekKeyword() === "type")
-          throw engineError("feature_not_supported", "ALTER COLUMN ... TYPE is not supported yet");
-        else throw engineError("syntax_error", "ALTER COLUMN requires SET or DROP");
+        } else if (this.peekKeyword() === "type") {
+          this.advance();
+          edit = { column, action: this.parseAlterColumnType() };
+        } else throw engineError("syntax_error", "ALTER COLUMN requires SET or DROP");
         actions.push({ kind: "alterColumn", edit });
       }
       if (this.peek().kind !== "comma") break;
       this.advance();
     }
     return { kind: "alterTable", name, db, ifExists, action: { kind: "actions", actions } };
+  }
+
+  private parseAlterColumnType(): Extract<AlterColumnAction["action"], { kind: "setType" }> {
+    let typeName = this.expectIdentifier();
+    const typeMod = this.parseTypeMod();
+    if (this.consumeArrayBrackets()) typeName += "[]";
+    let using: Expr | null = null;
+    if (this.peekKeyword() === "using") {
+      this.advance();
+      using = this.parseExpr();
+    }
+    return { kind: "setType", typeName, typeMod, using };
   }
 
   // parseAlterSequence parses `ALTER SEQUENCE [IF EXISTS] <name> <action>` (spec/design/sequences.md

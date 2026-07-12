@@ -118,7 +118,7 @@ description = "ALTER SEQUENCE [IF EXISTS] name — beyond RESTART (ddl.sequence)
 
 [[capability]]
 id = "ddl.alter_table"
-description = "ALTER TABLE slices 1-4 (spec/design/alter.md): qualified targeting; standalone table/column/constraint renames; comma-combinable column default/nullability edits; ADD/DROP CHECK/UNIQUE/FOREIGN KEY/EXCLUDE constraints; and ADD COLUMN [IF NOT EXISTS] / DROP COLUMN [IF EXISTS] [RESTRICT|CASCADE]. Multi-actions apply left-to-right and publish all-or-nothing. ADD/DROP COLUMN perform one format-neutral table rewrite; ADD evaluates each old row's captured default through one statement entropy/clock seam and can create an inline PK, while DROP is limited to non-PK columns, physically removes the row slot, compacts every surviving ordinal, repairs incoming FKs/owned sequences, and drops column dependents under CASCADE (2BP01 under RESTRICT). ALTER COLUMN TYPE remains a recognized 0A000 deferral."
+description = "ALTER TABLE slices 1-5 (spec/design/alter.md): qualified targeting; standalone table/column/constraint renames; comma-combinable column default/nullability edits; ADD/DROP CHECK/UNIQUE/FOREIGN KEY/EXCLUDE constraints; ADD/DROP COLUMN; ALTER COLUMN TYPE [USING]; and standalone ADD/DROP PRIMARY KEY. Multi-actions apply left-to-right and publish all-or-nothing. Rewrite forms share one scan, re-encode changed values, validate the cascade-adjusted final constraint state, and rebuild/re-key affected table and index stores without changing the file format. A changed final PRIMARY KEY member is always re-keyed and keyability-checked; retyping an IDENTITY column atomically retypes its owned sequence bounds."
 
 [[capability]]
 id = "ddl.serial"
