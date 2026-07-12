@@ -1794,15 +1794,6 @@ impl Engine {
                             ));
                         }
                         let dropped_source = column_sources[ci].clone();
-                        let expr_uses =
-                            |e: &Expr| check_referenced_columns(e, &table.columns).contains(&ci);
-                        let check_dep = table.checks.iter().any(|c| expr_uses(&c.expr));
-                        let index_dep = table.indexes.iter().any(|ix| {
-                            ix.keys.iter().any(|k| match k {
-                                IndexKey::Column(c) => *c == ci,
-                                IndexKey::Expr(e) => expr_uses(&e.expr),
-                            }) || ix.predicate.as_ref().is_some_and(|p| expr_uses(&p.expr))
-                        });
                         // PostgreSQL owns an FK through its local (referencing) columns. Dropping
                         // one removes the whole FK under RESTRICT. A self-FK that uses the column
                         // only on the referenced side remains a dependency.
@@ -1817,10 +1808,6 @@ impl Engine {
                             .foreign_keys
                             .iter()
                             .any(|fk| fk_uses_self_ref_column(fk) && !fk_uses_local_column(fk));
-                        let exclusion_dep = table
-                            .exclusions
-                            .iter()
-                            .any(|e| e.elements.iter().any(|x| x.column == ci));
                         let incoming_dep = match column_sources[ci] {
                             ColumnSource::Original(old_ci) => snap.tables.iter().any(|(key, t)| {
                                 !key.eq_ignore_ascii_case(&old_key)
@@ -1838,13 +1825,7 @@ impl Engine {
                             }),
                             ColumnSource::Added => false,
                         };
-                        if !cascade
-                            && (check_dep
-                                || index_dep
-                                || self_ref_fk_dep
-                                || exclusion_dep
-                                || incoming_dep)
-                        {
+                        if !cascade && (self_ref_fk_dep || incoming_dep) {
                             return Err(EngineError::new(
                                 SqlState::DependentObjectsStillExist,
                                 format!(
@@ -1870,40 +1851,42 @@ impl Engine {
                                     }
                                 }
                             }
-                            let mut removed = Vec::<String>::new();
-                            table.checks.retain(|c| {
-                                let keep = !check_referenced_columns(&c.expr, &table.columns)
-                                    .contains(&ci);
-                                if !keep {
-                                    removed.push(c.name.to_ascii_lowercase());
-                                }
-                                keep
-                            });
-                            table.indexes.retain(|ix| {
-                                let uses = ix.keys.iter().any(|k| match k {
-                                    IndexKey::Column(c) => *c == ci,
-                                    IndexKey::Expr(e) => {
-                                        check_referenced_columns(&e.expr, &table.columns)
-                                            .contains(&ci)
-                                    }
-                                }) || ix.predicate.as_ref().is_some_and(|p| {
-                                    check_referenced_columns(&p.expr, &table.columns).contains(&ci)
-                                });
-                                if uses {
-                                    removed.push(ix.name.to_ascii_lowercase());
-                                }
-                                !uses
-                            });
-                            table.exclusions.retain(|e| {
-                                let uses = e.elements.iter().any(|x| x.column == ci);
-                                if uses {
-                                    removed.push(e.name.to_ascii_lowercase());
-                                }
-                                !uses
-                            });
-                            for name in removed {
-                                added_constraints.remove(&name);
+                        }
+                        // PostgreSQL treats same-table CHECKs, indexes (including UNIQUE), and
+                        // EXCLUDE constraints as internally dependent on their columns. They
+                        // disappear even under RESTRICT; CASCADE is for external dependents.
+                        let mut removed = Vec::<String>::new();
+                        table.checks.retain(|c| {
+                            let keep =
+                                !check_referenced_columns(&c.expr, &table.columns).contains(&ci);
+                            if !keep {
+                                removed.push(c.name.to_ascii_lowercase());
                             }
+                            keep
+                        });
+                        table.indexes.retain(|ix| {
+                            let uses = ix.keys.iter().any(|k| match k {
+                                IndexKey::Column(c) => *c == ci,
+                                IndexKey::Expr(e) => {
+                                    check_referenced_columns(&e.expr, &table.columns).contains(&ci)
+                                }
+                            }) || ix.predicate.as_ref().is_some_and(|p| {
+                                check_referenced_columns(&p.expr, &table.columns).contains(&ci)
+                            });
+                            if uses {
+                                removed.push(ix.name.to_ascii_lowercase());
+                            }
+                            !uses
+                        });
+                        table.exclusions.retain(|e| {
+                            let uses = e.elements.iter().any(|x| x.column == ci);
+                            if uses {
+                                removed.push(e.name.to_ascii_lowercase());
+                            }
+                            !uses
+                        });
+                        for name in removed {
+                            added_constraints.remove(&name);
                         }
                         // A local-side FK is internally owned by the dropped column and disappears
                         // without CASCADE. CASCADE also removes referenced-side-only self-FKs.

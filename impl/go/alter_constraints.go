@@ -38,10 +38,6 @@ func dropAlterColumn(t *catTable, d *alterDropColumn, snap *snapshot, original *
 	}
 	droppedSource := (*sources)[ci]
 	usesExpr := func(e exprNode) bool { return slices.Contains(checkReferencedColumns(e, t.Columns), ci) }
-	checkDep := false
-	for _, c := range t.Checks {
-		checkDep = checkDep || usesExpr(c.Expr)
-	}
 	indexUses := func(ix indexDef) bool {
 		for _, key := range ix.Keys {
 			if (key.Expr == nil && key.Col == ci) || (key.Expr != nil && usesExpr(key.Expr.Expr)) {
@@ -49,10 +45,6 @@ func dropAlterColumn(t *catTable, d *alterDropColumn, snap *snapshot, original *
 			}
 		}
 		return ix.Predicate != nil && usesExpr(ix.Predicate.Expr)
-	}
-	indexDep := false
-	for _, ix := range t.Indexes {
-		indexDep = indexDep || indexUses(ix)
 	}
 	// PostgreSQL owns an FK through its local (referencing) columns. Dropping one of those
 	// columns removes the whole FK even under RESTRICT. A self-referential FK that uses the
@@ -64,12 +56,6 @@ func dropAlterColumn(t *catTable, d *alterDropColumn, snap *snapshot, original *
 	selfRefFkDep := false
 	for _, fk := range t.ForeignKeys {
 		selfRefFkDep = selfRefFkDep || (fkUsesSelfRefColumn(fk) && !fkUsesLocalColumn(fk))
-	}
-	exclusionDep := false
-	for _, ex := range t.Exclusions {
-		for _, el := range ex.Elements {
-			exclusionDep = exclusionDep || el.Column == ci
-		}
 	}
 	incomingDep := false
 	if source := droppedSource; source.original >= 0 {
@@ -88,7 +74,7 @@ func dropAlterColumn(t *catTable, d *alterDropColumn, snap *snapshot, original *
 			}
 		}
 	}
-	if !d.Cascade && (checkDep || indexDep || selfRefFkDep || exclusionDep || incomingDep) {
+	if !d.Cascade && (selfRefFkDep || incomingDep) {
 		return newError(DependentObjectsStillExist, "cannot drop column "+d.Name+" because other objects depend on it")
 	}
 	if d.Cascade && (*sources)[ci].original >= 0 {
@@ -115,39 +101,40 @@ func dropAlterColumn(t *catTable, d *alterDropColumn, snap *snapshot, original *
 			}
 		}
 	}
-	if d.Cascade {
-		checks := t.Checks[:0]
-		for _, c := range t.Checks {
-			if usesExpr(c.Expr) {
-				delete(st.added, strings.ToLower(c.Name))
-			} else {
-				checks = append(checks, c)
-			}
+	// PostgreSQL treats same-table CHECKs, indexes (including UNIQUE), and EXCLUDE
+	// constraints as internally dependent on their columns. They disappear even under
+	// RESTRICT; CASCADE is needed only for external dependents such as incoming FKs.
+	checks := t.Checks[:0]
+	for _, c := range t.Checks {
+		if usesExpr(c.Expr) {
+			delete(st.added, strings.ToLower(c.Name))
+		} else {
+			checks = append(checks, c)
 		}
-		t.Checks = checks
-		indexes := t.Indexes[:0]
-		for _, ix := range t.Indexes {
-			if indexUses(ix) {
-				delete(st.added, strings.ToLower(ix.Name))
-			} else {
-				indexes = append(indexes, ix)
-			}
-		}
-		t.Indexes = indexes
-		exclusions := t.Exclusions[:0]
-		for _, ex := range t.Exclusions {
-			uses := false
-			for _, el := range ex.Elements {
-				uses = uses || el.Column == ci
-			}
-			if uses {
-				delete(st.added, strings.ToLower(ex.Name))
-			} else {
-				exclusions = append(exclusions, ex)
-			}
-		}
-		t.Exclusions = exclusions
 	}
+	t.Checks = checks
+	indexes := t.Indexes[:0]
+	for _, ix := range t.Indexes {
+		if indexUses(ix) {
+			delete(st.added, strings.ToLower(ix.Name))
+		} else {
+			indexes = append(indexes, ix)
+		}
+	}
+	t.Indexes = indexes
+	exclusions := t.Exclusions[:0]
+	for _, ex := range t.Exclusions {
+		uses := false
+		for _, el := range ex.Elements {
+			uses = uses || el.Column == ci
+		}
+		if uses {
+			delete(st.added, strings.ToLower(ex.Name))
+		} else {
+			exclusions = append(exclusions, ex)
+		}
+	}
+	t.Exclusions = exclusions
 	// Local-side FKs are internally owned by the dropped column and disappear without CASCADE.
 	// CASCADE additionally removes a self-reference that depends only on the referenced side.
 	fks := t.ForeignKeys[:0]

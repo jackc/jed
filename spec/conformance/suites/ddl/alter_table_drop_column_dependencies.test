@@ -1,6 +1,7 @@
-# DROP COLUMN dependency behavior that remains deliberately stricter than PostgreSQL for same-table
-# CHECK/index/EXCLUDE objects (alter.md §3.2/§7): RESTRICT blocks them; CASCADE removes them.
-# jed-specific; do not PostgreSQL-oracle-check.
+# DROP COLUMN dependency behavior (alter.md §3.2): same-table CHECK/index/EXCLUDE objects and a
+# local-side FK are internally dependent and disappear under RESTRICT; external FKs still require
+# CASCADE. Dense-ordinal introspection and DROP-PK narrowing make this file non-oracle despite the
+# PostgreSQL-matched dependency rule.
 # requires: ddl.alter_table, ddl.create_table, ddl.primary_key, ddl.column_default, ddl.check, ddl.unique, ddl.foreign_key, ddl.secondary_index, ddl.index_expr, ddl.index_partial, ddl.exclusion_constraint, dml.insert, query.select, query.order_by, introspect.columns, types.i32, types.range, expr.arithmetic
 
 statement ok
@@ -15,27 +16,29 @@ CREATE INDEX alter_drop_partial ON alter_drop_deps (keep) WHERE doomed > 0
 statement ok
 INSERT INTO alter_drop_deps VALUES (1, 2, 7, '[1,5)')
 
-statement error 2BP01
-ALTER TABLE alter_drop_deps DROP doomed
-
-# RESTRICT failure is atomic.
-query III nosort
-SELECT id, doomed, keep FROM alter_drop_deps
-----
-1
-2
-7
-
 statement ok
-ALTER TABLE alter_drop_deps DROP doomed CASCADE
+ALTER TABLE alter_drop_deps DROP doomed
 
 # CHECK/UNIQUE/expression/partial dependents disappeared; unrelated EXCLUDE survived its ordinal
 # compaction and still rejects overlap.
+query II nosort
+SELECT id, keep FROM alter_drop_deps
+----
+1
+7
+
 statement ok
 INSERT INTO alter_drop_deps VALUES (2, 7, '[6,9)')
 
 statement error 23P01
 INSERT INTO alter_drop_deps VALUES (3, 8, '[4,7)')
+
+# An EXCLUDE constraint is likewise internally dependent on its indexed column.
+statement ok
+ALTER TABLE alter_drop_deps DROP span
+
+statement ok
+INSERT INTO alter_drop_deps VALUES (3, 8)
 
 statement ok
 CREATE TABLE alter_drop_fk_parent (id i32 PRIMARY KEY, doomed i32 UNIQUE, keep i32 UNIQUE)

@@ -214,14 +214,15 @@ before the cost ceiling is checked and before the rewrite is published.
 
 Remove the column and rewrite each leaf without its region — **and renumber every surviving
 positional reference** (§0.1): each `pk_ordinal` / `key_element` / FK / `excl_col_ordinal`
-greater than the dropped ordinal decrements by one. Dependency handling: under `RESTRICT`
-(default), an index / constraint / PK that uses the column normally blocks the drop (`2BP01`), and
-`CASCADE` drops those dependents first. The PostgreSQL-matched exception is a FOREIGN KEY owned by
-its local (referencing) columns: dropping any such column automatically drops the whole FK even
-under `RESTRICT`. An FK that uses the column only on its referenced side (including a
-self-referential FK) remains an external dependency and blocks without `CASCADE`. Dropping a column also
-rewrites any stored expression text (§0.2) that survives — and a `CHECK`/index expression that
-*referenced the dropped column* is itself dropped (RESTRICT: `2BP01`; CASCADE: dropped).
+greater than the dropped ordinal decrements by one. Dependency handling matches PostgreSQL's
+internal/external distinction: same-table `CHECK`, index (including a UNIQUE backing index), and
+`EXCLUDE` objects that use the column are internally dependent and are dropped automatically even
+under `RESTRICT` (the default). A FOREIGN KEY owned by the column through its local (referencing)
+side is likewise dropped automatically. An FK that uses the column only on its referenced side
+(including a self-referential FK) is an external dependency and blocks with `2BP01` unless
+`CASCADE` drops it. Dropping a column also rewrites any stored expression text (§0.2) that survives;
+a `CHECK`, expression index, or partial-index predicate that referenced the column is removed with
+its owning object.
 Dropping a **PK member** implies dropping the whole PK and re-keying to synthetic rowid (§3.4)
 — the hairy case; deferred to its own slice. A column referenced by a **parent** FK (this
 table is the parent) blocks under RESTRICT.
@@ -326,7 +327,6 @@ already exist — a small follow-on, not scheduled.
 | Type conversion without `USING` | Uses jed's explicit `CAST` matrix (§3.3) | Requires an implicit/assignment cast | One canonical strict conversion matrix; potentially lossy conversions remain visibly bounded to DDL rather than relaxing assignment |
 | Drop-primary-key spelling | `DROP PRIMARY KEY [CASCADE\|RESTRICT]` (§3.4) | `DROP CONSTRAINT <name>` | jed has no persisted PK constraint object/name to address |
 | ALTER TABLE on a non-table | `42809` for an index or sequence | Lenient for some relation kinds | jed's ALTER TABLE owns only the table surface; object-specific ALTER statements remain separate |
-| Local DROP COLUMN dependency under RESTRICT | Automatically removes a FOREIGN KEY owned by a dropped local/referencing column (PG-matched); still blocks a same-table CHECK/index/EXCLUDE with `2BP01` (§3.2) | Automatically removes every internally-dependent same-table object without `CASCADE`; RESTRICT mainly blocks external dependents | FK ownership follows PG; the remaining explicit rule for stored-expression/index consumers keeps the dense-catalog rewrite legible |
 
 ## 8. Slicing
 

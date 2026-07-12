@@ -108,13 +108,15 @@ removes dependent foreign keys. `ADD COLUMN` rewrites existing rows with the col
 null), evaluates expression defaults once per row, and accepts the same inline constraints as
 `CREATE TABLE`; `IF NOT EXISTS` is available. A non-empty table cannot add a `NOT NULL` column with
 no usable default (`23502`). `DROP COLUMN` also rewrites the table, physically removes the row slot,
-and compacts surviving ordinals. It defaults to `RESTRICT` (`2BP01` when an index or constraint uses
-the column); `CASCADE` removes those dependents, including foreign keys from other tables. `ALTER
-COLUMN TYPE` converts every row through jed's explicit cast matrix, or through a per-row `USING`
-expression, then revalidates constraints and rebuilds indexes. `ADD PRIMARY KEY` validates NOT NULL
-and uniqueness before re-keying; `DROP PRIMARY KEY` re-keys to synthetic rowids and retains member
-NOT NULL status. ALTER TABLE does not yet manage identity properties. Identity-column defaults and
-nullability must be managed through the future
+and compacts surviving ordinals. As in PostgreSQL, same-table CHECK, index (including UNIQUE), and
+EXCLUDE dependents are removed automatically, as is a foreign key that owns the column on its local
+side. The default `RESTRICT` mode still reports `2BP01` for external dependents such as a foreign key
+that references the column from another table; `CASCADE` removes those too. `ALTER COLUMN TYPE`
+converts every row through jed's explicit cast matrix, or through a per-row `USING` expression, then
+revalidates constraints and rebuilds indexes. `ADD PRIMARY KEY` validates NOT NULL and uniqueness
+before re-keying; `DROP PRIMARY KEY` re-keys to synthetic rowids and retains member NOT NULL status.
+ALTER TABLE does not yet manage identity properties. Identity-column defaults and nullability must be
+managed through the future
 identity-specific syntax rather than the generic column actions. PRIMARY KEY has no persisted constraint
 object, so renaming the derived `account_pkey` handle reports `42704`; an explicit name on an added
 primary key is accepted but the handle remains derived.

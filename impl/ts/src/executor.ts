@@ -4495,12 +4495,10 @@ export class Engine {
                 "dropping a primary-key column is not supported yet",
               );
             const usesExpr = (expr: Expr) => checkReferencedColumns(expr, table.columns).includes(ci);
-            const checkDep = table.checks.some((c) => usesExpr(c.expr));
             const indexUses = (index: IndexDef) =>
               index.keys.some((key) =>
                 key.kind === "column" ? key.column === ci : usesExpr(key.expr),
               ) || (index.predicate !== undefined && usesExpr(index.predicate.expr));
-            const indexDep = table.indexes.some(indexUses);
             // PostgreSQL owns an FK through its local (referencing) columns. Dropping one removes
             // the whole FK under RESTRICT. A self-FK that uses the column only on the referenced
             // side remains a dependency.
@@ -4510,9 +4508,6 @@ export class Engine {
               fk.refColumns.includes(ci);
             const selfRefFkDep = table.fks.some(
               (fk) => fkUsesSelfRefColumn(fk) && !fkUsesLocalColumn(fk),
-            );
-            const exclusionDep = table.exclusions.some((ex) =>
-              ex.elements.some((el) => el.column === ci),
             );
             const source = columnSources[ci]!;
             const incomingDep =
@@ -4528,10 +4523,7 @@ export class Engine {
                       !cascadeUniqueCols.some((cols) => sameSet(sortedUnique(fk.refColumns), cols)),
                   ),
               );
-            if (
-              !action.cascade &&
-              (checkDep || indexDep || selfRefFkDep || exclusionDep || incomingDep)
-            )
+            if (!action.cascade && (selfRefFkDep || incomingDep))
               throw engineError(
                 "dependent_objects_still_exist",
                 `cannot drop column ${action.name} because other objects depend on it`,
@@ -4548,22 +4540,25 @@ export class Engine {
                         cascadeDroppedColumnFks.add(
                           `${key.toLowerCase()}\0${fk.name.toLowerCase()}`,
                         );
-              table.checks = table.checks.filter((check) => {
-                const keep = !usesExpr(check.expr);
-                if (!keep) added.delete(check.name.toLowerCase());
-                return keep;
-              });
-              table.indexes = table.indexes.filter((index) => {
-                const keep = !indexUses(index);
-                if (!keep) added.delete(index.name.toLowerCase());
-                return keep;
-              });
-              table.exclusions = table.exclusions.filter((ex) => {
-                const keep = !ex.elements.some((el) => el.column === ci);
-                if (!keep) added.delete(ex.name.toLowerCase());
-                return keep;
-              });
             }
+            // PostgreSQL treats same-table CHECKs, indexes (including UNIQUE), and EXCLUDE
+            // constraints as internally dependent on their columns. They disappear even under
+            // RESTRICT; CASCADE is needed only for external dependents such as incoming FKs.
+            table.checks = table.checks.filter((check) => {
+              const keep = !usesExpr(check.expr);
+              if (!keep) added.delete(check.name.toLowerCase());
+              return keep;
+            });
+            table.indexes = table.indexes.filter((index) => {
+              const keep = !indexUses(index);
+              if (!keep) added.delete(index.name.toLowerCase());
+              return keep;
+            });
+            table.exclusions = table.exclusions.filter((ex) => {
+              const keep = !ex.elements.some((el) => el.column === ci);
+              if (!keep) added.delete(ex.name.toLowerCase());
+              return keep;
+            });
             // A local-side FK is internally owned by the dropped column and disappears without
             // CASCADE. CASCADE also removes referenced-side-only self-FKs.
             table.fks = table.fks.filter((fk) => {

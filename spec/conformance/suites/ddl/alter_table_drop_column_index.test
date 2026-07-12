@@ -1,0 +1,54 @@
+# DROP COLUMN automatically removes every same-table index that depends on the column, matching
+# PostgreSQL: plain/multicolumn, expression, partial, and UNIQUE-backing indexes all disappear under
+# the default RESTRICT mode. Reusing their relation names proves the catalog objects were removed.
+# requires: ddl.alter_table, ddl.create_table, ddl.primary_key, ddl.check, ddl.unique, ddl.secondary_index, ddl.index_expr, ddl.index_partial, dml.insert, query.select, query.order_by, types.i32, expr.arithmetic
+
+statement ok
+CREATE TABLE alter_drop_index_auto (id i32 PRIMARY KEY, doomed i32, keep i32, CONSTRAINT alter_drop_index_check CHECK (doomed > 0), CONSTRAINT alter_drop_index_unique UNIQUE (doomed))
+
+statement ok
+CREATE INDEX alter_drop_index_plain ON alter_drop_index_auto (doomed)
+
+statement ok
+CREATE INDEX alter_drop_index_multi ON alter_drop_index_auto (doomed, keep)
+
+statement ok
+CREATE INDEX alter_drop_index_expr ON alter_drop_index_auto ((doomed + 1))
+
+statement ok
+CREATE INDEX alter_drop_index_partial ON alter_drop_index_auto (keep) WHERE doomed > 0
+
+statement ok
+INSERT INTO alter_drop_index_auto VALUES (1, 10, 7)
+
+statement ok
+ALTER TABLE alter_drop_index_auto DROP COLUMN doomed
+
+statement ok
+CREATE INDEX alter_drop_index_plain ON alter_drop_index_auto (keep)
+
+statement ok
+CREATE INDEX alter_drop_index_multi ON alter_drop_index_auto (keep, id)
+
+statement ok
+CREATE INDEX alter_drop_index_expr ON alter_drop_index_auto ((keep + 1))
+
+statement ok
+CREATE INDEX alter_drop_index_partial ON alter_drop_index_auto (id) WHERE keep > 0
+
+statement ok
+CREATE INDEX alter_drop_index_unique ON alter_drop_index_auto (keep)
+
+statement ok
+ALTER TABLE alter_drop_index_auto ADD CONSTRAINT alter_drop_index_check CHECK (keep > 0)
+
+statement ok
+INSERT INTO alter_drop_index_auto VALUES (2, 7)
+
+query II nosort
+SELECT id, keep FROM alter_drop_index_auto ORDER BY id
+----
+1
+7
+2
+7
