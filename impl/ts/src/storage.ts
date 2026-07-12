@@ -135,6 +135,10 @@ export class TableStore {
     if (n > this.nextRowid) this.nextRowid = n;
   }
 
+  nextSyntheticRowid(): bigint {
+    return this.nextRowid;
+  }
+
   // replace overwrites the row stored at an existing key (UPDATE). The key is
   // unchanged, so key order and the rowid counter are untouched. May fault the target leaf.
   replace(key: Uint8Array, row: Row): void {

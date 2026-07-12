@@ -647,6 +647,18 @@ class Parser {
     return this.peekKeyword() === "constraint" && this.peekKeywordAt(2) === "unique";
   }
 
+  // Whether the cursor sits on a table-level PRIMARY KEY constraint, including the named form.
+  // ALTER TABLE uses this to keep the authoritative-but-deferred ADD PRIMARY KEY grammar on its
+  // 0A000 path instead of parsing `primary key` as a column name and type.
+  private atPrimaryKeyTableConstraint(): boolean {
+    if (this.peekKeyword() === "primary" && this.peekKeywordAt(1) === "key") return true;
+    return (
+      this.peekKeyword() === "constraint" &&
+      this.peekKeywordAt(2) === "primary" &&
+      this.peekKeywordAt(3) === "key"
+    );
+  }
+
   // parseUniqueTableConstraint parses one table-level `[CONSTRAINT name] UNIQUE ( col [,
   // col]* )` (the cursor is verified by atUniqueTableConstraint). The member list reuses
   // the PRIMARY KEY list shape (spec/design/grammar.md §31).
@@ -1254,8 +1266,8 @@ class Parser {
     return { kind: "dropSequence", names, ifExists };
   }
 
-  // Parse ALTER TABLE's authoritative grammar frame (alter.md §1). Slices 1-2 execute RENAME,
-  // catalog-only ALTER COLUMN edits, and ADD/DROP non-PK constraints.
+  // Parse ALTER TABLE's authoritative grammar frame (alter.md §1). Slices 1-3 execute RENAME,
+  // ADD COLUMN, catalog-only ALTER COLUMN edits, and ADD/DROP non-PK constraints.
   private parseAlterTable(): Statement {
     this.expectKeyword("alter");
     this.expectKeyword("table");
@@ -1305,11 +1317,42 @@ class Parser {
     for (;;) {
       if (this.peekKeyword() === "add") {
         this.advance();
-        if (this.peekKeyword() === "column")
-          throw engineError(
-            "feature_not_supported",
-            "ALTER TABLE ... ADD COLUMN is not supported yet",
-          );
+        const columnNoise = this.peekKeyword() === "column";
+        if (columnNoise) this.advance();
+        let addIfNotExists = false;
+        if (this.peekKeyword() === "if") {
+          this.advance();
+          this.expectKeyword("not");
+          this.expectKeyword("exists");
+          addIfNotExists = true;
+        }
+        if (
+          columnNoise ||
+          addIfNotExists ||
+          !(
+            this.atCheckConstraint() ||
+            this.atUniqueTableConstraint() ||
+            this.atForeignKeyTableConstraint() ||
+            this.atExclusionTableConstraint() ||
+            this.atPrimaryKeyTableConstraint()
+          )
+        ) {
+          const checks: CheckDef[] = [];
+          const uniques: UniqueDef[] = [];
+          const foreignKeys: ForeignKeyDef[] = [];
+          const column = this.parseColumnDef(name, checks, uniques, foreignKeys);
+          actions.push({
+            kind: "addColumn",
+            column,
+            checks,
+            uniques,
+            foreignKeys,
+            ifNotExists: addIfNotExists,
+          });
+          if (this.peek().kind !== "comma") break;
+          this.advance();
+          continue;
+        }
         const constraint = this.atCheckConstraint()
           ? { kind: "check" as const, def: this.parseCheckConstraint() }
           : this.atUniqueTableConstraint()
@@ -1322,7 +1365,7 @@ class Parser {
         if (constraint === null)
           throw engineError(
             "feature_not_supported",
-            "ALTER TABLE ... ADD COLUMN or PRIMARY KEY is not supported yet",
+            "ALTER TABLE ... ADD PRIMARY KEY is not supported yet",
           );
         actions.push({ kind: "addConstraint", constraint });
       } else if (this.peekKeyword() === "drop") {

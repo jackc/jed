@@ -174,6 +174,10 @@ impl TableStore {
         }
     }
 
+    pub(crate) fn next_rowid(&self) -> i64 {
+        self.next_rowid
+    }
+
     /// Replace the row stored at an existing key (UPDATE). The key is unchanged, so
     /// key order and the rowid counter are untouched. The caller only replaces keys it
     /// just found, so the overwrite always lands on a present key. May fault the target leaf.

@@ -712,6 +712,21 @@ export class Snapshot {
     }
   }
 
+  alterTableRewrite(
+    table: Table,
+    colTypes: ColType[],
+    entries: Entry[],
+    nextRowid: bigint,
+    pageSize: number,
+  ): void {
+    this.putTableResolved(table, colTypes, pageSize);
+    const store = this.store(table.name);
+    store.bumpRowidTo(nextRowid);
+    for (const entry of entries)
+      if (!store.insert(entry.key, entry.row))
+        throw new Error("ADD COLUMN retains distinct existing storage keys");
+  }
+
   syncAlterConstraintIndexes(
     old: Table,
     next: Table,
@@ -732,6 +747,26 @@ export class Snapshot {
       if (this.storePaging !== null) s.attachPaging(this.storePaging);
       for (const e of entries.get(k) ?? []) s.insert(e, []);
       this.indexStores.set(k, s);
+    }
+  }
+
+  rebuildAlterIndexes(
+    old: Table,
+    next: Table,
+    entries: Map<string, Uint8Array[]>,
+    pageSize: number,
+  ): void {
+    for (const index of old.indexes) {
+      const key = index.name.toLowerCase();
+      this.indexStores.delete(key);
+      this.gistTrees.delete(key);
+    }
+    for (const index of next.indexes) {
+      const key = index.name.toLowerCase();
+      const store = new TableStore(pagePayload(pageSize), []);
+      if (this.storePaging !== null) store.attachPaging(this.storePaging);
+      for (const entry of entries.get(key) ?? []) store.insert(entry, []);
+      this.indexStores.set(key, store);
     }
   }
 

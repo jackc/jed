@@ -40,7 +40,7 @@ type statement struct {
 	Rollback *rollback
 }
 
-// alterTable is ALTER TABLE slices 1-2 (spec/design/alter.md): one standalone rename or a
+// alterTable is ALTER TABLE slices 1-3 (spec/design/alter.md): one standalone rename or a
 // comma-separated mixed action list. Exactly one Rename* field or Actions is populated.
 type alterTable struct {
 	Name             string
@@ -55,9 +55,18 @@ type alterTable struct {
 type renamePair struct{ Old, New string }
 
 type alterTableEdit struct {
-	Column *alterColumnAction
-	Add    *alterConstraintDef
-	Drop   *dropConstraintDef
+	Column    *alterColumnAction
+	AddColumn *alterAddColumn
+	Add       *alterConstraintDef
+	Drop      *dropConstraintDef
+}
+
+type alterAddColumn struct {
+	Column      columnDef
+	Checks      []checkDef
+	Uniques     []uniqueDef
+	ForeignKeys []foreignKeyDef
+	IfNotExists bool
 }
 
 type alterConstraintDef struct {

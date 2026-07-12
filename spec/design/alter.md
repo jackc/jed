@@ -9,10 +9,12 @@
 > reproduce identically (CLAUDE.md §2, §8). When a decision here changes, change the
 > data/grammar and here in the same edit.
 >
-> **Status: Slices 1–2 landed.** The canonical grammar and all three native cores implement the
+> **Status: Slices 1–3 landed.** The canonical grammar and all three native cores implement the
 > catalog-only frame: renames, column defaults/nullability, and `ADD`/`DROP CONSTRAINT` for CHECK,
-> UNIQUE, FOREIGN KEY, and EXCLUDE, including comma-action atomicity and validating scans. Slices
-> 3–5 remain designed but unimplemented; their grammar is recognized and reports `0A000`.
+> UNIQUE, FOREIGN KEY, and EXCLUDE, including comma-action atomicity and validating scans; `ADD
+> COLUMN` appends the catalog column and atomically rebuilds the table (and re-keys it for an inline
+> PRIMARY KEY). Slices 4–5 remain designed but unimplemented; their grammar is recognized and
+> reports `0A000`.
 
 `ALTER TABLE` mutates a table's definition in place — its columns, its constraints, its
 name. It is the last major DDL gap: `CREATE TABLE` / `DROP TABLE` / `CREATE INDEX` /
@@ -195,6 +197,17 @@ default over a non-empty table is `23502` (PG-faithful). Inline `UNIQUE` / `PRIM
 `REFERENCES` validate as in §2.6/§3.4; a `serial` / `IDENTITY` column auto-creates its owned
 sequence ([sequences.md](sequences.md)).
 
+**Implemented slice-3 details.** Multiple added columns share one key-ordered rewrite scan and one
+statement entropy/clock seam. The value placed into old rows is the default captured by that `ADD`
+action; a later comma-action `ALTER c SET DEFAULT ...` changes future inserts, not the scheduled
+rewrite value. An inline PRIMARY KEY is legal only when the table has no PK, re-encodes every table
+key, and rebuilds every secondary-index suffix; duplicate rewritten keys are `23505` on `<t>_pkey`.
+The rewrite retains the no-PK synthetic-rowid high-water when no PK is added. All validation and
+sequence advancement are statement-atomic. Owned-sequence auto-naming reserves named inline index
+additions, and later index actions see pending owned sequences, so the two cannot overlap in the
+shared relation namespace; each replacement row also pays the ordinary `value_compress` write charge
+before the cost ceiling is checked and before the rewrite is published.
+
 ### 3.2 `DROP COLUMN`
 
 Remove the column and rewrite each leaf without its region — **and renumber every surviving
@@ -283,7 +296,8 @@ Ordered lowest-risk → highest, each a vertical slice (CLAUDE.md §10):
    `SET/DROP NOT NULL`. Zero format risk; establishes the whole scaffold.
 2. **✅ `ADD` / `DROP CONSTRAINT`** — `CHECK` / `UNIQUE` / `FOREIGN KEY` / `EXCLUDE` with the
    validating scan (retires the FK/EXCLUDE `ADD CONSTRAINT` follow-ons in TODO).
-3. **`ADD COLUMN`** — the first rewrite; per-row default evaluation.
+3. **✅ `ADD COLUMN`** — the first rewrite; per-row default evaluation, inline constraints, and
+   inline-PK re-keying.
 4. **`DROP COLUMN`** — the ordinal renumber + dependency cascade (non-PK columns).
 5. **`ALTER COLUMN TYPE`** + **`ADD`/`DROP PRIMARY KEY`** — the re-encode/re-key rewrites.
 

@@ -103,6 +103,17 @@ test("UPDATE meters compress attempts per rewritten row", () => {
   assert.equal(big, small + SLABS_600);
 });
 
+test("ALTER ADD COLUMN meters compress attempts per rewritten row", () => {
+  const db = twoTables();
+  const readDelta = cost(db, "SELECT * FROM comp") - cost(db, "SELECT * FROM control");
+  const comp = cost(db, "ALTER TABLE comp ADD extra i32");
+  const control = cost(db, "ALTER TABLE control ADD extra i32");
+  // Both ALTERs do the same scan/rewrite. The compressed table additionally pays the old value's
+  // decompression slabs plus the replacement row's fresh compression attempt.
+  assert.equal(readDelta, SLABS_600);
+  assert.equal(comp, control + readDelta + SLABS_600);
+});
+
 test("decimal payloads compress too", () => {
   // A long-coefficient decimal's body is a spillable payload like text/bytea
   // (large-values.md §12/§13): 801 digits → 201 base-10⁴ groups → a 407-byte payload,

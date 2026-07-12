@@ -13,6 +13,7 @@ import type {
   CreateTable,
   CreateType,
   ConflictTarget,
+  ColumnDef,
   Cte,
   CteBody,
   Delete,
@@ -100,7 +101,7 @@ import {
   loadedTimeZones as loadedTimeZonesGlobal,
   type TimeZoneInfo,
 } from "./timezone.ts";
-import { crc32Ieee, newTempStorage, pagePayload } from "./format.ts";
+import { crc32Ieee, newTempStorage, pagePayload, recordCompressUnits } from "./format.ts";
 import { commitDurableAttachment, persistTemp } from "./persist.ts";
 import { Decimal, workLinear } from "./decimal.ts";
 import { encodeBool, encodeInt, encodeTerminated } from "./encoding.ts";
@@ -3200,7 +3201,12 @@ export class Engine {
         // Create the OWNED sequence — a default ascending i64 for serial, or the IDENTITY column's
         // `( seq_options )` (defaulting the same way) — and synthesize the DEFAULT nextval(...)
         // expression default (format_version 8 mechanism).
-        const seqName = this.chooseSerialSeqName(ct.name, def.name, pendingSerials);
+        const seqName = this.chooseSerialSeqName(
+          ct.name,
+          def.name,
+          pendingSerials,
+          [],
+        );
         const owner: SeqOwner = { table: ct.name, column: columns.length }; // this column's ordinal
         const opts = def.identity !== null ? def.identity.options : emptySeqOptions();
         // The owned sequence's data type follows the column (§14): serial → the pseudo-type,
@@ -3859,14 +3865,21 @@ export class Engine {
   // chooseSerialSeqName chooses the auto-generated name for a serial column's OWNED sequence
   // (spec/design/sequences.md §12), matching PostgreSQL: lower(table)_lower(column)_seq, with the
   // smallest integer suffix 1, 2, … appended until the name is free in the relation namespace — not
-  // taken by an existing relation, not equal to the table being created, and not already chosen by
-  // an earlier serial column of the same statement (pending). All-lowercase identifier-derived.
-  private chooseSerialSeqName(table: string, column: string, pending: SequenceDef[]): string {
+  // taken by an existing relation, not equal to the table being created, not already chosen by an
+  // earlier serial column of the same statement (pending), and not held by a caller-known pending
+  // relation. All-lowercase identifier-derived.
+  private chooseSerialSeqName(
+    table: string,
+    column: string,
+    pending: SequenceDef[],
+    reserved: string[],
+  ): string {
     const base = `${table.toLowerCase()}_${column.toLowerCase()}_seq`;
     const taken = (c: string): boolean =>
       this.relationExists(c) ||
       c.toLowerCase() === table.toLowerCase() ||
-      pending.some((s) => s.name.toLowerCase() === c.toLowerCase());
+      pending.some((s) => s.name.toLowerCase() === c.toLowerCase()) ||
+      reserved.some((name) => name.toLowerCase() === c.toLowerCase());
     if (!taken(base)) return base;
     for (let n = 1; ; n++) {
       const cand = base + n.toString();
@@ -4131,7 +4144,7 @@ export class Engine {
     return { kind: "statement", cost: 0n, rowsAffected: null };
   }
 
-  // executeAlterTable implements the catalog-only ALTER TABLE slices 1-2 (alter.md §1/§2).
+  // executeAlterTable implements ALTER TABLE slices 1-3 (alter.md §1-§3.1).
   private executeAlterTable(at: AlterTable): Outcome {
     checkCatalogRelWrite(at.name);
     this.checkAttachmentWritable(at.db);
@@ -4184,12 +4197,15 @@ export class Engine {
           snap.findIndex(name) !== null ||
           snap.sequence(name) !== undefined
         : this.relationExists(name);
+    const pendingSerials: SequenceDef[] = [];
     const workingRelationTaken = (name: string): boolean => {
+      if (pendingSerials.some((s) => s.name.toLowerCase() === name.toLowerCase())) return true;
       if (table.indexes.some((i) => i.name.toLowerCase() === name.toLowerCase())) return true;
       if (original.indexes.some((i) => i.name.toLowerCase() === name.toLowerCase())) return false;
       return relationTaken(name);
     };
     const addedConstraints = new Set<string>();
+    const addedColumns: Column[] = [];
     const cascadeUniqueCols: number[][] = [];
     const rewriteExprs = (
       column?: { oldName: string; newName: string },
@@ -4305,7 +4321,66 @@ export class Engine {
           table.indexes.some((i) => i.unique && i.name.toLowerCase() === n.toLowerCase()) ||
           table.fks.some((f) => f.name.toLowerCase() === n.toLowerCase()) ||
           table.exclusions.some((e) => e.name.toLowerCase() === n.toLowerCase());
-        for (const action of at.action.actions) {
+        const actions = [...at.action.actions];
+        while (actions.length > 0) {
+          const action = actions.shift()!;
+          if (action.kind === "addColumn") {
+            if (columnIndex(table, action.column.name) >= 0) {
+              if (action.ifNotExists) continue;
+              throw engineError(
+                "duplicate_column",
+                `column already exists: ${action.column.name}`,
+              );
+            }
+            if (action.foreignKeys.length > 0 && (tempScope || attachmentScope))
+              throw engineError(
+                "feature_not_supported",
+                "this constraint is not supported in this table scope",
+              );
+            // Earlier index actions already live in table; named inline UNIQUE constraints are
+            // queued only after this column resolves. Both reserve their relation names while an
+            // owned serial/identity sequence chooses its name.
+            const reservedRelationNames = table.indexes.map((i) => i.name);
+            if (!action.column.primaryKey)
+              reservedRelationNames.push(
+                ...action.uniques.flatMap((u) => (u.name === null ? [] : [u.name])),
+              );
+            const col = this.buildAlterAddedColumn(
+              table,
+              action.column,
+              pendingSerials,
+              reservedRelationNames,
+              tempScope,
+              attachmentScope,
+            );
+            table.columns.push(col);
+            if (col.primaryKey) table.pk = [table.columns.length - 1];
+            addedColumns.push(col);
+            actions.unshift(
+              ...action.checks.map(
+                (def) =>
+                  ({
+                    kind: "addConstraint",
+                    constraint: { kind: "check", def },
+                  }) as const,
+              ),
+              ...action.uniques.filter(() => !col.primaryKey).map(
+                (def) =>
+                  ({
+                    kind: "addConstraint",
+                    constraint: { kind: "unique", def },
+                  }) as const,
+              ),
+              ...action.foreignKeys.map(
+                (def) =>
+                  ({
+                    kind: "addConstraint",
+                    constraint: { kind: "foreignKey", def },
+                  }) as const,
+              ),
+            );
+            continue;
+          }
           if (action.kind === "addConstraint") {
             const c = action.constraint;
             if (c.kind === "foreignKey" || c.kind === "exclude") {
@@ -4621,8 +4696,82 @@ export class Engine {
       }
     }
 
+    const alterPageSize = attachmentScope ? this.attachPageSize(at.db!.toLowerCase()) : this.pageSize;
+    const rewriteColTypes =
+      addedColumns.length === 0
+        ? null
+        : table.columns.map((c) => resolveColType(c.type, this.readSnap().types));
     const meter = this.session.newMeter();
-    const mask = table.columns.map((c, i) => !original.columns[i]!.notNull && c.notNull);
+    let rewriteRows: Entry[] | null = null;
+    let rewriteNextRowid = 0n;
+    if (addedColumns.length > 0) {
+      for (const seq of pendingSerials) {
+        let sw: Snapshot;
+        if (at.db === undefined) {
+          if (tempScope) {
+            this.session.tx!.tempDirty = true;
+            sw = this.session.tx!.tempWorking;
+          } else sw = this.working();
+        } else if (at.db.toLowerCase() === "temp") {
+          this.session.tx!.tempDirty = true;
+          sw = this.session.tx!.tempWorking;
+        } else if (at.db.toLowerCase() === "main") sw = this.working();
+        else sw = this.attachWriteSnap(at.db.toLowerCase())!;
+        sw.putSequence(seq);
+      }
+      const store = this.lkpStoreScoped(at.db, original.name);
+      const scan = store.scanWithUnits(original.columns.map(() => true));
+      rewriteNextRowid = store.nextSyntheticRowid();
+      meter.charge(COSTS.pageRead * BigInt(scan.pages) + COSTS.valueDecompress * BigInt(scan.slabs));
+      const defaults = this.resolveDefaultExprs({
+        ...table,
+        columns: addedColumns,
+        pk: [],
+        checks: [],
+        indexes: [],
+        fks: [],
+        exclusions: [],
+      });
+      const rng = new StmtRng();
+      const rekey =
+        table.pk.length !== original.pk.length ||
+        table.pk.some((v, i) => v !== original.pk[i]);
+      const colls = this.columnCollations(table.columns);
+      const seenKeys = new Set<string>();
+      let compressUnits = 0n;
+      rewriteRows = scan.entries.map((entry) => {
+        meter.guard();
+        meter.charge(COSTS.storageRowRead);
+        const row = store.resolveAll(entry.row);
+        for (let i = original.columns.length; i < table.columns.length; i++) {
+          const added = addedColumns[i - original.columns.length]!;
+          const value = this.evalDefault(
+            added,
+            defaults[i - original.columns.length]!,
+            rng,
+            meter,
+          );
+          if (table.columns[i]!.notNull && value.kind === "null")
+            throw notNullViolation(table.columns[i]!.name);
+          row.push(value);
+        }
+        const key = rekey ? encodePkKey(table, table.pk, colls, row) : entry.key;
+        if (rekey) {
+          const hash = Array.from(key).join(",");
+          if (seenKeys.has(hash)) throw uniqueViolation(table.name, pkeyName(table.name));
+          seenKeys.add(hash);
+        }
+        compressUnits += BigInt(
+          recordCompressUnits(rewriteColTypes!, key, row, pagePayload(alterPageSize)),
+        );
+        return { key, row };
+      });
+      meter.charge(COSTS.valueCompress * compressUnits);
+      meter.guard();
+    }
+    const mask = table.columns.map(
+      (c, i) => i < original.columns.length && !original.columns[i]!.notNull && c.notNull,
+    );
     if (mask.some(Boolean)) {
       const store = this.lkpStoreScoped(at.db, original.name);
       const { entries, pages, slabs } = store.scanWithUnits(mask);
@@ -4638,14 +4787,18 @@ export class Engine {
     const constraintEntries = new Map<string, Uint8Array[]>();
     if (addedConstraints.size > 0) {
       const store = this.lkpStoreScoped(at.db, original.name),
-        all = store.scanWithUnits(table.columns.map(() => true));
-      meter.charge(COSTS.pageRead * BigInt(all.pages) + COSTS.valueDecompress * BigInt(all.slabs));
+        all =
+          rewriteRows === null
+            ? store.scanWithUnits(table.columns.map(() => true))
+            : { entries: rewriteRows, pages: 0, slabs: 0 };
+      if (rewriteRows === null)
+        meter.charge(COSTS.pageRead * BigInt(all.pages) + COSTS.valueDecompress * BigInt(all.slabs));
       const checks = this.resolveChecks(table),
         colls = this.columnCollations(table.columns),
         seen = new Map<string, Set<string>>();
       for (const entry of all.entries) {
         meter.guard();
-        meter.charge(COSTS.storageRowRead);
+        if (rewriteRows === null) meter.charge(COSTS.storageRowRead);
         const row = store.resolveInlineColumns(entry.row);
         for (const ck of checks)
           if (addedConstraints.has(ck.name.toLowerCase()))
@@ -4720,6 +4873,23 @@ export class Engine {
             }
       for (const es of constraintEntries.values()) es.sort(compareBytes);
     }
+    const rekeyed =
+      rewriteRows !== null &&
+      (table.pk.length !== original.pk.length || table.pk.some((v, i) => v !== original.pk[i]));
+    if (rekeyed) {
+      constraintEntries.clear();
+      const colls = this.columnCollations(table.columns);
+      for (const index of table.indexes) {
+        const resolved = this.resolveIndex(table, index);
+        const entries: Uint8Array[] = [];
+        for (const row of rewriteRows!)
+          entries.push(
+            ...this.indexEntries(table.columns, colls, resolved, row.key, row.row),
+          );
+        entries.sort(compareBytes);
+        constraintEntries.set(index.name.toLowerCase(), entries);
+      }
+    }
     let ws: Snapshot;
     if (at.db === undefined) {
       if (this.isTempTable(original.name)) {
@@ -4738,8 +4908,12 @@ export class Engine {
         default:
           ws = this.attachWriteSnap(at.db.toLowerCase())!;
       }
-    ws.alterTableCatalog(oldKey, table, renameTable, indexRename);
-    ws.syncAlterConstraintIndexes(original, table, constraintEntries, this.pageSize);
+    if (rewriteRows !== null) {
+      ws.alterTableRewrite(table, rewriteColTypes!, rewriteRows, rewriteNextRowid, alterPageSize);
+    } else ws.alterTableCatalog(oldKey, table, renameTable, indexRename);
+    if (rekeyed)
+      ws.rebuildAlterIndexes(original, table, constraintEntries, alterPageSize);
+    else ws.syncAlterConstraintIndexes(original, table, constraintEntries, alterPageSize);
     for (const cols of cascadeUniqueCols) {
       for (const [key, child] of [...ws.tables]) {
         if (child.name.toLowerCase() === table.name.toLowerCase()) continue;
@@ -4793,6 +4967,177 @@ export class Engine {
         `column ${col.name} is of type ${canonicalName(sty)} but default expression is of type ${rtName(rt)}`,
       );
     return { ...col, default: null, defaultExpr: { exprText: def.text, expr: def.expr } };
+  }
+
+  private buildAlterAddedColumn(
+    table: Table,
+    def: ColumnDef,
+    pending: SequenceDef[],
+    reservedRelationNames: string[],
+    tempScope: boolean,
+    attachmentScope: boolean,
+  ): Column {
+    const serialKind = serialPseudoType(def.typeName);
+    let type: Type;
+    let decimal: DecimalTypmod | null = null;
+    let varcharLen: number | null = null;
+    if (serialKind !== undefined) {
+      if (def.typeMod !== null)
+        throw engineError(
+          "syntax_error",
+          `type modifier is not allowed for type ${def.typeName}`,
+        );
+      type = scalarT(serialKind);
+    } else if (def.typeName.endsWith("[]")) {
+      if (def.typeMod !== null)
+        throw engineError(
+          "feature_not_supported",
+          "a type modifier on an array type is not supported yet",
+        );
+      const base = def.typeName.slice(0, -2);
+      const scalar = scalarTypeFromName(base),
+        composite = this.compositeType(base);
+      if (scalar !== undefined) type = arrayT(scalarT(scalar));
+      else if (composite !== undefined) type = arrayT(compositeT(composite.name));
+      else throw engineError("undefined_object", `type does not exist: ${base}`);
+    } else if (rangeByName(def.typeName) !== undefined) {
+      if (def.typeMod !== null)
+        throw engineError(
+          "feature_not_supported",
+          "a type modifier on a range type is not supported",
+        );
+      type = rangeT(scalarT(elementScalar(rangeByName(def.typeName)!)));
+    } else if (scalarTypeFromName(def.typeName) !== undefined) {
+      const [scalar, d, vl] = resolveTypeAndTypmod(def.typeName, def.typeMod);
+      if (scalar === "jsonpath")
+        throw engineError("feature_not_supported", "a jsonpath column is not supported yet");
+      type = scalarT(scalar);
+      decimal = d;
+      varcharLen = vl;
+    } else {
+      const composite = this.compositeType(def.typeName);
+      if (composite === undefined)
+        throw engineError("undefined_object", `type does not exist: ${def.typeName}`);
+      if (def.typeMod !== null)
+        throw engineError(
+          "feature_not_supported",
+          `a type modifier is not supported for composite type ${def.typeName}`,
+        );
+      type = compositeT(composite.name);
+    }
+
+    let collation: string | null = null;
+    if (def.collation !== null) {
+      if (!typeIsText(type))
+        throw typeError(`collations are not supported by type ${typeCanonicalName(type)}`);
+      resolveCollationName(this, def.collation);
+      if (def.collation !== "C") collation = def.collation;
+    } else if (typeIsText(type)) collation = this.readSnap().defaultCollation;
+    if (tempScope && collation !== null)
+      throw engineError(
+        "feature_not_supported",
+        "COLLATE on a temporary-table column is not yet supported",
+      );
+    if (attachmentScope && (type.kind === "composite" || collation !== null))
+      throw engineError(
+        "feature_not_supported",
+        "this column type or collation is not supported on an attached-database table",
+      );
+
+    let col: Column = {
+      name: def.name,
+      type,
+      decimal,
+      varcharLen,
+      primaryKey: def.primaryKey,
+      notNull:
+        def.primaryKey ||
+        def.notNull ||
+        serialKind !== undefined ||
+        def.identity !== null,
+      default: null,
+      defaultExpr: null,
+      identity: null,
+      collation,
+    };
+    if (def.primaryKey) {
+      if (table.pk.length > 0)
+        throw engineError(
+          "invalid_table_definition",
+          `multiple primary keys for table ${table.name} are not allowed`,
+        );
+      if (
+        !typeIsInteger(type) &&
+        !typeIsBoolean(type) &&
+        !typeIsText(type) &&
+        !typeIsBytea(type) &&
+        !typeIsDecimal(type) &&
+        !typeIsUuid(type) &&
+        !typeIsTimestamp(type) &&
+        !typeIsTimestamptz(type) &&
+        !typeIsDate(type) &&
+        !typeIsInterval(type) &&
+        !typeIsFloat(type) &&
+        !typeIsRange(type) &&
+        !typeIsArrayKeyable(type)
+      )
+        throw engineError(
+          "feature_not_supported",
+          `a ${typeCanonicalName(type)} primary key is not supported yet`,
+        );
+    }
+    if (serialKind !== undefined || def.identity !== null) {
+      if (attachmentScope)
+        throw engineError(
+          "feature_not_supported",
+          "a serial / IDENTITY column on an attached-database table is not supported yet",
+        );
+      if (def.identity !== null && !typeIsInteger(type))
+        throw engineError(
+          "invalid_parameter_value",
+          "identity column type must be smallint, integer, or bigint",
+        );
+      if (def.identity !== null && (def.default !== null || serialKind !== undefined))
+        throw engineError(
+          "syntax_error",
+          `both default and identity specified for column ${def.name} of table ${table.name}`,
+        );
+      if (serialKind !== undefined && def.default !== null)
+        throw engineError(
+          "syntax_error",
+          `multiple default values specified for column ${def.name} of table ${table.name}`,
+        );
+      const seqName = this.chooseSerialSeqName(
+        table.name,
+        def.name,
+        pending,
+        reservedRelationNames,
+      );
+      const opts = { ...(def.identity?.options ?? emptySeqOptions()) };
+      if (opts.dataType !== null)
+        throw engineError("syntax_error", "conflicting or redundant options");
+      const scalar = serialKind ?? (type.kind === "scalar" ? type.scalar : undefined);
+      const dtype = scalar === undefined ? undefined : seqDataTypeForScalar(scalar);
+      if (dtype === undefined) throw new Error("serial/identity integer");
+      opts.dataType = dtype;
+      pending.push(
+        buildSequenceDef(seqName, opts, { table: table.name, column: table.columns.length }),
+      );
+      const exprText = `nextval ( '${seqName.replace(/'/g, "''")}' )`;
+      col = {
+        ...col,
+        defaultExpr: { exprText, expr: parseExpression(exprText) },
+        identity:
+          def.identity === null ? null : def.identity.always ? "always" : "byDefault",
+      };
+    } else if (type.kind === "composite" || type.kind === "array" || type.kind === "range") {
+      if (def.default !== null)
+        throw engineError(
+          "feature_not_supported",
+          "a DEFAULT on a composite-, array-, or range-typed column is not supported yet",
+        );
+    } else if (def.default !== null) col = this.buildAlterDefault(col, def.default);
+    return col;
   }
 
   // findIndex finds the table owning the named index in the visible snapshot

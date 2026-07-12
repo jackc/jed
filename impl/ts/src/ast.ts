@@ -749,7 +749,7 @@ export type AlterSequence = {
     | { kind: "rename"; newName: string };
 };
 
-// ALTER TABLE slices 1-2 (spec/design/alter.md): one standalone rename or a comma-separated mixed
+// ALTER TABLE slices 1-3 (spec/design/alter.md): one standalone rename or a comma-separated mixed
 // action list. The parser guarantees rename/actions are never mixed.
 export type AlterTable = {
   kind: "alterTable";
@@ -764,6 +764,14 @@ export type AlterTable = {
 };
 
 export type AlterTableEdit =
+  | {
+      kind: "addColumn";
+      column: ColumnDef;
+      checks: CheckDef[];
+      uniques: UniqueDef[];
+      foreignKeys: ForeignKeyDef[];
+      ifNotExists: boolean;
+    }
   | { kind: "alterColumn"; edit: AlterColumnAction }
   | { kind: "addConstraint"; constraint: AlterConstraintDef }
   | { kind: "dropConstraint"; name: string; ifExists: boolean; cascade: boolean };

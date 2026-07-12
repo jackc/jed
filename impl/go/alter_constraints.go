@@ -381,7 +381,7 @@ func (db *engine) dropAlterConstraint(t *catTable, d *dropConstraintDef, snap *s
 
 // validateAlterConstraints scans once, checks every newly-added surviving constraint against the
 // final table definition, and returns sorted backing-index entries for publication.
-func (db *engine) validateAlterConstraints(original, t *catTable, dbScope *string, snap *snapshot, st *alterConstraintState, meter *costMeter) (map[string][][]byte, error) {
+func (db *engine) validateAlterConstraints(original, t *catTable, dbScope *string, snap *snapshot, st *alterConstraintState, meter *costMeter, rewritten []entry) (map[string][][]byte, error) {
 	if len(st.added) == 0 {
 		return nil, nil
 	}
@@ -390,11 +390,16 @@ func (db *engine) validateAlterConstraints(original, t *catTable, dbScope *strin
 		mask[i] = true
 	}
 	store := db.lkpStoreScoped(dbScope, original.Name)
-	rows, pages, slabs, err := store.ScanWithUnits(mask)
-	if err != nil {
-		return nil, err
+	rows := rewritten
+	if rows == nil {
+		var pages, slabs int
+		var err error
+		rows, pages, slabs, err = store.ScanWithUnits(mask)
+		if err != nil {
+			return nil, err
+		}
+		meter.Charge(costs.PageRead*int64(pages) + costs.ValueDecompress*int64(slabs))
 	}
-	meter.Charge(costs.PageRead*int64(pages) + costs.ValueDecompress*int64(slabs))
 	checks, err := db.resolveChecks(t)
 	if err != nil {
 		return nil, err
@@ -406,7 +411,9 @@ func (db *engine) validateAlterConstraints(original, t *catTable, dbScope *strin
 		if err := meter.Guard(); err != nil {
 			return nil, err
 		}
-		meter.Charge(costs.StorageRowRead)
+		if rewritten == nil {
+			meter.Charge(costs.StorageRowRead)
+		}
 		row, err := store.resolveInlineColumns(e.Row)
 		if err != nil {
 			return nil, err

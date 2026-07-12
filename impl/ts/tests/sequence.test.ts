@@ -163,8 +163,6 @@ test("unsupported ALTER SEQUENCE actions are 0A000", () => {
   assert.equal(errCode(db, "ALTER SEQUENCE s OWNED BY t.c"), "0A000");
   assert.equal(errCode(db, "ALTER SEQUENCE s OWNER TO bob"), "0A000");
   assert.equal(errCode(db, "ALTER SEQUENCE s SET SCHEMA other"), "0A000");
-  // ALTER TABLE owns its authoritative planned grammar; ADD COLUMN is a later slice → 0A000.
-  assert.equal(errCode(db, "ALTER TABLE t ADD COLUMN c i32"), "0A000");
 });
 
 // An ALTER SEQUENCE … <options> edit is a transactional catalog write — it rolls back with its block

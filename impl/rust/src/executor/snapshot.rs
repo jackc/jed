@@ -796,6 +796,29 @@ impl Snapshot {
         }
     }
 
+    /// Publish an ADD COLUMN catalog and its fully materialized replacement rows. Existing storage
+    /// keys are supplied by the executor: retained for a normal append or re-encoded for an inline
+    /// PRIMARY KEY. The table store is rebuilt with the new column codec/leaf shape.
+    pub(crate) fn alter_table_rewrite(
+        &mut self,
+        table: Table,
+        col_types: Vec<ColType>,
+        entries: &[(Vec<u8>, Row)],
+        next_rowid: i64,
+        page_size: u32,
+    ) -> Result<()> {
+        let key = table.name.to_ascii_lowercase();
+        self.put_table_resolved(table, col_types, page_size);
+        let store = self.store_mut(&key);
+        store.bump_rowid_to(next_rowid);
+        for (k, row) in entries {
+            if !store.insert(k.clone(), row.clone())? {
+                unreachable!("ADD COLUMN retains distinct existing storage keys")
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn sync_alter_constraint_indexes(
         &mut self,
         old: &Table,
@@ -833,6 +856,33 @@ impl Snapshot {
                 s.insert(e.clone(), Vec::new())?;
             }
             std::sync::Arc::make_mut(&mut self.index_stores).insert(k, s);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn rebuild_alter_indexes(
+        &mut self,
+        old: &Table,
+        next: &Table,
+        entries: &std::collections::HashMap<String, Vec<Vec<u8>>>,
+        page_size: u32,
+    ) -> Result<()> {
+        for ix in &old.indexes {
+            let key = ix.name.to_ascii_lowercase();
+            std::sync::Arc::make_mut(&mut self.index_stores).remove(&key);
+            std::sync::Arc::make_mut(&mut self.gist_trees).remove(&key);
+        }
+        let cap = crate::format::page_payload(page_size);
+        for ix in &next.indexes {
+            let key = ix.name.to_ascii_lowercase();
+            let mut store = TableStore::new(cap, Vec::new());
+            if let Some(paging) = &self.store_paging {
+                store.attach_paging(paging.clone());
+            }
+            for entry in entries.get(&key).into_iter().flatten() {
+                store.insert(entry.clone(), Vec::new())?;
+            }
+            std::sync::Arc::make_mut(&mut self.index_stores).insert(key, store);
         }
         Ok(())
     }

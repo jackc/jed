@@ -517,7 +517,8 @@ impl Engine {
                 // Create the OWNED sequence — a default ascending i64 for `serial`, or the IDENTITY
                 // column's `( seq_options )` (defaulting the same way) — and synthesize the
                 // `DEFAULT nextval('<auto-name>')` expression default (format_version 8 mechanism).
-                let seqname = self.choose_serial_seq_name(&ct.name, &def.name, &pending_serials);
+                let seqname =
+                    self.choose_serial_seq_name(&ct.name, &def.name, &pending_serials, &[]);
                 let owner = SeqOwner {
                     table: ct.name.clone(),
                     column: columns.len() as u16, // this column's ordinal (pushed below)
@@ -1386,7 +1387,8 @@ impl Engine {
         })
     }
 
-    /// Execute ALTER TABLE slices 1-2 (alter.md §1/§2): catalog-only edits and constraints.
+    /// Execute ALTER TABLE slices 1-3 (alter.md §1-§3.1): catalog edits, constraints, and the
+    /// append-column table rewrite.
     pub(crate) fn execute_alter_table(&mut self, at: AlterTable) -> Result<Outcome> {
         check_catalog_rel_write(&at.name)?;
         self.check_attachment_writable(at.db.as_deref())?;
@@ -1413,7 +1415,8 @@ impl Engine {
                     format!("database \"{}\" is not attached", at.db.as_deref().unwrap()),
                 )
             })?,
-        };
+        }
+        .clone();
         let Some(original_ref) = snap.table(&at.name) else {
             if snap.find_index(&at.name).is_some() || snap.sequence(&at.name).is_some() {
                 return Err(EngineError::new(
@@ -1438,6 +1441,8 @@ impl Engine {
         let mut rename_table = false;
         let mut index_rename: Option<(String, String)> = None;
         let mut added_constraints = std::collections::HashSet::<String>::new();
+        let mut added_columns = Vec::<Column>::new();
+        let mut pending_serials = Vec::<SequenceDef>::new();
         let mut cascade_unique_cols = Vec::<Vec<usize>>::new();
         let attachment_scope = at
             .db
@@ -1454,23 +1459,30 @@ impl Engine {
         };
         // ADD/DROP actions edit `table` left-to-right. A dropped index owned by this table has
         // released its relation name, while an earlier ADD has already occupied its new one.
-        let working_relation_taken = |working: &Table, name: &str| {
-            if working
-                .indexes
-                .iter()
-                .any(|i| i.name.eq_ignore_ascii_case(name))
-            {
-                true
-            } else if original
-                .indexes
-                .iter()
-                .any(|i| i.name.eq_ignore_ascii_case(name))
-            {
-                false
-            } else {
-                relation_taken(name)
-            }
-        };
+        let working_relation_taken =
+            |working: &Table, pending_sequences: &[SequenceDef], name: &str| {
+                if pending_sequences
+                    .iter()
+                    .any(|s| s.name.eq_ignore_ascii_case(name))
+                {
+                    return true;
+                }
+                if working
+                    .indexes
+                    .iter()
+                    .any(|i| i.name.eq_ignore_ascii_case(name))
+                {
+                    true
+                } else if original
+                    .indexes
+                    .iter()
+                    .any(|i| i.name.eq_ignore_ascii_case(name))
+                {
+                    false
+                } else {
+                    relation_taken(name)
+                }
+            };
 
         match at.action {
             AlterTableAction::RenameTable(new_name) => {
@@ -1576,7 +1588,79 @@ impl Engine {
                     .sort_by_key(|x| x.name.to_ascii_lowercase());
             }
             AlterTableAction::Actions(actions) => {
-                for action in actions {
+                let mut actions = std::collections::VecDeque::from(actions);
+                while let Some(action) = actions.pop_front() {
+                    if let AlterTableEdit::AddColumn {
+                        column,
+                        checks,
+                        uniques,
+                        foreign_keys,
+                        if_not_exists,
+                    } = action
+                    {
+                        if table
+                            .columns
+                            .iter()
+                            .any(|c| c.name.eq_ignore_ascii_case(&column.name))
+                        {
+                            if if_not_exists {
+                                continue;
+                            }
+                            return Err(EngineError::new(
+                                SqlState::DuplicateColumn,
+                                format!("column already exists: {}", column.name),
+                            ));
+                        }
+                        if (!foreign_keys.is_empty() && temp_scope)
+                            || (!foreign_keys.is_empty() && attachment_scope)
+                        {
+                            return Err(EngineError::new(
+                                SqlState::FeatureNotSupported,
+                                "this constraint is not supported in this table scope",
+                            ));
+                        }
+                        // Earlier index actions already live in `table`; named inline UNIQUE
+                        // constraints are queued only after this column resolves. Both reserve their
+                        // relation names while an owned serial/identity sequence chooses its name.
+                        let mut reserved_relation_names: Vec<String> =
+                            table.indexes.iter().map(|i| i.name.clone()).collect();
+                        if !column.primary_key {
+                            reserved_relation_names
+                                .extend(uniques.iter().filter_map(|u| u.name.clone()));
+                        }
+                        let col = self.build_alter_added_column(
+                            &table,
+                            &column,
+                            &mut pending_serials,
+                            &reserved_relation_names,
+                            temp_scope,
+                            attachment_scope,
+                        )?;
+                        table.columns.push(col.clone());
+                        let added_primary_key = col.primary_key;
+                        if added_primary_key {
+                            table.pk = vec![table.columns.len() - 1];
+                        }
+                        added_columns.push(col);
+                        // Inline constraints are the same definitions as CREATE TABLE. Queue them
+                        // immediately after the column so later comma-actions see their effects.
+                        for fk in foreign_keys.into_iter().rev() {
+                            actions.push_front(AlterTableEdit::AddConstraint(
+                                AlterConstraintDef::ForeignKey(fk),
+                            ));
+                        }
+                        for unique in uniques.into_iter().filter(|_| !added_primary_key).rev() {
+                            actions.push_front(AlterTableEdit::AddConstraint(
+                                AlterConstraintDef::Unique(unique),
+                            ));
+                        }
+                        for check in checks.into_iter().rev() {
+                            actions.push_front(AlterTableEdit::AddConstraint(
+                                AlterConstraintDef::Check(check),
+                            ));
+                        }
+                        continue;
+                    }
                     if let AlterTableEdit::AddConstraint(def) = action {
                         if matches!(
                             &def,
@@ -1693,7 +1777,7 @@ impl Engine {
                                 }
                                 let name = if let Some(name) = d.name {
                                     check_reserved_name("constraint", &name)?;
-                                    if working_relation_taken(&table, &name) {
+                                    if working_relation_taken(&table, &pending_serials, &name) {
                                         return Err(EngineError::new(
                                             SqlState::DuplicateTable,
                                             format!("relation already exists: {name}"),
@@ -1720,7 +1804,7 @@ impl Engine {
                                     );
                                     let mut name = base.clone();
                                     let mut suffix = 0u32;
-                                    while working_relation_taken(&table, &name)
+                                    while working_relation_taken(&table, &pending_serials, &name)
                                         || constraint_name_taken(&table, &name)
                                     {
                                         suffix += 1;
@@ -1893,7 +1977,7 @@ impl Engine {
                                 )?;
                                 let name = if let Some(name) = d.name {
                                     check_reserved_name("constraint", &name)?;
-                                    if working_relation_taken(&table, &name) {
+                                    if working_relation_taken(&table, &pending_serials, &name) {
                                         return Err(EngineError::new(
                                             SqlState::DuplicateTable,
                                             format!("relation already exists: {name}"),
@@ -1920,7 +2004,7 @@ impl Engine {
                                     );
                                     let mut name = base.clone();
                                     let mut suffix = 0u32;
-                                    while working_relation_taken(&table, &name)
+                                    while working_relation_taken(&table, &pending_serials, &name)
                                         || constraint_name_taken(&table, &name)
                                     {
                                         suffix += 1;
@@ -2081,13 +2165,100 @@ impl Engine {
             }
         }
 
+        let page_size = at
+            .db
+            .as_deref()
+            .filter(|q| !matches!(q.to_ascii_lowercase().as_str(), "main" | "temp"))
+            .map(|q| self.attach_page_size(&q.to_ascii_lowercase()))
+            .unwrap_or(self.page_size);
+        let rewrite_col_types: Option<Vec<ColType>> = (!added_columns.is_empty()).then(|| {
+            let main = self.read_snap();
+            table
+                .columns
+                .iter()
+                .map(|c| resolve_col_type(&c.ty, &main.types))
+                .collect()
+        });
+        let mut meter = self.session.new_meter();
+        let mut rewrite_entries: Option<Vec<(Vec<u8>, Row)>> = None;
+        let mut rewrite_next_rowid = 0i64;
+        if !added_columns.is_empty() {
+            // Make owned sequences visible to their synthesized nextval defaults. Statement-level
+            // rollback restores the prior working root if any later validation fails.
+            for seq in pending_serials.iter().cloned() {
+                match at.db.as_deref().map(str::to_ascii_lowercase) {
+                    None if temp_scope => self.temp_working_mut().put_sequence(seq),
+                    None => self.working_mut().put_sequence(seq),
+                    Some(q) if q == "temp" => self.temp_working_mut().put_sequence(seq),
+                    Some(q) if q == "main" => self.working_mut().put_sequence(seq),
+                    Some(q) => self.attach_write_snap(&q).put_sequence(seq),
+                }
+            }
+            let old_mask = vec![true; original.columns.len()];
+            let store = self.store_scoped(at.db.as_deref(), &original.name);
+            let (mut rows, pages, slabs) = store.scan_with_units(&old_mask)?;
+            rewrite_next_rowid = store.next_rowid();
+            meter.charge(COSTS.page_read * pages as i64 + COSTS.value_decompress * slabs as i64);
+            let defaults = self.resolve_default_exprs(&Table {
+                name: table.name.clone(),
+                columns: added_columns.clone(),
+                pk: Vec::new(),
+                checks: Vec::new(),
+                indexes: Vec::new(),
+                foreign_keys: Vec::new(),
+                exclusions: Vec::new(),
+            })?;
+            let first = original.columns.len();
+            let rng = std::cell::Cell::new(crate::seam::StmtRng::new());
+            let rekey = table.pk != original.pk;
+            let pk: Vec<(usize, Type)> = table
+                .pk
+                .iter()
+                .map(|&i| (i, table.columns[i].ty.clone()))
+                .collect();
+            let colls = self.column_collations(&table.columns);
+            let mut seen_keys = std::collections::HashSet::new();
+            let mut compress_units = 0i64;
+            for (key, row) in &mut rows {
+                meter.guard()?;
+                meter.charge(COSTS.storage_row_read);
+                store.resolve_all(row)?;
+                for i in first..table.columns.len() {
+                    let added = &added_columns[i - first];
+                    let value =
+                        self.eval_default(added, defaults[i - first].as_ref(), &rng, &mut meter)?;
+                    if table.columns[i].not_null && matches!(value, Value::Null) {
+                        return Err(EngineError::not_null_violation(&table.columns[i].name));
+                    }
+                    row.push(value);
+                }
+                if rekey {
+                    *key = encode_pk_key(&pk, &colls, row)?;
+                    if !seen_keys.insert(key.clone()) {
+                        return Err(EngineError::unique_violation(
+                            &table.name,
+                            format!("{}_pkey", table.name.to_ascii_lowercase()),
+                        ));
+                    }
+                }
+                compress_units += crate::format::record_compress_units(
+                    rewrite_col_types.as_ref().expect("rewrite column types"),
+                    key,
+                    row,
+                    crate::format::page_payload(page_size),
+                ) as i64;
+            }
+            meter.charge(COSTS.value_compress * compress_units);
+            meter.guard()?;
+            rewrite_entries = Some(rows);
+        }
+
         let mask: Vec<bool> = table
             .columns
             .iter()
             .zip(&original.columns)
             .map(|(n, o)| !o.not_null && n.not_null)
             .collect();
-        let mut meter = self.session.new_meter();
         if mask.iter().any(|x| *x) {
             let store = self.store_scoped(at.db.as_deref(), &original.name);
             let (entries, pages, slabs) = store.scan_with_units(&mask)?;
@@ -2105,10 +2276,16 @@ impl Engine {
         }
         let mut constraint_entries = std::collections::HashMap::<String, Vec<Vec<u8>>>::new();
         if !added_constraints.is_empty() {
-            let all_mask = vec![true; table.columns.len()];
             let store = self.store_scoped(at.db.as_deref(), &original.name);
-            let (rows, pages, slabs) = store.scan_with_units(&all_mask)?;
-            meter.charge(COSTS.page_read * pages as i64 + COSTS.value_decompress * slabs as i64);
+            let rows = if let Some(rows) = &rewrite_entries {
+                rows.clone()
+            } else {
+                let all_mask = vec![true; table.columns.len()];
+                let (rows, pages, slabs) = store.scan_with_units(&all_mask)?;
+                meter
+                    .charge(COSTS.page_read * pages as i64 + COSTS.value_decompress * slabs as i64);
+                rows
+            };
             let checks = self.resolve_checks(&table)?;
             let colls = self.column_collations(&table.columns);
             let mut seen =
@@ -2116,7 +2293,9 @@ impl Engine {
             let rng = std::cell::Cell::new(crate::seam::StmtRng::new());
             for (key, mut row) in rows.iter().cloned() {
                 meter.guard()?;
-                meter.charge(COSTS.storage_row_read);
+                if rewrite_entries.is_none() {
+                    meter.charge(COSTS.storage_row_read);
+                }
                 store.resolve_inline_columns(&mut row)?;
                 for ck in checks
                     .iter()
@@ -2212,8 +2391,22 @@ impl Engine {
                 es.sort();
             }
         }
+        let rekeyed = rewrite_entries.is_some() && table.pk != original.pk;
+        if rekeyed {
+            constraint_entries.clear();
+            let colls = self.column_collations(&table.columns);
+            for ix in &table.indexes {
+                let ri = self.resolve_index(&table, ix)?;
+                let out = constraint_entries
+                    .entry(ix.name.to_ascii_lowercase())
+                    .or_default();
+                for (key, row) in rewrite_entries.as_ref().unwrap() {
+                    out.extend(self.index_entries(&table.columns, &colls, &ri, key, row)?);
+                }
+                out.sort();
+            }
+        }
         let ir = index_rename.as_ref().map(|(a, b)| (a.as_str(), b.as_str()));
-        let page_size = self.page_size;
         let ws = match at.db.as_deref().map(str::to_ascii_lowercase) {
             None if self.is_temp_table(&original.name) => self.temp_working_mut(),
             None => self.working_mut(),
@@ -2221,8 +2414,22 @@ impl Engine {
             Some(q) if q == "main" => self.working_mut(),
             Some(q) => self.attach_write_snap(&q),
         };
-        ws.alter_table_catalog(&old_key, table.clone(), rename_table, ir);
-        ws.sync_alter_constraint_indexes(&original, &table, &constraint_entries, page_size)?;
+        if let Some(entries) = &rewrite_entries {
+            ws.alter_table_rewrite(
+                table.clone(),
+                rewrite_col_types.expect("rewrite column types"),
+                entries,
+                rewrite_next_rowid,
+                page_size,
+            )?;
+        } else {
+            ws.alter_table_catalog(&old_key, table.clone(), rename_table, ir);
+        }
+        if rekeyed {
+            ws.rebuild_alter_indexes(&original, &table, &constraint_entries, page_size)?;
+        } else {
+            ws.sync_alter_constraint_indexes(&original, &table, &constraint_entries, page_size)?;
+        }
         ws.cascade_dropped_unique_fks(&table.name, &cascade_unique_cols);
         Ok(Outcome::Statement {
             cost: meter.accrued,
@@ -2325,6 +2532,267 @@ impl Engine {
                 expr: def.expr.clone(),
             }),
         ))
+    }
+
+    /// Resolve one ADD COLUMN definition using the same type/default/identity rules as CREATE
+    /// TABLE. Inline CHECK/UNIQUE/REFERENCES definitions are deliberately handled by the existing
+    /// ALTER ADD CONSTRAINT path after this returns.
+    fn build_alter_added_column(
+        &self,
+        table: &Table,
+        def: &crate::ast::ColumnDef,
+        pending_serials: &mut Vec<SequenceDef>,
+        reserved_relation_names: &[String],
+        temp_scope: bool,
+        attachment_scope: bool,
+    ) -> Result<Column> {
+        let serial_kind = serial_pseudo_type(&def.type_name);
+        let (ty, decimal, varchar_len): (Type, Option<DecimalTypmod>, Option<u32>) =
+            if let Some(sk) = serial_kind {
+                if def.type_mod.is_some() {
+                    return Err(EngineError::new(
+                        SqlState::SyntaxError,
+                        format!("type modifier is not allowed for type {}", def.type_name),
+                    ));
+                }
+                (Type::Scalar(sk), None, None)
+            } else if let Some(base) = def.type_name.strip_suffix("[]") {
+                if def.type_mod.is_some() {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "a type modifier on an array type is not supported yet",
+                    ));
+                }
+                match ScalarType::from_name(base) {
+                    Some(s) => (Type::Array(Box::new(Type::Scalar(s))), None, None),
+                    None => match self.read_snap().composite_type(base) {
+                        Some(c) => (
+                            Type::Array(Box::new(Type::Composite(crate::types::CompositeRef {
+                                name: c.name.clone(),
+                            }))),
+                            None,
+                            None,
+                        ),
+                        None => {
+                            return Err(EngineError::new(
+                                SqlState::UndefinedObject,
+                                format!("type does not exist: {base}"),
+                            ));
+                        }
+                    },
+                }
+            } else if let Some(rdesc) = crate::range::range_by_name(&def.type_name) {
+                if def.type_mod.is_some() {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "a type modifier on a range type is not supported",
+                    ));
+                }
+                (
+                    Type::Range(Box::new(Type::Scalar(crate::range::element_scalar(rdesc)))),
+                    None,
+                    None,
+                )
+            } else if ScalarType::from_name(&def.type_name).is_some() {
+                let (s, d, v) = resolve_type_and_typmod(&def.type_name, &def.type_mod)?;
+                if s == ScalarType::JsonPath {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "a jsonpath column is not supported yet",
+                    ));
+                }
+                (Type::Scalar(s), d, v)
+            } else if let Some(c) = self.read_snap().composite_type(&def.type_name) {
+                if def.type_mod.is_some() {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        format!(
+                            "a type modifier is not supported for composite type {}",
+                            def.type_name
+                        ),
+                    ));
+                }
+                (
+                    Type::Composite(crate::types::CompositeRef {
+                        name: c.name.clone(),
+                    }),
+                    None,
+                    None,
+                )
+            } else {
+                return Err(EngineError::new(
+                    SqlState::UndefinedObject,
+                    format!("type does not exist: {}", def.type_name),
+                ));
+            };
+
+        let collation = if let Some(name) = &def.collation {
+            if !ty.is_text() {
+                return Err(type_error(format!(
+                    "collations are not supported by type {}",
+                    ty.canonical_name()
+                )));
+            }
+            resolve_collation_name(self, name)?;
+            if name == "C" {
+                None
+            } else {
+                Some(name.clone())
+            }
+        } else if ty.is_text() {
+            self.read_snap().default_collation().map(str::to_string)
+        } else {
+            None
+        };
+        if temp_scope && collation.is_some() {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "COLLATE on a temporary-table column is not yet supported",
+            ));
+        }
+        if attachment_scope && (ty.is_composite() || collation.is_some()) {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "this column type or collation is not supported on an attached-database table",
+            ));
+        }
+
+        let mut col = Column {
+            name: def.name.clone(),
+            ty,
+            decimal,
+            varchar_len,
+            primary_key: def.primary_key,
+            not_null: def.primary_key
+                || def.not_null
+                || serial_kind.is_some()
+                || def.identity.is_some(),
+            default: None,
+            default_expr: None,
+            identity: None,
+            collation,
+        };
+        if def.primary_key {
+            if !table.pk.is_empty() {
+                return Err(EngineError::new(
+                    SqlState::InvalidTableDefinition,
+                    format!(
+                        "multiple primary keys for table {} are not allowed",
+                        table.name
+                    ),
+                ));
+            }
+            if !col.ty.is_integer()
+                && !col.ty.is_bool()
+                && !col.ty.is_text()
+                && !col.ty.is_bytea()
+                && !col.ty.is_decimal()
+                && !col.ty.is_uuid()
+                && !col.ty.is_timestamp()
+                && !col.ty.is_timestamptz()
+                && !col.ty.is_date()
+                && !col.ty.is_interval()
+                && !col.ty.is_float()
+                && !col.ty.is_range()
+                && !is_array_keyable(&col.ty)
+            {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    format!(
+                        "a {} primary key is not supported yet",
+                        col.ty.canonical_name()
+                    ),
+                ));
+            }
+        }
+        if serial_kind.is_some() || def.identity.is_some() {
+            if attachment_scope {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "a serial / IDENTITY column on an attached-database table is not supported yet",
+                ));
+            }
+            if def.identity.is_some() && !col.ty.is_integer() {
+                return Err(EngineError::new(
+                    SqlState::InvalidParameterValue,
+                    "identity column type must be smallint, integer, or bigint",
+                ));
+            }
+            if def.identity.is_some() && (def.default.is_some() || serial_kind.is_some()) {
+                return Err(EngineError::new(
+                    SqlState::SyntaxError,
+                    format!(
+                        "both default and identity specified for column {} of table {}",
+                        def.name, table.name
+                    ),
+                ));
+            }
+            if serial_kind.is_some() && def.default.is_some() {
+                return Err(EngineError::new(
+                    SqlState::SyntaxError,
+                    format!(
+                        "multiple default values specified for column {} of table {}",
+                        def.name, table.name
+                    ),
+                ));
+            }
+            let seqname = self.choose_serial_seq_name(
+                &table.name,
+                &def.name,
+                pending_serials,
+                reserved_relation_names,
+            );
+            let mut opts = def
+                .identity
+                .as_ref()
+                .map(|x| x.options.clone())
+                .unwrap_or_default();
+            if opts.data_type.is_some() {
+                return Err(EngineError::new(
+                    SqlState::SyntaxError,
+                    "conflicting or redundant options",
+                ));
+            }
+            let seq_scalar = serial_kind.unwrap_or_else(|| col.ty.scalar());
+            opts.data_type = Some(
+                SeqDataType::for_scalar(seq_scalar)
+                    .expect("serial/identity is integer")
+                    .pg_name()
+                    .to_string(),
+            );
+            pending_serials.push(build_sequence_def(
+                &seqname,
+                &opts,
+                Some(SeqOwner {
+                    table: table.name.clone(),
+                    column: table.columns.len() as u16,
+                }),
+            )?);
+            let expr_text = format!("nextval ( '{}' )", seqname.replace('\'', "''"));
+            col.default_expr = Some(DefaultExpr {
+                expr: crate::parser::parse_expression(&expr_text)?,
+                expr_text,
+            });
+            col.identity = def.identity.as_ref().map(|id| {
+                if id.always {
+                    IdentityKind::Always
+                } else {
+                    IdentityKind::ByDefault
+                }
+            });
+        } else if col.ty.is_composite() || col.ty.is_array() || col.ty.is_range() {
+            if def.default.is_some() {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "a DEFAULT on a composite-, array-, or range-typed column is not supported yet",
+                ));
+            }
+        } else if let Some(default) = &def.default {
+            let (value, expr) = self.build_alter_default(&col, default)?;
+            col.default = value;
+            col.default_expr = expr;
+        }
+        Ok(col)
     }
 
     /// Resolve a table's CHECK constraints for a write statement: each stored expression

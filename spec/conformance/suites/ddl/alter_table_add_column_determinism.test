@@ -1,0 +1,38 @@
+# ALTER TABLE slice 3 determinism/resource cases. The injected seam and jed cost ceiling make this
+# suite intentionally non-oracle; the PG-comparable ADD COLUMN behavior lives in the sibling suite.
+# requires: ddl.alter_table, ddl.create_table, ddl.primary_key, ddl.column_default_expr, dml.insert, query.select, query.order_by, types.i32, types.uuid, func.uuid_generate, expr.arithmetic, resource.cost_metering
+
+# A cost abort publishes neither the catalog column nor rewritten rows.
+statement ok
+CREATE TABLE alter_add_costly (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO alter_add_costly VALUES (1), (2)
+
+# max_cost: 2
+statement error 54P01
+ALTER TABLE alter_add_costly ADD costly i32 DEFAULT 1 + 1
+
+statement error 42703
+SELECT costly FROM alter_add_costly
+
+# A volatile default is evaluated once per old row through one statement seam.
+statement ok
+CREATE TABLE alter_add_uuid (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO alter_add_uuid VALUES (1), (2)
+
+# seed: 1
+# clock: 1721056591872000
+# cost: 5
+statement ok
+ALTER TABLE alter_add_uuid ADD token uuid DEFAULT uuidv7() NOT NULL
+
+query IT nosort
+SELECT id, token FROM alter_add_uuid ORDER BY id
+----
+1
+0190b6f7-8000-7000-910a-2dec89025cc1
+2
+0190b6f7-8000-7001-beeb-8da1658eec67

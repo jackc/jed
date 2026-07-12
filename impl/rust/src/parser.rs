@@ -548,6 +548,17 @@ impl Parser {
                 && self.peek_keyword_at(2).as_deref() == Some("unique"))
     }
 
+    /// Whether the cursor sits on a table-level PRIMARY KEY constraint, including the named form.
+    /// ALTER TABLE uses this lookahead to keep the authoritative-but-deferred ADD PRIMARY KEY
+    /// grammar on its 0A000 path instead of misclassifying `primary key` as a column name/type.
+    fn at_primary_key_table_constraint(&self) -> bool {
+        (self.peek_keyword().as_deref() == Some("primary")
+            && self.peek_keyword_at(1).as_deref() == Some("key"))
+            || (self.peek_keyword().as_deref() == Some("constraint")
+                && self.peek_keyword_at(2).as_deref() == Some("primary")
+                && self.peek_keyword_at(3).as_deref() == Some("key"))
+    }
+
     /// Parse one table-level `[CONSTRAINT name] UNIQUE ( col [, col]* )` (the cursor is
     /// verified by `at_unique_table_constraint`). The member list reuses the PRIMARY KEY
     /// list shape (spec/design/grammar.md §31).
@@ -1445,8 +1456,8 @@ impl Parser {
         })
     }
 
-    /// Parse ALTER TABLE's authoritative grammar frame (alter.md §1). Slices 1-2 execute RENAME,
-    /// catalog-only ALTER COLUMN edits, and ADD/DROP non-PK constraints.
+    /// Parse ALTER TABLE's authoritative grammar frame (alter.md §1). Slices 1-3 execute RENAME,
+    /// ADD COLUMN, catalog-only ALTER COLUMN edits, and ADD/DROP non-PK constraints.
     fn parse_alter_table(&mut self) -> Result<AlterTable> {
         self.expect_keyword("alter")?;
         self.expect_keyword("table")?;
@@ -1486,11 +1497,47 @@ impl Parser {
                 match self.peek_keyword().as_deref() {
                     Some("add") => {
                         self.advance();
-                        if self.peek_keyword().as_deref() == Some("column") {
-                            return Err(EngineError::new(
-                                SqlState::FeatureNotSupported,
-                                "ALTER TABLE ... ADD COLUMN is not supported yet".to_string(),
-                            ));
+                        let column_noise = self.peek_keyword().as_deref() == Some("column");
+                        if column_noise {
+                            self.advance();
+                        }
+                        let if_not_exists = if self.peek_keyword().as_deref() == Some("if") {
+                            self.advance();
+                            self.expect_keyword("not")?;
+                            self.expect_keyword("exists")?;
+                            true
+                        } else {
+                            false
+                        };
+                        if column_noise
+                            || if_not_exists
+                            || !(self.at_check_constraint()
+                                || self.at_unique_table_constraint()
+                                || self.at_foreign_key_table_constraint()
+                                || self.at_exclusion_table_constraint()
+                                || self.at_primary_key_table_constraint())
+                        {
+                            let mut checks = Vec::new();
+                            let mut uniques = Vec::new();
+                            let mut foreign_keys = Vec::new();
+                            let column = self.parse_column_def(
+                                &name,
+                                &mut checks,
+                                &mut uniques,
+                                &mut foreign_keys,
+                            )?;
+                            actions.push(AlterTableEdit::AddColumn {
+                                column,
+                                checks,
+                                uniques,
+                                foreign_keys,
+                                if_not_exists,
+                            });
+                            if !matches!(self.peek(), Token::Comma) {
+                                break;
+                            }
+                            self.advance();
+                            continue;
                         }
                         let def = if self.at_check_constraint() {
                             AlterConstraintDef::Check(self.parse_check_constraint()?)
@@ -1505,8 +1552,7 @@ impl Parser {
                         } else {
                             return Err(EngineError::new(
                                 SqlState::FeatureNotSupported,
-                                "ALTER TABLE ... ADD COLUMN or PRIMARY KEY is not supported yet"
-                                    .to_string(),
+                                "ALTER TABLE ... ADD PRIMARY KEY is not supported yet".to_string(),
                             ));
                         };
                         actions.push(AlterTableEdit::AddConstraint(def));

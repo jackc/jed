@@ -700,6 +700,17 @@ func (p *parser) atUniqueTableConstraint() bool {
 	return p.peekKeyword() == "constraint" && p.peekKeywordAt(2) == "unique"
 }
 
+// atPrimaryKeyTableConstraint reports whether the cursor sits on a table-level PRIMARY KEY
+// constraint, including the named form. ALTER TABLE uses this to keep the authoritative-but-
+// deferred ADD PRIMARY KEY grammar on its 0A000 path instead of parsing `primary key` as a column.
+func (p *parser) atPrimaryKeyTableConstraint() bool {
+	if p.peekKeyword() == "primary" && p.peekKeywordAt(1) == "key" {
+		return true
+	}
+	return p.peekKeyword() == "constraint" &&
+		p.peekKeywordAt(2) == "primary" && p.peekKeywordAt(3) == "key"
+}
+
 // parseUniqueTableConstraint parses one table-level `[CONSTRAINT name] UNIQUE ( col [,
 // col]* )` (the cursor is verified by atUniqueTableConstraint). The member list reuses
 // the PRIMARY KEY list shape (spec/design/grammar.md §31).
@@ -1703,9 +1714,8 @@ func (p *parser) parseDropSequence() (*dropSequence, error) {
 	return &dropSequence{Names: names, IfExists: ifExists}, nil
 }
 
-// parseAlterTable parses ALTER TABLE's authoritative grammar frame (alter.md §1). Slices 1-2 execute
-// RENAME, catalog-only ALTER COLUMN edits, and ADD/DROP non-PK constraints. Column-shape and TYPE
-// forms remain recognized 0A000 deferrals.
+// parseAlterTable parses ALTER TABLE's authoritative grammar frame (alter.md §1). Slices 1-3 execute
+// RENAME, ADD COLUMN, catalog-only ALTER COLUMN edits, and ADD/DROP non-PK constraints.
 func (p *parser) parseAlterTable() (*alterTable, error) {
 	if err := p.expectKeyword("alter"); err != nil {
 		return nil, err
@@ -1772,8 +1782,35 @@ func (p *parser) parseAlterTable() (*alterTable, error) {
 		switch p.peekKeyword() {
 		case "add":
 			p.advance()
-			if p.peekKeyword() == "column" {
-				return nil, newError(FeatureNotSupported, "ALTER TABLE ... ADD COLUMN is not supported yet")
+			columnNoise := p.peekKeyword() == "column"
+			if columnNoise {
+				p.advance()
+			}
+			ifNotExists := false
+			if p.peekKeyword() == "if" {
+				p.advance()
+				if err := p.expectKeyword("not"); err != nil {
+					return nil, err
+				}
+				if err := p.expectKeyword("exists"); err != nil {
+					return nil, err
+				}
+				ifNotExists = true
+			}
+			if columnNoise || ifNotExists || !(p.atCheckConstraint() || p.atUniqueTableConstraint() || p.atForeignKeyTableConstraint() || p.atExclusionTableConstraint() || p.atPrimaryKeyTableConstraint()) {
+				var checks []checkDef
+				var uniques []uniqueDef
+				var fks []foreignKeyDef
+				col, e := p.parseColumnDef(name, &checks, &uniques, &fks)
+				if e != nil {
+					return nil, e
+				}
+				at.Actions = append(at.Actions, alterTableEdit{AddColumn: &alterAddColumn{Column: col, Checks: checks, Uniques: uniques, ForeignKeys: fks, IfNotExists: ifNotExists}})
+				if p.peek().Kind != tokComma {
+					return at, nil
+				}
+				p.advance()
+				continue
 			}
 			var add alterConstraintDef
 			switch {
@@ -1802,7 +1839,7 @@ func (p *parser) parseAlterTable() (*alterTable, error) {
 				}
 				add.Exclude = &v
 			default:
-				return nil, newError(FeatureNotSupported, "ALTER TABLE ... ADD COLUMN or PRIMARY KEY is not supported yet")
+				return nil, newError(FeatureNotSupported, "ALTER TABLE ... ADD PRIMARY KEY is not supported yet")
 			}
 			at.Actions = append(at.Actions, alterTableEdit{Add: &add})
 		case "drop":

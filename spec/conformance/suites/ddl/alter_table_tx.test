@@ -1,6 +1,6 @@
 # skip: disk — explicit transactions span records, while disk mode reopens after every record.
-# ALTER TABLE slice 1 participates in ordinary transactional rollback and READ ONLY admission.
-# requires: ddl.alter_table, ddl.create_table, ddl.primary_key, dml.insert, query.select, txn.explicit, txn.read_only, types.i32
+# ALTER TABLE slices 1-3 participate in ordinary transactional rollback and READ ONLY admission.
+# requires: ddl.alter_table, ddl.create_table, ddl.primary_key, ddl.column_default, dml.insert, query.select, txn.explicit, txn.read_only, types.i32
 
 statement ok
 CREATE TABLE alter_tx (id i32 PRIMARY KEY, v i32)
@@ -25,6 +25,19 @@ SELECT id, v FROM alter_tx
 
 statement error 42703
 SELECT changed FROM alter_tx
+
+# A table rewrite and its catalog edit roll back together.
+statement ok
+BEGIN
+
+statement ok
+ALTER TABLE alter_tx ADD added i32 DEFAULT 8
+
+statement ok
+ROLLBACK
+
+statement error 42703
+SELECT added FROM alter_tx
 
 statement ok
 BEGIN READ ONLY

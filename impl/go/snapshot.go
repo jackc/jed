@@ -872,6 +872,22 @@ func (s *snapshot) alterTableCatalog(oldKey string, t *catTable, renameTable, in
 	}
 }
 
+func (s *snapshot) alterTableRewrite(t *catTable, colTypes []colType, entries []entry, nextRowid int64, pageSize uint32) error {
+	s.putTableResolved(t, colTypes, pageSize)
+	store := s.store(t.Name)
+	store.BumpRowidTo(nextRowid)
+	for _, e := range entries {
+		ok, err := store.Insert(e.Key, e.Row)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			panic("ADD COLUMN retains distinct existing storage keys")
+		}
+	}
+	return nil
+}
+
 // syncAlterConstraintIndexes applies the backing-store delta for ALTER TABLE slice 2 after the
 // final catalog and row validation have succeeded. Entries are already sorted by raw key bytes.
 func (s *snapshot) syncAlterConstraintIndexes(old, next *catTable, entries map[string][][]byte, pageSize uint32) error {
@@ -906,6 +922,28 @@ func (s *snapshot) syncAlterConstraintIndexes(old, next *catTable, entries map[s
 			}
 			if !inserted {
 				panic("constraint index entries include the storage-key suffix")
+			}
+		}
+		s.indexStores[key] = fresh
+	}
+	return nil
+}
+
+func (s *snapshot) rebuildAlterIndexes(old, next *catTable, entries map[string][][]byte, pageSize uint32) error {
+	for _, ix := range old.Indexes {
+		key := strings.ToLower(ix.Name)
+		delete(s.indexStores, key)
+		delete(s.gistTrees, key)
+	}
+	for _, ix := range next.Indexes {
+		key := strings.ToLower(ix.Name)
+		fresh := newTableStore(pagePayload(pageSize), nil)
+		if s.storePaging != nil {
+			fresh.attachPaging(s.storePaging)
+		}
+		for _, e := range entries[key] {
+			if _, err := fresh.Insert(e, nil); err != nil {
+				return err
 			}
 		}
 		s.indexStores[key] = fresh

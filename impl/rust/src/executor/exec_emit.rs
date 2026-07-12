@@ -1106,13 +1106,15 @@ impl Engine {
     /// Choose the auto-generated name for a `serial` column's OWNED sequence (sequences.md §12),
     /// matching PostgreSQL: `lower(table)_lower(column)_seq`, with the smallest integer suffix `1`,
     /// `2`, … appended until the name is free in the relation namespace — not taken by an existing
-    /// relation, not equal to the table being created, and not already chosen by an earlier `serial`
-    /// column of the same statement (`pending`). All-lowercase identifier-derived, so deterministic.
+    /// relation, not equal to the table being created, not already chosen by an earlier `serial`
+    /// column of the same statement (`pending`), and not held by a caller-known pending relation.
+    /// All-lowercase identifier-derived, so deterministic.
     pub(crate) fn choose_serial_seq_name(
         &self,
         table: &str,
         column: &str,
         pending: &[SequenceDef],
+        reserved: &[String],
     ) -> String {
         let base = format!(
             "{}_{}_seq",
@@ -1123,6 +1125,7 @@ impl Engine {
             self.relation_exists(c)
                 || c.eq_ignore_ascii_case(table)
                 || pending.iter().any(|s| s.name.eq_ignore_ascii_case(c))
+                || reserved.iter().any(|name| name.eq_ignore_ascii_case(c))
         };
         if !taken(&base) {
             return base;

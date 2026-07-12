@@ -49,13 +49,15 @@ Each is rejected before anything is written — a statement is all-or-nothing. S
 
 ## Altering a table
 
-`ALTER TABLE` can rename a table, column, or constraint; change a column's default or `NOT NULL`
-status; and add or drop CHECK, UNIQUE, FOREIGN KEY, and EXCLUDE constraints. Try these statements:
+`ALTER TABLE` can add columns, rename a table, column, or constraint; change a column's default or
+`NOT NULL` status; and add or drop CHECK, UNIQUE, FOREIGN KEY, and EXCLUDE constraints. Try these
+statements:
 
 ```sql
 ALTER TABLE account RENAME COLUMN balance TO available_balance;
 ALTER TABLE account ALTER COLUMN available_balance SET DEFAULT 0;
 ALTER TABLE account ALTER COLUMN available_balance SET NOT NULL;
+ALTER TABLE account ADD COLUMN opened_by text DEFAULT 'import';
 ALTER TABLE account RENAME CONSTRAINT balance_nonnegative TO nonnegative_balance;
 ALTER TABLE account ADD CONSTRAINT owner_unique UNIQUE (owner);
 ALTER TABLE account DROP CONSTRAINT owner_unique;
@@ -78,11 +80,14 @@ table.
 
 Adding a constraint validates existing rows before publishing it and builds the backing index for
 UNIQUE or EXCLUDE. Dropping a referenced UNIQUE constraint defaults to `RESTRICT`; `CASCADE` also
-removes dependent foreign keys. ALTER TABLE does not yet add or drop columns, change column types,
-or manage identity properties. Identity-column defaults and nullability must be managed through the
+removes dependent foreign keys. `ADD COLUMN` rewrites existing rows with the column's default (or
+null), evaluates expression defaults once per row, and accepts the same inline constraints as
+`CREATE TABLE`; `IF NOT EXISTS` is available. A non-empty table cannot add a `NOT NULL` column with
+no usable default (`23502`). ALTER TABLE does not yet drop columns, change existing column types, or
+manage identity properties. Identity-column defaults and nullability must be managed through the
 future identity-specific syntax rather than the generic column actions. PRIMARY KEY has no persisted
-constraint object yet, so renaming the derived `account_pkey` handle reports `42704`; that form is
-deferred with primary-key alteration.
+constraint object yet, so renaming the derived `account_pkey` handle reports `42704`; standalone
+primary-key alteration remains deferred.
 
 ## Exclusion constraints — `EXCLUDE`
 

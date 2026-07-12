@@ -231,10 +231,6 @@ func TestSequenceAlterUnsupportedActionsAre0A000(t *testing.T) {
 			t.Fatalf("%q: expected 0A000, got %s", sql, code)
 		}
 	}
-	// ALTER TABLE owns its authoritative planned grammar; ADD COLUMN is a later slice → 0A000.
-	if code := seqErrCode(t, db, "ALTER TABLE t ADD COLUMN c i32"); code != "0A000" {
-		t.Fatalf("expected 0A000, got %s", code)
-	}
 }
 
 // An ALTER SEQUENCE … <options> edit is a transactional catalog write — it rolls back with its block

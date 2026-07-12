@@ -420,7 +420,7 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 			// Create the OWNED sequence — a default ascending i64 for serial, or the IDENTITY column's
 			// `( seq_options )` (defaulting the same way) — and synthesize the DEFAULT nextval(...)
 			// expression default (format_version 8 mechanism).
-			seqName := db.chooseSerialSeqName(ct.Name, def.Name, pendingSerials)
+			seqName := db.chooseSerialSeqName(ct.Name, def.Name, pendingSerials, nil)
 			owner := &seqOwner{Table: ct.Name, Column: uint16(len(columns))} // this column's ordinal
 			var opts seqOptions
 			if def.Identity != nil {
@@ -1472,7 +1472,7 @@ func (db *engine) executeDropTable(dt *dropTable) (outcome, error) {
 	return outcome{Kind: outcomeStatement, Cost: 0}, nil
 }
 
-// executeAlterTable implements the catalog-only ALTER TABLE slices 1-2 (alter.md §1/§2).
+// executeAlterTable implements ALTER TABLE slices 1-3 (alter.md §1-§3.1).
 // It edits one private table copy, validates the final state, and publishes one catalog mutation.
 func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 	if err := checkCatalogRelWrite(at.Name); err != nil {
@@ -1522,6 +1522,8 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 	table.ForeignKeys = append([]foreignKey(nil), original.ForeignKeys...)
 	table.Exclusions = append([]exclusionConstraint(nil), original.Exclusions...)
 	constraintState := newAlterConstraintState()
+	var addedColumns []catColumn
+	var pendingSerials []*sequenceDef
 	indexOld, indexNew := "", ""
 	renameTable := ""
 	relationTaken := func(name string) bool {
@@ -1536,6 +1538,11 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 	// snapshot: an owned index removed from `table` has released its name, while an earlier ADD has
 	// already occupied its new name.
 	workingRelationTaken := func(name string) bool {
+		for _, seq := range pendingSerials {
+			if strings.EqualFold(seq.Name, name) {
+				return true
+			}
+		}
 		for _, ix := range table.Indexes {
 			if strings.EqualFold(ix.Name, name) {
 				return true
@@ -1655,7 +1662,63 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 			return strings.ToLower(table.Exclusions[i].Name) < strings.ToLower(table.Exclusions[j].Name)
 		})
 	} else {
-		for _, a := range at.Actions {
+		actions := append([]alterTableEdit(nil), at.Actions...)
+		for len(actions) > 0 {
+			a := actions[0]
+			actions = actions[1:]
+			if a.AddColumn != nil {
+				add := a.AddColumn
+				if table.ColumnIndex(add.Column.Name) >= 0 {
+					if add.IfNotExists {
+						continue
+					}
+					return outcome{}, newError(DuplicateColumn, "column already exists: "+add.Column.Name)
+				}
+				if len(add.ForeignKeys) > 0 && (snap == db.tempSnap() || isAttachmentScope(at.DB)) {
+					return outcome{}, newError(FeatureNotSupported, "this constraint is not supported in this table scope")
+				}
+				// Earlier index actions already live in table; named inline UNIQUE constraints are
+				// queued only after this column resolves. Both reserve their relation names while an
+				// owned serial/identity sequence chooses its name.
+				reservedRelationNames := make([]string, 0, len(table.Indexes)+len(add.Uniques))
+				for _, ix := range table.Indexes {
+					reservedRelationNames = append(reservedRelationNames, ix.Name)
+				}
+				if !add.Column.PrimaryKey {
+					for _, u := range add.Uniques {
+						if u.Name != "" {
+							reservedRelationNames = append(reservedRelationNames, u.Name)
+						}
+					}
+				}
+				col, err := db.buildAlterAddedColumn(&table, &add.Column, &pendingSerials, reservedRelationNames, snap == db.tempSnap(), isAttachmentScope(at.DB))
+				if err != nil {
+					return outcome{}, err
+				}
+				table.Columns = append(table.Columns, col)
+				if col.PrimaryKey {
+					table.PK = []int{len(table.Columns) - 1}
+				}
+				addedColumns = append(addedColumns, col)
+				var inline []alterTableEdit
+				for i := range add.Checks {
+					d := add.Checks[i]
+					inline = append(inline, alterTableEdit{Add: &alterConstraintDef{Check: &d}})
+				}
+				for i := range add.Uniques {
+					if col.PrimaryKey {
+						continue
+					}
+					d := add.Uniques[i]
+					inline = append(inline, alterTableEdit{Add: &alterConstraintDef{Unique: &d}})
+				}
+				for i := range add.ForeignKeys {
+					d := add.ForeignKeys[i]
+					inline = append(inline, alterTableEdit{Add: &alterConstraintDef{Foreign: &d}})
+				}
+				actions = append(inline, actions...)
+				continue
+			}
 			if a.Add != nil {
 				if (snap == db.tempSnap()) && (a.Add.Foreign != nil || a.Add.Exclude != nil) {
 					return outcome{}, newError(FeatureNotSupported, "this constraint is not supported on a temporary table")
@@ -1714,9 +1777,107 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 		}
 	}
 
+	alterPageSize := db.pageSize
+	if isAttachmentScope(at.DB) {
+		alterPageSize = db.attachPageSize(strings.ToLower(*at.DB))
+	}
+	var rewriteColTypes []colType
+	if len(addedColumns) > 0 {
+		rewriteColTypes = make([]colType, len(table.Columns))
+		for i, c := range table.Columns {
+			rewriteColTypes[i] = resolveColType(c.Type, db.readSnap().types)
+		}
+	}
 	meter := db.session.newMeter()
+	var rewriteRows []entry
+	rewriteNextRowid := int64(0)
+	if len(addedColumns) > 0 {
+		for _, seq := range pendingSerials {
+			var sw *snapshot
+			if at.DB == nil {
+				if snap == db.tempSnap() {
+					db.session.tx.tempDirty = true
+					sw = db.session.tx.tempWorking
+				} else {
+					sw = db.working()
+				}
+			} else {
+				switch strings.ToLower(*at.DB) {
+				case "temp":
+					db.session.tx.tempDirty = true
+					sw = db.session.tx.tempWorking
+				case "main":
+					sw = db.working()
+				default:
+					sw = db.attachWriteSnap(strings.ToLower(*at.DB))
+				}
+			}
+			sw.putSequence(seq)
+		}
+		store := db.lkpStoreScoped(at.DB, original.Name)
+		oldMask := make([]bool, len(original.Columns))
+		for i := range oldMask {
+			oldMask[i] = true
+		}
+		rows, pages, slabs, err := store.ScanWithUnits(oldMask)
+		if err != nil {
+			return outcome{}, err
+		}
+		rewriteNextRowid = store.nextRowid
+		meter.Charge(costs.PageRead*int64(pages) + costs.ValueDecompress*int64(slabs))
+		defaultTable := table
+		defaultTable.Columns = append([]catColumn(nil), addedColumns...)
+		defaults, err := db.resolveDefaultExprs(&defaultTable)
+		if err != nil {
+			return outcome{}, err
+		}
+		rng := newStmtRng()
+		rekey := !slices.Equal(table.PK, original.PK)
+		colls := db.columnCollations(table.Columns)
+		seenKeys := map[string]bool{}
+		compressUnits := int64(0)
+		for i := range rows {
+			if err := meter.Guard(); err != nil {
+				return outcome{}, err
+			}
+			meter.Charge(costs.StorageRowRead)
+			row, err := store.resolveAll(rows[i].Row)
+			if err != nil {
+				return outcome{}, err
+			}
+			for ci := len(original.Columns); ci < len(table.Columns); ci++ {
+				added := addedColumns[ci-len(original.Columns)]
+				v, err := db.evalDefault(added, defaults[ci-len(original.Columns)], rng, meter)
+				if err != nil {
+					return outcome{}, err
+				}
+				if table.Columns[ci].NotNull && v.IsNull() {
+					return outcome{}, newNotNullViolation(table.Columns[ci].Name)
+				}
+				row = append(row, v)
+			}
+			rows[i].Row = row
+			if rekey {
+				key, err := encodePkKey(&table, table.PK, colls, row)
+				if err != nil {
+					return outcome{}, err
+				}
+				if seenKeys[string(key)] {
+					return outcome{}, newUniqueViolation(table.Name, pkeyName(table.Name))
+				}
+				seenKeys[string(key)] = true
+				rows[i].Key = key
+			}
+			compressUnits += int64(recordCompressUnits(rewriteColTypes, rows[i].Key, row, pagePayload(alterPageSize)))
+		}
+		meter.Charge(costs.ValueCompress * compressUnits)
+		if err := meter.Guard(); err != nil {
+			return outcome{}, err
+		}
+		rewriteRows = rows
+	}
 	mask := make([]bool, len(table.Columns))
-	for i := range table.Columns {
+	for i := range original.Columns {
 		mask[i] = !original.Columns[i].NotNull && table.Columns[i].NotNull
 	}
 	if slices.Contains(mask, true) {
@@ -1742,9 +1903,29 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 			}
 		}
 	}
-	constraintEntries, err := db.validateAlterConstraints(original, &table, at.DB, snap, constraintState, meter)
+	constraintEntries, err := db.validateAlterConstraints(original, &table, at.DB, snap, constraintState, meter, rewriteRows)
 	if err != nil {
 		return outcome{}, err
+	}
+	rekeyed := rewriteRows != nil && !slices.Equal(table.PK, original.PK)
+	if rekeyed {
+		constraintEntries = map[string][][]byte{}
+		colls := db.columnCollations(table.Columns)
+		for _, ix := range table.Indexes {
+			ri, err := db.resolveIndex(&table, ix)
+			if err != nil {
+				return outcome{}, err
+			}
+			key := strings.ToLower(ix.Name)
+			for _, entry := range rewriteRows {
+				es, err := db.indexEntries(table.Columns, colls, &ri, entry.Key, entry.Row)
+				if err != nil {
+					return outcome{}, err
+				}
+				constraintEntries[key] = append(constraintEntries[key], es...)
+			}
+			slices.SortFunc(constraintEntries[key], bytes.Compare)
+		}
 	}
 	var ws *snapshot
 	if at.DB == nil {
@@ -1765,8 +1946,19 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 			ws = db.attachWriteSnap(strings.ToLower(*at.DB))
 		}
 	}
-	ws.alterTableCatalog(oldKey, &table, renameTable, indexOld, indexNew)
-	if err := ws.syncAlterConstraintIndexes(original, &table, constraintEntries, db.pageSize); err != nil {
+	if rewriteRows != nil {
+		if err := ws.alterTableRewrite(&table, rewriteColTypes, rewriteRows, rewriteNextRowid, alterPageSize); err != nil {
+			return outcome{}, err
+		}
+	} else {
+		ws.alterTableCatalog(oldKey, &table, renameTable, indexOld, indexNew)
+	}
+	if rekeyed {
+		err = ws.rebuildAlterIndexes(original, &table, constraintEntries, alterPageSize)
+	} else {
+		err = ws.syncAlterConstraintIndexes(original, &table, constraintEntries, alterPageSize)
+	}
+	if err != nil {
 		return outcome{}, err
 	}
 	for key, changed := range constraintState.other {
@@ -1799,6 +1991,142 @@ func (db *engine) buildAlterDefault(col catColumn, def *defaultDef) (*Value, *de
 		return nil, nil, typeError(fmt.Sprintf("column %s is of type %s but default expression is of type %s", col.Name, ty.CanonicalName(), rtName(rt)))
 	}
 	return nil, &defaultExprDef{ExprText: def.Text, Expr: def.Expr}, nil
+}
+
+func (db *engine) buildAlterAddedColumn(table *catTable, def *columnDef, pending *[]*sequenceDef, reservedRelationNames []string, tempScope, attachmentScope bool) (catColumn, error) {
+	serialKind, isSerial := serialPseudoType(def.TypeName)
+	var ty dataType
+	var decimal *decimalTypmod
+	var varcharLen *uint32
+	if isSerial {
+		if def.TypeMod != nil {
+			return catColumn{}, newError(SyntaxError, "type modifier is not allowed for type "+def.TypeName)
+		}
+		ty = scalarT(serialKind)
+	} else if base, ok := strings.CutSuffix(def.TypeName, "[]"); ok {
+		if def.TypeMod != nil {
+			return catColumn{}, newError(FeatureNotSupported, "a type modifier on an array type is not supported yet")
+		}
+		if s, ok := scalarTypeFromName(base); ok {
+			ty = arrayT(scalarT(s))
+		} else if c := db.readSnap().compositeType(base); c != nil {
+			ty = arrayT(compositeT(c.Name))
+		} else {
+			return catColumn{}, newError(UndefinedObject, "type does not exist: "+base)
+		}
+	} else if r, ok := rangeByName(def.TypeName); ok {
+		if def.TypeMod != nil {
+			return catColumn{}, newError(FeatureNotSupported, "a type modifier on a range type is not supported")
+		}
+		ty = rangeT(scalarT(elementScalar(r)))
+	} else if _, ok := scalarTypeFromName(def.TypeName); ok {
+		s, d, v, err := resolveTypeAndTypmod(def.TypeName, def.TypeMod)
+		if err != nil {
+			return catColumn{}, err
+		}
+		if s == scalarJsonPath {
+			return catColumn{}, newError(FeatureNotSupported, "a jsonpath column is not supported yet")
+		}
+		ty, decimal, varcharLen = scalarT(s), d, v
+	} else if c := db.readSnap().compositeType(def.TypeName); c != nil {
+		if def.TypeMod != nil {
+			return catColumn{}, newError(FeatureNotSupported, "a type modifier is not supported for composite type "+def.TypeName)
+		}
+		ty = compositeT(c.Name)
+	} else {
+		return catColumn{}, newError(UndefinedObject, "type does not exist: "+def.TypeName)
+	}
+
+	collation := ""
+	if def.Collation != "" {
+		if !ty.IsText() {
+			return catColumn{}, typeError("collations are not supported by type " + ty.CanonicalName())
+		}
+		if _, err := resolveCollationName(db, def.Collation); err != nil {
+			return catColumn{}, err
+		}
+		if def.Collation != "C" {
+			collation = def.Collation
+		}
+	} else if ty.IsText() {
+		collation = db.readSnap().defaultCollation
+	}
+	if tempScope && collation != "" {
+		return catColumn{}, newError(FeatureNotSupported, "COLLATE on a temporary-table column is not yet supported")
+	}
+	if attachmentScope && (ty.IsComposite() || collation != "") {
+		return catColumn{}, newError(FeatureNotSupported, "this column type or collation is not supported on an attached-database table")
+	}
+
+	col := catColumn{Name: def.Name, Type: ty, Decimal: decimal, VarcharLen: varcharLen, PrimaryKey: def.PrimaryKey, NotNull: def.PrimaryKey || def.NotNull || isSerial || def.Identity != nil, Collation: collation}
+	if def.PrimaryKey {
+		if len(table.PK) > 0 {
+			return catColumn{}, newError(InvalidTableDefinition, "multiple primary keys for table "+table.Name+" are not allowed")
+		}
+		if ty.IsComposite() || (ty.IsArray() && !isArrayKeyable(ty)) || (!ty.IsArray() && !ty.IsRange() && !isKeyableScalarType(ty.ScalarTy())) {
+			return catColumn{}, newError(FeatureNotSupported, "a "+ty.CanonicalName()+" primary key is not supported yet")
+		}
+	}
+	if isSerial || def.Identity != nil {
+		if attachmentScope {
+			return catColumn{}, newError(FeatureNotSupported, "a serial / IDENTITY column on an attached-database table is not supported yet")
+		}
+		if def.Identity != nil && !ty.IsInteger() {
+			return catColumn{}, newError(InvalidParameterValue, "identity column type must be smallint, integer, or bigint")
+		}
+		if def.Identity != nil && (def.Default != nil || isSerial) {
+			return catColumn{}, newError(SyntaxError, fmt.Sprintf("both default and identity specified for column %s of table %s", def.Name, table.Name))
+		}
+		if isSerial && def.Default != nil {
+			return catColumn{}, newError(SyntaxError, fmt.Sprintf("multiple default values specified for column %s of table %s", def.Name, table.Name))
+		}
+		seqName := db.chooseSerialSeqName(table.Name, def.Name, *pending, reservedRelationNames)
+		var opts seqOptions
+		if def.Identity != nil {
+			opts = def.Identity.Options
+		}
+		if opts.DataType != "" {
+			return catColumn{}, newError(SyntaxError, "conflicting or redundant options")
+		}
+		seqScalar := serialKind
+		if !isSerial {
+			seqScalar = ty.ScalarTy()
+		}
+		dtype, ok := seqDataTypeForScalar(seqScalar)
+		if !ok {
+			panic("serial/identity integer")
+		}
+		opts.DataType = dtype.PgName()
+		seq, err := buildSequenceDef(seqName, opts, &seqOwner{Table: table.Name, Column: uint16(len(table.Columns))})
+		if err != nil {
+			return catColumn{}, err
+		}
+		*pending = append(*pending, seq)
+		exprText := "nextval ( '" + strings.ReplaceAll(seqName, "'", "''") + "' )"
+		expr, err := parseExpression(exprText)
+		if err != nil {
+			return catColumn{}, err
+		}
+		col.DefaultExpr = &defaultExprDef{ExprText: exprText, Expr: expr}
+		if def.Identity != nil {
+			k := identityByDefault
+			if def.Identity.Always {
+				k = identityAlways
+			}
+			col.Identity = &k
+		}
+	} else if ty.IsComposite() || ty.IsArray() || ty.IsRange() {
+		if def.Default != nil {
+			return catColumn{}, newError(FeatureNotSupported, "a DEFAULT on a composite-, array-, or range-typed column is not supported yet")
+		}
+	} else if def.Default != nil {
+		dv, de, err := db.buildAlterDefault(col, def.Default)
+		if err != nil {
+			return catColumn{}, err
+		}
+		col.Default, col.DefaultExpr = dv, de
+	}
+	return col, nil
 }
 
 func rewriteAlterTableExpressions(table *catTable, old, next string, tableRename bool) error {
@@ -1857,9 +2185,10 @@ func rewriteAlterTableExpressions(table *catTable, old, next string, tableRename
 // chooseSerialSeqName chooses the auto-generated name for a serial column's OWNED sequence
 // (spec/design/sequences.md §12), matching PostgreSQL: lower(table)_lower(column)_seq, with the
 // smallest integer suffix 1, 2, … appended until the name is free in the relation namespace — not
-// taken by an existing relation, not equal to the table being created, and not already chosen by an
-// earlier serial column of the same statement (pending). All-lowercase identifier-derived.
-func (db *engine) chooseSerialSeqName(table, column string, pending []*sequenceDef) string {
+// taken by an existing relation, not equal to the table being created, not already chosen by an
+// earlier serial column of the same statement (pending), and not held by a caller-known pending
+// relation. All-lowercase identifier-derived.
+func (db *engine) chooseSerialSeqName(table, column string, pending []*sequenceDef, reserved []string) string {
 	base := strings.ToLower(table) + "_" + strings.ToLower(column) + "_seq"
 	taken := func(c string) bool {
 		if db.relationExists(c) || strings.EqualFold(c, table) {
@@ -1867,6 +2196,11 @@ func (db *engine) chooseSerialSeqName(table, column string, pending []*sequenceD
 		}
 		for _, s := range pending {
 			if strings.EqualFold(s.Name, c) {
+				return true
+			}
+		}
+		for _, name := range reserved {
+			if strings.EqualFold(name, c) {
 				return true
 			}
 		}

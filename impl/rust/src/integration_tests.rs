@@ -3,6 +3,8 @@
 //! private internal modules. Cargo's auto-discovery is off (autotests = false); this is the seam.
 #![cfg(test)]
 
+#[path = "../tests/alter_table.rs"]
+mod alter_table;
 #[path = "../tests/api.rs"]
 mod api;
 #[path = "../tests/array.rs"]

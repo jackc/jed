@@ -167,6 +167,18 @@ fn update_meters_compress_attempts_per_rewritten_row() {
 }
 
 #[test]
+fn alter_add_column_meters_compress_attempts_per_rewritten_row() {
+    let mut db = two_tables();
+    let read_delta = cost(&mut db, "SELECT * FROM comp") - cost(&mut db, "SELECT * FROM control");
+    let comp = cost(&mut db, "ALTER TABLE comp ADD extra i32");
+    let control = cost(&mut db, "ALTER TABLE control ADD extra i32");
+    // Both ALTERs do the same scan/rewrite. The compressed table additionally pays the old value's
+    // decompression slabs plus the replacement row's fresh compression attempt.
+    assert_eq!(read_delta, SLABS_600);
+    assert_eq!(comp, control + read_delta + SLABS_600);
+}
+
+#[test]
 fn decimal_payloads_compress_too() {
     // A long-coefficient decimal's body (flags|scale|ndigits|groups) is a spillable payload
     // like text/bytea (large-values.md §12/§13). 801 digits (an "12"-run plus ".5" so the

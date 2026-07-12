@@ -3,16 +3,22 @@
 # ALTER TABLE must classify the DDL capability from the resolved qualifier, not only the bare table
 # name. A same-named temp table must never let allow_temp_ddl authorize a persistent attachment edit.
 # attach: work
-# requires: ddl.alter_table, ddl.create_table, ddl.temp_table, ddl.primary_key, ddl.foreign_key, ddl.exclusion_constraint, attach.in_memory, harness.attach, session.allow_ddl, session.allow_temp_ddl, dml.insert, query.select, query.qualified_table, types.i32
+# requires: ddl.alter_table, ddl.create_table, ddl.temp_table, ddl.primary_key, ddl.column_default, ddl.foreign_key, ddl.exclusion_constraint, attach.in_memory, harness.attach, session.allow_ddl, session.allow_temp_ddl, dml.insert, query.select, query.qualified_table, types.i32
 
 statement ok
 CREATE TABLE work.scope_target (id i32 PRIMARY KEY, v i32)
+
+statement ok
+CREATE TABLE work.add_target (id i32 PRIMARY KEY)
 
 statement ok
 CREATE TEMP TABLE scope_target (id i32 PRIMARY KEY, v i32)
 
 statement ok
 INSERT INTO work.scope_target VALUES (1, 10)
+
+statement ok
+INSERT INTO work.add_target VALUES (1)
 
 statement ok
 INSERT INTO temp.scope_target VALUES (1, 20)
@@ -52,3 +58,22 @@ query I nosort
 SELECT temp_changed FROM temp.scope_target WHERE id = 1
 ----
 20
+
+# Rewrites route to the same qualified storage domain as catalog-only edits.
+statement ok
+ALTER TABLE temp.scope_target ADD local_added i32 DEFAULT 21
+
+query I nosort
+SELECT local_added FROM temp.scope_target WHERE id = 1
+----
+21
+
+# allow_ddl: on
+# allow_temp_ddl: off
+statement ok
+ALTER TABLE work.add_target ADD attached_added i32 DEFAULT 11
+
+query I nosort
+SELECT attached_added FROM work.add_target WHERE id = 1
+----
+11
