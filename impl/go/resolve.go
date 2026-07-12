@@ -2290,7 +2290,7 @@ func resolveBinary(s *scope, b *binaryExpr, ag *aggCtx, params *paramTypes) (*rE
 	case opJsonPathExists, opJsonPathMatch:
 		sym, fnKind := "@?", jpfExists
 		if b.Op == opJsonPathMatch {
-			sym, fnKind = "@@", jpfMatch
+			sym, fnKind = "@@", jpfMatchSilent
 		}
 		jsonbHint := scalarJsonb
 		ctx, ct, err := resolve(s, b.Lhs, &jsonbHint, ag, params)

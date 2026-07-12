@@ -145,6 +145,17 @@ SELECT xs FROM cmpn ORDER BY xs
 {1,3}
 {1,NULL}
 
+# Strict ordering is irreflexive; the non-strict operators include structural equality.
+query BBBB nosort
+SELECT ARRAY[1,NULL] < ARRAY[1,NULL], ARRAY[1,NULL] <= ARRAY[1,NULL],
+       ARRAY[1,NULL] > ARRAY[1,NULL], ARRAY[1,NULL] >= ARRAY[1,NULL]
+FROM cmpn WHERE id = 1
+----
+false
+true
+false
+true
+
 # {1,NULL} > {1,3}: the 2nd element NULL is larger than 3 -> TRUE (definite, not UNKNOWN).
 query B nosort
 SELECT xs > ARRAY[1,3] FROM cmpn WHERE id = 2

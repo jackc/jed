@@ -57,6 +57,16 @@ true
 true
 true
 
+# Strict ordering is irreflexive; the non-strict operators include equality.
+query BBBB nosort
+SELECT '{"a":1}'::jsonb < '{"a":1}'::jsonb, '{"a":1}'::jsonb <= '{"a":1}'::jsonb,
+       '{"a":1}'::jsonb > '{"a":1}'::jsonb, '{"a":1}'::jsonb >= '{"a":1}'::jsonb
+----
+false
+true
+false
+true
+
 # Type-rank cross-kind: a Number outranks a String, an Object outranks everything.
 query BBB nosort
 SELECT '1'::jsonb > '"zzz"'::jsonb, '{}'::jsonb > '[1,2,3]'::jsonb, 'null'::jsonb < 'false'::jsonb

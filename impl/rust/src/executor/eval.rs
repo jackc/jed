@@ -831,13 +831,19 @@ impl RExpr {
                         Ok(seq.into_iter().next().map_or(Value::Null, Value::Jsonb))
                     }
                     JsonPathFnKind::QueryArray => Ok(Value::Jsonb(JsonNode::Array(seq))),
-                    // jsonb_path_match / @@: the path must produce EXACTLY one boolean item.
+                    // jsonb_path_match: the path must produce EXACTLY one boolean item.
                     JsonPathFnKind::Match => match seq.as_slice() {
                         [JsonNode::Bool(b)] => Ok(Value::Bool(*b)),
                         _ => Err(EngineError::new(
                             SqlState::SingletonSqlJsonItemRequired,
                             "single boolean result is expected",
                         )),
+                    },
+                    // @@ is PostgreSQL's silent match form: suppress a non-singleton/non-boolean
+                    // result to SQL NULL.
+                    JsonPathFnKind::MatchSilent => match seq.as_slice() {
+                        [JsonNode::Bool(b)] => Ok(Value::Bool(*b)),
+                        _ => Ok(Value::Null),
                     },
                 }
             }

@@ -116,6 +116,17 @@ SELECT jsonb_path_match('{}', '$.a == 1')
 ----
 false
 
+# A non-predicate path produces a JSON item, not the required single boolean item. The scalar
+# function reports PostgreSQL's dedicated cardinality/type error; this is distinct from @@, whose
+# PostgreSQL-compatible silent form yields NULL for the same input.
+statement error 22038
+SELECT jsonb_path_match('{"a": 1}', '$.a')
+
+query B nosort
+SELECT '{"a": 1}'::jsonb @@ '$.a'
+----
+NULL
+
 # The @@ operator is jsonb_path_match, with && / || and an existential element comparison.
 query BBB nosort
 SELECT '{"a": 1}'::jsonb @@ '$.a == 1', '{"a": 1}'::jsonb @@ '$.a > 5', '{"a": [1, 2, 3]}'::jsonb @@ '$.a[*] == 2'

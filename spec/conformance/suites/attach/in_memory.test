@@ -9,7 +9,7 @@
 # no embedded multi-database model), so CROSS-CORE-checked, NOT PostgreSQL-oracle-checked.
 # attach: mydb
 # attach: refs
-# requires: attach.in_memory, harness.attach, query.qualified_table, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.unique, ddl.check, dml.insert, dml.insert_multi_row, dml.insert_select, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.join_inner, types.i32, types.text
+# requires: attach.in_memory, harness.attach, query.qualified_table, ddl.create_table, ddl.temp_table, ddl.primary_key, ddl.secondary_index, ddl.unique, ddl.check, dml.insert, dml.insert_multi_row, dml.insert_select, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.join_inner, types.i32, types.text, session.allow_temp_ddl
 
 # --- CREATE TABLE into an attachment + populate it --------------------------------------------
 
@@ -177,3 +177,25 @@ CREATE TABLE mydb.f (id i32 PRIMARY KEY, parent i32 REFERENCES tag (id))
 
 statement error 0A000
 INSERT INTO mydb.acct VALUES (1, 'a@x', 1) ON CONFLICT (id) DO NOTHING
+
+# --- explicit attachment scope wins over a same-named temporary table -------------------------
+
+# A temp relation may share a name with a relation in an explicit attachment: bare lookup sees the
+# session-local temp table, while mydb.item must continue to route to the attachment's catalog/store.
+statement ok
+CREATE TEMP TABLE item (id i32 PRIMARY KEY, name text, qty i32)
+
+statement ok
+INSERT INTO item VALUES (1, 'temporary', 999)
+
+query TI nosort
+SELECT name, qty FROM item WHERE id = 1
+----
+temporary
+999
+
+query TI nosort
+SELECT name, qty FROM mydb.item WHERE id = 1
+----
+apple
+10

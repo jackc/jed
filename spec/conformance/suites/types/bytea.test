@@ -102,6 +102,11 @@ INSERT INTO t VALUES (8, '\xzz')
 statement error 22P02
 INSERT INTO t VALUES (9, 'deadbeef')
 
+# ... and a prefix with the required backslash but the wrong format marker. This isolates the second
+# prefix byte from the wholly-missing-prefix case above.
+statement error 22P02
+INSERT INTO t VALUES (9, '\y00')
+
 # ... and a comparison literal traps the same way (pre-scan)
 statement error 22P02
 SELECT id FROM t WHERE b = '\xgg'

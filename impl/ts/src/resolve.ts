@@ -2030,12 +2030,12 @@ export function resolveBinary(
       }
       return resolveJsonbDelete(scope, true, rhs, rbase.node, ag, params);
     }
-    // `jsonb @? jsonpath` = jsonb_path_exists, `jsonb @@ jsonpath` = jsonb_path_match
-    // (jsonpath.md §6). Both reuse the jsonpath kernels.
+    // `jsonb @? jsonpath` = jsonb_path_exists; `jsonb @@ jsonpath` is the silent form of
+    // jsonb_path_match (jsonpath.md §6). Both reuse the jsonpath kernels.
     case "jsonPathExists":
     case "jsonPathMatch": {
       const [sym, kind]: [string, JsonPathFnKind] =
-        op === "jsonPathExists" ? ["@?", "exists"] : ["@@", "match"];
+        op === "jsonPathExists" ? ["@?", "exists"] : ["@@", "matchSilent"];
       const ctx = resolve(scope, lhs, "jsonb", ag, params);
       if (ctx.type.kind !== "jsonb" && ctx.type.kind !== "null") {
         throw engineError(

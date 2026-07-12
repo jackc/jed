@@ -3481,11 +3481,17 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			}
 			return JsonbValue(seq[0]), nil
 		case jpfMatch:
-			// jsonb_path_match / @@: the path must produce EXACTLY one boolean item.
+			// jsonb_path_match: the path must produce EXACTLY one boolean item.
 			if len(seq) == 1 && seq[0].Kind == JBool {
 				return BoolValue(seq[0].B), nil
 			}
 			return Value{}, newError(SingletonSqlJsonItemRequired, "single boolean result is expected")
+		case jpfMatchSilent:
+			// @@ is PostgreSQL's silent match form: suppress a non-singleton/non-boolean result to NULL.
+			if len(seq) == 1 && seq[0].Kind == JBool {
+				return BoolValue(seq[0].B), nil
+			}
+			return NullValue(), nil
 		default: // jpfQueryArray
 			return JsonbValue(JsonNode{Kind: JArray, Arr: seq}), nil
 		}

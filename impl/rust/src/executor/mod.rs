@@ -2090,8 +2090,11 @@ pub(crate) enum JsonPathFnKind {
     /// `jsonb_path_query_array` → the sequence wrapped in a JSON array.
     QueryArray,
     /// `jsonb_path_match` → the single boolean the path/predicate produces (22038 if not exactly one
-    /// boolean item). Also the `@@` operator.
+    /// boolean item).
     Match,
+    /// The PostgreSQL `@@` operator: the same match with non-singleton/non-boolean results suppressed
+    /// to SQL NULL.
+    MatchSilent,
 }
 
 /// Which SQL/JSON query function an [`RExpr::JsonSqlFn`] node is (json-sql-functions.md §5).

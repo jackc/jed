@@ -269,7 +269,7 @@ pub(crate) fn resolve_binary(
             let (sym, kind) = if matches!(op, BinaryOp::JsonPathExists) {
                 ("@?", JsonPathFnKind::Exists)
             } else {
-                ("@@", JsonPathFnKind::Match)
+                ("@@", JsonPathFnKind::MatchSilent)
             };
             let (ctx, ct) = resolve(scope, lhs, Some(ScalarType::Jsonb), agg, params)?;
             if !matches!(ct, ResolvedType::Jsonb | ResolvedType::Null) {
@@ -928,7 +928,9 @@ pub(crate) fn resolve_jsonpath_fn(
 ) -> Result<(RExpr, ResolvedType)> {
     let (ctx, path) = resolve_jsonpath_args(scope, name, args, agg, params)?;
     let result = match kind {
-        JsonPathFnKind::Exists | JsonPathFnKind::Match => ResolvedType::Bool,
+        JsonPathFnKind::Exists | JsonPathFnKind::Match | JsonPathFnKind::MatchSilent => {
+            ResolvedType::Bool
+        }
         JsonPathFnKind::QueryFirst | JsonPathFnKind::QueryArray => ResolvedType::Jsonb,
     };
     Ok((

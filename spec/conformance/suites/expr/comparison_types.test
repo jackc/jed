@@ -3,11 +3,11 @@
 # covered elsewhere; this file pins the FOUR ordering operators as projected boolean
 # VALUES — the value-module Lt3/Gt3 kernels and the `<=`/`>=` (Lt3∨Eq3 / Gt3∨Eq3)
 # compositions — for each type family beyond the integer/decimal numeric path:
-# f64, f32, text, boolean, bytea, uuid, timestamp, timestamptz, interval, and
+# f64, f32, text, boolean, bytea, uuid, date, timestamp, timestamptz, interval, and
 # the decimal path itself. Each operator is three-valued: a NULL operand makes the
 # result UNKNOWN (NULL), never true/false (null.three_valued). PostgreSQL-oracle-checkable.
 # Format + `requires`: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.comparison_order, query.order_by, expr.comparison_value, cast.operator, cast.string_literal, types.i32, types.text, types.boolean, types.boolean_storable, types.decimal, types.bytea, types.uuid, types.timestamp, types.timestamptz, types.interval, types.f64, types.f32, null.three_valued
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.comparison_order, query.order_by, expr.comparison_value, cast.operator, cast.string_literal, types.i32, types.text, types.boolean, types.boolean_storable, types.decimal, types.bytea, types.uuid, types.date, types.timestamp, types.timestamptz, types.interval, types.f64, types.f32, null.three_valued
 
 # Each section asserts a strictly-less pair (`a < b`) — which makes `< <=` true and `> >=`
 # false (the row `t t f f`) — and the equal pair (`a = a`) — `< >` false, `<= >=` true
@@ -132,6 +132,14 @@ SELECT '\x01'::bytea < '\x0102'::bytea, '\xff'::bytea > '\x01'::bytea
 true
 true
 
+query BBBB nosort
+SELECT '\x01'::bytea < '\x01'::bytea, '\x01'::bytea <= '\x01'::bytea, '\x01'::bytea > '\x01'::bytea, '\x01'::bytea >= '\x01'::bytea
+----
+false
+true
+false
+true
+
 # --- uuid: unsigned-byte order over the 16 bytes ------------------------------------
 query BBBB nosort
 SELECT '00000000-0000-0000-0000-000000000001'::uuid < '00000000-0000-0000-0000-000000000002'::uuid, '00000000-0000-0000-0000-000000000001'::uuid <= '00000000-0000-0000-0000-000000000002'::uuid, '00000000-0000-0000-0000-000000000001'::uuid > '00000000-0000-0000-0000-000000000002'::uuid, '00000000-0000-0000-0000-000000000001'::uuid >= '00000000-0000-0000-0000-000000000002'::uuid
@@ -147,6 +155,31 @@ SELECT 'ff000000-0000-0000-0000-000000000000'::uuid > '00000000-0000-0000-0000-0
 ----
 true
 
+query BBBB nosort
+SELECT '00000000-0000-0000-0000-000000000001'::uuid < '00000000-0000-0000-0000-000000000001'::uuid, '00000000-0000-0000-0000-000000000001'::uuid <= '00000000-0000-0000-0000-000000000001'::uuid, '00000000-0000-0000-0000-000000000001'::uuid > '00000000-0000-0000-0000-000000000001'::uuid, '00000000-0000-0000-0000-000000000001'::uuid >= '00000000-0000-0000-0000-000000000001'::uuid
+----
+false
+true
+false
+true
+
+# --- date: by the i32 day count -------------------------------------------------------
+query BBBB nosort
+SELECT date '2024-01-01' < date '2024-01-02', date '2024-01-01' <= date '2024-01-02', date '2024-01-01' > date '2024-01-02', date '2024-01-01' >= date '2024-01-02'
+----
+true
+true
+false
+false
+
+query BBBB nosort
+SELECT date '2024-01-01' < date '2024-01-01', date '2024-01-01' <= date '2024-01-01', date '2024-01-01' > date '2024-01-01', date '2024-01-01' >= date '2024-01-01'
+----
+false
+true
+false
+true
+
 # --- timestamp: by instant (i64 microseconds) -------------------------------------
 query BBBB nosort
 SELECT timestamp '2024-01-01 00:00:00' < timestamp '2024-06-01 12:00:00', timestamp '2024-01-01 00:00:00' <= timestamp '2024-06-01 12:00:00', timestamp '2024-01-01 00:00:00' > timestamp '2024-06-01 12:00:00', timestamp '2024-01-01 00:00:00' >= timestamp '2024-06-01 12:00:00'
@@ -156,12 +189,28 @@ true
 false
 false
 
+query BBBB nosort
+SELECT timestamp '2024-01-01 00:00:00' < timestamp '2024-01-01 00:00:00', timestamp '2024-01-01 00:00:00' <= timestamp '2024-01-01 00:00:00', timestamp '2024-01-01 00:00:00' > timestamp '2024-01-01 00:00:00', timestamp '2024-01-01 00:00:00' >= timestamp '2024-01-01 00:00:00'
+----
+false
+true
+false
+true
+
 # --- timestamptz: compared at the SAME instant after the offset is folded to UTC -----
 # `00:00:00+00` is earlier than `00:00:00-05` (which is 05:00:00 UTC).
 query BB nosort
 SELECT timestamptz '2024-01-01 00:00:00+00' < timestamptz '2024-01-01 00:00:00-05', timestamptz '2024-01-01 05:00:00+00' >= timestamptz '2024-01-01 00:00:00-05'
 ----
 true
+true
+
+query BBBB nosort
+SELECT timestamptz '2024-01-01 05:00:00+00' < timestamptz '2024-01-01 00:00:00-05', timestamptz '2024-01-01 05:00:00+00' <= timestamptz '2024-01-01 00:00:00-05', timestamptz '2024-01-01 05:00:00+00' > timestamptz '2024-01-01 00:00:00-05', timestamptz '2024-01-01 05:00:00+00' >= timestamptz '2024-01-01 00:00:00-05'
+----
+false
+true
+false
 true
 
 # --- interval: by the canonical span (1 day = 24h, 1 month = 30 days — PG's rule) ----
@@ -187,6 +236,14 @@ SELECT interval '2 days' >= interval '48 hours', interval '2 days' > interval '4
 ----
 true
 false
+
+query BBBB nosort
+SELECT interval '2 days' < interval '48 hours', interval '2 days' <= interval '48 hours', interval '2 days' > interval '48 hours', interval '2 days' >= interval '48 hours'
+----
+false
+true
+false
+true
 
 # --- three-valued NULL propagation: a NULL operand makes every ordering op UNKNOWN ----
 # Reached through columns (a typed NULL) so each type's Lt3/Gt3 hits its NULL guard.

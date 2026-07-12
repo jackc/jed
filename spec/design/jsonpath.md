@@ -198,7 +198,7 @@ context, a `jsonpath`, and optional `vars jsonb` + `silent boolean` trailing arg
 | function | kind | result | semantics |
 |---|---|---|---|
 | `jsonb_path_exists(jsonb, jsonpath [, vars, silent])` | scalar | `boolean` | sequence non-empty |
-| `jsonb_path_match(jsonb, jsonpath [, vars, silent])` | scalar | `boolean` | sequence must be a single boolean (`22034` otherwise unless silent) |
+| `jsonb_path_match(jsonb, jsonpath [, vars, silent])` | scalar | `boolean` | sequence must be a single boolean (`22038` otherwise unless silent) |
 | `jsonb_path_query(jsonb, jsonpath [, vars, silent])` | **SRF** | setof `jsonb` | one row per sequence item |
 | `jsonb_path_query_array(jsonb, jsonpath [, vars, silent])` | scalar | `jsonb` | wrap the sequence in a JSON array |
 | `jsonb_path_query_first(jsonb, jsonpath [, vars, silent])` | scalar | `jsonb` | first item, or NULL if empty |
@@ -244,13 +244,14 @@ single-column `Table` and driven by per-kind row generators (the executor's `res
 | operator | meaning | result |
 |---|---|---|
 | `jsonb @? jsonpath` | `jsonb_path_exists` | `boolean` |
-| `jsonb @@ jsonpath` | `jsonb_path_match` | `boolean` |
+| `jsonb @@ jsonpath` | silent `jsonb_path_match` | `boolean` |
 
 New `[[operator]]` rows (kind `"json_path"`). The lexer's `@` arm (today only `@>`) gains
 `@?` and `@@` — the exact precedent set by `@>`/`<@`. The parser binds them at the
 containment-operator precedence level (the `@>` level); the resolver routes a `jsonb @?
 jsonpath` to the path-exists kernel — hand-written dispatch, like the `@>` containment
-dispatch.
+dispatch. PostgreSQL's operator is the match function's `silent = true` form: when the path does
+not produce exactly one boolean item, `jsonb_path_match` raises `22038` but `@@` returns SQL NULL.
 
 ---
 
@@ -288,7 +289,7 @@ Register the SQL/JSON class-22 subcodes in [../errors/registry.toml](../errors/r
 | `22035` | `no_sql_json_item` | `JSON_VALUE`/`JSON_QUERY` empty, no `ON EMPTY` default |
 | `22036` | `non_numeric_sql_json_item` | arithmetic / numeric method on a non-number |
 | `22037` | `non_unique_keys_in_a_json_object` | object construction unique-keys |
-| `22038` | `singleton_sql_json_item_required` | `JSON_VALUE` requires a scalar |
+| `22038` | `singleton_sql_json_item_required` | `JSON_VALUE` requires a scalar; `jsonb_path_match` requires one boolean |
 
 Reuse existing codes where PG does: **`42601`** for a malformed path *literal* (syntax-error
 class, at resolve), **`2201B`** for a malformed `like_regex` pattern, **`0A000`** for the
@@ -317,9 +318,10 @@ After the `jsonb` foundation ([json.md §12](json.md), J0–J2):
   - **P1b/P2-match** ✅ — TOP-LEVEL predicates + `jsonb_path_match` + the `@@` operator (§6)
     have landed. A jsonpath body may be a top-level boolean predicate (`$.a == 1`,
     `$.a > 1 && $.b < 2`) — the same predicate grammar as a filter, rooted at the document.
-    `jsonb_path_match(ctx, path)` / `ctx @@ path` requires the path to produce **exactly one
-    boolean** item (else `22038`); a top-level predicate always does, with an unknown result
-    rendering as `false`. A top-level predicate, queried, yields the boolean as a single item;
+    `jsonb_path_match(ctx, path)` requires the path to produce **exactly one boolean** item (else
+    `22038`); `ctx @@ path` is its PostgreSQL-compatible silent form and returns SQL NULL for that
+    error. A top-level predicate always produces one boolean, with an unknown result rendering as
+    `false`. A top-level predicate, queried, yields the boolean as a single item;
     it renders parenthesized (`($."a" == 1)`), which round-trips through compile. Capability
     `expr.jsonpath_match`. **Still deferred (`0A000`):** item methods, arithmetic, the §4.3
     Pike-VM `like_regex` / `starts with` / `is unknown` predicates, and `$name` variables —

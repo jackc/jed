@@ -1894,7 +1894,7 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         case "queryArray":
           return jsonbValue({ kind: "array", elements: seq });
         case "match": {
-          // jsonb_path_match / @@: the path must produce EXACTLY one boolean item.
+          // jsonb_path_match: the path must produce EXACTLY one boolean item.
           if (seq.length === 1 && seq[0]!.kind === "bool") {
             return boolValue(seq[0]!.value);
           }
@@ -1903,6 +1903,12 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
             "single boolean result is expected",
           );
         }
+        case "matchSilent":
+          // @@ is PostgreSQL's silent match form: suppress a non-singleton/non-boolean result to
+          // SQL NULL.
+          return seq.length === 1 && seq[0]!.kind === "bool"
+            ? boolValue(seq[0]!.value)
+            : nullValue();
       }
       break;
     }

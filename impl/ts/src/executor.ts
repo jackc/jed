@@ -17246,7 +17246,12 @@ export type JsonBuildKind = "array" | "object";
 // "queryArray" — jsonb_path_query_array → the sequence wrapped in a JSON array;
 // "match" — jsonb_path_match (and the `@@` operator) → the single boolean the path/predicate
 // produces (22038 if not exactly one boolean item).
-export type JsonPathFnKind = "exists" | "queryFirst" | "queryArray" | "match";
+export type JsonPathFnKind =
+  | "exists"
+  | "queryFirst"
+  | "queryArray"
+  | "match"
+  | "matchSilent";
 
 // JsonSqlKind selects which SQL/JSON query function a "jsonSqlFn" RExpr node is
 // (json-sql-functions.md §5, S2): "exists" — JSON_EXISTS → boolean (non-empty sequence); errors

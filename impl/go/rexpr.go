@@ -960,9 +960,11 @@ const (
 	jpfQueryFirst
 	// jpfQueryArray is jsonb_path_query_array → the sequence wrapped in a JSON array.
 	jpfQueryArray
-	// jpfMatch is jsonb_path_match (and the `@@` operator) → the single boolean the path/predicate
-	// produces (22038 if not exactly one boolean item).
+	// jpfMatch is jsonb_path_match → the single boolean the path/predicate produces (22038 if not
+	// exactly one boolean item). jpfMatchSilent is the PostgreSQL @@ operator: the same match, but a
+	// non-singleton/non-boolean result is suppressed to SQL NULL.
 	jpfMatch
+	jpfMatchSilent
 )
 
 // rExpr is a resolved expression over fixed column indices, ready to evaluate against a
