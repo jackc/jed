@@ -1,0 +1,331 @@
+# Working TODO — Cost as a plan input (Path B)
+
+> **Temporary multi-session implementation checklist.** The canonical roadmap item is
+> “Cost as a plan input (the strategic investment — Path B)” in [TODO.md](TODO.md), and the
+> canonical architectural record remains [CLAUDE.md](CLAUDE.md) plus `spec/design/*`.
+> This file records execution order and handoff state only. Move every settled decision into
+> the relevant canonical document as it is made. Delete this file after the work is landed and
+> the remaining follow-ons, if any, have been folded back into `TODO.md`.
+
+Initial Path B is complete through **P8**. **P9** is the later statistics-quality refinement
+already anticipated by `TODO.md`; **P10** is the final landing gate.
+
+## Standing rules for every slice
+
+- [ ] Spec behavior before executor code. Keep estimator algorithms hand-written in Rust, Go,
+  and TypeScript; only mechanical constants and fixtures belong in shared generated data.
+- [ ] Land behavior in all three native cores in lockstep.
+- [ ] Keep plan choice, estimated values, actual metered cost, and EXPLAIN spelling deterministic
+  and cross-core identical.
+- [ ] Re-pin every affected `# cost:` assertion in the same slice that changes the selected plan.
+- [ ] Add a NoREC relation in every slice that enables a new optimization or plan choice.
+- [ ] Keep planning unmetered. Estimates must not charge the runtime meter or affect `max_cost` /
+  `lifetime_max_cost` enforcement.
+- [ ] Preserve PostgreSQL result behavior. EXPLAIN and jed's deterministic estimator remain
+  jed-owned surfaces and are not PostgreSQL-oracle output.
+- [ ] Add no dependency without explicit human confirmation.
+- [ ] Update relevant specs, `CLAUDE.md`, `TODO.md`, website documentation, and examples as each
+  user-visible or standing decision lands.
+
+## P0 — Ratify and specify deterministic plan choice
+
+**Goal:** settle the contract before any statistics or estimator implementation.
+
+- [ ] Add a dedicated estimator design section/document and link it from
+  [planner.md](spec/design/planner.md), [cost.md](spec/design/cost.md), and
+  [explain.md](spec/design/explain.md).
+- [ ] Ratify the “spec the plan” branch of class P in
+  [determinism.md](spec/design/determinism.md): independent cores must select the same plan rather
+  than ledgering per-core plan/cost divergence.
+- [ ] Update `CLAUDE.md` with the ratified rule that cost identity includes deterministic
+  plan-estimator identity.
+- [ ] Define the estimator's complete input set: query structure, catalog facts, transactional
+  statistics, and any admitted storage-structure facts.
+- [ ] Decide literal-versus-parameter behavior. Planning occurs before parameter binding today, so
+  parameter estimates need a deterministic generic rule unless the pipeline is deliberately
+  revised.
+- [ ] Define `est_rows` and `est_cost` representations, including zero, unknown/unavailable facts,
+  maximum values, and rendering.
+- [ ] Define exact arithmetic: integer or fixed rational operations, rounding direction at every
+  step, checked multiplication/addition, and saturation/overflow behavior identical across cores.
+- [ ] Define the estimate as named runtime-cost-unit counts plus their weighted total from
+  `spec/cost/schedule.toml`; do not invent wall-clock-only weights inside the planner.
+- [ ] Record the consequence that currently unmetered work, including sorting, is invisible to the
+  Path B objective. If such work must influence plan selection, first add and re-pin a runtime cost
+  unit explicitly.
+- [ ] Define a total candidate order and final tie-break, including access-path kind, lowercased
+  index name, physical relation order, and join algorithm.
+- [ ] Define supported and fallback estimation rules for every current plan-node kind.
+- [ ] Define a deterministic resource bound for join search so untrusted SQL cannot trigger an
+  exponential unmetered planner.
+- [ ] Decide the shared data/fixture locations and wire their coherence checks into `rake verify`.
+
+**Exit gate:** the estimator, statistics lifecycle, candidate ordering, cache-validity inputs, and
+search limits are fully specified without relying on a core implementation as the authority.
+
+## P1 — Transactional per-table row counts
+
+**Goal:** make the first estimator input exact, cheap, transactional, and available after reopen.
+
+The stores already maintain exact counts when built from empty, but a disk-loaded B+tree skeleton
+deliberately carries an unknown count so open does not walk every leaf. Persist the count; do not
+restore that leaf walk.
+
+- [ ] Define the row-count range and byte encoding in `spec/fileformat/format.md`.
+- [ ] Allocate the next `format_version` and add the count to each table catalog entry.
+- [ ] Write the exact count in from-scratch serialization and incremental catalog rewrites.
+- [ ] Load the count alongside `root_data_page` and install it into the disk-loaded `PMap` /
+  table-store skeleton in all three cores.
+- [ ] Preserve the invariant `root_data_page == 0` iff the persisted count is zero; reject corrupt
+  mismatches where they can be detected without a leaf walk.
+- [ ] Maintain the count through INSERT, INSERT … SELECT, DELETE, UPDATE re-keying, UPSERT paths,
+  cascades, ALTER rewrites, CREATE/DROP, and statement rollback.
+- [ ] Verify explicit-transaction rollback restores the old count just like other snapshot state.
+- [ ] Cover main, attached, in-memory, file-backed, and session-temporary table domains.
+- [ ] Ensure post-open mutations keep maintaining the loaded known count rather than reverting it
+  to unknown.
+- [ ] Add a byte-exact golden fixture isolating the new table-catalog field.
+- [ ] Add cross-core golden write/read tests and corruption tests.
+- [ ] Add transactional tests for commit, rollback, reopen, deletes to zero, and failed mutations.
+- [ ] Add a regression proving file open remains O(interior spine) and does not fault table leaves
+  merely to obtain the count.
+
+**Exit gate:** every visible snapshot carries an exact table count, rollback restores it, and every
+core writes and reads byte-identical files without regressing open behavior.
+
+## P2 — Statistics-aware prepared-plan cache validity
+
+**Goal:** a cached plan must remain identical to a freshly planned query after estimator inputs
+change.
+
+- [ ] Define a deterministic estimator-input fingerprint for the relations a plan references.
+- [ ] Include every fact that can affect selection: row counts, admitted structural page facts,
+  later histogram/NDV versions, database/attachment identity, and relevant catalog generation.
+- [ ] Extend prepared-plan cache entries and hit validation in Rust, Go, and TypeScript.
+- [ ] Keep the fingerprint relation-scoped where practical so unrelated table changes do not
+  invalidate a plan unnecessarily.
+- [ ] Handle attached databases explicitly; do not validate only against the main database's
+  catalog/statistics state.
+- [ ] Keep temporary-relation plans uncacheable under the existing rule unless a complete temp
+  fingerprint is deliberately specified.
+- [ ] Ensure working-transaction statistics never populate a committed cache entry.
+- [ ] Verify rollback leaves the committed fingerprint and cache validity unchanged.
+- [ ] Add prepared-versus-fresh tests that alter relevant and irrelevant table counts.
+- [ ] Assert cached and fresh executions choose the same EXPLAIN plan and accrue the same actual
+  cost.
+
+**Exit gate:** every cache hit is result-, plan-, estimate-, and actual-cost-identical to a fresh
+planning pass over the same visible snapshot.
+
+## P3 — Deterministic all-candidate inventory, behavior-neutral
+
+**Goal:** expose all legal choices without changing which plan runs yet.
+
+- [ ] Refactor `detectScanBound` / `detect_scan_bound` / `detectScanBound` into a candidate
+  inventory plus a separate selector.
+- [ ] Enumerate full scan, PK bound, every eligible ordered B-tree index, GiST, GIN, PK interval
+  set, and ordered-index interval set candidates.
+- [ ] Preserve each consumer policy explicitly: SELECT and the existing UPDATE/DELETE ordering.
+- [ ] Give every candidate a canonical identity and deterministic ordering independent of maps or
+  host iteration.
+- [ ] Retain a legacy selector that reproduces today's fixed precedence and lowest-lowercased-index
+  tie-break exactly.
+- [ ] Make scan-order capabilities and required residual filters explicit candidate properties.
+- [ ] Keep physical plan fields and executor behavior unchanged in this slice.
+- [ ] Add shared/cross-core inventory cases for multiple usable indexes and mixed access methods.
+- [ ] Run existing EXPLAIN, cost, NoREC, and CI suites with zero output or cost re-pins.
+
+**Exit gate:** every core inventories the same candidates, while the legacy selector proves the
+refactor is plan-, result-, EXPLAIN-, and cost-neutral.
+
+## P4 — Base-relation estimator in shadow mode
+
+**Goal:** estimate every base access candidate without using estimates to select it.
+
+- [ ] Author shared estimator constants/facts as language-neutral data; generate only mechanical
+  constants, never planner control flow.
+- [ ] Author shared estimator fixture vectors with inputs, per-unit counts, `est_rows`, weighted
+  `est_cost`, and expected tie keys.
+- [ ] Implement identical arithmetic helpers in all three cores.
+- [ ] Estimate full scans from row count and admitted structural facts.
+- [ ] Estimate PK equality/prefix/range candidates.
+- [ ] Estimate ordered B-tree equality-prefix and trailing-range candidates.
+- [ ] Estimate GIN, GiST, and interval-set candidates with deterministic fallback rules when row
+  counts are the only available statistics.
+- [ ] Specify selectivity for equality, inequality/range, `IS NULL`, `IN`, `BETWEEN`, AND, OR, and
+  unsupported/opaque predicates.
+- [ ] Estimate residual-filter rows separately from access-path candidate rows.
+- [ ] Estimate the runtime units affected by the access path, including `page_read`,
+  `storage_row_read`, touched-column decompression, access-method work, filter `operator_eval`, and
+  produced rows where applicable.
+- [ ] Keep the legacy selected candidate authoritative; store or test shadow estimates only.
+- [ ] Cross-check estimates against actual cost in exact/simple cases, while documenting that an
+  estimate is not generally required to equal runtime cost.
+- [ ] Run the shared estimator vectors in Rust, Go, and TypeScript.
+
+**Exit gate:** all cores compute byte-identical estimates for the complete base-candidate fixture
+matrix, and no user-visible plan or cost has changed.
+
+## P5 — Whole-plan estimation and EXPLAIN columns
+
+**Goal:** propagate estimates through the selected plan and make them corpus-assertable.
+
+- [ ] Define whether each node's `est_cost` is local, subtree-cumulative, or both; expose exactly
+  one unambiguous contract in EXPLAIN.
+- [ ] Propagate estimates through residual filters and projections.
+- [ ] Propagate through nested-loop, index-nested-loop, and hash joins in current FROM order.
+- [ ] Propagate through aggregate/GROUP BY, HAVING, window, DISTINCT, Sort, and LIMIT/OFFSET.
+- [ ] Propagate through SRFs, CTE materialization/references, derived tables, VALUES, set operations,
+  and FROM-less SELECT.
+- [ ] Cover INSERT/UPDATE/DELETE plan nodes or record an explicit initial narrowing for DML
+  estimates.
+- [ ] Add `est_rows` and `est_cost` columns to the EXPLAIN result type and renderer in all cores.
+- [ ] Specify exact column types, rendering, and sentinel behavior.
+- [ ] Keep the EXPLAIN statement's own runtime cost at one `row_produced` per emitted plan row; the
+  new cells themselves do not add execution cost.
+- [ ] Keep EXPLAIN ANALYZE actual cost/rows separate from estimates.
+- [ ] Re-pin every existing EXPLAIN corpus entry to the expanded result shape.
+- [ ] Add estimate-focused corpus cases for empty, selective, nonselective, join, aggregate, and
+  LIMIT plans.
+- [ ] Update `spec/design/explain.md`, website SQL docs, and live examples.
+
+**Exit gate:** plain EXPLAIN exposes deterministic per-node estimates for every supported current
+plan shape, and the shared corpus asserts them across all cores.
+
+## P6 — Cost-based single-relation access-path selection
+
+**Goal:** make the first observable plan choices from estimates.
+
+### P6a — PK, full scan, and ordered B-tree
+
+- [ ] Replace the legacy selector for eligible SELECT base relations with minimum estimated cost.
+- [ ] Apply the canonical P0 tie-break after estimated cost.
+- [ ] Consider access path and required ordering together wherever current ORDER BY/index rules
+  interact with the chosen bound.
+- [ ] Preserve the full WHERE as the residual filter for every candidate.
+- [ ] Decide whether UPDATE/DELETE remain on legacy policies for this milestone; document and test
+  the boundary.
+- [ ] Add EXPLAIN cases where row-count changes flip full/PK/index choices.
+- [ ] Add competing-index cases proving name order loses when cost differs and wins only on an exact
+  tie.
+- [ ] Re-pin every affected `# cost:` entry.
+- [ ] Add a new NoREC scenario for cost-selected competing access paths.
+- [ ] Benchmark point, range, selective-index, and nonselective-index cases before/after.
+
+### P6b — GIN, GiST, interval sets, and ordering paths
+
+- [ ] Enable cost selection for GIN candidates.
+- [ ] Enable cost selection for GiST candidates.
+- [ ] Enable cost selection for PK and ordered-index interval sets.
+- [ ] Integrate secondary-index ORDER BY/top-N candidates without silently pricing unmetered sort
+  work.
+- [ ] Add mixed-access-method ties and selectivity flips.
+- [ ] Extend NoREC relations and re-pin costs for every newly selectable path.
+- [ ] Run affected access-path benchmarks and full cross-core CI.
+
+**Exit gate:** every single-relation SELECT access path is selected from the deterministic estimator,
+with exact tie behavior, EXPLAIN coverage, NoREC coverage, and re-pinned actual costs.
+
+## P7 — Costed two-relation join orientation and algorithm
+
+**Goal:** choose the cheaper legal driver and join implementation for the first reorderable join.
+
+- [ ] Introduce a physical relation-order/permutation representation without changing resolved
+  logical column slots.
+- [ ] Enumerate both orientations of eligible two-relation INNER/CROSS joins.
+- [ ] Enumerate nested-loop, index-nested-loop, and hash candidates for each legal orientation.
+- [ ] Estimate outer rows, repeated inner scans/seeks, hash build/probe byte work, ON residual work,
+  join rows, and downstream rows/cost.
+- [ ] Let a sibling-column bound become an INL candidate only when its dependency is already on the
+  physical left side.
+- [ ] Make hash build/probe orientation explicit; the current fixed right-build behavior becomes a
+  candidate rather than an invariant.
+- [ ] Treat LEFT/RIGHT/FULL joins, LATERAL, correlated dependencies, and non-reorderable derived/CTE
+  shapes as barriers for this slice.
+- [ ] Re-evaluate join sort-elision and LIMIT/top-N rules against the selected physical order.
+- [ ] Specify plan-dependent error ordering under the ratified deterministic plan contract; keep
+  error corpus cases single-offender where required.
+- [ ] Add cases where FROM order wins, reverse order wins, INL wins, hash wins, and exact ties occur.
+- [ ] Add/revise NoREC and join-commutativity scenarios with total ORDER BY output comparison.
+- [ ] Re-pin affected costs and benchmark both orientations/algorithms.
+
+**Exit gate:** eligible two-table INNER/CROSS joins choose the same cheapest orientation and
+algorithm in every core, with barriers preserving all other join semantics.
+
+## P8 — Bounded deterministic N-way left-deep join ordering
+
+**Goal:** generalize Path B to multi-relation joins without unbounded planning work.
+
+- [ ] Partition the logical join tree into reorderable INNER/CROSS islands separated by outer-join,
+  LATERAL, correlation, and other semantic barriers.
+- [ ] Specify and implement the bounded search algorithm chosen in P0 (for example, capped dynamic
+  programming with a deterministic fallback).
+- [ ] Include physical access path and join algorithm in each partial-plan state rather than choosing
+  them independently after join order.
+- [ ] Apply canonical state deduplication and tie-breaking independent of hashmap order.
+- [ ] Carry estimated rows/cost forward at each left-deep step.
+- [ ] Admit an INL edge only after its required sibling relation is present in the left prefix.
+- [ ] Preserve resolved expression slots through a physical relation permutation/mapping.
+- [ ] Re-run ORDER BY, scan-order, and LIMIT/top-N decisions on the final physical tree.
+- [ ] Add 3+-relation tests covering disconnected CROSS products, selective predicates, competing
+  indexes, INL dependencies, hash choices, ties, barriers, NULLs, and empty relations.
+- [ ] Add a dedicated N-way NoREC/metamorphic relation comparing reordered and deliberately
+  non-reorderable equivalent forms.
+- [ ] Add planning-limit boundary tests proving large FROM lists remain deterministically bounded.
+- [ ] Re-pin actual costs and benchmark representative 3-, 5-, and cap-boundary joins.
+
+**Exit gate / initial Path B milestone:** every eligible left-deep join island is selected from a
+bounded, spec'd, deterministic cost search across all three cores; access paths, join choices,
+EXPLAIN estimates, actual costs, and NoREC coverage agree.
+
+## P9 — Deterministic NDV and histogram statistics follow-on
+
+**Goal:** improve estimate quality without changing the estimator's determinism contract.
+
+- [ ] Choose the SQL-reachable collection surface, likely an `ANALYZE` vertical slice, and define
+  its PostgreSQL relationship/divergences.
+- [ ] Define per-column facts: NULL count/fraction, distinct count, histogram bounds, most-common
+  values/frequencies, and any value-width facts needed by existing runtime cost units.
+- [ ] Define exact versus sampled collection. If sampled, specify a cross-core-identical sampling
+  algorithm and seed; do not use host randomness or iteration order.
+- [ ] Scan rows in deterministic storage-key order and canonicalize values with shared type rules.
+- [ ] Define histogram bucket count, boundary selection, duplicate handling, NULL handling,
+  collation behavior, and open/container-type eligibility.
+- [ ] Define transactional update, rollback, persistence, invalidation, and deterministic staleness
+  policy. Never use wall-clock age.
+- [ ] Add statistics to the file format with byte-exact fixtures and corruption validation.
+- [ ] Extend the prepared-plan fingerprint with the new statistics facts/version.
+- [ ] Feed NDV/histograms into the existing selectivity rules without altering arithmetic or final
+  tie-breaking.
+- [ ] Add corpus cases where distributions with equal row counts choose different plans.
+- [ ] Re-pin costs, extend NoREC, and benchmark skewed/uniform distributions.
+
+**Exit gate:** statistics collection and use are SQL-reachable, transactional, persisted,
+byte-identical, deterministic, cache-safe, and demonstrably improve plan selection under skew.
+
+## P10 — Final verification, documentation, and cleanup
+
+- [ ] Run shared estimator fixture verification in all cores.
+- [ ] Run file-format goldens and cross-core round trips.
+- [ ] Run focused row-count transaction/reopen and prepared-cache suites.
+- [ ] Run all EXPLAIN and cost conformance suites.
+- [ ] Run the full NoREC sweep.
+- [ ] Run `rake verify` and `rake ci`.
+- [ ] Run affected access-path and join benchmarks and record before/after results.
+- [ ] Update `CLAUDE.md` and every affected `spec/design/*` document to final landed behavior.
+- [ ] Update website SQL/EXPLAIN documentation and live examples.
+- [ ] Check off or rewrite the canonical Path B entries in `TODO.md`, leaving only genuine
+  follow-ons.
+- [ ] Remove completed material from this file as canonical docs become authoritative.
+- [ ] Delete this temporary checklist once no cross-session handoff state remains.
+
+## Cross-session handoff
+
+Update this short block at the end of each work session.
+
+- **Current slice:** P0 — not started
+- **Last completed checkpoint:** none
+- **Branch / last pushed commit:** none
+- **Verification last run:** none
+- **Known blockers or open decisions:** none recorded
+- **Next action:** author and ratify the P0 estimator/plan-choice contract before implementation
