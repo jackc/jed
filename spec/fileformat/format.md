@@ -15,7 +15,27 @@ and (b) write the same logical database to bytes that equal the golden *exactly*
 other's output. A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 27)
+## Version scope (`format_version` 28)
+
+`format_version` **28** — **transactional per-table row counts**
+([../design/estimator.md §5](../design/estimator.md)). Every table catalog entry appends a fixed
+**`row_count i64`** immediately after `root_data_page`. It is an eight-byte big-endian
+two's-complement integer, restricted to `0..i64::MAX`; negative encodings are `XX001`. The count is
+the exact number of rows in that table for the same committed snapshot as the catalog/root pointer.
+It is maintained in working snapshots by insert/remove, so statement failure and transaction
+rollback restore it with the B+tree root, and it is available after reopen without visiting a leaf.
+
+The structural invariant is exact and checked at catalog load:
+
+```
+(root_data_page == 0) == (row_count == 0)
+```
+
+A mismatch is `XX001` without an eager leaf recount; the checksum-protected catalog value is trusted
+otherwise. This keeps open O(interior spine). The existing no-primary-key exception remains:
+reconstructing the next synthetic rowid still faults leaves to find the maximum key, independently
+of row-count loading. A v27 table entry has no count tail, so v28 is the normal pre-1.0 clean break;
+readers accept only the exact current version and all goldens move atomically.
 
 `format_version` **27** — **partial-index predicates** ([../design/indexes.md §9](../design/indexes.md)).
 A `CREATE [UNIQUE] INDEX … WHERE predicate` (B-tree only) indexes only the rows whose predicate is
@@ -365,9 +385,9 @@ each commit, under the reader watermark) so the persisted list stays bounded. Li
 (v3) are kept reachable and never freed; a dead chain (from an updated/deleted row) is reclaimed at
 the next within-session rebuild. **Open reads only the interior spine**: with the free-list read from
 the persisted chain, the *last* reason open touched every leaf — summing the per-table row count from
-each leaf header — is also **dropped**, so `read_skeleton` builds the interior skeleton without
-reading the leaf level (a disk-loaded store carries an *unknown* row count and derives emptiness from
-its root — [../design/storage.md §6](../design/storage.md)). A **no-PK** table is the lone exception:
+each leaf header — is replaced in v28 by the exact catalog `row_count`, so `read_skeleton` builds the
+interior skeleton without reading the leaf level ([../design/storage.md §6](../design/storage.md)). A
+**no-PK** table is the lone exception:
 its synthetic rowid is reconstructed as `max key + 1`, which still faults its leaves.
 
 ## Conventions
@@ -448,7 +468,7 @@ and slot selection):
 | offset | size | field |
 |---|---|---|
 | 0  | 4 | `magic` = `4A 45 44 42` (ASCII `JEDB`, for the engine `jed`) |
-| 4  | 2 | `format_version` (u16) — current = **`27`** |
+| 4  | 2 | `format_version` (u16) — current = **`28`** |
 | 6  | 2 | reserved (0) |
 | 8  | 4 | `page_size` (u32) |
 | 12 | 8 | `txid` (u64) — commit counter; the highest valid slot wins on open |
@@ -477,7 +497,7 @@ present (copy-on-write never overwrote them). `create` seeds **both** slots with
 `txid = 1` meta, so two valid slots exist from the first moment (the first even-`txid` commit
 then overwrites slot 0).
 
-**Opening (slot selection).** Validate each slot independently (magic, `format_version == 27`,
+**Opening (slot selection).** Validate each slot independently (magic, `format_version == 28`,
 offsets 6–7 reserved == 0, `free_list_head` == 0 or in `[2, page_count)`, `crc32`). Choose the
 **valid** slot with the **highest `txid`**; on a tie, slot 0. Exactly one valid → use it (torn-write
 fallback). Neither valid → `data_corrupted`. The chosen meta's `free_list_head` is followed to load
@@ -598,6 +618,7 @@ columns and the index list after the checks, and retires column-flag bit0):
 | &nbsp;&nbsp;&nbsp;&nbsp;`excl_col_ordinal` | u16 — the element's column ordinal into **this** table (per element) |
 | &nbsp;&nbsp;&nbsp;&nbsp;`excl_op` | u8 — the element's operator strategy (`0` = `&&`, `1` = `=`; other values are `XX001`) (per element, immediately after its `excl_col_ordinal`) |
 | `root_data_page` | u32 — the **root B-tree node** of this table, or 0 if it has no rows |
+| `row_count` | i64 — **new in v28**: exact nonnegative table cardinality, eight-byte big-endian two's-complement; must be `0..i64::MAX`, and `(root_data_page == 0) == (row_count == 0)` or the file is `XX001` |
 
 Columns are emitted in declaration order. Checks are emitted in their **evaluation order** —
 ascending byte order of the lowercased `check_name` ([../design/constraints.md
@@ -957,8 +978,8 @@ child, is always underfull, and is merged away by the next rebalance that touche
 `12 + sep_len ≤ 12 + RECORD_MAX(0) = 12 + (C−12)/2 ≤ C` — so every interior split can leave at
 least one side with a separator.
 
-An empty table has `root_data_page = 0` and no node pages. A one-row table is a single leaf
-with `N = 1`. The root may be a leaf (small table) or an interior node (taller tree); it is
+An empty table has `root_data_page = 0`, `row_count = 0`, and no node pages. A one-row table has
+`row_count = 1` and is a single leaf with `N = 1`. The root may be a leaf (small table) or an interior node (taller tree); it is
 distinguished by its `page_type`, never by its index.
 
 ### Fan-out: the size-driven split/merge byte contract
@@ -1329,8 +1350,8 @@ not by a static golden, because it depends on the commit history.)
 
 - **Empty database** (no tables): one catalog page with `item_count = 0`; `root_page = 2`,
   `page_count = 3` (two meta slots + the catalog page).
-- **Empty table** (no rows): `root_data_page = 0`; no node pages.
-- **Single-row table**: one leaf node, `N = 1`.
+- **Empty table** (no rows): `root_data_page = 0`, `row_count = 0`; no node pages.
+- **Single-row table**: `row_count = 1`; one leaf node, `N = 1`.
 
 ## Fixtures
 
@@ -1346,6 +1367,7 @@ the interior-node format and the split contract.
 | `overflow_table.jed` | large **incompressible** `text` + `bytea` values that **spill out-of-line plain** (v3) — `page_type 4` overflow chains (3-page + 2-page), the `0x02` external pointer (compression attempted, rejected by *store-smaller*), and an inline+external+NULL mix in one leaf ([../design/large-values.md](../design/large-values.md) §12) |
 | `compressed_table.jed` | large **compressible** values (v3, Slice B) — a `0x03` inline-compressed text (a long run that compresses back under `RECORD_MAX`), a `0x04` external-compressed text (compressed block still over the cap → a chain holding **compressed** bytes), an inline-compressed bytea, and an inline-plain + NULL mix ([../design/large-values.md](../design/large-values.md) §13, [lz4.md](lz4.md)) |
 | `one_table_empty.jed` | one table, zero rows (`root_data_page = 0`) |
+| `row_count_table.jed` | **v28 row-count catalog tail in isolation** — a three-row PK table with `root_data_page != 0` and `row_count = 3`; `one_table_empty.jed` supplies the paired zero/zero encoding |
 | `pk_table.jed` | an int PK table whose rows force a **3-node tree** (record-free interior root + two leaves holding **all** the records — the v24 B+tree shape) at page 256 — the load-bearing interior-node + copy-up split proof; includes a NULL value in a row (exercising the fixed-width region's null bitmap + zero-filled slot) |
 | `max_sep_table.jed` | **degenerate interior fan-out** ([../design/bplus-reshape.md §4.2](../design/bplus-reshape.md)) — a secondary index over near-`RECORD_MAX(0)` text keys, sized so two separators + pointers overflow `C` and the pinned `N = 2 → m = 1` interior split produces a legal **`N = 0` interior node**; pins the minimum-fanout invariant and the degenerate split shape |
 | `text_table.jed` | a text column — the value codec's text branch; empty string, embedded quote, multi-byte + astral chars, a NULL (single leaf) |

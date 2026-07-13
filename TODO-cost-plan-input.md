@@ -99,31 +99,36 @@ These decisions materially affect later slices. The maintainer approved all six 
 
 **Goal:** make the first estimator input exact, cheap, transactional, and available after reopen.
 
-The stores already maintain exact counts when built from empty, but a disk-loaded B+tree skeleton
-deliberately carries an unknown count so open does not walk every leaf. Persist the count; do not
-restore that leaf walk.
+The stores already maintained exact counts when built from empty, but a disk-loaded B+tree skeleton
+deliberately carried an unknown count so open did not walk every leaf. v28 now persists the count
+without restoring that leaf walk.
 
-- [ ] Define the row-count range and byte encoding in `spec/fileformat/format.md`.
-- [ ] Allocate the next `format_version` and add the count to each table catalog entry.
-- [ ] Write the exact count in from-scratch serialization and incremental catalog rewrites.
-- [ ] Load the count alongside `root_data_page` and install it into the disk-loaded `PMap` /
+- [x] Define the row-count range and byte encoding in `spec/fileformat/format.md`.
+- [x] Allocate the next `format_version` and add the count to each table catalog entry.
+- [x] Write the exact count in from-scratch serialization and incremental catalog rewrites.
+- [x] Load the count alongside `root_data_page` and install it into the disk-loaded `PMap` /
   table-store skeleton in all three cores.
-- [ ] Preserve the invariant `root_data_page == 0` iff the persisted count is zero; reject corrupt
+- [x] Preserve the invariant `root_data_page == 0` iff the persisted count is zero; reject corrupt
   mismatches where they can be detected without a leaf walk.
-- [ ] Maintain the count through INSERT, INSERT … SELECT, DELETE, UPDATE re-keying, UPSERT paths,
+- [x] Maintain the count through INSERT, INSERT … SELECT, DELETE, UPDATE re-keying, UPSERT paths,
   cascades, ALTER rewrites, CREATE/DROP, and statement rollback.
-- [ ] Verify explicit-transaction rollback restores the old count just like other snapshot state.
-- [ ] Cover main, attached, in-memory, file-backed, and session-temporary table domains.
-- [ ] Ensure post-open mutations keep maintaining the loaded known count rather than reverting it
+- [x] Verify explicit-transaction rollback restores the old count just like other snapshot state.
+- [x] Cover main, attached, in-memory, file-backed, and session-temporary table domains.
+- [x] Ensure post-open mutations keep maintaining the loaded known count rather than reverting it
   to unknown.
-- [ ] Add a byte-exact golden fixture isolating the new table-catalog field.
-- [ ] Add cross-core golden write/read tests and corruption tests.
-- [ ] Add transactional tests for commit, rollback, reopen, deletes to zero, and failed mutations.
-- [ ] Add a regression proving file open remains O(interior spine) and does not fault table leaves
+- [x] Add a byte-exact golden fixture isolating the new table-catalog field.
+- [x] Add cross-core golden write/read tests and corruption tests.
+- [x] Add transactional tests for commit, rollback, reopen, deletes to zero, and failed mutations.
+- [x] Add a regression proving file open remains O(interior spine) and does not fault table leaves
   merely to obtain the count.
 
 **Exit gate:** every visible snapshot carries an exact table count, rollback restores it, and every
 core writes and reads byte-identical files without regressing open behavior.
+
+**Status:** complete on 2026-07-13. `format_version` 28 stores `row_count` as a nonnegative signed
+`i64` end-to-end (Rust `i64`, Go `int64`, TypeScript `bigint`), with an exact-version clean break and
+no v27 migration path. `bundle exec rake ci` passes after regenerating and independently verifying
+all 61 file-format fixtures. P2 is the next implementation slice.
 
 ## P2 — Statistics-aware prepared-plan cache validity
 

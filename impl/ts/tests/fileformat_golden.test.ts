@@ -59,6 +59,13 @@ function oneTableEmptyDB(): Engine {
   return db;
 }
 
+function rowCountTableDB(): Engine {
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY)");
+  run(db, "INSERT INTO t VALUES (1), (2), (3)");
+  return db;
+}
+
 // compositePKTableDB has a COMPOSITE primary key (constraints.md §3) — the stored key is
 // the concatenation of the members' encodings (4-byte i32 then 2-byte i16,
 // encoding.md §2.3). Rows insert in ascending tuple order (the tree shape is
@@ -913,6 +920,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "overflow_table.jed", build: overflowTableDB },
     { name: "compressed_table.jed", build: compressedTableDB },
     { name: "one_table_empty.jed", build: oneTableEmptyDB },
+    { name: "row_count_table.jed", build: rowCountTableDB },
     { name: "pk_table.jed", build: pkTableDB },
     { name: "text_table.jed", build: textTableDB },
     { name: "varchar_table.jed", build: varcharTableDB },
@@ -982,6 +990,7 @@ test("read goldens reproduces rows", () => {
   loadUnicode(); // the unicode-collated goldens open via a loaded bundle (collation.md §4)
   const cases: { name: string; build: () => Engine; table: string }[] = [
     { name: "one_table_empty.jed", build: oneTableEmptyDB, table: "t" },
+    { name: "row_count_table.jed", build: rowCountTableDB, table: "t" },
     { name: "overflow_table.jed", build: overflowTableDB, table: "t" },
     { name: "compressed_table.jed", build: compressedTableDB, table: "t" },
     { name: "pk_table.jed", build: pkTableDB, table: "t" },
@@ -1139,6 +1148,73 @@ test("crc32 known vector", () => {
 test("serialize is deterministic", () => {
   const db = pkTableDB();
   assert.ok(bytesEqual(toImage(db, GOLDEN_PAGE_SIZE, 1n), toImage(db, GOLDEN_PAGE_SIZE, 1n)));
+});
+
+test("persisted row count tracks DML and rollback", () => {
+  const db = loadEngine(fixture("row_count_table.jed"));
+  const count = (): bigint => db.committed.store("t").count()!;
+
+  assert.equal(count(), 3n, "v28 catalog count restored on open");
+  run(db, "INSERT INTO t VALUES (4)");
+  assert.equal(count(), 4n);
+  run(db, "UPDATE t SET id = 40 WHERE id = 4");
+  assert.equal(count(), 4n, "primary-key rewrite is count-neutral");
+  assert.throws(() => run(db, "INSERT INTO t VALUES (40)"));
+  assert.equal(count(), 4n, "failed statement restores the count");
+  run(db, "DELETE FROM t WHERE id = 40");
+  assert.equal(count(), 3n);
+
+  run(db, "BEGIN READ WRITE");
+  run(db, "INSERT INTO t VALUES (5)");
+  assert.equal(db.session.tx!.working.store("t").count(), 4n);
+  run(db, "ROLLBACK");
+  assert.equal(count(), 3n, "rollback restores root and count together");
+
+  run(db, "CREATE TEMP TABLE tt (id i32 PRIMARY KEY)");
+  run(db, "INSERT INTO tt VALUES (1), (2)");
+  assert.equal(db.session.tempCommitted.store("tt").count(), 2n);
+  run(db, "BEGIN READ WRITE");
+  run(db, "INSERT INTO tt VALUES (3)");
+  assert.equal(db.session.tx!.tempWorking.store("tt").count(), 3n);
+  run(db, "ROLLBACK");
+  assert.equal(db.session.tempCommitted.store("tt").count(), 2n);
+
+  const reopened = loadEngine(toImage(db, GOLDEN_PAGE_SIZE, 2n));
+  assert.equal(reopened.committed.store("t").count(), 3n);
+  run(reopened, "DELETE FROM t");
+  assert.equal(reopened.committed.store("t").count(), 0n);
+  const zero = loadEngine(toImage(reopened, GOLDEN_PAGE_SIZE, 3n));
+  assert.equal(zero.committed.store("t").count(), 0n);
+});
+
+test("table row-count root invariant is rejected", () => {
+  const image = fixture("row_count_table.jed");
+  const rootPage = new DataView(image.buffer, image.byteOffset, image.byteLength).getUint32(
+    20,
+    false,
+  );
+  const pageStart = rootPage * GOLDEN_PAGE_SIZE;
+  const pattern = Uint8Array.of(0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 3);
+  const matches: number[] = [];
+  for (let i = pageStart + 16; i <= pageStart + GOLDEN_PAGE_SIZE - pattern.length; i++) {
+    if (pattern.every((b, j) => image[i + j] === b)) matches.push(i);
+  }
+  assert.deepStrictEqual(matches.length, 1, "locate the fixture's root/count tail uniquely");
+  image.fill(0, matches[0]! + 4, matches[0]! + 12);
+
+  // Refresh the catalog page CRC after forging a structurally inconsistent, checksum-valid page.
+  const covered = new Uint8Array(GOLDEN_PAGE_SIZE - 4);
+  covered.set(image.subarray(pageStart, pageStart + 12), 0);
+  covered.set(image.subarray(pageStart + 16, pageStart + GOLDEN_PAGE_SIZE), 12);
+  new DataView(image.buffer, image.byteOffset, image.byteLength).setUint32(
+    pageStart + 12,
+    crc32Ieee(covered),
+    false,
+  );
+  assert.throws(
+    () => loadEngine(image),
+    (e: unknown) => e instanceof Error && e.message.startsWith("XX001"),
+  );
 });
 
 test("corrupt image is rejected with XX001", () => {

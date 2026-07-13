@@ -72,6 +72,18 @@ fn one_table_empty_db() -> Session {
     db
 }
 
+fn row_count_table_db() -> Session {
+    let mut db = Database::create(CreateOptions {
+        page_size: GOLDEN_PAGE_SIZE,
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
+    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY)");
+    run(&mut db, "INSERT INTO t VALUES (1), (2), (3)");
+    db
+}
+
 /// A table with a COMPOSITE primary key (constraints.md §3) — the stored key is the
 /// concatenation of the members' encodings (4-byte i32 ‖ 2-byte i16, encoding.md §2.3).
 /// Rows insert in ascending tuple order (the tree shape is order-sensitive), with a negative
@@ -1355,6 +1367,7 @@ fn write_matches_goldens() {
         ("overflow_table.jed", overflow_table_db),
         ("compressed_table.jed", compressed_table_db),
         ("one_table_empty.jed", one_table_empty_db),
+        ("row_count_table.jed", row_count_table_db),
         ("pk_table.jed", pk_table_db),
         ("text_table.jed", text_table_db),
         ("varchar_table.jed", varchar_table_db),
@@ -1424,6 +1437,7 @@ fn read_goldens_reproduces_rows() {
     load_unicode(); // the unicode-collated goldens open via a loaded bundle (collation.md §4)
     let cases: &[(&str, Builder, &str)] = &[
         ("one_table_empty.jed", one_table_empty_db, "t"),
+        ("row_count_table.jed", row_count_table_db, "t"),
         ("overflow_table.jed", overflow_table_db, "t"),
         ("compressed_table.jed", compressed_table_db, "t"),
         ("pk_table.jed", pk_table_db, "t"),

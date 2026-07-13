@@ -547,14 +547,13 @@ impl TableStore {
     }
 
     /// Install a disk-loaded B+tree skeleton as this store's contents (format.rs `read_skeleton`).
-    /// The row count is left **unknown** — open no longer walks the leaves to sum it
-    /// (spec/design/storage.md §6).
-    pub(crate) fn set_skeleton(&mut self, root: Option<Arc<Node>>) {
-        self.rows = PMap::from_skeleton(root);
+    /// Tables pass the exact v28 catalog row count; index stores pass `None`.
+    pub(crate) fn set_skeleton(&mut self, root: Option<Arc<Node>>, count: Option<i64>) {
+        self.rows = PMap::from_skeleton(root, count);
     }
 
-    /// The exact row count, or `None` when unknown (a disk-loaded store — see [`PMap::count`]).
-    pub fn count(&self) -> Option<usize> {
+    /// The exact nonnegative row count, or `None` for an index skeleton whose count is not persisted.
+    pub fn count(&self) -> Option<i64> {
         self.rows.count()
     }
 

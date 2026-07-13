@@ -470,9 +470,14 @@ func (s *tableStore) faultLeaf(page uint32) (*pnode, error) {
 }
 
 // setSkeleton installs a disk-loaded B+tree skeleton as this store's contents (format.go
-// loadEnginePaged). The row count is left unknown — open reads only the interior spine, not the
-// leaves (spec/design/storage.md §6).
-func (s *tableStore) setSkeleton(root *pnode) { s.rows = fromSkeleton(root) }
+// loadEnginePaged). Tables pass the exact v28 catalog count; index stores pass known=false.
+func (s *tableStore) setSkeleton(root *pnode, rowCount int64, known bool) {
+	s.rows = fromSkeleton(root, rowCount, known)
+}
+
+// Count returns the exact nonnegative row count and whether this store knows it. Table stores are
+// always known; a loaded index skeleton is the only unknown case.
+func (s *tableStore) Count() (int64, bool) { return s.rows.Count() }
 
 // storedBytes is the total on-disk record bytes this store holds — the deterministic,
 // cross-core-identical footprint measure the temp-table budget sums (spec/design/temp-tables.md §7).

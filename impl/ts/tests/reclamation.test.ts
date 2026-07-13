@@ -265,8 +265,8 @@ class CountingStore implements BlockStore {
   }
 }
 
-// open reads the interior spine, NOT every leaf (spec/design/storage.md §6, "drop the eager count").
-// Since v25 dropped the free-list reachability walk and this slice dropped the row-count leaf sum, open
+// open reads the interior spine, NOT every leaf (spec/design/storage.md §6). Since v25 dropped the
+// free-list reachability walk and v28 persists the row count instead of summing leaf headers, open
 // faults only catalog + interior pages + ~one leaf per bottom-level interior (to classify the level) +
 // the meta/free-list pages — all O(interior spine). The block-read count must stay well below the leaf
 // count, and above all must not scale with it. A counting BlockStore is the only way to see this (it is

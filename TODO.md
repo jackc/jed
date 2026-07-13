@@ -188,17 +188,21 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   search are specified in [estimator.md](spec/design/estimator.md); mechanical facts live in
   [estimator.toml](spec/cost/estimator.toml). Implementation remains open in the slices below and
   the multi-session handoff is [TODO-cost-plan-input.md](TODO-cost-plan-input.md).
+- [x] **P1 — transactional per-table row counts** — `format_version` 28 appends an exact
+  nonnegative signed-`i64` `row_count` to every table catalog entry, installs it beside loaded
+  demand-paged skeletons without a leaf walk, and maintains it with snapshot roots across DML,
+  failure, rollback, temp/attached routing, and reopen. Root/count mismatches are `XX001`; shared
+  byte goldens and all three cores pin the contract. → [format.md](spec/fileformat/format.md),
+  [storage.md §6](spec/design/storage.md)
 - [ ] **Plan-time cost estimator** — estimate the same cost units the runtime meter charges
   (`page_read`/`storage_row_read`/`row_produced`/…) for each candidate plan and pick the cheapest,
   instead of today's structural tie-breaks (lowest index name, FROM order). Authored as a **spec'd,
   cross-core-identical, deterministic artifact** (the §8 discipline the runtime schedule already
   follows) so plan choice stays byte-identical across cores. The prerequisite for cost-based selection
   and the `EXPLAIN` `est_rows`/`est_cost` columns (the EXPLAIN follow-on above). _(size: L–XL; ×3 cores)_
-- [ ] **Table statistics** — the estimator's inputs. Start with a **transactional per-table row count**
-  (cheap; deterministic — it rolls back with its transaction like the `nextval` counter,
-  [determinism.md §5](spec/design/determinism.md)). Per-column distinct-value counts / histograms are a
-  later step, computed by a spec'd pass over the (deterministic) data so they stay cross-core-identical.
-  _(size: M row-count / L histograms)_
+- [ ] **Column statistics** — the initial transactional per-table row count landed in P1. Add
+  per-column distinct-value counts / histograms later, computed by a spec'd pass over deterministic
+  data so they stay cross-core-identical. _(size: L histograms)_
 - [ ] **Cost-based access-path + join-order selection** — with the estimator + row counts, choose the
   cheapest bound per relation and **reorder the left-deep join** (drive the smaller / more-selective
   relation, enable index-nested-loop) rather than honoring FROM order. Re-pins the affected `# cost:`

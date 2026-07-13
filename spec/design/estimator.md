@@ -142,9 +142,9 @@ literal bound's overlapping node count; it may not fault a leaf to count matchin
 values.
 
 Statistics are snapshot state. Pending mutations change the writer's working statistics and
-rollback discards them; readers keep the statistics pinned with their data snapshot. P1 persists
-row count in the table catalog so reopen does not restore the former full-leaf count walk. Future
-NDV/histogram collection follows the same transactional rule.
+rollback discards them; readers keep the statistics pinned with their data snapshot. Since v28, the
+exact row count is persisted in the table catalog, so reopen does not restore the former full-leaf
+count walk. Future NDV/histogram collection follows the same transactional rule.
 
 Every relation also owns a transactional **estimator revision** used only for cache validity. A
 successful statement that may change any admitted estimator input advances that relation's revision

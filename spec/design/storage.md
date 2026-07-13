@@ -138,8 +138,8 @@ meta — detail specified in [../fileformat/format.md](../fileformat/format.md).
 > is now **read from the persisted `page_type 7` chain on open** (no reachability walk) and
 > **reclaimed in-commit** each commit, so the file stays bounded within a session too. **Open now
 > reads only the interior spine** — the two reasons it used to touch every leaf are both gone (v25
-> dropped the free-list reachability walk; the follow-on **dropped the eager row-count** leaf sum, so
-> a loaded store carries an *unknown* count and derives emptiness from its root), making open
+> dropped the free-list reachability walk; v28 persists the exact per-table row count in the
+> checksum-protected catalog, replacing the former eager leaf sum), making open
 > O(interior spine) rather than O(file). Demand paging / the bounded buffer pool (P6.4,
 > [pager.md](pager.md)), overflow pages for over-large values, and LZ4 compression (both v3,
 > [large-values.md](large-values.md)) have **also landed**. **Still deferred** (later Phase-6 items,
@@ -229,15 +229,16 @@ sits so the options stay open (CLAUDE.md §9).
   high-water), so persisting the free-list does not grow the file, and it is torn-write-safe (a
   reused/rewritten page is dead at the fallback snapshot). An in-memory database reclaims the
   same way with **no persistence** (no meta, never reopened — post-commit RAM rebuild).
-- **Open reads only the interior spine** — ✅ **landed ("drop the eager count").** After v25
+- **Open reads only the interior spine** — ✅ **landed; exact counts persisted in v28.** After v25
   removed the reachability walk, the *last* reason open touched every leaf was summing the per-table
-  row count from each leaf header. That eager count is now **dropped**: `read_skeleton` builds the
-  demand-paged interior skeleton **without reading the leaf level** — it exploits the B+tree
+  row count from each leaf header. `read_skeleton` builds the demand-paged interior skeleton
+  **without reading the leaf level** — it exploits the B+tree
   same-depth invariant (an interior's children are homogeneous), resolving only the **first** child of
   each interior to classify the level, then referencing leaf siblings as `OnDisk` without reading
-  them. A disk-loaded store therefore carries an **unknown** row count (`Option`/nullable — nothing in
-  the engine needs a loaded table's exact count; a capacity hint tolerates its absence) and derives
-  **emptiness from its root** (exact, O(1) — an empty tree has no root). Open is now **O(interior
+  them. v28 appends the table's exact nonnegative `i64` count to its catalog entry and installs it
+  with that skeleton; `(root_data_page == 0) == (row_count == 0)` is checked without a leaf walk.
+  Working-snapshot insert/remove maintains the count with the root, so rollback restores both.
+  Open remains **O(interior
   spine)** — catalog + interior pages + ~one leaf per bottom-level interior (the classify peek) + the
   meta/free-list pages — not O(file). The lone exception is a **no-PK** table, whose synthetic-rowid
   reconstruction still faults its leaves to find `max key + 1` (most tables have a PK; bounded by the
@@ -311,7 +312,7 @@ sits so the options stay open (CLAUDE.md §9).
   parse, corruption is caught the instant the page is read: **at open for a catalog or interior
   (routing-spine) page** — the pages the demand-paged loader reads — and **at fault for a leaf or
   overflow page**, which open no longer reads (open reads only the interior spine — the free-list
-  reachability walk and the row-count leaf walk are both gone). Either way it is caught **or inert**
+  reachability walk is gone and v28 loads row counts from the catalog). Either way it is caught **or inert**
   (a corrupted *dead* page is never read), never served as wrong rows; a full scan validates every
   live page. It is **not** end-to-end integrity (a malicious rewriter can recompute the CRC; that is
   the encryption-at-rest / authenticated-page door below, not this), and it is **not** metered

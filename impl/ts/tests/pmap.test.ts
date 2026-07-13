@@ -32,12 +32,11 @@ function row(n: number): Row {
 }
 
 // pmCount returns pm's exact row count, asserting the map knows it. An in-memory map (built from
-// empty by insert) always knows its count; a disk-loaded skeleton does not (spec/design/storage.md
-// §6, "drop the eager count"), but these tests never load one.
+// empty by insert) always knows its count; table skeletons restore it from v28 catalog data.
 function pmCount(pm: PMap): number {
   const c = pm.getCount();
   assert.notEqual(c, null, "expected a known row count on an in-memory map");
-  return c!;
+  return Number(c!);
 }
 
 function keyStr(k: Uint8Array): string {

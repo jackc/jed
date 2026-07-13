@@ -450,14 +450,13 @@ export class TableStore {
   }
 
   // setSkeleton installs a disk-loaded B+tree skeleton as this store's contents (format.ts
-  // loadEnginePaged). The row count is left unknown — open reads only the interior spine, not the
-  // leaves (spec/design/storage.md §6).
-  setSkeleton(root: PNode | null): void {
-    this.rows = pmapFromSkeleton(root);
+  // loadEnginePaged). Tables pass the exact v28 catalog count; index stores pass null.
+  setSkeleton(root: PNode | null, rowCount: bigint | null): void {
+    this.rows = pmapFromSkeleton(root, rowCount);
   }
 
-  // count returns the exact row count, or null when unknown (a disk-loaded store — see PMap).
-  count(): number | null {
+  // count returns the exact nonnegative row count, or null for an index skeleton.
+  count(): bigint | null {
     return this.rows.getCount();
   }
 

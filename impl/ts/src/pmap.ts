@@ -280,16 +280,15 @@ function newInterior(keys: Uint8Array[], children: Child[]): PNode {
 // PMap is a persistent ordered map from encoded key to Row. `clone()` is an O(1) independent
 // snapshot (the root is shared; nodes are immutable).
 //
-// rowCount is the exact row count when known. A map built from empty by insert/remove maintains it
-// for free; a map loaded from a disk skeleton (pmapFromSkeleton) carries null — unknown — because
-// open reads only the interior spine and never walks the leaves to sum it (spec/design/storage.md
-// §6), and nothing needs the exact count of a loaded table. isEmpty never consults it: it derives
-// emptiness from the root, exact and O(1) whether or not the count is known.
+// rowCount is the exact nonnegative row count when known. Table maps are built from empty or
+// restored with their v28 catalog count and maintain it across insert/remove. Index maps loaded
+// from a disk skeleton carry null because index cardinality is not persisted. isEmpty never
+// consults it: it derives emptiness from the root, exact and O(1) whether or not the count is known.
 export class PMap {
   private root: PNode | null;
-  private rowCount: number | null;
+  private rowCount: bigint | null;
 
-  constructor(root: PNode | null = null, rowCount: number | null = 0) {
+  constructor(root: PNode | null = null, rowCount: bigint | null = 0n) {
     this.root = root;
     this.rowCount = rowCount;
   }
@@ -298,9 +297,9 @@ export class PMap {
     return new PMap(this.root, this.rowCount);
   }
 
-  // getCount returns the exact row count, or null when unknown (a disk-loaded skeleton). Callers
-  // that only need a capacity hint use `?? 0`; nothing needs an exact count of a loaded table.
-  getCount(): number | null {
+  // getCount returns the exact nonnegative row count, or null for an index skeleton whose count is
+  // not persisted.
+  getCount(): bigint | null {
     return this.rowCount;
   }
 
@@ -340,8 +339,7 @@ export class PMap {
   ): Row | undefined {
     if (this.root === null) {
       this.root = newLeaf([key], [val], [weight]);
-      // Maintain the count only when it is known; a disk-loaded skeleton stays null.
-      if (this.rowCount !== null) this.rowCount++;
+      if (this.rowCount !== null) this.rowCount += 1n;
       return undefined;
     }
     const ctx: InsCtx = { old: undefined, replaced: false };
@@ -350,7 +348,7 @@ export class PMap {
       out.whole !== null
         ? out.whole
         : newInterior([out.sep], [residentRef(out.left), residentRef(out.right)]);
-    if (!ctx.replaced && this.rowCount !== null) this.rowCount++;
+    if (!ctx.replaced && this.rowCount !== null) this.rowCount += 1n;
     return ctx.old;
   }
 
@@ -373,7 +371,7 @@ export class PMap {
     } else {
       this.root = newRoot;
     }
-    if (this.rowCount !== null) this.rowCount--;
+    if (this.rowCount !== null) this.rowCount -= 1n;
     return res.removed;
   }
 
@@ -713,9 +711,9 @@ function* walkRevIter(n: PNode, b: KeyBound, src: LeafSource | null): Generator<
 }
 
 // pmapFromSkeleton reconstructs a map from a disk-loaded skeleton root (format.ts loadEnginePaged).
-// The count is unknown — open reads only the interior spine (spec/design/storage.md §6).
-export function pmapFromSkeleton(root: PNode | null): PMap {
-  return new PMap(root, null);
+// Tables pass their exact v28 catalog count; indexes pass null.
+export function pmapFromSkeleton(root: PNode | null, rowCount: bigint | null): PMap {
+  return new PMap(root, rowCount);
 }
 
 type InsCtx = { old: Row | undefined; replaced: boolean };

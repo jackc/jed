@@ -604,12 +604,14 @@ cross-core-identical and owns that consequence (the host-extension boundary, §1
   (`format_version` 25 — meta offset 28 `free_list_head` + a new `page_type 7` free-list page; open
   reads the persisted free-list instead of the reachability walk, and a file commit reclaims its fresh
   orphans in-commit under the reader watermark, `spec/design/storage.md` §6). **Open now reads only
-  the interior spine** — with v25's free-list persistence, the last reason open touched every leaf
-  (summing the per-table row count from each leaf header) was **dropped**: `read_skeleton` classifies
-  each interior's children by the B+tree same-depth invariant (resolve only the first child, reference
-  leaf siblings as `OnDisk` without reading them), so a disk-loaded store carries an *unknown* count
-  and derives emptiness from its root, and open is O(interior spine) not O(file) (`spec/design/storage.md`
-  §6; the no-PK synthetic-rowid table is the lone leaf-faulting exception). The from-scratch whole-image
+  the interior spine** — with v25's free-list persistence, v28 removes the last reason open touched
+  every leaf by persisting an exact nonnegative signed-i64 row count in each table catalog entry.
+  The catalog loader checks `(root_data_page == 0) == (row_count == 0)` and installs the count beside
+  the skeleton; `read_skeleton` classifies each interior's children by the B+tree same-depth invariant
+  (resolve only the first child, reference leaf siblings as `OnDisk` without reading them). Counts
+  follow the persistent root through DML and snapshot rollback, so open is O(interior spine), not
+  O(file) (`spec/design/storage.md` §6; the no-PK synthetic-rowid table is the lone leaf-faulting
+  exception). The from-scratch whole-image
   serializer survives as `create`'s initial write and the golden generator.
 - **Host file API (Phase 7).** The embedding surface (`spec/design/api.md`) `open`s/`create`s
   a database file and `commit`s the whole image **durably** via temp-file + fsync + atomic

@@ -242,8 +242,8 @@ leaf** — `varchar(10)`, `decimal(8,2)`; a composite renders **its name as crea
 canonical id from ranges.toml (`i32range`, `numrange`, …); an array appends `[]` to its element's
 rendering (`i32[]`, `addr[]` — and when the element-typmod narrowing lifts, `varchar(5)[]`).
 
-Deliberately minimal: no row counts (a count would force the leaf walks the v25 open work just
-removed — storage.md §6), no `DEFAULT` rendering yet (it needs a pinned canonical
+Deliberately minimal: no row-count column yet (v28 persists the fact for planning, but exposing it is
+a separate introspection-surface decision), no `DEFAULT` rendering yet (it needs a pinned canonical
 expression-text form; deferred to a later column addition). **Growth is by adding columns**, so
 consumers should select columns by name, not `SELECT *` positionally — documented at the
 relation, PG's own catalog posture.

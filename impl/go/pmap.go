@@ -175,23 +175,23 @@ func (n *pnode) childSlot(key []byte) int {
 // PMap is a persistent ordered map from encoded key to Row. A value copy is an O(1) independent
 // snapshot (the root pointer is shared; nodes are immutable).
 //
-// length is the exact row count when known. A map built from empty by Insert/Remove maintains it
-// for free; a map loaded from a disk skeleton (fromSkeleton) leaves lengthUnknown set — open reads
-// only the interior spine and never walks the leaves to sum it (spec/design/storage.md §6), and
-// nothing needs the exact count of a loaded table. lengthUnknown is deliberately the NON-zero-value
-// flag: a fresh (zero-value) pMap and newPMap are known-0, matching newTableStore's zero-value rows.
+// length is the exact nonnegative row count when known. Table maps are built from empty or restored
+// with their v28 catalog count and maintain it across Insert/Remove. Index maps loaded from a disk
+// skeleton leave lengthUnknown set because index cardinality is not persisted. lengthUnknown is
+// deliberately the NON-zero-value flag: a fresh (zero-value) pMap and newPMap are known-0, matching
+// newTableStore's zero-value rows.
 type pMap struct {
 	root          *pnode
-	length        int
+	length        int64
 	lengthUnknown bool
 }
 
 // NewPMap returns an empty map (known count 0).
 func newPMap() pMap { return pMap{} }
 
-// Count returns the exact row count and whether it is known. A disk-loaded skeleton returns
-// (0, false); nothing in the engine needs a loaded table's exact count (IsEmpty uses the root).
-func (m *pMap) Count() (int, bool) { return m.length, !m.lengthUnknown }
+// Count returns the exact nonnegative row count and whether it is known. Only disk-loaded index
+// skeletons use the unknown state; table skeletons receive the v28 catalog count.
+func (m *pMap) Count() (int64, bool) { return m.length, !m.lengthUnknown }
 
 // IsEmpty reports whether the map has no rows — derived from the root (exact, O(1)), independent of
 // whether the count is known.
@@ -200,9 +200,11 @@ func (m *pMap) IsEmpty() bool { return m.root == nil }
 // root exposes the root node to the serializer (format.go). nil for an empty map.
 func (m *pMap) rootNode() *pnode { return m.root }
 
-// fromSkeleton reconstructs a map from a disk-loaded skeleton root (format.go loadEnginePaged). The
-// count is unknown — open reads only the interior spine (spec/design/storage.md §6).
-func fromSkeleton(root *pnode) pMap { return pMap{root: root, lengthUnknown: true} }
+// fromSkeleton reconstructs a map from a disk-loaded skeleton root (format.go loadEnginePaged).
+// Tables pass their exact v28 catalog count; indexes pass known=false.
+func fromSkeleton(root *pnode, length int64, known bool) pMap {
+	return pMap{root: root, length: length, lengthUnknown: !known}
+}
 
 // Get looks up the row at key — a root→leaf descent (interior nodes only route, v24). src faults an
 // OnDisk leaf on the descent (nil for a fully-resident in-memory tree); an I/O error propagates.
@@ -352,8 +354,12 @@ func (m *pMap) demoteCleanLeaves() {
 // node is dropped (GC) once its rows are appended, so the resident leaf set stays bounded by the
 // pool, not the tree (pager.md §4).
 func (m *pMap) inorder(src leafSource) ([][]byte, []storedRow, error) {
-	keys := make([][]byte, 0, m.length)
-	vals := make([]storedRow, 0, m.length)
+	capacity := 0
+	if !m.lengthUnknown && m.length <= int64(^uint(0)>>1) {
+		capacity = int(m.length)
+	}
+	keys := make([][]byte, 0, capacity)
+	vals := make([]storedRow, 0, capacity)
 	var walk func(n *pnode) error
 	walk = func(n *pnode) error {
 		if n == nil {

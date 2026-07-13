@@ -29,15 +29,14 @@ func pmKey(n uint64) []byte {
 }
 
 // pmLen returns m's exact row count, failing if the map does not know it. An in-memory map (built
-// from empty by Insert) always knows its count; a disk-loaded skeleton does not (spec/design/storage.md
-// §6, "drop the eager count"), but these tests never load one.
+// from empty by Insert) always knows its count; table skeletons restore it from v28 catalog data.
 func pmLen(t *testing.T, m *pMap) int {
 	t.Helper()
 	n, known := m.Count()
 	if !known {
 		t.Fatal("expected a known row count on an in-memory map")
 	}
-	return n
+	return int(n)
 }
 
 func pmRow(n int64) storedRow { return storedRow{IntValue(n)} }

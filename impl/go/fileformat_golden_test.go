@@ -10,6 +10,7 @@ package jed
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -62,6 +63,13 @@ func pkTableDB(t *testing.T) *Session {
 func oneTableEmptyDB(t *testing.T) *Session {
 	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i16)")
+	return db
+}
+
+func rowCountTableDB(t *testing.T) *Session {
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
+	run(t, db, "INSERT INTO t VALUES (1), (2), (3)")
 	return db
 }
 
@@ -903,6 +911,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"overflow_table.jed", overflowTableDB},
 		{"compressed_table.jed", compressedTableDB},
 		{"one_table_empty.jed", oneTableEmptyDB},
+		{"row_count_table.jed", rowCountTableDB},
 		{"pk_table.jed", pkTableDB},
 		{"text_table.jed", textTableDB},
 		{"varchar_table.jed", varcharTableDB},
@@ -977,6 +986,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		table string
 	}{
 		{"one_table_empty.jed", oneTableEmptyDB, "t"},
+		{"row_count_table.jed", rowCountTableDB, "t"},
 		{"overflow_table.jed", overflowTableDB, "t"},
 		{"compressed_table.jed", compressedTableDB, "t"},
 		{"pk_table.jed", pkTableDB, "t"},
@@ -1184,6 +1194,117 @@ func TestSerializeIsDeterministic(t *testing.T) {
 	b, _ := db.ToImage(goldenPageSize, 1)
 	if !bytes.Equal(a, b) {
 		t.Errorf("serializing the same database twice produced different bytes")
+	}
+}
+
+func exactStoreCount(t *testing.T, store *tableStore) int64 {
+	t.Helper()
+	n, known := store.Count()
+	if !known {
+		t.Fatal("expected an exact table row count")
+	}
+	return n
+}
+
+func TestPersistedRowCountTracksDMLAndRollback(t *testing.T) {
+	loaded, err := loadEngine(fixture(t, "row_count_table.jed"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := func() int64 { return exactStoreCount(t, loaded.lkpStore("t")) }
+	if got := count(); got != 3 {
+		t.Fatalf("v28 catalog count = %d, want 3", got)
+	}
+	run(t, loaded, "INSERT INTO t VALUES (4)")
+	if got := count(); got != 4 {
+		t.Fatalf("count after insert = %d, want 4", got)
+	}
+	run(t, loaded, "UPDATE t SET id = 40 WHERE id = 4")
+	if got := count(); got != 4 {
+		t.Fatalf("count after primary-key update = %d, want 4", got)
+	}
+	if _, err := queryOutcome(loaded, "INSERT INTO t VALUES (40)", nil); err == nil {
+		t.Fatal("expected duplicate-key insert to fail")
+	}
+	if got := count(); got != 4 {
+		t.Fatalf("count after failed statement = %d, want 4", got)
+	}
+	run(t, loaded, "DELETE FROM t WHERE id = 40")
+	if got := count(); got != 3 {
+		t.Fatalf("count after delete = %d, want 3", got)
+	}
+
+	run(t, loaded, "BEGIN READ WRITE")
+	run(t, loaded, "INSERT INTO t VALUES (5)")
+	if got := count(); got != 4 {
+		t.Fatalf("working count = %d, want 4", got)
+	}
+	run(t, loaded, "ROLLBACK")
+	if got := count(); got != 3 {
+		t.Fatalf("count after rollback = %d, want 3", got)
+	}
+
+	run(t, loaded, "CREATE TEMP TABLE tt (id i32 PRIMARY KEY)")
+	run(t, loaded, "INSERT INTO tt VALUES (1), (2)")
+	if got := exactStoreCount(t, loaded.lkpStore("tt")); got != 2 {
+		t.Fatalf("temp count = %d, want 2", got)
+	}
+	run(t, loaded, "BEGIN READ WRITE")
+	run(t, loaded, "INSERT INTO tt VALUES (3)")
+	if got := exactStoreCount(t, loaded.lkpStore("tt")); got != 3 {
+		t.Fatalf("temp working count = %d, want 3", got)
+	}
+	run(t, loaded, "ROLLBACK")
+	if got := exactStoreCount(t, loaded.lkpStore("tt")); got != 2 {
+		t.Fatalf("temp count after rollback = %d, want 2", got)
+	}
+
+	image, err := loaded.ToImage(goldenPageSize, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := loadEngine(image)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := exactStoreCount(t, reopened.lkpStore("t")); got != 3 {
+		t.Fatalf("count after second reopen = %d, want 3", got)
+	}
+	run(t, reopened, "DELETE FROM t")
+	if got := exactStoreCount(t, reopened.lkpStore("t")); got != 0 {
+		t.Fatalf("count after delete-to-zero = %d, want 0", got)
+	}
+	zeroImage, err := reopened.ToImage(goldenPageSize, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zero, err := loadEngine(zeroImage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := exactStoreCount(t, zero.lkpStore("t")); got != 0 {
+		t.Fatalf("zero count after reopen = %d, want 0", got)
+	}
+}
+
+func TestTableRowCountInvariantsAreRejected(t *testing.T) {
+	valid := tableEntryBytes(&catTable{Name: "t"}, 2, nil, 3)
+
+	rootWithZeroCount := append([]byte(nil), valid...)
+	binary.BigEndian.PutUint64(rootWithZeroCount[len(rootWithZeroCount)-8:], 0)
+	var count int64
+	if _, _, _, err := decodeTableEntry(rootWithZeroCount, new(int), &count); err == nil {
+		t.Fatal("expected root/nonzero-count mismatch to be rejected")
+	} else if ee, ok := err.(*EngineError); !ok || ee.Code() != "XX001" {
+		t.Fatalf("expected XX001, got %v", err)
+	}
+
+	negativeCount := append([]byte(nil), valid...)
+	binary.BigEndian.PutUint64(negativeCount[len(negativeCount)-8:], ^uint64(0))
+	if _, _, _, err := decodeTableEntry(negativeCount, new(int), &count); err == nil {
+		t.Fatal("expected negative row count to be rejected")
+	} else if ee, ok := err.(*EngineError); !ok || ee.Code() != "XX001" {
+		t.Fatalf("expected XX001, got %v", err)
 	}
 }
 

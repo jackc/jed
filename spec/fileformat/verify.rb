@@ -25,7 +25,10 @@
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 27 # format_version 27: partial-index predicates (indexes.md §9) — the per-index index_flags
+VERSION = 28 # format_version 28: every table catalog entry appends row_count i64 (big-endian
+# two's-complement, restricted to nonnegative values) after root_data_page. The reference derives it
+# from the declarative rows and rejects `(root == 0) != (count == 0)` on decode. format_version 27:
+# partial-index predicates (indexes.md §9) — the per-index index_flags
 # byte gains bit1 has_predicate, and (only when set) a u16 length + canonical predicate text follows
 # index_root_page (a fixture writes it as `predicate: "<text>"`). B-tree only. A non-partial index is
 # byte-identical to v26, so a file with no partial index moves to v27 only by its version byte + meta CRC.
@@ -280,6 +283,14 @@ PK_TABLE = {
   # the tree becomes interior-root + two leaves (the load-bearing interior-node + split proof).
   # id 3 has a NULL value. Inserted in ascending key order (the tree shape is order-sensitive).
   rows: (1..20).map { |i| [i, i == 3 ? nil : i * 10] }
+}.freeze
+
+# The v28 catalog-tail fixture: three rows keep the tree to one small leaf while pinning a nonzero
+# `root_data_page` followed by `row_count = 3`. `one_table_empty.jed` pins the zero/zero pair.
+ROW_COUNT_TABLE = {
+  name: "t",
+  columns: [col("id", "i32", pk: true)],
+  rows: [[1], [2], [3]]
 }.freeze
 
 # A table whose rows force a HEIGHT-2 tree (an interior node whose children are themselves
@@ -1168,6 +1179,7 @@ FIXTURES = [
   { file: "compressed_table.jed", page_size: 256, tables: [COMPRESSED_TABLE] },
   { file: "one_table_empty.jed", page_size: 256,
     tables: [{ name: "t", columns: [col("id", "i32", pk: true), col("v", "i16")], rows: [] }] },
+  { file: "row_count_table.jed", page_size: 256, tables: [ROW_COUNT_TABLE] },
   { file: "pk_table.jed",        page_size: 256, tables: [PK_TABLE] },
   { file: "text_table.jed",      page_size: 256, tables: [TEXT_TABLE] },
   { file: "varchar_table.jed",   page_size: 256, tables: [VARCHAR_TABLE] },
@@ -1733,7 +1745,7 @@ def pk_order(table)
   table[:pk_order] || table[:columns].each_index.select { |i| table[:columns][i][:pk] }
 end
 
-def table_entry_bytes(table, root_data_page, index_roots)
+def table_entry_bytes(table, root_data_page, index_roots, row_count)
   out = +"".b
   out << u16(table[:name].bytesize) << table[:name].b
   out << u16(table[:columns].size)
@@ -1871,6 +1883,10 @@ def table_entry_bytes(table, root_data_page, index_roots)
     end
   end
   out << u32(root_data_page)
+  raise "row_count must fit nonnegative i64" unless row_count.between?(0, (1 << 63) - 1)
+  raise "root_data_page/row_count invariant violated" unless root_data_page.zero? == row_count.zero?
+
+  out << [row_count].pack("q>")
   out
 end
 
@@ -2752,7 +2768,9 @@ def build_image(types, sequences, tables, page_size, collations = [])
   sorted_types.each { |ct| cat_entries << ("\x01".b + composite_type_entry_bytes(ct)) }
   sorted_seqs.each { |s| cat_entries << ("\x02".b + sequence_entry_bytes(s)) }
   sorted_colls.each { |c| cat_entries << ("\x03".b + collation_entry_bytes(c)) }
-  sorted.each_with_index { |t, ti| cat_entries << ("\x00".b + table_entry_bytes(t, root_data[ti], index_roots[ti])) }
+  sorted.each_with_index do |t, ti|
+    cat_entries << ("\x00".b + table_entry_bytes(t, root_data[ti], index_roots[ti], t[:rows].length))
+  end
   cat_groups = pack(cat_entries.map(&:bytesize), cap)
   page_count = cat_root + cat_groups.size
 
@@ -3087,8 +3105,13 @@ def decode_table_entry(buf, pos)
     exclusions << { name: ename, index: iname, elements: elements }
   end
   root, pos = take(buf, pos, 4)
+  count_raw, pos = take(buf, pos, 8)
+  row_count = count_raw.unpack1("q>")
+  raise "negative table row_count" if row_count.negative?
+  raise "root_data_page/row_count invariant violated" unless root.unpack1("N").zero? == row_count.zero?
+
   [{ name: name, columns: columns, pk: pk, checks: checks, indexes: indexes, fks: fks,
-     exclusions: exclusions, root_data_page: root.unpack1("N") }, pos]
+     exclusions: exclusions, root_data_page: root.unpack1("N"), row_count: row_count }, pos]
 end
 
 # Read one value via the value codec (inverse of encode_value): a presence tag, then — when
@@ -3542,6 +3565,7 @@ def decode_image(image)
 
       entry, pos = decode_table_entry(pg[:payload], pos)
       rows = read_tree_rows(image, ps, entry[:root_data_page], entry[:columns])
+      raise "persisted row_count does not match decoded rows" unless entry[:row_count] == rows.length
       indexes = entry[:indexes].map do |ix|
         raw = if ix[:kind] == "gist"
                 read_gist_keys(image, ps, ix[:root_page]).sort

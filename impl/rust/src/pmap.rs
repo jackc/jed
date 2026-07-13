@@ -468,16 +468,15 @@ fn build_interior(
 /// plus a length copy) and yields an independent snapshot: mutating the clone leaves this map
 /// untouched.
 ///
-/// `count` is the exact row count **when known** (`Some`): a map built from empty by insert/remove
-/// maintains it for free. A map loaded from a disk skeleton (`from_skeleton`) carries `None` —
-/// **unknown** — because the count would cost a full leaf walk to compute and nothing needs it
-/// eagerly (open reads only the interior spine now, spec/design/storage.md §6). `is_empty` never
-/// consults it: it derives emptiness from the root (an empty map has no root), which is exact and
-/// O(1) whether or not the count is known.
+/// `count` is the exact nonnegative row count **when known** (`Some`): table maps are built from
+/// empty or restored with their v28 catalog count and maintain it across insert/remove. Index maps
+/// loaded from a disk skeleton still carry `None` because index cardinality is not a plan input and
+/// is not persisted. `is_empty` never consults it: it derives emptiness from the root (an empty map
+/// has no root), which is exact and O(1) whether or not the count is known.
 #[derive(Clone, Default)]
 pub struct PMap {
     root: Option<Arc<Node>>,
-    count: Option<usize>,
+    count: Option<i64>,
 }
 
 /// A contiguous range of encoded keys — the form a primary-key predicate pushes down to a bounded
@@ -550,10 +549,8 @@ impl PMap {
         }
     }
 
-    /// The exact row count, or `None` when unknown (a disk-loaded skeleton — see the struct doc).
-    /// Callers that only need a capacity hint use `.unwrap_or(0)`; callers that need an exact count
-    /// on a disk-loaded map must scan (nothing in the engine does — the count is near-vestigial).
-    pub fn count(&self) -> Option<usize> {
+    /// The exact nonnegative row count, or `None` for an index skeleton whose count is not persisted.
+    pub fn count(&self) -> Option<i64> {
         self.count
     }
 
@@ -566,10 +563,10 @@ impl PMap {
         self.root.as_ref()
     }
 
-    /// Reconstruct a map from a disk-loaded skeleton root (format.rs `read_skeleton`). The count is
-    /// **unknown** — open no longer walks the leaves to sum it (spec/design/storage.md §6).
-    pub(crate) fn from_skeleton(root: Option<Arc<Node>>) -> Self {
-        PMap { root, count: None }
+    /// Reconstruct a map from a disk-loaded skeleton root (format.rs `read_skeleton`). Table maps
+    /// receive the exact v28 catalog count; index maps pass `None`.
+    pub(crate) fn from_skeleton(root: Option<Arc<Node>>, count: Option<i64>) -> Self {
+        PMap { root, count }
     }
 
     /// Look up the row at `key`, or `None` — a root→leaf descent (interior nodes only route, v24).
@@ -618,9 +615,12 @@ impl PMap {
         };
         self.root = Some(new_root);
         if old.is_none() {
-            // Maintain the count only when it is known (`Some`). A disk-loaded skeleton stays
-            // `None` — we never learned the base to increment from, and nothing needs it.
-            self.count = self.count.map(|n| n + 1);
+            // Maintain the count only when it is known (`Some`). A disk-loaded index skeleton stays
+            // `None`; table skeletons receive the exact v28 base count.
+            self.count = self.count.map(|n| {
+                n.checked_add(1)
+                    .expect("row count remains within nonnegative i64")
+            });
         }
         Ok(old)
     }
@@ -654,7 +654,10 @@ impl PMap {
             } else {
                 Some(new_root)
             };
-            self.count = self.count.map(|n| n - 1);
+            self.count = self.count.map(|n| {
+                n.checked_sub(1)
+                    .expect("a removed row implies a positive row count")
+            });
         }
         Ok(removed)
     }
@@ -769,7 +772,11 @@ impl PMap {
     /// the executor materializes the rows it scans (streaming the rows themselves is a deferred,
     /// out-of-scope follow-on — spec/design/pager.md §4/§6).
     pub(crate) fn iter(&self, src: Option<&dyn LeafSource>) -> Result<Vec<(Vec<u8>, Row)>> {
-        let mut out = Vec::with_capacity(self.count.unwrap_or(0));
+        let mut out = Vec::with_capacity(
+            self.count
+                .and_then(|n| usize::try_from(n).ok())
+                .unwrap_or(0),
+        );
         if let Some(root) = &self.root {
             collect(root, src, &mut out)?;
         }
@@ -1534,7 +1541,7 @@ mod tests {
             );
         }
         // An in-memory map (built from empty) tracks its count exactly (`Some`).
-        assert_eq!(pm.count(), Some(bt.len()));
+        assert_eq!(pm.count(), Some(bt.len() as i64));
         check_invariants(&pm);
         for k in 0..n {
             assert_eq!(pm.get(&key(k), None).unwrap().as_ref(), bt.get(&key(k)));
@@ -1670,7 +1677,7 @@ mod tests {
                 .unwrap();
             bt.insert(big_key(k), Vec::new());
         }
-        assert_eq!(pm.count(), Some(bt.len()));
+        assert_eq!(pm.count(), Some(bt.len() as i64));
         // Structure: fits + routing correctness (0-key interiors allowed).
         fn walk(node: &Node, cap: usize, shape: LeafShape) {
             assert!(node.payload(shape) <= cap, "node overflows its page");

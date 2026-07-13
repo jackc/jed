@@ -89,7 +89,11 @@ const MAGIC: [u8; 4] = *b"JEDB";
 /// gains bit1 `has_predicate`, and — only when set — a `u16 pred_len` + `pred_len` UTF-8 bytes of the
 /// predicate's canonical text follow `index_root_page`. B-tree only. A non-partial index is
 /// byte-identical to v26, so a file with no partial index moves to v27 only by its version byte + CRC.
-const FORMAT_VERSION: u16 = 27;
+///
+/// v28 = **transactional table row counts** (spec/design/estimator.md §5): every table catalog entry
+/// appends an exact nonnegative big-endian `i64` count after `root_data_page`; root zero iff count
+/// zero. The count is installed beside the demand-paged skeleton, keeping open off the leaf level.
+const FORMAT_VERSION: u16 = 28;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
 /// (`page_type`, `item_count`, `next_page`) plus a 4-byte per-page `crc32` (offset 12).
 pub(crate) const PAGE_HEADER: usize = 16;
@@ -1273,9 +1277,16 @@ impl Snapshot {
             ));
             cat_entries.push(e);
         }
-        for (ti, (_, t, _)) in tables.iter().enumerate() {
+        for (ti, (_, t, store)) in tables.iter().enumerate() {
             let mut e = vec![0u8];
-            e.extend_from_slice(&table_entry_bytes(t, root_data_page[ti], &index_roots[ti]));
+            e.extend_from_slice(&table_entry_bytes(
+                t,
+                root_data_page[ti],
+                &index_roots[ti],
+                store
+                    .count()
+                    .expect("table stores always carry an exact row count"),
+            ));
             cat_entries.push(e);
         }
         let entry_sizes: Vec<usize> = cat_entries.iter().map(|e| e.len()).collect();
@@ -1586,9 +1597,16 @@ impl Snapshot {
             ));
             cat_entries.push(e);
         }
-        for (ti, (_, t, _)) in tables.iter().enumerate() {
+        for (ti, (_, t, store)) in tables.iter().enumerate() {
             let mut e = vec![0u8];
-            e.extend_from_slice(&table_entry_bytes(t, root_data_page[ti], &index_roots[ti]));
+            e.extend_from_slice(&table_entry_bytes(
+                t,
+                root_data_page[ti],
+                &index_roots[ti],
+                store
+                    .count()
+                    .expect("table stores always carry an exact row count"),
+            ));
             cat_entries.push(e);
         }
         let entry_sizes: Vec<usize> = cat_entries.iter().map(|e| e.len()).collect();
@@ -1897,7 +1915,7 @@ impl Engine {
                 if kind != 0 {
                     return Err(corrupt("unknown catalog entry kind"));
                 }
-                let (table, root_data_page, index_roots) =
+                let (table, root_data_page, row_count, index_roots) =
                     decode_table_entry(page.payload, &mut pos)?;
                 let name = table.name.clone();
                 let has_pk = !table.pk_indices().is_empty();
@@ -1908,12 +1926,11 @@ impl Engine {
                 // `put_table` (spec/design/composite.md §3).
                 let col_types = Arc::new(snap.store(&name).col_types().to_vec());
                 if root_data_page != 0 {
-                    // Reads only the interior spine — leaves stay `OnDisk`, the row count is left
-                    // unknown (spec/design/storage.md §6). v25 already dropped the free-list
-                    // reachability walk; dropping the row-count leaf sum makes open O(interior spine).
+                    // Reads only the interior spine — leaves stay `OnDisk`; the exact row count was
+                    // restored from the v28 catalog entry (spec/design/storage.md §6).
                     let root = read_skeleton(&paging, root_data_page, &col_types)?;
                     let store = snap.store_mut(&name);
-                    store.set_skeleton(Some(root));
+                    store.set_skeleton(Some(root), Some(row_count));
                     if !has_pk {
                         // No-PK rowid reconstruction faults the leaves to find the largest key; only
                         // for keyless tables (most have a PK), and bounded by the pool.
@@ -1952,7 +1969,7 @@ impl Engine {
                             // An index tree has zero value columns (empty-payload records); its
                             // Packed leaves reconstruct empty rows from a shared empty col-type list.
                             let root = read_skeleton(&paging, iroot, &Arc::new(Vec::new()))?;
-                            istore.set_skeleton(Some(root));
+                            istore.set_skeleton(Some(root), None);
                         }
                     } else {
                         istore.attach_paging(paging.clone());
@@ -2191,8 +2208,8 @@ fn collect_tree_pages(node: &Node, reached: &mut HashSet<u32>) {
 
 /// Read a table's on-disk B-tree (rooted at `root_page`) into a demand-paged **skeleton**: interior
 /// nodes resident, every leaf left `OnDisk` (faulted on first access). Returns the root node only —
-/// the row count is **not** computed (open reads only the interior spine, not the leaves; the store's
-/// count stays unknown, spec/design/storage.md §6). A table whose root is itself a single leaf has no
+/// it does not compute a row count because the caller installs the exact v28 catalog count alongside
+/// the skeleton (spec/design/storage.md §6). A table whose root is itself a single leaf has no
 /// interior parent to hold an `OnDisk` reference, so the root leaf is faulted resident
 /// (spec/design/pager.md §1/§4).
 fn read_skeleton(
@@ -2211,7 +2228,7 @@ fn read_skeleton(
 /// and the leaf faults on first access. An interior page yields `Child::Resident` with its children
 /// resolved.
 ///
-/// The open-speed trick (spec/design/storage.md §6, "drop the eager count"): an interior's children
+/// The open-speed trick (spec/design/storage.md §6, v28 catalog count): an interior's children
 /// are **homogeneous** — a B+tree keeps every leaf at one depth, so an interior's children are either
 /// all leaves or all interiors. We resolve only the **first** child to learn which; if it came back
 /// `OnDisk` (a leaf), every sibling is a leaf too and becomes an `OnDisk` reference **without a
@@ -2565,7 +2582,18 @@ fn write_overflow_chain(
 }
 
 /// One table's catalog entry bytes (spec/fileformat/format.md).
-fn table_entry_bytes(table: &Table, root_data_page: u32, index_roots: &[u32]) -> Vec<u8> {
+fn table_entry_bytes(
+    table: &Table,
+    root_data_page: u32,
+    index_roots: &[u32],
+    row_count: i64,
+) -> Vec<u8> {
+    assert!(row_count >= 0, "table row count is nonnegative");
+    assert_eq!(
+        root_data_page == 0,
+        row_count == 0,
+        "table root and row count agree"
+    );
     let mut out = Vec::new();
     let name = table.name.as_bytes();
     out.extend_from_slice(&(name.len() as u16).to_be_bytes());
@@ -2770,6 +2798,7 @@ fn table_entry_bytes(table: &Table, root_data_page: u32, index_roots: &[u32]) ->
         }
     }
     out.extend_from_slice(&root_data_page.to_be_bytes());
+    out.extend_from_slice(&row_count.to_be_bytes());
     out
 }
 
@@ -3532,7 +3561,7 @@ fn decode_collation_entry(buf: &[u8], pos: &mut usize) -> Result<(Collation, boo
     Ok((coll, is_default))
 }
 
-fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u32>)> {
+fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, Vec<u32>)> {
     let name = read_string(buf, pos)?;
     let col_count = read_u16(buf, pos)? as usize;
     let mut columns = Vec::with_capacity(col_count);
@@ -3875,6 +3904,13 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u3
         });
     }
     let root_data_page = read_u32(buf, pos)?;
+    let row_count = read_i64(buf, pos)?;
+    if row_count < 0 {
+        return Err(corrupt("negative table row count"));
+    }
+    if (root_data_page == 0) != (row_count == 0) {
+        return Err(corrupt("table root and row count disagree"));
+    }
     Ok((
         Table {
             name,
@@ -3886,6 +3922,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u3
             exclusions,
         },
         root_data_page,
+        row_count,
         index_roots,
     ))
 }
@@ -4806,6 +4843,77 @@ mod tests {
             "PK table rows survive the round trip"
         );
         assert_eq!(loaded.rows_in_key_order("r"), db.rows_in_key_order("r"));
+    }
+
+    #[test]
+    fn persisted_row_count_tracks_dml_and_rollback() {
+        let image = sample_db().to_image(8192, 1).unwrap();
+        let mut db = Engine::from_image(&image).expect("re-open");
+        let count = |db: &Engine| db.store_scoped(Some("main"), "t").count().unwrap();
+
+        assert_eq!(count(&db), 3, "v28 catalog count restored on open");
+        execute(&mut db, "INSERT INTO t VALUES (4, 40)").unwrap();
+        assert_eq!(count(&db), 4);
+        execute(&mut db, "UPDATE t SET id = 40 WHERE id = 4").unwrap();
+        assert_eq!(count(&db), 4, "primary-key rewrite is count-neutral");
+        assert!(execute(&mut db, "INSERT INTO t VALUES (40, 99)").is_err());
+        assert_eq!(count(&db), 4, "failed statement restores the count");
+        execute(&mut db, "DELETE FROM t WHERE id = 40").unwrap();
+        assert_eq!(count(&db), 3);
+
+        execute(&mut db, "BEGIN READ WRITE").unwrap();
+        execute(&mut db, "INSERT INTO t VALUES (5, 50)").unwrap();
+        assert_eq!(count(&db), 4, "working snapshot carries its own count");
+        execute(&mut db, "ROLLBACK").unwrap();
+        assert_eq!(count(&db), 3, "rollback restores root and count together");
+
+        execute(&mut db, "CREATE TEMP TABLE tt (id i32 PRIMARY KEY)").unwrap();
+        execute(&mut db, "INSERT INTO tt VALUES (1), (2)").unwrap();
+        assert_eq!(
+            db.store_scoped(Some("temp"), "tt").count(),
+            Some(2),
+            "temp stores use the same exact-count map"
+        );
+        execute(&mut db, "BEGIN READ WRITE").unwrap();
+        execute(&mut db, "INSERT INTO tt VALUES (3)").unwrap();
+        assert_eq!(db.store_scoped(Some("temp"), "tt").count(), Some(3));
+        execute(&mut db, "ROLLBACK").unwrap();
+        assert_eq!(db.store_scoped(Some("temp"), "tt").count(), Some(2));
+
+        let image = db.to_image(8192, 2).unwrap();
+        let mut reopened = Engine::from_image(&image).unwrap();
+        assert_eq!(count(&reopened), 3, "mutated count survives another reopen");
+        execute(&mut reopened, "DELETE FROM t").unwrap();
+        assert_eq!(count(&reopened), 0);
+        let zero_image = reopened.to_image(8192, 3).unwrap();
+        let zero = Engine::from_image(&zero_image).unwrap();
+        assert_eq!(count(&zero), 0, "zero count and zero root survive reopen");
+    }
+
+    #[test]
+    fn table_row_count_invariants_are_rejected() {
+        let table = Table {
+            name: "t".to_string(),
+            columns: Vec::new(),
+            pk: Vec::new(),
+            checks: Vec::new(),
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+            exclusions: Vec::new(),
+        };
+        let valid = table_entry_bytes(&table, 2, &[], 3);
+
+        let mut root_with_zero_count = valid.clone();
+        let n = root_with_zero_count.len();
+        root_with_zero_count[n - 8..].copy_from_slice(&0i64.to_be_bytes());
+        let err = decode_table_entry(&root_with_zero_count, &mut 0).unwrap_err();
+        assert_eq!(err.state, SqlState::DataCorrupted);
+
+        let mut negative_count = valid;
+        let n = negative_count.len();
+        negative_count[n - 8..].copy_from_slice(&(-1i64).to_be_bytes());
+        let err = decode_table_entry(&negative_count, &mut 0).unwrap_err();
+        assert_eq!(err.state, SqlState::DataCorrupted);
     }
 
     #[test]
