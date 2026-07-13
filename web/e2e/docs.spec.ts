@@ -358,8 +358,8 @@ test('the explain page shows the OR / IN-list interval-set access path', async (
 
 test('the explain page shows the index-nested-loop access path on a join', async ({ page }) => {
   await page.goto('/docs/sql/explain/');
-  // Sixth panel = EXPLAIN SELECT ... FROM trip JOIN city ON city.id = trip.city_id: the inner city
-  // scan is a per-outer-row PK seek, labelled Index-nested-loop.
+  // Sixth panel authors city first, but P7 physically drives trip and makes city the per-outer-row
+  // PK seek, labelled Index-nested-loop.
   const panel = page.getByTestId('live-sql').nth(5);
   await expect(panel.getByTestId('result-rows')).toContainText('Nested Loop');
   await expect(panel.getByTestId('result-rows')).toContainText(
@@ -369,7 +369,7 @@ test('the explain page shows the index-nested-loop access path on a join', async
 
 test('the explain page shows the deterministic hash-join operator', async ({ page }) => {
   await page.goto('/docs/sql/explain/');
-  // Seventh panel = an equality join whose inner trip.city_id has no usable index.
+  // Seventh panel = an equality join between two columns with no usable index.
   const panel = page.getByTestId('live-sql').nth(6);
   await expect(panel.getByTestId('result-rows')).toContainText('Hash Join');
   await expect(panel.getByTestId('result-rows')).toContainText('inner; keys=1; on:conjuncts=1');

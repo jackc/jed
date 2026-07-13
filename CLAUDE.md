@@ -975,8 +975,14 @@ of executing a query** and **abort when a caller-supplied ceiling is exceeded**.
   GiST/GIN, both interval-set families, full scan, and eligible order-only B-tree walks compete after
   composing natural order, the complete residual/projection, and LIMIT/OFFSET early-out. Exact ties
   use the canonical kind/lowercased-name order; blocking sort remains unmetered and receives no
-  private planner weight. Multi-relation SELECTs and UPDATE/DELETE keep their explicit fixed policies
-  until P7 or a mutation-specific slice.
+  private planner weight.
+  P7 cost-selects eligible exactly-two-base-relation INNER/CROSS pipelines across both physical
+  orientations, every ordinary access pair, physically legal sibling INL bounds, and the existing
+  safe ON-equijoin hash gate. Physical rows are restored to their resolved logical slots before
+  expression evaluation; EXPLAIN shows physical child order. Join top-N discounts only work that
+  execution really skips, exact ties retain source order, and the chosen deterministic plan defines
+  runtime error visitation. Outer/dependency barriers, wider joins, and UPDATE/DELETE retain their
+  explicit staged policies until P8 or a mutation-specific slice.
 - **Ceiling + abort.** A caller may set a **maximum cost**; the instant accrued cost reaches
   it, execution **aborts deterministically** with a defined error code (registered in
   `spec/errors/`). The abort point is itself deterministic (same query + db + ceiling → same

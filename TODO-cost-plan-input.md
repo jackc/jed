@@ -318,27 +318,36 @@ with exact tie behavior, EXPLAIN coverage, NoREC coverage, and re-pinned actual 
 
 **Goal:** choose the cheaper legal driver and join implementation for the first reorderable join.
 
-- [ ] Introduce a physical relation-order/permutation representation without changing resolved
+- [x] Introduce a physical relation-order/permutation representation without changing resolved
   logical column slots.
-- [ ] Enumerate both orientations of eligible two-relation INNER/CROSS joins.
-- [ ] Enumerate nested-loop, index-nested-loop, and hash candidates for each legal orientation.
-- [ ] Estimate outer rows, repeated inner scans/seeks, hash build/probe byte work, ON residual work,
+- [x] Enumerate both orientations of eligible two-relation INNER/CROSS joins.
+- [x] Enumerate nested-loop, index-nested-loop, and hash candidates for each legal orientation.
+- [x] Estimate outer rows, repeated inner scans/seeks, hash build/probe byte work, ON residual work,
   join rows, and downstream rows/cost.
-- [ ] Let a sibling-column bound become an INL candidate only when its dependency is already on the
+- [x] Let a sibling-column bound become an INL candidate only when its dependency is already on the
   physical left side.
-- [ ] Make hash build/probe orientation explicit; the current fixed right-build behavior becomes a
+- [x] Make hash build/probe orientation explicit; the current fixed right-build behavior becomes a
   candidate rather than an invariant.
-- [ ] Treat LEFT/RIGHT/FULL joins, LATERAL, correlated dependencies, and non-reorderable derived/CTE
+- [x] Treat LEFT/RIGHT/FULL joins, LATERAL, correlated dependencies, and non-reorderable derived/CTE
   shapes as barriers for this slice.
-- [ ] Re-evaluate join sort-elision and LIMIT/top-N rules against the selected physical order.
-- [ ] Specify plan-dependent error ordering under the ratified deterministic plan contract; keep
+- [x] Re-evaluate join sort-elision and LIMIT/top-N rules against the selected physical order.
+- [x] Specify plan-dependent error ordering under the ratified deterministic plan contract; keep
   error corpus cases single-offender where required.
-- [ ] Add cases where FROM order wins, reverse order wins, INL wins, hash wins, and exact ties occur.
-- [ ] Add/revise NoREC and join-commutativity scenarios with total ORDER BY output comparison.
-- [ ] Re-pin affected costs and benchmark both orientations/algorithms.
+- [x] Add cases where FROM order wins, reverse order wins, INL wins, hash wins, and exact ties occur.
+- [x] Add/revise NoREC and join-commutativity scenarios with total ORDER BY output comparison.
+- [x] Re-pin affected costs and benchmark both orientations/algorithms.
 
 **Exit gate:** eligible two-table INNER/CROSS joins choose the same cheapest orientation and
 algorithm in every core, with barriers preserving all other join semantics.
+
+**Status:** implemented and verified on 2026-07-13. Rust, Go, and TypeScript enumerate the same
+complete two-orientation access/algorithm set and execute through a physical-position-to-source-
+ordinal map while preserving resolved logical slots. `query/cost_plan_join_p7.test` pins source-
+order ties and wins, reverse-order wins, reverse PK INL, hash selection, LEFT barriers, physical
+EXPLAIN leaves, exact actual costs, top-N behavior, and single-offender error visitation. Existing
+join costs were re-pinned; `cost_plan_p7` adds NoREC relations for reverse INL, hash, and reversed
+top-N. Permanent forward/reverse INL and hash/nested lanes cover both orientations and all three
+algorithms with identical checksums. Full CI passes, including the 20-seed all-core NoREC sweep.
 
 ## P8 — Bounded deterministic N-way left-deep join ordering
 
@@ -411,20 +420,21 @@ byte-identical, deterministic, cache-safe, and demonstrably improve plan selecti
 
 Update this short block at the end of each work session.
 
-- **Current slice:** P6b complete; P7 costed two-relation join orientation and algorithm is next
-- **Last completed checkpoint:** one-base-relation SELECTs cost-select every full, PK, ordered
-  B-tree, GIN, GiST, and interval-set access identity as a complete pipeline in all three cores,
-  including deterministic exact ties, natural-order composition, bounded order-only walks, shared
-  EXPLAIN/cost coverage, benchmarks, and NoREC relations
+- **Current slice:** P7 complete; P8 bounded deterministic N-way left-deep join ordering is next
+- **Last completed checkpoint:** eligible two-base-relation INNER/CROSS SELECTs cost-select both
+  physical orientations, all ordinary access pairs, physically legal INL bounds, and safe
+  ON-equijoin hash candidates as complete pipelines in all three cores, with deterministic ties,
+  physical EXPLAIN order, top-N composition, barriers, shared cost/error coverage, benchmarks, and
+  NoREC relations
 - **Branch / completion:** `path-b-p0-estimator-contract` / commit titled
-  `Implement P6b complete single-relation selection`
-- **Verification last run:** `bundle exec rake ci` (including the 20-seed, 2,160-check all-core NoREC
-  sweep), explicit memory+disk conformance on all three cores, release unit suites, `bundle exec rake
-  fmt`, `bundle exec rake verify`, and the website production build passed on 2026-07-13; native
-  Rust/Go/TypeScript before/after benchmarks used identical regenerated format-28 data
-- **Known blockers or open decisions:** no product blocker or open P6b decision. The aggregate
+  `Implement costed two-relation join search`
+- **Verification last run:** `bundle exec rake ci` (including the 20-seed all-core NoREC sweep),
+  explicit memory+disk conformance on all three cores, release unit suites, `bundle exec rake fmt`,
+  `bundle exec rake verify`, and the website production build passed on 2026-07-13; native
+  Rust/Go/TypeScript P7 benchmark lanes returned identical checksums
+- **Known blockers or open decisions:** no product blocker or open P7 decision. The aggregate
   `bench:run` wrapper could not build its optional WASI harness because `wasm32-wasip1` is not
   installed; the affected native core harnesses were run directly instead, without provisioning a
   toolchain target
-- **Next action:** specify P7's legal two-relation physical candidates and ask the maintainer about
-  major join-orientation, algorithm-selection, or pricing decisions before implementation
+- **Next action:** specify P8's dynamic-programming state/property retention and greedy fallback,
+  asking the maintainer about any major search-state decisions before implementation

@@ -4,17 +4,25 @@
 	const seed = `CREATE TABLE city (
   id     i32 PRIMARY KEY,
   name   text NOT NULL,
-  region i32 NOT NULL
+  region i32 NOT NULL,
+  zone   i32 NOT NULL
 );
 CREATE INDEX city_region ON city (region);
 INSERT INTO city VALUES
-  (1, 'Tokyo',  1),
-  (2, 'Osaka',  1),
-  (3, 'Paris',  2),
-  (4, 'Lyon',   2),
-  (5, 'Kyoto',  1);
+  (1, 'Tokyo',  1, 1),
+  (2, 'Osaka',  1, 1),
+  (3, 'Paris',  2, 3),
+  (4, 'Lyon',   2, 3),
+  (5, 'Kyoto',  1, 1),
+  (6, 'Rome',   3, 6),
+  (7, 'Milan',  3, 7),
+  (8, 'Berlin', 4, 8),
+  (9, 'Bonn',   4, 9),
+  (10, 'Lima',  5, 10);
 CREATE TABLE trip (id i32 PRIMARY KEY, city_id i32 NOT NULL);
-INSERT INTO trip VALUES (1, 3), (2, 1), (3, 3);`;
+INSERT INTO trip VALUES
+  (1, 3), (2, 1), (3, 3), (4, 4), (5, 5),
+  (6, 6), (7, 7), (8, 8), (9, 9), (10, 10);`;
 
 	const fullScan = `EXPLAIN SELECT name FROM city ORDER BY name LIMIT 2;`;
 	const pkBound = `EXPLAIN SELECT name FROM city WHERE id = 3;`;
@@ -22,9 +30,9 @@ INSERT INTO trip VALUES (1, 3), (2, 1), (3, 3);`;
 	const indexRange = `EXPLAIN SELECT name FROM city WHERE region > 1;`;
 	const pointSet = `EXPLAIN SELECT name FROM city WHERE id IN (1, 3, 5);`;
 	const indexNestedLoop = `EXPLAIN SELECT c.name
-FROM trip t JOIN city c ON c.id = t.city_id;`;
+FROM city c JOIN trip t ON c.id = t.city_id;`;
 	const hashJoin = `EXPLAIN SELECT c.name, t.id
-FROM city c JOIN trip t ON c.region = t.city_id;`;
+FROM city c JOIN trip t ON c.zone = t.city_id;`;
 	const aggregate = `EXPLAIN SELECT region, count(*)
 FROM city GROUP BY region;`;
 	const analyze = `EXPLAIN ANALYZE SELECT name FROM city WHERE id = 3;`;
@@ -57,7 +65,10 @@ of full, primary-key, ordered B-tree, GIN, GiST, and interval-set paths, includi
 the residual/projection, and LIMIT/OFFSET early-out. An `ORDER BY ... LIMIT` may also admit an
 order-only B-tree walk. Exact ties use a fixed access-kind order and then lowercased index name.
 Estimates are planner heuristics, not a resource limit or a promise to equal execution; runtime cost
-ceilings always use the actual meter. Joins and mutation target scans retain fixed policies for now.
+ceilings always use the actual meter. For eligible two-table `INNER`/`CROSS` joins, jed also compares
+both physical relation orders and legal nested-loop, index-nested-loop, and hash alternatives;
+EXPLAIN's child order is the chosen execution order, not necessarily SQL source order. Outer joins,
+dependency-bearing inputs, wider joins, and mutation target scans retain their staged policies.
 
 ## A blocking sort and bounded top-k
 
@@ -117,14 +128,20 @@ range/scalar predicates (`&&`, `@>`, `=`) can use a bare earlier-sibling column.
 `Index-nested-loop GIN bound` and `Index-nested-loop GiST bound`. The plan stays a `Nested Loop`; the
 inner child makes the per-outer access method visible.
 
+The indexed relation need not appear second in SQL. This example deliberately writes `city` first;
+the planner chooses `trip` as the physical outer and `city` as the bounded inner, while projection
+still uses the resolved source columns normally.
+
 <LiveSql seed={seed} query={indexNestedLoop} rows={8} />
 
 ## A hash join
 
-When no inner index can serve an `INNER` or `LEFT` equality join, jed may build the right input into
-an in-memory `Hash Join` and probe it with the left. Bare same-type column equalities become hash
-keys; multiple keys follow source order. NULL keys never match, and the complete `ON` predicate is
-still checked on candidates. `keys=N` makes the choice visible. The build table is currently
+For an eligible two-table `INNER` equality join, jed compares an in-memory `Hash Join` in both
+physical orientations with its nested-loop and INL alternatives. The selected physical inner is
+the hash build and the outer is the probe. Bare same-type `ON` column equalities become hash keys;
+multiple keys follow source order. NULL keys never match, and the complete `ON` predicate is still
+checked on candidates. `keys=N` makes the choice visible. `LEFT` joins retain their authored order,
+and a `CROSS JOIN ... WHERE a = b` is not rewritten into hash form. The build table is currently
 in-memory; grace-hash spill is a later storage slice.
 
 <LiveSql seed={seed} query={hashJoin} rows={8} />

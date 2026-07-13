@@ -232,12 +232,21 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   sort remains unmetered. Shared EXPLAIN/cost cases pin method/name ties, row-count/selectivity flips,
   and actual costs; `cost_plan_p6b` supplies the NoREC relation. →
   [estimator.md §9.1](spec/design/estimator.md), [planner.md §5.2](spec/design/planner.md)
+- [x] **P7 — costed two-relation orientation and algorithm** — eligible exactly-two-base-relation
+  INNER/CROSS SELECTs now compare both physical orientations, every ordinary access-path pair,
+  physically legal sibling-bound INL paths, and the existing safe ON-equijoin hash alternative as
+  complete pipelines. Logical slots remain source-ordered while execution and EXPLAIN follow the
+  selected physical order; exact ties retain source order, top-N discounts only work actually
+  skipped, and barriers keep their prior behavior. Shared plan/cost/error coverage, NoREC, and the
+  permanent forward/reverse INL plus hash/nested benchmark matrix pin the slice. →
+  [estimator.md §9.2](spec/design/estimator.md), [planner.md §5.3](spec/design/planner.md)
+- [ ] **P8 — bounded deterministic N-way join ordering** — generalize P7 to reorderable INNER/CROSS
+  islands with exhaustive left-deep dynamic programming through 8 relations and deterministic
+  greedy cheapest-next beyond the cap. Re-pin each affected `# cost:` entry. _(size: L; ×3 cores;
+  +NoREC)_
 - [ ] **Column statistics** — the initial transactional per-table row count landed in P1. Add
   per-column distinct-value counts / histograms later, computed by a spec'd pass over deterministic
   data so they stay cross-core-identical. _(size: L histograms)_
-- [ ] **Complete cost-based join-order selection** — **reorder the left-deep join** (drive the smaller / more-selective
-  relation, enable index-nested-loop) rather than honoring FROM order. Re-pin each affected
-  `# cost:` corpus entry as the observable plan changes land. _(P7–P8; size: L; ×3 cores; +NoREC)_
 
 ### Planner infrastructure
 

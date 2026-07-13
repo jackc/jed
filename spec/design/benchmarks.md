@@ -8,7 +8,8 @@ throughput** benchmarks (the `concurrent_read` kind, §8.1). Rule-based access-p
 scratch workloads including `composite_pk_lookup`, `interval_set_pk`, and
 `bounded_index_limit`; P6b adds `order_only_index_limit` and `gist_range_select` while reusing
 `gin_contains` and `interval_set_pk` for its cross-method matrix. `join_inl_topn` covers the
-combined join rule, alongside `gin_inl` and the
+combined join rule, while P7 adds the reversed-source-order
+`join_reverse_inl` / `join_reverse_nested_fallback` pair alongside `gin_inl` and the
 `gist_inl` / `gist_inl_nested_fallback` pair for opclass sibling bounds, and the
 `hash_join_equijoin` / `hash_join_nested_fallback` pair. `order_by_limit`
 is the permanent blocking-sort top-k lane: one million fixed
@@ -43,6 +44,17 @@ rule. Median per-query time was **3.0 ms hash vs 436 ms nested Go** (147×), **3
 (136×), and **9.1 ms vs 852 ms TypeScript** (94×). PostgreSQL was 0.79/0.84 ms and chose its own
 optimizer plan for both spellings. Timings are non-gating; cross-engine checksum equality, exact
 costs, collision invariants, and the NoREC optimized/fallback relation are the correctness proof.
+
+**P7 two-relation result (2026-07-13).** The new permanent `join_reverse_inl` /
+`join_reverse_nested_fallback` pair puts the indexed 50,000-row relation first in SQL and the
+250-row driver second. P7 reverses the physical order and performs 250 PK probes; the equivalent
+`i.id + 0 = d.k` spelling makes INL ineligible and supplies the nested-loop reference. Both return
+the same 250 logical matches and checksum `bfa69a736f5387bd`, including PostgreSQL. Median per-query
+time was **12.1 ms INL vs 774 ms nested Go** (64×), **7.55 ms vs 1.04 s Rust** (138×), and
+**0.995 ms vs 4.54 s TypeScript** (4,563×). The companion FROM-order `join_inl_topn` lane retained
+checksum `836953ce88391bbd`, while the hash/nested pair retained checksum `bcb67a58737e9b73`.
+Together those permanent lanes exercise both physical orientations and all three P7 algorithms;
+the shared plan/cost corpus remains the deterministic selection proof and timings remain non-gating.
 
 **P6b selector result (2026-07-13).** The native before/after run covered `gin_contains`,
 `interval_set_pk`, `order_only_index_limit`, and `gist_range_select`. Every core retained the same

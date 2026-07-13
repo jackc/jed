@@ -227,6 +227,50 @@ setup_sql = [
   "INSERT INTO hash_ref_right SELECT g, g % 500 FROM generate_series(1, 2500) AS g"
 ]
 
+# P7 reverse-orientation INL and its results-identical nested-loop reference. The indexed 50k-row
+# relation deliberately appears first in SQL. Costed two-relation search reverses the physical
+# order so the 250-row driver is left and the PK relation becomes the per-row bound inner; wrapping
+# the PK expression in +0 keeps the same equality result while making the INL bound ineligible.
+[[bench]]
+name = "join_reverse_inl"
+description = "P7 reverse physical order: 250 PK probes although the indexed 50k-row relation appears first"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT count(*) FROM p7_reverse_inner i JOIN p7_reverse_driver d ON i.id = d.k"
+warmup = 2
+iterations = 10
+seed = 4263
+expect_rows_per_iter = 1
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS p7_reverse_driver",
+  "DROP TABLE IF EXISTS p7_reverse_inner",
+  "CREATE TABLE p7_reverse_inner (id bigint PRIMARY KEY, v bigint)",
+  "CREATE TABLE p7_reverse_driver (id bigint PRIMARY KEY, k bigint)",
+  "INSERT INTO p7_reverse_inner SELECT g, g * 2 FROM generate_series(1, 50000) AS g",
+  "INSERT INTO p7_reverse_driver SELECT g, g * 199 FROM generate_series(1, 250) AS g"
+]
+
+[[bench]]
+name = "join_reverse_nested_fallback"
+description = "Expression-key nested-loop reference for join_reverse_inl; identical 250-row join result"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT count(*) FROM p7_reverse_ref_inner i JOIN p7_reverse_ref_driver d ON i.id + 0 = d.k"
+warmup = 2
+iterations = 10
+seed = 4264
+expect_rows_per_iter = 1
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS p7_reverse_ref_driver",
+  "DROP TABLE IF EXISTS p7_reverse_ref_inner",
+  "CREATE TABLE p7_reverse_ref_inner (id bigint PRIMARY KEY, v bigint)",
+  "CREATE TABLE p7_reverse_ref_driver (id bigint PRIMARY KEY, k bigint)",
+  "INSERT INTO p7_reverse_ref_inner SELECT g, g * 2 FROM generate_series(1, 50000) AS g",
+  "INSERT INTO p7_reverse_ref_driver SELECT g, g * 199 FROM generate_series(1, 250) AS g"
+]
+
 [[bench]]
 name = "secondary_lookup"
 description = "Secondary-index equality lookup on 1M rows (~10 rows per customer)"
