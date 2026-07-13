@@ -92,41 +92,8 @@ impl Engine {
         Ok((rows, (pages, slabs)))
     }
 
-    /// Fetch the rows a SINGLE already-encoded leading-column index value admits — the equality
-    /// prefix scan `[0x00‖value, byte-successor)` over the index B-tree plus, per admitted entry, the
-    /// Fetch keyed rows for one encoded leading-column value. This is the point-probe primitive used
-    /// by secondary-index point sets.
-    pub(crate) fn index_point_entries(
-        &self,
-        table_name: &str,
-        name_key: &str,
-        suffix_types: &[ScalarType],
-        value_key: &[u8],
-        mask: &[bool],
-    ) -> Result<(Vec<(Vec<u8>, Row)>, (usize, usize))> {
-        // The entry-key prefix: the §2.2 present tag + the value's bare key bytes. The range
-        // is every entry extending the prefix: [prefix, byte-successor(prefix)).
-        let mut prefix = vec![0x00u8];
-        prefix.extend_from_slice(value_key);
-        let bound = KeyBound {
-            lo: Some(prefix.clone()),
-            lo_inc: true,
-            hi: prefix_successor(&prefix),
-            hi_inc: false,
-        };
-        let plen = prefix.len();
-        self.index_scan_bound_entries(table_name, name_key, suffix_types, &bound, plen, mask)
-    }
-
-    /// Execute a primary-key OR / IN-list point-set bound (cost.md §3 "OR / IN-list"): each distinct
-    /// encoded key is a point probe `[k, k]` over the row's own B-tree, and the admitted rows are
-    /// concatenated in ascending key order (the same order a full scan would yield). The per-probe
-    /// `(pages, slabs)` blocks sum, so the metered cost is the sum of the individual point lookups —
-    /// a core that full-scans instead computes a different cost (the cross-core contract, §8).
-    /// Returns the `(key, row)` entries so the mutation paths can remove/replace by key; SELECT
-    /// discards the keys. `masked` selects the reconstruction variant (SELECT reconstructs only the
-    /// touched columns; a mutation needs whole rows to re-key / remove index entries) — cost-neutral,
-    /// so both charge the identical `(pages, slabs)` driven by the shared `mask`.
+    /// Execute canonical logical intervals over the row's own B-tree. Storage keys are retained for
+    /// mutation consumers, and each disjoint interval's page/slab block is summed.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn pk_key_set_rows(
         &self,
@@ -141,20 +108,15 @@ impl Engine {
         let mut entries: Vec<(Vec<u8>, Row)> = Vec::new();
         let mut pages = 0usize;
         let mut slabs = 0usize;
-        for k in encode_key_set(
+        for b in canonical_interval_set(
             ks.pk_type,
-            &ks.srcs,
+            &ks.specs,
+            &ks.clip,
             params,
             outer,
             ks.coll.as_deref(),
             left,
         ) {
-            let b = KeyBound {
-                lo: Some(k.clone()),
-                lo_inc: true,
-                hi: Some(k),
-                hi_inc: true,
-            };
             let (es, p, s) = if masked {
                 store.range_scan_with_units(&b, mask)?
             } else {
@@ -167,11 +129,8 @@ impl Engine {
         Ok((entries, (pages, slabs)))
     }
 
-    /// Execute a secondary-index OR / IN-list point-set bound (cost.md §3 "OR / IN-list"): each
-    /// distinct encoded value is an index point probe ([`Self::index_point_rows`]), and the rows are
-    /// gathered in ascending value order. Because a row has exactly one value for the indexed column,
-    /// distinct values probe disjoint row sets — no row is fetched twice. The per-probe
-    /// `(pages, slabs)` blocks sum, matching the PK point-set cost contract.
+    /// Map canonical logical intervals into the secondary index's present-value key space. Each
+    /// admitted index entry point-looks-up the table row in deterministic byte-key order.
     pub(crate) fn index_key_set_rows(
         &self,
         table_name: &str,
@@ -198,16 +157,35 @@ impl Engine {
         let mut rows: Vec<(Vec<u8>, Row)> = Vec::new();
         let mut pages = 0usize;
         let mut slabs = 0usize;
-        for k in encode_key_set(
+        for logical in canonical_interval_set(
             ks.col_type,
-            &ks.srcs,
+            &ks.specs,
+            &ks.clip,
             params,
             outer,
             ks.coll.as_deref(),
             left,
         ) {
-            let (r, (p, s)) =
-                self.index_point_entries(table_name, &ks.name_key, &ks.tail_types, &k, mask)?;
+            let physical = index_logical_interval(&logical);
+            let point = logical.lo.is_some()
+                && logical.lo == logical.hi
+                && logical.lo_inc
+                && logical.hi_inc;
+            let mut suffix_types = ks.tail_types.clone();
+            let prefix_len = if point {
+                1 + logical.lo.as_ref().unwrap().len()
+            } else {
+                suffix_types.insert(0, ks.col_type);
+                0
+            };
+            let (r, (p, s)) = self.index_scan_bound_entries(
+                table_name,
+                &ks.name_key,
+                &suffix_types,
+                &physical,
+                prefix_len,
+                mask,
+            )?;
             rows.extend(r);
             pages += p;
             slabs += s;

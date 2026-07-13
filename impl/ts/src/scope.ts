@@ -1900,14 +1900,6 @@ export function renderBoundTerms(col: string, terms: BoundTerm[]): string {
   return terms.map((t) => `${col} ${boundOpText(t.op)} ${renderBoundSrc(t.src)}`).join(" and ");
 }
 
-// renderKeySet renders a merged OR / IN-list point-set bound's const-sources as `col in (a, b, c)`
-// (cost.md §3 "OR / IN-list"), in source order (the plan-time order, before the exec-time encode /
-// dedup / sort) — deterministic across cores. Each source renders via renderBoundSrc (a bind param as
-// `$N`, a correlated column as `outer`, a literal via its token).
-export function renderKeySet(col: string, srcs: RExpr[]): string {
-  return col + " in (" + srcs.map((s) => renderBoundSrc(s)).join(", ") + ")";
-}
-
 // boundOpText is the symbol for a bound comparison operator.
 export function boundOpText(op: BinaryOp): string {
   switch (op) {

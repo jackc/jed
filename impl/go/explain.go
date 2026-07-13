@@ -530,9 +530,9 @@ func (db *engine) accessPath(tableName string, b *scanBound, inl bool) string {
 	case b.gist != nil:
 		return "GiST bound: using " + b.gist.nameKey
 	case b.pkSet != nil:
-		return prefix + "PK point set: " + renderKeySet(db.firstPKColName(tableName), b.pkSet.srcs)
+		return prefix + "PK interval set: " + db.firstPKColName(tableName) + "; intervals=" + strconv.Itoa(len(b.pkSet.specs))
 	case b.indexSet != nil:
-		return prefix + "Index point set: using " + b.indexSet.nameKey
+		return prefix + "Index interval set: using " + b.indexSet.nameKey + "; intervals=" + strconv.Itoa(len(b.indexSet.specs))
 	default:
 		return "Full scan"
 	}
@@ -552,18 +552,6 @@ func renderPKBound(b *pkBoundPlan) string {
 		parts = append(parts, strings.Split(renderBoundTerms(b.rangeName, b.rangeTerms), " and ")...)
 	}
 	return strings.Join(parts, " and ")
-}
-
-// renderKeySet renders a merged OR / IN-list point-set bound's const-sources as
-// `col in (a, b, c)` (cost.md §3 "OR / IN-list"), in source order (the plan-time order, before
-// the exec-time encode / dedup / sort) — deterministic across cores. Each source renders via
-// renderBoundSrc (a bind param as `$N`, a correlated column as `outer`, a literal via its token).
-func renderKeySet(col string, srcs []*rExpr) string {
-	parts := make([]string, len(srcs))
-	for i, s := range srcs {
-		parts[i] = renderBoundSrc(s)
-	}
-	return col + " in (" + strings.Join(parts, ", ") + ")"
 }
 
 // firstPKColName returns the name of a table's first primary-key column (in key order), or "pk" when

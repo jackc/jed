@@ -414,7 +414,7 @@ export function pkIndices(t: Table): number[] {
 }
 
 // primaryKeyIndex returns the primary-key column's index iff the key is SINGLE-column, else -1.
-// Callers that genuinely require one member (notably OR/IN point sets) use this helper; tuple bounds
+// Callers that genuinely require one member (notably OR/IN interval sets) use this helper; tuple bounds
 // iterate pkIndices directly.
 export function primaryKeyIndex(t: Table): number {
   const idxs = pkIndices(t);

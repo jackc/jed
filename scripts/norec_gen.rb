@@ -40,6 +40,8 @@
 #              disjunct's key in a `BinaryOp`, so no disjunct is a bare column and it full-scans. Both
 #              must return identical rows — including a NULL list element (adds no match), an absent
 #              key, and across a PK-IN-list UPDATE/DELETE (the point-set DML path).
+#   interval_set — same-key OR range leaves and IN∩range lower to canonical disjoint intervals;
+#              wrapping the key in `+ 0` defeats the rule. Query rows and mutation end states match.
 #   index_order — `ORDER BY v LIMIT k` over a secondary-indexed non-PK column walks the index tree
 #              (a top-N, cost.md §3 "secondary-index order"); `ORDER BY v` with no LIMIT keeps the
 #              eager sort. Over a total order (distinct `v`, NULLS LAST) the index top-N windows and
@@ -164,6 +166,10 @@ OR_IN_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index dml.insert d
                dml.update dml.delete query.select query.where_eq query.order_by
                query.logical_connectives query.point_lookup query.or_in_point_lookup expr.in_list
                expr.arithmetic expr.comparison_value types.i32 null.three_valued].freeze
+INTERVAL_SET_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row dml.update
+                      query.select query.where_eq query.comparison_order query.order_by
+                      query.logical_connectives query.point_lookup query.or_in_point_lookup
+                      query.interval_set expr.in_list expr.between expr.arithmetic types.i32].freeze
 DISTINCT_ORDER_REQ = %w[ddl.create_table ddl.primary_key ddl.composite_primary_key dml.insert
                         dml.insert_multi_row query.select query.distinct query.order_by
                         query.order_by_keys query.limit query.offset query.order_by_pk_scan
@@ -832,6 +838,44 @@ def gen_or_in(seed)
   stmt(out, "DELETE FROM t WHERE id = #{victim} OR id = #{absent}")
   pair.call("id IN (#{three.join(', ')}) after DELETE of #{victim}",
             "id IN (#{three.join(', ')})", "id + 0 IN (#{three.join(', ')})", in_pk.call(three))
+
+  out.join("\n") + "\n"
+end
+
+# --- scenario: canonical interval-set algebra --------------------------------------------------
+def gen_interval_set(seed)
+  rng = Random.new(seed)
+  ids = (1..40).to_a.sample(14, random: rng).sort
+  rows = ids.map { |id| [id, rng.rand(-100..100)] }
+  lo, hi = ids.sample(2, random: rng).sort
+  cut = ids.sample(random: rng)
+  points = ids.sample(4, random: rng).sort
+  flat = ->(rs) { rs.flat_map { |id, v| [id.to_s, v.to_s] } }
+
+  out = header(seed, INTERVAL_SET_REQ, "canonical interval-set algebra")
+  values = rows.map { |id, v| "(#{id}, #{v})" }.join(', ')
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
+  stmt(out, "INSERT INTO t VALUES #{values}")
+
+  union = rows.select { |id, _v| id <= lo || id >= hi }
+  out << "# disjoint/overlapping range union"
+  q(out, "II", "SELECT id, v FROM t WHERE id <= #{lo} OR id >= #{hi} ORDER BY id", flat.call(union))
+  q(out, "II", "SELECT id, v FROM t WHERE id + 0 <= #{lo} OR id + 0 >= #{hi} ORDER BY id", flat.call(union))
+
+  inter = rows.select { |id, _v| points.include?(id) && id > cut }
+  list = points.join(', ')
+  out << "# point set intersected with a range"
+  q(out, "II", "SELECT id, v FROM t WHERE id IN (#{list}) AND id > #{cut} ORDER BY id", flat.call(inter))
+  q(out, "II", "SELECT id, v FROM t WHERE id + 0 IN (#{list}) AND id + 0 > #{cut} ORDER BY id", flat.call(inter))
+
+  stmt(out, "CREATE TABLE t_scan (id i32 PRIMARY KEY, v i32)")
+  stmt(out, "INSERT INTO t_scan VALUES #{values}")
+  stmt(out, "UPDATE t SET v = v + 1000 WHERE id <= #{lo} OR id >= #{hi}")
+  stmt(out, "UPDATE t_scan SET v = v + 1000 WHERE id + 0 <= #{lo} OR id + 0 >= #{hi}")
+  updated = rows.map { |id, v| [id, id <= lo || id >= hi ? v + 1000 : v] }
+  out << "# canonical and full-scan mutation end states"
+  q(out, "II", "SELECT id, v FROM t ORDER BY id", flat.call(updated))
+  q(out, "II", "SELECT id, v FROM t_scan ORDER BY id", flat.call(updated))
 
   out.join("\n") + "\n"
 end
@@ -1731,6 +1775,7 @@ SCENARIOS = {
   "index_range" => method(:gen_index_range),
   "index_prefix" => method(:gen_index_prefix),
   "or_in" => method(:gen_or_in),
+  "interval_set" => method(:gen_interval_set),
   "index_order" => method(:gen_index_order),
   "distinct_order" => method(:gen_distinct_order),
   "join_order" => method(:gen_join_order),

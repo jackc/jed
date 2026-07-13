@@ -10,10 +10,9 @@ impl ScanBound {
     /// Whether this bound needs the general eager materialize path (`materialize_rel` / the DML
     /// scan) rather than a single-contiguous-range fast path (streaming scan, columnar project,
     /// vectorized aggregate, streaming sort, join top-N). True for a second-tree gather
-    /// (index / GIN / GiST) and for a merged OR/IN point-set (`PkSet` / `IndexSet` — a union of
-    /// probes, cost.md §3 "OR / IN-list"); false for a plain PK contiguous bound (which every fast
+    /// (index / GIN / GiST) and for a canonical interval set (`PkSet` / `IndexSet`); false for a plain PK contiguous bound (which every fast
     /// path handles via a single `build_key_bound`). Every single-table fast-path gate consults
-    /// this so the point-set bounds are interpreted in exactly ONE place (`materialize_rel`), never
+    /// this so interval-set bounds are interpreted in exactly ONE place (`materialize_rel`), never
     /// silently dropped to a full scan by a fast path that only understands `Pk`.
     pub(crate) fn needs_eager_scan(&self) -> bool {
         matches!(
@@ -282,6 +281,21 @@ pub(crate) fn detect_scan_bound_with_policy(
     if rel.is_attachment() {
         return None;
     }
+    let pk_intervals = rel.table.primary_key_index().and_then(|pk_local| {
+        let sty = rel.table.columns[pk_local].ty.as_scalar()?;
+        let coll = key_collation_ctx(catalog, &rel.table.columns[pk_local])?;
+        let (specs, clip) =
+            detect_interval_set(filter, rel.offset + pk_local, sty, coll.as_deref())?;
+        Some(PkKeySet {
+            pk_type: sty,
+            coll,
+            specs,
+            clip,
+        })
+    });
+    if policy.index_set && pk_intervals.as_ref().is_some_and(|p| !p.clip.is_empty()) {
+        return pk_intervals.map(ScanBound::PkSet);
+    }
     if let Some(b) = detect_pk_bound(&[filter], rel, None, catalog) {
         return Some(ScanBound::Pk(b));
     }
@@ -291,6 +305,13 @@ pub(crate) fn detect_scan_bound_with_policy(
             // trailing range over a B-tree index's leading key columns. Indexes are held in
             // ascending lowercased-name order, so the first `Some` wins.
             if let Some(ib) = build_index_access_predicate(filter, rel, idx, None, catalog) {
+                if policy.index_set {
+                    if let Some(set) = build_index_interval_set_plan(filter, rel, idx, catalog)
+                        .filter(|s| !s.clip.is_empty())
+                    {
+                        return Some(ScanBound::IndexSet(set));
+                    }
+                }
                 return Some(ScanBound::Index(ib));
             }
         }
@@ -322,65 +343,64 @@ pub(crate) fn detect_scan_bound_with_policy(
     // "OR / IN-list"). Reached only when no contiguous PK/index/GIN/GiST bound applied above, so
     // this never displaces an existing plan. The primary key wins over a secondary index (its own
     // key — no second tree), matching `detect_scan_bound`'s PK-then-index ordering.
-    if let Some(b) = rel.table.primary_key_index().and_then(|pk_local| {
-        let sty = rel.table.columns[pk_local].ty.as_scalar()?;
-        let coll = key_collation_ctx(catalog, &rel.table.columns[pk_local])?;
-        let srcs = detect_key_set(filter, rel.offset + pk_local, sty, coll.as_deref())?;
-        Some(ScanBound::PkSet(PkKeySet {
-            pk_type: sty,
-            coll,
-            srcs,
-        }))
-    }) {
-        return Some(b);
+    if let Some(set) = pk_intervals {
+        return Some(ScanBound::PkSet(set));
     }
     if !policy.index_set {
         return None;
     }
     for idx in &rel.table.indexes {
-        if idx.kind != IndexKind::Btree {
-            continue;
-        }
-        // A PARTIAL index is not used for the OR/IN point-set this slice (indexes.md §9): the merged
-        // point-lookup path carries no predicate-implication gate, so it stays non-partial (a
-        // follow-on) — falling through leaves a correct full scan.
-        if idx.predicate.is_some() {
-            continue;
-        }
-        // The OR/IN merged-point-lookup bound is column-only this slice (an expression index takes
-        // the access-predicate path — indexes.md §5; OR/IN over an expression key is a follow-on).
-        let Some(cols) = idx.column_ordinals() else {
-            continue;
-        };
-        let ci = cols[0];
-        let Some(ty) = rel.table.columns[ci].ty.as_scalar() else {
-            continue;
-        };
-        if cols[1..].iter().any(|&c| {
-            rel.table.columns[c]
-                .ty
-                .as_scalar()
-                .is_none_or(|s| !s.is_fixed_width())
-        }) {
-            continue;
-        }
-        let Some(coll) = key_collation_ctx(catalog, &rel.table.columns[ci]) else {
-            continue;
-        };
-        if let Some(srcs) = detect_key_set(filter, rel.offset + ci, ty, coll.as_deref()) {
-            return Some(ScanBound::IndexSet(IndexKeySet {
-                name_key: idx.name.to_ascii_lowercase(),
-                col_type: ty,
-                coll,
-                tail_types: cols[1..]
-                    .iter()
-                    .map(|&c| rel.table.columns[c].ty.scalar())
-                    .collect(),
-                srcs,
-            }));
+        if let Some(set) = build_index_interval_set_plan(filter, rel, idx, catalog) {
+            return Some(ScanBound::IndexSet(set));
         }
     }
     None
+}
+
+fn interval_plan_has_range(specs: &[IntervalSpec], clip: &[BoundTerm]) -> bool {
+    specs
+        .iter()
+        .flat_map(|s| &s.terms)
+        .chain(clip)
+        .any(|t| !matches!(t.op, CmpOp::Eq))
+}
+
+fn build_index_interval_set_plan(
+    filter: &RExpr,
+    rel: &ScopeRel,
+    idx: &IndexDef,
+    catalog: &Engine,
+) -> Option<IndexKeySet> {
+    if idx.kind != IndexKind::Btree || idx.predicate.is_some() {
+        return None;
+    }
+    let cols = idx.column_ordinals()?;
+    let ci = cols[0];
+    let ty = rel.table.columns[ci].ty.as_scalar()?;
+    if cols[1..].iter().any(|&c| {
+        rel.table.columns[c]
+            .ty
+            .as_scalar()
+            .is_none_or(|s| !s.is_fixed_width())
+    }) {
+        return None;
+    }
+    let coll = key_collation_ctx(catalog, &rel.table.columns[ci])?;
+    let (specs, clip) = detect_interval_set(filter, rel.offset + ci, ty, coll.as_deref())?;
+    if interval_plan_has_range(&specs, &clip) && !ty.is_fixed_width() {
+        return None;
+    }
+    Some(IndexKeySet {
+        name_key: idx.name.to_ascii_lowercase(),
+        col_type: ty,
+        coll,
+        tail_types: cols[1..]
+            .iter()
+            .map(|&c| rel.table.columns[c].ty.scalar())
+            .collect(),
+        specs,
+        clip,
+    })
 }
 
 impl Engine {
@@ -411,78 +431,88 @@ impl Engine {
     }
 }
 
-/// Find an OR / IN-list disjunction of equalities on ONE key column (at global index `key_idx`) and
-/// return its equality const-sources (one per disjunct), or `None` if the filter has no such shape
-/// (cost.md §3 "OR / IN-list"). `x IN (a, b, c)` desugars to `x = a OR x = b OR x = c` at resolve
-/// time (grammar.md §20), so an IN-list and a hand-written OR-of-equalities present the identical
-/// tree — this handles both. The filter's top-level AND-chain is flattened; the FIRST conjunct that
-/// reduces to a pure disjunction of `keycol = const` equalities is used (the rest of the WHERE stays
-/// the residual filter). A conjunct reduces iff it is a `keycol = const`, or an OR of two reducing
-/// operands — an AND, a NOT, a range comparison, or an equality on a different column makes it
-/// non-reducing, so a mixed disjunction (`pk = 1 OR x = 2`) or a NOT IN (`NOT (pk = 1 OR …)`)
-/// correctly yields no bound. Conservative + sound: an unrecognized filter contributes no bound.
-pub(crate) fn detect_key_set(
+/// Find the first top-level conjunct that is a pure OR of intervals on one key. A leaf is a single
+/// comparison or an AND of same-key comparisons (BETWEEN's resolved shape). Direct same-key
+/// comparisons in the remaining top-level conjuncts become a global clip. The full predicate stays
+/// residual, so rejecting any other shape is conservative and widening an unencodable endpoint is
+/// sound.
+pub(crate) fn detect_interval_set(
     filter: &RExpr,
     key_idx: usize,
     key_type: ScalarType,
     coll: Option<&Collation>,
-) -> Option<Vec<BoundSrc>> {
+) -> Option<(Vec<IntervalSpec>, Vec<BoundTerm>)> {
     let col_coll = coll.map(|c| c.name.as_str());
-    // Walk the top-level AND chain; the FIRST conjunct that reduces to a pure disjunction of
-    // `keycol = const` equalities is used (the rest of the WHERE stays the residual filter).
-    pub(crate) fn walk(
-        e: &RExpr,
-        key_idx: usize,
-        key_type: ScalarType,
-        col_coll: Option<&str>,
-    ) -> Option<Vec<BoundSrc>> {
+    fn flatten<'a>(e: &'a RExpr, out: &mut Vec<&'a RExpr>) {
         if let RExpr::And(l, r) = e {
-            return walk(l, key_idx, key_type, col_coll)
-                .or_else(|| walk(r, key_idx, key_type, col_coll));
+            flatten(l, out);
+            flatten(r, out);
+        } else {
+            out.push(e);
         }
-        reduce_key_set(e, key_idx, key_type, col_coll)
     }
-    walk(filter, key_idx, key_type, col_coll)
+    let mut conjuncts = Vec::new();
+    flatten(filter, &mut conjuncts);
+    let mut found = None;
+    for (i, e) in conjuncts.iter().enumerate() {
+        if !matches!(e, RExpr::Or(_, _)) {
+            continue;
+        }
+        if let Some(specs) = reduce_interval_union(e, key_idx, key_type, col_coll) {
+            found = Some((i, specs));
+            break;
+        }
+    }
+    let (found_idx, specs) = found?;
+    let mut clip = Vec::new();
+    for (i, e) in conjuncts.into_iter().enumerate() {
+        if i != found_idx {
+            collect_bound_terms(
+                e,
+                &KeyMatch::Column(key_idx),
+                key_type,
+                col_coll,
+                None,
+                &mut clip,
+            );
+        }
+    }
+    Some((specs, clip))
 }
 
-/// Reduce one predicate to the set of equality const-sources it bounds `key_idx` with, or `None` if
-/// it is not a pure disjunction of `keycol = const` ([`detect_key_set`]). Descends OR nodes only; a
-/// single `keycol = const` leaf is the base case (the same term extraction as
-/// [`collect_bound_terms`], with no sibling references — a once-materialized bound). A comparison
-/// bounds the key only when ITS resolved collation matches the key column's frozen collation.
-pub(crate) fn reduce_key_set(
+/// Reduce one pure OR tree to interval specs. Each non-OR leaf may be a conjunction, but every term
+/// must bound this key with a matching type and collation.
+pub(crate) fn reduce_interval_union(
     e: &RExpr,
     key_idx: usize,
     key_type: ScalarType,
     col_coll: Option<&str>,
-) -> Option<Vec<BoundSrc>> {
+) -> Option<Vec<IntervalSpec>> {
     if let RExpr::Or(l, r) = e {
-        let mut left = reduce_key_set(l, key_idx, key_type, col_coll)?;
-        let right = reduce_key_set(r, key_idx, key_type, col_coll)?;
+        let mut left = reduce_interval_union(l, key_idx, key_type, col_coll)?;
+        let right = reduce_interval_union(r, key_idx, key_type, col_coll)?;
         left.extend(right);
         return Some(left);
     }
-    if let RExpr::Compare {
-        op: CmpOp::Eq,
-        lhs,
-        rhs,
-        collation,
-    } = e
-    {
-        if collation.as_ref().map(|c| c.name.as_str()) != col_coll {
-            return None;
+    fn leaf_terms(
+        e: &RExpr,
+        key_idx: usize,
+        key_type: ScalarType,
+        col_coll: Option<&str>,
+        out: &mut Vec<BoundTerm>,
+    ) -> bool {
+        if let RExpr::And(l, r) = e {
+            return leaf_terms(l, key_idx, key_type, col_coll, out)
+                && leaf_terms(r, key_idx, key_type, col_coll, out);
         }
-        let is_key = |x: &RExpr| matches!(x, RExpr::Column(i) if *i == key_idx);
-        let src = if is_key(lhs) {
-            const_source(rhs, key_type, None)
-        } else if is_key(rhs) {
-            const_source(lhs, key_type, None)
-        } else {
-            None
-        };
-        return src.map(|s| vec![s]);
+        let before = out.len();
+        collect_bound_terms(e, &KeyMatch::Column(key_idx), key_type, col_coll, None, out);
+        out.len() == before + 1
     }
-    None
+    let mut terms = Vec::new();
+    leaf_terms(e, key_idx, key_type, col_coll, &mut terms)
+        .then_some(IntervalSpec { terms })
+        .map(|s| vec![s])
 }
 
 /// Detect an **index-nested-loop** scan bound for a join inner relation `rel` (spec/design/cost.md
@@ -2248,32 +2278,145 @@ pub(crate) fn flip_cmp(op: CmpOp) -> CmpOp {
     }
 }
 
-/// Encode an OR / IN-list's equality const-sources into the key space and return a SORTED,
-/// DE-DUPLICATED set of encoded keys — the distinct point probes a merged point-set bound visits
-/// (cost.md §3 "OR / IN-list"). A src that is NULL (3VL-never-true) or does not encode into the key
-/// domain (an out-of-range integer — no stored key can equal it) contributes no point and is skipped
-/// (sound: the union stays a superset, and the residual filter re-checks each admitted row). Byte-
-/// dedup == value-dedup and byte-sort == value-sort under the order-preserving key encoding
-/// (encoding.md §2), so probing the sorted distinct keys yields rows in ascending key order with no
-/// row visited twice. Shared by the PK and secondary-index point-set executors.
-pub(crate) fn encode_key_set(
+/// Encode one source interval into logical key space. NULL makes the disjunct empty; an
+/// unencodable equality cannot match and is also empty, while an unencodable range endpoint is
+/// dropped as a sound widening because the complete predicate remains the residual filter.
+fn build_logical_interval(
     key_type: ScalarType,
-    srcs: &[BoundSrc],
+    terms: &[BoundTerm],
     params: &[Value],
     outer: &[&[Value]],
     coll: Option<&Collation>,
     left: &[Value],
-) -> Vec<Vec<u8>> {
-    let mut keys: Vec<Vec<u8>> = Vec::with_capacity(srcs.len());
-    for src in srcs {
-        match encode_bound_key(key_type, src, params, outer, coll, left) {
-            BoundKey::Null | BoundKey::OutOfRange => continue,
-            BoundKey::Key(k) => keys.push(k),
+) -> Option<KeyBound> {
+    let mut b = KeyBound::unbounded();
+    for term in terms {
+        let key = match encode_bound_key(key_type, &term.src, params, outer, coll, left) {
+            BoundKey::Null => return None,
+            BoundKey::OutOfRange if matches!(term.op, CmpOp::Eq) => return None,
+            BoundKey::OutOfRange => continue,
+            BoundKey::Key(k) => k,
+        };
+        match term.op {
+            CmpOp::Eq => {
+                intersect_lo(&mut b, &key, true);
+                intersect_hi(&mut b, &key, true);
+            }
+            CmpOp::Gt => intersect_lo(&mut b, &key, false),
+            CmpOp::Ge => intersect_lo(&mut b, &key, true),
+            CmpOp::Lt => intersect_hi(&mut b, &key, false),
+            CmpOp::Le => intersect_hi(&mut b, &key, true),
+            CmpOp::Ne => {}
         }
     }
-    keys.sort();
-    keys.dedup();
-    keys
+    (!bound_empty(&b)).then_some(b)
+}
+
+fn intersect_bounds(mut a: KeyBound, b: &KeyBound) -> KeyBound {
+    if let Some(lo) = &b.lo {
+        intersect_lo(&mut a, lo, b.lo_inc);
+    }
+    if let Some(hi) = &b.hi {
+        intersect_hi(&mut a, hi, b.hi_inc);
+    }
+    a
+}
+
+pub(crate) fn canonical_interval_set(
+    key_type: ScalarType,
+    specs: &[IntervalSpec],
+    clip_terms: &[BoundTerm],
+    params: &[Value],
+    outer: &[&[Value]],
+    coll: Option<&Collation>,
+    left: &[Value],
+) -> Vec<KeyBound> {
+    let clip = if clip_terms.is_empty() {
+        KeyBound::unbounded()
+    } else if let Some(b) = build_logical_interval(key_type, clip_terms, params, outer, coll, left)
+    {
+        b
+    } else {
+        return Vec::new();
+    };
+    let mut intervals: Vec<KeyBound> = specs
+        .iter()
+        .filter_map(|spec| {
+            let b = build_logical_interval(key_type, &spec.terms, params, outer, coll, left)?;
+            let b = intersect_bounds(b, &clip);
+            (!bound_empty(&b)).then_some(b)
+        })
+        .collect();
+    intervals.sort_by(|a, b| match (&a.lo, &b.lo) {
+        (None, None) => b.lo_inc.cmp(&a.lo_inc),
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (Some(x), Some(y)) => x.cmp(y).then_with(|| b.lo_inc.cmp(&a.lo_inc)),
+    });
+    let mut out: Vec<KeyBound> = Vec::with_capacity(intervals.len());
+    for next in intervals {
+        let Some(cur) = out.last_mut() else {
+            out.push(next);
+            continue;
+        };
+        let mut merge = cur.hi.is_none() || next.lo.is_none();
+        if !merge {
+            let cmp = next.lo.as_ref().unwrap().cmp(cur.hi.as_ref().unwrap());
+            merge = cmp.is_lt() || (cmp.is_eq() && (cur.hi_inc || next.lo_inc));
+            if !merge && key_type.is_fixed_width() && cur.hi_inc && next.lo_inc {
+                merge = prefix_successor(cur.hi.as_ref().unwrap()) == next.lo;
+            }
+        }
+        if !merge {
+            out.push(next);
+            continue;
+        }
+        if cur.hi.is_none() {
+            continue;
+        }
+        match (&next.hi, &cur.hi) {
+            (None, _) => {
+                cur.hi = None;
+                cur.hi_inc = false;
+            }
+            (Some(n), Some(c)) if n > c || (n == c && next.hi_inc) => {
+                cur.hi = Some(n.clone());
+                cur.hi_inc = next.hi_inc;
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+pub(crate) fn index_logical_interval(logical: &KeyBound) -> KeyBound {
+    let mut b = KeyBound {
+        lo: Some(vec![0x00]),
+        lo_inc: true,
+        hi: Some(vec![0x01]),
+        hi_inc: false,
+    };
+    if let Some(lo) = &logical.lo {
+        let mut p = vec![0x00];
+        p.extend_from_slice(lo);
+        if logical.lo_inc {
+            intersect_lo(&mut b, &p, true);
+        } else if let Some(next) = prefix_successor(&p) {
+            intersect_lo(&mut b, &next, true);
+        }
+    }
+    if let Some(hi) = &logical.hi {
+        let mut p = vec![0x00];
+        p.extend_from_slice(hi);
+        if logical.hi_inc {
+            if let Some(next) = prefix_successor(&p) {
+                intersect_hi(&mut b, &next, false);
+            }
+        } else {
+            intersect_hi(&mut b, &p, false);
+        }
+    }
+    b
 }
 
 /// Build a PK tuple's concrete storage-key range. Equality members append bare encodings to P; a

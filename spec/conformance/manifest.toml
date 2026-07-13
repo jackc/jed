@@ -198,7 +198,11 @@ description = "Composite-primary-key tuple bounds — a WHERE over `(pk1, pk2, .
 
 [[capability]]
 id = "query.or_in_point_lookup"
-description = "OR / IN-list merged point lookups — a single relation whose WHERE is a top-level disjunction of equalities on ONE key column, `pk = a OR pk = b OR …` or the equivalent `pk IN (a, b, …)` (which desugars to that OR-chain, grammar.md §20), OR the same shape on a leading B-tree secondary-index column, is lowered to a UNION of point probes over a de-duplicated, sorted set of encoded keys (a bitmap-OR) instead of a full scan (spec/design/cost.md §3 \"OR / IN-list\"). Each distinct non-NULL key is a point lookup; the whole WHERE stays the residual filter (the union is a superset of the matching rows), so results are unchanged. The bound is a LAST RESORT — it fires only where no contiguous PK/index/GIN/GiST bound already applies — for SELECT and UPDATE/DELETE alike. A cost-visible optimization: the metered cost is the SUM of the per-probe bounded scans (each probe's page_read to its access-path nodes + storage_row_read to the rows it admits), so a core lacking it full-scans and computes a different cost — cost-asserting OR/IN tests require it. Builds on query.point_lookup and expr.in_list."
+description = "OR / IN-list merged point lookups — a disjunction of equalities on one single-column PK or leading B-tree index key lowers to canonical encoded point intervals instead of a full scan. Runtime values are sorted, de-duplicated, and probed in key order; the complete WHERE remains the residual filter. UPDATE/DELETE share the path. Builds on query.point_lookup and expr.in_list; generalized by query.interval_set."
+
+[[capability]]
+id = "query.interval_set"
+description = "Canonical key-interval sets — a pure OR whose leaves are same-key equality/range comparisons (including BETWEEN conjunctions) lowers to a runtime-encoded, sorted, disjoint interval list over a single-column PK or leading B-tree key. A co-present same-key AND range clips every OR/IN interval; empty intervals vanish; overlaps, duplicates, touching endpoints, and fixed-width byte-adjacent closed intervals merge, so each candidate emits once in key order. Cost sums canonical interval scans, not source disjuncts. SELECT and UPDATE/DELETE share the path; mixed keys, NOT/non-bound leaves, promoted comparisons, unsafe collations, and variable-width secondary range unions fall back. Builds on query.or_in_point_lookup and query.index_range."
 
 [[capability]]
 id = "query.index_mutation"

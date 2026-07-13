@@ -45,6 +45,46 @@ gen = "int_uniform"
 min = 42001
 max = 43000
 
+# Canonical range-union intervals (query.interval_set). Two disjoint, parameterized PK windows each
+# admit roughly 9–17 rows from a 100k-row scratch table. Before interval-set lowering this OR shape
+# full-scanned every row; runtime encoding now sorts/canonicalizes the two windows and scans them once.
+[[bench]]
+name = "interval_set_pk"
+description = "Two disjoint parameterized PK ranges on 100k rows; canonical interval scans vs. a full scan"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT id, v FROM interval_orders WHERE id BETWEEN $1 AND $2 OR id BETWEEN $3 AND $4 ORDER BY id"
+warmup = 500
+iterations = 15000
+seed = 4254
+engines = ["jed", "postgres"]
+setup_sql = [
+  "CREATE TABLE interval_orders (id bigint PRIMARY KEY, v bigint)",
+  "INSERT INTO interval_orders SELECT g, g * 2 FROM generate_series(1, 100000) AS g"
+]
+
+[[bench.param]]
+gen = "int_uniform"
+min = 100
+max = 49000
+
+[[bench.param]]
+gen = "int_window"
+base = 0
+off_min = 8
+off_max = 16
+
+[[bench.param]]
+gen = "int_uniform"
+min = 51000
+max = 99900
+
+[[bench.param]]
+gen = "int_window"
+base = 2
+off_min = 8
+off_max = 16
+
 [[bench]]
 name = "secondary_lookup"
 description = "Secondary-index equality lookup on 1M rows (~10 rows per customer)"

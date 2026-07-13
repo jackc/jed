@@ -190,8 +190,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   the sum of the per-probe bounded scans; cap `query.or_in_point_lookup`.
   → [cost.md §3](spec/design/cost.md), `spec/conformance/suites/query/or_in_point_lookup.test`
   - [x] _follow-on:_ a secondary-index point-set for UPDATE/DELETE (landed with `query.index_mutation`).
-  - [ ] _follow-on:_ range disjuncts in the union (`pk = 1 OR pk BETWEEN 10 AND 20`); intersecting an
-    IN-list with a co-present range conjunct (`pk IN (1..9) AND pk > 4`).
+  - [x] **Canonical interval-set algebra** — range disjuncts plus point-set/range intersection,
+    runtime sort/clip/merge, shared by PK/index SELECT and mutation paths; cap `query.interval_set`.
 - [x] **Composite-PK tuple bounds** — maximal equality prefix plus an optional next-member range,
   shared by SELECT, UPDATE/DELETE, correlated scans, join-relation bounds, and composite INL; cap
   `query.composite_pk_pushdown`. → [cost.md §3](spec/design/cost.md),

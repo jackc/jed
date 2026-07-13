@@ -2,9 +2,9 @@
 # EXPLAIN of a DELETE deletes nothing, an EXPLAIN of an INSERT inserts nothing. The DML root is
 # Insert / Update / Delete; INSERT … VALUES has a Values child, INSERT … SELECT renders its source
 # subplan, and UPDATE/DELETE render the residual Filter + the target Scan. The scan access path is
-# chosen by the same policy-driven inventory the executor uses (PK, ordered B-tree, GIN/GiST, point
-# set), so the reported path matches what the statement would run.
-# requires: ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.secondary_index, ddl.index_partial, ddl.gin_index, ddl.gist_index, dml.insert, dml.insert_select, dml.insert_multi_row, dml.insert_on_conflict, dml.update, dml.delete, query.select, query.where_eq, query.comparison_order, query.point_lookup, query.composite_pk_pushdown, query.index_range, query.index_partial, query.or_in_point_lookup, query.index_mutation, query.gin_scan, query.gist_scan, query.explain, dml.explain, expr.arithmetic, expr.in_list, types.i32, types.text, types.array, types.range, func.array_containment, func.range_constructors, func.range_operators
+# chosen by the same policy-driven inventory the executor uses (PK, ordered B-tree, GIN/GiST,
+# interval set), so the reported path matches what the statement would run.
+# requires: ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.secondary_index, ddl.index_partial, ddl.gin_index, ddl.gist_index, dml.insert, dml.insert_select, dml.insert_multi_row, dml.insert_on_conflict, dml.update, dml.delete, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.point_lookup, query.composite_pk_pushdown, query.index_range, query.index_partial, query.or_in_point_lookup, query.interval_set, query.index_mutation, query.gin_scan, query.gist_scan, query.explain, dml.explain, expr.arithmetic, expr.in_list, types.i32, types.text, types.array, types.range, func.array_containment, func.range_constructors, func.range_operators
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, v i32, s text)
@@ -217,7 +217,20 @@ Filter
 conjuncts=1
 2
 Scan dml_index_plan
-Index point set: using dml_index_plan_v_idx
+Index interval set: using dml_index_plan_v_idx; intervals=2
+
+query ITT nosort
+EXPLAIN DELETE FROM dml_index_plan WHERE v < 10 OR v >= 30
+----
+0
+Delete dml_index_plan
+-
+1
+Filter
+conjuncts=1
+2
+Scan dml_index_plan
+Index interval set: using dml_index_plan_v_idx; intervals=2
 
 query ITT nosort
 EXPLAIN DELETE FROM dml_index_plan WHERE v + 0 = 10

@@ -4457,18 +4457,17 @@ pub(crate) struct PkBound {
     member_count: usize,
 }
 
-/// The plan-time result of an OR / IN-list disjunction of primary-key equalities
-/// (`pk = a OR pk = b OR …`, or the equivalent `pk IN (a, b, …)` which desugars to that OR-chain
-/// — cost.md §3 "OR / IN-list"). `srcs` is the equality const-sources, one per disjunct, in source
-/// order (a bind param, an outer/correlated column, or a literal — a const-source of the PK type).
-/// At exec time each src encodes into the PK key space; the resulting keys are de-duplicated and
-/// sorted, and each becomes a point probe `[k, k]`. The whole WHERE stays the residual filter (the
-/// union is a superset), so the result is unchanged. `coll` is the PK's key collation (`None` for a
-/// `C` key), as in [`PkBound`].
+pub(crate) struct IntervalSpec {
+    terms: Vec<BoundTerm>,
+}
+
+/// Canonical interval-set plan over a single-column PK. Specs are OR disjuncts; `clip` is the
+/// co-present top-level AND bounds on that key.
 pub(crate) struct PkKeySet {
     pk_type: ScalarType,
     coll: Option<std::sync::Arc<Collation>>,
-    srcs: Vec<BoundSrc>,
+    specs: Vec<IntervalSpec>,
+    clip: Vec<BoundTerm>,
 }
 
 /// The [`PkKeySet`] analog over a leading B-tree secondary-index column (indexes.md §5): each
@@ -4480,17 +4479,17 @@ pub(crate) struct IndexKeySet {
     col_type: ScalarType,
     coll: Option<std::sync::Arc<Collation>>,
     tail_types: Vec<ScalarType>,
-    srcs: Vec<BoundSrc>,
+    specs: Vec<IntervalSpec>,
+    clip: Vec<BoundTerm>,
 }
 
 /// A per-relation scan bound (cost.md §3): a primary-key range, a secondary-index
 /// equality (spec/design/indexes.md §5), a GIN-bounded scan over an array column
-/// (spec/design/gin.md §6), a GiST-bounded scan, or a MERGED point-set (an OR / IN-list of key
-/// equalities lowered to a union of point probes — cost.md §3 "OR / IN-list"). The PK bound wins
+/// (spec/design/gin.md §6), a GiST-bounded scan, or a canonical interval set. The PK bound wins
 /// when several apply — it is the row's own key (no second tree, range-capable, strictly cheaper);
 /// the ordered-index equality bound wins over GIN (the deterministic precedence, gin.md §6). The
-/// point-set bounds (`PkSet`/`IndexSet`) are a LAST-RESORT access path, chosen only when no
-/// contiguous PK/index/GIN/GiST bound applies, so they never displace an existing plan.
+/// interval-set bounds (`PkSet`/`IndexSet`) are normally the last resort; a co-present same-key
+/// range clip deliberately makes the set win over the broader contiguous clip alone.
 pub(crate) enum ScanBound {
     Pk(PkBound),
     Index(IndexBound),

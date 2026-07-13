@@ -73,6 +73,33 @@ fn composite_pk_float_param_widens_soundly() {
 }
 
 #[test]
+fn interval_set_runtime_union_and_clip() {
+    let mut db = db_with(&[
+        "CREATE TABLE t (id i32 PRIMARY KEY, v i32)",
+        "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40)",
+    ]);
+    let got = rows(
+        &mut db,
+        "SELECT id FROM t WHERE id < $1 OR id >= $2 ORDER BY id",
+        &[Value::Int(3), Value::Int(4)],
+    );
+    assert_eq!(
+        got,
+        vec![
+            vec![Value::Int(1)],
+            vec![Value::Int(2)],
+            vec![Value::Int(4)]
+        ]
+    );
+    let clipped = rows(
+        &mut db,
+        "SELECT id FROM t WHERE id IN ($1, $2, $3) AND id > $4 ORDER BY id",
+        &[Value::Int(1), Value::Int(3), Value::Int(4), Value::Int(2)],
+    );
+    assert_eq!(clipped, vec![vec![Value::Int(3)], vec![Value::Int(4)]]);
+}
+
+#[test]
 fn param_adopts_narrow_column_type_and_traps_overflow() {
     // `$1` compared against an i16 column is typed i16; a value out of i16 range traps
     // 22003 at bind, before any scan.

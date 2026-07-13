@@ -328,7 +328,6 @@ import {
   relOfIndex,
   renderBoundSrc,
   renderBoundTerms,
-  renderKeySet,
   resolvedTypeOf,
   resolvedTypeOfCol,
   rtName,
@@ -2997,10 +2996,20 @@ export class Engine {
         return "GiST bound: using " + b.gist.nameKey;
       case "pkSet":
         return (
-          prefix + "PK point set: " + renderKeySet(this.firstPKColName(tableName), b.pkSet.srcs)
+          prefix +
+          "PK interval set: " +
+          this.firstPKColName(tableName) +
+          "; intervals=" +
+          b.pkSet.specs.length
         );
       case "indexSet":
-        return prefix + "Index point set: using " + b.indexSet.nameKey;
+        return (
+          prefix +
+          "Index interval set: using " +
+          b.indexSet.nameKey +
+          "; intervals=" +
+          b.indexSet.specs.length
+        );
     }
   }
 
@@ -6515,15 +6524,8 @@ export class Engine {
     return this.indexScanBoundEntries(tableName, nameKey, suffixTypes, b, prefix.length, mask);
   }
 
-  // pkKeySetRows executes a primary-key OR / IN-list point-set bound (cost.md §3 "OR / IN-list"):
-  // each distinct encoded key is a point probe [k, k] over the row's own B-tree, and the admitted
-  // rows are concatenated in ascending key order (the same order a full scan would yield). The
-  // per-probe (pages, slabs) blocks sum, so the metered cost is the sum of the individual point
-  // lookups — a core that full-scans instead computes a different cost (the cross-core contract, §8).
-  // Returns the (key, row) entries so the mutation paths can remove/replace by key; SELECT discards
-  // the keys. The SELECT/mutation feeds share the one lazy reconstruction (the masked/unmasked
-  // split is collapsed — bplus-reshape.md B4); both charge the identical (pages, slabs) driven by
-  // the shared mask.
+  // Execute canonical logical intervals over the row's own B-tree. Storage keys are retained for
+  // mutation consumers, and each disjoint interval's page/slab block is summed.
   pkKeySetRows(
     store: TableStore,
     ks: PkKeySet,
@@ -6535,8 +6537,15 @@ export class Engine {
     const entries: Entry[] = [];
     let pages = 0;
     let slabs = 0;
-    for (const k of encodeKeySet(ks.pkType, ks.srcs, params, outer, ks.coll, left)) {
-      const b: KeyBound = { lo: k, loInc: true, hi: k, hiInc: true };
+    for (const b of canonicalIntervalSet(
+      ks.pkType,
+      ks.specs,
+      ks.clip,
+      params,
+      outer,
+      ks.coll,
+      left,
+    )) {
       const u = store.rangeScanWithUnits(b, mask);
       for (const e of u.entries) entries.push(e);
       pages += u.pages;
@@ -6545,11 +6554,8 @@ export class Engine {
     return { entries, pages, slabs };
   }
 
-  // indexKeySetRows executes a secondary-index OR / IN-list point-set bound (cost.md §3 "OR /
-  // IN-list"): each distinct encoded value is an index point probe (indexPointRows), and the rows are
-  // gathered in ascending value order. Because a row has exactly one value for the indexed column,
-  // distinct values probe disjoint row sets — no row is fetched twice. The per-probe (pages, slabs)
-  // blocks sum, matching the PK point-set cost contract.
+  // Map canonical logical intervals into the secondary index's present-value key space. Each
+  // admitted index entry point-looks-up the table row in deterministic byte-key order.
   indexKeySetRows(
     tableName: string,
     ks: IndexKeySet,
@@ -6573,8 +6579,32 @@ export class Engine {
     const entries: Entry[] = [];
     let pages = 0;
     let slabs = 0;
-    for (const k of encodeKeySet(ks.colType, ks.srcs, params, outer, ks.coll, left)) {
-      const r = this.indexPointEntries(tableName, ks.nameKey, ks.tailTypes, k, mask);
+    for (const logical of canonicalIntervalSet(
+      ks.colType,
+      ks.specs,
+      ks.clip,
+      params,
+      outer,
+      ks.coll,
+      left,
+    )) {
+      const physical = indexLogicalInterval(logical);
+      const point =
+        logical.lo !== null &&
+        logical.hi !== null &&
+        logical.loInc &&
+        logical.hiInc &&
+        bytesEq(logical.lo, logical.hi);
+      const suffixTypes = point ? ks.tailTypes : [ks.colType, ...ks.tailTypes];
+      const prefixLen = point ? 1 + logical.lo!.length : 0;
+      const r = this.indexScanBoundEntries(
+        tableName,
+        ks.nameKey,
+        suffixTypes,
+        physical,
+        prefixLen,
+        mask,
+      );
       for (const entry of r.entries) entries.push(entry);
       pages += r.pages;
       slabs += r.slabs;
@@ -13339,12 +13369,10 @@ function* scanSource(rows: Row[], nodeCount: number, meter: Meter): Generator<Ro
 
 // ScanBound is a per-relation scan bound (cost.md §3): a primary-key range, a
 // secondary-index equality (spec/design/indexes.md §5), a GIN-bounded scan over an array column
-// (spec/design/gin.md §6), a GiST-bounded scan, or a MERGED point-set (an OR / IN-list of key
-// equalities lowered to a union of point probes — cost.md §3 "OR / IN-list"). The PK bound wins
+// (spec/design/gin.md §6), a GiST-bounded scan, or a canonical interval set over one key. The PK bound wins
 // when several apply (it is the row's own key — no second tree, range-capable, strictly cheaper);
-// the ordered-index equality bound wins over GIN (gin.md §6). The point-set bounds (pkSet/indexSet)
-// are a LAST-RESORT access path, chosen only when no contiguous PK/index/GIN/GiST bound applies, so
-// they never displace an existing plan.
+// the ordered-index equality bound wins over GIN (gin.md §6). Interval sets are normally the last
+// resort; a same-key OR/IN plus a direct range clip deliberately wins over the broader clip alone.
 export type ScanBound =
   | { kind: "pk"; pk: PkBound }
   | { kind: "index"; index: IndexBound }
@@ -13366,10 +13394,10 @@ export type MutationScanBatch = {
 // needsEagerScan reports whether a bound needs the general eager materialize path (materializeRel /
 // the DML scan) rather than a single-contiguous-range fast path (streaming scan, columnar project,
 // vectorized aggregate, streaming sort, join top-N). True for a second-tree gather (index / GIN /
-// GiST) and for a merged OR/IN point-set (pkSet / indexSet — a union of probes, cost.md §3
-// "OR / IN-list"); false for a null bound or a plain PK contiguous bound (which every fast path
+// GiST) and for a canonical interval set (pkSet / indexSet); false for a null bound or a plain PK
+// contiguous bound (which every fast path
 // handles via a single buildKeyBound). Every single-table fast-path gate consults this so the
-// point-set bounds are interpreted in exactly ONE place (materializeRel), never silently dropped to
+// interval-set bounds are interpreted in exactly ONE place (materializeRel), never silently dropped to
 // a full scan by a fast path that only understands `pk`. Nil-safe (a null/undefined bound is not eager).
 export function needsEagerScan(sb: ScanBound | null | undefined): boolean {
   if (sb === null || sb === undefined) return false;
@@ -13382,25 +13410,25 @@ export function needsEagerScan(sb: ScanBound | null | undefined): boolean {
   );
 }
 
-// PkKeySet is the plan-time result of an OR / IN-list disjunction of primary-key equalities
-// (`pk = a OR pk = b OR …`, or the equivalent `pk IN (a, b, …)` which desugars to that OR-chain —
-// cost.md §3 "OR / IN-list"). srcs is the equality const-sources, one per disjunct, in source order
-// (a bind param, an outer/correlated column, or a literal — isConstSource of the PK type). At exec
-// time each src encodes into the PK key space; the resulting keys are de-duplicated and sorted, and
-// each becomes a point probe [k, k]. The whole WHERE stays the residual filter (the union is a
-// superset), so the result is unchanged. coll is the PK's key collation (null for a C key).
-export type PkKeySet = { pkType: ScalarType; coll: Collation | null; srcs: RExpr[] };
+// One OR disjunct becomes an IntervalSpec; co-present direct comparisons become clip terms. Runtime
+// encoding turns them into a sorted, disjoint key-interval list. The full WHERE remains residual.
+export type IntervalSpec = { terms: BoundTerm[] };
+export type PkKeySet = {
+  pkType: ScalarType;
+  coll: Collation | null;
+  specs: IntervalSpec[];
+  clip: BoundTerm[];
+};
 
-// IndexKeySet is the PkKeySet analog over a leading B-tree secondary-index column (indexes.md §5):
-// each distinct encoded value becomes an index point probe (prefix scan + per-entry row lookup), and
-// the rows are gathered in ascending value order. tailTypes is the remaining key components' types
-// (as in IndexBound) — the per-entry key-suffix skip.
+// IndexKeySet is the PkKeySet analog over a leading B-tree secondary-index column. tailTypes names
+// the remaining key components used to recover each table storage-key suffix.
 export type IndexKeySet = {
   nameKey: string;
   colType: ScalarType;
   coll: Collation | null;
   tailTypes: ScalarType[];
-  srcs: RExpr[];
+  specs: IntervalSpec[];
+  clip: BoundTerm[];
 };
 
 // GistBound is the plan-time result of GiST analysis (spec/design/gist.md §5): the chosen GiST index
@@ -13617,6 +13645,21 @@ export function detectScanBoundWithPolicy(
   // A host-attached relation full-scans this slice (attached-databases.md §8): the bounded-scan exec
   // path resolves index stores unscoped, so no PK/index/GiST/GIN bound may apply to an attachment.
   if (isAttachmentScope(rel.db)) return null;
+  const pkLocal = primaryKeyIndex(rel.table);
+  let pkIntervals: PkKeySet | null = null;
+  if (pkLocal >= 0) {
+    const sty = typeAsScalar(rel.table.columns[pkLocal]!.type);
+    if (sty !== undefined) {
+      const ctx = keyCollationCtx(snap, rel.table.columns[pkLocal]!);
+      if (ctx !== null) {
+        const set = detectIntervalSet(filter, rel.offset + pkLocal, sty, ctx.coll);
+        if (set !== null) pkIntervals = { pkType: sty, coll: ctx.coll, ...set };
+      }
+    }
+  }
+  if (policy.indexSet && pkIntervals !== null && pkIntervals.clip.length > 0) {
+    return { kind: "pkSet", pkSet: pkIntervals };
+  }
   const bp = detectPkBound([filter], rel, -1, snap);
   if (bp !== null) return { kind: "pk", pk: bp };
   if (policy.orderedIndex) {
@@ -13625,7 +13668,13 @@ export function detectScanBoundWithPolicy(
       // range over a B-tree index's leading key columns. Indexes are held in ascending lowercased-name
       // order, so the first non-null wins.
       const ib = buildIndexAccessPredicate(filter, rel, idx, -1, snap, engine);
-      if (ib !== null) return { kind: "index", index: ib };
+      if (ib !== null) {
+        if (policy.indexSet) {
+          const set = buildIndexIntervalSetPlan(filter, rel, idx, snap);
+          if (set !== null && set.clip.length > 0) return { kind: "indexSet", indexSet: set };
+        }
+        return { kind: "index", index: ib };
+      }
     }
   }
   if (policy.gistBeforeGin) {
@@ -13643,105 +13692,122 @@ export function detectScanBoundWithPolicy(
   // "OR / IN-list"). Reached only when no contiguous PK/index/GIN/GiST bound applied above, so this
   // never displaces an existing plan. The primary key wins over a secondary index (its own key — no
   // second tree), matching detectScanBound's ordering.
-  const pkLocal = primaryKeyIndex(rel.table);
-  if (pkLocal >= 0) {
-    const sty = typeAsScalar(rel.table.columns[pkLocal]!.type);
-    if (sty !== undefined) {
-      const ctx = keyCollationCtx(snap, rel.table.columns[pkLocal]!);
-      if (ctx !== null) {
-        const srcs = detectKeySet(filter, rel.offset + pkLocal, sty, ctx.coll);
-        if (srcs !== null) return { kind: "pkSet", pkSet: { pkType: sty, coll: ctx.coll, srcs } };
-      }
-    }
-  }
+  if (pkIntervals !== null) return { kind: "pkSet", pkSet: pkIntervals };
   if (!policy.indexSet) return null;
   for (const idx of rel.table.indexes) {
-    if (idx.kind !== "btree") continue;
-    // A PARTIAL index is not used for the OR/IN point-set this slice (indexes.md §9): the merged
-    // point-lookup path carries no predicate-implication gate, so it stays non-partial (a follow-on) —
-    // falling through leaves a correct full scan.
-    if (idx.predicate !== undefined) continue;
-    // The OR/IN merged-point-lookup bound is column-only this slice (an expression index takes the
-    // access-predicate path — indexes.md §5; OR/IN over an expression key is a follow-on).
-    const cols = indexColumnOrdinals(idx);
-    if (cols === null) continue;
-    const ci = cols[0]!;
-    const ty = typeAsScalar(rel.table.columns[ci]!.type);
-    if (ty === undefined) continue;
-    if (
-      cols.slice(1).some((c) => {
-        const ts = typeAsScalar(rel.table.columns[c]!.type);
-        return ts === undefined || !isFixedWidth(ts);
-      })
-    ) {
-      continue;
-    }
-    const ctx = keyCollationCtx(snap, rel.table.columns[ci]!);
-    if (ctx === null) continue;
-    const srcs = detectKeySet(filter, rel.offset + ci, ty, ctx.coll);
-    if (srcs !== null) {
-      const tailTypes = cols.slice(1).map((c) => typeScalar(rel.table.columns[c]!.type));
-      return {
-        kind: "indexSet",
-        indexSet: { nameKey: idx.name.toLowerCase(), colType: ty, coll: ctx.coll, tailTypes, srcs },
-      };
-    }
+    const set = buildIndexIntervalSetPlan(filter, rel, idx, snap);
+    if (set !== null) return { kind: "indexSet", indexSet: set };
   }
   return null;
 }
 
-// detectKeySet finds an OR / IN-list disjunction of equalities on ONE key column (at global index
-// keyIdx) and returns its equality const-sources (one per disjunct), or null if the filter has no
-// such shape (cost.md §3 "OR / IN-list"). `x IN (a, b, c)` desugars to `x = a OR x = b OR x = c` at
-// resolve time (grammar.md §20), so an IN-list and a hand-written OR-of-equalities present the
-// identical tree — this handles both. The filter's top-level AND-chain is flattened; the FIRST
-// conjunct that reduces to a pure disjunction of `keycol = const` equalities is used (the rest of the
-// WHERE stays the residual filter). A conjunct reduces iff it is a `keycol = const`, or an OR of two
-// reducing operands — an AND, a NOT, a range comparison, or an equality on a different column makes it
-// non-reducing, so a mixed disjunction (`pk = 1 OR x = 2`) or a NOT IN (`NOT (pk = 1 OR …)`) correctly
-// yields no bound. Conservative + sound: an unrecognized filter contributes no bound.
-export function detectKeySet(
+function intervalPlanHasRange(specs: IntervalSpec[], clip: BoundTerm[]): boolean {
+  return specs.some((s) => s.terms.some((t) => t.op !== "eq")) || clip.some((t) => t.op !== "eq");
+}
+
+function buildIndexIntervalSetPlan(
+  filter: RExpr,
+  rel: ScopeRel,
+  idx: IndexDef,
+  snap: Snapshot,
+): IndexKeySet | null {
+  if (idx.kind !== "btree" || idx.predicate !== undefined) return null;
+  const cols = indexColumnOrdinals(idx);
+  if (cols === null) return null;
+  const ci = cols[0]!;
+  const ty = typeAsScalar(rel.table.columns[ci]!.type);
+  if (ty === undefined) return null;
+  if (
+    cols.slice(1).some((c) => {
+      const t = typeAsScalar(rel.table.columns[c]!.type);
+      return t === undefined || !isFixedWidth(t);
+    })
+  )
+    return null;
+  const ctx = keyCollationCtx(snap, rel.table.columns[ci]!);
+  if (ctx === null) return null;
+  const set = detectIntervalSet(filter, rel.offset + ci, ty, ctx.coll);
+  if (set === null || (intervalPlanHasRange(set.specs, set.clip) && !isFixedWidth(ty))) return null;
+  return {
+    nameKey: idx.name.toLowerCase(),
+    colType: ty,
+    coll: ctx.coll,
+    tailTypes: cols.slice(1).map((c) => typeScalar(rel.table.columns[c]!.type)),
+    ...set,
+  };
+}
+
+// Find the first top-level conjunct that is a pure OR of same-key intervals. Other direct same-key
+// conjuncts become a global clip; every other shape remains residual only.
+export function detectIntervalSet(
   filter: RExpr | null,
   keyIdx: number,
   keyType: ScalarType,
   coll: Collation | null,
-): RExpr[] | null {
+): { specs: IntervalSpec[]; clip: BoundTerm[] } | null {
+  if (filter === null) return null;
   const colColl = coll !== null ? coll.name : null;
-  let found: RExpr[] | null = null;
-  const walkAnd = (e: RExpr | null): void => {
-    if (found !== null || e === null) return;
+  const conjuncts: RExpr[] = [];
+  const flatten = (e: RExpr): void => {
     if (e.kind === "and") {
-      walkAnd(e.lhs);
-      walkAnd(e.rhs);
+      flatten(e.lhs);
+      flatten(e.rhs);
       return;
     }
-    const srcs = reduceKeySet(e, keyIdx, keyType, colColl);
-    if (srcs !== null) found = srcs;
+    conjuncts.push(e);
   };
-  walkAnd(filter);
-  return found;
+  flatten(filter);
+  let found = -1;
+  let specs: IntervalSpec[] | null = null;
+  for (let i = 0; i < conjuncts.length; i++) {
+    if (conjuncts[i]!.kind !== "or") continue;
+    const reduced = reduceIntervalUnion(conjuncts[i]!, keyIdx, keyType, colColl);
+    if (reduced !== null) {
+      found = i;
+      specs = reduced;
+      break;
+    }
+  }
+  if (specs === null) return null;
+  const clip: BoundTerm[] = [];
+  for (let i = 0; i < conjuncts.length; i++) {
+    if (i === found) continue;
+    const t = asBoundTerm(
+      conjuncts[i]!,
+      { kind: "column", index: keyIdx },
+      keyType,
+      colColl,
+      -1,
+    );
+    if (t !== null) clip.push(t);
+  }
+  return { specs, clip };
 }
 
-// reduceKeySet reduces one predicate to the set of equality const-sources it bounds keyIdx with, or
-// null if it is not a pure disjunction of `keycol = const` (detectKeySet). Descends OR nodes only; a
-// single `keycol = const` leaf is the base case (reusing asBoundTerm, siblingCutoff -1 — no sibling
-// references in a once-materialized bound).
-export function reduceKeySet(
+// Reduce a pure OR tree into interval specs; a non-OR leaf may be an AND only when every term bounds
+// the same key with a matching type and collation.
+export function reduceIntervalUnion(
   e: RExpr,
   keyIdx: number,
   keyType: ScalarType,
   colColl: string | null,
-): RExpr[] | null {
+): IntervalSpec[] | null {
   if (e.kind === "or") {
-    const l = reduceKeySet(e.lhs, keyIdx, keyType, colColl);
+    const l = reduceIntervalUnion(e.lhs, keyIdx, keyType, colColl);
     if (l === null) return null;
-    const r = reduceKeySet(e.rhs, keyIdx, keyType, colColl);
+    const r = reduceIntervalUnion(e.rhs, keyIdx, keyType, colColl);
     if (r === null) return null;
     return l.concat(r);
   }
-  const t = asBoundTerm(e, { kind: "column", index: keyIdx }, keyType, colColl, -1);
-  if (t !== null && t.op === "eq") return [t.src];
-  return null;
+  const terms: BoundTerm[] = [];
+  const walk = (x: RExpr): boolean => {
+    if (x.kind === "and") return walk(x.lhs) && walk(x.rhs);
+    const t = asBoundTerm(x, { kind: "column", index: keyIdx }, keyType, colColl, -1);
+    if (t === null) return false;
+    terms.push(t);
+    return true;
+  };
+  return walk(e) && terms.length > 0 ? [{ terms }] : null;
 }
 
 // detectINLBound detects an index-nested-loop scan bound for a join inner relation rel (cost.md §3
@@ -15743,34 +15809,138 @@ export function encodeValueKey(pkType: ScalarType, v: Value, coll: Collation | n
   return { kind: "outOfRange" };
 }
 
-// encodeKeySet encodes an OR / IN-list's equality const-sources into the key space and returns a
-// SORTED, DE-DUPLICATED set of encoded keys — the distinct point probes a merged point-set bound
-// visits (cost.md §3 "OR / IN-list"). A src that is NULL (3VL-never-true) or does not encode into the
-// key domain (an out-of-range integer — no stored key can equal it) contributes no point and is
-// skipped (sound: the union stays a superset, and the residual filter re-checks each admitted row).
-// Byte-dedup == value-dedup and byte-sort == value-sort under the order-preserving key encoding
-// (encoding.md §2), so probing the sorted distinct keys yields rows in ascending key order with no
-// row visited twice. Shared by the PK and secondary-index point-set executors.
-export function encodeKeySet(
+// Encode one source interval into logical key space. NULL or an unencodable equality makes it empty;
+// an unencodable range endpoint is dropped as a sound widening because WHERE remains residual.
+function buildLogicalInterval(
   keyType: ScalarType,
-  srcs: RExpr[],
+  terms: BoundTerm[],
   params: Value[],
   outer: Row[],
   coll: Collation | null,
   left: Row,
-): Uint8Array[] {
-  const keys: Uint8Array[] = [];
-  for (const src of srcs) {
-    const bk = encodeBoundKey(keyType, src, params, outer, coll, left);
-    if (bk.kind !== "key") continue;
-    keys.push(bk.key);
+): KeyBound | null {
+  const b = unboundedBound();
+  for (const term of terms) {
+    const encoded = encodeBoundKey(keyType, term.src, params, outer, coll, left);
+    if (encoded.kind === "null") return null;
+    if (encoded.kind === "outOfRange") {
+      if (term.op === "eq") return null;
+      continue;
+    }
+    switch (term.op) {
+      case "eq":
+        intersectLo(b, encoded.key, true);
+        intersectHi(b, encoded.key, true);
+        break;
+      case "gt":
+        intersectLo(b, encoded.key, false);
+        break;
+      case "ge":
+        intersectLo(b, encoded.key, true);
+        break;
+      case "lt":
+        intersectHi(b, encoded.key, false);
+        break;
+      case "le":
+        intersectHi(b, encoded.key, true);
+        break;
+    }
   }
-  keys.sort((a, b) => compareBytes(a, b));
-  const out: Uint8Array[] = [];
-  for (let i = 0; i < keys.length; i++) {
-    if (i === 0 || !bytesEq(keys[i]!, keys[i - 1]!)) out.push(keys[i]!);
+  return boundEmpty(b) ? null : b;
+}
+
+function intersectBounds(a: KeyBound, b: KeyBound): KeyBound {
+  const out = { ...a };
+  if (b.lo !== null) intersectLo(out, b.lo, b.loInc);
+  if (b.hi !== null) intersectHi(out, b.hi, b.hiInc);
+  return out;
+}
+
+export function canonicalIntervalSet(
+  keyType: ScalarType,
+  specs: IntervalSpec[],
+  clipTerms: BoundTerm[],
+  params: Value[],
+  outer: Row[],
+  coll: Collation | null,
+  left: Row,
+): KeyBound[] {
+  const clip =
+    clipTerms.length === 0
+      ? unboundedBound()
+      : buildLogicalInterval(keyType, clipTerms, params, outer, coll, left);
+  if (clip === null) return [];
+  const intervals: KeyBound[] = [];
+  for (const spec of specs) {
+    const raw = buildLogicalInterval(keyType, spec.terms, params, outer, coll, left);
+    if (raw === null) continue;
+    const b = intersectBounds(raw, clip);
+    if (!boundEmpty(b)) intervals.push(b);
+  }
+  intervals.sort((a, b) => {
+    if (a.lo === null) return b.lo === null ? Number(b.loInc) - Number(a.loInc) : -1;
+    if (b.lo === null) return 1;
+    const cmp = compareBytes(a.lo, b.lo);
+    return cmp !== 0 ? cmp : Number(b.loInc) - Number(a.loInc);
+  });
+  const out: KeyBound[] = [];
+  for (const next of intervals) {
+    const cur = out.at(-1);
+    if (cur === undefined) {
+      out.push(next);
+      continue;
+    }
+    let merge = cur.hi === null || next.lo === null;
+    if (!merge) {
+      const cmp = compareBytes(next.lo!, cur.hi!);
+      merge = cmp < 0 || (cmp === 0 && (cur.hiInc || next.loInc));
+      if (!merge && isFixedWidth(keyType) && cur.hiInc && next.loInc) {
+        const successor = prefixSuccessor(cur.hi!);
+        merge = successor !== null && bytesEq(successor, next.lo!);
+      }
+    }
+    if (!merge) {
+      out.push(next);
+      continue;
+    }
+    if (cur.hi === null) continue;
+    if (next.hi === null) {
+      cur.hi = null;
+      cur.hiInc = false;
+    } else {
+      const cmp = compareBytes(next.hi, cur.hi);
+      if (cmp > 0 || (cmp === 0 && next.hiInc)) {
+        cur.hi = next.hi;
+        cur.hiInc = next.hiInc;
+      }
+    }
   }
   return out;
+}
+
+export function indexLogicalInterval(logical: KeyBound): KeyBound {
+  const b: KeyBound = {
+    lo: new Uint8Array([0x00]),
+    loInc: true,
+    hi: new Uint8Array([0x01]),
+    hiInc: false,
+  };
+  if (logical.lo !== null) {
+    const p = concatBytes([new Uint8Array([0x00]), logical.lo]);
+    if (logical.loInc) intersectLo(b, p, true);
+    else {
+      const next = prefixSuccessor(p);
+      if (next !== null) intersectLo(b, next, true);
+    }
+  }
+  if (logical.hi !== null) {
+    const p = concatBytes([new Uint8Array([0x00]), logical.hi]);
+    if (logical.hiInc) {
+      const next = prefixSuccessor(p);
+      if (next !== null) intersectHi(b, next, false);
+    } else intersectHi(b, p, false);
+  }
+  return b;
 }
 
 // intersectLo tightens b's lower bound to the more restrictive of (current, key); at an equal key an

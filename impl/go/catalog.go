@@ -512,7 +512,7 @@ func (t *catTable) PKIndices() []int {
 }
 
 // PrimaryKeyIndex returns the primary-key column's index iff the key is SINGLE-column, else -1.
-// Callers that genuinely require one member (notably the OR/IN point-set path) use this helper;
+// Callers that genuinely require one member (notably the OR/IN interval-set path) use this helper;
 // tuple-aware PK bounds iterate PKIndices directly.
 func (t *catTable) PrimaryKeyIndex() int {
 	idxs := t.PKIndices()

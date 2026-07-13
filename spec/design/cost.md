@@ -376,32 +376,45 @@ an equality ends the prefix: its range may bind, but a later member cannot (no s
 `expr/cost.test`, `query/distinct.test`, `query/limit_offset.test`, and `query/select_list.test`
 exercise them in context.
 
-### Bounded scan / OR / IN-list — merged point lookups
+### Bounded scan / OR / IN-list — canonical interval sets
 
 The point-lookup bound above flattens the top-level **AND-chain** and *never descends an `OR`* — a
 disjunction is not one contiguous range. But a disjunction of **equalities on ONE key column** —
 `pk = a OR pk = b OR pk = c`, or the equivalent `pk IN (a, b, c)` (which PostgreSQL and jed both
 **desugar to that OR-chain**, grammar.md §20) — is exactly a **union of point lookups**. This lowers
 it to a **merged point-set** bound: a de-duplicated, sorted set of encoded keys (a *bitmap-OR*), each
-key a point probe. It applies to the **primary key** and to a **leading B-tree secondary-index
-column**; it is a deliberate, cost-visible optimization gated by the `query.or_in_point_lookup`
-capability.
+key a point probe. The generalized form also admits `<`/`<=`/`>`/`>=` leaves and BETWEEN
+conjunctions on that same key, producing a union of ranges. It applies to a **single-column primary
+key** and to a **leading B-tree secondary-index column**; it is a deliberate, cost-visible
+optimization gated by `query.or_in_point_lookup` (points) and `query.interval_set` (range unions and
+point-set/range intersection).
 
 - **Which predicates lower.** The top-level AND-chain is flattened, and the **first** conjunct that
-  reduces to a pure disjunction of `keycol = const-source` equalities is the bound (an `OR` node
-  reduces iff **both** operands reduce; a `keycol = const` leaf is the base case — same
-  const-source rule as the point lookup). An `AND`, a `NOT` (so `NOT IN` never lowers), a range
-  comparison, or an equality on a *different* column makes a disjunct non-reducing, so a **mixed**
+  reduces to a pure disjunction of same-key intervals is the bound. An OR node reduces iff both
+  operands reduce; a leaf is one same-type comparison, or an AND of comparisons on that key
+  (BETWEEN's resolved shape). Direct same-key comparison conjuncts outside the OR clip every
+  disjunct, so `key IN (...) AND key > c` probes only surviving points. A `NOT`, non-bound
+  expression, promoted comparison, unsafe collation, or comparison on a different column makes a
+  disjunct non-reducing, so a **mixed**
   disjunction (`pk = 1 OR x = 2`) correctly does not lower — it stays a full scan. The whole WHERE
   remains the **residual filter**, so the merged set is always a *superset* of the matching rows and
   the result is unchanged.
-- **Last resort.** The merged point-set is chosen **only** where no contiguous PK / index / GIN /
+- **Precedence.** An interval set is normally the same last resort as the old point set: it is chosen
+  only where no contiguous PK / index / GIN /
   GiST bound already applies, so it never displaces an existing plan and no already-bounded cost
-  moves. UPDATE/DELETE admit both PK and secondary-index point sets through the same final fallback.
+  moves. The one deliberate exception is a same-key OR/IN set with a co-present clip: that canonical
+  intersection wins over the broader contiguous clip alone. UPDATE/DELETE admit PK and secondary-
+  index interval sets through the same path.
   Mutation execution retains each fetched storage key and defensively de-duplicates candidates in
   first-probe order before residual evaluation, so one row can never be rewritten twice even if a
   future index generalization makes probe result sets overlap.
-- **The cost is the SUM of the per-probe bounded scans.** Each distinct key is one point probe, and
+- **Canonicalization and cost.** Runtime sources are encoded first, then each disjunct is clipped;
+  empty intervals disappear, and the remainder sort by encoded lower endpoint and merge when they
+  overlap or touch. Fixed-width closed intervals also merge when `prefix-successor(left.hi) ==
+  right.lo`; this is the shared byte-adjacency rule, never host integer arithmetic. Rows therefore
+  emit once in key order even for overlapping source disjuncts. Cost is the **sum of canonical
+  disjoint intervals'** bounded scans, not source leaves. Each surviving isolated point is one point
+  probe, and
   the probes' `page_read` (each probe's root→leaf path — for a secondary index, the index-tree path
   **plus** each admitted row's PK point lookup) and `storage_row_read` (the rows each probe admits)
   **add up**. So an *N*-key IN-list over a single-leaf table charges *N* × `page_read` (each probe
@@ -417,10 +430,12 @@ capability.
   reads nothing. Because the key encoding is order-preserving, byte-dedup is value-dedup and the
   sorted probes yield rows in ascending key order (for the PK, the same order a full scan would).
 
-A merged point-set bound takes the **eager materialize path** — the single-table streaming / columnar
+A canonical interval-set bound takes the **eager materialize path** — the single-table streaming / columnar
 / vectorized-aggregate fast paths (which each interpret only a single contiguous bound) gate **off**
 it, exactly as they do an index / GIN / GiST bound. `spec/conformance/suites/query/or_in_point_lookup.test`
-pins these costs cross-core.
+pins point costs cross-core; `query/interval_set.test` pins clipping, range union, overlap merging,
+and fallbacks. Secondary-index range intervals retain the ordered-index fixed-width leading/tail
+eligibility needed to recover row-key suffixes; variable-width leading range unions fall back.
 
 ### Index-bounded scan — a secondary index narrows a base-relation scan
 

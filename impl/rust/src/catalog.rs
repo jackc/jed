@@ -482,7 +482,7 @@ impl Table {
     }
 
     /// The primary-key column's index iff the key is SINGLE-column. Callers that genuinely require
-    /// one member (notably OR/IN point sets) use this helper; tuple bounds iterate `pk_indices`.
+    /// one member (notably OR/IN interval sets) use this helper; tuple bounds iterate `pk_indices`.
     pub fn primary_key_index(&self) -> Option<usize> {
         match self.pk_indices().as_slice() {
             [i] => Some(*i),

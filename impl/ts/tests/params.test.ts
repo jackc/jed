@@ -66,6 +66,25 @@ test("composite PK float parameter widens soundly", () => {
   assert.deepStrictEqual(ints(got), [10n]);
 });
 
+test("interval-set runtime union and clip", () => {
+  const db = dbWith([
+    "CREATE TABLE t (id i32 PRIMARY KEY, v i32)",
+    "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40)",
+  ]);
+  const union = rows(db, "SELECT id FROM t WHERE id < $1 OR id >= $2 ORDER BY id", [
+    intValue(3n),
+    intValue(4n),
+  ]);
+  assert.deepStrictEqual(ints(union), [1n, 2n, 4n]);
+  const clipped = rows(db, "SELECT id FROM t WHERE id IN ($1, $2, $3) AND id > $4 ORDER BY id", [
+    intValue(1n),
+    intValue(3n),
+    intValue(4n),
+    intValue(2n),
+  ]);
+  assert.deepStrictEqual(ints(clipped), [3n, 4n]);
+});
+
 test("param adopts narrow column type and traps overflow", () => {
   const db = dbWith([
     "CREATE TABLE t (id i32 PRIMARY KEY, s i16)",

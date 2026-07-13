@@ -2,7 +2,7 @@
 # functions, set operations, derived tables / subqueries, CTEs, VALUES, and set-returning functions.
 # The plan tree is rendered in pre-order (depth-numbered), so the rows read top-down as the executor's
 # pipeline reads bottom-up. Deterministic and cross-core-identical, asserted with `nosort`.
-# requires: ddl.create_table, ddl.primary_key, ddl.composite_primary_key, dml.insert, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.point_lookup, query.composite_pk_pushdown, query.limit, query.order_by, query.order_by_ordinal, query.aggregates, query.group_by, query.having, query.join_inner, query.cross_join, query.join_pushdown, query.index_nested_loop, query.union, query.derived_table, query.subquery_scalar, query.cte, query.window, query.window_aggregate, query.set_returning, query.values, query.explain, cast.explicit, types.i16, types.i32, types.text
+# requires: ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.secondary_index, dml.insert, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.point_lookup, query.composite_pk_pushdown, query.interval_set, query.index_range, query.limit, query.order_by, query.order_by_ordinal, query.aggregates, query.group_by, query.having, query.join_inner, query.cross_join, query.join_pushdown, query.index_nested_loop, query.union, query.derived_table, query.subquery_scalar, query.cte, query.window, query.window_aggregate, query.set_returning, query.values, query.explain, cast.explicit, types.i16, types.i32, types.text
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, v i32, s text)
@@ -232,4 +232,60 @@ Filter
 conjuncts=1
 1
 Scan cpk
+Full scan; touched=2
+
+# Canonical interval sets expose a stable structural disjunct count, independent of runtime values.
+statement ok
+CREATE TABLE intervals (id i32 PRIMARY KEY, v i32)
+
+statement ok
+CREATE INDEX intervals_v_idx ON intervals (v)
+
+query ITT nosort
+EXPLAIN SELECT id FROM intervals WHERE id < 3 OR id >= 7
+----
+0
+Filter
+conjuncts=1
+1
+Scan intervals
+PK interval set: id; intervals=2; touched=1
+
+query ITT nosort
+EXPLAIN SELECT id FROM intervals WHERE v < 20 OR v >= 40
+----
+0
+Filter
+conjuncts=1
+1
+Scan intervals
+Index interval set: using intervals_v_idx; intervals=2; touched=2
+
+# Mixed-key disjuncts cannot form a sound interval set and retain the full scan.
+query ITT nosort
+EXPLAIN SELECT id FROM intervals WHERE id < 3 OR v >= 40
+----
+0
+Filter
+conjuncts=1
+1
+Scan intervals
+Full scan; touched=2
+
+# A variable-width leading index key supports point intervals, but not range unions: recovering the
+# row-key suffix from an arbitrary text interval still needs the deferred variable-width skip.
+statement ok
+CREATE TABLE text_intervals (id i32 PRIMARY KEY, v text)
+
+statement ok
+CREATE INDEX text_intervals_v_idx ON text_intervals (v)
+
+query ITT nosort
+EXPLAIN SELECT id FROM text_intervals WHERE v < 'b' OR v >= 'z'
+----
+0
+Filter
+conjuncts=1
+1
+Scan text_intervals
 Full scan; touched=2

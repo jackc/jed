@@ -537,12 +537,15 @@ impl Engine {
             Some(ScanBound::Gin(gb)) => format!("GIN bound: using {}", gb.name_key),
             Some(ScanBound::Gist(gp)) => format!("GiST bound: using {}", gp.name_key),
             Some(ScanBound::PkSet(ks)) => format!(
-                "{prefix}PK point set: {}",
-                render_key_set(&self.first_pk_col_name(table_name), &ks.srcs)
+                "{prefix}PK interval set: {}; intervals={}",
+                self.first_pk_col_name(table_name),
+                ks.specs.len()
             ),
-            Some(ScanBound::IndexSet(ks)) => {
-                format!("{prefix}Index point set: using {}", ks.name_key)
-            }
+            Some(ScanBound::IndexSet(ks)) => format!(
+                "{prefix}Index interval set: using {}; intervals={}",
+                ks.name_key,
+                ks.specs.len()
+            ),
         }
     }
 

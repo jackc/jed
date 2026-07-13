@@ -1399,15 +1399,6 @@ pub(crate) fn with_note(detail: impl Into<String>, note: &str) -> String {
     format!("{detail}; ordered: {note}")
 }
 
-/// Render a merged OR / IN-list point-set bound's const-sources as `col in (a, b, c)` (cost.md §3
-/// "OR / IN-list"), in source order (the plan-time order, before the exec-time encode / dedup /
-/// sort) — deterministic across cores. Each source renders via [`render_bound_src`] (a bind param
-/// as `$N`, a correlated column as `outer`, a literal via its token).
-pub(crate) fn render_key_set(col: &str, srcs: &[BoundSrc]) -> String {
-    let parts: Vec<String> = srcs.iter().map(render_bound_src).collect();
-    format!("{col} in ({})", parts.join(", "))
-}
-
 /// Render a primary-key bound's terms as `col <op> <src>` conjuncts joined by " and " — e.g.
 /// `id = $1`, `id >= 5 and id < 10`.
 pub(crate) fn render_bound_terms(col: &str, terms: &[BoundTerm]) -> String {

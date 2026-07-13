@@ -62,8 +62,9 @@ SELECT a FROM t WHERE id IN (3, 3, 3)
 ----
 30
 
-# An all-miss IN reads no rows: {99,100} → 2 page (both probes visit the leaf) + 0 scanned/produced.
-# cost: 2
+# Adjacent fixed-width points {99,100} canonicalize to one closed interval by byte adjacency, so the
+# all-miss range visits the leaf once and reads no rows.
+# cost: 1
 query I rowsort
 SELECT a FROM t WHERE id IN (99, 100)
 ----
@@ -99,9 +100,7 @@ SELECT id FROM t WHERE id = 2 OR a = 60
 2
 6
 
-# EXPLAIN surfaces the chosen access path: `PK point set: <col> in (<sources>)` — the const-sources
-# in source order (before the exec-time encode / dedup / sort). The IN-list and the OR spelling render
-# identically (both desugar to the same OR-of-equalities). touched=2 = {id (filter), a (projection)}.
+# EXPLAIN surfaces the generalized interval-set path and its structural disjunct count.
 query ITT nosort
 EXPLAIN SELECT a FROM t WHERE id IN (1, 3, 5)
 ----
@@ -110,7 +109,7 @@ Filter
 conjuncts=1
 1
 Scan t
-PK point set: id in (1, 3, 5); touched=2
+PK interval set: id; intervals=3; touched=2
 
 query ITT nosort
 EXPLAIN SELECT id FROM t WHERE id = 1 OR id = 4 OR id = 7
@@ -120,7 +119,7 @@ Filter
 conjuncts=1
 1
 Scan t
-PK point set: id in (1, 4, 7); touched=1
+PK interval set: id; intervals=3; touched=1
 
 # --- Secondary-index point set (indexes.md §5) ---
 # The same merge over a leading B-tree secondary-index column: each distinct value is an index point
@@ -164,7 +163,7 @@ Filter
 conjuncts=1
 1
 Scan s
-Index point set: using sx; touched=2
+Index interval set: using sx; intervals=2; touched=2
 
 # --- Text key set ---
 statement ok

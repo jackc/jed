@@ -84,8 +84,8 @@ func TestOrInPointSetMultiLeaf(t *testing.T) {
 	}
 }
 
-// Bind parameters and a correlated outer column flow through the point-set encode path (encodeKeySet
-// resolves reParam / reOuterColumn per the same rules as the single point-lookup bound).
+// Bind parameters and a correlated outer column flow through the interval-set encode path, which
+// resolves reParam / reOuterColumn per the same rules as the single point-lookup bound.
 func TestOrInPointSetParamsAndCorrelated(t *testing.T) {
 	t.Parallel()
 	db := dbWith(t,
@@ -110,6 +110,27 @@ func TestOrInPointSetParamsAndCorrelated(t *testing.T) {
 	}
 	if len(dup.Rows) != 1 || dup.Rows[0][0].Int != 20 {
 		t.Fatalf("IN($1,$2) with equal params got %v, want [20]", dup.Rows)
+	}
+
+	// Runtime endpoints are canonicalized only after binding: adjacent ranges merge, and the
+	// co-present clip removes points below its lower endpoint.
+	ranges, err := queryOutcome(db, "SELECT id FROM t WHERE id < $1 OR id >= $2 ORDER BY id", []Value{
+		IntValue(3), IntValue(4),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ranges.Rows) != 3 || ranges.Rows[0][0].Int != 1 || ranges.Rows[1][0].Int != 2 || ranges.Rows[2][0].Int != 4 {
+		t.Fatalf("parameter interval union got %v, want [1, 2, 4]", ranges.Rows)
+	}
+	clipped, err := queryOutcome(db, "SELECT id FROM t WHERE id IN ($1, $2, $3) AND id > $4 ORDER BY id", []Value{
+		IntValue(1), IntValue(3), IntValue(4), IntValue(2),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(clipped.Rows) != 2 || clipped.Rows[0][0].Int != 3 || clipped.Rows[1][0].Int != 4 {
+		t.Fatalf("parameter interval clip got %v, want [3, 4]", clipped.Rows)
 	}
 
 	// A correlated OR of the inner PK against outer columns bounds the inner per outer row.
@@ -189,12 +210,12 @@ func TestOrInPointSetExplain(t *testing.T) {
 		"CREATE INDEX sx ON s (x)")
 
 	cases := []struct{ sql, want string }{
-		{"EXPLAIN SELECT a FROM t WHERE id IN (3, 1)", "PK point set: id in (3, 1)"},
-		{"EXPLAIN SELECT a FROM t WHERE id = 1 OR id = 2", "PK point set: id in (1, 2)"},
-		{"EXPLAIN SELECT id FROM s WHERE x IN (10, 20)", "Index point set: using sx"},
+		{"EXPLAIN SELECT a FROM t WHERE id IN (3, 1)", "PK interval set: id; intervals=2"},
+		{"EXPLAIN SELECT a FROM t WHERE id = 1 OR id = 2", "PK interval set: id; intervals=2"},
+		{"EXPLAIN SELECT id FROM s WHERE x IN (10, 20)", "Index interval set: using sx; intervals=2"},
 		// DML lowers the PK point set too; secondary-index mutation point sets are covered by corpus.
-		{"EXPLAIN DELETE FROM t WHERE id IN (1, 3)", "PK point set: id in (1, 3)"},
-		{"EXPLAIN UPDATE t SET a = 0 WHERE id = 2 OR id = 3", "PK point set: id in (2, 3)"},
+		{"EXPLAIN DELETE FROM t WHERE id IN (1, 3)", "PK interval set: id; intervals=2"},
+		{"EXPLAIN UPDATE t SET a = 0 WHERE id = 2 OR id = 3", "PK interval set: id; intervals=2"},
 	}
 	for _, c := range cases {
 		out, err := queryOutcome(db, c.sql, nil)

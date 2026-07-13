@@ -96,7 +96,7 @@ then takes the unoptimized path (full scan, eager sort), which is always correct
 
 | # | rule | gate (summary) | sets | cost contract |
 |---|---|---|---|---|
-| 1 | **scan bounds** | per base relation (not SRF/derived): a WHERE conjunct bounds the relation's key per the §5 precedence | `relBounds[i]` | cost.md §3 "bounded scan", "index-bounded scan", "GIN-bounded scan", "GiST-bounded scan", "OR / IN-list" |
+| 1 | **scan bounds** | per base relation (not SRF/derived): a WHERE conjunct bounds the relation's key per the §5 precedence | `relBounds[i]` | cost.md §3 "bounded scan", "index-bounded scan", "GIN-bounded scan", "GiST-bounded scan", "canonical interval sets" |
 | 2 | **index-nested-loop** | a join inner base relation (INNER/CROSS/LEFT right side, not lateral/CTE) whose PK / leading index column compares to an **earlier sibling** column in ON or WHERE | `relINLBounds[i]` | cost.md §3 "JOIN" (per-outer-row seek) |
 | 3 | **ORDER BY via PK scan order** | single base relation, non-aggregate, column-only keys: the ORDER BY is a one-direction PK prefix (ASC) or the full PK (DESC ⇒ reverse scan), collation-matching the stored key | `pkOrdered`, `pkReverse` | cost.md §3 "ORDER BY satisfied by primary-key order" (sort elided; with LIMIT, a top-N) |
 | 4 | **ORDER BY via secondary-index order** | rule 3 did not fire; a LIMIT; no scan bound on the relation; no window/DISTINCT; the ORDER BY is exactly a B-tree index's columns, ASC NULLS LAST, fixed-width PK | `indexOrder` | cost.md §3 "ORDER BY satisfied by secondary-index order" (index-walk top-N) |
@@ -112,7 +112,7 @@ The physical fields live in a dedicated sub-struct of the plan (`phys` — Go
 logical fields plus the `relMasks` annotation are stage 1's output, `phys` is stage 3's.
 
 The **mechanisms** the rules call — `detectScanBound`, `detectINLBound`,
-`buildIndexAccessPredicate`, `orderSatisfiedByPK`, `orderSatisfiedByIndex`, key-set
+`buildIndexAccessPredicate`, `orderSatisfiedByPK`, `orderSatisfiedByIndex`, interval-set
 reduction — are shared pattern-matching/encoding machinery, not rules; they also serve
 UPDATE/DELETE planning and exec-time eligibility checks, and live with the access-path
 code, not in the optimizer pass.
@@ -136,8 +136,10 @@ selection + execution spec; cost-based selection is a later concern, §7):
 3. **GiST bound** — a range/scalar operator conjunct over a GiST-indexed column.
 4. **GIN bound** — an array-operator conjunct (`@>`, `&&`, `= ANY`, `=`) over a
    GIN-indexed column.
-5. **OR / IN-list point set** (last resort) — a disjunction of key equalities on the PK or
-   a leading index column, lowered to a union of point probes.
+5. **OR / IN interval set** (normally last resort) — a pure same-key disjunction of equality/range
+   leaves on a single-column PK or leading index column, runtime-canonicalized to disjoint key
+   intervals. A co-present direct range on that same key clips the set; this clipped set deliberately
+   wins over the broader contiguous clip alone.
 6. Else: **full scan**.
 
 Whatever the bound, the WHERE stays the **residual filter** — a bound only narrows which
@@ -149,11 +151,12 @@ The detector is one inventory with an explicit **consumer policy**, not separate
 UPDATE, DELETE, and EXPLAIN ladders. This is behavior-neutral plumbing for the rule-based
 extensions: it makes later eligibility changes one policy edit while preserving today's choices.
 
-- **SELECT** admits PK, ordered B-tree, GiST, GIN, PK point-set, and ordered-index point-set
+- **SELECT** admits PK, ordered B-tree, GiST, GIN, PK interval-set, and ordered-index interval-set
   candidates in the §5 order.
-- **UPDATE/DELETE** admit PK, ordered B-tree, GIN, GiST, PK point-set, and ordered-index point-set.
+- **UPDATE/DELETE** admit PK, ordered B-tree, GIN, GiST, PK interval-set, and ordered-index interval-set.
   Their established GIN-before-GiST order is preserved (unlike SELECT's GiST-before-GIN order), and
-  point sets remain the last resort after every contiguous/opclass bound. A host-attached target
+  interval sets remain the last resort after every contiguous/opclass bound except for the
+  same-key clipping case above. A host-attached target
   policy-disables every bound and full-scans through its scoped store, unchanged.
 - **DML EXPLAIN** renders the same typed mutation physical plan execution consumes. It does not run
   a parallel detector.

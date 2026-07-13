@@ -338,13 +338,13 @@ test('the explain page renders a live plan with the PK-bound access path', async
   await expect(panel.getByTestId('result-rows')).toContainText('Filter');
 });
 
-test('the explain page shows the OR / IN-list merged point-set access path', async ({ page }) => {
+test('the explain page shows the OR / IN-list interval-set access path', async ({ page }) => {
   await page.goto('/docs/sql/explain/');
   // Fifth panel = EXPLAIN SELECT ... WHERE id IN (1, 3, 5): a union of point probes, labelled
-  // "PK point set" (cost.md §3 "OR / IN-list").
+  // "PK interval set" (cost.md §3 "OR / IN-list").
   const panel = page.getByTestId('live-sql').nth(4);
   await expect(panel.getByTestId('result-rows')).toContainText('Scan city');
-  await expect(panel.getByTestId('result-rows')).toContainText('PK point set: id in (1, 3, 5)');
+  await expect(panel.getByTestId('result-rows')).toContainText('PK interval set: id; intervals=3');
 });
 
 test('the explain page shows the index-nested-loop access path on a join', async ({ page }) => {

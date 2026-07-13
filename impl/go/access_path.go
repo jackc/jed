@@ -11,9 +11,9 @@ import (
 // planner.md §4 — the machinery the optimize.go rules call, not the rules themselves: it also
 // serves UPDATE/DELETE planning and exec-time eligibility). This file holds the row-source scan
 // interface (rowSource/scanSource), the access-plan shapes
-// (pkBoundPlan/scanBound/indexBoundPlan/gistBoundPlan/ginBoundPlan/keySet plans), the predicate
+// (pkBoundPlan/scanBound/indexBoundPlan/gistBoundPlan/ginBoundPlan/interval-set plans), the predicate
 // analysis that detects a point lookup / range / index / GIN / GiST bound from a filter
-// (detectPKBound/detectScanBound/detectKeySet/detectGinBound/detectGistBound, buildIndexAccessPredicate),
+// (detectPKBound/detectScanBound/detectIntervalSet/detectGinBound/detectGistBound, buildIndexAccessPredicate),
 // the ORDER-BY-via-scan-order analysis (orderSatisfiedByPK/orderSatisfiedByIndex),
 // the order-preserving key-bound encoding (buildKeyBound/encodeBoundKey/encodeTextBound), and the
 // streaming/window-top-N eligibility checks.
@@ -102,13 +102,11 @@ type pkBoundPlan struct {
 
 // scanBound is a per-relation scan bound (cost.md §3): a primary-key range, a
 // secondary-index equality (spec/design/indexes.md §5), a GIN-bounded scan over an
-// array column (spec/design/gin.md §6), a GiST-bounded scan, or a MERGED point-set (an
-// OR / IN-list of key equalities lowered to a union of point probes — cost.md §3 "OR /
-// IN-list") — exactly one field is set. The PK bound wins when several apply (it is the
+// array column (spec/design/gin.md §6), a GiST-bounded scan, or a canonical interval set — exactly
+// one field is set. The PK bound wins when several apply (it is the
 // row's own key — no second tree, range-capable, strictly cheaper); the ordered-index
-// equality bound wins over GIN (gin.md §6). The point-set bounds (pkSet/indexSet) are a
-// LAST-RESORT access path, chosen only when no contiguous PK/index/GIN/GiST bound applies,
-// so they never displace an existing plan.
+// equality bound wins over GIN (gin.md §6). Interval sets (pkSet/indexSet) are normally the last
+// resort; a same-key set with a direct range clip wins over the broader clip alone.
 type scanBound struct {
 	pk       *pkBoundPlan
 	index    *indexBoundPlan
@@ -141,27 +139,29 @@ type mutationScanBatch struct {
 // needsEagerScan reports whether a bound needs the general eager materialize path (materializeRel /
 // the DML scan) rather than a single-contiguous-range fast path (streaming scan, columnar project,
 // vectorized aggregate, streaming sort, join top-N). True for a second-tree gather (index / GIN /
-// GiST) and for a merged OR/IN point-set (pkSet / indexSet — a union of probes, cost.md §3
-// "OR / IN-list"); false for a nil bound or a plain PK contiguous bound (which every fast path
+// GiST) and for a canonical interval set (pkSet / indexSet); false for a nil bound or a plain PK
+// contiguous bound (which every fast path
 // handles via a single buildKeyBound). Every single-table fast-path gate consults this so the
-// point-set bounds are interpreted in exactly ONE place (materializeRel), never silently dropped to
+// interval-set bounds are interpreted in exactly ONE place (materializeRel), never silently dropped to
 // a full scan by a fast path that only understands `pk`. Nil-safe (a nil bound is not eager).
 func (sb *scanBound) needsEagerScan() bool {
 	return sb != nil && (sb.index != nil || sb.gin != nil || sb.gist != nil || sb.pkSet != nil || sb.indexSet != nil)
 }
 
-// pkKeySetPlan is the plan-time result of an OR / IN-list disjunction of primary-key
-// equalities (`pk = a OR pk = b OR …`, or the equivalent `pk IN (a, b, …)` which desugars
-// to that OR-chain — cost.md §3 "OR / IN-list"). srcs is the equality const-sources, one
-// per disjunct, in source order (a bind param, an outer/correlated column, or a literal —
-// isConstSource of the PK type). At exec time each src encodes into the PK key space; the
-// resulting keys are de-duplicated and sorted, and each becomes a point probe [k, k]. The
-// whole WHERE stays the residual filter (the union is a superset), so the result is
-// unchanged. coll is the PK's key collation (nil for a C key), as in pkBoundPlan.
+// intervalSpec is one OR disjunct represented as the conjunction of its bound terms. It becomes
+// one logical key interval at execution, after params/outer sources are known.
+type intervalSpec struct {
+	terms []boundTerm
+}
+
+// pkKeySetPlan is the generalized OR/IN interval-set plan over a single-column PK. Each spec is a
+// point or range disjunct; clip terms are co-present top-level AND bounds on the same key. Execution
+// encodes, clips, sorts, and merges them into canonical disjoint intervals.
 type pkKeySetPlan struct {
 	pkType scalarType
 	coll   *Collation
-	srcs   []*rExpr
+	specs  []intervalSpec
+	clip   []boundTerm
 }
 
 // indexKeySetPlan is the pkKeySetPlan analog over a leading B-tree secondary-index column
@@ -174,7 +174,24 @@ type indexKeySetPlan struct {
 	colType   scalarType
 	coll      *Collation
 	tailTypes []scalarType
-	srcs      []*rExpr
+	specs     []intervalSpec
+	clip      []boundTerm
+}
+
+func intervalPlanHasRange(specs []intervalSpec, clip []boundTerm) bool {
+	for _, spec := range specs {
+		for _, t := range spec.terms {
+			if t.op != opEq {
+				return true
+			}
+		}
+	}
+	for _, t := range clip {
+		if t.op != opEq {
+			return true
+		}
+	}
+	return false
 }
 
 // gistBoundPlan is the plan-time result of GiST analysis (spec/design/gist.md §5): the chosen GiST
@@ -407,6 +424,20 @@ func detectScanBoundWithPolicy(filter *rExpr, rel scopeRel, db *engine, policy s
 	if rel.isAttachment() {
 		return nil
 	}
+	var pkIntervals *pkKeySetPlan
+	if pkLocal := rel.table.PrimaryKeyIndex(); pkLocal >= 0 {
+		if sty, ok := rel.table.Columns[pkLocal].Type.AsScalar(); ok {
+			if coll, push := db.keyCollationCtx(rel.table.Columns[pkLocal]); push {
+				if specs, clip := detectIntervalSet(filter, rel.offset+pkLocal, sty, coll); specs != nil {
+					pkIntervals = &pkKeySetPlan{pkType: sty, coll: coll, specs: specs, clip: clip}
+				}
+			}
+		}
+	}
+	// A co-present same-key range clips an OR/IN set before the ordinary contiguous bound can win.
+	if policy.indexSet && pkIntervals != nil && len(pkIntervals.clip) > 0 {
+		return &scanBound{pkSet: pkIntervals}
+	}
 	if bp := db.detectPKBound([]*rExpr{filter}, rel, -1); bp != nil {
 		return &scanBound{pk: bp}
 	}
@@ -417,6 +448,11 @@ func detectScanBoundWithPolicy(filter *rExpr, rel scopeRel, db *engine, policy s
 			// by the passes below), an ineligible tail, or no bound. Indexes are held in ascending
 			// lowercased-name order, so the first non-nil wins — the deterministic tie-break.
 			if ib := db.buildIndexAccessPredicate(filter, rel, idx, -1); ib != nil {
+				if policy.indexSet {
+					if is := db.buildIndexIntervalSetPlan(filter, rel, idx); is != nil && len(is.clip) > 0 {
+						return &scanBound{indexSet: is}
+					}
+				}
 				return &scanBound{index: ib}
 			}
 		}
@@ -442,65 +478,55 @@ func detectScanBoundWithPolicy(filter *rExpr, rel scopeRel, db *engine, policy s
 	// (cost.md §3 "OR / IN-list"). Reached only when no contiguous PK/index/GIN/GiST bound
 	// applied above, so this never displaces an existing plan. The primary key wins over a
 	// secondary index (its own key — no second tree), matching detectScanBound's ordering.
-	if pkLocal := rel.table.PrimaryKeyIndex(); pkLocal >= 0 {
-		if sty, ok := rel.table.Columns[pkLocal].Type.AsScalar(); ok {
-			if coll, push := db.keyCollationCtx(rel.table.Columns[pkLocal]); push {
-				if srcs := detectKeySet(filter, rel.offset+pkLocal, sty, coll); srcs != nil {
-					return &scanBound{pkSet: &pkKeySetPlan{pkType: sty, coll: coll, srcs: srcs}}
-				}
-			}
-		}
+	if pkIntervals != nil {
+		return &scanBound{pkSet: pkIntervals}
 	}
 	if !policy.indexSet {
 		return nil
 	}
 	for _, idx := range rel.table.Indexes {
-		if idx.Kind != indexBtree {
-			continue
-		}
-		// A PARTIAL index is not used for the OR/IN point-set this slice (indexes.md §9): the merged
-		// point-lookup path carries no predicate-implication gate, so it stays non-partial (a
-		// follow-on) — falling through leaves a correct full scan.
-		if idx.Predicate != nil {
-			continue
-		}
-		// The OR/IN merged-point-lookup bound is column-only this slice (an expression index takes
-		// the access-predicate path — indexes.md §5; OR/IN over an expression key is a follow-on).
-		cols := idx.columnOrdinals()
-		if cols == nil {
-			continue
-		}
-		ci := cols[0]
-		ty, ok := rel.table.Columns[ci].Type.AsScalar()
-		if !ok {
-			continue
-		}
-		unskippableTail := false
-		for _, c := range cols[1:] {
-			s, ok := rel.table.Columns[c].Type.AsScalar()
-			if !ok || !s.IsFixedWidth() {
-				unskippableTail = true
-				break
-			}
-		}
-		if unskippableTail {
-			continue
-		}
-		coll, push := db.keyCollationCtx(rel.table.Columns[ci])
-		if !push {
-			continue
-		}
-		if srcs := detectKeySet(filter, rel.offset+ci, ty, coll); srcs != nil {
-			tail := make([]scalarType, 0, len(cols)-1)
-			for _, c := range cols[1:] {
-				tail = append(tail, rel.table.Columns[c].Type.ScalarTy())
-			}
-			return &scanBound{indexSet: &indexKeySetPlan{
-				nameKey: strings.ToLower(idx.Name), colType: ty, coll: coll, tailTypes: tail, srcs: srcs,
-			}}
+		if is := db.buildIndexIntervalSetPlan(filter, rel, idx); is != nil {
+			return &scanBound{indexSet: is}
 		}
 	}
 	return nil
+}
+
+func (db *engine) buildIndexIntervalSetPlan(filter *rExpr, rel scopeRel, idx indexDef) *indexKeySetPlan {
+	if idx.Kind != indexBtree || idx.Predicate != nil {
+		return nil
+	}
+	cols := idx.columnOrdinals()
+	if cols == nil {
+		return nil
+	}
+	ci := cols[0]
+	ty, ok := rel.table.Columns[ci].Type.AsScalar()
+	if !ok {
+		return nil
+	}
+	for _, c := range cols[1:] {
+		s, ok := rel.table.Columns[c].Type.AsScalar()
+		if !ok || !s.IsFixedWidth() {
+			return nil
+		}
+	}
+	coll, push := db.keyCollationCtx(rel.table.Columns[ci])
+	if !push {
+		return nil
+	}
+	specs, clip := detectIntervalSet(filter, rel.offset+ci, ty, coll)
+	if specs == nil {
+		return nil
+	}
+	if intervalPlanHasRange(specs, clip) && !ty.IsFixedWidth() {
+		return nil
+	}
+	tail := make([]scalarType, 0, len(cols)-1)
+	for _, c := range cols[1:] {
+		tail = append(tail, rel.table.Columns[c].Type.ScalarTy())
+	}
+	return &indexKeySetPlan{nameKey: strings.ToLower(idx.Name), colType: ty, coll: coll, tailTypes: tail, specs: specs, clip: clip}
 }
 
 // planMutationScan selects an UPDATE/DELETE target access path through the same inventory as SELECT,
@@ -516,65 +542,81 @@ func (db *engine) planMutationScan(scope *string, table *catTable, filter *rExpr
 	return plan
 }
 
-// detectKeySet finds an OR / IN-list disjunction of equalities on ONE key column (at global
-// index keyIdx) and returns its equality const-sources (one per disjunct), or nil if the
-// filter has no such shape (cost.md §3 "OR / IN-list"). `x IN (a, b, c)` desugars to
-// `x = a OR x = b OR x = c` at resolve time (grammar.md §20), so an IN-list and a hand-written
-// OR-of-equalities present the identical tree — this handles both. The filter's top-level
-// AND-chain is flattened; the FIRST conjunct that reduces to a pure disjunction of
-// `keycol = const` equalities is used (the rest of the WHERE stays the residual filter). A
-// conjunct reduces iff it is a `keycol = const`, or an OR of two reducing operands — an AND,
-// a NOT, a range comparison, or an equality on a different column makes it non-reducing, so a
-// mixed disjunction (`pk = 1 OR x = 2`) or a NOT IN (`NOT (pk = 1 OR …)`) correctly yields
-// no bound. Conservative + sound: an unrecognized filter contributes no bound.
-func detectKeySet(filter *rExpr, keyIdx int, keyType scalarType, coll *Collation) []*rExpr {
+// detectIntervalSet finds the first top-level AND conjunct that is a pure OR of intervals on one
+// key. A leaf is one comparison or an AND of comparisons (BETWEEN's resolved shape). Other direct
+// top-level comparisons on the same key become a global clip, implementing IN/OR ∩ range.
+func detectIntervalSet(filter *rExpr, keyIdx int, keyType scalarType, coll *Collation) (specs []intervalSpec, clip []boundTerm) {
 	if filter == nil {
-		return nil
+		return nil, nil
 	}
 	colColl := ""
 	if coll != nil {
 		colColl = coll.Name
 	}
-	var found []*rExpr
-	var walkAnd func(e *rExpr)
-	walkAnd = func(e *rExpr) {
-		if found != nil || e == nil {
-			return
-		}
+	var conjuncts []*rExpr
+	var flatten func(*rExpr)
+	flatten = func(e *rExpr) {
 		if e.kind == reAnd {
-			walkAnd(e.lhs)
-			walkAnd(e.rhs)
+			flatten(e.lhs)
+			flatten(e.rhs)
 			return
 		}
-		if srcs, ok := reduceKeySet(e, keyIdx, keyType, colColl); ok {
-			found = srcs
+		conjuncts = append(conjuncts, e)
+	}
+	flatten(filter)
+	found := -1
+	for i, e := range conjuncts {
+		if e.kind != reOr {
+			continue
+		}
+		if reduced, ok := reduceIntervalUnion(e, keyIdx, keyType, colColl); ok {
+			specs, found = reduced, i
+			break
 		}
 	}
-	walkAnd(filter)
-	return found
+	if found < 0 {
+		return nil, nil
+	}
+	for i, e := range conjuncts {
+		if i == found {
+			continue
+		}
+		if t, ok := asBoundTerm(e, columnMatch(keyIdx), keyType, colColl, -1); ok {
+			clip = append(clip, t)
+		}
+	}
+	return specs, clip
 }
 
-// reduceKeySet reduces one predicate to the set of equality const-sources it bounds keyIdx
-// with, or (nil, false) if it is not a pure disjunction of `keycol = const` (detectKeySet).
-// Descends OR nodes only; a single `keycol = const` leaf is the base case (reusing
-// asBoundTerm, siblingCutoff -1 — no sibling references in a once-materialized bound).
-func reduceKeySet(e *rExpr, keyIdx int, keyType scalarType, colColl string) ([]*rExpr, bool) {
+func reduceIntervalUnion(e *rExpr, keyIdx int, keyType scalarType, colColl string) ([]intervalSpec, bool) {
 	if e == nil {
 		return nil, false
 	}
 	if e.kind == reOr {
-		l, lok := reduceKeySet(e.lhs, keyIdx, keyType, colColl)
+		l, lok := reduceIntervalUnion(e.lhs, keyIdx, keyType, colColl)
 		if !lok {
 			return nil, false
 		}
-		r, rok := reduceKeySet(e.rhs, keyIdx, keyType, colColl)
+		r, rok := reduceIntervalUnion(e.rhs, keyIdx, keyType, colColl)
 		if !rok {
 			return nil, false
 		}
 		return append(l, r...), true
 	}
-	if t, ok := asBoundTerm(e, columnMatch(keyIdx), keyType, colColl, -1); ok && t.op == opEq {
-		return []*rExpr{t.src}, true
+	var terms []boundTerm
+	var walk func(*rExpr) bool
+	walk = func(x *rExpr) bool {
+		if x.kind == reAnd {
+			return walk(x.lhs) && walk(x.rhs)
+		}
+		t, ok := asBoundTerm(x, columnMatch(keyIdx), keyType, colColl, -1)
+		if ok {
+			terms = append(terms, t)
+		}
+		return ok
+	}
+	if walk(e) && len(terms) > 0 {
+		return []intervalSpec{{terms: terms}}, true
 	}
 	return nil, false
 }
@@ -1155,46 +1197,114 @@ func (db *engine) indexPointEntries(tableName, nameKey string, suffixTypes []sca
 	return db.indexScanBoundEntries(tableName, nameKey, suffixTypes, b, len(prefix), mask)
 }
 
-// encodeKeySet encodes an OR / IN-list's equality const-sources into the key space and returns
-// a SORTED, DE-DUPLICATED set of encoded keys — the distinct point probes a merged point-set
-// bound visits (cost.md §3 "OR / IN-list"). A src that is NULL (3VL-never-true) or does not
-// encode into the key domain (an out-of-range integer — no stored key can equal it) contributes
-// no point and is skipped (sound: the union stays a superset, and the residual filter re-checks
-// each admitted row). Byte-dedup == value-dedup and byte-sort == value-sort under the
-// order-preserving key encoding (encoding.md §2), so probing the sorted distinct keys yields
-// rows in ascending key order with no row visited twice. Shared by the PK and secondary-index
-// point-set executors.
-func encodeKeySet(keyType scalarType, srcs []*rExpr, params []Value, outer []storedRow, coll *Collation, left storedRow) [][]byte {
-	keys := make([][]byte, 0, len(srcs))
-	for _, src := range srcs {
-		key, isNull, ok := encodeBoundKey(keyType, src, params, outer, coll, left)
-		if isNull || !ok {
+func buildLogicalInterval(keyType scalarType, terms []boundTerm, params []Value, outer []storedRow, coll *Collation, left storedRow) (keyBound, bool) {
+	b := unboundedBound()
+	for _, t := range terms {
+		key, isNull, ok := encodeBoundKey(keyType, t.src, params, outer, coll, left)
+		if isNull {
+			return keyBound{}, true
+		}
+		if !ok {
+			if t.op == opEq {
+				return keyBound{}, true
+			}
 			continue
 		}
-		keys = append(keys, key)
+		switch t.op {
+		case opEq:
+			b = intersectLo(b, key, true)
+			b = intersectHi(b, key, true)
+		case opGt:
+			b = intersectLo(b, key, false)
+		case opGe:
+			b = intersectLo(b, key, true)
+		case opLt:
+			b = intersectHi(b, key, false)
+		case opLe:
+			b = intersectHi(b, key, true)
+		}
 	}
-	sort.Slice(keys, func(i, j int) bool { return bytes.Compare(keys[i], keys[j]) < 0 })
-	out := keys[:0]
-	for i, k := range keys {
-		if i == 0 || !bytes.Equal(k, keys[i-1]) {
-			out = append(out, k)
+	return b, boundEmpty(b)
+}
+
+func intersectBounds(a, b keyBound) keyBound {
+	out := a
+	if b.lo != nil {
+		out = intersectLo(out, b.lo, b.loInc)
+	}
+	if b.hi != nil {
+		out = intersectHi(out, b.hi, b.hiInc)
+	}
+	return out
+}
+
+func canonicalIntervalSet(keyType scalarType, specs []intervalSpec, clipTerms []boundTerm, params []Value, outer []storedRow, coll *Collation, left storedRow) []keyBound {
+	clip := unboundedBound()
+	if len(clipTerms) > 0 {
+		var empty bool
+		clip, empty = buildLogicalInterval(keyType, clipTerms, params, outer, coll, left)
+		if empty {
+			return nil
+		}
+	}
+	intervals := make([]keyBound, 0, len(specs))
+	for _, spec := range specs {
+		b, empty := buildLogicalInterval(keyType, spec.terms, params, outer, coll, left)
+		if empty {
+			continue
+		}
+		b = intersectBounds(b, clip)
+		if !boundEmpty(b) {
+			intervals = append(intervals, b)
+		}
+	}
+	sort.SliceStable(intervals, func(i, j int) bool {
+		if intervals[i].lo == nil {
+			return intervals[j].lo != nil
+		}
+		if intervals[j].lo == nil {
+			return false
+		}
+		if c := bytes.Compare(intervals[i].lo, intervals[j].lo); c != 0 {
+			return c < 0
+		}
+		return intervals[i].loInc && !intervals[j].loInc
+	})
+	out := intervals[:0]
+	for _, next := range intervals {
+		if len(out) == 0 {
+			out = append(out, next)
+			continue
+		}
+		cur := &out[len(out)-1]
+		merge := cur.hi == nil || next.lo == nil
+		if !merge {
+			cmp := bytes.Compare(next.lo, cur.hi)
+			merge = cmp < 0 || (cmp == 0 && (cur.hiInc || next.loInc))
+			if !merge && keyType.IsFixedWidth() && cur.hiInc && next.loInc {
+				merge = bytes.Equal(prefixSuccessor(cur.hi), next.lo)
+			}
+		}
+		if !merge {
+			out = append(out, next)
+			continue
+		}
+		if cur.hi == nil {
+			continue
+		}
+		if next.hi == nil {
+			cur.hi, cur.hiInc = nil, false
+		} else if cmp := bytes.Compare(next.hi, cur.hi); cmp > 0 || (cmp == 0 && next.hiInc) {
+			cur.hi, cur.hiInc = next.hi, next.hiInc
 		}
 	}
 	return out
 }
 
-// pkKeySetRows executes a primary-key OR / IN-list point-set bound (cost.md §3 "OR / IN-list"):
-// each distinct encoded key is a point probe [k, k] over the row's own B-tree, and the admitted
-// rows are concatenated in ascending key order (the same order a full scan would yield). The
-// per-probe (pages, slabs) blocks sum, so the metered cost is the sum of the individual point
-// lookups — a core that full-scans instead computes a different cost (the cross-core contract,
-// §8). Returns the (key, row) entries so the mutation paths can Remove/Replace by key; SELECT
-// discards the keys. Reconstruction is uniformly lazy since B4 (bplus-reshape.md) — the old
-// masked/unmasked reconstruction variants are collapsed, and the (pages, slabs) cost stays driven
-// by the shared mask (the cost touched set).
+// pkKeySetRows executes canonical logical intervals over the row's own B-tree. It retains storage
+// keys for mutation consumers and sums each disjoint interval's page/slab block.
 func (db *engine) pkKeySetRows(store *tableStore, ks *pkKeySetPlan, params []Value, outer []storedRow, mask []bool, left storedRow, masked bool) (entries []entry, pages, slabs int, err error) {
-	for _, k := range encodeKeySet(ks.pkType, ks.srcs, params, outer, ks.coll, left) {
-		b := keyBound{lo: k, loInc: true, hi: k, hiInc: true}
+	for _, b := range canonicalIntervalSet(ks.pkType, ks.specs, ks.clip, params, outer, ks.coll, left) {
 		es, p, sl, err := store.RangeScanWithUnits(b, mask)
 		if err != nil {
 			return nil, 0, 0, err
@@ -1206,11 +1316,8 @@ func (db *engine) pkKeySetRows(store *tableStore, ks *pkKeySetPlan, params []Val
 	return entries, pages, slabs, nil
 }
 
-// indexKeySetRows executes a secondary-index OR / IN-list point-set bound (cost.md §3 "OR /
-// IN-list"): each distinct encoded value is an index point probe (indexPointRows), and the rows
-// are gathered in ascending value order. Because a row has exactly one value for the indexed
-// column, distinct values probe disjoint row sets — no row is fetched twice. The per-probe
-// (pages, slabs) blocks sum, matching the PK point-set cost contract.
+// indexKeySetRows maps canonical logical intervals into the secondary index's present-value key
+// space. Each admitted index entry point-looks-up the table row; the complete WHERE remains residual.
 func (db *engine) indexKeySetRows(tableName string, ks *indexKeySetPlan, params []Value, outer []storedRow, mask []bool, left storedRow) (rows []storedRow, pages, slabs int, err error) {
 	entries, pages, slabs, err := db.indexKeySetEntries(tableName, ks, params, outer, mask, left)
 	if err != nil {
@@ -1224,8 +1331,15 @@ func (db *engine) indexKeySetRows(tableName string, ks *indexKeySetPlan, params 
 }
 
 func (db *engine) indexKeySetEntries(tableName string, ks *indexKeySetPlan, params []Value, outer []storedRow, mask []bool, left storedRow) (entries []entry, pages, slabs int, err error) {
-	for _, k := range encodeKeySet(ks.colType, ks.srcs, params, outer, ks.coll, left) {
-		r, p, sl, err := db.indexPointEntries(tableName, ks.nameKey, ks.tailTypes, k, mask)
+	for _, logical := range canonicalIntervalSet(ks.colType, ks.specs, ks.clip, params, outer, ks.coll, left) {
+		physical := indexLogicalInterval(logical)
+		suffix, prefixLen := ks.tailTypes, 0
+		if logical.lo != nil && logical.hi != nil && logical.loInc && logical.hiInc && bytes.Equal(logical.lo, logical.hi) {
+			prefixLen = 1 + len(logical.lo)
+		} else {
+			suffix = append([]scalarType{ks.colType}, suffix...)
+		}
+		r, p, sl, err := db.indexScanBoundEntries(tableName, ks.nameKey, suffix, physical, prefixLen, mask)
 		if err != nil {
 			return nil, 0, 0, err
 		}
@@ -1234,6 +1348,29 @@ func (db *engine) indexKeySetEntries(tableName string, ks *indexKeySetPlan, para
 		slabs += sl
 	}
 	return entries, pages, slabs, nil
+}
+
+func indexLogicalInterval(logical keyBound) keyBound {
+	b := keyBound{lo: []byte{0x00}, loInc: true, hi: []byte{0x01}, hiInc: false}
+	if logical.lo != nil {
+		p := append([]byte{0x00}, logical.lo...)
+		if logical.loInc {
+			b = intersectLo(b, p, true)
+		} else if next := prefixSuccessor(p); next != nil {
+			b = intersectLo(b, next, true)
+		}
+	}
+	if logical.hi != nil {
+		p := append([]byte{0x00}, logical.hi...)
+		if logical.hiInc {
+			if next := prefixSuccessor(p); next != nil {
+				b = intersectHi(b, next, false)
+			}
+		} else {
+			b = intersectHi(b, p, false)
+		}
+	}
+	return b
 }
 
 // executeMutationScan executes a planned UPDATE/DELETE access path into the normalized keyed-row

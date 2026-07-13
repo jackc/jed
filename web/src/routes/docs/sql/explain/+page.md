@@ -82,14 +82,14 @@ On a **composite** index over `(a, b, …)` the bound extends to a **multi-colum
 on the leading columns, optionally followed by a range on the next (`a = 1 AND b > 3`). The `WHERE`
 always stays the residual filter, so the rows are identical to a full scan — only the work drops.
 The same `Index bound` detail appears below an `Update` or `Delete` root when a write's target scan
-uses that index; an indexed `IN` list appears as `Index point set`.
+uses that index; an indexed `IN` list appears as an `Index interval set`.
 
-## An OR / IN-list of keys
+## OR / IN key intervals
 
-An `IN`-list on the primary key — or the equivalent `id = 1 OR id = 3 OR id = 5` — is a **union of
-point lookups**, not a full scan: the `PK point set` detail lists the keys, and jed seeks each one
-(de-duplicated) instead of walking the whole table. The same applies to an indexed non-key column
-(`Index point set: using <index>`).
+An `IN`-list on the primary key — or an OR of equality/range predicates on that key — becomes a
+canonical interval set, not a full scan. jed encodes runtime values, clips a co-present AND range,
+and merges duplicates/overlaps before scanning each disjoint interval once. The same applies to an
+indexed non-key column (`Index interval set: using <index>`).
 
 <LiveSql seed={seed} query={pointSet} rows={8} />
 
