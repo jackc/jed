@@ -29,7 +29,7 @@ test("composite key flags members and orders by tuple", () => {
   assert.ok(t.columns[0]!.primaryKey && t.columns[0]!.notNull);
   assert.ok(t.columns[1]!.primaryKey && t.columns[1]!.notNull);
   assert.ok(!t.columns[2]!.primaryKey);
-  // Single-column pushdown accessor must NOT see a composite key.
+  // The single-member-only helper must NOT see a composite key.
   assert.equal(primaryKeyIndex(t), -1);
 
   // Insert out of tuple order; include a negative first component (sign-flip) and ties

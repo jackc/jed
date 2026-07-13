@@ -21,6 +21,30 @@ gen = "int_uniform"
 min = 1
 max = 1000000
 
+# Composite-PK complete tuple lookup (query.composite_pk_pushdown). The scratch setup builds 100
+# contiguous 1000-row bucket prefixes; fixing bucket=42 and probing id exercises direct tuple-key
+# encoding. Before the tuple-bound slice jed full-scanned all 100k rows per iteration.
+[[bench]]
+name = "composite_pk_lookup"
+description = "Composite-PK exact tuple lookup on 100k rows; direct concatenated-key seek"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT v FROM composite_orders WHERE bucket = 42 AND id = $1"
+warmup = 500
+iterations = 20000
+seed = 4253
+expect_rows_per_iter = 1
+engines = ["jed", "postgres"]
+setup_sql = [
+  "CREATE TABLE composite_orders (bucket bigint, id bigint, v bigint, PRIMARY KEY (bucket, id))",
+  "INSERT INTO composite_orders SELECT (g - 1) / 1000, g, g * 2 FROM generate_series(1, 100000) AS g"
+]
+
+[[bench.param]]
+gen = "int_uniform"
+min = 42001
+max = 43000
+
 [[bench]]
 name = "secondary_lookup"
 description = "Secondary-index equality lookup on 1M rows (~10 rows per customer)"

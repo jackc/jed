@@ -225,9 +225,9 @@ The existing per-relation pushdown seam ([cost.md §3](cost.md) "bounded scan") 
 second bound kind. For each **base relation of a SELECT scan** (single-table, a JOIN
 base table, or a correlated subquery's inner table), the plan picks, in order:
 
-1. The **single-column PK bound**, if the WHERE AND-chain bounds the relation's PK
-   (unchanged — the PK is the row's own key; it needs no second tree, supports ranges,
-   and is strictly cheaper).
+1. The **PK tuple bound**, if the WHERE AND-chain supplies a maximal leading equality prefix and
+   optional next-member range (the PK is the row's own key; it needs no second tree and is strictly
+   cheaper).
 2. Else, an **index access-predicate bound**: among the relation's B-tree indexes, the
    one with the **lowest lowercased name** (a deterministic choice; cost-based selection
    is a later concern) that yields a non-empty **access predicate** — a maximal

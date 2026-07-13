@@ -128,7 +128,8 @@ For each base relation, `detectScanBound` picks the **first** bound kind that ap
 a fixed precedence, not a costed choice ([indexes.md §5](indexes.md) is the authoritative
 selection + execution spec; cost-based selection is a later concern, §7):
 
-1. **Single-column PK bound** (point or range) — the row's own key; no second tree.
+1. **PK tuple bound** (maximal equality prefix plus optional next-member range) — the row's own key;
+   no second tree.
 2. **B-tree index access predicate** — the **lowest-lowercased-name** index yielding a
    non-empty equality-prefix (+ optional trailing range) predicate; column and expression
    keys; a partial index only when a WHERE conjunct structurally implies its predicate.
@@ -191,6 +192,6 @@ contiguous-PK scan may realize the same contract as a pull source rather than an
   precedence and the FROM-order join tree *inside* stage 3, once the estimator + table
   statistics exist; re-pins the affected `# cost:` entries and forces the class-P decision
   (§6).
-- **New physical rules** (LIMIT + index-bound streaming, composite-PK prefix pushdown, hash join,
+- **New physical rules** (LIMIT + index-bound streaming, hash join,
   top-k heap — each tracked in TODO.md) land as
   discrete rule functions in the §4 inventory, each with its NoREC relation.

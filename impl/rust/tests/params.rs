@@ -45,6 +45,34 @@ fn where_pk_eq_param_point_lookup() {
 }
 
 #[test]
+fn composite_pk_param_tuple_bound() {
+    let mut db = db_with(&[
+        "CREATE TABLE t (a i32, b i16, v i32, PRIMARY KEY (b, a))",
+        "INSERT INTO t VALUES (1, 1, 10), (2, 1, 20), (3, 1, 30), (1, 2, 40)",
+    ]);
+    let got = rows(
+        &mut db,
+        "SELECT v FROM t WHERE b = $1 AND a >= $2 ORDER BY a",
+        &[Value::Int(1), Value::Int(2)],
+    );
+    assert_eq!(got, vec![vec![Value::Int(20)], vec![Value::Int(30)]]);
+}
+
+#[test]
+fn composite_pk_float_param_widens_soundly() {
+    let mut db = db_with(&[
+        "CREATE TABLE t (f f64, a i32, v i32, PRIMARY KEY (f, a))",
+        "INSERT INTO t VALUES (1.5, 1, 10), (2.5, 1, 20)",
+    ]);
+    let got = rows(
+        &mut db,
+        "SELECT v FROM t WHERE f = $1 AND a = $2",
+        &[Value::Float64(1.5), Value::Int(1)],
+    );
+    assert_eq!(got, vec![vec![Value::Int(10)]]);
+}
+
+#[test]
 fn param_adopts_narrow_column_type_and_traps_overflow() {
     // `$1` compared against an i16 column is typed i16; a value out of i16 range traps
     // 22003 at bind, before any scan.

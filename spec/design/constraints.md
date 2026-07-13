@@ -216,10 +216,12 @@ secondary-index catalog reshape (`format_version` 5 — [indexes.md §6](indexes
 [../fileformat/format.md](../fileformat/format.md)) records the key as an explicit ordinal
 list in key order, which lifted the narrowing.
 
-**Planner.** The primary-key pushdown (cost.md §3) recognizes **single-column** keys only; a
-composite-PK table scans whole this slice (sound and deterministic — the bound is an
-optimization, never a semantic). Composite point-lookup/prefix pushdown is a follow-on
-optimization slice and carries the NoREC growth obligation with it (conformance.md §8).
+**Planner.** Primary-key pushdown (cost.md §3) treats the key as its ordered member tuple. A
+maximal equality prefix bounds the corresponding storage-key prefix; equality on every member is
+an exact point lookup, and a range on the first non-equality member tightens that prefix interval.
+Predicates on a non-leading member alone never seed a bound (there is no skip-scan). The rule is
+shared by SELECT, UPDATE/DELETE, correlated scans, join-relation pushdown, and index-nested-loop
+inner scans; every consumer retains the complete predicate as a residual recheck.
 
 **Persistence.** Since `format_version` 5 the catalog records the primary key as an explicit
 **ordinal list in key order** (`pk_count` + column ordinals — format.md); the old per-column

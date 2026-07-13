@@ -326,6 +326,7 @@ import {
   seqBoundCheckLast,
   seqBoundCheckStart,
   relOfIndex,
+  renderBoundSrc,
   renderBoundTerms,
   renderKeySet,
   resolvedTypeOf,
@@ -2987,7 +2988,7 @@ export class Engine {
     const prefix = inl ? "Index-nested-loop " : "";
     switch (b.kind) {
       case "pk":
-        return prefix + "PK bound: " + renderBoundTerms(this.firstPKColName(tableName), b.pk.terms);
+        return prefix + "PK bound: " + renderPkBound(b.pk);
       case "index":
         return prefix + "Index bound: using " + b.index.nameKey;
       case "gin":
@@ -13616,22 +13617,8 @@ export function detectScanBoundWithPolicy(
   // A host-attached relation full-scans this slice (attached-databases.md §8): the bounded-scan exec
   // path resolves index stores unscoped, so no PK/index/GiST/GIN bound may apply to an attachment.
   if (isAttachmentScope(rel.db)) return null;
-  const pkLocal = primaryKeyIndex(rel.table);
-  if (pkLocal >= 0) {
-    // Ordered-equality pushdown is scalar-only; a non-scalar (range) PK skips it (point-lookup
-    // deferred for containers — ranges.md §10), falling through to a full scan + residual filter.
-    const sty = typeAsScalar(rel.table.columns[pkLocal]!.type);
-    if (sty !== undefined) {
-      // The PK column's key collation form (collation.md §8/§12): null ⇒ collated but Skewed ⇒
-      // refuse pushdown (full heap-scan recompute — the read-safety rule §12); else { coll } where
-      // coll is null (C, raw-byte key) or the Full-collated table (push via the sort key).
-      const ctx = keyCollationCtx(snap, rel.table.columns[pkLocal]!);
-      if (ctx !== null) {
-        const bp = detectPkBound(filter, rel.offset + pkLocal, sty, ctx.coll);
-        if (bp !== null) return { kind: "pk", pk: bp };
-      }
-    }
-  }
+  const bp = detectPkBound([filter], rel, -1, snap);
+  if (bp !== null) return { kind: "pk", pk: bp };
   if (policy.orderedIndex) {
     for (const idx of rel.table.indexes) {
       // An index access predicate (indexes.md §5.1): a maximal equality prefix + optional trailing
@@ -13656,6 +13643,7 @@ export function detectScanBoundWithPolicy(
   // "OR / IN-list"). Reached only when no contiguous PK/index/GIN/GiST bound applied above, so this
   // never displaces an existing plan. The primary key wins over a secondary index (its own key — no
   // second tree), matching detectScanBound's ordering.
+  const pkLocal = primaryKeyIndex(rel.table);
   if (pkLocal >= 0) {
     const sty = typeAsScalar(rel.table.columns[pkLocal]!.type);
     if (sty !== undefined) {
@@ -13797,17 +13785,15 @@ export function detectINLBound(
     return terms;
   };
   const hasSibling = (terms: BoundTerm[]): boolean => terms.some((t) => t.src.kind === "column");
-  // Primary-key bound first (the row's own key — range-capable, strictly cheaper).
-  const pkLocal = primaryKeyIndex(rel.table);
-  if (pkLocal >= 0) {
-    const sty = typeAsScalar(rel.table.columns[pkLocal]!.type);
-    if (sty !== undefined) {
-      const ctx = keyCollationCtx(snap, rel.table.columns[pkLocal]!);
-      if (ctx !== null) {
-        const terms = collect(rel.offset + pkLocal, sty, ctx.coll);
-        if (hasSibling(terms)) return { kind: "pk", pk: { pkType: sty, terms, coll: ctx.coll } };
-      }
-    }
+  // Primary-key tuple bound first (the row's own key — range-capable, strictly cheaper).
+  const pk = detectPkBound([on, whereFilter], rel, cutoff, snap);
+  if (
+    pk !== null &&
+    (pk.eqCols.some((ec) => ec.srcs.some((src) => src.kind === "column")) ||
+      pk.eqCols.some((ec) => hasSibling(ec.ranges)) ||
+      (pk.range !== null && hasSibling(pk.range.terms)))
+  ) {
+    return { kind: "pk", pk };
   }
   // Else a leading secondary-index equality bound to a sibling (indexes in ascending lowercased name
   // order — the deterministic tie-break, matching detectScanBound).
@@ -15175,40 +15161,87 @@ export function prefixSuccessor(p: Uint8Array): Uint8Array | null {
 // (a `5 < pk` flips to `pk > 5`). src is the constant/parameter operand node.
 export type BoundTerm = { op: BinaryOp; src: RExpr };
 
-// PkBound is the plan-time result of PK analysis: the PK's storage type + the bound terms. The concrete
-// key range is built per execution by buildKeyBound.
-// coll is the key column's resolved collation when it is collated AND Full (loaded version matches
-// the file pin) — the probe encodes via this collation's UCA sort key (encoding.md §2.12), seeking
-// the same key FORM the B-tree stores (spec/design/collation.md §8). null for a C (raw-byte) key. A
-// Skewed collated key never produces a PkBound (keyCollationCtx refuses the bound — collation.md §12).
-export type PkBound = { pkType: ScalarType; terms: BoundTerm[]; coll: Collation | null };
+export type PkEqCol = {
+  name: string;
+  colType: ScalarType;
+  srcs: RExpr[];
+  ranges: BoundTerm[];
+  coll: Collation | null;
+};
+export type PkRange = {
+  name: string;
+  colType: ScalarType;
+  terms: BoundTerm[];
+  coll: Collation | null;
+};
+
+// PkBound is a PK tuple's maximal equality prefix plus an optional range on the next member.
+export type PkBound = { eqCols: PkEqCol[]; range: PkRange | null; memberCount: number };
+
+export function renderPkBound(bound: PkBound): string {
+  const parts: string[] = [];
+  for (const ec of bound.eqCols) {
+    for (const src of ec.srcs) parts.push(ec.name + " = " + renderBoundSrc(src));
+    if (ec.ranges.length > 0) parts.push(renderBoundTerms(ec.name, ec.ranges));
+  }
+  if (bound.range !== null) parts.push(renderBoundTerms(bound.range.name, bound.range.terms));
+  return parts.join(" and ");
+}
 
 // BoundKey is the outcome of encoding a const-source into the PK key space: a usable key, a NULL const
 // (the comparison is 3VL-unknown ⇒ empty range), or an out-of-range integer (drop this half-bound).
 export type BoundKey = { kind: "key"; key: Uint8Array } | { kind: "null" } | { kind: "outOfRange" };
 
-// detectPkBound flattens the WHERE's top-level AND-chain (an OR is never descended — a disjunction is
-// not a contiguous range) and collects every `pk <cmp> const-source` conjunct. null ⇒ full scan.
-// Conservative + sound: an unrecognized conjunct contributes no bound and stays in the residual filter.
+// detectPkBound constructs a PK tuple's maximal equality prefix plus optional next-member range.
 export function detectPkBound(
-  filter: RExpr,
-  pkIdx: number,
-  pkType: ScalarType,
-  coll: Collation | null,
+  filters: (RExpr | null)[],
+  rel: ScopeRel,
+  siblingCutoff: number,
+  snap: Snapshot,
 ): PkBound | null {
-  const colColl = coll !== null ? coll.name : null;
-  const terms: BoundTerm[] = [];
-  const walk = (e: RExpr): void => {
-    if (e.kind === "and") {
-      walk(e.lhs);
-      walk(e.rhs);
-      return;
+  const members = pkIndices(rel.table);
+  if (members.length === 0) return null;
+  const eqCols: PkEqCol[] = [];
+  let range: PkRange | null = null;
+  for (const ci of members) {
+    const column = rel.table.columns[ci]!;
+    const ty = typeAsScalar(column.type);
+    if (ty === undefined) break;
+    const ctx = keyCollationCtx(snap, column);
+    if (ctx === null) break;
+    const colColl = ctx.coll !== null ? ctx.coll.name : null;
+    const terms: BoundTerm[] = [];
+    const walk = (e: RExpr | null): void => {
+      if (e === null) return;
+      if (e.kind === "and") {
+        walk(e.lhs);
+        walk(e.rhs);
+        return;
+      }
+      const t = asBoundTerm(
+        e,
+        { kind: "column", index: rel.offset + ci },
+        ty,
+        colColl,
+        siblingCutoff,
+      );
+      if (t !== null) terms.push(t);
+    };
+    for (const filter of filters) walk(filter);
+    const eqs = terms.filter((t) => t.op === "eq").map((t) => t.src);
+    const ranges = terms.filter((t) => t.op !== "eq");
+    if (eqs.length > 0) {
+      eqCols.push({ name: column.name, colType: ty, srcs: eqs, ranges, coll: ctx.coll });
+      continue;
     }
-    const t = asBoundTerm(e, { kind: "column", index: pkIdx }, pkType, colColl, -1);
-    if (t !== null) terms.push(t);
-  };
-  walk(filter);
-  return terms.length === 0 ? null : { pkType, terms, coll };
+    if (ranges.length > 0) {
+      range = { name: column.name, colType: ty, terms: ranges, coll: ctx.coll };
+    }
+    break;
+  }
+  return eqCols.length === 0 && range === null
+    ? null
+    : { eqCols, range, memberCount: members.length };
 }
 
 // KeyMatch is what a bound's key operand is (spec/design/indexes.md §5): a plain column at a global
@@ -15444,10 +15477,8 @@ export function flipCmp(op: BinaryOp): BinaryOp {
   }
 }
 
-// buildKeyBound turns the plan-time terms into a concrete key range at exec time: encode each
-// const-source and intersect the half-bounds. null ⇒ the range admits no key (a NULL const — 3VL — or
-// contradictory bounds), so the scan reads nothing. An out-of-range integer const drops only its own
-// half-bound (a wider, still sound, scan).
+// buildKeyBound encodes a PK tuple bound. A complete equality tuple is [P,P], a proper prefix is
+// [P,prefixSuccessor(P)), and an optional next-member range tightens that prefix interval.
 // outer carries the enclosing rows (innermost last) so a correlated "outerColumn" source resolves to
 // the current outer row's value; it is empty for a top-level statement. left is the current combined
 // left-hand row of a left-deep join, from which an index-nested-loop "column" (sibling) source resolves
@@ -15458,29 +15489,87 @@ export function buildKeyBound(
   outer: Row[],
   left: Row,
 ): KeyBound | null {
-  const b = unboundedBound();
-  for (const t of bp.terms) {
-    const r = encodeBoundKey(bp.pkType, t.src, params, outer, bp.coll, left);
-    if (r.kind === "null") return null;
-    if (r.kind === "outOfRange") continue;
-    const key = r.key;
-    switch (t.op) {
-      case "eq":
-        intersectLo(b, key, true);
-        intersectHi(b, key, true);
-        break;
-      case "gt":
-        intersectLo(b, key, false);
-        break;
-      case "ge":
-        intersectLo(b, key, true);
-        break;
-      case "lt":
-        intersectHi(b, key, false);
-        break;
-      case "le":
-        intersectHi(b, key, true);
-        break;
+  const parts: Uint8Array[] = [];
+  for (const ec of bp.eqCols) {
+    let agreed: Uint8Array | null = null;
+    for (const src of ec.srcs) {
+      const encoded = encodeBoundKey(ec.colType, src, params, outer, ec.coll, left);
+      if (encoded.kind === "null") return null;
+      if (encoded.kind === "outOfRange") {
+        // Float bound encoding remains deferred. Preserve the old sound widening (and its INL
+        // re-scan shape), retaining only an already-encoded leading tuple prefix.
+        if (isFloat(ec.colType)) {
+          const p = concatBytes(parts);
+          return {
+            lo: p.length === 0 ? null : p,
+            loInc: true,
+            hi: p.length === 0 ? null : prefixSuccessor(p),
+            hiInc: false,
+          };
+        }
+        return null;
+      }
+      if (agreed === null) agreed = encoded.key;
+      else if (!bytesEq(agreed, encoded.key)) return null;
+    }
+    for (const term of ec.ranges) {
+      const encoded = encodeBoundKey(ec.colType, term.src, params, outer, ec.coll, left);
+      if (encoded.kind === "null") return null;
+      if (encoded.kind === "outOfRange") continue;
+      const cmp = compareBytes(agreed!, encoded.key);
+      if (
+        (term.op === "gt" && cmp <= 0) ||
+        (term.op === "ge" && cmp < 0) ||
+        (term.op === "lt" && cmp >= 0) ||
+        (term.op === "le" && cmp > 0)
+      ) {
+        return null;
+      }
+    }
+    parts.push(agreed!);
+  }
+  const p = concatBytes(parts);
+  if (bp.eqCols.length === bp.memberCount) {
+    return { lo: p, loInc: true, hi: p.slice(), hiInc: true };
+  }
+  const b: KeyBound = {
+    lo: p.length === 0 ? null : p.slice(),
+    loInc: true,
+    hi: prefixSuccessor(p),
+    hiInc: false,
+  };
+  if (bp.range !== null) {
+    for (const t of bp.range.terms) {
+      const encoded = encodeBoundKey(
+        bp.range.colType,
+        t.src,
+        params,
+        outer,
+        bp.range.coll,
+        left,
+      );
+      if (encoded.kind === "null") return null;
+      if (encoded.kind === "outOfRange") continue;
+      const endpoint = concatBytes([p, encoded.key]);
+      switch (t.op) {
+        case "gt": {
+          const next = prefixSuccessor(endpoint);
+          if (next === null) return null;
+          intersectLo(b, next, true);
+          break;
+        }
+        case "ge":
+          intersectLo(b, endpoint, true);
+          break;
+        case "lt":
+          intersectHi(b, endpoint, false);
+          break;
+        case "le": {
+          const next = prefixSuccessor(endpoint);
+          if (next !== null) intersectHi(b, next, false);
+          break;
+        }
+      }
     }
   }
   return boundEmpty(b) ? null : b;

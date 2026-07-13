@@ -4434,17 +4434,27 @@ pub(crate) struct BoundTerm {
     src: BoundSrc,
 }
 
-/// The plan-time result of PK analysis: the PK's storage type + the bound terms. The concrete key
-/// range is built per execution by `build_key_bound`.
-pub(crate) struct PkBound {
-    pk_type: ScalarType,
-    terms: Vec<BoundTerm>,
-    /// The key column's resolved collation when it is collated AND `Full` (loaded version matches
-    /// the file's pin) — the probe encodes via this collation's UCA sort key (encoding.md §2.12), so
-    /// it seeks the same key FORM the B-tree stores (spec/design/collation.md §8). `None` for a `C`
-    /// (raw-byte) key. A `Skewed` collated key never produces a `PkBound` at all (`key_collation_ctx`
-    /// refuses the bound — collation.md §12), so this is `Some` only for a safe-to-seek collated key.
+pub(crate) struct PkEqCol {
+    name: String,
+    col_type: ScalarType,
+    srcs: Vec<BoundSrc>,
+    ranges: Vec<BoundTerm>,
     coll: Option<std::sync::Arc<Collation>>,
+}
+
+pub(crate) struct PkRange {
+    name: String,
+    col_type: ScalarType,
+    terms: Vec<BoundTerm>,
+    coll: Option<std::sync::Arc<Collation>>,
+}
+
+/// The plan-time result of PK tuple analysis: a maximal equality prefix plus an optional range on
+/// the next member. The concrete key range is built per execution by `build_key_bound`.
+pub(crate) struct PkBound {
+    eq_cols: Vec<PkEqCol>,
+    range: Option<PkRange>,
+    member_count: usize,
 }
 
 /// The plan-time result of an OR / IN-list disjunction of primary-key equalities

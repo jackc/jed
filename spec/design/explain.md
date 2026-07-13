@@ -123,7 +123,8 @@ bottoming out at relation leaves.
 Attributes are `; `-separated; a node with none renders `-`.
 
 - **Scan access path** (from the relation's chosen bound): `Full scan` · `PK bound: <col> <op> <src>`
-  (conjuncts joined by ` and `) · `Index bound: using <index>` · `GIN bound: using <index>` ·
+  (conjuncts joined by ` and `; composite-PK members render in key order) ·
+  `Index bound: using <index>` · `GIN bound: using <index>` ·
   `GiST bound: using <index>`. The index name is the stored **lowercased** name. `<op>` is one of
   `= <> < > <= >=`. `<src>` is `$N` (a bind parameter, 1-based), `outer` (a correlated outer column),
   or a literal (integer / boolean / decimal / quoted text rendered via the value's canonical form; a

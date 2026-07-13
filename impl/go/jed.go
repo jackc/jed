@@ -191,6 +191,7 @@ var SupportedCapabilities = []string{
 	"query.where_eq",
 	"query.comparison_order",
 	"query.point_lookup",
+	"query.composite_pk_pushdown",
 	"query.or_in_point_lookup",
 	"query.index_mutation",
 	"query.limit_short_circuit",

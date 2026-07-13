@@ -190,7 +190,11 @@ description = "WHERE with an ordering predicate ( < , > , <= , >= )"
 
 [[capability]]
 id = "query.point_lookup"
-description = "Primary-key predicate pushdown — a single-table WHERE on the primary key (`pk = c`, `pk < c`, BETWEEN, AND-combinations) seeks/ranges the storage B-tree instead of a full scan, so page_read drops to the nodes on the access path and storage_row_read to the rows in range (spec/design/cost.md §3 \"bounded scan / point lookup\"). A cost-visible optimization: a core lacking it would compute the higher full-scan cost, so cost-asserting tests over PK predicates require it."
+description = "Primary-key predicate pushdown — a WHERE on the primary key seeks/ranges the storage B-tree instead of a full scan, so page_read drops to the nodes on the access path and storage_row_read to the rows in range (spec/design/cost.md §3 \"bounded scan / point lookup\"). For a single-column key this covers `pk = c`, ordering comparisons, BETWEEN, and AND-combinations. A cost-visible optimization: a core lacking it would compute the higher full-scan cost, so cost-asserting tests over PK predicates require it."
+
+[[capability]]
+id = "query.composite_pk_pushdown"
+description = "Composite-primary-key tuple bounds — a WHERE over `(pk1, pk2, ...)` consumes the maximal equality prefix in PK key order plus an optional range on the next member. Equality on every member is an exact tuple point lookup; a proper prefix scans `[P, prefix-successor(P))`; a trailing range tightens that byte interval. NULL, conflicting equality sources, and unrepresentable equality values are empty; a non-leading member alone does not bound (no skip-scan). The same bound serves SELECT, UPDATE/DELETE, independent join-relation pushdown, correlated scans, and index-nested-loop inner scans, with the complete predicate retained as a residual recheck. Builds on query.point_lookup and ddl.composite_primary_key."
 
 [[capability]]
 id = "query.or_in_point_lookup"

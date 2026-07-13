@@ -2,7 +2,7 @@
 # functions, set operations, derived tables / subqueries, CTEs, VALUES, and set-returning functions.
 # The plan tree is rendered in pre-order (depth-numbered), so the rows read top-down as the executor's
 # pipeline reads bottom-up. Deterministic and cross-core-identical, asserted with `nosort`.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.point_lookup, query.limit, query.order_by, query.order_by_ordinal, query.aggregates, query.group_by, query.having, query.join_inner, query.cross_join, query.join_pushdown, query.index_nested_loop, query.union, query.derived_table, query.subquery_scalar, query.cte, query.window, query.window_aggregate, query.set_returning, query.values, query.explain, types.i32, types.text
+# requires: ddl.create_table, ddl.primary_key, ddl.composite_primary_key, dml.insert, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.point_lookup, query.composite_pk_pushdown, query.limit, query.order_by, query.order_by_ordinal, query.aggregates, query.group_by, query.having, query.join_inner, query.cross_join, query.join_pushdown, query.index_nested_loop, query.union, query.derived_table, query.subquery_scalar, query.cte, query.window, query.window_aggregate, query.set_returning, query.values, query.explain, cast.explicit, types.i16, types.i32, types.text
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, v i32, s text)
@@ -186,3 +186,50 @@ Subquery x
 1
 Values
 rows=2
+
+# Composite-PK bounds render consumed members in PK key order, independent of WHERE source order.
+statement ok
+CREATE TABLE cpk (a i32, b i16, v text, PRIMARY KEY (b, a))
+
+query ITT nosort
+EXPLAIN SELECT v FROM cpk WHERE a = 2 AND b = 1
+----
+0
+Filter
+conjuncts=2
+1
+Scan cpk
+PK bound: b = 1 and a = 2; touched=3
+
+query ITT nosort
+EXPLAIN SELECT a FROM cpk WHERE b = 1 AND a >= 2
+----
+0
+Filter
+conjuncts=2
+1
+Scan cpk
+PK bound: b = 1 and a >= 2; touched=2
+
+# A non-leading member alone cannot seed a tuple bound.
+query ITT nosort
+EXPLAIN SELECT v FROM cpk WHERE a = 2
+----
+0
+Filter
+conjuncts=1
+1
+Scan cpk
+Full scan; touched=2
+
+# A promoted comparison wraps the narrow key member rather than comparing in its storage type, so
+# it remains residual and cannot seed a tuple bound.
+query ITT nosort
+EXPLAIN SELECT v FROM cpk WHERE b = 1::i32
+----
+0
+Filter
+conjuncts=1
+1
+Scan cpk
+Full scan; touched=2

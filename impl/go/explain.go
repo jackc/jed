@@ -522,7 +522,7 @@ func (db *engine) accessPath(tableName string, b *scanBound, inl bool) string {
 	case b == nil:
 		return "Full scan"
 	case b.pk != nil:
-		return prefix + "PK bound: " + renderBoundTerms(db.firstPKColName(tableName), b.pk.terms)
+		return prefix + "PK bound: " + renderPKBound(b.pk)
 	case b.index != nil:
 		return prefix + "Index bound: using " + b.index.nameKey
 	case b.gin != nil:
@@ -536,6 +536,22 @@ func (db *engine) accessPath(tableName string, b *scanBound, inl bool) string {
 	default:
 		return "Full scan"
 	}
+}
+
+func renderPKBound(b *pkBoundPlan) string {
+	parts := make([]string, 0, len(b.eqCols)+len(b.rangeTerms))
+	for _, ec := range b.eqCols {
+		for _, src := range ec.srcs {
+			parts = append(parts, ec.name+" = "+renderBoundSrc(src))
+		}
+		if ec.ranges != nil {
+			parts = append(parts, strings.Split(renderBoundTerms(ec.name, ec.ranges), " and ")...)
+		}
+	}
+	if b.rangeTerms != nil {
+		parts = append(parts, strings.Split(renderBoundTerms(b.rangeName, b.rangeTerms), " and ")...)
+	}
+	return strings.Join(parts, " and ")
 }
 
 // renderKeySet renders a merged OR / IN-list point-set bound's const-sources as

@@ -76,11 +76,9 @@ SELECT a, b FROM t ORDER BY a, b, c LIMIT 2
 2
 20
 
-# A residual WHERE composes with the streaming scan: `a >= 2` filters per scanned row, and the LIMIT
-# still short-circuits (a composite PK has no single-column bound, so this is a full ordered scan +
-# residual filter). The scan reads (1,*) [filtered out], then (2,*),(3,*) [produced], and stops.
-# 1 page + 3 scanned + 3 filter + 2 produced = 9.
-# cost: 9
+# A leading composite-PK range composes with the streaming scan: `a >= 2` starts at the tuple-prefix
+# bound, then LIMIT short-circuits after (2,*),(3,*). 1 page + 2 scanned + 2 filter + 2 produced = 7.
+# cost: 7
 query II nosort
 SELECT a, b FROM t WHERE a >= 2 ORDER BY a LIMIT 2
 ----

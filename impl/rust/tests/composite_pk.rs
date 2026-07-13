@@ -37,7 +37,7 @@ fn composite_key_orders_by_tuple() {
     assert!(t.columns[0].primary_key && t.columns[0].not_null);
     assert!(t.columns[1].primary_key && t.columns[1].not_null);
     assert!(!t.columns[2].primary_key);
-    // Single-column pushdown accessor must NOT see a composite key.
+    // The single-member-only helper must NOT see a composite key.
     assert_eq!(t.primary_key_index(), None);
 
     // Insert out of tuple order; include a negative first component (sign-flip) and ties

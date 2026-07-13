@@ -60,6 +60,10 @@ actually references.
 A `WHERE` on the primary key bounds the scan to a point lookup — the `PK bound` detail names the
 column and predicate. The original `WHERE` stays as the residual `Filter` above the scan.
 
+For a composite primary key, the detail lists the usable members in key order. jed seeks an exact
+tuple when every member has an equality, or scans a leading equality prefix with an optional range
+on the next member; a predicate on only a non-leading member remains a full scan.
+
 <LiveSql seed={seed} query={pkBound} rows={8} />
 
 ## A secondary-index bound

@@ -13,6 +13,9 @@
 #   pushdown — `pk = K` / `pk BETWEEN a AND b` seek a B-tree node; `pk + 0 = K` is a `BinaryOp`,
 #              so `detect_pk_bound` (which matches only a bare `RExpr::Column`) does NOT push it
 #              and it full-scans. Both must return identical rows.
+#   composite_pk — `(b, a)` tuple equality / leading-prefix + range binds a composite PK; wrapping
+#              the key operands in `+ 0` defeats the bound. SELECT and identically-seeded UPDATE
+#              paths must produce the same by-construction rows.
 #   limit    — LIMIT short-circuits the streaming scan at the window; OFFSET / the full query do
 #              not. Over a total order (`ORDER BY` the unique pk) the windows must reconstruct the
 #              whole — each window matches its by-construction slice. Both directions: `ORDER BY id`
@@ -115,6 +118,11 @@ PUSHDOWN_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_r
                   query.where_eq query.comparison_order query.point_lookup query.order_by
                   query.logical_connectives expr.arithmetic expr.between expr.comparison_value
                   types.i32].freeze
+COMPOSITE_PK_REQ = %w[ddl.create_table ddl.primary_key ddl.composite_primary_key dml.insert
+                      dml.insert_multi_row dml.update query.select query.where_eq
+                      query.comparison_order query.logical_connectives query.order_by
+                      query.point_lookup query.composite_pk_pushdown expr.arithmetic
+                      expr.between types.i32].freeze
 LIMIT_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
                query.comparison_order query.order_by query.limit query.offset
                query.limit_short_circuit types.i32].freeze
@@ -273,6 +281,48 @@ def gen_pushdown(seed)
             block.call(->(id, _v) { id >= lo && id <= hi }))
   pair.call("range 41..50 (empty)", "id BETWEEN 41 AND 50", "id + 0 BETWEEN 41 AND 50",
             block.call(->(id, _v) { id >= 41 && id <= 50 }))
+
+  out.join("\n") + "\n"
+end
+
+# --- scenario: composite-primary-key tuple bounds ---------------------------------------------
+def gen_composite_pk(seed)
+  rng = Random.new(seed)
+  rows = (1..4).flat_map do |b|
+    (1..3).map { |a| [a, b, rng.rand(-100..100)] }
+  end
+  b = rng.rand(1..4)
+  point_a = rng.rand(1..3)
+  lo = rng.rand(1..3)
+  flat = ->(rs) { rs.sort_by { |a, key_b, _v| [key_b, a] }.flat_map { |a, key_b, v| [a.to_s, key_b.to_s, v.to_s] } }
+
+  out = header(seed, COMPOSITE_PK_REQ, "composite-primary-key tuple bounds")
+  values = rows.map { |a, key_b, v| "(#{a}, #{key_b}, #{v})" }.join(', ')
+  stmt(out, "CREATE TABLE t (a i32, b i32, v i32, PRIMARY KEY (b, a))")
+  stmt(out, "INSERT INTO t VALUES #{values}")
+
+  pairs = [
+    ["complete tuple", "b = #{b} AND a = #{point_a}", "b + 0 = #{b} AND a + 0 = #{point_a}",
+     rows.select { |a, key_b, _v| key_b == b && a == point_a }],
+    ["leading prefix", "b = #{b}", "b + 0 = #{b}", rows.select { |_a, key_b, _v| key_b == b }],
+    ["prefix plus range", "b = #{b} AND a >= #{lo}", "b + 0 = #{b} AND a + 0 >= #{lo}",
+     rows.select { |a, key_b, _v| key_b == b && a >= lo }]
+  ]
+  pairs.each do |title, opt, scan, selected|
+    out << "# #{title}: tuple bound"
+    q(out, "III", "SELECT a, b, v FROM t WHERE #{opt} ORDER BY b, a", flat.call(selected))
+    out << "# equivalent full scan (+0 defeats tuple matching)"
+    q(out, "III", "SELECT a, b, v FROM t WHERE #{scan} ORDER BY b, a", flat.call(selected))
+  end
+
+  stmt(out, "CREATE TABLE t_scan (a i32, b i32, v i32, PRIMARY KEY (b, a))")
+  stmt(out, "INSERT INTO t_scan VALUES #{values}")
+  stmt(out, "UPDATE t SET v = v + 1000 WHERE b = #{b} AND a >= #{lo}")
+  stmt(out, "UPDATE t_scan SET v = v + 1000 WHERE b + 0 = #{b} AND a + 0 >= #{lo}")
+  updated = rows.map { |a, key_b, v| [a, key_b, key_b == b && a >= lo ? v + 1000 : v] }
+  out << "# bounded and full-scan mutation end states"
+  q(out, "III", "SELECT a, b, v FROM t ORDER BY b, a", flat.call(updated))
+  q(out, "III", "SELECT a, b, v FROM t_scan ORDER BY b, a", flat.call(updated))
 
   out.join("\n") + "\n"
 end
@@ -1670,6 +1720,7 @@ end
 
 SCENARIOS = {
   "pushdown" => method(:gen_pushdown),
+  "composite_pk" => method(:gen_composite_pk),
   "limit" => method(:gen_limit),
   "join" => method(:gen_join),
   "correlated" => method(:gen_correlated),

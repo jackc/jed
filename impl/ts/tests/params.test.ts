@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { EngineError, intValue, nullValue } from "../src/tooling.ts";
 import type { Value } from "../src/lib.ts";
+import { float64Value } from "../src/value.ts";
 import { type Handle, dbWith, queryOutcome } from "./util.ts";
 import { memDb } from "./mem_db.ts";
 
@@ -39,6 +40,30 @@ test("WHERE pk = $1 point lookup", () => {
     "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)",
   ]);
   assert.deepStrictEqual(ints(rows(db, "SELECT v FROM t WHERE id = $1", [intValue(2n)])), [20n]);
+});
+
+test("composite PK parameter tuple bound", () => {
+  const db = dbWith([
+    "CREATE TABLE t (a i32, b i16, v i32, PRIMARY KEY (b, a))",
+    "INSERT INTO t VALUES (1, 1, 10), (2, 1, 20), (3, 1, 30), (1, 2, 40)",
+  ]);
+  const got = rows(db, "SELECT v FROM t WHERE b = $1 AND a >= $2 ORDER BY a", [
+    intValue(1n),
+    intValue(2n),
+  ]);
+  assert.deepStrictEqual(ints(got), [20n, 30n]);
+});
+
+test("composite PK float parameter widens soundly", () => {
+  const db = dbWith([
+    "CREATE TABLE t (f f64, a i32, v i32, PRIMARY KEY (f, a))",
+    "INSERT INTO t VALUES (1.5, 1, 10), (2.5, 1, 20)",
+  ]);
+  const got = rows(db, "SELECT v FROM t WHERE f = $1 AND a = $2", [
+    float64Value(1.5),
+    intValue(1n),
+  ]);
+  assert.deepStrictEqual(ints(got), [10n]);
 });
 
 test("param adopts narrow column type and traps overflow", () => {

@@ -60,6 +60,28 @@ func TestWherePkEqParamPointLookup(t *testing.T) {
 	}
 }
 
+func TestCompositePKParamTupleBound(t *testing.T) {
+	t.Parallel()
+	db := dbWith(t,
+		"CREATE TABLE t (a i32, b i16, v i32, PRIMARY KEY (b, a))",
+		"INSERT INTO t VALUES (1, 1, 10), (2, 1, 20), (3, 1, 30), (1, 2, 40)")
+	rows := queryRows(t, db, "SELECT v FROM t WHERE b = $1 AND a >= $2 ORDER BY a", IntValue(1), IntValue(2))
+	if !eqInts(firstInts(rows), 20, 30) {
+		t.Fatalf("got %v want [20 30]", firstInts(rows))
+	}
+}
+
+func TestCompositePKFloatParamWidensSoundly(t *testing.T) {
+	t.Parallel()
+	db := dbWith(t,
+		"CREATE TABLE t (f f64, a i32, v i32, PRIMARY KEY (f, a))",
+		"INSERT INTO t VALUES (1.5, 1, 10), (2.5, 1, 20)")
+	rows := queryRows(t, db, "SELECT v FROM t WHERE f = $1 AND a = $2", Float64Value(1.5), IntValue(1))
+	if !eqInts(firstInts(rows), 10) {
+		t.Fatalf("got %v want [10]", firstInts(rows))
+	}
+}
+
 func TestParamAdoptsNarrowColumnTypeAndTrapsOverflow(t *testing.T) {
 	t.Parallel()
 	db := dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY, s i16)",

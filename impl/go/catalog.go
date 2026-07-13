@@ -511,10 +511,9 @@ func (t *catTable) PKIndices() []int {
 	return t.PK
 }
 
-// PrimaryKeyIndex returns the primary-key column's index iff the key is SINGLE-column,
-// else -1. The PK pushdown (point lookup / range bound) recognizes single-column keys
-// only — a composite-PK table full-scans this slice (spec/design/constraints.md §3) — so
-// every pushdown site routes through this accessor and stays sound by construction.
+// PrimaryKeyIndex returns the primary-key column's index iff the key is SINGLE-column, else -1.
+// Callers that genuinely require one member (notably the OR/IN point-set path) use this helper;
+// tuple-aware PK bounds iterate PKIndices directly.
 func (t *catTable) PrimaryKeyIndex() int {
 	idxs := t.PKIndices()
 	if len(idxs) == 1 {

@@ -38,7 +38,7 @@ func TestCompositeKeyOrdersByTuple(t *testing.T) {
 	if tab.Columns[2].PrimaryKey {
 		t.Fatal("non-member column must not be flagged")
 	}
-	// Single-column pushdown accessor must NOT see a composite key.
+	// The single-member-only helper must NOT see a composite key.
 	if got := tab.PrimaryKeyIndex(); got != -1 {
 		t.Fatalf("PrimaryKeyIndex = %d, want -1 for a composite key", got)
 	}

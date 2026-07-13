@@ -102,7 +102,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [x] **Set-returning functions** — `generate_series` in FROM, a synthetic one-column relation, a `generated_row` cost unit. → [functions.md §10](spec/design/functions.md)
   - [ ] _follow-on:_ the column-alias-list `AS g(c)`. (`LATERAL` ✅ landed; `unnest(array)` ✅ landed — AF3.)
 - [x] **Composite `PRIMARY KEY`** — table-level `PRIMARY KEY (a, b, …)`, key bytes = members' concatenated encodings. → [constraints.md §3](spec/design/constraints.md)
-  - [ ] _follow-on:_ composite point-lookup / prefix pushdown (a composite-PK table full-scans today — an optimization slice with its NoREC obligation).
+  - [x] **Composite point/prefix pushdown** — maximal equality prefix plus an optional next-member range, shared by SELECT, UPDATE/DELETE, correlated scans, join-relation bounds, and INL; cap `query.composite_pk_pushdown`. → [cost.md §3](spec/design/cost.md)
 - [x] **`FOREIGN KEY` constraints** — column-/table-level `REFERENCES`, composite + self-reference, same-type pairing (`42804`), MATCH SIMPLE, enforced at four write sites (`23503`), `format_version` 11. → [constraints.md §6](spec/design/constraints.md)
   - [ ] _follow-on:_ the referential **actions** `ON DELETE/UPDATE CASCADE | SET NULL | SET DEFAULT` (parse but `0A000` today); `MATCH FULL`; a **backing index** on the child FK columns (the parent-side check full-scans children today); FK type pairing relaxed to PG's comparable-types.
 - [x] **Secondary indexes** (`CREATE INDEX` / `DROP INDEX`) — non-unique on-disk B-trees, maintained in the two-phase pass; the planner index-bounds a base scan on an access predicate; `format_version` 5. → [indexes.md](spec/design/indexes.md)
@@ -192,9 +192,12 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [x] _follow-on:_ a secondary-index point-set for UPDATE/DELETE (landed with `query.index_mutation`).
   - [ ] _follow-on:_ range disjuncts in the union (`pk = 1 OR pk BETWEEN 10 AND 20`); intersecting an
     IN-list with a co-present range conjunct (`pk IN (1..9) AND pk > 4`).
+- [x] **Composite-PK tuple bounds** — maximal equality prefix plus an optional next-member range,
+  shared by SELECT, UPDATE/DELETE, correlated scans, join-relation bounds, and composite INL; cap
+  `query.composite_pk_pushdown`. → [cost.md §3](spec/design/cost.md),
+  `spec/conformance/suites/query/composite_pk_pushdown.test`
 - _Already tracked in their home sections (all planner follow-ons):_ the **LIMIT-streaming +
-  index-bound** combination (the Secondary-indexes item); **composite-PK prefix pushdown** (the
-  Composite `PRIMARY KEY` item); a **hash-join operator** (the
+  index-bound** combination (the Secondary-indexes item); a **hash-join operator** (the
   spill item — nested-loop is the only join today); the **ORDER BY + LIMIT top-k** heap (bench-driven
   perf). Each is a rule-based, results-identical win.
 

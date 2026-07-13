@@ -532,10 +532,7 @@ impl Engine {
         let prefix = if inl { "Index-nested-loop " } else { "" };
         match b {
             None => "Full scan".to_string(),
-            Some(ScanBound::Pk(pb)) => format!(
-                "{prefix}PK bound: {}",
-                render_bound_terms(&self.first_pk_col_name(table_name), &pb.terms)
-            ),
+            Some(ScanBound::Pk(pb)) => format!("{prefix}PK bound: {}", render_pk_bound(pb)),
             Some(ScanBound::Index(ib)) => format!("{prefix}Index bound: using {}", ib.name_key),
             Some(ScanBound::Gin(gb)) => format!("GIN bound: using {}", gb.name_key),
             Some(ScanBound::Gist(gp)) => format!("GiST bound: using {}", gp.name_key),
@@ -562,4 +559,20 @@ impl Engine {
         }
         "pk".to_string()
     }
+}
+
+fn render_pk_bound(bound: &PkBound) -> String {
+    let mut parts = Vec::new();
+    for ec in &bound.eq_cols {
+        for src in &ec.srcs {
+            parts.push(format!("{} = {}", ec.name, render_bound_src(src)));
+        }
+        if !ec.ranges.is_empty() {
+            parts.push(render_bound_terms(&ec.name, &ec.ranges));
+        }
+    }
+    if let Some(range) = &bound.range {
+        parts.push(render_bound_terms(&range.name, &range.terms));
+    }
+    parts.join(" and ")
 }

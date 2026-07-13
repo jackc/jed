@@ -80,17 +80,24 @@ type boundTerm struct {
 	src *rExpr
 }
 
-// pkBoundPlan is the plan-time result of PK analysis: the PK column's storage type + the bound
-// terms. The concrete key range is built per execution by buildKeyBound.
+// pkEqCol is one member of the maximal equality prefix of a primary-key tuple.
+type pkEqCol struct {
+	name    string
+	colType scalarType
+	coll    *Collation
+	srcs    []*rExpr
+	ranges  []boundTerm
+}
+
+// pkBoundPlan is the plan-time result of PK tuple analysis: a maximal equality prefix plus an
+// optional range on the next member. The concrete storage-key range is built per execution.
 type pkBoundPlan struct {
-	pkType scalarType
-	terms  []boundTerm
-	// coll is the key column's resolved collation when it is collated AND Full (loaded version
-	// matches the file pin) — the probe encodes via this collation's UCA sort key (encoding.md
-	// §2.12), seeking the same key FORM the B-tree stores (spec/design/collation.md §8). nil for a
-	// C (raw-byte) key. A Skewed collated key never produces a pkBoundPlan (keyCollationCtx refuses
-	// the bound — collation.md §12).
-	coll *Collation
+	eqCols      []pkEqCol
+	rangeName   string
+	rangeType   scalarType
+	rangeColl   *Collation
+	rangeTerms  []boundTerm
+	memberCount int
 }
 
 // scanBound is a per-relation scan bound (cost.md §3): a primary-key range, a
@@ -400,19 +407,8 @@ func detectScanBoundWithPolicy(filter *rExpr, rel scopeRel, db *engine, policy s
 	if rel.isAttachment() {
 		return nil
 	}
-	if pkLocal := rel.table.PrimaryKeyIndex(); pkLocal >= 0 {
-		// Ordered-equality pushdown is scalar-only; a non-scalar (range) PK skips it (point-lookup
-		// deferred for containers — ranges.md §10), falling through to a full scan + residual filter.
-		if sty, ok := rel.table.Columns[pkLocal].Type.AsScalar(); ok {
-			// The PK column's key collation form (collation.md §8/§12): push=false ⇒ collated but
-			// Skewed ⇒ refuse pushdown (full heap-scan recompute — the read-safety rule §12); else
-			// coll is nil (C, raw-byte key) or the Full-collated table (push via the sort key).
-			if coll, push := db.keyCollationCtx(rel.table.Columns[pkLocal]); push {
-				if bp := detectPKBound(filter, rel.offset+pkLocal, sty, coll); bp != nil {
-					return &scanBound{pk: bp}
-				}
-			}
-		}
+	if bp := db.detectPKBound([]*rExpr{filter}, rel, -1); bp != nil {
+		return &scanBound{pk: bp}
 	}
 	if policy.orderedIndex {
 		for _, idx := range rel.table.Indexes {
@@ -637,14 +633,19 @@ func detectINLBound(on *rExpr, whereFilter *rExpr, rel scopeRel, db *engine) *sc
 		return false
 	}
 	// Primary-key bound first (the row's own key — range-capable, strictly cheaper).
-	if pkLocal := rel.table.PrimaryKeyIndex(); pkLocal >= 0 {
-		if sty, ok := rel.table.Columns[pkLocal].Type.AsScalar(); ok {
-			if coll, push := db.keyCollationCtx(rel.table.Columns[pkLocal]); push {
-				terms := collect(rel.offset+pkLocal, sty, coll)
-				if hasSibling(terms) {
-					return &scanBound{pk: &pkBoundPlan{pkType: sty, terms: terms, coll: coll}}
+	if bp := db.detectPKBound([]*rExpr{on, whereFilter}, rel, rel.offset); bp != nil {
+		for _, ec := range bp.eqCols {
+			for _, src := range ec.srcs {
+				if src.kind == reColumn {
+					return &scanBound{pk: bp}
 				}
 			}
+			if hasSibling(ec.ranges) {
+				return &scanBound{pk: bp}
+			}
+		}
+		if hasSibling(bp.rangeTerms) {
+			return &scanBound{pk: bp}
 		}
 	}
 	// Else a leading secondary-index equality bound to a sibling (indexes in ascending lowercased
@@ -1593,33 +1594,64 @@ func prefixSuccessor(p []byte) []byte {
 	return nil
 }
 
-// detectPKBound flattens the WHERE's top-level AND-chain (an OR is never descended — a disjunction
-// is not a contiguous range) and collects every `pk <cmp> const-source` conjunct. Returns nil when
-// none exist (⇒ full scan). Conservative + sound: an unrecognized conjunct contributes no bound and
-// stays in the residual filter. coll is the key column's collation when collated AND Full (nil for a
-// C key); a comparison's own collation must match it for the comparison to seed a bound.
-func detectPKBound(filter *rExpr, pkIdx int, pkType scalarType, coll *Collation) *pkBoundPlan {
-	colColl := ""
-	if coll != nil {
-		colColl = coll.Name
-	}
-	var terms []boundTerm
-	var walk func(e *rExpr)
-	walk = func(e *rExpr) {
-		if e.kind == reAnd {
-			walk(e.lhs)
-			walk(e.rhs)
-			return
-		}
-		if t, ok := asBoundTerm(e, columnMatch(pkIdx), pkType, colColl, -1); ok {
-			terms = append(terms, t)
-		}
-	}
-	walk(filter)
-	if len(terms) == 0 {
+// detectPKBound constructs the maximal equality prefix plus optional next-member range for a PK
+// tuple. filters are walked independently as top-level AND chains (ordinary scans pass WHERE;
+// index-nested-loop passes ON and WHERE). siblingCutoff has the same meaning as asBoundTerm.
+func (db *engine) detectPKBound(filters []*rExpr, rel scopeRel, siblingCutoff int) *pkBoundPlan {
+	pk := rel.table.PKIndices()
+	if len(pk) == 0 {
 		return nil
 	}
-	return &pkBoundPlan{pkType: pkType, terms: terms, coll: coll}
+	bp := &pkBoundPlan{memberCount: len(pk)}
+	for _, ci := range pk {
+		ty, ok := rel.table.Columns[ci].Type.AsScalar()
+		if !ok {
+			break
+		}
+		coll, push := db.keyCollationCtx(rel.table.Columns[ci])
+		if !push {
+			break
+		}
+		colColl := ""
+		if coll != nil {
+			colColl = coll.Name
+		}
+		var eqs []*rExpr
+		var ranges []boundTerm
+		var walk func(*rExpr)
+		walk = func(e *rExpr) {
+			if e == nil {
+				return
+			}
+			if e.kind == reAnd {
+				walk(e.lhs)
+				walk(e.rhs)
+				return
+			}
+			if t, ok := asBoundTerm(e, columnMatch(rel.offset+ci), ty, colColl, siblingCutoff); ok {
+				if t.op == opEq {
+					eqs = append(eqs, t.src)
+				} else {
+					ranges = append(ranges, t)
+				}
+			}
+		}
+		for _, filter := range filters {
+			walk(filter)
+		}
+		if len(eqs) > 0 {
+			bp.eqCols = append(bp.eqCols, pkEqCol{name: rel.table.Columns[ci].Name, colType: ty, coll: coll, srcs: eqs, ranges: ranges})
+			continue
+		}
+		if len(ranges) > 0 {
+			bp.rangeName, bp.rangeType, bp.rangeColl, bp.rangeTerms = rel.table.Columns[ci].Name, ty, coll, ranges
+		}
+		break
+	}
+	if len(bp.eqCols) == 0 && bp.rangeTerms == nil {
+		return nil
+	}
+	return bp
 }
 
 // keyMatch is what a bound's key operand is (spec/design/indexes.md §5): a plain column at a
@@ -1871,35 +1903,85 @@ func flipCompare(op binaryOp) binaryOp {
 	}
 }
 
-// buildKeyBound turns the plan-time terms into a concrete key range at exec time: encode each
-// const-source in the PK key space and intersect the half-bounds. empty=true ⇒ the range admits no
-// key (a NULL const — 3VL — or contradictory bounds like pk>5 AND pk<5), so the scan reads nothing
-// and charges nothing. An out-of-range integer const drops only its own half-bound (a wider, still
-// sound, scan), never a wrong key.
+// buildKeyBound turns a PK tuple plan into a concrete storage-key range. Equality members append
+// bare component encodings to P. A complete tuple is [P,P], a proper prefix is
+// [P,prefixSuccessor(P)), and a next-member range tightens that prefix interval.
 // outer carries the enclosing rows (innermost last) so a correlated reOuterColumn source resolves to
 // the current outer row's value; it is nil for a top-level statement.
 func (db *engine) buildKeyBound(bp *pkBoundPlan, params []Value, outer []storedRow, left storedRow) (keyBound, bool) {
-	b := unboundedBound()
-	for _, t := range bp.terms {
-		key, isNull, ok := encodeBoundKey(bp.pkType, t.src, params, outer, bp.coll, left)
+	var p []byte
+	for _, ec := range bp.eqCols {
+		var agreed []byte
+		for _, src := range ec.srcs {
+			key, isNull, ok := encodeBoundKey(ec.colType, src, params, outer, ec.coll, left)
+			if isNull {
+				return keyBound{}, true
+			}
+			if !ok {
+				// Float bound encoding remains deferred. Preserve the old sound widening (and its
+				// INL re-scan shape), retaining only any already-encoded leading tuple prefix.
+				if ec.colType.IsFloat() {
+					if len(p) == 0 {
+						return unboundedBound(), false
+					}
+					b := keyBound{lo: append([]byte(nil), p...), loInc: true, hi: prefixSuccessor(p), hiInc: false}
+					return b, boundEmpty(b)
+				}
+				return keyBound{}, true
+			}
+			if agreed == nil {
+				agreed = key
+			} else if !bytes.Equal(agreed, key) {
+				return keyBound{}, true
+			}
+		}
+		for _, term := range ec.ranges {
+			key, isNull, ok := encodeBoundKey(ec.colType, term.src, params, outer, ec.coll, left)
+			if isNull {
+				return keyBound{}, true
+			}
+			if !ok {
+				continue
+			}
+			cmp := bytes.Compare(agreed, key)
+			if (term.op == opGt && cmp <= 0) || (term.op == opGe && cmp < 0) ||
+				(term.op == opLt && cmp >= 0) || (term.op == opLe && cmp > 0) {
+				return keyBound{}, true
+			}
+		}
+		p = append(p, agreed...)
+	}
+	if len(bp.eqCols) == bp.memberCount {
+		return keyBound{lo: p, loInc: true, hi: append([]byte(nil), p...), hiInc: true}, false
+	}
+	b := keyBound{lo: append([]byte(nil), p...), loInc: true, hi: prefixSuccessor(p), hiInc: false}
+	if len(p) == 0 {
+		b.lo = nil
+	}
+	for _, t := range bp.rangeTerms {
+		key, isNull, ok := encodeBoundKey(bp.rangeType, t.src, params, outer, bp.rangeColl, left)
 		if isNull {
 			return keyBound{}, true
 		}
 		if !ok {
 			continue
 		}
+		endpoint := append(append([]byte(nil), p...), key...)
 		switch t.op {
-		case opEq:
-			b = intersectLo(b, key, true)
-			b = intersectHi(b, key, true)
 		case opGt:
-			b = intersectLo(b, key, false)
+			next := prefixSuccessor(endpoint)
+			if next == nil {
+				return keyBound{}, true
+			}
+			b = intersectLo(b, next, true)
 		case opGe:
-			b = intersectLo(b, key, true)
+			b = intersectLo(b, endpoint, true)
 		case opLt:
-			b = intersectHi(b, key, false)
+			b = intersectHi(b, endpoint, false)
 		case opLe:
-			b = intersectHi(b, key, true)
+			if next := prefixSuccessor(endpoint); next != nil {
+				b = intersectHi(b, next, false)
+			}
 		}
 	}
 	if boundEmpty(b) {

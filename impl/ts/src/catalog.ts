@@ -413,10 +413,9 @@ export function pkIndices(t: Table): number[] {
   return t.pk;
 }
 
-// primaryKeyIndex returns the primary-key column's index iff the key is SINGLE-column,
-// else -1. The PK pushdown (point lookup / range bound) recognizes single-column keys
-// only — a composite-PK table full-scans this slice (spec/design/constraints.md §3) — so
-// every pushdown site routes through this accessor and stays sound by construction.
+// primaryKeyIndex returns the primary-key column's index iff the key is SINGLE-column, else -1.
+// Callers that genuinely require one member (notably OR/IN point sets) use this helper; tuple bounds
+// iterate pkIndices directly.
 export function primaryKeyIndex(t: Table): number {
   const idxs = pkIndices(t);
   return idxs.length === 1 ? idxs[0]! : -1;

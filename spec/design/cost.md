@@ -329,6 +329,17 @@ a primary-key comparison maps to a contiguous range of storage keys, and the sca
 B-tree nodes that range can intersect. This is the engine's first index-style access path; it is a
 deliberate, cost-visible optimization, gated by the `query.point_lookup` capability.
 
+For a composite primary key `(pk1, pk2, ...)`, the same rule consumes a **maximal equality prefix**
+in key order and optionally the ordering comparisons on the next member. Each equality member may
+have several conjuncts, but all runtime values must encode to the same non-NULL key; disagreement,
+NULL, or an unrepresentable value is provably empty. Equality on every member produces the exact
+tuple point `[P, P]`. A proper equality prefix produces `[P, prefix-successor(P))`; comparisons on
+the next member tighten that interval using the concatenated `P || member-key` endpoint. `>` skips
+the complete endpoint subtree with `prefix-successor(P || member-key)`, and `<=` includes it by
+using that successor as the exclusive upper endpoint. This byte rule works identically for fixed-
+and variable-width/self-delimiting members and for Full collated text keys. The first member without
+an equality ends the prefix: its range may bind, but a later member cannot (no skip-scan).
+
 - **Which predicates bound.** Flatten the WHERE's top-level **AND-chain** (an `OR` is never
   descended — a disjunction is not one contiguous range) and collect every conjunct of the form
   `pk <cmp> const-source` (`=`, `<`, `<=`, `>`, `>=`; the primary key on either side; `BETWEEN`
@@ -340,7 +351,10 @@ deliberate, cost-visible optimization, gated by the `query.point_lookup` capabil
   and the result is unchanged. A no-PK relation is **not** bounded (it keeps the full-scan cost
   above). In a **JOIN** each base table is bounded *independently* by the WHERE conjuncts on **its
   own** primary key against such a const-source (`query.join_pushdown`, "/ JOIN" below); a
-  cross-relation `b.pk = a.x` is **not** bounded (a follow-on — see "/ JOIN").
+  cross-relation `b.pk = a.x` is **not** bounded by this once-materialized path (see the
+  per-outer-row index-nested-loop rule below). For a composite key, these tests apply member by
+  member in key order; a correlated or sibling source may participate in any consumed leading
+  member.
 - **`page_read` = the nodes the bound's key range intersects.** A scan visits the root, then
   descends only into a child subtree whose separator span can overlap the range — so a **point
   lookup** (`pk = c`) charges the root→leaf path (the tree height), and a **range** charges the
@@ -413,7 +427,7 @@ pins these costs cross-core.
 A **secondary index** ([indexes.md](indexes.md)) gives a second bound kind at the same
 per-relation pushdown seam. For each base relation of a **SELECT** scan (single-table, a JOIN
 base table, or a correlated subquery's inner table), and for an **UPDATE/DELETE target**, the plan
-picks the **single-column PK bound first** (it is the row's own key — no second tree, range-capable,
+picks the **PK tuple bound first** (it is the row's own key — no second tree, range-capable,
 strictly cheaper);
 else, among the relation's B-tree indexes, the **lowest lowercased name** one that yields a
 non-empty **access predicate** — a maximal **equality prefix** on the leading key columns

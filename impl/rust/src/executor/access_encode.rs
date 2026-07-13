@@ -282,16 +282,7 @@ pub(crate) fn detect_scan_bound_with_policy(
     if rel.is_attachment() {
         return None;
     }
-    if let Some(b) = rel.table.primary_key_index().and_then(|pk_local| {
-        // Ordered-equality pushdown is scalar-only; a non-scalar (range) PK skips it (point-lookup
-        // deferred for containers — ranges.md §10), falling through to a full scan + residual filter.
-        let sty = rel.table.columns[pk_local].ty.as_scalar()?;
-        // The PK column's key collation form (collation.md §8/§12): `Some(None)` = `C` (raw-byte
-        // key); `Some(Some(coll))` = collated AND `Full` (push via the sort key); `None` = collated
-        // but `Skewed` ⇒ refuse pushdown (full heap-scan recompute — the read-safety rule §12).
-        let coll = key_collation_ctx(catalog, &rel.table.columns[pk_local])?;
-        detect_pk_bound(filter, rel.offset + pk_local, sty, coll)
-    }) {
+    if let Some(b) = detect_pk_bound(&[filter], rel, None, catalog) {
         return Some(ScanBound::Pk(b));
     }
     if policy.ordered_index {
@@ -536,27 +527,23 @@ pub(crate) fn detect_inl_bound(
         }
         terms
     };
-    // Primary-key bound first (the row's own key — range-capable, strictly cheaper).
-    if let Some(b) = rel.table.primary_key_index().and_then(|pk_local| {
-        let sty = rel.table.columns[pk_local].ty.as_scalar()?;
-        let coll = key_collation_ctx(catalog, &rel.table.columns[pk_local])?;
-        let terms = collect(
-            rel.offset + pk_local,
-            sty,
-            coll.as_ref().map(|c| c.name.as_str()),
-        );
-        terms
-            .iter()
-            .any(|t| matches!(t.src, BoundSrc::Sibling(_)))
-            .then(|| {
-                ScanBound::Pk(PkBound {
-                    pk_type: sty,
-                    terms,
-                    coll,
-                })
-            })
-    }) {
-        return Some(b);
+    // Primary-key tuple bound first (the row's own key — range-capable, strictly cheaper).
+    let filters: Vec<&RExpr> = on.into_iter().chain(where_filter).collect();
+    if let Some(b) = detect_pk_bound(&filters, rel, cutoff, catalog) {
+        let has_sibling = b.eq_cols.iter().any(|ec| {
+            ec.srcs.iter().any(|s| matches!(s, BoundSrc::Sibling(_)))
+                || ec
+                    .ranges
+                    .iter()
+                    .any(|t| matches!(t.src, BoundSrc::Sibling(_)))
+        }) || b.range.as_ref().is_some_and(|r| {
+            r.terms
+                .iter()
+                .any(|t| matches!(t.src, BoundSrc::Sibling(_)))
+        });
+        if has_sibling {
+            return Some(ScanBound::Pk(b));
+        }
     }
     // Else a leading secondary-index equality bound to a sibling (indexes held in ascending
     // lowercased-name order — the deterministic tie-break, matching detect_scan_bound).
@@ -1886,34 +1873,72 @@ pub(crate) fn fk_probe(
     }
 }
 
-/// Flatten the WHERE's top-level AND-chain (an OR is never descended — a disjunction is not a
-/// contiguous range) and collect every `pk <cmp> const-source` conjunct. `None` ⇒ no usable bound
-/// (full scan). Conservative + sound: an unrecognized conjunct contributes no bound and stays in the
-/// residual filter.
+/// Construct a PK tuple's maximal equality prefix plus optional range on the next member. Each
+/// filter is walked as a top-level AND chain; ordinary scans pass WHERE, while INL passes ON+WHERE.
 pub(crate) fn detect_pk_bound(
-    filter: &RExpr,
-    pk_idx: usize,
-    pk_type: ScalarType,
-    coll: Option<std::sync::Arc<Collation>>,
+    filters: &[&RExpr],
+    rel: &ScopeRel,
+    sibling_cutoff: Option<usize>,
+    catalog: &Engine,
 ) -> Option<PkBound> {
-    let mut terms = Vec::new();
-    collect_bound_terms(
-        filter,
-        &KeyMatch::Column(pk_idx),
-        pk_type,
-        coll.as_ref().map(|c| c.name.as_str()),
-        None,
-        &mut terms,
-    );
-    if terms.is_empty() {
-        None
-    } else {
-        Some(PkBound {
-            pk_type,
-            terms,
-            coll,
-        })
+    let pk = rel.table.pk_indices();
+    if pk.is_empty() {
+        return None;
     }
+    let mut eq_cols = Vec::new();
+    let mut range = None;
+    for ci in &pk {
+        let Some(ty) = rel.table.columns[*ci].ty.as_scalar() else {
+            break;
+        };
+        let Some(coll) = key_collation_ctx(catalog, &rel.table.columns[*ci]) else {
+            break;
+        };
+        let mut terms = Vec::new();
+        for filter in filters {
+            collect_bound_terms(
+                filter,
+                &KeyMatch::Column(rel.offset + *ci),
+                ty,
+                coll.as_ref().map(|c| c.name.as_str()),
+                sibling_cutoff,
+                &mut terms,
+            );
+        }
+        let mut eqs = Vec::new();
+        let mut ranges = Vec::new();
+        for term in terms {
+            if matches!(term.op, CmpOp::Eq) {
+                eqs.push(term.src);
+            } else {
+                ranges.push(term);
+            }
+        }
+        if !eqs.is_empty() {
+            eq_cols.push(PkEqCol {
+                name: rel.table.columns[*ci].name.clone(),
+                col_type: ty,
+                srcs: eqs,
+                ranges,
+                coll,
+            });
+            continue;
+        }
+        if !ranges.is_empty() {
+            range = Some(PkRange {
+                name: rel.table.columns[*ci].name.clone(),
+                col_type: ty,
+                terms: ranges,
+                coll,
+            });
+        }
+        break;
+    }
+    (!eq_cols.is_empty() || range.is_some()).then(|| PkBound {
+        eq_cols,
+        range,
+        member_count: pk.len(),
+    })
 }
 
 /// `sibling_cutoff` (index-nested-loop join, cost.md §3 "JOIN"): when `Some(cut)`, a bare column
@@ -2251,40 +2276,119 @@ pub(crate) fn encode_key_set(
     keys
 }
 
-/// Build the concrete key range at exec time: encode each const-source and intersect the half-bounds.
-/// `outer` carries the enclosing rows (innermost last) so a correlated `Outer` source resolves to
-/// the current outer row's value; it is empty for a top-level statement. `left` is the current
-/// combined left-hand row of a left-deep join, from which an index-nested-loop `Sibling` source
-/// resolves (empty outside the join loop — a `Sibling` never appears there). `None` ⇒ the range
-/// admits no key (a NULL const/value — 3VL — or contradictory bounds), so the scan reads nothing. An
-/// out-of-range integer const drops only its own half-bound (a wider, still sound, scan).
+/// Build a PK tuple's concrete storage-key range. Equality members append bare encodings to P; a
+/// complete tuple is `[P,P]`, a proper prefix is `[P,prefix-successor(P))`, and a next-member range
+/// tightens that prefix interval.
 pub(crate) fn build_key_bound(
     bp: &PkBound,
     params: &[Value],
     outer: &[&[Value]],
     left: &[Value],
 ) -> Option<KeyBound> {
-    let mut b = KeyBound::unbounded();
-    for t in &bp.terms {
-        let key =
-            match encode_bound_key(bp.pk_type, &t.src, params, outer, bp.coll.as_deref(), left) {
+    let mut p = Vec::new();
+    for ec in &bp.eq_cols {
+        let mut agreed: Option<Vec<u8>> = None;
+        for src in &ec.srcs {
+            let key =
+                match encode_bound_key(ec.col_type, src, params, outer, ec.coll.as_deref(), left) {
+                    BoundKey::Null => return None,
+                    // Float bound encoding remains deferred. Preserve the old sound widening (and its
+                    // INL re-scan shape), retaining only an already-encoded tuple prefix.
+                    BoundKey::OutOfRange if ec.col_type.is_float() => {
+                        return Some(if p.is_empty() {
+                            KeyBound::unbounded()
+                        } else {
+                            KeyBound {
+                                lo: Some(p.clone()),
+                                lo_inc: true,
+                                hi: prefix_successor(&p),
+                                hi_inc: false,
+                            }
+                        });
+                    }
+                    BoundKey::OutOfRange => return None,
+                    BoundKey::Key(k) => k,
+                };
+            match &agreed {
+                None => agreed = Some(key),
+                Some(prev) if *prev == key => {}
+                Some(_) => return None,
+            }
+        }
+        for term in &ec.ranges {
+            let key = match encode_bound_key(
+                ec.col_type,
+                &term.src,
+                params,
+                outer,
+                ec.coll.as_deref(),
+                left,
+            ) {
                 BoundKey::Null => return None,
                 BoundKey::OutOfRange => continue,
                 BoundKey::Key(k) => k,
             };
-        match t.op {
-            CmpOp::Eq => {
-                intersect_lo(&mut b, &key, true);
-                intersect_hi(&mut b, &key, true);
+            let cmp = agreed
+                .as_ref()
+                .expect("PK equality member has a source")
+                .cmp(&key);
+            let false_term = match term.op {
+                CmpOp::Gt => !cmp.is_gt(),
+                CmpOp::Ge => cmp.is_lt(),
+                CmpOp::Lt => !cmp.is_lt(),
+                CmpOp::Le => cmp.is_gt(),
+                CmpOp::Eq | CmpOp::Ne => false,
+            };
+            if false_term {
+                return None;
             }
-            CmpOp::Gt => intersect_lo(&mut b, &key, false),
-            CmpOp::Ge => intersect_lo(&mut b, &key, true),
-            CmpOp::Lt => intersect_hi(&mut b, &key, false),
-            CmpOp::Le => intersect_hi(&mut b, &key, true),
-            // `<>` never becomes a bound term (filtered in `collect_bound_terms`), so it never
-            // reaches here; it contributes no half-bound regardless (sound — the residual filter
-            // re-applies the whole WHERE).
-            CmpOp::Ne => {}
+        }
+        p.extend_from_slice(&agreed.expect("PK equality member has a source"));
+    }
+    if bp.eq_cols.len() == bp.member_count {
+        return Some(KeyBound {
+            lo: Some(p.clone()),
+            lo_inc: true,
+            hi: Some(p),
+            hi_inc: true,
+        });
+    }
+    let mut b = KeyBound {
+        lo: (!p.is_empty()).then(|| p.clone()),
+        lo_inc: true,
+        hi: prefix_successor(&p),
+        hi_inc: false,
+    };
+    if let Some(rng) = &bp.range {
+        for t in &rng.terms {
+            let key = match encode_bound_key(
+                rng.col_type,
+                &t.src,
+                params,
+                outer,
+                rng.coll.as_deref(),
+                left,
+            ) {
+                BoundKey::Null => return None,
+                BoundKey::OutOfRange => continue,
+                BoundKey::Key(k) => k,
+            };
+            let mut endpoint = p.clone();
+            endpoint.extend_from_slice(&key);
+            match t.op {
+                CmpOp::Gt => match prefix_successor(&endpoint) {
+                    Some(next) => intersect_lo(&mut b, &next, true),
+                    None => return None,
+                },
+                CmpOp::Ge => intersect_lo(&mut b, &endpoint, true),
+                CmpOp::Lt => intersect_hi(&mut b, &endpoint, false),
+                CmpOp::Le => {
+                    if let Some(next) = prefix_successor(&endpoint) {
+                        intersect_hi(&mut b, &next, false);
+                    }
+                }
+                CmpOp::Eq | CmpOp::Ne => {}
+            }
         }
     }
     if bound_empty(&b) { None } else { Some(b) }

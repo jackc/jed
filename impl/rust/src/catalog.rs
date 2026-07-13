@@ -481,10 +481,8 @@ impl Table {
         self.pk.clone()
     }
 
-    /// The primary-key column's index iff the key is SINGLE-column. The PK pushdown
-    /// (point lookup / range bound) recognizes single-column keys only — a composite-PK
-    /// table full-scans this slice (spec/design/constraints.md §3) — so every pushdown
-    /// site routes through this accessor and stays sound by construction.
+    /// The primary-key column's index iff the key is SINGLE-column. Callers that genuinely require
+    /// one member (notably OR/IN point sets) use this helper; tuple bounds iterate `pk_indices`.
     pub fn primary_key_index(&self) -> Option<usize> {
         match self.pk_indices().as_slice() {
             [i] => Some(*i),
