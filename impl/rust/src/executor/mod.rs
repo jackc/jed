@@ -4374,6 +4374,12 @@ pub(crate) struct PhysicalPlan {
     /// Physical join position -> logical FROM ordinal. P7 sets `[0, 1]` or `[1, 0]` for eligible
     /// two-base INNER/CROSS joins; empty retains source order at barriers. Resolved slots never move.
     relation_order: Vec<usize>,
+    /// One entry per physical append step for P8's N-way all-base INNER/CROSS plan. The step owns
+    /// the authored ON trees that become dependency-complete there, in source order, plus an
+    /// optional deterministic hash operator. An INL step is identified by the appended relation's
+    /// `rel_inl_bounds` entry; otherwise no hash means nested loop. Empty retains the legacy join
+    /// tree (including every semantic barrier and P7's two-relation representation).
+    join_steps: Vec<PhysicalJoinStep>,
     /// Deterministic two-input hash operator. Builds the right input and probes the left using
     /// same-type bare-column equality keys in source order. `None` keeps nested loop.
     hash_join: Option<HashJoinPlan>,
@@ -4425,6 +4431,11 @@ pub(crate) struct PhysicalPlan {
 
 pub(crate) struct HashJoinPlan {
     keys: Vec<HashJoinKey>,
+}
+
+pub(crate) struct PhysicalJoinStep {
+    on_indices: Vec<usize>,
+    hash_join: Option<HashJoinPlan>,
 }
 
 pub(crate) struct HashJoinKey {

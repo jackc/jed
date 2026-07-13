@@ -29,6 +29,83 @@ pub(crate) fn combine_physical_relation_rows(
 }
 
 impl Engine {
+    pub(crate) fn exec_costed_nway_join(
+        &self,
+        plan: &SelectPlan,
+        env: &EvalEnv<'_>,
+        params: &[Value],
+        outer_stack: &[&[Value]],
+        materialized: &[Vec<Row>],
+        step_count: usize,
+        stmt_rng: &std::cell::Cell<crate::seam::StmtRng>,
+        meter: &mut Meter,
+    ) -> Result<Vec<Row>> {
+        let driver = plan.phys.relation_order[0];
+        let mut running: Vec<Row> = materialized[driver]
+            .iter()
+            .map(|row| place_physical_relation_row(plan, driver, row))
+            .collect();
+        for (position, step) in plan.phys.join_steps.iter().take(step_count).enumerate() {
+            let inner = plan.phys.relation_order[position + 1];
+            let inner_inl = plan.phys.rel_inl_bounds[inner].is_some();
+            let inner_rows = &materialized[inner];
+            let hash_table = step
+                .hash_join
+                .as_ref()
+                .map(|hash| {
+                    HashJoinTable::build(hash, plan.rels[inner].offset, 0, inner_rows, meter)
+                })
+                .transpose()?;
+            let mut next = Vec::new();
+            for left in &running {
+                let inl_rows;
+                let hash_rows;
+                let candidates = if inner_inl {
+                    inl_rows = self.materialize_rel(
+                        plan,
+                        inner,
+                        params,
+                        outer_stack,
+                        left,
+                        stmt_rng,
+                        env.ctes,
+                        meter,
+                    )?;
+                    &inl_rows
+                } else if let Some(table) = &hash_table {
+                    hash_rows = table
+                        .probe(step.hash_join.as_ref().expect("hash step"), left, meter)?
+                        .into_iter()
+                        .map(|index| inner_rows[index].clone())
+                        .collect();
+                    &hash_rows
+                } else {
+                    inner_rows
+                };
+                for right in candidates {
+                    let mut combined = left.clone();
+                    let offset = plan.rels[inner].offset;
+                    combined[offset..offset + right.len()].clone_from_slice(right);
+                    let mut keep = true;
+                    for &on_index in &step.on_indices {
+                        let Some(predicate) = plan.joins[on_index].on.as_ref() else {
+                            continue;
+                        };
+                        if !predicate.eval(&combined, env, meter)?.is_true() {
+                            keep = false;
+                            break;
+                        }
+                    }
+                    if keep {
+                        next.push(combined);
+                    }
+                }
+            }
+            running = next;
+        }
+        Ok(running)
+    }
+
     fn exec_costed_two_relation_join(
         &self,
         plan: &SelectPlan,
@@ -206,9 +283,13 @@ impl Engine {
         // sort is elided and the loop short-circuits a top-N.
         if plan.phys.join_pk_ordered {
             return Ok(Emitter::Final {
-                rows: self
-                    .exec_streaming_join(plan, &env, meter, params, outer, stmt_rng)?
-                    .rows,
+                rows: if plan.phys.join_steps.len() + 1 == plan.rels.len() && plan.rels.len() >= 3 {
+                    self.exec_streaming_nway_join(plan, &env, meter, params, outer, stmt_rng)?
+                        .rows
+                } else {
+                    self.exec_streaming_join(plan, &env, meter, params, outer, stmt_rng)?
+                        .rows
+                },
             });
         }
 
@@ -274,7 +355,21 @@ impl Engine {
         // A FROM-less SELECT has no relations: seed `running` with ONE virtual zero-column row
         // instead of a table's rows (grammar.md §34). No scan ran, so no scan cost accrued.
         let mut running: Vec<Row>;
-        if plan.phys.relation_order.len() == 2 {
+        if plan.phys.join_steps.len() + 1 == plan.rels.len()
+            && plan.phys.relation_order.len() == plan.rels.len()
+            && plan.rels.len() >= 3
+        {
+            running = self.exec_costed_nway_join(
+                plan,
+                &env,
+                params,
+                outer,
+                &materialized,
+                plan.phys.join_steps.len(),
+                stmt_rng,
+                meter,
+            )?;
+        } else if plan.phys.relation_order.len() == 2 {
             running = self.exec_costed_two_relation_join(
                 plan,
                 &env,

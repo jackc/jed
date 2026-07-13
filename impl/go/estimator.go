@@ -1193,6 +1193,9 @@ func joinEstimatedRows(kind joinKind, on *rExpr, physicalPairs, logicalPairs, pr
 }
 
 func (db *engine) estimateJoinTree(sp *selectPlan, n int, ctx *estimateCTECtx) estimatedPlan {
+	if len(sp.phys.relationOrder) == len(sp.rels) && len(sp.phys.joinSteps)+1 == len(sp.rels) {
+		return db.estimateNWayJoinTree(sp, n, ctx)
+	}
 	if n == 2 && len(sp.phys.relationOrder) == 2 {
 		return db.estimateTwoRelationJoin(sp, ctx)
 	}
@@ -1242,6 +1245,94 @@ func (db *engine) estimateJoinTree(sp *selectPlan, n int, ctx *estimateCTECtx) e
 	addPlanUnit(&root, estimatorUnitOperatorEval, satEstimateMul(estimatorOperatorNodes(join.on), invocations))
 	db.addExpressionSubqueries(&root, join.on, invocations, ctx)
 	return parentEstimatedPlan(root, left, right)
+}
+
+func (db *engine) estimateNWayJoinTree(sp *selectPlan, n int, ctx *estimateCTECtx) estimatedPlan {
+	if n == 1 {
+		return db.estimateRelation(sp, sp.phys.relationOrder[0], ctx)
+	}
+	outer := db.estimateNWayJoinTree(sp, n-1, ctx)
+	innerOrdinal := sp.phys.relationOrder[n-1]
+	innerPerCall := db.estimateRelation(sp, innerOrdinal, ctx)
+	boundByOuter := sp.phys.relINLBounds[innerOrdinal] != nil
+	fullPairs := satEstimateMul(outer.root.rows, innerPerCall.root.rows)
+	fullLogicalRows := satEstimateMul(outer.root.logicalRows, innerPerCall.root.logicalRows)
+	if boundByOuter {
+		fullLogicalRows = fullPairs
+	}
+	step := sp.phys.joinSteps[n-2]
+	fullRows := fullPairs
+	if !boundByOuter {
+		for _, onIndex := range step.onIndices {
+			fullRows = estimateSelectivity(predicateSelectivity(sp.joins[onIndex].on), fullRows)
+			fullLogicalRows = estimateSelectivity(predicateSelectivity(sp.joins[onIndex].on), fullLogicalRows)
+		}
+	}
+	outerCalls, deliveredRows := outer.root.rows, fullRows
+	if n == len(sp.rels) && sp.phys.joinPkOrdered && sp.limit != nil {
+		target := *sp.limit
+		if sp.offset != nil {
+			target = satEstimateAdd(target, *sp.offset)
+		}
+		postFilterRows := fullRows
+		if sp.filter != nil {
+			postFilterRows = estimateSelectivity(predicateSelectivity(sp.filter), fullRows)
+		}
+		switch {
+		case target == 0:
+			outerCalls, deliveredRows = 0, 0
+		case postFilterRows > target && fullRows > 0:
+			outerCalls = ceilEstimateMulDiv(target, outer.root.rows, postFilterRows)
+			if outerCalls > outer.root.rows {
+				outerCalls = outer.root.rows
+			}
+			deliveredRows = ceilEstimateMulDiv(outerCalls, fullRows, outer.root.rows)
+			if deliveredRows > fullRows {
+				deliveredRows = fullRows
+			}
+		}
+	}
+	inner := innerPerCall
+	visitedPairs := fullPairs
+	if boundByOuter {
+		inner.root = repeatPlanEstimate(inner.root, outerCalls)
+		for i := range inner.nodes {
+			inner.nodes[i] = repeatPlanEstimate(inner.nodes[i], outerCalls)
+		}
+		visitedPairs = inner.root.rows
+	} else if outerCalls < outer.root.rows {
+		visitedPairs = ceilEstimateMulDiv(outerCalls, fullPairs, outer.root.rows)
+	}
+	root := addPlanEstimates(outer.root, inner.root)
+	root.rows, root.logicalRows = deliveredRows, fullLogicalRows
+	invocations := visitedPairs
+	if step.hashJoin != nil {
+		keyBytes, framedBytes := int64(0), int64(0)
+		for _, key := range step.hashJoin.keys {
+			width := int64(defaultVariableKeyBytes)
+			if scalar, ok := key.ty.AsScalar(); ok && scalar.IsFixedWidth() {
+				width = int64(scalar.WidthBytes())
+			}
+			keyBytes = satEstimateAdd(keyBytes, width)
+			framedBytes = satEstimateAdd(framedBytes, satEstimateAdd(4, width))
+		}
+		addPlanUnit(&root, estimatorUnitHashBuild, satEstimateMul(innerPerCall.root.rows, keyBytes))
+		addPlanUnit(&root, estimatorUnitHashProbe, satEstimateAdd(satEstimateMul(outerCalls, keyBytes), satEstimateMul(deliveredRows, framedBytes)))
+		invocations = deliveredRows
+	}
+	onNodes := int64(0)
+	for _, onIndex := range step.onIndices {
+		onNodes = satEstimateAdd(onNodes, estimatorOperatorNodes(sp.joins[onIndex].on))
+	}
+	addPlanUnit(&root, estimatorUnitOperatorEval, satEstimateMul(onNodes, invocations))
+	for _, onIndex := range step.onIndices {
+		db.addExpressionSubqueries(&root, sp.joins[onIndex].on, invocations, ctx)
+	}
+	return parentEstimatedPlan(root, outer, inner)
+}
+
+func (db *engine) estimateJoinSearchPrefix(sp *selectPlan, relations int) planEstimate {
+	return db.estimateNWayJoinTree(sp, relations, nil).root
 }
 
 func (db *engine) estimateTwoRelationJoin(sp *selectPlan, ctx *estimateCTECtx) estimatedPlan {

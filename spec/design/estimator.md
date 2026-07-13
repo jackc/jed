@@ -10,9 +10,9 @@
 > landed.** P6a applies those estimates to the first staged access-path set described in §9.1;
 > P6b extends that single-relation choice to every access method and complete ordering/LIMIT
 > pipelines. P7 cost-selects two-base-relation INNER/CROSS orientation, access paths, and join
-> algorithm as described in §9.2. P8 in
-> [../../TODO-cost-plan-input.md](../../TODO-cost-plan-input.md) implement this contract as vertical
-> slices.
+> algorithm as described in §9.2. P8's N-way state contract and bounded search are specified in
+> §10; implementation status remains tracked in
+> [../../TODO-cost-plan-input.md](../../TODO-cost-plan-input.md).
 
 ## 1. Decision and scope
 
@@ -546,10 +546,76 @@ Only left-deep orders are in Path B. INNER/CROSS relations form reorderable isla
 LATERAL, correlation, and other dependency-bearing nodes are barriers. P7 introduces two-relation
 orientation; P8 generalizes the island search.
 
-For an island of at most `join_dp_limit = 8` relations, enumerate left-deep candidates by exhaustive
-dynamic programming over source-ordinal subsets. State keys, retained physical properties, and
-iteration order are fixed by the P8 spec; unordered containers may store states but may never decide
-enumeration or winners. Exact ties use §9.
+### 10.1 Islands and predicate ownership
+
+An eligible input is a non-lateral base table. SRFs, CTE scans, derived tables, correlated inputs,
+and every outer-join edge are hard fences. No relation or compound subtree moves across a fence.
+In the resolver's authored left-deep chain, the all-base INNER/CROSS prefix is the first island. After
+a fence, the fixed left prefix and the relation introduced by the fence remain in source order; a
+following run of two or more base relations introduced by INNER/CROSS edges is a new reorderable
+island appended to that fixed prefix. This is deliberately narrower than treating an outer-join
+subtree as an atomic input that may move through a higher INNER join.
+
+Each authored `ON` expression remains one intact eager expression tree. Its dependency set is the
+union of:
+
+- the original right-side/source-owner relation of that join; and
+- every local base relation referenced by the expression.
+
+Within an island, evaluate that complete tree at the earliest physical join step whose joined subset
+contains the dependency set. If several trees become ready at one step, evaluate them by authored
+join ordinal. Never split an `AND` tree merely to schedule or estimate it earlier: splitting would
+change eager evaluation, errors, and `operator_eval` cost. A barrier step evaluates its own `ON` in
+the authored position. The selected physical order defines deterministic error visitation, as in P7.
+
+An INL bound for the newly appended relation may use a sibling column from any relation already in
+the physical left prefix. A hash alternative may use equality keys from any newly-ready `ON` tree
+between that prefix and the appended relation. Hash remains legal only when the *complete* newly-ready
+set passes the existing non-trapping safe-conjunct gate; every newly-ready tree remains an
+authoritative residual recheck in authored order.
+
+### 10.2 Partial state and exhaustive DP
+
+For an island of at most `join_dp_limit = 8` movable base relations, enumerate left-deep candidates
+by dynamic programming over source-ordinal subsets. A partial state contains:
+
+```
+JoinState {
+    subset                 # source-ordinal bit set within the island
+    relation_sequence      # physical prefix, source ordinals
+    per_relation_access    # ordinary bound or the appended relation's INL bound
+    per_step_algorithm     # INL, hash, or nested loop plus newly-ready ON ordinals
+    estimate               # cumulative units, physical rows, logical rows
+    satisfies_query_order  # requested forward driver-PK order, or false
+}
+```
+
+The order property is query-specific rather than a catalog of every possible interesting order.
+It is true only when the physical driver uses the storage-key form accepted by the existing
+join-PK-order gate and the complete left-deep prefix preserves that order. Nested loop, INL, and the
+deterministic probe-outer hash operator preserve their left input's order.
+
+Access paths can produce different physical row estimates, so retaining only the cheapest state per
+subset is not exhaustive under jed's estimator: a more expensive but smaller prefix can make every
+later repeated seek or probe cheaper. For each `(subset, satisfies_query_order)` bucket, retain the
+deterministic Pareto frontier over:
+
+```
+(cumulative est_cost, physical rows, logical rows)
+```
+
+State A dominates B only when all three values are `<=` and at least one is `<`. For identical
+physical/logical rows, retain only the lower-cost state; for an exact triple tie retain §9's
+canonical structural winner. Future left-deep extensions are monotone in all three dimensions, so a
+dominated state cannot become a winner. Saturation does not weaken that property.
+
+Enumeration is independent of maps: process subset cardinality ascending, subset masks numerically
+ascending, retained states in §9 structural order, not-yet-joined source ordinals ascending, access
+identities in canonical access order, and algorithms in canonical algorithm order. Implementations
+may use a map for lookup only; they sort before every decision. A completed state's final comparison
+uses the complete SELECT pipeline, including the final ordering/LIMIT rule, then §9.
+
+### 10.3 Larger islands
 
 For a larger island:
 
@@ -561,6 +627,24 @@ For a larger island:
 This deterministic cheapest-next fallback is polynomial and uses no random/GEQO path. Eight follows
 PostgreSQL's default join-collapse boundary; the overriding reason for not adopting GEQO beyond it
 is cross-core identity and reproducibility.
+
+For a post-fence island, the already-fixed prefix is the driver state and step 1 is omitted. Greedy
+selection retains one state, not a frontier. Every round inventories remaining source ordinals,
+access identities, and algorithms in the same order as §10.2 and retains the first minimum under
+§9. Planning exposes no counter or timing-dependent early exit.
+
+### 10.4 Final ordering and LIMIT
+
+After an island winner is installed, recompute ORDER BY satisfaction against the complete physical
+tree. The initial N-way ordered-LIMIT executor fully materializes the selected left subtree and
+streams only the final join step. Therefore the estimator retains every earlier scan/join unit and
+applies §8.2's uniform prefix formula only to the final step's outer-prefix visits, hash probes and
+bucket verification, or repeated INL inner work. Ordinary base scans and a final hash build remain
+complete. This is the direct N-way extension of P7 and deliberately does not claim a fully streaming
+recursive join tree; such an executor would require a broader per-level discount model.
+
+Join-PK order is ineligible across a semantic fence. Without an eligible ordered LIMIT, the complete
+tree retains the blocking Sort; its unmetered bookkeeping still adds no private planner weight.
 
 ## 11. EXPLAIN contract
 

@@ -2900,6 +2900,12 @@ export class Engine {
   }
 
   private estimateJoinTree(sp: SelectPlan, n: number, ctx: EstimateCteContext | null): EstimatedPlan {
+    if (
+      sp.phys.relationOrder.length === sp.rels.length &&
+      sp.phys.joinSteps.length + 1 === sp.rels.length
+    ) {
+      return this.estimateNWayJoinTree(sp, n, ctx);
+    }
     if (n === 2 && sp.phys.relationOrder.length === 2) {
       return this.estimateTwoRelationJoin(sp, ctx);
     }
@@ -2954,6 +2960,119 @@ export class Engine {
     addPlanUnit(root, UNIT_OPERATOR_EVAL, saturatingEstimateMultiply(estimatorOperatorNodes(join.on), invocations));
     this.addExpressionSubqueries(root, join.on, invocations, ctx);
     return parentEstimatedPlan(root, left, right);
+  }
+
+  // P8 estimate in selected physical order. Each authored ON tree is charged exactly once, at the
+  // first step where its original right owner and every referenced relation are present. Ordered
+  // LIMIT can discount only the final step; its selected left subtree stays fully materialized.
+  private estimateNWayJoinTree(
+    sp: SelectPlan,
+    n: number,
+    ctx: EstimateCteContext | null,
+  ): EstimatedPlan {
+    if (n === 1) return this.estimateRelation(sp, sp.phys.relationOrder[0]!, ctx);
+    const outer = this.estimateNWayJoinTree(sp, n - 1, ctx);
+    const innerOrdinal = sp.phys.relationOrder[n - 1]!;
+    const innerPerCall = this.estimateRelation(sp, innerOrdinal, ctx);
+    const boundByOuter = sp.phys.relINLBounds[innerOrdinal] !== null;
+    const fullPairs = saturatingEstimateMultiply(outer.root.rows, innerPerCall.root.rows);
+    let fullLogicalRows = saturatingEstimateMultiply(
+      outer.root.logicalRows,
+      innerPerCall.root.logicalRows,
+    );
+    if (boundByOuter) fullLogicalRows = fullPairs;
+    const step = sp.phys.joinSteps[n - 2]!;
+    let fullRows = fullPairs;
+    if (!boundByOuter) {
+      for (const onIndex of step.onIndices) {
+        const selectivity = estimatorPredicateSelectivity(sp.joins[onIndex]!.on);
+        fullRows = estimateSelectivity(selectivity, fullRows);
+        fullLogicalRows = estimateSelectivity(selectivity, fullLogicalRows);
+      }
+    }
+
+    let outerCalls = outer.root.rows;
+    let deliveredRows = fullRows;
+    if (n === sp.rels.length && sp.phys.joinPkOrdered && sp.limit !== null) {
+      const target = saturatingEstimateAdd(sp.limit, sp.offset ?? 0n);
+      const postFilterRows =
+        sp.filter === null
+          ? fullRows
+          : estimateSelectivity(estimatorPredicateSelectivity(sp.filter), fullRows);
+      if (target === 0n) {
+        outerCalls = 0n;
+        deliveredRows = 0n;
+      } else if (postFilterRows > target && fullRows > 0n) {
+        outerCalls = ceilEstimateMultiplyDivide(target, outer.root.rows, postFilterRows);
+        if (outerCalls > outer.root.rows) outerCalls = outer.root.rows;
+        deliveredRows = ceilEstimateMultiplyDivide(outerCalls, fullRows, outer.root.rows);
+        if (deliveredRows > fullRows) deliveredRows = fullRows;
+      }
+    }
+
+    let inner = innerPerCall;
+    let visitedPairs = fullPairs;
+    if (boundByOuter) {
+      inner = {
+        root: repeatPlanEstimate(inner.root, outerCalls),
+        nodes: inner.nodes.map((node) => repeatPlanEstimate(node, outerCalls)),
+      };
+      visitedPairs = inner.root.rows;
+    } else if (outerCalls < outer.root.rows) {
+      visitedPairs = ceilEstimateMultiplyDivide(outerCalls, fullPairs, outer.root.rows);
+    }
+
+    const root = addPlanEstimates(outer.root, inner.root);
+    root.rows = deliveredRows;
+    root.logicalRows = fullLogicalRows;
+    let invocations = visitedPairs;
+    if (step.hashJoin !== null) {
+      let keyBytes = 0n;
+      let framedBytes = 0n;
+      for (const key of step.hashJoin.keys) {
+        const scalar = typeAsScalar(key.type);
+        const width =
+          scalar !== undefined && isFixedWidth(scalar)
+            ? BigInt(widthBytes(scalar))
+            : DEFAULT_VARIABLE_KEY_BYTES;
+        keyBytes = saturatingEstimateAdd(keyBytes, width);
+        framedBytes = saturatingEstimateAdd(framedBytes, saturatingEstimateAdd(4n, width));
+      }
+      addPlanUnit(
+        root,
+        UNIT_HASH_BUILD,
+        saturatingEstimateMultiply(innerPerCall.root.rows, keyBytes),
+      );
+      addPlanUnit(
+        root,
+        UNIT_HASH_PROBE,
+        saturatingEstimateAdd(
+          saturatingEstimateMultiply(outerCalls, keyBytes),
+          saturatingEstimateMultiply(deliveredRows, framedBytes),
+        ),
+      );
+      invocations = deliveredRows;
+    }
+    let onNodes = 0n;
+    for (const onIndex of step.onIndices) {
+      onNodes = saturatingEstimateAdd(
+        onNodes,
+        estimatorOperatorNodes(sp.joins[onIndex]!.on),
+      );
+    }
+    addPlanUnit(root, UNIT_OPERATOR_EVAL, saturatingEstimateMultiply(onNodes, invocations));
+    for (const onIndex of step.onIndices) {
+      this.addExpressionSubqueries(root, sp.joins[onIndex]!.on, invocations, ctx);
+    }
+    return parentEstimatedPlan(root, outer, inner);
+  }
+
+  estimateJoinSearchPrefix(
+    sp: SelectPlan,
+    relations: number,
+  ): { cost: bigint; rows: bigint; logicalRows: bigint } {
+    const root = this.estimateNWayJoinTree(sp, relations, null).root;
+    return { cost: planEstimateCost(root), rows: root.rows, logicalRows: root.logicalRows };
   }
 
   // P7 estimate in selected physical order. A join top-N caps only outer-driven work that the
@@ -3558,6 +3677,14 @@ export class Engine {
     depth: number,
     note: string,
   ): void {
+    if (
+      sp.phys.relationOrder.length === sp.rels.length &&
+      sp.phys.joinSteps.length + 1 === sp.rels.length &&
+      sp.rels.length >= 3
+    ) {
+      this.renderNWayJoinTree(r, sp, n, depth, note);
+      return;
+    }
     if (n === 1) {
       this.renderRelLeaf(r, sp, 0, depth, note);
       return;
@@ -3575,6 +3702,38 @@ export class Engine {
     }
     this.renderJoinTree(r, sp, n - 1, depth + 1, "");
     this.renderRelLeaf(r, sp, n - 1, depth + 1, "");
+  }
+
+  private renderNWayJoinTree(
+    r: ExplainRender,
+    sp: SelectPlan,
+    n: number,
+    depth: number,
+    note: string,
+  ): void {
+    if (n === 1) {
+      this.renderRelLeaf(r, sp, sp.phys.relationOrder[0]!, depth, note);
+      return;
+    }
+    const step = sp.phys.joinSteps[n - 2]!;
+    const conjuncts = step.onIndices.reduce((total, index) => {
+      const on = sp.joins[index]!.on;
+      return total + (on === null ? 0 : conjunctCount(on));
+    }, 0);
+    const kind = step.onIndices.length === 0 ? "cross" : "inner";
+    let detail = kind;
+    if (step.onIndices.length === 1) detail = `${kind}; on:conjuncts=${conjuncts}`;
+    else if (step.onIndices.length > 1)
+      detail = `${kind}; on:predicates=${step.onIndices.length},conjuncts=${conjuncts}`;
+    if (step.hashJoin !== null) {
+      detail =
+        step.onIndices.length === 1
+          ? `${kind}; keys=${step.hashJoin.keys.length}; on:conjuncts=${conjuncts}`
+          : `${kind}; keys=${step.hashJoin.keys.length}; on:predicates=${step.onIndices.length},conjuncts=${conjuncts}`;
+    }
+    r.emit(depth, step.hashJoin === null ? "Nested Loop" : "Hash Join", withNote(detail, note));
+    this.renderNWayJoinTree(r, sp, n - 1, depth + 1, "");
+    this.renderRelLeaf(r, sp, sp.phys.relationOrder[n - 1]!, depth + 1, "");
   }
 
   // renderRelLeaf emits one relation: a base-table Scan (with its access path), an SRF, a CTE Scan, or a
@@ -11123,6 +11282,7 @@ export class Engine {
       relMasks: [],
       phys: {
         hashJoin: null,
+        joinSteps: [],
         relationOrder: [],
         pkOrdered: false,
         pkReverse: false,
@@ -12986,6 +13146,84 @@ export class Engine {
     };
   }
 
+  // P8 ordered LIMIT: every selected prefix step is completed first, then only the final join
+  // step streams and short-circuits. This preserves the chosen left subtree's full materialization
+  // and makes the estimator's final-step-only discount match execution.
+  private execStreamingNWayJoin(
+    plan: SelectPlan,
+    env: EvalEnv,
+    meter: Meter,
+    params: Value[],
+    outer: Row[],
+  ): SelectResult {
+    const materialized: Row[][] = plan.rels.map((rel, ordinal) =>
+      rel.lateral || plan.phys.relINLBounds[ordinal] !== null
+        ? []
+        : this.materializeRel(plan, ordinal, outer, [], env, params, meter),
+    );
+    const finalPosition = plan.rels.length - 1;
+    const running = this.execCostedNWayJoin(
+      plan,
+      env,
+      meter,
+      params,
+      materialized,
+      finalPosition - 1,
+    );
+    const inner = plan.phys.relationOrder[finalPosition]!;
+    const step = plan.phys.joinSteps[finalPosition - 1]!;
+    const innerRows = materialized[inner]!;
+    const innerINL = plan.phys.relINLBounds[inner] !== null;
+    const hashTable =
+      step.hashJoin === null
+        ? null
+        : new HashJoinTable(step.hashJoin, plan.rels[inner]!.offset, 0, innerRows, meter);
+
+    const limit = plan.limit;
+    const offset = plan.offset ?? 0n;
+    let passed = 0n;
+    const rows: Value[][] = [];
+    if (limit !== 0n) {
+      // biome-ignore lint/suspicious/noLabelVar: `outerRows` labels the final nested-loop exit.
+      outerRows: for (const left of running) {
+        let candidates = innerRows;
+        if (innerINL) {
+          candidates = this.materializeRel(plan, inner, outer, left, env, params, meter);
+        } else if (hashTable !== null) {
+          candidates = hashTable
+            .probe(step.hashJoin!, left, meter)
+            .map((index) => innerRows[index]!);
+        }
+        for (const right of candidates) {
+          const combined = left.slice();
+          combined.splice(plan.rels[inner]!.offset, right.length, ...right);
+          let keep = true;
+          for (const onIndex of step.onIndices) {
+            const on = plan.joins[onIndex]!.on;
+            if (on !== null && !isTrue(evalExpr(on, combined, env, meter))) {
+              keep = false;
+              break;
+            }
+          }
+          if (!keep) continue;
+          if (plan.filter !== null && !isTrue(evalExpr(plan.filter, combined, env, meter))) continue;
+          passed++;
+          if (passed <= offset) continue;
+          meter.guard();
+          meter.charge(COSTS.rowProduced);
+          rows.push(plan.projections.map((projection) => evalExpr(projection, combined, env, meter)));
+          if (limit !== null && BigInt(rows.length) >= limit) break outerRows;
+        }
+      }
+    }
+    return {
+      columnNames: plan.columnNames,
+      columnTypes: plan.columnTypes,
+      rows,
+      cost: meter.accrued,
+    };
+  }
+
   // Whether a file-backed all-C scan's K fixed-width rows fit the cross-core logical top-k
   // work_mem estimate (8 bytes per row + 40 per value). In-memory / unlimited handles always use
   // top-k. Untouched slots are nulled in the retained copy; a touched variable/open type has no
@@ -13120,9 +13358,31 @@ export class Engine {
     // and resolves its sibling source from the current left row (cost.md §3 "JOIN"); else the
     // once-materialized relBounds.
     const inl = plan.phys.relINLBounds[ri] !== null;
-    const siblingRange = inl
-      ? relationColumnRange(plan, physicalRelOrdinal(plan, 0))
-      : null;
+    let inlFilters: RExpr[] = [];
+    let siblingRange: ColumnRange = null;
+    if (
+      inl &&
+      plan.phys.joinSteps.length + 1 === plan.rels.length &&
+      plan.phys.relationOrder.length === plan.rels.length
+    ) {
+      const position = plan.phys.relationOrder.indexOf(ri);
+      if (position <= 0) throw new Error("an N-way INL relation follows its physical outer");
+      inlFilters = plan.phys.joinSteps[position - 1]!.onIndices.flatMap((index) => {
+        const on = plan.joins[index]!.on;
+        return on === null ? [] : [on];
+      });
+      siblingRange = plan.phys.relationOrder
+        .slice(0, position)
+        .flatMap((ordinal) => relationColumnRange(plan, ordinal));
+    } else if (inl && plan.phys.relationOrder.length === 2) {
+      const on = plan.joins[0]!.on;
+      if (on !== null) inlFilters = [on];
+      siblingRange = relationColumnRange(plan, physicalRelOrdinal(plan, 0));
+    } else if (inl) {
+      const on = plan.joins[ri - 1]!.on;
+      if (on !== null) inlFilters = [on];
+      siblingRange = [{ start: 0, end: rel.offset }];
+    }
     const relBound = plan.phys.relINLBounds[ri] ?? plan.phys.relBounds[ri]!;
     if (relBound !== null && relBound.kind === "index") {
       const r = this.indexBoundRows(
@@ -13139,7 +13399,7 @@ export class Engine {
     } else if (relBound !== null && relBound.kind === "gin") {
       let m: { strategy: GinStrategy; query: RExpr } | null = null;
       if (inl) {
-        for (const filter of [plan.joins[ri - 1]!.on, plan.filter]) {
+        for (const filter of [...inlFilters, plan.filter]) {
           if (filter === null) continue;
           m = ginSiblingMatch(filter, relBound.gin.colGlobal, siblingRange);
           if (m !== null) break;
@@ -13163,7 +13423,7 @@ export class Engine {
     } else if (relBound !== null && relBound.kind === "gist") {
       let q: RExpr | null = null;
       if (inl) {
-        for (const filter of [plan.joins[ri - 1]!.on, plan.filter]) {
+        for (const filter of [...inlFilters, plan.filter]) {
           if (filter === null) continue;
           q =
             relBound.gist.strategy === "equal"
@@ -13679,6 +13939,64 @@ export class Engine {
     return out;
   }
 
+  private execCostedNWayJoin(
+    plan: SelectPlan,
+    env: EvalEnv,
+    meter: Meter,
+    params: Value[],
+    materialized: Row[][],
+    stepCount: number,
+  ): Row[] {
+    const driver = plan.phys.relationOrder[0]!;
+    let running = materialized[driver]!.map((row) =>
+      placePhysicalRelationRow(plan, driver, row),
+    );
+    for (let position = 0; position < stepCount; position++) {
+      const step = plan.phys.joinSteps[position]!;
+      const inner = plan.phys.relationOrder[position + 1]!;
+      const innerRows = materialized[inner]!;
+      const innerINL = plan.phys.relINLBounds[inner] !== null;
+      const hashTable =
+        step.hashJoin === null
+          ? null
+          : new HashJoinTable(step.hashJoin, plan.rels[inner]!.offset, 0, innerRows, meter);
+      const next: Row[] = [];
+      for (const left of running) {
+        let candidates = innerRows;
+        if (innerINL) {
+          candidates = this.materializeRel(
+            plan,
+            inner,
+            env.outer,
+            left,
+            env,
+            params,
+            meter,
+          );
+        } else if (hashTable !== null) {
+          candidates = hashTable
+            .probe(step.hashJoin!, left, meter)
+            .map((index) => innerRows[index]!);
+        }
+        for (const right of candidates) {
+          const combined = left.slice();
+          combined.splice(plan.rels[inner]!.offset, right.length, ...right);
+          let keep = true;
+          for (const onIndex of step.onIndices) {
+            const on = plan.joins[onIndex]!.on;
+            if (on !== null && !isTrue(evalExpr(on, combined, env, meter))) {
+              keep = false;
+              break;
+            }
+          }
+          if (keep) next.push(combined);
+        }
+      }
+      running = next;
+    }
+    return running;
+  }
+
   // execSelectEmit runs a SelectPlan's blocking part and returns an Emitter describing how to emit its
   // output rows (spec/design/streaming.md §4, S4): the scan / join / WHERE / window / ORDER BY / GROUP
   // BY / DISTINCT all run here (charging their cost into meter), producing either a windowed buffer
@@ -13748,7 +14066,11 @@ export class Engine {
     // join drives/probes the outer in PK order so the output is already ordered — the sort is elided
     // and the loop short-circuits a top-N.
     if (plan.phys.joinPkOrdered) {
-      return finalEmitter(this.execStreamingJoin(plan, env, meter, params, env.outer).rows);
+      const result =
+        plan.phys.joinSteps.length + 1 === plan.rels.length && plan.rels.length >= 3
+          ? this.execStreamingNWayJoin(plan, env, meter, params, env.outer)
+          : this.execStreamingJoin(plan, env, meter, params, env.outer);
+      return finalEmitter(result.rows);
     }
 
     // Windowed top-N (spec/design/window.md §5.2, cost.md §3): a plain window query whose LIMIT is
@@ -13799,7 +14121,20 @@ export class Engine {
     // A FROM-less SELECT has no relations: seed `running` with ONE virtual zero-column row
     // instead of a table's rows (grammar.md §34). No scan ran, so no scan cost accrued.
     let running: Row[];
-    if (plan.phys.relationOrder.length === 2) {
+    if (
+      plan.phys.joinSteps.length + 1 === plan.rels.length &&
+      plan.phys.relationOrder.length === plan.rels.length &&
+      plan.rels.length >= 3
+    ) {
+      running = this.execCostedNWayJoin(
+        plan,
+        env,
+        meter,
+        params,
+        materialized,
+        plan.phys.joinSteps.length,
+      );
+    } else if (plan.phys.relationOrder.length === 2) {
       running = this.execCostedTwoRelationJoin(plan, env, meter, params, materialized);
     } else {
       running = plan.rels.length === 0 ? [[]] : materialized[0]!;
@@ -15712,7 +16047,13 @@ export function detectINLBound(
   rel: ScopeRel,
   snap: Snapshot,
 ): ScanBound | null {
-  return inventoryINLCandidates(on, whereFilter, rel, { start: 0, end: rel.offset }, snap)[0]?.bound ?? null;
+  return inventoryINLCandidates(
+    on,
+    whereFilter,
+    rel,
+    [{ start: 0, end: rel.offset }],
+    snap,
+  )[0]?.bound ?? null;
 }
 
 // inventoryINLCandidates enumerates every legal sibling-dependent inner access path in canonical
@@ -17358,10 +17699,10 @@ export type BoundTerm = { op: BinaryOp; src: RExpr };
 
 // The global logical-slot interval whose bare columns are stable for one physical outer row.
 // null closes the sibling-bound door for an ordinary once-materialized scan.
-export type ColumnRange = { start: number; end: number } | null;
+export type ColumnRange = { start: number; end: number }[] | null;
 
 function columnRangeContains(range: ColumnRange, index: number): boolean {
-  return range !== null && index >= range.start && index < range.end;
+  return range !== null && range.some((span) => index >= span.start && index < span.end);
 }
 
 export type PkEqCol = {
@@ -20595,6 +20936,10 @@ export type PhysicalPlan = {
   // Deterministic two-input hash operator. Builds the right input and probes the left using
   // same-type bare-column equality keys in source order. null keeps nested loop.
   hashJoin: HashJoinPlan | null;
+  // P8's selected left-deep N-way join steps. Each step owns the authored ON trees that become
+  // ready when its right input is added, and optionally a deterministic hash operator for them.
+  // Empty preserves the legacy source-order/P7 executor paths.
+  joinSteps: PhysicalJoinStep[];
   // pkOrdered reports that ORDER BY is satisfied by the single base relation's PRIMARY-KEY scan
   // order — the table tree already yields rows in this order, so the sort is elided (and with a
   // LIMIT the scan short-circuits a top-N). True iff the query is a single-table, non-aggregate,
@@ -20646,7 +20991,7 @@ export function physicalRelOrdinal(plan: SelectPlan, position: number): number {
 
 export function relationColumnRange(plan: SelectPlan, ordinal: number): Exclude<ColumnRange, null> {
   const rel = plan.rels[ordinal]!;
-  return { start: rel.offset, end: rel.offset + rel.colCount };
+  return [{ start: rel.offset, end: rel.offset + rel.colCount }];
 }
 
 function logicalJoinRowWidth(plan: SelectPlan): number {
@@ -20674,6 +21019,7 @@ function combinePhysicalRelationRows(
 
 export type HashJoinPlan = { keys: HashJoinKey[] };
 export type HashJoinKey = { left: number; right: number; type: Type };
+export type PhysicalJoinStep = { onIndices: number[]; hashJoin: HashJoinPlan | null };
 
 // SetOpPlan is a resolved set operation: both operands planned with the same parent scope, the
 // unified output types, and the trailing ORDER BY / LIMIT / OFFSET resolved by output column.

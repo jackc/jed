@@ -1423,6 +1423,127 @@ impl Engine {
         })
     }
 
+    /// P8 N-way join top-N. The selected left subtree is fully materialized in driver-PK order;
+    /// only the final append step streams and stops after the OFFSET/LIMIT window fills.
+    pub(crate) fn exec_streaming_nway_join(
+        &self,
+        plan: &SelectPlan,
+        env: &EvalEnv,
+        meter: &mut Meter,
+        params: &[Value],
+        outer: &[&[Value]],
+        stmt_rng: &std::cell::Cell<crate::seam::StmtRng>,
+    ) -> Result<SelectResult> {
+        let mut materialized = Vec::with_capacity(plan.rels.len());
+        for (ordinal, rel) in plan.rels.iter().enumerate() {
+            if rel.lateral || plan.phys.rel_inl_bounds[ordinal].is_some() {
+                materialized.push(Vec::new());
+            } else {
+                materialized.push(self.materialize_rel(
+                    plan,
+                    ordinal,
+                    params,
+                    outer,
+                    &[],
+                    stmt_rng,
+                    env.ctes,
+                    meter,
+                )?);
+            }
+        }
+        let final_position = plan.rels.len() - 1;
+        let running = self.exec_costed_nway_join(
+            plan,
+            env,
+            params,
+            outer,
+            &materialized,
+            final_position - 1,
+            stmt_rng,
+            meter,
+        )?;
+        let inner = plan.phys.relation_order[final_position];
+        let step = &plan.phys.join_steps[final_position - 1];
+        let inner_inl = plan.phys.rel_inl_bounds[inner].is_some();
+        let inner_rows = &materialized[inner];
+        let hash_table = step
+            .hash_join
+            .as_ref()
+            .map(|hash| HashJoinTable::build(hash, plan.rels[inner].offset, 0, inner_rows, meter))
+            .transpose()?;
+
+        let limit = plan.limit;
+        let offset = plan.offset.unwrap_or(0);
+        let mut passed = 0i64;
+        let mut rows = Vec::new();
+        if limit != Some(0) {
+            'outer: for left in &running {
+                let inl_rows;
+                let hash_rows;
+                let candidates = if inner_inl {
+                    inl_rows = self.materialize_rel(
+                        plan, inner, params, outer, left, stmt_rng, env.ctes, meter,
+                    )?;
+                    &inl_rows
+                } else if let Some(table) = &hash_table {
+                    hash_rows = table
+                        .probe(step.hash_join.as_ref().expect("hash step"), left, meter)?
+                        .into_iter()
+                        .map(|index| inner_rows[index].clone())
+                        .collect();
+                    &hash_rows
+                } else {
+                    inner_rows
+                };
+                for right in candidates {
+                    let mut combined = left.clone();
+                    let inner_offset = plan.rels[inner].offset;
+                    combined[inner_offset..inner_offset + right.len()].clone_from_slice(right);
+                    let mut keep = true;
+                    for &on_index in &step.on_indices {
+                        let Some(predicate) = plan.joins[on_index].on.as_ref() else {
+                            continue;
+                        };
+                        if !predicate.eval(&combined, env, meter)?.is_true() {
+                            keep = false;
+                            break;
+                        }
+                    }
+                    if !keep {
+                        continue;
+                    }
+                    let pass = match &plan.filter {
+                        Some(filter) => filter.eval(&combined, env, meter)?.is_true(),
+                        None => true,
+                    };
+                    if !pass {
+                        continue;
+                    }
+                    passed += 1;
+                    if passed <= offset {
+                        continue;
+                    }
+                    meter.guard()?;
+                    meter.charge(COSTS.row_produced);
+                    let mut projected = Vec::with_capacity(plan.projections.len());
+                    for projection in &plan.projections {
+                        projected.push(projection.eval(&combined, env, meter)?);
+                    }
+                    rows.push(projected);
+                    if limit.is_some_and(|limit| rows.len() as i64 >= limit) {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        Ok(SelectResult {
+            column_names: plan.column_names.clone(),
+            column_types: plan.column_types.clone(),
+            rows,
+            cost: meter.accrued,
+        })
+    }
+
     /// Build a [`Sorter`](crate::spill::Sorter) for `order`, bounded by this handle's `work_mem`.
     /// Spilling is enabled only when the host supplied scratch backing. The Node/file host uses the
     /// OS temp directory, independently of the database path, so read-only filesystems remain
@@ -1526,17 +1647,43 @@ impl Engine {
         let bound = plan.phys.rel_inl_bounds[ri]
             .as_ref()
             .or(plan.phys.rel_bounds[ri].as_ref());
-        let (inl_on, sibling_columns) = if inl && plan.phys.relation_order.len() == 2 {
+        let (inl_filters, sibling_columns): (Vec<&RExpr>, Vec<(usize, usize)>) = if inl
+            && plan.phys.join_steps.len() + 1 == plan.rels.len()
+            && plan.phys.relation_order.len() == plan.rels.len()
+        {
+            let position = plan
+                .phys
+                .relation_order
+                .iter()
+                .position(|ordinal| *ordinal == ri)
+                .expect("an N-way INL relation is in physical order");
+            let filters = plan.phys.join_steps[position - 1]
+                .on_indices
+                .iter()
+                .filter_map(|index| plan.joins[*index].on.as_ref())
+                .collect();
+            let ranges = plan.phys.relation_order[..position]
+                .iter()
+                .map(|ordinal| {
+                    let outer_rel = &plan.rels[*ordinal];
+                    (outer_rel.offset, outer_rel.offset + outer_rel.col_count)
+                })
+                .collect();
+            (filters, ranges)
+        } else if inl && plan.phys.relation_order.len() == 2 {
             let outer_ordinal = super::optimize::physical_rel_ordinal(plan, 0);
             let outer_rel = &plan.rels[outer_ordinal];
             (
-                plan.joins[0].on.as_ref(),
-                (outer_rel.offset, outer_rel.offset + outer_rel.col_count),
+                plan.joins[0].on.iter().collect(),
+                vec![(outer_rel.offset, outer_rel.offset + outer_rel.col_count)],
             )
         } else if inl {
-            (plan.joins[ri - 1].on.as_ref(), (0, rel.offset))
+            (
+                plan.joins[ri - 1].on.iter().collect(),
+                vec![(0, rel.offset)],
+            )
         } else {
-            (None, (0, 0))
+            (Vec::new(), Vec::new())
         };
         let (mut rows, (node_count, slabs)) = match bound {
             Some(ScanBound::Pk(bp)) => match build_key_bound(bp, params, outer, left) {
@@ -1561,11 +1708,12 @@ impl Engine {
             )?,
             Some(ScanBound::Gin(gb)) => {
                 let query = if inl {
-                    [inl_on, plan.filter.as_ref()]
-                        .into_iter()
-                        .flatten()
+                    inl_filters
+                        .iter()
+                        .copied()
+                        .chain(plan.filter.iter())
                         .find_map(|f| {
-                            gin_sibling_match(f, gb.col_global, sibling_columns).map(|(_, q)| q)
+                            gin_sibling_match(f, gb.col_global, &sibling_columns).map(|(_, q)| q)
                         })
                 } else {
                     plan.filter
@@ -1587,15 +1735,16 @@ impl Engine {
             }
             Some(ScanBound::Gist(gb)) => {
                 let query = if inl {
-                    [inl_on, plan.filter.as_ref()]
-                        .into_iter()
-                        .flatten()
+                    inl_filters
+                        .iter()
+                        .copied()
+                        .chain(plan.filter.iter())
                         .find_map(|f| match gb.strategy {
                             crate::gist::GistStrategy::Equal => {
-                                gist_scalar_sibling_match(f, gb.col_global, sibling_columns)
+                                gist_scalar_sibling_match(f, gb.col_global, &sibling_columns)
                                     .map(|(_, q)| q)
                             }
-                            _ => gist_sibling_match(f, gb.col_global, sibling_columns)
+                            _ => gist_sibling_match(f, gb.col_global, &sibling_columns)
                                 .map(|(_, q)| q),
                         })
                 } else {

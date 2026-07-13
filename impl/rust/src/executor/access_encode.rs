@@ -134,7 +134,7 @@ pub(crate) fn build_index_access_predicate(
     filter: &RExpr,
     rel: &ScopeRel,
     idx: &IndexDef,
-    sibling_columns: Option<(usize, usize)>,
+    sibling_columns: Option<&[(usize, usize)]>,
     catalog: &Engine,
 ) -> Option<IndexBound> {
     if idx.kind != IndexKind::Btree {
@@ -1700,7 +1700,8 @@ pub(crate) fn detect_inl_bound(
     rel: &ScopeRel,
     catalog: &Engine,
 ) -> Option<ScanBound> {
-    inventory_inl_candidates(on, where_filter, rel, (0, rel.offset), catalog)
+    let sibling_columns = [(0, rel.offset)];
+    inventory_inl_candidates(on, where_filter, rel, &sibling_columns, catalog)
         .into_iter()
         .next()
         .and_then(|candidate| candidate.bound)
@@ -1710,7 +1711,7 @@ pub(crate) fn inventory_inl_candidates<'a>(
     on: Option<&'a RExpr>,
     where_filter: Option<&'a RExpr>,
     rel: &ScopeRel,
-    sibling_columns: (usize, usize),
+    sibling_columns: &[(usize, usize)],
     catalog: &Engine,
 ) -> Vec<ScanCandidate<'a>> {
     // A host-attached inner relation full-scans per outer row this slice (attached-databases.md §8):
@@ -2205,15 +2206,15 @@ pub(crate) fn gist_match(
     gist_match_operand(filter, col_global, rexpr_is_constant)
 }
 
-pub(crate) fn gist_sibling_match(
-    filter: &RExpr,
+pub(crate) fn gist_sibling_match<'a>(
+    filter: &'a RExpr,
     col_global: usize,
-    sibling_columns: (usize, usize),
-) -> Option<(crate::gist::GistStrategy, &RExpr)> {
+    sibling_columns: &[(usize, usize)],
+) -> Option<(crate::gist::GistStrategy, &'a RExpr)> {
     gist_match_operand(
         filter,
         col_global,
-        |q| matches!(q, RExpr::Column(i) if *i >= sibling_columns.0 && *i < sibling_columns.1),
+        |q| matches!(q, RExpr::Column(i) if sibling_columns.iter().any(|(start, end)| *i >= *start && *i < *end)),
     )
 }
 
@@ -2267,15 +2268,15 @@ pub(crate) fn gist_scalar_match(
     gist_scalar_match_operand(filter, col_global, rexpr_is_constant)
 }
 
-pub(crate) fn gist_scalar_sibling_match(
-    filter: &RExpr,
+pub(crate) fn gist_scalar_sibling_match<'a>(
+    filter: &'a RExpr,
     col_global: usize,
-    sibling_columns: (usize, usize),
-) -> Option<(crate::gist::GistStrategy, &RExpr)> {
+    sibling_columns: &[(usize, usize)],
+) -> Option<(crate::gist::GistStrategy, &'a RExpr)> {
     gist_scalar_match_operand(
         filter,
         col_global,
-        |q| matches!(q, RExpr::Column(i) if *i >= sibling_columns.0 && *i < sibling_columns.1),
+        |q| matches!(q, RExpr::Column(i) if sibling_columns.iter().any(|(start, end)| *i >= *start && *i < *end)),
     )
 }
 
@@ -2334,15 +2335,15 @@ pub(crate) fn gin_match(filter: &RExpr, col_global: usize) -> Option<(GinStrateg
     gin_match_operand(filter, col_global, rexpr_is_constant)
 }
 
-pub(crate) fn gin_sibling_match(
-    filter: &RExpr,
+pub(crate) fn gin_sibling_match<'a>(
+    filter: &'a RExpr,
     col_global: usize,
-    sibling_columns: (usize, usize),
-) -> Option<(GinStrategy, &RExpr)> {
+    sibling_columns: &[(usize, usize)],
+) -> Option<(GinStrategy, &'a RExpr)> {
     gin_match_operand(
         filter,
         col_global,
-        |q| matches!(q, RExpr::Column(i) if *i >= sibling_columns.0 && *i < sibling_columns.1),
+        |q| matches!(q, RExpr::Column(i) if sibling_columns.iter().any(|(start, end)| *i >= *start && *i < *end)),
     )
 }
 
@@ -3242,7 +3243,7 @@ pub(crate) fn fk_probe(
 pub(crate) fn detect_pk_bound(
     filters: &[&RExpr],
     rel: &ScopeRel,
-    sibling_columns: Option<(usize, usize)>,
+    sibling_columns: Option<&[(usize, usize)]>,
     catalog: &Engine,
 ) -> Option<PkBound> {
     let pk = rel.table.pk_indices();
@@ -3509,7 +3510,7 @@ pub(crate) fn collect_bound_terms(
     key: &KeyMatch,
     pk_type: ScalarType,
     col_coll: Option<&str>,
-    sibling_columns: Option<(usize, usize)>,
+    sibling_columns: Option<&[(usize, usize)]>,
     terms: &mut Vec<BoundTerm>,
 ) {
     match e {
@@ -3574,7 +3575,7 @@ pub(crate) fn collect_bound_terms(
 pub(crate) fn const_source(
     e: &RExpr,
     pk_type: ScalarType,
-    sibling_columns: Option<(usize, usize)>,
+    sibling_columns: Option<&[(usize, usize)]>,
 ) -> Option<BoundSrc> {
     match e {
         RExpr::Param(i) => Some(BoundSrc::Param(*i)),
@@ -3593,7 +3594,11 @@ pub(crate) fn const_source(
             level: *level,
             index: *index,
         }),
-        RExpr::Column(g) if sibling_columns.is_some_and(|(start, end)| *g >= start && *g < end) => {
+        RExpr::Column(g)
+            if sibling_columns.is_some_and(|ranges| {
+                ranges.iter().any(|(start, end)| *g >= *start && *g < *end)
+            }) =>
+        {
             Some(BoundSrc::Sibling(*g))
         }
         _ => None,

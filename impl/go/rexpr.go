@@ -1524,6 +1524,10 @@ type physicalPlan struct {
 	// for eligible two-base INNER/CROSS joins; nil retains source order at every barrier. Resolved
 	// expression slots never change.
 	relationOrder []int
+	// joinSteps is P8's per-append physical N-way plan. Each step owns the authored ON trees that
+	// become dependency-complete there and an optional hash operator; a non-nil relINLBounds entry
+	// on the appended relation denotes INL, otherwise nil hash denotes nested loop.
+	joinSteps []physicalJoinStep
 	// hashJoin is the deterministic two-input hash operator. It builds the right input and probes
 	// the left using same-type bare-column equality keys in source order. nil keeps nested loop.
 	hashJoin *hashJoinPlan
@@ -1575,6 +1579,11 @@ type physicalPlan struct {
 
 type hashJoinPlan struct {
 	keys []hashJoinKey
+}
+
+type physicalJoinStep struct {
+	onIndices []int
+	hashJoin  *hashJoinPlan
 }
 
 type hashJoinKey struct {

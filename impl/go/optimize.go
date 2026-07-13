@@ -2,6 +2,7 @@ package jed
 
 import (
 	"bytes"
+	"math/bits"
 	"sort"
 )
 
@@ -12,9 +13,9 @@ func physicalRelOrdinal(plan *selectPlan, position int) int {
 	return position
 }
 
-func relationColumnRange(plan *selectPlan, ordinal int) *columnRange {
+func relationColumnRange(plan *selectPlan, ordinal int) columnRanges {
 	rel := plan.rels[ordinal]
-	return &columnRange{start: rel.offset, end: rel.offset + rel.colCount}
+	return columnRanges{{start: rel.offset, end: rel.offset + rel.colCount}}
 }
 
 // Physical / access-path selection — Stage 3 of the planner (spec/design/planner.md §4). The
@@ -40,6 +41,7 @@ func (db *engine) optimizeSelect(plan *selectPlan, rels []scopeRel) {
 	db.ruleOrderByIndexScan(plan, rels)
 	db.ruleCostedSingleRelationPipeline(plan, rels)
 	db.ruleCostedTwoRelationJoin(plan, rels)
+	db.ruleCostedNWayJoin(plan, rels)
 	db.ruleJoinPkOrdered(plan, rels)
 	db.ruleOrderByLimitTopK(plan, rels)
 }
@@ -58,14 +60,31 @@ func (db *engine) ruleHashJoin(plan *selectPlan, rels []scopeRel) {
 }
 
 func buildHashJoinPlan(plan *selectPlan, rels []scopeRel, outer, inner int) *hashJoinPlan {
-	if len(rels) != 2 || len(plan.joins) != 1 || plan.joins[0].on == nil {
+	return buildHashJoinPlanForOns(plan, rels, []int{outer}, inner, []int{0})
+}
+
+func buildHashJoinPlanForOns(plan *selectPlan, rels []scopeRel, outers []int, inner int, onIndices []int) *hashJoinPlan {
+	if len(onIndices) == 0 {
 		return nil
 	}
 	var conjuncts []*rExpr
-	flattenHashJoinConjuncts(plan.joins[0].on, &conjuncts)
+	for _, onIndex := range onIndices {
+		if plan.joins[onIndex].on == nil {
+			return nil
+		}
+		flattenHashJoinConjuncts(plan.joins[onIndex].on, &conjuncts)
+	}
 	keys := make([]hashJoinKey, 0)
-	outerRange := columnRange{start: rels[outer].offset, end: rels[outer].offset + len(rels[outer].table.Columns)}
 	innerRange := columnRange{start: rels[inner].offset, end: rels[inner].offset + len(rels[inner].table.Columns)}
+	isOuter := func(index int) bool {
+		for _, ordinal := range outers {
+			span := columnRange{start: rels[ordinal].offset, end: rels[ordinal].offset + len(rels[ordinal].table.Columns)}
+			if span.contains(index) {
+				return true
+			}
+		}
+		return false
+	}
 	for _, expr := range conjuncts {
 		if !hashJoinSafeConjunct(expr) {
 			return nil
@@ -74,10 +93,10 @@ func buildHashJoinPlan(plan *selectPlan, rels []scopeRel, outer, inner int) *has
 			continue
 		}
 		left, right := expr.lhs.index, expr.rhs.index
-		if innerRange.contains(left) && outerRange.contains(right) {
+		if innerRange.contains(left) && isOuter(right) {
 			left, right = right, left
 		}
-		if !outerRange.contains(left) || !innerRange.contains(right) {
+		if !isOuter(left) || !innerRange.contains(right) {
 			continue
 		}
 		lt, lok := hashJoinColumnType(rels, left)
@@ -331,6 +350,26 @@ const (
 	joinAlgorithmNested
 )
 
+type joinSearchAccess struct {
+	identity scanCandidateIdentity
+	bound    *scanBound
+	inl      bool
+	onIndex  int // -1 means WHERE-derived rather than one authored ON tree
+}
+
+type joinSearchStep struct {
+	algorithm joinAlgorithm
+	onIndices []int
+}
+
+type joinSearchState struct {
+	order               []int
+	access              []joinSearchAccess
+	steps               []joinSearchStep
+	estimate            planEstimate
+	satisfiesQueryOrder bool
+}
+
 type twoRelationCandidate struct {
 	order                  [2]int
 	outerIdentity          scanCandidateIdentity
@@ -445,6 +484,367 @@ func (db *engine) ruleCostedTwoRelationJoin(plan *selectPlan, rels []scopeRel) {
 	plan.phys.hashJoin = selected.hash
 }
 
+func cloneJoinSearchState(state joinSearchState) joinSearchState {
+	clone := state
+	clone.order = append([]int(nil), state.order...)
+	clone.access = append([]joinSearchAccess(nil), state.access...)
+	clone.steps = append([]joinSearchStep(nil), state.steps...)
+	return clone
+}
+
+func compareJoinSearchState(a, b joinSearchState) int {
+	for i := 0; i < len(a.order) && i < len(b.order); i++ {
+		if a.order[i] < b.order[i] {
+			return -1
+		}
+		if a.order[i] > b.order[i] {
+			return 1
+		}
+	}
+	if len(a.order) < len(b.order) {
+		return -1
+	}
+	if len(a.order) > len(b.order) {
+		return 1
+	}
+	for i := range a.access {
+		if c := compareScanIdentity(a.access[i].identity, b.access[i].identity); c != 0 {
+			return c
+		}
+		if a.access[i].inl && b.access[i].inl && a.access[i].onIndex != b.access[i].onIndex {
+			if a.access[i].onIndex < b.access[i].onIndex {
+				return -1
+			}
+			return 1
+		}
+	}
+	for i := range a.steps {
+		if a.steps[i].algorithm < b.steps[i].algorithm {
+			return -1
+		}
+		if a.steps[i].algorithm > b.steps[i].algorithm {
+			return 1
+		}
+		for j := 0; j < len(a.steps[i].onIndices) && j < len(b.steps[i].onIndices); j++ {
+			if a.steps[i].onIndices[j] < b.steps[i].onIndices[j] {
+				return -1
+			}
+			if a.steps[i].onIndices[j] > b.steps[i].onIndices[j] {
+				return 1
+			}
+		}
+	}
+	return 0
+}
+
+func joinSearchMask(state joinSearchState) int {
+	mask := 0
+	for _, ordinal := range state.order {
+		mask |= 1 << ordinal
+	}
+	return mask
+}
+
+func joinFrontierIndex(mask int, ordered bool) int {
+	if ordered {
+		return mask*2 + 1
+	}
+	return mask * 2
+}
+
+func insertJoinFrontier(frontier *[]joinSearchState, candidate joinSearchState) {
+	cost, rows, logical := candidate.estimate.cost(), candidate.estimate.rows, candidate.estimate.logicalRows
+	for _, prior := range *frontier {
+		pcost := prior.estimate.cost()
+		weak := pcost <= cost && prior.estimate.rows <= rows && prior.estimate.logicalRows <= logical
+		strict := pcost < cost || prior.estimate.rows < rows || prior.estimate.logicalRows < logical
+		if (weak && strict) || (pcost == cost && prior.estimate.rows == rows && prior.estimate.logicalRows == logical && compareJoinSearchState(prior, candidate) <= 0) {
+			return
+		}
+	}
+	out := (*frontier)[:0]
+	for _, prior := range *frontier {
+		pcost := prior.estimate.cost()
+		dominated := cost <= pcost && rows <= prior.estimate.rows && logical <= prior.estimate.logicalRows &&
+			(cost < pcost || rows < prior.estimate.rows || logical < prior.estimate.logicalRows)
+		if !dominated {
+			out = append(out, prior)
+		}
+	}
+	out = append(out, candidate)
+	sort.SliceStable(out, func(i, j int) bool { return compareJoinSearchState(out[i], out[j]) < 0 })
+	*frontier = out
+}
+
+func expressionRelationDependencies(plan *selectPlan, expr *rExpr, deps []bool) {
+	if expr == nil {
+		return
+	}
+	if expr.kind == reColumn {
+		for ordinal, rel := range plan.rels {
+			if expr.index >= rel.offset && expr.index < rel.offset+rel.colCount {
+				deps[ordinal] = true
+				break
+			}
+		}
+	}
+	expressionRelationDependencies(plan, expr.operand, deps)
+	expressionRelationDependencies(plan, expr.lhs, deps)
+	expressionRelationDependencies(plan, expr.rhs, deps)
+	for _, arm := range expr.caseArms {
+		expressionRelationDependencies(plan, arm.cond, deps)
+		expressionRelationDependencies(plan, arm.result, deps)
+	}
+	expressionRelationDependencies(plan, expr.caseEls, deps)
+	for _, arg := range expr.sargs {
+		expressionRelationDependencies(plan, arg, deps)
+	}
+}
+
+func newlyReadyOnIndices(plan *selectPlan, before, after []bool) []int {
+	var ready []int
+	for index, join := range plan.joins {
+		if join.on == nil {
+			continue
+		}
+		deps := make([]bool, len(plan.rels))
+		deps[index+1] = true
+		expressionRelationDependencies(plan, join.on, deps)
+		readyBefore, readyAfter := true, true
+		for ordinal, needed := range deps {
+			if needed && !before[ordinal] {
+				readyBefore = false
+			}
+			if needed && !after[ordinal] {
+				readyAfter = false
+			}
+		}
+		if readyAfter && !readyBefore {
+			ready = append(ready, index)
+		}
+	}
+	return ready
+}
+
+func (db *engine) installJoinSearchState(plan *selectPlan, rels []scopeRel, state joinSearchState) {
+	n := len(plan.rels)
+	plan.phys.relationOrder = append([]int(nil), state.order...)
+	present := make([]bool, n)
+	for _, ordinal := range state.order {
+		present[ordinal] = true
+	}
+	for ordinal := 0; ordinal < n; ordinal++ {
+		if !present[ordinal] {
+			plan.phys.relationOrder = append(plan.phys.relationOrder, ordinal)
+		}
+	}
+	plan.phys.relBounds = make([]*scanBound, n)
+	plan.phys.relINLBounds = make([]*scanBound, n)
+	plan.phys.hashJoin = nil
+	for position, access := range state.access {
+		ordinal := state.order[position]
+		if access.inl {
+			plan.phys.relINLBounds[ordinal] = access.bound
+		} else {
+			plan.phys.relBounds[ordinal] = access.bound
+		}
+	}
+	plan.phys.joinSteps = make([]physicalJoinStep, len(state.steps))
+	for position, step := range state.steps {
+		inner := state.order[position+1]
+		var hash *hashJoinPlan
+		if step.algorithm == joinAlgorithmHash {
+			hash = buildHashJoinPlanForOns(plan, rels, state.order[:position+1], inner, step.onIndices)
+		}
+		plan.phys.joinSteps[position] = physicalJoinStep{onIndices: append([]int(nil), step.onIndices...), hashJoin: hash}
+	}
+	plan.phys.pkOrdered, plan.phys.pkReverse, plan.phys.joinPkOrdered = false, false, false
+	plan.phys.indexOrder, plan.phys.topK = nil, nil
+}
+
+func (db *engine) refreshJoinSearchState(plan *selectPlan, rels []scopeRel, state *joinSearchState) {
+	db.installJoinSearchState(plan, rels, *state)
+	state.estimate = db.estimateJoinSearchPrefix(plan, len(state.order))
+}
+
+func (db *engine) nwayDriverSatisfiesOrder(plan *selectPlan, rels []scopeRel, driver int) bool {
+	if plan.isAgg || plan.hasWindow || plan.distinct || len(plan.order) == 0 || len(plan.orderExprs) != 0 || plan.limit == nil {
+		return false
+	}
+	bound := plan.phys.relBounds[driver]
+	if bound != nil && bound.pk == nil {
+		return false
+	}
+	ok, reverse := db.orderSatisfiedByPK(rels[driver].table, plan.rels[driver].offset, plan.order)
+	return ok && !reverse
+}
+
+func (db *engine) expandJoinSearchState(plan *selectPlan, rels []scopeRel, state joinSearchState) []joinSearchState {
+	n := len(plan.rels)
+	present := make([]bool, n)
+	var siblingColumns columnRanges
+	for _, ordinal := range state.order {
+		present[ordinal] = true
+		rel := plan.rels[ordinal]
+		siblingColumns = append(siblingColumns, columnRange{start: rel.offset, end: rel.offset + rel.colCount})
+	}
+	var out []joinSearchState
+	for inner := 0; inner < n; inner++ {
+		if present[inner] {
+			continue
+		}
+		after := append([]bool(nil), present...)
+		after[inner] = true
+		onIndices := newlyReadyOnIndices(plan, present, after)
+		type inlChoice struct {
+			candidate scanCandidate
+			onIndex   int
+		}
+		var inl []inlChoice
+		for _, onIndex := range onIndices {
+			for _, candidate := range inventoryINLCandidates(plan.joins[onIndex].on, nil, rels[inner], siblingColumns, db) {
+				inl = append(inl, inlChoice{candidate, onIndex})
+			}
+		}
+		for _, candidate := range inventoryINLCandidates(nil, plan.filter, rels[inner], siblingColumns, db) {
+			inl = append(inl, inlChoice{candidate, -1})
+		}
+		sort.SliceStable(inl, func(i, j int) bool {
+			if c := compareScanIdentity(inl[i].candidate.identity, inl[j].candidate.identity); c != 0 {
+				return c < 0
+			}
+			return inl[i].onIndex < inl[j].onIndex
+		})
+		for _, choice := range inl {
+			candidate := cloneJoinSearchState(state)
+			candidate.order = append(candidate.order, inner)
+			candidate.access = append(candidate.access, joinSearchAccess{identity: choice.candidate.identity, bound: choice.candidate.bound, inl: true, onIndex: choice.onIndex})
+			candidate.steps = append(candidate.steps, joinSearchStep{algorithm: joinAlgorithmINL, onIndices: append([]int(nil), onIndices...)})
+			db.refreshJoinSearchState(plan, rels, &candidate)
+			out = append(out, candidate)
+		}
+		hasHash := buildHashJoinPlanForOns(plan, rels, state.order, inner, onIndices) != nil
+		for _, access := range inventoryScanCandidates(plan.filter, rels[inner], db) {
+			if hasHash {
+				candidate := cloneJoinSearchState(state)
+				candidate.order = append(candidate.order, inner)
+				candidate.access = append(candidate.access, joinSearchAccess{identity: access.identity, bound: access.bound, onIndex: -1})
+				candidate.steps = append(candidate.steps, joinSearchStep{algorithm: joinAlgorithmHash, onIndices: append([]int(nil), onIndices...)})
+				db.refreshJoinSearchState(plan, rels, &candidate)
+				out = append(out, candidate)
+			}
+			candidate := cloneJoinSearchState(state)
+			candidate.order = append(candidate.order, inner)
+			candidate.access = append(candidate.access, joinSearchAccess{identity: access.identity, bound: access.bound, onIndex: -1})
+			candidate.steps = append(candidate.steps, joinSearchStep{algorithm: joinAlgorithmNested, onIndices: append([]int(nil), onIndices...)})
+			db.refreshJoinSearchState(plan, rels, &candidate)
+			out = append(out, candidate)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool { return compareJoinSearchState(out[i], out[j]) < 0 })
+	return out
+}
+
+func (db *engine) ruleCostedNWayJoin(plan *selectPlan, rels []scopeRel) {
+	n := len(plan.rels)
+	if n < 3 || len(rels) != n || len(plan.joins)+1 != n {
+		return
+	}
+	for _, join := range plan.joins {
+		if join.kind != joinInner && join.kind != joinCross {
+			return
+		}
+	}
+	for _, rel := range plan.rels {
+		if rel.lateral || rel.srf != nil || rel.cte != nil || rel.derived != nil {
+			return
+		}
+	}
+
+	var winner joinSearchState
+	haveWinner := false
+	if n <= joinDPLimit {
+		frontiers := make([][]joinSearchState, (1<<n)*2)
+		for ordinal := 0; ordinal < n; ordinal++ {
+			for _, access := range inventoryScanCandidates(plan.filter, rels[ordinal], db) {
+				state := joinSearchState{order: []int{ordinal}, access: []joinSearchAccess{{identity: access.identity, bound: access.bound, onIndex: -1}}}
+				db.refreshJoinSearchState(plan, rels, &state)
+				state.satisfiesQueryOrder = db.nwayDriverSatisfiesOrder(plan, rels, ordinal)
+				idx := joinFrontierIndex(joinSearchMask(state), state.satisfiesQueryOrder)
+				insertJoinFrontier(&frontiers[idx], state)
+			}
+		}
+		for size := 1; size < n; size++ {
+			for mask := 1; mask < 1<<n; mask++ {
+				if bits.OnesCount(uint(mask)) != size {
+					continue
+				}
+				for _, ordered := range []bool{false, true} {
+					states := append([]joinSearchState(nil), frontiers[joinFrontierIndex(mask, ordered)]...)
+					for _, state := range states {
+						for _, candidate := range db.expandJoinSearchState(plan, rels, state) {
+							idx := joinFrontierIndex(joinSearchMask(candidate), candidate.satisfiesQueryOrder)
+							insertJoinFrontier(&frontiers[idx], candidate)
+						}
+					}
+				}
+			}
+		}
+		full := (1 << n) - 1
+		var completed []joinSearchState
+		completed = append(completed, frontiers[joinFrontierIndex(full, false)]...)
+		completed = append(completed, frontiers[joinFrontierIndex(full, true)]...)
+		sort.SliceStable(completed, func(i, j int) bool { return compareJoinSearchState(completed[i], completed[j]) < 0 })
+		var winnerCost int64
+		for _, state := range completed {
+			db.installJoinSearchState(plan, rels, state)
+			plan.phys.joinPkOrdered = state.satisfiesQueryOrder && db.joinPKOrderedForCandidate(plan, rels)
+			cost := db.estimateSelectPlan(plan, nil).root.cost()
+			if !haveWinner || cost < winnerCost {
+				winner, winnerCost, haveWinner = state, cost, true
+			}
+		}
+	} else {
+		var drivers []joinSearchState
+		for ordinal := 0; ordinal < n; ordinal++ {
+			for _, access := range inventoryScanCandidates(plan.filter, rels[ordinal], db) {
+				state := joinSearchState{order: []int{ordinal}, access: []joinSearchAccess{{identity: access.identity, bound: access.bound, onIndex: -1}}}
+				db.refreshJoinSearchState(plan, rels, &state)
+				state.satisfiesQueryOrder = db.nwayDriverSatisfiesOrder(plan, rels, ordinal)
+				drivers = append(drivers, state)
+			}
+		}
+		sort.SliceStable(drivers, func(i, j int) bool {
+			if drivers[i].estimate.cost() != drivers[j].estimate.cost() {
+				return drivers[i].estimate.cost() < drivers[j].estimate.cost()
+			}
+			return compareJoinSearchState(drivers[i], drivers[j]) < 0
+		})
+		if len(drivers) > 0 {
+			winner, haveWinner = drivers[0], true
+		}
+		for haveWinner && len(winner.order) < n {
+			next := db.expandJoinSearchState(plan, rels, winner)
+			sort.SliceStable(next, func(i, j int) bool {
+				if next[i].estimate.cost() != next[j].estimate.cost() {
+					return next[i].estimate.cost() < next[j].estimate.cost()
+				}
+				return compareJoinSearchState(next[i], next[j]) < 0
+			})
+			if len(next) == 0 {
+				haveWinner = false
+				break
+			}
+			winner = next[0]
+		}
+	}
+	if !haveWinner {
+		return
+	}
+	db.installJoinSearchState(plan, rels, winner)
+	plan.phys.joinPkOrdered = winner.satisfiesQueryOrder && db.joinPKOrderedForCandidate(plan, rels)
+}
+
 // ruleIndexNestedLoop — index-nested-loop pushdown (cost.md §3 "JOIN"): a join inner relation
 // whose primary key / indexed column is compared to a SIBLING column of an earlier relation
 // (`a JOIN b ON b.pk = a.x`) is re-materialized per outer row, seeking instead of full-scanning —
@@ -519,16 +919,22 @@ func (db *engine) ruleJoinPkOrdered(plan *selectPlan, rels []scopeRel) {
 }
 
 func (db *engine) joinPKOrderedForCandidate(plan *selectPlan, rels []scopeRel) bool {
-	if len(plan.rels) != 2 || len(rels) != 2 || len(plan.joins) != 1 {
+	if len(plan.rels) < 2 || len(rels) != len(plan.rels) || len(plan.joins)+1 != len(plan.rels) {
 		return false
 	}
 	outer := physicalRelOrdinal(plan, 0)
-	inner := physicalRelOrdinal(plan, 1)
+	inner := physicalRelOrdinal(plan, len(plan.rels)-1)
+	allInner := true
+	for _, join := range plan.joins {
+		allInner = allInner && (join.kind == joinInner || join.kind == joinCross)
+	}
+	allBase := true
+	for _, rel := range plan.rels {
+		allBase = allBase && !rel.lateral && rel.srf == nil && rel.cte == nil && rel.derived == nil
+	}
 	if !plan.isAgg && !plan.hasWindow && !plan.distinct && len(plan.order) > 0 && len(plan.orderExprs) == 0 &&
 		plan.limit != nil &&
-		(plan.joins[0].kind == joinInner || plan.joins[0].kind == joinCross) &&
-		!plan.rels[outer].lateral && plan.rels[outer].srf == nil && plan.rels[outer].cte == nil && plan.rels[outer].derived == nil &&
-		!plan.rels[inner].lateral && plan.rels[inner].srf == nil && plan.rels[inner].cte == nil && plan.rels[inner].derived == nil &&
+		allInner && allBase &&
 		!plan.phys.relBounds[outer].needsEagerScan() &&
 		plan.phys.relINLBounds[outer] == nil && joinTopNINLCompatible(plan.phys.relINLBounds[inner]) &&
 		len(plan.order) <= len(rels[outer].table.PKIndices()) {

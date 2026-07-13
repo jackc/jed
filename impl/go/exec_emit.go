@@ -153,6 +153,66 @@ func (db *engine) execCostedTwoRelationJoin(plan *selectPlan, env *evalEnv, mete
 	return out, nil
 }
 
+func (db *engine) execCostedNWayJoin(plan *selectPlan, env *evalEnv, meter *costMeter, params []Value, outerStack []storedRow, materialized [][]storedRow, stepCount int) ([]storedRow, error) {
+	driver := plan.phys.relationOrder[0]
+	running := make([]storedRow, len(materialized[driver]))
+	for i, row := range materialized[driver] {
+		running[i] = placePhysicalRelationRow(plan, driver, row)
+	}
+	for position := 0; position < stepCount; position++ {
+		step := plan.phys.joinSteps[position]
+		inner := plan.phys.relationOrder[position+1]
+		innerRows := materialized[inner]
+		var table *hashJoinTable
+		var err error
+		if step.hashJoin != nil {
+			table, err = newHashJoinTable(step.hashJoin, plan.rels[inner].offset, 0, innerRows, meter)
+			if err != nil {
+				return nil, err
+			}
+		}
+		var next []storedRow
+		for _, left := range running {
+			candidates := innerRows
+			if plan.phys.relINLBounds[inner] != nil {
+				candidates, err = db.materializeRel(plan, inner, params, outerStack, left, env.rng, env.ctes, meter)
+				if err != nil {
+					return nil, err
+				}
+			} else if table != nil {
+				candidates, err = table.probe(step.hashJoin, left, meter)
+				if err != nil {
+					return nil, err
+				}
+			}
+			for _, right := range candidates {
+				combined := append(storedRow(nil), left...)
+				copy(combined[plan.rels[inner].offset:], right)
+				keep := true
+				for _, onIndex := range step.onIndices {
+					predicate := plan.joins[onIndex].on
+					if predicate == nil {
+						continue
+					}
+					v, err := predicate.eval(combined, env, meter)
+					if err != nil {
+						return nil, err
+					}
+					if !v.IsTrue() {
+						keep = false
+						break
+					}
+				}
+				if keep {
+					next = append(next, combined)
+				}
+			}
+		}
+		running = next
+	}
+	return running, nil
+}
+
 // drainEager builds the full output slice from the emitter — the materialized drive
 // (spec/design/streaming.md §4). The lazy queryValues drive (bufferedCursor) emits the same rows one at
 // a time instead; both charge the identical units in the identical order, so totals agree (§6).
@@ -336,7 +396,13 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 	// join drives/probes the outer in PK order so the output is already ordered — the sort is elided
 	// and the loop short-circuits a top-N.
 	if plan.phys.joinPkOrdered {
-		res, err := db.execStreamingJoin(plan, env, meter, params, outer, env.rng)
+		var res selectResult
+		var err error
+		if len(plan.rels) >= 3 && len(plan.phys.joinSteps)+1 == len(plan.rels) {
+			res, err = db.execStreamingNWayJoin(plan, env, meter, params, outer, env.rng)
+		} else {
+			res, err = db.execStreamingJoin(plan, env, meter, params, outer, env.rng)
+		}
 		if err != nil {
 			return emitter{}, err
 		}
@@ -383,7 +449,13 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 	// A FROM-less SELECT has no relations: seed `running` with ONE virtual zero-column row
 	// instead of a table's rows (grammar.md §34). No scan ran, so no scan cost accrued.
 	var running []storedRow
-	if len(plan.phys.relationOrder) == 2 {
+	if len(plan.rels) >= 3 && len(plan.phys.relationOrder) == len(plan.rels) && len(plan.phys.joinSteps)+1 == len(plan.rels) {
+		var err error
+		running, err = db.execCostedNWayJoin(plan, env, meter, params, outer, materialized, len(plan.phys.joinSteps))
+		if err != nil {
+			return emitter{}, err
+		}
+	} else if len(plan.phys.relationOrder) == 2 {
 		var err error
 		running, err = db.execCostedTwoRelationJoin(plan, env, meter, params, outer, materialized)
 		if err != nil {

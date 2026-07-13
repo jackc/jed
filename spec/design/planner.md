@@ -1,7 +1,7 @@
 # The planner: explicit optimizer-pass structure — design
 
 > How a SELECT becomes an executable plan, and where each optimization lives. The planner
-> is a **deterministic rule engine** whose cost-based single-relation and two-relation choices have
+> is a **deterministic rule engine** whose cost-based single-relation and join choices have
 > landed: it resolves
 > the query into a **logical plan**, applies **rewrite rules** (none exist yet — §3), and
 > then runs **physical/access-path selection** — a fixed, ordered list of discrete rules,
@@ -102,14 +102,14 @@ then takes the unoptimized path (full scan, eager sort), which is always correct
 | 3 | **hash join** | exactly two non-lateral inputs; INNER/LEFT ON contains one or more same-type, key-encodable bare-column equalities across the inputs; no inner INL; every remaining ON conjunct is a non-trapping leaf equality/inequality | `hashJoin` | cost.md §3 "hash JOIN" (`hash_build`/`hash_probe`; ON only for bucket candidates) |
 | 4 | **ORDER BY via PK scan order** | single base relation, non-aggregate, column-only keys: the ORDER BY is a one-direction PK prefix (ASC) or the full PK (DESC ⇒ reverse scan), collation-matching the stored key | `pkOrdered`, `pkReverse` | cost.md §3 "ORDER BY satisfied by primary-key order" (sort elided; with LIMIT, a top-N) |
 | 5 | **single-relation pipeline choice / ORDER BY via secondary-index order** | one base relation: compose every access candidate with its natural PK/index order, add every eligible order-only B-tree walk when LIMIT is present, and minimize cumulative scheduled cost through LIMIT/OFFSET; exact index-order shape/type gates remain | `relBounds[0]`, `pkOrdered`, `pkReverse`, `indexOrder` | estimator.md §9.1; cost.md §3 "ORDER BY satisfied by secondary-index order" |
-| 6 | **costed two-relation join** | exactly two non-lateral base relations with one INNER/CROSS edge: cost both orientations, all ordinary access pairs, every physically-dependent INL access, and every safe ON-equijoin hash alternative | `relationOrder`, `relBounds`, `relINLBounds`, `hashJoin` | estimator.md §9.2; cost.md §3 "JOIN" |
-| 7 | **join sort-elision** | exactly two non-lateral base relations, INNER/CROSS, a LIMIT, forward selected-outer-PK ORDER BY with no key beyond the outer PK, no eager bound on the outer; any storage-key-ordered inner INL bound is opened per outer row | `joinPkOrdered` | cost.md §3 "JOIN" (the join top-N) |
+| 6 | **bounded costed join search** | P7's two-base shape and P8's maximal hard-fenced base INNER/CROSS islands: exhaustive Pareto-frontier left-deep DP through 8 movable relations, deterministic cheapest-next above it; ordinary access, physically-dependent INL, and safe ON-equijoin hash are chosen per step | `relationOrder`, `joinSteps`, `relBounds`, `relINLBounds` | estimator.md §9.2/§10; cost.md §3 "JOIN" |
+| 7 | **join sort-elision** | a selected fence-free left-deep INNER/CROSS tree, a LIMIT, forward driver-PK ORDER BY with no key beyond that PK, no eager non-PK bound on the driver; the materialized left subtree feeds a streaming final join step | `joinPkOrdered` | estimator.md §10.4; cost.md §3 "JOIN" (the join top-N) |
 | 8 | **blocking ORDER BY top-k** | rules 4–7 did not elide the sort; plain SELECT (no DISTINCT, aggregate/group, or window), ORDER BY + constant LIMIT; checked `K = OFFSET + LIMIT` (`LIMIT 0` ⇒ K=0) | `topK` | cost.md §3 "blocking ORDER BY top-k" (full scan/evaluation and cost retained; sort work reduced) |
 
 Data-flow dependencies fixing the order: rules 2–3 first form the staged legacy join choice; rule 5
 reads the complete rule-1 inventory and subsumes rule 4's provisional single-relation order decision;
-rule 6 replaces the staged join fields only for its eligible two-relation shape and evaluates each
-candidate's order property; rule 7 records the winning candidate's join sort-elision; rule 8 reads
+rule 6 replaces the staged join fields for eligible P7/P8 shapes and evaluates each candidate's
+query-specific order property; rule 7 records the winning candidate's join sort-elision; rule 8 reads
 the three preceding sort-elision decisions. Rules 4–6
 that select scan order remain mutually exclusive by their gates; hash join preserves the same
 physical-outer then physical-inner candidate enumeration and may compose with join sort-elision.
@@ -117,8 +117,9 @@ physical-outer then physical-inner candidate enumeration and may compose with jo
 The physical fields live in a dedicated sub-struct of the plan (`phys` — Go
 `physicalPlan`, Rust/TS `PhysicalPlan`), so the stage boundary is visible in the type: the
 logical fields plus the `relMasks` annotation are stage 1's output, `phys` is stage 3's.
-P7's `relationOrder` maps physical positions to source ordinals; it never rewrites resolved logical
-column slots.
+`relationOrder` maps physical positions to source ordinals; it never rewrites resolved logical
+column slots. `joinSteps[position - 1]` records the newly-ready authored `ON` ordinals and the
+algorithm for appending that physical relation. P7 is the two-entry instance of the same P8 shape.
 
 The **mechanisms** the rules call — `detectScanBound`, `detectINLBound`,
 `buildIndexAccessPredicate`, `orderSatisfiedByPK`, `orderSatisfiedByIndex`, interval-set
@@ -254,6 +255,21 @@ Join-PK ordering is recalculated per candidate against the selected physical out
 row-count-only prefix estimate discounts only skipped probe/ON/INL work; ordinary base scans and hash
 build remain complete. Outer joins, LATERAL, CTE/SRF/derived inputs, and wider joins keep the staged
 FROM-order behavior until P8 or a barrier-specific slice.
+
+### 5.4 P8 N-way SELECT policy
+
+P8 generalizes §5.3 through the bounded state search in [estimator.md §10](estimator.md). Each
+authored `ON` tree is scheduled intact at its earliest dependency-complete physical step; every
+selected step carries its own nested-loop/INL/hash choice. The executor places each appended base
+row into its resolved source slot range before evaluating those source-ordered predicates, so a
+physical permutation never changes expression slots.
+
+Outer joins, LATERAL/correlation, SRFs, CTEs, and derived inputs are hard fences. The physical order
+may change only inside maximal all-base INNER/CROSS islands and never moves an input or compound
+subtree across a fence. DP retains the Pareto frontier required by access-dependent physical row
+counts through eight movable relations; larger islands use the one-state deterministic
+cheapest-next fallback. The final selected tree alone feeds ORDER BY/LIMIT recomputation, with only
+its final join step eligible for N-way streaming top-N.
 
 ## 6. Neutrality and determinism
 

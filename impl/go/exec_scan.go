@@ -1499,6 +1499,108 @@ func (db *engine) execStreamingJoin(plan *selectPlan, env *evalEnv, meter *costM
 	return selectResult{columnNames: plan.columnNames, columnTypes: plan.columnTypes, rows: out, cost: meter.Accrued}, nil
 }
 
+func (db *engine) execStreamingNWayJoin(plan *selectPlan, env *evalEnv, meter *costMeter, params []Value, outer []storedRow, rng *stmtRng) (selectResult, error) {
+	materialized := make([][]storedRow, len(plan.rels))
+	for ordinal, rel := range plan.rels {
+		if rel.lateral || plan.phys.relINLBounds[ordinal] != nil {
+			continue
+		}
+		rows, err := db.materializeRel(plan, ordinal, params, outer, nil, rng, env.ctes, meter)
+		if err != nil {
+			return selectResult{}, err
+		}
+		materialized[ordinal] = rows
+	}
+	finalPosition := len(plan.rels) - 1
+	running, err := db.execCostedNWayJoin(plan, env, meter, params, outer, materialized, finalPosition-1)
+	if err != nil {
+		return selectResult{}, err
+	}
+	inner := plan.phys.relationOrder[finalPosition]
+	step := plan.phys.joinSteps[finalPosition-1]
+	innerRows := materialized[inner]
+	var table *hashJoinTable
+	if step.hashJoin != nil {
+		table, err = newHashJoinTable(step.hashJoin, plan.rels[inner].offset, 0, innerRows, meter)
+		if err != nil {
+			return selectResult{}, err
+		}
+	}
+	var offset int64
+	if plan.offset != nil {
+		offset = *plan.offset
+	}
+	var passed int64
+	var out [][]Value
+	if plan.limit == nil || *plan.limit > 0 {
+	outerLoop:
+		for _, left := range running {
+			candidates := innerRows
+			if plan.phys.relINLBounds[inner] != nil {
+				candidates, err = db.materializeRel(plan, inner, params, outer, left, rng, env.ctes, meter)
+				if err != nil {
+					return selectResult{}, err
+				}
+			} else if table != nil {
+				candidates, err = table.probe(step.hashJoin, left, meter)
+				if err != nil {
+					return selectResult{}, err
+				}
+			}
+			for _, right := range candidates {
+				combined := append(storedRow(nil), left...)
+				copy(combined[plan.rels[inner].offset:], right)
+				keep := true
+				for _, onIndex := range step.onIndices {
+					if plan.joins[onIndex].on == nil {
+						continue
+					}
+					v, err := plan.joins[onIndex].on.eval(combined, env, meter)
+					if err != nil {
+						return selectResult{}, err
+					}
+					if !v.IsTrue() {
+						keep = false
+						break
+					}
+				}
+				if !keep {
+					continue
+				}
+				if plan.filter != nil {
+					v, err := plan.filter.eval(combined, env, meter)
+					if err != nil {
+						return selectResult{}, err
+					}
+					if !v.IsTrue() {
+						continue
+					}
+				}
+				passed++
+				if passed <= offset {
+					continue
+				}
+				if err := meter.Guard(); err != nil {
+					return selectResult{}, err
+				}
+				meter.Charge(costs.RowProduced)
+				projected := make([]Value, len(plan.projections))
+				for i, p := range plan.projections {
+					projected[i], err = p.eval(combined, env, meter)
+					if err != nil {
+						return selectResult{}, err
+					}
+				}
+				out = append(out, projected)
+				if plan.limit != nil && int64(len(out)) >= *plan.limit {
+					break outerLoop
+				}
+			}
+		}
+	}
+	return selectResult{columnNames: append([]string(nil), plan.columnNames...), columnTypes: append([]resolvedType(nil), plan.columnTypes...), rows: out, cost: meter.Accrued}, nil
+}
+
 // newSorterFor builds a sorter for order, bounded by this handle's workMem. Spilling is enabled only
 // when the host supplied scratch backing. The file host uses the OS temp directory independently of
 // the database path, so read-only filesystems remain readable; in-memory hosts leave it empty and
@@ -1602,6 +1704,33 @@ func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 	if sb == nil {
 		sb = plan.phys.relBounds[ri]
 	}
+	var inlFilters []*rExpr
+	var siblingColumns columnRanges
+	if inl && len(plan.phys.joinSteps)+1 == len(plan.rels) && len(plan.phys.relationOrder) == len(plan.rels) {
+		position := 0
+		for i, ordinal := range plan.phys.relationOrder {
+			if ordinal == ri {
+				position = i
+				break
+			}
+		}
+		for _, onIndex := range plan.phys.joinSteps[position-1].onIndices {
+			inlFilters = append(inlFilters, plan.joins[onIndex].on)
+		}
+		for _, ordinal := range plan.phys.relationOrder[:position] {
+			r := plan.rels[ordinal]
+			siblingColumns = append(siblingColumns, columnRange{start: r.offset, end: r.offset + r.colCount})
+		}
+	} else if inl && len(plan.phys.relationOrder) == 2 {
+		inlFilters = append(inlFilters, plan.joins[0].on)
+		siblingColumns = relationColumnRange(plan, physicalRelOrdinal(plan, 0))
+	} else if inl {
+		inlFilters = append(inlFilters, plan.joins[ri-1].on)
+		siblingColumns = columnRanges{{start: 0, end: rel.offset}}
+	}
+	if inl {
+		inlFilters = append(inlFilters, plan.filter)
+	}
 	var rows []storedRow
 	var nodeCount, slabs int
 	if sb != nil && sb.index != nil {
@@ -1614,13 +1743,7 @@ func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 		// otherwise the ordinary constant WHERE operand. The full predicate remains residual.
 		var query *rExpr
 		if inl {
-			on := plan.joins[ri-1].on
-			siblingColumns := &columnRange{start: 0, end: rel.offset}
-			if len(plan.phys.relationOrder) == 2 {
-				on = plan.joins[0].on
-				siblingColumns = relationColumnRange(plan, physicalRelOrdinal(plan, 0))
-			}
-			for _, filter := range []*rExpr{on, plan.filter} {
+			for _, filter := range inlFilters {
 				if _, q, ok := ginSiblingMatch(filter, sb.gin.colGlobal, siblingColumns); ok {
 					query = q
 					break
@@ -1645,13 +1768,7 @@ func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 		// Re-find Q using the same operand class as planning. GiST remains always-recheck.
 		var query *rExpr
 		if inl {
-			on := plan.joins[ri-1].on
-			siblingColumns := &columnRange{start: 0, end: rel.offset}
-			if len(plan.phys.relationOrder) == 2 {
-				on = plan.joins[0].on
-				siblingColumns = relationColumnRange(plan, physicalRelOrdinal(plan, 0))
-			}
-			for _, filter := range []*rExpr{on, plan.filter} {
+			for _, filter := range inlFilters {
 				var q *rExpr
 				var ok bool
 				if sb.gist.strategy == gistEqual {

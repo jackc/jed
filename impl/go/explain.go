@@ -348,6 +348,9 @@ func (db *engine) renderFrom(r *explainRender, sp *selectPlan, depth int, orderN
 // join (joins[n-2]), whose left subtree is the join over the first n-1 relations and whose right child
 // is rels[n-1]. note tags the outermost node with an elided ORDER BY.
 func (db *engine) renderJoinTree(r *explainRender, sp *selectPlan, n, depth int, note string) error {
+	if len(sp.rels) >= 3 && len(sp.phys.relationOrder) == len(sp.rels) && len(sp.phys.joinSteps)+1 == len(sp.rels) {
+		return db.renderNWayJoinTree(r, sp, n, depth, note)
+	}
 	if n == 1 {
 		return db.renderRelLeaf(r, sp, 0, depth, note)
 	}
@@ -372,6 +375,43 @@ func (db *engine) renderJoinTree(r *explainRender, sp *selectPlan, n, depth int,
 		return err
 	}
 	return db.renderRelLeaf(r, sp, n-1, depth+1, "")
+}
+
+func (db *engine) renderNWayJoinTree(r *explainRender, sp *selectPlan, n, depth int, note string) error {
+	if n == 1 {
+		return db.renderRelLeaf(r, sp, sp.phys.relationOrder[0], depth, note)
+	}
+	step := sp.phys.joinSteps[n-2]
+	conjuncts := 0
+	for _, onIndex := range step.onIndices {
+		if sp.joins[onIndex].on != nil {
+			conjuncts += conjunctCount(sp.joins[onIndex].on)
+		}
+	}
+	kind := "cross"
+	if len(step.onIndices) > 0 {
+		kind = "inner"
+	}
+	node := "Nested Loop"
+	detail := kind
+	if len(step.onIndices) == 1 {
+		detail = fmt.Sprintf("%s; on:conjuncts=%d", kind, conjuncts)
+	} else if len(step.onIndices) > 1 {
+		detail = fmt.Sprintf("%s; on:predicates=%d,conjuncts=%d", kind, len(step.onIndices), conjuncts)
+	}
+	if step.hashJoin != nil {
+		node = "Hash Join"
+		if len(step.onIndices) == 1 {
+			detail = fmt.Sprintf("%s; keys=%d; on:conjuncts=%d", kind, len(step.hashJoin.keys), conjuncts)
+		} else {
+			detail = fmt.Sprintf("%s; keys=%d; on:predicates=%d,conjuncts=%d", kind, len(step.hashJoin.keys), len(step.onIndices), conjuncts)
+		}
+	}
+	r.emit(depth, node, withNote(detail, note))
+	if err := db.renderNWayJoinTree(r, sp, n-1, depth+1, ""); err != nil {
+		return err
+	}
+	return db.renderRelLeaf(r, sp, sp.phys.relationOrder[n-1], depth+1, "")
 }
 
 // renderRelLeaf emits one relation: a base-table Scan (with its access path), an SRF, a CTE Scan, or a

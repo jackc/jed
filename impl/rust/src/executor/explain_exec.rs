@@ -409,6 +409,12 @@ impl Engine {
         depth: i64,
         note: &str,
     ) -> Result<()> {
+        if sp.phys.relation_order.len() == sp.rels.len()
+            && sp.phys.join_steps.len() + 1 == sp.rels.len()
+            && sp.rels.len() >= 3
+        {
+            return self.render_nway_join_tree(r, sp, n, depth, note);
+        }
         if n == 1 {
             return self.render_rel_leaf(r, sp, 0, depth, note);
         }
@@ -436,6 +442,56 @@ impl Engine {
         }
         self.render_join_tree(r, sp, n - 1, depth + 1, "")?;
         self.render_rel_leaf(r, sp, n - 1, depth + 1, "")
+    }
+
+    fn render_nway_join_tree(
+        &self,
+        r: &mut ExplainRender,
+        sp: &SelectPlan,
+        n: usize,
+        depth: i64,
+        note: &str,
+    ) -> Result<()> {
+        if n == 1 {
+            return self.render_rel_leaf(r, sp, sp.phys.relation_order[0], depth, note);
+        }
+        let step = &sp.phys.join_steps[n - 2];
+        let conjuncts = step.on_indices.iter().fold(0i64, |total, index| {
+            total + sp.joins[*index].on.as_ref().map_or(0, conjunct_count)
+        });
+        let kind = if step.on_indices.is_empty() {
+            "cross"
+        } else {
+            "inner"
+        };
+        let (node, detail) = match &step.hash_join {
+            Some(hash) if step.on_indices.len() == 1 => (
+                "Hash Join",
+                format!("{kind}; keys={}; on:conjuncts={conjuncts}", hash.keys.len()),
+            ),
+            Some(hash) => (
+                "Hash Join",
+                format!(
+                    "{kind}; keys={}; on:predicates={},conjuncts={conjuncts}",
+                    hash.keys.len(),
+                    step.on_indices.len()
+                ),
+            ),
+            None if step.on_indices.is_empty() => ("Nested Loop", kind.to_string()),
+            None if step.on_indices.len() == 1 => {
+                ("Nested Loop", format!("{kind}; on:conjuncts={conjuncts}"))
+            }
+            None => (
+                "Nested Loop",
+                format!(
+                    "{kind}; on:predicates={},conjuncts={conjuncts}",
+                    step.on_indices.len()
+                ),
+            ),
+        };
+        r.emit(depth, node, with_note(detail, note));
+        self.render_nway_join_tree(r, sp, n - 1, depth + 1, "")?;
+        self.render_rel_leaf(r, sp, sp.phys.relation_order[n - 1], depth + 1, "")
     }
 
     /// Emit one relation: a base-table Scan (with its access path), an SRF, a CTE Scan, or a Subquery

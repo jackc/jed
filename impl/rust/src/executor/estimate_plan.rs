@@ -298,6 +298,11 @@ impl Engine {
         n: usize,
         ctx: Option<&EstimateCteCtx>,
     ) -> EstimatedPlan {
+        if sp.phys.relation_order.len() == sp.rels.len()
+            && sp.phys.join_steps.len() + 1 == sp.rels.len()
+        {
+            return self.estimate_nway_join_tree(sp, n, ctx);
+        }
         if n == 2 && sp.phys.relation_order.len() == 2 {
             return self.estimate_two_relation_join(sp, ctx);
         }
@@ -374,6 +379,129 @@ impl Engine {
         );
         self.add_expression_subqueries(&mut root, join.on.as_ref(), invocations, ctx);
         EstimatedPlan::parent(root, &[&left, &right])
+    }
+
+    fn estimate_nway_join_tree(
+        &self,
+        sp: &SelectPlan,
+        n: usize,
+        ctx: Option<&EstimateCteCtx>,
+    ) -> EstimatedPlan {
+        if n == 1 {
+            return self.estimate_relation(sp, sp.phys.relation_order[0], ctx);
+        }
+        let outer = self.estimate_nway_join_tree(sp, n - 1, ctx);
+        let inner_ordinal = sp.phys.relation_order[n - 1];
+        let inner_per_call = self.estimate_relation(sp, inner_ordinal, ctx);
+        let bound_by_outer = sp.phys.rel_inl_bounds[inner_ordinal].is_some();
+        let full_pairs = sat_mul(outer.root.rows, inner_per_call.root.rows);
+        let full_logical_pairs = sat_mul(outer.root.logical_rows, inner_per_call.root.logical_rows);
+        let step = &sp.phys.join_steps[n - 2];
+        let mut full_rows = full_pairs;
+        let mut full_logical_rows = if bound_by_outer {
+            full_pairs
+        } else {
+            full_logical_pairs
+        };
+        if !bound_by_outer {
+            for &on_index in &step.on_indices {
+                let selectivity = estimator_predicate_selectivity(sp.joins[on_index].on.as_ref());
+                full_rows = estimate_rows(&selectivity, full_rows);
+                full_logical_rows = estimate_rows(&selectivity, full_logical_rows);
+            }
+        }
+
+        let mut outer_calls = outer.root.rows;
+        let mut delivered_rows = full_rows;
+        if n == sp.rels.len() && sp.phys.join_pk_ordered {
+            if let Some(limit) = sp.limit {
+                let target = sat_add(limit, sp.offset.unwrap_or(0));
+                let post_filter_rows = sp.filter.as_ref().map_or(full_rows, |filter| {
+                    estimate_rows(&estimator_predicate_selectivity(Some(filter)), full_rows)
+                });
+                if target == 0 {
+                    outer_calls = 0;
+                    delivered_rows = 0;
+                } else if post_filter_rows > target && full_rows > 0 {
+                    outer_calls = ceil_estimate_mul_div(target, outer.root.rows, post_filter_rows)
+                        .min(outer.root.rows);
+                    delivered_rows = ceil_estimate_mul_div(outer_calls, full_rows, outer.root.rows)
+                        .min(full_rows);
+                }
+            }
+        }
+
+        let mut inner = inner_per_call.clone();
+        let mut visited_pairs = full_pairs;
+        if bound_by_outer {
+            inner.root = inner.root.repeated(outer_calls);
+            inner.nodes = inner
+                .nodes
+                .iter()
+                .map(|node| node.repeated(outer_calls))
+                .collect();
+            visited_pairs = inner.root.rows;
+        } else if outer_calls < outer.root.rows {
+            visited_pairs = ceil_estimate_mul_div(outer_calls, full_pairs, outer.root.rows);
+        }
+
+        let mut root = outer.root.add(&inner.root);
+        root.rows = delivered_rows;
+        root.logical_rows = full_logical_rows;
+        let mut invocations = visited_pairs;
+        if let Some(hash) = &step.hash_join {
+            let (key_bytes, framed_bytes) =
+                hash.keys
+                    .iter()
+                    .fold((0, 0), |(key_total, framed_total), key| {
+                        let width = match &key.ty {
+                            Type::Scalar(scalar) if scalar.is_fixed_width() => {
+                                scalar.width_bytes() as i64
+                            }
+                            _ => DEFAULT_VARIABLE_KEY_BYTES,
+                        };
+                        (
+                            sat_add(key_total, width),
+                            sat_add(framed_total, sat_add(4, width)),
+                        )
+                    });
+            root.add_unit(
+                UNIT_HASH_BUILD,
+                sat_mul(inner_per_call.root.rows, key_bytes),
+            );
+            root.add_unit(
+                UNIT_HASH_PROBE,
+                sat_add(
+                    sat_mul(outer_calls, key_bytes),
+                    sat_mul(delivered_rows, framed_bytes),
+                ),
+            );
+            invocations = delivered_rows;
+        }
+        let on_nodes = step.on_indices.iter().fold(0, |total, on_index| {
+            sat_add(
+                total,
+                estimator_operator_nodes(sp.joins[*on_index].on.as_ref()),
+            )
+        });
+        root.add_unit(UNIT_OPERATOR_EVAL, sat_mul(on_nodes, invocations));
+        for &on_index in &step.on_indices {
+            self.add_expression_subqueries(
+                &mut root,
+                sp.joins[on_index].on.as_ref(),
+                invocations,
+                ctx,
+            );
+        }
+        EstimatedPlan::parent(root, &[&outer, &inner])
+    }
+
+    pub(crate) fn estimate_join_search_prefix(
+        &self,
+        sp: &SelectPlan,
+        relations: usize,
+    ) -> PlanEstimate {
+        self.estimate_nway_join_tree(sp, relations, None).root
     }
 
     fn estimate_two_relation_join(

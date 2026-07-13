@@ -23,6 +23,45 @@ fn relation_columns(plan: &SelectPlan, ordinal: usize) -> (usize, usize) {
     (rel.offset, rel.offset + rel.col_count)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum JoinSearchAlgorithm {
+    Inl,
+    Hash,
+    Nested,
+}
+
+#[derive(Clone)]
+enum JoinSearchAccess {
+    Ordinary(ScanCandidateIdentity),
+    Inl {
+        identity: ScanCandidateIdentity,
+        on_index: Option<usize>,
+    },
+}
+
+impl JoinSearchAccess {
+    fn identity(&self) -> &ScanCandidateIdentity {
+        match self {
+            Self::Ordinary(identity) | Self::Inl { identity, .. } => identity,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct JoinSearchStep {
+    algorithm: JoinSearchAlgorithm,
+    on_indices: Vec<usize>,
+}
+
+#[derive(Clone)]
+struct JoinSearchState {
+    order: Vec<usize>,
+    access: Vec<JoinSearchAccess>,
+    steps: Vec<JoinSearchStep>,
+    estimate: crate::estimator::PlanEstimate,
+    satisfies_query_order: bool,
+}
+
 impl Engine {
     /// Apply the physical rules to a freshly resolved logical plan, in a FIXED order that is part
     /// of the cross-core contract (spec/design/planner.md §4): later rules read earlier rules'
@@ -39,6 +78,7 @@ impl Engine {
         self.rule_order_by_index_scan(plan, scope);
         self.rule_costed_single_relation_pipeline(plan, scope);
         self.rule_costed_two_relation_join(plan, scope);
+        self.rule_costed_nway_join(plan, scope);
         self.rule_join_pk_ordered(plan, scope);
         self.rule_order_by_limit_top_k(plan);
     }
@@ -151,7 +191,7 @@ impl Engine {
                     plan.joins[0].on.as_ref(),
                     plan.filter.as_ref(),
                     &scope.rels[inner],
-                    relation_columns(plan, outer),
+                    &[relation_columns(plan, outer)],
                     scope.catalog,
                 ) {
                     candidates.push(Candidate {
@@ -239,19 +279,395 @@ impl Engine {
         }
     }
 
-    fn join_pk_ordered_for_candidate(&self, plan: &SelectPlan, scope: &Scope<'_>) -> bool {
-        if plan.rels.len() != 2 || scope.rels.len() != 2 || plan.joins.len() != 1 {
-            return false;
+    /// P8's bounded deterministic N-way left-deep search. The initial implementation searches the
+    /// maximal fence-free shape represented by this flat plan: three or more non-lateral base
+    /// relations connected entirely by INNER/CROSS edges. Any semantic barrier retains the legacy
+    /// source-order tree, so no relation can cross it.
+    fn rule_costed_nway_join(&self, plan: &mut SelectPlan, scope: &Scope<'_>) {
+        let n = plan.rels.len();
+        if n < 3
+            || scope.rels.len() != n
+            || plan.joins.len() + 1 != n
+            || plan
+                .joins
+                .iter()
+                .any(|join| !matches!(join.kind, JoinKind::Inner | JoinKind::Cross))
+            || plan.rels.iter().any(|rel| {
+                rel.lateral || rel.srf.is_some() || rel.cte.is_some() || rel.derived.is_some()
+            })
+        {
+            return;
         }
-        let outer = physical_rel_ordinal(plan, 0);
-        let inner = physical_rel_ordinal(plan, 1);
+
+        let winner = if n <= crate::estimator_constants::JOIN_DP_LIMIT {
+            self.search_nway_dp(plan, scope)
+        } else {
+            self.search_nway_greedy(plan, scope)
+        };
+        let Some(winner) = winner else { return };
+        self.install_nway_state(plan, scope, &winner);
+        plan.phys.pk_ordered = false;
+        plan.phys.pk_reverse = false;
+        plan.phys.index_order = None;
+        plan.phys.join_pk_ordered =
+            winner.satisfies_query_order && self.join_pk_ordered_for_candidate(plan, scope);
+        plan.phys.top_k = None;
+    }
+
+    fn search_nway_dp(&self, plan: &mut SelectPlan, scope: &Scope<'_>) -> Option<JoinSearchState> {
+        let n = plan.rels.len();
+        let bucket_count = (1usize << n) * 2;
+        let mut frontiers: Vec<Vec<JoinSearchState>> = vec![Vec::new(); bucket_count];
+        for ordinal in 0..n {
+            let identities: Vec<_> = inventory_scan_candidates(
+                plan.filter.as_ref(),
+                &scope.rels[ordinal],
+                scope.catalog,
+            )
+            .into_iter()
+            .map(|candidate| candidate.identity)
+            .collect();
+            for identity in identities {
+                let mut state = JoinSearchState {
+                    order: vec![ordinal],
+                    access: vec![JoinSearchAccess::Ordinary(identity)],
+                    steps: Vec::new(),
+                    estimate: crate::estimator::PlanEstimate::empty(0),
+                    satisfies_query_order: false,
+                };
+                self.refresh_nway_state(plan, scope, &mut state);
+                state.satisfies_query_order =
+                    self.nway_driver_satisfies_order(plan, scope, ordinal);
+                let index = frontier_index(nway_state_mask(&state), state.satisfies_query_order);
+                insert_nway_frontier(&mut frontiers[index], state);
+            }
+        }
+
+        for size in 1..n {
+            for mask in 1usize..(1usize << n) {
+                if mask.count_ones() as usize != size {
+                    continue;
+                }
+                for ordered in [false, true] {
+                    let states = frontiers[frontier_index(mask, ordered)].clone();
+                    for state in states {
+                        for candidate in self.expand_nway_state(plan, scope, &state) {
+                            let next_mask = nway_state_mask(&candidate);
+                            let index = frontier_index(next_mask, candidate.satisfies_query_order);
+                            insert_nway_frontier(&mut frontiers[index], candidate);
+                        }
+                    }
+                }
+            }
+        }
+
+        let full_mask = (1usize << n) - 1;
+        let mut completed = Vec::new();
+        for ordered in [false, true] {
+            completed.extend(frontiers[frontier_index(full_mask, ordered)].clone());
+        }
+        completed.sort_by(compare_nway_state);
+        let mut winner: Option<(i64, JoinSearchState)> = None;
+        for state in completed {
+            self.install_nway_state(plan, scope, &state);
+            plan.phys.join_pk_ordered =
+                state.satisfies_query_order && self.join_pk_ordered_for_candidate(plan, scope);
+            let cost = self.estimate_select_plan_cost(plan);
+            if winner.as_ref().is_none_or(|(prior, _)| cost < *prior) {
+                winner = Some((cost, state));
+            }
+        }
+        winner.map(|(_, state)| state)
+    }
+
+    fn search_nway_greedy(
+        &self,
+        plan: &mut SelectPlan,
+        scope: &Scope<'_>,
+    ) -> Option<JoinSearchState> {
+        let n = plan.rels.len();
+        let mut drivers = Vec::new();
+        for ordinal in 0..n {
+            let identities: Vec<_> = inventory_scan_candidates(
+                plan.filter.as_ref(),
+                &scope.rels[ordinal],
+                scope.catalog,
+            )
+            .into_iter()
+            .map(|candidate| candidate.identity)
+            .collect();
+            for identity in identities {
+                let mut state = JoinSearchState {
+                    order: vec![ordinal],
+                    access: vec![JoinSearchAccess::Ordinary(identity)],
+                    steps: Vec::new(),
+                    estimate: crate::estimator::PlanEstimate::empty(0),
+                    satisfies_query_order: false,
+                };
+                self.refresh_nway_state(plan, scope, &mut state);
+                state.satisfies_query_order =
+                    self.nway_driver_satisfies_order(plan, scope, ordinal);
+                drivers.push(state);
+            }
+        }
+        drivers.sort_by(compare_nway_state);
+        let mut state = drivers.into_iter().min_by(|a, b| {
+            a.estimate
+                .cost()
+                .cmp(&b.estimate.cost())
+                .then_with(|| compare_nway_state(a, b))
+        })?;
+        while state.order.len() < n {
+            let mut next = self.expand_nway_state(plan, scope, &state);
+            next.sort_by(compare_nway_state);
+            state = next.into_iter().min_by(|a, b| {
+                a.estimate
+                    .cost()
+                    .cmp(&b.estimate.cost())
+                    .then_with(|| compare_nway_state(a, b))
+            })?;
+        }
+        Some(state)
+    }
+
+    fn expand_nway_state(
+        &self,
+        plan: &mut SelectPlan,
+        scope: &Scope<'_>,
+        state: &JoinSearchState,
+    ) -> Vec<JoinSearchState> {
+        let n = plan.rels.len();
+        let mut present = vec![false; n];
+        for &ordinal in &state.order {
+            present[ordinal] = true;
+        }
+        let sibling_columns: Vec<_> = state
+            .order
+            .iter()
+            .map(|&ordinal| relation_columns(plan, ordinal))
+            .collect();
+        let mut out = Vec::new();
+        for inner in 0..n {
+            if present[inner] {
+                continue;
+            }
+            let mut after = present.clone();
+            after[inner] = true;
+            let on_indices = newly_ready_on_indices(plan, &present, &after);
+
+            let mut inl_choices = Vec::new();
+            for &on_index in &on_indices {
+                for candidate in inventory_inl_candidates(
+                    plan.joins[on_index].on.as_ref(),
+                    None,
+                    &scope.rels[inner],
+                    &sibling_columns,
+                    scope.catalog,
+                ) {
+                    inl_choices.push((candidate.identity, Some(on_index)));
+                }
+            }
+            for candidate in inventory_inl_candidates(
+                None,
+                plan.filter.as_ref(),
+                &scope.rels[inner],
+                &sibling_columns,
+                scope.catalog,
+            ) {
+                inl_choices.push((candidate.identity, None));
+            }
+            inl_choices
+                .sort_by(|a, b| compare_scan_identity(&a.0, &b.0).then_with(|| a.1.cmp(&b.1)));
+            inl_choices.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+            for (identity, on_index) in inl_choices {
+                let mut candidate = state.clone();
+                candidate.order.push(inner);
+                candidate
+                    .access
+                    .push(JoinSearchAccess::Inl { identity, on_index });
+                candidate.steps.push(JoinSearchStep {
+                    algorithm: JoinSearchAlgorithm::Inl,
+                    on_indices: on_indices.clone(),
+                });
+                self.refresh_nway_state(plan, scope, &mut candidate);
+                out.push(candidate);
+            }
+
+            let identities: Vec<_> =
+                inventory_scan_candidates(plan.filter.as_ref(), &scope.rels[inner], scope.catalog)
+                    .into_iter()
+                    .map(|candidate| candidate.identity)
+                    .collect();
+            let has_hash = self
+                .hash_join_plan_for_ons(plan, scope, &state.order, inner, &on_indices)
+                .is_some();
+            for identity in identities {
+                if has_hash {
+                    let mut candidate = state.clone();
+                    candidate.order.push(inner);
+                    candidate
+                        .access
+                        .push(JoinSearchAccess::Ordinary(identity.clone()));
+                    candidate.steps.push(JoinSearchStep {
+                        algorithm: JoinSearchAlgorithm::Hash,
+                        on_indices: on_indices.clone(),
+                    });
+                    self.refresh_nway_state(plan, scope, &mut candidate);
+                    out.push(candidate);
+                }
+                let mut candidate = state.clone();
+                candidate.order.push(inner);
+                candidate.access.push(JoinSearchAccess::Ordinary(identity));
+                candidate.steps.push(JoinSearchStep {
+                    algorithm: JoinSearchAlgorithm::Nested,
+                    on_indices: on_indices.clone(),
+                });
+                self.refresh_nway_state(plan, scope, &mut candidate);
+                out.push(candidate);
+            }
+        }
+        out.sort_by(compare_nway_state);
+        out
+    }
+
+    fn refresh_nway_state(
+        &self,
+        plan: &mut SelectPlan,
+        scope: &Scope<'_>,
+        state: &mut JoinSearchState,
+    ) {
+        self.install_nway_state(plan, scope, state);
+        plan.phys.join_pk_ordered = false;
+        state.estimate = self.estimate_join_search_prefix(plan, state.order.len());
+    }
+
+    fn install_nway_state(
+        &self,
+        plan: &mut SelectPlan,
+        scope: &Scope<'_>,
+        state: &JoinSearchState,
+    ) {
+        let n = plan.rels.len();
+        plan.phys.relation_order = state.order.clone();
+        plan.phys
+            .relation_order
+            .extend((0..n).filter(|ordinal| !state.order.contains(ordinal)));
+        plan.phys.rel_bounds = (0..n).map(|_| None).collect();
+        plan.phys.rel_inl_bounds = (0..n).map(|_| None).collect();
+        plan.phys.hash_join = None;
+        plan.phys.join_steps.clear();
+
+        for (position, access) in state.access.iter().enumerate() {
+            let ordinal = state.order[position];
+            match access {
+                JoinSearchAccess::Ordinary(identity) => {
+                    plan.phys.rel_bounds[ordinal] = inventory_scan_candidates(
+                        plan.filter.as_ref(),
+                        &scope.rels[ordinal],
+                        scope.catalog,
+                    )
+                    .into_iter()
+                    .find(|candidate| candidate.identity == *identity)
+                    .and_then(|candidate| candidate.bound);
+                }
+                JoinSearchAccess::Inl { identity, on_index } => {
+                    let sibling_columns: Vec<_> = state.order[..position]
+                        .iter()
+                        .map(|&source| relation_columns(plan, source))
+                        .collect();
+                    let (on, filter) = match on_index {
+                        Some(index) => (plan.joins[*index].on.as_ref(), None),
+                        None => (None, plan.filter.as_ref()),
+                    };
+                    plan.phys.rel_inl_bounds[ordinal] = inventory_inl_candidates(
+                        on,
+                        filter,
+                        &scope.rels[ordinal],
+                        &sibling_columns,
+                        scope.catalog,
+                    )
+                    .into_iter()
+                    .find(|candidate| candidate.identity == *identity)
+                    .and_then(|candidate| candidate.bound);
+                }
+            }
+        }
+
+        for (position, step) in state.steps.iter().enumerate() {
+            let inner = state.order[position + 1];
+            let hash_join = (step.algorithm == JoinSearchAlgorithm::Hash)
+                .then(|| {
+                    self.hash_join_plan_for_ons(
+                        plan,
+                        scope,
+                        &state.order[..position + 1],
+                        inner,
+                        &step.on_indices,
+                    )
+                })
+                .flatten();
+            plan.phys.join_steps.push(PhysicalJoinStep {
+                on_indices: step.on_indices.clone(),
+                hash_join,
+            });
+        }
+        plan.phys.pk_ordered = false;
+        plan.phys.pk_reverse = false;
+        plan.phys.index_order = None;
+        plan.phys.top_k = None;
+    }
+
+    fn nway_driver_satisfies_order(
+        &self,
+        plan: &SelectPlan,
+        scope: &Scope<'_>,
+        driver: usize,
+    ) -> bool {
         !plan.is_agg
             && !plan.has_window
             && !plan.distinct
             && !plan.order.is_empty()
             && plan.order_exprs.is_empty()
             && plan.limit.is_some()
-            && matches!(plan.joins[0].kind, JoinKind::Inner | JoinKind::Cross)
+            && matches!(plan.phys.rel_bounds[driver], None | Some(ScanBound::Pk(_)))
+            && order_satisfied_by_pk(
+                scope.rels[driver].table,
+                plan.rels[driver].offset,
+                &plan.order,
+                self,
+            ) == Some(false)
+    }
+
+    fn hash_join_plan_for_ons(
+        &self,
+        plan: &SelectPlan,
+        scope: &Scope<'_>,
+        outer_relations: &[usize],
+        inner: usize,
+        on_indices: &[usize],
+    ) -> Option<HashJoinPlan> {
+        build_hash_join_plan_for_ons(plan, scope, outer_relations, inner, on_indices)
+    }
+
+    fn join_pk_ordered_for_candidate(&self, plan: &SelectPlan, scope: &Scope<'_>) -> bool {
+        if plan.rels.len() < 2
+            || scope.rels.len() != plan.rels.len()
+            || plan.joins.len() + 1 != plan.rels.len()
+        {
+            return false;
+        }
+        let outer = physical_rel_ordinal(plan, 0);
+        let inner = physical_rel_ordinal(plan, plan.rels.len() - 1);
+        !plan.is_agg
+            && !plan.has_window
+            && !plan.distinct
+            && !plan.order.is_empty()
+            && plan.order_exprs.is_empty()
+            && plan.limit.is_some()
+            && plan
+                .joins
+                .iter()
+                .all(|join| matches!(join.kind, JoinKind::Inner | JoinKind::Cross))
             && plan
                 .rels
                 .iter()
@@ -282,17 +698,173 @@ impl Engine {
     }
 }
 
+fn compare_scan_identity(
+    a: &ScanCandidateIdentity,
+    b: &ScanCandidateIdentity,
+) -> std::cmp::Ordering {
+    a.kind
+        .cmp(&b.kind)
+        .then_with(|| a.index_name.as_bytes().cmp(b.index_name.as_bytes()))
+}
+
+fn compare_nway_state(a: &JoinSearchState, b: &JoinSearchState) -> std::cmp::Ordering {
+    a.order
+        .cmp(&b.order)
+        .then_with(|| {
+            a.access
+                .iter()
+                .zip(&b.access)
+                .find_map(|(left, right)| {
+                    let identity = compare_scan_identity(left.identity(), right.identity());
+                    if identity != std::cmp::Ordering::Equal {
+                        return Some(identity);
+                    }
+                    match (left, right) {
+                        (
+                            JoinSearchAccess::Inl { on_index: a, .. },
+                            JoinSearchAccess::Inl { on_index: b, .. },
+                        ) if a != b => Some(a.cmp(b)),
+                        _ => None,
+                    }
+                })
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .then_with(|| {
+            a.steps
+                .iter()
+                .zip(&b.steps)
+                .find_map(|(left, right)| {
+                    let algorithm = left.algorithm.cmp(&right.algorithm);
+                    if algorithm != std::cmp::Ordering::Equal {
+                        Some(algorithm)
+                    } else if left.on_indices != right.on_indices {
+                        Some(left.on_indices.cmp(&right.on_indices))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+}
+
+fn nway_state_mask(state: &JoinSearchState) -> usize {
+    state
+        .order
+        .iter()
+        .fold(0usize, |mask, ordinal| mask | (1usize << ordinal))
+}
+
+fn frontier_index(mask: usize, ordered: bool) -> usize {
+    mask * 2 + usize::from(ordered)
+}
+
+fn insert_nway_frontier(frontier: &mut Vec<JoinSearchState>, candidate: JoinSearchState) {
+    let candidate_cost = candidate.estimate.cost();
+    let candidate_rows = candidate.estimate.rows;
+    let candidate_logical = candidate.estimate.logical_rows;
+    if frontier.iter().any(|prior| {
+        let prior_cost = prior.estimate.cost();
+        let weak = prior_cost <= candidate_cost
+            && prior.estimate.rows <= candidate_rows
+            && prior.estimate.logical_rows <= candidate_logical;
+        let strict = prior_cost < candidate_cost
+            || prior.estimate.rows < candidate_rows
+            || prior.estimate.logical_rows < candidate_logical;
+        (weak && strict)
+            || (prior_cost == candidate_cost
+                && prior.estimate.rows == candidate_rows
+                && prior.estimate.logical_rows == candidate_logical
+                && compare_nway_state(prior, &candidate) != std::cmp::Ordering::Greater)
+    }) {
+        return;
+    }
+    frontier.retain(|prior| {
+        !(candidate_cost <= prior.estimate.cost()
+            && candidate_rows <= prior.estimate.rows
+            && candidate_logical <= prior.estimate.logical_rows
+            && (candidate_cost < prior.estimate.cost()
+                || candidate_rows < prior.estimate.rows
+                || candidate_logical < prior.estimate.logical_rows))
+    });
+    frontier.push(candidate);
+    frontier.sort_by(compare_nway_state);
+}
+
+fn expression_relation_dependencies(plan: &SelectPlan, expr: &RExpr, present: &mut [bool]) {
+    if let RExpr::Column(index) = expr {
+        if let Some((ordinal, _)) = plan
+            .rels
+            .iter()
+            .enumerate()
+            .find(|(_, rel)| *index >= rel.offset && *index < rel.offset + rel.col_count)
+        {
+            present[ordinal] = true;
+        }
+    }
+    for child in estimator_expression_children(expr) {
+        expression_relation_dependencies(plan, child, present);
+    }
+}
+
+fn join_on_dependencies(plan: &SelectPlan, join_index: usize) -> Vec<bool> {
+    let mut dependencies = vec![false; plan.rels.len()];
+    dependencies[join_index + 1] = true; // the authored right-side owner is always a dependency
+    if let Some(on) = &plan.joins[join_index].on {
+        expression_relation_dependencies(plan, on, &mut dependencies);
+    }
+    dependencies
+}
+
+fn newly_ready_on_indices(plan: &SelectPlan, before: &[bool], after: &[bool]) -> Vec<usize> {
+    plan.joins
+        .iter()
+        .enumerate()
+        .filter_map(|(index, join)| {
+            join.on.as_ref()?;
+            let dependencies = join_on_dependencies(plan, index);
+            let ready_after = dependencies
+                .iter()
+                .enumerate()
+                .all(|(ordinal, needed)| !needed || after[ordinal]);
+            let ready_before = dependencies
+                .iter()
+                .enumerate()
+                .all(|(ordinal, needed)| !needed || before[ordinal]);
+            (ready_after && !ready_before).then_some(index)
+        })
+        .collect()
+}
+
 fn build_hash_join_plan(
     plan: &SelectPlan,
     scope: &Scope<'_>,
     outer: usize,
     inner: usize,
 ) -> Option<HashJoinPlan> {
-    let on = plan.joins[0].on.as_ref()?;
+    build_hash_join_plan_for_ons(plan, scope, &[outer], inner, &[0])
+}
+
+fn build_hash_join_plan_for_ons(
+    plan: &SelectPlan,
+    scope: &Scope<'_>,
+    outer_relations: &[usize],
+    inner: usize,
+    on_indices: &[usize],
+) -> Option<HashJoinPlan> {
+    if on_indices.is_empty() {
+        return None;
+    }
     let mut conjuncts = Vec::new();
-    flatten_hash_join_conjuncts(on, &mut conjuncts);
-    let outer_columns = relation_columns(plan, outer);
+    for &on_index in on_indices {
+        flatten_hash_join_conjuncts(plan.joins[on_index].on.as_ref()?, &mut conjuncts);
+    }
     let inner_columns = relation_columns(plan, inner);
+    let is_outer_column = |index: usize| {
+        outer_relations.iter().any(|ordinal| {
+            let (start, end) = relation_columns(plan, *ordinal);
+            index >= start && index < end
+        })
+    };
     let mut keys = Vec::new();
     for expr in conjuncts {
         if !hash_join_safe_conjunct(expr) {
@@ -311,18 +883,10 @@ fn build_hash_join_plan(
             continue;
         };
         let (mut left, mut right) = (*left, *right);
-        if left >= inner_columns.0
-            && left < inner_columns.1
-            && right >= outer_columns.0
-            && right < outer_columns.1
-        {
+        if left >= inner_columns.0 && left < inner_columns.1 && is_outer_column(right) {
             std::mem::swap(&mut left, &mut right);
         }
-        if left < outer_columns.0
-            || left >= outer_columns.1
-            || right < inner_columns.0
-            || right >= inner_columns.1
-        {
+        if !is_outer_column(left) || right < inner_columns.0 || right >= inner_columns.1 {
             continue;
         }
         let Some(left_ty) = hash_join_column_type(&scope.rels, left) else {

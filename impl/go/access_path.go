@@ -370,7 +370,7 @@ type indexBoundPlan struct {
 // equality prefix that is not a fixed-width scalar — the width-based key-suffix skip needs it).
 // siblingColumns opens the index-nested-loop door by admitting a bare sibling reColumn in the
 // selected physical-left relation's global slot interval; nil is an ordinary bound.
-func (db *engine) buildIndexAccessPredicate(filter *rExpr, rel scopeRel, idx indexDef, siblingColumns *columnRange) *indexBoundPlan {
+func (db *engine) buildIndexAccessPredicate(filter *rExpr, rel scopeRel, idx indexDef, siblingColumns columnRanges) *indexBoundPlan {
 	if idx.Kind != indexBtree {
 		return nil
 	}
@@ -807,7 +807,7 @@ func reduceIntervalUnion(e *rExpr, keyIdx int, keyType scalarType, colColl strin
 // superset), so the ROWS are unchanged; only the inner re-scan cost drops. Caller restricts this to
 // a base table that is the right/nullable side of an INNER/CROSS/LEFT join.
 func detectINLBound(on *rExpr, whereFilter *rExpr, rel scopeRel, db *engine) *scanBound {
-	candidates := inventoryINLCandidates(on, whereFilter, rel, &columnRange{start: 0, end: rel.offset}, db)
+	candidates := inventoryINLCandidates(on, whereFilter, rel, columnRanges{{start: 0, end: rel.offset}}, db)
 	if len(candidates) == 0 {
 		return nil
 	}
@@ -817,7 +817,7 @@ func detectINLBound(on *rExpr, whereFilter *rExpr, rel scopeRel, db *engine) *sc
 // inventoryINLCandidates returns every sibling-dependent access path for rel in canonical
 // estimator order. siblingColumns is the selected physical-left relation's logical slot interval;
 // this is deliberately independent of FROM ordinal so P7 can cost the reverse orientation.
-func inventoryINLCandidates(on *rExpr, whereFilter *rExpr, rel scopeRel, siblingColumns *columnRange, db *engine) []scanCandidate {
+func inventoryINLCandidates(on *rExpr, whereFilter *rExpr, rel scopeRel, siblingColumns columnRanges, db *engine) []scanCandidate {
 	// A host-attached inner relation full-scans per outer row this slice (attached-databases.md §8):
 	// the seek would resolve its index store unscoped. Index-nested-loop over an attachment is a
 	// perf follow-on.
@@ -1054,7 +1054,7 @@ func ginMatch(filter *rExpr, colGlobal int) (ginStrategy, *rExpr, bool) {
 
 // ginSiblingMatch is the join counterpart of ginMatch: Q must be a bare column from an earlier
 // sibling relation. Expressions, the indexed inner column, and later-sibling columns are rejected.
-func ginSiblingMatch(filter *rExpr, colGlobal int, siblingColumns *columnRange) (ginStrategy, *rExpr, bool) {
+func ginSiblingMatch(filter *rExpr, colGlobal int, siblingColumns columnRanges) (ginStrategy, *rExpr, bool) {
 	return ginMatchOperand(filter, colGlobal, func(e *rExpr) bool {
 		return e != nil && e.kind == reColumn && siblingColumns.contains(e.index)
 	})
@@ -1141,7 +1141,7 @@ func gistScalarMatch(filter *rExpr, colGlobal int) (gistStrategy, *rExpr, bool) 
 	return gistScalarMatchOperand(filter, colGlobal, rexprIsConstant)
 }
 
-func gistScalarSiblingMatch(filter *rExpr, colGlobal int, siblingColumns *columnRange) (gistStrategy, *rExpr, bool) {
+func gistScalarSiblingMatch(filter *rExpr, colGlobal int, siblingColumns columnRanges) (gistStrategy, *rExpr, bool) {
 	return gistScalarMatchOperand(filter, colGlobal, func(e *rExpr) bool {
 		return e != nil && e.kind == reColumn && siblingColumns.contains(e.index)
 	})
@@ -1189,7 +1189,7 @@ func gistMatch(filter *rExpr, colGlobal int) (gistStrategy, *rExpr, bool) {
 	return gistMatchOperand(filter, colGlobal, rexprIsConstant)
 }
 
-func gistSiblingMatch(filter *rExpr, colGlobal int, siblingColumns *columnRange) (gistStrategy, *rExpr, bool) {
+func gistSiblingMatch(filter *rExpr, colGlobal int, siblingColumns columnRanges) (gistStrategy, *rExpr, bool) {
 	return gistMatchOperand(filter, colGlobal, func(e *rExpr) bool {
 		return e != nil && e.kind == reColumn && siblingColumns.contains(e.index)
 	})
@@ -1999,7 +1999,7 @@ func prefixSuccessor(p []byte) []byte {
 // detectPKBound constructs the maximal equality prefix plus optional next-member range for a PK
 // tuple. filters are walked independently as top-level AND chains (ordinary scans pass WHERE;
 // index-nested-loop passes ON and WHERE). siblingColumns has the same meaning as asBoundTerm.
-func (db *engine) detectPKBound(filters []*rExpr, rel scopeRel, siblingColumns *columnRange) *pkBoundPlan {
+func (db *engine) detectPKBound(filters []*rExpr, rel scopeRel, siblingColumns columnRanges) *pkBoundPlan {
 	pk := rel.table.PKIndices()
 	if len(pk) == 0 {
 		return nil
@@ -2214,11 +2214,22 @@ type columnRange struct {
 	end   int
 }
 
-func (r *columnRange) contains(index int) bool {
-	return r != nil && index >= r.start && index < r.end
+func (r columnRange) contains(index int) bool {
+	return index >= r.start && index < r.end
 }
 
-func asBoundTerm(e *rExpr, key keyMatch, pkType scalarType, colColl string, siblingColumns *columnRange) (boundTerm, bool) {
+type columnRanges []columnRange
+
+func (r columnRanges) contains(index int) bool {
+	for _, span := range r {
+		if index >= span.start && index < span.end {
+			return true
+		}
+	}
+	return false
+}
+
+func asBoundTerm(e *rExpr, key keyMatch, pkType scalarType, colColl string, siblingColumns columnRanges) (boundTerm, bool) {
 	if e.kind != reCompare {
 		return boundTerm{}, false
 	}
@@ -2265,7 +2276,7 @@ func asBoundTerm(e *rExpr, key keyMatch, pkType scalarType, colColl string, sibl
 // siblingColumns opens the index-nested-loop door (cost.md §3 "JOIN"): a bare reColumn in the
 // selected physical-left relation's global slot interval is a valid per-outer-row bound source.
 // nil (the ordinary once-materialized bound) accepts only literals/params/outer references.
-func isConstSource(e *rExpr, pkType scalarType, siblingColumns *columnRange) bool {
+func isConstSource(e *rExpr, pkType scalarType, siblingColumns columnRanges) bool {
 	switch e.kind {
 	case reParam, reConstNull, reOuterColumn:
 		return true
