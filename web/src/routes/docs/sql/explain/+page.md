@@ -32,23 +32,28 @@ FROM city GROUP BY region;`;
 
 <svelte:head>
 	<title>EXPLAIN — jed</title>
-	<meta name="description" content="EXPLAIN in jed renders the planner's chosen plan as a deterministic depth/node/detail result set — the access path, join shape, and sort elision — and EXPLAIN ANALYZE reports the real, deterministic execution cost. Run live." />
+	<meta name="description" content="EXPLAIN in jed renders the planner's chosen plan with deterministic row and cost estimates — plus the access path, join shape, and sort elision — while EXPLAIN ANALYZE reports real deterministic execution cost. Run live." />
 </svelte:head>
 
 # EXPLAIN
 
 `EXPLAIN` shows **how** jed will run a statement — which access path the planner chose (a full scan,
 a primary-key lookup, a secondary-index bound), how joins are shaped, and whether an `ORDER BY` is
-served by scan order, a bounded top-k heap, or a full sort. It renders the plan as an ordinary result set with three
+served by scan order, a bounded top-k heap, or a full sort. It renders the plan as an ordinary result set with five
 columns:
 
 - **`depth`** — the plan node's nesting level (0 = the top of the pipeline). The rows are a
   pre-order walk of the plan tree, so they read top-down as execution reads bottom-up.
 - **`node`** — the operator (`Scan`, `Filter`, `Sort`, `Aggregate`, `Nested Loop`, `Hash Join`, `Limit`, …).
 - **`detail`** — its attributes (the access path, key counts, and so on; `-` when it has none).
+- **`est_rows`** — rows the node is estimated to deliver to its parent. A write root reports
+  estimated affected rows.
+- **`est_cost`** — cumulative estimated work through that node, using the same deterministic cost
+  units as execution.
 
 The plan is a **deterministic** function of the query and the database, so every jed core renders
-the identical plan.
+the identical plan and estimates. Estimates are planner heuristics, not a resource limit or a
+promise to equal execution; runtime cost ceilings always use the actual meter.
 
 ## A blocking sort and bounded top-k
 
@@ -129,7 +134,8 @@ in-memory; grace-hash spill is a later storage slice.
 Plain `EXPLAIN` only **plans** the statement — it never runs it, so `EXPLAIN DELETE …` deletes
 nothing. `EXPLAIN ANALYZE` also **executes** the statement and reports its **actual** accrued
 [cost](../select/) and row count on an `Analyze` node. Because jed's cost is deterministic, this
-figure is exact and reproducible — not a wall-clock estimate.
+figure is exact and reproducible — not a wall-clock estimate. The `Analyze` row repeats its child's
+planned `est_rows` and `est_cost`; actual figures remain in `detail`, so the two are never conflated.
 
 <LiveSql seed={seed} query={analyze} rows={8} />
 

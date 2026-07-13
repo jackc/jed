@@ -101,25 +101,33 @@ SELECT id FROM t WHERE id = 2 OR a = 60
 6
 
 # EXPLAIN surfaces the generalized interval-set path and its structural disjunct count.
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT a FROM t WHERE id IN (1, 3, 5)
 ----
 0
 Filter
 conjuncts=1
+3
+22
 1
 Scan t
 PK interval set: id; intervals=3; touched=2
+3
+4
 
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT id FROM t WHERE id = 1 OR id = 4 OR id = 7
 ----
 0
 Filter
 conjuncts=1
+3
+22
 1
 Scan t
 PK interval set: id; intervals=3; touched=1
+3
+4
 
 # --- Secondary-index point set (indexes.md §5) ---
 # The same merge over a leading B-tree secondary-index column: each distinct value is an index point
@@ -155,15 +163,19 @@ SELECT id FROM s WHERE x = 20 OR x = 40
 
 # EXPLAIN of the secondary-index point set names the index (like the single-value index bound).
 # touched=2 = {id (projection), x (filter)}.
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT id FROM s WHERE x IN (10, 30)
 ----
 0
 Filter
 conjuncts=1
+2
+13
 1
 Scan s
 Index interval set: using sx; intervals=2; touched=2
+2
+5
 
 # --- Text key set ---
 statement ok

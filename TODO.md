@@ -38,14 +38,13 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 ## Core query / DML completeness
 
 - [x] **`EXPLAIN` / `EXPLAIN ANALYZE`** — render the planner's chosen plan as a deterministic
-  `depth`/`node`/`detail` result set (pre-order, `nosort`), without executing the inner statement;
+  `depth`/`node`/`detail`/`est_rows`/`est_cost` result set (pre-order, `nosort`), without executing
+  the inner statement;
   `ANALYZE` runs it and reports the actual (deterministic) accrued cost + row count on an `Analyze`
   root. Covers read queries + DML (plan-only, never mutates); `ANALYZE` of a write executes + commits.
   The observability substrate for the cost-based planner. → [explain.md](spec/design/explain.md)
-  - [ ] _follow-on:_ estimated-cost columns (`est_rows`/`est_cost`) once a **plan-time cost
-    estimator** lands (the reason the structured-column shape was chosen — the doorway to a
-    cost-based planner); per-node cost attribution under `ANALYZE`; a full expression printer for the
-    residual filter / projections (currently a `conjuncts=N` count) + exact float-literal bound
+  - [ ] _follow-on:_ per-node actual cost attribution under `ANALYZE`; a full expression printer for
+    the residual filter / projections (currently a `conjuncts=N` count) + exact float-literal bound
     rendering (each needs a determinism-ledger entry); an `EXPLAIN (…)` option list; a
     streaming/buffered/deferred lane tag; the DML touched-set count; `EXPLAIN` of a data-modifying `WITH`.
 - [x] **Predicate forms — `IN`/`BETWEEN`/`LIKE`/`CASE`** — plus `ILIKE`, and the regex operators `~`/`~*`/`!~`/`!~*` + `regexp_replace`/`regexp_match` (a hand-written linear-time Pike VM, ReDoS-immune). → grammar.md §20–§23, [regex.md](spec/design/regex.md)
@@ -214,12 +213,12 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   and residual work remain separate. Estimates are planner annotations only and the legacy selector
   still runs. → [estimator.md §7](spec/design/estimator.md),
   [estimator vectors](spec/cost/estimator_vectors.toml)
-- [ ] **Plan-time cost estimator** — estimate the same cost units the runtime meter charges
-  (`page_read`/`storage_row_read`/`row_produced`/…) for each candidate plan and pick the cheapest,
-  instead of today's structural tie-breaks (lowest index name, FROM order). Authored as a **spec'd,
-  cross-core-identical, deterministic artifact** (the §8 discipline the runtime schedule already
-  follows) so plan choice stays byte-identical across cores. The prerequisite for cost-based selection
-  and the `EXPLAIN` `est_rows`/`est_cost` columns (the EXPLAIN follow-on above). _(size: L–XL; ×3 cores)_
+- [x] **P5 — whole-plan estimator + EXPLAIN estimates** — propagate the selected plan's exact-rational
+  cardinality and runtime-unit estimate through filters/projections, every join algorithm, grouping,
+  windows, distinct/sort/limit, SRFs, CTEs, derived/VALUES/set-op/from-less queries, and currently
+  rendered DML nodes. EXPLAIN exposes non-NULL cumulative `i64` `est_rows`/`est_cost`; ANALYZE keeps
+  actual root figures separate. The legacy selector remains authoritative until P6. →
+  [estimator.md §8](spec/design/estimator.md), [explain.md §2](spec/design/explain.md)
 - [ ] **Column statistics** — the initial transactional per-table row count landed in P1. Add
   per-column distinct-value counts / histograms later, computed by a spec'd pass over deterministic
   data so they stay cross-core-identical. _(size: L histograms)_

@@ -7,11 +7,13 @@ import (
 )
 
 // EXPLAIN renders the planner's chosen plan as a deterministic, cross-core-identical result set
-// (spec/design/explain.md). The output is an ordinary query outcome with three columns:
+// (spec/design/explain.md). The output is an ordinary query outcome with five columns:
 //
 //	depth  i32   the plan node's nesting level (0-based), from a pre-order DFS of the plan tree
 //	node   text  the operator label (a fixed vocabulary — the §8 cross-core spelling contract)
 //	detail text  the node's attributes (access path, keys, counts); "-" when it has none
+//	est_rows i64 rows estimated to leave this node (affected rows for a DML root)
+//	est_cost i64 cumulative scheduled cost estimated through this node
 //
 // Rows are emitted in pre-order, so the row order is deterministic by construction — the corpus
 // asserts an EXPLAIN with `nosort` (a sanctioned use, like composite record_out). Plain EXPLAIN
@@ -23,7 +25,9 @@ import (
 
 // explainRender accumulates the rendered plan rows.
 type explainRender struct {
-	rows [][]Value
+	rows      [][]Value
+	estimates []planEstimate
+	next      int
 }
 
 // emit appends one plan row. An empty detail becomes the "-" sentinel so no cell renders blank.
@@ -31,7 +35,15 @@ func (r *explainRender) emit(depth int, node, detail string) {
 	if detail == "" {
 		detail = "-"
 	}
-	r.rows = append(r.rows, []Value{IntValue(int64(depth)), TextValue(node), TextValue(detail)})
+	estimate := planEstimate{}
+	if r.next < len(r.estimates) {
+		estimate = r.estimates[r.next]
+	}
+	r.next++
+	r.rows = append(r.rows, []Value{
+		IntValue(int64(depth)), TextValue(node), TextValue(detail),
+		IntValue(estimate.rows), IntValue(estimate.cost()),
+	})
 }
 
 // executeExplain plans the inner statement and renders the plan (spec/design/explain.md). Plain
@@ -46,7 +58,11 @@ func (db *engine) executeExplain(ex *explain, params []Value) (outcome, error) {
 		// bound value), so supplied parameters are neither needed nor bound.
 		return outcome{}, newError(SyntaxError, "bind parameters are not allowed in EXPLAIN")
 	}
-	var r explainRender
+	estimates, err := db.estimateExplain(ex.Inner)
+	if err != nil {
+		return outcome{}, err
+	}
+	r := explainRender{estimates: estimates}
 	if err := db.renderExplain(&r, ex.Inner, 0); err != nil {
 		return outcome{}, err
 	}
@@ -62,7 +78,11 @@ func (db *engine) executeExplain(ex *explain, params []Value) (outcome, error) {
 // row_produced per emitted plan row (independent of the inner cost, which appears only in the root).
 func (db *engine) executeExplainAnalyze(inner *statement, params []Value) (outcome, error) {
 	// Render the plan tree first (plan-only, no execution — pre-mutation).
-	var body explainRender
+	estimates, err := db.estimateExplain(inner)
+	if err != nil {
+		return outcome{}, err
+	}
+	body := explainRender{estimates: estimates}
 	if err := db.renderExplain(&body, inner, 0); err != nil {
 		return outcome{}, err
 	}
@@ -78,10 +98,14 @@ func (db *engine) executeExplainAnalyze(inner *statement, params []Value) (outco
 		actualRows = innerOut.RowsAffected // a DML statement without RETURNING
 	}
 	// Assemble: the Analyze root carries the actual figures; the plan tree sits one level deeper.
-	var r explainRender
+	r := explainRender{estimates: []planEstimate{}}
+	if len(estimates) > 0 {
+		r.estimates = append(r.estimates, estimates[0])
+	}
 	r.emit(0, "Analyze", fmt.Sprintf("cost=%d rows=%d", innerOut.Cost, actualRows))
 	for _, row := range body.rows {
-		r.rows = append(r.rows, []Value{IntValue(row[0].Int + 1), row[1], row[2]})
+		shifted := append([]Value{IntValue(row[0].Int + 1)}, row[1:]...)
+		r.rows = append(r.rows, shifted)
 	}
 	return db.explainOutcome(r.rows), nil
 }
@@ -93,8 +117,8 @@ func (db *engine) explainOutcome(rows [][]Value) outcome {
 	meter.Charge(costs.RowProduced * int64(len(rows)))
 	return outcome{
 		Kind:        outcomeQuery,
-		ColumnNames: []string{"depth", "node", "detail"},
-		ColumnTypes: []string{"i32", "text", "text"},
+		ColumnNames: []string{"depth", "node", "detail", "est_rows", "est_cost"},
+		ColumnTypes: []string{"i32", "text", "text", "i64", "i64"},
 		Rows:        rows,
 		Cost:        meter.Accrued,
 	}

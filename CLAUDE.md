@@ -968,6 +968,10 @@ of executing a query** and **abort when a caller-supplied ceiling is exceeded**.
   every base candidate from exact row counts and resident tree facts. Logical output selectivity is
   applied once against the base relation; GIN/GiST residual rechecks add work without reducing rows a
   second time. The annotations remain unobservable and the legacy selector is still authoritative.
+  P5 now propagates the selected plan through every rendered query/DML node and exposes cumulative
+  non-NULL `i64` `est_rows`/`est_cost` columns in EXPLAIN. ANALYZE keeps actual root cost/rows in its
+  detail, CTE attribution follows execution semantics, and streaming LIMIT prefixes affect estimates.
+  Estimates remain annotations: P6 is the first slice that lets them choose an access path.
 - **Ceiling + abort.** A caller may set a **maximum cost**; the instant accrued cost reaches
   it, execution **aborts deterministically** with a defined error code (registered in
   `spec/errors/`). The abort point is itself deterministic (same query + db + ceiling → same

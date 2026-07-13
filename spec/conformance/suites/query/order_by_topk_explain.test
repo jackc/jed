@@ -14,95 +14,139 @@ statement ok
 INSERT INTO tkxu VALUES (1, 30), (2, 5)
 
 # The physical decision is visible on the blocking Sort node.
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT id FROM tkx ORDER BY a DESC, id LIMIT 3 OFFSET 2
 ----
 0
 Limit
 limit=3 offset=2
 1
+5
+1
 Sort
 keys=2, top-k=5
+3
+4
 2
 Scan tkx
 Full scan; touched=2
+3
+4
 
 # LIMIT 0 records K=0 even with a huge OFFSET.
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT id FROM tkx ORDER BY a LIMIT 0 OFFSET 9223372036854775807
 ----
 0
 Limit
 limit=0 offset=9223372036854775807
+0
+4
 1
 Sort
 keys=1, top-k=0
+3
+4
 2
 Scan tkx
 Full scan; touched=2
+3
+4
 
 # K overflow is guarded identically and falls back to the full sort.
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT id FROM tkx ORDER BY a LIMIT 1 OFFSET 9223372036854775807
 ----
 0
 Limit
 limit=1 offset=9223372036854775807
+0
+4
 1
 Sort
 keys=1
+3
+4
 2
 Scan tkx
 Full scan; touched=2
+3
+4
 
 # DISTINCT, aggregate/group, and set-operation plans remain outside the rule.
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT DISTINCT a FROM tkx ORDER BY a LIMIT 2
 ----
 0
 Limit
 limit=2
+2
+6
 1
 Sort
 keys=1
+3
+4
 2
 Distinct
 -
 3
+4
+3
 Scan tkx
 Full scan; touched=1
+3
+4
 
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT a, count(*) FROM tkx GROUP BY a ORDER BY a LIMIT 2
 ----
 0
 Limit
 limit=2
+2
+9
 1
 Sort
 keys=1
+3
+7
 2
 Aggregate
 groups=1 aggs=1
 3
+7
+3
 Scan tkx
 Full scan; touched=1
+3
+4
 
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT a FROM tkx UNION ALL SELECT score FROM tkxu ORDER BY 1 LIMIT 2
 ----
 0
 Limit
 limit=2
+2
+12
 1
 Sort
 keys=1
+5
+12
 2
 Union
 all
+5
+12
 3
 Scan tkx
 Full scan; touched=1
 3
+7
+3
 Scan tkxu
 Full scan; touched=1
+2
+5

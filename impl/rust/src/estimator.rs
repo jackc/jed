@@ -91,6 +91,103 @@ pub(crate) struct CandidateEstimate {
     pub(crate) tie_key: String,
 }
 
+/// P5's cumulative estimate for one rendered plan node. `logical_rows` carries the unbounded
+/// logical population alongside the rows delivered by the selected access path, preventing a
+/// residual predicate used as a bound from being selectivity-folded twice.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PlanEstimate {
+    pub(crate) rows: i64,
+    pub(crate) logical_rows: i64,
+    pub(crate) units: [i64; ESTIMATOR_UNIT_COUNT],
+}
+
+impl PlanEstimate {
+    pub(crate) fn empty(rows: i64) -> Self {
+        let rows = rows.clamp(0, MAX_ESTIMATE);
+        Self {
+            rows,
+            logical_rows: rows,
+            units: [0; ESTIMATOR_UNIT_COUNT],
+        }
+    }
+
+    pub(crate) fn cost(&self) -> i64 {
+        self.units
+            .iter()
+            .zip(ESTIMATOR_UNIT_WEIGHTS)
+            .fold(0, |total, (count, weight)| {
+                sat_add(total, sat_mul(*count, weight))
+            })
+    }
+
+    pub(crate) fn add(&self, rhs: &Self) -> Self {
+        let mut out = self.clone();
+        for (value, addend) in out.units.iter_mut().zip(rhs.units) {
+            *value = sat_add(*value, addend);
+        }
+        out
+    }
+
+    pub(crate) fn repeated(&self, count: i64) -> Self {
+        let count = count.clamp(0, MAX_ESTIMATE);
+        Self {
+            rows: sat_mul(self.rows, count),
+            logical_rows: sat_mul(self.logical_rows, count),
+            units: self.units.map(|value| sat_mul(value, count)),
+        }
+    }
+
+    pub(crate) fn add_unit(&mut self, unit: usize, count: i64) {
+        self.units[unit] = sat_add(self.units[unit], count.clamp(0, MAX_ESTIMATE));
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EstimatedPlan {
+    pub(crate) root: PlanEstimate,
+    /// Pre-order, exactly matching the hand-written EXPLAIN renderer.
+    pub(crate) nodes: Vec<PlanEstimate>,
+}
+
+impl EstimatedPlan {
+    pub(crate) fn leaf(estimate: PlanEstimate) -> Self {
+        Self {
+            root: estimate.clone(),
+            nodes: vec![estimate],
+        }
+    }
+
+    pub(crate) fn parent(root: PlanEstimate, children: &[&Self]) -> Self {
+        let mut nodes = vec![root.clone()];
+        for child in children {
+            nodes.extend(child.nodes.iter().cloned());
+        }
+        Self { root, nodes }
+    }
+
+    pub(crate) fn wrap(
+        child: Self,
+        rows: i64,
+        logical_rows: i64,
+        local: [i64; ESTIMATOR_UNIT_COUNT],
+    ) -> Self {
+        let mut root = child.root.clone();
+        root.rows = rows.clamp(0, MAX_ESTIMATE);
+        root.logical_rows = logical_rows.clamp(0, MAX_ESTIMATE);
+        for (value, addend) in root.units.iter_mut().zip(local) {
+            *value = sat_add(*value, addend);
+        }
+        let mut nodes = vec![root.clone()];
+        nodes.extend(child.nodes);
+        Self { root, nodes }
+    }
+
+    pub(crate) fn add_root_unit(&mut self, unit: usize, count: i64) {
+        self.root.add_unit(unit, count);
+        self.nodes[0] = self.root.clone();
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CandidateInputs<'a> {
     pub(crate) kind: &'a str,

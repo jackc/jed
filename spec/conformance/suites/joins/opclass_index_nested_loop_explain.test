@@ -18,7 +18,7 @@ statement ok
 CREATE INDEX op_slot_r ON op_slot USING gist (r)
 
 # The GIN sibling bound is visible even when it overrides a constant once-bound scan.
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT p.id, d.id
 FROM op_probe p JOIN op_doc d ON d.tags && p.q
 WHERE d.tags @> ARRAY[40]
@@ -26,32 +26,46 @@ WHERE d.tags @> ARRAY[40]
 0
 Filter
 conjuncts=1
+0
+0
 1
 Nested Loop
 inner; on:conjuncts=1
+0
+0
 2
 Scan op_probe
 Full scan; touched=2
+0
+0
 2
 Scan op_doc
 Index-nested-loop GIN bound: using op_doc_tags; touched=2
+0
+0
 
 # An operand from the indexed inner row is not a sibling query; the inner remains a full scan.
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT p.id, d.id FROM op_probe p JOIN op_doc d ON d.tags && d.alt
 ----
 0
 Nested Loop
 inner; on:conjuncts=1
+0
+0
 1
 Scan op_probe
 Full scan; touched=1
+0
+0
 1
 Scan op_doc
 Full scan; touched=3
+0
+0
 
 # A later relation is unavailable while the middle relation opens, so it cannot bind that scan.
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT p.id, d.id, x.id
 FROM op_probe p CROSS JOIN op_doc d CROSS JOIN op_probe x
 WHERE d.tags && x.q
@@ -59,37 +73,55 @@ WHERE d.tags && x.q
 0
 Filter
 conjuncts=1
+0
+0
 1
 Nested Loop
 cross
+0
+0
 2
 Nested Loop
 cross
+0
+0
 3
 Scan op_probe
 Full scan; touched=1
+0
+0
 3
 Scan op_doc
 Full scan; touched=2
+0
+0
 2
 Scan op_probe
 Full scan; touched=2
+0
+0
 
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT p.id, s.id FROM op_probe p JOIN op_slot s ON s.r && p.rq
 ----
 0
 Nested Loop
 inner; on:conjuncts=1
+0
+0
 1
 Scan op_probe
 Full scan; touched=2
+0
+0
 1
 Scan op_slot
 Index-nested-loop GiST bound: using op_slot_r; touched=2
+0
+0
 
 # A usable GiST sibling bound likewise overrides an ordinary constant GiST bound.
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT p.id, s.id
 FROM op_probe p JOIN op_slot s ON s.r && p.rq
 WHERE s.r && int4range(1, 2)
@@ -97,25 +129,39 @@ WHERE s.r && int4range(1, 2)
 0
 Filter
 conjuncts=1
+0
+0
 1
 Nested Loop
 inner; on:conjuncts=1
+0
+0
 2
 Scan op_probe
 Full scan; touched=2
+0
+0
 2
 Scan op_slot
 Index-nested-loop GiST bound: using op_slot_r; touched=2
+0
+0
 
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT p.id, s.id FROM op_probe p JOIN op_slot s ON s.r && s.alt
 ----
 0
 Nested Loop
 inner; on:conjuncts=1
+0
+0
 1
 Scan op_probe
 Full scan; touched=1
+0
+0
 1
 Scan op_slot
 Full scan; touched=3
+0
+0

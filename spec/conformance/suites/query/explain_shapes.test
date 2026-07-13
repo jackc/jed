@@ -17,239 +17,333 @@ statement ok
 INSERT INTO u VALUES (1, 1)
 
 # A whole-table aggregate: no grouping keys, one aggregate, no touched columns for count(*).
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT count(*) FROM t
 ----
 0
 Aggregate
 groups=0 aggs=1
 1
+4
+1
 Scan t
 Full scan
+1
+2
 
 # GROUP BY + HAVING: the grouping-key / aggregate / HAVING-conjunct counts appear on the Aggregate.
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT v, count(*) FROM t GROUP BY v HAVING count(*) > 1
 ----
 0
 Aggregate
 groups=1 aggs=2; having:conjuncts=1
 1
+6
+1
 Scan t
 Full scan; touched=1
+1
+2
 
 # An eligible two-input equality join is a Hash Join with key/ON counts; each input is a Scan child.
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT * FROM t JOIN u ON u.tid = t.id
 ----
 0
 Hash Join
 inner; keys=1; on:conjuncts=1
 1
+22
+1
 Scan t
 Full scan; touched=3
 1
+2
+1
 Scan u
 Full scan; touched=2
+1
+2
 
 # Index-nested-loop join: the inner relation `t` has its PK compared to the sibling `u.tid`, so its
 # scan is a per-outer-row seek — the access path shows `Index-nested-loop PK bound` (query.index_nested_loop).
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT * FROM u JOIN t ON t.id = u.tid
 ----
 0
 Nested Loop
 inner; on:conjuncts=1
 1
+6
+1
 Scan u
 Full scan; touched=2
 1
+2
+1
 Scan t
 Index-nested-loop PK bound: id = join; touched=3
+1
+2
 
 # Join sort-elision and the inner per-outer bound are independent decisions and both stay visible.
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT u.id, t.id FROM u JOIN t ON t.id = u.tid ORDER BY u.id LIMIT 2
 ----
 0
 Limit
 limit=2
 1
+6
+1
 Nested Loop
 inner; on:conjuncts=1; ordered: join pk ordered
+1
+5
 2
 Scan u
 Full scan; touched=2
+1
+2
 2
 Scan t
 Index-nested-loop PK bound: id = join; touched=1
+1
+2
 
 # A CROSS JOIN with a WHERE: the residual Filter is the parent; the per-table PK bound shows on t.
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT * FROM t CROSS JOIN u WHERE t.id = 1
 ----
 0
 Filter
 conjuncts=1
 1
+6
+1
 Nested Loop
 cross
+1
+4
 2
 Scan t
 PK bound: id = 1; touched=3
+1
+2
 2
 Scan u
 Full scan; touched=2
+1
+2
 
 # A set operation renders as a Union / Intersect / Except node over its two operand plans.
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT v FROM t UNION SELECT id FROM u
 ----
 0
 Union
 distinct
+2
+6
 1
 Scan t
 Full scan; touched=1
 1
+3
+1
 Scan u
 Full scan; touched=1
+1
+3
 
 # A trailing ORDER BY / LIMIT on a set operation sits above the Union.
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT v FROM t UNION ALL SELECT id FROM u ORDER BY 1 LIMIT 3
 ----
 0
 Limit
 limit=3
+2
+6
 1
 Sort
 keys=1
 2
+6
+2
 Union
 all
+2
+6
 3
 Scan t
 Full scan; touched=1
+1
+3
 3
 Scan u
 Full scan; touched=1
+1
+3
 
 # A derived table is a Subquery node whose inner plan recurses one level deeper.
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT * FROM (SELECT v FROM t WHERE id = 1) x
 ----
 0
 Subquery x
 -
 1
+5
+1
 Filter
 conjuncts=1
+1
+4
 2
 Scan t
 PK bound: id = 1; touched=2
+1
+2
 
 # A WITH renders the WITH node, each CTE (with its materialization mode + body), then the main body.
-query ITT nosort
+query ITTII nosort
 EXPLAIN WITH c AS (SELECT v FROM t) SELECT * FROM c
 ----
 0
 WITH
 ctes=1
 1
+4
+1
 CTE c
 inlined
+1
+0
 2
 Scan t
 Full scan; touched=1
 1
+3
+1
 CTE Scan c
 -
+1
+4
 
 # A window function adds a Window node carrying the number of window functions.
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT sum(v) OVER (PARTITION BY id) FROM t
 ----
 0
 Window
 funcs=1
 1
+4
+1
 Scan t
 Full scan; touched=2
+1
+2
 
 # A FROM-less query is a single Result node.
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT 1
 ----
 0
 Result
 -
+1
+1
 
 # A set-returning function in FROM is an SRF node.
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT * FROM generate_series(1, 5)
 ----
 0
 SRF generate_series
 -
+5
+10
 
 # A VALUES relation (as a derived table) is a Values leaf carrying its row count.
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT * FROM (VALUES (1),(2)) x
 ----
 0
 Subquery x
 -
+2
+4
 1
 Values
 rows=2
+2
+2
 
 # Composite-PK bounds render consumed members in PK key order, independent of WHERE source order.
 statement ok
 CREATE TABLE cpk (a i32, b i16, v text, PRIMARY KEY (b, a))
 
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT v FROM cpk WHERE a = 2 AND b = 1
 ----
 0
 Filter
 conjuncts=2
+0
+0
 1
 Scan cpk
 PK bound: b = 1 and a = 2; touched=3
+0
+0
 
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT a FROM cpk WHERE b = 1 AND a >= 2
 ----
 0
 Filter
 conjuncts=2
+0
+0
 1
 Scan cpk
 PK bound: b = 1 and a >= 2; touched=2
+0
+0
 
 # A non-leading member alone cannot seed a tuple bound.
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT v FROM cpk WHERE a = 2
 ----
 0
 Filter
 conjuncts=1
+0
+0
 1
 Scan cpk
 Full scan; touched=2
+0
+0
 
 # A promoted comparison wraps the narrow key member rather than comparing in its storage type, so
 # it remains residual and cannot seed a tuple bound.
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT v FROM cpk WHERE b = 1::i32
 ----
 0
 Filter
 conjuncts=1
+0
+0
 1
 Scan cpk
 Full scan; touched=2
+0
+0
 
 # Canonical interval sets expose a stable structural disjunct count, independent of runtime values.
 statement ok
@@ -258,50 +352,68 @@ CREATE TABLE intervals (id i32 PRIMARY KEY, v i32)
 statement ok
 CREATE INDEX intervals_v_idx ON intervals (v)
 
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT id FROM intervals WHERE id < 3 OR id >= 7
 ----
 0
 Filter
 conjuncts=1
+0
+0
 1
 Scan intervals
 PK interval set: id; intervals=2; touched=1
+0
+0
 
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT id FROM intervals WHERE v < 20 OR v >= 40
 ----
 0
 Filter
 conjuncts=1
+0
+0
 1
 Scan intervals
 Index interval set: using intervals_v_idx; intervals=2; touched=2
+0
+0
 
 # A bounded scan can satisfy ORDER BY only through the same index it is already walking.
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT id FROM intervals WHERE v >= 20 ORDER BY v LIMIT 2
 ----
 0
 Limit
 limit=2
+0
+0
 1
 Filter
 conjuncts=1
+0
+0
 2
 Scan intervals
 Index bound: using intervals_v_idx; touched=2; ordered: index order: intervals_v_idx
+0
+0
 
 # Mixed-key disjuncts cannot form a sound interval set and retain the full scan.
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT id FROM intervals WHERE id < 3 OR v >= 40
 ----
 0
 Filter
 conjuncts=1
+0
+0
 1
 Scan intervals
 Full scan; touched=2
+0
+0
 
 # A variable-width leading index key supports point intervals, but not range unions: recovering the
 # row-key suffix from an arbitrary text interval still needs the deferred variable-width skip.
@@ -311,12 +423,16 @@ CREATE TABLE text_intervals (id i32 PRIMARY KEY, v text)
 statement ok
 CREATE INDEX text_intervals_v_idx ON text_intervals (v)
 
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT id FROM text_intervals WHERE v < 'b' OR v >= 'z'
 ----
 0
 Filter
 conjuncts=1
+0
+0
 1
 Scan text_intervals
 Full scan; touched=2
+0
+0

@@ -1271,11 +1271,13 @@ pub(crate) fn reject_params_for_ddl(params: &[Value]) -> Result<()> {
 
 // ================================================================================================
 // EXPLAIN — render the planner's chosen plan as a deterministic, cross-core-identical result set
-// (spec/design/explain.md). The output is an ordinary query Outcome with three columns:
+// (spec/design/explain.md). The output is an ordinary query Outcome with five columns:
 //
 //   depth  i32   the plan node's nesting level (0-based), from a pre-order DFS of the plan tree
 //   node   text  the operator label (a fixed vocabulary — the §8 cross-core spelling contract)
 //   detail text  the node's attributes (access path, keys, counts); "-" when it has none
+//   est_rows i64 the deterministic estimated output rows for this subtree
+//   est_cost i64 the deterministic cumulative estimated cost for this subtree
 //
 // Rows are emitted in pre-order, so the row order is deterministic by construction — the corpus
 // asserts an EXPLAIN with `nosort`. Every cell is non-empty and free of leading/trailing whitespace
@@ -1289,19 +1291,37 @@ pub(crate) fn reject_params_for_ddl(params: &[Value]) -> Result<()> {
 #[derive(Default)]
 pub(crate) struct ExplainRender {
     pub(crate) rows: Vec<Vec<Value>>,
+    estimates: Vec<(i64, i64)>,
+    next_estimate: usize,
 }
 
 impl ExplainRender {
+    pub(crate) fn with_estimates(estimates: Vec<(i64, i64)>) -> Self {
+        Self {
+            rows: Vec::new(),
+            estimates,
+            next_estimate: 0,
+        }
+    }
+
     /// Append one plan row. An empty detail becomes the "-" sentinel so no cell renders blank.
     pub(crate) fn emit(&mut self, depth: i64, node: impl Into<String>, detail: impl Into<String>) {
         let mut detail = detail.into();
         if detail.is_empty() {
             detail = "-".to_string();
         }
+        let (est_rows, est_cost) = self
+            .estimates
+            .get(self.next_estimate)
+            .copied()
+            .unwrap_or((0, 0));
+        self.next_estimate += 1;
         self.rows.push(vec![
             Value::Int(depth),
             Value::Text(node.into()),
             Value::Text(detail),
+            Value::Int(est_rows),
+            Value::Int(est_cost),
         ]);
     }
 }

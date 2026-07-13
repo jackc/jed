@@ -14,66 +14,90 @@ INSERT INTO hx_l VALUES (1, 1, 10), (2, 2, 20)
 statement ok
 INSERT INTO hx_r VALUES (10, 1, 30), (11, 2, 40)
 
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT l.id, r.id FROM hx_l l JOIN hx_r r ON l.k = r.k
 ----
 0
 Hash Join
 inner; keys=1; on:conjuncts=1
 1
+32
+1
 Scan hx_l
 Full scan; touched=2
+2
+3
 1
 Scan hx_r
 Full scan; touched=2
+2
+3
 
 # Hash build/probe work is cost-bounded. This ceiling is intentionally below the full query.
 # max_cost: 10
 statement error 54P01
 SELECT l.id, r.id FROM hx_l l JOIN hx_r r ON l.k = r.k
 
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT l.id, r.id FROM hx_l l LEFT JOIN hx_r r ON l.k = r.k AND l.v = r.v
 ----
 0
 Hash Join
 left; keys=2; on:conjuncts=2
+2
+78
 1
 Scan hx_l
 Full scan; touched=3
+2
+3
 1
 Scan hx_r
 Full scan; touched=3
+2
+3
 
 # A usable inner PK lookup has first refusal and remains index-nested-loop.
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT l.id, r.id FROM hx_l l JOIN hx_r r ON r.id = l.k
 ----
 0
 Nested Loop
 inner; on:conjuncts=1
+2
+11
 1
 Scan hx_l
 Full scan; touched=2
+2
+3
 1
 Scan hx_r
 Index-nested-loop PK bound: id = join; touched=1
+2
+4
 
 # Expression keys and potentially trapping residuals retain nested loop.
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT l.id, r.id FROM hx_l l JOIN hx_r r ON l.k + 0 = r.k
 ----
 0
 Nested Loop
 inner; on:conjuncts=1
 1
+15
+1
 Scan hx_l
 Full scan; touched=2
+2
+3
 1
 Scan hx_r
 Full scan; touched=2
+2
+3
 
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT l.id, r.id FROM hx_l l JOIN hx_r r
   ON l.k = r.k AND 1 / (l.v - r.v) = 1
 ----
@@ -81,27 +105,39 @@ EXPLAIN SELECT l.id, r.id FROM hx_l l JOIN hx_r r
 Nested Loop
 inner; on:conjuncts=2
 1
+27
+1
 Scan hx_l
 Full scan; touched=3
+2
+3
 1
 Scan hx_r
 Full scan; touched=3
+2
+3
 
 # RIGHT and wider joins remain nested loops until their ordering/preservation contracts are spec'd.
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT l.id, r.id FROM hx_l l RIGHT JOIN hx_r r ON l.k = r.k
 ----
 0
 Nested Loop
 right; on:conjuncts=1
+2
+12
 1
 Scan hx_l
 Full scan; touched=2
+2
+3
 1
 Scan hx_r
 Full scan; touched=2
+2
+3
 
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT a.id, b.id, c.id
 FROM hx_l a JOIN hx_r b ON a.k = b.k JOIN hx_l c ON b.v = c.v
 ----
@@ -109,14 +145,24 @@ FROM hx_l a JOIN hx_r b ON a.k = b.k JOIN hx_l c ON b.v = c.v
 Nested Loop
 inner; on:conjuncts=1
 1
+16
+1
 Nested Loop
 inner; on:conjuncts=1
+1
+10
 2
 Scan hx_l
 Full scan; touched=2
+2
+3
 2
 Scan hx_r
 Full scan; touched=3
+2
+3
 1
 Scan hx_l
 Full scan; touched=2
+2
+3

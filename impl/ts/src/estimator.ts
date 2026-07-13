@@ -127,6 +127,83 @@ export type CandidateEstimate = {
   tieKey: string;
 };
 
+export type PlanEstimate = {
+  rows: bigint;
+  logicalRows: bigint;
+  units: bigint[];
+};
+
+export type EstimatedPlan = { root: PlanEstimate; nodes: PlanEstimate[] };
+
+export function emptyPlanEstimate(rows = 0n, logicalRows = rows): PlanEstimate {
+  return {
+    rows: clampEstimate(rows),
+    logicalRows: clampEstimate(logicalRows),
+    units: Array<bigint>(ESTIMATOR_UNIT_COUNT).fill(0n),
+  };
+}
+
+export function clonePlanEstimate(estimate: PlanEstimate): PlanEstimate {
+  return { rows: estimate.rows, logicalRows: estimate.logicalRows, units: [...estimate.units] };
+}
+
+export function planEstimateCost(estimate: PlanEstimate): bigint {
+  let cost = 0n;
+  for (let i = 0; i < ESTIMATOR_UNIT_COUNT; i++) {
+    cost = saturatingEstimateAdd(
+      cost,
+      saturatingEstimateMultiply(estimate.units[i]!, ESTIMATOR_UNIT_WEIGHTS[i]!),
+    );
+  }
+  return cost;
+}
+
+export function addPlanEstimates(lhs: PlanEstimate, rhs: PlanEstimate): PlanEstimate {
+  const out = clonePlanEstimate(lhs);
+  for (let i = 0; i < ESTIMATOR_UNIT_COUNT; i++)
+    out.units[i] = saturatingEstimateAdd(out.units[i]!, rhs.units[i]!);
+  return out;
+}
+
+export function repeatPlanEstimate(estimate: PlanEstimate, count: bigint): PlanEstimate {
+  const n = clampEstimate(count);
+  return {
+    rows: saturatingEstimateMultiply(estimate.rows, n),
+    logicalRows: saturatingEstimateMultiply(estimate.logicalRows, n),
+    units: estimate.units.map((value) => saturatingEstimateMultiply(value, n)),
+  };
+}
+
+export function addPlanUnit(estimate: PlanEstimate, unit: number, count: bigint): void {
+  estimate.units[unit] = saturatingEstimateAdd(estimate.units[unit]!, clampEstimate(count));
+}
+
+export function leafEstimatedPlan(estimate: PlanEstimate): EstimatedPlan {
+  return { root: estimate, nodes: [estimate] };
+}
+
+export function wrapEstimatedPlan(
+  child: EstimatedPlan,
+  rows: bigint,
+  logicalRows: bigint,
+  local: bigint[],
+): EstimatedPlan {
+  const root = clonePlanEstimate(child.root);
+  root.rows = clampEstimate(rows);
+  root.logicalRows = clampEstimate(logicalRows);
+  for (let i = 0; i < ESTIMATOR_UNIT_COUNT; i++)
+    root.units[i] = saturatingEstimateAdd(root.units[i]!, local[i] ?? 0n);
+  return { root, nodes: [root, ...child.nodes] };
+}
+
+export function parentEstimatedPlan(
+  root: PlanEstimate,
+  ...children: EstimatedPlan[]
+): EstimatedPlan {
+  const parent = clonePlanEstimate(root);
+  return { root: parent, nodes: [parent, ...children.flatMap((child) => child.nodes)] };
+}
+
 export type CandidateEstimateInputs = {
   kind: string;
   indexName: string;

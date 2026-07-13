@@ -6,7 +6,8 @@
 > document specifies the algorithms every core will implement independently.
 >
 > **Status: P0 contract ratified; P1 row counts, P2 cache validity, P3 complete candidate
-> inventory, and P4 shadow base-relation estimates landed.** The current planner still uses
+> inventory, P4 shadow base-relation estimates, and P5 whole-plan propagation + EXPLAIN columns
+> landed.** The current planner still uses
 > the legacy fixed selector in
 > [planner.md](planner.md). P4–P8 in
 > [../../TODO-cost-plan-input.md](../../TODO-cost-plan-input.md) implement this contract as vertical
@@ -267,6 +268,9 @@ the plan contract; the chosen plan still returns identical rows.
   database/attachment snapshot; they require no storage leaf reads.
 - Derived table / scalar subquery / CTE body: its recursively estimated output.
 - Materialized CTE reference: the body's rows; its scan work is counted separately (§8).
+- A recursive CTE's self-reference estimates zero rows/work at that recursive edge in initial P5;
+  the visible seed/nonrecursive body still estimates normally. Iteration cardinality needs a later
+  recursive-growth model rather than an implementation-dependent planning loop.
 - CROSS JOIN: `sat_mul(left_rows, right_rows)`.
 - INNER equality join without NDV facts: equality selectivity over the saturated product; multiple
   equality keys apply left to right. Other ON predicates use their structural fractions.
@@ -326,12 +330,13 @@ The following rules cover additional units:
   no extra until statistics/model data define one;
 - `hash_build`/`hash_probe` use exact encoded bytes for fixed-width keys and
   `default_variable_key_bytes` for a variable-width or unknown key, never less than the runtime
-  minimum of one per inspected key; estimated bucket verification uses estimated join candidates;
+  minimum of one per inspected key; estimated bucket verification uses estimated join candidates
+  and includes each composite part's four-byte length frame;
 - `aggregate_accumulate` is `input_rows × aggregate_count`;
 - `cte_scan_row` is materialized rows per reference;
 - `generated_row` is the SRF cardinality;
-- `window_result` is output rows per window function; `window_frame_step` follows the spec'd frame
-  algorithm over estimated partition rows where derivable, otherwise zero;
+- `window_result` is output rows per window function. Initial P5 has no partition-size/distribution
+  statistic for `window_frame_step`, so that size-dependent extra is zero;
 - `constraint_check` and `value_compress` are zero in initial SELECT selection.
 
 Join candidates count their different repetition shapes explicitly:
@@ -358,10 +363,56 @@ saturated cumulative cost of the rendered subtree through that node. A SELECT's 
 node additionally owns the top-level projection and final `row_produced` units because the v1 plan
 tree has no separate Project node. A lone Scan/Result is outermost when no wrapper exists.
 
-LIMIT/ordered-stream short-circuit is a physical-plan property: its child scan estimate is reduced
-to the rows/pages expected to be pulled, not estimated eagerly then sliced only at the Limit node.
-Consequently estimates are computed over a complete candidate pipeline rather than by blindly
-adding immutable logical-node estimates.
+LIMIT/ordered-stream short-circuit is a physical-plan property: eligible single-relation scans and
+backward-safe window top-N plans reduce their child scan to the rows/pages expected to be pulled,
+not an eagerly estimated full input sliced only at the Limit node. An unbounded secondary-index
+order prices the expected index prefix plus table point fetches. Bound index/GiST/GIN paths retain
+their conservative structural descent and reduce admitted table fetches; the join-PK-ordered stream
+retains full-child work until a deterministic join-output stop model lands. Consequently estimates
+are computed over a complete candidate pipeline rather than by blindly adding immutable logical-node
+estimates.
+
+The following attribution rules close the remaining current-plan shapes:
+
+- a residual `Filter` applies the complete predicate once to the logical input population, caps the
+  result by rows physically delivered by its child, and adds expression work for the child rows;
+- a nested-loop join adds both input scans once and ON work over its saturated candidate pairs; an
+  index-nested-loop repeats the selected inner access work by outer rows; a hash join adds its fixed
+  build/probe work and ON recheck work over estimated bucket candidates;
+- `Aggregate`, `Window`, `Distinct`, `Sort`, and `Limit` transform rows in executor pipeline order;
+  unmetered bookkeeping adds no private unit. Projection work uses its real invocation population
+  (`Distinct` projects before dedup; an ordinary projection is after the final window), while
+  `row_produced` uses final emitted rows;
+- a set-operation node owns the saturated sum of operand unit vectors. Its combine, trailing sort,
+  and trailing limit are unmetered even when they change `est_rows`;
+- a derived-table `Subquery` owns its recursively estimated body. Literal `Values` owns exact rows
+  plus expression work; an SRF owns argument work plus `generated_row`; and a FROM-less `Result`
+  starts from one virtual row and owns no scan work;
+- a materialized CTE body contributes once and each reference adds `cte_scan_row`; an inlined body
+  contributes at each reference; an unreferenced read-only body contributes zero. Definition
+  subtrees remain intrinsically estimated for display, but a `WITH` root sums semantic execution
+  contributions rather than blindly summing those metadata edges; and
+- subqueries inside expressions contribute once when uncorrelated and once per estimated invoking
+  row when correlated. Unknown value-size extras remain zero under §8.2's existing fallback.
+
+### 8.4 DML estimates
+
+P5 covers every node in the DML shapes plain EXPLAIN currently renders, while P0's legacy DML
+access-path policy remains authoritative:
+
+- `INSERT ... VALUES` starts with the exact authored candidate count; `INSERT ... SELECT` owns its
+  rendered source-query estimate;
+- `UPDATE`/`DELETE` own the selected mutation scan plus residual-filter estimate, including a filter
+  expression's scalar subplans; and
+- a DML root's `est_rows` is affected rows. `ON CONFLICT DO NOTHING` / `DO UPDATE` keeps the source
+  candidate count until conflict-frequency statistics exist.
+
+Mutation-only work with no current rendered node — VALUES/default/assignment/check/`RETURNING`
+expressions, uniqueness probes, compression, and phase-two writes — uses the initial zero fallback.
+That is an explicit precision boundary, not an assertion that execution performs no such work; the
+runtime meter remains authoritative. A later DML-estimator slice may add those units without changing
+the legacy mutation access policy or root cardinality. These estimates never change mutation
+execution or its actual cost.
 
 ## 9. Candidate total order
 
@@ -411,7 +462,7 @@ is cross-core identity and reproducibility.
 
 ## 11. EXPLAIN contract
 
-When P5 lands, EXPLAIN appends two non-NULL `i64` columns to its existing result:
+EXPLAIN appends two non-NULL `i64` columns to its existing result:
 
 | column | meaning |
 |---|---|
@@ -423,6 +474,11 @@ Fallback rules make both values available for every node, so NULL is unnecessary
 `cost=<actual> rows=<actual>` root remains actual runtime data; estimated columns remain estimates.
 The EXPLAIN statement itself still charges one actual `row_produced` per rendered row — adding two
 cells changes no render cost.
+
+For a DML root, `est_rows` means affected rows (§8.4). An `Analyze` wrapper repeats its planned
+child's two estimate values; the actual `cost=<actual> rows=<actual>` figures remain confined to the
+detail cell. `WITH` uses the semantic CTE attribution in §8.3 and explain.md rather than treating
+definition-display edges as repeated execution.
 
 Plain EXPLAIN is jed-owned and not PostgreSQL-oracle imported. Its estimate rows are asserted
 `nosort` in the shared corpus, making arithmetic, candidate choice, and tie breaks one cross-core

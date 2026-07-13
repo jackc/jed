@@ -37,13 +37,20 @@ PostgreSQL — even though plain `EXPLAIN` never executes.
 
 ## 2. Output shape (the two harness constraints that fix it)
 
-EXPLAIN produces an ordinary query result set (a SELECT-shaped `Outcome`) with three columns:
+EXPLAIN produces an ordinary query result set (a SELECT-shaped `Outcome`) with five columns:
 
 | column | type | meaning |
 |---|---|---|
 | `depth`  | `i32`  | the plan node's nesting level (0-based), from a **pre-order DFS** of the plan tree |
 | `node`   | `text` | the operator label — a **fixed cross-core vocabulary** (§4), the §8 spelling contract |
 | `detail` | `text` | the node's attributes (access path, keys, counts); the sentinel `-` when it has none |
+| `est_rows` | `i64` | rows this node is estimated to deliver to its rendered parent; a DML root uses estimated affected rows |
+| `est_cost` | `i64` | saturated cumulative scheduled cost attributable through this node |
+
+The estimate columns are non-NULL shortest-decimal integers in `0..i64::MAX`. They are planner
+estimates, not safety limits and not a promise to equal execution. Their exact arithmetic and
+per-node attribution are specified in [estimator.md §8.3/§11](estimator.md). There is no unavailable
+sentinel: deterministic fallback rules produce an estimate for every currently renderable node.
 
 Two properties of the conformance harness ([../conformance/README.md](../conformance/README.md);
 `impl/*/…/conformance` render the actual cell **raw** while the expected line is `TrimSpace`d, and a
@@ -74,6 +81,10 @@ The `EXPLAIN` statement's **own** cost (its `Outcome.Cost`) is **one `row_produc
 row** — a small, deterministic function of the plan-row count, independent of the inner cost. So a
 `# cost:` directive on an `EXPLAIN ANALYZE` pins the render cost, while the (larger) inner cost
 appears only inside the root. Plain EXPLAIN runs no inner meter; it charges only its render cost.
+
+The `Analyze` wrapper repeats the planned child's `est_rows` and `est_cost`; only its `detail`
+contains actual figures. This keeps the estimated and actual surfaces separate without inventing a
+second estimate for a renderer-only wrapper.
 
 Per-node cost attribution is **out** for now (jed's meter is a single global counter); ANALYZE
 reports the whole-statement figure. Per-node metering is a possible follow-on.
@@ -169,27 +180,46 @@ surfaces and how each is pinned:
 So **v1 needs no `determinism_exceptions.toml` entry.** Two follow-ons *would*: exact float-literal
 bound rendering, and a full expression printer.
 
+### Estimate attribution for non-tree execution shapes
+
+Most rendered parent/child edges are execution-subtree edges and cumulative cost composes normally.
+`WITH` is the deliberate exception because its display contains both CTE **definitions** and the
+main body, while execution may inline a definition at a reference instead of executing it at its
+displayed definition site:
+
+- a materialized referenced `CTE <name>` owns its body once; a materialized `CTE Scan <name>` owns
+  only `cte_scan_row` buffer reads;
+- an inlined `CTE <name>` definition contributes zero at the definition site, while its `CTE Scan`
+  owns the referenced body's intrinsic estimate;
+- an unreferenced read-only CTE contributes zero even though its child plan remains displayed and
+  carries its intrinsic informational estimate; and
+- the `WITH` root includes only contributions that execution actually performs, plus its main body.
+
+This semantic attribution is intentionally not a blind sum over every displayed metadata edge.
+Derived-table `Subquery` edges are ordinary execution edges and do compose normally.
+
+For DML, the root's `est_rows` is estimated affected rows, matching the row-count concept reported
+by `EXPLAIN ANALYZE` for a mutation without `RETURNING`. `INSERT` uses estimated source candidates;
+`UPDATE`/`DELETE` use the selected target scan plus the residual predicate. `ON CONFLICT` keeps the
+candidate count until distribution statistics can predict conflicts without planning-time leaf I/O.
+
 ## 6. Divergences from PostgreSQL (documented per CLAUDE.md §1)
 
-- **Format is jed's own**, not PG's indented `QUERY PLAN` text: structured `depth`/`node`/`detail`
-  columns, chosen for corpus-assertability (the whitespace/empty-cell constraints of §2) and for
-  clean forward extension (future `est_rows`/`est_cost` columns for the cost-based planner slot in as
-  new columns). Not oracle-imported.
+- **Format is jed's own**, not PG's indented `QUERY PLAN` text: structured
+  `depth`/`node`/`detail`/`est_rows`/`est_cost` columns, chosen for corpus-assertability under the
+  whitespace/empty-cell constraints of §2. Not oracle-imported.
 - **No parenthesized option list** (`EXPLAIN (FORMAT …, VERBOSE, …)`); the surface is bare
   `EXPLAIN [ANALYZE] <stmt>`. A `(…)` option list is a possible follow-on.
 - **Node vocabulary reflects jed's executor** (one `Aggregate`, one `Nested Loop`), not PG's richer
   set of physical operators — jed owns its surface.
-- **ANALYZE reports deterministic accrued cost, not wall-clock time / actual-vs-estimated rows** —
-  the property that makes it corpus-assertable.
+- **ANALYZE reports deterministic accrued cost and actual root rows, not wall-clock time or
+  per-node actuals** — the estimate columns remain planner values, which keeps both surfaces
+  corpus-assertable.
 
 ## 7. Deferred follow-ons (none foreclosed)
 
-- Per-node cost attribution under ANALYZE (needs a per-operator sub-meter).
+- Per-node actual cost attribution under ANALYZE (needs a per-operator sub-meter).
 - A full expression printer for the residual filter / projections (a ledgered spelling contract).
 - Exact float-literal bound rendering (needs a ledger entry).
-- Estimated-cost columns (`est_rows`/`est_cost`) are ratified in
-  [estimator.md §11](estimator.md): when P5 lands they are non-NULL `i64`, with rows emitted by
-  each node and saturated subtree-cumulative scheduled cost. Implementation remains a follow-on;
-  the structured-column shape was chosen for this extension.
 - A `(…)` option list; a streaming/buffered/deferred lane tag; EXPLAIN of a data-modifying `WITH`.
 - The DML touched-set count (UPDATE/DELETE), and collation-name rendering in keys.

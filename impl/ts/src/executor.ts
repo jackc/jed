@@ -99,17 +99,35 @@ import {
 import { COSTS } from "./costs.ts";
 import {
   andSelectivity,
+  addPlanEstimates,
+  addPlanUnit,
+  clonePlanEstimate,
+  emptyPlanEstimate,
   estimateCandidate,
   estimateSelectivity,
   fractionSelectivity,
+  leafEstimatedPlan,
   notSelectivity,
   orSelectivity,
+  parentEstimatedPlan,
+  planEstimateCost,
+  repeatPlanEstimate,
+  scaleEstimateCeil,
   selectivityClass,
   saturatingEstimateAdd,
+  saturatingEstimateMultiply,
+  wrapEstimatedPlan,
   type CandidateEstimate,
+  type EstimatedPlan,
+  type PlanEstimate,
   type Selectivity,
 } from "./estimator.ts";
 import {
+  DEFAULT_DISTINCT_VALUES,
+  DEFAULT_SRF_ROWS,
+  DEFAULT_VARIABLE_KEY_BYTES,
+  ESTIMATOR_UNIT_COUNT,
+  MAX_ESTIMATE,
   SELECTIVITY_BOOLEAN,
   SELECTIVITY_EQUALITY,
   SELECTIVITY_INEQUALITY,
@@ -123,6 +141,17 @@ import {
   ACCESS_GIST_EQUAL,
   ACCESS_GIST_RANGE,
   ACCESS_UNSUPPORTED,
+  SELECTIVITY_OPAQUE,
+  UNIT_AGGREGATE_ACCUMULATE,
+  UNIT_CTE_SCAN_ROW,
+  UNIT_GENERATED_ROW,
+  UNIT_HASH_BUILD,
+  UNIT_HASH_PROBE,
+  UNIT_OPERATOR_EVAL,
+  UNIT_PAGE_READ,
+  UNIT_ROW_PRODUCED,
+  UNIT_STORAGE_ROW_READ,
+  UNIT_WINDOW_RESULT,
 } from "./estimator_constants.ts";
 import { Cursor, type RowSource } from "./cursor.ts";
 // Type-only (erased) — no runtime cycle: the executor↔api value edge stays one-directional.
@@ -979,6 +1008,8 @@ export type FkDependent = {
   refTableName: string; // canonical referencing-table name — for the RESTRICT detail
   droppedName: string; // canonical name of the dropped table the FK references — for the RESTRICT detail
 };
+
+type EstimateCteContext = { bindings: CteBinding[]; modes: CteMode[]; bodies: EstimatedPlan[] };
 
 export class Engine {
   // The last committed, immutable state — what fresh readers (and autocommit reads) see.
@@ -2629,6 +2660,485 @@ export class Engine {
     }
   }
 
+  // --- P5 whole-plan estimates ---------------------------------------------------------------
+
+  private estimateSumExprNodes(exprs: RExpr[]): bigint {
+    return exprs.reduce((total, expr) => saturatingEstimateAdd(total, estimatorOperatorNodes(expr)), 0n);
+  }
+
+  private addExpressionSubqueries(
+    dst: PlanEstimate,
+    expr: RExpr | null,
+    invocations: bigint,
+    ctx: EstimateCteContext | null,
+  ): void {
+    if (expr === null) return;
+    const add = (child: RExpr | null | undefined): void => {
+      if (child !== undefined) this.addExpressionSubqueries(dst, child, invocations, ctx);
+    };
+    const addMany = (children: RExpr[]): void => {
+      for (const child of children) add(child);
+    };
+    switch (expr.kind) {
+      case "subquery": {
+        add(expr.lhs);
+        const count = queryPlanReferencesOuter(expr.plan, 0) ? invocations : 1n;
+        const extra = repeatPlanEstimate(this.estimateQueryPlan(expr.plan, ctx).root, count);
+        for (let i = 0; i < ESTIMATOR_UNIT_COUNT; i++) {
+          dst.units[i] = saturatingEstimateAdd(dst.units[i]!, extra.units[i]!);
+        }
+        return;
+      }
+      case "inValues": add(expr.lhs); return;
+      case "quantified": add(expr.lhs); add(expr.array); return;
+      case "cast": case "arrayCast": case "neg": case "not": case "isNull":
+      case "isJson": case "jsonCtor": add(expr.operand); return;
+      case "arith": case "compare": case "and": case "or": case "distinct":
+      case "like": case "regex": add(expr.lhs); add(expr.rhs); return;
+      case "jsonGet": case "jsonHasKey": case "jsonDelete": add(expr.base); add(expr.arg); return;
+      case "jsonContains": case "jsonConcat": add(expr.a); add(expr.b); return;
+      case "casing": add(expr.arg); return;
+      case "atTimeZone": add(expr.zone); add(expr.value); return;
+      case "dateTrunc": add(expr.unit); add(expr.value); add(expr.zone); return;
+      case "extract": add(expr.value); return;
+      case "dateConvert": add(expr.inner); return;
+      case "case":
+        add(expr.els);
+        for (const arm of expr.arms) { add(arm.cond); add(arm.result); }
+        return;
+      case "greatestLeast": case "coalesce": case "scalarFunc": case "arrayFunc":
+      case "regexFunc": case "rangeFunc": case "rangeCtor": case "rangeOp":
+      case "rangeSetOp": case "variadic": case "jsonBuild": case "jsonSetInsert":
+      case "jsonObjectFromArrays": case "jsonPathFn": case "jsonSqlFn": addMany(expr.args); return;
+      case "row": addMany(expr.fields); return;
+      case "array": addMany(expr.elements); return;
+      case "field": add(expr.base); return;
+      case "subscript": add(expr.base); addMany(rSubscriptBounds(expr.subscripts)); return;
+      default: return;
+    }
+  }
+
+  private addExpressionListSubqueries(
+    dst: PlanEstimate,
+    exprs: RExpr[],
+    invocations: bigint,
+    ctx: EstimateCteContext | null,
+  ): void {
+    for (const expr of exprs) this.addExpressionSubqueries(dst, expr, invocations, ctx);
+  }
+
+  private estimatePow(base: bigint, exponent: number): bigint {
+    let result = 1n;
+    for (let i = 0; i < exponent; i++) result = saturatingEstimateMultiply(result, base);
+    return result;
+  }
+
+  private estimateWindowRows(rows: bigint, limit: bigint | null, offset: bigint | null): bigint {
+    let result = rows;
+    if (offset !== null) result = offset >= result ? 0n : result - offset;
+    if (limit !== null && limit < result) result = limit;
+    return result;
+  }
+
+  private requiredEstimateInput(selectivity: Selectivity, target: bigint, maximum: bigint): bigint {
+    target = target < 0n ? 0n : target > MAX_ESTIMATE ? MAX_ESTIMATE : target;
+    maximum = maximum < 0n ? 0n : maximum > MAX_ESTIMATE ? MAX_ESTIMATE : maximum;
+    if (target === 0n || maximum === 0n) return 0n;
+    if (estimateSelectivity(selectivity, maximum) < target) return maximum;
+    let lo = 0n;
+    let hi = maximum;
+    while (lo < hi) {
+      const mid = lo + (hi - lo) / 2n;
+      if (estimateSelectivity(selectivity, mid) >= target) hi = mid;
+      else lo = mid + 1n;
+    }
+    return lo;
+  }
+
+  private capStreamingScanEstimate(plan: EstimatedPlan, sp: SelectPlan, requested: bigint): void {
+    if (sp.rels.length !== 1 || plan.nodes.length === 0) return;
+    const oldRows = plan.root.units[UNIT_STORAGE_ROW_READ]!;
+    const cap = requested < 0n ? 0n : requested > oldRows ? oldRows : requested;
+    if (cap === oldRows) return;
+    const delta = oldRows - cap;
+    plan.root.rows = cap;
+    plan.root.units[UNIT_STORAGE_ROW_READ] = cap;
+    const rel = sp.rels[0]!;
+    const store = this.estimatorStore(rel.db, rel.tableName);
+    const height = BigInt(store.height());
+    const bound = sp.phys.relBounds[0] ?? null;
+    const indexFetch = bound !== null && ["index", "gin", "gist", "indexSet"].includes(bound.kind);
+    if (indexFetch) {
+      let reduction = saturatingEstimateMultiply(delta, height);
+      if (reduction > plan.root.units[UNIT_PAGE_READ]!) reduction = plan.root.units[UNIT_PAGE_READ]!;
+      plan.root.units[UNIT_PAGE_READ] = plan.root.units[UNIT_PAGE_READ]! - reduction;
+    } else if (sp.phys.indexOrder !== null && bound === null) {
+      const index = this.estimatorIndexStore(rel.db, sp.phys.indexOrder.nameKey);
+      const indexPages = estimatorClampPages(cap, BigInt(index.nodeCount()), BigInt(index.height()));
+      plan.root.units[UNIT_PAGE_READ] = saturatingEstimateAdd(
+        indexPages,
+        saturatingEstimateMultiply(cap, height),
+      );
+    } else {
+      const pages = estimatorClampPages(cap, BigInt(store.nodeCount()), height);
+      if (pages < plan.root.units[UNIT_PAGE_READ]!) plan.root.units[UNIT_PAGE_READ] = pages;
+    }
+    plan.nodes[0] = plan.root;
+  }
+
+  private estimateScanCandidate(bound: ScanBound | null, residual: RExpr | null): ScanCandidate {
+    let kind: ScanCandidateKind = "full";
+    let indexName = "";
+    if (bound !== null) {
+      switch (bound.kind) {
+        case "pk": kind = "pk"; break;
+        case "index": kind = "btree"; indexName = bound.index.nameKey; break;
+        case "gist": kind = "gist"; indexName = bound.gist.nameKey; break;
+        case "gin": kind = "gin"; indexName = bound.gin.nameKey; break;
+        case "pkSet": kind = "pk_interval"; break;
+        case "indexSet": kind = "index_interval"; indexName = bound.indexSet.nameKey; break;
+      }
+    }
+    return {
+      identity: { kind, indexName }, bound, residual,
+      scanOrder: kind === "btree" || kind === "index_interval"
+        ? { kind: "indexKey", indexName, reversible: false }
+        : { kind: "storageKey", reversible: true },
+    };
+  }
+
+  private estimateSelectedScan(rel: ScopeRel, bound: ScanBound | null, residual: RExpr | null): PlanEstimate {
+    const estimate = estimateScanCandidates([this.estimateScanCandidate(bound, residual)], rel, this, false)[0];
+    if (estimate === undefined) return emptyPlanEstimate();
+    const units = [...estimate.units];
+    units[UNIT_OPERATOR_EVAL] = 0n;
+    units[UNIT_ROW_PRODUCED] = 0n;
+    const logicalRows = this.estimatorStore(rel.db, rel.table.name).count() ?? 0n;
+    return { rows: units[UNIT_STORAGE_ROW_READ]!, logicalRows, units };
+  }
+
+  private estimatePlanRelScope(rel: PlanRel): ScopeRel | null {
+    const table = this.lkpTableScoped(rel.db, rel.tableName);
+    if (table === undefined) return null;
+    return { label: rel.tableName.toLowerCase(), table, offset: rel.offset, ...(rel.db === undefined ? {} : { db: rel.db }) };
+  }
+
+  private estimateSrfRows(srf: SrfPlan): bigint {
+    if (srf.kind !== "generate_series" || srf.args.length < 2 || srf.args.length > 3 ||
+      srf.args[0]!.kind !== "constInt" || srf.args[1]!.kind !== "constInt" ||
+      (srf.args.length === 3 && srf.args[2]!.kind !== "constInt")) return DEFAULT_SRF_ROWS;
+    const start = srf.args[0].value;
+    const stop = srf.args[1].value;
+    const stepExpr = srf.args[2];
+    const step = stepExpr !== undefined && stepExpr.kind === "constInt" ? stepExpr.value : 1n;
+    if (step === 0n || (step > 0n && start > stop) || (step < 0n && start < stop)) return 0n;
+    const distance = start <= stop ? stop - start : start - stop;
+    const rows = distance / (step < 0n ? -step : step) + 1n;
+    return rows > MAX_ESTIMATE ? MAX_ESTIMATE : rows;
+  }
+
+  private estimateCatalogRows(srf: SrfPlan): bigint {
+    const scope = srf.introspectScope ?? "main";
+    const snap = this.snapForScope(scope);
+    if (snap === undefined) return 0n;
+    let rows = 0n;
+    for (const table of snap.tablesSorted()) {
+      switch (srf.kind) {
+        case "jed_tables": rows = saturatingEstimateAdd(rows, 1n); break;
+        case "jed_columns": rows = saturatingEstimateAdd(rows, BigInt(table.columns.length)); break;
+        case "jed_indexes": rows = saturatingEstimateAdd(rows, BigInt(table.indexes.length)); break;
+        case "jed_constraints": {
+          rows = saturatingEstimateAdd(rows, BigInt(table.checks.length + table.fks.length + table.exclusions.length));
+          rows = saturatingEstimateAdd(rows, BigInt(table.indexes.filter((index) => index.unique).length));
+          break;
+        }
+      }
+    }
+    return rows;
+  }
+
+  private estimateRelation(sp: SelectPlan, index: number, ctx: EstimateCteContext | null): EstimatedPlan {
+    const rel = sp.rels[index]!;
+    if (rel.derived !== undefined) {
+      const body = this.estimateQueryPlan(rel.derived, ctx);
+      return parentEstimatedPlan(body.root, body);
+    }
+    if (rel.cte !== undefined && ctx !== null && rel.cte < ctx.bodies.length) {
+      const body = ctx.bodies[rel.cte]!;
+      if (ctx.modes[rel.cte] === "materialize") {
+        const estimate = emptyPlanEstimate(body.root.rows);
+        addPlanUnit(estimate, UNIT_CTE_SCAN_ROW, body.root.rows);
+        return leafEstimatedPlan(estimate);
+      }
+      return leafEstimatedPlan(clonePlanEstimate(body.root));
+    }
+    if (rel.srf !== undefined) {
+      const rows = rel.srf.kind.startsWith("jed_") ? this.estimateCatalogRows(rel.srf) : this.estimateSrfRows(rel.srf);
+      const estimate = emptyPlanEstimate(rows);
+      addPlanUnit(estimate, UNIT_GENERATED_ROW, rows);
+      addPlanUnit(estimate, UNIT_OPERATOR_EVAL, this.estimateSumExprNodes(rel.srf.args));
+      this.addExpressionListSubqueries(estimate, rel.srf.args, 1n, ctx);
+      return leafEstimatedPlan(estimate);
+    }
+    const scopeRel = this.estimatePlanRelScope(rel);
+    if (scopeRel === null) return leafEstimatedPlan(emptyPlanEstimate());
+    const inl = sp.phys.relINLBounds[index] ?? null;
+    const bound = inl ?? sp.phys.relBounds[index]!;
+    const estimate = this.estimateSelectedScan(scopeRel, bound, sp.filter);
+    // An unbounded secondary-index ORDER BY walks the index and point-fetches the table; it is
+    // physically different from the full-table candidate that supplied the legacy access bound.
+    if (index === 0 && bound === null && sp.phys.indexOrder !== null) {
+      const tableStore = this.estimatorStore(rel.db, rel.tableName);
+      const indexStore = this.estimatorIndexStore(rel.db, sp.phys.indexOrder.nameKey);
+      estimate.units[UNIT_PAGE_READ] = saturatingEstimateAdd(
+        BigInt(indexStore.nodeCount()),
+        saturatingEstimateMultiply(estimate.rows, BigInt(tableStore.height())),
+      );
+    }
+    return leafEstimatedPlan(estimate);
+  }
+
+  private estimateJoinTree(sp: SelectPlan, n: number, ctx: EstimateCteContext | null): EstimatedPlan {
+    if (n === 1) return this.estimateRelation(sp, 0, ctx);
+    const left = this.estimateJoinTree(sp, n - 1, ctx);
+    let right = this.estimateRelation(sp, n - 1, ctx);
+    const rightPerCallLogical = right.root.logicalRows;
+    const boundByOuter = sp.phys.relINLBounds[n - 1] !== null;
+    if (boundByOuter || sp.rels[n - 1]!.lateral === true) {
+      right = { root: repeatPlanEstimate(right.root, left.root.rows), nodes: right.nodes.map((node) => repeatPlanEstimate(node, left.root.rows)) };
+    }
+    const physicalPairs = boundByOuter || sp.rels[n - 1]!.lateral === true
+      ? right.root.rows : saturatingEstimateMultiply(left.root.rows, right.root.rows);
+    const logicalPairs = boundByOuter
+      ? physicalPairs
+      : saturatingEstimateMultiply(left.root.logicalRows, rightPerCallLogical);
+    const join = sp.joins[n - 2]!;
+    let rows = physicalPairs;
+    let logicalRows = logicalPairs;
+    if (join.on !== null && !boundByOuter) {
+      rows = estimateSelectivity(estimatorPredicateSelectivity(join.on), rows);
+      logicalRows = estimateSelectivity(estimatorPredicateSelectivity(join.on), logicalRows);
+    }
+    const preservedLeft = left.root.rows;
+    const preservedRight = right.root.rows;
+    if (join.kind === "left") { rows = rows < preservedLeft ? preservedLeft : rows; logicalRows = logicalRows < preservedLeft ? preservedLeft : logicalRows; }
+    if (join.kind === "right") { rows = rows < preservedRight ? preservedRight : rows; logicalRows = logicalRows < preservedRight ? preservedRight : logicalRows; }
+    if (join.kind === "full") {
+      const preserved = preservedLeft > preservedRight ? preservedLeft : preservedRight;
+      rows = rows < preserved ? preserved : rows;
+      logicalRows = logicalRows < preserved ? preserved : logicalRows;
+    }
+    const root = addPlanEstimates(left.root, right.root);
+    root.rows = rows;
+    root.logicalRows = logicalRows;
+    let invocations = physicalPairs;
+    if (n === 2 && sp.phys.hashJoin !== null) {
+      let keyBytes = 0n;
+      let framedBytes = 0n;
+      for (const key of sp.phys.hashJoin.keys) {
+        const scalar = typeAsScalar(key.type);
+        const width = scalar !== undefined && isFixedWidth(scalar)
+          ? BigInt(widthBytes(scalar))
+          : DEFAULT_VARIABLE_KEY_BYTES;
+        keyBytes = saturatingEstimateAdd(keyBytes, width);
+        framedBytes = saturatingEstimateAdd(framedBytes, saturatingEstimateAdd(4n, width));
+      }
+      addPlanUnit(root, UNIT_HASH_BUILD, saturatingEstimateMultiply(right.root.rows, keyBytes));
+      addPlanUnit(root, UNIT_HASH_PROBE, saturatingEstimateAdd(saturatingEstimateMultiply(left.root.rows, keyBytes), saturatingEstimateMultiply(rows, framedBytes)));
+      invocations = rows;
+    }
+    addPlanUnit(root, UNIT_OPERATOR_EVAL, saturatingEstimateMultiply(estimatorOperatorNodes(join.on), invocations));
+    this.addExpressionSubqueries(root, join.on, invocations, ctx);
+    return parentEstimatedPlan(root, left, right);
+  }
+
+  private estimateSelectPlan(sp: SelectPlan, ctx: EstimateCteContext | null): EstimatedPlan {
+    let plan = sp.rels.length === 0 ? leafEstimatedPlan(emptyPlanEstimate(1n)) : this.estimateJoinTree(sp, sp.rels.length, ctx);
+    if (sp.limit !== null && !sp.distinct && (streamingScanEligible(sp) || sp.phys.indexOrder !== null || this.windowTopNEligible(sp))) {
+      const target = saturatingEstimateAdd(sp.limit, sp.offset ?? 0n);
+      const cap = sp.filter === null
+        ? target
+        : this.requiredEstimateInput(estimatorPredicateSelectivity(sp.filter), target, plan.root.rows);
+      this.capStreamingScanEstimate(plan, sp, cap);
+    }
+    if (sp.filter !== null) {
+      const inputRows = plan.root.rows;
+      const logicalRows = estimateSelectivity(estimatorPredicateSelectivity(sp.filter), plan.root.logicalRows);
+      const rows = logicalRows > plan.root.rows ? plan.root.rows : logicalRows;
+      const local = Array<bigint>(ESTIMATOR_UNIT_COUNT).fill(0n);
+      local[UNIT_OPERATOR_EVAL] = saturatingEstimateMultiply(estimatorOperatorNodes(sp.filter), inputRows);
+      plan = wrapEstimatedPlan(plan, rows, logicalRows, local);
+      this.addExpressionSubqueries(plan.root, sp.filter, inputRows, ctx);
+      plan.nodes[0] = plan.root;
+    }
+    if (sp.isAgg) {
+      const inputRows = plan.root.rows;
+      let rows = 1n;
+      if (sp.groupKeys.length > 0) {
+        const maxGroups = this.estimatePow(DEFAULT_DISTINCT_VALUES, sp.groupKeys.length);
+        rows = inputRows > maxGroups ? maxGroups : inputRows;
+        if (sp.groupSets.length > 1) rows = saturatingEstimateMultiply(rows, BigInt(sp.groupSets.length));
+      } else if (sp.groupSets.length > 1) rows = BigInt(sp.groupSets.length);
+      const groupRows = rows;
+      const local = Array<bigint>(ESTIMATOR_UNIT_COUNT).fill(0n);
+      local[UNIT_OPERATOR_EVAL] = saturatingEstimateMultiply(this.estimateSumExprNodes(sp.groupExprs), inputRows);
+      for (const agg of sp.aggSpecs) {
+        let nodes = saturatingEstimateAdd(estimatorOperatorNodes(agg.operand), estimatorOperatorNodes(agg.filter ?? null));
+        if (agg.hypo != null) nodes = saturatingEstimateAdd(nodes, this.estimateSumExprNodes(agg.hypo.keys));
+        local[UNIT_OPERATOR_EVAL] = saturatingEstimateAdd(local[UNIT_OPERATOR_EVAL]!, saturatingEstimateMultiply(nodes, inputRows));
+        local[UNIT_OPERATOR_EVAL] = saturatingEstimateAdd(local[UNIT_OPERATOR_EVAL]!, saturatingEstimateMultiply(estimatorOperatorNodes(agg.osaFrac ?? null), rows));
+      }
+      local[UNIT_AGGREGATE_ACCUMULATE] = saturatingEstimateMultiply(inputRows, BigInt(sp.aggSpecs.length));
+      let logicalRows = rows;
+      if (sp.having !== null) {
+        local[UNIT_OPERATOR_EVAL] = saturatingEstimateAdd(local[UNIT_OPERATOR_EVAL]!, saturatingEstimateMultiply(estimatorOperatorNodes(sp.having), rows));
+        rows = estimateSelectivity(estimatorPredicateSelectivity(sp.having), rows);
+        logicalRows = rows;
+      }
+      plan = wrapEstimatedPlan(plan, rows, logicalRows, local);
+      this.addExpressionListSubqueries(plan.root, sp.groupExprs, inputRows, ctx);
+      for (const agg of sp.aggSpecs) {
+        this.addExpressionSubqueries(plan.root, agg.operand, inputRows, ctx);
+        this.addExpressionSubqueries(plan.root, agg.filter ?? null, inputRows, ctx);
+        if (agg.hypo != null) this.addExpressionListSubqueries(plan.root, agg.hypo.keys, inputRows, ctx);
+        this.addExpressionSubqueries(plan.root, agg.osaFrac ?? null, groupRows, ctx);
+      }
+      this.addExpressionSubqueries(plan.root, sp.having, groupRows, ctx);
+      plan.nodes[0] = plan.root;
+    }
+    if (sp.hasWindow) {
+      const local = Array<bigint>(ESTIMATOR_UNIT_COUNT).fill(0n);
+      let nodes = this.estimateSumExprNodes(sp.windowKeys);
+      for (const spec of sp.windowSpecs) nodes = saturatingEstimateAdd(nodes, saturatingEstimateAdd(this.estimateSumExprNodes(spec.args), estimatorOperatorNodes(spec.filter ?? null)));
+      local[UNIT_OPERATOR_EVAL] = saturatingEstimateMultiply(nodes, plan.root.rows);
+      local[UNIT_WINDOW_RESULT] = saturatingEstimateMultiply(plan.root.rows, BigInt(sp.windowSpecs.length));
+      plan = wrapEstimatedPlan(plan, plan.root.rows, plan.root.logicalRows, local);
+      this.addExpressionListSubqueries(plan.root, sp.windowKeys, plan.root.rows, ctx);
+      for (const spec of sp.windowSpecs) {
+        this.addExpressionListSubqueries(plan.root, spec.args, plan.root.rows, ctx);
+        this.addExpressionSubqueries(plan.root, spec.filter ?? null, plan.root.rows, ctx);
+      }
+      plan.nodes[0] = plan.root;
+    }
+    let distinctInputRows: bigint | null = null;
+    if (sp.distinct) {
+      distinctInputRows = plan.root.rows;
+      const maxRows = this.estimatePow(DEFAULT_DISTINCT_VALUES, sp.projections.length);
+      const rows = plan.root.rows > maxRows ? maxRows : plan.root.rows;
+      plan = wrapEstimatedPlan(plan, rows, rows, Array<bigint>(ESTIMATOR_UNIT_COUNT).fill(0n));
+    }
+    const orderElided = sp.phys.pkOrdered || sp.phys.indexOrder !== null || sp.phys.joinPkOrdered;
+    if (sp.order.length > 0 && !orderElided) {
+      const local = Array<bigint>(ESTIMATOR_UNIT_COUNT).fill(0n);
+      local[UNIT_OPERATOR_EVAL] = saturatingEstimateMultiply(this.estimateSumExprNodes(sp.orderExprs), plan.root.rows);
+      plan = wrapEstimatedPlan(plan, plan.root.rows, plan.root.logicalRows, local);
+      this.addExpressionListSubqueries(plan.root, sp.orderExprs, plan.root.rows, ctx);
+      plan.nodes[0] = plan.root;
+    }
+    if (sp.limit !== null || sp.offset !== null) {
+      const rows = this.estimateWindowRows(plan.root.rows, sp.limit, sp.offset);
+      plan = wrapEstimatedPlan(plan, rows, rows, Array<bigint>(ESTIMATOR_UNIT_COUNT).fill(0n));
+    }
+    const projectionRows = distinctInputRows ?? plan.root.rows;
+    addPlanUnit(plan.root, UNIT_OPERATOR_EVAL, saturatingEstimateMultiply(this.estimateSumExprNodes(sp.projections), projectionRows));
+    this.addExpressionListSubqueries(plan.root, sp.projections, projectionRows, ctx);
+    addPlanUnit(plan.root, UNIT_ROW_PRODUCED, plan.root.rows);
+    plan.nodes[0] = plan.root;
+    return plan;
+  }
+
+  private estimateQueryPlan(plan: QueryPlan, ctx: EstimateCteContext | null): EstimatedPlan {
+    if (plan.kind === "select") return this.estimateSelectPlan(plan, ctx);
+    if (plan.kind === "values") {
+      const estimate = emptyPlanEstimate(BigInt(plan.rows.length));
+      for (const row of plan.rows) {
+        addPlanUnit(estimate, UNIT_OPERATOR_EVAL, this.estimateSumExprNodes(row));
+        this.addExpressionListSubqueries(estimate, row, 1n, ctx);
+      }
+      addPlanUnit(estimate, UNIT_ROW_PRODUCED, estimate.rows);
+      return leafEstimatedPlan(estimate);
+    }
+    if (plan.kind === "with") return this.estimateWithPlan(plan);
+    const lhs = this.estimateQueryPlan(plan.lhs, ctx);
+    const rhs = this.estimateQueryPlan(plan.rhs, ctx);
+    let rows = saturatingEstimateAdd(lhs.root.rows, rhs.root.rows);
+    if (!plan.all) {
+      if (plan.op === "union") {
+        const maxRows = this.estimatePow(DEFAULT_DISTINCT_VALUES, plan.columnTypes.length);
+        if (rows > maxRows) rows = maxRows;
+      } else if (plan.op === "intersect") {
+        rows = lhs.root.rows < rhs.root.rows ? lhs.root.rows : rhs.root.rows;
+        rows = scaleEstimateCeil(rows, SELECTIVITY_OPAQUE);
+      } else {
+        rows = scaleEstimateCeil(lhs.root.rows, SELECTIVITY_OPAQUE);
+      }
+    }
+    const root = addPlanEstimates(lhs.root, rhs.root);
+    root.rows = rows; root.logicalRows = rows;
+    let out = parentEstimatedPlan(root, lhs, rhs);
+    if (plan.order.length > 0) out = wrapEstimatedPlan(out, out.root.rows, out.root.logicalRows, Array<bigint>(ESTIMATOR_UNIT_COUNT).fill(0n));
+    if (plan.limit !== null || plan.offset !== null) {
+      rows = this.estimateWindowRows(out.root.rows, plan.limit, plan.offset);
+      out = wrapEstimatedPlan(out, rows, rows, Array<bigint>(ESTIMATOR_UNIT_COUNT).fill(0n));
+    }
+    return out;
+  }
+
+  private estimateWithPlan(plan: WithPlan): EstimatedPlan {
+    const ctx: EstimateCteContext = { bindings: plan.bindings, modes: plan.modes, bodies: [] };
+    const definitionNodes: PlanEstimate[] = [];
+    let bindingContribution = emptyPlanEstimate();
+    for (let i = 0; i < plan.bindings.length; i++) {
+      const binding = plan.bindings[i]!;
+      const body = binding.source.kind === "query" ? this.estimateQueryPlan(binding.source.plan, ctx) : leafEstimatedPlan(emptyPlanEstimate());
+      ctx.bodies.push(body);
+      const mode = plan.modes[i] ?? "inline";
+      let cteEstimate = emptyPlanEstimate(body.root.rows);
+      if (mode === "materialize" && binding.refs > 0) {
+        cteEstimate = clonePlanEstimate(body.root);
+        bindingContribution = addPlanEstimates(bindingContribution, body.root);
+      }
+      definitionNodes.push(cteEstimate);
+      if (binding.source.kind === "query") definitionNodes.push(...body.nodes);
+    }
+    const body = this.estimateQueryPlan(plan.body, ctx);
+    const root = addPlanEstimates(bindingContribution, body.root);
+    root.rows = body.root.rows; root.logicalRows = body.root.logicalRows;
+    return { root, nodes: [root, ...definitionNodes, ...body.nodes] };
+  }
+
+  private estimateMutationScan(table: Table, db: string | undefined, filter: RExpr | null): EstimatedPlan {
+    const rel: ScopeRel = { label: table.name.toLowerCase(), table, offset: 0, ...(db === undefined ? {} : { db }) };
+    const scan = leafEstimatedPlan(this.estimateSelectedScan(rel, this.planMutationScan(db, table, filter).bound, filter));
+    if (filter === null) return scan;
+    const logicalRows = estimateSelectivity(estimatorPredicateSelectivity(filter), scan.root.logicalRows);
+    const rows = logicalRows > scan.root.rows ? scan.root.rows : logicalRows;
+    const local = Array<bigint>(ESTIMATOR_UNIT_COUNT).fill(0n);
+    local[UNIT_OPERATOR_EVAL] = saturatingEstimateMultiply(estimatorOperatorNodes(filter), scan.root.rows);
+    const plan = wrapEstimatedPlan(scan, rows, logicalRows, local);
+    this.addExpressionSubqueries(plan.root, filter, scan.root.rows, null);
+    plan.nodes[0] = plan.root;
+    return plan;
+  }
+
+  private estimateExplain(inner: Statement): PlanEstimate[] {
+    if (inner.kind === "insert") {
+      if (this.lkpTableScoped(inner.db, inner.table) === undefined) throw engineError("undefined_table", "table does not exist: " + inner.table);
+      const source = inner.source.kind === "select"
+        ? this.estimateQueryPlan(this.planQuery(inner.source.select, null, [], new ParamTypes()), null)
+        : leafEstimatedPlan(emptyPlanEstimate(BigInt(inner.source.rows.length)));
+      return parentEstimatedPlan(source.root, source).nodes;
+    }
+    if (inner.kind === "update" || inner.kind === "delete") {
+      const table = this.lkpTableScoped(inner.db, inner.table);
+      if (table === undefined) throw engineError("undefined_table", "table does not exist: " + inner.table);
+      const filter = this.explainDmlFilter(table, inner.filter);
+      const scan = this.estimateMutationScan(table, inner.db, filter);
+      return parentEstimatedPlan(scan.root, scan).nodes;
+    }
+    return this.estimateQueryPlan(this.planExplainInner(inner), null).nodes;
+  }
+
   // executeExplain plans the inner statement and renders the plan as a deterministic result set
   // (spec/design/explain.md). Plain EXPLAIN never executes the inner statement — renderExplain produces
   // the plan structs, which renderQueryPlan walks. The EXPLAIN statement's own cost is one rowProduced
@@ -2643,7 +3153,11 @@ export class Engine {
       // value), so supplied parameters are neither needed nor bound.
       throw engineError("syntax_error", "bind parameters are not allowed in EXPLAIN");
     }
-    const r = new ExplainRender();
+    const estimates = this.estimateExplain(ex.inner).map((estimate) => ({
+      rows: estimate.rows,
+      cost: planEstimateCost(estimate),
+    }));
+    const r = new ExplainRender(estimates);
     this.renderExplain(r, ex.inner, 0);
     return this.explainOutcome(r.rows);
   }
@@ -2657,7 +3171,11 @@ export class Engine {
   // rowProduced per emitted plan row (independent of the inner cost, which appears only in the root).
   private executeExplainAnalyze(inner: Statement, params: Value[]): Outcome {
     // Render the plan tree first (plan-only, no execution — pre-mutation).
-    const body = new ExplainRender();
+    const estimates = this.estimateExplain(inner).map((estimate) => ({
+      rows: estimate.rows,
+      cost: planEstimateCost(estimate),
+    }));
+    const body = new ExplainRender(estimates);
     this.renderExplain(body, inner, 0);
     // Execute the inner statement for real, capturing its actual accrued cost + row count. Privileges
     // and the lifetime budget were already admitted on the EXPLAIN (dispatchStmt recurses into the
@@ -2668,10 +3186,11 @@ export class Engine {
         ? BigInt(innerOut.rowsAffected ?? 0) // a DML statement without RETURNING
         : BigInt(innerOut.rows.length);
     // Assemble: the Analyze root carries the actual figures; the plan tree sits one level deeper.
-    const r = new ExplainRender();
+    const rootEstimate = estimates[0] ?? { rows: 0n, cost: 0n };
+    const r = new ExplainRender([rootEstimate]);
     r.emit(0, "Analyze", `cost=${innerOut.cost} rows=${actualRows}`);
     for (const row of body.rows) {
-      r.rows.push({ depth: row.depth + 1, node: row.node, detail: row.detail });
+      r.rows.push({ ...row, depth: row.depth + 1 });
     }
     return this.explainOutcome(r.rows);
   }
@@ -2683,12 +3202,14 @@ export class Engine {
     meter.charge(COSTS.rowProduced * BigInt(rows.length));
     return {
       kind: "query",
-      columnNames: ["depth", "node", "detail"],
-      columnTypes: ["i32", "text", "text"],
+      columnNames: ["depth", "node", "detail", "est_rows", "est_cost"],
+      columnTypes: ["i32", "text", "text", "i64", "i64"],
       rows: rows.map((row) => [
         intValue(BigInt(row.depth)),
         textValue(row.node),
         textValue(row.detail),
+        intValue(row.estRows),
+        intValue(row.estCost),
       ]),
       cost: meter.accrued,
     };

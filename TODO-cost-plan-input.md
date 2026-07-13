@@ -229,27 +229,34 @@ and actual cost are unchanged. `bundle exec rake ci` passes.
 
 **Goal:** propagate estimates through the selected plan and make them corpus-assertable.
 
-- [ ] Define whether each node's `est_cost` is local, subtree-cumulative, or both; expose exactly
+- [x] Define whether each node's `est_cost` is local, subtree-cumulative, or both; expose exactly
   one unambiguous contract in EXPLAIN.
-- [ ] Propagate estimates through residual filters and projections.
-- [ ] Propagate through nested-loop, index-nested-loop, and hash joins in current FROM order.
-- [ ] Propagate through aggregate/GROUP BY, HAVING, window, DISTINCT, Sort, and LIMIT/OFFSET.
-- [ ] Propagate through SRFs, CTE materialization/references, derived tables, VALUES, set operations,
+- [x] Propagate estimates through residual filters and projections.
+- [x] Propagate through nested-loop, index-nested-loop, and hash joins in current FROM order.
+- [x] Propagate through aggregate/GROUP BY, HAVING, window, DISTINCT, Sort, and LIMIT/OFFSET.
+- [x] Propagate through SRFs, CTE materialization/references, derived tables, VALUES, set operations,
   and FROM-less SELECT.
-- [ ] Cover INSERT/UPDATE/DELETE plan nodes or record an explicit initial narrowing for DML
+- [x] Cover INSERT/UPDATE/DELETE plan nodes or record an explicit initial narrowing for DML
   estimates.
-- [ ] Add `est_rows` and `est_cost` columns to the EXPLAIN result type and renderer in all cores.
-- [ ] Specify exact column types, rendering, and sentinel behavior.
-- [ ] Keep the EXPLAIN statement's own runtime cost at one `row_produced` per emitted plan row; the
+- [x] Add `est_rows` and `est_cost` columns to the EXPLAIN result type and renderer in all cores.
+- [x] Specify exact column types, rendering, and sentinel behavior.
+- [x] Keep the EXPLAIN statement's own runtime cost at one `row_produced` per emitted plan row; the
   new cells themselves do not add execution cost.
-- [ ] Keep EXPLAIN ANALYZE actual cost/rows separate from estimates.
-- [ ] Re-pin every existing EXPLAIN corpus entry to the expanded result shape.
-- [ ] Add estimate-focused corpus cases for empty, selective, nonselective, join, aggregate, and
+- [x] Keep EXPLAIN ANALYZE actual cost/rows separate from estimates.
+- [x] Re-pin every existing EXPLAIN corpus entry to the expanded result shape.
+- [x] Add estimate-focused corpus cases for empty, selective, nonselective, join, aggregate, and
   LIMIT plans.
-- [ ] Update `spec/design/explain.md`, website SQL docs, and live examples.
+- [x] Update `spec/design/explain.md`, website SQL docs, and live examples.
 
 **Exit gate:** plain EXPLAIN exposes deterministic per-node estimates for every supported current
 plan shape, and the shared corpus asserts them across all cores.
+
+**Status:** complete on 2026-07-13. Every rendered SELECT and DML shape now carries non-NULL `i64`
+rows plus cumulative scheduled cost in Rust, Go, and TypeScript. The traversal includes hidden scalar
+subplans, semantic inline/materialized CTE attribution, fixed-width hash-key framing, ordered scan and
+backward-window LIMIT prefixes, and affected-row DML roots while leaving the legacy selector
+authoritative. The expanded existing corpus plus populated empty/selective/full/hash/group/limit
+cases pass in all three cores; full CI verification is recorded with the landing commit.
 
 ## P6 — Cost-based single-relation access-path selection
 
@@ -382,13 +389,16 @@ byte-identical, deterministic, cache-safe, and demonstrably improve plan selecti
 
 Update this short block at the end of each work session.
 
-- **Current slice:** P0 complete; P1 is next but has not started
-- **Last completed checkpoint:** canonical estimator data and contract ratified; planner, cost,
-  determinism, conformance, EXPLAIN, `CLAUDE.md`, and `TODO.md` synchronized
-- **Branch / P0 completion:** `path-b-p0-estimator-contract` / latest commit titled
-  `docs(planner): ratify Path B estimator contract`
-- **Verification last run:** `bundle exec rake verify` passed 2026-07-13; estimator checker passed;
-  `git diff --check` passed
-- **Known blockers or open decisions:** none for P0; all six maintainer decisions are recorded above
-- **Next action:** begin P1 by specifying the persisted per-table row-count field and format-version
-  transition; ask the maintainer before any major file-format compatibility choice
+- **Current slice:** P5 complete; P6 cost-based single-relation selection is next and has not started
+- **Last completed checkpoint:** whole-plan estimates and five-column EXPLAIN landed in all three
+  cores, with the expanded shared corpus and canonical specs/docs synchronized
+- **Branch / completion:** `path-b-p0-estimator-contract` / commit titled
+  `Implement P5 whole-plan EXPLAIN estimates`
+- **Verification last run:** `bundle exec rake ci`, final memory+disk conformance on all three cores,
+  `bundle exec rake fmt`, `bundle exec rake verify`, and the website production build passed on
+  2026-07-13
+- **Known blockers or open decisions:** none for P5; mutation-only hidden work deliberately retains
+  the documented zero fallback, and the legacy selector remains authoritative
+- **Next action:** begin P6a by specifying and enabling estimated-cost selection among full, PK, and
+  ordered B-tree candidates; ask the maintainer before the DML policy checkpoint or any other major
+  selection-semantic decision

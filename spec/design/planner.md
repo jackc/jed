@@ -235,8 +235,8 @@ elides its sort only when the source emits the requested PK order or walks the e
   under the §3 contract.
 - **Plan-time cost estimator** ([estimator.md](estimator.md)) — a stage-3 *annotation* pass:
   estimate the same units the runtime meter charges for each candidate using the ratified exact,
-  cross-core-identical contract; feeds the future EXPLAIN `est_rows`/`est_cost` columns
-  ([explain.md](explain.md) §7).
+  cross-core-identical contract. Whole-plan estimates now feed EXPLAIN's `est_rows`/`est_cost`
+  columns; the next slices make candidate selection consume them ([explain.md](explain.md) §2).
 - **Cost-based access-path + join-order selection** (TODO.md) — replaces §5's fixed
   precedence and the FROM-order join tree *inside* stage 3, once the estimator + table
   statistics exist; each enabling slice re-pins affected `# cost:` entries and proves the

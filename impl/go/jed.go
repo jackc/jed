@@ -224,8 +224,8 @@ var SupportedCapabilities = []string{
 	// Partial-index bound — the planner uses a partial index only when the WHERE contains a
 	// conjunct structurally equal to the index predicate (spec/design/indexes.md §9).
 	"query.index_partial",
-	// EXPLAIN — render the planner's chosen plan as a deterministic depth/node/detail result set,
-	// without executing the inner statement (spec/design/explain.md).
+	// EXPLAIN — render the selected plan as deterministic depth/node/detail/est_rows/est_cost rows
+	// without executing it (spec/design/explain.md).
 	"query.explain",
 	// EXPLAIN of a DML statement (INSERT/UPDATE/DELETE), plan-only — renders without mutating.
 	"dml.explain",

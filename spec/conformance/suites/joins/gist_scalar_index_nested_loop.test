@@ -90,18 +90,24 @@ LIMIT 2
 statement ok
 CREATE INDEX seat_room_btree ON seat (room)
 
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT p.id, s.id FROM room_probe p JOIN seat s ON s.room = p.room
 ----
 0
 Nested Loop
 inner; on:conjuncts=1
+4
+25
 1
 Scan room_probe
 Full scan; touched=2
+4
+5
 1
 Scan seat
 Index-nested-loop Index bound: using seat_room_btree; touched=2
+4
+12
 
 # A primary-key sibling bound is cheaper still and wins over a GiST index on that same key.
 statement ok
@@ -113,15 +119,21 @@ CREATE INDEX seat_pk_room_gist ON seat_pk USING gist (room)
 statement ok
 INSERT INTO seat_pk VALUES (10, 1), (20, 2), (30, 3)
 
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT p.id, s.id FROM room_probe p JOIN seat_pk s ON s.room = p.room
 ----
 0
 Nested Loop
 inner; on:conjuncts=1
+4
+21
 1
 Scan room_probe
 Full scan; touched=2
+4
+5
 1
 Scan seat_pk
 Index-nested-loop PK bound: room = join; touched=2
+4
+8

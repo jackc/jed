@@ -57,6 +57,7 @@ mod exec_emit;
 mod exec_scan;
 mod hash_join;
 pub(crate) use hash_join::*;
+mod estimate_plan;
 mod execute;
 mod explain_exec;
 mod kernels;

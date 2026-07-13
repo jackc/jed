@@ -208,12 +208,14 @@ ux_c
 
 # --- EXPLAIN: a Catalog Scan leaf carrying its database scope ------------------------------------
 
-query ITT nosort
+query ITTII nosort
 EXPLAIN SELECT name FROM jed_indexes
 ----
 0
 Catalog Scan jed_indexes
 db=main
+4
+8
 
 # --- privileges: gated exactly like a user table (per-table SELECT under the envelope) -----------
 

@@ -1,0 +1,148 @@
+# Whole-plan estimate propagation is jed-owned planner behavior, so these populated cases are
+# cross-core checked and intentionally not PostgreSQL-oracle imported.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.order_by_pk_scan, query.order_by_index_scan, query.bounded_limit_streaming, query.limit, query.aggregates, query.group_by, query.join_inner, query.qualified_column, query.hash_join, query.subquery_scalar, query.window, query.window_ranking, query.explain, types.i32
+
+statement ok
+CREATE TABLE p5_l (id i32 PRIMARY KEY, k i32)
+
+statement ok
+CREATE TABLE p5_r (id i32 PRIMARY KEY, k i32)
+
+# Empty base relation: no rows and no resident storage nodes means no estimated scheduled work.
+query ITTII nosort
+EXPLAIN SELECT id, k FROM p5_l
+----
+0
+Scan p5_l
+Full scan; touched=2
+0
+0
+
+statement ok
+INSERT INTO p5_l VALUES (1, 1), (2, 1), (3, 2), (4, 3)
+
+statement ok
+INSERT INTO p5_r VALUES (10, 1), (11, 2), (12, 2), (13, 4)
+
+# Nonselective base scan: the root owns final projection and row-produced work.
+query ITTII nosort
+EXPLAIN SELECT id, k FROM p5_l
+----
+0
+Scan p5_l
+Full scan; touched=2
+4
+9
+
+# Equality without a usable key remains a full scan, with one estimated output row.
+query ITTII nosort
+EXPLAIN SELECT id FROM p5_l WHERE k = 1
+----
+0
+Filter
+conjuncts=1
+1
+10
+1
+Scan p5_l
+Full scan; touched=2
+4
+5
+
+# An uncorrelated scalar subquery is hidden from the rendered tree but contributes its body once.
+query ITTII nosort
+EXPLAIN SELECT (SELECT count(*) FROM p5_r) FROM p5_l
+----
+0
+Scan p5_l
+Full scan
+4
+23
+
+# The hash node owns fixed-width build/probe bytes and estimated bucket verification.
+query ITTII nosort
+EXPLAIN SELECT l.id, r.id FROM p5_l l JOIN p5_r r ON l.k = r.k
+----
+0
+Hash Join
+inner; keys=1; on:conjuncts=1
+1
+52
+1
+Scan p5_l
+Full scan; touched=2
+4
+5
+1
+Scan p5_r
+Full scan; touched=2
+4
+5
+
+# Group cardinality uses the shared no-statistics distinct-count fallback capped by input rows.
+query ITTII nosort
+EXPLAIN SELECT k, count(*) FROM p5_l GROUP BY k
+----
+0
+Aggregate
+groups=1 aggs=1
+4
+13
+1
+Scan p5_l
+Full scan; touched=1
+4
+5
+
+# An ordered streaming LIMIT prices only the prefix expected to be pulled from the PK scan.
+query ITTII nosort
+EXPLAIN SELECT id, k FROM p5_l ORDER BY id LIMIT 2
+----
+0
+Limit
+limit=2
+2
+5
+1
+Scan p5_l
+Full scan; touched=2; ordered: pk ordered
+2
+3
+
+# The same prefix rule applies to the executor's backward-safe windowed top-N path.
+query ITTII nosort
+EXPLAIN SELECT id, row_number() OVER (ORDER BY id) FROM p5_l ORDER BY id LIMIT 2
+----
+0
+Limit
+limit=2
+2
+7
+1
+Window
+funcs=1
+2
+5
+2
+Scan p5_l
+Full scan; touched=1; ordered: pk ordered
+2
+3
+
+statement ok
+CREATE INDEX p5_l_k_idx ON p5_l (k)
+
+# An unbounded ordered-index scan prices both the index prefix and table point fetches.
+query ITTII nosort
+EXPLAIN SELECT id, k FROM p5_l ORDER BY k LIMIT 2
+----
+0
+Limit
+limit=2
+2
+7
+1
+Scan p5_l
+Full scan; touched=2; ordered: index order: p5_l_k_idx
+2
+5

@@ -1817,22 +1817,41 @@ export function stmtKind(stmt: Statement): string {
 
 // --- EXPLAIN rendering (spec/design/explain.md) ------------------------------------------------
 // EXPLAIN renders the planner's chosen plan as a deterministic, cross-core-identical result set: an
-// ordinary query Outcome with three columns — depth (i32, the pre-order nesting level), node (the
-// operator label — a fixed vocabulary, the §8 spelling contract), detail ("-" when a node has none).
+// ordinary query Outcome with five columns — depth (i32, the pre-order nesting level), node (the
+// operator label — a fixed vocabulary, the §8 spelling contract), detail ("-" when a node has none),
+// and the deterministic est_rows/est_cost pair.
 // Every cell is non-empty and free of leading/trailing whitespace (the harness renders the actual cell
 // raw but TrimSpaces the expected line), so indentation is the depth integer, never whitespace (§2).
 // The renderer is hand-written per core (§5 forbids codegenning it); the corpus + explain.md are the
 // contract. The Engine methods above walk the plan; these module-level helpers spell each token.
 
-// ExplainRow is one rendered plan row before it becomes a Value triple in explainOutcome.
-export type ExplainRow = { depth: number; node: string; detail: string };
+// ExplainRow is one rendered plan row before it becomes a Value tuple in explainOutcome.
+export type ExplainRow = {
+  depth: number;
+  node: string;
+  detail: string;
+  estRows: bigint;
+  estCost: bigint;
+};
 
 // ExplainRender accumulates the rendered plan rows. emit normalizes an empty detail to the "-"
 // sentinel so no cell renders blank (spec/design/explain.md §2).
 export class ExplainRender {
   rows: ExplainRow[] = [];
+  private next = 0;
+  private estimates: { rows: bigint; cost: bigint }[];
+  constructor(estimates: { rows: bigint; cost: bigint }[] = []) {
+    this.estimates = estimates;
+  }
   emit(depth: number, node: string, detail: string): void {
-    this.rows.push({ depth, node, detail: detail === "" ? "-" : detail });
+    const estimate = this.estimates[this.next++] ?? { rows: 0n, cost: 0n };
+    this.rows.push({
+      depth,
+      node,
+      detail: detail === "" ? "-" : detail,
+      estRows: estimate.rows,
+      estCost: estimate.cost,
+    });
   }
 }
 

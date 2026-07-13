@@ -25,7 +25,12 @@ impl Engine {
                 "bind parameters are not allowed in EXPLAIN",
             ));
         }
-        let mut r = ExplainRender::default();
+        let estimates = self
+            .estimate_explain(&inner)?
+            .into_iter()
+            .map(|estimate| (estimate.rows, estimate.cost()))
+            .collect();
+        let mut r = ExplainRender::with_estimates(estimates);
         self.render_explain(&mut r, &inner, 0)?;
         Ok(self.explain_outcome(r.rows))
     }
@@ -44,7 +49,12 @@ impl Engine {
         params: &[Value],
     ) -> Result<Outcome> {
         // Render the plan tree first (plan-only, no execution — pre-mutation).
-        let mut body = ExplainRender::default();
+        let estimates: Vec<_> = self
+            .estimate_explain(&inner)?
+            .into_iter()
+            .map(|estimate| (estimate.rows, estimate.cost()))
+            .collect();
+        let mut body = ExplainRender::with_estimates(estimates.clone());
         self.render_explain(&mut body, &inner, 0)?;
         // Execute the inner statement for real, capturing its actual accrued cost + row count.
         let inner_out = self.dispatch_stmt_body(inner, params)?;
@@ -55,7 +65,7 @@ impl Engine {
         };
         let inner_cost = inner_out.cost();
         // Assemble: the Analyze root carries the actual figures; the plan tree sits one level deeper.
-        let mut r = ExplainRender::default();
+        let mut r = ExplainRender::with_estimates(estimates.first().copied().into_iter().collect());
         r.emit(
             0,
             "Analyze",
@@ -69,7 +79,15 @@ impl Engine {
             };
             let node = it.next().expect("a plan row has a node cell");
             let detail = it.next().expect("a plan row has a detail cell");
-            r.rows.push(vec![Value::Int(depth + 1), node, detail]);
+            let est_rows = it.next().expect("a plan row has an est_rows cell");
+            let est_cost = it.next().expect("a plan row has an est_cost cell");
+            r.rows.push(vec![
+                Value::Int(depth + 1),
+                node,
+                detail,
+                est_rows,
+                est_cost,
+            ]);
         }
         Ok(self.explain_outcome(r.rows))
     }
@@ -84,8 +102,16 @@ impl Engine {
                 "depth".to_string(),
                 "node".to_string(),
                 "detail".to_string(),
+                "est_rows".to_string(),
+                "est_cost".to_string(),
             ],
-            column_types: vec!["i32".to_string(), "text".to_string(), "text".to_string()],
+            column_types: vec![
+                "i32".to_string(),
+                "text".to_string(),
+                "text".to_string(),
+                "i64".to_string(),
+                "i64".to_string(),
+            ],
             rows,
             cost: meter.accrued,
         }

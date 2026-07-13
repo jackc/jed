@@ -466,7 +466,9 @@ pub(crate) fn inventory_scan_candidates<'a>(
     candidates
 }
 
-fn estimator_predicate_selectivity(expr: Option<&RExpr>) -> crate::estimator::Selectivity {
+pub(crate) fn estimator_predicate_selectivity(
+    expr: Option<&RExpr>,
+) -> crate::estimator::Selectivity {
     use crate::estimator::Selectivity;
     use crate::estimator_constants::*;
     let Some(expr) = expr else {
@@ -956,7 +958,7 @@ fn estimator_candidate_selectivity(
     }
 }
 
-fn estimator_operator_nodes(expr: Option<&RExpr>) -> i64 {
+pub(crate) fn estimator_operator_nodes(expr: Option<&RExpr>) -> i64 {
     use crate::estimator::sat_add;
     let Some(expr) = expr else { return 0 };
     let children: i64 = match expr {
@@ -1088,7 +1090,96 @@ fn estimator_operator_nodes(expr: Option<&RExpr>) -> i64 {
     sat_add(1, children)
 }
 
-fn estimator_clamp_pages(rows: i64, nodes: i64, height: i64) -> i64 {
+/// Direct resolved-expression children in deterministic evaluation-tree order. P5 uses this to
+/// find hidden scalar subplans without teaching the estimator a second expression layout.
+pub(crate) fn estimator_expression_children(expr: &RExpr) -> Vec<&RExpr> {
+    match expr {
+        RExpr::Subquery { lhs, .. } => lhs.iter().map(Box::as_ref).collect(),
+        RExpr::InValues { lhs, .. } => vec![lhs],
+        RExpr::Quantified { lhs, array, .. }
+        | RExpr::Arith {
+            lhs, rhs: array, ..
+        }
+        | RExpr::Compare {
+            lhs, rhs: array, ..
+        }
+        | RExpr::Distinct {
+            lhs, rhs: array, ..
+        }
+        | RExpr::Like {
+            lhs, rhs: array, ..
+        }
+        | RExpr::Regex {
+            lhs, rhs: array, ..
+        }
+        | RExpr::And(lhs, array)
+        | RExpr::Or(lhs, array) => vec![lhs, array],
+        RExpr::Cast { inner, .. }
+        | RExpr::ArrayCast { inner, .. }
+        | RExpr::DateConvert { inner, .. } => vec![inner],
+        RExpr::Neg { operand, .. }
+        | RExpr::IsNull { operand, .. }
+        | RExpr::IsJson { operand, .. }
+        | RExpr::JsonCtor { operand, .. } => vec![operand],
+        RExpr::Not(child) => vec![child],
+        RExpr::Casing { arg, .. } => vec![arg],
+        RExpr::AtTimeZone { zone, value, .. } => vec![zone, value],
+        RExpr::DateTrunc { unit, value, zone } => {
+            let mut children = vec![unit.as_ref(), value.as_ref()];
+            children.extend(zone.iter().map(Box::as_ref));
+            children
+        }
+        RExpr::Extract { value, .. } => vec![value],
+        RExpr::JsonGet { base, arg, .. }
+        | RExpr::JsonHasKey { base, arg, .. }
+        | RExpr::JsonDelete { base, arg, .. } => vec![base, arg],
+        RExpr::JsonContains { a, b } | RExpr::JsonConcat { a, b } => vec![a, b],
+        RExpr::Case { arms, els, .. } => {
+            let mut children = Vec::with_capacity(1 + arms.len() * 2);
+            for (condition, result) in arms {
+                children.push(condition);
+                children.push(result);
+            }
+            children.push(els);
+            children
+        }
+        RExpr::Coalesce { args, .. }
+        | RExpr::GreatestLeast { args, .. }
+        | RExpr::ScalarFunc { args, .. }
+        | RExpr::ArrayFunc { args, .. }
+        | RExpr::RangeFunc { args, .. }
+        | RExpr::RegexFunc { args, .. }
+        | RExpr::RangeCtor { args, .. }
+        | RExpr::RangeOp { args, .. }
+        | RExpr::RangeSetOp { args, .. }
+        | RExpr::Variadic { args, .. }
+        | RExpr::JsonBuild { args, .. }
+        | RExpr::JsonSetInsert { args, .. }
+        | RExpr::JsonObjectFromArrays { args, .. }
+        | RExpr::JsonPathFn { args, .. } => args.iter().collect(),
+        RExpr::JsonSqlFn { ctx, path, .. } => vec![ctx, path],
+        RExpr::Row(fields) | RExpr::Array { elems: fields, .. } => fields.iter().collect(),
+        RExpr::Field { base, .. } => vec![base],
+        RExpr::Subscript {
+            base, subscripts, ..
+        } => {
+            let mut children = vec![base.as_ref()];
+            for subscript in subscripts {
+                match subscript {
+                    RSubscript::Index(index) => children.push(index),
+                    RSubscript::Slice { lower, upper } => {
+                        children.extend(lower.iter().map(Box::as_ref));
+                        children.extend(upper.iter().map(Box::as_ref));
+                    }
+                }
+            }
+            children
+        }
+        _ => Vec::new(),
+    }
+}
+
+pub(crate) fn estimator_clamp_pages(rows: i64, nodes: i64, height: i64) -> i64 {
     if rows == 0 || nodes == 0 {
         0
     } else {
@@ -1164,6 +1255,146 @@ pub(crate) fn estimate_scan_candidates(
             })
         })
         .collect()
+}
+
+/// Estimate the access work owned by one already-selected scan. This keeps P5 observational: it
+/// reads the legacy physical choice and never feeds an estimate back into selection.
+pub(crate) fn estimate_selected_scan(
+    bound: Option<&ScanBound>,
+    residual: Option<&RExpr>,
+    rel: &ScopeRel<'_>,
+    catalog: &Engine,
+) -> crate::estimator::PlanEstimate {
+    use crate::estimator::{CandidateInputs, PlanEstimate, estimate_candidate, estimate_rows};
+
+    let (kind, index_name) = match bound {
+        None => (ScanCandidateKind::Full, ""),
+        Some(ScanBound::Pk(_)) => (ScanCandidateKind::Pk, ""),
+        Some(ScanBound::Index(bound)) => (ScanCandidateKind::Btree, bound.name_key.as_str()),
+        Some(ScanBound::Gist(bound)) => (ScanCandidateKind::Gist, bound.name_key.as_str()),
+        Some(ScanBound::Gin(bound)) => (ScanCandidateKind::Gin, bound.name_key.as_str()),
+        Some(ScanBound::PkSet(_)) => (ScanCandidateKind::PkInterval, ""),
+        Some(ScanBound::IndexSet(bound)) => {
+            (ScanCandidateKind::IndexInterval, bound.name_key.as_str())
+        }
+    };
+    let store = catalog.store_scoped(rel.db.as_deref(), &rel.table.name);
+    let row_count = store.count().unwrap_or(0);
+    let access_selectivity = match bound {
+        Some(ScanBound::Pk(bound)) => {
+            if bound
+                .eq_cols
+                .iter()
+                .any(|column| estimator_equality_sources_impossible(&column.srcs, column.col_type))
+            {
+                crate::estimator::Selectivity::Zero
+            } else if bound.eq_cols.len() == bound.member_count && bound.range.is_none() {
+                crate::estimator::Selectivity::Unique
+            } else {
+                let mut result = estimator_equality_prefix(bound.eq_cols.len());
+                if let Some(range) = &bound.range {
+                    result = result.and(estimator_range_terms(&range.terms, range.col_type));
+                }
+                result
+            }
+        }
+        Some(ScanBound::Index(bound)) => {
+            if bound
+                .eq_cols
+                .iter()
+                .any(|column| estimator_equality_sources_impossible(&column.srcs, column.col_type))
+            {
+                crate::estimator::Selectivity::Zero
+            } else {
+                let unique = rel.table.indexes.iter().any(|index| {
+                    index.name.eq_ignore_ascii_case(&bound.name_key)
+                        && index.unique
+                        && bound.eq_cols.len() == index.keys.len()
+                        && bound.range.is_none()
+                });
+                if unique {
+                    crate::estimator::Selectivity::Unique
+                } else {
+                    let mut result = estimator_equality_prefix(bound.eq_cols.len());
+                    if let Some(range) = &bound.range {
+                        result = result.and(estimator_range_terms(&range.terms, range.col_type));
+                    }
+                    result
+                }
+            }
+        }
+        Some(ScanBound::Gist(bound)) => crate::estimator::selectivity_class(
+            if bound.strategy == crate::gist::GistStrategy::Equal {
+                crate::estimator_constants::ACCESS_GIST_EQUAL
+            } else {
+                crate::estimator_constants::ACCESS_GIST_RANGE
+            },
+        ),
+        Some(ScanBound::Gin(bound)) => crate::estimator::selectivity_class(match bound.strategy {
+            GinStrategy::Contains => crate::estimator_constants::ACCESS_GIN_CONTAINS,
+            GinStrategy::Overlaps => crate::estimator_constants::ACCESS_GIN_OVERLAPS,
+            GinStrategy::Member => crate::estimator_constants::ACCESS_GIN_MEMBER,
+            GinStrategy::Equal => crate::estimator_constants::ACCESS_GIN_EQUAL,
+        }),
+        Some(ScanBound::PkSet(bound)) => {
+            estimator_interval_selectivity(&bound.specs, &bound.clip, true, bound.pk_type)
+        }
+        Some(ScanBound::IndexSet(bound)) => {
+            let unique = rel.table.indexes.iter().any(|index| {
+                index.name.eq_ignore_ascii_case(&bound.name_key)
+                    && index.unique
+                    && index.keys.len() == 1
+            });
+            estimator_interval_selectivity(&bound.specs, &bound.clip, unique, bound.col_type)
+        }
+        None => crate::estimator::Selectivity::All,
+    };
+    let scan_rows = estimate_rows(&access_selectivity, row_count);
+    let output_rows = if matches!(access_selectivity, crate::estimator::Selectivity::Zero) {
+        0
+    } else {
+        estimate_rows(&estimator_predicate_selectivity(residual), row_count)
+    };
+    let table_height = store.height() as i64;
+    let (access_nodes, access_height) = match kind {
+        ScanCandidateKind::Btree | ScanCandidateKind::Gin | ScanCandidateKind::IndexInterval => {
+            let index = catalog.index_store_scoped(rel.db.as_deref(), index_name);
+            (index.node_count() as i64, index.height() as i64)
+        }
+        _ => (store.node_count() as i64, table_height),
+    };
+    let access_pages = if kind == ScanCandidateKind::Full {
+        access_nodes
+    } else {
+        estimator_clamp_pages(
+            estimate_rows(&access_selectivity, access_nodes),
+            access_nodes,
+            access_height,
+        )
+    };
+    let access_work = match kind {
+        ScanCandidateKind::Gin => scan_rows,
+        ScanCandidateKind::Gist => access_pages,
+        _ => 0,
+    };
+    let mut candidate = estimate_candidate(CandidateInputs {
+        kind: crate::estimator_constants::ACCESS_PATH_ORDER[kind as usize],
+        index_name,
+        scan_rows,
+        output_rows,
+        access_pages,
+        table_height,
+        filter_nodes: estimator_operator_nodes(residual),
+        access_work,
+        produces_rows: false,
+    });
+    candidate.units[crate::estimator_constants::UNIT_OPERATOR_EVAL] = 0;
+    candidate.units[crate::estimator_constants::UNIT_ROW_PRODUCED] = 0;
+    PlanEstimate {
+        rows: candidate.units[crate::estimator_constants::UNIT_STORAGE_ROW_READ],
+        logical_rows: row_count,
+        units: candidate.units,
+    }
 }
 
 fn candidate_index(

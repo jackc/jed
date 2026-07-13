@@ -336,6 +336,8 @@ test('the explain page renders a live plan with the PK-bound access path', async
   await expect(panel.getByTestId('result-rows')).toContainText('Scan city');
   await expect(panel.getByTestId('result-rows')).toContainText('PK bound: id = 3');
   await expect(panel.getByTestId('result-rows')).toContainText('Filter');
+  await expect(panel).toContainText('est_rows');
+  await expect(panel).toContainText('est_cost');
 });
 
 test('the explain page shows bounded top-k on a blocking sort', async ({ page }) => {
