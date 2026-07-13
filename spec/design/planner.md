@@ -1,7 +1,8 @@
 # The planner: explicit optimizer-pass structure — design
 
 > How a SELECT becomes an executable plan, and where each optimization lives. The planner
-> is a **deterministic rule engine** whose first cost-based access choice has landed: it resolves
+> is a **deterministic rule engine** whose cost-based single-relation and two-relation choices have
+> landed: it resolves
 > the query into a **logical plan**, applies **rewrite rules** (none exist yet — §3), and
 > then runs **physical/access-path selection** — a fixed, ordered list of discrete rules,
 > each a single function owning its gate and its action. This doc is the contract all three
@@ -96,25 +97,28 @@ then takes the unoptimized path (full scan, eager sort), which is always correct
 
 | # | rule | gate (summary) | sets | cost contract |
 |---|---|---|---|---|
-| 1 | **scan bounds** | per base relation (not SRF/derived): inventory and estimate every legal path; a one-base-relation SELECT cost-selects all access methods, while joins and mutations retain §5.1's explicit staged legacy boundaries | `relBounds[i]` | cost.md §3 "bounded scan", "index-bounded scan", "GIN-bounded scan", "GiST-bounded scan", "canonical interval sets" |
+| 1 | **scan bounds** | per base relation (not SRF/derived): inventory and estimate every legal path; one-base-relation and eligible P7 two-base-relation SELECTs consume the complete inventory, while other joins and mutations retain §5.1's explicit staged boundaries | `relBounds[i]` | cost.md §3 "bounded scan", "index-bounded scan", "GIN-bounded scan", "GiST-bounded scan", "canonical interval sets" |
 | 2 | **index-nested-loop** | a join inner base relation (INNER/CROSS/LEFT right side, not lateral/CTE) with a PK / leading B-tree comparison or GIN/GiST query operand from a bare **earlier sibling** column in ON or WHERE | `relINLBounds[i]` | cost.md §3 "JOIN" (per-outer-row seek/gather) |
 | 3 | **hash join** | exactly two non-lateral inputs; INNER/LEFT ON contains one or more same-type, key-encodable bare-column equalities across the inputs; no inner INL; every remaining ON conjunct is a non-trapping leaf equality/inequality | `hashJoin` | cost.md §3 "hash JOIN" (`hash_build`/`hash_probe`; ON only for bucket candidates) |
 | 4 | **ORDER BY via PK scan order** | single base relation, non-aggregate, column-only keys: the ORDER BY is a one-direction PK prefix (ASC) or the full PK (DESC ⇒ reverse scan), collation-matching the stored key | `pkOrdered`, `pkReverse` | cost.md §3 "ORDER BY satisfied by primary-key order" (sort elided; with LIMIT, a top-N) |
 | 5 | **single-relation pipeline choice / ORDER BY via secondary-index order** | one base relation: compose every access candidate with its natural PK/index order, add every eligible order-only B-tree walk when LIMIT is present, and minimize cumulative scheduled cost through LIMIT/OFFSET; exact index-order shape/type gates remain | `relBounds[0]`, `pkOrdered`, `pkReverse`, `indexOrder` | estimator.md §9.1; cost.md §3 "ORDER BY satisfied by secondary-index order" |
-| 6 | **join sort-elision** | exactly two non-lateral base relations, INNER/CROSS, a LIMIT, forward outer-PK ORDER BY with no key beyond the outer PK, no eager bound on the outer; any storage-key-ordered inner INL bound is opened per outer row | `joinPkOrdered` | cost.md §3 "JOIN" (the join top-N) |
-| 7 | **blocking ORDER BY top-k** | rules 4–6 did not elide the sort; plain SELECT (no DISTINCT, aggregate/group, or window), ORDER BY + constant LIMIT; checked `K = OFFSET + LIMIT` (`LIMIT 0` ⇒ K=0) | `topK` | cost.md §3 "blocking ORDER BY top-k" (full scan/evaluation and cost retained; sort work reduced) |
+| 6 | **costed two-relation join** | exactly two non-lateral base relations with one INNER/CROSS edge: cost both orientations, all ordinary access pairs, every physically-dependent INL access, and every safe ON-equijoin hash alternative | `relationOrder`, `relBounds`, `relINLBounds`, `hashJoin` | estimator.md §9.2; cost.md §3 "JOIN" |
+| 7 | **join sort-elision** | exactly two non-lateral base relations, INNER/CROSS, a LIMIT, forward selected-outer-PK ORDER BY with no key beyond the outer PK, no eager bound on the outer; any storage-key-ordered inner INL bound is opened per outer row | `joinPkOrdered` | cost.md §3 "JOIN" (the join top-N) |
+| 8 | **blocking ORDER BY top-k** | rules 4–7 did not elide the sort; plain SELECT (no DISTINCT, aggregate/group, or window), ORDER BY + constant LIMIT; checked `K = OFFSET + LIMIT` (`LIMIT 0` ⇒ K=0) | `topK` | cost.md §3 "blocking ORDER BY top-k" (full scan/evaluation and cost retained; sort work reduced) |
 
-Data-flow dependencies fixing the order: rule 3 reads `relINLBounds` (rule 2), so a usable INL
-always wins; rule 5 reads the complete rule-1 inventory and subsumes rule 4's provisional
-single-relation order decision when it cost-selects the final pipeline; rule 6 reads
-`relBounds[0]` and `relINLBounds` (rules 1–2); rule 7 reads
+Data-flow dependencies fixing the order: rules 2–3 first form the staged legacy join choice; rule 5
+reads the complete rule-1 inventory and subsumes rule 4's provisional single-relation order decision;
+rule 6 replaces the staged join fields only for its eligible two-relation shape and evaluates each
+candidate's order property; rule 7 records the winning candidate's join sort-elision; rule 8 reads
 the three preceding sort-elision decisions. Rules 4–6
 that select scan order remain mutually exclusive by their gates; hash join preserves the same
-left-then-right candidate enumeration and may compose with join sort-elision.
+physical-outer then physical-inner candidate enumeration and may compose with join sort-elision.
 
 The physical fields live in a dedicated sub-struct of the plan (`phys` — Go
 `physicalPlan`, Rust/TS `PhysicalPlan`), so the stage boundary is visible in the type: the
 logical fields plus the `relMasks` annotation are stage 1's output, `phys` is stage 3's.
+P7's `relationOrder` maps physical positions to source ordinals; it never rewrites resolved logical
+column slots.
 
 The **mechanisms** the rules call — `detectScanBound`, `detectINLBound`,
 `buildIndexAccessPredicate`, `orderSatisfiedByPK`, `orderSatisfiedByIndex`, interval-set
@@ -230,6 +234,26 @@ up-front structural page block. An interval set charges each disjoint interval o
 filled window never starts or charges later intervals. GIN/GiST complete and charge their opclass
 gather before table fetch, then stop point-lookups and residual work at OFFSET+LIMIT. An ORDER BY
 elides its sort only when the source emits the requested PK order or walks the exact ordering index.
+
+### 5.3 P7 two-relation SELECT policy
+
+An eligible exactly-two-base-relation INNER/CROSS SELECT consumes both complete ordinary access
+inventories and a sibling-bound inventory for each possible physical inner. It compares both source
+orientations and all legal nested-loop, hash, and index-nested-loop candidates as complete pipelines.
+The hash gate remains the existing safe ON-equijoin gate; WHERE-derived hash keys are not a P7
+rewrite. A sibling INL source must lie in the selected physical outer relation, independent of its
+original FROM ordinal.
+
+`relationOrder` is physical-position → source-ordinal. The executor materializes/scans by that map,
+but combines each pair into the original source relation's global slot interval before evaluating
+resolved expressions. EXPLAIN renders the selected physical child order. Exact ties compare source
+ordinal sequences, then each physical relation's access identity, then join algorithm, as
+[estimator.md §9](estimator.md) specifies.
+
+Join-PK ordering is recalculated per candidate against the selected physical outer. Its deterministic
+row-count-only prefix estimate discounts only skipped probe/ON/INL work; ordinary base scans and hash
+build remain complete. Outer joins, LATERAL, CTE/SRF/derived inputs, and wider joins keep the staged
+FROM-order behavior until P8 or a barrier-specific slice.
 
 ## 6. Neutrality and determinism
 

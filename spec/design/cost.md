@@ -1049,7 +1049,9 @@ one row → **20**; the +2 is the preserved-left rows).
 
 **Deterministic in-memory hash JOIN.** For exactly two non-lateral inputs, an INNER or LEFT `ON`
 predicate with one or more same-resolved-type bare-column equalities across the inputs may build the
-right/FROM-order input and probe the left. A usable inner index-nested-loop bound wins first. The
+physical inner input and probe the physical outer. Before P7 those roles were fixed to right/FROM
+order and left/FROM order respectively; P7 makes each orientation and an eligible INL separate
+costed candidates. The
 remaining `ON` conjuncts must be structurally non-trapping leaf equality/inequality predicates;
 expression keys, arithmetic/function predicates, RIGHT/FULL, and joins wider than two inputs retain
 nested loop. Keys admit the existing key-encodable scalars plus scalar-element arrays/ranges;
@@ -1067,22 +1069,23 @@ nested loop: the new hash units represent key construction/lookup/collision veri
 comparisons against provably nonmatching buckets disappear. A guard at each component and bucket
 entry makes `max_cost` bound build/probe work deterministically.
 
-Buckets retain right input order and probes consume left input order, so emitted matches reproduce
-the nested-loop sequence exactly; LEFT emits an unmatched left row after its empty/rejected bucket
-run. Hash collisions compare the full canonical bytes before admitting a candidate, and the executor
+Buckets retain physical-build input order and probes consume physical-outer order, so emitted matches
+reproduce that orientation's nested-loop sequence exactly. The pre-P7 LEFT shape remains a barrier
+and therefore keeps its FROM-order roles and unmatched-left behavior. Hash collisions compare the
+full canonical bytes before admitting a candidate, and the executor
 never iterates the map to emit rows. WHERE, ORDER BY, LIMIT/OFFSET, projection, and `row_produced`
 remain downstream and unchanged. The table is deliberately in-memory; grace-hash spill is the
 remaining storage slice ([spill.md](spill.md) §7).
 
 **ORDER BY satisfied by the OUTER relation's PK scan order — the join top-N.** Because the join
-operator probes/drives the **outer** (first) relation in primary-key order, a two-table INNER/CROSS join whose
+operator probes/drives the selected physical **outer** relation in primary-key order, a two-table INNER/CROSS join whose
 `ORDER BY` is a prefix of the **outer** relation's PK — and which has a `LIMIT` — needs **no sort**:
 the join output already arrives in `(outer PK, inner key)` order. The engine elides the sort and
 **STOPS the join probe loop once the `LIMIT`/`OFFSET` window is filled**, so the `ON`/WHERE
 `operator_eval`s and `row_produced` drop to the combinations *actually examined* — the cost-visible
 win. Without an index-nested-loop bound, both tables are still **materialized in full**
 (`storage_row_read` = the sum of cardinalities, the rule above; a constant WHERE bound on the inner
-still applies). An eligible hash join also builds its complete right input before probing, then stops
+still applies). An eligible hash join also builds its complete physical inner input before probing, then stops
 `hash_probe` and candidate ON work once the window fills. With a PK/B-tree/GIN/GiST **INL inner**, the outer
 is materialized once and the inner bound is opened per outer row; every started bound is gathered
 completely in its ordinary key order, while bounds for later outer rows are never opened after the
@@ -1096,6 +1099,12 @@ engages only when:
   scan order does not satisfy, unlike the single-table "runs past the PK" case;
 - the outer carries **no non-PK bound** (a PK bound / no bound keeps it in PK order).
 - the optional inner INL bound emits storage-key order: PK, ordered B-tree, GIN, or GiST.
+
+P7 estimates the stopped work with [estimator.md §8.2](estimator.md): from the estimated post-ON,
+post-WHERE fanout it computes how many outer runs are needed for `OFFSET + LIMIT`. Only candidate
+visits/ON evaluation, hash probes and bucket verification, and later INL seeks are reduced. Both
+ordinary base relations are still fully materialized and a hash build is still complete, matching
+the executor rather than assigning an optimistic private saving.
 
 `joins/order_by_outer_pk.test` pins the top-N (with the ON-eval drop), the OFFSET, the inner-PK-bound
 composition, the CROSS form, and the `ORDER BY a.id, b.id` contrast that keeps the full nested loop +

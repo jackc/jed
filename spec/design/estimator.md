@@ -9,7 +9,8 @@
 > inventory, P4 base-relation estimates, and P5 whole-plan propagation + EXPLAIN columns
 > landed.** P6a applies those estimates to the first staged access-path set described in §9.1;
 > P6b extends that single-relation choice to every access method and complete ordering/LIMIT
-> pipelines. Joins retain the explicit legacy boundary there. P7–P8 in
+> pipelines. P7 cost-selects two-base-relation INNER/CROSS orientation, access paths, and join
+> algorithm as described in §9.2. P8 in
 > [../../TODO-cost-plan-input.md](../../TODO-cost-plan-input.md) implement this contract as vertical
 > slices.
 
@@ -350,6 +351,17 @@ Join candidates count their different repetition shapes explicitly:
   probe rows/bytes, then reapplies and charges the full ON expression for estimated
   bucket-verification candidates.
 
+For the two-relation ordered join top-N, let `T = OFFSET + LIMIT`, let `J` be the estimated
+post-ON, post-WHERE rows before the window, and let `O` be the physical outer rows. When `T > 0`
+and `J > T`, the estimated number of outer rows whose join runs are started is
+`min(O, ceil(T * O / J))`; `J = 0` conservatively starts all `O`, and `T = 0` starts none. The
+multiply/divide uses quotient/remainder saturation, never float arithmetic. This is the initial
+row-count-only uniform-fanout model; P9 may replace it only with specified distribution facts.
+It discounts only work the executor actually skips: nested-loop candidate/ON visits, hash probes
+and bucket verification, and repeated INL inner scans. Both ordinary base scans remain fully
+materialized, and a hash build remains complete. The selected outer's complete materialization is
+also retained even when no probe run starts.
+
 An uncorrelated scalar, EXISTS, or IN subquery contributes its subplan once. A correlated subquery
 contributes its subplan and owning predicate work once per estimated invoking outer row, using
 saturated multiplication. EXISTS reduces its child pull to at most one row when the physical plan
@@ -367,10 +379,10 @@ LIMIT/ordered-stream short-circuit is a physical-plan property: eligible single-
 backward-safe window top-N plans reduce their child scan to the rows/pages expected to be pulled,
 not an eagerly estimated full input sliced only at the Limit node. An unbounded secondary-index
 order prices the expected index prefix plus table point fetches. Bound index/GiST/GIN paths retain
-their conservative structural descent and reduce admitted table fetches; the join-PK-ordered stream
-retains full-child work until a deterministic join-output stop model lands. Consequently estimates
-are computed over a complete candidate pipeline rather than by blindly adding immutable logical-node
-estimates.
+their conservative structural descent and reduce admitted table fetches. P7's join-PK-ordered
+stream applies §8.2's deterministic outer-prefix model while retaining complete base
+materialization and hash-build work. Consequently estimates are computed over a complete candidate
+pipeline rather than by blindly adding immutable logical-node estimates.
 
 The following attribution rules close the remaining current-plan shapes:
 
@@ -485,6 +497,48 @@ The resulting rule is deterministic:
    candidate list is already in §9 order.
 
 UPDATE and DELETE continue to call the mutation legacy policy from §1/§8.4.
+
+### 9.2 P7 two-relation selector
+
+P7 applies when a SELECT has exactly two non-lateral base relations joined by one INNER or CROSS
+edge. An SRF, CTE, derived table, outer join, or correlated/dependency-bearing input is a barrier and
+keeps the complete pre-P7 FROM-order policy. Attachments remain eligible base relations, but their
+existing access-path inventory may contain only the full path.
+
+The physical plan stores `relation_order = [outer_source_ordinal, inner_source_ordinal]`; resolved
+column slots and every expression remain in logical source order. Execution places each local base
+row into its original global slot interval before evaluating ON, WHERE, ORDER BY, or projection, so
+reordering changes neither name resolution nor row shape.
+
+For each of the two source-ordinal orientations, inventory in §9 order:
+
+1. every legal ordinary access candidate for the outer relation;
+2. every legal ordinary access candidate for the inner relation;
+3. materializing nested loop for each outer/inner access pair;
+4. deterministic hash join for the same pair when the existing safe ON-only bare-column equijoin
+   gate accepts it; and
+5. every legal INL inner access whose bare sibling source belongs to the chosen physical outer.
+
+P7 does not derive a hash key from WHERE and therefore does not turn `CROSS JOIN ... WHERE a=b`
+into a hash join. That is a separate logical-predicate rewrite. For hash, the physical inner is the
+build input and the physical outer is the probe input; the selected key records those roles
+explicitly. For INL, constants on the same key may tighten the bound, but a sibling column is legal
+only when its owning relation is already on the physical left. Every full WHERE and ON expression
+remains residual and authoritative.
+
+Each candidate then recomputes join-order sort elision against its physical outer. The established
+gate remains exact: two base relations, INNER/CROSS, forward outer-PK ORDER BY with no trailing key,
+LIMIT, storage-order outer access, and a storage-key-ordered INL inner if present. An eligible
+candidate applies §8.2's top-N prefix model; all others retain the blocking Sort, whose bookkeeping
+has no private estimator weight.
+
+Candidates are structurally sorted before estimation by physical relation sequence, outer access,
+inner access, and join-algorithm rank. The minimum complete-pipeline cost wins; retaining the first
+candidate on an exact cost tie therefore implements §9 without map iteration. The selected plan's
+physical visit order also defines deterministic error visitation and cost-ceiling abort order.
+P7 deliberately does not preserve FROM-order precedence between multiple possible runtime errors;
+portable error corpus cases use a single offending evaluation unless a selected plan is itself the
+behavior under test.
 
 ## 10. Join search and its deterministic bound
 

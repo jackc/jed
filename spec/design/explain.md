@@ -130,8 +130,10 @@ There is still no `HashAggregate` / `GroupAggregate` split.
 Emitted outermost-first, each the pre-order parent of the next, so the tree reads top-down as the
 pipeline reads bottom-up: **Limit → Sort → Distinct → Window → Aggregate → Filter → FROM tree**. A
 node is emitted only when present. The FROM tree is a left-deep chain of join nodes over the plan's
-relations (the outermost node is the last join; its right child is the last relation),
-bottoming out at relation leaves.
+physical relation order (the outermost node is the last join; its right child is the physical inner
+relation), bottoming out at relation leaves. P7 may therefore render the second source relation as
+the left/outer child of an eligible two-relation INNER/CROSS join. Resolved logical slots remain in
+source order; EXPLAIN shows execution order.
 
 ### Detail grammar
 
@@ -174,8 +176,8 @@ surfaces and how each is pinned:
 - **Index names** — always the stored lowercased name; estimated cost chooses across P6's complete
   single-relation set and deterministic lowest-name order breaks an exact same-kind cost tie
   (indexes.md §5).
-- **Iteration order** — relations, joins, aggregates, CTE bindings iterate in slice order, never a
-  map.
+- **Iteration order** — relation leaves iterate the selected physical-order slice (source order at
+  every P7 barrier); joins, aggregates, and CTE bindings iterate their authored slices, never a map.
 - **Literal rendering** — integer / boolean / decimal / text / date / timestamp / uuid render
   deterministically. **`float` is the one hazard** (its layout is a ratified determinism-ledger
   exception, and floats are keyable), so a float bound literal renders as the fixed token `<float>`,
