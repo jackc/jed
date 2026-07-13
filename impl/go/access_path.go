@@ -1400,7 +1400,7 @@ func (db *engine) executeMutationScan(plan mutationScanPlan, tableName string, p
 		if _, q, ok := ginMatch(plan.filter, b.gin.colGlobal); ok {
 			query = q
 		}
-		entries, pages, slabs, err := db.ginBoundRows(tableName, b.gin, query, env, meter, mask)
+		entries, pages, slabs, err := db.ginBoundRows(tableName, b.gin, query, env, meter, mask, false)
 		return mutationScanBatch{entries: entries, pages: pages, slabs: slabs}, err
 	}
 	if b.gist != nil {
@@ -1408,7 +1408,7 @@ func (db *engine) executeMutationScan(plan mutationScanPlan, tableName string, p
 		if q, ok := gistQueryOperand(plan.filter, b.gist); ok {
 			query = q
 		}
-		entries, pages, slabs, err := db.gistBoundRows(tableName, b.gist, query, env, meter, mask)
+		entries, pages, slabs, err := db.gistBoundRows(tableName, b.gist, query, env, meter, mask, false)
 		return mutationScanBatch{entries: entries, pages: pages, slabs: slabs}, err
 	}
 	if b.pkSet != nil {
@@ -1453,7 +1453,7 @@ func (db *engine) executeMutationScan(plan mutationScanPlan, tableName string, p
 // (the candidate set IS the storage keys), with the up-front (page_read nodes, value_decompress
 // slabs) block. SELECT drops the keys; UPDATE/DELETE keep them to rewrite/remove the rows
 // (gin.md §6). GinEntry is charged inside (during the gather); the caller charges the block.
-func (db *engine) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr, env *evalEnv, meter *costMeter, mask []bool) (out []entry, pages, slabs int, err error) {
+func (db *engine) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr, env *evalEnv, meter *costMeter, mask []bool, keysOnly bool) (out []entry, pages, slabs int, err error) {
 	store := db.lkpStore(tableName)
 	if query == nil {
 		return nil, 0, 0, nil
@@ -1581,6 +1581,10 @@ func (db *engine) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr,
 	}
 
 	for _, key := range cand {
+		if keysOnly {
+			out = append(out, entry{Key: key})
+			continue
+		}
 		row, ok, n, sl, e := store.GetWithUnits(key, mask)
 		if e != nil {
 			return nil, 0, 0, e
@@ -1605,7 +1609,7 @@ func (db *engine) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr,
 // directly. Degenerate constant queries (gist.md §5): a NULL Q and an empty && query match nothing; an
 // empty @> query (col @> 'empty') matches every row → full-scan fallback (the empty bound is invisible
 // to the overlap-descend).
-func (db *engine) gistBoundRows(tableName string, gb *gistBoundPlan, query *rExpr, env *evalEnv, meter *costMeter, mask []bool) (out []entry, pages, slabs int, err error) {
+func (db *engine) gistBoundRows(tableName string, gb *gistBoundPlan, query *rExpr, env *evalEnv, meter *costMeter, mask []bool, keysOnly bool) (out []entry, pages, slabs int, err error) {
 	store := db.lkpStore(tableName)
 	if query == nil {
 		return nil, 0, 0, nil
@@ -1660,6 +1664,10 @@ func (db *engine) gistBoundRows(tableName string, gb *gistBoundPlan, query *rExp
 	slices.SortFunc(skeys, bytes.Compare)
 	skeys = slices.CompactFunc(skeys, bytes.Equal)
 	for _, key := range skeys {
+		if keysOnly {
+			out = append(out, entry{Key: key})
+			continue
+		}
 		row, ok, n, sl, e := store.GetWithUnits(key, mask)
 		if e != nil {
 			return nil, 0, 0, e
@@ -2281,33 +2289,40 @@ func boundEmpty(b keyBound) bool {
 // of the old runSelect: materialize, nested-loop join, WHERE, then aggregate / DISTINCT / window
 // + project. The per-row evaluator gets an evalEnv carrying the engine + outer rows, so a
 // correlated subquery in any clause re-executes against them (grammar.md §26).
-// execStreamingScan executes the streaming primary-key-ordered scan path (spec/design/cost.md §3):
-// a single-table, no-blocking-operator query whose output order is already the table's primary-key
-// scan order — either no ORDER BY (the LIMIT short-circuit) or an ORDER BY satisfied by PK order
-// (plan.pkOrdered, set by orderSatisfiedByPK) — streams scan→filter→project with NO sort, and (when
-// there is a LIMIT) stops the scan the instant the LIMIT/OFFSET window is filled, charging
-// storage_row_read only for the rows actually read. With no LIMIT it emits every survivor after
-// OFFSET (the sort is simply elided — same rows, same cost as the eager/sort path). It is
-// cost-equivalent to the eager path EXCEPT that a LIMIT reads (and filters) fewer rows, which is the
-// deliberate cost change. page_read is the full block (the bound's node count) — it does not
-// short-circuit; only the row reads do. Rows match the eager path exactly: the offset..offset+limit
-// slice of the primary-key-ordered filtered rows (which, for a pkOrdered query, IS the ORDER BY's
-// result — the stored PK order is the requested order).
+// execStreamingScan executes the bounded streaming scan path (spec/design/cost.md §3): full or
+// contiguous-PK scans, canonical PK/index interval sets, and compatible ordered-index scans stop at
+// the LIMIT/OFFSET window. GIN/GiST complete their candidate gather, then stop table point-lookups at
+// that window. Only started interval blocks are charged; an opclass gather is charged in full.
 // streamingScanEligible reports whether plan is the single-table, no-blocking-operator STREAMING SCAN
 // shape (spec/design/cost.md §3, streaming.md §4) — a single relation, no join/aggregate/window, an
-// output order the primary-key scan already yields (pkOrdered, or no ORDER BY with a LIMIT
-// short-circuit), no index/GIN/GiST bound (those read the full admitted set eagerly), and a real
-// table store (not an SRF / CTE / derived source). Both execSelectPlan (which routes to the eager
-// execStreamingScan) and tryStreamingQuery (the lazy Query lane) gate on this ONE predicate, so the
-// two never drift.
+// output order the chosen bound already yields, and a real table store (not an SRF / CTE / derived
+// source). Without ORDER BY, LIMIT observes the chosen access path's existing deterministic order.
+// With ORDER BY, PK/PK-interval bounds must preserve PK order, or an ordered-index bound/set must
+// walk the exact index that satisfies the order.
 func streamingScanEligible(plan *selectPlan) bool {
-	return len(plan.rels) == 1 && len(plan.joins) == 0 &&
-		!plan.isAgg && !plan.hasWindow &&
-		(plan.phys.pkOrdered || (!plan.distinct && len(plan.order) == 0 && plan.limit != nil)) &&
-		!plan.phys.relBounds[0].needsEagerScan() &&
-		plan.rels[0].srf == nil &&
-		plan.rels[0].cte == nil &&
-		plan.rels[0].derived == nil
+	if len(plan.rels) != 1 || len(plan.joins) != 0 || plan.isAgg || plan.hasWindow ||
+		plan.rels[0].srf != nil || plan.rels[0].cte != nil || plan.rels[0].derived != nil {
+		return false
+	}
+	sb := plan.phys.relBounds[0]
+	if len(plan.order) == 0 {
+		return !plan.distinct && plan.limit != nil
+	}
+	if plan.phys.pkOrdered {
+		return sb == nil || sb.pk != nil || sb.pkSet != nil || sb.gin != nil || sb.gist != nil
+	}
+	return plan.phys.indexOrder != nil && indexOrderCompatibleBound(plan.phys.indexOrder, sb) && sb != nil
+}
+
+// pullStreamingScanEligible is the narrower gate for the Query API's direct storeScan cursor. The
+// generalized bound streams still execute lazily through bufferedScanCursor on first pull, but that
+// older cursor understands only a full/contiguous-PK scan.
+func pullStreamingScanEligible(plan *selectPlan) bool {
+	if !streamingScanEligible(plan) {
+		return false
+	}
+	sb := plan.phys.relBounds[0]
+	return sb == nil || sb.pk != nil
 }
 
 // windowTopNEligible reports whether a plain (non-grouped) window query can serve its LIMIT with a

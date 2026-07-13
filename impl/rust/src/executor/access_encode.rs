@@ -4669,29 +4669,51 @@ pub(crate) struct EvalEnv<'a> {
 
 /// Whether `plan` is the single-table, no-blocking-operator **streaming scan** shape
 /// (spec/design/cost.md §3, streaming.md §4) — a single relation, no join / aggregate / window, an
-/// output order the primary-key scan already yields (`pk_ordered`, or no `ORDER BY` with a `LIMIT`
-/// short-circuit), no index/GIN/GiST bound (those read the full admitted set eagerly), and a real
-/// table store (not an SRF / CTE / derived source). Both [`exec_select_plan`](Engine::exec_select_plan)
-/// (which routes to the eager `exec_streaming_scan`) and [`try_scan_query`](Engine::try_scan_query)
-/// (the lazy `query()` lane) gate on this ONE predicate, so the two never drift.
+/// output order the chosen bound already yields, and a real table store. Without ORDER BY, LIMIT
+/// observes the access path's existing deterministic order. With ORDER BY, a PK/PK-set bound must
+/// preserve PK order, or an ordered-index bound/set must walk the exact ordering index.
 pub(crate) fn streaming_scan_eligible(plan: &SelectPlan) -> bool {
-    plan.rels.len() == 1
+    if !(plan.rels.len() == 1
         && plan.joins.is_empty()
         && !plan.is_agg
         && !plan.has_window
-        && (plan.phys.pk_ordered
-            || (!plan.distinct && plan.order.is_empty() && plan.limit.is_some()))
-        && !matches!(
-            plan.phys.rel_bounds[0],
-            Some(ScanBound::Index(_))
-                | Some(ScanBound::Gin(_))
-                | Some(ScanBound::Gist(_))
-                | Some(ScanBound::PkSet(_))
-                | Some(ScanBound::IndexSet(_))
-        )
         && plan.rels[0].srf.is_none()
         && plan.rels[0].cte.is_none()
-        && plan.rels[0].derived.is_none()
+        && plan.rels[0].derived.is_none())
+    {
+        return false;
+    }
+    let bound = plan.phys.rel_bounds[0].as_ref();
+    if plan.order.is_empty() {
+        return !plan.distinct && plan.limit.is_some();
+    }
+    if plan.phys.pk_ordered {
+        return matches!(
+            bound,
+            None | Some(ScanBound::Pk(_))
+                | Some(ScanBound::PkSet(_))
+                | Some(ScanBound::Gin(_))
+                | Some(ScanBound::Gist(_))
+        );
+    }
+    match (&plan.phys.index_order, bound) {
+        (Some(io), Some(bound)) => index_order_compatible_bound(io, Some(bound)),
+        _ => false,
+    }
+}
+
+pub(crate) fn pull_streaming_scan_eligible(plan: &SelectPlan) -> bool {
+    streaming_scan_eligible(plan)
+        && matches!(plan.phys.rel_bounds[0], None | Some(ScanBound::Pk(_)))
+}
+
+pub(crate) fn index_order_compatible_bound(io: &IndexOrder, bound: Option<&ScanBound>) -> bool {
+    match bound {
+        None => true,
+        Some(ScanBound::Index(ib)) => ib.name_key == io.name_key,
+        Some(ScanBound::IndexSet(ks)) => ks.name_key == io.name_key,
+        _ => false,
+    }
 }
 
 /// Whether `plan` is a shape [`project_columnar`](Engine::project_columnar) specializes: a bare-column

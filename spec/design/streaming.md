@@ -288,9 +288,8 @@ independently — the P6.4 precedent):
   cursor (frame stack over the persistent map) in Rust/Go; a generator in TS. Internal; the existing
   push `scan_range` can stay for the mutation paths initially. The §3 VDBE-prerequisite.
 - **S3 — stream the non-blocking pipeline + snapshot pinning.** ✅ **Landed (all three cores).** The
-  `query()` → `Rows` path now serves the single-table no-blocking-operator read (the PK-ordered /
-  LIMIT-short-circuit shape `streaming_scan_eligible` gates — shared with the eager `exec_streaming_scan`
-  so the two never drift) through a lazy **`Streaming`** cursor: scan-cursor (S2) → resolve touched
+  `query()` → `Rows` path serves the original full/contiguous-PK, no-blocking-operator read (now gated
+  by `pull_streaming_scan_eligible`) through a lazy **`Streaming`** cursor: scan-cursor (S2) → resolve touched
   columns → `WHERE` → project, **one row per `next`**, accruing the identical cost units at the identical
   sites as the eager path. The cursor **owns a frozen snapshot** (Rust: a snapshot `Engine` built from
   the visible root + a copy of the session envelope, sharing the seam via `Rc` + the lifetime gauge;
@@ -305,7 +304,8 @@ independently — the P6.4 precedent):
   iteration (Rust stashes it for `Rows::error()`; Go sets `Rows.Err()`; TS throws out of the iterator).
   Verified per core by unit tests: `query()` == `execute()` rows + total cost under full drain, early
   exit charges less, the snapshot pin + watermark, and the mid-drain abort. Prepared-statement streaming
-  later landed as S8; the `Database::query` watermark on the bare single-handle path — named here as a
+  later landed as S8; generalized bounded scans now use the buffered-first-pull lane and dispatch the
+  same `exec_streaming_scan` operator. The `Database::query` watermark on the bare single-handle path — named here as a
   follow-on when the bare path streamed but pinned nothing — has since been **resolved by construction**
   (see the closing note after S8).
 - **S4 — lazy output from the blocking operators.** ✅ **Landed (all three cores).** The `query()` →

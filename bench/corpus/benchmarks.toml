@@ -85,6 +85,38 @@ base = 2
 off_min = 8
 off_max = 16
 
+# Bounded LIMIT streaming over an ordered secondary-index range
+# (query.bounded_limit_streaming). The range admits 65–129 rows, but ORDER BY the same index lets
+# each core stop its index walk and table point-lookups after five rows. Before this slice the bound
+# was gathered eagerly, so every admitted row was fetched before LIMIT discarded all but five.
+[[bench]]
+name = "bounded_index_limit"
+description = "Secondary-index range on 100k rows with a compatible ORDER BY and LIMIT 5; stop after five table lookups"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT id, x FROM bounded_orders WHERE x BETWEEN $1 AND $2 ORDER BY x LIMIT 5"
+warmup = 500
+iterations = 15000
+seed = 4255
+expect_rows_per_iter = 5
+engines = ["jed", "postgres"]
+setup_sql = [
+  "CREATE TABLE bounded_orders (id bigint PRIMARY KEY, x bigint, v bigint)",
+  "INSERT INTO bounded_orders SELECT g, g, g * 2 FROM generate_series(1, 100000) AS g",
+  "CREATE INDEX bounded_orders_x_idx ON bounded_orders (x)"
+]
+
+[[bench.param]]
+gen = "int_uniform"
+min = 100
+max = 99800
+
+[[bench.param]]
+gen = "int_window"
+base = 0
+off_min = 64
+off_max = 128
+
 [[bench]]
 name = "secondary_lookup"
 description = "Secondary-index equality lookup on 1M rows (~10 rows per customer)"

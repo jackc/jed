@@ -42,6 +42,9 @@
 #              key, and across a PK-IN-list UPDATE/DELETE (the point-set DML path).
 #   interval_set — same-key OR range leaves and IN∩range lower to canonical disjoint intervals;
 #              wrapping the key in `+ 0` defeats the rule. Query rows and mutation end states match.
+#   bounded_limit — LIMIT/OFFSET windows over PK interval sets, a compatible ordered secondary-index
+#              bound, and a GIN candidate gather match semantically-equivalent unbounded spellings.
+#              This checks that stopping table work early never changes the chosen result window.
 #   index_order — `ORDER BY v LIMIT k` over a secondary-indexed non-PK column walks the index tree
 #              (a top-N, cost.md §3 "secondary-index order"); `ORDER BY v` with no LIMIT keeps the
 #              eager sort. Over a total order (distinct `v`, NULLS LAST) the index top-N windows and
@@ -170,6 +173,11 @@ INTERVAL_SET_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_mul
                       query.select query.where_eq query.comparison_order query.order_by
                       query.logical_connectives query.point_lookup query.or_in_point_lookup
                       query.interval_set expr.in_list expr.between expr.arithmetic types.i32].freeze
+BOUNDED_LIMIT_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index ddl.gin_index dml.insert
+                       dml.insert_multi_row query.select query.comparison_order query.logical_connectives
+                       query.order_by query.order_by_keys query.limit query.offset query.index_range
+                       query.interval_set query.gin_scan query.bounded_limit_streaming expr.between
+                       expr.arithmetic types.i32 types.array func.array_containment].freeze
 DISTINCT_ORDER_REQ = %w[ddl.create_table ddl.primary_key ddl.composite_primary_key dml.insert
                         dml.insert_multi_row query.select query.distinct query.order_by
                         query.order_by_keys query.limit query.offset query.order_by_pk_scan
@@ -876,6 +884,59 @@ def gen_interval_set(seed)
   out << "# canonical and full-scan mutation end states"
   q(out, "II", "SELECT id, v FROM t ORDER BY id", flat.call(updated))
   q(out, "II", "SELECT id, v FROM t_scan ORDER BY id", flat.call(updated))
+
+  out.join("\n") + "\n"
+end
+
+# --- scenario: LIMIT streaming over bounded access paths --------------------------------------
+def gen_bounded_limit(seed)
+  rng = Random.new(seed)
+  ids = (1..50).to_a.sample(14, random: rng).sort
+  xs = (1..100).to_a.sample(ids.size, random: rng)
+  rows = ids.each_with_index.map do |id, i|
+    # A small tag domain makes each GIN posting list non-trivial; every row has at least one term.
+    [id, xs[i], rng.rand(-100..100), Array.new(rng.rand(1..3)) { rng.rand(0..3) }.uniq]
+  end
+  flat = ->(rs) { rs.flat_map { |id, x, _v, _tags| [id.to_s, x.to_s] } }
+
+  out = header(seed, BOUNDED_LIMIT_REQ, "LIMIT streaming over bounded access paths")
+  values = rows.map { |id, x, v, tags| "(#{id}, #{x}, #{v}, '{#{tags.join(',')}}')" }.join(', ')
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, x i32, v i32, tags i32[])")
+  stmt(out, "INSERT INTO t VALUES #{values}")
+  stmt(out, "CREATE INDEX t_x_idx ON t (x)")
+  stmt(out, "CREATE INDEX t_tags_gin ON t USING gin (tags)")
+
+  # A compatible ORDER BY consumes the same secondary index that supplies the range bound. The +0
+  # spelling defeats both planner rules but denotes the same total order because x is distinct.
+  sx = rows.sort_by { |_id, x, _v, _tags| x }
+  lo, hi = sx.values_at(2, sx.size - 3).map { |r| r[1] }.sort
+  admitted = sx.select { |_id, x, _v, _tags| x.between?(lo, hi) }
+  k = rng.rand(2..4)
+  off = rng.rand(0..2)
+  expected = admitted[off, k] || []
+  out << "# compatible ordered secondary-index bound"
+  q(out, "II", "SELECT id, x FROM t WHERE x BETWEEN #{lo} AND #{hi} ORDER BY x LIMIT #{k} OFFSET #{off}", flat.call(expected))
+  q(out, "II", "SELECT id, x FROM t WHERE x + 0 BETWEEN #{lo} AND #{hi} ORDER BY x + 0, id LIMIT #{k} OFFSET #{off}", flat.call(expected))
+
+  # The optimized spelling visits disjoint PK intervals sequentially (in reverse here); wrapping the
+  # key defeats the interval-set bound and gives the full-scan reference over the same total order.
+  low, high = ids.values_at(3, ids.size - 4)
+  admitted = rows.select { |id, _x, _v, _tags| id <= low || id >= high }.sort_by { |id, _x, _v, _tags| -id }
+  off = rng.rand(0..2)
+  expected = admitted[off, k] || []
+  out << "# reverse PK interval-set window"
+  q(out, "II", "SELECT id, x FROM t WHERE id <= #{low} OR id >= #{high} ORDER BY id DESC LIMIT #{k} OFFSET #{off}", flat.call(expected))
+  q(out, "II", "SELECT id, x FROM t WHERE id + 0 <= #{low} OR id + 0 >= #{high} ORDER BY id + 0 DESC LIMIT #{k} OFFSET #{off}", flat.call(expected))
+
+  # GIN gathers the complete posting list but may stop candidate row lookups at the window. The
+  # contained-by spelling is equivalent and intentionally not GIN-accelerated.
+  term = rows.flat_map { |_id, _x, _v, tags| tags }.sample(random: rng)
+  admitted = rows.select { |_id, _x, _v, tags| tags.include?(term) }.sort_by(&:first)
+  off = [rng.rand(0..1), [admitted.size - 1, 0].max].min
+  expected = admitted[off, k] || []
+  out << "# GIN gather with a bounded PK-ordered result window"
+  q(out, "II", "SELECT id, x FROM t WHERE tags @> ARRAY[#{term}]::i32[] ORDER BY id LIMIT #{k} OFFSET #{off}", flat.call(expected))
+  q(out, "II", "SELECT id, x FROM t WHERE ARRAY[#{term}]::i32[] <@ tags ORDER BY id LIMIT #{k} OFFSET #{off}", flat.call(expected))
 
   out.join("\n") + "\n"
 end
@@ -1776,6 +1837,7 @@ SCENARIOS = {
   "index_prefix" => method(:gen_index_prefix),
   "or_in" => method(:gen_or_in),
   "interval_set" => method(:gen_interval_set),
+  "bounded_limit" => method(:gen_bounded_limit),
   "index_order" => method(:gen_index_order),
   "distinct_order" => method(:gen_distinct_order),
   "join_order" => method(:gen_join_order),

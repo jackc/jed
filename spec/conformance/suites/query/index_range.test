@@ -121,9 +121,10 @@ SELECT id FROM t WHERE id >= 7 AND id <= 9 AND v > 0 ORDER BY id
 8
 9
 
-# --- LIMIT does not stream over an index bound (eager path; only row_produced drops) --
+# --- incompatible PK ORDER BY stays blocking over the secondary-index bound --------
 
-# 21 with 4 fewer produced = 17
+# ORDER BY id cannot consume v-index order, so all five candidates are fetched before
+# sorting; only four row_produced units drop: 21 - 4 = 17.
 # cost: 17
 query I nosort
 SELECT id FROM t WHERE v > 55 ORDER BY id LIMIT 1

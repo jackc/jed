@@ -1,0 +1,175 @@
+# LIMIT streaming over bounded access paths (cost.md §3): the access gather/order remains exact, but
+# table fetch/filter/project work stops once OFFSET+LIMIT survivors are known. Cost pins distinguish
+# this from eager bounded materialization; result rows remain PostgreSQL-comparable.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.gin_index, ddl.gist_index, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.order_by, query.limit, query.offset, query.point_lookup, query.index_range, query.or_in_point_lookup, query.interval_set, query.gin_scan, query.gist_scan, query.limit_short_circuit, query.order_by_pk_scan, query.order_by_index_scan, query.bounded_limit_streaming, types.i32, types.array, types.range, func.array_containment, func.range_constructors, func.range_operators, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, x i32, keep i32)
+
+statement ok
+CREATE INDEX tx ON t (x)
+
+statement ok
+INSERT INTO t VALUES
+  (1, 30, 0), (2, 10, 1), (3, 20, 0), (4, 20, 1),
+  (5, 40, 1), (6, 50, 0), (7, 60, 1), (8, 70, 1)
+
+# A contiguous secondary-index range pulls in index order and stops after two residual survivors.
+# cost: 23
+query I nosort
+SELECT id FROM t WHERE x >= 20 AND keep = 1 LIMIT 2
+----
+4
+5
+
+# ORDER BY the exact bounded index is compatible and avoids the blocking sort. OFFSET counts
+# residual-filter survivors, not raw index entries.
+# cost: 33
+query I nosort
+SELECT id FROM t WHERE x >= 20 AND keep = 1 ORDER BY x LIMIT 2 OFFSET 1
+----
+5
+7
+
+# Non-unique index ties retain their storage-key (PK) tie-break while the bounded walk stops.
+# cost: 9
+query I nosort
+SELECT id FROM t WHERE x = 20 ORDER BY x LIMIT 2
+----
+3
+4
+
+# A bounded miss still descends the index once and performs no table lookup.
+# cost: 1
+query I nosort
+SELECT id FROM t WHERE x = 999 ORDER BY x LIMIT 1
+----
+
+# ORDER BY the PK is incompatible with a secondary-index range, so it still materializes/sorts all
+# candidates before applying LIMIT.
+# cost: 38
+query I nosort
+SELECT id FROM t WHERE x >= 20 AND keep = 1 ORDER BY id LIMIT 2
+----
+4
+5
+
+# A PK interval set charges/pulls only its first interval when that fills the window.
+# cost: 6
+query I nosort
+SELECT id FROM t WHERE id <= 2 OR id >= 7 LIMIT 1
+----
+1
+
+# OFFSET exhausts the first interval, so the second interval is started and charged.
+# cost: 15
+query I nosort
+SELECT id FROM t WHERE id <= 2 OR id >= 7 LIMIT 1 OFFSET 2
+----
+7
+
+# Reverse PK order starts at the high interval and never pulls the low interval.
+# cost: 11
+query I nosort
+SELECT id FROM t WHERE id <= 2 OR id >= 7 ORDER BY id DESC LIMIT 2
+----
+8
+7
+
+# A secondary-index interval set likewise leaves its later interval untouched when LIMIT fills.
+# cost: 7
+query I nosort
+SELECT id FROM t WHERE x < 20 OR x >= 60 LIMIT 1
+----
+2
+
+# A maximal equality prefix plus trailing range on a composite index uses the same bounded walk
+# that satisfies the exact multi-column ORDER BY. Row-key recovery must skip every index component.
+statement ok
+CREATE TABLE m (id i32 PRIMARY KEY, a i32, b i32)
+
+statement ok
+CREATE INDEX m_ab ON m (a, b)
+
+statement ok
+INSERT INTO m VALUES (1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40), (5, 2, 20)
+
+# cost: 13
+query I nosort
+SELECT id FROM m WHERE a = 1 AND b >= 20 ORDER BY a, b LIMIT 2
+----
+2
+3
+
+# LIMIT 0 starts no member of an interval set, so it charges no interval access block.
+# cost: 0
+query I nosort
+SELECT id FROM t WHERE id <= 2 OR id >= 7 LIMIT 0
+----
+
+# --- GIN: complete posting gather, bounded table point-lookups -------------------------------
+statement ok
+CREATE TABLE g (id i32 PRIMARY KEY, tags i32[], keep i32)
+
+statement ok
+CREATE INDEX g_tags_gin ON g USING gin (tags)
+
+statement ok
+INSERT INTO g VALUES
+  (1, ARRAY[1], 0), (2, ARRAY[1,2], 1), (3, ARRAY[1,3], 1),
+  (4, ARRAY[2], 1), (5, ARRAY[1,4], 1)
+
+# cost: 18
+query I nosort
+SELECT id FROM g WHERE tags && ARRAY[1] AND keep = 1 LIMIT 1
+----
+2
+
+# Storage-key candidate order satisfies PK ORDER BY; an unrelated order remains blocking.
+# cost: 18
+query I nosort
+SELECT id FROM g WHERE tags && ARRAY[1] AND keep = 1 ORDER BY id LIMIT 1
+----
+2
+
+# cost: 30
+query I nosort
+SELECT id FROM g WHERE tags && ARRAY[1] AND keep = 1 ORDER BY keep LIMIT 1
+----
+2
+
+# LIMIT 0 still performs and charges the complete posting gather, but no table candidate lookup.
+# cost: 5
+query I nosort
+SELECT id FROM g WHERE tags && ARRAY[1] LIMIT 0
+----
+
+# --- GiST: complete tree descent, bounded table point-lookups -------------------------------
+statement ok
+CREATE TABLE r (id i32 PRIMARY KEY, span int4range, keep i32)
+
+statement ok
+CREATE INDEX r_span_gist ON r USING gist (span)
+
+statement ok
+INSERT INTO r VALUES
+  (1, '[1,10)', 0), (2, '[2,9)', 1), (3, '[3,8)', 1),
+  (4, '[20,30)', 1), (5, '[4,7)', 1)
+
+# cost: 17
+query I nosort
+SELECT id FROM r WHERE span && int4range(5,6) AND keep = 1 LIMIT 1
+----
+2
+
+# cost: 11
+query I nosort
+SELECT id FROM r WHERE span && int4range(5,6) AND keep = 1 ORDER BY id DESC LIMIT 1
+----
+5
+
+# LIMIT 0 still completes the conservative GiST descent, then performs no table lookup.
+# cost: 4
+query I nosort
+SELECT id FROM r WHERE span && int4range(5,6) LIMIT 0
+----

@@ -269,10 +269,10 @@ PK/ordered/full choice stands.
 
 **Narrowings this slice** (documented, relaxable, each a follow-on with its own NoREC
 obligation — [conformance.md §8](conformance.md)): a **constant** query operand only (no
-correlated / array-column operand); **`@>`, `&&`, `= ANY`, and array `=` only** (no `<@` or
-`IN` over a scalar list); and **no LIMIT-streaming
-combination** — a GIN-bounded scan with a `LIMIT` takes the eager path, like the ordered-index
-bound (mutations have no `LIMIT`).
+correlated / array-column operand); and **`@>`, `&&`, `= ANY`, and array `=` only** (no `<@` or
+`IN` over a scalar list). With a non-blocking `LIMIT`, posting-list gather/combine remains complete
+and fully charged, then storage-key-ordered table point-lookups and residual work stop at the window
+(mutations have no `LIMIT`).
 
 ### Cost (the cross-core contract — [cost.md §3](cost.md))
 
@@ -389,8 +389,8 @@ vertical slice with a NoREC obligation ([conformance.md §8](conformance.md)):
   element key encodings lift ([encoding.md §2.4–§2.6](encoding.md)); composite-element arrays too.
 - **More operators** — `<@` (contained-by, a broad scan + recheck), `IN` membership over a
   scalar list. (`const = ANY(col)` membership and array `=` have landed — §1/§6.)
-- **Multi-column GIN**, correlated / array-column query operands, and the LIMIT-streaming
-  combination. (GIN and ordered-index bounds for `UPDATE`/`DELETE` scans have landed — §6 and
+- **Multi-column GIN** and correlated / array-column query operands. (GIN and ordered-index bounds
+  for `UPDATE`/`DELETE` scans plus bounded LIMIT streaming have landed — §6 and
   [indexes.md §5.1](indexes.md).)
 - **Posting-list run compression** — a long contiguous run of one term's entries
   (a term present in very many rows) is stored as the raw entry sequence this slice; PG's

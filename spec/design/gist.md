@@ -226,6 +226,12 @@ recheck** the residual operator on each candidate row (the GIN always-recheck po
 — unobservable in results, only adds the already-metered `operator_eval`). Same rows as the
 full-scan residual, lower cost.
 
+A bounded `SELECT` with `LIMIT` still completes and charges this conservative descent before it can
+know the candidate set, but it then point-looks-up, rechecks, and projects candidates only until the
+`OFFSET`/`LIMIT` window is full. Candidate storage keys are in primary-key order (reversed for a
+compatible descending primary-key `ORDER BY`); an incompatible `ORDER BY` remains blocking and
+consumes the complete candidate set before sorting. See [cost.md §3](cost.md).
+
 **GX1 acceleration scope.** GX1 accelerates **`&&` (overlaps) and `@>` (contains)** — the two whose
 conservative descend predicate is exactly `range_overlaps(node_union, query)` (a matching row must
 overlap the query, and every row lies in its subtree's union, so a non-overlapping union holds no

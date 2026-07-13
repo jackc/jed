@@ -4,19 +4,117 @@
 
 use super::*;
 
+#[allow(clippy::too_many_arguments)]
+fn process_streaming_row(
+    store: &TableStore,
+    row: &Row,
+    plan: &SelectPlan,
+    env: &EvalEnv,
+    meter: &mut Meter,
+    offset: i64,
+    passed: &mut i64,
+    seen: &mut std::collections::HashSet<Vec<Value>>,
+    out: &mut Vec<Vec<Value>>,
+    guarded: bool,
+) -> Result<bool> {
+    if !guarded {
+        meter.guard()?;
+    }
+    meter.charge(COSTS.storage_row_read);
+    let resolved;
+    let row = if TableStore::needs_resolution(row, &plan.rel_masks[0]) {
+        let mut r = row.clone();
+        store.resolve_columns(&mut r, &plan.rel_masks[0])?;
+        resolved = r;
+        &resolved
+    } else {
+        row
+    };
+    if let Some(filter) = &plan.filter {
+        if !filter.eval(row, env, meter)?.is_true() {
+            return Ok(true);
+        }
+    }
+    if plan.distinct {
+        let mut projected = Vec::with_capacity(plan.projections.len());
+        for p in &plan.projections {
+            projected.push(p.eval(row, env, meter)?);
+        }
+        if !seen.insert(projected.clone()) {
+            return Ok(true);
+        }
+        *passed += 1;
+        if *passed <= offset {
+            return Ok(true);
+        }
+        meter.charge(COSTS.row_produced);
+        out.push(projected);
+    } else {
+        *passed += 1;
+        if *passed <= offset {
+            return Ok(true);
+        }
+        meter.charge(COSTS.row_produced);
+        let mut projected = Vec::with_capacity(plan.projections.len());
+        for p in &plan.projections {
+            projected.push(p.eval(row, env, meter)?);
+        }
+        out.push(projected);
+    }
+    Ok(plan.limit.is_none_or(|limit| (out.len() as i64) < limit))
+}
+
+fn index_row_key<'a>(entry_key: &'a [u8], prefix_len: usize, suffix: &[ScalarType]) -> &'a [u8] {
+    let mut at = prefix_len;
+    for ty in suffix {
+        at += if entry_key.get(at) == Some(&0x01) {
+            1
+        } else {
+            1 + ty.width_bytes()
+        };
+    }
+    &entry_key[at..]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_stream_table_interval(
+    store: &TableStore,
+    bound: &KeyBound,
+    reverse: bool,
+    plan: &SelectPlan,
+    env: &EvalEnv,
+    meter: &mut Meter,
+    offset: i64,
+    passed: &mut i64,
+    seen: &mut std::collections::HashSet<Vec<Value>>,
+    out: &mut Vec<Vec<Value>>,
+    can_pull: bool,
+) -> Result<bool> {
+    let (overlap, slabs) = store.overlap_scan_units(bound, &plan.rel_masks[0])?;
+    meter.charge(COSTS.page_read * overlap as i64 + COSTS.value_decompress * slabs as i64);
+    if !can_pull {
+        return Ok(false);
+    }
+    let mut more = true;
+    let mut visit = |_key: &[u8], row: &Row| -> Result<bool> {
+        more = process_streaming_row(
+            store, row, plan, env, meter, offset, passed, seen, out, false,
+        )?;
+        Ok(more)
+    };
+    if reverse {
+        store.scan_range_rev(bound, &mut visit)?;
+    } else {
+        store.scan_range(bound, &mut visit)?;
+    }
+    Ok(more)
+}
+
 impl Engine {
-    /// The streaming primary-key-ordered scan path (spec/design/cost.md §3): a single-table,
-    /// no-blocking-operator query whose output order is already the table's primary-key scan order
-    /// — either no ORDER BY (the LIMIT short-circuit) or an ORDER BY satisfied by PK order
-    /// (`plan.phys.pk_ordered`, set by `order_satisfied_by_pk`) — streams scan→filter→project with NO
-    /// sort, and (when there is a LIMIT) stops the scan the instant the LIMIT/OFFSET window is
-    /// filled, charging storage_row_read only for the rows actually read. With no LIMIT it emits
-    /// every survivor after OFFSET (the sort is simply elided — same rows, same cost as the eager/
-    /// sort path). Cost-equivalent to the eager path EXCEPT that a LIMIT reads (and filters) fewer
-    /// rows — the deliberate cost change. page_read is the full block (the bound's node count); only
-    /// the row reads short-circuit. Rows match the eager path exactly: the offset..offset+limit
-    /// slice of the primary-key-ordered filtered rows (which, for a `pk_ordered` query, is exactly
-    /// the ORDER BY's result — the stored PK order IS the requested order).
+    /// The bounded streaming scan path (spec/design/cost.md §3): full/contiguous PK scans,
+    /// canonical PK/index interval sets, and compatible ordered-index scans stop at the
+    /// LIMIT/OFFSET window. GIN/GiST complete their candidate gather, then stop table point-lookups
+    /// at that window. Only started interval blocks are charged; an opclass gather is charged in full.
     pub(crate) fn exec_streaming_scan(
         &self,
         plan: &SelectPlan,
@@ -25,109 +123,290 @@ impl Engine {
         params: &[Value],
     ) -> Result<SelectResult> {
         let store = self.store_scoped(plan.rels[0].db.as_deref(), &plan.rels[0].table_name);
-        // A `pk_reverse` plan (ORDER BY the full PK all-DESC) walks the tree backward; everything
-        // else (forward `pk_ordered`, or the no-ORDER-BY LIMIT short-circuit) walks forward.
-        let reverse = plan.phys.pk_reverse;
-
-        // Resolve the scan bound (the PK pushdown, if any) and charge the page_read block. This path
-        // is single-table (gated below), so the only relation is `rel_bounds[0]`. A correlated bound
-        // resolves against `env.outer` (the enclosing rows). An INDEX bound never streams — the
-        // dispatch gate routes it to the eager path (cost.md §3 "LIMIT short-circuit").
-        let (bound, empty) = match &plan.phys.rel_bounds[0] {
-            Some(ScanBound::Pk(bp)) => match build_key_bound(bp, params, env.outer, &[]) {
-                Some(b) => (b, false),
-                None => (KeyBound::unbounded(), true),
-            },
-            Some(ScanBound::Index(_))
-            | Some(ScanBound::Gin(_))
-            | Some(ScanBound::Gist(_))
-            | Some(ScanBound::PkSet(_))
-            | Some(ScanBound::IndexSet(_)) => {
-                unreachable!("the streaming path is gated to PK/full scans")
-            }
-            None => (KeyBound::unbounded(), false),
-        };
-        let (overlap, slabs) = if empty {
-            (0, 0)
-        } else {
-            store.overlap_scan_units(&bound, &plan.rel_masks[0])?
-        };
-        meter.charge(COSTS.page_read * overlap as i64 + COSTS.value_decompress * slabs as i64);
-
-        // `limit` is optional here: a `pk_ordered` query may have no LIMIT (it streams every
-        // survivor in order, eliding the sort), while the LIMIT short-circuit always has one.
-        let limit = plan.limit;
         let offset = plan.offset.unwrap_or(0);
-        // DISTINCT (cost.md §3): when the scan already yields ORDER BY order, dedup runs streaming —
-        // project EVERY scanned filtered row (the dedup key), drop a value already in `seen` keeping
-        // the first (scan-order) occurrence, then the LIMIT/OFFSET window the DISTINCT rows. The sort
-        // is elided; the projection is charged per scanned filtered row (the §3 asymmetry).
-        let distinct = plan.distinct;
         let mut out: Vec<Vec<Value>> = Vec::new();
-        if !empty && limit != Some(0) {
-            let mut passed: i64 = 0;
-            let mut seen: std::collections::HashSet<Vec<Value>> = std::collections::HashSet::new();
-            let mut visit = |_key: &[u8], row: &Row| -> Result<bool> {
-                meter.guard()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
-                meter.charge(COSTS.storage_row_read);
-                // Materialize the touched columns if the lazy load left them unfetched
-                // (large-values.md §14); the resolved copy is made only when needed, so the
-                // streaming path stays allocation-free for fully-resident rows.
-                let resolved;
-                let row = if TableStore::needs_resolution(row, &plan.rel_masks[0]) {
-                    let mut r = row.clone();
-                    store.resolve_columns(&mut r, &plan.rel_masks[0])?;
-                    resolved = r;
-                    &resolved
-                } else {
-                    row
-                };
-                let keep = match &plan.filter {
-                    Some(f) => f.eval(row, env, meter)?.is_true(),
-                    None => true,
-                };
-                if !keep {
-                    return Ok(true);
+        let mut passed = 0i64;
+        let mut seen = std::collections::HashSet::new();
+        let can_pull = plan.limit != Some(0);
+
+        match &plan.phys.rel_bounds[0] {
+            None => {
+                scan_stream_table_interval(
+                    store,
+                    &KeyBound::unbounded(),
+                    plan.phys.pk_reverse,
+                    plan,
+                    env,
+                    meter,
+                    offset,
+                    &mut passed,
+                    &mut seen,
+                    &mut out,
+                    can_pull,
+                )?;
+            }
+            Some(ScanBound::Pk(bp)) => {
+                if let Some(bound) = build_key_bound(bp, params, env.outer, &[]) {
+                    scan_stream_table_interval(
+                        store,
+                        &bound,
+                        plan.phys.pk_reverse,
+                        plan,
+                        env,
+                        meter,
+                        offset,
+                        &mut passed,
+                        &mut seen,
+                        &mut out,
+                        can_pull,
+                    )?;
                 }
-                if distinct {
-                    // Project per scanned filtered row (the dedup key) and drop duplicates by first
-                    // occurrence; the OFFSET/LIMIT then window the DISTINCT rows.
-                    let mut projected = Vec::with_capacity(plan.projections.len());
-                    for p in &plan.projections {
-                        projected.push(p.eval(row, env, meter)?);
+            }
+            Some(ScanBound::PkSet(ks)) => {
+                if can_pull {
+                    let intervals = canonical_interval_set(
+                        ks.pk_type,
+                        &ks.specs,
+                        &ks.clip,
+                        params,
+                        env.outer,
+                        ks.coll.as_deref(),
+                        &[],
+                    );
+                    if plan.phys.pk_reverse {
+                        for bound in intervals.iter().rev() {
+                            if !scan_stream_table_interval(
+                                store,
+                                bound,
+                                true,
+                                plan,
+                                env,
+                                meter,
+                                offset,
+                                &mut passed,
+                                &mut seen,
+                                &mut out,
+                                can_pull,
+                            )? {
+                                break;
+                            }
+                        }
+                    } else {
+                        for bound in &intervals {
+                            if !scan_stream_table_interval(
+                                store,
+                                bound,
+                                false,
+                                plan,
+                                env,
+                                meter,
+                                offset,
+                                &mut passed,
+                                &mut seen,
+                                &mut out,
+                                can_pull,
+                            )? {
+                                break;
+                            }
+                        }
                     }
-                    if !seen.insert(projected.clone()) {
-                        return Ok(true); // a duplicate of an already-emitted/seen value
-                    }
-                    passed += 1;
-                    if passed <= offset {
-                        return Ok(true);
-                    }
-                    meter.charge(COSTS.row_produced);
-                    out.push(projected);
-                } else {
-                    passed += 1;
-                    if passed <= offset {
-                        return Ok(true);
-                    }
-                    meter.charge(COSTS.row_produced);
-                    let mut projected = Vec::with_capacity(plan.projections.len());
-                    for p in &plan.projections {
-                        projected.push(p.eval(row, env, meter)?);
-                    }
-                    out.push(projected);
                 }
-                // Stop once a LIMIT window is filled; with no LIMIT, never stop early (emit every
-                // survivor after OFFSET, in primary-key scan order).
-                Ok(match limit {
-                    Some(l) => (out.len() as i64) < l,
-                    None => true,
-                })
-            };
-            if reverse {
-                store.scan_range_rev(&bound, &mut visit)?;
-            } else {
-                store.scan_range(&bound, &mut visit)?;
+            }
+            Some(ScanBound::Index(ib)) => {
+                if let Some((bound, prefix_len)) = build_index_bound(ib, params, env.outer, &[]) {
+                    let istore = self.index_store(&ib.name_key);
+                    let (overlap, slabs) = istore.overlap_scan_units(&bound, &[])?;
+                    meter.charge(
+                        COSTS.page_read * overlap as i64 + COSTS.value_decompress * slabs as i64,
+                    );
+                    if can_pull {
+                        let mut visit = |entry_key: &[u8], _row: &Row| -> Result<bool> {
+                            meter.guard()?;
+                            let row_key = index_row_key(entry_key, prefix_len, &ib.suffix_types);
+                            let (row, pages, slabs) =
+                                store.get_with_units(row_key, &plan.rel_masks[0])?;
+                            let row = row.expect("an index entry references a stored row");
+                            meter.charge(
+                                COSTS.page_read * pages as i64
+                                    + COSTS.value_decompress * slabs as i64,
+                            );
+                            process_streaming_row(
+                                store,
+                                &row,
+                                plan,
+                                env,
+                                meter,
+                                offset,
+                                &mut passed,
+                                &mut seen,
+                                &mut out,
+                                true,
+                            )
+                        };
+                        istore.scan_range(&bound, &mut visit)?;
+                    }
+                }
+            }
+            Some(ScanBound::IndexSet(ks)) => {
+                if can_pull {
+                    for logical in canonical_interval_set(
+                        ks.col_type,
+                        &ks.specs,
+                        &ks.clip,
+                        params,
+                        env.outer,
+                        ks.coll.as_deref(),
+                        &[],
+                    ) {
+                        let physical = index_logical_interval(&logical);
+                        let point = logical.lo.is_some()
+                            && logical.lo == logical.hi
+                            && logical.lo_inc
+                            && logical.hi_inc;
+                        let mut suffix = ks.tail_types.clone();
+                        let prefix_len = if point {
+                            1 + logical.lo.as_ref().unwrap().len()
+                        } else {
+                            suffix.insert(0, ks.col_type);
+                            0
+                        };
+                        let istore = self.index_store(&ks.name_key);
+                        let (overlap, slabs) = istore.overlap_scan_units(&physical, &[])?;
+                        meter.charge(
+                            COSTS.page_read * overlap as i64
+                                + COSTS.value_decompress * slabs as i64,
+                        );
+                        let mut more = true;
+                        let mut visit = |entry_key: &[u8], _row: &Row| -> Result<bool> {
+                            meter.guard()?;
+                            let row_key = index_row_key(entry_key, prefix_len, &suffix);
+                            let (row, pages, slabs) =
+                                store.get_with_units(row_key, &plan.rel_masks[0])?;
+                            let row = row.expect("an index entry references a stored row");
+                            meter.charge(
+                                COSTS.page_read * pages as i64
+                                    + COSTS.value_decompress * slabs as i64,
+                            );
+                            more = process_streaming_row(
+                                store,
+                                &row,
+                                plan,
+                                env,
+                                meter,
+                                offset,
+                                &mut passed,
+                                &mut seen,
+                                &mut out,
+                                true,
+                            )?;
+                            Ok(more)
+                        };
+                        istore.scan_range(&physical, &mut visit)?;
+                        if !more {
+                            break;
+                        }
+                    }
+                }
+            }
+            Some(ScanBound::Gin(gb)) => {
+                let query = plan
+                    .filter
+                    .as_ref()
+                    .and_then(|filter| gin_match(filter, gb.col_global).map(|(_, q)| q));
+                let (mut candidates, (pages, slabs)) = self.gin_bound_rows(
+                    &plan.rels[0].table_name,
+                    gb,
+                    query,
+                    env,
+                    meter,
+                    &plan.rel_masks[0],
+                    true,
+                )?;
+                meter
+                    .charge(COSTS.page_read * pages as i64 + COSTS.value_decompress * slabs as i64);
+                if can_pull {
+                    if plan.phys.pk_reverse {
+                        candidates.reverse();
+                    }
+                    for (key, candidate) in candidates {
+                        meter.guard()?;
+                        let row = if candidate.is_empty() {
+                            let (row, pages, slabs) =
+                                store.get_with_units(&key, &plan.rel_masks[0])?;
+                            meter.charge(
+                                COSTS.page_read * pages as i64
+                                    + COSTS.value_decompress * slabs as i64,
+                            );
+                            row.expect("a GIN entry references a stored row")
+                        } else {
+                            candidate
+                        };
+                        if !process_streaming_row(
+                            store,
+                            &row,
+                            plan,
+                            env,
+                            meter,
+                            offset,
+                            &mut passed,
+                            &mut seen,
+                            &mut out,
+                            true,
+                        )? {
+                            break;
+                        }
+                    }
+                }
+            }
+            Some(ScanBound::Gist(gb)) => {
+                let query = plan
+                    .filter
+                    .as_ref()
+                    .and_then(|filter| gist_query_operand(filter, gb));
+                let (mut candidates, (pages, slabs)) = self.gist_bound_rows(
+                    &plan.rels[0].table_name,
+                    gb,
+                    query,
+                    env,
+                    meter,
+                    &plan.rel_masks[0],
+                    true,
+                )?;
+                meter
+                    .charge(COSTS.page_read * pages as i64 + COSTS.value_decompress * slabs as i64);
+                if can_pull {
+                    if plan.phys.pk_reverse {
+                        candidates.reverse();
+                    }
+                    for (key, candidate) in candidates {
+                        meter.guard()?;
+                        let row = if candidate.is_empty() {
+                            let (row, pages, slabs) =
+                                store.get_with_units(&key, &plan.rel_masks[0])?;
+                            meter.charge(
+                                COSTS.page_read * pages as i64
+                                    + COSTS.value_decompress * slabs as i64,
+                            );
+                            row.expect("a GiST entry references a stored row")
+                        } else {
+                            candidate
+                        };
+                        if !process_streaming_row(
+                            store,
+                            &row,
+                            plan,
+                            env,
+                            meter,
+                            offset,
+                            &mut passed,
+                            &mut seen,
+                            &mut out,
+                            true,
+                        )? {
+                            break;
+                        }
+                    }
+                }
             }
         }
         Ok(SelectResult {
@@ -467,9 +746,9 @@ impl Engine {
         self.build_scan_rows(plan, bound_params, subquery_cost)
     }
 
-    /// Classify a resolved plan (already folded + params bound) as streaming or buffered and build the
-    /// matching lazy cursor. The streaming branch resolves the PK scan bound + the up-front cost
-    /// block (S3); the buffered branch runs its blocking part lazily on the first pull (S4). `plan` is
+    /// Classify a resolved plan (already folded + params bound) as direct-pull or buffered and build
+    /// the matching lazy cursor. The direct branch handles full/contiguous-PK scans; generalized
+    /// bounded streams run through the buffered cursor on first pull. `plan` is
     /// shared (`Rc`) — a cache hit hands the SAME allocation here without re-planning. Returns `None`
     /// only in the (unreachable, defensive) case that an eligible plan carries a non-PK scan bound, so
     /// the caller falls through. Under full drain the rows + total cost are byte-identical to the
@@ -480,7 +759,7 @@ impl Engine {
         bound_params: Vec<Value>,
         subquery_cost: i64,
     ) -> Result<Option<Rows>> {
-        if streaming_scan_eligible(&plan) {
+        if pull_streaming_scan_eligible(&plan) {
             // Resolve the scan bound (the PK pushdown, if any) and the up-front cost block — identical
             // to `exec_streaming_scan`. An empty bound (e.g. `pk = NULL`) admits no row.
             let reverse = plan.phys.pk_reverse;
@@ -1105,6 +1384,7 @@ impl Engine {
                     &env,
                     meter,
                     &plan.rel_masks[ri],
+                    false,
                 )?;
                 // SELECT discards the storage keys (UPDATE/DELETE keep them — gin.md §6).
                 (pairs.into_iter().map(|(_, v)| v).collect(), units)
@@ -1121,6 +1401,7 @@ impl Engine {
                     &env,
                     meter,
                     &plan.rel_masks[ri],
+                    false,
                 )?;
                 // SELECT discards the storage keys (UPDATE/DELETE keep them — gist.md §5).
                 (pairs.into_iter().map(|(_, v)| v).collect(), units)

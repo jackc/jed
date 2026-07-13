@@ -1,6 +1,7 @@
 package jed
 
 import (
+	"bytes"
 	"path/filepath"
 	"sync/atomic"
 )
@@ -160,10 +161,10 @@ func (db *engine) tryScanQuery(stmt statement, params []Value, sc *stmtCache) (*
 
 // buildScanRows binds params, optionally folds uncorrelated subqueries to constants (doFold — done on
 // a freshly-planned plan, skipped for a cached one which has no subquery), classifies the plan as
-// streaming or buffered via streamingScanEligible, and returns the matching lazy cursor. When doFold
-// is false, sp is a shared cached plan and stays strictly read-only. The streaming branch resolves
-// the PK scan bound + the up-front cost block; the buffered branch runs its blocking part lazily on
-// the first pull. Under full drain the rows + total cost are byte-identical to the eager path.
+// direct-pull or buffered via pullStreamingScanEligible, and returns the matching lazy cursor. When
+// doFold is false, sp is a shared cached plan and stays strictly read-only. The direct branch handles
+// full/contiguous-PK scans; generalized bounded streams run through the buffered cursor on first pull.
+// Under full drain the rows + total cost are byte-identical to the eager path.
 func (db *engine) buildScanRows(sp *selectPlan, ptys []scalarType, params []Value, doFold bool) (*Rows, bool, error) {
 	bound, err := bindParams(params, ptys)
 	if err != nil {
@@ -181,7 +182,7 @@ func (db *engine) buildScanRows(sp *selectPlan, ptys []scalarType, params []Valu
 		}
 	}
 
-	if streamingScanEligible(sp) {
+	if pullStreamingScanEligible(sp) {
 		// Resolve the scan bound (the PK pushdown, if any) and the up-front cost block. An empty bound
 		// (e.g. pk = NULL) admits no row.
 		b := unboundedBound()
@@ -647,28 +648,6 @@ func (c *deferredCursor) close() {
 
 func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costMeter, params []Value) (selectResult, error) {
 	store := db.lkpStoreScoped(plan.rels[0].db, plan.rels[0].tableName)
-
-	// Resolve the scan bound (the PK pushdown, if any) and charge the page_read block. A correlated
-	// bound resolves against env.outer (the enclosing rows).
-	// This path is single-table (gated below), so the only relation is relBounds[0].
-	// An INDEX bound never streams — the dispatch gate routes it to the eager path
-	// (cost.md §3 "LIMIT short-circuit").
-	b := unboundedBound()
-	empty := false
-	overlap, slabs := 0, 0
-	if plan.phys.relBounds[0] != nil && plan.phys.relBounds[0].pk != nil {
-		b, empty = db.buildKeyBound(plan.phys.relBounds[0].pk, params, env.outer, nil)
-	}
-	if !empty {
-		var err error
-		if overlap, slabs, err = store.OverlapScanUnits(b, plan.relMasks[0]); err != nil {
-			return selectResult{}, err
-		}
-	}
-	meter.Charge(costs.PageRead*int64(overlap) + costs.ValueDecompress*int64(slabs))
-
-	// limit is optional here: a pkOrdered query may have no LIMIT (it streams every survivor in
-	// order, eliding the sort), while the LIMIT short-circuit always has one.
 	var offset int64
 	if plan.offset != nil {
 		offset = *plan.offset
@@ -679,84 +658,259 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 	// first (scan-order) occurrence, then the LIMIT/OFFSET window the DISTINCT rows. The sort is
 	// elided; the projection is charged per scanned filtered row (the §3 asymmetry).
 	seen := make(map[string]bool)
-	// Skip the scan entirely for LIMIT 0 (no window to fill).
-	if !empty && (plan.limit == nil || *plan.limit > 0) {
-		var passed int64
-		// A pkReverse plan (ORDER BY the full PK all-DESC) walks the tree backward; everything else
-		// (forward pkOrdered, or the no-ORDER-BY LIMIT short-circuit) walks forward.
-		visit := func(_ []byte, row storedRow) (bool, error) {
+	var passed int64
+	visitRow := func(row storedRow, guarded bool) (bool, error) {
+		if !guarded {
 			if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned row (CLAUDE.md §13)
 				return false, err
 			}
-			meter.Charge(costs.StorageRowRead)
-			// Materialize the touched columns if the lazy load left them unfetched
-			// (large-values.md §14) — a fresh copy only when needed (resolveColumns).
-			row, err := store.resolveColumns(row, plan.relMasks[0])
+		}
+		meter.Charge(costs.StorageRowRead)
+		// Materialize the touched columns if the lazy load left them unfetched
+		// (large-values.md §14) — a fresh copy only when needed (resolveColumns).
+		row, err := store.resolveColumns(row, plan.relMasks[0])
+		if err != nil {
+			return false, err
+		}
+		if plan.filter != nil {
+			v, err := plan.filter.eval(row, env, meter)
 			if err != nil {
 				return false, err
 			}
-			if plan.filter != nil {
-				v, err := plan.filter.eval(row, env, meter)
+			if !v.IsTrue() {
+				return true, nil
+			}
+		}
+		if plan.distinct {
+			// Project per scanned filtered row (the dedup key) and drop duplicates by first
+			// occurrence; the OFFSET/LIMIT then window the DISTINCT rows.
+			projected := make([]Value, len(plan.projections))
+			for i, p := range plan.projections {
+				v, err := p.eval(row, env, meter)
 				if err != nil {
 					return false, err
 				}
-				if !v.IsTrue() {
-					return true, nil
-				}
+				projected[i] = v
 			}
-			if plan.distinct {
-				// Project per scanned filtered row (the dedup key) and drop duplicates by first
-				// occurrence; the OFFSET/LIMIT then window the DISTINCT rows.
-				projected := make([]Value, len(plan.projections))
-				for i, p := range plan.projections {
-					v, err := p.eval(row, env, meter)
-					if err != nil {
-						return false, err
-					}
-					projected[i] = v
-				}
-				if key := distinctRowKey(projected); seen[key] {
-					return true, nil // a duplicate of an already-emitted/seen value
-				} else {
-					seen[key] = true
-				}
-				passed++
-				if passed <= offset {
-					return true, nil
-				}
-				meter.Charge(costs.RowProduced)
-				out = append(out, projected)
+			if key := distinctRowKey(projected); seen[key] {
+				return true, nil // a duplicate of an already-emitted/seen value
 			} else {
-				passed++
-				if passed <= offset {
-					return true, nil
-				}
-				meter.Charge(costs.RowProduced)
-				projected := make([]Value, len(plan.projections))
-				for i, p := range plan.projections {
-					v, err := p.eval(row, env, meter)
-					if err != nil {
-						return false, err
-					}
-					projected[i] = v
-				}
-				out = append(out, projected)
+				seen[key] = true
 			}
-			// Stop once a LIMIT window is filled; with no LIMIT, never stop early (emit every
-			// survivor after OFFSET, in primary-key scan order).
-			if plan.limit != nil {
-				return int64(len(out)) < *plan.limit, nil
+			passed++
+			if passed <= offset {
+				return true, nil
 			}
-			return true, nil
+			meter.Charge(costs.RowProduced)
+			out = append(out, projected)
+		} else {
+			passed++
+			if passed <= offset {
+				return true, nil
+			}
+			meter.Charge(costs.RowProduced)
+			projected := make([]Value, len(plan.projections))
+			for i, p := range plan.projections {
+				v, err := p.eval(row, env, meter)
+				if err != nil {
+					return false, err
+				}
+				projected[i] = v
+			}
+			out = append(out, projected)
+		}
+		// Stop once a LIMIT window is filled; with no LIMIT, never stop early (emit every
+		// survivor after OFFSET, in primary-key scan order).
+		if plan.limit != nil {
+			return int64(len(out)) < *plan.limit, nil
+		}
+		return true, nil
+	}
+
+	canPull := plan.limit == nil || *plan.limit > 0
+	scanTableInterval := func(b keyBound, reverse bool, charge bool) (bool, error) {
+		if charge {
+			overlap, slabs, err := store.OverlapScanUnits(b, plan.relMasks[0])
+			if err != nil {
+				return false, err
+			}
+			meter.Charge(costs.PageRead*int64(overlap) + costs.ValueDecompress*int64(slabs))
+		}
+		if !canPull {
+			return false, nil
+		}
+		keepGoing := true
+		visit := func(_ []byte, row storedRow) (bool, error) {
+			var err error
+			keepGoing, err = visitRow(row, false)
+			return keepGoing, err
 		}
 		var err error
-		if plan.phys.pkReverse {
+		if reverse {
 			err = store.ScanRangeRev(b, visit)
 		} else {
 			err = store.ScanRange(b, visit)
 		}
+		return keepGoing, err
+	}
+
+	rowKeyFromIndex := func(ekey []byte, prefixLen int, suffix []scalarType) []byte {
+		at := prefixLen
+		for _, ty := range suffix {
+			if at < len(ekey) && ekey[at] == 0x01 {
+				at++
+			} else {
+				at += 1 + ty.WidthBytes()
+			}
+		}
+		return ekey[at:]
+	}
+	scanIndexInterval := func(nameKey string, b keyBound, prefixLen int, suffix []scalarType, charge bool) (bool, error) {
+		istore := db.lkpIndexStore(nameKey)
+		if charge {
+			overlap, slabs, err := istore.OverlapScanUnits(b, nil)
+			if err != nil {
+				return false, err
+			}
+			meter.Charge(costs.PageRead*int64(overlap) + costs.ValueDecompress*int64(slabs))
+		}
+		if !canPull {
+			return false, nil
+		}
+		keepGoing := true
+		err := istore.ScanRange(b, func(ekey []byte, _ storedRow) (bool, error) {
+			if err := meter.Guard(); err != nil {
+				return false, err
+			}
+			rowKey := rowKeyFromIndex(ekey, prefixLen, suffix)
+			row, ok, pages, slabs, err := store.GetWithUnits(rowKey, plan.relMasks[0])
+			if err != nil {
+				return false, err
+			}
+			if !ok {
+				panic("an index entry references a stored row")
+			}
+			meter.Charge(costs.PageRead*int64(pages) + costs.ValueDecompress*int64(slabs))
+			keepGoing, err = visitRow(row, true)
+			return keepGoing, err
+		})
+		return keepGoing, err
+	}
+
+	sb := plan.phys.relBounds[0]
+	switch {
+	case sb == nil || sb.pk != nil:
+		b, empty := unboundedBound(), false
+		if sb != nil {
+			b, empty = db.buildKeyBound(sb.pk, params, env.outer, nil)
+		}
+		if !empty {
+			if _, err := scanTableInterval(b, plan.phys.pkReverse, true); err != nil {
+				return selectResult{}, err
+			}
+		}
+	case sb.pkSet != nil:
+		if canPull {
+			intervals := canonicalIntervalSet(sb.pkSet.pkType, sb.pkSet.specs, sb.pkSet.clip, params, env.outer, sb.pkSet.coll, nil)
+			for step := 0; step < len(intervals); step++ {
+				i := step
+				if plan.phys.pkReverse {
+					i = len(intervals) - 1 - step
+				}
+				more, err := scanTableInterval(intervals[i], plan.phys.pkReverse, true)
+				if err != nil {
+					return selectResult{}, err
+				}
+				if !more {
+					break
+				}
+			}
+		}
+	case sb.index != nil:
+		b, prefixLen, empty := db.buildIndexBound(sb.index, params, env.outer, nil)
+		if !empty {
+			if _, err := scanIndexInterval(sb.index.nameKey, b, prefixLen, sb.index.suffixTypes, true); err != nil {
+				return selectResult{}, err
+			}
+		}
+	case sb.indexSet != nil:
+		if canPull {
+			ks := sb.indexSet
+			for _, logical := range canonicalIntervalSet(ks.colType, ks.specs, ks.clip, params, env.outer, ks.coll, nil) {
+				physical := indexLogicalInterval(logical)
+				suffix, prefixLen := ks.tailTypes, 0
+				if logical.lo != nil && logical.hi != nil && logical.loInc && logical.hiInc && bytes.Equal(logical.lo, logical.hi) {
+					prefixLen = 1 + len(logical.lo)
+				} else {
+					suffix = append([]scalarType{ks.colType}, suffix...)
+				}
+				more, err := scanIndexInterval(ks.nameKey, physical, prefixLen, suffix, true)
+				if err != nil {
+					return selectResult{}, err
+				}
+				if !more {
+					break
+				}
+			}
+		}
+	case sb.gin != nil || sb.gist != nil:
+		var entries []entry
+		var pages, slabs int
+		var err error
+		if sb.gin != nil {
+			var query *rExpr
+			if plan.filter != nil {
+				if _, q, ok := ginMatch(plan.filter, sb.gin.colGlobal); ok {
+					query = q
+				}
+			}
+			entries, pages, slabs, err = db.ginBoundRows(plan.rels[0].tableName, sb.gin, query, env, meter, plan.relMasks[0], true)
+		} else {
+			var query *rExpr
+			if plan.filter != nil {
+				if q, ok := gistQueryOperand(plan.filter, sb.gist); ok {
+					query = q
+				}
+			}
+			entries, pages, slabs, err = db.gistBoundRows(plan.rels[0].tableName, sb.gist, query, env, meter, plan.relMasks[0], true)
+		}
 		if err != nil {
 			return selectResult{}, err
+		}
+		// The opclass gather is complete and charged up front. Ordinary entries carry only storage
+		// keys; a degenerate full-scan fallback carries the already-fetched rows and its full block.
+		meter.Charge(costs.PageRead*int64(pages) + costs.ValueDecompress*int64(slabs))
+		if canPull {
+			for step := 0; step < len(entries); step++ {
+				if err := meter.Guard(); err != nil {
+					return selectResult{}, err
+				}
+				i := step
+				if plan.phys.pkReverse {
+					i = len(entries) - 1 - step
+				}
+				e := entries[i]
+				row := e.Row
+				if row == nil {
+					var ok bool
+					var n, sl int
+					row, ok, n, sl, err = store.GetWithUnits(e.Key, plan.relMasks[0])
+					if err != nil {
+						return selectResult{}, err
+					}
+					if !ok {
+						panic("an opclass entry references a stored row")
+					}
+					meter.Charge(costs.PageRead*int64(n) + costs.ValueDecompress*int64(sl))
+				}
+				more, err := visitRow(row, true)
+				if err != nil {
+					return selectResult{}, err
+				}
+				if !more {
+					break
+				}
+			}
 		}
 	}
 	return selectResult{columnNames: plan.columnNames, columnTypes: plan.columnTypes, rows: out, cost: meter.Accrued}, nil
@@ -1286,7 +1440,7 @@ func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 				query = q
 			}
 		}
-		entries, pages, sl, err := db.ginBoundRows(rel.tableName, sb.gin, query, env, meter, plan.relMasks[ri])
+		entries, pages, sl, err := db.ginBoundRows(rel.tableName, sb.gin, query, env, meter, plan.relMasks[ri], false)
 		if err != nil {
 			return nil, err
 		}
@@ -1305,7 +1459,7 @@ func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 				query = q
 			}
 		}
-		entries, pages, sl, err := db.gistBoundRows(rel.tableName, sb.gist, query, env, meter, plan.relMasks[ri])
+		entries, pages, sl, err := db.gistBoundRows(rel.tableName, sb.gist, query, env, meter, plan.relMasks[ri], false)
 		if err != nil {
 			return nil, err
 		}

@@ -473,11 +473,13 @@ The index-bounded scan accrues, in place of the full-scan block:
 For UPDATE/DELETE this scan block replaces the full-scan block exactly: the bare mutation omits
 SELECT's final `row_produced`, while RETURNING adds its ordinary projection/production units;
 phase-2 row and index writes stay unmetered. Deterministic and byte-identical across cores: the
-index tree shape, the entry-key encoding, and the overlap rule are all §8 contracts. **Narrowings
-this slice** (indexes.md §5): the range column and every trailing column are **fixed-width**
-(indexes.md §5.1 — an equality-prefix column may be variable-width), and
-**no LIMIT-streaming combination** — an index-bounded scan with a LIMIT takes the eager path
-(reads the full admitted set; the short-circuit below stays PK/full-scan-only).
+index tree shape, the entry-key encoding, and the overlap rule are all §8 contracts. With a
+non-blocking `LIMIT`, the index range is pulled in entry order: its structural index-tree page block
+is charged up front, while admitted-row point-lookups, `storage_row_read`, residual evaluation, and
+projection stop at `OFFSET+LIMIT` survivors. An `ORDER BY` can elide its sort only when it is exactly
+this same index order; an incompatible order keeps eager gather + sort. **Narrowing** (indexes.md
+§5): the range column and every trailing column are **fixed-width** (indexes.md §5.1 — an
+equality-prefix column may be variable-width).
 
 **DDL costs.** `CREATE INDEX` charges its build scan over the existing rows: `page_read` ×
 the **table's** full node count + `storage_row_read` per row (the build's touched set — the
@@ -520,8 +522,10 @@ element, or a NULL `= ANY` scalar. Two **full-scan fallbacks** charge the full s
 cannot enumerate, having no terms): `@> '{}'` (every non-NULL array contains the empty array), and
 array `=` whose `Q` has no non-NULL element (`col = '{}'` / `col = ARRAY[NULL,…]`). Deterministic and
 byte-identical across cores: the term extraction, the term encoding, the entry-tree shape, and the
-overlap rule are all §8 contracts (gin.md §8). **Narrowings this slice** (gin.md §6): constant query
-operand only, `@>`/`&&`/`= ANY`/`=` only, and no LIMIT-streaming combination. A **GIN-bounded
+overlap rule are all §8 contracts (gin.md §8). With a non-blocking `LIMIT`, term scans and posting
+combine remain complete and charge every `page_read`/`gin_entry`; only candidate table point-lookups,
+`storage_row_read`, residual evaluation, and output after the window disappear. **Narrowings this
+slice** (gin.md §6): constant query operand only and `@>`/`&&`/`= ANY`/`=` only. A **GIN-bounded
 `UPDATE`/`DELETE`** accrues this same scan block in place of its full-scan block (after PK and any
 ordered B-tree bound, mutation precedence tries GIN before GiST); so a
 `DELETE … WHERE col @> Q` costs the matching `SELECT`'s scan minus the `row_produced` a bare mutation
@@ -554,7 +558,9 @@ accrues:
 The count is byte-identical across cores: the resident tree is rebuilt **canonically** from the leaf
 set (`build_from_leaf_keys` — content-deterministic, gist.md §3), so the nodes-visited and the
 `gist_descent` charge are a pure function of `(query, row set)`, independent of insertion order or
-medium (in-memory vs reopened file). **Narrowings** (gist.md §5/§6): constant query operand only;
+medium (in-memory vs reopened file). With a non-blocking `LIMIT`, the R-tree descent still completes
+and charges all visited nodes/interiors, then storage-key-ordered candidate table point-lookups and
+residual work stop at the window. **Narrowings** (gist.md §5/§6): constant query operand only;
 `range_ops` accelerates `&&`/`@>` (an empty `&&` query is provably empty → 0, an empty `@>` query falls
 back to the full scan); the scalar `=` opclass accelerates `=` over the **fixed-width** keyables and is
 the **fallback bound** — a `col = const` over a PK or B-tree-indexed column takes the cheaper bound, so
@@ -719,13 +725,15 @@ the engine **streams** scan→filter→project and **stops the scan the instant 
 window is filled.** This is the engine's first early-out, gated by the `query.limit_short_circuit`
 capability.
 
-- **`storage_row_read` counts only the rows actually read.** The scan reads in primary-key order,
+- **`storage_row_read` counts only the rows actually read.** A full/PK scan reads in primary-key order;
+  an ordered-index bound reads index-entry order; GIN/GiST read their storage-key candidate order;
   skipping `OFFSET` passing rows and producing `LIMIT` rows, then **stops** — so it charges
   `storage_row_read` (and the filter's `operator_eval`s) only for the rows up to that point, not the
   whole table. `SELECT v FROM u LIMIT 2` over a 5-row table reads 2 rows, not 5. This is the
-  deliberate cost change; it is genuine (the scan really stops — leaves past the stop point are never
-  faulted), not a post-hoc truncation, so the cost honestly bounds the work (CLAUDE.md §13).
-- **`page_read` does NOT short-circuit** — it stays the full block (the scan bound's node count
+  deliberate cost change; it is genuine, not a post-hoc truncation. An ordered B-tree walk never
+  faults leaves past the stop point; GIN/GiST complete only their opclass gather and leave later table
+  candidates unfetched, so the cost honestly bounds the work (CLAUDE.md §13).
+- **Contiguous-bound `page_read` does NOT short-circuit** — it stays the full block (the scan bound's node count
   plus the bound's overflow chain pages and `value_decompress` slabs, charged up front), so a
   `LIMIT` does not lower it. Keeping
   `page_read` the structural count preserves its "logical, buffer-pool-invisible" definition and one
@@ -739,16 +747,21 @@ capability.
   "ORDER BY satisfied by primary-key order" below, which short-circuits exactly like the no-`ORDER
   BY` case. `query/limit_offset.test` pins both sides — `ORDER BY id` (the PK) short-circuits while
   `ORDER BY val` (a non-PK) scans all rows.
-- **Composes with the PK bound.** A `WHERE pk <range> ... LIMIT n` first bounds the scan to the key
-  range (above), then short-circuits within it once `n` rows are produced. (An **index** bound does
-  **not** stream — an index-bounded scan with a LIMIT takes the eager path; see the index-bounded
-  scan subsection above.)
-- **The rows are identical** to the eager path: the `offset..offset+limit` slice of the
-  primary-key-ordered filtered rows. (The *result set* of a `LIMIT` with no `ORDER BY` is
-  SQL-unspecified — CLAUDE.md §8 — but our cores agree, scanning in primary-key order.)
+- **Composes with every bound kind.** A contiguous PK/index bound short-circuits within its range.
+  A canonical PK/index interval set starts disjoint intervals in key order and charges an interval's
+  page block only on first pull; once the window fills, later intervals are neither started nor
+  charged. GIN/GiST still complete and charge candidate gathering, but stop candidate table fetches.
+- **ORDER BY compatibility is structural.** PK bounds, PK interval sets, and storage-key-sorted
+  GIN/GiST candidates can serve matching PK order (including reverse iteration). An ordered-index
+  bound/set can serve only the exact same index's ASC order. Any other ORDER BY is blocking and
+  retains the eager materialize + sort path.
+- **The rows are identical** to the eager path: the `offset..offset+limit` slice of the chosen
+  access path's filtered order. With a compatible `ORDER BY`, that is the requested order. Without
+  `ORDER BY`, the result set is SQL-unspecified (CLAUDE.md §8), but all cores make the same
+  deterministic access-path choice and order.
 
-`query/limit_offset.test` pins these costs cross-core (a uniform-value table makes the no-`ORDER BY`
-subset deterministic so a specific result can be asserted alongside the `# cost:`).
+`query/limit_offset.test` pins the full/PK cases; `query/bounded_limit_streaming.test` pins ordered
+index, interval-set, GIN, GiST, compatible-order, and blocking-order cases cross-core.
 
 ### ORDER BY satisfied by primary-key order — eliding the sort
 

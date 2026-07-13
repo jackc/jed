@@ -301,8 +301,9 @@ An `UPDATE` / `DELETE` target scan uses the same eligible access predicate as SE
 every admitted `(storage key, old row)` from the pre-mutation index state, rechecks the complete
 WHERE, finishes validation for the whole batch, and only then changes table/index storage. Thus an
 indexed-column update, a PK-rekeying update, and a partial/expression-index bound cannot perturb the
-candidate walk in progress. The **LIMIT streaming short-circuit does not combine** with an index
-bound (an index-bounded scan with LIMIT takes the eager path — its cost reads the full admitted set).
+candidate walk in progress. With a non-blocking `LIMIT`, the same bound is pulled in index-entry
+order and table point-lookups stop at `OFFSET+LIMIT` residual survivors. If `ORDER BY` is exactly the
+same index order, its sort is also elided; an incompatible order retains eager gather + sort.
 
 An index is **eligible for the bound only when every key element from the range element
 onward** — i.e. all elements **after the equality prefix** — has a **fixed-width scalar**

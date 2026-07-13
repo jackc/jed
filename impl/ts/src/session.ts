@@ -252,23 +252,43 @@ export class SessionState {
 
 // streamingScanEligible reports whether plan is the single-table, no-blocking-operator STREAMING SCAN
 // shape (spec/design/cost.md §3, streaming.md §4) — a single relation, no join/aggregate/window, an
-// output order the primary-key scan already yields (pkOrdered, or no ORDER BY with a LIMIT
-// short-circuit), no index/GIN/GiST bound (those read the full admitted set eagerly), and a real table
-// store (not an SRF / CTE / derived source). Both execSelectPlan (which routes to the eager
-// execStreamingScan) and tryStreamingQuery (the lazy query() lane) gate on this ONE predicate, so the
-// two never drift.
+// output order the chosen bound already yields, and a real table store. Without ORDER BY, LIMIT
+// observes the access path's deterministic order. With ORDER BY, a PK/PK-set bound must preserve PK
+// order, or an ordered-index bound/set must walk the exact ordering index.
 export function streamingScanEligible(plan: SelectPlan): boolean {
+  if (
+    plan.rels.length !== 1 ||
+    plan.joins.length !== 0 ||
+    plan.isAgg ||
+    plan.hasWindow ||
+    plan.rels[0]!.srf !== undefined ||
+    plan.rels[0]!.cte !== undefined ||
+    plan.rels[0]!.derived !== undefined
+  )
+    return false;
+  const bound = plan.phys.relBounds[0]!;
+  if (plan.order.length === 0) return !plan.distinct && plan.limit !== null;
+  if (plan.phys.pkOrdered)
+    return (
+      bound === null ||
+      bound.kind === "pk" ||
+      bound.kind === "pkSet" ||
+      bound.kind === "gin" ||
+      bound.kind === "gist"
+    );
+  const io = plan.phys.indexOrder;
   return (
-    plan.rels.length === 1 &&
-    plan.joins.length === 0 &&
-    !plan.isAgg &&
-    !plan.hasWindow &&
-    (plan.phys.pkOrdered || (!plan.distinct && plan.order.length === 0 && plan.limit !== null)) &&
-    !needsEagerScan(plan.phys.relBounds[0]) &&
-    plan.rels[0]!.srf === undefined &&
-    plan.rels[0]!.cte === undefined &&
-    plan.rels[0]!.derived === undefined
+    io !== null &&
+    bound !== null &&
+    ((bound.kind === "index" && bound.index.nameKey === io.nameKey) ||
+      (bound.kind === "indexSet" && bound.indexSet.nameKey === io.nameKey))
   );
+}
+
+export function pullStreamingScanEligible(plan: SelectPlan): boolean {
+  if (!streamingScanEligible(plan)) return false;
+  const bound = plan.phys.relBounds[0]!;
+  return bound === null || bound.kind === "pk";
 }
 
 // frameBackwardSafe reports whether a frame folds only rows at or before the current row in the scan

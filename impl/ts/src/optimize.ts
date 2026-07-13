@@ -112,10 +112,10 @@ function ruleOrderByPkScan(plan: SelectPlan, rels: ScopeRel[], snap: Snapshot): 
 // ruleOrderByIndexScan — ORDER BY satisfied by SECONDARY-INDEX scan order (cost.md §3): when the
 // PK scan does NOT satisfy the order but a B-tree index's columns do, and there is a LIMIT, walk
 // that index and point-look-up each row — a top-N that avoids the blocking sort. Gated to a LIMIT
-// and to no WHERE pushdown bound (combining them is a follow-on); mutually exclusive with
-// pkOrdered.
+// and, when a WHERE bound exists, only when that bound walks the same index in the same order;
+// mutually exclusive with pkOrdered.
 function ruleOrderByIndexScan(plan: SelectPlan, rels: ScopeRel[], snap: Snapshot): void {
-  plan.phys.indexOrder =
+  const candidate =
     !plan.isAgg &&
     !plan.hasWindow &&
     !plan.distinct &&
@@ -126,9 +126,16 @@ function ruleOrderByIndexScan(plan: SelectPlan, rels: ScopeRel[], snap: Snapshot
     plan.rels.length === 1 &&
     plan.rels[0]!.srf === undefined &&
     plan.rels[0]!.cte === undefined &&
-    plan.rels[0]!.derived === undefined &&
-    plan.phys.relBounds[0] === null
+    plan.rels[0]!.derived === undefined
       ? orderSatisfiedByIndex(snap, rels[0]!.table, plan.rels[0]!.offset, plan.order)
+      : null;
+  const bound = plan.phys.relBounds[0]!;
+  plan.phys.indexOrder =
+    candidate !== null &&
+    (bound === null ||
+      (bound.kind === "index" && bound.index.nameKey === candidate.nameKey) ||
+      (bound.kind === "indexSet" && bound.indexSet.nameKey === candidate.nameKey))
+      ? candidate
       : null;
 }
 

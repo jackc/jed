@@ -281,6 +281,7 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "query.composite_pk_pushdown",
   "query.or_in_point_lookup",
   "query.interval_set",
+  "query.bounded_limit_streaming",
   "query.index_mutation",
   "query.limit_short_circuit",
   "query.order_by_pk_scan",

@@ -45,28 +45,20 @@ impl Engine {
             return self.exec_vectorized_agg(plan, &env, meter);
         }
 
-        // Streaming primary-key-ordered scan (spec/design/cost.md §3): a single-table query with no
-        // blocking operator beyond an ORDER BY the scan already satisfies — either no ORDER BY with
-        // a LIMIT (the LIMIT short-circuit), or an ORDER BY satisfied by the table's primary-key
-        // scan order (`plan.phys.pk_ordered`) — streams scan→filter→project with NO sort, and with a
-        // LIMIT STOPS the scan once the window is filled (so storage_row_read counts only the rows
-        // actually read). A `pk_ordered` DISTINCT streams too: the dedup runs in scan order (the sort
-        // elided), so it short-circuits a top-N like the non-DISTINCT case. A non-PK-ordered ORDER BY,
-        // a no-ORDER-BY DISTINCT, aggregate, or join must see every row (sort/dedup/group/combine), so
-        // it keeps the eager path below. page_read stays the full block; only the row reads short-circuit.
-        // (On the lazy `query()` path the streamable shape is served directly by `try_streaming_query`
-        // before reaching here — `BufferedScan` only ever drives the non-streamable plans — but the eager
-        // `execute()` path still routes through here, so the dispatch stays.)
+        // Bounded streaming scan (spec/design/cost.md §3): a single-table query whose chosen access
+        // path supplies its observable order stops row fetch/filter/project work at the LIMIT window.
+        // This covers PK and compatible ordered-index intervals plus GIN/GiST candidate sets (whose
+        // gather remains complete). Generalized bounds reach this dispatch from BufferedScan's first
+        // pull; the older full/contiguous-PK shape also has a direct pull cursor.
         if streaming_scan_eligible(plan) {
             return Ok(Emitter::Final {
                 rows: self.exec_streaming_scan(plan, &env, meter, params)?.rows,
             });
         }
 
-        // Streaming secondary-index-order scan (cost.md §3 "secondary-index order"): the planner set
-        // `index_order` only for a single-table, non-aggregate/window/DISTINCT, no-bound, LIMITed
-        // query whose ORDER BY a B-tree index satisfies (and the PK scan does not). Walk the index +
-        // point-lookup; the eager sort is elided.
+        // Streaming secondary-index-order scan (cost.md §3 "secondary-index order"): compatible
+        // bounded plans were caught above, so this fallback handles the no-bound LIMIT shape. Walk
+        // the ordering index + point-lookup; the eager sort is elided.
         if let Some(io) = &plan.phys.index_order {
             return Ok(Emitter::Final {
                 rows: self.exec_index_order_scan(plan, io, &env, meter)?.rows,
@@ -77,9 +69,9 @@ impl Engine {
         // non-aggregate, non-DISTINCT query with an ORDER BY the scan does NOT already satisfy
         // (`!plan.phys.pk_ordered` — caught above) streams scan→filter→Sorter, so the input is never
         // materialized in the executor heap and the sort spills sorted runs to disk under work_mem
-        // (file-backed databases). DISTINCT/aggregate/join take the eager path below, and an index
-        // bound does not stream (like the LIMIT short-circuit). Results + cost are identical to the
-        // eager sort (the sort is unmetered — cost.md §3; spill.md §6).
+        // (file-backed databases). DISTINCT/aggregate/join take the eager path below, and an
+        // incompatible index bound does not stream through this sorter. Results + cost are identical
+        // to the eager sort (the sort is unmetered — cost.md §3; spill.md §6).
         if !plan.order.is_empty()
             && !plan.phys.pk_ordered
             && plan.order_exprs.is_empty() // a materialized expression key takes the eager path below

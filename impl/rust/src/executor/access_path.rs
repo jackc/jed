@@ -225,11 +225,11 @@ impl Engine {
             }
             Some(ScanBound::Gin(gb)) => {
                 let query = filter.and_then(|f| gin_match(f, gb.col_global).map(|(_, q)| q));
-                self.gin_bound_rows(table_name, gb, query, env, meter, mask)?
+                self.gin_bound_rows(table_name, gb, query, env, meter, mask, false)?
             }
             Some(ScanBound::Gist(gb)) => {
                 let query = filter.and_then(|f| gist_query_operand(f, gb));
-                self.gist_bound_rows(table_name, gb, query, env, meter, mask)?
+                self.gist_bound_rows(table_name, gb, query, env, meter, mask, false)?
             }
             Some(ScanBound::PkSet(ks)) => {
                 self.pk_key_set_rows(store, ks, params, &[], mask, &[], false)?
@@ -277,6 +277,7 @@ impl Engine {
         env: &EvalEnv,
         meter: &mut Meter,
         mask: &[bool],
+        keys_only: bool,
     ) -> Result<(Vec<(Vec<u8>, Row)>, (usize, usize))> {
         let store = self.store(table_name);
         // Extract the query's distinct terms. This (the opclass `extract_query_terms`) is a pure
@@ -407,6 +408,10 @@ impl Engine {
         let mut slabs = 0usize;
         let mut rows = Vec::with_capacity(candidates.len());
         for key in candidates {
+            if keys_only {
+                rows.push((key, Vec::new()));
+                continue;
+            }
             let (row, n, s) = store.get_with_units(&key, mask)?;
             pages += n;
             slabs += s;
@@ -434,6 +439,7 @@ impl Engine {
         env: &EvalEnv,
         meter: &mut Meter,
         mask: &[bool],
+        keys_only: bool,
     ) -> Result<(Vec<(Vec<u8>, Row)>, (usize, usize))> {
         use crate::gist::{GistQuery, GistStrategy};
         let store = self.store(table_name);
@@ -499,6 +505,10 @@ impl Engine {
         let mut slabs = 0usize;
         let mut rows = Vec::with_capacity(skeys.len());
         for key in skeys {
+            if keys_only {
+                rows.push((key, Vec::new()));
+                continue;
+            }
             let (row, n, s) = store.get_with_units(&key, mask)?;
             pages += n;
             slabs += s;

@@ -86,14 +86,25 @@ func (db *engine) ruleOrderByPkScan(plan *selectPlan, rels []scopeRel) {
 // ruleOrderByIndexScan — ORDER BY satisfied by SECONDARY-INDEX scan order (cost.md §3): when the
 // PK scan does NOT satisfy the order but a B-tree index's columns do, and there is a LIMIT, walk
 // that index and point-look-up each row — a top-N that avoids the blocking sort. Gated to a LIMIT
-// and to no WHERE pushdown bound (combining them is a follow-on); mutually exclusive with
-// pkOrdered.
+// and, when a WHERE bound exists, only when that bound walks the same index in the same order;
+// mutually exclusive with pkOrdered.
 func (db *engine) ruleOrderByIndexScan(plan *selectPlan, rels []scopeRel) {
 	if !plan.isAgg && !plan.hasWindow && !plan.distinct && !plan.phys.pkOrdered && plan.limit != nil &&
 		len(plan.order) > 0 && len(plan.orderExprs) == 0 && len(plan.rels) == 1 && plan.rels[0].srf == nil &&
-		plan.rels[0].cte == nil && plan.rels[0].derived == nil && plan.phys.relBounds[0] == nil {
-		plan.phys.indexOrder = db.orderSatisfiedByIndex(rels[0].table, plan.rels[0].offset, plan.order)
+		plan.rels[0].cte == nil && plan.rels[0].derived == nil {
+		io := db.orderSatisfiedByIndex(rels[0].table, plan.rels[0].offset, plan.order)
+		if io != nil && indexOrderCompatibleBound(io, plan.phys.relBounds[0]) {
+			plan.phys.indexOrder = io
+		}
 	}
+}
+
+func indexOrderCompatibleBound(io *indexOrderPlan, sb *scanBound) bool {
+	if sb == nil {
+		return true
+	}
+	return (sb.index != nil && sb.index.nameKey == io.nameKey) ||
+		(sb.indexSet != nil && sb.indexSet.nameKey == io.nameKey)
 }
 
 // ruleJoinPkOrdered — ORDER BY satisfied by the OUTER relation's PK scan order in a two-table

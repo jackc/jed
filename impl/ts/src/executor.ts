@@ -352,6 +352,7 @@ import {
   groupByIntKey,
   isAttachmentScope,
   operandCol,
+  pullStreamingScanEligible,
   streamingScanEligible,
   vectorizedProjectEligible,
   vectorizedSpecEligible,
@@ -6687,6 +6688,7 @@ export class Engine {
     env: EvalEnv,
     meter: Meter,
     mask: boolean[],
+    keysOnly = false,
   ): { entries: Entry[]; pages: number; slabs: number } {
     const store = this.lkpStore(tableName);
     if (query === null) return { entries: [], pages: 0, slabs: 0 };
@@ -6784,6 +6786,10 @@ export class Engine {
     let slabs = 0;
     const entries: Entry[] = [];
     for (const key of cand) {
+      if (keysOnly) {
+        entries.push({ key, row: [] });
+        continue;
+      }
       const u = store.getWithUnits(key, mask);
       pages += u.pages;
       slabs += u.slabs;
@@ -6809,6 +6815,7 @@ export class Engine {
     env: EvalEnv,
     meter: Meter,
     mask: boolean[],
+    keysOnly = false,
   ): { entries: Entry[]; pages: number; slabs: number } {
     const store = this.lkpStore(tableName);
     if (query === null) return { entries: [], pages: 0, slabs: 0 };
@@ -6855,6 +6862,10 @@ export class Engine {
     let slabs = 0;
     const entries: Entry[] = [];
     for (const key of deduped) {
+      if (keysOnly) {
+        entries.push({ key, row: [] });
+        continue;
+      }
       const u = store.getWithUnits(key, mask);
       pages += u.pages;
       slabs += u.slabs;
@@ -11329,17 +11340,9 @@ export class Engine {
   // of the old runSelect: materialize, nested-loop join, WHERE, then aggregate / DISTINCT / window
   // + project. The per-row evaluator gets an EvalEnv carrying the outer rows + a runSubquery
   // callback, so a correlated subquery in any clause re-executes against them (grammar.md §26).
-  // execStreamingScan executes the streaming primary-key-ordered scan path (spec/design/cost.md §3):
-  // a single-table, no-blocking-operator query whose output order is already the table's primary-key
-  // scan order — either no ORDER BY (the LIMIT short-circuit) or an ORDER BY satisfied by PK order
-  // (plan.phys.pkOrdered, set by orderSatisfiedByPK) — streams scan→filter→project with NO sort, and (when
-  // there is a LIMIT) stops the scan the instant the LIMIT/OFFSET window is filled, charging
-  // storageRowRead only for the rows actually read. With no LIMIT it emits every survivor after
-  // OFFSET (the sort is simply elided — same rows, same cost as the eager/sort path).
-  // Cost-equivalent to the eager path EXCEPT that a LIMIT reads (and filters) fewer rows — the
-  // deliberate cost change. pageRead is the full block (the bound's node count); only the row reads
-  // short-circuit. Rows match the eager path exactly: the offset..offset+limit slice of the
-  // primary-key-ordered filtered rows (which, for a pkOrdered query, IS the ORDER BY's result).
+  // execStreamingScan executes the bounded streaming scan path (spec/design/cost.md §3): PK and
+  // compatible ordered-index intervals stop at the LIMIT/OFFSET window; GIN/GiST complete their
+  // candidate gather, then stop table point-lookups there. Only started interval blocks are charged.
   // snapshotEngine builds a frozen read-snapshot Engine for a streaming cursor (spec/design/streaming.md
   // §5): the VISIBLE main / session-temp snapshots captured (the snapshots are immutable
   // copy-on-write, so sharing the references pins the roots and keeps them stable for the cursor's life,
@@ -11443,9 +11446,9 @@ export class Engine {
     return this.buildScanRows(sp, bound, subqueryCost.value);
   }
 
-  // buildScanRows classifies a resolved plan (already folded + params bound) as streaming or buffered
-  // and builds the matching lazy cursor. The streaming branch resolves the PK scan bound + the up-front
-  // cost block (S3); the buffered branch runs its blocking part lazily on the first pull (S4). sp is
+  // buildScanRows classifies a resolved plan as direct-pull or buffered. The direct branch handles
+  // full/contiguous-PK scans; generalized bounded streams run through the buffered cursor on first
+  // pull. sp is
   // shared with a prepared statement's plan cache — a cache hit hands the SAME plan object here without
   // re-planning. Under full drain the rows + total cost are byte-identical to the eager path.
   buildScanRows(
@@ -11453,7 +11456,7 @@ export class Engine {
     bound: Value[],
     subqueryCost: bigint,
   ): { columnNames: string[]; columnTypes: string[]; cursor: Cursor } {
-    if (streamingScanEligible(sp)) {
+    if (pullStreamingScanEligible(sp)) {
       // Resolve the scan bound (the PK pushdown, if any) and the up-front cost block. An empty bound
       // (e.g. pk = NULL) admits no row.
       let keyB: KeyBound = unboundedBound();
@@ -11642,26 +11645,6 @@ export class Engine {
     params: Value[],
   ): SelectResult {
     const store = this.lkpStoreScoped(plan.rels[0]!.db, plan.rels[0]!.tableName);
-
-    // Resolve the scan bound (the PK pushdown, if any) and charge the pageRead block. This path is
-    // single-table (gated below), so the only relation is relBounds[0]. A correlated bound resolves
-    // against env.outer (the enclosing rows).
-    // An INDEX bound never streams — the dispatch gate routes it to the eager path
-    // (cost.md §3 "LIMIT short-circuit").
-    let bound: KeyBound = unboundedBound();
-    let empty = false;
-    const sb = plan.phys.relBounds[0]!;
-    if (sb !== null) {
-      if (sb.kind !== "pk") throw new Error("the streaming path is gated to PK/full scans");
-      const b = buildKeyBound(sb.pk, params, env.outer, []);
-      if (b === null) empty = true;
-      else bound = b;
-    }
-    const su = empty ? { pages: 0, slabs: 0 } : store.overlapScanUnits(bound, plan.relMasks[0]!);
-    meter.charge(COSTS.pageRead * BigInt(su.pages) + COSTS.valueDecompress * BigInt(su.slabs));
-
-    // limit is optional here: a pkOrdered query may have no LIMIT (it streams every survivor in
-    // order, eliding the sort), while the LIMIT short-circuit always has one.
     const limit = plan.limit;
     const offset = plan.offset ?? 0n;
     const out: Value[][] = [];
@@ -11671,11 +11654,9 @@ export class Engine {
     // elided; the projection is charged per scanned filtered row (the §3 asymmetry).
     const distinct = plan.distinct;
     const seen = new Set<string>();
-    // Skip the scan entirely for LIMIT 0 (no window to fill).
-    if (!empty && limit !== 0n) {
-      let passed = 0n;
-      const visit = (_key: Uint8Array, rawRow: Row): boolean => {
-        meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
+    let passed = 0n;
+    const processRow = (rawRow: Row, guarded: boolean): boolean => {
+        if (!guarded) meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
         meter.charge(COSTS.storageRowRead);
         // Materialize the touched columns if the lazy load left them unfetched
         // (large-values.md §14) — a fresh copy only when needed (resolveColumns).
@@ -11703,11 +11684,141 @@ export class Engine {
         // Stop once a LIMIT window is filled; with no LIMIT, never stop early (emit every survivor
         // after OFFSET, in primary-key scan order).
         return limit === null ? true : BigInt(out.length) < limit;
-      };
-      // A pkReverse plan (ORDER BY the full PK all-DESC) walks the tree backward; everything else
-      // (forward pkOrdered, or the no-ORDER-BY LIMIT short-circuit) walks forward.
-      if (plan.phys.pkReverse) store.scanRangeRev(bound, visit);
+    };
+    const canPull = limit !== 0n;
+    const scanTable = (bound: KeyBound, reverse: boolean): boolean => {
+      const su = store.overlapScanUnits(bound, plan.relMasks[0]!);
+      meter.charge(COSTS.pageRead * BigInt(su.pages) + COSTS.valueDecompress * BigInt(su.slabs));
+      if (!canPull) return false;
+      let more = true;
+      const visit = (_key: Uint8Array, row: Row): boolean => (more = processRow(row, false));
+      if (reverse) store.scanRangeRev(bound, visit);
       else store.scanRange(bound, visit);
+      return more;
+    };
+    const rowKeyFromIndex = (
+      entryKey: Uint8Array,
+      prefixLen: number,
+      suffix: ScalarType[],
+    ): Uint8Array => {
+      let at = prefixLen;
+      for (const ty of suffix) at += entryKey[at] === 0x01 ? 1 : 1 + widthBytes(ty);
+      return entryKey.slice(at);
+    };
+    const scanIndex = (
+      nameKey: string,
+      bound: KeyBound,
+      prefixLen: number,
+      suffix: ScalarType[],
+    ): boolean => {
+      const istore = this.lkpIndexStore(nameKey);
+      const su = istore.overlapScanUnits(bound, []);
+      meter.charge(COSTS.pageRead * BigInt(su.pages) + COSTS.valueDecompress * BigInt(su.slabs));
+      if (!canPull) return false;
+      let more = true;
+      istore.scanRange(bound, (entryKey) => {
+        meter.guard();
+        const rowKey = rowKeyFromIndex(entryKey, prefixLen, suffix);
+        const u = store.getWithUnits(rowKey, plan.relMasks[0]!);
+        if (u.row === undefined) throw new Error("an index entry references a stored row");
+        meter.charge(COSTS.pageRead * BigInt(u.pages) + COSTS.valueDecompress * BigInt(u.slabs));
+        more = processRow(u.row, true);
+        return more;
+      });
+      return more;
+    };
+
+    const sb = plan.phys.relBounds[0]!;
+    if (sb === null) {
+      scanTable(unboundedBound(), plan.phys.pkReverse);
+    } else if (sb.kind === "pk") {
+      const bound = buildKeyBound(sb.pk, params, env.outer, []);
+      if (bound !== null) scanTable(bound, plan.phys.pkReverse);
+    } else if (sb.kind === "pkSet") {
+      if (canPull) {
+        const intervals = canonicalIntervalSet(
+          sb.pkSet.pkType,
+          sb.pkSet.specs,
+          sb.pkSet.clip,
+          params,
+          env.outer,
+          sb.pkSet.coll,
+          [],
+        );
+        if (plan.phys.pkReverse) intervals.reverse();
+        for (const bound of intervals) {
+          if (!scanTable(bound, plan.phys.pkReverse)) break;
+        }
+      }
+    } else if (sb.kind === "index") {
+      const built = buildIndexBound(sb.index, params, env.outer, []);
+      if (built !== null)
+        scanIndex(sb.index.nameKey, built.bound, built.prefixLen, sb.index.suffixTypes);
+    } else if (sb.kind === "indexSet") {
+      if (canPull) {
+        const ks = sb.indexSet;
+        for (const logical of canonicalIntervalSet(
+          ks.colType,
+          ks.specs,
+          ks.clip,
+          params,
+          env.outer,
+          ks.coll,
+          [],
+        )) {
+          const physical = indexLogicalInterval(logical);
+          const point =
+            logical.lo !== null &&
+            logical.hi !== null &&
+            logical.loInc &&
+            logical.hiInc &&
+            bytesEq(logical.lo, logical.hi);
+          const suffix = point ? ks.tailTypes : [ks.colType, ...ks.tailTypes];
+          const prefixLen = point ? 1 + logical.lo!.length : 0;
+          if (!scanIndex(ks.nameKey, physical, prefixLen, suffix)) break;
+        }
+      }
+    } else if (sb.kind === "gin" || sb.kind === "gist") {
+      const gathered =
+        sb.kind === "gin"
+          ? this.ginBoundRows(
+              plan.rels[0]!.tableName,
+              sb.gin,
+              plan.filter === null ? null : (ginMatch(plan.filter, sb.gin.colGlobal)?.query ?? null),
+              env,
+              meter,
+              plan.relMasks[0]!,
+              true,
+            )
+          : this.gistBoundRows(
+              plan.rels[0]!.tableName,
+              sb.gist,
+              plan.filter === null ? null : gistQueryOperand(plan.filter, sb.gist),
+              env,
+              meter,
+              plan.relMasks[0]!,
+              true,
+            );
+      meter.charge(
+        COSTS.pageRead * BigInt(gathered.pages) +
+          COSTS.valueDecompress * BigInt(gathered.slabs),
+      );
+      const entries = plan.phys.pkReverse ? gathered.entries.reverse() : gathered.entries;
+      if (canPull) {
+        for (const candidate of entries) {
+          meter.guard();
+          let row = candidate.row;
+          if (row.length === 0) {
+            const u = store.getWithUnits(candidate.key, plan.relMasks[0]!);
+            if (u.row === undefined) throw new Error("an opclass entry references a stored row");
+            meter.charge(
+              COSTS.pageRead * BigInt(u.pages) + COSTS.valueDecompress * BigInt(u.slabs),
+            );
+            row = u.row;
+          }
+          if (!processRow(row, true)) break;
+        }
+      }
     }
     return {
       columnNames: plan.columnNames,
@@ -12666,22 +12777,16 @@ export class Engine {
       return this.execVectorizedAgg(plan, env, meter, params);
     }
 
-    // Streaming primary-key-ordered scan (spec/design/cost.md §3): a single-table query with no
-    // blocking operator beyond an ORDER BY the scan already satisfies — either no ORDER BY with a
-    // LIMIT (the LIMIT short-circuit), or an ORDER BY satisfied by the table's primary-key scan order
-    // (plan.phys.pkOrdered) — streams scan→filter→project with NO sort, and with a LIMIT STOPS the scan
-    // once the window is filled, so storageRowRead counts only the rows actually read. A pkOrdered
-    // DISTINCT streams too: the dedup runs in scan order (the sort elided), so it short-circuits a
-    // top-N like the non-DISTINCT case. A non-PK-ordered ORDER BY, a no-ORDER-BY DISTINCT, aggregate,
-    // or join must see every row, so it keeps the eager path below. pageRead stays the full block.
+    // Bounded streaming scan (spec/design/cost.md §3): a single-table query whose chosen access path
+    // supplies its observable order stops row fetch/filter/project work at the LIMIT window. GIN/GiST
+    // candidate gathering remains complete.
     if (streamingScanEligible(plan)) {
       return finalEmitter(this.execStreamingScan(plan, env, meter, params).rows);
     }
 
-    // Streaming secondary-index-order scan (cost.md §3 "secondary-index order"): the planner set
-    // indexOrder only for a single-table, non-aggregate/window/DISTINCT, no-bound, LIMITed query
-    // whose ORDER BY a B-tree index satisfies (and the PK scan does not). Walk the index +
-    // point-lookup; the eager sort is elided.
+    // Streaming secondary-index-order scan (cost.md §3 "secondary-index order"): compatible bounded
+    // plans were caught above, so this fallback handles the no-bound LIMIT shape. Walk the ordering
+    // index + point-lookup; the eager sort is elided.
     if (plan.phys.indexOrder !== null) {
       return finalEmitter(this.execIndexOrderScan(plan, plan.phys.indexOrder, env, meter).rows);
     }
@@ -12690,8 +12795,8 @@ export class Engine {
     // non-DISTINCT query with an ORDER BY the scan does NOT already satisfy (!plan.phys.pkOrdered — caught
     // above) streams scan→filter→sorter, so the input is never materialized in the executor heap and
     // the sort spills sorted runs to disk under workMem (file-backed databases). DISTINCT/aggregate/
-    // join take the eager path below, and an index bound does not stream (like the LIMIT
-    // short-circuit). Results + cost are identical to the eager sort (the sort is unmetered —
+    // join take the eager path below, and an incompatible index bound does not stream through this
+    // sorter. Results + cost are identical to the eager sort (the sort is unmetered —
     // cost.md §3; spill.md §6).
     if (
       plan.order.length > 0 &&

@@ -20,7 +20,7 @@
 # charge no collate (deterministic-collation equality is byte-identity, §7). The drop is the
 # CROSS-CORE contract (Rust == Go == TS) — a full scan of each query would cost strictly more.
 #
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.point_lookup, query.limit, query.order_by_pk_scan, expr.collate, ddl.collate_column, ddl.secondary_index, types.i32, types.text, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.order_by, query.order_by_keys, query.point_lookup, query.index_range, query.limit, query.order_by_pk_scan, query.order_by_index_scan, query.bounded_limit_streaming, expr.collate, ddl.collate_column, ddl.secondary_index, types.i32, types.text, resource.cost_metering
 
 # load-collation: unicode = collation/17.0.0/root.allkeys
 
@@ -87,6 +87,26 @@ SELECT id FROM ci WHERE name = 'A'
 query I nosort
 SELECT id FROM ci WHERE name = 'q'
 ----
+
+# A variable-width collated equality prefix plus a fixed-width trailing range can compose with ORDER
+# BY over that exact multi-column index. Equality needs no collate units; rank order supplies the
+# within-name order. Cost: index page(1) + two table lookup pages + two storage reads + six predicate
+# evaluations + two produced = 13.
+statement ok
+CREATE TABLE cim (id i32 PRIMARY KEY, name text COLLATE "unicode", rank i32)
+
+statement ok
+CREATE INDEX cim_name_rank ON cim (name, rank)
+
+statement ok
+INSERT INTO cim VALUES (1, 'A', 3), (2, 'A', 1), (3, 'A', 2), (4, 'b', 2)
+
+# cost: 13
+query I nosort
+SELECT id FROM cim WHERE name = 'A' AND rank >= 2 ORDER BY name, rank LIMIT 2
+----
+3
+1
 
 # --- Collated ORDER BY satisfied by the collated PK scan order (the collation payoff) -----------
 #

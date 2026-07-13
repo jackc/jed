@@ -186,8 +186,14 @@ It accelerates the two array set operators, array membership, and exact equality
 The original `WHERE` stays as the residual filter, so the answer is identical to the full-scan
 answer — the index is transparent. The same bound applies to **`UPDATE` and `DELETE`**: a mutation
 whose `WHERE` is GIN-accelerable narrows its target-row scan through the index too, so the rows it
-rewrites or removes are exactly the full-scan set (only faster). Containment (`intro` and `gin` both
-hold `{10, 20}`):
+rewrites or removes are exactly the full-scan set (only faster).
+
+For a bounded `SELECT ... LIMIT`, jed completes the posting-list gather, then fetches and rechecks
+candidate table rows only until the requested window is full. With an ordered B-tree bound, it can
+stop the index walk itself at the same point. A matching `ORDER BY` keeps this bounded path; an
+incompatible order still consumes and sorts the complete candidate set.
+
+Containment (`intro` and `gin` both hold `{10, 20}`):
 
 <LiveSql seed={ginSeed} query={containsQuery} rows={6} />
 

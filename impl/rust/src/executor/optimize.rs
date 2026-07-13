@@ -124,7 +124,7 @@ impl Engine {
     /// a LIMIT, walk that index in key order and point-look-up each row — a top-N that avoids the
     /// blocking sort (and, for a collated index, the collate units). Gated to a LIMIT because
     /// without one the index walk + N point lookups costs more than a full scan + sort. A WHERE
-    /// pushdown bound (combining the two) is a follow-on, so it requires no rel bound. Mutually
+    /// pushdown bound may combine only when it walks that same index in the same order. Mutually
     /// exclusive with `pk_ordered`.
     fn rule_order_by_index_scan(&self, plan: &mut SelectPlan, scope: &Scope<'_>) {
         plan.phys.index_order = if !plan.is_agg
@@ -138,12 +138,12 @@ impl Engine {
             && plan.rels[0].srf.is_none()
             && plan.rels[0].cte.is_none()
             && plan.rels[0].derived.is_none()
-            && plan.phys.rel_bounds[0].is_none()
             // A host-attached relation full-scans this slice (attached-databases.md §8): the
             // index-order exec resolves its index store UNSCOPED, so gate it off (perf follow-on).
             && !scope.rels[0].is_attachment()
         {
             order_satisfied_by_index(scope.rels[0].table, plan.rels[0].offset, &plan.order, self)
+                .filter(|io| index_order_compatible_bound(io, plan.phys.rel_bounds[0].as_ref()))
         } else {
             None
         };

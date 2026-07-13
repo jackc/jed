@@ -69,8 +69,8 @@ SELECT id, v FROM t WHERE id = 7 AND v = 2
 7
 2
 
-# LIMIT does not stream over an index bound (the eager path reads the full admitted
-# set; only row_produced drops): 17 - 3 = 14
+# ORDER BY id is incompatible with the v-index order, so the blocking path reads the
+# full admitted set; only row_produced drops: 17 - 3 = 14
 # cost: 14
 query I nosort
 SELECT id FROM t WHERE v = 3 ORDER BY id LIMIT 1

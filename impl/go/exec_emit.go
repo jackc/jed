@@ -203,16 +203,10 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 		}
 	}
 
-	// Streaming primary-key-ordered scan (spec/design/cost.md §3): a single-table query with no
-	// blocking operator beyond an ORDER BY the scan already satisfies — either no ORDER BY with a
-	// LIMIT (the LIMIT short-circuit), or an ORDER BY satisfied by the table's primary-key scan order
-	// (plan.pkOrdered) — streams scan→filter→project with NO sort, and with a LIMIT STOPS the scan
-	// once the window is filled, so storage_row_read counts only the rows actually read (a genuine
-	// early-out, not a post-hoc truncation). A non-PK-ordered ORDER BY, DISTINCT, aggregate, or join
-	// must see every row, so it keeps the sort/eager path below. page_read stays the full block (the
-	// bound's node count); only row reads short-circuit.
-	// An index-bounded scan does not stream (cost.md §3 "index-bounded scan"): it reads
-	// the full admitted set via the eager path below.
+	// Bounded streaming scan (spec/design/cost.md §3): a single-table query whose chosen access path
+	// supplies its observable order stops row fetch/filter/project work at the LIMIT window. This
+	// covers PK and compatible ordered-index intervals plus GIN/GiST candidate sets (whose gather
+	// remains complete).
 	// A set-returning relation is generated, not scanned — it takes the eager path
 	// (functions.md §10); the streaming reader assumes a table store.
 	// A pkOrdered DISTINCT streams too: the dedup runs in scan order (the sort elided), so it
@@ -225,10 +219,9 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 		return emitter{final: res.rows, mode: emitFinal}, nil
 	}
 
-	// Streaming secondary-index-order scan (cost.md §3 "secondary-index order"): the planner set
-	// indexOrder only for a single-table, non-aggregate/window/DISTINCT, no-bound, LIMITed query
-	// whose ORDER BY a B-tree index satisfies (and the PK scan does not). Walk the index +
-	// point-lookup; the eager sort is elided.
+	// Streaming secondary-index-order scan (cost.md §3 "secondary-index order"): compatible bounded
+	// plans were caught above, so this fallback handles the no-bound LIMIT shape. Walk the ordering
+	// index + point-lookup; the eager sort is elided.
 	if plan.phys.indexOrder != nil {
 		res, err := db.execIndexOrderScan(plan, plan.phys.indexOrder, env, meter)
 		if err != nil {
@@ -241,8 +234,8 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 	// non-DISTINCT query with an ORDER BY the scan does NOT already satisfy (!plan.pkOrdered — caught
 	// above) streams scan→filter→sorter, so the input is never materialized in the executor heap and
 	// the sort spills sorted runs to disk under workMem (file-backed databases). DISTINCT/aggregate/
-	// join take the eager path below, and an index bound does not stream (like the LIMIT
-	// short-circuit). Results + cost are identical to the eager sort (the sort is unmetered —
+	// join take the eager path below, and an incompatible index bound does not stream through this
+	// sorter. Results + cost are identical to the eager sort (the sort is unmetered —
 	// cost.md §3; spill.md §6).
 	if len(plan.order) > 0 && !plan.phys.pkOrdered && len(plan.orderExprs) == 0 && len(plan.rels) == 1 && len(plan.joins) == 0 &&
 		!plan.isAgg && !plan.hasWindow && !plan.distinct &&
