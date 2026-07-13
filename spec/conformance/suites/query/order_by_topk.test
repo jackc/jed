@@ -1,0 +1,111 @@
+# Bounded top-k for blocking ORDER BY ... LIMIT (planner.md §4, spill.md §5). The rule retains
+# K=OFFSET+LIMIT rows with the exact ORDER BY comparator and input position as stable tie-break.
+# Sort/heap bookkeeping is unmetered: every cost below is the former full-sort cost.
+# requires: ddl.create_table, ddl.primary_key, dml.insert_multi_row, query.select, query.order_by, query.order_by_keys, query.order_by_expr, query.order_by_topk, query.limit, query.offset, query.join_inner, expr.arithmetic, expr.collate, types.i32, types.text, error.division_by_zero, resource.cost_metering
+
+# load-collation: unicode = collation/17.0.0/root.allkeys
+
+statement ok
+CREATE TABLE tk (id i32 PRIMARY KEY, a i32, b i32, s text)
+
+statement ok
+INSERT INTO tk VALUES
+  (1, 10, 5, 'z'),
+  (2, 10, NULL, 'A'),
+  (3, 20, 7, 'ä'),
+  (4, 10, 5, 'a'),
+  (5, NULL, 9, 'b'),
+  (6, 30, 1, 'a'),
+  (7, 20, 7, 'ñ'),
+  (8, NULL, NULL, 'n')
+
+# Mixed direction, default NULL placement, and OFFSET. DESC puts NULL a first; tied (a,b) rows keep
+# PK input order.
+# Cost = page_read 1 + eight storage reads + three produced rows.
+# names: id
+# cost: 12
+query I nosort
+SELECT id FROM tk ORDER BY a DESC, b ASC LIMIT 3 OFFSET 2
+----
+6
+3
+7
+
+# Explicit NULL placement and full ties. NULL a leads; within it b DESC NULLS LAST puts id5 first.
+# names: id
+# cost: 12
+query I nosort
+SELECT id FROM tk ORDER BY a ASC NULLS FIRST, b DESC NULLS LAST, id LIMIT 3
+----
+5
+8
+1
+
+# K >= cardinality is the full stable order, then the ordinary OFFSET window applies.
+# names: id
+# cost: 16
+query I nosort
+SELECT id FROM tk ORDER BY a, id LIMIT 20 OFFSET 1
+----
+2
+4
+3
+7
+6
+5
+8
+
+# A large OFFSET retains every input row but returns an empty window without integer truncation.
+# names: id
+# cost: 9
+query I nosort
+SELECT id FROM tk ORDER BY a DESC LIMIT 2 OFFSET 100
+----
+
+# Expression keys are evaluated for every post-filter row before top-k reduction. `a + b` is one
+# operator_eval per row; NULL results sort last. Cost = 1 + 8 reads + 8 evals + 3 produced.
+# names: id
+# cost: 20
+query I nosort
+SELECT id FROM tk ORDER BY a + b, id DESC LIMIT 3
+----
+4
+1
+7
+
+# Collated keys build every UCA decoration before selection. unicode orders a < A < ä < b < n < ñ < z.
+# names: id
+# cost: 12
+query I nosort
+SELECT id FROM tk ORDER BY s COLLATE "unicode", id LIMIT 3
+----
+4
+6
+2
+
+# A blocking join sort uses the same pre-sort row sequence. The extra inner key prevents the outer-PK
+# sort-elision rule, and stable ties follow nested-loop input order.
+statement ok
+CREATE TABLE tku (id i32 PRIMARY KEY, tid i32, score i32)
+
+statement ok
+INSERT INTO tku VALUES (1, 1, 5), (2, 1, 5), (3, 3, 9), (4, 3, 1), (5, 6, 7)
+
+# names: tid, uid
+query II nosort
+SELECT tk.id AS tid, tku.id AS uid
+FROM tk JOIN tku ON tku.tid = tk.id
+ORDER BY tku.score DESC, tk.id, tku.id
+LIMIT 3
+----
+3
+3
+6
+5
+1
+1
+
+# LIMIT 0 does not suppress a trapping ORDER expression: all order values are still evaluated at
+# the former pre-sort point, and the first row raises the same error.
+statement error 22012
+SELECT id FROM tk ORDER BY 1 / (id - id) LIMIT 0

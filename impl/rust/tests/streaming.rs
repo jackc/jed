@@ -541,6 +541,29 @@ fn sorted_spill_merge_streams_lazily() {
     let sql = "SELECT id, k FROM t ORDER BY k, id";
     let (er, ec) = eager(&mut db.session(SessionOptions::default()), sql);
 
+    // K=5 fits the shared fixed-row estimate under 512 bytes (5 × (8 + 2×40) = 440), so the
+    // blocking first pull owns no spill run. At 128 bytes the rule falls back to the existing
+    // external sorter, whose undrained merge keeps runs live until drop.
+    {
+        let mut s = db.session(SessionOptions::default());
+        s.set_work_mem(512);
+        let mut rows = s.query(&format!("{sql} LIMIT 5"), &[]).unwrap();
+        assert!(rows.next().is_some());
+        assert_eq!(count_spill_files(), 0, "fitting top-k creates no run");
+    }
+    {
+        let mut s = db.session(SessionOptions::default());
+        s.set_work_mem(128);
+        let mut rows = s.query(&format!("{sql} LIMIT 5"), &[]).unwrap();
+        assert!(rows.next().is_some());
+        assert!(
+            count_spill_files() > 0,
+            "top-k over work_mem falls back to external sort"
+        );
+        drop(rows);
+    }
+    assert_eq!(count_spill_files(), 0, "fallback drop cleans its runs");
+
     // Full lazy drain under a tiny work_mem (forces spill + merge): rows + cost match the oracle.
     {
         let mut s = db.session(SessionOptions::default());

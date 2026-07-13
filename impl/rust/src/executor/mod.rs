@@ -4364,6 +4364,9 @@ pub(crate) struct PhysicalPlan {
     /// output is already in order — the sort is elided and a `LIMIT` short-circuits the loop. Set only
     /// for exactly two non-lateral base relations, a `LIMIT`, and a forward outer-PK `ORDER BY`.
     join_pk_ordered: bool,
+    /// `K = OFFSET + LIMIT` for a blocking plain-SELECT sort. `None` means the rule did not fire
+    /// (or K overflowed), so the ordinary full sort remains authoritative.
+    top_k: Option<i64>,
     /// Scan-bound pushdown, **one entry per relation** in `rels`: the WHERE conjuncts that
     /// bound that relation's scan — a primary-key range, or (when no PK bound applies) a
     /// secondary-index equality (cost.md §3 "bounded scan" / "index-bounded scan"). `None` ⇒

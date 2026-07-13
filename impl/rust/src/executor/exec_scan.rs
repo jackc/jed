@@ -634,6 +634,7 @@ impl Engine {
         let mut e = Engine::from_snapshot(self.read_snap().clone());
         e.page_size = self.page_size;
         e.paging = self.paging.clone();
+        e.path = self.path.clone();
         e.read_only = self.read_only;
         let src = &self.session;
         let dst = &mut e.session;
@@ -1104,8 +1105,12 @@ impl Engine {
                     Ok(true)
                 })?;
             }
-            sort_rows(&mut rows, &plan.order)?;
             let total = rows.len() as i64;
+            if let Some(k) = plan.phys.top_k {
+                rows = top_k_rows(rows, &plan.order, k)?;
+            } else {
+                sort_rows(&mut rows, &plan.order)?;
+            }
             (total, crate::spill::SortedRows::InMemory(rows.into_iter()))
         } else {
             // Stream the scan → filter → sorter. ORDER BY is blocking, so the scan never
@@ -1113,7 +1118,14 @@ impl Engine {
             // columns resolved (large-values.md §14), the WHERE applied (charging operator_eval), and
             // a survivor pushed into the sorter, which spills when it exceeds the budget. Only
             // surviving rows are cloned.
-            let mut sorter = self.new_sorter(&plan.order);
+            let use_top_k = plan
+                .phys
+                .top_k
+                .is_some_and(|k| self.streaming_top_k_fits(plan, k));
+            let mut keeper =
+                use_top_k.then(|| TopKKeeper::new(plan.phys.top_k.unwrap(), &plan.order, false));
+            let mut sorter = (!use_top_k).then(|| self.new_sorter(&plan.order));
+            let mut total = 0i64;
             if !empty {
                 // Read-only SELECT feed: reconstruct only the touched columns (Track A1).
                 store.scan_range(&bound, &mut |_key, row| {
@@ -1132,13 +1144,28 @@ impl Engine {
                         None => true,
                     };
                     if keep {
-                        sorter.push(resolved.unwrap_or_else(|| row.clone()))?;
+                        total += 1;
+                        let mut owned = resolved.unwrap_or_else(|| row.clone());
+                        if let Some(k) = &mut keeper {
+                            for (value, touched) in owned.iter_mut().zip(&plan.rel_masks[0]) {
+                                if !*touched {
+                                    *value = Value::Null;
+                                }
+                            }
+                            k.push(owned)?;
+                        } else {
+                            sorter.as_mut().unwrap().push(owned)?;
+                        }
                     }
                     Ok(true) // never stop early — the sort must see every row
                 })?;
             }
-            let total = sorter.total() as i64;
-            (total, sorter.finish()?)
+            let sorted = if let Some(k) = keeper {
+                crate::spill::SortedRows::InMemory(k.finish().into_iter())
+            } else {
+                sorter.unwrap().finish()?
+            };
+            (total, sorted)
         };
 
         // LIMIT / OFFSET window over the sort's total row count (known without materializing the
@@ -1158,6 +1185,44 @@ impl Engine {
             sorted,
             remaining: (end - start) as usize,
         })
+    }
+
+    /// Whether a file-backed all-C scan's K fixed-width rows fit the cross-core logical top-k
+    /// work_mem estimate (8 bytes per row + 40 per value). In-memory / unlimited handles always
+    /// use top-k. Untouched slots are nulled in the retained copy; a touched variable/open type has
+    /// no static maximum and keeps the external sorter.
+    fn streaming_top_k_fits(&self, plan: &SelectPlan, k: i64) -> bool {
+        if k == 0 || self.path.is_none() || self.session.work_mem == 0 {
+            return true;
+        }
+        let Some(table) = self.table_scoped(plan.rels[0].db.as_deref(), &plan.rels[0].table_name)
+        else {
+            return false;
+        };
+        if table.columns.iter().enumerate().any(|(i, col)| {
+            if !plan.rel_masks[0][i] {
+                return false;
+            }
+            !matches!(
+                col.ty,
+                Type::Scalar(
+                    ScalarType::Int16
+                        | ScalarType::Int32
+                        | ScalarType::Int64
+                        | ScalarType::Bool
+                        | ScalarType::Uuid
+                        | ScalarType::Timestamp
+                        | ScalarType::Timestamptz
+                        | ScalarType::Float32
+                        | ScalarType::Float64
+                        | ScalarType::Date
+                )
+            )
+        }) {
+            return false;
+        }
+        let row_budget = 8usize.saturating_add(40usize.saturating_mul(table.columns.len()));
+        usize::try_from(k).is_ok_and(|count| count <= self.session.work_mem / row_budget)
     }
 
     /// Streaming two-table INNER/CROSS join whose `ORDER BY` is satisfied by the OUTER (first)
@@ -1256,7 +1321,7 @@ impl Engine {
     /// spill — spill.md §2); spill runs live next to the database file (same filesystem, guaranteed
     /// writable), falling back to the system temp dir.
     pub(crate) fn new_sorter(&self, order: &[crate::spill::SortKey]) -> crate::spill::Sorter {
-        let spill_dir = if self.paging.is_some() {
+        let spill_dir = if self.path.is_some() {
             let dir = self
                 .path
                 .as_ref()

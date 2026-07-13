@@ -95,17 +95,24 @@ import type { Privileges, PrivilegeSet } from "./privileges.ts";
 import type { ClockFunc, RandomFill } from "./seam.ts";
 import type { Value } from "./value.ts";
 
-// databaseFromSnapshot builds an in-memory handle whose committed root is `snap` (the file snapshot)
-// — no file backing. A read handle keeps one with no open transaction (reads hit committed = the
-// pinned snapshot); a write handle keeps one with an open READ WRITE block and publishes its working set.
-function databaseFromSnapshot(snap: Snapshot, pageSize: number): Engine {
+// databaseFromSnapshot builds a session-local handle whose committed root is `snap`. It retains the
+// shared storage identity only for host-backed spill; the snapshot's stores continue to own paging.
+// A read handle keeps no open transaction (reads hit committed = the pinned snapshot); a write handle
+// keeps an open READ WRITE block and publishes its working set.
+function databaseFromSnapshot(snap: Snapshot, core: SharedCore): Engine {
   const db = new Engine();
   db.committed = snap;
   // A minted session MUST serialize/split at the FILE's page size (not the in-memory default), so its
   // stores' cap matches the physical pages persist writes — and so every core builds byte-identical
   // file-backed databases (CLAUDE.md §8). In-memory the core's pageSize is the default, so this is a
   // no-op there.
-  db.pageSize = pageSize;
+  db.pageSize = core.pageSize;
+  // work_mem spill is a host property of the shared storage identity. Minted sessions must retain
+  // its path/sink or a file-backed ORDER BY silently becomes in-memory-only. The snapshot's stores
+  // already carry paging; installing the storage owner's pager here would bypass its page accounting.
+  db.path = core.storage.path;
+  db.spillSink = core.storage.spillSink;
+  db.readOnly = core.readOnly;
   return db;
 }
 
@@ -388,7 +395,7 @@ export class Database {
   readSession(): Session {
     const snap = this.core.committed; // pin (immutable — no clone)
     this.core.register(snap.txid);
-    const engine = databaseFromSnapshot(snap, this.core.pageSize);
+    const engine = databaseFromSnapshot(snap, this.core);
     // The attached roots are pinned together with the committed root (attached-databases.md §5), so the
     // session sees a consistent cross-database snapshot; it routes attachment persists via the core.
     engine.core = this.core;
@@ -413,7 +420,7 @@ export class Database {
     this.core.writerActive = true;
     const base = this.core.committed;
     // committed = the immutable base; beginTx clones it to working.
-    const engine = databaseFromSnapshot(base, this.core.pageSize);
+    const engine = databaseFromSnapshot(base, this.core);
     engine.core = this.core;
     engine.attachedCommitted = this.core.attached; // pin the attached roots together (§5)
     engine.beginTx(true);
@@ -429,7 +436,7 @@ export class Database {
   // independent owns-its-Engine session.)
   session(opts: SessionOptions = {}): Session {
     const snap = this.core.committed;
-    const engine = databaseFromSnapshot(snap, this.core.pageSize);
+    const engine = databaseFromSnapshot(snap, this.core);
     engine.session = new SessionState(opts);
     engine.core = this.core;
     engine.attachedCommitted = this.core.attached; // pin the attached roots together (§5)
@@ -605,7 +612,7 @@ export class Database {
   // detail white-box tests + the in-repo tools reach for (CLAUDE.md §10). ---
 
   private committedEngine(): Engine {
-    return databaseFromSnapshot(this.core.committed, this.core.pageSize);
+    return databaseFromSnapshot(this.core.committed, this.core);
   }
   table(name: string): Table | undefined {
     return this.committedEngine().table(name);

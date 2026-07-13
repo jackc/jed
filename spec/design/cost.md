@@ -788,6 +788,26 @@ capability.
 `query/limit_offset.test` pins the full/PK cases; `query/bounded_limit_streaming.test` pins ordered
 index, interval-set, GIN, GiST, compatible-order, and blocking-order cases cross-core.
 
+### Blocking ORDER BY + LIMIT — bounded top-k, unchanged cost
+
+When an ORDER BY remains blocking but a plain SELECT has a constant LIMIT, the planner records
+`K = OFFSET + LIMIT` (checked in i64; `LIMIT 0` records K=0). The executor retains the best K rows
+with the exact ORDER BY comparator plus input position as a stable tie-break, then sorts only those
+rows. This changes memory and comparison work, not the metered schedule:
+
+- the blocking scan still reads and filters every input row, so `page_read`, `storage_row_read`, and
+  filter/operator costs are unchanged;
+- every expression ORDER BY key and collated sort-key decoration runs at its former pre-sort point,
+  including on LIMIT 0, so trapping errors and their preceding cost are unchanged;
+- only the windowed rows are projected and charged `row_produced`, exactly as before; heap and sort
+  bookkeeping remain unmetered;
+- DISTINCT, aggregate/group, window, set-operation, checked-K-overflow, and file-backed rows whose
+  fixed-width K estimate exceeds `work_mem` keep their full/external sorter.
+
+The capability is `query.order_by_topk`; `query/order_by_topk.test` pins values, errors, and zero
+cost drift, while `query/order_by_topk_explain.test` pins the physical gates. The spill/no-spill
+boundary is an internal per-core unit test because temporary run files are not SQL-observable.
+
 ### ORDER BY satisfied by primary-key order — eliding the sort
 
 An `ORDER BY` is normally a **blocking** operator: the engine must read every row, sort, then window

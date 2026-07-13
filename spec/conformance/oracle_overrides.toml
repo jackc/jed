@@ -11,6 +11,11 @@
 #   sql     the record's SQL, matched after whitespace-normalization
 #   reason  why jed departs from PostgreSQL here
 
+[[override]]
+file = "query/order_by_topk.test"
+sql = "SELECT id FROM tk ORDER BY 1 / (id - id) LIMIT 0"
+reason = "jed preserves its blocking ORDER BY evaluation schedule under LIMIT 0: every fallible ORDER expression is evaluated at the ordinary pre-sort point, so the first row traps 22012. PostgreSQL plans LIMIT 0 as a no-execution node and does not evaluate the sort key. The top-k rule is results/cost neutral relative to jed's pre-rule full-sort lane; changing this established resource/error timing is outside this optimization (cost.md 'Blocking ORDER BY + LIMIT')."
+
 # --- AT TIME ZONE over a legacy alias: jed's starter JTZ bundle (spec/tz/2026a) ships the link
 # US/Eastern -> America/New_York, so a query resolves it. The live postgres:18 oracle in this
 # devcontainer is built against a tzdata set WITHOUT the legacy `US/*` backward-compatibility names

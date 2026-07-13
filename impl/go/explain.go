@@ -281,7 +281,11 @@ func (db *engine) renderSelectPlan(r *explainRender, sp *selectPlan, depth int) 
 		case sp.phys.joinPkOrdered:
 			orderNote = "join pk ordered"
 		default:
-			r.emit(d, "Sort", fmt.Sprintf("keys=%d", len(sp.order)))
+			detail := fmt.Sprintf("keys=%d", len(sp.order))
+			if sp.phys.topK != nil {
+				detail += fmt.Sprintf(", top-k=%d", *sp.phys.topK)
+			}
+			r.emit(d, "Sort", detail)
 			d++
 		}
 	}

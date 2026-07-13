@@ -515,6 +515,37 @@ test("sorted output spilling merge streams lazily", () => {
     const eager = eagerResult(oracle, sql);
     oracle.close();
 
+    // K=5 fits the shared fixed-row estimate under 512 bytes (5 × (8 + 2×40) = 440), so the
+    // blocking first pull owns no spill run. At 128 bytes the rule falls back to the existing
+    // external sorter, whose undrained merge keeps runs live until close.
+    const fit = db.session();
+    fit.setWorkMem(512);
+    const fitCursor = fit.query(`${sql} LIMIT 5`);
+    assert.equal(fitCursor[Symbol.iterator]().next().done, false);
+    assert.equal(
+      readdirSync(dir).filter((n) => n.startsWith("jed-spill-")).length,
+      0,
+      "fitting top-k creates no run",
+    );
+    fitCursor.close();
+    fit.close();
+
+    const fallback = db.session();
+    fallback.setWorkMem(128);
+    const fallbackCursor = fallback.query(`${sql} LIMIT 5`);
+    assert.equal(fallbackCursor[Symbol.iterator]().next().done, false);
+    assert.ok(
+      readdirSync(dir).some((n) => n.startsWith("jed-spill-")),
+      "top-k over workMem falls back to external sort",
+    );
+    fallbackCursor.close();
+    fallback.close();
+    assert.equal(
+      readdirSync(dir).filter((n) => n.startsWith("jed-spill-")).length,
+      0,
+      "fallback close cleans its runs",
+    );
+
     // Full lazy drain under a tiny workMem (forces spill + merge): rows + cost match the oracle.
     const s = db.session();
     s.setWorkMem(128); // ~2-3 rows per run → dozens of runs + a deep merge

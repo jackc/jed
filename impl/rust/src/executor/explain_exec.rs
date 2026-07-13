@@ -327,7 +327,11 @@ impl Engine {
             } else if sp.phys.join_pk_ordered {
                 order_note = "join pk ordered".to_string();
             } else {
-                r.emit(d, "Sort", format!("keys={}", sp.order.len()));
+                let mut detail = format!("keys={}", sp.order.len());
+                if let Some(k) = sp.phys.top_k {
+                    detail.push_str(&format!(", top-k={k}"));
+                }
+                r.emit(d, "Sort", detail);
                 d += 1;
             }
         }

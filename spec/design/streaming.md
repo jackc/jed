@@ -384,6 +384,12 @@ independently — the P6.4 precedent):
   last `exec_select_emit`-path output-laziness follow-on — **prepared-statement streaming landed in S8
   (below)**, and the bare-handle `Database::query` watermark follow-on has since been resolved by
   construction (see the closing note after S8).
+  A later results-identical refinement now feeds eligible blocking `ORDER BY ... LIMIT` scans into a
+  bounded stable top-k heap before this emitter is built. The blocking scan/filter still completes;
+  only K rows enter the in-memory `SortedRows`. If fixed-width K exceeds `work_mem`, the same external
+  sorter/merge emitter remains in force. Minted shared sessions and their frozen cursor engines carry
+  the core storage path/spill host identity, so file-backed fallback remains available through
+  both `execute()` and `query()`; in-memory cores remain no-spill by their absent path.
 - **S8 — prepared-statement streaming.** ✅ **Landed (all three cores).** A **prepared** query
   (`prepare` + `query_prepared` / `QueryValues` / `PreparedStatement.query`) used to **materialize** —
   it ran the eager `execute`/`dispatch` path and wrapped the resulting `Outcome` in a buffered `Rows`,

@@ -1150,20 +1150,9 @@ func sortRowsCollated[R ~[]Value](rows []R, order []orderSlot) error {
 	}
 	d := make([]deco, len(rows))
 	for i, row := range rows {
-		var keys [][]byte
-		for _, k := range order {
-			if k.collation == nil {
-				continue
-			}
-			if row[k.idx].Kind == ValText {
-				sk, err := sortKey(k.collation, row[k.idx].str())
-				if err != nil {
-					return err
-				}
-				keys = append(keys, sk)
-			} else {
-				keys = append(keys, nil) // NULL (a collated slot is text) — handled by NULL placement
-			}
+		keys, err := collationKeysForRow(row, order)
+		if err != nil {
+			return err
 		}
 		d[i] = deco{keys: keys, row: row}
 	}
@@ -1174,6 +1163,27 @@ func sortRowsCollated[R ~[]Value](rows []R, order []orderSlot) error {
 		rows[i] = d[i].row
 	}
 	return nil
+}
+
+// collationKeysForRow decorates one row with its collated ORDER BY keys. Keeping this as the
+// single row-level primitive makes full sort and bounded top-k fail at the same input row.
+func collationKeysForRow[R ~[]Value](row R, order []orderSlot) ([][]byte, error) {
+	var keys [][]byte
+	for _, k := range order {
+		if k.collation == nil {
+			continue
+		}
+		if row[k.idx].Kind == ValText {
+			sk, err := sortKey(k.collation, row[k.idx].str())
+			if err != nil {
+				return nil, err
+			}
+			keys = append(keys, sk)
+		} else {
+			keys = append(keys, nil) // NULL (a collated slot is text) — handled by NULL placement
+		}
+	}
+	return keys, nil
 }
 
 // cmpDecorated compares two decorated rows (precomputed collated-key bytes + the row) by the ORDER BY

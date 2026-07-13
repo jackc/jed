@@ -16,7 +16,7 @@ INSERT INTO city VALUES
 CREATE TABLE trip (id i32 PRIMARY KEY, city_id i32 NOT NULL);
 INSERT INTO trip VALUES (1, 3), (2, 1), (3, 3);`;
 
-	const fullScan = `EXPLAIN SELECT name FROM city ORDER BY name;`;
+	const fullScan = `EXPLAIN SELECT name FROM city ORDER BY name LIMIT 2;`;
 	const pkBound = `EXPLAIN SELECT name FROM city WHERE id = 3;`;
 	const indexBound = `EXPLAIN SELECT name FROM city WHERE region = 1;`;
 	const indexRange = `EXPLAIN SELECT name FROM city WHERE region > 1;`;
@@ -37,7 +37,7 @@ FROM city GROUP BY region;`;
 
 `EXPLAIN` shows **how** jed will run a statement — which access path the planner chose (a full scan,
 a primary-key lookup, a secondary-index bound), how joins are shaped, and whether an `ORDER BY` is
-served by scan order or needs a sort. It renders the plan as an ordinary result set with three
+served by scan order, a bounded top-k heap, or a full sort. It renders the plan as an ordinary result set with three
 columns:
 
 - **`depth`** — the plan node's nesting level (0 = the top of the pipeline). The rows are a
@@ -48,10 +48,11 @@ columns:
 The plan is a **deterministic** function of the query and the database, so every jed core renders
 the identical plan.
 
-## A full scan
+## A blocking sort and bounded top-k
 
-With no usable bound, a scan reads the whole table. `touched=` reports how many columns the query
-actually references.
+With no usable scan order, `ORDER BY` is blocking and the scan reads the whole table. A finite LIMIT
+adds `top-k=K` to the Sort: jed retains only `K = OFFSET + LIMIT` rows while preserving the exact
+stable full-sort result. `touched=` reports how many columns the query actually references.
 
 <LiveSql seed={seed} query={fullScan} rows={8} />
 

@@ -19,8 +19,8 @@
 > improvements >5% vs 1 residual regression — point lookups **−19%**, secondary lookup **−20%**,
 > full-scan aggregates **−25…−29%** (the fan-out win), durable commit and the window benches
 > flat-to-better on isolated re-runs (the sweep's outliers were fsync/CPU interference noise);
-> the one real residual is TS `order_by_limit` **+16%** on the known full-sort lane (subsumed by
-> the standing "ORDER BY + LIMIT top-k" TODO item). Slice record below:
+> the one real residual was TS `order_by_limit` **+16%** on the former full-sort lane; the bounded
+> `ORDER BY + LIMIT` top-k rule has now resolved that follow-on. Slice record below:
 >
 > **B1 LANDED** (the format bump — all four implementations byte-identical at
 > `format_version` 24, goldens regenerated incl. the `max_sep_table.jed` degenerate-fan-out

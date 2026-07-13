@@ -29,6 +29,9 @@ follow-ons ([§7](#7-slicing--follow-ons)) because each needs a *different* algo
 hash table, or — for hash JOIN — a hash-join operator that does not yet exist; jed joins are
 nested-loop today).
 
+The blocking sort also has a results-identical **bounded top-k** rule for `ORDER BY ... LIMIT`
+([§4.1](#41-bounded-top-k-before-spill)): finite windows that fit the budget avoid creating runs.
+
 ## 2. The work-memory budget
 
 A **`work_mem`** handle setting (api.md §2.1, [§3](#3-the-budget-api)) bounds the memory a single
@@ -86,6 +89,30 @@ merge sort**:
 
 The merge **reproduces the single in-memory stable sort byte-for-byte**
 ([§6](#6-determinism--cost-invariance)).
+
+### 4.1 Bounded top-k before spill
+
+A plain SELECT with a blocking `ORDER BY` and constant `LIMIT` retains only
+`K = OFFSET + LIMIT` rows in a max-heap, then sorts those retained rows for output. `LIMIT 0`
+uses K=0 regardless of OFFSET; checked i64 addition means K overflow simply keeps the full sorter.
+The heap comparator is the exact ORDER BY comparator plus the row's monotonically increasing input
+position, so a full key tie retains precisely the stable full-sort order.
+
+The all-C, column-key single-table feed can push directly into this heap. On a file-backed database,
+the direct lane is admitted only when every **touched** column is a fixed scalar; untouched slots
+are replaced by NULL in a private retained-row copy so their variable payloads are released, and the
+cross-core logical estimate `K × (8 + 40 × column_count)` must fit `work_mem`. Touched variable/open
+rows and an oversized K
+fall back to the existing external `Sorter`. In-memory and runtime-unlimited (`work_mem = 0`) handles
+always use top-k. This conservative pre-check is necessary: after a heap has discarded a row, it
+cannot reconstruct the full input to begin an ordinary external sort.
+
+Expression ORDER BY values and collated sort keys retain their former failure timing. Expression
+keys are materialized for every post-filter row before selection; collated paths first complete the
+scan/filter materialization and then decorate every row in input order. Only then does top-k discard
+rows. A collated LIMIT 0 still decorates every row and can raise the same sort-key error. The generic
+eager plain-SELECT seam applies the same selection to joins, SRFs, CTEs, derived relations, and
+non-streamable access paths. DISTINCT, aggregate/group, window, and set-operation sorts stay full.
 
 **The spill file is per-core and internal.** Because spill is not a §8 byte contract (results +
 cost are invariant — [§6](#6-determinism--cost-invariance)), the run file's bytes need only
@@ -152,6 +179,10 @@ Sequenced so the canonical operator lands first on a frozen budget seam:
 - **External merge sort for `ORDER BY` ✅ (this slice).** The `Sorter`, the spill-run files, the
   streaming single-table feed, and the `work_mem` API. Built Rust-first, then Go/TS — a
   result/cost-neutral change, so each core lands green independently (like P5.1 / P6.4b).
+- **Bounded `ORDER BY ... LIMIT` top-k ✅.** The stable max-heap runs before spill when fixed-width K
+  fits `work_mem`; otherwise the external sorter remains authoritative. Expression/collation error
+  timing, LIMIT 0, overflow, and the excluded blocking shapes are corpus-pinned; per-core tests assert
+  both the no-run and fallback-to-run paths.
 
 Deferred follow-ons (none foreclosed; each its own slice with the same invariance contract):
 

@@ -454,7 +454,7 @@ max = 99999
 
 [[bench]]
 name = "order_by_limit"
-description = "Top-100 by non-indexed column over 1M rows (full sort or top-k)"
+description = "Top-100 by a non-indexed column over 1M fixed-width rows — blocking scan into the bounded stable top-k heap (K=100), with no spill runs"
 dataset = "large"
 kind = "query"
 sql = "SELECT id, amount FROM orders ORDER BY amount DESC, id ASC LIMIT 100"

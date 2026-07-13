@@ -37,6 +37,7 @@ export function optimizeSelect(
   ruleOrderByPkScan(plan, rels, snap);
   ruleOrderByIndexScan(plan, rels, snap);
   ruleJoinPkOrdered(plan, rels, snap);
+  ruleOrderByLimitTopK(plan);
 }
 
 // ruleScanBounds — primary-key / index predicate pushdown, per base relation: detect WHERE
@@ -174,4 +175,29 @@ function ruleJoinPkOrdered(plan: SelectPlan, rels: ScopeRel[], snap: Snapshot): 
     const dir = orderSatisfiedByPK(snap, rels[0]!.table, plan.rels[0]!.offset, plan.order);
     plan.phys.joinPkOrdered = dir !== null && !dir.reverse;
   }
+}
+
+// ruleOrderByLimitTopK — bounded selection for a BLOCKING ORDER BY with a constant LIMIT. Plain
+// SELECT pre-sort rows have one deterministic sequence across base scans, joins, SRFs, CTEs, and
+// derived relations. DISTINCT, aggregate/group, and window plans stay excluded. Earlier sort
+// elision rules win. LIMIT 0 records K=0 regardless of OFFSET; bigint addition cannot overflow.
+function ruleOrderByLimitTopK(plan: SelectPlan): void {
+  if (
+    plan.isAgg ||
+    plan.hasWindow ||
+    plan.distinct ||
+    plan.order.length === 0 ||
+    plan.limit === null ||
+    plan.phys.pkOrdered ||
+    plan.phys.indexOrder !== null ||
+    plan.phys.joinPkOrdered
+  ) {
+    return;
+  }
+  if (plan.limit === 0n) {
+    plan.phys.topK = 0n;
+    return;
+  }
+  const k = (plan.offset ?? 0n) + plan.limit;
+  if (k <= 9223372036854775807n) plan.phys.topK = k;
 }

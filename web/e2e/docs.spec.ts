@@ -338,6 +338,13 @@ test('the explain page renders a live plan with the PK-bound access path', async
   await expect(panel.getByTestId('result-rows')).toContainText('Filter');
 });
 
+test('the explain page shows bounded top-k on a blocking sort', async ({ page }) => {
+  await page.goto('/docs/sql/explain/');
+  const panel = page.getByTestId('live-sql').nth(0);
+  await expect(panel.getByTestId('result-rows')).toContainText('Sort');
+  await expect(panel.getByTestId('result-rows')).toContainText('keys=1, top-k=2');
+});
+
 test('the explain page shows the OR / IN-list interval-set access path', async ({ page }) => {
   await page.goto('/docs/sql/explain/');
   // Fifth panel = EXPLAIN SELECT ... WHERE id IN (1, 3, 5): a union of point probes, labelled

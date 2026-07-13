@@ -37,6 +37,7 @@ func (db *engine) snapshotEngine() *engine {
 		session:   s,
 		pageSize:  db.pageSize,
 		paging:    db.paging,
+		path:      db.path,
 		readOnly:  db.readOnly,
 		// The frozen read engine carries the same pinned attachment view so a streaming read of an
 		// attached database (attached-databases.md §5) resolves through it; it never commits (read-only),
@@ -1168,17 +1169,31 @@ func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costM
 				return emitter{}, err
 			}
 		}
-		if err := sortRows(rows, plan.order); err != nil {
+		total = int64(len(rows))
+		if plan.phys.topK != nil {
+			var err error
+			rows, err = topKRows(rows, plan.order, *plan.phys.topK)
+			if err != nil {
+				return emitter{}, err
+			}
+		} else if err := sortRows(rows, plan.order); err != nil {
 			return emitter{}, err
 		}
-		total = int64(len(rows))
 		sorted = &sortedRows{mem: rows}
 	} else {
 		// Stream the scan → filter → sorter. ORDER BY is blocking, so the scan never short-circuits:
 		// every in-range row is read (charging storage_row_read), its touched columns resolved
 		// (large-values.md §14), the WHERE applied (charging operator_eval), and a survivor pushed into
 		// the sorter, which spills when it exceeds the budget.
-		s := db.newSorterFor(plan.order)
+		useTopK := plan.phys.topK != nil && db.streamingTopKFits(plan, *plan.phys.topK)
+		var t *topKKeeper
+		var s *sorter
+		if useTopK {
+			t = newTopKKeeper(*plan.phys.topK, plan.order, false)
+		} else {
+			s = db.newSorterFor(plan.order)
+		}
+		var survivorCount int64
 		if !empty {
 			err := store.ScanRange(b, func(_ []byte, row storedRow) (bool, error) {
 				if err := meter.Guard(); err != nil { // enforce the cost ceiling per scanned row (CLAUDE.md §13)
@@ -1198,8 +1213,16 @@ func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costM
 					keep = v.IsTrue()
 				}
 				if keep {
-					if err := s.push(row); err != nil {
-						return false, err
+					survivorCount++
+					if useTopK {
+						row = topKPruneUntouched(row, plan.relMasks[0])
+						if err := t.push(row); err != nil {
+							return false, err
+						}
+					} else {
+						if err := s.push(row); err != nil {
+							return false, err
+						}
 					}
 				}
 				return true, nil // never stop early — the sort must see every row
@@ -1208,11 +1231,15 @@ func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costM
 				return emitter{}, err
 			}
 		}
-		total = int64(s.total)
-		var err error
-		sorted, err = s.finish()
-		if err != nil {
-			return emitter{}, err
+		total = survivorCount
+		if useTopK {
+			sorted = &sortedRows{mem: t.finish()}
+		} else {
+			var err error
+			sorted, err = s.finish()
+			if err != nil {
+				return emitter{}, err
+			}
 		}
 	}
 
@@ -1238,6 +1265,61 @@ func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costM
 		}
 	}
 	return emitter{sorted: sorted, start: 0, end: end - start, mode: emitSorted}, nil
+}
+
+// streamingTopKFits decides whether a file-backed all-C scan can retain K rows without exceeding
+// work_mem's deterministic top-k estimate. An in-memory database (or work_mem=0) has no spill
+// contract, so it always uses top-k. File-backed variable/open-type rows have no static upper bound
+// and conservatively keep the existing external sorter. Untouched slots are nulled in a private
+// retained-row copy; fixed touched scalars use one shared logical
+// estimate across cores: 8 bytes per row plus 40 bytes per value (including UUID's payload).
+func (db *engine) streamingTopKFits(plan *selectPlan, k int64) bool {
+	if k == 0 || db.path == "" || db.session.workMem == 0 {
+		return true
+	}
+	table, ok := db.lkpTableScoped(plan.rels[0].db, plan.rels[0].tableName)
+	if !ok {
+		return false
+	}
+	for i, col := range table.Columns {
+		if !plan.relMasks[0][i] {
+			continue
+		}
+		ty, scalar := col.Type.AsScalar()
+		if !scalar || !topKFixedScalar(ty) {
+			return false
+		}
+	}
+	rowBudget := int64(8 + 40*len(table.Columns))
+	return k <= int64(db.session.workMem)/rowBudget
+}
+
+// topKPruneUntouched releases variable payloads the logical touched set proves no downstream
+// filter/order/projection can read. It never mutates a stored shared row.
+func topKPruneUntouched(row storedRow, mask []bool) storedRow {
+	for _, touched := range mask {
+		if !touched {
+			out := make(storedRow, len(row))
+			copy(out, row)
+			for i := range out {
+				if !mask[i] {
+					out[i] = NullValue()
+				}
+			}
+			return out
+		}
+	}
+	return row
+}
+
+func topKFixedScalar(ty scalarType) bool {
+	switch ty {
+	case scalarInt16, scalarInt32, scalarInt64, scalarBool, scalarUuid, scalarTimestamp,
+		scalarTimestamptz, scalarFloat32, scalarFloat64, scalarDate:
+		return true
+	default:
+		return false
+	}
 }
 
 // execStreamingJoin is a streaming two-table INNER/CROSS join whose ORDER BY is satisfied by the
@@ -1334,7 +1416,7 @@ func (db *engine) execStreamingJoin(plan *selectPlan, env *evalEnv, meter *costM
 // next to the database file (same filesystem, guaranteed writable).
 func (db *engine) newSorterFor(order []orderSlot) *sorter {
 	spillDir := ""
-	if db.paging != nil {
+	if db.path != "" {
 		spillDir = filepath.Dir(db.path)
 	}
 	return newSorter(order, db.session.workMem, spillDir)

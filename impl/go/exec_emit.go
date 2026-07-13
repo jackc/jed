@@ -490,8 +490,16 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 		if err := materializeOrderExprs(rows, plan.orderExprs, env, meter); err != nil {
 			return emitter{}, err
 		}
-		if err := sortRows(rows, plan.order); err != nil {
-			return emitter{}, err
+		if plan.phys.topK != nil {
+			var err error
+			rows, err = topKRows(rows, plan.order, *plan.phys.topK)
+			if err != nil {
+				return emitter{}, err
+			}
+		} else {
+			if err := sortRows(rows, plan.order); err != nil {
+				return emitter{}, err
+			}
 		}
 	}
 

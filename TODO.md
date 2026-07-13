@@ -204,9 +204,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   shared by SELECT, UPDATE/DELETE, correlated scans, join-relation bounds, and composite INL; cap
   `query.composite_pk_pushdown`. → [cost.md §3](spec/design/cost.md),
   `spec/conformance/suites/query/composite_pk_pushdown.test`
-- _Already tracked in their home sections (all planner follow-ons):_ a **hash-join operator** (the
-  spill item — nested-loop is the only join today); the **ORDER BY + LIMIT top-k** heap (bench-driven
-  perf). Each is a rule-based, results-identical win.
+- _Still tracked in its home section:_ a **hash-join operator** (the spill item — nested-loop is the
+  only non-indexed join today). The **ORDER BY + LIMIT top-k** heap has landed.
 
 ### Cost as a plan input (the strategic investment — Path B)
 
@@ -266,7 +265,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] **Spilling hash aggregate / `DISTINCT` / hash JOIN** — the remaining blocking operators (spill.md §7). Each needs a *different* algorithm: a partitioned (grace) hash that preserves first-occurrence order for aggregate/DISTINCT, and — for hash JOIN — a hash-join operator first (jed joins are nested-loop today), then grace-hash spill to bound the build side. _(size: L–XL each)_
 - [ ] **Bench-driven perf follow-ons** — the measured gaps remaining after the `perf-point-lookup` work (which took `point_lookup_pk` past same-language PG clients in all 3 cores):
   - [ ] **Rust CoW insert deep-clone** — `node_insert` rebuilds a path node with `Vec::clone`, deep-copying every key (`Vec<Vec<u8>>`) + row where Go's `[][]byte` copy is pointer-shallow (why `insert_rollback` is rust 21.6ms vs go 10.3ms). Fix: share entry storage (`Arc<[u8]>` keys / `Arc`-shared rows). Rust-only, no byte or cost change. _(size: M)_
-  - [ ] **ORDER BY + LIMIT top-k** — `order_by_limit` full-sorts all 1M rows before slicing (0.76–1.6s vs PG ~20ms). A bounded top-k selection (heap of LIMIT+OFFSET, index-stable tie-break) cuts the sort to ~scan cost. Rows + cost unchanged. The post-reshape bench shows TS +16% on this lane (lazy-reconstruction overhead on the full-sort input) — this item subsumes that residual. _(size: M; ×3 cores)_
+  - [x] **ORDER BY + LIMIT top-k** — a blocking plain SELECT retains `LIMIT+OFFSET` rows in a stable max-heap; fixed-width K within `work_mem` creates no spill runs, oversized/variable rows retain the external sorter. Expression/collation failure timing, LIMIT 0, overflow, costs, and exclusions are corpus-pinned; `order_by_limit` is the permanent proof lane. _(landed; ×3 cores)_
   - [ ] **Full-scan materialization** — `full_scan_agg` clones every row into a buffer before aggregating (143–281ms vs PG ~13ms). Streaming aggregation over the scan visitor is the contained first step; the full fix is the spill item above. _(size: M–L)_
 - [x] **Large values — overflow pages + compression (TOAST-equivalent)** — large `text`/`bytea`/`decimal`/`json` pushed out-of-line onto overflow-page chains (`format_version` 3), optionally LZ4-compressed first via a deterministic hand-rolled block codec (no third-party dep — a library fails §8 byte-identity). → [large-values.md](spec/design/large-values.md), [lz4.md](spec/fileformat/lz4.md)
   - [ ] _follow-on:_ chain sharing on rewrite (let a rewritten record keep an unchanged value's existing chain — a byte-layout change, lands in all cores + incremental tests together).

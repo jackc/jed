@@ -137,6 +137,8 @@ Attributes are `; `-separated; a node with none renders `-`.
 - **Sort elision** (on the FROM top node when an ORDER BY is served by scan order rather than a
   `Sort`): `ordered: pk ordered` (`(reverse)` for a DESC scan) · `ordered: index order: <index>` ·
   `ordered: join pk ordered`.
+- **Sort**: `keys=N`; when the blocking ORDER BY + LIMIT rule applies, `keys=N, top-k=K`, where
+  K is the checked `OFFSET + LIMIT` retained-row bound (`LIMIT 0` renders `top-k=0`).
 - **Filter / join ON**: `conjuncts=N` (top-level AND count). A full expression printer is a
   follow-on (§5); v1 renders a count, not the predicate text — except the compact bound predicate
   above.

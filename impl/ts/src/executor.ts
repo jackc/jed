@@ -366,6 +366,8 @@ import {
   keyCmp,
   materializeOrderExprs,
   sortRows,
+  TopKKeeper,
+  topKRows,
   valueCmp,
 } from "./window.ts";
 export * from "./snapshot.ts";
@@ -2826,7 +2828,9 @@ export class Engine {
       } else if (sp.phys.joinPkOrdered) {
         orderNote = "join pk ordered";
       } else {
-        r.emit(d, "Sort", `keys=${sp.order.length}`);
+        let detail = `keys=${sp.order.length}`;
+        if (sp.phys.topK !== null) detail += `, top-k=${sp.phys.topK}`;
+        r.emit(d, "Sort", detail);
         d++;
       }
     }
@@ -10426,6 +10430,7 @@ export class Engine {
         pkReverse: false,
         indexOrder: null,
         joinPkOrdered: false,
+        topK: null,
         relBounds: [],
         relINLBounds: [],
       },
@@ -11361,6 +11366,8 @@ export class Engine {
     e.committed = this.readSnap();
     e.pageSize = this.pageSize;
     e.paging = this.paging;
+    e.path = this.path;
+    e.spillSink = this.spillSink;
     e.readOnly = this.readOnly;
     const src = this.session;
     const dst = e.session;
@@ -12089,15 +12096,19 @@ export class Engine {
           return true;
         });
       }
-      sortRows(rows, plan.order);
       total = BigInt(rows.length);
-      sorted = new SortedRows(rows, null);
+      const retained = plan.phys.topK === null ? rows : topKRows(rows, plan.order, plan.phys.topK);
+      if (plan.phys.topK === null) sortRows(retained, plan.order);
+      sorted = new SortedRows(retained, null);
     } else {
       // Stream the scan → filter → sorter. ORDER BY is blocking, so the scan never short-circuits: every
       // in-range row is read (charging storageRowRead), its touched columns resolved (large-values.md
       // §14), the WHERE applied (charging operator_eval), and a survivor pushed into the sorter, which
       // spills when it exceeds the budget.
-      const sorter = this.newSorterFor(plan.order);
+      const useTopK = plan.phys.topK !== null && this.streamingTopKFits(plan, plan.phys.topK);
+      const keeper = useTopK ? new TopKKeeper(plan.phys.topK!, plan.order, false) : null;
+      const sorter = useTopK ? null : this.newSorterFor(plan.order);
+      let survivorCount = 0n;
       if (!empty) {
         // Read-only SELECT feed: reconstruct only the touched columns (Track A1).
         store.scanRange(bound, (_key, rawRow) => {
@@ -12107,12 +12118,16 @@ export class Engine {
           if (plan.filter !== null && !isTrue(evalExpr(plan.filter, row, env, meter))) {
             return true;
           }
-          sorter.push(row);
+          survivorCount++;
+          if (keeper !== null) {
+            keeper.push(row.map((value, i) => (plan.relMasks[0]![i] ? value : nullValue())));
+          }
+          else sorter!.push(row);
           return true; // never stop early — the sort must see every row
         });
       }
-      total = BigInt(sorter.total);
-      sorted = sorter.finish();
+      total = survivorCount;
+      sorted = keeper !== null ? new SortedRows(keeper.finish(), null) : sorter!.finish();
     }
 
     // LIMIT / OFFSET window over the sort's total row count (known without materializing the output).
@@ -12185,6 +12200,36 @@ export class Engine {
       rows: out,
       cost: meter.accrued,
     };
+  }
+
+  // Whether a file-backed all-C scan's K fixed-width rows fit the cross-core logical top-k
+  // work_mem estimate (8 bytes per row + 40 per value). In-memory / unlimited handles always use
+  // top-k. Untouched slots are nulled in the retained copy; a touched variable/open type has no
+  // static maximum and keeps the external sorter.
+  private streamingTopKFits(plan: SelectPlan, k: bigint): boolean {
+    if (k === 0n || this.spillSink === null || this.session.workMem === 0) return true;
+    const table = this.lkpTableScoped(plan.rels[0]!.db, plan.rels[0]!.tableName);
+    if (table === undefined) return false;
+    const fixed = new Set<ScalarType>([
+      "i16",
+      "i32",
+      "i64",
+      "boolean",
+      "uuid",
+      "timestamp",
+      "timestamptz",
+      "f32",
+      "f64",
+      "date",
+    ]);
+    if (
+      table.columns.some(
+        (col, i) => plan.relMasks[0]![i] && !fixed.has(typeAsScalar(col.type)!),
+      )
+    )
+      return false;
+    const rowBudget = 8 + 40 * table.columns.length;
+    return k <= BigInt(Math.floor(this.session.workMem / rowBudget));
   }
 
   // newSorterFor builds a Sorter for order, bounded by this handle's workMem. Spilling is enabled only
@@ -12997,7 +13042,7 @@ export class Engine {
 
     // WHERE over the combined rows. A WHERE arithmetic can throw (22003/22012); each surviving
     // combined row's filter accrues operator_eval.
-    const rows: Row[] = [];
+    let rows: Row[] = [];
     for (const row of running) {
       if (plan.filter === null || isTrue(evalExpr(plan.filter, row, env, meter))) rows.push(row);
     }
@@ -13024,7 +13069,8 @@ export class Engine {
       // appended column and the slot-based sort below is unchanged — the window-key precedent. The
       // evaluation is metered per node (cost.md §3); a no-op for a column/ordinal-only ORDER BY.
       materializeOrderExprs(rows, plan.orderExprs, env, meter);
-      sortRows(rows, plan.order);
+      if (plan.phys.topK !== null) rows = topKRows(rows, plan.order, plan.phys.topK);
+      else sortRows(rows, plan.order);
     }
 
     // LIMIT / OFFSET window bounds over a result of `len` rows. Clamp in the bigint domain
@@ -18733,6 +18779,9 @@ export type PhysicalPlan = {
   // its output is already in order — the sort is elided and a LIMIT short-circuits the loop. Set only
   // for exactly two non-lateral base relations, a LIMIT, and a forward outer-PK ORDER BY.
   joinPkOrdered: boolean;
+  // K = OFFSET + LIMIT for a blocking plain-SELECT sort. null means the rule did not fire, so the
+  // ordinary full sort remains authoritative.
+  topK: bigint | null;
   // Primary-key predicate pushdown, ONE entry per relation in rels: the WHERE conjuncts that bound
   // that relation's storage key, so its scan seeks/ranges instead of walking the whole B-tree
   // (cost.md §3 "bounded scan"). null ⇒ a full scan of that relation. In a JOIN each base table is

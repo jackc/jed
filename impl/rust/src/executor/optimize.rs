@@ -24,6 +24,7 @@ impl Engine {
         self.rule_order_by_pk_scan(plan, scope);
         self.rule_order_by_index_scan(plan, scope);
         self.rule_join_pk_ordered(plan, scope);
+        self.rule_order_by_limit_top_k(plan);
     }
 
     /// Scan-bound pushdown, per base relation: detect WHERE conjuncts that bound that relation's
@@ -190,5 +191,30 @@ impl Engine {
             && plan.order.len() <= scope.rels[0].table.pk_indices().len()
             && order_satisfied_by_pk(scope.rels[0].table, plan.rels[0].offset, &plan.order, self)
                 == Some(false);
+    }
+
+    /// Bounded selection for a BLOCKING `ORDER BY` with a constant LIMIT. Plain SELECT pre-sort
+    /// rows have one deterministic input sequence across base scans, joins, SRFs, CTEs, and derived
+    /// relations. DISTINCT, aggregate/group, and window plans have different blocking-stage order
+    /// and remain excluded. Earlier sort-elision rules win. LIMIT 0 records K=0 regardless of
+    /// OFFSET; otherwise checked addition makes overflow fall back to the full sort.
+    fn rule_order_by_limit_top_k(&self, plan: &mut SelectPlan) {
+        if plan.is_agg
+            || plan.has_window
+            || plan.distinct
+            || plan.order.is_empty()
+            || plan.limit.is_none()
+            || plan.phys.pk_ordered
+            || plan.phys.index_order.is_some()
+            || plan.phys.join_pk_ordered
+        {
+            return;
+        }
+        let limit = plan.limit.unwrap();
+        plan.phys.top_k = if limit == 0 {
+            Some(0)
+        } else {
+            plan.offset.unwrap_or(0).checked_add(limit)
+        };
     }
 }

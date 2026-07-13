@@ -427,6 +427,8 @@ only yesterday's optimizations is false confidence (CLAUDE.md §10 "no silent ca
   `<@` spelling that defeats the sibling bound, including NULL/empty query arrays;
   **gist_inl** — GiST range `@>` and scalar `=` sibling bounds are compared with equivalent `<@`
   and paired-inequality full-scan spellings, including NULL/empty range queries;
+  **topk** — a blocking ORDER BY LIMIT/OFFSET heap is compared with a DISTINCT-gated full sort over
+  PK-unique rows, covering mixed direction, NULL placement, ties, expression keys, and LIMIT 0;
   **index** — a secondary-index equality (`v = K` on an indexed column) fetches via the index
   tree + per-row point lookups ([indexes.md §5](indexes.md)), defeated by `v + 0 = K`, checked
   across UPDATE/DELETE maintenance and a NULL indexed value (3VL through the index); **or_in** — an

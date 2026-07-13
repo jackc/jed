@@ -101,9 +101,11 @@ then takes the unoptimized path (full scan, eager sort), which is always correct
 | 3 | **ORDER BY via PK scan order** | single base relation, non-aggregate, column-only keys: the ORDER BY is a one-direction PK prefix (ASC) or the full PK (DESC ⇒ reverse scan), collation-matching the stored key | `pkOrdered`, `pkReverse` | cost.md §3 "ORDER BY satisfied by primary-key order" (sort elided; with LIMIT, a top-N) |
 | 4 | **ORDER BY via secondary-index order** | rule 3 did not fire; a LIMIT; no window/DISTINCT; the ORDER BY is exactly a B-tree index's columns, ASC NULLS LAST, fixed-width PK; an existing bound is allowed only when it walks that same index | `indexOrder` | cost.md §3 "ORDER BY satisfied by secondary-index order" (index-walk top-N) |
 | 5 | **join sort-elision** | exactly two non-lateral base relations, INNER/CROSS, a LIMIT, forward outer-PK ORDER BY with no key beyond the outer PK, no eager bound on the outer; any storage-key-ordered inner INL bound is opened per outer row | `joinPkOrdered` | cost.md §3 "JOIN" (the join top-N) |
+| 6 | **blocking ORDER BY top-k** | rules 3–5 did not elide the sort; plain SELECT (no DISTINCT, aggregate/group, or window), ORDER BY + constant LIMIT; checked `K = OFFSET + LIMIT` (`LIMIT 0` ⇒ K=0) | `topK` | cost.md §3 "blocking ORDER BY top-k" (full scan/evaluation and cost retained; sort work reduced) |
 
 Data-flow dependencies fixing the order: rule 4 reads `relBounds[0]` (rule 1) and
-`pkOrdered` (rule 3); rule 5 reads `relBounds[0]` and `relINLBounds` (rules 1–2). Rules 3–5
+`pkOrdered` (rule 3); rule 5 reads `relBounds[0]` and `relINLBounds` (rules 1–2); rule 6 reads
+the three preceding sort-elision decisions. Rules 3–5
 are mutually exclusive by their gates (rule 4 requires `!pkOrdered`; rule 5's two-relation
 gate excludes 3/4's single-relation gates).
 
@@ -120,7 +122,8 @@ code, not in the optimizer pass.
 **EXPLAIN** renders every rule's decision ([explain.md §4](explain.md)): rule 1 as the
 scan's access-path detail, rule 2 as the `Index-nested-loop` prefix, rules 3–5 as the
 sort-elision note (`ordered: pk ordered` / `index order: <index>` / `join pk ordered`) —
-which is what makes each rule corpus-assertable without touching internals.
+and rule 6 as `Sort keys=N, top-k=K`, which makes each rule corpus-assertable without touching
+internals.
 
 ## 5. Access-path precedence (rule 1's internal order)
 
@@ -202,6 +205,5 @@ elides its sort only when the source emits the requested PK order or walks the e
   precedence and the FROM-order join tree *inside* stage 3, once the estimator + table
   statistics exist; re-pins the affected `# cost:` entries and forces the class-P decision
   (§6).
-- **New physical rules** (LIMIT + index-bound streaming, hash join,
-  top-k heap — each tracked in TODO.md) land as
+- **New physical rules** (hash join and later access paths tracked in TODO.md) land as
   discrete rule functions in the §4 inventory, each with its NoREC relation.

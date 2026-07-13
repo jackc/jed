@@ -939,17 +939,104 @@ export function cmpWindowRows(
 // collated ORDER BY is in-memory only this slice, so this never spills (collated keys are slice 1e).
 export function sortRowsCollated(rows: Row[], order: OrderSlot[]): void {
   // (keys[i], row) per row; a keys entry is null for a NULL value, the sort-key bytes otherwise.
-  const deco: { keys: (Uint8Array | null)[]; row: Row }[] = rows.map((row) => {
-    const keys: (Uint8Array | null)[] = [];
-    for (const k of order) {
-      if (k.collation === null) continue;
-      const v = row[k.idx]!;
-      keys.push(v.kind === "text" ? collationSortKey(k.collation, v.text) : null);
-    }
-    return { keys, row };
-  });
+  const deco: { keys: (Uint8Array | null)[]; row: Row }[] = rows.map((row) => ({
+    keys: collationKeysForRow(row, order),
+    row,
+  }));
   deco.sort((a, b) => cmpDecorated(a.keys, a.row, b.keys, b.row, order));
   for (let i = 0; i < deco.length; i++) rows[i] = deco[i]!.row;
+}
+
+function collationKeysForRow(row: Row, order: OrderSlot[]): (Uint8Array | null)[] {
+  const keys: (Uint8Array | null)[] = [];
+  for (const k of order) {
+    if (k.collation === null) continue;
+    const v = row[k.idx]!;
+    keys.push(v.kind === "text" ? collationSortKey(k.collation, v.text) : null);
+  }
+  return keys;
+}
+
+type TopKItem = { keys: (Uint8Array | null)[]; row: Row; pos: bigint };
+
+// TopKKeeper is a bounded max-heap whose root is the worst retained row. The monotonically
+// increasing input position completes the exact ORDER BY comparator and preserves stable ties.
+export class TopKKeeper {
+  private readonly k: bigint;
+  private readonly order: OrderSlot[];
+  private readonly collated: boolean;
+  private nextPos = 0n;
+  private items: TopKItem[] = [];
+
+  constructor(k: bigint, order: OrderSlot[], collated: boolean) {
+    this.k = k;
+    this.order = order;
+    this.collated = collated;
+  }
+
+  private compare(a: TopKItem, b: TopKItem): number {
+    const byKey = this.collated
+      ? cmpDecorated(a.keys, a.row, b.keys, b.row, this.order)
+      : cmpRowsByOrder(a.row, b.row, this.order);
+    if (byKey !== 0) return byKey;
+    return a.pos < b.pos ? -1 : a.pos > b.pos ? 1 : 0;
+  }
+
+  push(row: Row): void {
+    const item: TopKItem = {
+      keys: this.collated ? collationKeysForRow(row, this.order) : [],
+      row,
+      pos: this.nextPos++,
+    };
+    // A collated LIMIT 0 still decorates every input row, preserving the full sort's trap point.
+    if (this.k === 0n) return;
+    if (BigInt(this.items.length) < this.k) {
+      this.items.push(item);
+      this.siftUp(this.items.length - 1);
+    } else if (this.compare(item, this.items[0]!) < 0) {
+      this.items[0] = item;
+      this.siftDown(0);
+    }
+  }
+
+  private siftUp(child: number): void {
+    while (child > 0) {
+      const parent = Math.floor((child - 1) / 2);
+      if (this.compare(this.items[child]!, this.items[parent]!) <= 0) break;
+      [this.items[child], this.items[parent]] = [this.items[parent]!, this.items[child]!];
+      child = parent;
+    }
+  }
+
+  private siftDown(parent: number): void {
+    for (;;) {
+      const left = parent * 2 + 1;
+      if (left >= this.items.length) return;
+      const right = left + 1;
+      let worst = left;
+      if (right < this.items.length && this.compare(this.items[right]!, this.items[left]!) > 0) {
+        worst = right;
+      }
+      if (this.compare(this.items[worst]!, this.items[parent]!) <= 0) return;
+      [this.items[parent], this.items[worst]] = [this.items[worst]!, this.items[parent]!];
+      parent = worst;
+    }
+  }
+
+  finish(): Row[] {
+    this.items.sort((a, b) => this.compare(a, b));
+    return this.items.map((item) => item.row);
+  }
+}
+
+export function topKRows(rows: Row[], order: OrderSlot[], k: bigint): Row[] {
+  const keeper = new TopKKeeper(
+    k,
+    order,
+    order.some((key) => key.collation !== null),
+  );
+  for (const row of rows) keeper.push(row);
+  return keeper.finish();
 }
 
 // cmpDecorated compares two decorated rows (precomputed collated-key bytes + the row) by the ORDER BY

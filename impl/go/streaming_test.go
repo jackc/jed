@@ -613,6 +613,36 @@ func TestSortedSpillMergeStreamsLazily(t *testing.T) {
 	er, ec := eagerResult(t, oracle, sql)
 	oracle.Close()
 
+	// A finite top-k whose shared fixed-row estimate fits workMem bypasses the external sorter:
+	// after the blocking first pull there is no live spill run. Lowering the budget below K's
+	// estimate falls back to the existing sorter, whose undrained merge keeps runs live.
+	fit := db.Session(SessionOptions{})
+	fit.SetWorkMem(512) // K=5 × (8 + 2×40) = 440 bytes
+	fitRows, err := fit.queryValues(sql+" LIMIT 5", nil)
+	if err != nil || !fitRows.Next() {
+		t.Fatalf("top-k first pull: %v", err)
+	}
+	if n := countSpillFiles(); n != 0 {
+		t.Fatalf("fitting top-k created %d spill files", n)
+	}
+	_ = fitRows.Close()
+	fit.Close()
+
+	fallback := db.Session(SessionOptions{})
+	fallback.SetWorkMem(128)
+	fallbackRows, err := fallback.queryValues(sql+" LIMIT 5", nil)
+	if err != nil || !fallbackRows.Next() {
+		t.Fatalf("fallback first pull: %v", err)
+	}
+	if n := countSpillFiles(); n == 0 {
+		t.Fatal("top-k over workMem must fall back to the external sorter")
+	}
+	_ = fallbackRows.Close()
+	fallback.Close()
+	if n := countSpillFiles(); n != 0 {
+		t.Fatalf("fallback close leaked %d spill files", n)
+	}
+
 	// Full lazy drain under a tiny workMem (forces spill + merge): rows + cost match the oracle.
 	s := db.Session(SessionOptions{})
 	s.SetWorkMem(128) // ~2-3 rows per run → dozens of runs + a deep merge

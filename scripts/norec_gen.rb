@@ -45,6 +45,9 @@
 #   bounded_limit — LIMIT/OFFSET windows over PK interval sets, a compatible ordered secondary-index
 #              bound, and a GIN candidate gather match semantically-equivalent unbounded spellings.
 #              This checks that stopping table work early never changes the chosen result window.
+#   topk     — a blocking ORDER BY LIMIT/OFFSET bounded max-heap is compared with an otherwise
+#              identical SELECT DISTINCT over PK-unique output rows, which gates the rule off and
+#              full-sorts. Mixed directions, NULLs, ties, expression keys, and LIMIT 0 are covered.
 #   index_order — `ORDER BY v LIMIT k` over a secondary-indexed non-PK column walks the index tree
 #              (a top-N, cost.md §3 "secondary-index order"); `ORDER BY v` with no LIMIT keeps the
 #              eager sort. Over a total order (distinct `v`, NULLS LAST) the index top-N windows and
@@ -185,6 +188,9 @@ BOUNDED_LIMIT_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index ddl.
                        query.order_by query.order_by_keys query.limit query.offset query.index_range
                        query.interval_set query.gin_scan query.bounded_limit_streaming expr.between
                        expr.arithmetic types.i32 types.array func.array_containment].freeze
+TOPK_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
+              query.distinct query.order_by query.order_by_keys query.order_by_expr query.limit
+              query.offset query.order_by_topk expr.arithmetic types.i32 null.three_valued].freeze
 DISTINCT_ORDER_REQ = %w[ddl.create_table ddl.primary_key ddl.composite_primary_key dml.insert
                         dml.insert_multi_row query.select query.distinct query.order_by
                         query.order_by_keys query.limit query.offset query.order_by_pk_scan
@@ -959,6 +965,76 @@ def gen_bounded_limit(seed)
   out << "# GIN gather with a bounded PK-ordered result window"
   q(out, "II", "SELECT id, x FROM t WHERE tags @> ARRAY[#{term}]::i32[] ORDER BY id LIMIT #{k} OFFSET #{off}", flat.call(expected))
   q(out, "II", "SELECT id, x FROM t WHERE ARRAY[#{term}]::i32[] <@ tags ORDER BY id LIMIT #{k} OFFSET #{off}", flat.call(expected))
+
+  out.join("\n") + "\n"
+end
+
+# --- scenario: blocking ORDER BY LIMIT bounded top-k vs DISTINCT-gated full sort -----------------
+def gen_topk(seed)
+  rng = Random.new(seed)
+  ids = (1..80).to_a.sample(18, random: rng).sort
+  rows = ids.map do |id|
+    a = rng.rand < 0.2 ? nil : rng.rand(-3..3) # deliberate ties + NULLs
+    b = rng.rand < 0.2 ? nil : rng.rand(-4..4)
+    [id, a, b]
+  end
+  sqlv = ->(v) { v.nil? ? "NULL" : v.to_s }
+  flat = ->(rs) { rs.flat_map { |id, a, b| [id.to_s, sqlv.call(a), sqlv.call(b)] } }
+
+  # a ASC NULLS LAST, b DESC (default NULLS FIRST), id ASC.
+  mixed = rows.sort do |x, y|
+    c = if x[1].nil? || y[1].nil?
+          x[1].nil? == y[1].nil? ? 0 : (x[1].nil? ? 1 : -1)
+        else
+          x[1] <=> y[1]
+        end
+    if c.zero?
+      c = if x[2].nil? || y[2].nil?
+            x[2].nil? == y[2].nil? ? 0 : (x[2].nil? ? -1 : 1)
+          else
+            y[2] <=> x[2]
+          end
+    end
+    c.zero? ? x[0] <=> y[0] : c
+  end
+
+  out = header(seed, TOPK_REQ, "blocking ORDER BY LIMIT bounded top-k")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32)")
+  values = rows.map { |id, a, b| "(#{id}, #{sqlv.call(a)}, #{sqlv.call(b)})" }.join(', ')
+  stmt(out, "INSERT INTO t VALUES #{values}")
+
+  k = rng.rand(2..6)
+  off = rng.rand(0..4)
+  expected = mixed[off, k] || []
+  out << "# mixed direction/NULL/tie top-k versus PK-unique DISTINCT full sort"
+  q(out, "III", "SELECT id, a, b FROM t ORDER BY a, b DESC, id LIMIT #{k} OFFSET #{off}", flat.call(expected))
+  q(out, "III", "SELECT DISTINCT id, a, b FROM t ORDER BY a, b DESC, id LIMIT #{k} OFFSET #{off}", flat.call(expected))
+
+  # Expression key: NULL sum sorts last; DESC id is the stable total-order tie-break.
+  expr = rows.sort do |x, y|
+    xs = x[1].nil? || x[2].nil? ? nil : x[1] + x[2]
+    ys = y[1].nil? || y[2].nil? ? nil : y[1] + y[2]
+    c = if xs.nil? || ys.nil?
+          xs.nil? == ys.nil? ? 0 : (xs.nil? ? 1 : -1)
+        else
+          xs <=> ys
+        end
+    c.zero? ? y[0] <=> x[0] : c
+  end
+  expected = expr[off, k] || []
+  flat_expr = ->(rs) do
+    rs.flat_map do |id, a, b|
+      sum = a.nil? || b.nil? ? nil : a + b
+      [id.to_s, sqlv.call(a), sqlv.call(b), sqlv.call(sum)]
+    end
+  end
+  out << "# expression-key top-k versus PK-unique DISTINCT full sort"
+  q(out, "IIII", "SELECT id, a, b, a + b AS ord FROM t ORDER BY a + b, id DESC LIMIT #{k} OFFSET #{off}", flat_expr.call(expected))
+  q(out, "IIII", "SELECT DISTINCT id, a, b, a + b AS ord FROM t ORDER BY a + b, id DESC LIMIT #{k} OFFSET #{off}", flat_expr.call(expected))
+
+  out << "# LIMIT 0 still runs both pre-sort lanes and yields the same empty result"
+  q(out, "III", "SELECT id, a, b FROM t ORDER BY a, id LIMIT 0 OFFSET #{off}", [])
+  q(out, "III", "SELECT DISTINCT id, a, b FROM t ORDER BY a, id LIMIT 0 OFFSET #{off}", [])
 
   out.join("\n") + "\n"
 end
@@ -1991,6 +2067,7 @@ SCENARIOS = {
   "or_in" => method(:gen_or_in),
   "interval_set" => method(:gen_interval_set),
   "bounded_limit" => method(:gen_bounded_limit),
+  "topk" => method(:gen_topk),
   "index_order" => method(:gen_index_order),
   "distinct_order" => method(:gen_distinct_order),
   "join_order" => method(:gen_join_order),

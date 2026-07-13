@@ -1540,6 +1540,10 @@ type physicalPlan struct {
 	// its output is already in order — the sort is elided and a LIMIT short-circuits the loop. Set only
 	// for exactly two non-lateral base relations, a LIMIT, and a forward outer-PK ORDER BY.
 	joinPkOrdered bool
+	// topK is K = OFFSET + LIMIT for a blocking plain SELECT sort. The executor retains only the
+	// best K rows with the exact stable ORDER BY comparator. nil means the rule did not fire (or K
+	// overflowed), so the ordinary full sort remains authoritative.
+	topK *int64
 	// relBounds is the scan-bound pushdown, ONE entry per relation in rels: the WHERE
 	// conjuncts that bound that relation's storage key, so its scan seeks/ranges instead of walking
 	// the whole B-tree (spec/design/cost.md §3 "bounded scan"). nil ⇒ a full scan of that relation.

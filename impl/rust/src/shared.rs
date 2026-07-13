@@ -687,6 +687,16 @@ impl Shared {
             .page_size
     }
 
+    /// Copy the immutable host path onto a freshly minted execution engine so file-backed spill is
+    /// available. The published snapshot's stores already own the shared paging context; installing
+    /// it as this session's write pager would bypass the core's page-accounting owner.
+    fn configure_engine(&self, engine: &mut Engine) {
+        let storage = self.storage.lock().expect("storage lock not poisoned");
+        engine.page_size = storage.page_size;
+        engine.path = storage.path.clone();
+        engine.read_only = storage.read_only;
+    }
+
     /// Whether this core is a read-only file-backed database (a write is `25006`). In-memory cores
     /// are always writable.
     fn read_only(&self) -> bool {
@@ -1184,7 +1194,7 @@ impl Database {
     pub fn read_session(&self) -> Session {
         let (snap, attached, version) = self.0.pin_latest(); // atomic load+register (§8): no gap
         let mut engine = Engine::from_snapshot((*snap).clone());
-        engine.page_size = self.0.page_size(); // serialize/split at the file's page size (§8)
+        self.0.configure_engine(&mut engine);
         engine.read_only = true; // the executor rejects writes (25006) / poisons a read-only block
         engine.core = Some(self.0.clone()); // route to the attachment registry (§5)
         engine.attached_committed = attached; // pin the attached roots together (§5)
@@ -1214,7 +1224,7 @@ impl Database {
         let (base, attached) = self.0.pin_roots();
         let base_version = base.txid;
         let mut engine = Engine::from_snapshot((*base).clone());
-        engine.page_size = self.0.page_size(); // serialize/split at the file's page size (§8)
+        self.0.configure_engine(&mut engine);
         engine.core = Some(self.0.clone()); // route to the attachment registry (§5)
         engine.attached_committed = attached; // pin the attached roots together (§5)
         engine
@@ -1250,7 +1260,7 @@ impl Database {
             (snap, attached, version, Access::ReadWrite, None)
         };
         let mut engine = Engine::from_snapshot((*snap).clone());
-        engine.page_size = self.0.page_size(); // serialize/split at the file's page size (§8)
+        self.0.configure_engine(&mut engine);
         engine.core = Some(self.0.clone()); // route to the attachment registry (§5)
         engine.attached_committed = attached; // pin the attached roots together (§5)
         engine.session = SessionState::with_options(opts);

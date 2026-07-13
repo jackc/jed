@@ -7,8 +7,18 @@ over a dedicated `gin` dataset (§4), the regex + window benchmarks, and the **c
 throughput** benchmarks (the `concurrent_read` kind, §8.1). Rule-based access-path work is pinned by
 scratch workloads including `composite_pk_lookup`, `interval_set_pk`, and
 `bounded_index_limit`, plus `join_inl_topn` for the combined join rule and `gin_inl` for the opclass
-sibling-bound rule. This document is the
+sibling-bound rule. `order_by_limit` is the permanent blocking-sort top-k lane: one million fixed
+rows, K=100, cross-engine checksum equality, and the scan-dominated timing/memory payoff. This document is the
 canonical record for the `bench/` subsystem.
+
+**Top-k result (2026-07-12).** On the permanent `order_by_limit` lane, every jed core and
+PostgreSQL returned checksum `6350e1a54bbefa1d`. Median per-query time moved from the 2026-07-01
+pre-top-k run to **145 ms Go** (2.07 s before, −93%), **140 ms Rust** (643 ms before, −78%), and
+**246 ms TypeScript** (1.86 s before, −87%); PostgreSQL was 24 ms on the same host. The blocking scan
+still visits one million rows, but only K=100 retained rows reach the final sort — a 10,000× bound on
+sort candidates — and the per-core spill tests prove this fixed-width K creates no run while a
+smaller `work_mem` falls back to the existing external sorter. Timings remain non-gating; checksum,
+corpus results/costs, and the no-run/fallback invariants are the correctness proof.
 
 ## 1. Purpose and non-goals
 

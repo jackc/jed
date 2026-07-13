@@ -21,6 +21,32 @@ func (db *engine) optimizeSelect(plan *selectPlan, rels []scopeRel) {
 	db.ruleOrderByPkScan(plan, rels)
 	db.ruleOrderByIndexScan(plan, rels)
 	db.ruleJoinPkOrdered(plan, rels)
+	db.ruleOrderByLimitTopK(plan, rels)
+}
+
+// ruleOrderByLimitTopK — bounded selection for a BLOCKING ORDER BY with a constant LIMIT. Plain
+// SELECT pre-sort rows have one deterministic input sequence regardless of whether they come from a
+// base scan, join, SRF, CTE, or derived relation, so the rule is generic over those sources. DISTINCT,
+// aggregate/group, and window plans have different blocking-stage order and remain excluded. Sorts
+// already elided by PK/index/join order win first. LIMIT 0 deliberately records K=0 regardless of
+// OFFSET; otherwise OFFSET+LIMIT is checked in i64 and overflow falls back to the full sort.
+func (db *engine) ruleOrderByLimitTopK(plan *selectPlan, _ []scopeRel) {
+	if plan.isAgg || plan.hasWindow || plan.distinct || len(plan.order) == 0 || plan.limit == nil ||
+		plan.phys.pkOrdered || plan.phys.indexOrder != nil || plan.phys.joinPkOrdered {
+		return
+	}
+	k := int64(0)
+	if *plan.limit != 0 {
+		offset := int64(0)
+		if plan.offset != nil {
+			offset = *plan.offset
+		}
+		if offset > int64(^uint64(0)>>1)-*plan.limit {
+			return
+		}
+		k = offset + *plan.limit
+	}
+	plan.phys.topK = &k
 }
 
 // ruleScanBounds — scan-bound pushdown, per base relation: detect WHERE conjuncts that bound that

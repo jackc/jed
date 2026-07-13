@@ -971,16 +971,7 @@ pub(crate) fn sort_rows_collated(
 ) -> Result<()> {
     let mut decorated: Vec<(Vec<Option<Vec<u8>>>, Row)> = Vec::with_capacity(rows.len());
     for row in rows.drain(..) {
-        let mut keys: Vec<Option<Vec<u8>>> = Vec::new();
-        for (idx, _, _, coll) in order {
-            if let Some(c) = coll {
-                let k = match &row[*idx] {
-                    Value::Text(s) => Some(collation::sort_key(c, s)?),
-                    _ => None, // NULL (a collated slot is text) — handled by NULL placement
-                };
-                keys.push(k);
-            }
-        }
+        let keys = collation_keys_for_row(&row, order)?;
         decorated.push((keys, row));
     }
     decorated.sort_by(|a, b| cmp_decorated(a, b, order));
@@ -996,9 +987,17 @@ pub(crate) fn cmp_decorated(
     b: &(Vec<Option<Vec<u8>>>, Row),
     order: &[crate::spill::SortKey],
 ) -> std::cmp::Ordering {
+    cmp_decorated_parts(&a.0, &a.1, &b.0, &b.1, order)
+}
+
+fn cmp_decorated_parts(
+    akeys: &[Option<Vec<u8>>],
+    arow: &Row,
+    bkeys: &[Option<Vec<u8>>],
+    brow: &Row,
+    order: &[crate::spill::SortKey],
+) -> std::cmp::Ordering {
     use std::cmp::Ordering;
-    let (akeys, arow) = a;
-    let (bkeys, brow) = b;
     let mut ci = 0usize; // advances once per collated slot (keys stored in slot order)
     for (idx, descending, nulls_first, coll) in order {
         let ord = if coll.is_some() {
@@ -1034,6 +1033,142 @@ pub(crate) fn cmp_decorated(
         }
     }
     Ordering::Equal
+}
+
+fn collation_keys_for_row(
+    row: &Row,
+    order: &[crate::spill::SortKey],
+) -> Result<Vec<Option<Vec<u8>>>> {
+    let mut keys = Vec::new();
+    for (idx, _, _, coll) in order {
+        if let Some(c) = coll {
+            keys.push(match &row[*idx] {
+                Value::Text(s) => Some(collation::sort_key(c, s)?),
+                _ => None,
+            });
+        }
+    }
+    Ok(keys)
+}
+
+struct TopKItem {
+    keys: Vec<Option<Vec<u8>>>,
+    row: Row,
+    pos: usize,
+}
+
+/// A bounded max-heap whose root is the worst retained row. Input position completes the exact
+/// ORDER BY comparator, preserving stable full-sort ties even though heap layout is unstable.
+pub(crate) struct TopKKeeper {
+    k: usize,
+    next_pos: usize,
+    collated: bool,
+    order: Vec<crate::spill::SortKey>,
+    items: Vec<TopKItem>,
+}
+
+impl TopKKeeper {
+    pub(crate) fn new(k: i64, order: &[crate::spill::SortKey], collated: bool) -> Self {
+        Self {
+            k: usize::try_from(k).unwrap_or(usize::MAX),
+            next_pos: 0,
+            collated,
+            order: order.to_vec(),
+            items: Vec::new(),
+        }
+    }
+
+    fn cmp(&self, a: &TopKItem, b: &TopKItem) -> std::cmp::Ordering {
+        let by_key = if self.collated {
+            cmp_decorated_parts(&a.keys, &a.row, &b.keys, &b.row, &self.order)
+        } else {
+            cmp_rows_by_order(&a.row, &b.row, &self.order)
+        };
+        by_key.then_with(|| a.pos.cmp(&b.pos))
+    }
+
+    pub(crate) fn push(&mut self, row: Row) -> Result<()> {
+        let keys = if self.collated {
+            collation_keys_for_row(&row, &self.order)?
+        } else {
+            Vec::new()
+        };
+        let item = TopKItem {
+            keys,
+            row,
+            pos: self.next_pos,
+        };
+        self.next_pos += 1;
+        // Collated LIMIT 0 still decorates every row so its deterministic failure point is unchanged.
+        if self.k == 0 {
+            return Ok(());
+        }
+        if self.items.len() < self.k {
+            self.items.push(item);
+            self.sift_up(self.items.len() - 1);
+        } else if self.cmp(&item, &self.items[0]).is_lt() {
+            self.items[0] = item;
+            self.sift_down(0);
+        }
+        Ok(())
+    }
+
+    fn sift_up(&mut self, mut child: usize) {
+        while child > 0 {
+            let parent = (child - 1) / 2;
+            if !self.cmp(&self.items[child], &self.items[parent]).is_gt() {
+                break;
+            }
+            self.items.swap(child, parent);
+            child = parent;
+        }
+    }
+
+    fn sift_down(&mut self, mut parent: usize) {
+        loop {
+            let left = parent * 2 + 1;
+            if left >= self.items.len() {
+                break;
+            }
+            let right = left + 1;
+            let mut worst = left;
+            if right < self.items.len() && self.cmp(&self.items[right], &self.items[left]).is_gt() {
+                worst = right;
+            }
+            if !self.cmp(&self.items[worst], &self.items[parent]).is_gt() {
+                break;
+            }
+            self.items.swap(parent, worst);
+            parent = worst;
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> Vec<Row> {
+        let collated = self.collated;
+        let order = self.order;
+        self.items.sort_by(|a, b| {
+            let by_key = if collated {
+                cmp_decorated_parts(&a.keys, &a.row, &b.keys, &b.row, &order)
+            } else {
+                cmp_rows_by_order(&a.row, &b.row, &order)
+            };
+            by_key.then_with(|| a.pos.cmp(&b.pos))
+        });
+        self.items.into_iter().map(|item| item.row).collect()
+    }
+}
+
+pub(crate) fn top_k_rows(
+    rows: Vec<Row>,
+    order: &[crate::spill::SortKey],
+    k: i64,
+) -> Result<Vec<Row>> {
+    let collated = order.iter().any(|key| key.3.is_some());
+    let mut keeper = TopKKeeper::new(k, order, collated);
+    for row in rows {
+        keeper.push(row)?;
+    }
+    Ok(keeper.finish())
 }
 
 /// One ORDER BY key's total-order comparison. NULL placement is governed by `nulls_first`

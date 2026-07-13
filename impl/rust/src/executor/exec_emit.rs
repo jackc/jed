@@ -347,7 +347,11 @@ impl Engine {
             // the appended column and the slot-based sort below is unchanged — the window-key precedent.
             // The evaluation is metered per node (cost.md §3); empty for a column/ordinal-only ORDER BY.
             materialize_order_exprs(&mut rows, &plan.order_exprs, &env, meter)?;
-            sort_rows(&mut rows, &plan.order)?;
+            if let Some(k) = plan.phys.top_k {
+                rows = top_k_rows(rows, &plan.order, k)?;
+            } else {
+                sort_rows(&mut rows, &plan.order)?;
+            }
         }
 
         // LIMIT / OFFSET window bounds over a result of `len` rows. Clamp in the integer

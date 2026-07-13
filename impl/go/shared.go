@@ -824,7 +824,7 @@ func (s *Database) ReadSession() *Session {
 	snap := rt.committed
 	// Reads never mutate the snapshot (a write is rejected before dispatch), so the engine shares the
 	// immutable pinned snapshot directly — no clone. The attached roots are pinned together (§5).
-	engine := &engine{committed: snap, pageSize: s.core.pageSize(), session: newSession()}
+	engine := &engine{committed: snap, pageSize: s.core.pageSize(), path: s.core.storage.path, session: newSession()}
 	engine.core = s.core
 	engine.attachedCommitted = rt.attached
 	engine.readOnly = true // the executor rejects writes (25006) / poisons a read-only block
@@ -847,7 +847,7 @@ func (s *Database) WriteSession() *Session {
 	rt := s.core.roots.Load()
 	base := rt.committed
 	// committed is the immutable base (the writer mutates only working, which beginTx clones off it).
-	engine := &engine{committed: base, pageSize: s.core.pageSize(), session: newSession()}
+	engine := &engine{committed: base, pageSize: s.core.pageSize(), path: s.core.storage.path, session: newSession()}
 	engine.core = s.core
 	engine.attachedCommitted = rt.attached
 	_, _ = engine.beginTx(true, true)
@@ -866,7 +866,7 @@ func (s *Database) Session(opts SessionOptions) *Session {
 	// autocommit lazy-gate one — no persistent pin (each autocommit read pins per statement).
 	if s.core.readOnlyMode() {
 		rt, v := s.core.pinLatest()
-		engine := &engine{committed: rt.committed, pageSize: s.core.pageSize(), session: newSessionWithOptions(opts)}
+		engine := &engine{committed: rt.committed, pageSize: s.core.pageSize(), path: s.core.storage.path, session: newSessionWithOptions(opts)}
 		engine.core = s.core
 		engine.attachedCommitted = rt.attached
 		engine.readOnly = true // the executor enforces read-only too (rejects BEGIN READ WRITE, poisons a read-only block)
@@ -874,7 +874,7 @@ func (s *Database) Session(opts SessionOptions) *Session {
 	}
 	rt := s.core.roots.Load()
 	snap := rt.committed
-	engine := &engine{committed: snap, pageSize: s.core.pageSize(), session: newSessionWithOptions(opts)}
+	engine := &engine{committed: snap, pageSize: s.core.pageSize(), path: s.core.storage.path, session: newSessionWithOptions(opts)}
 	engine.core = s.core
 	engine.attachedCommitted = rt.attached
 	return &Session{core: s.core, engine: engine, access: accessReadWrite, baseVersion: snap.txid}

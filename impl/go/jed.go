@@ -201,6 +201,7 @@ var SupportedCapabilities = []string{
 	"query.order_by_index_scan",
 	"query.order_by_join_scan",
 	"query.order_by_join_inl",
+	"query.order_by_topk",
 	// Database-qualified table names — `main.`/`temp.` in table position (attached-databases.md §3,
 	// Slice 1a).
 	"query.qualified_table",
