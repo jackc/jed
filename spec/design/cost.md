@@ -859,9 +859,9 @@ stable sort's tie-break. It engages when:
   The rows match the eager sort exactly. `query/order_by_index_scan.test` pins the top-N, the residual
   filter, the OFFSET, and the no-`LIMIT` / non-indexed-column contrasts that keep the eager sort.
 
-Narrowings (each a follow-on): combining the index walk with a `WHERE` pushdown bound, `DESC` (a
-reverse index walk — restricted to a unique index, the same tie-break trap), and a strict-prefix-of-a-
-multi-column-index `ORDER BY` all keep the eager path.
+Narrowings (each a follow-on): `DESC` (a reverse index walk — restricted to a unique index, the same
+tie-break trap) and a strict-prefix-of-a-multi-column-index `ORDER BY` keep the eager path. A WHERE
+pushdown bound over this exact index now composes with the walk (the bounded LIMIT rule above).
 
 ### Windowed top-N — a backward window served from the LIMIT prefix
 
@@ -988,20 +988,27 @@ loop drives the **outer** (first) relation in primary-key order, a two-table INN
 the join output already arrives in `(outer PK, inner key)` order. The engine elides the sort and
 **STOPS the nested loop once the `LIMIT`/`OFFSET` window is filled**, so the `ON`/WHERE
 `operator_eval`s and `row_produced` drop to the combinations *actually examined* — the cost-visible
-win. Both tables are still **materialized in full** (`storage_row_read` = the sum of cardinalities,
-the rule above; the bound a WHERE pushes onto the inner still applies), so only the in-memory loop
-short-circuits. The rows are byte-identical to the eager nested-loop-then-sort. Gated by
-`query.order_by_join_scan`; engages only when:
+win. Without an index-nested-loop bound, both tables are still **materialized in full**
+(`storage_row_read` = the sum of cardinalities, the rule above; a constant WHERE bound on the inner
+still applies), so only the in-memory loop short-circuits. With a PK/B-tree **INL inner**, the outer
+is materialized once and the inner bound is opened per outer row; every started bound is gathered
+completely in its ordinary key order, while bounds for later outer rows are never opened after the
+window fills. This is the eager INL nested-loop order, so rows remain byte-identical to the blocking
+sort path. Gated by `query.order_by_join_scan` plus `query.order_by_join_inl` for the combination;
+engages only when:
 - exactly **two non-lateral base relations**, an **INNER or CROSS** join, and a **`LIMIT`**;
 - the `ORDER BY` is a **pure prefix of the outer PK** (forward/`ASC`, collation-matching) with **no
   trailing key** — the outer PK is unique over the *outer table* but **not** over the join output (one
   outer row fans out to many), so an extra key (`ORDER BY a.id, b.x`) is a real tie-break the outer
   scan order does not satisfy, unlike the single-table "runs past the PK" case;
 - the outer carries **no non-PK bound** (a PK bound / no bound keeps it in PK order).
+- the optional inner INL bound is PK or ordered B-tree (GIN/GiST sibling bounds are separate work).
 
 `joins/order_by_outer_pk.test` pins the top-N (with the ON-eval drop), the OFFSET, the inner-PK-bound
 composition, the CROSS form, and the `ORDER BY a.id, b.id` contrast that keeps the full nested loop +
-sort. Narrowings (follow-ons): `DESC` (a reverse outer scan), more than two relations, an
+sort. `joins/order_by_inl_topn.test` pins PK hit/miss/NULL probes, residual rejection, OFFSET,
+secondary-index fanout, LIMIT 0, EXPLAIN composition, and the blocking inner-key contrast. Narrowings
+(follow-ons): `DESC` (a reverse outer scan), more than two relations, an
 outer-table non-PK bound, `LEFT`/`RIGHT`/`FULL`, and `DISTINCT`.
 
 ### FROM-less `SELECT` — the virtual row charges no scan units

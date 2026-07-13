@@ -1162,11 +1162,11 @@ impl Engine {
     /// relation's primary-key scan order (cost.md §3 "secondary-index order" companion — the join
     /// top-N). A left-deep nested loop produces combined rows in `(outer PK, inner key)` order — which
     /// IS the requested order, since the outer drives the loop in PK order — so the blocking sort is
-    /// elided, and with a `LIMIT` the loop STOPS once the window is filled. Both tables are still
-    /// materialized in full (`storage_row_read` = the sum of cardinalities, the join contract), but the
-    /// `ON`/`WHERE` `operator_eval`s and `row_produced` drop to the combinations actually examined —
-    /// the cost-visible win. Gated (by the caller / `plan.phys.join_pk_ordered`) to exactly two non-lateral
-    /// base relations, an INNER or CROSS join, a `LIMIT`, and an `ORDER BY` the outer PK satisfies.
+    /// elided, and with a `LIMIT` the loop STOPS once the window is filled. An ordinary inner is
+    /// materialized once; an index-nested-loop inner is opened per outer row and later seeks are
+    /// skipped when the window fills. Gated (by the caller / `plan.phys.join_pk_ordered`) to exactly
+    /// two non-lateral base relations, an INNER or CROSS join, a `LIMIT`, and an `ORDER BY` the outer
+    /// PK satisfies.
     pub(crate) fn exec_streaming_join(
         &self,
         plan: &SelectPlan,
@@ -1176,13 +1176,16 @@ impl Engine {
         outer: &[&[Value]],
         stmt_rng: &std::cell::Cell<crate::seam::StmtRng>,
     ) -> Result<SelectResult> {
-        // Materialize both relations once, in primary-key order (the page_read block + per-row
-        // storage_row_read accrue inside materialize_rel, cost.md §3) — the same full materialization
-        // the eager join does; only the nested-loop work short-circuits.
+        // Materialize the outer once, in primary-key order. An ordinary inner is materialized once
+        // too; an INL inner is opened below per outer row. Scan units accrue inside materialize_rel.
         let left_rows =
             self.materialize_rel(plan, 0, params, outer, &[], stmt_rng, env.ctes, meter)?;
-        let right_rows =
-            self.materialize_rel(plan, 1, params, outer, &[], stmt_rng, env.ctes, meter)?;
+        let right_inl = plan.phys.rel_inl_bounds[1].is_some();
+        let right_rows = if right_inl {
+            Vec::new()
+        } else {
+            self.materialize_rel(plan, 1, params, outer, &[], stmt_rng, env.ctes, meter)?
+        };
         let on = &plan.joins[0].on;
 
         let limit = plan.limit;
@@ -1191,7 +1194,15 @@ impl Engine {
         if limit != Some(0) {
             let mut passed: i64 = 0;
             'outer: for left in &left_rows {
-                for right in &right_rows {
+                let inner_rows;
+                let current_right = if right_inl {
+                    inner_rows = self
+                        .materialize_rel(plan, 1, params, outer, left, stmt_rng, env.ctes, meter)?;
+                    &inner_rows
+                } else {
+                    &right_rows
+                };
+                for right in current_right {
                     let mut combined = left.clone();
                     combined.extend_from_slice(right);
                     // INNER: keep the pair iff its ON is TRUE (3VL); CROSS: keep every pair (no ON).

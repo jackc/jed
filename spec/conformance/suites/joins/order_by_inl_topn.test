@@ -1,0 +1,116 @@
+# Two-table join top-N combined with index-nested-loop (cost.md §3): ORDER BY the forward outer PK
+# preserves the eager INL nested-loop order, while LIMIT stops opening later per-outer inner bounds.
+# A started PK/index bound is materialized completely; only later outer-row probes disappear.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, dml.insert, dml.insert_multi_row, query.select, query.join_inner, query.cross_join, query.qualified_column, query.table_alias, query.where_eq, query.comparison_order, query.logical_connectives, query.order_by, query.order_by_keys, query.limit, query.offset, query.index_nested_loop, query.order_by_join_scan, query.order_by_join_inl, types.i32, null.three_valued, resource.cost_metering
+
+statement ok
+CREATE TABLE o (id i32 PRIMARY KEY, k i32)
+
+statement ok
+CREATE TABLE i (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO o VALUES (1, 2), (2, 5), (3, 9), (4, NULL), (5, 4)
+
+statement ok
+INSERT INTO i VALUES (2, 20), (4, 40), (5, 50)
+
+# Two hits fill the window, so the miss, NULL-empty bound, and final hit are never opened.
+# outer full scan: 1 page + 5 rows; two inner point bounds: 2 × (1 page + 1 row);
+# two ON evaluations + two produced = 14.
+# cost: 14
+query II nosort
+SELECT o.id, i.id FROM o JOIN i ON i.id = o.k ORDER BY o.id LIMIT 2
+----
+1
+2
+2
+5
+
+# LIMIT 0 still materializes the outer source, but opens no inner bound.
+# cost: 6
+query II nosort
+SELECT o.id, i.id FROM o JOIN i ON i.id = o.k ORDER BY o.id LIMIT 0
+----
+
+# OFFSET consumes the first two hits. Execution must continue through the miss (one page), the
+# NULL-empty bound (zero), and the final hit: outer 6 + inner 7 + ON 3 + produced 1 = 17.
+# cost: 17
+query II nosort
+SELECT o.id, i.id FROM o JOIN i ON i.id = o.k ORDER BY o.id LIMIT 2 OFFSET 2
+----
+5
+4
+
+# A WHERE-derived sibling bound composes with CROSS JOIN. There is no ON evaluation; the residual
+# WHERE is evaluated on the two hits: outer 6 + inner 4 + WHERE 2 + produced 2 = 14.
+# cost: 14
+query II nosort
+SELECT o.id, i.id FROM o CROSS JOIN i WHERE i.id = o.k ORDER BY o.id LIMIT 2
+----
+1
+2
+2
+5
+
+# Residual ON rejection: all three hits are examined before two survive. Outer 6 + inner 7 +
+# three 3-node AND predicates + two produced = 24.
+# cost: 24
+query II nosort
+SELECT o.id, i.id FROM o JOIN i ON i.id = o.k AND i.v > 20 ORDER BY o.id LIMIT 2
+----
+2
+5
+5
+4
+
+# Residual WHERE rejection stops after the second hit: outer 6 + inner 4 + two ON + two WHERE +
+# one produced = 15.
+# cost: 15
+query II nosort
+SELECT o.id, i.id FROM o JOIN i ON i.id = o.k WHERE i.v > 20 ORDER BY o.id LIMIT 1
+----
+2
+5
+
+# Secondary-index INL fanout preserves the eager per-outer index/PK order. Each started bound is
+# gathered completely, so p1 and p2 each cost index page(1) + two table pages + two row reads = 5;
+# p3 is never opened. Outer 4 + bounds 10 + ON 3 + produced 3 = 20.
+statement ok
+CREATE TABLE p (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE c (id i32 PRIMARY KEY, pref i32)
+
+statement ok
+CREATE INDEX c_pref ON c (pref)
+
+statement ok
+INSERT INTO p VALUES (1), (2), (3)
+
+statement ok
+INSERT INTO c VALUES (10, 1), (11, 1), (12, 2), (13, 2), (14, 3)
+
+# cost: 20
+query II nosort
+SELECT p.id, c.id FROM p JOIN c ON c.pref = p.id ORDER BY p.id LIMIT 3
+----
+1
+10
+1
+11
+2
+12
+
+# An inner ORDER BY tie-break is still blocking. The eager INL path opens all three bounds, evaluates
+# all five ON pairs, sorts, then emits three rows: outer 4 + inner 13 + ON 5 + produced 3 = 25.
+# cost: 25
+query II nosort
+SELECT p.id, c.id FROM p JOIN c ON c.pref = p.id ORDER BY p.id, c.id LIMIT 3
+----
+1
+10
+1
+11
+2
+12

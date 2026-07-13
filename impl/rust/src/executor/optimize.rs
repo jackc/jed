@@ -178,10 +178,10 @@ impl Engine {
                     | Some(ScanBound::PkSet(_))
                     | Some(ScanBound::IndexSet(_))
             )
-            // The inner relation must not be an index-nested-loop relation — it is re-materialized
-            // per outer row, so the two-table streaming loop (both materialized once) does not
-            // apply (combining the top-N loop with INL is a follow-on).
-            && plan.phys.rel_inl_bounds.iter().all(|b| b.is_none())
+            && plan.phys.rel_inl_bounds[0].is_none()
+            // PK and ordered-B-tree INL materialization emits the same per-outer key order as the
+            // eager nested-loop path. GIN/GiST sibling bounds arrive separately in Phase 6.
+            && matches!(plan.phys.rel_inl_bounds[1], None | Some(ScanBound::Pk(_)) | Some(ScanBound::Index(_)))
             // No ORDER BY key beyond the outer PK: the outer PK is unique over the OUTER table but
             // NOT over the join output (one outer row fans out to many), so an extra key (`ORDER BY
             // a.id, b.x`) is a real tie-break the outer scan order does not satisfy — unlike the

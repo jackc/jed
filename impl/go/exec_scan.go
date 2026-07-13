@@ -1243,19 +1243,22 @@ func (db *engine) execStreamingSort(plan *selectPlan, env *evalEnv, meter *costM
 // execStreamingJoin is a streaming two-table INNER/CROSS join whose ORDER BY is satisfied by the
 // OUTER (first) relation's PK scan order (cost.md §3 "JOIN"). A left-deep nested loop produces
 // combined rows in (outer PK, inner key) order — which IS the requested order — so the sort is
-// elided, and with a LIMIT the loop STOPS once the window is filled. Both tables are still
-// materialized in full (storage_row_read = the sum of cardinalities, the join contract); only the
-// ON/WHERE operator_evals and row_produced short-circuit. Gated (by the caller / plan.joinPkOrdered)
-// to exactly two non-lateral base relations, an INNER/CROSS join, a LIMIT, and a forward outer-PK
-// ORDER BY.
+// elided, and with a LIMIT the loop STOPS once the window is filled. An ordinary inner is
+// materialized once; an index-nested-loop inner is opened per outer row and later seeks are skipped
+// when the window fills. Gated (by the caller / plan.joinPkOrdered) to exactly two non-lateral base
+// relations, an INNER/CROSS join, a LIMIT, and a forward outer-PK ORDER BY.
 func (db *engine) execStreamingJoin(plan *selectPlan, env *evalEnv, meter *costMeter, params []Value, outer []storedRow, rng *stmtRng) (selectResult, error) {
 	leftRows, err := db.materializeRel(plan, 0, params, outer, nil, rng, env.ctes, meter)
 	if err != nil {
 		return selectResult{}, err
 	}
-	rightRows, err := db.materializeRel(plan, 1, params, outer, nil, rng, env.ctes, meter)
-	if err != nil {
-		return selectResult{}, err
+	rightINL := plan.phys.relINLBounds[1] != nil
+	var rightRows []storedRow
+	if !rightINL {
+		rightRows, err = db.materializeRel(plan, 1, params, outer, nil, rng, env.ctes, meter)
+		if err != nil {
+			return selectResult{}, err
+		}
 	}
 	on := plan.joins[0].on
 
@@ -1268,7 +1271,14 @@ func (db *engine) execStreamingJoin(plan *selectPlan, env *evalEnv, meter *costM
 		var passed int64
 	outerLoop:
 		for _, left := range leftRows {
-			for _, right := range rightRows {
+			innerRows := rightRows
+			if rightINL {
+				innerRows, err = db.materializeRel(plan, 1, params, outer, left, rng, env.ctes, meter)
+				if err != nil {
+					return selectResult{}, err
+				}
+			}
+			for _, right := range innerRows {
 				combined := make(storedRow, 0, len(left)+len(right))
 				combined = append(combined, left...)
 				combined = append(combined, right...)

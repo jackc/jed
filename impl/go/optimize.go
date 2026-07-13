@@ -113,7 +113,8 @@ func indexOrderCompatibleBound(io *indexOrderPlan, sb *scanBound) bool {
 // the loop short-circuits a top-N. Gated to exactly two non-lateral base relations, an INNER/CROSS
 // join, a LIMIT, and a FORWARD outer-PK order with NO key beyond the outer PK (an extra key is a
 // real tie-break the outer scan order does not satisfy — the outer PK is not unique over the join
-// output). The outer must carry no non-PK bound (a PK bound / no bound keeps it in PK order).
+// output). The outer must carry no non-PK bound (a PK bound / no bound keeps it in PK order); the
+// optional inner INL must be PK/B-tree so its per-outer materialization preserves eager key order.
 func (db *engine) ruleJoinPkOrdered(plan *selectPlan, rels []scopeRel) {
 	if !plan.isAgg && !plan.hasWindow && !plan.distinct && len(plan.order) > 0 && len(plan.orderExprs) == 0 &&
 		plan.limit != nil && len(plan.rels) == 2 && len(plan.joins) == 1 &&
@@ -121,9 +122,16 @@ func (db *engine) ruleJoinPkOrdered(plan *selectPlan, rels []scopeRel) {
 		!plan.rels[0].lateral && plan.rels[0].srf == nil && plan.rels[0].cte == nil && plan.rels[0].derived == nil &&
 		!plan.rels[1].lateral && plan.rels[1].srf == nil && plan.rels[1].cte == nil && plan.rels[1].derived == nil &&
 		!plan.phys.relBounds[0].needsEagerScan() &&
-		plan.phys.relINLBounds[0] == nil && plan.phys.relINLBounds[1] == nil &&
+		plan.phys.relINLBounds[0] == nil && joinTopNINLCompatible(plan.phys.relINLBounds[1]) &&
 		len(plan.order) <= len(rels[0].table.PKIndices()) {
 		ok, reverse := db.orderSatisfiedByPK(rels[0].table, plan.rels[0].offset, plan.order)
 		plan.phys.joinPkOrdered = ok && !reverse
 	}
+}
+
+// joinTopNINLCompatible reports whether the two-table streaming join can open the inner bound once
+// per outer row without changing nested-loop order. PK and ordered-B-tree INL materialization emits
+// the same key order as the eager INL path; opclass sibling bounds arrive in Phase 6.
+func joinTopNINLCompatible(sb *scanBound) bool {
+	return sb == nil || sb.pk != nil || sb.index != nil
 }

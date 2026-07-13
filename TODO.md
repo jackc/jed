@@ -184,8 +184,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   right/nullable side of INNER/CROSS/LEFT only), turning O(N·M) into O(N·log M); cap
   `query.index_nested_loop`. → [cost.md §3](spec/design/cost.md),
   `spec/conformance/suites/joins/index_nested_loop.test`
-  - [ ] _follow-on:_ combining INL with the two-table streaming top-N join (`join_pk_ordered`);
-    GIN/GiST sibling bounds.
+  - [x] **Two-table top-N combination** — an outer-PK-ordered LIMIT opens a PK/B-tree INL inner
+    bound per outer row and stops later seeks at the window; cap `query.order_by_join_inl`.
+  - [ ] _follow-on:_ GIN/GiST sibling bounds.
 - [x] **`OR` / `IN`-list → merged point lookups** — a disjunction of equalities on one key column
   (the PK, or a leading B-tree secondary-index column) lowers to a union of point probes over a
   de-duplicated, sorted key set; a last resort (fires only where no contiguous bound applies), cost =

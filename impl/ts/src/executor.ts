@@ -12131,11 +12131,10 @@ export class Engine {
   // execStreamingJoin is a streaming two-table INNER/CROSS join whose ORDER BY is satisfied by the
   // OUTER (first) relation's PK scan order (cost.md §3 "JOIN"). A left-deep nested loop produces
   // combined rows in (outer PK, inner key) order — which IS the requested order — so the sort is
-  // elided, and with a LIMIT the loop STOPS once the window is filled. Both tables are still
-  // materialized in full (storageRowRead = the sum of cardinalities, the join contract); only the
-  // ON/WHERE operator_evals and rowProduced short-circuit. Gated (by the caller / plan.phys.joinPkOrdered)
-  // to exactly two non-lateral base relations, an INNER/CROSS join, a LIMIT, and a forward outer-PK
-  // ORDER BY.
+  // elided, and with a LIMIT the loop STOPS once the window is filled. An ordinary inner is
+  // materialized once; an index-nested-loop inner is opened per outer row and later seeks are skipped
+  // when the window fills. Gated (by the caller / plan.phys.joinPkOrdered) to exactly two non-lateral
+  // base relations, an INNER/CROSS join, a LIMIT, and a forward outer-PK ORDER BY.
   private execStreamingJoin(
     plan: SelectPlan,
     env: EvalEnv,
@@ -12144,7 +12143,8 @@ export class Engine {
     outer: Row[],
   ): SelectResult {
     const leftRows = this.materializeRel(plan, 0, outer, [], env, params, meter);
-    const rightRows = this.materializeRel(plan, 1, outer, [], env, params, meter);
+    const rightINL = plan.phys.relINLBounds[1] !== null;
+    const rightRows = rightINL ? [] : this.materializeRel(plan, 1, outer, [], env, params, meter);
     const on = plan.joins[0]!.on;
 
     const limit = plan.limit;
@@ -12154,7 +12154,10 @@ export class Engine {
       let passed = 0n;
       // biome-ignore lint/suspicious/noLabelVar: `outer` is a loop label for the nested-join break/continue, not a variable.
       outer: for (const left of leftRows) {
-        for (const right of rightRows) {
+        const innerRows = rightINL
+          ? this.materializeRel(plan, 1, outer, left, env, params, meter)
+          : rightRows;
+        for (const right of innerRows) {
           const combined = [...left, ...right];
           // INNER: keep the pair iff its ON is TRUE (3VL); CROSS: keep every pair (no ON).
           if (on !== null && !isTrue(evalExpr(on, combined, env, meter))) continue;

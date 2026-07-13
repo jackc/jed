@@ -420,13 +420,18 @@ only yesterday's optimizations is false confidence (CLAUDE.md §10 "no silent ca
   the pushdown), defeated by `pk + 0 = K`; **correlated** — a correlated subquery whose inner pk
   equals an outer column (`inr.id = o.k`) bounds the inner re-scan to a per-outer-row seek
   (through EXISTS / scalar / IN, including a NULL outer key), defeated by `inr.id + 0 = o.k`;
+  **join_inl_topn** — an outer-PK-ordered join LIMIT combines with a PK/secondary-index sibling
+  bound, defeated by wrapping both the inner key and outer order key in `+ 0`; both spellings must
+  produce the same total-order window;
   **index** — a secondary-index equality (`v = K` on an indexed column) fetches via the index
   tree + per-row point lookups ([indexes.md §5](indexes.md)), defeated by `v + 0 = K`, checked
   across UPDATE/DELETE maintenance and a NULL indexed value (3VL through the index); **or_in** — an
   OR / IN-list of key equalities (`pk IN (a,b,c)`, `pk = a OR pk = b`, and the secondary-index form)
   lowers to a **union of point probes** ([cost.md §3](cost.md) "OR / IN-list"), defeated by
   `pk + 0 IN (…)`, checked with a NULL list element / an absent key / across a PK-IN-list
-  UPDATE/DELETE (the point-set DML path); **window** —
+  UPDATE/DELETE (the point-set DML path); **interval_set** and **bounded_limit** — canonical disjoint
+  key intervals and their bounded LIMIT windows match `+ 0` full-scan spellings across PK, ordered
+  secondary-index, and GIN cases; **window** —
   the window frame **sliding-window optimization** ([window.md §5.2](window.md)): an explicit
   expanding `ROWS UNBOUNDED PRECEDING..CURRENT ROW` aggregate (the sliding path) must equal the
   DEFAULT-frame aggregate (the separate running-pass path) — distinct ids ⇒ no peers ⇒ the two
@@ -445,8 +450,8 @@ only yesterday's optimizations is false confidence (CLAUDE.md §10 "no silent ca
   against the same logic; **join_comm** — INNER-JOIN commutativity (`a JOIN b` ≡ `b JOIN a`) and the
   CROSS-JOIN-plus-filter equivalence (`a JOIN b ON a.k=b.k` ≡ `a CROSS JOIN b WHERE a.k=b.k`), the
   same projected pairs through different execution shapes.
-- **NOT yet covered (needs a new relation):** any future index *range* / multi-column-prefix
-  bound, DISTINCT / aggregate pushdown, or other optimization added later; on the TLP side,
+- **NOT yet covered (needs a new relation):** any future optimization without a scenario in
+  `scripts/norec_gen.rb`; on the TLP side,
   `AVG` aggregate partitioning (deferred — its by-construction expected is an exact-`decimal`
   `SUM`/`COUNT` division, above). Each is a future relation the sweep does **not** yet exercise — add a
   scenario when it lands.

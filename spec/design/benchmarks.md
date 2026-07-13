@@ -6,7 +6,8 @@ benchmarks (`gin_contains` / `gin_overlaps` / `gin_member` / `gin_array_eq` / `g
 over a dedicated `gin` dataset (§4), the regex + window benchmarks, and the **concurrent-reader
 throughput** benchmarks (the `concurrent_read` kind, §8.1). Rule-based access-path work is pinned by
 scratch workloads including `composite_pk_lookup`, `interval_set_pk`, and
-`bounded_index_limit`. This document is the canonical record for the `bench/` subsystem.
+`bounded_index_limit`, plus `join_inl_topn` for the combined join rule. This document is the
+canonical record for the `bench/` subsystem.
 
 ## 1. Purpose and non-goals
 

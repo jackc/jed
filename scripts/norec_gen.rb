@@ -56,6 +56,9 @@
 #              served by the nested loop in (outer PK, inner key) order (the sort elided, cost.md §3
 #              "JOIN"); with a LIMIT it short-circuits the loop. The windows + the no-LIMIT eager full
 #              must reconstruct the SAME by-construction (a.id, b.id)-ordered join.
+#   join_inl_topn — the join top-N opens a PK/secondary-index INL bound once per outer row and stops
+#              later probes at LIMIT; wrapping the inner key and ORDER BY outer key in `+ 0` defeats
+#              both rules. The bounded and blocking spellings must return the same total-order window.
 #   tlp      — Ternary-Logic Partitioning (SQLancer): for ANY predicate p, every row is in exactly
 #              one of `WHERE p` (TRUE) / `WHERE NOT p` (FALSE) / `WHERE p IS NULL` (UNKNOWN), so the
 #              three partitions UNION ALL must reconstruct the whole table (and COUNT over the whole
@@ -186,6 +189,11 @@ JOIN_ORDER_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi
                     query.join_inner query.qualified_column query.table_alias query.where_eq
                     query.comparison_order query.order_by query.order_by_keys query.limit
                     query.offset query.order_by_join_scan types.i32].freeze
+JOIN_INL_TOPN_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index dml.insert
+                       dml.insert_multi_row query.select query.join_inner query.qualified_column
+                       query.table_alias query.where_eq query.order_by query.order_by_keys query.limit
+                       query.offset query.index_nested_loop query.order_by_join_scan
+                       query.order_by_join_inl expr.arithmetic types.i32 null.three_valued].freeze
 TLP_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
              query.where_eq query.comparison_order query.order_by query.is_null
              query.logical_connectives query.union query.aggregates query.group_by
@@ -981,6 +989,57 @@ def gen_join_order(seed)
     out << "# a JOIN b ON a.k = b.k ORDER BY a.id #{clause.empty? ? '(full eager reference)' : clause}"
     q(out, "II", "SELECT a.id, b.id FROM a JOIN b ON a.k = b.k ORDER BY a.id #{clause}".strip, flat.call(exp))
   end
+
+  out.join("\n") + "\n"
+end
+
+# --- scenario: join top-N combined with index-nested-loop -------------------------------------
+def gen_join_inl_topn(seed)
+  rng = Random.new(seed)
+  inner_ids = (10..70).to_a.sample(8, random: rng).sort
+  outer_ids = (1..40).to_a.sample(10, random: rng).sort
+  # Guarantee a useful mix: six hits, one NULL-empty bound, and three misses.
+  misses = ((71..100).to_a).sample(3, random: rng)
+  keys = inner_ids.sample(6, random: rng) + [nil] + misses
+  keys.shuffle!(random: rng)
+  orows = outer_ids.zip(keys)
+  irows = inner_ids.map { |id| [id, rng.rand(-100..100)] }
+  joined = orows.filter_map do |oid, key|
+    hit = irows.find { |iid, _v| iid == key }
+    hit && [oid, hit[0]]
+  end.sort
+  flat = ->(rs) { rs.flat_map { |a, b| [a.to_s, b.to_s] } }
+  k = rng.rand(2..[joined.size - 1, 2].max)
+  off = rng.rand(0..1)
+
+  out = header(seed, JOIN_INL_TOPN_REQ, "join top-N combined with index-nested-loop")
+  stmt(out, "CREATE TABLE o (id i32 PRIMARY KEY, k i32)")
+  stmt(out, "CREATE TABLE i (id i32 PRIMARY KEY, v i32)")
+  stmt(out, "INSERT INTO o VALUES #{orows.map { |id, key| "(#{id}, #{key.nil? ? 'NULL' : key})" }.join(', ')}")
+  stmt(out, "INSERT INTO i VALUES #{irows.map { |id, v| "(#{id}, #{v})" }.join(', ')}")
+
+  expected = joined[off, k] || []
+  out << "# PK INL + outer-PK top-N versus a blocking full-scan spelling"
+  q(out, "II", "SELECT o.id, i.id FROM o JOIN i ON i.id = o.k ORDER BY o.id LIMIT #{k} OFFSET #{off}", flat.call(expected))
+  q(out, "II", "SELECT o.id, i.id FROM o JOIN i ON i.id + 0 = o.k ORDER BY o.id + 0, i.id LIMIT #{k} OFFSET #{off}", flat.call(expected))
+
+  # Secondary-index fanout: the index emits equal-pref children in PK order, exactly the explicit
+  # reference tie-break. A +0-wrapped inner key defeats INL and outer-key +0 defeats join top-N.
+  prows = (1..5).map { |id| [id] }
+  crows = (101..112).map { |id| [id, rng.rand(1..5)] }
+  fanout = prows.flat_map do |(pid)|
+    crows.select { |_cid, pref| pref == pid }.map { |cid, _pref| [pid, cid] }
+  end
+  fk = rng.rand(2..[fanout.size - 1, 2].max)
+  expected = fanout[0, fk] || []
+  stmt(out, "CREATE TABLE p (id i32 PRIMARY KEY)")
+  stmt(out, "CREATE TABLE c (id i32 PRIMARY KEY, pref i32)")
+  stmt(out, "CREATE INDEX c_pref ON c (pref)")
+  stmt(out, "INSERT INTO p VALUES #{prows.map { |(id)| "(#{id})" }.join(', ')}")
+  stmt(out, "INSERT INTO c VALUES #{crows.map { |id, pref| "(#{id}, #{pref})" }.join(', ')}")
+  out << "# secondary-index fanout INL + outer-PK top-N versus blocking full scan"
+  q(out, "II", "SELECT p.id, c.id FROM p JOIN c ON c.pref = p.id ORDER BY p.id LIMIT #{fk}", flat.call(expected))
+  q(out, "II", "SELECT p.id, c.id FROM p JOIN c ON c.pref + 0 = p.id ORDER BY p.id + 0, c.id LIMIT #{fk}", flat.call(expected))
 
   out.join("\n") + "\n"
 end
@@ -1841,6 +1900,7 @@ SCENARIOS = {
   "index_order" => method(:gen_index_order),
   "distinct_order" => method(:gen_distinct_order),
   "join_order" => method(:gen_join_order),
+  "join_inl_topn" => method(:gen_join_inl_topn),
   "gin" => method(:gen_gin),
   "gin_any" => method(:gen_gin_any),
   "gin_eq" => method(:gen_gin_eq),

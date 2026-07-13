@@ -346,6 +346,7 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "query.order_by_pk_scan",
     "query.order_by_index_scan",
     "query.order_by_join_scan",
+    "query.order_by_join_inl",
     // Database-qualified table names — `main.`/`temp.` in table position (attached-databases.md §3,
     // Slice 1a).
     "query.qualified_table",

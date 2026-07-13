@@ -145,7 +145,8 @@ function ruleOrderByIndexScan(plan: SelectPlan, rels: ScopeRel[], snap: Snapshot
 // the loop short-circuits a top-N. Gated to exactly two non-lateral base relations, an INNER/CROSS
 // join, a LIMIT, and a FORWARD outer-PK order with NO key beyond the outer PK (an extra key is a
 // real tie-break the outer scan order does not satisfy — the outer PK is not unique over the join
-// output). The outer must carry no non-PK bound (a PK bound / no bound keeps it in PK order).
+// output). The outer must carry no non-PK bound (a PK bound / no bound keeps it in PK order); the
+// optional inner INL must be PK/B-tree so its per-outer materialization preserves eager key order.
 function ruleJoinPkOrdered(plan: SelectPlan, rels: ScopeRel[], snap: Snapshot): void {
   if (
     !plan.isAgg &&
@@ -163,7 +164,9 @@ function ruleJoinPkOrdered(plan: SelectPlan, rels: ScopeRel[], snap: Snapshot): 
     ) &&
     !needsEagerScan(plan.phys.relBounds[0]) &&
     plan.phys.relINLBounds[0] === null &&
-    plan.phys.relINLBounds[1] === null &&
+    (plan.phys.relINLBounds[1] === null ||
+      plan.phys.relINLBounds[1]!.kind === "pk" ||
+      plan.phys.relINLBounds[1]!.kind === "index") &&
     plan.order.length <= pkIndices(rels[0]!.table).length
   ) {
     const dir = orderSatisfiedByPK(snap, rels[0]!.table, plan.rels[0]!.offset, plan.order);

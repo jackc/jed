@@ -113,6 +113,12 @@ primary key cannot disturb the scan. An `IN` list on an indexed leading column u
 set of index point probes. The complete `WHERE` is still rechecked for every candidate; only the
 work changes, never which rows are updated or deleted.
 
+The same rule applies inside a join: `parent JOIN child ON child.parent_id = parent.id` opens the
+child index once per parent row instead of rescanning all children. With `ORDER BY parent.id LIMIT
+...`, jed preserves that nested-loop order and stops opening later child bounds as soon as the result
+window is full. Each bound it does start is gathered completely, so duplicate child keys retain their
+primary-key tie-break and the result is identical to the blocking plan.
+
 ## Expression indexes
 
 A key element can be an **expression** over the table's columns instead of a bare column — a bare

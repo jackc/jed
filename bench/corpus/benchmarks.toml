@@ -117,6 +117,27 @@ base = 0
 off_min = 64
 off_max = 128
 
+# Join top-N combined with index-nested-loop (query.order_by_join_inl). The outer-PK order needs no
+# sort and LIMIT 10 stops after ten per-outer inner PK seeks. Before the combination, INL still
+# opened all 10k inner bounds and the blocking path sorted the complete 1:1 join before slicing.
+[[bench]]
+name = "join_inl_topn"
+description = "Outer-PK ORDER BY LIMIT 10 over a 10k×100k 1:1 join; stop after ten inner PK seeks"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT o.id, i.v FROM join_outer o JOIN join_inner i ON i.id = o.k ORDER BY o.id LIMIT 10"
+warmup = 50
+iterations = 1000
+seed = 4256
+expect_rows_per_iter = 10
+engines = ["jed", "postgres"]
+setup_sql = [
+  "CREATE TABLE join_outer (id bigint PRIMARY KEY, k bigint)",
+  "CREATE TABLE join_inner (id bigint PRIMARY KEY, v bigint)",
+  "INSERT INTO join_outer SELECT g, g FROM generate_series(1, 10000) AS g",
+  "INSERT INTO join_inner SELECT g, g * 2 FROM generate_series(1, 100000) AS g"
+]
+
 [[bench]]
 name = "secondary_lookup"
 description = "Secondary-index equality lookup on 1M rows (~10 rows per customer)"
