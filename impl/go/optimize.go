@@ -5,6 +5,18 @@ import (
 	"sort"
 )
 
+func physicalRelOrdinal(plan *selectPlan, position int) int {
+	if len(plan.phys.relationOrder) == len(plan.rels) {
+		return plan.phys.relationOrder[position]
+	}
+	return position
+}
+
+func relationColumnRange(plan *selectPlan, ordinal int) *columnRange {
+	rel := plan.rels[ordinal]
+	return &columnRange{start: rel.offset, end: rel.offset + rel.colCount}
+}
+
 // Physical / access-path selection — Stage 3 of the planner (spec/design/planner.md §4). The
 // optimizeSelect pass runs after the resolve half has built the logical plan (planSelect,
 // planner.go) and applies each optimization as a DISCRETE RULE: one function owning its gate (the
@@ -27,6 +39,7 @@ func (db *engine) optimizeSelect(plan *selectPlan, rels []scopeRel) {
 	db.ruleOrderByPkScan(plan, rels)
 	db.ruleOrderByIndexScan(plan, rels)
 	db.ruleCostedSingleRelationPipeline(plan, rels)
+	db.ruleCostedTwoRelationJoin(plan, rels)
 	db.ruleJoinPkOrdered(plan, rels)
 	db.ruleOrderByLimitTopK(plan, rels)
 }
@@ -41,22 +54,30 @@ func (db *engine) ruleHashJoin(plan *selectPlan, rels []scopeRel) {
 		(plan.joins[0].kind != joinInner && plan.joins[0].kind != joinLeft) || plan.joins[0].on == nil {
 		return
 	}
+	plan.phys.hashJoin = buildHashJoinPlan(plan, rels, 0, 1)
+}
+
+func buildHashJoinPlan(plan *selectPlan, rels []scopeRel, outer, inner int) *hashJoinPlan {
+	if len(rels) != 2 || len(plan.joins) != 1 || plan.joins[0].on == nil {
+		return nil
+	}
 	var conjuncts []*rExpr
 	flattenHashJoinConjuncts(plan.joins[0].on, &conjuncts)
 	keys := make([]hashJoinKey, 0)
-	rightOffset := rels[1].offset
+	outerRange := columnRange{start: rels[outer].offset, end: rels[outer].offset + len(rels[outer].table.Columns)}
+	innerRange := columnRange{start: rels[inner].offset, end: rels[inner].offset + len(rels[inner].table.Columns)}
 	for _, expr := range conjuncts {
 		if !hashJoinSafeConjunct(expr) {
-			return
+			return nil
 		}
 		if expr.op != opEq || expr.lhs.kind != reColumn || expr.rhs.kind != reColumn {
 			continue
 		}
 		left, right := expr.lhs.index, expr.rhs.index
-		if left >= rightOffset && right < rightOffset {
+		if innerRange.contains(left) && outerRange.contains(right) {
 			left, right = right, left
 		}
-		if left < 0 || left >= rightOffset || right < rightOffset {
+		if !outerRange.contains(left) || !innerRange.contains(right) {
 			continue
 		}
 		lt, lok := hashJoinColumnType(rels, left)
@@ -67,8 +88,9 @@ func (db *engine) ruleHashJoin(plan *selectPlan, rels []scopeRel) {
 		keys = append(keys, hashJoinKey{left: left, right: right, ty: lt})
 	}
 	if len(keys) > 0 {
-		plan.phys.hashJoin = &hashJoinPlan{keys: keys}
+		return &hashJoinPlan{keys: keys}
 	}
+	return nil
 }
 
 func flattenHashJoinConjuncts(expr *rExpr, out *[]*rExpr) {
@@ -301,6 +323,128 @@ func (db *engine) ruleCostedSingleRelationPipeline(plan *selectPlan, rels []scop
 	plan.phys.indexOrder = pipelines[winner].indexOrder
 }
 
+type joinAlgorithm int
+
+const (
+	joinAlgorithmINL joinAlgorithm = iota
+	joinAlgorithmHash
+	joinAlgorithmNested
+)
+
+type twoRelationCandidate struct {
+	order                  [2]int
+	outerIdentity          scanCandidateIdentity
+	innerIdentity          scanCandidateIdentity
+	algorithm              joinAlgorithm
+	outerBound, innerBound *scanBound
+	innerINL               *scanBound
+	hash                   *hashJoinPlan
+}
+
+func compareScanIdentity(a, b scanCandidateIdentity) int {
+	if a.kind < b.kind {
+		return -1
+	}
+	if a.kind > b.kind {
+		return 1
+	}
+	return bytes.Compare([]byte(a.indexName), []byte(b.indexName))
+}
+
+// ruleCostedTwoRelationJoin is P7's exhaustive two-base INNER/CROSS search. Resolved logical slots
+// stay in source order; relationOrder controls only physical drive/build order.
+func (db *engine) ruleCostedTwoRelationJoin(plan *selectPlan, rels []scopeRel) {
+	if len(rels) != 2 || len(plan.rels) != 2 || len(plan.joins) != 1 ||
+		(plan.joins[0].kind != joinInner && plan.joins[0].kind != joinCross) {
+		return
+	}
+	for i := range plan.rels {
+		if plan.rels[i].lateral || plan.rels[i].srf != nil || plan.rels[i].cte != nil || plan.rels[i].derived != nil {
+			return
+		}
+	}
+
+	ordinary := [2][]scanCandidate{
+		inventoryScanCandidates(plan.filter, rels[0], db),
+		inventoryScanCandidates(plan.filter, rels[1], db),
+	}
+	var candidates []twoRelationCandidate
+	for _, order := range [][2]int{{0, 1}, {1, 0}} {
+		outer, inner := order[0], order[1]
+		hash := buildHashJoinPlan(plan, rels, outer, inner)
+		for _, oc := range ordinary[outer] {
+			for _, ic := range ordinary[inner] {
+				base := twoRelationCandidate{
+					order: order, outerIdentity: oc.identity, innerIdentity: ic.identity,
+					outerBound: oc.bound, innerBound: ic.bound,
+				}
+				if hash != nil {
+					hc := base
+					hc.algorithm, hc.hash = joinAlgorithmHash, hash
+					candidates = append(candidates, hc)
+				}
+				base.algorithm = joinAlgorithmNested
+				candidates = append(candidates, base)
+			}
+			inl := inventoryINLCandidates(plan.joins[0].on, plan.filter, rels[inner], relationColumnRange(plan, outer), db)
+			for _, ic := range inl {
+				candidates = append(candidates, twoRelationCandidate{
+					order: order, outerIdentity: oc.identity, innerIdentity: ic.identity,
+					algorithm: joinAlgorithmINL, outerBound: oc.bound, innerINL: ic.bound,
+				})
+			}
+		}
+	}
+	if len(candidates) == 0 {
+		return
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		a, b := candidates[i], candidates[j]
+		if a.order != b.order {
+			if a.order[0] != b.order[0] {
+				return a.order[0] < b.order[0]
+			}
+			return a.order[1] < b.order[1]
+		}
+		if c := compareScanIdentity(a.outerIdentity, b.outerIdentity); c != 0 {
+			return c < 0
+		}
+		if c := compareScanIdentity(a.innerIdentity, b.innerIdentity); c != 0 {
+			return c < 0
+		}
+		return a.algorithm < b.algorithm
+	})
+
+	winner, winnerCost := -1, int64(0)
+	for i, candidate := range candidates {
+		trial := *plan
+		trial.phys = plan.phys
+		trial.phys.relationOrder = []int{candidate.order[0], candidate.order[1]}
+		trial.phys.relBounds = make([]*scanBound, 2)
+		trial.phys.relINLBounds = make([]*scanBound, 2)
+		trial.phys.relBounds[candidate.order[0]] = candidate.outerBound
+		trial.phys.relBounds[candidate.order[1]] = candidate.innerBound
+		trial.phys.relINLBounds[candidate.order[1]] = candidate.innerINL
+		trial.phys.hashJoin = candidate.hash
+		trial.phys.pkOrdered, trial.phys.pkReverse = false, false
+		trial.phys.indexOrder = nil
+		trial.phys.joinPkOrdered = db.joinPKOrderedForCandidate(&trial, rels)
+		trial.phys.topK = nil
+		cost := db.estimateSelectPlan(&trial, nil).root.cost()
+		if winner == -1 || cost < winnerCost {
+			winner, winnerCost = i, cost
+		}
+	}
+	selected := candidates[winner]
+	plan.phys.relationOrder = []int{selected.order[0], selected.order[1]}
+	plan.phys.relBounds = make([]*scanBound, 2)
+	plan.phys.relINLBounds = make([]*scanBound, 2)
+	plan.phys.relBounds[selected.order[0]] = selected.outerBound
+	plan.phys.relBounds[selected.order[1]] = selected.innerBound
+	plan.phys.relINLBounds[selected.order[1]] = selected.innerINL
+	plan.phys.hashJoin = selected.hash
+}
+
 // ruleIndexNestedLoop — index-nested-loop pushdown (cost.md §3 "JOIN"): a join inner relation
 // whose primary key / indexed column is compared to a SIBLING column of an earlier relation
 // (`a JOIN b ON b.pk = a.x`) is re-materialized per outer row, seeking instead of full-scanning —
@@ -371,17 +515,27 @@ func indexOrderCompatibleBound(io *indexOrderPlan, sb *scanBound) bool {
 // output). The outer must carry no non-PK bound (a PK bound / no bound keeps it in PK order); the
 // optional inner INL must be PK/B-tree so its per-outer materialization preserves eager key order.
 func (db *engine) ruleJoinPkOrdered(plan *selectPlan, rels []scopeRel) {
-	if !plan.isAgg && !plan.hasWindow && !plan.distinct && len(plan.order) > 0 && len(plan.orderExprs) == 0 &&
-		plan.limit != nil && len(plan.rels) == 2 && len(plan.joins) == 1 &&
-		(plan.joins[0].kind == joinInner || plan.joins[0].kind == joinCross) &&
-		!plan.rels[0].lateral && plan.rels[0].srf == nil && plan.rels[0].cte == nil && plan.rels[0].derived == nil &&
-		!plan.rels[1].lateral && plan.rels[1].srf == nil && plan.rels[1].cte == nil && plan.rels[1].derived == nil &&
-		!plan.phys.relBounds[0].needsEagerScan() &&
-		plan.phys.relINLBounds[0] == nil && joinTopNINLCompatible(plan.phys.relINLBounds[1]) &&
-		len(plan.order) <= len(rels[0].table.PKIndices()) {
-		ok, reverse := db.orderSatisfiedByPK(rels[0].table, plan.rels[0].offset, plan.order)
-		plan.phys.joinPkOrdered = ok && !reverse
+	plan.phys.joinPkOrdered = db.joinPKOrderedForCandidate(plan, rels)
+}
+
+func (db *engine) joinPKOrderedForCandidate(plan *selectPlan, rels []scopeRel) bool {
+	if len(plan.rels) != 2 || len(rels) != 2 || len(plan.joins) != 1 {
+		return false
 	}
+	outer := physicalRelOrdinal(plan, 0)
+	inner := physicalRelOrdinal(plan, 1)
+	if !plan.isAgg && !plan.hasWindow && !plan.distinct && len(plan.order) > 0 && len(plan.orderExprs) == 0 &&
+		plan.limit != nil &&
+		(plan.joins[0].kind == joinInner || plan.joins[0].kind == joinCross) &&
+		!plan.rels[outer].lateral && plan.rels[outer].srf == nil && plan.rels[outer].cte == nil && plan.rels[outer].derived == nil &&
+		!plan.rels[inner].lateral && plan.rels[inner].srf == nil && plan.rels[inner].cte == nil && plan.rels[inner].derived == nil &&
+		!plan.phys.relBounds[outer].needsEagerScan() &&
+		plan.phys.relINLBounds[outer] == nil && joinTopNINLCompatible(plan.phys.relINLBounds[inner]) &&
+		len(plan.order) <= len(rels[outer].table.PKIndices()) {
+		ok, reverse := db.orderSatisfiedByPK(rels[outer].table, plan.rels[outer].offset, plan.order)
+		return ok && !reverse
+	}
+	return false
 }
 
 // joinTopNINLCompatible reports whether the two-table streaming join can open the inner bound once

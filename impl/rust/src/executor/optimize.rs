@@ -10,6 +10,19 @@
 
 use super::*;
 
+pub(crate) fn physical_rel_ordinal(plan: &SelectPlan, position: usize) -> usize {
+    if plan.phys.relation_order.len() == plan.rels.len() {
+        plan.phys.relation_order[position]
+    } else {
+        position
+    }
+}
+
+fn relation_columns(plan: &SelectPlan, ordinal: usize) -> (usize, usize) {
+    let rel = &plan.rels[ordinal];
+    (rel.offset, rel.offset + rel.col_count)
+}
+
 impl Engine {
     /// Apply the physical rules to a freshly resolved logical plan, in a FIXED order that is part
     /// of the cross-core contract (spec/design/planner.md §4): later rules read earlier rules'
@@ -25,6 +38,7 @@ impl Engine {
         self.rule_order_by_pk_scan(plan, scope);
         self.rule_order_by_index_scan(plan, scope);
         self.rule_costed_single_relation_pipeline(plan, scope);
+        self.rule_costed_two_relation_join(plan, scope);
         self.rule_join_pk_ordered(plan, scope);
         self.rule_order_by_limit_top_k(plan);
     }
@@ -43,56 +57,297 @@ impl Engine {
         {
             return;
         }
-        let Some(on) = plan.joins[0].on.as_ref() else {
+        plan.phys.hash_join = build_hash_join_plan(plan, scope, 0, 1);
+    }
+
+    fn hash_join_plan_for(
+        &self,
+        plan: &SelectPlan,
+        scope: &Scope<'_>,
+        outer: usize,
+        inner: usize,
+    ) -> Option<HashJoinPlan> {
+        build_hash_join_plan(plan, scope, outer, inner)
+    }
+
+    /// P7's exhaustive two-base INNER/CROSS selector.
+    fn rule_costed_two_relation_join(&self, plan: &mut SelectPlan, scope: &Scope<'_>) {
+        if scope.rels.len() != 2
+            || plan.rels.len() != 2
+            || plan.joins.len() != 1
+            || !matches!(plan.joins[0].kind, JoinKind::Inner | JoinKind::Cross)
+            || plan
+                .rels
+                .iter()
+                .any(|r| r.lateral || r.srf.is_some() || r.cte.is_some() || r.derived.is_some())
+        {
             return;
-        };
-        let mut conjuncts = Vec::new();
-        flatten_hash_join_conjuncts(on, &mut conjuncts);
-        let right_offset = scope.rels[1].offset;
-        let mut keys = Vec::new();
-        for expr in conjuncts {
-            if !hash_join_safe_conjunct(expr) {
-                return;
-            }
-            let RExpr::Compare {
-                op: CmpOp::Eq,
-                lhs,
-                rhs,
-                ..
-            } = expr
-            else {
-                continue;
-            };
-            let (RExpr::Column(left), RExpr::Column(right)) = (&**lhs, &**rhs) else {
-                continue;
-            };
-            let (mut left, mut right) = (*left, *right);
-            if left >= right_offset && right < right_offset {
-                std::mem::swap(&mut left, &mut right);
-            }
-            if left >= right_offset || right < right_offset {
-                continue;
-            }
-            let Some(left_ty) = hash_join_column_type(&scope.rels, left) else {
-                continue;
-            };
-            let Some(right_ty) = hash_join_column_type(&scope.rels, right) else {
-                continue;
-            };
-            if left_ty != right_ty || !hash_join_keyable_type(left_ty) {
-                continue;
-            }
-            keys.push(HashJoinKey {
-                left,
-                right,
-                ty: left_ty.clone(),
-            });
         }
-        if !keys.is_empty() {
-            plan.phys.hash_join = Some(HashJoinPlan { keys });
+
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+        enum Algorithm {
+            Inl,
+            Hash,
+            Nested,
+        }
+        struct Candidate {
+            order: [usize; 2],
+            outer_identity: ScanCandidateIdentity,
+            inner_identity: ScanCandidateIdentity,
+            algorithm: Algorithm,
+            outer_bound: Option<ScanBound>,
+            inner_bound: Option<ScanBound>,
+            inner_inl: Option<ScanBound>,
+        }
+
+        let mut ordinary = [
+            inventory_scan_candidates(plan.filter.as_ref(), &scope.rels[0], scope.catalog),
+            inventory_scan_candidates(plan.filter.as_ref(), &scope.rels[1], scope.catalog),
+        ];
+        let mut candidates = Vec::new();
+        for order in [[0, 1], [1, 0]] {
+            let [outer, inner] = order;
+            let has_hash = self.hash_join_plan_for(plan, scope, outer, inner).is_some();
+            let outer_access = std::mem::take(&mut ordinary[outer]);
+            for oc in outer_access {
+                let inner_access = inventory_scan_candidates(
+                    plan.filter.as_ref(),
+                    &scope.rels[inner],
+                    scope.catalog,
+                );
+                for mut ic in inner_access {
+                    if has_hash {
+                        candidates.push(Candidate {
+                            order,
+                            outer_identity: oc.identity.clone(),
+                            inner_identity: ic.identity.clone(),
+                            algorithm: Algorithm::Hash,
+                            outer_bound: None,
+                            inner_bound: ic.bound.take(),
+                            inner_inl: None,
+                        });
+                        // Rebuild the same ordinary bound for the nested alternative; ScanBound is
+                        // intentionally owned, so inventory rather than cloning keeps the type flat.
+                        ic = inventory_scan_candidates(
+                            plan.filter.as_ref(),
+                            &scope.rels[inner],
+                            scope.catalog,
+                        )
+                        .into_iter()
+                        .find(|c| c.identity == ic.identity)
+                        .expect("ordinary candidate identity is reproducible");
+                    }
+                    candidates.push(Candidate {
+                        order,
+                        outer_identity: oc.identity.clone(),
+                        inner_identity: ic.identity,
+                        algorithm: Algorithm::Nested,
+                        outer_bound: None,
+                        inner_bound: ic.bound,
+                        inner_inl: None,
+                    });
+                }
+                for ic in inventory_inl_candidates(
+                    plan.joins[0].on.as_ref(),
+                    plan.filter.as_ref(),
+                    &scope.rels[inner],
+                    relation_columns(plan, outer),
+                    scope.catalog,
+                ) {
+                    candidates.push(Candidate {
+                        order,
+                        outer_identity: oc.identity.clone(),
+                        inner_identity: ic.identity,
+                        algorithm: Algorithm::Inl,
+                        outer_bound: None,
+                        inner_bound: None,
+                        inner_inl: ic.bound,
+                    });
+                }
+                // Candidate outer bounds are likewise owned. Re-inventory them after structural
+                // expansion and attach by identity below.
+            }
+            ordinary[outer] =
+                inventory_scan_candidates(plan.filter.as_ref(), &scope.rels[outer], scope.catalog);
+        }
+        if candidates.is_empty() {
+            return;
+        }
+        candidates.sort_by(|a, b| {
+            a.order
+                .cmp(&b.order)
+                .then_with(|| a.outer_identity.kind.cmp(&b.outer_identity.kind))
+                .then_with(|| {
+                    a.outer_identity
+                        .index_name
+                        .as_bytes()
+                        .cmp(b.outer_identity.index_name.as_bytes())
+                })
+                .then_with(|| a.inner_identity.kind.cmp(&b.inner_identity.kind))
+                .then_with(|| {
+                    a.inner_identity
+                        .index_name
+                        .as_bytes()
+                        .cmp(b.inner_identity.index_name.as_bytes())
+                })
+                .then_with(|| a.algorithm.cmp(&b.algorithm))
+        });
+
+        let mut winner: Option<(i64, Candidate)> = None;
+        for mut candidate in candidates {
+            let [outer, inner] = candidate.order;
+            let mut outer_candidate =
+                inventory_scan_candidates(plan.filter.as_ref(), &scope.rels[outer], scope.catalog)
+                    .into_iter()
+                    .find(|c| c.identity == candidate.outer_identity)
+                    .expect("outer candidate identity is reproducible");
+            candidate.outer_bound = outer_candidate.bound.take();
+            plan.phys.relation_order = candidate.order.to_vec();
+            plan.phys.rel_bounds = vec![None, None];
+            plan.phys.rel_inl_bounds = vec![None, None];
+            plan.phys.rel_bounds[outer] = candidate.outer_bound.take();
+            plan.phys.rel_bounds[inner] = candidate.inner_bound.take();
+            plan.phys.rel_inl_bounds[inner] = candidate.inner_inl.take();
+            plan.phys.hash_join = matches!(candidate.algorithm, Algorithm::Hash)
+                .then(|| self.hash_join_plan_for(plan, scope, outer, inner))
+                .flatten();
+            plan.phys.pk_ordered = false;
+            plan.phys.pk_reverse = false;
+            plan.phys.index_order = None;
+            plan.phys.join_pk_ordered = self.join_pk_ordered_for_candidate(plan, scope);
+            plan.phys.top_k = None;
+            let cost = self.estimate_select_plan_cost(plan);
+            candidate.outer_bound = plan.phys.rel_bounds[outer].take();
+            candidate.inner_bound = plan.phys.rel_bounds[inner].take();
+            candidate.inner_inl = plan.phys.rel_inl_bounds[inner].take();
+            plan.phys.hash_join = None;
+            if winner.as_ref().is_none_or(|(prior, _)| cost < *prior) {
+                winner = Some((cost, candidate));
+            }
+        }
+        if let Some((_, mut selected)) = winner {
+            let [outer, inner] = selected.order;
+            plan.phys.relation_order = selected.order.to_vec();
+            plan.phys.rel_bounds = vec![None, None];
+            plan.phys.rel_inl_bounds = vec![None, None];
+            plan.phys.rel_bounds[outer] = selected.outer_bound.take();
+            plan.phys.rel_bounds[inner] = selected.inner_bound.take();
+            plan.phys.rel_inl_bounds[inner] = selected.inner_inl.take();
+            plan.phys.hash_join = matches!(selected.algorithm, Algorithm::Hash)
+                .then(|| self.hash_join_plan_for(plan, scope, outer, inner))
+                .flatten();
         }
     }
 
+    fn join_pk_ordered_for_candidate(&self, plan: &SelectPlan, scope: &Scope<'_>) -> bool {
+        if plan.rels.len() != 2 || scope.rels.len() != 2 || plan.joins.len() != 1 {
+            return false;
+        }
+        let outer = physical_rel_ordinal(plan, 0);
+        let inner = physical_rel_ordinal(plan, 1);
+        !plan.is_agg
+            && !plan.has_window
+            && !plan.distinct
+            && !plan.order.is_empty()
+            && plan.order_exprs.is_empty()
+            && plan.limit.is_some()
+            && matches!(plan.joins[0].kind, JoinKind::Inner | JoinKind::Cross)
+            && plan
+                .rels
+                .iter()
+                .all(|r| !r.lateral && r.srf.is_none() && r.cte.is_none() && r.derived.is_none())
+            && !matches!(
+                plan.phys.rel_bounds[outer],
+                Some(ScanBound::Index(_))
+                    | Some(ScanBound::Gin(_))
+                    | Some(ScanBound::Gist(_))
+                    | Some(ScanBound::PkSet(_))
+                    | Some(ScanBound::IndexSet(_))
+            )
+            && plan.phys.rel_inl_bounds[outer].is_none()
+            && matches!(
+                plan.phys.rel_inl_bounds[inner],
+                None | Some(ScanBound::Pk(_))
+                    | Some(ScanBound::Index(_))
+                    | Some(ScanBound::Gin(_))
+                    | Some(ScanBound::Gist(_))
+            )
+            && plan.order.len() <= scope.rels[outer].table.pk_indices().len()
+            && order_satisfied_by_pk(
+                scope.rels[outer].table,
+                plan.rels[outer].offset,
+                &plan.order,
+                self,
+            ) == Some(false)
+    }
+}
+
+fn build_hash_join_plan(
+    plan: &SelectPlan,
+    scope: &Scope<'_>,
+    outer: usize,
+    inner: usize,
+) -> Option<HashJoinPlan> {
+    let on = plan.joins[0].on.as_ref()?;
+    let mut conjuncts = Vec::new();
+    flatten_hash_join_conjuncts(on, &mut conjuncts);
+    let outer_columns = relation_columns(plan, outer);
+    let inner_columns = relation_columns(plan, inner);
+    let mut keys = Vec::new();
+    for expr in conjuncts {
+        if !hash_join_safe_conjunct(expr) {
+            return None;
+        }
+        let RExpr::Compare {
+            op: CmpOp::Eq,
+            lhs,
+            rhs,
+            ..
+        } = expr
+        else {
+            continue;
+        };
+        let (RExpr::Column(left), RExpr::Column(right)) = (&**lhs, &**rhs) else {
+            continue;
+        };
+        let (mut left, mut right) = (*left, *right);
+        if left >= inner_columns.0
+            && left < inner_columns.1
+            && right >= outer_columns.0
+            && right < outer_columns.1
+        {
+            std::mem::swap(&mut left, &mut right);
+        }
+        if left < outer_columns.0
+            || left >= outer_columns.1
+            || right < inner_columns.0
+            || right >= inner_columns.1
+        {
+            continue;
+        }
+        let Some(left_ty) = hash_join_column_type(&scope.rels, left) else {
+            continue;
+        };
+        let Some(right_ty) = hash_join_column_type(&scope.rels, right) else {
+            continue;
+        };
+        if left_ty != right_ty || !hash_join_keyable_type(left_ty) {
+            continue;
+        }
+        keys.push(HashJoinKey {
+            left,
+            right,
+            ty: left_ty.clone(),
+        });
+    }
+    if !keys.is_empty() {
+        Some(HashJoinPlan { keys })
+    } else {
+        None
+    }
+}
+
+impl Engine {
     /// Scan-bound pushdown, per base relation: detect WHERE conjuncts that bound that relation's
     /// scan — a PK range, else a secondary-index equality — so it seeks/ranges instead of walking
     /// the whole B-tree (cost.md §3 "bounded scan" / "index-bounded scan"; indexes.md §5). The
@@ -364,39 +619,7 @@ impl Engine {
     /// input order, which a reverse outer scan would invert — reverse join is a follow-on). The
     /// outer must carry no non-PK bound (a PK bound / no bound keeps it in PK order).
     fn rule_join_pk_ordered(&self, plan: &mut SelectPlan, scope: &Scope<'_>) {
-        plan.phys.join_pk_ordered = !plan.is_agg
-            && !plan.has_window
-            && !plan.distinct
-            && !plan.order.is_empty()
-            && plan.order_exprs.is_empty()
-            && plan.limit.is_some()
-            && plan.rels.len() == 2
-            && plan.joins.len() == 1
-            && matches!(plan.joins[0].kind, JoinKind::Inner | JoinKind::Cross)
-            && plan
-                .rels
-                .iter()
-                .all(|r| !r.lateral && r.srf.is_none() && r.cte.is_none() && r.derived.is_none())
-            && !matches!(
-                plan.phys.rel_bounds[0],
-                Some(ScanBound::Index(_))
-                    | Some(ScanBound::Gin(_))
-                    | Some(ScanBound::Gist(_))
-                    | Some(ScanBound::PkSet(_))
-                    | Some(ScanBound::IndexSet(_))
-            )
-            && plan.phys.rel_inl_bounds[0].is_none()
-            // Every admitted INL materialization emits storage-key order; GIN/GiST candidate
-            // gathers sort explicitly before returning.
-            && matches!(plan.phys.rel_inl_bounds[1], None | Some(ScanBound::Pk(_)) | Some(ScanBound::Index(_)) | Some(ScanBound::Gin(_)) | Some(ScanBound::Gist(_)))
-            // No ORDER BY key beyond the outer PK: the outer PK is unique over the OUTER table but
-            // NOT over the join output (one outer row fans out to many), so an extra key (`ORDER BY
-            // a.id, b.x`) is a real tie-break the outer scan order does not satisfy — unlike the
-            // single-table case where a past-the-PK key is genuinely redundant. So require the
-            // order to be a pure prefix of the outer PK (no trailing keys).
-            && plan.order.len() <= scope.rels[0].table.pk_indices().len()
-            && order_satisfied_by_pk(scope.rels[0].table, plan.rels[0].offset, &plan.order, self)
-                == Some(false);
+        plan.phys.join_pk_ordered = self.join_pk_ordered_for_candidate(plan, scope);
     }
 
     /// Bounded selection for a BLOCKING `ORDER BY` with a constant LIMIT. Plain SELECT pre-sort

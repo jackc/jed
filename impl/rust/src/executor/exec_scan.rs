@@ -1293,15 +1293,35 @@ impl Engine {
         outer: &[&[Value]],
         stmt_rng: &std::cell::Cell<crate::seam::StmtRng>,
     ) -> Result<SelectResult> {
-        // Materialize the outer once, in primary-key order. An ordinary inner is materialized once
-        // too; an INL inner is opened below per outer row. Scan units accrue inside materialize_rel.
-        let left_rows =
-            self.materialize_rel(plan, 0, params, outer, &[], stmt_rng, env.ctes, meter)?;
-        let right_inl = plan.phys.rel_inl_bounds[1].is_some();
+        // Materialize the selected physical outer once, in primary-key order. An ordinary inner is
+        // materialized once too; an INL inner is opened below per outer row. Every local row is
+        // placed back into its original logical slot interval before expression evaluation.
+        let outer_ordinal = super::optimize::physical_rel_ordinal(plan, 0);
+        let inner_ordinal = super::optimize::physical_rel_ordinal(plan, 1);
+        let left_rows = self.materialize_rel(
+            plan,
+            outer_ordinal,
+            params,
+            outer,
+            &[],
+            stmt_rng,
+            env.ctes,
+            meter,
+        )?;
+        let right_inl = plan.phys.rel_inl_bounds[inner_ordinal].is_some();
         let right_rows = if right_inl {
             Vec::new()
         } else {
-            self.materialize_rel(plan, 1, params, outer, &[], stmt_rng, env.ctes, meter)?
+            self.materialize_rel(
+                plan,
+                inner_ordinal,
+                params,
+                outer,
+                &[],
+                stmt_rng,
+                env.ctes,
+                meter,
+            )?
         };
         let on = &plan.joins[0].on;
 
@@ -1314,7 +1334,13 @@ impl Engine {
                 .hash_join
                 .as_ref()
                 .map(|hash_plan| {
-                    HashJoinTable::build(hash_plan, plan.rels[1].offset, &right_rows, meter)
+                    HashJoinTable::build(
+                        hash_plan,
+                        plan.rels[inner_ordinal].offset,
+                        plan.rels[outer_ordinal].offset,
+                        &right_rows,
+                        meter,
+                    )
                 })
                 .transpose()?;
             let mut passed: i64 = 0;
@@ -1322,8 +1348,18 @@ impl Engine {
                 let inner_rows;
                 let hash_rows;
                 let current_right = if right_inl {
-                    inner_rows = self
-                        .materialize_rel(plan, 1, params, outer, left, stmt_rng, env.ctes, meter)?;
+                    let outer_logical =
+                        super::exec_emit::place_physical_relation_row(plan, outer_ordinal, left);
+                    inner_rows = self.materialize_rel(
+                        plan,
+                        inner_ordinal,
+                        params,
+                        outer,
+                        &outer_logical,
+                        stmt_rng,
+                        env.ctes,
+                        meter,
+                    )?;
                     &inner_rows
                 } else if let Some(table) = &hash_table {
                     hash_rows = table
@@ -1336,8 +1372,13 @@ impl Engine {
                     &right_rows
                 };
                 for right in current_right {
-                    let mut combined = left.clone();
-                    combined.extend_from_slice(right);
+                    let combined = super::exec_emit::combine_physical_relation_rows(
+                        plan,
+                        outer_ordinal,
+                        left,
+                        inner_ordinal,
+                        right,
+                    );
                     // INNER: keep the pair iff its ON is TRUE (3VL); CROSS: keep every pair (no ON).
                     let keep = match on {
                         Some(pred) => pred.eval(&combined, env, meter)?.is_true(),
@@ -1485,6 +1526,18 @@ impl Engine {
         let bound = plan.phys.rel_inl_bounds[ri]
             .as_ref()
             .or(plan.phys.rel_bounds[ri].as_ref());
+        let (inl_on, sibling_columns) = if inl && plan.phys.relation_order.len() == 2 {
+            let outer_ordinal = super::optimize::physical_rel_ordinal(plan, 0);
+            let outer_rel = &plan.rels[outer_ordinal];
+            (
+                plan.joins[0].on.as_ref(),
+                (outer_rel.offset, outer_rel.offset + outer_rel.col_count),
+            )
+        } else if inl {
+            (plan.joins[ri - 1].on.as_ref(), (0, rel.offset))
+        } else {
+            (None, (0, 0))
+        };
         let (mut rows, (node_count, slabs)) = match bound {
             Some(ScanBound::Pk(bp)) => match build_key_bound(bp, params, outer, left) {
                 Some(b) => {
@@ -1508,11 +1561,11 @@ impl Engine {
             )?,
             Some(ScanBound::Gin(gb)) => {
                 let query = if inl {
-                    [plan.joins[ri - 1].on.as_ref(), plan.filter.as_ref()]
+                    [inl_on, plan.filter.as_ref()]
                         .into_iter()
                         .flatten()
                         .find_map(|f| {
-                            gin_sibling_match(f, gb.col_global, rel.offset).map(|(_, q)| q)
+                            gin_sibling_match(f, gb.col_global, sibling_columns).map(|(_, q)| q)
                         })
                 } else {
                     plan.filter
@@ -1534,15 +1587,16 @@ impl Engine {
             }
             Some(ScanBound::Gist(gb)) => {
                 let query = if inl {
-                    [plan.joins[ri - 1].on.as_ref(), plan.filter.as_ref()]
+                    [inl_on, plan.filter.as_ref()]
                         .into_iter()
                         .flatten()
                         .find_map(|f| match gb.strategy {
                             crate::gist::GistStrategy::Equal => {
-                                gist_scalar_sibling_match(f, gb.col_global, rel.offset)
+                                gist_scalar_sibling_match(f, gb.col_global, sibling_columns)
                                     .map(|(_, q)| q)
                             }
-                            _ => gist_sibling_match(f, gb.col_global, rel.offset).map(|(_, q)| q),
+                            _ => gist_sibling_match(f, gb.col_global, sibling_columns)
+                                .map(|(_, q)| q),
                         })
                 } else {
                     plan.filter.as_ref().and_then(|f| gist_query_operand(f, gb))

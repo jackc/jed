@@ -1520,6 +1520,10 @@ type selectPlan struct {
 // after the resolve half has built the logical plan. A zero-valued physicalPlan is always correct —
 // the executor then full-scans and eager-sorts.
 type physicalPlan struct {
+	// relationOrder maps physical join positions to logical FROM ordinals. P7 sets [0,1] or [1,0]
+	// for eligible two-base INNER/CROSS joins; nil retains source order at every barrier. Resolved
+	// expression slots never change.
+	relationOrder []int
 	// hashJoin is the deterministic two-input hash operator. It builds the right input and probes
 	// the left using same-type bare-column equality keys in source order. nil keeps nested loop.
 	hashJoin *hashJoinPlan

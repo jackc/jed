@@ -6,6 +6,7 @@ use super::*;
 pub(crate) struct HashJoinTable {
     entries: HashMap<u64, Vec<HashJoinEntry>>,
     hash: fn(&[u8]) -> u64,
+    probe_offset: usize,
 }
 
 struct HashJoinEntry {
@@ -16,16 +17,25 @@ struct HashJoinEntry {
 impl HashJoinTable {
     pub(crate) fn build(
         plan: &HashJoinPlan,
-        right_offset: usize,
+        build_offset: usize,
+        probe_offset: usize,
         rows: &[Row],
         meter: &mut Meter,
     ) -> Result<Self> {
-        Self::build_with_hash(plan, right_offset, rows, meter, hash_join_fnv1a)
+        Self::build_with_hash(
+            plan,
+            build_offset,
+            probe_offset,
+            rows,
+            meter,
+            hash_join_fnv1a,
+        )
     }
 
     fn build_with_hash(
         plan: &HashJoinPlan,
-        right_offset: usize,
+        build_offset: usize,
+        probe_offset: usize,
         rows: &[Row],
         meter: &mut Meter,
         hash: fn(&[u8]) -> u64,
@@ -33,11 +43,12 @@ impl HashJoinTable {
         let mut table = Self {
             entries: HashMap::new(),
             hash,
+            probe_offset,
         };
         let indices: Vec<usize> = plan
             .keys
             .iter()
-            .map(|key| key.right - right_offset)
+            .map(|key| key.right - build_offset)
             .collect();
         let types: Vec<&Type> = plan.keys.iter().map(|key| &key.ty).collect();
         for (row_index, row) in rows.iter().enumerate() {
@@ -60,7 +71,11 @@ impl HashJoinTable {
         row: &Row,
         meter: &mut Meter,
     ) -> Result<Vec<usize>> {
-        let indices: Vec<usize> = plan.keys.iter().map(|key| key.left).collect();
+        let indices: Vec<usize> = plan
+            .keys
+            .iter()
+            .map(|key| key.left - self.probe_offset)
+            .collect();
         let types: Vec<&Type> = plan.keys.iter().map(|key| &key.ty).collect();
         let Some(key) = hash_join_row_key(row, &indices, &types, COSTS.hash_probe, meter)? else {
             return Ok(Vec::new());
@@ -145,7 +160,8 @@ mod tests {
             vec![Value::Int(2), Value::Int(21)],
         ];
         let mut meter = Meter::new();
-        let table = HashJoinTable::build_with_hash(&plan, 1, &rows, &mut meter, collide).unwrap();
+        let table =
+            HashJoinTable::build_with_hash(&plan, 1, 0, &rows, &mut meter, collide).unwrap();
         let got = table
             .probe(&plan, &vec![Value::Int(2)], &mut Meter::new())
             .unwrap();

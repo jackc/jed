@@ -4371,6 +4371,9 @@ pub(crate) struct SelectPlan {
 /// executor then full-scans and eager-sorts.
 #[derive(Default)]
 pub(crate) struct PhysicalPlan {
+    /// Physical join position -> logical FROM ordinal. P7 sets `[0, 1]` or `[1, 0]` for eligible
+    /// two-base INNER/CROSS joins; empty retains source order at barriers. Resolved slots never move.
+    relation_order: Vec<usize>,
     /// Deterministic two-input hash operator. Builds the right input and probes the left using
     /// same-type bare-column equality keys in source order. `None` keeps nested loop.
     hash_join: Option<HashJoinPlan>,

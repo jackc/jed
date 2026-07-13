@@ -4,7 +4,106 @@
 
 use super::*;
 
+fn logical_join_row_width(plan: &SelectPlan) -> usize {
+    plan.rels.last().map_or(0, |rel| rel.offset + rel.col_count)
+}
+
+pub(crate) fn place_physical_relation_row(plan: &SelectPlan, ordinal: usize, row: &Row) -> Row {
+    let mut out = vec![Value::Null; logical_join_row_width(plan)];
+    let offset = plan.rels[ordinal].offset;
+    out[offset..offset + row.len()].clone_from_slice(row);
+    out
+}
+
+pub(crate) fn combine_physical_relation_rows(
+    plan: &SelectPlan,
+    outer_ordinal: usize,
+    outer: &Row,
+    inner_ordinal: usize,
+    inner: &Row,
+) -> Row {
+    let mut out = place_physical_relation_row(plan, outer_ordinal, outer);
+    let offset = plan.rels[inner_ordinal].offset;
+    out[offset..offset + inner.len()].clone_from_slice(inner);
+    out
+}
+
 impl Engine {
+    fn exec_costed_two_relation_join(
+        &self,
+        plan: &SelectPlan,
+        env: &EvalEnv<'_>,
+        params: &[Value],
+        outer_stack: &[&[Value]],
+        materialized: &[Vec<Row>],
+        stmt_rng: &std::cell::Cell<crate::seam::StmtRng>,
+        meter: &mut Meter,
+    ) -> Result<Vec<Row>> {
+        let outer_ordinal = super::optimize::physical_rel_ordinal(plan, 0);
+        let inner_ordinal = super::optimize::physical_rel_ordinal(plan, 1);
+        let outer_rows = &materialized[outer_ordinal];
+        let inner_inl = plan.phys.rel_inl_bounds[inner_ordinal].is_some();
+        let inner_rows = &materialized[inner_ordinal];
+        let on = plan.joins[0].on.as_ref();
+        let hash_table = if let Some(hash) = &plan.phys.hash_join {
+            Some(HashJoinTable::build(
+                hash,
+                plan.rels[inner_ordinal].offset,
+                plan.rels[outer_ordinal].offset,
+                inner_rows,
+                meter,
+            )?)
+        } else {
+            None
+        };
+
+        let mut out = Vec::new();
+        for outer_row in outer_rows {
+            let candidates: Vec<Row> = if inner_inl {
+                let outer_logical = place_physical_relation_row(plan, outer_ordinal, outer_row);
+                self.materialize_rel(
+                    plan,
+                    inner_ordinal,
+                    params,
+                    outer_stack,
+                    &outer_logical,
+                    stmt_rng,
+                    env.ctes,
+                    meter,
+                )?
+            } else if let Some(table) = &hash_table {
+                table
+                    .probe(
+                        plan.phys.hash_join.as_ref().expect("hash plan"),
+                        outer_row,
+                        meter,
+                    )?
+                    .into_iter()
+                    .map(|i| inner_rows[i].clone())
+                    .collect()
+            } else {
+                inner_rows.clone()
+            };
+            for inner_row in &candidates {
+                let combined = combine_physical_relation_rows(
+                    plan,
+                    outer_ordinal,
+                    outer_row,
+                    inner_ordinal,
+                    inner_row,
+                );
+                let keep = match on {
+                    None => true,
+                    Some(pred) => pred.eval(&combined, env, meter)?.is_true(),
+                };
+                if keep {
+                    out.push(combined);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Run a [`SelectPlan`]'s **blocking part** and return an [`Emitter`] describing how to emit its
     /// output rows (spec/design/streaming.md §4, S4): the scan / join / `WHERE` / window / `ORDER BY`
     /// / `GROUP BY` / `DISTINCT` all run here (charging their cost into `meter`), producing either an
@@ -174,41 +273,153 @@ impl Engine {
         // right key order — so a join is deterministic even with no ORDER BY (CLAUDE.md §10).
         // A FROM-less SELECT has no relations: seed `running` with ONE virtual zero-column row
         // instead of a table's rows (grammar.md §34). No scan ran, so no scan cost accrued.
-        let mut running: Vec<Row> = if plan.rels.is_empty() {
-            vec![Vec::new()]
+        let mut running: Vec<Row>;
+        if plan.phys.relation_order.len() == 2 {
+            running = self.exec_costed_two_relation_join(
+                plan,
+                &env,
+                params,
+                outer,
+                &materialized,
+                stmt_rng,
+                meter,
+            )?;
         } else {
-            std::mem::take(&mut materialized[0])
-        };
-        for (k, pj) in plan.joins.iter().enumerate() {
-            let on = &pj.on;
-            let emit_left = matches!(pj.kind, JoinKind::Left | JoinKind::Full);
-            let emit_right = matches!(pj.kind, JoinKind::Right | JoinKind::Full);
-            // NULL-pad widths come from the PLAN, never a sampled row, so they are correct even
-            // when `running`/`right_rows` is empty: the right table begins at flat offset
-            // rels[k+1].offset (= the width of every running row) and is that many columns wide.
-            let left_pad = plan.rels[k + 1].offset;
-            let right_pad = plan.rels[k + 1].col_count;
-            let mut next: Vec<Row> = Vec::new();
-            // A CORRELATED LATERAL relation (§44): re-materialize it ONCE PER combined left-hand row,
-            // with that row pushed onto the outer-row stack as the body's immediate outer (the
-            // correlated-subquery mechanism). The plan guarantees INNER/CROSS/LEFT here (RIGHT/FULL
-            // to a correlated lateral is 42P10), so there is no unmatched-right emission.
-            if plan.rels[k + 1].lateral {
-                for left in &running {
-                    let mut lat_outer: Vec<&[Value]> = outer.to_vec();
-                    lat_outer.push(left);
-                    let right_rows = self.materialize_rel(
-                        plan,
-                        k + 1,
-                        params,
-                        &lat_outer,
-                        &[],
-                        stmt_rng,
-                        env.ctes,
+            running = if plan.rels.is_empty() {
+                vec![Vec::new()]
+            } else {
+                std::mem::take(&mut materialized[0])
+            };
+            for (k, pj) in plan.joins.iter().enumerate() {
+                let on = &pj.on;
+                let emit_left = matches!(pj.kind, JoinKind::Left | JoinKind::Full);
+                let emit_right = matches!(pj.kind, JoinKind::Right | JoinKind::Full);
+                // NULL-pad widths come from the PLAN, never a sampled row, so they are correct even
+                // when `running`/`right_rows` is empty: the right table begins at flat offset
+                // rels[k+1].offset (= the width of every running row) and is that many columns wide.
+                let left_pad = plan.rels[k + 1].offset;
+                let right_pad = plan.rels[k + 1].col_count;
+                let mut next: Vec<Row> = Vec::new();
+                // A CORRELATED LATERAL relation (§44): re-materialize it ONCE PER combined left-hand row,
+                // with that row pushed onto the outer-row stack as the body's immediate outer (the
+                // correlated-subquery mechanism). The plan guarantees INNER/CROSS/LEFT here (RIGHT/FULL
+                // to a correlated lateral is 42P10), so there is no unmatched-right emission.
+                if plan.rels[k + 1].lateral {
+                    for left in &running {
+                        let mut lat_outer: Vec<&[Value]> = outer.to_vec();
+                        lat_outer.push(left);
+                        let right_rows = self.materialize_rel(
+                            plan,
+                            k + 1,
+                            params,
+                            &lat_outer,
+                            &[],
+                            stmt_rng,
+                            env.ctes,
+                            meter,
+                        )?;
+                        let mut left_matched = false;
+                        for right in &right_rows {
+                            let mut combined = left.clone();
+                            combined.extend_from_slice(right);
+                            let keep = match on {
+                                None => true,
+                                Some(pred) => pred.eval(&combined, &env, meter)?.is_true(),
+                            };
+                            if keep {
+                                next.push(combined);
+                                left_matched = true;
+                            }
+                        }
+                        if emit_left && !left_matched {
+                            let mut combined = left.clone();
+                            combined.resize(combined.len() + right_pad, Value::Null);
+                            next.push(combined);
+                        }
+                    }
+                    running = next;
+                    continue;
+                }
+                // An INDEX-NESTED-LOOP inner relation (cost.md §3 "JOIN"): re-materialize it ONCE PER
+                // combined left-hand row, its scan bounded per outer row by the `Sibling` columns of that
+                // row (a per-outer-row seek instead of a full scan). Detection restricts this to the
+                // RIGHT/nullable side of an INNER/CROSS/LEFT join, so there is never an unmatched-RIGHT
+                // emission (RIGHT/FULL are excluded — a preserved side cannot be bounded per outer row).
+                // The whole ON/WHERE stays applied (the ON here, the WHERE below), so rows are unchanged.
+                if plan.phys.rel_inl_bounds[k + 1].is_some() {
+                    debug_assert!(!emit_right, "index-nested-loop excludes RIGHT/FULL joins");
+                    for left in &running {
+                        let right_rows = self.materialize_rel(
+                            plan,
+                            k + 1,
+                            params,
+                            outer,
+                            left,
+                            stmt_rng,
+                            env.ctes,
+                            meter,
+                        )?;
+                        let mut left_matched = false;
+                        for right in &right_rows {
+                            let mut combined = left.clone();
+                            combined.extend_from_slice(right);
+                            let keep = match on {
+                                None => true,
+                                Some(pred) => pred.eval(&combined, &env, meter)?.is_true(),
+                            };
+                            if keep {
+                                next.push(combined);
+                                left_matched = true;
+                            }
+                        }
+                        if emit_left && !left_matched {
+                            let mut combined = left.clone();
+                            combined.resize(combined.len() + right_pad, Value::Null);
+                            next.push(combined);
+                        }
+                    }
+                    running = next;
+                    continue;
+                }
+                let right_rows = &materialized[k + 1];
+                // The hash rule is exactly two inputs, so it can only own join 0. Build the right input
+                // once, then probe running rows in left order. Bucket indices retain right order and the
+                // full ON is rechecked, reproducing nested-loop enumeration and LEFT null-extension.
+                if k == 0
+                    && let Some(hash_plan) = &plan.phys.hash_join
+                {
+                    let table = HashJoinTable::build(
+                        hash_plan,
+                        plan.rels[1].offset,
+                        plan.rels[0].offset,
+                        right_rows,
                         meter,
                     )?;
+                    let pred = on.as_ref().expect("a hash join always has an ON predicate");
+                    for left in &running {
+                        let candidates = table.probe(hash_plan, left, meter)?;
+                        let mut left_matched = false;
+                        for ri in candidates {
+                            let mut combined = left.clone();
+                            combined.extend_from_slice(&right_rows[ri]);
+                            if pred.eval(&combined, &env, meter)?.is_true() {
+                                next.push(combined);
+                                left_matched = true;
+                            }
+                        }
+                        if emit_left && !left_matched {
+                            let mut combined = left.clone();
+                            combined.resize(combined.len() + right_pad, Value::Null);
+                            next.push(combined);
+                        }
+                    }
+                    running = next;
+                    continue;
+                }
+                let mut right_matched = vec![false; right_rows.len()];
+                for left in &running {
                     let mut left_matched = false;
-                    for right in &right_rows {
+                    for (ri, right) in right_rows.iter().enumerate() {
                         let mut combined = left.clone();
                         combined.extend_from_slice(right);
                         let keep = match on {
@@ -218,6 +429,7 @@ impl Engine {
                         if keep {
                             next.push(combined);
                             left_matched = true;
+                            right_matched[ri] = true;
                         }
                     }
                     if emit_left && !left_matched {
@@ -226,112 +438,17 @@ impl Engine {
                         next.push(combined);
                     }
                 }
-                running = next;
-                continue;
-            }
-            // An INDEX-NESTED-LOOP inner relation (cost.md §3 "JOIN"): re-materialize it ONCE PER
-            // combined left-hand row, its scan bounded per outer row by the `Sibling` columns of that
-            // row (a per-outer-row seek instead of a full scan). Detection restricts this to the
-            // RIGHT/nullable side of an INNER/CROSS/LEFT join, so there is never an unmatched-RIGHT
-            // emission (RIGHT/FULL are excluded — a preserved side cannot be bounded per outer row).
-            // The whole ON/WHERE stays applied (the ON here, the WHERE below), so rows are unchanged.
-            if plan.phys.rel_inl_bounds[k + 1].is_some() {
-                debug_assert!(!emit_right, "index-nested-loop excludes RIGHT/FULL joins");
-                for left in &running {
-                    let right_rows = self.materialize_rel(
-                        plan,
-                        k + 1,
-                        params,
-                        outer,
-                        left,
-                        stmt_rng,
-                        env.ctes,
-                        meter,
-                    )?;
-                    let mut left_matched = false;
-                    for right in &right_rows {
-                        let mut combined = left.clone();
-                        combined.extend_from_slice(right);
-                        let keep = match on {
-                            None => true,
-                            Some(pred) => pred.eval(&combined, &env, meter)?.is_true(),
-                        };
-                        if keep {
+                if emit_right {
+                    for (ri, right) in right_rows.iter().enumerate() {
+                        if !right_matched[ri] {
+                            let mut combined: Row = vec![Value::Null; left_pad];
+                            combined.extend_from_slice(right);
                             next.push(combined);
-                            left_matched = true;
                         }
-                    }
-                    if emit_left && !left_matched {
-                        let mut combined = left.clone();
-                        combined.resize(combined.len() + right_pad, Value::Null);
-                        next.push(combined);
                     }
                 }
                 running = next;
-                continue;
             }
-            let right_rows = &materialized[k + 1];
-            // The hash rule is exactly two inputs, so it can only own join 0. Build the right input
-            // once, then probe running rows in left order. Bucket indices retain right order and the
-            // full ON is rechecked, reproducing nested-loop enumeration and LEFT null-extension.
-            if k == 0
-                && let Some(hash_plan) = &plan.phys.hash_join
-            {
-                let table =
-                    HashJoinTable::build(hash_plan, plan.rels[1].offset, right_rows, meter)?;
-                let pred = on.as_ref().expect("a hash join always has an ON predicate");
-                for left in &running {
-                    let candidates = table.probe(hash_plan, left, meter)?;
-                    let mut left_matched = false;
-                    for ri in candidates {
-                        let mut combined = left.clone();
-                        combined.extend_from_slice(&right_rows[ri]);
-                        if pred.eval(&combined, &env, meter)?.is_true() {
-                            next.push(combined);
-                            left_matched = true;
-                        }
-                    }
-                    if emit_left && !left_matched {
-                        let mut combined = left.clone();
-                        combined.resize(combined.len() + right_pad, Value::Null);
-                        next.push(combined);
-                    }
-                }
-                running = next;
-                continue;
-            }
-            let mut right_matched = vec![false; right_rows.len()];
-            for left in &running {
-                let mut left_matched = false;
-                for (ri, right) in right_rows.iter().enumerate() {
-                    let mut combined = left.clone();
-                    combined.extend_from_slice(right);
-                    let keep = match on {
-                        None => true,
-                        Some(pred) => pred.eval(&combined, &env, meter)?.is_true(),
-                    };
-                    if keep {
-                        next.push(combined);
-                        left_matched = true;
-                        right_matched[ri] = true;
-                    }
-                }
-                if emit_left && !left_matched {
-                    let mut combined = left.clone();
-                    combined.resize(combined.len() + right_pad, Value::Null);
-                    next.push(combined);
-                }
-            }
-            if emit_right {
-                for (ri, right) in right_rows.iter().enumerate() {
-                    if !right_matched[ri] {
-                        let mut combined: Row = vec![Value::Null; left_pad];
-                        combined.extend_from_slice(right);
-                        next.push(combined);
-                    }
-                }
-            }
-            running = next;
         }
 
         // WHERE over the combined rows (consume `running`, no extra clone). A WHERE arithmetic

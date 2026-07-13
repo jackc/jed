@@ -101,6 +101,7 @@ import {
   andSelectivity,
   addPlanEstimates,
   addPlanUnit,
+  ceilEstimateMultiplyDivide,
   clonePlanEstimate,
   emptyPlanEstimate,
   estimateCandidate,
@@ -2899,6 +2900,9 @@ export class Engine {
   }
 
   private estimateJoinTree(sp: SelectPlan, n: number, ctx: EstimateCteContext | null): EstimatedPlan {
+    if (n === 2 && sp.phys.relationOrder.length === 2) {
+      return this.estimateTwoRelationJoin(sp, ctx);
+    }
     if (n === 1) return this.estimateRelation(sp, 0, ctx);
     const left = this.estimateJoinTree(sp, n - 1, ctx);
     let right = this.estimateRelation(sp, n - 1, ctx);
@@ -2950,6 +2954,103 @@ export class Engine {
     addPlanUnit(root, UNIT_OPERATOR_EVAL, saturatingEstimateMultiply(estimatorOperatorNodes(join.on), invocations));
     this.addExpressionSubqueries(root, join.on, invocations, ctx);
     return parentEstimatedPlan(root, left, right);
+  }
+
+  // P7 estimate in selected physical order. A join top-N caps only outer-driven work that the
+  // executor actually skips; ordinary base materialization and the hash build remain complete.
+  private estimateTwoRelationJoin(
+    sp: SelectPlan,
+    ctx: EstimateCteContext | null,
+  ): EstimatedPlan {
+    const outerOrdinal = physicalRelOrdinal(sp, 0);
+    const innerOrdinal = physicalRelOrdinal(sp, 1);
+    const outer = this.estimateRelation(sp, outerOrdinal, ctx);
+    let inner = this.estimateRelation(sp, innerOrdinal, ctx);
+    const innerPerCall = {
+      root: clonePlanEstimate(inner.root),
+      nodes: inner.nodes.map(clonePlanEstimate),
+    };
+    const boundByOuter = sp.phys.relINLBounds[innerOrdinal] !== null;
+    const fullPairs = saturatingEstimateMultiply(outer.root.rows, innerPerCall.root.rows);
+    const fullLogicalPairs = saturatingEstimateMultiply(
+      outer.root.logicalRows,
+      innerPerCall.root.logicalRows,
+    );
+    const join = sp.joins[0]!;
+    let fullRows = fullPairs;
+    let fullLogicalRows = fullLogicalPairs;
+    if (join.on !== null && !boundByOuter) {
+      const selectivity = estimatorPredicateSelectivity(join.on);
+      fullRows = estimateSelectivity(selectivity, fullRows);
+      fullLogicalRows = estimateSelectivity(selectivity, fullLogicalRows);
+    }
+
+    let outerCalls = outer.root.rows;
+    let deliveredRows = fullRows;
+    if (sp.phys.joinPkOrdered && sp.limit !== null) {
+      const target = saturatingEstimateAdd(sp.limit, sp.offset ?? 0n);
+      const postFilterRows = sp.filter === null
+        ? fullRows
+        : estimateSelectivity(estimatorPredicateSelectivity(sp.filter), fullRows);
+      if (target === 0n) {
+        outerCalls = 0n;
+        deliveredRows = 0n;
+      } else if (postFilterRows > target && fullRows > 0n) {
+        outerCalls = ceilEstimateMultiplyDivide(target, outer.root.rows, postFilterRows);
+        if (outerCalls > outer.root.rows) outerCalls = outer.root.rows;
+        deliveredRows = ceilEstimateMultiplyDivide(outerCalls, fullRows, outer.root.rows);
+        if (deliveredRows > fullRows) deliveredRows = fullRows;
+      }
+    }
+
+    let visitedPairs = fullPairs;
+    if (boundByOuter) {
+      inner = {
+        root: repeatPlanEstimate(inner.root, outerCalls),
+        nodes: inner.nodes.map((node) => repeatPlanEstimate(node, outerCalls)),
+      };
+      visitedPairs = inner.root.rows;
+    } else if (outerCalls < outer.root.rows) {
+      visitedPairs = ceilEstimateMultiplyDivide(outerCalls, fullPairs, outer.root.rows);
+    }
+
+    const root = addPlanEstimates(outer.root, inner.root);
+    root.rows = deliveredRows;
+    root.logicalRows = fullLogicalRows;
+    let invocations = visitedPairs;
+    if (sp.phys.hashJoin !== null) {
+      let keyBytes = 0n;
+      let framedBytes = 0n;
+      for (const key of sp.phys.hashJoin.keys) {
+        const scalar = typeAsScalar(key.type);
+        const width = scalar !== undefined && isFixedWidth(scalar)
+          ? BigInt(widthBytes(scalar))
+          : DEFAULT_VARIABLE_KEY_BYTES;
+        keyBytes = saturatingEstimateAdd(keyBytes, width);
+        framedBytes = saturatingEstimateAdd(framedBytes, saturatingEstimateAdd(4n, width));
+      }
+      addPlanUnit(
+        root,
+        UNIT_HASH_BUILD,
+        saturatingEstimateMultiply(innerPerCall.root.rows, keyBytes),
+      );
+      addPlanUnit(
+        root,
+        UNIT_HASH_PROBE,
+        saturatingEstimateAdd(
+          saturatingEstimateMultiply(outerCalls, keyBytes),
+          saturatingEstimateMultiply(deliveredRows, framedBytes),
+        ),
+      );
+      invocations = deliveredRows;
+    }
+    addPlanUnit(
+      root,
+      UNIT_OPERATOR_EVAL,
+      saturatingEstimateMultiply(estimatorOperatorNodes(join.on), invocations),
+    );
+    this.addExpressionSubqueries(root, join.on, invocations, ctx);
+    return parentEstimatedPlan(root, outer, inner);
   }
 
   private estimateSelectPlan(sp: SelectPlan, ctx: EstimateCteContext | null): EstimatedPlan {
@@ -3467,6 +3568,11 @@ export class Engine {
       ? `${j.kind}; keys=${sp.phys.hashJoin!.keys.length}; on:conjuncts=${j.on === null ? 0 : conjunctCount(j.on)}`
       : joinDetail(j);
     r.emit(depth, isHash ? "Hash Join" : "Nested Loop", withNote(detail, note));
+    if (n === 2 && sp.phys.relationOrder.length === 2) {
+      this.renderRelLeaf(r, sp, sp.phys.relationOrder[0]!, depth + 1, "");
+      this.renderRelLeaf(r, sp, sp.phys.relationOrder[1]!, depth + 1, "");
+      return;
+    }
     this.renderJoinTree(r, sp, n - 1, depth + 1, "");
     this.renderRelLeaf(r, sp, n - 1, depth + 1, "");
   }
@@ -11017,6 +11123,7 @@ export class Engine {
       relMasks: [],
       phys: {
         hashJoin: null,
+        relationOrder: [],
         pkOrdered: false,
         pkReverse: false,
         indexOrder: null,
@@ -12805,9 +12912,13 @@ export class Engine {
     params: Value[],
     outer: Row[],
   ): SelectResult {
-    const leftRows = this.materializeRel(plan, 0, outer, [], env, params, meter);
-    const rightINL = plan.phys.relINLBounds[1] !== null;
-    const rightRows = rightINL ? [] : this.materializeRel(plan, 1, outer, [], env, params, meter);
+    const outerOrdinal = physicalRelOrdinal(plan, 0);
+    const innerOrdinal = physicalRelOrdinal(plan, 1);
+    const leftRows = this.materializeRel(plan, outerOrdinal, outer, [], env, params, meter);
+    const rightINL = plan.phys.relINLBounds[innerOrdinal] !== null;
+    const rightRows = rightINL
+      ? []
+      : this.materializeRel(plan, innerOrdinal, outer, [], env, params, meter);
     const on = plan.joins[0]!.on;
 
     const limit = plan.limit;
@@ -12817,17 +12928,41 @@ export class Engine {
       const hashTable =
         plan.phys.hashJoin === null
           ? null
-          : new HashJoinTable(plan.phys.hashJoin, plan.rels[1]!.offset, rightRows, meter);
+          : new HashJoinTable(
+              plan.phys.hashJoin,
+              plan.rels[innerOrdinal]!.offset,
+              plan.rels[outerOrdinal]!.offset,
+              rightRows,
+              meter,
+            );
       let passed = 0n;
       // biome-ignore lint/suspicious/noLabelVar: `outer` is a loop label for the nested-join break/continue, not a variable.
       outer: for (const left of leftRows) {
-        const innerRows = rightINL
-          ? this.materializeRel(plan, 1, outer, left, env, params, meter)
-          : hashTable === null
-            ? rightRows
-            : hashTable.probe(plan.phys.hashJoin!, left, meter).map((ri) => rightRows[ri]!);
+        let innerRows = rightRows;
+        if (rightINL) {
+          const outerLogical = placePhysicalRelationRow(plan, outerOrdinal, left);
+          innerRows = this.materializeRel(
+            plan,
+            innerOrdinal,
+            outer,
+            outerLogical,
+            env,
+            params,
+            meter,
+          );
+        } else if (hashTable !== null) {
+          innerRows = hashTable
+            .probe(plan.phys.hashJoin!, left, meter)
+            .map((ri) => rightRows[ri]!);
+        }
         for (const right of innerRows) {
-          const combined = [...left, ...right];
+          const combined = combinePhysicalRelationRows(
+            plan,
+            outerOrdinal,
+            left,
+            innerOrdinal,
+            right,
+          );
           // INNER: keep the pair iff its ON is TRUE (3VL); CROSS: keep every pair (no ON).
           if (on !== null && !isTrue(evalExpr(on, combined, env, meter))) continue;
           // The residual WHERE over the combined row (per surviving pair).
@@ -12985,6 +13120,9 @@ export class Engine {
     // and resolves its sibling source from the current left row (cost.md §3 "JOIN"); else the
     // once-materialized relBounds.
     const inl = plan.phys.relINLBounds[ri] !== null;
+    const siblingRange = inl
+      ? relationColumnRange(plan, physicalRelOrdinal(plan, 0))
+      : null;
     const relBound = plan.phys.relINLBounds[ri] ?? plan.phys.relBounds[ri]!;
     if (relBound !== null && relBound.kind === "index") {
       const r = this.indexBoundRows(
@@ -13003,7 +13141,7 @@ export class Engine {
       if (inl) {
         for (const filter of [plan.joins[ri - 1]!.on, plan.filter]) {
           if (filter === null) continue;
-          m = ginSiblingMatch(filter, relBound.gin.colGlobal, rel.offset);
+          m = ginSiblingMatch(filter, relBound.gin.colGlobal, siblingRange);
           if (m !== null) break;
         }
       } else if (plan.filter !== null) {
@@ -13029,8 +13167,8 @@ export class Engine {
           if (filter === null) continue;
           q =
             relBound.gist.strategy === "equal"
-              ? (gistScalarSiblingMatch(filter, relBound.gist.colGlobal, rel.offset)?.query ?? null)
-              : (gistSiblingMatch(filter, relBound.gist.colGlobal, rel.offset)?.query ?? null);
+              ? (gistScalarSiblingMatch(filter, relBound.gist.colGlobal, siblingRange)?.query ?? null)
+              : (gistSiblingMatch(filter, relBound.gist.colGlobal, siblingRange)?.query ?? null);
           if (q !== null) break;
         }
       } else if (plan.filter !== null) {
@@ -13486,6 +13624,61 @@ export class Engine {
       : [whole.map((a) => finalizeAcc(a))];
   }
 
+  private execCostedTwoRelationJoin(
+    plan: SelectPlan,
+    env: EvalEnv,
+    meter: Meter,
+    params: Value[],
+    materialized: Row[][],
+  ): Row[] {
+    const outerOrdinal = physicalRelOrdinal(plan, 0);
+    const innerOrdinal = physicalRelOrdinal(plan, 1);
+    const outerRows = materialized[outerOrdinal]!;
+    const innerRows = materialized[innerOrdinal]!;
+    const innerINL = plan.phys.relINLBounds[innerOrdinal] !== null;
+    const hashTable = plan.phys.hashJoin === null
+      ? null
+      : new HashJoinTable(
+          plan.phys.hashJoin,
+          plan.rels[innerOrdinal]!.offset,
+          plan.rels[outerOrdinal]!.offset,
+          innerRows,
+          meter,
+        );
+    const on = plan.joins[0]!.on;
+    const out: Row[] = [];
+    for (const outerRow of outerRows) {
+      let candidates = innerRows;
+      if (innerINL) {
+        const outerLogical = placePhysicalRelationRow(plan, outerOrdinal, outerRow);
+        candidates = this.materializeRel(
+          plan,
+          innerOrdinal,
+          env.outer,
+          outerLogical,
+          env,
+          params,
+          meter,
+        );
+      } else if (hashTable !== null) {
+        candidates = hashTable
+          .probe(plan.phys.hashJoin!, outerRow, meter)
+          .map((index) => innerRows[index]!);
+      }
+      for (const innerRow of candidates) {
+        const combined = combinePhysicalRelationRows(
+          plan,
+          outerOrdinal,
+          outerRow,
+          innerOrdinal,
+          innerRow,
+        );
+        if (on === null || isTrue(evalExpr(on, combined, env, meter))) out.push(combined);
+      }
+    }
+    return out;
+  }
+
   // execSelectEmit runs a SelectPlan's blocking part and returns an Emitter describing how to emit its
   // output rows (spec/design/streaming.md §4, S4): the scan / join / WHERE / window / ORDER BY / GROUP
   // BY / DISTINCT all run here (charging their cost into meter), producing either a windowed buffer
@@ -13605,8 +13798,12 @@ export class Engine {
     const nullRow = (n: number): Row => Array.from({ length: n }, () => nullValue());
     // A FROM-less SELECT has no relations: seed `running` with ONE virtual zero-column row
     // instead of a table's rows (grammar.md §34). No scan ran, so no scan cost accrued.
-    let running: Row[] = plan.rels.length === 0 ? [[]] : materialized[0]!;
-    for (let k = 0; k < plan.joins.length; k++) {
+    let running: Row[];
+    if (plan.phys.relationOrder.length === 2) {
+      running = this.execCostedTwoRelationJoin(plan, env, meter, params, materialized);
+    } else {
+      running = plan.rels.length === 0 ? [[]] : materialized[0]!;
+      for (let k = 0; k < plan.joins.length; k++) {
       const on = plan.joins[k]!.on;
       const kind = plan.joins[k]!.kind;
       const emitLeft = kind === "left" || kind === "full";
@@ -13675,6 +13872,7 @@ export class Engine {
         const table = new HashJoinTable(
           plan.phys.hashJoin,
           plan.rels[1]!.offset,
+          plan.rels[0]!.offset,
           rightRows,
           meter,
         );
@@ -13711,7 +13909,8 @@ export class Engine {
           if (!rightMatched[ri]) next.push(nullRow(leftPad).concat(rightRows[ri]!));
         }
       }
-      running = next;
+        running = next;
+      }
     }
 
     // WHERE over the combined rows. A WHERE arithmetic can throw (22003/22012); each surviving
@@ -14435,14 +14634,14 @@ export type IndexBound = {
 // (taking its range conjuncts, if any, as the trailing range). null for a non-B-tree index, a Skewed
 // collated bound column (whose stored keys are at the file's pinned version — collation.md §12), no
 // bound at all, or an ineligible suffix (a column after the equality prefix that is not a fixed-width
-// scalar — the width-based key-suffix skip needs it). siblingCutoff opens the index-nested-loop door
-// (>= 0 admits a bare sibling "column" node with index < cutoff as a bound source, resolved per outer
-// row); -1 is the ordinary once-materialized bound.
+// scalar — the width-based key-suffix skip needs it). siblingRange opens the index-nested-loop door:
+// a bare sibling "column" node inside that global slot interval is resolved per outer row. null is
+// the ordinary once-materialized bound.
 export function buildIndexAccessPredicate(
   filter: RExpr,
   rel: ScopeRel,
   idx: IndexDef,
-  siblingCutoff: number,
+  siblingRange: ColumnRange,
   snap: Snapshot,
   engine: Engine,
 ): IndexBound | null {
@@ -14505,7 +14704,7 @@ export function buildIndexAccessPredicate(
         walk(e.rhs);
         return;
       }
-      const t = asBoundTerm(e, matcher, ty, colColl, siblingCutoff);
+      const t = asBoundTerm(e, matcher, ty, colColl, siblingRange);
       if (t !== null) {
         if (t.op === "eq") eqs.push(t.src);
         else ranges.push(t);
@@ -14579,12 +14778,12 @@ export function inventoryScanCandidates(
   const full = storageOrderCandidate("full", "", null, filter);
   if (isAttachmentScope(rel.db) || filter === null) return [full];
   const candidates: ScanCandidate[] = [];
-  const bp = detectPkBound([filter], rel, -1, snap);
+  const bp = detectPkBound([filter], rel, null, snap);
   if (bp !== null) {
     candidates.push(storageOrderCandidate("pk", "", { kind: "pk", pk: bp }, filter));
   }
   for (const idx of rel.table.indexes) {
-    const bound = buildIndexAccessPredicate(filter, rel, idx, -1, snap, engine);
+    const bound = buildIndexAccessPredicate(filter, rel, idx, null, snap, engine);
     if (bound !== null) {
       candidates.push(
         indexOrderCandidate("btree", bound.nameKey, { kind: "index", index: bound }, filter),
@@ -15461,7 +15660,7 @@ export function detectIntervalSet(
       { kind: "column", index: keyIdx },
       keyType,
       colColl,
-      -1,
+      null,
     );
     if (t !== null) clip.push(t);
   }
@@ -15486,7 +15685,7 @@ export function reduceIntervalUnion(
   const terms: BoundTerm[] = [];
   const walk = (x: RExpr): boolean => {
     if (x.kind === "and") return walk(x.lhs) && walk(x.rhs);
-    const t = asBoundTerm(x, { kind: "column", index: keyIdx }, keyType, colColl, -1);
+    const t = asBoundTerm(x, { kind: "column", index: keyIdx }, keyType, colColl, null);
     if (t === null) return false;
     terms.push(t);
     return true;
@@ -15513,10 +15712,23 @@ export function detectINLBound(
   rel: ScopeRel,
   snap: Snapshot,
 ): ScanBound | null {
+  return inventoryINLCandidates(on, whereFilter, rel, { start: 0, end: rel.offset }, snap)[0]?.bound ?? null;
+}
+
+// inventoryINLCandidates enumerates every legal sibling-dependent inner access path in canonical
+// access-kind/name order. siblingRange is the selected physical outer relation's logical slot range,
+// so reverse orientation never admits a column from the dependency side by source-position accident.
+export function inventoryINLCandidates(
+  on: RExpr | null,
+  whereFilter: RExpr | null,
+  rel: ScopeRel,
+  siblingRange: ColumnRange,
+  snap: Snapshot,
+): ScanCandidate[] {
   // A host-attached inner relation full-scans per outer row this slice (attached-databases.md §8): the
   // seek would resolve its index store unscoped. Index-nested-loop over an attachment is a perf follow-on.
-  if (isAttachmentScope(rel.db)) return null;
-  const cutoff = rel.offset;
+  if (isAttachmentScope(rel.db)) return [];
+  const candidates: ScanCandidate[] = [];
   const collect = (keyIdx: number, ty: ScalarType, coll: Collation | null): BoundTerm[] => {
     const colColl = coll !== null ? coll.name : null;
     const terms: BoundTerm[] = [];
@@ -15527,7 +15739,7 @@ export function detectINLBound(
         walk(e.rhs);
         return;
       }
-      const t = asBoundTerm(e, { kind: "column", index: keyIdx }, ty, colColl, cutoff);
+      const t = asBoundTerm(e, { kind: "column", index: keyIdx }, ty, colColl, siblingRange);
       if (t !== null) terms.push(t);
     };
     walk(on);
@@ -15536,14 +15748,14 @@ export function detectINLBound(
   };
   const hasSibling = (terms: BoundTerm[]): boolean => terms.some((t) => t.src.kind === "column");
   // Primary-key tuple bound first (the row's own key — range-capable, strictly cheaper).
-  const pk = detectPkBound([on, whereFilter], rel, cutoff, snap);
+  const pk = detectPkBound([on, whereFilter], rel, siblingRange, snap);
   if (
     pk !== null &&
     (pk.eqCols.some((ec) => ec.srcs.some((src) => src.kind === "column")) ||
       pk.eqCols.some((ec) => hasSibling(ec.ranges)) ||
       (pk.range !== null && hasSibling(pk.range.terms)))
   ) {
-    return { kind: "pk", pk };
+    candidates.push(storageOrderCandidate("pk", "", { kind: "pk", pk }, whereFilter));
   }
   // Else a leading secondary-index equality bound to a sibling (indexes in ascending lowercased name
   // order — the deterministic tie-break, matching detectScanBound).
@@ -15581,7 +15793,7 @@ export function detectINLBound(
       // "index-nested-loop"). suffixTypes are the trailing columns (columns[1..], fixed-width by the
       // check above), width-skipped past the single equality slot.
       const suffixTypes = cols.slice(1).map((c) => typeScalar(rel.table.columns[c]!.type));
-      return {
+      const bound: ScanBound = {
         kind: "index",
         index: {
           nameKey: idx.name.toLowerCase(),
@@ -15590,6 +15802,7 @@ export function detectINLBound(
           suffixTypes,
         },
       };
+      candidates.push(indexOrderCandidate("btree", idx.name.toLowerCase(), bound, whereFilter));
     }
   }
   // Opclass sibling bounds follow the cheaper PK and ordered-B-tree paths. GiST precedes GIN,
@@ -15602,24 +15815,39 @@ export function detectINLBound(
     const colType = rel.table.columns[ci]!.type;
     for (const filter of filters) {
       if (colType.kind === "range") {
-        const m = gistSiblingMatch(filter, colGlobal, cutoff);
+        const m = gistSiblingMatch(filter, colGlobal, siblingRange);
         if (m !== null)
-          return {
-            kind: "gist",
-            gist: { nameKey: idx.name.toLowerCase(), strategy: m.strategy, colGlobal },
-          };
+          candidates.push(
+            storageOrderCandidate(
+              "gist",
+              idx.name.toLowerCase(),
+              {
+                kind: "gist",
+                gist: { nameKey: idx.name.toLowerCase(), strategy: m.strategy, colGlobal },
+              },
+              whereFilter,
+            ),
+          );
       } else if (isGistScalarType(colType)) {
-        if (gistScalarSiblingMatch(filter, colGlobal, cutoff) !== null)
-          return {
-            kind: "gist",
-            gist: {
-              nameKey: idx.name.toLowerCase(),
-              strategy: "equal",
-              colGlobal,
-              scalarType: typeScalar(colType),
-            },
-          };
+        if (gistScalarSiblingMatch(filter, colGlobal, siblingRange) !== null)
+          candidates.push(
+            storageOrderCandidate(
+              "gist",
+              idx.name.toLowerCase(),
+              {
+                kind: "gist",
+                gist: {
+                  nameKey: idx.name.toLowerCase(),
+                  strategy: "equal",
+                  colGlobal,
+                  scalarType: typeScalar(colType),
+                },
+              },
+              whereFilter,
+            ),
+          );
       }
+      if (candidates.at(-1)?.identity.indexName === idx.name.toLowerCase()) break;
     }
   }
   for (const idx of rel.table.indexes) {
@@ -15629,20 +15857,33 @@ export function detectINLBound(
     const colType = rel.table.columns[ci]!.type;
     if (colType.kind !== "array") continue;
     for (const filter of filters) {
-      const m = ginSiblingMatch(filter, colGlobal, cutoff);
+      const m = ginSiblingMatch(filter, colGlobal, siblingRange);
       if (m !== null)
-        return {
-          kind: "gin",
-          gin: {
-            nameKey: idx.name.toLowerCase(),
-            elemType: typeScalar(colType.elem),
-            strategy: m.strategy,
-            colGlobal,
-          },
-        };
+        candidates.push(
+          storageOrderCandidate(
+            "gin",
+            idx.name.toLowerCase(),
+            {
+              kind: "gin",
+              gin: {
+                nameKey: idx.name.toLowerCase(),
+                elemType: typeScalar(colType.elem),
+                strategy: m.strategy,
+                colGlobal,
+              },
+            },
+            whereFilter,
+          ),
+        );
+      if (candidates.at(-1)?.identity.indexName === idx.name.toLowerCase()) break;
     }
   }
-  return null;
+  candidates.sort((a, b) => {
+    const rank = SCAN_CANDIDATE_KINDS.indexOf(a.identity.kind) - SCAN_CANDIDATE_KINDS.indexOf(b.identity.kind);
+    if (rank !== 0) return rank;
+    return a.identity.indexName < b.identity.indexName ? -1 : a.identity.indexName > b.identity.indexName ? 1 : 0;
+  });
+  return candidates;
 }
 
 // keyCollationCtx reports the collation a key over col is STORED under, deciding whether — and how —
@@ -15842,12 +16083,12 @@ export function ginMatch(
 export function ginSiblingMatch(
   filter: RExpr,
   colGlobal: number,
-  cutoff: number,
+  siblingRange: ColumnRange,
 ): { strategy: GinStrategy; query: RExpr } | null {
   return ginMatchOperand(
     filter,
     colGlobal,
-    (q) => q.kind === "column" && q.index < cutoff,
+    (q) => q.kind === "column" && columnRangeContains(siblingRange, q.index),
   );
 }
 
@@ -15943,12 +16184,12 @@ export function gistScalarMatch(filter: RExpr, colGlobal: number): { query: RExp
 export function gistScalarSiblingMatch(
   filter: RExpr,
   colGlobal: number,
-  cutoff: number,
+  siblingRange: ColumnRange,
 ): { query: RExpr } | null {
   return gistScalarMatchOperand(
     filter,
     colGlobal,
-    (q) => q.kind === "column" && q.index < cutoff,
+    (q) => q.kind === "column" && columnRangeContains(siblingRange, q.index),
   );
 }
 
@@ -15995,12 +16236,12 @@ export function gistMatch(
 export function gistSiblingMatch(
   filter: RExpr,
   colGlobal: number,
-  cutoff: number,
+  siblingRange: ColumnRange,
 ): { strategy: GistStrategy; query: RExpr } | null {
   return gistMatchOperand(
     filter,
     colGlobal,
-    (q) => q.kind === "column" && q.index < cutoff,
+    (q) => q.kind === "column" && columnRangeContains(siblingRange, q.index),
   );
 }
 
@@ -16842,16 +17083,19 @@ type HashJoinHash = (key: Uint8Array) => bigint;
 export class HashJoinTable {
   private readonly entries = new Map<bigint, HashJoinEntry[]>();
   private readonly hash: HashJoinHash;
+  private readonly probeOffset: number;
 
   constructor(
     plan: HashJoinPlan,
-    rightOffset: number,
+    buildOffset: number,
+    probeOffset: number,
     rows: Row[],
     meter: Meter,
     hash: HashJoinHash = hashJoinFnv1a,
   ) {
     this.hash = hash;
-    const indices = plan.keys.map((key) => key.right - rightOffset);
+    this.probeOffset = probeOffset;
+    const indices = plan.keys.map((key) => key.right - buildOffset);
     const types = plan.keys.map((key) => key.type);
     for (let row = 0; row < rows.length; row++) {
       const encoded = hashJoinRowKey(rows[row]!, indices, types, COSTS.hashBuild, meter);
@@ -16866,7 +17110,7 @@ export class HashJoinTable {
   probe(plan: HashJoinPlan, row: Row, meter: Meter): number[] {
     const encoded = hashJoinRowKey(
       row,
-      plan.keys.map((key) => key.left),
+      plan.keys.map((key) => key.left - this.probeOffset),
       plan.keys.map((key) => key.type),
       COSTS.hashProbe,
       meter,
@@ -17112,6 +17356,14 @@ export function prefixSuccessor(p: Uint8Array): Uint8Array | null {
 // (a `5 < pk` flips to `pk > 5`). src is the constant/parameter operand node.
 export type BoundTerm = { op: BinaryOp; src: RExpr };
 
+// The global logical-slot interval whose bare columns are stable for one physical outer row.
+// null closes the sibling-bound door for an ordinary once-materialized scan.
+export type ColumnRange = { start: number; end: number } | null;
+
+function columnRangeContains(range: ColumnRange, index: number): boolean {
+  return range !== null && index >= range.start && index < range.end;
+}
+
 export type PkEqCol = {
   name: string;
   colType: ScalarType;
@@ -17147,7 +17399,7 @@ export type BoundKey = { kind: "key"; key: Uint8Array } | { kind: "null" } | { k
 export function detectPkBound(
   filters: (RExpr | null)[],
   rel: ScopeRel,
-  siblingCutoff: number,
+  siblingRange: ColumnRange,
   snap: Snapshot,
 ): PkBound | null {
   const members = pkIndices(rel.table);
@@ -17174,7 +17426,7 @@ export function detectPkBound(
         { kind: "column", index: rel.offset + ci },
         ty,
         colColl,
-        siblingCutoff,
+        siblingRange,
       );
       if (t !== null) terms.push(t);
     };
@@ -17344,7 +17596,7 @@ export function asBoundTerm(
   km: KeyMatch,
   pkType: ScalarType,
   colColl: string | null,
-  siblingCutoff: number,
+  siblingRange: ColumnRange,
 ): BoundTerm | null {
   if (e.kind !== "compare") return null;
   // A comparison bounds the key only when ITS resolved collation matches the key column's frozen
@@ -17361,8 +17613,8 @@ export function asBoundTerm(
   if (e.op !== "eq" && e.op !== "lt" && e.op !== "le" && e.op !== "gt" && e.op !== "ge")
     return null;
   const isPk = (x: RExpr): boolean => keyMatches(km, x);
-  if (isPk(e.lhs) && isConstSource(e.rhs, pkType, siblingCutoff)) return { op: e.op, src: e.rhs };
-  if (isPk(e.rhs) && isConstSource(e.lhs, pkType, siblingCutoff))
+  if (isPk(e.lhs) && isConstSource(e.rhs, pkType, siblingRange)) return { op: e.op, src: e.rhs };
+  if (isPk(e.rhs) && isConstSource(e.lhs, pkType, siblingRange))
     return { op: flipCmp(e.op), src: e.lhs };
   return null;
 }
@@ -17374,19 +17626,17 @@ export function asBoundTerm(
 // whole inner table per outer row (cost.md §3 "bounded scan", grammar.md §26). A type-mismatched outer
 // reference is wrapped in a cast by the resolver (as for a const literal), so it never arrives here bare.
 //
-// siblingCutoff opens the index-nested-loop door (cost.md §3 "JOIN"): when >= 0, a bare "column" node
-// whose GLOBAL index is < siblingCutoff — a column of an EARLIER join relation — is a valid bound source,
-// resolved per outer row from the combined left-hand row (like "outerColumn", a bare sibling column implies
-// a type match — a mismatch is a cast, never bare). -1 (the ordinary once-materialized bound) accepts only
-// literals/params/outer references.
-export function isConstSource(e: RExpr, pkType: ScalarType, siblingCutoff: number): boolean {
+// siblingRange opens the index-nested-loop door (cost.md §3 "JOIN"): a bare "column" node whose
+// GLOBAL index is inside the selected physical outer relation's interval is a valid bound source,
+// resolved per outer row from the combined logical row. null accepts only literals/params/outers.
+export function isConstSource(e: RExpr, pkType: ScalarType, siblingRange: ColumnRange): boolean {
   switch (e.kind) {
     case "param":
     case "constNull":
     case "outerColumn":
       return true;
     case "column":
-      return siblingCutoff >= 0 && e.index < siblingCutoff;
+      return columnRangeContains(siblingRange, e.index);
     case "constInt":
       return isInteger(pkType);
     case "constBool":
@@ -20339,6 +20589,9 @@ export type SelectPlan = {
 // after the resolve half has built the logical plan. A zero-valued PhysicalPlan is always correct —
 // the executor then full-scans and eager-sorts.
 export type PhysicalPlan = {
+  // Physical input position to logical source ordinal for P7's selected two-relation orientation.
+  // Empty preserves source order for every plan outside that slice.
+  relationOrder: number[];
   // Deterministic two-input hash operator. Builds the right input and probes the left using
   // same-type bare-column equality keys in source order. null keeps nested loop.
   hashJoin: HashJoinPlan | null;
@@ -20384,6 +20637,40 @@ export type PhysicalPlan = {
   // precedence over relBounds for that relation.
   relINLBounds: (ScanBound | null)[];
 };
+
+export function physicalRelOrdinal(plan: SelectPlan, position: number): number {
+  return plan.phys.relationOrder.length === plan.rels.length
+    ? plan.phys.relationOrder[position]!
+    : position;
+}
+
+export function relationColumnRange(plan: SelectPlan, ordinal: number): Exclude<ColumnRange, null> {
+  const rel = plan.rels[ordinal]!;
+  return { start: rel.offset, end: rel.offset + rel.colCount };
+}
+
+function logicalJoinRowWidth(plan: SelectPlan): number {
+  const last = plan.rels.at(-1);
+  return last === undefined ? 0 : last.offset + last.colCount;
+}
+
+function placePhysicalRelationRow(plan: SelectPlan, ordinal: number, row: Row): Row {
+  const result = Array.from({ length: logicalJoinRowWidth(plan) }, () => nullValue());
+  result.splice(plan.rels[ordinal]!.offset, row.length, ...row);
+  return result;
+}
+
+function combinePhysicalRelationRows(
+  plan: SelectPlan,
+  outerOrdinal: number,
+  outer: Row,
+  innerOrdinal: number,
+  inner: Row,
+): Row {
+  const result = placePhysicalRelationRow(plan, outerOrdinal, outer);
+  result.splice(plan.rels[innerOrdinal]!.offset, inner.length, ...inner);
+  return result;
+}
 
 export type HashJoinPlan = { keys: HashJoinKey[] };
 export type HashJoinKey = { left: number; right: number; type: Type };

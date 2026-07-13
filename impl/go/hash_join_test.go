@@ -13,7 +13,7 @@ func TestHashJoinRejectsForcedHashCollisions(t *testing.T) {
 		{IntValue(2), IntValue(20)},
 		{IntValue(2), IntValue(21)},
 	}
-	table, err := newHashJoinTableWithHash(plan, 1, right, newMeter(), func([]byte) uint64 { return 0 })
+	table, err := newHashJoinTableWithHash(plan, 1, 0, right, newMeter(), func([]byte) uint64 { return 0 })
 	if err != nil {
 		t.Fatal(err)
 	}

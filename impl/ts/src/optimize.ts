@@ -12,6 +12,7 @@
 import { pkIndices } from "./catalog.ts";
 import type {
   Engine,
+  HashJoinPlan,
   IndexOrder,
   RExpr,
   ScanBound,
@@ -21,14 +22,18 @@ import type {
 } from "./executor.ts";
 import {
   SCAN_CANDIDATE_KINDS,
+  compareLowerName,
   detectINLBound,
   estimateScanCandidates,
   fkTypesEqual,
   inventoryScanCandidates,
+  inventoryINLCandidates,
   needsEagerScan,
   orderSatisfiedByIndex,
   orderSatisfiedByIndexes,
   orderSatisfiedByPK,
+  physicalRelOrdinal,
+  relationColumnRange,
   scanBoundHasStorageOrder,
   SELECT_SCAN_BOUND_POLICY,
   selectCostedScanCandidate,
@@ -56,6 +61,7 @@ export function optimizeSelect(
   ruleOrderByPkScan(plan, rels, snap);
   ruleOrderByIndexScan(plan, rels, snap);
   ruleCostedSingleRelationPipeline(plan, rels, snap, eng);
+  ruleCostedTwoRelationJoin(plan, rels, snap, eng);
   ruleJoinPkOrdered(plan, rels, snap);
   ruleOrderByLimitTopK(plan);
 }
@@ -76,12 +82,25 @@ function ruleHashJoin(plan: SelectPlan, rels: ScopeRel[]): void {
   ) {
     return;
   }
+  plan.phys.hashJoin = buildHashJoinPlan(plan, rels, 0, 1);
+}
+
+function buildHashJoinPlan(
+  plan: SelectPlan,
+  rels: ScopeRel[],
+  outer: number,
+  inner: number,
+): HashJoinPlan | null {
+  if (rels.length !== 2 || plan.joins.length !== 1 || plan.joins[0]!.on === null) return null;
   const conjuncts: RExpr[] = [];
   flattenHashJoinConjuncts(plan.joins[0]!.on!, conjuncts);
-  const rightOffset = rels[1]!.offset;
+  const outerRange = relationColumnRange(plan, outer);
+  const innerRange = relationColumnRange(plan, inner);
+  const contains = (range: { start: number; end: number }, index: number): boolean =>
+    index >= range.start && index < range.end;
   const keys: { left: number; right: number; type: Type }[] = [];
   for (const expr of conjuncts) {
-    if (!hashJoinSafeConjunct(expr)) return;
+    if (!hashJoinSafeConjunct(expr)) return null;
     if (
       expr.kind !== "compare" ||
       expr.op !== "eq" ||
@@ -92,8 +111,8 @@ function ruleHashJoin(plan: SelectPlan, rels: ScopeRel[]): void {
     }
     let left = expr.lhs.index;
     let right = expr.rhs.index;
-    if (left >= rightOffset && right < rightOffset) [left, right] = [right, left];
-    if (left >= rightOffset || right < rightOffset) continue;
+    if (contains(innerRange, left) && contains(outerRange, right)) [left, right] = [right, left];
+    if (!contains(outerRange, left) || !contains(innerRange, right)) continue;
     const leftType = hashJoinColumnType(rels, left);
     const rightType = hashJoinColumnType(rels, right);
     if (
@@ -106,7 +125,7 @@ function ruleHashJoin(plan: SelectPlan, rels: ScopeRel[]): void {
     }
     keys.push({ left, right, type: leftType });
   }
-  if (keys.length > 0) plan.phys.hashJoin = { keys };
+  return keys.length > 0 ? { keys } : null;
 }
 
 function flattenHashJoinConjuncts(expr: RExpr, out: RExpr[]): void {
@@ -305,6 +324,154 @@ function ruleCostedSingleRelationPipeline(
   plan.phys.indexOrder = winner.indexOrder;
 }
 
+type JoinAlgorithm = "inl" | "hash" | "nested";
+
+type TwoRelationCandidate = {
+  order: [number, number];
+  outerIdentity: ScanCandidateIdentity;
+  innerIdentity: ScanCandidateIdentity;
+  algorithm: JoinAlgorithm;
+  outerBound: ScanBound | null;
+  innerBound: ScanBound | null;
+  innerINL: ScanBound | null;
+  hashJoin: HashJoinPlan | null;
+};
+
+function compareScanIdentity(a: ScanCandidateIdentity, b: ScanCandidateIdentity): number {
+  const rank = SCAN_CANDIDATE_KINDS.indexOf(a.kind) - SCAN_CANDIDATE_KINDS.indexOf(b.kind);
+  return rank !== 0 ? rank : compareLowerName({ name: a.indexName }, { name: b.indexName });
+}
+
+// P7 exhaustively composes every ordinary access path and legal join algorithm in both physical
+// orientations. Logical expression slots remain in source order; relationOrder changes only which
+// relation drives and which relation builds/seeks.
+function ruleCostedTwoRelationJoin(
+  plan: SelectPlan,
+  rels: ScopeRel[],
+  snap: Snapshot,
+  eng: Engine,
+): void {
+  if (
+    rels.length !== 2 ||
+    plan.rels.length !== 2 ||
+    plan.joins.length !== 1 ||
+    (plan.joins[0]!.kind !== "inner" && plan.joins[0]!.kind !== "cross") ||
+    plan.rels.some(
+      (rel) =>
+        rel.lateral || rel.srf !== undefined || rel.cte !== undefined || rel.derived !== undefined,
+    )
+  ) {
+    return;
+  }
+
+  const ordinary = [
+    inventoryScanCandidates(plan.filter, rels[0]!, snap, eng),
+    inventoryScanCandidates(plan.filter, rels[1]!, snap, eng),
+  ];
+  const candidates: TwoRelationCandidate[] = [];
+  for (const order of [
+    [0, 1],
+    [1, 0],
+  ] as [number, number][]) {
+    const [outer, inner] = order;
+    const hashJoin = buildHashJoinPlan(plan, rels, outer, inner);
+    for (const outerAccess of ordinary[outer]!) {
+      for (const innerAccess of ordinary[inner]!) {
+        if (hashJoin !== null) {
+          candidates.push({
+            order,
+            outerIdentity: outerAccess.identity,
+            innerIdentity: innerAccess.identity,
+            algorithm: "hash",
+            outerBound: outerAccess.bound,
+            innerBound: innerAccess.bound,
+            innerINL: null,
+            hashJoin,
+          });
+        }
+        candidates.push({
+          order,
+          outerIdentity: outerAccess.identity,
+          innerIdentity: innerAccess.identity,
+          algorithm: "nested",
+          outerBound: outerAccess.bound,
+          innerBound: innerAccess.bound,
+          innerINL: null,
+          hashJoin: null,
+        });
+      }
+      for (const innerAccess of inventoryINLCandidates(
+        plan.joins[0]!.on,
+        plan.filter,
+        rels[inner]!,
+        relationColumnRange(plan, outer),
+        snap,
+      )) {
+        candidates.push({
+          order,
+          outerIdentity: outerAccess.identity,
+          innerIdentity: innerAccess.identity,
+          algorithm: "inl",
+          outerBound: outerAccess.bound,
+          innerBound: null,
+          innerINL: innerAccess.bound,
+          hashJoin: null,
+        });
+      }
+    }
+  }
+  const algorithmRank: Record<JoinAlgorithm, number> = { inl: 0, hash: 1, nested: 2 };
+  candidates.sort((a, b) => {
+    const order = a.order[0] - b.order[0] || a.order[1] - b.order[1];
+    if (order !== 0) return order;
+    const outer = compareScanIdentity(a.outerIdentity, b.outerIdentity);
+    if (outer !== 0) return outer;
+    const inner = compareScanIdentity(a.innerIdentity, b.innerIdentity);
+    return inner !== 0 ? inner : algorithmRank[a.algorithm] - algorithmRank[b.algorithm];
+  });
+
+  let winner: TwoRelationCandidate | null = null;
+  let winnerCost = 0n;
+  for (const candidate of candidates) {
+    const [outer, inner] = candidate.order;
+    const relBounds: (ScanBound | null)[] = [null, null];
+    const relINLBounds: (ScanBound | null)[] = [null, null];
+    relBounds[outer] = candidate.outerBound;
+    relBounds[inner] = candidate.innerBound;
+    relINLBounds[inner] = candidate.innerINL;
+    const trial: SelectPlan = {
+      ...plan,
+      phys: {
+        ...plan.phys,
+        relationOrder: [...candidate.order],
+        relBounds,
+        relINLBounds,
+        hashJoin: candidate.hashJoin,
+        pkOrdered: false,
+        pkReverse: false,
+        indexOrder: null,
+        joinPkOrdered: false,
+        topK: null,
+      },
+    };
+    trial.phys.joinPkOrdered = joinPkOrderedForCandidate(trial, rels, snap);
+    const cost = eng.estimateSelectPlanCost(trial);
+    if (winner === null || cost < winnerCost) {
+      winner = candidate;
+      winnerCost = cost;
+    }
+  }
+  if (winner === null) return;
+  const [outer, inner] = winner.order;
+  plan.phys.relationOrder = [...winner.order];
+  plan.phys.relBounds = [null, null];
+  plan.phys.relINLBounds = [null, null];
+  plan.phys.relBounds[outer] = winner.outerBound;
+  plan.phys.relBounds[inner] = winner.innerBound;
+  plan.phys.relINLBounds[inner] = winner.innerINL;
+  plan.phys.hashJoin = winner.hashJoin;
+}
+
 // ruleIndexNestedLoop — index-nested-loop pushdown (cost.md §3 "JOIN"): a join inner relation
 // whose primary key / indexed column is compared to a SIBLING column of an earlier relation
 // (`a JOIN b ON b.pk = a.x`) is re-materialized per outer row, seeking instead of full-scanning —
@@ -392,6 +559,13 @@ function ruleOrderByIndexScan(plan: SelectPlan, rels: ScopeRel[], snap: Snapshot
 // output). The outer must carry no non-PK bound (a PK bound / no bound keeps it in PK order); the
 // optional inner INL must be PK/B-tree so its per-outer materialization preserves eager key order.
 function ruleJoinPkOrdered(plan: SelectPlan, rels: ScopeRel[], snap: Snapshot): void {
+  plan.phys.joinPkOrdered = joinPkOrderedForCandidate(plan, rels, snap);
+}
+
+function joinPkOrderedForCandidate(plan: SelectPlan, rels: ScopeRel[], snap: Snapshot): boolean {
+  if (plan.rels.length !== 2 || rels.length !== 2 || plan.joins.length !== 1) return false;
+  const outer = physicalRelOrdinal(plan, 0);
+  const inner = physicalRelOrdinal(plan, 1);
   if (
     !plan.isAgg &&
     !plan.hasWindow &&
@@ -399,25 +573,24 @@ function ruleJoinPkOrdered(plan: SelectPlan, rels: ScopeRel[], snap: Snapshot): 
     plan.order.length > 0 &&
     plan.orderExprs.length === 0 &&
     plan.limit !== null &&
-    plan.rels.length === 2 &&
-    plan.joins.length === 1 &&
     (plan.joins[0]!.kind === "inner" || plan.joins[0]!.kind === "cross") &&
     plan.rels.every(
       (r) =>
         r.lateral !== true && r.srf === undefined && r.cte === undefined && r.derived === undefined,
     ) &&
-    !needsEagerScan(plan.phys.relBounds[0]) &&
-    plan.phys.relINLBounds[0] === null &&
-    (plan.phys.relINLBounds[1] === null ||
-      plan.phys.relINLBounds[1]!.kind === "pk" ||
-      plan.phys.relINLBounds[1]!.kind === "index" ||
-      plan.phys.relINLBounds[1]!.kind === "gin" ||
-      plan.phys.relINLBounds[1]!.kind === "gist") &&
-    plan.order.length <= pkIndices(rels[0]!.table).length
+    !needsEagerScan(plan.phys.relBounds[outer]) &&
+    plan.phys.relINLBounds[outer] === null &&
+    (plan.phys.relINLBounds[inner] === null ||
+      plan.phys.relINLBounds[inner]!.kind === "pk" ||
+      plan.phys.relINLBounds[inner]!.kind === "index" ||
+      plan.phys.relINLBounds[inner]!.kind === "gin" ||
+      plan.phys.relINLBounds[inner]!.kind === "gist") &&
+    plan.order.length <= pkIndices(rels[outer]!.table).length
   ) {
-    const dir = orderSatisfiedByPK(snap, rels[0]!.table, plan.rels[0]!.offset, plan.order);
-    plan.phys.joinPkOrdered = dir !== null && !dir.reverse;
+    const dir = orderSatisfiedByPK(snap, rels[outer]!.table, plan.rels[outer]!.offset, plan.order);
+    return dir !== null && !dir.reverse;
   }
+  return false;
 }
 
 // ruleOrderByLimitTopK — bounded selection for a BLOCKING ORDER BY with a constant LIMIT. Plain

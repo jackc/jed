@@ -430,6 +430,10 @@ impl Engine {
             ("Nested Loop", join_detail(j))
         };
         r.emit(depth, node, with_note(detail, note));
+        if n == 2 && sp.phys.relation_order.len() == 2 {
+            self.render_rel_leaf(r, sp, sp.phys.relation_order[0], depth + 1, "")?;
+            return self.render_rel_leaf(r, sp, sp.phys.relation_order[1], depth + 1, "");
+        }
         self.render_join_tree(r, sp, n - 1, depth + 1, "")?;
         self.render_rel_leaf(r, sp, n - 1, depth + 1, "")
     }

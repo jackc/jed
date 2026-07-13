@@ -362,6 +362,12 @@ func (db *engine) renderJoinTree(r *explainRender, sp *selectPlan, n, depth int,
 		}
 	}
 	r.emit(depth, node, withNote(detail, note))
+	if n == 2 && len(sp.phys.relationOrder) == 2 {
+		if err := db.renderRelLeaf(r, sp, sp.phys.relationOrder[0], depth+1, ""); err != nil {
+			return err
+		}
+		return db.renderRelLeaf(r, sp, sp.phys.relationOrder[1], depth+1, "")
+	}
 	if err := db.renderJoinTree(r, sp, n-1, depth+1, ""); err != nil {
 		return err
 	}

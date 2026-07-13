@@ -9,8 +9,9 @@ import (
 // probe filters the full key bytes so even a forced hash collision cannot admit a false match. The
 // executor never iterates the map to emit rows.
 type hashJoinTable struct {
-	entries map[uint64][]hashJoinEntry
-	hash    func([]byte) uint64
+	entries     map[uint64][]hashJoinEntry
+	hash        func([]byte) uint64
+	probeOffset int
 }
 
 type hashJoinEntry struct {
@@ -18,17 +19,17 @@ type hashJoinEntry struct {
 	row storedRow
 }
 
-func newHashJoinTable(plan *hashJoinPlan, rightOffset int, rows []storedRow, meter *costMeter) (*hashJoinTable, error) {
-	return newHashJoinTableWithHash(plan, rightOffset, rows, meter, hashJoinFNV1a)
+func newHashJoinTable(plan *hashJoinPlan, buildOffset, probeOffset int, rows []storedRow, meter *costMeter) (*hashJoinTable, error) {
+	return newHashJoinTableWithHash(plan, buildOffset, probeOffset, rows, meter, hashJoinFNV1a)
 }
 
-func newHashJoinTableWithHash(plan *hashJoinPlan, rightOffset int, rows []storedRow, meter *costMeter, hasher func([]byte) uint64) (*hashJoinTable, error) {
-	t := &hashJoinTable{entries: make(map[uint64][]hashJoinEntry), hash: hasher}
+func newHashJoinTableWithHash(plan *hashJoinPlan, buildOffset, probeOffset int, rows []storedRow, meter *costMeter, hasher func([]byte) uint64) (*hashJoinTable, error) {
+	t := &hashJoinTable{entries: make(map[uint64][]hashJoinEntry), hash: hasher, probeOffset: probeOffset}
 	for _, row := range rows {
 		indices := make([]int, len(plan.keys))
 		types := make([]dataType, len(plan.keys))
 		for i, key := range plan.keys {
-			indices[i] = key.right - rightOffset
+			indices[i] = key.right - buildOffset
 			types[i] = key.ty
 		}
 		encoded, present, err := hashJoinRowKey(row, indices, types, costs.HashBuild, meter)
@@ -48,7 +49,7 @@ func (t *hashJoinTable) probe(plan *hashJoinPlan, row storedRow, meter *costMete
 	indices := make([]int, len(plan.keys))
 	types := make([]dataType, len(plan.keys))
 	for i, key := range plan.keys {
-		indices[i] = key.left
+		indices[i] = key.left - t.probeOffset
 		types[i] = key.ty
 	}
 	encoded, present, err := hashJoinRowKey(row, indices, types, costs.HashProbe, meter)

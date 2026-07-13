@@ -1405,14 +1405,16 @@ func topKFixedScalar(ty scalarType) bool {
 // when the window fills. Gated (by the caller / plan.joinPkOrdered) to exactly two non-lateral base
 // relations, an INNER/CROSS join, a LIMIT, and a forward outer-PK ORDER BY.
 func (db *engine) execStreamingJoin(plan *selectPlan, env *evalEnv, meter *costMeter, params []Value, outer []storedRow, rng *stmtRng) (selectResult, error) {
-	leftRows, err := db.materializeRel(plan, 0, params, outer, nil, rng, env.ctes, meter)
+	outerOrdinal := physicalRelOrdinal(plan, 0)
+	innerOrdinal := physicalRelOrdinal(plan, 1)
+	leftRows, err := db.materializeRel(plan, outerOrdinal, params, outer, nil, rng, env.ctes, meter)
 	if err != nil {
 		return selectResult{}, err
 	}
-	rightINL := plan.phys.relINLBounds[1] != nil
+	rightINL := plan.phys.relINLBounds[innerOrdinal] != nil
 	var rightRows []storedRow
 	if !rightINL {
-		rightRows, err = db.materializeRel(plan, 1, params, outer, nil, rng, env.ctes, meter)
+		rightRows, err = db.materializeRel(plan, innerOrdinal, params, outer, nil, rng, env.ctes, meter)
 		if err != nil {
 			return selectResult{}, err
 		}
@@ -1420,7 +1422,7 @@ func (db *engine) execStreamingJoin(plan *selectPlan, env *evalEnv, meter *costM
 	on := plan.joins[0].on
 	var hashTable *hashJoinTable
 	if plan.phys.hashJoin != nil && (plan.limit == nil || *plan.limit != 0) {
-		hashTable, err = newHashJoinTable(plan.phys.hashJoin, plan.rels[1].offset, rightRows, meter)
+		hashTable, err = newHashJoinTable(plan.phys.hashJoin, plan.rels[innerOrdinal].offset, plan.rels[outerOrdinal].offset, rightRows, meter)
 		if err != nil {
 			return selectResult{}, err
 		}
@@ -1437,7 +1439,8 @@ func (db *engine) execStreamingJoin(plan *selectPlan, env *evalEnv, meter *costM
 		for _, left := range leftRows {
 			innerRows := rightRows
 			if rightINL {
-				innerRows, err = db.materializeRel(plan, 1, params, outer, left, rng, env.ctes, meter)
+				outerLogical := placePhysicalRelationRow(plan, outerOrdinal, left)
+				innerRows, err = db.materializeRel(plan, innerOrdinal, params, outer, outerLogical, rng, env.ctes, meter)
 				if err != nil {
 					return selectResult{}, err
 				}
@@ -1448,9 +1451,7 @@ func (db *engine) execStreamingJoin(plan *selectPlan, env *evalEnv, meter *costM
 				}
 			}
 			for _, right := range innerRows {
-				combined := make(storedRow, 0, len(left)+len(right))
-				combined = append(combined, left...)
-				combined = append(combined, right...)
+				combined := combinePhysicalRelationRows(plan, outerOrdinal, left, innerOrdinal, right)
 				// INNER: keep the pair iff its ON is TRUE (3VL); CROSS: keep every pair (no ON).
 				if on != nil {
 					v, err := on.eval(combined, env, meter)
@@ -1613,8 +1614,14 @@ func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 		// otherwise the ordinary constant WHERE operand. The full predicate remains residual.
 		var query *rExpr
 		if inl {
-			for _, filter := range []*rExpr{plan.joins[ri-1].on, plan.filter} {
-				if _, q, ok := ginSiblingMatch(filter, sb.gin.colGlobal, rel.offset); ok {
+			on := plan.joins[ri-1].on
+			siblingColumns := &columnRange{start: 0, end: rel.offset}
+			if len(plan.phys.relationOrder) == 2 {
+				on = plan.joins[0].on
+				siblingColumns = relationColumnRange(plan, physicalRelOrdinal(plan, 0))
+			}
+			for _, filter := range []*rExpr{on, plan.filter} {
+				if _, q, ok := ginSiblingMatch(filter, sb.gin.colGlobal, siblingColumns); ok {
 					query = q
 					break
 				}
@@ -1638,13 +1645,19 @@ func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 		// Re-find Q using the same operand class as planning. GiST remains always-recheck.
 		var query *rExpr
 		if inl {
-			for _, filter := range []*rExpr{plan.joins[ri-1].on, plan.filter} {
+			on := plan.joins[ri-1].on
+			siblingColumns := &columnRange{start: 0, end: rel.offset}
+			if len(plan.phys.relationOrder) == 2 {
+				on = plan.joins[0].on
+				siblingColumns = relationColumnRange(plan, physicalRelOrdinal(plan, 0))
+			}
+			for _, filter := range []*rExpr{on, plan.filter} {
 				var q *rExpr
 				var ok bool
 				if sb.gist.strategy == gistEqual {
-					_, q, ok = gistScalarSiblingMatch(filter, sb.gist.colGlobal, rel.offset)
+					_, q, ok = gistScalarSiblingMatch(filter, sb.gist.colGlobal, siblingColumns)
 				} else {
-					_, q, ok = gistSiblingMatch(filter, sb.gist.colGlobal, rel.offset)
+					_, q, ok = gistSiblingMatch(filter, sb.gist.colGlobal, siblingColumns)
 				}
 				if ok {
 					query = q

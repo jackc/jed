@@ -14,6 +14,6 @@ test("forced hash collisions recheck full keys", () => {
     [intValue(2n), intValue(20n)],
     [intValue(2n), intValue(21n)],
   ];
-  const table = new HashJoinTable(plan, 1, rows, new Meter(), () => 0n);
+  const table = new HashJoinTable(plan, 1, 0, rows, new Meter(), () => 0n);
   assert.deepEqual(table.probe(plan, [intValue(2n)], new Meter()), [1, 2]);
 });

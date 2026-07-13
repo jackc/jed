@@ -3,6 +3,7 @@ package jed
 import (
 	"bytes"
 	"fmt"
+	"math/bits"
 	"strings"
 )
 
@@ -56,6 +57,23 @@ func satEstimateMul(a, b int64) int64 {
 		return maxEstimate
 	}
 	return a * b
+}
+
+// ceilEstimateMulDiv computes ceil(a*b/d) with an exact unsigned 128-bit temporary. Callers use
+// a<=d, so the quotient is at most b and therefore remains in the signed estimator domain.
+func ceilEstimateMulDiv(a, b, d int64) int64 {
+	if a <= 0 || b <= 0 || d <= 0 {
+		return 0
+	}
+	hi, lo := bits.Mul64(uint64(a), uint64(b))
+	q, r := bits.Div64(hi, lo, uint64(d))
+	if r != 0 {
+		q++
+	}
+	if q > uint64(maxEstimate) {
+		return maxEstimate
+	}
+	return int64(q)
 }
 
 // scaleEstimateCeil computes ceil(n*numerator/denominator) without a wider intermediate.
@@ -1175,6 +1193,9 @@ func joinEstimatedRows(kind joinKind, on *rExpr, physicalPairs, logicalPairs, pr
 }
 
 func (db *engine) estimateJoinTree(sp *selectPlan, n int, ctx *estimateCTECtx) estimatedPlan {
+	if n == 2 && len(sp.phys.relationOrder) == 2 {
+		return db.estimateTwoRelationJoin(sp, ctx)
+	}
 	if n == 1 {
 		return db.estimateRelation(sp, 0, ctx)
 	}
@@ -1221,6 +1242,83 @@ func (db *engine) estimateJoinTree(sp *selectPlan, n int, ctx *estimateCTECtx) e
 	addPlanUnit(&root, estimatorUnitOperatorEval, satEstimateMul(estimatorOperatorNodes(join.on), invocations))
 	db.addExpressionSubqueries(&root, join.on, invocations, ctx)
 	return parentEstimatedPlan(root, left, right)
+}
+
+func (db *engine) estimateTwoRelationJoin(sp *selectPlan, ctx *estimateCTECtx) estimatedPlan {
+	outerOrdinal := physicalRelOrdinal(sp, 0)
+	innerOrdinal := physicalRelOrdinal(sp, 1)
+	outer := db.estimateRelation(sp, outerOrdinal, ctx)
+	innerPerCall := db.estimateRelation(sp, innerOrdinal, ctx)
+	boundByOuter := sp.phys.relINLBounds[innerOrdinal] != nil
+
+	fullPairs := satEstimateMul(outer.root.rows, innerPerCall.root.rows)
+	fullLogicalPairs := satEstimateMul(outer.root.logicalRows, innerPerCall.root.logicalRows)
+	join := sp.joins[0]
+	fullRows, fullLogicalRows := joinEstimatedRows(
+		join.kind, join.on, fullPairs, fullLogicalPairs,
+		outer.root.rows, innerPerCall.root.rows, boundByOuter,
+	)
+
+	outerCalls := outer.root.rows
+	deliveredRows := fullRows
+	if sp.phys.joinPkOrdered && sp.limit != nil {
+		target := *sp.limit
+		if sp.offset != nil {
+			target = satEstimateAdd(target, *sp.offset)
+		}
+		postFilterRows := fullRows
+		if sp.filter != nil {
+			postFilterRows = estimateSelectivity(predicateSelectivity(sp.filter), fullRows)
+		}
+		switch {
+		case target == 0:
+			outerCalls, deliveredRows = 0, 0
+		case postFilterRows > target && fullRows > 0:
+			outerCalls = ceilEstimateMulDiv(target, outer.root.rows, postFilterRows)
+			if outerCalls > outer.root.rows {
+				outerCalls = outer.root.rows
+			}
+			deliveredRows = ceilEstimateMulDiv(outerCalls, fullRows, outer.root.rows)
+			if deliveredRows > fullRows {
+				deliveredRows = fullRows
+			}
+		}
+	}
+
+	inner := innerPerCall
+	visitedPairs := fullPairs
+	if boundByOuter {
+		inner.root = repeatPlanEstimate(inner.root, outerCalls)
+		for i := range inner.nodes {
+			inner.nodes[i] = repeatPlanEstimate(inner.nodes[i], outerCalls)
+		}
+		visitedPairs = inner.root.rows
+	} else if outerCalls < outer.root.rows {
+		visitedPairs = ceilEstimateMulDiv(outerCalls, fullPairs, outer.root.rows)
+	}
+
+	root := addPlanEstimates(outer.root, inner.root)
+	root.rows, root.logicalRows = deliveredRows, fullLogicalRows
+	invocations := visitedPairs
+	if sp.phys.hashJoin != nil {
+		keyBytes, framedBytes := int64(0), int64(0)
+		for _, key := range sp.phys.hashJoin.keys {
+			width := int64(defaultVariableKeyBytes)
+			if scalar, ok := key.ty.AsScalar(); ok && scalar.IsFixedWidth() {
+				width = int64(scalar.WidthBytes())
+			}
+			keyBytes = satEstimateAdd(keyBytes, width)
+			framedBytes = satEstimateAdd(framedBytes, satEstimateAdd(4, width))
+		}
+		addPlanUnit(&root, estimatorUnitHashBuild, satEstimateMul(innerPerCall.root.rows, keyBytes))
+		addPlanUnit(&root, estimatorUnitHashProbe, satEstimateAdd(
+			satEstimateMul(outerCalls, keyBytes), satEstimateMul(deliveredRows, framedBytes),
+		))
+		invocations = deliveredRows
+	}
+	addPlanUnit(&root, estimatorUnitOperatorEval, satEstimateMul(estimatorOperatorNodes(join.on), invocations))
+	db.addExpressionSubqueries(&root, join.on, invocations, ctx)
+	return parentEstimatedPlan(root, outer, inner)
 }
 
 func (db *engine) estimateSelectPlan(sp *selectPlan, ctx *estimateCTECtx) estimatedPlan {

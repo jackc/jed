@@ -73,6 +73,86 @@ type emitter struct {
 	mode     emitMode
 }
 
+func logicalJoinRowWidth(plan *selectPlan) int {
+	if len(plan.rels) == 0 {
+		return 0
+	}
+	last := plan.rels[len(plan.rels)-1]
+	return last.offset + last.colCount
+}
+
+func placePhysicalRelationRow(plan *selectPlan, ordinal int, row storedRow) storedRow {
+	out := make(storedRow, logicalJoinRowWidth(plan))
+	for i := range out {
+		out[i] = NullValue()
+	}
+	copy(out[plan.rels[ordinal].offset:], row)
+	return out
+}
+
+func combinePhysicalRelationRows(plan *selectPlan, outerOrdinal int, outer storedRow, innerOrdinal int, inner storedRow) storedRow {
+	out := placePhysicalRelationRow(plan, outerOrdinal, outer)
+	copy(out[plan.rels[innerOrdinal].offset:], inner)
+	return out
+}
+
+// execCostedTwoRelationJoin executes P7's selected physical orientation while placing every local
+// row back into its original logical slot interval before expression evaluation.
+func (db *engine) execCostedTwoRelationJoin(plan *selectPlan, env *evalEnv, meter *costMeter, params []Value, outerStack []storedRow, materialized [][]storedRow) ([]storedRow, error) {
+	outerOrdinal := physicalRelOrdinal(plan, 0)
+	innerOrdinal := physicalRelOrdinal(plan, 1)
+	outerRows := materialized[outerOrdinal]
+	innerINL := plan.phys.relINLBounds[innerOrdinal] != nil
+	innerRows := materialized[innerOrdinal]
+	on := plan.joins[0].on
+
+	var table *hashJoinTable
+	var err error
+	if plan.phys.hashJoin != nil {
+		table, err = newHashJoinTable(
+			plan.phys.hashJoin,
+			plan.rels[innerOrdinal].offset,
+			plan.rels[outerOrdinal].offset,
+			innerRows,
+			meter,
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	var out []storedRow
+	for _, outerRow := range outerRows {
+		candidates := innerRows
+		if innerINL {
+			outerLogical := placePhysicalRelationRow(plan, outerOrdinal, outerRow)
+			candidates, err = db.materializeRel(plan, innerOrdinal, params, outerStack, outerLogical, env.rng, env.ctes, meter)
+			if err != nil {
+				return nil, err
+			}
+		} else if table != nil {
+			candidates, err = table.probe(plan.phys.hashJoin, outerRow, meter)
+			if err != nil {
+				return nil, err
+			}
+		}
+		for _, innerRow := range candidates {
+			combined := combinePhysicalRelationRows(plan, outerOrdinal, outerRow, innerOrdinal, innerRow)
+			if on != nil {
+				v, err := on.eval(combined, env, meter)
+				if err != nil {
+					return nil, err
+				}
+				if !v.IsTrue() {
+					continue
+				}
+			}
+			out = append(out, combined)
+		}
+	}
+	return out, nil
+}
+
 // drainEager builds the full output slice from the emitter — the materialized drive
 // (spec/design/streaming.md §4). The lazy queryValues drive (bufferedCursor) emits the same rows one at
 // a time instead; both charge the identical units in the identical order, so totals agree (§6).
@@ -302,35 +382,156 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 	// match run, all unmatched right rows last in right key order (CLAUDE.md §10).
 	// A FROM-less SELECT has no relations: seed `running` with ONE virtual zero-column row
 	// instead of a table's rows (grammar.md §34). No scan ran, so no scan cost accrued.
-	running := []storedRow{{}}
-	if len(plan.rels) > 0 {
-		running = materialized[0]
-	}
-	for k := range plan.joins {
-		on := plan.joins[k].on
-		emitLeft := plan.joins[k].kind == joinLeft || plan.joins[k].kind == joinFull
-		emitRight := plan.joins[k].kind == joinRight || plan.joins[k].kind == joinFull
-		// NULL-pad widths come from the PLAN, never a sampled row, so they are correct even when
-		// `running`/`rightRows` is empty: the right table begins at flat offset rels[k+1].offset
-		// (= the width of every running row) and is that many columns wide.
-		leftPad := plan.rels[k+1].offset
-		rightPad := plan.rels[k+1].colCount
-		var next []storedRow
-		// A CORRELATED LATERAL relation (§44): re-materialize it ONCE PER combined left-hand row, with
-		// that row pushed onto the outer-row stack as the body's immediate outer (the correlated-
-		// subquery mechanism). The plan guarantees INNER/CROSS/LEFT here (RIGHT/FULL to a correlated
-		// lateral is 42P10), so there is no unmatched-right emission.
-		if plan.rels[k+1].lateral {
-			for _, left := range running {
-				latOuter := make([]storedRow, len(outer)+1)
-				copy(latOuter, outer)
-				latOuter[len(outer)] = left
-				rightRows, err := db.materializeRel(plan, k+1, params, latOuter, nil, env.rng, env.ctes, meter)
+	var running []storedRow
+	if len(plan.phys.relationOrder) == 2 {
+		var err error
+		running, err = db.execCostedTwoRelationJoin(plan, env, meter, params, outer, materialized)
+		if err != nil {
+			return emitter{}, err
+		}
+	} else {
+		running = []storedRow{{}}
+		if len(plan.rels) > 0 {
+			running = materialized[0]
+		}
+		for k := range plan.joins {
+			on := plan.joins[k].on
+			emitLeft := plan.joins[k].kind == joinLeft || plan.joins[k].kind == joinFull
+			emitRight := plan.joins[k].kind == joinRight || plan.joins[k].kind == joinFull
+			// NULL-pad widths come from the PLAN, never a sampled row, so they are correct even when
+			// `running`/`rightRows` is empty: the right table begins at flat offset rels[k+1].offset
+			// (= the width of every running row) and is that many columns wide.
+			leftPad := plan.rels[k+1].offset
+			rightPad := plan.rels[k+1].colCount
+			var next []storedRow
+			// A CORRELATED LATERAL relation (§44): re-materialize it ONCE PER combined left-hand row, with
+			// that row pushed onto the outer-row stack as the body's immediate outer (the correlated-
+			// subquery mechanism). The plan guarantees INNER/CROSS/LEFT here (RIGHT/FULL to a correlated
+			// lateral is 42P10), so there is no unmatched-right emission.
+			if plan.rels[k+1].lateral {
+				for _, left := range running {
+					latOuter := make([]storedRow, len(outer)+1)
+					copy(latOuter, outer)
+					latOuter[len(outer)] = left
+					rightRows, err := db.materializeRel(plan, k+1, params, latOuter, nil, env.rng, env.ctes, meter)
+					if err != nil {
+						return emitter{}, err
+					}
+					leftMatched := false
+					for _, right := range rightRows {
+						combined := make(storedRow, 0, len(left)+len(right))
+						combined = append(combined, left...)
+						combined = append(combined, right...)
+						keep := true
+						if on != nil {
+							v, err := on.eval(combined, env, meter)
+							if err != nil {
+								return emitter{}, err
+							}
+							keep = v.IsTrue()
+						}
+						if keep {
+							next = append(next, combined)
+							leftMatched = true
+						}
+					}
+					if emitLeft && !leftMatched {
+						combined := make(storedRow, 0, len(left)+rightPad)
+						combined = append(combined, left...)
+						for i := 0; i < rightPad; i++ {
+							combined = append(combined, NullValue())
+						}
+						next = append(next, combined)
+					}
+				}
+				running = next
+				continue
+			}
+			// An INDEX-NESTED-LOOP inner relation (cost.md §3 "JOIN"): re-materialize it ONCE PER combined
+			// left-hand row, its scan bounded per outer row by the SIBLING columns of that row (a
+			// per-outer-row seek instead of a full scan). Detection restricts this to the RIGHT/nullable
+			// side of an INNER/CROSS/LEFT join, so there is never an unmatched-RIGHT emission (RIGHT/FULL
+			// are excluded — a preserved side cannot be bounded per outer row). The whole ON/WHERE stays
+			// applied (the ON here, the WHERE below), so rows are unchanged.
+			if plan.phys.relINLBounds[k+1] != nil {
+				for _, left := range running {
+					rightRows, err := db.materializeRel(plan, k+1, params, outer, left, env.rng, env.ctes, meter)
+					if err != nil {
+						return emitter{}, err
+					}
+					leftMatched := false
+					for _, right := range rightRows {
+						combined := make(storedRow, 0, len(left)+len(right))
+						combined = append(combined, left...)
+						combined = append(combined, right...)
+						keep := true
+						if on != nil {
+							v, err := on.eval(combined, env, meter)
+							if err != nil {
+								return emitter{}, err
+							}
+							keep = v.IsTrue()
+						}
+						if keep {
+							next = append(next, combined)
+							leftMatched = true
+						}
+					}
+					if emitLeft && !leftMatched {
+						combined := make(storedRow, 0, len(left)+rightPad)
+						combined = append(combined, left...)
+						for i := 0; i < rightPad; i++ {
+							combined = append(combined, NullValue())
+						}
+						next = append(next, combined)
+					}
+				}
+				running = next
+				continue
+			}
+			rightRows := materialized[k+1]
+			// The hash rule is currently exactly two inputs, so it can only own join 0. Build the right
+			// input once, then probe left rows in running order. Candidate buckets retain right order and
+			// the full ON is rechecked, reproducing nested-loop enumeration and LEFT null-extension.
+			if k == 0 && plan.phys.hashJoin != nil {
+				table, err := newHashJoinTable(plan.phys.hashJoin, plan.rels[1].offset, plan.rels[0].offset, rightRows, meter)
 				if err != nil {
 					return emitter{}, err
 				}
+				for _, left := range running {
+					candidates, err := table.probe(plan.phys.hashJoin, left, meter)
+					if err != nil {
+						return emitter{}, err
+					}
+					leftMatched := false
+					for _, right := range candidates {
+						combined := make(storedRow, 0, len(left)+len(right))
+						combined = append(combined, left...)
+						combined = append(combined, right...)
+						v, err := on.eval(combined, env, meter)
+						if err != nil {
+							return emitter{}, err
+						}
+						if v.IsTrue() {
+							next = append(next, combined)
+							leftMatched = true
+						}
+					}
+					if emitLeft && !leftMatched {
+						combined := append(storedRow{}, left...)
+						for i := 0; i < rightPad; i++ {
+							combined = append(combined, NullValue())
+						}
+						next = append(next, combined)
+					}
+				}
+				running = next
+				continue
+			}
+			rightMatched := make([]bool, len(rightRows))
+			for _, left := range running {
 				leftMatched := false
-				for _, right := range rightRows {
+				for ri, right := range rightRows {
 					combined := make(storedRow, 0, len(left)+len(right))
 					combined = append(combined, left...)
 					combined = append(combined, right...)
@@ -345,6 +546,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 					if keep {
 						next = append(next, combined)
 						leftMatched = true
+						rightMatched[ri] = true
 					}
 				}
 				if emitLeft && !leftMatched {
@@ -356,133 +558,20 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 					next = append(next, combined)
 				}
 			}
-			running = next
-			continue
-		}
-		// An INDEX-NESTED-LOOP inner relation (cost.md §3 "JOIN"): re-materialize it ONCE PER combined
-		// left-hand row, its scan bounded per outer row by the SIBLING columns of that row (a
-		// per-outer-row seek instead of a full scan). Detection restricts this to the RIGHT/nullable
-		// side of an INNER/CROSS/LEFT join, so there is never an unmatched-RIGHT emission (RIGHT/FULL
-		// are excluded — a preserved side cannot be bounded per outer row). The whole ON/WHERE stays
-		// applied (the ON here, the WHERE below), so rows are unchanged.
-		if plan.phys.relINLBounds[k+1] != nil {
-			for _, left := range running {
-				rightRows, err := db.materializeRel(plan, k+1, params, outer, left, env.rng, env.ctes, meter)
-				if err != nil {
-					return emitter{}, err
-				}
-				leftMatched := false
-				for _, right := range rightRows {
-					combined := make(storedRow, 0, len(left)+len(right))
-					combined = append(combined, left...)
-					combined = append(combined, right...)
-					keep := true
-					if on != nil {
-						v, err := on.eval(combined, env, meter)
-						if err != nil {
-							return emitter{}, err
+			if emitRight {
+				for ri, right := range rightRows {
+					if !rightMatched[ri] {
+						combined := make(storedRow, 0, leftPad+len(right))
+						for i := 0; i < leftPad; i++ {
+							combined = append(combined, NullValue())
 						}
-						keep = v.IsTrue()
-					}
-					if keep {
+						combined = append(combined, right...)
 						next = append(next, combined)
-						leftMatched = true
 					}
-				}
-				if emitLeft && !leftMatched {
-					combined := make(storedRow, 0, len(left)+rightPad)
-					combined = append(combined, left...)
-					for i := 0; i < rightPad; i++ {
-						combined = append(combined, NullValue())
-					}
-					next = append(next, combined)
 				}
 			}
 			running = next
-			continue
 		}
-		rightRows := materialized[k+1]
-		// The hash rule is currently exactly two inputs, so it can only own join 0. Build the right
-		// input once, then probe left rows in running order. Candidate buckets retain right order and
-		// the full ON is rechecked, reproducing nested-loop enumeration and LEFT null-extension.
-		if k == 0 && plan.phys.hashJoin != nil {
-			table, err := newHashJoinTable(plan.phys.hashJoin, plan.rels[1].offset, rightRows, meter)
-			if err != nil {
-				return emitter{}, err
-			}
-			for _, left := range running {
-				candidates, err := table.probe(plan.phys.hashJoin, left, meter)
-				if err != nil {
-					return emitter{}, err
-				}
-				leftMatched := false
-				for _, right := range candidates {
-					combined := make(storedRow, 0, len(left)+len(right))
-					combined = append(combined, left...)
-					combined = append(combined, right...)
-					v, err := on.eval(combined, env, meter)
-					if err != nil {
-						return emitter{}, err
-					}
-					if v.IsTrue() {
-						next = append(next, combined)
-						leftMatched = true
-					}
-				}
-				if emitLeft && !leftMatched {
-					combined := append(storedRow{}, left...)
-					for i := 0; i < rightPad; i++ {
-						combined = append(combined, NullValue())
-					}
-					next = append(next, combined)
-				}
-			}
-			running = next
-			continue
-		}
-		rightMatched := make([]bool, len(rightRows))
-		for _, left := range running {
-			leftMatched := false
-			for ri, right := range rightRows {
-				combined := make(storedRow, 0, len(left)+len(right))
-				combined = append(combined, left...)
-				combined = append(combined, right...)
-				keep := true
-				if on != nil {
-					v, err := on.eval(combined, env, meter)
-					if err != nil {
-						return emitter{}, err
-					}
-					keep = v.IsTrue()
-				}
-				if keep {
-					next = append(next, combined)
-					leftMatched = true
-					rightMatched[ri] = true
-				}
-			}
-			if emitLeft && !leftMatched {
-				combined := make(storedRow, 0, len(left)+rightPad)
-				combined = append(combined, left...)
-				for i := 0; i < rightPad; i++ {
-					combined = append(combined, NullValue())
-				}
-				next = append(next, combined)
-			}
-		}
-		if emitRight {
-			for ri, right := range rightRows {
-				if !rightMatched[ri] {
-					combined := make(storedRow, 0, leftPad+len(right))
-					for i := 0; i < leftPad; i++ {
-						combined = append(combined, NullValue())
-					}
-					combined = append(combined, right...)
-					next = append(next, combined)
-				}
-			}
-		}
-		running = next
 	}
 
 	// WHERE over the combined rows. A WHERE arithmetic can trap (22003/22012); each surviving

@@ -134,7 +134,7 @@ pub(crate) fn build_index_access_predicate(
     filter: &RExpr,
     rel: &ScopeRel,
     idx: &IndexDef,
-    sibling_cutoff: Option<usize>,
+    sibling_columns: Option<(usize, usize)>,
     catalog: &Engine,
 ) -> Option<IndexBound> {
     if idx.kind != IndexKind::Btree {
@@ -188,7 +188,7 @@ pub(crate) fn build_index_access_predicate(
             &matcher,
             ty,
             coll.as_ref().map(|c| c.name.as_str()),
-            sibling_cutoff,
+            sibling_columns,
             &mut terms,
         );
         let (eqs, ranges): (Vec<BoundTerm>, Vec<BoundTerm>) =
@@ -1700,29 +1700,43 @@ pub(crate) fn detect_inl_bound(
     rel: &ScopeRel,
     catalog: &Engine,
 ) -> Option<ScanBound> {
+    inventory_inl_candidates(on, where_filter, rel, (0, rel.offset), catalog)
+        .into_iter()
+        .next()
+        .and_then(|candidate| candidate.bound)
+}
+
+pub(crate) fn inventory_inl_candidates<'a>(
+    on: Option<&'a RExpr>,
+    where_filter: Option<&'a RExpr>,
+    rel: &ScopeRel,
+    sibling_columns: (usize, usize),
+    catalog: &Engine,
+) -> Vec<ScanCandidate<'a>> {
     // A host-attached inner relation full-scans per outer row this slice (attached-databases.md §8):
     // the seek would resolve its index store unscoped. Index-nested-loop over an attachment is a
     // perf follow-on.
     if rel.is_attachment() {
-        return None;
+        return Vec::new();
     }
-    let cutoff = Some(rel.offset);
+    let sibling_range = Some(sibling_columns);
     // Collect the key's bound terms from BOTH the ON and the WHERE (a NULL predicate contributes
     // none), with sibling columns admitted.
     let collect = |key_idx: usize, ty: ScalarType, ccoll: Option<&str>| -> Vec<BoundTerm> {
         let mut terms = Vec::new();
         let km = KeyMatch::Column(key_idx);
         if let Some(f) = on {
-            collect_bound_terms(f, &km, ty, ccoll, cutoff, &mut terms);
+            collect_bound_terms(f, &km, ty, ccoll, sibling_range, &mut terms);
         }
         if let Some(f) = where_filter {
-            collect_bound_terms(f, &km, ty, ccoll, cutoff, &mut terms);
+            collect_bound_terms(f, &km, ty, ccoll, sibling_range, &mut terms);
         }
         terms
     };
     // Primary-key tuple bound first (the row's own key — range-capable, strictly cheaper).
     let filters: Vec<&RExpr> = on.into_iter().chain(where_filter).collect();
-    if let Some(b) = detect_pk_bound(&filters, rel, cutoff, catalog) {
+    let mut candidates = Vec::with_capacity(1 + rel.table.indexes.len());
+    if let Some(b) = detect_pk_bound(&filters, rel, sibling_range, catalog) {
         let has_sibling = b.eq_cols.iter().any(|ec| {
             ec.srcs.iter().any(|s| matches!(s, BoundSrc::Sibling(_)))
                 || ec
@@ -1735,7 +1749,12 @@ pub(crate) fn detect_inl_bound(
                 .any(|t| matches!(t.src, BoundSrc::Sibling(_)))
         });
         if has_sibling {
-            return Some(ScanBound::Pk(b));
+            candidates.push(storage_order_candidate(
+                ScanCandidateKind::Pk,
+                String::new(),
+                Some(ScanBound::Pk(b)),
+                where_filter,
+            ));
         }
     }
     // Else a leading secondary-index equality bound to a sibling (indexes held in ascending
@@ -1775,19 +1794,25 @@ pub(crate) fn detect_inl_bound(
             // column bound to a sibling); a multi-column / range INL bound is a follow-on (cost.md
             // §3 "index-nested-loop"). `suffix_types` are the trailing columns (columns[1..],
             // fixed-width by the check above), width-skipped past the single equality slot.
-            return Some(ScanBound::Index(IndexBound {
-                name_key: idx.name.to_ascii_lowercase(),
-                eq_cols: vec![IndexEqCol {
-                    col_type: ty,
-                    coll,
-                    srcs: eqs,
-                }],
-                range: None,
-                suffix_types: cols[1..]
-                    .iter()
-                    .map(|&c| rel.table.columns[c].ty.scalar())
-                    .collect(),
-            }));
+            let name_key = idx.name.to_ascii_lowercase();
+            candidates.push(index_order_candidate(
+                ScanCandidateKind::Btree,
+                name_key.clone(),
+                ScanBound::Index(IndexBound {
+                    name_key,
+                    eq_cols: vec![IndexEqCol {
+                        col_type: ty,
+                        coll,
+                        srcs: eqs,
+                    }],
+                    range: None,
+                    suffix_types: cols[1..]
+                        .iter()
+                        .map(|&c| rel.table.columns[c].ty.scalar())
+                        .collect(),
+                }),
+                where_filter,
+            ));
         }
     }
     // Opclass sibling bounds follow the cheaper primary-key and ordered-B-tree paths. GiST precedes
@@ -1801,23 +1826,38 @@ pub(crate) fn detect_inl_bound(
         let col_ty = &rel.table.columns[ci].ty;
         for filter in &filters {
             if col_ty.range_element().is_some() {
-                if let Some((strategy, _)) = gist_sibling_match(filter, col_global, rel.offset) {
-                    return Some(ScanBound::Gist(GistBound {
-                        name_key: idx.name.to_ascii_lowercase(),
-                        strategy,
-                        col_global,
-                        scalar_type: None,
-                    }));
+                if let Some((strategy, _)) = gist_sibling_match(filter, col_global, sibling_columns)
+                {
+                    let name_key = idx.name.to_ascii_lowercase();
+                    candidates.push(storage_order_candidate(
+                        ScanCandidateKind::Gist,
+                        name_key.clone(),
+                        Some(ScanBound::Gist(GistBound {
+                            name_key,
+                            strategy,
+                            col_global,
+                            scalar_type: None,
+                        })),
+                        where_filter,
+                    ));
+                    break;
                 }
             } else if is_gist_scalar_type(col_ty)
-                && gist_scalar_sibling_match(filter, col_global, rel.offset).is_some()
+                && gist_scalar_sibling_match(filter, col_global, sibling_columns).is_some()
             {
-                return Some(ScanBound::Gist(GistBound {
-                    name_key: idx.name.to_ascii_lowercase(),
-                    strategy: crate::gist::GistStrategy::Equal,
-                    col_global,
-                    scalar_type: Some(col_ty.scalar()),
-                }));
+                let name_key = idx.name.to_ascii_lowercase();
+                candidates.push(storage_order_candidate(
+                    ScanCandidateKind::Gist,
+                    name_key.clone(),
+                    Some(ScanBound::Gist(GistBound {
+                        name_key,
+                        strategy: crate::gist::GistStrategy::Equal,
+                        col_global,
+                        scalar_type: Some(col_ty.scalar()),
+                    })),
+                    where_filter,
+                ));
+                break;
             }
         }
     }
@@ -1831,17 +1871,32 @@ pub(crate) fn detect_inl_bound(
             continue;
         };
         for filter in &filters {
-            if let Some((strategy, _)) = gin_sibling_match(filter, col_global, rel.offset) {
-                return Some(ScanBound::Gin(GinBound {
-                    name_key: idx.name.to_ascii_lowercase(),
-                    elem_type,
-                    strategy,
-                    col_global,
-                }));
+            if let Some((strategy, _)) = gin_sibling_match(filter, col_global, sibling_columns) {
+                let name_key = idx.name.to_ascii_lowercase();
+                candidates.push(storage_order_candidate(
+                    ScanCandidateKind::Gin,
+                    name_key.clone(),
+                    Some(ScanBound::Gin(GinBound {
+                        name_key,
+                        elem_type,
+                        strategy,
+                        col_global,
+                    })),
+                    where_filter,
+                ));
+                break;
             }
         }
     }
-    None
+    candidates.sort_by(|a, b| {
+        a.identity.kind.cmp(&b.identity.kind).then_with(|| {
+            a.identity
+                .index_name
+                .as_bytes()
+                .cmp(b.identity.index_name.as_bytes())
+        })
+    });
+    candidates
 }
 
 /// The collation a key over `col` is STORED under, deciding whether — and how — a comparison bound
@@ -2153,12 +2208,12 @@ pub(crate) fn gist_match(
 pub(crate) fn gist_sibling_match(
     filter: &RExpr,
     col_global: usize,
-    cutoff: usize,
+    sibling_columns: (usize, usize),
 ) -> Option<(crate::gist::GistStrategy, &RExpr)> {
     gist_match_operand(
         filter,
         col_global,
-        |q| matches!(q, RExpr::Column(i) if *i < cutoff),
+        |q| matches!(q, RExpr::Column(i) if *i >= sibling_columns.0 && *i < sibling_columns.1),
     )
 }
 
@@ -2215,12 +2270,12 @@ pub(crate) fn gist_scalar_match(
 pub(crate) fn gist_scalar_sibling_match(
     filter: &RExpr,
     col_global: usize,
-    cutoff: usize,
+    sibling_columns: (usize, usize),
 ) -> Option<(crate::gist::GistStrategy, &RExpr)> {
     gist_scalar_match_operand(
         filter,
         col_global,
-        |q| matches!(q, RExpr::Column(i) if *i < cutoff),
+        |q| matches!(q, RExpr::Column(i) if *i >= sibling_columns.0 && *i < sibling_columns.1),
     )
 }
 
@@ -2282,12 +2337,12 @@ pub(crate) fn gin_match(filter: &RExpr, col_global: usize) -> Option<(GinStrateg
 pub(crate) fn gin_sibling_match(
     filter: &RExpr,
     col_global: usize,
-    cutoff: usize,
+    sibling_columns: (usize, usize),
 ) -> Option<(GinStrategy, &RExpr)> {
     gin_match_operand(
         filter,
         col_global,
-        |q| matches!(q, RExpr::Column(i) if *i < cutoff),
+        |q| matches!(q, RExpr::Column(i) if *i >= sibling_columns.0 && *i < sibling_columns.1),
     )
 }
 
@@ -3187,7 +3242,7 @@ pub(crate) fn fk_probe(
 pub(crate) fn detect_pk_bound(
     filters: &[&RExpr],
     rel: &ScopeRel,
-    sibling_cutoff: Option<usize>,
+    sibling_columns: Option<(usize, usize)>,
     catalog: &Engine,
 ) -> Option<PkBound> {
     let pk = rel.table.pk_indices();
@@ -3210,7 +3265,7 @@ pub(crate) fn detect_pk_bound(
                 &KeyMatch::Column(rel.offset + *ci),
                 ty,
                 coll.as_ref().map(|c| c.name.as_str()),
-                sibling_cutoff,
+                sibling_columns,
                 &mut terms,
             );
         }
@@ -3454,13 +3509,13 @@ pub(crate) fn collect_bound_terms(
     key: &KeyMatch,
     pk_type: ScalarType,
     col_coll: Option<&str>,
-    sibling_cutoff: Option<usize>,
+    sibling_columns: Option<(usize, usize)>,
     terms: &mut Vec<BoundTerm>,
 ) {
     match e {
         RExpr::And(l, r) => {
-            collect_bound_terms(l, key, pk_type, col_coll, sibling_cutoff, terms);
-            collect_bound_terms(r, key, pk_type, col_coll, sibling_cutoff, terms);
+            collect_bound_terms(l, key, pk_type, col_coll, sibling_columns, terms);
+            collect_bound_terms(r, key, pk_type, col_coll, sibling_columns, terms);
         }
         // `<>` is not a contiguous range, so it never seeds an index/PK bound — it stays in the
         // residual filter (a full scan + filter). Skipping it here keeps the deterministic cost
@@ -3487,9 +3542,9 @@ pub(crate) fn collect_bound_terms(
             // The key operand on either side (op flipped when it is on the right); the other side a
             // matching-type const-source. Anything else contributes no term.
             let term = if is_pk(lhs) {
-                const_source(rhs, pk_type, sibling_cutoff).map(|src| BoundTerm { op: *op, src })
+                const_source(rhs, pk_type, sibling_columns).map(|src| BoundTerm { op: *op, src })
             } else if is_pk(rhs) {
-                const_source(lhs, pk_type, sibling_cutoff).map(|src| BoundTerm {
+                const_source(lhs, pk_type, sibling_columns).map(|src| BoundTerm {
                     op: flip_cmp(*op),
                     src,
                 })
@@ -3519,7 +3574,7 @@ pub(crate) fn collect_bound_terms(
 pub(crate) fn const_source(
     e: &RExpr,
     pk_type: ScalarType,
-    sibling_cutoff: Option<usize>,
+    sibling_columns: Option<(usize, usize)>,
 ) -> Option<BoundSrc> {
     match e {
         RExpr::Param(i) => Some(BoundSrc::Param(*i)),
@@ -3538,7 +3593,7 @@ pub(crate) fn const_source(
             level: *level,
             index: *index,
         }),
-        RExpr::Column(g) if sibling_cutoff.is_some_and(|cut| *g < cut) => {
+        RExpr::Column(g) if sibling_columns.is_some_and(|(start, end)| *g >= start && *g < end) => {
             Some(BoundSrc::Sibling(*g))
         }
         _ => None,

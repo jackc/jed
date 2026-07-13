@@ -55,6 +55,13 @@ export function saturatingEstimateMultiply(a: bigint, b: bigint): bigint {
   return a * b;
 }
 
+// Exact ceil(a*b/d). BigInt supplies the cross-core wide intermediate directly.
+export function ceilEstimateMultiplyDivide(a: bigint, b: bigint, d: bigint): bigint {
+  if (a <= 0n || b <= 0n || d <= 0n) return 0n;
+  const quotient = (a * b + d - 1n) / d;
+  return quotient > MAX_ESTIMATE ? MAX_ESTIMATE : quotient;
+}
+
 // ceil(n*numerator/denominator), deliberately expressed without relying on a wider temporary.
 export function scaleEstimateCeil(n: bigint, fraction: EstimatorFraction): bigint {
   if (n <= 0n || fraction.numerator <= 0n) return 0n;
