@@ -8,8 +8,9 @@
 > **Status: this doc is a framework + ledger.** The four-guarantee model and the
 > already-existing carve-out (row order without `ORDER BY`) are **ratified**. The clock/entropy
 > seam (§5) and the exception ledger (§9) have **landed**, and **binary floats** (§6, class A)
-> have **landed** across all three cores. Still open: the `order_sensitive` catalog flag and
-> **plan-dependent observables** (§8) remain **unratified**, pending parallelism. Each section
+> have **landed** across all three cores. Plan-dependent observables (§8) are **ratified** by
+> specifying the plan; they remain inside G1/G2 rather than becoming an exception. Still open:
+> the `order_sensitive` catalog flag and the rest of the parallelism framework (§7). Each section
 > marks its status. When any decision here is ratified, update the data it points at,
 > [conformance.md](conformance.md) §4, and [CLAUDE.md](../../CLAUDE.md) §8/§10/§13 in the same
 > change (§10 below lists the edits).
@@ -52,7 +53,8 @@ to drop a *weaker* guarantee, or none:
   internally (a value with a right answer, computed differently per core) — §6, case **A**.
 
 So the genuinely-irreducible surrender of the sacred guarantee is far narrower than "relax
-determinism" suggests: essentially floats, plus (eventually) plan-dependent observables.
+determinism" suggests: essentially floats, plus any deliberately admitted parallel-strategy
+exception. Plan identity is not in that set (§8).
 
 ---
 
@@ -67,7 +69,7 @@ keeps, and the test mechanism that still catches real bugs in it.
 | **B** — Boundary inputs | host clock / OS entropy | `now()`/`current_timestamp`; `clock_timestamp()`; `random()`; `gen_random_uuid()` (v4); UUIDv7 | G1, G2 *(injected/seeded)* | — *(prod: G1, G2 on the raw draw only)* | inject fixed/advancing clock+seed → exact; else property/bounds (§5) |
 | **A** — Approximate / internal | IEEE / libm / approximate algorithm | binary `float` compute (§6); future `approx_count_distinct`, `TABLESAMPLE`, percentiles | G1 *(per binary)* | G2, G3 | epsilon / reduced-precision `R` tag + PG-only oracle |
 | **I** — Implementation identity | the core itself | `version()`, build/identity reflection | G1 | G2, G3 *(by construction)* | property / regex on format, never value |
-| **P** — Plan / strategy dependent | independent planners; parallelism | error *selection* among ≥2 candidate errors; cost under divergent plans; parallel fold order (§7) | varies — see §7/§8 | varies | serial==parallel metamorphic relation (§7); single-error test authoring (§8) |
+| **P** — Plan / strategy dependent | deliberately underspecified physical strategy; parallelism | error *selection* among ≥2 candidate errors; parallel fold order (§7) | varies — see §7 | varies | serial==parallel metamorphic relation (§7); single-error test authoring (§8) |
 
 Mapping to the original framing of these discussions: case **U** = "SELECT without ORDER
 BY," **B** = "random and time-based functions," **A** = "inherently approximate/lossy types
@@ -105,6 +107,10 @@ deliberately keeps **inside** the deterministic contract by paying for it elsewh
   binary float ([json.md §8](json.md)), so JSON introduces **no new** sanctioned relaxation
   (its only seam-reads are the existing clock/entropy ones, the `.datetime()`/`_tz` path
   surface — [jsonpath.md §5.1](jsonpath.md), class **B** below).
+- **Plan choice and estimates.** Independently implemented optimizers are not permission to pick
+  different winners. [estimator.md](estimator.md) specifies the plan inputs, arithmetic, candidate
+  order, and bounded search, so the selected plan, EXPLAIN estimates, actual metered cost, and
+  deterministic error visitation remain G1/G2 facts. A mismatch has no class-P ledger escape.
 
 ---
 
@@ -303,43 +309,44 @@ already guards predicate pushdown.
   which thread processes it — reproducible, parallel-safe, and cross-core identical on the
   seeded/test path. (Production-entropy mode is non-deterministic regardless.)
 - **Error selection** — when ≥2 rows could trap, parallelism makes *which* error surfaces
-  non-deterministic. This is the **same** problem as plan-divergent error selection (§8, class
-  **P**), so it folds in there: the *fact* of erroring stays deterministic where possible,
-  *which* of several distinct errors wins is the ledgered part, and error `.test` cases are
-  authored with a **single offending row** so they stay deterministic. The related
+  non-deterministic. Serial plan-dependent error selection is fixed by the ratified plan contract
+  (§8); an underspecified parallel schedule would be the remaining class-**P** problem. Until that
+  is resolved, error `.test` cases are authored with a **single offending row** so they stay
+  deterministic. The related
   "does it error at all under `LIMIT`" edge (jed already has it — `SELECT DISTINCT 1/a … LIMIT
   1` traps where the plain form does not, [cost.md](cost.md) §3) is evaluation-strategy-
   dependent today; parallelism only widens it.
 
 ---
 
-## 8. Plan-dependent observables (UNRATIFIED — open fork)
+## 8. Plan-dependent observables (RATIFIED — specify the plan)
 
-**Status: unratified.** Today the planner is simple enough that all cores choose the same
-plan (the NoREC sweep even asserts pushdown happens), so plan-dependent observables agree by
-construction. As the optimizer grows (cost-based join ordering, index selection), two
-independently hand-written planners (CLAUDE.md §5 forbids codegenning them) will sometimes
-pick **different plans**, and anything observable that depends on the chosen plan diverges
-across cores — class **P**:
+**Status: ratified.** Physical plans affect observable actual cost and may affect which of several
+candidate runtime errors surfaces through evaluation/visitation order. Cost-based access and join
+selection therefore cannot be an implementation-private heuristic: cross-core cost identity (G2)
+requires plan identity.
 
-- **Error selection** — which of several candidate errors surfaces depends on
-  evaluation/visitation order, which is plan- (and parallelism-) dependent.
-- **Cost itself (CLAUDE.md §13).** This is the sharp edge: cost = Σ `page_read` +
-  `row_produced` + `operator_eval`, and an index seek vs a seq scan have *different costs*. So
-  **cross-core cost-identity (G2 on cost) silently presumes plan-identity.** A cost-based
-  join-orderer can break it.
+Path B resolves this by **specifying the plan**, not by ledgering divergence. For a fixed resolved
+query and visible estimator inputs, every core inventories the same legal candidates, computes the
+same exact integer estimates, applies the same total tie order, and performs the same bounded join
+search. [estimator.md](estimator.md) is the algorithm contract and
+[../cost/estimator.toml](../cost/estimator.toml) owns its mechanical constants and orders. The
+planner remains independently hand-written in Rust, Go, and TypeScript; the no-planner-codegen
+boundary does not make its outputs discretionary.
 
-The fork to decide when it first bites (do not resolve now, but do not let it surprise you):
+The verification stack is deliberately redundant:
 
-- **Spec the plan** — make plan choice / cost-model tie-breaking part of the shared contract
-  so independent planners converge on the same plan. Strongest (keeps cost in G2) but the
-  hardest, and in tension with "don't codegen the planner."
-- **Ledger the divergence** — weaken cost-identity to *per-core* (G1, not G2) when plans
-  legitimately differ, recorded as a class-**P** exception with the divergence bounded to cost
-  + error-selection.
+- shared estimator vectors pin per-unit counts, rows, weighted cost, and tie keys;
+- EXPLAIN pins the chosen physical tree and per-node estimates;
+- `# cost:` pins the actual runtime consequence; and
+- each newly enabled plan choice adds a NoREC/metamorphic relation for result correctness.
 
-Until ratified, keep error `.test` cases single-error (§7) and keep `# cost:` assertions on
-query shapes where all cores plan identically.
+A disagreement is a planner bug and gets no class-P exception entry. Deterministic error selection
+follows from selecting the same plan and using each executor's already-fixed evaluation order. A
+later plan-contract change may deliberately re-pin which error wins, but all cores must change
+together. Error corpus cases should still prefer one offending row so a plan slice tests the
+intended rule instead of accidentally pinning an unrelated visitation detail. Parallel execution
+remains the separate proposed class-P problem in §7.
 
 ---
 
@@ -373,8 +380,9 @@ PG-divergence warns today — so the ledger cannot fall out of date.
 **Admission criteria** (what makes a candidate legitimate vs a bug in disguise):
 
 1. **Intrinsic, not accidental.** The non-determinism is sourced from entropy, the wall
-   clock, IEEE/libm, an underspecified contract, the core's own identity, or independent
-   planners — never from an implementation artifact (hashmap order stays forbidden, §3).
+   clock, IEEE/libm, an underspecified contract, the core's own identity, or a deliberately
+   underspecified parallel schedule — never from an implementation artifact (hashmap order stays
+   forbidden, §3), and never merely from independent planner implementations (§8).
 2. **Cannot be cheaply narrowed away.** Prefer seam injection (§5), a deterministic
    tiebreaker (jed already breaks `ORDER BY` ties by PK — [encoding.md](encoding.md)), a
    spec'd algorithm, or an order-independent definition (§7 resolution A) **over** granting an
@@ -386,24 +394,21 @@ PG-divergence warns today — so the ledger cannot fall out of date.
 
 ---
 
-## 10. What ratification changes (downstream edits)
+## 10. Ratification checklist (downstream edits)
 
 When a section here moves from proposed/unratified to ratified, update **in the same change**:
 
-- **[conformance.md](conformance.md) §4** — flip the *Determinism rules* from absolute
-  prohibition ("No nondeterminism. No wall-clock, no random. No floats.") to **default-deny +
-  enumerated ledgered exceptions**, each citing its class and test mechanism here.
-- **New harness mechanisms** — injected clock+seed for replay (makes class **B** exact); the
-  **`R`** reduced-precision comparison (class **A**, the tag is already reserved); property /
-  invariant assertions (a `# satisfies:`-style directive, classes **I**/**A**); the
-  serial-vs-parallel metamorphic relation (§7) in the sweep.
-- **[../functions/catalog.toml](../functions/catalog.toml)** — the `order_sensitive` field on
-  aggregates (§7), with its `verify.rb`/codegen branch.
-- **[CLAUDE.md](../../CLAUDE.md)** — §8 (divergence hotspots) and §10 (determinism everywhere)
-  gain a pointer to this doc; §13 gains the explicit note that cost-identity presumes
-  plan-identity (the §8 fork).
-- **[../conformance/determinism_exceptions.toml](../conformance/)** — created with the §9
-  format and wired into `rake verify` (coherence) and the importer/sweep (drift).
+- its canonical mechanical data and subsystem design document;
+- [conformance.md](conformance.md) §4 plus the exact/property/metamorphic assertion surface that
+  will detect cross-core drift;
+- [CLAUDE.md](../../CLAUDE.md) §8/§10/§13 where the standing contract changes; and
+- [../conformance/determinism_exceptions.toml](../conformance/determinism_exceptions.toml) only if
+  a guarantee is actually relaxed, never merely because an implementation is independent.
+
+The §8 Path-B ratification completes those documentation/data edits in P0. Later implementation
+slices add estimator vectors, EXPLAIN columns, actual-cost pins, and NoREC relations before each
+new physical choice becomes authoritative. The proposed §7 parallelism work additionally needs the
+`order_sensitive` catalog field and a serial-vs-parallel sweep before it can be ratified.
 
 ---
 
@@ -418,5 +423,5 @@ When a section here moves from proposed/unratified to ratified, update **in the 
 | §5 class **B** | Clock + entropy seams, spec'd PRNG | **ratified** for `uuidv4`/`uuidv7` and the clock functions `now()`/`current_timestamp`/`clock_timestamp()` ([entropy.md](entropy.md)); **proposed** for `random()` |
 | §6 class **A** | Binary floats (`f32`/`f64`) | **landed** — spec + ledger authored, all three cores ([float.md](float.md)) |
 | §7 class **P** | Parallelism = optimization; `order_sensitive` flag | **proposed framework** |
-| §8 class **P** | Plan-dependent observables / cost-identity fork | **unratified** (open) |
-| §9 | Exception ledger + admission criteria | **proposed** |
+| §8 | Plan-dependent observables / cost identity | **ratified** — specify the plan; no exception ([estimator.md](estimator.md)) |
+| §9 | Exception ledger + admission criteria | **landed** |

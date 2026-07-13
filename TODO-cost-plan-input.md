@@ -7,8 +7,8 @@
 > the relevant canonical document as it is made. Delete this file after the work is landed and
 > the remaining follow-ons, if any, have been folded back into `TODO.md`.
 
-Initial Path B is complete through **P8**. **P9** is the later statistics-quality refinement
-already anticipated by `TODO.md`; **P10** is the final landing gate.
+The ordered phase ladder carries initial Path B through **P8**. **P9** is the later
+statistics-quality refinement already anticipated by `TODO.md`; **P10** is the final landing gate.
 
 ## Standing rules for every slice
 
@@ -31,65 +31,67 @@ already anticipated by `TODO.md`; **P10** is the final landing gate.
 
 **Goal:** settle the contract before any statistics or estimator implementation.
 
-- [ ] Add a dedicated estimator design section/document and link it from
+- [x] Add a dedicated estimator design section/document and link it from
   [planner.md](spec/design/planner.md), [cost.md](spec/design/cost.md), and
   [explain.md](spec/design/explain.md).
-- [ ] Ratify the “spec the plan” branch of class P in
+- [x] Ratify the “spec the plan” branch of class P in
   [determinism.md](spec/design/determinism.md): independent cores must select the same plan rather
   than ledgering per-core plan/cost divergence.
-- [ ] Update `CLAUDE.md` with the ratified rule that cost identity includes deterministic
+- [x] Update `CLAUDE.md` with the ratified rule that cost identity includes deterministic
   plan-estimator identity.
-- [ ] Define the estimator's complete input set: query structure, catalog facts, transactional
+- [x] Define the estimator's complete input set: query structure, catalog facts, transactional
   statistics, and any admitted storage-structure facts.
-- [ ] Decide literal-versus-parameter behavior. Planning occurs before parameter binding today, so
+- [x] Decide literal-versus-parameter behavior. Planning occurs before parameter binding today, so
   parameter estimates need a deterministic generic rule unless the pipeline is deliberately
   revised.
-- [ ] Define `est_rows` and `est_cost` representations, including zero, unknown/unavailable facts,
+- [x] Define `est_rows` and `est_cost` representations, including zero, unknown/unavailable facts,
   maximum values, and rendering.
-- [ ] Define exact arithmetic: integer or fixed rational operations, rounding direction at every
+- [x] Define exact arithmetic: integer or fixed rational operations, rounding direction at every
   step, checked multiplication/addition, and saturation/overflow behavior identical across cores.
-- [ ] Define the estimate as named runtime-cost-unit counts plus their weighted total from
+- [x] Define the estimate as named runtime-cost-unit counts plus their weighted total from
   `spec/cost/schedule.toml`; do not invent wall-clock-only weights inside the planner.
-- [ ] Record the consequence that currently unmetered work, including sorting, is invisible to the
+- [x] Record the consequence that currently unmetered work, including sorting, is invisible to the
   Path B objective. If such work must influence plan selection, first add and re-pin a runtime cost
   unit explicitly.
-- [ ] Define a total candidate order and final tie-break, including access-path kind, lowercased
+- [x] Define a total candidate order and final tie-break, including access-path kind, lowercased
   index name, physical relation order, and join algorithm.
-- [ ] Define supported and fallback estimation rules for every current plan-node kind.
-- [ ] Define a deterministic resource bound for join search so untrusted SQL cannot trigger an
+- [x] Define supported and fallback estimation rules for every current plan-node kind.
+- [x] Define a deterministic resource bound for join search so untrusted SQL cannot trigger an
   exponential unmetered planner.
-- [ ] Decide the shared data/fixture locations and wire their coherence checks into `rake verify`.
+- [x] Decide the shared data/fixture locations and wire their coherence checks into `rake verify`.
 
 **Exit gate:** the estimator, statistics lifecycle, candidate ordering, cache-validity inputs, and
 search limits are fully specified without relying on a core implementation as the authority.
 
+**Status:** complete on 2026-07-13. `bundle exec rake verify` passes; no engine behavior changed.
+
 ### P0 human decision checkpoint
 
-These decisions materially affect later slices and require maintainer confirmation before P0 is
-ratified. Recommendations are the working defaults, not standing decisions yet.
+These decisions materially affect later slices. The maintainer approved all six recommendations on
+2026-07-13; they are now canonical in [estimator.md](spec/design/estimator.md).
 
-- [ ] **Optimization objective.** Recommended: Path B minimizes the existing observable runtime
+- [x] **Optimization objective.** Path B minimizes the existing observable runtime
   cost schedule exactly as `TODO.md` says. It does not add private planner-only weights for
   currently unmetered work such as sort comparisons, dedup bookkeeping, or row concatenation. If
   those operations should influence selection, expand the runtime schedule in an explicit earlier
   slice and re-pin its costs first.
-- [ ] **Parameter sensitivity.** Recommended: keep physical planning before parameter binding.
+- [x] **Parameter sensitivity.** Keep physical planning before parameter binding.
   Literals may use value-aware statistics when those exist; `$N` uses a deterministic generic
   selectivity. A custom parameter-sensitive plan can be a later feature rather than reshaping the
   pipeline and prepared-plan cache in initial Path B.
-- [ ] **Initial selectivity constants.** Recommended: borrow PostgreSQL's row-count-only defaults
+- [x] **Initial selectivity constants.** Borrow PostgreSQL's row-count-only defaults
   but encode them as exact rational data — equality `1/200`, one-sided inequality `1/3`, and a
   paired range `1/200` — with exact unique-key rules overriding the defaults.
-- [ ] **Join-search bound.** Recommended: exhaustive deterministic left-deep dynamic programming
+- [x] **Join-search bound.** Use exhaustive deterministic left-deep dynamic programming
   for reorderable islands of at most 8 relations, then deterministic greedy cheapest-next for
   larger islands. This borrows PostgreSQL's default join-collapse boundary without adopting its
   randomized GEQO fallback.
-- [ ] **Estimator inputs and cache validity.** Recommended: admit only catalog/statistics facts and
+- [x] **Estimator inputs and cache validity.** Admit only catalog/statistics facts and
   storage facts visible without leaf I/O (for example exact resident-skeleton node counts and tree
   height). Cache them with a relation-scoped estimator-input fingerprint, including attachment
   identity, rather than a database-wide generation that invalidates prepared plans after unrelated
   table writes.
-- [ ] **DML scope.** Recommended: initial cost-based selection applies to SELECT. UPDATE/DELETE use
+- [x] **DML scope.** Initial cost-based selection applies to SELECT. UPDATE/DELETE use
   the behavior-neutral candidate inventory but retain their current fixed policies until a
   dedicated slice decides mutation visitation/error-order consequences.
 
@@ -174,7 +176,7 @@ refactor is plan-, result-, EXPLAIN-, and cost-neutral.
 
 - [ ] Author shared estimator constants/facts as language-neutral data; generate only mechanical
   constants, never planner control flow.
-- [ ] Author shared estimator fixture vectors with inputs, per-unit counts, `est_rows`, weighted
+- [ ] Author `spec/cost/estimator_vectors.toml` with inputs, per-unit counts, `est_rows`, weighted
   `est_cost`, and expected tie keys.
 - [ ] Implement identical arithmetic helpers in all three cores.
 - [ ] Estimate full scans from row count and admitted structural facts.
@@ -353,10 +355,13 @@ byte-identical, deterministic, cache-safe, and demonstrably improve plan selecti
 
 Update this short block at the end of each work session.
 
-- **Current slice:** P0 — decision audit complete; awaiting maintainer decisions
-- **Last completed checkpoint:** P0 major-decision surface audited against planner, cost,
-  determinism, EXPLAIN, storage, and plan-cache contracts
-- **Branch / last pushed commit:** `path-b-p0-estimator-contract` / `7241a969`
-- **Verification last run:** none
-- **Known blockers or open decisions:** the six P0 human decisions recorded above
-- **Next action:** record maintainer answers, then author and ratify the canonical P0 contract
+- **Current slice:** P0 complete; P1 is next but has not started
+- **Last completed checkpoint:** canonical estimator data and contract ratified; planner, cost,
+  determinism, conformance, EXPLAIN, `CLAUDE.md`, and `TODO.md` synchronized
+- **Branch / P0 completion:** `path-b-p0-estimator-contract` / latest commit titled
+  `docs(planner): ratify Path B estimator contract`
+- **Verification last run:** `bundle exec rake verify` passed 2026-07-13; estimator checker passed;
+  `git diff --check` passed
+- **Known blockers or open decisions:** none for P0; all six maintainer decisions are recorded above
+- **Next action:** begin P1 by specifying the persisted per-table row-count field and format-version
+  transition; ask the maintainer before any major file-format compatibility choice

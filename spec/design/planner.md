@@ -182,30 +182,33 @@ elides its sort only when the source emits the requested PK order or walks the e
 
 ## 6. Neutrality and determinism
 
-- **Same plan everywhere.** For a given (query, catalog) every core must choose the same
-  plan: tie-breaks are structural and deterministic (the lowest-lowercased-name index,
-  FROM-order left-deep joins), never map-iteration or cost-estimate dependent. Plan choice
-  is observable through the metered cost and the EXPLAIN dump, both corpus-pinned — a
-  divergent planner is a failing `.test` file, not a silent drift.
+- **Same plan everywhere.** For a given resolved query and visible estimator inputs every core
+  must choose the same plan. Today's selector uses structural tie-breaks (the
+  lowest-lowercased-name index and FROM-order left-deep joins); Path B replaces those primary
+  choices with the exact shared estimate and total candidate order in
+  [estimator.md](estimator.md). Neither path may depend on map iteration. Plan choice is observable
+  through metered cost and EXPLAIN, both corpus-pinned — a divergent planner is a failing `.test`
+  file, not a silent drift.
 - **The pass structure is behavior-neutral scaffolding.** Splitting the stages changed no
   gate, no precedence, no tie-break; the corpus (cost pins, EXPLAIN suites, the NoREC/TLP
   sweep) passed unchanged across the refactor, which is the byte-identity proof.
-- **The forward hazard is ratified elsewhere:** as the optimizer grows, independently
-  hand-written planners may pick different plans, and cost-identity silently presumes
-  plan-identity — the unratified class-**P** fork ([determinism.md §8](determinism.md)).
-  Until it is ratified, every new rule keeps plan choice structurally deterministic and
-  `# cost:` assertions stay on shapes where all cores plan identically.
+- **The forward hazard is resolved by specifying the plan.** Path B keeps plan identity inside
+  the cross-core contract: shared estimator facts, exact arithmetic, complete candidate order,
+  and bounded search are specified in [estimator.md](estimator.md) and ratified in
+  [determinism.md §8](determinism.md). The algorithms remain hand-written per core. Shared
+  estimator vectors, EXPLAIN rows, actual `# cost:` pins, and NoREC relations detect drift.
 
 ## 7. Where future passes plug in
 
 - **Predicate pushdown + simplification** (TODO.md) — the first stage-2 rewrite rules,
   under the §3 contract.
-- **Plan-time cost estimator** (TODO.md) — a stage-3 *annotation* pass: estimate the same
-  units the runtime meter charges for each candidate, as a spec'd, cross-core-identical
-  artifact; feeds the future EXPLAIN `est_rows`/`est_cost` columns (explain.md §7).
+- **Plan-time cost estimator** ([estimator.md](estimator.md)) — a stage-3 *annotation* pass:
+  estimate the same units the runtime meter charges for each candidate using the ratified exact,
+  cross-core-identical contract; feeds the future EXPLAIN `est_rows`/`est_cost` columns
+  ([explain.md](explain.md) §7).
 - **Cost-based access-path + join-order selection** (TODO.md) — replaces §5's fixed
   precedence and the FROM-order join tree *inside* stage 3, once the estimator + table
-  statistics exist; re-pins the affected `# cost:` entries and forces the class-P decision
-  (§6).
+  statistics exist; each enabling slice re-pins affected `# cost:` entries and proves the
+  already-ratified plan-identity contract (§6).
 - **New physical rules** (the hash join above and later access paths tracked in TODO.md) land as
   discrete rule functions in the §4 inventory, each with its NoREC relation.

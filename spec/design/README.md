@@ -65,6 +65,12 @@ Each doc explains *why* a decision was made and points at the **data** that enco
 - [api.md](api.md) — the host/embedding API: open/create/commit/close a database file,
   prepare/execute/query, the `Rows` cursor, `$N` bind parameters, and the structured-error
   surface — the same shape across cores (CLAUDE.md §1/§2).
+- [planner.md](planner.md) — the deterministic logical/rewrite/physical planner stages,
+  current rule inventory, access-path policies, and optimizer extension points.
+- [estimator.md](estimator.md) — the ratified Path-B plan-time cardinality/cost contract:
+  exact arithmetic, canonical inputs and defaults, candidate ordering, and bounded join search.
+- [explain.md](explain.md) — deterministic, corpus-assertable rendering of the selected physical
+  plan, actual ANALYZE cost, and the scheduled estimate-column extension.
 - [cost.md](cost.md) — the deterministic cost-accounting seam: the unit schedule as data,
   the cross-core accrual rules, the counter representation, and the deferred ceiling/abort
   (CLAUDE.md §13).

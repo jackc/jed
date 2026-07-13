@@ -187,7 +187,9 @@ bound rendering, and a full expression printer.
 - Per-node cost attribution under ANALYZE (needs a per-operator sub-meter).
 - A full expression printer for the residual filter / projections (a ledgered spelling contract).
 - Exact float-literal bound rendering (needs a ledger entry).
-- Estimated-cost columns (`est_rows`/`est_cost`) once a plan-time cost estimator lands — the reason
-  the structured-column shape was chosen.
+- Estimated-cost columns (`est_rows`/`est_cost`) are ratified in
+  [estimator.md §11](estimator.md): when P5 lands they are non-NULL `i64`, with rows emitted by
+  each node and saturated subtree-cumulative scheduled cost. Implementation remains a follow-on;
+  the structured-column shape was chosen for this extension.
 - A `(…)` option list; a streaming/buffered/deferred lane tag; EXPLAIN of a data-modifying `WITH`.
 - The DML touched-set count (UPDATE/DELETE), and collation-name rendering in keys.

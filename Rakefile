@@ -133,6 +133,7 @@ task :verify do
     ["file format", "spec/fileformat/verify.rb"],
     ["function catalog", "spec/functions/verify.rb"],
     ["cost schedule", "spec/cost/verify.rb"],
+    ["plan estimator", "spec/cost/estimator_verify.rb"],
     ["operator codegen (drift)", "scripts/gen_catalog.rb", "--check"],
     ["cost codegen (drift)", "scripts/gen_costs.rb", "--check"],
     ["error codegen (drift)", "scripts/gen_errors.rb", "--check"],

@@ -181,6 +181,13 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 
 ### Cost as a plan input (the strategic investment — Path B)
 
+- [x] **P0 — deterministic estimator contract ratified** — chose “spec the plan,” keeping physical
+  plan identity and actual cost inside the cross-core contract rather than ledgering class-P
+  divergence. Exact arithmetic, generic pre-bind parameters, PostgreSQL-derived rational defaults,
+  relation-scoped cache validity, SELECT-first scope, complete ties, and bounded left-deep join
+  search are specified in [estimator.md](spec/design/estimator.md); mechanical facts live in
+  [estimator.toml](spec/cost/estimator.toml). Implementation remains open in the slices below and
+  the multi-session handoff is [TODO-cost-plan-input.md](TODO-cost-plan-input.md).
 - [ ] **Plan-time cost estimator** — estimate the same cost units the runtime meter charges
   (`page_read`/`storage_row_read`/`row_produced`/…) for each candidate plan and pick the cheapest,
   instead of today's structural tie-breaks (lowest index name, FROM order). Authored as a **spec'd,

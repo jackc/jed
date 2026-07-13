@@ -259,6 +259,9 @@ Shared, language-neutral data:
 - The **comparison / coercion / promotion matrix**.
 - The **function / operator catalog** — name, arg types, return type, null behavior.
 - The **error-code registry** (errors are structured data, not free text).
+- The runtime **cost schedule** and the plan estimator's mechanical facts — exact selectivity
+  rationals, representation limits, and complete access/join tie orders. Estimator algorithms and
+  candidate search remain hand-written per core (`spec/design/estimator.md`).
 
 **Codegen is the middle path** for large, purely mechanical surfaces (the function
 catalog especially): generate per-language stubs from the shared definition. It sits
@@ -402,6 +405,12 @@ cross-core-identical and owns that consequence (the host-extension boundary, §1
   exact and byte-identical cross-core, and the conformance harness compares such queries
   order-insensitively (`rowsort`). *With* `ORDER BY` the order is **fully** deterministic, ties
   included (broken by primary key).
+- **Plan choice and estimates** — ✅ **decided: specify the plan.** For the same resolved query and
+  visible estimator inputs, every core must inventory, estimate, order, and select the same physical
+  candidate (`spec/design/estimator.md`). The planner stays hand-written, but its arithmetic, shared
+  facts, total ties, and bounded search are contract data/algorithms. Selected-plan, EXPLAIN-estimate,
+  actual-cost, or deterministic error-visitation drift is a bug, not a class-P exception
+  (`spec/design/determinism.md` §8).
 
 ### Byte fixtures make the two worst subsystems verifiable, not hoped-for
 
@@ -650,7 +659,8 @@ The design is optimized for AI agents even more than for humans. In practice:
   introspection and leave the agreeing behavior (23503 at every write site, MATCH SIMPLE, the
   batch end state, 42830/2BP01) to `ddl/foreign_key.test`.
 - **Determinism everywhere** — deterministic results (exact multiset, values, types, errors,
-  cost), deterministic error messages, no wall-clock nondeterminism. **Row order is
+  selected plan, integer estimates, cost), deterministic error messages, no wall-clock
+  nondeterminism. **Row order is
   deterministic iff `ORDER BY` is present** (§8): without it the order is unspecified (the
   harness compares `rowsort`), so a query need not be force-ordered just to be testable — but
   everything *else* stays bit-reproducible, which is what the agent loop and cross-impl sync
@@ -661,7 +671,9 @@ The design is optimized for AI agents even more than for humans. In practice:
   a **host-injected seam** (`spec/design/entropy.md`) and so stay *deterministic given the seam
   inputs* (tests inject a fixed seed + a fixed/advancing clock → byte-identical cross-core; production
   reads OS entropy + wall clock). The seam joins the storage and cost seams as the engine's third
-  "host supplies it" boundary.
+  "host supplies it" boundary. Cost-based planning stays exact: the estimator's inputs, rational
+  arithmetic, candidate ties, and bounded search are specified in `spec/design/estimator.md`, and
+  plan divergence has no determinism-ledger exception.
 - **Benchmarks are wall-clock, never conformance.** `bench/` (`rake bench:setup/run/report`,
   [spec/design/benchmarks.md](spec/design/benchmarks.md)) compares the three cores against
   PostgreSQL and SQLite. Deliberately **outside `rake ci`** and the conformance contract
@@ -939,6 +951,11 @@ of executing a query** and **abort when a caller-supplied ceiling is exceeded**.
   of the shared contract: **every core must compute the identical cost** for the same
   `(query, database)`. This makes cost a §8-style divergence hotspot and a candidate for the
   conformance corpus (assert the cost, not only the rows).
+- **Plan identity is part of cost identity.** A different access path or join order performs
+  different metered work. Path B therefore minimizes only the shared runtime schedule, with no
+  private planner weights, and specifies estimator inputs, exact integer/rational arithmetic,
+  complete ties, and bounded search in `spec/design/estimator.md`. Estimates are unmetered
+  heuristics, never safety gates; the actual runtime counter remains authoritative for ceilings.
 - **Ceiling + abort.** A caller may set a **maximum cost**; the instant accrued cost reaches
   it, execution **aborts deterministically** with a defined error code (registered in
   `spec/errors/`). The abort point is itself deterministic (same query + db + ceiling → same

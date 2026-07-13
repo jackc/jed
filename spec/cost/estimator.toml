@@ -1,0 +1,86 @@
+# Plan-time estimator facts — CANONICAL DATA (CLAUDE.md §5/§8; estimator.md).
+#
+# This is the mechanical half of the ratified Path-B estimator contract. The planner and
+# estimator algorithms remain hand-written in every core; P0 only fixes the shared constants and
+# total tie orders they consume. P4 will add codegen'd per-core constants plus shared vectors at
+# `spec/cost/estimator_vectors.toml`. `spec/cost/estimator_verify.rb` checks this file through
+# `rake verify` now.
+
+schema_version = 1
+
+# Estimates are non-negative signed-i64 values. Every overflowing arithmetic operation saturates
+# here; TS uses bigint internally but clamps to the same maximum.
+max_estimate = 9223372036854775807
+max_selectivity_denominator = 1000000
+
+# Cardinality scaling applies each exact rational with ceiling division. A positive fraction over
+# a non-empty input therefore estimates at least one row unless a structural proof yields zero.
+row_rounding = "ceiling"
+
+# Initial Path B retains the current plan-before-bind pipeline. A $N placeholder uses the same
+# generic selectivity as an unknown value of the predicate's structural class.
+parameter_strategy = "generic_before_bind"
+
+# Left-deep dynamic programming is exhaustive through this many relations. Larger reorderable
+# islands use the deterministic cheapest-next fallback rather than PostgreSQL's randomized GEQO.
+join_dp_limit = 8
+large_join_strategy = "greedy_cheapest_next"
+
+# Row-count-only fallbacks used before P9's NDV/histogram statistics land.
+default_distinct_values = 200
+default_srf_rows = 1000
+default_variable_key_bytes = 1
+
+# PostgreSQL's no-statistics selectivity defaults, expressed as exact reduced rationals rather
+# than binary floats. `matching` is PG's broader "other matching operator" default; `boolean` and
+# `opaque` are jed-owned deterministic fallbacks for structural classes PG normally delegates to
+# type/operator-specific estimators.
+
+[[selectivity]]
+id = "equality"
+numerator = 1
+denominator = 200
+
+[[selectivity]]
+id = "inequality"
+numerator = 1
+denominator = 3
+
+[[selectivity]]
+id = "paired_range"
+numerator = 1
+denominator = 200
+
+[[selectivity]]
+id = "null_test"
+numerator = 1
+denominator = 200
+
+[[selectivity]]
+id = "match"
+numerator = 1
+denominator = 200
+
+[[selectivity]]
+id = "matching"
+numerator = 1
+denominator = 100
+
+[[selectivity]]
+id = "boolean"
+numerator = 1
+denominator = 2
+
+[[selectivity]]
+id = "opaque"
+numerator = 1
+denominator = 3
+
+# Equal estimated cost falls back to today's structural preferences. Names compare after
+# lowercasing by raw UTF-8 bytes; relation sequences compare by original FROM ordinal.
+
+[tie_break]
+access_path = ["pk", "btree", "gist", "gin", "pk_interval", "index_interval", "full"]
+join_algorithm = ["index_nested_loop", "hash", "nested_loop"]
+relation_order = "source_ordinal_lexicographic"
+index_name_order = "lowercase_utf8_bytewise"

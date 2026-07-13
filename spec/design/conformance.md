@@ -268,6 +268,11 @@ Every corpus entry MUST obey:
   with a stated blast radius and test mechanism. Two relaxations are exercised today: `f64`
   (class **A**, below) and the UUID generators (class **B**); everything else stays fully
   deterministic and cross-core byte-identical.
+- **Plan identity is exact, not ledgered.** A fixed resolved query and visible estimator inputs
+  must produce the same physical plan, `est_rows`/`est_cost`, and actual `# cost:` in every core.
+  [estimator.md](estimator.md) specifies exact arithmetic, candidate ties, and bounded search;
+  estimator vectors and EXPLAIN rows become the direct differential surface as their slices land.
+  A plan mismatch is a bug and has no class-P exception.
 - **Floats** are the class-**A** ledgered exception. `f64` ([float.md](float.md)) is exempt from
   cross-core byte-identity for *computed/rendered values only* — compared via the `R` tag's
   tolerant rule (§1). Its *storage* bytes, *total order*, *arithmetic kernel*, *exact-sum

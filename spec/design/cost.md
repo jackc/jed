@@ -5,6 +5,8 @@
 > weights); this doc is the *why* and — because cost is a cross-core contract with no
 > reference implementation (§2) — the precise **accrual rules** every core must obey.
 > The schedule is validated by [../cost/verify.rb](../cost/verify.rb) (`rake verify`).
+> The separate, unmetered plan-time consumer of these units is specified in
+> [estimator.md](estimator.md); it owns no private cost weights.
 
 A first-class use case is **safely evaluating untrusted, user-supplied queries**
 (CLAUDE.md §13). That requires the engine to **deterministically meter the cost of
@@ -29,6 +31,13 @@ and so it is **asserted in the conformance corpus** (the `# cost:` directive —
 [conformance.md](conformance.md)), not merely in per-core tests. A divergence in any
 core's counting is a failing corpus entry the day it appears.
 
+That identity includes **plan identity**. A different access path or join order accrues different
+runtime events even when it returns the same rows. Path B therefore specifies estimator inputs,
+exact arithmetic, candidate ordering, and bounded search as a shared contract
+([estimator.md](estimator.md); [determinism.md §8](determinism.md)). Independent cores implement the
+planner by hand but must select the same physical plan; plan divergence is a bug, not a sanctioned
+cost exception.
+
 ## 2. The unit schedule is data
 
 The cost units and their weights live in [../cost/schedule.toml](../cost/schedule.toml)
@@ -37,6 +46,11 @@ The cost units and their weights live in [../cost/schedule.toml](../cost/schedul
 as the operator catalog ([codegen.md](codegen.md)). The accrual **sites** (which line in
 the executor/evaluator/storage fires which unit) are hand-written per core; §5 forbids
 codegenning the evaluator. Only the **weights** are shared data.
+
+The planner's mechanical defaults and tie orders live separately in
+[../cost/estimator.toml](../cost/estimator.toml). They control estimates, not runtime accrual.
+Estimated cost is a saturated weighted sum over this schedule; it never increments the real meter,
+weakens a ceiling, or replaces actual cost as the enforcement value.
 
 The core seam units, all weight `1`:
 
@@ -1333,7 +1347,9 @@ Metering covers **execution** — per-row scans, per-row produced, per-row expre
 evaluation. It deliberately does **not** meter:
 
 - **Parse / plan / resolve** — these are per-statement (and the literal range-checks,
-  type resolution, etc. happen once), not per-row execution.
+  type resolution, etc. happen once), not per-row execution. The Path-B estimator and candidate
+  search are therefore unmetered; [estimator.md §10](estimator.md) supplies a deterministic bound
+  on join search so untrusted SQL cannot request unbounded exponential planning work.
 - **`ORDER BY` sort-internal comparisons** — the sort compares `Value`s directly, not
   through the expression evaluator, so they are outside the `operator_eval` unit (and the
   `decimal_work` unit — `MIN`/`MAX` folds are the same direct compare and share this
