@@ -158,7 +158,7 @@ CREATE TABLE tag (id i32 PRIMARY KEY)
 statement ok
 INSERT INTO tag VALUES (1), (2)
 
-# cost: 19
+# cost: 28
 query III nosort
 SELECT o.id, inr.v, tag.id FROM o JOIN inr ON inr.id = o.k CROSS JOIN tag ORDER BY o.id, tag.id
 ----

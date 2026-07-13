@@ -185,8 +185,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   divergence. Exact arithmetic, generic pre-bind parameters, PostgreSQL-derived rational defaults,
   relation-scoped cache validity, SELECT-first scope, complete ties, and bounded left-deep join
   search are specified in [estimator.md](spec/design/estimator.md); mechanical facts live in
-  [estimator.toml](spec/cost/estimator.toml). The remaining implementation continues in the slices
-  below; the multi-session handoff is [TODO-cost-plan-input.md](TODO-cost-plan-input.md).
+  [estimator.toml](spec/cost/estimator.toml). P1–P8 below complete the initial implementation;
+  distribution statistics remain the explicit later refinement.
 - [x] **P1 — transactional per-table row counts** — `format_version` 28 appends an exact
   nonnegative signed-`i64` `row_count` to every table catalog entry, installs it beside loaded
   demand-paged skeletons without a leaf walk, and maintains it with snapshot roots across DML,
@@ -240,10 +240,14 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   skipped, and barriers keep their prior behavior. Shared plan/cost/error coverage, NoREC, and the
   permanent forward/reverse INL plus hash/nested benchmark matrix pin the slice. →
   [estimator.md §9.2](spec/design/estimator.md), [planner.md §5.3](spec/design/planner.md)
-- [ ] **P8 — bounded deterministic N-way join ordering** — generalize P7 to reorderable INNER/CROSS
-  islands with exhaustive left-deep dynamic programming through 8 relations and deterministic
-  greedy cheapest-next beyond the cap. Re-pin each affected `# cost:` entry. _(size: L; ×3 cores;
-  +NoREC)_
+- [x] **P8 — bounded deterministic N-way join ordering** — maximal all-base INNER/CROSS islands now
+  jointly select physical order, access path, and join algorithm. Deterministic Pareto-frontier
+  left-deep DP covers through 8 movable relations; larger islands use cheapest-next construction.
+  Outer/dependency inputs are hard fences, authored ON trees schedule intact, and N-way ordered
+  LIMIT discounts only its final streamed step. Shared plan/cost/cap/barrier coverage, the dedicated
+  `cost_plan_p8` NoREC relation, and 3-/5-/9-way benchmark lanes pin the slice. Native before/after
+  checksums match, with measured `ns/op` 95.7–99.9% lower than the pre-P8 planner across those lanes. →
+  [estimator.md §10](spec/design/estimator.md), [planner.md §5.4](spec/design/planner.md)
 - [ ] **Column statistics** — the initial transactional per-table row count landed in P1. Add
   per-column distinct-value counts / histograms later, computed by a spec'd pass over deterministic
   data so they stay cross-core-identical. _(size: L histograms)_

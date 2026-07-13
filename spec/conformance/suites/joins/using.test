@@ -112,7 +112,7 @@ NULL
 # A USING CHAIN re-merges the same column: `a JOIN b USING(k) JOIN c USING(k)` keeps one k, then
 # x, y, z. Only k present in all three (k=3) survives.
 # names: k, x, y, z
-# cost: 25
+# cost: 21
 query IIII nosort
 SELECT * FROM a JOIN b USING(k) JOIN c USING(k) ORDER BY k
 ----

@@ -85,7 +85,7 @@ NULL
 
 # A NATURAL chain re-merges k across all three: only k present in all (k=3).
 # names: k, x, y, z
-# cost: 25
+# cost: 21
 query IIII nosort
 SELECT * FROM a NATURAL JOIN b NATURAL JOIN c ORDER BY k
 ----

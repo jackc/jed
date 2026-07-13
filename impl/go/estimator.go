@@ -1255,6 +1255,7 @@ func (db *engine) estimateNWayJoinTree(sp *selectPlan, n int, ctx *estimateCTECt
 	innerOrdinal := sp.phys.relationOrder[n-1]
 	innerPerCall := db.estimateRelation(sp, innerOrdinal, ctx)
 	boundByOuter := sp.phys.relINLBounds[innerOrdinal] != nil
+	lateral := sp.rels[innerOrdinal].lateral
 	fullPairs := satEstimateMul(outer.root.rows, innerPerCall.root.rows)
 	fullLogicalRows := satEstimateMul(outer.root.logicalRows, innerPerCall.root.logicalRows)
 	if boundByOuter {
@@ -1266,6 +1267,31 @@ func (db *engine) estimateNWayJoinTree(sp *selectPlan, n int, ctx *estimateCTECt
 		for _, onIndex := range step.onIndices {
 			fullRows = estimateSelectivity(predicateSelectivity(sp.joins[onIndex].on), fullRows)
 			fullLogicalRows = estimateSelectivity(predicateSelectivity(sp.joins[onIndex].on), fullLogicalRows)
+		}
+	}
+	stepKind := joinCross
+	if len(step.onIndices) > 0 {
+		stepKind = joinInner
+	}
+	for _, onIndex := range step.onIndices {
+		if kind := sp.joins[onIndex].kind; kind == joinLeft || kind == joinRight || kind == joinFull {
+			stepKind = kind
+		}
+	}
+	if stepKind == joinLeft || stepKind == joinFull {
+		if fullRows < outer.root.rows {
+			fullRows = outer.root.rows
+		}
+		if fullLogicalRows < outer.root.logicalRows {
+			fullLogicalRows = outer.root.logicalRows
+		}
+	}
+	if stepKind == joinRight || stepKind == joinFull {
+		if fullRows < innerPerCall.root.rows {
+			fullRows = innerPerCall.root.rows
+		}
+		if fullLogicalRows < innerPerCall.root.logicalRows {
+			fullLogicalRows = innerPerCall.root.logicalRows
 		}
 	}
 	outerCalls, deliveredRows := outer.root.rows, fullRows
@@ -1294,7 +1320,7 @@ func (db *engine) estimateNWayJoinTree(sp *selectPlan, n int, ctx *estimateCTECt
 	}
 	inner := innerPerCall
 	visitedPairs := fullPairs
-	if boundByOuter {
+	if boundByOuter || lateral {
 		inner.root = repeatPlanEstimate(inner.root, outerCalls)
 		for i := range inner.nodes {
 			inner.nodes[i] = repeatPlanEstimate(inner.nodes[i], outerCalls)

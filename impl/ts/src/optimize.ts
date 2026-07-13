@@ -552,12 +552,6 @@ function compareJoinSearchState(a: JoinSearchState, b: JoinSearchState): number 
   return 0;
 }
 
-function joinSearchMask(state: JoinSearchState): number {
-  let mask = 0;
-  for (const ordinal of state.order) mask |= 1 << ordinal;
-  return mask;
-}
-
 function joinFrontierIndex(mask: number, ordered: boolean): number {
   return mask * 2 + (ordered ? 1 : 0);
 }
@@ -692,6 +686,7 @@ function expandJoinSearchState(
   plan: SelectPlan,
   rels: ScopeRel[],
   state: JoinSearchState,
+  allowed: number[],
   snap: Snapshot,
   eng: Engine,
 ): JoinSearchState[] {
@@ -700,7 +695,7 @@ function expandJoinSearchState(
   const siblingColumns = state.order.flatMap((ordinal) => relationColumnRange(plan, ordinal));
   for (const ordinal of state.order) present[ordinal] = true;
   const out: JoinSearchState[] = [];
-  for (let inner = 0; inner < n; inner++) {
+  for (const inner of allowed) {
     if (present[inner]) continue;
     const after = [...present];
     after[inner] = true;
@@ -784,59 +779,73 @@ function popcount(value: number): number {
   return count;
 }
 
-// P8's bounded deterministic N-way search. Up to JOIN_DP_LIMIT relations use subset DP with a
-// Pareto frontier over cumulative cost, physical rows, and logical rows per requested-order
-// property. Larger islands use the same canonical candidate expansion greedily.
-function ruleCostedNWayJoin(plan: SelectPlan, rels: ScopeRel[], snap: Snapshot, eng: Engine): void {
-  const n = plan.rels.length;
-  if (
-    n < 3 ||
-    rels.length !== n ||
-    plan.joins.length + 1 !== n ||
-    plan.joins.some((join) => join.kind !== "inner" && join.kind !== "cross") ||
-    plan.rels.some(
-      (rel) =>
-        rel.lateral || rel.srf !== undefined || rel.cte !== undefined || rel.derived !== undefined,
-    )
-  ) {
-    return;
+function islandMask(state: JoinSearchState, island: number[]): number {
+  const present = new Set(state.order);
+  let mask = 0;
+  for (let position = 0; position < island.length; position++) {
+    if (present.has(island[position]!)) mask |= 1 << position;
   }
+  return mask;
+}
 
-  const initialState = (ordinal: number, access: ScanCandidate): JoinSearchState => {
-    const state: JoinSearchState = {
-      order: [ordinal],
-      access: [{ identity: access.identity, bound: access.bound, inl: false, onIndex: -1 }],
-      steps: [],
-      estimate: { cost: 0n, rows: 0n, logicalRows: 0n },
-      satisfiesQueryOrder: false,
-    };
-    refreshJoinSearchState(plan, rels, state, eng);
-    state.satisfiesQueryOrder = nwayDriverSatisfiesOrder(plan, rels, ordinal, snap);
-    return state;
+function initialJoinSearchState(
+  plan: SelectPlan,
+  rels: ScopeRel[],
+  ordinal: number,
+  access: ScanCandidate,
+  snap: Snapshot,
+  eng: Engine,
+): JoinSearchState {
+  const state: JoinSearchState = {
+    order: [ordinal],
+    access: [{ identity: access.identity, bound: access.bound, inl: false, onIndex: -1 }],
+    steps: [],
+    estimate: { cost: 0n, rows: 0n, logicalRows: 0n },
+    satisfiesQueryOrder: false,
   };
+  refreshJoinSearchState(plan, rels, state, eng);
+  state.satisfiesQueryOrder = nwayDriverSatisfiesOrder(plan, rels, ordinal, snap);
+  return state;
+}
 
+function searchJoinIsland(
+  plan: SelectPlan,
+  rels: ScopeRel[],
+  prefix: JoinSearchState | null,
+  island: number[],
+  snap: Snapshot,
+  eng: Engine,
+): JoinSearchState | null {
   let winner: JoinSearchState | null = null;
-  if (n <= JOIN_DP_LIMIT) {
-    const frontiers: JoinSearchState[][] = Array.from({ length: (1 << n) * 2 }, () => []);
-    for (let ordinal = 0; ordinal < n; ordinal++) {
-      for (const access of inventoryScanCandidates(plan.filter, rels[ordinal]!, snap, eng)) {
-        const state = initialState(ordinal, access);
-        insertJoinFrontier(
-          frontiers[joinFrontierIndex(joinSearchMask(state), state.satisfiesQueryOrder)]!,
-          state,
-        );
+  if (island.length <= JOIN_DP_LIMIT) {
+    const frontiers: JoinSearchState[][] = Array.from(
+      { length: (1 << island.length) * 2 },
+      () => [],
+    );
+    if (prefix !== null) {
+      insertJoinFrontier(frontiers[joinFrontierIndex(0, prefix.satisfiesQueryOrder)]!, prefix);
+    } else {
+      for (const ordinal of island) {
+        for (const access of inventoryScanCandidates(plan.filter, rels[ordinal]!, snap, eng)) {
+          const state = initialJoinSearchState(plan, rels, ordinal, access, snap, eng);
+          insertJoinFrontier(
+            frontiers[joinFrontierIndex(islandMask(state, island), state.satisfiesQueryOrder)]!,
+            state,
+          );
+        }
       }
     }
-    for (let size = 1; size < n; size++) {
-      for (let mask = 1; mask < 1 << n; mask++) {
+    const firstSize = prefix === null ? 1 : 0;
+    for (let size = firstSize; size < island.length; size++) {
+      for (let mask = 0; mask < 1 << island.length; mask++) {
         if (popcount(mask) !== size) continue;
         for (const ordered of [false, true]) {
           const states = [...frontiers[joinFrontierIndex(mask, ordered)]!];
           for (const state of states) {
-            for (const candidate of expandJoinSearchState(plan, rels, state, snap, eng)) {
+            for (const candidate of expandJoinSearchState(plan, rels, state, island, snap, eng)) {
               insertJoinFrontier(
                 frontiers[
-                  joinFrontierIndex(joinSearchMask(candidate), candidate.satisfiesQueryOrder)
+                  joinFrontierIndex(islandMask(candidate, island), candidate.satisfiesQueryOrder)
                 ]!,
                 candidate,
               );
@@ -845,39 +854,47 @@ function ruleCostedNWayJoin(plan: SelectPlan, rels: ScopeRel[], snap: Snapshot, 
         }
       }
     }
-    const full = (1 << n) - 1;
+    const full = (1 << island.length) - 1;
     const completed = [
       ...frontiers[joinFrontierIndex(full, false)]!,
       ...frontiers[joinFrontierIndex(full, true)]!,
     ].sort(compareJoinSearchState);
     let winnerCost = 0n;
     for (const state of completed) {
-      installJoinSearchState(plan, rels, state);
-      plan.phys.joinPkOrdered =
-        state.satisfiesQueryOrder && joinPkOrderedForCandidate(plan, rels, snap);
-      const cost = eng.estimateSelectPlanCost(plan);
+      let cost = state.estimate.cost;
+      if (state.order.length === plan.rels.length) {
+        installJoinSearchState(plan, rels, state);
+        plan.phys.joinPkOrdered =
+          state.satisfiesQueryOrder && joinPkOrderedForCandidate(plan, rels, snap);
+        cost = eng.estimateSelectPlanCost(plan);
+      }
       if (winner === null || cost < winnerCost) {
         winner = state;
         winnerCost = cost;
       }
     }
   } else {
-    const drivers: JoinSearchState[] = [];
-    for (let ordinal = 0; ordinal < n; ordinal++) {
-      for (const access of inventoryScanCandidates(plan.filter, rels[ordinal]!, snap, eng)) {
-        drivers.push(initialState(ordinal, access));
+    if (prefix !== null) {
+      winner = prefix;
+    } else {
+      const drivers: JoinSearchState[] = [];
+      for (const ordinal of island) {
+        for (const access of inventoryScanCandidates(plan.filter, rels[ordinal]!, snap, eng)) {
+          drivers.push(initialJoinSearchState(plan, rels, ordinal, access, snap, eng));
+        }
       }
+      drivers.sort((a, b) =>
+        a.estimate.cost === b.estimate.cost
+          ? compareJoinSearchState(a, b)
+          : a.estimate.cost < b.estimate.cost
+            ? -1
+            : 1,
+      );
+      winner = drivers[0] ?? null;
     }
-    drivers.sort((a, b) =>
-      a.estimate.cost === b.estimate.cost
-        ? compareJoinSearchState(a, b)
-        : a.estimate.cost < b.estimate.cost
-          ? -1
-          : 1,
-    );
-    winner = drivers[0] ?? null;
-    while (winner !== null && winner.order.length < n) {
-      const next = expandJoinSearchState(plan, rels, winner, snap, eng).sort((a, b) =>
+    const targetLength = (prefix?.order.length ?? 0) + island.length;
+    while (winner !== null && winner.order.length < targetLength) {
+      const next = expandJoinSearchState(plan, rels, winner, island, snap, eng).sort((a, b) =>
         a.estimate.cost === b.estimate.cost
           ? compareJoinSearchState(a, b)
           : a.estimate.cost < b.estimate.cost
@@ -887,10 +904,132 @@ function ruleCostedNWayJoin(plan: SelectPlan, rels: ScopeRel[], snap: Snapshot, 
       winner = next[0] ?? null;
     }
   }
-  if (winner === null) return;
-  installJoinSearchState(plan, rels, winner);
+  return winner;
+}
+
+function scanIdentityForBound(bound: ScanBound | null): ScanCandidateIdentity {
+  if (bound === null) return { kind: "full", indexName: "" };
+  switch (bound.kind) {
+    case "pk":
+      return { kind: "pk", indexName: "" };
+    case "index":
+      return { kind: "btree", indexName: bound.index.nameKey };
+    case "gin":
+      return { kind: "gin", indexName: bound.gin.nameKey };
+    case "gist":
+      return { kind: "gist", indexName: bound.gist.nameKey };
+    case "pkSet":
+      return { kind: "pk_interval", indexName: "" };
+    case "indexSet":
+      return { kind: "index_interval", indexName: bound.indexSet.nameKey };
+  }
+}
+
+function appendFixedJoinRelation(
+  plan: SelectPlan,
+  rels: ScopeRel[],
+  state: JoinSearchState | null,
+  ordinal: number,
+  bound: ScanBound | null,
+  inlBound: ScanBound | null,
+  eng: Engine,
+): JoinSearchState {
+  const accessBound = inlBound ?? bound;
+  const access: JoinSearchAccess = {
+    identity: scanIdentityForBound(accessBound),
+    bound: accessBound,
+    inl: inlBound !== null,
+    onIndex: ordinal === 0 ? -1 : ordinal - 1,
+  };
+  const next: JoinSearchState =
+    state === null
+      ? {
+          order: [ordinal],
+          access: [access],
+          steps: [],
+          estimate: { cost: 0n, rows: 0n, logicalRows: 0n },
+          satisfiesQueryOrder: false,
+        }
+      : cloneJoinSearchState(state);
+  if (state !== null) {
+    next.order.push(ordinal);
+    next.access.push(access);
+    // Include the authored join ordinal even for ON-less barrier steps so LEFT/RIGHT/FULL and the
+    // exact INNER/CROSS spelling remain recoverable by the mixed-tree estimator/executor.
+    next.steps.push({
+      algorithm: inlBound === null ? "nested" : "inl",
+      onIndices: [ordinal - 1],
+    });
+  }
+  next.satisfiesQueryOrder = false;
+  refreshJoinSearchState(plan, rels, next, eng);
+  return next;
+}
+
+type JoinSearchSegment =
+  | { kind: "island"; ordinals: number[] }
+  | { kind: "fixed"; ordinal: number };
+
+function joinSearchSegments(plan: SelectPlan): JoinSearchSegment[] {
+  const base = (ordinal: number): boolean => {
+    const rel = plan.rels[ordinal]!;
+    return (
+      !rel.lateral && rel.srf === undefined && rel.cte === undefined && rel.derived === undefined
+    );
+  };
+  const movableEdge = (right: number): boolean => {
+    const kind = plan.joins[right - 1]!.kind;
+    return kind === "inner" || kind === "cross";
+  };
+  const segments: JoinSearchSegment[] = [];
+  let ordinal = 0;
+  while (ordinal < plan.rels.length) {
+    const canStart = base(ordinal) && (ordinal === 0 || movableEdge(ordinal));
+    if (!canStart) {
+      segments.push({ kind: "fixed", ordinal });
+      ordinal++;
+      continue;
+    }
+    const island = [ordinal++];
+    while (ordinal < plan.rels.length && base(ordinal) && movableEdge(ordinal)) {
+      island.push(ordinal++);
+    }
+    if (island.length >= 2) segments.push({ kind: "island", ordinals: island });
+    else segments.push({ kind: "fixed", ordinal: island[0]! });
+  }
+  return segments;
+}
+
+// P8's bounded deterministic N-way island search. Semantic fences remain fixed in source order;
+// each maximal all-base INNER/CROSS run on either side is searched independently.
+function ruleCostedNWayJoin(plan: SelectPlan, rels: ScopeRel[], snap: Snapshot, eng: Engine): void {
+  const n = plan.rels.length;
+  if (n < 3 || rels.length !== n || plan.joins.length + 1 !== n) return;
+  const segments = joinSearchSegments(plan);
+  if (!segments.some((segment) => segment.kind === "island")) return;
+  const legacyBounds = [...plan.phys.relBounds];
+  const legacyINLBounds = [...plan.phys.relINLBounds];
+  let state: JoinSearchState | null = null;
+  for (const segment of segments) {
+    if (segment.kind === "island") {
+      state = searchJoinIsland(plan, rels, state, segment.ordinals, snap, eng);
+      if (state === null) return;
+    } else {
+      state = appendFixedJoinRelation(
+        plan,
+        rels,
+        state,
+        segment.ordinal,
+        legacyBounds[segment.ordinal] ?? null,
+        legacyINLBounds[segment.ordinal] ?? null,
+        eng,
+      );
+    }
+  }
+  if (state === null) return;
+  installJoinSearchState(plan, rels, state);
   plan.phys.joinPkOrdered =
-    winner.satisfiesQueryOrder && joinPkOrderedForCandidate(plan, rels, snap);
+    state.satisfiesQueryOrder && joinPkOrderedForCandidate(plan, rels, snap);
 }
 
 // ruleIndexNestedLoop — index-nested-loop pushdown (cost.md §3 "JOIN"): a join inner relation

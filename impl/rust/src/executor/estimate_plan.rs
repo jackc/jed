@@ -394,6 +394,7 @@ impl Engine {
         let inner_ordinal = sp.phys.relation_order[n - 1];
         let inner_per_call = self.estimate_relation(sp, inner_ordinal, ctx);
         let bound_by_outer = sp.phys.rel_inl_bounds[inner_ordinal].is_some();
+        let lateral = sp.rels[inner_ordinal].lateral;
         let full_pairs = sat_mul(outer.root.rows, inner_per_call.root.rows);
         let full_logical_pairs = sat_mul(outer.root.logical_rows, inner_per_call.root.logical_rows);
         let step = &sp.phys.join_steps[n - 2];
@@ -409,6 +410,25 @@ impl Engine {
                 full_rows = estimate_rows(&selectivity, full_rows);
                 full_logical_rows = estimate_rows(&selectivity, full_logical_rows);
             }
+        }
+        let step_kind = step.on_indices.iter().fold(
+            if step.on_indices.is_empty() {
+                JoinKind::Cross
+            } else {
+                JoinKind::Inner
+            },
+            |kind, on_index| match sp.joins[*on_index].kind {
+                JoinKind::Left | JoinKind::Right | JoinKind::Full => sp.joins[*on_index].kind,
+                _ => kind,
+            },
+        );
+        if matches!(step_kind, JoinKind::Left | JoinKind::Full) {
+            full_rows = full_rows.max(outer.root.rows);
+            full_logical_rows = full_logical_rows.max(outer.root.logical_rows);
+        }
+        if matches!(step_kind, JoinKind::Right | JoinKind::Full) {
+            full_rows = full_rows.max(inner_per_call.root.rows);
+            full_logical_rows = full_logical_rows.max(inner_per_call.root.logical_rows);
         }
 
         let mut outer_calls = outer.root.rows;
@@ -433,7 +453,7 @@ impl Engine {
 
         let mut inner = inner_per_call.clone();
         let mut visited_pairs = full_pairs;
-        if bound_by_outer {
+        if bound_by_outer || lateral {
             inner.root = inner.root.repeated(outer_calls);
             inner.nodes = inner
                 .nodes

@@ -131,9 +131,10 @@ Emitted outermost-first, each the pre-order parent of the next, so the tree read
 pipeline reads bottom-up: **Limit → Sort → Distinct → Window → Aggregate → Filter → FROM tree**. A
 node is emitted only when present. The FROM tree is a left-deep chain of join nodes over the plan's
 physical relation order (the outermost node is the last join; its right child is the physical inner
-relation), bottoming out at relation leaves. P7 may therefore render the second source relation as
-the left/outer child of an eligible two-relation INNER/CROSS join. Resolved logical slots remain in
-source order; EXPLAIN shows execution order.
+relation), bottoming out at relation leaves. P8 may therefore render any relation from a searched
+INNER/CROSS island as the driver or a later inner leaf. Hard-fenced outer/dependency relations stay
+in their authored position, and independently searched islands may follow them. Resolved logical
+slots remain in source order; EXPLAIN shows execution order.
 
 ### Detail grammar
 
@@ -160,8 +161,10 @@ Attributes are `; `-separated; a node with none renders `-`.
   follow-on (§5); v1 renders a count, not the predicate text — except the compact bound predicate
   above.
 - **Aggregate**: `groups=G aggs=A` (+ `sets=S` when more than one grouping set; + `having:conjuncts=K`).
-- **Window**: `funcs=N`. **Nested Loop**: `<kind>` (`inner`/`cross`/`left`/`right`/`full`) + `on:conjuncts=N`.
-  **Hash Join**: `<kind>; keys=K; on:conjuncts=N` (`kind` is `inner` or `left`).
+- **Window**: `funcs=N`. **Nested Loop**: `<kind>` (`inner`/`cross`/`left`/`right`/`full`) +
+  `on:conjuncts=N`; when several authored ON trees first become ready at the same P8 step, the
+  suffix is `on:predicates=P,conjuncts=N`. **Hash Join** inserts `keys=K` before the same ON suffix
+  (`kind` is `inner`, or `left` on the established two-input path).
 - **Limit**: `limit=N` / `offset=M` (an absent side omitted). **Values**: `rows=N`.
 - **Set op**: `all` / `distinct`. **CTE**: `inlined` / `materialized` (the planner's choice) + `recursive`.
 - **Insert**: `-` or `on conflict do nothing` / `on conflict do update`. **Update**: `sets=N`. **Delete**: `-`.
@@ -176,8 +179,9 @@ surfaces and how each is pinned:
 - **Index names** — always the stored lowercased name; estimated cost chooses across P6's complete
   single-relation set and deterministic lowest-name order breaks an exact same-kind cost tie
   (indexes.md §5).
-- **Iteration order** — relation leaves iterate the selected physical-order slice (source order at
-  every P7 barrier); joins, aggregates, and CTE bindings iterate their authored slices, never a map.
+- **Iteration order** — relation leaves iterate P8's selected physical-order slice inside each
+  island and authored order at every hard fence; retained DP states, joins, aggregates, and CTE
+  bindings iterate their specified structural order, never a map.
 - **Literal rendering** — integer / boolean / decimal / text / date / timestamp / uuid render
   deterministically. **`float` is the one hazard** (its layout is a ratified determinism-ledger
   exception, and floats are keyable), so a float bound literal renders as the fixed token `<float>`,

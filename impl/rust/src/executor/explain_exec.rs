@@ -459,11 +459,18 @@ impl Engine {
         let conjuncts = step.on_indices.iter().fold(0i64, |total, index| {
             total + sp.joins[*index].on.as_ref().map_or(0, conjunct_count)
         });
-        let kind = if step.on_indices.is_empty() {
-            "cross"
-        } else {
-            "inner"
-        };
+        let step_kind = step.on_indices.iter().fold(
+            if step.on_indices.is_empty() {
+                JoinKind::Cross
+            } else {
+                JoinKind::Inner
+            },
+            |kind, index| match sp.joins[*index].kind {
+                JoinKind::Left | JoinKind::Right | JoinKind::Full => sp.joins[*index].kind,
+                _ => kind,
+            },
+        );
+        let kind = join_kind_text(step_kind);
         let (node, detail) = match &step.hash_join {
             Some(hash) if step.on_indices.len() == 1 => (
                 "Hash Join",

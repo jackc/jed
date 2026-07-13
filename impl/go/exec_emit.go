@@ -153,6 +153,19 @@ func (db *engine) execCostedTwoRelationJoin(plan *selectPlan, env *evalEnv, mete
 	return out, nil
 }
 
+func physicalStepKind(plan *selectPlan, step physicalJoinStep) joinKind {
+	kind := joinCross
+	if len(step.onIndices) > 0 {
+		kind = joinInner
+	}
+	for _, onIndex := range step.onIndices {
+		if candidate := plan.joins[onIndex].kind; candidate == joinLeft || candidate == joinRight || candidate == joinFull {
+			kind = candidate
+		}
+	}
+	return kind
+}
+
 func (db *engine) execCostedNWayJoin(plan *selectPlan, env *evalEnv, meter *costMeter, params []Value, outerStack []storedRow, materialized [][]storedRow, stepCount int) ([]storedRow, error) {
 	driver := plan.phys.relationOrder[0]
 	running := make([]storedRow, len(materialized[driver]))
@@ -163,6 +176,9 @@ func (db *engine) execCostedNWayJoin(plan *selectPlan, env *evalEnv, meter *cost
 		step := plan.phys.joinSteps[position]
 		inner := plan.phys.relationOrder[position+1]
 		innerRows := materialized[inner]
+		stepKind := physicalStepKind(plan, step)
+		emitLeft := stepKind == joinLeft || stepKind == joinFull
+		emitRight := stepKind == joinRight || stepKind == joinFull
 		var table *hashJoinTable
 		var err error
 		if step.hashJoin != nil {
@@ -172,10 +188,17 @@ func (db *engine) execCostedNWayJoin(plan *selectPlan, env *evalEnv, meter *cost
 			}
 		}
 		var next []storedRow
+		rightMatched := make([]bool, len(innerRows))
 		for _, left := range running {
 			candidates := innerRows
 			if plan.phys.relINLBounds[inner] != nil {
 				candidates, err = db.materializeRel(plan, inner, params, outerStack, left, env.rng, env.ctes, meter)
+				if err != nil {
+					return nil, err
+				}
+			} else if plan.rels[inner].lateral {
+				lateralOuter := append(append([]storedRow(nil), outerStack...), left)
+				candidates, err = db.materializeRel(plan, inner, params, lateralOuter, nil, env.rng, env.ctes, meter)
 				if err != nil {
 					return nil, err
 				}
@@ -185,7 +208,8 @@ func (db *engine) execCostedNWayJoin(plan *selectPlan, env *evalEnv, meter *cost
 					return nil, err
 				}
 			}
-			for _, right := range candidates {
+			leftMatched := false
+			for ri, right := range candidates {
 				combined := append(storedRow(nil), left...)
 				copy(combined[plan.rels[inner].offset:], right)
 				keep := true
@@ -205,6 +229,20 @@ func (db *engine) execCostedNWayJoin(plan *selectPlan, env *evalEnv, meter *cost
 				}
 				if keep {
 					next = append(next, combined)
+					leftMatched = true
+					if emitRight {
+						rightMatched[ri] = true
+					}
+				}
+			}
+			if emitLeft && !leftMatched {
+				next = append(next, append(storedRow(nil), left...))
+			}
+		}
+		if emitRight {
+			for ri, right := range innerRows {
+				if !rightMatched[ri] {
+					next = append(next, placePhysicalRelationRow(plan, inner, right))
 				}
 			}
 		}

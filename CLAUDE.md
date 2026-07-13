@@ -976,13 +976,17 @@ of executing a query** and **abort when a caller-supplied ceiling is exceeded**.
   composing natural order, the complete residual/projection, and LIMIT/OFFSET early-out. Exact ties
   use the canonical kind/lowercased-name order; blocking sort remains unmetered and receives no
   private planner weight.
-  P7 cost-selects eligible exactly-two-base-relation INNER/CROSS pipelines across both physical
-  orientations, every ordinary access pair, physically legal sibling INL bounds, and the existing
-  safe ON-equijoin hash gate. Physical rows are restored to their resolved logical slots before
-  expression evaluation; EXPLAIN shows physical child order. Join top-N discounts only work that
-  execution really skips, exact ties retain source order, and the chosen deterministic plan defines
-  runtime error visitation. Outer/dependency barriers, wider joins, and UPDATE/DELETE retain their
-  explicit staged policies until P8 or a mutation-specific slice.
+  P7's two-relation selector is now the smallest instance of P8's bounded N-way search. Maximal
+  all-base INNER/CROSS islands retain deterministic Pareto frontiers over estimated cost, physical
+  rows, and logical rows through eight movable relations; larger islands use deterministic
+  cheapest-next construction. Every step jointly selects ordinary/INL access and nested/hash
+  algorithm, and each authored ON tree stays intact until its owner and dependencies are present.
+  Physical rows are restored to resolved logical slots before expression evaluation; EXPLAIN shows
+  physical child order. Outer joins, LATERAL/correlation, SRFs, CTEs, and derived inputs are hard
+  fences: no relation crosses them, while following base INNER/CROSS islands may be searched against
+  the fixed prefix. N-way ordered LIMIT materializes the winning left subtree and discounts only the
+  final streamed join step. Exact structural ties and the selected plan define error/abort visitation.
+  UPDATE/DELETE retain their explicit staged policy until a mutation-specific slice.
 - **Ceiling + abort.** A caller may set a **maximum cost**; the instant accrued cost reaches
   it, execution **aborts deterministically** with a defined error code (registered in
   `spec/errors/`). The abort point is itself deterministic (same query + db + ceiling → same

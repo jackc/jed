@@ -62,6 +62,11 @@ struct JoinSearchState {
     satisfies_query_order: bool,
 }
 
+enum JoinSearchSegment {
+    Island(Vec<usize>),
+    Fixed(usize),
+}
+
 impl Engine {
     /// Apply the physical rules to a freshly resolved logical plan, in a FIXED order that is part
     /// of the cross-core contract (spec/design/planner.md §4): later rules read earlier rules'
@@ -279,80 +284,140 @@ impl Engine {
         }
     }
 
-    /// P8's bounded deterministic N-way left-deep search. The initial implementation searches the
-    /// maximal fence-free shape represented by this flat plan: three or more non-lateral base
-    /// relations connected entirely by INNER/CROSS edges. Any semantic barrier retains the legacy
-    /// source-order tree, so no relation can cross it.
+    /// P8's bounded deterministic N-way left-deep island search. Semantic fences remain fixed in
+    /// source order; each maximal all-base INNER/CROSS run on either side is searched independently.
     fn rule_costed_nway_join(&self, plan: &mut SelectPlan, scope: &Scope<'_>) {
         let n = plan.rels.len();
-        if n < 3
-            || scope.rels.len() != n
-            || plan.joins.len() + 1 != n
-            || plan
-                .joins
-                .iter()
-                .any(|join| !matches!(join.kind, JoinKind::Inner | JoinKind::Cross))
-            || plan.rels.iter().any(|rel| {
-                rel.lateral || rel.srf.is_some() || rel.cte.is_some() || rel.derived.is_some()
-            })
+        if n < 3 || scope.rels.len() != n || plan.joins.len() + 1 != n {
+            return;
+        }
+        let segments = join_search_segments(plan);
+        if !segments
+            .iter()
+            .any(|segment| matches!(segment, JoinSearchSegment::Island(_)))
         {
             return;
         }
-
-        let winner = if n <= crate::estimator_constants::JOIN_DP_LIMIT {
-            self.search_nway_dp(plan, scope)
-        } else {
-            self.search_nway_greedy(plan, scope)
-        };
-        let Some(winner) = winner else { return };
-        self.install_nway_state(plan, scope, &winner);
-        plan.phys.pk_ordered = false;
-        plan.phys.pk_reverse = false;
-        plan.phys.index_order = None;
-        plan.phys.join_pk_ordered =
-            winner.satisfies_query_order && self.join_pk_ordered_for_candidate(plan, scope);
-        plan.phys.top_k = None;
-    }
-
-    fn search_nway_dp(&self, plan: &mut SelectPlan, scope: &Scope<'_>) -> Option<JoinSearchState> {
-        let n = plan.rels.len();
-        let bucket_count = (1usize << n) * 2;
-        let mut frontiers: Vec<Vec<JoinSearchState>> = vec![Vec::new(); bucket_count];
-        for ordinal in 0..n {
-            let identities: Vec<_> = inventory_scan_candidates(
-                plan.filter.as_ref(),
-                &scope.rels[ordinal],
-                scope.catalog,
-            )
-            .into_iter()
-            .map(|candidate| candidate.identity)
-            .collect();
-            for identity in identities {
-                let mut state = JoinSearchState {
-                    order: vec![ordinal],
-                    access: vec![JoinSearchAccess::Ordinary(identity)],
-                    steps: Vec::new(),
-                    estimate: crate::estimator::PlanEstimate::empty(0),
-                    satisfies_query_order: false,
+        let legacy_access: Vec<_> = (0..n)
+            .map(|ordinal| {
+                let (bound, inl) = match &plan.phys.rel_inl_bounds[ordinal] {
+                    Some(bound) => (Some(bound), true),
+                    None => (plan.phys.rel_bounds[ordinal].as_ref(), false),
                 };
-                self.refresh_nway_state(plan, scope, &mut state);
-                state.satisfies_query_order =
-                    self.nway_driver_satisfies_order(plan, scope, ordinal);
-                let index = frontier_index(nway_state_mask(&state), state.satisfies_query_order);
-                insert_nway_frontier(&mut frontiers[index], state);
+                let identity = scan_bound_identity(bound);
+                if inl {
+                    JoinSearchAccess::Inl {
+                        identity,
+                        on_index: ordinal.checked_sub(1),
+                    }
+                } else {
+                    JoinSearchAccess::Ordinary(identity)
+                }
+            })
+            .collect();
+
+        let mut state = None;
+        for segment in segments {
+            state = match segment {
+                JoinSearchSegment::Island(island) => {
+                    self.search_nway_island(plan, scope, state, &island)
+                }
+                JoinSearchSegment::Fixed(ordinal) => Some(self.append_fixed_nway_relation(
+                    plan,
+                    scope,
+                    state,
+                    ordinal,
+                    legacy_access[ordinal].clone(),
+                )),
+            };
+            if state.is_none() {
+                return;
             }
         }
+        let Some(winner) = state else { return };
+        self.install_nway_state(plan, scope, &winner);
+        plan.phys.join_pk_ordered =
+            winner.satisfies_query_order && self.join_pk_ordered_for_candidate(plan, scope);
+    }
 
-        for size in 1..n {
-            for mask in 1usize..(1usize << n) {
+    fn search_nway_island(
+        &self,
+        plan: &mut SelectPlan,
+        scope: &Scope<'_>,
+        prefix: Option<JoinSearchState>,
+        island: &[usize],
+    ) -> Option<JoinSearchState> {
+        if island.len() <= crate::estimator_constants::JOIN_DP_LIMIT {
+            self.search_nway_dp(plan, scope, prefix, island)
+        } else {
+            self.search_nway_greedy(plan, scope, prefix, island)
+        }
+    }
+
+    fn initial_nway_state(
+        &self,
+        plan: &mut SelectPlan,
+        scope: &Scope<'_>,
+        ordinal: usize,
+        identity: ScanCandidateIdentity,
+    ) -> JoinSearchState {
+        let mut state = JoinSearchState {
+            order: vec![ordinal],
+            access: vec![JoinSearchAccess::Ordinary(identity)],
+            steps: Vec::new(),
+            estimate: crate::estimator::PlanEstimate::empty(0),
+            satisfies_query_order: false,
+        };
+        self.refresh_nway_state(plan, scope, &mut state);
+        state.satisfies_query_order = self.nway_driver_satisfies_order(plan, scope, ordinal);
+        state
+    }
+
+    fn search_nway_dp(
+        &self,
+        plan: &mut SelectPlan,
+        scope: &Scope<'_>,
+        prefix: Option<JoinSearchState>,
+        island: &[usize],
+    ) -> Option<JoinSearchState> {
+        let bucket_count = (1usize << island.len()) * 2;
+        let mut frontiers: Vec<Vec<JoinSearchState>> = vec![Vec::new(); bucket_count];
+        let first_size = if let Some(state) = prefix {
+            let index = frontier_index(0, state.satisfies_query_order);
+            insert_nway_frontier(&mut frontiers[index], state);
+            0
+        } else {
+            for &ordinal in island {
+                let identities: Vec<_> = inventory_scan_candidates(
+                    plan.filter.as_ref(),
+                    &scope.rels[ordinal],
+                    scope.catalog,
+                )
+                .into_iter()
+                .map(|candidate| candidate.identity)
+                .collect();
+                for identity in identities {
+                    let state = self.initial_nway_state(plan, scope, ordinal, identity);
+                    let index = frontier_index(
+                        nway_island_mask(&state, island),
+                        state.satisfies_query_order,
+                    );
+                    insert_nway_frontier(&mut frontiers[index], state);
+                }
+            }
+            1
+        };
+
+        for size in first_size..island.len() {
+            for mask in 0usize..(1usize << island.len()) {
                 if mask.count_ones() as usize != size {
                     continue;
                 }
                 for ordered in [false, true] {
                     let states = frontiers[frontier_index(mask, ordered)].clone();
                     for state in states {
-                        for candidate in self.expand_nway_state(plan, scope, &state) {
-                            let next_mask = nway_state_mask(&candidate);
+                        for candidate in self.expand_nway_state(plan, scope, &state, island) {
+                            let next_mask = nway_island_mask(&candidate, island);
                             let index = frontier_index(next_mask, candidate.satisfies_query_order);
                             insert_nway_frontier(&mut frontiers[index], candidate);
                         }
@@ -361,7 +426,7 @@ impl Engine {
             }
         }
 
-        let full_mask = (1usize << n) - 1;
+        let full_mask = (1usize << island.len()) - 1;
         let mut completed = Vec::new();
         for ordered in [false, true] {
             completed.extend(frontiers[frontier_index(full_mask, ordered)].clone());
@@ -369,10 +434,14 @@ impl Engine {
         completed.sort_by(compare_nway_state);
         let mut winner: Option<(i64, JoinSearchState)> = None;
         for state in completed {
-            self.install_nway_state(plan, scope, &state);
-            plan.phys.join_pk_ordered =
-                state.satisfies_query_order && self.join_pk_ordered_for_candidate(plan, scope);
-            let cost = self.estimate_select_plan_cost(plan);
+            let cost = if state.order.len() == plan.rels.len() {
+                self.install_nway_state(plan, scope, &state);
+                plan.phys.join_pk_ordered =
+                    state.satisfies_query_order && self.join_pk_ordered_for_candidate(plan, scope);
+                self.estimate_select_plan_cost(plan)
+            } else {
+                state.estimate.cost()
+            };
             if winner.as_ref().is_none_or(|(prior, _)| cost < *prior) {
                 winner = Some((cost, state));
             }
@@ -384,41 +453,37 @@ impl Engine {
         &self,
         plan: &mut SelectPlan,
         scope: &Scope<'_>,
+        prefix: Option<JoinSearchState>,
+        island: &[usize],
     ) -> Option<JoinSearchState> {
-        let n = plan.rels.len();
-        let mut drivers = Vec::new();
-        for ordinal in 0..n {
-            let identities: Vec<_> = inventory_scan_candidates(
-                plan.filter.as_ref(),
-                &scope.rels[ordinal],
-                scope.catalog,
-            )
-            .into_iter()
-            .map(|candidate| candidate.identity)
-            .collect();
-            for identity in identities {
-                let mut state = JoinSearchState {
-                    order: vec![ordinal],
-                    access: vec![JoinSearchAccess::Ordinary(identity)],
-                    steps: Vec::new(),
-                    estimate: crate::estimator::PlanEstimate::empty(0),
-                    satisfies_query_order: false,
-                };
-                self.refresh_nway_state(plan, scope, &mut state);
-                state.satisfies_query_order =
-                    self.nway_driver_satisfies_order(plan, scope, ordinal);
-                drivers.push(state);
+        let prefix_len = prefix.as_ref().map_or(0, |state| state.order.len());
+        let mut state = if let Some(state) = prefix {
+            state
+        } else {
+            let mut drivers = Vec::new();
+            for &ordinal in island {
+                let identities: Vec<_> = inventory_scan_candidates(
+                    plan.filter.as_ref(),
+                    &scope.rels[ordinal],
+                    scope.catalog,
+                )
+                .into_iter()
+                .map(|candidate| candidate.identity)
+                .collect();
+                for identity in identities {
+                    drivers.push(self.initial_nway_state(plan, scope, ordinal, identity));
+                }
             }
-        }
-        drivers.sort_by(compare_nway_state);
-        let mut state = drivers.into_iter().min_by(|a, b| {
-            a.estimate
-                .cost()
-                .cmp(&b.estimate.cost())
-                .then_with(|| compare_nway_state(a, b))
-        })?;
-        while state.order.len() < n {
-            let mut next = self.expand_nway_state(plan, scope, &state);
+            drivers.sort_by(compare_nway_state);
+            drivers.into_iter().min_by(|a, b| {
+                a.estimate
+                    .cost()
+                    .cmp(&b.estimate.cost())
+                    .then_with(|| compare_nway_state(a, b))
+            })?
+        };
+        while state.order.len() < prefix_len + island.len() {
+            let mut next = self.expand_nway_state(plan, scope, &state, island);
             next.sort_by(compare_nway_state);
             state = next.into_iter().min_by(|a, b| {
                 a.estimate
@@ -430,11 +495,46 @@ impl Engine {
         Some(state)
     }
 
+    fn append_fixed_nway_relation(
+        &self,
+        plan: &mut SelectPlan,
+        scope: &Scope<'_>,
+        state: Option<JoinSearchState>,
+        ordinal: usize,
+        access: JoinSearchAccess,
+    ) -> JoinSearchState {
+        let mut next = if let Some(mut state) = state {
+            state.order.push(ordinal);
+            state.access.push(access.clone());
+            state.steps.push(JoinSearchStep {
+                algorithm: if matches!(access, JoinSearchAccess::Inl { .. }) {
+                    JoinSearchAlgorithm::Inl
+                } else {
+                    JoinSearchAlgorithm::Nested
+                },
+                on_indices: vec![ordinal - 1],
+            });
+            state
+        } else {
+            JoinSearchState {
+                order: vec![ordinal],
+                access: vec![access],
+                steps: Vec::new(),
+                estimate: crate::estimator::PlanEstimate::empty(0),
+                satisfies_query_order: false,
+            }
+        };
+        next.satisfies_query_order = false;
+        self.refresh_nway_state(plan, scope, &mut next);
+        next
+    }
+
     fn expand_nway_state(
         &self,
         plan: &mut SelectPlan,
         scope: &Scope<'_>,
         state: &JoinSearchState,
+        allowed: &[usize],
     ) -> Vec<JoinSearchState> {
         let n = plan.rels.len();
         let mut present = vec![false; n];
@@ -447,7 +547,7 @@ impl Engine {
             .map(|&ordinal| relation_columns(plan, ordinal))
             .collect();
         let mut out = Vec::new();
-        for inner in 0..n {
+        for &inner in allowed {
             if present[inner] {
                 continue;
             }
@@ -747,11 +847,67 @@ fn compare_nway_state(a: &JoinSearchState, b: &JoinSearchState) -> std::cmp::Ord
         })
 }
 
-fn nway_state_mask(state: &JoinSearchState) -> usize {
-    state
-        .order
+fn nway_island_mask(state: &JoinSearchState, island: &[usize]) -> usize {
+    island
         .iter()
-        .fold(0usize, |mask, ordinal| mask | (1usize << ordinal))
+        .enumerate()
+        .fold(0usize, |mask, (position, ordinal)| {
+            if state.order.contains(ordinal) {
+                mask | (1usize << position)
+            } else {
+                mask
+            }
+        })
+}
+
+fn scan_bound_identity(bound: Option<&ScanBound>) -> ScanCandidateIdentity {
+    let (kind, index_name) = match bound {
+        None => (ScanCandidateKind::Full, String::new()),
+        Some(ScanBound::Pk(_)) => (ScanCandidateKind::Pk, String::new()),
+        Some(ScanBound::Index(bound)) => (ScanCandidateKind::Btree, bound.name_key.clone()),
+        Some(ScanBound::Gin(bound)) => (ScanCandidateKind::Gin, bound.name_key.clone()),
+        Some(ScanBound::Gist(bound)) => (ScanCandidateKind::Gist, bound.name_key.clone()),
+        Some(ScanBound::PkSet(_)) => (ScanCandidateKind::PkInterval, String::new()),
+        Some(ScanBound::IndexSet(bound)) => {
+            (ScanCandidateKind::IndexInterval, bound.name_key.clone())
+        }
+    };
+    ScanCandidateIdentity { kind, index_name }
+}
+
+fn join_search_segments(plan: &SelectPlan) -> Vec<JoinSearchSegment> {
+    let is_base = |ordinal: usize| {
+        let rel = &plan.rels[ordinal];
+        !rel.lateral && rel.srf.is_none() && rel.cte.is_none() && rel.derived.is_none()
+    };
+    let movable_edge = |right: usize| {
+        matches!(
+            plan.joins[right - 1].kind,
+            JoinKind::Inner | JoinKind::Cross
+        )
+    };
+    let mut segments = Vec::new();
+    let mut ordinal = 0;
+    while ordinal < plan.rels.len() {
+        let can_start = is_base(ordinal) && (ordinal == 0 || movable_edge(ordinal));
+        if !can_start {
+            segments.push(JoinSearchSegment::Fixed(ordinal));
+            ordinal += 1;
+            continue;
+        }
+        let mut island = vec![ordinal];
+        ordinal += 1;
+        while ordinal < plan.rels.len() && is_base(ordinal) && movable_edge(ordinal) {
+            island.push(ordinal);
+            ordinal += 1;
+        }
+        if island.len() >= 2 {
+            segments.push(JoinSearchSegment::Island(island));
+        } else {
+            segments.push(JoinSearchSegment::Fixed(island[0]));
+        }
+    }
+    segments
 }
 
 fn frontier_index(mask: usize, ordered: bool) -> usize {

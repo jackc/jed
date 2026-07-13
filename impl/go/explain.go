@@ -388,10 +388,7 @@ func (db *engine) renderNWayJoinTree(r *explainRender, sp *selectPlan, n, depth 
 			conjuncts += conjunctCount(sp.joins[onIndex].on)
 		}
 	}
-	kind := "cross"
-	if len(step.onIndices) > 0 {
-		kind = "inner"
-	}
+	kind := joinKindText(physicalStepKind(sp, step))
 	node := "Nested Loop"
 	detail := kind
 	if len(step.onIndices) == 1 {

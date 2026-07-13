@@ -38,6 +38,9 @@
 #              top-N compare P6b's whole-pipeline winner with a deliberately non-accelerated form.
 #   cost_plan_p7 — reverse-orientation INL, hash-vs-nested algorithm selection, and selected-outer
 #              join top-N compare P7 winners with deliberately non-accelerated blocking forms.
+#   cost_plan_p8 — N-way INL dependencies, selected-final-step top-N, and independently searched
+#              INNER islands around a LEFT fence compare P8 winners with expression-key forms that
+#              defeat the corresponding indexed/hash choices without changing rows.
 #   index_mut — UPDATE/DELETE target scans use a bare indexed equality/range or secondary-index
 #              IN-list; the equivalent `v + 0` predicates defeat the mutation bound. Applied to
 #              identically-seeded tables, both paths must reach the same by-construction end state,
@@ -187,6 +190,11 @@ COST_PLAN_P7_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_mul
                       query.join_inner query.qualified_column query.comparison_order query.order_by
                       query.order_by_keys query.limit query.index_nested_loop query.hash_join
                       query.order_by_join_scan expr.arithmetic types.i32].freeze
+COST_PLAN_P8_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
+                      query.join_inner query.join_left query.cross_join query.qualified_column
+                      query.comparison_order query.order_by query.order_by_keys query.limit
+                      query.index_nested_loop query.hash_join query.order_by_join_scan
+                      expr.arithmetic types.i32 null.three_valued].freeze
 INDEX_MUT_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index dml.insert
                    dml.insert_multi_row dml.update dml.delete query.select query.where_eq
                    query.comparison_order query.order_by query.or_in_point_lookup
@@ -856,6 +864,88 @@ def gen_cost_plan_p7(seed)
   out << "# reverse selected-outer top-N versus expression-key blocking sort"
   q(out, "II", "SELECT a.id,b.id FROM ra a JOIN rb b ON a.id>0 ORDER BY b.id LIMIT #{k}", window)
   q(out, "II", "SELECT a.id,b.id FROM ra a JOIN rb b ON a.id>0 ORDER BY b.id+0,a.id LIMIT #{k}", window)
+
+  out.join("\n") + "\n"
+end
+
+# --- scenario: P8 bounded deterministic N-way join search ------------------------------------
+def gen_cost_plan_p8(seed)
+  rng = Random.new(seed)
+  out = header(seed, COST_PLAN_P8_REQ,
+               "P8 N-way join ordering, final-step top-N, and hard-fenced islands")
+
+  # The large indexed relation is authored first. P8 may place driver before it, then append the
+  # tag relation, while each complete authored ON tree is evaluated exactly once. Wrapping both
+  # indexed keys defeats INL/hash alternatives but preserves the total-ordered result.
+  ix = (1..12).map { |id| [id, rng.rand(1..4)] }
+  driver = [[1, 2, 1], [2, 5, 2], [3, 9, 3], [4, 12, 4], [5, 99, 1], [6, nil, 2]]
+  tags = (1..4).map { |id| [id, rng.rand(10..40)] }
+  stmt(out, "CREATE TABLE ix (id i32 PRIMARY KEY, k i32)")
+  stmt(out, "CREATE TABLE driver (id i32 PRIMARY KEY, ixid i32, tagid i32)")
+  stmt(out, "CREATE TABLE tag (id i32 PRIMARY KEY, v i32)")
+  stmt(out, "INSERT INTO ix VALUES #{ix.map { |id, k| "(#{id},#{k})" }.join(', ')}")
+  stmt(out, "INSERT INTO driver VALUES #{driver.map { |id, ixid, tagid| "(#{id},#{ixid || 'NULL'},#{tagid})" }.join(', ')}")
+  stmt(out, "INSERT INTO tag VALUES #{tags.map { |id, v| "(#{id},#{v})" }.join(', ')}")
+  rows = driver.filter_map do |did, ixid, tagid|
+    next unless ixid && ix.any? { |iid, _k| iid == ixid } && tags.any? { |tid, _v| tid == tagid }
+
+    [ixid, did, tagid]
+  end.sort_by { |iid, did, tid| [did, iid, tid] }.flatten.map(&:to_s)
+  out << "# N-way sibling-bound plan versus expression-key nested loops"
+  q(out, "III",
+    "SELECT i.id,d.id,t.id FROM ix i JOIN driver d ON i.id=d.ixid JOIN tag t ON t.id=d.tagid ORDER BY d.id,i.id,t.id",
+    rows)
+  q(out, "III",
+    "SELECT i.id,d.id,t.id FROM ix i JOIN driver d ON i.id+0=d.ixid JOIN tag t ON t.id+0=d.tagid ORDER BY d.id,i.id,t.id",
+    rows)
+
+  # Only the final join step is streamed. The expression ORDER BY supplies the same total tie order
+  # while gating join-PK order off and forcing the blocking reference path.
+  stmt(out, "CREATE TABLE oa (id i32 PRIMARY KEY)")
+  stmt(out, "CREATE TABLE ob (id i32 PRIMARY KEY)")
+  stmt(out, "CREATE TABLE oc (id i32 PRIMARY KEY)")
+  stmt(out, "INSERT INTO oa VALUES #{(1..12).map { |id| "(#{id})" }.join(', ')}")
+  stmt(out, "INSERT INTO ob VALUES #{(1..4).map { |id| "(#{id})" }.join(', ')}")
+  stmt(out, "INSERT INTO oc VALUES #{(1..3).map { |id| "(#{id})" }.join(', ')}")
+  limit = rng.rand(2..6)
+  window = (1..3).flat_map do |cid|
+    (1..12).flat_map { |aid| (1..4).map { |bid| [aid, bid, cid] } }
+  end.first(limit).flatten.map(&:to_s)
+  out << "# N-way selected-final-step top-N versus expression-key blocking sort"
+  q(out, "III",
+    "SELECT a.id,b.id,c.id FROM oa a JOIN ob b ON a.id>0 CROSS JOIN oc c ORDER BY c.id LIMIT #{limit}",
+    window)
+  q(out, "III",
+    "SELECT a.id,b.id,c.id FROM oa a JOIN ob b ON a.id>0 CROSS JOIN oc c ORDER BY c.id+0,a.id,b.id LIMIT #{limit}",
+    window)
+
+  # A LEFT edge fixes its authored relation while the all-base INNER island on either side remains
+  # independently searchable. One leading match has no bc row so NULL extension is compared too.
+  stmt(out, "CREATE TABLE bi (id i32 PRIMARY KEY)")
+  stmt(out, "CREATE TABLE bd (id i32 PRIMARY KEY, iid i32)")
+  stmt(out, "CREATE TABLE bc (id i32 PRIMARY KEY, bid i32)")
+  stmt(out, "CREATE TABLE bx (id i32 PRIMARY KEY)")
+  stmt(out, "CREATE TABLE byy (id i32 PRIMARY KEY, xid i32)")
+  stmt(out, "INSERT INTO bi VALUES #{(1..8).map { |id| "(#{id})" }.join(', ')}")
+  stmt(out, "INSERT INTO bd VALUES (1,2), (2,7), (3,99), (4,NULL)")
+  stmt(out, "INSERT INTO bc VALUES (10,1), (20,99)")
+  stmt(out, "INSERT INTO bx VALUES (1), (2), (3), (4)")
+  stmt(out, "INSERT INTO byy VALUES (1,1), (2,3), (3,9)")
+  barrier_rows = [
+    2, 1, 10, 1, 1,
+    2, 1, 10, 3, 2,
+    7, 2, "NULL", 1, 1,
+    7, 2, "NULL", 3, 2,
+  ].map(&:to_s)
+  optimized = "SELECT i.id,b.id,c.id,x.id,y.id FROM bi i JOIN bd b ON i.id=b.iid " \
+              "LEFT JOIN bc c ON b.id=c.bid CROSS JOIN bx x JOIN byy y ON x.id=y.xid " \
+              "ORDER BY b.id,x.id,y.id"
+  reference = "SELECT i.id,b.id,c.id,x.id,y.id FROM bi i JOIN bd b ON i.id+0=b.iid " \
+              "LEFT JOIN bc c ON b.id=c.bid CROSS JOIN bx x JOIN byy y ON x.id+0=y.xid " \
+              "ORDER BY b.id,x.id,y.id"
+  out << "# independently searched islands around a LEFT fence, including NULL extension"
+  q(out, "IIIII", optimized, barrier_rows)
+  q(out, "IIIII", reference, barrier_rows)
 
   out.join("\n") + "\n"
 end
@@ -2287,6 +2377,7 @@ SCENARIOS = {
   "cost_plan" => method(:gen_cost_plan),
   "cost_plan_p6b" => method(:gen_cost_plan_p6b),
   "cost_plan_p7" => method(:gen_cost_plan_p7),
+  "cost_plan_p8" => method(:gen_cost_plan_p8),
   "index_mut" => method(:gen_index_mutation),
   "index_expr" => method(:gen_index_expr),
   "index_range" => method(:gen_index_range),

@@ -120,7 +120,7 @@ SELECT a.id, b.id, c.id FROM a, b, c ORDER BY a.id, b.id, c.id
 # (The pre-INL full-inner-scan baseline was 28 — for a single-leaf inner the per-outer seeks cost a
 # little more; the win shows when the inner is large, N·log M ≪ N·M.)
 # names: id, id, id
-# cost: 31
+# cost: 20
 query III nosort
 SELECT a.id, b.id, c.id FROM a, b JOIN c ON b.id = c.id ORDER BY a.id, b.id
 ----

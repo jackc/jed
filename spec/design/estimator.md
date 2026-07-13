@@ -5,14 +5,11 @@
 > runtime unit weights remain canonical in [../cost/schedule.toml](../cost/schedule.toml). This
 > document specifies the algorithms every core will implement independently.
 >
-> **Status: P0 contract ratified; P1 row counts, P2 cache validity, P3 complete candidate
-> inventory, P4 base-relation estimates, and P5 whole-plan propagation + EXPLAIN columns
-> landed.** P6a applies those estimates to the first staged access-path set described in §9.1;
-> P6b extends that single-relation choice to every access method and complete ordering/LIMIT
-> pipelines. P7 cost-selects two-base-relation INNER/CROSS orientation, access paths, and join
-> algorithm as described in §9.2. P8's N-way state contract and bounded search are specified in
-> §10; implementation status remains tracked in
-> [../../TODO-cost-plan-input.md](../../TODO-cost-plan-input.md).
+> **Status: P0–P8 landed.** P1 supplies row counts, P2 cache validity, P3 complete candidate
+> inventory, P4 base estimates, and P5 whole-plan propagation + EXPLAIN columns. P6 selects
+> complete single-relation pipelines, P7 cost-selects two-relation orientation and algorithm, and
+> P8 implements §10's hard-fenced N-way search with Pareto-frontier DP through eight movable
+> relations and deterministic cheapest-next construction above the cap.
 
 ## 1. Decision and scope
 
@@ -351,16 +348,16 @@ Join candidates count their different repetition shapes explicitly:
   probe rows/bytes, then reapplies and charges the full ON expression for estimated
   bucket-verification candidates.
 
-For the two-relation ordered join top-N, let `T = OFFSET + LIMIT`, let `J` be the estimated
-post-ON, post-WHERE rows before the window, and let `O` be the physical outer rows. When `T > 0`
-and `J > T`, the estimated number of outer rows whose join runs are started is
-`min(O, ceil(T * O / J))`; `J = 0` conservatively starts all `O`, and `T = 0` starts none. The
-multiply/divide uses quotient/remainder saturation, never float arithmetic. This is the initial
-row-count-only uniform-fanout model; P9 may replace it only with specified distribution facts.
-It discounts only work the executor actually skips: nested-loop candidate/ON visits, hash probes
-and bucket verification, and repeated INL inner scans. Both ordinary base scans remain fully
-materialized, and a hash build remains complete. The selected outer's complete materialization is
-also retained even when no probe run starts.
+For an eligible ordered join top-N, let `T = OFFSET + LIMIT`, let `J` be the estimated post-ON,
+post-WHERE rows before the window, and let `L` be the rows in the physical left subtree presented
+to the final join step. When `T > 0` and `J > T`, the estimated number of left rows whose final join
+runs are started is `min(L, ceil(T * L / J))`; `J = 0` conservatively starts all `L`, and `T = 0`
+starts none. The multiply/divide uses quotient/remainder saturation, never float arithmetic. This
+is the initial row-count-only uniform-fanout model; P9 may replace it only with specified
+distribution facts. It discounts only final-step work the executor actually skips: nested-loop
+candidate/ON visits, hash probes and bucket verification, or repeated INL inner scans. The selected
+left subtree and ordinary base scans remain complete, as does a final hash build. In the
+two-relation case `L` is the selected driver relation.
 
 An uncorrelated scalar, EXISTS, or IN subquery contributes its subplan once. A correlated subquery
 contributes its subplan and owning predicate work once per estimated invoking outer row, using
@@ -379,10 +376,10 @@ LIMIT/ordered-stream short-circuit is a physical-plan property: eligible single-
 backward-safe window top-N plans reduce their child scan to the rows/pages expected to be pulled,
 not an eagerly estimated full input sliced only at the Limit node. An unbounded secondary-index
 order prices the expected index prefix plus table point fetches. Bound index/GiST/GIN paths retain
-their conservative structural descent and reduce admitted table fetches. P7's join-PK-ordered
-stream applies §8.2's deterministic outer-prefix model while retaining complete base
-materialization and hash-build work. Consequently estimates are computed over a complete candidate
-pipeline rather than by blindly adding immutable logical-node estimates.
+their conservative structural descent and reduce admitted table fetches. P8's join-PK-ordered
+stream applies §8.2's deterministic final-step prefix model while retaining its complete left
+subtree, base materialization, and hash-build work. Consequently estimates are computed over a
+complete candidate pipeline rather than by blindly adding immutable logical-node estimates.
 
 The following attribution rules close the remaining current-plan shapes:
 

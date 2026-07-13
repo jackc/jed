@@ -1,0 +1,887 @@
+# P8 searches maximal contiguous base-table INNER/CROSS islands as complete N-way physical
+# pipelines. Fixed join barriers remain in source order, authored ON trees schedule intact, and
+# DP switches to deterministic greedy construction above join_dp_limit=8. This is jed-owned
+# plan/cost behavior and is intentionally not PostgreSQL-oracle output.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, dml.insert, dml.insert_multi_row, query.select, query.join_inner, query.join_left, query.cross_join, query.qualified_column, query.comparison_order, query.logical_connectives, query.where_eq, query.order_by, query.order_by_keys, query.limit, query.explain, query.hash_join, query.index_nested_loop, query.order_by_join_scan, types.i32, resource.cost_metering
+
+# --- canonical tie and disconnected product --------------------------------------------
+
+statement ok
+CREATE TABLE p8_ta (id i32 PRIMARY KEY, k i32)
+
+statement ok
+CREATE TABLE p8_tb (id i32 PRIMARY KEY, k i32)
+
+statement ok
+CREATE TABLE p8_tc (id i32 PRIMARY KEY, k i32)
+
+statement ok
+INSERT INTO p8_ta VALUES (1, 1), (2, 2)
+
+statement ok
+INSERT INTO p8_tb VALUES (1, 1), (2, 2)
+
+statement ok
+INSERT INTO p8_tc VALUES (1, 1), (2, 2)
+
+# Every complete estimate ties. Canonical relation order [0,1,2] and nested loops win.
+query ITTII nosort
+EXPLAIN SELECT a.id, b.id, c.id
+FROM p8_ta a JOIN p8_tb b ON a.k = b.k JOIN p8_tc c ON b.k = c.k
+----
+0
+Nested Loop
+inner; on:conjuncts=1
+1
+16
+1
+Nested Loop
+inner; on:conjuncts=1
+1
+10
+2
+Scan p8_ta
+Full scan; touched=2
+2
+3
+2
+Scan p8_tb
+Full scan; touched=2
+2
+3
+1
+Scan p8_tc
+Full scan; touched=2
+2
+3
+
+# cost: 19
+query III nosort
+SELECT a.id, b.id, c.id
+FROM p8_ta a JOIN p8_tb b ON a.k = b.k JOIN p8_tc c ON b.k = c.k
+ORDER BY a.id
+----
+1
+1
+1
+2
+2
+2
+
+# A disconnected relation is a legal CROSS extension of the connected prefix.
+query ITTII nosort
+EXPLAIN SELECT a.id, b.id, c.id
+FROM p8_ta a JOIN p8_tb b ON a.k = b.k CROSS JOIN p8_tc c
+----
+0
+Nested Loop
+cross
+2
+15
+1
+Nested Loop
+inner; on:conjuncts=1
+1
+10
+2
+Scan p8_ta
+Full scan; touched=2
+2
+3
+2
+Scan p8_tb
+Full scan; touched=2
+2
+3
+1
+Scan p8_tc
+Full scan; touched=1
+2
+3
+
+# --- N-way INL dependency ---------------------------------------------------------------
+
+statement ok
+CREATE TABLE p8_ix (id i32 PRIMARY KEY, v i32)
+
+statement ok
+CREATE TABLE p8_drv (id i32 PRIMARY KEY, ixid i32)
+
+statement ok
+CREATE TABLE p8_tag (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO p8_ix VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50),
+  (6, 60), (7, 70), (8, 80), (9, 90), (10, 100), (11, 110), (12, 120),
+  (13, 130), (14, 140), (15, 150), (16, 160), (17, 170), (18, 180),
+  (19, 190), (20, 200)
+
+statement ok
+INSERT INTO p8_drv VALUES (1, 2), (2, 15), (3, 99)
+
+statement ok
+INSERT INTO p8_tag VALUES (1), (2)
+
+# p8_ix is first logically, but its PK join bound requires p8_drv in the physical prefix.
+query ITTII nosort
+EXPLAIN SELECT i.id, d.id, t.id
+FROM p8_ix i JOIN p8_drv d ON i.id = d.ixid CROSS JOIN p8_tag t
+----
+0
+Nested Loop
+cross
+6
+22
+1
+Nested Loop
+inner; on:conjuncts=1
+3
+13
+2
+Scan p8_drv
+Full scan; touched=2
+3
+4
+2
+Scan p8_ix
+Index-nested-loop PK bound: id = join; touched=1
+3
+6
+1
+Scan p8_tag
+Full scan; touched=1
+2
+3
+
+# cost: 18
+query III nosort
+SELECT i.id, d.id, t.id
+FROM p8_ix i JOIN p8_drv d ON i.id = d.ixid CROSS JOIN p8_tag t
+ORDER BY d.id, t.id
+----
+2
+1
+1
+2
+1
+2
+15
+2
+1
+15
+2
+2
+
+# --- selective competing indexes -------------------------------------------------------
+
+statement ok
+CREATE TABLE p8_ca (id i32 PRIMARY KEY, x i32, y i32)
+
+statement ok
+CREATE INDEX p8_ca_a_y ON p8_ca (y)
+
+statement ok
+CREATE INDEX p8_ca_z_x ON p8_ca (x)
+
+statement ok
+CREATE TABLE p8_cb (id i32 PRIMARY KEY, aid i32)
+
+statement ok
+CREATE TABLE p8_cc (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO p8_ca VALUES (1, 1, 1), (2, 2, 0), (3, 3, 1), (4, 4, 0),
+  (5, 5, 1), (6, 6, 0), (7, 7, 1), (8, 8, 0), (9, 9, 1), (10, 10, 0),
+  (11, 11, 1), (12, 12, 0), (13, 13, 1), (14, 14, 0), (15, 15, 1),
+  (16, 16, 0), (17, 17, 1), (18, 18, 0), (19, 19, 1), (20, 20, 0)
+
+statement ok
+INSERT INTO p8_cb VALUES (1, 7), (2, 18), (3, 99)
+
+statement ok
+INSERT INTO p8_cc VALUES (1), (2)
+
+# The higher-named equality index wins over the lower-named inequality index on estimated cost.
+query ITTII nosort
+EXPLAIN SELECT a.id, b.id, c.id
+FROM p8_ca a JOIN p8_cb b ON a.id = b.aid CROSS JOIN p8_cc c
+WHERE a.x = 7 AND a.y >= 0
+----
+0
+Filter
+conjuncts=2
+1
+20
+1
+Nested Loop
+cross
+2
+13
+2
+Nested Loop
+inner; on:conjuncts=1
+1
+10
+3
+Scan p8_ca
+Index bound: using p8_ca_z_x; touched=3
+1
+3
+3
+Scan p8_cb
+Full scan; touched=2
+3
+4
+2
+Scan p8_cc
+Full scan; touched=1
+2
+3
+
+# cost: 21
+query III nosort
+SELECT a.id, b.id, c.id
+FROM p8_ca a JOIN p8_cb b ON a.id = b.aid CROSS JOIN p8_cc c
+WHERE a.x = 7 AND a.y >= 0
+ORDER BY c.id
+----
+7
+1
+1
+7
+1
+2
+
+# --- hash choice ------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE p8_ha (id i32 PRIMARY KEY, k i32)
+
+statement ok
+CREATE TABLE p8_hb (id i32 PRIMARY KEY, k i32)
+
+statement ok
+CREATE TABLE p8_hc (id i32 PRIMARY KEY, k i32)
+
+statement ok
+INSERT INTO p8_ha VALUES (1, 1), (2, 2), (3, 3), (4, 4), (5, 5),
+  (6, 6), (7, 7), (8, 8), (9, 9), (10, 10)
+
+statement ok
+INSERT INTO p8_hb VALUES (1, 1), (2, 2), (3, 3), (4, 4), (5, 5),
+  (6, 6), (7, 7), (8, 8), (9, 9), (10, 10)
+
+statement ok
+INSERT INTO p8_hc VALUES (1, 1), (2, 2), (3, 3), (4, 4), (5, 5),
+  (6, 6), (7, 7), (8, 8), (9, 9), (10, 10)
+
+query ITTII nosort
+EXPLAIN SELECT a.id, b.id, c.id
+FROM p8_ha a JOIN p8_hb b ON a.k = b.k JOIN p8_hc c ON b.k = c.k
+----
+0
+Nested Loop
+inner; on:conjuncts=1
+1
+133
+1
+Hash Join
+inner; keys=1; on:conjuncts=1
+1
+111
+2
+Scan p8_ha
+Full scan; touched=2
+10
+11
+2
+Scan p8_hb
+Full scan; touched=2
+10
+11
+1
+Scan p8_hc
+Full scan; touched=2
+10
+11
+
+# cost: 313
+query III nosort
+SELECT a.id, b.id, c.id
+FROM p8_ha a JOIN p8_hb b ON a.k = b.k JOIN p8_hc c ON b.k = c.k
+ORDER BY a.id
+----
+1
+1
+1
+2
+2
+2
+3
+3
+3
+4
+4
+4
+5
+5
+5
+6
+6
+6
+7
+7
+7
+8
+8
+8
+9
+9
+9
+10
+10
+10
+
+# --- intact ON ownership ---------------------------------------------------------------
+
+statement ok
+CREATE TABLE p8_m0 (id i32 PRIMARY KEY, k i32)
+
+statement ok
+CREATE TABLE p8_m1 (id i32 PRIMARY KEY, k i32)
+
+statement ok
+CREATE TABLE p8_m2 (id i32 PRIMARY KEY, k i32)
+
+statement ok
+CREATE TABLE p8_m3 (id i32 PRIMARY KEY, k i32)
+
+statement ok
+INSERT INTO p8_m0 VALUES (1, 1), (2, 2)
+
+statement ok
+INSERT INTO p8_m1 VALUES (1, 1), (2, 2)
+
+statement ok
+INSERT INTO p8_m2 VALUES (1, 1), (2, 2)
+
+statement ok
+INSERT INTO p8_m3 VALUES (1, 1), (2, 2)
+
+# Both conjuncts authored on m3 stay together and schedule exactly once when m3 is added.
+query ITTII nosort
+EXPLAIN SELECT a.id, b.id, c.id, d.id
+FROM p8_m0 a
+JOIN p8_m1 b ON a.k = b.k
+JOIN p8_m2 c ON b.k = c.k
+JOIN p8_m3 d ON c.k = d.k AND b.k = d.k
+----
+0
+Nested Loop
+inner; on:conjuncts=2
+1
+25
+1
+Nested Loop
+inner; on:conjuncts=1
+1
+15
+2
+Nested Loop
+inner; on:conjuncts=1
+1
+10
+3
+Scan p8_m0
+Full scan; touched=2
+2
+3
+3
+Scan p8_m1
+Full scan; touched=2
+2
+3
+2
+Scan p8_m2
+Full scan; touched=2
+2
+3
+1
+Scan p8_m3
+Full scan; touched=2
+2
+3
+
+# --- fixed barrier and post-barrier island ---------------------------------------------
+
+statement ok
+CREATE TABLE p8_fa (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE p8_fb (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE p8_fc (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE p8_fd (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE p8_fe (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO p8_fa VALUES (1), (2)
+
+statement ok
+INSERT INTO p8_fb VALUES (1)
+
+statement ok
+INSERT INTO p8_fc VALUES (1), (3)
+
+statement ok
+INSERT INTO p8_fd VALUES (1), (2), (3), (4), (5)
+
+statement ok
+INSERT INTO p8_fe VALUES (1)
+
+# The leading island reverses to use p8_fa's PK. LEFT remains a fixed barrier, and the suffix
+# island is searched only after that fixed prefix; no relation crosses p8_fc.
+query ITTII nosort
+EXPLAIN SELECT a.id, b.id, c.id, d.id, e.id
+FROM p8_fa a
+JOIN p8_fb b ON a.id = b.id
+LEFT JOIN p8_fc c ON b.id = c.id
+JOIN p8_fd d ON c.id = d.id
+JOIN p8_fe e ON d.id = e.id
+----
+0
+Nested Loop
+inner; on:conjuncts=1
+1
+15
+1
+Nested Loop
+inner; on:conjuncts=1
+1
+11
+2
+Nested Loop
+left; on:conjuncts=1
+1
+8
+3
+Nested Loop
+inner; on:conjuncts=1
+1
+5
+4
+Scan p8_fb
+Full scan; touched=1
+1
+2
+4
+Scan p8_fa
+Index-nested-loop PK bound: id = join; touched=1
+1
+2
+3
+Scan p8_fc
+Index-nested-loop PK bound: id = join; touched=1
+1
+2
+2
+Scan p8_fd
+Index-nested-loop PK bound: id = join; touched=1
+1
+2
+1
+Scan p8_fe
+Index-nested-loop PK bound: id = join; touched=1
+1
+2
+
+# cost: 15
+query IIIII nosort
+SELECT a.id, b.id, c.id, d.id, e.id
+FROM p8_fa a
+JOIN p8_fb b ON a.id = b.id
+LEFT JOIN p8_fc c ON b.id = c.id
+JOIN p8_fd d ON c.id = d.id
+JOIN p8_fe e ON d.id = e.id
+----
+1
+1
+1
+1
+1
+
+# --- NULL and empty relation behavior --------------------------------------------------
+
+statement ok
+CREATE TABLE p8_na (id i32 PRIMARY KEY, k i32)
+
+statement ok
+CREATE TABLE p8_nb (id i32 PRIMARY KEY, k i32)
+
+statement ok
+CREATE TABLE p8_nc (id i32 PRIMARY KEY, k i32)
+
+statement ok
+INSERT INTO p8_na VALUES (1, NULL), (2, 2)
+
+statement ok
+INSERT INTO p8_nb VALUES (10, NULL), (20, 2)
+
+statement ok
+INSERT INTO p8_nc VALUES (100, NULL), (200, 2)
+
+# NULL equality remains UNKNOWN regardless of the chosen physical order.
+# cost: 16
+query III nosort
+SELECT a.id, b.id, c.id
+FROM p8_na a JOIN p8_nb b ON a.k = b.k JOIN p8_nc c ON b.k = c.k
+----
+2
+20
+200
+
+statement ok
+CREATE TABLE p8_empty (id i32 PRIMARY KEY, k i32)
+
+query ITTII nosort
+EXPLAIN SELECT a.id, e.id, c.id
+FROM p8_na a JOIN p8_empty e ON a.k = e.k JOIN p8_nc c ON e.k = c.k
+----
+0
+Nested Loop
+inner; on:conjuncts=1
+0
+6
+1
+Nested Loop
+inner; on:conjuncts=1
+0
+3
+2
+Scan p8_na
+Full scan; touched=2
+2
+3
+2
+Scan p8_empty
+Full scan; touched=2
+0
+0
+1
+Scan p8_nc
+Full scan; touched=2
+2
+3
+
+# cost: 6
+query III nosort
+SELECT a.id, e.id, c.id
+FROM p8_na a JOIN p8_empty e ON a.k = e.k JOIN p8_nc c ON e.k = c.k
+----
+
+# --- DP cap boundary -------------------------------------------------------------------
+
+statement ok
+CREATE TABLE p8_n1 (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE p8_n2 (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE p8_n3 (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE p8_n4 (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE p8_n5 (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE p8_n6 (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE p8_n7 (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE p8_n8 (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE p8_n9 (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO p8_n1 VALUES (1)
+
+statement ok
+INSERT INTO p8_n2 VALUES (1)
+
+statement ok
+INSERT INTO p8_n3 VALUES (1)
+
+statement ok
+INSERT INTO p8_n4 VALUES (1)
+
+statement ok
+INSERT INTO p8_n5 VALUES (1)
+
+statement ok
+INSERT INTO p8_n6 VALUES (1)
+
+statement ok
+INSERT INTO p8_n7 VALUES (1)
+
+statement ok
+INSERT INTO p8_n8 VALUES (1)
+
+statement ok
+INSERT INTO p8_n9 VALUES (1)
+
+# Eight relations use subset DP. Exact ties retain the canonical source sequence.
+query ITTII nosort
+EXPLAIN SELECT n1.id FROM p8_n1 n1
+CROSS JOIN p8_n2 n2 CROSS JOIN p8_n3 n3 CROSS JOIN p8_n4 n4
+CROSS JOIN p8_n5 n5 CROSS JOIN p8_n6 n6 CROSS JOIN p8_n7 n7 CROSS JOIN p8_n8 n8
+----
+0
+Nested Loop
+cross
+1
+17
+1
+Nested Loop
+cross
+1
+14
+2
+Nested Loop
+cross
+1
+12
+3
+Nested Loop
+cross
+1
+10
+4
+Nested Loop
+cross
+1
+8
+5
+Nested Loop
+cross
+1
+6
+6
+Nested Loop
+cross
+1
+4
+7
+Scan p8_n1
+Full scan; touched=1
+1
+2
+7
+Scan p8_n2
+Full scan
+1
+2
+6
+Scan p8_n3
+Full scan
+1
+2
+5
+Scan p8_n4
+Full scan
+1
+2
+4
+Scan p8_n5
+Full scan
+1
+2
+3
+Scan p8_n6
+Full scan
+1
+2
+2
+Scan p8_n7
+Full scan
+1
+2
+1
+Scan p8_n8
+Full scan
+1
+2
+
+# Nine relations exceed the cap and use deterministic greedy left-deep construction.
+query ITTII nosort
+EXPLAIN SELECT n1.id FROM p8_n1 n1
+CROSS JOIN p8_n2 n2 CROSS JOIN p8_n3 n3 CROSS JOIN p8_n4 n4
+CROSS JOIN p8_n5 n5 CROSS JOIN p8_n6 n6 CROSS JOIN p8_n7 n7 CROSS JOIN p8_n8 n8
+CROSS JOIN p8_n9 n9
+----
+0
+Nested Loop
+cross
+1
+19
+1
+Nested Loop
+cross
+1
+16
+2
+Nested Loop
+cross
+1
+14
+3
+Nested Loop
+cross
+1
+12
+4
+Nested Loop
+cross
+1
+10
+5
+Nested Loop
+cross
+1
+8
+6
+Nested Loop
+cross
+1
+6
+7
+Nested Loop
+cross
+1
+4
+8
+Scan p8_n1
+Full scan; touched=1
+1
+2
+8
+Scan p8_n2
+Full scan
+1
+2
+7
+Scan p8_n3
+Full scan
+1
+2
+6
+Scan p8_n4
+Full scan
+1
+2
+5
+Scan p8_n5
+Full scan
+1
+2
+4
+Scan p8_n6
+Full scan
+1
+2
+3
+Scan p8_n7
+Full scan
+1
+2
+2
+Scan p8_n8
+Full scan
+1
+2
+1
+Scan p8_n9
+Full scan
+1
+2
+
+# --- ordered LIMIT materializes the selected prefix ------------------------------------
+
+statement ok
+CREATE TABLE p8_oa (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE p8_ob (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE p8_oc (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO p8_oa VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10),
+  (11), (12), (13), (14), (15), (16), (17), (18), (19), (20)
+
+statement ok
+INSERT INTO p8_ob VALUES (1), (2), (3)
+
+statement ok
+INSERT INTO p8_oc VALUES (1), (2)
+
+# c x a is fully materialized. Only the final join with b receives the ordered top-N discount.
+query ITTII nosort
+EXPLAIN SELECT a.id, b.id, c.id
+FROM p8_oa a JOIN p8_ob b ON a.id > 0 CROSS JOIN p8_oc c
+ORDER BY c.id LIMIT 2
+----
+0
+Limit
+limit=2
+2
+36
+1
+Nested Loop
+inner; on:conjuncts=1; ordered: join pk ordered
+2
+34
+2
+Nested Loop
+cross
+40
+24
+3
+Scan p8_oc
+Full scan; touched=1
+2
+3
+3
+Scan p8_oa
+Full scan; touched=1
+20
+21
+2
+Scan p8_ob
+Full scan; touched=1
+3
+4
+
+# cost: 32
+query III nosort
+SELECT a.id, b.id, c.id
+FROM p8_oa a JOIN p8_ob b ON a.id > 0 CROSS JOIN p8_oc c
+ORDER BY c.id LIMIT 2
+----
+1
+1
+1
+1
+2
+1

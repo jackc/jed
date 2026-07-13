@@ -86,8 +86,9 @@ one base relation. The accrual rules below are unchanged: they describe the actu
 path wins. P6b extends that rule to GiST, GIN, both interval families, and secondary-index
 ORDER-BY/top-N alternatives by comparing the complete scheduled single-relation pipeline. A plain
 LIMIT can therefore change the access winner when early-out changes metered work; unmetered sorting
-still contributes no private planner weight. Multi-relation SELECTs and UPDATE/DELETE retain their
-staged fixed policies until P7/a mutation-specific slice ([estimator.md §9.1](estimator.md)).
+still contributes no private planner weight. P7/P8 select eligible multi-relation SELECT pipelines;
+hard-fenced inputs and UPDATE/DELETE retain their staged policies
+([estimator.md §9.1](estimator.md)).
 
 - **`storage_row_read`** is charged once per row pulled from a store, at the top of the
   executor scan loop, **before** the filter runs — in `SELECT`, `DELETE`, and `UPDATE`.
@@ -999,15 +1000,17 @@ order). `query/distinct.test`'s composite-PK section pins the streaming top-N (a
 ### JOIN — nested-loop and deterministic hash contracts
 
 A multi-table `SELECT` ([grammar.md](grammar.md) §15) is logically left-deep. Nested loop is the
-fallback physical operator; an eligible two-input INNER/LEFT equijoin may use the deterministic
-in-memory hash operator below. Cost is pinned here because, with no reference implementation, the
-count is a cross-core contract (§1).
+fallback physical operator; an eligible INNER step in a searched P8 island, or the established
+authored two-input INNER/LEFT shape, may use the deterministic in-memory hash operator below. Cost
+is pinned here because, with no reference implementation, the count is a cross-core contract (§1).
 
-- **`storage_row_read` is charged once per physical row as each base table is materialized** —
-  total = the **sum of the table cardinalities** (`|A| + |B| + …`), independent of join order or
-  fan-out. A row is pulled from its store exactly once (each table is scanned into memory in
-  primary-key order); a physical join then reads that **in-memory** buffer, which is not a
-  store and charges nothing. This keeps the existing rule verbatim ("once per row pulled from a
+- **`storage_row_read` is charged once per physical row as each ordinary base table is
+  materialized** — for non-INL inputs, total = the **sum of admitted table rows**, independent of
+  join order or fan-out. Each such row is pulled from its store exactly once (the table is scanned
+  into memory in primary-key order); a physical join then reads that **in-memory** buffer, which is
+  not a store and charges nothing. An INL relation is deliberately not materialized up front: each
+  physical-left row opens its bound and charges the rows admitted by that seek/gather. This keeps
+  the existing rule verbatim ("once per row pulled from a
   store, in the executor loop not the storage iterator" — so the Rust lazy-iterator vs Go/TS
   materialized-slice split stays neutralized) and keeps single-table cost identical (one table →
   its cardinality). When a table is **bounded** by a WHERE predicate on its own primary key
@@ -1047,16 +1050,20 @@ NULL-extended rows are ordinary surviving combined rows, so they incur WHERE `op
 unmatched left rows: materialization is 7, ON is 12, and 3 rows emit → **22** (the INNER form emits
 one row → **20**; the +2 is the preserved-left rows).
 
-**Deterministic in-memory hash JOIN.** For exactly two non-lateral inputs, an INNER or LEFT `ON`
-predicate with one or more same-resolved-type bare-column equalities across the inputs may build the
-physical inner input and probe the physical outer. Before P7 those roles were fixed to right/FROM
-order and left/FROM order respectively; P7 makes each orientation and an eligible INL separate
-costed candidates. The
-remaining `ON` conjuncts must be structurally non-trapping leaf equality/inequality predicates;
-expression keys, arithmetic/function predicates, RIGHT/FULL, and joins wider than two inputs retain
-nested loop. Keys admit the existing key-encodable scalars plus scalar-element arrays/ranges;
-composite and json/jsonb/jsonpath keys retain nested loop. Equality keys are selected in source
-conjunct order, never map order.
+**Deterministic in-memory hash JOIN.** For the established exactly-two-input path, a non-lateral
+INNER or LEFT `ON` predicate with one or more same-resolved-type bare-column equalities across the
+inputs may build the physical inner and probe the physical outer. P7 made both legal INNER
+orientations, INL, and nested loop separate costed candidates. P8 applies the same hash alternative
+at an INNER island step when a newly-ready authored `ON` tree supplies equality keys between the
+accumulated physical prefix and the appended relation. Every newly-ready tree remains an
+authoritative residual recheck in authored order.
+
+The complete newly-ready predicate set must pass the structurally non-trapping safe-conjunct gate;
+expression keys and arithmetic/function predicates therefore retain nested loop at that step.
+RIGHT/FULL and wider outer-join barrier steps also retain their fixed operator. Keys admit the
+existing key-encodable scalars plus scalar-element arrays/ranges; composite and
+json/jsonb/jsonpath keys retain nested loop. Equality keys are selected in authored predicate and
+source-conjunct order, never map order.
 
 The build table uses the canonical order-preserving key bytes for each component, framed in key-list
 order. SQL NULL never matches: every component is inspected and metered, but a tuple with any NULL is
@@ -1069,49 +1076,53 @@ nested loop: the new hash units represent key construction/lookup/collision veri
 comparisons against provably nonmatching buckets disappear. A guard at each component and bucket
 entry makes `max_cost` bound build/probe work deterministically.
 
-Buckets retain physical-build input order and probes consume physical-outer order, so emitted matches
-reproduce that orientation's nested-loop sequence exactly. The pre-P7 LEFT shape remains a barrier
-and therefore keeps its FROM-order roles and unmatched-left behavior. Hash collisions compare the
-full canonical bytes before admitting a candidate, and the executor
-never iterates the map to emit rows. WHERE, ORDER BY, LIMIT/OFFSET, projection, and `row_produced`
-remain downstream and unchanged. The table is deliberately in-memory; grace-hash spill is the
-remaining storage slice ([spill.md](spill.md) §7).
+Buckets retain physical-build input order and probes consume accumulated physical-left order, so
+emitted matches reproduce that step's nested-loop sequence exactly. A LEFT edge remains a P8 hard
+fence and keeps its authored unmatched-left behavior (the exactly-two-input legacy hash path keeps
+its authored build/probe roles). Hash collisions compare the full canonical bytes before admitting
+a candidate, and the executor never iterates the map to emit rows. WHERE, ORDER BY, LIMIT/OFFSET,
+projection, and `row_produced` remain downstream and unchanged. The table is deliberately in-memory;
+grace-hash spill is the remaining storage slice ([spill.md](spill.md) §7).
 
-**ORDER BY satisfied by the OUTER relation's PK scan order — the join top-N.** Because the join
-operator probes/drives the selected physical **outer** relation in primary-key order, a two-table INNER/CROSS join whose
-`ORDER BY` is a prefix of the **outer** relation's PK — and which has a `LIMIT` — needs **no sort**:
-the join output already arrives in `(outer PK, inner key)` order. The engine elides the sort and
-**STOPS the join probe loop once the `LIMIT`/`OFFSET` window is filled**, so the `ON`/WHERE
-`operator_eval`s and `row_produced` drop to the combinations *actually examined* — the cost-visible
-win. Without an index-nested-loop bound, both tables are still **materialized in full**
-(`storage_row_read` = the sum of cardinalities, the rule above; a constant WHERE bound on the inner
-still applies). An eligible hash join also builds its complete physical inner input before probing, then stops
-`hash_probe` and candidate ON work once the window fills. With a PK/B-tree/GIN/GiST **INL inner**, the outer
-is materialized once and the inner bound is opened per outer row; every started bound is gathered
-completely in its ordinary key order, while bounds for later outer rows are never opened after the
-window fills. This is the eager INL nested-loop order, so rows remain byte-identical to the blocking
-sort path. Gated by `query.order_by_join_scan` plus `query.order_by_join_inl` for the combination;
-engages only when:
-- exactly **two non-lateral base relations**, an **INNER or CROSS** join, and a **`LIMIT`**;
-- the `ORDER BY` is a **pure prefix of the outer PK** (forward/`ASC`, collation-matching) with **no
-  trailing key** — the outer PK is unique over the *outer table* but **not** over the join output (one
-  outer row fans out to many), so an extra key (`ORDER BY a.id, b.x`) is a real tie-break the outer
-  scan order does not satisfy, unlike the single-table "runs past the PK" case;
-- the outer carries **no non-PK bound** (a PK bound / no bound keeps it in PK order).
-- the optional inner INL bound emits storage-key order: PK, ordered B-tree, GIN, or GiST.
+**ORDER BY satisfied by the DRIVER relation's PK scan order — the join top-N.** P8's selected
+fence-free INNER/CROSS tree preserves its physical **driver** relation's primary-key order through
+every left-deep nested-loop, INL, or probe-left hash step. If `ORDER BY` is a prefix of that driver
+PK and the query has a `LIMIT`, no sort is needed. The initial N-way executor fully materializes and
+joins the selected left subtree, then **stops only the final join step** once the
+`LIMIT`/`OFFSET` window is filled. The two-table case is the smallest instance: its left subtree is
+just the driver.
 
-P7 estimates the stopped work with [estimator.md §8.2](estimator.md): from the estimated post-ON,
-post-WHERE fanout it computes how many outer runs are needed for `OFFSET + LIMIT`. Only candidate
-visits/ON evaluation, hash probes and bucket verification, and later INL seeks are reduced. Both
-ordinary base relations are still fully materialized and a hash build is still complete, matching
-the executor rather than assigning an optimistic private saving.
+Ordinary base inputs and every earlier join step therefore retain their complete work. An ordinary
+final inner is still materialized in full. A final hash step builds its complete physical inner,
+then may stop `hash_probe`, bucket verification, and candidate `ON` work. With a final
+PK/B-tree/GIN/GiST INL relation, the bound opens per materialized-left row; every started bound is
+gathered completely in storage-key order, while later bounds never open after the window fills.
+The selected order is byte-identical to the blocking-sort result under the gate below. The rule is
+gated by `query.order_by_join_scan` plus `query.order_by_join_inl` for the combination and engages
+only when:
+
+- the complete physical tree is a fence-free set of non-lateral base relations joined by
+  **INNER/CROSS** edges, with a **`LIMIT`**;
+- the `ORDER BY` is a **pure prefix of the driver PK** (forward/`ASC`, collation-matching) with **no
+  trailing key** — that PK is unique over the driver table but not over join output, so an extra key
+  (`ORDER BY a.id, b.x`) is a real tie-break the driver scan order does not satisfy;
+- the driver carries **no non-PK bound** (a PK bound / no bound keeps it in PK order); and
+- a final INL bound, if selected, emits storage-key order: PK, ordered B-tree, GIN, or GiST.
+
+P8 estimates the stopped final-step work with [estimator.md §8.2](estimator.md): from estimated
+post-ON/post-WHERE fanout it computes how many materialized-left rows are needed for
+`OFFSET + LIMIT`. Only final candidate visits/ON evaluation, hash probes and bucket verification,
+or final repeated INL work are reduced. The entire left subtree, every ordinary base scan, and a
+final hash build remain complete, matching the executor rather than assigning an optimistic private
+saving.
 
 `joins/order_by_outer_pk.test` pins the top-N (with the ON-eval drop), the OFFSET, the inner-PK-bound
 composition, the CROSS form, and the `ORDER BY a.id, b.id` contrast that keeps the full nested loop +
 sort. `joins/order_by_inl_topn.test` pins PK hit/miss/NULL probes, residual rejection, OFFSET,
-secondary-index fanout, LIMIT 0, EXPLAIN composition, and the blocking inner-key contrast. Narrowings
-(follow-ons): `DESC` (a reverse outer scan), more than two relations, an
-outer-table non-PK bound, `LEFT`/`RIGHT`/`FULL`, and `DISTINCT`.
+secondary-index fanout, LIMIT 0, EXPLAIN composition, and the blocking inner-key contrast.
+`query/cost_plan_join_p8.test` pins the N-way materialized-left estimate and physical result order.
+Narrowings (follow-ons): `DESC` (a reverse driver scan), per-level recursive streaming/discount,
+a driver non-PK bound, `LEFT`/`RIGHT`/`FULL`, and `DISTINCT`.
 
 ### FROM-less `SELECT` — the virtual row charges no scan units
 

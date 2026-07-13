@@ -2975,6 +2975,7 @@ export class Engine {
     const innerOrdinal = sp.phys.relationOrder[n - 1]!;
     const innerPerCall = this.estimateRelation(sp, innerOrdinal, ctx);
     const boundByOuter = sp.phys.relINLBounds[innerOrdinal] !== null;
+    const lateral = sp.rels[innerOrdinal]!.lateral;
     const fullPairs = saturatingEstimateMultiply(outer.root.rows, innerPerCall.root.rows);
     let fullLogicalRows = saturatingEstimateMultiply(
       outer.root.logicalRows,
@@ -2989,6 +2990,21 @@ export class Engine {
         fullRows = estimateSelectivity(selectivity, fullRows);
         fullLogicalRows = estimateSelectivity(selectivity, fullLogicalRows);
       }
+    }
+    const stepKind = step.onIndices.reduce<JoinKind>((kind, onIndex) => {
+      const candidate = sp.joins[onIndex]!.kind;
+      return candidate === "left" || candidate === "right" || candidate === "full"
+        ? candidate
+        : kind;
+    }, step.onIndices.length === 0 ? "cross" : "inner");
+    if (stepKind === "left" || stepKind === "full") {
+      if (fullRows < outer.root.rows) fullRows = outer.root.rows;
+      if (fullLogicalRows < outer.root.logicalRows) fullLogicalRows = outer.root.logicalRows;
+    }
+    if (stepKind === "right" || stepKind === "full") {
+      if (fullRows < innerPerCall.root.rows) fullRows = innerPerCall.root.rows;
+      if (fullLogicalRows < innerPerCall.root.logicalRows)
+        fullLogicalRows = innerPerCall.root.logicalRows;
     }
 
     let outerCalls = outer.root.rows;
@@ -3012,7 +3028,7 @@ export class Engine {
 
     let inner = innerPerCall;
     let visitedPairs = fullPairs;
-    if (boundByOuter) {
+    if (boundByOuter || lateral) {
       inner = {
         root: repeatPlanEstimate(inner.root, outerCalls),
         nodes: inner.nodes.map((node) => repeatPlanEstimate(node, outerCalls)),
@@ -3720,8 +3736,13 @@ export class Engine {
       const on = sp.joins[index]!.on;
       return total + (on === null ? 0 : conjunctCount(on));
     }, 0);
-    const kind = step.onIndices.length === 0 ? "cross" : "inner";
-    let detail = kind;
+    const kind = step.onIndices.reduce<JoinKind>((current, index) => {
+      const candidate = sp.joins[index]!.kind;
+      return candidate === "left" || candidate === "right" || candidate === "full"
+        ? candidate
+        : current;
+    }, step.onIndices.length === 0 ? "cross" : "inner");
+    let detail: string = kind;
     if (step.onIndices.length === 1) detail = `${kind}; on:conjuncts=${conjuncts}`;
     else if (step.onIndices.length > 1)
       detail = `${kind}; on:predicates=${step.onIndices.length},conjuncts=${conjuncts}`;
@@ -13956,13 +13977,24 @@ export class Engine {
       const inner = plan.phys.relationOrder[position + 1]!;
       const innerRows = materialized[inner]!;
       const innerINL = plan.phys.relINLBounds[inner] !== null;
+      const innerLateral = plan.rels[inner]!.lateral;
+      const stepKind = step.onIndices.reduce<JoinKind>((kind, onIndex) => {
+        const candidate = plan.joins[onIndex]!.kind;
+        return candidate === "left" || candidate === "right" || candidate === "full"
+          ? candidate
+          : kind;
+      }, step.onIndices.length === 0 ? "cross" : "inner");
+      const emitLeft = stepKind === "left" || stepKind === "full";
+      const emitRight = stepKind === "right" || stepKind === "full";
       const hashTable =
         step.hashJoin === null
           ? null
           : new HashJoinTable(step.hashJoin, plan.rels[inner]!.offset, 0, innerRows, meter);
       const next: Row[] = [];
+      const rightMatched = new Array<boolean>(innerRows.length).fill(false);
       for (const left of running) {
         let candidates = innerRows;
+        let candidateIndices: number[] | null = null;
         if (innerINL) {
           candidates = this.materializeRel(
             plan,
@@ -13973,12 +14005,23 @@ export class Engine {
             params,
             meter,
           );
+        } else if (innerLateral) {
+          candidates = this.materializeRel(
+            plan,
+            inner,
+            [...env.outer, left],
+            [],
+            env,
+            params,
+            meter,
+          );
         } else if (hashTable !== null) {
-          candidates = hashTable
-            .probe(step.hashJoin!, left, meter)
-            .map((index) => innerRows[index]!);
+          candidateIndices = hashTable.probe(step.hashJoin!, left, meter);
+          candidates = candidateIndices.map((index) => innerRows[index]!);
         }
-        for (const right of candidates) {
+        let leftMatched = false;
+        for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex++) {
+          const right = candidates[candidateIndex]!;
           const combined = left.slice();
           combined.splice(plan.rels[inner]!.offset, right.length, ...right);
           let keep = true;
@@ -13989,7 +14032,22 @@ export class Engine {
               break;
             }
           }
-          if (keep) next.push(combined);
+          if (keep) {
+            next.push(combined);
+            leftMatched = true;
+            if (!innerINL && !innerLateral) {
+              rightMatched[candidateIndices?.[candidateIndex] ?? candidateIndex] = true;
+            }
+          }
+        }
+        if (emitLeft && !leftMatched) next.push(left);
+      }
+      if (emitRight) {
+        for (let index = 0; index < innerRows.length; index++) {
+          if (rightMatched[index]) continue;
+          const combined = Array.from({ length: logicalJoinRowWidth(plan) }, () => nullValue());
+          combined.splice(plan.rels[inner]!.offset, innerRows[index]!.length, ...innerRows[index]!);
+          next.push(combined);
         }
       }
       running = next;

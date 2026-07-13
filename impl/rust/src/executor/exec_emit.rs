@@ -28,6 +28,20 @@ pub(crate) fn combine_physical_relation_rows(
     out
 }
 
+fn physical_step_kind(plan: &SelectPlan, step: &PhysicalJoinStep) -> JoinKind {
+    step.on_indices.iter().fold(
+        if step.on_indices.is_empty() {
+            JoinKind::Cross
+        } else {
+            JoinKind::Inner
+        },
+        |kind, on_index| match plan.joins[*on_index].kind {
+            JoinKind::Left | JoinKind::Right | JoinKind::Full => plan.joins[*on_index].kind,
+            _ => kind,
+        },
+    )
+}
+
 impl Engine {
     pub(crate) fn exec_costed_nway_join(
         &self,
@@ -48,7 +62,11 @@ impl Engine {
         for (position, step) in plan.phys.join_steps.iter().take(step_count).enumerate() {
             let inner = plan.phys.relation_order[position + 1];
             let inner_inl = plan.phys.rel_inl_bounds[inner].is_some();
+            let inner_lateral = plan.rels[inner].lateral;
             let inner_rows = &materialized[inner];
+            let step_kind = physical_step_kind(plan, step);
+            let emit_left = matches!(step_kind, JoinKind::Left | JoinKind::Full);
+            let emit_right = matches!(step_kind, JoinKind::Right | JoinKind::Full);
             let hash_table = step
                 .hash_join
                 .as_ref()
@@ -57,8 +75,11 @@ impl Engine {
                 })
                 .transpose()?;
             let mut next = Vec::new();
+            let mut right_matched = vec![false; inner_rows.len()];
             for left in &running {
                 let inl_rows;
+                let lateral_rows;
+                let mut lateral_outer_stack;
                 let hash_rows;
                 let candidates = if inner_inl {
                     inl_rows = self.materialize_rel(
@@ -72,6 +93,20 @@ impl Engine {
                         meter,
                     )?;
                     &inl_rows
+                } else if inner_lateral {
+                    lateral_outer_stack = outer_stack.to_vec();
+                    lateral_outer_stack.push(left);
+                    lateral_rows = self.materialize_rel(
+                        plan,
+                        inner,
+                        params,
+                        &lateral_outer_stack,
+                        &[],
+                        stmt_rng,
+                        env.ctes,
+                        meter,
+                    )?;
+                    &lateral_rows
                 } else if let Some(table) = &hash_table {
                     hash_rows = table
                         .probe(step.hash_join.as_ref().expect("hash step"), left, meter)?
@@ -82,7 +117,8 @@ impl Engine {
                 } else {
                     inner_rows
                 };
-                for right in candidates {
+                let mut left_matched = false;
+                for (candidate_index, right) in candidates.iter().enumerate() {
                     let mut combined = left.clone();
                     let offset = plan.rels[inner].offset;
                     combined[offset..offset + right.len()].clone_from_slice(right);
@@ -98,7 +134,25 @@ impl Engine {
                     }
                     if keep {
                         next.push(combined);
+                        left_matched = true;
+                        if emit_right {
+                            right_matched[candidate_index] = true;
+                        }
                     }
+                }
+                if emit_left && !left_matched {
+                    next.push(left.clone());
+                }
+            }
+            if emit_right {
+                for (index, right) in inner_rows.iter().enumerate() {
+                    if right_matched[index] {
+                        continue;
+                    }
+                    let mut combined = vec![Value::Null; logical_join_row_width(plan)];
+                    let offset = plan.rels[inner].offset;
+                    combined[offset..offset + right.len()].clone_from_slice(right);
+                    next.push(combined);
                 }
             }
             running = next;

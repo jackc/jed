@@ -375,10 +375,18 @@ test('the explain page shows the deterministic hash-join operator', async ({ pag
   await expect(panel.getByTestId('result-rows')).toContainText('inner; keys=1; on:conjuncts=1');
 });
 
+test('the explain page shows a bounded N-way physical join tree', async ({ page }) => {
+  await page.goto('/docs/sql/explain/');
+  const panel = page.getByTestId('live-sql').nth(7);
+  await expect(panel.getByTestId('result-rows')).toContainText('Scan city');
+  await expect(panel.getByTestId('result-rows')).toContainText('Scan trip');
+  await expect(panel.getByTestId('result-rows')).toContainText('Scan region');
+});
+
 test('the explain page runs EXPLAIN ANALYZE with a deterministic cost', async ({ page }) => {
   await page.goto('/docs/sql/explain/');
-  // Ninth panel = EXPLAIN ANALYZE: the Analyze root reports the real accrued cost + row count.
-  const panel = page.getByTestId('live-sql').nth(8);
+  // Tenth panel = EXPLAIN ANALYZE: the Analyze root reports the real accrued cost + row count.
+  const panel = page.getByTestId('live-sql').nth(9);
   await expect(panel.getByTestId('result-rows')).toContainText('Analyze');
   await expect(panel.getByTestId('result-rows')).toContainText('cost=');
 });

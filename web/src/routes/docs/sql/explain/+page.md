@@ -22,7 +22,10 @@ INSERT INTO city VALUES
 CREATE TABLE trip (id i32 PRIMARY KEY, city_id i32 NOT NULL);
 INSERT INTO trip VALUES
   (1, 3), (2, 1), (3, 3), (4, 4), (5, 5),
-  (6, 6), (7, 7), (8, 8), (9, 9), (10, 10);`;
+  (6, 6), (7, 7), (8, 8), (9, 9), (10, 10);
+CREATE TABLE region (id i32 PRIMARY KEY, name text NOT NULL);
+INSERT INTO region VALUES
+  (1, 'Kansai'), (2, 'France'), (3, 'Italy'), (4, 'Germany'), (5, 'Peru');`;
 
 	const fullScan = `EXPLAIN SELECT name FROM city ORDER BY name LIMIT 2;`;
 	const pkBound = `EXPLAIN SELECT name FROM city WHERE id = 3;`;
@@ -33,6 +36,10 @@ INSERT INTO trip VALUES
 FROM city c JOIN trip t ON c.id = t.city_id;`;
 	const hashJoin = `EXPLAIN SELECT c.name, t.id
 FROM city c JOIN trip t ON c.zone = t.city_id;`;
+	const nwayJoin = `EXPLAIN SELECT c.name, t.id, r.name
+FROM city c
+JOIN trip t ON c.id = t.city_id
+JOIN region r ON r.id = c.region;`;
 	const aggregate = `EXPLAIN SELECT region, count(*)
 FROM city GROUP BY region;`;
 	const analyze = `EXPLAIN ANALYZE SELECT name FROM city WHERE id = 3;`;
@@ -65,10 +72,13 @@ of full, primary-key, ordered B-tree, GIN, GiST, and interval-set paths, includi
 the residual/projection, and LIMIT/OFFSET early-out. An `ORDER BY ... LIMIT` may also admit an
 order-only B-tree walk. Exact ties use a fixed access-kind order and then lowercased index name.
 Estimates are planner heuristics, not a resource limit or a promise to equal execution; runtime cost
-ceilings always use the actual meter. For eligible two-table `INNER`/`CROSS` joins, jed also compares
-both physical relation orders and legal nested-loop, index-nested-loop, and hash alternatives;
-EXPLAIN's child order is the chosen execution order, not necessarily SQL source order. Outer joins,
-dependency-bearing inputs, wider joins, and mutation target scans retain their staged policies.
+ceilings always use the actual meter. For base-table `INNER`/`CROSS` joins, jed jointly compares
+physical relation order, access paths, and legal nested-loop, index-nested-loop, and hash alternatives.
+EXPLAIN's child order is the chosen execution order, not necessarily SQL source order. Search is
+exhaustive and left-deep through eight movable relations, then uses deterministic cheapest-next
+construction. Outer joins and dependency-bearing inputs are hard fences: nothing crosses them, but
+base-table islands on either side may still be searched. Mutation target scans retain their staged
+policy.
 
 ## A blocking sort and bounded top-k
 
@@ -136,15 +146,26 @@ still uses the resolved source columns normally.
 
 ## A hash join
 
-For an eligible two-table `INNER` equality join, jed compares an in-memory `Hash Join` in both
-physical orientations with its nested-loop and INL alternatives. The selected physical inner is
-the hash build and the outer is the probe. Bare same-type `ON` column equalities become hash keys;
+At an eligible `INNER` equality step, jed compares an in-memory `Hash Join` in each legal physical
+orientation with its nested-loop and INL alternatives. The selected physical inner is the hash
+build and the accumulated left prefix is the probe. Bare same-type `ON` column equalities become hash keys;
 multiple keys follow source order. NULL keys never match, and the complete `ON` predicate is still
 checked on candidates. `keys=N` makes the choice visible. `LEFT` joins retain their authored order,
 and a `CROSS JOIN ... WHERE a = b` is not rewritten into hash form. The build table is currently
 in-memory; grace-hash spill is a later storage slice.
 
 <LiveSql seed={seed} query={hashJoin} rows={8} />
+
+## Bounded N-way join ordering
+
+For three or more base relations, each left-deep step carries its selected access method and join
+algorithm. An index-nested-loop dependency becomes legal only after its referenced sibling is in the
+physical left prefix. Each authored `ON` expression stays intact and runs at the earliest step where
+its original right-side owner and every referenced relation are present. With an ordered LIMIT, jed
+materializes the selected left subtree and streams only the final join step, so its estimates never
+discount work the executor still performs.
+
+<LiveSql seed={seed} query={nwayJoin} rows={11} />
 
 ## Aggregation
 

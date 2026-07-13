@@ -271,6 +271,105 @@ setup_sql = [
   "INSERT INTO p7_reverse_ref_driver SELECT g, g * 199 FROM generate_series(1, 250) AS g"
 ]
 
+# P8 three-relation DP: the large indexed relation is authored first, but the complete N-way
+# winner can drive from the small relation and retain legal PK/secondary join dependencies.
+[[bench]]
+name = "join_nway_inl_3"
+description = "P8 three-way join search: drive 100 rows into indexed 20k-row and 20-row relations"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT count(*) FROM p8_j3_inner i JOIN p8_j3_driver d ON i.id = d.k JOIN p8_j3_tag t ON t.id = d.tag"
+warmup = 2
+iterations = 20
+seed = 4265
+expect_rows_per_iter = 1
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS p8_j3_tag",
+  "DROP TABLE IF EXISTS p8_j3_driver",
+  "DROP TABLE IF EXISTS p8_j3_inner",
+  "CREATE TABLE p8_j3_inner (id bigint PRIMARY KEY, v bigint)",
+  "CREATE TABLE p8_j3_driver (id bigint PRIMARY KEY, k bigint, tag bigint)",
+  "CREATE TABLE p8_j3_tag (id bigint PRIMARY KEY, v bigint)",
+  "INSERT INTO p8_j3_inner SELECT g, g * 2 FROM generate_series(1, 20000) AS g",
+  "INSERT INTO p8_j3_driver SELECT g, g * 199, (g % 20) + 1 FROM generate_series(1, 100) AS g",
+  "INSERT INTO p8_j3_tag SELECT g, g * 3 FROM generate_series(1, 20) AS g"
+]
+
+# Five relations remain inside exhaustive DP. Source order starts with four 20k-row relations;
+# the 100-row driver authored last supplies a legal reverse chain of PK INL dependencies.
+[[bench]]
+name = "join_nway_inl_5"
+description = "P8 five-way DP: reverse a source-authored 20k-row PK chain from a 100-row driver"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT count(*) FROM p8_j5_r1 a JOIN p8_j5_r2 b ON a.id = b.id JOIN p8_j5_r3 c ON b.id = c.id JOIN p8_j5_r4 d ON c.id = d.id JOIN p8_j5_driver e ON d.id = e.k"
+warmup = 1
+iterations = 10
+seed = 4266
+expect_rows_per_iter = 1
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS p8_j5_driver",
+  "DROP TABLE IF EXISTS p8_j5_r4",
+  "DROP TABLE IF EXISTS p8_j5_r3",
+  "DROP TABLE IF EXISTS p8_j5_r2",
+  "DROP TABLE IF EXISTS p8_j5_r1",
+  "CREATE TABLE p8_j5_r1 (id bigint PRIMARY KEY)",
+  "CREATE TABLE p8_j5_r2 (id bigint PRIMARY KEY)",
+  "CREATE TABLE p8_j5_r3 (id bigint PRIMARY KEY)",
+  "CREATE TABLE p8_j5_r4 (id bigint PRIMARY KEY)",
+  "CREATE TABLE p8_j5_driver (id bigint PRIMARY KEY, k bigint)",
+  "INSERT INTO p8_j5_r1 SELECT g FROM generate_series(1, 20000) AS g",
+  "INSERT INTO p8_j5_r2 SELECT g FROM generate_series(1, 20000) AS g",
+  "INSERT INTO p8_j5_r3 SELECT g FROM generate_series(1, 20000) AS g",
+  "INSERT INTO p8_j5_r4 SELECT g FROM generate_series(1, 20000) AS g",
+  "INSERT INTO p8_j5_driver SELECT g, g * 199 FROM generate_series(1, 100) AS g"
+]
+
+# Nine movable relations are the first size above join_dp_limit=8, so this permanently exercises
+# deterministic cheapest-next construction rather than the subset-DP implementation.
+[[bench]]
+name = "join_nway_greedy_9"
+description = "P8 cap boundary: deterministic greedy search over a nine-relation reverse PK chain"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT count(*) FROM p8_j9_r1 a JOIN p8_j9_r2 b ON a.id = b.id JOIN p8_j9_r3 c ON b.id = c.id JOIN p8_j9_r4 d ON c.id = d.id JOIN p8_j9_r5 e ON d.id = e.id JOIN p8_j9_r6 f ON e.id = f.id JOIN p8_j9_r7 h ON f.id = h.id JOIN p8_j9_r8 i ON h.id = i.id JOIN p8_j9_driver j ON i.id = j.k"
+warmup = 1
+iterations = 10
+seed = 4267
+expect_rows_per_iter = 1
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS p8_j9_driver",
+  "DROP TABLE IF EXISTS p8_j9_r8",
+  "DROP TABLE IF EXISTS p8_j9_r7",
+  "DROP TABLE IF EXISTS p8_j9_r6",
+  "DROP TABLE IF EXISTS p8_j9_r5",
+  "DROP TABLE IF EXISTS p8_j9_r4",
+  "DROP TABLE IF EXISTS p8_j9_r3",
+  "DROP TABLE IF EXISTS p8_j9_r2",
+  "DROP TABLE IF EXISTS p8_j9_r1",
+  "CREATE TABLE p8_j9_r1 (id bigint PRIMARY KEY)",
+  "CREATE TABLE p8_j9_r2 (id bigint PRIMARY KEY)",
+  "CREATE TABLE p8_j9_r3 (id bigint PRIMARY KEY)",
+  "CREATE TABLE p8_j9_r4 (id bigint PRIMARY KEY)",
+  "CREATE TABLE p8_j9_r5 (id bigint PRIMARY KEY)",
+  "CREATE TABLE p8_j9_r6 (id bigint PRIMARY KEY)",
+  "CREATE TABLE p8_j9_r7 (id bigint PRIMARY KEY)",
+  "CREATE TABLE p8_j9_r8 (id bigint PRIMARY KEY)",
+  "CREATE TABLE p8_j9_driver (id bigint PRIMARY KEY, k bigint)",
+  "INSERT INTO p8_j9_r1 SELECT g FROM generate_series(1, 1000) AS g",
+  "INSERT INTO p8_j9_r2 SELECT g FROM generate_series(1, 1000) AS g",
+  "INSERT INTO p8_j9_r3 SELECT g FROM generate_series(1, 1000) AS g",
+  "INSERT INTO p8_j9_r4 SELECT g FROM generate_series(1, 1000) AS g",
+  "INSERT INTO p8_j9_r5 SELECT g FROM generate_series(1, 1000) AS g",
+  "INSERT INTO p8_j9_r6 SELECT g FROM generate_series(1, 1000) AS g",
+  "INSERT INTO p8_j9_r7 SELECT g FROM generate_series(1, 1000) AS g",
+  "INSERT INTO p8_j9_r8 SELECT g FROM generate_series(1, 1000) AS g",
+  "INSERT INTO p8_j9_driver SELECT g, g * 47 FROM generate_series(1, 20) AS g"
+]
+
 [[bench]]
 name = "secondary_lookup"
 description = "Secondary-index equality lookup on 1M rows (~10 rows per customer)"
