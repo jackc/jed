@@ -10,6 +10,8 @@ require "toml-rb"
 require "set"
 
 ESTIMATOR_PATH = File.join(__dir__, "estimator.toml")
+VECTORS_PATH = File.join(__dir__, "estimator_vectors.toml")
+SCHEDULE_PATH = File.join(__dir__, "schedule.toml")
 
 EXPECTED_SELECTIVITY = {
   "equality" => [1, 200],
@@ -24,6 +26,15 @@ EXPECTED_SELECTIVITY = {
 
 EXPECTED_ACCESS_ORDER = %w[pk btree gist gin pk_interval index_interval full].freeze
 EXPECTED_JOIN_ORDER = %w[index_nested_loop hash nested_loop].freeze
+EXPECTED_ACCESS_METHOD = {
+  "gist_equal" => "equality",
+  "gist_range" => "matching",
+  "gin_contains" => "matching",
+  "gin_overlaps" => "matching",
+  "gin_member" => "matching",
+  "gin_equal" => "matching",
+  "unsupported" => "opaque",
+}.freeze
 
 def fail!(message)
   warn "FAIL: #{message}"
@@ -50,6 +61,7 @@ def main
   expect_equal(data, "default_variable_key_bytes", 1)
 
   entries = data["selectivity"] || []
+  selectivity_count = entries.length
   ids = entries.map { |entry| entry["id"] }
   duplicates = ids.tally.select { |_, count| count > 1 }.keys
   fail!("estimator.toml: duplicate selectivity ids: #{duplicates.join(', ')}") unless duplicates.empty?
@@ -87,7 +99,73 @@ def main
   fail!("tie_break.access_path must contain unique values") unless tie["access_path"].uniq == tie["access_path"]
   fail!("tie_break.join_algorithm must contain unique values") unless tie["join_algorithm"].uniq == tie["join_algorithm"]
 
-  puts "OK: #{entries.length} estimator selectivities + total tie orders coherent"
+  access_method = data["access_method"] || {}
+  fail!("estimator.toml: access_method classification drift") unless access_method == EXPECTED_ACCESS_METHOD
+
+  vectors = TomlRB.load_file(VECTORS_PATH)
+  expect_equal(vectors, "schema_version", 1)
+  schedule = TomlRB.load_file(SCHEDULE_PATH).fetch("unit")
+  weights = schedule.to_h { |unit| [unit.fetch("id"), unit.fetch("weight")] }
+  access_rank = EXPECTED_ACCESS_ORDER.each_with_index.to_h
+
+  ids = []
+  %w[arithmetic predicate candidate].each do |section|
+    entries = vectors[section] || []
+    entries.each do |entry|
+      id = entry["id"]
+      fail!("estimator_vectors.toml: #{section} entry missing id") unless id.is_a?(String) && !id.empty?
+      ids << "#{section}:#{id}"
+    end
+  end
+  dup_ids = ids.tally.select { |_, count| count > 1 }.keys
+  fail!("estimator_vectors.toml: duplicate ids: #{dup_ids.join(', ')}") unless dup_ids.empty?
+
+  (vectors["arithmetic"] || []).each do |entry|
+    fail!("arithmetic #{entry['id']}: unknown op") unless %w[scale_ceil sat_add sat_mul].include?(entry["op"])
+    %w[a b expected].each do |field|
+      fail!("arithmetic #{entry['id']}: #{field} must be a nonnegative integer") unless entry[field].is_a?(Integer) && entry[field] >= 0
+    end
+    if entry["op"] == "scale_ceil"
+      fail!("arithmetic #{entry['id']}: c must be positive") unless entry["c"].is_a?(Integer) && entry["c"].positive?
+    end
+  end
+
+  token_ids = EXPECTED_SELECTIVITY.keys + %w[all zero unique and or not]
+  (vectors["predicate"] || []).each do |entry|
+    tokens = entry["tokens"]
+    fail!("predicate #{entry['id']}: tokens must be a nonempty string array") unless tokens.is_a?(Array) && !tokens.empty? && tokens.all?(String)
+    unknown = tokens - token_ids
+    fail!("predicate #{entry['id']}: unknown tokens #{unknown.join(', ')}") unless unknown.empty?
+    %w[n expected].each do |field|
+      fail!("predicate #{entry['id']}: #{field} must be a nonnegative integer") unless entry[field].is_a?(Integer) && entry[field] >= 0
+    end
+  end
+
+  (vectors["candidate"] || []).each do |entry|
+    id = entry.fetch("id")
+    kind = entry["kind"]
+    fail!("candidate #{id}: unknown kind #{kind.inspect}") unless access_rank.key?(kind)
+    name = entry["index_name"]
+    fail!("candidate #{id}: index_name must be a string") unless name.is_a?(String)
+    expected_tie = "#{access_rank.fetch(kind)}:#{name}"
+    fail!("candidate #{id}: tie_key must be #{expected_tie.inspect}") unless entry["tie_key"] == expected_tie
+    %w[scan_rows output_rows access_pages table_height filter_nodes access_work est_rows est_cost].each do |field|
+      fail!("candidate #{id}: #{field} must be a nonnegative integer") unless entry[field].is_a?(Integer) && entry[field] >= 0
+    end
+    fail!("candidate #{id}: produces_rows must be boolean") unless [true, false].include?(entry["produces_rows"])
+    fail!("candidate #{id}: est_rows must equal output_rows") unless entry["est_rows"] == entry["output_rows"]
+    units = entry["units"] || {}
+    unknown_units = units.keys - weights.keys
+    fail!("candidate #{id}: unknown units #{unknown_units.join(', ')}") unless unknown_units.empty?
+    unless units.values.all? { |count| count.is_a?(Integer) && count >= 0 }
+      fail!("candidate #{id}: unit counts must be nonnegative integers")
+    end
+    cost = weights.sum { |unit, weight| units.fetch(unit, 0) * weight }
+    cost = [cost, data.fetch("max_estimate")].min
+    fail!("candidate #{id}: est_cost expected #{cost}, got #{entry['est_cost']}") unless entry["est_cost"] == cost
+  end
+
+  puts "OK: #{selectivity_count} estimator selectivities + #{ids.length} P4 vectors + total tie orders coherent"
 end
 
 main

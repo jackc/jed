@@ -964,6 +964,10 @@ of executing a query** and **abort when a caller-supplied ceiling is exceeded**.
   P3 now inventories every legal base-relation access path in the canonical kind/name order, with
   explicit scan-order and residual-filter facts, then applies a separate legacy selector so plans,
   EXPLAIN, and actual cost remain unchanged until cost-based selection lands.
+  P4 now computes shadow `rows`, per-runtime-unit counts, weighted `cost`, and canonical tie keys for
+  every base candidate from exact row counts and resident tree facts. Logical output selectivity is
+  applied once against the base relation; GIN/GiST residual rechecks add work without reducing rows a
+  second time. The annotations remain unobservable and the legacy selector is still authoritative.
 - **Ceiling + abort.** A caller may set a **maximum cost**; the instant accrued cost reaches
   it, execution **aborts deterministically** with a defined error code (registered in
   `spec/errors/`). The abort point is itself deterministic (same query + db + ceiling → same

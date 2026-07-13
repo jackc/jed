@@ -192,29 +192,38 @@ pin complete mixed-method inventory and both legacy exceptions. No output or cos
 
 **Goal:** estimate every base access candidate without using estimates to select it.
 
-- [ ] Author shared estimator constants/facts as language-neutral data; generate only mechanical
+- [x] Author shared estimator constants/facts as language-neutral data; generate only mechanical
   constants, never planner control flow.
-- [ ] Author `spec/cost/estimator_vectors.toml` with inputs, per-unit counts, `est_rows`, weighted
+- [x] Author `spec/cost/estimator_vectors.toml` with inputs, per-unit counts, `est_rows`, weighted
   `est_cost`, and expected tie keys.
-- [ ] Implement identical arithmetic helpers in all three cores.
-- [ ] Estimate full scans from row count and admitted structural facts.
-- [ ] Estimate PK equality/prefix/range candidates.
-- [ ] Estimate ordered B-tree equality-prefix and trailing-range candidates.
-- [ ] Estimate GIN, GiST, and interval-set candidates with deterministic fallback rules when row
+- [x] Implement identical arithmetic helpers in all three cores.
+- [x] Estimate full scans from row count and admitted structural facts.
+- [x] Estimate PK equality/prefix/range candidates.
+- [x] Estimate ordered B-tree equality-prefix and trailing-range candidates.
+- [x] Estimate GIN, GiST, and interval-set candidates with deterministic fallback rules when row
   counts are the only available statistics.
-- [ ] Specify selectivity for equality, inequality/range, `IS NULL`, `IN`, `BETWEEN`, AND, OR, and
+- [x] Specify selectivity for equality, inequality/range, `IS NULL`, `IN`, `BETWEEN`, AND, OR, and
   unsupported/opaque predicates.
-- [ ] Estimate residual-filter rows separately from access-path candidate rows.
-- [ ] Estimate the runtime units affected by the access path, including `page_read`,
+- [x] Estimate residual-filter rows separately from access-path candidate rows.
+- [x] Estimate the runtime units affected by the access path, including `page_read`,
   `storage_row_read`, touched-column decompression, access-method work, filter `operator_eval`, and
   produced rows where applicable.
-- [ ] Keep the legacy selected candidate authoritative; store or test shadow estimates only.
-- [ ] Cross-check estimates against actual cost in exact/simple cases, while documenting that an
+- [x] Keep the legacy selected candidate authoritative; store or test shadow estimates only.
+- [x] Cross-check estimates against actual cost in exact/simple cases, while documenting that an
   estimate is not generally required to equal runtime cost.
-- [ ] Run the shared estimator vectors in Rust, Go, and TypeScript.
+- [x] Run the shared estimator vectors in Rust, Go, and TypeScript.
 
 **Exit gate:** all cores compute byte-identical estimates for the complete base-candidate fixture
 matrix, and no user-visible plan or cost has changed.
+
+**Status:** complete on 2026-07-13. Shared generated facts and 23 canonical arithmetic,
+predicate, and all-access-method vectors feed hand-written estimators in Rust, Go, and TypeScript.
+Every base-relation inventory is annotated once with exact row count plus resident node-count/height
+facts; structural NULL/conflict/range proofs yield zero, and simple full scans cross-check exactly
+against actual metered cost. The accepted P4 checkpoint estimates logical output once from the full
+WHERE against base `N`; lossy GIN/GiST residual rechecks add `operator_eval` work but do not apply
+selectivity a second time. The legacy selector remains authoritative, so plans, EXPLAIN, results,
+and actual cost are unchanged. `bundle exec rake ci` passes.
 
 ## P5 — Whole-plan estimation and EXPLAIN columns
 

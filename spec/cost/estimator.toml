@@ -76,6 +76,18 @@ id = "opaque"
 numerator = 1
 denominator = 3
 
+# Initial P4 access-method classification. These describe candidate SCAN rows only; logical output
+# rows always come from the complete WHERE over the base relation (estimator.md §7), so a lossy
+# recheck never applies the same default a second time without a false-positive statistic.
+[access_method]
+gist_equal = "equality"
+gist_range = "matching"
+gin_contains = "matching"
+gin_overlaps = "matching"
+gin_member = "matching"
+gin_equal = "matching"
+unsupported = "opaque"
+
 # Equal estimated cost falls back to today's structural preferences. Names compare after
 # lowercasing by raw UTF-8 bytes; relation sequences compare by original FROM ordinal.
 

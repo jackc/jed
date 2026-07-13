@@ -414,6 +414,21 @@ export class PMap {
     return count(this.root);
   }
 
+  // Root-to-leaf node count (0 empty, 1 root leaf). An on-disk child is always a leaf, so the
+  // resident interior skeleton contains the complete height and no page must be faulted.
+  height(): number {
+    const walk = (n: PNode | null): number => {
+      if (n === null) return 0;
+      let best = 0;
+      for (const child of n.children) {
+        const childHeight = child.node === null ? 1 : walk(child.node);
+        if (childHeight > best) best = childHeight;
+      }
+      return 1 + best;
+    };
+    return walk(this.root);
+  }
+
   // residentRecordBytes is the total on-disk record bytes stored in this tree — the sum of every
   // leaf entry's weight (records live only in leaves, v24). The deterministic, cross-core-identical
   // measure of a temp table's storage footprint (spec/design/temp-tables.md §7; weight is the

@@ -742,6 +742,26 @@ impl PMap {
         self.root.as_deref().map(count).unwrap_or(0)
     }
 
+    /// Root-to-leaf node count (`0` empty, `1` root leaf). Interior skeletons are resident and an
+    /// `OnDisk` child is always a leaf, so this never faults a page.
+    pub(crate) fn height(&self) -> usize {
+        fn height(node: &Node) -> usize {
+            if node.children.is_empty() {
+                return 1;
+            }
+            1 + node
+                .children
+                .iter()
+                .map(|child| match child {
+                    Child::Resident(node) => height(node),
+                    Child::OnDisk(_) => 1,
+                })
+                .max()
+                .unwrap_or(0)
+        }
+        self.root.as_deref().map(height).unwrap_or(0)
+    }
+
     /// Total on-disk record bytes stored in this tree — the sum of every leaf entry's `weight`
     /// (records live only in leaves, v24). The deterministic, cross-core-identical measure of a
     /// temp table's storage footprint (spec/design/temp-tables.md §7; `weight` is

@@ -1555,6 +1555,9 @@ type physicalPlan struct {
 	// index-nested-loop case (a follow-on). The residual filter stays the WHOLE `filter`, re-applied
 	// after the join — the bound only narrows which rows are scanned.
 	relBounds []*scanBound
+	// relEstimates is P4's shadow-only estimate inventory. It is observational: the legacy selector
+	// remains authoritative until P7, and execution never reads this field.
+	relEstimates [][]candidateEstimate
 	// relINLBounds is the INDEX-NESTED-LOOP scan bounds, one per relation (cost.md §3 "JOIN").
 	// Non-nil for a join inner relation whose primary key / indexed column is compared to a SIBLING
 	// column of an earlier relation (`a JOIN b ON b.pk = a.x`) — a per-outer-row bound resolved from

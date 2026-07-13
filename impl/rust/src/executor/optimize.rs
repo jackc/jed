@@ -106,20 +106,34 @@ impl Engine {
     /// anyway, but gate it explicitly). A CTE relation needs no skip — `detect_scan_bound`
     /// returns None for it.
     fn rule_scan_bounds(&self, plan: &mut SelectPlan, scope: &Scope<'_>) {
-        plan.phys.rel_bounds = scope
-            .rels
-            .iter()
-            .enumerate()
-            .map(
-                |(i, rel)| match (&plan.filter, &plan.rels[i].srf, &plan.rels[i].derived) {
-                    // A scan bound applies only to a base table — a set-returning function or a
-                    // derived table is a computed source with no store to seek (functions.md §10,
-                    // §42).
-                    (Some(f), None, None) => detect_scan_bound(f, rel, scope.catalog),
-                    _ => None,
-                },
-            )
-            .collect();
+        plan.phys.rel_bounds = Vec::with_capacity(scope.rels.len());
+        plan.phys.rel_estimates = Vec::with_capacity(scope.rels.len());
+        for (i, rel) in scope.rels.iter().enumerate() {
+            if plan.rels[i].srf.is_some()
+                || plan.rels[i].derived.is_some()
+                || plan.rels[i].cte.is_some()
+            {
+                plan.phys.rel_bounds.push(None);
+                plan.phys.rel_estimates.push(Vec::new());
+                continue;
+            }
+            let candidates = inventory_scan_candidates(plan.filter.as_ref(), rel, scope.catalog);
+            plan.phys.rel_estimates.push(estimate_scan_candidates(
+                &candidates,
+                rel,
+                scope.catalog,
+                plan.rels.len() == 1
+                    && !plan.is_agg
+                    && !plan.distinct
+                    && plan.limit.is_none()
+                    && plan.offset.is_none()
+                    && !plan.has_window,
+            ));
+            plan.phys.rel_bounds.push(select_legacy_scan_candidate(
+                candidates,
+                SELECT_SCAN_BOUND_POLICY,
+            ));
+        }
     }
 
     /// Index-nested-loop pushdown (cost.md §3 "JOIN"): a join inner relation whose primary key /

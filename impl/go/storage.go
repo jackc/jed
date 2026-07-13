@@ -173,6 +173,7 @@ func (s *tableStore) IterInKeyOrder() ([]storedRow, error) {
 // NodeCount is the number of B-tree nodes (pages) in this store — the page_read count a full
 // scan charges (spec/design/cost.md §3 "page_read"). 0 for an empty table.
 func (s *tableStore) NodeCount() int { return s.rows.nodeCount() }
+func (s *tableStore) Height() int    { return s.rows.height() }
 
 // RangeRows returns the rows whose primary key lies within the bound, in key order — a bounded
 // B-tree scan that faults only the leaves the bound spans (spec/design/cost.md §3 "bounded scan").

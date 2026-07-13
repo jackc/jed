@@ -229,6 +229,10 @@ impl TableStore {
         self.rows.node_count()
     }
 
+    pub(crate) fn height(&self) -> usize {
+        self.rows.height()
+    }
+
     /// All `(encoded key, row)` pairs in key order, as **owned** pairs (spec/design/pager.md §4,
     /// [`PMap::iter`]). Used by the executor's UPDATE/DELETE scan and the on-disk free-list rowid
     /// reconstruction (spec/fileformat/format.md). Eager; bounded resident leaves as `iter_in_key_order`.

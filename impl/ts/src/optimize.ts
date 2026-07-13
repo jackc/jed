@@ -13,11 +13,14 @@ import { pkIndices } from "./catalog.ts";
 import type { Engine, RExpr, ScopeRel, SelectPlan } from "./executor.ts";
 import {
   detectINLBound,
-  detectScanBound,
+  estimateScanCandidates,
   fkTypesEqual,
+  inventoryScanCandidates,
   needsEagerScan,
   orderSatisfiedByIndex,
   orderSatisfiedByPK,
+  SELECT_SCAN_BOUND_POLICY,
+  selectLegacyScanCandidate,
 } from "./executor.ts";
 import type { Snapshot } from "./snapshot.ts";
 import type { ScalarType, Type } from "./types.ts";
@@ -146,15 +149,29 @@ function hashJoinKeyableScalar(type: ScalarType): boolean {
 // (functions.md §10), so skip detection for it. A CTE reference is likewise a computed/buffered
 // source with no store PK (cte.md §5), so skip it too.
 function ruleScanBounds(plan: SelectPlan, rels: ScopeRel[], snap: Snapshot, eng: Engine): void {
-  const filter = plan.filter;
-  plan.phys.relBounds = rels.map((rel, i) =>
-    filter === null ||
-    plan.rels[i]!.srf !== undefined ||
-    plan.rels[i]!.cte !== undefined ||
-    plan.rels[i]!.derived !== undefined
-      ? null
-      : detectScanBound(filter, rel, snap, eng),
-  );
+  plan.phys.relEstimates = rels.map(() => []);
+  plan.phys.relBounds = rels.map((rel, i) => {
+    if (
+      plan.rels[i]!.srf !== undefined ||
+      plan.rels[i]!.cte !== undefined ||
+      plan.rels[i]!.derived !== undefined
+    ) {
+      return null;
+    }
+    const candidates = inventoryScanCandidates(plan.filter, rel, snap, eng);
+    plan.phys.relEstimates[i] = estimateScanCandidates(
+      candidates,
+      rel,
+      eng,
+      rels.length === 1 &&
+        !plan.isAgg &&
+        !plan.distinct &&
+        plan.limit === null &&
+        plan.offset === null &&
+        !plan.hasWindow,
+    );
+    return selectLegacyScanCandidate(candidates, SELECT_SCAN_BOUND_POLICY);
+  });
 }
 
 // ruleIndexNestedLoop — index-nested-loop pushdown (cost.md §3 "JOIN"): a join inner relation

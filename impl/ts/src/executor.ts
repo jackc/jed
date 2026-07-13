@@ -97,6 +97,33 @@ import {
   sortKey as collationSortKey,
 } from "./collation.ts";
 import { COSTS } from "./costs.ts";
+import {
+  andSelectivity,
+  estimateCandidate,
+  estimateSelectivity,
+  fractionSelectivity,
+  notSelectivity,
+  orSelectivity,
+  selectivityClass,
+  saturatingEstimateAdd,
+  type CandidateEstimate,
+  type Selectivity,
+} from "./estimator.ts";
+import {
+  SELECTIVITY_BOOLEAN,
+  SELECTIVITY_EQUALITY,
+  SELECTIVITY_INEQUALITY,
+  SELECTIVITY_MATCH,
+  SELECTIVITY_NULL_TEST,
+  SELECTIVITY_PAIRED_RANGE,
+  ACCESS_GIN_CONTAINS,
+  ACCESS_GIN_EQUAL,
+  ACCESS_GIN_MEMBER,
+  ACCESS_GIN_OVERLAPS,
+  ACCESS_GIST_EQUAL,
+  ACCESS_GIST_RANGE,
+  ACCESS_UNSUPPORTED,
+} from "./estimator_constants.ts";
 import { Cursor, type RowSource } from "./cursor.ts";
 // Type-only (erased) — no runtime cycle: the executor↔api value edge stays one-directional.
 import type { RunResult } from "./ergonomic.ts";
@@ -1448,6 +1475,12 @@ export class Engine {
     return this.snapForScope(scope)!.store(name);
   }
 
+  // Planner-only structural estimator inputs. These wrappers keep the scope-aware lookup funnels
+  // private while allowing optimize.ts to ask this Engine to estimate its own candidate inventory.
+  estimatorStore(scope: string | undefined, name: string): TableStore {
+    return this.lkpStoreScoped(scope, name);
+  }
+
   // writeStoreScoped resolves a table's WRITE store honoring an explicit database qualifier, marking the
   // right domain dirty (main / temp / the attachment); an undefined scope keeps the bare temp-first funnel.
   private writeStoreScoped(scope: string | undefined, name: string): TableStore {
@@ -1469,6 +1502,10 @@ export class Engine {
   private lkpIndexStoreScoped(scope: string | undefined, nameKey: string): TableStore {
     if (scope === undefined) return this.lkpIndexStore(nameKey);
     return this.snapForScope(scope)!.indexStore(nameKey);
+  }
+
+  estimatorIndexStore(scope: string | undefined, nameKey: string): TableStore {
+    return this.lkpIndexStoreScoped(scope, nameKey);
   }
 
   private writeIndexStoreScoped(scope: string | undefined, nameKey: string): TableStore {
@@ -10461,6 +10498,7 @@ export class Engine {
         joinPkOrdered: false,
         topK: null,
         relBounds: [],
+        relEstimates: [],
         relINLBounds: [],
       },
     };
@@ -14088,6 +14126,633 @@ export function inventoryScanCandidates(
     return compareLowerName({ name: a.identity.indexName }, { name: b.identity.indexName });
   });
   return candidates;
+}
+
+function estimatorRangeOperand(expr: RExpr): { operand: RExpr; lower: boolean } | null {
+  if (
+    expr.kind !== "compare" ||
+    (expr.op !== "lt" && expr.op !== "le" && expr.op !== "gt" && expr.op !== "ge")
+  ) {
+    return null;
+  }
+  if (rexprIsConstant(expr.rhs) && !rexprIsConstant(expr.lhs)) {
+    return { operand: expr.lhs, lower: expr.op === "gt" || expr.op === "ge" };
+  }
+  if (rexprIsConstant(expr.lhs) && !rexprIsConstant(expr.rhs)) {
+    return { operand: expr.rhs, lower: expr.op === "lt" || expr.op === "le" };
+  }
+  return null;
+}
+
+function estimatorPairedRange(lhs: RExpr, rhs: RExpr): boolean {
+  const a = estimatorRangeOperand(lhs);
+  const b = estimatorRangeOperand(rhs);
+  return a !== null && b !== null && a.lower !== b.lower && rexprEqShifted(a.operand, b.operand, 0);
+}
+
+function estimatorPredicateSelectivity(expr: RExpr | null): Selectivity {
+  if (expr === null) return { kind: "all" };
+  switch (expr.kind) {
+    case "constBool":
+      return { kind: expr.value ? "all" : "zero" };
+    case "constNull":
+      return { kind: "zero" };
+    case "and": {
+      const conjuncts: RExpr[] = [];
+      estimatorFlattenBoolean(expr, "and", conjuncts);
+      if (estimatorConjunctionContradictory(conjuncts)) return { kind: "zero" };
+      const used = conjuncts.map(() => false);
+      let result: Selectivity = { kind: "all" };
+      for (let i = 0; i < conjuncts.length; i++) {
+        if (used[i]) continue;
+        let paired = -1;
+        for (let j = i + 1; j < conjuncts.length; j++) {
+          if (!used[j] && estimatorPairedRange(conjuncts[i]!, conjuncts[j]!)) {
+            paired = j;
+            break;
+          }
+        }
+        if (paired >= 0) {
+          used[paired] = true;
+          result = andSelectivity(result, fractionSelectivity(SELECTIVITY_PAIRED_RANGE));
+        } else {
+          result = andSelectivity(result, estimatorPredicateSelectivity(conjuncts[i]!));
+        }
+      }
+      return result;
+    }
+    case "or": {
+      const disjuncts: RExpr[] = [];
+      estimatorFlattenBoolean(expr, "or", disjuncts);
+      let result: Selectivity | null = null;
+      for (let i = 0; i < disjuncts.length; i++) {
+        const part = disjuncts[i]!;
+        const equality = estimatorEqualityParts(part);
+        if (
+          equality !== null &&
+          disjuncts.slice(0, i).some((prior) => {
+            const before = estimatorEqualityParts(prior);
+            return (
+              before !== null &&
+              rexprEqShifted(equality.operand, before.operand, 0) &&
+              rexprEqShifted(equality.literal, before.literal, 0)
+            );
+          })
+        ) {
+          continue;
+        }
+        const estimated = estimatorPredicateSelectivity(part);
+        result = result === null ? estimated : orSelectivity(result, estimated);
+      }
+      return result ?? { kind: "zero" };
+    }
+    case "not":
+      return notSelectivity(estimatorPredicateSelectivity(expr.operand));
+    case "compare":
+      if (expr.lhs.kind === "constNull" || expr.rhs.kind === "constNull") return { kind: "zero" };
+      if (expr.op === "eq") return fractionSelectivity(SELECTIVITY_EQUALITY);
+      if (expr.op === "ne") return notSelectivity(fractionSelectivity(SELECTIVITY_EQUALITY));
+      return fractionSelectivity(SELECTIVITY_INEQUALITY);
+    case "distinct": {
+      const equality = fractionSelectivity(SELECTIVITY_EQUALITY);
+      return expr.negated ? equality : notSelectivity(equality);
+    }
+    case "isNull": {
+      const nullTest = fractionSelectivity(SELECTIVITY_NULL_TEST);
+      return expr.negated ? notSelectivity(nullTest) : nullTest;
+    }
+    case "like":
+    case "regex": {
+      const matched = fractionSelectivity(SELECTIVITY_MATCH);
+      return expr.negated ? notSelectivity(matched) : matched;
+    }
+    case "column":
+      return fractionSelectivity(SELECTIVITY_BOOLEAN);
+    default:
+      return selectivityClass(ACCESS_UNSUPPORTED);
+  }
+}
+
+function estimatorFlattenBoolean(expr: RExpr, kind: "and" | "or", out: RExpr[]): void {
+  if (expr.kind === kind) {
+    estimatorFlattenBoolean(expr.lhs, kind, out);
+    estimatorFlattenBoolean(expr.rhs, kind, out);
+  } else {
+    out.push(expr);
+  }
+}
+
+function estimatorLiteral(expr: RExpr): boolean {
+  return expr.kind.startsWith("const"); // parameters are a separate non-literal node kind
+}
+
+function estimatorEqualityParts(expr: RExpr): { operand: RExpr; literal: RExpr } | null {
+  if (expr.kind !== "compare" || expr.op !== "eq") return null;
+  if (estimatorLiteral(expr.rhs) && !rexprIsConstant(expr.lhs)) {
+    return { operand: expr.lhs, literal: expr.rhs };
+  }
+  if (estimatorLiteral(expr.lhs) && !rexprIsConstant(expr.rhs)) {
+    return { operand: expr.rhs, literal: expr.lhs };
+  }
+  return null;
+}
+
+type EstimatorComparison = {
+  operand: RExpr;
+  literal: RExpr;
+  op: "eq" | "lt" | "le" | "gt" | "ge";
+};
+
+function estimatorComparisonParts(expr: RExpr): EstimatorComparison | null {
+  if (
+    expr.kind !== "compare" ||
+    (expr.op !== "eq" &&
+      expr.op !== "lt" &&
+      expr.op !== "le" &&
+      expr.op !== "gt" &&
+      expr.op !== "ge")
+  ) {
+    return null;
+  }
+  if (estimatorLiteral(expr.rhs) && !rexprIsConstant(expr.lhs)) {
+    return { operand: expr.lhs, literal: expr.rhs, op: expr.op };
+  }
+  if (estimatorLiteral(expr.lhs) && !rexprIsConstant(expr.rhs)) {
+    return {
+      operand: expr.rhs,
+      literal: expr.lhs,
+      op: flipCmp(expr.op) as EstimatorComparison["op"],
+    };
+  }
+  return null;
+}
+
+// Compare resolved, same-kind plan-time literals by their SQL total order. Open/unsupported
+// literal kinds return null: missing a proof is safe, inventing one is not.
+function estimatorLiteralCmp(a: RExpr, b: RExpr): number | null {
+  if (a.kind !== b.kind) return null;
+  switch (a.kind) {
+    case "constInt": {
+      if (b.kind !== "constInt") return null;
+      const y = b.value;
+      return a.value < y ? -1 : a.value > y ? 1 : 0;
+    }
+    case "constTimestamp": {
+      if (b.kind !== "constTimestamp") return null;
+      const y = b.value;
+      return a.value < y ? -1 : a.value > y ? 1 : 0;
+    }
+    case "constTimestamptz": {
+      if (b.kind !== "constTimestamptz") return null;
+      const y = b.value;
+      return a.value < y ? -1 : a.value > y ? 1 : 0;
+    }
+    case "constDate": {
+      if (b.kind !== "constDate") return null;
+      const y = b.value;
+      return a.value < y ? -1 : a.value > y ? 1 : 0;
+    }
+    case "constBool": {
+      if (b.kind !== "constBool") return null;
+      return a.value === b.value ? 0 : a.value ? 1 : -1;
+    }
+    case "constText": {
+      if (b.kind !== "constText") return null;
+      const y = b.value;
+      return a.value < y ? -1 : a.value > y ? 1 : 0;
+    }
+    case "constDecimal": {
+      if (b.kind !== "constDecimal") return null;
+      return a.value.cmpValue(b.value);
+    }
+    case "constFloat": {
+      if (b.kind !== "constFloat") return null;
+      return a.ty === b.ty ? floatTotalCmp(a.value, b.value) : null;
+    }
+    case "constBytea": {
+      if (b.kind !== "constBytea") return null;
+      return compareBytes(a.value, b.value);
+    }
+    case "constUuid": {
+      if (b.kind !== "constUuid") return null;
+      return compareBytes(a.value, b.value);
+    }
+    case "constInterval": {
+      if (b.kind !== "constInterval") return null;
+      const x = intervalSpan(a.value);
+      const y = intervalSpan(b.value);
+      return x < y ? -1 : x > y ? 1 : 0;
+    }
+    default:
+      return null;
+  }
+}
+
+function estimatorComparisonSatisfied(order: number, op: EstimatorComparison["op"]): boolean {
+  switch (op) {
+    case "eq":
+      return order === 0;
+    case "lt":
+      return order < 0;
+    case "le":
+      return order <= 0;
+    case "gt":
+      return order > 0;
+    case "ge":
+      return order >= 0;
+  }
+}
+
+function estimatorComparisonsContradict(a: EstimatorComparison, b: EstimatorComparison): boolean {
+  if (!rexprEqShifted(a.operand, b.operand, 0)) return false;
+  return estimatorBoundsContradict(a.op, a.literal, b.op, b.literal);
+}
+
+function estimatorBoundsContradict(
+  aOp: EstimatorComparison["op"],
+  aLiteral: RExpr,
+  bOp: EstimatorComparison["op"],
+  bLiteral: RExpr,
+): boolean {
+  // Text equality is byte identity, but range order may use a derived collation unavailable here.
+  if (
+    (aLiteral.kind === "constText" || bLiteral.kind === "constText") &&
+    (aOp !== "eq" || bOp !== "eq")
+  ) {
+    return false;
+  }
+  if (aOp === "eq") {
+    const order = estimatorLiteralCmp(aLiteral, bLiteral);
+    return order !== null && !estimatorComparisonSatisfied(order, bOp);
+  }
+  if (bOp === "eq") {
+    const order = estimatorLiteralCmp(bLiteral, aLiteral);
+    return order !== null && !estimatorComparisonSatisfied(order, aOp);
+  }
+  const aLower = aOp === "gt" || aOp === "ge";
+  const bLower = bOp === "gt" || bOp === "ge";
+  if (aLower === bLower) return false;
+  const [lowerOp, lowerLiteral, upperOp, upperLiteral] = aLower
+    ? [aOp, aLiteral, bOp, bLiteral]
+    : [bOp, bLiteral, aOp, aLiteral];
+  const order = estimatorLiteralCmp(lowerLiteral, upperLiteral);
+  return order !== null && (order > 0 || (order === 0 && (lowerOp === "gt" || upperOp === "lt")));
+}
+
+function estimatorConjunctionContradictory(conjuncts: RExpr[]): boolean {
+  const comparisons: EstimatorComparison[] = [];
+  for (const conjunct of conjuncts) {
+    const comparison = estimatorComparisonParts(conjunct);
+    if (comparison === null) continue;
+    if (
+      comparison.literal.kind === "constNull" ||
+      comparisons.some((prior) => estimatorComparisonsContradict(prior, comparison))
+    ) {
+      return true;
+    }
+    comparisons.push(comparison);
+  }
+  return false;
+}
+
+function estimatorEqualitySourcesImpossible(sources: RExpr[], keyType: ScalarType): boolean {
+  return sources.some(
+    (source, i) =>
+      source.kind === "constNull" ||
+      (source.kind === "constInt" && isInteger(keyType) && !inRange(keyType, source.value)) ||
+      sources
+        .slice(0, i)
+        .some((prior) => estimatorBoundsContradict("eq", prior, "eq", source)),
+  );
+}
+
+function estimatorRangeTerms(terms: BoundTerm[], keyType: ScalarType): Selectivity {
+  if (terms.length === 0) return { kind: "all" };
+  if (terms.some((term) => term.src.kind === "constNull")) return { kind: "zero" };
+  if (
+    terms.some(
+      (term, i) =>
+        (term.op === "eq" &&
+          term.src.kind === "constInt" &&
+          isInteger(keyType) &&
+          !inRange(keyType, term.src.value)) ||
+        terms
+          .slice(0, i)
+          .some((prior) =>
+            estimatorBoundsContradict(
+              prior.op as EstimatorComparison["op"],
+              prior.src,
+              term.op as EstimatorComparison["op"],
+              term.src,
+            ),
+          ),
+    )
+  ) {
+    return { kind: "zero" };
+  }
+  if (terms.some((term) => term.op === "eq")) return fractionSelectivity(SELECTIVITY_EQUALITY);
+  const lower = terms.some((term) => term.op === "gt" || term.op === "ge");
+  const upper = terms.some((term) => term.op === "lt" || term.op === "le");
+  return fractionSelectivity(lower && upper ? SELECTIVITY_PAIRED_RANGE : SELECTIVITY_INEQUALITY);
+}
+
+function estimatorEqualityPrefix(count: number): Selectivity {
+  let result: Selectivity = { kind: "all" };
+  for (let i = 0; i < count; i++) {
+    result = andSelectivity(result, fractionSelectivity(SELECTIVITY_EQUALITY));
+  }
+  return result;
+}
+
+function estimatorIntervalSelectivity(
+  specs: IntervalSpec[],
+  clip: BoundTerm[],
+  uniquePoints: boolean,
+  keyType: ScalarType,
+): Selectivity {
+  let result: Selectivity | null = null;
+  for (const spec of specs) {
+    const structural = estimatorRangeTerms(spec.terms, keyType);
+    const term =
+      structural.kind === "zero"
+        ? structural
+        : uniquePoints && spec.terms.length > 0 && spec.terms.every((bound) => bound.op === "eq")
+        ? ({ kind: "unique" } as const)
+        : structural;
+    result = result === null ? term : orSelectivity(result, term);
+  }
+  result ??= { kind: "zero" };
+  return clip.length === 0 ? result : andSelectivity(result, estimatorRangeTerms(clip, keyType));
+}
+
+function estimatorCandidateSelectivity(candidate: ScanCandidate, rel: ScopeRel): Selectivity {
+  const bound = candidate.bound;
+  if (bound === null) return { kind: "all" };
+  switch (bound.kind) {
+    case "pk": {
+      if (
+        bound.pk.eqCols.some((column) =>
+          estimatorEqualitySourcesImpossible(column.srcs, column.colType),
+        )
+      )
+        return { kind: "zero" };
+      if (bound.pk.eqCols.length === bound.pk.memberCount && bound.pk.range === null)
+        return { kind: "unique" };
+      let result = estimatorEqualityPrefix(bound.pk.eqCols.length);
+      if (bound.pk.range !== null)
+        result = andSelectivity(
+          result,
+          estimatorRangeTerms(bound.pk.range.terms, bound.pk.range.colType),
+        );
+      return result;
+    }
+    case "index": {
+      if (
+        bound.index.eqCols.some((column) =>
+          estimatorEqualitySourcesImpossible(column.srcs, column.colType),
+        )
+      )
+        return { kind: "zero" };
+      const index = rel.table.indexes.find(
+        (definition) => definition.name.toLowerCase() === candidate.identity.indexName,
+      );
+      if (
+        index?.unique === true &&
+        bound.index.eqCols.length === index.keys.length &&
+        bound.index.range === null
+      ) {
+        return { kind: "unique" };
+      }
+      let result = estimatorEqualityPrefix(bound.index.eqCols.length);
+      if (bound.index.range !== null)
+        result = andSelectivity(
+          result,
+          estimatorRangeTerms(bound.index.range.terms, bound.index.range.colType),
+        );
+      return result;
+    }
+    case "gist":
+      return selectivityClass(bound.gist.strategy === "equal" ? ACCESS_GIST_EQUAL : ACCESS_GIST_RANGE);
+    case "gin":
+      return selectivityClass(
+        bound.gin.strategy === "contains"
+          ? ACCESS_GIN_CONTAINS
+          : bound.gin.strategy === "overlaps"
+            ? ACCESS_GIN_OVERLAPS
+            : bound.gin.strategy === "member"
+              ? ACCESS_GIN_MEMBER
+              : ACCESS_GIN_EQUAL,
+      );
+    case "pkSet":
+      return estimatorIntervalSelectivity(
+        bound.pkSet.specs,
+        bound.pkSet.clip,
+        true,
+        bound.pkSet.pkType,
+      );
+    case "indexSet": {
+      const index = rel.table.indexes.find(
+        (definition) => definition.name.toLowerCase() === candidate.identity.indexName,
+      );
+      return estimatorIntervalSelectivity(
+        bound.indexSet.specs,
+        bound.indexSet.clip,
+        index?.unique === true && index.keys.length === 1,
+        bound.indexSet.colType,
+      );
+    }
+  }
+}
+
+function estimatorOperatorNodes(expr: RExpr | null): bigint {
+  if (expr === null) return 0n;
+  const sum = (...children: (RExpr | null)[]): bigint =>
+    children.reduce<bigint>(
+      (total, child) => saturatingEstimateAdd(total, estimatorOperatorNodes(child)),
+      0n,
+    );
+  let children = 0n;
+  switch (expr.kind) {
+    case "column":
+    case "outerColumn":
+    case "param":
+    case "constInt":
+    case "constFloat":
+    case "constBool":
+    case "constText":
+    case "constDecimal":
+    case "constBytea":
+    case "constUuid":
+    case "constTimestamp":
+    case "constTimestamptz":
+    case "constDate":
+    case "constInterval":
+    case "constJson":
+    case "constJsonb":
+    case "constJsonPath":
+    case "constNull":
+    case "constArray":
+    case "constRange":
+    case "dateClock":
+      return 0n;
+    case "subquery":
+      children = sum(expr.lhs);
+      break;
+    case "inValues":
+      children = sum(expr.lhs);
+      break;
+    case "quantified":
+      children = sum(expr.lhs, expr.array);
+      break;
+    case "cast":
+    case "arrayCast":
+    case "neg":
+    case "not":
+    case "isNull":
+    case "isJson":
+    case "jsonCtor":
+      children = sum(expr.operand);
+      break;
+    case "arith":
+    case "compare":
+    case "and":
+    case "or":
+    case "distinct":
+    case "like":
+    case "regex":
+      children = sum(expr.lhs, expr.rhs);
+      break;
+    case "jsonGet":
+    case "jsonHasKey":
+    case "jsonDelete":
+      children = sum(expr.base, expr.arg);
+      break;
+    case "jsonContains":
+    case "jsonConcat":
+      children = sum(expr.a, expr.b);
+      break;
+    case "casing":
+      children = sum(expr.arg);
+      break;
+    case "atTimeZone":
+      children = sum(expr.zone, expr.value);
+      break;
+    case "dateTrunc":
+      children = sum(expr.unit, expr.value, expr.zone);
+      break;
+    case "extract":
+      children = sum(expr.value);
+      break;
+    case "dateConvert":
+      children = sum(expr.inner);
+      break;
+    case "case":
+      children = sum(expr.els);
+      for (const arm of expr.arms) children = saturatingEstimateAdd(children, sum(arm.cond, arm.result));
+      break;
+    case "greatestLeast":
+    case "coalesce":
+    case "scalarFunc":
+    case "arrayFunc":
+    case "regexFunc":
+    case "rangeFunc":
+    case "rangeCtor":
+    case "rangeOp":
+    case "rangeSetOp":
+    case "variadic":
+    case "jsonBuild":
+    case "jsonSetInsert":
+    case "jsonObjectFromArrays":
+    case "jsonPathFn":
+    case "jsonSqlFn":
+      children = expr.args.reduce<bigint>(
+        (total, arg) => saturatingEstimateAdd(total, estimatorOperatorNodes(arg)),
+        0n,
+      );
+      break;
+    case "row":
+      children = expr.fields.reduce<bigint>(
+        (total, field) => saturatingEstimateAdd(total, estimatorOperatorNodes(field)),
+        0n,
+      );
+      break;
+    case "array":
+      children = expr.elements.reduce<bigint>(
+        (total, element) => saturatingEstimateAdd(total, estimatorOperatorNodes(element)),
+        0n,
+      );
+      break;
+    case "field":
+      children = sum(expr.base);
+      break;
+    case "subscript":
+      children = sum(expr.base, ...rSubscriptBounds(expr.subscripts));
+      break;
+  }
+  return saturatingEstimateAdd(1n, children);
+}
+
+function estimatorClampPages(rows: bigint, nodes: bigint, height: bigint): bigint {
+  if (rows === 0n || nodes === 0n) return 0n;
+  return rows < height ? height : rows > nodes ? nodes : rows;
+}
+
+export function estimateScanCandidates(
+  candidates: ScanCandidate[],
+  rel: ScopeRel,
+  engine: Engine,
+  producesRows: boolean,
+): CandidateEstimate[] {
+  const store = engine.estimatorStore(rel.db, rel.table.name);
+  const rowCount = store.count() ?? 0n;
+  const residual = candidates[0]?.residual ?? null;
+  const selectivities = candidates.map((candidate) => estimatorCandidateSelectivity(candidate, rel));
+  const outputSelectivity = selectivities.some((selectivity) => selectivity.kind === "zero")
+    ? ({ kind: "zero" } as const)
+    : estimatorPredicateSelectivity(residual);
+  const outputRows = estimateSelectivity(outputSelectivity, rowCount);
+  const tableHeight = BigInt(store.height());
+  const filterNodes = estimatorOperatorNodes(residual);
+  return candidates.map((candidate, i) => {
+    const selectivity = selectivities[i]!;
+    const scanRows = estimateSelectivity(selectivity, rowCount);
+    let accessNodes = BigInt(store.nodeCount());
+    let accessHeight = tableHeight;
+    if (
+      candidate.identity.kind === "btree" ||
+      candidate.identity.kind === "gin" ||
+      candidate.identity.kind === "index_interval"
+    ) {
+      const index = engine.estimatorIndexStore(rel.db, candidate.identity.indexName);
+      accessNodes = BigInt(index.nodeCount());
+      accessHeight = BigInt(index.height());
+    }
+    const accessPages =
+      candidate.identity.kind === "full"
+        ? accessNodes
+        : estimatorClampPages(
+            estimateSelectivity(selectivity, accessNodes),
+            accessNodes,
+            accessHeight,
+          );
+    const accessWork =
+      candidate.identity.kind === "gin"
+        ? scanRows
+        : candidate.identity.kind === "gist"
+          ? accessPages
+          : 0n;
+    return estimateCandidate({
+      kind: candidate.identity.kind,
+      indexName: candidate.identity.indexName,
+      scanRows,
+      outputRows,
+      accessPages,
+      tableHeight,
+      filterNodes,
+      accessWork,
+      producesRows,
+    });
+  });
 }
 
 function firstScanCandidate(
@@ -19141,6 +19806,8 @@ export type PhysicalPlan = {
   // (literal/param/outer) — a cross-relation `b.pk = a.x` is the index-nested-loop case (a
   // follow-on). The residual filter stays the WHOLE `filter`, re-applied after the join.
   relBounds: (ScanBound | null)[];
+  // P4 shadow estimates. The legacy selector remains authoritative and execution never reads these.
+  relEstimates: CandidateEstimate[][];
   // relINLBounds is the INDEX-NESTED-LOOP scan bounds, one per relation (cost.md §3 "JOIN"). Non-null
   // for a join inner relation whose primary key / indexed column is compared to a SIBLING column of an
   // earlier relation (`a JOIN b ON b.pk = a.x`) — a per-outer-row bound resolved from the combined

@@ -34,6 +34,8 @@ mod decimal;
 mod encoding;
 mod ergonomic;
 mod error;
+mod estimator;
+mod estimator_constants;
 mod executor;
 mod file;
 mod format;

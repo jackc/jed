@@ -1,0 +1,253 @@
+# Base-relation estimator vectors — CANONICAL DATA (estimator.md, Path B P4).
+#
+# Every core runs this file directly. `predicate.tokens` is a tiny postfix representation used only
+# by the fixture harness: leaves name estimator.toml selectivities (plus all/zero/unique), and
+# and/or/not use estimator.md §7.1's source-order folds. Candidate vectors feed already-derived scan
+# and logical-output rows into the common unit estimator so a mismatch identifies the exact runtime
+# unit. `units` is sparse: omitted schedule.toml units are expected zero.
+
+schema_version = 1
+
+[[arithmetic]]
+id = "scale_positive_minimum"
+op = "scale_ceil"
+a = 1
+b = 1
+c = 200
+expected = 1
+
+[[arithmetic]]
+id = "scale_large_without_wide_temporary"
+op = "scale_ceil"
+a = 9223372036854775807
+b = 1
+c = 3
+expected = 3074457345618258603
+
+[[arithmetic]]
+id = "saturating_add"
+op = "sat_add"
+a = 9223372036854775800
+b = 100
+expected = 9223372036854775807
+
+[[arithmetic]]
+id = "saturating_multiply"
+op = "sat_mul"
+a = 4611686018427387904
+b = 3
+expected = 9223372036854775807
+
+[[predicate]]
+id = "empty_equality"
+n = 0
+tokens = ["equality"]
+expected = 0
+
+[[predicate]]
+id = "equality"
+n = 1000
+tokens = ["equality"]
+expected = 5
+
+[[predicate]]
+id = "inequality"
+n = 1000
+tokens = ["inequality"]
+expected = 334
+
+[[predicate]]
+id = "paired_range"
+n = 1000
+tokens = ["paired_range"]
+expected = 5
+
+[[predicate]]
+id = "and_source_order_rounding"
+n = 1000
+tokens = ["equality", "inequality", "and"]
+expected = 2
+
+[[predicate]]
+id = "or_disjoint_upper_estimate"
+n = 1000
+tokens = ["equality", "inequality", "or"]
+expected = 339
+
+[[predicate]]
+id = "not_complement"
+n = 1000
+tokens = ["equality", "not"]
+expected = 995
+
+[[predicate]]
+id = "unique_lookup"
+n = 1000
+tokens = ["unique"]
+expected = 1
+
+[[predicate]]
+id = "boolean_fallback"
+n = 9
+tokens = ["boolean"]
+expected = 5
+
+[[candidate]]
+id = "full_unfiltered"
+kind = "full"
+index_name = ""
+scan_rows = 1000
+output_rows = 1000
+access_pages = 20
+table_height = 3
+filter_nodes = 0
+access_work = 0
+produces_rows = true
+tie_key = "6:"
+units = { storage_row_read = 1000, page_read = 20, row_produced = 1000 }
+est_rows = 1000
+est_cost = 2020
+
+[[candidate]]
+id = "full_opaque_filter"
+kind = "full"
+index_name = ""
+scan_rows = 1000
+output_rows = 334
+access_pages = 20
+table_height = 3
+filter_nodes = 1
+access_work = 0
+produces_rows = true
+tie_key = "6:"
+units = { storage_row_read = 1000, page_read = 20, row_produced = 334, operator_eval = 1000 }
+est_rows = 334
+est_cost = 2354
+
+[[candidate]]
+id = "pk_unique_equality"
+kind = "pk"
+index_name = ""
+scan_rows = 1
+output_rows = 1
+access_pages = 3
+table_height = 3
+filter_nodes = 1
+access_work = 0
+produces_rows = true
+tie_key = "0:"
+units = { storage_row_read = 1, page_read = 3, row_produced = 1, operator_eval = 1 }
+est_rows = 1
+est_cost = 6
+
+[[candidate]]
+id = "pk_generic_range"
+kind = "pk"
+index_name = ""
+scan_rows = 334
+output_rows = 334
+access_pages = 7
+table_height = 3
+filter_nodes = 1
+access_work = 0
+produces_rows = true
+tie_key = "0:"
+units = { storage_row_read = 334, page_read = 7, row_produced = 334, operator_eval = 334 }
+est_rows = 334
+est_cost = 1009
+
+[[candidate]]
+id = "btree_equality"
+kind = "btree"
+index_name = "ix_a"
+scan_rows = 5
+output_rows = 5
+access_pages = 2
+table_height = 3
+filter_nodes = 1
+access_work = 0
+produces_rows = true
+tie_key = "1:ix_a"
+units = { storage_row_read = 5, page_read = 17, row_produced = 5, operator_eval = 5 }
+est_rows = 5
+est_cost = 32
+
+[[candidate]]
+id = "btree_unique_equality"
+kind = "btree"
+index_name = "ux_a"
+scan_rows = 1
+output_rows = 1
+access_pages = 2
+table_height = 3
+filter_nodes = 1
+access_work = 0
+produces_rows = true
+tie_key = "1:ux_a"
+units = { storage_row_read = 1, page_read = 5, row_produced = 1, operator_eval = 1 }
+est_rows = 1
+est_cost = 8
+
+[[candidate]]
+id = "gist_matching_fallback"
+kind = "gist"
+index_name = "gx_r"
+scan_rows = 10
+output_rows = 10
+access_pages = 3
+table_height = 3
+filter_nodes = 1
+access_work = 2
+produces_rows = true
+tie_key = "2:gx_r"
+units = { storage_row_read = 10, page_read = 33, row_produced = 10, operator_eval = 10, gist_descent = 2 }
+est_rows = 10
+est_cost = 65
+
+[[candidate]]
+id = "gin_matching_fallback"
+kind = "gin"
+index_name = "gin_a"
+scan_rows = 10
+output_rows = 10
+access_pages = 3
+table_height = 3
+filter_nodes = 1
+access_work = 10
+produces_rows = true
+tie_key = "3:gin_a"
+units = { storage_row_read = 10, page_read = 33, row_produced = 10, operator_eval = 10, gin_entry = 10 }
+est_rows = 10
+est_cost = 73
+
+[[candidate]]
+id = "pk_interval_two_points"
+kind = "pk_interval"
+index_name = ""
+scan_rows = 10
+output_rows = 10
+access_pages = 6
+table_height = 3
+filter_nodes = 3
+access_work = 0
+produces_rows = true
+tie_key = "4:"
+units = { storage_row_read = 10, page_read = 6, row_produced = 10, operator_eval = 30 }
+est_rows = 10
+est_cost = 56
+
+[[candidate]]
+id = "index_interval_two_points"
+kind = "index_interval"
+index_name = "ix_a"
+scan_rows = 10
+output_rows = 10
+access_pages = 4
+table_height = 3
+filter_nodes = 3
+access_work = 0
+produces_rows = true
+tie_key = "5:ix_a"
+units = { storage_row_read = 10, page_read = 34, row_produced = 10, operator_eval = 30 }
+est_rows = 10
+est_cost = 84

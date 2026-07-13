@@ -174,15 +174,16 @@ func (db *engine) ruleOrderByLimitTopK(plan *selectPlan, _ []scopeRel) {
 // it per relation); a CTE relation needs no skip here — detectScanBound returns nil for it.
 func (db *engine) ruleScanBounds(plan *selectPlan, rels []scopeRel) {
 	plan.phys.relBounds = make([]*scanBound, len(rels))
-	if plan.filter != nil {
-		for i, rel := range rels {
-			// A set-returning relation or a derived table is a computed row source with no
-			// PK/index — it never bounds (functions.md §10, §42), so skip detection for it.
-			if plan.rels[i].srf != nil || plan.rels[i].derived != nil {
-				continue
-			}
-			plan.phys.relBounds[i] = detectScanBound(plan.filter, rel, db)
+	plan.phys.relEstimates = make([][]candidateEstimate, len(rels))
+	for i, rel := range rels {
+		// A set-returning relation or a derived/CTE source has no base store to estimate.
+		if plan.rels[i].srf != nil || plan.rels[i].derived != nil || plan.rels[i].cte != nil {
+			continue
 		}
+		candidates := inventoryScanCandidates(plan.filter, rel, db)
+		producesRows := len(rels) == 1 && !plan.isAgg && !plan.distinct && plan.limit == nil && plan.offset == nil && !plan.hasWindow
+		plan.phys.relEstimates[i] = db.estimateScanCandidates(candidates, rel, producesRows)
+		plan.phys.relBounds[i] = selectLegacyScanCandidate(candidates, selectScanBoundPolicy)
 	}
 }
 

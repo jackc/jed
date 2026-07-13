@@ -19,6 +19,10 @@ func TestScanCandidateInventoryIsCompleteCanonicalAndLegacyNeutral(t *testing.T)
 		"CREATE INDEX a_gin ON inventory USING gin (tags)",
 		"CREATE INDEX z_gist ON inventory USING gist (span)",
 		"CREATE INDEX a_gist ON inventory USING gist (span)",
+		"INSERT INTO inventory VALUES (1, 1, 1, '{1}', '[1,3)')",
+		"INSERT INTO inventory VALUES (2, 2, 2, '{1,2}', '[2,4)')",
+		"INSERT INTO inventory VALUES (3, 3, 3, '{3}', '[5,8)')",
+		"INSERT INTO inventory VALUES (4, 4, 4, '{4}', '[9,12)')",
 	} {
 		if _, err := execute(db, sql); err != nil {
 			t.Fatalf("%s: %v", sql, err)
@@ -78,6 +82,48 @@ func TestScanCandidateInventoryIsCompleteCanonicalAndLegacyNeutral(t *testing.T)
 	}
 	if !slices.Equal(got, want) {
 		t.Fatalf("candidate identities\n got: %v\nwant: %v", got, want)
+	}
+	estimates := db.estimateScanCandidates(candidates, rel, true)
+	if len(estimates) != len(candidates) {
+		t.Fatalf("shadow estimates = %d, candidates = %d", len(estimates), len(candidates))
+	}
+	logicalRows := estimates[0].rows
+	for i, estimate := range estimates {
+		wantTie := candidateTieKey(estimatorAccessPathOrder[int(candidates[i].identity.kind)], candidates[i].identity.indexName)
+		if estimate.tieKey != wantTie || estimate.rows != logicalRows || estimate.cost < 0 {
+			t.Fatalf("%s shadow estimate = %+v, logical rows %d tie %q", got[i], estimate, logicalRows, wantTie)
+		}
+	}
+	for _, check := range []struct {
+		sql            string
+		rows           int64
+		emptyCandidate string
+	}{
+		{sql: "SELECT id FROM inventory WHERE a IN (1, 1, 1, 1, 1)", rows: 1},
+		{sql: "SELECT id FROM inventory WHERE a = NULL", rows: 0, emptyCandidate: "btree:a_btree"},
+		{sql: "SELECT id FROM inventory WHERE a = 1 AND a = 2", rows: 0, emptyCandidate: "btree:a_btree"},
+		{sql: "SELECT id FROM inventory WHERE a > 3 AND a < 2", rows: 0, emptyCandidate: "btree:a_btree"},
+	} {
+		shapeFilter := plannedInventoryFilter(t, db, check.sql)
+		shapeCandidates := inventoryScanCandidates(shapeFilter, rel, db)
+		shapeEstimates := db.estimateScanCandidates(shapeCandidates, rel, true)
+		for i, estimate := range shapeEstimates {
+			if estimate.rows != check.rows {
+				t.Fatalf("%s %s output rows = %d, want %d", check.sql, shapeCandidates[i].identity, estimate.rows, check.rows)
+			}
+			if shapeCandidates[i].identity.String() == check.emptyCandidate && estimate.cost != 0 {
+				t.Fatalf("%s %s empty access cost = %d, want 0", check.sql, check.emptyCandidate, estimate.cost)
+			}
+		}
+	}
+	fullCandidates := inventoryScanCandidates(nil, rel, db)
+	fullEstimate := db.estimateScanCandidates(fullCandidates, rel, true)[0]
+	fullActual, err := execute(db, "SELECT id FROM inventory")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fullEstimate.cost != fullActual.Cost {
+		t.Fatalf("exact full-scan estimate cost = %d, actual = %d", fullEstimate.cost, fullActual.Cost)
 	}
 	// The direct id>=0 / a>=0 / b>=0 conjuncts clip their interval unions. Legacy selection must
 	// retain the pre-P3 exception where the clipped set replaces the broader contiguous PK bound.

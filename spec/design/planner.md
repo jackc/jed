@@ -192,6 +192,10 @@ The legacy selector preserves two details exactly: a same-key interval set with 
 range replaces the broader contiguous PK/B-tree bound, and UPDATE/DELETE try GIN before GiST while
 SELECT tries GiST before GIN. Within every index-bearing kind, the lowest lowercased name wins.
 P3 changes no physical plan field, executor dispatch, EXPLAIN spelling, or actual metered cost.
+P4 inventories once per base relation and attaches one shadow estimate per candidate: logical output
+rows, access scan rows expressed through scheduled unit counts, weighted cost, and the canonical tie
+key. The legacy selector does not read those annotations, so this remains plan-, EXPLAIN-, and
+actual-cost-neutral until P6.
 
 Access-path execution has a common key-preserving result: deterministic `(storage key, row)`
 candidates plus the exact up-front `page_read` / `value_decompress` / access-method work block.

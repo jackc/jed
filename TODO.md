@@ -206,6 +206,14 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   Candidates carry explicit scan-order and full residual-filter facts; a separate legacy selector
   preserves SELECT and mutation precedence, including clipped interval exceptions, with no plan,
   EXPLAIN, result, or actual-cost change. → [planner.md §5.1](spec/design/planner.md)
+- [x] **P4 — base-relation estimator in shadow mode** — shared generated facts plus a canonical
+  vector matrix drive independently hand-written Rust/Go/TypeScript arithmetic, predicate folds,
+  access-row estimates, runtime-unit vectors, weighted costs, and total tie keys for every base
+  candidate. Exact row counts and resident tree height/node count are admitted without leaf I/O;
+  logical output selectivity is applied once from the full WHERE, while access-specific scan rows
+  and residual work remain separate. Estimates are planner annotations only and the legacy selector
+  still runs. → [estimator.md §7](spec/design/estimator.md),
+  [estimator vectors](spec/cost/estimator_vectors.toml)
 - [ ] **Plan-time cost estimator** — estimate the same cost units the runtime meter charges
   (`page_read`/`storage_row_read`/`row_produced`/…) for each candidate plan and pick the cheapest,
   instead of today's structural tie-breaks (lowest index name, FROM order). Authored as a **spec'd,

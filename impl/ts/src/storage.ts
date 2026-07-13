@@ -169,6 +169,10 @@ export class TableStore {
     return this.rows.nodeCount();
   }
 
+  height(): number {
+    return this.rows.height();
+  }
+
   // entriesInKeyOrder returns all (key, row) pairs in encoded-key order. Used by the
   // on-disk serializer, which stores each row's key verbatim (the key is not always
   // reconstructable from the row — e.g. a no-PK table's synthetic rowid).

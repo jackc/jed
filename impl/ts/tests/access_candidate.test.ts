@@ -6,6 +6,7 @@ import { test } from "node:test";
 import type { Select } from "../src/ast.ts";
 import {
   Engine,
+  estimateScanCandidates,
   inventoryScanCandidates,
   MUTATION_SCAN_BOUND_POLICY,
   renderScanCandidateIdentity,
@@ -35,6 +36,10 @@ test("scan candidate inventory is complete, canonical, and legacy-neutral", () =
     "CREATE INDEX a_gin ON inventory USING gin (tags)",
     "CREATE INDEX z_gist ON inventory USING gist (span)",
     "CREATE INDEX a_gist ON inventory USING gist (span)",
+    "INSERT INTO inventory VALUES (1, 1, 1, '{1}', '[1,3)')",
+    "INSERT INTO inventory VALUES (2, 2, 2, '{1,2}', '[2,4)')",
+    "INSERT INTO inventory VALUES (3, 3, 3, '{3}', '[5,8)')",
+    "INSERT INTO inventory VALUES (4, 4, 4, '{4}', '[9,12)')",
   ]) {
     execute(db, sql);
   }
@@ -83,6 +88,42 @@ test("scan candidate inventory is complete, canonical, and legacy-neutral", () =
       assert.deepStrictEqual(candidate.scanOrder, { kind: "storageKey", reversible: true });
     }
   }
+  const estimates = estimateScanCandidates(candidates, rel, db, true);
+  assert.equal(estimates.length, candidates.length);
+  const logicalRows = estimates[0]!.rows;
+  for (const [i, estimate] of estimates.entries()) {
+    assert.equal(
+      estimate.rows,
+      logicalRows,
+      `${renderScanCandidateIdentity(candidates[i]!.identity)} logical rows`,
+    );
+    assert.match(estimate.tieKey, /^[0-6]:/);
+    assert(estimate.cost >= 0n);
+  }
+  for (const [sql, rows, emptyCandidate] of [
+    ["SELECT id FROM inventory WHERE a IN (1, 1, 1, 1, 1)", 1n, null],
+    ["SELECT id FROM inventory WHERE a = NULL", 0n, "btree:a_btree"],
+    ["SELECT id FROM inventory WHERE a = 1 AND a = 2", 0n, "btree:a_btree"],
+    ["SELECT id FROM inventory WHERE a > 3 AND a < 2", 0n, "btree:a_btree"],
+  ] as const) {
+    const shapeFilter = plannedInventoryFilter(db, sql);
+    const shapeCandidates = inventoryScanCandidates(shapeFilter, rel, internals.readSnap(), db);
+    for (const [i, estimate] of estimateScanCandidates(shapeCandidates, rel, db, true).entries()) {
+      assert.equal(estimate.rows, rows, `${sql} logical rows`);
+      if (renderScanCandidateIdentity(shapeCandidates[i]!.identity) === emptyCandidate) {
+        assert.equal(estimate.cost, 0n, `${sql} ${emptyCandidate} empty access`);
+      }
+    }
+  }
+  const fullEstimate = estimateScanCandidates(
+    inventoryScanCandidates(null, rel, internals.readSnap(), db),
+    rel,
+    db,
+    true,
+  )[0]!;
+  const fullActual = execute(db, "SELECT id FROM inventory");
+  assert.equal(fullActual.kind, "query");
+  assert.equal(fullEstimate.cost, fullActual.cost, "exact full-scan estimate equals actual cost");
   // Direct >= conjuncts clip the OR unions. Preserve the old exception where the clipped PK set
   // replaces the broader contiguous PK bound.
   assert.equal(selectLegacyScanCandidate(candidates, SELECT_SCAN_BOUND_POLICY)?.kind, "pkSet");

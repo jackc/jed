@@ -4406,6 +4406,8 @@ pub(crate) struct PhysicalPlan {
     /// a sibling column). The residual filter stays the WHOLE `filter`, re-applied after the
     /// join — the bound only narrows which rows are scanned.
     rel_bounds: Vec<Option<ScanBound>>,
+    /// P4's shadow-only base candidate estimates. Execution and the legacy selector do not read it.
+    rel_estimates: Vec<Vec<crate::estimator::CandidateEstimate>>,
     /// **Index-nested-loop** scan bounds, one per relation (cost.md §3 "JOIN"). `Some` for a join
     /// inner relation whose primary key / indexed column is compared to a **sibling** column of an
     /// earlier relation (`a JOIN b ON b.pk = a.x`) — a `BoundSrc::Sibling` bound resolved per outer

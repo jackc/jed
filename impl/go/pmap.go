@@ -419,6 +419,29 @@ func (m *pMap) nodeCount() int {
 	return count(m.root)
 }
 
+// height is the root-to-leaf node count (0 empty, 1 root leaf). OnDisk children are always leaves,
+// so the resident interior skeleton contains enough information and this never faults a page.
+func (m *pMap) height() int {
+	var walk func(n *pnode) int
+	walk = func(n *pnode) int {
+		if n == nil {
+			return 0
+		}
+		best := 0
+		for _, c := range n.children {
+			h := 1
+			if c.node != nil {
+				h = walk(c.node)
+			}
+			if h > best {
+				best = h
+			}
+		}
+		return 1 + best
+	}
+	return walk(m.root)
+}
+
 // residentRecordBytes is the total on-disk record bytes stored in this tree — the sum of every
 // leaf entry's weight (records live only in leaves, v24; interior weights are empty). The
 // deterministic, cross-core-identical measure of a temp table's storage footprint

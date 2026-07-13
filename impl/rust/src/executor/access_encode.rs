@@ -466,6 +466,706 @@ pub(crate) fn inventory_scan_candidates<'a>(
     candidates
 }
 
+fn estimator_predicate_selectivity(expr: Option<&RExpr>) -> crate::estimator::Selectivity {
+    use crate::estimator::Selectivity;
+    use crate::estimator_constants::*;
+    let Some(expr) = expr else {
+        return Selectivity::All;
+    };
+    match expr {
+        RExpr::ConstBool(true) => Selectivity::All,
+        RExpr::ConstBool(false) | RExpr::ConstNull => Selectivity::Zero,
+        RExpr::And(..) => {
+            let mut conjuncts = Vec::new();
+            estimator_flatten_boolean(expr, true, &mut conjuncts);
+            if estimator_conjunction_contradictory(&conjuncts) {
+                return Selectivity::Zero;
+            }
+            let mut used = vec![false; conjuncts.len()];
+            let mut result = Selectivity::All;
+            for i in 0..conjuncts.len() {
+                if used[i] {
+                    continue;
+                }
+                let paired = ((i + 1)..conjuncts.len())
+                    .find(|j| !used[*j] && estimator_paired_range(conjuncts[i], conjuncts[*j]));
+                if let Some(j) = paired {
+                    used[j] = true;
+                    result = result.and(Selectivity::fraction(SELECTIVITY_PAIRED_RANGE));
+                } else {
+                    result = result.and(estimator_predicate_selectivity(Some(conjuncts[i])));
+                }
+            }
+            result
+        }
+        RExpr::Or(..) => {
+            let mut disjuncts = Vec::new();
+            estimator_flatten_boolean(expr, false, &mut disjuncts);
+            let mut result: Option<Selectivity> = None;
+            for (i, disjunct) in disjuncts.iter().enumerate() {
+                let duplicate =
+                    estimator_equality_parts(disjunct).is_some_and(|(operand, literal)| {
+                        disjuncts[..i].iter().any(|prior| {
+                            estimator_equality_parts(prior).is_some_and(
+                                |(prior_operand, prior_literal)| {
+                                    rexpr_eq_shifted(operand, prior_operand, 0)
+                                        && rexpr_eq_shifted(literal, prior_literal, 0)
+                                },
+                            )
+                        })
+                    });
+                if duplicate {
+                    continue;
+                }
+                let part = estimator_predicate_selectivity(Some(disjunct));
+                result = Some(match result {
+                    None => part,
+                    Some(lhs) => lhs.or(part),
+                });
+            }
+            result.unwrap_or(Selectivity::Zero)
+        }
+        RExpr::Not(child) => estimator_predicate_selectivity(Some(child)).not(),
+        RExpr::Compare { lhs, rhs, .. }
+            if matches!(lhs.as_ref(), RExpr::ConstNull)
+                || matches!(rhs.as_ref(), RExpr::ConstNull) =>
+        {
+            Selectivity::Zero
+        }
+        RExpr::Compare { op: CmpOp::Eq, .. } => Selectivity::fraction(SELECTIVITY_EQUALITY),
+        RExpr::Compare { op: CmpOp::Ne, .. } => Selectivity::fraction(SELECTIVITY_EQUALITY).not(),
+        RExpr::Compare { .. } => Selectivity::fraction(SELECTIVITY_INEQUALITY),
+        RExpr::Distinct { negated, .. } => {
+            let equality = Selectivity::fraction(SELECTIVITY_EQUALITY);
+            if *negated { equality } else { equality.not() }
+        }
+        RExpr::IsNull { negated, .. } => {
+            let null_test = Selectivity::fraction(SELECTIVITY_NULL_TEST);
+            if *negated { null_test.not() } else { null_test }
+        }
+        RExpr::Like { negated, .. } | RExpr::Regex { negated, .. } => {
+            let matched = Selectivity::fraction(SELECTIVITY_MATCH);
+            if *negated { matched.not() } else { matched }
+        }
+        RExpr::Column(_) => Selectivity::fraction(SELECTIVITY_BOOLEAN),
+        _ => crate::estimator::selectivity_class(ACCESS_UNSUPPORTED),
+    }
+}
+
+fn estimator_flatten_boolean<'a>(expr: &'a RExpr, and: bool, out: &mut Vec<&'a RExpr>) {
+    match (and, expr) {
+        (true, RExpr::And(lhs, rhs)) | (false, RExpr::Or(lhs, rhs)) => {
+            estimator_flatten_boolean(lhs, and, out);
+            estimator_flatten_boolean(rhs, and, out);
+        }
+        _ => out.push(expr),
+    }
+}
+
+fn estimator_literal(expr: &RExpr) -> bool {
+    matches!(
+        expr,
+        RExpr::ConstInt(_)
+            | RExpr::ConstBool(_)
+            | RExpr::ConstText(_)
+            | RExpr::ConstDecimal(_)
+            | RExpr::ConstFloat32(_)
+            | RExpr::ConstFloat64(_)
+            | RExpr::ConstBytea(_)
+            | RExpr::ConstUuid(_)
+            | RExpr::ConstJsonPath(_)
+            | RExpr::ConstJson(_)
+            | RExpr::ConstJsonb(_)
+            | RExpr::ConstTimestamp(_)
+            | RExpr::ConstTimestamptz(_)
+            | RExpr::ConstDate(_)
+            | RExpr::ConstInterval(_)
+            | RExpr::ConstArray(_)
+            | RExpr::ConstRange(_)
+            | RExpr::ConstNull
+    )
+}
+
+fn estimator_equality_parts(expr: &RExpr) -> Option<(&RExpr, &RExpr)> {
+    let RExpr::Compare {
+        op: CmpOp::Eq,
+        lhs,
+        rhs,
+        ..
+    } = expr
+    else {
+        return None;
+    };
+    if estimator_literal(rhs) && !rexpr_is_constant(lhs) {
+        return Some((lhs, rhs));
+    }
+    if estimator_literal(lhs) && !rexpr_is_constant(rhs) {
+        return Some((rhs, lhs));
+    }
+    None
+}
+
+struct EstimatorComparison<'a> {
+    operand: &'a RExpr,
+    literal: &'a RExpr,
+    op: CmpOp,
+}
+
+fn estimator_comparison_parts(expr: &RExpr) -> Option<EstimatorComparison<'_>> {
+    let RExpr::Compare { op, lhs, rhs, .. } = expr else {
+        return None;
+    };
+    if !matches!(
+        op,
+        CmpOp::Eq | CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge
+    ) {
+        return None;
+    }
+    if estimator_literal(rhs) && !rexpr_is_constant(lhs) {
+        return Some(EstimatorComparison {
+            operand: lhs,
+            literal: rhs,
+            op: *op,
+        });
+    }
+    if estimator_literal(lhs) && !rexpr_is_constant(rhs) {
+        return Some(EstimatorComparison {
+            operand: rhs,
+            literal: lhs,
+            op: flip_cmp(*op),
+        });
+    }
+    None
+}
+
+// Compare resolved, same-kind plan-time literals by their SQL total order. Open/unsupported
+// literal kinds return None: missing a proof is safe, inventing one is not.
+fn estimator_literal_cmp(a: &RExpr, b: &RExpr) -> Option<std::cmp::Ordering> {
+    match (a, b) {
+        (RExpr::ConstInt(x), RExpr::ConstInt(y)) => Some(x.cmp(y)),
+        (RExpr::ConstBool(x), RExpr::ConstBool(y)) => Some(x.cmp(y)),
+        (RExpr::ConstText(x), RExpr::ConstText(y)) => Some(x.as_bytes().cmp(y.as_bytes())),
+        (RExpr::ConstDecimal(x), RExpr::ConstDecimal(y)) => Some(x.cmp_value(y)),
+        (RExpr::ConstFloat32(x), RExpr::ConstFloat32(y)) => {
+            Some(crate::value::total_cmp_f32(*x, *y))
+        }
+        (RExpr::ConstFloat64(x), RExpr::ConstFloat64(y)) => {
+            Some(crate::value::total_cmp_f64(*x, *y))
+        }
+        (RExpr::ConstBytea(x), RExpr::ConstBytea(y)) => Some(x.cmp(y)),
+        (RExpr::ConstUuid(x), RExpr::ConstUuid(y)) => Some(x.cmp(y)),
+        (RExpr::ConstTimestamp(x), RExpr::ConstTimestamp(y))
+        | (RExpr::ConstTimestamptz(x), RExpr::ConstTimestamptz(y)) => Some(x.cmp(y)),
+        (RExpr::ConstDate(x), RExpr::ConstDate(y)) => Some(x.cmp(y)),
+        (RExpr::ConstInterval(x), RExpr::ConstInterval(y)) => Some(x.span().cmp(&y.span())),
+        _ => None,
+    }
+}
+
+fn estimator_comparison_satisfied(order: std::cmp::Ordering, op: CmpOp) -> bool {
+    use std::cmp::Ordering;
+    match op {
+        CmpOp::Eq => order == Ordering::Equal,
+        CmpOp::Lt => order == Ordering::Less,
+        CmpOp::Le => order != Ordering::Greater,
+        CmpOp::Gt => order == Ordering::Greater,
+        CmpOp::Ge => order != Ordering::Less,
+        CmpOp::Ne => true,
+    }
+}
+
+fn estimator_comparisons_contradict(
+    a: &EstimatorComparison<'_>,
+    b: &EstimatorComparison<'_>,
+) -> bool {
+    use std::cmp::Ordering;
+    if !rexpr_eq_shifted(a.operand, b.operand, 0) {
+        return false;
+    }
+    // Text equality is byte identity, but range order may use a derived collation unavailable to
+    // this structural fold. Decline that proof rather than applying raw UTF-8 order.
+    if (matches!(a.literal, RExpr::ConstText(_)) || matches!(b.literal, RExpr::ConstText(_)))
+        && (a.op != CmpOp::Eq || b.op != CmpOp::Eq)
+    {
+        return false;
+    }
+    if a.op == CmpOp::Eq {
+        return estimator_literal_cmp(a.literal, b.literal)
+            .is_some_and(|order| !estimator_comparison_satisfied(order, b.op));
+    }
+    if b.op == CmpOp::Eq {
+        return estimator_literal_cmp(b.literal, a.literal)
+            .is_some_and(|order| !estimator_comparison_satisfied(order, a.op));
+    }
+    let a_lower = matches!(a.op, CmpOp::Gt | CmpOp::Ge);
+    let b_lower = matches!(b.op, CmpOp::Gt | CmpOp::Ge);
+    if a_lower == b_lower {
+        return false;
+    }
+    let (lower, upper) = if a_lower { (a, b) } else { (b, a) };
+    estimator_literal_cmp(lower.literal, upper.literal).is_some_and(|order| {
+        order == Ordering::Greater
+            || (order == Ordering::Equal && (lower.op == CmpOp::Gt || upper.op == CmpOp::Lt))
+    })
+}
+
+fn estimator_conjunction_contradictory(conjuncts: &[&RExpr]) -> bool {
+    let mut comparisons = Vec::with_capacity(conjuncts.len());
+    for conjunct in conjuncts {
+        let Some(comparison) = estimator_comparison_parts(conjunct) else {
+            continue;
+        };
+        if matches!(comparison.literal, RExpr::ConstNull)
+            || comparisons
+                .iter()
+                .any(|prior| estimator_comparisons_contradict(prior, &comparison))
+        {
+            return true;
+        }
+        comparisons.push(comparison);
+    }
+    false
+}
+
+fn estimator_range_operand(expr: &RExpr) -> Option<(&RExpr, bool)> {
+    let comparison = estimator_comparison_parts(expr)?;
+    (comparison.op != CmpOp::Eq).then_some((
+        comparison.operand,
+        matches!(comparison.op, CmpOp::Gt | CmpOp::Ge),
+    ))
+}
+
+fn estimator_paired_range(lhs: &RExpr, rhs: &RExpr) -> bool {
+    let (Some((a, a_lower)), Some((b, b_lower))) =
+        (estimator_range_operand(lhs), estimator_range_operand(rhs))
+    else {
+        return false;
+    };
+    a_lower != b_lower && rexpr_eq_shifted(a, b, 0)
+}
+
+fn estimator_bound_src_cmp(a: &BoundSrc, b: &BoundSrc) -> Option<std::cmp::Ordering> {
+    match (a, b) {
+        (BoundSrc::Int(x), BoundSrc::Int(y)) => Some(x.cmp(y)),
+        (BoundSrc::Bool(x), BoundSrc::Bool(y)) => Some(x.cmp(y)),
+        (BoundSrc::Uuid(x), BoundSrc::Uuid(y)) => Some(x.cmp(y)),
+        (BoundSrc::Timestamp(x), BoundSrc::Timestamp(y)) => Some(x.cmp(y)),
+        (BoundSrc::Date(x), BoundSrc::Date(y)) => Some(x.cmp(y)),
+        (BoundSrc::Text(x), BoundSrc::Text(y)) => Some(x.as_bytes().cmp(y.as_bytes())),
+        (BoundSrc::Bytea(x), BoundSrc::Bytea(y)) => Some(x.cmp(y)),
+        (BoundSrc::Decimal(x), BoundSrc::Decimal(y)) => Some(x.cmp_value(y)),
+        (BoundSrc::Interval(x), BoundSrc::Interval(y)) => Some(x.span().cmp(&y.span())),
+        _ => None,
+    }
+}
+
+fn estimator_bound_terms_contradict(a: &BoundTerm, b: &BoundTerm) -> bool {
+    use std::cmp::Ordering;
+    // Text range order may be collated; equality remains byte identity.
+    if (matches!(a.src, BoundSrc::Text(_)) || matches!(b.src, BoundSrc::Text(_)))
+        && (a.op != CmpOp::Eq || b.op != CmpOp::Eq)
+    {
+        return false;
+    }
+    if a.op == CmpOp::Eq {
+        return estimator_bound_src_cmp(&a.src, &b.src)
+            .is_some_and(|order| !estimator_comparison_satisfied(order, b.op));
+    }
+    if b.op == CmpOp::Eq {
+        return estimator_bound_src_cmp(&b.src, &a.src)
+            .is_some_and(|order| !estimator_comparison_satisfied(order, a.op));
+    }
+    let a_lower = matches!(a.op, CmpOp::Gt | CmpOp::Ge);
+    let b_lower = matches!(b.op, CmpOp::Gt | CmpOp::Ge);
+    if a_lower == b_lower {
+        return false;
+    }
+    let (lower, upper) = if a_lower { (a, b) } else { (b, a) };
+    estimator_bound_src_cmp(&lower.src, &upper.src).is_some_and(|order| {
+        order == Ordering::Greater
+            || (order == Ordering::Equal && (lower.op == CmpOp::Gt || upper.op == CmpOp::Lt))
+    })
+}
+
+fn estimator_equality_sources_impossible(sources: &[BoundSrc], key_type: ScalarType) -> bool {
+    sources.iter().enumerate().any(|(i, source)| {
+        matches!(source, BoundSrc::Null)
+            || matches!(source, BoundSrc::Int(value) if key_type.is_integer() && !key_type.in_range(*value))
+            || sources[..i].iter().any(|prior| {
+                estimator_bound_src_cmp(prior, source)
+                    .is_some_and(|order| order != std::cmp::Ordering::Equal)
+            })
+    })
+}
+
+fn estimator_range_terms(
+    terms: &[BoundTerm],
+    key_type: ScalarType,
+) -> crate::estimator::Selectivity {
+    use crate::estimator::Selectivity;
+    use crate::estimator_constants::*;
+    if terms.is_empty() {
+        return Selectivity::All;
+    }
+    if terms.iter().any(|term| matches!(&term.src, BoundSrc::Null)) {
+        return Selectivity::Zero;
+    }
+    if terms.iter().enumerate().any(|(i, term)| {
+        matches!(&term.src, BoundSrc::Int(value) if term.op == CmpOp::Eq && key_type.is_integer() && !key_type.in_range(*value))
+            || terms[..i]
+                .iter()
+                .any(|prior| estimator_bound_terms_contradict(prior, term))
+    }) {
+        return Selectivity::Zero;
+    }
+    if terms.iter().any(|term| term.op == CmpOp::Eq) {
+        return Selectivity::fraction(SELECTIVITY_EQUALITY);
+    }
+    let lower = terms
+        .iter()
+        .any(|term| matches!(term.op, CmpOp::Gt | CmpOp::Ge));
+    let upper = terms
+        .iter()
+        .any(|term| matches!(term.op, CmpOp::Lt | CmpOp::Le));
+    Selectivity::fraction(if lower && upper {
+        SELECTIVITY_PAIRED_RANGE
+    } else {
+        SELECTIVITY_INEQUALITY
+    })
+}
+
+fn estimator_equality_prefix(count: usize) -> crate::estimator::Selectivity {
+    use crate::estimator::Selectivity;
+    use crate::estimator_constants::SELECTIVITY_EQUALITY;
+    let mut result = Selectivity::All;
+    for _ in 0..count {
+        result = result.and(Selectivity::fraction(SELECTIVITY_EQUALITY));
+    }
+    result
+}
+
+fn estimator_interval_selectivity(
+    specs: &[IntervalSpec],
+    clip: &[BoundTerm],
+    unique_points: bool,
+    key_type: ScalarType,
+) -> crate::estimator::Selectivity {
+    use crate::estimator::Selectivity;
+    let mut disjunction: Option<Selectivity> = None;
+    for spec in specs {
+        let structural = estimator_range_terms(&spec.terms, key_type);
+        let term = if matches!(structural, Selectivity::Zero) {
+            structural
+        } else if unique_points
+            && !spec.terms.is_empty()
+            && spec.terms.iter().all(|term| term.op == CmpOp::Eq)
+        {
+            Selectivity::Unique
+        } else {
+            structural
+        };
+        disjunction = Some(match disjunction {
+            None => term,
+            Some(lhs) => lhs.or(term),
+        });
+    }
+    let mut result = disjunction.unwrap_or(Selectivity::Zero);
+    if !clip.is_empty() {
+        result = result.and(estimator_range_terms(clip, key_type));
+    }
+    result
+}
+
+fn estimator_candidate_selectivity(
+    candidate: &ScanCandidate<'_>,
+    rel: &ScopeRel<'_>,
+) -> crate::estimator::Selectivity {
+    use crate::estimator::Selectivity;
+    use crate::estimator::selectivity_class;
+    use crate::estimator_constants::*;
+    match candidate.bound.as_ref() {
+        Some(ScanBound::Pk(bound)) => {
+            if bound
+                .eq_cols
+                .iter()
+                .any(|column| estimator_equality_sources_impossible(&column.srcs, column.col_type))
+            {
+                return Selectivity::Zero;
+            }
+            if bound.eq_cols.len() == bound.member_count && bound.range.is_none() {
+                return Selectivity::Unique;
+            }
+            let mut result = estimator_equality_prefix(bound.eq_cols.len());
+            if let Some(range) = &bound.range {
+                result = result.and(estimator_range_terms(&range.terms, range.col_type));
+            }
+            result
+        }
+        Some(ScanBound::Index(bound)) => {
+            if bound
+                .eq_cols
+                .iter()
+                .any(|column| estimator_equality_sources_impossible(&column.srcs, column.col_type))
+            {
+                return Selectivity::Zero;
+            }
+            let unique = rel.table.indexes.iter().any(|index| {
+                index
+                    .name
+                    .eq_ignore_ascii_case(&candidate.identity.index_name)
+                    && index.unique
+                    && bound.eq_cols.len() == index.keys.len()
+                    && bound.range.is_none()
+            });
+            if unique {
+                return Selectivity::Unique;
+            }
+            let mut result = estimator_equality_prefix(bound.eq_cols.len());
+            if let Some(range) = &bound.range {
+                result = result.and(estimator_range_terms(&range.terms, range.col_type));
+            }
+            result
+        }
+        Some(ScanBound::Gist(bound)) => {
+            if bound.strategy == crate::gist::GistStrategy::Equal {
+                selectivity_class(ACCESS_GIST_EQUAL)
+            } else {
+                selectivity_class(ACCESS_GIST_RANGE)
+            }
+        }
+        Some(ScanBound::Gin(bound)) => selectivity_class(match bound.strategy {
+            GinStrategy::Contains => ACCESS_GIN_CONTAINS,
+            GinStrategy::Overlaps => ACCESS_GIN_OVERLAPS,
+            GinStrategy::Member => ACCESS_GIN_MEMBER,
+            GinStrategy::Equal => ACCESS_GIN_EQUAL,
+        }),
+        Some(ScanBound::PkSet(bound)) => {
+            estimator_interval_selectivity(&bound.specs, &bound.clip, true, bound.pk_type)
+        }
+        Some(ScanBound::IndexSet(bound)) => {
+            let unique = rel.table.indexes.iter().any(|index| {
+                index
+                    .name
+                    .eq_ignore_ascii_case(&candidate.identity.index_name)
+                    && index.unique
+                    && index.keys.len() == 1
+            });
+            estimator_interval_selectivity(&bound.specs, &bound.clip, unique, bound.col_type)
+        }
+        None => Selectivity::All,
+    }
+}
+
+fn estimator_operator_nodes(expr: Option<&RExpr>) -> i64 {
+    use crate::estimator::sat_add;
+    let Some(expr) = expr else { return 0 };
+    let children: i64 = match expr {
+        RExpr::Column(_)
+        | RExpr::OuterColumn { .. }
+        | RExpr::Param(_)
+        | RExpr::ConstInt(_)
+        | RExpr::ConstBool(_)
+        | RExpr::ConstText(_)
+        | RExpr::ConstDecimal(_)
+        | RExpr::ConstFloat32(_)
+        | RExpr::ConstFloat64(_)
+        | RExpr::ConstBytea(_)
+        | RExpr::ConstUuid(_)
+        | RExpr::ConstJsonPath(_)
+        | RExpr::ConstJson(_)
+        | RExpr::ConstJsonb(_)
+        | RExpr::ConstTimestamp(_)
+        | RExpr::ConstTimestamptz(_)
+        | RExpr::ConstDate(_)
+        | RExpr::ConstInterval(_)
+        | RExpr::ConstArray(_)
+        | RExpr::ConstRange(_)
+        | RExpr::DateClock { .. }
+        | RExpr::ConstNull => return 0,
+        RExpr::Subquery { lhs, .. } => estimator_operator_nodes(lhs.as_deref()),
+        RExpr::InValues { lhs, .. } => estimator_operator_nodes(Some(lhs)),
+        RExpr::Quantified { lhs, array, .. }
+        | RExpr::Arith {
+            lhs, rhs: array, ..
+        }
+        | RExpr::Compare {
+            lhs, rhs: array, ..
+        }
+        | RExpr::Distinct {
+            lhs, rhs: array, ..
+        }
+        | RExpr::Like {
+            lhs, rhs: array, ..
+        }
+        | RExpr::Regex {
+            lhs, rhs: array, ..
+        } => sat_add(
+            estimator_operator_nodes(Some(lhs)),
+            estimator_operator_nodes(Some(array)),
+        ),
+        RExpr::And(lhs, rhs) | RExpr::Or(lhs, rhs) => sat_add(
+            estimator_operator_nodes(Some(lhs)),
+            estimator_operator_nodes(Some(rhs)),
+        ),
+        RExpr::Cast { inner, .. }
+        | RExpr::ArrayCast { inner, .. }
+        | RExpr::DateConvert { inner, .. } => estimator_operator_nodes(Some(inner)),
+        RExpr::Neg { operand, .. }
+        | RExpr::IsNull { operand, .. }
+        | RExpr::IsJson { operand, .. }
+        | RExpr::JsonCtor { operand, .. } => estimator_operator_nodes(Some(operand)),
+        RExpr::Not(child) => estimator_operator_nodes(Some(child)),
+        RExpr::Casing { arg, .. } => estimator_operator_nodes(Some(arg)),
+        RExpr::AtTimeZone { zone, value, .. } => sat_add(
+            estimator_operator_nodes(Some(zone)),
+            estimator_operator_nodes(Some(value)),
+        ),
+        RExpr::DateTrunc { unit, value, zone } => sat_add(
+            sat_add(
+                estimator_operator_nodes(Some(unit)),
+                estimator_operator_nodes(Some(value)),
+            ),
+            estimator_operator_nodes(zone.as_deref()),
+        ),
+        RExpr::Extract { value, .. } => estimator_operator_nodes(Some(value)),
+        RExpr::JsonGet { base, arg, .. }
+        | RExpr::JsonHasKey { base, arg, .. }
+        | RExpr::JsonDelete { base, arg, .. } => sat_add(
+            estimator_operator_nodes(Some(base)),
+            estimator_operator_nodes(Some(arg)),
+        ),
+        RExpr::JsonContains { a, b } | RExpr::JsonConcat { a, b } => sat_add(
+            estimator_operator_nodes(Some(a)),
+            estimator_operator_nodes(Some(b)),
+        ),
+        RExpr::Case { arms, els, .. } => arms.iter().fold(
+            estimator_operator_nodes(Some(els)),
+            |total, (condition, result)| {
+                sat_add(
+                    total,
+                    sat_add(
+                        estimator_operator_nodes(Some(condition)),
+                        estimator_operator_nodes(Some(result)),
+                    ),
+                )
+            },
+        ),
+        RExpr::Coalesce { args, .. }
+        | RExpr::GreatestLeast { args, .. }
+        | RExpr::ScalarFunc { args, .. }
+        | RExpr::ArrayFunc { args, .. }
+        | RExpr::RangeFunc { args, .. }
+        | RExpr::RegexFunc { args, .. }
+        | RExpr::RangeCtor { args, .. }
+        | RExpr::RangeOp { args, .. }
+        | RExpr::RangeSetOp { args, .. }
+        | RExpr::Variadic { args, .. }
+        | RExpr::JsonBuild { args, .. }
+        | RExpr::JsonSetInsert { args, .. }
+        | RExpr::JsonObjectFromArrays { args, .. }
+        | RExpr::JsonPathFn { args, .. } => args.iter().fold(0, |total, arg| {
+            sat_add(total, estimator_operator_nodes(Some(arg)))
+        }),
+        RExpr::JsonSqlFn { ctx, path, .. } => sat_add(
+            estimator_operator_nodes(Some(ctx)),
+            estimator_operator_nodes(Some(path)),
+        ),
+        RExpr::Row(fields) | RExpr::Array { elems: fields, .. } => {
+            fields.iter().fold(0, |total, field| {
+                sat_add(total, estimator_operator_nodes(Some(field)))
+            })
+        }
+        RExpr::Field { base, .. } => estimator_operator_nodes(Some(base)),
+        RExpr::Subscript {
+            base, subscripts, ..
+        } => subscripts
+            .iter()
+            .flat_map(subscript_bounds)
+            .fold(estimator_operator_nodes(Some(base)), |total, bound| {
+                sat_add(total, estimator_operator_nodes(Some(bound)))
+            }),
+    };
+    sat_add(1, children)
+}
+
+fn estimator_clamp_pages(rows: i64, nodes: i64, height: i64) -> i64 {
+    if rows == 0 || nodes == 0 {
+        0
+    } else {
+        rows.max(height).min(nodes)
+    }
+}
+
+pub(crate) fn estimate_scan_candidates(
+    candidates: &[ScanCandidate<'_>],
+    rel: &ScopeRel<'_>,
+    catalog: &Engine,
+    produces_rows: bool,
+) -> Vec<crate::estimator::CandidateEstimate> {
+    use crate::estimator::{CandidateInputs, estimate_candidate, estimate_rows};
+    let store = catalog.store_scoped(rel.db.as_deref(), &rel.table.name);
+    let row_count = store.count().unwrap_or(0);
+    let selectivities: Vec<_> = candidates
+        .iter()
+        .map(|candidate| estimator_candidate_selectivity(candidate, rel))
+        .collect();
+    let output_selectivity = if selectivities
+        .iter()
+        .any(|selectivity| matches!(selectivity, crate::estimator::Selectivity::Zero))
+    {
+        crate::estimator::Selectivity::Zero
+    } else {
+        estimator_predicate_selectivity(candidates.first().and_then(|c| c.residual))
+    };
+    let output_rows = estimate_rows(&output_selectivity, row_count);
+    let table_height = store.height() as i64;
+    let filter_nodes = estimator_operator_nodes(candidates.first().and_then(|c| c.residual));
+    candidates
+        .iter()
+        .zip(selectivities)
+        .map(|(candidate, selectivity)| {
+            let kind =
+                crate::estimator_constants::ACCESS_PATH_ORDER[candidate.identity.kind as usize];
+            let scan_rows = estimate_rows(&selectivity, row_count);
+            let (access_nodes, access_height) = match candidate.identity.kind {
+                ScanCandidateKind::Btree
+                | ScanCandidateKind::Gin
+                | ScanCandidateKind::IndexInterval => {
+                    let index = catalog
+                        .index_store_scoped(rel.db.as_deref(), &candidate.identity.index_name);
+                    (index.node_count() as i64, index.height() as i64)
+                }
+                _ => (store.node_count() as i64, table_height),
+            };
+            let access_pages = if candidate.identity.kind == ScanCandidateKind::Full {
+                access_nodes
+            } else {
+                estimator_clamp_pages(
+                    estimate_rows(&selectivity, access_nodes),
+                    access_nodes,
+                    access_height,
+                )
+            };
+            let access_work = match candidate.identity.kind {
+                ScanCandidateKind::Gin => scan_rows,
+                ScanCandidateKind::Gist => access_pages,
+                _ => 0,
+            };
+            estimate_candidate(CandidateInputs {
+                kind,
+                index_name: &candidate.identity.index_name,
+                scan_rows,
+                output_rows,
+                access_pages,
+                table_height,
+                filter_nodes,
+                access_work,
+                produces_rows,
+            })
+        })
+        .collect()
+}
+
 fn candidate_index(
     candidates: &[ScanCandidate<'_>],
     kind: ScanCandidateKind,
@@ -5168,6 +5868,10 @@ mod candidate_inventory_tests {
             "CREATE INDEX a_gin ON inventory USING gin (tags)",
             "CREATE INDEX z_gist ON inventory USING gist (span)",
             "CREATE INDEX a_gist ON inventory USING gist (span)",
+            "INSERT INTO inventory VALUES (1, 1, 1, '{1}', '[1,3)')",
+            "INSERT INTO inventory VALUES (2, 2, 2, '{1,2}', '[2,4)')",
+            "INSERT INTO inventory VALUES (3, 3, 3, '{3}', '[5,8)')",
+            "INSERT INTO inventory VALUES (4, 4, 4, '{4}', '[9,12)')",
         ] {
             crate::execute(&mut db, sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
         }
@@ -5211,6 +5915,68 @@ mod candidate_inventory_tests {
             "full",
         ];
         assert_eq!(got, want);
+        let estimates = estimate_scan_candidates(&candidates, &rel, &db, true);
+        assert_eq!(estimates.len(), candidates.len());
+        let logical_rows = estimates[0].rows;
+        for (candidate, estimate) in candidates.iter().zip(&estimates) {
+            assert_eq!(
+                estimate.rows, logical_rows,
+                "{} logical rows",
+                candidate.identity
+            );
+            assert_eq!(
+                estimate.tie_key,
+                crate::estimator::candidate_tie_key(
+                    crate::estimator_constants::ACCESS_PATH_ORDER[candidate.identity.kind as usize],
+                    &candidate.identity.index_name,
+                )
+            );
+            assert!(estimate.cost >= 0);
+        }
+        for (sql, expected_rows, empty_candidate) in [
+            (
+                "SELECT id FROM inventory WHERE a IN (1, 1, 1, 1, 1)",
+                1,
+                None,
+            ),
+            (
+                "SELECT id FROM inventory WHERE a = NULL",
+                0,
+                Some("btree:a_btree"),
+            ),
+            (
+                "SELECT id FROM inventory WHERE a = 1 AND a = 2",
+                0,
+                Some("btree:a_btree"),
+            ),
+            (
+                "SELECT id FROM inventory WHERE a > 3 AND a < 2",
+                0,
+                Some("btree:a_btree"),
+            ),
+        ] {
+            let filter = planned_inventory_filter(&mut db, sql);
+            let shape_candidates = inventory_scan_candidates(Some(&filter), &rel, &db);
+            for (candidate, estimate) in shape_candidates.iter().zip(estimate_scan_candidates(
+                &shape_candidates,
+                &rel,
+                &db,
+                true,
+            )) {
+                assert_eq!(
+                    estimate.rows, expected_rows,
+                    "{sql} {} logical rows",
+                    candidate.identity
+                );
+                if empty_candidate == Some(candidate.identity.to_string().as_str()) {
+                    assert_eq!(estimate.cost, 0, "{sql} {empty_candidate:?} empty access");
+                }
+            }
+        }
+        let full_candidates = inventory_scan_candidates(None, &rel, &db);
+        let full_estimate = estimate_scan_candidates(&full_candidates, &rel, &db, true);
+        let full_actual = crate::execute(&mut db, "SELECT id FROM inventory").unwrap();
+        assert_eq!(full_estimate[0].cost, full_actual.cost());
         for candidate in &candidates {
             assert!(std::ptr::eq(candidate.residual.unwrap(), &filter));
             assert_eq!(

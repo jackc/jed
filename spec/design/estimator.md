@@ -5,8 +5,9 @@
 > runtime unit weights remain canonical in [../cost/schedule.toml](../cost/schedule.toml). This
 > document specifies the algorithms every core will implement independently.
 >
-> **Status: P0 contract ratified; P1 row counts, P2 cache validity, and P3 complete candidate
-> inventory landed.** The current planner still uses the legacy fixed selector in
+> **Status: P0 contract ratified; P1 row counts, P2 cache validity, P3 complete candidate
+> inventory, and P4 shadow base-relation estimates landed.** The current planner still uses
+> the legacy fixed selector in
 > [planner.md](planner.md). P4–P8 in
 > [../../TODO-cost-plan-input.md](../../TODO-cost-plan-input.md) implement this contract as vertical
 > slices. Until the selector slice lands, no plan, actual cost, or EXPLAIN row changes.
@@ -102,9 +103,9 @@ because intermediate ceiling and saturation are observable.
 - access-path and join-algorithm tie orders.
 
 `rake verify` runs `estimator_verify.rb` to reject missing/duplicate facts, unreduced or invalid
-fractions, changed approved defaults, and incomplete tie orders. P4 adds generated constant tables
-and the shared fixture matrix at `spec/cost/estimator_vectors.toml`; the verifier will validate its
-input, per-unit-count, row, cost, and tie-key fields then. Codegen may copy mechanical facts into
+fractions, changed approved defaults, incomplete tie orders, and incoherent P4 vectors. P4's
+generated constant tables and shared fixture matrix live at `spec/cost/estimator_vectors.toml`; the
+verifier validates its input, per-unit-count, row, cost, and tie-key fields. Codegen may copy mechanical facts into
 each core; it must never generate candidate enumeration, selectivity traversal, cost propagation,
 or join search.
 
@@ -225,10 +226,19 @@ An access candidate has two row counts:
 1. **scan rows** — rows admitted/fetched by its access predicate; and
 2. **output rows** — scan rows after residual predicate selectivity.
 
-Conjuncts consumed into an access bound are not applied a second time to output cardinality, but
-their expression nodes are still counted for runtime `operator_eval` because execution always
-rechecks the full WHERE. A known-superset access method uses its access-method selectivity for scan
-rows and the complete unproved portion as residual.
+The two counts deliberately have different bases. **Output rows are estimated once from the complete
+WHERE against the base relation's `N`, independently of the physical candidate.** Scan rows are
+estimated from the candidate's access predicate. The executor still rechecks the complete WHERE for
+every fetched row, so `operator_eval` uses scan rows even though logical output cardinality does not
+apply the predicate a second time. In particular, a lossy/superset GIN or GiST bound does not square
+the same no-statistics selectivity merely because it has a residual recheck: until P9 supplies a
+false-positive statistic, inventing a second reduction would make one logical predicate's output
+cardinality depend on its physical path. This rule was the P4 human decision checkpoint.
+
+The initial access-method classifications are canonical data in `estimator.toml`: scalar GiST `=`
+uses `equality`; range GiST and every GIN strategy use `matching`. Ordered/PK bounds derive their
+program from their equality prefix, optional trailing range, and interval disjunction. Unsupported
+access predicates use `opaque`.
 
 ### 7.1 Boolean composition
 
