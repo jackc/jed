@@ -401,6 +401,10 @@ pub struct Engine {
     /// The backing file path (`None` for an in-memory database). Set by the host API
     /// `open`/`create` (spec/design/api.md §2); `commit` writes here.
     pub(crate) path: Option<std::path::PathBuf>,
+    /// The host scratch directory for external-sort runs. File hosts set this independently of
+    /// `path` (normally to the OS temp directory), so a read-only database can spill without writing
+    /// beside its file. `None` for hosts with no spill backing (in-memory / OPFS).
+    pub(crate) spill_dir: Option<std::path::PathBuf>,
     /// The page size this database serializes with (from the file on open, from create opts,
     /// else `DEFAULT_PAGE_SIZE`). Fixed for the life of a file.
     pub(crate) page_size: u32,

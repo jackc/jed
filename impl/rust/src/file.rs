@@ -111,6 +111,7 @@ impl Engine {
         }
         let mut db = Engine::new();
         db.path = Some(path.to_path_buf());
+        db.spill_dir = Some(std::env::temp_dir());
         db.page_size = opts.page_size;
         db.committed.txid = 1; // the initial empty image is committed as txid 1
         db.write_full_image(opts.no_sync)?; // lay down the from-scratch image; later commits are incremental
@@ -174,6 +175,7 @@ impl Engine {
         let capacity = cache_leaves(opts.cache_bytes, pager.page_size());
         let mut db = Engine::open_paged(pager, capacity)?;
         db.path = Some(path.to_path_buf());
+        db.spill_dir = Some(std::env::temp_dir());
         db.read_only = opts.read_only;
         // `0` means "the default budget", not "unlimited" — the zero value is a safe finite budget
         // (matching Go/TS). Unbounded/never-spill is a runtime-only mode via `set_work_mem(0)`.

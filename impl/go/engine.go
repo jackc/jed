@@ -29,6 +29,10 @@ type engine struct {
 	// path is the backing file (empty for an in-memory database). Set by the host API
 	// Open/Create (spec/design/api.md §2); Commit writes here.
 	path string
+	// spillDir is the host scratch directory for external-sort runs. File hosts set it independently
+	// of path (normally to os.TempDir), so read-only database directories are never spill targets.
+	// Empty for hosts with no spill backing (in-memory / OPFS).
+	spillDir string
 	// pageSize is the page size this database serializes with (fixed for the life of a file).
 	pageSize uint32
 	// pageCount is the on-disk page high-water — the index an incremental commit extends at when the

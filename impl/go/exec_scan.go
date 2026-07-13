@@ -2,7 +2,6 @@ package jed
 
 import (
 	"bytes"
-	"path/filepath"
 	"sync/atomic"
 )
 
@@ -38,6 +37,7 @@ func (db *engine) snapshotEngine() *engine {
 		pageSize:  db.pageSize,
 		paging:    db.paging,
 		path:      db.path,
+		spillDir:  db.spillDir,
 		readOnly:  db.readOnly,
 		// The frozen read engine carries the same pinned attachment view so a streaming read of an
 		// attached database (attached-databases.md §5) resolves through it; it never commits (read-only),
@@ -1424,14 +1424,11 @@ func (db *engine) execStreamingJoin(plan *selectPlan, env *evalEnv, meter *costM
 }
 
 // newSorterFor builds a sorter for order, bounded by this handle's workMem. Spilling is enabled only
-// for a file-backed database (an in-memory one has nowhere to spill — spill.md §2); spill runs live
-// next to the database file (same filesystem, guaranteed writable).
+// when the host supplied scratch backing. The file host uses the OS temp directory independently of
+// the database path, so read-only filesystems remain readable; in-memory hosts leave it empty and
+// never spill (spill.md §2/§4).
 func (db *engine) newSorterFor(order []orderSlot) *sorter {
-	spillDir := ""
-	if db.path != "" {
-		spillDir = filepath.Dir(db.path)
-	}
-	return newSorter(order, db.session.workMem, spillDir)
+	return newSorter(order, db.session.workMem, db.spillDir)
 }
 
 // rowsFromValues reinterprets a result-row slice ([][]Value) as a join-feed buffer ([]Row). Row is

@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -165,6 +166,9 @@ func TestSpillLeavesNoTempFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Isolate this cleanup assertion from other parallel spill tests. Production file hosts use the
+	// OS temp directory; this white-box override is test-only.
+	db.spillDir = dir
 	seedSpill(t, db, 150)
 	db.SetWorkMem(64) // force heavy spilling
 
@@ -173,6 +177,76 @@ func TestSpillLeavesNoTempFiles(t *testing.T) {
 	runQuery(t, db, "SELECT id FROM t ORDER BY k, id LIMIT 3")
 	if n := countSpillFiles(); n != 0 {
 		t.Fatalf("spill run files leaked: %d remain", n)
+	}
+}
+
+func TestReadOnlyDatabaseDirectorySpillsToHostTemp(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("directory write permissions are not represented by Unix mode bits on Windows")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "read_only_spill.jed")
+	db, err := CreateDatabase(CreateOptions{Path: path, SkipFsync: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedSpill(t, db, 150)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The database filesystem is readable but cannot host a sibling spill file. The read-only handle
+	// must use independent host scratch storage and keep the database byte-identical.
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chmod(dir, 0o755) }()
+
+	ro, err := OpenDatabaseWithOptions(path, OpenOptions{ReadOnly: true, WorkMem: 64, SkipFsync: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ro.Close()
+	s := ro.ReadSession()
+	defer s.Close()
+	s.SetWorkMem(64) // force dozens of external-sort runs through the shared read-session plumbing
+	rows, _ := runQuery(t, s, "SELECT id FROM t ORDER BY k, id")
+	if len(rows) != 150 {
+		t.Fatalf("spilling read-only query returned %d rows, want 150", len(rows))
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "jed-spill-") {
+			t.Fatalf("spill file written beside read-only database: %s", entry.Name())
+		}
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatal("read-only spilling query changed the database file")
+	}
+}
+
+func TestSpillScratchFailureAbortsWith58030(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "spill_io_error.jed")
+	db, err := create(path, databaseOptions{PageSize: DefaultPageSize, noSync: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedSpill(t, db, 50)
+	db.spillDir = filepath.Join(t.TempDir(), "missing")
+	db.SetWorkMem(64)
+	if _, err := queryOutcome(db, "SELECT id FROM t ORDER BY k, id", nil); err == nil || errCodeOf(err) != "58030" {
+		t.Fatalf("unavailable spill target: got %v, want 58030", err)
 	}
 }
 

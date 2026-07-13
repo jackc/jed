@@ -10,6 +10,7 @@
 
 import type { Rows } from "./api.ts";
 import type { Engine, Outcome } from "./executor.ts";
+import { FileSpillSink } from "./spillfile.ts";
 import type { ScriptSummary } from "./split.ts";
 import type { Value } from "./value.ts";
 
@@ -88,4 +89,12 @@ export function executeParams(db: Engine, sql: string, params: Value[]): Outcome
 // return the O(1) ScriptSummary. All-or-nothing when the session is Idle (the migration/import path).
 export function executeScript(db: Engine, sql: string): ScriptSummary {
   return db.executeScript(sql);
+}
+
+// setSpillDirForTest overrides a Database's host scratch directory for per-core spill tests. The
+// public embedding surface deliberately has no configurable spill-target knob yet; tooling.ts is the
+// white-box test barrel, so reaching the runtime-private core here does not widen lib.ts.
+export function setSpillDirForTest(db: object, dir: string): void {
+  const internal = db as { core: { storage: Engine } };
+  internal.core.storage.spillSink = new FileSpillSink(dir);
 }

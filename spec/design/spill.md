@@ -119,9 +119,13 @@ round-trip **within one core, during one query, while the database file is uncha
 core serializes a run idiomatically with a **self-describing row codec** (a per-value type tag +
 payload, plus an opaque pass-through for an untouched [large-values.md](large-values.md) §14
 `Unfetched` reference, which rides along to the output and is never read) — *not* the §8 on-disk
-record format (which is schema-driven and a cross-core contract). The run files live in the host
-temp directory via stdlib file I/O only (no new dependency — CLAUDE.md §14; memory-safe, no
-`unsafe`/cgo — §13) and are deleted as the merge drains each one.
+record format (which is schema-driven and a cross-core contract). The run files live in a host
+scratch target **independent of the database path** — the native file hosts default to the OS temp
+directory, never beside the database — so a read-only open continues to work when the database's
+filesystem is read-only ([api.md](api.md) §2.1). Scratch files are created exclusively with private
+permissions, via stdlib file I/O only (no new dependency — CLAUDE.md §14; memory-safe, no
+`unsafe`/cgo — §13), and are deleted as the merge drains each one. Failure to create or extend a
+run is `58030 io_error`; the sorter never evades `work_mem` by retaining the overflow in memory.
 
 ## 5. Streaming the input (the single-table feed)
 

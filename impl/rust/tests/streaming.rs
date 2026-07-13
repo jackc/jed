@@ -504,8 +504,8 @@ fn sorted_early_exit_charges_less() {
 /// the lazy cursor is dropped undrained — §5).
 #[test]
 fn sorted_spill_merge_streams_lazily() {
-    // Isolate the spill files in a unique subdir so the run-file count is not raced by other tests
-    // (spill runs land next to the database file — executor `new_sorter`).
+    // Isolate the spill files in a unique subdir so the live-run count is not raced by other tests;
+    // production file hosts use the shared OS temp directory.
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("sorted_spill_lazy_dir");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -525,6 +525,7 @@ fn sorted_spill_merge_streams_lazily() {
         ..Default::default()
     })
     .unwrap();
+    db.set_spill_dir_for_test(dir.clone()); // isolate live-run assertions from parallel OS-temp spills
     {
         let mut w = db.write_session();
         w.query_outcome("CREATE TABLE t (id i32 PRIMARY KEY, k i32)", &[])

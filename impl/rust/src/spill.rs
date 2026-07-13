@@ -12,7 +12,7 @@
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -142,15 +142,20 @@ impl Sorter {
             .spill_dir
             .as_ref()
             .expect("spill_run requires a spill dir");
-        let seq = SPILL_SEQ.fetch_add(1, AtomicOrdering::Relaxed);
-        let path = dir.join(format!("jed-spill-{}-{}.tmp", std::process::id(), seq));
-        let file = File::create(&path).map_err(io_error)?;
+        let (path, file) = create_spill_file(dir)?;
         let mut w = BufWriter::new(file);
-        write_u64(&mut w, self.buf.len() as u64).map_err(io_error)?;
-        for row in &self.buf {
-            write_row(&mut w, row).map_err(io_error)?;
+        let write_result = (|| -> io::Result<()> {
+            write_u64(&mut w, self.buf.len() as u64)?;
+            for row in &self.buf {
+                write_row(&mut w, row)?;
+            }
+            w.flush()
+        })();
+        if let Err(e) = write_result {
+            drop(w);
+            let _ = fs::remove_file(&path);
+            return Err(io_error(e));
         }
-        w.flush().map_err(io_error)?;
         self.runs.push(path);
         self.buf.clear();
         self.buf_bytes = 0;
@@ -187,6 +192,28 @@ impl Sorter {
             }
         }
         Ok(SortedRows::Merge(Merger { sources, heap }))
+    }
+}
+
+/// Securely create one run in the host scratch directory. The OS temp directory can be shared by
+/// mutually untrusted users, so creation must be exclusive and the initial Unix mode private; a
+/// predictable pid/counter name is then only an identifier, never an overwrite primitive.
+fn create_spill_file(dir: &std::path::Path) -> Result<(PathBuf, File)> {
+    loop {
+        let seq = SPILL_SEQ.fetch_add(1, AtomicOrdering::Relaxed);
+        let path = dir.join(format!("jed-spill-{}-{}.tmp", std::process::id(), seq));
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        match opts.open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(io_error(e)),
+        }
     }
 }
 

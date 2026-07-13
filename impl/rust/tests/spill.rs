@@ -8,8 +8,11 @@
 
 use std::path::PathBuf;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use jed::value::Value;
-use jed::{CreateOptions, Database, Outcome, Session, SessionOptions};
+use jed::{CreateOptions, Database, OpenOptions, Outcome, Session, SessionOptions};
 
 fn tmp(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name)
@@ -119,13 +122,16 @@ fn spill_leaves_no_temp_files() {
     };
     let before = count_spill_files();
 
-    let mut db = Database::create(CreateOptions {
+    let db = Database::create(CreateOptions {
         path: Some(std::path::PathBuf::from(&path)),
         skip_fsync: true,
         ..Default::default()
     })
-    .unwrap()
-    .session(SessionOptions::default());
+    .unwrap();
+    // Isolate this cleanup assertion from other parallel spill tests. Production file hosts use the
+    // OS temp directory; this crate-private override is test-only.
+    db.set_spill_dir_for_test(dir.clone());
+    let mut db = db.session(SessionOptions::default());
     seed(&mut db, 150);
     db.set_work_mem(64); // force heavy spilling
 
@@ -140,6 +146,97 @@ fn spill_leaves_no_temp_files() {
 
     drop(db);
     let _ = std::fs::remove_file(&path);
+}
+
+#[cfg(unix)]
+struct RestoreWritableDir(PathBuf);
+
+#[cfg(unix)]
+impl Drop for RestoreWritableDir {
+    fn drop(&mut self) {
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn read_only_database_directory_spills_to_host_temp() {
+    let dir = tmp("read_only_spill_dir");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("db.jed");
+
+    let db = Database::create(CreateOptions {
+        path: Some(path.clone()),
+        skip_fsync: true,
+        ..Default::default()
+    })
+    .unwrap();
+    {
+        let mut s = db.session(SessionOptions::default());
+        seed(&mut s, 150);
+    }
+    drop(db);
+    let before = std::fs::read(&path).unwrap();
+
+    // The database filesystem is readable but cannot host a sibling spill file. The read-only
+    // handle must use independent host scratch storage and keep the database byte-identical.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let _restore = RestoreWritableDir(dir.clone());
+
+    let db = Database::open_with_options(
+        &path,
+        OpenOptions {
+            read_only: true,
+            work_mem: 64,
+            skip_fsync: true,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap();
+    let mut s = db.read_session();
+    s.set_work_mem(64); // force dozens of runs through the shared read-session plumbing
+    let (rows, _) = run(&mut s, "SELECT id FROM t ORDER BY k, id");
+    assert_eq!(rows.len(), 150);
+    assert!(
+        std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .all(|e| !e.file_name().to_string_lossy().starts_with("jed-spill-")),
+        "spill file was written beside the read-only database"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "read-only spilling query changed the database file"
+    );
+    drop(s);
+    drop(db);
+}
+
+#[test]
+fn unavailable_spill_scratch_aborts_with_58030() {
+    let path = tmp("spill_io_error.jed");
+    let _ = std::fs::remove_file(&path);
+    let db = Database::create(CreateOptions {
+        path: Some(path.clone()),
+        skip_fsync: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let missing = tmp("missing_spill_dir");
+    let _ = std::fs::remove_dir_all(&missing);
+    db.set_spill_dir_for_test(missing);
+    let mut s = db.session(SessionOptions::default());
+    seed(&mut s, 50);
+    s.set_work_mem(64);
+    let err = s
+        .query_outcome("SELECT id FROM t ORDER BY k, id", &[])
+        .unwrap_err();
+    assert_eq!(err.code(), "58030");
+    drop(s);
+    drop(db);
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]

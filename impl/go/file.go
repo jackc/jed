@@ -41,6 +41,7 @@ func create(path string, opts databaseOptions) (*engine, error) {
 	}
 	db := newEngine()
 	db.path = path
+	db.spillDir = os.TempDir()
 	db.pageSize = opts.PageSize
 	db.committed.txid = 1                                  // the initial empty image is committed as txid 1
 	if err := db.writeFullImage(opts.noSync); err != nil { // lay down the from-scratch image; later commits are incremental
@@ -139,6 +140,7 @@ func openWithOptions(path string, opts OpenOptions) (*engine, error) {
 		return nil, err
 	}
 	db.path = path
+	db.spillDir = os.TempDir()
 	db.readOnly = opts.ReadOnly
 	if opts.WorkMem != 0 {
 		db.session.workMem = opts.WorkMem

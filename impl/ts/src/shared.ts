@@ -96,7 +96,8 @@ import type { ClockFunc, RandomFill } from "./seam.ts";
 import type { Value } from "./value.ts";
 
 // databaseFromSnapshot builds a session-local handle whose committed root is `snap`. It retains the
-// shared storage identity only for host-backed spill; the snapshot's stores continue to own paging.
+// shared storage identity's independent host scratch sink for spill; the snapshot's stores continue
+// to own paging and the database path remains persistence-only.
 // A read handle keeps no open transaction (reads hit committed = the pinned snapshot); a write handle
 // keeps an open READ WRITE block and publishes its working set.
 function databaseFromSnapshot(snap: Snapshot, core: SharedCore): Engine {
@@ -107,9 +108,10 @@ function databaseFromSnapshot(snap: Snapshot, core: SharedCore): Engine {
   // file-backed databases (CLAUDE.md §8). In-memory the core's pageSize is the default, so this is a
   // no-op there.
   db.pageSize = core.pageSize;
-  // work_mem spill is a host property of the shared storage identity. Minted sessions must retain
-  // its path/sink or a file-backed ORDER BY silently becomes in-memory-only. The snapshot's stores
-  // already carry paging; installing the storage owner's pager here would bypass its page accounting.
+  // work_mem spill is a host property of the shared storage identity. Minted sessions retain its
+  // scratch sink independently of the persistence path; otherwise a file-backed ORDER BY silently
+  // becomes in-memory-only. The snapshot's stores already carry paging; installing the storage
+  // owner's pager here would bypass its page accounting.
   db.path = core.storage.path;
   db.spillSink = core.storage.spillSink;
   db.readOnly = core.readOnly;

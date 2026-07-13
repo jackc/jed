@@ -113,6 +113,14 @@ func (s *sorter) spillRun() error {
 	if err != nil {
 		return ioError(err)
 	}
+	path := f.Name()
+	keep := false
+	defer func() {
+		if !keep {
+			_ = f.Close()
+			_ = os.Remove(path)
+		}
+	}()
 	w := bufio.NewWriter(f)
 	spillWriteU64(w, uint64(len(s.buf)))
 	for _, row := range s.buf {
@@ -125,7 +133,8 @@ func (s *sorter) spillRun() error {
 	if err := f.Close(); err != nil {
 		return ioError(err)
 	}
-	s.runs = append(s.runs, f.Name())
+	s.runs = append(s.runs, path)
+	keep = true
 	s.buf = s.buf[:0]
 	s.bufBytes = 0
 	return nil

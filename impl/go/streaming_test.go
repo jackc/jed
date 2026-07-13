@@ -593,6 +593,7 @@ func TestSortedSpillMergeStreamsLazily(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	db.setSpillDirForTest(dir) // isolate live-run assertions from parallel OS-temp spills
 	w := db.WriteSession()
 	if _, err := queryOutcome(w, "CREATE TABLE t (id i32 PRIMARY KEY, k i32)", nil); err != nil {
 		t.Fatal(err)

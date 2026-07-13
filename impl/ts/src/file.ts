@@ -14,6 +14,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname } from "node:path";
 
 import { FileBlockStore } from "./fileblockstore.ts";
@@ -74,7 +75,9 @@ export function create(path: string, opts: DatabaseOptions = {}): Engine {
     cacheLeaves(DEFAULT_CACHE_BYTES, db.pageSize),
   ); // valid header
   db.committed.storePaging = db.paging;
-  db.spillSink = new FileSpillSink(dirname(path)); // ORDER BY spills next to the database file (spill.md §4)
+  // Scratch is independent of the persistence path: a read-only database directory must still be
+  // able to serve a bounded ORDER BY (spill.md §4, api.md §2.1).
+  db.spillSink = new FileSpillSink(tmpdir());
   return db;
 }
 
@@ -149,7 +152,9 @@ export function open(path: string, opts: OpenOptions = {}): Engine {
     db.path = path;
     db.persistHook = persistImpl; // autocommit each later write (transactions.md §4.1)
     db.readOnly = readOnly;
-    db.spillSink = new FileSpillSink(dirname(path)); // ORDER BY spills next to the database file (spill.md §4)
+    // Scratch is independent of the persistence path, so read-only database filesystems remain
+    // readable when ORDER BY crosses work_mem (spill.md §4, api.md §2.1).
+    db.spillSink = new FileSpillSink(tmpdir());
     // 0 (or unset) means "the default budget", not "unlimited" — the zero value stays a safe finite
     // budget (matching Go/Rust). Unbounded/never-spill is a runtime-only mode via setWorkMem(0).
     if (opts.workMem) db.session.workMem = opts.workMem;

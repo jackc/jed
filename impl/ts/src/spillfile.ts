@@ -8,14 +8,16 @@
 
 import { closeSync, openSync, readSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { engineError } from "./errors.ts";
 import type { SpillByteReader, SpillRun, SpillSink } from "./spill.ts";
 
 // A unique-per-process counter for spill file names (combined with the process id), so concurrent
 // sorters never collide. Internal — it never affects results (spill.md §6).
 let spillSeq = 0;
 
-// FileSpillSink writes each spilled run to a temp file under `dir` (the database file's directory,
-// guaranteed writable — spill.md §4) and hands back a FileSpillRun to read it lazily.
+// FileSpillSink writes each spilled run to a temp file under the host scratch directory (the Node
+// file host defaults to os.tmpdir(), never the database directory) and hands back a FileSpillRun to
+// read it lazily. Scratch can be shared, so creation is exclusive and private.
 export class FileSpillSink implements SpillSink {
   private dir: string;
 
@@ -24,10 +26,47 @@ export class FileSpillSink implements SpillSink {
   }
 
   writeRun(bytes: Uint8Array): SpillRun {
-    const path = join(this.dir, `jed-spill-${process.pid}-${spillSeq++}.tmp`);
-    writeFileSync(path, bytes);
-    return new FileSpillRun(path);
+    for (;;) {
+      const path = join(this.dir, `jed-spill-${process.pid}-${spillSeq++}.tmp`);
+      let fd: number;
+      try {
+        fd = openSync(path, "wx", 0o600);
+      } catch (e) {
+        if (isAlreadyExists(e)) continue;
+        throw spillIoError(e);
+      }
+      let open = true;
+      try {
+        writeFileSync(fd, bytes);
+        closeSync(fd);
+        open = false;
+        return new FileSpillRun(path);
+      } catch (e) {
+        if (open) {
+          try {
+            closeSync(fd);
+          } catch {
+            // preserve the original write/close error
+          }
+        }
+        try {
+          unlinkSync(path);
+        } catch {
+          // best-effort cleanup of a partial run
+        }
+        throw spillIoError(e);
+      }
+    }
   }
+}
+
+function isAlreadyExists(e: unknown): boolean {
+  return typeof e === "object" && e !== null && "code" in e && e.code === "EEXIST";
+}
+
+function spillIoError(e: unknown): Error {
+  const msg = e instanceof Error ? e.message : String(e);
+  return engineError("io_error", "I/O error: " + msg);
 }
 
 // FileSpillRun is a written run file; open() streams it back once (the k-way merge opens each run once).

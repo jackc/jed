@@ -635,6 +635,7 @@ impl Engine {
         e.page_size = self.page_size;
         e.paging = self.paging.clone();
         e.path = self.path.clone();
+        e.spill_dir = self.spill_dir.clone();
         e.read_only = self.read_only;
         let src = &self.session;
         let dst = &mut e.session;
@@ -1332,24 +1333,16 @@ impl Engine {
         })
     }
 
-    /// Build an [`Sorter`](crate::spill::Sorter) for `order`, bounded by this handle's `work_mem`.
-    /// Spilling is enabled only for a **file-backed** database (an in-memory one has nowhere to
-    /// spill — spill.md §2); spill runs live next to the database file (same filesystem, guaranteed
-    /// writable), falling back to the system temp dir.
+    /// Build a [`Sorter`](crate::spill::Sorter) for `order`, bounded by this handle's `work_mem`.
+    /// Spilling is enabled only when the host supplied scratch backing. The Node/file host uses the
+    /// OS temp directory, independently of the database path, so read-only filesystems remain
+    /// readable; in-memory hosts have no scratch backing and never spill (spill.md §2/§4).
     pub(crate) fn new_sorter(&self, order: &[crate::spill::SortKey]) -> crate::spill::Sorter {
-        let spill_dir = if self.path.is_some() {
-            let dir = self
-                .path
-                .as_ref()
-                .and_then(|p| p.parent())
-                .filter(|p| !p.as_os_str().is_empty())
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(std::env::temp_dir);
-            Some(dir)
-        } else {
-            None
-        };
-        crate::spill::Sorter::new(order.to_vec(), self.session.work_mem, spill_dir)
+        crate::spill::Sorter::new(
+            order.to_vec(),
+            self.session.work_mem,
+            self.spill_dir.clone(),
+        )
     }
 
     /// Materialize one FROM relation `ri` into its rows, given the current outer-row stack `outer`

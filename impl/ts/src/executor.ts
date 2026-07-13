@@ -12244,9 +12244,9 @@ export class Engine {
   }
 
   // newSorterFor builds a Sorter for order, bounded by this handle's workMem. Spilling is enabled only
-  // when a spillSink is present — a durable host that can spill to disk sets one (file.ts →
-  // FileSpillSink, writing runs next to the database file); an in-memory or OPFS database leaves it
-  // null and sorts fully resident (spill.md §2).
+  // when a spillSink is present — a durable host that can spill to disk sets one (the Node file host
+  // uses an OS-temp FileSpillSink, independent of the database path); an in-memory or OPFS database
+  // leaves it null and sorts fully resident (spill.md §2/§4).
   private newSorterFor(order: OrderSlot[]): Sorter {
     const compare: RowCompare = (a, b) => {
       for (const k of order) {

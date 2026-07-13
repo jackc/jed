@@ -7,13 +7,13 @@
 // spill temp file leaks. Files live under a fresh mkdtemp dir, never the repo tree.
 
 import assert from "node:assert/strict";
-import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { createDatabase } from "../src/tooling.ts";
+import { createDatabase, openDatabase, setSpillDirForTest } from "../src/tooling.ts";
 import { type Handle, queryOutcome } from "./util.ts";
-import type { Value } from "../src/lib.ts";
+import { EngineError, type Value } from "../src/lib.ts";
 import { memDb } from "./mem_db.ts";
 
 function runQuery(db: Handle, sql: string): { rows: Value[][]; cost: bigint } {
@@ -114,7 +114,10 @@ test("spilling sort matches the in-memory rows and cost", () => {
 test("spill leaves no temp files", () => {
   const dir = mkdtempSync(join(tmpdir(), "jed-spill-clean-"));
   try {
-    const db = createDatabase({ path: join(dir, "spill_cleanup.jed"), skipFsync: true }).session();
+    const database = createDatabase({ path: join(dir, "spill_cleanup.jed"), skipFsync: true });
+    // Isolate this cleanup assertion from other test files spilling in parallel to the OS temp dir.
+    setSpillDirForTest(database, dir);
+    const db = database.session();
     seedSpill(db, 150);
     db.setWorkMem(64); // force heavy spilling
 
@@ -122,6 +125,76 @@ test("spill leaves no temp files", () => {
     runQuery(db, "SELECT id FROM t ORDER BY k, id LIMIT 3");
     const leaked = readdirSync(dir).filter((n) => n.startsWith("jed-spill-"));
     assert.equal(leaked.length, 0, `spill run files leaked: ${leaked.join(", ")}`);
+    db.close();
+    database.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a read-only database directory spills to host scratch", {
+  skip: process.platform === "win32",
+}, () => {
+  const dir = mkdtempSync(join(tmpdir(), "jed-spill-read-only-"));
+  const path = join(dir, "db.jed");
+  let readOnly = false;
+  try {
+    {
+      const db = createDatabase({ path, skipFsync: true });
+      const s = db.session();
+      seedSpill(s, 150);
+      s.close();
+      db.close();
+    }
+    const before = readFileSync(path);
+
+    // The database filesystem is readable but cannot host a sibling spill file. The read-only
+    // handle must use independent host scratch storage and keep the database byte-identical.
+    chmodSync(dir, 0o555);
+    readOnly = true;
+    const db = openDatabase(path, { readOnly: true, workMem: 64, skipFsync: true });
+    try {
+      const s = db.readSession();
+      try {
+        s.setWorkMem(64); // force dozens of runs through the shared read-session plumbing
+        const { rows } = runQuery(s, "SELECT id FROM t ORDER BY k, id");
+        assert.equal(rows.length, 150);
+        assert.equal(
+          readdirSync(dir).filter((n) => n.startsWith("jed-spill-")).length,
+          0,
+          "spill file was written beside the read-only database",
+        );
+        assert.deepEqual(
+          readFileSync(path),
+          before,
+          "read-only spilling query changed the database file",
+        );
+      } finally {
+        s.close();
+      }
+    } finally {
+      db.close();
+    }
+  } finally {
+    if (readOnly) chmodSync(dir, 0o755);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an unavailable spill target aborts with 58030", () => {
+  const dir = mkdtempSync(join(tmpdir(), "jed-spill-io-error-"));
+  try {
+    const db = createDatabase({ path: join(dir, "db.jed"), skipFsync: true });
+    setSpillDirForTest(db, join(dir, "missing"));
+    const s = db.session();
+    seedSpill(s, 50);
+    s.setWorkMem(64);
+    assert.throws(
+      () => runQuery(s, "SELECT id FROM t ORDER BY k, id"),
+      (e: unknown) => e instanceof EngineError && e.code() === "58030",
+    );
+    s.close();
+    db.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

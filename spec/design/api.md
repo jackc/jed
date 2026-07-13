@@ -225,9 +225,10 @@ candidate is either backing-agnostic or a subset of the file case — so each la
   database (which cannot evict, so the bound is a deterministic abort — a `53200`-style
   out-of-memory error, fitting the untrusted-query resource guarantee, CLAUDE.md §13). DuckDB's
   `memory_limit` (default 80% of RAM) and SQLite's `soft_heap_limit`/`cache_size` are this knob.
-- **A spill target** — jed already has the `work_mem` *budget* (`open` opts, §2.1) but no *location*
-  for where a spilling operator ([spill.md](spill.md)) overflows to; DuckDB's `temporary_directory`
-  / SQLite's `temp_store` are this.
+- **A spill-target override** — jed already has the `work_mem` *budget* (`open` opts, §2.1) and file
+  hosts default spills to host scratch storage (the OS temp directory, independent of the database
+  path; [spill.md](spill.md) §4), but callers cannot yet select another location. DuckDB's
+  `temporary_directory` / SQLite's `temp_store` are this knob.
 - **A thread/parallelism count** — a later lever on the near-lock-free read path (CLAUDE.md §2/§3);
   DuckDB's `threads` / SQLite's worker-thread limit.
 

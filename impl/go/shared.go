@@ -183,6 +183,7 @@ type storage struct {
 	freeGenTxid uint64
 	readOnly    bool   // opened read-only (api.md §2.1): every session is then read-only, a write is 25006. Always false in-memory.
 	path        string // the backing file path; "" for an in-memory database (surfaced by Database.Path / Session.Path)
+	spillDir    string // host scratch directory for external-sort runs; independent of path, "" when unavailable
 }
 
 // persist durably publishes snap to the backing store via an incremental copy-on-write commit
@@ -511,6 +512,7 @@ func sharedCoreFromEngine(e *engine) *sharedCore {
 		paging:    e.paging,
 		readOnly:  e.readOnly,
 		path:      e.path,
+		spillDir:  e.spillDir,
 		// v25: the main domain (file or in-memory) reclaims within-session — the open path reads the
 		// persisted free-list and no longer reconstructs it, so mid-session orphans must be returned at
 		// each commit or they would leak permanently (format.md *Reclamation*).
@@ -682,6 +684,7 @@ func (db *Database) Attach(name string, source AttachSource, readOnly bool) erro
 			paging:    e.paging,
 			readOnly:  e.readOnly,
 			path:      e.path,
+			spillDir:  e.spillDir,
 			// v25: a file attachment persists + reclaims like the main file domain.
 			reclaimWithinSession: true,
 			liveAtCompaction:     e.liveAtCompaction,
@@ -811,6 +814,11 @@ func (s *Database) PageCount() uint32 { return s.core.pageCount() }
 // Path is the backing file path for a file-backed database; "" in-memory.
 func (s *Database) Path() string { return s.core.path() }
 
+// setSpillDirForTest overrides the host scratch directory for per-core spill tests. Production file
+// hosts install os.TempDir at open/create; this unexported hook keeps the configurable spill-target
+// follow-on out of the embedding API.
+func (s *Database) setSpillDirForTest(dir string) { s.core.storage.spillDir = dir }
+
 // ReadOnly reports whether this database was opened read-only. In-memory databases are writable.
 func (s *Database) ReadOnly() bool { return s.core.readOnlyMode() }
 
@@ -824,7 +832,7 @@ func (s *Database) ReadSession() *Session {
 	snap := rt.committed
 	// Reads never mutate the snapshot (a write is rejected before dispatch), so the engine shares the
 	// immutable pinned snapshot directly — no clone. The attached roots are pinned together (§5).
-	engine := &engine{committed: snap, pageSize: s.core.pageSize(), path: s.core.storage.path, session: newSession()}
+	engine := &engine{committed: snap, pageSize: s.core.pageSize(), path: s.core.storage.path, spillDir: s.core.storage.spillDir, session: newSession()}
 	engine.core = s.core
 	engine.attachedCommitted = rt.attached
 	engine.readOnly = true // the executor rejects writes (25006) / poisons a read-only block
@@ -847,7 +855,7 @@ func (s *Database) WriteSession() *Session {
 	rt := s.core.roots.Load()
 	base := rt.committed
 	// committed is the immutable base (the writer mutates only working, which beginTx clones off it).
-	engine := &engine{committed: base, pageSize: s.core.pageSize(), path: s.core.storage.path, session: newSession()}
+	engine := &engine{committed: base, pageSize: s.core.pageSize(), path: s.core.storage.path, spillDir: s.core.storage.spillDir, session: newSession()}
 	engine.core = s.core
 	engine.attachedCommitted = rt.attached
 	_, _ = engine.beginTx(true, true)
@@ -866,7 +874,7 @@ func (s *Database) Session(opts SessionOptions) *Session {
 	// autocommit lazy-gate one — no persistent pin (each autocommit read pins per statement).
 	if s.core.readOnlyMode() {
 		rt, v := s.core.pinLatest()
-		engine := &engine{committed: rt.committed, pageSize: s.core.pageSize(), path: s.core.storage.path, session: newSessionWithOptions(opts)}
+		engine := &engine{committed: rt.committed, pageSize: s.core.pageSize(), path: s.core.storage.path, spillDir: s.core.storage.spillDir, session: newSessionWithOptions(opts)}
 		engine.core = s.core
 		engine.attachedCommitted = rt.attached
 		engine.readOnly = true // the executor enforces read-only too (rejects BEGIN READ WRITE, poisons a read-only block)
@@ -874,7 +882,7 @@ func (s *Database) Session(opts SessionOptions) *Session {
 	}
 	rt := s.core.roots.Load()
 	snap := rt.committed
-	engine := &engine{committed: snap, pageSize: s.core.pageSize(), path: s.core.storage.path, session: newSessionWithOptions(opts)}
+	engine := &engine{committed: snap, pageSize: s.core.pageSize(), path: s.core.storage.path, spillDir: s.core.storage.spillDir, session: newSessionWithOptions(opts)}
 	engine.core = s.core
 	engine.attachedCommitted = rt.attached
 	return &Session{core: s.core, engine: engine, access: accessReadWrite, baseVersion: snap.txid}

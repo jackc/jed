@@ -217,6 +217,9 @@ pub(crate) struct Storage {
     read_only: bool,
     /// The backing file path; `None` for an in-memory database. Surfaced by [`Database::path`].
     path: Option<std::path::PathBuf>,
+    /// Host scratch directory for external-sort runs; independent of `path` so read-only database
+    /// directories never receive spill files. `None` for hosts with no spill backing.
+    spill_dir: Option<std::path::PathBuf>,
     /// Turns on within-session free-list compaction ([`Storage::maybe_compact`]): the never-reopened
     /// in-RAM temp domains set it (temp-tables.md §6, bplus-reshape.md), so their copy-on-write orphans
     /// are reclaimed rather than leaked. The main file/in-memory domain ALSO sets it (v25 — continuous
@@ -260,6 +263,7 @@ impl Storage {
             paging: crate::paging::SharedPaging::new(pager, usize::MAX),
             read_only: false,
             path: None,
+            spill_dir: None,
             reclaim_within_session: true,
             live_at_compaction: 0,
             free_gen_txid: 0,
@@ -687,13 +691,15 @@ impl Shared {
             .page_size
     }
 
-    /// Copy the immutable host path onto a freshly minted execution engine so file-backed spill is
-    /// available. The published snapshot's stores already own the shared paging context; installing
-    /// it as this session's write pager would bypass the core's page-accounting owner.
+    /// Copy the immutable host configuration onto a freshly minted execution engine. The database
+    /// path remains the persistence identity; the independent spill directory is scratch backing.
+    /// The published snapshot's stores already own the shared paging context; installing it as this
+    /// session's write pager would bypass the core's page-accounting owner.
     fn configure_engine(&self, engine: &mut Engine) {
         let storage = self.storage.lock().expect("storage lock not poisoned");
         engine.page_size = storage.page_size;
         engine.path = storage.path.clone();
+        engine.spill_dir = storage.spill_dir.clone();
         engine.read_only = storage.read_only;
     }
 
@@ -876,6 +882,7 @@ impl Database {
             paging,
             read_only: engine.read_only,
             path: engine.path.clone(),
+            spill_dir: engine.spill_dir.clone(),
             // v25: the main domain (file or in-memory) now reclaims within-session — the open path
             // reads the persisted free-list and no longer reconstructs it, so mid-session orphans must
             // be returned at each commit or they would leak permanently (format.md *Reclamation*).
@@ -972,6 +979,18 @@ impl Database {
     /// The backing file path for a file-backed database; `None` in-memory.
     pub fn path(&self) -> Option<std::path::PathBuf> {
         self.0.path()
+    }
+
+    /// Override the host scratch directory for per-core spill tests. Production hosts install the
+    /// OS temp directory at open/create; keeping this crate-private and test-only avoids widening the
+    /// embedding API before the configurable spill-target slice.
+    #[cfg(test)]
+    pub(crate) fn set_spill_dir_for_test(&self, dir: std::path::PathBuf) {
+        self.0
+            .storage
+            .lock()
+            .expect("storage lock not poisoned")
+            .spill_dir = Some(dir);
     }
 
     /// Whether this database was opened read-only (a write is `25006`). In-memory databases are
@@ -1083,6 +1102,7 @@ impl Database {
                 paging,
                 read_only: engine.read_only,
                 path: engine.path.clone(),
+                spill_dir: engine.spill_dir.clone(),
                 // v25: a file attachment persists + reclaims like the main file domain (above).
                 reclaim_within_session: true,
                 live_at_compaction: engine.live_at_compaction,

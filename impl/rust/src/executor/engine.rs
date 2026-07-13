@@ -18,6 +18,7 @@ impl Engine {
         Engine {
             committed: Snapshot::default(),
             path: None,
+            spill_dir: None,
             page_size,
             page_count: 0,
             free_pages: Vec::new(),
@@ -42,6 +43,7 @@ impl Engine {
         Engine {
             committed: snap,
             path: None,
+            spill_dir: None,
             page_size: DEFAULT_PAGE_SIZE,
             page_count: 0,
             free_pages: Vec::new(),
