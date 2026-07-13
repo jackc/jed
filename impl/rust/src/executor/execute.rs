@@ -653,6 +653,7 @@ impl Engine {
             Statement::Rollback => return self.rollback_tx(),
             _ => {}
         }
+        self.estimator_touched.clear();
         // Fresh per-statement sequence-advance scratch (a prior statement's error may have left it
         // populated — it is discarded, not flushed, on error; sequences.md §5).
         self.session.pending_seq.borrow_mut().clear();

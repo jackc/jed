@@ -42,9 +42,16 @@ export class Snapshot {
   // (CREATE/DROP/ALTER of a table/type/index), carried forward across clone(). Unlike txid it does
   // NOT move on data writes and is defined for in-memory databases too, so a prepared statement's
   // plan cache keys its committed-plan validity on it: a cached plan is reusable iff the read
-  // snapshot's catGen still equals the plan's (spec/design/api.md §2.4). NOT bumped by sequence
-  // nextval (a data write on the nextval path), only by sequence DDL — a SELECT plan binds no sequence.
+  // prepared statement's relation signature includes it alongside database identity, table name,
+  // and estimator revision (spec/design/api.md §2.4). NOT bumped by sequence nextval (a data write on
+  // the nextval path), only by sequence DDL — a SELECT plan binds no sequence.
   catGen: bigint = 0n;
+  // Exact, opaque prepared-cache identity/revision tokens (estimator.md §6). They are never
+  // serialized or rendered. A clone shares them until a relevant table mutation replaces its
+  // revision; a fresh create/open/attachment starts with a fresh database identity.
+  estimatorIdentity: object = {};
+  private estimatorBaseRevision: object = {};
+  private estimatorRevisions: Map<string, object> = new Map();
   tables: Map<string, Table>;
   // types holds the user-defined composite (row) types, keyed by lowercased name
   // (spec/design/composite.md). A database-level object set, separate from tables; serialized into
@@ -132,6 +139,9 @@ export class Snapshot {
     // GiST trees are never mutated in place — only replaced wholesale — so a shallow Map copy is safe.
     c.gistTrees = new Map(this.gistTrees);
     c.catGen = this.catGen;
+    c.estimatorIdentity = this.estimatorIdentity;
+    c.estimatorBaseRevision = this.estimatorBaseRevision;
+    c.estimatorRevisions = new Map(this.estimatorRevisions);
     // The temp domain's paging is shared by reference (one pool per domain), like a store's paging.
     c.storePaging = this.storePaging;
     return c;
@@ -141,6 +151,14 @@ export class Snapshot {
   // SELECT plan cached against a prior generation is thereby invalidated on the next execute.
   bumpCatGen(): void {
     this.catGen += 1n;
+  }
+
+  estimatorRevisionFor(name: string): object {
+    return this.estimatorRevisions.get(name.toLowerCase()) ?? this.estimatorBaseRevision;
+  }
+
+  bumpEstimatorRevision(name: string): void {
+    this.estimatorRevisions.set(name.toLowerCase(), {});
   }
 
   // gistTreeFor returns the resident GiST R-tree of the named index (lowercased key), or undefined if
@@ -593,6 +611,7 @@ export class Snapshot {
     if (this.storePaging !== null) st.attachPaging(this.storePaging);
     this.stores.set(key, st);
     this.tables.set(key, t);
+    this.estimatorRevisions.delete(key);
   }
 
   // removeTable removes a table's definition, its store, and its indexes' stores (DROP
@@ -603,6 +622,7 @@ export class Snapshot {
     if (t) for (const idx of t.indexes) this.indexStores.delete(idx.name.toLowerCase());
     this.tables.delete(key);
     this.stores.delete(key);
+    this.estimatorRevisions.delete(key);
   }
 
   // indexStore returns a secondary index's store (the index is known to exist). nameKey

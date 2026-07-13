@@ -194,6 +194,13 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   failure, rollback, temp/attached routing, and reopen. Root/count mismatches are `XX001`; shared
   byte goldens and all three cores pin the contract. → [format.md](spec/fileformat/format.md),
   [storage.md §6](spec/design/storage.md)
+- [x] **P2 — statistics-aware prepared-plan cache validity** — cached SELECT plans now carry an
+  exact, collision-free relation signature over each owning database/attachment identity, catalog
+  generation, normalized table name, and transactional estimator revision. Relevant row mutations
+  invalidate even when counts return to the old value; unrelated table writes remain hits; working
+  revisions cannot fill the committed slot; rollback restores validity; attachments validate against
+  their own snapshot identity. The tokens are non-persisted snapshot metadata, so the file format is
+  unchanged. → [estimator.md §6](spec/design/estimator.md), [api.md §2.4](spec/design/api.md)
 - [ ] **Plan-time cost estimator** — estimate the same cost units the runtime meter charges
   (`page_read`/`storage_row_read`/`row_produced`/…) for each candidate plan and pick the cheapest,
   instead of today's structural tie-breaks (lowest index name, FROM order). Authored as a **spec'd,

@@ -45,6 +45,7 @@ func (db *engine) ExecuteStmtParams(stmt statement, params []Value) (outcome, er
 	case stmt.Rollback != nil:
 		return db.rollbackTx()
 	}
+	clear(db.estimatorTouched)
 	// Fresh per-statement sequence-advance scratch (a prior statement's error may have left it
 	// populated — it is discarded, not flushed, on error; sequences.md §5).
 	db.session.pendingSeq = nil

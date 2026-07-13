@@ -309,11 +309,19 @@ pub struct Snapshot {
     /// The catalog generation — a monotonic counter bumped by every schema mutation (CREATE/DROP/
     /// ALTER of a table/type/index), carried forward across `clone()` (rides `#[derive(Clone)]`).
     /// Unlike `txid` it does NOT move on data writes and is defined for in-memory databases too, so
-    /// a prepared statement's plan cache keys its committed-plan validity on it: a cached plan is
-    /// reusable iff the read snapshot's `cat_gen` still equals the plan's (spec/design/api.md §2.4).
+    /// a prepared statement's relation signature includes it alongside database identity, table
+    /// name, and estimator revision (spec/design/api.md §2.4).
     /// NOT bumped by sequence `nextval` (a data write on the nextval path), only by sequence DDL — a
     /// SELECT plan binds no sequence.
     pub(crate) cat_gen: u64,
+    /// Opaque, non-persisted identity for this database domain. Snapshot/transaction clones share
+    /// it; every fresh create/open/attachment gets a new token (estimator.md §6).
+    pub(crate) estimator_identity: std::sync::Arc<EstimatorDatabaseIdentity>,
+    /// Base revision shared by tables not mutated under this identity, plus per-table overrides.
+    /// Replacing an `Arc` is an exact collision-free revision change; clone/rollback follow the
+    /// snapshot automatically and no file-format state is involved.
+    estimator_base_revision: std::sync::Arc<EstimatorRevision>,
+    estimator_revisions: std::sync::Arc<HashMap<String, std::sync::Arc<EstimatorRevision>>>,
     tables: std::sync::Arc<HashMap<String, Table>>,
     /// User-defined composite (row) types, keyed by lowercased name (spec/design/composite.md).
     /// A database-level object set, separate from `tables`; serialized into the catalog's
@@ -364,6 +372,16 @@ pub struct Snapshot {
     /// creates stores against the same domain page space, and `#[derive(Default)]` (`None`).
     /// NEVER serialized.
     store_paging: Option<std::sync::Arc<crate::paging::SharedPaging>>,
+}
+
+/// Non-persisted equality tokens used only by prepared-plan cache validation.
+#[derive(Default)]
+pub(crate) struct EstimatorDatabaseIdentity {
+    _marker: u8,
+}
+#[derive(Default)]
+pub(crate) struct EstimatorRevision {
+    _marker: u8,
 }
 
 /// One FOREIGN KEY dependent surfaced by a multi-table `DROP TABLE`'s dependency scan
@@ -470,6 +488,9 @@ pub struct Engine {
     /// only the DATABASE-scoped roots. Set at session mint; adopted from a tx's `attach_working` on a
     /// successful commit.
     pub(crate) attached_committed: HashMap<String, std::sync::Arc<Snapshot>>,
+    /// Relations whose estimator revision was already advanced by the current top-level statement.
+    /// Data-modifying CTEs may touch the same table more than once; the P2 contract advances it once.
+    pub(crate) estimator_touched: HashSet<(String, String)>,
 }
 
 /// An RAII counter for a live streaming cursor (temp-tables.md §6): built by [`Engine::open_stream_guard`]

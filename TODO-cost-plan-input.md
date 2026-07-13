@@ -128,31 +128,38 @@ core writes and reads byte-identical files without regressing open behavior.
 **Status:** complete on 2026-07-13. `format_version` 28 stores `row_count` as a nonnegative signed
 `i64` end-to-end (Rust `i64`, Go `int64`, TypeScript `bigint`), with an exact-version clean break and
 no v27 migration path. `bundle exec rake ci` passes after regenerating and independently verifying
-all 61 file-format fixtures. P2 is the next implementation slice.
+all 61 file-format fixtures. P2 is complete below; P3 is the next implementation slice.
 
 ## P2 — Statistics-aware prepared-plan cache validity
 
 **Goal:** a cached plan must remain identical to a freshly planned query after estimator inputs
 change.
 
-- [ ] Define a deterministic estimator-input fingerprint for the relations a plan references.
-- [ ] Include every fact that can affect selection: row counts, admitted structural page facts,
+- [x] Define a deterministic estimator-input fingerprint for the relations a plan references.
+- [x] Include every fact that can affect selection: row counts, admitted structural page facts,
   later histogram/NDV versions, database/attachment identity, and relevant catalog generation.
-- [ ] Extend prepared-plan cache entries and hit validation in Rust, Go, and TypeScript.
-- [ ] Keep the fingerprint relation-scoped where practical so unrelated table changes do not
+- [x] Extend prepared-plan cache entries and hit validation in Rust, Go, and TypeScript.
+- [x] Keep the fingerprint relation-scoped where practical so unrelated table changes do not
   invalidate a plan unnecessarily.
-- [ ] Handle attached databases explicitly; do not validate only against the main database's
+- [x] Handle attached databases explicitly; do not validate only against the main database's
   catalog/statistics state.
-- [ ] Keep temporary-relation plans uncacheable under the existing rule unless a complete temp
+- [x] Keep temporary-relation plans uncacheable under the existing rule unless a complete temp
   fingerprint is deliberately specified.
-- [ ] Ensure working-transaction statistics never populate a committed cache entry.
-- [ ] Verify rollback leaves the committed fingerprint and cache validity unchanged.
-- [ ] Add prepared-versus-fresh tests that alter relevant and irrelevant table counts.
-- [ ] Assert cached and fresh executions choose the same EXPLAIN plan and accrue the same actual
+- [x] Ensure working-transaction statistics never populate a committed cache entry.
+- [x] Verify rollback leaves the committed fingerprint and cache validity unchanged.
+- [x] Add prepared-versus-fresh tests that alter relevant and irrelevant table counts.
+- [x] Assert cached and fresh executions choose the same EXPLAIN plan and accrue the same actual
   cost.
 
 **Exit gate:** every cache hit is result-, plan-, estimate-, and actual-cost-identical to a fresh
 planning pass over the same visible snapshot.
+
+**Status:** complete on 2026-07-13. All three cores store and compare the exact source-order tuple
+field-by-field using opaque snapshot identity/revision tokens (never a collision-prone hash). Focused
+tests cover relevant and irrelevant count changes, count-return-to-prior-value invalidation,
+working-state fill exclusion, rollback, every DML disposition, per-attachment identity/generation,
+and fresh-versus-refilled EXPLAIN/row/actual-cost parity. `bundle exec rake ci` passes. No file-format
+or SQL result change; P3 is next.
 
 ## P3 — Deterministic all-candidate inventory, behavior-neutral
 

@@ -117,13 +117,11 @@ pub(crate) fn group_by_int_key(
 
 /// A prepared statement's memoized scan plan (spec/design/api.md §2.4): the resolved [`SelectPlan`]
 /// (shared `Rc`, so a cache hit rebuilds the cursor around the SAME plan allocation and re-plans
-/// nothing) plus the finalized `$N` param types, stamped with the [`Database`](crate::Database)
-/// (shared core) and committed catalog generation they were resolved against. A statement is a
-/// standalone value shared across sessions, so a hit requires the same core — `cat_gen` is only
-/// monotonic within one core; two databases can share a generation number with different schemas —
-/// AND the same generation (any DDL bumps it and the next execute re-plans), and re-checks that no
-/// plan relation is shadowed by the executing session's temp domain ([`Engine::plan_touches_temp`]).
-/// Filled only for a reusable plan read from committed state ([`Engine::try_scan_query`]). The plan
+/// nothing) plus the finalized `$N` param types, stamped with the shared-core identity and each base
+/// relation's ordered exact estimator-input tuple (database identity, catalog generation,
+/// normalized name, revision). A hit compares every field and therefore also rejects temp shadows
+/// and replaced attachments. Filled only for a reusable plan read from committed state
+/// ([`Engine::try_scan_query`]). The plan
 /// is `!Send` (it holds a regex `Cell`), so a `PreparedStatement` carrying one is `!Send` too — a
 /// non-regression, the whole query/cursor path is already thread-affine.
 pub(crate) struct CachedPlan {
@@ -135,9 +133,18 @@ pub(crate) struct CachedPlan {
     // alive — and the weak count keeps the allocation address from being reused, so the `ptr_eq`
     // identity check cannot alias a later database (no ABA).
     pub(crate) core: std::sync::Weak<crate::shared::Shared>,
-    pub(crate) cat_gen: u64,
+    pub(crate) inputs: Vec<EstimatorInputSignature>,
     pub(crate) plan: std::rc::Rc<SelectPlan>,
     pub(crate) param_types: Vec<ScalarType>,
+}
+
+/// One exact relation-scoped estimator-input signature entry (estimator.md §6). The database and
+/// revision fields are opaque `Arc` equality tokens, not hashes, so validation is collision-free.
+pub(crate) struct EstimatorInputSignature {
+    pub(crate) database: std::sync::Arc<EstimatorDatabaseIdentity>,
+    pub(crate) cat_gen: u64,
+    pub(crate) table: String,
+    pub(crate) revision: std::sync::Arc<EstimatorRevision>,
 }
 
 /// The lazy pull pipeline behind a streaming [`Rows`](crate::Rows) cursor (spec/design/streaming.md

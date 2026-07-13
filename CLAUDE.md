@@ -958,6 +958,9 @@ of executing a query** and **abort when a caller-supplied ceiling is exceeded**.
   private planner weights, and specifies estimator inputs, exact integer/rational arithmetic,
   complete ties, and bounded search in `spec/design/estimator.md`. Estimates are unmetered
   heuristics, never safety gates; the actual runtime counter remains authoritative for ceilings.
+  P2's prepared-plan cache now validates an exact relation-scoped signature over the owning
+  database/attachment identity, catalog generation, table name, and transactional estimator revision,
+  so a hit cannot preserve a plan selected from stale estimator inputs.
 - **Ceiling + abort.** A caller may set a **maximum cost**; the instant accrued cost reaches
   it, execution **aborts deterministically** with a defined error code (registered in
   `spec/errors/`). The abort point is itself deterministic (same query + db + ceiling → same

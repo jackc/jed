@@ -6,6 +6,23 @@
 use super::*;
 
 impl Snapshot {
+    /// Exact relation revision used only for prepared-plan cache validation (estimator.md §6).
+    pub(crate) fn estimator_revision(&self, name: &str) -> std::sync::Arc<EstimatorRevision> {
+        self.estimator_revisions
+            .get(&name.to_ascii_lowercase())
+            .cloned()
+            .unwrap_or_else(|| self.estimator_base_revision.clone())
+    }
+
+    /// Replace one relation's transactional revision token. The top-level statement tracker
+    /// de-duplicates calls, so data-modifying CTEs still advance a relation exactly once.
+    pub(crate) fn bump_estimator_revision(&mut self, name: &str) {
+        std::sync::Arc::make_mut(&mut self.estimator_revisions).insert(
+            name.to_ascii_lowercase(),
+            std::sync::Arc::new(EstimatorRevision::default()),
+        );
+    }
+
     /// Look up a table definition by name (case-insensitive).
     pub fn table(&self, name: &str) -> Option<&Table> {
         self.tables.get(&name.to_ascii_lowercase())
@@ -635,6 +652,7 @@ impl Snapshot {
             st.attach_paging(paging.clone());
         }
         std::sync::Arc::make_mut(&mut self.stores).insert(key.clone(), st);
+        std::sync::Arc::make_mut(&mut self.estimator_revisions).remove(&key);
         std::sync::Arc::make_mut(&mut self.tables).insert(key, table);
     }
 
@@ -651,6 +669,7 @@ impl Snapshot {
         }
         std::sync::Arc::make_mut(&mut self.tables).remove(key);
         std::sync::Arc::make_mut(&mut self.stores).remove(key);
+        std::sync::Arc::make_mut(&mut self.estimator_revisions).remove(key);
     }
 
     /// The store of a secondary index (panics if absent — callers resolve the index first).

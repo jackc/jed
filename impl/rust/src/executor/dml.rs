@@ -304,6 +304,9 @@ impl Engine {
                     ctx,
                     &mut meter,
                 )?;
+                if affected > 0 {
+                    self.mark_estimator_mutation(db.as_deref(), &table);
+                }
                 Ok(match (ret_nodes, returned) {
                     (Some((_, names, types)), Some(rows)) => Outcome::Query {
                         column_names: names,
@@ -458,6 +461,9 @@ impl Engine {
                     ctx,
                     &mut meter,
                 )?;
+                if affected > 0 {
+                    self.mark_estimator_mutation(db.as_deref(), &table);
+                }
                 Ok(match (ret_nodes, returned) {
                     (Some((_, names, types)), Some(rows)) => Outcome::Query {
                         column_names: names,
@@ -1834,6 +1840,9 @@ impl Engine {
                 istore.remove(ek)?;
             }
         }
+        if !matched.is_empty() {
+            self.mark_estimator_mutation(del.db.as_deref(), &del.table);
+        }
         Ok(match (ret, returned) {
             (Some((_, names, types)), Some(rows)) => Outcome::Query {
                 column_names: names,
@@ -2520,6 +2529,9 @@ impl Engine {
                     }
                 }
             }
+        }
+        if updated > 0 {
+            self.mark_estimator_mutation(upd.db.as_deref(), &upd.table);
         }
         Ok(match (ret, returned) {
             (Some((_, names, types)), Some(rows)) => Outcome::Query {

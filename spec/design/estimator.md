@@ -5,8 +5,8 @@
 > runtime unit weights remain canonical in [../cost/schedule.toml](../cost/schedule.toml). This
 > document specifies the algorithms every core will implement independently.
 >
-> **Status: P0 contract ratified; implementation not yet landed.** The current planner still uses
-> the fixed rules in [planner.md](planner.md). P1–P8 in
+> **Status: P0 contract ratified; P1 row counts and P2 cache validity landed.** The current planner
+> still uses the fixed rules in [planner.md](planner.md). P3–P8 in
 > [../../TODO-cost-plan-input.md](../../TODO-cost-plan-input.md) implement this contract as vertical
 > slices. Until the selector slice lands, no plan, actual cost, or EXPLAIN row changes.
 
@@ -152,6 +152,13 @@ once in the working snapshot; rollback restores it. It need not be persisted bec
 database has a new cache identity. Conservatively advancing after any successful row mutation is
 valid; failing to advance after an input change is not.
 
+P2 implements database identity and estimator revision as opaque, non-persisted equality tokens,
+not counters or hashes. A snapshot clone shares the tokens; the first successful row mutation of a
+relation in a statement replaces that relation's working token exactly once. Commit publishes the
+replacement and rollback discards it. A fresh create/open/attachment receives a fresh database token,
+so detach/reattach and reopen cannot alias an old cache entry. The tokens are cache metadata only:
+they are never estimator arithmetic inputs, serialized bytes, EXPLAIN values, or runtime cost.
+
 ## 6. Parameters, literals, and prepared-plan caching
 
 The pipeline remains `resolve → optimize → bind`. A literal is available to planning and may select
@@ -171,6 +178,13 @@ The database identity is an equality token, never a value read by the estimator 
 attachment contributes its own identity/generation/revision, so the main database's generation
 cannot validate a plan against a changed attachment. Temp, SRF, CTE, and derived-relation plans keep
 their existing uncacheable status until their cache identity is separately specified.
+
+The signature is stored and compared field-for-field; it is not compressed into a hash. Catalog
+generation is currently database-scoped, so unrelated DDL within the same database remains a safe,
+conservative invalidation. Row/statistics invalidation is relation-scoped: an unrelated table's
+revision change does not invalidate the entry. A cache entry may be filled only from committed state;
+a pre-existing committed entry may be consulted inside a transaction, but working revisions can only
+cause a miss and never replace that committed entry.
 
 This is a relation-scoped invalidation contract: a write to an unrelated table does not evict a
 prepared point lookup. A relevant revision change forces re-planning even if row count happens to

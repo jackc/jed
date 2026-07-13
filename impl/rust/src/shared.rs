@@ -1335,6 +1335,11 @@ pub struct Session {
 }
 
 impl Session {
+    #[cfg(test)]
+    pub(crate) fn test_engine(&self) -> &Engine {
+        &self.engine
+    }
+
     /// Run a (possibly mutating) statement on this session, binding `$N` params (spec/design/api.md
     /// §5). Routes by the session's state (read-only / open block / autocommit) with the lazy-gate
     /// lifecycle (§2.4).
@@ -1369,8 +1374,8 @@ impl Session {
     }
 
     /// [`query_ast`](Session::query_ast) with an optional prepared-statement plan cache: a scan-shaped
-    /// SELECT plans once and, when `cache` is `Some`, reuses that plan across executes over an
-    /// unchanged catalog (spec/design/api.md §2.4). Ad-hoc [`query`](Session::query) passes `None`.
+    /// SELECT plans once and, when `cache` is `Some`, reuses that plan across executes over unchanged
+    /// estimator inputs (spec/design/api.md §2.4). Ad-hoc [`query`](Session::query) passes `None`.
     fn query_ast_cached(
         &mut self,
         ast: &Statement,

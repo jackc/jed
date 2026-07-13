@@ -1,5 +1,5 @@
 // Prepared-statement plan cache (spec/design/api.md §2.4). A prepared statement caches its resolved
-// scan plan and reuses it across executes, re-planning only when the catalog changes. The behavior is
+// scan plan and reuses it across executes while its exact estimator inputs remain unchanged. The behavior is
 // invisible to the conformance corpus (which drives the materialized execute path and never reuses a
 // plan), so these per-core tests pin it directly: the cache engages (white-box, via the private
 // holder) and reuse is result/cost-identical (the regex-cost-drift guard); a DDL between executes
@@ -9,15 +9,27 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Engine, execute, intValue, prepare, queryPrepared } from "../src/tooling.ts";
+import { attachMemory } from "../src/shared.ts";
+import { ExplainRender } from "../src/scope.ts";
 import type { Value } from "../src/value.ts";
 import { memDb } from "./mem_db.ts";
 
 type PreparedLike = ReturnType<typeof prepare>;
 
 // The private scan-plan cache slot (white-box: TS `private` is compile-time only).
-function cacheOf(stmt: PreparedLike): { catGen: bigint; sp: unknown } | null {
-  return (stmt as unknown as { scHolder: { cache: { catGen: bigint; sp: unknown } | null } })
-    .scHolder.cache;
+function cacheOf(
+  stmt: PreparedLike,
+): { inputs: { database: object; catGen: bigint; revision: object }[]; sp: unknown } | null {
+  return (
+    stmt as unknown as {
+      scHolder: {
+        cache: {
+          inputs: { database: object; catGen: bigint; revision: object }[];
+          sp: unknown;
+        } | null;
+      };
+    }
+  ).scHolder.cache;
 }
 
 function drain(
@@ -31,6 +43,18 @@ function drain(
   const cost = cursor.cost;
   cursor.close();
   return { rows, cost };
+}
+
+// Render the exact physical plan held in the private cache. Public EXPLAIN plans afresh, so this is
+// the white-box comparison required to prove a refilled cache made the same choice as an
+// independently fresh prepared statement.
+function cachedExplain(db: Engine, stmt: PreparedLike): unknown[] {
+  const render = new ExplainRender();
+  const engine = db as unknown as {
+    renderSelectPlan(r: ExplainRender, sp: unknown, depth: number): void;
+  };
+  engine.renderSelectPlan(render, cacheOf(stmt)!.sp, 0);
+  return render.rows;
 }
 
 function seedOrders(db: Engine, n: number): void {
@@ -65,6 +89,120 @@ test("plan cache: point lookup reuses the plan, cost-identical", () => {
   assert.deepEqual(drain(db, stmt, [intValue(999n)]).rows, []);
 });
 
+test("plan cache: estimator revision tracks relevant relations only", () => {
+  const db = new Engine();
+  execute(db, "CREATE TABLE a (id i32 PRIMARY KEY, v i32)");
+  execute(db, "CREATE TABLE b (id i32 PRIMARY KEY, v i32)");
+  execute(db, "INSERT INTO a VALUES (1, 10)");
+  execute(db, "INSERT INTO b VALUES (1, 10)");
+  const stmt = prepare(db, "SELECT id FROM a WHERE v = $1");
+  drain(db, stmt, [intValue(10n)]);
+  const first = cacheOf(stmt)!;
+  const firstPlan = first.sp;
+  const firstRevision = first.inputs[0]!.revision;
+
+  execute(db, "INSERT INTO b VALUES (2, 20)");
+  drain(db, stmt, [intValue(10n)]);
+  assert.equal(cacheOf(stmt)!.sp, firstPlan, "unrelated row count invalidated the plan");
+
+  execute(db, "INSERT INTO a VALUES (2, 20)");
+  execute(db, "DELETE FROM a WHERE id = 2");
+  const refilled = drain(db, stmt, [intValue(10n)]);
+  assert.notEqual(cacheOf(stmt)!.sp, firstPlan, "referenced relation did not re-plan");
+  assert.notEqual(
+    cacheOf(stmt)!.inputs[0]!.revision,
+    firstRevision,
+    "equal row count falsely reused the old revision",
+  );
+  const fresh = prepare(db, "SELECT id FROM a WHERE v = $1");
+  const freshRun = drain(db, fresh, [intValue(10n)]);
+  assert.deepEqual(refilled.rows, freshRun.rows);
+  assert.equal(refilled.cost, freshRun.cost, "refilled and fresh actual cost must match");
+  assert.deepEqual(cachedExplain(db, stmt), cachedExplain(db, fresh));
+
+  // Cover every distinct row-mutation executor path. A no-op conflict remains a hit; real UPDATE,
+  // INSERT ... SELECT, UPSERT-update, and DELETE statements each replace the relation revision.
+  const plan = cacheOf(stmt)!.sp;
+  execute(db, "INSERT INTO a VALUES (1, 99) ON CONFLICT DO NOTHING");
+  drain(db, stmt, [intValue(10n)]);
+  assert.equal(cacheOf(stmt)!.sp, plan, "ON CONFLICT DO NOTHING invalidated an unchanged relation");
+  for (const [sql, param] of [
+    ["UPDATE a SET v = 11 WHERE id = 1", 11n],
+    ["INSERT INTO a SELECT 2, 20", 11n],
+    ["INSERT INTO a VALUES (1, 12) ON CONFLICT (id) DO UPDATE SET v = excluded.v", 12n],
+    ["DELETE FROM a WHERE id = 2", 12n],
+  ] as const) {
+    const before = cacheOf(stmt)!.sp;
+    execute(db, sql);
+    drain(db, stmt, [intValue(param)]);
+    assert.notEqual(cacheOf(stmt)!.sp, before, `row mutation did not invalidate: ${sql}`);
+  }
+});
+
+test("plan cache: rollback restores committed estimator signature", () => {
+  const db = new Engine();
+  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
+  execute(db, "INSERT INTO t VALUES (1, 10)");
+  const stmt = prepare(db, "SELECT id FROM t WHERE v = $1");
+  drain(db, stmt, [intValue(10n)]);
+  const committed = cacheOf(stmt)!;
+
+  execute(db, "BEGIN");
+  execute(db, "INSERT INTO t VALUES (2, 10)");
+  assert.deepEqual(drain(db, stmt, [intValue(10n)]).rows, [[intValue(1n)], [intValue(2n)]]);
+  assert.equal(cacheOf(stmt), committed, "working statistics replaced the committed cache entry");
+  execute(db, "ROLLBACK");
+  assert.deepEqual(drain(db, stmt, [intValue(10n)]).rows, [[intValue(1n)]]);
+  assert.equal(cacheOf(stmt), committed, "rollback did not restore the committed cache hit");
+});
+
+test("plan cache: attachment has an independent estimator signature", () => {
+  const db = memDb();
+  db.attach("aux", attachMemory(), false);
+  const s = db.session({});
+  s.execute("CREATE TABLE aux.t (id i32 PRIMARY KEY, v i32)");
+  s.execute("INSERT INTO aux.t VALUES (1, 10)");
+  const stmt = db.prepareStatement("SELECT id FROM aux.t WHERE v = $1");
+  const run = () => {
+    const cursor = s.queryPrepared(stmt, [intValue(10n)]);
+    const rows = [...cursor];
+    const cost = cursor.cost;
+    cursor.close();
+    return { rows, cost };
+  };
+  run();
+  const firstPlan = cacheOf(stmt)!.sp;
+  s.execute("CREATE TABLE local_only (id i32 PRIMARY KEY)");
+  run();
+  assert.equal(cacheOf(stmt)!.sp, firstPlan, "main DDL invalidated attachment-only plan");
+
+  s.execute("INSERT INTO aux.t VALUES (2, 10)");
+  const refilled = run();
+  assert.notEqual(cacheOf(stmt)!.sp, firstPlan, "attachment mutation did not re-plan");
+  const fresh = db.prepareStatement("SELECT id FROM aux.t WHERE v = $1");
+  const freshCursor = s.queryPrepared(fresh, [intValue(10n)]);
+  const freshRows = [...freshCursor];
+  const freshCost = freshCursor.cost;
+  freshCursor.close();
+  assert.deepEqual(refilled.rows, freshRows);
+  assert.equal(refilled.cost, freshCost);
+
+  // Replacing an attachment at the same name must reject the old cache entry even if the new
+  // database reaches the same catalog generation and has the same table shape.
+  const old = cacheOf(stmt)!;
+  db.detach("aux");
+  db.attach("aux", attachMemory(), false);
+  s.execute("CREATE TABLE aux.t (id i32 PRIMARY KEY, v i32)");
+  s.execute("INSERT INTO aux.t VALUES (9, 10), (10, 10)");
+  const replacedRows = run().rows;
+  const replaced = cacheOf(stmt)!;
+  assert.notEqual(replaced.inputs[0]!.database, old.inputs[0]!.database);
+  assert.notEqual(replaced.sp, old.sp);
+  assert.deepEqual(replacedRows, [[intValue(9n)], [intValue(10n)]]);
+  s.close();
+  db.close();
+});
+
 // DROP + re-CREATE with a different shape bumps the catalog generation, so the next execute re-plans
 // and reflects the new column set — a stale cached plan would return the old shape.
 test("plan cache: DROP/CREATE invalidates", () => {
@@ -75,7 +213,7 @@ test("plan cache: DROP/CREATE invalidates", () => {
 
   const r1 = drain(db, stmt, [intValue(1n)]);
   assert.deepEqual(r1.rows, [[intValue(1n), intValue(10n)]]);
-  const gen1 = cacheOf(stmt)!.catGen;
+  const gen1 = cacheOf(stmt)!.inputs[0]!.catGen;
 
   execute(db, "DROP TABLE t");
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, a i32, c i32)");
@@ -87,7 +225,11 @@ test("plan cache: DROP/CREATE invalidates", () => {
     [[intValue(1n), intValue(10n), intValue(20n)]],
     "a stale 2-column plan was served after DROP/CREATE",
   );
-  assert.notEqual(cacheOf(stmt)!.catGen, gen1, "catGen did not advance after DROP/CREATE");
+  assert.notEqual(
+    cacheOf(stmt)!.inputs[0]!.catGen,
+    gen1,
+    "catGen did not advance after DROP/CREATE",
+  );
 });
 
 // CREATE INDEX between executes invalidates the cached full-scan plan; the re-plan picks up the new

@@ -90,6 +90,14 @@ type engine struct {
 	// pinned for the life of an explicit BEGIN block. nil/empty when nothing is attached. Session-local
 	// temp is NOT here (it is on sessionState.tempCommitted); this is only the Database-scoped roots.
 	attachedCommitted map[string]*snapshot
+	// estimatorTouched de-duplicates per-relation revision advances within one top-level statement.
+	// A data-modifying CTE may target the same table more than once; P2 advances it exactly once.
+	estimatorTouched map[estimatorTouchedRelation]struct{}
+}
+
+type estimatorTouchedRelation struct {
+	database string
+	table    string
 }
 
 // SessionOptions are the relocatable session settings (spec/design/session.md §3 — the bucket-A
@@ -718,6 +726,38 @@ func (db *engine) writeStoreScoped(scope *string, name string) *tableStore {
 			return nil
 		}
 		return ws.store(name)
+	}
+}
+
+// markEstimatorMutation advances the target persistent relation's transactional cache revision once
+// for this top-level statement. Temp relations remain uncacheable and need no signature. Calling it
+// only after phase-2 DML changed at least one row preserves no-op statements' revision.
+func (db *engine) markEstimatorMutation(scope *string, table string) {
+	database := "main"
+	if scope == nil {
+		if db.isTempTable(table) {
+			return
+		}
+	} else {
+		database = strings.ToLower(*scope)
+		if database == "temp" {
+			return
+		}
+	}
+	key := estimatorTouchedRelation{database: database, table: strings.ToLower(table)}
+	if db.estimatorTouched == nil {
+		db.estimatorTouched = make(map[estimatorTouchedRelation]struct{})
+	}
+	if _, seen := db.estimatorTouched[key]; seen {
+		return
+	}
+	db.estimatorTouched[key] = struct{}{}
+	if database == "main" {
+		db.working().bumpEstimatorRevision(table)
+		return
+	}
+	if snap := db.attachWriteSnap(database); snap != nil {
+		snap.bumpEstimatorRevision(table)
 	}
 }
 

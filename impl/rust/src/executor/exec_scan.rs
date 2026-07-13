@@ -664,7 +664,7 @@ impl Engine {
     /// for a shape no scan lane covers (a non-`SELECT`, a write — incl. a `nextval`/`setval` SELECT,
     /// [`stmt_is_write`] — or a top-level set-op / VALUES / `WITH`), so the caller falls through to the
     /// deferred / materialized paths. When `cache` is `Some` (a prepared statement) a repeated execute
-    /// over an unchanged catalog reuses the cached plan and skips planning + the fold; the ad-hoc
+    /// over unchanged estimator inputs reuses the cached plan and skips planning + the fold; the ad-hoc
     /// `query()` passes `None` and still plans exactly once. The conformance corpus drives the
     /// materialized `execute()` path, so this lane stays invisible to it (per-core unit-tested to yield
     /// identical rows + total cost under full drain, streaming.md §6).
@@ -682,15 +682,14 @@ impl Engine {
         if stmt_is_write(ast) {
             return Ok(None);
         }
-        let (cur_gen, from_committed) = {
+        let from_committed = {
             let snap = self.read_snap();
-            (snap.cat_gen, std::ptr::eq(snap, &self.committed))
+            std::ptr::eq(snap, &self.committed)
         };
-        // Cache HIT: the plan was resolved against THIS database (same core — `cat_gen` is only
-        // monotonic within one core) and the read snapshot's catalog is unchanged since (its `cat_gen`
-        // still matches), and no relation name is shadowed by a session-local temp table the committed
-        // generation cannot see (`plan_touches_temp` — the statement may have been filled on a
-        // different session). Reuse the resolved plan + finalized param types — no `plan_query`, no
+        // Cache HIT: the statement still belongs to the same shared database and every ordered base
+        // relation has the same exact identity/generation/name/revision tuple. Resolving those tuples
+        // also rejects a temp shadow or a missing/replaced attachment. Reuse the resolved plan +
+        // finalized param types — no `plan_query`, no
         // fold, no param-type walk. A cached plan carries no subquery to fold (`plan_cacheable`
         // rejected any), so the shared `Rc` plan is never mutated; params are still bound per execute.
         if let (Some(cell), Some(core)) = (cache, &self.core) {
@@ -698,9 +697,8 @@ impl Engine {
                 .borrow()
                 .as_ref()
                 .filter(|cp| {
-                    cp.cat_gen == cur_gen
-                        && std::sync::Weak::ptr_eq(&cp.core, &std::sync::Arc::downgrade(core))
-                        && !self.plan_touches_temp(&cp.plan)
+                    std::sync::Weak::ptr_eq(&cp.core, &std::sync::Arc::downgrade(core))
+                        && self.estimator_inputs_match(&cp.plan, &cp.inputs)
                 })
                 .map(|cp| (std::rc::Rc::clone(&cp.plan), cp.param_types.clone()));
             if let Some((plan, ptys)) = hit {
@@ -731,18 +729,17 @@ impl Engine {
             CteCtx::empty(),
             &mut subquery_cost,
         )?;
-        // Fill the cache only from committed state — so `committed.cat_gen` is strictly increasing over
-        // the core's life and never aliases a rolled-back working generation, making the `cat_gen`
-        // equality on a later HIT a sound "same catalog" identity check (a statement first executed
-        // inside an open transaction re-plans until the tx commits) — and only for a reusable plan,
-        // and only when this engine belongs to a core (the entry's identity key; a bare/transient
-        // engine never fills).
-        let cacheable = from_committed && !uncacheable && self.plan_cacheable(&sp);
+        // Fill only from committed state, so a working transaction can consume an entry whose exact
+        // signature matches but can never publish its working revision into the committed cache slot.
+        // Also require a reusable plan and a core identity (a bare/transient engine never fills).
+        let inputs = self.estimator_inputs(&sp);
+        let cacheable =
+            from_committed && !uncacheable && self.plan_cacheable(&sp) && inputs.is_some();
         let plan = std::rc::Rc::new(sp);
         if let (Some(cell), true, Some(core)) = (cache, cacheable, &self.core) {
             *cell.borrow_mut() = Some(CachedPlan {
                 core: std::sync::Arc::downgrade(core),
-                cat_gen: cur_gen,
+                inputs: inputs.expect("cacheable plans have estimator inputs"),
                 plan: std::rc::Rc::clone(&plan),
                 param_types: ptys,
             });
@@ -843,8 +840,8 @@ impl Engine {
     /// Whether a resolved scan plan may be memoized on a prepared statement (spec/design/api.md §2.4).
     /// The subquery / precompiled-regex exclusion is tracked separately ([`ParamTypes::uncacheable`],
     /// set at the node's birth). Here the relations are vetted: a set-returning / CTE / derived
-    /// relation carries a nested plan or generator we do not vet for reuse, and a temp table lives in a
-    /// snapshot the cache key (`committed.cat_gen`) does not track — so a plan referencing any of those
+    /// relation carries a nested plan or generator we do not vet for reuse, and a temp table has no
+    /// persistent database identity/revision tuple — so a plan referencing any of those
     /// is never cached (a point lookup / plain join over persistent base tables has none).
     pub(crate) fn plan_cacheable(&self, sp: &SelectPlan) -> bool {
         sp.rels
@@ -857,10 +854,62 @@ impl Engine {
     /// THIS session's visible temp domain. Checked at cache fill (a temp plan is never cached) and
     /// re-checked on every cache HIT: a statement is shared across sessions, and a plan cached where
     /// a name was persistent must not be served on a session whose temp table shadows that name — the
-    /// temp domain is session-local, so the committed `cat_gen` the cache is keyed on cannot see it.
+    /// temp domain is session-local and intentionally has no cache signature.
     /// Cheap: one map lookup per relation, against a usually-empty temp catalog.
     pub(crate) fn plan_touches_temp(&self, sp: &SelectPlan) -> bool {
-        sp.rels.iter().any(|r| self.is_temp_table(&r.table_name))
+        sp.rels.iter().any(|r| match r.db.as_deref() {
+            Some(scope) => scope.eq_ignore_ascii_case("temp"),
+            None => self.is_temp_table(&r.table_name),
+        })
+    }
+
+    /// Resolve one base relation's exact estimator-input tuple against the currently visible pinned
+    /// database/attachment snapshot. Temp and synthetic/catalog relations stay uncacheable.
+    pub(crate) fn estimator_input(&self, rel: &PlanRel) -> Option<EstimatorInputSignature> {
+        let snap = match rel.db.as_deref() {
+            None => {
+                if self.is_temp_table(&rel.table_name) {
+                    return None;
+                }
+                self.read_snap()
+            }
+            Some(scope) if scope.eq_ignore_ascii_case("temp") => return None,
+            Some(scope) if scope.eq_ignore_ascii_case("main") => self.read_snap(),
+            Some(scope) => self.attach_read_snap(&scope.to_ascii_lowercase())?,
+        };
+        let table = rel.table_name.to_ascii_lowercase();
+        snap.table(&table)?;
+        Some(EstimatorInputSignature {
+            database: snap.estimator_identity.clone(),
+            cat_gen: snap.cat_gen,
+            table: table.clone(),
+            revision: snap.estimator_revision(&table),
+        })
+    }
+
+    pub(crate) fn estimator_inputs(&self, sp: &SelectPlan) -> Option<Vec<EstimatorInputSignature>> {
+        sp.rels
+            .iter()
+            .map(|rel| self.estimator_input(rel))
+            .collect()
+    }
+
+    pub(crate) fn estimator_inputs_match(
+        &self,
+        sp: &SelectPlan,
+        want: &[EstimatorInputSignature],
+    ) -> bool {
+        if sp.rels.len() != want.len() {
+            return false;
+        }
+        sp.rels.iter().zip(want).all(|(rel, want)| {
+            self.estimator_input(rel).is_some_and(|got| {
+                std::sync::Arc::ptr_eq(&got.database, &want.database)
+                    && got.cat_gen == want.cat_gen
+                    && got.table == want.table
+                    && std::sync::Arc::ptr_eq(&got.revision, &want.revision)
+            })
+        })
     }
 
     /// Try to serve `ast` as a lazy **deferred** query (spec/design/streaming.md §4/§7) — the

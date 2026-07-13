@@ -31,7 +31,17 @@ type snapshot struct {
 	// nextval (a data write on the nextval path), only by sequence DDL — a SELECT plan binds no
 	// sequence.
 	catGen uint64
-	tables map[string]*catTable
+	// estimatorIdentity is this database domain's cache-identity token. Transaction/snapshot clones
+	// share it; a fresh create/open/attachment gets a fresh token. It is deliberately opaque and
+	// never serialized or exposed to planning/EXPLAIN (estimator.md §6).
+	estimatorIdentity *estimatorDatabaseIdentity
+	// estimatorBaseRevision is the revision token of every table that has not been mutated since
+	// this database identity was created. estimatorRevisions overrides it per lowercased table name.
+	// Tokens are replaced (never incremented/hashes) so cache validation is exact and collision-free;
+	// the map and tokens clone transactionally with the snapshot and are never serialized.
+	estimatorBaseRevision *estimatorRevision
+	estimatorRevisions    map[string]*estimatorRevision
+	tables                map[string]*catTable
 	// types holds user-defined composite (row) types, keyed by lowercased name
 	// (spec/design/composite.md). A database-level object set, separate from tables; serialized
 	// into the catalog's composite-type entries (spec/fileformat/format.md). Sorted by key when
@@ -80,16 +90,26 @@ type snapshot struct {
 	storePaging *sharedPaging
 }
 
+// Non-zero-sized opaque equality tokens. Go permits distinct pointers to zero-sized variables to
+// compare equal, so the byte is load-bearing for collision-free cache identity.
+type (
+	estimatorDatabaseIdentity struct{ _ byte }
+	estimatorRevision         struct{ _ byte }
+)
+
 // newSnapshot builds an empty snapshot.
 func newSnapshot() *snapshot {
 	return &snapshot{
-		tables:      make(map[string]*catTable),
-		types:       make(map[string]*compositeType),
-		stores:      make(map[string]*tableStore),
-		indexStores: make(map[string]*tableStore),
-		sequences:   make(map[string]*sequenceDef),
-		collations:  make(map[string]*Collation),
-		gistTrees:   make(map[string]*gistTree),
+		estimatorIdentity:     &estimatorDatabaseIdentity{},
+		estimatorBaseRevision: &estimatorRevision{},
+		estimatorRevisions:    make(map[string]*estimatorRevision),
+		tables:                make(map[string]*catTable),
+		types:                 make(map[string]*compositeType),
+		stores:                make(map[string]*tableStore),
+		indexStores:           make(map[string]*tableStore),
+		sequences:             make(map[string]*sequenceDef),
+		collations:            make(map[string]*Collation),
+		gistTrees:             make(map[string]*gistTree),
 	}
 }
 
@@ -132,7 +152,26 @@ func (s *snapshot) clone() *snapshot {
 	for k, v := range s.gistTrees {
 		gistTrees[k] = v
 	}
-	return &snapshot{txid: s.txid, catGen: s.catGen, tables: tables, types: types, stores: stores, indexStores: indexStores, sequences: sequences, collations: collations, defaultCollation: s.defaultCollation, gistTrees: gistTrees, storePaging: s.storePaging}
+	estimatorRevisions := make(map[string]*estimatorRevision, len(s.estimatorRevisions))
+	for k, v := range s.estimatorRevisions {
+		estimatorRevisions[k] = v
+	}
+	return &snapshot{txid: s.txid, catGen: s.catGen, estimatorIdentity: s.estimatorIdentity, estimatorBaseRevision: s.estimatorBaseRevision, estimatorRevisions: estimatorRevisions, tables: tables, types: types, stores: stores, indexStores: indexStores, sequences: sequences, collations: collations, defaultCollation: s.defaultCollation, gistTrees: gistTrees, storePaging: s.storePaging}
+}
+
+// estimatorRevisionFor returns the exact cache-validity token for one persistent relation. Missing
+// entries share the database's base token; the lowercased table name is a separate signature field.
+func (s *snapshot) estimatorRevisionFor(name string) *estimatorRevision {
+	if r := s.estimatorRevisions[strings.ToLower(name)]; r != nil {
+		return r
+	}
+	return s.estimatorBaseRevision
+}
+
+// bumpEstimatorRevision replaces one relation's transactional revision token. The caller de-dupes
+// within a top-level statement, so a successful statement advances each touched relation once.
+func (s *snapshot) bumpEstimatorRevision(name string) {
+	s.estimatorRevisions[strings.ToLower(name)] = &estimatorRevision{}
 }
 
 // demoteCleanLeaves demotes every store's clean, persisted resident leaves to OnDisk references —
@@ -730,6 +769,7 @@ func (s *snapshot) putTableResolved(t *catTable, colTypes []colType, pageSize ui
 	}
 	s.stores[key] = st
 	s.tables[key] = t
+	delete(s.estimatorRevisions, key)
 }
 
 // removeTable removes a table's definition, its store, and its indexes' stores (DROP
@@ -743,6 +783,7 @@ func (s *snapshot) removeTable(key string) {
 	}
 	delete(s.tables, key)
 	delete(s.stores, key)
+	delete(s.estimatorRevisions, key)
 }
 
 // indexStore returns a secondary index's store (the index is known to exist). nameKey is

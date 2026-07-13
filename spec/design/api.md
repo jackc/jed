@@ -317,20 +317,25 @@ commit. `close` is idempotent.
 - **Plan cache.** A prepared query caches its **resolved plan** (not just the parsed AST) and
   reuses it across executes, so a repeated query skips planning entirely — the dominant
   cost of a trivial-plan / high-frequency lookup (planning is ~⅔ of a point lookup's latency and
-  ~88% of its allocations). The cache entry is keyed on the **database identity** (the shared
-  core) **plus its catalog generation** counter bumped by every schema-changing DDL
-  (`CREATE`/`DROP`/`ALTER` of a table, type, or index): a DDL between executes invalidates the
-  cached plan and the next execute re-plans (PostgreSQL invalidates prepared plans on schema
-  change the same way), and a statement handed to a *different* database never falsely hits (the
-  generation counter is only monotonic within one core — two databases can share a generation
-  number with different schemas), it just re-plans and re-keys. Because a statement may be filled
-  on one session and run on another, a hit also **re-checks the plan's relations against the
-  executing session's temp domain** (`plan_touches_temp`): a plan cached where a name was
-  persistent is never served on a session whose session-local temp table shadows that name (the
-  committed generation cannot see temp domains). To stay collision-free across a rolled-back
-  in-transaction DDL, the cache is **filled only from committed state**, making the committed
-  generation strictly monotonic; a statement first executed *inside* an open transaction re-plans
-  until it commits. A plan is cached only when reusing it is result/cost-**identical** to a fresh
+  ~88% of its allocations). The cache entry carries the shared-core identity (so a relation-free
+  plan cannot cross databases) plus an exact relation signature, in source order, of
+  `(database identity, catalog generation, lowercased table name, estimator revision)`. Identity and
+  revision are opaque equality tokens, not hashes; they clone with a snapshot, change transactionally,
+  and are never persisted or exposed. Every successful statement that mutates rows advances each
+  affected persistent relation once, so a relevant statistics/structure change forces re-planning
+  even when the row count returns to its previous value. An unrelated table write remains a hit.
+  Attachments contribute their own identity/generation/revision rather than borrowing `main`'s, and a
+  different database or detach/reattach cannot falsely hit. Catalog generation is still scoped to its
+  database, so unrelated DDL in that database is a safe conservative invalidation.
+
+  Because a statement may be filled on one session and run on another, a hit also **re-checks the
+  plan's relations against the executing session's temp domain** (`plan_touches_temp`): a plan cached
+  where a bare name was persistent is never served on a session whose session-local temp table shadows
+  that name. To keep working statistics and rolled-back DDL out of committed entries, the cache is
+  **filled only from committed state**. A pre-existing committed entry may be consulted inside a
+  transaction, but a changed working signature causes a miss and never replaces the committed slot;
+  rollback therefore restores the old hit. A plan is cached only when reusing it is
+  result/plan/estimate/cost-**identical** to a fresh
   plan — so a plan with an uncorrelated subquery (whose per-execution constant-fold bakes in one
   execution's params), a precompiled-regex node (whose one-shot compile-cost flag mutates during
   eval), or a temp / SRF / CTE / derived relation is **never** cached and re-plans each execute.

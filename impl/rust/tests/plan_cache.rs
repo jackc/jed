@@ -1,5 +1,5 @@
 // Prepared-statement plan-cache contract (spec/design/api.md §2.4). A prepared statement caches its
-// resolved scan plan and reuses it across executes, re-planning only when the catalog changes. The
+// resolved scan plan and reuses it across executes while its exact estimator inputs remain unchanged. The
 // behavior is invisible to the conformance corpus (which drives the materialized execute path and
 // never reuses a plan), so these per-core tests pin the OBSERVABLE contract through the public API:
 // reuse is result/cost-identical (the regex-cost-drift guard), a DDL between executes re-plans (no
@@ -7,7 +7,7 @@
 // cache actually engages (skips planning) is proved by the point_lookup_pk benchmark, not here.
 
 use jed::value::Value;
-use jed::{CreateOptions, Database, Session, SessionOptions};
+use jed::{AttachSource, CreateOptions, Database, Session, SessionOptions};
 
 // Compile-time guard (the `static_assertions::assert_not_impl_any!` pattern): `PreparedStatement` is
 // INTENTIONALLY `!Send` — its plan cache holds an `Rc<SelectPlan>` (the plan is `!Sync` via a regex
@@ -57,6 +57,19 @@ fn drain(
     (out, cost)
 }
 
+/// Render the exact physical plan held by a prepared statement's cache. Public EXPLAIN performs a
+/// fresh planning pass; this white-box helper compares the refilled cache with an independently
+/// fresh prepared plan.
+fn cached_explain(s: &Session, stmt: &jed::PreparedStatement) -> Vec<Vec<Value>> {
+    let cache = stmt.cache().borrow();
+    let plan = &cache.as_ref().expect("expected cached plan").plan;
+    let mut render = crate::executor::ExplainRender::default();
+    s.test_engine()
+        .render_select_plan(&mut render, plan, 0)
+        .unwrap();
+    render.rows
+}
+
 fn seed_orders(s: &mut Session, n: i64) {
     exec(s, "CREATE TABLE orders (id i32 PRIMARY KEY, amount i32)");
     for i in 1..=n {
@@ -90,6 +103,197 @@ fn point_lookup_reuse_is_cost_identical() {
     // A no-match param.
     let (r4, _) = drain(&mut s, &stmt, &[Value::Int(999)]);
     assert!(r4.is_empty());
+}
+
+/// P2 row-statistics validity is relation-scoped: unrelated writes retain the exact cached plan,
+/// while a referenced relation mutation (even when its count returns to the old value) re-plans.
+#[test]
+fn estimator_revision_tracks_relevant_relations() {
+    let mut s = mem();
+    exec(&mut s, "CREATE TABLE a (id i32 PRIMARY KEY, v i32)");
+    exec(&mut s, "CREATE TABLE b (id i32 PRIMARY KEY, v i32)");
+    exec(&mut s, "INSERT INTO a VALUES (1, 10)");
+    exec(&mut s, "INSERT INTO b VALUES (1, 10)");
+    let stmt = s.prepare("SELECT id FROM a WHERE v = $1").unwrap();
+    let _ = drain(&mut s, &stmt, &[Value::Int(10)]);
+    let first_plan = {
+        let cache = stmt.cache().borrow();
+        std::rc::Rc::clone(&cache.as_ref().expect("cache filled").plan)
+    };
+    let first_revision = {
+        let cache = stmt.cache().borrow();
+        cache.as_ref().unwrap().inputs[0].revision.clone()
+    };
+
+    exec(&mut s, "INSERT INTO b VALUES (2, 20)");
+    let _ = drain(&mut s, &stmt, &[Value::Int(10)]);
+    {
+        let cache = stmt.cache().borrow();
+        assert!(std::rc::Rc::ptr_eq(
+            &cache.as_ref().unwrap().plan,
+            &first_plan
+        ));
+    }
+
+    exec(&mut s, "INSERT INTO a VALUES (2, 20)");
+    exec(&mut s, "DELETE FROM a WHERE id = 2");
+    let (rows, cost) = drain(&mut s, &stmt, &[Value::Int(10)]);
+    {
+        let cache = stmt.cache().borrow();
+        let refilled = cache.as_ref().unwrap();
+        assert!(!std::rc::Rc::ptr_eq(&refilled.plan, &first_plan));
+        assert!(!std::sync::Arc::ptr_eq(
+            &refilled.inputs[0].revision,
+            &first_revision
+        ));
+    }
+    let fresh = s.prepare("SELECT id FROM a WHERE v = $1").unwrap();
+    let (fresh_rows, fresh_cost) = drain(&mut s, &fresh, &[Value::Int(10)]);
+    assert_eq!(rows, fresh_rows);
+    assert_eq!(
+        cost, fresh_cost,
+        "refilled and fresh actual cost must match"
+    );
+    assert_eq!(cached_explain(&s, &stmt), cached_explain(&s, &fresh));
+
+    // Cover each distinct row-mutation executor path. A no-op conflict remains a hit; real UPDATE,
+    // INSERT ... SELECT, UPSERT-update, and DELETE statements each replace the relation revision.
+    let plan = {
+        let cache = stmt.cache().borrow();
+        std::rc::Rc::clone(&cache.as_ref().unwrap().plan)
+    };
+    exec(
+        &mut s,
+        "INSERT INTO a VALUES (1, 99) ON CONFLICT DO NOTHING",
+    );
+    let _ = drain(&mut s, &stmt, &[Value::Int(10)]);
+    {
+        let cache = stmt.cache().borrow();
+        assert!(std::rc::Rc::ptr_eq(&cache.as_ref().unwrap().plan, &plan));
+    }
+    for (sql, param) in [
+        ("UPDATE a SET v = 11 WHERE id = 1", 11),
+        ("INSERT INTO a SELECT 2, 20", 11),
+        (
+            "INSERT INTO a VALUES (1, 12) ON CONFLICT (id) DO UPDATE SET v = excluded.v",
+            12,
+        ),
+        ("DELETE FROM a WHERE id = 2", 12),
+    ] {
+        let before = {
+            let cache = stmt.cache().borrow();
+            std::rc::Rc::clone(&cache.as_ref().unwrap().plan)
+        };
+        exec(&mut s, sql);
+        let _ = drain(&mut s, &stmt, &[Value::Int(param)]);
+        let cache = stmt.cache().borrow();
+        assert!(
+            !std::rc::Rc::ptr_eq(&cache.as_ref().unwrap().plan, &before),
+            "row mutation did not invalidate: {sql}"
+        );
+    }
+}
+
+/// Working statistics may invalidate a committed entry for the transaction's read, but may never
+/// replace it. Rollback restores the old revision and therefore the original cache hit.
+#[test]
+fn estimator_revision_rollback_restores_cache_hit() {
+    let mut s = mem();
+    exec(&mut s, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
+    exec(&mut s, "INSERT INTO t VALUES (1, 10)");
+    let stmt = s.prepare("SELECT id FROM t WHERE v = $1").unwrap();
+    let _ = drain(&mut s, &stmt, &[Value::Int(10)]);
+    let committed_plan = {
+        let cache = stmt.cache().borrow();
+        std::rc::Rc::clone(&cache.as_ref().unwrap().plan)
+    };
+
+    s.begin(true).unwrap();
+    exec(&mut s, "INSERT INTO t VALUES (2, 10)");
+    let (inside, _) = drain(&mut s, &stmt, &[Value::Int(10)]);
+    assert_eq!(inside, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+    {
+        let cache = stmt.cache().borrow();
+        assert!(std::rc::Rc::ptr_eq(
+            &cache.as_ref().unwrap().plan,
+            &committed_plan
+        ));
+    }
+    s.rollback().unwrap();
+    let (after, _) = drain(&mut s, &stmt, &[Value::Int(10)]);
+    assert_eq!(after, vec![vec![Value::Int(1)]]);
+    let cache = stmt.cache().borrow();
+    assert!(std::rc::Rc::ptr_eq(
+        &cache.as_ref().unwrap().plan,
+        &committed_plan
+    ));
+}
+
+/// Attachment-only plans key their owning attachment, not main's catalog/statistics state.
+#[test]
+fn attachment_has_independent_estimator_signature() {
+    let db = Database::create(CreateOptions::default()).unwrap();
+    db.attach("aux", AttachSource::memory(), false).unwrap();
+    let mut s = db.session(SessionOptions::default());
+    exec(&mut s, "CREATE TABLE aux.t (id i32 PRIMARY KEY, v i32)");
+    exec(&mut s, "INSERT INTO aux.t VALUES (1, 10)");
+    let stmt = db.prepare("SELECT id FROM aux.t WHERE v = $1").unwrap();
+    let _ = drain(&mut s, &stmt, &[Value::Int(10)]);
+    let first_plan = {
+        let cache = stmt.cache().borrow();
+        std::rc::Rc::clone(&cache.as_ref().unwrap().plan)
+    };
+
+    exec(&mut s, "CREATE TABLE local_only (id i32 PRIMARY KEY)");
+    let _ = drain(&mut s, &stmt, &[Value::Int(10)]);
+    {
+        let cache = stmt.cache().borrow();
+        assert!(std::rc::Rc::ptr_eq(
+            &cache.as_ref().unwrap().plan,
+            &first_plan
+        ));
+    }
+
+    exec(&mut s, "INSERT INTO aux.t VALUES (2, 10)");
+    let (rows, cost) = drain(&mut s, &stmt, &[Value::Int(10)]);
+    {
+        let cache = stmt.cache().borrow();
+        assert!(!std::rc::Rc::ptr_eq(
+            &cache.as_ref().unwrap().plan,
+            &first_plan
+        ));
+    }
+    let fresh = db.prepare("SELECT id FROM aux.t WHERE v = $1").unwrap();
+    let (fresh_rows, fresh_cost) = drain(&mut s, &fresh, &[Value::Int(10)]);
+    assert_eq!(rows, fresh_rows);
+    assert_eq!(cost, fresh_cost);
+
+    // A new attachment at the same name may have the same generation and schema; its opaque
+    // database identity must still reject the old entry.
+    let (old_plan, old_database) = {
+        let cache = stmt.cache().borrow();
+        let cached = cache.as_ref().unwrap();
+        (
+            std::rc::Rc::clone(&cached.plan),
+            cached.inputs[0].database.clone(),
+        )
+    };
+    db.detach("aux").unwrap();
+    db.attach("aux", AttachSource::memory(), false).unwrap();
+    exec(&mut s, "CREATE TABLE aux.t (id i32 PRIMARY KEY, v i32)");
+    exec(&mut s, "INSERT INTO aux.t VALUES (9, 10), (10, 10)");
+    let (replaced_rows, _) = drain(&mut s, &stmt, &[Value::Int(10)]);
+    let cache = stmt.cache().borrow();
+    let replaced = cache.as_ref().unwrap();
+    assert!(!std::sync::Arc::ptr_eq(
+        &replaced.inputs[0].database,
+        &old_database
+    ));
+    assert!(!std::rc::Rc::ptr_eq(&replaced.plan, &old_plan));
+    assert_eq!(
+        replaced_rows,
+        vec![vec![Value::Int(9)], vec![Value::Int(10)]]
+    );
 }
 
 /// DROP + re-CREATE with a different shape must re-plan (the catalog generation moved), so the next

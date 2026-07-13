@@ -1041,6 +1041,8 @@ export class Engine {
   // compaction (persistTemp → maybeCompact) must NOT reclaim pages — it could free one the cursor still
   // faults. Incremented when a streaming Rows opens (shared.ts), decremented on Close.
   openStreams: number;
+  // Per-top-level-statement de-duplication for transactional estimator-revision advances.
+  private estimatorTouched = new Set<string>();
 
   constructor() {
     this.committed = new Snapshot();
@@ -2086,6 +2088,7 @@ export class Engine {
       case "rollback":
         return this.rollbackTx();
     }
+    this.estimatorTouched.clear();
     // Fresh per-statement sequence-advance scratch (a prior statement's error may have left it
     // populated — it is discarded, not flushed, on error; sequences.md §5).
     this.session.pendingSeq.clear();
@@ -2160,6 +2163,23 @@ export class Engine {
     this.flushPendingSequences();
     this.commitTx();
     return outcome;
+  }
+
+  // Advance one persistent target's transactional estimator revision once for this top-level
+  // statement. Temp plans remain uncacheable and therefore need no cache signature.
+  private markEstimatorMutation(scope: string | undefined, table: string): void {
+    let database = "main";
+    if (scope === undefined) {
+      if (this.isTempTable(table)) return;
+    } else {
+      database = scope.toLowerCase();
+      if (database === "temp") return;
+    }
+    const key = database + "\0" + table.toLowerCase();
+    if (this.estimatorTouched.has(key)) return;
+    this.estimatorTouched.add(key);
+    if (database === "main") this.working().bumpEstimatorRevision(table);
+    else this.attachWriteSnap(database)!.bumpEstimatorRevision(table);
   }
 
   // beginTx opens an explicit transaction (spec/design/transactions.md §4.2). A nested BEGIN (a
@@ -7091,6 +7111,7 @@ export class Engine {
         ctx,
         meter,
       );
+      if (affected > 0) this.markEstimatorMutation(ins.db, ins.table);
       return dmlOutcome(ret?.names ?? null, ret?.types ?? null, returned, affected, meter.accrued);
     }
 
@@ -7217,6 +7238,7 @@ export class Engine {
       ctx,
       meter,
     );
+    if (affected > 0) this.markEstimatorMutation(ins.db, ins.table);
     return dmlOutcome(ret?.names ?? null, ret?.types ?? null, returned, affected, meter.accrued);
   }
 
@@ -8286,6 +8308,7 @@ export class Engine {
       const istore = this.writeIndexStoreScoped(del.db, def.name.toLowerCase());
       for (const ek of toRemove[kx]!) istore.remove(ek);
     }
+    if (matched.length > 0) this.markEstimatorMutation(del.db, del.table);
     return dmlOutcome(
       ret?.names ?? null,
       ret?.types ?? null,
@@ -8823,6 +8846,7 @@ export class Engine {
         }
       }
     }
+    if (updates.length > 0) this.markEstimatorMutation(upd.db, upd.table);
     return dmlOutcome(
       ret?.names ?? null,
       ret?.types ?? null,
@@ -11398,8 +11422,8 @@ export class Engine {
   // re-planned the same statement. Returns {columnNames, cursor} for a top-level read SELECT; null for
   // a shape no scan lane covers (a non-SELECT, a write — incl. a nextval/setval SELECT, stmtIsWrite —
   // or a top-level set-op / VALUES / WITH), so the caller falls through to the deferred / materialized
-  // paths. When holder is non-null (a prepared statement) a repeated execute over an unchanged catalog
-  // reuses the cached plan and skips planning + the fold; ad-hoc callers pass null and still plan once.
+  // paths. When holder is non-null (a prepared statement) a repeated execute over unchanged estimator
+  // inputs reuses the cached plan and skips planning + the fold; ad-hoc callers pass null and still plan once.
   // (Returns a Cursor, not a Rows, to avoid the executor↔api import cycle.) The conformance corpus
   // drives the materialized execute() path, so this lane stays invisible to it (unit-tested to yield
   // identical rows + total cost under full drain, streaming.md §6).
@@ -11410,15 +11434,13 @@ export class Engine {
   ): { columnNames: string[]; columnTypes: string[]; cursor: Cursor } | null {
     if (stmt.kind !== "select" || stmtIsWrite(stmt)) return null;
     const snap = this.readSnap();
-    const gen = snap.catGen;
     // The cache entry's identity key: the shared core when this engine belongs to one, else the bare
     // Engine itself (the low-level tooling path — object identity is GC-safe in JS, so a bare engine
     // caches without aliasing another).
     const ident = this.core ?? this;
-    // Cache HIT: the plan was resolved against THIS database (same core — catGen is only monotonic
-    // within one core) and the read snapshot's catalog is unchanged since (its catGen still matches),
-    // and no relation name is shadowed by a session-local temp table the committed generation cannot
-    // see (planTouchesTemp — the statement may have been filled on a different session). Reuse the
+    // Cache HIT: the statement still belongs to the same database identity and every ordered base
+    // relation has the same exact identity/generation/name/revision tuple. Resolving those tuples also
+    // rejects a temp shadow or a missing/replaced attachment. Reuse the
     // resolved plan + finalized param types — no planQuery, no fold, no param-type walk. A cached plan
     // carries no subquery to fold (planCacheable rejected any), so the shared plan is never mutated;
     // params are still bound per execute.
@@ -11426,8 +11448,7 @@ export class Engine {
       holder !== null &&
       holder.cache !== null &&
       holder.cache.core === ident &&
-      holder.cache.catGen === gen &&
-      !this.planTouchesTemp(holder.cache.sp)
+      this.estimatorInputsMatch(holder.cache.sp, holder.cache.inputs)
     ) {
       const c = holder.cache;
       return this.buildScanRows(c.sp, bindParams(params, c.ptys), 0n);
@@ -11446,17 +11467,18 @@ export class Engine {
     // (and is skipped on a hit) — cost stays identical.
     const subqueryCost = { value: 0n };
     this.foldUncorrelatedInSelect(sp, bound, EMPTY_CTE_CTX, subqueryCost);
-    // Fill the cache only from committed state — so committed.catGen is strictly increasing over the
-    // core's life and never aliases a rolled-back working generation, making the catGen equality on
-    // a later HIT a sound "same catalog" identity check (a statement first executed inside an open
-    // transaction re-plans until the tx commits) — and only for a reusable plan.
+    // Fill only from committed state, so a working transaction can consume an entry whose exact
+    // signature matches but can never publish its working revision into the committed cache slot.
+    // Also require a reusable plan.
+    const inputs = this.estimatorInputs(sp);
     if (
       holder !== null &&
       snap === this.committed &&
       !ptypes.uncacheable &&
-      this.planCacheable(sp)
+      this.planCacheable(sp) &&
+      inputs !== null
     ) {
-      holder.cache = { core: ident, catGen: gen, sp, ptys };
+      holder.cache = { core: ident, inputs, sp, ptys };
     }
     return this.buildScanRows(sp, bound, subqueryCost.value);
   }
@@ -11550,8 +11572,8 @@ export class Engine {
   // planCacheable reports whether a resolved scan plan may be memoized on a prepared statement. The
   // subquery / precompiled-regex exclusion is tracked separately (ParamTypes.uncacheable, set at the
   // node's birth). Here the relations are vetted: a set-returning / CTE / derived relation carries a
-  // nested plan or generator we do not vet for reuse, and a temp table lives in a snapshot the cache
-  // key (committed.catGen) does not track — so a plan referencing any of those is never cached (a point
+  // nested plan or generator we do not vet for reuse, and a temp table has no persistent database
+  // identity/revision tuple — so a plan referencing any of those is never cached (a point
   // lookup / plain join over persistent base tables has none).
   planCacheable(sp: SelectPlan): boolean {
     for (const r of sp.rels) {
@@ -11564,13 +11586,66 @@ export class Engine {
   // temporary table in THIS session's visible temp domain. Checked at cache fill (a temp plan is never
   // cached) and re-checked on every cache HIT: a statement is shared across sessions, and a plan
   // cached where a name was persistent must not be served on a session whose temp table shadows that
-  // name — the temp domain is session-local, so the committed catGen the cache is keyed on cannot see
-  // it. Cheap: one map lookup per relation, against a usually-empty temp catalog.
+  // name — the temp domain is session-local and intentionally has no cache signature. Cheap: one map
+  // lookup per relation, against a usually-empty temp catalog.
   planTouchesTemp(sp: SelectPlan): boolean {
     for (const r of sp.rels) {
+      if (r.db !== undefined) {
+        if (r.db.toLowerCase() === "temp") return true;
+        continue;
+      }
       if (this.isTempTable(r.tableName)) return true;
     }
     return false;
+  }
+
+  private estimatorInput(rel: PlanRel): EstimatorInputSignature | null {
+    let snap: Snapshot | null;
+    if (rel.db === undefined) {
+      if (this.isTempTable(rel.tableName)) return null;
+      snap = this.readSnap();
+    } else {
+      const scope = rel.db.toLowerCase();
+      if (scope === "temp") return null;
+      snap = scope === "main" ? this.readSnap() : (this.attachReadSnap(scope) ?? null);
+    }
+    if (snap === null) return null;
+    const table = rel.tableName.toLowerCase();
+    if (!snap.tables.has(table)) return null;
+    return {
+      database: snap.estimatorIdentity,
+      catGen: snap.catGen,
+      table,
+      revision: snap.estimatorRevisionFor(table),
+    };
+  }
+
+  private estimatorInputs(sp: SelectPlan): EstimatorInputSignature[] | null {
+    const inputs: EstimatorInputSignature[] = [];
+    for (const rel of sp.rels) {
+      const input = this.estimatorInput(rel);
+      if (input === null) return null;
+      inputs.push(input);
+    }
+    return inputs;
+  }
+
+  private estimatorInputsMatch(sp: SelectPlan, want: EstimatorInputSignature[]): boolean {
+    if (sp.rels.length !== want.length) return false;
+    for (let i = 0; i < sp.rels.length; i++) {
+      const got = this.estimatorInput(sp.rels[i]!);
+      const expected = want[i]!;
+      if (
+        got === null ||
+        got.database !== expected.database ||
+        got.catGen !== expected.catGen ||
+        got.table !== expected.table ||
+        got.revision !== expected.revision
+      ) {
+        return false;
+      }
+    }
+    return true;
   }
 
   // tryDeferredQuery tries to serve stmt as a lazy DEFERRED query (spec/design/streaming.md §4/§7) — the
@@ -18979,18 +19054,22 @@ export type QueryPlan = SelectPlan | SetOpPlan | ValuesPlan | WithPlan;
 // ScanCache is a prepared statement's memoized scan plan (spec/design/api.md §2.4): the resolved
 // SelectPlan (shared by reference, so a cache hit rebuilds the cursor around the SAME plan object and
 // re-plans nothing) plus the finalized $N param types, stamped with the database identity (core) and
-// committed catalog generation (catGen) they were resolved against. A statement is a standalone value
-// shared across sessions, so a hit requires the same core — catGen is only monotonic within one core;
-// two databases can share a generation number with different schemas — AND the same generation (any
-// DDL bumps it and the next execute re-plans), and re-checks that no plan relation is shadowed by the
-// executing session's temp domain (planTouchesTemp). Filled only for a reusable plan read from
-// committed state. core is the engine's shared core when it has one, else the bare Engine itself
+// each base relation's ordered exact estimator-input tuple (database identity, catalog generation,
+// normalized name, revision). A hit compares every field and therefore also rejects temp shadows and
+// replaced attachments. Filled only for a reusable plan read from committed state. core is the
+// engine's shared core when it has one, else the bare Engine itself
 // (object identity is GC-safe in JS) — so the low-level tooling path caches too, without aliasing.
 export type ScanCache = {
   core: AttachmentCore | Engine;
-  catGen: bigint;
+  inputs: EstimatorInputSignature[];
   sp: SelectPlan;
   ptys: ScalarType[];
+};
+export type EstimatorInputSignature = {
+  database: object;
+  catGen: bigint;
+  table: string;
+  revision: object;
 };
 // ScanCacheHolder is the mutable slot the executor reads/writes. A PreparedStatement owns one and
 // threads it through queryStmt → tryScanQuery (executor.ts is import-cycle-free of api.ts, so the

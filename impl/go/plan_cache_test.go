@@ -1,8 +1,8 @@
 package jed
 
 // White-box tests for the prepared-statement plan cache (spec/design/api.md §2.4). A prepared
-// statement caches its resolved scan plan and reuses it across executes, re-planning only when the
-// catalog changes. The behavior is invisible to the conformance corpus (which never reuses a plan
+// statement caches its resolved scan plan and reuses it across executes while its exact estimator
+// inputs remain unchanged. The behavior is invisible to the conformance corpus (which never reuses a plan
 // across statements), and the interesting properties are internal — that a hit
 // reuses the exact plan (not re-plans), that reuse is cost-identical, that DDL invalidates, that a
 // subquery / precompiled-regex / temp plan is never cached, and that a plan first executed inside a
@@ -12,6 +12,7 @@ package jed
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"sync"
 	"testing"
 )
@@ -25,6 +26,7 @@ func drainQ(t *testing.T, s *Session, stmt *PreparedStatement, params ...Value) 
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}
+	defer rows.Close()
 	var out [][]int64
 	for rows.Next() {
 		src := rows.Row()
@@ -55,6 +57,22 @@ func planCacheRowsEq(got [][]int64, want [][]int64) bool {
 		}
 	}
 	return true
+}
+
+// cachedExplain renders the exact physical plan held by stmt's cache. Public EXPLAIN performs a
+// fresh planning pass, so this white-box helper is what lets P2 compare a refilled cached plan with
+// an independently fresh prepared plan rather than merely comparing their executions.
+func cachedExplain(t *testing.T, s *Session, stmt *PreparedStatement) [][]Value {
+	t.Helper()
+	entry := stmt.sc.p.Load()
+	if entry == nil {
+		t.Fatal("expected cached plan")
+	}
+	var r explainRender
+	if err := s.engine.renderSelectPlan(&r, entry.sp, 0); err != nil {
+		t.Fatalf("render cached plan: %v", err)
+	}
+	return r.rows
 }
 
 func seedOrders(t *testing.T, db *Session, n int) {
@@ -117,6 +135,171 @@ func TestPlanCachePointLookupReuses(t *testing.T) {
 	}
 }
 
+// P2 estimator-input validity is relation-scoped for row statistics: mutating an unrelated table
+// keeps the exact cached plan, while mutating a referenced table forces a fresh plan. The refilled
+// plan's rows and actual cost must equal an independently fresh prepared statement.
+func TestPlanCacheEstimatorRevisionRelevantAndUnrelated(t *testing.T) {
+	t.Parallel()
+	db := memDB().Session(SessionOptions{})
+	mustExec(t, db, "CREATE TABLE a (id i32 PRIMARY KEY, v i32)")
+	mustExec(t, db, "CREATE TABLE b (id i32 PRIMARY KEY, v i32)")
+	mustExec(t, db, "INSERT INTO a VALUES (1, 10)")
+	mustExec(t, db, "INSERT INTO b VALUES (1, 10)")
+	stmt, err := db.Prepare("SELECT id FROM a WHERE v = $1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _ = drainQ(t, db, stmt, IntValue(10)); stmt.sc.p.Load() == nil {
+		t.Fatal("expected fill")
+	}
+	first := stmt.sc.p.Load()
+	firstPlan := first.sp
+	firstRevision := first.inputs[0].revision
+
+	mustExec(t, db, "INSERT INTO b VALUES (2, 20)")
+	if _, _ = drainQ(t, db, stmt, IntValue(10)); stmt.sc.p.Load().sp != firstPlan {
+		t.Fatal("an unrelated table row-count change invalidated the plan")
+	}
+
+	// Return a's count to its prior value before executing again. Revision identity, not count
+	// equality, must still force a re-plan because structure/future statistics may differ.
+	mustExec(t, db, "INSERT INTO a VALUES (2, 20)")
+	mustExec(t, db, "DELETE FROM a WHERE id = 2")
+	gotRows, gotCost := drainQ(t, db, stmt, IntValue(10))
+	refilled := stmt.sc.p.Load()
+	if refilled.sp == firstPlan || refilled.inputs[0].revision == firstRevision {
+		t.Fatal("a referenced relation mutation did not invalidate the estimator signature")
+	}
+	fresh, err := db.Prepare("SELECT id FROM a WHERE v = $1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	freshRows, freshCost := drainQ(t, db, fresh, IntValue(10))
+	if !planCacheRowsEq(gotRows, freshRows) || gotCost != freshCost {
+		t.Fatalf("refilled vs fresh = rows %v/%v cost %d/%d", gotRows, freshRows, gotCost, freshCost)
+	}
+	if got, want := cachedExplain(t, db, stmt), cachedExplain(t, db, fresh); !reflect.DeepEqual(got, want) {
+		t.Fatalf("refilled vs fresh EXPLAIN = %v / %v", got, want)
+	}
+
+	// Exercise every row-mutation disposition that owns a distinct executor path. A no-op conflict
+	// remains a hit; UPDATE, INSERT ... SELECT, UPSERT-update, and DELETE each invalidate.
+	plan := stmt.sc.p.Load().sp
+	mustExec(t, db, "INSERT INTO a VALUES (1, 99) ON CONFLICT DO NOTHING")
+	if _, _ = drainQ(t, db, stmt, IntValue(10)); stmt.sc.p.Load().sp != plan {
+		t.Fatal("ON CONFLICT DO NOTHING invalidated an unchanged relation")
+	}
+	for _, step := range []struct {
+		sql   string
+		param int64
+	}{
+		{"UPDATE a SET v = 11 WHERE id = 1", 11},
+		{"INSERT INTO a SELECT 2, 20", 11},
+		{"INSERT INTO a VALUES (1, 12) ON CONFLICT (id) DO UPDATE SET v = excluded.v", 12},
+		{"DELETE FROM a WHERE id = 2", 12},
+	} {
+		before := stmt.sc.p.Load().sp
+		mustExec(t, db, step.sql)
+		if _, _ = drainQ(t, db, stmt, IntValue(step.param)); stmt.sc.p.Load().sp == before {
+			t.Fatalf("row mutation did not invalidate: %s", step.sql)
+		}
+	}
+}
+
+// A working transaction receives its own revision token, but cannot overwrite a committed cache
+// entry. Rollback restores the committed token, so the original plan becomes a hit again.
+func TestPlanCacheEstimatorRevisionRollback(t *testing.T) {
+	t.Parallel()
+	db := memDB().Session(SessionOptions{})
+	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
+	mustExec(t, db, "INSERT INTO t VALUES (1, 10)")
+	stmt, err := db.Prepare("SELECT id FROM t WHERE v = $1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _ = drainQ(t, db, stmt, IntValue(10)); stmt.sc.p.Load() == nil {
+		t.Fatal("expected fill")
+	}
+	committed := stmt.sc.p.Load()
+	if err := db.Begin(true); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, db, "INSERT INTO t VALUES (2, 10)")
+	inTx, _ := drainQ(t, db, stmt, IntValue(10))
+	if !planCacheRowsEq(inTx, [][]int64{{1}, {2}}) {
+		t.Fatalf("in-tx rows = %v", inTx)
+	}
+	if stmt.sc.p.Load() != committed {
+		t.Fatal("working-transaction statistics populated the committed cache slot")
+	}
+	if err := db.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := drainQ(t, db, stmt, IntValue(10))
+	if !planCacheRowsEq(after, [][]int64{{1}}) || stmt.sc.p.Load() != committed {
+		t.Fatalf("rollback did not restore the committed cache hit: rows=%v", after)
+	}
+}
+
+// An attachment contributes its own identity/generation/revision. Main-database changes do not
+// invalidate an attachment-only plan; a row mutation in the referenced attachment does.
+func TestPlanCacheAttachmentEstimatorSignature(t *testing.T) {
+	t.Parallel()
+	base := memDB()
+	if err := base.Attach("aux", AttachMemory(), false); err != nil {
+		t.Fatal(err)
+	}
+	db := base.Session(SessionOptions{})
+	mustExec(t, db, "CREATE TABLE aux.t (id i32 PRIMARY KEY, v i32)")
+	mustExec(t, db, "INSERT INTO aux.t VALUES (1, 10)")
+	stmt, err := base.Prepare("SELECT id FROM aux.t WHERE v = $1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _ = drainQ(t, db, stmt, IntValue(10)); stmt.sc.p.Load() == nil {
+		t.Fatal("expected attachment plan fill")
+	}
+	firstPlan := stmt.sc.p.Load().sp
+	mustExec(t, db, "CREATE TABLE local_only (id i32 PRIMARY KEY)")
+	if _, _ = drainQ(t, db, stmt, IntValue(10)); stmt.sc.p.Load().sp != firstPlan {
+		t.Fatal("main catalog change invalidated an attachment-only plan")
+	}
+	mustExec(t, db, "INSERT INTO aux.t VALUES (2, 10)")
+	rows, cost := drainQ(t, db, stmt, IntValue(10))
+	if stmt.sc.p.Load().sp == firstPlan {
+		t.Fatal("attachment row-count change did not invalidate its plan")
+	}
+	fresh, err := base.Prepare("SELECT id FROM aux.t WHERE v = $1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	freshRows, freshCost := drainQ(t, db, fresh, IntValue(10))
+	if !planCacheRowsEq(rows, freshRows) || cost != freshCost {
+		t.Fatalf("attachment refilled vs fresh = rows %v/%v cost %d/%d", rows, freshRows, cost, freshCost)
+	}
+
+	// Replacing an attachment with a new database at the same name must not alias even when its
+	// catalog generation and table shape happen to match the old database.
+	old := stmt.sc.p.Load()
+	if err := base.Detach("aux"); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Attach("aux", AttachMemory(), false); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, db, "CREATE TABLE aux.t (id i32 PRIMARY KEY, v i32)")
+	mustExec(t, db, "INSERT INTO aux.t VALUES (9, 10), (10, 10)")
+	replacedRows, _ := drainQ(t, db, stmt, IntValue(10))
+	replaced := stmt.sc.p.Load()
+	if replaced.inputs[0].database == old.inputs[0].database || replaced.sp == old.sp {
+		t.Fatal("detach/reattach falsely reused the prior attachment identity")
+	}
+	if !planCacheRowsEq(replacedRows, [][]int64{{9}, {10}}) {
+		t.Fatalf("reattached rows = %v", replacedRows)
+	}
+}
+
 // DROP INDEX bumps the catalog generation on a table that survives, so the next execute re-plans and
 // falls back from the (now-gone) index lookup to a full scan — a stale cached index plan would try to
 // use a dropped index. Exercises the removeIndex catGen bump.
@@ -141,7 +324,7 @@ func TestPlanCacheDropIndexInvalidation(t *testing.T) {
 	if entry == nil {
 		t.Fatal("expected fill")
 	}
-	gen1 := entry.catGen
+	gen1 := entry.inputs[0].catGen
 
 	mustExec(t, db, "DROP INDEX t_a")
 	rScan, costScan := drainQ(t, db, stmt, IntValue(25)) // re-plan → full scan
@@ -152,7 +335,7 @@ func TestPlanCacheDropIndexInvalidation(t *testing.T) {
 		t.Fatalf("expected full scan costlier than index after DROP INDEX: scan=%d idx=%d "+
 			"(stale index plan served?)", costScan, costIdx)
 	}
-	if c := stmt.sc.p.Load(); c != nil && c.catGen == gen1 {
+	if c := stmt.sc.p.Load(); c != nil && c.inputs[0].catGen == gen1 {
 		t.Fatal("catGen did not advance after DROP INDEX — plan cache would serve a stale plan")
 	}
 }

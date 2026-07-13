@@ -31,6 +31,7 @@ impl Engine {
             open_streams: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             core: None,
             attached_committed: HashMap::new(),
+            estimator_touched: HashSet::new(),
         }
     }
 
@@ -56,6 +57,28 @@ impl Engine {
             open_streams: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             core: None,
             attached_committed: HashMap::new(),
+            estimator_touched: HashSet::new(),
+        }
+    }
+
+    /// Advance a persistent relation's transactional estimator revision once for this top-level
+    /// statement. Session temp plans remain uncacheable and carry no signature (estimator.md §6).
+    pub(crate) fn mark_estimator_mutation(&mut self, scope: Option<&str>, table: &str) {
+        let database = match scope {
+            None if self.is_temp_table(table) => return,
+            None => "main".to_string(),
+            Some(s) if s.eq_ignore_ascii_case("temp") => return,
+            Some(s) => s.to_ascii_lowercase(),
+        };
+        let key = (database.clone(), table.to_ascii_lowercase());
+        if !self.estimator_touched.insert(key) {
+            return;
+        }
+        if database == "main" {
+            self.working_mut().bump_estimator_revision(table);
+        } else {
+            self.attach_write_snap(&database)
+                .bump_estimator_revision(table);
         }
     }
 

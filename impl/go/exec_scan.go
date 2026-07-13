@@ -2,6 +2,7 @@ package jed
 
 import (
 	"bytes"
+	"strings"
 	"sync/atomic"
 )
 
@@ -47,30 +48,40 @@ func (db *engine) snapshotEngine() *engine {
 }
 
 // scanCache is one immutable filled entry of a prepared statement's plan cache (stmtCache): the
-// resolved scan plan + finalized param types, stamped with the Database (sharedCore) and committed
-// catalog generation they were resolved against. Built once, published via stmtCache.p, and never
-// mutated after — so a concurrent reader sees a complete entry or none.
+// resolved scan plan + finalized param types, stamped with the exact ordered estimator-input
+// signature they were resolved against. Built once, published via stmtCache.p, and never mutated
+// after — so a concurrent reader sees a complete entry or none.
 type scanCache struct {
-	// core identifies the Database the plan was resolved against. catGen is only monotonic within
-	// one core — two Databases can share a generation number with different schemas — so a hit
-	// requires the same core AND the same generation (spec/design/api.md §2.4).
+	// core identifies the Database the plan was resolved against (including relation-free plans).
+	// inputs is the exact P2 relation-scoped estimator signature in source ordinal order.
 	core   *sharedCore
-	catGen uint64
+	inputs []estimatorInputSignature
 	sp     *selectPlan
 	ptys   []scalarType
+}
+
+// estimatorInputSignature is collision-free by construction: identity and revision are opaque
+// pointer-equality tokens owned by the pinned snapshot, never hashes. Catalog generation and table
+// name remain explicit fields of the ratified tuple (spec/design/estimator.md §6).
+type estimatorInputSignature struct {
+	database *estimatorDatabaseIdentity
+	catGen   uint64
+	table    string
+	revision *estimatorRevision
 }
 
 // stmtCache memoizes a prepared statement's resolved scan plan + finalized param types so a repeated
 // execute skips planning entirely (spec/design/api.md §2.4) — the biggest lever for the point-lookup
 // / high-frequency class (planning is ~⅔ of a point lookup's latency and ~88% of its allocations, and
 // the resulting GC inflates the tail). An entry is valid only for the Database it was resolved
-// against and only while catGen still equals that core's committed catalog generation; any DDL bumps
-// catGen and the next execute re-plans. Filled only from committed state and only for a reusable plan
-// (planCacheable + !paramTypes.uncacheable), so reusing it is result/cost-identical to a fresh plan.
+// against and while every ordered relation signature field still matches: database identity,
+// catalog generation, normalized table name, and estimator revision. Filled only from committed
+// state and only for a reusable plan (planCacheable + !paramTypes.uncacheable), so reusing it is
+// result/plan/cost-identical to a fresh plan.
 // Zero value is "empty". The slot is a lock-free atomic pointer: a prepared statement is a standalone
 // value shared across sessions — and goroutines — so concurrent executes may race to fill it; the
-// entry itself is immutable and last-writer-wins (both candidates are correct for their core+catGen;
-// a statement bounced between databases or a pinned-vs-current session merely re-plans).
+// entry itself is immutable and last-writer-wins (both candidates are correct for their exact
+// input signature; a statement bounced between databases or snapshots merely re-plans).
 type stmtCache struct {
 	p atomic.Pointer[scanCache]
 }
@@ -79,9 +90,9 @@ type stmtCache struct {
 // subquery / precompiled-regex exclusion is tracked separately (paramTypes.uncacheable, set at the
 // node's birth — a folded uncorrelated subquery bakes in one execution's params, and a precompiled
 // regex carries a per-execution cost flag). Here the relations are vetted: a set-returning / CTE /
-// derived relation carries a nested plan or generator we do not vet for reuse, and a temp table lives
-// in a snapshot the cache key (committed.catGen) does not track — so a plan referencing any of those
-// is never cached (a point lookup / plain join over persistent base tables has none).
+// derived relation carries a nested plan or generator we do not vet for reuse, and a temp table has
+// no persistent database identity/revision tuple — so a plan referencing any of those is never
+// cached (a point lookup / plain join over persistent base tables has none).
 func (db *engine) planCacheable(sp *selectPlan) bool {
 	for i := range sp.rels {
 		r := &sp.rels[i]
@@ -96,15 +107,81 @@ func (db *engine) planCacheable(sp *selectPlan) bool {
 // temporary table in THIS session's visible temp domain. Checked at cache fill (a temp plan is never
 // cached) and re-checked on every cache HIT: a statement is shared across sessions, and a plan cached
 // where a name was persistent must not be served on a session whose temp table shadows that name —
-// the temp domain is session-local, so the committed catGen the cache is keyed on cannot see it.
+// the temp domain is session-local and intentionally has no cache signature.
 // Cheap: one map lookup per relation, against a usually-empty temp catalog.
 func (db *engine) planTouchesTemp(sp *selectPlan) bool {
 	for i := range sp.rels {
-		if db.isTempTable(sp.rels[i].tableName) {
+		r := &sp.rels[i]
+		if r.db != nil {
+			if strings.EqualFold(*r.db, "temp") {
+				return true
+			}
+			continue
+		}
+		if db.isTempTable(r.tableName) {
 			return true
 		}
 	}
 	return false
+}
+
+// estimatorInputFor resolves one base relation against this execution's visible pinned snapshots.
+// Temp and synthetic/catalog relations are uncacheable until they receive a complete identity.
+func (db *engine) estimatorInputFor(r *planRel) (estimatorInputSignature, bool) {
+	var snap *snapshot
+	if r.db == nil {
+		if db.isTempTable(r.tableName) {
+			return estimatorInputSignature{}, false
+		}
+		snap = db.readSnap()
+	} else {
+		switch strings.ToLower(*r.db) {
+		case "temp":
+			return estimatorInputSignature{}, false
+		case "main":
+			snap = db.readSnap()
+		default:
+			snap = db.attachReadSnap(strings.ToLower(*r.db))
+		}
+	}
+	if snap == nil {
+		return estimatorInputSignature{}, false
+	}
+	table := strings.ToLower(r.tableName)
+	if _, ok := snap.table(table); !ok {
+		return estimatorInputSignature{}, false
+	}
+	return estimatorInputSignature{
+		database: snap.estimatorIdentity,
+		catGen:   snap.catGen,
+		table:    table,
+		revision: snap.estimatorRevisionFor(table),
+	}, true
+}
+
+func (db *engine) estimatorInputs(sp *selectPlan) ([]estimatorInputSignature, bool) {
+	inputs := make([]estimatorInputSignature, len(sp.rels))
+	for i := range sp.rels {
+		input, ok := db.estimatorInputFor(&sp.rels[i])
+		if !ok {
+			return nil, false
+		}
+		inputs[i] = input
+	}
+	return inputs, true
+}
+
+func (db *engine) estimatorInputsMatch(sp *selectPlan, want []estimatorInputSignature) bool {
+	if len(sp.rels) != len(want) {
+		return false
+	}
+	for i := range sp.rels {
+		got, ok := db.estimatorInputFor(&sp.rels[i])
+		if !ok || got != want[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // tryScanQuery serves stmt as a lazy STREAMING or BUFFERED query (spec/design/streaming.md §3/§4),
@@ -113,8 +190,8 @@ func (db *engine) planTouchesTemp(sp *selectPlan) bool {
 // re-planned the same statement. Returns (rows, true, nil) for a top-level read SELECT; (nil, false,
 // nil) for a shape no scan lane covers (a non-SELECT, a write — incl. a nextval/setval SELECT,
 // stmtIsWrite — or a top-level set-op / VALUES / WITH), so the caller falls through to the deferred /
-// materialized paths. When sc is non-nil (a prepared statement) a repeated execute over an unchanged
-// catalog reuses the cached plan and skips planning + the fold; ad-hoc callers pass nil and still
+// materialized paths. When sc is non-nil (a prepared statement) a repeated execute over unchanged
+// estimator inputs reuses the cached plan and skips planning + the fold; ad-hoc callers pass nil and still
 // plan exactly once. The conformance corpus drives this lazy lane for every read (the harness routes
 // through queryValues), cross-checked to yield identical rows + total cost as the materialized drive
 // under full drain (streaming.md §6).
@@ -122,16 +199,15 @@ func (db *engine) tryScanQuery(stmt statement, params []Value, sc *stmtCache) (*
 	if stmt.Select == nil || stmtIsWrite(stmt) {
 		return nil, false, nil
 	}
-	// Cache HIT: the plan was resolved against THIS Database (same core — catGen is only monotonic
-	// within one core) and the read snapshot's catalog is unchanged since (its catGen still matches),
-	// and no relation name is shadowed by a session-local temp table the committed generation cannot
-	// see (planTouchesTemp — the statement may have been filled on a different session). Reuse the
+	// Cache HIT: the statement still belongs to the same shared Database and every ordered base
+	// relation has the same exact identity/generation/name/revision tuple. Resolving those tuples also
+	// rejects a session-local temp shadow or a missing/replaced attachment. Reuse the
 	// resolved plan + finalized param types — no planQuery, no fold, no param-type walk. A cached plan
 	// carries no subquery to fold (planCacheable rejected any), so the shared plan is never mutated;
 	// params are still bound per execute inside buildScanRows.
 	rsnap := db.readSnap()
 	if sc != nil {
-		if c := sc.p.Load(); c != nil && c.core == db.core && c.catGen == rsnap.catGen && !db.planTouchesTemp(c.sp) {
+		if c := sc.p.Load(); c != nil && c.core == db.core && db.estimatorInputsMatch(c.sp, c.inputs) {
 			return db.buildScanRows(c.sp, c.ptys, params, false)
 		}
 	}
@@ -149,13 +225,12 @@ func (db *engine) tryScanQuery(stmt statement, params []Value, sc *stmtCache) (*
 	if err != nil {
 		return nil, false, err
 	}
-	// Fill the cache only from committed state — so committed.catGen is strictly increasing over the
-	// core's life and never aliases a rolled-back working generation, making the catGen equality on
-	// a later HIT a sound "same catalog" identity check (a statement first executed inside an open
-	// transaction re-plans until the tx commits) — and only for a reusable plan, and only when this
-	// engine belongs to a core (the entry's identity key; a core-less engine never fills).
-	if sc != nil && db.core != nil && rsnap == db.committed && !ptypes.uncacheable && db.planCacheable(sp) {
-		sc.p.Store(&scanCache{core: db.core, catGen: rsnap.catGen, sp: sp, ptys: ptys})
+	// Fill only from committed state, so a working transaction can consume an entry whose exact
+	// signature matches but can never publish its working revision into the committed cache slot.
+	// Also require a reusable plan and a core identity (a core-less engine never fills).
+	inputs, inputsOK := db.estimatorInputs(sp)
+	if sc != nil && db.core != nil && rsnap == db.committed && !ptypes.uncacheable && db.planCacheable(sp) && inputsOK {
+		sc.p.Store(&scanCache{core: db.core, inputs: inputs, sp: sp, ptys: ptys})
 	}
 	return db.buildScanRows(sp, ptys, params, true)
 }
