@@ -114,8 +114,8 @@ one
 three
 
 # A sibling predicate on only the non-leading member cannot seed composite INL, so the inner scans
-# once; the same-type equality instead selects hash join and emits two exact-key matches.
-# cost: 52
+# once; the same-type equality selects the cheaper small-pair nested loop and emits two matches.
+# cost: 19
 query II nosort
 SELECT co.id, cp.a FROM co JOIN cp ON cp.a = co.a ORDER BY co.id, cp.a
 ----

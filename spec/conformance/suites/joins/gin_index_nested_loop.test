@@ -98,7 +98,7 @@ ORDER BY p.id, d.id
 12
 
 # Array equality gathers an @>-superset and rechecks exact equality.
-# cost: 51
+# cost: 166
 query II nosort
 SELECT p.id, d.id
 FROM gin_probe p JOIN gin_doc d ON d.tags = p.q
@@ -142,7 +142,7 @@ ORDER BY p.id, d.id
 
 # A usable sibling bound overrides the once-materialized constant GIN bound. Both predicates remain
 # residual, so the result is their intersection.
-# cost: 37
+# cost: 32
 query II nosort
 SELECT p.id, d.id
 FROM gin_probe p JOIN gin_doc d ON d.tags && p.q

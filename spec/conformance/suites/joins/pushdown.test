@@ -22,30 +22,30 @@ INSERT INTO a VALUES (1, 10), (2, 20), (3, 30)
 statement ok
 INSERT INTO b VALUES (10, 10), (20, 20), (30, 99)
 
-# INNER, WHERE on a's PK bounds a to one row; b builds fully. The one left hash probe finds b(10),
-# rechecks ON/WHERE, and produces it.
-# cost: 33
+# INNER, WHERE on a's PK bounds a to one row; b materializes fully. The selected nested loop checks
+# that row against b, rechecks ON/WHERE, and produces the one match.
+# cost: 11
 query II nosort
 SELECT a.id, b.id FROM a JOIN b ON a.k = b.k WHERE a.id = 1 ORDER BY a.id, b.id
 ----
 1
 10
 
-# INNER, WHERE `a.id = 999` is a point-lookup MISS. b still builds, but there is no probe/ON/output.
-# cost: 17
+# INNER, WHERE `a.id = 999` is a point-lookup MISS. b still materializes, but there is no ON/output.
+# cost: 5
 query II nosort
 SELECT a.id, b.id FROM a JOIN b ON a.k = b.k WHERE a.id = 999
 ----
 
-# INNER, range `a.id >= 2` bounds a to rows 2,3. Their probes yield one match and one miss.
-# cost: 38
+# INNER, range `a.id >= 2` bounds a to rows 2,3. Their nested-loop pairs yield one match.
+# cost: 15
 query I nosort
 SELECT a.id FROM a JOIN b ON a.k = b.k WHERE a.id >= 2 ORDER BY a.id, b.id
 ----
 2
 
-# Both sides bounded to one row; the one-row hash build/probe matches, then the 3-node WHERE passes.
-# cost: 25
+# Both sides bounded to one row; the one nested-loop pair matches, then the 3-node WHERE passes.
+# cost: 9
 query II nosort
 SELECT a.id, b.id FROM a JOIN b ON a.k = b.k WHERE a.id = 1 AND b.id = 10 ORDER BY a.id
 ----
@@ -72,9 +72,9 @@ SELECT a.id, b.id FROM a LEFT JOIN b ON a.k = b.k WHERE b.id = 10 ORDER BY a.id
 1
 10
 
-# Contrast 1 — a NON-key WHERE does not bound: `a.k = 10` full-scans a. Hash join still narrows ON
-# candidates by k; WHERE runs on its two matches and keeps one.
-# cost: 53
+# Contrast 1 — a NON-key WHERE does not bound: `a.k = 10` full-scans a. Nested loop applies ON to
+# every pair; WHERE runs on the two ON matches and keeps one.
+# cost: 20
 query I nosort
 SELECT a.id FROM a JOIN b ON a.k = b.k WHERE a.k = 10 ORDER BY a.id
 ----

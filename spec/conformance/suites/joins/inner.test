@@ -20,10 +20,10 @@ statement ok
 INSERT INTO b VALUES (10, 10, 'ten'), (20, 20, 'twenty'), (21, 20, 'twentyish'), (30, NULL, 'nullk')
 
 # Equi-join on k. a.k=10 → b(10); a.k=20 → b(20) and b(21); a.k=30 → no b; a.k=NULL → none.
-# Hash join builds b once, probes a in PK order, and rechecks ON on the three exact-key candidates.
-# Projection is two bare/qualified columns (leaves), so it adds no operator_eval.
+# P7 selects nested loop for this small pair: both relations materialize once, all 16 pairs recheck
+# ON, and the three matches are produced. Projection leaves add no operator_eval.
 # names: id, label
-# cost: 66
+# cost: 29
 query IT nosort
 SELECT a.id, b.label FROM a JOIN b ON a.k = b.k ORDER BY a.id, b.id
 ----
@@ -34,9 +34,9 @@ twenty
 2
 twentyish
 
-# An explicit INNER keyword is identical to a bare JOIN and selects the same hash plan/cost.
+# An explicit INNER keyword is identical to a bare JOIN and selects the same plan/cost.
 # names: id
-# cost: 66
+# cost: 29
 query I nosort
 SELECT a.id FROM a INNER JOIN b ON a.k = b.k ORDER BY a.id, b.id
 ----
@@ -46,9 +46,9 @@ SELECT a.id FROM a INNER JOIN b ON a.k = b.k ORDER BY a.id, b.id
 
 # WHERE applies AFTER the join, to the combined rows. The ON produces 3 matched rows; WHERE
 # `b.label = 'twenty'` evaluates on each and keeps one. Its ordinary operator_eval and
-# varlen_compare work composes with hash build/probe, candidate verification, ON, and output cost.
+# varlen_compare work composes with the selected nested-loop ON and output cost.
 # names: id, k
-# cost: 79
+# cost: 42
 query II nosort
 SELECT a.id, b.k FROM a JOIN b ON a.k = b.k WHERE b.label = 'twenty' ORDER BY a.id
 ----

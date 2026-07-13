@@ -18,8 +18,9 @@ statement ok
 INSERT INTO hj_right VALUES
   (10, 1, 'x'), (11, 1, 'b'), (12, 2, 'y'), (13, NULL, 'z'), (14, 4, 'q'), (15, 3, 'same')
 
-# Duplicates produce a many-to-many bucket run; NULL on either side never matches.
-# cost: 111
+# P7 selects nested loop for this small pair; duplicates still produce the same many-to-many run,
+# and NULL on either side never matches. The larger hash-win threshold is pinned by P7's own suite.
+# cost: 49
 query II nosort
 SELECT l.id, r.id
 FROM hj_left l JOIN hj_right r ON l.k = r.k

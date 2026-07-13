@@ -27,9 +27,9 @@ INSERT INTO a VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)
 statement ok
 INSERT INTO b VALUES (101, 10), (102, 20), (103, 30), (104, 40), (105, 50)
 
-# ORDER BY the OUTER PK `a.id` with a LIMIT: hash join builds b, then probes a in id order and stops
-# once two exact-key matches are produced. Later a rows incur no hash_probe/ON/output work.
-# cost: 60
+# ORDER BY the selected OUTER PK `a.id` with a LIMIT: the nested loop drives a in id order and stops
+# once two matches are produced. Later a rows incur no ON/output work.
+# cost: 21
 query II nosort
 SELECT a.id, b.id FROM a JOIN b ON a.k = b.k ORDER BY a.id LIMIT 2
 ----
@@ -40,8 +40,8 @@ SELECT a.id, b.id FROM a JOIN b ON a.k = b.k ORDER BY a.id LIMIT 2
 
 # CONTRAST — `ORDER BY a.id, b.id` references the INNER PK too, so it is NOT satisfied by the outer
 # scan order alone (the inner key is the tie-break, not part of `a`'s PK): the eager path completes
-# every hash probe/candidate check, sorts, then windows. Same rows; higher cost proves short-circuit.
-# cost: 99
+# every nested-loop pair, sorts, then windows. Same rows; higher cost proves short-circuit.
+# cost: 39
 query II nosort
 SELECT a.id, b.id FROM a JOIN b ON a.k = b.k ORDER BY a.id, b.id LIMIT 2
 ----
@@ -51,7 +51,7 @@ SELECT a.id, b.id FROM a JOIN b ON a.k = b.k ORDER BY a.id, b.id LIMIT 2
 102
 
 # OFFSET composes: probe/match a.id=1 and skip it, then take matches for a.id=2 and 3 before stopping.
-# cost: 73
+# cost: 27
 query II nosort
 SELECT a.id, b.id FROM a JOIN b ON a.k = b.k ORDER BY a.id LIMIT 2 OFFSET 1
 ----
@@ -62,9 +62,9 @@ SELECT a.id, b.id FROM a JOIN b ON a.k = b.k ORDER BY a.id LIMIT 2 OFFSET 1
 
 # A WHERE on the INNER PK composes with both optimizations: `b.id >= 103` is a join-pushdown PK range
 # bound (query.join_pushdown), so `b` materializes only rows 103,104,105 (3, not 5) — and the outer
-# scan order still elides the sort and short-circuits. The hash build contains only b=103..105; probes
-# a=1,2 miss, then a=3,4 match and fill the window. The residual WHERE runs on those candidates.
-# cost: 60
+# scan order still elides the sort and short-circuits. The inner contains only b=103..105; a=1,2
+# miss, then a=3,4 match and fill the window. The residual WHERE runs on those pairs.
+# cost: 25
 query II nosort
 SELECT a.id, b.id FROM a JOIN b ON a.k = b.k WHERE b.id >= 103 ORDER BY a.id LIMIT 2
 ----

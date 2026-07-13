@@ -18,10 +18,10 @@ query ITTII nosort
 EXPLAIN SELECT l.id, r.id FROM hx_l l JOIN hx_r r ON l.k = r.k
 ----
 0
-Hash Join
-inner; keys=1; on:conjuncts=1
+Nested Loop
+inner; on:conjuncts=1
 1
-32
+11
 1
 Scan hx_l
 Full scan; touched=2

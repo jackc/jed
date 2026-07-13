@@ -1,0 +1,277 @@
+# P7 cost-selects the complete two-base-relation INNER/CROSS pipeline across both physical
+# orientations and nested-loop, index-nested-loop, and hash algorithms. Logical column slots stay
+# in source order even when EXPLAIN renders the selected reverse physical order. This is jed-owned
+# plan/cost behavior and is intentionally not PostgreSQL-oracle output.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.join_inner, query.join_left, query.cross_join, query.qualified_column, query.comparison_order, query.order_by, query.order_by_keys, query.limit, query.explain, query.hash_join, query.index_nested_loop, query.order_by_join_scan, expr.arithmetic, types.i32, resource.cost_metering
+
+# --- canonical exact tie: FROM order wins -----------------------------------------------
+
+statement ok
+CREATE TABLE p7_ta (id i32 PRIMARY KEY, k i32)
+
+statement ok
+CREATE TABLE p7_tb (id i32 PRIMARY KEY, k i32)
+
+statement ok
+INSERT INTO p7_ta VALUES (1, 1), (2, 2)
+
+statement ok
+INSERT INTO p7_tb VALUES (11, 1), (12, 2)
+
+# Both nested-loop orientations have exactly the same complete estimate. Canonical physical
+# relation order [0,1] retains FROM order; nested beats hash for this small pair.
+query ITTII nosort
+EXPLAIN SELECT a.id, b.id FROM p7_ta a JOIN p7_tb b ON a.k = b.k
+----
+0
+Nested Loop
+inner; on:conjuncts=1
+1
+11
+1
+Scan p7_ta
+Full scan; touched=2
+2
+3
+1
+Scan p7_tb
+Full scan; touched=2
+2
+3
+
+# cost: 12
+query II nosort
+SELECT a.id, b.id FROM p7_ta a JOIN p7_tb b ON a.k = b.k ORDER BY a.id
+----
+1
+11
+2
+12
+
+# --- selected physical order drives join top-N -----------------------------------------
+
+statement ok
+CREATE TABLE p7_ra (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE p7_rb (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO p7_ra VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10),
+  (11), (12), (13), (14), (15), (16), (17), (18), (19), (20)
+
+statement ok
+INSERT INTO p7_rb VALUES (1), (2), (3)
+
+# ORDER BY the first source's PK makes FROM order strictly cheaper and keeps p7_ra outer.
+query ITTII nosort
+EXPLAIN SELECT a.id, b.id FROM p7_ra a JOIN p7_rb b ON a.id > 0 ORDER BY a.id LIMIT 2
+----
+0
+Limit
+limit=2
+2
+33
+1
+Nested Loop
+inner; on:conjuncts=1; ordered: join pk ordered
+2
+31
+2
+Scan p7_ra
+Full scan; touched=1
+20
+21
+2
+Scan p7_rb
+Full scan; touched=1
+3
+4
+
+# cost: 29
+query II nosort
+SELECT a.id, b.id FROM p7_ra a JOIN p7_rb b ON a.id > 0 ORDER BY a.id LIMIT 2
+----
+1
+1
+1
+2
+
+# ORDER BY the second source's PK reverses the winning orientation. The executor still evaluates
+# expressions and projects columns through their original logical slots.
+query ITTII nosort
+EXPLAIN SELECT a.id, b.id FROM p7_ra a JOIN p7_rb b ON a.id > 0 ORDER BY b.id LIMIT 2
+----
+0
+Limit
+limit=2
+2
+47
+1
+Nested Loop
+inner; on:conjuncts=1; ordered: join pk ordered
+7
+45
+2
+Scan p7_rb
+Full scan; touched=1
+3
+4
+2
+Scan p7_ra
+Full scan; touched=1
+20
+21
+
+# cost: 29
+query II nosort
+SELECT a.id, b.id FROM p7_ra a JOIN p7_rb b ON a.id > 0 ORDER BY b.id LIMIT 2
+----
+1
+1
+2
+1
+
+# --- reverse-orientation INL ------------------------------------------------------------
+
+statement ok
+CREATE TABLE p7_ix (id i32 PRIMARY KEY, v i32)
+
+statement ok
+CREATE TABLE p7_drv (id i32 PRIMARY KEY, ixid i32)
+
+statement ok
+INSERT INTO p7_ix VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50),
+  (6, 60), (7, 70), (8, 80), (9, 90), (10, 100), (11, 110), (12, 120),
+  (13, 130), (14, 140), (15, 150), (16, 160), (17, 170), (18, 180),
+  (19, 190), (20, 200)
+
+statement ok
+INSERT INTO p7_drv VALUES (1, 2), (2, 15), (3, 99)
+
+# p7_ix appears first in FROM, but its PK depends on p7_drv. Only [p7_drv,p7_ix] makes that
+# dependency physical-left, so the reverse INL wins and EXPLAIN renders the driver first.
+query ITTII nosort
+EXPLAIN SELECT i.id, d.id FROM p7_ix i JOIN p7_drv d ON i.id = d.ixid
+----
+0
+Nested Loop
+inner; on:conjuncts=1
+3
+16
+1
+Scan p7_drv
+Full scan; touched=2
+3
+4
+1
+Scan p7_ix
+Index-nested-loop PK bound: id = join; touched=1
+3
+6
+
+# cost: 13
+query II nosort
+SELECT i.id, d.id FROM p7_ix i JOIN p7_drv d ON i.id = d.ixid ORDER BY d.id
+----
+2
+1
+15
+2
+
+# An outer join is a P7 barrier. It retains logical/FROM order and the established LEFT hash path.
+query ITTII nosort
+EXPLAIN SELECT i.id, d.id FROM p7_ix i LEFT JOIN p7_drv d ON i.id = d.ixid
+----
+0
+Hash Join
+left; keys=1; on:conjuncts=1
+20
+317
+1
+Scan p7_ix
+Full scan; touched=1
+20
+21
+1
+Scan p7_drv
+Full scan; touched=2
+3
+4
+
+# --- hash wins at larger cardinality ----------------------------------------------------
+
+statement ok
+CREATE TABLE p7_ha (id i32 PRIMARY KEY, k i32)
+
+statement ok
+CREATE TABLE p7_hb (id i32 PRIMARY KEY, k i32)
+
+statement ok
+INSERT INTO p7_ha VALUES (1, 1), (2, 2), (3, 3), (4, 4), (5, 5),
+  (6, 6), (7, 7), (8, 8), (9, 9), (10, 10)
+
+statement ok
+INSERT INTO p7_hb VALUES (101, 1), (102, 2), (103, 3), (104, 4), (105, 5),
+  (106, 6), (107, 7), (108, 8), (109, 9), (110, 10)
+
+query ITTII nosort
+EXPLAIN SELECT a.id, b.id FROM p7_ha a JOIN p7_hb b ON a.k = b.k
+----
+0
+Hash Join
+inner; keys=1; on:conjuncts=1
+1
+112
+1
+Scan p7_ha
+Full scan; touched=2
+10
+11
+1
+Scan p7_hb
+Full scan; touched=2
+10
+11
+
+# cost: 202
+query II nosort
+SELECT a.id, b.id FROM p7_ha a JOIN p7_hb b ON a.k = b.k ORDER BY a.id
+----
+1
+101
+2
+102
+3
+103
+4
+104
+5
+105
+6
+106
+7
+107
+8
+108
+9
+109
+10
+110
+
+# Plan-dependent expression visitation remains deterministic. Keep this corpus tripwire to one
+# candidate pair and one offender so it does not promise a FROM-order error beyond the chosen plan.
+statement ok
+CREATE TABLE p7_ea (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE p7_eb (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO p7_ea VALUES (1)
+
+statement ok
+INSERT INTO p7_eb VALUES (1)
+
+statement error 22012
+SELECT a.id FROM p7_ea a JOIN p7_eb b ON 10 / (a.id - b.id) > 0

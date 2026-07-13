@@ -59,15 +59,15 @@ Full scan
 4
 23
 
-# The hash node owns fixed-width build/probe bytes and estimated bucket verification.
+# P7 chooses the lower estimated nested loop for this small relation pair.
 query ITTII nosort
 EXPLAIN SELECT l.id, r.id FROM p5_l l JOIN p5_r r ON l.k = r.k
 ----
 0
-Hash Join
-inner; keys=1; on:conjuncts=1
+Nested Loop
+inner; on:conjuncts=1
 1
-52
+27
 1
 Scan p5_l
 Full scan; touched=2

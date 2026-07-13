@@ -36,6 +36,8 @@
 #              defeats both bounds. P6a's cost-selected result and the full scan must agree.
 #   cost_plan_p6b — mixed GIN/GiST/B-tree predicates, PK/index interval sets, and an order-only
 #              top-N compare P6b's whole-pipeline winner with a deliberately non-accelerated form.
+#   cost_plan_p7 — reverse-orientation INL, hash-vs-nested algorithm selection, and selected-outer
+#              join top-N compare P7 winners with deliberately non-accelerated blocking forms.
 #   index_mut — UPDATE/DELETE target scans use a bare indexed equality/range or secondary-index
 #              IN-list; the equivalent `v + 0` predicates defeat the mutation bound. Applied to
 #              identically-seeded tables, both paths must reach the same by-construction end state,
@@ -181,6 +183,10 @@ COST_PLAN_P6B_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index ddl.
                        query.interval_set query.gin_scan query.gist_scan query.order_by_index_scan
                        expr.arithmetic expr.comparison_value types.i32 types.array types.range
                        func.array_containment func.range_constructors func.range_operators].freeze
+COST_PLAN_P7_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
+                      query.join_inner query.qualified_column query.comparison_order query.order_by
+                      query.order_by_keys query.limit query.index_nested_loop query.hash_join
+                      query.order_by_join_scan expr.arithmetic types.i32].freeze
 INDEX_MUT_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index dml.insert
                    dml.insert_multi_row dml.update dml.delete query.select query.where_eq
                    query.comparison_order query.order_by query.or_in_point_lookup
@@ -797,6 +803,59 @@ def gen_cost_plan_p6b(seed)
   out << "# order-only B-tree top-N versus expression-key blocking sort"
   q(out, "I", "SELECT id FROM t ORDER BY a LIMIT #{k}", flat.call(expected))
   q(out, "I", "SELECT id FROM t ORDER BY a + 0, id LIMIT #{k}", flat.call(expected))
+
+  out.join("\n") + "\n"
+end
+
+# --- scenario: P7 costed two-relation orientation and algorithm -------------------------------
+def gen_cost_plan_p7(seed)
+  rng = Random.new(seed)
+  out = header(seed, COST_PLAN_P7_REQ,
+               "P7 two-relation orientation, algorithm, and selected-outer top-N")
+
+  # Source order puts the indexed relation first. Only the reverse physical orientation can place
+  # the driver on the left and seek ix.id per driver row. Wrapping the indexed key defeats INL (and
+  # hash, because it is no longer a bare key) while preserving the total-ordered result.
+  ix = (1..12).map { |id| [id, rng.rand(1..4)] }
+  driver = (1..5).map { |id| [id, [2, 5, 9, 12, 99][id - 1]] }
+  stmt(out, "CREATE TABLE ix (id i32 PRIMARY KEY, k i32)")
+  stmt(out, "CREATE TABLE driver (id i32 PRIMARY KEY, ixid i32)")
+  stmt(out, "INSERT INTO ix VALUES #{ix.map { |id, k| "(#{id},#{k})" }.join(', ')}")
+  stmt(out, "INSERT INTO driver VALUES #{driver.map { |id, ixid| "(#{id},#{ixid})" }.join(', ')}")
+  expected = driver.filter_map { |did, ixid| ix.any? { |iid, _| iid == ixid } ? [ixid, did] : nil }
+                   .sort_by { |iid, did| [did, iid] }
+                   .flatten.map(&:to_s)
+  out << "# reverse physical orientation + PK INL versus expression-key nested loop"
+  q(out, "II", "SELECT i.id,d.id FROM ix i JOIN driver d ON i.id=d.ixid ORDER BY d.id,i.id", expected)
+  q(out, "II", "SELECT i.id,d.id FROM ix i JOIN driver d ON i.id+0=d.ixid ORDER BY d.id,i.id", expected)
+
+  # Ten rows per side cross the deterministic threshold where hash beats nested loop. +0 gates hash
+  # off; both spellings retain the full equality residual and must emit identical pairs.
+  ha = (1..10).map { |id| [id, rng.rand(1..4)] }
+  hb = (101..110).map { |id| [id, rng.rand(1..4)] }
+  stmt(out, "CREATE TABLE ha (id i32 PRIMARY KEY, k i32)")
+  stmt(out, "CREATE TABLE hb (id i32 PRIMARY KEY, k i32)")
+  stmt(out, "INSERT INTO ha VALUES #{ha.map { |id, k| "(#{id},#{k})" }.join(', ')}")
+  stmt(out, "INSERT INTO hb VALUES #{hb.map { |id, k| "(#{id},#{k})" }.join(', ')}")
+  pairs = ha.flat_map { |aid, ak| hb.select { |_bid, bk| ak == bk }.map { |bid, _bk| [aid, bid] } }
+            .sort.flatten.map(&:to_s)
+  out << "# cost-selected hash versus deliberately ineligible nested loop"
+  q(out, "II", "SELECT a.id,b.id FROM ha a JOIN hb b ON a.k=b.k ORDER BY a.id,b.id", pairs)
+  q(out, "II", "SELECT a.id,b.id FROM ha a JOIN hb b ON a.k+0=b.k ORDER BY a.id,b.id", pairs)
+
+  # ORDER BY the second source's PK makes it the selected outer and enables join top-N. Adding the
+  # first source's PK as a second expression key forces the blocking reference while defining the
+  # same tie order that the selected physical nested loop naturally emits.
+  stmt(out, "CREATE TABLE ra (id i32 PRIMARY KEY)")
+  stmt(out, "CREATE TABLE rb (id i32 PRIMARY KEY)")
+  stmt(out, "INSERT INTO ra VALUES #{(1..12).map { |id| "(#{id})" }.join(', ')}")
+  stmt(out, "INSERT INTO rb VALUES #{(1..4).map { |id| "(#{id})" }.join(', ')}")
+  k = rng.rand(2..6)
+  window = (1..4).flat_map { |bid| (1..12).map { |aid| [aid, bid] } }.first(k)
+                  .flatten.map(&:to_s)
+  out << "# reverse selected-outer top-N versus expression-key blocking sort"
+  q(out, "II", "SELECT a.id,b.id FROM ra a JOIN rb b ON a.id>0 ORDER BY b.id LIMIT #{k}", window)
+  q(out, "II", "SELECT a.id,b.id FROM ra a JOIN rb b ON a.id>0 ORDER BY b.id+0,a.id LIMIT #{k}", window)
 
   out.join("\n") + "\n"
 end
@@ -2227,6 +2286,7 @@ SCENARIOS = {
   "index" => method(:gen_index),
   "cost_plan" => method(:gen_cost_plan),
   "cost_plan_p6b" => method(:gen_cost_plan_p6b),
+  "cost_plan_p7" => method(:gen_cost_plan_p7),
   "index_mut" => method(:gen_index_mutation),
   "index_expr" => method(:gen_index_expr),
   "index_range" => method(:gen_index_range),

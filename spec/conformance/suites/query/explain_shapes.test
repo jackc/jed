@@ -46,15 +46,15 @@ Full scan; touched=1
 1
 2
 
-# An eligible two-input equality join is a Hash Join with key/ON counts; each input is a Scan child.
+# P7 chooses the lower estimated nested loop for this small equality join; each input is a Scan child.
 query ITTII nosort
 EXPLAIN SELECT * FROM t JOIN u ON u.tid = t.id
 ----
 0
-Hash Join
-inner; keys=1; on:conjuncts=1
+Nested Loop
+inner; on:conjuncts=1
 1
-22
+6
 1
 Scan t
 Full scan; touched=3
