@@ -1,6 +1,6 @@
 //! Access-path filter analysis and key/index encoding (mirrors impl/go access_path.go + the index/key
 //! encoders in dml.go/store_encode.go): the ScanBound/FkProbe/ScanSource impls, the WHERE-filter bound
-//! detection (detect_scan_bound/detect_pk_bound/detect_gin_bound/detect_gist_bound, order_satisfied_by_*),
+//! detection (detect_scan_bound/detect_pk_bound/inventory_scan_candidates, order_satisfied_by_*),
 //! the secondary-index entry encoders (index_entry_key/gist_entries/gin_entries), and the order-preserving
 //! key encoders (encode_key_value/encode_typed_key/encode_array_key, encode_bound_key).
 
@@ -26,11 +26,11 @@ impl ScanBound {
     }
 }
 
-/// The plan-time result of GiST analysis (spec/design/gist.md §5): the chosen GiST index (lowest
-/// lowercased name whose range column has a `col && const` / `col @> const` conjunct), the operator
-/// strategy, and the column's global scope index. Like [`GinBound`], the constant query operand is
-/// NOT stored (re-found in `plan.filter` at exec time by `gist_match`). No element type is carried:
-/// the gather descends the resident R-tree (gist.md §4.1), whose bounds are already decoded.
+/// The plan-time result for one eligible GiST index (spec/design/gist.md §5): its operator strategy
+/// and the column's global scope index. The inventory owns one plan per eligible index; the selector
+/// chooses among them. Like [`GinBound`], the constant query operand is NOT stored (re-found in
+/// `plan.filter` at exec time by `gist_match`). No element type is carried: the gather descends the
+/// resident R-tree (gist.md §4.1), whose bounds are already decoded.
 pub(crate) struct GistBound {
     /// The index store's key — the lowercased index name (its resident R-tree lives under this key).
     pub(crate) name_key: String,
@@ -62,11 +62,11 @@ pub(crate) enum GinStrategy {
     Equal,
 }
 
-/// The plan-time result of GIN analysis (spec/design/gin.md §6): the chosen GIN index (lowest
-/// lowercased name whose array column has a `col @> const` / `col && const` conjunct), the array
-/// **element** type (for `encode_element` — the term bytes), the operator strategy, and the
-/// column's global scope index. The constant query `Q` is NOT stored (`RExpr` is not `Clone`); it
-/// is re-found in `plan.filter` at exec time by `gin_match` and evaluated there.
+/// The plan-time result for one eligible GIN index (spec/design/gin.md §6): its array **element**
+/// type (for `encode_element` — the term bytes), operator strategy, and column's global scope index.
+/// The inventory owns one plan per eligible index; the selector chooses among them. The constant
+/// query `Q` is NOT stored (`RExpr` is not `Clone`); it is re-found in `plan.filter` at exec time by
+/// `gin_match` and evaluated there.
 pub(crate) struct GinBound {
     /// The index store's key — the lowercased index name.
     pub(crate) name_key: String,
@@ -95,9 +95,9 @@ pub(crate) struct IndexRange {
     pub(crate) terms: Vec<BoundTerm>,
 }
 
-/// The plan-time result of index analysis (indexes.md §5.1): the chosen index (lowest lowercased
-/// name yielding a non-empty access predicate) and the predicate — a maximal EQUALITY PREFIX on the
-/// leading key columns (`eq_cols`) plus an OPTIONAL RANGE on the next column (`range`). At exec time
+/// The plan-time result for one eligible ordered index (indexes.md §5.1): a maximal EQUALITY PREFIX
+/// on the leading key columns (`eq_cols`) plus an OPTIONAL RANGE on the next column (`range`). The
+/// inventory owns one plan per eligible index; the selector chooses among them. At exec time
 /// `build_index_bound` turns these into a concrete index-key range: the equality prefix bytes
 /// P = concatenated present slots, then the range (if any) intersected relative to P.
 /// `suffix_types` are the types of the index columns AFTER the equality prefix (`columns[eq..]`) —
@@ -235,9 +235,104 @@ pub(crate) fn build_index_access_predicate(
     })
 }
 
-/// Consumer-specific access-path eligibility/precedence. SELECT and mutation scans share the same
-/// inventory; their remaining difference is the established GIN/GiST order (mutation tries GIN
-/// first, SELECT GiST first). Encoding it here keeps EXPLAIN and execution on one detector.
+/// Canonical access-path rank from estimator.toml. Keep declaration order byte-identical to the
+/// shared fact: P4 compares estimated cost first, then this rank. P3 uses it only to sort inventory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ScanCandidateKind {
+    Pk,
+    Btree,
+    Gist,
+    Gin,
+    PkInterval,
+    IndexInterval,
+    Full,
+}
+
+/// Collision-free physical identity of one base-relation access candidate. `index_name` is the
+/// lowercased catalog name for index-bearing paths and empty for PK/PK-interval/full paths.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ScanCandidateIdentity {
+    kind: ScanCandidateKind,
+    index_name: String,
+}
+
+impl std::fmt::Display for ScanCandidateIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.kind {
+            ScanCandidateKind::Pk => f.write_str("pk"),
+            ScanCandidateKind::Btree => write!(f, "btree:{}", self.index_name),
+            ScanCandidateKind::Gist => write!(f, "gist:{}", self.index_name),
+            ScanCandidateKind::Gin => write!(f, "gin:{}", self.index_name),
+            ScanCandidateKind::PkInterval => f.write_str("pk_interval"),
+            ScanCandidateKind::IndexInterval => {
+                write!(f, "index_interval:{}", self.index_name)
+            }
+            ScanCandidateKind::Full => f.write_str("full"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ScanOrderCapability {
+    /// Table storage-key order. Full/PK/PK-set scans walk it directly; GIN/GiST gathers normalize to
+    /// it. The current executor supports both forward and reverse traversal.
+    StorageKey { reversible: bool },
+    /// One ordered B-tree's key order. The current ordered-index path walks only forward.
+    IndexKey {
+        index_name: String,
+        reversible: bool,
+    },
+}
+
+/// One legal base-relation access path. `bound = None` only for the explicit full scan. `residual`
+/// is always the complete WHERE (or `None` when there is no WHERE), because every access predicate
+/// is only a narrowing superset and execution retains the full recheck.
+pub(crate) struct ScanCandidate<'a> {
+    identity: ScanCandidateIdentity,
+    bound: Option<ScanBound>,
+    scan_order: ScanOrderCapability,
+    residual: Option<&'a RExpr>,
+}
+
+fn storage_order_candidate<'a>(
+    kind: ScanCandidateKind,
+    name: String,
+    bound: Option<ScanBound>,
+    filter: Option<&'a RExpr>,
+) -> ScanCandidate<'a> {
+    ScanCandidate {
+        identity: ScanCandidateIdentity {
+            kind,
+            index_name: name,
+        },
+        bound,
+        scan_order: ScanOrderCapability::StorageKey { reversible: true },
+        residual: filter,
+    }
+}
+
+fn index_order_candidate<'a>(
+    kind: ScanCandidateKind,
+    name: String,
+    bound: ScanBound,
+    filter: Option<&'a RExpr>,
+) -> ScanCandidate<'a> {
+    ScanCandidate {
+        identity: ScanCandidateIdentity {
+            kind,
+            index_name: name.clone(),
+        },
+        bound: Some(bound),
+        scan_order: ScanOrderCapability::IndexKey {
+            index_name: name,
+            reversible: false,
+        },
+        residual: filter,
+    }
+}
+
+/// Consumer-specific eligibility/precedence for the behavior-neutral LEGACY selector. Inventory is
+/// policy-free and complete. Mutation tries GIN before GiST; SELECT tries GiST before GIN.
 #[derive(Clone, Copy)]
 pub(crate) struct ScanBoundPolicy {
     ordered_index: bool,
@@ -258,7 +353,7 @@ pub(crate) const MUTATION_SCAN_BOUND_POLICY: ScanBoundPolicy = ScanBoundPolicy {
 };
 
 /// Pick one SELECT relation's scan bound (cost.md §3; indexes.md §5). This is the SELECT-policy
-/// wrapper over the shared inventory in [`detect_scan_bound_with_policy`].
+/// wrapper over the shared inventory plus behavior-neutral legacy selector.
 pub(crate) fn detect_scan_bound(
     filter: &RExpr,
     rel: &ScopeRel,
@@ -267,25 +362,72 @@ pub(crate) fn detect_scan_bound(
     detect_scan_bound_with_policy(filter, rel, catalog, SELECT_SCAN_BOUND_POLICY)
 }
 
-/// Inventory the structurally usable bounds for one base relation and return the first candidate
-/// admitted by `policy`. The whole WHERE remains the residual filter, so a disabled candidate always
-/// falls through to another sound bound or a full scan.
-pub(crate) fn detect_scan_bound_with_policy(
-    filter: &RExpr,
+/// Enumerate EVERY legal base access path in estimator.toml's canonical rank/name order. It never
+/// selects. A host-attached relation has only the full candidate because bounded execution still
+/// resolves its index stores through the unscoped funnel.
+pub(crate) fn inventory_scan_candidates<'a>(
+    filter: Option<&'a RExpr>,
     rel: &ScopeRel,
     catalog: &Engine,
-    policy: ScanBoundPolicy,
-) -> Option<ScanBound> {
-    // A host-attached relation full-scans this slice (attached-databases.md §8): the bounded-scan exec
-    // path resolves index stores UNSCOPED, so no PK/index/GiST/GIN bound may apply to an attachment.
+) -> Vec<ScanCandidate<'a>> {
+    let full = || storage_order_candidate(ScanCandidateKind::Full, String::new(), None, filter);
+    let Some(filter_expr) = filter else {
+        return vec![full()];
+    };
     if rel.is_attachment() {
-        return None;
+        return vec![full()];
+    }
+    let mut candidates = Vec::with_capacity(2 + rel.table.indexes.len() * 2);
+    if let Some(bound) = detect_pk_bound(&[filter_expr], rel, None, catalog) {
+        candidates.push(storage_order_candidate(
+            ScanCandidateKind::Pk,
+            String::new(),
+            Some(ScanBound::Pk(bound)),
+            filter,
+        ));
+    }
+    for idx in &rel.table.indexes {
+        if let Some(bound) = build_index_access_predicate(filter_expr, rel, idx, None, catalog) {
+            let name = bound.name_key.clone();
+            candidates.push(index_order_candidate(
+                ScanCandidateKind::Btree,
+                name,
+                ScanBound::Index(bound),
+                filter,
+            ));
+        }
+    }
+    for idx in &rel.table.indexes {
+        if let Some(bound) =
+            build_gist_bound_for_index(filter_expr, idx, &rel.table.columns, rel.offset)
+        {
+            let name = bound.name_key.clone();
+            candidates.push(storage_order_candidate(
+                ScanCandidateKind::Gist,
+                name,
+                Some(ScanBound::Gist(bound)),
+                filter,
+            ));
+        }
+    }
+    for idx in &rel.table.indexes {
+        if let Some(bound) =
+            build_gin_bound_for_index(filter_expr, idx, &rel.table.columns, rel.offset)
+        {
+            let name = bound.name_key.clone();
+            candidates.push(storage_order_candidate(
+                ScanCandidateKind::Gin,
+                name,
+                Some(ScanBound::Gin(bound)),
+                filter,
+            ));
+        }
     }
     let pk_intervals = rel.table.primary_key_index().and_then(|pk_local| {
         let sty = rel.table.columns[pk_local].ty.as_scalar()?;
         let coll = key_collation_ctx(catalog, &rel.table.columns[pk_local])?;
         let (specs, clip) =
-            detect_interval_set(filter, rel.offset + pk_local, sty, coll.as_deref())?;
+            detect_interval_set(filter_expr, rel.offset + pk_local, sty, coll.as_deref())?;
         Some(PkKeySet {
             pk_type: sty,
             coll,
@@ -293,68 +435,132 @@ pub(crate) fn detect_scan_bound_with_policy(
             clip,
         })
     });
-    if policy.index_set && pk_intervals.as_ref().is_some_and(|p| !p.clip.is_empty()) {
-        return pk_intervals.map(ScanBound::PkSet);
+    if let Some(bound) = pk_intervals {
+        candidates.push(storage_order_candidate(
+            ScanCandidateKind::PkInterval,
+            String::new(),
+            Some(ScanBound::PkSet(bound)),
+            filter,
+        ));
     }
-    if let Some(b) = detect_pk_bound(&[filter], rel, None, catalog) {
-        return Some(ScanBound::Pk(b));
+    for idx in &rel.table.indexes {
+        if let Some(bound) = build_index_interval_set_plan(filter_expr, rel, idx, catalog) {
+            let name = bound.name_key.clone();
+            candidates.push(index_order_candidate(
+                ScanCandidateKind::IndexInterval,
+                name,
+                ScanBound::IndexSet(bound),
+                filter,
+            ));
+        }
     }
-    if policy.ordered_index {
-        for idx in &rel.table.indexes {
-            // An index access predicate (indexes.md §5.1): a maximal equality prefix + optional
-            // trailing range over a B-tree index's leading key columns. Indexes are held in
-            // ascending lowercased-name order, so the first `Some` wins.
-            if let Some(ib) = build_index_access_predicate(filter, rel, idx, None, catalog) {
-                if policy.index_set {
-                    if let Some(set) = build_index_interval_set_plan(filter, rel, idx, catalog)
-                        .filter(|s| !s.clip.is_empty())
-                    {
-                        return Some(ScanBound::IndexSet(set));
-                    }
-                }
-                return Some(ScanBound::Index(ib));
+    candidates.push(full());
+    candidates.sort_by(|a, b| {
+        a.identity.kind.cmp(&b.identity.kind).then_with(|| {
+            a.identity
+                .index_name
+                .as_bytes()
+                .cmp(b.identity.index_name.as_bytes())
+        })
+    });
+    candidates
+}
+
+fn candidate_index(
+    candidates: &[ScanCandidate<'_>],
+    kind: ScanCandidateKind,
+    name: Option<&str>,
+) -> Option<usize> {
+    candidates.iter().position(|candidate| {
+        candidate.identity.kind == kind
+            && name.is_none_or(|name| candidate.identity.index_name == name)
+    })
+}
+
+fn take_candidate(
+    candidates: &mut [ScanCandidate<'_>],
+    kind: ScanCandidateKind,
+    name: Option<&str>,
+) -> Option<ScanBound> {
+    let i = candidate_index(candidates, kind, name)?;
+    candidates[i].bound.take()
+}
+
+/// Reproduce the pre-P3 policy exactly. This order deliberately differs from the canonical cost-tie
+/// order for clipped same-key interval sets and for mutation's GIN-before-GiST precedence.
+pub(crate) fn select_legacy_scan_candidate(
+    mut candidates: Vec<ScanCandidate<'_>>,
+    policy: ScanBoundPolicy,
+) -> Option<ScanBound> {
+    if policy.index_set {
+        if let Some(i) = candidate_index(&candidates, ScanCandidateKind::PkInterval, None) {
+            if matches!(&candidates[i].bound, Some(ScanBound::PkSet(set)) if !set.clip.is_empty()) {
+                return candidates[i].bound.take();
             }
         }
     }
-    if policy.gist_before_gin {
-        if let Some(gb) =
-            detect_gist_bound(filter, &rel.table.indexes, &rel.table.columns, rel.offset)
-        {
-            return Some(ScanBound::Gist(gb));
+    if let Some(bound) = take_candidate(&mut candidates, ScanCandidateKind::Pk, None) {
+        return Some(bound);
+    }
+    if policy.ordered_index {
+        let btree_names: Vec<String> = candidates
+            .iter()
+            .filter(|candidate| candidate.identity.kind == ScanCandidateKind::Btree)
+            .map(|candidate| candidate.identity.index_name.clone())
+            .collect();
+        for name in btree_names {
+            if policy.index_set {
+                if let Some(i) =
+                    candidate_index(&candidates, ScanCandidateKind::IndexInterval, Some(&name))
+                {
+                    if matches!(&candidates[i].bound, Some(ScanBound::IndexSet(set)) if !set.clip.is_empty())
+                    {
+                        return candidates[i].bound.take();
+                    }
+                }
+            }
+            if let Some(bound) =
+                take_candidate(&mut candidates, ScanCandidateKind::Btree, Some(&name))
+            {
+                return Some(bound);
+            }
         }
-        if let Some(gb) =
-            detect_gin_bound(filter, &rel.table.indexes, &rel.table.columns, rel.offset)
-        {
-            return Some(ScanBound::Gin(gb));
-        }
+    }
+    let (first, second) = if policy.gist_before_gin {
+        (ScanCandidateKind::Gist, ScanCandidateKind::Gin)
     } else {
-        if let Some(gb) =
-            detect_gin_bound(filter, &rel.table.indexes, &rel.table.columns, rel.offset)
-        {
-            return Some(ScanBound::Gin(gb));
+        (ScanCandidateKind::Gin, ScanCandidateKind::Gist)
+    };
+    if let Some(bound) = take_candidate(&mut candidates, first, None) {
+        return Some(bound);
+    }
+    if let Some(bound) = take_candidate(&mut candidates, second, None) {
+        return Some(bound);
+    }
+    if policy.index_set {
+        if let Some(bound) = take_candidate(&mut candidates, ScanCandidateKind::PkInterval, None) {
+            return Some(bound);
         }
-        if let Some(gb) =
-            detect_gist_bound(filter, &rel.table.indexes, &rel.table.columns, rel.offset)
+        if let Some(bound) = take_candidate(&mut candidates, ScanCandidateKind::IndexInterval, None)
         {
-            return Some(ScanBound::Gist(gb));
-        }
-    }
-    // LAST RESORT — an OR / IN-list of key equalities lowered to merged point probes (cost.md §3
-    // "OR / IN-list"). Reached only when no contiguous PK/index/GIN/GiST bound applied above, so
-    // this never displaces an existing plan. The primary key wins over a secondary index (its own
-    // key — no second tree), matching `detect_scan_bound`'s PK-then-index ordering.
-    if let Some(set) = pk_intervals {
-        return Some(ScanBound::PkSet(set));
-    }
-    if !policy.index_set {
-        return None;
-    }
-    for idx in &rel.table.indexes {
-        if let Some(set) = build_index_interval_set_plan(filter, rel, idx, catalog) {
-            return Some(ScanBound::IndexSet(set));
+            return Some(bound);
         }
     }
     None
+}
+
+/// Compatibility entry point used by SELECT and UPDATE/DELETE. P6 replaces only this selector for
+/// eligible SELECT relations; candidate inventory remains unchanged.
+pub(crate) fn detect_scan_bound_with_policy(
+    filter: &RExpr,
+    rel: &ScopeRel,
+    catalog: &Engine,
+    policy: ScanBoundPolicy,
+) -> Option<ScanBound> {
+    select_legacy_scan_candidate(
+        inventory_scan_candidates(Some(filter), rel, catalog),
+        policy,
+    )
 }
 
 fn interval_plan_has_range(specs: &[IntervalSpec], clip: &[BoundTerm]) -> bool {
@@ -896,83 +1102,61 @@ pub(crate) fn order_satisfied_by_index(
     None
 }
 
-/// Detect a GIN-bounded scan over `columns`/`indexes` (gin.md §6): the lowest-named GIN index
-/// whose array column at `offset + ci` has a GIN-accelerable conjunct (`col @> const`,
-/// `col && const`, `const = ANY(col)`, or `col = const`). Factored out so the SELECT planner
-/// (`detect_scan_bound`) and the UPDATE/DELETE scan both use the identical detection — the
-/// mutations pass their own table's indexes/columns at `offset = 0`.
-pub(crate) fn detect_gin_bound(
+/// Inventory one GIN index when its array column has an accelerable conjunct (`col @> const`,
+/// `col && const`, `const = ANY(col)`, or `col = const`). Legacy selection later picks a winner.
+pub(crate) fn build_gin_bound_for_index(
     filter: &RExpr,
-    indexes: &[IndexDef],
+    idx: &IndexDef,
     columns: &[Column],
     offset: usize,
 ) -> Option<GinBound> {
-    for idx in indexes {
-        if idx.kind != IndexKind::Gin {
-            continue;
-        }
-        let ci = idx.first_column();
-        let col_global = offset + ci;
-        let Some(elem_ty) = columns[ci].ty.array_element().map(|t| t.scalar()) else {
-            continue; // a GIN column is always an array (the CREATE INDEX gate); defensive
-        };
-        if let Some((strategy, _)) = gin_match(filter, col_global) {
-            return Some(GinBound {
-                name_key: idx.name.to_ascii_lowercase(),
-                elem_type: elem_ty,
-                strategy,
-                col_global,
-            });
-        }
+    if idx.kind != IndexKind::Gin {
+        return None;
+    }
+    let ci = idx.first_column();
+    let col_global = offset + ci;
+    let elem_ty = columns[ci].ty.array_element()?.scalar();
+    if let Some((strategy, _)) = gin_match(filter, col_global) {
+        return Some(GinBound {
+            name_key: idx.name.to_ascii_lowercase(),
+            elem_type: elem_ty,
+            strategy,
+            col_global,
+        });
     }
     None
 }
 
-/// Detect a GiST-bounded scan over `columns`/`indexes` (spec/design/gist.md §5): the lowest-named
-/// GiST index whose range column at `offset + ci` has a GiST-accelerable conjunct (`col && const`
-/// or `col @> const`). Factored out so the SELECT planner (`detect_scan_bound`) and the
-/// UPDATE/DELETE scan share the identical detection (the GIN precedent) — the mutations pass their
-/// own table's indexes/columns at `offset = 0`.
-pub(crate) fn detect_gist_bound(
+/// Inventory one single-column GiST index. Multi-column GiST indexes are EXCLUDE backing structures
+/// and remain constraint-only, never planner candidates.
+pub(crate) fn build_gist_bound_for_index(
     filter: &RExpr,
-    indexes: &[IndexDef],
+    idx: &IndexDef,
     columns: &[Column],
     offset: usize,
 ) -> Option<GistBound> {
-    for idx in indexes {
-        if idx.kind != IndexKind::Gist {
-            continue;
+    if idx.kind != IndexKind::Gist || idx.keys.len() != 1 {
+        return None;
+    }
+    let ci = idx.first_column();
+    let col_global = offset + ci;
+    let col_ty = &columns[ci].ty;
+    if col_ty.range_element().is_some() {
+        if let Some((strategy, _)) = gist_match(filter, col_global) {
+            return Some(GistBound {
+                name_key: idx.name.to_ascii_lowercase(),
+                strategy,
+                col_global,
+                scalar_type: None,
+            });
         }
-        // The planner gather is single-operator: only a single-column GiST index accelerates a
-        // `col && Q` / `col @> Q` / `col = Q` conjunct. A multi-column GiST index (an EXCLUDE
-        // backing structure, gist.md §7) is probed only by the constraint, never the planner.
-        if idx.keys.len() != 1 {
-            continue;
-        }
-        let ci = idx.first_column();
-        let col_global = offset + ci;
-        let col_ty = &columns[ci].ty;
-        if col_ty.range_element().is_some() {
-            // `range_ops` (GX1): a `col && Q` / `col @> Q` conjunct.
-            if let Some((strategy, _)) = gist_match(filter, col_global) {
-                return Some(GistBound {
-                    name_key: idx.name.to_ascii_lowercase(),
-                    strategy,
-                    col_global,
-                    scalar_type: None,
-                });
-            }
-        } else if is_gist_scalar_type(col_ty) {
-            // scalar `=` opclass (GX2): a `col = Q` conjunct over a fixed-width keyable scalar.
-            if gist_scalar_match(filter, col_global).is_some() {
-                return Some(GistBound {
-                    name_key: idx.name.to_ascii_lowercase(),
-                    strategy: crate::gist::GistStrategy::Equal,
-                    col_global,
-                    scalar_type: Some(col_ty.scalar()),
-                });
-            }
-        }
+    } else if is_gist_scalar_type(col_ty) && gist_scalar_match(filter, col_global).is_some() {
+        return Some(GistBound {
+            name_key: idx.name.to_ascii_lowercase(),
+            strategy: crate::gist::GistStrategy::Equal,
+            col_global,
+            scalar_type: Some(col_ty.scalar()),
+        });
     }
     None
 }
@@ -4964,4 +5148,136 @@ pub(crate) enum LaneSrc<'a> {
         cols: &'a [Vec<Value>],
         sel: Option<&'a [i32]>,
     },
+}
+
+#[cfg(test)]
+mod candidate_inventory_tests {
+    use super::*;
+    use crate::ast::Statement;
+
+    /// Inventory is an internal planner invariant the SQL corpus cannot render: EXPLAIN shows only
+    /// the selected path. Mirrors the Go/TS white-box case with two eligible indexes of every kind.
+    #[test]
+    fn scan_candidate_inventory_is_complete_canonical_and_legacy_neutral() {
+        let mut db = Engine::new();
+        for sql in [
+            "CREATE TABLE inventory (id i32 PRIMARY KEY, a i32, b i32, tags i32[], span i32range)",
+            "CREATE INDEX z_btree ON inventory (b)",
+            "CREATE INDEX a_btree ON inventory (a)",
+            "CREATE INDEX z_gin ON inventory USING gin (tags)",
+            "CREATE INDEX a_gin ON inventory USING gin (tags)",
+            "CREATE INDEX z_gist ON inventory USING gist (span)",
+            "CREATE INDEX a_gist ON inventory USING gist (span)",
+        ] {
+            crate::execute(&mut db, sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+
+        let filter = planned_inventory_filter(
+            &db,
+            "SELECT id FROM inventory WHERE \
+             (id = 1 OR id = 2) AND id >= 0 AND \
+             (a = 1 OR a = 2) AND a >= 0 AND \
+             (b = 1 OR b = 2) AND b >= 0 AND \
+             tags @> ARRAY[1] AND span && i32range(1, 3)",
+        );
+        let mut table = db.table("inventory").expect("inventory table").clone();
+        // Deliberately scramble the catalog slice: canonical identity, never container iteration,
+        // determines inventory order.
+        table.indexes.reverse();
+        let rel = ScopeRel {
+            label: "inventory".to_string(),
+            table: &table,
+            offset: 0,
+            qualifier_only: false,
+            cte: None,
+            db: None,
+        };
+        let candidates = inventory_scan_candidates(Some(&filter), &rel, &db);
+        let got: Vec<String> = candidates
+            .iter()
+            .map(|candidate| candidate.identity.to_string())
+            .collect();
+        let want = vec![
+            "pk",
+            "btree:a_btree",
+            "btree:z_btree",
+            "gist:a_gist",
+            "gist:z_gist",
+            "gin:a_gin",
+            "gin:z_gin",
+            "pk_interval",
+            "index_interval:a_btree",
+            "index_interval:z_btree",
+            "full",
+        ];
+        assert_eq!(got, want);
+        for candidate in &candidates {
+            assert!(std::ptr::eq(candidate.residual.unwrap(), &filter));
+            assert_eq!(
+                candidate.bound.is_none(),
+                candidate.identity.kind == ScanCandidateKind::Full,
+                "{} bound shape",
+                candidate.identity
+            );
+            match candidate.identity.kind {
+                ScanCandidateKind::Btree | ScanCandidateKind::IndexInterval => {
+                    assert!(matches!(
+                        &candidate.scan_order,
+                        ScanOrderCapability::IndexKey { index_name, reversible: false }
+                            if index_name == &candidate.identity.index_name
+                    ));
+                }
+                _ => assert!(matches!(
+                    candidate.scan_order,
+                    ScanOrderCapability::StorageKey { reversible: true }
+                )),
+            }
+        }
+        // The direct >= conjuncts clip their OR unions. Preserve the pre-P3 exception where the
+        // clipped PK set replaces the broader contiguous PK bound.
+        assert!(matches!(
+            select_legacy_scan_candidate(candidates, SELECT_SCAN_BOUND_POLICY),
+            Some(ScanBound::PkSet(_))
+        ));
+
+        let index_clip_filter = planned_inventory_filter(
+            &db,
+            "SELECT id FROM inventory WHERE \
+			 (a = 1 OR a = 2) AND a >= 0 AND \
+			 (b = 1 OR b = 2) AND b >= 0",
+        );
+        let selected = select_legacy_scan_candidate(
+            inventory_scan_candidates(Some(&index_clip_filter), &rel, &db),
+            SELECT_SCAN_BOUND_POLICY,
+        );
+        assert!(matches!(
+            selected,
+            Some(ScanBound::IndexSet(set)) if set.name_key == "a_btree"
+        ));
+
+        let opclass_filter = planned_inventory_filter(
+            &db,
+            "SELECT id FROM inventory WHERE tags @> ARRAY[1] AND span && i32range(1, 3)",
+        );
+        let selected = select_legacy_scan_candidate(
+            inventory_scan_candidates(Some(&opclass_filter), &rel, &db),
+            SELECT_SCAN_BOUND_POLICY,
+        );
+        assert!(matches!(selected, Some(ScanBound::Gist(g)) if g.name_key == "a_gist"));
+        let selected = select_legacy_scan_candidate(
+            inventory_scan_candidates(Some(&opclass_filter), &rel, &db),
+            MUTATION_SCAN_BOUND_POLICY,
+        );
+        assert!(matches!(selected, Some(ScanBound::Gin(g)) if g.name_key == "a_gin"));
+    }
+
+    fn planned_inventory_filter(db: &Engine, sql: &str) -> RExpr {
+        let Statement::Select(select) = db.parse(sql).unwrap() else {
+            panic!("inventory query did not parse as SELECT");
+        };
+        db.plan_select(&select, None, &[], &mut ParamTypes::default())
+            .unwrap()
+            .filter
+            .expect("inventory query filter")
+    }
 }

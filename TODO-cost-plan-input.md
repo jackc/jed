@@ -128,7 +128,7 @@ core writes and reads byte-identical files without regressing open behavior.
 **Status:** complete on 2026-07-13. `format_version` 28 stores `row_count` as a nonnegative signed
 `i64` end-to-end (Rust `i64`, Go `int64`, TypeScript `bigint`), with an exact-version clean break and
 no v27 migration path. `bundle exec rake ci` passes after regenerating and independently verifying
-all 61 file-format fixtures. P2 is complete below; P3 is the next implementation slice.
+all 61 file-format fixtures. P2 and P3 are complete below; P4 is the next implementation slice.
 
 ## P2 — Statistics-aware prepared-plan cache validity
 
@@ -159,28 +159,34 @@ field-by-field using opaque snapshot identity/revision tokens (never a collision
 tests cover relevant and irrelevant count changes, count-return-to-prior-value invalidation,
 working-state fill exclusion, rollback, every DML disposition, per-attachment identity/generation,
 and fresh-versus-refilled EXPLAIN/row/actual-cost parity. `bundle exec rake ci` passes. No file-format
-or SQL result change; P3 is next.
+or SQL result change; P3 is complete below and P4 is next.
 
 ## P3 — Deterministic all-candidate inventory, behavior-neutral
 
 **Goal:** expose all legal choices without changing which plan runs yet.
 
-- [ ] Refactor `detectScanBound` / `detect_scan_bound` / `detectScanBound` into a candidate
+- [x] Refactor `detectScanBound` / `detect_scan_bound` / `detectScanBound` into a candidate
   inventory plus a separate selector.
-- [ ] Enumerate full scan, PK bound, every eligible ordered B-tree index, GiST, GIN, PK interval
+- [x] Enumerate full scan, PK bound, every eligible ordered B-tree index, GiST, GIN, PK interval
   set, and ordered-index interval set candidates.
-- [ ] Preserve each consumer policy explicitly: SELECT and the existing UPDATE/DELETE ordering.
-- [ ] Give every candidate a canonical identity and deterministic ordering independent of maps or
+- [x] Preserve each consumer policy explicitly: SELECT and the existing UPDATE/DELETE ordering.
+- [x] Give every candidate a canonical identity and deterministic ordering independent of maps or
   host iteration.
-- [ ] Retain a legacy selector that reproduces today's fixed precedence and lowest-lowercased-index
+- [x] Retain a legacy selector that reproduces today's fixed precedence and lowest-lowercased-index
   tie-break exactly.
-- [ ] Make scan-order capabilities and required residual filters explicit candidate properties.
-- [ ] Keep physical plan fields and executor behavior unchanged in this slice.
-- [ ] Add shared/cross-core inventory cases for multiple usable indexes and mixed access methods.
-- [ ] Run existing EXPLAIN, cost, NoREC, and CI suites with zero output or cost re-pins.
+- [x] Make scan-order capabilities and required residual filters explicit candidate properties.
+- [x] Keep physical plan fields and executor behavior unchanged in this slice.
+- [x] Add shared/cross-core inventory cases for multiple usable indexes and mixed access methods.
+- [x] Run existing EXPLAIN, cost, NoREC, and CI suites with zero output or cost re-pins.
 
 **Exit gate:** every core inventories the same candidates, while the legacy selector proves the
 refactor is plan-, result-, EXPLAIN-, and cost-neutral.
+
+**Status:** complete on 2026-07-13. Rust, Go, and TypeScript inventory the same canonical identities
+independently of catalog iteration and retain the complete WHERE plus explicit scan-order facts on
+each candidate. Shared EXPLAIN cases pin the old SELECT/mutation choices; per-core white-box tests
+pin complete mixed-method inventory and both legacy exceptions. No output or cost was re-pinned;
+`bundle exec rake ci` passes. P4 is next.
 
 ## P4 — Base-relation estimator in shadow mode
 

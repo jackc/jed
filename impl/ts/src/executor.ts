@@ -13666,10 +13666,9 @@ function* scanSource(rows: Row[], nodeCount: number, meter: Meter): Generator<Ro
 
 // ScanBound is a per-relation scan bound (cost.md §3): a primary-key range, a
 // secondary-index equality (spec/design/indexes.md §5), a GIN-bounded scan over an array column
-// (spec/design/gin.md §6), a GiST-bounded scan, or a canonical interval set over one key. The PK bound wins
-// when several apply (it is the row's own key — no second tree, range-capable, strictly cheaper);
-// the ordered-index equality bound wins over GIN (gin.md §6). Interval sets are normally the last
-// resort; a same-key OR/IN plus a direct range clip deliberately wins over the broader clip alone.
+// (spec/design/gin.md §6), a GiST-bounded scan, or a canonical interval set over one key. Candidate
+// inventory and consumer selection are deliberately separate; this remains the executor-facing
+// shape of the selected candidate.
 export type ScanBound =
   | { kind: "pk"; pk: PkBound }
   | { kind: "index"; index: IndexBound }
@@ -13677,6 +13676,82 @@ export type ScanBound =
   | { kind: "gist"; gist: GistBound }
   | { kind: "pkSet"; pkSet: PkKeySet }
   | { kind: "indexSet"; indexSet: IndexKeySet };
+
+// Canonical access-path rank from estimator.toml. The array order is the shared P0 fact; P4 will
+// compare estimated cost first, then this rank. P3 uses it only to sort the complete inventory.
+export const SCAN_CANDIDATE_KINDS = [
+  "pk",
+  "btree",
+  "gist",
+  "gin",
+  "pk_interval",
+  "index_interval",
+  "full",
+] as const;
+export type ScanCandidateKind = (typeof SCAN_CANDIDATE_KINDS)[number];
+
+// (kind, lowercased indexName) is a candidate's collision-free physical identity. indexName is
+// empty for PK/PK-interval/full paths; catalog index names are unique within the relation namespace.
+export type ScanCandidateIdentity = { kind: ScanCandidateKind; indexName: string };
+
+export function renderScanCandidateIdentity(id: ScanCandidateIdentity): string {
+  switch (id.kind) {
+    case "pk":
+    case "pk_interval":
+    case "full":
+      return id.kind;
+    case "btree":
+    case "gist":
+    case "gin":
+    case "index_interval":
+      return `${id.kind}:${id.indexName}`;
+  }
+}
+
+// Explicit scan-order ability. Full/PK/PK-set scans walk table storage-key order; GIN/GiST gathers
+// normalize to it, and the executor supports forward/reverse. B-tree paths walk one named index in
+// forward key order only.
+export type ScanOrderCapability =
+  | { kind: "storageKey"; reversible: true }
+  | { kind: "indexKey"; indexName: string; reversible: false };
+
+// One legal base-relation access path. bound is null only for the explicit full scan. residual is
+// always the complete WHERE (null only when there is no WHERE): every access predicate is a
+// narrowing superset and execution retains the full recheck.
+export type ScanCandidate = {
+  identity: ScanCandidateIdentity;
+  bound: ScanBound | null;
+  scanOrder: ScanOrderCapability;
+  residual: RExpr | null;
+};
+
+function storageOrderCandidate(
+  kind: ScanCandidateKind,
+  indexName: string,
+  bound: ScanBound | null,
+  filter: RExpr | null,
+): ScanCandidate {
+  return {
+    identity: { kind, indexName },
+    bound,
+    scanOrder: { kind: "storageKey", reversible: true },
+    residual: filter,
+  };
+}
+
+function indexOrderCandidate(
+  kind: ScanCandidateKind,
+  indexName: string,
+  bound: ScanBound,
+  filter: RExpr | null,
+): ScanCandidate {
+  return {
+    identity: { kind, indexName },
+    bound,
+    scanOrder: { kind: "indexKey", indexName, reversible: false },
+    residual: filter,
+  };
+}
 
 // A mutation plan carries the chosen access path and its relation scope. Execution normalizes every
 // access path into keyed entries so UPDATE/DELETE can preserve their two-phase write discipline.
@@ -13728,10 +13803,10 @@ export type IndexKeySet = {
   clip: BoundTerm[];
 };
 
-// GistBound is the plan-time result of GiST analysis (spec/design/gist.md §5): the chosen GiST index
-// (lowest lowercased name whose range column has a `col && const` / `col @> const` conjunct), the
-// descent strategy, and the column's global scope index. Like GinBound, the constant query operand is
-// NOT stored (re-found in plan.filter at exec time by gistMatch). No element type — the gather
+// GistBound is the plan-time result for one eligible GiST index (spec/design/gist.md §5): its descent
+// strategy and the column's global scope index. The inventory owns one plan per eligible index; the
+// selector chooses among them. Like GinBound, the constant query operand is NOT stored (re-found in
+// plan.filter at exec time by gistMatch). No element type — the gather
 // descends the resident R-tree (gist.md §4.1), whose bounds are already decoded.
 export type GistBound = {
   nameKey: string;
@@ -13752,11 +13827,11 @@ export type GistBound = {
 // element multisets, so col = Q ⟹ col @> Q), made exact by the residual = filter.
 export type GinStrategy = "contains" | "overlaps" | "member" | "equal";
 
-// GinBound is the plan-time result of GIN analysis (spec/design/gin.md §6): the chosen GIN
-// index (lowest lowercased name whose array column has a `col @> const` / `col && const`
-// conjunct), the array ELEMENT type (for encode(term) — the term bytes), the operator
-// strategy, and the column's global scope index. The constant query Q is NOT stored; it is
-// re-found in plan.filter at exec time by ginMatch and evaluated there.
+// GinBound is the plan-time result for one eligible GIN index (spec/design/gin.md §6): its array
+// ELEMENT type (for encode(term) — the term bytes), operator strategy, and column's global scope
+// index. The inventory owns one plan per eligible index; the selector chooses among them. The
+// constant query Q is NOT stored; it is re-found in plan.filter at exec time by ginMatch and
+// evaluated there.
 export type GinBound = {
   nameKey: string;
   elemType: ScalarType;
@@ -13775,10 +13850,10 @@ export type IndexEqCol = { colType: ScalarType; coll: Collation | null; srcs: RE
 // on the key column immediately after the equality prefix. Its column is fixed-width (never collated).
 export type IndexRange = { colType: ScalarType; terms: BoundTerm[] };
 
-// IndexBound is the plan-time result of index analysis (indexes.md §5.1): the chosen index (lowest
-// lowercased name yielding a non-empty access predicate) and the predicate — a maximal EQUALITY PREFIX
-// on the leading key columns (eqCols) plus an OPTIONAL RANGE on the next column (range). At exec time
-// buildIndexBound turns these into a concrete index-key range: the equality prefix bytes P =
+// IndexBound is the plan-time result for one eligible ordered index (indexes.md §5.1): a maximal
+// EQUALITY PREFIX on the leading key columns (eqCols) plus an OPTIONAL RANGE on the next column
+// (range). The inventory owns one plan per eligible index; the selector chooses among them. At exec
+// time buildIndexBound turns these into a concrete index-key range: the equality prefix bytes P =
 // concatenated present slots, then the range (if any) intersected relative to P. suffixTypes are the
 // types of the index columns AFTER the equality prefix (columns[eqCols.length..]) — the range column
 // (if any) plus every trailing column — each FIXED-WIDTH so an admitted entry's row-key suffix is
@@ -13898,9 +13973,8 @@ export function buildIndexAccessPredicate(
   return { nameKey: idx.name.toLowerCase(), eqCols, range, suffixTypes };
 }
 
-// ScanBoundPolicy is the consumer-specific eligibility/precedence part of access-path selection.
-// SELECT and mutation scans share one inventory below. Their remaining difference is the established
-// GIN/GiST order: mutation tries GIN first, while SELECT tries GiST first.
+// ScanBoundPolicy is the consumer-specific eligibility/precedence of the behavior-neutral LEGACY
+// selector. Inventory is policy-free and complete. Mutation tries GIN first; SELECT tries GiST first.
 export type ScanBoundPolicy = {
   orderedIndex: boolean;
   indexSet: boolean;
@@ -13920,7 +13994,7 @@ export const MUTATION_SCAN_BOUND_POLICY: ScanBoundPolicy = {
 };
 
 // detectScanBound picks one SELECT relation's scan bound. It is the SELECT-policy wrapper over the
-// shared inventory in detectScanBoundWithPolicy.
+// shared inventory plus behavior-neutral legacy selector.
 export function detectScanBound(
   filter: RExpr,
   rel: ScopeRel,
@@ -13930,18 +14004,46 @@ export function detectScanBound(
   return detectScanBoundWithPolicy(filter, rel, snap, engine, SELECT_SCAN_BOUND_POLICY);
 }
 
-// detectScanBoundWithPolicy inventories the structurally usable bounds for one base relation and
-// returns the first candidate admitted by policy. The whole WHERE remains the residual filter.
-export function detectScanBoundWithPolicy(
-  filter: RExpr,
+// inventoryScanCandidates enumerates EVERY legal base access path in estimator.toml's canonical
+// rank/name order. It never selects. A host-attached relation has only the full candidate because
+// bounded execution still resolves its index stores through the unscoped funnel.
+export function inventoryScanCandidates(
+  filter: RExpr | null,
   rel: ScopeRel,
   snap: Snapshot,
   engine: Engine,
-  policy: ScanBoundPolicy,
-): ScanBound | null {
-  // A host-attached relation full-scans this slice (attached-databases.md §8): the bounded-scan exec
-  // path resolves index stores unscoped, so no PK/index/GiST/GIN bound may apply to an attachment.
-  if (isAttachmentScope(rel.db)) return null;
+): ScanCandidate[] {
+  const full = storageOrderCandidate("full", "", null, filter);
+  if (isAttachmentScope(rel.db) || filter === null) return [full];
+  const candidates: ScanCandidate[] = [];
+  const bp = detectPkBound([filter], rel, -1, snap);
+  if (bp !== null) {
+    candidates.push(storageOrderCandidate("pk", "", { kind: "pk", pk: bp }, filter));
+  }
+  for (const idx of rel.table.indexes) {
+    const bound = buildIndexAccessPredicate(filter, rel, idx, -1, snap, engine);
+    if (bound !== null) {
+      candidates.push(
+        indexOrderCandidate("btree", bound.nameKey, { kind: "index", index: bound }, filter),
+      );
+    }
+  }
+  for (const idx of rel.table.indexes) {
+    const bound = buildGistBoundForIndex(filter, idx, rel.table.columns, rel.offset);
+    if (bound !== null) {
+      candidates.push(
+        storageOrderCandidate("gist", bound.nameKey, { kind: "gist", gist: bound }, filter),
+      );
+    }
+  }
+  for (const idx of rel.table.indexes) {
+    const bound = buildGinBoundForIndex(filter, idx, rel.table.columns, rel.offset);
+    if (bound !== null) {
+      candidates.push(
+        storageOrderCandidate("gin", bound.nameKey, { kind: "gin", gin: bound }, filter),
+      );
+    }
+  }
   const pkLocal = primaryKeyIndex(rel.table);
   let pkIntervals: PkKeySet | null = null;
   if (pkLocal >= 0) {
@@ -13954,48 +14056,113 @@ export function detectScanBoundWithPolicy(
       }
     }
   }
-  if (policy.indexSet && pkIntervals !== null && pkIntervals.clip.length > 0) {
-    return { kind: "pkSet", pkSet: pkIntervals };
+  if (pkIntervals !== null) {
+    candidates.push(
+      storageOrderCandidate(
+        "pk_interval",
+        "",
+        { kind: "pkSet", pkSet: pkIntervals },
+        filter,
+      ),
+    );
   }
-  const bp = detectPkBound([filter], rel, -1, snap);
-  if (bp !== null) return { kind: "pk", pk: bp };
-  if (policy.orderedIndex) {
-    for (const idx of rel.table.indexes) {
-      // An index access predicate (indexes.md §5.1): a maximal equality prefix + optional trailing
-      // range over a B-tree index's leading key columns. Indexes are held in ascending lowercased-name
-      // order, so the first non-null wins.
-      const ib = buildIndexAccessPredicate(filter, rel, idx, -1, snap, engine);
-      if (ib !== null) {
-        if (policy.indexSet) {
-          const set = buildIndexIntervalSetPlan(filter, rel, idx, snap);
-          if (set !== null && set.clip.length > 0) return { kind: "indexSet", indexSet: set };
-        }
-        return { kind: "index", index: ib };
-      }
+  for (const idx of rel.table.indexes) {
+    const bound = buildIndexIntervalSetPlan(filter, rel, idx, snap);
+    if (bound !== null) {
+      candidates.push(
+        indexOrderCandidate(
+          "index_interval",
+          bound.nameKey,
+          { kind: "indexSet", indexSet: bound },
+          filter,
+        ),
+      );
     }
   }
-  if (policy.gistBeforeGin) {
-    const gtb = detectGistBound(filter, rel.table.indexes, rel.table.columns, rel.offset);
-    if (gtb !== null) return { kind: "gist", gist: gtb };
-    const gb = detectGinBound(filter, rel.table.indexes, rel.table.columns, rel.offset);
-    if (gb !== null) return { kind: "gin", gin: gb };
-  } else {
-    const gb = detectGinBound(filter, rel.table.indexes, rel.table.columns, rel.offset);
-    if (gb !== null) return { kind: "gin", gin: gb };
-    const gtb = detectGistBound(filter, rel.table.indexes, rel.table.columns, rel.offset);
-    if (gtb !== null) return { kind: "gist", gist: gtb };
+  candidates.push(full);
+  candidates.sort((a, b) => {
+    const rank =
+      SCAN_CANDIDATE_KINDS.indexOf(a.identity.kind) -
+      SCAN_CANDIDATE_KINDS.indexOf(b.identity.kind);
+    if (rank !== 0) return rank;
+    return compareLowerName({ name: a.identity.indexName }, { name: b.identity.indexName });
+  });
+  return candidates;
+}
+
+function firstScanCandidate(
+  candidates: ScanCandidate[],
+  kind: ScanCandidateKind,
+): ScanCandidate | undefined {
+  return candidates.find((candidate) => candidate.identity.kind === kind);
+}
+
+function namedScanCandidate(
+  candidates: ScanCandidate[],
+  kind: ScanCandidateKind,
+  name: string,
+): ScanCandidate | undefined {
+  return candidates.find(
+    (candidate) => candidate.identity.kind === kind && candidate.identity.indexName === name,
+  );
+}
+
+// selectLegacyScanCandidate reproduces the pre-P3 policy exactly. Its order deliberately differs
+// from the canonical cost-tie order for clipped same-key interval sets and mutation's GIN/GiST order.
+export function selectLegacyScanCandidate(
+  candidates: ScanCandidate[],
+  policy: ScanBoundPolicy,
+): ScanBound | null {
+  if (policy.indexSet) {
+    const candidate = firstScanCandidate(candidates, "pk_interval");
+    if (candidate?.bound?.kind === "pkSet" && candidate.bound.pkSet.clip.length > 0) {
+      return candidate.bound;
+    }
   }
-  // LAST RESORT — an OR / IN-list of key equalities lowered to merged point probes (cost.md §3
-  // "OR / IN-list"). Reached only when no contiguous PK/index/GIN/GiST bound applied above, so this
-  // never displaces an existing plan. The primary key wins over a secondary index (its own key — no
-  // second tree), matching detectScanBound's ordering.
-  if (pkIntervals !== null) return { kind: "pkSet", pkSet: pkIntervals };
-  if (!policy.indexSet) return null;
-  for (const idx of rel.table.indexes) {
-    const set = buildIndexIntervalSetPlan(filter, rel, idx, snap);
-    if (set !== null) return { kind: "indexSet", indexSet: set };
+  const pk = firstScanCandidate(candidates, "pk");
+  if (pk?.bound !== null && pk?.bound !== undefined) return pk.bound;
+  if (policy.orderedIndex) {
+    for (const candidate of candidates) {
+      if (candidate.identity.kind !== "btree") continue;
+      if (policy.indexSet) {
+        const set = namedScanCandidate(
+          candidates,
+          "index_interval",
+          candidate.identity.indexName,
+        );
+        if (set?.bound?.kind === "indexSet" && set.bound.indexSet.clip.length > 0) {
+          return set.bound;
+        }
+      }
+      return candidate.bound;
+    }
+  }
+  const [firstOpclass, secondOpclass]: ScanCandidateKind[] = policy.gistBeforeGin
+    ? ["gist", "gin"]
+    : ["gin", "gist"];
+  const first = firstScanCandidate(candidates, firstOpclass);
+  if (first?.bound !== null && first?.bound !== undefined) return first.bound;
+  const second = firstScanCandidate(candidates, secondOpclass);
+  if (second?.bound !== null && second?.bound !== undefined) return second.bound;
+  if (policy.indexSet) {
+    const pkSet = firstScanCandidate(candidates, "pk_interval");
+    if (pkSet?.bound !== null && pkSet?.bound !== undefined) return pkSet.bound;
+    const indexSet = firstScanCandidate(candidates, "index_interval");
+    if (indexSet?.bound !== null && indexSet?.bound !== undefined) return indexSet.bound;
   }
   return null;
+}
+
+// Compatibility entry point used by SELECT and UPDATE/DELETE. P6 replaces only this selector for
+// eligible SELECT relations; candidate inventory remains unchanged.
+export function detectScanBoundWithPolicy(
+  filter: RExpr,
+  rel: ScopeRel,
+  snap: Snapshot,
+  engine: Engine,
+  policy: ScanBoundPolicy,
+): ScanBound | null {
+  return selectLegacyScanCandidate(inventoryScanCandidates(filter, rel, snap, engine), policy);
 }
 
 function intervalPlanHasRange(specs: IntervalSpec[], clip: BoundTerm[]): boolean {
@@ -14401,33 +14568,27 @@ export function orderSatisfiedByIndex(
   return null;
 }
 
-// detectGinBound detects a GIN-bounded scan over columns/indexes (gin.md §6): the lowest-named GIN
-// index whose array column at offset+ci has a GIN-accelerable conjunct (`col @> const`,
-// `col && const`, `const = ANY(col)`, or `col = const`). Factored out so the SELECT planner
-// (detectScanBound) and the UPDATE/DELETE scan both use the identical detection — the mutations
-// pass their own table's indexes/columns at offset 0.
-export function detectGinBound(
-  filter: RExpr | null,
-  indexes: IndexDef[],
+// buildGinBoundForIndex inventories one GIN index when its array column has an accelerable conjunct
+// (`col @> const`, `col && const`, `const = ANY(col)`, or `col = const`).
+export function buildGinBoundForIndex(
+  filter: RExpr,
+  idx: IndexDef,
   columns: Column[],
   offset: number,
 ): GinBound | null {
-  if (filter === null) return null;
-  for (const idx of indexes) {
-    if (idx.kind !== "gin") continue;
-    const ci = indexFirstColumn(idx);
-    const colGlobal = offset + ci;
-    const colType = columns[ci]!.type;
-    if (colType.kind !== "array") continue; // a GIN column is always an array (the gate); defensive
-    const m = ginMatch(filter, colGlobal);
-    if (m !== null) {
-      return {
-        nameKey: idx.name.toLowerCase(),
-        elemType: typeScalar(colType.elem),
-        strategy: m.strategy,
-        colGlobal,
-      };
-    }
+  if (idx.kind !== "gin") return null;
+  const ci = indexFirstColumn(idx);
+  const colGlobal = offset + ci;
+  const colType = columns[ci]!.type;
+  if (colType.kind !== "array") return null; // defensive: CREATE INDEX enforces array
+  const m = ginMatch(filter, colGlobal);
+  if (m !== null) {
+    return {
+      nameKey: idx.name.toLowerCase(),
+      elemType: typeScalar(colType.elem),
+      strategy: m.strategy,
+      colGlobal,
+    };
   }
   return null;
 }
@@ -14509,42 +14670,31 @@ function ginMatchOperand(
   return null;
 }
 
-// detectGistBound detects a GiST-bounded scan over columns/indexes (spec/design/gist.md §5): the
-// lowest-named GiST index whose range column at offset+ci has a `col && const` / `col @> const`
-// conjunct. Factored out so the SELECT planner (detectScanBound) and the UPDATE/DELETE scan share the
-// identical detection (the GIN precedent) — the mutations pass their indexes/columns at offset 0.
-export function detectGistBound(
-  filter: RExpr | null,
-  indexes: IndexDef[],
+// buildGistBoundForIndex inventories one single-column GiST index. Multi-column GiST indexes are
+// EXCLUDE backing structures and remain constraint-only, never planner candidates.
+export function buildGistBoundForIndex(
+  filter: RExpr,
+  idx: IndexDef,
   columns: Column[],
   offset: number,
 ): GistBound | null {
-  if (filter === null) return null;
-  for (const idx of indexes) {
-    if (idx.kind !== "gist") continue;
-    // The planner gather is single-operator: only a single-column GiST index accelerates a
-    // `col && Q` / `col @> Q` / `col = Q` conjunct. A multi-column GiST index (an EXCLUDE backing
-    // structure, gist.md §7) is probed only by the constraint, never the planner.
-    if (idx.keys.length !== 1) continue;
-    const ci = indexFirstColumn(idx);
-    const colGlobal = offset + ci;
-    const colType = columns[ci]!.type;
-    if (colType.kind === "range") {
-      // range_ops (GX1): a `col && Q` / `col @> Q` conjunct.
-      const m = gistMatch(filter, colGlobal);
-      if (m !== null) {
-        return { nameKey: idx.name.toLowerCase(), strategy: m.strategy, colGlobal };
-      }
-    } else if (isGistScalarType(colType)) {
-      // scalar `=` opclass (GX2): a `col = Q` conjunct over a fixed-width keyable scalar.
-      if (gistScalarMatch(filter, colGlobal) !== null) {
-        return {
-          nameKey: idx.name.toLowerCase(),
-          strategy: "equal",
-          colGlobal,
-          scalarType: typeScalar(colType),
-        };
-      }
+  if (idx.kind !== "gist" || idx.keys.length !== 1) return null;
+  const ci = indexFirstColumn(idx);
+  const colGlobal = offset + ci;
+  const colType = columns[ci]!.type;
+  if (colType.kind === "range") {
+    const m = gistMatch(filter, colGlobal);
+    if (m !== null) {
+      return { nameKey: idx.name.toLowerCase(), strategy: m.strategy, colGlobal };
+    }
+  } else if (isGistScalarType(colType)) {
+    if (gistScalarMatch(filter, colGlobal) !== null) {
+      return {
+        nameKey: idx.name.toLowerCase(),
+        strategy: "equal",
+        colGlobal,
+        scalarType: typeScalar(colType),
+      };
     }
   }
   return null;

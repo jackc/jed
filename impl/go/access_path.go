@@ -13,7 +13,8 @@ import (
 // interface (rowSource/scanSource), the access-plan shapes
 // (pkBoundPlan/scanBound/indexBoundPlan/gistBoundPlan/ginBoundPlan/interval-set plans), the predicate
 // analysis that detects a point lookup / range / index / GIN / GiST bound from a filter
-// (detectPKBound/detectScanBound/detectIntervalSet/detectGinBound/detectGistBound, buildIndexAccessPredicate),
+// (detectPKBound/inventoryScanCandidates/detectIntervalSet/buildGinBoundForIndex/
+// buildGistBoundForIndex/buildIndexAccessPredicate),
 // the ORDER-BY-via-scan-order analysis (orderSatisfiedByPK/orderSatisfiedByIndex),
 // the order-preserving key-bound encoding (buildKeyBound/encodeBoundKey/encodeTextBound), and the
 // streaming/window-top-N eligibility checks.
@@ -103,10 +104,8 @@ type pkBoundPlan struct {
 // scanBound is a per-relation scan bound (cost.md §3): a primary-key range, a
 // secondary-index equality (spec/design/indexes.md §5), a GIN-bounded scan over an
 // array column (spec/design/gin.md §6), a GiST-bounded scan, or a canonical interval set — exactly
-// one field is set. The PK bound wins when several apply (it is the
-// row's own key — no second tree, range-capable, strictly cheaper); the ordered-index
-// equality bound wins over GIN (gin.md §6). Interval sets (pkSet/indexSet) are normally the last
-// resort; a same-key set with a direct range clip wins over the broader clip alone.
+// one field is set. Candidate inventory and consumer selection are deliberately separate; this
+// union remains the executor-facing shape of the selected candidate.
 type scanBound struct {
 	pk       *pkBoundPlan
 	index    *indexBoundPlan
@@ -114,6 +113,99 @@ type scanBound struct {
 	gist     *gistBoundPlan
 	pkSet    *pkKeySetPlan
 	indexSet *indexKeySetPlan
+}
+
+// scanCandidateKind is the canonical access-path rank from estimator.toml. Keep the declaration
+// order byte-identical to that shared fact: P4 will compare estimated cost first, then this rank.
+// P3 uses it only to make the complete inventory deterministic; legacy selection remains separate.
+type scanCandidateKind uint8
+
+const (
+	scanCandidatePK scanCandidateKind = iota
+	scanCandidateBtree
+	scanCandidateGist
+	scanCandidateGin
+	scanCandidatePKInterval
+	scanCandidateIndexInterval
+	scanCandidateFull
+)
+
+// scanCandidateIdentity is a candidate's canonical, collision-free physical identity. indexName is
+// the lowercased catalog name for an index-bearing path and empty for PK/PK-interval/full paths.
+// Index names are unique within the relation namespace, so (kind, indexName) is total for an
+// inventory.
+type scanCandidateIdentity struct {
+	kind      scanCandidateKind
+	indexName string
+}
+
+func (id scanCandidateIdentity) String() string {
+	switch id.kind {
+	case scanCandidatePK:
+		return "pk"
+	case scanCandidateBtree:
+		return "btree:" + id.indexName
+	case scanCandidateGist:
+		return "gist:" + id.indexName
+	case scanCandidateGin:
+		return "gin:" + id.indexName
+	case scanCandidatePKInterval:
+		return "pk_interval"
+	case scanCandidateIndexInterval:
+		return "index_interval:" + id.indexName
+	case scanCandidateFull:
+		return "full"
+	default:
+		panic("unknown scan candidate kind")
+	}
+}
+
+type scanOrderKind uint8
+
+const (
+	// scanOrderStorageKey is table-storage-key order. Full/PK/PK-set scans walk the table tree in
+	// this order; GIN/GiST candidate gathers normalize to it before table fetch. The current executor
+	// can walk it both forward and reverse.
+	scanOrderStorageKey scanOrderKind = iota
+	// scanOrderIndexKey is one ordered B-tree's key order. The current ordered-index path walks only
+	// forward; indexName identifies exactly which ORDER BY capability it can satisfy.
+	scanOrderIndexKey
+)
+
+// scanOrderCapability makes an access path's observable row-order ability explicit rather than
+// re-deriving it from the ScanBound union at each optimizer consumer.
+type scanOrderCapability struct {
+	kind       scanOrderKind
+	indexName  string
+	reversible bool
+}
+
+// scanCandidate is one legal base-relation access path. bound is nil only for the explicit full-scan
+// candidate. residual is always the complete WHERE (nil only when there is no WHERE): every access
+// predicate is a narrowing superset and execution must retain the full filter recheck.
+type scanCandidate struct {
+	identity  scanCandidateIdentity
+	bound     *scanBound
+	scanOrder scanOrderCapability
+	residual  *rExpr
+}
+
+func storageOrderCandidate(kind scanCandidateKind, name string, bound *scanBound, filter *rExpr) scanCandidate {
+	return scanCandidate{
+		identity:  scanCandidateIdentity{kind: kind, indexName: name},
+		bound:     bound,
+		scanOrder: scanOrderCapability{kind: scanOrderStorageKey, reversible: true},
+		residual:  filter,
+	}
+}
+
+func indexOrderCandidate(kind scanCandidateKind, name string, bound *scanBound, filter *rExpr) scanCandidate {
+	return scanCandidate{
+		identity:  scanCandidateIdentity{kind: kind, indexName: name},
+		bound:     bound,
+		scanOrder: scanOrderCapability{kind: scanOrderIndexKey, indexName: name},
+		residual:  filter,
+	}
 }
 
 // mutationScanPlan is the small physical plan shared by UPDATE/DELETE execution and DML EXPLAIN.
@@ -194,11 +286,11 @@ func intervalPlanHasRange(specs []intervalSpec, clip []boundTerm) bool {
 	return false
 }
 
-// gistBoundPlan is the plan-time result of GiST analysis (spec/design/gist.md §5): the chosen GiST
-// index (lowest lowercased name whose range column has a `col && const` / `col @> const` conjunct),
-// the descent strategy, and the column's global scope index. Like ginBoundPlan, the constant query
-// operand is NOT stored (re-found in plan.filter at exec time by gistMatch). No element type is
-// carried — the gather descends the resident R-tree (gist.md §4.1), whose bounds are already decoded.
+// gistBoundPlan is the plan-time result for one eligible GiST index (spec/design/gist.md §5): its
+// descent strategy and the column's global scope index. The inventory owns one plan per eligible
+// index; the selector chooses among them. Like ginBoundPlan, the constant query operand is NOT stored
+// (re-found in plan.filter at exec time by gistMatch). No element type is carried — the gather
+// descends the resident R-tree (gist.md §4.1), whose bounds are already decoded.
 type gistBoundPlan struct {
 	nameKey   string
 	strategy  gistStrategy
@@ -229,11 +321,11 @@ const (
 	ginEqual
 )
 
-// ginBoundPlan is the plan-time result of GIN analysis (spec/design/gin.md §6): the chosen
-// GIN index (lowest lowercased name whose array column has a `col @> const` / `col && const`
-// conjunct), the array ELEMENT type (for encode(term) — the term bytes), the operator
-// strategy, and the column's global scope index. The constant query Q is NOT stored; it is
-// re-found in plan.filter at exec time by ginMatch and evaluated there.
+// ginBoundPlan is the plan-time result for one eligible GIN index (spec/design/gin.md §6): its array
+// ELEMENT type (for encode(term) — the term bytes), operator strategy, and column's global scope
+// index. The inventory owns one plan per eligible index; the selector chooses among them. The
+// constant query Q is NOT stored; it is re-found in plan.filter at exec time by ginMatch and
+// evaluated there.
 type ginBoundPlan struct {
 	nameKey   string
 	elemType  scalarType
@@ -252,10 +344,10 @@ type indexEqCol struct {
 	srcs    []*rExpr
 }
 
-// indexBoundPlan is the plan-time result of index analysis (indexes.md §5.1): the chosen index
-// (lowest lowercased name yielding a non-empty access predicate) and the predicate — a maximal
+// indexBoundPlan is the plan-time result for one eligible ordered index (indexes.md §5.1): a maximal
 // EQUALITY PREFIX on the leading key columns (eqCols) plus an OPTIONAL RANGE on the next column
-// (rangeTerms / rangeType). At exec time buildIndexBound turns these into a concrete index-key
+// (rangeTerms / rangeType). The inventory owns one plan per eligible index; the selector chooses
+// among them. At exec time buildIndexBound turns these into a concrete index-key
 // range: the equality prefix bytes P = concatenated present slots, then the range (if any)
 // intersected relative to P. suffixTypes are the types of the index columns AFTER the equality
 // prefix (columns[len(eqCols):]) — the range column (if any) plus every trailing column — each
@@ -394,10 +486,9 @@ func (db *engine) buildIndexAccessPredicate(filter *rExpr, rel scopeRel, idx ind
 	}
 }
 
-// scanBoundPolicy is the consumer-specific eligibility/precedence part of access-path selection.
-// SELECT and mutation scans share one inventory below. Their candidate sets now differ only in the
+// scanBoundPolicy is the consumer-specific eligibility/precedence part of LEGACY access-path
+// selection. Inventory is policy-free and complete. SELECT and mutation scans differ only in their
 // established GiST/GIN precedence: mutations try GIN before GiST while SELECT tries GiST before GIN.
-// Keeping that difference as data here prevents EXPLAIN and execution from growing separate ladders.
 type scanBoundPolicy struct {
 	orderedIndex  bool
 	indexSet      bool
@@ -410,19 +501,39 @@ var (
 )
 
 // detectScanBound picks one SELECT relation's scan bound (cost.md §3; indexes.md §5). It is the
-// SELECT-policy wrapper over the shared inventory in detectScanBoundWithPolicy.
+// SELECT-policy wrapper over the shared inventory + behavior-neutral legacy selector.
 func detectScanBound(filter *rExpr, rel scopeRel, db *engine) *scanBound {
 	return detectScanBoundWithPolicy(filter, rel, db, selectScanBoundPolicy)
 }
 
-// detectScanBoundWithPolicy inventories the structurally usable bounds for one base relation and
-// returns the first candidate admitted by policy. The whole WHERE remains the residual filter, so a
-// disabled candidate always falls through to another sound bound or a full scan.
-func detectScanBoundWithPolicy(filter *rExpr, rel scopeRel, db *engine, policy scanBoundPolicy) *scanBound {
-	// A host-attached relation full-scans this slice (attached-databases.md §8): the bounded-scan exec
-	// path resolves index stores unscoped, so no PK/index/GiST/GIN bound may apply to an attachment.
-	if rel.isAttachment() {
-		return nil
+// inventoryScanCandidates enumerates EVERY legal base access path in estimator.toml's canonical
+// rank/name order. It never selects. A host-attached relation has only the full candidate this slice
+// because bounded execution still resolves its index stores through the unscoped funnel.
+func inventoryScanCandidates(filter *rExpr, rel scopeRel, db *engine) []scanCandidate {
+	full := storageOrderCandidate(scanCandidateFull, "", nil, filter)
+	if rel.isAttachment() || filter == nil {
+		return []scanCandidate{full}
+	}
+	candidates := make([]scanCandidate, 0, 2+len(rel.table.Indexes)*2)
+	if bp := db.detectPKBound([]*rExpr{filter}, rel, -1); bp != nil {
+		candidates = append(candidates, storageOrderCandidate(scanCandidatePK, "", &scanBound{pk: bp}, filter))
+	}
+	// Do not trust catalog/container iteration for identity order. The final sort applies the shared
+	// kind rank followed by raw UTF-8 bytes of the already-lowercased index name.
+	for _, idx := range rel.table.Indexes {
+		if ib := db.buildIndexAccessPredicate(filter, rel, idx, -1); ib != nil {
+			candidates = append(candidates, indexOrderCandidate(scanCandidateBtree, ib.nameKey, &scanBound{index: ib}, filter))
+		}
+	}
+	for _, idx := range rel.table.Indexes {
+		if gb := buildGistBoundForIndex(filter, idx, rel.table.Columns, rel.offset); gb != nil {
+			candidates = append(candidates, storageOrderCandidate(scanCandidateGist, gb.nameKey, &scanBound{gist: gb}, filter))
+		}
+	}
+	for _, idx := range rel.table.Indexes {
+		if gb := buildGinBoundForIndex(filter, idx, rel.table.Columns, rel.offset); gb != nil {
+			candidates = append(candidates, storageOrderCandidate(scanCandidateGin, gb.nameKey, &scanBound{gin: gb}, filter))
+		}
 	}
 	var pkIntervals *pkKeySetPlan
 	if pkLocal := rel.table.PrimaryKeyIndex(); pkLocal >= 0 {
@@ -434,62 +545,95 @@ func detectScanBoundWithPolicy(filter *rExpr, rel scopeRel, db *engine, policy s
 			}
 		}
 	}
-	// A co-present same-key range clips an OR/IN set before the ordinary contiguous bound can win.
-	if policy.indexSet && pkIntervals != nil && len(pkIntervals.clip) > 0 {
-		return &scanBound{pkSet: pkIntervals}
-	}
-	if bp := db.detectPKBound([]*rExpr{filter}, rel, -1); bp != nil {
-		return &scanBound{pk: bp}
-	}
-	if policy.orderedIndex {
-		for _, idx := range rel.table.Indexes {
-			// An index access predicate (indexes.md §5.1): a maximal equality prefix + optional trailing
-			// range over a B-tree index's leading key columns. Returns nil for a GIN/GiST index (handled
-			// by the passes below), an ineligible tail, or no bound. Indexes are held in ascending
-			// lowercased-name order, so the first non-nil wins — the deterministic tie-break.
-			if ib := db.buildIndexAccessPredicate(filter, rel, idx, -1); ib != nil {
-				if policy.indexSet {
-					if is := db.buildIndexIntervalSetPlan(filter, rel, idx); is != nil && len(is.clip) > 0 {
-						return &scanBound{indexSet: is}
-					}
-				}
-				return &scanBound{index: ib}
-			}
-		}
-	}
-	if policy.gistBeforeGin {
-		// SELECT's established order is GiST then GIN after PK/ordered B-tree.
-		if gb := detectGistBound(filter, rel.table.Indexes, rel.table.Columns, rel.offset); gb != nil {
-			return &scanBound{gist: gb}
-		}
-		if gb := detectGinBound(filter, rel.table.Indexes, rel.table.Columns, rel.offset); gb != nil {
-			return &scanBound{gin: gb}
-		}
-	} else {
-		// UPDATE/DELETE's established order is GIN then GiST after PK. Phase 0 preserves it.
-		if gb := detectGinBound(filter, rel.table.Indexes, rel.table.Columns, rel.offset); gb != nil {
-			return &scanBound{gin: gb}
-		}
-		if gb := detectGistBound(filter, rel.table.Indexes, rel.table.Columns, rel.offset); gb != nil {
-			return &scanBound{gist: gb}
-		}
-	}
-	// LAST RESORT — an OR / IN-list of key equalities lowered to merged point probes
-	// (cost.md §3 "OR / IN-list"). Reached only when no contiguous PK/index/GIN/GiST bound
-	// applied above, so this never displaces an existing plan. The primary key wins over a
-	// secondary index (its own key — no second tree), matching detectScanBound's ordering.
 	if pkIntervals != nil {
-		return &scanBound{pkSet: pkIntervals}
-	}
-	if !policy.indexSet {
-		return nil
+		candidates = append(candidates, storageOrderCandidate(scanCandidatePKInterval, "", &scanBound{pkSet: pkIntervals}, filter))
 	}
 	for _, idx := range rel.table.Indexes {
 		if is := db.buildIndexIntervalSetPlan(filter, rel, idx); is != nil {
-			return &scanBound{indexSet: is}
+			candidates = append(candidates, indexOrderCandidate(scanCandidateIndexInterval, is.nameKey, &scanBound{indexSet: is}, filter))
+		}
+	}
+	candidates = append(candidates, full)
+	sort.SliceStable(candidates, func(i, j int) bool {
+		a, b := candidates[i].identity, candidates[j].identity
+		if a.kind != b.kind {
+			return a.kind < b.kind
+		}
+		return bytes.Compare([]byte(a.indexName), []byte(b.indexName)) < 0
+	})
+	return candidates
+}
+
+func firstScanCandidate(candidates []scanCandidate, kind scanCandidateKind) *scanCandidate {
+	for i := range candidates {
+		if candidates[i].identity.kind == kind {
+			return &candidates[i]
 		}
 	}
 	return nil
+}
+
+func namedScanCandidate(candidates []scanCandidate, kind scanCandidateKind, name string) *scanCandidate {
+	for i := range candidates {
+		if candidates[i].identity.kind == kind && candidates[i].identity.indexName == name {
+			return &candidates[i]
+		}
+	}
+	return nil
+}
+
+// selectLegacyScanCandidate reproduces the pre-P3 fixed policy exactly. Its order deliberately is
+// NOT the inventory's canonical cost-tie order in two cases: a clipped same-key interval set replaces
+// its broader contiguous PK/index bound, and mutations put GIN before GiST. Returning nil selects the
+// explicit full candidate while preserving the physical plan's existing nil spelling.
+func selectLegacyScanCandidate(candidates []scanCandidate, policy scanBoundPolicy) *scanBound {
+	if policy.indexSet {
+		if c := firstScanCandidate(candidates, scanCandidatePKInterval); c != nil && len(c.bound.pkSet.clip) > 0 {
+			return c.bound
+		}
+	}
+	if c := firstScanCandidate(candidates, scanCandidatePK); c != nil {
+		return c.bound
+	}
+	if policy.orderedIndex {
+		for _, c := range candidates {
+			if c.identity.kind != scanCandidateBtree {
+				continue
+			}
+			if policy.indexSet {
+				if set := namedScanCandidate(candidates, scanCandidateIndexInterval, c.identity.indexName); set != nil && len(set.bound.indexSet.clip) > 0 {
+					return set.bound
+				}
+			}
+			return c.bound
+		}
+	}
+	firstOpclass := scanCandidateGist
+	secondOpclass := scanCandidateGin
+	if !policy.gistBeforeGin {
+		firstOpclass, secondOpclass = secondOpclass, firstOpclass
+	}
+	if c := firstScanCandidate(candidates, firstOpclass); c != nil {
+		return c.bound
+	}
+	if c := firstScanCandidate(candidates, secondOpclass); c != nil {
+		return c.bound
+	}
+	if policy.indexSet {
+		if c := firstScanCandidate(candidates, scanCandidatePKInterval); c != nil {
+			return c.bound
+		}
+		if c := firstScanCandidate(candidates, scanCandidateIndexInterval); c != nil {
+			return c.bound
+		}
+	}
+	return nil
+}
+
+// detectScanBoundWithPolicy is the compatibility entry point used by SELECT and UPDATE/DELETE.
+// P6 replaces only this selector for eligible SELECT relations; the complete inventory stays.
+func detectScanBoundWithPolicy(filter *rExpr, rel scopeRel, db *engine, policy scanBoundPolicy) *scanBound {
+	return selectLegacyScanCandidate(inventoryScanCandidates(filter, rel, db), policy)
 }
 
 func (db *engine) buildIndexIntervalSetPlan(filter *rExpr, rel scopeRel, idx indexDef) *indexKeySetPlan {
@@ -819,29 +963,22 @@ func (db *engine) keyCollationCtx(col catColumn) (*Collation, bool) {
 	return nil, false
 }
 
-// detectGinBound detects a GIN-bounded scan over columns/indexes (gin.md §6): the lowest-named
-// GIN index whose array column at offset+ci has a GIN-accelerable conjunct (`col @> const`,
-// `col && const`, `const = ANY(col)`, or `col = const`). Factored out so the SELECT planner
-// (detectScanBound) and the UPDATE/DELETE scan both use the identical detection — the mutations
-// pass their own table's indexes/columns at offset 0.
-func detectGinBound(filter *rExpr, indexes []indexDef, columns []catColumn, offset int) *ginBoundPlan {
-	if filter == nil {
+// buildGinBoundForIndex inventories one GIN index when its array column has an accelerable conjunct
+// (`col @> const`, `col && const`, `const = ANY(col)`, or `col = const`). The complete inventory
+// calls it once per catalog index; legacy selection later chooses the lowest name.
+func buildGinBoundForIndex(filter *rExpr, idx indexDef, columns []catColumn, offset int) *ginBoundPlan {
+	if filter == nil || idx.Kind != indexGin {
 		return nil
 	}
-	for _, idx := range indexes {
-		if idx.Kind != indexGin {
-			continue
-		}
-		ci := idx.firstColumn()
-		colGlobal := offset + ci
-		at := columns[ci].Type
-		if at.Array == nil {
-			continue // a GIN column is always an array (the CREATE INDEX gate); defensive
-		}
-		if s, _, ok := ginMatch(filter, colGlobal); ok {
-			return &ginBoundPlan{
-				nameKey: strings.ToLower(idx.Name), elemType: at.Array.ScalarTy(), strategy: s, colGlobal: colGlobal,
-			}
+	ci := idx.firstColumn()
+	colGlobal := offset + ci
+	at := columns[ci].Type
+	if at.Array == nil {
+		return nil // a GIN column is always an array (the CREATE INDEX gate); defensive
+	}
+	if s, _, ok := ginMatch(filter, colGlobal); ok {
+		return &ginBoundPlan{
+			nameKey: strings.ToLower(idx.Name), elemType: at.Array.ScalarTy(), strategy: s, colGlobal: colGlobal,
 		}
 	}
 	return nil
@@ -916,34 +1053,24 @@ func ginMatchOperand(filter *rExpr, colGlobal int, queryOK func(*rExpr) bool) (g
 	return 0, nil, false
 }
 
-// detectGistBound detects a GiST-bounded scan over columns/indexes (spec/design/gist.md §5): the
-// lowest-named GiST index whose range column at offset+ci has a `col && const` / `col @> const`
-// conjunct. Factored out so the SELECT planner (detectScanBound) and the UPDATE/DELETE scan share
-// the identical detection (the GIN precedent) — the mutations pass their indexes/columns at offset 0.
-func detectGistBound(filter *rExpr, indexes []indexDef, columns []catColumn, offset int) *gistBoundPlan {
-	for _, idx := range indexes {
-		if idx.Kind != indexGist {
-			continue
+// buildGistBoundForIndex inventories one single-column GiST index. Multi-column GiST indexes are
+// EXCLUDE backing structures and remain constraint-only, never planner candidates.
+func buildGistBoundForIndex(filter *rExpr, idx indexDef, columns []catColumn, offset int) *gistBoundPlan {
+	if filter == nil || idx.Kind != indexGist || len(idx.Keys) != 1 {
+		return nil
+	}
+	ci := idx.firstColumn()
+	colGlobal := offset + ci
+	colTy := columns[ci].Type
+	if colTy.IsRange() {
+		// range_ops (GX1): a `col && Q` / `col @> Q` conjunct.
+		if s, _, ok := gistMatch(filter, colGlobal); ok {
+			return &gistBoundPlan{nameKey: strings.ToLower(idx.Name), strategy: s, colGlobal: colGlobal}
 		}
-		// The planner gather is single-operator: only a single-column GiST index accelerates a
-		// `col && Q` / `col @> Q` / `col = Q` conjunct. A multi-column GiST index (an EXCLUDE backing
-		// structure, gist.md §7) is probed only by the constraint, never the planner.
-		if len(idx.Keys) != 1 {
-			continue
-		}
-		ci := idx.firstColumn()
-		colGlobal := offset + ci
-		colTy := columns[ci].Type
-		if colTy.IsRange() {
-			// range_ops (GX1): a `col && Q` / `col @> Q` conjunct.
-			if s, _, ok := gistMatch(filter, colGlobal); ok {
-				return &gistBoundPlan{nameKey: strings.ToLower(idx.Name), strategy: s, colGlobal: colGlobal}
-			}
-		} else if isGistScalarType(colTy) {
-			// scalar `=` opclass (GX2): a `col = Q` conjunct over a fixed-width keyable scalar.
-			if _, _, ok := gistScalarMatch(filter, colGlobal); ok {
-				return &gistBoundPlan{nameKey: strings.ToLower(idx.Name), strategy: gistEqual, colGlobal: colGlobal, scalarType: colTy.ScalarTy()}
-			}
+	} else if isGistScalarType(colTy) {
+		// scalar `=` opclass (GX2): a `col = Q` conjunct over a fixed-width keyable scalar.
+		if _, _, ok := gistScalarMatch(filter, colGlobal); ok {
+			return &gistBoundPlan{nameKey: strings.ToLower(idx.Name), strategy: gistEqual, colGlobal: colGlobal, scalarType: colTy.ScalarTy()}
 		}
 	}
 	return nil

@@ -4528,11 +4528,9 @@ pub(crate) struct IndexKeySet {
 
 /// A per-relation scan bound (cost.md §3): a primary-key range, a secondary-index
 /// equality (spec/design/indexes.md §5), a GIN-bounded scan over an array column
-/// (spec/design/gin.md §6), a GiST-bounded scan, or a canonical interval set. The PK bound wins
-/// when several apply — it is the row's own key (no second tree, range-capable, strictly cheaper);
-/// the ordered-index equality bound wins over GIN (the deterministic precedence, gin.md §6). The
-/// interval-set bounds (`PkSet`/`IndexSet`) are normally the last resort; a co-present same-key
-/// range clip deliberately makes the set win over the broader contiguous clip alone.
+/// (spec/design/gin.md §6), a GiST-bounded scan, or a canonical interval set. Candidate inventory
+/// and consumer selection are deliberately separate; this remains the executor-facing shape of
+/// the selected candidate.
 pub(crate) enum ScanBound {
     Pk(PkBound),
     Index(IndexBound),

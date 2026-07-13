@@ -1,0 +1,86 @@
+# P3 access-candidate inventory neutrality. EXPLAIN exposes only the legacy-selected member; the
+# mirrored per-core white-box tests assert the complete canonical list for this same mixed relation
+# (two B-tree, two GiST, two GIN, PK/index interval sets, and full scan). These shared cases pin that
+# routing the selector through the new inventory changes no plan spelling or consumer precedence.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.gin_index, ddl.gist_index, dml.update, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.point_lookup, query.index_range, query.or_in_point_lookup, query.interval_set, query.gin_scan, query.gist_scan, query.explain, dml.explain, types.i32, types.array, types.range, func.array_containment, func.range_constructors, func.range_operators
+
+statement ok
+CREATE TABLE candidate_inventory (id i32 PRIMARY KEY, a i32, b i32, tags i32[], span i32range)
+
+# Create reverse-lexical names first. Candidate ordering is by canonical lowercased identity, never
+# insertion/container order.
+statement ok
+CREATE INDEX z_btree ON candidate_inventory (b)
+
+statement ok
+CREATE INDEX a_btree ON candidate_inventory (a)
+
+statement ok
+CREATE INDEX z_gin ON candidate_inventory USING gin (tags)
+
+statement ok
+CREATE INDEX a_gin ON candidate_inventory USING gin (tags)
+
+statement ok
+CREATE INDEX z_gist ON candidate_inventory USING gist (span)
+
+statement ok
+CREATE INDEX a_gist ON candidate_inventory USING gist (span)
+
+# A clipped same-key interval set retains its legacy exception over the broader contiguous PK bound.
+query ITT nosort
+EXPLAIN SELECT id FROM candidate_inventory WHERE (id = 1 OR id = 2) AND id >= 0 AND (a = 1 OR a = 2) AND a >= 0 AND (b = 1 OR b = 2) AND b >= 0 AND tags @> ARRAY[1] AND span && i32range(1, 3)
+----
+0
+Filter
+conjuncts=8
+1
+Scan candidate_inventory
+PK interval set: id; intervals=2; touched=5
+
+# The same clipped-set exception applies to the lowest usable ordered index.
+query ITT nosort
+EXPLAIN SELECT id FROM candidate_inventory WHERE (a = 1 OR a = 2) AND a >= 0 AND (b = 1 OR b = 2) AND b >= 0
+----
+0
+Filter
+conjuncts=4
+1
+Scan candidate_inventory
+Index interval set: using a_btree; intervals=2; touched=3
+
+# Every usable B-tree is inventoried; the legacy selector retains the lowest-lowercased name.
+query ITT nosort
+EXPLAIN SELECT id FROM candidate_inventory WHERE a = 7 AND b = 7 AND tags @> ARRAY[1] AND span && i32range(1, 3)
+----
+0
+Filter
+conjuncts=4
+1
+Scan candidate_inventory
+Index bound: using a_btree; touched=5
+
+# SELECT retains GiST-before-GIN plus lowest name among each access method.
+query ITT nosort
+EXPLAIN SELECT id FROM candidate_inventory WHERE tags @> ARRAY[1] AND span && i32range(1, 3)
+----
+0
+Filter
+conjuncts=2
+1
+Scan candidate_inventory
+GiST bound: using a_gist; touched=3
+
+# Mutation retains its established GIN-before-GiST policy over the same complete inventory.
+query ITT nosort
+EXPLAIN UPDATE candidate_inventory SET id = id WHERE tags @> ARRAY[1] AND span && i32range(1, 3)
+----
+0
+Update candidate_inventory
+sets=1
+1
+Filter
+conjuncts=2
+2
+Scan candidate_inventory
+GIN bound: using a_gin

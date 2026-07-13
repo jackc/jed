@@ -186,8 +186,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   divergence. Exact arithmetic, generic pre-bind parameters, PostgreSQL-derived rational defaults,
   relation-scoped cache validity, SELECT-first scope, complete ties, and bounded left-deep join
   search are specified in [estimator.md](spec/design/estimator.md); mechanical facts live in
-  [estimator.toml](spec/cost/estimator.toml). Implementation remains open in the slices below and
-  the multi-session handoff is [TODO-cost-plan-input.md](TODO-cost-plan-input.md).
+  [estimator.toml](spec/cost/estimator.toml). The remaining implementation continues in the slices
+  below; the multi-session handoff is [TODO-cost-plan-input.md](TODO-cost-plan-input.md).
 - [x] **P1 — transactional per-table row counts** — `format_version` 28 appends an exact
   nonnegative signed-`i64` `row_count` to every table catalog entry, installs it beside loaded
   demand-paged skeletons without a leaf walk, and maintains it with snapshot roots across DML,
@@ -201,6 +201,11 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   revisions cannot fill the committed slot; rollback restores validity; attachments validate against
   their own snapshot identity. The tokens are non-persisted snapshot metadata, so the file format is
   unchanged. → [estimator.md §6](spec/design/estimator.md), [api.md §2.4](spec/design/api.md)
+- [x] **P3 — deterministic all-candidate inventory** — every core now enumerates full, PK, every
+  eligible B-tree/GiST/GIN index, and every PK/index interval path in the shared canonical order.
+  Candidates carry explicit scan-order and full residual-filter facts; a separate legacy selector
+  preserves SELECT and mutation precedence, including clipped interval exceptions, with no plan,
+  EXPLAIN, result, or actual-cost change. → [planner.md §5.1](spec/design/planner.md)
 - [ ] **Plan-time cost estimator** — estimate the same cost units the runtime meter charges
   (`page_read`/`storage_row_read`/`row_produced`/…) for each candidate plan and pick the cheapest,
   instead of today's structural tie-breaks (lowest index name, FROM order). Authored as a **spec'd,

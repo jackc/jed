@@ -1,7 +1,7 @@
 # The planner: explicit optimizer-pass structure — design
 
 > How a SELECT becomes an executable plan, and where each optimization lives. The planner
-> is a **deterministic rule engine** (no statistics, no cost-based choice yet): it resolves
+> is a **deterministic rule engine** (no statistics-based choice or cost-based choice yet): it resolves
 > the query into a **logical plan**, applies **rewrite rules** (none exist yet — §3), and
 > then runs **physical/access-path selection** — a fixed, ordered list of discrete rules,
 > each a single function owning its gate and its action. This doc is the contract all three
@@ -129,9 +129,10 @@ internals.
 
 ## 5. Access-path precedence (rule 1's internal order)
 
-For each base relation, `detectScanBound` picks the **first** bound kind that applies —
-a fixed precedence, not a costed choice ([indexes.md §5](indexes.md) is the authoritative
-selection + execution spec; cost-based selection is a later concern, §7):
+For each base relation, the access-path machinery inventories every legal candidate, then the
+legacy selector picks the **first** bound kind that applies — a fixed precedence, not a costed
+choice ([indexes.md §5](indexes.md) is the authoritative selection + execution spec; cost-based
+selection is a later concern, §7):
 
 1. **PK tuple bound** (maximal equality prefix plus optional next-member range) — the row's own key;
    no second tree.
@@ -152,19 +153,45 @@ rows are scanned, so a superset bound is always sound.
 
 ### 5.1 Consumer policies over one bound inventory
 
-The detector is one inventory with an explicit **consumer policy**, not separate SELECT,
-UPDATE, DELETE, and EXPLAIN ladders. This is behavior-neutral plumbing for the rule-based
-extensions: it makes later eligibility changes one policy edit while preserving today's choices.
+Every core builds one complete, policy-free inventory, then applies an explicit **consumer policy**;
+there are no separate SELECT, UPDATE, DELETE, and EXPLAIN detection ladders. This P3 plumbing is
+behavior-neutral and leaves the selected physical `ScanBound` union unchanged.
+
+The inventory contains one candidate for each legal physical access path: PK tuple, every eligible
+ordered B-tree index, every eligible GiST index, every eligible GIN index, PK interval set, every
+eligible ordered-index interval set, and an explicit full scan. A host-attached relation has only the
+full candidate until bounded attachment execution is scoped correctly. A relation without a WHERE
+also has only the full candidate.
+
+Each candidate carries these explicit planning facts:
+
+- a collision-free identity `(kind, lowercased_index_name)`, with an empty name for PK, PK interval,
+  and full paths;
+- the existing executor `ScanBound`, absent only for full scan;
+- its scan-order capability: reversible table-storage-key order, or forward order in one named
+  B-tree index; and
+- the complete resolved WHERE as the required residual filter, absent only when there is no WHERE.
+
+Inventory order is the P0 total access-path order: PK, ordered B-tree, GiST, GIN, PK interval,
+ordered-index interval, full. Index-bearing candidates of the same kind sort by raw UTF-8 bytes of
+their already-lowercased catalog name. Catalog container or map iteration must not affect this order.
+This order is the future equal-estimate tie-break; the legacy selector below deliberately preserves
+two older precedence exceptions and does not simply take the inventory's first element.
 
 - **SELECT** admits PK, ordered B-tree, GiST, GIN, PK interval-set, and ordered-index interval-set
   candidates in the §5 order.
 - **UPDATE/DELETE** admit PK, ordered B-tree, GIN, GiST, PK interval-set, and ordered-index interval-set.
   Their established GIN-before-GiST order is preserved (unlike SELECT's GiST-before-GIN order), and
   interval sets remain the last resort after every contiguous/opclass bound except for the
-  same-key clipping case above. A host-attached target
-  policy-disables every bound and full-scans through its scoped store, unchanged.
+  same-key clipping case above. A host-attached target's inventory admits only full scan and routes
+  it through its scoped store, unchanged.
 - **DML EXPLAIN** renders the same typed mutation physical plan execution consumes. It does not run
   a parallel detector.
+
+The legacy selector preserves two details exactly: a same-key interval set with a direct clipping
+range replaces the broader contiguous PK/B-tree bound, and UPDATE/DELETE try GIN before GiST while
+SELECT tries GiST before GIN. Within every index-bearing kind, the lowest lowercased name wins.
+P3 changes no physical plan field, executor dispatch, EXPLAIN spelling, or actual metered cost.
 
 Access-path execution has a common key-preserving result: deterministic `(storage key, row)`
 candidates plus the exact up-front `page_read` / `value_decompress` / access-method work block.

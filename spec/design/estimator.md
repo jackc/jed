@@ -5,8 +5,9 @@
 > runtime unit weights remain canonical in [../cost/schedule.toml](../cost/schedule.toml). This
 > document specifies the algorithms every core will implement independently.
 >
-> **Status: P0 contract ratified; P1 row counts and P2 cache validity landed.** The current planner
-> still uses the fixed rules in [planner.md](planner.md). P3–P8 in
+> **Status: P0 contract ratified; P1 row counts, P2 cache validity, and P3 complete candidate
+> inventory landed.** The current planner still uses the legacy fixed selector in
+> [planner.md](planner.md). P4–P8 in
 > [../../TODO-cost-plan-input.md](../../TODO-cost-plan-input.md) implement this contract as vertical
 > slices. Until the selector slice lands, no plan, actual cost, or EXPLAIN row changes.
 

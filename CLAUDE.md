@@ -961,6 +961,9 @@ of executing a query** and **abort when a caller-supplied ceiling is exceeded**.
   P2's prepared-plan cache now validates an exact relation-scoped signature over the owning
   database/attachment identity, catalog generation, table name, and transactional estimator revision,
   so a hit cannot preserve a plan selected from stale estimator inputs.
+  P3 now inventories every legal base-relation access path in the canonical kind/name order, with
+  explicit scan-order and residual-filter facts, then applies a separate legacy selector so plans,
+  EXPLAIN, and actual cost remain unchanged until cost-based selection lands.
 - **Ceiling + abort.** A caller may set a **maximum cost**; the instant accrued cost reaches
   it, execution **aborts deterministically** with a defined error code (registered in
   `spec/errors/`). The abort point is itself deterministic (same query + db + ceiling → same
