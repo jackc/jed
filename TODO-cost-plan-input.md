@@ -63,6 +63,36 @@ already anticipated by `TODO.md`; **P10** is the final landing gate.
 **Exit gate:** the estimator, statistics lifecycle, candidate ordering, cache-validity inputs, and
 search limits are fully specified without relying on a core implementation as the authority.
 
+### P0 human decision checkpoint
+
+These decisions materially affect later slices and require maintainer confirmation before P0 is
+ratified. Recommendations are the working defaults, not standing decisions yet.
+
+- [ ] **Optimization objective.** Recommended: Path B minimizes the existing observable runtime
+  cost schedule exactly as `TODO.md` says. It does not add private planner-only weights for
+  currently unmetered work such as sort comparisons, dedup bookkeeping, or row concatenation. If
+  those operations should influence selection, expand the runtime schedule in an explicit earlier
+  slice and re-pin its costs first.
+- [ ] **Parameter sensitivity.** Recommended: keep physical planning before parameter binding.
+  Literals may use value-aware statistics when those exist; `$N` uses a deterministic generic
+  selectivity. A custom parameter-sensitive plan can be a later feature rather than reshaping the
+  pipeline and prepared-plan cache in initial Path B.
+- [ ] **Initial selectivity constants.** Recommended: borrow PostgreSQL's row-count-only defaults
+  but encode them as exact rational data — equality `1/200`, one-sided inequality `1/3`, and a
+  paired range `1/200` — with exact unique-key rules overriding the defaults.
+- [ ] **Join-search bound.** Recommended: exhaustive deterministic left-deep dynamic programming
+  for reorderable islands of at most 8 relations, then deterministic greedy cheapest-next for
+  larger islands. This borrows PostgreSQL's default join-collapse boundary without adopting its
+  randomized GEQO fallback.
+- [ ] **Estimator inputs and cache validity.** Recommended: admit only catalog/statistics facts and
+  storage facts visible without leaf I/O (for example exact resident-skeleton node counts and tree
+  height). Cache them with a relation-scoped estimator-input fingerprint, including attachment
+  identity, rather than a database-wide generation that invalidates prepared plans after unrelated
+  table writes.
+- [ ] **DML scope.** Recommended: initial cost-based selection applies to SELECT. UPDATE/DELETE use
+  the behavior-neutral candidate inventory but retain their current fixed policies until a
+  dedicated slice decides mutation visitation/error-order consequences.
+
 ## P1 — Transactional per-table row counts
 
 **Goal:** make the first estimator input exact, cheap, transactional, and available after reopen.
@@ -323,9 +353,10 @@ byte-identical, deterministic, cache-safe, and demonstrably improve plan selecti
 
 Update this short block at the end of each work session.
 
-- **Current slice:** P0 — not started
-- **Last completed checkpoint:** none
-- **Branch / last pushed commit:** none
+- **Current slice:** P0 — decision audit complete; awaiting maintainer decisions
+- **Last completed checkpoint:** P0 major-decision surface audited against planner, cost,
+  determinism, EXPLAIN, storage, and plan-cache contracts
+- **Branch / last pushed commit:** `path-b-p0-estimator-contract` / `7241a969`
 - **Verification last run:** none
-- **Known blockers or open decisions:** none recorded
-- **Next action:** author and ratify the P0 estimator/plan-choice contract before implementation
+- **Known blockers or open decisions:** the six P0 human decisions recorded above
+- **Next action:** record maintainer answers, then author and ratify the canonical P0 contract
