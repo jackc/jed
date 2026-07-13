@@ -6,12 +6,11 @@
 > document specifies the algorithms every core will implement independently.
 >
 > **Status: P0 contract ratified; P1 row counts, P2 cache validity, P3 complete candidate
-> inventory, P4 shadow base-relation estimates, and P5 whole-plan propagation + EXPLAIN columns
-> landed.** The current planner still uses
-> the legacy fixed selector in
-> [planner.md](planner.md). P4–P8 in
+> inventory, P4 base-relation estimates, and P5 whole-plan propagation + EXPLAIN columns
+> landed.** P6a applies those estimates to the first staged access-path set described in §9.1;
+> later access methods and joins retain the explicit legacy boundaries there. P6b–P8 in
 > [../../TODO-cost-plan-input.md](../../TODO-cost-plan-input.md) implement this contract as vertical
-> slices. Until the selector slice lands, no plan, actual cost, or EXPLAIN row changes.
+> slices.
 
 ## 1. Decision and scope
 
@@ -437,6 +436,37 @@ join:   index nested loop < hash < nested loop
 
 A future access method or join algorithm is ineligible for cost selection until this data and the
 candidate's final field order are extended, verified, and implemented in all cores.
+
+### 9.1 P6a staged selector boundary
+
+P6a enables cost choice only for a SELECT plan containing exactly one base relation and no join.
+The rule applies recursively to a qualifying single-relation subquery, but not to SRF, CTE, or
+derived-table relation nodes, which have no base-store candidate inventory. A multi-relation SELECT
+retains its complete legacy per-relation choices until P7 can price access paths together with join
+orientation and algorithm; independently replacing one join input from a base-only estimate would
+not minimize the whole join plan.
+
+The staged candidate rule is deterministic:
+
+1. build and estimate the complete P3 inventory;
+2. compute the legacy SELECT winner;
+3. if that winner is GiST, GIN, a PK interval set, or an ordered-index interval set, retain it
+   unchanged until P6b; otherwise
+4. compare every legal PK, ordered B-tree, and full-scan candidate by `est_cost`, then apply §9's
+   access-kind and lowercased-index-name order on an exact cost tie.
+
+This boundary permits PK/B-tree/full competition even when a deferred access method is present but
+would not have won the legacy precedence. It never silently promotes a P6b method. UPDATE and DELETE
+continue to call the mutation legacy policy from §1/§8.4.
+
+P6a compares the P4 base-candidate estimate: access pages/work, admitted table rows, and the complete
+WHERE residual work. Logical output rows and any candidate-independent final production work are the
+same for every competitor and do not break ties. The selected candidate's explicit scan-order
+capability is then authoritative for the already-landed ORDER BY rules: table-storage-order paths
+(full, PK, PK interval, normalized GiST/GIN) may satisfy a PK order, while an ordered B-tree path may
+satisfy only that same named index order. An incompatible selected path keeps the blocking sort.
+P6a neither invents a sort weight nor adds a new order-only access candidate; P6b integrates the
+secondary-index ORDER BY/top-N alternatives and their LIMIT-aware cumulative estimates.
 
 ## 10. Join search and its deterministic bound
 

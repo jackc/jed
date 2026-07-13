@@ -443,7 +443,10 @@ only yesterday's optimizations is false confidence (CLAUDE.md §10 "no silent ca
   OR / IN-list of key equalities (`pk IN (a,b,c)`, `pk = a OR pk = b`, and the secondary-index form)
   lowers to a **union of point probes** ([cost.md §3](cost.md) "OR / IN-list"), defeated by
   `pk + 0 IN (…)`, checked with a NULL list element / an absent key / across a PK-IN-list
-  UPDATE/DELETE (the point-set DML path); **interval_set** and **bounded_limit** — canonical disjoint
+  UPDATE/DELETE (the point-set DML path); **cost_plan** — P6a's competing ordered-B-tree choice,
+  where a higher-named equality index beats a lower-named inequality index by estimate and wrapping
+  both operands in `+ 0` supplies the equivalent full-scan reference; **interval_set** and
+  **bounded_limit** — canonical disjoint
   key intervals and their bounded LIMIT windows match `+ 0` full-scan spellings across PK, ordered
   secondary-index, and GIN cases; **window** —
   the window frame **sliding-window optimization** ([window.md §5.2](window.md)): an explicit

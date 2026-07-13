@@ -507,8 +507,7 @@ max = 100000
 # [32,96], both endpoints bind-param const-sources) range-scans orders_customer_idx over ~640 rows
 # instead of full-scanning the 1M-row table. Before this feature a secondary-index range full-scanned;
 # now it seeks the index leaves for the range + point-looks-up each row. The int_window param keeps
-# the width small so the range is genuinely selective (a wide secondary-index range would pessimize
-# into a point-lookup storm — jed applies the bound structurally, no cost-based choice yet). All
+# the width small so the range is genuinely selective; P6a's estimator retains this index path. All
 # engines; the cross-engine checksum is plan-independent.
 [[bench]]
 name = "index_range"
@@ -530,6 +529,26 @@ gen = "int_window"
 base = 0
 off_min = 32
 off_max = 96
+
+# P6a nonselective-index rejection. The indexed one-sided predicate admits effectively the whole
+# uniform customer_id domain for parameters 1..100. A secondary-index walk would add one table-tree
+# point lookup per admitted row, so the deterministic estimate chooses the full table scan instead.
+# COUNT keeps the benchmark output small while exercising the selected scan over all qualifying rows.
+[[bench]]
+name = "index_range_nonselective"
+description = "Nonselective secondary-index range over 1M rows; P6a rejects the point-lookup storm for a full scan"
+dataset = "large"
+kind = "query"
+sql = "SELECT count(*) FROM orders WHERE customer_id >= $1"
+warmup = 3
+iterations = 20
+seed = 4261
+expect_rows_per_iter = 1
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 100
 
 [[bench]]
 name = "full_scan_agg"

@@ -85,13 +85,13 @@ func TestScanCandidateInventoryIsCompleteCanonicalAndLegacyNeutral(t *testing.T)
 	}
 	estimates := db.estimateScanCandidates(candidates, rel, true)
 	if len(estimates) != len(candidates) {
-		t.Fatalf("shadow estimates = %d, candidates = %d", len(estimates), len(candidates))
+		t.Fatalf("candidate estimates = %d, candidates = %d", len(estimates), len(candidates))
 	}
 	logicalRows := estimates[0].rows
 	for i, estimate := range estimates {
 		wantTie := candidateTieKey(estimatorAccessPathOrder[int(candidates[i].identity.kind)], candidates[i].identity.indexName)
 		if estimate.tieKey != wantTie || estimate.rows != logicalRows || estimate.cost < 0 {
-			t.Fatalf("%s shadow estimate = %+v, logical rows %d tie %q", got[i], estimate, logicalRows, wantTie)
+			t.Fatalf("%s candidate estimate = %+v, logical rows %d tie %q", got[i], estimate, logicalRows, wantTie)
 		}
 	}
 	for _, check := range []struct {

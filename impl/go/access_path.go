@@ -630,8 +630,50 @@ func selectLegacyScanCandidate(candidates []scanCandidate, policy scanBoundPolic
 	return nil
 }
 
-// detectScanBoundWithPolicy is the compatibility entry point used by SELECT and UPDATE/DELETE.
-// P6 replaces only this selector for eligible SELECT relations; the complete inventory stays.
+// selectCostedP6aScanCandidate enables the first Path-B choice without pulling later access
+// methods forward. If the legacy winner is a GiST/GIN/interval candidate, that winner remains
+// authoritative until P6b. Otherwise PK, ordered B-tree, and full candidates compete by estimated
+// cost; candidates are already in the canonical P0 tie order, so retaining the first exact-cost
+// winner applies the kind/name tie-break without host iteration.
+func selectCostedP6aScanCandidate(candidates []scanCandidate, estimates []candidateEstimate, legacy *scanBound) *scanBound {
+	if len(candidates) == 0 || len(candidates) != len(estimates) {
+		return legacy
+	}
+	legacyKind := scanCandidateFull
+	for i := range candidates {
+		if candidates[i].bound == legacy {
+			legacyKind = candidates[i].identity.kind
+			break
+		}
+	}
+	if legacyKind != scanCandidatePK && legacyKind != scanCandidateBtree && legacyKind != scanCandidateFull {
+		return legacy
+	}
+	winner := -1
+	for i := range candidates {
+		kind := candidates[i].identity.kind
+		if kind != scanCandidatePK && kind != scanCandidateBtree && kind != scanCandidateFull {
+			continue
+		}
+		if winner == -1 || estimates[i].cost < estimates[winner].cost {
+			winner = i
+		}
+	}
+	if winner == -1 {
+		return legacy
+	}
+	return candidates[winner].bound
+}
+
+// scanBoundHasStorageOrder reports the scan-order capability used by ORDER BY/scan composition.
+// Full, PK, PK-interval, and normalized GIN/GiST candidates emit table storage-key order. Ordered
+// B-tree candidates and index interval sets emit their named index order instead.
+func scanBoundHasStorageOrder(bound *scanBound) bool {
+	return bound == nil || bound.pk != nil || bound.pkSet != nil || bound.gin != nil || bound.gist != nil
+}
+
+// detectScanBoundWithPolicy is the compatibility entry point used by legacy SELECT boundaries and
+// UPDATE/DELETE. P6a calls the costed wrapper directly for eligible SELECT relations.
 func detectScanBoundWithPolicy(filter *rExpr, rel scopeRel, db *engine, policy scanBoundPolicy) *scanBound {
 	return selectLegacyScanCandidate(inventoryScanCandidates(filter, rel, db), policy)
 }

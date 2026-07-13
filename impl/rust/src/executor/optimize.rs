@@ -118,7 +118,7 @@ impl Engine {
                 continue;
             }
             let candidates = inventory_scan_candidates(plan.filter.as_ref(), rel, scope.catalog);
-            plan.phys.rel_estimates.push(estimate_scan_candidates(
+            let estimates = estimate_scan_candidates(
                 &candidates,
                 rel,
                 scope.catalog,
@@ -128,11 +128,14 @@ impl Engine {
                     && plan.limit.is_none()
                     && plan.offset.is_none()
                     && !plan.has_window,
-            ));
-            plan.phys.rel_bounds.push(select_legacy_scan_candidate(
-                candidates,
-                SELECT_SCAN_BOUND_POLICY,
-            ));
+            );
+            let bound = if plan.rels.len() == 1 {
+                select_costed_p6a_scan_candidate(candidates, &estimates, SELECT_SCAN_BOUND_POLICY)
+            } else {
+                select_legacy_scan_candidate(candidates, SELECT_SCAN_BOUND_POLICY)
+            };
+            plan.phys.rel_estimates.push(estimates);
+            plan.phys.rel_bounds.push(bound);
         }
     }
 
@@ -190,6 +193,7 @@ impl Engine {
             && plan.rels[0].srf.is_none()
             && plan.rels[0].cte.is_none()
             && plan.rels[0].derived.is_none()
+            && scan_bound_has_storage_order(plan.phys.rel_bounds[0].as_ref())
         {
             order_satisfied_by_pk(scope.rels[0].table, plan.rels[0].offset, &plan.order, self)
         } else {

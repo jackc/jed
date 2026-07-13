@@ -1,7 +1,7 @@
 # The planner: explicit optimizer-pass structure — design
 
 > How a SELECT becomes an executable plan, and where each optimization lives. The planner
-> is a **deterministic rule engine** (no statistics-based choice or cost-based choice yet): it resolves
+> is a **deterministic rule engine** whose first cost-based access choice has landed: it resolves
 > the query into a **logical plan**, applies **rewrite rules** (none exist yet — §3), and
 > then runs **physical/access-path selection** — a fixed, ordered list of discrete rules,
 > each a single function owning its gate and its action. This doc is the contract all three
@@ -96,7 +96,7 @@ then takes the unoptimized path (full scan, eager sort), which is always correct
 
 | # | rule | gate (summary) | sets | cost contract |
 |---|---|---|---|---|
-| 1 | **scan bounds** | per base relation (not SRF/derived): a WHERE conjunct bounds the relation's key per the §5 precedence | `relBounds[i]` | cost.md §3 "bounded scan", "index-bounded scan", "GIN-bounded scan", "GiST-bounded scan", "canonical interval sets" |
+| 1 | **scan bounds** | per base relation (not SRF/derived): inventory and estimate every legal path; a one-base-relation SELECT cost-selects P6a's PK/B-tree/full set, while §5.1's explicit staged legacy boundaries remain | `relBounds[i]` | cost.md §3 "bounded scan", "index-bounded scan", "GIN-bounded scan", "GiST-bounded scan", "canonical interval sets" |
 | 2 | **index-nested-loop** | a join inner base relation (INNER/CROSS/LEFT right side, not lateral/CTE) with a PK / leading B-tree comparison or GIN/GiST query operand from a bare **earlier sibling** column in ON or WHERE | `relINLBounds[i]` | cost.md §3 "JOIN" (per-outer-row seek/gather) |
 | 3 | **hash join** | exactly two non-lateral inputs; INNER/LEFT ON contains one or more same-type, key-encodable bare-column equalities across the inputs; no inner INL; every remaining ON conjunct is a non-trapping leaf equality/inequality | `hashJoin` | cost.md §3 "hash JOIN" (`hash_build`/`hash_probe`; ON only for bucket candidates) |
 | 4 | **ORDER BY via PK scan order** | single base relation, non-aggregate, column-only keys: the ORDER BY is a one-direction PK prefix (ASC) or the full PK (DESC ⇒ reverse scan), collation-matching the stored key | `pkOrdered`, `pkReverse` | cost.md §3 "ORDER BY satisfied by primary-key order" (sort elided; with LIMIT, a top-N) |
@@ -127,12 +127,11 @@ scan's access-path detail, rule 2 as the `Index-nested-loop` prefix, rule 3 as `
 and rule 7 as `Sort keys=N, top-k=K`, which makes each rule corpus-assertable without touching
 internals.
 
-## 5. Access-path precedence (rule 1's internal order)
+## 5. Access-path inventory and staged selection (rule 1)
 
-For each base relation, the access-path machinery inventories every legal candidate, then the
-legacy selector picks the **first** bound kind that applies — a fixed precedence, not a costed
-choice ([indexes.md §5](indexes.md) is the authoritative selection + execution spec; cost-based
-selection is a later concern, §7):
+For each base relation, the access-path machinery inventories every legal candidate. P6a cost-selects
+the first staged set for eligible one-base-relation SELECTs (§5.2); every deferred shape still uses
+the legacy selector, whose fixed precedence is:
 
 1. **PK tuple bound** (maximal equality prefix plus optional next-member range) — the row's own key;
    no second tree.
@@ -192,10 +191,25 @@ The legacy selector preserves two details exactly: a same-key interval set with 
 range replaces the broader contiguous PK/B-tree bound, and UPDATE/DELETE try GIN before GiST while
 SELECT tries GiST before GIN. Within every index-bearing kind, the lowest lowercased name wins.
 P3 changes no physical plan field, executor dispatch, EXPLAIN spelling, or actual metered cost.
-P4 inventories once per base relation and attaches one shadow estimate per candidate: logical output
-rows, access scan rows expressed through scheduled unit counts, weighted cost, and the canonical tie
-key. The legacy selector does not read those annotations, so this remains plan-, EXPLAIN-, and
-actual-cost-neutral until P6.
+P4 inventories once per base relation and attaches one estimate per candidate: logical output rows,
+access scan rows expressed through scheduled unit counts, weighted cost, and the canonical tie key.
+P6a now consumes that vector only within §5.2's staged set; the remaining consumers retain explicit
+legacy policies rather than accidentally inheriting a partial cost selector.
+
+### 5.2 P6a SELECT policy
+
+For a SELECT with exactly one base relation and no join, rule 1 computes the complete inventory and
+P4 estimate vector once. If the legacy winner belongs to P6b (GiST, GIN, or either interval-set
+kind), it remains selected. Otherwise PK, every ordered B-tree bound, and full scan compete by
+minimum estimated cost, with the inventory's kind/name order breaking exact ties. Multi-relation
+SELECTs retain legacy per-relation selection until P7, and UPDATE/DELETE retain §5.1's mutation
+policy until their dedicated slice.
+
+Rules 4 and 5 consume the selected candidate's explicit scan-order property. A PK ORDER BY is
+elided only for a table-storage-order candidate; a B-tree candidate can elide only the exact same
+index order under rule 5's existing gate. The chosen bound always retains the complete WHERE as its
+residual. P6b is responsible for adding order-only index alternatives to the cost competition and
+for LIMIT-aware pricing across those pipelines.
 
 Access-path execution has a common key-preserving result: deterministic `(storage key, row)`
 candidates plus the exact up-front `page_read` / `value_decompress` / access-method work block.
@@ -233,10 +247,11 @@ elides its sort only when the source emits the requested PK order or walks the e
 
 - **Predicate pushdown + simplification** (TODO.md) — the first stage-2 rewrite rules,
   under the §3 contract.
-- **Plan-time cost estimator** ([estimator.md](estimator.md)) — a stage-3 *annotation* pass:
+- **Plan-time cost estimator** ([estimator.md](estimator.md)) — a stage-3 annotation and selection pass:
   estimate the same units the runtime meter charges for each candidate using the ratified exact,
   cross-core-identical contract. Whole-plan estimates now feed EXPLAIN's `est_rows`/`est_cost`
-  columns; the next slices make candidate selection consume them ([explain.md](explain.md) §2).
+  columns. P6a consumes base estimates for one-relation PK/B-tree/full selection; later slices add
+  the remaining methods and join search ([explain.md](explain.md) §2).
 - **Cost-based access-path + join-order selection** (TODO.md) — replaces §5's fixed
   precedence and the FROM-order join tree *inside* stage 3, once the estimator + table
   statistics exist; each enabling slice re-pins affected `# cost:` entries and proves the

@@ -962,16 +962,20 @@ of executing a query** and **abort when a caller-supplied ceiling is exceeded**.
   database/attachment identity, catalog generation, table name, and transactional estimator revision,
   so a hit cannot preserve a plan selected from stale estimator inputs.
   P3 now inventories every legal base-relation access path in the canonical kind/name order, with
-  explicit scan-order and residual-filter facts, then applies a separate legacy selector so plans,
-  EXPLAIN, and actual cost remain unchanged until cost-based selection lands.
-  P4 now computes shadow `rows`, per-runtime-unit counts, weighted `cost`, and canonical tie keys for
+  explicit scan-order and residual-filter facts, then applies a separate legacy selector at the
+  staged boundaries that have not yet moved to cost selection.
+  P4 computes `rows`, per-runtime-unit counts, weighted `cost`, and canonical tie keys for
   every base candidate from exact row counts and resident tree facts. Logical output selectivity is
   applied once against the base relation; GIN/GiST residual rechecks add work without reducing rows a
-  second time. The annotations remain unobservable and the legacy selector is still authoritative.
+  second time.
   P5 now propagates the selected plan through every rendered query/DML node and exposes cumulative
   non-NULL `i64` `est_rows`/`est_cost` columns in EXPLAIN. ANALYZE keeps actual root cost/rows in its
   detail, CTE attribution follows execution semantics, and streaming LIMIT prefixes affect estimates.
-  Estimates remain annotations: P6 is the first slice that lets them choose an access path.
+  P6a is the first cost-selected slice: a SELECT with exactly one base relation chooses the minimum
+  estimated-cost PK, ordered-B-tree, or full-scan candidate, using the canonical total tie order and
+  then recomputing whether the selected path supplies storage order. Multi-relation SELECTs,
+  UPDATE/DELETE, and a legacy winner from the deferred GIN/GiST/interval families keep their explicit
+  fixed policies until P6b/P7 or a mutation-specific slice.
 - **Ceiling + abort.** A caller may set a **maximum cost**; the instant accrued cost reaches
   it, execution **aborts deterministically** with a defined error code (registered in
   `spec/errors/`). The abort point is itself deterministic (same query + db + ceiling → same

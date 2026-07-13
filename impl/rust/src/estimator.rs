@@ -1,4 +1,4 @@
-//! Deterministic Path-B estimator arithmetic shared by planner shadow estimates and fixtures.
+//! Deterministic Path-B estimator arithmetic shared by planner candidate estimates and fixtures.
 
 use crate::estimator_constants::*;
 

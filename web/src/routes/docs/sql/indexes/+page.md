@@ -84,8 +84,10 @@ ORDER BY id;`;
 
 An index speeds up a lookup **without changing the answer**. A query returns the same rows whether
 or not an index exists — the index only changes *which rows are scanned* (and the deterministic
-[cost](../select/) shown with each result). jed uses an applicable index automatically, and
-keeps every index up to date on each `INSERT`, `UPDATE`, and `DELETE`.
+[cost](../select/) shown with each result). For a one-table `SELECT`, jed estimates the scheduled
+work of full, primary-key, and every applicable ordered B-tree path and picks the cheapest; an exact
+tie prefers PK, then the lower-named B-tree, then full scan. Every index stays up to date on each
+`INSERT`, `UPDATE`, and `DELETE` whether or not a particular query selects it.
 
 ## Ordered indexes (the default)
 
@@ -101,8 +103,9 @@ its canonical span, so `INTERVAL '1 mon'` and `INTERVAL '30 days'` index as one 
 discrete `range` is stored canonical, so `'[1,4]'::int4range` and `'[1,5)'::int4range` index as one.
 
 The `city` table below indexes its `region` code (`1` = Asia, `2` = Europe). Run the lookup, then
-edit the `WHERE` to `region = 2` — the index narrows the scan to the matching rows, and the result
-is the same set you'd get without it:
+edit the `WHERE` to `region = 2` — the selective equality chooses the index and narrows the scan to
+the matching rows. A broad range may deliberately choose the full scan instead, avoiding an index
+walk followed by a table point lookup for nearly every row. Either way the result is the same:
 
 <LiveSql seed={orderedSeed} query={orderedQuery} rows={6} />
 

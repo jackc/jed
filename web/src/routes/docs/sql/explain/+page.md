@@ -52,8 +52,11 @@ columns:
   units as execution.
 
 The plan is a **deterministic** function of the query and the database, so every jed core renders
-the identical plan and estimates. Estimates are planner heuristics, not a resource limit or a
-promise to equal execution; runtime cost ceilings always use the actual meter.
+the identical plan and estimates. For a one-table query, jed compares the estimated scheduled work
+of the full scan, primary-key bound, and every usable ordered B-tree bound; exact ties prefer PK,
+then the lower-named B-tree, then full scan. Estimates are planner heuristics, not a resource limit
+or a promise to equal execution; runtime cost ceilings always use the actual meter. GIN, GiST,
+interval sets, joins, and mutation target scans retain their documented fixed policies for now.
 
 ## A blocking sort and bounded top-k
 
@@ -76,17 +79,19 @@ on the next member; a predicate on only a non-leading member remains a full scan
 
 ## A secondary-index bound
 
-A predicate on an indexed non-key column uses the index — `Index bound: using <index>`. An
-**equality** (`region = 1`) seeks the matching entries:
+An applicable predicate on an indexed non-key column contributes an index candidate. When its
+estimate wins, EXPLAIN shows `Index bound: using <index>`. An **equality** (`region = 1`) is normally
+selective enough to seek the matching entries:
 
 <LiveSql seed={seed} query={indexBound} rows={8} />
 
-A **range** on an indexed column (`region > 1`, `<`, `<=`, `>=`, `BETWEEN`) is bounded the same way —
-jed range-scans the index leaves instead of the whole table:
+A **range** on an indexed column (`region > 1`, `<`, `<=`, `>=`, `BETWEEN`) is also a candidate, but
+a broad secondary-index range can cost more than reading the table once because every admitted index
+entry needs a table point fetch. This tiny-table example therefore chooses the full scan:
 
 <LiveSql seed={seed} query={indexRange} rows={8} />
 
-On a **composite** index over `(a, b, …)` the bound extends to a **multi-column prefix**: an equality
+On a **composite** index over `(a, b, …)` the candidate bound extends to a **multi-column prefix**: an equality
 on the leading columns, optionally followed by a range on the next (`a = 1 AND b > 3`). The `WHERE`
 always stays the residual filter, so the rows are identical to a full scan — only the work drops.
 The same `Index bound` detail appears below an `Update` or `Delete` root when a write's target scan

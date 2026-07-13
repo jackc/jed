@@ -210,22 +210,29 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   access-row estimates, runtime-unit vectors, weighted costs, and total tie keys for every base
   candidate. Exact row counts and resident tree height/node count are admitted without leaf I/O;
   logical output selectivity is applied once from the full WHERE, while access-specific scan rows
-  and residual work remain separate. Estimates are planner annotations only and the legacy selector
-  still runs. → [estimator.md §7](spec/design/estimator.md),
+  and residual work remain separate. P6a now consumes the eligible subset; deferred access methods
+  and plan shapes retain their staged legacy policies. → [estimator.md §7](spec/design/estimator.md),
   [estimator vectors](spec/cost/estimator_vectors.toml)
 - [x] **P5 — whole-plan estimator + EXPLAIN estimates** — propagate the selected plan's exact-rational
   cardinality and runtime-unit estimate through filters/projections, every join algorithm, grouping,
   windows, distinct/sort/limit, SRFs, CTEs, derived/VALUES/set-op/from-less queries, and currently
   rendered DML nodes. EXPLAIN exposes non-NULL cumulative `i64` `est_rows`/`est_cost`; ANALYZE keeps
-  actual root figures separate. The legacy selector remains authoritative until P6. →
+  actual root figures separate. →
   [estimator.md §8](spec/design/estimator.md), [explain.md §2](spec/design/explain.md)
+- [x] **P6a — costed PK / ordered-B-tree / full selection** — a SELECT with exactly one base
+  relation now chooses the minimum estimated-cost eligible base path under the canonical exact tie
+  order. The selected path's real storage-order capability feeds the existing ORDER BY rules. Shared
+  EXPLAIN/cost cases pin row-count flips and competing-index ties; NoREC covers the optimization.
+  UPDATE/DELETE, multi-relation SELECTs, and legacy winners from the deferred GIN/GiST/interval
+  families retain their explicit policies until the corresponding later slice. →
+  [estimator.md §9.1](spec/design/estimator.md), [planner.md §5.2](spec/design/planner.md)
 - [ ] **Column statistics** — the initial transactional per-table row count landed in P1. Add
   per-column distinct-value counts / histograms later, computed by a spec'd pass over deterministic
   data so they stay cross-core-identical. _(size: L histograms)_
-- [ ] **Cost-based access-path + join-order selection** — with the estimator + row counts, choose the
-  cheapest bound per relation and **reorder the left-deep join** (drive the smaller / more-selective
-  relation, enable index-nested-loop) rather than honoring FROM order. Re-pins the affected `# cost:`
-  corpus entries (the observable-cost consequence above). _(size: L; ×3 cores; +NoREC)_
+- [ ] **Complete cost-based access-path + join-order selection** — add GIN, GiST, interval-set, and
+  order-only alternatives, then **reorder the left-deep join** (drive the smaller / more-selective
+  relation, enable index-nested-loop) rather than honoring FROM order. Re-pin each affected
+  `# cost:` corpus entry as the observable plan changes land. _(P6b–P8; size: L; ×3 cores; +NoREC)_
 
 ### Planner infrastructure
 

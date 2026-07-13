@@ -31,6 +31,9 @@
 #              lookups (spec/design/indexes.md §5); `v + 0 = K` is a `BinaryOp`, so the detector
 #              (bare column only) does NOT use the index and it full-scans. Both must return
 #              identical rows — including across UPDATE/DELETE maintenance and a NULL value (3VL).
+#   cost_plan — competing usable B-tree predicates give the lower-name range candidate a higher
+#              estimate than the higher-name equality candidate; wrapping both columns in `+ 0`
+#              defeats both bounds. P6a's cost-selected result and the full scan must agree.
 #   index_mut — UPDATE/DELETE target scans use a bare indexed equality/range or secondary-index
 #              IN-list; the equivalent `v + 0` predicates defeat the mutation bound. Applied to
 #              identically-seeded tables, both paths must reach the same by-construction end state,
@@ -165,6 +168,10 @@ INDEX_RANGE_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index dml.in
                      dml.insert_multi_row query.select query.comparison_order query.order_by
                      query.index_range expr.arithmetic expr.comparison_value types.i32
                      null.three_valued].freeze
+COST_PLAN_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index dml.insert
+                   dml.insert_multi_row query.select query.where_eq query.comparison_order query.logical_connectives
+                   query.order_by query.index_range expr.arithmetic expr.comparison_value
+                   types.i32].freeze
 INDEX_MUT_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index dml.insert
                    dml.insert_multi_row dml.update dml.delete query.select query.where_eq
                    query.comparison_order query.order_by query.or_in_point_lookup
@@ -680,6 +687,33 @@ def gen_index(seed)
   stmt(out, "DELETE FROM t WHERE id = #{victim}")
   ipair.call("v = #{present} after DELETE removed id #{victim}", present,
              flat.call(with_v.call(present)))
+
+  out.join("\n") + "\n"
+end
+
+# --- scenario: P6a cost-selected competing B-tree paths ---------------------------------------
+# Both indexes are structurally usable. The lower-named `a_range` has a one-sided inequality
+# estimate while `z_eq` has an equality estimate, so P6a must choose z_eq once the table has this
+# nontrivial row count. Wrapping both columns in +0 defeats both access predicates and full-scans.
+def gen_cost_plan(seed)
+  rng = Random.new(seed)
+  rows = (1..12).map { |id| [id, rng.rand(0..20), rng.rand(0..3)] }
+  lo = rng.rand(0..10)
+  target = rows.map { |_id, _a, b| b }.sample(random: rng)
+  expected = rows.select { |_id, a, b| a > lo && b == target }
+                 .sort_by(&:first)
+                 .map { |id, _a, _b| id.to_s }
+
+  out = header(seed, COST_PLAN_REQ, "P6a cost-selected competing B-tree paths")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32)")
+  stmt(out, "CREATE INDEX a_range ON t (a)")
+  stmt(out, "CREATE INDEX z_eq ON t (b)")
+  stmt(out, "INSERT INTO t VALUES #{rows.map { |id, a, b| "(#{id}, #{a}, #{b})" }.join(', ')}")
+
+  out << "# equality estimate on z_eq beats the lower-named a_range inequality"
+  q(out, "I", "SELECT id FROM t WHERE a > #{lo} AND b = #{target} ORDER BY id", expected)
+  out << "# +0 defeats both access predicates and full-scans — MUST match"
+  q(out, "I", "SELECT id FROM t WHERE a + 0 > #{lo} AND b + 0 = #{target} ORDER BY id", expected)
 
   out.join("\n") + "\n"
 end
@@ -2108,6 +2142,7 @@ SCENARIOS = {
   "correlated" => method(:gen_correlated),
   "index_nested_loop" => method(:gen_index_nested_loop),
   "index" => method(:gen_index),
+  "cost_plan" => method(:gen_cost_plan),
   "index_mut" => method(:gen_index_mutation),
   "index_expr" => method(:gen_index_expr),
   "index_range" => method(:gen_index_range),

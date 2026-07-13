@@ -1,5 +1,5 @@
-//! P5 whole-plan estimate propagation. The traversal mirrors `explain_exec`'s pre-order renderer;
-//! estimates observe the legacy physical plan and never participate in plan selection.
+//! P5 whole-plan estimate propagation. The traversal mirrors `explain_exec`'s pre-order renderer
+//! and observes the physical plan after P6a's staged base-access selection.
 
 use super::*;
 use crate::estimator::{EstimatedPlan, PlanEstimate, estimate_rows, sat_add, sat_mul, scale_ceil};

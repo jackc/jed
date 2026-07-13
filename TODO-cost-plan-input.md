@@ -264,19 +264,31 @@ cases pass in all three cores; full CI verification is recorded with the landing
 
 ### P6a — PK, full scan, and ordered B-tree
 
-- [ ] Replace the legacy selector for eligible SELECT base relations with minimum estimated cost.
-- [ ] Apply the canonical P0 tie-break after estimated cost.
-- [ ] Consider access path and required ordering together wherever current ORDER BY/index rules
+- [x] Replace the legacy selector for eligible SELECT base relations with minimum estimated cost.
+- [x] Apply the canonical P0 tie-break after estimated cost.
+- [x] Consider access path and required ordering together wherever current ORDER BY/index rules
   interact with the chosen bound.
-- [ ] Preserve the full WHERE as the residual filter for every candidate.
-- [ ] Decide whether UPDATE/DELETE remain on legacy policies for this milestone; document and test
+- [x] Preserve the full WHERE as the residual filter for every candidate.
+- [x] Decide whether UPDATE/DELETE remain on legacy policies for this milestone; document and test
   the boundary.
-- [ ] Add EXPLAIN cases where row-count changes flip full/PK/index choices.
-- [ ] Add competing-index cases proving name order loses when cost differs and wins only on an exact
+- [x] Add EXPLAIN cases where row-count changes flip full/PK/index choices.
+- [x] Add competing-index cases proving name order loses when cost differs and wins only on an exact
   tie.
-- [ ] Re-pin every affected `# cost:` entry.
-- [ ] Add a new NoREC scenario for cost-selected competing access paths.
-- [ ] Benchmark point, range, selective-index, and nonselective-index cases before/after.
+- [x] Re-pin every affected `# cost:` entry.
+- [x] Add a new NoREC scenario for cost-selected competing access paths.
+- [x] Benchmark point, range, selective-index, and nonselective-index cases before/after.
+
+**Status:** implemented on 2026-07-13. A SELECT with exactly one base relation cost-selects the
+minimum PK, ordered-B-tree, or full candidate. Exact ties retain canonical kind/name inventory order;
+the selected path's storage-order capability feeds the existing ORDER BY rules. Multi-relation
+SELECTs, UPDATE/DELETE, and a legacy winner from the deferred GIN/GiST/interval families retain their
+fixed policies. Shared EXPLAIN/cost cases pin row-count flips, competing-index ties, residual filters,
+ordering composition, and the DML boundary; the `cost_plan` NoREC relation covers a lower-name range
+candidate losing to a higher-name equality candidate. Native Rust/Go/TypeScript before/after runs
+cover `point_lookup_pk`, `secondary_lookup`, `index_range`, and `index_range_nonselective` on the
+same format-28 dataset; checksums match and the timing deltas are within -1.6% to +4.7%.
+`bundle exec rake ci`, the explicit all-core memory/disk conformance pass, spec verification,
+formatting, and the website production build pass.
 
 ### P6b — GIN, GiST, interval sets, and ordering paths
 
@@ -389,16 +401,20 @@ byte-identical, deterministic, cache-safe, and demonstrably improve plan selecti
 
 Update this short block at the end of each work session.
 
-- **Current slice:** P5 complete; P6 cost-based single-relation selection is next and has not started
-- **Last completed checkpoint:** whole-plan estimates and five-column EXPLAIN landed in all three
-  cores, with the expanded shared corpus and canonical specs/docs synchronized
+- **Current slice:** P6a complete; P6b deferred-access-method and ordering-path selection is next
+- **Last completed checkpoint:** one-base-relation SELECTs cost-select PK, every ordered B-tree, and
+  full scan in all three cores, with exact ties, ordering composition, staged legacy boundaries,
+  shared EXPLAIN/cost coverage, and a new NoREC relation
 - **Branch / completion:** `path-b-p0-estimator-contract` / commit titled
-  `Implement P5 whole-plan EXPLAIN estimates`
-- **Verification last run:** `bundle exec rake ci`, final memory+disk conformance on all three cores,
-  `bundle exec rake fmt`, `bundle exec rake verify`, and the website production build passed on
-  2026-07-13
-- **Known blockers or open decisions:** none for P5; mutation-only hidden work deliberately retains
-  the documented zero fallback, and the legacy selector remains authoritative
-- **Next action:** begin P6a by specifying and enabling estimated-cost selection among full, PK, and
-  ordered B-tree candidates; ask the maintainer before the DML policy checkpoint or any other major
-  selection-semantic decision
+  `Implement P6a cost-based access selection`
+- **Verification last run:** `bundle exec rake ci` (including the 20-seed, 2,100-check all-core NoREC
+  sweep), an explicit final memory+disk conformance pass on all three cores, `bundle exec rake fmt`,
+  `bundle exec rake verify`, and the website production build passed on 2026-07-13; native
+  Rust/Go/TypeScript before/after benchmarks used identical regenerated format-28 data
+- **Known blockers or open decisions:** no product blocker or open P6a decision. The aggregate
+  `bench:run` wrapper could not build its optional WASI harness because `wasm32-wasip1` is not
+  installed; the affected native core harnesses were run directly instead, without provisioning a
+  toolchain target
+- **Next action:** specify P6b's whole-pipeline candidates before enabling GIN, GiST, interval sets,
+  or secondary-index ORDER BY/top-N cost selection; ask the maintainer about any major selection or
+  pricing decision

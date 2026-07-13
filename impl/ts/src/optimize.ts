@@ -19,7 +19,9 @@ import {
   needsEagerScan,
   orderSatisfiedByIndex,
   orderSatisfiedByPK,
+  scanBoundHasStorageOrder,
   SELECT_SCAN_BOUND_POLICY,
+  selectCostedP6aScanCandidate,
   selectLegacyScanCandidate,
 } from "./executor.ts";
 import type { Snapshot } from "./snapshot.ts";
@@ -159,7 +161,7 @@ function ruleScanBounds(plan: SelectPlan, rels: ScopeRel[], snap: Snapshot, eng:
       return null;
     }
     const candidates = inventoryScanCandidates(plan.filter, rel, snap, eng);
-    plan.phys.relEstimates[i] = estimateScanCandidates(
+    const estimates = estimateScanCandidates(
       candidates,
       rel,
       eng,
@@ -170,7 +172,10 @@ function ruleScanBounds(plan: SelectPlan, rels: ScopeRel[], snap: Snapshot, eng:
         plan.offset === null &&
         !plan.hasWindow,
     );
-    return selectLegacyScanCandidate(candidates, SELECT_SCAN_BOUND_POLICY);
+    plan.phys.relEstimates[i] = estimates;
+    return rels.length === 1
+      ? selectCostedP6aScanCandidate(candidates, estimates, SELECT_SCAN_BOUND_POLICY)
+      : selectLegacyScanCandidate(candidates, SELECT_SCAN_BOUND_POLICY);
   });
 }
 
@@ -214,7 +219,8 @@ function ruleOrderByPkScan(plan: SelectPlan, rels: ScopeRel[], snap: Snapshot): 
     plan.rels.length === 1 &&
     plan.rels[0]!.srf === undefined &&
     plan.rels[0]!.cte === undefined &&
-    plan.rels[0]!.derived === undefined
+    plan.rels[0]!.derived === undefined &&
+    scanBoundHasStorageOrder(plan.phys.relBounds[0])
       ? orderSatisfiedByPK(snap, rels[0]!.table, plan.rels[0]!.offset, plan.order)
       : null;
   plan.phys.pkOrdered = pkDir !== null;

@@ -1408,13 +1408,60 @@ fn candidate_index(
     })
 }
 
-fn take_candidate(
-    candidates: &mut [ScanCandidate<'_>],
-    kind: ScanCandidateKind,
-    name: Option<&str>,
-) -> Option<ScanBound> {
-    let i = candidate_index(candidates, kind, name)?;
-    candidates[i].bound.take()
+fn legacy_scan_candidate_index(
+    candidates: &[ScanCandidate<'_>],
+    policy: ScanBoundPolicy,
+) -> Option<usize> {
+    if policy.index_set {
+        if let Some(i) = candidate_index(candidates, ScanCandidateKind::PkInterval, None) {
+            if matches!(&candidates[i].bound, Some(ScanBound::PkSet(set)) if !set.clip.is_empty()) {
+                return Some(i);
+            }
+        }
+    }
+    if let Some(i) = candidate_index(candidates, ScanCandidateKind::Pk, None) {
+        return Some(i);
+    }
+    if policy.ordered_index {
+        for (i, candidate) in candidates.iter().enumerate() {
+            if candidate.identity.kind != ScanCandidateKind::Btree {
+                continue;
+            }
+            if policy.index_set {
+                if let Some(set_i) = candidate_index(
+                    candidates,
+                    ScanCandidateKind::IndexInterval,
+                    Some(&candidate.identity.index_name),
+                ) {
+                    if matches!(&candidates[set_i].bound, Some(ScanBound::IndexSet(set)) if !set.clip.is_empty())
+                    {
+                        return Some(set_i);
+                    }
+                }
+            }
+            return Some(i);
+        }
+    }
+    let (first, second) = if policy.gist_before_gin {
+        (ScanCandidateKind::Gist, ScanCandidateKind::Gin)
+    } else {
+        (ScanCandidateKind::Gin, ScanCandidateKind::Gist)
+    };
+    if let Some(i) = candidate_index(candidates, first, None) {
+        return Some(i);
+    }
+    if let Some(i) = candidate_index(candidates, second, None) {
+        return Some(i);
+    }
+    if policy.index_set {
+        if let Some(i) = candidate_index(candidates, ScanCandidateKind::PkInterval, None) {
+            return Some(i);
+        }
+        if let Some(i) = candidate_index(candidates, ScanCandidateKind::IndexInterval, None) {
+            return Some(i);
+        }
+    }
+    candidate_index(candidates, ScanCandidateKind::Full, None)
 }
 
 /// Reproduce the pre-P3 policy exactly. This order deliberately differs from the canonical cost-tie
@@ -1423,65 +1470,60 @@ pub(crate) fn select_legacy_scan_candidate(
     mut candidates: Vec<ScanCandidate<'_>>,
     policy: ScanBoundPolicy,
 ) -> Option<ScanBound> {
-    if policy.index_set {
-        if let Some(i) = candidate_index(&candidates, ScanCandidateKind::PkInterval, None) {
-            if matches!(&candidates[i].bound, Some(ScanBound::PkSet(set)) if !set.clip.is_empty()) {
-                return candidates[i].bound.take();
-            }
-        }
-    }
-    if let Some(bound) = take_candidate(&mut candidates, ScanCandidateKind::Pk, None) {
-        return Some(bound);
-    }
-    if policy.ordered_index {
-        let btree_names: Vec<String> = candidates
-            .iter()
-            .filter(|candidate| candidate.identity.kind == ScanCandidateKind::Btree)
-            .map(|candidate| candidate.identity.index_name.clone())
-            .collect();
-        for name in btree_names {
-            if policy.index_set {
-                if let Some(i) =
-                    candidate_index(&candidates, ScanCandidateKind::IndexInterval, Some(&name))
-                {
-                    if matches!(&candidates[i].bound, Some(ScanBound::IndexSet(set)) if !set.clip.is_empty())
-                    {
-                        return candidates[i].bound.take();
-                    }
-                }
-            }
-            if let Some(bound) =
-                take_candidate(&mut candidates, ScanCandidateKind::Btree, Some(&name))
-            {
-                return Some(bound);
-            }
-        }
-    }
-    let (first, second) = if policy.gist_before_gin {
-        (ScanCandidateKind::Gist, ScanCandidateKind::Gin)
-    } else {
-        (ScanCandidateKind::Gin, ScanCandidateKind::Gist)
-    };
-    if let Some(bound) = take_candidate(&mut candidates, first, None) {
-        return Some(bound);
-    }
-    if let Some(bound) = take_candidate(&mut candidates, second, None) {
-        return Some(bound);
-    }
-    if policy.index_set {
-        if let Some(bound) = take_candidate(&mut candidates, ScanCandidateKind::PkInterval, None) {
-            return Some(bound);
-        }
-        if let Some(bound) = take_candidate(&mut candidates, ScanCandidateKind::IndexInterval, None)
-        {
-            return Some(bound);
-        }
-    }
-    None
+    let winner = legacy_scan_candidate_index(&candidates, policy)?;
+    candidates[winner].bound.take()
 }
 
-/// Compatibility entry point used by SELECT and UPDATE/DELETE. P6 replaces only this selector for
-/// eligible SELECT relations; candidate inventory remains unchanged.
+/// Enable P6a's first costed choice without pulling P6b/P7 candidates forward. When the legacy
+/// winner is GiST, GIN, or an interval set it remains authoritative. Otherwise PK, ordered B-tree,
+/// and full candidates compete by estimated cost; retaining the first equal-cost entry applies the
+/// inventory's canonical kind/name tie order.
+pub(crate) fn select_costed_p6a_scan_candidate(
+    mut candidates: Vec<ScanCandidate<'_>>,
+    estimates: &[crate::estimator::CandidateEstimate],
+    policy: ScanBoundPolicy,
+) -> Option<ScanBound> {
+    if candidates.is_empty() || candidates.len() != estimates.len() {
+        return select_legacy_scan_candidate(candidates, policy);
+    }
+    let Some(legacy) = legacy_scan_candidate_index(&candidates, policy) else {
+        return None;
+    };
+    if !matches!(
+        candidates[legacy].identity.kind,
+        ScanCandidateKind::Pk | ScanCandidateKind::Btree | ScanCandidateKind::Full
+    ) {
+        return candidates[legacy].bound.take();
+    }
+    let mut winner: Option<usize> = None;
+    for (i, candidate) in candidates.iter().enumerate() {
+        if !matches!(
+            candidate.identity.kind,
+            ScanCandidateKind::Pk | ScanCandidateKind::Btree | ScanCandidateKind::Full
+        ) {
+            continue;
+        }
+        if winner.is_none_or(|prior| estimates[i].cost < estimates[prior].cost) {
+            winner = Some(i);
+        }
+    }
+    winner.and_then(|i| candidates[i].bound.take())
+}
+
+/// The scan-order property consumed by the current ORDER BY rules. Full, PK, PK-interval, and
+/// normalized GIN/GiST paths emit table storage-key order; B-tree and index-interval paths emit a
+/// named secondary-index order instead.
+pub(crate) fn scan_bound_has_storage_order(bound: Option<&ScanBound>) -> bool {
+    matches!(
+        bound,
+        None | Some(
+            ScanBound::Pk(_) | ScanBound::PkSet(_) | ScanBound::Gin(_) | ScanBound::Gist(_)
+        )
+    )
+}
+
+/// Compatibility entry point used by legacy SELECT boundaries and UPDATE/DELETE. P6a calls the
+/// costed selector directly for eligible SELECT relations; candidate inventory remains unchanged.
 pub(crate) fn detect_scan_bound_with_policy(
     filter: &RExpr,
     rel: &ScopeRel,

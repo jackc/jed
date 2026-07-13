@@ -1,7 +1,8 @@
-# P3 access-candidate inventory neutrality. EXPLAIN exposes only the legacy-selected member; the
+# P3 access-candidate inventory plus staged selector coverage. EXPLAIN exposes only the selected member; the
 # mirrored per-core white-box tests assert the complete canonical list for this same mixed relation
 # (two B-tree, two GiST, two GIN, PK/index interval sets, and full scan). These shared cases pin that
-# routing the selector through the new inventory changes no plan spelling or consumer precedence.
+# P6a exact ties preserve the original B-tree outcome while deferred and mutation policies retain
+# their explicit precedence.
 # requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.gin_index, ddl.gist_index, dml.update, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.point_lookup, query.index_range, query.or_in_point_lookup, query.interval_set, query.gin_scan, query.gist_scan, query.explain, dml.explain, types.i32, types.array, types.range, func.array_containment, func.range_constructors, func.range_operators
 
 statement ok
@@ -57,7 +58,7 @@ Index interval set: using a_btree; intervals=2; touched=3
 0
 0
 
-# Every usable B-tree is inventoried; the legacy selector retains the lowest-lowercased name.
+# Every usable B-tree is inventoried; an exact cost tie retains the lowest-lowercased name.
 query ITTII nosort
 EXPLAIN SELECT id FROM candidate_inventory WHERE a = 7 AND b = 7 AND tags @> ARRAY[1] AND span && i32range(1, 3)
 ----

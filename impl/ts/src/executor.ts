@@ -15339,8 +15339,44 @@ export function selectLegacyScanCandidate(
   return null;
 }
 
-// Compatibility entry point used by SELECT and UPDATE/DELETE. P6 replaces only this selector for
-// eligible SELECT relations; candidate inventory remains unchanged.
+// selectCostedP6aScanCandidate enables the first Path-B choice without pulling P6b/P7 access
+// methods forward. A legacy GiST/GIN/interval winner remains authoritative. Otherwise PK, ordered
+// B-tree, and full candidates compete by estimate; inventory order is the canonical exact-cost
+// kind/name tie-break.
+export function selectCostedP6aScanCandidate(
+  candidates: ScanCandidate[],
+  estimates: CandidateEstimate[],
+  policy: ScanBoundPolicy,
+): ScanBound | null {
+  const legacy = selectLegacyScanCandidate(candidates, policy);
+  if (candidates.length === 0 || candidates.length !== estimates.length) return legacy;
+  const legacyCandidate = candidates.find((candidate) => candidate.bound === legacy);
+  const legacyKind = legacyCandidate?.identity.kind ?? "full";
+  if (legacyKind !== "pk" && legacyKind !== "btree" && legacyKind !== "full") return legacy;
+  let winner = -1;
+  for (let i = 0; i < candidates.length; i++) {
+    const kind = candidates[i]!.identity.kind;
+    if (kind !== "pk" && kind !== "btree" && kind !== "full") continue;
+    if (winner === -1 || estimates[i]!.cost < estimates[winner]!.cost) winner = i;
+  }
+  return winner === -1 ? legacy : candidates[winner]!.bound;
+}
+
+// Full, PK, PK-interval, and normalized GIN/GiST paths emit table storage-key order. Ordered
+// B-tree and index-interval paths emit their named secondary-index order instead.
+export function scanBoundHasStorageOrder(bound: ScanBound | null | undefined): boolean {
+  return (
+    bound === null ||
+    bound === undefined ||
+    bound.kind === "pk" ||
+    bound.kind === "pkSet" ||
+    bound.kind === "gin" ||
+    bound.kind === "gist"
+  );
+}
+
+// Compatibility entry point used by legacy SELECT boundaries and UPDATE/DELETE. P6a calls the
+// costed selector directly for eligible SELECT relations; candidate inventory remains unchanged.
 export function detectScanBoundWithPolicy(
   filter: RExpr,
   rel: ScopeRel,
@@ -20327,7 +20363,9 @@ export type PhysicalPlan = {
   // (literal/param/outer) — a cross-relation `b.pk = a.x` is the index-nested-loop case (a
   // follow-on). The residual filter stays the WHOLE `filter`, re-applied after the join.
   relBounds: (ScanBound | null)[];
-  // P4 shadow estimates. The legacy selector remains authoritative and execution never reads these.
+  // Deterministic base candidate estimates. P6a consumes them only for eligible one-base-relation
+  // SELECT PK/B-tree/full choices; later access methods and joins retain staged legacy policies.
+  // Execution never reads these.
   relEstimates: CandidateEstimate[][];
   // relINLBounds is the INDEX-NESTED-LOOP scan bounds, one per relation (cost.md §3 "JOIN"). Non-null
   // for a join inner relation whose primary key / indexed column is compared to a SIBLING column of an

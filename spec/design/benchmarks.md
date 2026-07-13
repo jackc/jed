@@ -561,7 +561,7 @@ distributed across engines.
 
 ## 11. Backfill and the growth obligation
 
-v1 ships six benchmarks (point lookup, secondary-index lookup, full-scan aggregate,
+v1 began with six benchmarks (point lookup, secondary-index lookup, full-scan aggregate,
 ORDER BY + LIMIT, insert+rollback throughput, durable single-row commits) over two
 datasets (10k / 1M rows). Known gaps, tracked in TODO.md Phase 8:
 
@@ -579,3 +579,8 @@ datasets (10k / 1M rows). Known gaps, tracked in TODO.md Phase 8:
 **Standing obligation** (CLAUDE.md §10): a perf-relevant feature lands with a benchmark
 the same way an optimization lands with a NoREC relation; a perf-sensitive change runs
 the affected benchmarks before and after, and both numbers go in the change description.
+P6a adds `index_range_nonselective`: a one-sided predicate over the 1M-row secondary index whose
+table-fetch storm the deterministic estimator rejects in favor of a full scan. Together with
+`point_lookup_pk`, `secondary_lookup`, and `index_range`, it pins the point/range and
+selective/nonselective access-path performance matrix without making wall-clock timing part of
+conformance.

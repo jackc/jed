@@ -222,21 +222,24 @@ reads.
 rule inventory are in [planner.md](planner.md) §4/§5.)
 
 The existing per-relation pushdown seam ([cost.md §3](cost.md) "bounded scan") gains a
-second bound kind. For each **base relation of a SELECT scan** (single-table, a JOIN
-base table, or a correlated subquery's inner table), the plan picks, in order:
+second bound kind. Candidate detection remains the following complete structural inventory:
 
 1. The **PK tuple bound**, if the WHERE AND-chain supplies a maximal leading equality prefix and
    optional next-member range (the PK is the row's own key; it needs no second tree and is strictly
    cheaper).
-2. Else, an **index access-predicate bound**: among the relation's B-tree indexes, the
-   one with the **lowest lowercased name** (a deterministic choice; cost-based selection
-   is a later concern) that yields a non-empty **access predicate** — a maximal
+2. An **index access-predicate bound** for every B-tree index that yields a non-empty **access
+   predicate** — a maximal
    **equality prefix** on the index's leading key columns plus an **optional range** on
    the next key column (§5.1). Each prefix/range term is a `col <cmp> const-source`
    conjunct, `const-source` being a literal, `$N` param, or correlated outer / sibling
    column (the same rule as the PK bound, type-matched so a promoted comparison stays
    residual).
-3. Else, the full scan.
+3. The full scan.
+
+For a one-base-relation SELECT, P6a chooses the minimum estimated cost among the PK candidate, every
+ordered B-tree candidate, and full scan; exact ties use kind then lowest lowercased index name
+([estimator.md §9.1](estimator.md)). A multi-relation SELECT and UPDATE/DELETE retain the fixed
+consumer policies in [planner.md §5.1](planner.md) until P7 and the mutation-specific slice.
 
 #### 5.1 The access predicate — equality prefix + optional trailing range
 

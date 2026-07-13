@@ -51,6 +51,9 @@ The estimate columns are non-NULL shortest-decimal integers in `0..i64::MAX`. Th
 estimates, not safety limits and not a promise to equal execution. Their exact arithmetic and
 per-node attribution are specified in [estimator.md §8.3/§11](estimator.md). There is no unavailable
 sentinel: deterministic fallback rules produce an estimate for every currently renderable node.
+For a one-base-relation SELECT, P6a also uses the base candidates' `est_cost` to choose among full,
+PK, and ordered B-tree scans; `query/cost_plan_access.test` asserts row-count flips, competing-index
+cost/name ties, scan-order composition, actual cost, and the legacy mutation boundary.
 
 Two properties of the conformance harness ([../conformance/README.md](../conformance/README.md);
 `impl/*/…/conformance` render the actual cell **raw** while the expected line is `TrimSpace`d, and a
@@ -167,8 +170,8 @@ The plan structs are already cross-core identical (they drive the `# cost:` cont
 rendering is deterministic **by construction provided every emitted token is deterministic**. The
 surfaces and how each is pinned:
 
-- **Index names** — always the stored lowercased name; the planner's index choice is already a
-  deterministic lowest-name tie-break (indexes.md §5).
+- **Index names** — always the stored lowercased name; estimated cost chooses within P6a's eligible
+  set and deterministic lowest-name order breaks an exact same-kind cost tie (indexes.md §5).
 - **Iteration order** — relations, joins, aggregates, CTE bindings iterate in slice order, never a
   map.
 - **Literal rendering** — integer / boolean / decimal / text / date / timestamp / uuid render

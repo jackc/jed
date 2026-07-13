@@ -183,7 +183,12 @@ func (db *engine) ruleScanBounds(plan *selectPlan, rels []scopeRel) {
 		candidates := inventoryScanCandidates(plan.filter, rel, db)
 		producesRows := len(rels) == 1 && !plan.isAgg && !plan.distinct && plan.limit == nil && plan.offset == nil && !plan.hasWindow
 		plan.phys.relEstimates[i] = db.estimateScanCandidates(candidates, rel, producesRows)
-		plan.phys.relBounds[i] = selectLegacyScanCandidate(candidates, selectScanBoundPolicy)
+		legacy := selectLegacyScanCandidate(candidates, selectScanBoundPolicy)
+		if len(rels) == 1 {
+			plan.phys.relBounds[i] = selectCostedP6aScanCandidate(candidates, plan.phys.relEstimates[i], legacy)
+		} else {
+			plan.phys.relBounds[i] = legacy
+		}
 	}
 }
 
@@ -218,7 +223,8 @@ func (db *engine) ruleIndexNestedLoop(plan *selectPlan, rels []scopeRel) {
 // keeping first occurrence in scan order — and the sort is elided, cost.md §3 "DISTINCT".)
 func (db *engine) ruleOrderByPkScan(plan *selectPlan, rels []scopeRel) {
 	if !plan.isAgg && len(plan.order) > 0 && len(plan.orderExprs) == 0 && len(plan.rels) == 1 &&
-		plan.rels[0].srf == nil && plan.rels[0].cte == nil && plan.rels[0].derived == nil {
+		plan.rels[0].srf == nil && plan.rels[0].cte == nil && plan.rels[0].derived == nil &&
+		scanBoundHasStorageOrder(plan.phys.relBounds[0]) {
 		plan.phys.pkOrdered, plan.phys.pkReverse = db.orderSatisfiedByPK(rels[0].table, plan.rels[0].offset, plan.order)
 	}
 }

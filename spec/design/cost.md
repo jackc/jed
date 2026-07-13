@@ -81,6 +81,11 @@ uniform `operator_eval` (§3).
 These rules are the contract. They must be implemented **identically** in Rust, Go, and
 TS; any deviation diverges the count and fails the corpus.
 
+P6a now lets the estimator select among full, PK, and ordered B-tree candidates for a SELECT with
+one base relation. The accrual rules below are unchanged: they describe the actual work of whichever
+path wins. GiST/GIN/interval winners, multi-relation SELECTs, and UPDATE/DELETE retain their staged
+fixed policies until P6b/P7/a mutation-specific slice ([estimator.md §9.1](estimator.md)).
+
 - **`storage_row_read`** is charged once per row pulled from a store, at the top of the
   executor scan loop, **before** the filter runs — in `SELECT`, `DELETE`, and `UPDATE`.
   It is charged in the **executor loop, not inside the storage iterator**: the Rust store
@@ -343,7 +348,7 @@ a primary-key comparison maps to a contiguous range of storage keys, and the sca
 B-tree nodes that range can intersect. This is the engine's first index-style access path; it is a
 deliberate, cost-visible optimization, gated by the `query.point_lookup` capability.
 
-For a composite primary key `(pk1, pk2, ...)`, the same rule consumes a **maximal equality prefix**
+For a composite primary key `(pk1, pk2, ...)`, the same candidate consumes a **maximal equality prefix**
 in key order and optionally the ordering comparisons on the next member. Each equality member may
 have several conjuncts, but all runtime values must encode to the same non-NULL key; disagreement,
 NULL, or an unrepresentable value is provably empty. Equality on every member produces the exact
@@ -453,16 +458,14 @@ eligibility needed to recover row-key suffixes; variable-width leading range uni
 
 ### Index-bounded scan — a secondary index narrows a base-relation scan
 
-A **secondary index** ([indexes.md](indexes.md)) gives a second bound kind at the same
-per-relation pushdown seam. For each base relation of a **SELECT** scan (single-table, a JOIN
-base table, or a correlated subquery's inner table), and for an **UPDATE/DELETE target**, the plan
-picks the **PK tuple bound first** (it is the row's own key — no second tree, range-capable,
-strictly cheaper);
-else, among the relation's B-tree indexes, the **lowest lowercased name** one that yields a
-non-empty **access predicate** — a maximal **equality prefix** on the leading key columns
-plus an **optional range** on the next column (indexes.md §5.1; the same const-source rule as
-above — literal / `$N` / correlated outer / sibling column, type-matched); else the full
-scan. Gated by the `ddl.secondary_index` capability (a leading/trailing-column **range** by
+A **secondary index** ([indexes.md](indexes.md)) gives another bound kind at the same
+per-relation pushdown seam. Every eligible B-tree contributes an access candidate: a maximal
+**equality prefix** on the leading key columns plus an **optional range** on the next column
+(indexes.md §5.1; the same const-source rule as above — literal / `$N` / correlated outer / sibling
+column, type-matched). For a one-base-relation SELECT, P6a compares all such candidates against the
+PK and full paths by estimated scheduled cost; exact ties use PK, then lowercased index name, then
+full scan. Joins and UPDATE/DELETE retain their fixed consumer policies for now. Gated by the
+`ddl.secondary_index` capability (a leading/trailing-column **range** by
 `query.index_range`, a **multi-column equality prefix** by `query.index_prefix`), pinned
 cross-core in `spec/conformance/suites/query/index_scan.test` (and `index_range.test` /
 `index_prefix.test`).
