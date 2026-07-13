@@ -91,7 +91,7 @@ Each doc explains *why* a decision was made and points at the **data** that enco
 - [constraints.md](constraints.md) — column/table constraints: `NOT NULL`, `DEFAULT` (constant +
   expression), `CHECK`, and `UNIQUE` (a UNIQUE constraint *is* its backing unique index).
 - [indexes.md](indexes.md) — secondary indexes: the catalog reshape (pk ordinal list + per-table
-  index lists), index B-trees, the unique flag, and the planner's first-column pushdown.
+  index lists), index B-trees, the unique flag, and equality-prefix/trailing-range planner bounds.
 - [aggregates.md](aggregates.md) — `COUNT`/`SUM`/`MIN`/`MAX`/`AVG`, `GROUP BY`, and `HAVING`: PG
   widening, the grouping-error rule, NULL handling, and determinism.
 - [window.md](window.md) — window functions (`OVER`): the post-aggregation window stage, partition/
@@ -100,7 +100,8 @@ Each doc explains *why* a decision was made and points at the **data** that enco
 - [pager.md](pager.md) — the per-core buffer pool / demand paging (P6.4): a bounded page cache
   with eviction above the block seam, the `cache_bytes` budget, and logical-cost invisibility.
 - [spill.md](spill.md) — streaming + spill-to-disk operators: the `ORDER BY` external merge sort
-  bounded by `work_mem` (the hash aggregate / DISTINCT / hash join are follow-ons).
+  bounded by `work_mem`; grace-hash spill for the landed in-memory hash join, spilling hash
+  aggregate, and spilling DISTINCT are follow-ons.
 - [streaming.md](streaming.md) — the true streaming result cursor (design): making `Rows` a pull
   source — non-blocking pipeline streams lazily, blocking operators buffer-then-stream — with
   PG-faithful snapshot pinning, the cost-invariant-under-full-drain contract, and the VDBE-forward

@@ -164,7 +164,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 ## Query planner / optimizer
 
 > The planner is a **deterministic rule engine**: it pattern-matches the WHERE shape to pick an
-> access path (PK bound → first-column index equality → GiST → GIN → full scan for SELECT; mutation
+> access path (PK tuple bound → ordered B-tree → GiST → GIN → interval set → full scan for SELECT; mutation
 > retains its documented GIN/GiST order) and runs joins as
 > left-deep joins in FROM order, with structural INL/hash rules — no cost-based choice, no
 > statistics, no join reordering.

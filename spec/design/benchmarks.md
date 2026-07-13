@@ -6,8 +6,9 @@ benchmarks (`gin_contains` / `gin_overlaps` / `gin_member` / `gin_array_eq` / `g
 over a dedicated `gin` dataset (§4), the regex + window benchmarks, and the **concurrent-reader
 throughput** benchmarks (the `concurrent_read` kind, §8.1). Rule-based access-path work is pinned by
 scratch workloads including `composite_pk_lookup`, `interval_set_pk`, and
-`bounded_index_limit`, plus `join_inl_topn` for the combined join rule and `gin_inl` for the opclass
-sibling-bound rule, and the `hash_join_equijoin` / `hash_join_nested_fallback` pair. `order_by_limit`
+`bounded_index_limit`, plus `join_inl_topn` for the combined join rule, `gin_inl` and the
+`gist_inl` / `gist_inl_nested_fallback` pair for opclass sibling bounds, and the
+`hash_join_equijoin` / `hash_join_nested_fallback` pair. `order_by_limit`
 is the permanent blocking-sort top-k lane: one million fixed
 rows, K=100, cross-engine checksum equality, and the scan-dominated timing/memory payoff. This document is the
 canonical record for the `bench/` subsystem.
@@ -20,6 +21,18 @@ still visits one million rows, but only K=100 retained rows reach the final sort
 sort candidates — and the per-core spill tests prove this fixed-width K creates no run while a
 smaller `work_mem` falls back to the existing external sorter. Timings remain non-gating; checksum,
 corpus results/costs, and the no-run/fallback invariants are the correctness proof.
+
+**GiST sibling-INL result (2026-07-13).** The permanent `gist_inl` /
+`gist_inl_nested_fallback` pair joins ten scalar probes to 50,000 inner rows and returns the same
+500-row result per iteration (checksum `342dce43410acbad`). The bare equality uses jed's scalar GiST
+sibling bound; equivalent paired inequalities force the nested-loop reference. Median per-query time
+was **0.28 ms bounded vs 47.6 ms nested Go** (171×), **0.30 ms vs 53.0 ms Rust** (178×), and
+**1.09 ms vs 137 ms TypeScript** (126×). The PostgreSQL lane creates an ordinary B-tree because
+its scalar GiST opclass requires the optional `btree_gist` extension; its drivers returned the same
+checksum.
+The scratch setup begins with explicit drops, so the pair is repeatable across sequential language
+harnesses. Timings remain non-gating; the checksum, shared GiST range/scalar corpus, and NoREC
+optimized/fallback relations are the correctness proof.
 
 **Hash-join result (2026-07-13).** The permanent `hash_join_equijoin` /
 `hash_join_nested_fallback` pair joins two 2,500-row inputs into the same 12,500-row logical result

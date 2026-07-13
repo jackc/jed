@@ -36,6 +36,7 @@ seed = 4253
 expect_rows_per_iter = 1
 engines = ["jed", "postgres"]
 setup_sql = [
+  "DROP TABLE IF EXISTS composite_orders",
   "CREATE TABLE composite_orders (bucket bigint, id bigint, v bigint, PRIMARY KEY (bucket, id))",
   "INSERT INTO composite_orders SELECT (g - 1) / 1000, g, g * 2 FROM generate_series(1, 100000) AS g"
 ]
@@ -59,6 +60,7 @@ iterations = 15000
 seed = 4254
 engines = ["jed", "postgres"]
 setup_sql = [
+  "DROP TABLE IF EXISTS interval_orders",
   "CREATE TABLE interval_orders (id bigint PRIMARY KEY, v bigint)",
   "INSERT INTO interval_orders SELECT g, g * 2 FROM generate_series(1, 100000) AS g"
 ]
@@ -101,6 +103,7 @@ seed = 4255
 expect_rows_per_iter = 5
 engines = ["jed", "postgres"]
 setup_sql = [
+  "DROP TABLE IF EXISTS bounded_orders",
   "CREATE TABLE bounded_orders (id bigint PRIMARY KEY, x bigint, v bigint)",
   "INSERT INTO bounded_orders SELECT g, g, g * 2 FROM generate_series(1, 100000) AS g",
   "CREATE INDEX bounded_orders_x_idx ON bounded_orders (x)"
@@ -132,6 +135,8 @@ seed = 4256
 expect_rows_per_iter = 10
 engines = ["jed", "postgres"]
 setup_sql = [
+  "DROP TABLE IF EXISTS join_inner",
+  "DROP TABLE IF EXISTS join_outer",
   "CREATE TABLE join_outer (id bigint PRIMARY KEY, k bigint)",
   "CREATE TABLE join_inner (id bigint PRIMARY KEY, v bigint)",
   "INSERT INTO join_outer SELECT g, g FROM generate_series(1, 10000) AS g",
@@ -153,6 +158,8 @@ seed = 4257
 expect_rows_per_iter = 1
 engines = ["jed", "postgres"]
 setup_sql = [
+  "DROP TABLE IF EXISTS hash_right",
+  "DROP TABLE IF EXISTS hash_left",
   "CREATE TABLE hash_left (id bigint PRIMARY KEY, k bigint)",
   "CREATE TABLE hash_right (id bigint PRIMARY KEY, k bigint)",
   "INSERT INTO hash_left SELECT g, g % 500 FROM generate_series(1, 2500) AS g",
@@ -171,6 +178,8 @@ seed = 4258
 expect_rows_per_iter = 1
 engines = ["jed", "postgres"]
 setup_sql = [
+  "DROP TABLE IF EXISTS hash_ref_right",
+  "DROP TABLE IF EXISTS hash_ref_left",
   "CREATE TABLE hash_ref_left (id bigint PRIMARY KEY, k bigint)",
   "CREATE TABLE hash_ref_right (id bigint PRIMARY KEY, k bigint)",
   "INSERT INTO hash_ref_left SELECT g, g % 500 FROM generate_series(1, 2500) AS g",
@@ -369,6 +378,75 @@ setup_sql = [
   "DROP TABLE IF EXISTS gin_inl_outer",
   "CREATE TABLE gin_inl_outer (id bigint PRIMARY KEY, q bigint[])",
   "INSERT INTO gin_inl_outer VALUES (1, '{1}'), (2, '{2}'), (3, '{3}'), (4, '{4}'), (5, '{5}'), (6, '{6}'), (7, '{7}'), (8, '{8}'), (9, '{9}'), (10, '{10}')"
+]
+
+# GiST scalar-equality sibling INL and its results-identical, deliberately non-accelerated spelling.
+# Each of ten outer values matches fifty of the 50k inner rows. jed's `s.room = p.q` opens one GiST
+# bound per outer row; paired inequalities retain the nested-loop fallback. PostgreSQL uses its
+# built-in B-tree for the same result workload because scalar GiST requires the optional btree_gist
+# extension; the measured jed optimized/fallback pair is still the rule comparison.
+[[bench]]
+name = "gist_inl"
+description = "GiST sibling-bound join: 10 scalar-equality probes into a 50k-row table"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT p.id, s.id FROM gist_inl_outer p JOIN gist_inl_inner s ON s.room = p.q ORDER BY p.id, s.id"
+warmup = 2
+iterations = 10
+seed = 4259
+expect_rows_per_iter = 500
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS gist_inl_inner",
+  "DROP TABLE IF EXISTS gist_inl_outer",
+  "CREATE TABLE gist_inl_outer (id bigint PRIMARY KEY, q bigint)",
+  "CREATE TABLE gist_inl_inner (id bigint PRIMARY KEY, room bigint)",
+  "INSERT INTO gist_inl_outer VALUES (1, 0), (2, 1), (3, 2), (4, 3), (5, 4), (6, 5), (7, 6), (8, 7), (9, 8), (10, 9)",
+  "INSERT INTO gist_inl_inner SELECT g, g % 1000 FROM generate_series(CAST(1 AS bigint), CAST(50000 AS bigint)) AS g",
+  "CREATE INDEX gist_inl_inner_room_gist ON gist_inl_inner USING gist (room)"
+]
+
+[bench.setup_sql_override]
+postgres = [
+  "DROP TABLE IF EXISTS gist_inl_inner",
+  "DROP TABLE IF EXISTS gist_inl_outer",
+  "CREATE TABLE gist_inl_outer (id bigint PRIMARY KEY, q bigint)",
+  "CREATE TABLE gist_inl_inner (id bigint PRIMARY KEY, room bigint)",
+  "INSERT INTO gist_inl_outer VALUES (1, 0), (2, 1), (3, 2), (4, 3), (5, 4), (6, 5), (7, 6), (8, 7), (9, 8), (10, 9)",
+  "INSERT INTO gist_inl_inner SELECT g, g % 1000 FROM generate_series(CAST(1 AS bigint), CAST(50000 AS bigint)) AS g",
+  "CREATE INDEX gist_inl_inner_room_idx ON gist_inl_inner (room)"
+]
+
+[[bench]]
+name = "gist_inl_nested_fallback"
+description = "Nested-loop reference for gist_inl using equivalent paired inequalities"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT p.id, s.id FROM gist_inl_ref_outer p JOIN gist_inl_ref_inner s ON s.room >= p.q AND s.room <= p.q ORDER BY p.id, s.id"
+warmup = 2
+iterations = 10
+seed = 4260
+expect_rows_per_iter = 500
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS gist_inl_ref_inner",
+  "DROP TABLE IF EXISTS gist_inl_ref_outer",
+  "CREATE TABLE gist_inl_ref_outer (id bigint PRIMARY KEY, q bigint)",
+  "CREATE TABLE gist_inl_ref_inner (id bigint PRIMARY KEY, room bigint)",
+  "INSERT INTO gist_inl_ref_outer VALUES (1, 0), (2, 1), (3, 2), (4, 3), (5, 4), (6, 5), (7, 6), (8, 7), (9, 8), (10, 9)",
+  "INSERT INTO gist_inl_ref_inner SELECT g, g % 1000 FROM generate_series(CAST(1 AS bigint), CAST(50000 AS bigint)) AS g",
+  "CREATE INDEX gist_inl_ref_inner_room_gist ON gist_inl_ref_inner USING gist (room)"
+]
+
+[bench.setup_sql_override]
+postgres = [
+  "DROP TABLE IF EXISTS gist_inl_ref_inner",
+  "DROP TABLE IF EXISTS gist_inl_ref_outer",
+  "CREATE TABLE gist_inl_ref_outer (id bigint PRIMARY KEY, q bigint)",
+  "CREATE TABLE gist_inl_ref_inner (id bigint PRIMARY KEY, room bigint)",
+  "INSERT INTO gist_inl_ref_outer VALUES (1, 0), (2, 1), (3, 2), (4, 3), (5, 4), (6, 5), (7, 6), (8, 7), (9, 8), (10, 9)",
+  "INSERT INTO gist_inl_ref_inner SELECT g, g % 1000 FROM generate_series(CAST(1 AS bigint), CAST(50000 AS bigint)) AS g",
+  "CREATE INDEX gist_inl_ref_inner_room_idx ON gist_inl_ref_inner (room)"
 ]
 
 # The same merge over a leading SECONDARY-INDEX column: an 8-value IN-list on customer_id (~10 rows per

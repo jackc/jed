@@ -207,5 +207,5 @@ elides its sort only when the source emits the requested PK order or walks the e
   precedence and the FROM-order join tree *inside* stage 3, once the estimator + table
   statistics exist; re-pins the affected `# cost:` entries and forces the class-P decision
   (§6).
-- **New physical rules** (hash join and later access paths tracked in TODO.md) land as
+- **New physical rules** (the hash join above and later access paths tracked in TODO.md) land as
   discrete rule functions in the §4 inventory, each with its NoREC relation.

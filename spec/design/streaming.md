@@ -268,8 +268,9 @@ happens and *when* cost accrues, never *what* a fully-drained query observes.**
 - **The §8 byte contract.** The on-disk format, key encoding, and goldens are untouched — streaming
   is an executor/cursor change, no `format_version` bump.
 - **Blocking operators still buffer their input** (correctly), and `ORDER BY` still spills under
-  `work_mem` ([spill.md](spill.md)). Streaming bounds the *output*, not the blocking input — the
-  spilling hash aggregate / `DISTINCT` / hash join remain the [spill.md §7](spill.md) follow-ons.
+  `work_mem` ([spill.md](spill.md)). Streaming bounds the *output*, not the blocking input —
+  grace-hash spill for the landed in-memory hash join, spilling hash aggregate, and spilling
+  `DISTINCT` remain the [spill.md §7](spill.md) follow-ons.
 - **Lazy page + large-value decode** (§1) are already done and unchanged.
 
 ## 7. Slicing (the mergeable steps)
