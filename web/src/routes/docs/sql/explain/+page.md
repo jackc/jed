@@ -95,10 +95,13 @@ indexed non-key column (`Index interval set: using <index>`).
 
 ## An index-nested-loop join
 
-When a join's inner relation is matched on **its own primary key** against a column of the outer
-relation (`c.id = t.city_id`), jed seeks that inner row **per outer row** instead of re-scanning the
-whole inner table — an `Index-nested-loop PK bound` on the inner `Scan`. The join turns O(N·M) into
-O(N·log M), and the plan stays a `Nested Loop` whose inner child names the per-outer-row bound.
+When a join's inner relation is matched on **its own primary key or index** against a column of the
+outer relation (`c.id = t.city_id`), jed opens that bound **per outer row** instead of re-scanning the
+whole inner table — an `Index-nested-loop … bound` on the inner `Scan`. Alongside primary-key and
+ordered B-tree comparisons, GIN array predicates (`@>`, `&&`, array `=`, scalar `= ANY`) and GiST
+range/scalar predicates (`&&`, `@>`, `=`) can use a bare earlier-sibling column. EXPLAIN names these
+`Index-nested-loop GIN bound` and `Index-nested-loop GiST bound`. The plan stays a `Nested Loop`; the
+inner child makes the per-outer access method visible.
 
 <LiveSql seed={seed} query={indexNestedLoop} rows={8} />
 

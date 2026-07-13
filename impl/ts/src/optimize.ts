@@ -166,7 +166,9 @@ function ruleJoinPkOrdered(plan: SelectPlan, rels: ScopeRel[], snap: Snapshot): 
     plan.phys.relINLBounds[0] === null &&
     (plan.phys.relINLBounds[1] === null ||
       plan.phys.relINLBounds[1]!.kind === "pk" ||
-      plan.phys.relINLBounds[1]!.kind === "index") &&
+      plan.phys.relINLBounds[1]!.kind === "index" ||
+      plan.phys.relINLBounds[1]!.kind === "gin" ||
+      plan.phys.relINLBounds[1]!.kind === "gist") &&
     plan.order.length <= pkIndices(rels[0]!.table).length
   ) {
     const dir = orderSatisfiedByPK(snap, rels[0]!.table, plan.rels[0]!.offset, plan.order);

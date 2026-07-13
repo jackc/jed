@@ -357,6 +357,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "query.correlated_pushdown",
     "query.join_pushdown",
     "query.index_nested_loop",
+    "query.gin_index_nested_loop",
+    "query.gist_index_nested_loop",
     // Index range scans + multi-column prefix bounds (spec/design/indexes.md §5.1).
     "query.index_range",
     "query.index_prefix",

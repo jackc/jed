@@ -749,6 +749,47 @@ func detectINLBound(on *rExpr, whereFilter *rExpr, rel scopeRel, db *engine) *sc
 			}}
 		}
 	}
+	// Opclass sibling bounds follow the cheaper primary-key and ordered-B-tree paths. GiST precedes
+	// GIN, matching the ordinary SELECT access-path precedence; each detector admits only a bare
+	// column from an earlier sibling, never the indexed relation itself or a later relation.
+	filters := []*rExpr{on, whereFilter}
+	for _, idx := range rel.table.Indexes {
+		if idx.Kind != indexGist || len(idx.Keys) != 1 {
+			continue
+		}
+		ci := idx.firstColumn()
+		colGlobal := rel.offset + ci
+		colTy := rel.table.Columns[ci].Type
+		for _, filter := range filters {
+			if colTy.IsRange() {
+				if s, _, ok := gistSiblingMatch(filter, colGlobal, cutoff); ok {
+					return &scanBound{gist: &gistBoundPlan{nameKey: strings.ToLower(idx.Name), strategy: s, colGlobal: colGlobal}}
+				}
+			} else if isGistScalarType(colTy) {
+				if _, _, ok := gistScalarSiblingMatch(filter, colGlobal, cutoff); ok {
+					return &scanBound{gist: &gistBoundPlan{nameKey: strings.ToLower(idx.Name), strategy: gistEqual, colGlobal: colGlobal, scalarType: colTy.ScalarTy()}}
+				}
+			}
+		}
+	}
+	for _, idx := range rel.table.Indexes {
+		if idx.Kind != indexGin {
+			continue
+		}
+		ci := idx.firstColumn()
+		colGlobal := rel.offset + ci
+		at := rel.table.Columns[ci].Type
+		if at.Array == nil {
+			continue
+		}
+		for _, filter := range filters {
+			if s, _, ok := ginSiblingMatch(filter, colGlobal, cutoff); ok {
+				return &scanBound{gin: &ginBoundPlan{
+					nameKey: strings.ToLower(idx.Name), elemType: at.Array.ScalarTy(), strategy: s, colGlobal: colGlobal,
+				}}
+			}
+		}
+	}
 	return nil
 }
 
@@ -815,27 +856,39 @@ func detectGinBound(filter *rExpr, indexes []indexDef, columns []catColumn, offs
 // operand (the scalar c for ginMember, the array Q otherwise). Used at plan time (strategy) and exec
 // time (recover the operand from plan.filter), so the two agree on the same conjunct by construction.
 func ginMatch(filter *rExpr, colGlobal int) (ginStrategy, *rExpr, bool) {
+	return ginMatchOperand(filter, colGlobal, rexprIsConstant)
+}
+
+// ginSiblingMatch is the join counterpart of ginMatch: Q must be a bare column from an earlier
+// sibling relation. Expressions, the indexed inner column, and later-sibling columns are rejected.
+func ginSiblingMatch(filter *rExpr, colGlobal, cutoff int) (ginStrategy, *rExpr, bool) {
+	return ginMatchOperand(filter, colGlobal, func(e *rExpr) bool {
+		return e != nil && e.kind == reColumn && e.index < cutoff
+	})
+}
+
+func ginMatchOperand(filter *rExpr, colGlobal int, queryOK func(*rExpr) bool) (ginStrategy, *rExpr, bool) {
 	if filter == nil {
 		return 0, nil, false
 	}
 	if filter.kind == reAnd {
-		if s, q, ok := ginMatch(filter.lhs, colGlobal); ok {
+		if s, q, ok := ginMatchOperand(filter.lhs, colGlobal, queryOK); ok {
 			return s, q, true
 		}
-		return ginMatch(filter.rhs, colGlobal)
+		return ginMatchOperand(filter.rhs, colGlobal, queryOK)
 	}
 	if filter.kind == reArrayFunc && len(filter.sargs) == 2 {
 		a, b := filter.sargs[0], filter.sargs[1]
 		switch filter.afunc {
 		case afContains:
-			if isColumn(a, colGlobal) && rexprIsConstant(b) {
+			if isColumn(a, colGlobal) && queryOK(b) {
 				return ginContains, b, true
 			}
 		case afOverlaps:
-			if isColumn(a, colGlobal) && rexprIsConstant(b) {
+			if isColumn(a, colGlobal) && queryOK(b) {
 				return ginOverlaps, b, true
 			}
-			if isColumn(b, colGlobal) && rexprIsConstant(a) {
+			if isColumn(b, colGlobal) && queryOK(a) {
 				return ginOverlaps, a, true
 			}
 		}
@@ -845,10 +898,10 @@ func ginMatch(filter *rExpr, colGlobal int) (ginStrategy, *rExpr, bool) {
 	// (the @>-superset gather + the residual =). <> is NOT matched (only OpEq). When the column is an
 	// array, the other constant operand is necessarily an array too (resolve rejects array/scalar =).
 	if filter.kind == reCompare && filter.op == opEq {
-		if isColumn(filter.lhs, colGlobal) && rexprIsConstant(filter.rhs) {
+		if isColumn(filter.lhs, colGlobal) && queryOK(filter.rhs) {
 			return ginEqual, filter.rhs, true
 		}
-		if isColumn(filter.rhs, colGlobal) && rexprIsConstant(filter.lhs) {
+		if isColumn(filter.rhs, colGlobal) && queryOK(filter.lhs) {
 			return ginEqual, filter.lhs, true
 		}
 	}
@@ -857,7 +910,7 @@ func ginMatch(filter *rExpr, colGlobal int) (ginStrategy, *rExpr, bool) {
 	// comparison/quantifier — those are not a single-term posting gather). The recovered query
 	// operand is the scalar c; ginBoundRows reads it via ginMember.
 	if filter.kind == reQuantified && filter.op == opEq && !filter.quantAll &&
-		isColumn(filter.rhs, colGlobal) && rexprIsConstant(filter.lhs) {
+		isColumn(filter.rhs, colGlobal) && queryOK(filter.lhs) {
 		return ginMember, filter.lhs, true
 	}
 	return 0, nil, false
@@ -902,20 +955,30 @@ func detectGistBound(filter *rExpr, indexes []indexDef, columns []catColumn, off
 // accelerated (the `=` opclass has only the equal strategy). Returns the Equal strategy and the
 // constant operand — used at plan time (strategy) and exec time (recover from plan.filter).
 func gistScalarMatch(filter *rExpr, colGlobal int) (gistStrategy, *rExpr, bool) {
+	return gistScalarMatchOperand(filter, colGlobal, rexprIsConstant)
+}
+
+func gistScalarSiblingMatch(filter *rExpr, colGlobal, cutoff int) (gistStrategy, *rExpr, bool) {
+	return gistScalarMatchOperand(filter, colGlobal, func(e *rExpr) bool {
+		return e != nil && e.kind == reColumn && e.index < cutoff
+	})
+}
+
+func gistScalarMatchOperand(filter *rExpr, colGlobal int, queryOK func(*rExpr) bool) (gistStrategy, *rExpr, bool) {
 	if filter == nil {
 		return 0, nil, false
 	}
 	if filter.kind == reAnd {
-		if s, q, ok := gistScalarMatch(filter.lhs, colGlobal); ok {
+		if s, q, ok := gistScalarMatchOperand(filter.lhs, colGlobal, queryOK); ok {
 			return s, q, true
 		}
-		return gistScalarMatch(filter.rhs, colGlobal)
+		return gistScalarMatchOperand(filter.rhs, colGlobal, queryOK)
 	}
 	if filter.kind == reCompare && filter.op == opEq {
-		if isColumn(filter.lhs, colGlobal) && rexprIsConstant(filter.rhs) {
+		if isColumn(filter.lhs, colGlobal) && queryOK(filter.rhs) {
 			return gistEqual, filter.rhs, true
 		}
-		if isColumn(filter.rhs, colGlobal) && rexprIsConstant(filter.lhs) {
+		if isColumn(filter.rhs, colGlobal) && queryOK(filter.lhs) {
 			return gistEqual, filter.lhs, true
 		}
 	}
@@ -940,27 +1003,37 @@ func gistQueryOperand(filter *rExpr, gb *gistBoundPlan) (*rExpr, bool) {
 // The other range operators stay full-scan this slice. Returns the strategy and the constant query
 // operand — used at plan time (strategy) and exec time (recover from plan.filter).
 func gistMatch(filter *rExpr, colGlobal int) (gistStrategy, *rExpr, bool) {
+	return gistMatchOperand(filter, colGlobal, rexprIsConstant)
+}
+
+func gistSiblingMatch(filter *rExpr, colGlobal, cutoff int) (gistStrategy, *rExpr, bool) {
+	return gistMatchOperand(filter, colGlobal, func(e *rExpr) bool {
+		return e != nil && e.kind == reColumn && e.index < cutoff
+	})
+}
+
+func gistMatchOperand(filter *rExpr, colGlobal int, queryOK func(*rExpr) bool) (gistStrategy, *rExpr, bool) {
 	if filter == nil {
 		return 0, nil, false
 	}
 	if filter.kind == reAnd {
-		if s, q, ok := gistMatch(filter.lhs, colGlobal); ok {
+		if s, q, ok := gistMatchOperand(filter.lhs, colGlobal, queryOK); ok {
 			return s, q, true
 		}
-		return gistMatch(filter.rhs, colGlobal)
+		return gistMatchOperand(filter.rhs, colGlobal, queryOK)
 	}
 	if filter.kind == reRangeOp && len(filter.sargs) == 2 {
 		a, b := filter.sargs[0], filter.sargs[1]
 		switch filter.rop {
 		case roOverlaps: // && — symmetric in its operands
-			if isColumn(a, colGlobal) && rexprIsConstant(b) {
+			if isColumn(a, colGlobal) && queryOK(b) {
 				return gistOverlaps, b, true
 			}
-			if isColumn(b, colGlobal) && rexprIsConstant(a) {
+			if isColumn(b, colGlobal) && queryOK(a) {
 				return gistOverlaps, a, true
 			}
 		case roContains: // @> — the indexed column must be the container (LEFT)
-			if isColumn(a, colGlobal) && rexprIsConstant(b) {
+			if isColumn(a, colGlobal) && queryOK(b) {
 				return gistContains, b, true
 			}
 		}
@@ -1400,7 +1473,7 @@ func (db *engine) executeMutationScan(plan mutationScanPlan, tableName string, p
 		if _, q, ok := ginMatch(plan.filter, b.gin.colGlobal); ok {
 			query = q
 		}
-		entries, pages, slabs, err := db.ginBoundRows(tableName, b.gin, query, env, meter, mask, false)
+		entries, pages, slabs, err := db.ginBoundRows(tableName, b.gin, query, nil, env, meter, mask, false)
 		return mutationScanBatch{entries: entries, pages: pages, slabs: slabs}, err
 	}
 	if b.gist != nil {
@@ -1408,7 +1481,7 @@ func (db *engine) executeMutationScan(plan mutationScanPlan, tableName string, p
 		if q, ok := gistQueryOperand(plan.filter, b.gist); ok {
 			query = q
 		}
-		entries, pages, slabs, err := db.gistBoundRows(tableName, b.gist, query, env, meter, mask, false)
+		entries, pages, slabs, err := db.gistBoundRows(tableName, b.gist, query, nil, env, meter, mask, false)
 		return mutationScanBatch{entries: entries, pages: pages, slabs: slabs}, err
 	}
 	if b.pkSet != nil {
@@ -1439,28 +1512,29 @@ func (db *engine) executeMutationScan(plan mutationScanPlan, tableName string, p
 }
 
 // ginBoundRows executes a GIN-bounded scan (spec/design/gin.md §6, cost.md §3). Evaluates the
-// constant query operand, extracts its terms + mode via the array_ops opclass (an array for @>/&&/=;
+// query operand, extracts its terms + mode via the array_ops opclass (an array for @>/&&/=;
 // a single scalar term for = ANY — ginMember; the array's distinct non-NULL terms for = — ginEqual),
 // gathers each term's posting list (a prefix range scan of the GIN entry tree), combines them by mode
 // (@>, = ANY, and = → intersection, && → union) into the candidate storage-key set, and
 // point-looks-up each candidate in storage-key order. The original predicate stays the residual WHERE
 // filter (re-applied downstream), so the result is always correct. Returns the candidate rows + the
 // scan's up-front (pages, slabs); gin_entry (per posting entry visited) is charged on meter directly.
-// Degenerate constant queries (gin.md §6): a NULL Q, an @> whose Q holds a NULL element, an && with
+// Degenerate queries (gin.md §6): a NULL Q, an @> whose Q holds a NULL element, an && with
 // no non-NULL term, and a NULL = ANY scalar are provably empty; @> '{}' and array = with no non-NULL
 // term fall back to the full scan.
 // ginBoundRows gathers a GIN-bounded scan's candidate rows as (storage key, row) Entry pairs
 // (the candidate set IS the storage keys), with the up-front (page_read nodes, value_decompress
 // slabs) block. SELECT drops the keys; UPDATE/DELETE keep them to rewrite/remove the rows
 // (gin.md §6). GinEntry is charged inside (during the gather); the caller charges the block.
-func (db *engine) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr, env *evalEnv, meter *costMeter, mask []bool, keysOnly bool) (out []entry, pages, slabs int, err error) {
+func (db *engine) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr, queryRow storedRow, env *evalEnv, meter *costMeter, mask []bool, keysOnly bool) (out []entry, pages, slabs int, err error) {
 	store := db.lkpStore(tableName)
 	if query == nil {
 		return nil, 0, 0, nil
 	}
 	// Extract the query's terms (extract_query_terms) — a pure planning step, NOT metered (cost.md
-	// §3): evaluate Q on a scratch meter. Q is a constant, so the nil row suffices.
-	qv, err := query.eval(nil, env, &costMeter{})
+	// §3): evaluate Q on a scratch meter. queryRow is nil for an ordinary constant bound and the
+	// combined left-hand row for an index-nested-loop sibling bound.
+	qv, err := query.eval(queryRow, env, &costMeter{})
 	if err != nil {
 		return nil, 0, 0, err
 	}
@@ -1600,7 +1674,7 @@ func (db *engine) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr,
 }
 
 // gistBoundRows gathers a GiST-bounded scan's candidate rows (spec/design/gist.md §5). Evaluates the
-// constant query operand, then DESCENDS the index's resident R-tree visiting only children
+// query operand, then DESCENDS the index's resident R-tree visiting only children
 // consistent with the query, collecting candidate storage keys at the leaves; each candidate row is
 // point-looked-up in storage-key order. The original &&/@> predicate stays the residual WHERE filter
 // (always-recheck), so the result is exactly the full-scan result — the bound only narrows which rows
@@ -1609,13 +1683,13 @@ func (db *engine) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr,
 // directly. Degenerate constant queries (gist.md §5): a NULL Q and an empty && query match nothing; an
 // empty @> query (col @> 'empty') matches every row → full-scan fallback (the empty bound is invisible
 // to the overlap-descend).
-func (db *engine) gistBoundRows(tableName string, gb *gistBoundPlan, query *rExpr, env *evalEnv, meter *costMeter, mask []bool, keysOnly bool) (out []entry, pages, slabs int, err error) {
+func (db *engine) gistBoundRows(tableName string, gb *gistBoundPlan, query *rExpr, queryRow storedRow, env *evalEnv, meter *costMeter, mask []bool, keysOnly bool) (out []entry, pages, slabs int, err error) {
 	store := db.lkpStore(tableName)
 	if query == nil {
 		return nil, 0, 0, nil
 	}
-	// The query operand is a constant; evaluating it (extract query) is a planning step, NOT metered.
-	qv, err := query.eval(nil, env, &costMeter{})
+	// Extracting the constant or once-per-outer sibling query is a planning step, NOT metered.
+	qv, err := query.eval(queryRow, env, &costMeter{})
 	if err != nil {
 		return nil, 0, 0, err
 	}

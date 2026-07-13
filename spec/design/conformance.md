@@ -423,6 +423,10 @@ only yesterday's optimizations is false confidence (CLAUDE.md §10 "no silent ca
   **join_inl_topn** — an outer-PK-ordered join LIMIT combines with a PK/secondary-index sibling
   bound, defeated by wrapping both the inner key and outer order key in `+ 0`; both spellings must
   produce the same total-order window;
+  **gin_inl** — a GIN `@>` query from an earlier sibling is compared with the equivalent reversed
+  `<@` spelling that defeats the sibling bound, including NULL/empty query arrays;
+  **gist_inl** — GiST range `@>` and scalar `=` sibling bounds are compared with equivalent `<@`
+  and paired-inequality full-scan spellings, including NULL/empty range queries;
   **index** — a secondary-index equality (`v = K` on an indexed column) fetches via the index
   tree + per-row point lookups ([indexes.md §5](indexes.md)), defeated by `v + 0 = K`, checked
   across UPDATE/DELETE maintenance and a NULL indexed value (3VL through the index); **or_in** — an

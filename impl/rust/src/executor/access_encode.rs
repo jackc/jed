@@ -627,6 +627,57 @@ pub(crate) fn detect_inl_bound(
             }));
         }
     }
+    // Opclass sibling bounds follow the cheaper primary-key and ordered-B-tree paths. GiST precedes
+    // GIN, matching ordinary SELECT planning. Only a bare earlier-sibling column is admissible.
+    for idx in &rel.table.indexes {
+        if idx.kind != IndexKind::Gist || idx.keys.len() != 1 {
+            continue;
+        }
+        let ci = idx.first_column();
+        let col_global = rel.offset + ci;
+        let col_ty = &rel.table.columns[ci].ty;
+        for filter in &filters {
+            if col_ty.range_element().is_some() {
+                if let Some((strategy, _)) = gist_sibling_match(filter, col_global, rel.offset) {
+                    return Some(ScanBound::Gist(GistBound {
+                        name_key: idx.name.to_ascii_lowercase(),
+                        strategy,
+                        col_global,
+                        scalar_type: None,
+                    }));
+                }
+            } else if is_gist_scalar_type(col_ty)
+                && gist_scalar_sibling_match(filter, col_global, rel.offset).is_some()
+            {
+                return Some(ScanBound::Gist(GistBound {
+                    name_key: idx.name.to_ascii_lowercase(),
+                    strategy: crate::gist::GistStrategy::Equal,
+                    col_global,
+                    scalar_type: Some(col_ty.scalar()),
+                }));
+            }
+        }
+    }
+    for idx in &rel.table.indexes {
+        if idx.kind != IndexKind::Gin {
+            continue;
+        }
+        let ci = idx.first_column();
+        let col_global = rel.offset + ci;
+        let Some(elem_type) = rel.table.columns[ci].ty.array_element().map(|t| t.scalar()) else {
+            continue;
+        };
+        for filter in &filters {
+            if let Some((strategy, _)) = gin_sibling_match(filter, col_global, rel.offset) {
+                return Some(ScanBound::Gin(GinBound {
+                    name_key: idx.name.to_ascii_lowercase(),
+                    elem_type,
+                    strategy,
+                    col_global,
+                }));
+            }
+        }
+    }
     None
 }
 
@@ -938,18 +989,42 @@ pub(crate) fn gist_match(
     filter: &RExpr,
     col_global: usize,
 ) -> Option<(crate::gist::GistStrategy, &RExpr)> {
+    gist_match_operand(filter, col_global, rexpr_is_constant)
+}
+
+pub(crate) fn gist_sibling_match(
+    filter: &RExpr,
+    col_global: usize,
+    cutoff: usize,
+) -> Option<(crate::gist::GistStrategy, &RExpr)> {
+    gist_match_operand(
+        filter,
+        col_global,
+        |q| matches!(q, RExpr::Column(i) if *i < cutoff),
+    )
+}
+
+fn gist_match_operand<'a, F>(
+    filter: &'a RExpr,
+    col_global: usize,
+    query_ok: F,
+) -> Option<(crate::gist::GistStrategy, &'a RExpr)>
+where
+    F: Fn(&RExpr) -> bool + Copy,
+{
     use crate::gist::GistStrategy;
     match filter {
-        RExpr::And(l, r) => gist_match(l, col_global).or_else(|| gist_match(r, col_global)),
+        RExpr::And(l, r) => gist_match_operand(l, col_global, query_ok)
+            .or_else(|| gist_match_operand(r, col_global, query_ok)),
         // `col && Q` — overlap is symmetric in its operands.
         RExpr::RangeOp {
             op: RangeOp::Overlaps,
             args,
             ..
         } if args.len() == 2 => {
-            if is_column(&args[0], col_global) && rexpr_is_constant(&args[1]) {
+            if is_column(&args[0], col_global) && query_ok(&args[1]) {
                 Some((GistStrategy::Overlaps, &args[1]))
-            } else if is_column(&args[1], col_global) && rexpr_is_constant(&args[0]) {
+            } else if is_column(&args[1], col_global) && query_ok(&args[0]) {
                 Some((GistStrategy::Overlaps, &args[0]))
             } else {
                 None
@@ -960,7 +1035,7 @@ pub(crate) fn gist_match(
             op: RangeOp::Contains,
             args,
             ..
-        } if args.len() == 2 => (is_column(&args[0], col_global) && rexpr_is_constant(&args[1]))
+        } if args.len() == 2 => (is_column(&args[0], col_global) && query_ok(&args[1]))
             .then_some((GistStrategy::Contains, &args[1])),
         _ => None,
     }
@@ -976,20 +1051,42 @@ pub(crate) fn gist_scalar_match(
     filter: &RExpr,
     col_global: usize,
 ) -> Option<(crate::gist::GistStrategy, &RExpr)> {
+    gist_scalar_match_operand(filter, col_global, rexpr_is_constant)
+}
+
+pub(crate) fn gist_scalar_sibling_match(
+    filter: &RExpr,
+    col_global: usize,
+    cutoff: usize,
+) -> Option<(crate::gist::GistStrategy, &RExpr)> {
+    gist_scalar_match_operand(
+        filter,
+        col_global,
+        |q| matches!(q, RExpr::Column(i) if *i < cutoff),
+    )
+}
+
+fn gist_scalar_match_operand<'a, F>(
+    filter: &'a RExpr,
+    col_global: usize,
+    query_ok: F,
+) -> Option<(crate::gist::GistStrategy, &'a RExpr)>
+where
+    F: Fn(&RExpr) -> bool + Copy,
+{
     use crate::gist::GistStrategy;
     match filter {
-        RExpr::And(l, r) => {
-            gist_scalar_match(l, col_global).or_else(|| gist_scalar_match(r, col_global))
-        }
+        RExpr::And(l, r) => gist_scalar_match_operand(l, col_global, query_ok)
+            .or_else(|| gist_scalar_match_operand(r, col_global, query_ok)),
         RExpr::Compare {
             op: CmpOp::Eq,
             lhs,
             rhs,
             ..
         } => {
-            if is_column(lhs, col_global) && rexpr_is_constant(rhs) {
+            if is_column(lhs, col_global) && query_ok(rhs) {
                 Some((GistStrategy::Equal, rhs.as_ref()))
-            } else if is_column(rhs, col_global) && rexpr_is_constant(lhs) {
+            } else if is_column(rhs, col_global) && query_ok(lhs) {
                 Some((GistStrategy::Equal, lhs.as_ref()))
             } else {
                 None
@@ -1021,20 +1118,44 @@ pub(crate) fn gist_query_operand<'a>(filter: &'a RExpr, gb: &GistBound) -> Optio
 /// strategy) and exec time (to recover the operand from `plan.filter`), so the two agree on the
 /// same conjunct by construction.
 pub(crate) fn gin_match(filter: &RExpr, col_global: usize) -> Option<(GinStrategy, &RExpr)> {
+    gin_match_operand(filter, col_global, rexpr_is_constant)
+}
+
+pub(crate) fn gin_sibling_match(
+    filter: &RExpr,
+    col_global: usize,
+    cutoff: usize,
+) -> Option<(GinStrategy, &RExpr)> {
+    gin_match_operand(
+        filter,
+        col_global,
+        |q| matches!(q, RExpr::Column(i) if *i < cutoff),
+    )
+}
+
+fn gin_match_operand<'a, F>(
+    filter: &'a RExpr,
+    col_global: usize,
+    query_ok: F,
+) -> Option<(GinStrategy, &'a RExpr)>
+where
+    F: Fn(&RExpr) -> bool + Copy,
+{
     match filter {
-        RExpr::And(l, r) => gin_match(l, col_global).or_else(|| gin_match(r, col_global)),
+        RExpr::And(l, r) => gin_match_operand(l, col_global, query_ok)
+            .or_else(|| gin_match_operand(r, col_global, query_ok)),
         RExpr::ArrayFunc {
             func: ArrayFunc::Contains,
             args,
-        } if args.len() == 2 => (is_column(&args[0], col_global) && rexpr_is_constant(&args[1]))
+        } if args.len() == 2 => (is_column(&args[0], col_global) && query_ok(&args[1]))
             .then_some((GinStrategy::Contains, &args[1])),
         RExpr::ArrayFunc {
             func: ArrayFunc::Overlaps,
             args,
         } if args.len() == 2 => {
-            if is_column(&args[0], col_global) && rexpr_is_constant(&args[1]) {
+            if is_column(&args[0], col_global) && query_ok(&args[1]) {
                 Some((GinStrategy::Overlaps, &args[1]))
-            } else if is_column(&args[1], col_global) && rexpr_is_constant(&args[0]) {
+            } else if is_column(&args[1], col_global) && query_ok(&args[0]) {
                 Some((GinStrategy::Overlaps, &args[0]))
             } else {
                 None
@@ -1051,9 +1172,9 @@ pub(crate) fn gin_match(filter: &RExpr, col_global: usize) -> Option<(GinStrateg
             rhs,
             ..
         } => {
-            if is_column(lhs, col_global) && rexpr_is_constant(rhs) {
+            if is_column(lhs, col_global) && query_ok(rhs) {
                 Some((GinStrategy::Equal, rhs.as_ref()))
-            } else if is_column(rhs, col_global) && rexpr_is_constant(lhs) {
+            } else if is_column(rhs, col_global) && query_ok(lhs) {
                 Some((GinStrategy::Equal, lhs.as_ref()))
             } else {
                 None
@@ -1068,7 +1189,7 @@ pub(crate) fn gin_match(filter: &RExpr, col_global: usize) -> Option<(GinStrateg
             all: false,
             lhs,
             array,
-        } if is_column(array, col_global) && rexpr_is_constant(lhs) => {
+        } if is_column(array, col_global) && query_ok(lhs) => {
             Some((GinStrategy::Member, lhs.as_ref()))
         }
         _ => None,

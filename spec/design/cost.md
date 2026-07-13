@@ -495,8 +495,9 @@ A **GIN index** ([gin.md](gin.md)) gives a third bound kind at the same per-rela
 the PK bound and the ordered-index equality bound). For a base relation of a **`SELECT`, `UPDATE`,
 or `DELETE`** scan whose WHERE has a conjunct `col @> Q` (contains), `col && Q` (overlaps),
 `c = ANY(col)` (membership), or `col = Q` (exact array equality) where `col` is GIN-indexed and the
-query operand is a **constant**, the scan gathers candidates from the index instead of
-full-scanning. Gated by the `query.gin_scan` capability (with `query.gin_any_eq` for `= ANY`,
+query operand is a **constant** (or, for the join-INL form below, a bare earlier-sibling column), the
+scan gathers candidates from the index instead of full-scanning. Gated by the `query.gin_scan`
+capability (with `query.gin_any_eq` for `= ANY`,
 `query.gin_array_eq` for array `=`, and `query.gin_mutation` for the `UPDATE`/`DELETE` bound), pinned
 cross-core in `spec/conformance/suites/query/gin_scan.test` (and `gin_any_eq.test` /
 `gin_array_eq.test` / `gin_mutation.test`).
@@ -525,7 +526,8 @@ byte-identical across cores: the term extraction, the term encoding, the entry-t
 overlap rule are all §8 contracts (gin.md §8). With a non-blocking `LIMIT`, term scans and posting
 combine remain complete and charge every `page_read`/`gin_entry`; only candidate table point-lookups,
 `storage_row_read`, residual evaluation, and output after the window disappear. **Narrowings this
-slice** (gin.md §6): constant query operand only and `@>`/`&&`/`= ANY`/`=` only. A **GIN-bounded
+slice** (gin.md §6): ordinary bounds require a constant query operand; join INL additionally admits
+a bare earlier-sibling operand; operators remain `@>`/`&&`/`= ANY`/`=` only. A **GIN-bounded
 `UPDATE`/`DELETE`** accrues this same scan block in place of its full-scan block (after PK and any
 ordered B-tree bound, mutation precedence tries GIN before GiST); so a
 `DELETE … WHERE col @> Q` costs the matching `SELECT`'s scan minus the `row_produced` a bare mutation
@@ -539,9 +541,10 @@ table charges 0, `DROP INDEX` charges 0.
 
 ### GiST-bounded scan — an R-tree narrows a range- or scalar-column scan
 
-A `range_col && const` / `range_col @> const` over a **GiST-indexed** range column
-([gist.md §5](gist.md)), or a `scalar_col = const` over a **GiST-indexed** fixed-width scalar column
-(the scalar `=` opclass, [gist.md §6](gist.md)), bounds the scan: the planner **descends the index's
+A `range_col && Q` / `range_col @> Q` over a **GiST-indexed** range column
+([gist.md §5](gist.md)), or a `scalar_col = Q` over a **GiST-indexed** fixed-width scalar column
+(the scalar `=` opclass, [gist.md §6](gist.md)), bounds the scan when `Q` is constant, or a bare
+earlier-sibling column in the join-INL form below. The planner **descends the index's
 resident R-tree**, visiting only the children whose bounding union is `consistent` with the query (for
 `=`, whose `[min,max]` key-byte interval brackets the query key). In place of the full-scan block it
 accrues:
@@ -560,7 +563,8 @@ set (`build_from_leaf_keys` — content-deterministic, gist.md §3), so the node
 `gist_descent` charge are a pure function of `(query, row set)`, independent of insertion order or
 medium (in-memory vs reopened file). With a non-blocking `LIMIT`, the R-tree descent still completes
 and charges all visited nodes/interiors, then storage-key-ordered candidate table point-lookups and
-residual work stop at the window. **Narrowings** (gist.md §5/§6): constant query operand only;
+residual work stop at the window. **Narrowings** (gist.md §5/§6): ordinary bounds require a constant
+query operand; join INL additionally admits a bare earlier-sibling operand;
 `range_ops` accelerates `&&`/`@>` (an empty `&&` query is provably empty → 0, an empty `@>` query falls
 back to the full scan); the scalar `=` opclass accelerates `=` over the **fixed-width** keyables and is
 the **fallback bound** — a `col = const` over a PK or B-tree-indexed column takes the cheaper bound, so
@@ -696,6 +700,27 @@ is asymptotic, on large inners. Gated by `query.index_nested_loop`, pinned cross
 `spec/conformance/suites/joins/index_nested_loop.test` (and it re-pins the affected
 `joins/pushdown.test` / `self_join.test` / `comma.test` / `qualified*.test` cross-relation cases).
 EXPLAIN surfaces the access path as `Index-nested-loop PK bound` / `Index-nested-loop Index bound`.
+
+The same rule admits **opclass sibling bounds** after the cheaper PK and ordered-B-tree checks:
+
+- GIN `@>` / `&&` / array `=` and scalar `= ANY(array)` evaluate a bare earlier-sibling query
+  operand once per outer row, then charge the ordinary posting-list `page_read` + `gin_entry` gather
+  and candidate point-lookups for that value.
+- single-column GiST range `&&` / `@>` and fixed-width scalar `=` form one query per outer row, then
+  charge the ordinary visited-node `page_read` + `gist_descent` + candidate point-lookups. A
+  multi-column exclusion GiST is never a read bound.
+
+Every degenerate value keeps the access method's ordinary semantics **per outer row**: a provably
+empty value reads nothing, while GIN no-term and GiST empty-containment fallbacks full-scan that inner
+once for the current outer row. Candidate rows stay in storage-key order and the complete ON/WHERE is
+residual-rechecked; therefore lossy candidates, misses, and LEFT NULL extension are results-identical
+to nested loop. An unsupported runtime value yields the specified empty/fallback behavior, never an
+unsound prune. The operand must be the bare earlier column — the inner's own column and a later
+sibling are rejected. A usable sibling bound takes precedence over the relation's once-materialized
+constant bound; within INL the fixed order is PK → ordered B-tree → GiST → GIN. Gated by
+`query.gin_index_nested_loop` / `query.gist_index_nested_loop`, with cross-core costs pinned in the
+three `joins/*index_nested_loop.test` opclass suites. EXPLAIN uses `Index-nested-loop GIN bound` /
+`Index-nested-loop GiST bound`.
 
 **Bounded scan / correlated — the inner PK bound from an outer column.** A correlated subquery is
 re-executed once per outer row (see "Subqueries" below). When its inner query is a **single table**
@@ -990,7 +1015,7 @@ the join output already arrives in `(outer PK, inner key)` order. The engine eli
 `operator_eval`s and `row_produced` drop to the combinations *actually examined* — the cost-visible
 win. Without an index-nested-loop bound, both tables are still **materialized in full**
 (`storage_row_read` = the sum of cardinalities, the rule above; a constant WHERE bound on the inner
-still applies), so only the in-memory loop short-circuits. With a PK/B-tree **INL inner**, the outer
+still applies), so only the in-memory loop short-circuits. With a PK/B-tree/GIN/GiST **INL inner**, the outer
 is materialized once and the inner bound is opened per outer row; every started bound is gathered
 completely in its ordinary key order, while bounds for later outer rows are never opened after the
 window fills. This is the eager INL nested-loop order, so rows remain byte-identical to the blocking
@@ -1002,7 +1027,7 @@ engages only when:
   outer row fans out to many), so an extra key (`ORDER BY a.id, b.x`) is a real tie-break the outer
   scan order does not satisfy, unlike the single-table "runs past the PK" case;
 - the outer carries **no non-PK bound** (a PK bound / no bound keeps it in PK order).
-- the optional inner INL bound is PK or ordered B-tree (GIN/GiST sibling bounds are separate work).
+- the optional inner INL bound emits storage-key order: PK, ordered B-tree, GIN, or GiST.
 
 `joins/order_by_outer_pk.test` pins the top-N (with the ON-eval drop), the OFFSET, the inner-PK-bound
 composition, the CROSS form, and the `ORDER BY a.id, b.id` contrast that keeps the full nested loop +

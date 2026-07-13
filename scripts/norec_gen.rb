@@ -59,6 +59,10 @@
 #   join_inl_topn — the join top-N opens a PK/secondary-index INL bound once per outer row and stops
 #              later probes at LIMIT; wrapping the inner key and ORDER BY outer key in `+ 0` defeats
 #              both rules. The bounded and blocking spellings must return the same total-order window.
+#   gin_inl  — a GIN @> query operand from an earlier sibling bounds the inner once per outer row;
+#              the equivalent sibling <@ indexed-column spelling defeats the bound.
+#   gist_inl — GiST range @> and fixed-width scalar = sibling operands bound the inner; equivalent
+#              <@ and paired-inequality spellings defeat the bounds.
 #   tlp      — Ternary-Logic Partitioning (SQLancer): for ANY predicate p, every row is in exactly
 #              one of `WHERE p` (TRUE) / `WHERE NOT p` (FALSE) / `WHERE p IS NULL` (UNKNOWN), so the
 #              three partitions UNION ALL must reconstruct the whole table (and COUNT over the whole
@@ -194,6 +198,16 @@ JOIN_INL_TOPN_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index dml.
                        query.table_alias query.where_eq query.order_by query.order_by_keys query.limit
                        query.offset query.index_nested_loop query.order_by_join_scan
                        query.order_by_join_inl expr.arithmetic types.i32 null.three_valued].freeze
+GIN_INL_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index dml.insert dml.insert_multi_row
+                  query.select query.join_inner query.qualified_column query.order_by
+                  query.index_nested_loop query.gin_scan query.gin_index_nested_loop types.i32
+                  types.array func.array_containment null.three_valued].freeze
+GIST_INL_REQ = %w[ddl.create_table ddl.primary_key ddl.gist_index ddl.gist_scalar_index dml.insert
+                   dml.insert_multi_row query.select query.join_inner query.qualified_column
+                   query.order_by query.comparison_order query.logical_connectives
+                   query.index_nested_loop query.gist_scan query.gist_scalar_scan
+                   query.gist_index_nested_loop types.i32 types.range func.range_operators
+                   null.three_valued].freeze
 TLP_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
              query.where_eq query.comparison_order query.order_by query.is_null
              query.logical_connectives query.union query.aggregates query.group_by
@@ -1041,6 +1055,86 @@ def gen_join_inl_topn(seed)
   q(out, "II", "SELECT p.id, c.id FROM p JOIN c ON c.pref = p.id ORDER BY p.id LIMIT #{fk}", flat.call(expected))
   q(out, "II", "SELECT p.id, c.id FROM p JOIN c ON c.pref + 0 = p.id ORDER BY p.id + 0, c.id LIMIT #{fk}", flat.call(expected))
 
+  out.join("\n") + "\n"
+end
+
+# --- scenario: GIN sibling-bound index-nested-loop -------------------------------------------
+def gen_gin_inl(seed)
+  rng = Random.new(seed)
+  pids = (1..30).to_a.sample(7, random: rng).sort
+  dids = (101..150).to_a.sample(10, random: rng).sort
+  probes = pids.each_with_index.map do |id, i|
+    qv = if i == 0
+           nil
+         elsif i == 1
+           []
+         else
+           Array.new(rng.rand(1..3)) { rng.rand(0..5) }
+         end
+    [id, qv]
+  end
+  docs = dids.map { |id| [id, Array.new(rng.rand(0..4)) { rng.rand(0..5) }] }
+  contains = ->(tags, qv) { !qv.nil? && qv.uniq.all? { |term| tags.include?(term) } }
+  joined = probes.flat_map do |pid, qv|
+    docs.select { |_did, tags| contains.call(tags, qv) }.map { |did, _| [pid, did] }
+  end
+  flat = ->(rs) { rs.flat_map { |a, b| [a.to_s, b.to_s] } }
+  lit = ->(a) { a.nil? ? "NULL" : "'{#{a.join(',')}}'" }
+
+  out = header(seed, GIN_INL_REQ, "GIN sibling-bound index-nested-loop")
+  stmt(out, "CREATE TABLE p (id i32 PRIMARY KEY, q i32[])")
+  stmt(out, "CREATE TABLE d (id i32 PRIMARY KEY, tags i32[])")
+  stmt(out, "CREATE INDEX d_tags_gin ON d USING gin (tags)")
+  stmt(out, "INSERT INTO p VALUES #{probes.map { |id, qv| "(#{id}, #{lit.call(qv)})" }.join(', ')}")
+  stmt(out, "INSERT INTO d VALUES #{docs.map { |id, tags| "(#{id}, #{lit.call(tags)})" }.join(', ')}")
+
+  out << "# GIN sibling @> bound versus the equivalent non-accelerated <@ spelling"
+  q(out, "II", "SELECT p.id, d.id FROM p JOIN d ON d.tags @> p.q ORDER BY p.id, d.id", flat.call(joined))
+  q(out, "II", "SELECT p.id, d.id FROM p JOIN d ON p.q <@ d.tags ORDER BY p.id, d.id", flat.call(joined))
+  out.join("\n") + "\n"
+end
+
+# --- scenario: GiST sibling-bound index-nested-loop (range + scalar opclasses) ----------------
+def gen_gist_inl(seed)
+  rng = Random.new(seed)
+  pids = (1..30).to_a.sample(7, random: rng).sort
+  sids = (101..150).to_a.sample(10, random: rng).sort
+  probes = pids.each_with_index.map do |id, i|
+    qv = i == 0 ? nil : i == 1 ? :empty : [rng.rand(0..8), rng.rand(9..15)]
+    [id, qv, i == 0 ? nil : rng.rand(0..4)]
+  end
+  slots = sids.each_with_index.map do |id, i|
+    rv = i == 0 ? :empty : [rng.rand(0..8), rng.rand(9..15)]
+    [id, rv, i == 1 ? nil : rng.rand(0..4)]
+  end
+  contains = lambda do |r, qv|
+    next false if qv.nil?
+    next true if qv == :empty
+    r.is_a?(Array) && r[0] <= qv[0] && qv[1] <= r[1]
+  end
+  range_join = probes.flat_map do |pid, qv, _room|
+    slots.select { |_sid, r, _| contains.call(r, qv) }.map { |sid, _r, _| [pid, sid] }
+  end
+  scalar_join = probes.flat_map do |pid, _qv, room|
+    slots.select { |_sid, _r, sroom| !room.nil? && room == sroom }.map { |sid, _r, _| [pid, sid] }
+  end
+  flat = ->(rs) { rs.flat_map { |a, b| [a.to_s, b.to_s] } }
+  rlit = ->(r) { r.nil? ? "NULL" : r == :empty ? "'empty'" : "'[#{r[0]},#{r[1]})'" }
+
+  out = header(seed, GIST_INL_REQ, "GiST sibling-bound index-nested-loop")
+  stmt(out, "CREATE TABLE p (id i32 PRIMARY KEY, q int4range, room i32)")
+  stmt(out, "CREATE TABLE s (id i32 PRIMARY KEY, r int4range, room i32)")
+  stmt(out, "CREATE INDEX s_r_gist ON s USING gist (r)")
+  stmt(out, "CREATE INDEX s_room_gist ON s USING gist (room)")
+  stmt(out, "INSERT INTO p VALUES #{probes.map { |id, qv, room| "(#{id}, #{rlit.call(qv)}, #{room || 'NULL'})" }.join(', ')}")
+  stmt(out, "INSERT INTO s VALUES #{slots.map { |id, r, room| "(#{id}, #{rlit.call(r)}, #{room || 'NULL'})" }.join(', ')}")
+
+  out << "# range_ops sibling @> bound versus equivalent non-accelerated <@"
+  q(out, "II", "SELECT p.id, s.id FROM p JOIN s ON s.r @> p.q ORDER BY p.id, s.id", flat.call(range_join))
+  q(out, "II", "SELECT p.id, s.id FROM p JOIN s ON p.q <@ s.r ORDER BY p.id, s.id", flat.call(range_join))
+  out << "# scalar = sibling bound versus equivalent paired inequalities"
+  q(out, "II", "SELECT p.id, s.id FROM p JOIN s ON s.room = p.room ORDER BY p.id, s.id", flat.call(scalar_join))
+  q(out, "II", "SELECT p.id, s.id FROM p JOIN s ON s.room >= p.room AND s.room <= p.room ORDER BY p.id, s.id", flat.call(scalar_join))
   out.join("\n") + "\n"
 end
 
@@ -1901,6 +1995,8 @@ SCENARIOS = {
   "distinct_order" => method(:gen_distinct_order),
   "join_order" => method(:gen_join_order),
   "join_inl_topn" => method(:gen_join_inl_topn),
+  "gin_inl" => method(:gen_gin_inl),
+  "gist_inl" => method(:gen_gist_inl),
   "gin" => method(:gen_gin),
   "gin_any" => method(:gen_gin_any),
   "gin_eq" => method(:gen_gin_eq),

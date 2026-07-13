@@ -1,0 +1,121 @@
+# jed-specific EXPLAIN shapes for GIN/GiST sibling INL. PostgreSQL exposes different plan text and
+# may reorder joins, so this suite is cross-core checked and intentionally not oracle-imported.
+# requires: ddl.create_table, ddl.primary_key, ddl.gin_index, ddl.gist_index, query.select, query.join_inner, query.cross_join, query.qualified_column, query.where_eq, query.logical_connectives, query.explain, query.index_nested_loop, query.gin_scan, query.gist_scan, query.gin_index_nested_loop, query.gist_index_nested_loop, types.i32, types.array, types.range, func.array_containment, func.range_constructors, func.range_operators
+
+statement ok
+CREATE TABLE op_probe (id i32 PRIMARY KEY, q i32[], rq int4range)
+
+statement ok
+CREATE TABLE op_doc (id i32 PRIMARY KEY, tags i32[], alt i32[])
+
+statement ok
+CREATE INDEX op_doc_tags ON op_doc USING gin (tags)
+
+statement ok
+CREATE TABLE op_slot (id i32 PRIMARY KEY, r int4range, alt int4range)
+
+statement ok
+CREATE INDEX op_slot_r ON op_slot USING gist (r)
+
+# The GIN sibling bound is visible even when it overrides a constant once-bound scan.
+query ITT nosort
+EXPLAIN SELECT p.id, d.id
+FROM op_probe p JOIN op_doc d ON d.tags && p.q
+WHERE d.tags @> ARRAY[40]
+----
+0
+Filter
+conjuncts=1
+1
+Nested Loop
+inner; on:conjuncts=1
+2
+Scan op_probe
+Full scan; touched=2
+2
+Scan op_doc
+Index-nested-loop GIN bound: using op_doc_tags; touched=2
+
+# An operand from the indexed inner row is not a sibling query; the inner remains a full scan.
+query ITT nosort
+EXPLAIN SELECT p.id, d.id FROM op_probe p JOIN op_doc d ON d.tags && d.alt
+----
+0
+Nested Loop
+inner; on:conjuncts=1
+1
+Scan op_probe
+Full scan; touched=1
+1
+Scan op_doc
+Full scan; touched=3
+
+# A later relation is unavailable while the middle relation opens, so it cannot bind that scan.
+query ITT nosort
+EXPLAIN SELECT p.id, d.id, x.id
+FROM op_probe p CROSS JOIN op_doc d CROSS JOIN op_probe x
+WHERE d.tags && x.q
+----
+0
+Filter
+conjuncts=1
+1
+Nested Loop
+cross
+2
+Nested Loop
+cross
+3
+Scan op_probe
+Full scan; touched=1
+3
+Scan op_doc
+Full scan; touched=2
+2
+Scan op_probe
+Full scan; touched=2
+
+query ITT nosort
+EXPLAIN SELECT p.id, s.id FROM op_probe p JOIN op_slot s ON s.r && p.rq
+----
+0
+Nested Loop
+inner; on:conjuncts=1
+1
+Scan op_probe
+Full scan; touched=2
+1
+Scan op_slot
+Index-nested-loop GiST bound: using op_slot_r; touched=2
+
+# A usable GiST sibling bound likewise overrides an ordinary constant GiST bound.
+query ITT nosort
+EXPLAIN SELECT p.id, s.id
+FROM op_probe p JOIN op_slot s ON s.r && p.rq
+WHERE s.r && int4range(1, 2)
+----
+0
+Filter
+conjuncts=1
+1
+Nested Loop
+inner; on:conjuncts=1
+2
+Scan op_probe
+Full scan; touched=2
+2
+Scan op_slot
+Index-nested-loop GiST bound: using op_slot_r; touched=2
+
+query ITT nosort
+EXPLAIN SELECT p.id, s.id FROM op_probe p JOIN op_slot s ON s.r && s.alt
+----
+0
+Nested Loop
+inner; on:conjuncts=1
+1
+Scan op_probe
+Full scan; touched=1
+1
+Scan op_slot
+Full scan; touched=3

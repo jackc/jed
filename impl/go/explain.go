@@ -526,9 +526,9 @@ func (db *engine) accessPath(tableName string, b *scanBound, inl bool) string {
 	case b.index != nil:
 		return prefix + "Index bound: using " + b.index.nameKey
 	case b.gin != nil:
-		return "GIN bound: using " + b.gin.nameKey
+		return prefix + "GIN bound: using " + b.gin.nameKey
 	case b.gist != nil:
-		return "GiST bound: using " + b.gist.nameKey
+		return prefix + "GiST bound: using " + b.gist.nameKey
 	case b.pkSet != nil:
 		return prefix + "PK interval set: " + db.firstPKColName(tableName) + "; intervals=" + strconv.Itoa(len(b.pkSet.specs))
 	case b.indexSet != nil:

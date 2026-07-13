@@ -97,10 +97,10 @@ then takes the unoptimized path (full scan, eager sort), which is always correct
 | # | rule | gate (summary) | sets | cost contract |
 |---|---|---|---|---|
 | 1 | **scan bounds** | per base relation (not SRF/derived): a WHERE conjunct bounds the relation's key per the §5 precedence | `relBounds[i]` | cost.md §3 "bounded scan", "index-bounded scan", "GIN-bounded scan", "GiST-bounded scan", "canonical interval sets" |
-| 2 | **index-nested-loop** | a join inner base relation (INNER/CROSS/LEFT right side, not lateral/CTE) whose PK / leading index column compares to an **earlier sibling** column in ON or WHERE | `relINLBounds[i]` | cost.md §3 "JOIN" (per-outer-row seek) |
+| 2 | **index-nested-loop** | a join inner base relation (INNER/CROSS/LEFT right side, not lateral/CTE) with a PK / leading B-tree comparison or GIN/GiST query operand from a bare **earlier sibling** column in ON or WHERE | `relINLBounds[i]` | cost.md §3 "JOIN" (per-outer-row seek/gather) |
 | 3 | **ORDER BY via PK scan order** | single base relation, non-aggregate, column-only keys: the ORDER BY is a one-direction PK prefix (ASC) or the full PK (DESC ⇒ reverse scan), collation-matching the stored key | `pkOrdered`, `pkReverse` | cost.md §3 "ORDER BY satisfied by primary-key order" (sort elided; with LIMIT, a top-N) |
 | 4 | **ORDER BY via secondary-index order** | rule 3 did not fire; a LIMIT; no window/DISTINCT; the ORDER BY is exactly a B-tree index's columns, ASC NULLS LAST, fixed-width PK; an existing bound is allowed only when it walks that same index | `indexOrder` | cost.md §3 "ORDER BY satisfied by secondary-index order" (index-walk top-N) |
-| 5 | **join sort-elision** | exactly two non-lateral base relations, INNER/CROSS, a LIMIT, forward outer-PK ORDER BY with no key beyond the outer PK, no eager bound on the outer; an inner PK/B-tree INL bound is opened per outer row | `joinPkOrdered` | cost.md §3 "JOIN" (the join top-N) |
+| 5 | **join sort-elision** | exactly two non-lateral base relations, INNER/CROSS, a LIMIT, forward outer-PK ORDER BY with no key beyond the outer PK, no eager bound on the outer; any storage-key-ordered inner INL bound is opened per outer row | `joinPkOrdered` | cost.md §3 "JOIN" (the join top-N) |
 
 Data-flow dependencies fixing the order: rule 4 reads `relBounds[0]` (rule 1) and
 `pkOrdered` (rule 3); rule 5 reads `relBounds[0]` and `relINLBounds` (rules 1–2). Rules 3–5

@@ -534,8 +534,8 @@ impl Engine {
             None => "Full scan".to_string(),
             Some(ScanBound::Pk(pb)) => format!("{prefix}PK bound: {}", render_pk_bound(pb)),
             Some(ScanBound::Index(ib)) => format!("{prefix}Index bound: using {}", ib.name_key),
-            Some(ScanBound::Gin(gb)) => format!("GIN bound: using {}", gb.name_key),
-            Some(ScanBound::Gist(gp)) => format!("GiST bound: using {}", gp.name_key),
+            Some(ScanBound::Gin(gb)) => format!("{prefix}GIN bound: using {}", gb.name_key),
+            Some(ScanBound::Gist(gp)) => format!("{prefix}GiST bound: using {}", gp.name_key),
             Some(ScanBound::PkSet(ks)) => format!(
                 "{prefix}PK interval set: {}; intervals={}",
                 self.first_pk_col_name(table_name),

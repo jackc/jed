@@ -179,9 +179,9 @@ impl Engine {
                     | Some(ScanBound::IndexSet(_))
             )
             && plan.phys.rel_inl_bounds[0].is_none()
-            // PK and ordered-B-tree INL materialization emits the same per-outer key order as the
-            // eager nested-loop path. GIN/GiST sibling bounds arrive separately in Phase 6.
-            && matches!(plan.phys.rel_inl_bounds[1], None | Some(ScanBound::Pk(_)) | Some(ScanBound::Index(_)))
+            // Every admitted INL materialization emits storage-key order; GIN/GiST candidate
+            // gathers sort explicitly before returning.
+            && matches!(plan.phys.rel_inl_bounds[1], None | Some(ScanBound::Pk(_)) | Some(ScanBound::Index(_)) | Some(ScanBound::Gin(_)) | Some(ScanBound::Gist(_)))
             // No ORDER BY key beyond the outer PK: the outer PK is unique over the OUTER table but
             // NOT over the join output (one outer row fans out to many), so an extra key (`ORDER BY
             // a.id, b.x`) is a real tie-break the outer scan order does not satisfy — unlike the

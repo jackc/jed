@@ -417,3 +417,10 @@ with a `LIMIT`, this becomes a **top-N**: the scan stops as soon as the window i
 collated primary key is stored in its collation's order, so a collated `ORDER BY` is satisfied the
 same way, with no in-memory re-sort. (Ordering by a non-key column, or `DESC`, still does a full
 sort for now.)
+
+Joins also reuse indexes without statistics: when the right side's primary key, B-tree key, GIN
+array predicate, or GiST range/scalar predicate takes its query value from a bare column of an
+earlier `FROM` item, jed opens that bound once per left row and residual-checks the complete join
+predicate. NULL and empty values keep the same SQL semantics, including LEFT-join NULL extension.
+With `ORDER BY` on the outer primary key plus `LIMIT`, these storage-key-ordered inner bounds compose
+with the join top-N and later outer rows are never opened after the window fills.

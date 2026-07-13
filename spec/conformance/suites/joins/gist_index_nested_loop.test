@@ -1,0 +1,131 @@
+# GiST range_ops sibling-bound index-nested-loop (gist.md §5.1; cost.md §3 "JOIN"). The range
+# query is built once per outer row, the resident tree descends, candidates return in storage-key
+# order, and &&/@> remain residual always-recheck predicates.
+# requires: ddl.create_table, ddl.primary_key, ddl.gist_index, dml.insert, dml.insert_multi_row, query.select, query.join_inner, query.join_left, query.cross_join, query.qualified_column, query.table_alias, query.where_eq, query.comparison_order, query.logical_connectives, query.order_by, query.limit, query.index_nested_loop, query.gist_scan, query.gist_index_nested_loop, query.order_by_join_scan, query.order_by_join_inl, types.i32, types.range, func.range_constructors, func.range_operators, null.three_valued, resource.cost_metering
+
+statement ok
+CREATE TABLE gist_probe (id i32 PRIMARY KEY, q int4range)
+
+statement ok
+CREATE TABLE gist_slot (id i32 PRIMARY KEY, r int4range, alt int4range)
+
+statement ok
+CREATE INDEX gist_slot_r ON gist_slot USING gist (r)
+
+statement ok
+INSERT INTO gist_probe VALUES
+  (1, '[4,6)'),
+  (2, '[15,18)'),
+  (3, 'empty'),
+  (4, NULL),
+  (5, '[150,160)')
+
+statement ok
+INSERT INTO gist_slot VALUES
+  (1, '[1,5)', '[4,6)'),
+  (2, '[10,20)', '[15,18)'),
+  (3, '[3,8)', '[1,2)'),
+  (4, '[100,200)', '[150,160)'),
+  (5, '[50,60)', 'empty'),
+  (6, '[15,25)', NULL),
+  (7, 'empty', '[1,2)'),
+  (8, NULL, '[1,2)')
+
+# Empty and NULL overlap queries are provably empty per outer row.
+# cost: 35
+query II nosort
+SELECT p.id, s.id
+FROM gist_probe p JOIN gist_slot s ON s.r && p.q
+ORDER BY p.id, s.id
+----
+1
+1
+1
+3
+2
+2
+2
+6
+5
+4
+
+# LEFT null-extension is sound for empty/NULL queries.
+# cost: 37
+query II nosort
+SELECT p.id, s.id
+FROM gist_probe p LEFT JOIN gist_slot s ON s.r && p.q
+ORDER BY p.id, s.id
+----
+1
+1
+1
+3
+2
+2
+2
+6
+3
+NULL
+4
+NULL
+5
+4
+
+# @> uses the same overlap descent as a lossy superset and residual-rechecks containment. An empty
+# sibling query falls back to a full inner scan because every non-NULL range contains empty.
+# cost: 55
+query II nosort
+SELECT p.id, s.id
+FROM gist_probe p JOIN gist_slot s ON s.r @> p.q
+ORDER BY p.id, s.id
+----
+1
+3
+2
+2
+2
+6
+3
+1
+3
+2
+3
+3
+3
+4
+3
+5
+3
+6
+3
+7
+5
+4
+
+# WHERE-derived CROSS bound and residual conjuncts.
+# cost: 40
+query II nosort
+SELECT p.id, s.id
+FROM gist_probe p CROSS JOIN gist_slot s
+WHERE s.r && p.q AND p.id < 3 AND s.id > 1
+ORDER BY p.id, s.id
+----
+1
+3
+2
+2
+2
+6
+
+# The storage-key-ordered GiST candidate source composes with the join top-N lane.
+# cost: 17
+query II nosort
+SELECT p.id, s.id
+FROM gist_probe p JOIN gist_slot s ON s.r && p.q
+ORDER BY p.id
+LIMIT 2
+----
+1
+1
+1
+3

@@ -131,7 +131,8 @@ func (db *engine) ruleJoinPkOrdered(plan *selectPlan, rels []scopeRel) {
 
 // joinTopNINLCompatible reports whether the two-table streaming join can open the inner bound once
 // per outer row without changing nested-loop order. PK and ordered-B-tree INL materialization emits
-// the same key order as the eager INL path; opclass sibling bounds arrive in Phase 6.
+// the same key order as the eager INL path. GIN/GiST candidates are explicitly sorted by storage
+// key, so the opclass sibling bounds preserve it too.
 func joinTopNINLCompatible(sb *scanBound) bool {
-	return sb == nil || sb.pk != nil || sb.index != nil
+	return sb == nil || sb.pk != nil || sb.index != nil || sb.gin != nil || sb.gist != nil
 }

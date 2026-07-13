@@ -317,6 +317,7 @@ impl Engine {
                     &plan.rels[0].table_name,
                     gb,
                     query,
+                    &[],
                     env,
                     meter,
                     &plan.rel_masks[0],
@@ -367,6 +368,7 @@ impl Engine {
                     &plan.rels[0].table_name,
                     gb,
                     query,
+                    &[],
                     env,
                     meter,
                     &plan.rel_masks[0],
@@ -1356,6 +1358,7 @@ impl Engine {
         // takes precedence and resolves its `Sibling` source from the current left row (cost.md §3
         // "JOIN"); else the once-materialized `rel_bounds`.
         let store = self.store_scoped(rel.db.as_deref(), &rel.table_name);
+        let inl = plan.phys.rel_inl_bounds[ri].is_some();
         let bound = plan.phys.rel_inl_bounds[ri]
             .as_ref()
             .or(plan.phys.rel_bounds[ri].as_ref());
@@ -1381,17 +1384,23 @@ impl Engine {
                 left,
             )?,
             Some(ScanBound::Gin(gb)) => {
-                // Re-find the constant query `Q` in the WHERE filter (the same conjunct the plan-time
-                // `gin_match` chose — gin.md §6); the `@>`/`&&` predicate also stays as the residual
-                // filter applied to these rows downstream.
-                let query = plan
-                    .filter
-                    .as_ref()
-                    .and_then(|f| gin_match(f, gb.col_global).map(|(_, q)| q));
+                let query = if inl {
+                    [plan.joins[ri - 1].on.as_ref(), plan.filter.as_ref()]
+                        .into_iter()
+                        .flatten()
+                        .find_map(|f| {
+                            gin_sibling_match(f, gb.col_global, rel.offset).map(|(_, q)| q)
+                        })
+                } else {
+                    plan.filter
+                        .as_ref()
+                        .and_then(|f| gin_match(f, gb.col_global).map(|(_, q)| q))
+                };
                 let (pairs, units) = self.gin_bound_rows(
                     &rel.table_name,
                     gb,
                     query,
+                    left,
                     &env,
                     meter,
                     &plan.rel_masks[ri],
@@ -1401,14 +1410,25 @@ impl Engine {
                 (pairs.into_iter().map(|(_, v)| v).collect(), units)
             }
             Some(ScanBound::Gist(gb)) => {
-                // Re-find the constant query `Q` in the WHERE filter (the conjunct plan-time
-                // `gist_match` chose — gist.md §5); the `&&`/`@>` predicate also stays as the
-                // residual filter applied to these rows downstream (always-recheck).
-                let query = plan.filter.as_ref().and_then(|f| gist_query_operand(f, gb));
+                let query = if inl {
+                    [plan.joins[ri - 1].on.as_ref(), plan.filter.as_ref()]
+                        .into_iter()
+                        .flatten()
+                        .find_map(|f| match gb.strategy {
+                            crate::gist::GistStrategy::Equal => {
+                                gist_scalar_sibling_match(f, gb.col_global, rel.offset)
+                                    .map(|(_, q)| q)
+                            }
+                            _ => gist_sibling_match(f, gb.col_global, rel.offset).map(|(_, q)| q),
+                        })
+                } else {
+                    plan.filter.as_ref().and_then(|f| gist_query_operand(f, gb))
+                };
                 let (pairs, units) = self.gist_bound_rows(
                     &rel.table_name,
                     gb,
                     query,
+                    left,
                     &env,
                     meter,
                     &plan.rel_masks[ri],

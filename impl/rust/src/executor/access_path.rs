@@ -225,11 +225,11 @@ impl Engine {
             }
             Some(ScanBound::Gin(gb)) => {
                 let query = filter.and_then(|f| gin_match(f, gb.col_global).map(|(_, q)| q));
-                self.gin_bound_rows(table_name, gb, query, env, meter, mask, false)?
+                self.gin_bound_rows(table_name, gb, query, &[], env, meter, mask, false)?
             }
             Some(ScanBound::Gist(gb)) => {
                 let query = filter.and_then(|f| gist_query_operand(f, gb));
-                self.gist_bound_rows(table_name, gb, query, env, meter, mask, false)?
+                self.gist_bound_rows(table_name, gb, query, &[], env, meter, mask, false)?
             }
             Some(ScanBound::PkSet(ks)) => {
                 self.pk_key_set_rows(store, ks, params, &[], mask, &[], false)?
@@ -251,7 +251,7 @@ impl Engine {
         })
     }
 
-    /// Execute a GIN-bounded scan (spec/design/gin.md §6, cost.md §3). Evaluates the constant
+    /// Execute a GIN-bounded scan (spec/design/gin.md §6, cost.md §3). Evaluates the
     /// query operand, extracts its terms + mode via the `array_ops` opclass (an array for `@>`/`&&`;
     /// a single scalar term for `= ANY` — `Member`; the array's distinct non-NULL terms for `=` —
     /// `Equal`), gathers each term's posting list (a prefix range scan of the GIN entry tree),
@@ -274,6 +274,7 @@ impl Engine {
         table_name: &str,
         gb: &GinBound,
         query: Option<&RExpr>,
+        query_row: &[Value],
         env: &EvalEnv,
         meter: &mut Meter,
         mask: &[bool],
@@ -282,9 +283,9 @@ impl Engine {
         let store = self.store(table_name);
         // Extract the query's distinct terms. This (the opclass `extract_query_terms`) is a pure
         // planning step, NOT metered (cost.md §3) — evaluate `Q` on a scratch meter. `Q` is a
-        // constant, so the empty row suffices.
+        // `query_row` is empty for a constant bound and the combined left row for a sibling INL.
         let qv = match query {
-            Some(q) => q.eval(&[], env, &mut Meter::new())?,
+            Some(q) => q.eval(query_row, env, &mut Meter::new())?,
             None => return Ok((Vec::new(), (0, 0))),
         };
         // Each term is the element's order-preserving key encoding (gin.md §4) — the SAME bytes the
@@ -420,7 +421,7 @@ impl Engine {
         Ok((rows, (pages, slabs)))
     }
 
-    /// Gather a GiST-bounded scan's candidate rows (spec/design/gist.md §5). Evaluates the constant
+    /// Gather a GiST-bounded scan's candidate rows (spec/design/gist.md §5). Evaluates the
     /// query operand, then **descends the index's resident R-tree** visiting only children
     /// `consistent` with the query, collecting candidate storage keys at the leaves; each candidate
     /// row is point-looked-up in storage-key order. The original `&&`/`@>` predicate stays the
@@ -436,6 +437,7 @@ impl Engine {
         table_name: &str,
         gb: &GistBound,
         query: Option<&RExpr>,
+        query_row: &[Value],
         env: &EvalEnv,
         meter: &mut Meter,
         mask: &[bool],
@@ -443,10 +445,10 @@ impl Engine {
     ) -> Result<(Vec<(Vec<u8>, Row)>, (usize, usize))> {
         use crate::gist::{GistQuery, GistStrategy};
         let store = self.store(table_name);
-        // The query operand is a constant; evaluating it (the opclass "extract query") is a planning
-        // step, NOT metered (cost.md §3) — a scratch meter over the empty row.
+        // Extracting a constant or once-per-outer sibling query is a planning step, NOT metered
+        // (cost.md §3), and uses a scratch meter.
         let qv = match query {
-            Some(q) => q.eval(&[], env, &mut Meter::new())?,
+            Some(q) => q.eval(query_row, env, &mut Meter::new())?,
             None => return Ok((Vec::new(), (0, 0))),
         };
         // Form the resident-tree search query from the constant, handling the strategy-specific

@@ -279,6 +279,24 @@ bound; the GiST `=` gather fires only when a GiST index is the *only* index on t
 ordered-index pushdown explicitly **skips** a GiST index (its store key is `[v, v]‖skey`, not the
 ordered-index key form, so it must never be probed as a B-tree).
 
+### 6.1 Join sibling query operands
+
+For an INNER/CROSS/LEFT join's right base relation, range_ops `&&`/`@>` and fixed-width scalar `=`
+may take the opclass query from a **bare column of an earlier sibling relation**. The value is
+evaluated once for the current combined left row; the engine forms the same range/scalar query,
+descends the resident tree, sorts candidate storage keys, fetches them in that order, and reapplies
+the complete ON and WHERE predicates. NULL, empty-overlap, empty-containment fallback, and scalar
+encoding behave exactly as for a constant query **per outer row**. A LEFT join NULL-extends a miss or
+empty bound. The always-recheck posture covers lossy candidates unchanged.
+
+The query node must itself be the earlier column: expressions, a column from the indexed relation,
+later siblings, and correlated outers do not qualify. Multi-column exclusion GiST indexes remain
+constraint-only. PK and ordered-B-tree sibling bounds win first; GiST then precedes GIN. A usable
+sibling GiST bound overrides an ordinary once-materialized constant bound. Because candidates are in
+storage-key order, the bound also composes with the two-table join top-N rule. Capability
+`query.gist_index_nested_loop` and the `gist*_index_nested_loop.test` suites pin both opclasses,
+cost, residuals, LEFT behavior, precedence, and EXPLAIN.
+
 ## 7. `EXCLUDE` constraints (GX3) ✅ LANDED
 
 ```sql
@@ -415,6 +433,9 @@ Each is its own vertical slice with a NoREC/oracle obligation ([conformance.md �
   such a type lands — at which point it slots into the same seam.
 - **SP-GiST** (`index_kind = 3`) — a space-partitioning sibling, a separate access method, not
   scheduled.
+- **General expression, correlated, same-relation, or later-sibling planner query operands** — the
+  bare earlier-sibling form has landed (§6.1); broader operands need their own evaluation-order and
+  soundness contract.
 - **GiST on a TEMP table** — `0A000` in GX1: the resident R-tree (§4.1) would live on the temp
   snapshot, deferred with the rest of the container-on-temp work
   ([temp-tables.md](temp-tables.md)). A persistent table's GiST index is fully supported.

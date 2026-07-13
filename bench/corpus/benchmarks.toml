@@ -313,6 +313,25 @@ gen = "int_uniform"
 min = 1
 max = 1000000
 
+# Opclass sibling index-nested-loop (query.gin_index_nested_loop). Ten outer arrays each select one
+# term from the 200k-row GIN dataset. Before the sibling bound, the nested loop full-scanned the
+# inner ten times. The explicit inner-id tie-break keeps the checksum total-order.
+[[bench]]
+name = "gin_inl"
+description = "GIN sibling-bound join: 10 term probes into the 200k-row array dataset"
+dataset = "gin"
+kind = "query"
+sql = "SELECT o.id, d.id FROM gin_inl_outer o JOIN docs d ON d.tags @> o.q ORDER BY o.id, d.id"
+warmup = 5
+iterations = 50
+seed = 4257
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS gin_inl_outer",
+  "CREATE TABLE gin_inl_outer (id bigint PRIMARY KEY, q bigint[])",
+  "INSERT INTO gin_inl_outer VALUES (1, '{1}'), (2, '{2}'), (3, '{3}'), (4, '{4}'), (5, '{5}'), (6, '{6}'), (7, '{7}'), (8, '{8}'), (9, '{9}'), (10, '{10}')"
+]
+
 # The same merge over a leading SECONDARY-INDEX column: an 8-value IN-list on customer_id (~10 rows per
 # value) lowers to 8 index point probes + a PK lookup per admitted row, vs. a full scan
 # (query.or_in_point_lookup, the secondary-index path).

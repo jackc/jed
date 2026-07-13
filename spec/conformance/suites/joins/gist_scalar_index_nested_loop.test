@@ -1,0 +1,127 @@
+# GiST fixed-width scalar = sibling-bound index-nested-loop (gist.md §6.1). This file is not
+# PostgreSQL-oracle-imported because PG requires the btree_gist extension for the DDL; the equality
+# rows are ordinary PG semantics. It also pins that a regular B-tree sibling bound wins when both
+# access methods index the same scalar column.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.gist_scalar_index, dml.insert, dml.insert_multi_row, query.select, query.join_inner, query.join_left, query.cross_join, query.qualified_column, query.table_alias, query.where_eq, query.comparison_order, query.logical_connectives, query.order_by, query.limit, query.explain, query.index_nested_loop, query.gist_scalar_scan, query.gist_index_nested_loop, query.order_by_join_scan, query.order_by_join_inl, types.i32, null.three_valued, resource.cost_metering
+
+statement ok
+CREATE TABLE room_probe (id i32 PRIMARY KEY, room i32)
+
+statement ok
+CREATE TABLE seat (id i32 PRIMARY KEY, room i32)
+
+statement ok
+CREATE INDEX seat_room_gist ON seat USING gist (room)
+
+statement ok
+INSERT INTO room_probe VALUES (1, 10), (2, 20), (3, 99), (4, NULL)
+
+statement ok
+INSERT INTO seat VALUES
+  (1, 10), (2, 20), (3, 10), (4, 30), (5, 20),
+  (6, 40), (7, 10), (8, 50), (9, NULL)
+
+# cost: 34
+query II nosort
+SELECT p.id, s.id
+FROM room_probe p JOIN seat s ON s.room = p.room
+ORDER BY p.id, s.id
+----
+1
+1
+1
+3
+1
+7
+2
+2
+2
+5
+
+# cost: 36
+query II nosort
+SELECT p.id, s.id
+FROM room_probe p LEFT JOIN seat s ON s.room = p.room
+ORDER BY p.id, s.id
+----
+1
+1
+1
+3
+1
+7
+2
+2
+2
+5
+3
+NULL
+4
+NULL
+
+# WHERE-derived bound plus a residual reject.
+# cost: 42
+query II nosort
+SELECT p.id, s.id
+FROM room_probe p CROSS JOIN seat s
+WHERE s.room = p.room AND s.id > 2
+ORDER BY p.id, s.id
+----
+1
+3
+1
+7
+2
+5
+
+# cost: 18
+query II nosort
+SELECT p.id, s.id
+FROM room_probe p JOIN seat s ON s.room = p.room
+ORDER BY p.id
+LIMIT 2
+----
+1
+1
+1
+3
+
+# Ordered B-tree precedence over GiST for the same sibling equality.
+statement ok
+CREATE INDEX seat_room_btree ON seat (room)
+
+query ITT nosort
+EXPLAIN SELECT p.id, s.id FROM room_probe p JOIN seat s ON s.room = p.room
+----
+0
+Nested Loop
+inner; on:conjuncts=1
+1
+Scan room_probe
+Full scan; touched=2
+1
+Scan seat
+Index-nested-loop Index bound: using seat_room_btree; touched=2
+
+# A primary-key sibling bound is cheaper still and wins over a GiST index on that same key.
+statement ok
+CREATE TABLE seat_pk (room i32 PRIMARY KEY, id i32)
+
+statement ok
+CREATE INDEX seat_pk_room_gist ON seat_pk USING gist (room)
+
+statement ok
+INSERT INTO seat_pk VALUES (10, 1), (20, 2), (30, 3)
+
+query ITT nosort
+EXPLAIN SELECT p.id, s.id FROM room_probe p JOIN seat_pk s ON s.room = p.room
+----
+0
+Nested Loop
+inner; on:conjuncts=1
+1
+Scan room_probe
+Full scan; touched=2
+1
+Scan seat_pk
+Index-nested-loop PK bound: room = join; touched=2

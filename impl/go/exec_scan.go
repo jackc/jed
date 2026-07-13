@@ -864,7 +864,7 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 					query = q
 				}
 			}
-			entries, pages, slabs, err = db.ginBoundRows(plan.rels[0].tableName, sb.gin, query, env, meter, plan.relMasks[0], true)
+			entries, pages, slabs, err = db.ginBoundRows(plan.rels[0].tableName, sb.gin, query, nil, env, meter, plan.relMasks[0], true)
 		} else {
 			var query *rExpr
 			if plan.filter != nil {
@@ -872,7 +872,7 @@ func (db *engine) execStreamingScan(plan *selectPlan, env *evalEnv, meter *costM
 					query = q
 				}
 			}
-			entries, pages, slabs, err = db.gistBoundRows(plan.rels[0].tableName, sb.gist, query, env, meter, plan.relMasks[0], true)
+			entries, pages, slabs, err = db.gistBoundRows(plan.rels[0].tableName, sb.gist, query, nil, env, meter, plan.relMasks[0], true)
 		}
 		if err != nil {
 			return selectResult{}, err
@@ -1431,6 +1431,7 @@ func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 	// once-materialized relBounds.
 	store := db.lkpStoreScoped(rel.db, rel.tableName)
 	sb := plan.phys.relINLBounds[ri]
+	inl := sb != nil
 	if sb == nil {
 		sb = plan.phys.relBounds[ri]
 	}
@@ -1442,15 +1443,22 @@ func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 			return nil, err
 		}
 	} else if sb != nil && sb.gin != nil {
-		// Re-find the constant query Q in the WHERE filter (the same conjunct plan-time ginMatch
-		// chose — gin.md §6); the @>/&& predicate also stays the residual filter downstream.
+		// Re-find Q using the same operand class as planning: ON then WHERE for a sibling INL,
+		// otherwise the ordinary constant WHERE operand. The full predicate remains residual.
 		var query *rExpr
-		if plan.filter != nil {
+		if inl {
+			for _, filter := range []*rExpr{plan.joins[ri-1].on, plan.filter} {
+				if _, q, ok := ginSiblingMatch(filter, sb.gin.colGlobal, rel.offset); ok {
+					query = q
+					break
+				}
+			}
+		} else if plan.filter != nil {
 			if _, q, ok := ginMatch(plan.filter, sb.gin.colGlobal); ok {
 				query = q
 			}
 		}
-		entries, pages, sl, err := db.ginBoundRows(rel.tableName, sb.gin, query, env, meter, plan.relMasks[ri], false)
+		entries, pages, sl, err := db.ginBoundRows(rel.tableName, sb.gin, query, left, env, meter, plan.relMasks[ri], false)
 		if err != nil {
 			return nil, err
 		}
@@ -1461,15 +1469,28 @@ func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 		}
 		nodeCount, slabs = pages, sl
 	} else if sb != nil && sb.gist != nil {
-		// Re-find the constant query Q (the conjunct plan-time gistMatch chose — gist.md §5); the
-		// &&/@> predicate also stays the residual filter downstream (always-recheck).
+		// Re-find Q using the same operand class as planning. GiST remains always-recheck.
 		var query *rExpr
-		if plan.filter != nil {
+		if inl {
+			for _, filter := range []*rExpr{plan.joins[ri-1].on, plan.filter} {
+				var q *rExpr
+				var ok bool
+				if sb.gist.strategy == gistEqual {
+					_, q, ok = gistScalarSiblingMatch(filter, sb.gist.colGlobal, rel.offset)
+				} else {
+					_, q, ok = gistSiblingMatch(filter, sb.gist.colGlobal, rel.offset)
+				}
+				if ok {
+					query = q
+					break
+				}
+			}
+		} else if plan.filter != nil {
 			if q, ok := gistQueryOperand(plan.filter, sb.gist); ok {
 				query = q
 			}
 		}
-		entries, pages, sl, err := db.gistBoundRows(rel.tableName, sb.gist, query, env, meter, plan.relMasks[ri], false)
+		entries, pages, sl, err := db.gistBoundRows(rel.tableName, sb.gist, query, left, env, meter, plan.relMasks[ri], false)
 		if err != nil {
 			return nil, err
 		}

@@ -2992,9 +2992,9 @@ export class Engine {
       case "index":
         return prefix + "Index bound: using " + b.index.nameKey;
       case "gin":
-        return "GIN bound: using " + b.gin.nameKey;
+        return prefix + "GIN bound: using " + b.gin.nameKey;
       case "gist":
-        return "GiST bound: using " + b.gist.nameKey;
+        return prefix + "GiST bound: using " + b.gist.nameKey;
       case "pkSet":
         return (
           prefix +
@@ -6642,12 +6642,12 @@ export class Engine {
       }
       case "gin": {
         const m = filter !== null ? ginMatch(filter, b.gin.colGlobal) : null;
-        const r = this.ginBoundRows(tableName, b.gin, m?.query ?? null, env, meter, mask);
+        const r = this.ginBoundRows(tableName, b.gin, m?.query ?? null, [], env, meter, mask);
         return { ...r, empty: false };
       }
       case "gist": {
         const q = filter !== null ? gistQueryOperand(filter, b.gist) : null;
-        const r = this.gistBoundRows(tableName, b.gist, q, env, meter, mask);
+        const r = this.gistBoundRows(tableName, b.gist, q, [], env, meter, mask);
         return { ...r, empty: false };
       }
       case "pkSet": {
@@ -6671,7 +6671,7 @@ export class Engine {
   }
 
   // ginBoundRows executes a GIN-bounded scan (spec/design/gin.md §6, cost.md §3). Evaluates the
-  // constant query operand, extracts its terms + mode via the array_ops opclass (an array for @>/&&/=;
+  // query operand, extracts its terms + mode via the array_ops opclass (an array for @>/&&/=;
   // a single scalar term for = ANY — "member"; the array's distinct non-NULL terms for = — "equal"),
   // gathers each term's posting list (a prefix range scan of the GIN entry tree), combines them by
   // mode (@>, = ANY, and = → intersection, && → union) into the candidate storage-key set, and
@@ -6685,6 +6685,7 @@ export class Engine {
     tableName: string,
     gb: GinBound,
     query: RExpr | null,
+    queryRow: Row,
     env: EvalEnv,
     meter: Meter,
     mask: boolean[],
@@ -6693,8 +6694,9 @@ export class Engine {
     const store = this.lkpStore(tableName);
     if (query === null) return { entries: [], pages: 0, slabs: 0 };
     // Extract the query's terms (extract_query_terms) — a pure planning step, NOT metered (cost.md
-    // §3): evaluate Q on a scratch meter. Q is a constant, so the empty row suffices.
-    const qv = evalExpr(query, [], env, new Meter());
+    // §3): evaluate Q on a scratch meter. queryRow is empty for a constant bound and the combined
+    // left row for a sibling INL.
+    const qv = evalExpr(query, queryRow, env, new Meter());
     // Each term is the element's order-preserving key encoding (gin.md §4) — the SAME bytes the
     // entries carry, so a term doubles as its posting-list prefix below. Encoding now lets us dedup
     // distinct terms by bytes (a bijection: byte-dedup == value-dedup, byte-sort == value-sort)
@@ -6812,6 +6814,7 @@ export class Engine {
     tableName: string,
     gb: GistBound,
     query: RExpr | null,
+    queryRow: Row,
     env: EvalEnv,
     meter: Meter,
     mask: boolean[],
@@ -6819,8 +6822,8 @@ export class Engine {
   ): { entries: Entry[]; pages: number; slabs: number } {
     const store = this.lkpStore(tableName);
     if (query === null) return { entries: [], pages: 0, slabs: 0 };
-    // The query operand is a constant; evaluating it (extract query) is a planning step, NOT metered.
-    const qv = evalExpr(query, [], env, new Meter());
+    // Extracting a constant or once-per-outer sibling query is a planning step, NOT metered.
+    const qv = evalExpr(query, queryRow, env, new Meter());
     // Form the resident-tree search query from the constant, handling strategy-specific degenerate
     // cases. A NULL query is never TRUE for any row (all strategies).
     let gq: GistQuery;
@@ -11785,6 +11788,7 @@ export class Engine {
               plan.rels[0]!.tableName,
               sb.gin,
               plan.filter === null ? null : (ginMatch(plan.filter, sb.gin.colGlobal)?.query ?? null),
+              [],
               env,
               meter,
               plan.relMasks[0]!,
@@ -11794,6 +11798,7 @@ export class Engine {
               plan.rels[0]!.tableName,
               sb.gist,
               plan.filter === null ? null : gistQueryOperand(plan.filter, sb.gist),
+              [],
               env,
               meter,
               plan.relMasks[0]!,
@@ -12285,6 +12290,7 @@ export class Engine {
     // An index-nested-loop bound (per-outer-row seek) takes precedence over the once-materialized bound
     // and resolves its sibling source from the current left row (cost.md §3 "JOIN"); else the
     // once-materialized relBounds.
+    const inl = plan.phys.relINLBounds[ri] !== null;
     const relBound = plan.phys.relINLBounds[ri] ?? plan.phys.relBounds[ri]!;
     if (relBound !== null && relBound.kind === "index") {
       const r = this.indexBoundRows(
@@ -12299,13 +12305,21 @@ export class Engine {
       nodeCount = r.pages;
       slabs = r.slabs;
     } else if (relBound !== null && relBound.kind === "gin") {
-      // Re-find the constant query Q in the WHERE filter (the same conjunct plan-time ginMatch
-      // chose — gin.md §6); the @>/&& predicate also stays the residual filter downstream.
-      const m = plan.filter !== null ? ginMatch(plan.filter, relBound.gin.colGlobal) : null;
+      let m: { strategy: GinStrategy; query: RExpr } | null = null;
+      if (inl) {
+        for (const filter of [plan.joins[ri - 1]!.on, plan.filter]) {
+          if (filter === null) continue;
+          m = ginSiblingMatch(filter, relBound.gin.colGlobal, rel.offset);
+          if (m !== null) break;
+        }
+      } else if (plan.filter !== null) {
+        m = ginMatch(plan.filter, relBound.gin.colGlobal);
+      }
       const r = this.ginBoundRows(
         rel.tableName,
         relBound.gin,
         m?.query ?? null,
+        left,
         env,
         meter,
         plan.relMasks[ri]!,
@@ -12315,10 +12329,28 @@ export class Engine {
       nodeCount = r.pages;
       slabs = r.slabs;
     } else if (relBound !== null && relBound.kind === "gist") {
-      // Re-find the constant query Q (the conjunct plan-time analysis chose — gist.md §5/§6); the
-      // &&/@>/= predicate also stays the residual filter downstream (always-recheck).
-      const q = plan.filter !== null ? gistQueryOperand(plan.filter, relBound.gist) : null;
-      const r = this.gistBoundRows(rel.tableName, relBound.gist, q, env, meter, plan.relMasks[ri]!);
+      let q: RExpr | null = null;
+      if (inl) {
+        for (const filter of [plan.joins[ri - 1]!.on, plan.filter]) {
+          if (filter === null) continue;
+          q =
+            relBound.gist.strategy === "equal"
+              ? (gistScalarSiblingMatch(filter, relBound.gist.colGlobal, rel.offset)?.query ?? null)
+              : (gistSiblingMatch(filter, relBound.gist.colGlobal, rel.offset)?.query ?? null);
+          if (q !== null) break;
+        }
+      } else if (plan.filter !== null) {
+        q = gistQueryOperand(plan.filter, relBound.gist);
+      }
+      const r = this.gistBoundRows(
+        rel.tableName,
+        relBound.gist,
+        q,
+        left,
+        env,
+        meter,
+        plan.relMasks[ri]!,
+      );
       rows = r.entries.map((e) => e.row);
       nodeCount = r.pages;
       slabs = r.slabs;
@@ -14016,6 +14048,56 @@ export function detectINLBound(
       };
     }
   }
+  // Opclass sibling bounds follow the cheaper PK and ordered-B-tree paths. GiST precedes GIN,
+  // matching ordinary SELECT planning; only a bare earlier-sibling column is admissible.
+  const filters = [on, whereFilter].filter((f): f is RExpr => f !== null);
+  for (const idx of rel.table.indexes) {
+    if (idx.kind !== "gist" || idx.keys.length !== 1) continue;
+    const ci = indexFirstColumn(idx);
+    const colGlobal = rel.offset + ci;
+    const colType = rel.table.columns[ci]!.type;
+    for (const filter of filters) {
+      if (colType.kind === "range") {
+        const m = gistSiblingMatch(filter, colGlobal, cutoff);
+        if (m !== null)
+          return {
+            kind: "gist",
+            gist: { nameKey: idx.name.toLowerCase(), strategy: m.strategy, colGlobal },
+          };
+      } else if (isGistScalarType(colType)) {
+        if (gistScalarSiblingMatch(filter, colGlobal, cutoff) !== null)
+          return {
+            kind: "gist",
+            gist: {
+              nameKey: idx.name.toLowerCase(),
+              strategy: "equal",
+              colGlobal,
+              scalarType: typeScalar(colType),
+            },
+          };
+      }
+    }
+  }
+  for (const idx of rel.table.indexes) {
+    if (idx.kind !== "gin") continue;
+    const ci = indexFirstColumn(idx);
+    const colGlobal = rel.offset + ci;
+    const colType = rel.table.columns[ci]!.type;
+    if (colType.kind !== "array") continue;
+    for (const filter of filters) {
+      const m = ginSiblingMatch(filter, colGlobal, cutoff);
+      if (m !== null)
+        return {
+          kind: "gin",
+          gin: {
+            nameKey: idx.name.toLowerCase(),
+            elemType: typeScalar(colType.elem),
+            strategy: m.strategy,
+            colGlobal,
+          },
+        };
+    }
+  }
   return null;
 }
 
@@ -14205,19 +14287,42 @@ export function ginMatch(
   filter: RExpr,
   colGlobal: number,
 ): { strategy: GinStrategy; query: RExpr } | null {
+  return ginMatchOperand(filter, colGlobal, rexprIsConstant);
+}
+
+export function ginSiblingMatch(
+  filter: RExpr,
+  colGlobal: number,
+  cutoff: number,
+): { strategy: GinStrategy; query: RExpr } | null {
+  return ginMatchOperand(
+    filter,
+    colGlobal,
+    (q) => q.kind === "column" && q.index < cutoff,
+  );
+}
+
+function ginMatchOperand(
+  filter: RExpr,
+  colGlobal: number,
+  queryOK: (query: RExpr) => boolean,
+): { strategy: GinStrategy; query: RExpr } | null {
   if (filter.kind === "and") {
-    return ginMatch(filter.lhs, colGlobal) ?? ginMatch(filter.rhs, colGlobal);
+    return (
+      ginMatchOperand(filter.lhs, colGlobal, queryOK) ??
+      ginMatchOperand(filter.rhs, colGlobal, queryOK)
+    );
   }
   if (filter.kind === "arrayFunc" && filter.args.length === 2) {
     const a = filter.args[0]!;
     const b = filter.args[1]!;
     if (filter.func === "contains") {
-      if (isColumnRef(a, colGlobal) && rexprIsConstant(b))
+      if (isColumnRef(a, colGlobal) && queryOK(b))
         return { strategy: "contains", query: b };
     } else if (filter.func === "overlaps") {
-      if (isColumnRef(a, colGlobal) && rexprIsConstant(b))
+      if (isColumnRef(a, colGlobal) && queryOK(b))
         return { strategy: "overlaps", query: b };
-      if (isColumnRef(b, colGlobal) && rexprIsConstant(a))
+      if (isColumnRef(b, colGlobal) && queryOK(a))
         return { strategy: "overlaps", query: a };
     }
   }
@@ -14226,9 +14331,9 @@ export function ginMatch(
   // @>-superset gather + the residual =). <> is NOT matched (only "eq"). When the column is an array,
   // the other constant operand is necessarily an array too (resolve rejects an array/scalar =).
   if (filter.kind === "compare" && filter.op === "eq") {
-    if (isColumnRef(filter.lhs, colGlobal) && rexprIsConstant(filter.rhs))
+    if (isColumnRef(filter.lhs, colGlobal) && queryOK(filter.rhs))
       return { strategy: "equal", query: filter.rhs };
-    if (isColumnRef(filter.rhs, colGlobal) && rexprIsConstant(filter.lhs))
+    if (isColumnRef(filter.rhs, colGlobal) && queryOK(filter.lhs))
       return { strategy: "equal", query: filter.lhs };
   }
   // `c = ANY(col)` — the array spelling of membership (gin.md §6): the GIN column must be ANY's
@@ -14240,7 +14345,7 @@ export function ginMatch(
     filter.op === "eq" &&
     !filter.all &&
     isColumnRef(filter.array, colGlobal) &&
-    rexprIsConstant(filter.lhs)
+    queryOK(filter.lhs)
   ) {
     return { strategy: "member", query: filter.lhs };
   }
@@ -14294,13 +14399,36 @@ export function detectGistBound(
 // accelerated (the `=` opclass has only the equal strategy). Returns the constant operand — used at
 // plan time (existence) and exec time (recover from plan.filter).
 export function gistScalarMatch(filter: RExpr, colGlobal: number): { query: RExpr } | null {
+  return gistScalarMatchOperand(filter, colGlobal, rexprIsConstant);
+}
+
+export function gistScalarSiblingMatch(
+  filter: RExpr,
+  colGlobal: number,
+  cutoff: number,
+): { query: RExpr } | null {
+  return gistScalarMatchOperand(
+    filter,
+    colGlobal,
+    (q) => q.kind === "column" && q.index < cutoff,
+  );
+}
+
+function gistScalarMatchOperand(
+  filter: RExpr,
+  colGlobal: number,
+  queryOK: (query: RExpr) => boolean,
+): { query: RExpr } | null {
   if (filter.kind === "and") {
-    return gistScalarMatch(filter.lhs, colGlobal) ?? gistScalarMatch(filter.rhs, colGlobal);
+    return (
+      gistScalarMatchOperand(filter.lhs, colGlobal, queryOK) ??
+      gistScalarMatchOperand(filter.rhs, colGlobal, queryOK)
+    );
   }
   if (filter.kind === "compare" && filter.op === "eq") {
-    if (isColumnRef(filter.lhs, colGlobal) && rexprIsConstant(filter.rhs))
+    if (isColumnRef(filter.lhs, colGlobal) && queryOK(filter.rhs))
       return { query: filter.rhs };
-    if (isColumnRef(filter.rhs, colGlobal) && rexprIsConstant(filter.lhs))
+    if (isColumnRef(filter.rhs, colGlobal) && queryOK(filter.lhs))
       return { query: filter.lhs };
   }
   return null;
@@ -14323,21 +14451,44 @@ export function gistMatch(
   filter: RExpr,
   colGlobal: number,
 ): { strategy: GistStrategy; query: RExpr } | null {
+  return gistMatchOperand(filter, colGlobal, rexprIsConstant);
+}
+
+export function gistSiblingMatch(
+  filter: RExpr,
+  colGlobal: number,
+  cutoff: number,
+): { strategy: GistStrategy; query: RExpr } | null {
+  return gistMatchOperand(
+    filter,
+    colGlobal,
+    (q) => q.kind === "column" && q.index < cutoff,
+  );
+}
+
+function gistMatchOperand(
+  filter: RExpr,
+  colGlobal: number,
+  queryOK: (query: RExpr) => boolean,
+): { strategy: GistStrategy; query: RExpr } | null {
   if (filter.kind === "and") {
-    return gistMatch(filter.lhs, colGlobal) ?? gistMatch(filter.rhs, colGlobal);
+    return (
+      gistMatchOperand(filter.lhs, colGlobal, queryOK) ??
+      gistMatchOperand(filter.rhs, colGlobal, queryOK)
+    );
   }
   if (filter.kind === "rangeOp" && filter.args.length === 2) {
     const a = filter.args[0]!;
     const b = filter.args[1]!;
     if (filter.op === "overlaps") {
       // && — symmetric in its operands.
-      if (isColumnRef(a, colGlobal) && rexprIsConstant(b))
+      if (isColumnRef(a, colGlobal) && queryOK(b))
         return { strategy: "overlaps", query: b };
-      if (isColumnRef(b, colGlobal) && rexprIsConstant(a))
+      if (isColumnRef(b, colGlobal) && queryOK(a))
         return { strategy: "overlaps", query: a };
     } else if (filter.op === "contains") {
       // @> — the indexed column must be the container (LEFT).
-      if (isColumnRef(a, colGlobal) && rexprIsConstant(b))
+      if (isColumnRef(a, colGlobal) && queryOK(b))
         return { strategy: "contains", query: b };
     }
   }

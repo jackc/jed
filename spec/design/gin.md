@@ -218,8 +218,7 @@ The per-relation pushdown seam ([indexes.md §5](indexes.md), [cost.md §3](cost
 relation scanned by a **`SELECT`, `UPDATE`, or `DELETE`**, if the `WHERE` AND-chain has a conjunct
 `col @> Q` (contains), `col && Q` (overlaps), `c = ANY(col)` (membership), or `col = Q`
 (exact array equality) where `col` is a GIN-indexed column and **the query operand is a
-constant** (`Q` a literal/`$N`-param array, `c` a literal/`$N`-param scalar — a
-correlated/array-column operand is a follow-on), the plan bounds the scan through the GIN
+constant** (`Q` a literal/`$N`-param array, `c` a literal/`$N`-param scalar), the plan bounds the scan through the GIN
 index. **`UPDATE`/`DELETE` apply the identical bound to their target-row scan** (the gather +
 residual filter that finds the rows to rewrite/remove), so the same conjunct that bounds a
 `SELECT` bounds the mutation — only the GiST/GIN precedence differs: after PK and ordered B-tree,
@@ -268,11 +267,32 @@ PK/ordered/full choice stands.
    correct.
 
 **Narrowings this slice** (documented, relaxable, each a follow-on with its own NoREC
-obligation — [conformance.md §8](conformance.md)): a **constant** query operand only (no
-correlated / array-column operand); and **`@>`, `&&`, `= ANY`, and array `=` only** (no `<@` or
+obligation — [conformance.md §8](conformance.md)): ordinary single-relation/mutation bounds require
+a **constant** query operand; join INL additionally admits the bare earlier-sibling operand in §6.1,
+but not an expression, the indexed relation's own column, a later sibling, or a correlated outer
+operand. The accelerated operators are **`@>`, `&&`, `= ANY`, and array `=` only** (no `<@` or
 `IN` over a scalar list). With a non-blocking `LIMIT`, posting-list gather/combine remains complete
 and fully charged, then storage-key-ordered table point-lookups and residual work stop at the window
 (mutations have no `LIMIT`).
+
+### 6.1 Join sibling query operands
+
+For an INNER/CROSS/LEFT join's right base relation, the same four GIN strategies may take their query
+operand from a **bare column of an earlier sibling relation**. This is the opclass form of the
+index-nested-loop rule: evaluate the sibling value once for the current combined left row, perform
+the ordinary posting gather, fetch candidates in storage-key order, and reapply the complete ON and
+WHERE predicates. NULL, empty, NULL-containing, and duplicate-term values take exactly the
+provably-empty/full-scan-fallback paths above **per outer row**. A fallback scans the inner for that
+outer row; it never turns an unsupported runtime value into an unsound prune. An empty/miss candidate
+set on a LEFT join produces the normal NULL extension.
+
+Detection reads ON before WHERE and requires the query node itself to be that bare earlier column.
+An inner array column and a later sibling are unavailable and remain full-scan shapes. PK and ordered
+B-tree INL have precedence; then GiST precedes GIN, matching SELECT bound precedence. A usable GIN
+sibling bound overrides an ordinary once-materialized constant bound because it must be rebuilt for
+each outer row. Capability `query.gin_index_nested_loop` and
+`suites/joins/gin_index_nested_loop.test` pin rows, cost, rejection gates, precedence, EXPLAIN, and
+the join top-N composition.
 
 ### Cost (the cross-core contract — [cost.md §3](cost.md))
 
@@ -389,8 +409,9 @@ vertical slice with a NoREC obligation ([conformance.md §8](conformance.md)):
   element key encodings lift ([encoding.md §2.4–§2.6](encoding.md)); composite-element arrays too.
 - **More operators** — `<@` (contained-by, a broad scan + recheck), `IN` membership over a
   scalar list. (`const = ANY(col)` membership and array `=` have landed — §1/§6.)
-- **Multi-column GIN** and correlated / array-column query operands. (GIN and ordered-index bounds
-  for `UPDATE`/`DELETE` scans plus bounded LIMIT streaming have landed — §6 and
+- **Multi-column GIN** and general correlated / expression / same-or-later-relation query operands.
+  (Bare earlier-sibling operands, GIN and ordered-index bounds for `UPDATE`/`DELETE` scans, and
+  bounded LIMIT streaming have landed — §6/§6.1 and
   [indexes.md §5.1](indexes.md).)
 - **Posting-list run compression** — a long contiguous run of one term's entries
   (a term present in very many rows) is stored as the raw entry sequence this slice; PG's

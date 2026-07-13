@@ -164,7 +164,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 ## Query planner / optimizer
 
 > The planner is a **deterministic rule engine**: it pattern-matches the WHERE shape to pick an
-> access path (PK bound → first-column index equality → GIN → GiST → full scan) and runs joins as
+> access path (PK bound → first-column index equality → GiST → GIN → full scan for SELECT; mutation
+> retains its documented GIN/GiST order) and runs joins as
 > left-deep nested loops in FROM order — no cost-based choice, no statistics, no join reordering.
 > `EXPLAIN` (above) now makes those choices inspectable + corpus-assertable, the substrate for this
 > work. **The load-bearing constraint:** cost is **observable and a cross-core contract** (§8; the
@@ -186,7 +187,11 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   `spec/conformance/suites/joins/index_nested_loop.test`
   - [x] **Two-table top-N combination** — an outer-PK-ordered LIMIT opens a PK/B-tree INL inner
     bound per outer row and stops later seeks at the window; cap `query.order_by_join_inl`.
-  - [ ] _follow-on:_ GIN/GiST sibling bounds.
+  - [x] **GIN sibling bounds** — `@>` / `&&` / array `=` / scalar `= ANY` may take a bare
+    earlier-sibling query operand, preserving opclass degenerates and residual recheck; cap
+    `query.gin_index_nested_loop`.
+  - [x] **GiST sibling bounds** — range `&&` / `@>` and fixed-width scalar `=` may take a bare
+    earlier-sibling query operand; cap `query.gist_index_nested_loop`.
 - [x] **`OR` / `IN`-list → merged point lookups** — a disjunction of equalities on one key column
   (the PK, or a leading B-tree secondary-index column) lowers to a union of point probes over a
   de-duplicated, sorted key set; a last resort (fires only where no contiguous bound applies), cost =
