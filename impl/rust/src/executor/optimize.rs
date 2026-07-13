@@ -24,6 +24,7 @@ impl Engine {
         self.rule_hash_join(plan, scope);
         self.rule_order_by_pk_scan(plan, scope);
         self.rule_order_by_index_scan(plan, scope);
+        self.rule_costed_single_relation_pipeline(plan, scope);
         self.rule_join_pk_ordered(plan, scope);
         self.rule_order_by_limit_top_k(plan);
     }
@@ -130,12 +131,134 @@ impl Engine {
                     && !plan.has_window,
             );
             let bound = if plan.rels.len() == 1 {
-                select_costed_p6a_scan_candidate(candidates, &estimates, SELECT_SCAN_BOUND_POLICY)
+                select_costed_scan_candidate(candidates, &estimates, SELECT_SCAN_BOUND_POLICY)
             } else {
                 select_legacy_scan_candidate(candidates, SELECT_SCAN_BOUND_POLICY)
             };
             plan.phys.rel_estimates.push(estimates);
             plan.phys.rel_bounds.push(bound);
+        }
+    }
+
+    /// Compose every legal access path with its natural ordering, add missing order-only B-tree
+    /// top-N walks, and choose the minimum cumulative scheduled estimate through LIMIT/OFFSET.
+    /// Blocking-sort bookkeeping remains unmetered. Candidates are sorted by canonical
+    /// access-kind/name identity, so the first exact-cost winner is the P0 tie-break.
+    fn rule_costed_single_relation_pipeline(&self, plan: &mut SelectPlan, scope: &Scope<'_>) {
+        if scope.rels.len() != 1
+            || plan.rels.len() != 1
+            || plan.rels[0].srf.is_some()
+            || plan.rels[0].cte.is_some()
+            || plan.rels[0].derived.is_some()
+        {
+            return;
+        }
+        let rel = &scope.rels[0];
+        let access = inventory_scan_candidates(plan.filter.as_ref(), rel, scope.catalog);
+        if access.is_empty() {
+            return;
+        }
+
+        let pk_dir = if !plan.is_agg && !plan.order.is_empty() && plan.order_exprs.is_empty() {
+            order_satisfied_by_pk(rel.table, plan.rels[0].offset, &plan.order, self)
+        } else {
+            None
+        };
+        let index_orders = if !rel.is_attachment()
+            && !plan.is_agg
+            && !plan.has_window
+            && !plan.distinct
+            && !plan.order.is_empty()
+            && plan.order_exprs.is_empty()
+            && pk_dir.is_none()
+        {
+            order_satisfied_by_indexes(rel.table, plan.rels[0].offset, &plan.order, self)
+        } else {
+            Vec::new()
+        };
+
+        struct PipelineCandidate {
+            identity: ScanCandidateIdentity,
+            bound: Option<ScanBound>,
+            pk_ordered: bool,
+            pk_reverse: bool,
+            index_order: Option<IndexOrder>,
+        }
+
+        let mut pipelines = Vec::with_capacity(access.len() + index_orders.len());
+        for candidate in access {
+            let (pk_ordered, pk_reverse, index_order) = match &candidate.scan_order {
+                ScanOrderCapability::StorageKey { .. } => {
+                    (pk_dir.is_some(), pk_dir == Some(true), None)
+                }
+                ScanOrderCapability::IndexKey { index_name, .. } => (
+                    false,
+                    false,
+                    index_orders
+                        .iter()
+                        .find(|order| order.name_key == *index_name)
+                        .cloned(),
+                ),
+            };
+            pipelines.push(PipelineCandidate {
+                identity: candidate.identity,
+                bound: candidate.bound,
+                pk_ordered,
+                pk_reverse,
+                index_order,
+            });
+        }
+        for order in index_orders {
+            if plan.limit.is_none() {
+                break; // the established order-only eligibility gate requires LIMIT
+            }
+            let identity = ScanCandidateIdentity {
+                kind: ScanCandidateKind::Btree,
+                index_name: order.name_key.clone(),
+            };
+            if pipelines
+                .iter()
+                .any(|candidate| candidate.identity == identity)
+            {
+                continue;
+            }
+            pipelines.push(PipelineCandidate {
+                identity,
+                bound: None,
+                pk_ordered: false,
+                pk_reverse: false,
+                index_order: Some(order),
+            });
+        }
+        pipelines.sort_by(|a, b| {
+            a.identity.kind.cmp(&b.identity.kind).then_with(|| {
+                a.identity
+                    .index_name
+                    .as_bytes()
+                    .cmp(b.identity.index_name.as_bytes())
+            })
+        });
+
+        let mut winner: Option<(i64, PipelineCandidate)> = None;
+        for mut candidate in pipelines {
+            plan.phys.rel_bounds[0] = candidate.bound.take();
+            plan.phys.pk_ordered = candidate.pk_ordered;
+            plan.phys.pk_reverse = candidate.pk_reverse;
+            plan.phys.index_order = candidate.index_order.take();
+            plan.phys.join_pk_ordered = false;
+            plan.phys.top_k = None;
+            let cost = self.estimate_select_plan_cost(plan);
+            candidate.bound = plan.phys.rel_bounds[0].take();
+            candidate.index_order = plan.phys.index_order.take();
+            if winner.as_ref().is_none_or(|(prior, _)| cost < *prior) {
+                winner = Some((cost, candidate));
+            }
+        }
+        if let Some((_, winner)) = winner {
+            plan.phys.rel_bounds[0] = winner.bound;
+            plan.phys.pk_ordered = winner.pk_ordered;
+            plan.phys.pk_reverse = winner.pk_reverse;
+            plan.phys.index_order = winner.index_order;
         }
     }
 

@@ -212,7 +212,8 @@ func TestOrInPointSetExplain(t *testing.T) {
 	cases := []struct{ sql, want string }{
 		{"EXPLAIN SELECT a FROM t WHERE id IN (3, 1)", "PK interval set: id; intervals=2"},
 		{"EXPLAIN SELECT a FROM t WHERE id = 1 OR id = 2", "PK interval set: id; intervals=2"},
-		{"EXPLAIN SELECT id FROM s WHERE x IN (10, 20)", "Index interval set: using sx; intervals=2"},
+		// P6b whole-pipeline costing prefers a full scan for this tiny secondary-index relation.
+		{"EXPLAIN SELECT id FROM s WHERE x IN (10, 20)", "Full scan"},
 		// DML lowers the PK point set too; secondary-index mutation point sets are covered by corpus.
 		{"EXPLAIN DELETE FROM t WHERE id IN (1, 3)", "PK interval set: id; intervals=2"},
 		{"EXPLAIN UPDATE t SET a = 0 WHERE id = 2 OR id = 3", "PK interval set: id; intervals=2"},

@@ -252,8 +252,8 @@ pub(crate) enum ScanCandidateKind {
 /// lowercased catalog name for index-bearing paths and empty for PK/PK-interval/full paths.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ScanCandidateIdentity {
-    kind: ScanCandidateKind,
-    index_name: String,
+    pub(crate) kind: ScanCandidateKind,
+    pub(crate) index_name: String,
 }
 
 impl std::fmt::Display for ScanCandidateIdentity {
@@ -288,10 +288,10 @@ pub(crate) enum ScanOrderCapability {
 /// is always the complete WHERE (or `None` when there is no WHERE), because every access predicate
 /// is only a narrowing superset and execution retains the full recheck.
 pub(crate) struct ScanCandidate<'a> {
-    identity: ScanCandidateIdentity,
-    bound: Option<ScanBound>,
-    scan_order: ScanOrderCapability,
-    residual: Option<&'a RExpr>,
+    pub(crate) identity: ScanCandidateIdentity,
+    pub(crate) bound: Option<ScanBound>,
+    pub(crate) scan_order: ScanOrderCapability,
+    pub(crate) residual: Option<&'a RExpr>,
 }
 
 fn storage_order_candidate<'a>(
@@ -1474,11 +1474,10 @@ pub(crate) fn select_legacy_scan_candidate(
     candidates[winner].bound.take()
 }
 
-/// Enable P6a's first costed choice without pulling P6b/P7 candidates forward. When the legacy
-/// winner is GiST, GIN, or an interval set it remains authoritative. Otherwise PK, ordered B-tree,
-/// and full candidates compete by estimated cost; retaining the first equal-cost entry applies the
-/// inventory's canonical kind/name tie order.
-pub(crate) fn select_costed_p6a_scan_candidate(
+/// Select the lowest base-access estimate across the complete P3 inventory. P6b's whole-pipeline
+/// rule subsequently recomputes the eligible single-relation winner after composing ordering and
+/// LIMIT/OFFSET. Retaining the first equal-cost entry applies canonical kind/name order.
+pub(crate) fn select_costed_scan_candidate(
     mut candidates: Vec<ScanCandidate<'_>>,
     estimates: &[crate::estimator::CandidateEstimate],
     policy: ScanBoundPolicy,
@@ -1486,23 +1485,8 @@ pub(crate) fn select_costed_p6a_scan_candidate(
     if candidates.is_empty() || candidates.len() != estimates.len() {
         return select_legacy_scan_candidate(candidates, policy);
     }
-    let Some(legacy) = legacy_scan_candidate_index(&candidates, policy) else {
-        return None;
-    };
-    if !matches!(
-        candidates[legacy].identity.kind,
-        ScanCandidateKind::Pk | ScanCandidateKind::Btree | ScanCandidateKind::Full
-    ) {
-        return candidates[legacy].bound.take();
-    }
     let mut winner: Option<usize> = None;
-    for (i, candidate) in candidates.iter().enumerate() {
-        if !matches!(
-            candidate.identity.kind,
-            ScanCandidateKind::Pk | ScanCandidateKind::Btree | ScanCandidateKind::Full
-        ) {
-            continue;
-        }
+    for (i, _) in candidates.iter().enumerate() {
         if winner.is_none_or(|prior| estimates[i].cost < estimates[prior].cost) {
             winner = Some(i);
         }
@@ -2001,6 +1985,7 @@ pub(crate) fn pk_storage_width(table: &Table) -> Option<usize> {
 
 /// The secondary-index-order plan: walk a B-tree index in key order to satisfy an `ORDER BY` without
 /// a sort, point-looking-up each row by its primary key (cost.md §3 "secondary-index order").
+#[derive(Clone)]
 pub(crate) struct IndexOrder {
     /// The index store's key — the lowercased index name.
     pub(crate) name_key: String,
@@ -2023,13 +2008,16 @@ pub(crate) struct IndexOrder {
 /// load-bearing: a strict prefix of a *multi*-column index would tie-break by the remaining index
 /// columns rather than the PK, diverging from the eager sort (the same tie-break trap the
 /// composite-PK reverse case carries). `DESC` (a reverse index walk) is a follow-on.
-pub(crate) fn order_satisfied_by_index(
+pub(crate) fn order_satisfied_by_indexes(
     table: &Table,
     offset: usize,
     order: &[crate::spill::SortKey],
     catalog: &Engine,
-) -> Option<IndexOrder> {
-    let pk_width = pk_storage_width(table)?;
+) -> Vec<IndexOrder> {
+    let Some(pk_width) = pk_storage_width(table) else {
+        return Vec::new();
+    };
+    let mut matching_indexes = Vec::new();
     for idx in &table.indexes {
         if idx.kind != IndexKind::Btree {
             continue; // only an ordered B-tree realizes the column order (GIN/GiST do not)
@@ -2049,30 +2037,43 @@ pub(crate) fn order_satisfied_by_index(
         if order.len() != cols.len() {
             continue; // the ORDER BY must be EXACTLY the index columns (see the doc — tie-break)
         }
-        let matches = order
-            .iter()
-            .enumerate()
-            .all(|(i, (slot, descending, nulls_first, coll))| {
-                if *descending || *nulls_first {
-                    return false; // ASC + NULLS LAST only — the order a forward index walk realizes
-                }
-                if *slot != offset + cols[i] {
-                    return false; // the i-th index column, in key order
-                }
-                match key_collation_ctx(catalog, &table.columns[cols[i]]) {
-                    None => false, // Skewed / unresolvable — never walked for order (§12)
-                    Some(None) => coll.is_none(),
-                    Some(Some(c)) => matches!(coll, Some(c2) if c2.name == c.name),
-                }
-            });
-        if matches {
-            return Some(IndexOrder {
+        let matches_order =
+            order
+                .iter()
+                .enumerate()
+                .all(|(i, (slot, descending, nulls_first, coll))| {
+                    if *descending || *nulls_first {
+                        return false; // ASC + NULLS LAST only — the order a forward index walk realizes
+                    }
+                    if *slot != offset + cols[i] {
+                        return false; // the i-th index column, in key order
+                    }
+                    match key_collation_ctx(catalog, &table.columns[cols[i]]) {
+                        None => false, // Skewed / unresolvable — never walked for order (§12)
+                        Some(None) => coll.is_none(),
+                        Some(Some(c)) => matches!(coll, Some(c2) if c2.name == c.name),
+                    }
+                });
+        if matches_order {
+            matching_indexes.push(IndexOrder {
                 name_key: idx.name.to_ascii_lowercase(),
                 pk_width,
             });
         }
     }
-    None
+    matching_indexes.sort_by(|a, b| a.name_key.as_bytes().cmp(b.name_key.as_bytes()));
+    matching_indexes
+}
+
+pub(crate) fn order_satisfied_by_index(
+    table: &Table,
+    offset: usize,
+    order: &[crate::spill::SortKey],
+    catalog: &Engine,
+) -> Option<IndexOrder> {
+    order_satisfied_by_indexes(table, offset, order, catalog)
+        .into_iter()
+        .next()
 }
 
 /// Inventory one GIN index when its array column has an accelerable conjunct (`col @> const`,

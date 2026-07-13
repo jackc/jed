@@ -162,11 +162,11 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 
 ## Query planner / optimizer
 
-> The planner is a **deterministic rule engine**: it pattern-matches the WHERE shape to pick an
-> access path (PK tuple bound → ordered B-tree → GiST → GIN → interval set → full scan for SELECT; mutation
-> retains its documented GIN/GiST order) and runs joins as
-> left-deep joins in FROM order, with structural INL/hash rules — no cost-based choice, no
-> statistics, no join reordering.
+> The planner is a **deterministic rule engine with a costed single-relation slice**: a one-table
+> SELECT inventories every access/order pipeline and chooses the lowest shared estimate; mutations
+> retain their documented fixed precedence. Joins remain left-deep in FROM order with structural
+> INL/hash rules — no costed join choice or join reordering yet. Exact transactional row counts are
+> the only persisted statistics; column distributions remain a follow-on.
 > `EXPLAIN` (above) now makes those choices inspectable + corpus-assertable, the substrate for this
 > work. **The load-bearing constraint:** cost is **observable and a cross-core contract** (§8; the
 > `# cost:` corpus directive), so (a) any plan change that changes which plan runs changes the metered
@@ -210,8 +210,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   access-row estimates, runtime-unit vectors, weighted costs, and total tie keys for every base
   candidate. Exact row counts and resident tree height/node count are admitted without leaf I/O;
   logical output selectivity is applied once from the full WHERE, while access-specific scan rows
-  and residual work remain separate. P6a now consumes the eligible subset; deferred access methods
-  and plan shapes retain their staged legacy policies. → [estimator.md §7](spec/design/estimator.md),
+  and residual work remain separate. P6 now consumes every single-relation access estimate; joins
+  and mutations retain their staged legacy policies. → [estimator.md §7](spec/design/estimator.md),
   [estimator vectors](spec/cost/estimator_vectors.toml)
 - [x] **P5 — whole-plan estimator + EXPLAIN estimates** — propagate the selected plan's exact-rational
   cardinality and runtime-unit estimate through filters/projections, every join algorithm, grouping,
@@ -226,13 +226,18 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   UPDATE/DELETE, multi-relation SELECTs, and legacy winners from the deferred GIN/GiST/interval
   families retain their explicit policies until the corresponding later slice. →
   [estimator.md §9.1](spec/design/estimator.md), [planner.md §5.2](spec/design/planner.md)
+- [x] **P6b — complete costed single-relation pipelines** — GIN, GiST, PK/index interval sets,
+  natural bound order, and eligible order-only B-tree top-N walks now join the same competition.
+  The estimator prices only scheduled runtime units through residual/projection and LIMIT/OFFSET;
+  sort remains unmetered. Shared EXPLAIN/cost cases pin method/name ties, row-count/selectivity flips,
+  and actual costs; `cost_plan_p6b` supplies the NoREC relation. →
+  [estimator.md §9.1](spec/design/estimator.md), [planner.md §5.2](spec/design/planner.md)
 - [ ] **Column statistics** — the initial transactional per-table row count landed in P1. Add
   per-column distinct-value counts / histograms later, computed by a spec'd pass over deterministic
   data so they stay cross-core-identical. _(size: L histograms)_
-- [ ] **Complete cost-based access-path + join-order selection** — add GIN, GiST, interval-set, and
-  order-only alternatives, then **reorder the left-deep join** (drive the smaller / more-selective
+- [ ] **Complete cost-based join-order selection** — **reorder the left-deep join** (drive the smaller / more-selective
   relation, enable index-nested-loop) rather than honoring FROM order. Re-pin each affected
-  `# cost:` corpus entry as the observable plan changes land. _(P6b–P8; size: L; ×3 cores; +NoREC)_
+  `# cost:` corpus entry as the observable plan changes land. _(P7–P8; size: L; ×3 cores; +NoREC)_
 
 ### Planner infrastructure
 

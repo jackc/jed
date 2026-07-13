@@ -38,7 +38,7 @@ FROM city GROUP BY region;`;
 # EXPLAIN
 
 `EXPLAIN` shows **how** jed will run a statement — which access path the planner chose (a full scan,
-a primary-key lookup, a secondary-index bound), how joins are shaped, and whether an `ORDER BY` is
+a primary-key lookup, a B-tree/GIN/GiST/interval bound), how joins are shaped, and whether an `ORDER BY` is
 served by scan order, a bounded top-k heap, or a full sort. It renders the plan as an ordinary result set with five
 columns:
 
@@ -52,11 +52,12 @@ columns:
   units as execution.
 
 The plan is a **deterministic** function of the query and the database, so every jed core renders
-the identical plan and estimates. For a one-table query, jed compares the estimated scheduled work
-of the full scan, primary-key bound, and every usable ordered B-tree bound; exact ties prefer PK,
-then the lower-named B-tree, then full scan. Estimates are planner heuristics, not a resource limit
-or a promise to equal execution; runtime cost ceilings always use the actual meter. GIN, GiST,
-interval sets, joins, and mutation target scans retain their documented fixed policies for now.
+the identical plan and estimates. For a one-table query, jed compares the complete scheduled work
+of full, primary-key, ordered B-tree, GIN, GiST, and interval-set paths, including natural ordering,
+the residual/projection, and LIMIT/OFFSET early-out. An `ORDER BY ... LIMIT` may also admit an
+order-only B-tree walk. Exact ties use a fixed access-kind order and then lowercased index name.
+Estimates are planner heuristics, not a resource limit or a promise to equal execution; runtime cost
+ceilings always use the actual meter. Joins and mutation target scans retain fixed policies for now.
 
 ## A blocking sort and bounded top-k
 

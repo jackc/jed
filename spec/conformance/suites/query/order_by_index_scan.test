@@ -40,11 +40,10 @@ apple
 3
 banana
 
-# A residual WHERE composes: `amt >= 20` filters per looked-up row. The index walk yields name order
-# apple(amt 10, filtered), banana(20, kept), cherry(30, kept), and stops at LIMIT 2. Three rows are
-# looked up (incl. the filtered apple). 1 index page + 3 lookup pages + 3 storage_row_read + 3 filter
-# + 2 produced = 12.
-# cost: 12
+# A residual WHERE composes with whole-pipeline selection. At five rows, the generic inequality
+# estimate prices the full scan plus blocking sort below the order-only index walk. Runtime charges
+# page(1) + rows(5) + filters(5) + produced(2) = 13; sort itself remains unmetered.
+# cost: 13
 query IT nosort
 SELECT id, name FROM t WHERE amt >= 20 ORDER BY name LIMIT 2
 ----
@@ -53,9 +52,9 @@ banana
 1
 cherry
 
-# OFFSET composes: skip the first index entry (apple), then take banana, cherry. The skipped row IS
-# looked up (and counted). 1 index page + 3 lookup pages + 3 storage_row_read + 2 produced = 9.
-# cost: 9
+# With OFFSET, the estimator prices the full scan plus blocking sort below the three-look-up index
+# prefix. Runtime charges one table page + five rows + two produced = 8.
+# cost: 8
 query IT nosort
 SELECT id, name FROM t ORDER BY name LIMIT 2 OFFSET 1
 ----

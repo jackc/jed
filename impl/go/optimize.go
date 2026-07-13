@@ -1,5 +1,10 @@
 package jed
 
+import (
+	"bytes"
+	"sort"
+)
+
 // Physical / access-path selection — Stage 3 of the planner (spec/design/planner.md §4). The
 // optimizeSelect pass runs after the resolve half has built the logical plan (planSelect,
 // planner.go) and applies each optimization as a DISCRETE RULE: one function owning its gate (the
@@ -21,6 +26,7 @@ func (db *engine) optimizeSelect(plan *selectPlan, rels []scopeRel) {
 	db.ruleHashJoin(plan, rels)
 	db.ruleOrderByPkScan(plan, rels)
 	db.ruleOrderByIndexScan(plan, rels)
+	db.ruleCostedSingleRelationPipeline(plan, rels)
 	db.ruleJoinPkOrdered(plan, rels)
 	db.ruleOrderByLimitTopK(plan, rels)
 }
@@ -185,11 +191,114 @@ func (db *engine) ruleScanBounds(plan *selectPlan, rels []scopeRel) {
 		plan.phys.relEstimates[i] = db.estimateScanCandidates(candidates, rel, producesRows)
 		legacy := selectLegacyScanCandidate(candidates, selectScanBoundPolicy)
 		if len(rels) == 1 {
-			plan.phys.relBounds[i] = selectCostedP6aScanCandidate(candidates, plan.phys.relEstimates[i], legacy)
+			plan.phys.relBounds[i] = selectCostedScanCandidate(candidates, plan.phys.relEstimates[i], legacy)
 		} else {
 			plan.phys.relBounds[i] = legacy
 		}
 	}
+}
+
+// singleRelationPipelineCandidate is P6b's complete physical choice for one base relation. Its
+// identity is the canonical access-kind/name tie key. An order-only B-tree has a nil bound but a
+// B-tree identity plus indexOrder; every ordinary access candidate retains its executor ScanBound.
+type singleRelationPipelineCandidate struct {
+	identity   scanCandidateIdentity
+	bound      *scanBound
+	pkOrdered  bool
+	pkReverse  bool
+	indexOrder *indexOrderPlan
+}
+
+// ruleCostedSingleRelationPipeline composes every legal access path with its natural ordering,
+// adds missing order-only B-tree top-N walks, and selects the minimum cumulative scheduled estimate
+// through LIMIT/OFFSET. Sort bookkeeping remains unmetered: an incompatible order simply leaves the
+// ordinary blocking Sort in the trial plan. Exact ties retain canonical access-kind/name order.
+func (db *engine) ruleCostedSingleRelationPipeline(plan *selectPlan, rels []scopeRel) {
+	if len(rels) != 1 || len(plan.rels) != 1 || plan.rels[0].srf != nil || plan.rels[0].cte != nil ||
+		plan.rels[0].derived != nil {
+		return
+	}
+	rel := rels[0]
+	access := inventoryScanCandidates(plan.filter, rel, db)
+	if len(access) == 0 {
+		return
+	}
+
+	pkOrdered, pkReverse := false, false
+	if !plan.isAgg && len(plan.order) > 0 && len(plan.orderExprs) == 0 {
+		pkOrdered, pkReverse = db.orderSatisfiedByPK(rel.table, plan.rels[0].offset, plan.order)
+	}
+	var indexOrders []indexOrderPlan
+	if !rel.isAttachment() && !plan.isAgg && !plan.hasWindow && !plan.distinct &&
+		len(plan.order) > 0 && len(plan.orderExprs) == 0 && !pkOrdered {
+		indexOrders = db.orderSatisfiedByIndexes(rel.table, plan.rels[0].offset, plan.order)
+	}
+
+	pipelines := make([]singleRelationPipelineCandidate, 0, len(access)+len(indexOrders))
+	seen := make(map[string]struct{}, len(access)+len(indexOrders))
+	for _, candidate := range access {
+		pipeline := singleRelationPipelineCandidate{identity: candidate.identity, bound: candidate.bound}
+		switch candidate.scanOrder.kind {
+		case scanOrderStorageKey:
+			if pkOrdered {
+				pipeline.pkOrdered, pipeline.pkReverse = true, pkReverse
+			}
+		case scanOrderIndexKey:
+			for i := range indexOrders {
+				if indexOrders[i].nameKey == candidate.scanOrder.indexName {
+					io := indexOrders[i]
+					pipeline.indexOrder = &io
+					break
+				}
+			}
+		}
+		pipelines = append(pipelines, pipeline)
+		seen[candidate.identity.String()] = struct{}{}
+	}
+	for i := range indexOrders {
+		if plan.limit == nil {
+			break // the established order-only eligibility gate requires LIMIT
+		}
+		identity := scanCandidateIdentity{kind: scanCandidateBtree, indexName: indexOrders[i].nameKey}
+		if _, ok := seen[identity.String()]; ok {
+			continue
+		}
+		io := indexOrders[i]
+		pipelines = append(pipelines, singleRelationPipelineCandidate{
+			identity: identity, indexOrder: &io,
+		})
+	}
+	sort.SliceStable(pipelines, func(i, j int) bool {
+		a, b := pipelines[i].identity, pipelines[j].identity
+		if a.kind != b.kind {
+			return a.kind < b.kind
+		}
+		return bytes.Compare([]byte(a.indexName), []byte(b.indexName)) < 0
+	})
+
+	winner, winnerCost := -1, int64(0)
+	for i := range pipelines {
+		trial := *plan
+		trial.phys = plan.phys
+		trial.phys.relBounds = append([]*scanBound(nil), plan.phys.relBounds...)
+		trial.phys.relBounds[0] = pipelines[i].bound
+		trial.phys.pkOrdered = pipelines[i].pkOrdered
+		trial.phys.pkReverse = pipelines[i].pkReverse
+		trial.phys.indexOrder = pipelines[i].indexOrder
+		trial.phys.joinPkOrdered = false
+		trial.phys.topK = nil
+		cost := db.estimateSelectPlan(&trial, nil).root.cost()
+		if winner == -1 || cost < winnerCost {
+			winner, winnerCost = i, cost
+		}
+	}
+	if winner < 0 {
+		return
+	}
+	plan.phys.relBounds[0] = pipelines[winner].bound
+	plan.phys.pkOrdered = pipelines[winner].pkOrdered
+	plan.phys.pkReverse = pipelines[winner].pkReverse
+	plan.phys.indexOrder = pipelines[winner].indexOrder
 }
 
 // ruleIndexNestedLoop — index-nested-loop pushdown (cost.md §3 "JOIN"): a join inner relation

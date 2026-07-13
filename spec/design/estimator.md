@@ -8,7 +8,8 @@
 > **Status: P0 contract ratified; P1 row counts, P2 cache validity, P3 complete candidate
 > inventory, P4 base-relation estimates, and P5 whole-plan propagation + EXPLAIN columns
 > landed.** P6a applies those estimates to the first staged access-path set described in §9.1;
-> later access methods and joins retain the explicit legacy boundaries there. P6b–P8 in
+> P6b extends that single-relation choice to every access method and complete ordering/LIMIT
+> pipelines. Joins retain the explicit legacy boundary there. P7–P8 in
 > [../../TODO-cost-plan-input.md](../../TODO-cost-plan-input.md) implement this contract as vertical
 > slices.
 
@@ -437,36 +438,53 @@ join:   index nested loop < hash < nested loop
 A future access method or join algorithm is ineligible for cost selection until this data and the
 candidate's final field order are extended, verified, and implemented in all cores.
 
-### 9.1 P6a staged selector boundary
+### 9.1 P6 single-relation selector
 
-P6a enables cost choice only for a SELECT plan containing exactly one base relation and no join.
+P6 enables cost choice only for a SELECT plan containing exactly one base relation and no join.
 The rule applies recursively to a qualifying single-relation subquery, but not to SRF, CTE, or
 derived-table relation nodes, which have no base-store candidate inventory. A multi-relation SELECT
 retains its complete legacy per-relation choices until P7 can price access paths together with join
 orientation and algorithm; independently replacing one join input from a base-only estimate would
 not minimize the whole join plan.
 
-The staged candidate rule is deterministic:
+P6a first staged the rule over PK, ordered B-tree, and full-scan candidates while a legacy
+GiST/GIN/interval winner remained authoritative. P6b removes that staging boundary. Its candidate
+set contains every legal P3 access path: PK, every ordered B-tree bound, every GiST bound, every GIN
+bound, PK interval set, every ordered-index interval set, and full scan.
+
+P6b compares **complete single-relation physical pipelines**, not isolated base scans. Each access
+candidate is composed with the ordering property it naturally provides:
+
+- a table-storage-order path uses an eligible PK `ORDER BY` direction;
+- a B-tree bound or ordered-index interval set uses an eligible exact same-index `ORDER BY`; and
+- an incompatible order remains a blocking Sort whose bookkeeping contributes no private weight.
+
+For `ORDER BY ... LIMIT`, every eligible secondary B-tree order that has no same-index access bound
+adds one **order-only B-tree** candidate. It walks that index and point-fetches table rows while
+retaining the complete WHERE residual. When the same index already supplies a legal bound, its one
+candidate composes the bound and order rather than duplicating the identity. Multiple matching
+ordering indexes are all inventoried and sorted by lowercased name; catalog order never chooses one.
+The existing exact-order, forward `ASC NULLS LAST`, fixed-width-PK, non-partial-index gates remain
+unchanged.
+
+For every pipeline, the estimator applies the selected access work, residual, projection and other
+nodes at their real stages, then applies any ordering/streaming `OFFSET + LIMIT` prefix. This makes a
+plain `LIMIT` as well as an `ORDER BY ... LIMIT` capable of changing the winner when it changes
+scheduled page, row, access-method, or expression work. A blocking sort comparison still adds zero:
+P6b does not price unmetered sorting. The winner is the lowest cumulative `est_cost` after those
+effects, followed by §9's access-kind/name tie order. A natural-order form is canonical for its
+access identity, so an otherwise-identical blocking-sort duplicate is not inventoried.
+
+The resulting rule is deterministic:
 
 1. build and estimate the complete P3 inventory;
-2. compute the legacy SELECT winner;
-3. if that winner is GiST, GIN, a PK interval set, or an ordered-index interval set, retain it
-   unchanged until P6b; otherwise
-4. compare every legal PK, ordered B-tree, and full-scan candidate by `est_cost`, then apply §9's
-   access-kind and lowercased-index-name order on an exact cost tie.
+2. compose each access path with its one canonical natural-order property;
+3. add any missing eligible order-only B-tree identities;
+4. estimate every complete pipeline through its final LIMIT/OFFSET; and
+5. choose minimum cumulative cost, retaining the first candidate on an exact cost tie because the
+   candidate list is already in §9 order.
 
-This boundary permits PK/B-tree/full competition even when a deferred access method is present but
-would not have won the legacy precedence. It never silently promotes a P6b method. UPDATE and DELETE
-continue to call the mutation legacy policy from §1/§8.4.
-
-P6a compares the P4 base-candidate estimate: access pages/work, admitted table rows, and the complete
-WHERE residual work. Logical output rows and any candidate-independent final production work are the
-same for every competitor and do not break ties. The selected candidate's explicit scan-order
-capability is then authoritative for the already-landed ORDER BY rules: table-storage-order paths
-(full, PK, PK interval, normalized GiST/GIN) may satisfy a PK order, while an ordered B-tree path may
-satisfy only that same named index order. An incompatible selected path keeps the blocking sort.
-P6a neither invents a sort weight nor adds a new order-only access candidate; P6b integrates the
-secondary-index ORDER BY/top-N alternatives and their LIMIT-aware cumulative estimates.
+UPDATE and DELETE continue to call the mutation legacy policy from §1/§8.4.
 
 ## 10. Join search and its deterministic bound
 

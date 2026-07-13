@@ -120,6 +120,47 @@ base = 0
 off_min = 64
 off_max = 128
 
+# P6b order-only candidate: no WHERE bound supplies the order, so the planner compares a full scan
+# plus unmetered blocking sort with a secondary-index walk whose LIMIT stops after five lookups.
+[[bench]]
+name = "order_only_index_limit"
+description = "Order-only secondary-index walk on 100k reverse-PK rows with LIMIT 5"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT id, x FROM p6b_ordered ORDER BY x LIMIT 5"
+warmup = 500
+iterations = 15000
+seed = 4261
+expect_rows_per_iter = 5
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS p6b_ordered",
+  "CREATE TABLE p6b_ordered (id bigint PRIMARY KEY, x bigint)",
+  "INSERT INTO p6b_ordered SELECT g, 100001 - g FROM generate_series(1, 100000) AS g",
+  "CREATE INDEX p6b_ordered_x_idx ON p6b_ordered (x)"
+]
+
+# P6b makes GiST a cost-selected single-relation candidate. Ten ranges contain the fixed one-point
+# query range; the complete path competes with the 50k-row full scan.
+[[bench]]
+name = "gist_range_select"
+description = "Cost-selected GiST range containment over 50k rows with ten matches"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT id FROM p6b_ranges WHERE span @> int4range(25000, 25001) ORDER BY id"
+warmup = 200
+iterations = 5000
+seed = 4262
+expect_rows_per_iter = 10
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS p6b_ranges",
+  "CREATE TABLE p6b_ranges (id bigint PRIMARY KEY, span int4range)",
+  "INSERT INTO p6b_ranges (id) SELECT g FROM generate_series(1, 50000) AS g",
+  "UPDATE p6b_ranges SET span = int4range(CAST(id AS integer), CAST(id + 10 AS integer))",
+  "CREATE INDEX p6b_ranges_span_gist ON p6b_ranges USING gist (span)"
+]
+
 # Join top-N combined with index-nested-loop (query.order_by_join_inl). The outer-PK order needs no
 # sort and LIMIT 10 stops after ten per-outer inner PK seeks. Before the combination, INL still
 # opened all 10k inner bounds and the blocking path sorted the complete 1:1 join before slicing.
@@ -720,8 +761,8 @@ max = 999000
 # jed defers casting *to* an array type (0A000), and PostgreSQL infers an uncast pgx-bound
 # ARRAY[$1,$2] as text[] (no bigint[] @> text[]); element casts sidestep both. Params draw from
 # the same [1,500] term domain as the data, so a two-term `@>` intersects to a handful of rows
-# (the GIN sweet spot — jed always takes the GIN-bounded scan, rule-based) and `&&` unions to a
-# few thousand. Answers are index-independent, so the cross-engine checksum holds either way.
+# (the GIN sweet spot — P6b's estimate selects the GIN-bounded scan) and `&&` unions to a few
+# thousand. Answers are index-independent, so the cross-engine checksum holds either way.
 [[bench]]
 name = "gin_contains"
 description = "GIN @> (contains): rows whose tags array contains BOTH query terms — a two-posting-list intersection over a 200k-row bigint[] column"

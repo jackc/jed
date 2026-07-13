@@ -630,31 +630,17 @@ func selectLegacyScanCandidate(candidates []scanCandidate, policy scanBoundPolic
 	return nil
 }
 
-// selectCostedP6aScanCandidate enables the first Path-B choice without pulling later access
-// methods forward. If the legacy winner is a GiST/GIN/interval candidate, that winner remains
-// authoritative until P6b. Otherwise PK, ordered B-tree, and full candidates compete by estimated
-// cost; candidates are already in the canonical P0 tie order, so retaining the first exact-cost
-// winner applies the kind/name tie-break without host iteration.
-func selectCostedP6aScanCandidate(candidates []scanCandidate, estimates []candidateEstimate, legacy *scanBound) *scanBound {
+// selectCostedScanCandidate selects the lowest base-access estimate across the complete P3
+// inventory. P6b's whole-pipeline rule subsequently recomputes the eligible single-relation winner
+// after composing ordering and LIMIT/OFFSET; this helper supplies the provisional rule-1 choice.
+// Candidates are already in canonical P0 tie order, so retaining the first exact-cost winner applies
+// the kind/name tie-break without host iteration.
+func selectCostedScanCandidate(candidates []scanCandidate, estimates []candidateEstimate, legacy *scanBound) *scanBound {
 	if len(candidates) == 0 || len(candidates) != len(estimates) {
-		return legacy
-	}
-	legacyKind := scanCandidateFull
-	for i := range candidates {
-		if candidates[i].bound == legacy {
-			legacyKind = candidates[i].identity.kind
-			break
-		}
-	}
-	if legacyKind != scanCandidatePK && legacyKind != scanCandidateBtree && legacyKind != scanCandidateFull {
 		return legacy
 	}
 	winner := -1
 	for i := range candidates {
-		kind := candidates[i].identity.kind
-		if kind != scanCandidatePK && kind != scanCandidateBtree && kind != scanCandidateFull {
-			continue
-		}
 		if winner == -1 || estimates[i].cost < estimates[winner].cost {
 			winner = i
 		}
@@ -2759,11 +2745,12 @@ type indexOrderPlan struct {
 // match) and sorting by the column's stored key collation (Skewed/unresolvable → refuse, §12), AND
 // the table's PK is fixed-width. The exact-match requirement is load-bearing: a strict prefix of a
 // multi-column index would tie-break by the remaining index columns, not the PK.
-func (db *engine) orderSatisfiedByIndex(table *catTable, offset int, order []orderSlot) *indexOrderPlan {
+func (db *engine) orderSatisfiedByIndexes(table *catTable, offset int, order []orderSlot) []indexOrderPlan {
 	pkWidth, ok := pkStorageWidth(table)
 	if !ok {
 		return nil
 	}
+	var matches []indexOrderPlan
 	for _, idx := range table.Indexes {
 		if idx.Kind != indexBtree {
 			continue // only an ordered B-tree realizes the column order (GIN/GiST do not)
@@ -2784,34 +2771,45 @@ func (db *engine) orderSatisfiedByIndex(table *catTable, offset int, order []ord
 		if len(order) != len(cols) {
 			continue // the ORDER BY must be EXACTLY the index columns (see the doc — tie-break)
 		}
-		matches := true
+		matchesOrder := true
 		for i, o := range order {
 			if o.descending || o.nullsFirst {
-				matches = false // ASC + NULLS LAST only — the order a forward index walk realizes
+				matchesOrder = false // ASC + NULLS LAST only — the order a forward index walk realizes
 				break
 			}
 			if o.idx != offset+cols[i] {
-				matches = false
+				matchesOrder = false
 				break
 			}
 			coll, push := db.keyCollationCtx(table.Columns[cols[i]])
 			if !push { // Skewed / unresolvable — never walked for order (§12)
-				matches = false
+				matchesOrder = false
 				break
 			}
 			if coll == nil {
 				if o.collation != nil {
-					matches = false
+					matchesOrder = false
 					break
 				}
 			} else if o.collation == nil || o.collation.Name != coll.Name {
-				matches = false
+				matchesOrder = false
 				break
 			}
 		}
-		if matches {
-			return &indexOrderPlan{nameKey: strings.ToLower(idx.Name), pkWidth: pkWidth}
+		if matchesOrder {
+			matches = append(matches, indexOrderPlan{nameKey: strings.ToLower(idx.Name), pkWidth: pkWidth})
 		}
 	}
-	return nil
+	sort.SliceStable(matches, func(i, j int) bool {
+		return bytes.Compare([]byte(matches[i].nameKey), []byte(matches[j].nameKey)) < 0
+	})
+	return matches
+}
+
+func (db *engine) orderSatisfiedByIndex(table *catTable, offset int, order []orderSlot) *indexOrderPlan {
+	matches := db.orderSatisfiedByIndexes(table, offset, order)
+	if len(matches) == 0 {
+		return nil
+	}
+	return &matches[0]
 }

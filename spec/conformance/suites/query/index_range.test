@@ -123,9 +123,9 @@ SELECT id FROM t WHERE id >= 7 AND id <= 9 AND v > 0 ORDER BY id
 
 # --- incompatible PK ORDER BY stays blocking over the secondary-index bound --------
 
-# ORDER BY id cannot consume v-index order, so all five candidates are fetched before
-# sorting; only four row_produced units drop: 21 - 4 = 17.
-# cost: 17
+# Whole-pipeline selection instead chooses the PK-ordered full scan: it reads and filters ids 1..6,
+# then stops as soon as id 6 fills LIMIT. page(1) + rows(6) + filters(6) + produced(1) = 14.
+# cost: 14
 query I nosort
 SELECT id FROM t WHERE v > 55 ORDER BY id LIMIT 1
 ----

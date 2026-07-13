@@ -96,16 +96,17 @@ then takes the unoptimized path (full scan, eager sort), which is always correct
 
 | # | rule | gate (summary) | sets | cost contract |
 |---|---|---|---|---|
-| 1 | **scan bounds** | per base relation (not SRF/derived): inventory and estimate every legal path; a one-base-relation SELECT cost-selects P6a's PK/B-tree/full set, while §5.1's explicit staged legacy boundaries remain | `relBounds[i]` | cost.md §3 "bounded scan", "index-bounded scan", "GIN-bounded scan", "GiST-bounded scan", "canonical interval sets" |
+| 1 | **scan bounds** | per base relation (not SRF/derived): inventory and estimate every legal path; a one-base-relation SELECT cost-selects all access methods, while joins and mutations retain §5.1's explicit staged legacy boundaries | `relBounds[i]` | cost.md §3 "bounded scan", "index-bounded scan", "GIN-bounded scan", "GiST-bounded scan", "canonical interval sets" |
 | 2 | **index-nested-loop** | a join inner base relation (INNER/CROSS/LEFT right side, not lateral/CTE) with a PK / leading B-tree comparison or GIN/GiST query operand from a bare **earlier sibling** column in ON or WHERE | `relINLBounds[i]` | cost.md §3 "JOIN" (per-outer-row seek/gather) |
 | 3 | **hash join** | exactly two non-lateral inputs; INNER/LEFT ON contains one or more same-type, key-encodable bare-column equalities across the inputs; no inner INL; every remaining ON conjunct is a non-trapping leaf equality/inequality | `hashJoin` | cost.md §3 "hash JOIN" (`hash_build`/`hash_probe`; ON only for bucket candidates) |
 | 4 | **ORDER BY via PK scan order** | single base relation, non-aggregate, column-only keys: the ORDER BY is a one-direction PK prefix (ASC) or the full PK (DESC ⇒ reverse scan), collation-matching the stored key | `pkOrdered`, `pkReverse` | cost.md §3 "ORDER BY satisfied by primary-key order" (sort elided; with LIMIT, a top-N) |
-| 5 | **ORDER BY via secondary-index order** | rule 4 did not fire; a LIMIT; no window/DISTINCT; the ORDER BY is exactly a B-tree index's columns, ASC NULLS LAST, fixed-width PK; an existing bound is allowed only when it walks that same index | `indexOrder` | cost.md §3 "ORDER BY satisfied by secondary-index order" (index-walk top-N) |
+| 5 | **single-relation pipeline choice / ORDER BY via secondary-index order** | one base relation: compose every access candidate with its natural PK/index order, add every eligible order-only B-tree walk when LIMIT is present, and minimize cumulative scheduled cost through LIMIT/OFFSET; exact index-order shape/type gates remain | `relBounds[0]`, `pkOrdered`, `pkReverse`, `indexOrder` | estimator.md §9.1; cost.md §3 "ORDER BY satisfied by secondary-index order" |
 | 6 | **join sort-elision** | exactly two non-lateral base relations, INNER/CROSS, a LIMIT, forward outer-PK ORDER BY with no key beyond the outer PK, no eager bound on the outer; any storage-key-ordered inner INL bound is opened per outer row | `joinPkOrdered` | cost.md §3 "JOIN" (the join top-N) |
 | 7 | **blocking ORDER BY top-k** | rules 4–6 did not elide the sort; plain SELECT (no DISTINCT, aggregate/group, or window), ORDER BY + constant LIMIT; checked `K = OFFSET + LIMIT` (`LIMIT 0` ⇒ K=0) | `topK` | cost.md §3 "blocking ORDER BY top-k" (full scan/evaluation and cost retained; sort work reduced) |
 
 Data-flow dependencies fixing the order: rule 3 reads `relINLBounds` (rule 2), so a usable INL
-always wins; rule 5 reads `relBounds[0]` (rule 1) and `pkOrdered` (rule 4); rule 6 reads
+always wins; rule 5 reads the complete rule-1 inventory and subsumes rule 4's provisional
+single-relation order decision when it cost-selects the final pipeline; rule 6 reads
 `relBounds[0]` and `relINLBounds` (rules 1–2); rule 7 reads
 the three preceding sort-elision decisions. Rules 4–6
 that select scan order remain mutually exclusive by their gates; hash join preserves the same
@@ -129,8 +130,8 @@ internals.
 
 ## 5. Access-path inventory and staged selection (rule 1)
 
-For each base relation, the access-path machinery inventories every legal candidate. P6a cost-selects
-the first staged set for eligible one-base-relation SELECTs (§5.2); every deferred shape still uses
+For each base relation, the access-path machinery inventories every legal candidate. P6 cost-selects
+the complete set for eligible one-base-relation SELECTs (§5.2); every deferred shape still uses
 the legacy selector, whose fixed precedence is:
 
 1. **PK tuple bound** (maximal equality prefix plus optional next-member range) — the row's own key;
@@ -193,23 +194,28 @@ SELECT tries GiST before GIN. Within every index-bearing kind, the lowest lowerc
 P3 changes no physical plan field, executor dispatch, EXPLAIN spelling, or actual metered cost.
 P4 inventories once per base relation and attaches one estimate per candidate: logical output rows,
 access scan rows expressed through scheduled unit counts, weighted cost, and the canonical tie key.
-P6a now consumes that vector only within §5.2's staged set; the remaining consumers retain explicit
+P6 now consumes that vector as the base annotation for §5.2's complete pipeline set; joins and
+mutations retain explicit
 legacy policies rather than accidentally inheriting a partial cost selector.
 
-### 5.2 P6a SELECT policy
+### 5.2 P6 single-relation SELECT policy
 
 For a SELECT with exactly one base relation and no join, rule 1 computes the complete inventory and
-P4 estimate vector once. If the legacy winner belongs to P6b (GiST, GIN, or either interval-set
-kind), it remains selected. Otherwise PK, every ordered B-tree bound, and full scan compete by
-minimum estimated cost, with the inventory's kind/name order breaking exact ties. Multi-relation
-SELECTs retain legacy per-relation selection until P7, and UPDATE/DELETE retain §5.1's mutation
-policy until their dedicated slice.
+P4 estimate vector once. Rule 5 then composes every access identity with the natural storage/index
+order it can provide, adds every eligible order-only B-tree identity not already present when LIMIT
+is present, and compares the complete scheduled estimate through residual filtering, projection,
+ordering and LIMIT/OFFSET.
+GiST, GIN, both interval-set kinds, PK, every ordered B-tree, and full scan all participate. Multiple
+matching ordering indexes participate independently in canonical name order. Multi-relation SELECTs
+retain legacy per-relation selection until P7, and UPDATE/DELETE retain §5.1's mutation policy until
+their dedicated slice.
 
-Rules 4 and 5 consume the selected candidate's explicit scan-order property. A PK ORDER BY is
-elided only for a table-storage-order candidate; a B-tree candidate can elide only the exact same
-index order under rule 5's existing gate. The chosen bound always retains the complete WHERE as its
-residual. P6b is responsible for adding order-only index alternatives to the cost competition and
-for LIMIT-aware pricing across those pipelines.
+Rules 4 and 5 consume each candidate's explicit scan-order property. A PK ORDER BY is
+elided only for a table-storage-order candidate; a B-tree bound can always elide only the exact same
+index order, while a boundless order-only candidate additionally requires LIMIT. The chosen bound
+always retains the complete WHERE as its residual. A plain or ordered LIMIT may change the winner
+only through scheduled work it avoids; blocking sort work remains unmetered and contributes no
+private planner weight.
 
 Access-path execution has a common key-preserving result: deterministic `(storage key, row)`
 candidates plus the exact up-front `page_read` / `value_decompress` / access-method work block.
@@ -241,7 +247,8 @@ elides its sort only when the source emits the requested PK order or walks the e
   the cross-core contract: shared estimator facts, exact arithmetic, complete candidate order,
   and bounded search are specified in [estimator.md](estimator.md) and ratified in
   [determinism.md §8](determinism.md). The algorithms remain hand-written per core. Shared
-  estimator vectors, EXPLAIN rows, actual `# cost:` pins, and NoREC relations detect drift.
+  estimator vectors, complete-pipeline EXPLAIN rows, actual `# cost:` pins, and NoREC relations detect
+  drift.
 
 ## 7. Where future passes plug in
 
@@ -250,8 +257,8 @@ elides its sort only when the source emits the requested PK order or walks the e
 - **Plan-time cost estimator** ([estimator.md](estimator.md)) — a stage-3 annotation and selection pass:
   estimate the same units the runtime meter charges for each candidate using the ratified exact,
   cross-core-identical contract. Whole-plan estimates now feed EXPLAIN's `est_rows`/`est_cost`
-  columns. P6a consumes base estimates for one-relation PK/B-tree/full selection; later slices add
-  the remaining methods and join search ([explain.md](explain.md) §2).
+  columns. P6 consumes complete one-relation access/ordering pipelines; later slices add join search
+  ([explain.md](explain.md) §2).
 - **Cost-based access-path + join-order selection** (TODO.md) — replaces §5's fixed
   precedence and the FROM-order join tree *inside* stage 3, once the estimator + table
   statistics exist; each enabling slice re-pins affected `# cost:` entries and proves the

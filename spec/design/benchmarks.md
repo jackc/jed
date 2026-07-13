@@ -6,7 +6,9 @@ benchmarks (`gin_contains` / `gin_overlaps` / `gin_member` / `gin_array_eq` / `g
 over a dedicated `gin` dataset (§4), the regex + window benchmarks, and the **concurrent-reader
 throughput** benchmarks (the `concurrent_read` kind, §8.1). Rule-based access-path work is pinned by
 scratch workloads including `composite_pk_lookup`, `interval_set_pk`, and
-`bounded_index_limit`, plus `join_inl_topn` for the combined join rule, `gin_inl` and the
+`bounded_index_limit`; P6b adds `order_only_index_limit` and `gist_range_select` while reusing
+`gin_contains` and `interval_set_pk` for its cross-method matrix. `join_inl_topn` covers the
+combined join rule, alongside `gin_inl` and the
 `gist_inl` / `gist_inl_nested_fallback` pair for opclass sibling bounds, and the
 `hash_join_equijoin` / `hash_join_nested_fallback` pair. `order_by_limit`
 is the permanent blocking-sort top-k lane: one million fixed
@@ -41,6 +43,15 @@ rule. Median per-query time was **3.0 ms hash vs 436 ms nested Go** (147×), **3
 (136×), and **9.1 ms vs 852 ms TypeScript** (94×). PostgreSQL was 0.79/0.84 ms and chose its own
 optimizer plan for both spellings. Timings are non-gating; cross-engine checksum equality, exact
 costs, collision invariants, and the NoREC optimized/fallback relation are the correctness proof.
+
+**P6b selector result (2026-07-13).** The native before/after run covered `gin_contains`,
+`interval_set_pk`, `order_only_index_limit`, and `gist_range_select`. Every core retained the same
+per-lane checksum (`1cee697762ea2e7f`, `e8e4cd343f1e418c`, `c1289e7ca1211ba5`, and
+`9a99571dc60b90c5`, respectively). A reversed-order repeat of the longest GIN lane measured
+**287 µs vs 280 µs Go (+2.3%)**, **226 µs vs 218 µs Rust (+3.5%)**, and **450 µs vs 449 µs
+TypeScript (+0.1%)** after versus before. The other lanes retained their access shapes; their
+single-run variation was non-gating. The shared plan/cost corpus is the selection proof, while these
+checksums establish unchanged results across the newly cost-selected paths.
 
 ## 1. Purpose and non-goals
 
@@ -584,3 +595,7 @@ table-fetch storm the deterministic estimator rejects in favor of a full scan. T
 `point_lookup_pk`, `secondary_lookup`, and `index_range`, it pins the point/range and
 selective/nonselective access-path performance matrix without making wall-clock timing part of
 conformance.
+P6b adds `order_only_index_limit` and `gist_range_select`, and treats `gin_contains` plus
+`interval_set_pk` as affected selector lanes. Together they cover order-only B-tree, GiST, GIN, and
+interval-set choices across every native core; timings remain observational and checksum equality is
+the benchmark gate.

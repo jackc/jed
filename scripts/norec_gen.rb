@@ -34,6 +34,8 @@
 #   cost_plan — competing usable B-tree predicates give the lower-name range candidate a higher
 #              estimate than the higher-name equality candidate; wrapping both columns in `+ 0`
 #              defeats both bounds. P6a's cost-selected result and the full scan must agree.
+#   cost_plan_p6b — mixed GIN/GiST/B-tree predicates, PK/index interval sets, and an order-only
+#              top-N compare P6b's whole-pipeline winner with a deliberately non-accelerated form.
 #   index_mut — UPDATE/DELETE target scans use a bare indexed equality/range or secondary-index
 #              IN-list; the equivalent `v + 0` predicates defeat the mutation bound. Applied to
 #              identically-seeded tables, both paths must reach the same by-construction end state,
@@ -172,6 +174,13 @@ COST_PLAN_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index dml.inse
                    dml.insert_multi_row query.select query.where_eq query.comparison_order query.logical_connectives
                    query.order_by query.index_range expr.arithmetic expr.comparison_value
                    types.i32].freeze
+COST_PLAN_P6B_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index ddl.gin_index
+                       ddl.gist_index dml.insert dml.insert_multi_row query.select query.where_eq
+                       query.comparison_order query.logical_connectives query.order_by
+                       query.order_by_keys query.limit query.index_range query.or_in_point_lookup
+                       query.interval_set query.gin_scan query.gist_scan query.order_by_index_scan
+                       expr.arithmetic expr.comparison_value types.i32 types.array types.range
+                       func.array_containment func.range_constructors func.range_operators].freeze
 INDEX_MUT_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index dml.insert
                    dml.insert_multi_row dml.update dml.delete query.select query.where_eq
                    query.comparison_order query.order_by query.or_in_point_lookup
@@ -714,6 +723,80 @@ def gen_cost_plan(seed)
   q(out, "I", "SELECT id FROM t WHERE a > #{lo} AND b = #{target} ORDER BY id", expected)
   out << "# +0 defeats both access predicates and full-scans — MUST match"
   q(out, "I", "SELECT id FROM t WHERE a + 0 > #{lo} AND b + 0 = #{target} ORDER BY id", expected)
+
+  out.join("\n") + "\n"
+end
+
+# --- scenario: P6b whole-pipeline selection across access/order families -----------------------
+def gen_cost_plan_p6b(seed)
+  rng = Random.new(seed)
+  ids = (1..12).to_a
+  avals = ids.shuffle(random: rng)
+  rows = ids.map do |id|
+    tags = [id % 3, (id + 1) % 5].uniq
+    [id, avals[id - 1], tags, [id, id + 4]]
+  end
+  arr = ->(xs) { "ARRAY[#{xs.join(',')}]::i32[]" }
+  range = ->(lo, hi) { "i32range(#{lo},#{hi})" }
+  flat = ->(rs) { rs.map { |id, _a, _tags, _span| id.to_s } }
+
+  out = header(seed, COST_PLAN_P6B_REQ,
+               "P6b whole-pipeline selection across GIN/GiST/interval/order families")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, a i32, tags i32[], span i32range)")
+  stmt(out, "CREATE INDEX t_a ON t (a)")
+  stmt(out, "CREATE INDEX t_tags ON t USING gin (tags)")
+  stmt(out, "CREATE INDEX t_span ON t USING gist (span)")
+  values = rows.map do |id, a, tags, span|
+    "(#{id},#{a},'{#{tags.join(',')}}','[#{span[0]},#{span[1]})')"
+  end.join(', ')
+  stmt(out, "INSERT INTO t VALUES #{values}")
+
+  # Competing B-tree range and GIN predicates exercise selectivity-based cross-method choice.
+  term = rows.flat_map { |_id, _a, tags, _span| tags }.sample(random: rng)
+  cut = avals.sort[4]
+  expected = rows.select { |_id, a, tags, _span| a > cut && tags.include?(term) }.sort_by(&:first)
+  out << "# mixed B-tree range and GIN bound versus a full-scan spelling"
+  q(out, "I", "SELECT id FROM t WHERE a > #{cut} AND tags @> #{arr.call([term])} ORDER BY id",
+    flat.call(expected))
+  q(out, "I", "SELECT id FROM t WHERE a + 0 > #{cut} AND #{arr.call([term])} <@ tags ORDER BY id",
+    flat.call(expected))
+
+  # GiST and GIN have equal intrinsic access weights; the complete residual estimate and canonical
+  # kind order choose deterministically. Reversed operators defeat both bounds without changing rows.
+  qpoint = rng.rand(4..9)
+  expected = rows.select do |_id, _a, tags, span|
+    tags.include?(term) && span[0] <= qpoint && qpoint + 1 <= span[1]
+  end.sort_by(&:first)
+  out << "# competing GIN and GiST bounds versus an unaccelerated equivalent"
+  q(out, "I",
+    "SELECT id FROM t WHERE tags @> #{arr.call([term])} AND span @> #{range.call(qpoint, qpoint + 1)} ORDER BY id",
+    flat.call(expected))
+  q(out, "I",
+    "SELECT id FROM t WHERE #{arr.call([term])} <@ tags AND #{range.call(qpoint, qpoint + 1)} <@ span ORDER BY id",
+    flat.call(expected))
+
+  low, high = ids.values_at(2, 9)
+  expected = rows.select { |id, _a, _tags, _span| id <= low || id >= high }.sort_by(&:first)
+  out << "# PK interval set versus wrapped-key full scan"
+  q(out, "I", "SELECT id FROM t WHERE id <= #{low} OR id >= #{high} ORDER BY id", flat.call(expected))
+  q(out, "I", "SELECT id FROM t WHERE id + 0 <= #{low} OR id + 0 >= #{high} ORDER BY id",
+    flat.call(expected))
+
+  points = avals.sample(2, random: rng).sort
+  expected = rows.select { |_id, a, _tags, _span| points.include?(a) }.sort_by(&:first)
+  out << "# ordered-index interval set versus wrapped-key full scan"
+  q(out, "I", "SELECT id FROM t WHERE a = #{points[0]} OR a = #{points[1]} ORDER BY id",
+    flat.call(expected))
+  q(out, "I", "SELECT id FROM t WHERE a + 0 = #{points[0]} OR a + 0 = #{points[1]} ORDER BY id",
+    flat.call(expected))
+
+  # a is distinct, so both ORDER BY spellings are total. The first admits an order-only B-tree walk;
+  # +0 gates it off and leaves the blocking-sort reference.
+  k = rng.rand(2..5)
+  expected = rows.sort_by { |_id, a, _tags, _span| a }.first(k)
+  out << "# order-only B-tree top-N versus expression-key blocking sort"
+  q(out, "I", "SELECT id FROM t ORDER BY a LIMIT #{k}", flat.call(expected))
+  q(out, "I", "SELECT id FROM t ORDER BY a + 0, id LIMIT #{k}", flat.call(expected))
 
   out.join("\n") + "\n"
 end
@@ -2143,6 +2226,7 @@ SCENARIOS = {
   "index_nested_loop" => method(:gen_index_nested_loop),
   "index" => method(:gen_index),
   "cost_plan" => method(:gen_cost_plan),
+  "cost_plan_p6b" => method(:gen_cost_plan_p6b),
   "index_mut" => method(:gen_index_mutation),
   "index_expr" => method(:gen_index_expr),
   "index_range" => method(:gen_index_range),

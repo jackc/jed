@@ -1,0 +1,340 @@
+# P6b: one-relation SELECTs cost the complete access/order/residual/LIMIT pipeline across GIN,
+# GiST, PK/index interval sets, and order-only B-tree walks. These cases pin row-count flips,
+# cross-method selectivity and kind/name ties, natural-order composition, and actual costs.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.gin_index, ddl.gist_index, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.or_in_point_lookup, query.interval_set, query.gin_scan, query.gist_scan, query.order_by, query.order_by_keys, query.limit, query.order_by_index_scan, query.explain, types.i32, types.array, types.range, func.array_containment, func.range_constructors, func.range_operators, resource.cost_metering
+
+# --- GIN and GiST row-count flips ------------------------------------------------------------
+
+statement ok
+CREATE TABLE p6b_g (id i32 PRIMARY KEY, tags i32[])
+
+statement ok
+CREATE INDEX p6b_g_tags ON p6b_g USING gin (tags)
+
+statement ok
+INSERT INTO p6b_g VALUES (1, ARRAY[1])
+
+# One row makes the full scan cheaper than posting gather plus table recovery.
+query ITTII nosort
+EXPLAIN SELECT id FROM p6b_g WHERE tags && ARRAY[1]
+----
+0
+Filter
+conjuncts=1
+1
+5
+1
+Scan p6b_g
+Full scan; touched=2
+1
+2
+
+statement ok
+INSERT INTO p6b_g VALUES (2, ARRAY[1])
+
+# At two rows the deterministic GIN selectivity estimate flips the selected access path.
+query ITTII nosort
+EXPLAIN SELECT id FROM p6b_g WHERE tags && ARRAY[1]
+----
+0
+Filter
+conjuncts=1
+1
+7
+1
+Scan p6b_g
+GIN bound: using p6b_g_tags; touched=2
+1
+4
+
+# cost: 13
+query I nosort
+SELECT id FROM p6b_g WHERE tags && ARRAY[1] ORDER BY id
+----
+1
+2
+
+statement ok
+CREATE TABLE p6b_r (id i32 PRIMARY KEY, span i32range)
+
+statement ok
+CREATE INDEX p6b_r_span ON p6b_r USING gist (span)
+
+statement ok
+INSERT INTO p6b_r VALUES (1, '[1,10)')
+
+query ITTII nosort
+EXPLAIN SELECT id FROM p6b_r WHERE span && i32range(5,6)
+----
+0
+Filter
+conjuncts=1
+1
+5
+1
+Scan p6b_r
+Full scan; touched=2
+1
+2
+
+statement ok
+INSERT INTO p6b_r VALUES (2, '[1,10)')
+
+query ITTII nosort
+EXPLAIN SELECT id FROM p6b_r WHERE span && i32range(5,6)
+----
+0
+Filter
+conjuncts=1
+1
+7
+1
+Scan p6b_r
+GiST bound: using p6b_r_span; touched=2
+1
+4
+
+# cost: 11
+query I nosort
+SELECT id FROM p6b_r WHERE span && i32range(5,6) ORDER BY id
+----
+1
+2
+
+# --- interval-set selection and competition --------------------------------------------------
+
+statement ok
+CREATE TABLE p6b_i (id i32 PRIMARY KEY, x i32)
+
+statement ok
+CREATE INDEX p6b_i_x ON p6b_i (x)
+
+statement ok
+INSERT INTO p6b_i VALUES (1, 1), (2, 2)
+
+# At two rows the full scan beats a secondary-index interval set.
+query ITTII nosort
+EXPLAIN SELECT id FROM p6b_i WHERE x = 1 OR x = 2
+----
+0
+Filter
+conjuncts=1
+2
+11
+1
+Scan p6b_i
+Full scan; touched=2
+2
+3
+
+statement ok
+INSERT INTO p6b_i VALUES (3, 3), (4, 4)
+
+# The same two-point predicate flips to the index interval set at four rows.
+query ITTII nosort
+EXPLAIN SELECT id FROM p6b_i WHERE x = 1 OR x = 2
+----
+0
+Filter
+conjuncts=1
+2
+13
+1
+Scan p6b_i
+Index interval set: using p6b_i_x; intervals=2; touched=2
+2
+5
+
+statement ok
+INSERT INTO p6b_i VALUES (5, 5), (6, 6), (7, 7), (8, 8), (9, 9), (10, 10), (11, 11), (12, 12)
+
+# A narrow PK interval set beats the simultaneously usable broad contiguous PK bound.
+query ITTII nosort
+EXPLAIN SELECT x FROM p6b_i WHERE (id = 1 OR id = 2) AND id >= 0
+----
+0
+Filter
+conjuncts=2
+1
+8
+1
+Scan p6b_i
+PK interval set: id; intervals=2; touched=2
+1
+2
+
+# The ordered-index interval set makes the same selectivity-driven choice.
+query ITTII nosort
+EXPLAIN SELECT id FROM p6b_i WHERE (x = 1 OR x = 2) AND x >= 0
+----
+0
+Filter
+conjuncts=2
+1
+9
+1
+Scan p6b_i
+Index interval set: using p6b_i_x; intervals=2; touched=2
+1
+3
+
+# cost: 11
+query I nosort
+SELECT x FROM p6b_i WHERE id = 1 OR id = 2 ORDER BY x
+----
+1
+2
+
+# cost: 13
+query I nosort
+SELECT id FROM p6b_i WHERE x = 1 OR x = 2 ORDER BY id
+----
+1
+2
+
+# A selected B-tree bound carries its exact natural index order even without LIMIT; this is not an
+# order-only candidate, so the LIMIT eligibility gate does not apply.
+query ITTII nosort
+EXPLAIN SELECT id FROM p6b_i WHERE x = 1 ORDER BY x
+----
+0
+Filter
+conjuncts=1
+1
+5
+1
+Scan p6b_i
+Index bound: using p6b_i_x; touched=2; ordered: index order: p6b_i_x
+1
+3
+
+# cost: 5
+query I nosort
+SELECT id FROM p6b_i WHERE x = 1 ORDER BY x
+----
+1
+
+# --- order-only candidates and deterministic name ties --------------------------------------
+
+statement ok
+CREATE TABLE p6b_o (id i32 PRIMARY KEY, a i32)
+
+# Reverse creation order cannot leak into the exact tie between identical order-only walks.
+statement ok
+CREATE INDEX z_order ON p6b_o (a)
+
+statement ok
+CREATE INDEX a_order ON p6b_o (a)
+
+statement ok
+INSERT INTO p6b_o VALUES (1, 99)
+
+# At one row the full scan plus unmetered blocking sort remains cheaper.
+query ITTII nosort
+EXPLAIN SELECT id FROM p6b_o ORDER BY a LIMIT 1
+----
+0
+Limit
+limit=1
+1
+3
+1
+Sort
+keys=1, top-k=1
+1
+2
+2
+Scan p6b_o
+Full scan; touched=2
+1
+2
+
+statement ok
+INSERT INTO p6b_o VALUES (2, 98)
+
+# At two rows the order-only walk wins; exact cost/name ties retain lowercased a_order.
+query ITTII nosort
+EXPLAIN SELECT id FROM p6b_o ORDER BY a LIMIT 1
+----
+0
+Limit
+limit=1
+1
+4
+1
+Scan p6b_o
+Full scan; touched=2; ordered: index order: a_order
+1
+3
+
+# cost: 4
+query I nosort
+SELECT id FROM p6b_o ORDER BY a LIMIT 1
+----
+2
+
+# --- mixed access-method cost and tie behavior -----------------------------------------------
+
+statement ok
+CREATE TABLE p6b_m (id i32 PRIMARY KEY, a i32, tags i32[], span i32range)
+
+statement ok
+CREATE INDEX p6b_m_a ON p6b_m (a)
+
+statement ok
+CREATE INDEX p6b_m_tags ON p6b_m USING gin (tags)
+
+statement ok
+CREATE INDEX p6b_m_span ON p6b_m USING gist (span)
+
+statement ok
+INSERT INTO p6b_m VALUES
+  (1,1,ARRAY[1],'[1,3)'), (2,2,ARRAY[2],'[2,4)'), (3,0,ARRAY[0],'[3,5)'),
+  (4,1,ARRAY[1],'[4,6)'), (5,2,ARRAY[2],'[5,7)'), (6,0,ARRAY[0],'[6,8)'),
+  (7,1,ARRAY[1],'[7,9)'), (8,2,ARRAY[2],'[8,10)'), (9,0,ARRAY[0],'[9,11)'),
+  (10,1,ARRAY[1],'[10,12)'), (11,2,ARRAY[2],'[11,13)'), (12,0,ARRAY[0],'[12,14)')
+
+# B-tree equality is cheaper than the competing GIN predicate.
+query ITTII nosort
+EXPLAIN SELECT id FROM p6b_m WHERE a = 1 AND tags && ARRAY[1]
+----
+0
+Filter
+conjuncts=2
+1
+8
+1
+Scan p6b_m
+Index bound: using p6b_m_a; touched=3
+1
+3
+
+# Replacing equality with a range raises the B-tree estimate, so GIN wins.
+query ITTII nosort
+EXPLAIN SELECT id FROM p6b_m WHERE a > 0 AND tags && ARRAY[1]
+----
+0
+Filter
+conjuncts=2
+1
+9
+1
+Scan p6b_m
+GIN bound: using p6b_m_tags; touched=3
+1
+4
+
+# GIN and GiST have the same complete-pipeline estimate here. Canonical kind order retains GiST.
+query ITTII nosort
+EXPLAIN SELECT id FROM p6b_m WHERE tags && ARRAY[1] AND span && i32range(4,5)
+----
+0
+Filter
+conjuncts=2
+1
+10
+1
+Scan p6b_m
+GiST bound: using p6b_m_span; touched=3
+1
+4

@@ -83,8 +83,11 @@ TS; any deviation diverges the count and fails the corpus.
 
 P6a now lets the estimator select among full, PK, and ordered B-tree candidates for a SELECT with
 one base relation. The accrual rules below are unchanged: they describe the actual work of whichever
-path wins. GiST/GIN/interval winners, multi-relation SELECTs, and UPDATE/DELETE retain their staged
-fixed policies until P6b/P7/a mutation-specific slice ([estimator.md §9.1](estimator.md)).
+path wins. P6b extends that rule to GiST, GIN, both interval families, and secondary-index
+ORDER-BY/top-N alternatives by comparing the complete scheduled single-relation pipeline. A plain
+LIMIT can therefore change the access winner when early-out changes metered work; unmetered sorting
+still contributes no private planner weight. Multi-relation SELECTs and UPDATE/DELETE retain their
+staged fixed policies until P7/a mutation-specific slice ([estimator.md §9.1](estimator.md)).
 
 - **`storage_row_read`** is charged once per row pulled from a store, at the top of the
   executor scan loop, **before** the filter runs — in `SELECT`, `DELETE`, and `UPDATE`.

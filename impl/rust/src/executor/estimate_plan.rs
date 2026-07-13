@@ -1,5 +1,5 @@
 //! P5 whole-plan estimate propagation. The traversal mirrors `explain_exec`'s pre-order renderer
-//! and observes the physical plan after P6a's staged base-access selection.
+//! and observes the physical plan after P6's single-relation pipeline selection.
 
 use super::*;
 use crate::estimator::{EstimatedPlan, PlanEstimate, estimate_rows, sat_add, sat_mul, scale_ceil};
@@ -538,6 +538,10 @@ impl Engine {
         plan.add_root_unit(UNIT_ROW_PRODUCED, plan.root.rows);
         plan.nodes[0] = plan.root.clone();
         plan
+    }
+
+    pub(crate) fn estimate_select_plan_cost(&self, sp: &SelectPlan) -> i64 {
+        self.estimate_select_plan(sp, None).root.cost()
     }
 
     fn estimate_values_plan(

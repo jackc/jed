@@ -971,11 +971,12 @@ of executing a query** and **abort when a caller-supplied ceiling is exceeded**.
   P5 now propagates the selected plan through every rendered query/DML node and exposes cumulative
   non-NULL `i64` `est_rows`/`est_cost` columns in EXPLAIN. ANALYZE keeps actual root cost/rows in its
   detail, CTE attribution follows execution semantics, and streaming LIMIT prefixes affect estimates.
-  P6a is the first cost-selected slice: a SELECT with exactly one base relation chooses the minimum
-  estimated-cost PK, ordered-B-tree, or full-scan candidate, using the canonical total tie order and
-  then recomputing whether the selected path supplies storage order. Multi-relation SELECTs,
-  UPDATE/DELETE, and a legacy winner from the deferred GIN/GiST/interval families keep their explicit
-  fixed policies until P6b/P7 or a mutation-specific slice.
+  P6 now cost-selects the complete single-base-relation pipeline: PK, every ordered-B-tree,
+  GiST/GIN, both interval-set families, full scan, and eligible order-only B-tree walks compete after
+  composing natural order, the complete residual/projection, and LIMIT/OFFSET early-out. Exact ties
+  use the canonical kind/lowercased-name order; blocking sort remains unmetered and receives no
+  private planner weight. Multi-relation SELECTs and UPDATE/DELETE keep their explicit fixed policies
+  until P7 or a mutation-specific slice.
 - **Ceiling + abort.** A caller may set a **maximum cost**; the instant accrued cost reaches
   it, execution **aborts deterministically** with a defined error code (registered in
   `spec/errors/`). The abort point is itself deterministic (same query + db + ceiling → same

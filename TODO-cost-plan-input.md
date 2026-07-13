@@ -292,14 +292,24 @@ formatting, and the website production build pass.
 
 ### P6b — GIN, GiST, interval sets, and ordering paths
 
-- [ ] Enable cost selection for GIN candidates.
-- [ ] Enable cost selection for GiST candidates.
-- [ ] Enable cost selection for PK and ordered-index interval sets.
-- [ ] Integrate secondary-index ORDER BY/top-N candidates without silently pricing unmetered sort
+- [x] Enable cost selection for GIN candidates.
+- [x] Enable cost selection for GiST candidates.
+- [x] Enable cost selection for PK and ordered-index interval sets.
+- [x] Integrate secondary-index ORDER BY/top-N candidates without silently pricing unmetered sort
   work.
-- [ ] Add mixed-access-method ties and selectivity flips.
-- [ ] Extend NoREC relations and re-pin costs for every newly selectable path.
-- [ ] Run affected access-path benchmarks and full cross-core CI.
+- [x] Add mixed-access-method ties and selectivity flips.
+- [x] Extend NoREC relations and re-pin costs for every newly selectable path.
+- [x] Run affected access-path benchmarks and full cross-core CI.
+
+**Status:** implemented and verified on 2026-07-13. Every one-base-relation access identity now
+competes as a complete access/order/residual/projection/LIMIT pipeline. Eligible order-only B-tree
+walks participate only with LIMIT, while a selected same-index bound carries its natural order
+without that extra gate.
+`query/cost_plan_access_p6b.test` pins GIN/GiST and interval row-count flips, mixed-method
+selectivity/kind ties, lexical order-index ties, EXPLAIN estimates, and actual costs. The dedicated
+`cost_plan_p6b` NoREC scenario covers optimized and deliberately unaccelerated equivalents. Native
+before/after benchmark checksums match for GIN, GiST, interval, and order-only lanes. Full CI passes,
+including the 20-seed, 2,160-check all-core NoREC sweep.
 
 **Exit gate:** every single-relation SELECT access path is selected from the deterministic estimator,
 with exact tie behavior, EXPLAIN coverage, NoREC coverage, and re-pinned actual costs.
@@ -401,20 +411,20 @@ byte-identical, deterministic, cache-safe, and demonstrably improve plan selecti
 
 Update this short block at the end of each work session.
 
-- **Current slice:** P6a complete; P6b deferred-access-method and ordering-path selection is next
-- **Last completed checkpoint:** one-base-relation SELECTs cost-select PK, every ordered B-tree, and
-  full scan in all three cores, with exact ties, ordering composition, staged legacy boundaries,
-  shared EXPLAIN/cost coverage, and a new NoREC relation
+- **Current slice:** P6b complete; P7 costed two-relation join orientation and algorithm is next
+- **Last completed checkpoint:** one-base-relation SELECTs cost-select every full, PK, ordered
+  B-tree, GIN, GiST, and interval-set access identity as a complete pipeline in all three cores,
+  including deterministic exact ties, natural-order composition, bounded order-only walks, shared
+  EXPLAIN/cost coverage, benchmarks, and NoREC relations
 - **Branch / completion:** `path-b-p0-estimator-contract` / commit titled
-  `Implement P6a cost-based access selection`
-- **Verification last run:** `bundle exec rake ci` (including the 20-seed, 2,100-check all-core NoREC
-  sweep), an explicit final memory+disk conformance pass on all three cores, `bundle exec rake fmt`,
-  `bundle exec rake verify`, and the website production build passed on 2026-07-13; native
+  `Implement P6b complete single-relation selection`
+- **Verification last run:** `bundle exec rake ci` (including the 20-seed, 2,160-check all-core NoREC
+  sweep), explicit memory+disk conformance on all three cores, release unit suites, `bundle exec rake
+  fmt`, `bundle exec rake verify`, and the website production build passed on 2026-07-13; native
   Rust/Go/TypeScript before/after benchmarks used identical regenerated format-28 data
-- **Known blockers or open decisions:** no product blocker or open P6a decision. The aggregate
+- **Known blockers or open decisions:** no product blocker or open P6b decision. The aggregate
   `bench:run` wrapper could not build its optional WASI harness because `wasm32-wasip1` is not
   installed; the affected native core harnesses were run directly instead, without provisioning a
   toolchain target
-- **Next action:** specify P6b's whole-pipeline candidates before enabling GIN, GiST, interval sets,
-  or secondary-index ORDER BY/top-N cost selection; ask the maintainer about any major selection or
-  pricing decision
+- **Next action:** specify P7's legal two-relation physical candidates and ask the maintainer about
+  major join-orientation, algorithm-selection, or pricing decisions before implementation

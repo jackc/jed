@@ -3047,6 +3047,10 @@ export class Engine {
     return plan;
   }
 
+  estimateSelectPlanCost(sp: SelectPlan): bigint {
+    return planEstimateCost(this.estimateSelectPlan(sp, null).root);
+  }
+
   private estimateQueryPlan(plan: QueryPlan, ctx: EstimateCteContext | null): EstimatedPlan {
     if (plan.kind === "select") return this.estimateSelectPlan(plan, ctx);
     if (plan.kind === "values") {
@@ -15339,24 +15343,18 @@ export function selectLegacyScanCandidate(
   return null;
 }
 
-// selectCostedP6aScanCandidate enables the first Path-B choice without pulling P6b/P7 access
-// methods forward. A legacy GiST/GIN/interval winner remains authoritative. Otherwise PK, ordered
-// B-tree, and full candidates compete by estimate; inventory order is the canonical exact-cost
-// kind/name tie-break.
-export function selectCostedP6aScanCandidate(
+// Select the lowest base-access estimate across the complete P3 inventory. P6b's whole-pipeline
+// rule subsequently recomputes the eligible single-relation winner after composing ordering and
+// LIMIT/OFFSET. Inventory order is the canonical exact-cost kind/name tie-break.
+export function selectCostedScanCandidate(
   candidates: ScanCandidate[],
   estimates: CandidateEstimate[],
   policy: ScanBoundPolicy,
 ): ScanBound | null {
   const legacy = selectLegacyScanCandidate(candidates, policy);
   if (candidates.length === 0 || candidates.length !== estimates.length) return legacy;
-  const legacyCandidate = candidates.find((candidate) => candidate.bound === legacy);
-  const legacyKind = legacyCandidate?.identity.kind ?? "full";
-  if (legacyKind !== "pk" && legacyKind !== "btree" && legacyKind !== "full") return legacy;
   let winner = -1;
   for (let i = 0; i < candidates.length; i++) {
-    const kind = candidates[i]!.identity.kind;
-    if (kind !== "pk" && kind !== "btree" && kind !== "full") continue;
     if (winner === -1 || estimates[i]!.cost < estimates[winner]!.cost) winner = i;
   }
   return winner === -1 ? legacy : candidates[winner]!.bound;
@@ -15740,14 +15738,15 @@ export type IndexOrder = { nameKey: string; pkWidth: number };
 // match) and sorting by the column's stored key collation (Skewed/unresolvable → refuse, §12), AND
 // the table's PK is fixed-width. The exact-match requirement is load-bearing: a strict prefix of a
 // multi-column index would tie-break by the remaining index columns, not the PK.
-export function orderSatisfiedByIndex(
+export function orderSatisfiedByIndexes(
   snap: Snapshot,
   table: Table,
   offset: number,
   order: OrderSlot[],
-): IndexOrder | null {
+): IndexOrder[] {
   const pkWidth = pkStorageWidth(table);
-  if (pkWidth === null) return null;
+  if (pkWidth === null) return [];
+  const matchingIndexes: IndexOrder[] = [];
   for (const idx of table.indexes) {
     if (idx.kind !== "btree") continue; // only an ordered B-tree realizes the column order
     // A PARTIAL index is not used for ORDER-BY skip-sort this slice (indexes.md §9): it holds only its
@@ -15785,9 +15784,19 @@ export function orderSatisfiedByIndex(
         break;
       }
     }
-    if (matches) return { nameKey: idx.name.toLowerCase(), pkWidth };
+    if (matches) matchingIndexes.push({ nameKey: idx.name.toLowerCase(), pkWidth });
   }
-  return null;
+  matchingIndexes.sort((a, b) => compareLowerName({ name: a.nameKey }, { name: b.nameKey }));
+  return matchingIndexes;
+}
+
+export function orderSatisfiedByIndex(
+  snap: Snapshot,
+  table: Table,
+  offset: number,
+  order: OrderSlot[],
+): IndexOrder | null {
+  return orderSatisfiedByIndexes(snap, table, offset, order)[0] ?? null;
 }
 
 // buildGinBoundForIndex inventories one GIN index when its array column has an accelerable conjunct
@@ -20363,9 +20372,8 @@ export type PhysicalPlan = {
   // (literal/param/outer) — a cross-relation `b.pk = a.x` is the index-nested-loop case (a
   // follow-on). The residual filter stays the WHOLE `filter`, re-applied after the join.
   relBounds: (ScanBound | null)[];
-  // Deterministic base candidate estimates. P6a consumes them only for eligible one-base-relation
-  // SELECT PK/B-tree/full choices; later access methods and joins retain staged legacy policies.
-  // Execution never reads these.
+  // Deterministic base candidate estimates. P6b composes them into complete one-base-relation
+  // access/ordering pipelines; joins retain staged legacy policies. Execution never reads these.
   relEstimates: CandidateEstimate[][];
   // relINLBounds is the INDEX-NESTED-LOOP scan bounds, one per relation (cost.md §3 "JOIN"). Non-null
   // for a join inner relation whose primary key / indexed column is compared to a SIBLING column of an

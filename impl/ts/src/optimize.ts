@@ -10,21 +10,32 @@
 // cycle follows the session.ts precedent.)
 
 import { pkIndices } from "./catalog.ts";
-import type { Engine, RExpr, ScopeRel, SelectPlan } from "./executor.ts";
+import type {
+  Engine,
+  IndexOrder,
+  RExpr,
+  ScanBound,
+  ScanCandidateIdentity,
+  ScopeRel,
+  SelectPlan,
+} from "./executor.ts";
 import {
+  SCAN_CANDIDATE_KINDS,
   detectINLBound,
   estimateScanCandidates,
   fkTypesEqual,
   inventoryScanCandidates,
   needsEagerScan,
   orderSatisfiedByIndex,
+  orderSatisfiedByIndexes,
   orderSatisfiedByPK,
   scanBoundHasStorageOrder,
   SELECT_SCAN_BOUND_POLICY,
-  selectCostedP6aScanCandidate,
+  selectCostedScanCandidate,
   selectLegacyScanCandidate,
 } from "./executor.ts";
 import type { Snapshot } from "./snapshot.ts";
+import { isAttachmentScope } from "./session.ts";
 import type { ScalarType, Type } from "./types.ts";
 
 // optimizeSelect applies the physical rules to a freshly resolved logical plan, in a FIXED order
@@ -44,6 +55,7 @@ export function optimizeSelect(
   ruleHashJoin(plan, rels);
   ruleOrderByPkScan(plan, rels, snap);
   ruleOrderByIndexScan(plan, rels, snap);
+  ruleCostedSingleRelationPipeline(plan, rels, snap, eng);
   ruleJoinPkOrdered(plan, rels, snap);
   ruleOrderByLimitTopK(plan);
 }
@@ -174,9 +186,123 @@ function ruleScanBounds(plan: SelectPlan, rels: ScopeRel[], snap: Snapshot, eng:
     );
     plan.phys.relEstimates[i] = estimates;
     return rels.length === 1
-      ? selectCostedP6aScanCandidate(candidates, estimates, SELECT_SCAN_BOUND_POLICY)
+      ? selectCostedScanCandidate(candidates, estimates, SELECT_SCAN_BOUND_POLICY)
       : selectLegacyScanCandidate(candidates, SELECT_SCAN_BOUND_POLICY);
   });
+}
+
+type SingleRelationPipelineCandidate = {
+  identity: ScanCandidateIdentity;
+  bound: ScanBound | null;
+  pkOrdered: boolean;
+  pkReverse: boolean;
+  indexOrder: IndexOrder | null;
+};
+
+// P6b composes every legal access path with its natural ordering, adds missing order-only B-tree
+// top-N walks, and selects the minimum cumulative scheduled estimate through LIMIT/OFFSET. A
+// blocking sort adds no private weight. Canonical identity order breaks exact cost ties.
+function ruleCostedSingleRelationPipeline(
+  plan: SelectPlan,
+  rels: ScopeRel[],
+  snap: Snapshot,
+  eng: Engine,
+): void {
+  if (
+    rels.length !== 1 ||
+    plan.rels.length !== 1 ||
+    plan.rels[0]!.srf !== undefined ||
+    plan.rels[0]!.cte !== undefined ||
+    plan.rels[0]!.derived !== undefined
+  ) {
+    return;
+  }
+  const rel = rels[0]!;
+  const access = inventoryScanCandidates(plan.filter, rel, snap, eng);
+  if (access.length === 0) return;
+
+  const pkDir =
+    !plan.isAgg && plan.order.length > 0 && plan.orderExprs.length === 0
+      ? orderSatisfiedByPK(snap, rel.table, plan.rels[0]!.offset, plan.order)
+      : null;
+  const indexOrders =
+    !isAttachmentScope(rel.db) &&
+    !plan.isAgg &&
+    !plan.hasWindow &&
+    !plan.distinct &&
+    plan.order.length > 0 &&
+    plan.orderExprs.length === 0 &&
+    pkDir === null
+      ? orderSatisfiedByIndexes(snap, rel.table, plan.rels[0]!.offset, plan.order)
+      : [];
+
+  const orderByName = new Map(indexOrders.map((order) => [order.nameKey, order]));
+  const pipelines: SingleRelationPipelineCandidate[] = access.map((candidate) => {
+    const storageOrder = candidate.scanOrder.kind === "storageKey";
+    const indexOrder =
+      candidate.scanOrder.kind === "indexKey"
+        ? (orderByName.get(candidate.scanOrder.indexName) ?? null)
+        : null;
+    return {
+      identity: candidate.identity,
+      bound: candidate.bound,
+      pkOrdered: storageOrder && pkDir !== null,
+      pkReverse: storageOrder && (pkDir?.reverse ?? false),
+      indexOrder,
+    };
+  });
+  const identityKey = (identity: ScanCandidateIdentity): string =>
+    `${identity.kind}\u0000${identity.indexName}`;
+  const seen = new Set(pipelines.map((candidate) => identityKey(candidate.identity)));
+  for (const indexOrder of indexOrders) {
+    if (plan.limit === null) break; // the established order-only eligibility gate requires LIMIT
+    const identity: ScanCandidateIdentity = { kind: "btree", indexName: indexOrder.nameKey };
+    if (seen.has(identityKey(identity))) continue;
+    pipelines.push({
+      identity,
+      bound: null,
+      pkOrdered: false,
+      pkReverse: false,
+      indexOrder,
+    });
+  }
+  pipelines.sort((a, b) => {
+    const rank =
+      SCAN_CANDIDATE_KINDS.indexOf(a.identity.kind) - SCAN_CANDIDATE_KINDS.indexOf(b.identity.kind);
+    if (rank !== 0) return rank;
+    return a.identity.indexName < b.identity.indexName
+      ? -1
+      : a.identity.indexName > b.identity.indexName
+        ? 1
+        : 0;
+  });
+
+  let winner: SingleRelationPipelineCandidate | null = null;
+  let winnerCost = 0n;
+  for (const candidate of pipelines) {
+    const trial: SelectPlan = {
+      ...plan,
+      phys: {
+        ...plan.phys,
+        relBounds: [candidate.bound],
+        pkOrdered: candidate.pkOrdered,
+        pkReverse: candidate.pkReverse,
+        indexOrder: candidate.indexOrder,
+        joinPkOrdered: false,
+        topK: null,
+      },
+    };
+    const cost = eng.estimateSelectPlanCost(trial);
+    if (winner === null || cost < winnerCost) {
+      winner = candidate;
+      winnerCost = cost;
+    }
+  }
+  if (winner === null) return;
+  plan.phys.relBounds[0] = winner.bound;
+  plan.phys.pkOrdered = winner.pkOrdered;
+  plan.phys.pkReverse = winner.pkReverse;
+  plan.phys.indexOrder = winner.indexOrder;
 }
 
 // ruleIndexNestedLoop — index-nested-loop pushdown (cost.md §3 "JOIN"): a join inner relation

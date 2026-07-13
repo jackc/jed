@@ -4407,9 +4407,8 @@ pub(crate) struct PhysicalPlan {
     /// a sibling column). The residual filter stays the WHOLE `filter`, re-applied after the
     /// join — the bound only narrows which rows are scanned.
     rel_bounds: Vec<Option<ScanBound>>,
-    /// Deterministic base candidate estimates. P6a consumes them only for eligible one-base-relation
-    /// SELECT PK/B-tree/full choices; later access methods and joins retain staged legacy policies.
-    /// Execution never reads this field.
+    /// Deterministic base candidate estimates. P6b composes them into complete one-base-relation
+    /// access/ordering pipelines; joins retain staged legacy policies. Execution never reads this.
     rel_estimates: Vec<Vec<crate::estimator::CandidateEstimate>>,
     /// **Index-nested-loop** scan bounds, one per relation (cost.md §3 "JOIN"). `Some` for a join
     /// inner relation whose primary key / indexed column is compared to a **sibling** column of an

@@ -197,6 +197,11 @@ answer — the index is transparent. The same bound applies to **`UPDATE` and `D
 whose `WHERE` is GIN-accelerable narrows its target-row scan through the index too, so the rows it
 rewrites or removes are exactly the full-scan set (only faster).
 
+For a one-table `SELECT`, an eligible GIN path competes by deterministic estimated cost with the
+full scan, primary-key, B-tree, GiST, and interval alternatives. The estimate covers the complete
+pipeline and may therefore choose a different path as row count, residual selectivity, ordering, or
+LIMIT changes; exact ties follow a fixed access-kind and lowercased-name order.
+
 For a bounded `SELECT ... LIMIT`, jed completes the posting-list gather, then fetches and rechecks
 candidate table rows only until the requested window is full. With an ordered B-tree bound, it can
 stop the index walk itself at the same point. A matching `ORDER BY` keeps this bounded path; an
