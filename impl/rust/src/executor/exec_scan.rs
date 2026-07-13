@@ -1227,7 +1227,7 @@ impl Engine {
 
     /// Streaming two-table INNER/CROSS join whose `ORDER BY` is satisfied by the OUTER (first)
     /// relation's primary-key scan order (cost.md §3 "secondary-index order" companion — the join
-    /// top-N). A left-deep nested loop produces combined rows in `(outer PK, inner key)` order — which
+    /// top-N). The physical join produces combined rows in `(outer PK, inner key)` order — which
     /// IS the requested order, since the outer drives the loop in PK order — so the blocking sort is
     /// elided, and with a `LIMIT` the loop STOPS once the window is filled. An ordinary inner is
     /// materialized once; an index-nested-loop inner is opened per outer row and later seeks are
@@ -1259,13 +1259,29 @@ impl Engine {
         let offset = plan.offset.unwrap_or(0);
         let mut out: Vec<Vec<Value>> = Vec::new();
         if limit != Some(0) {
+            let hash_table = plan
+                .phys
+                .hash_join
+                .as_ref()
+                .map(|hash_plan| {
+                    HashJoinTable::build(hash_plan, plan.rels[1].offset, &right_rows, meter)
+                })
+                .transpose()?;
             let mut passed: i64 = 0;
             'outer: for left in &left_rows {
                 let inner_rows;
+                let hash_rows;
                 let current_right = if right_inl {
                     inner_rows = self
                         .materialize_rel(plan, 1, params, outer, left, stmt_rng, env.ctes, meter)?;
                     &inner_rows
+                } else if let Some(table) = &hash_table {
+                    hash_rows = table
+                        .probe(plan.phys.hash_join.as_ref().unwrap(), left, meter)?
+                        .into_iter()
+                        .map(|ri| right_rows[ri].clone())
+                        .collect();
+                    &hash_rows
                 } else {
                     &right_rows
                 };

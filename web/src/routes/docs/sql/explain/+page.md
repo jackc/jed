@@ -23,6 +23,8 @@ INSERT INTO trip VALUES (1, 3), (2, 1), (3, 3);`;
 	const pointSet = `EXPLAIN SELECT name FROM city WHERE id IN (1, 3, 5);`;
 	const indexNestedLoop = `EXPLAIN SELECT c.name
 FROM trip t JOIN city c ON c.id = t.city_id;`;
+	const hashJoin = `EXPLAIN SELECT c.name, t.id
+FROM city c JOIN trip t ON c.region = t.city_id;`;
 	const aggregate = `EXPLAIN SELECT region, count(*)
 FROM city GROUP BY region;`;
 	const analyze = `EXPLAIN ANALYZE SELECT name FROM city WHERE id = 3;`;
@@ -42,7 +44,7 @@ columns:
 
 - **`depth`** — the plan node's nesting level (0 = the top of the pipeline). The rows are a
   pre-order walk of the plan tree, so they read top-down as execution reads bottom-up.
-- **`node`** — the operator (`Scan`, `Filter`, `Sort`, `Aggregate`, `Nested Loop`, `Limit`, …).
+- **`node`** — the operator (`Scan`, `Filter`, `Sort`, `Aggregate`, `Nested Loop`, `Hash Join`, `Limit`, …).
 - **`detail`** — its attributes (the access path, key counts, and so on; `-` when it has none).
 
 The plan is a **deterministic** function of the query and the database, so every jed core renders
@@ -105,6 +107,16 @@ range/scalar predicates (`&&`, `@>`, `=`) can use a bare earlier-sibling column.
 inner child makes the per-outer access method visible.
 
 <LiveSql seed={seed} query={indexNestedLoop} rows={8} />
+
+## A hash join
+
+When no inner index can serve an `INNER` or `LEFT` equality join, jed may build the right input into
+an in-memory `Hash Join` and probe it with the left. Bare same-type column equalities become hash
+keys; multiple keys follow source order. NULL keys never match, and the complete `ON` predicate is
+still checked on candidates. `keys=N` makes the choice visible. The build table is currently
+in-memory; grace-hash spill is a later storage slice.
+
+<LiveSql seed={seed} query={hashJoin} rows={8} />
 
 ## Aggregation
 

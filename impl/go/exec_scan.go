@@ -1323,7 +1323,7 @@ func topKFixedScalar(ty scalarType) bool {
 }
 
 // execStreamingJoin is a streaming two-table INNER/CROSS join whose ORDER BY is satisfied by the
-// OUTER (first) relation's PK scan order (cost.md §3 "JOIN"). A left-deep nested loop produces
+// OUTER (first) relation's PK scan order (cost.md §3 "JOIN"). The physical join produces
 // combined rows in (outer PK, inner key) order — which IS the requested order — so the sort is
 // elided, and with a LIMIT the loop STOPS once the window is filled. An ordinary inner is
 // materialized once; an index-nested-loop inner is opened per outer row and later seeks are skipped
@@ -1343,6 +1343,13 @@ func (db *engine) execStreamingJoin(plan *selectPlan, env *evalEnv, meter *costM
 		}
 	}
 	on := plan.joins[0].on
+	var hashTable *hashJoinTable
+	if plan.phys.hashJoin != nil && (plan.limit == nil || *plan.limit != 0) {
+		hashTable, err = newHashJoinTable(plan.phys.hashJoin, plan.rels[1].offset, rightRows, meter)
+		if err != nil {
+			return selectResult{}, err
+		}
+	}
 
 	var offset int64
 	if plan.offset != nil {
@@ -1356,6 +1363,11 @@ func (db *engine) execStreamingJoin(plan *selectPlan, env *evalEnv, meter *costM
 			innerRows := rightRows
 			if rightINL {
 				innerRows, err = db.materializeRel(plan, 1, params, outer, left, rng, env.ctes, meter)
+				if err != nil {
+					return selectResult{}, err
+				}
+			} else if hashTable != nil {
+				innerRows, err = hashTable.probe(plan.phys.hashJoin, left, meter)
 				if err != nil {
 					return selectResult{}, err
 				}

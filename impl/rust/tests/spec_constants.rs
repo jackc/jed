@@ -480,6 +480,8 @@ fn cost_schedule_matches_spec() {
             "regex_compile" => COSTS.regex_compile,
             "regex_step" => COSTS.regex_step,
             "window_result" => COSTS.window_result,
+            "hash_build" => COSTS.hash_build,
+            "hash_probe" => COSTS.hash_probe,
             "window_frame_step" => COSTS.window_frame_step,
             "varlen_compare" => COSTS.varlen_compare,
             other => panic!("cost unit {other} has no COSTS field — update this cross-check"),

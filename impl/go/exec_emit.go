@@ -253,7 +253,7 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 
 	// Streaming two-table join (cost.md §3 "JOIN"): the planner set joinPkOrdered only for a two-table
 	// INNER/CROSS join whose ORDER BY the OUTER relation's PK scan order satisfies, with a LIMIT. The
-	// nested loop drives the outer in PK order so the output is already ordered — the sort is elided
+	// join drives/probes the outer in PK order so the output is already ordered — the sort is elided
 	// and the loop short-circuits a top-N.
 	if plan.phys.joinPkOrdered {
 		res, err := db.execStreamingJoin(plan, env, meter, params, outer, env.rng)
@@ -402,6 +402,44 @@ func (db *engine) execSelectEmit(plan *selectPlan, outer []storedRow, params []V
 			continue
 		}
 		rightRows := materialized[k+1]
+		// The hash rule is currently exactly two inputs, so it can only own join 0. Build the right
+		// input once, then probe left rows in running order. Candidate buckets retain right order and
+		// the full ON is rechecked, reproducing nested-loop enumeration and LEFT null-extension.
+		if k == 0 && plan.phys.hashJoin != nil {
+			table, err := newHashJoinTable(plan.phys.hashJoin, plan.rels[1].offset, rightRows, meter)
+			if err != nil {
+				return emitter{}, err
+			}
+			for _, left := range running {
+				candidates, err := table.probe(plan.phys.hashJoin, left, meter)
+				if err != nil {
+					return emitter{}, err
+				}
+				leftMatched := false
+				for _, right := range candidates {
+					combined := make(storedRow, 0, len(left)+len(right))
+					combined = append(combined, left...)
+					combined = append(combined, right...)
+					v, err := on.eval(combined, env, meter)
+					if err != nil {
+						return emitter{}, err
+					}
+					if v.IsTrue() {
+						next = append(next, combined)
+						leftMatched = true
+					}
+				}
+				if emitLeft && !leftMatched {
+					combined := append(storedRow{}, left...)
+					for i := 0; i < rightPad; i++ {
+						combined = append(combined, NullValue())
+					}
+					next = append(next, combined)
+				}
+			}
+			running = next
+			continue
+		}
 		rightMatched := make([]bool, len(rightRows))
 		for _, left := range running {
 			leftMatched := false

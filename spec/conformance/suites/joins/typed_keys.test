@@ -1,4 +1,5 @@
-# JOIN ON equality over NON-INTEGER key types — the nested-loop ON match (grammar.md §15) driven
+# JOIN ON equality over NON-INTEGER key types — the hash-key encoding and residual ON match
+# (grammar.md §15) driven
 # by each type's value-canonical equality and three-valued ON, for decimal, bytea, uuid, timestamp,
 # and timestamptz. The dedicated joins/*.test match only i32 / text / boolean keys; this file
 # pushes the join key comparison through the §8 hotspot types. The headline case is decimal: 1.5
@@ -7,7 +8,7 @@
 # LEFT JOIN case pins the 3VL ON rule: a NULL join key never matches, so its row is NULL-extended
 # like any other unmatched left row. Rows are asserted with `rowsort` (join output order is
 # unspecified — §8).
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.join_inner, query.join_left, query.table_alias, query.qualified_column, types.i16, types.i32, types.i64, types.decimal, types.bytea, types.uuid, types.timestamp, types.timestamptz, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.join_inner, query.join_left, query.table_alias, query.qualified_column, query.hash_join, types.i16, types.i32, types.i64, types.decimal, types.bytea, types.uuid, types.timestamp, types.timestamptz, resource.cost_metering
 
 # --- decimal: 1.5 matches 1.50 across stored scales (value-canonical, not lexical) -----------
 statement ok

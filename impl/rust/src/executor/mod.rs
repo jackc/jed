@@ -55,6 +55,8 @@ mod dml;
 mod eval;
 mod exec_emit;
 mod exec_scan;
+mod hash_join;
+pub(crate) use hash_join::*;
 mod execute;
 mod explain_exec;
 mod kernels;
@@ -4343,6 +4345,9 @@ pub(crate) struct SelectPlan {
 /// executor then full-scans and eager-sorts.
 #[derive(Default)]
 pub(crate) struct PhysicalPlan {
+    /// Deterministic two-input hash operator. Builds the right input and probes the left using
+    /// same-type bare-column equality keys in source order. `None` keeps nested loop.
+    hash_join: Option<HashJoinPlan>,
     /// `ORDER BY` is satisfied by the single base relation's **primary-key scan order** — the
     /// table tree already yields rows in this order, so the sort is elided (and with a `LIMIT`
     /// the scan short-circuits a top-N). True iff the query is a single-table, non-aggregate,
@@ -4360,7 +4365,7 @@ pub(crate) struct PhysicalPlan {
     /// cheaper). `None` keeps the eager/streaming sort.
     index_order: Option<IndexOrder>,
     /// `ORDER BY` is satisfied by the OUTER relation's primary-key scan order in a two-table
-    /// INNER/CROSS join (cost.md §3 "JOIN"): the nested loop drives the outer in PK order, so its
+    /// INNER/CROSS join (cost.md §3 "JOIN"): the join drives/probes the outer in PK order, so its
     /// output is already in order — the sort is elided and a `LIMIT` short-circuits the loop. Set only
     /// for exactly two non-lateral base relations, a `LIMIT`, and a forward outer-PK `ORDER BY`.
     join_pk_ordered: bool,
@@ -4384,6 +4389,16 @@ pub(crate) struct PhysicalPlan {
     /// instead of full-scanning — O(N·M) → O(N·log M). `None` ⇒ the ordinary once-materialized
     /// `rel_bounds` path. A set entry takes precedence over `rel_bounds` for that relation.
     rel_inl_bounds: Vec<Option<ScanBound>>,
+}
+
+pub(crate) struct HashJoinPlan {
+    keys: Vec<HashJoinKey>,
+}
+
+pub(crate) struct HashJoinKey {
+    left: usize,
+    right: usize,
+    ty: Type,
 }
 
 // ---- Primary-key predicate pushdown (spec/design/cost.md §3 "bounded scan / point lookup") ----

@@ -138,6 +138,45 @@ setup_sql = [
   "INSERT INTO join_inner SELECT g, g * 2 FROM generate_series(1, 100000) AS g"
 ]
 
+# Deterministic in-memory hash join (query.hash_join) and its expression-key nested-loop reference.
+# Both produce 12,500 matches from the same 2,500×2,500 logical inputs. The bare same-type column
+# equality selects hash join; wrapping the left key in +0 deliberately defeats the rule.
+[[bench]]
+name = "hash_join_equijoin"
+description = "In-memory hash equijoin: build/probe 2,500-row inputs instead of 6.25M nested-loop candidates"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT count(*) FROM hash_left l JOIN hash_right r ON l.k = r.k"
+warmup = 2
+iterations = 10
+seed = 4257
+expect_rows_per_iter = 1
+engines = ["jed", "postgres"]
+setup_sql = [
+  "CREATE TABLE hash_left (id bigint PRIMARY KEY, k bigint)",
+  "CREATE TABLE hash_right (id bigint PRIMARY KEY, k bigint)",
+  "INSERT INTO hash_left SELECT g, g % 500 FROM generate_series(1, 2500) AS g",
+  "INSERT INTO hash_right SELECT g, g % 500 FROM generate_series(1, 2500) AS g"
+]
+
+[[bench]]
+name = "hash_join_nested_fallback"
+description = "Expression-key nested-loop reference for hash_join_equijoin; identical 12,500-row join result"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT count(*) FROM hash_ref_left l JOIN hash_ref_right r ON l.k + 0 = r.k"
+warmup = 2
+iterations = 10
+seed = 4258
+expect_rows_per_iter = 1
+engines = ["jed", "postgres"]
+setup_sql = [
+  "CREATE TABLE hash_ref_left (id bigint PRIMARY KEY, k bigint)",
+  "CREATE TABLE hash_ref_right (id bigint PRIMARY KEY, k bigint)",
+  "INSERT INTO hash_ref_left SELECT g, g % 500 FROM generate_series(1, 2500) AS g",
+  "INSERT INTO hash_ref_right SELECT g, g % 500 FROM generate_series(1, 2500) AS g"
+]
+
 [[bench]]
 name = "secondary_lookup"
 description = "Secondary-index equality lookup on 1M rows (~10 rows per customer)"

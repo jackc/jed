@@ -2,7 +2,7 @@
 # every relation in scope (no match 42703, two+ matches 42702 ambiguous, exactly one resolves);
 # a qualified `rel.col` names exactly one relation (unknown qualifier 42P01, known relation with
 # no such column 42703) and is never ambiguous. ORDER BY may use a qualified key.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.order_by_keys, query.join_inner, query.index_nested_loop, query.qualified_column, types.i32, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.order_by_keys, query.join_inner, query.index_nested_loop, query.hash_join, query.qualified_column, types.i32, resource.cost_metering
 
 statement ok
 CREATE TABLE t1 (id i32 PRIMARY KEY, shared i32, only1 i32)
@@ -17,9 +17,9 @@ statement ok
 INSERT INTO t2 VALUES (1, 100, 33), (2, 999, 44)
 
 # `only1` / `only2` each exist in exactly one relation, so they resolve UNQUALIFIED. The join
-# t1.shared = t2.shared matches only (t1.1, t2.1). 2 + 2 materialized (4) + 4 ON + 1 produced = 9.
+# t1.shared = t2.shared matches only (t1.1, t2.1) through the hash build/probe path.
 # names: only1, only2
-# cost: 11
+# cost: 32
 query II nosort
 SELECT only1, only2 FROM t1 JOIN t2 ON t1.shared = t2.shared ORDER BY only1
 ----
@@ -28,7 +28,7 @@ SELECT only1, only2 FROM t1 JOIN t2 ON t1.shared = t2.shared ORDER BY only1
 
 # Qualified `id` references resolve to their named relation (both tables have an `id`).
 # names: id, id
-# cost: 11
+# cost: 32
 query II nosort
 SELECT t1.id, t2.id FROM t1 JOIN t2 ON t1.shared = t2.shared
 ----

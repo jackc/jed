@@ -354,7 +354,7 @@ impl Engine {
         self.render_from(r, sp, d, &order_note)
     }
 
-    /// Emit the FROM tree: a left-deep chain of Nested Loop joins over the plan's relations, or a
+    /// Emit the FROM tree: a left-deep chain of physical joins over the plan's relations, or a
     /// single relation leaf, or a Result node for a FROM-less query. `order_note`, when non-empty,
     /// records an elided ORDER BY on the tree's top node.
     pub(crate) fn render_from(
@@ -387,7 +387,23 @@ impl Engine {
             return self.render_rel_leaf(r, sp, 0, depth, note);
         }
         let j = &sp.joins[n - 2];
-        r.emit(depth, "Nested Loop", with_note(join_detail(j), note));
+        let (node, detail) = if n == 2 {
+            match &sp.phys.hash_join {
+                Some(hash) => (
+                    "Hash Join",
+                    format!(
+                        "{}; keys={}; on:conjuncts={}",
+                        join_kind_text(j.kind),
+                        hash.keys.len(),
+                        j.on.as_ref().map_or(0, conjunct_count)
+                    ),
+                ),
+                None => ("Nested Loop", join_detail(j)),
+            }
+        } else {
+            ("Nested Loop", join_detail(j))
+        };
+        r.emit(depth, node, with_note(detail, note));
         self.render_join_tree(r, sp, n - 1, depth + 1, "")?;
         self.render_rel_leaf(r, sp, n - 1, depth + 1, "")
     }

@@ -2,7 +2,7 @@
 # functions, set operations, derived tables / subqueries, CTEs, VALUES, and set-returning functions.
 # The plan tree is rendered in pre-order (depth-numbered), so the rows read top-down as the executor's
 # pipeline reads bottom-up. Deterministic and cross-core-identical, asserted with `nosort`.
-# requires: ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.secondary_index, dml.insert, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.point_lookup, query.composite_pk_pushdown, query.interval_set, query.index_range, query.bounded_limit_streaming, query.limit, query.order_by, query.order_by_ordinal, query.order_by_index_scan, query.order_by_join_scan, query.order_by_join_inl, query.aggregates, query.group_by, query.having, query.join_inner, query.cross_join, query.join_pushdown, query.index_nested_loop, query.union, query.derived_table, query.subquery_scalar, query.cte, query.window, query.window_aggregate, query.set_returning, query.values, query.explain, cast.explicit, types.i16, types.i32, types.text
+# requires: ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.secondary_index, dml.insert, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.point_lookup, query.composite_pk_pushdown, query.interval_set, query.index_range, query.bounded_limit_streaming, query.limit, query.order_by, query.order_by_ordinal, query.order_by_index_scan, query.order_by_join_scan, query.order_by_join_inl, query.aggregates, query.group_by, query.having, query.join_inner, query.cross_join, query.join_pushdown, query.index_nested_loop, query.hash_join, query.union, query.derived_table, query.subquery_scalar, query.cte, query.window, query.window_aggregate, query.set_returning, query.values, query.explain, cast.explicit, types.i16, types.i32, types.text
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, v i32, s text)
@@ -38,13 +38,13 @@ groups=1 aggs=2; having:conjuncts=1
 Scan t
 Full scan; touched=1
 
-# An inner join is a Nested Loop with the ON conjunct count; each base table is a Scan child.
+# An eligible two-input equality join is a Hash Join with key/ON counts; each input is a Scan child.
 query ITT nosort
 EXPLAIN SELECT * FROM t JOIN u ON u.tid = t.id
 ----
 0
-Nested Loop
-inner; on:conjuncts=1
+Hash Join
+inner; keys=1; on:conjuncts=1
 1
 Scan t
 Full scan; touched=3

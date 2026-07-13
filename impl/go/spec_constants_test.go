@@ -404,6 +404,10 @@ func TestCostScheduleMatchesSpec(t *testing.T) {
 			return costs.RowProduced
 		case "operator_eval":
 			return costs.OperatorEval
+		case "hash_build":
+			return costs.HashBuild
+		case "hash_probe":
+			return costs.HashProbe
 		case "aggregate_accumulate":
 			return costs.AggregateAccumulate
 		case "cte_scan_row":

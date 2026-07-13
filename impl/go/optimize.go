@@ -18,10 +18,123 @@ package jed
 func (db *engine) optimizeSelect(plan *selectPlan, rels []scopeRel) {
 	db.ruleScanBounds(plan, rels)
 	db.ruleIndexNestedLoop(plan, rels)
+	db.ruleHashJoin(plan, rels)
 	db.ruleOrderByPkScan(plan, rels)
 	db.ruleOrderByIndexScan(plan, rels)
 	db.ruleJoinPkOrdered(plan, rels)
 	db.ruleOrderByLimitTopK(plan, rels)
+}
+
+// ruleHashJoin selects the deterministic two-input in-memory hash operator after INL has had first
+// refusal. The ON tree must be an AND-chain of non-trapping leaf equality/inequality comparisons,
+// with at least one same-type bare-column equality crossing from the left input to the right. Every
+// crossing equality becomes a key, in source order. The full ON remains authoritative at execution.
+func (db *engine) ruleHashJoin(plan *selectPlan, rels []scopeRel) {
+	if len(rels) != 2 || len(plan.joins) != 1 || plan.rels[0].lateral || plan.rels[1].lateral ||
+		plan.phys.relINLBounds[1] != nil ||
+		(plan.joins[0].kind != joinInner && plan.joins[0].kind != joinLeft) || plan.joins[0].on == nil {
+		return
+	}
+	var conjuncts []*rExpr
+	flattenHashJoinConjuncts(plan.joins[0].on, &conjuncts)
+	keys := make([]hashJoinKey, 0)
+	rightOffset := rels[1].offset
+	for _, expr := range conjuncts {
+		if !hashJoinSafeConjunct(expr) {
+			return
+		}
+		if expr.op != opEq || expr.lhs.kind != reColumn || expr.rhs.kind != reColumn {
+			continue
+		}
+		left, right := expr.lhs.index, expr.rhs.index
+		if left >= rightOffset && right < rightOffset {
+			left, right = right, left
+		}
+		if left < 0 || left >= rightOffset || right < rightOffset {
+			continue
+		}
+		lt, lok := hashJoinColumnType(rels, left)
+		rt, rok := hashJoinColumnType(rels, right)
+		if !lok || !rok || !hashJoinTypesEqual(lt, rt) || !hashJoinKeyableType(lt) {
+			continue
+		}
+		keys = append(keys, hashJoinKey{left: left, right: right, ty: lt})
+	}
+	if len(keys) > 0 {
+		plan.phys.hashJoin = &hashJoinPlan{keys: keys}
+	}
+}
+
+func flattenHashJoinConjuncts(expr *rExpr, out *[]*rExpr) {
+	if expr.kind == reAnd {
+		flattenHashJoinConjuncts(expr.lhs, out)
+		flattenHashJoinConjuncts(expr.rhs, out)
+		return
+	}
+	*out = append(*out, expr)
+}
+
+func hashJoinSafeConjunct(expr *rExpr) bool {
+	return expr.kind == reCompare && (expr.op == opEq || expr.op == opNe) &&
+		hashJoinLeaf(expr.lhs) && hashJoinLeaf(expr.rhs)
+}
+
+func hashJoinLeaf(expr *rExpr) bool {
+	switch expr.kind {
+	case reColumn, reConstInt, reConstBool, reConstText, reConstDecimal, reConstBytea,
+		reConstUuid, reConstTimestamp, reConstTimestamptz, reConstDate, reConstInterval,
+		reConstFloat32, reConstFloat64, reConstJson, reConstJsonb, reConstJsonPath, reConstNull,
+		reConstArray, reConstRange:
+		return true
+	default:
+		return false
+	}
+}
+
+func hashJoinColumnType(rels []scopeRel, index int) (dataType, bool) {
+	for _, rel := range rels {
+		local := index - rel.offset
+		if local >= 0 && local < len(rel.table.Columns) {
+			return rel.table.Columns[local].Type, true
+		}
+	}
+	return dataType{}, false
+}
+
+func hashJoinTypesEqual(a, b dataType) bool {
+	if (a.Comp != nil) != (b.Comp != nil) || (a.Array != nil) != (b.Array != nil) ||
+		(a.Range != nil) != (b.Range != nil) {
+		return false
+	}
+	if a.Comp != nil {
+		return false
+	}
+	if a.Array != nil {
+		return hashJoinTypesEqual(*a.Array, *b.Array)
+	}
+	if a.Range != nil {
+		return hashJoinTypesEqual(*a.Range, *b.Range)
+	}
+	return a.Scalar == b.Scalar
+}
+
+func hashJoinKeyableType(ty dataType) bool {
+	if ty.Comp != nil {
+		return false
+	}
+	if ty.Array != nil {
+		return ty.Array.Comp == nil && ty.Array.Array == nil && ty.Array.Range == nil &&
+			hashJoinKeyableScalar(ty.Array.Scalar)
+	}
+	if ty.Range != nil {
+		return ty.Range.Comp == nil && ty.Range.Array == nil && ty.Range.Range == nil &&
+			hashJoinKeyableScalar(ty.Range.Scalar)
+	}
+	return hashJoinKeyableScalar(ty.Scalar)
+}
+
+func hashJoinKeyableScalar(ty scalarType) bool {
+	return ty != scalarJson && ty != scalarJsonb && ty != scalarJsonPath
 }
 
 // ruleOrderByLimitTopK — bounded selection for a BLOCKING ORDER BY with a constant LIMIT. Plain
@@ -134,7 +247,7 @@ func indexOrderCompatibleBound(io *indexOrderPlan, sb *scanBound) bool {
 }
 
 // ruleJoinPkOrdered — ORDER BY satisfied by the OUTER relation's PK scan order in a two-table
-// INNER/CROSS join (cost.md §3 "JOIN"): the nested loop drives the outer (rels[0]) in PK order, so
+// INNER/CROSS join (cost.md §3 "JOIN"): the join drives/probes the outer (rels[0]) in PK order, so
 // the join output is already in (outer PK, inner key) order — the sort is elided, and with a LIMIT
 // the loop short-circuits a top-N. Gated to exactly two non-lateral base relations, an INNER/CROSS
 // join, a LIMIT, and a FORWARD outer-PK order with NO key beyond the outer PK (an extra key is a

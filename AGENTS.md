@@ -113,6 +113,8 @@ files in the same change.
   encryption-at-rest design.
 - Replication, where relevant, is block-delta shipping at the block seam, not a
   WAL.
+- The deterministic hash JOIN is currently in-memory; grace-hash partitioning is
+  the remaining spill slice and must preserve probe/bucket order and cost.
 
 ## Safety And Resource Boundaries
 

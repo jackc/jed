@@ -976,16 +976,17 @@ order). `query/distinct.test`'s composite-PK section pins the streaming top-N (a
 `DESC` variant). A `DISTINCT` whose `ORDER BY` the scan does *not* satisfy — or a no-`ORDER-BY`
 `DISTINCT` — keeps the eager project-all-then-dedup path.
 
-### JOIN — multi-table FROM (the nested-loop contract)
+### JOIN — nested-loop and deterministic hash contracts
 
-A multi-table `SELECT` ([grammar.md](grammar.md) §15) is a **left-deep nested-loop** join. Its
-cost is pinned here because, with no reference implementation, the count is a cross-core contract
-(§1). Three rules, each a small extension of the single-table rules above:
+A multi-table `SELECT` ([grammar.md](grammar.md) §15) is logically left-deep. Nested loop is the
+fallback physical operator; an eligible two-input INNER/LEFT equijoin may use the deterministic
+in-memory hash operator below. Cost is pinned here because, with no reference implementation, the
+count is a cross-core contract (§1).
 
 - **`storage_row_read` is charged once per physical row as each base table is materialized** —
   total = the **sum of the table cardinalities** (`|A| + |B| + …`), independent of join order or
   fan-out. A row is pulled from its store exactly once (each table is scanned into memory in
-  primary-key order); the nested loop then re-reads from that **in-memory** buffer, which is not a
+  primary-key order); a physical join then reads that **in-memory** buffer, which is not a
   store and charges nothing. This keeps the existing rule verbatim ("once per row pulled from a
   store, in the executor loop not the storage iterator" — so the Rust lazy-iterator vs Go/TS
   materialized-slice split stays neutralized) and keeps single-table cost identical (one table →
@@ -993,8 +994,8 @@ cost is pinned here because, with no reference implementation, the count is a cr
   (`query.join_pushdown`, "Bounded scan / JOIN" above), only its in-range rows are materialized, so
   its `storage_row_read` (and `page_read`) is the bounded count, not the full cardinality — a miss
   materializes zero. The bound never changes the result, only which rows are scanned.
-- **The `ON`-predicate `operator_eval` is charged per candidate combination** the join evaluates
-  it against — for an `INNER JOIN`, once per (running-row × right-row) pair, the `ON` tree's
+- **Nested-loop fallback `ON` cost is per candidate combination** — for an `INNER JOIN`, once per
+  (running-row × right-row) pair, the `ON` tree's
   interior nodes firing pre-order with **no short-circuit**, exactly like a WHERE. A `CROSS JOIN`
   has no `ON` and charges no join `operator_eval` (it keeps every pair). So `ON` cost =
   |running| × |right| × (interior nodes in the `ON`), deterministic and fan-out-explicit. The
@@ -1003,39 +1004,66 @@ cost is pinned here because, with no reference implementation, the count is a cr
   it fixes the cost-ceiling abort point even though only the total is asserted today).
 - **WHERE `operator_eval`** is charged per **surviving combined row** (post-join), and
   **`row_produced`** per emitted output row (post-`LIMIT`/`OFFSET`) — both unchanged; the combined
-  row is simply wider. Join materialization buffering, the nested-loop control flow, and row
+  row is simply wider. Join materialization buffering, physical control flow, and row
   concatenation are **unmetered**, like the `ORDER BY` sort and the `LIMIT` slice.
 
-**Worked example.** Tables `a` (3 rows), `b` (2 rows), each small enough to be a single leaf
-page; `SELECT * FROM a JOIN b ON a.k = b.k`, with 2 pairs surviving the `ON`. Materialize `a` →
-1 `page_read` + 3 `storage_row_read`; materialize `b` → 1 + 2; the `ON` (`a.k = b.k`, one
-interior `compare` node — its operands are leaf columns, charging nothing) over 3 × 2 = 6
-candidate pairs → 6 `operator_eval`; no WHERE; `*` is bare-column projection (leaves, charge
-nothing); 2 emitted rows → 2 `row_produced`. **Total = (1 + 3) + (1 + 2) + 6 + 2 = 15.** A
+**Nested-loop worked example.** Tables `a` (3 rows), `b` (2 rows), each small enough to be a single
+leaf page; `SELECT * FROM a JOIN b ON a.k + 0 = b.k`, with 2 pairs surviving. The expression key
+keeps nested loop. Materialize `a` → 1 `page_read` + 3 `storage_row_read`; materialize `b` → 1 + 2;
+the `ON` has two interior nodes (`+`, `=`) over 3 × 2 = 6 candidate pairs → 12 `operator_eval`; no
+WHERE; `*` is bare-column projection; 2 emitted rows → 2 `row_produced`. **Total =
+(1 + 3) + (1 + 2) + 12 + 2 = 21.** A
 `CROSS JOIN` of the same tables emits all 6 pairs and evaluates no `ON`: 1 + 3 + 1 + 2 + 0 + 6 =
 **13**.
 
-**OUTER joins charge identically — only the produced-row count grows.** `LEFT`/`RIGHT`/`FULL [OUTER]
-JOIN` ([grammar.md](grammar.md) §15) evaluate the `ON` over the **same** `|running| × |right|`
+**Nested-loop OUTER joins charge identically — only the produced-row count grows.** `LEFT`/`RIGHT`/
+`FULL [OUTER] JOIN` ([grammar.md](grammar.md) §15) evaluate the `ON` over the **same**
+`|running| × |right|`
 candidate set (so the `ON` `operator_eval` count is unchanged from an INNER join of the same tables);
 a row that matches nothing is then **NULL-extended on the absent side and added to the surviving set
 without re-evaluating `ON`** — the NULL-extension itself is unmetered, like row concatenation. Those
 NULL-extended rows are ordinary surviving combined rows, so they incur WHERE `operator_eval` and
-`row_produced` exactly like matched rows. So for the example tables with `SELECT * FROM a LEFT JOIN b
-ON a.k = b.k` where 1 `a`-row matches 1 `b`-row and the other 2 `a`-rows match nothing: 1 + 3 and
-1 + 2 to materialize (one leaf page each), 6 `ON`, no WHERE, and 1 matched + 2 NULL-extended = 3
-emitted rows → **(1 + 3) + (1 + 2) + 6 + 3 = 16** (the INNER form of the same query is
-`… + 1 = 14`; the +2 is the two preserved-left rows).
+`row_produced` exactly like matched rows. For the expression-key example with one match and two
+unmatched left rows: materialization is 7, ON is 12, and 3 rows emit → **22** (the INNER form emits
+one row → **20**; the +2 is the preserved-left rows).
 
-**ORDER BY satisfied by the OUTER relation's PK scan order — the join top-N.** Because the nested
-loop drives the **outer** (first) relation in primary-key order, a two-table INNER/CROSS join whose
+**Deterministic in-memory hash JOIN.** For exactly two non-lateral inputs, an INNER or LEFT `ON`
+predicate with one or more same-resolved-type bare-column equalities across the inputs may build the
+right/FROM-order input and probe the left. A usable inner index-nested-loop bound wins first. The
+remaining `ON` conjuncts must be structurally non-trapping leaf equality/inequality predicates;
+expression keys, arithmetic/function predicates, RIGHT/FULL, and joins wider than two inputs retain
+nested loop. Keys admit the existing key-encodable scalars plus scalar-element arrays/ranges;
+composite and json/jsonb/jsonpath keys retain nested loop. Equality keys are selected in source
+conjunct order, never map order.
+
+The build table uses the canonical order-preserving key bytes for each component, framed in key-list
+order. SQL NULL never matches: every component is inspected and metered, but a tuple with any NULL is
+not inserted/probed. `hash_build` charges `max(1, encoded_key_len)` per selected component of every
+right row; `hash_probe` charges the same per component of every left row, plus
+`max(1, min(probe_key_len, bucket_key_len))` before each full-byte bucket collision/candidate check.
+The full `ON` predicate is then reapplied to exact-key candidates, charging its ordinary
+`operator_eval` and size-scaled comparison units only there. This is a deliberate cost change from
+nested loop: the new hash units represent key construction/lookup/collision verification, while
+comparisons against provably nonmatching buckets disappear. A guard at each component and bucket
+entry makes `max_cost` bound build/probe work deterministically.
+
+Buckets retain right input order and probes consume left input order, so emitted matches reproduce
+the nested-loop sequence exactly; LEFT emits an unmatched left row after its empty/rejected bucket
+run. Hash collisions compare the full canonical bytes before admitting a candidate, and the executor
+never iterates the map to emit rows. WHERE, ORDER BY, LIMIT/OFFSET, projection, and `row_produced`
+remain downstream and unchanged. The table is deliberately in-memory; grace-hash spill is the
+remaining storage slice ([spill.md](spill.md) §7).
+
+**ORDER BY satisfied by the OUTER relation's PK scan order — the join top-N.** Because the join
+operator probes/drives the **outer** (first) relation in primary-key order, a two-table INNER/CROSS join whose
 `ORDER BY` is a prefix of the **outer** relation's PK — and which has a `LIMIT` — needs **no sort**:
 the join output already arrives in `(outer PK, inner key)` order. The engine elides the sort and
-**STOPS the nested loop once the `LIMIT`/`OFFSET` window is filled**, so the `ON`/WHERE
+**STOPS the join probe loop once the `LIMIT`/`OFFSET` window is filled**, so the `ON`/WHERE
 `operator_eval`s and `row_produced` drop to the combinations *actually examined* — the cost-visible
 win. Without an index-nested-loop bound, both tables are still **materialized in full**
 (`storage_row_read` = the sum of cardinalities, the rule above; a constant WHERE bound on the inner
-still applies), so only the in-memory loop short-circuits. With a PK/B-tree/GIN/GiST **INL inner**, the outer
+still applies). An eligible hash join also builds its complete right input before probing, then stops
+`hash_probe` and candidate ON work once the window fills. With a PK/B-tree/GIN/GiST **INL inner**, the outer
 is materialized once and the inner bound is opened per outer row; every started bound is gathered
 completely in its ordinary key order, while bounds for later outer rows are never opened after the
 window fills. This is the eager INL nested-loop order, so rows remain byte-identical to the blocking

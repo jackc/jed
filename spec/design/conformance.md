@@ -429,6 +429,9 @@ only yesterday's optimizations is false confidence (CLAUDE.md §10 "no silent ca
   and paired-inequality full-scan spellings, including NULL/empty range queries;
   **topk** — a blocking ORDER BY LIMIT/OFFSET heap is compared with a DISTINCT-gated full sort over
   PK-unique rows, covering mixed direction, NULL placement, ties, expression keys, and LIMIT 0;
+  **hash_join** — same-type bare-column equality selects deterministic hash build/probe while
+  wrapping the left key in `+ 0` retains nested loop; INNER/LEFT, duplicates, NULLs, and multiple
+  equality keys must return the same total-ordered rows;
   **index** — a secondary-index equality (`v = K` on an indexed column) fetches via the index
   tree + per-row point lookups ([indexes.md §5](indexes.md)), defeated by `v + 0 = K`, checked
   across UPDATE/DELETE maintenance and a NULL indexed value (3VL through the index); **or_in** — an

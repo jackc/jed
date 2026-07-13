@@ -1,7 +1,7 @@
 # Composite-primary-key tuple bounds (constraints.md §3; cost.md §3). The planner consumes the
 # maximal equality prefix in PRIMARY-KEY order plus an optional range on the next member. The whole
 # WHERE / ON remains the residual recheck, so only cost changes. All tables here fit in one leaf.
-# requires: ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.collate_column, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.order_by, query.qualified_column, query.join_inner, query.index_nested_loop, query.subquery_exists, query.subquery_correlated, query.correlated_pushdown, query.point_lookup, query.composite_pk_pushdown, types.i16, types.i32, types.text, null.three_valued, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.collate_column, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.order_by, query.qualified_column, query.join_inner, query.index_nested_loop, query.hash_join, query.subquery_exists, query.subquery_correlated, query.correlated_pushdown, query.point_lookup, query.composite_pk_pushdown, types.i16, types.i32, types.text, null.three_valued, resource.cost_metering
 
 # The PK order is (b,a), deliberately different from declaration order.
 statement ok
@@ -113,9 +113,9 @@ one
 2
 three
 
-# A sibling predicate on only the non-leading member cannot seed INL, so the inner full-scans once
-# and the ordinary nested loop evaluates all 3×3 pairs. Materialization = 8, ON = 9, outputs = 2.
-# cost: 19
+# A sibling predicate on only the non-leading member cannot seed composite INL, so the inner scans
+# once; the same-type equality instead selects hash join and emits two exact-key matches.
+# cost: 52
 query II nosort
 SELECT co.id, cp.a FROM co JOIN cp ON cp.a = co.a ORDER BY co.id, cp.a
 ----

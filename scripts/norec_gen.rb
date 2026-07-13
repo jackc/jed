@@ -48,6 +48,9 @@
 #   topk     — a blocking ORDER BY LIMIT/OFFSET bounded max-heap is compared with an otherwise
 #              identical SELECT DISTINCT over PK-unique output rows, which gates the rule off and
 #              full-sorts. Mixed directions, NULLs, ties, expression keys, and LIMIT 0 are covered.
+#   hash_join — same-type bare-column equality selects the deterministic hash operator; wrapping the
+#              left key in `+ 0` defeats it and retains nested loop. INNER, LEFT, duplicates, NULLs,
+#              and multiple keys must produce the same total-ordered rows.
 #   index_order — `ORDER BY v LIMIT k` over a secondary-indexed non-PK column walks the index tree
 #              (a top-N, cost.md §3 "secondary-index order"); `ORDER BY v` with no LIMIT keeps the
 #              eager sort. Over a total order (distinct `v`, NULLS LAST) the index top-N windows and
@@ -191,6 +194,10 @@ BOUNDED_LIMIT_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index ddl.
 TOPK_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
               query.distinct query.order_by query.order_by_keys query.order_by_expr query.limit
               query.offset query.order_by_topk expr.arithmetic types.i32 null.three_valued].freeze
+HASH_JOIN_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
+                   query.join_inner query.join_left query.qualified_column query.order_by
+                   query.order_by_keys query.hash_join expr.arithmetic types.i32
+                   null.three_valued].freeze
 DISTINCT_ORDER_REQ = %w[ddl.create_table ddl.primary_key ddl.composite_primary_key dml.insert
                         dml.insert_multi_row query.select query.distinct query.order_by
                         query.order_by_keys query.limit query.offset query.order_by_pk_scan
@@ -1035,6 +1042,47 @@ def gen_topk(seed)
   out << "# LIMIT 0 still runs both pre-sort lanes and yields the same empty result"
   q(out, "III", "SELECT id, a, b FROM t ORDER BY a, id LIMIT 0 OFFSET #{off}", [])
   q(out, "III", "SELECT DISTINCT id, a, b FROM t ORDER BY a, id LIMIT 0 OFFSET #{off}", [])
+
+  out.join("\n") + "\n"
+end
+
+# --- scenario: deterministic hash join vs expression-key nested loop -----------------------------
+def gen_hash_join(seed)
+  rng = Random.new(seed)
+  av = (1..40).to_a.sample(9, random: rng).sort.map do |id|
+    [id, rng.rand < 0.2 ? nil : rng.rand(0..4), rng.rand(0..2)]
+  end
+  bv = (51..90).to_a.sample(11, random: rng).sort.map do |id|
+    [id, rng.rand < 0.2 ? nil : rng.rand(0..4), rng.rand(0..2)]
+  end
+  sqlv = ->(v) { v.nil? ? "NULL" : v.to_s }
+  inner = av.flat_map do |aid, ak, ax|
+    bv.filter_map { |bid, bk, bx| [aid, bid, ax, bx] if !ak.nil? && ak == bk }
+  end
+  left = av.flat_map do |aid, ak, ax|
+    matches = bv.filter_map { |bid, bk, bx| [aid, bid, ax, bx] if !ak.nil? && ak == bk }
+    matches.empty? ? [[aid, nil, ax, nil]] : matches
+  end
+  multi = inner.select { |_aid, _bid, ax, bx| ax == bx }
+  flat = ->(rows) { rows.flat_map { |aid, bid, _ax, _bx| [aid.to_s, sqlv.call(bid)] } }
+
+  out = header(seed, HASH_JOIN_REQ, "deterministic in-memory hash join")
+  stmt(out, "CREATE TABLE a (id i32 PRIMARY KEY, k i32, x i32)")
+  stmt(out, "CREATE TABLE b (id i32 PRIMARY KEY, k i32, x i32)")
+  stmt(out, "INSERT INTO a VALUES #{av.map { |r| "(#{r[0]}, #{sqlv.call(r[1])}, #{r[2]})" }.join(', ')}")
+  stmt(out, "INSERT INTO b VALUES #{bv.map { |r| "(#{r[0]}, #{sqlv.call(r[1])}, #{r[2]})" }.join(', ')}")
+
+  out << "# INNER: hash equality versus expression-key nested loop"
+  q(out, "II", "SELECT a.id, b.id FROM a JOIN b ON a.k = b.k ORDER BY a.id, b.id", flat.call(inner))
+  q(out, "II", "SELECT a.id, b.id FROM a JOIN b ON a.k + 0 = b.k ORDER BY a.id, b.id", flat.call(inner))
+
+  out << "# LEFT: unmatched probes stay in left order"
+  q(out, "II", "SELECT a.id, b.id FROM a LEFT JOIN b ON a.k = b.k ORDER BY a.id, b.id", flat.call(left))
+  q(out, "II", "SELECT a.id, b.id FROM a LEFT JOIN b ON a.k + 0 = b.k ORDER BY a.id, b.id", flat.call(left))
+
+  out << "# multiple equality keys versus one wrapped key"
+  q(out, "II", "SELECT a.id, b.id FROM a JOIN b ON a.k = b.k AND a.x = b.x ORDER BY a.id, b.id", flat.call(multi))
+  q(out, "II", "SELECT a.id, b.id FROM a JOIN b ON a.k + 0 = b.k AND a.x = b.x ORDER BY a.id, b.id", flat.call(multi))
 
   out.join("\n") + "\n"
 end
@@ -2068,6 +2116,7 @@ SCENARIOS = {
   "interval_set" => method(:gen_interval_set),
   "bounded_limit" => method(:gen_bounded_limit),
   "topk" => method(:gen_topk),
+  "hash_join" => method(:gen_hash_join),
   "index_order" => method(:gen_index_order),
   "distinct_order" => method(:gen_distinct_order),
   "join_order" => method(:gen_join_order),

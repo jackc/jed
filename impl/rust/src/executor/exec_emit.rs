@@ -103,7 +103,7 @@ impl Engine {
 
         // Streaming two-table join (cost.md §3 "JOIN"): the planner set `join_pk_ordered` only for a
         // two-table INNER/CROSS join whose ORDER BY the OUTER relation's PK scan order satisfies, with
-        // a LIMIT. The nested loop drives the outer in PK order so the output is already ordered — the
+        // a LIMIT. The join drives/probes the outer in PK order so the output is already ordered — the
         // sort is elided and the loop short-circuits a top-N.
         if plan.phys.join_pk_ordered {
             return Ok(Emitter::Final {
@@ -271,6 +271,35 @@ impl Engine {
                 continue;
             }
             let right_rows = &materialized[k + 1];
+            // The hash rule is exactly two inputs, so it can only own join 0. Build the right input
+            // once, then probe running rows in left order. Bucket indices retain right order and the
+            // full ON is rechecked, reproducing nested-loop enumeration and LEFT null-extension.
+            if k == 0
+                && let Some(hash_plan) = &plan.phys.hash_join
+            {
+                let table =
+                    HashJoinTable::build(hash_plan, plan.rels[1].offset, right_rows, meter)?;
+                let pred = on.as_ref().expect("a hash join always has an ON predicate");
+                for left in &running {
+                    let candidates = table.probe(hash_plan, left, meter)?;
+                    let mut left_matched = false;
+                    for ri in candidates {
+                        let mut combined = left.clone();
+                        combined.extend_from_slice(&right_rows[ri]);
+                        if pred.eval(&combined, &env, meter)?.is_true() {
+                            next.push(combined);
+                            left_matched = true;
+                        }
+                    }
+                    if emit_left && !left_matched {
+                        let mut combined = left.clone();
+                        combined.resize(combined.len() + right_pad, Value::Null);
+                        next.push(combined);
+                    }
+                }
+                running = next;
+                continue;
+            }
             let mut right_matched = vec![false; right_rows.len()];
             for left in &running {
                 let mut left_matched = false;

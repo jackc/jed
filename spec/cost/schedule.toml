@@ -124,6 +124,26 @@ event  = "one function/operator (interior expression node) evaluation"
 # overrides it today, so cost is unchanged; tuning a base is a pure data change.
 
 [[unit]]
+id     = "hash_build"
+weight = 1
+event  = "one canonical join-key byte processed while building a hash table (NULL contributes one unit)"
+# A hash JOIN builds the right/FROM-order input. For every selected equality key of every build row,
+# it charges max(1, encoded_key_len) before inserting the non-NULL tuple. The encoding is the shared
+# order-preserving key encoding, so the count is deterministic across cores; the minimum-one rule
+# meters NULL inspection even though SQL NULL keys are not inserted. This unit replaces no expression
+# cost: the full ON predicate is still re-evaluated for bucket candidates (../design/cost.md §3).
+
+[[unit]]
+id     = "hash_probe"
+weight = 1
+event  = "one canonical join-key byte processed while probing or verifying a hash bucket (NULL contributes one unit)"
+# The probe-side twin of hash_build. For every selected equality key of every left/FROM-order row,
+# it charges max(1, encoded_key_len); any NULL component makes the probe miss after all components
+# have been inspected. Every bucket entry additionally charges max(1, min(probe_len, entry_len))
+# before its full-byte collision check. Candidate ON evaluation and output use their ordinary
+# operator_eval / row_produced units.
+
+[[unit]]
 id     = "aggregate_accumulate"
 weight = 1
 event  = "one aggregate accumulator update — one (input row x aggregate) folded into a group"

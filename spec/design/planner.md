@@ -98,16 +98,18 @@ then takes the unoptimized path (full scan, eager sort), which is always correct
 |---|---|---|---|---|
 | 1 | **scan bounds** | per base relation (not SRF/derived): a WHERE conjunct bounds the relation's key per the §5 precedence | `relBounds[i]` | cost.md §3 "bounded scan", "index-bounded scan", "GIN-bounded scan", "GiST-bounded scan", "canonical interval sets" |
 | 2 | **index-nested-loop** | a join inner base relation (INNER/CROSS/LEFT right side, not lateral/CTE) with a PK / leading B-tree comparison or GIN/GiST query operand from a bare **earlier sibling** column in ON or WHERE | `relINLBounds[i]` | cost.md §3 "JOIN" (per-outer-row seek/gather) |
-| 3 | **ORDER BY via PK scan order** | single base relation, non-aggregate, column-only keys: the ORDER BY is a one-direction PK prefix (ASC) or the full PK (DESC ⇒ reverse scan), collation-matching the stored key | `pkOrdered`, `pkReverse` | cost.md §3 "ORDER BY satisfied by primary-key order" (sort elided; with LIMIT, a top-N) |
-| 4 | **ORDER BY via secondary-index order** | rule 3 did not fire; a LIMIT; no window/DISTINCT; the ORDER BY is exactly a B-tree index's columns, ASC NULLS LAST, fixed-width PK; an existing bound is allowed only when it walks that same index | `indexOrder` | cost.md §3 "ORDER BY satisfied by secondary-index order" (index-walk top-N) |
-| 5 | **join sort-elision** | exactly two non-lateral base relations, INNER/CROSS, a LIMIT, forward outer-PK ORDER BY with no key beyond the outer PK, no eager bound on the outer; any storage-key-ordered inner INL bound is opened per outer row | `joinPkOrdered` | cost.md §3 "JOIN" (the join top-N) |
-| 6 | **blocking ORDER BY top-k** | rules 3–5 did not elide the sort; plain SELECT (no DISTINCT, aggregate/group, or window), ORDER BY + constant LIMIT; checked `K = OFFSET + LIMIT` (`LIMIT 0` ⇒ K=0) | `topK` | cost.md §3 "blocking ORDER BY top-k" (full scan/evaluation and cost retained; sort work reduced) |
+| 3 | **hash join** | exactly two non-lateral inputs; INNER/LEFT ON contains one or more same-type, key-encodable bare-column equalities across the inputs; no inner INL; every remaining ON conjunct is a non-trapping leaf equality/inequality | `hashJoin` | cost.md §3 "hash JOIN" (`hash_build`/`hash_probe`; ON only for bucket candidates) |
+| 4 | **ORDER BY via PK scan order** | single base relation, non-aggregate, column-only keys: the ORDER BY is a one-direction PK prefix (ASC) or the full PK (DESC ⇒ reverse scan), collation-matching the stored key | `pkOrdered`, `pkReverse` | cost.md §3 "ORDER BY satisfied by primary-key order" (sort elided; with LIMIT, a top-N) |
+| 5 | **ORDER BY via secondary-index order** | rule 4 did not fire; a LIMIT; no window/DISTINCT; the ORDER BY is exactly a B-tree index's columns, ASC NULLS LAST, fixed-width PK; an existing bound is allowed only when it walks that same index | `indexOrder` | cost.md §3 "ORDER BY satisfied by secondary-index order" (index-walk top-N) |
+| 6 | **join sort-elision** | exactly two non-lateral base relations, INNER/CROSS, a LIMIT, forward outer-PK ORDER BY with no key beyond the outer PK, no eager bound on the outer; any storage-key-ordered inner INL bound is opened per outer row | `joinPkOrdered` | cost.md §3 "JOIN" (the join top-N) |
+| 7 | **blocking ORDER BY top-k** | rules 4–6 did not elide the sort; plain SELECT (no DISTINCT, aggregate/group, or window), ORDER BY + constant LIMIT; checked `K = OFFSET + LIMIT` (`LIMIT 0` ⇒ K=0) | `topK` | cost.md §3 "blocking ORDER BY top-k" (full scan/evaluation and cost retained; sort work reduced) |
 
-Data-flow dependencies fixing the order: rule 4 reads `relBounds[0]` (rule 1) and
-`pkOrdered` (rule 3); rule 5 reads `relBounds[0]` and `relINLBounds` (rules 1–2); rule 6 reads
-the three preceding sort-elision decisions. Rules 3–5
-are mutually exclusive by their gates (rule 4 requires `!pkOrdered`; rule 5's two-relation
-gate excludes 3/4's single-relation gates).
+Data-flow dependencies fixing the order: rule 3 reads `relINLBounds` (rule 2), so a usable INL
+always wins; rule 5 reads `relBounds[0]` (rule 1) and `pkOrdered` (rule 4); rule 6 reads
+`relBounds[0]` and `relINLBounds` (rules 1–2); rule 7 reads
+the three preceding sort-elision decisions. Rules 4–6
+that select scan order remain mutually exclusive by their gates; hash join preserves the same
+left-then-right candidate enumeration and may compose with join sort-elision.
 
 The physical fields live in a dedicated sub-struct of the plan (`phys` — Go
 `physicalPlan`, Rust/TS `PhysicalPlan`), so the stage boundary is visible in the type: the
@@ -120,9 +122,9 @@ UPDATE/DELETE planning and exec-time eligibility checks, and live with the acces
 code, not in the optimizer pass.
 
 **EXPLAIN** renders every rule's decision ([explain.md §4](explain.md)): rule 1 as the
-scan's access-path detail, rule 2 as the `Index-nested-loop` prefix, rules 3–5 as the
-sort-elision note (`ordered: pk ordered` / `index order: <index>` / `join pk ordered`) —
-and rule 6 as `Sort keys=N, top-k=K`, which makes each rule corpus-assertable without touching
+scan's access-path detail, rule 2 as the `Index-nested-loop` prefix, rule 3 as `Hash Join`, rules
+4–6 as the sort-elision note (`ordered: pk ordered` / `index order: <index>` / `join pk ordered`) —
+and rule 7 as `Sort keys=N, top-k=K`, which makes each rule corpus-assertable without touching
 internals.
 
 ## 5. Access-path precedence (rule 1's internal order)

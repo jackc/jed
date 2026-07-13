@@ -1,0 +1,129 @@
+# Deterministic in-memory hash join (planner.md §4; cost.md §3). The right/FROM-order input is the
+# build side and the left input is probed in storage order. Buckets retain right order, so matching
+# rows enumerate exactly like the nested-loop fallback; SQL NULL keys never match. The full ON is
+# rechecked on candidates. Costs include canonical-key-byte hash_build/hash_probe units.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.join_inner, query.join_left, query.qualified_column, query.order_by, query.order_by_keys, query.limit, query.logical_connectives, query.comparison_order, query.hash_join, types.i32, types.text, null.three_valued, resource.cost_metering
+
+statement ok
+CREATE TABLE hj_left (id i32 PRIMARY KEY, k i32, v text)
+
+statement ok
+CREATE TABLE hj_right (id i32 PRIMARY KEY, k i32, v text)
+
+statement ok
+INSERT INTO hj_left VALUES
+  (1, 1, 'a'), (2, 1, 'b'), (3, 2, 'c'), (4, NULL, 'd'), (5, 3, 'same')
+
+statement ok
+INSERT INTO hj_right VALUES
+  (10, 1, 'x'), (11, 1, 'b'), (12, 2, 'y'), (13, NULL, 'z'), (14, 4, 'q'), (15, 3, 'same')
+
+# Duplicates produce a many-to-many bucket run; NULL on either side never matches.
+# cost: 111
+query II nosort
+SELECT l.id, r.id
+FROM hj_left l JOIN hj_right r ON l.k = r.k
+ORDER BY l.id, r.id
+----
+1
+10
+1
+11
+2
+10
+2
+11
+3
+12
+5
+15
+
+# LEFT emits an unmatched probe row immediately after its empty bucket run.
+# cost: 112
+query II nosort
+SELECT l.id, r.id
+FROM hj_left l LEFT JOIN hj_right r ON l.k = r.k
+ORDER BY l.id, r.id
+----
+1
+10
+1
+11
+2
+10
+2
+11
+3
+12
+4
+NULL
+5
+15
+
+# Multiple equality keys use source order and one composite hash key.
+# cost: 134
+query II nosort
+SELECT l.id, r.id
+FROM hj_left l JOIN hj_right r ON l.k = r.k AND l.v = r.v
+ORDER BY l.id, r.id
+----
+2
+11
+5
+15
+
+# A safe leaf residual is reapplied to candidates; candidates rejected by it do not match LEFT.
+query II nosort
+SELECT l.id, r.id
+FROM hj_left l LEFT JOIN hj_right r ON l.k = r.k AND l.v <> r.v
+ORDER BY l.id, r.id
+----
+1
+10
+1
+11
+2
+10
+3
+12
+4
+NULL
+5
+NULL
+
+# A text equality is keyable too; canonical byte length contributes to hash cost.
+query II nosort
+SELECT l.id, r.id
+FROM hj_left l JOIN hj_right r ON l.v = r.v
+ORDER BY l.id, r.id
+----
+2
+11
+5
+15
+
+# ORDER BY/LIMIT stay downstream; hash enumeration supplies the stable input tie order.
+query II nosort
+SELECT l.id, r.id
+FROM hj_left l JOIN hj_right r ON l.k = r.k
+ORDER BY r.id DESC, l.id
+LIMIT 3
+----
+5
+15
+3
+12
+1
+11
+
+# Empty build and probe inputs remain ordinary empty joins.
+statement ok
+CREATE TABLE hj_empty (id i32 PRIMARY KEY, k i32)
+
+query II rowsort
+SELECT e.id, r.id FROM hj_empty e JOIN hj_right r ON e.k = r.k
+----
+
+query II rowsort
+SELECT l.id, e.id FROM hj_left l JOIN hj_empty e ON l.k = e.k
+----

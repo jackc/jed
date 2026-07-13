@@ -365,10 +365,18 @@ test('the explain page shows the index-nested-loop access path on a join', async
   );
 });
 
+test('the explain page shows the deterministic hash-join operator', async ({ page }) => {
+  await page.goto('/docs/sql/explain/');
+  // Seventh panel = an equality join whose inner trip.city_id has no usable index.
+  const panel = page.getByTestId('live-sql').nth(6);
+  await expect(panel.getByTestId('result-rows')).toContainText('Hash Join');
+  await expect(panel.getByTestId('result-rows')).toContainText('inner; keys=1; on:conjuncts=1');
+});
+
 test('the explain page runs EXPLAIN ANALYZE with a deterministic cost', async ({ page }) => {
   await page.goto('/docs/sql/explain/');
-  // Eighth panel = EXPLAIN ANALYZE: the Analyze root reports the real accrued cost + row count.
-  const panel = page.getByTestId('live-sql').nth(7);
+  // Ninth panel = EXPLAIN ANALYZE: the Analyze root reports the real accrued cost + row count.
+  const panel = page.getByTestId('live-sql').nth(8);
   await expect(panel.getByTestId('result-rows')).toContainText('Analyze');
   await expect(panel.getByTestId('result-rows')).toContainText('cost=');
 });

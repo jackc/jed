@@ -10,15 +10,17 @@
 // cycle follows the session.ts precedent.)
 
 import { pkIndices } from "./catalog.ts";
-import type { Engine, ScopeRel, SelectPlan } from "./executor.ts";
+import type { Engine, RExpr, ScopeRel, SelectPlan } from "./executor.ts";
 import {
   detectINLBound,
   detectScanBound,
+  fkTypesEqual,
   needsEagerScan,
   orderSatisfiedByIndex,
   orderSatisfiedByPK,
 } from "./executor.ts";
 import type { Snapshot } from "./snapshot.ts";
+import type { ScalarType, Type } from "./types.ts";
 
 // optimizeSelect applies the physical rules to a freshly resolved logical plan, in a FIXED order
 // that is part of the cross-core contract (spec/design/planner.md §4): later rules read earlier
@@ -34,10 +36,102 @@ export function optimizeSelect(
 ): void {
   ruleScanBounds(plan, rels, snap, eng);
   ruleIndexNestedLoop(plan, rels, snap);
+  ruleHashJoin(plan, rels);
   ruleOrderByPkScan(plan, rels, snap);
   ruleOrderByIndexScan(plan, rels, snap);
   ruleJoinPkOrdered(plan, rels, snap);
   ruleOrderByLimitTopK(plan);
+}
+
+// ruleHashJoin selects the deterministic two-input in-memory hash operator after INL has had first
+// refusal. ON must be an AND-chain of non-trapping leaf equality/inequality comparisons, with at
+// least one same-type bare-column equality crossing the inputs. Crossing equalities become keys in
+// source order; the full ON remains authoritative at execution.
+function ruleHashJoin(plan: SelectPlan, rels: ScopeRel[]): void {
+  if (
+    rels.length !== 2 ||
+    plan.joins.length !== 1 ||
+    plan.rels[0]!.lateral ||
+    plan.rels[1]!.lateral ||
+    plan.phys.relINLBounds[1] !== null ||
+    (plan.joins[0]!.kind !== "inner" && plan.joins[0]!.kind !== "left") ||
+    plan.joins[0]!.on === null
+  ) {
+    return;
+  }
+  const conjuncts: RExpr[] = [];
+  flattenHashJoinConjuncts(plan.joins[0]!.on!, conjuncts);
+  const rightOffset = rels[1]!.offset;
+  const keys: { left: number; right: number; type: Type }[] = [];
+  for (const expr of conjuncts) {
+    if (!hashJoinSafeConjunct(expr)) return;
+    if (
+      expr.kind !== "compare" ||
+      expr.op !== "eq" ||
+      expr.lhs.kind !== "column" ||
+      expr.rhs.kind !== "column"
+    ) {
+      continue;
+    }
+    let left = expr.lhs.index;
+    let right = expr.rhs.index;
+    if (left >= rightOffset && right < rightOffset) [left, right] = [right, left];
+    if (left >= rightOffset || right < rightOffset) continue;
+    const leftType = hashJoinColumnType(rels, left);
+    const rightType = hashJoinColumnType(rels, right);
+    if (
+      leftType === null ||
+      rightType === null ||
+      !fkTypesEqual(leftType, rightType) ||
+      !hashJoinKeyableType(leftType)
+    ) {
+      continue;
+    }
+    keys.push({ left, right, type: leftType });
+  }
+  if (keys.length > 0) plan.phys.hashJoin = { keys };
+}
+
+function flattenHashJoinConjuncts(expr: RExpr, out: RExpr[]): void {
+  if (expr.kind === "and") {
+    flattenHashJoinConjuncts(expr.lhs, out);
+    flattenHashJoinConjuncts(expr.rhs, out);
+  } else {
+    out.push(expr);
+  }
+}
+
+function hashJoinSafeConjunct(expr: RExpr): boolean {
+  return (
+    expr.kind === "compare" &&
+    (expr.op === "eq" || expr.op === "ne") &&
+    hashJoinLeaf(expr.lhs) &&
+    hashJoinLeaf(expr.rhs)
+  );
+}
+
+function hashJoinLeaf(expr: RExpr): boolean {
+  return expr.kind === "column" || expr.kind.startsWith("const");
+}
+
+function hashJoinColumnType(rels: ScopeRel[], index: number): Type | null {
+  for (const rel of rels) {
+    const local = index - rel.offset;
+    if (local >= 0 && local < rel.table.columns.length) return rel.table.columns[local]!.type;
+  }
+  return null;
+}
+
+function hashJoinKeyableType(type: Type): boolean {
+  if (type.kind === "composite") return false;
+  if (type.kind === "array" || type.kind === "range") {
+    return type.elem.kind === "scalar" && hashJoinKeyableScalar(type.elem.scalar);
+  }
+  return hashJoinKeyableScalar(type.scalar);
+}
+
+function hashJoinKeyableScalar(type: ScalarType): boolean {
+  return type !== "json" && type !== "jsonb" && type !== "jsonpath";
 }
 
 // ruleScanBounds — primary-key / index predicate pushdown, per base relation: detect WHERE
@@ -141,7 +235,7 @@ function ruleOrderByIndexScan(plan: SelectPlan, rels: ScopeRel[], snap: Snapshot
 }
 
 // ruleJoinPkOrdered — ORDER BY satisfied by the OUTER relation's PK scan order in a two-table
-// INNER/CROSS join (cost.md §3 "JOIN"): the nested loop drives the outer (rels[0]) in PK order, so
+// INNER/CROSS join (cost.md §3 "JOIN"): the join drives/probes the outer (rels[0]) in PK order, so
 // the join output is already in (outer PK, inner key) order — the sort is elided, and with a LIMIT
 // the loop short-circuits a top-N. Gated to exactly two non-lateral base relations, an INNER/CROSS
 // join, a LIMIT, and a FORWARD outer-PK order with NO key beyond the outer PK (an extra key is a

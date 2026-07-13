@@ -462,8 +462,9 @@ cross-core-identical and owns that consequence (the host-extension boundary, §1
   seam-foundation-first; P6.4) and **streaming + spill-to-disk operators** (sort / hash join /
   aggregate / DISTINCT bounded by a memory budget, spilling when exceeded — the **`ORDER BY`
   external merge sort + its streaming single-table feed have landed**, [spec/design/spill.md](spec/design/spill.md),
-  bounded by the `work_mem` handle setting; the spilling hash aggregate / `DISTINCT` / hash JOIN
-  are follow-ons), and **lazy record decode** (a faulted leaf stays its **compact on-disk bytes**,
+  bounded by the `work_mem` handle setting; the **deterministic in-memory hash JOIN has landed** and
+  its grace-hash spill, spilling hash aggregate, and spilling `DISTINCT` are follow-ons), and **lazy
+  record decode** (a faulted leaf stays its **compact on-disk bytes**,
   decoding each column **on demand** for the query's touched set instead of materializing every
   value into an inflated `Value` tree — **design landed**, [spec/design/lazy-record.md](spec/design/lazy-record.md),
   the last of the four lazy-decode levels and the successor to streaming.md's "S5"; it makes the

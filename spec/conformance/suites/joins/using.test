@@ -6,7 +6,7 @@
 # side: the left for INNER/LEFT, the right for RIGHT. `FULL JOIN ... USING` (whose merge is a
 # COALESCE) is a deferred 0A000 narrowing, and a type-mismatched USING column is jed's strict-
 # comparison 42804 — both documented divergences from PostgreSQL in oracle_overrides.toml.
-# requires: ddl.create_table, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.where_eq, query.comparison_order, query.order_by, query.order_by_keys, query.join_using, query.join_inner, query.join_left, query.join_right, query.qualified_column, types.i32, types.text, resource.cost_metering
+# requires: ddl.create_table, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.where_eq, query.comparison_order, query.order_by, query.order_by_keys, query.join_using, query.join_inner, query.join_left, query.join_right, query.qualified_column, query.hash_join, types.i32, types.text, resource.cost_metering
 
 statement ok
 CREATE TABLE a (k i32, x i32)
@@ -29,7 +29,7 @@ INSERT INTO c VALUES (3, 3000), (5, 5000)
 # INNER USING: `*` expands the MERGED k first, then a's other cols, then b's: k, x, y. Only matched
 # rows (k in {2,3}).
 # names: k, x, y
-# cost: 19
+# cost: 52
 query III nosort
 SELECT * FROM a JOIN b USING(k) ORDER BY k
 ----
@@ -42,7 +42,7 @@ SELECT * FROM a JOIN b USING(k) ORDER BY k
 
 # A bare `k` resolves to the merged column (unambiguous despite both tables having k).
 # names: k, x, y
-# cost: 19
+# cost: 52
 query III nosort
 SELECT k, x, y FROM a JOIN b USING(k) ORDER BY k
 ----
@@ -55,7 +55,7 @@ SELECT k, x, y FROM a JOIN b USING(k) ORDER BY k
 
 # The qualified a.k / b.k still reach each side (here equal, so both = the merged value).
 # names: k, k, x, y
-# cost: 19
+# cost: 52
 query IIII nosort
 SELECT a.k, b.k, x, y FROM a JOIN b USING(k) ORDER BY a.k
 ----
@@ -70,7 +70,7 @@ SELECT a.k, b.k, x, y FROM a JOIN b USING(k) ORDER BY a.k
 
 # WHERE on the merged column filters after the join.
 # names: x, y
-# cost: 20
+# cost: 53
 query II nosort
 SELECT x, y FROM a JOIN b USING(k) WHERE k = 3
 ----
@@ -79,7 +79,7 @@ SELECT x, y FROM a JOIN b USING(k) WHERE k = 3
 
 # LEFT USING: every left row kept; the merged k of an unmatched-left row (k=1) is the LEFT value.
 # names: k, x, y
-# cost: 20
+# cost: 53
 query III nosort
 SELECT k, x, y FROM a LEFT JOIN b USING(k) ORDER BY k
 ----
@@ -136,7 +136,7 @@ INSERT INTO q VALUES (1, 2, 200), (1, 3, 300)
 
 # Both k and m are merged, FIRST and in USING order: k, m, x, y. Match is (k=1, m=2).
 # names: k, m, x, y
-# cost: 19
+# cost: 58
 query IIII nosort
 SELECT * FROM p JOIN q USING(k, m) ORDER BY k, m
 ----

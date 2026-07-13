@@ -166,7 +166,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 > The planner is a **deterministic rule engine**: it pattern-matches the WHERE shape to pick an
 > access path (PK bound → first-column index equality → GiST → GIN → full scan for SELECT; mutation
 > retains its documented GIN/GiST order) and runs joins as
-> left-deep nested loops in FROM order — no cost-based choice, no statistics, no join reordering.
+> left-deep joins in FROM order, with structural INL/hash rules — no cost-based choice, no
+> statistics, no join reordering.
 > `EXPLAIN` (above) now makes those choices inspectable + corpus-assertable, the substrate for this
 > work. **The load-bearing constraint:** cost is **observable and a cross-core contract** (§8; the
 > `# cost:` corpus directive), so (a) any plan change that changes which plan runs changes the metered
@@ -177,35 +178,6 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 > are **not** cost-neutral here — they drop `operator_eval` charges — so each needs an explicit cost
 > decision, not a silent apply. Every optimization is a vertical slice carrying a **NoREC relation**
 > (the standing §7 obligation — the sweep does not discover new optimizations).
-
-### Rule-based extensions (results-identical, no statistics)
-
-- [x] **Index-nested-loop join** — a cross-relation join key (`a JOIN b ON b.pk = a.x`) binds the
-  inner relation to a per-outer-row point/range lookup (PK + leading secondary-index bounds; the
-  right/nullable side of INNER/CROSS/LEFT only), turning O(N·M) into O(N·log M); cap
-  `query.index_nested_loop`. → [cost.md §3](spec/design/cost.md),
-  `spec/conformance/suites/joins/index_nested_loop.test`
-  - [x] **Two-table top-N combination** — an outer-PK-ordered LIMIT opens a PK/B-tree INL inner
-    bound per outer row and stops later seeks at the window; cap `query.order_by_join_inl`.
-  - [x] **GIN sibling bounds** — `@>` / `&&` / array `=` / scalar `= ANY` may take a bare
-    earlier-sibling query operand, preserving opclass degenerates and residual recheck; cap
-    `query.gin_index_nested_loop`.
-  - [x] **GiST sibling bounds** — range `&&` / `@>` and fixed-width scalar `=` may take a bare
-    earlier-sibling query operand; cap `query.gist_index_nested_loop`.
-- [x] **`OR` / `IN`-list → merged point lookups** — a disjunction of equalities on one key column
-  (the PK, or a leading B-tree secondary-index column) lowers to a union of point probes over a
-  de-duplicated, sorted key set; a last resort (fires only where no contiguous bound applies), cost =
-  the sum of the per-probe bounded scans; cap `query.or_in_point_lookup`.
-  → [cost.md §3](spec/design/cost.md), `spec/conformance/suites/query/or_in_point_lookup.test`
-  - [x] _follow-on:_ a secondary-index point-set for UPDATE/DELETE (landed with `query.index_mutation`).
-  - [x] **Canonical interval-set algebra** — range disjuncts plus point-set/range intersection,
-    runtime sort/clip/merge, shared by PK/index SELECT and mutation paths; cap `query.interval_set`.
-- [x] **Composite-PK tuple bounds** — maximal equality prefix plus an optional next-member range,
-  shared by SELECT, UPDATE/DELETE, correlated scans, join-relation bounds, and composite INL; cap
-  `query.composite_pk_pushdown`. → [cost.md §3](spec/design/cost.md),
-  `spec/conformance/suites/query/composite_pk_pushdown.test`
-- _Still tracked in its home section:_ a **hash-join operator** (the spill item — nested-loop is the
-  only non-indexed join today). The **ORDER BY + LIMIT top-k** heap has landed.
 
 ### Cost as a plan input (the strategic investment — Path B)
 
@@ -262,10 +234,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   rule. → [attached-databases.md](spec/design/attached-databases.md) _(size: L; deps: N-root commit
   (done); §9/§13)_
 - [ ] **Streaming + spill-to-disk operators** — bound blocking operators (`ORDER BY`, hash `JOIN`, `GROUP BY`/aggregate, `DISTINCT`) by a memory budget and **spill to disk** when exceeded, so a query over larger-than-RAM data never materializes its whole input/output in memory. **Landed:** the **external merge sort for `ORDER BY`** (a `Sorter` bounded by `work_mem`, spills sorted runs + k-way merges, byte-for-byte identical to the in-memory sort). → [spill.md](spec/design/spill.md) _(size: XL; deps: paged storage; §9/§13)_
-  - [ ] **Spilling hash aggregate / `DISTINCT` / hash JOIN** — the remaining blocking operators (spill.md §7). Each needs a *different* algorithm: a partitioned (grace) hash that preserves first-occurrence order for aggregate/DISTINCT, and — for hash JOIN — a hash-join operator first (jed joins are nested-loop today), then grace-hash spill to bound the build side. _(size: L–XL each)_
+  - [ ] **Spilling hash aggregate / `DISTINCT` / hash JOIN** — the remaining blocking operators (spill.md §7). Each needs a *different* algorithm: a partitioned (grace) hash that preserves first-occurrence order for aggregate/DISTINCT, and grace-hash partitioning to bound the existing in-memory hash JOIN's build side without changing its stable probe/bucket order. _(size: L–XL each)_
 - [ ] **Bench-driven perf follow-ons** — the measured gaps remaining after the `perf-point-lookup` work (which took `point_lookup_pk` past same-language PG clients in all 3 cores):
   - [ ] **Rust CoW insert deep-clone** — `node_insert` rebuilds a path node with `Vec::clone`, deep-copying every key (`Vec<Vec<u8>>`) + row where Go's `[][]byte` copy is pointer-shallow (why `insert_rollback` is rust 21.6ms vs go 10.3ms). Fix: share entry storage (`Arc<[u8]>` keys / `Arc`-shared rows). Rust-only, no byte or cost change. _(size: M)_
-  - [x] **ORDER BY + LIMIT top-k** — a blocking plain SELECT retains `LIMIT+OFFSET` rows in a stable max-heap; fixed-width K within `work_mem` creates no spill runs, oversized/variable rows retain the external sorter. Expression/collation failure timing, LIMIT 0, overflow, costs, and exclusions are corpus-pinned; `order_by_limit` is the permanent proof lane. _(landed; ×3 cores)_
   - [ ] **Full-scan materialization** — `full_scan_agg` clones every row into a buffer before aggregating (143–281ms vs PG ~13ms). Streaming aggregation over the scan visitor is the contained first step; the full fix is the spill item above. _(size: M–L)_
 - [x] **Large values — overflow pages + compression (TOAST-equivalent)** — large `text`/`bytea`/`decimal`/`json` pushed out-of-line onto overflow-page chains (`format_version` 3), optionally LZ4-compressed first via a deterministic hand-rolled block codec (no third-party dep — a library fails §8 byte-identity). → [large-values.md](spec/design/large-values.md), [lz4.md](spec/fileformat/lz4.md)
   - [ ] _follow-on:_ chain sharing on rewrite (let a rewritten record keep an unchanged value's existing chain — a byte-layout change, lands in all cores + incremental tests together).

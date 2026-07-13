@@ -308,7 +308,7 @@ func (db *engine) renderSelectPlan(r *explainRender, sp *selectPlan, depth int) 
 	return db.renderFrom(r, sp, d, orderNote)
 }
 
-// renderFrom emits the FROM tree: a left-deep chain of Nested Loop joins over the plan's relations,
+// renderFrom emits the FROM tree: a left-deep chain of physical joins over the plan's relations,
 // or a single relation leaf, or a Result node for a FROM-less query. orderNote, when non-empty,
 // records an elided ORDER BY on the tree's top node.
 func (db *engine) renderFrom(r *explainRender, sp *selectPlan, depth int, orderNote string) error {
@@ -328,7 +328,16 @@ func (db *engine) renderJoinTree(r *explainRender, sp *selectPlan, n, depth int,
 		return db.renderRelLeaf(r, sp, 0, depth, note)
 	}
 	j := sp.joins[n-2]
-	r.emit(depth, "Nested Loop", withNote(joinDetail(j), note))
+	node := "Nested Loop"
+	detail := joinDetail(j)
+	if n == 2 && sp.phys.hashJoin != nil {
+		node = "Hash Join"
+		detail = fmt.Sprintf("%s; keys=%d", joinKindText(j.kind), len(sp.phys.hashJoin.keys))
+		if j.on != nil {
+			detail += fmt.Sprintf("; on:conjuncts=%d", conjunctCount(j.on))
+		}
+	}
+	r.emit(depth, node, withNote(detail, note))
 	if err := db.renderJoinTree(r, sp, n-1, depth+1, ""); err != nil {
 		return err
 	}

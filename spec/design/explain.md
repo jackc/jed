@@ -92,7 +92,8 @@ the executor, §5 forbids codegenning it); the corpus + this table are the contr
 | set-returning function in FROM | `SRF <name>` |
 | CTE reference | `CTE Scan <name>` |
 | derived table / subquery in FROM | `Subquery <alias>` |
-| join | `Nested Loop` |
+| nested-loop join | `Nested Loop` |
+| hash join | `Hash Join` |
 | residual WHERE | `Filter` |
 | aggregation / GROUP BY | `Aggregate` |
 | window stage | `Window` |
@@ -106,16 +107,15 @@ the executor, §5 forbids codegenning it); the corpus + this table are the contr
 | DML roots | `Insert <table>` / `Update <table>` / `Delete <table>` |
 | EXPLAIN ANALYZE root | `Analyze` |
 
-jed has **one** aggregation strategy and **one** join executor, so `Aggregate` and `Nested Loop`
-are single spellings (no `HashAggregate` / `GroupAggregate` split — that would be a contract jed
-cannot yet honor deterministically).
+jed has one aggregation strategy (`Aggregate`) and two join operators (`Nested Loop`, `Hash Join`).
+There is still no `HashAggregate` / `GroupAggregate` split.
 
 ### Operator order for a SELECT
 
 Emitted outermost-first, each the pre-order parent of the next, so the tree reads top-down as the
 pipeline reads bottom-up: **Limit → Sort → Distinct → Window → Aggregate → Filter → FROM tree**. A
-node is emitted only when present. The FROM tree is a left-deep chain of `Nested Loop` nodes over
-the plan's relations (the outermost node is the last join; its right child is the last relation),
+node is emitted only when present. The FROM tree is a left-deep chain of join nodes over the plan's
+relations (the outermost node is the last join; its right child is the last relation),
 bottoming out at relation leaves.
 
 ### Detail grammar
@@ -144,6 +144,7 @@ Attributes are `; `-separated; a node with none renders `-`.
   above.
 - **Aggregate**: `groups=G aggs=A` (+ `sets=S` when more than one grouping set; + `having:conjuncts=K`).
 - **Window**: `funcs=N`. **Nested Loop**: `<kind>` (`inner`/`cross`/`left`/`right`/`full`) + `on:conjuncts=N`.
+  **Hash Join**: `<kind>; keys=K; on:conjuncts=N` (`kind` is `inner` or `left`).
 - **Limit**: `limit=N` / `offset=M` (an absent side omitted). **Values**: `rows=N`.
 - **Set op**: `all` / `distinct`. **CTE**: `inlined` / `materialized` (the planner's choice) + `recursive`.
 - **Insert**: `-` or `on conflict do nothing` / `on conflict do update`. **Update**: `sets=N`. **Delete**: `-`.

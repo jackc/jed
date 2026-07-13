@@ -21,10 +21,75 @@ impl Engine {
     pub(crate) fn optimize_select(&self, plan: &mut SelectPlan, scope: &Scope<'_>) {
         self.rule_scan_bounds(plan, scope);
         self.rule_index_nested_loop(plan, scope);
+        self.rule_hash_join(plan, scope);
         self.rule_order_by_pk_scan(plan, scope);
         self.rule_order_by_index_scan(plan, scope);
         self.rule_join_pk_ordered(plan, scope);
         self.rule_order_by_limit_top_k(plan);
+    }
+
+    /// Select the deterministic two-input in-memory hash operator after INL has had first refusal.
+    /// The ON tree must be an AND-chain of non-trapping leaf equality/inequality comparisons, with
+    /// at least one same-type bare-column equality crossing the inputs. Crossing equalities become
+    /// keys in source order; the full ON remains authoritative at execution.
+    fn rule_hash_join(&self, plan: &mut SelectPlan, scope: &Scope<'_>) {
+        if scope.rels.len() != 2
+            || plan.joins.len() != 1
+            || plan.rels[0].lateral
+            || plan.rels[1].lateral
+            || plan.phys.rel_inl_bounds[1].is_some()
+            || !matches!(plan.joins[0].kind, JoinKind::Inner | JoinKind::Left)
+        {
+            return;
+        }
+        let Some(on) = plan.joins[0].on.as_ref() else {
+            return;
+        };
+        let mut conjuncts = Vec::new();
+        flatten_hash_join_conjuncts(on, &mut conjuncts);
+        let right_offset = scope.rels[1].offset;
+        let mut keys = Vec::new();
+        for expr in conjuncts {
+            if !hash_join_safe_conjunct(expr) {
+                return;
+            }
+            let RExpr::Compare {
+                op: CmpOp::Eq,
+                lhs,
+                rhs,
+                ..
+            } = expr
+            else {
+                continue;
+            };
+            let (RExpr::Column(left), RExpr::Column(right)) = (&**lhs, &**rhs) else {
+                continue;
+            };
+            let (mut left, mut right) = (*left, *right);
+            if left >= right_offset && right < right_offset {
+                std::mem::swap(&mut left, &mut right);
+            }
+            if left >= right_offset || right < right_offset {
+                continue;
+            }
+            let Some(left_ty) = hash_join_column_type(&scope.rels, left) else {
+                continue;
+            };
+            let Some(right_ty) = hash_join_column_type(&scope.rels, right) else {
+                continue;
+            };
+            if left_ty != right_ty || !hash_join_keyable_type(left_ty) {
+                continue;
+            }
+            keys.push(HashJoinKey {
+                left,
+                right,
+                ty: left_ty.clone(),
+            });
+        }
+        if !keys.is_empty() {
+            plan.phys.hash_join = Some(HashJoinPlan { keys });
+        }
     }
 
     /// Scan-bound pushdown, per base relation: detect WHERE conjuncts that bound that relation's
@@ -151,7 +216,7 @@ impl Engine {
     }
 
     /// ORDER BY satisfied by the OUTER relation's PK scan order in a two-table INNER/CROSS join
-    /// (cost.md §3 "JOIN"): the nested loop drives the outer (rels[0]) in PK order, so the join
+    /// (cost.md §3 "JOIN"): the join drives/probes the outer (rels[0]) in PK order, so the join
     /// output is already in `(outer PK, inner key)` order — the sort is elided, and with a LIMIT
     /// the loop short-circuits a top-N. Gated to exactly two non-lateral base relations, an
     /// INNER/CROSS join, a LIMIT, and a FORWARD outer-PK order (the eager stable sort ties in
@@ -217,4 +282,76 @@ impl Engine {
             plan.offset.unwrap_or(0).checked_add(limit)
         };
     }
+}
+
+fn flatten_hash_join_conjuncts<'a>(expr: &'a RExpr, out: &mut Vec<&'a RExpr>) {
+    if let RExpr::And(lhs, rhs) = expr {
+        flatten_hash_join_conjuncts(lhs, out);
+        flatten_hash_join_conjuncts(rhs, out);
+    } else {
+        out.push(expr);
+    }
+}
+
+fn hash_join_safe_conjunct(expr: &RExpr) -> bool {
+    matches!(
+        expr,
+        RExpr::Compare {
+            op: CmpOp::Eq | CmpOp::Ne,
+            lhs,
+            rhs,
+            ..
+        } if hash_join_leaf(lhs) && hash_join_leaf(rhs)
+    )
+}
+
+fn hash_join_leaf(expr: &RExpr) -> bool {
+    matches!(
+        expr,
+        RExpr::Column(_)
+            | RExpr::ConstInt(_)
+            | RExpr::ConstBool(_)
+            | RExpr::ConstText(_)
+            | RExpr::ConstDecimal(_)
+            | RExpr::ConstFloat32(_)
+            | RExpr::ConstFloat64(_)
+            | RExpr::ConstBytea(_)
+            | RExpr::ConstUuid(_)
+            | RExpr::ConstTimestamp(_)
+            | RExpr::ConstTimestamptz(_)
+            | RExpr::ConstDate(_)
+            | RExpr::ConstInterval(_)
+            | RExpr::ConstJson(_)
+            | RExpr::ConstJsonb(_)
+            | RExpr::ConstJsonPath(_)
+            | RExpr::ConstNull
+            | RExpr::ConstArray(_)
+            | RExpr::ConstRange(_)
+    )
+}
+
+fn hash_join_column_type<'a>(rels: &'a [ScopeRel<'_>], index: usize) -> Option<&'a Type> {
+    rels.iter().find_map(|rel| {
+        index
+            .checked_sub(rel.offset)
+            .and_then(|local| rel.table.columns.get(local))
+            .map(|column| &column.ty)
+    })
+}
+
+fn hash_join_keyable_type(ty: &Type) -> bool {
+    match ty {
+        Type::Scalar(s) => hash_join_keyable_scalar(*s),
+        Type::Array(elem) | Type::Range(elem) => {
+            matches!(&**elem, Type::Scalar(s) if hash_join_keyable_scalar(*s))
+        }
+        Type::Composite(_) => false,
+    }
+}
+
+fn hash_join_keyable_scalar(ty: ScalarType) -> bool {
+    !matches!(
+        ty,
+        ScalarType::Json | ScalarType::Jsonb | ScalarType::JsonPath
+    )
 }

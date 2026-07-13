@@ -2853,7 +2853,7 @@ export class Engine {
     this.renderFrom(r, sp, d, orderNote);
   }
 
-  // renderFrom emits the FROM tree: a left-deep chain of Nested Loop joins over the plan's relations,
+  // renderFrom emits the FROM tree: a left-deep chain of physical joins over the plan's relations,
   // or a single relation leaf, or a Result node for a FROM-less query. orderNote, when non-empty,
   // records an elided ORDER BY on the tree's top node.
   private renderFrom(r: ExplainRender, sp: SelectPlan, depth: number, orderNote: string): void {
@@ -2880,7 +2880,11 @@ export class Engine {
       return;
     }
     const j = sp.joins[n - 2]!;
-    r.emit(depth, "Nested Loop", withNote(joinDetail(j), note));
+    const isHash = n === 2 && sp.phys.hashJoin !== null;
+    const detail = isHash
+      ? `${j.kind}; keys=${sp.phys.hashJoin!.keys.length}; on:conjuncts=${j.on === null ? 0 : conjunctCount(j.on)}`
+      : joinDetail(j);
+    r.emit(depth, isHash ? "Hash Join" : "Nested Loop", withNote(detail, note));
     this.renderJoinTree(r, sp, n - 1, depth + 1, "");
     this.renderRelLeaf(r, sp, n - 1, depth + 1, "");
   }
@@ -10426,6 +10430,7 @@ export class Engine {
       offset: sel.offset,
       relMasks: [],
       phys: {
+        hashJoin: null,
         pkOrdered: false,
         pkReverse: false,
         indexOrder: null,
@@ -12149,7 +12154,7 @@ export class Engine {
   }
 
   // execStreamingJoin is a streaming two-table INNER/CROSS join whose ORDER BY is satisfied by the
-  // OUTER (first) relation's PK scan order (cost.md §3 "JOIN"). A left-deep nested loop produces
+  // OUTER (first) relation's PK scan order (cost.md §3 "JOIN"). The physical join produces
   // combined rows in (outer PK, inner key) order — which IS the requested order — so the sort is
   // elided, and with a LIMIT the loop STOPS once the window is filled. An ordinary inner is
   // materialized once; an index-nested-loop inner is opened per outer row and later seeks are skipped
@@ -12171,12 +12176,18 @@ export class Engine {
     const offset = plan.offset ?? 0n;
     const out: Value[][] = [];
     if (limit !== 0n) {
+      const hashTable =
+        plan.phys.hashJoin === null
+          ? null
+          : new HashJoinTable(plan.phys.hashJoin, plan.rels[1]!.offset, rightRows, meter);
       let passed = 0n;
       // biome-ignore lint/suspicious/noLabelVar: `outer` is a loop label for the nested-join break/continue, not a variable.
       outer: for (const left of leftRows) {
         const innerRows = rightINL
           ? this.materializeRel(plan, 1, outer, left, env, params, meter)
-          : rightRows;
+          : hashTable === null
+            ? rightRows
+            : hashTable.probe(plan.phys.hashJoin!, left, meter).map((ri) => rightRows[ri]!);
         for (const right of innerRows) {
           const combined = [...left, ...right];
           // INNER: keep the pair iff its ON is TRUE (3VL); CROSS: keep every pair (no ON).
@@ -12903,7 +12914,7 @@ export class Engine {
 
     // Streaming two-table join (cost.md §3 "JOIN"): the planner set joinPkOrdered only for a two-table
     // INNER/CROSS join whose ORDER BY the OUTER relation's PK scan order satisfies, with a LIMIT. The
-    // nested loop drives the outer in PK order so the output is already ordered — the sort is elided
+    // join drives/probes the outer in PK order so the output is already ordered — the sort is elided
     // and the loop short-circuits a top-N.
     if (plan.phys.joinPkOrdered) {
       return finalEmitter(this.execStreamingJoin(plan, env, meter, params, env.outer).rows);
@@ -13019,6 +13030,31 @@ export class Engine {
         continue;
       }
       const rightRows = materialized[k + 1]!;
+      // The hash rule is exactly two inputs, so it can only own join 0. Build the right input once,
+      // then probe running rows in left order. Bucket indices retain right order and the full ON is
+      // rechecked, reproducing nested-loop enumeration and LEFT null-extension.
+      if (k === 0 && plan.phys.hashJoin !== null) {
+        const table = new HashJoinTable(
+          plan.phys.hashJoin,
+          plan.rels[1]!.offset,
+          rightRows,
+          meter,
+        );
+        for (const left of running) {
+          const candidates = table.probe(plan.phys.hashJoin, left, meter);
+          let leftMatched = false;
+          for (const ri of candidates) {
+            const combined = left.concat(rightRows[ri]!);
+            if (isTrue(evalExpr(on!, combined, env, meter))) {
+              next.push(combined);
+              leftMatched = true;
+            }
+          }
+          if (emitLeft && !leftMatched) next.push(left.concat(nullRow(rightPad)));
+        }
+        running = next;
+        continue;
+      }
       const rightMatched: boolean[] = new Array(rightRows.length).fill(false);
       for (const left of running) {
         let leftMatched = false;
@@ -15339,6 +15375,94 @@ export function encodeTypedKey(ty: Type, value: Value, coll: Collation | null): 
     return encodeArrayKey(typeScalar(ty.elem), value);
   }
   return encodeKeyValue(typeScalar(ty), value, coll);
+}
+
+type HashJoinEntry = { key: Uint8Array; row: number };
+type HashJoinHash = (key: Uint8Array) => bigint;
+
+// HashJoinTable is lookup-only: each bucket retains right/build row indices in input order, probes
+// compare the complete canonical key bytes, and the executor never iterates the map to emit rows.
+// The optional hasher exists only so unit tests can force collisions.
+export class HashJoinTable {
+  private readonly entries = new Map<bigint, HashJoinEntry[]>();
+  private readonly hash: HashJoinHash;
+
+  constructor(
+    plan: HashJoinPlan,
+    rightOffset: number,
+    rows: Row[],
+    meter: Meter,
+    hash: HashJoinHash = hashJoinFnv1a,
+  ) {
+    this.hash = hash;
+    const indices = plan.keys.map((key) => key.right - rightOffset);
+    const types = plan.keys.map((key) => key.type);
+    for (let row = 0; row < rows.length; row++) {
+      const encoded = hashJoinRowKey(rows[row]!, indices, types, COSTS.hashBuild, meter);
+      if (encoded === null) continue;
+      const hash = this.hash(encoded);
+      const bucket = this.entries.get(hash) ?? [];
+      bucket.push({ key: encoded, row });
+      this.entries.set(hash, bucket);
+    }
+  }
+
+  probe(plan: HashJoinPlan, row: Row, meter: Meter): number[] {
+    const encoded = hashJoinRowKey(
+      row,
+      plan.keys.map((key) => key.left),
+      plan.keys.map((key) => key.type),
+      COSTS.hashProbe,
+      meter,
+    );
+    if (encoded === null) return [];
+    const bucket = this.entries.get(this.hash(encoded)) ?? [];
+    const rows: number[] = [];
+    for (const entry of bucket) {
+      meter.guard();
+      meter.charge(COSTS.hashProbe * BigInt(Math.max(1, Math.min(entry.key.length, encoded.length))));
+      if (bytesEq(entry.key, encoded)) rows.push(entry.row);
+    }
+    return rows;
+  }
+}
+
+function hashJoinRowKey(
+  row: Row,
+  indices: number[],
+  types: Type[],
+  unit: bigint,
+  meter: Meter,
+): Uint8Array | null {
+  const parts: Uint8Array[] = [];
+  let present = true;
+  for (let i = 0; i < indices.length; i++) {
+    meter.guard();
+    const value = row[indices[i]!]!;
+    if (value.kind === "null") {
+      meter.charge(unit);
+      present = false;
+      parts.push(new Uint8Array());
+      continue;
+    }
+    const part = encodeTypedKey(types[i]!, value, null);
+    meter.charge(unit * BigInt(Math.max(1, part.length)));
+    parts.push(part);
+  }
+  if (!present) return null;
+  const framed: Uint8Array[] = [];
+  for (const part of parts) {
+    const length = new Uint8Array(4);
+    new DataView(length.buffer).setUint32(0, part.length);
+    framed.push(length, part);
+  }
+  return concatBytes(framed);
+}
+
+function hashJoinFnv1a(key: Uint8Array): bigint {
+  let hash = 14695981039346656037n;
+  for (const byte of key) hash = ((hash ^ BigInt(byte)) * 1099511628211n) & 0xffffffffffffffffn;
+  return hash;
 }
 
 // encodeArrayKey is the order-preserving array-elements-terminated key for an array value
@@ -18759,6 +18883,9 @@ export type SelectPlan = {
 // after the resolve half has built the logical plan. A zero-valued PhysicalPlan is always correct —
 // the executor then full-scans and eager-sorts.
 export type PhysicalPlan = {
+  // Deterministic two-input hash operator. Builds the right input and probes the left using
+  // same-type bare-column equality keys in source order. null keeps nested loop.
+  hashJoin: HashJoinPlan | null;
   // pkOrdered reports that ORDER BY is satisfied by the single base relation's PRIMARY-KEY scan
   // order — the table tree already yields rows in this order, so the sort is elided (and with a
   // LIMIT the scan short-circuits a top-N). True iff the query is a single-table, non-aggregate,
@@ -18775,7 +18902,7 @@ export type PhysicalPlan = {
   // cheaper). null keeps the eager/streaming sort.
   indexOrder: IndexOrder | null;
   // joinPkOrdered reports that ORDER BY is satisfied by the OUTER relation's PK scan order in a
-  // two-table INNER/CROSS join (cost.md §3 "JOIN"): the nested loop drives the outer in PK order, so
+  // two-table INNER/CROSS join (cost.md §3 "JOIN"): the join drives/probes the outer in PK order, so
   // its output is already in order — the sort is elided and a LIMIT short-circuits the loop. Set only
   // for exactly two non-lateral base relations, a LIMIT, and a forward outer-PK ORDER BY.
   joinPkOrdered: boolean;
@@ -18798,6 +18925,9 @@ export type PhysicalPlan = {
   // precedence over relBounds for that relation.
   relINLBounds: (ScanBound | null)[];
 };
+
+export type HashJoinPlan = { keys: HashJoinKey[] };
+export type HashJoinKey = { left: number; right: number; type: Type };
 
 // SetOpPlan is a resolved set operation: both operands planned with the same parent scope, the
 // unified output types, and the trailing ORDER BY / LIMIT / OFFSET resolved by output column.

@@ -16,6 +16,8 @@ export interface CostSchedule {
   decimalWork: bigint;
   rowProduced: bigint;
   operatorEval: bigint;
+  hashBuild: bigint;
+  hashProbe: bigint;
   aggregateAccumulate: bigint;
   cteScanRow: bigint;
   generatedRow: bigint;
@@ -41,6 +43,8 @@ export const COSTS: CostSchedule = {
   decimalWork: 1n,
   rowProduced: 1n,
   operatorEval: 1n,
+  hashBuild: 1n,
+  hashProbe: 1n,
   aggregateAccumulate: 1n,
   cteScanRow: 1n,
   generatedRow: 1n,

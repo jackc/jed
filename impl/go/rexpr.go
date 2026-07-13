@@ -1520,6 +1520,9 @@ type selectPlan struct {
 // after the resolve half has built the logical plan. A zero-valued physicalPlan is always correct —
 // the executor then full-scans and eager-sorts.
 type physicalPlan struct {
+	// hashJoin is the deterministic two-input hash operator. It builds the right input and probes
+	// the left using same-type bare-column equality keys in source order. nil keeps nested loop.
+	hashJoin *hashJoinPlan
 	// pkOrdered reports that ORDER BY is satisfied by the single base relation's PRIMARY-KEY scan
 	// order — the table tree already yields rows in this order, so the sort is elided (and with a
 	// LIMIT the scan short-circuits a top-N). True iff the query is a single-table, non-aggregate,
@@ -1536,7 +1539,7 @@ type physicalPlan struct {
 	// cheaper). nil keeps the eager/streaming sort.
 	indexOrder *indexOrderPlan
 	// joinPkOrdered reports that ORDER BY is satisfied by the OUTER relation's PK scan order in a
-	// two-table INNER/CROSS join (cost.md §3 "JOIN"): the nested loop drives the outer in PK order, so
+	// two-table INNER/CROSS join (cost.md §3 "JOIN"): the join drives/probes the outer in PK order, so
 	// its output is already in order — the sort is elided and a LIMIT short-circuits the loop. Set only
 	// for exactly two non-lateral base relations, a LIMIT, and a forward outer-PK ORDER BY.
 	joinPkOrdered bool
@@ -1560,6 +1563,16 @@ type physicalPlan struct {
 	// full-scanning — O(N·M) → O(N·log M). nil ⇒ the ordinary once-materialized relBounds path. A
 	// non-nil entry takes precedence over relBounds for that relation.
 	relINLBounds []*scanBound
+}
+
+type hashJoinPlan struct {
+	keys []hashJoinKey
+}
+
+type hashJoinKey struct {
+	left  int
+	right int
+	ty    dataType
 }
 
 // setOpPlan is a resolved set operation: both operands planned with the same parent scope, the

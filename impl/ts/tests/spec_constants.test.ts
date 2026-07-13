@@ -226,6 +226,10 @@ test("cost schedule matches spec/cost/schedule.toml", () => {
         return COSTS.rowProduced;
       case "operator_eval":
         return COSTS.operatorEval;
+      case "hash_build":
+        return COSTS.hashBuild;
+      case "hash_probe":
+        return COSTS.hashProbe;
       case "aggregate_accumulate":
         return COSTS.aggregateAccumulate;
       case "generated_row":

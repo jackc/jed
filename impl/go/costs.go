@@ -17,6 +17,8 @@ type costSchedule struct {
 	DecimalWork         int64
 	RowProduced         int64
 	OperatorEval        int64
+	HashBuild           int64
+	HashProbe           int64
 	AggregateAccumulate int64
 	CteScanRow          int64
 	GeneratedRow        int64
@@ -42,6 +44,8 @@ var costs = costSchedule{
 	DecimalWork:         1,
 	RowProduced:         1,
 	OperatorEval:        1,
+	HashBuild:           1,
+	HashProbe:           1,
 	AggregateAccumulate: 1,
 	CteScanRow:          1,
 	GeneratedRow:        1,

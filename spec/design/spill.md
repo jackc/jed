@@ -26,8 +26,7 @@ is a candidate to bound by a **work-memory budget** and spill the overflow to di
 keeps a single-table `ORDER BY` from materializing its input at all
 ([§5](#5-streaming-the-input-the-single-table-feed)). The other three are sequenced as
 follow-ons ([§7](#7-slicing--follow-ons)) because each needs a *different* algorithm (a spilling
-hash table, or — for hash JOIN — a hash-join operator that does not yet exist; jed joins are
-nested-loop today).
+hash table; the join form now has its in-memory operator and still needs grace-hash partitioning).
 
 The blocking sort also has a results-identical **bounded top-k** rule for `ORDER BY ... LIMIT`
 ([§4.1](#41-bounded-top-k-before-spill)): finite windows that fit the budget avoid creating runs.
@@ -194,9 +193,9 @@ Deferred follow-ons (none foreclosed; each its own slice with the same invarianc
 - **Spilling `DISTINCT`.** Same shape: bound the dedup set, spill partitions, preserve
   first-occurrence order. (A sort-based dedup would change that order, so it must be a partitioned
   hash, not the merge sort above.)
-- **Hash `JOIN` + grace-hash spill.** jed joins are nested-loop today; this first adds a hash-join
-  operator (a planner choice), then bounds its build side by `work_mem` with grace-hash
-  partitioning. This is the item that bounds a *join's* input materialization
+- **Grace-hash `JOIN` spill.** The deterministic in-memory hash-join operator exists; bound its
+  right/build side by `work_mem` with grace-hash partitioning while preserving its left-probe/right-
+  bucket row sequence and cost. This is the item that bounds a *join's* input materialization
   ([§5](#5-streaming-the-input-the-single-table-feed)).
 
 A later refinement, also not foreclosed: routing the spill files through a host **storage seam**
