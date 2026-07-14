@@ -276,6 +276,22 @@ test("pmap: near-cap keys force degenerate interior nodes", () => {
   assert.equal(pmCount(pm), 0);
 });
 
+test("pmap: direct point get counts one descent and reconstruction", () => {
+  const pm = new PMap();
+  for (let k = 0; k < 2000; k++) pm.insert(key(k), row(k), W, CAP, SHAPE, null);
+  assert.ok(pm.height() > 1, "test needs a multi-level tree");
+
+  const hit = pm.getCounted(key(777), null);
+  assert.deepEqual(hit.row, row(777));
+  assert.equal(hit.nodes, pm.height(), "one root-to-leaf descent");
+  assert.equal(hit.rowsReconstructed, 1, "a hit reconstructs exactly one row");
+
+  const miss = pm.getCounted(key(3000), null);
+  assert.equal(miss.row, undefined);
+  assert.equal(miss.nodes, pm.height(), "a miss still descends once");
+  assert.equal(miss.rowsReconstructed, 0, "a miss reconstructs no row");
+});
+
 // The bounded scan yields exactly the in-bound rows, in order, and the counted nodes match
 // overlapNodeCount; the pull cursor and the reverse walk agree with it.
 test("pmap: bounded scans and cursor agree", () => {

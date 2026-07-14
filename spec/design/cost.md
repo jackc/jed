@@ -387,6 +387,13 @@ an equality ends the prefix: its range may bind, but a later member cannot (no s
 - **`storage_row_read` = the rows in range.** Only the rows whose key lies within the bound are
   read and charged (and then filtered) — a point lookup reads 0 or 1 row, not the whole table.
   The residual filter's `operator_eval`s therefore accrue only over the in-range rows.
+- **A complete-PK equality uses the direct point primitive.** The streaming/prepared lane encodes
+  the full tuple once (not duplicate `[lo, hi]` endpoints), performs one counted root→leaf descent,
+  reconstructs a hit once, and emits no storage-key copy. The same fused `get_with_units` primitive
+  supplies secondary/GIN/GiST candidate table fetches. This changes no units: a hit still pays tree
+  height + its actual touched overflow/decompression units + one `storage_row_read`; a miss pays the
+  tree height and reconstructs no row. General ranges and incomplete composite-key prefixes retain
+  the range cursor.
 - **A provably empty range charges nothing.** A `pk = NULL` (3VL-unknown) or contradictory bounds
   (`pk > 5 AND pk < 5`) admit no key, so the scan reads no page and no row — `page_read` 0,
   `storage_row_read` 0, and a mutation deletes/updates nothing. (A point-lookup *miss* on an

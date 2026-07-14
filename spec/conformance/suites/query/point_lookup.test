@@ -35,6 +35,14 @@ query I nosort
 SELECT a FROM t WHERE id = 99
 ----
 
+# A NULL equality is 3VL-unknown and therefore a provably empty point bound: no page is visited and
+# no row is reconstructed. Bind-parameter NULL uses this same runtime encoder and is pinned in the
+# per-core host-API suites (the shared SQL corpus has no parameter-value directive).
+# cost: 0
+query I nosort
+SELECT a FROM t WHERE id = NULL
+----
+
 # Range `id >= 4`: the bound [4, +∞) reads rows 4,5,6. 1 page + 3 scanned + 3 filter + 3 produced = 10.
 # cost: 10
 query I nosort
@@ -102,6 +110,13 @@ query I nosort
 SELECT id FROM t WHERE id = 3 AND a > 0
 ----
 3
+
+# The direct point remains subject to the unchanged residual. A false residual reads/reconstructs the
+# one admitted row, evaluates the 3-node AND, and produces nothing: 1 page + 1 row + 3 filter = 5.
+# cost: 5
+query I nosort
+SELECT id FROM t WHERE id = 3 AND a < 0
+----
 
 # UPDATE pushes the bound down too: `id = 5` scans 1 row (not 6). 1 page + 1 scanned + 1 filter
 # (`id = 5`) + 0 (the `0` RHS is a leaf) = 3. No rows produced (a mutation).

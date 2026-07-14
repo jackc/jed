@@ -37,6 +37,13 @@ fn cost(db: &mut Session, sql: &str) -> i64 {
     }
 }
 
+fn stream_cost(db: &mut Session, sql: &str) -> i64 {
+    let mut rows = db.query(sql, &[]).unwrap();
+    for _ in &mut rows {}
+    rows.error().unwrap();
+    rows.cost()
+}
+
 /// `comp` row 1 carries a 600-char "x" run → 0x03 inline-compressed (LZ4 shrinks it far under
 /// RECORD_MAX, so no chain); `control` is the same shape fully inline-plain. Row 2 is inline in
 /// both. Same tree shape (one leaf each), so cost deltas isolate the compression units.
@@ -108,6 +115,14 @@ fn bounded_scan_charges_only_admitted_values_and_limit_does_not_lower() {
     let comp_hit = cost(&mut db, "SELECT * FROM comp WHERE id = 1");
     let control_hit = cost(&mut db, "SELECT * FROM control WHERE id = 1");
     assert_eq!(comp_hit, control_hit + SLABS_600);
+    assert_eq!(
+        stream_cost(&mut db, "SELECT * FROM comp WHERE id = 1"),
+        comp_hit
+    );
+    assert_eq!(
+        stream_cost(&mut db, "SELECT * FROM control WHERE id = 1"),
+        control_hit
+    );
     // ... the one that admits only the inline record pays nothing extra ...
     let comp_miss = cost(&mut db, "SELECT * FROM comp WHERE id = 2");
     let control_miss = cost(&mut db, "SELECT * FROM control WHERE id = 2");

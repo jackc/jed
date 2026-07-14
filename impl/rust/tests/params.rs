@@ -42,6 +42,26 @@ fn where_pk_eq_param_point_lookup() {
     ]);
     let got = rows(&mut db, "SELECT v FROM t WHERE id = $1", &[Value::Int(2)]);
     assert_eq!(got, vec![vec![Value::Int(20)]]);
+
+    match db
+        .query_outcome("SELECT v FROM t WHERE id = $1", &[Value::Null])
+        .unwrap()
+    {
+        Outcome::Query { rows, cost, .. } => {
+            assert!(rows.is_empty(), "NULL point parameter is 3VL-empty");
+            assert_eq!(cost, 0, "NULL point parameter performs no descent");
+        }
+        _ => panic!("expected a query result"),
+    }
+    assert_eq!(
+        err_code(
+            &mut db,
+            "SELECT v FROM t WHERE id = $1",
+            &[Value::Int(i32::MAX as i64 + 1)]
+        ),
+        "22003",
+        "an out-of-range point parameter fails during typed binding"
+    );
 }
 
 #[test]

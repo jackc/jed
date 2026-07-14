@@ -58,6 +58,13 @@ func TestWherePkEqParamPointLookup(t *testing.T) {
 	if len(rows) != 1 || rows[0][0].Int != 20 {
 		t.Fatalf("got %v want [[20]]", rows)
 	}
+	out, err := queryOutcome(db, "SELECT v FROM t WHERE id = $1", []Value{NullValue()})
+	if err != nil || len(out.Rows) != 0 || out.Cost != 0 {
+		t.Fatalf("NULL point parameter = rows %v cost %d err %v, want empty cost 0", out.Rows, out.Cost, err)
+	}
+	if c := paramErrCode(t, db, "SELECT v FROM t WHERE id = $1", IntValue(int64(1)<<31)); c != "22003" {
+		t.Fatalf("out-of-range point parameter code = %s want 22003", c)
+	}
 }
 
 func TestCompositePKParamTupleBound(t *testing.T) {

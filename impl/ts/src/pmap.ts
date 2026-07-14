@@ -367,13 +367,28 @@ export class PMap {
   // an OnDisk leaf on the descent (null for a fully-resident in-memory tree); an I/O error
   // propagates as a thrown EngineError.
   get(key: Uint8Array, src: LeafSource | null): Row | undefined {
+    return this.getCounted(key, src).row;
+  }
+
+  // One direct root→leaf point descent plus its visited-node count. Reconstructs a hit once and
+  // creates neither a range bound nor an emitted storage-key object.
+  getCounted(
+    key: Uint8Array,
+    src: LeafSource | null,
+  ): { row: Row | undefined; nodes: number; rowsReconstructed: number } {
     let n = this.root;
-    if (n === null) return undefined;
+    if (n === null) return { row: undefined, nodes: 0, rowsReconstructed: 0 };
+    let nodes = 1;
     while (!isLeaf(n)) {
       n = resolveChild(n.children[childSlot(n, key)], src);
+      nodes++;
     }
     const { index, found } = search(n, key);
-    return found ? rowAt(n, index) : undefined;
+    return {
+      row: found ? rowAt(n, index) : undefined,
+      nodes,
+      rowsReconstructed: found ? 1 : 0,
+    };
   }
 
   // insert inserts or overwrites key with val (on-disk record size weight); cap is the page payload
@@ -698,6 +713,12 @@ export class PMap {
     if (this.root !== null) yield* walkRevIter(this.root, b, src);
   }
 
+  // SELECT's row-only pull form: identical range traversal without allocating an unused [key,row]
+  // tuple for every emitted record.
+  *scanRowsIter(b: KeyBound, src: LeafSource | null, reverse: boolean): Generator<Row> {
+    if (this.root !== null) yield* walkRowsIter(this.root, b, src, reverse);
+  }
+
   // demoteCleanLeaves demotes every CLEAN, PERSISTED resident leaf to its OnDisk(page) reference —
   // the post-commit residency flip (bplus-reshape.md B4): after a commit assigns page ids to the
   // dirty nodes it wrote, the committed tree sheds its leaf payloads and becomes the skeletal
@@ -772,6 +793,29 @@ function* walkRevIter(n: PNode, b: KeyBound, src: LeafSource | null): Generator<
   const [cf, cl] = childWindow(b, n);
   for (let i = cl; i >= cf; i--) {
     yield* walkRevIter(resolveChild(n.children[i], src), b, src);
+  }
+}
+
+function* walkRowsIter(
+  n: PNode,
+  b: KeyBound,
+  src: LeafSource | null,
+  reverse: boolean,
+): Generator<Row> {
+  if (isLeaf(n)) {
+    const [ef, el] = entryWindow(b, n);
+    if (reverse) {
+      for (let i = el - 1; i >= ef; i--) yield rowAt(n, i);
+    } else {
+      for (let i = ef; i < el; i++) yield rowAt(n, i);
+    }
+    return;
+  }
+  const [cf, cl] = childWindow(b, n);
+  if (reverse) {
+    for (let i = cl; i >= cf; i--) yield* walkRowsIter(resolveChild(n.children[i], src), b, src, true);
+  } else {
+    for (let i = cf; i <= cl; i++) yield* walkRowsIter(resolveChild(n.children[i], src), b, src, false);
   }
 }
 

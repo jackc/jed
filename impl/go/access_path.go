@@ -2323,42 +2323,38 @@ func flipCompare(op binaryOp) binaryOp {
 	}
 }
 
-// buildKeyBound turns a PK tuple plan into a concrete storage-key range. Equality members append
-// bare component encodings to P. A complete tuple is [P,P], a proper prefix is
-// [P,prefixSuccessor(P)), and a next-member range tightens that prefix interval.
-// outer carries the enclosing rows (innermost last) so a correlated reOuterColumn source resolves to
-// the current outer row's value; it is nil for a top-level statement.
-func (db *engine) buildKeyBound(bp *pkBoundPlan, params []Value, outer []storedRow, left storedRow) (keyBound, bool) {
-	var p []byte
+// buildPKEqualityPrefix encodes the PK equality prefix once, including duplicate-source and
+// same-column-range contradictions. didWiden preserves the deferred float-key fallback.
+func (db *engine) buildPKEqualityPrefix(bp *pkBoundPlan, params []Value, outer []storedRow, left storedRow) (p []byte, widened keyBound, didWiden, empty bool) {
 	for _, ec := range bp.eqCols {
 		var agreed []byte
 		for _, src := range ec.srcs {
 			key, isNull, ok := encodeBoundKey(ec.colType, src, params, outer, ec.coll, left)
 			if isNull {
-				return keyBound{}, true
+				return nil, keyBound{}, false, true
 			}
 			if !ok {
 				// Float bound encoding remains deferred. Preserve the old sound widening (and its
 				// INL re-scan shape), retaining only any already-encoded leading tuple prefix.
 				if ec.colType.IsFloat() {
 					if len(p) == 0 {
-						return unboundedBound(), false
+						return nil, unboundedBound(), true, false
 					}
 					b := keyBound{lo: append([]byte(nil), p...), loInc: true, hi: prefixSuccessor(p), hiInc: false}
-					return b, boundEmpty(b)
+					return nil, b, true, boundEmpty(b)
 				}
-				return keyBound{}, true
+				return nil, keyBound{}, false, true
 			}
 			if agreed == nil {
 				agreed = key
 			} else if !bytes.Equal(agreed, key) {
-				return keyBound{}, true
+				return nil, keyBound{}, false, true
 			}
 		}
 		for _, term := range ec.ranges {
 			key, isNull, ok := encodeBoundKey(ec.colType, term.src, params, outer, ec.coll, left)
 			if isNull {
-				return keyBound{}, true
+				return nil, keyBound{}, false, true
 			}
 			if !ok {
 				continue
@@ -2366,10 +2362,26 @@ func (db *engine) buildKeyBound(bp *pkBoundPlan, params []Value, outer []storedR
 			cmp := bytes.Compare(agreed, key)
 			if (term.op == opGt && cmp <= 0) || (term.op == opGe && cmp < 0) ||
 				(term.op == opLt && cmp >= 0) || (term.op == opLe && cmp > 0) {
-				return keyBound{}, true
+				return nil, keyBound{}, false, true
 			}
 		}
 		p = append(p, agreed...)
+	}
+	return p, keyBound{}, false, false
+}
+
+// buildKeyBound turns a PK tuple plan into a concrete storage-key range. Equality members append
+// bare component encodings to P. A complete tuple is [P,P], a proper prefix is
+// [P,prefixSuccessor(P)), and a next-member range tightens that prefix interval.
+// outer carries the enclosing rows (innermost last) so a correlated reOuterColumn source resolves to
+// the current outer row's value; it is nil for a top-level statement.
+func (db *engine) buildKeyBound(bp *pkBoundPlan, params []Value, outer []storedRow, left storedRow) (keyBound, bool) {
+	p, widened, didWiden, empty := db.buildPKEqualityPrefix(bp, params, outer, left)
+	if empty {
+		return keyBound{}, true
+	}
+	if didWiden {
+		return widened, false
 	}
 	if len(bp.eqCols) == bp.memberCount {
 		return keyBound{lo: p, loInc: true, hi: append([]byte(nil), p...), hiInc: true}, false
@@ -2408,6 +2420,22 @@ func (db *engine) buildKeyBound(bp *pkBoundPlan, params []Value, outer []storedR
 		return keyBound{}, true
 	}
 	return b, false
+}
+
+// buildCompletePKPoint resolves a full-PK equality plan to one storage key. It shares the equality
+// encoder with the general range path but does not duplicate the key into [lo, hi].
+func (db *engine) buildCompletePKPoint(bp *pkBoundPlan, params []Value, outer []storedRow, left storedRow) (key []byte, point, empty bool) {
+	if len(bp.eqCols) != bp.memberCount || len(bp.rangeTerms) != 0 {
+		return nil, false, false
+	}
+	key, _, widened, empty := db.buildPKEqualityPrefix(bp, params, outer, left)
+	if empty {
+		return nil, true, true
+	}
+	if !widened {
+		return key, true, false
+	}
+	return nil, false, false
 }
 
 // encodeBoundKey encodes a const-source's value into the PK's storage key (the same codec INSERT

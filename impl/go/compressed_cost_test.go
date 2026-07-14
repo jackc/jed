@@ -79,6 +79,11 @@ func TestCompressedCostBoundedScanAndLimit(t *testing.T) {
 	if d := mustCost(t, db, "SELECT * FROM comp WHERE id = 1") - mustCost(t, db, "SELECT * FROM control WHERE id = 1"); d != slabs600 {
 		t.Fatalf("admitting lookup delta = %d, want %d", d, slabs600)
 	}
+	_, compStream := streamResult(t, db, "SELECT * FROM comp WHERE id = 1")
+	_, controlStream := streamResult(t, db, "SELECT * FROM control WHERE id = 1")
+	if compStream-controlStream != slabs600 {
+		t.Fatalf("streaming admitting lookup delta = %d, want %d", compStream-controlStream, slabs600)
+	}
 	// ... the one that admits only the inline record pays nothing extra ...
 	if d := mustCost(t, db, "SELECT * FROM comp WHERE id = 2") - mustCost(t, db, "SELECT * FROM control WHERE id = 2"); d != 0 {
 		t.Fatalf("inline lookup delta = %d, want 0", d)

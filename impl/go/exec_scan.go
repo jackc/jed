@@ -263,13 +263,34 @@ func (db *engine) buildScanRows(sp *selectPlan, ptys []scalarType, params []Valu
 		// (e.g. pk = NULL) admits no row.
 		b := unboundedBound()
 		empty := false
+		var pointKey []byte
+		isPoint := false
 		if sp.phys.relBounds[0] != nil && sp.phys.relBounds[0].pk != nil {
-			b, empty = db.buildKeyBound(sp.phys.relBounds[0].pk, bound, nil, nil)
+			pointKey, isPoint, empty = db.buildCompletePKPoint(sp.phys.relBounds[0].pk, bound, nil, nil)
+			if !isPoint {
+				b, empty = db.buildKeyBound(sp.phys.relBounds[0].pk, bound, nil, nil)
+			}
 		}
 		snap := db.snapshotEngine()
 		store := snap.lkpStoreScoped(sp.rels[0].db, sp.rels[0].tableName)
 		overlap, slabs := 0, 0
-		if !empty {
+		var pointScan *pointStoreScan
+		if isPoint && !empty && store.anySpillableTouched(sp.relMasks[0]) {
+			row, found, pages, decompress, getErr := store.GetWithUnits(pointKey, sp.relMasks[0])
+			if getErr != nil {
+				return nil, false, getErr
+			}
+			overlap, slabs = pages, decompress
+			if !found {
+				row = nil
+			}
+			pointScan = store.pointScanPrefetched(row)
+		} else if isPoint && !empty {
+			overlap = store.pointNodeCount()
+			pointScan = store.pointScanDeferred(pointKey)
+		} else if isPoint {
+			pointScan = store.pointScanPrefetched(nil)
+		} else if !empty {
 			if overlap, slabs, err = store.OverlapScanUnits(b, sp.relMasks[0]); err != nil {
 				return nil, false, err
 			}
@@ -294,7 +315,11 @@ func (db *engine) buildScanRows(sp *selectPlan, ptys []scalarType, params []Valu
 			done:     empty || (sp.limit != nil && *sp.limit == 0),
 		}
 		if !cur.done {
-			cur.scan = store.storeScan(b, sp.phys.pkReverse)
+			if isPoint {
+				cur.point = pointScan
+			} else {
+				cur.scan = store.storeScan(b, sp.phys.pkReverse)
+			}
 		}
 		return &Rows{columnNames: sp.columnNames, columnTypes: typeNames(sp.columnTypes), cursor: cur}, true, nil
 	}
@@ -329,6 +354,7 @@ type streamingCursor struct {
 	env      *evalEnv
 	meter    *costMeter
 	scan     *storeScan
+	point    *pointStoreScan
 	offset   int64
 	limit    *int64
 	distinct bool
@@ -349,7 +375,14 @@ func (c *streamingCursor) nextRow() ([]Value, bool, error) {
 		return nil, false, nil
 	}
 	for {
-		_, row, ok, err := c.scan.next()
+		var row storedRow
+		var ok bool
+		var err error
+		if c.point != nil {
+			row, ok, err = c.point.next()
+		} else {
+			_, row, ok, err = c.scan.next()
+		}
 		if err != nil {
 			return nil, false, err
 		}
@@ -363,7 +396,11 @@ func (c *streamingCursor) nextRow() ([]Value, bool, error) {
 		c.meter.Charge(costs.StorageRowRead)
 		// Materialize the touched columns left unfetched by the lazy load (large-values.md §14); the
 		// chain reads were already metered in the up-front block (cost.md §3).
-		row, err = c.scan.resolveColumns(row, c.plan.relMasks[0])
+		if c.point != nil {
+			row, err = c.point.resolveColumns(row, c.plan.relMasks[0])
+		} else {
+			row, err = c.scan.resolveColumns(row, c.plan.relMasks[0])
+		}
 		if err != nil {
 			return nil, false, err
 		}

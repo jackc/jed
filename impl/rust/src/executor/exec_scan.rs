@@ -764,26 +764,60 @@ impl Engine {
             // Resolve the scan bound (the PK pushdown, if any) and the up-front cost block — identical
             // to `exec_streaming_scan`. An empty bound (e.g. `pk = NULL`) admits no row.
             let reverse = plan.phys.pk_reverse;
-            let (bound, empty) = match &plan.phys.rel_bounds[0] {
-                Some(ScanBound::Pk(bp)) => match build_key_bound(bp, &bound_params, &[], &[]) {
-                    Some(b) => (b, false),
-                    None => (KeyBound::unbounded(), true),
-                },
+            let point = match &plan.phys.rel_bounds[0] {
+                Some(ScanBound::Pk(bp)) => build_complete_pk_point(bp, &bound_params, &[], &[]),
+                _ => CompletePkPoint::NotPoint,
+            };
+            let (bound, empty) = match (&plan.phys.rel_bounds[0], &point) {
+                (_, CompletePkPoint::Empty) => (KeyBound::unbounded(), true),
+                (Some(ScanBound::Pk(bp)), CompletePkPoint::NotPoint) => {
+                    match build_key_bound(bp, &bound_params, &[], &[]) {
+                        Some(b) => (b, false),
+                        None => (KeyBound::unbounded(), true),
+                    }
+                }
+                (Some(ScanBound::Pk(_)), CompletePkPoint::Key(_)) => (KeyBound::unbounded(), false),
                 // Eligibility already excludes index/GIN/GiST bounds; this is defensive.
-                Some(_) => return Ok(None),
-                None => (KeyBound::unbounded(), false),
+                (Some(_), _) => return Ok(None),
+                (None, _) => (KeyBound::unbounded(), false),
             };
             let snap = self.snapshot_engine();
-            let (overlap, slabs) = if empty {
-                (0, 0)
-            } else {
-                snap.store_scoped(plan.rels[0].db.as_deref(), &plan.rels[0].table_name)
-                    .overlap_scan_units(&bound, &plan.rel_masks[0])?
+            let store = snap.store_scoped(plan.rels[0].db.as_deref(), &plan.rels[0].table_name);
+            let (overlap, slabs, scan) = match point {
+                CompletePkPoint::Key(key) if store.any_spillable_touched(&plan.rel_masks[0]) => {
+                    // The old up-front slab block already reconstructed spillable point rows here.
+                    // Keep that error/cost timing, but retain the row for first pull instead of
+                    // descending and reconstructing it again.
+                    let (row, pages, slabs) = store.get_with_units(&key, &plan.rel_masks[0])?;
+                    (
+                        pages,
+                        slabs,
+                        StreamingFeed::Point(store.point_scan_prefetched(row)),
+                    )
+                }
+                CompletePkPoint::Key(key) => (
+                    store.point_node_count(),
+                    0,
+                    StreamingFeed::Point(store.point_scan_deferred(key)),
+                ),
+                CompletePkPoint::Empty => (
+                    0,
+                    0,
+                    StreamingFeed::Point(store.point_scan_prefetched(None)),
+                ),
+                CompletePkPoint::NotPoint => {
+                    let (pages, slabs) = if empty {
+                        (0, 0)
+                    } else {
+                        store.overlap_scan_units(&bound, &plan.rel_masks[0])?
+                    };
+                    (
+                        pages,
+                        slabs,
+                        StreamingFeed::Range(store.store_scan(bound, reverse)),
+                    )
+                }
             };
-            // cursor is `'static`, so it owns the mask.
-            let scan = snap
-                .store_scoped(plan.rels[0].db.as_deref(), &plan.rels[0].table_name)
-                .store_scan(bound, reverse);
             let mut meter = snap.session.new_meter();
             meter.accrued = subquery_cost; // the folded constant cost (lifetime already charged)
             meter.charge(COSTS.page_read * overlap as i64 + COSTS.value_decompress * slabs as i64);

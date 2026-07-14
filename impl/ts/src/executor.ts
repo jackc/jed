@@ -12681,14 +12681,36 @@ export class Engine {
       let keyB: KeyBound = unboundedBound();
       let empty = false;
       const sb = sp.phys.relBounds[0]!;
+      let point: CompletePkPoint = { kind: "notPoint" };
       if (sb !== null && sb.kind === "pk") {
-        const b = buildKeyBound(sb.pk, bound, [], []);
-        if (b === null) empty = true;
-        else keyB = b;
+        point = buildCompletePkPoint(sb.pk, bound, [], []);
+        if (point.kind === "empty") empty = true;
+        else if (point.kind === "notPoint") {
+          const b = buildKeyBound(sb.pk, bound, [], []);
+          if (b === null) empty = true;
+          else keyB = b;
+        }
       }
       const snap = this.snapshotEngine();
       const store = snap.lkpStoreScoped(sp.rels[0]!.db, sp.rels[0]!.tableName);
-      const su = empty ? { pages: 0, slabs: 0 } : store.overlapScanUnits(keyB, sp.relMasks[0]!);
+      let pointInput:
+        | { kind: "deferred"; key: Uint8Array }
+        | { kind: "prefetched"; row: Row | undefined }
+        | null = null;
+      let su: { pages: number; slabs: number };
+      if (point.kind === "key" && store.anySpillableTouched(sp.relMasks[0]!)) {
+        const got = store.getWithUnits(point.key, sp.relMasks[0]!);
+        su = { pages: got.pages, slabs: got.slabs };
+        pointInput = { kind: "prefetched", row: got.row };
+      } else if (point.kind === "key") {
+        su = { pages: store.pointNodeCount(), slabs: 0 };
+        pointInput = { kind: "deferred", key: point.key };
+      } else if (point.kind === "empty") {
+        su = { pages: 0, slabs: 0 };
+        pointInput = { kind: "prefetched", row: undefined };
+      } else {
+        su = empty ? { pages: 0, slabs: 0 } : store.overlapScanUnits(keyB, sp.relMasks[0]!);
+      }
       const meter = snap.session.newMeter();
       meter.accrued = subqueryCost; // the folded constant cost (lifetime already charged)
       meter.charge(COSTS.pageRead * BigInt(su.pages) + COSTS.valueDecompress * BigInt(su.slabs));
@@ -12702,7 +12724,7 @@ export class Engine {
         ctes: EMPTY_CTE_CTX,
         exec: snap,
       };
-      const gen = streamRows(sp, env, meter, store, keyB, empty);
+      const gen = streamRows(sp, env, meter, store, keyB, empty, pointInput);
       const source: RowSource = {
         nextRow: () => {
           const r = gen.next();
@@ -19298,6 +19320,64 @@ export function flipCmp(op: BinaryOp): BinaryOp {
   }
 }
 
+type PkEqualityPrefix =
+  | { kind: "empty" }
+  | { kind: "widened"; bound: KeyBound }
+  | { kind: "exact"; key: Uint8Array };
+
+// Encode the PK equality prefix once, including duplicate-source and same-column-range
+// contradictions. A deferred float key preserves the existing sound range widening.
+function buildPkEqualityPrefix(
+  bp: PkBound,
+  params: Value[],
+  outer: Row[],
+  left: Row,
+): PkEqualityPrefix {
+  const parts: Uint8Array[] = [];
+  for (const ec of bp.eqCols) {
+    let agreed: Uint8Array | null = null;
+    for (const src of ec.srcs) {
+      const encoded = encodeBoundKey(ec.colType, src, params, outer, ec.coll, left);
+      if (encoded.kind === "null") return { kind: "empty" };
+      if (encoded.kind === "outOfRange") {
+        // Float bound encoding remains deferred. Preserve the old sound widening (and its INL
+        // re-scan shape), retaining only an already-encoded leading tuple prefix.
+        if (isFloat(ec.colType)) {
+          const p = concatBytes(parts);
+          return {
+            kind: "widened",
+            bound: {
+              lo: p.length === 0 ? null : p,
+              loInc: true,
+              hi: p.length === 0 ? null : prefixSuccessor(p),
+              hiInc: false,
+            },
+          };
+        }
+        return { kind: "empty" };
+      }
+      if (agreed === null) agreed = encoded.key;
+      else if (!bytesEq(agreed, encoded.key)) return { kind: "empty" };
+    }
+    for (const term of ec.ranges) {
+      const encoded = encodeBoundKey(ec.colType, term.src, params, outer, ec.coll, left);
+      if (encoded.kind === "null") return { kind: "empty" };
+      if (encoded.kind === "outOfRange") continue;
+      const cmp = compareBytes(agreed!, encoded.key);
+      if (
+        (term.op === "gt" && cmp <= 0) ||
+        (term.op === "ge" && cmp < 0) ||
+        (term.op === "lt" && cmp >= 0) ||
+        (term.op === "le" && cmp > 0)
+      ) {
+        return { kind: "empty" };
+      }
+    }
+    parts.push(agreed!);
+  }
+  return { kind: "exact", key: concatBytes(parts) };
+}
+
 // buildKeyBound encodes a PK tuple bound. A complete equality tuple is [P,P], a proper prefix is
 // [P,prefixSuccessor(P)), and an optional next-member range tightens that prefix interval.
 // outer carries the enclosing rows (innermost last) so a correlated "outerColumn" source resolves to
@@ -19310,46 +19390,10 @@ export function buildKeyBound(
   outer: Row[],
   left: Row,
 ): KeyBound | null {
-  const parts: Uint8Array[] = [];
-  for (const ec of bp.eqCols) {
-    let agreed: Uint8Array | null = null;
-    for (const src of ec.srcs) {
-      const encoded = encodeBoundKey(ec.colType, src, params, outer, ec.coll, left);
-      if (encoded.kind === "null") return null;
-      if (encoded.kind === "outOfRange") {
-        // Float bound encoding remains deferred. Preserve the old sound widening (and its INL
-        // re-scan shape), retaining only an already-encoded leading tuple prefix.
-        if (isFloat(ec.colType)) {
-          const p = concatBytes(parts);
-          return {
-            lo: p.length === 0 ? null : p,
-            loInc: true,
-            hi: p.length === 0 ? null : prefixSuccessor(p),
-            hiInc: false,
-          };
-        }
-        return null;
-      }
-      if (agreed === null) agreed = encoded.key;
-      else if (!bytesEq(agreed, encoded.key)) return null;
-    }
-    for (const term of ec.ranges) {
-      const encoded = encodeBoundKey(ec.colType, term.src, params, outer, ec.coll, left);
-      if (encoded.kind === "null") return null;
-      if (encoded.kind === "outOfRange") continue;
-      const cmp = compareBytes(agreed!, encoded.key);
-      if (
-        (term.op === "gt" && cmp <= 0) ||
-        (term.op === "ge" && cmp < 0) ||
-        (term.op === "lt" && cmp >= 0) ||
-        (term.op === "le" && cmp > 0)
-      ) {
-        return null;
-      }
-    }
-    parts.push(agreed!);
-  }
-  const p = concatBytes(parts);
+  const prefix = buildPkEqualityPrefix(bp, params, outer, left);
+  if (prefix.kind === "empty") return null;
+  if (prefix.kind === "widened") return prefix.bound;
+  const p = prefix.key;
   if (bp.eqCols.length === bp.memberCount) {
     return { lo: p, loInc: true, hi: p.slice(), hiInc: true };
   }
@@ -19394,6 +19438,26 @@ export function buildKeyBound(
     }
   }
   return boundEmpty(b) ? null : b;
+}
+
+export type CompletePkPoint =
+  | { kind: "notPoint" }
+  | { kind: "empty" }
+  | { kind: "key"; key: Uint8Array };
+
+// Resolve a full-PK equality plan to one storage key. It shares the equality encoder with general
+// ranges but does not duplicate the point into independent lower/upper endpoint arrays.
+export function buildCompletePkPoint(
+  bp: PkBound,
+  params: Value[],
+  outer: Row[],
+  left: Row,
+): CompletePkPoint {
+  if (bp.eqCols.length !== bp.memberCount || bp.range !== null) return { kind: "notPoint" };
+  const prefix = buildPkEqualityPrefix(bp, params, outer, left);
+  if (prefix.kind === "empty") return { kind: "empty" };
+  if (prefix.kind === "widened") return { kind: "notPoint" };
+  return { kind: "key", key: prefix.key };
 }
 
 // buildIndexBound turns an index access predicate into a concrete index-key range at exec time

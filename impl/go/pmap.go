@@ -270,26 +270,35 @@ func fromSkeleton(root *pnode, length int64, known bool) pMap {
 // Get looks up the row at key — a root→leaf descent (interior nodes only route, v24). src faults an
 // OnDisk leaf on the descent (nil for a fully-resident in-memory tree); an I/O error propagates.
 func (m *pMap) Get(key []byte, src leafSource) (storedRow, bool, error) {
+	row, found, _, _, err := m.GetCounted(key, src)
+	return row, found, err
+}
+
+// GetCounted performs one direct root-to-leaf point descent and returns its visited-node count. It
+// reconstructs the matching row once, constructs no range bound, and emits no storage key.
+func (m *pMap) GetCounted(key []byte, src leafSource) (storedRow, bool, int, int, error) {
 	n := m.root
 	if n == nil {
-		return nil, false, nil
+		return nil, false, 0, 0, nil
 	}
+	nodes := 1
 	for !n.isLeaf() {
 		child, err := resolveChild(n.children[n.childSlot(key)], src)
 		if err != nil {
-			return nil, false, err
+			return nil, false, 0, 0, err
 		}
 		n = child
+		nodes++
 	}
 	i, found := n.search(key)
 	if !found {
-		return nil, false, nil
+		return nil, false, nodes, 0, nil
 	}
 	row, err := n.rowAt(i)
 	if err != nil {
-		return nil, false, err
+		return nil, false, 0, 0, err
 	}
-	return row, true, nil
+	return row, true, nodes, 1, nil
 }
 
 // Insert inserts or overwrites key with val (on-disk record size weight); cap is the page payload

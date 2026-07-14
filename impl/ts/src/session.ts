@@ -503,6 +503,7 @@ export function* streamRows(
   store: TableStore,
   bound: KeyBound,
   empty: boolean,
+  point: { kind: "deferred"; key: Uint8Array } | { kind: "prefetched"; row: Row | undefined } | null,
 ): Generator<Value[]> {
   if (empty || sp.limit === 0n) return;
   const offset = sp.offset ?? 0n;
@@ -511,7 +512,8 @@ export function* streamRows(
   let passed = 0n;
   let produced = 0n;
   // A pkReverse plan (ORDER BY the full PK all-DESC) walks the tree backward; everything else forward.
-  for (const [, rawRow] of store.scanIter(bound, sp.phys.pkReverse)) {
+  const input = point === null ? store.scanRowsIter(bound, sp.phys.pkReverse) : pointRows(store, point);
+  for (const rawRow of input) {
     meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
     meter.charge(COSTS.storageRowRead);
     // Materialize the touched columns left unfetched by the lazy load (large-values.md §14); the chain
@@ -542,6 +544,14 @@ export function* streamRows(
     // for-of pulls the next row only when another is actually needed.
     if (sp.limit !== null && produced >= sp.limit) return;
   }
+}
+
+function* pointRows(
+  store: TableStore,
+  point: { kind: "deferred"; key: Uint8Array } | { kind: "prefetched"; row: Row | undefined },
+): Generator<Row> {
+  const row = point.kind === "prefetched" ? point.row : store.get(point.key);
+  if (row !== undefined) yield row;
 }
 
 // bufferedRows is the lazy pull pipeline behind a BUFFERED cursor for a blocking plan

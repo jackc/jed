@@ -334,6 +334,31 @@ func TestPMapNearCapKeysDegenerateInterior(t *testing.T) {
 	}
 }
 
+func TestPMapDirectPointGetCountsOneDescentAndReconstruction(t *testing.T) {
+	t.Parallel()
+	var pm pMap
+	for k := uint64(0); k < 2000; k++ {
+		pm.Insert(pmKey(k), pmRow(int64(k)), pmW, pmCap, pmShape, nil)
+	}
+	if pm.height() <= 1 {
+		t.Fatal("test needs a multi-level tree")
+	}
+	hit, found, hitNodes, hitRows, err := pm.GetCounted(pmKey(777), nil)
+	if err != nil || !found || !reflect.DeepEqual(hit, pmRow(777)) {
+		t.Fatalf("hit = %v/%v, err=%v", hit, found, err)
+	}
+	if hitNodes != pm.height() || hitRows != 1 {
+		t.Fatalf("hit counts nodes=%d rows=%d, want height=%d rows=1", hitNodes, hitRows, pm.height())
+	}
+	miss, found, missNodes, missRows, err := pm.GetCounted(pmKey(3000), nil)
+	if err != nil || found || miss != nil {
+		t.Fatalf("miss = %v/%v, err=%v", miss, found, err)
+	}
+	if missNodes != pm.height() || missRows != 0 {
+		t.Fatalf("miss counts nodes=%d rows=%d, want height=%d rows=0", missNodes, missRows, pm.height())
+	}
+}
+
 // The bounded scan yields exactly the in-bound rows, in order, and the nodes counted during the
 // one windowed walk match overlapNodeCount's second counting descent (the page_read contract,
 // cost.md §3).

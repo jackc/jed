@@ -58,6 +58,11 @@ func TestOverflowCostBoundedScanChargesOnlyAdmittedChains(t *testing.T) {
 	if spillHit != controlHit+textChainPages {
 		t.Fatalf("spilled lookup: cost %d, want control %d + %d", spillHit, controlHit, textChainPages)
 	}
+	_, spillStream := streamResult(t, db, "SELECT * FROM spill WHERE id = 1")
+	_, controlStream := streamResult(t, db, "SELECT * FROM control WHERE id = 1")
+	if spillStream != spillHit || controlStream != controlHit {
+		t.Fatalf("streaming point costs spill/control = %d/%d, want eager %d/%d", spillStream, controlStream, spillHit, controlHit)
+	}
 	// ... the one that admits only the inline record pays nothing extra.
 	spillInline := mustCost(t, db, "SELECT * FROM spill WHERE id = 2")
 	controlInline := mustCost(t, db, "SELECT * FROM control WHERE id = 2")

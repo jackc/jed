@@ -65,9 +65,45 @@ impl StoreScan {
         self.cursor.next(src_ref)
     }
 
+    /// SELECT's row-only pull: identical traversal without cloning an unused storage key.
+    pub(crate) fn next_row(&mut self) -> Result<Option<Row>> {
+        let src = make_src(&self.store.paging, &self.store.col_types);
+        let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
+        self.cursor.next_row(src_ref)
+    }
+
     /// Materialize the unfetched values in the columns `mask` selects, in place, through the snapshot's
     /// pager (large-values.md §14) — the per-row resolve step of a streaming pipeline. Delegates to the
     /// owned snapshot store, so it reads through the same pinned pages the scan walks.
+    pub(crate) fn resolve_columns(&self, row: &mut Row, mask: &[bool]) -> Result<()> {
+        self.store.resolve_columns(row, mask)
+    }
+}
+
+enum PointState {
+    Deferred(Vec<u8>),
+    Prefetched(Option<Row>),
+    Done,
+}
+
+/// A one-row, row-only point cursor. Spillable touched rows may be prefetched while computing the
+/// existing up-front cost block; fixed-width probes defer their one descent to first pull, preserving
+/// early-drop and corruption timing.
+pub(crate) struct PointStoreScan {
+    store: TableStore,
+    state: PointState,
+}
+
+impl PointStoreScan {
+    pub(crate) fn next_row(&mut self) -> Result<Option<Row>> {
+        let state = std::mem::replace(&mut self.state, PointState::Done);
+        match state {
+            PointState::Deferred(key) => self.store.get(&key),
+            PointState::Prefetched(row) => Ok(row),
+            PointState::Done => Ok(None),
+        }
+    }
+
     pub(crate) fn resolve_columns(&self, row: &mut Row, mask: &[bool]) -> Result<()> {
         self.store.resolve_columns(row, mask)
     }
@@ -394,14 +430,29 @@ impl TableStore {
         key: &[u8],
         mask: &[bool],
     ) -> Result<(Option<Row>, usize, usize)> {
-        let point = KeyBound {
-            lo: Some(key.to_vec()),
-            lo_inc: true,
-            hi: Some(key.to_vec()),
-            hi_inc: true,
-        };
-        let (entries, pages, slabs) = self.range_scan_with_units(&point, mask)?;
-        Ok((entries.into_iter().next().map(|(_, v)| v), pages, slabs))
+        let src = make_src(&self.paging, &self.col_types);
+        let src_ref = src.as_ref().map(|s| s as &dyn LeafSource);
+        let (row, mut pages, _rows_reconstructed) = self.rows.get_counted(key, src_ref)?;
+        let mut slabs = 0usize;
+        if let Some(row) = &row
+            && crate::format::any_spillable_masked(&self.col_types, mask)
+        {
+            let units = crate::format::record_scan_units(&self.col_types, key, row, self.cap, mask);
+            pages += units.pages;
+            slabs = units.decompress;
+        }
+        Ok((row, pages, slabs))
+    }
+
+    /// The logical `page_read` count for a point probe before touching its leaf. A non-empty tree
+    /// visits exactly one node per level, hit or miss; used to preserve lazy first-pull timing for
+    /// fixed-width point cursors.
+    pub(crate) fn point_node_count(&self) -> usize {
+        self.rows.height()
+    }
+
+    pub(crate) fn any_spillable_touched(&self, mask: &[bool]) -> bool {
+        crate::format::any_spillable_masked(&self.col_types, mask)
     }
 
     /// The `value_compress` slabs storing this record costs — one `ceil(raw/C)` block per
@@ -518,6 +569,20 @@ impl TableStore {
         StoreScan {
             cursor: self.rows.range_cursor(b, reverse),
             store: self.clone(),
+        }
+    }
+
+    pub(crate) fn point_scan_deferred(&self, key: Vec<u8>) -> PointStoreScan {
+        PointStoreScan {
+            store: self.clone(),
+            state: PointState::Deferred(key),
+        }
+    }
+
+    pub(crate) fn point_scan_prefetched(&self, row: Option<Row>) -> PointStoreScan {
+        PointStoreScan {
+            store: self.clone(),
+            state: PointState::Prefetched(row),
         }
     }
 

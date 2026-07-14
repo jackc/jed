@@ -104,6 +104,40 @@ func (s *storeScan) resolveColumns(row storedRow, mask []bool) (storedRow, error
 	return s.store.resolveColumns(row, mask)
 }
 
+// pointStoreScan is a one-row, row-only cursor. A spillable touched row may already be prefetched by
+// the up-front cost walk; a fixed-width point defers its one descent to first pull.
+type pointStoreScan struct {
+	store      *tableStore
+	key        []byte
+	row        storedRow
+	prefetched bool
+	done       bool
+}
+
+func (s *tableStore) pointScanDeferred(key []byte) *pointStoreScan {
+	return &pointStoreScan{store: s, key: key}
+}
+
+func (s *tableStore) pointScanPrefetched(row storedRow) *pointStoreScan {
+	return &pointStoreScan{store: s, row: row, prefetched: true}
+}
+
+func (s *pointStoreScan) next() (storedRow, bool, error) {
+	if s.done {
+		return nil, false, nil
+	}
+	s.done = true
+	if s.prefetched {
+		return s.row, s.row != nil, nil
+	}
+	row, found, err := s.store.Get(s.key)
+	return row, found, err
+}
+
+func (s *pointStoreScan) resolveColumns(row storedRow, mask []bool) (storedRow, error) {
+	return s.store.resolveColumns(row, mask)
+}
+
 // weight is this row's on-disk record size — the weight the page-backed B+tree splits on. Accounts
 // for out-of-line spill at cap (an externalized value weighs its pointer, not its full body —
 // large-values.md §12), so split points match the serialized pages.
@@ -311,15 +345,25 @@ func (s *tableStore) ColumnarScanMasked(b keyBound, mask []bool) (cols [][]Value
 // (page_read, value_decompress) block its point bound charges — the index fetch path's Get +
 // OverlapScanUnits in one descent.
 func (s *tableStore) GetWithUnits(key []byte, mask []bool) (storedRow, bool, int, int, error) {
-	point := keyBound{lo: key, loInc: true, hi: key, hiInc: true}
-	entries, pages, slabs, err := s.RangeScanWithUnits(point, mask)
+	row, found, pages, _, err := s.rows.GetCounted(key, s.leafSrc())
 	if err != nil {
 		return nil, false, 0, 0, err
 	}
-	if len(entries) == 0 {
-		return nil, false, pages, slabs, nil
+	slabs := 0
+	if found && anySpillableMasked(s.colTypes, mask) {
+		chainPages, decompress := recordScanUnits(s.colTypes, key, row, s.cap, mask)
+		pages += chainPages
+		slabs = decompress
 	}
-	return entries[0].Row, true, pages, slabs, nil
+	return row, found, pages, slabs, nil
+}
+
+// pointNodeCount is the point probe's logical page_read count before touching a leaf: one node per
+// level for every hit or miss in a non-empty tree.
+func (s *tableStore) pointNodeCount() int { return s.rows.height() }
+
+func (s *tableStore) anySpillableTouched(mask []bool) bool {
+	return anySpillableMasked(s.colTypes, mask)
 }
 
 // WriteCompressUnits is the value_compress slabs storing this record costs — one ceil(raw/C)

@@ -4036,26 +4036,32 @@ pub(crate) fn index_logical_interval(logical: &KeyBound) -> KeyBound {
     b
 }
 
-/// Build a PK tuple's concrete storage-key range. Equality members append bare encodings to P; a
-/// complete tuple is `[P,P]`, a proper prefix is `[P,prefix-successor(P))`, and a next-member range
-/// tightens that prefix interval.
-pub(crate) fn build_key_bound(
+enum PkEqualityPrefix {
+    Empty,
+    Widened(KeyBound),
+    Exact(Vec<u8>),
+}
+
+/// Encode the PK equality prefix once, including every duplicate-source and same-column range
+/// contradiction. A float source that cannot be represented by the deferred key codec preserves
+/// the existing sound range widening.
+fn build_pk_equality_prefix(
     bp: &PkBound,
     params: &[Value],
     outer: &[&[Value]],
     left: &[Value],
-) -> Option<KeyBound> {
+) -> PkEqualityPrefix {
     let mut p = Vec::new();
     for ec in &bp.eq_cols {
         let mut agreed: Option<Vec<u8>> = None;
         for src in &ec.srcs {
             let key =
                 match encode_bound_key(ec.col_type, src, params, outer, ec.coll.as_deref(), left) {
-                    BoundKey::Null => return None,
+                    BoundKey::Null => return PkEqualityPrefix::Empty,
                     // Float bound encoding remains deferred. Preserve the old sound widening (and its
                     // INL re-scan shape), retaining only an already-encoded tuple prefix.
                     BoundKey::OutOfRange if ec.col_type.is_float() => {
-                        return Some(if p.is_empty() {
+                        return PkEqualityPrefix::Widened(if p.is_empty() {
                             KeyBound::unbounded()
                         } else {
                             KeyBound {
@@ -4066,13 +4072,13 @@ pub(crate) fn build_key_bound(
                             }
                         });
                     }
-                    BoundKey::OutOfRange => return None,
+                    BoundKey::OutOfRange => return PkEqualityPrefix::Empty,
                     BoundKey::Key(k) => k,
                 };
             match &agreed {
                 None => agreed = Some(key),
                 Some(prev) if *prev == key => {}
-                Some(_) => return None,
+                Some(_) => return PkEqualityPrefix::Empty,
             }
         }
         for term in &ec.ranges {
@@ -4084,7 +4090,7 @@ pub(crate) fn build_key_bound(
                 ec.coll.as_deref(),
                 left,
             ) {
-                BoundKey::Null => return None,
+                BoundKey::Null => return PkEqualityPrefix::Empty,
                 BoundKey::OutOfRange => continue,
                 BoundKey::Key(k) => k,
             };
@@ -4100,11 +4106,28 @@ pub(crate) fn build_key_bound(
                 CmpOp::Eq | CmpOp::Ne => false,
             };
             if false_term {
-                return None;
+                return PkEqualityPrefix::Empty;
             }
         }
         p.extend_from_slice(&agreed.expect("PK equality member has a source"));
     }
+    PkEqualityPrefix::Exact(p)
+}
+
+/// Build a PK tuple's concrete storage-key range. Equality members append bare encodings to P; a
+/// complete tuple is `[P,P]`, a proper prefix is `[P,prefix-successor(P))`, and a next-member range
+/// tightens that prefix interval.
+pub(crate) fn build_key_bound(
+    bp: &PkBound,
+    params: &[Value],
+    outer: &[&[Value]],
+    left: &[Value],
+) -> Option<KeyBound> {
+    let p = match build_pk_equality_prefix(bp, params, outer, left) {
+        PkEqualityPrefix::Empty => return None,
+        PkEqualityPrefix::Widened(bound) => return Some(bound),
+        PkEqualityPrefix::Exact(p) => p,
+    };
     if bp.eq_cols.len() == bp.member_count {
         return Some(KeyBound {
             lo: Some(p.clone()),
@@ -4152,6 +4175,30 @@ pub(crate) fn build_key_bound(
         }
     }
     if bound_empty(&b) { None } else { Some(b) }
+}
+
+pub(crate) enum CompletePkPoint {
+    NotPoint,
+    Empty,
+    Key(Vec<u8>),
+}
+
+/// Resolve a full-PK equality plan to its one storage key. The equality-prefix encoder is shared
+/// with the general bound path, but this point form does not duplicate the key into `[lo, hi]`.
+pub(crate) fn build_complete_pk_point(
+    bp: &PkBound,
+    params: &[Value],
+    outer: &[&[Value]],
+    left: &[Value],
+) -> CompletePkPoint {
+    if bp.eq_cols.len() != bp.member_count || bp.range.is_some() {
+        return CompletePkPoint::NotPoint;
+    }
+    match build_pk_equality_prefix(bp, params, outer, left) {
+        PkEqualityPrefix::Empty => CompletePkPoint::Empty,
+        PkEqualityPrefix::Exact(key) => CompletePkPoint::Key(key),
+        PkEqualityPrefix::Widened(_) => CompletePkPoint::NotPoint,
+    }
 }
 
 /// Turn an index access predicate into a concrete index-key range at exec time (indexes.md §5.1).

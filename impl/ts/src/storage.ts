@@ -339,9 +339,19 @@ export class TableStore {
     key: Uint8Array,
     mask: boolean[],
   ): { row: Row | undefined; pages: number; slabs: number } {
-    const point: KeyBound = { lo: key, loInc: true, hi: key, hiInc: true };
-    const { entries, pages, slabs } = this.rangeScanWithUnits(point, mask);
-    return { row: entries.length > 0 ? entries[0].row : undefined, pages, slabs };
+    const got = this.rows.getCounted(key, this.leafSrc());
+    let pages = got.nodes;
+    let slabs = 0;
+    if (got.row !== undefined && anySpillableMasked(this.colTypes, mask)) {
+      const units = recordScanUnits(this.colTypes, key, got.row, this.cap, mask);
+      pages += units.pages;
+      slabs = units.decompress;
+    }
+    return { row: got.row, pages, slabs };
+  }
+
+  pointNodeCount(): number {
+    return this.rows.height();
   }
 
   // writeCompressUnits is the value_compress slabs storing this record costs — one ceil(raw/C)
@@ -426,6 +436,10 @@ export class TableStore {
   scanIter(b: KeyBound, reverse: boolean): Generator<[Uint8Array, Row]> {
     const src = this.leafSrc();
     return reverse ? this.rows.scanRangeRevIter(b, src) : this.rows.scanRangeIter(b, src);
+  }
+
+  scanRowsIter(b: KeyBound, reverse: boolean): Generator<Row> {
+    return this.rows.scanRowsIter(b, this.leafSrc(), reverse);
   }
 
   // treeRoot is the root B-tree node of this store, for the page-backed serializer

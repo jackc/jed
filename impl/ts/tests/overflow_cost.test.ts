@@ -30,6 +30,14 @@ function cost(db: Handle, sql: string): bigint {
   return queryOutcome(db, sql).cost;
 }
 
+function streamCost(db: Session, sql: string): bigint {
+  const cursor = db.query(sql);
+  for (const _ of cursor) void _;
+  const result = cursor.cost;
+  cursor.close();
+  return result;
+}
+
 // Two tables of identical shape: `spill` row 1 carries a 600-char text (3-page chain), `control`
 // keeps every value inline. Row 2 is inline in both.
 function overflowTables(): Session {
@@ -56,6 +64,8 @@ test("a bounded scan charges only the admitted records' chains", () => {
   const spillHit = cost(db, "SELECT * FROM spill WHERE id = 1");
   const controlHit = cost(db, "SELECT * FROM control WHERE id = 1");
   assert.strictEqual(spillHit, controlHit + TEXT_CHAIN_PAGES);
+  assert.strictEqual(streamCost(db, "SELECT * FROM spill WHERE id = 1"), spillHit);
+  assert.strictEqual(streamCost(db, "SELECT * FROM control WHERE id = 1"), controlHit);
   // ... the one that admits only the inline record pays nothing extra.
   const spillInline = cost(db, "SELECT * FROM spill WHERE id = 2");
   const controlInline = cost(db, "SELECT * FROM control WHERE id = 2");

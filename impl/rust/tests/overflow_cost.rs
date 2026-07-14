@@ -56,6 +56,13 @@ fn cost(db: &mut Session, sql: &str) -> i64 {
     }
 }
 
+fn stream_cost(db: &mut Session, sql: &str) -> i64 {
+    let mut rows = db.query(sql, &[]).unwrap();
+    for _ in &mut rows {}
+    rows.error().unwrap();
+    rows.cost()
+}
+
 /// Two tables of identical shape: `spill` row 1 carries a 600-char text (3-page chain),
 /// `control` keeps every value inline. Row 2 is inline in both.
 fn two_tables() -> Session {
@@ -96,6 +103,14 @@ fn bounded_scan_charges_only_admitted_chains() {
     let spill_hit = cost(&mut db, "SELECT * FROM spill WHERE id = 1");
     let control_hit = cost(&mut db, "SELECT * FROM control WHERE id = 1");
     assert_eq!(spill_hit, control_hit + TEXT_CHAIN_PAGES);
+    assert_eq!(
+        stream_cost(&mut db, "SELECT * FROM spill WHERE id = 1"),
+        spill_hit
+    );
+    assert_eq!(
+        stream_cost(&mut db, "SELECT * FROM control WHERE id = 1"),
+        control_hit
+    );
     // ... the one that admits only the inline record pays nothing extra.
     let spill_inline = cost(&mut db, "SELECT * FROM spill WHERE id = 2");
     let control_inline = cost(&mut db, "SELECT * FROM control WHERE id = 2");

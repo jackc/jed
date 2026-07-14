@@ -229,10 +229,23 @@ This is the load-bearing simplification, in the same spirit as the buffer pool (
 §3](pager.md)) and the spill sorter ([spill.md §6](spill.md)): **streaming changes *when* work
 happens and *when* cost accrues, never *what* a fully-drained query observes.**
 
-- **Cost accrues during `next()`, not during `query()`.** The same units fire at the same sites for
-  the same rows; they are merely pulled forward to when the caller asks for each row. Under **full
-  drain** (every row pulled) the accrued **total is byte-identical** to the materialized path — so
-  every `# cost:` corpus value holds unchanged.
+- **Per-row cost accrues during `next()`; scan-wide blocks retain their existing open timing.** The
+  same units fire at the same sites for the same rows. The bounded scan's logical `page_read` block
+  and any touched-value overflow/decompression block are still computed and charged while building
+  the cursor; `storage_row_read`, residual evaluation, projection, and `row_produced` occur as rows
+  are pulled. Under **full drain** (every row pulled) the accrued **total is byte-identical** to the
+  materialized path — so every `# cost:` corpus value holds unchanged.
+- **Complete-PK point timing is explicit.** A fixed-width-only hit/miss charges the tree-height
+  `page_read` block at cursor construction from the resident skeleton, but defers the one leaf
+  descent and possible row reconstruction until first `next()`; dropping before that pull does not
+  fault the leaf. If any touched column can spill, determining its actual disposition is part of the
+  pre-existing scan-wide block: cursor construction performs the one fused descent, computes chain
+  pages/decompression slabs, and retains the optional row for first pull. A corrupt leaf therefore
+  still errors at open for that spillable case and at first pull for the fixed-only case; an external
+  value body is resolved (and can error) on first pull. A cost ceiling below the up-front block still
+  aborts at open; ceilings reached by `storage_row_read`/residual/projection still abort during
+  iteration. The direct cursor removes the former second descent/reconstruction without moving any
+  of these boundaries.
 - **The conformance harness drains fully.** The corpus contract is a query's complete result
   multiset + total cost (compared `rowsort` where unordered — CLAUDE.md §8). The per-core harness
   therefore **drains the cursor to exhaustion, reads `cost()` after drain, and surfaces any error

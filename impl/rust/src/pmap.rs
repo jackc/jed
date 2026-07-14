@@ -641,17 +641,30 @@ impl PMap {
     /// read path clones the row out (spec/design/pager.md §4). `src` faults an `OnDisk` leaf on the
     /// descent (`None` for a fully-resident in-memory tree).
     pub(crate) fn get(&self, key: &[u8], src: Option<&dyn LeafSource>) -> Result<Option<Row>> {
+        Ok(self.get_counted(key, src)?.0)
+    }
+
+    /// Direct point lookup plus the number of B+tree nodes visited. Counts during the same
+    /// root→leaf descent and reconstructs the matching row once; it builds no range bound and emits
+    /// no storage key.
+    pub(crate) fn get_counted(
+        &self,
+        key: &[u8],
+        src: Option<&dyn LeafSource>,
+    ) -> Result<(Option<Row>, usize, usize)> {
         // Hold an owned `Arc` to the current node so a faulted leaf outlives the step that reads it.
         let mut cur = match &self.root {
-            None => return Ok(None),
+            None => return Ok((None, 0, 0)),
             Some(root) => root.clone(),
         };
+        let mut nodes = 1usize;
         while !cur.is_leaf() {
             cur = child(&cur, cur.child_slot(key), src)?;
+            nodes += 1;
         }
         match cur.search(key) {
-            Ok(i) => Ok(Some(cur.row_at(i)?)),
-            Err(_) => Ok(None),
+            Ok(i) => Ok((Some(cur.row_at(i)?), nodes, 1)),
+            Err(_) => Ok((None, nodes, 0)),
         }
     }
 
@@ -1079,6 +1092,22 @@ impl RangeCursor {
     /// or pops an exhausted frame. `src` is supplied per call (rebuilt cheaply by the caller) so the
     /// cursor itself borrows nothing — see [`RangeCursor`].
     pub(crate) fn next(&mut self, src: Option<&dyn LeafSource>) -> Result<Option<(Vec<u8>, Row)>> {
+        self.next_inner(src, true)
+            .map(|entry| entry.map(|(key, row)| (key.expect("key requested"), row)))
+    }
+
+    /// Row-only pull used by SELECT. It follows the same frame transitions as [`next`](Self::next)
+    /// but does not copy the leaf's storage key merely to discard it in the executor.
+    pub(crate) fn next_row(&mut self, src: Option<&dyn LeafSource>) -> Result<Option<Row>> {
+        self.next_inner(src, false)
+            .map(|entry| entry.map(|(_, row)| row))
+    }
+
+    fn next_inner(
+        &mut self,
+        src: Option<&dyn LeafSource>,
+        with_key: bool,
+    ) -> Result<Option<(Option<Vec<u8>>, Row)>> {
         let reverse = self.reverse;
         loop {
             let (emit, descend) = {
@@ -1099,7 +1128,10 @@ impl RangeCursor {
                     };
                     if frame.is_leaf {
                         (
-                            Some((frame.node.key_at(p).to_vec(), frame.node.row_at(p)?)),
+                            Some((
+                                with_key.then(|| frame.node.key_at(p).to_vec()),
+                                frame.node.row_at(p)?,
+                            )),
                             None,
                         )
                     } else {
@@ -1780,6 +1812,26 @@ mod tests {
             );
         }
         assert!(pm.is_empty());
+    }
+
+    #[test]
+    fn direct_point_get_counts_one_descent_and_reconstruction() {
+        let mut pm = PMap::new();
+        for k in 0..2000 {
+            pm.insert(key(k), row(k as i64), W, CAP, SHAPE, None)
+                .unwrap();
+        }
+        assert!(pm.height() > 1, "test needs a multi-level tree");
+
+        let (hit, hit_nodes, hit_rows) = pm.get_counted(&key(777), None).unwrap();
+        assert_eq!(hit, Some(row(777)));
+        assert_eq!(hit_nodes, pm.height(), "one root-to-leaf descent");
+        assert_eq!(hit_rows, 1, "a hit reconstructs exactly one row");
+
+        let (miss, miss_nodes, miss_rows) = pm.get_counted(&key(3000), None).unwrap();
+        assert_eq!(miss, None);
+        assert_eq!(miss_nodes, pm.height(), "a miss still descends once");
+        assert_eq!(miss_rows, 0, "a miss reconstructs no row");
     }
 
     /// The bounded scan yields exactly the in-bound rows, in order, and the counted nodes match

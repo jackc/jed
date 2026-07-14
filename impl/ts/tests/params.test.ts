@@ -40,6 +40,17 @@ test("WHERE pk = $1 point lookup", () => {
     "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)",
   ]);
   assert.deepStrictEqual(ints(rows(db, "SELECT v FROM t WHERE id = $1", [intValue(2n)])), [20n]);
+  const nil = queryOutcome(db, "SELECT v FROM t WHERE id = $1", [nullValue()]);
+  assert.equal(nil.kind, "query");
+  if (nil.kind === "query") {
+    assert.deepStrictEqual(nil.rows, [], "NULL point parameter is 3VL-empty");
+    assert.equal(nil.cost, 0n, "NULL point parameter performs no descent");
+  }
+  assert.equal(
+    paramErrCode(db, "SELECT v FROM t WHERE id = $1", [intValue(2147483648n)]),
+    "22003",
+    "an out-of-range point parameter fails during typed binding",
+  );
 });
 
 test("composite PK parameter tuple bound", () => {

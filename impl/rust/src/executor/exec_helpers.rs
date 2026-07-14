@@ -157,6 +157,27 @@ pub(crate) struct EstimatorInputSignature {
 /// project for ONE output row, accruing the identical cost units at the identical sites as the eager
 /// path — so a fully-drained streaming query observes the same rows + total cost (streaming.md §6),
 /// while a caller that stops early reads (and charges) less.
+pub(crate) enum StreamingFeed {
+    Range(crate::storage::StoreScan),
+    Point(crate::storage::PointStoreScan),
+}
+
+impl StreamingFeed {
+    fn next_row(&mut self) -> Result<Option<Row>> {
+        match self {
+            StreamingFeed::Range(scan) => scan.next_row(),
+            StreamingFeed::Point(scan) => scan.next_row(),
+        }
+    }
+
+    fn resolve_columns(&self, row: &mut Row, mask: &[bool]) -> Result<()> {
+        match self {
+            StreamingFeed::Range(scan) => scan.resolve_columns(row, mask),
+            StreamingFeed::Point(scan) => scan.resolve_columns(row, mask),
+        }
+    }
+}
+
 pub(crate) struct StreamingScan {
     pub(crate) engine: Engine,
     /// The resolved plan, shared (`Rc`) so a prepared statement's plan cache and this cursor hold the
@@ -165,7 +186,7 @@ pub(crate) struct StreamingScan {
     pub(crate) plan: std::rc::Rc<SelectPlan>,
     pub(crate) params: Vec<Value>,
     pub(crate) rng: std::cell::Cell<crate::seam::StmtRng>,
-    pub(crate) scan: crate::storage::StoreScan,
+    pub(crate) scan: StreamingFeed,
     pub(crate) meter: Meter,
     pub(crate) offset: i64,
     pub(crate) limit: Option<i64>,
@@ -203,8 +224,8 @@ impl crate::cursor::RowStream for StreamingScan {
         };
         let mask = &self.plan.rel_masks[0];
         loop {
-            let (_key, mut row) = match self.scan.next()? {
-                Some(p) => p,
+            let mut row = match self.scan.next_row()? {
+                Some(row) => row,
                 None => {
                     self.done = true;
                     return Ok(None);

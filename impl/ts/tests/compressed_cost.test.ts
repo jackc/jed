@@ -28,6 +28,14 @@ function cost(db: Handle, sql: string): bigint {
   return queryOutcome(db, sql).cost;
 }
 
+function streamCost(db: Session, sql: string): bigint {
+  const cursor = db.query(sql);
+  for (const _ of cursor) void _;
+  const result = cursor.cost;
+  cursor.close();
+  return result;
+}
+
 // `comp` row 1 carries a 600-char "x" run → 0x03 inline-compressed (LZ4 shrinks it far under
 // RECORD_MAX, so no chain); `control` is the same shape fully inline-plain. Row 2 is inline in
 // both. Same tree shape (one leaf each), so cost deltas isolate the compression units.
@@ -69,6 +77,10 @@ test("bounded scan charges only admitted values and LIMIT does not lower", () =>
   assert.equal(
     cost(db, "SELECT * FROM comp WHERE id = 1"),
     cost(db, "SELECT * FROM control WHERE id = 1") + SLABS_600,
+  );
+  assert.equal(
+    streamCost(db, "SELECT * FROM comp WHERE id = 1"),
+    streamCost(db, "SELECT * FROM control WHERE id = 1") + SLABS_600,
   );
   // ... the one that admits only the inline record pays nothing extra ...
   assert.equal(
