@@ -1178,6 +1178,25 @@ per `WHERE` evaluation, `aggregate_accumulate` per folded row. Worked examples (
 indexes — 4 `generated_row` + 4 `row_produced` = **8** (the same for a 4-constraint
 `jed_constraints` scan).
 
+`jed_statistics` uses the same model: one `generated_row` for each collected column summary and no
+page/storage-row units. Its values come from the pinned resident snapshot facts, never a collection
+scan; `ANALYZE`, below, owns that scan's cost.
+
+### `statistics_value` — deterministic ANALYZE collection
+
+`ANALYZE table [(columns)]` ([statistics.md](statistics.md)) scans each requested column separately.
+Each scan charges the ordinary full one-column `page_read`, `storage_row_read`, overflow-page, and
+`value_decompress` block. Before hashing/sampling each row it additionally charges
+`statistics_value × max(1, canonical_width)`: comparison-key bytes for a distribution-eligible
+value, ordinary canonical value-body bytes otherwise, one for NULL. The charge occurs before the
+work and guard, so a ceiling aborts at the same value/byte boundary in every core and statement
+rollback discards partially collected facts. Sampling/sorting is fixed at at most 30,000 rows, so it
+is absolutely bounded and adds no second variable unit.
+
+For an inline `i32` one-column table with `N` rows and `P` B+tree nodes, `ANALYZE t` costs
+`P page_read + N storage_row_read + 4N statistics_value`; it emits no result rows and therefore no
+`row_produced`. An ineligible NULL value still costs one `statistics_value`.
+
 ### `sequence_advance` — a sequence mutation
 
 `nextval('s')` (and, from S2, `setval`) advances a sequence's catalog tuple, more than a pure

@@ -9,7 +9,9 @@
 > inventory, P4 base estimates, and P5 whole-plan propagation + EXPLAIN columns. P6 selects
 > complete single-relation pipelines, P7 cost-selects two-relation orientation and algorithm, and
 > P8 implements §10's hard-fenced N-way search with Pareto-frontier DP through eight movable
-> relations and deterministic cheapest-next construction above the cap.
+> relations and deterministic cheapest-next construction above the cap. P9 adds the retained,
+> transactional `ANALYZE` facts specified in [statistics.md](statistics.md): exact NULL/width facts,
+> bounded deterministic NDV/MCV/histograms, and statistics-aware base/join/distinct estimates.
 
 ## 1. Decision and scope
 
@@ -121,8 +123,8 @@ The initial selectivities are:
 | bare boolean expression | `1/2` | jed fallback |
 | unsupported/opaque predicate | `1/3` | jed conservative fallback |
 
-These are planner facts, not claims about real data. P9 replaces a default with statistics only
-where that replacement is itself spec'd; fallback values remain stable.
+These are planner facts, not claims about real data. P9 replaces a default only under
+[statistics.md](statistics.md)'s exact applicability rules; fallback values remain stable.
 
 ## 5. Inputs and the no-planning-I/O rule
 
@@ -145,7 +147,9 @@ values.
 Statistics are snapshot state. Pending mutations change the writer's working statistics and
 rollback discards them; readers keep the statistics pinned with their data snapshot. Since v28, the
 exact row count is persisted in the table catalog, so reopen does not restore the former full-leaf
-count walk. Future NDV/histogram collection follows the same transactional rule.
+count walk. Since v29, explicit `ANALYZE` persists per-column facts; later DML retains them, marks
+them stale, and rescales them deterministically against the current exact row count
+([statistics.md](statistics.md) §2/§5).
 
 Every relation also owns a transactional **estimator revision** used only for cache validity. A
 successful statement that may change any admitted estimator input advances that relation's revision
@@ -163,8 +167,9 @@ they are never estimator arithmetic inputs, serialized bytes, EXPLAIN values, or
 ## 6. Parameters, literals, and prepared-plan caching
 
 The pipeline remains `resolve → optimize → bind`. A literal is available to planning and may select
-a structural class or, once P9 lands, a histogram bucket. `$N` is not bound at physical-selection
-time and always receives the generic selectivity for its predicate class. Initial Path B has no
+a structural class or a histogram bucket. `$N` is not bound at physical-selection time and always
+receives a generic estimate: statistics-aware NDV average density for eligible equality, otherwise
+the generic structural selectivity. It never receives an MCV/histogram bucket. Initial Path B has no
 custom parameter-sensitive plans.
 
 A prepared-plan cache entry is reusable only when an exact, collision-free, relation-scoped input
@@ -230,8 +235,8 @@ WHERE against the base relation's `N`, independently of the physical candidate.*
 estimated from the candidate's access predicate. The executor still rechecks the complete WHERE for
 every fetched row, so `operator_eval` uses scan rows even though logical output cardinality does not
 apply the predicate a second time. In particular, a lossy/superset GIN or GiST bound does not square
-the same no-statistics selectivity merely because it has a residual recheck: until P9 supplies a
-false-positive statistic, inventing a second reduction would make one logical predicate's output
+the same selectivity merely because it has a residual recheck: P9 does not collect access-method
+false-positive statistics, and inventing a second reduction would make one logical predicate's output
 cardinality depend on its physical path. This rule was the P4 human decision checkpoint.
 
 The initial access-method classifications are canonical data in `estimator.toml`: scalar GiST `=`
@@ -247,12 +252,14 @@ the same deterministic contradiction and paired-range inventory the access detec
 - **AND:** begin with `N`; apply each remaining conjunct's exact fraction to the current row count,
   left to right with `scale_ceil`.
 - **OR:** estimate every disjunct against the original `N`, add the parts in source order with
-  saturation, and cap at `N`. This disjoint-union upper estimate is deliberately simple until P9
-  supplies overlap/NDV facts. `N = 0` yields zero.
+  saturation, and cap at `N`. This disjoint-union upper estimate deliberately has no overlap model.
+  P9 refines individual disjuncts but retains this upper fold.
+  `N = 0` yields zero.
 - **NOT:** `N - estimate(predicate, N)`.
 
 The formulas approximate SQL 3VL when NULL-distribution facts are absent; they never change SQL
-evaluation. P9 may replace them only with spec'd NULL/NDV statistics. Syntactically equivalent but
+evaluation. P9's exact NULL fraction makes supported column complements subtract from non-NULL rows
+under statistics.md §6. Syntactically equivalent but
 differently associated predicates may estimate differently because source-order ceiling is part of
 the plan contract; the chosen plan still returns identical rows.
 
@@ -353,8 +360,8 @@ post-WHERE rows before the window, and let `L` be the rows in the physical left 
 to the final join step. When `T > 0` and `J > T`, the estimated number of left rows whose final join
 runs are started is `min(L, ceil(T * L / J))`; `J = 0` conservatively starts all `L`, and `T = 0`
 starts none. The multiply/divide uses quotient/remainder saturation, never float arithmetic. This
-is the initial row-count-only uniform-fanout model; P9 may replace it only with specified
-distribution facts. It discounts only final-step work the executor actually skips: nested-loop
+is the initial row-count-only uniform-fanout model; P9 leaves it unchanged because per-join fanout
+correlation is not a collected fact. It discounts only final-step work the executor actually skips: nested-loop
 candidate/ON visits, hash probes and bucket verification, or repeated INL inner scans. The selected
 left subtree and ordinary base scans remain complete, as does a final hash build. In the
 two-relation case `L` is the selected driver relation.
@@ -643,7 +650,26 @@ recursive join tree; such an executor would require a broader per-level discount
 Join-PK order is ineligible across a semantic fence. Without an eligible ordered LIMIT, the complete
 tree retains the blocking Sort; its unmetered bookkeeping still adds no private planner weight.
 
-## 11. EXPLAIN contract
+## 11. P9 column-statistics refinement
+
+[statistics.md](statistics.md) owns collection, persistence, staleness, type eligibility, and the
+complete formulas. The estimator-facing summary is:
+
+- planning reads only resident snapshot facts; ANALYZE is the only leaf-scanning collection path;
+- current NULL/MCV/histogram populations rescale from `analyzed_rows` to exact current table rows;
+- low analyzed NDV (at most 10% of analyzed non-NULL rows) stays fixed, while higher NDV scales
+  proportionally and clamps to current non-NULL rows;
+- a known literal may match MCV or the step histogram; a generic parameter may use average NDV
+  density but never a value bucket;
+- eligible equality joins use both inputs' non-NULL rows and maximum NDV; simple-column GROUP BY /
+  DISTINCT uses the product of per-column NDVs plus a NULL group; and
+- average canonical key width replaces the variable-width hash fallback where present.
+
+Facts never change §3 arithmetic or §9 ties. A stale/sample statistic is heuristic and cannot turn
+an unobserved literal into a structural zero. No-statistics and ineligible shapes retain §§4/7's
+stable defaults.
+
+## 12. EXPLAIN contract
 
 EXPLAIN appends two non-NULL `i64` columns to its existing result:
 
@@ -667,7 +693,7 @@ Plain EXPLAIN is jed-owned and not PostgreSQL-oracle imported. Its estimate rows
 `nosort` in the shared corpus, making arithmetic, candidate choice, and tie breaks one cross-core
 contract.
 
-## 12. Conformance and slice gates
+## 13. Conformance and slice gates
 
 - **P0:** data coherence only (`rake verify`); no engine behavior changes.
 - **P1/P2:** byte goldens, transactional statistics, reopen, and cache fresh-vs-hit parity.
@@ -675,15 +701,18 @@ contract.
 - **P5:** EXPLAIN estimate columns become the differential assertion surface.
 - **P6–P8:** each enabled choice carries EXPLAIN cases, actual `# cost:` re-pins, a new NoREC
   relation, and affected benchmarks.
+- **P9:** ANALYZE SQL/cost corpus, v29 cross-core/Ruby goldens, collection arithmetic vectors,
+  retained-stale/cache/rollback coverage, EXPLAIN flips, NoREC, and skew/uniform benchmarks.
 
 PostgreSQL remains the result oracle, not the plan/estimate oracle. The borrowed default
 selectivities are recorded data, not a promise to reproduce PostgreSQL plans.
 
-## 13. Deliberate boundaries and deferred work
+## 14. Deliberate boundaries and deferred work
 
 - No parameter-sensitive/custom plans in initial Path B.
 - No cost-based DML access policy until a mutation-specific slice.
-- No NDV, MCV, histogram, or value-size statistics until P9.
+- No extended/multi-column statistics, automatic analyze, configurable targets, MCV-aware join
+  skew, or distribution facts for composite/array/json/jsonb in P9.
 - No planner-only wall-clock cost model.
 - No bushy join trees, GEQO/random search, parallel-plan search, or adaptive runtime re-planning.
 - No planning-time leaf reads or statistics sampling.

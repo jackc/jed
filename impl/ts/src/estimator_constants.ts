@@ -8,6 +8,14 @@ export const DEFAULT_DISTINCT_VALUES = 200n;
 export const DEFAULT_SRF_ROWS = 1000n;
 export const DEFAULT_VARIABLE_KEY_BYTES = 1n;
 export const JOIN_DP_LIMIT = 8;
+export const STATISTICS_TARGET = 100;
+export const STATISTICS_SAMPLE_ROWS = 30000;
+export const STATISTICS_KMV_HASHES = 4096;
+export const STATISTICS_MCV_ENTRIES = 100;
+export const STATISTICS_HISTOGRAM_BOUNDS = 101;
+export const STATISTICS_MAX_VALUE_BYTES = 128;
+export const STATISTICS_NDV_SCALE_NUMERATOR = 1n;
+export const STATISTICS_NDV_SCALE_DENOMINATOR = 10n;
 
 export const SELECTIVITY_EQUALITY: EstimatorFraction = { numerator: 1n, denominator: 200n };
 export const SELECTIVITY_INEQUALITY: EstimatorFraction = { numerator: 1n, denominator: 3n };
@@ -36,32 +44,34 @@ export const ESTIMATOR_ACCESS_PATH_ORDER = [
   "full",
 ] as const;
 
-export const ESTIMATOR_UNIT_COUNT = 23;
+export const ESTIMATOR_UNIT_COUNT = 24;
 export const UNIT_STORAGE_ROW_READ = 0;
-export const UNIT_PAGE_READ = 1;
-export const UNIT_CONSTRAINT_CHECK = 2;
-export const UNIT_VALUE_COMPRESS = 3;
-export const UNIT_VALUE_DECOMPRESS = 4;
-export const UNIT_DECIMAL_WORK = 5;
-export const UNIT_ROW_PRODUCED = 6;
-export const UNIT_OPERATOR_EVAL = 7;
-export const UNIT_HASH_BUILD = 8;
-export const UNIT_HASH_PROBE = 9;
-export const UNIT_AGGREGATE_ACCUMULATE = 10;
-export const UNIT_CTE_SCAN_ROW = 11;
-export const UNIT_GENERATED_ROW = 12;
-export const UNIT_SEQUENCE_ADVANCE = 13;
-export const UNIT_GIN_ENTRY = 14;
-export const UNIT_GIST_DESCENT = 15;
-export const UNIT_COLLATE = 16;
-export const UNIT_TIMEZONE = 17;
-export const UNIT_REGEX_COMPILE = 18;
-export const UNIT_REGEX_STEP = 19;
-export const UNIT_WINDOW_RESULT = 20;
-export const UNIT_VARLEN_COMPARE = 21;
-export const UNIT_WINDOW_FRAME_STEP = 22;
+export const UNIT_STATISTICS_VALUE = 1;
+export const UNIT_PAGE_READ = 2;
+export const UNIT_CONSTRAINT_CHECK = 3;
+export const UNIT_VALUE_COMPRESS = 4;
+export const UNIT_VALUE_DECOMPRESS = 5;
+export const UNIT_DECIMAL_WORK = 6;
+export const UNIT_ROW_PRODUCED = 7;
+export const UNIT_OPERATOR_EVAL = 8;
+export const UNIT_HASH_BUILD = 9;
+export const UNIT_HASH_PROBE = 10;
+export const UNIT_AGGREGATE_ACCUMULATE = 11;
+export const UNIT_CTE_SCAN_ROW = 12;
+export const UNIT_GENERATED_ROW = 13;
+export const UNIT_SEQUENCE_ADVANCE = 14;
+export const UNIT_GIN_ENTRY = 15;
+export const UNIT_GIST_DESCENT = 16;
+export const UNIT_COLLATE = 17;
+export const UNIT_TIMEZONE = 18;
+export const UNIT_REGEX_COMPILE = 19;
+export const UNIT_REGEX_STEP = 20;
+export const UNIT_WINDOW_RESULT = 21;
+export const UNIT_VARLEN_COMPARE = 22;
+export const UNIT_WINDOW_FRAME_STEP = 23;
 export const ESTIMATOR_UNIT_IDS = [
   "storage_row_read",
+  "statistics_value",
   "page_read",
   "constraint_check",
   "value_compress",
@@ -86,6 +96,7 @@ export const ESTIMATOR_UNIT_IDS = [
   "window_frame_step",
 ] as const;
 export const ESTIMATOR_UNIT_WEIGHTS = [
+  1n,
   1n,
   1n,
   1n,

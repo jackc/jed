@@ -1245,6 +1245,7 @@ export function stmtIsWrite(stmt: Statement): boolean {
     return stmt.analyze && stmtIsWrite(stmt.inner);
   }
   return (
+    stmt.kind === "analyze" ||
     stmt.kind === "createTable" ||
     stmt.kind === "dropTable" ||
     stmt.kind === "alterTable" ||
@@ -1435,6 +1436,10 @@ export type PrivReq = {
 export function collectStmtPrivs(stmt: Statement, req: PrivReq): void {
   const locals = new Set<string>();
   switch (stmt.kind) {
+    case "analyze":
+      req.isDdl = true;
+      req.tables.push({ name: stmt.name, priv: "select" });
+      break;
     case "createTable":
       req.isDdl = true;
       // A temp table's DDL is gated by the temp-scoped split of allowDdl (temp-tables.md §5):
@@ -1782,6 +1787,8 @@ export function exprReadsColumns(e: Expr): boolean {
 // message text is informational — never matched; spec/design/conformance.md §2).
 export function stmtKind(stmt: Statement): string {
   switch (stmt.kind) {
+    case "analyze":
+      return "ANALYZE";
     case "createTable":
       return "CREATE TABLE";
     case "dropTable":

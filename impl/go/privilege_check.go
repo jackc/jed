@@ -22,7 +22,7 @@ func stmtIsWrite(stmt statement) bool {
 	if stmt.Explain != nil {
 		return stmt.Explain.Analyze && stmtIsWrite(*stmt.Explain.Inner)
 	}
-	if stmt.CreateTable != nil || stmt.DropTable != nil || stmt.AlterTable != nil ||
+	if stmt.Analyze != nil || stmt.CreateTable != nil || stmt.DropTable != nil || stmt.AlterTable != nil ||
 		stmt.CreateIndex != nil || stmt.DropIndex != nil ||
 		stmt.CreateType != nil || stmt.DropType != nil ||
 		stmt.CreateSequence != nil || stmt.AlterSequence != nil || stmt.DropSequence != nil ||
@@ -537,6 +537,9 @@ func (db *engine) attachBlockPoison(rows *Rows) *Rows {
 func collectStmtPrivs(stmt statement, req *privReq) {
 	locals := map[string]bool{}
 	switch {
+	case stmt.Analyze != nil:
+		req.isDDL = true
+		req.needTable(stmt.Analyze.Name, PrivSelect)
 	case stmt.CreateTable != nil:
 		req.isDDL = true
 		// A temp table's DDL is gated by the temp-scoped split of allowDDL (temp-tables.md §5):

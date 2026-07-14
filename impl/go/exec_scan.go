@@ -1650,6 +1650,8 @@ func (db *engine) materializeRel(plan *selectPlan, ri int, params []Value, outer
 			return db.jedIndexesRows(rel.srf, meter)
 		case srfJedConstraints:
 			return db.jedConstraintsRows(rel.srf, meter)
+		case srfJedStatistics:
+			return db.jedStatisticsRows(rel.srf, meter)
 		}
 		return nil, nil
 	}

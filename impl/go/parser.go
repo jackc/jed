@@ -112,6 +112,12 @@ func parseSQL(sql string) (statement, error) {
 
 func (p *parser) parseStatement() (statement, error) {
 	switch p.peekKeyword() {
+	case "analyze":
+		analyze, err := p.parseAnalyze()
+		if err != nil {
+			return statement{}, err
+		}
+		return statement{Analyze: analyze}, nil
 	// CREATE / DROP dispatch on the object keyword (TABLE vs [UNIQUE] INDEX — grammar.md
 	// §30; UNIQUE needs no lookahead of its own — after CREATE the next word being UNIQUE
 	// can only be CREATE UNIQUE INDEX).
@@ -229,6 +235,36 @@ func (p *parser) parseStatement() (statement, error) {
 	default:
 		return statement{}, newError(SyntaxError, fmt.Sprintf("unexpected keyword '%s'", p.peekKeyword()))
 	}
+}
+
+// parseAnalyze parses `ANALYZE qualified_table [(identifier [, identifier ...])]`.
+func (p *parser) parseAnalyze() (*analyzeStmt, error) {
+	if err := p.expectKeyword("analyze"); err != nil {
+		return nil, err
+	}
+	db, name, err := p.parseQualifiedTableName()
+	if err != nil {
+		return nil, err
+	}
+	columns := []string{}
+	if p.peek().Kind == tokLParen {
+		p.advance()
+		for {
+			column, err := p.expectIdentifier()
+			if err != nil {
+				return nil, err
+			}
+			columns = append(columns, column)
+			if p.peek().Kind != tokComma {
+				break
+			}
+			p.advance()
+		}
+		if err := p.expect(tokRParen); err != nil {
+			return nil, err
+		}
+	}
+	return &analyzeStmt{Name: name, DB: db, Columns: columns}, nil
 }
 
 // parseBegin parses `BEGIN [TRANSACTION|WORK] [READ ONLY|READ WRITE]` or `START TRANSACTION

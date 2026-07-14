@@ -35,6 +35,7 @@ import type { FkDependent } from "./executor.ts";
 import type { Type } from "./types.ts";
 import { resolveColType } from "./catalog.ts";
 import type { PrivilegeSet } from "./privileges.ts";
+import type { ColumnStatistics } from "./statistics.ts";
 export class Snapshot {
   // txid is the snapshot's version — the commit counter (transactions.md §8; the watermark unit).
   txid: bigint;
@@ -52,6 +53,7 @@ export class Snapshot {
   estimatorIdentity: object = {};
   private estimatorBaseRevision: object = {};
   private estimatorRevisions: Map<string, object> = new Map();
+  statistics: Map<string, Map<number, ColumnStatistics>> = new Map();
   tables: Map<string, Table>;
   // types holds the user-defined composite (row) types, keyed by lowercased name
   // (spec/design/composite.md). A database-level object set, separate from tables; serialized into
@@ -142,6 +144,21 @@ export class Snapshot {
     c.estimatorIdentity = this.estimatorIdentity;
     c.estimatorBaseRevision = this.estimatorBaseRevision;
     c.estimatorRevisions = new Map(this.estimatorRevisions);
+    c.statistics = new Map(
+      [...this.statistics].map(([table, columns]) => [
+        table,
+        new Map(
+          [...columns].map(([column, statistics]) => [
+            column,
+            {
+              ...statistics,
+              mcv: statistics.mcv.slice(),
+              histogram: statistics.histogram.slice(),
+            },
+          ]),
+        ),
+      ]),
+    );
     // The temp domain's paging is shared by reference (one pool per domain), like a store's paging.
     c.storePaging = this.storePaging;
     return c;
@@ -159,6 +176,38 @@ export class Snapshot {
 
   bumpEstimatorRevision(name: string): void {
     this.estimatorRevisions.set(name.toLowerCase(), {});
+  }
+
+  columnStatistics(table: string, column: number): ColumnStatistics | undefined {
+    return this.statistics.get(table.toLowerCase())?.get(column);
+  }
+
+  putColumnStatistics(table: string, column: number, statistics: ColumnStatistics): void {
+    const key = table.toLowerCase();
+    let columns = this.statistics.get(key);
+    if (columns === undefined) {
+      columns = new Map();
+      this.statistics.set(key, columns);
+    }
+    columns.set(column, statistics);
+  }
+
+  markStatisticsStale(table: string): void {
+    const columns = this.statistics.get(table.toLowerCase());
+    if (columns === undefined) return;
+    for (const statistics of columns.values()) statistics.stale = true;
+  }
+
+  clearStatistics(table: string): void {
+    this.statistics.delete(table.toLowerCase());
+  }
+
+  clearColumnStatistics(table: string, column: number): void {
+    const key = table.toLowerCase();
+    const columns = this.statistics.get(key);
+    if (columns === undefined) return;
+    columns.delete(column);
+    if (columns.size === 0) this.statistics.delete(key);
   }
 
   // gistTreeFor returns the resident GiST R-tree of the named index (lowercased key), or undefined if
@@ -350,6 +399,8 @@ export class Snapshot {
         const cols = indexColumnOrdinals(idx);
         return cols?.some((c) => isSkewed(table.columns[c]!.collation));
       });
+      for (let column = 0; column < table.columns.length; column++)
+        if (isSkewed(table.columns[column]!.collation)) this.clearColumnStatistics(key, column);
       if (!pkSkewed && indexes.length === 0) continue;
       const colls: (Collation | null)[] = table.columns.map((c) =>
         c.collation !== null ? (this.resolveCollation(c.collation) ?? null) : null,
@@ -612,6 +663,7 @@ export class Snapshot {
     this.stores.set(key, st);
     this.tables.set(key, t);
     this.estimatorRevisions.delete(key);
+    this.statistics.delete(key);
   }
 
   // removeTable removes a table's definition, its store, and its indexes' stores (DROP
@@ -699,6 +751,11 @@ export class Snapshot {
         this.stores.delete(oldKey);
         this.stores.set(newKey, store);
       }
+      const statistics = this.statistics.get(oldKey);
+      if (statistics !== undefined) {
+        this.statistics.delete(oldKey);
+        this.statistics.set(newKey, statistics);
+      }
     }
     this.tables.set(newKey, table);
     if (indexRename) {
@@ -739,7 +796,10 @@ export class Snapshot {
     nextRowid: bigint,
     pageSize: number,
   ): void {
+    const key = table.name.toLowerCase();
+    const statistics = this.statistics.get(key);
     this.putTableResolved(table, colTypes, pageSize);
+    if (statistics !== undefined) this.statistics.set(key, statistics);
     const store = this.store(table.name);
     store.bumpRowidTo(nextRowid);
     for (const entry of entries)

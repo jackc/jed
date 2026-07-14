@@ -1,0 +1,276 @@
+# P9 deterministic column statistics (spec/design/statistics.md). ANALYZE is an explicit,
+# transactional write; facts are snapshot state, persist across reopen, and remain available but
+# stale after DML. The integer estimator consumes NULL/NDV/MCV/histogram facts without planning-time
+# leaf reads. jed_statistics is jed-owned introspection and EXPLAIN is jed-owned plan output, so this
+# file is cross-core checked rather than PostgreSQL-oracle imported.
+# requires: maintenance.analyze, introspect.statistics, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.alter_table, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.where_eq, query.comparison_order, query.logical_connectives, expr.in_list, expr.between, expr.case, query.order_by, query.explain, query.qualified_table, session.privileges, session.allow_ddl, types.i32, types.text, types.decimal, types.array, types.jsonb, resource.cost_metering
+
+statement ok
+CREATE TABLE p9_stats (id i32 PRIMARY KEY, skew i32, label text)
+
+statement ok
+CREATE INDEX p9_stats_skew_idx ON p9_stats (skew)
+
+statement ok
+INSERT INTO p9_stats VALUES
+  (1, 0, 'a'), (2, 0, 'bb'), (3, 0, 'ccc'), (4, 0, 'dddd'), (5, 0, 'eeeee'),
+  (6, 0, 'ffffff'), (7, 0, 'ggggggg'), (8, 0, 'hhhhhhhh'),
+  (9, 1, 'iiiiiiiii'), (10, NULL, NULL)
+
+# Before ANALYZE the structural 1/200 equality fallback makes the index cheapest.
+query ITTII nosort
+EXPLAIN SELECT id FROM p9_stats WHERE skew = 0
+----
+0
+Filter
+conjuncts=1
+1
+5
+1
+Scan p9_stats
+Index bound: using p9_stats_skew_idx; touched=2
+1
+3
+
+# Collection is column-selective. For these complete ten-row populations, skew has two MCVs and
+# label has nine; its C-collation comparison keys average seven bytes.
+# cost: 123
+statement ok
+ANALYZE p9_stats (skew, label)
+
+# cost: 4
+query TTIBIIIII nosort
+SELECT table_name, column_name, analyzed_rows, is_stale, null_count, distinct_count,
+       sample_rows, average_width, mcv_count, histogram_count
+FROM jed_statistics ORDER BY column_name
+----
+p9_stats
+label
+10
+false
+1
+9
+10
+7
+9
+0
+p9_stats
+skew
+10
+false
+1
+2
+10
+4
+2
+0
+
+# The 80% MCV makes a full scan cheaper, while the rare value retains the index path.
+query ITTII nosort
+EXPLAIN SELECT id FROM p9_stats WHERE skew = 0
+----
+0
+Filter
+conjuncts=1
+8
+29
+1
+Scan p9_stats
+Full scan; touched=2
+10
+11
+
+query ITTII nosort
+EXPLAIN SELECT id FROM p9_stats WHERE skew = 1
+----
+0
+Filter
+conjuncts=1
+1
+5
+1
+Scan p9_stats
+Index bound: using p9_stats_skew_idx; touched=2
+1
+3
+
+# IN de-duplicates canonically, NULL contributes no TRUE rows, and NOT complements inside the
+# nine-row non-NULL population. The NOT BETWEEN NULL case retains the remaining outward bound.
+query I nosort
+SELECT count(*) FROM p9_stats WHERE skew IN (1, 1, NULL)
+----
+1
+
+query I nosort
+SELECT count(*) FROM p9_stats WHERE NOT (skew >= 1)
+----
+8
+
+query I nosort
+SELECT count(*) FROM p9_stats WHERE skew NOT BETWEEN NULL AND 0
+----
+1
+
+# Even a successful zero-row DML conservatively marks every retained target fact stale.
+statement ok
+DELETE FROM p9_stats WHERE id = 999
+
+query TB nosort
+SELECT column_name, is_stale FROM jed_statistics ORDER BY column_name
+----
+label
+true
+skew
+true
+
+# A selective refresh replaces only label; skew remains stale and available to the estimator.
+statement ok
+ANALYZE main.p9_stats (label)
+
+query TB nosort
+SELECT column_name, is_stale FROM main.jed_statistics ORDER BY column_name
+----
+label
+false
+skew
+true
+
+# Surface errors are deterministic and PostgreSQL-shaped for the supported table/column form.
+statement error 42601
+ANALYZE p9_stats ()
+
+statement error 42701
+ANALYZE p9_stats (skew, skew)
+
+statement error 42703
+ANALYZE p9_stats (missing)
+
+statement error 42P01
+ANALYZE missing_table
+
+statement error 42809
+ANALYZE jed_statistics
+
+# ANALYZE requires both target SELECT and the host's persistent-DDL capability.
+# allow_ddl: off
+statement error 42501
+ANALYZE p9_stats (skew)
+
+# default_privileges: NONE
+# allow_ddl: on
+statement error 42501
+ANALYZE p9_stats (skew)
+
+# jed_statistics is independently SELECT-gated like every catalog relation.
+# default_privileges: NONE
+statement error 42501
+SELECT column_name FROM jed_statistics
+
+# default_privileges: NONE
+# grant: SELECT ON jed_statistics
+query T nosort
+SELECT column_name FROM jed_statistics ORDER BY column_name
+----
+label
+skew
+
+# NoREC: the statistics-selected plan must preserve the unoptimized relation exactly.
+query I nosort
+SELECT count(*) FROM p9_stats WHERE skew = 0
+----
+8
+
+query I nosort
+SELECT count(*) FROM p9_stats WHERE CASE WHEN skew = 0 THEN true ELSE false END
+----
+8
+
+# Catalog-only table/column renames retain facts under their new names, and ADD COLUMN preserves the
+# old ordinal facts without synthesizing one for the new column. A DROP COLUMN/value rewrite clears
+# all table facts because ordinals and stored values changed.
+statement ok
+CREATE TABLE p9_lifecycle (id i32 PRIMARY KEY, v i32, w i32)
+
+statement ok
+INSERT INTO p9_lifecycle VALUES (1, 10, 20)
+
+statement ok
+ANALYZE p9_lifecycle
+
+statement ok
+ALTER TABLE p9_lifecycle RENAME TO p9_lifecycle_renamed
+
+statement ok
+ALTER TABLE p9_lifecycle_renamed RENAME COLUMN v TO value
+
+query TT nosort
+SELECT table_name, column_name FROM jed_statistics
+WHERE table_name = 'p9_lifecycle_renamed' ORDER BY column_name
+----
+p9_lifecycle_renamed
+id
+p9_lifecycle_renamed
+value
+p9_lifecycle_renamed
+w
+
+statement ok
+ALTER TABLE p9_lifecycle_renamed ADD COLUMN extra i32
+
+query T nosort
+SELECT column_name FROM jed_statistics
+WHERE table_name = 'p9_lifecycle_renamed' ORDER BY column_name
+----
+id
+value
+w
+
+statement ok
+ALTER TABLE p9_lifecycle_renamed DROP COLUMN w
+
+query I nosort
+SELECT count(*) FROM jed_statistics WHERE table_name = 'p9_lifecycle_renamed'
+----
+0
+
+# Distribution-ineligible open/JSON types still collect NULL and average-width facts but expose no
+# NDV, MCV, or histogram.
+statement ok
+CREATE TABLE p9_ineligible (id i32 PRIMARY KEY, xs i32[], doc jsonb)
+
+statement ok
+INSERT INTO p9_ineligible VALUES (1, ARRAY[1,2], '{"a":1}'), (2, NULL, NULL)
+
+statement ok
+ANALYZE p9_ineligible (xs, doc)
+
+query TBBII nosort
+SELECT column_name, distinct_count IS NULL, average_width IS NOT NULL, mcv_count, histogram_count
+FROM jed_statistics WHERE table_name = 'p9_ineligible' ORDER BY column_name
+----
+doc
+true
+true
+0
+0
+xs
+true
+true
+0
+0
+
+# Resolved integer/decimal comparisons retain syntactic integer constants in the plan. Statistics
+# key construction widens those constants to decimal before consulting a decimal histogram/MCV.
+statement ok
+CREATE TABLE p9_decimal (id i32 PRIMARY KEY, v decimal)
+
+statement ok
+INSERT INTO p9_decimal VALUES (1, 0.5), (2, 1), (3, 1.5), (4, 2), (5, 2.5)
+
+statement ok
+ANALYZE p9_decimal (v)
+
+query I nosort
+SELECT count(*) FROM p9_decimal WHERE v BETWEEN 1 AND 2.0
+----
+3

@@ -987,6 +987,14 @@ of executing a query** and **abort when a caller-supplied ceiling is exceeded**.
   the fixed prefix. N-way ordered LIMIT materializes the winning left subtree and discounts only the
   final streamed join step. Exact structural ties and the selected plan define error/abort visitation.
   UPDATE/DELETE retain their explicit staged policy until a mutation-specific slice.
+  P9 adds explicit transactional `ANALYZE table [(columns)]`. Each requested column is scanned in
+  storage-key order to collect exact NULL/width facts, a deterministic bounded FNV-priority sample,
+  KMV NDV, MCVs, and equi-depth bounds. Format v29 persists the facts; DML retains and marks them
+  stale, with fixed low-cardinality or proportional high-cardinality NDV scaling against current
+  exact row counts. Planning remains leaf-I/O-free. The facts refine literal/parameter selectivity,
+  equality joins, simple GROUP BY/DISTINCT, and variable-width hash work, are cache-safe and
+  cross-core identical, and are summarized by `jed_statistics`. See
+  `spec/design/statistics.md`; automatic analyze and extended/correlation statistics remain deferred.
 - **Ceiling + abort.** A caller may set a **maximum cost**; the instant accrued cost reaches
   it, execution **aborts deterministically** with a defined error code (registered in
   `spec/errors/`). The abort point is itself deterministic (same query + db + ceiling → same

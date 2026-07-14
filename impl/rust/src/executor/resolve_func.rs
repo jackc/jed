@@ -1748,7 +1748,8 @@ pub(crate) fn stmt_is_write(stmt: &Statement) -> bool {
     }
     matches!(
         stmt,
-        Statement::CreateTable(_)
+        Statement::Analyze(_)
+            | Statement::CreateTable(_)
             | Statement::DropTable(_)
             | Statement::AlterTable(_)
             | Statement::CreateIndex(_)
@@ -1953,6 +1954,10 @@ impl PrivReq {
 pub(crate) fn collect_stmt_privs(stmt: &Statement, req: &mut PrivReq) {
     let locals = HashSet::new();
     match stmt {
+        Statement::Analyze(analyze) => {
+            req.is_ddl = true;
+            req.need_table(&analyze.name, Privilege::Select);
+        }
         Statement::CreateTable(ct) => {
             req.is_ddl = true;
             // A temp table's DDL is gated by the temp-scoped split of `allow_ddl` (temp-tables.md §5):
@@ -2318,6 +2323,7 @@ pub(crate) fn expr_reads_columns(e: &Expr) -> bool {
 /// text is informational — never matched; spec/design/conformance.md §2).
 pub(crate) fn stmt_kind(stmt: &Statement) -> &'static str {
     match stmt {
+        Statement::Analyze(_) => "ANALYZE",
         Statement::CreateTable(_) => "CREATE TABLE",
         Statement::DropTable(_) => "DROP TABLE",
         Statement::AlterTable(_) => "ALTER TABLE",

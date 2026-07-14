@@ -832,6 +832,7 @@ pub(crate) fn rexpr_const_to_value(node: &RExpr) -> Result<Value> {
         RExpr::ConstJson(s) => Value::Json(s.clone()),
         RExpr::ConstJsonPath(s) => Value::JsonPath(s.clone()),
         RExpr::ConstJsonb(n) => Value::Jsonb((**n).clone()),
+        RExpr::ConstRange(range) => Value::Range((**range).clone()),
         _ => return Err(type_error("non-constant array element literal".to_string())),
     })
 }

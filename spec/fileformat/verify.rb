@@ -25,7 +25,8 @@
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 28 # format_version 28: every table catalog entry appends row_count i64 (big-endian
+VERSION = 29 # format_version 29: deterministic per-column statistics use kind-4 catalog entries;
+# format_version 28: every table catalog entry appends row_count i64 (big-endian
 # two's-complement, restricted to nonnegative values) after root_data_page. The reference derives it
 # from the declarative rows and rejects `(root == 0) != (count == 0)` on decode. format_version 27:
 # partial-index predicates (indexes.md §9) — the per-index index_flags
@@ -292,6 +293,34 @@ ROW_COUNT_TABLE = {
   columns: [col("id", "i32", pk: true)],
   rows: [[1], [2], [3]]
 }.freeze
+
+# v29 statistics catalog fixture. `fresh` is analyzed at its current four-row state; `stale` was
+# analyzed at three rows and then received one insert, so its exact stored facts remain intact with
+# the stale bit set. Small complete samples place every distinct non-NULL value in the MCV list.
+STATISTICS_TABLES = [
+  { name: "fresh",
+    columns: [col("id", "i32", pk: true), col("v", "text")],
+    rows: [[1, "a"], [2, "a"], [3, "b"], [4, nil]],
+    statistics: [
+      { column: 0, stale: false, analyzed_rows: 4, null_count: 0, width_sum: 16,
+        distinct_count: 4, sample_rows: 4, sample_nonnull_rows: 4,
+        mcv: [[1, 1], [2, 1], [3, 1], [4, 1]], histogram: [] },
+      { column: 1, stale: false, analyzed_rows: 4, null_count: 1, width_sum: 9,
+        distinct_count: 2, sample_rows: 4, sample_nonnull_rows: 3,
+        mcv: [["a", 2], ["b", 1]], histogram: [] }
+    ] },
+  { name: "stale",
+    columns: [col("id", "i32", pk: true), col("v", "text")],
+    rows: [[1, "x"], [2, "x"], [3, nil], [4, "y"]],
+    statistics: [
+      { column: 0, stale: true, analyzed_rows: 3, null_count: 0, width_sum: 12,
+        distinct_count: 3, sample_rows: 3, sample_nonnull_rows: 3,
+        mcv: [[1, 1], [2, 1], [3, 1]], histogram: [] },
+      { column: 1, stale: true, analyzed_rows: 3, null_count: 1, width_sum: 6,
+        distinct_count: 1, sample_rows: 3, sample_nonnull_rows: 2,
+        mcv: [["x", 2]], histogram: [] }
+    ] }
+].freeze
 
 # A table whose rows force a HEIGHT-2 tree (an interior node whose children are themselves
 # interior nodes) at page_size 256. A wide text padding column makes each record ~66 bytes, so a
@@ -1180,6 +1209,7 @@ FIXTURES = [
   { file: "one_table_empty.jed", page_size: 256,
     tables: [{ name: "t", columns: [col("id", "i32", pk: true), col("v", "i16")], rows: [] }] },
   { file: "row_count_table.jed", page_size: 256, tables: [ROW_COUNT_TABLE] },
+  { file: "statistics_table.jed", page_size: 256, tables: STATISTICS_TABLES },
   { file: "pk_table.jed",        page_size: 256, tables: [PK_TABLE] },
   { file: "text_table.jed",      page_size: 256, tables: [TEXT_TABLE] },
   { file: "varchar_table.jed",   page_size: 256, tables: [VARCHAR_TABLE] },
@@ -1888,6 +1918,37 @@ def table_entry_bytes(table, root_data_page, index_roots, row_count)
 
   out << [row_count].pack("q>")
   out
+end
+
+# Serialize one table's v29 kind-4 column-statistics groups. The caller already emits tables in name
+# order; columns are sorted here, and each group is summary, MCV ordinals, then histogram ordinals.
+def statistics_entries(table)
+  (table[:statistics] || []).sort_by { |s| s[:column] }.flat_map do |s|
+    col = table[:columns].fetch(s[:column])
+    distribution = !s[:distinct_count].nil?
+    summary = +"\x04\x00".b
+    summary << u16(table[:name].bytesize) << table[:name].b << u16(s[:column])
+    summary << [(s[:stale] ? 1 : 0) | (distribution ? 2 : 0)].pack("C")
+    summary << [s[:analyzed_rows], s[:null_count], s[:width_sum], s[:distinct_count] || 0].pack("q>q>q>q>")
+    summary << u32(s[:sample_rows]) << u32(s[:sample_nonnull_rows])
+    summary << u16(s[:mcv].size) << u16(s[:histogram].size)
+    out = [summary]
+    s[:mcv].each_with_index do |(value, frequency), ordinal|
+      encoded = encode_value(col[:type], value)
+      item = +"\x04\x01".b
+      item << u16(table[:name].bytesize) << table[:name].b << u16(s[:column])
+      item << u16(ordinal) << u32(frequency) << u16(encoded.bytesize) << encoded
+      out << item
+    end
+    s[:histogram].each_with_index do |value, ordinal|
+      encoded = encode_value(col[:type], value)
+      item = +"\x04\x02".b
+      item << u16(table[:name].bytesize) << table[:name].b << u16(s[:column])
+      item << u16(ordinal) << u16(encoded.bytesize) << encoded
+      out << item
+    end
+    out
+  end
 end
 
 # Serialize a composite-type catalog entry's BODY (after the entry_kind=1 byte), v9: name, field
@@ -2771,6 +2832,7 @@ def build_image(types, sequences, tables, page_size, collations = [])
   sorted.each_with_index do |t, ti|
     cat_entries << ("\x00".b + table_entry_bytes(t, root_data[ti], index_roots[ti], t[:rows].length))
   end
+  sorted.each { |t| cat_entries.concat(statistics_entries(t)) }
   cat_groups = pack(cat_entries.map(&:bytesize), cap)
   page_count = cat_root + cat_groups.size
 
@@ -3526,6 +3588,70 @@ def read_tree_keys(image, ps, root_page)
   keys
 end
 
+def decode_statistics_entry(buf, pos, tables, statistics, expected)
+  kb, pos = take(buf, pos, 1)
+  kind = kb.getbyte(0)
+  name, pos = take_str(buf, pos)
+  cb, pos = take(buf, pos, 2)
+  column = cb.unpack1("n")
+  table = tables.find { |t| t[:name].downcase == name.downcase } or raise "statistics reference unknown table"
+  raise "statistics reference unknown column" if column >= table[:columns].size
+
+  key = [name.downcase, column]
+  if kind.zero?
+    raise "duplicate statistics summary" if expected.key?(key)
+    fb, pos = take(buf, pos, 1)
+    flags = fb.getbyte(0)
+    raise "reserved statistics flag" unless (flags & ~3).zero?
+    raw, pos = take(buf, pos, 32)
+    analyzed, null_count, width_sum, distinct = raw.unpack("q>q>q>q>")
+    sb, pos = take(buf, pos, 8)
+    sample_rows, sample_nonnull = sb.unpack("NN")
+    counts, pos = take(buf, pos, 4)
+    mcv_count, histogram_count = counts.unpack("nn")
+    distribution = (flags & 2) != 0
+    raise "invalid statistics summary" if analyzed.negative? || null_count.negative? || null_count > analyzed ||
+                                          width_sum.negative? || sample_rows > [analyzed, 30_000].min ||
+                                          sample_nonnull > sample_rows || mcv_count > 100 || histogram_count > 101 ||
+                                          (!histogram_count.zero? && histogram_count < 2) ||
+                                          (distribution ? !distinct.between?(0, analyzed - null_count) : !distinct.zero?)
+    item = { table: name, column: column, stale: (flags & 1) != 0, analyzed_rows: analyzed,
+             null_count: null_count, width_sum: width_sum,
+             distinct_count: distribution ? distinct : nil, sample_rows: sample_rows,
+             sample_nonnull_rows: sample_nonnull, mcv: [], histogram: [] }
+    statistics << item
+    expected[key] = [mcv_count, histogram_count]
+    return pos
+  end
+
+  item = statistics.find { |s| s[:table].downcase == name.downcase && s[:column] == column } or
+    raise "statistics item precedes summary"
+  counts = expected.fetch(key)
+  ob, pos = take(buf, pos, 2)
+  ordinal = ob.unpack1("n")
+  if kind == 1
+    fb, pos = take(buf, pos, 4)
+    frequency = fb.unpack1("N")
+    raise "invalid statistics MCV ordinal/frequency" unless ordinal == item[:mcv].size &&
+                                                              ordinal < counts[0] &&
+                                                              frequency.between?(1, item[:sample_nonnull_rows])
+  elsif kind != 2
+    raise "unknown statistics entry kind"
+  elsif ordinal != item[:histogram].size || ordinal >= counts[1]
+    raise "invalid statistics histogram ordinal"
+  end
+  lb, pos = take(buf, pos, 2)
+  length = lb.unpack1("n")
+  raise "invalid statistics value length" unless length.between?(1, 128)
+  encoded, pos = take(buf, pos, length)
+  value, value_pos = decode_value(table[:columns][column][:type], encoded, 0)
+  raise "noncanonical statistics value" unless value_pos == encoded.bytesize &&
+                                               encode_value(table[:columns][column][:type], value) == encoded &&
+                                               !value.nil?
+  kind == 1 ? item[:mcv] << [value, frequency] : item[:histogram] << value
+  pos
+end
+
 def decode_image(image)
   ps = image.byteslice(8, 4).unpack1("N")
   meta = select_meta(image, ps)
@@ -3533,6 +3659,8 @@ def decode_image(image)
   sequences = []
   collations = []
   tables = []
+  statistics = []
+  statistics_expected = {}
   # Composite types in scope for the recursive value codec; populated as the (types-first) catalog
   # is read, so every composite a table row references is registered before its rows are decoded.
   $ctypes = {}
@@ -3561,6 +3689,10 @@ def decode_image(image)
         collations << c
         next
       end
+      if kind == 4
+        pos = decode_statistics_entry(pg[:payload], pos, tables, statistics, statistics_expected)
+        next
+      end
       raise "unknown catalog entry kind #{kind}" unless kind.zero?
 
       entry, pos = decode_table_entry(pg[:payload], pos)
@@ -3579,7 +3711,13 @@ def decode_image(image)
     end
     cat = pg[:next_page]
   end
-  { types: types, sequences: sequences, collations: collations, tables: tables }
+  statistics_expected.each do |(table, column), (mcv_count, histogram_count)|
+    item = statistics.find { |s| s[:table].downcase == table && s[:column] == column }
+    raise "incomplete statistics group" unless item && item[:mcv].size == mcv_count &&
+                                               item[:histogram].size == histogram_count
+  end
+  { types: types, sequences: sequences, collations: collations, tables: tables,
+    statistics: statistics }
 end
 
 # Decode a sequence catalog entry's body (inverse of sequence_entry_bytes); the caller has consumed
@@ -3619,6 +3757,12 @@ end
 def expected_collations(fx)
   (fx[:collations] || []).sort_by { |c| c[:name] }
                          .map { |c| { name: c[:name], default: !!c[:default], unicode: c[:unicode], cldr: c[:cldr], desc: c[:desc] } }
+end
+
+def expected_statistics(fx)
+  fx[:tables].sort_by { |t| t[:name].downcase }.flat_map do |t|
+    (t[:statistics] || []).sort_by { |s| s[:column] }.map { |s| { table: t[:name], **s } }
+  end
 end
 
 # The composite-type content a fixture should decode to (name-sorted, normalized fields).
@@ -3793,6 +3937,10 @@ def verify
       unless content_equal?(c, want_colls[i])
         fail!("#{fx[:file]}: collation #{i} mismatch\n  got:  #{c.inspect}\n  want: #{want_colls[i].inspect}")
       end
+    end
+    want_statistics = expected_statistics(fx)
+    unless content_equal?(decoded[:statistics], want_statistics)
+      fail!("#{fx[:file]}: statistics mismatch\n  got:  #{decoded[:statistics].inspect}\n  want: #{want_statistics.inspect}")
     end
   end
 

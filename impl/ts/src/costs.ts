@@ -9,6 +9,7 @@
 // bigint for i64 parity with the Rust/Go cores (a number is f64 — CLAUDE.md §8).
 export interface CostSchedule {
   storageRowRead: bigint;
+  statisticsValue: bigint;
   pageRead: bigint;
   constraintCheck: bigint;
   valueCompress: bigint;
@@ -36,6 +37,7 @@ export interface CostSchedule {
 // The canonical cost schedule — weights accrued per unit during query execution.
 export const COSTS: CostSchedule = {
   storageRowRead: 1n,
+  statisticsValue: 1n,
   pageRead: 1n,
   constraintCheck: 1n,
   valueCompress: 1n,

@@ -65,9 +65,15 @@ impl Engine {
     /// statement. Session temp plans remain uncacheable and carry no signature (estimator.md §6).
     pub(crate) fn mark_estimator_mutation(&mut self, scope: Option<&str>, table: &str) {
         let database = match scope {
-            None if self.is_temp_table(table) => return,
+            None if self.is_temp_table(table) => {
+                self.temp_working_mut().mark_statistics_stale(table);
+                return;
+            }
             None => "main".to_string(),
-            Some(s) if s.eq_ignore_ascii_case("temp") => return,
+            Some(s) if s.eq_ignore_ascii_case("temp") => {
+                self.temp_working_mut().mark_statistics_stale(table);
+                return;
+            }
             Some(s) => s.to_ascii_lowercase(),
         };
         let key = (database.clone(), table.to_ascii_lowercase());
@@ -75,10 +81,13 @@ impl Engine {
             return;
         }
         if database == "main" {
-            self.working_mut().bump_estimator_revision(table);
+            let snapshot = self.working_mut();
+            snapshot.bump_estimator_revision(table);
+            snapshot.mark_statistics_stale(table);
         } else {
-            self.attach_write_snap(&database)
-                .bump_estimator_revision(table);
+            let snapshot = self.attach_write_snap(&database);
+            snapshot.bump_estimator_revision(table);
+            snapshot.mark_statistics_stale(table);
         }
     }
 
@@ -110,6 +119,55 @@ impl Engine {
             .iter()
             .map(|c| c.collation.as_ref().and_then(|n| snap.resolve_collation(n)))
             .collect()
+    }
+
+    /// The relation-owning read snapshot for planner/ANALYZE metadata. An unqualified relation
+    /// follows the same temp-first rule as `table_scoped`/`store_scoped`.
+    pub(crate) fn relation_snap(&self, scope: Option<&str>, table: &str) -> &Snapshot {
+        match scope {
+            Some(scope) => self
+                .snap_for_scope(scope)
+                .expect("database qualifier resolved upstream"),
+            None if self.temp_read_snap().table(table).is_some() => self.temp_read_snap(),
+            None => self.read_snap(),
+        }
+    }
+
+    /// Resolve frozen column collations in the same database scope as the owning relation.
+    pub(crate) fn column_collations_scoped(
+        &self,
+        scope: Option<&str>,
+        table: &str,
+        columns: &[Column],
+    ) -> Vec<Option<std::sync::Arc<Collation>>> {
+        let snap = self.relation_snap(scope, table);
+        columns
+            .iter()
+            .map(|column| {
+                column
+                    .collation
+                    .as_ref()
+                    .and_then(|name| snap.resolve_collation(name))
+            })
+            .collect()
+    }
+
+    pub(crate) fn column_statistics_scoped(
+        &self,
+        scope: Option<&str>,
+        table: &str,
+        column: usize,
+    ) -> Option<&ColumnStatistics> {
+        let snap = self.relation_snap(scope, table);
+        let definition = snap.table(table)?.columns.get(column)?;
+        if definition
+            .collation
+            .as_deref()
+            .is_some_and(|name| snap.collation_skew(name).is_some())
+        {
+            return None;
+        }
+        snap.column_statistics(table, column)
     }
 
     /// Refuse a WRITE that would maintain a collated B-tree under a **version-skewed** collation

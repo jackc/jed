@@ -8,6 +8,7 @@
 /// The deterministic cost-unit weights, mirroring spec/cost/schedule.toml.
 pub struct CostSchedule {
     pub storage_row_read: i64,
+    pub statistics_value: i64,
     pub page_read: i64,
     pub constraint_check: i64,
     pub value_compress: i64,
@@ -35,6 +36,7 @@ pub struct CostSchedule {
 /// The canonical cost schedule — weights accrued per unit during query execution.
 pub const COSTS: CostSchedule = CostSchedule {
     storage_row_read: 1,
+    statistics_value: 1,
     page_read: 1,
     constraint_check: 1,
     value_compress: 1,

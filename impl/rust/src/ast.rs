@@ -6,6 +6,7 @@ use crate::decimal::Decimal;
 /// A parsed top-level statement.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Statement {
+    Analyze(Analyze),
     CreateTable(CreateTable),
     DropTable(DropTable),
     AlterTable(AlterTable),
@@ -55,6 +56,16 @@ pub enum Statement {
     /// `ROLLBACK [TRANSACTION|WORK]` — discard the open block's working set and return to
     /// autocommit; a `ROLLBACK` with no open block is a no-op success (transactions.md §4.2).
     Rollback,
+}
+
+/// `ANALYZE table [(column, ...)]` (spec/design/statistics.md). An empty `columns` vector means all
+/// columns. ANALYZE is a transactional write even though it only derives catalog statistics from
+/// existing rows.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Analyze {
+    pub name: String,
+    pub db: Option<String>,
+    pub columns: Vec<String>,
 }
 
 /// `ALTER TABLE` slices 1-5 (spec/design/alter.md): one standalone rename or a comma-separated

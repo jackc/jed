@@ -22,9 +22,11 @@ import {
   create,
   Engine,
   execute,
+  loadEngine,
   loadUnicodeData,
   open,
   render,
+  toImage,
 } from "../src/tooling.ts";
 import { specPath } from "./tomlmini.ts";
 import { errCode } from "./util.ts";
@@ -290,6 +292,7 @@ test("a version-skewed collation blocks writes but reads still work", () => {
   const db = new Engine();
   exec(db, `CREATE TABLE t (x text COLLATE "unicode" PRIMARY KEY)`);
   exec(db, `INSERT INTO t VALUES ('b'), ('a')`);
+  exec(db, `ANALYZE t (x)`);
   exec(db, `INSERT INTO t VALUES ('c')`); // Full → succeeds
   assert.ok(db.collations().every((c) => c.verdict === "full"));
 
@@ -333,13 +336,18 @@ test("upgradeCollations clears the skew", () => {
   const db = new Engine();
   exec(db, `CREATE TABLE t (x text COLLATE "unicode" PRIMARY KEY)`);
   exec(db, `INSERT INTO t VALUES ('b'), ('a')`);
+  exec(db, `ANALYZE t (x)`);
   const loaded = loadedCollation("unicode")!;
   db.committed.collations.set("unicode", { ...loaded, unicodeVersion: "0.0.0" });
+  const reopened = loadEngine(toImage(db, 8192, 1n));
+  assert.ok(reopened.committed.columnStatistics("t", 0));
+  assert.equal(reopened.estimatorColumnStatistics(undefined, "t", 0), undefined);
 
-  assert.equal(db.upgradeCollations(), 1); // one collation re-pinned
-  const uni = db.collations().find((c) => c.name === "unicode");
+  assert.equal(reopened.upgradeCollations(), 1); // one collation re-pinned
+  const uni = reopened.collations().find((c) => c.name === "unicode");
   assert.equal(uni!.verdict, "full");
   assert.equal(uni!.unicodeVersion, loaded.unicodeVersion);
-  exec(db, `INSERT INTO t VALUES ('c')`); // writable after upgrade
-  assert.equal(db.upgradeCollations(), 0); // idempotent no-op
+  assert.equal(reopened.committed.columnStatistics("t", 0), undefined);
+  exec(reopened, `INSERT INTO t VALUES ('c')`); // writable after upgrade
+  assert.equal(reopened.upgradeCollations(), 0); // idempotent no-op
 });

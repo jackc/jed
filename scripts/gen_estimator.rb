@@ -56,6 +56,14 @@ def rust_file(data, units)
     pub const DEFAULT_SRF_ROWS: i64 = #{data.fetch('default_srf_rows')};
     pub const DEFAULT_VARIABLE_KEY_BYTES: i64 = #{data.fetch('default_variable_key_bytes')};
     pub const JOIN_DP_LIMIT: usize = #{data.fetch('join_dp_limit')};
+    pub const STATISTICS_TARGET: usize = #{data.fetch('statistics_target')};
+    pub const STATISTICS_SAMPLE_ROWS: usize = #{data.fetch('statistics_sample_rows')};
+    pub const STATISTICS_KMV_HASHES: usize = #{data.fetch('statistics_kmv_hashes')};
+    pub const STATISTICS_MCV_ENTRIES: usize = #{data.fetch('statistics_mcv_entries')};
+    pub const STATISTICS_HISTOGRAM_BOUNDS: usize = #{data.fetch('statistics_histogram_bounds')};
+    pub const STATISTICS_MAX_VALUE_BYTES: usize = #{data.fetch('statistics_max_value_bytes')};
+    pub const STATISTICS_NDV_SCALE_NUMERATOR: i64 = #{data.fetch('statistics_ndv_scale_numerator')};
+    pub const STATISTICS_NDV_SCALE_DENOMINATOR: i64 = #{data.fetch('statistics_ndv_scale_denominator')};
 
     #{fractions}
 
@@ -107,6 +115,14 @@ def go_file(data, units)
     \tdefaultSRFRows          int64 = #{data.fetch('default_srf_rows')}
     \tdefaultVariableKeyBytes int64 = #{data.fetch('default_variable_key_bytes')}
     \tjoinDPLimit                   = #{data.fetch('join_dp_limit')}
+    \tstatisticsTarget              = #{data.fetch('statistics_target')}
+    \tstatisticsSampleRows          = #{data.fetch('statistics_sample_rows')}
+    \tstatisticsKMVHashes           = #{data.fetch('statistics_kmv_hashes')}
+    \tstatisticsMCVEntries          = #{data.fetch('statistics_mcv_entries')}
+    \tstatisticsHistogramBounds     = #{data.fetch('statistics_histogram_bounds')}
+    \tstatisticsMaxValueBytes       = #{data.fetch('statistics_max_value_bytes')}
+    \tstatisticsNDVScaleNumerator   = #{data.fetch('statistics_ndv_scale_numerator')}
+    \tstatisticsNDVScaleDenominator = #{data.fetch('statistics_ndv_scale_denominator')}
     )
 
     #{fractions}
@@ -157,6 +173,14 @@ def ts_file(data, units)
     export const DEFAULT_SRF_ROWS = #{data.fetch('default_srf_rows')}n;
     export const DEFAULT_VARIABLE_KEY_BYTES = #{data.fetch('default_variable_key_bytes')}n;
     export const JOIN_DP_LIMIT = #{data.fetch('join_dp_limit')};
+    export const STATISTICS_TARGET = #{data.fetch('statistics_target')};
+    export const STATISTICS_SAMPLE_ROWS = #{data.fetch('statistics_sample_rows')};
+    export const STATISTICS_KMV_HASHES = #{data.fetch('statistics_kmv_hashes')};
+    export const STATISTICS_MCV_ENTRIES = #{data.fetch('statistics_mcv_entries')};
+    export const STATISTICS_HISTOGRAM_BOUNDS = #{data.fetch('statistics_histogram_bounds')};
+    export const STATISTICS_MAX_VALUE_BYTES = #{data.fetch('statistics_max_value_bytes')};
+    export const STATISTICS_NDV_SCALE_NUMERATOR = #{data.fetch('statistics_ndv_scale_numerator')}n;
+    export const STATISTICS_NDV_SCALE_DENOMINATOR = #{data.fetch('statistics_ndv_scale_denominator')}n;
 
     #{fractions}
 

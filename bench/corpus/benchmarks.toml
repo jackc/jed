@@ -370,6 +370,83 @@ setup_sql = [
   "INSERT INTO p8_j9_driver SELECT g, g * 47 FROM generate_series(1, 20) AS g"
 ]
 
+# P9 column statistics. Uniform lanes retain the selective index plan before/after ANALYZE; skewed
+# lanes expose the intended plan flip for a 90%-common value. Each pair returns the same count and
+# differs only by the explicit collection step, so native-core checksums remain directly comparable.
+[[bench]]
+name = "statistics_uniform_before"
+description = "P9 uniform distribution before ANALYZE: row-count fallback selects the secondary index"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT count(*) FROM p9_uniform WHERE v = 1"
+warmup = 2
+iterations = 20
+seed = 4268
+expect_rows_per_iter = 1
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS p9_uniform",
+  "CREATE TABLE p9_uniform (id bigint PRIMARY KEY, v bigint)",
+  "INSERT INTO p9_uniform SELECT g, (g - 1) % 500 FROM generate_series(1, 50000) AS g",
+  "CREATE INDEX p9_uniform_v_idx ON p9_uniform (v)"
+]
+
+[[bench]]
+name = "statistics_uniform_after"
+description = "P9 uniform distribution after ANALYZE: NDV preserves the selective secondary-index plan"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT count(*) FROM p9_uniform WHERE v = 1"
+warmup = 2
+iterations = 20
+seed = 4269
+expect_rows_per_iter = 1
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS p9_uniform",
+  "CREATE TABLE p9_uniform (id bigint PRIMARY KEY, v bigint)",
+  "INSERT INTO p9_uniform SELECT g, (g - 1) % 500 FROM generate_series(1, 50000) AS g",
+  "CREATE INDEX p9_uniform_v_idx ON p9_uniform (v)",
+  "ANALYZE p9_uniform (v)"
+]
+
+[[bench]]
+name = "statistics_skew_before"
+description = "P9 90%-skewed value before ANALYZE: fallback chooses an expensive secondary-index path"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT count(*) FROM p9_skew WHERE v = 0"
+warmup = 1
+iterations = 10
+seed = 4270
+expect_rows_per_iter = 1
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS p9_skew",
+  "CREATE TABLE p9_skew (id bigint PRIMARY KEY, v bigint)",
+  "INSERT INTO p9_skew SELECT g, CASE WHEN g <= 45000 THEN 0 ELSE g END FROM generate_series(1, 50000) AS g",
+  "CREATE INDEX p9_skew_v_idx ON p9_skew (v)"
+]
+
+[[bench]]
+name = "statistics_skew_after"
+description = "P9 90%-skewed value after ANALYZE: MCV evidence selects the cheaper full scan"
+dataset = "scratch"
+kind = "query"
+sql = "SELECT count(*) FROM p9_skew WHERE v = 0"
+warmup = 1
+iterations = 10
+seed = 4271
+expect_rows_per_iter = 1
+engines = ["jed", "postgres"]
+setup_sql = [
+  "DROP TABLE IF EXISTS p9_skew",
+  "CREATE TABLE p9_skew (id bigint PRIMARY KEY, v bigint)",
+  "INSERT INTO p9_skew SELECT g, CASE WHEN g <= 45000 THEN 0 ELSE g END FROM generate_series(1, 50000) AS g",
+  "CREATE INDEX p9_skew_v_idx ON p9_skew (v)",
+  "ANALYZE p9_skew (v)"
+]
+
 [[bench]]
 name = "secondary_lookup"
 description = "Secondary-index equality lookup on 1M rows (~10 rows per customer)"

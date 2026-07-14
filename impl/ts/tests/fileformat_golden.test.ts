@@ -66,6 +66,18 @@ function rowCountTableDB(): Engine {
   return db;
 }
 
+function statisticsTableDB(): Engine {
+  const db = goldenDb();
+  run(db, "CREATE TABLE fresh (id i32 PRIMARY KEY, v text)");
+  run(db, "CREATE TABLE stale (id i32 PRIMARY KEY, v text)");
+  run(db, "INSERT INTO fresh VALUES (1, 'a'), (2, 'a'), (3, 'b'), (4, NULL)");
+  run(db, "INSERT INTO stale VALUES (1, 'x'), (2, 'x'), (3, NULL)");
+  run(db, "ANALYZE fresh");
+  run(db, "ANALYZE stale");
+  run(db, "INSERT INTO stale VALUES (4, 'y')");
+  return db;
+}
+
 // compositePKTableDB has a COMPOSITE primary key (constraints.md §3) — the stored key is
 // the concatenation of the members' encodings (4-byte i32 then 2-byte i16,
 // encoding.md §2.3). Rows insert in ascending tuple order (the tree shape is
@@ -921,6 +933,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "compressed_table.jed", build: compressedTableDB },
     { name: "one_table_empty.jed", build: oneTableEmptyDB },
     { name: "row_count_table.jed", build: rowCountTableDB },
+    { name: "statistics_table.jed", build: statisticsTableDB },
     { name: "pk_table.jed", build: pkTableDB },
     { name: "text_table.jed", build: textTableDB },
     { name: "varchar_table.jed", build: varcharTableDB },
@@ -1214,6 +1227,33 @@ test("table row-count root invariant is rejected", () => {
   assert.throws(
     () => loadEngine(image),
     (e: unknown) => e instanceof Error && e.message.startsWith("XX001"),
+  );
+});
+
+test("statistics semantic corruption is rejected", () => {
+  const image = fixture("statistics_table.jed");
+  // kind=4, summary=0, name="fresh", column=0, flags=distribution. Refresh the catalog page CRC so
+  // the reserved flag reaches the statistics decoder instead of failing at the checksum guard.
+  const pattern = Uint8Array.of(4, 0, 0, 5, 102, 114, 101, 115, 104, 0, 0, 2);
+  const matches: number[] = [];
+  for (let i = 0; i <= image.length - pattern.length; i++) {
+    if (pattern.every((byte, j) => image[i + j] === byte)) matches.push(i);
+  }
+  assert.equal(matches.length, 1, "locate one statistics summary");
+  const flags = matches[0]! + pattern.length - 1;
+  image[flags] = 0x80;
+  const pageStart = Math.floor(flags / GOLDEN_PAGE_SIZE) * GOLDEN_PAGE_SIZE;
+  const covered = new Uint8Array(GOLDEN_PAGE_SIZE - 4);
+  covered.set(image.subarray(pageStart, pageStart + 12), 0);
+  covered.set(image.subarray(pageStart + 16, pageStart + GOLDEN_PAGE_SIZE), 12);
+  new DataView(image.buffer, image.byteOffset, image.byteLength).setUint32(
+    pageStart + 12,
+    crc32Ieee(covered),
+    false,
+  );
+  assert.throws(
+    () => loadEngine(image),
+    (error: unknown) => error instanceof Error && error.message.startsWith("XX001"),
   );
 });
 

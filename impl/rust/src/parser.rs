@@ -6,14 +6,14 @@
 
 use crate::ast::{
     AlterColumnAction, AlterColumnKind, AlterConstraintDef, AlterSeqAction, AlterSequence,
-    AlterTable, AlterTableAction, AlterTableEdit, Assignment, BinaryOp, CheckDef, ColumnDef,
-    ConflictAction, ConflictTarget, CreateIndex, CreateSequence, CreateTable, CreateType, Cte,
-    CteBody, DefaultDef, Delete, DropIndex, DropSequence, DropTable, DropType, ExcludeDef, Expr,
-    ForeignKeyDef, GroupItem, IdentitySpec, IndexKeyElem, IndexPredicate, Insert, InsertSource,
-    InsertValue, JoinClause, JoinKind, JsonOnBehavior, JsonPredicateKind, JsonTable, JsonWrapper,
-    JtColumn, Literal, OnConflict, OrderKey, Overriding, QueryExpr, RefAction, Select, SelectItem,
-    SelectItems, SeqOptions, SetOp, SetOpKind, Statement, SubscriptSpec, TableRef, TypeFieldDef,
-    TypeMod, UnaryOp, UniqueDef, Update, WindowDef, WithExpr, WithQuery,
+    AlterTable, AlterTableAction, AlterTableEdit, Analyze, Assignment, BinaryOp, CheckDef,
+    ColumnDef, ConflictAction, ConflictTarget, CreateIndex, CreateSequence, CreateTable,
+    CreateType, Cte, CteBody, DefaultDef, Delete, DropIndex, DropSequence, DropTable, DropType,
+    ExcludeDef, Expr, ForeignKeyDef, GroupItem, IdentitySpec, IndexKeyElem, IndexPredicate, Insert,
+    InsertSource, InsertValue, JoinClause, JoinKind, JsonOnBehavior, JsonPredicateKind, JsonTable,
+    JsonWrapper, JtColumn, Literal, OnConflict, OrderKey, Overriding, QueryExpr, RefAction, Select,
+    SelectItem, SelectItems, SeqOptions, SetOp, SetOpKind, Statement, SubscriptSpec, TableRef,
+    TypeFieldDef, TypeMod, UnaryOp, UniqueDef, Update, WindowDef, WithExpr, WithQuery,
 };
 use crate::ast::{FrameBound, FrameExclusion, FrameMode, WindowFrame, WindowOrderKey};
 use crate::decimal::Decimal;
@@ -98,6 +98,7 @@ impl Parser {
     fn parse_statement(&mut self) -> Result<Statement> {
         // Dispatch on the leading keyword. Remaining productions land in Phases D–E.
         match self.peek_keyword().as_deref() {
+            Some("analyze") => Ok(Statement::Analyze(self.parse_analyze()?)),
             // CREATE / DROP dispatch on the object keyword (TABLE vs [UNIQUE] INDEX —
             // grammar.md §30; UNIQUE needs no lookahead of its own — after CREATE the next
             // word being UNIQUE can only be CREATE UNIQUE INDEX).
@@ -151,6 +152,25 @@ impl Parser {
             Some(other) => Err(syntax(format!("unexpected keyword '{other}'"))),
             None => Err(syntax("expected a SQL statement")),
         }
+    }
+
+    /// Parse `ANALYZE qualified_table [(identifier [, identifier ...])]`.
+    fn parse_analyze(&mut self) -> Result<Analyze> {
+        self.expect_keyword("analyze")?;
+        let (db, name) = self.parse_qualified_table_name()?;
+        let mut columns = Vec::new();
+        if matches!(self.peek(), Token::LParen) {
+            self.advance();
+            loop {
+                columns.push(self.expect_identifier()?);
+                if !matches!(self.peek(), Token::Comma) {
+                    break;
+                }
+                self.advance();
+            }
+            self.expect(&Token::RParen)?;
+        }
+        Ok(Analyze { name, db, columns })
     }
 
     /// `BEGIN [TRANSACTION|WORK] [READ ONLY|READ WRITE]` or `START TRANSACTION [READ ONLY|READ

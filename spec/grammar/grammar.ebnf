@@ -54,6 +54,7 @@ sql_statement  ::= create_table
                  | query_statement
                  | update
                  | delete
+                 | analyze
                  | explain
                  | begin
                  | commit
@@ -68,6 +69,12 @@ sql_statement  ::= create_table
  * reports its actual accrued cost + row count. */
 explain        ::= "EXPLAIN" "ANALYZE"? explainable
 explainable    ::= query_statement | insert | update | delete
+
+/* Deterministic column-statistics collection (../design/statistics.md). One target per statement;
+ * an omitted column list means every declared column. Database-wide/multi-target ANALYZE and PG's
+ * option list are deferred. ANALYZE is positional and non-reserved, so it remains a legal identifier
+ * everywhere another production expects one. */
+analyze        ::= "ANALYZE" qualified_table ("(" identifier ("," identifier)* ")")?
 
 /* --- DDL ----------------------------------------------------------------- */
 

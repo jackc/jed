@@ -970,9 +970,7 @@ func (db *engine) executeInsert(ins *insert, params []Value, ctx cteCtx) (outcom
 		if err != nil {
 			return outcome{}, err
 		}
-		if affected > 0 {
-			db.markEstimatorMutation(ins.DB, ins.Table)
-		}
+		db.markEstimatorMutation(ins.DB, ins.Table)
 		return dmlOutcome(retNames, retTypes, returned, affected, meter.Accrued), nil
 	}
 
@@ -1122,9 +1120,7 @@ func (db *engine) executeInsert(ins *insert, params []Value, ctx cteCtx) (outcom
 	if err != nil {
 		return outcome{}, err
 	}
-	if affected > 0 {
-		db.markEstimatorMutation(ins.DB, ins.Table)
-	}
+	db.markEstimatorMutation(ins.DB, ins.Table)
 	return dmlOutcome(retNames, retTypes, returned, affected, meter.Accrued), nil
 }
 
@@ -2350,9 +2346,7 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (ou
 			}
 		}
 	}
-	if len(matched) > 0 {
-		db.markEstimatorMutation(del.DB, del.Table)
-	}
+	db.markEstimatorMutation(del.DB, del.Table)
 	return dmlOutcome(retNames, retTypes, returned, int64(len(matched)), meter.Accrued), nil
 }
 
@@ -3074,9 +3068,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 			}
 		}
 	}
-	if len(updates) > 0 {
-		db.markEstimatorMutation(upd.DB, upd.Table)
-	}
+	db.markEstimatorMutation(upd.DB, upd.Table)
 	return dmlOutcome(retNames, retTypes, returned, int64(len(updates)), meter.Accrued), nil
 }
 

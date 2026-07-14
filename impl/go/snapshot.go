@@ -41,6 +41,7 @@ type snapshot struct {
 	// the map and tokens clone transactionally with the snapshot and are never serialized.
 	estimatorBaseRevision *estimatorRevision
 	estimatorRevisions    map[string]*estimatorRevision
+	statistics            map[string]map[int]*columnStatistics
 	tables                map[string]*catTable
 	// types holds user-defined composite (row) types, keyed by lowercased name
 	// (spec/design/composite.md). A database-level object set, separate from tables; serialized
@@ -103,6 +104,7 @@ func newSnapshot() *snapshot {
 		estimatorIdentity:     &estimatorDatabaseIdentity{},
 		estimatorBaseRevision: &estimatorRevision{},
 		estimatorRevisions:    make(map[string]*estimatorRevision),
+		statistics:            make(map[string]map[int]*columnStatistics),
 		tables:                make(map[string]*catTable),
 		types:                 make(map[string]*compositeType),
 		stores:                make(map[string]*tableStore),
@@ -156,7 +158,72 @@ func (s *snapshot) clone() *snapshot {
 	for k, v := range s.estimatorRevisions {
 		estimatorRevisions[k] = v
 	}
-	return &snapshot{txid: s.txid, catGen: s.catGen, estimatorIdentity: s.estimatorIdentity, estimatorBaseRevision: s.estimatorBaseRevision, estimatorRevisions: estimatorRevisions, tables: tables, types: types, stores: stores, indexStores: indexStores, sequences: sequences, collations: collations, defaultCollation: s.defaultCollation, gistTrees: gistTrees, storePaging: s.storePaging}
+	statistics := make(map[string]map[int]*columnStatistics, len(s.statistics))
+	for table, columns := range s.statistics {
+		copyColumns := make(map[int]*columnStatistics, len(columns))
+		for column, statistics := range columns {
+			copyStatistics := *statistics
+			copyStatistics.MCV = append([]statisticsMCV(nil), statistics.MCV...)
+			copyStatistics.Histogram = append([]statisticsValue(nil), statistics.Histogram...)
+			copyColumns[column] = &copyStatistics
+		}
+		statistics[table] = copyColumns
+	}
+	return &snapshot{txid: s.txid, catGen: s.catGen, estimatorIdentity: s.estimatorIdentity, estimatorBaseRevision: s.estimatorBaseRevision, estimatorRevisions: estimatorRevisions, statistics: statistics, tables: tables, types: types, stores: stores, indexStores: indexStores, sequences: sequences, collations: collations, defaultCollation: s.defaultCollation, gistTrees: gistTrees, storePaging: s.storePaging}
+}
+
+func (s *snapshot) columnStatistics(table string, column int) *columnStatistics {
+	return s.statistics[strings.ToLower(table)][column]
+}
+
+func (s *snapshot) putColumnStatistics(table string, column int, statistics *columnStatistics) {
+	key := strings.ToLower(table)
+	if s.statistics[key] == nil {
+		s.statistics[key] = make(map[int]*columnStatistics)
+	}
+	s.statistics[key][column] = statistics
+}
+
+type sortedColumnStatistics struct {
+	table      string
+	column     int
+	statistics *columnStatistics
+}
+
+func (s *snapshot) statisticsSorted() []sortedColumnStatistics {
+	tables := make([]string, 0, len(s.statistics))
+	for table := range s.statistics {
+		tables = append(tables, table)
+	}
+	sort.Strings(tables)
+	var out []sortedColumnStatistics
+	for _, table := range tables {
+		columns := make([]int, 0, len(s.statistics[table]))
+		for column := range s.statistics[table] {
+			columns = append(columns, column)
+		}
+		sort.Ints(columns)
+		for _, column := range columns {
+			out = append(out, sortedColumnStatistics{table: table, column: column, statistics: s.statistics[table][column]})
+		}
+	}
+	return out
+}
+
+func (s *snapshot) markStatisticsStale(table string) {
+	for _, statistics := range s.statistics[strings.ToLower(table)] {
+		statistics.Stale = true
+	}
+}
+
+func (s *snapshot) clearStatistics(table string) { delete(s.statistics, strings.ToLower(table)) }
+
+func (s *snapshot) clearColumnStatistics(table string, column int) {
+	key := strings.ToLower(table)
+	delete(s.statistics[key], column)
+	if len(s.statistics[key]) == 0 {
+		delete(s.statistics, key)
+	}
 }
 
 // estimatorRevisionFor returns the exact cache-validity token for one persistent relation. Missing
@@ -317,6 +384,11 @@ func (s *snapshot) upgradeCollations(pageSize uint32) (int, error) {
 			}
 			if affected {
 				indexes = append(indexes, idx)
+			}
+		}
+		for column, definition := range table.Columns {
+			if isSkewed(definition.Collation) {
+				s.clearColumnStatistics(key, column)
 			}
 		}
 		if !pkSkewed && len(indexes) == 0 {
@@ -770,6 +842,7 @@ func (s *snapshot) putTableResolved(t *catTable, colTypes []colType, pageSize ui
 	s.stores[key] = st
 	s.tables[key] = t
 	delete(s.estimatorRevisions, key)
+	delete(s.statistics, key)
 }
 
 // removeTable removes a table's definition, its store, and its indexes' stores (DROP
@@ -870,6 +943,10 @@ func (s *snapshot) alterTableCatalog(oldKey string, t *catTable, renameTable, in
 			delete(s.stores, oldKey)
 			s.stores[newKey] = st
 		}
+		if statistics, ok := s.statistics[oldKey]; ok {
+			delete(s.statistics, oldKey)
+			s.statistics[newKey] = statistics
+		}
 	}
 	s.tables[newKey] = t
 	if indexOld != "" {
@@ -914,7 +991,12 @@ func (s *snapshot) alterTableCatalog(oldKey string, t *catTable, renameTable, in
 }
 
 func (s *snapshot) alterTableRewrite(t *catTable, colTypes []colType, entries []entry, nextRowid int64, pageSize uint32) error {
+	key := strings.ToLower(t.Name)
+	statistics := s.statistics[key]
 	s.putTableResolved(t, colTypes, pageSize)
+	if statistics != nil {
+		s.statistics[key] = statistics
+	}
 	store := s.store(t.Name)
 	store.BumpRowidTo(nextRowid)
 	for _, e := range entries {

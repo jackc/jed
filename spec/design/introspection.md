@@ -3,8 +3,9 @@
 > How a query (and through it, a host) discovers what a database contains: the decision —
 > **`jed_`-prefixed virtual catalog relations**, scoped per database by the existing qualifier —
 > plus the **`jed_` name reservation** that keeps their namespace clear (§4, **implemented**).
-> Four relations are implemented — **`jed_tables` + `jed_columns`** (slice I1 — §5) and
-> **`jed_indexes` + `jed_constraints`** (slice I2 — §5.1); `jed_sequences` / `jed_types` remain
+> Five relations are implemented — **`jed_tables` + `jed_columns`** (slice I1 — §5),
+> **`jed_indexes` + `jed_constraints`** (slice I2 — §5.1), and **`jed_statistics`** (P9 — §5.2);
+> `jed_sequences` / `jed_types` remain
 > designed-only (I3).
 > [attached-databases.md](attached-databases.md) §3 owns the qualifier model the scoping rides;
 > [session.md](session.md) owns the privilege gating; [api.md](api.md) §7 owns the host handle —
@@ -323,9 +324,37 @@ kind order because an FK and a UNIQUE index may share a name within one table (F
 only against the constraint namespace, constraints.md §6.2), so a global name sort is not a total
 order.
 
+## 5.2 `jed_statistics` (P9) — implemented
+
+The same read-only, qualified, computed-relation model exposes one summary row per analyzed column:
+
+```
+jed_statistics(
+  table_name       text NOT NULL,
+  column_name      text NOT NULL,
+  analyzed_rows    i64 NOT NULL,
+  is_stale         boolean NOT NULL,
+  null_count       i64 NOT NULL,
+  distinct_count   i64,
+  sample_rows      i64 NOT NULL,
+  average_width    i64,
+  mcv_count        i32 NOT NULL,
+  histogram_count  i32 NOT NULL
+)
+```
+
+`distinct_count` is NULL for a distribution-ineligible type; `average_width` is NULL when the
+analyzed population had no non-NULL value. Counts describe the stored analyzed fact, not a
+row-count-rescaled current estimate. `is_stale` becomes true after later DML and remains visible
+until explicit ANALYZE replaces the column fact ([statistics.md](statistics.md)). Rows generate by
+lowercased table name then column ordinal. The relation is independently privilege-gated under the
+name `jed_statistics`, charges one `generated_row` per summary, and exposes no typed MCV/histogram
+arrays in P9.
+
 **Later relations** (same model, own slices — I3): `jed_sequences` (the six definition fields +
 ownership), `jed_types` (composite types + fields). Capability ids `introspect.tables`,
-`introspect.columns`, `introspect.indexes`, `introspect.constraints`, … — one per relation.
+`introspect.columns`, `introspect.indexes`, `introspect.constraints`, `introspect.statistics`, … —
+one per relation.
 
 ## 6. The host API carries no introspection convenience
 
@@ -376,5 +405,6 @@ The later relations' own errors (if any new arise) are pinned by their implement
 | **I0** | this doc; `42939` in the error registry; the `jed_` reservation in all three cores; `suites/ddl/reserved_names.test` | ✅ landed |
 | **I1** | `jed_tables` + `jed_columns`: resolution funnel interception (CTE-shadow / built-in-first / qualifier scoping), computed-relation execution riding the SRF plan shape, privilege gating, the 42809 read-only rejections, `generated_row` cost pinning (cost.md), `EXPLAIN` `Catalog Scan`, capabilities `introspect.tables`/`introspect.columns`, the canonical-type-text corpus (`suites/introspection/`, 4 files incl. temp + attachment scoping), `/web` docs | ✅ landed |
 | **I2** | `jed_indexes` + `jed_constraints` (§5.1): two more built-in-name-classifier entries + two row generators (every gate inherited from I1), the `text[]` member-list columns, the CHECK `expression` from the persisted canonical text, capabilities `introspect.indexes`/`introspect.constraints`, corpus (`suites/introspection/jed_indexes.test` + `jed_constraints.test`), cost.md worked examples, `/web` docs | ✅ **this change** |
+| **P9** | `jed_statistics` (§5.2): one summary row per analyzed column, qualified-domain scoping, stale/NDV/width/count visibility, capability `introspect.statistics`, corpus + `/web` docs | ✅ landed with column statistics |
 | I3 | `jed_sequences`, `jed_types` | not started |
 | — | `information_schema` compat views over the `jed_` relations | door open, **not planned** |

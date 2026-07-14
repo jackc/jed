@@ -15,7 +15,17 @@ and (b) write the same logical database to bytes that equal the golden *exactly*
 other's output. A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 28)
+## Version scope (`format_version` 29)
+
+`format_version` **29** — **persisted deterministic column statistics**
+([../design/statistics.md](../design/statistics.md)). The catalog stream gains `entry_kind = 4`
+statistics records after the table-entry group. A summary plus bounded one-value MCV/histogram
+records represent each analyzed column without changing the meta page, table entries, value codec,
+or page types. A later DML statement retains the records and sets their summary's `stale` bit;
+ANALYZE replaces selected columns transactionally. Each retained value's ordinary typed codec body
+and regenerated comparison key are at most 128 bytes, so a maximum-length table name plus one value
+record fits the minimum 256-byte page. Files without statistics still move to v29 by the version
+bytes/meta CRC under the exact-version clean break.
 
 `format_version` **28** — **transactional per-table row counts**
 ([../design/estimator.md §5](../design/estimator.md)). Every table catalog entry appends a fixed
@@ -468,7 +478,7 @@ and slot selection):
 | offset | size | field |
 |---|---|---|
 | 0  | 4 | `magic` = `4A 45 44 42` (ASCII `JEDB`, for the engine `jed`) |
-| 4  | 2 | `format_version` (u16) — current = **`28`** |
+| 4  | 2 | `format_version` (u16) — current = **`29`** |
 | 6  | 2 | reserved (0) |
 | 8  | 4 | `page_size` (u32) |
 | 12 | 8 | `txid` (u64) — commit counter; the highest valid slot wins on open |
@@ -497,7 +507,7 @@ present (copy-on-write never overwrote them). `create` seeds **both** slots with
 `txid = 1` meta, so two valid slots exist from the first moment (the first even-`txid` commit
 then overwrites slot 0).
 
-**Opening (slot selection).** Validate each slot independently (magic, `format_version == 28`,
+**Opening (slot selection).** Validate each slot independently (magic, `format_version == 29`,
 offsets 6–7 reserved == 0, `free_list_head` == 0 or in `[2, page_count)`, `crc32`). Choose the
 **valid** slot with the **highest `txid`**; on a tie, slot 0. Exactly one valid → use it (torn-write
 fallback). Neither valid → `data_corrupted`. The chosen meta's `free_list_head` is followed to load
@@ -536,11 +546,13 @@ B-tree root moves). Its **encoding is byte-identical to v1**; only its location 
 (`root_page`) and `root_data_page` now points at a **B-tree root node** instead of a record
 chain head.
 
-**Each catalog entry is kind-tagged (v9, extended v12/v18):** a leading `entry_kind` u8 — `0` = a
+**Each catalog entry is kind-tagged (v9, extended v12/v18/v29):** a leading `entry_kind` u8 — `0` = a
 table entry, `1` = a composite-type entry ([../design/composite.md §3](../design/composite.md)), `2` =
 a sequence entry ([../design/sequences.md §3](../design/sequences.md)), `3` = a collation reference entry
-([../design/collation.md §5](../design/collation.md)). Entries are emitted in kind order
-**composite-type (1), then sequence (2), then collation (3), then table (0)**, each group in ascending
+([../design/collation.md §5](../design/collation.md)), `4` = a column-statistics entry
+([../design/statistics.md §7](../design/statistics.md)). Entries are emitted in kind order
+**composite-type (1), then sequence (2), then collation (3), table (0), then statistics (4)**, each
+object group in ascending
 lowercased-name order (collations sort by their exact, case-sensitive name). Each page's `item_count` is the number of entries (of any kind) it holds;
 entries are packed greedily into the chain, kind-tagged in stream order, exactly as table entries
 were through v8 (a single entry must fit one page, i.e. ≤ `C`, else `0A000`; the `RECORD_MAX = C/2`
@@ -660,6 +672,57 @@ and bit 3 (`default_is_expr`, whose persisted text is the `nextval('<table>_<col
 BY DEFAULT`. The backing sequence is an ordinary owned sequence entry (v14 `has_owner`), so `DROP
 TABLE` auto-drops it and the column's default/owner bytes are exactly a `serial` column's; the
 identity bits restore the INSERT/UPDATE gating (`428C9`) after a reopen.
+
+### Column-statistics entries (`entry_kind = 4`, v29)
+
+Statistics entries follow every table entry and sort by `(lowercase table_name, column_ordinal,
+stats_kind, item_ordinal)`. Every entry begins:
+
+| field | encoding |
+|---|---|
+| `entry_kind` | u8 = `4` |
+| `stats_kind` | u8: `0` summary, `1` MCV, `2` histogram; other values `XX001` |
+| `table_name_len` | u16 |
+| `table_name` | UTF-8 original table name; must resolve case-insensitively |
+| `column_ordinal` | u16; must be `< col_count` |
+
+A **summary** (`stats_kind = 0`) continues:
+
+| field | encoding |
+|---|---|
+| `stats_flags` | u8: bit0 `stale`, bit1 `distribution_eligible`; bits 2–7 zero |
+| `analyzed_rows` | non-negative i64 |
+| `null_count` | non-negative i64, `<= analyzed_rows` |
+| `width_sum` | non-negative i64 (saturated collection sum) |
+| `distinct_count` | non-negative i64; zero when bit1 is clear, otherwise `<= analyzed_rows - null_count` |
+| `sample_rows` | u32, `<= min(analyzed_rows, 30000)` |
+| `sample_nonnull_rows` | u32, `<= sample_rows` |
+| `mcv_count` | u16, `<= 100` |
+| `histogram_count` | u16, `<= 101`; zero or `>= 2` |
+
+An **MCV item** (`stats_kind = 1`) continues:
+
+| field | encoding |
+|---|---|
+| `item_ordinal` | u16, contiguous `0...mcv_count-1` |
+| `sample_frequency` | u32, in `1..sample_nonnull_rows` |
+| `value_len` | u16 in `1..128` |
+| `value` | ordinary non-NULL single-value codec bytes for the owning column type (`0x00` + inline body), exactly `value_len` bytes; external/compressed pointer forms are forbidden |
+
+A **histogram item** (`stats_kind = 2`) continues:
+
+| field | encoding |
+|---|---|
+| `item_ordinal` | u16, contiguous `0...histogram_count-1` |
+| `value_len` | u16 in `1..128` |
+| `value` | the same ordinary non-NULL single-value codec form as MCV |
+
+The loader first registers ordinary tables/types, then resolves statistics. A summary is unique per
+column and its declared item counts must exactly match following entries. Every value must decode
+fully under the resolved column type, remain non-NULL, re-encode to the same bytes, and regenerate a
+comparison key no longer than 128 bytes. Distribution-ineligible summaries have no MCV/histogram
+items. MCV values are distinct and ordered by descending frequency then comparison key; histogram
+bounds are nondecreasing. Bad flags/counts/order/references/types/bytes are `XX001`.
 
 ### Composite-type entry (`entry_kind = 1`, v9)
 

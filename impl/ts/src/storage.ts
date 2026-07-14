@@ -169,6 +169,15 @@ export class TableStore {
     return this.rows.nodeCount();
   }
 
+  statisticsScanUnits(
+    key: Uint8Array,
+    row: Row,
+    column: number,
+  ): { pages: number; decompress: number } {
+    const mask = this.colTypes.map((_, i) => i === column);
+    return recordScanUnits(this.colTypes, key, row, this.cap, mask);
+  }
+
   height(): number {
     return this.rows.height();
   }

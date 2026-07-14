@@ -554,6 +554,96 @@ pub(crate) fn estimator_predicate_selectivity(
     }
 }
 
+/// P9 relation-aware refinement of the structural predicate program. Unsupported leaves retain the
+/// standing defaults byte-for-byte; supported bare-column leaves use the relation's snapshot facts.
+pub(crate) fn estimator_predicate_selectivity_with_statistics(
+    expr: Option<&RExpr>,
+    rel: &ScopeRel<'_>,
+    catalog: &Engine,
+) -> crate::estimator::Selectivity {
+    use crate::estimator::Selectivity;
+    let Some(expr) = expr else {
+        return Selectivity::All;
+    };
+    match expr {
+        RExpr::And(..) => {
+            let mut conjuncts = Vec::new();
+            estimator_flatten_boolean(expr, true, &mut conjuncts);
+            if estimator_conjunction_contradictory(&conjuncts) {
+                return Selectivity::Zero;
+            }
+            let mut used = vec![false; conjuncts.len()];
+            let mut result = Selectivity::All;
+            for i in 0..conjuncts.len() {
+                if used[i] {
+                    continue;
+                }
+                let paired = ((i + 1)..conjuncts.len())
+                    .find(|j| !used[*j] && estimator_paired_range(conjuncts[i], conjuncts[*j]));
+                if let Some(j) = paired {
+                    used[j] = true;
+                    let range = statistics_paired_range_selectivity(
+                        conjuncts[i],
+                        conjuncts[j],
+                        rel,
+                        catalog,
+                    )
+                    .unwrap_or_else(|| {
+                        Selectivity::fraction(crate::estimator_constants::SELECTIVITY_PAIRED_RANGE)
+                    });
+                    result = result.and(range);
+                } else {
+                    result = result.and(estimator_predicate_selectivity_with_statistics(
+                        Some(conjuncts[i]),
+                        rel,
+                        catalog,
+                    ));
+                }
+            }
+            result
+        }
+        RExpr::Or(..) => {
+            if let Some(estimate) =
+                statistics_equality_disjunction_selectivity(expr, rel, catalog, false)
+            {
+                return estimate;
+            }
+            let mut disjuncts = Vec::new();
+            estimator_flatten_boolean(expr, false, &mut disjuncts);
+            let mut result: Option<Selectivity> = None;
+            for (i, disjunct) in disjuncts.iter().enumerate() {
+                let duplicate =
+                    estimator_equality_parts(disjunct).is_some_and(|(operand, literal)| {
+                        disjuncts[..i].iter().any(|prior| {
+                            estimator_equality_parts(prior).is_some_and(
+                                |(prior_operand, prior_literal)| {
+                                    rexpr_eq_shifted(operand, prior_operand, 0)
+                                        && rexpr_eq_shifted(literal, prior_literal, 0)
+                                },
+                            )
+                        })
+                    });
+                if duplicate {
+                    continue;
+                }
+                let part =
+                    estimator_predicate_selectivity_with_statistics(Some(disjunct), rel, catalog);
+                result = Some(match result {
+                    None => part,
+                    Some(lhs) => lhs.or(part),
+                });
+            }
+            result.unwrap_or(Selectivity::Zero)
+        }
+        RExpr::Not(child) => statistics_negated_leaf_selectivity(child, rel, catalog)
+            .unwrap_or_else(|| {
+                estimator_predicate_selectivity_with_statistics(Some(child), rel, catalog).not()
+            }),
+        _ => statistics_leaf_selectivity(expr, rel, catalog)
+            .unwrap_or_else(|| estimator_predicate_selectivity(Some(expr))),
+    }
+}
+
 fn estimator_flatten_boolean<'a>(expr: &'a RExpr, and: bool, out: &mut Vec<&'a RExpr>) {
     match (and, expr) {
         (true, RExpr::And(lhs, rhs)) | (false, RExpr::Or(lhs, rhs)) => {
@@ -879,13 +969,14 @@ fn estimator_interval_selectivity(
 }
 
 fn estimator_candidate_selectivity(
-    candidate: &ScanCandidate<'_>,
+    bound: Option<&ScanBound>,
+    identity: &ScanCandidateIdentity,
     rel: &ScopeRel<'_>,
 ) -> crate::estimator::Selectivity {
     use crate::estimator::Selectivity;
     use crate::estimator::selectivity_class;
     use crate::estimator_constants::*;
-    match candidate.bound.as_ref() {
+    match bound {
         Some(ScanBound::Pk(bound)) => {
             if bound
                 .eq_cols
@@ -912,9 +1003,7 @@ fn estimator_candidate_selectivity(
                 return Selectivity::Zero;
             }
             let unique = rel.table.indexes.iter().any(|index| {
-                index
-                    .name
-                    .eq_ignore_ascii_case(&candidate.identity.index_name)
+                index.name.eq_ignore_ascii_case(&identity.index_name)
                     && index.unique
                     && bound.eq_cols.len() == index.keys.len()
                     && bound.range.is_none()
@@ -946,15 +1035,175 @@ fn estimator_candidate_selectivity(
         }
         Some(ScanBound::IndexSet(bound)) => {
             let unique = rel.table.indexes.iter().any(|index| {
-                index
-                    .name
-                    .eq_ignore_ascii_case(&candidate.identity.index_name)
+                index.name.eq_ignore_ascii_case(&identity.index_name)
                     && index.unique
                     && index.keys.len() == 1
             });
             estimator_interval_selectivity(&bound.specs, &bound.clip, unique, bound.col_type)
         }
         None => Selectivity::All,
+    }
+}
+
+fn estimator_interval_selectivity_with_statistics(
+    specs: &[IntervalSpec],
+    clip: &[BoundTerm],
+    unique_points: bool,
+    key_type: ScalarType,
+    column: usize,
+    rel: &ScopeRel<'_>,
+    catalog: &Engine,
+) -> crate::estimator::Selectivity {
+    use crate::estimator::Selectivity;
+    let mut disjunction: Option<Selectivity> = None;
+    for spec in specs {
+        let structural = estimator_range_terms(&spec.terms, key_type);
+        let term = if matches!(structural, Selectivity::Zero) {
+            structural
+        } else if unique_points
+            && !spec.terms.is_empty()
+            && spec.terms.iter().all(|term| term.op == CmpOp::Eq)
+        {
+            Selectivity::Unique
+        } else {
+            statistics_bound_terms_selectivity(rel, column, &spec.terms, catalog)
+                .unwrap_or(structural)
+        };
+        disjunction = Some(match disjunction {
+            None => term,
+            Some(lhs) => lhs.or(term),
+        });
+    }
+    let mut result = disjunction.unwrap_or(Selectivity::Zero);
+    if !clip.is_empty() {
+        result = result.and(
+            statistics_bound_terms_selectivity(rel, column, clip, catalog)
+                .unwrap_or_else(|| estimator_range_terms(clip, key_type)),
+        );
+    }
+    result
+}
+
+fn estimator_candidate_selectivity_with_statistics(
+    bound: Option<&ScanBound>,
+    identity: &ScanCandidateIdentity,
+    rel: &ScopeRel<'_>,
+    catalog: &Engine,
+) -> crate::estimator::Selectivity {
+    use crate::estimator::Selectivity;
+    use crate::estimator_constants::SELECTIVITY_EQUALITY;
+    let structural = estimator_candidate_selectivity(bound, identity, rel);
+    if matches!(structural, Selectivity::Zero | Selectivity::Unique) {
+        return structural;
+    }
+    match bound {
+        Some(ScanBound::Pk(bound)) => {
+            let mut result = Selectivity::All;
+            for eq in &bound.eq_cols {
+                let Some(column) = rel
+                    .table
+                    .columns
+                    .iter()
+                    .position(|column| column.name.eq_ignore_ascii_case(&eq.name))
+                else {
+                    return structural;
+                };
+                let estimate = eq.srcs.first().and_then(|source| {
+                    statistics_bound_source_selectivity(rel, column, CmpOp::Eq, source, catalog)
+                });
+                result = result
+                    .and(estimate.unwrap_or_else(|| Selectivity::fraction(SELECTIVITY_EQUALITY)));
+            }
+            if let Some(range) = &bound.range {
+                let Some(column) = rel
+                    .table
+                    .columns
+                    .iter()
+                    .position(|column| column.name.eq_ignore_ascii_case(&range.name))
+                else {
+                    return structural;
+                };
+                result = result.and(
+                    statistics_bound_terms_selectivity(rel, column, &range.terms, catalog)
+                        .unwrap_or_else(|| estimator_range_terms(&range.terms, range.col_type)),
+                );
+            }
+            result
+        }
+        Some(ScanBound::Index(bound)) => {
+            let Some(index) = rel
+                .table
+                .indexes
+                .iter()
+                .find(|index| index.name.eq_ignore_ascii_case(&identity.index_name))
+            else {
+                return structural;
+            };
+            let mut result = Selectivity::All;
+            for (position, eq) in bound.eq_cols.iter().enumerate() {
+                let Some(column) = index.keys.get(position).and_then(IndexKey::as_column) else {
+                    result = result.and(Selectivity::fraction(SELECTIVITY_EQUALITY));
+                    continue;
+                };
+                let estimate = eq.srcs.first().and_then(|source| {
+                    statistics_bound_source_selectivity(rel, column, CmpOp::Eq, source, catalog)
+                });
+                result = result
+                    .and(estimate.unwrap_or_else(|| Selectivity::fraction(SELECTIVITY_EQUALITY)));
+            }
+            if let Some(range) = &bound.range {
+                let Some(column) = index
+                    .keys
+                    .get(bound.eq_cols.len())
+                    .and_then(IndexKey::as_column)
+                else {
+                    return result.and(estimator_range_terms(&range.terms, range.col_type));
+                };
+                result = result.and(
+                    statistics_bound_terms_selectivity(rel, column, &range.terms, catalog)
+                        .unwrap_or_else(|| estimator_range_terms(&range.terms, range.col_type)),
+                );
+            }
+            result
+        }
+        Some(ScanBound::PkSet(bound)) => {
+            let Some(column) = rel.table.primary_key_index() else {
+                return structural;
+            };
+            estimator_interval_selectivity_with_statistics(
+                &bound.specs,
+                &bound.clip,
+                true,
+                bound.pk_type,
+                column,
+                rel,
+                catalog,
+            )
+        }
+        Some(ScanBound::IndexSet(bound)) => {
+            let Some(index) = rel
+                .table
+                .indexes
+                .iter()
+                .find(|index| index.name.eq_ignore_ascii_case(&identity.index_name))
+            else {
+                return structural;
+            };
+            let Some(column) = index.keys.first().and_then(IndexKey::as_column) else {
+                return structural;
+            };
+            let unique = index.unique && index.keys.len() == 1;
+            estimator_interval_selectivity_with_statistics(
+                &bound.specs,
+                &bound.clip,
+                unique,
+                bound.col_type,
+                column,
+                rel,
+                catalog,
+            )
+        }
+        _ => structural,
     }
 }
 
@@ -1198,7 +1447,14 @@ pub(crate) fn estimate_scan_candidates(
     let row_count = store.count().unwrap_or(0);
     let selectivities: Vec<_> = candidates
         .iter()
-        .map(|candidate| estimator_candidate_selectivity(candidate, rel))
+        .map(|candidate| {
+            estimator_candidate_selectivity_with_statistics(
+                candidate.bound.as_ref(),
+                &candidate.identity,
+                rel,
+                catalog,
+            )
+        })
         .collect();
     let output_selectivity = if selectivities
         .iter()
@@ -1206,7 +1462,11 @@ pub(crate) fn estimate_scan_candidates(
     {
         crate::estimator::Selectivity::Zero
     } else {
-        estimator_predicate_selectivity(candidates.first().and_then(|c| c.residual))
+        estimator_predicate_selectivity_with_statistics(
+            candidates.first().and_then(|c| c.residual),
+            rel,
+            catalog,
+        )
     };
     let output_rows = estimate_rows(&output_selectivity, row_count);
     let table_height = store.height() as i64;
@@ -1280,7 +1540,7 @@ pub(crate) fn estimate_selected_scan(
     };
     let store = catalog.store_scoped(rel.db.as_deref(), &rel.table.name);
     let row_count = store.count().unwrap_or(0);
-    let access_selectivity = match bound {
+    let structural_access_selectivity = match bound {
         Some(ScanBound::Pk(bound)) => {
             if bound
                 .eq_cols
@@ -1349,11 +1609,29 @@ pub(crate) fn estimate_selected_scan(
         }
         None => crate::estimator::Selectivity::All,
     };
+    let identity = ScanCandidateIdentity {
+        kind,
+        index_name: index_name.to_string(),
+    };
+    let access_selectivity =
+        estimator_candidate_selectivity_with_statistics(bound, &identity, rel, catalog);
+    let access_selectivity = if matches!(access_selectivity, crate::estimator::Selectivity::All)
+        && !matches!(
+            structural_access_selectivity,
+            crate::estimator::Selectivity::All
+        ) {
+        structural_access_selectivity
+    } else {
+        access_selectivity
+    };
     let scan_rows = estimate_rows(&access_selectivity, row_count);
     let output_rows = if matches!(access_selectivity, crate::estimator::Selectivity::Zero) {
         0
     } else {
-        estimate_rows(&estimator_predicate_selectivity(residual), row_count)
+        estimate_rows(
+            &estimator_predicate_selectivity_with_statistics(residual, rel, catalog),
+            row_count,
+        )
     };
     let table_height = store.height() as i64;
     let (access_nodes, access_height) = match kind {

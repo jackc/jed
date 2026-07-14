@@ -1601,6 +1601,7 @@ impl Engine {
                 SrfKind::JedColumns => self.jed_columns_rows(srf, meter),
                 SrfKind::JedIndexes => self.jed_indexes_rows(srf, meter),
                 SrfKind::JedConstraints => self.jed_constraints_rows(srf, meter),
+                SrfKind::JedStatistics => self.jed_statistics_rows(srf, meter),
             };
         }
         // A CTE reference delivers its rows from the per-statement context (cte.md §3/§5): a

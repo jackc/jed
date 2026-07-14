@@ -48,6 +48,8 @@ A separate **`allow_ddl`** flag (default on) gates all `CREATE` / `DROP` / `ALTE
 - **`EXECUTE`** on every named function it calls. Built-in operators (`+`, `=`, …) are never gated —
   they are pure and unavoidable. Revoking `EXECUTE` on `uuidv4()` or `now()` is the easy way to pin a
   session's determinism.
+- **`ANALYZE table [(columns)]`** needs `SELECT` on its target plus `allow_ddl`. Collection reads the
+  table and transactionally replaces planner facts; this slice has no separate `MAINTAIN` privilege.
 
 ## Existence is checked first
 

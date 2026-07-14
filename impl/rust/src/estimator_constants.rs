@@ -12,6 +12,14 @@ pub const DEFAULT_DISTINCT_VALUES: i64 = 200;
 pub const DEFAULT_SRF_ROWS: i64 = 1000;
 pub const DEFAULT_VARIABLE_KEY_BYTES: i64 = 1;
 pub const JOIN_DP_LIMIT: usize = 8;
+pub const STATISTICS_TARGET: usize = 100;
+pub const STATISTICS_SAMPLE_ROWS: usize = 30000;
+pub const STATISTICS_KMV_HASHES: usize = 4096;
+pub const STATISTICS_MCV_ENTRIES: usize = 100;
+pub const STATISTICS_HISTOGRAM_BOUNDS: usize = 101;
+pub const STATISTICS_MAX_VALUE_BYTES: usize = 128;
+pub const STATISTICS_NDV_SCALE_NUMERATOR: i64 = 1;
+pub const STATISTICS_NDV_SCALE_DENOMINATOR: i64 = 10;
 
 pub const SELECTIVITY_EQUALITY: EstimatorFraction = EstimatorFraction {
     numerator: 1,
@@ -64,32 +72,34 @@ pub const ACCESS_PATH_ORDER: [&str; 7] = [
     "full",
 ];
 
-pub const ESTIMATOR_UNIT_COUNT: usize = 23;
+pub const ESTIMATOR_UNIT_COUNT: usize = 24;
 pub const UNIT_STORAGE_ROW_READ: usize = 0;
-pub const UNIT_PAGE_READ: usize = 1;
-pub const UNIT_CONSTRAINT_CHECK: usize = 2;
-pub const UNIT_VALUE_COMPRESS: usize = 3;
-pub const UNIT_VALUE_DECOMPRESS: usize = 4;
-pub const UNIT_DECIMAL_WORK: usize = 5;
-pub const UNIT_ROW_PRODUCED: usize = 6;
-pub const UNIT_OPERATOR_EVAL: usize = 7;
-pub const UNIT_HASH_BUILD: usize = 8;
-pub const UNIT_HASH_PROBE: usize = 9;
-pub const UNIT_AGGREGATE_ACCUMULATE: usize = 10;
-pub const UNIT_CTE_SCAN_ROW: usize = 11;
-pub const UNIT_GENERATED_ROW: usize = 12;
-pub const UNIT_SEQUENCE_ADVANCE: usize = 13;
-pub const UNIT_GIN_ENTRY: usize = 14;
-pub const UNIT_GIST_DESCENT: usize = 15;
-pub const UNIT_COLLATE: usize = 16;
-pub const UNIT_TIMEZONE: usize = 17;
-pub const UNIT_REGEX_COMPILE: usize = 18;
-pub const UNIT_REGEX_STEP: usize = 19;
-pub const UNIT_WINDOW_RESULT: usize = 20;
-pub const UNIT_VARLEN_COMPARE: usize = 21;
-pub const UNIT_WINDOW_FRAME_STEP: usize = 22;
+pub const UNIT_STATISTICS_VALUE: usize = 1;
+pub const UNIT_PAGE_READ: usize = 2;
+pub const UNIT_CONSTRAINT_CHECK: usize = 3;
+pub const UNIT_VALUE_COMPRESS: usize = 4;
+pub const UNIT_VALUE_DECOMPRESS: usize = 5;
+pub const UNIT_DECIMAL_WORK: usize = 6;
+pub const UNIT_ROW_PRODUCED: usize = 7;
+pub const UNIT_OPERATOR_EVAL: usize = 8;
+pub const UNIT_HASH_BUILD: usize = 9;
+pub const UNIT_HASH_PROBE: usize = 10;
+pub const UNIT_AGGREGATE_ACCUMULATE: usize = 11;
+pub const UNIT_CTE_SCAN_ROW: usize = 12;
+pub const UNIT_GENERATED_ROW: usize = 13;
+pub const UNIT_SEQUENCE_ADVANCE: usize = 14;
+pub const UNIT_GIN_ENTRY: usize = 15;
+pub const UNIT_GIST_DESCENT: usize = 16;
+pub const UNIT_COLLATE: usize = 17;
+pub const UNIT_TIMEZONE: usize = 18;
+pub const UNIT_REGEX_COMPILE: usize = 19;
+pub const UNIT_REGEX_STEP: usize = 20;
+pub const UNIT_WINDOW_RESULT: usize = 21;
+pub const UNIT_VARLEN_COMPARE: usize = 22;
+pub const UNIT_WINDOW_FRAME_STEP: usize = 23;
 pub const ESTIMATOR_UNIT_IDS: [&str; ESTIMATOR_UNIT_COUNT] = [
     "storage_row_read",
+    "statistics_value",
     "page_read",
     "constraint_check",
     "value_compress",
@@ -115,6 +125,7 @@ pub const ESTIMATOR_UNIT_IDS: [&str; ESTIMATOR_UNIT_COUNT] = [
 ];
 #[rustfmt::skip]
 pub const ESTIMATOR_UNIT_WEIGHTS: [i64; ESTIMATOR_UNIT_COUNT] = [
+    1,
     1,
     1,
     1,

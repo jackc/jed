@@ -26,10 +26,21 @@ parameter_strategy = "generic_before_bind"
 join_dp_limit = 8
 large_join_strategy = "greedy_cheapest_next"
 
-# Row-count-only fallbacks used before P9's NDV/histogram statistics land.
+# Row-count-only fallbacks retained when P9 has no applicable column statistics.
 default_distinct_values = 200
 default_srf_rows = 1000
 default_variable_key_bytes = 1
+
+# P9 deterministic ANALYZE/statistics limits (statistics.md). These are cross-core mechanical facts,
+# never handle settings: changing work_mem cannot change persisted statistics or a selected plan.
+statistics_target = 100
+statistics_sample_rows = 30000
+statistics_kmv_hashes = 4096
+statistics_mcv_entries = 100
+statistics_histogram_bounds = 101
+statistics_max_value_bytes = 128
+statistics_ndv_scale_numerator = 1
+statistics_ndv_scale_denominator = 10
 
 # PostgreSQL's no-statistics selectivity defaults, expressed as exact reduced rationals rather
 # than binary floats. `matching` is PG's broader "other matching operator" default; `boolean` and

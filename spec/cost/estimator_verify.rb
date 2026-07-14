@@ -59,6 +59,14 @@ def main
   expect_equal(data, "default_distinct_values", 200)
   expect_equal(data, "default_srf_rows", 1000)
   expect_equal(data, "default_variable_key_bytes", 1)
+  expect_equal(data, "statistics_target", 100)
+  expect_equal(data, "statistics_sample_rows", 30_000)
+  expect_equal(data, "statistics_kmv_hashes", 4_096)
+  expect_equal(data, "statistics_mcv_entries", 100)
+  expect_equal(data, "statistics_histogram_bounds", 101)
+  expect_equal(data, "statistics_max_value_bytes", 128)
+  expect_equal(data, "statistics_ndv_scale_numerator", 1)
+  expect_equal(data, "statistics_ndv_scale_denominator", 10)
 
   entries = data["selectivity"] || []
   selectivity_count = entries.length

@@ -69,6 +69,8 @@ Each doc explains *why* a decision was made and points at the **data** that enco
   current rule inventory, access-path policies, and optimizer extension points.
 - [estimator.md](estimator.md) — the ratified Path-B plan-time cardinality/cost contract:
   exact arithmetic, canonical inputs and defaults, candidate ordering, and bounded join search.
+- [statistics.md](statistics.md) — deterministic transactional `ANALYZE`, bounded NDV/MCV/histogram
+  collection, retained staleness, v29 persistence, estimator use, and `jed_statistics`.
 - [explain.md](explain.md) — deterministic, corpus-assertable rendering of the selected physical
   plan, actual ANALYZE cost, and the scheduled estimate-column extension.
 - [cost.md](cost.md) — the deterministic cost-accounting seam: the unit schedule as data,

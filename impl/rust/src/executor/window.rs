@@ -1581,6 +1581,8 @@ mod skew_tests {
         )
         .unwrap();
         crate::execute(&mut db, "INSERT INTO t VALUES ('b'), ('a')").unwrap();
+        crate::execute(&mut db, "ANALYZE t (x)").unwrap();
+        assert!(db.committed.column_statistics("t", 0).is_some());
         // Full so far: a write succeeds and every referenced collation reports Full.
         crate::execute(&mut db, "INSERT INTO t VALUES ('c')").unwrap();
         assert!(
@@ -1597,6 +1599,13 @@ mod skew_tests {
         let mut skewed = (*loaded).clone();
         skewed.unicode_version = "0.0.0".to_string();
         db.committed.put_collation(Arc::new(skewed));
+        // Persist and reopen the exact old-file/new-bundle state. Statistics values remain
+        // structurally valid even though their old comparison ordering cannot be checked with the
+        // loaded bundle; opening must succeed, and the estimator must not consume the facts.
+        let image = db.to_image(8192, 1).expect("serialize skewed statistics");
+        db = Engine::from_image(&image).expect("open skewed statistics");
+        assert!(db.committed.column_statistics("t", 0).is_some());
+        assert!(db.column_statistics_scoped(None, "t", 0).is_none());
 
         // The verdict is now Skewed and visible via introspection (the file's pin is reported).
         let info = db.collations();
@@ -1640,6 +1649,8 @@ mod skew_tests {
         )
         .unwrap();
         crate::execute(&mut db, "INSERT INTO t VALUES ('b'), ('a')").unwrap();
+        crate::execute(&mut db, "ANALYZE t (x)").unwrap();
+        assert!(db.committed.column_statistics("t", 0).is_some());
         // Inject skew (a file built under a prior bundle), as in the test above.
         let loaded = crate::collation::loaded_collation("unicode").unwrap();
         let mut skewed = (*loaded).clone();
@@ -1670,6 +1681,10 @@ mod skew_tests {
             .expect("unicode referenced");
         assert_eq!(uni.verdict, CollationVerdict::Full, "Full after upgrade");
         assert_eq!(uni.unicode_version, loaded.unicode_version);
+        assert!(
+            db.committed.column_statistics("t", 0).is_none(),
+            "upgrade clears facts ordered under the old collation"
+        );
         crate::execute(&mut db, "INSERT INTO t VALUES ('c')").expect("writable after upgrade");
 
         // Idempotent: nothing is skewed now, so a second upgrade re-pins zero collations.

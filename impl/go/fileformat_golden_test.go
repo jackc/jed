@@ -73,6 +73,18 @@ func rowCountTableDB(t *testing.T) *Session {
 	return db
 }
 
+func statisticsTableDB(t *testing.T) *Session {
+	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
+	run(t, db, "CREATE TABLE fresh (id i32 PRIMARY KEY, v text)")
+	run(t, db, "CREATE TABLE stale (id i32 PRIMARY KEY, v text)")
+	run(t, db, "INSERT INTO fresh VALUES (1, 'a'), (2, 'a'), (3, 'b'), (4, NULL)")
+	run(t, db, "INSERT INTO stale VALUES (1, 'x'), (2, 'x'), (3, NULL)")
+	run(t, db, "ANALYZE fresh")
+	run(t, db, "ANALYZE stale")
+	run(t, db, "INSERT INTO stale VALUES (4, 'y')")
+	return db
+}
+
 // compositePKTableDB has a COMPOSITE primary key (constraints.md §3) — the stored key is
 // the concatenation of the members' encodings (4-byte i32 then 2-byte i16,
 // encoding.md §2.3). Rows insert in ascending tuple order (the tree shape is
@@ -912,6 +924,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"compressed_table.jed", compressedTableDB},
 		{"one_table_empty.jed", oneTableEmptyDB},
 		{"row_count_table.jed", rowCountTableDB},
+		{"statistics_table.jed", statisticsTableDB},
 		{"pk_table.jed", pkTableDB},
 		{"text_table.jed", textTableDB},
 		{"varchar_table.jed", varcharTableDB},
@@ -1194,6 +1207,26 @@ func TestSerializeIsDeterministic(t *testing.T) {
 	b, _ := db.ToImage(goldenPageSize, 1)
 	if !bytes.Equal(a, b) {
 		t.Errorf("serializing the same database twice produced different bytes")
+	}
+}
+
+func TestStatisticsSemanticCorruptionRejected(t *testing.T) {
+	image := fixture(t, "statistics_table.jed")
+	// kind=4, summary=0, name="fresh", column=0, flags=distribution. Keep the page checksum valid so
+	// the reserved flag is rejected by the statistics decoder rather than the CRC guard.
+	pattern := []byte{4, 0, 0, 5, 'f', 'r', 'e', 's', 'h', 0, 0, 2}
+	if bytes.Count(image, pattern) != 1 {
+		t.Fatal("expected one statistics summary pattern")
+	}
+	flags := bytes.Index(image, pattern) + len(pattern) - 1
+	image[flags] = 0x80
+	pageStart := flags / goldenPageSize * goldenPageSize
+	covered := append([]byte(nil), image[pageStart:pageStart+12]...)
+	covered = append(covered, image[pageStart+16:pageStart+goldenPageSize]...)
+	binary.BigEndian.PutUint32(image[pageStart+12:pageStart+16], crc32IEEE(covered))
+	_, err := loadEngine(image)
+	if err == nil || err.(*EngineError).Code() != "XX001" {
+		t.Fatalf("reserved statistics flag: want XX001, got %v", err)
 	}
 }
 

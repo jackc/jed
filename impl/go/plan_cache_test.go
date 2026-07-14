@@ -183,12 +183,12 @@ func TestPlanCacheEstimatorRevisionRelevantAndUnrelated(t *testing.T) {
 		t.Fatalf("refilled vs fresh EXPLAIN = %v / %v", got, want)
 	}
 
-	// Exercise every row-mutation disposition that owns a distinct executor path. A no-op conflict
-	// remains a hit; UPDATE, INSERT ... SELECT, UPSERT-update, and DELETE each invalidate.
-	plan := stmt.sc.p.Load().sp
+	// P9 conservatively advances the target revision even for a successful zero-row disposition,
+	// retaining its facts as stale.
+	beforeNoop := stmt.sc.p.Load().sp
 	mustExec(t, db, "INSERT INTO a VALUES (1, 99) ON CONFLICT DO NOTHING")
-	if _, _ = drainQ(t, db, stmt, IntValue(10)); stmt.sc.p.Load().sp != plan {
-		t.Fatal("ON CONFLICT DO NOTHING invalidated an unchanged relation")
+	if _, _ = drainQ(t, db, stmt, IntValue(10)); stmt.sc.p.Load().sp == beforeNoop {
+		t.Fatal("ON CONFLICT DO NOTHING did not conservatively invalidate the target")
 	}
 	for _, step := range []struct {
 		sql   string
@@ -204,6 +204,45 @@ func TestPlanCacheEstimatorRevisionRelevantAndUnrelated(t *testing.T) {
 		if _, _ = drainQ(t, db, stmt, IntValue(step.param)); stmt.sc.p.Load().sp == before {
 			t.Fatalf("row mutation did not invalidate: %s", step.sql)
 		}
+	}
+}
+
+func TestPlanCacheAnalyzeInvalidatesOnlyRelevantRelation(t *testing.T) {
+	t.Parallel()
+	db := memDB().Session(SessionOptions{})
+	mustExec(t, db, "CREATE TABLE a (id i32 PRIMARY KEY, v i32)")
+	mustExec(t, db, "CREATE INDEX a_v_idx ON a (v)")
+	mustExec(t, db, "INSERT INTO a VALUES (1,0),(2,0),(3,0),(4,0),(5,0),(6,0),(7,0),(8,0),(9,1),(10,NULL)")
+	mustExec(t, db, "CREATE TABLE b (id i32 PRIMARY KEY, v i32)")
+	mustExec(t, db, "INSERT INTO b VALUES (1, 1)")
+	stmt, err := db.Prepare("SELECT id FROM a WHERE v = 0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	drainQ(t, db, stmt)
+	initial := stmt.sc.p.Load().sp
+
+	mustExec(t, db, "ANALYZE b")
+	drainQ(t, db, stmt)
+	if stmt.sc.p.Load().sp != initial {
+		t.Fatal("ANALYZE of an unrelated relation invalidated the plan")
+	}
+
+	mustExec(t, db, "ANALYZE a (v)")
+	rows, cost := drainQ(t, db, stmt)
+	if stmt.sc.p.Load().sp == initial {
+		t.Fatal("ANALYZE of the referenced relation did not invalidate the plan")
+	}
+	fresh, err := db.Prepare("SELECT id FROM a WHERE v = 0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	freshRows, freshCost := drainQ(t, db, fresh)
+	if !planCacheRowsEq(rows, freshRows) || cost != freshCost {
+		t.Fatalf("refilled vs fresh = rows %v/%v cost %d/%d", rows, freshRows, cost, freshCost)
+	}
+	if got, want := cachedExplain(t, db, stmt), cachedExplain(t, db, fresh); !reflect.DeepEqual(got, want) {
+		t.Fatalf("refilled vs fresh EXPLAIN = %v / %v", got, want)
 	}
 }
 

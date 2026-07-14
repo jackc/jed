@@ -9,11 +9,19 @@ type estimatorFraction struct {
 }
 
 const (
-	maxEstimate             int64 = 9223372036854775807
-	defaultDistinctValues   int64 = 200
-	defaultSRFRows          int64 = 1000
-	defaultVariableKeyBytes int64 = 1
-	joinDPLimit                   = 8
+	maxEstimate                   int64 = 9223372036854775807
+	defaultDistinctValues         int64 = 200
+	defaultSRFRows                int64 = 1000
+	defaultVariableKeyBytes       int64 = 1
+	joinDPLimit                         = 8
+	statisticsTarget                    = 100
+	statisticsSampleRows                = 30000
+	statisticsKMVHashes                 = 4096
+	statisticsMCVEntries                = 100
+	statisticsHistogramBounds           = 101
+	statisticsMaxValueBytes             = 128
+	statisticsNDVScaleNumerator         = 1
+	statisticsNDVScaleDenominator       = 10
 )
 
 var (
@@ -47,35 +55,37 @@ var estimatorAccessPathOrder = [...]string{
 	"full",
 }
 
-const estimatorUnitCount = 23
+const estimatorUnitCount = 24
 const (
 	estimatorUnitStorageRowRead      = 0
-	estimatorUnitPageRead            = 1
-	estimatorUnitConstraintCheck     = 2
-	estimatorUnitValueCompress       = 3
-	estimatorUnitValueDecompress     = 4
-	estimatorUnitDecimalWork         = 5
-	estimatorUnitRowProduced         = 6
-	estimatorUnitOperatorEval        = 7
-	estimatorUnitHashBuild           = 8
-	estimatorUnitHashProbe           = 9
-	estimatorUnitAggregateAccumulate = 10
-	estimatorUnitCteScanRow          = 11
-	estimatorUnitGeneratedRow        = 12
-	estimatorUnitSequenceAdvance     = 13
-	estimatorUnitGinEntry            = 14
-	estimatorUnitGistDescent         = 15
-	estimatorUnitCollate             = 16
-	estimatorUnitTimezone            = 17
-	estimatorUnitRegexCompile        = 18
-	estimatorUnitRegexStep           = 19
-	estimatorUnitWindowResult        = 20
-	estimatorUnitVarlenCompare       = 21
-	estimatorUnitWindowFrameStep     = 22
+	estimatorUnitStatisticsValue     = 1
+	estimatorUnitPageRead            = 2
+	estimatorUnitConstraintCheck     = 3
+	estimatorUnitValueCompress       = 4
+	estimatorUnitValueDecompress     = 5
+	estimatorUnitDecimalWork         = 6
+	estimatorUnitRowProduced         = 7
+	estimatorUnitOperatorEval        = 8
+	estimatorUnitHashBuild           = 9
+	estimatorUnitHashProbe           = 10
+	estimatorUnitAggregateAccumulate = 11
+	estimatorUnitCteScanRow          = 12
+	estimatorUnitGeneratedRow        = 13
+	estimatorUnitSequenceAdvance     = 14
+	estimatorUnitGinEntry            = 15
+	estimatorUnitGistDescent         = 16
+	estimatorUnitCollate             = 17
+	estimatorUnitTimezone            = 18
+	estimatorUnitRegexCompile        = 19
+	estimatorUnitRegexStep           = 20
+	estimatorUnitWindowResult        = 21
+	estimatorUnitVarlenCompare       = 22
+	estimatorUnitWindowFrameStep     = 23
 )
 
 var estimatorUnitIDs = [...]string{
 	"storage_row_read",
+	"statistics_value",
 	"page_read",
 	"constraint_check",
 	"value_compress",
@@ -101,6 +111,7 @@ var estimatorUnitIDs = [...]string{
 }
 
 var estimatorUnitWeights = [...]int64{
+	1,
 	1,
 	1,
 	1,

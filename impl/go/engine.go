@@ -465,6 +465,43 @@ func (db *engine) columnCollations(columns []catColumn) []*Collation {
 	return out
 }
 
+// relationSnap is the relation-owning read snapshot for planner/ANALYZE metadata. A bare name uses
+// the same temp-first rule as lkpTableScoped/lkpStoreScoped.
+func (db *engine) relationSnap(scope *string, table string) *snapshot {
+	if scope != nil {
+		return db.snapForScope(*scope)
+	}
+	if _, ok := db.tempSnap().table(table); ok {
+		return db.tempSnap()
+	}
+	return db.readSnap()
+}
+
+func (db *engine) columnCollationsScoped(scope *string, table string, columns []catColumn) []*Collation {
+	snap := db.relationSnap(scope, table)
+	out := make([]*Collation, len(columns))
+	for i := range columns {
+		if columns[i].Collation != "" {
+			out[i] = snap.resolveCollation(columns[i].Collation)
+		}
+	}
+	return out
+}
+
+func (db *engine) columnStatisticsScoped(scope *string, table string, column int) *columnStatistics {
+	snap := db.relationSnap(scope, table)
+	definition := snap.tables[strings.ToLower(table)]
+	if definition == nil || column < 0 || column >= len(definition.Columns) {
+		return nil
+	}
+	if name := definition.Columns[column].Collation; name != "" {
+		if _, _, _, _, skewed := snap.collationSkew(name); skewed {
+			return nil
+		}
+	}
+	return snap.columnStatistics(table, column)
+}
+
 // collatedTextKey is the order-preserving key body for a text value (encoding.md §2.12): the
 // collation's UCA sort key when coll is non-nil (a non-C collated column), else the C
 // text-terminated-escape body (§2.4). The sort key can fail (0A000) on a code point the collation
@@ -736,11 +773,15 @@ func (db *engine) markEstimatorMutation(scope *string, table string) {
 	database := "main"
 	if scope == nil {
 		if db.isTempTable(table) {
+			db.session.tx.tempDirty = true
+			db.session.tx.tempWorking.markStatisticsStale(table)
 			return
 		}
 	} else {
 		database = strings.ToLower(*scope)
 		if database == "temp" {
+			db.session.tx.tempDirty = true
+			db.session.tx.tempWorking.markStatisticsStale(table)
 			return
 		}
 	}
@@ -753,11 +794,14 @@ func (db *engine) markEstimatorMutation(scope *string, table string) {
 	}
 	db.estimatorTouched[key] = struct{}{}
 	if database == "main" {
-		db.working().bumpEstimatorRevision(table)
+		snap := db.working()
+		snap.bumpEstimatorRevision(table)
+		snap.markStatisticsStale(table)
 		return
 	}
 	if snap := db.attachWriteSnap(database); snap != nil {
 		snap.bumpEstimatorRevision(table)
+		snap.markStatisticsStale(table)
 	}
 }
 

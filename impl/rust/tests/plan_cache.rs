@@ -156,9 +156,9 @@ fn estimator_revision_tracks_relevant_relations() {
     );
     assert_eq!(cached_explain(&s, &stmt), cached_explain(&s, &fresh));
 
-    // Cover each distinct row-mutation executor path. A no-op conflict remains a hit; real UPDATE,
-    // INSERT ... SELECT, UPSERT-update, and DELETE statements each replace the relation revision.
-    let plan = {
+    // Cover each distinct row-mutation executor path. P9 conservatively advances the target
+    // revision even for a successful zero-row disposition, retaining its facts as stale.
+    let before_noop = {
         let cache = stmt.cache().borrow();
         std::rc::Rc::clone(&cache.as_ref().unwrap().plan)
     };
@@ -169,7 +169,10 @@ fn estimator_revision_tracks_relevant_relations() {
     let _ = drain(&mut s, &stmt, &[Value::Int(10)]);
     {
         let cache = stmt.cache().borrow();
-        assert!(std::rc::Rc::ptr_eq(&cache.as_ref().unwrap().plan, &plan));
+        assert!(!std::rc::Rc::ptr_eq(
+            &cache.as_ref().unwrap().plan,
+            &before_noop
+        ));
     }
     for (sql, param) in [
         ("UPDATE a SET v = 11 WHERE id = 1", 11),
@@ -192,6 +195,49 @@ fn estimator_revision_tracks_relevant_relations() {
             "row mutation did not invalidate: {sql}"
         );
     }
+}
+
+/// ANALYZE advances only its target relation's estimator revision. A cached target plan is
+/// refilled against the new distribution facts and agrees with an independently fresh plan.
+#[test]
+fn analyze_invalidates_only_relevant_cached_plans() {
+    let mut s = mem();
+    exec(&mut s, "CREATE TABLE a (id i32 PRIMARY KEY, v i32)");
+    exec(&mut s, "CREATE INDEX a_v_idx ON a (v)");
+    exec(
+        &mut s,
+        "INSERT INTO a VALUES (1,0),(2,0),(3,0),(4,0),(5,0),(6,0),(7,0),(8,0),(9,1),(10,NULL)",
+    );
+    exec(&mut s, "CREATE TABLE b (id i32 PRIMARY KEY, v i32)");
+    exec(&mut s, "INSERT INTO b VALUES (1, 1)");
+    let stmt = s.prepare("SELECT id FROM a WHERE v = 0").unwrap();
+    let _ = drain(&mut s, &stmt, &[]);
+    let initial = {
+        let cache = stmt.cache().borrow();
+        std::rc::Rc::clone(&cache.as_ref().unwrap().plan)
+    };
+
+    exec(&mut s, "ANALYZE b");
+    let _ = drain(&mut s, &stmt, &[]);
+    {
+        let cache = stmt.cache().borrow();
+        assert!(std::rc::Rc::ptr_eq(&cache.as_ref().unwrap().plan, &initial));
+    }
+
+    exec(&mut s, "ANALYZE a (v)");
+    let (rows, cost) = drain(&mut s, &stmt, &[]);
+    {
+        let cache = stmt.cache().borrow();
+        assert!(!std::rc::Rc::ptr_eq(
+            &cache.as_ref().unwrap().plan,
+            &initial
+        ));
+    }
+    let fresh = s.prepare("SELECT id FROM a WHERE v = 0").unwrap();
+    let (fresh_rows, fresh_cost) = drain(&mut s, &fresh, &[]);
+    assert_eq!(rows, fresh_rows);
+    assert_eq!(cost, fresh_cost);
+    assert_eq!(cached_explain(&s, &stmt), cached_explain(&s, &fresh));
 }
 
 /// Working statistics may invalidate a committed entry for the transaction's read, but may never

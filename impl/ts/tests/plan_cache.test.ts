@@ -120,12 +120,16 @@ test("plan cache: estimator revision tracks relevant relations only", () => {
   assert.equal(refilled.cost, freshRun.cost, "refilled and fresh actual cost must match");
   assert.deepEqual(cachedExplain(db, stmt), cachedExplain(db, fresh));
 
-  // Cover every distinct row-mutation executor path. A no-op conflict remains a hit; real UPDATE,
-  // INSERT ... SELECT, UPSERT-update, and DELETE statements each replace the relation revision.
-  const plan = cacheOf(stmt)!.sp;
+  // P9 conservatively advances the target revision even for a successful zero-row disposition,
+  // retaining its facts as stale.
+  const beforeNoop = cacheOf(stmt)!.sp;
   execute(db, "INSERT INTO a VALUES (1, 99) ON CONFLICT DO NOTHING");
   drain(db, stmt, [intValue(10n)]);
-  assert.equal(cacheOf(stmt)!.sp, plan, "ON CONFLICT DO NOTHING invalidated an unchanged relation");
+  assert.notEqual(
+    cacheOf(stmt)!.sp,
+    beforeNoop,
+    "ON CONFLICT DO NOTHING did not conservatively invalidate the target",
+  );
   for (const [sql, param] of [
     ["UPDATE a SET v = 11 WHERE id = 1", 11n],
     ["INSERT INTO a SELECT 2, 20", 11n],
@@ -137,6 +141,34 @@ test("plan cache: estimator revision tracks relevant relations only", () => {
     drain(db, stmt, [intValue(param)]);
     assert.notEqual(cacheOf(stmt)!.sp, before, `row mutation did not invalidate: ${sql}`);
   }
+});
+
+test("plan cache: ANALYZE invalidates only its target relation", () => {
+  const db = new Engine();
+  execute(db, "CREATE TABLE a (id i32 PRIMARY KEY, v i32)");
+  execute(db, "CREATE INDEX a_v_idx ON a (v)");
+  execute(
+    db,
+    "INSERT INTO a VALUES (1,0),(2,0),(3,0),(4,0),(5,0),(6,0),(7,0),(8,0),(9,1),(10,NULL)",
+  );
+  execute(db, "CREATE TABLE b (id i32 PRIMARY KEY, v i32)");
+  execute(db, "INSERT INTO b VALUES (1, 1)");
+  const stmt = prepare(db, "SELECT id FROM a WHERE v = 0");
+  drain(db, stmt);
+  const initial = cacheOf(stmt)!.sp;
+
+  execute(db, "ANALYZE b");
+  drain(db, stmt);
+  assert.equal(cacheOf(stmt)!.sp, initial, "unrelated ANALYZE invalidated the plan");
+
+  execute(db, "ANALYZE a (v)");
+  const refilled = drain(db, stmt);
+  assert.notEqual(cacheOf(stmt)!.sp, initial, "target ANALYZE did not invalidate the plan");
+  const fresh = prepare(db, "SELECT id FROM a WHERE v = 0");
+  const freshRun = drain(db, fresh);
+  assert.deepEqual(refilled.rows, freshRun.rows);
+  assert.equal(refilled.cost, freshRun.cost);
+  assert.deepEqual(cachedExplain(db, stmt), cachedExplain(db, fresh));
 });
 
 test("plan cache: rollback restores committed estimator signature", () => {

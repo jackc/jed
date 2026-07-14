@@ -400,6 +400,88 @@ func predicateSelectivity(expr *rExpr) selectivityExpr {
 	}
 }
 
+func (db *engine) predicateSelectivityWithStatistics(expr *rExpr, rel scopeRel) selectivityExpr {
+	if expr == nil {
+		return selectivityExpr{kind: selectivityAll}
+	}
+	switch expr.kind {
+	case reAnd:
+		var conjuncts []*rExpr
+		flattenEstimatorBoolean(expr, reAnd, &conjuncts)
+		if estimatorConjunctionContradictory(conjuncts) {
+			return selectivityExpr{kind: selectivityZero}
+		}
+		used := make([]bool, len(conjuncts))
+		result := selectivityExpr{kind: selectivityAll}
+		for i, conjunct := range conjuncts {
+			if used[i] {
+				continue
+			}
+			paired := -1
+			for j := i + 1; j < len(conjuncts); j++ {
+				if !used[j] && pairedRangeConjunction(conjunct, conjuncts[j]) {
+					paired = j
+					break
+				}
+			}
+			if paired >= 0 {
+				used[paired] = true
+				rangeEstimate, ok := db.statisticsPairedRangeSelectivity(conjunct, conjuncts[paired], rel)
+				if !ok {
+					rangeEstimate = fractionSelectivity(selectivityPairedRange)
+				}
+				result = result.And(rangeEstimate)
+			} else {
+				result = result.And(db.predicateSelectivityWithStatistics(conjunct, rel))
+			}
+		}
+		return result
+	case reOr:
+		if estimate, ok := db.statisticsEqualityDisjunctionSelectivity(expr, rel); ok {
+			return estimate
+		}
+		var disjuncts []*rExpr
+		flattenEstimatorBoolean(expr, reOr, &disjuncts)
+		var result *selectivityExpr
+		for i, disjunct := range disjuncts {
+			duplicate := false
+			if operand, literal, ok := estimatorEqualityParts(disjunct); ok {
+				for _, prior := range disjuncts[:i] {
+					pOperand, pLiteral, pok := estimatorEqualityParts(prior)
+					if pok && rexprEqShifted(operand, pOperand, 0) && rexprEqShifted(literal, pLiteral, 0) {
+						duplicate = true
+						break
+					}
+				}
+			}
+			if duplicate {
+				continue
+			}
+			part := db.predicateSelectivityWithStatistics(disjunct, rel)
+			if result == nil {
+				result = &part
+			} else {
+				combined := result.Or(part)
+				result = &combined
+			}
+		}
+		if result == nil {
+			return selectivityExpr{kind: selectivityZero}
+		}
+		return *result
+	case reNot:
+		if estimate, ok := db.statisticsNegatedLeafSelectivity(expr.operand, rel); ok {
+			return estimate
+		}
+		return db.predicateSelectivityWithStatistics(expr.operand, rel).Not()
+	default:
+		if estimate, ok := db.statisticsLeafSelectivity(expr, rel); ok {
+			return estimate
+		}
+		return predicateSelectivity(expr)
+	}
+}
+
 func flattenEstimatorBoolean(expr *rExpr, kind rExprKind, out *[]*rExpr) {
 	if expr.kind == kind {
 		flattenEstimatorBoolean(expr.lhs, kind, out)
@@ -747,6 +829,143 @@ func candidateAccessSelectivity(candidate scanCandidate, rel scopeRel) selectivi
 	}
 }
 
+func (db *engine) intervalSelectivityWithStatistics(
+	specs []intervalSpec,
+	clip []boundTerm,
+	uniquePoints bool,
+	keyType scalarType,
+	column int,
+	rel scopeRel,
+) selectivityExpr {
+	var disjunction *selectivityExpr
+	for _, spec := range specs {
+		structural := rangeTermsSelectivity(spec.terms, keyType)
+		term := structural
+		allEqual := len(spec.terms) > 0
+		for _, bound := range spec.terms {
+			allEqual = allEqual && bound.op == opEq
+		}
+		if structural.kind != selectivityZero && uniquePoints && allEqual {
+			term = selectivityExpr{kind: selectivityUnique}
+		} else if structural.kind != selectivityZero {
+			if estimated, ok := db.statisticsBoundTermsSelectivity(rel, column, spec.terms); ok {
+				term = estimated
+			}
+		}
+		if disjunction == nil {
+			disjunction = &term
+		} else {
+			combined := disjunction.Or(term)
+			disjunction = &combined
+		}
+	}
+	if disjunction == nil {
+		zero := selectivityExpr{kind: selectivityZero}
+		disjunction = &zero
+	}
+	if len(clip) > 0 {
+		clipEstimate := rangeTermsSelectivity(clip, keyType)
+		if estimated, ok := db.statisticsBoundTermsSelectivity(rel, column, clip); ok {
+			clipEstimate = estimated
+		}
+		return disjunction.And(clipEstimate)
+	}
+	return *disjunction
+}
+
+func (db *engine) candidateAccessSelectivityWithStatistics(candidate scanCandidate, rel scopeRel) selectivityExpr {
+	structural := candidateAccessSelectivity(candidate, rel)
+	if structural.kind == selectivityZero || structural.kind == selectivityUnique {
+		return structural
+	}
+	switch candidate.identity.kind {
+	case scanCandidatePK:
+		result := selectivityExpr{kind: selectivityAll}
+		for _, eq := range candidate.bound.pk.eqCols {
+			column := rel.table.ColumnIndex(eq.name)
+			estimate := fractionSelectivity(selectivityEquality)
+			if column >= 0 && len(eq.srcs) > 0 {
+				if refined, ok := db.statisticsBoundSourceSelectivity(rel, column, opEq, eq.srcs[0]); ok {
+					estimate = refined
+				}
+			}
+			result = result.And(estimate)
+		}
+		if len(candidate.bound.pk.rangeTerms) > 0 {
+			column := rel.table.ColumnIndex(candidate.bound.pk.rangeName)
+			estimate := rangeTermsSelectivity(candidate.bound.pk.rangeTerms, candidate.bound.pk.rangeType)
+			if column >= 0 {
+				if refined, ok := db.statisticsBoundTermsSelectivity(rel, column, candidate.bound.pk.rangeTerms); ok {
+					estimate = refined
+				}
+			}
+			result = result.And(estimate)
+		}
+		return result
+	case scanCandidateBtree:
+		var index *indexDef
+		for i := range rel.table.Indexes {
+			if strings.EqualFold(rel.table.Indexes[i].Name, candidate.identity.indexName) {
+				index = &rel.table.Indexes[i]
+				break
+			}
+		}
+		if index == nil {
+			return structural
+		}
+		result := selectivityExpr{kind: selectivityAll}
+		for position, eq := range candidate.bound.index.eqCols {
+			estimate := fractionSelectivity(selectivityEquality)
+			if position < len(index.Keys) {
+				if column, ok := index.Keys[position].asColumn(); ok && len(eq.srcs) > 0 {
+					if refined, ok := db.statisticsBoundSourceSelectivity(rel, column, opEq, eq.srcs[0]); ok {
+						estimate = refined
+					}
+				}
+			}
+			result = result.And(estimate)
+		}
+		if len(candidate.bound.index.rangeTerms) > 0 {
+			estimate := rangeTermsSelectivity(candidate.bound.index.rangeTerms, candidate.bound.index.rangeType)
+			position := len(candidate.bound.index.eqCols)
+			if position < len(index.Keys) {
+				if column, ok := index.Keys[position].asColumn(); ok {
+					if refined, ok := db.statisticsBoundTermsSelectivity(rel, column, candidate.bound.index.rangeTerms); ok {
+						estimate = refined
+					}
+				}
+			}
+			result = result.And(estimate)
+		}
+		return result
+	case scanCandidatePKInterval:
+		if len(rel.table.PK) != 1 {
+			return structural
+		}
+		bound := candidate.bound.pkSet
+		return db.intervalSelectivityWithStatistics(bound.specs, bound.clip, true, bound.pkType, rel.table.PK[0], rel)
+	case scanCandidateIndexInterval:
+		var index *indexDef
+		for i := range rel.table.Indexes {
+			if strings.EqualFold(rel.table.Indexes[i].Name, candidate.identity.indexName) {
+				index = &rel.table.Indexes[i]
+				break
+			}
+		}
+		if index == nil || len(index.Keys) == 0 {
+			return structural
+		}
+		column, ok := index.Keys[0].asColumn()
+		if !ok {
+			return structural
+		}
+		bound := candidate.bound.indexSet
+		return db.intervalSelectivityWithStatistics(bound.specs, bound.clip, index.Unique && len(index.Keys) == 1, bound.colType, column, rel)
+	default:
+		return structural
+	}
+}
+
 func estimatorOperatorNodes(expr *rExpr) int64 {
 	if expr == nil {
 		return 0
@@ -799,15 +1018,15 @@ func (db *engine) estimateScanCandidates(candidates []scanCandidate, rel scopeRe
 	selectivities := make([]selectivityExpr, len(candidates))
 	accessProvesEmpty := false
 	for i, candidate := range candidates {
-		selectivities[i] = candidateAccessSelectivity(candidate, rel)
+		selectivities[i] = db.candidateAccessSelectivityWithStatistics(candidate, rel)
 		accessProvesEmpty = accessProvesEmpty || selectivities[i].kind == selectivityZero
 	}
-	outputSelectivity := predicateSelectivity(func() *rExpr {
+	outputSelectivity := db.predicateSelectivityWithStatistics(func() *rExpr {
 		if len(candidates) == 0 {
 			return nil
 		}
 		return candidates[0].residual
-	}())
+	}(), rel)
 	if accessProvesEmpty {
 		outputSelectivity = selectivityExpr{kind: selectivityZero}
 	}
@@ -1046,6 +1265,126 @@ func (db *engine) planRelScope(rel planRel) (scopeRel, bool) {
 	return scopeRel{label: strings.ToLower(rel.tableName), table: table, offset: rel.offset, db: rel.db}, true
 }
 
+func (db *engine) estimateColumnStatistics(sp *selectPlan, global int) (int, *currentColumnStatistics, bool) {
+	for ordinal, rel := range sp.rels {
+		if global < rel.offset || global >= rel.offset+rel.colCount {
+			continue
+		}
+		scope, ok := db.planRelScope(rel)
+		if !ok {
+			return 0, nil, false
+		}
+		statistics := db.currentColumnStatistics(scope, global-rel.offset)
+		return ordinal, statistics, statistics != nil
+	}
+	return 0, nil, false
+}
+
+func estimateExpressionOwner(sp *selectPlan, expr *rExpr) (int, int) {
+	if expr == nil {
+		return 0, 0
+	}
+	merge := func(a, aState, b, bState int) (int, int) {
+		if aState == 2 || bState == 2 || aState == 1 && bState == 1 && a != b {
+			return 0, 2
+		}
+		if aState == 1 {
+			return a, 1
+		}
+		if bState == 1 {
+			return b, 1
+		}
+		return 0, 0
+	}
+	switch expr.kind {
+	case reColumn:
+		for ordinal, rel := range sp.rels {
+			if expr.index >= rel.offset && expr.index < rel.offset+rel.colCount {
+				return ordinal, 1
+			}
+		}
+	case reCompare, reDistinct, reAnd, reOr:
+		a, as := estimateExpressionOwner(sp, expr.lhs)
+		b, bs := estimateExpressionOwner(sp, expr.rhs)
+		return merge(a, as, b, bs)
+	case reNot, reIsNull:
+		return estimateExpressionOwner(sp, expr.operand)
+	case reInValues:
+		return estimateExpressionOwner(sp, expr.lhs)
+	}
+	return 0, 0
+}
+
+func (db *engine) estimatePredicateSelectivityWithStatistics(sp *selectPlan, expr *rExpr) selectivityExpr {
+	if expr == nil {
+		return selectivityExpr{kind: selectivityAll}
+	}
+	if expr.kind == reCompare && expr.op == opEq && expr.lhs.kind == reColumn && expr.rhs.kind == reColumn {
+		leftRel, left, leftOK := db.estimateColumnStatistics(sp, expr.lhs.index)
+		rightRel, right, rightOK := db.estimateColumnStatistics(sp, expr.rhs.index)
+		if leftOK && rightOK && leftRel != rightRel && left.ndv != nil && right.ndv != nil {
+			population := satEstimateMul(left.rows, right.rows)
+			denominator := max64(1, max64(*left.ndv, *right.ndv))
+			rows := ceilEstimateMulDiv(left.nonnullRows, right.nonnullRows, denominator)
+			if rows > population {
+				rows = population
+			}
+			return statisticsSelectivity(rows, population)
+		}
+	}
+	if ordinal, state := estimateExpressionOwner(sp, expr); state == 1 {
+		if scope, ok := db.planRelScope(sp.rels[ordinal]); ok {
+			return db.predicateSelectivityWithStatistics(expr, scope)
+		}
+	}
+	switch expr.kind {
+	case reAnd:
+		return db.estimatePredicateSelectivityWithStatistics(sp, expr.lhs).And(
+			db.estimatePredicateSelectivityWithStatistics(sp, expr.rhs),
+		)
+	case reOr:
+		return db.estimatePredicateSelectivityWithStatistics(sp, expr.lhs).Or(
+			db.estimatePredicateSelectivityWithStatistics(sp, expr.rhs),
+		)
+	case reNot:
+		return db.estimatePredicateSelectivityWithStatistics(sp, expr.operand).Not()
+	default:
+		return predicateSelectivity(expr)
+	}
+}
+
+func (db *engine) estimateSimpleDistinctRows(sp *selectPlan, globals []int, inputRows int64) (int64, bool) {
+	if len(globals) == 0 {
+		return 0, false
+	}
+	groups := int64(1)
+	for _, global := range globals {
+		_, statistics, ok := db.estimateColumnStatistics(sp, global)
+		if !ok || statistics.ndv == nil {
+			return 0, false
+		}
+		buckets := *statistics.ndv
+		if statistics.nullRows > 0 {
+			buckets++
+		}
+		groups = satEstimateMul(groups, buckets)
+	}
+	if groups > inputRows {
+		groups = inputRows
+	}
+	return groups, true
+}
+
+func (db *engine) estimateHashWidth(sp *selectPlan, global int, ty dataType) int64 {
+	if scalar, ok := ty.AsScalar(); ok && scalar.IsFixedWidth() {
+		return int64(scalar.WidthBytes())
+	}
+	if _, statistics, ok := db.estimateColumnStatistics(sp, global); ok && statistics.averageWidth != nil {
+		return max64(1, *statistics.averageWidth)
+	}
+	return defaultVariableKeyBytes
+}
+
 func estimateGenerateSeriesRows(srf *srfPlan) int64 {
 	if srf.kind != srfGenerateSeries || len(srf.args) < 2 || len(srf.args) > 3 ||
 		srf.args[0].kind != reConstInt || srf.args[1].kind != reConstInt ||
@@ -1099,6 +1438,8 @@ func (db *engine) estimateCatalogRows(srf *srfPlan) int64 {
 					rows = satEstimateAdd(rows, 1)
 				}
 			}
+		case srfJedStatistics:
+			rows = satEstimateAdd(rows, int64(len(snap.statistics[strings.ToLower(table.Name)])))
 		}
 	}
 	return rows
@@ -1156,11 +1497,12 @@ func (db *engine) estimateRelation(sp *selectPlan, index int, ctx *estimateCTECt
 	}
 }
 
-func joinEstimatedRows(kind joinKind, on *rExpr, physicalPairs, logicalPairs, preservedLeft, preservedRight int64, boundByOuter bool) (int64, int64) {
+func (db *engine) joinEstimatedRows(sp *selectPlan, kind joinKind, on *rExpr, physicalPairs, logicalPairs, preservedLeft, preservedRight int64, boundByOuter bool) (int64, int64) {
 	physicalRows, logicalRows := physicalPairs, logicalPairs
 	if on != nil && !boundByOuter {
-		physicalRows = estimateSelectivity(predicateSelectivity(on), physicalPairs)
-		logicalRows = estimateSelectivity(predicateSelectivity(on), logicalPairs)
+		selectivity := db.estimatePredicateSelectivityWithStatistics(sp, on)
+		physicalRows = estimateSelectivity(selectivity, physicalPairs)
+		logicalRows = estimateSelectivity(selectivity, logicalPairs)
 	}
 	switch kind {
 	case joinLeft:
@@ -1222,24 +1564,23 @@ func (db *engine) estimateJoinTree(sp *selectPlan, n int, ctx *estimateCTECtx) e
 		logicalPairs = physicalPairs
 	}
 	join := sp.joins[n-2]
-	rows, logicalRows := joinEstimatedRows(join.kind, join.on, physicalPairs, logicalPairs, left.root.rows, right.root.rows, boundByOuter)
+	rows, logicalRows := db.joinEstimatedRows(sp, join.kind, join.on, physicalPairs, logicalPairs, left.root.rows, right.root.rows, boundByOuter)
 	root := addPlanEstimates(left.root, right.root)
 	root.rows, root.logicalRows = rows, logicalRows
 	invocations := physicalPairs
 	if n == 2 && sp.phys.hashJoin != nil {
 		// Key evaluation charges each encoded part. Exact-bucket verification compares the framed
 		// composite key (u32 length + part), so it includes four bytes per key.
-		keyBytes, framedBytes := int64(0), int64(0)
+		buildBytes, probeBytes, framedBytes := int64(0), int64(0), int64(0)
 		for _, key := range sp.phys.hashJoin.keys {
-			width := int64(defaultVariableKeyBytes)
-			if scalar, ok := key.ty.AsScalar(); ok && scalar.IsFixedWidth() {
-				width = int64(scalar.WidthBytes())
-			}
-			keyBytes = satEstimateAdd(keyBytes, width)
-			framedBytes = satEstimateAdd(framedBytes, satEstimateAdd(4, width))
+			buildWidth := db.estimateHashWidth(sp, key.right, key.ty)
+			probeWidth := db.estimateHashWidth(sp, key.left, key.ty)
+			buildBytes = satEstimateAdd(buildBytes, buildWidth)
+			probeBytes = satEstimateAdd(probeBytes, probeWidth)
+			framedBytes = satEstimateAdd(framedBytes, satEstimateAdd(4, min64(buildWidth, probeWidth)))
 		}
-		addPlanUnit(&root, estimatorUnitHashBuild, satEstimateMul(right.root.rows, keyBytes))
-		addPlanUnit(&root, estimatorUnitHashProbe, satEstimateAdd(satEstimateMul(left.root.rows, keyBytes), satEstimateMul(rows, framedBytes)))
+		addPlanUnit(&root, estimatorUnitHashBuild, satEstimateMul(right.root.rows, buildBytes))
+		addPlanUnit(&root, estimatorUnitHashProbe, satEstimateAdd(satEstimateMul(left.root.rows, probeBytes), satEstimateMul(rows, framedBytes)))
 		invocations = rows
 	}
 	addPlanUnit(&root, estimatorUnitOperatorEval, satEstimateMul(estimatorOperatorNodes(join.on), invocations))
@@ -1265,8 +1606,9 @@ func (db *engine) estimateNWayJoinTree(sp *selectPlan, n int, ctx *estimateCTECt
 	fullRows := fullPairs
 	if !boundByOuter {
 		for _, onIndex := range step.onIndices {
-			fullRows = estimateSelectivity(predicateSelectivity(sp.joins[onIndex].on), fullRows)
-			fullLogicalRows = estimateSelectivity(predicateSelectivity(sp.joins[onIndex].on), fullLogicalRows)
+			selectivity := db.estimatePredicateSelectivityWithStatistics(sp, sp.joins[onIndex].on)
+			fullRows = estimateSelectivity(selectivity, fullRows)
+			fullLogicalRows = estimateSelectivity(selectivity, fullLogicalRows)
 		}
 	}
 	stepKind := joinCross
@@ -1302,7 +1644,7 @@ func (db *engine) estimateNWayJoinTree(sp *selectPlan, n int, ctx *estimateCTECt
 		}
 		postFilterRows := fullRows
 		if sp.filter != nil {
-			postFilterRows = estimateSelectivity(predicateSelectivity(sp.filter), fullRows)
+			postFilterRows = estimateSelectivity(db.estimatePredicateSelectivityWithStatistics(sp, sp.filter), fullRows)
 		}
 		switch {
 		case target == 0:
@@ -1333,17 +1675,16 @@ func (db *engine) estimateNWayJoinTree(sp *selectPlan, n int, ctx *estimateCTECt
 	root.rows, root.logicalRows = deliveredRows, fullLogicalRows
 	invocations := visitedPairs
 	if step.hashJoin != nil {
-		keyBytes, framedBytes := int64(0), int64(0)
+		buildBytes, probeBytes, framedBytes := int64(0), int64(0), int64(0)
 		for _, key := range step.hashJoin.keys {
-			width := int64(defaultVariableKeyBytes)
-			if scalar, ok := key.ty.AsScalar(); ok && scalar.IsFixedWidth() {
-				width = int64(scalar.WidthBytes())
-			}
-			keyBytes = satEstimateAdd(keyBytes, width)
-			framedBytes = satEstimateAdd(framedBytes, satEstimateAdd(4, width))
+			buildWidth := db.estimateHashWidth(sp, key.right, key.ty)
+			probeWidth := db.estimateHashWidth(sp, key.left, key.ty)
+			buildBytes = satEstimateAdd(buildBytes, buildWidth)
+			probeBytes = satEstimateAdd(probeBytes, probeWidth)
+			framedBytes = satEstimateAdd(framedBytes, satEstimateAdd(4, min64(buildWidth, probeWidth)))
 		}
-		addPlanUnit(&root, estimatorUnitHashBuild, satEstimateMul(innerPerCall.root.rows, keyBytes))
-		addPlanUnit(&root, estimatorUnitHashProbe, satEstimateAdd(satEstimateMul(outerCalls, keyBytes), satEstimateMul(deliveredRows, framedBytes)))
+		addPlanUnit(&root, estimatorUnitHashBuild, satEstimateMul(innerPerCall.root.rows, buildBytes))
+		addPlanUnit(&root, estimatorUnitHashProbe, satEstimateAdd(satEstimateMul(outerCalls, probeBytes), satEstimateMul(deliveredRows, framedBytes)))
 		invocations = deliveredRows
 	}
 	onNodes := int64(0)
@@ -1371,8 +1712,8 @@ func (db *engine) estimateTwoRelationJoin(sp *selectPlan, ctx *estimateCTECtx) e
 	fullPairs := satEstimateMul(outer.root.rows, innerPerCall.root.rows)
 	fullLogicalPairs := satEstimateMul(outer.root.logicalRows, innerPerCall.root.logicalRows)
 	join := sp.joins[0]
-	fullRows, fullLogicalRows := joinEstimatedRows(
-		join.kind, join.on, fullPairs, fullLogicalPairs,
+	fullRows, fullLogicalRows := db.joinEstimatedRows(
+		sp, join.kind, join.on, fullPairs, fullLogicalPairs,
 		outer.root.rows, innerPerCall.root.rows, boundByOuter,
 	)
 
@@ -1385,7 +1726,7 @@ func (db *engine) estimateTwoRelationJoin(sp *selectPlan, ctx *estimateCTECtx) e
 		}
 		postFilterRows := fullRows
 		if sp.filter != nil {
-			postFilterRows = estimateSelectivity(predicateSelectivity(sp.filter), fullRows)
+			postFilterRows = estimateSelectivity(db.estimatePredicateSelectivityWithStatistics(sp, sp.filter), fullRows)
 		}
 		switch {
 		case target == 0:
@@ -1418,18 +1759,17 @@ func (db *engine) estimateTwoRelationJoin(sp *selectPlan, ctx *estimateCTECtx) e
 	root.rows, root.logicalRows = deliveredRows, fullLogicalRows
 	invocations := visitedPairs
 	if sp.phys.hashJoin != nil {
-		keyBytes, framedBytes := int64(0), int64(0)
+		buildBytes, probeBytes, framedBytes := int64(0), int64(0), int64(0)
 		for _, key := range sp.phys.hashJoin.keys {
-			width := int64(defaultVariableKeyBytes)
-			if scalar, ok := key.ty.AsScalar(); ok && scalar.IsFixedWidth() {
-				width = int64(scalar.WidthBytes())
-			}
-			keyBytes = satEstimateAdd(keyBytes, width)
-			framedBytes = satEstimateAdd(framedBytes, satEstimateAdd(4, width))
+			buildWidth := db.estimateHashWidth(sp, key.right, key.ty)
+			probeWidth := db.estimateHashWidth(sp, key.left, key.ty)
+			buildBytes = satEstimateAdd(buildBytes, buildWidth)
+			probeBytes = satEstimateAdd(probeBytes, probeWidth)
+			framedBytes = satEstimateAdd(framedBytes, satEstimateAdd(4, min64(buildWidth, probeWidth)))
 		}
-		addPlanUnit(&root, estimatorUnitHashBuild, satEstimateMul(innerPerCall.root.rows, keyBytes))
+		addPlanUnit(&root, estimatorUnitHashBuild, satEstimateMul(innerPerCall.root.rows, buildBytes))
 		addPlanUnit(&root, estimatorUnitHashProbe, satEstimateAdd(
-			satEstimateMul(outerCalls, keyBytes), satEstimateMul(deliveredRows, framedBytes),
+			satEstimateMul(outerCalls, probeBytes), satEstimateMul(deliveredRows, framedBytes),
 		))
 		invocations = deliveredRows
 	}
@@ -1452,14 +1792,14 @@ func (db *engine) estimateSelectPlan(sp *selectPlan, ctx *estimateCTECtx) estima
 		}
 		cap := target
 		if sp.filter != nil {
-			cap = requiredEstimateInput(predicateSelectivity(sp.filter), target, plan.root.rows)
+			cap = requiredEstimateInput(db.estimatePredicateSelectivityWithStatistics(sp, sp.filter), target, plan.root.rows)
 		}
 		db.capStreamingScanEstimate(&plan, sp, cap)
 	}
 
 	if sp.filter != nil {
 		inputRows := plan.root.rows
-		logicalRows := estimateSelectivity(predicateSelectivity(sp.filter), plan.root.logicalRows)
+		logicalRows := estimateSelectivity(db.estimatePredicateSelectivityWithStatistics(sp, sp.filter), plan.root.logicalRows)
 		rows := logicalRows
 		if rows > plan.root.rows {
 			rows = plan.root.rows
@@ -1476,9 +1816,13 @@ func (db *engine) estimateSelectPlan(sp *selectPlan, ctx *estimateCTECtx) estima
 		rows := int64(1)
 		if len(sp.groupKeys) > 0 {
 			rows = inputRows
-			maxGroups := satEstimatePow(defaultDistinctValues, len(sp.groupKeys))
-			if rows > maxGroups {
-				rows = maxGroups
+			if estimated, ok := db.estimateSimpleDistinctRows(sp, sp.groupKeys, inputRows); ok {
+				rows = estimated
+			} else {
+				maxGroups := satEstimatePow(defaultDistinctValues, len(sp.groupKeys))
+				if rows > maxGroups {
+					rows = maxGroups
+				}
 			}
 			if len(sp.groupSets) > 1 {
 				rows = satEstimateMul(rows, int64(len(sp.groupSets)))
@@ -1541,9 +1885,21 @@ func (db *engine) estimateSelectPlan(sp *selectPlan, ctx *estimateCTECtx) estima
 	if sp.distinct {
 		distinctInputRows = plan.root.rows
 		rows := plan.root.rows
-		maxRows := satEstimatePow(defaultDistinctValues, len(sp.projections))
-		if rows > maxRows {
-			rows = maxRows
+		globals := make([]int, 0, len(sp.projections))
+		for _, projection := range sp.projections {
+			if projection.kind != reColumn {
+				globals = nil
+				break
+			}
+			globals = append(globals, projection.index)
+		}
+		if estimated, ok := db.estimateSimpleDistinctRows(sp, globals, rows); ok {
+			rows = estimated
+		} else {
+			maxRows := satEstimatePow(defaultDistinctValues, len(sp.projections))
+			if rows > maxRows {
+				rows = maxRows
+			}
 		}
 		plan = wrapEstimatedPlan(plan, rows, rows, [estimatorUnitCount]int64{})
 	}

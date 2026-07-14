@@ -349,6 +349,7 @@ func TestSkewedCollationBlocksWrites(t *testing.T) {
 	for _, sql := range []string{
 		`CREATE TABLE t (x text COLLATE "unicode" PRIMARY KEY)`,
 		`INSERT INTO t VALUES ('b'), ('a')`,
+		`ANALYZE t (x)`,
 		`INSERT INTO t VALUES ('c')`, // Full → succeeds
 	} {
 		if _, err := queryOutcome(db, sql, nil); err != nil {
@@ -419,6 +420,7 @@ func TestUpgradeCollationsClearsSkew(t *testing.T) {
 	for _, sql := range []string{
 		`CREATE TABLE t (x text COLLATE "unicode" PRIMARY KEY)`,
 		`INSERT INTO t VALUES ('b'), ('a')`,
+		`ANALYZE t (x)`,
 	} {
 		if _, err := queryOutcome(db, sql, nil); err != nil {
 			t.Fatalf("%s: unexpected error %v", sql, err)
@@ -428,6 +430,21 @@ func TestUpgradeCollationsClearsSkew(t *testing.T) {
 	skewed := *loaded
 	skewed.UnicodeVersion = "0.0.0"
 	db.engine.committed.collations["unicode"] = &skewed
+	image, err := db.ToImage(8192, 1)
+	if err != nil {
+		t.Fatalf("serialize skewed statistics: %v", err)
+	}
+	loadedEngine, err := loadEngine(image)
+	if err != nil {
+		t.Fatalf("open skewed statistics: %v", err)
+	}
+	if loadedEngine.committed.columnStatistics("t", 0) == nil {
+		t.Fatal("persisted statistics should remain structurally present")
+	}
+	if loadedEngine.columnStatisticsScoped(nil, "t", 0) != nil {
+		t.Fatal("skewed statistics must be unavailable to the estimator")
+	}
+	db.engine = loadedEngine
 
 	n, err := db.UpgradeCollations()
 	if err != nil {
@@ -445,6 +462,9 @@ func TestUpgradeCollationsClearsSkew(t *testing.T) {
 				t.Fatalf("unicode pin after upgrade: got %q, want %q", c.UnicodeVersion, loaded.UnicodeVersion)
 			}
 		}
+	}
+	if db.engine.committed.columnStatistics("t", 0) != nil {
+		t.Fatal("upgrade must clear facts ordered under the old collation")
 	}
 	if _, err := queryOutcome(db, `INSERT INTO t VALUES ('c')`, nil); err != nil {
 		t.Fatalf("writable after upgrade: %v", err)

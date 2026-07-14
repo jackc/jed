@@ -1179,10 +1179,21 @@ export type WithQuery = {
   recursive: boolean;
 };
 
+// Analyze is `ANALYZE table [(column, ...)]` (spec/design/statistics.md). An empty columns array
+// means all columns. ANALYZE is a transactional write even though it only derives catalog
+// statistics from existing rows.
+export type Analyze = {
+  kind: "analyze";
+  name: string;
+  db?: string;
+  columns: string[];
+};
+
 // Statement is a parsed top-level statement. A lone SELECT stays `Select`; `SetOp` appears only
 // when at least one set operator is present, and `With` only when a WITH prefix is present, so the
 // plain-query path and host API are untouched.
 export type Statement =
+  | Analyze
   | CreateTable
   | DropTable
   | CreateIndex

@@ -7,6 +7,7 @@
 import type {
   AlterTable,
   AlterSequence,
+  Analyze,
   BinaryOp,
   CreateIndex,
   CreateSequence,
@@ -97,6 +98,7 @@ import {
   sortKey as collationSortKey,
 } from "./collation.ts";
 import { COSTS } from "./costs.ts";
+import { collectColumnStatistics, type ColumnStatistics } from "./statistics.ts";
 import {
   andSelectivity,
   addPlanEstimates,
@@ -135,6 +137,8 @@ import {
   SELECTIVITY_MATCH,
   SELECTIVITY_NULL_TEST,
   SELECTIVITY_PAIRED_RANGE,
+  STATISTICS_NDV_SCALE_DENOMINATOR,
+  STATISTICS_NDV_SCALE_NUMERATOR,
   ACCESS_GIN_CONTAINS,
   ACCESS_GIN_EQUAL,
   ACCESS_GIN_MEMBER,
@@ -245,6 +249,7 @@ import {
 import {
   type Value,
   arrayValue,
+  byteaValue,
   boolValue,
   canonFloat,
   dateValue,
@@ -264,6 +269,10 @@ import {
   intervalValue,
   jsonValue,
   jsonbValue,
+  jsonPathValue,
+  timestampValue,
+  timestamptzValue,
+  uuidValue,
 } from "./value.ts";
 import {
   compile as jsonPathCompile,
@@ -1678,6 +1687,50 @@ export class Engine {
     );
   }
 
+  // Relation-owning snapshot for planner/ANALYZE metadata. Bare names follow the normal temp-first
+  // relation lookup instead of accidentally reading main-domain collations/statistics.
+  private relationSnap(scope: string | undefined, tableName: string): Snapshot {
+    if (scope !== undefined) return this.snapForScope(scope)!;
+    return this.tempSnap().table(tableName) !== undefined ? this.tempSnap() : this.readSnap();
+  }
+
+  private columnCollationsScoped(
+    scope: string | undefined,
+    tableName: string,
+    columns: Column[],
+  ): (Collation | null)[] {
+    const snap = this.relationSnap(scope, tableName);
+    return columns.map((column) =>
+      column.collation === null ? null : (snap.resolveCollation(column.collation) ?? null),
+    );
+  }
+
+  estimatorColumnStatistics(
+    scope: string | undefined,
+    tableName: string,
+    column: number,
+  ): ColumnStatistics | undefined {
+    const snap = this.relationSnap(scope, tableName);
+    const definition = snap.table(tableName)?.columns[column];
+    if (
+      definition?.collation !== null &&
+      definition?.collation !== undefined &&
+      snap.collationSkew(definition.collation) !== undefined
+    )
+      return undefined;
+    return snap.columnStatistics(tableName, column);
+  }
+
+  estimatorCollation(
+    scope: string | undefined,
+    tableName: string,
+    column: Column,
+  ): Collation | null {
+    return column.collation === null
+      ? null
+      : (this.relationSnap(scope, tableName).resolveCollation(column.collation) ?? null);
+  }
+
   // ensureCollationsWritable refuses a WRITE that would maintain a collated B-tree under a
   // version-skewed collation (the slice-2d verdict, spec/design/collation.md §12/§14): if any of
   // columns carries a collation the file pinned to a different (unicode, cldr) than the loaded bundle
@@ -2239,16 +2292,25 @@ export class Engine {
   private markEstimatorMutation(scope: string | undefined, table: string): void {
     let database = "main";
     if (scope === undefined) {
-      if (this.isTempTable(table)) return;
+      if (this.isTempTable(table)) {
+        this.session.tx!.tempDirty = true;
+        this.session.tx!.tempWorking.markStatisticsStale(table);
+        return;
+      }
     } else {
       database = scope.toLowerCase();
-      if (database === "temp") return;
+      if (database === "temp") {
+        this.session.tx!.tempDirty = true;
+        this.session.tx!.tempWorking.markStatisticsStale(table);
+        return;
+      }
     }
     const key = database + "\0" + table.toLowerCase();
     if (this.estimatorTouched.has(key)) return;
     this.estimatorTouched.add(key);
-    if (database === "main") this.working().bumpEstimatorRevision(table);
-    else this.attachWriteSnap(database)!.bumpEstimatorRevision(table);
+    const snapshot = database === "main" ? this.working() : this.attachWriteSnap(database)!;
+    snapshot.bumpEstimatorRevision(table);
+    snapshot.markStatisticsStale(table);
   }
 
   // beginTx opens an explicit transaction (spec/design/transactions.md §4.2). A nested BEGIN (a
@@ -2610,6 +2672,9 @@ export class Engine {
 
   private dispatchStmtBody(stmt: Statement, params: Value[]): Outcome {
     switch (stmt.kind) {
+      case "analyze":
+        rejectParamsForDDL(params);
+        return this.executeAnalyze(stmt);
       case "createTable":
         rejectParamsForDDL(params);
         return this.executeCreateTable(stmt);
@@ -2659,6 +2724,55 @@ export class Engine {
         // dispatch; it never reaches here.
         throw engineError("syntax_error", "unexpected statement kind");
     }
+  }
+
+  private executeAnalyze(analyze: Analyze): Outcome {
+    this.checkAttachmentWritable(analyze.db);
+    if (isCatalogRelName(analyze.name.toLowerCase())) {
+      throw engineError("wrong_object_type", `cannot modify system relation ${analyze.name}`);
+    }
+    const table = this.lkpTableScoped(analyze.db, analyze.name);
+    if (table === undefined)
+      throw engineError("undefined_table", `table does not exist: ${analyze.name}`);
+    const columns: number[] = [];
+    const seen = new Set<string>();
+    if (analyze.columns.length === 0) {
+      for (let i = 0; i < table.columns.length; i++) columns.push(i);
+    } else {
+      for (const name of analyze.columns) {
+        const key = name.toLowerCase();
+        if (seen.has(key))
+          throw engineError("duplicate_column", `column ${name} appears more than once`);
+        seen.add(key);
+        const column = table.columns.findIndex((candidate) => candidate.name.toLowerCase() === key);
+        if (column < 0)
+          throw engineError("undefined_column", `column does not exist: ${name}`);
+        columns.push(column);
+      }
+    }
+    const store = this.lkpStoreScoped(analyze.db, analyze.name);
+    const collations = this.columnCollationsScoped(analyze.db, table.name, table.columns);
+    const meter = this.session.newMeter();
+    const facts = columns.map((column) => ({
+      column,
+      statistics: collectColumnStatistics(table, store, collations, column, meter),
+    }));
+    const database =
+      analyze.db === undefined
+        ? this.isTempTable(analyze.name)
+          ? "temp"
+          : "main"
+        : analyze.db.toLowerCase();
+    let target: Snapshot;
+    if (database === "temp") {
+      this.session.tx!.tempDirty = true;
+      target = this.session.tx!.tempWorking;
+    } else if (database === "main") target = this.working();
+    else target = this.attachWriteSnap(database)!;
+    for (const fact of facts)
+      target.putColumnStatistics(table.name, fact.column, fact.statistics);
+    if (database !== "temp") target.bumpEstimatorRevision(table.name);
+    return { kind: "statement", cost: meter.accrued, rowsAffected: 0 };
   }
 
   // --- P5 whole-plan estimates ---------------------------------------------------------------
@@ -2824,6 +2938,146 @@ export class Engine {
     return { label: rel.tableName.toLowerCase(), table, offset: rel.offset, ...(rel.db === undefined ? {} : { db: rel.db }) };
   }
 
+  private estimateColumnStatistics(
+    sp: SelectPlan,
+    global: number,
+  ): { ordinal: number; statistics: CurrentColumnStatistics } | null {
+    for (let ordinal = 0; ordinal < sp.rels.length; ordinal++) {
+      const rel = sp.rels[ordinal]!;
+      if (global < rel.offset || global >= rel.offset + rel.colCount) continue;
+      const scope = this.estimatePlanRelScope(rel);
+      if (scope === null) return null;
+      const statistics = currentColumnStatistics(this, scope, global - rel.offset);
+      return statistics === null ? null : { ordinal, statistics };
+    }
+    return null;
+  }
+
+  private estimateExpressionOwner(
+    sp: SelectPlan,
+    expr: RExpr | null,
+  ): { kind: "none" } | { kind: "one"; ordinal: number } | { kind: "mixed" } {
+    if (expr === null) return { kind: "none" };
+    const merge = (
+      a: ReturnType<Engine["estimateExpressionOwner"]>,
+      b: ReturnType<Engine["estimateExpressionOwner"]>,
+    ): ReturnType<Engine["estimateExpressionOwner"]> => {
+      if (a.kind === "mixed" || b.kind === "mixed") return { kind: "mixed" };
+      if (a.kind === "one" && b.kind === "one")
+        return a.ordinal === b.ordinal ? a : { kind: "mixed" };
+      return a.kind === "one" ? a : b;
+    };
+    if (expr.kind === "column") {
+      const ordinal = sp.rels.findIndex(
+        (rel) => expr.index >= rel.offset && expr.index < rel.offset + rel.colCount,
+      );
+      return ordinal < 0 ? { kind: "none" } : { kind: "one", ordinal };
+    }
+    switch (expr.kind) {
+      case "compare":
+      case "distinct":
+      case "and":
+      case "or":
+        return merge(
+          this.estimateExpressionOwner(sp, expr.lhs),
+          this.estimateExpressionOwner(sp, expr.rhs),
+        );
+      case "not":
+      case "isNull":
+        return this.estimateExpressionOwner(sp, expr.operand);
+      case "inValues":
+        return this.estimateExpressionOwner(sp, expr.lhs);
+      default:
+        return { kind: "none" };
+    }
+  }
+
+  private estimatePredicateSelectivityWithStatistics(
+    sp: SelectPlan,
+    expr: RExpr | null,
+  ): Selectivity {
+    if (expr === null) return { kind: "all" };
+    if (
+      expr.kind === "compare" &&
+      expr.op === "eq" &&
+      expr.lhs.kind === "column" &&
+      expr.rhs.kind === "column"
+    ) {
+      const left = this.estimateColumnStatistics(sp, expr.lhs.index);
+      const right = this.estimateColumnStatistics(sp, expr.rhs.index);
+      if (
+        left !== null &&
+        right !== null &&
+        left.ordinal !== right.ordinal &&
+        left.statistics.ndv !== null &&
+        right.statistics.ndv !== null
+      ) {
+        const population = saturatingEstimateMultiply(
+          left.statistics.rows,
+          right.statistics.rows,
+        );
+        const denominator =
+          left.statistics.ndv > right.statistics.ndv
+            ? left.statistics.ndv
+            : right.statistics.ndv;
+        let rows = ceilEstimateMultiplyDivide(
+          left.statistics.nonnullRows,
+          right.statistics.nonnullRows,
+          denominator < 1n ? 1n : denominator,
+        );
+        if (rows > population) rows = population;
+        return statisticsSelectivity(rows, population);
+      }
+    }
+    const owner = this.estimateExpressionOwner(sp, expr);
+    if (owner.kind === "one") {
+      const scope = this.estimatePlanRelScope(sp.rels[owner.ordinal]!);
+      if (scope !== null)
+        return estimatorPredicateSelectivityWithStatistics(expr, scope, this);
+    }
+    switch (expr.kind) {
+      case "and":
+        return andSelectivity(
+          this.estimatePredicateSelectivityWithStatistics(sp, expr.lhs),
+          this.estimatePredicateSelectivityWithStatistics(sp, expr.rhs),
+        );
+      case "or":
+        return orSelectivity(
+          this.estimatePredicateSelectivityWithStatistics(sp, expr.lhs),
+          this.estimatePredicateSelectivityWithStatistics(sp, expr.rhs),
+        );
+      case "not":
+        return notSelectivity(this.estimatePredicateSelectivityWithStatistics(sp, expr.operand));
+      default:
+        return estimatorPredicateSelectivity(expr);
+    }
+  }
+
+  private estimateSimpleDistinctRows(
+    sp: SelectPlan,
+    globals: number[],
+    inputRows: bigint,
+  ): bigint | null {
+    if (globals.length === 0) return null;
+    let groups = 1n;
+    for (const global of globals) {
+      const current = this.estimateColumnStatistics(sp, global)?.statistics;
+      if (current === undefined || current.ndv === null) return null;
+      groups = saturatingEstimateMultiply(
+        groups,
+        current.ndv + (current.nullRows > 0n ? 1n : 0n),
+      );
+    }
+    return groups > inputRows ? inputRows : groups;
+  }
+
+  private estimateHashWidth(sp: SelectPlan, global: number, type: Type): bigint {
+    const scalar = typeAsScalar(type);
+    if (scalar !== undefined && isFixedWidth(scalar)) return BigInt(widthBytes(scalar));
+    return this.estimateColumnStatistics(sp, global)?.statistics.averageWidth ??
+      DEFAULT_VARIABLE_KEY_BYTES;
+  }
+
   private estimateSrfRows(srf: SrfPlan): bigint {
     if (srf.kind !== "generate_series" || srf.args.length < 2 || srf.args.length > 3 ||
       srf.args[0]!.kind !== "constInt" || srf.args[1]!.kind !== "constInt" ||
@@ -2842,6 +3096,11 @@ export class Engine {
     const scope = srf.introspectScope ?? "main";
     const snap = this.snapForScope(scope);
     if (snap === undefined) return 0n;
+    if (srf.kind === "jed_statistics") {
+      let count = 0n;
+      for (const columns of snap.statistics.values()) count += BigInt(columns.size);
+      return count > MAX_ESTIMATE ? MAX_ESTIMATE : count;
+    }
     let rows = 0n;
     for (const table of snap.tablesSorted()) {
       switch (srf.kind) {
@@ -2926,8 +3185,9 @@ export class Engine {
     let rows = physicalPairs;
     let logicalRows = logicalPairs;
     if (join.on !== null && !boundByOuter) {
-      rows = estimateSelectivity(estimatorPredicateSelectivity(join.on), rows);
-      logicalRows = estimateSelectivity(estimatorPredicateSelectivity(join.on), logicalRows);
+      const selectivity = this.estimatePredicateSelectivityWithStatistics(sp, join.on);
+      rows = estimateSelectivity(selectivity, rows);
+      logicalRows = estimateSelectivity(selectivity, logicalRows);
     }
     const preservedLeft = left.root.rows;
     const preservedRight = right.root.rows;
@@ -2943,18 +3203,21 @@ export class Engine {
     root.logicalRows = logicalRows;
     let invocations = physicalPairs;
     if (n === 2 && sp.phys.hashJoin !== null) {
-      let keyBytes = 0n;
+      let buildBytes = 0n;
+      let probeBytes = 0n;
       let framedBytes = 0n;
       for (const key of sp.phys.hashJoin.keys) {
-        const scalar = typeAsScalar(key.type);
-        const width = scalar !== undefined && isFixedWidth(scalar)
-          ? BigInt(widthBytes(scalar))
-          : DEFAULT_VARIABLE_KEY_BYTES;
-        keyBytes = saturatingEstimateAdd(keyBytes, width);
-        framedBytes = saturatingEstimateAdd(framedBytes, saturatingEstimateAdd(4n, width));
+        const buildWidth = this.estimateHashWidth(sp, key.right, key.type);
+        const probeWidth = this.estimateHashWidth(sp, key.left, key.type);
+        buildBytes = saturatingEstimateAdd(buildBytes, buildWidth);
+        probeBytes = saturatingEstimateAdd(probeBytes, probeWidth);
+        framedBytes = saturatingEstimateAdd(
+          framedBytes,
+          saturatingEstimateAdd(4n, buildWidth < probeWidth ? buildWidth : probeWidth),
+        );
       }
-      addPlanUnit(root, UNIT_HASH_BUILD, saturatingEstimateMultiply(right.root.rows, keyBytes));
-      addPlanUnit(root, UNIT_HASH_PROBE, saturatingEstimateAdd(saturatingEstimateMultiply(left.root.rows, keyBytes), saturatingEstimateMultiply(rows, framedBytes)));
+      addPlanUnit(root, UNIT_HASH_BUILD, saturatingEstimateMultiply(right.root.rows, buildBytes));
+      addPlanUnit(root, UNIT_HASH_PROBE, saturatingEstimateAdd(saturatingEstimateMultiply(left.root.rows, probeBytes), saturatingEstimateMultiply(rows, framedBytes)));
       invocations = rows;
     }
     addPlanUnit(root, UNIT_OPERATOR_EVAL, saturatingEstimateMultiply(estimatorOperatorNodes(join.on), invocations));
@@ -2986,7 +3249,10 @@ export class Engine {
     let fullRows = fullPairs;
     if (!boundByOuter) {
       for (const onIndex of step.onIndices) {
-        const selectivity = estimatorPredicateSelectivity(sp.joins[onIndex]!.on);
+        const selectivity = this.estimatePredicateSelectivityWithStatistics(
+          sp,
+          sp.joins[onIndex]!.on,
+        );
         fullRows = estimateSelectivity(selectivity, fullRows);
         fullLogicalRows = estimateSelectivity(selectivity, fullLogicalRows);
       }
@@ -3014,7 +3280,7 @@ export class Engine {
       const postFilterRows =
         sp.filter === null
           ? fullRows
-          : estimateSelectivity(estimatorPredicateSelectivity(sp.filter), fullRows);
+          : estimateSelectivity(this.estimatePredicateSelectivityWithStatistics(sp, sp.filter), fullRows);
       if (target === 0n) {
         outerCalls = 0n;
         deliveredRows = 0n;
@@ -3043,27 +3309,29 @@ export class Engine {
     root.logicalRows = fullLogicalRows;
     let invocations = visitedPairs;
     if (step.hashJoin !== null) {
-      let keyBytes = 0n;
+      let buildBytes = 0n;
+      let probeBytes = 0n;
       let framedBytes = 0n;
       for (const key of step.hashJoin.keys) {
-        const scalar = typeAsScalar(key.type);
-        const width =
-          scalar !== undefined && isFixedWidth(scalar)
-            ? BigInt(widthBytes(scalar))
-            : DEFAULT_VARIABLE_KEY_BYTES;
-        keyBytes = saturatingEstimateAdd(keyBytes, width);
-        framedBytes = saturatingEstimateAdd(framedBytes, saturatingEstimateAdd(4n, width));
+        const buildWidth = this.estimateHashWidth(sp, key.right, key.type);
+        const probeWidth = this.estimateHashWidth(sp, key.left, key.type);
+        buildBytes = saturatingEstimateAdd(buildBytes, buildWidth);
+        probeBytes = saturatingEstimateAdd(probeBytes, probeWidth);
+        framedBytes = saturatingEstimateAdd(
+          framedBytes,
+          saturatingEstimateAdd(4n, buildWidth < probeWidth ? buildWidth : probeWidth),
+        );
       }
       addPlanUnit(
         root,
         UNIT_HASH_BUILD,
-        saturatingEstimateMultiply(innerPerCall.root.rows, keyBytes),
+        saturatingEstimateMultiply(innerPerCall.root.rows, buildBytes),
       );
       addPlanUnit(
         root,
         UNIT_HASH_PROBE,
         saturatingEstimateAdd(
-          saturatingEstimateMultiply(outerCalls, keyBytes),
+          saturatingEstimateMultiply(outerCalls, probeBytes),
           saturatingEstimateMultiply(deliveredRows, framedBytes),
         ),
       );
@@ -3115,7 +3383,7 @@ export class Engine {
     let fullRows = fullPairs;
     let fullLogicalRows = fullLogicalPairs;
     if (join.on !== null && !boundByOuter) {
-      const selectivity = estimatorPredicateSelectivity(join.on);
+      const selectivity = this.estimatePredicateSelectivityWithStatistics(sp, join.on);
       fullRows = estimateSelectivity(selectivity, fullRows);
       fullLogicalRows = estimateSelectivity(selectivity, fullLogicalRows);
     }
@@ -3126,7 +3394,7 @@ export class Engine {
       const target = saturatingEstimateAdd(sp.limit, sp.offset ?? 0n);
       const postFilterRows = sp.filter === null
         ? fullRows
-        : estimateSelectivity(estimatorPredicateSelectivity(sp.filter), fullRows);
+        : estimateSelectivity(this.estimatePredicateSelectivityWithStatistics(sp, sp.filter), fullRows);
       if (target === 0n) {
         outerCalls = 0n;
         deliveredRows = 0n;
@@ -3154,26 +3422,29 @@ export class Engine {
     root.logicalRows = fullLogicalRows;
     let invocations = visitedPairs;
     if (sp.phys.hashJoin !== null) {
-      let keyBytes = 0n;
+      let buildBytes = 0n;
+      let probeBytes = 0n;
       let framedBytes = 0n;
       for (const key of sp.phys.hashJoin.keys) {
-        const scalar = typeAsScalar(key.type);
-        const width = scalar !== undefined && isFixedWidth(scalar)
-          ? BigInt(widthBytes(scalar))
-          : DEFAULT_VARIABLE_KEY_BYTES;
-        keyBytes = saturatingEstimateAdd(keyBytes, width);
-        framedBytes = saturatingEstimateAdd(framedBytes, saturatingEstimateAdd(4n, width));
+        const buildWidth = this.estimateHashWidth(sp, key.right, key.type);
+        const probeWidth = this.estimateHashWidth(sp, key.left, key.type);
+        buildBytes = saturatingEstimateAdd(buildBytes, buildWidth);
+        probeBytes = saturatingEstimateAdd(probeBytes, probeWidth);
+        framedBytes = saturatingEstimateAdd(
+          framedBytes,
+          saturatingEstimateAdd(4n, buildWidth < probeWidth ? buildWidth : probeWidth),
+        );
       }
       addPlanUnit(
         root,
         UNIT_HASH_BUILD,
-        saturatingEstimateMultiply(innerPerCall.root.rows, keyBytes),
+        saturatingEstimateMultiply(innerPerCall.root.rows, buildBytes),
       );
       addPlanUnit(
         root,
         UNIT_HASH_PROBE,
         saturatingEstimateAdd(
-          saturatingEstimateMultiply(outerCalls, keyBytes),
+          saturatingEstimateMultiply(outerCalls, probeBytes),
           saturatingEstimateMultiply(deliveredRows, framedBytes),
         ),
       );
@@ -3194,12 +3465,15 @@ export class Engine {
       const target = saturatingEstimateAdd(sp.limit, sp.offset ?? 0n);
       const cap = sp.filter === null
         ? target
-        : this.requiredEstimateInput(estimatorPredicateSelectivity(sp.filter), target, plan.root.rows);
+        : this.requiredEstimateInput(this.estimatePredicateSelectivityWithStatistics(sp, sp.filter), target, plan.root.rows);
       this.capStreamingScanEstimate(plan, sp, cap);
     }
     if (sp.filter !== null) {
       const inputRows = plan.root.rows;
-      const logicalRows = estimateSelectivity(estimatorPredicateSelectivity(sp.filter), plan.root.logicalRows);
+      const logicalRows = estimateSelectivity(
+        this.estimatePredicateSelectivityWithStatistics(sp, sp.filter),
+        plan.root.logicalRows,
+      );
       const rows = logicalRows > plan.root.rows ? plan.root.rows : logicalRows;
       const local = Array<bigint>(ESTIMATOR_UNIT_COUNT).fill(0n);
       local[UNIT_OPERATOR_EVAL] = saturatingEstimateMultiply(estimatorOperatorNodes(sp.filter), inputRows);
@@ -3211,8 +3485,12 @@ export class Engine {
       const inputRows = plan.root.rows;
       let rows = 1n;
       if (sp.groupKeys.length > 0) {
-        const maxGroups = this.estimatePow(DEFAULT_DISTINCT_VALUES, sp.groupKeys.length);
-        rows = inputRows > maxGroups ? maxGroups : inputRows;
+        rows =
+          this.estimateSimpleDistinctRows(sp, sp.groupKeys, inputRows) ??
+          (() => {
+            const maxGroups = this.estimatePow(DEFAULT_DISTINCT_VALUES, sp.groupKeys.length);
+            return inputRows > maxGroups ? maxGroups : inputRows;
+          })();
         if (sp.groupSets.length > 1) rows = saturatingEstimateMultiply(rows, BigInt(sp.groupSets.length));
       } else if (sp.groupSets.length > 1) rows = BigInt(sp.groupSets.length);
       const groupRows = rows;
@@ -3259,8 +3537,15 @@ export class Engine {
     let distinctInputRows: bigint | null = null;
     if (sp.distinct) {
       distinctInputRows = plan.root.rows;
-      const maxRows = this.estimatePow(DEFAULT_DISTINCT_VALUES, sp.projections.length);
-      const rows = plan.root.rows > maxRows ? maxRows : plan.root.rows;
+      const globals = sp.projections.every((projection) => projection.kind === "column")
+        ? sp.projections.map((projection) => (projection as Extract<RExpr, { kind: "column" }>).index)
+        : [];
+      const rows =
+        this.estimateSimpleDistinctRows(sp, globals, plan.root.rows) ??
+        (() => {
+          const maxRows = this.estimatePow(DEFAULT_DISTINCT_VALUES, sp.projections.length);
+          return plan.root.rows > maxRows ? maxRows : plan.root.rows;
+        })();
       plan = wrapEstimatedPlan(plan, rows, rows, Array<bigint>(ESTIMATOR_UNIT_COUNT).fill(0n));
     }
     const orderElided = sp.phys.pkOrdered || sp.phys.indexOrder !== null || sp.phys.joinPkOrdered;
@@ -3775,7 +4060,8 @@ export class Engine {
         rel.srf.kind === "jed_tables" ||
         rel.srf.kind === "jed_columns" ||
         rel.srf.kind === "jed_indexes" ||
-        rel.srf.kind === "jed_constraints"
+        rel.srf.kind === "jed_constraints" ||
+        rel.srf.kind === "jed_statistics"
       ) {
         r.emit(
           depth,
@@ -6100,6 +6386,9 @@ export class Engine {
       columnSources.some(
         (source, i) => source.kind !== "original" || source.column !== i,
       );
+    const clearStatistics = rowSteps.some(
+      (step) => step.kind === "drop" || step.kind === "setType",
+    );
     const pkRekeyed =
       table.pk.length !== original.pk.length ||
       table.pk.some((column, i) => {
@@ -6329,6 +6618,7 @@ export class Engine {
     if (rewriteRows !== null) {
       ws.alterTableRewrite(table, rewriteColTypes!, rewriteRows, rewriteNextRowid, alterPageSize);
     } else ws.alterTableCatalog(oldKey, table, renameTable, indexRename);
+    if (clearStatistics) ws.clearStatistics(table.name);
     if (rekeyed)
       ws.rebuildAlterIndexes(original, table, constraintEntries, alterPageSize);
     else ws.syncAlterConstraintIndexes(original, table, constraintEntries, alterPageSize);
@@ -7959,7 +8249,7 @@ export class Engine {
         ctx,
         meter,
       );
-      if (affected > 0) this.markEstimatorMutation(ins.db, ins.table);
+      this.markEstimatorMutation(ins.db, ins.table);
       return dmlOutcome(ret?.names ?? null, ret?.types ?? null, returned, affected, meter.accrued);
     }
 
@@ -8086,7 +8376,7 @@ export class Engine {
       ctx,
       meter,
     );
-    if (affected > 0) this.markEstimatorMutation(ins.db, ins.table);
+    this.markEstimatorMutation(ins.db, ins.table);
     return dmlOutcome(ret?.names ?? null, ret?.types ?? null, returned, affected, meter.accrued);
   }
 
@@ -9156,7 +9446,7 @@ export class Engine {
       const istore = this.writeIndexStoreScoped(del.db, def.name.toLowerCase());
       for (const ek of toRemove[kx]!) istore.remove(ek);
     }
-    if (matched.length > 0) this.markEstimatorMutation(del.db, del.table);
+    this.markEstimatorMutation(del.db, del.table);
     return dmlOutcome(
       ret?.names ?? null,
       ret?.types ?? null,
@@ -9694,7 +9984,7 @@ export class Engine {
         }
       }
     }
-    if (updates.length > 0) this.markEstimatorMutation(upd.db, upd.table);
+    this.markEstimatorMutation(upd.db, upd.table);
     return dmlOutcome(
       ret?.names ?? null,
       ret?.types ?? null,
@@ -11986,6 +12276,47 @@ export class Engine {
     return out;
   }
 
+  private jedStatisticsRows(srf: SrfPlan, meter: Meter): Row[] {
+    const snap = this.snapForScope(srf.introspectScope!);
+    if (snap === undefined) {
+      throw engineError("undefined_table", `database "${srf.introspectScope}" is not attached`);
+    }
+    const out: Row[] = [];
+    for (const tableKey of [...snap.statistics.keys()].sort()) {
+      const table = snap.tables.get(tableKey);
+      if (table === undefined) continue;
+      const columns = snap.statistics.get(tableKey)!;
+      for (const column of [...columns.keys()].sort((a, b) => a - b)) {
+        const statistics = columns.get(column)!;
+        const declared = table.columns[column];
+        if (declared === undefined) continue;
+        meter.guard();
+        meter.charge(COSTS.generatedRow);
+        const nonnull = statistics.analyzedRows - statistics.nullCount;
+        const averageWidth =
+          nonnull === 0n
+            ? nullValue()
+            : intValue(
+                statistics.widthSum / nonnull +
+                  (statistics.widthSum % nonnull === 0n ? 0n : 1n),
+              );
+        out.push([
+          textValue(table.name),
+          textValue(declared.name),
+          intValue(statistics.analyzedRows),
+          boolValue(statistics.stale),
+          intValue(statistics.nullCount),
+          statistics.distinctCount === null ? nullValue() : intValue(statistics.distinctCount),
+          intValue(BigInt(statistics.sampleRows)),
+          averageWidth,
+          intValue(BigInt(statistics.mcv.length)),
+          intValue(BigInt(statistics.histogram.length)),
+        ]);
+      }
+    }
+    return out;
+  }
+
   // jedConstraintsRows generates the rows of the jed_constraints catalog relation (introspection.md
   // §5.1): one row per CHECK / UNIQUE / FK / EXCLUDE constraint of every user table of the scope's
   // snapshot, in (lowercased table name, then a fixed KIND order — check, unique, foreign_key,
@@ -13335,6 +13666,8 @@ export class Engine {
           return this.jedIndexesRows(rel.srf, meter);
         case "jed_constraints":
           return this.jedConstraintsRows(rel.srf, meter);
+        case "jed_statistics":
+          return this.jedStatisticsRows(rel.srf, meter);
       }
     }
     // A CTE reference delivers its rows from the per-statement context (cte.md §3/§5): a MATERIALIZED
@@ -15267,6 +15600,697 @@ function estimatorPairedRange(lhs: RExpr, rhs: RExpr): boolean {
   return a !== null && b !== null && a.lower !== b.lower && rexprEqShifted(a.operand, b.operand, 0);
 }
 
+type CurrentColumnStatistics = {
+  rows: bigint;
+  nullRows: bigint;
+  nonnullRows: bigint;
+  ndv: bigint | null;
+  averageWidth: bigint | null;
+  mcv: { key: Uint8Array; rows: bigint }[];
+  histogram: Uint8Array[];
+  completeMcv: boolean;
+};
+
+function statisticsSelectivity(rows: bigint, population: bigint): Selectivity {
+  if (rows <= 0n || population <= 0n) return { kind: "zero" };
+  if (rows >= population) return { kind: "all" };
+  return fractionSelectivity({ numerator: rows, denominator: population });
+}
+
+function statisticsScale(n: bigint, numerator: bigint, denominator: bigint): bigint {
+  if (n <= 0n || numerator <= 0n || denominator <= 0n) return 0n;
+  return scaleEstimateCeil(n, { numerator, denominator });
+}
+
+function currentColumnStatistics(
+  engine: Engine,
+  rel: ScopeRel,
+  column: number,
+): CurrentColumnStatistics | null {
+  const fact = engine.estimatorColumnStatistics(rel.db, rel.table.name, column);
+  if (fact === undefined) return null;
+  const rows = engine.estimatorStore(rel.db, rel.table.name).count() ?? 0n;
+  if (fact.analyzedRows === 0n && rows !== 0n) return null;
+  const nullRows =
+    fact.analyzedRows === 0n
+      ? 0n
+      : statisticsScale(rows, fact.nullCount, fact.analyzedRows) > rows
+        ? rows
+        : statisticsScale(rows, fact.nullCount, fact.analyzedRows);
+  const nonnullRows = rows - nullRows;
+  const analyzedNonnull = fact.analyzedRows - fact.nullCount;
+  let ndv: bigint | null = null;
+  if (fact.distinctCount !== null) {
+    if (analyzedNonnull === 0n) ndv = 0n;
+    else if (
+      fact.distinctCount * STATISTICS_NDV_SCALE_DENOMINATOR >
+      analyzedNonnull * STATISTICS_NDV_SCALE_NUMERATOR
+    ) {
+      ndv = statisticsScale(nonnullRows, fact.distinctCount, analyzedNonnull);
+    } else ndv = fact.distinctCount;
+    if (ndv > nonnullRows) ndv = nonnullRows;
+  }
+  const averageWidth =
+    analyzedNonnull === 0n
+      ? null
+      : fact.widthSum / analyzedNonnull + (fact.widthSum % analyzedNonnull === 0n ? 0n : 1n);
+  let remaining = nonnullRows;
+  let sampledMcvRows = 0;
+  const mcv = fact.mcv.map((entry) => {
+    let scaled = statisticsScale(rows, BigInt(entry.frequency), BigInt(fact.sampleRows));
+    if (scaled > remaining) scaled = remaining;
+    remaining -= scaled;
+    sampledMcvRows += entry.frequency;
+    return { key: entry.value.key.slice(), rows: scaled };
+  });
+  return {
+    rows,
+    nullRows,
+    nonnullRows,
+    ndv,
+    averageWidth,
+    mcv,
+    histogram: fact.histogram.map((bound) => bound.key.slice()),
+    completeMcv:
+      !fact.stale &&
+      BigInt(fact.sampleRows) === fact.analyzedRows &&
+      sampledMcvRows === fact.sampleNonNullRows,
+  };
+}
+
+function statisticsColumn(expr: RExpr, rel: ScopeRel): number | null {
+  if (
+    expr.kind !== "column" ||
+    expr.index < rel.offset ||
+    expr.index >= rel.offset + rel.table.columns.length
+  )
+    return null;
+  return expr.index - rel.offset;
+}
+
+function statisticsReverseOp(op: BinaryOp): BinaryOp {
+  switch (op) {
+    case "lt": return "gt";
+    case "le": return "ge";
+    case "gt": return "lt";
+    case "ge": return "le";
+    default: return op;
+  }
+}
+
+function statisticsConstantValue(expr: RExpr): Value | null {
+  switch (expr.kind) {
+    case "constNull": return nullValue();
+    case "constInt": return intValue(expr.value);
+    case "constBool": return boolValue(expr.value);
+    case "constText": return textValue(expr.value);
+    case "constDecimal": return decimalValue(expr.value);
+    case "constFloat": return expr.ty === "f32" ? float32Value(expr.value) : float64Value(expr.value);
+    case "constBytea": return byteaValue(expr.value);
+    case "constUuid": return uuidValue(expr.value);
+    case "constTimestamp": return timestampValue(expr.value);
+    case "constTimestamptz": return timestamptzValue(expr.value);
+    case "constDate": return dateValue(expr.value);
+    case "constInterval": return intervalValue(expr.value);
+    case "constJson": return jsonValue(expr.value);
+    case "constJsonb": return jsonbValue(expr.value);
+    case "constJsonPath": return jsonPathValue(expr.value);
+    case "constRange": return expr.value;
+    default: return null;
+  }
+}
+
+function statisticsComparison(
+  expr: RExpr,
+  rel: ScopeRel,
+): { column: number; op: BinaryOp; literal: RExpr } | null {
+  if (expr.kind !== "compare") return null;
+  const lhsColumn = statisticsColumn(expr.lhs, rel);
+  if (
+    lhsColumn !== null &&
+    (statisticsConstantValue(expr.rhs) !== null || expr.rhs.kind === "constNull" || expr.rhs.kind === "param")
+  )
+    return { column: lhsColumn, op: expr.op, literal: expr.rhs };
+  const rhsColumn = statisticsColumn(expr.rhs, rel);
+  if (
+    rhsColumn !== null &&
+    (statisticsConstantValue(expr.lhs) !== null || expr.lhs.kind === "constNull" || expr.lhs.kind === "param")
+  )
+    return { column: rhsColumn, op: statisticsReverseOp(expr.op), literal: expr.lhs };
+  return null;
+}
+
+function statisticsValueKey(
+  value: Value,
+  rel: ScopeRel,
+  column: number,
+  engine: Engine,
+): Uint8Array | null {
+  const declared = rel.table.columns[column]!;
+  const keyValue = statisticsKeyValue(value, declared.type);
+  if (keyValue === null) return null;
+  try {
+    return encodeTypedKey(
+      declared.type,
+      keyValue,
+      engine.estimatorCollation(rel.db, rel.table.name, declared),
+    );
+  } catch {
+    return null;
+  }
+}
+
+function statisticsLiteralKey(
+  literal: RExpr,
+  rel: ScopeRel,
+  column: number,
+  engine: Engine,
+): Uint8Array | null {
+  const value = statisticsConstantValue(literal);
+  return value === null ? null : statisticsValueKey(value, rel, column, engine);
+}
+
+// Adapt a comparison literal to the column's stored-key family. Integer/decimal comparisons
+// promote the integer even though the resolved expression retains its syntactic int constant.
+// Any other mismatched family uses the deterministic row-count fallback.
+function statisticsKeyValue(value: Value, ty: Type): Value | null {
+  if (value.kind === "null") return null;
+  if (ty.kind === "range") return value.kind === "range" ? value : null;
+  if (ty.kind !== "scalar") return null;
+  if (ty.scalar === "decimal" && value.kind === "int") {
+    return decimalValue(Decimal.fromBigInt(value.int));
+  }
+  const compatible =
+    ((ty.scalar === "i16" || ty.scalar === "i32" || ty.scalar === "i64") && value.kind === "int") ||
+    (ty.scalar === "boolean" && value.kind === "bool") ||
+    (ty.scalar === "text" && value.kind === "text") ||
+    (ty.scalar === "decimal" && value.kind === "decimal") ||
+    (ty.scalar === "bytea" && value.kind === "bytea") ||
+    (ty.scalar === "uuid" && value.kind === "uuid") ||
+    (ty.scalar === "timestamp" && value.kind === "timestamp") ||
+    (ty.scalar === "timestamptz" && value.kind === "timestamptz") ||
+    (ty.scalar === "date" && value.kind === "date") ||
+    (ty.scalar === "interval" && value.kind === "interval") ||
+    (ty.scalar === "f32" && value.kind === "f32") ||
+    (ty.scalar === "f64" && value.kind === "f64") ||
+    (ty.scalar === "json" && value.kind === "json") ||
+    (ty.scalar === "jsonb" && value.kind === "jsonb") ||
+    (ty.scalar === "jsonpath" && value.kind === "jsonpath");
+  return compatible ? value : null;
+}
+
+function statisticsEqualityRows(current: CurrentColumnStatistics, key: Uint8Array): bigint {
+  const mcv = current.mcv.find((entry) => compareBytes(entry.key, key) === 0);
+  if (mcv !== undefined) return mcv.rows;
+  if (current.completeMcv) return 0n;
+  let mcvRows = current.mcv.reduce(
+    (sum, entry) => saturatingEstimateAdd(sum, entry.rows),
+    0n,
+  );
+  if (mcvRows > current.nonnullRows) mcvRows = current.nonnullRows;
+  const remainingNdv =
+    current.ndv === null || current.ndv - BigInt(current.mcv.length) < 1n
+      ? 1n
+      : current.ndv - BigInt(current.mcv.length);
+  return statisticsScale(current.nonnullRows - mcvRows, 1n, remainingNdv);
+}
+
+function statisticsKeySatisfies(order: number, op: BinaryOp): boolean {
+  switch (op) {
+    case "eq": return order === 0;
+    case "ne": return order !== 0;
+    case "lt": return order < 0;
+    case "le": return order <= 0;
+    case "gt": return order > 0;
+    case "ge": return order >= 0;
+    default: return false;
+  }
+}
+
+function statisticsLessRows(
+  current: CurrentColumnStatistics,
+  key: Uint8Array,
+  inclusive: boolean,
+): bigint {
+  const op: BinaryOp = inclusive ? "le" : "lt";
+  let mcvRows = 0n;
+  let allMcvRows = 0n;
+  for (const entry of current.mcv) {
+    allMcvRows = saturatingEstimateAdd(allMcvRows, entry.rows);
+    if (statisticsKeySatisfies(compareBytes(entry.key, key), op))
+      mcvRows = saturatingEstimateAdd(mcvRows, entry.rows);
+  }
+  if (allMcvRows > current.nonnullRows) allMcvRows = current.nonnullRows;
+  const residual = current.nonnullRows - allMcvRows;
+  let histogramRows: bigint;
+  if (current.histogram.length >= 2) {
+    let ordinal = 0;
+    while (
+      ordinal < current.histogram.length &&
+      (compareBytes(current.histogram[ordinal]!, key) < 0 ||
+        (inclusive && compareBytes(current.histogram[ordinal]!, key) === 0))
+    )
+      ordinal++;
+    histogramRows = statisticsScale(
+      residual,
+      BigInt(ordinal),
+      BigInt(current.histogram.length - 1),
+    );
+    if (histogramRows > residual) histogramRows = residual;
+  } else {
+    histogramRows = statisticsScale(
+      residual,
+      SELECTIVITY_INEQUALITY.numerator,
+      SELECTIVITY_INEQUALITY.denominator,
+    );
+  }
+  const rows = saturatingEstimateAdd(mcvRows, histogramRows);
+  return rows > current.nonnullRows ? current.nonnullRows : rows;
+}
+
+function statisticsComparisonRows(
+  current: CurrentColumnStatistics,
+  op: BinaryOp,
+  key: Uint8Array,
+): bigint {
+  switch (op) {
+    case "eq": return statisticsEqualityRows(current, key);
+    case "ne": return current.nonnullRows - statisticsEqualityRows(current, key);
+    case "lt": return statisticsLessRows(current, key, false);
+    case "le": return statisticsLessRows(current, key, true);
+    case "gt": return current.nonnullRows - statisticsLessRows(current, key, true);
+    case "ge": return current.nonnullRows - statisticsLessRows(current, key, false);
+    default: return 0n;
+  }
+}
+
+function statisticsBoundSourceSelectivity(
+  rel: ScopeRel,
+  column: number,
+  op: BinaryOp,
+  source: RExpr,
+  engine: Engine,
+): Selectivity | null {
+  const current = currentColumnStatistics(engine, rel, column);
+  if (current === null) return null;
+  if (source.kind === "constNull") return { kind: "zero" };
+  if (source.kind === "param" || source.kind === "column" || source.kind === "outerColumn") {
+    if (op !== "eq" || current.ndv === null) return null;
+    return statisticsSelectivity(
+      statisticsScale(current.nonnullRows, 1n, current.ndv < 1n ? 1n : current.ndv),
+      current.rows,
+    );
+  }
+  const key = statisticsLiteralKey(source, rel, column, engine);
+  return key === null
+    ? null
+    : statisticsSelectivity(statisticsComparisonRows(current, op, key), current.rows);
+}
+
+function statisticsBoundTermsSelectivity(
+  rel: ScopeRel,
+  column: number,
+  terms: BoundTerm[],
+  engine: Engine,
+): Selectivity | null {
+  if (terms.length === 0) return { kind: "all" };
+  const equality = terms.find((term) => term.op === "eq");
+  if (equality !== undefined)
+    return statisticsBoundSourceSelectivity(rel, column, "eq", equality.src, engine);
+  const lower = terms.find((term) => term.op === "gt" || term.op === "ge");
+  const upper = terms.find((term) => term.op === "lt" || term.op === "le");
+  if (lower === undefined || upper === undefined) {
+    const term = lower ?? upper;
+    return term === undefined
+      ? null
+      : statisticsBoundSourceSelectivity(rel, column, term.op, term.src, engine);
+  }
+  const current = currentColumnStatistics(engine, rel, column);
+  const lowerKey = statisticsLiteralKey(lower.src, rel, column, engine);
+  const upperKey = statisticsLiteralKey(upper.src, rel, column, engine);
+  if (current === null || lowerKey === null || upperKey === null) return null;
+  let mcvRows = 0n;
+  let allMcvRows = 0n;
+  for (const entry of current.mcv) {
+    allMcvRows = saturatingEstimateAdd(allMcvRows, entry.rows);
+    if (
+      statisticsKeySatisfies(compareBytes(entry.key, lowerKey), lower.op) &&
+      statisticsKeySatisfies(compareBytes(entry.key, upperKey), upper.op)
+    )
+      mcvRows = saturatingEstimateAdd(mcvRows, entry.rows);
+  }
+  if (allMcvRows > current.nonnullRows) allMcvRows = current.nonnullRows;
+  const residual = current.nonnullRows - allMcvRows;
+  let histogramRows: bigint;
+  if (current.histogram.length >= 2) {
+    let lowerOrdinal = 0;
+    while (
+      lowerOrdinal < current.histogram.length &&
+      (compareBytes(current.histogram[lowerOrdinal]!, lowerKey) < 0 ||
+        (lower.op === "gt" && compareBytes(current.histogram[lowerOrdinal]!, lowerKey) === 0))
+    )
+      lowerOrdinal++;
+    let upperOrdinal = 0;
+    while (
+      upperOrdinal < current.histogram.length &&
+      (compareBytes(current.histogram[upperOrdinal]!, upperKey) < 0 ||
+        (upper.op === "le" && compareBytes(current.histogram[upperOrdinal]!, upperKey) === 0))
+    )
+      upperOrdinal++;
+    histogramRows = statisticsScale(
+      residual,
+      BigInt(Math.max(0, upperOrdinal - lowerOrdinal)),
+      BigInt(current.histogram.length - 1),
+    );
+    if (histogramRows > residual) histogramRows = residual;
+  } else {
+    histogramRows = statisticsScale(
+      residual,
+      SELECTIVITY_PAIRED_RANGE.numerator,
+      SELECTIVITY_PAIRED_RANGE.denominator,
+    );
+  }
+  const rows = saturatingEstimateAdd(mcvRows, histogramRows);
+  return statisticsSelectivity(rows > current.nonnullRows ? current.nonnullRows : rows, current.rows);
+}
+
+function statisticsLeafSelectivity(
+  expr: RExpr,
+  rel: ScopeRel,
+  engine: Engine,
+): Selectivity | null {
+  if (expr.kind === "isNull") {
+    const column = statisticsColumn(expr.operand, rel);
+    if (column === null) return null;
+    const current = currentColumnStatistics(engine, rel, column);
+    if (current === null) return null;
+    return statisticsSelectivity(expr.negated ? current.nonnullRows : current.nullRows, current.rows);
+  }
+  if (expr.kind === "column") {
+    const column = statisticsColumn(expr, rel);
+    if (
+      column === null ||
+      rel.table.columns[column]!.type.kind !== "scalar" ||
+      rel.table.columns[column]!.type.scalar !== "boolean"
+    )
+      return null;
+    const current = currentColumnStatistics(engine, rel, column);
+    const key = statisticsValueKey(boolValue(true), rel, column, engine);
+    if (current === null || key === null) return null;
+    return statisticsSelectivity(statisticsEqualityRows(current, key), current.rows);
+  }
+  if (expr.kind === "inValues") {
+    const column = statisticsColumn(expr.lhs, rel);
+    if (column === null) return null;
+    const current = currentColumnStatistics(engine, rel, column);
+    if (current === null) return null;
+    const seen = new Set<string>();
+    let rows = 0n;
+    let hasNull = false;
+    for (const value of expr.list) {
+      if (value.kind === "null") {
+        hasNull = true;
+        continue;
+      }
+      const key = statisticsValueKey(value, rel, column, engine);
+      const id = key === null ? null : encodeBytea(key, "hex");
+      if (key !== null && id !== null && !seen.has(id)) {
+        seen.add(id);
+        rows = saturatingEstimateAdd(rows, statisticsEqualityRows(current, key));
+        if (rows > current.nonnullRows) rows = current.nonnullRows;
+      }
+    }
+    if (expr.negated) rows = hasNull ? 0n : current.nonnullRows - rows;
+    return statisticsSelectivity(rows, current.rows);
+  }
+  const comparison = statisticsComparison(expr, rel);
+  if (comparison === null) return null;
+  const current = currentColumnStatistics(engine, rel, comparison.column);
+  if (current === null) return null;
+  if (comparison.literal.kind === "constNull") return { kind: "zero" };
+  if (comparison.literal.kind === "param") {
+    if ((comparison.op !== "eq" && comparison.op !== "ne") || current.ndv === null) return null;
+    let rows = statisticsScale(current.nonnullRows, 1n, current.ndv < 1n ? 1n : current.ndv);
+    if (comparison.op === "ne") rows = current.nonnullRows - rows;
+    return statisticsSelectivity(rows, current.rows);
+  }
+  const key = statisticsLiteralKey(comparison.literal, rel, comparison.column, engine);
+  if (key === null) return null;
+  return statisticsSelectivity(
+    statisticsComparisonRows(current, comparison.op, key),
+    current.rows,
+  );
+}
+
+function collectStatisticsEqualityDisjunction(
+  expr: RExpr,
+  rel: ScopeRel,
+  out: { column: number | null; literals: RExpr[] },
+): boolean {
+  if (expr.kind === "or")
+    return (
+      collectStatisticsEqualityDisjunction(expr.lhs, rel, out) &&
+      collectStatisticsEqualityDisjunction(expr.rhs, rel, out)
+    );
+  const comparison = statisticsComparison(expr, rel);
+  if (
+    comparison === null ||
+    comparison.op !== "eq" ||
+    (out.column !== null && out.column !== comparison.column)
+  )
+    return false;
+  out.column = comparison.column;
+  out.literals.push(comparison.literal);
+  return true;
+}
+
+function statisticsEqualityDisjunctionSelectivity(
+  expr: RExpr,
+  rel: ScopeRel,
+  engine: Engine,
+): Selectivity | null {
+  const disjunction: { column: number | null; literals: RExpr[] } = { column: null, literals: [] };
+  if (!collectStatisticsEqualityDisjunction(expr, rel, disjunction) || disjunction.column === null)
+    return null;
+  const current = currentColumnStatistics(engine, rel, disjunction.column);
+  if (current === null) return null;
+  const seen = new Set<string>();
+  let matched = 0n;
+  for (const literal of disjunction.literals) {
+    if (literal.kind === "constNull") continue;
+    if (literal.kind === "param") {
+      if (current.ndv === null) return null;
+      matched = saturatingEstimateAdd(
+        matched,
+        statisticsScale(current.nonnullRows, 1n, current.ndv < 1n ? 1n : current.ndv),
+      );
+    } else {
+      const key = statisticsLiteralKey(literal, rel, disjunction.column, engine);
+      const id = key === null ? null : encodeBytea(key, "hex");
+      if (key !== null && id !== null && !seen.has(id)) {
+        seen.add(id);
+        matched = saturatingEstimateAdd(matched, statisticsEqualityRows(current, key));
+      }
+    }
+    if (matched > current.nonnullRows) matched = current.nonnullRows;
+  }
+  return statisticsSelectivity(matched, current.rows);
+}
+
+function statisticsNegatedPairedRangeSelectivity(
+  lhs: RExpr,
+  rhs: RExpr,
+  rel: ScopeRel,
+  engine: Engine,
+): Selectivity | null {
+  const a = statisticsComparison(lhs, rel);
+  const b = statisticsComparison(rhs, rel);
+  if (a === null || b === null || a.column !== b.column) return null;
+  const lower = a.op === "gt" || a.op === "ge" ? a : b;
+  const upper = lower === a ? b : a;
+  if (
+    (lower.op !== "gt" && lower.op !== "ge") ||
+    (upper.op !== "lt" && upper.op !== "le")
+  )
+    return null;
+  const lowerNull = lower.literal.kind === "constNull";
+  const upperNull = upper.literal.kind === "constNull";
+  if (lowerNull || upperNull) {
+    if (lowerNull && upperNull) return { kind: "zero" };
+    if (lowerNull)
+      return statisticsBoundSourceSelectivity(
+        rel,
+        a.column,
+        upper.op === "le" ? "gt" : "ge",
+        upper.literal,
+        engine,
+      );
+    return statisticsBoundSourceSelectivity(
+      rel,
+      a.column,
+      lower.op === "ge" ? "lt" : "le",
+      lower.literal,
+      engine,
+    );
+  }
+  const current = currentColumnStatistics(engine, rel, a.column);
+  const positive = statisticsPairedRangeSelectivity(lhs, rhs, rel, engine);
+  if (current === null || positive === null) return null;
+  return statisticsSelectivity(
+    current.nonnullRows - estimateSelectivity(positive, current.rows),
+    current.rows,
+  );
+}
+
+function statisticsNegatedLeafSelectivity(
+  expr: RExpr,
+  rel: ScopeRel,
+  engine: Engine,
+): Selectivity | null {
+  const disjunction: { column: number | null; literals: RExpr[] } = { column: null, literals: [] };
+  if (collectStatisticsEqualityDisjunction(expr, rel, disjunction) && disjunction.column !== null) {
+    const current = currentColumnStatistics(engine, rel, disjunction.column);
+    if (current === null) return null;
+    const seen = new Set<string>();
+    let matched = 0n;
+    let hasNull = false;
+    for (const literal of disjunction.literals) {
+      if (literal.kind === "constNull") hasNull = true;
+      else if (literal.kind === "param") {
+        if (current.ndv === null) return null;
+        matched = saturatingEstimateAdd(
+          matched,
+          statisticsScale(current.nonnullRows, 1n, current.ndv < 1n ? 1n : current.ndv),
+        );
+      } else {
+        const key = statisticsLiteralKey(literal, rel, disjunction.column, engine);
+        const id = key === null ? null : encodeBytea(key, "hex");
+        if (key !== null && id !== null && !seen.has(id)) {
+          seen.add(id);
+          matched = saturatingEstimateAdd(matched, statisticsEqualityRows(current, key));
+        }
+      }
+      if (matched > current.nonnullRows) matched = current.nonnullRows;
+    }
+    return statisticsSelectivity(hasNull ? 0n : current.nonnullRows - matched, current.rows);
+  }
+  if (expr.kind === "and") {
+    const paired = statisticsNegatedPairedRangeSelectivity(expr.lhs, expr.rhs, rel, engine);
+    if (paired !== null) return paired;
+  }
+  const comparison = statisticsComparison(expr, rel);
+  if (comparison !== null) {
+    const current = currentColumnStatistics(engine, rel, comparison.column);
+    if (current === null) return null;
+    if (comparison.literal.kind === "constNull") return { kind: "zero" };
+    let rows: bigint;
+    if (comparison.literal.kind === "param") {
+      if ((comparison.op !== "eq" && comparison.op !== "ne") || current.ndv === null)
+        return null;
+      rows = statisticsScale(
+        current.nonnullRows,
+        1n,
+        current.ndv < 1n ? 1n : current.ndv,
+      );
+      if (comparison.op === "ne") rows = current.nonnullRows - rows;
+    } else {
+      const key = statisticsLiteralKey(comparison.literal, rel, comparison.column, engine);
+      if (key === null) return null;
+      rows = statisticsComparisonRows(current, comparison.op, key);
+    }
+    return statisticsSelectivity(current.nonnullRows - rows, current.rows);
+  }
+  if (expr.kind === "column") {
+    const column = statisticsColumn(expr, rel);
+    if (
+      column === null ||
+      rel.table.columns[column]!.type.kind !== "scalar" ||
+      rel.table.columns[column]!.type.scalar !== "boolean"
+    )
+      return null;
+    const current = currentColumnStatistics(engine, rel, column);
+    const key = statisticsValueKey(boolValue(true), rel, column, engine);
+    if (current === null || key === null) return null;
+    return statisticsSelectivity(
+      current.nonnullRows - statisticsEqualityRows(current, key),
+      current.rows,
+    );
+  }
+  return null;
+}
+
+function statisticsPairedRangeSelectivity(
+  lhs: RExpr,
+  rhs: RExpr,
+  rel: ScopeRel,
+  engine: Engine,
+): Selectivity | null {
+  const a = statisticsComparison(lhs, rel);
+  const b = statisticsComparison(rhs, rel);
+  if (
+    a === null ||
+    b === null ||
+    a.column !== b.column ||
+    a.literal.kind === "param" ||
+    b.literal.kind === "param"
+  )
+    return null;
+  const lower = a.op === "gt" || a.op === "ge" ? a : b;
+  const upper = lower === a ? b : a;
+  if (
+    (lower.op !== "gt" && lower.op !== "ge") ||
+    (upper.op !== "lt" && upper.op !== "le")
+  )
+    return null;
+  const lowerKey = statisticsLiteralKey(lower.literal, rel, a.column, engine);
+  const upperKey = statisticsLiteralKey(upper.literal, rel, a.column, engine);
+  const current = currentColumnStatistics(engine, rel, a.column);
+  if (lowerKey === null || upperKey === null || current === null) return null;
+  let mcvRows = 0n;
+  let allMcvRows = 0n;
+  for (const entry of current.mcv) {
+    allMcvRows = saturatingEstimateAdd(allMcvRows, entry.rows);
+    if (
+      statisticsKeySatisfies(compareBytes(entry.key, lowerKey), lower.op) &&
+      statisticsKeySatisfies(compareBytes(entry.key, upperKey), upper.op)
+    )
+      mcvRows = saturatingEstimateAdd(mcvRows, entry.rows);
+  }
+  if (allMcvRows > current.nonnullRows) allMcvRows = current.nonnullRows;
+  const residual = current.nonnullRows - allMcvRows;
+  let histogramRows: bigint;
+  if (current.histogram.length >= 2) {
+    let lowerOrdinal = 0;
+    while (
+      lowerOrdinal < current.histogram.length &&
+      (compareBytes(current.histogram[lowerOrdinal]!, lowerKey) < 0 ||
+        (lower.op === "gt" && compareBytes(current.histogram[lowerOrdinal]!, lowerKey) === 0))
+    )
+      lowerOrdinal++;
+    let upperOrdinal = 0;
+    while (
+      upperOrdinal < current.histogram.length &&
+      (compareBytes(current.histogram[upperOrdinal]!, upperKey) < 0 ||
+        (upper.op === "le" && compareBytes(current.histogram[upperOrdinal]!, upperKey) === 0))
+    )
+      upperOrdinal++;
+    histogramRows = statisticsScale(
+      residual,
+      BigInt(Math.max(0, upperOrdinal - lowerOrdinal)),
+      BigInt(current.histogram.length - 1),
+    );
+    if (histogramRows > residual) histogramRows = residual;
+  } else {
+    histogramRows = statisticsScale(
+      residual,
+      SELECTIVITY_PAIRED_RANGE.numerator,
+      SELECTIVITY_PAIRED_RANGE.denominator,
+    );
+  }
+  const rows = saturatingEstimateAdd(mcvRows, histogramRows);
+  return statisticsSelectivity(rows > current.nonnullRows ? current.nonnullRows : rows, current.rows);
+}
+
 function estimatorPredicateSelectivity(expr: RExpr | null): Selectivity {
   if (expr === null) return { kind: "all" };
   switch (expr.kind) {
@@ -15347,6 +16371,80 @@ function estimatorPredicateSelectivity(expr: RExpr | null): Selectivity {
       return fractionSelectivity(SELECTIVITY_BOOLEAN);
     default:
       return selectivityClass(ACCESS_UNSUPPORTED);
+  }
+}
+
+function estimatorPredicateSelectivityWithStatistics(
+  expr: RExpr | null,
+  rel: ScopeRel,
+  engine: Engine,
+): Selectivity {
+  if (expr === null) return { kind: "all" };
+  switch (expr.kind) {
+    case "and": {
+      const conjuncts: RExpr[] = [];
+      estimatorFlattenBoolean(expr, "and", conjuncts);
+      if (estimatorConjunctionContradictory(conjuncts)) return { kind: "zero" };
+      const used = conjuncts.map(() => false);
+      let result: Selectivity = { kind: "all" };
+      for (let i = 0; i < conjuncts.length; i++) {
+        if (used[i]) continue;
+        let paired = -1;
+        for (let j = i + 1; j < conjuncts.length; j++) {
+          if (!used[j] && estimatorPairedRange(conjuncts[i]!, conjuncts[j]!)) {
+            paired = j;
+            break;
+          }
+        }
+        if (paired >= 0) {
+          used[paired] = true;
+          result = andSelectivity(
+            result,
+            statisticsPairedRangeSelectivity(conjuncts[i]!, conjuncts[paired]!, rel, engine) ??
+              fractionSelectivity(SELECTIVITY_PAIRED_RANGE),
+          );
+        } else {
+          result = andSelectivity(
+            result,
+            estimatorPredicateSelectivityWithStatistics(conjuncts[i]!, rel, engine),
+          );
+        }
+      }
+      return result;
+    }
+    case "or": {
+      const equality = statisticsEqualityDisjunctionSelectivity(expr, rel, engine);
+      if (equality !== null) return equality;
+      const disjuncts: RExpr[] = [];
+      estimatorFlattenBoolean(expr, "or", disjuncts);
+      let result: Selectivity | null = null;
+      for (let i = 0; i < disjuncts.length; i++) {
+        const part = disjuncts[i]!;
+        const equality = estimatorEqualityParts(part);
+        if (
+          equality !== null &&
+          disjuncts.slice(0, i).some((prior) => {
+            const before = estimatorEqualityParts(prior);
+            return (
+              before !== null &&
+              rexprEqShifted(equality.operand, before.operand, 0) &&
+              rexprEqShifted(equality.literal, before.literal, 0)
+            );
+          })
+        )
+          continue;
+        const estimated = estimatorPredicateSelectivityWithStatistics(part, rel, engine);
+        result = result === null ? estimated : orSelectivity(result, estimated);
+      }
+      return result ?? { kind: "zero" };
+    }
+    case "not":
+      return (
+        statisticsNegatedLeafSelectivity(expr.operand, rel, engine) ??
+        notSelectivity(estimatorPredicateSelectivityWithStatistics(expr.operand, rel, engine))
+      );
+    default:
+      return statisticsLeafSelectivity(expr, rel, engine) ?? estimatorPredicateSelectivity(expr);
   }
 }
 
@@ -15681,6 +16779,127 @@ function estimatorCandidateSelectivity(candidate: ScanCandidate, rel: ScopeRel):
   }
 }
 
+function estimatorIntervalSelectivityWithStatistics(
+  specs: IntervalSpec[],
+  clip: BoundTerm[],
+  uniquePoints: boolean,
+  keyType: ScalarType,
+  column: number,
+  rel: ScopeRel,
+  engine: Engine,
+): Selectivity {
+  let result: Selectivity | null = null;
+  for (const spec of specs) {
+    const structural = estimatorRangeTerms(spec.terms, keyType);
+    const term =
+      structural.kind === "zero"
+        ? structural
+        : uniquePoints && spec.terms.length > 0 && spec.terms.every((bound) => bound.op === "eq")
+          ? ({ kind: "unique" } as const)
+          : (statisticsBoundTermsSelectivity(rel, column, spec.terms, engine) ?? structural);
+    result = result === null ? term : orSelectivity(result, term);
+  }
+  result ??= { kind: "zero" };
+  return clip.length === 0
+    ? result
+    : andSelectivity(
+        result,
+        statisticsBoundTermsSelectivity(rel, column, clip, engine) ??
+          estimatorRangeTerms(clip, keyType),
+      );
+}
+
+function estimatorCandidateSelectivityWithStatistics(
+  candidate: ScanCandidate,
+  rel: ScopeRel,
+  engine: Engine,
+): Selectivity {
+  const structural = estimatorCandidateSelectivity(candidate, rel);
+  if (structural.kind === "zero" || structural.kind === "unique") return structural;
+  const bound = candidate.bound;
+  if (bound === null) return structural;
+  switch (bound.kind) {
+    case "pk": {
+      let result: Selectivity = { kind: "all" };
+      for (const equality of bound.pk.eqCols) {
+        const column = columnIndex(rel.table, equality.name);
+        const estimate =
+          column >= 0 && equality.srcs.length > 0
+            ? statisticsBoundSourceSelectivity(rel, column, "eq", equality.srcs[0]!, engine)
+            : null;
+        result = andSelectivity(result, estimate ?? fractionSelectivity(SELECTIVITY_EQUALITY));
+      }
+      if (bound.pk.range !== null) {
+        const column = columnIndex(rel.table, bound.pk.range.name);
+        result = andSelectivity(
+          result,
+          (column >= 0
+            ? statisticsBoundTermsSelectivity(rel, column, bound.pk.range.terms, engine)
+            : null) ?? estimatorRangeTerms(bound.pk.range.terms, bound.pk.range.colType),
+        );
+      }
+      return result;
+    }
+    case "index": {
+      const index = rel.table.indexes.find(
+        (definition) => definition.name.toLowerCase() === candidate.identity.indexName,
+      );
+      if (index === undefined) return structural;
+      let result: Selectivity = { kind: "all" };
+      for (let position = 0; position < bound.index.eqCols.length; position++) {
+        const equality = bound.index.eqCols[position]!;
+        const key = index.keys[position];
+        const estimate =
+          key?.kind === "column" && equality.srcs.length > 0
+            ? statisticsBoundSourceSelectivity(rel, key.column, "eq", equality.srcs[0]!, engine)
+            : null;
+        result = andSelectivity(result, estimate ?? fractionSelectivity(SELECTIVITY_EQUALITY));
+      }
+      if (bound.index.range !== null) {
+        const key = index.keys[bound.index.eqCols.length];
+        result = andSelectivity(
+          result,
+          (key?.kind === "column"
+            ? statisticsBoundTermsSelectivity(rel, key.column, bound.index.range.terms, engine)
+            : null) ?? estimatorRangeTerms(bound.index.range.terms, bound.index.range.colType),
+        );
+      }
+      return result;
+    }
+    case "pkSet": {
+      const members = pkIndices(rel.table);
+      if (members.length !== 1) return structural;
+      return estimatorIntervalSelectivityWithStatistics(
+        bound.pkSet.specs,
+        bound.pkSet.clip,
+        true,
+        bound.pkSet.pkType,
+        members[0]!,
+        rel,
+        engine,
+      );
+    }
+    case "indexSet": {
+      const index = rel.table.indexes.find(
+        (definition) => definition.name.toLowerCase() === candidate.identity.indexName,
+      );
+      const key = index?.keys[0];
+      if (index === undefined || key?.kind !== "column") return structural;
+      return estimatorIntervalSelectivityWithStatistics(
+        bound.indexSet.specs,
+        bound.indexSet.clip,
+        index.unique && index.keys.length === 1,
+        bound.indexSet.colType,
+        key.column,
+        rel,
+        engine,
+      );
+    }
+    default:
+      return structural;
+  }
+}
+
 function estimatorOperatorNodes(expr: RExpr | null): bigint {
   if (expr === null) return 0n;
   const sum = (...children: (RExpr | null)[]): bigint =>
@@ -15823,10 +17042,12 @@ export function estimateScanCandidates(
   const store = engine.estimatorStore(rel.db, rel.table.name);
   const rowCount = store.count() ?? 0n;
   const residual = candidates[0]?.residual ?? null;
-  const selectivities = candidates.map((candidate) => estimatorCandidateSelectivity(candidate, rel));
+  const selectivities = candidates.map((candidate) =>
+    estimatorCandidateSelectivityWithStatistics(candidate, rel, engine),
+  );
   const outputSelectivity = selectivities.some((selectivity) => selectivity.kind === "zero")
     ? ({ kind: "zero" } as const)
-    : estimatorPredicateSelectivity(residual);
+    : estimatorPredicateSelectivityWithStatistics(residual, rel, engine);
   const outputRows = estimateSelectivity(outputSelectivity, rowCount);
   const tableHeight = BigInt(store.height());
   const filterNodes = estimatorOperatorNodes(residual);
@@ -20259,7 +21480,8 @@ export type SrfKind =
   | "jed_indexes"
   // The jed_constraints catalog relation (introspection.md §5.1, slice I2) — one row per CHECK /
   // UNIQUE / FK / EXCLUDE constraint of every user table.
-  | "jed_constraints";
+  | "jed_constraints"
+  | "jed_statistics";
 
 // SrfPlan is a resolved set-returning-function row source (spec/design/functions.md §10,
 // array-functions.md §9). kind selects the generator: generate_series(start, stop[, step]) (args =
@@ -20289,7 +21511,12 @@ export type SrfPlan = {
 // AFTER a statement-local CTE (a CTE shadows a catalog relation — PG-matching, oracle-checked) and
 // BEFORE the user catalog (post-I0 the two can never collide; for a pre-reservation legacy file the
 // built-in wins and the user relation is unreachable by name — §5).
-export type CatalogRelKind = "jed_tables" | "jed_columns" | "jed_indexes" | "jed_constraints";
+export type CatalogRelKind =
+  | "jed_tables"
+  | "jed_columns"
+  | "jed_indexes"
+  | "jed_constraints"
+  | "jed_statistics";
 
 export function catalogRelKind(name: string): CatalogRelKind | undefined {
   const lname = name.toLowerCase();
@@ -20297,7 +21524,8 @@ export function catalogRelKind(name: string): CatalogRelKind | undefined {
     lname === "jed_tables" ||
     lname === "jed_columns" ||
     lname === "jed_indexes" ||
-    lname === "jed_constraints"
+    lname === "jed_constraints" ||
+    lname === "jed_statistics"
   ) {
     return lname;
   }
@@ -20376,7 +21604,7 @@ export function catalogRelTable(kind: CatalogRelKind): Table {
         // A partial index's predicate canonical text; NULL for a non-partial index (indexes.md §9).
         col("predicate", "text", false),
       ]);
-    default: // "jed_constraints"
+    case "jed_constraints":
       return table("jed_constraints", [
         col("name", "text", true),
         col("table_name", "text", true),
@@ -20385,6 +21613,19 @@ export function catalogRelTable(kind: CatalogRelKind): Table {
         col("expression", "text", false),
         col("ref_table", "text", false),
         textArr("ref_columns", false),
+      ]);
+    default: // "jed_statistics"
+      return table("jed_statistics", [
+        col("table_name", "text", true),
+        col("column_name", "text", true),
+        col("analyzed_rows", "i64", true),
+        col("is_stale", "boolean", true),
+        col("null_count", "i64", true),
+        col("distinct_count", "i64", false),
+        col("sample_rows", "i64", true),
+        col("average_width", "i64", false),
+        col("mcv_count", "i32", true),
+        col("histogram_count", "i32", true),
       ]);
   }
 }

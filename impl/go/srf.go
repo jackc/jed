@@ -504,6 +504,8 @@ func catalogRelKind(name string) (srfKind, bool) {
 		return srfJedIndexes, true
 	case "jed_constraints":
 		return srfJedConstraints, true
+	case "jed_statistics":
+		return srfJedStatistics, true
 	}
 	return 0, false
 }
@@ -570,7 +572,7 @@ func catalogRelTable(kind srfKind) *catTable {
 			// A partial index's predicate canonical text; NULL for a non-partial index (indexes.md §9).
 			{Name: "predicate", Type: scalarT(scalarText)},
 		}}
-	default: // srfJedConstraints
+	case srfJedConstraints:
 		return &catTable{Name: "jed_constraints", Columns: []catColumn{
 			{Name: "name", Type: scalarT(scalarText), NotNull: true},
 			{Name: "table_name", Type: scalarT(scalarText), NotNull: true},
@@ -579,6 +581,19 @@ func catalogRelTable(kind srfKind) *catTable {
 			{Name: "expression", Type: scalarT(scalarText)},
 			{Name: "ref_table", Type: scalarT(scalarText)},
 			{Name: "ref_columns", Type: textArr},
+		}}
+	default: // srfJedStatistics
+		return &catTable{Name: "jed_statistics", Columns: []catColumn{
+			{Name: "table_name", Type: scalarT(scalarText), NotNull: true},
+			{Name: "column_name", Type: scalarT(scalarText), NotNull: true},
+			{Name: "analyzed_rows", Type: scalarT(scalarInt64), NotNull: true},
+			{Name: "is_stale", Type: scalarT(scalarBool), NotNull: true},
+			{Name: "null_count", Type: scalarT(scalarInt64), NotNull: true},
+			{Name: "distinct_count", Type: scalarT(scalarInt64)},
+			{Name: "sample_rows", Type: scalarT(scalarInt64), NotNull: true},
+			{Name: "average_width", Type: scalarT(scalarInt64)},
+			{Name: "mcv_count", Type: scalarT(scalarInt32), NotNull: true},
+			{Name: "histogram_count", Type: scalarT(scalarInt32), NotNull: true},
 		}}
 	}
 }
@@ -729,6 +744,42 @@ func (db *engine) jedIndexesRows(sp *srfPlan, m *costMeter) ([]storedRow, error)
 				predicate,
 			})
 		}
+	}
+	return out, nil
+}
+
+func (db *engine) jedStatisticsRows(sp *srfPlan, m *costMeter) ([]storedRow, error) {
+	snap := db.snapForScope(sp.introspectScope)
+	if snap == nil {
+		return nil, newError(UndefinedTable, `database "`+sp.introspectScope+`" is not attached`)
+	}
+	var out []storedRow
+	for _, item := range snap.statisticsSorted() {
+		table := snap.tables[item.table]
+		if table == nil || item.column >= len(table.Columns) {
+			continue
+		}
+		if err := m.Guard(); err != nil {
+			return nil, err
+		}
+		m.Charge(costs.GeneratedRow)
+		statistics := item.statistics
+		distinct := NullValue()
+		if statistics.DistinctCount != nil {
+			distinct = IntValue(*statistics.DistinctCount)
+		}
+		averageWidth := NullValue()
+		nonnull := statistics.AnalyzedRows - statistics.NullCount
+		if nonnull > 0 {
+			averageWidth = IntValue((statistics.WidthSum + nonnull - 1) / nonnull)
+		}
+		out = append(out, storedRow{
+			TextValue(table.Name), TextValue(table.Columns[item.column].Name),
+			IntValue(statistics.AnalyzedRows), BoolValue(statistics.Stale),
+			IntValue(statistics.NullCount), distinct, IntValue(int64(statistics.SampleRows)),
+			averageWidth, IntValue(int64(len(statistics.MCV))),
+			IntValue(int64(len(statistics.Histogram))),
+		})
 	}
 	return out, nil
 }

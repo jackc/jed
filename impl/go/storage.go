@@ -175,6 +175,14 @@ func (s *tableStore) IterInKeyOrder() ([]storedRow, error) {
 func (s *tableStore) NodeCount() int { return s.rows.nodeCount() }
 func (s *tableStore) Height() int    { return s.rows.height() }
 
+func (s *tableStore) columnType(column int) colType { return s.colTypes[column] }
+
+func (s *tableStore) statisticsScanUnits(key []byte, row storedRow, column int) (pages, slabs int) {
+	mask := make([]bool, len(s.colTypes))
+	mask[column] = true
+	return recordScanUnits(s.colTypes, key, row, s.cap, mask)
+}
+
 // RangeRows returns the rows whose primary key lies within the bound, in key order — a bounded
 // B-tree scan that faults only the leaves the bound spans (spec/design/cost.md §3 "bounded scan").
 func (s *tableStore) RangeRows(b keyBound) ([]storedRow, error) {

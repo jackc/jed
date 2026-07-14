@@ -248,9 +248,16 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   `cost_plan_p8` NoREC relation, and 3-/5-/9-way benchmark lanes pin the slice. Native before/after
   checksums match, with measured `ns/op` 95.7–99.9% lower than the pre-P8 planner across those lanes. →
   [estimator.md §10](spec/design/estimator.md), [planner.md §5.4](spec/design/planner.md)
-- [ ] **Column statistics** — the initial transactional per-table row count landed in P1. Add
-  per-column distinct-value counts / histograms later, computed by a spec'd pass over deterministic
-  data so they stay cross-core-identical. _(size: L histograms)_
+- [x] **P9 — deterministic column statistics** — `ANALYZE table [(columns)]` now collects exact
+  NULL/width facts plus bounded deterministic NDV/MCV/equi-depth histograms in all three cores.
+  Facts are transactional, v29-persisted, retained-but-stale after DML, relation-scoped for prepared
+  cache validity, visible through `jed_statistics`, and consumed by literal/parameter predicates,
+  equality joins, GROUP BY/DISTINCT, and variable-width hash estimates. The 30,000-row FNV priority
+  sample, 4,096-entry KMV, fixed/proportional stale-NDV rule, actual collection cost, plan flips,
+  NoREC, byte goldens, and uniform/skew benchmark lanes are shared contracts. Pattern selectivity,
+  extended/multi-column correlation, configurable targets, MCV-aware join skew, and automatic
+  analyze remain explicit follow-ons. → [statistics.md](spec/design/statistics.md),
+  [estimator.md §11](spec/design/estimator.md)
 
 ### Planner infrastructure
 

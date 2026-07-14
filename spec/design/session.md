@@ -445,6 +445,14 @@ untrusted-scratch pattern is `allow_ddl = off` + explicit `allow_temp_ddl = on`.
 `allow_shared_temp_ddl`, for a database-wide shared temp kind, was briefly shipped and then removed —
 temp-tables.md §13, attached-databases.md §6.)
 
+**`ANALYZE` (P9)** is SQL-reachable maintenance that reads every requested target-column value and
+publishes planner metadata. It therefore requires target-table `SELECT` **and** `allow_ddl`, is a
+write for transaction/read-only classification, and adds no separate PostgreSQL-style `MAINTAIN`
+privilege in this slice ([statistics.md](statistics.md) §1). The same `allow_ddl` gate applies to a
+temporary target; `allow_temp_ddl` controls temporary schema creation/removal, not durable planner-
+metadata authority. A host that wants ANALYZE without general DDL can run it through a separately
+trusted session; splitting a maintenance capability is deferred.
+
 The capability envelope governs the **SQL surface** only. Privileged **host-API** maintenance ops —
 `db.load_unicode_data`, `db.set_default_collation`, and `db.upgrade_collations()` (the COLLATION
 UPGRADE migration, [collation.md §12](collation.md)) — are **not SQL-reachable**, so they sit

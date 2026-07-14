@@ -418,7 +418,8 @@ func (db *engine) renderRelLeaf(r *explainRender, sp *selectPlan, i, depth int, 
 	rel := sp.rels[i]
 	switch {
 	case rel.srf != nil && (rel.srf.kind == srfJedTables || rel.srf.kind == srfJedColumns ||
-		rel.srf.kind == srfJedIndexes || rel.srf.kind == srfJedConstraints):
+		rel.srf.kind == srfJedIndexes || rel.srf.kind == srfJedConstraints ||
+		rel.srf.kind == srfJedStatistics):
 		// A catalog relation (introspection.md §5) is computed, not scanned — its own node name
 		// (it is a relation, not a function) plus the database scope it reads.
 		r.emit(depth, "Catalog Scan "+rel.tableName, withNote("db="+rel.srf.introspectScope, note))

@@ -522,6 +522,7 @@ impl Engine {
                     | SrfKind::JedColumns
                     | SrfKind::JedIndexes
                     | SrfKind::JedConstraints
+                    | SrfKind::JedStatistics
             ) {
                 r.emit(
                     depth,

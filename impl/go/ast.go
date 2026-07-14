@@ -5,6 +5,7 @@ package jed
 
 // Statement is a parsed top-level statement (exactly one of the fields is set).
 type statement struct {
+	Analyze     *analyzeStmt
 	CreateTable *createTable
 	DropTable   *dropTable
 	AlterTable  *alterTable
@@ -38,6 +39,15 @@ type statement struct {
 	Begin    *begin
 	Commit   *commit
 	Rollback *rollback
+}
+
+// analyzeStmt is `ANALYZE table [(column, ...)]` (spec/design/statistics.md). An empty Columns
+// slice means all columns. ANALYZE is a transactional write even though it only derives catalog
+// statistics from existing rows.
+type analyzeStmt struct {
+	Name    string
+	DB      *string
+	Columns []string
 }
 
 // alterTable is ALTER TABLE slices 1-5 (spec/design/alter.md): one standalone rename or a

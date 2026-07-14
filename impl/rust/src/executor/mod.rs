@@ -7,11 +7,11 @@
 pub(crate) use crate::api::Rows;
 pub(crate) use crate::ast::{
     AlterColumnKind, AlterConstraintDef, AlterSeqAction, AlterSequence, AlterTable,
-    AlterTableAction, AlterTableEdit, BinaryOp, ConflictAction, ConflictTarget, CreateIndex,
-    CreateSequence, CreateTable, CreateType, Cte, CteBody, DefaultDef, Delete, DropIndex,
-    DropSequence, DropTable, DropType, Expr, GroupItem, IndexKeyElem, Insert, InsertSource,
-    InsertValue, JoinKind, JsonOnBehavior, JsonPredicateKind, JsonTable, JsonWrapper, JtColumn,
-    Literal, OnConflict, OrderKey, Overriding, QueryExpr, RefAction, Select, SelectItems,
+    AlterTableAction, AlterTableEdit, Analyze, BinaryOp, ConflictAction, ConflictTarget,
+    CreateIndex, CreateSequence, CreateTable, CreateType, Cte, CteBody, DefaultDef, Delete,
+    DropIndex, DropSequence, DropTable, DropType, Expr, GroupItem, IndexKeyElem, Insert,
+    InsertSource, InsertValue, JoinKind, JsonOnBehavior, JsonPredicateKind, JsonTable, JsonWrapper,
+    JtColumn, Literal, OnConflict, OrderKey, Overriding, QueryExpr, RefAction, Select, SelectItems,
     SeqOptions, SetOp, SetOpKind, Statement, SubscriptSpec, TableRef, TypeFieldDef, TypeMod,
     UnaryOp, Update, WindowDef, WithExpr, WithQuery,
 };
@@ -82,6 +82,8 @@ mod access_encode;
 pub(crate) use access_encode::*;
 mod engine;
 mod snapshot;
+mod statistics;
+pub(crate) use statistics::*;
 // __SUBMODULES__
 
 /// The outcome of executing one statement. Both variants carry the deterministic
@@ -323,6 +325,8 @@ pub struct Snapshot {
     /// snapshot automatically and no file-format state is involved.
     estimator_base_revision: std::sync::Arc<EstimatorRevision>,
     estimator_revisions: std::sync::Arc<HashMap<String, std::sync::Arc<EstimatorRevision>>>,
+    /// Persisted, transactional P9 column facts, keyed by lowercased table name then column ordinal.
+    statistics: std::sync::Arc<HashMap<String, HashMap<usize, ColumnStatistics>>>,
     tables: std::sync::Arc<HashMap<String, Table>>,
     /// User-defined composite (row) types, keyed by lowercased name (spec/design/composite.md).
     /// A database-level object set, separate from `tables`; serialized into the catalog's
@@ -3468,6 +3472,8 @@ pub(crate) enum SrfKind {
     /// The `jed_constraints` catalog relation (introspection.md §5.1, slice I2) — one row per
     /// CHECK / UNIQUE / FK / EXCLUDE constraint of every user table, in (table, kind, name) order.
     JedConstraints,
+    /// The P9 one-row-per-analyzed-column statistics summary relation.
+    JedStatistics,
 }
 
 /// A resolved `JSON_TABLE` plan (T1, json-table.md §3) — the compiled root path + the column tree.
@@ -3542,6 +3548,7 @@ fn catalog_rel_kind(name: &str) -> Option<SrfKind> {
         "jed_columns" => Some(SrfKind::JedColumns),
         "jed_indexes" => Some(SrfKind::JedIndexes),
         "jed_constraints" => Some(SrfKind::JedConstraints),
+        "jed_statistics" => Some(SrfKind::JedStatistics),
         _ => None,
     }
 }
@@ -3645,8 +3652,7 @@ fn catalog_rel_table(kind: SrfKind) -> Box<Table> {
                 col("predicate", ScalarType::Text, false),
             ],
         ),
-        // SrfKind::JedConstraints
-        _ => table(
+        SrfKind::JedConstraints => table(
             "jed_constraints",
             vec![
                 col("name", ScalarType::Text, true),
@@ -3658,6 +3664,22 @@ fn catalog_rel_table(kind: SrfKind) -> Box<Table> {
                 text_arr("ref_columns", false),
             ],
         ),
+        SrfKind::JedStatistics => table(
+            "jed_statistics",
+            vec![
+                col("table_name", ScalarType::Text, true),
+                col("column_name", ScalarType::Text, true),
+                col("analyzed_rows", ScalarType::Int64, true),
+                col("is_stale", ScalarType::Bool, true),
+                col("null_count", ScalarType::Int64, true),
+                col("distinct_count", ScalarType::Int64, false),
+                col("sample_rows", ScalarType::Int64, true),
+                col("average_width", ScalarType::Int64, false),
+                col("mcv_count", ScalarType::Int32, true),
+                col("histogram_count", ScalarType::Int32, true),
+            ],
+        ),
+        _ => unreachable!("only catalog-relation kinds reach catalog_rel_table"),
     }
 }
 

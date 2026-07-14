@@ -26,7 +26,7 @@ ORDER BY table_name, ordinal;`;
 
 <svelte:head>
 	<title>Introspection — jed</title>
-	<meta name="description" content="The jed_ catalog relations — jed_tables, jed_columns, jed_indexes, jed_constraints: discover tables, columns, indexes, and constraints from SQL, queryable and joinable, per attached database." />
+	<meta name="description" content="The jed_ catalog relations — discover tables, columns, indexes, constraints, and planner statistics from SQL, queryable and joinable per attached database." />
 </svelte:head>
 
 # Introspection
@@ -35,7 +35,7 @@ The `jed_` catalog relations describe a database *from SQL*. They are ordinary r
 relations — select from them, filter them, join them — whose rows are computed on the fly from
 the database's catalog. Nothing is stored, so they are always current.
 
-Four relations ship today:
+Five relations ship today:
 
 - **`jed_tables`** — one row per user table: `name` (the table name as written in `CREATE TABLE`).
 - **`jed_columns`** — one row per column of every user table: `table_name`, `name`, `ordinal`
@@ -51,6 +51,10 @@ Four relations ship today:
   `CHECK`), `expression` (the `CHECK` text; `NULL` otherwise), and `ref_table` / `ref_columns`
   (the foreign-key parent; `NULL` otherwise). A `UNIQUE` constraint *is* its backing unique index,
   so it appears in both `jed_indexes` and `jed_constraints` under the same name.
+- **`jed_statistics`** — one summary per analyzed column: table/column name, analyzed row and NULL
+  counts, stale flag, optional distinct count, sample rows, average width, and MCV/histogram counts.
+  Typed distribution values stay internal; run [`ANALYZE`](../statistics/) to create or refresh a
+  fact. A successful table write retains its facts and marks them stale.
 
 <LiveSql {seed} {query} rows={10} />
 
@@ -60,6 +64,7 @@ Things to try in the panel above:
 - Reconstruct a key — `SELECT name FROM jed_columns WHERE table_name = 'booking' AND pk_ordinal IS NOT NULL ORDER BY pk_ordinal;`
 - List the indexes — `SELECT name, table_name, columns, is_unique, method FROM jed_indexes ORDER BY table_name, name;`
 - List the constraints — `SELECT name, table_name, type, columns, expression, ref_table, ref_columns FROM jed_constraints ORDER BY table_name, type, name;`
+- Inspect planner facts — `SELECT table_name, column_name, analyzed_rows, is_stale, distinct_count FROM jed_statistics ORDER BY table_name, column_name;`
 - Find every foreign key and its parent — `SELECT table_name, columns, ref_table, ref_columns FROM jed_constraints WHERE type = 'foreign_key';`
 - Count columns per table — `SELECT table_name, count(*) FROM jed_columns GROUP BY table_name;`
 - Create a table or index, then re-run the query — the new rows appear immediately.

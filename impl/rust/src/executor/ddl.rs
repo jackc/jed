@@ -189,6 +189,10 @@ impl Engine {
         params: &[Value],
     ) -> Result<Outcome> {
         match stmt {
+            Statement::Analyze(analyze) => {
+                reject_params_for_ddl(params)?;
+                self.execute_analyze(analyze)
+            }
             Statement::CreateTable(ct) => {
                 reject_params_for_ddl(params)?;
                 self.execute_create_table(ct)
@@ -2887,6 +2891,9 @@ impl Engine {
 				.iter()
 				.any(|&column| type_changed_columns[column]);
         let table_rewrite_needed = rewrite_needed || !row_steps.is_empty() || pk_rekeyed;
+        let clear_statistics = row_steps
+            .iter()
+            .any(|step| matches!(step, RowStep::Drop(_) | RowStep::SetType { .. }));
         let rewrite_col_types: Option<Vec<ColType>> = table_rewrite_needed.then(|| {
             let main = self.read_snap();
             table
@@ -3174,6 +3181,9 @@ impl Engine {
             )?;
         } else {
             ws.alter_table_catalog(&old_key, table.clone(), rename_table, ir);
+        }
+        if clear_statistics {
+            ws.clear_statistics(&table.name);
         }
         if rekeyed {
             ws.rebuild_alter_indexes(&original, &table, &constraint_entries, page_size)?;

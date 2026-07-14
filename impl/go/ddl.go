@@ -19,6 +19,8 @@ import (
 // message text is informational — never matched; spec/design/conformance.md §2).
 func stmtKind(stmt statement) string {
 	switch {
+	case stmt.Analyze != nil:
+		return "ANALYZE"
 	case stmt.CreateTable != nil:
 		return "CREATE TABLE"
 	case stmt.DropTable != nil:
@@ -97,6 +99,11 @@ func (db *engine) rebuildMainGistTreesIfDirty() error {
 
 func (db *engine) dispatchStmtBody(stmt statement, params []Value) (outcome, error) {
 	switch {
+	case stmt.Analyze != nil:
+		if err := rejectParamsForDDL(params); err != nil {
+			return outcome{}, err
+		}
+		return db.executeAnalyze(stmt.Analyze)
 	case stmt.CreateTable != nil:
 		if err := rejectParamsForDDL(params); err != nil {
 			return outcome{}, err
@@ -2030,6 +2037,13 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 		}
 	}
 	pkRekeyed := len(table.PK) != len(original.PK)
+	clearStatistics := false
+	for _, step := range rowSteps {
+		if step.kind == alterRowDrop || step.kind == alterRowType {
+			clearStatistics = true
+			break
+		}
+	}
 	if !pkRekeyed {
 		for i, next := range table.PK {
 			if next < 0 || next >= len(columnSources) || columnSources[next].original != original.PK[i] || columnSources[next].typeChanged {
@@ -2234,6 +2248,9 @@ func (db *engine) executeAlterTable(at *alterTable) (outcome, error) {
 		}
 	} else {
 		ws.alterTableCatalog(oldKey, &table, renameTable, indexOld, indexNew)
+	}
+	if clearStatistics {
+		ws.clearStatistics(table.Name)
 	}
 	if rekeyed {
 		err = ws.rebuildAlterIndexes(original, &table, constraintEntries, alterPageSize)

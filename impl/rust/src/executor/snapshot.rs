@@ -23,6 +23,73 @@ impl Snapshot {
         );
     }
 
+    pub(crate) fn column_statistics(
+        &self,
+        table: &str,
+        column: usize,
+    ) -> Option<&ColumnStatistics> {
+        self.statistics
+            .get(&table.to_ascii_lowercase())
+            .and_then(|columns| columns.get(&column))
+    }
+
+    pub(crate) fn column_statistics_mut(
+        &mut self,
+        table: &str,
+        column: usize,
+    ) -> Option<&mut ColumnStatistics> {
+        std::sync::Arc::make_mut(&mut self.statistics)
+            .get_mut(&table.to_ascii_lowercase())
+            .and_then(|columns| columns.get_mut(&column))
+    }
+
+    pub(crate) fn statistics_sorted(&self) -> Vec<(&str, usize, &ColumnStatistics)> {
+        let mut out = Vec::new();
+        for (table, columns) in self.statistics.iter() {
+            for (column, statistics) in columns {
+                out.push((table.as_str(), *column, statistics));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(b.0).then_with(|| a.1.cmp(&b.1)));
+        out
+    }
+
+    pub(crate) fn put_column_statistics(
+        &mut self,
+        table: &str,
+        column: usize,
+        statistics: ColumnStatistics,
+    ) {
+        let all = std::sync::Arc::make_mut(&mut self.statistics);
+        all.entry(table.to_ascii_lowercase())
+            .or_default()
+            .insert(column, statistics);
+    }
+
+    pub(crate) fn mark_statistics_stale(&mut self, table: &str) {
+        let all = std::sync::Arc::make_mut(&mut self.statistics);
+        if let Some(columns) = all.get_mut(&table.to_ascii_lowercase()) {
+            for statistics in columns.values_mut() {
+                statistics.stale = true;
+            }
+        }
+    }
+
+    pub(crate) fn clear_statistics(&mut self, table: &str) {
+        std::sync::Arc::make_mut(&mut self.statistics).remove(&table.to_ascii_lowercase());
+    }
+
+    pub(crate) fn clear_column_statistics(&mut self, table: &str, column: usize) {
+        let key = table.to_ascii_lowercase();
+        let all = std::sync::Arc::make_mut(&mut self.statistics);
+        if let Some(columns) = all.get_mut(&key) {
+            columns.remove(&column);
+            if columns.is_empty() {
+                all.remove(&key);
+            }
+        }
+    }
+
     /// Look up a table definition by name (case-insensitive).
     pub fn table(&self, name: &str) -> Option<&Table> {
         self.tables.get(&name.to_ascii_lowercase())
@@ -245,6 +312,11 @@ impl Snapshot {
                 })
                 .cloned()
                 .collect();
+            for (column, definition) in table.columns.iter().enumerate() {
+                if is_skewed(&definition.collation) {
+                    self.clear_column_statistics(&key, column);
+                }
+            }
             if !pk_skewed && indexes.is_empty() {
                 continue;
             }
@@ -670,6 +742,7 @@ impl Snapshot {
         std::sync::Arc::make_mut(&mut self.tables).remove(key);
         std::sync::Arc::make_mut(&mut self.stores).remove(key);
         std::sync::Arc::make_mut(&mut self.estimator_revisions).remove(key);
+        std::sync::Arc::make_mut(&mut self.statistics).remove(key);
     }
 
     /// The store of a secondary index (panics if absent — callers resolve the index first).
@@ -761,6 +834,10 @@ impl Snapshot {
             std::sync::Arc::make_mut(&mut self.tables).remove(old_key);
             if let Some(store) = std::sync::Arc::make_mut(&mut self.stores).remove(old_key) {
                 std::sync::Arc::make_mut(&mut self.stores).insert(new_key.clone(), store);
+            }
+            if let Some(statistics) = std::sync::Arc::make_mut(&mut self.statistics).remove(old_key)
+            {
+                std::sync::Arc::make_mut(&mut self.statistics).insert(new_key.clone(), statistics);
             }
         }
         std::sync::Arc::make_mut(&mut self.tables).insert(new_key.clone(), table.clone());

@@ -1,0 +1,106 @@
+# skip: disk — the explicit transaction spans records and cannot survive the disk runner's
+# per-record reopen (spec/design/conformance.md §3).
+# P9 statistics are ordinary transactional snapshot state. DML staleness and ANALYZE replacements
+# are visible inside the writer, commit atomically, and roll back with the corresponding table data.
+# A collection ceiling abort installs no partial column set. Cross-core checked; statistics contents
+# and jed's cost ceilings are not PostgreSQL-oracle surfaces.
+# requires: maintenance.analyze, introspect.statistics, txn.explicit, txn.read_only, ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.update, query.select, query.where_eq, query.order_by, resource.cost_limit, types.i32
+
+statement ok
+CREATE TABLE p9_tx (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO p9_tx VALUES (1, 10), (2, 20), (3, NULL)
+
+statement ok
+ANALYZE p9_tx
+
+query TB nosort
+SELECT column_name, is_stale FROM jed_statistics ORDER BY column_name
+----
+id
+false
+v
+false
+
+# A zero-row UPDATE marks working facts stale, and rollback restores the committed fresh facts.
+statement ok
+BEGIN
+
+statement ok
+UPDATE p9_tx SET v = 0 WHERE id = 999
+
+query TB nosort
+SELECT column_name, is_stale FROM jed_statistics ORDER BY column_name
+----
+id
+true
+v
+true
+
+statement ok
+ROLLBACK
+
+query TB nosort
+SELECT column_name, is_stale FROM jed_statistics ORDER BY column_name
+----
+id
+false
+v
+false
+
+# A committed DML mark remains available rather than deleting the facts.
+statement ok
+INSERT INTO p9_tx VALUES (4, 20)
+
+query B nosort
+SELECT is_stale FROM jed_statistics WHERE column_name = 'v'
+----
+true
+
+# ANALYZE refreshes only the working snapshot; rollback restores the pre-block stale fact.
+statement ok
+BEGIN
+
+statement ok
+ANALYZE p9_tx (v)
+
+query B nosort
+SELECT is_stale FROM jed_statistics WHERE column_name = 'v'
+----
+false
+
+statement ok
+ROLLBACK
+
+query BI nosort
+SELECT is_stale, analyzed_rows FROM jed_statistics WHERE column_name = 'v'
+----
+true
+3
+
+# A cost abort during the first scan leaves the entire prior fact set untouched.
+# max_cost: 2
+statement error 54P01
+ANALYZE p9_tx
+
+query TBI nosort
+SELECT column_name, is_stale, analyzed_rows FROM jed_statistics ORDER BY column_name
+----
+id
+true
+3
+v
+true
+3
+
+# ANALYZE is a write and is rejected by a READ ONLY transaction.
+statement ok
+BEGIN READ ONLY
+
+statement error 25006
+ANALYZE p9_tx
+
+statement ok
+ROLLBACK
+

@@ -25,6 +25,24 @@ fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
+fn refresh_test_page_crc(image: &mut [u8], page_start: usize) {
+    let mut crc = 0xffff_ffffu32;
+    for byte in image[page_start..page_start + 12]
+        .iter()
+        .chain(image[page_start + 16..page_start + GOLDEN_PAGE_SIZE as usize].iter())
+    {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xedb8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    image[page_start + 12..page_start + 16].copy_from_slice(&(!crc).to_be_bytes());
+}
+
 /// Load jed's pinned production `JUCD` bundle into the engine-global set so the `unicode`-collated
 /// goldens build (set_default_collation / COLLATE) and read back (the file's reference entry resolves
 /// its table from a loaded bundle — collation.md §4/§9, slice 3c). Idempotent (global, first-wins).
@@ -81,6 +99,29 @@ fn row_count_table_db() -> Session {
     .session(SessionOptions::default());
     run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY)");
     run(&mut db, "INSERT INTO t VALUES (1), (2), (3)");
+    db
+}
+
+fn statistics_table_db() -> Session {
+    let mut db = Database::create(CreateOptions {
+        page_size: GOLDEN_PAGE_SIZE,
+        ..Default::default()
+    })
+    .unwrap()
+    .session(SessionOptions::default());
+    run(&mut db, "CREATE TABLE fresh (id i32 PRIMARY KEY, v text)");
+    run(&mut db, "CREATE TABLE stale (id i32 PRIMARY KEY, v text)");
+    run(
+        &mut db,
+        "INSERT INTO fresh VALUES (1, 'a'), (2, 'a'), (3, 'b'), (4, NULL)",
+    );
+    run(
+        &mut db,
+        "INSERT INTO stale VALUES (1, 'x'), (2, 'x'), (3, NULL)",
+    );
+    run(&mut db, "ANALYZE fresh");
+    run(&mut db, "ANALYZE stale");
+    run(&mut db, "INSERT INTO stale VALUES (4, 'y')");
     db
 }
 
@@ -1368,6 +1409,7 @@ fn write_matches_goldens() {
         ("compressed_table.jed", compressed_table_db),
         ("one_table_empty.jed", one_table_empty_db),
         ("row_count_table.jed", row_count_table_db),
+        ("statistics_table.jed", statistics_table_db),
         ("pk_table.jed", pk_table_db),
         ("text_table.jed", text_table_db),
         ("varchar_table.jed", varchar_table_db),
@@ -1428,6 +1470,29 @@ fn write_matches_goldens() {
         let image = build().to_image(GOLDEN_PAGE_SIZE, 1).unwrap();
         assert_eq!(image, fixture(name), "serialized bytes differ from {name}");
     }
+}
+
+#[test]
+fn statistics_semantic_corruption_is_rejected() {
+    let mut image = fixture("statistics_table.jed");
+    // kind=4, summary=0, name="fresh", column=0, flags=distribution. Forge a reserved flag while
+    // keeping the containing catalog page checksum valid, so this reaches the statistics decoder.
+    let pattern = [4, 0, 0, 5, b'f', b'r', b'e', b's', b'h', 0, 0, 2];
+    let matches: Vec<usize> = image
+        .windows(pattern.len())
+        .enumerate()
+        .filter_map(|(at, bytes)| (bytes == pattern).then_some(at))
+        .collect();
+    assert_eq!(matches.len(), 1, "locate one statistics summary");
+    let flags = matches[0] + pattern.len() - 1;
+    image[flags] = 0x80;
+    let page_start = flags / GOLDEN_PAGE_SIZE as usize * GOLDEN_PAGE_SIZE as usize;
+    refresh_test_page_crc(&mut image, page_start);
+    let error = match Database::from_image(&image) {
+        Ok(_) => panic!("reserved statistics flag must be rejected"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), "XX001");
 }
 
 /// READ side: loading a golden reproduces the same rows the builder produced. The

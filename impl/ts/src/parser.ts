@@ -273,6 +273,8 @@ class Parser {
 
   parseStatement(): Statement {
     switch (this.peekKeyword()) {
+      case "analyze":
+        return this.parseAnalyze();
       // CREATE / DROP dispatch on the object keyword (TABLE vs [UNIQUE] INDEX — grammar.md
       // §30; UNIQUE needs no lookahead of its own — after CREATE the next word being
       // UNIQUE can only be CREATE UNIQUE INDEX).
@@ -325,6 +327,23 @@ class Parser {
       default:
         throw engineError("syntax_error", `unexpected keyword '${this.peekKeyword()}'`);
     }
+  }
+
+  // parseAnalyze parses `ANALYZE qualified_table [(identifier [, identifier ...])]`.
+  private parseAnalyze(): Statement {
+    this.expectKeyword("analyze");
+    const [db, name] = this.parseQualifiedTableName();
+    const columns: string[] = [];
+    if (this.peek().kind === "lparen") {
+      this.advance();
+      for (;;) {
+        columns.push(this.expectIdentifier());
+        if (this.peek().kind !== "comma") break;
+        this.advance();
+      }
+      this.expect("rparen");
+    }
+    return { kind: "analyze", name, db, columns };
   }
 
   // parseBegin parses `BEGIN [TRANSACTION|WORK] [READ ONLY|READ WRITE]` or `START TRANSACTION

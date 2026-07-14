@@ -229,6 +229,21 @@ impl TableStore {
         self.rows.node_count()
     }
 
+    pub(crate) fn column_type(&self, column: usize) -> &ColType {
+        &self.col_types[column]
+    }
+
+    pub(crate) fn statistics_scan_units(
+        &self,
+        key: &[u8],
+        row: &Row,
+        column: usize,
+    ) -> crate::format::ScanUnits {
+        let mut mask = vec![false; self.col_types.len()];
+        mask[column] = true;
+        crate::format::record_scan_units(&self.col_types, key, row, self.cap, &mask)
+    }
+
     pub(crate) fn height(&self) -> usize {
         self.rows.height()
     }

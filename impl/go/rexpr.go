@@ -1358,6 +1358,8 @@ const (
 	// srfJedConstraints is the jed_constraints catalog relation (introspection.md §5.1, slice I2) —
 	// one row per CHECK / UNIQUE / FK / EXCLUDE constraint of every user table.
 	srfJedConstraints
+	// srfJedStatistics is the P9 one-row-per-analyzed-column summary relation.
+	srfJedStatistics
 )
 
 // srfPlan is a resolved set-returning-function row source (spec/design/functions.md §10,

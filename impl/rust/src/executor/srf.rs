@@ -808,6 +808,47 @@ impl Engine {
         Ok(out)
     }
 
+    pub(crate) fn jed_statistics_rows(&self, srf: &SrfPlan, meter: &mut Meter) -> Result<Vec<Row>> {
+        let Some(snap) = self.snap_for_scope(&srf.introspect_scope) else {
+            return Err(EngineError::new(
+                SqlState::UndefinedTable,
+                format!("database \"{}\" is not attached", srf.introspect_scope),
+            ));
+        };
+        let mut out = Vec::new();
+        for (table_key, column, statistics) in snap.statistics_sorted() {
+            let Some(table) = snap.table(table_key) else {
+                continue;
+            };
+            let Some(declared) = table.columns.get(column) else {
+                continue;
+            };
+            meter.guard()?;
+            meter.charge(COSTS.generated_row);
+            let nonnull = statistics.analyzed_rows - statistics.null_count;
+            let average_width = if nonnull == 0 {
+                Value::Null
+            } else {
+                let quotient = statistics.width_sum / nonnull;
+                let remainder = statistics.width_sum % nonnull;
+                Value::Int(quotient + i64::from(remainder != 0))
+            };
+            out.push(vec![
+                Value::Text(table.name.clone()),
+                Value::Text(declared.name.clone()),
+                Value::Int(statistics.analyzed_rows),
+                Value::Bool(statistics.stale),
+                Value::Int(statistics.null_count),
+                statistics.distinct_count.map_or(Value::Null, Value::Int),
+                Value::Int(statistics.sample_rows as i64),
+                average_width,
+                Value::Int(statistics.mcv.len() as i64),
+                Value::Int(statistics.histogram.len() as i64),
+            ]);
+        }
+        Ok(out)
+    }
+
     /// Generate the rows of the `jed_constraints` catalog relation (introspection.md §5.1): one row
     /// per CHECK / UNIQUE / FK / EXCLUDE constraint of every user table of the scope's snapshot, in
     /// (lowercased table name, then a fixed KIND order — check, unique, foreign_key, exclude — each

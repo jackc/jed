@@ -775,6 +775,10 @@ var SupportedCapabilities = []string{
 	// relation — one row per user table of the qualified database, derived at execution from its
 	// pinned catalog snapshot; SELECT-gated like a user table; write/DDL targets are 42809.
 	"introspect.tables",
+	// Explicit deterministic per-column statistics and their read-only computed catalog relation
+	// (P9, spec/design/statistics.md).
+	"maintenance.analyze",
+	"introspect.statistics",
 	// The jed_columns catalog relation (I1): one row per column of every user table — ordinal,
 	// canonical type text, not_null, pk_ordinal (introspection.md §5).
 	"introspect.columns",

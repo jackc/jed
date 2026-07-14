@@ -159,6 +159,144 @@ impl Engine {
         })
     }
 
+    fn estimate_column_statistics(
+        &self,
+        sp: &SelectPlan,
+        global: usize,
+    ) -> Option<(usize, CurrentColumnStatistics)> {
+        for (ordinal, rel) in sp.rels.iter().enumerate() {
+            if global < rel.offset || global >= rel.offset + rel.col_count {
+                continue;
+            }
+            let scope = self.estimate_plan_rel_scope(rel)?;
+            return current_column_statistics(&scope, global - rel.offset, self)
+                .map(|statistics| (ordinal, statistics));
+        }
+        None
+    }
+
+    fn estimate_expression_relation<'a>(
+        &'a self,
+        sp: &SelectPlan,
+        expr: &RExpr,
+    ) -> Option<ScopeRel<'a>> {
+        fn merge(
+            a: std::result::Result<Option<usize>, ()>,
+            b: std::result::Result<Option<usize>, ()>,
+        ) -> std::result::Result<Option<usize>, ()> {
+            match (a, b) {
+                (Ok(Some(a)), Ok(Some(b))) if a == b => Ok(Some(a)),
+                (Ok(Some(a)), Ok(None)) | (Ok(None), Ok(Some(a))) => Ok(Some(a)),
+                (Ok(None), Ok(None)) => Ok(None),
+                _ => Err(()),
+            }
+        }
+        fn owner(sp: &SelectPlan, expr: &RExpr) -> std::result::Result<Option<usize>, ()> {
+            match expr {
+                RExpr::Column(global) => Ok(sp
+                    .rels
+                    .iter()
+                    .position(|rel| *global >= rel.offset && *global < rel.offset + rel.col_count)),
+                RExpr::Compare { lhs, rhs, .. }
+                | RExpr::Distinct { lhs, rhs, .. }
+                | RExpr::And(lhs, rhs)
+                | RExpr::Or(lhs, rhs) => merge(owner(sp, lhs), owner(sp, rhs)),
+                RExpr::Not(child) | RExpr::IsNull { operand: child, .. } => owner(sp, child),
+                RExpr::InValues { lhs, .. } => owner(sp, lhs),
+                _ => Ok(None),
+            }
+        }
+        self.estimate_plan_rel_scope(&sp.rels[owner(sp, expr).ok()??])
+    }
+
+    fn estimate_predicate_selectivity_with_statistics(
+        &self,
+        sp: &SelectPlan,
+        expr: Option<&RExpr>,
+    ) -> crate::estimator::Selectivity {
+        use crate::estimator::Selectivity;
+        let Some(expr) = expr else {
+            return Selectivity::All;
+        };
+        if let RExpr::Compare {
+            op: CmpOp::Eq,
+            lhs,
+            rhs,
+            ..
+        } = expr
+            && let (RExpr::Column(left), RExpr::Column(right)) = (lhs.as_ref(), rhs.as_ref())
+            && let (Some((left_rel, left_stats)), Some((right_rel, right_stats))) = (
+                self.estimate_column_statistics(sp, *left),
+                self.estimate_column_statistics(sp, *right),
+            )
+            && left_rel != right_rel
+            && let (Some(left_ndv), Some(right_ndv)) = (left_stats.ndv, right_stats.ndv)
+        {
+            let population = sat_mul(left_stats.rows, right_stats.rows);
+            let rows = ceil_estimate_mul_div(
+                left_stats.nonnull_rows,
+                right_stats.nonnull_rows,
+                left_ndv.max(right_ndv).max(1),
+            )
+            .min(population);
+            return if rows == 0 || population == 0 {
+                Selectivity::Zero
+            } else if rows >= population {
+                Selectivity::All
+            } else {
+                Selectivity::fraction(EstimatorFraction {
+                    numerator: rows,
+                    denominator: population,
+                })
+            };
+        }
+        if let Some(rel) = self.estimate_expression_relation(sp, expr) {
+            return estimator_predicate_selectivity_with_statistics(Some(expr), &rel, self);
+        }
+        match expr {
+            RExpr::And(lhs, rhs) => self
+                .estimate_predicate_selectivity_with_statistics(sp, Some(lhs))
+                .and(self.estimate_predicate_selectivity_with_statistics(sp, Some(rhs))),
+            RExpr::Or(lhs, rhs) => self
+                .estimate_predicate_selectivity_with_statistics(sp, Some(lhs))
+                .or(self.estimate_predicate_selectivity_with_statistics(sp, Some(rhs))),
+            RExpr::Not(child) => self
+                .estimate_predicate_selectivity_with_statistics(sp, Some(child))
+                .not(),
+            _ => estimator_predicate_selectivity(Some(expr)),
+        }
+    }
+
+    fn estimate_simple_distinct_rows<'a>(
+        &self,
+        sp: &SelectPlan,
+        globals: impl IntoIterator<Item = &'a usize>,
+        input_rows: i64,
+    ) -> Option<i64> {
+        let mut groups = 1i64;
+        let mut any = false;
+        for global in globals {
+            any = true;
+            let (_, statistics) = self.estimate_column_statistics(sp, *global)?;
+            let buckets = statistics
+                .ndv?
+                .saturating_add(i64::from(statistics.null_rows > 0));
+            groups = sat_mul(groups, buckets);
+        }
+        any.then_some(groups.min(input_rows))
+    }
+
+    fn estimate_hash_width(&self, sp: &SelectPlan, global: usize, ty: &Type) -> i64 {
+        match ty {
+            Type::Scalar(scalar) if scalar.is_fixed_width() => scalar.width_bytes() as i64,
+            _ => self
+                .estimate_column_statistics(sp, global)
+                .and_then(|(_, statistics)| statistics.average_width)
+                .unwrap_or(DEFAULT_VARIABLE_KEY_BYTES)
+                .max(1),
+        }
+    }
+
     fn estimate_generate_series_rows(srf: &SrfPlan) -> i64 {
         let [RExpr::ConstInt(start), RExpr::ConstInt(stop), rest @ ..] = srf.args.as_slice() else {
             return DEFAULT_SRF_ROWS;
@@ -183,6 +321,9 @@ impl Engine {
         let Some(snap) = self.snap_for_scope(&srf.introspect_scope) else {
             return 0;
         };
+        if srf.kind == SrfKind::JedStatistics {
+            return snap.statistics_sorted().len().min(MAX_ESTIMATE as usize) as i64;
+        }
         snap.tables_sorted().into_iter().fold(0, |rows, table| {
             let count = match srf.kind {
                 SrfKind::JedTables => 1,
@@ -227,7 +368,8 @@ impl Engine {
                 SrfKind::JedTables
                 | SrfKind::JedColumns
                 | SrfKind::JedIndexes
-                | SrfKind::JedConstraints => self.estimate_catalog_rows(srf),
+                | SrfKind::JedConstraints
+                | SrfKind::JedStatistics => self.estimate_catalog_rows(srf),
                 _ => DEFAULT_SRF_ROWS,
             };
             let mut estimate = PlanEstimate::empty(rows);
@@ -259,6 +401,8 @@ impl Engine {
     }
 
     fn estimate_join_rows(
+        &self,
+        sp: &SelectPlan,
         kind: JoinKind,
         on: Option<&RExpr>,
         physical_pairs: i64,
@@ -269,7 +413,7 @@ impl Engine {
     ) -> (i64, i64) {
         let (mut rows, mut logical_rows) = (physical_pairs, logical_pairs);
         if on.is_some() && !bound_by_outer {
-            let selectivity = estimator_predicate_selectivity(on);
+            let selectivity = self.estimate_predicate_selectivity_with_statistics(sp, on);
             rows = estimate_rows(&selectivity, rows);
             logical_rows = estimate_rows(&selectivity, logical_rows);
         }
@@ -332,7 +476,8 @@ impl Engine {
             sat_mul(left.root.logical_rows, right_per_call_logical)
         };
         let join = &sp.joins[n - 2];
-        let (rows, logical_rows) = Self::estimate_join_rows(
+        let (rows, logical_rows) = self.estimate_join_rows(
+            sp,
             join.kind,
             join.on.as_ref(),
             physical_pairs,
@@ -347,26 +492,23 @@ impl Engine {
         let mut invocations = physical_pairs;
         if n == 2 {
             if let Some(hash) = &sp.phys.hash_join {
-                let (key_bytes, framed_bytes) =
+                let (build_bytes, probe_bytes, framed_bytes) =
                     hash.keys
                         .iter()
-                        .fold((0, 0), |(key_total, framed_total), key| {
-                            let width = match &key.ty {
-                                Type::Scalar(scalar) if scalar.is_fixed_width() => {
-                                    scalar.width_bytes() as i64
-                                }
-                                _ => DEFAULT_VARIABLE_KEY_BYTES,
-                            };
+                        .fold((0, 0, 0), |(build, probe, framed), key| {
+                            let build_width = self.estimate_hash_width(sp, key.right, &key.ty);
+                            let probe_width = self.estimate_hash_width(sp, key.left, &key.ty);
                             (
-                                sat_add(key_total, width),
-                                sat_add(framed_total, sat_add(4, width)),
+                                sat_add(build, build_width),
+                                sat_add(probe, probe_width),
+                                sat_add(framed, sat_add(4, build_width.min(probe_width))),
                             )
                         });
-                root.add_unit(UNIT_HASH_BUILD, sat_mul(right.root.rows, key_bytes));
+                root.add_unit(UNIT_HASH_BUILD, sat_mul(right.root.rows, build_bytes));
                 root.add_unit(
                     UNIT_HASH_PROBE,
                     sat_add(
-                        sat_mul(left.root.rows, key_bytes),
+                        sat_mul(left.root.rows, probe_bytes),
                         sat_mul(rows, framed_bytes),
                     ),
                 );
@@ -406,7 +548,10 @@ impl Engine {
         };
         if !bound_by_outer {
             for &on_index in &step.on_indices {
-                let selectivity = estimator_predicate_selectivity(sp.joins[on_index].on.as_ref());
+                let selectivity = self.estimate_predicate_selectivity_with_statistics(
+                    sp,
+                    sp.joins[on_index].on.as_ref(),
+                );
                 full_rows = estimate_rows(&selectivity, full_rows);
                 full_logical_rows = estimate_rows(&selectivity, full_logical_rows);
             }
@@ -437,7 +582,10 @@ impl Engine {
             if let Some(limit) = sp.limit {
                 let target = sat_add(limit, sp.offset.unwrap_or(0));
                 let post_filter_rows = sp.filter.as_ref().map_or(full_rows, |filter| {
-                    estimate_rows(&estimator_predicate_selectivity(Some(filter)), full_rows)
+                    estimate_rows(
+                        &self.estimate_predicate_selectivity_with_statistics(sp, Some(filter)),
+                        full_rows,
+                    )
                 });
                 if target == 0 {
                     outer_calls = 0;
@@ -470,29 +618,26 @@ impl Engine {
         root.logical_rows = full_logical_rows;
         let mut invocations = visited_pairs;
         if let Some(hash) = &step.hash_join {
-            let (key_bytes, framed_bytes) =
+            let (build_bytes, probe_bytes, framed_bytes) =
                 hash.keys
                     .iter()
-                    .fold((0, 0), |(key_total, framed_total), key| {
-                        let width = match &key.ty {
-                            Type::Scalar(scalar) if scalar.is_fixed_width() => {
-                                scalar.width_bytes() as i64
-                            }
-                            _ => DEFAULT_VARIABLE_KEY_BYTES,
-                        };
+                    .fold((0, 0, 0), |(build, probe, framed), key| {
+                        let build_width = self.estimate_hash_width(sp, key.right, &key.ty);
+                        let probe_width = self.estimate_hash_width(sp, key.left, &key.ty);
                         (
-                            sat_add(key_total, width),
-                            sat_add(framed_total, sat_add(4, width)),
+                            sat_add(build, build_width),
+                            sat_add(probe, probe_width),
+                            sat_add(framed, sat_add(4, build_width.min(probe_width))),
                         )
                     });
             root.add_unit(
                 UNIT_HASH_BUILD,
-                sat_mul(inner_per_call.root.rows, key_bytes),
+                sat_mul(inner_per_call.root.rows, build_bytes),
             );
             root.add_unit(
                 UNIT_HASH_PROBE,
                 sat_add(
-                    sat_mul(outer_calls, key_bytes),
+                    sat_mul(outer_calls, probe_bytes),
                     sat_mul(delivered_rows, framed_bytes),
                 ),
             );
@@ -537,7 +682,8 @@ impl Engine {
         let full_pairs = sat_mul(outer.root.rows, inner_per_call.root.rows);
         let full_logical_pairs = sat_mul(outer.root.logical_rows, inner_per_call.root.logical_rows);
         let join = &sp.joins[0];
-        let (full_rows, full_logical_rows) = Self::estimate_join_rows(
+        let (full_rows, full_logical_rows) = self.estimate_join_rows(
+            sp,
             join.kind,
             join.on.as_ref(),
             full_pairs,
@@ -553,7 +699,10 @@ impl Engine {
             if let Some(limit) = sp.limit {
                 let target = sat_add(limit, sp.offset.unwrap_or(0));
                 let post_filter_rows = sp.filter.as_ref().map_or(full_rows, |filter| {
-                    estimate_rows(&estimator_predicate_selectivity(Some(filter)), full_rows)
+                    estimate_rows(
+                        &self.estimate_predicate_selectivity_with_statistics(sp, Some(filter)),
+                        full_rows,
+                    )
                 });
                 if target == 0 {
                     outer_calls = 0;
@@ -586,29 +735,26 @@ impl Engine {
         root.logical_rows = full_logical_rows;
         let mut invocations = visited_pairs;
         if let Some(hash) = &sp.phys.hash_join {
-            let (key_bytes, framed_bytes) =
+            let (build_bytes, probe_bytes, framed_bytes) =
                 hash.keys
                     .iter()
-                    .fold((0, 0), |(key_total, framed_total), key| {
-                        let width = match &key.ty {
-                            Type::Scalar(scalar) if scalar.is_fixed_width() => {
-                                scalar.width_bytes() as i64
-                            }
-                            _ => DEFAULT_VARIABLE_KEY_BYTES,
-                        };
+                    .fold((0, 0, 0), |(build, probe, framed), key| {
+                        let build_width = self.estimate_hash_width(sp, key.right, &key.ty);
+                        let probe_width = self.estimate_hash_width(sp, key.left, &key.ty);
                         (
-                            sat_add(key_total, width),
-                            sat_add(framed_total, sat_add(4, width)),
+                            sat_add(build, build_width),
+                            sat_add(probe, probe_width),
+                            sat_add(framed, sat_add(4, build_width.min(probe_width))),
                         )
                     });
             root.add_unit(
                 UNIT_HASH_BUILD,
-                sat_mul(inner_per_call.root.rows, key_bytes),
+                sat_mul(inner_per_call.root.rows, build_bytes),
             );
             root.add_unit(
                 UNIT_HASH_PROBE,
                 sat_add(
-                    sat_mul(outer_calls, key_bytes),
+                    sat_mul(outer_calls, probe_bytes),
                     sat_mul(delivered_rows, framed_bytes),
                 ),
             );
@@ -637,7 +783,7 @@ impl Engine {
                 let target = sat_add(limit, sp.offset.unwrap_or(0));
                 let cap = sp.filter.as_ref().map_or(target, |filter| {
                     required_estimate_input(
-                        &estimator_predicate_selectivity(Some(filter)),
+                        &self.estimate_predicate_selectivity_with_statistics(sp, Some(filter)),
                         target,
                         plan.root.rows,
                     )
@@ -649,7 +795,7 @@ impl Engine {
         if let Some(filter) = &sp.filter {
             let input_rows = plan.root.rows;
             let logical_rows = estimate_rows(
-                &estimator_predicate_selectivity(Some(filter)),
+                &self.estimate_predicate_selectivity_with_statistics(sp, Some(filter)),
                 plan.root.logical_rows,
             );
             let rows = logical_rows.min(plan.root.rows);
@@ -666,7 +812,10 @@ impl Engine {
             let mut rows = if sp.group_keys.is_empty() {
                 1
             } else {
-                input_rows.min(estimate_pow(DEFAULT_DISTINCT_VALUES, sp.group_keys.len()))
+                self.estimate_simple_distinct_rows(sp, sp.group_keys.iter(), input_rows)
+                    .unwrap_or_else(|| {
+                        input_rows.min(estimate_pow(DEFAULT_DISTINCT_VALUES, sp.group_keys.len()))
+                    })
             };
             if sp.group_sets.len() > 1 {
                 rows = if sp.group_keys.is_empty() {
@@ -761,10 +910,30 @@ impl Engine {
         let mut distinct_input_rows = None;
         if sp.distinct {
             distinct_input_rows = Some(plan.root.rows);
-            let rows = plan
-                .root
-                .rows
-                .min(estimate_pow(DEFAULT_DISTINCT_VALUES, sp.projections.len()));
+            let rows = if sp
+                .projections
+                .iter()
+                .all(|projection| matches!(projection, RExpr::Column(_)))
+            {
+                let globals: Vec<usize> = sp
+                    .projections
+                    .iter()
+                    .filter_map(|projection| match projection {
+                        RExpr::Column(global) => Some(*global),
+                        _ => None,
+                    })
+                    .collect();
+                self.estimate_simple_distinct_rows(sp, globals.iter(), plan.root.rows)
+                    .unwrap_or_else(|| {
+                        plan.root
+                            .rows
+                            .min(estimate_pow(DEFAULT_DISTINCT_VALUES, sp.projections.len()))
+                    })
+            } else {
+                plan.root
+                    .rows
+                    .min(estimate_pow(DEFAULT_DISTINCT_VALUES, sp.projections.len()))
+            };
             plan = EstimatedPlan::wrap(plan, rows, rows, [0; ESTIMATOR_UNIT_COUNT]);
         }
 

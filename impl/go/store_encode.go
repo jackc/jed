@@ -727,6 +727,14 @@ func rExprConstToValue(e *rExpr) (Value, error) {
 		return Float32Value(float32(e.cFloat)), nil
 	case reConstFloat64:
 		return Float64Value(e.cFloat), nil
+	case reConstRange:
+		return RangeValue(e.cRange), nil
+	case reConstJson:
+		return JsonValue(e.cText), nil
+	case reConstJsonPath:
+		return JsonPathValue(e.cText), nil
+	case reConstJsonb:
+		return JsonbValue(*e.cJsonb), nil
 	default:
 		return Value{}, typeError("non-constant array element literal")
 	}

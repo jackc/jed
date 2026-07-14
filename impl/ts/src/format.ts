@@ -37,7 +37,7 @@ import { type Collation, loadedCollation } from "./collation.ts";
 import { Decimal } from "./decimal.ts";
 import { decodeInt, decodeIntAt, encodeNullable } from "./encoding.ts";
 import { engineError } from "./errors.ts";
-import { Engine, Snapshot } from "./executor.ts";
+import { encodeTypedKey, Engine, Snapshot } from "./executor.ts";
 import {
   buildGistFromLeafKeys,
   GIST_SCALAR_OPCLASS,
@@ -49,7 +49,7 @@ import {
 import { lz4Compress, lz4Decompress } from "./lz4.ts";
 import { MemoryBlockStore } from "./memoryblockstore.ts";
 import { Pager } from "./pager.ts";
-import { decodedRows, onDiskRef, residentRef } from "./pmap.ts";
+import { compareBytes, decodedRows, onDiskRef, residentRef } from "./pmap.ts";
 import { rangeForElement } from "./range.ts";
 import type { Child, LeafShape, PackedLeaf, PNode } from "./pmap.ts";
 import { SharedPaging } from "./paging.ts";
@@ -101,8 +101,15 @@ import {
   jsonbValue,
 } from "./value.ts";
 import type { JsonNode } from "./json.ts";
+import type { ColumnStatistics, StatisticsValue } from "./statistics.ts";
+import {
+  STATISTICS_HISTOGRAM_BOUNDS,
+  STATISTICS_MAX_VALUE_BYTES,
+  STATISTICS_MCV_ENTRIES,
+  STATISTICS_SAMPLE_ROWS,
+} from "./estimator_constants.ts";
 
-const FORMAT_VERSION = 28; // 28 = exact table row count: each table catalog entry appends a nonnegative i64 row_count after root_data_page, with (root_data_page == 0) == (row_count == 0); on-disk format version (27 = partial-index predicates — spec/design/indexes.md §9: the per-index index_flags byte gains bit1 has_predicate, and (only when set) a u16 length + the canonical predicate text (the *Check-expression text* form) follows index_root_page; on load a partial predicate re-parses that text (XX001 on failure, like a stored CHECK) and a non-btree index with bit1 set is data_corrupted. B-tree only. A non-partial index is byte-identical to v26, so a file with no partial index moves to v27 only by its version byte + meta CRC. 26 = expression index keys — spec/design/indexes.md §1/§6: a per-index key element is a u16 column ordinal OR the 0xFFFF sentinel (never a valid ordinal, col_count ≤ 65535) + a u16 length + the expression's canonical UTF-8 text (the *Check-expression text* form, re-parsed on load — XX001 on failure, like a stored CHECK; a GIN/GiST index with a non-column key is data_corrupted). Only the index-list changes; a plain column index is byte-identical to v6, so a file with no expression index moves to v26 only by its version byte + meta CRC. 25 = on-disk free-list persistence — spec/fileformat/format.md; storage.md §6: meta offset 28 becomes free_list_head (0 = empty), and a page_type 7 free-list page persists the unconsumed free-list so open reads it directly instead of reconstructing it by walking every leaf; paired with continuous within-session reclamation. A from-scratch image (create/goldens) has an EMPTY free-list, so free_list_head = 0 and no page_type 7 page: every golden's only v25 change is its version byte + meta CRC. 24 = the B+tree reshape — spec/design/bplus-reshape.md, spec/fileformat/format.md "The per-table data B+tree": records live ONLY in leaves; an INTERIOR page (page_type 3) is a record-free routing skeleton — N+1 child pointers (u32 BE) ‖ an N-entry END-OFFSET separator directory (u32 BE) ‖ the separator key blob. A separator is a COPY of a boundary key (a leaf split copies the right half's first key up; an interior split pushes its median separator up; leaf merges remove the parent separator, interior merges pull it down — the regenerated "Fan-out" byte contract). The LEAF column regions gain a leading flags byte (reserved 0 — the dictionary door) and split by column CLASS: a FIXED-WIDTH column region is a null bitmap (ceil(N/8), MSB-first, set = NULL) + N×width dense UNTAGGED slots (a NULL slot zero-filled); a VARIABLE-WIDTH region is an N-entry end-offset value directory + the v23 tagged codec bytes with NULL a ZERO-LENGTH SPAN — the presence tag 0x01 never appears inside a v24 leaf (the single-value codec elsewhere — catalog defaults, overflow content, composite/array element bodies — is byte-unchanged). Directories throughout drop the redundant leading zero (N end offsets, not N+1 prefix sums). record_size is restated as key_len + Σ value_size (fixed → width, NULL variable → 0; the v23 phantom 2+ is dropped); RECORD_MAX keeps its value (C − max(12, 12+16K))/2, re-derived leaf-only. 23 = PAX leaf layout — a B-tree LEAF page stored its records COLUMN-MAJOR (key directory ‖ key blob ‖ column directory ‖ per column a value directory + tagged bodies, NULL = a 0x01 byte); interior pages stayed row-major and carried full records. 22 = varchar(n) length limits — spec/design/types.md §15: a text column entry appends a u32 varchar_max_len in the typmod slot (type_code 4) — 0 = unbounded, 1…10485760 = the varchar(n)/string(n) limit; a composite text field carries the same u32. The value codec is unchanged (a value is checked/truncated before encoding). A file whose every text column is unbounded still moves to v22 by its version byte + a 0 on each text column/field. 21 = EXCLUDE constraints — spec/design/gist.md §7/§8, GX3: a per-table exclusion list after the foreign-key list, each entry the constraint name + its backing GiST index name + a (column ordinal u16, operator strategy u8) element vector (&& = 0, = 1). The backing GiST index is stored like any GiST index — the index list now admits MULTI-COLUMN GiST indexes whose leaf/interior bound is the per-column component bounds concatenated (single-column GX1/GX2 bytes unchanged). A table with no exclusion still moves to v21 by its version byte + the zero count. 20 = GiST indexes — spec/design/gist.md GX1: a per-index index_kind = 2 selects the GiST access method, and the index's on-disk form is a persisted R-tree of bounding-predicate nodes — two new page types 5 (GiST leaf) / 6 (GiST interior). A leaf entry is bound_len(u16) ‖ encodeRangeBody(bound) ‖ skey_len(u16) ‖ skey; an interior entry is bound_len(u16) ‖ encodeRangeBody(union) ‖ child_page(u32). The catalog index entry is unchanged (index_root_page points at the R-tree root, 0 for empty); a file with no GiST index moves to v20 only by its version byte. 19 = storable json/jsonb columns — spec/design/json.md, slice J1/J1b: a column type can be json (type_code 18) or jsonb (type_code 19), plain scalar catalog entries with no extra descriptor (the has_jsonb_dict door §3.2 stays clear, zero bytes). A json value's body is the verbatim text, length-prefixed like text (§4); a jsonb value's body is the self-delimiting tagged-node tree (§2 — node tags + unsigned LEB128 varint counts, numbers as the decimal body), riding the large-value overflow + LZ4 path. No catalog-shape change, so a file with no json/jsonb column moves to v19 only by its version byte. 18 = reference-only collations: the catalog entry_kind 3 collation entry is metadata ONLY — a flags byte bit0 is_default, then name + unicodeVersion + cldrVersion + description (each u16-len + UTF-8) — emitted after sequences and before tables; the compiled table is NOT in the file, it is vendored into the binary and resolved by name on open, spec/design/collation.md §2/§5/§9. This supersedes v17's baked snapshot (the LZ4-compressed .coll artifact is gone). The per-column collation is unchanged (column flags byte bit6 has_collation + a trailing name). 17 = baked collations (superseded). 16 = range columns: a column type can be a range — type_code 17 + an inline element-type descriptor, one scalar code, spec/design/ranges.md §3 — and a range value is a flags byte (EMPTY/LB_INF/UB_INF/LB_INC/UB_INC) followed by the present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: a kind-2 catalog entry — name + six big-endian i64 fields + a flags byte — emitted after composite-type (kind 1) entries and before table (kind 0) entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4; 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
+const FORMAT_VERSION = 29; // 29 = deterministic per-column statistics (kind 4; spec/design/statistics.md); 28 = exact table row count: each table catalog entry appends a nonnegative i64 row_count after root_data_page, with (root_data_page == 0) == (row_count == 0); on-disk format version (27 = partial-index predicates — spec/design/indexes.md §9: the per-index index_flags byte gains bit1 has_predicate, and (only when set) a u16 length + the canonical predicate text (the *Check-expression text* form) follows index_root_page; on load a partial predicate re-parses that text (XX001 on failure, like a stored CHECK) and a non-btree index with bit1 set is data_corrupted. B-tree only. A non-partial index is byte-identical to v26, so a file with no partial index moves to v27 only by its version byte + meta CRC. 26 = expression index keys — spec/design/indexes.md §1/§6: a per-index key element is a u16 column ordinal OR the 0xFFFF sentinel (never a valid ordinal, col_count ≤ 65535) + a u16 length + the expression's canonical UTF-8 text (the *Check-expression text* form, re-parsed on load — XX001 on failure, like a stored CHECK; a GIN/GiST index with a non-column key is data_corrupted). Only the index-list changes; a plain column index is byte-identical to v6, so a file with no expression index moves to v26 only by its version byte + meta CRC. 25 = on-disk free-list persistence — spec/fileformat/format.md; storage.md §6: meta offset 28 becomes free_list_head (0 = empty), and a page_type 7 free-list page persists the unconsumed free-list so open reads it directly instead of reconstructing it by walking every leaf; paired with continuous within-session reclamation. A from-scratch image (create/goldens) has an EMPTY free-list, so free_list_head = 0 and no page_type 7 page: every golden's only v25 change is its version byte + meta CRC. 24 = the B+tree reshape — spec/design/bplus-reshape.md, spec/fileformat/format.md "The per-table data B+tree": records live ONLY in leaves; an INTERIOR page (page_type 3) is a record-free routing skeleton — N+1 child pointers (u32 BE) ‖ an N-entry END-OFFSET separator directory (u32 BE) ‖ the separator key blob. A separator is a COPY of a boundary key (a leaf split copies the right half's first key up; an interior split pushes its median separator up; leaf merges remove the parent separator, interior merges pull it down — the regenerated "Fan-out" byte contract). The LEAF column regions gain a leading flags byte (reserved 0 — the dictionary door) and split by column CLASS: a FIXED-WIDTH column region is a null bitmap (ceil(N/8), MSB-first, set = NULL) + N×width dense UNTAGGED slots (a NULL slot zero-filled); a VARIABLE-WIDTH region is an N-entry end-offset value directory + the v23 tagged codec bytes with NULL a ZERO-LENGTH SPAN — the presence tag 0x01 never appears inside a v24 leaf (the single-value codec elsewhere — catalog defaults, overflow content, composite/array element bodies — is byte-unchanged). Directories throughout drop the redundant leading zero (N end offsets, not N+1 prefix sums). record_size is restated as key_len + Σ value_size (fixed → width, NULL variable → 0; the v23 phantom 2+ is dropped); RECORD_MAX keeps its value (C − max(12, 12+16K))/2, re-derived leaf-only. 23 = PAX leaf layout — a B-tree LEAF page stored its records COLUMN-MAJOR (key directory ‖ key blob ‖ column directory ‖ per column a value directory + tagged bodies, NULL = a 0x01 byte); interior pages stayed row-major and carried full records. 22 = varchar(n) length limits — spec/design/types.md §15: a text column entry appends a u32 varchar_max_len in the typmod slot (type_code 4) — 0 = unbounded, 1…10485760 = the varchar(n)/string(n) limit; a composite text field carries the same u32. The value codec is unchanged (a value is checked/truncated before encoding). A file whose every text column is unbounded still moves to v22 by its version byte + a 0 on each text column/field. 21 = EXCLUDE constraints — spec/design/gist.md §7/§8, GX3: a per-table exclusion list after the foreign-key list, each entry the constraint name + its backing GiST index name + a (column ordinal u16, operator strategy u8) element vector (&& = 0, = 1). The backing GiST index is stored like any GiST index — the index list now admits MULTI-COLUMN GiST indexes whose leaf/interior bound is the per-column component bounds concatenated (single-column GX1/GX2 bytes unchanged). A table with no exclusion still moves to v21 by its version byte + the zero count. 20 = GiST indexes — spec/design/gist.md GX1: a per-index index_kind = 2 selects the GiST access method, and the index's on-disk form is a persisted R-tree of bounding-predicate nodes — two new page types 5 (GiST leaf) / 6 (GiST interior). A leaf entry is bound_len(u16) ‖ encodeRangeBody(bound) ‖ skey_len(u16) ‖ skey; an interior entry is bound_len(u16) ‖ encodeRangeBody(union) ‖ child_page(u32). The catalog index entry is unchanged (index_root_page points at the R-tree root, 0 for empty); a file with no GiST index moves to v20 only by its version byte. 19 = storable json/jsonb columns — spec/design/json.md, slice J1/J1b: a column type can be json (type_code 18) or jsonb (type_code 19), plain scalar catalog entries with no extra descriptor (the has_jsonb_dict door §3.2 stays clear, zero bytes). A json value's body is the verbatim text, length-prefixed like text (§4); a jsonb value's body is the self-delimiting tagged-node tree (§2 — node tags + unsigned LEB128 varint counts, numbers as the decimal body), riding the large-value overflow + LZ4 path. No catalog-shape change, so a file with no json/jsonb column moves to v19 only by its version byte. 18 = reference-only collations: the catalog entry_kind 3 collation entry is metadata ONLY — a flags byte bit0 is_default, then name + unicodeVersion + cldrVersion + description (each u16-len + UTF-8) — emitted after sequences and before tables; the compiled table is NOT in the file, it is vendored into the binary and resolved by name on open, spec/design/collation.md §2/§5/§9. This supersedes v17's baked snapshot (the LZ4-compressed .coll artifact is gone). The per-column collation is unchanged (column flags byte bit6 has_collation + a trailing name). 17 = baked collations (superseded). 16 = range columns: a column type can be a range — type_code 17 + an inline element-type descriptor, one scalar code, spec/design/ranges.md §3 — and a range value is a flags byte (EMPTY/LB_INF/UB_INF/LB_INC/UB_INC) followed by the present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: a kind-2 catalog entry — name + six big-endian i64 fields + a flags byte — emitted after composite-type (kind 1) entries and before table (kind 0) entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4; 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
 const PAGE_HEADER = 16; // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
 const RECORD_MAX_RESERVE = 12; // bytes reserved inside RECORD_MAX beyond the per-column term — independent of PAGE_HEADER (format.md "Why the record cap"). Historically the two-key interior node's 3 child pointers (4·3); since v24 the value is kept as the K=0 floor of the leaf-only re-derivation (a two-record index leaf is exactly 2·(C−12)/2 + 4·2 + 4 = C).
 const PAGE_CATALOG = 1; // page_type for a catalog page
@@ -1321,6 +1328,247 @@ function writeOverflowChain(
   return indices[0]!;
 }
 
+function statisticsDistributionEligible(type: Type): boolean {
+  if (type.kind === "composite" || type.kind === "array") return false;
+  return (
+    type.kind === "range" ||
+    (type.scalar !== "json" && type.scalar !== "jsonb" && type.scalar !== "jsonpath")
+  );
+}
+
+// P9 kind-4 catalog entries in canonical (table, column, subkind, ordinal) order.
+function statisticsCatalogEntries(snap: Snapshot): Uint8Array[] {
+  const entries: Uint8Array[] = [];
+  const tableKeys = [...snap.statistics.keys()].sort();
+  for (const tableKey of tableKeys) {
+    const table = snap.tables.get(tableKey)!;
+    const columns = snap.statistics.get(tableKey)!;
+    for (const column of [...columns.keys()].sort((a, b) => a - b)) {
+      const statistics = columns.get(column)!;
+      const summary = new ByteWriter();
+      summary.u8(4);
+      summary.u8(0);
+      wstr(summary, table.name);
+      summary.u16(column);
+      summary.u8((statistics.stale ? 1 : 0) | (statistics.distinctCount !== null ? 2 : 0));
+      summary.i64(statistics.analyzedRows);
+      summary.i64(statistics.nullCount);
+      summary.i64(statistics.widthSum);
+      summary.i64(statistics.distinctCount ?? 0n);
+      summary.u32(statistics.sampleRows);
+      summary.u32(statistics.sampleNonNullRows);
+      summary.u16(statistics.mcv.length);
+      summary.u16(statistics.histogram.length);
+      entries.push(summary.toBytes());
+
+      const colType = snap.stores.get(tableKey)!.columnTypes()[column]!;
+      for (let ordinal = 0; ordinal < statistics.mcv.length; ordinal++) {
+        const mcv = statistics.mcv[ordinal]!;
+        const entry = new ByteWriter();
+        entry.u8(4);
+        entry.u8(1);
+        wstr(entry, table.name);
+        entry.u16(column);
+        entry.u16(ordinal);
+        entry.u32(mcv.frequency);
+        const encoded = encodeValue(colType, mcv.value.value);
+        entry.u16(encoded.length);
+        entry.bytes(encoded);
+        entries.push(entry.toBytes());
+      }
+      for (let ordinal = 0; ordinal < statistics.histogram.length; ordinal++) {
+        const bound = statistics.histogram[ordinal]!;
+        const entry = new ByteWriter();
+        entry.u8(4);
+        entry.u8(2);
+        wstr(entry, table.name);
+        entry.u16(column);
+        entry.u16(ordinal);
+        const encoded = encodeValue(colType, bound.value);
+        entry.u16(encoded.length);
+        entry.bytes(encoded);
+        entries.push(entry.toBytes());
+      }
+    }
+  }
+  return entries;
+}
+
+function decodeStatisticsValue(
+  buf: Uint8Array,
+  cur: Cursor,
+  snap: Snapshot,
+  tableKey: string,
+  column: number,
+): StatisticsValue {
+  const table = snap.tables.get(tableKey);
+  if (table === undefined || column >= table.columns.length) {
+    throw engineError("data_corrupted", "statistics reference an unknown table or column");
+  }
+  const colType = snap.stores.get(tableKey)!.columnTypes()[column]!;
+  const valueLength = readU16(buf, cur);
+  if (valueLength === 0 || valueLength > STATISTICS_MAX_VALUE_BYTES) {
+    throw engineError("data_corrupted", "invalid statistics value length");
+  }
+  const encoded = take(buf, cur, valueLength);
+  const valueCursor = { pos: 0 };
+  const value = readValue(colType, encoded, valueCursor, null, []);
+  if (
+    valueCursor.pos !== encoded.length ||
+    compareBytes(encodeValue(colType, value), encoded) !== 0
+  ) {
+    throw engineError("data_corrupted", "noncanonical statistics value");
+  }
+  if (value.kind === "null") {
+    throw engineError("data_corrupted", "statistics values may not be NULL");
+  }
+  const declared = table.columns[column]!;
+  const collationSkewed =
+    declared.collation !== null && snap.collationSkew(declared.collation) !== undefined;
+  const coll =
+    declared.collation === null ? null : (snap.resolveCollation(declared.collation) ?? null);
+  let key: Uint8Array = new Uint8Array();
+  if (!collationSkewed) {
+    try {
+      key = encodeTypedKey(declared.type, value, coll);
+    } catch {
+      throw engineError("data_corrupted", "invalid statistics comparison value");
+    }
+  }
+  // A skewed collation's values were ordered by the file-pinned bundle. Their value bytes remain
+  // canonical, but rebuilding comparison keys with the loaded bundle cannot validate the old order.
+  // The estimator ignores these facts and upgradeCollations clears them.
+  if (
+    encodeValue(colType, value).length - 1 > STATISTICS_MAX_VALUE_BYTES ||
+    key.length > STATISTICS_MAX_VALUE_BYTES
+  ) {
+    throw engineError("data_corrupted", "oversized persisted statistics value");
+  }
+  return { value, key };
+}
+
+function decodeStatisticsEntry(
+  buf: Uint8Array,
+  cur: Cursor,
+  snap: Snapshot,
+  expected: Map<string, readonly [number, number]>,
+): void {
+  const subkind = readU8(buf, cur);
+  const tableKey = readString(buf, cur).toLowerCase();
+  const column = readU16(buf, cur);
+  const table = snap.tables.get(tableKey);
+  if (table === undefined)
+    throw engineError("data_corrupted", "statistics reference an unknown table");
+  if (column >= table.columns.length)
+    throw engineError("data_corrupted", "statistics reference an unknown column");
+  const declared = table.columns[column]!;
+  const collationSkewed =
+    declared.collation !== null && snap.collationSkew(declared.collation) !== undefined;
+  const groupKey = `${tableKey}\0${column}`;
+
+  if (subkind === 0) {
+    if (expected.has(groupKey)) throw engineError("data_corrupted", "duplicate statistics summary");
+    const flags = readU8(buf, cur);
+    const analyzedRows = readI64(buf, cur);
+    const nullCount = readI64(buf, cur);
+    const widthSum = readI64(buf, cur);
+    const distinctRaw = readI64(buf, cur);
+    const sampleRows = readU32(buf, cur);
+    const sampleNonNullRows = readU32(buf, cur);
+    const mcvCount = readU16(buf, cur);
+    const histogramCount = readU16(buf, cur);
+    const distribution = (flags & 2) !== 0;
+    if (
+      (flags & ~3) !== 0 ||
+      analyzedRows < 0n ||
+      nullCount < 0n ||
+      nullCount > analyzedRows ||
+      widthSum < 0n ||
+      BigInt(sampleRows) > analyzedRows ||
+      sampleRows > STATISTICS_SAMPLE_ROWS ||
+      sampleNonNullRows > sampleRows ||
+      mcvCount > STATISTICS_MCV_ENTRIES ||
+      histogramCount > STATISTICS_HISTOGRAM_BOUNDS ||
+      (distribution && distinctRaw < 0n) ||
+      (!distribution && distinctRaw !== 0n) ||
+      (distribution && distinctRaw > analyzedRows - nullCount) ||
+      (histogramCount !== 0 && histogramCount < 2) ||
+      distribution !== statisticsDistributionEligible(table.columns[column]!.type)
+    ) {
+      throw engineError("data_corrupted", "invalid statistics summary");
+    }
+    const statistics: ColumnStatistics = {
+      analyzedRows,
+      stale: (flags & 1) !== 0,
+      nullCount,
+      widthSum,
+      distinctCount: distribution ? distinctRaw : null,
+      sampleRows,
+      sampleNonNullRows,
+      mcv: [],
+      histogram: [],
+    };
+    snap.putColumnStatistics(tableKey, column, statistics);
+    expected.set(groupKey, [mcvCount, histogramCount]);
+    return;
+  }
+
+  const counts = expected.get(groupKey);
+  if (counts === undefined) {
+    throw engineError(
+      "data_corrupted",
+      subkind === 1
+        ? "statistics MCV precedes its summary"
+        : "statistics histogram precedes its summary",
+    );
+  }
+  const statistics = snap.columnStatistics(tableKey, column)!;
+  if (subkind === 1) {
+    const ordinal = readU16(buf, cur);
+    const frequency = readU32(buf, cur);
+    const value = decodeStatisticsValue(buf, cur, snap, tableKey, column);
+    if (
+      ordinal !== statistics.mcv.length ||
+      ordinal >= counts[0] ||
+      frequency === 0 ||
+      frequency > statistics.sampleNonNullRows
+    ) {
+      throw engineError("data_corrupted", "invalid statistics MCV ordinal or frequency");
+    }
+    if (
+      !collationSkewed &&
+      statistics.mcv.some((existing) => compareBytes(existing.value.key, value.key) === 0)
+    ) {
+      throw engineError("data_corrupted", "duplicate statistics MCV value");
+    }
+    const previous = statistics.mcv.at(-1);
+    if (
+      !collationSkewed &&
+      previous !== undefined &&
+      (frequency > previous.frequency ||
+        (frequency === previous.frequency && compareBytes(value.key, previous.value.key) < 0))
+    ) {
+      throw engineError("data_corrupted", "statistics MCV values are out of order");
+    }
+    statistics.mcv.push({ value, frequency });
+    return;
+  }
+  if (subkind === 2) {
+    const ordinal = readU16(buf, cur);
+    const value = decodeStatisticsValue(buf, cur, snap, tableKey, column);
+    if (ordinal !== statistics.histogram.length || ordinal >= counts[1]) {
+      throw engineError("data_corrupted", "invalid statistics histogram ordinal");
+    }
+    const previous = statistics.histogram.at(-1);
+    if (!collationSkewed && previous !== undefined && compareBytes(previous.key, value.key) > 0) {
+      throw engineError("data_corrupted", "statistics histogram is out of order");
+    }
+    statistics.histogram.push(value);
+    return;
+  }
+  throw engineError("data_corrupted", "unknown statistics entry subkind");
+}
+
 // tableEntryBytes builds one table's catalog entry (format.md). indexRoots is each
 // index's tree root page, parallel to table.indexes.
 function tableEntryBytes(
@@ -1864,6 +2112,7 @@ export function toImage(src: Engine | Snapshot, pageSize: number, txid: bigint):
       concat([Uint8Array.of(0), tableEntryBytes(t, rootDataPage[ti]!, indexRoots[ti]!, rowCount)]),
     );
   }
+  catEntries.push(...statisticsCatalogEntries(snap));
   const entrySizes = catEntries.map((e) => e.length);
   const catGroups = pack(entrySizes, capacity);
   const pageCount = catRoot + catGroups.length;
@@ -2162,6 +2411,7 @@ export function incrementalImage(
       concat([Uint8Array.of(0), tableEntryBytes(t, rootDataPage[ti]!, indexRoots[ti]!, rowCount)]),
     );
   }
+  catEntries.push(...statisticsCatalogEntries(snap));
   const entrySizes = catEntries.map((e) => e.length);
   const catGroups = pack(entrySizes, capacity);
   const catPages = catGroups.map(() => alloc.take());
@@ -2564,6 +2814,7 @@ export function loadEnginePaged(paging: SharedPaging): Engine {
   if (mt === null) throw engineError("data_corrupted", "no valid meta page");
 
   const snap = new Snapshot(mt.txid);
+  const statisticsExpected = new Map<string, readonly [number, number]>();
   // v25: the free-list is read from the persisted chain (below), not reconstructed by a reachability
   // walk — so the catalog + skeleton load no longer tracks a reached set.
   let catPage = mt.rootPage;
@@ -2591,6 +2842,10 @@ export function loadEnginePaged(paging: SharedPaging): Engine {
         const { coll, isDefault } = decodeCollationEntry(pg.payload, cur);
         if (isDefault) snap.defaultCollation = coll.name;
         snap.collations.set(coll.name, coll);
+        continue;
+      }
+      if (kind === 4) {
+        decodeStatisticsEntry(pg.payload, cur, snap, statisticsExpected);
         continue;
       }
       if (kind !== 0) throw engineError("data_corrupted", "unknown catalog entry kind");
@@ -2641,6 +2896,20 @@ export function loadEnginePaged(paging: SharedPaging): Engine {
       }
     }
     catPage = pg.nextPage;
+  }
+
+  for (const [groupKey, counts] of statisticsExpected) {
+    const separator = groupKey.lastIndexOf("\0");
+    const tableKey = groupKey.slice(0, separator);
+    const column = Number(groupKey.slice(separator + 1));
+    const statistics = snap.columnStatistics(tableKey, column);
+    if (
+      statistics === undefined ||
+      statistics.mcv.length !== counts[0] ||
+      statistics.histogram.length !== counts[1]
+    ) {
+      throw engineError("data_corrupted", "incomplete statistics entry group");
+    }
   }
 
   // Two-pass: validate the composite-type catalog (existence + acyclicity) — XX001 on a bad

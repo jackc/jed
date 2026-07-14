@@ -1,0 +1,24 @@
+# PostgreSQL-oracle-clean subset of P9's SQL surface. Deterministic sampling, persistence,
+# introspection, cost, and plan estimates are jed-owned and live in statistics_p9.test; this file
+# proves the supported one-table/all-column and one-table/column-list forms preserve PG results.
+# requires: maintenance.analyze, ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.comparison_order, query.order_by, types.i32, types.text
+
+statement ok
+CREATE TABLE analyze_oracle (id i32 PRIMARY KEY, category i32, label text)
+
+statement ok
+INSERT INTO analyze_oracle VALUES (1, 10, 'a'), (2, 10, 'b'), (3, NULL, NULL)
+
+statement ok
+ANALYZE analyze_oracle
+
+statement ok
+ANALYZE analyze_oracle (category, label)
+
+query IT rowsort
+SELECT id, label FROM analyze_oracle WHERE category = 10 ORDER BY id
+----
+1
+a
+2
+b

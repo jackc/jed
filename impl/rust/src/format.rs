@@ -25,7 +25,7 @@ use crate::collation::Collation;
 use crate::decimal::Decimal;
 use crate::encoding::{decode_int, encode_nullable};
 use crate::error::{EngineError, Result, SqlState};
-use crate::executor::{Engine, Snapshot};
+use crate::executor::{ColumnStatistics, Engine, Snapshot, StatisticsValue};
 use crate::interval::Interval;
 use crate::json::JsonNode;
 use crate::pager::Pager;
@@ -93,7 +93,7 @@ const MAGIC: [u8; 4] = *b"JEDB";
 /// v28 = **transactional table row counts** (spec/design/estimator.md §5): every table catalog entry
 /// appends an exact nonnegative big-endian `i64` count after `root_data_page`; root zero iff count
 /// zero. The count is installed beside the demand-paged skeleton, keeping open off the leaf level.
-const FORMAT_VERSION: u16 = 28;
+const FORMAT_VERSION: u16 = 29;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
 /// (`page_type`, `item_count`, `next_page`) plus a 4-byte per-page `crc32` (offset 12).
 pub(crate) const PAGE_HEADER: usize = 16;
@@ -319,7 +319,7 @@ fn page_crc(page: &[u8]) -> u32 {
 /// A **composite** value (spec/design/composite.md §4) is the shared presence tag then a body of
 /// `null-bitmap ‖ each present field's value-codec body` (no per-field tag — the bitmap carries
 /// presence): see [`encode_composite_body`]. Recurses for nested composites.
-fn encode_value(ty: &ColType, v: &Value) -> Vec<u8> {
+pub(crate) fn encode_value(ty: &ColType, v: &Value) -> Vec<u8> {
     match ty {
         ColType::Scalar(s) => encode_scalar(*s, v),
         ColType::Composite { fields, .. } => match v {
@@ -1289,6 +1289,7 @@ impl Snapshot {
             ));
             cat_entries.push(e);
         }
+        cat_entries.extend(statistics_catalog_entries(self));
         let entry_sizes: Vec<usize> = cat_entries.iter().map(|e| e.len()).collect();
         let cat_groups = pack(&entry_sizes, cap)?;
         let page_count = cat_root + cat_groups.len() as u32;
@@ -1609,6 +1610,7 @@ impl Snapshot {
             ));
             cat_entries.push(e);
         }
+        cat_entries.extend(statistics_catalog_entries(self));
         let entry_sizes: Vec<usize> = cat_entries.iter().map(|e| e.len()).collect();
         let cat_groups = pack(&entry_sizes, cap)?;
         let cat_pages: Vec<u32> = (0..cat_groups.len()).map(|_| alloc.take()).collect();
@@ -1879,6 +1881,8 @@ impl Engine {
         // v25: the free-list is read from the persisted chain (below), not reconstructed by a
         // reachability walk — so the catalog + skeleton load no longer tracks a `reached` set.
         let mut cat_page = meta.root_page;
+        let mut statistics_expected: std::collections::HashMap<(String, usize), (usize, usize)> =
+            std::collections::HashMap::new();
         while cat_page != 0 {
             let block = paging.pager().read_block(cat_page)?;
             let page = parse_page(&block)?;
@@ -1910,6 +1914,15 @@ impl Engine {
                         snap.set_default_collation(Some(coll.name.clone()));
                     }
                     snap.put_collation(std::sync::Arc::new(coll));
+                    continue;
+                }
+                if kind == 4 {
+                    decode_statistics_entry(
+                        page.payload,
+                        &mut pos,
+                        &mut snap,
+                        &mut statistics_expected,
+                    )?;
                     continue;
                 }
                 if kind != 0 {
@@ -1978,6 +1991,15 @@ impl Engine {
                 }
             }
             cat_page = page.next_page;
+        }
+
+        for ((table, column), (mcv_count, histogram_count)) in statistics_expected {
+            let statistics = snap
+                .column_statistics(&table, column)
+                .ok_or_else(|| corrupt("missing statistics summary"))?;
+            if statistics.mcv.len() != mcv_count || statistics.histogram.len() != histogram_count {
+                return Err(corrupt("incomplete statistics entry group"));
+            }
         }
 
         // Two-pass: validate the composite-type catalog (existence + acyclicity) — XX001 on a bad
@@ -2579,6 +2601,256 @@ fn write_overflow_chain(
         });
     }
     indices[0]
+}
+
+/// P9 kind-4 catalog entries in canonical `(table, column, subkind, ordinal)` order.
+fn statistics_catalog_entries(snapshot: &Snapshot) -> Vec<Vec<u8>> {
+    let mut entries = Vec::new();
+    for (table_key, column, statistics) in snapshot.statistics_sorted() {
+        let table = snapshot
+            .table(table_key)
+            .expect("statistics reference a live table");
+        let mut summary = vec![4u8, 0u8];
+        push_string(&mut summary, &table.name);
+        summary.extend_from_slice(&(column as u16).to_be_bytes());
+        let mut flags = 0u8;
+        if statistics.stale {
+            flags |= 0b1;
+        }
+        if statistics.distinct_count.is_some() {
+            flags |= 0b10;
+        }
+        summary.push(flags);
+        summary.extend_from_slice(&statistics.analyzed_rows.to_be_bytes());
+        summary.extend_from_slice(&statistics.null_count.to_be_bytes());
+        summary.extend_from_slice(&statistics.width_sum.to_be_bytes());
+        summary.extend_from_slice(&statistics.distinct_count.unwrap_or(0).to_be_bytes());
+        summary.extend_from_slice(&statistics.sample_rows.to_be_bytes());
+        summary.extend_from_slice(&statistics.sample_nonnull_rows.to_be_bytes());
+        summary.extend_from_slice(&(statistics.mcv.len() as u16).to_be_bytes());
+        summary.extend_from_slice(&(statistics.histogram.len() as u16).to_be_bytes());
+        entries.push(summary);
+
+        let col_type = snapshot.store(table_key).column_type(column);
+        for (ordinal, mcv) in statistics.mcv.iter().enumerate() {
+            let mut entry = vec![4u8, 1u8];
+            push_string(&mut entry, &table.name);
+            entry.extend_from_slice(&(column as u16).to_be_bytes());
+            entry.extend_from_slice(&(ordinal as u16).to_be_bytes());
+            entry.extend_from_slice(&mcv.frequency.to_be_bytes());
+            let encoded = encode_value(col_type, &mcv.value.value);
+            entry.extend_from_slice(&(encoded.len() as u16).to_be_bytes());
+            entry.extend_from_slice(&encoded);
+            entries.push(entry);
+        }
+        for (ordinal, bound) in statistics.histogram.iter().enumerate() {
+            let mut entry = vec![4u8, 2u8];
+            push_string(&mut entry, &table.name);
+            entry.extend_from_slice(&(column as u16).to_be_bytes());
+            entry.extend_from_slice(&(ordinal as u16).to_be_bytes());
+            let encoded = encode_value(col_type, &bound.value);
+            entry.extend_from_slice(&(encoded.len() as u16).to_be_bytes());
+            entry.extend_from_slice(&encoded);
+            entries.push(entry);
+        }
+    }
+    entries
+}
+
+fn decode_statistics_value(
+    buf: &[u8],
+    pos: &mut usize,
+    snapshot: &Snapshot,
+    table_key: &str,
+    column: usize,
+) -> Result<StatisticsValue> {
+    let table = snapshot
+        .table(table_key)
+        .ok_or_else(|| corrupt("statistics reference an unknown table"))?;
+    let declared = table
+        .columns
+        .get(column)
+        .ok_or_else(|| corrupt("statistics reference an unknown column"))?;
+    let collation_skewed = declared
+        .collation
+        .as_deref()
+        .is_some_and(|name| snapshot.collation_skew(name).is_some());
+    let ty = snapshot.store(table_key).column_type(column).clone();
+    let coll = declared
+        .collation
+        .as_deref()
+        .and_then(|name| snapshot.resolve_collation(name));
+    let value_len = read_u16(buf, pos)? as usize;
+    if value_len == 0
+        || value_len > crate::estimator_constants::STATISTICS_MAX_VALUE_BYTES
+        || *pos + value_len > buf.len()
+    {
+        return Err(corrupt("invalid statistics value length"));
+    }
+    let encoded = &buf[*pos..*pos + value_len];
+    *pos += value_len;
+    let mut value_pos = 0usize;
+    let mut sink = Vec::new();
+    let value = read_value(&ty, encoded, &mut value_pos, None, &mut sink)?;
+    if value_pos != encoded.len() || encode_value(&ty, &value) != encoded {
+        return Err(corrupt("noncanonical statistics value"));
+    }
+    if matches!(value, Value::Null) {
+        return Err(corrupt("statistics values may not be NULL"));
+    }
+    // A skewed collation's persisted values were ordered with the file-pinned bundle, not the
+    // currently loaded bundle. The values remain byte-canonical, but rebuilding and validating
+    // their comparison keys here could reject a healthy old file. Skewed facts are unavailable to
+    // the estimator and are cleared by `upgrade_collations`, so retain an inert key until then.
+    let key = if collation_skewed {
+        Vec::new()
+    } else {
+        crate::executor::encode_typed_key(&declared.ty, &value, coll.as_deref())
+            .map_err(|_| corrupt("invalid statistics comparison value"))?
+    };
+    let body_len = encode_value(&ty, &value).len().saturating_sub(1);
+    if body_len > crate::estimator_constants::STATISTICS_MAX_VALUE_BYTES
+        || key.len() > crate::estimator_constants::STATISTICS_MAX_VALUE_BYTES
+    {
+        return Err(corrupt("oversized persisted statistics value"));
+    }
+    Ok(StatisticsValue { value, key })
+}
+
+fn decode_statistics_entry(
+    buf: &[u8],
+    pos: &mut usize,
+    snapshot: &mut Snapshot,
+    expected: &mut std::collections::HashMap<(String, usize), (usize, usize)>,
+) -> Result<()> {
+    let subkind = read_u8(buf, pos)?;
+    let table_name = read_string(buf, pos)?;
+    let table_key = table_name.to_ascii_lowercase();
+    let column = read_u16(buf, pos)? as usize;
+    let table = snapshot
+        .table(&table_key)
+        .ok_or_else(|| corrupt("statistics reference an unknown table"))?;
+    if column >= table.columns.len() {
+        return Err(corrupt("statistics reference an unknown column"));
+    }
+    let collation_skewed = table.columns[column]
+        .collation
+        .as_deref()
+        .is_some_and(|name| snapshot.collation_skew(name).is_some());
+    let group_key = (table_key.clone(), column);
+    match subkind {
+        0 => {
+            if expected.contains_key(&group_key) {
+                return Err(corrupt("duplicate statistics summary"));
+            }
+            let flags = read_u8(buf, pos)?;
+            if flags & !0b11 != 0 {
+                return Err(corrupt("reserved statistics flag set"));
+            }
+            let analyzed_rows = read_i64(buf, pos)?;
+            let null_count = read_i64(buf, pos)?;
+            let width_sum = read_i64(buf, pos)?;
+            let distinct_raw = read_i64(buf, pos)?;
+            let sample_rows = read_u32(buf, pos)?;
+            let sample_nonnull_rows = read_u32(buf, pos)?;
+            let mcv_count = read_u16(buf, pos)? as usize;
+            let histogram_count = read_u16(buf, pos)? as usize;
+            let distribution = flags & 0b10 != 0;
+            if analyzed_rows < 0
+                || null_count < 0
+                || null_count > analyzed_rows
+                || width_sum < 0
+                || sample_rows as i64 > analyzed_rows
+                || sample_rows as usize > crate::estimator_constants::STATISTICS_SAMPLE_ROWS
+                || sample_nonnull_rows > sample_rows
+                || mcv_count > crate::estimator_constants::STATISTICS_MCV_ENTRIES
+                || histogram_count > crate::estimator_constants::STATISTICS_HISTOGRAM_BOUNDS
+                || (distribution && distinct_raw < 0)
+                || (!distribution && distinct_raw != 0)
+                || (distribution && distinct_raw > analyzed_rows - null_count)
+                || (histogram_count != 0 && histogram_count < 2)
+                || distribution != crate::executor::distribution_eligible(&table.columns[column].ty)
+            {
+                return Err(corrupt("invalid statistics summary"));
+            }
+            expected.insert(group_key, (mcv_count, histogram_count));
+            snapshot.put_column_statistics(
+                &table_key,
+                column,
+                ColumnStatistics {
+                    analyzed_rows,
+                    stale: flags & 0b1 != 0,
+                    null_count,
+                    width_sum,
+                    distinct_count: distribution.then_some(distinct_raw),
+                    sample_rows,
+                    sample_nonnull_rows,
+                    mcv: Vec::new(),
+                    histogram: Vec::new(),
+                },
+            );
+        }
+        1 => {
+            let (mcv_count, _) = *expected
+                .get(&group_key)
+                .ok_or_else(|| corrupt("statistics MCV precedes its summary"))?;
+            let ordinal = read_u16(buf, pos)? as usize;
+            let frequency = read_u32(buf, pos)?;
+            let value = decode_statistics_value(buf, pos, snapshot, &table_key, column)?;
+            let statistics = snapshot
+                .column_statistics_mut(&table_key, column)
+                .expect("summary was installed");
+            if ordinal != statistics.mcv.len()
+                || ordinal >= mcv_count
+                || frequency == 0
+                || frequency > statistics.sample_nonnull_rows
+            {
+                return Err(corrupt("invalid statistics MCV ordinal or frequency"));
+            }
+            if !collation_skewed
+                && statistics
+                    .mcv
+                    .iter()
+                    .any(|existing| existing.value.key == value.key)
+            {
+                return Err(corrupt("duplicate statistics MCV value"));
+            }
+            if !collation_skewed
+                && let Some(previous) = statistics.mcv.last()
+                && (frequency > previous.frequency
+                    || (frequency == previous.frequency && value.key < previous.value.key))
+            {
+                return Err(corrupt("statistics MCV values are out of order"));
+            }
+            statistics
+                .mcv
+                .push(crate::executor::StatisticsMcv { value, frequency });
+        }
+        2 => {
+            let (_, histogram_count) = *expected
+                .get(&group_key)
+                .ok_or_else(|| corrupt("statistics histogram precedes its summary"))?;
+            let ordinal = read_u16(buf, pos)? as usize;
+            let value = decode_statistics_value(buf, pos, snapshot, &table_key, column)?;
+            let statistics = snapshot
+                .column_statistics_mut(&table_key, column)
+                .expect("summary was installed");
+            if ordinal != statistics.histogram.len() || ordinal >= histogram_count {
+                return Err(corrupt("invalid statistics histogram ordinal"));
+            }
+            if !collation_skewed
+                && statistics
+                    .histogram
+                    .last()
+                    .is_some_and(|previous| previous.key > value.key)
+            {
+                return Err(corrupt("statistics histogram is out of order"));
+            }
+            statistics.histogram.push(value);
+        }
+        _ => return Err(corrupt("unknown statistics entry subkind")),
+    }
+    Ok(())
 }
 
 /// One table's catalog entry bytes (spec/fileformat/format.md).

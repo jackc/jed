@@ -36,6 +36,17 @@ event  = "one row read from a table store during a scan"
 # executor scan loop, not the storage iterator (../design/cost.md §3).
 
 [[unit]]
+id     = "statistics_value"
+weight = 1
+event  = "one canonical value/key byte inspected while ANALYZE collects a column statistic (NULL contributes one unit)"
+# P9 (../design/statistics.md §4). ANALYZE scans one requested column at a time and charges
+# max(1, canonical_width) before hashing/sampling each row: the order-preserving comparison-key
+# bytes for a distribution-eligible value, ordinary canonical value-body bytes otherwise, and one
+# for NULL. Ordinary page_read/storage_row_read/overflow/decompression charges remain beside it.
+# The fixed 30,000-row sample bounds the later sort; this unit bounds the full-population value work
+# so max_cost aborts collection transactionally at the same point in every core.
+
+[[unit]]
 id     = "page_read"
 weight = 1
 event  = "one B-tree node (page) touched while scanning a table store"

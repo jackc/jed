@@ -1,0 +1,231 @@
+# P9 statistics refine stale NDV scaling, equality joins, and simple-column GROUP BY/DISTINCT
+# cardinality (spec/design/statistics.md §§5–6). Low-cardinality NDV stays fixed; key-like NDV scales
+# proportionally to the current non-NULL population. These deterministic integer estimates and plan
+# choices are jed-owned and cross-core checked.
+# requires: maintenance.analyze, introspect.statistics, ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.insert_select, query.select, query.set_returning, query.comparison_order, query.aggregates, query.group_by, query.distinct, query.join_inner, query.table_alias, query.qualified_column, query.explain, query.order_by, expr.arithmetic, expr.between, cast.explicit, types.i32, types.i64
+
+# --- fixed versus proportional NDV under retained stale facts -----------------------------------
+
+statement ok
+CREATE TABLE p9_scale (id i32 PRIMARY KEY, enumv i32)
+
+statement ok
+INSERT INTO p9_scale
+SELECT CAST(generate_series AS i32), CAST(generate_series % 2 AS i32)
+FROM generate_series(1, 100)
+
+statement ok
+ANALYZE p9_scale
+
+# Double the population without refreshing. Raw facts remain at 100 rows and stale; current enumv
+# NDV remains 2 while key-like id NDV scales from 100 to 200.
+statement ok
+INSERT INTO p9_scale
+SELECT CAST(generate_series + 100 AS i32), CAST(generate_series % 2 AS i32)
+FROM generate_series(1, 100)
+
+query TIBI nosort
+SELECT column_name, analyzed_rows, is_stale, distinct_count
+FROM jed_statistics ORDER BY column_name
+----
+enumv
+100
+true
+2
+id
+100
+true
+100
+
+query ITTII nosort
+EXPLAIN SELECT enumv, count(*) FROM p9_scale GROUP BY enumv
+----
+0
+Aggregate
+groups=1 aggs=1
+2
+403
+1
+Scan p9_scale
+Full scan; touched=1
+200
+201
+
+query ITTII nosort
+EXPLAIN SELECT id, count(*) FROM p9_scale GROUP BY id
+----
+0
+Aggregate
+groups=2 aggs=1
+200
+601
+1
+Scan p9_scale
+Full scan; touched=2
+200
+201
+
+query ITTII nosort
+EXPLAIN SELECT DISTINCT enumv FROM p9_scale
+----
+0
+Distinct
+-
+2
+203
+1
+Scan p9_scale
+Full scan; touched=1
+200
+201
+
+# --- NULL bucket and equality-join NDV -----------------------------------------------------------
+
+statement ok
+CREATE TABLE p9_left (id i32 PRIMARY KEY, k i32)
+
+statement ok
+CREATE TABLE p9_right (id i32 PRIMARY KEY, k i32)
+
+statement ok
+INSERT INTO p9_left VALUES
+  (1,0),(2,0),(3,0),(4,0),(5,0),(6,0),(7,0),(8,0),(9,1),(10,NULL)
+
+statement ok
+INSERT INTO p9_right VALUES (1,0),(2,0),(3,1),(4,1),(5,2),(6,NULL)
+
+statement ok
+ANALYZE p9_left (k)
+
+statement ok
+ANALYZE p9_right (k)
+
+# ceil(9 non-NULL × 5 non-NULL / max(2,3) NDV) = 15 join rows.
+query ITTII nosort
+EXPLAIN SELECT l.id, r.id FROM p9_left l JOIN p9_right r ON l.k = r.k
+----
+0
+Nested Loop
+inner; on:conjuncts=1
+15
+93
+1
+Scan p9_left
+Full scan; touched=2
+10
+11
+1
+Scan p9_right
+Full scan; touched=2
+6
+7
+
+# Two non-NULL values plus one NULL group.
+query ITTII nosort
+EXPLAIN SELECT k, count(*) FROM p9_left GROUP BY k
+----
+0
+Aggregate
+groups=1 aggs=1
+3
+24
+1
+Scan p9_left
+Full scan; touched=1
+10
+11
+
+query ITTII nosort
+EXPLAIN SELECT DISTINCT k FROM p9_left
+----
+0
+Distinct
+-
+3
+14
+1
+Scan p9_left
+Full scan; touched=1
+10
+11
+
+# --- histogram target ---------------------------------------------------------------------------
+
+# More than 100 complete-population groups produces no one-off MCVs and exactly 101 equi-depth
+# bounds. This also exercises exact KMV NDV below the 4,096-hash cap.
+statement ok
+CREATE TABLE p9_histogram (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO p9_histogram
+SELECT CAST(generate_series AS i32), CAST(generate_series AS i32)
+FROM generate_series(1, 102)
+
+statement ok
+ANALYZE p9_histogram (v)
+
+query IIIII nosort
+SELECT analyzed_rows, distinct_count, sample_rows, mcv_count, histogram_count
+FROM jed_statistics WHERE table_name = 'p9_histogram'
+----
+102
+102
+102
+0
+101
+
+# Step-CDF one-sided and paired-range estimates use the stored 101 bounds without within-bucket
+# interpolation. The paired form is evaluated once rather than multiplying two inequalities.
+query ITTII nosort
+EXPLAIN SELECT id FROM p9_histogram WHERE v < 52
+----
+0
+Filter
+conjuncts=1
+53
+258
+1
+Scan p9_histogram
+Full scan; touched=2
+102
+103
+
+query ITTII nosort
+EXPLAIN SELECT id FROM p9_histogram WHERE v BETWEEN 26 AND 76
+----
+0
+Filter
+conjuncts=2
+53
+462
+1
+Scan p9_histogram
+Full scan; touched=2
+102
+103
+
+# --- bounded sample and KMV cap ----------------------------------------------------------------
+
+# 30,001 unique values force the 30,000-row priority-sample cap and the 4,096-hash KMV estimate.
+# FNV-1a over the canonical i32 keys makes the stored deterministic estimate 14,315; the bounded
+# sample has no duplicate groups, so it produces 101 equi-depth bounds and no MCVs.
+statement ok
+CREATE TABLE p9_bounded (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO p9_bounded
+SELECT CAST(generate_series AS i32), CAST(generate_series AS i32)
+FROM generate_series(1, 30001)
+
+statement ok
+ANALYZE p9_bounded (v)
+
+query IIIII nosort
+SELECT analyzed_rows, distinct_count, sample_rows, mcv_count, histogram_count
+FROM jed_statistics WHERE table_name = 'p9_bounded'
+----
+30001
+14315
+30000
+0
+101
