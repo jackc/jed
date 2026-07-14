@@ -388,6 +388,7 @@ import {
   insertDetail,
   joinDetail,
   limitDetail,
+  paramLabels,
   rejectParamsForDDL,
   seqBoundCheckLast,
   seqBoundCheckStart,
@@ -12573,28 +12574,29 @@ export class Engine {
   // its filter/projection against this engine, so the streaming cursor is self-contained — it does not
   // reference the live handle, so it survives Database.query's transient session (streaming.md §5).
   snapshotEngine(): Engine {
-    const e = new Engine();
+    // This is a read-only execution context, not a new database. Allocate the two thin objects it
+    // actually needs instead of running Engine/SessionState constructors that build empty catalog,
+    // temp-catalog, privilege, seam, and session-state graphs only to replace their roots below.
+    const e = Object.create(Engine.prototype) as Engine;
     e.committed = this.readSnap();
+    e.core = null;
+    e.attachedCommitted = this.attachReadView();
+    e.session = SessionState.frozenRead(this.session, this.tempSnap());
     e.pageSize = this.pageSize;
     e.paging = this.paging;
     e.path = this.path;
     e.spillSink = this.spillSink;
     e.readOnly = this.readOnly;
-    const src = this.session;
-    const dst = e.session;
-    dst.maxCost = src.maxCost;
-    dst.lifetime = src.lifetime; // shared LifetimeBudget — streaming cost counts (§5)
-    dst.workMem = src.workMem;
-    dst.seam = src.seam; // shared seam — uuid/clock draw from the injected source
-    dst.vars = src.vars;
-    dst.timeZone = src.timeZone;
-    dst.sessionSeq = src.sessionSeq; // currval/lastval reads stay faithful
-    dst.sessionLastName = src.sessionLastName;
-    dst.tempCommitted = this.tempSnap();
-    // The frozen read engine carries the same pinned attachment view so a streaming read of an attached
-    // database (attached-databases.md §5) resolves through it; it never commits (read-only), so it needs
-    // no core back-ref. tempCommitted above already froze the temp snapshot.
-    e.attachedCommitted = this.attachReadView();
+    // Write/persistence-only fields retain the inert values a freshly constructed snapshot Engine had.
+    e.pageCount = 0;
+    e.freePages = [];
+    e.persistHook = null;
+    e.reclaimWithinSession = false;
+    e.liveAtCompaction = 0;
+    e.freeGenTxid = 0n;
+    e.tempStorage = null;
+    e.openStreams = 0;
+    e.estimatorTouched = new Set();
     return e;
   }
 
@@ -12633,7 +12635,7 @@ export class Engine {
       this.estimatorInputsMatch(holder.cache.sp, holder.cache.inputs)
     ) {
       const c = holder.cache;
-      return this.buildScanRows(c.sp, bindParams(params, c.ptys), 0n);
+      return this.buildScanRows(c.sp, bindParams(params, c.ptys, c.plabels), 0n, c.resultTypes);
     }
     // MISS: plan once.
     const ptypes = new ParamTypes();
@@ -12641,7 +12643,9 @@ export class Engine {
     if (plan.kind !== "select") return null; // set-op / VALUES / WITH — a scan lane does not cover it
     const sp = plan;
     const ptys = ptypes.finalize();
-    const bound = bindParams(params, ptys);
+    const plabels = paramLabels(ptys.length);
+    const bound = bindParams(params, ptys, plabels);
+    const resultTypes = typeNames(sp.columnTypes);
     // Fold globally-uncorrelated subqueries to constants (at top level every surviving subquery is
     // uncorrelated) so the per-row eval re-enters nothing — keeping the cursor self-contained. The
     // fold's own cost was already charged to the shared lifetime gauge by its sub-executions; it is
@@ -12660,9 +12664,9 @@ export class Engine {
       this.planCacheable(sp) &&
       inputs !== null
     ) {
-      holder.cache = { core: ident, inputs, sp, ptys };
+      holder.cache = { core: ident, inputs, sp, ptys, plabels, resultTypes };
     }
-    return this.buildScanRows(sp, bound, subqueryCost.value);
+    return this.buildScanRows(sp, bound, subqueryCost.value, resultTypes);
   }
 
   // buildScanRows classifies a resolved plan as direct-pull or buffered. The direct branch handles
@@ -12674,6 +12678,7 @@ export class Engine {
     sp: SelectPlan,
     bound: Value[],
     subqueryCost: bigint,
+    resultTypes: string[],
   ): { columnNames: string[]; columnTypes: string[]; cursor: Cursor } {
     if (pullStreamingScanEligible(sp)) {
       // Resolve the scan bound (the PK pushdown, if any) and the up-front cost block. An empty bound
@@ -12737,7 +12742,7 @@ export class Engine {
       };
       return {
         columnNames: sp.columnNames,
-        columnTypes: typeNames(sp.columnTypes),
+        columnTypes: resultTypes,
         cursor: Cursor.streaming(source),
       };
     }
@@ -12768,7 +12773,7 @@ export class Engine {
     };
     return {
       columnNames: sp.columnNames,
-      columnTypes: typeNames(sp.columnTypes),
+      columnTypes: resultTypes,
       cursor: Cursor.streaming(source),
     };
   }
@@ -12837,14 +12842,25 @@ export class Engine {
   private estimatorInputsMatch(sp: SelectPlan, want: EstimatorInputSignature[]): boolean {
     if (sp.rels.length !== want.length) return false;
     for (let i = 0; i < sp.rels.length; i++) {
-      const got = this.estimatorInput(sp.rels[i]!);
+      const rel = sp.rels[i]!;
       const expected = want[i]!;
+      let snap: Snapshot | null;
+      if (rel.db === undefined) {
+        if (this.tempSnap().tableByKey(expected.table) !== undefined) return false;
+        snap = this.readSnap();
+      } else if (rel.db.toLowerCase() === "temp") {
+        return false;
+      } else if (rel.db.toLowerCase() === "main") {
+        snap = this.readSnap();
+      } else {
+        snap = this.attachReadSnap(rel.db.toLowerCase()) ?? null;
+      }
       if (
-        got === null ||
-        got.database !== expected.database ||
-        got.catGen !== expected.catGen ||
-        got.table !== expected.table ||
-        got.revision !== expected.revision
+        snap === null ||
+        snap.tableByKey(expected.table) === undefined ||
+        snap.estimatorIdentity !== expected.database ||
+        snap.catGen !== expected.catGen ||
+        snap.estimatorRevisionForKey(expected.table) !== expected.revision
       ) {
         return false;
       }
@@ -22444,6 +22460,8 @@ export type ScanCache = {
   inputs: EstimatorInputSignature[];
   sp: SelectPlan;
   ptys: ScalarType[];
+  plabels: string[];
+  resultTypes: string[];
 };
 export type EstimatorInputSignature = {
   database: object;

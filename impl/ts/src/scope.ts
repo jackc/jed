@@ -1019,14 +1019,22 @@ export function unifyParamType(a: ScalarType, b: ScalarType, idx0: number): Scal
 // bindParams coerces each supplied bind value to its inferred parameter type, two-phase /
 // all-or-nothing like INSERT (spec/design/api.md §5): a count mismatch is 42601 and every value
 // is validated up front (22003/42804/22P02/23502 via storeValue) before any row is touched.
-export function bindParams(supplied: Value[], types: ScalarType[]): Value[] {
+export function paramLabels(n: number): string[] {
+  return Array.from({ length: n }, (_, i) => `$${i + 1}`);
+}
+
+export function bindParams(
+  supplied: Value[],
+  types: ScalarType[],
+  labels: readonly string[] = paramLabels(types.length),
+): Value[] {
   if (supplied.length !== types.length) {
     throw engineError(
       "syntax_error",
       `bind parameter count mismatch: statement expects ${types.length}, got ${supplied.length}`,
     );
   }
-  return types.map((ty, i) => storeValue(supplied[i]!, ty, null, null, false, `$${i + 1}`));
+  return types.map((ty, i) => storeValue(supplied[i]!, ty, null, null, false, labels[i]!));
 }
 
 // rejectParamsForDDL throws 42601 if bind parameters are supplied to a CREATE/DROP TABLE (which

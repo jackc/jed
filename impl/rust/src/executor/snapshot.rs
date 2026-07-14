@@ -8,8 +8,13 @@ use super::*;
 impl Snapshot {
     /// Exact relation revision used only for prepared-plan cache validation (estimator.md §6).
     pub(crate) fn estimator_revision(&self, name: &str) -> std::sync::Arc<EstimatorRevision> {
+        let key = name.to_ascii_lowercase();
+        self.estimator_revision_by_key(&key)
+    }
+
+    pub(crate) fn estimator_revision_by_key(&self, key: &str) -> std::sync::Arc<EstimatorRevision> {
         self.estimator_revisions
-            .get(&name.to_ascii_lowercase())
+            .get(key)
             .cloned()
             .unwrap_or_else(|| self.estimator_base_revision.clone())
     }
@@ -93,6 +98,10 @@ impl Snapshot {
     /// Look up a table definition by name (case-insensitive).
     pub fn table(&self, name: &str) -> Option<&Table> {
         self.tables.get(&name.to_ascii_lowercase())
+    }
+
+    pub(crate) fn table_by_key(&self, key: &str) -> Option<&Table> {
+        self.tables.get(key)
     }
 
     /// The canonical name of every table in this snapshot, sorted ascending by lowercased name (the

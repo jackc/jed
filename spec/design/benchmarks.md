@@ -93,6 +93,47 @@ SQLite hot means were **6.72 µs** (`mattn-cgo`), **2.78 µs** (`rusqlite`), and
 while the ramp p90 records the first-fault work the representation slice targets. Timings remain
 non-gating; both lanes' checksum agreement is the correctness gate.
 
+**Point-lookup optimization result (2026-07-14).** The completed follow-ons keep clean packed-leaf
+keys block-backed with lazy weights, use one counted B+tree descent and one row reconstruction for a
+complete primary-key equality, share cached bind labels/result metadata, validate cached estimator
+inputs through normalized keys, and avoid constructing unused frozen-session state. The final shared
+run produced:
+
+| Lane / native core | Mean | p50 | p90 | p99 |
+|---|---:|---:|---:|---:|
+| ramp — Go | 8.326 µs | 1.786 µs | 51.161 µs | 66.532 µs |
+| ramp — Rust | 5.632 µs | 2.162 µs | 34.828 µs | 37.017 µs |
+| ramp — TypeScript | 13.884 µs | 6.781 µs | 62.523 µs | 72.699 µs |
+| hot — Go | 2.015 µs | 1.905 µs | 2.442 µs | 7.381 µs |
+| hot — Rust | 2.183 µs | 2.149 µs | 2.457 µs | 2.685 µs |
+| hot — TypeScript | 6.659 µs | 6.098 µs | 7.822 µs | 12.000 µs |
+
+Against the split baseline above, ramp mean improved by about **10% Go, 14% Rust, and 25%
+TypeScript**; hot mean improved by **16%, 23%, and 14%**. Same-run SQLite hot means were **6.175
+µs** (`mattn-cgo`), **2.775 µs** (`rusqlite`), and **6.714 µs** (`node:sqlite`), so every native jed
+core is now at or below its same-language SQLite mean as well as its PostgreSQL client mean on this
+machine. This is an environment-relative result, not a performance contract. Every implementation
+retained checksum `f82d3b99ddaff0fb` for ramp and `28f09c46d56e242a` for hot. Follow-up runs also
+covered `composite_pk_lookup`, `secondary_lookup`, expression/partial lookup, and primary/secondary
+`in_list` lanes; their reporters found no cross-core/engine answer mismatch.
+
+Temporary, non-checked-in allocation probes used identical before/after boundaries around a fully
+drained prepared query. Rust counted allocator calls by harness phase (argument bind, cursor open,
+drain/checksum); Go used `testing.AllocsPerRun` around the internal prepared cursor; TypeScript summed
+V8 `--trace-gc-nvp` allocation bytes plus the final residual after a forced-GC start. They are review
+evidence rather than a test gate:
+
+| Core / probe | Constant | `id` point | Four-column point |
+|---|---:|---:|---:|
+| Rust allocations/op | 29 → 24 | 47 → 35 | ~62 → 41 |
+| Rust bytes/op | 2,892 → 2,830 | 3,777 → 3,688 | ~4,676 → 3,906 |
+| Go allocations/op | 11 → 8 | 22 → 18 | 26 → 22 |
+| TypeScript allocated bytes/op | 9,423 → 5,025 | 15,421 → 10,893 | 18,118 → 13,535 |
+
+The remaining allocations include owned public output values and the safe cursor lifetime; neither is
+weakened for a benchmark. Allocation counts/bytes are diagnostic only and may move with compiler or
+runtime versions.
+
 ## 1. Purpose and non-goals
 
 The benchmark suite answers two questions, continuously:

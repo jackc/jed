@@ -138,6 +138,36 @@ export class SessionState {
     this.readPin = null;
   }
 
+  // Build the session envelope for a frozen read cursor without constructing and then discarding a
+  // fresh temp Snapshot, LifetimeBudget, Seam, Privileges, and five Maps. Planning/admission has
+  // already completed before a cursor is created, and the frozen executor is read-only, so it needs
+  // only the state evaluation and metering can observe. Mutable per-statement sequence staging stays
+  // independently empty, matching a fresh SessionState; stable session facts are shared exactly as
+  // snapshotEngine shared them after construction before this allocation-focused form existed.
+  static frozenRead(source: SessionState, tempCommitted: Snapshot): SessionState {
+    const frozen = Object.create(SessionState.prototype) as SessionState;
+    frozen.tx = null;
+    frozen.maxCost = source.maxCost;
+    frozen.lifetime = source.lifetime;
+    frozen.maxSqlLength = source.maxSqlLength;
+    frozen.workMem = source.workMem;
+    frozen.seam = source.seam;
+    frozen.sessionSeq = source.sessionSeq;
+    frozen.sessionLastName = source.sessionLastName;
+    frozen.pendingSeq = new Map();
+    frozen.pendingCurrval = new Map();
+    frozen.pendingLastName = null;
+    frozen.privileges = source.privileges;
+    frozen.allowDdl = source.allowDdl;
+    frozen.allowTempDdl = source.allowTempDdl;
+    frozen.tempBuffers = source.tempBuffers;
+    frozen.tempCommitted = tempCommitted;
+    frozen.vars = source.vars;
+    frozen.timeZone = source.timeZone;
+    frozen.readPin = null;
+    return frozen;
+  }
+
   // setTimeZone sets the session time zone (spec/design/session.md §6.2, timezones.md §9.4): the zone
   // a timestamptz is decomposed in. Accepts UTC, a fixed ±HH:MM offset, or a named IANA zone a loaded
   // JTZ bundle provides; a name no bundle provides (and not a built-in) is 22023, the value unchanged.
@@ -503,7 +533,10 @@ export function* streamRows(
   store: TableStore,
   bound: KeyBound,
   empty: boolean,
-  point: { kind: "deferred"; key: Uint8Array } | { kind: "prefetched"; row: Row | undefined } | null,
+  point:
+    | { kind: "deferred"; key: Uint8Array }
+    | { kind: "prefetched"; row: Row | undefined }
+    | null,
 ): Generator<Value[]> {
   if (empty || sp.limit === 0n) return;
   const offset = sp.offset ?? 0n;
@@ -512,7 +545,8 @@ export function* streamRows(
   let passed = 0n;
   let produced = 0n;
   // A pkReverse plan (ORDER BY the full PK all-DESC) walks the tree backward; everything else forward.
-  const input = point === null ? store.scanRowsIter(bound, sp.phys.pkReverse) : pointRows(store, point);
+  const input =
+    point === null ? store.scanRowsIter(bound, sp.phys.pkReverse) : pointRows(store, point);
   for (const rawRow of input) {
     meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
     meter.charge(COSTS.storageRowRead);

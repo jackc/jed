@@ -447,6 +447,18 @@ func dateClockLiteral(s string, params *paramTypes) (*rExpr, resolvedType, bool)
 // all-or-nothing like INSERT (spec/design/api.md §5): a count mismatch is 42601 and every value
 // is validated up front (22003/42804/22P02/23502 via storeValue) before any row is touched.
 func bindParams(supplied []Value, types []scalarType) ([]Value, error) {
+	return bindParamsWithLabels(supplied, types, paramLabels(len(types)))
+}
+
+func paramLabels(n int) []string {
+	labels := make([]string, n)
+	for i := range labels {
+		labels[i] = fmt.Sprintf("$%d", i+1)
+	}
+	return labels
+}
+
+func bindParamsWithLabels(supplied []Value, types []scalarType, labels []string) ([]Value, error) {
 	if len(supplied) != len(types) {
 		return nil, newError(SyntaxError, fmt.Sprintf(
 			"bind parameter count mismatch: statement expects %d, got %d", len(types), len(supplied),
@@ -454,7 +466,7 @@ func bindParams(supplied []Value, types []scalarType) ([]Value, error) {
 	}
 	bound := make([]Value, len(types))
 	for i, ty := range types {
-		v, err := storeValue(supplied[i], ty, nil, nil, false, fmt.Sprintf("$%d", i+1))
+		v, err := storeValue(supplied[i], ty, nil, nil, false, labels[i])
 		if err != nil {
 			return nil, err
 		}

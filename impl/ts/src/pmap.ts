@@ -287,12 +287,8 @@ function entryWindow(b: KeyBound, n: PNode): [number, number] {
     }
     return lo;
   };
-  const first =
-    b.lo === null ? 0 : lowerBound(b.lo, !b.loInc);
-  let last =
-    b.hi === null
-      ? nodeLen(n)
-      : lowerBound(b.hi, b.hiInc);
+  const first = b.lo === null ? 0 : lowerBound(b.lo, !b.loInc);
+  let last = b.hi === null ? nodeLen(n) : lowerBound(b.hi, b.hiInc);
   if (last < first) last = first;
   return [first, last];
 }
@@ -813,9 +809,11 @@ function* walkRowsIter(
   }
   const [cf, cl] = childWindow(b, n);
   if (reverse) {
-    for (let i = cl; i >= cf; i--) yield* walkRowsIter(resolveChild(n.children[i], src), b, src, true);
+    for (let i = cl; i >= cf; i--)
+      yield* walkRowsIter(resolveChild(n.children[i], src), b, src, true);
   } else {
-    for (let i = cf; i <= cl; i++) yield* walkRowsIter(resolveChild(n.children[i], src), b, src, false);
+    for (let i = cf; i <= cl; i++)
+      yield* walkRowsIter(resolveChild(n.children[i], src), b, src, false);
   }
 }
 

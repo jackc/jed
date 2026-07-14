@@ -28,8 +28,11 @@ func (db *engine) snapshotEngine() *engine {
 	// read-only maps (vars/sessionSeq); reset the per-statement / transaction state below.
 	s.tx = nil
 	s.readPin = nil
-	s.pendingSeq = map[string]*sequenceDef{}
-	s.pendingCurrval = map[string]int64{}
+	// A scan-lane statement cannot contain a sequence mutator (stmtIsWrite routes it away before this
+	// context exists). Nil maps preserve empty-map reads and fail loudly if that invariant is ever
+	// broken, while avoiding two per-cursor maps that can never receive a write.
+	s.pendingSeq = nil
+	s.pendingCurrval = nil
 	s.pendingLastName = ""
 	s.tempCommitted = db.tempSnap()
 	return &engine{
@@ -54,10 +57,12 @@ func (db *engine) snapshotEngine() *engine {
 type scanCache struct {
 	// core identifies the Database the plan was resolved against (including relation-free plans).
 	// inputs is the exact P2 relation-scoped estimator signature in source ordinal order.
-	core   *sharedCore
-	inputs []estimatorInputSignature
-	sp     *selectPlan
-	ptys   []scalarType
+	core        *sharedCore
+	inputs      []estimatorInputSignature
+	sp          *selectPlan
+	ptys        []scalarType
+	plabels     []string
+	resultTypes []string
 }
 
 // estimatorInputSignature is collision-free by construction: identity and revision are opaque
@@ -176,8 +181,26 @@ func (db *engine) estimatorInputsMatch(sp *selectPlan, want []estimatorInputSign
 		return false
 	}
 	for i := range sp.rels {
-		got, ok := db.estimatorInputFor(&sp.rels[i])
-		if !ok || got != want[i] {
+		rel, expected := &sp.rels[i], want[i]
+		var snap *snapshot
+		if rel.db == nil {
+			if _, ok := db.tempSnap().tableByKey(expected.table); ok {
+				return false
+			}
+			snap = db.readSnap()
+		} else if strings.EqualFold(*rel.db, "temp") {
+			return false
+		} else if strings.EqualFold(*rel.db, "main") {
+			snap = db.readSnap()
+		} else {
+			snap = db.attachReadSnap(strings.ToLower(*rel.db))
+		}
+		if snap == nil {
+			return false
+		}
+		if _, ok := snap.tableByKey(expected.table); !ok ||
+			snap.estimatorIdentity != expected.database || snap.catGen != expected.catGen ||
+			snap.estimatorRevisionForKey(expected.table) != expected.revision {
 			return false
 		}
 	}
@@ -208,7 +231,7 @@ func (db *engine) tryScanQuery(stmt statement, params []Value, sc *stmtCache) (*
 	rsnap := db.readSnap()
 	if sc != nil {
 		if c := sc.p.Load(); c != nil && c.core == db.core && db.estimatorInputsMatch(c.sp, c.inputs) {
-			return db.buildScanRows(c.sp, c.ptys, params, false)
+			return db.buildScanRows(c.sp, c.ptys, c.plabels, c.resultTypes, params, false)
 		}
 	}
 	// MISS: plan once.
@@ -225,14 +248,16 @@ func (db *engine) tryScanQuery(stmt statement, params []Value, sc *stmtCache) (*
 	if err != nil {
 		return nil, false, err
 	}
+	plabels := paramLabels(len(ptys))
+	resultTypes := typeNames(sp.columnTypes)
 	// Fill only from committed state, so a working transaction can consume an entry whose exact
 	// signature matches but can never publish its working revision into the committed cache slot.
 	// Also require a reusable plan and a core identity (a core-less engine never fills).
 	inputs, inputsOK := db.estimatorInputs(sp)
 	if sc != nil && db.core != nil && rsnap == db.committed && !ptypes.uncacheable && db.planCacheable(sp) && inputsOK {
-		sc.p.Store(&scanCache{core: db.core, inputs: inputs, sp: sp, ptys: ptys})
+		sc.p.Store(&scanCache{core: db.core, inputs: inputs, sp: sp, ptys: ptys, plabels: plabels, resultTypes: resultTypes})
 	}
-	return db.buildScanRows(sp, ptys, params, true)
+	return db.buildScanRows(sp, ptys, plabels, resultTypes, params, true)
 }
 
 // buildScanRows binds params, optionally folds uncorrelated subqueries to constants (doFold — done on
@@ -241,8 +266,8 @@ func (db *engine) tryScanQuery(stmt statement, params []Value, sc *stmtCache) (*
 // doFold is false, sp is a shared cached plan and stays strictly read-only. The direct branch handles
 // full/contiguous-PK scans; generalized bounded streams run through the buffered cursor on first pull.
 // Under full drain the rows + total cost are byte-identical to the eager path.
-func (db *engine) buildScanRows(sp *selectPlan, ptys []scalarType, params []Value, doFold bool) (*Rows, bool, error) {
-	bound, err := bindParams(params, ptys)
+func (db *engine) buildScanRows(sp *selectPlan, ptys []scalarType, plabels, resultTypes []string, params []Value, doFold bool) (*Rows, bool, error) {
+	bound, err := bindParamsWithLabels(params, ptys, plabels)
 	if err != nil {
 		return nil, false, err
 	}
@@ -321,7 +346,7 @@ func (db *engine) buildScanRows(sp *selectPlan, ptys []scalarType, params []Valu
 				cur.scan = store.storeScan(b, sp.phys.pkReverse)
 			}
 		}
-		return &Rows{columnNames: sp.columnNames, columnTypes: typeNames(sp.columnTypes), cursor: cur}, true, nil
+		return &Rows{columnNames: sp.columnNames, columnTypes: resultTypes, cursor: cur}, true, nil
 	}
 
 	// Blocking (buffered) shape: buffers its input but yields the output one row at a time via
@@ -337,7 +362,7 @@ func (db *engine) buildScanRows(sp *selectPlan, ptys []scalarType, params []Valu
 		rng:    newStmtRng(),
 		meter:  meter,
 	}
-	return &Rows{columnNames: sp.columnNames, columnTypes: typeNames(sp.columnTypes), cursor: c}, true, nil
+	return &Rows{columnNames: sp.columnNames, columnTypes: resultTypes, cursor: c}, true, nil
 }
 
 // streamingCursor is the lazy pull pipeline behind a streaming Rows cursor (spec/design/streaming.md

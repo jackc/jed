@@ -1229,6 +1229,19 @@ pub(crate) fn unify_param_type(a: ScalarType, b: ScalarType, idx0: usize) -> Res
 /// like INSERT (spec/design/api.md §5): a count mismatch is 42601 and every value is validated
 /// up front (22003/42804/22P02/23502 via `store_value`) before any row is touched.
 pub(crate) fn bind_params(supplied: &[Value], types: &[ScalarType]) -> Result<Vec<Value>> {
+    let labels = param_labels(types.len());
+    bind_params_with_labels(supplied, types, &labels)
+}
+
+pub(crate) fn param_labels(len: usize) -> Vec<String> {
+    (1..=len).map(|i| format!("${i}")).collect()
+}
+
+pub(crate) fn bind_params_with_labels(
+    supplied: &[Value],
+    types: &[ScalarType],
+    labels: &[String],
+) -> Result<Vec<Value>> {
     if supplied.len() != types.len() {
         return Err(EngineError::new(
             SqlState::SyntaxError,
@@ -1244,14 +1257,7 @@ pub(crate) fn bind_params(supplied: &[Value], types: &[ScalarType]) -> Result<Ve
         // A bound parameter is coerced exactly like a literal in that position: typmod is
         // unconstrained (a comparison/insert against a column re-applies the column typmod),
         // not_null is false (NULL is a legal bound value; a NOT NULL target re-checks at store).
-        bound.push(store_value(
-            v.clone(),
-            *ty,
-            None,
-            None,
-            false,
-            &format!("${}", i + 1),
-        )?);
+        bound.push(store_value(v.clone(), *ty, None, None, false, &labels[i])?);
     }
     Ok(bound)
 }

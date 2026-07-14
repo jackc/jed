@@ -55,12 +55,12 @@ impl PreparedStatement {
 /// `query()` — a lazy pull pipeline that yields one row at a time over a pinned snapshot. The seam
 /// is the same either way, so callers are unchanged.
 pub struct Rows {
-    column_names: Vec<String>,
+    column_names: std::rc::Rc<[String]>,
     /// The canonical type name of each output column (parallel to `column_names`), carried on the
     /// total `query` seam so a streaming read exposes its types like the materialized [`Outcome`] did
     /// — `i16`/`text`/`decimal`/…, or `unknown` for an untyped NULL column (spec/design/conformance.md
     /// §7). Empty for a non-query statement.
-    column_types: Vec<String>,
+    column_types: std::rc::Rc<[String]>,
     cursor: Cursor,
     /// The command tag for a statement run through the now-total `query` seam (spec/design/api.md §4):
     /// how many rows a DML statement (INSERT/UPDATE/DELETE without RETURNING) touched. `None` for a
@@ -100,8 +100,8 @@ impl Rows {
                 rows,
                 cost,
             } => Rows {
-                column_names,
-                column_types,
+                column_names: std::rc::Rc::from(column_names),
+                column_types: std::rc::Rc::from(column_types),
                 cursor: Cursor::buffered(rows, cost),
                 rows_affected: None,
                 error: None,
@@ -112,8 +112,8 @@ impl Rows {
                 cost,
                 rows_affected,
             } => Rows {
-                column_names: Vec::new(),
-                column_types: Vec::new(),
+                column_names: std::rc::Rc::from(Vec::new()),
+                column_types: std::rc::Rc::from(Vec::new()),
                 cursor: Cursor::buffered(Vec::new(), cost),
                 rows_affected,
                 error: None,
@@ -126,13 +126,13 @@ impl Rows {
     /// Wrap a lazy streaming pull source as a `Rows` cursor (S3, spec/design/streaming.md §4),
     /// carrying the resolved output column names and types.
     pub(crate) fn from_streaming(
-        column_names: Vec<String>,
-        column_types: Vec<String>,
+        column_names: impl Into<std::rc::Rc<[String]>>,
+        column_types: impl Into<std::rc::Rc<[String]>>,
         source: Box<dyn crate::cursor::RowStream>,
     ) -> Rows {
         Rows {
-            column_names,
-            column_types,
+            column_names: column_names.into(),
+            column_types: column_types.into(),
             cursor: Cursor::streaming(source),
             rows_affected: None,
             error: None,

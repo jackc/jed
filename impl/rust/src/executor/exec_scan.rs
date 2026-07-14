@@ -693,17 +693,25 @@ impl Engine {
         // fold, no param-type walk. A cached plan carries no subquery to fold (`plan_cacheable`
         // rejected any), so the shared `Rc` plan is never mutated; params are still bound per execute.
         if let (Some(cell), Some(core)) = (cache, &self.core) {
-            let hit = cell
-                .borrow()
-                .as_ref()
-                .filter(|cp| {
-                    std::sync::Weak::ptr_eq(&cp.core, &std::sync::Arc::downgrade(core))
-                        && self.estimator_inputs_match(&cp.plan, &cp.inputs)
-                })
-                .map(|cp| (std::rc::Rc::clone(&cp.plan), cp.param_types.clone()));
-            if let Some((plan, ptys)) = hit {
-                let bound_params = bind_params(params, &ptys)?;
-                if let Some(rows) = self.build_scan_rows(plan, bound_params, 0)? {
+            let hit = {
+                let cached = cell.borrow();
+                cached
+                    .as_ref()
+                    .filter(|cp| {
+                        std::sync::Weak::ptr_eq(&cp.core, &std::sync::Arc::downgrade(core))
+                            && self.estimator_inputs_match(&cp.plan, &cp.inputs)
+                    })
+                    .map(|cp| {
+                        Ok((
+                            std::rc::Rc::clone(&cp.plan),
+                            bind_params_with_labels(params, &cp.param_types, &cp.param_labels)?,
+                            cp.metadata.clone(),
+                        ))
+                    })
+                    .transpose()?
+            };
+            if let Some((plan, bound_params, metadata)) = hit {
+                if let Some(rows) = self.build_scan_rows(plan, bound_params, 0, metadata)? {
                     return Ok(Some(rows));
                 }
             }
@@ -716,7 +724,8 @@ impl Engine {
         };
         let uncacheable = ptypes.uncacheable;
         let ptys = ptypes.finalize()?;
-        let bound_params = bind_params(params, &ptys)?;
+        let labels = param_labels(ptys.len());
+        let bound_params = bind_params_with_labels(params, &ptys, &labels)?;
         // Fold globally-uncorrelated subqueries to constants (at top level every surviving subquery is
         // uncorrelated) so the per-row eval re-enters nothing — keeping the cursor self-contained. The
         // fold's own cost was already charged to the shared lifetime gauge by its sub-executions; it is
@@ -736,15 +745,18 @@ impl Engine {
         let cacheable =
             from_committed && !uncacheable && self.plan_cacheable(&sp) && inputs.is_some();
         let plan = std::rc::Rc::new(sp);
+        let metadata = ResultMetadata::from_plan(&plan);
         if let (Some(cell), true, Some(core)) = (cache, cacheable, &self.core) {
             *cell.borrow_mut() = Some(CachedPlan {
                 core: std::sync::Arc::downgrade(core),
                 inputs: inputs.expect("cacheable plans have estimator inputs"),
                 plan: std::rc::Rc::clone(&plan),
                 param_types: ptys,
+                param_labels: labels,
+                metadata: metadata.clone(),
             });
         }
-        self.build_scan_rows(plan, bound_params, subquery_cost)
+        self.build_scan_rows(plan, bound_params, subquery_cost, metadata)
     }
 
     /// Classify a resolved plan (already folded + params bound) as direct-pull or buffered and build
@@ -759,6 +771,7 @@ impl Engine {
         plan: std::rc::Rc<SelectPlan>,
         bound_params: Vec<Value>,
         subquery_cost: i64,
+        metadata: ResultMetadata,
     ) -> Result<Option<Rows>> {
         if pull_streaming_scan_eligible(&plan) {
             // Resolve the scan bound (the PK pushdown, if any) and the up-front cost block — identical
@@ -825,8 +838,6 @@ impl Engine {
             let limit = plan.limit;
             let offset = plan.offset.unwrap_or(0);
             let distinct = plan.distinct;
-            let column_names = plan.column_names.clone();
-            let column_types = type_names(&plan.column_types);
             let done = empty || limit == Some(0);
             let stream = StreamingScan {
                 engine: snap,
@@ -844,8 +855,8 @@ impl Engine {
                 done,
             };
             return Ok(Some(Rows::from_streaming(
-                column_names,
-                column_types,
+                metadata.column_names,
+                metadata.column_types,
                 Box::new(stream),
             )));
         }
@@ -854,8 +865,6 @@ impl Engine {
         let snap = self.snapshot_engine();
         let mut meter = snap.session.new_meter();
         meter.accrued = subquery_cost; // the folded constant cost (lifetime already charged)
-        let column_names = plan.column_names.clone();
-        let column_types = type_names(&plan.column_types);
         let stream = BufferedScan {
             engine: snap,
             plan,
@@ -865,8 +874,8 @@ impl Engine {
             state: BufState::Pending,
         };
         Ok(Some(Rows::from_streaming(
-            column_names,
-            column_types,
+            metadata.column_names,
+            metadata.column_types,
             Box::new(stream),
         )))
     }
@@ -937,12 +946,27 @@ impl Engine {
             return false;
         }
         sp.rels.iter().zip(want).all(|(rel, want)| {
-            self.estimator_input(rel).is_some_and(|got| {
-                std::sync::Arc::ptr_eq(&got.database, &want.database)
-                    && got.cat_gen == want.cat_gen
-                    && got.table == want.table
-                    && std::sync::Arc::ptr_eq(&got.revision, &want.revision)
-            })
+            let snap = match rel.db.as_deref() {
+                None => {
+                    if self.temp_read_snap().table_by_key(&want.table).is_some() {
+                        return false;
+                    }
+                    self.read_snap()
+                }
+                Some(scope) if scope.eq_ignore_ascii_case("temp") => return false,
+                Some(scope) if scope.eq_ignore_ascii_case("main") => self.read_snap(),
+                Some(scope) => match self.attach_read_snap(&scope.to_ascii_lowercase()) {
+                    Some(snap) => snap,
+                    None => return false,
+                },
+            };
+            snap.table_by_key(&want.table).is_some()
+                && std::sync::Arc::ptr_eq(&snap.estimator_identity, &want.database)
+                && snap.cat_gen == want.cat_gen
+                && std::sync::Arc::ptr_eq(
+                    &snap.estimator_revision_by_key(&want.table),
+                    &want.revision,
+                )
         })
     }
 

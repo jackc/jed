@@ -136,6 +136,23 @@ pub(crate) struct CachedPlan {
     pub(crate) inputs: Vec<EstimatorInputSignature>,
     pub(crate) plan: std::rc::Rc<SelectPlan>,
     pub(crate) param_types: Vec<ScalarType>,
+    pub(crate) param_labels: Vec<String>,
+    pub(crate) metadata: ResultMetadata,
+}
+
+#[derive(Clone)]
+pub(crate) struct ResultMetadata {
+    pub(crate) column_names: std::rc::Rc<[String]>,
+    pub(crate) column_types: std::rc::Rc<[String]>,
+}
+
+impl ResultMetadata {
+    pub(crate) fn from_plan(plan: &SelectPlan) -> Self {
+        Self {
+            column_names: std::rc::Rc::from(plan.column_names.clone()),
+            column_types: std::rc::Rc::from(type_names(&plan.column_types)),
+        }
+    }
 }
 
 /// One exact relation-scoped estimator-input signature entry (estimator.md §6). The database and

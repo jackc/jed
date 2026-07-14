@@ -229,7 +229,11 @@ func (s *snapshot) clearColumnStatistics(table string, column int) {
 // estimatorRevisionFor returns the exact cache-validity token for one persistent relation. Missing
 // entries share the database's base token; the lowercased table name is a separate signature field.
 func (s *snapshot) estimatorRevisionFor(name string) *estimatorRevision {
-	if r := s.estimatorRevisions[strings.ToLower(name)]; r != nil {
+	return s.estimatorRevisionForKey(strings.ToLower(name))
+}
+
+func (s *snapshot) estimatorRevisionForKey(key string) *estimatorRevision {
+	if r := s.estimatorRevisions[key]; r != nil {
 		return r
 	}
 	return s.estimatorBaseRevision
@@ -477,6 +481,11 @@ func (s *snapshot) upgradeCollations(pageSize uint32) (int, error) {
 // table looks up a table definition by name (case-insensitive).
 func (s *snapshot) table(name string) (*catTable, bool) {
 	t, ok := s.tables[strings.ToLower(name)]
+	return t, ok
+}
+
+func (s *snapshot) tableByKey(key string) (*catTable, bool) {
+	t, ok := s.tables[key]
 	return t, ok
 }
 

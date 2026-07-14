@@ -171,7 +171,11 @@ export class Snapshot {
   }
 
   estimatorRevisionFor(name: string): object {
-    return this.estimatorRevisions.get(name.toLowerCase()) ?? this.estimatorBaseRevision;
+    return this.estimatorRevisionForKey(name.toLowerCase());
+  }
+
+  estimatorRevisionForKey(key: string): object {
+    return this.estimatorRevisions.get(key) ?? this.estimatorBaseRevision;
   }
 
   bumpEstimatorRevision(name: string): void {
@@ -284,6 +288,10 @@ export class Snapshot {
   // table looks up a table definition by name (case-insensitive).
   table(name: string): Table | undefined {
     return this.tables.get(name.toLowerCase());
+  }
+
+  tableByKey(key: string): Table | undefined {
+    return this.tables.get(key);
   }
 
   // compositeType looks up a composite type definition by name (case-insensitive).

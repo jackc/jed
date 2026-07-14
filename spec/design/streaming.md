@@ -307,7 +307,9 @@ independently — the P6.4 precedent):
   columns → `WHERE` → project, **one row per `next`**, accruing the identical cost units at the identical
   sites as the eager path. The cursor **owns a frozen snapshot** (Rust: a snapshot `Engine` built from
   the visible root + a copy of the session envelope, sharing the seam via `Rc` + the lifetime gauge;
-  Go/TS: a captured snapshot engine sharing the seam by reference), so the returned `Rows` is
+  Go/TS: a captured snapshot engine sharing the seam by reference; TS constructs only thin frozen
+  `Engine`/`SessionState` shells and points them at the already-pinned roots instead of allocating
+  throwaway empty catalog/session graphs), so the returned `Rows` is
   self-contained and survives the transient `Database::query` session (§5). The §5 snapshot pin is
   registered in the live-reader watermark (`reader_pin` on the shared core; deregistered on cursor
   `close`/drop), and `close` releases it. **Scope this slice:** only the `query()`/`Rows` surface streams
