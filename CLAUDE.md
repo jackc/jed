@@ -954,8 +954,8 @@ of executing a query** and **abort when a caller-supplied ceiling is exceeded**.
   `(query, database)`. This makes cost a §8-style divergence hotspot and a candidate for the
   conformance corpus (assert the cost, not only the rows).
 - **Plan identity is part of cost identity.** A different access path or join order performs
-  different metered work. Path B therefore minimizes only the shared runtime schedule, with no
-  private planner weights, and specifies estimator inputs, exact integer/rational arithmetic,
+  different metered work. The landed Path B planner minimizes only the shared runtime schedule,
+  with no private planner weights, and specifies estimator inputs, exact integer/rational arithmetic,
   complete ties, and bounded search in `spec/design/estimator.md`. Estimates are unmetered
   heuristics, never safety gates; the actual runtime counter remains authoritative for ceilings.
   P2's prepared-plan cache now validates an exact relation-scoped signature over the owning

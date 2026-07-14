@@ -162,113 +162,41 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 
 ## Query planner / optimizer
 
-> The planner is a **deterministic rule engine with a costed single-relation slice**: a one-table
-> SELECT inventories every access/order pipeline and chooses the lowest shared estimate; mutations
-> retain their documented fixed precedence. Joins remain left-deep in FROM order with structural
-> INL/hash rules — no costed join choice or join reordering yet. Exact transactional row counts are
-> the only persisted statistics; column distributions remain a follow-on.
-> `EXPLAIN` (above) now makes those choices inspectable + corpus-assertable, the substrate for this
-> work. **The load-bearing constraint:** cost is **observable and a cross-core contract** (§8; the
+> The planner is a **deterministic cost-based rule engine**. A one-table SELECT inventories every
+> legal access/order pipeline; eligible INNER/CROSS base-table islands jointly choose physical
+> relation order, access paths, and nested-loop / index-nested-loop / hash algorithms through a
+> bounded left-deep search. Exact row counts and explicit deterministic column statistics are
+> transactional and persisted; `EXPLAIN` makes the selected plan and its estimates
+> corpus-assertable. Mutations and hard-fenced join shapes retain their documented fixed policies.
+> **The load-bearing constraint:** cost is **observable and a cross-core contract** (§8; the
 > `# cost:` corpus directive), so (a) any plan change that changes which plan runs changes the metered
-> cost — it must recompute *identically* in all three cores and re-pins the affected `# cost:` entries;
-> (b) a cost-*based* planner is admissible **only** if its estimator is itself a spec'd, deterministic,
-> cross-core-identical artifact (like the cost schedule) — then cost-based plan choice *extends* the §8
-> contract rather than breaking it; (c) some textbook rewrites (constant folding, CSE, short-circuit)
-> are **not** cost-neutral here — they drop `operator_eval` charges — so each needs an explicit cost
+> cost — it must recompute *identically* in all three cores and re-pin the affected `# cost:` entries;
+> (b) the estimator is itself a spec'd, deterministic, cross-core-identical artifact, so cost-based
+> plan choice *extends* the §8 contract rather than breaking it; (c) some textbook rewrites
+> (constant folding, CSE, short-circuit) are **not** cost-neutral here — they drop `operator_eval`
+> charges — so each needs an explicit cost
 > decision, not a silent apply. Every optimization is a vertical slice carrying a **NoREC relation**
 > (the standing §7 obligation — the sweep does not discover new optimizations).
 
-### Cost as a plan input (the strategic investment — Path B)
+### Cost-based planner follow-ons
 
-- [x] **P0 — deterministic estimator contract ratified** — chose “spec the plan,” keeping physical
-  plan identity and actual cost inside the cross-core contract rather than ledgering class-P
-  divergence. Exact arithmetic, generic pre-bind parameters, PostgreSQL-derived rational defaults,
-  relation-scoped cache validity, SELECT-first scope, complete ties, and bounded left-deep join
-  search are specified in [estimator.md](spec/design/estimator.md); mechanical facts live in
-  [estimator.toml](spec/cost/estimator.toml). P1–P8 below complete the initial implementation;
-  distribution statistics remain the explicit later refinement.
-- [x] **P1 — transactional per-table row counts** — `format_version` 28 appends an exact
-  nonnegative signed-`i64` `row_count` to every table catalog entry, installs it beside loaded
-  demand-paged skeletons without a leaf walk, and maintains it with snapshot roots across DML,
-  failure, rollback, temp/attached routing, and reopen. Root/count mismatches are `XX001`; shared
-  byte goldens and all three cores pin the contract. → [format.md](spec/fileformat/format.md),
-  [storage.md §6](spec/design/storage.md)
-- [x] **P2 — statistics-aware prepared-plan cache validity** — cached SELECT plans now carry an
-  exact, collision-free relation signature over each owning database/attachment identity, catalog
-  generation, normalized table name, and transactional estimator revision. Relevant row mutations
-  invalidate even when counts return to the old value; unrelated table writes remain hits; working
-  revisions cannot fill the committed slot; rollback restores validity; attachments validate against
-  their own snapshot identity. The tokens are non-persisted snapshot metadata, so the file format is
-  unchanged. → [estimator.md §6](spec/design/estimator.md), [api.md §2.4](spec/design/api.md)
-- [x] **P3 — deterministic all-candidate inventory** — every core now enumerates full, PK, every
-  eligible B-tree/GiST/GIN index, and every PK/index interval path in the shared canonical order.
-  Candidates carry explicit scan-order and full residual-filter facts; a separate legacy selector
-  preserves SELECT and mutation precedence, including clipped interval exceptions, with no plan,
-  EXPLAIN, result, or actual-cost change. → [planner.md §5.1](spec/design/planner.md)
-- [x] **P4 — base-relation estimator in shadow mode** — shared generated facts plus a canonical
-  vector matrix drive independently hand-written Rust/Go/TypeScript arithmetic, predicate folds,
-  access-row estimates, runtime-unit vectors, weighted costs, and total tie keys for every base
-  candidate. Exact row counts and resident tree height/node count are admitted without leaf I/O;
-  logical output selectivity is applied once from the full WHERE, while access-specific scan rows
-  and residual work remain separate. P6 now consumes every single-relation access estimate; joins
-  and mutations retain their staged legacy policies. → [estimator.md §7](spec/design/estimator.md),
-  [estimator vectors](spec/cost/estimator_vectors.toml)
-- [x] **P5 — whole-plan estimator + EXPLAIN estimates** — propagate the selected plan's exact-rational
-  cardinality and runtime-unit estimate through filters/projections, every join algorithm, grouping,
-  windows, distinct/sort/limit, SRFs, CTEs, derived/VALUES/set-op/from-less queries, and currently
-  rendered DML nodes. EXPLAIN exposes non-NULL cumulative `i64` `est_rows`/`est_cost`; ANALYZE keeps
-  actual root figures separate. →
-  [estimator.md §8](spec/design/estimator.md), [explain.md §2](spec/design/explain.md)
-- [x] **P6a — costed PK / ordered-B-tree / full selection** — a SELECT with exactly one base
-  relation now chooses the minimum estimated-cost eligible base path under the canonical exact tie
-  order. The selected path's real storage-order capability feeds the existing ORDER BY rules. Shared
-  EXPLAIN/cost cases pin row-count flips and competing-index ties; NoREC covers the optimization.
-  UPDATE/DELETE, multi-relation SELECTs, and legacy winners from the deferred GIN/GiST/interval
-  families retain their explicit policies until the corresponding later slice. →
-  [estimator.md §9.1](spec/design/estimator.md), [planner.md §5.2](spec/design/planner.md)
-- [x] **P6b — complete costed single-relation pipelines** — GIN, GiST, PK/index interval sets,
-  natural bound order, and eligible order-only B-tree top-N walks now join the same competition.
-  The estimator prices only scheduled runtime units through residual/projection and LIMIT/OFFSET;
-  sort remains unmetered. Shared EXPLAIN/cost cases pin method/name ties, row-count/selectivity flips,
-  and actual costs; `cost_plan_p6b` supplies the NoREC relation. →
-  [estimator.md §9.1](spec/design/estimator.md), [planner.md §5.2](spec/design/planner.md)
-- [x] **P7 — costed two-relation orientation and algorithm** — eligible exactly-two-base-relation
-  INNER/CROSS SELECTs now compare both physical orientations, every ordinary access-path pair,
-  physically legal sibling-bound INL paths, and the existing safe ON-equijoin hash alternative as
-  complete pipelines. Logical slots remain source-ordered while execution and EXPLAIN follow the
-  selected physical order; exact ties retain source order, top-N discounts only work actually
-  skipped, and barriers keep their prior behavior. Shared plan/cost/error coverage, NoREC, and the
-  permanent forward/reverse INL plus hash/nested benchmark matrix pin the slice. →
-  [estimator.md §9.2](spec/design/estimator.md), [planner.md §5.3](spec/design/planner.md)
-- [x] **P8 — bounded deterministic N-way join ordering** — maximal all-base INNER/CROSS islands now
-  jointly select physical order, access path, and join algorithm. Deterministic Pareto-frontier
-  left-deep DP covers through 8 movable relations; larger islands use cheapest-next construction.
-  Outer/dependency inputs are hard fences, authored ON trees schedule intact, and N-way ordered
-  LIMIT discounts only its final streamed step. Shared plan/cost/cap/barrier coverage, the dedicated
-  `cost_plan_p8` NoREC relation, and 3-/5-/9-way benchmark lanes pin the slice. Native before/after
-  checksums match, with measured `ns/op` 95.7–99.9% lower than the pre-P8 planner across those lanes. →
-  [estimator.md §10](spec/design/estimator.md), [planner.md §5.4](spec/design/planner.md)
-- [x] **P9 — deterministic column statistics** — `ANALYZE table [(columns)]` now collects exact
-  NULL/width facts plus bounded deterministic NDV/MCV/equi-depth histograms in all three cores.
-  Facts are transactional, v29-persisted, retained-but-stale after DML, relation-scoped for prepared
-  cache validity, visible through `jed_statistics`, and consumed by literal/parameter predicates,
-  equality joins, GROUP BY/DISTINCT, and variable-width hash estimates. The 30,000-row FNV priority
-  sample, 4,096-entry KMV, fixed/proportional stale-NDV rule, actual collection cost, plan flips,
-  NoREC, byte goldens, and uniform/skew benchmark lanes are shared contracts. Pattern selectivity,
-  extended/multi-column correlation, configurable targets, MCV-aware join skew, and automatic
-  analyze remain explicit follow-ons. → [statistics.md](spec/design/statistics.md),
-  [estimator.md §11](spec/design/estimator.md)
+- [x] **Cost as a plan input (Path B)** — landed end-to-end: exact transactional row counts,
+  relation-scoped prepared-plan validity, complete candidate inventory, whole-plan estimates and
+  EXPLAIN columns, costed access/order pipelines, bounded deterministic N-way join search, and
+  transactional v29 `ANALYZE` statistics. The canonical contracts are
+  [estimator.md](spec/design/estimator.md), [statistics.md](spec/design/statistics.md),
+  [planner.md](spec/design/planner.md), and [explain.md](spec/design/explain.md).
+  - [ ] _follow-on:_ cost-based `UPDATE`/`DELETE` access policy, with mutation visitation/error order
+    decided and re-pinned explicitly.
+  - [ ] _follow-on:_ parameter-sensitive/custom prepared plans; planning remains pre-bind today.
+  - [ ] _follow-on:_ statistics quality — pattern selectivity, extended/multi-column correlation,
+    configurable targets, MCV-aware join skew, automatic analyze, and distribution facts for
+    composite/array/json/jsonb.
+  - [ ] _follow-on:_ broader physical search — costed outer/barrier shapes, bushy trees, parallel
+    plan search, or adaptive runtime re-planning; each requires a bounded deterministic contract.
 
 ### Planner infrastructure
 
-- [x] **Explicit optimizer-pass structure** — ✅ landed, all three cores: `planSelect` is now Stage 1
-  (resolve → the logical plan + the `computeRelMasks` touched-set annotation), a documented empty
-  Stage-2 rewrite seam, and Stage 3 — `optimizeSelect` (optimize.go / executor/optimize.rs /
-  optimize.ts) applying each optimization as a discrete rule owning its gate + action
-  (ruleScanBounds → ruleIndexNestedLoop → ruleOrderByPkScan → ruleOrderByIndexScan →
-  ruleJoinPkOrdered, fixed order), writing into the type-visible `SelectPlan.phys` sub-struct. A
-  pure restructure — plan choice, cost, and EXPLAIN unchanged (zero corpus re-pins).
-  → [planner.md](spec/design/planner.md)
 - [ ] **Predicate pushdown + simplification** — push WHERE conjuncts into derived tables / CTEs /
   through joins to the earliest relation, and detect contradictions (`x > 5 AND x < 3` → a provably
   empty scan). **Caveat:** plan-time **constant folding** / CSE removes `operator_eval` charges and so

@@ -65,6 +65,18 @@ TypeScript (+0.1%)** after versus before. The other lanes retained their access 
 single-run variation was non-gating. The shared plan/cost corpus is the selection proof, while these
 checksums establish unchanged results across the newly cost-selected paths.
 
+**Path-B final rerun (2026-07-13).** Fresh format-v29 jed datasets were generated from the committed
+benchmark definitions, and all 20 access, join, and statistics lanes were rerun directly on the
+native Go, Rust, and TypeScript harnesses. Every per-lane checksum agreed across the three cores.
+Representative final medians were `gin_contains` **257/218/426 µs**, `join_reverse_inl`
+**187/155/551 µs** versus its
+results-identical nested reference **830 ms/1.35 s/4.59 s**, and the 3/5/9-relation lanes
+**188/271/119 µs Go**, **95/208/78 µs Rust**, and **274/769/281 µs TypeScript**. The skew statistics
+pair retained checksum `52e015d7a68673bd` and improved after ANALYZE by **18.7× Go, 8.2× Rust, and
+5.7× TypeScript** in this rerun. These environment-relative timings do not replace the phase-local
+before/after records above; they verify that the final integrated branch retains their plan shapes,
+answers, and performance direction.
+
 ## 1. Purpose and non-goals
 
 The benchmark suite answers two questions, continuously:

@@ -405,10 +405,10 @@ When a section here moves from proposed/unratified to ratified, update **in the 
 - [../conformance/determinism_exceptions.toml](../conformance/determinism_exceptions.toml) only if
   a guarantee is actually relaxed, never merely because an implementation is independent.
 
-The §8 Path-B ratification completes those documentation/data edits in P0. Later implementation
-slices add estimator vectors, EXPLAIN columns, actual-cost pins, and NoREC relations before each
-new physical choice becomes authoritative. The proposed §7 parallelism work additionally needs the
-`order_sensitive` catalog field and a serial-vs-parallel sweep before it can be ratified.
+The §8 Path-B implementation includes the estimator vectors, EXPLAIN columns, actual-cost pins, and
+NoREC relations required before each physical choice becomes authoritative. The proposed §7
+parallelism work additionally needs the `order_sensitive` catalog field and a serial-vs-parallel
+sweep before it can be ratified.
 
 ---
 

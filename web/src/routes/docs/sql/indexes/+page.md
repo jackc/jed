@@ -84,10 +84,11 @@ ORDER BY id;`;
 
 An index speeds up a lookup **without changing the answer**. A query returns the same rows whether
 or not an index exists — the index only changes *which rows are scanned* (and the deterministic
-[cost](../select/) shown with each result). For a one-table `SELECT`, jed estimates the scheduled
-work of full, primary-key, and every applicable ordered B-tree path and picks the cheapest; an exact
-tie prefers PK, then the lower-named B-tree, then full scan. Every index stays up to date on each
-`INSERT`, `UPDATE`, and `DELETE` whether or not a particular query selects it.
+[cost](../select/) shown with each result). For a one-table `SELECT`, jed estimates the complete
+scheduled pipeline for full, primary-key, ordered B-tree, GIN, GiST, and interval-set paths and
+picks the cheapest; exact ties use a fixed access-kind order and then lowercased index name. Every
+index stays up to date on each `INSERT`, `UPDATE`, and `DELETE` whether or not a particular query
+selects it.
 
 ## Ordered indexes (the default)
 
@@ -96,9 +97,8 @@ equality lookups — `WHERE column = …` — by seeking instead of scanning the
 `PRIMARY KEY` is itself an index, and a `UNIQUE` constraint is backed by a unique index. The
 indexed column must be a key-encodable type (the integer widths, `boolean`, `uuid`, `timestamp`,
 `timestamptz`, `date`, `interval`, the variable-width `text`/`bytea`/`numeric`, and a **`range`**
-type — the first *container* key, which sorts by the same total order as `<`/`ORDER BY`); indexing a
-`float` column is `0A000` (a deliberate, permanent exclusion — a computed binary float could sort
-differently across implementations, so floats stay out of stored order). An `interval` key sorts by
+type — the first *container* key, which sorts by the same total order as `<`/`ORDER BY`), plus
+`f32`/`f64` through jed's byte-pinned total float order. An `interval` key sorts by
 its canonical span, so `INTERVAL '1 mon'` and `INTERVAL '30 days'` index as one value; likewise a
 discrete `range` is stored canonical, so `'[1,4]'::int4range` and `'[1,5)'::int4range` index as one.
 

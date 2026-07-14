@@ -1,14 +1,14 @@
 # Column statistics and `ANALYZE` — design
 
-> P9 of [estimator.md](estimator.md): deterministic, transactional, persisted column-distribution
-> facts collected through SQL and consumed by the cross-core physical-plan contract. Mechanical
+> Deterministic, transactional, persisted column-distribution facts collected through SQL and
+> consumed by the cross-core physical-plan contract in [estimator.md](estimator.md). Mechanical
 > limits live in [../cost/estimator.toml](../cost/estimator.toml); runtime collection cost lives in
 > [../cost/schedule.toml](../cost/schedule.toml); the v29 bytes live in
 > [../fileformat/format.md](../fileformat/format.md).
 
 ## 1. Surface and PostgreSQL relationship
 
-P9 implements one table per statement:
+The implemented surface accepts one table per statement:
 
 ```sql
 ANALYZE table_name
@@ -304,7 +304,7 @@ jed_statistics(
 One row exists per collected column, ordered internally by lowercased table name then column ordinal.
 It charges one `generated_row` at the source, no page/storage row units, is independently SELECT-
 gated as `jed_statistics`, and scopes through `main`/`temp`/attachments like the other catalog
-relations. Typed MCV/histogram arrays stay internal in P9.
+relations. Typed MCV/histogram arrays stay internal in the current surface.
 
 ## 9. Conformance obligations
 

@@ -3,15 +3,14 @@
 > The ratified Path-B contract for making cost a physical-plan input. The mechanical constants
 > and total tie orders are canonical data in [../cost/estimator.toml](../cost/estimator.toml); the
 > runtime unit weights remain canonical in [../cost/schedule.toml](../cost/schedule.toml). This
-> document specifies the algorithms every core will implement independently.
+> document specifies the algorithms every core implements independently.
 >
-> **Status: P0–P8 landed.** P1 supplies row counts, P2 cache validity, P3 complete candidate
-> inventory, P4 base estimates, and P5 whole-plan propagation + EXPLAIN columns. P6 selects
-> complete single-relation pipelines, P7 cost-selects two-relation orientation and algorithm, and
-> P8 implements §10's hard-fenced N-way search with Pareto-frontier DP through eight movable
-> relations and deterministic cheapest-next construction above the cap. P9 adds the retained,
-> transactional `ANALYZE` facts specified in [statistics.md](statistics.md): exact NULL/width facts,
-> bounded deterministic NDV/MCV/histograms, and statistics-aware base/join/distinct estimates.
+> **Status: implemented in all three native cores.** The landed contract includes exact row counts,
+> relation-scoped prepared-plan validity, complete candidate inventory, base and whole-plan
+> estimates, EXPLAIN columns, complete single-relation pipeline selection, hard-fenced N-way join
+> search with Pareto-frontier DP through eight movable relations and deterministic cheapest-next
+> construction above the cap, and the retained transactional `ANALYZE` facts specified in
+> [statistics.md](statistics.md).
 
 ## 1. Decision and scope
 
@@ -104,11 +103,11 @@ because intermediate ceiling and saturation are observable.
 - access-path and join-algorithm tie orders.
 
 `rake verify` runs `estimator_verify.rb` to reject missing/duplicate facts, unreduced or invalid
-fractions, changed approved defaults, incomplete tie orders, and incoherent P4 vectors. P4's
+fractions, changed approved defaults, incomplete tie orders, and incoherent estimator vectors. The
 generated constant tables and shared fixture matrix live at `spec/cost/estimator_vectors.toml`; the
-verifier validates its input, per-unit-count, row, cost, and tie-key fields. Codegen may copy mechanical facts into
-each core; it must never generate candidate enumeration, selectivity traversal, cost propagation,
-or join search.
+verifier validates its input, per-unit-count, row, cost, and tie-key fields. Codegen may copy
+mechanical facts into each core; it must never generate candidate enumeration, selectivity
+traversal, cost propagation, or join search.
 
 The initial selectivities are:
 
@@ -123,8 +122,8 @@ The initial selectivities are:
 | bare boolean expression | `1/2` | jed fallback |
 | unsupported/opaque predicate | `1/3` | jed conservative fallback |
 
-These are planner facts, not claims about real data. P9 replaces a default only under
-[statistics.md](statistics.md)'s exact applicability rules; fallback values remain stable.
+These are planner facts, not claims about real data. Collected statistics replace a default only
+under [statistics.md](statistics.md)'s exact applicability rules; fallback values remain stable.
 
 ## 5. Inputs and the no-planning-I/O rule
 
@@ -157,7 +156,7 @@ once in the working snapshot; rollback restores it. It need not be persisted bec
 database has a new cache identity. Conservatively advancing after any successful row mutation is
 valid; failing to advance after an input change is not.
 
-P2 implements database identity and estimator revision as opaque, non-persisted equality tokens,
+Database identity and estimator revision are opaque, non-persisted equality tokens,
 not counters or hashes. A snapshot clone shares the tokens; the first successful row mutation of a
 relation in a statement replaces that relation's working token exactly once. Commit publishes the
 replacement and rollback discards it. A fresh create/open/attachment receives a fresh database token,
@@ -235,9 +234,9 @@ WHERE against the base relation's `N`, independently of the physical candidate.*
 estimated from the candidate's access predicate. The executor still rechecks the complete WHERE for
 every fetched row, so `operator_eval` uses scan rows even though logical output cardinality does not
 apply the predicate a second time. In particular, a lossy/superset GIN or GiST bound does not square
-the same selectivity merely because it has a residual recheck: P9 does not collect access-method
-false-positive statistics, and inventing a second reduction would make one logical predicate's output
-cardinality depend on its physical path. This rule was the P4 human decision checkpoint.
+the same selectivity merely because it has a residual recheck: current statistics do not collect
+access-method false-positive statistics, and inventing a second reduction would make one logical
+predicate's output cardinality depend on its physical path. This separation is deliberate.
 
 The initial access-method classifications are canonical data in `estimator.toml`: scalar GiST `=`
 uses `equality`; range GiST and every GIN strategy use `matching`. Ordered/PK bounds derive their
@@ -253,12 +252,12 @@ the same deterministic contradiction and paired-range inventory the access detec
   left to right with `scale_ceil`.
 - **OR:** estimate every disjunct against the original `N`, add the parts in source order with
   saturation, and cap at `N`. This disjoint-union upper estimate deliberately has no overlap model.
-  P9 refines individual disjuncts but retains this upper fold.
+  Column statistics refine individual disjuncts but retain this upper fold.
   `N = 0` yields zero.
 - **NOT:** `N - estimate(predicate, N)`.
 
 The formulas approximate SQL 3VL when NULL-distribution facts are absent; they never change SQL
-evaluation. P9's exact NULL fraction makes supported column complements subtract from non-NULL rows
+evaluation. An exact NULL fraction makes supported column complements subtract from non-NULL rows
 under statistics.md §6. Syntactically equivalent but
 differently associated predicates may estimate differently because source-order ceiling is part of
 the plan contract; the chosen plan still returns identical rows.
@@ -273,7 +272,7 @@ the plan contract; the chosen plan still returns identical rows.
   database/attachment snapshot; they require no storage leaf reads.
 - Derived table / scalar subquery / CTE body: its recursively estimated output.
 - Materialized CTE reference: the body's rows; its scan work is counted separately (§8).
-- A recursive CTE's self-reference estimates zero rows/work at that recursive edge in initial P5;
+- A recursive CTE's self-reference estimates zero rows/work at that recursive edge;
   the visible seed/nonrecursive body still estimates normally. Iteration cardinality needs a later
   recursive-growth model rather than an implementation-dependent planning loop.
 - CROSS JOIN: `sat_mul(left_rows, right_rows)`.
@@ -340,9 +339,10 @@ The following rules cover additional units:
 - `aggregate_accumulate` is `input_rows × aggregate_count`;
 - `cte_scan_row` is materialized rows per reference;
 - `generated_row` is the SRF cardinality;
-- `window_result` is output rows per window function. Initial P5 has no partition-size/distribution
-  statistic for `window_frame_step`, so that size-dependent extra is zero;
-- `constraint_check` and `value_compress` are zero in initial SELECT selection.
+- `window_result` is output rows per window function. The current model has no
+  partition-size/distribution statistic for `window_frame_step`, so that size-dependent extra is
+  zero;
+- `constraint_check` and `value_compress` are zero in current SELECT selection.
 
 Join candidates count their different repetition shapes explicitly:
 
@@ -360,8 +360,9 @@ post-WHERE rows before the window, and let `L` be the rows in the physical left 
 to the final join step. When `T > 0` and `J > T`, the estimated number of left rows whose final join
 runs are started is `min(L, ceil(T * L / J))`; `J = 0` conservatively starts all `L`, and `T = 0`
 starts none. The multiply/divide uses quotient/remainder saturation, never float arithmetic. This
-is the initial row-count-only uniform-fanout model; P9 leaves it unchanged because per-join fanout
-correlation is not a collected fact. It discounts only final-step work the executor actually skips: nested-loop
+is the current row-count-only uniform-fanout model; column statistics leave it unchanged because
+per-join fanout correlation is not a collected fact. It discounts only final-step work the executor
+actually skips: nested-loop
 candidate/ON visits, hash probes and bucket verification, or repeated INL inner scans. The selected
 left subtree and ordinary base scans remain complete, as does a final hash build. In the
 two-relation case `L` is the selected driver relation.
@@ -383,7 +384,7 @@ LIMIT/ordered-stream short-circuit is a physical-plan property: eligible single-
 backward-safe window top-N plans reduce their child scan to the rows/pages expected to be pulled,
 not an eagerly estimated full input sliced only at the Limit node. An unbounded secondary-index
 order prices the expected index prefix plus table point fetches. Bound index/GiST/GIN paths retain
-their conservative structural descent and reduce admitted table fetches. P8's join-PK-ordered
+their conservative structural descent and reduce admitted table fetches. A join-PK-ordered
 stream applies §8.2's deterministic final-step prefix model while retaining its complete left
 subtree, base materialization, and hash-build work. Consequently estimates are computed over a
 complete candidate pipeline rather than by blindly adding immutable logical-node estimates.
@@ -413,8 +414,8 @@ The following attribution rules close the remaining current-plan shapes:
 
 ### 8.4 DML estimates
 
-P5 covers every node in the DML shapes plain EXPLAIN currently renders, while P0's legacy DML
-access-path policy remains authoritative:
+The estimator covers every node in the DML shapes plain EXPLAIN currently renders, while the fixed
+DML access-path policy remains authoritative:
 
 - `INSERT ... VALUES` starts with the exact authored candidate count; `INSERT ... SELECT` owns its
   rendered source-query estimate;
@@ -454,22 +455,20 @@ join:   index nested loop < hash < nested loop
 A future access method or join algorithm is ineligible for cost selection until this data and the
 candidate's final field order are extended, verified, and implemented in all cores.
 
-### 9.1 P6 single-relation selector
+### 9.1 Single-relation selector
 
-P6 enables cost choice only for a SELECT plan containing exactly one base relation and no join.
+The single-relation rule applies to a SELECT plan containing exactly one base relation and no join.
 The rule applies recursively to a qualifying single-relation subquery, but not to SRF, CTE, or
 derived-table relation nodes, which have no base-store candidate inventory. A multi-relation SELECT
-retains its complete legacy per-relation choices until P7 can price access paths together with join
+feeds the same candidate inventories into §9.2/§10 so access paths are priced together with join
 orientation and algorithm; independently replacing one join input from a base-only estimate would
 not minimize the whole join plan.
 
-P6a first staged the rule over PK, ordered B-tree, and full-scan candidates while a legacy
-GiST/GIN/interval winner remained authoritative. P6b removes that staging boundary. Its candidate
-set contains every legal P3 access path: PK, every ordered B-tree bound, every GiST bound, every GIN
-bound, PK interval set, every ordered-index interval set, and full scan.
+The candidate set contains every legal access path: PK, every ordered B-tree bound, every GiST
+bound, every GIN bound, PK interval set, every ordered-index interval set, and full scan.
 
-P6b compares **complete single-relation physical pipelines**, not isolated base scans. Each access
-candidate is composed with the ordering property it naturally provides:
+The selector compares **complete single-relation physical pipelines**, not isolated base scans.
+Each access candidate is composed with the ordering property it naturally provides:
 
 - a table-storage-order path uses an eligible PK `ORDER BY` direction;
 - a B-tree bound or ordered-index interval set uses an eligible exact same-index `ORDER BY`; and
@@ -487,26 +486,26 @@ For every pipeline, the estimator applies the selected access work, residual, pr
 nodes at their real stages, then applies any ordering/streaming `OFFSET + LIMIT` prefix. This makes a
 plain `LIMIT` as well as an `ORDER BY ... LIMIT` capable of changing the winner when it changes
 scheduled page, row, access-method, or expression work. A blocking sort comparison still adds zero:
-P6b does not price unmetered sorting. The winner is the lowest cumulative `est_cost` after those
-effects, followed by §9's access-kind/name tie order. A natural-order form is canonical for its
+the estimator does not price unmetered sorting. The winner is the lowest cumulative `est_cost`
+after those effects, followed by §9's access-kind/name tie order. A natural-order form is canonical for its
 access identity, so an otherwise-identical blocking-sort duplicate is not inventoried.
 
 The resulting rule is deterministic:
 
-1. build and estimate the complete P3 inventory;
+1. build and estimate the complete access-path inventory;
 2. compose each access path with its one canonical natural-order property;
 3. add any missing eligible order-only B-tree identities;
 4. estimate every complete pipeline through its final LIMIT/OFFSET; and
 5. choose minimum cumulative cost, retaining the first candidate on an exact cost tie because the
    candidate list is already in §9 order.
 
-UPDATE and DELETE continue to call the mutation legacy policy from §1/§8.4.
+UPDATE and DELETE continue to call the fixed mutation policy from §1/§8.4.
 
-### 9.2 P7 two-relation selector
+### 9.2 Two-relation selector
 
-P7 applies when a SELECT has exactly two non-lateral base relations joined by one INNER or CROSS
-edge. An SRF, CTE, derived table, outer join, or correlated/dependency-bearing input is a barrier and
-keeps the complete pre-P7 FROM-order policy. Attachments remain eligible base relations, but their
+This rule applies when a SELECT has exactly two non-lateral base relations joined by one INNER or
+CROSS edge. An SRF, CTE, derived table, outer join, or correlated/dependency-bearing input is a barrier and
+keeps the complete fixed FROM-order policy. Attachments remain eligible base relations, but their
 existing access-path inventory may contain only the full path.
 
 The physical plan stores `relation_order = [outer_source_ordinal, inner_source_ordinal]`; resolved
@@ -523,10 +522,10 @@ For each of the two source-ordinal orientations, inventory in §9 order:
    gate accepts it; and
 5. every legal INL inner access whose bare sibling source belongs to the chosen physical outer.
 
-P7 does not derive a hash key from WHERE and therefore does not turn `CROSS JOIN ... WHERE a=b`
-into a hash join. That is a separate logical-predicate rewrite. For hash, the physical inner is the
-build input and the physical outer is the probe input; the selected key records those roles
-explicitly. For INL, constants on the same key may tighten the bound, but a sibling column is legal
+The selector does not derive a hash key from WHERE and therefore does not turn
+`CROSS JOIN ... WHERE a=b` into a hash join. That is a separate logical-predicate rewrite. For hash,
+the physical inner is the build input and the physical outer is the probe input; the selected key
+records those roles explicitly. For INL, constants on the same key may tighten the bound, but a sibling column is legal
 only when its owning relation is already on the physical left. Every full WHERE and ON expression
 remains residual and authoritative.
 
@@ -540,15 +539,15 @@ Candidates are structurally sorted before estimation by physical relation sequen
 inner access, and join-algorithm rank. The minimum complete-pipeline cost wins; retaining the first
 candidate on an exact cost tie therefore implements §9 without map iteration. The selected plan's
 physical visit order also defines deterministic error visitation and cost-ceiling abort order.
-P7 deliberately does not preserve FROM-order precedence between multiple possible runtime errors;
-portable error corpus cases use a single offending evaluation unless a selected plan is itself the
-behavior under test.
+The costed selector deliberately does not preserve FROM-order precedence between multiple possible
+runtime errors; portable error corpus cases use a single offending evaluation unless a selected plan
+is itself the behavior under test.
 
 ## 10. Join search and its deterministic bound
 
 Only left-deep orders are in Path B. INNER/CROSS relations form reorderable islands; outer joins,
-LATERAL, correlation, and other dependency-bearing nodes are barriers. P7 introduces two-relation
-orientation; P8 generalizes the island search.
+LATERAL, correlation, and other dependency-bearing nodes are barriers. The two-relation orientation
+rule is the smallest instance of the N-way island search.
 
 ### 10.1 Islands and predicate ownership
 
@@ -570,7 +569,7 @@ Within an island, evaluate that complete tree at the earliest physical join step
 contains the dependency set. If several trees become ready at one step, evaluate them by authored
 join ordinal. Never split an `AND` tree merely to schedule or estimate it earlier: splitting would
 change eager evaluation, errors, and `operator_eval` cost. A barrier step evaluates its own `ON` in
-the authored position. The selected physical order defines deterministic error visitation, as in P7.
+the authored position. The selected physical order defines deterministic error visitation.
 
 An INL bound for the newly appended relation may use a sibling column from any relation already in
 the physical left prefix. A hash alternative may use equality keys from any newly-ready `ON` tree
@@ -644,13 +643,14 @@ tree. The initial N-way ordered-LIMIT executor fully materializes the selected l
 streams only the final join step. Therefore the estimator retains every earlier scan/join unit and
 applies §8.2's uniform prefix formula only to the final step's outer-prefix visits, hash probes and
 bucket verification, or repeated INL inner work. Ordinary base scans and a final hash build remain
-complete. This is the direct N-way extension of P7 and deliberately does not claim a fully streaming
-recursive join tree; such an executor would require a broader per-level discount model.
+complete. This is the direct N-way extension of the two-relation selector and deliberately does not
+claim a fully streaming recursive join tree; such an executor would require a broader per-level
+discount model.
 
 Join-PK order is ineligible across a semantic fence. Without an eligible ordered LIMIT, the complete
 tree retains the blocking Sort; its unmetered bookkeeping still adds no private planner weight.
 
-## 11. P9 column-statistics refinement
+## 11. Column-statistics refinement
 
 [statistics.md](statistics.md) owns collection, persistence, staleness, type eligibility, and the
 complete formulas. The estimator-facing summary is:
@@ -693,26 +693,27 @@ Plain EXPLAIN is jed-owned and not PostgreSQL-oracle imported. Its estimate rows
 `nosort` in the shared corpus, making arithmetic, candidate choice, and tie breaks one cross-core
 contract.
 
-## 13. Conformance and slice gates
+## 13. Conformance coverage
 
-- **P0:** data coherence only (`rake verify`); no engine behavior changes.
-- **P1/P2:** byte goldens, transactional statistics, reopen, and cache fresh-vs-hit parity.
-- **P3/P4:** shared candidate/estimator vectors; legacy selector keeps all corpus outputs unchanged.
-- **P5:** EXPLAIN estimate columns become the differential assertion surface.
-- **P6–P8:** each enabled choice carries EXPLAIN cases, actual `# cost:` re-pins, a new NoREC
-  relation, and affected benchmarks.
-- **P9:** ANALYZE SQL/cost corpus, v29 cross-core/Ruby goldens, collection arithmetic vectors,
-  retained-stale/cache/rollback coverage, EXPLAIN flips, NoREC, and skew/uniform benchmarks.
+- `rake verify` checks shared estimator facts, exact arithmetic vectors, and complete tie orders.
+- Byte goldens, transactional row-count/statistics tests, reopen tests, and cache fresh-vs-hit parity
+  cover persisted and snapshot inputs.
+- Shared access-candidate and estimator vectors pin every base access method.
+- EXPLAIN rows and `# cost:` assertions pin the selected physical tree, estimates, and actual
+  runtime consequence.
+- Each enabled physical choice carries a NoREC relation and affected benchmark lane.
+- ANALYZE coverage includes SQL/cost corpus cases, v29 cross-core/Ruby goldens, collection
+  arithmetic, retained-stale/cache/rollback behavior, plan flips, NoREC, and skew/uniform lanes.
 
 PostgreSQL remains the result oracle, not the plan/estimate oracle. The borrowed default
 selectivities are recorded data, not a promise to reproduce PostgreSQL plans.
 
 ## 14. Deliberate boundaries and deferred work
 
-- No parameter-sensitive/custom plans in initial Path B.
+- No parameter-sensitive/custom plans in the current planner.
 - No cost-based DML access policy until a mutation-specific slice.
 - No extended/multi-column statistics, automatic analyze, configurable targets, MCV-aware join
-  skew, or distribution facts for composite/array/json/jsonb in P9.
+  skew, or distribution facts for composite/array/json/jsonb.
 - No planner-only wall-clock cost model.
 - No bushy join trees, GEQO/random search, parallel-plan search, or adaptive runtime re-planning.
 - No planning-time leaf reads or statistics sampling.

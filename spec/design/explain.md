@@ -1,8 +1,8 @@
 # EXPLAIN — design
 
 > `EXPLAIN [ANALYZE] <statement>` renders the planner's chosen plan as a deterministic result
-> set instead of running the statement. This is the observability substrate the cost-based
-> planner work builds on: it makes the planner's access-path / join / sort-elision decisions
+> set instead of running the statement. This is the observability surface for the cost-based
+> planner: it makes the planner's access-path / join / sort-elision decisions
 > inspectable and, crucially, **assertable in the shared conformance corpus** — one entry
 > verifies all three cores render a byte-identical plan. This doc is the contract all three
 > cores implement in lockstep (CLAUDE.md §2); the grammar is in
@@ -51,9 +51,9 @@ The estimate columns are non-NULL shortest-decimal integers in `0..i64::MAX`. Th
 estimates, not safety limits and not a promise to equal execution. Their exact arithmetic and
 per-node attribution are specified in [estimator.md §8.3/§11](estimator.md). There is no unavailable
 sentinel: deterministic fallback rules produce an estimate for every currently renderable node.
-For a one-base-relation SELECT, P6 uses complete-pipeline `est_cost` to choose among every access
+For a one-base-relation SELECT, complete-pipeline `est_cost` chooses among every access
 method and eligible order-only B-tree walk; `query/cost_plan_access*.test` asserts row-count and
-selectivity flips, cross-method/name ties, scan-order composition, actual cost, and the legacy
+selectivity flips, cross-method/name ties, scan-order composition, actual cost, and the staged
 mutation boundary.
 
 Two properties of the conformance harness ([../conformance/README.md](../conformance/README.md);
@@ -131,8 +131,9 @@ Emitted outermost-first, each the pre-order parent of the next, so the tree read
 pipeline reads bottom-up: **Limit → Sort → Distinct → Window → Aggregate → Filter → FROM tree**. A
 node is emitted only when present. The FROM tree is a left-deep chain of join nodes over the plan's
 physical relation order (the outermost node is the last join; its right child is the physical inner
-relation), bottoming out at relation leaves. P8 may therefore render any relation from a searched
-INNER/CROSS island as the driver or a later inner leaf. Hard-fenced outer/dependency relations stay
+relation), bottoming out at relation leaves. EXPLAIN may therefore render any relation from a
+searched INNER/CROSS island as the driver or a later inner leaf. Hard-fenced outer/dependency
+relations stay
 in their authored position, and independently searched islands may follow them. Resolved logical
 slots remain in source order; EXPLAIN shows execution order.
 
@@ -162,7 +163,7 @@ Attributes are `; `-separated; a node with none renders `-`.
   above.
 - **Aggregate**: `groups=G aggs=A` (+ `sets=S` when more than one grouping set; + `having:conjuncts=K`).
 - **Window**: `funcs=N`. **Nested Loop**: `<kind>` (`inner`/`cross`/`left`/`right`/`full`) +
-  `on:conjuncts=N`; when several authored ON trees first become ready at the same P8 step, the
+  `on:conjuncts=N`; when several authored ON trees first become ready at the same physical step, the
   suffix is `on:predicates=P,conjuncts=N`. **Hash Join** inserts `keys=K` before the same ON suffix
   (`kind` is `inner`, or `left` on the established two-input path).
 - **Limit**: `limit=N` / `offset=M` (an absent side omitted). **Values**: `rows=N`.
@@ -176,10 +177,10 @@ The plan structs are already cross-core identical (they drive the `# cost:` cont
 rendering is deterministic **by construction provided every emitted token is deterministic**. The
 surfaces and how each is pinned:
 
-- **Index names** — always the stored lowercased name; estimated cost chooses across P6's complete
+- **Index names** — always the stored lowercased name; estimated cost chooses across the complete
   single-relation set and deterministic lowest-name order breaks an exact same-kind cost tie
   (indexes.md §5).
-- **Iteration order** — relation leaves iterate P8's selected physical-order slice inside each
+- **Iteration order** — relation leaves iterate the selected physical-order slice inside each
   island and authored order at every hard fence; retained DP states, joins, aggregates, and CTE
   bindings iterate their specified structural order, never a map.
 - **Literal rendering** — integer / boolean / decimal / text / date / timestamp / uuid render

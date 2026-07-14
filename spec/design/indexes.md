@@ -236,10 +236,12 @@ second bound kind. Candidate detection remains the following complete structural
    residual).
 3. The full scan.
 
-For a one-base-relation SELECT, P6a chooses the minimum estimated cost among the PK candidate, every
-ordered B-tree candidate, and full scan; exact ties use kind then lowest lowercased index name
-([estimator.md §9.1](estimator.md)). A multi-relation SELECT and UPDATE/DELETE retain the fixed
-consumer policies in [planner.md §5.1](planner.md) until P7 and the mutation-specific slice.
+For a one-base-relation SELECT, the planner chooses the minimum complete-pipeline estimated cost
+among the PK candidate, every eligible B-tree/GiST/GIN/interval candidate, and full scan; exact ties
+use kind then lowest lowercased index name ([estimator.md §9.1](estimator.md)). Eligible
+multi-relation SELECTs feed the same access inventories into the bounded join search. UPDATE/DELETE
+retain the fixed consumer policies in [planner.md §5.1](planner.md) until their mutation-specific
+slice.
 
 #### 5.1 The access predicate — equality prefix + optional trailing range
 

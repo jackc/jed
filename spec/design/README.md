@@ -67,14 +67,15 @@ Each doc explains *why* a decision was made and points at the **data** that enco
   surface — the same shape across cores (CLAUDE.md §1/§2).
 - [planner.md](planner.md) — the deterministic logical/rewrite/physical planner stages,
   current rule inventory, access-path policies, and optimizer extension points.
-- [estimator.md](estimator.md) — the ratified Path-B plan-time cardinality/cost contract:
-  exact arithmetic, canonical inputs and defaults, candidate ordering, and bounded join search.
+- [estimator.md](estimator.md) — the implemented Path-B plan-time cardinality/cost contract:
+  exact arithmetic, canonical inputs and defaults, complete candidate ordering, bounded join
+  search, and statistics-aware estimates.
 - [statistics.md](statistics.md) — deterministic transactional `ANALYZE`, bounded NDV/MCV/histogram
   collection, retained staleness, v29 persistence, estimator use, and `jed_statistics`.
 - [explain.md](explain.md) — deterministic, corpus-assertable rendering of the selected physical
-  plan, actual ANALYZE cost, and the scheduled estimate-column extension.
+  plan, its `est_rows`/`est_cost`, and actual ANALYZE cost.
 - [cost.md](cost.md) — the deterministic cost-accounting seam: the unit schedule as data,
-  the cross-core accrual rules, the counter representation, and the deferred ceiling/abort
+  the cross-core accrual rules, the counter representation, and the landed ceiling/abort
   (CLAUDE.md §13).
 - [cores.md](cores.md) — what counts as a core vs. a wrapper, when to add the next core,
   and which languages add new divergence (the selection rule behind CLAUDE.md §2).

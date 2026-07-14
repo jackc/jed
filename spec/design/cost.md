@@ -81,14 +81,12 @@ uniform `operator_eval` (§3).
 These rules are the contract. They must be implemented **identically** in Rust, Go, and
 TS; any deviation diverges the count and fails the corpus.
 
-P6a now lets the estimator select among full, PK, and ordered B-tree candidates for a SELECT with
-one base relation. The accrual rules below are unchanged: they describe the actual work of whichever
-path wins. P6b extends that rule to GiST, GIN, both interval families, and secondary-index
-ORDER-BY/top-N alternatives by comparing the complete scheduled single-relation pipeline. A plain
-LIMIT can therefore change the access winner when early-out changes metered work; unmetered sorting
-still contributes no private planner weight. P7/P8 select eligible multi-relation SELECT pipelines;
-hard-fenced inputs and UPDATE/DELETE retain their staged policies
-([estimator.md §9.1](estimator.md)).
+The estimator selects among full, PK, ordered B-tree, GiST, GIN, both interval families, and
+secondary-index ORDER-BY/top-N alternatives by comparing the complete scheduled single-relation
+pipeline. A plain LIMIT can therefore change the access winner when early-out changes metered work;
+unmetered sorting still contributes no private planner weight. Bounded join search selects eligible
+multi-relation SELECT pipelines; hard-fenced inputs and UPDATE/DELETE retain their staged policies
+([estimator.md §9–§10](estimator.md)).
 
 - **`storage_row_read`** is charged once per row pulled from a store, at the top of the
   executor scan loop, **before** the filter runs — in `SELECT`, `DELETE`, and `UPDATE`.
@@ -714,11 +712,11 @@ constant path): the inner is re-materialized per outer row, so a LEFT join's NUL
 per outer row by whether *its* bounded scan (re-checked against the full `ON`) yields a match — an
 empty bound NULL-extends that outer row, exactly as a full scan with no match would. **Gated to the
 RIGHT/nullable side of an INNER/CROSS/LEFT join**: a RIGHT/FULL **preserved** side must emit rows that
-match *no* outer row, so it cannot be bounded per outer row (it keeps the full scan). For tiny inners
-(a single leaf) the per-outer seeks can cost a few `page_read` *more* than one full scan — the rule is
-applied structurally (no cost-based choice yet), and the cost honestly reflects the re-scan; the win
-is asymptotic, on large inners. Gated by `query.index_nested_loop`, pinned cross-core in
-`spec/conformance/suites/joins/index_nested_loop.test` (and it re-pins the affected
+match *no* outer row, so it cannot be bounded per outer row (it keeps the full scan). For eligible
+cost-searched INNER/CROSS islands, INL competes against ordinary and hash alternatives, so a tiny
+inner can retain its cheaper ordinary scan. Hard-fenced LEFT shapes retain the staged structural INL
+policy, and actual cost honestly reflects that re-scan. Gated by `query.index_nested_loop` and
+pinned cross-core in `spec/conformance/suites/joins/index_nested_loop.test` (and it re-pins the affected
 `joins/pushdown.test` / `self_join.test` / `comma.test` / `qualified*.test` cross-relation cases).
 EXPLAIN surfaces the access path as `Index-nested-loop PK bound` / `Index-nested-loop Index bound`.
 
@@ -1084,7 +1082,7 @@ a candidate, and the executor never iterates the map to emit rows. WHERE, ORDER 
 projection, and `row_produced` remain downstream and unchanged. The table is deliberately in-memory;
 grace-hash spill is the remaining storage slice ([spill.md](spill.md) §7).
 
-**ORDER BY satisfied by the DRIVER relation's PK scan order — the join top-N.** P8's selected
+**ORDER BY satisfied by the DRIVER relation's PK scan order — the join top-N.** The selected
 fence-free INNER/CROSS tree preserves its physical **driver** relation's primary-key order through
 every left-deep nested-loop, INL, or probe-left hash step. If `ORDER BY` is a prefix of that driver
 PK and the query has a `LIMIT`, no sort is needed. The initial N-way executor fully materializes and
