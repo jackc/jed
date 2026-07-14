@@ -1372,7 +1372,7 @@ fn serialize_node(
     let index = *next_index;
     *next_index += 1;
 
-    let n = node.keys.len() as u32;
+    let n = node.len() as u32;
     // Encode records, spilling over-large values to overflow pages allocated after this node's index
     // (post-order traversal + record-then-column order → deterministic, golden-pinnable). A LEAF is
     // column-major (PAX v23 — encode_leaf_pax); an INTERIOR node stays row-major.
@@ -1394,9 +1394,10 @@ fn serialize_node(
             store.resolve_all(row)?;
         }
         let rows: Vec<&[Value]> = leaf_rows.iter().map(Vec::as_slice).collect();
+        let keys: Vec<&[u8]> = (0..node.len()).map(|i| node.key_at(i)).collect();
         (
             PAGE_LEAF,
-            encode_leaf_pax(col_types, &node.keys, &rows, cap, &mut take, &mut ovf),
+            encode_leaf_pax(col_types, &keys, &rows, cap, &mut take, &mut ovf),
         )
     } else {
         (PAGE_INTERIOR, encode_interior(&node.keys, &child_pages))
@@ -2052,7 +2053,7 @@ fn collect_leaf_overflow(
             // chain matters here, never an inline-deferred body), so the form-(a) `Arc` wrap (L3)
             // is dropped per leaf — it exists only to satisfy the lazy decoder's signature. Only
             // variable-width (spillable) columns can own a chain; fixed-width regions are skipped.
-            let shared: Arc<[u8]> = Arc::from(block.as_slice());
+            let shared = Arc::new(block.to_vec());
             let payload = &shared[PAGE_HEADER..];
             let dirs = parse_pax_leaf(payload, n, col_types)?;
             for (c, ty) in col_types.iter().enumerate() {
@@ -2494,9 +2495,9 @@ fn encode_disposed_value(
 /// region: a flags byte (0), then — fixed-width — the null bitmap + `N × width` dense untagged
 /// slots (a NULL slot zero-filled), or — variable-width — an `N`-entry end-offset value directory
 /// + the tagged value bodies (NULL = a zero-length span).
-fn encode_leaf_pax(
+fn encode_leaf_pax<K: AsRef<[u8]>>(
     col_types: &[ColType],
-    keys: &[Vec<u8>],
+    keys: &[K],
     rows: &[&[Value]],
     cap: usize,
     take: &mut dyn FnMut() -> u32,
@@ -2510,7 +2511,7 @@ fn encode_leaf_pax(
     let mut val_bytes: Vec<Vec<Vec<u8>>> = (0..k).map(|_| Vec::with_capacity(n)).collect();
     let mut nulls: Vec<Vec<bool>> = (0..k).map(|_| vec![false; n]).collect();
     for (i, &row) in rows.iter().enumerate() {
-        let plan = plan_dispositions(col_types, &keys[i], row, cap);
+        let plan = plan_dispositions(col_types, keys[i].as_ref(), row, cap);
         for (c, (ty, val)) in col_types.iter().zip(row.iter()).enumerate() {
             let is_null = matches!(val, Value::Null);
             nulls[c][i] = is_null;
@@ -2527,11 +2528,11 @@ fn encode_leaf_pax(
     // key directory (N end offsets) + key blob.
     let mut off = 0u32;
     for key in keys {
-        off += key.len() as u32;
+        off += key.as_ref().len() as u32;
         out.extend_from_slice(&off.to_be_bytes());
     }
     for key in keys {
-        out.extend_from_slice(key);
+        out.extend_from_slice(key.as_ref());
     }
     // column directory: absolute payload offset of each region.
     let base_after_col_dir = out.len() + 4 * (k + 1);
@@ -3401,7 +3402,7 @@ impl PaxDirs {
 /// directory `u32` arrays, and a shared `Arc` to the table's column types.
 pub(crate) struct PackedLeaf {
     /// The whole page image (one `page_size` buffer). Shared across every reconstructed inline value.
-    block: Arc<[u8]>,
+    block: Arc<Vec<u8>>,
     /// Offset of the payload within `block` — always `PAGE_HEADER` (the value directories index the
     /// payload; the shared block is needed whole so `Unfetched::Inline` offsets are block-relative).
     payload_off: usize,
@@ -3419,6 +3420,28 @@ pub(crate) struct PackedLeaf {
 }
 
 impl PackedLeaf {
+    pub(crate) fn len(&self) -> usize {
+        self.n
+    }
+
+    /// Borrow key `i` directly from the retained page block. Directory bounds were validated when
+    /// the leaf faulted, so this accessor is infallible for a resident Packed leaf.
+    pub(crate) fn key(&self, i: usize) -> &[u8] {
+        let payload = &self.block[self.payload_off..];
+        self.dirs
+            .key(payload, i)
+            .expect("validated PAX leaf key directory")
+    }
+
+    /// The exact serialized record size, derived only when size-driven mutation/rebalance needs it.
+    pub(crate) fn record_weight(&self, i: usize) -> u32 {
+        let mut size = self.key(i).len();
+        for c in 0..self.col_types.len() {
+            size += self.dirs.value_len(c, i);
+        }
+        size as u32
+    }
+
     /// Reconstruct value `(record i, column c)` — the O(1) PAX column span decoded by the **same**
     /// [`read_value_lazy`] the eager fault ran (packed-leaf.md §4). A spillable body becomes an
     /// `Unfetched::Inline` block-slice (zero-copy, pinned by `block`); a fixed-width scalar decodes
@@ -3455,7 +3478,7 @@ impl PackedLeaf {
 
     /// The shared page block — the buffer-pool pin (§7). Exposed for the fault-path invariant tests.
     #[cfg(test)]
-    pub(crate) fn block(&self) -> &Arc<[u8]> {
+    pub(crate) fn block(&self) -> &Arc<Vec<u8>> {
         &self.block
     }
 }
@@ -3546,17 +3569,16 @@ fn parse_pax_leaf(payload: &[u8], n: usize, col_types: &[ColType]) -> Result<Pax
 /// chain read, no decompression — resolved later only for the columns a query touches. Each
 /// weight is the bytes the record occupies on the page (exactly the writer's `record_size`).
 pub(crate) fn decode_leaf_node(
-    block: &[u8],
+    block: Vec<u8>,
     page: u32,
     col_types: Arc<Vec<ColType>>,
     paging: std::sync::Weak<SharedPaging>,
 ) -> Result<Node> {
-    let parsed = parse_page(block)?;
+    let parsed = parse_page(&block)?;
     if parsed.page_type != PAGE_LEAF {
         return Err(corrupt("demand-paged a non-leaf page"));
     }
     let n = parsed.item_count as usize;
-    let k = col_types.len();
     // Packed form (packed-leaf.md §5): retain the page block + the PAX directories, decode **no**
     // values. `parse_pax_leaf` validates + parses the directories in one pass with no value decode,
     // so a malformed *directory* still surfaces `data_corrupted` here; a malformed value *body*
@@ -3564,20 +3586,9 @@ pub(crate) fn decode_leaf_node(
     // directories alone (§3) — the weight is `key_len + Σ_c value_len(c, i)` (the v24 record_size),
     // exactly what the writer split on — so the resident leaf is `≈ page_size` (§9), never an
     // inflated row vector.
-    let shared: Arc<[u8]> = Arc::from(block);
+    let shared = Arc::new(block);
     let payload = &shared[PAGE_HEADER..];
     let dirs = parse_pax_leaf(payload, n, col_types.as_slice())?;
-    let mut keys = Vec::with_capacity(n);
-    let mut weights = Vec::with_capacity(n);
-    for i in 0..n {
-        let key = dirs.key(payload, i)?.to_vec();
-        let mut w = key.len();
-        for c in 0..k {
-            w += dirs.value_len(c, i);
-        }
-        weights.push(w as u32);
-        keys.push(key);
-    }
     let packed = PackedLeaf {
         block: Arc::clone(&shared),
         payload_off: PAGE_HEADER,
@@ -3586,7 +3597,7 @@ pub(crate) fn decode_leaf_node(
         paging,
         n,
     };
-    Ok(Node::leaf_loaded_packed(keys, weights, packed, page))
+    Ok(Node::leaf_loaded_packed(packed, page))
 }
 
 /// Decode one catalog table entry: the `Table` (its pk list, checks, and index definitions
@@ -4627,7 +4638,7 @@ fn read_overflow_chain(
 /// the rest when a dirty leaf re-encodes (`resolve_for_encode`).
 fn read_value_lazy(
     tyref: &crate::value::TypeRef,
-    block: &Arc<[u8]>,
+    block: &Arc<Vec<u8>>,
     buf: &[u8],
     pos: &mut usize,
     paging: &std::sync::Weak<SharedPaging>,
@@ -5482,7 +5493,7 @@ mod tests {
 
     // --- L3: zero-copy block-shared deferral (spec/design/lazy-record.md §5a/§12) ---
 
-    /// A faulted leaf holds its page block **once** as a shared `Arc<[u8]>`; every deferred inline
+    /// A faulted leaf holds its page block **once** as a shared `Arc<Vec<u8>>`; every deferred inline
     /// value in the leaf references that one block by `(off, len)` — **form (a)** — rather than
     /// owning a private copy of its body (form (b), L2). This is the resident-memory dividend (§9):
     /// resident leaf bytes track `≈ page_size`, not the sum of the decoded values. The property is
@@ -5539,13 +5550,25 @@ mod tests {
         // demand by `row_at`. Reconstruction produces the same Unfetched::Inline block-slices the
         // eager fault used to, so the form-(a) sharing property still holds.
         let node = decode_leaf_node(
-            &block,
+            block,
             2,
             Arc::new(col_types.clone()),
             std::sync::Weak::new(),
         )
         .expect("decode leaf");
         assert!(node.packed.is_some(), "a faulted leaf is Packed");
+        assert!(
+            node.keys.is_empty() && node.weights.is_empty(),
+            "a Packed leaf keeps no per-record key or weight objects"
+        );
+        assert_eq!(node.len(), keys.len());
+        for i in 0..keys.len() {
+            assert_eq!(node.key_at(i), keys[i]);
+            assert_eq!(
+                node.packed.as_ref().unwrap().record_weight(i) as usize,
+                record_size(&col_types, &keys[i], &rows[i], cap)
+            );
+        }
         assert!(
             node.vals.is_empty(),
             "a Packed leaf holds no decoded row vector (resident bytes ≈ page_size, §9)"
@@ -5555,7 +5578,7 @@ mod tests {
         let recon: Vec<Vec<Value>> = (0..rows.len())
             .map(|i| node.row_at(i).expect("reconstruct row"))
             .collect();
-        let blocks: Vec<&std::sync::Arc<[u8]>> = recon
+        let blocks: Vec<&std::sync::Arc<Vec<u8>>> = recon
             .iter()
             .flatten()
             .filter_map(|v| match v {
@@ -5638,7 +5661,7 @@ mod tests {
         assert!(ovf.is_empty());
         let block = make_page(ps, PAGE_LEAF, rows.len() as u32, 0, &payload);
         let node = decode_leaf_node(
-            &block,
+            block,
             2,
             Arc::new(col_types.clone()),
             std::sync::Weak::new(),

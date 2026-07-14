@@ -165,7 +165,7 @@ cross-core coordination.
   + a thin per-record index), shared across every reader of that leaf — the literal PG/SQLite
   model and the honest buffer-pool bound (§9). Per-core: **Go/TS get it almost for free** — a
   `[]byte` slice / `Uint8Array` subarray **is** a view that keeps the backing block alive under GC;
-  **Rust** uses an `Arc<[u8]>` (or the block `Arc<Node>` already in the pool) plus an offset. The
+  **Rust** uses an `Arc<Vec<u8>>` (or the block `Arc<Node>` already in the pool) plus an offset. The
   deferred value holds the shared block, so it stays `'static` and composes with the streaming
   cursor's existing snapshot pin (§7).
 - **(b) Owned span (lower-risk first functional slice).** A deferred value owns a `Vec<u8>` /
@@ -175,10 +175,9 @@ cross-core coordination.
   lifetimes (`'static` trivially, no block retention), so it is the natural first landing; a core
   can upgrade (b)→(a) for the memory/zero-copy win whenever it chooses.
 
-**Recommendation:** target **(a)**; land **(b)** first where the lifetime work in a core is
-non-trivial (chiefly Rust), then upgrade. The keys may likewise become block slices under (a)
-(zero-copy keys) — a further follow-on; keep them owned initially (small, and navigation reads them
-constantly).
+**Status:** form **(a)** is landed in all three cores. Clean Packed leaves also borrow keys directly
+from the retained page's key blob through the shared end-offset directory; there is no owned key
+vector on the fault path.
 
 ---
 
@@ -346,8 +345,8 @@ S3 / S4 precedent):
   it is nearly free; Rust upgrades (b)→(a)). Add a per-core test that resident leaf bytes track
   `≈ resident_leaves × page_size` (§9). *Optional but recommended — the dividend §9 exists for.*
 
-Deferred follow-ons (none foreclosed): **keys as block slices** (zero-copy keys under (a));
-**in-memory databases adopting deferral** — ✅ **done (bplus-reshape.md B3)**: the Memory pager
+Deferred follow-ons (none foreclosed): **in-memory databases adopting deferral** — ✅ **done
+(bplus-reshape.md B3)**: the Memory pager
 backing landed and in-memory databases defer like files (this follow-on's gate — pager.md §6, so
 they page through the identical path); a **per-column offset cache** on a resident leaf (SQLite's
 `OP_Column` offset memoization — skip re-walking earlier columns on repeated access of the same

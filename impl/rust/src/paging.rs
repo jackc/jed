@@ -74,7 +74,7 @@ impl SharedPaging {
             // column the query touches is read. The shared `col_types` `Arc` is cloned into the leaf
             // (O(1)), so a resident leaf adds no per-leaf column-type copy (§9).
             crate::format::decode_leaf_node(
-                &block,
+                block,
                 page,
                 Arc::clone(col_types),
                 Arc::downgrade(self),

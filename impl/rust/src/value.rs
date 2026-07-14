@@ -123,7 +123,7 @@ pub enum Value {
 pub enum Unfetched {
     /// `0x00` inline-plain, **deferred** (spec/design/lazy-record.md §5a, L3): the value's bytes are
     /// resident in the record, but its decode is deferred until the column is touched. **Form (a),
-    /// zero-copy block-shared:** `block` is the faulted leaf's whole page block (one `Arc<[u8]>`
+    /// zero-copy block-shared:** `block` is the faulted leaf's whole page block (one `Arc<Vec<u8>>`
     /// shared by every deferred value in the leaf), and the body is `block[off .. off + len]` (the
     /// bytes after the `0x00` present tag). The fault copies nothing per value — it parses spans and
     /// hands out `Arc` clones — and the scan-emit clone is a refcount bump, so resident leaf memory
@@ -133,7 +133,7 @@ pub enum Unfetched {
     /// rides a spilling sort and is read back from a run file owns a fresh single-body `Arc` — a
     /// degenerate form (a), since its page block may be long gone — `spill.rs`.)
     Inline {
-        block: Arc<[u8]>,
+        block: Arc<Vec<u8>>,
         off: u32,
         len: u32,
         ty: TypeRef,

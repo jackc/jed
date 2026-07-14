@@ -14,7 +14,10 @@
 > deleted (reconstruction is uniformly lazy; a touched-set miss resolves on demand — the
 > demand-fault backstop), and `Decoded` survives only as the writer's transient
 > materialize–mutate–repack buffer plus the deliberately-resident temp-table stores
-> ([bplus-reshape.md](bplus-reshape.md) status note). Body text below is kept as
+> ([bplus-reshape.md](bplus-reshape.md) status note). (d) Since the 2026-07 point-lookup pass, a
+> clean Packed leaf also retains **keys and record weights only as page-backed directory facts**:
+> navigation borrows key spans, weights are derived lazily, and owned keys/weights appear only at
+> the Packed→Decoded mutation boundary. Body text below is kept as
 > the design rationale; where it says "interior nodes are always Decoded" or "B-tree stores
 > records in interior nodes too", read it as v23 history.
 >
@@ -128,18 +131,16 @@ row-major on disk — v23 regroups leaves only — and read constantly by naviga
 - **Decoded** — `vals: Vec<Row>` / `[]storedRow`, as today. The form for **in-memory / `from_image` /
   mutated / dirty** leaves. A pure in-memory database (no pager) stays fully Decoded — it has nothing to
   page from and no resident pressure to relieve (lazy-record §4's carve-out, verbatim).
-- **Packed** — `block: Arc<[u8]>` (the leaf's whole page image) + the **parsed PAX directories** (the
-  `paxLeaf` / `PaxDirs` the fault already builds: `keys` spans, `colVals` spans, `colOff` value
-  directories). Holds **no `Vec<Row>`**. Produced **only** by `decode_leaf_node` on a demand-paged
-  fault.
+- **Packed** — the leaf's whole page image + the **parsed PAX directories** (`key_end` plus the
+  fixed/variable column-region directories). Holds **no per-record key objects, decoded rows, or
+  eager weights**. Produced **only** by `decode_leaf_node` on a demand-paged fault.
 
-Navigation is unaffected: B-tree search / split / merge / cost-count compare **keys** (raw bytes,
-directly available as `paxLeaf.keys[i]` in both forms) and **never read `vals`** — confirmed across all
-`.vals` sites (the value region is read only at emit and mutation). So the value representation can
-change without touching the load-bearing navigation code (the same structural fact lazy-record §3 rests
-on). Per-record **weights** (split math) are likewise derivable from the directories without decoding a
-single value — `weight(i) = 2 + key_len(i) + Σ_c (colOff[c][i+1] − colOff[c][i])` — so a Packed leaf can
-carry weights (or compute them lazily) with no value decode.
+Navigation uses a form-neutral `key_at(i)` accessor: Decoded returns its owned key and Packed returns a
+borrowed span of the page's key blob. Binary search therefore reads the retained bytes directly and
+allocates no key wrapper or copy. Per-record **weights** (split math) are likewise derived only when
+mutation/rebalance/serialization needs them, without decoding a value:
+`weight(i) = key_len(i) + Σ_c value_region_len(c, i)`. A Packed leaf carries neither a weight vector nor
+per-record key objects while clean.
 
 ---
 
@@ -180,13 +181,14 @@ each core chooses idiomatically. The representation is **the parsed PAX director
 of discarded:
 
 - **Rust** — `packed: Option<PackedLeaf>` on `Node` (leaves only; `None` for Decoded/interior), where
-  `PackedLeaf { block: Arc<[u8]>, dirs: PaxDirs }` — `PaxDirs { col_start, col_off, … }` is exactly the
+  `PackedLeaf { block: Arc<Vec<u8>>, dirs: PaxDirs }` — `PaxDirs { key_end, regions, … }` is exactly the
   struct `parse_pax_leaf` already returns ([format.rs](../../impl/rust/src/format.rs)). A block-slice is
   `(Arc clone, off, len)`; the `Arc` keeps the page alive past pool eviction (the existing
   `Unfetched::Inline` L3 mechanism, generalized from "held when a value defers" to "the leaf's backing
   store").
-- **Go** — the retained `*paxLeaf` (`{keys, colVals, colOff}`); `colVals[c]`/`keys[i]` are `[]byte`
-  subslices of the block and therefore GC-alive views of the page.
+- **Go** — the retained `*paxLeaf` (`{keyBlob, keyEnd, regions}`); `key(i)` and the column accessors
+  return `[]byte` subslices and therefore GC-alive views of the page. There is no resident `[][]byte`
+  key directory.
 - **TS** — the retained parsed directories over a `Uint8Array.subarray` view of the block
   (single-threaded).
 
@@ -195,8 +197,8 @@ The decisive difference from the pre-PAX prototype: **no fault-time offset pass.
 delivers the boundary index **on disk** — `parse_pax_leaf` reads the directories in one pass with **no
 value decode at all** — so the fault does no per-value copy, no per-value decode, and no boundary
 computation: it parses the directory `u32`s (already required to validate the page) and retains them
-with the block. Keys stay owned/decoded initially (small, read constantly); **keys as block-slices** is
-a deferred follow-on (§11).
+with the block. Keys are block spans located from the shared `key_end` directory; search compares those
+spans directly.
 
 ---
 
@@ -231,14 +233,14 @@ No new lifetime model — it composes with the three already in place ([lazy-rec
 - **Copy-on-write immutability.** A clean leaf's page is immutable on disk; a Packed leaf's directories
   and block-slices read bytes that never change under them. Reconstruction works on the scan's own
   cloned row, never the shared tree — so repeated scans re-reconstruct (and re-charge) consistently.
-- **The buffer-pool pin.** Under Packed the leaf's `Arc<[u8]>` (Go/TS GC view) **is** the pin — a
+- **The buffer-pool pin.** Under Packed the leaf's `Arc<Vec<u8>>` (Go/TS GC view) **is** the pin — a
   reconstructed row's block-slice values outlive pool eviction, identical to how an in-flight
   `Unfetched::Inline` value already survives it.
 - **The streaming cursor's snapshot.** A row of block-slice values a streaming `Rows` yields is
   `'static` for the same reason its `Unfetched::Inline` values already are.
 
 **Mutation.** A copy-on-write insert/delete descends to a leaf and rebuilds it. On reaching a **Packed**
-leaf it first **materializes it to Decoded** (`to_decoded()` = `row_at` over all records), then the
+leaf it first **materializes keys, rows, and weights together to Decoded** (`decoded_parts()`), then the
 existing `build` / `node_insert` / `node_remove` / `merge_rebalance` logic runs **unchanged** — a
 mutated leaf is always Decoded (and dirty, page `0`), so serialization (`serialize_dirty`, which only
 touches dirty nodes, re-emits PAX column-major from the Decoded rows) also stays unchanged. The write
@@ -288,8 +290,8 @@ expanded row vectors.
 - **The §8 byte contract** — on-disk format, key encoding, goldens, the round-trip. No `format_version`
   bump (PAX already owns v23).
 - **The cost contract** — the static touched set and every `# cost:` value.
-- **B-tree navigation / split / merge** — keys are raw bytes (directly `paxLeaf.keys[i]`); values going
-  Packed does not touch them, and per-record weights are derivable from the directories (§3).
+- **B-tree navigation / split / merge** — keys are raw bytes through `key_at(i)`; values going Packed
+  does not touch them, and per-record weights are derivable from the directories (§3).
 - **Interior nodes** — always Decoded, row-major on disk (small separators, read constantly).
 - **Pure in-memory databases** — stay Decoded via `from_image` (§3), like the buffer pool and
   lazy-record.
@@ -312,14 +314,17 @@ expanded row vectors.
   only touches dirty/Decoded nodes; `serialize_node` materializes a Packed root leaf via the seam).
   Representation stays all-Decoded, so `row_at = vals[i].clone()` — byte-identical. *Mergeable, no
   behavior change.*
-- **S2 — Packed leaf (the memory win).** ✅ **landed (Rust).** `decode_leaf_node` retains `(block,
-  PaxDirs, Arc<col_types>, n)` and stores **no** row vector; `row_at` / `col_at` / `row_at_masked`
+- **S2 — Packed leaf (the memory win).** ✅ **landed in all three cores.** `decode_leaf_node` retains
+  `(block, PaxDirs, col_types, n)` and stores **no** per-record key, row, or weight vector; `key_at`
+  borrows the page key span, weights derive from the directories, and `row_at` / `col_at`
   reconstruct via `read_value_lazy(col_types[c], dirs.value(c, i))`; mutation descent materializes
-  Packed→Decoded through `decoded_rows` (§7). The `col_at` / `row_at_masked` touched-column accessors
+  Packed→Decoded through `decoded_parts` (§7). The touched-column accessors
   are built and unit-tested here even though the executor does not yet *drive* masked reconstruction —
   that is the deferred S3 below. Unit tests: a faulted-leaf reconstruction shares one page block across
   all its deferred inline values (resident `≈ page_size`, §9), and `col_at`/`row_at_masked` reconstruct
-  only the touched columns byte-identically to the whole row. Built Rust-first.
+  only the touched columns byte-identically to the whole row. Representation-invariant tests also
+  pin that a faulted leaf has empty resident key/weight vectors and that key/weight access matches
+  the encoder facts.
 - **S3 — touched-column-only reconstruction wired through the executor (the PAX dividend).** *Landed
   in all three cores 2026-07 (Track A1, a per-core internal optimization like the vectorized executor —
   results/cost/byte-neutral, no `format_version` bump). Go first (`materializeRel`/`scanRange`/`storeScan`
@@ -433,7 +438,7 @@ aggregates — including the **vectorized aggregate executor** (single-base-tabl
 whole-table or single-integer-key GROUP BY) that the aggregate gather rides — have all landed in Rust, Go,
 and TS. Deferred follow-ons (none foreclosed): **Nested-value structural memo** (skip re-parsing a single `jsonb`/array/composite value's
 *interior* on repeated access — the narrow residual of §6, not the column-location memo PAX already
-provides); **keys as block-slices** (zero-copy keys under Packed); **in-memory databases adopting
+provides); **in-memory databases adopting
 deferral** only if a Memory pager backing lands ([pager.md §6](pager.md)).
 
 ---

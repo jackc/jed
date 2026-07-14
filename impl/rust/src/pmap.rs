@@ -90,8 +90,9 @@ fn child(node: &Node, i: usize, src: Option<&dyn LeafSource>) -> Result<Arc<Node
     }
 }
 
-/// One B+tree node. A **leaf** has no children and `keys.len() == vals.len() == weights.len()`
-/// (or a `packed` block in place of `vals`). An **interior** node has `children.len() ==
+/// One B+tree node. A **decoded leaf** has no children and
+/// `keys.len() == vals.len() == weights.len()`; a **packed leaf** keeps all three in its page-backed
+/// `packed` representation and leaves those vectors empty. An **interior** node has `children.len() ==
 /// keys.len() + 1` and **empty** `vals`/`weights` — its keys are the routing separators, its
 /// payload is derived from the separator bytes themselves (v24, record-free). Nodes are shared
 /// behind `Arc`; a mutation clones only the root→leaf path and shares every untouched subtree.
@@ -105,8 +106,8 @@ pub(crate) struct Node {
     /// [`row_at`](Node::row_at) / [`col_at`](Node::col_at) / [`with_row`](Node::with_row) /
     /// [`decoded_rows`](Node::decoded_rows) seam on leaves, never indexed directly.
     pub(crate) vals: Vec<Row>,
-    /// Each leaf record's on-disk size (`format::record_size`) — the size-driven split weight.
-    /// Empty for interior nodes.
+    /// Each decoded-leaf record's on-disk size (`format::record_size`) — the size-driven split
+    /// weight. Empty for packed leaves (derived from the PAX directories) and interior nodes.
     pub(crate) weights: Vec<u32>,
     pub(crate) children: Vec<Child>,
     /// The **Packed** (block-backed) resident form of a demand-paged clean leaf (packed-leaf.md §5):
@@ -187,20 +188,14 @@ impl Node {
     }
 
     /// A **Packed** leaf reconstructed from disk at `page` for the demand-paging fault path
-    /// (format.rs `decode_leaf_node`, packed-leaf.md §5). Holds `keys` + `weights` (both derivable
-    /// from the PAX directories with no value decode, §3) and the `packed` block; `vals` is **empty**
-    /// and rows are reconstructed on demand through the accessor seam. Returns the bare `Node` — the
-    /// buffer pool wraps it in an `Arc` (paging.rs). A leaf has no children.
-    pub(crate) fn leaf_loaded_packed(
-        keys: Vec<Vec<u8>>,
-        weights: Vec<u32>,
-        packed: PackedLeaf,
-        page: u32,
-    ) -> Node {
+    /// (format.rs `decode_leaf_node`, packed-leaf.md §5). Keys, weights, and rows remain in the
+    /// retained page block and are accessed through the accessor seam. Returns the bare `Node` —
+    /// the buffer pool wraps it in an `Arc` (paging.rs). A leaf has no children.
+    pub(crate) fn leaf_loaded_packed(packed: PackedLeaf, page: u32) -> Node {
         Node {
-            keys,
+            keys: Vec::new(),
             vals: Vec::new(),
-            weights,
+            weights: Vec::new(),
             children: Vec::new(),
             packed: Some(packed),
             page: AtomicU32::new(page),
@@ -211,13 +206,40 @@ impl Node {
         self.children.is_empty()
     }
 
+    /// Logical key count. Packed leaves derive it from their PAX directory and deliberately keep
+    /// no per-record key objects in the node.
+    pub(crate) fn len(&self) -> usize {
+        self.packed
+            .as_ref()
+            .map_or(self.keys.len(), PackedLeaf::len)
+    }
+
+    /// Key `i` as a borrowed span. Packed leaves return a view into the retained page block.
+    pub(crate) fn key_at(&self, i: usize) -> &[u8] {
+        match &self.packed {
+            None => &self.keys[i],
+            Some(p) => p.key(i),
+        }
+    }
+
+    /// Record `i`'s serialized weight. Packed leaves derive it from key and PAX column spans.
+    fn weight_at(&self, i: usize) -> u32 {
+        match &self.packed {
+            None => self.weights[i],
+            Some(p) => p.record_weight(i),
+        }
+    }
+
+    fn total_weight(&self) -> usize {
+        (0..self.len()).map(|i| self.weight_at(i) as usize).sum()
+    }
+
     /// This node's serialized payload size (format.md): a leaf is `Σ weights +
     /// leaf_overhead(N, shape)`; an interior node is `8·N + 4 + Σ sep_len` (child pointers +
     /// separator directory + key blob — record-free, v24).
     fn payload(&self, shape: LeafShape) -> usize {
         if self.is_leaf() {
-            self.weights.iter().map(|&w| w as usize).sum::<usize>()
-                + leaf_overhead(self.keys.len(), shape)
+            self.total_weight() + leaf_overhead(self.len(), shape)
         } else {
             8 * self.keys.len() + 4 + self.keys.iter().map(Vec::len).sum::<usize>()
         }
@@ -226,7 +248,17 @@ impl Node {
     /// Binary-search a **leaf**'s keys: `Ok(i)` if `key` sits at index `i`, else `Err(i)` for the
     /// insertion slot. `Vec<u8>::cmp` is lexicographic (memcmp) — the key contract.
     fn search(&self, key: &[u8]) -> std::result::Result<usize, usize> {
-        self.keys.binary_search_by(|k| k.as_slice().cmp(key))
+        let mut lo = 0usize;
+        let mut hi = self.len();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            match self.key_at(mid).cmp(key) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => return Ok(mid),
+            }
+        }
+        Err(lo)
     }
 
     /// The child an **interior** descent takes for `key`: `partition_point(sep ≤ key)` — a key
@@ -280,8 +312,26 @@ impl Node {
     pub(crate) fn decoded_rows(&self) -> Result<Vec<Row>> {
         match &self.packed {
             None => Ok(self.vals.clone()),
-            Some(p) => (0..self.keys.len()).map(|i| p.row(i)).collect(),
+            Some(p) => (0..p.len()).map(|i| p.row(i)).collect(),
         }
+    }
+
+    /// Materialize a leaf's keys, rows, and weights together at the Packed→Decoded mutation
+    /// boundary. This is the only place a clean leaf creates owned per-record keys/weights.
+    fn decoded_parts(&self) -> Result<(Vec<Vec<u8>>, Vec<Row>, Vec<u32>)> {
+        if self.packed.is_none() {
+            return Ok((self.keys.clone(), self.vals.clone(), self.weights.clone()));
+        }
+        let n = self.len();
+        let mut keys = Vec::with_capacity(n);
+        let mut vals = Vec::with_capacity(n);
+        let mut weights = Vec::with_capacity(n);
+        for i in 0..n {
+            keys.push(self.key_at(i).to_vec());
+            vals.push(self.row_at(i)?);
+            weights.push(self.weight_at(i));
+        }
+        Ok((keys, vals, weights))
     }
 }
 
@@ -527,15 +577,31 @@ impl KeyBound {
     /// lie within the bound — the binary-searched equivalent of testing `contains` per key,
     /// honoring the endpoint inclusivity flags.
     fn entry_window(&self, node: &Node) -> (usize, usize) {
+        let lower_bound = |key: &[u8], inclusive: bool| {
+            let mut lo = 0usize;
+            let mut hi = node.len();
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                let before = if inclusive {
+                    node.key_at(mid) < key
+                } else {
+                    node.key_at(mid) <= key
+                };
+                if before {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            lo
+        };
         let first = match &self.lo {
             None => 0,
-            Some(lo) if self.lo_inc => node.keys.partition_point(|k| k.as_slice() < lo.as_slice()),
-            Some(lo) => node.keys.partition_point(|k| k.as_slice() <= lo.as_slice()),
+            Some(lo) => lower_bound(lo, self.lo_inc),
         };
         let last = match &self.hi {
-            None => node.keys.len(),
-            Some(hi) if self.hi_inc => node.keys.partition_point(|k| k.as_slice() <= hi.as_slice()),
-            Some(hi) => node.keys.partition_point(|k| k.as_slice() < hi.as_slice()),
+            None => node.len(),
+            Some(hi) => lower_bound(hi, !self.hi_inc),
         };
         (first, last.max(first))
     }
@@ -770,7 +836,7 @@ impl PMap {
     /// would contribute 0 (defensive — temp stores have none).
     pub(crate) fn resident_record_bytes(&self) -> u64 {
         fn walk(node: &Node) -> u64 {
-            let here: u64 = node.weights.iter().map(|&w| w as u64).sum();
+            let here = node.total_weight() as u64;
             let kids: u64 = node
                 .children
                 .iter()
@@ -1033,7 +1099,7 @@ impl RangeCursor {
                     };
                     if frame.is_leaf {
                         (
-                            Some((frame.node.keys[p].clone(), frame.node.row_at(p)?)),
+                            Some((frame.node.key_at(p).to_vec(), frame.node.row_at(p)?)),
                             None,
                         )
                     } else {
@@ -1072,27 +1138,22 @@ fn node_insert(
     shape: LeafShape,
 ) -> Result<Ins> {
     if node.is_leaf() {
-        let (i, edited_keys, mut vals, mut weights) = match node.search(&key) {
+        let found = node.search(&key);
+        let (mut keys, mut vals, mut weights) = node.decoded_parts()?;
+        let i = match found {
             Ok(i) => {
-                let mut vals = node.decoded_rows()?;
                 *old = Some(std::mem::replace(&mut vals[i], val));
-                let mut weights = node.weights.clone();
                 weights[i] = weight;
-                (i, node.keys.clone(), vals, weights)
+                i
             }
             Err(i) => {
-                let mut keys = node.keys.clone();
-                let mut vals = node.decoded_rows()?;
-                let mut weights = node.weights.clone();
                 keys.insert(i, key);
                 vals.insert(i, val);
                 weights.insert(i, weight);
-                (i, keys, vals, weights)
+                i
             }
         };
-        let _ = &mut vals;
-        let _ = &mut weights;
-        return Ok(build_leaf(edited_keys, vals, weights, cap, shape, Some(i)));
+        return Ok(build_leaf(keys, vals, weights, cap, shape, Some(i)));
     }
     // Fault the target child (a `Resident` interior, or an `OnDisk` leaf brought in for
     // mutation — it becomes a dirty resident node on the rebuilt path).
@@ -1138,9 +1199,7 @@ fn node_remove(
     if node.is_leaf() {
         return match node.search(key) {
             Ok(i) => {
-                let mut keys = node.keys.clone();
-                let mut vals = node.decoded_rows()?;
-                let mut weights = node.weights.clone();
+                let (mut keys, mut vals, mut weights) = node.decoded_parts()?;
                 keys.remove(i);
                 let removed = vals.remove(i);
                 weights.remove(i);
@@ -1211,12 +1270,11 @@ fn merge_at(
     let right = child(node, j + 1, src)?;
 
     let merged = if left.is_leaf() {
-        let mut mkeys = left.keys.clone();
-        let mut mvals = left.decoded_rows()?;
-        let mut mweights = left.weights.clone();
-        mkeys.extend(right.keys.iter().cloned());
-        mvals.extend(right.decoded_rows()?);
-        mweights.extend(right.weights.iter().copied());
+        let (mut mkeys, mut mvals, mut mweights) = left.decoded_parts()?;
+        let (rkeys, rvals, rweights) = right.decoded_parts()?;
+        mkeys.extend(rkeys);
+        mvals.extend(rvals);
+        mweights.extend(rweights);
         build_leaf(mkeys, mvals, mweights, cap, shape, None)
     } else {
         let mut mkeys = left.keys.clone();
@@ -1256,8 +1314,8 @@ fn merge_at(
 /// the resident leaf set stays bounded by the pool, not the tree (pager.md §4).
 fn collect(node: &Node, src: Option<&dyn LeafSource>, out: &mut Vec<(Vec<u8>, Row)>) -> Result<()> {
     if node.is_leaf() {
-        for i in 0..node.keys.len() {
-            out.push((node.keys[i].clone(), node.row_at(i)?));
+        for i in 0..node.len() {
+            out.push((node.key_at(i).to_vec(), node.row_at(i)?));
         }
         return Ok(());
     }
@@ -1285,7 +1343,7 @@ fn collect_range(
     if node.is_leaf() {
         let (ef, el) = b.entry_window(node);
         for i in ef..el {
-            out.push((node.keys[i].clone(), node.row_at(i)?));
+            out.push((node.key_at(i).to_vec(), node.row_at(i)?));
         }
         return Ok(());
     }
@@ -1381,7 +1439,7 @@ fn walk_range_visit(
     if node.is_leaf() {
         let (ef, el) = b.entry_window(node);
         for i in ef..el {
-            if !node.with_row(i, |row| visit(&node.keys[i], row))? {
+            if !node.with_row(i, |row| visit(node.key_at(i), row))? {
                 return Ok(false);
             }
         }
@@ -1410,7 +1468,7 @@ fn walk_range_visit_rev(
     if node.is_leaf() {
         let (ef, el) = b.entry_window(node);
         for i in (ef..el).rev() {
-            if !node.with_row(i, |row| visit(&node.keys[i], row))? {
+            if !node.with_row(i, |row| visit(node.key_at(i), row))? {
                 return Ok(false);
             }
         }

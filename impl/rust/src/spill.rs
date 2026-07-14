@@ -620,7 +620,7 @@ fn read_value<R: Read>(r: &mut R) -> io::Result<Value> {
             let body = read_bytes(r)?;
             let len = body.len() as u32;
             Value::Unfetched(Unfetched::Inline {
-                block: Arc::from(body),
+                block: Arc::new(body),
                 off: 0,
                 len,
                 ty: crate::value::TypeRef::sentinel(),

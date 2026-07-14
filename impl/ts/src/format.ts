@@ -49,7 +49,7 @@ import {
 import { lz4Compress, lz4Decompress } from "./lz4.ts";
 import { MemoryBlockStore } from "./memoryblockstore.ts";
 import { Pager } from "./pager.ts";
-import { compareBytes, decodedRows, onDiskRef, residentRef } from "./pmap.ts";
+import { compareBytes, decodedRows, keyViews, nodeLen, onDiskRef, residentRef } from "./pmap.ts";
 import { rangeForElement } from "./range.ts";
 import type { Child, LeafShape, PackedLeaf, PNode } from "./pmap.ts";
 import { SharedPaging } from "./paging.ts";
@@ -2238,7 +2238,7 @@ function serializeNode(
     // hot path (create's empty image / golden generator / toImage canonical), so the clones are
     // acceptable (packed-leaf.md §7).
     const rows = decodedRows(n).map((row) => store.resolveAll(row));
-    payload = encodeLeafPax(colTypes, n.keys, rows, capacity, take, ovf);
+    payload = encodeLeafPax(colTypes, keyViews(n), rows, capacity, take, ovf);
   }
   if (payload.length > capacity) {
     throw engineError(
@@ -2246,7 +2246,7 @@ function serializeNode(
       "a record larger than the per-row limit is not supported",
     );
   }
-  body.push({ index, pageType, itemCount: n.keys.length, nextPage: 0, payload });
+  body.push({ index, pageType, itemCount: nodeLen(n), nextPage: 0, payload });
   for (const o of ovf) {
     body.push({
       index: o.index,
@@ -3266,7 +3266,6 @@ export function decodeLeafNode(
   if (pg.pageType !== PAGE_LEAF)
     throw engineError("data_corrupted", "demand-paged a non-leaf page");
   const n = pg.itemCount;
-  const k = colTypes.length;
   // Packed form (packed-leaf.md §5): retain the page payload (a subarray view of the block — GC keeps
   // the block alive, the equivalent of Rust's Arc<[u8]>) + the parsed PAX directories, and decode NO
   // values. parsePaxLeaf validated + parsed the directories with no value decode, so a malformed
@@ -3276,15 +3275,6 @@ export function decodeLeafNode(
   // resident leaf is ≈ pageSize (§9), never an inflated row vector.
   const dirs = parsePaxLeaf(pg.payload, n, colTypes);
   const payload = pg.payload;
-  const keys: Uint8Array[] = [];
-  const weights: number[] = [];
-  for (let i = 0; i < n; i++) {
-    const key = paxKey(payload, dirs, i).slice(); // copy out of the borrowed page slice
-    let w = key.length;
-    for (let c = 0; c < k; c++) w += paxValueLen(dirs, c, i);
-    weights.push(w);
-    keys.push(key);
-  }
   // Reconstruct-on-demand seam (closes over the directories + payload). NULL comes off the region
   // (bitmap / zero span) with no decode; a fixed-width slot is the untagged inline body — decoded
   // eagerly (deferring a fixed-width scalar buys nothing, lazy-record.md §6); a variable value's
@@ -3305,14 +3295,22 @@ export function decodeLeafNode(
   };
   const packed: PackedLeaf = {
     n,
+    key(i: number): Uint8Array {
+      return paxKey(payload, dirs, i);
+    },
+    weight(i: number): number {
+      let size = paxKey(payload, dirs, i).length;
+      for (let c = 0; c < colTypes.length; c++) size += paxValueLen(dirs, c, i);
+      return size;
+    },
     col,
     row(i: number): Row {
-      const row: Row = new Array(k);
-      for (let c = 0; c < k; c++) row[c] = col(i, c);
+      const row: Row = new Array(colTypes.length);
+      for (let c = 0; c < colTypes.length; c++) row[c] = col(i, c);
       return row;
     },
   };
-  return { keys, vals: [], weights, children: [], packed, page };
+  return { keys: [], vals: [], weights: [], children: [], packed, page };
 }
 
 type Cursor = { pos: number };

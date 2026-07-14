@@ -369,6 +369,20 @@ func TestLazyInlineFaultedLeafSharesPageBlock(t *testing.T) {
 	if node.packed == nil {
 		t.Fatalf("a faulted leaf is Packed (packed-leaf.md §5)")
 	}
+	if len(node.keys) != 0 || len(node.weights) != 0 {
+		t.Fatalf("a Packed leaf keeps no per-record key or weight objects")
+	}
+	if node.keyLen() != len(keys) {
+		t.Fatalf("logical key count = %d, want %d", node.keyLen(), len(keys))
+	}
+	for i := range keys {
+		if !bytes.Equal(node.keyAt(i), keys[i]) {
+			t.Fatalf("keyAt(%d) differs from encoded key", i)
+		}
+		if got, want := node.weightAt(i), uint32(recordSize(colTypes, keys[i], rows[i], capacity)); got != want {
+			t.Fatalf("weightAt(%d) = %d, want %d", i, got, want)
+		}
+	}
 	if len(node.vals) != 0 {
 		t.Fatalf("a Packed leaf holds no decoded row vector (resident ≈ pageSize, §9); got %d", len(node.vals))
 	}

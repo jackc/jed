@@ -29,8 +29,9 @@ import (
 	"sort"
 )
 
-// pnode is one B+tree node. A LEAF has no children and len(keys) == len(vals) == len(weights)
-// (or a packed block in place of vals). An INTERIOR node has len(children) == len(keys)+1 and
+// pnode is one B+tree node. A decoded LEAF has no children and
+// len(keys) == len(vals) == len(weights); a packed leaf keeps all three in its page-backed packed
+// representation and leaves those slices nil. An INTERIOR node has len(children) == len(keys)+1 and
 // EMPTY vals/weights — its keys are the routing separators, its payload is derived from the
 // separator bytes themselves (v24, record-free). Nodes are never mutated after construction.
 // page is the on-disk page index (0 when dirty), set once at the commit that first persists it.
@@ -92,6 +93,70 @@ func (n *pnode) decodedRows() ([]storedRow, error) {
 	return rows, nil
 }
 
+func (n *pnode) keyLen() int {
+	if n.packed != nil {
+		return n.packed.n
+	}
+	return len(n.keys)
+}
+
+// keyAt returns key i as a borrowed span; a Packed leaf's span points into its retained page block.
+func (n *pnode) keyAt(i int) []byte {
+	if n.packed != nil {
+		return n.packed.key(i)
+	}
+	return n.keys[i]
+}
+
+// keyViews returns the leaf keys as a transient slice of borrowed spans for serialization. Packed
+// leaves allocate only this short-lived directory; the resident node still owns no per-key objects.
+func (n *pnode) keyViews() [][]byte {
+	if n.packed == nil {
+		return n.keys
+	}
+	keys := make([][]byte, n.keyLen())
+	for i := range keys {
+		keys[i] = n.keyAt(i)
+	}
+	return keys
+}
+
+func (n *pnode) weightAt(i int) uint32 {
+	if n.packed != nil {
+		return n.packed.recordWeight(i)
+	}
+	return n.weights[i]
+}
+
+func (n *pnode) totalWeight() int {
+	total := 0
+	for i := 0; i < n.keyLen(); i++ {
+		total += int(n.weightAt(i))
+	}
+	return total
+}
+
+// decodedParts materializes a leaf once at the Packed→Decoded mutation boundary.
+func (n *pnode) decodedParts() ([][]byte, []storedRow, []uint32, error) {
+	if n.packed == nil {
+		return cloneKeys(n.keys), cloneVals(n.vals), cloneWeights(n.weights), nil
+	}
+	count := n.keyLen()
+	keys := make([][]byte, count)
+	vals := make([]storedRow, count)
+	weights := make([]uint32, count)
+	for i := 0; i < count; i++ {
+		keys[i] = bytes.Clone(n.keyAt(i))
+		row, err := n.rowAt(i)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		vals[i] = row
+		weights[i] = n.weightAt(i)
+	}
+	return keys, vals, weights, nil
+}
+
 // childRef is a B+tree node's reference to one child. Under demand paging (P6.4b, spec/design/pager.md
 // §4) a clean leaf need not be resident: an interior node keeps an OnDisk page id for such a child and
 // the read path faults it through the buffer pool on access. node != nil ⇒ resident (a dirty node, a
@@ -134,11 +199,7 @@ func (n *pnode) isLeaf() bool { return len(n.children) == 0 }
 // directory + key blob — record-free, v24).
 func (n *pnode) payload(shape leafShape) int {
 	if n.isLeaf() {
-		total := 0
-		for _, w := range n.weights {
-			total += int(w)
-		}
-		return total + leafOverhead(len(n.keys), shape)
+		return n.totalWeight() + leafOverhead(n.keyLen(), shape)
 	}
 	total := 8*len(n.keys) + 4
 	for _, k := range n.keys {
@@ -150,10 +211,10 @@ func (n *pnode) payload(shape leafShape) int {
 // search binary-searches a LEAF's keys, returning (index, found): found ⇒ key is at keys[index];
 // else index is the insertion slot.
 func (n *pnode) search(key []byte) (int, bool) {
-	lo, hi := 0, len(n.keys)
+	lo, hi := 0, n.keyLen()
 	for lo < hi {
 		mid := int(uint(lo+hi) >> 1)
-		switch bytes.Compare(n.keys[mid], key) {
+		switch bytes.Compare(n.keyAt(mid), key) {
 		case 0:
 			return mid, true
 		case -1:
@@ -366,12 +427,12 @@ func (m *pMap) inorder(src leafSource) ([][]byte, []storedRow, error) {
 			return nil
 		}
 		if n.isLeaf() {
-			for i := range n.keys {
+			for i := 0; i < n.keyLen(); i++ {
 				row, err := n.rowAt(i)
 				if err != nil {
 					return err
 				}
-				keys = append(keys, n.keys[i])
+				keys = append(keys, n.keyAt(i))
 				vals = append(vals, row)
 			}
 			return nil
@@ -454,10 +515,7 @@ func (m *pMap) residentRecordBytes() uint64 {
 		if n == nil {
 			return 0
 		}
-		var here uint64
-		for _, w := range n.weights {
-			here += uint64(w)
-		}
+		here := uint64(n.totalWeight())
 		for _, c := range n.children {
 			if c.node != nil {
 				here += walk(c.node)
@@ -522,18 +580,18 @@ func (b keyBound) childWindow(n *pnode) (int, int) {
 func (b keyBound) entryWindow(n *pnode) (int, int) {
 	first := 0
 	if b.lo != nil {
-		first = sort.Search(len(n.keys), func(i int) bool {
-			c := bytes.Compare(n.keys[i], b.lo)
+		first = sort.Search(n.keyLen(), func(i int) bool {
+			c := bytes.Compare(n.keyAt(i), b.lo)
 			if b.loInc {
 				return c >= 0
 			}
 			return c > 0
 		})
 	}
-	last := len(n.keys)
+	last := n.keyLen()
 	if b.hi != nil {
-		last = sort.Search(len(n.keys), func(i int) bool {
-			c := bytes.Compare(n.keys[i], b.hi)
+		last = sort.Search(n.keyLen(), func(i int) bool {
+			c := bytes.Compare(n.keyAt(i), b.hi)
 			if b.hiInc {
 				return c > 0
 			}
@@ -577,7 +635,7 @@ func (m *pMap) rangeEntriesCounted(b keyBound, src leafSource) ([][]byte, []stor
 				if err != nil {
 					return err
 				}
-				keys = append(keys, n.keys[i])
+				keys = append(keys, n.keyAt(i))
 				vals = append(vals, row)
 			}
 			return nil
@@ -740,7 +798,7 @@ func (m *pMap) scanRange(b keyBound, src leafSource, visit func(key []byte, row 
 				if err != nil {
 					return false, err
 				}
-				cont, err := visit(n.keys[i], row)
+				cont, err := visit(n.keyAt(i), row)
 				if err != nil || !cont {
 					return cont, err
 				}
@@ -782,7 +840,7 @@ func (m *pMap) scanRangeRev(b keyBound, src leafSource, visit func(key []byte, r
 				if err != nil {
 					return false, err
 				}
-				cont, err := visit(n.keys[i], row)
+				cont, err := visit(n.keyAt(i), row)
 				if err != nil || !cont {
 					return cont, err
 				}
@@ -884,7 +942,7 @@ func (c *rangeCursor) next() (key []byte, row storedRow, ok bool, err error) {
 			if err != nil {
 				return nil, nil, false, err
 			}
-			return fr.node.keys[p], row, true, nil
+			return fr.node.keyAt(p), row, true, nil
 		}
 		child, e := resolveChild(fr.node.children[p], c.src)
 		if e != nil {
@@ -1039,29 +1097,19 @@ func buildInterior(keys [][]byte, children []childRef, cap int, edited int) (ins
 func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedRow, replaced *bool, src leafSource, cap int, shape leafShape) (insOut, error) {
 	if n.isLeaf() {
 		i, found := n.search(key)
-		var keys [][]byte
-		var vals []storedRow
-		var weights []uint32
+		keys, vals, weights, err := n.decodedParts()
+		if err != nil {
+			return insOut{}, err
+		}
 		if found {
-			rows, err := n.decodedRows()
-			if err != nil {
-				return insOut{}, err
-			}
-			*old = rows[i]
+			*old = vals[i]
 			*replaced = true
-			rows[i] = val
-			keys = cloneKeys(n.keys)
-			vals = rows
-			weights = cloneWeights(n.weights)
+			vals[i] = val
 			weights[i] = weight
 		} else {
-			rows, err := n.decodedRows()
-			if err != nil {
-				return insOut{}, err
-			}
-			keys = insertKeyAt(n.keys, i, key)
-			vals = insertValAt(rows, i, val)
-			weights = insertWeightAt(n.weights, i, weight)
+			keys = insertKeyAt(keys, i, key)
+			vals = insertValAt(vals, i, val)
+			weights = insertWeightAt(weights, i, weight)
 		}
 		return buildLeaf(keys, vals, weights, cap, shape, i), nil
 	}
@@ -1109,12 +1157,12 @@ func nodeRemove(n *pnode, key []byte, src leafSource, cap int, shape leafShape) 
 		if !found {
 			return n, nil, false, nil
 		}
-		rows, err := n.decodedRows()
+		keys, rows, weights, err := n.decodedParts()
 		if err != nil {
 			return nil, nil, false, err
 		}
 		vals, removed := removeValAt(rows, i)
-		return &pnode{keys: removeKeyAt(n.keys, i), vals: vals, weights: removeWeightAt(n.weights, i)}, removed, true, nil
+		return &pnode{keys: removeKeyAt(keys, i), vals: vals, weights: removeWeightAt(weights, i)}, removed, true, nil
 	}
 	i := n.childSlot(key)
 	childNode, err := resolveChild(n.children[i], src)
@@ -1186,23 +1234,23 @@ func mergeAt(n *pnode, j int, src leafSource, cap int, shape leafShape) (*pnode,
 	var merged insOut
 	if left.isLeaf() {
 		// Materialize both leaves (either may be Packed) before merging — the merged node is Decoded.
-		leftRows, err := left.decodedRows()
+		leftKeys, leftRows, leftWeights, err := left.decodedParts()
 		if err != nil {
 			return nil, err
 		}
-		rightRows, err := right.decodedRows()
+		rightKeys, rightRows, rightWeights, err := right.decodedParts()
 		if err != nil {
 			return nil, err
 		}
-		mkeys := make([][]byte, 0, len(left.keys)+len(right.keys))
-		mkeys = append(mkeys, left.keys...)
-		mkeys = append(mkeys, right.keys...)
+		mkeys := make([][]byte, 0, len(leftKeys)+len(rightKeys))
+		mkeys = append(mkeys, leftKeys...)
+		mkeys = append(mkeys, rightKeys...)
 		mvals := make([]storedRow, 0, len(leftRows)+len(rightRows))
 		mvals = append(mvals, leftRows...)
 		mvals = append(mvals, rightRows...)
-		mweights := make([]uint32, 0, len(left.weights)+len(right.weights))
-		mweights = append(mweights, left.weights...)
-		mweights = append(mweights, right.weights...)
+		mweights := make([]uint32, 0, len(leftWeights)+len(rightWeights))
+		mweights = append(mweights, leftWeights...)
+		mweights = append(mweights, rightWeights...)
 		merged = buildLeaf(mkeys, mvals, mweights, cap, shape, -1) // merge-overflow: balanced
 	} else {
 		mkeys := make([][]byte, 0, len(left.keys)+1+len(right.keys))

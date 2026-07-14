@@ -1009,12 +1009,12 @@ func serializeNode(n *pnode, store *tableStore, capacity int, nextIndex uint32, 
 			}
 			rows[ri] = resolved
 		}
-		payload = encodeLeafPAX(colTypes, n.keys, rows, capacity, take, &ovf)
+		payload = encodeLeafPAX(colTypes, n.keyViews(), rows, capacity, take, &ovf)
 	}
 	if len(payload) > capacity {
 		return 0, 0, newError(FeatureNotSupported, "a record larger than the per-row limit is not supported")
 	}
-	*body = append(*body, bodyPage{index: index, pageType: pageType, itemCount: uint32(len(n.keys)), payload: payload})
+	*body = append(*body, bodyPage{index: index, pageType: pageType, itemCount: uint32(n.keyLen()), payload: payload})
 	for _, o := range ovf {
 		*body = append(*body, bodyPage{index: o.index, pageType: pageOverflow, itemCount: o.itemCount, nextPage: o.nextPage, payload: o.payload})
 	}
@@ -3604,7 +3604,8 @@ type paxRegion struct {
 }
 
 type paxLeaf struct {
-	keys    [][]byte // n key spans (views into the page payload)
+	keyBlob []byte   // the shared key bytes in the retained page payload
+	keyEnd  []uint32 // N end offsets into keyBlob; no per-record slice wrappers
 	regions []paxRegion
 }
 
@@ -3633,12 +3634,7 @@ func parsePaxLeaf(payload []byte, n int, colTypes []colType) (*paxLeaf, error) {
 	if keyBlob+int(prev) > len(payload) {
 		return nil, newError(DataCorrupted, "PAX leaf key blob overruns page")
 	}
-	keys := make([][]byte, n)
-	lo := uint32(0)
-	for i := 0; i < n; i++ {
-		keys[i] = payload[keyBlob+int(lo) : keyBlob+int(keyEnd[i])]
-		lo = keyEnd[i]
-	}
+	keyBytes := payload[keyBlob : keyBlob+int(prev)]
 	pos = keyBlob + int(prev)
 	colStart := make([]uint32, k+1)
 	for c := range colStart {
@@ -3691,7 +3687,16 @@ func parsePaxLeaf(payload []byte, n int, colTypes []colType) (*paxLeaf, error) {
 			regions[c] = paxRegion{ends: ends, body: payload[p:end]}
 		}
 	}
-	return &paxLeaf{keys: keys, regions: regions}, nil
+	return &paxLeaf{keyBlob: keyBytes, keyEnd: keyEnd, regions: regions}, nil
+}
+
+// key returns record i's key as a borrowed span of the retained page block.
+func (l *paxLeaf) key(i int) []byte {
+	lo := uint32(0)
+	if i > 0 {
+		lo = l.keyEnd[i-1]
+	}
+	return l.keyBlob[lo:l.keyEnd[i]]
 }
 
 // isNull reports whether value (record i, column c) is NULL — the region bitmap (fixed-width) or
@@ -3759,6 +3764,17 @@ type packedLeaf struct {
 	n      int
 }
 
+func (p *packedLeaf) key(i int) []byte { return p.dirs.key(i) }
+
+// recordWeight derives the exact serialized record size only when mutation/rebalance needs it.
+func (p *packedLeaf) recordWeight(i int) uint32 {
+	w := len(p.key(i))
+	for c := range p.colTypes {
+		w += p.dirs.valueLen(c, i)
+	}
+	return uint32(w)
+}
+
 // value reconstructs value (record i, column c) — the O(1) PAX column span (packed-leaf.md §4). A
 // NULL is answered from the region bitmap / zero-length span with no decode. A fixed-width slot is
 // the untagged inline body, decoded eagerly (deferring a fixed-width scalar buys nothing,
@@ -3808,7 +3824,6 @@ func decodeLeafNode(block []byte, pageID uint32, colTypes []colType, paging *sha
 		return nil, newError(DataCorrupted, "demand-paged a non-leaf page")
 	}
 	n := int(pg.itemCount)
-	k := len(colTypes)
 	leaf, err := parsePaxLeaf(pg.payload, n, colTypes)
 	if err != nil {
 		return nil, err
@@ -3820,19 +3835,8 @@ func decodeLeafNode(block []byte, pageID uint32, colTypes []colType, paging *sha
 	// from the directories alone (§3): the weight is len(key) + Σ_c valueLen(c, i) (the v24
 	// record_size), exactly what the writer split on — so the resident leaf is ≈ pageSize (§9),
 	// never an inflated row vector.
-	keys, weights := make([][]byte, 0, n), make([]uint32, 0, n)
-	for i := 0; i < n; i++ {
-		key := make([]byte, len(leaf.keys[i]))
-		copy(key, leaf.keys[i])
-		w := len(key)
-		for c := 0; c < k; c++ {
-			w += leaf.valueLen(c, i)
-		}
-		weights = append(weights, uint32(w))
-		keys = append(keys, key)
-	}
 	packed := &packedLeaf{dirs: leaf, colTypes: colTypes, paging: paging, n: n}
-	return &pnode{keys: keys, weights: weights, packed: packed, page: pageID}, nil
+	return &pnode{packed: packed, page: pageID}, nil
 }
 
 // decodeTableEntry decodes one catalog table entry: the *Table (its pk list, checks, and

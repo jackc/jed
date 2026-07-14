@@ -22,11 +22,12 @@ import {
   encodeLeafPax,
   encodeValue,
   makePage,
+  recordSize,
   type OverflowPageOut,
   resolveUnfetched,
   resolveUnfetchedSelf,
 } from "../src/format.ts";
-import { colAt, rowAt } from "../src/pmap.ts";
+import { colAt, keyAt, nodeLen, rowAt } from "../src/pmap.ts";
 import { createDatabase, openDatabase } from "../src/tooling.ts";
 import {
   arrayValue,
@@ -337,6 +338,13 @@ test("a faulted leaf shares one page block across its deferred values", () => {
   // inline-deferred unfetched (form (a)) block views the eager fault used to.
   const node = decodeLeafNode(block, 2, colTypes, null);
   assert.ok(node.packed !== undefined, "a faulted leaf is Packed (packed-leaf.md §5)");
+  assert.equal(node.keys.length, 0, "a Packed leaf owns no per-record key objects");
+  assert.equal(node.weights.length, 0, "a Packed leaf owns no eager weights");
+  assert.equal(nodeLen(node), keys.length);
+  keys.forEach((key, i) => {
+    assert.deepEqual(keyAt(node, i), key);
+    assert.equal(node.packed!.weight(i), recordSize(colTypes, key, rows[i]!, capacity));
+  });
   assert.equal(
     node.vals.length,
     0,

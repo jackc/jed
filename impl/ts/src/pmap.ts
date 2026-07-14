@@ -30,6 +30,9 @@ import type { Value } from "./value.ts";
 // below). Built by format.ts decodeLeafNode.
 export interface PackedLeaf {
   readonly n: number;
+  // Borrow key i directly from the retained page block and derive its record weight lazily.
+  key(i: number): Uint8Array;
+  weight(i: number): number;
   // Reconstruct the whole value row i — uniformly LAZY (bplus-reshape.md B4): fixed-width columns
   // decode eagerly, variable columns defer as self-resolving unfetched values.
   row(i: number): Row;
@@ -39,8 +42,8 @@ export interface PackedLeaf {
 
 // One B+tree node. `children` is empty for a leaf; otherwise children.length === keys.length+1 and
 // the node is a record-free interior (v24): its keys are the routing separators and its
-// vals/weights are EMPTY. For a leaf keys.length === vals.length === weights.length (or a `packed`
-// block in place of vals); weights[i] is record i's on-disk size, for the size-driven split/merge.
+// vals/weights are EMPTY. A decoded leaf has keys.length === vals.length === weights.length; a
+// Packed leaf keeps all three in its retained page block and leaves those arrays empty.
 // page is the on-disk page index (0 when dirty), set once at the commit that first persists this
 // node. Exported so the serializer (format.ts) can read/build it.
 export type PNode = {
@@ -89,6 +92,47 @@ export function decodedRows(n: PNode): Row[] {
   const rows: Row[] = new Array(n.packed.n);
   for (let i = 0; i < n.packed.n; i++) rows[i] = n.packed.row(i);
   return rows;
+}
+
+export function nodeLen(n: PNode): number {
+  return n.packed?.n ?? n.keys.length;
+}
+
+export function keyAt(n: PNode, i: number): Uint8Array {
+  return n.packed ? n.packed.key(i) : n.keys[i]!;
+}
+
+function weightAt(n: PNode, i: number): number {
+  return n.packed ? n.packed.weight(i) : n.weights[i]!;
+}
+
+function totalWeight(n: PNode): number {
+  let total = 0;
+  for (let i = 0; i < nodeLen(n); i++) total += weightAt(n, i);
+  return total;
+}
+
+// keyViews constructs only a transient directory of block-backed spans when the full serializer
+// needs leaf keys. The resident Packed node owns no per-record key objects.
+export function keyViews(n: PNode): Uint8Array[] {
+  if (!n.packed) return n.keys;
+  const keys = new Array<Uint8Array>(n.packed.n);
+  for (let i = 0; i < keys.length; i++) keys[i] = n.packed.key(i);
+  return keys;
+}
+
+function decodedParts(n: PNode): { keys: Uint8Array[]; vals: Row[]; weights: number[] } {
+  if (!n.packed) return { keys: n.keys.slice(), vals: n.vals.slice(), weights: n.weights.slice() };
+  const count = n.packed.n;
+  const keys = new Array<Uint8Array>(count);
+  const vals = new Array<Row>(count);
+  const weights = new Array<number>(count);
+  for (let i = 0; i < count; i++) {
+    keys[i] = n.packed.key(i).slice();
+    vals[i] = n.packed.row(i);
+    weights[i] = n.packed.weight(i);
+  }
+  return { keys, vals, weights };
 }
 
 // A B+tree node's reference to one child. Under demand paging (P6.4b, spec/design/pager.md §4) a
@@ -150,9 +194,7 @@ export function leafOverhead(n: number, shape: LeafShape): number {
 // record-free, v24).
 function payload(n: PNode, shape: LeafShape): number {
   if (isLeaf(n)) {
-    let total = 0;
-    for (const w of n.weights) total += w;
-    return total + leafOverhead(n.keys.length, shape);
+    return totalWeight(n) + leafOverhead(nodeLen(n), shape);
   }
   let seps = 0;
   for (const k of n.keys) seps += k.length;
@@ -234,14 +276,23 @@ function childWindow(b: KeyBound, n: PNode): [number, number] {
 // lie within the bound — the binary-searched equivalent of testing containment per key, honoring
 // the endpoint inclusivity flags. Applies only at leaves (interior nodes carry no records, v24).
 function entryWindow(b: KeyBound, n: PNode): [number, number] {
+  const lowerBound = (key: Uint8Array, greater: boolean): number => {
+    let lo = 0;
+    let hi = nodeLen(n);
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      const c = compareBytes(keyAt(n, mid), key);
+      if (c < 0 || (greater && c === 0)) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  };
   const first =
-    b.lo === null ? 0 : b.loInc ? lowerBoundGE(n.keys, b.lo) : lowerBoundGT(n.keys, b.lo);
+    b.lo === null ? 0 : lowerBound(b.lo, !b.loInc);
   let last =
     b.hi === null
-      ? n.keys.length
-      : b.hiInc
-        ? lowerBoundGT(n.keys, b.hi)
-        : lowerBoundGE(n.keys, b.hi);
+      ? nodeLen(n)
+      : lowerBound(b.hi, b.hiInc);
   if (last < first) last = first;
   return [first, last];
 }
@@ -249,10 +300,10 @@ function entryWindow(b: KeyBound, n: PNode): [number, number] {
 // search binary-searches a LEAF's keys: found ⇒ keys[index] === key, else index is the insertion slot.
 function search(n: PNode, key: Uint8Array): { index: number; found: boolean } {
   let lo = 0;
-  let hi = n.keys.length;
+  let hi = nodeLen(n);
   while (lo < hi) {
     const mid = (lo + hi) >> 1;
-    const c = compareBytes(n.keys[mid], key);
+    const c = compareBytes(keyAt(n, mid), key);
     if (c === 0) return { index: mid, found: true };
     if (c < 0) lo = mid + 1;
     else hi = mid;
@@ -364,7 +415,7 @@ export class PMap {
     // The root may have drained: an empty leaf becomes the empty map; a 0-key interior root hands
     // the root down a level (height shrinks). The root is exempt from the underfull rule, so no
     // rebalance here.
-    if (newRoot.keys.length === 0) {
+    if (nodeLen(newRoot) === 0) {
       // The lone surviving child becomes the new root — fault it if it is an OnDisk leaf (a tree of
       // height 2 can collapse to its single bottom child).
       this.root = isLeaf(newRoot) ? null : resolveChild(newRoot.children[0], src);
@@ -385,8 +436,8 @@ export class PMap {
     const vals: Row[] = [];
     const walk = (n: PNode): void => {
       if (isLeaf(n)) {
-        for (let i = 0; i < n.keys.length; i++) {
-          keys.push(n.keys[i]);
+        for (let i = 0; i < nodeLen(n); i++) {
+          keys.push(keyAt(n, i));
           vals.push(rowAt(n, i));
         }
         return;
@@ -438,8 +489,7 @@ export class PMap {
   residentRecordBytes(): number {
     const walk = (n: PNode | null): number => {
       if (n === null) return 0;
-      let here = 0;
-      for (const w of n.weights) here += w;
+      let here = totalWeight(n);
       for (const c of n.children) if (c.node !== null) here += walk(c.node);
       return here;
     };
@@ -472,7 +522,7 @@ export class PMap {
       if (isLeaf(n)) {
         const [ef, el] = entryWindow(b, n);
         for (let i = ef; i < el; i++) {
-          keys.push(n.keys[i]);
+          keys.push(keyAt(n, i));
           vals.push(rowAt(n, i));
         }
         return;
@@ -587,7 +637,7 @@ export class PMap {
       if (isLeaf(n)) {
         const [ef, el] = entryWindow(b, n);
         for (let i = ef; i < el; i++) {
-          if (!visit(n.keys[i], rowAt(n, i))) return false;
+          if (!visit(keyAt(n, i), rowAt(n, i))) return false;
         }
         return true;
       }
@@ -615,7 +665,7 @@ export class PMap {
       if (isLeaf(n)) {
         const [ef, el] = entryWindow(b, n);
         for (let i = el - 1; i >= ef; i--) {
-          if (!visit(n.keys[i], rowAt(n, i))) return false;
+          if (!visit(keyAt(n, i), rowAt(n, i))) return false;
         }
         return true;
       }
@@ -703,7 +753,7 @@ export class PMap {
 function* walkIter(n: PNode, b: KeyBound, src: LeafSource | null): Generator<[Uint8Array, Row]> {
   if (isLeaf(n)) {
     const [ef, el] = entryWindow(b, n);
-    for (let i = ef; i < el; i++) yield [n.keys[i], rowAt(n, i)];
+    for (let i = ef; i < el; i++) yield [keyAt(n, i), rowAt(n, i)];
     return;
   }
   const [cf, cl] = childWindow(b, n);
@@ -716,7 +766,7 @@ function* walkIter(n: PNode, b: KeyBound, src: LeafSource | null): Generator<[Ui
 function* walkRevIter(n: PNode, b: KeyBound, src: LeafSource | null): Generator<[Uint8Array, Row]> {
   if (isLeaf(n)) {
     const [ef, el] = entryWindow(b, n);
-    for (let i = el - 1; i >= ef; i--) yield [n.keys[i], rowAt(n, i)];
+    for (let i = el - 1; i >= ef; i--) yield [keyAt(n, i), rowAt(n, i)];
     return;
   }
   const [cf, cl] = childWindow(b, n);
@@ -877,19 +927,18 @@ function nodeInsert(
 ): InsOut {
   if (isLeaf(n)) {
     const { index, found } = search(n, key);
+    const { keys, vals, weights } = decodedParts(n);
     if (found) {
-      const vals = decodedRows(n);
-      const weights = n.weights.slice();
       ctx.old = vals[index];
       ctx.replaced = true;
       vals[index] = val;
       weights[index] = weight;
-      return buildLeaf(n.keys.slice(), vals, weights, cap, shape, index);
+      return buildLeaf(keys, vals, weights, cap, shape, index);
     }
     return buildLeaf(
-      insertAt(n.keys, index, key),
-      insertAt(decodedRows(n), index, val),
-      insertAt(n.weights, index, weight),
+      insertAt(keys, index, key),
+      insertAt(vals, index, val),
+      insertAt(weights, index, weight),
       cap,
       shape,
       index,
@@ -934,11 +983,11 @@ function nodeRemove(
   if (isLeaf(n)) {
     const { index, found } = search(n, key);
     if (!found) return { ok: false, node: n, removed: undefined };
-    const rows = decodedRows(n);
+    const { keys, vals: rows, weights } = decodedParts(n);
     const removed = rows[index];
     return {
       ok: true,
-      node: newLeaf(removeAt(n.keys, index), removeAt(rows, index), removeAt(n.weights, index)),
+      node: newLeaf(removeAt(keys, index), removeAt(rows, index), removeAt(weights, index)),
       removed,
     };
   }
@@ -996,9 +1045,11 @@ function mergeAt(
   let merged: InsOut;
   if (isLeaf(left)) {
     // Materialize both leaves (either may be Packed) before merging — the merged node is Decoded.
-    const mkeys = [...left.keys, ...right.keys];
-    const mvals = [...decodedRows(left), ...decodedRows(right)];
-    const mweights = [...left.weights, ...right.weights];
+    const l = decodedParts(left);
+    const r = decodedParts(right);
+    const mkeys = [...l.keys, ...r.keys];
+    const mvals = [...l.vals, ...r.vals];
+    const mweights = [...l.weights, ...r.weights];
     merged = buildLeaf(mkeys, mvals, mweights, cap, shape, null);
   } else {
     const mkeys = [...left.keys, n.keys[j]!, ...right.keys];

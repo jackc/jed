@@ -107,12 +107,11 @@ A fixed-capacity cache mapping `page_id → decoded page`, with:
   database thrashed the pool under the default, paying a fault + leaf decode on most point lookups.
   256 MiB keeps the dominant RAM-sized case fully resident; a host that wants the old bound passes
   `cache_bytes` explicitly.) The budget is a *handle* setting, not an
-  on-disk parameter. **Caveat — the bound counts `cache_leaves × page_size`, but a resident leaf
-  today holds the *inflated decoded* form** (`vals: Vec<Row>` of expanded `Value` trees, several ×
-  its on-disk bytes), so true resident bytes run above the stated budget. The
-  [lazy-record.md](lazy-record.md) reshape (keep a faulted leaf as its compact on-disk bytes,
-  decode columns on demand) makes resident leaf memory `≈ cache_leaves × page_size` — i.e. makes
-  this byte budget *mean what it says*; it is a results/cost-neutral change above this seam.
+  on-disk parameter. A resident clean leaf is the retained page block plus shared PAX directories:
+  rows decode by touched column, keys are borrowed spans of the key blob, and record weights derive
+  lazily. It owns no per-record key, row, or weight objects, so resident leaf memory is
+  `≈ cache_leaves × page_size` and the byte budget means what it says. This Packed representation is
+  results/cost/byte-neutral above the seam ([packed-leaf.md](packed-leaf.md)).
 - **Eviction — CLOCK (second-chance).** A simple per-core CLOCK over the resident pages: a
   reference bit set on access, a hand that sweeps and evicts the first unreferenced, unpinned,
   clean page. CLOCK over strict LRU because it needs no per-access list surgery and is the
