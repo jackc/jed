@@ -6,12 +6,28 @@
 schema_version = 1
 
 [[bench]]
-name = "point_lookup_pk"
-description = "PK point lookup on 1M rows; a B-tree seek in every engine"
+name = "point_lookup_pk_ramp"
+description = "PK point lookup on 1M rows with a short warmup; includes jed leaf-cache population"
 dataset = "large"
 kind = "query"
 sql = "SELECT id, customer_id, amount, note FROM orders WHERE id = $1"
 warmup = 2000
+iterations = 50000
+seed = 4201
+expect_rows_per_iter = 1
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 1000000
+
+[[bench]]
+name = "point_lookup_pk"
+description = "Fully-hot PK point lookup on 1M rows after warming the leaf working set"
+dataset = "large"
+kind = "query"
+sql = "SELECT id, customer_id, amount, note FROM orders WHERE id = $1"
+warmup = 50000
 iterations = 50000
 seed = 4201
 expect_rows_per_iter = 1

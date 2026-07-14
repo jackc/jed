@@ -111,6 +111,10 @@ module BenchResults
     end
   end
 
+  def humanize_optional(ns)
+    ns ? humanize(ns) : "—"
+  end
+
   def delta_class(delta)
     return "noise" if delta.abs < NOISE_PCT
 
@@ -162,7 +166,11 @@ module BenchResults
           width_pct: [r["ns_per_op"] * 100.0 / slowest, 0.4].max,
           ns: humanize(r["ns_per_op"]),
           mult: format("%.1f×", r["ns_per_op"].to_f / fastest),
-          tooltip: "min #{humanize(r['min_ns'])} · p50 #{humanize(r['p50_ns'])} · " \
+          p50: humanize_optional(r["p50_ns"]),
+          p90: humanize_optional(r["p90_ns"]),
+          p99: humanize_optional(r["p99_ns"]),
+          tooltip: "min #{humanize(r['min_ns'])} · p50 #{humanize_optional(r['p50_ns'])} · " \
+                   "p90 #{humanize_optional(r['p90_ns'])} · p99 #{humanize_optional(r['p99_ns'])} · " \
                    "#{r['iterations']} iterations · #{r['rows_total']} rows",
           delta: diff&.dig(:delta_pct),
           delta_tooltip: diff && diff[:before] &&

@@ -89,6 +89,8 @@ type Result struct {
 	NsPerOp     int64  `json:"ns_per_op"`
 	MinNs       int64  `json:"min_ns"`
 	P50Ns       int64  `json:"p50_ns"`
+	P90Ns       int64  `json:"p90_ns"`
+	P99Ns       int64  `json:"p99_ns"`
 	RowsTotal   int64  `json:"rows_total"`
 	Checksum    string `json:"checksum"`
 	Fingerprint string `json:"fingerprint"`
@@ -135,7 +137,7 @@ func Run(cfg Config, corpusDir, dataDir, filter string) ([]Result, error) {
 
 func runOne(cfg Config, b *Bench, datasets *Datasets, dataDir, want string) (Result, error) {
 	res := Result{
-		Schema: 1, Bench: b.Name, Dataset: b.Dataset, Engine: cfg.Engine, Lang: cfg.Lang,
+		Schema: 2, Bench: b.Name, Dataset: b.Dataset, Engine: cfg.Engine, Lang: cfg.Lang,
 		Variant: cfg.Variant, Iterations: b.Iterations, Warmup: b.Warmup,
 		Fingerprint: want, StartedAt: time.Now().UTC().Format(time.RFC3339),
 	}
@@ -275,7 +277,9 @@ func runOne(cfg Config, b *Bench, datasets *Datasets, dataDir, want string) (Res
 	}
 	res.NsPerOp = res.TotalNs / int64(b.Iterations)
 	res.MinNs = elapsed[0]
-	res.P50Ns = elapsed[(len(elapsed)-1)/2]
+	res.P50Ns = percentile(elapsed, 50)
+	res.P90Ns = percentile(elapsed, 90)
+	res.P99Ns = percentile(elapsed, 99)
 	res.Checksum = sum.Hex()
 	return res, nil
 }
@@ -379,10 +383,19 @@ func runConcurrent(cfg Config, b *Bench, ce ConcurrentEngine, res Result) (Resul
 	res.TotalNs = wall
 	res.NsPerOp = wall / int64(b.Iterations)
 	res.MinNs = all[0]
-	res.P50Ns = all[(len(all)-1)/2]
+	res.P50Ns = percentile(all, 50)
+	res.P90Ns = percentile(all, 90)
+	res.P99Ns = percentile(all, 99)
 	res.RowsTotal = rowsTotal
 	res.Checksum = combined.Hex()
 	return res, nil
+}
+
+// percentile returns the lower sample percentile from an already-sorted, non-empty
+// distribution. The index floor((n-1)*pct/100) keeps p50 identical to the historical
+// lower median and is mirrored by every harness (benchmarks.md §6).
+func percentile(sorted []int64, pct int) int64 {
+	return sorted[(len(sorted)-1)*pct/100]
 }
 
 // partition tiles items into n contiguous blocks (the first len%n blocks get one extra),

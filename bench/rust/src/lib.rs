@@ -425,6 +425,8 @@ pub struct ResultLine {
     pub ns_per_op: i64,
     pub min_ns: i64,
     pub p50_ns: i64,
+    pub p90_ns: i64,
+    pub p99_ns: i64,
     pub rows_total: i64,
     pub checksum: String,
     pub fingerprint: String,
@@ -435,9 +437,10 @@ impl ResultLine {
     pub fn to_json(&self, cfg: &Config) -> String {
         format!(
             concat!(
-                "{{\"schema\":1,\"bench\":\"{}\",\"dataset\":\"{}\",\"engine\":\"{}\",",
+                "{{\"schema\":2,\"bench\":\"{}\",\"dataset\":\"{}\",\"engine\":\"{}\",",
                 "\"lang\":\"{}\",\"variant\":\"{}\",\"iterations\":{},\"warmup\":{},",
                 "\"readers\":{},\"total_ns\":{},\"ns_per_op\":{},\"min_ns\":{},\"p50_ns\":{},",
+                "\"p90_ns\":{},\"p99_ns\":{},",
                 "\"rows_total\":{},\"checksum\":\"{}\",\"fingerprint\":\"{}\",\"started_at\":\"{}\"}}"
             ),
             self.bench,
@@ -452,6 +455,8 @@ impl ResultLine {
             self.ns_per_op,
             self.min_ns,
             self.p50_ns,
+            self.p90_ns,
+            self.p99_ns,
             self.rows_total,
             self.checksum,
             self.fingerprint,
@@ -608,7 +613,9 @@ fn run_one(
         total_ns,
         ns_per_op: total_ns / b.iterations as i64,
         min_ns: elapsed[0],
-        p50_ns: elapsed[(elapsed.len() - 1) / 2],
+        p50_ns: percentile(&elapsed, 50),
+        p90_ns: percentile(&elapsed, 90),
+        p99_ns: percentile(&elapsed, 99),
         rows_total,
         checksum: sum.hex(),
         fingerprint: want.to_string(),
@@ -678,12 +685,20 @@ fn run_concurrent(
         total_ns: out.wall_ns,
         ns_per_op: out.wall_ns / b.iterations as i64,
         min_ns: elapsed[0],
-        p50_ns: elapsed[(elapsed.len() - 1) / 2],
+        p50_ns: percentile(&elapsed, 50),
+        p90_ns: percentile(&elapsed, 90),
+        p99_ns: percentile(&elapsed, 99),
         rows_total: out.rows_total,
         checksum: combined.hex(),
         fingerprint: want.to_string(),
         started_at,
     }))
+}
+
+/// Lower sample percentile from an already-sorted, non-empty distribution. This
+/// preserves the historical lower-median definition for p50.
+fn percentile(sorted: &[i64], pct: usize) -> i64 {
+    sorted[(sorted.len() - 1) * pct / 100]
 }
 
 // The target table of a write statement — the word after INTO (INSERT), UPDATE, or FROM (DELETE) —
@@ -786,5 +801,13 @@ mod tests {
         assert_eq!(write_table("INSERT INTO orders VALUES ($1)"), "orders");
         assert_eq!(write_table("UPDATE orders SET v = $1"), "orders");
         assert_eq!(write_table("DELETE FROM orders WHERE id=$1"), "orders");
+    }
+
+    #[test]
+    fn sample_percentiles() {
+        let samples: Vec<i64> = (0..=10).collect();
+        assert_eq!(percentile(&samples, 50), 5);
+        assert_eq!(percentile(&samples, 90), 9);
+        assert_eq!(percentile(&samples, 99), 9);
     }
 }

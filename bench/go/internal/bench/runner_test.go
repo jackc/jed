@@ -14,3 +14,12 @@ func TestWriteTable(t *testing.T) {
 		}
 	}
 }
+
+func TestPercentile(t *testing.T) {
+	samples := []int64{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+	for pct, want := range map[int]int64{50: 5, 90: 9, 99: 9} {
+		if got := percentile(samples, pct); got != want {
+			t.Errorf("percentile(samples, %d) = %d, want %d", pct, got, want)
+		}
+	}
+}

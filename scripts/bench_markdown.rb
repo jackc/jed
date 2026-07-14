@@ -79,10 +79,10 @@ model[:sections].each do |s|
   desc << s[:subtitle]
   out << desc.join("  \n") # two-space hard breaks: one paragraph, three lines
   out << ""
-  headers = ["engine", "", "ns/op", "vs fastest"]
+  headers = ["engine", "", "ns/op", "p50", "p90", "p99", "vs fastest"]
   headers << "Δ vs baseline" if baseline_dir
   rows = s[:rows].map do |r|
-    cells = [r[:label], bar(r[:width_pct]), r[:ns], r[:mult]]
+    cells = [r[:label], bar(r[:width_pct]), r[:ns], r[:p50], r[:p90], r[:p99], r[:mult]]
     cells << (r[:delta] ? format("%+.1f%%", r[:delta]) : "—") if baseline_dir
     cells
   end

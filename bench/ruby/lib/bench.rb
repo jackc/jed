@@ -177,14 +177,16 @@ module Bench
 
   ResultLine = Struct.new(
     :bench, :dataset, :iterations, :warmup, :total_ns, :ns_per_op, :min_ns, :p50_ns,
+    :p90_ns, :p99_ns,
     :rows_total, :checksum, :fingerprint, :started_at
   ) do
     # The JSONL contract (benchmarks.md §6) — field order matches the other harnesses exactly.
     def to_json_line(cfg)
-      %({"schema":1,"bench":"#{bench}","dataset":"#{dataset}","engine":"#{cfg[:engine]}",) +
+      %({"schema":2,"bench":"#{bench}","dataset":"#{dataset}","engine":"#{cfg[:engine]}",) +
         %("lang":"#{cfg[:lang]}","variant":"#{cfg[:variant]}","iterations":#{iterations},) +
         %("warmup":#{warmup},"readers":0,"total_ns":#{total_ns},"ns_per_op":#{ns_per_op},"min_ns":#{min_ns},) +
-        %("p50_ns":#{p50_ns},"rows_total":#{rows_total},"checksum":"#{checksum}",) +
+        %("p50_ns":#{p50_ns},"p90_ns":#{p90_ns},"p99_ns":#{p99_ns},) +
+        %("rows_total":#{rows_total},"checksum":"#{checksum}",) +
         %("fingerprint":"#{fingerprint}","started_at":"#{started_at}"})
     end
   end
@@ -275,12 +277,19 @@ module Bench
     elapsed.sort!
     total_ns = elapsed.sum
     ns_per_op = total_ns / w.iterations
-    warn "  → #{ns_per_op} ns/op, #{allocs_per_op} allocs/op (p50 #{elapsed[(elapsed.length - 1) / 2]})"
+    p50 = percentile(elapsed, 50)
+    p90 = percentile(elapsed, 90)
+    p99 = percentile(elapsed, 99)
+    warn "  → #{ns_per_op} ns/op, #{allocs_per_op} allocs/op (p50/p90/p99 #{p50}/#{p90}/#{p99})"
     ResultLine.new(
       w.name, w.dataset, w.iterations, w.warmup, total_ns, ns_per_op,
-      elapsed[0], elapsed[(elapsed.length - 1) / 2], rows_total, sum.hex, want, started_at
+      elapsed[0], p50, p90, p99, rows_total, sum.hex, want, started_at
     )
   end
+
+  # Lower sample percentile from an already-sorted, non-empty distribution. This
+  # preserves the historical lower-median definition for p50.
+  def percentile(sorted, pct) = sorted[(sorted.length - 1) * pct / 100]
 
   # Uniform entrypoint: bench_jed.rb <corpus_dir> <data_dir> <out_path> [name_filter].
   def main_with(cfg)

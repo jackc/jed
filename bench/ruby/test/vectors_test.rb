@@ -34,4 +34,11 @@ class VectorsTest < Minitest::Test
     c.end_row
     assert_equal "dd6e60407d30d28b", c.hex
   end
+
+  def test_lower_sample_percentiles
+    samples = (0..10).to_a
+    assert_equal 5, Bench.percentile(samples, 50)
+    assert_equal 9, Bench.percentile(samples, 90)
+    assert_equal 9, Bench.percentile(samples, 99)
+  end
 end

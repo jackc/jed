@@ -354,6 +354,8 @@ interface ResultLine {
   ns_per_op: number;
   min_ns: number;
   p50_ns: number;
+  p90_ns: number;
+  p99_ns: number;
   rows_total: number;
   checksum: string;
   fingerprint: string;
@@ -440,7 +442,7 @@ async function runOne(
       for (const h of out.blockHexes) combined.text(h);
       const cel = out.elapsed.slice().sort((a, z) => (a < z ? -1 : a > z ? 1 : 0));
       return {
-        schema: 1,
+        schema: 2,
         bench: b.name,
         dataset: b.dataset,
         engine: cfg.engine,
@@ -452,7 +454,9 @@ async function runOne(
         total_ns: Number(out.wallNs),
         ns_per_op: Number(out.wallNs / BigInt(b.iterations)),
         min_ns: Number(cel[0]),
-        p50_ns: Number(cel[(cel.length - 1) >> 1]),
+        p50_ns: Number(percentile(cel, 50)),
+        p90_ns: Number(percentile(cel, 90)),
+        p99_ns: Number(percentile(cel, 99)),
         rows_total: out.rowsTotal,
         checksum: combined.hex(),
         fingerprint: want,
@@ -525,7 +529,7 @@ async function runOne(
     let totalNs = 0n;
     for (const d of elapsed) totalNs += d;
     return {
-      schema: 1,
+      schema: 2,
       bench: b.name,
       dataset: b.dataset,
       engine: cfg.engine,
@@ -537,7 +541,9 @@ async function runOne(
       total_ns: Number(totalNs),
       ns_per_op: Number(totalNs / BigInt(b.iterations)),
       min_ns: Number(elapsed[0]),
-      p50_ns: Number(elapsed[(elapsed.length - 1) >> 1]),
+      p50_ns: Number(percentile(elapsed, 50)),
+      p90_ns: Number(percentile(elapsed, 90)),
+      p99_ns: Number(percentile(elapsed, 99)),
       rows_total: rowsTotal,
       checksum: sum.hex(),
       fingerprint: want,
@@ -546,6 +552,12 @@ async function runOne(
   } finally {
     await eng.close();
   }
+}
+
+// Lower sample percentile from an already-sorted, non-empty distribution. This
+// preserves the historical lower-median definition for p50.
+export function percentile(sorted: bigint[], pct: number): bigint {
+  return sorted[Math.floor(((sorted.length - 1) * pct) / 100)];
 }
 
 // The target table of a write statement — the word after INTO (INSERT), UPDATE, or FROM (DELETE) —

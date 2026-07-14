@@ -52,9 +52,9 @@ rows.each do |(bench, dataset), group|
 
   detail = columns.map do |c|
     r = by_col[c]
-    (r ? "#{BenchResults.humanize(r['min_ns'])}/#{BenchResults.humanize(r['p50_ns'])}" : "-").rjust(col_w)
+    (r ? ["min", "p50", "p90", "p99"].map { |p| BenchResults.humanize_optional(r["#{p}_ns"]) }.join("/") : "-").rjust(col_w)
   end
-  puts "#{'  min/p50'.ljust(label_w)}  #{detail.join('  ')}"
+  puts "#{'  min/p50/p90/p99'.ljust(label_w)}  #{detail.join('  ')}"
 end
 
 unless failures.empty?

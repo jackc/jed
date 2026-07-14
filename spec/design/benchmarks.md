@@ -1,6 +1,6 @@
 # Benchmarks — cross-core and cross-engine wall-clock measurement
 
-Status: v1 landed (corpus format, setup tool, six benchmarks, harnesses in all three
+Status: v2 landed (corpus format, setup tool, harnesses in all three
 cores). Grown since with `cte_materialized`, `lateral_top_n_per_group`, the GIN-bounded-scan
 benchmarks (`gin_contains` / `gin_overlaps` / `gin_member` / `gin_array_eq` / `gin_delete`)
 over a dedicated `gin` dataset (§4), the regex + window benchmarks, and the **concurrent-reader
@@ -77,6 +77,22 @@ pair retained checksum `52e015d7a68673bd` and improved after ANALYZE by **18.7×
 before/after records above; they verify that the final integrated branch retains their plan shapes,
 answers, and performance direction.
 
+**Point-lookup ramp/hot split baseline (2026-07-14).** The former `point_lookup_pk` number mixed
+steady prepared execution with the first fault of roughly 5,000 packed leaves: 2,000 random warmup
+probes could not populate a roughly 6,900-leaf working set. It is now the explicitly named
+`point_lookup_pk_ramp` lane, while `point_lookup_pk` warms with 50,000 probes before measuring. Both
+retain the same SQL, million-row dataset, seed, generator, expected-row check, and cross-engine
+checksum; because the longer warmup consumes more of the parameter stream, the measured checksums
+are respectively `f82d3b99ddaff0fb` and `28f09c46d56e242a`. Result schema 2 adds p90/p99 so the
+population tail is visible instead of being hidden by mean+p50. Before the packed-key/direct-point
+follow-ons, the ramp mean / p50 / p90 was **9.25 / 2.38 / 54.1 µs Go**, **6.52 / 2.92 / 37.0 µs
+Rust**, and **18.6 / 7.95 / 90.2 µs TypeScript**; the fully-hot values collapsed to **2.41 / 2.19 /
+3.02 µs**, **2.83 / 2.82 / 3.36 µs**, and **7.77 / 7.19 / 8.81 µs** respectively. Same-language
+SQLite hot means were **6.72 µs** (`mattn-cgo`), **2.78 µs** (`rusqlite`), and **6.47 µs**
+(`node:sqlite`). The split proves the diagnosis directly: Go and Rust hot means are close to p50,
+while the ramp p90 records the first-fault work the representation slice targets. Timings remain
+non-gating; both lanes' checksum agreement is the correctness gate.
+
 ## 1. Purpose and non-goals
 
 The benchmark suite answers two questions, continuously:
@@ -137,12 +153,12 @@ benchmarks are added by editing `benchmarks.toml` (and, if they need new data,
 schema_version = 1
 
 [[bench]]
-name        = "point_lookup_pk"     # unique; result key together with (engine, lang, variant)
-description = "PK point lookup on 1M rows"
+name        = "point_lookup_pk"     # fully-hot lane; point_lookup_pk_ramp keeps the short warmup
+description = "Fully-hot PK point lookup on 1M rows after warming the leaf working set"
 dataset     = "large"               # "small" | "large" | "scratch" (§8)
 kind        = "query"               # "query" | "write_rollback" | "write_durable" | "concurrent_read" (§8.1)
 sql         = "SELECT id, customer_id, amount, note FROM orders WHERE id = $1"
-warmup      = 2000                  # untimed iterations (consume the same param stream)
+warmup      = 50000                 # enough random probes to touch essentially every leaf
 iterations  = 50000                 # timed iterations
 seed        = 4201                  # splitmix64 seed for this bench's param stream (§4)
 
@@ -343,23 +359,27 @@ truncated on open. One JSON object (single line, keys in this order) per complet
 benchmark:
 
 ```json
-{"schema":1,"bench":"point_lookup_pk","dataset":"large","engine":"jed","lang":"go",
- "variant":"core","iterations":50000,"warmup":2000,"readers":0,"total_ns":312000000,
- "ns_per_op":6240,"min_ns":4100,"p50_ns":5900,"rows_total":50000,"checksum":"9f86d081884c7d65",
+{"schema":2,"bench":"point_lookup_pk","dataset":"large","engine":"jed","lang":"go",
+ "variant":"core","iterations":50000,"warmup":50000,"readers":0,"total_ns":312000000,
+ "ns_per_op":6240,"min_ns":4100,"p50_ns":5900,"p90_ns":6700,"p99_ns":9100,
+ "rows_total":50000,"checksum":"9f86d081884c7d65",
  "fingerprint":"<sha256 hex>","started_at":"2026-06-12T14:03:11Z"}
 ```
 
 `readers` is the concurrency level (`concurrent_read` only; `0` for the other kinds). For
 `concurrent_read`, `total_ns` is the **wall clock of the timed phase** (so `ns_per_op =
 wall / iterations` is the *throughput* latency that falls as readers scale), and `min_ns` /
-`p50_ns` are the merged per-query latency distribution across readers (§8.1).
+`p50_ns` / `p90_ns` / `p99_ns` are the merged per-query latency distribution across readers (§8.1).
 
 - `engine` ∈ `jed | postgres | sqlite`; `lang` ∈ `go | rust | ts`; `variant` names the
   driver: `core` (jed), `pgx`, `postgres-crate`, `porsager`, `modernc`, `mattn-cgo`,
   `rusqlite`, `node-sqlite`. The comparison key is `(engine, lang, variant)`.
 - Timing: per-iteration elapsed via the language's monotonic clock (Go `time.Now`, Rust
   `Instant`, TS `process.hrtime.bigint`); `ns_per_op = total_ns / iterations` (integer
-  division), `min_ns`, `p50_ns` (sorted, lower median). Mean + min + p50, nothing more.
+  division). `min_ns`, `p50_ns`, `p90_ns`, and `p99_ns` come from the sorted samples at
+  index `floor((N - 1) * percentile / 100)`; this keeps p50's historical lower-median definition.
+  Schema 2 adds p90/p99 so cache-fault and GC tails remain visible; reporters continue to read
+  schema-1 runs and render their missing tail fields as an em dash.
 - `rows_total`: rows returned across measured iterations (0 for write kinds — their
   verification lives in the checksum).
 

@@ -106,13 +106,16 @@ template = <<~'HTML'
   <% if s[:sql] -%><p class="sql"><code><%= h(s[:sql]) %></code></p><% end -%>
   <p class="subtitle"><%= h(s[:subtitle]) %></p>
   <table>
-  <tr><th></th><th></th><th class="num">ns/op</th><th class="num">vs fastest</th>
+  <tr><th></th><th></th><th class="num">ns/op</th><th class="num">p50</th><th class="num">p90</th><th class="num">p99</th><th class="num">vs fastest</th>
   <% if baseline_dir -%><th class="num">Δ vs baseline</th><% end -%></tr>
   <% s[:rows].each do |r| -%>
   <tr class="<%= r[:family] %>">
     <td class="label"><%= h(r[:label]) %></td>
     <td class="barcell"><div class="bar <%= r[:family] %>" style="width: <%= format("%.1f", r[:width_pct]) %>%"></div></td>
     <td class="num" title="<%= h(r[:tooltip]) %>"><%= h(r[:ns]) %></td>
+    <td class="num"><%= h(r[:p50]) %></td>
+    <td class="num"><%= h(r[:p90]) %></td>
+    <td class="num"><%= h(r[:p99]) %></td>
     <td class="num"><%= h(r[:mult]) %></td>
   <% if baseline_dir -%>
     <% if r[:delta] -%>
