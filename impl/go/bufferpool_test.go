@@ -1,6 +1,10 @@
 package jed
 
-import "testing"
+import (
+	"sync/atomic"
+	"testing"
+	"time"
+)
 
 func BenchmarkBufferPoolPopulate(b *testing.B) {
 	const capacity = 32_768
@@ -112,5 +116,131 @@ func TestBufferPoolCapacityOneEvictsEveryTime(t *testing.T) {
 	}
 	if pool.resident() != 1 {
 		t.Fatalf("resident = %d", pool.resident())
+	}
+}
+
+func TestBufferPoolDistinctPageLoadersRunOutsidePoolLock(t *testing.T) {
+	t.Parallel()
+	pool := newBufferPool(4)
+	started := make(chan uint32, 2)
+	release := make(chan struct{})
+	results := make(chan uint32, 2)
+
+	for _, page := range []uint32{11, 12} {
+		go func() {
+			node, err := pool.getOrLoad(page, func() (*pnode, error) {
+				started <- page
+				<-release
+				return &pnode{page: page}, nil
+			})
+			if err != nil {
+				results <- 0
+				return
+			}
+			results <- node.page
+		}()
+	}
+
+	first := false
+	second := false
+	for i := 0; i < 2; i++ {
+		select {
+		case <-started:
+			if i == 0 {
+				first = true
+			} else {
+				second = true
+			}
+		case <-time.After(2 * time.Second):
+			i = 2
+		}
+	}
+	close(release)
+	got := map[uint32]bool{<-results: true, <-results: true}
+	if !first {
+		t.Fatal("no page loader entered")
+	}
+	if !second {
+		t.Fatal("a distinct page loader was serialized behind the pool lock")
+	}
+	if !got[11] || !got[12] {
+		t.Fatalf("loaded pages = %v, want 11 and 12", got)
+	}
+}
+
+func TestBufferPoolSamePageMissIsSingleFlight(t *testing.T) {
+	t.Parallel()
+	pool := newBufferPool(4)
+	var loads atomic.Int32
+	leaderStarted := make(chan struct{})
+	release := make(chan struct{})
+	results := make(chan *pnode, 2)
+
+	go func() {
+		node, _ := pool.getOrLoad(7, func() (*pnode, error) {
+			loads.Add(1)
+			close(leaderStarted)
+			<-release
+			return &pnode{page: 70}, nil
+		})
+		results <- node
+	}()
+	<-leaderStarted
+	go func() {
+		node, _ := pool.getOrLoad(7, func() (*pnode, error) {
+			loads.Add(1)
+			return &pnode{page: 71}, nil
+		})
+		results <- node
+	}()
+	close(release)
+
+	first, second := <-results, <-results
+	if got := loads.Load(); got != 1 {
+		t.Fatalf("same page load count = %d, want 1", got)
+	}
+	if first != second || first.page != 70 {
+		t.Fatalf("single-flight results = (%p page %d, %p page %d)", first, first.page, second, second.page)
+	}
+}
+
+func TestBufferPoolInvalidateDuringLoadPreventsStaleReinsertion(t *testing.T) {
+	t.Parallel()
+	pool := newBufferPool(4)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	loaded := make(chan *pnode, 1)
+
+	go func() {
+		node, _ := pool.getOrLoad(9, func() (*pnode, error) {
+			close(started)
+			<-release
+			return &pnode{page: 90}, nil
+		})
+		loaded <- node
+	}()
+	<-started
+	pool.invalidate(9)
+
+	// A caller from the newly published snapshot must not join the detached old flight. It loads fresh
+	// content immediately while the old caller still holds its immutable bytes.
+	fresh, err := pool.getOrLoad(9, func() (*pnode, error) { return &pnode{page: 91}, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.page != 91 {
+		t.Fatalf("fresh page = %d, want 91", fresh.page)
+	}
+	close(release)
+	if node := <-loaded; node.page != 90 {
+		t.Fatalf("in-flight caller page = %d, want 90", node.page)
+	}
+
+	fresh, err = pool.getOrLoad(9, func() (*pnode, error) { return &pnode{page: 92}, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.page != 91 {
+		t.Fatalf("cached page = %d, want fresh 91 (old flight replaced it)", fresh.page)
 	}
 }

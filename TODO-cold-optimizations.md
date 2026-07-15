@@ -1,7 +1,7 @@
 # Cold point-lookup optimization handoff
 
-Status: P0, P1, and P2 improvements 1--2 implemented and verified 2026-07-15; P2 improvements 3--4
-remain follow-ons. Written 2026-07-14 on
+Status: P0, P1, and P2 improvements 1--3 implemented and verified 2026-07-15; P2 improvement 4
+remains a follow-on. Written 2026-07-14 on
 branch `perf/point-lookup-cache` at
 `cbbdd184132649a894f72bc58d7be7e2f2d12f87`, then revised after evaluating standard-library,
 third-party, SIMD/intrinsic, assembly, alternate-CRC, and cryptographic-hash options.
@@ -361,11 +361,23 @@ These are secondary and should be measured only after P0/P1:
    noise: median mean / p50 / p90 / p99 moved from **2.910/2.161/7.557/10.105 µs** to
    **2.983/2.288/7.857/9.544 µs**, retaining checksum `f82d3b99ddaff0fb`. Full results and runtime/host
    context are in `spec/design/benchmarks.md`.
-3. For concurrent cold faults, stop holding the global pool lock across file read, checksum, and PAX
-   parse. The current Rust path holds the pool mutex through the loader; Go uses one mutex for pager and
-   pool. Use a per-page loading/single-flight state or an unlock-load-recheck insertion protocol, while
-   preserving commit synchronization and preventing stale page-id reuse. This does not explain the
-   single-reader ramp result, but the slow CRC amplifies head-of-line blocking for concurrent readers.
+3. **Complete (2026-07-15):** Rust and Go now coordinate misses with a per-page loading/single-flight
+   entry. The pool mutex covers only hit/miss registration and CLOCK insertion; physical reads retain
+   the separate pager lock that serializes them against commit writes, while CRC validation and PAX
+   parsing run outside both locks. Different-page decode work can overlap, and same-page callers share
+   one node or load error. Commit invalidation evicts a resident entry, then marks and detaches any
+   in-flight old load: existing waiters may finish on its immutable result, post-invalidation callers
+   start a fresh load, and stale content cannot be reinserted after page-id reuse. The reader watermark
+   remains the snapshot-safety gate. TypeScript stays on its direct single-threaded path. Focused tests
+   in both threaded cores prove different-page overlap, same-page single flight, and invalidation during
+   load; the existing concurrent file reader/writer tests still pass, including Go under `-race`.
+   The new `concurrent_read_pk_cold_r{1,4}` benchmark keeps the million-row working set inside the
+   default cache but begins measurement after only 2,000 probes, isolating concurrent cache population.
+   In the paired final-tree run, r4 throughput time moved **11.220 → 10.212 µs/op Go (-9.0%)** and
+   **10.154 → 9.078 µs/op Rust (-10.6%)**; single-threaded TypeScript was unchanged within noise
+   (**60.811 → 61.996 µs/op**). The per-reader-count checksums remained cross-core identical
+   (`f086f7634186c3f4` r1, `c72e6d5fabdc504e` r4). Timings are observational; the synchronization
+   tests pin the structural property.
 4. If applications need predictable startup latency and the working set fits in the configured cache,
    an explicit/background prewarm facility can shift first faults out of request latency. Treat it as
    a policy feature, not a substitute for making faults cheap.
@@ -398,5 +410,7 @@ reaches about 9 us mean and 12/21 us p90/p99. Fully-hot performance stayed effec
 The browser fallback remains pure TypeScript and should be measured separately on each supported
 browser when browser performance becomes an active benchmark lane.
 
-P1 removed the residual per-record directory allocations without weakening validation. The smaller P2
-work can target remaining page-read and cache-population tails without weakening the checksum guarantee.
+P1 removed the residual per-record directory allocations without weakening validation. P2 removed the
+measured index-growth and Rust seek overhead, then eliminated global-pool head-of-line blocking during
+concurrent checksum/PAX decode. The remaining prewarm item is an explicit policy facility, not a
+fault-path correctness or checksum change.

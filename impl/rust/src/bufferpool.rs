@@ -14,7 +14,8 @@
 //! decoupled from the node codec and unit-testable on its own.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::error::Result;
 
@@ -35,12 +36,64 @@ struct Slot<T> {
     referenced: bool,
 }
 
-/// A bounded CLOCK cache from page id to a decoded value.
-pub(crate) struct BufferPool<T> {
+/// One page load shared by every caller that misses on the same page while its physical read and
+/// decode are in progress. The result is published once; followers wait without holding the pool
+/// mutex. Errors are shared too, so one corrupt/read-failing page still performs one load attempt.
+struct LoadFlight<T> {
+    result: Mutex<Option<Result<Arc<T>>>>,
+    ready: Condvar,
+    invalidated: AtomicBool,
+}
+
+impl<T> LoadFlight<T> {
+    fn new() -> Self {
+        LoadFlight {
+            result: Mutex::new(None),
+            ready: Condvar::new(),
+            invalidated: AtomicBool::new(false),
+        }
+    }
+
+    fn wait(&self) -> Result<Arc<T>> {
+        let mut result = self.result.lock().expect("buffer-pool flight poisoned");
+        loop {
+            if let Some(result) = result.as_ref() {
+                return result.clone();
+            }
+            result = self
+                .ready
+                .wait(result)
+                .expect("buffer-pool flight poisoned");
+        }
+    }
+
+    fn complete(&self, result: Result<Arc<T>>) {
+        *self.result.lock().expect("buffer-pool flight poisoned") = Some(result);
+        self.ready.notify_all();
+    }
+
+    fn invalidate(&self) {
+        self.invalidated.store(true, Ordering::Release);
+    }
+
+    fn is_invalidated(&self) -> bool {
+        self.invalidated.load(Ordering::Acquire)
+    }
+}
+
+/// The short-critical-section CLOCK state. Physical read, checksum, and PAX parsing never run while
+/// this mutex is held.
+struct PoolState<T> {
     capacity: usize,
     slots: Vec<Slot<T>>,
     index: HashMap<u32, usize>,
     hand: usize,
+    loading: HashMap<u32, Arc<LoadFlight<T>>>,
+}
+
+/// A bounded CLOCK cache from page id to a decoded value, with per-page single-flight misses.
+pub(crate) struct BufferPool<T> {
+    state: Mutex<PoolState<T>>,
 }
 
 impl<T> BufferPool<T> {
@@ -48,10 +101,13 @@ impl<T> BufferPool<T> {
     pub(crate) fn new(capacity: usize) -> Self {
         let capacity = capacity.max(1);
         BufferPool {
-            capacity,
-            slots: Vec::new(),
-            index: HashMap::with_capacity(initial_index_capacity(capacity)),
-            hand: 0,
+            state: Mutex::new(PoolState {
+                capacity,
+                slots: Vec::new(),
+                index: HashMap::with_capacity(initial_index_capacity(capacity)),
+                hand: 0,
+                loading: HashMap::new(),
+            }),
         }
     }
 
@@ -59,19 +115,78 @@ impl<T> BufferPool<T> {
     /// reference bit), a **miss** calls `load` (read + decode the page), caches it — evicting one
     /// page under CLOCK if at capacity — and returns it. `load`'s error propagates uncached.
     pub(crate) fn get_or_load(
-        &mut self,
+        &self,
         page_id: u32,
         load: impl FnOnce() -> Result<T>,
     ) -> Result<Arc<T>> {
-        if let Some(&i) = self.index.get(&page_id) {
-            self.slots[i].referenced = true;
-            return Ok(self.slots[i].value.clone());
+        let (flight, leader) = {
+            let mut state = self.state.lock().expect("buffer pool mutex poisoned");
+            if let Some(&i) = state.index.get(&page_id) {
+                state.slots[i].referenced = true;
+                return Ok(state.slots[i].value.clone());
+            }
+            if let Some(flight) = state.loading.get(&page_id) {
+                (Arc::clone(flight), false)
+            } else {
+                let flight = Arc::new(LoadFlight::new());
+                state.loading.insert(page_id, Arc::clone(&flight));
+                (flight, true)
+            }
+        };
+
+        if !leader {
+            return flight.wait();
         }
-        let value = Arc::new(load()?);
-        self.insert(page_id, value.clone());
-        Ok(value)
+
+        // Deliberately outside the pool lock: distinct page faults can perform their checksum and PAX
+        // parse concurrently. The pager separately serializes the short physical read against commit.
+        let result = load().map(Arc::new);
+        {
+            let mut state = self.state.lock().expect("buffer pool mutex poisoned");
+            let is_current = state
+                .loading
+                .get(&page_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &flight));
+            if !flight.is_invalidated() {
+                if let Ok(value) = &result {
+                    state.insert(page_id, Arc::clone(value));
+                }
+            }
+            // Publish before removing the flight while the state mutex excludes a new leader. A new
+            // caller then either hits the inserted value or starts a fresh load after an error /
+            // invalidation; existing followers all observe this leader's one result.
+            flight.complete(result.clone());
+            if is_current {
+                state.loading.remove(&page_id);
+            }
+        }
+        result
     }
 
+    /// The number of pages currently resident — the bound the pool enforces (`≤ capacity`), surfaced
+    /// publicly via [`crate::Engine::resident_leaves`] (P6.4c, spec/design/pager.md §3).
+    pub(crate) fn resident(&self) -> usize {
+        self.state
+            .lock()
+            .expect("buffer pool mutex poisoned")
+            .slots
+            .len()
+    }
+
+    /// Drop any cached entry for `page`, then mark and detach an in-flight load. Detaching prevents a
+    /// post-commit caller from joining the old load; marking it non-cacheable closes the
+    /// unlock-load-recheck race, so the old decode cannot be inserted after commit invalidation.
+    /// Callers already waiting on that load still receive its immutable result.
+    pub(crate) fn invalidate(&self, page: u32) {
+        let mut state = self.state.lock().expect("buffer pool mutex poisoned");
+        state.invalidate(page);
+        if let Some(flight) = state.loading.remove(&page) {
+            flight.invalidate();
+        }
+    }
+}
+
+impl<T> PoolState<T> {
     /// Insert a freshly-loaded page, evicting one under CLOCK if at capacity.
     fn insert(&mut self, page_id: u32, value: Arc<T>) {
         if self.slots.len() < self.capacity {
@@ -108,19 +223,13 @@ impl<T> BufferPool<T> {
         }
     }
 
-    /// The number of pages currently resident — the bound the pool enforces (`≤ capacity`), surfaced
-    /// publicly via [`crate::Engine::resident_leaves`] (P6.4c, spec/design/pager.md §3).
-    pub(crate) fn resident(&self) -> usize {
-        self.slots.len()
-    }
-
     /// Drop any cached entry for `page` — required when a commit REWRITES a page in place, which happens
     /// when within-session compaction (a reclaim domain — temp, or an in-memory database with reclamation
     /// on) hands a freed page id back to a new node: the pool caches by page id, so the stale decode of
     /// the page's PRIOR content must be evicted or a later fault returns old rows. A no-op when the page
     /// is not resident — the common case, since a copy-on-write commit without reuse only ever writes
     /// fresh, never-cached high-water pages (so the main file path pays only a map lookup).
-    pub(crate) fn invalidate(&mut self, page: u32) {
+    fn invalidate(&mut self, page: u32) {
         let Some(i) = self.index.remove(&page) else {
             return;
         };
@@ -144,6 +253,9 @@ impl<T> BufferPool<T> {
 mod tests {
     use super::*;
     use std::cell::Cell;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
 
     /// A loader that counts how many times it actually read a page (a cache miss).
     fn counting<'a>(loads: &'a Cell<u32>, v: u32) -> impl FnOnce() -> Result<u32> + 'a {
@@ -155,7 +267,7 @@ mod tests {
 
     #[test]
     fn hit_returns_cached_without_reloading() {
-        let mut pool: BufferPool<u32> = BufferPool::new(4);
+        let pool: BufferPool<u32> = BufferPool::new(4);
         let loads = Cell::new(0);
         assert_eq!(*pool.get_or_load(7, counting(&loads, 70)).unwrap(), 70);
         assert_eq!(*pool.get_or_load(7, counting(&loads, 70)).unwrap(), 70);
@@ -165,7 +277,7 @@ mod tests {
 
     #[test]
     fn resident_set_never_exceeds_capacity() {
-        let mut pool: BufferPool<u32> = BufferPool::new(3);
+        let pool: BufferPool<u32> = BufferPool::new(3);
         let loads = Cell::new(0);
         for p in 0..100u32 {
             pool.get_or_load(p, counting(&loads, p)).unwrap();
@@ -186,7 +298,7 @@ mod tests {
     fn clock_gives_a_referenced_page_a_second_chance() {
         // Fill {0,1,2}; touch 0 (sets its ref bit); inserting 3 should evict 1 (the first
         // unreferenced under the hand), sparing the recently-touched 0.
-        let mut pool: BufferPool<u32> = BufferPool::new(3);
+        let pool: BufferPool<u32> = BufferPool::new(3);
         let loads = Cell::new(0);
         for p in 0..3u32 {
             pool.get_or_load(p, counting(&loads, p)).unwrap();
@@ -204,7 +316,7 @@ mod tests {
 
     #[test]
     fn capacity_one_evicts_every_time() {
-        let mut pool: BufferPool<u32> = BufferPool::new(1);
+        let pool: BufferPool<u32> = BufferPool::new(1);
         let loads = Cell::new(0);
         pool.get_or_load(1, counting(&loads, 1)).unwrap();
         pool.get_or_load(2, counting(&loads, 2)).unwrap();
@@ -222,7 +334,7 @@ mod tests {
 
         let pool = BufferPool::<u32>::new(6_900);
         assert!(
-            pool.index.capacity() >= 6_900,
+            pool.state.lock().unwrap().index.capacity() >= 6_900,
             "constructor must apply the initial index reservation"
         );
 
@@ -230,15 +342,154 @@ mod tests {
         // pool. Pin the allocation property directly: that population must not grow/rehash the
         // eagerly reserved page-id index.
         let value = Arc::new(0u32);
-        let mut pool = BufferPool::new(32_768);
-        let reserved = pool.index.capacity();
+        let pool = BufferPool::new(32_768);
+        let mut state = pool.state.lock().unwrap();
+        let reserved = state.index.capacity();
         for page in 0..6_900 {
-            pool.insert(page, Arc::clone(&value));
+            state.insert(page, Arc::clone(&value));
         }
         assert_eq!(
-            pool.index.capacity(),
+            state.index.capacity(),
             reserved,
             "diagnosed cold population must not reallocate the page-id index",
+        );
+    }
+
+    #[test]
+    fn distinct_page_loaders_run_outside_the_pool_lock() {
+        let pool = Arc::new(BufferPool::new(4));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let mut handles = Vec::new();
+
+        for page in [11u32, 12] {
+            let pool = Arc::clone(&pool);
+            let release = Arc::clone(&release);
+            let started_tx = started_tx.clone();
+            handles.push(thread::spawn(move || {
+                pool.get_or_load(page, || {
+                    started_tx.send(page).unwrap();
+                    let (lock, ready) = &*release;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = ready.wait(released).unwrap();
+                    }
+                    Ok(page)
+                })
+                .unwrap()
+            }));
+        }
+        drop(started_tx);
+
+        let first = started_rx.recv_timeout(Duration::from_secs(2));
+        let second = started_rx.recv_timeout(Duration::from_secs(2));
+        {
+            let (lock, ready) = &*release;
+            *lock.lock().unwrap() = true;
+            ready.notify_all();
+        }
+        let values: Vec<u32> = handles.into_iter().map(|h| *h.join().unwrap()).collect();
+
+        assert!(first.is_ok(), "no page loader entered");
+        assert!(
+            second.is_ok(),
+            "a distinct page loader was serialized behind the pool lock"
+        );
+        assert_eq!(values, vec![11, 12]);
+    }
+
+    #[test]
+    fn same_page_miss_is_single_flight() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let pool = Arc::new(BufferPool::new(4));
+        let loads = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let (leader_tx, leader_rx) = mpsc::channel();
+
+        let leader = {
+            let pool = Arc::clone(&pool);
+            let loads = Arc::clone(&loads);
+            let release = Arc::clone(&release);
+            thread::spawn(move || {
+                pool.get_or_load(7, || {
+                    loads.fetch_add(1, Ordering::SeqCst);
+                    leader_tx.send(()).unwrap();
+                    let (lock, ready) = &*release;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = ready.wait(released).unwrap();
+                    }
+                    Ok(70)
+                })
+                .unwrap()
+            })
+        };
+        leader_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let follower = {
+            let pool = Arc::clone(&pool);
+            let loads = Arc::clone(&loads);
+            thread::spawn(move || {
+                pool.get_or_load(7, || {
+                    loads.fetch_add(1, Ordering::SeqCst);
+                    Ok(71)
+                })
+                .unwrap()
+            })
+        };
+        {
+            let (lock, ready) = &*release;
+            *lock.lock().unwrap() = true;
+            ready.notify_all();
+        }
+
+        let first = leader.join().unwrap();
+        let second = follower.join().unwrap();
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(*first, 70);
+    }
+
+    #[test]
+    fn invalidate_during_load_prevents_stale_reinsertion() {
+        let pool = Arc::new(BufferPool::new(4));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+
+        let loading = {
+            let pool = Arc::clone(&pool);
+            let release = Arc::clone(&release);
+            thread::spawn(move || {
+                pool.get_or_load(9, || {
+                    started_tx.send(()).unwrap();
+                    let (lock, ready) = &*release;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = ready.wait(released).unwrap();
+                    }
+                    Ok(90)
+                })
+                .unwrap()
+            })
+        };
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        pool.invalidate(9);
+
+        // A caller from the newly published snapshot must not join the detached old flight. It loads
+        // fresh content immediately, even while the old caller is still parsing its immutable bytes.
+        let fresh = pool.get_or_load(9, || Ok(91)).unwrap();
+        assert_eq!(*fresh, 91);
+        {
+            let (lock, ready) = &*release;
+            *lock.lock().unwrap() = true;
+            ready.notify_all();
+        }
+        assert_eq!(*loading.join().unwrap(), 90);
+        assert_eq!(
+            *pool.get_or_load(9, || Ok(92)).unwrap(),
+            91,
+            "invalidated old decode must not replace the fresh cache entry"
         );
     }
 }

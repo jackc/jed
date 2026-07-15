@@ -11,8 +11,9 @@
 //!
 //! Not a §8 byte contract (pager.md §3): the pool changes *when* a page is resident, never *what* a
 //! query observes — so each core realizes it idiomatically (like P5.3's per-core concurrency). The
-//! two locks are taken pool-then-pager and never the reverse (the commit write path locks only the
-//! pager), so they cannot deadlock.
+//! pool internally locks only for hit/flight/CLOCK bookkeeping; the physical read takes the pager
+//! lock separately, and checksum + PAX parsing run outside both locks. Commits still serialize with
+//! the physical read through the pager lock.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -41,7 +42,7 @@ pub(crate) fn cache_leaves(cache_bytes: usize, page_size: u32) -> usize {
 /// One database's pager + leaf buffer pool, shared (`Arc`) by all its stores and snapshots.
 pub(crate) struct SharedPaging {
     pager: Mutex<Pager>,
-    pool: Mutex<BufferPool<Node>>,
+    pool: BufferPool<Node>,
 }
 
 impl SharedPaging {
@@ -49,7 +50,7 @@ impl SharedPaging {
     pub(crate) fn new(pager: Pager, capacity: usize) -> Arc<SharedPaging> {
         Arc::new(SharedPaging {
             pager: Mutex::new(pager),
-            pool: Mutex::new(BufferPool::new(capacity)),
+            pool: BufferPool::new(capacity),
         })
     }
 
@@ -62,8 +63,7 @@ impl SharedPaging {
         page: u32,
         col_types: &Arc<Vec<ColType>>,
     ) -> Result<Arc<Node>> {
-        let mut pool = self.pool.lock().expect("buffer pool mutex poisoned");
-        pool.get_or_load(page, || {
+        self.pool.get_or_load(page, || {
             let block = self
                 .pager
                 .lock()
@@ -89,23 +89,18 @@ impl SharedPaging {
 
     /// Drop any stale pool entry for a rewritten page (bufferpool.rs `invalidate`): a no-op unless a
     /// reclaim domain reused a freed page id, in which case the pool's prior decode must be evicted. This
-    /// locks ONLY the pool; `fault_leaf` locks pool-then-pager, so invalidating while a pager guard is
-    /// held would be the reverse order (deadlock). The commit write paths therefore collect the rewritten
-    /// page ids and call this only AFTER the pager guard drops.
+    /// marks and detaches an in-flight decode as well as dropping a resident entry, closing the stale
+    /// insertion race and making post-commit callers load fresh now that decode runs outside the pool
+    /// lock. Commit paths call this after writing; the reader-liveness watermark ensures an old
+    /// snapshot's page is never reused under that reader.
     pub(crate) fn invalidate(&self, page: u32) {
-        self.pool
-            .lock()
-            .expect("buffer pool mutex poisoned")
-            .invalidate(page);
+        self.pool.invalidate(page);
     }
 
     /// The number of leaf pages currently resident in the pool — the gauge the public
     /// [`crate::Engine::resident_leaves`] reports and the `cache_pages` budget bounds (P6.4c,
     /// spec/design/pager.md §3).
     pub(crate) fn resident_leaves(&self) -> usize {
-        self.pool
-            .lock()
-            .expect("buffer pool mutex poisoned")
-            .resident()
+        self.pool.resident()
     }
 }

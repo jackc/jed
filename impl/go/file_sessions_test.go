@@ -189,11 +189,12 @@ func TestFileBackedReadOnlyOpenRejectsWrites(t *testing.T) {
 
 func TestFileBackedReadersRunConcurrentlyWithAWriter(t *testing.T) {
 	t.Parallel()
-	// The deep 7c requirement: file-backed read sessions fault clean pages through the shared,
-	// mutex-guarded buffer pool concurrently with a writer committing (and persisting dirty pages) on
-	// another goroutine. Each reader pins a snapshot and must see an internally consistent count;
-	// reclamation stays trivially watermark-safe (reconstruct-on-open free-list). Run under `go test
-	// -race` (rake concurrency:race walks the threaded conformance; this exercises the file pager).
+	// The deep 7c requirement: file-backed read sessions fault clean pages through the shared pool
+	// concurrently with a writer committing (and persisting dirty pages) on another goroutine. Pool
+	// bookkeeping is mutex-guarded, while cold decode runs outside that critical section. Each reader
+	// pins a snapshot and must see an internally consistent count; reclamation stays watermark-safe.
+	// Run under `go test -race` (rake concurrency:race walks the threaded conformance; this exercises
+	// the file pager).
 	path := filepath.Join(t.TempDir(), "file_sessions_concurrent.jed")
 	func() {
 		// Small pages so the table spans several leaves (real faults).

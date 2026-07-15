@@ -11,8 +11,9 @@ package jed
 // is immutable so any node still referenced stays alive (GC) and a re-load is a harmless duplicate.
 //
 // Not a §8 byte contract (pager.md §3): the pool changes WHEN a page is resident, never WHAT a query
-// observes — so each core realizes it idiomatically (like P5.3's per-core concurrency). One mutex
-// guards both the pager and the pool, so the read (fault) and commit (write) paths cannot race.
+// observes — so each core realizes it idiomatically (like P5.3's per-core concurrency). The pool
+// internally locks only hit/flight/CLOCK bookkeeping; pagerMu separately serializes physical reads
+// against commit writes. Checksum + PAX parsing run outside both locks.
 
 import "sync"
 
@@ -41,9 +42,9 @@ func cacheLeaves(cacheBytes int, pageSize uint32) int {
 // sharedPaging is one database's pager + leaf buffer pool, shared (pointer) by all its stores and
 // snapshots.
 type sharedPaging struct {
-	mu   sync.Mutex
-	pgr  *pager
-	pool *bufferPool
+	pagerMu sync.Mutex
+	pgr     *pager
+	pool    *bufferPool
 }
 
 // newSharedPaging wraps an open pager with a CLOCK pool of capacity leaves.
@@ -56,10 +57,8 @@ func newSharedPaging(p *pager, capacity int) *sharedPaging {
 // evicting under CLOCK if full. A page id belongs to exactly one table, so caching by global page id
 // with a caller-supplied decoder is consistent (pager.md §4).
 func (s *sharedPaging) faultLeaf(page uint32, colTypes []colType) (*pnode, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	return s.pool.getOrLoad(page, func() (*pnode, error) {
-		block, err := s.pgr.readBlock(page)
+		block, err := s.readBlock(page)
 		if err != nil {
 			return nil, err
 		}
@@ -71,27 +70,27 @@ func (s *sharedPaging) faultLeaf(page uint32, colTypes []colType) (*pnode, error
 	})
 }
 
-// readBlock reads one page through the shared pager under the paging lock — the overflow-chain
-// read path the scan layer's read-on-touch resolution uses (large-values.md §14); concurrent
-// readers may resolve while another faults a leaf, so the same mutex serializes both.
+// readBlock reads one page through the shared pager under the pager lock — the overflow-chain read
+// path the scan layer's read-on-touch resolution uses (large-values.md §14). The lock covers only
+// the physical read; leaf checksum/PAX decode happens after it is released.
 func (s *sharedPaging) readBlock(page uint32) ([]byte, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.pagerMu.Lock()
+	defer s.pagerMu.Unlock()
 	return s.pgr.readBlock(page)
 }
 
 // withPager runs fn with the pager locked — the commit write path (file.go persist pwrites dirty
 // pages + meta) takes the same lock the fault path does, so they cannot race.
 func (s *sharedPaging) withPager(fn func(*pager) error) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.pagerMu.Lock()
+	defer s.pagerMu.Unlock()
 	return fn(s.pgr)
 }
 
 // close closes the backing file (Engine.Close).
 func (s *sharedPaging) close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.pagerMu.Lock()
+	defer s.pagerMu.Unlock()
 	return s.pgr.close()
 }
 
@@ -99,7 +98,5 @@ func (s *sharedPaging) close() error {
 // demand-paging tests assert stays below the budget even for a database far larger than it. P6.4c
 // promotes it to the public memory-budget surface.
 func (s *sharedPaging) residentLeaves() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	return s.pool.resident()
 }

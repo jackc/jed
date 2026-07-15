@@ -119,6 +119,19 @@ A fixed-capacity cache mapping `page_id → decoded page`, with:
   million-row table's roughly 6,900 leaves without a rehash, but bounded so a very large caller cache
   budget does not become an equally large eager allocation before any page is touched. This is
   implementation machinery, not part of the memory-budget or observable-behavior contract.
+- **Concurrent miss coordination — per-page single flight.** In the threaded Rust and Go cores, the
+  pool mutex covers only the page-id hit/miss lookup, in-flight registration, and CLOCK insertion;
+  it is **not held** across the physical page read, CRC validation, or PAX parse. Misses for different
+  page ids therefore parse concurrently, while callers racing on the same page wait on one per-page
+  loading entry and receive the same decoded node (or the same load error). The pager lock remains
+  around the short physical read, serializing it against commit writes; decode happens after that lock
+  is released. Commit invalidation both evicts a resident entry and marks and detaches an in-flight
+  load: callers already waiting on it receive its immutable old result, callers arriving after
+  invalidation start a fresh load, and the old decode cannot be inserted after the commit reuses that
+  page id. The reader-liveness watermark still supplies the stronger snapshot rule: a page visible
+  to an old reader is not eligible for reuse until that reader unpins it. TypeScript is
+  single-threaded and retains its direct synchronous load path. This coordination is internal
+  performance machinery, not an observable cross-core contract.
 - **Eviction — CLOCK (second-chance).** A simple per-core CLOCK over the resident pages: a
   reference bit set on access, a hand that sweeps and evicts the first unreferenced, unpinned,
   clean page. CLOCK over strict LRU because it needs no per-access list surgery and is the
@@ -158,8 +171,9 @@ ChildRef = Resident(node)      # an in-memory node: a dirty/uncommitted node, or
 Traversal (`get`, `iter`, insert/delete descent) resolves an `OnDisk(p)` by asking the buffer
 pool for page `p` — a **hit** returns the cached decoded node; a **miss** `read_block`s it,
 decodes it (the existing node codec, format.md), inserts it into the pool (evicting if full),
-and returns it. A `Resident(node)` is used directly. So the resident set is bounded by the pool
-budget, not by the tree size.
+and returns it. Concurrent same-page misses share that one load; different-page decode work runs
+outside the pool lock (§3). A `Resident(node)` is used directly. So the resident set is bounded by
+the pool budget, not by the tree size.
 
 **P6.4b's first form — interior skeleton resident, leaves `OnDisk` (§1).** In the landed slice,
 `open` materializes the **interior** nodes resident (`Resident`) and leaves each *leaf* child an
@@ -328,5 +342,10 @@ floor/cap and the geometric `reserve` logic are identical across cores (pure int
 - **No nondeterminism leaks.** The pool keys on page id (deterministic), never on hashmap
   iteration order; eviction never affects which rows/pages a query logically touches; the I/O on
   a miss is unmetered, so timing never enters cost (CLAUDE.md §8/§10).
+- **Concurrent load order is invisible.** Per-page single flight may change which reader performs a
+  physical load or the order distinct decoded leaves enter CLOCK, but never the page bytes, result,
+  error, logical page count, or metered cost. In-flight invalidation detaches the old load and
+  prevents a reused page id from retaining a stale cache entry; snapshot safety remains governed by
+  the watermark (§3/§4).
 - **Memory safety holds** — the file backing is `pread`-style random reads into owned buffers in
   every core (no `unsafe`, no cgo; CLAUDE.md §2/§13).

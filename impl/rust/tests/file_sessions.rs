@@ -182,11 +182,11 @@ fn read_only_open_rejects_writes() {
 
 #[test]
 fn file_backed_readers_run_concurrently_with_a_committing_writer() {
-    // The deep 7c requirement: file-backed read sessions fault clean pages through the shared,
-    // Mutex-guarded buffer pool concurrently with a writer committing (and persisting dirty pages)
-    // on another thread. Each reader pins a snapshot and must see an internally consistent count;
-    // reclamation stays trivially watermark-safe (reconstruct-on-open free-list). Run under
-    // `rake concurrency:race` for the data-race assertion.
+    // The deep 7c requirement: file-backed read sessions fault clean pages through the shared pool
+    // concurrently with a writer committing (and persisting dirty pages) on another thread. Pool
+    // bookkeeping is mutex-guarded, while cold decode runs outside that critical section. Each reader
+    // pins a snapshot and must see an internally consistent count; reclamation stays watermark-safe.
+    // Run under `rake concurrency:race` for the data-race assertion.
     let path = tmp("file_sessions_concurrent.jed");
     let _ = std::fs::remove_file(&path);
     {

@@ -229,6 +229,36 @@ instrumentation (the same review-evidence status as the prepared-lookup allocati
 while the permanent unit test pins exact reads, short-read `58030`, and cursor preservation on the
 positioned platforms.
 
+**Concurrent cold-fault single-flight result (2026-07-15).** P2 improvement 3 removes the global
+buffer-pool mutex from the physical-read + checksum + PAX-parse body in the threaded cores. Rust and
+Go now register one in-flight load per page under a short pool critical section: distinct pages decode
+concurrently, same-page callers share one result, and commit invalidation makes an in-flight old decode
+non-cacheable and detaches it from post-invalidation callers, so page-id reuse cannot leave a stale
+cache entry. The pager lock still serializes the physical read against commit writes; TypeScript
+remains single-threaded. Permanent unit tests pin the overlap/single-flight/invalidation properties,
+and the existing concurrent file reader/writer tests retain snapshot isolation (Go also passed under
+`-race`).
+
+The shared benchmark corpus gains `concurrent_read_pk_cold_r1` and `_r4`: 20,000 random lookups over
+the million-row table after only 2,000 warmup probes. Its roughly 6,900-leaf working set fits in the
+default pool, so the measured phase populates the cache without mixing in eviction thrash. The paired
+baseline (`bench/results/20260715-133613`) and final-tree run
+(`bench/results/20260715-135749`) on the Intel Core Ultra 9 285K host (Go 1.26.3, rustc 1.92.0)
+produced:
+
+| Core / cold lane | Before | After | Change |
+|---|---:|---:|---:|
+| Go r1 | 35.903 µs/op | 36.683 µs/op | +2.2% (noise) |
+| Go r4 | 11.220 µs/op | 10.212 µs/op | -9.0% |
+| Rust r1 | 31.015 µs/op | 31.273 µs/op | +0.8% (noise) |
+| Rust r4 | 10.154 µs/op | 9.078 µs/op | -10.6% |
+| TypeScript r1 | 64.754 µs/op | 64.634 µs/op | -0.2% (noise) |
+| TypeScript r4 | 60.811 µs/op | 61.996 µs/op | +1.9% (noise) |
+
+The r1 and r4 checksums were respectively `f086f7634186c3f4` and `c72e6d5fabdc504e` in every
+native core. Wall-clock movement is observational and includes parse/plan work on every query; the
+focused synchronization tests, rather than a timing threshold, are the regression gate.
+
 ## 1. Purpose and non-goals
 
 The benchmark suite answers two questions, continuously:
@@ -650,8 +680,10 @@ model but not jed's or SQLite's.
 `Database`** — the slice-7 convergence (session.md §2.4/§10): `open`/`create` return a
 `Database` that mints concurrently-usable reader `Session`s sharing one committed snapshot +
 buffer pool, and the §3 read path is lock-free against everything but a commit. The corpus
-ships `concurrent_read_pk_r1` and `concurrent_read_pk_r4` — the same PK point lookup at one
-and four readers, so r1's `ns_per_op` over r4's is the realized speedup.
+ships two r1/r4 pairs: `concurrent_read_pk_r{1,4}` is fully resident, while
+`concurrent_read_pk_cold_r{1,4}` starts measured work with most of the million-row leaf working set
+absent. Within each pair the SQL and parameter stream are identical and only reader count changes,
+so r1's `ns_per_op` over r4's is the realized speedup.
 
 Per iteration of the run loop the kind does **not** apply (it is not a per-statement loop).
 Instead the runner materializes the deterministic param stream, splits the measured params
@@ -671,13 +703,13 @@ The checksum is partition-folded (§6). Readers re-parse the SQL each call — d
 via the session prepared-statement form — so a constant per-query parse cost is *included*
 (uniform across the jed cores, so it does not distort the scaling).
 
-**Dataset choice.** The benches use the **resident** `small` dataset deliberately: with the
-whole working set in the buffer pool after warmup, the bench isolates the concurrent *read
-path* (parse + plan + a resident B-tree seek per reader) and shows near-linear scaling on a
-multi-core box. On a larger-than-pool dataset, random lookups fault under the shared
-buffer-pool mutex, which serializes readers and masks the lock-free read scaling — that is a
-**pager**-concurrency concern (a sharded/lock-free pool is the optimization a future
-larger-than-pool variant would measure), separate from the §3 reader/writer guarantee.
+**Dataset choices.** The resident pair uses the **`small`** dataset deliberately: with the whole
+working set in the buffer pool after warmup, it isolates the concurrent *read path* (parse + plan +
+a resident B-tree seek per reader) and shows near-linear scaling on a multi-core box. The cold pair
+uses **`large`** with the same short 2,000-probe warmup as the point-lookup ramp: most of its roughly
+6,900 leaves are absent when measurement starts, but all fit inside the default 32,768-leaf pool. It
+therefore isolates concurrent page-cache population, including read/checksum/PAX parse, without
+eviction. A truly larger-than-pool variant remains a separate **pager eviction/thrashing** follow-on.
 
 **Scope — jed-only.** `concurrent_read` benches set `engines = ["jed"]`. This validates jed's
 own concurrent sessions and keeps the three-way **cross-core** answer-agreement gate (Go ==
@@ -760,10 +792,10 @@ datasets (10k / 1M rows). Known gaps, tracked in TODO.md Phase 8:
 - GROUP BY aggregate; UPDATE / DELETE throughput; miss-heavy point lookups;
 - text-heavy / large-value rows (exercise the overflow + LZ4 path);
 - ✅ **`Database` concurrent-reader throughput** — landed as the `concurrent_read` kind
-  (§8.1): `concurrent_read_pk_r{1,4}` over the resident `small` dataset, jed-only, scaling
-  near-linearly on the native threaded cores (the lock-free §3 read path). Remaining
-  concurrency follow-ons: a larger-than-pool variant (measures the buffer-pool mutex / a
-  future sharded pool), and a cross-*engine* comparison (PG/SQLite connection pools);
+  (§8.1): `concurrent_read_pk_r{1,4}` over the resident `small` dataset plus
+  `concurrent_read_pk_cold_r{1,4}` over cold population of the cache-fitting `large` dataset,
+  jed-only. Remaining concurrency follow-ons: a truly larger-than-pool eviction/thrashing variant,
+  and a cross-*engine* comparison (PG/SQLite connection pools);
 - cold-open time;
 - durable-commit batch-size sweep (1 vs 100 vs 1000 rows per commit).
 

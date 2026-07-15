@@ -1186,9 +1186,9 @@ expect_rows_per_iter = 100
 #
 # The dataset is `small` (10k rows) ON PURPOSE: the whole working set is RESIDENT after warmup, so the
 # bench isolates the concurrent READ PATH (parse + plan + a resident B-tree seek per reader) from the
-# buffer pool's page-fault path. On a larger-than-pool dataset random lookups fault under the shared
-# pool mutex, which serializes readers and hides the lock-free read scaling — a pager-concurrency
-# concern, separate from §3's reader/writer story and a noted future variant (benchmarks.md §8.1).
+# buffer pool's page-fault path. The cold-population r1/r4 pair below measures that separate pager
+# concern over a working set that still fits in the pool. A truly larger-than-pool eviction/thrashing
+# variant remains a follow-on (benchmarks.md §8.1).
 #
 # jed-only (engines = ["jed"]): this validates jed's own concurrent sessions and keeps the three-way
 # cross-core answer-agreement gate (Go == Rust == TS under three threading models — a new differential
@@ -1233,3 +1233,44 @@ expect_rows_per_iter = 1
 gen = "int_uniform"
 min = 1
 max = 10000
+
+# Concurrent COLD-fault throughput over the million-row table. Unlike the resident pair above, the
+# short warmup leaves most of the roughly 6,900-leaf working set absent from jed's default pool when
+# measurement starts. The working set still fits the configured pool: this isolates concurrent cache
+# population (page read + checksum + PAX parse), not eviction/thrashing. The r1/r4 pair differs only in
+# reader count and uses the same deterministic parameter stream.
+[[bench]]
+name = "concurrent_read_pk_cold_r1"
+description = "Concurrent PK point lookup while populating the 1M-row leaf cache, 1 reader Session (cold-fault baseline)"
+dataset = "large"
+kind = "concurrent_read"
+engines = ["jed"]
+readers = 1
+sql = "SELECT id, customer_id, amount, note FROM orders WHERE id = $1"
+warmup = 2000
+iterations = 20000
+seed = 4231
+expect_rows_per_iter = 1
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 1000000
+
+[[bench]]
+name = "concurrent_read_pk_cold_r4"
+description = "Concurrent PK point lookup while populating the 1M-row leaf cache, 4 reader Sessions sharing one Database"
+dataset = "large"
+kind = "concurrent_read"
+engines = ["jed"]
+readers = 4
+sql = "SELECT id, customer_id, amount, note FROM orders WHERE id = $1"
+warmup = 2000
+iterations = 20000
+seed = 4231
+expect_rows_per_iter = 1
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 1000000
