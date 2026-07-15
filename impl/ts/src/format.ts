@@ -8,7 +8,7 @@
 //
 // JS hazards handled here: u64 txid via DataView.setBigUint64 (bigint); UTF-8 names via
 // TextEncoder/TextDecoder (name_len is the UTF-8 byte length, not String#length);
-// big-endian via DataView (never host order); CRC-32 hand-rolled (>>> 0 for unsigned).
+// big-endian via DataView (never host order); CRC-32 backend results normalized unsigned.
 
 import type { Expr } from "./ast.ts";
 import {
@@ -35,6 +35,7 @@ import {
 import { parseExpression } from "./parser.ts";
 import { type Collation, loadedCollation } from "./collation.ts";
 import { Decimal } from "./decimal.ts";
+import { crc32Ieee, crc32Update } from "./crc32.ts";
 import { decodeInt, decodeIntAt, encodeNullable } from "./encoding.ts";
 import { engineError } from "./errors.ts";
 import { encodeTypedKey, Engine, Snapshot } from "./executor.ts";
@@ -289,35 +290,17 @@ function readRangeElementType(buf: Uint8Array, cur: Cursor): Type {
   return scalarT(s);
 }
 
-// crc32Update folds data into a running CRC-32/IEEE register (reflected, poly 0xEDB88320)
-// WITHOUT the final XOR, so it composes: crc32Update(crc32Update(0xFFFFFFFF, a), b) over a split
-// buffer equals folding a‖b. Both crc32Ieee and the split pageCrc build on it. `>>> 0` keeps the
-// running value an unsigned 32-bit number (feeding it back through `^` is bit-identical anyway).
-function crc32Update(crc: number, data: Uint8Array): number {
-  for (const b of data) {
-    crc ^= b;
-    for (let i = 0; i < 8; i++) {
-      const mask = -(crc & 1); // 0xFFFFFFFF if low bit set, else 0
-      crc = (crc >>> 1) ^ (0xedb88320 & mask);
-    }
-  }
-  return crc >>> 0;
-}
-
-// crc32Ieee is CRC-32/IEEE (reflected, poly 0xEDB88320, init/final 0xFFFFFFFF) — the
-// standard zlib CRC32, hand-rolled so no dependency is needed. Pinned by the vector
-// crc32("123456789") === 0xCBF43926.
-export function crc32Ieee(data: Uint8Array): number {
-  return (crc32Update(0xffffffff, data) ^ 0xffffffff) >>> 0;
-}
+// Keep this re-export for the collation/time-zone artifact codecs and white-box format tests. The
+// backend itself lives in crc32.ts so the Node host can select zlib without entering the OPFS graph.
+export { crc32Ieee } from "./crc32.ts";
 
 // pageCrc is the per-page checksum (v7, format.md *Page header*): CRC-32/IEEE over a body page's
 // bytes EXCLUDING its own 4-byte crc32 field at [12,16) — i.e. [0,12) then [16,pageSize), covering
 // the header, payload, and zero-fill tail. makePage writes it; parsePage/readPage re-verify it
 // (mismatch → XX001). page is one full page (pageSize bytes).
-function pageCrc(page: Uint8Array): number {
-  const c = crc32Update(0xffffffff, page.subarray(0, 12));
-  return (crc32Update(c, page.subarray(PAGE_HEADER)) ^ 0xffffffff) >>> 0;
+export function pageCrc(page: Uint8Array): number {
+  const checksum = crc32Update(0, page.subarray(0, 12));
+  return crc32Update(checksum, page.subarray(PAGE_HEADER));
 }
 
 // encodeValue is the value codec (format.md): a 1-byte presence tag (0x01 = NULL), then the type's

@@ -5,6 +5,8 @@
 // just the dirty pages, published by alternating the meta slot (spec/fileformat/format.md, P6.1 part
 // B) — the block seam below pwrites pages (writeSync at a position) into the open file.
 
+import "./crc32_node.ts";
+
 import {
   closeSync,
   existsSync,

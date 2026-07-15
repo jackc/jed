@@ -171,8 +171,10 @@ the storage seam (CLAUDE.md §9, [storage.md](storage.md)):
   unpredictable — not reconstructable from one sample, the security posture), and tests inject the
   engine's provided deterministic source.
 - **A spec'd PRNG as shared data** (CLAUDE.md §5) — one algorithm pinned byte-for-byte, the way
-  CRC-32 and the decimal limb arithmetic are already hand-rolled identically across cores
-  ([decimal.md](decimal.md) §1). **Landed: splitmix64** ([entropy.md](entropy.md) §2,
+  CRC-32 parameters/results and decimal limb arithmetic are pinned across cores
+  ([../fileformat/format.md](../fileformat/format.md), [decimal.md](decimal.md) §1). CRC machinery may
+  use a conforming runtime-accelerated backend; its bytes remain identical. **Landed: splitmix64**
+  ([entropy.md](entropy.md) §2,
   [../encoding/prng.toml](../encoding/prng.toml) + `prng_verify.rb`) as the engine's *provided
   deterministic source* (injectable for reproducibility, **not** the production default), so
   `uuidv4`/`uuidv7` are **cross-core identical** when it is injected; a future `random()` reuses it.

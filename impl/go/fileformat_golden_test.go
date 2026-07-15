@@ -12,6 +12,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -1183,6 +1184,45 @@ func TestRoundTripAtDefaultPageSize(t *testing.T) {
 func TestCRC32KnownVector(t *testing.T) {
 	if got := crc32IEEE([]byte("123456789")); got != 0xCBF43926 {
 		t.Errorf("crc32(\"123456789\") = %#08x, want 0xCBF43926", got)
+	}
+}
+
+func TestCRC32IncrementalCompositionAndPageCoverage(t *testing.T) {
+	payload := make([]byte, 8192)
+	for i := range payload {
+		payload[i] = byte(i*37 + i/7 + 11)
+	}
+	want := crc32IEEE(payload)
+	for split := 0; split <= len(payload); split++ {
+		checksum := crc32.Update(0, crc32.IEEETable, payload[:split])
+		checksum = crc32.Update(checksum, crc32.IEEETable, payload[split:])
+		if checksum != want {
+			t.Fatalf("incremental CRC at split %d = %#08x, want %#08x", split, checksum, want)
+		}
+	}
+
+	page := make([]byte, goldenPageSize)
+	for i := range page {
+		page[i] = byte(i*29 + 7)
+	}
+	covered := append(append([]byte{}, page[:12]...), page[pageHeader:]...)
+	if got, want := pageCRC(page), crc32IEEE(covered); got != want {
+		t.Fatalf("page CRC = %#08x, covered-byte CRC = %#08x", got, want)
+	}
+	original := pageCRC(page)
+	for i := 12; i < pageHeader; i++ {
+		page[i] ^= 0xFF
+	}
+	if got := pageCRC(page); got != original {
+		t.Fatalf("checksum field affected page CRC: got %#08x, want %#08x", got, original)
+	}
+	for _, offset := range []int{0, 11, pageHeader, len(page) - 1} {
+		before := pageCRC(page)
+		page[offset] ^= 0x80
+		if got := pageCRC(page); got == before {
+			t.Fatalf("protected offset %d did not affect page CRC", offset)
+		}
+		page[offset] ^= 0x80
 	}
 }
 

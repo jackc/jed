@@ -134,6 +134,29 @@ The remaining allocations include owned public output values and the safe cursor
 weakened for a benchmark. Allocation counts/bytes are diagnostic only and may move with compiler or
 runtime versions.
 
+**Cold page-checksum result (2026-07-15).** P0 kept the format-v29 CRC-32/IEEE byte contract and
+replaced only its implementation machinery: Go uses the runtime-dispatched standard `hash/crc32`,
+Node uses `node:zlib.crc32`, Rust uses safe slicing-by-8, and browser TypeScript retains the same safe
+slicing backend without importing Node modules. The shared run in
+`bench/results/20260715-021326` on an Intel Core Ultra 9 285K (Go 1.26.3, rustc 1.92.0, Node
+24.16.0) produced:
+
+| Lane / native core | Mean | p50 | p90 | p99 |
+|---|---:|---:|---:|---:|
+| ramp — Go | 2.953 µs | 2.208 µs | 5.543 µs | 9.215 µs |
+| ramp — Rust | 2.926 µs | 2.103 µs | 7.566 µs | 10.882 µs |
+| ramp — TypeScript | 8.548 µs | 6.885 µs | 11.931 µs | 20.521 µs |
+| hot — Go | 1.965 µs | 1.950 µs | 2.376 µs | 3.550 µs |
+| hot — Rust | 2.072 µs | 2.045 µs | 2.342 µs | 2.590 µs |
+| hot — TypeScript | 6.845 µs | 6.287 µs | 8.285 µs | 12.772 µs |
+
+Against the 2026-07-14 final point-lookup run above, ramp mean fell by **65% Go, 48% Rust, and
+38% TypeScript**; ramp p90 fell by **89%, 78%, and 81%** respectively. The fully-hot lane stayed
+within ordinary single-run variation. All native cores retained ramp checksum `f82d3b99ddaff0fb`
+and hot checksum `28f09c46d56e242a`, and the existing golden/corruption suites remained green. The
+timings are observational, while identical file bytes, answers, and corruption behavior are the
+correctness gates.
+
 ## 1. Purpose and non-goals
 
 The benchmark suite answers two questions, continuously:

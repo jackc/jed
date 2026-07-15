@@ -21,8 +21,9 @@ Style (CLAUDE.md §10): **boring, explicit code over clever abstraction.**
 - **UTF-8, not UTF-16.** Table/column names go through `TextEncoder`/`TextDecoder`;
   on-disk `name_len` fields are UTF-8 **byte** lengths, not `String#length`.
 - **Big-endian via `DataView`** (`littleEndian = false`), with `setBigUint64` for the u64
-  `txid` — never host byte order. CRC-32/IEEE is hand-rolled (`>>> 0` for unsigned),
-  pinned by `crc32("123456789") === 0xCBF43926`.
+  `txid` — never host byte order. CRC-32/IEEE is pinned by
+  `crc32("123456789") === 0xCBF43926`; Node uses `node:zlib.crc32`, while browser/OPFS paths use a
+  safe slicing-by-8 implementation (`>>> 0` keeps results unsigned). Both produce identical bytes.
 - **No iteration-order leak.** JS `Map` is insertion-ordered, so storage sorts on
   iteration; encoded keys are held as a binary string (byte == code unit) so the default
   string sort is exactly unsigned byte order (CLAUDE.md §8).

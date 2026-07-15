@@ -12,6 +12,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"math"
 	"slices"
 	"sort"
@@ -212,25 +213,11 @@ func scalarForTypeCode(code byte) (scalarType, bool) {
 	}
 }
 
-// crc32Update folds data into a running CRC-32/IEEE register (reflected, poly 0xEDB88320)
-// WITHOUT the final XOR, so it composes: crc32Update(crc32Update(0xFFFFFFFF, a), b) over a
-// split buffer equals folding a‖b. Both crc32IEEE and the split pageCRC build on it.
-func crc32Update(crc uint32, data []byte) uint32 {
-	for _, b := range data {
-		crc ^= uint32(b)
-		for i := 0; i < 8; i++ {
-			mask := -(crc & 1) // 0xFFFFFFFF if low bit set, else 0
-			crc = (crc >> 1) ^ (0xEDB88320 & mask)
-		}
-	}
-	return crc
-}
-
 // crc32IEEE is CRC-32/IEEE (reflected, poly 0xEDB88320, init/final 0xFFFFFFFF) — the
-// standard zlib CRC32, hand-rolled so no dependency is needed. Pinned by the vector
-// crc32("123456789") == 0xCBF43926.
+// standard zlib CRC32. The standard library runtime-dispatches to accelerated implementations where
+// available and retains a portable fallback. Pinned by crc32("123456789") == 0xCBF43926.
 func crc32IEEE(data []byte) uint32 {
-	return ^crc32Update(0xFFFFFFFF, data)
+	return crc32.ChecksumIEEE(data)
 }
 
 // pageCRC is the per-page checksum (v7, format.md *Page header*): CRC-32/IEEE over a body page's
@@ -238,7 +225,8 @@ func crc32IEEE(data []byte) uint32 {
 // the header, payload, and zero-fill tail. makePage writes it; parsePage re-verifies it (mismatch →
 // XX001). page is one full page (pageSize bytes).
 func pageCRC(page []byte) uint32 {
-	return ^crc32Update(crc32Update(0xFFFFFFFF, page[0:12]), page[pageHeader:])
+	checksum := crc32.Update(0, crc32.IEEETable, page[0:12])
+	return crc32.Update(checksum, crc32.IEEETable, page[pageHeader:])
 }
 
 // encodeValue is the value codec (format.md): a 1-byte presence tag (0x01 = NULL), then the type's

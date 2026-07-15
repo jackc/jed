@@ -491,8 +491,12 @@ and slot selection):
 begins (page 1 starts at byte `page_size`).
 
 **Checksum.** CRC-32/IEEE (reflected, polynomial `0xEDB88320`, init `0xFFFFFFFF`, final XOR
-`0xFFFFFFFF`) — the standard zlib CRC32, hand-rolled identically in every core (no runtime
-dependency). Pinned by the vector `crc32("123456789") == 0xCBF43926`.
+`0xFFFFFFFF`) — the standard zlib CRC32. Pinned by the vector
+`crc32("123456789") == 0xCBF43926`. The parameters, covered bytes, and resulting `u32` are the
+language-neutral contract; cores may use safe table implementations or standard-library/runtime
+acceleration as long as they produce byte-identical results. Feeding multiple spans must be
+equivalent to checksumming their concatenation; raw versus finalized internal register state is
+implementation machinery.
 
 **`root_page` is relocatable.** In v1 the catalog root was fixed at page 2; in v2 the catalog
 chain is rewritten to fresh pages on every commit (it carries each table's B-tree root, which

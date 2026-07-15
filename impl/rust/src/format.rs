@@ -275,26 +275,87 @@ fn scalar_for_type_code(code: u8) -> Option<ScalarType> {
     }
 }
 
-/// Fold `data` into a running CRC-32/IEEE register (reflected, poly 0xEDB88320), **without** the
-/// final XOR — so it composes: `crc32_update(crc32_update(0xFFFF_FFFF, a), b)` over a split buffer
-/// equals folding `a ‖ b`. Both `crc32_ieee` and the split [`page_crc`] build on it.
-fn crc32_update(mut crc: u32, data: &[u8]) -> u32 {
-    for &b in data {
-        crc ^= b as u32;
-        for _ in 0..8 {
+const CRC32_IEEE_POLYNOMIAL: u32 = 0xEDB8_8320;
+
+/// Derive the eight slicing tables from the format's reflected CRC-32/IEEE polynomial. These are
+/// implementation machinery, not duplicated format data: the polynomial and checksum parameters
+/// remain canonical in `spec/fileformat/format.md`.
+const fn crc32_tables() -> [[u32; 256]; 8] {
+    let mut tables = [[0u32; 256]; 8];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut bit = 0;
+        while bit < 8 {
             let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            crc = (crc >> 1) ^ (CRC32_IEEE_POLYNOMIAL & mask);
+            bit += 1;
         }
+        tables[0][i] = crc;
+        i += 1;
+    }
+
+    let mut slice = 1;
+    while slice < 8 {
+        i = 0;
+        while i < 256 {
+            let crc = tables[slice - 1][i];
+            tables[slice][i] = (crc >> 8) ^ tables[0][(crc & 0xFF) as usize];
+            i += 1;
+        }
+        slice += 1;
+    }
+    tables
+}
+
+const CRC32_TABLES: [[u32; 256]; 8] = crc32_tables();
+
+/// Fold `data` into a running, unfinalized CRC-32/IEEE register with safe slicing-by-8. The
+/// eight-byte word is little-endian because this is the reflected form of the polynomial; explicit
+/// byte assembly keeps the result independent of host byte order.
+fn crc32_update(mut crc: u32, data: &[u8]) -> u32 {
+    let mut offset = 0;
+    while data.len() - offset >= 8 {
+        let first = crc
+            ^ u32::from_le_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]);
+        let second = u32::from_le_bytes([
+            data[offset + 4],
+            data[offset + 5],
+            data[offset + 6],
+            data[offset + 7],
+        ]);
+        crc = CRC32_TABLES[7][(first & 0xFF) as usize]
+            ^ CRC32_TABLES[6][((first >> 8) & 0xFF) as usize]
+            ^ CRC32_TABLES[5][((first >> 16) & 0xFF) as usize]
+            ^ CRC32_TABLES[4][(first >> 24) as usize]
+            ^ CRC32_TABLES[3][(second & 0xFF) as usize]
+            ^ CRC32_TABLES[2][((second >> 8) & 0xFF) as usize]
+            ^ CRC32_TABLES[1][((second >> 16) & 0xFF) as usize]
+            ^ CRC32_TABLES[0][(second >> 24) as usize];
+        offset += 8;
+    }
+    for &byte in &data[offset..] {
+        crc = (crc >> 8) ^ CRC32_TABLES[0][((crc ^ u32::from(byte)) & 0xFF) as usize];
     }
     crc
 }
 
-/// CRC-32/IEEE (reflected, poly 0xEDB88320, init/final 0xFFFFFFFF) — the standard
-/// zlib CRC32, hand-rolled so no runtime dependency is needed. Pinned by the vector
-/// `crc32("123456789") == 0xCBF43926`. Also the collation `.coll` artifact's
+/// Extend a finalized standard CRC-32/IEEE checksum. `crc32_extend(crc32_extend(0, a), b)` equals
+/// the checksum of `a ‖ b`, matching the public composition convention used by Go and Node.
+fn crc32_extend(crc: u32, data: &[u8]) -> u32 {
+    !crc32_update(!crc, data)
+}
+
+/// CRC-32/IEEE (reflected, poly 0xEDB88320, init/final 0xFFFFFFFF) — the standard zlib CRC32.
+/// Pinned by the vector `crc32("123456789") == 0xCBF43926`. Also the collation `.coll` artifact's
 /// `content_hash` (spec/collation/README.md §3), hence `pub`.
 pub fn crc32_ieee(data: &[u8]) -> u32 {
-    !crc32_update(0xFFFF_FFFF, data)
+    crc32_extend(0, data)
 }
 
 /// The per-page checksum (v7, spec/fileformat/format.md *Page header*): CRC-32/IEEE over a body
@@ -302,10 +363,7 @@ pub fn crc32_ieee(data: &[u8]) -> u32 {
 /// `[16, page_size)`, covering the header, payload, and zero-fill tail. `make_page` writes it;
 /// `parse_page` re-verifies it (mismatch → `XX001`). `page` is one full page (`page_size` bytes).
 fn page_crc(page: &[u8]) -> u32 {
-    !crc32_update(
-        crc32_update(0xFFFF_FFFF, &page[0..12]),
-        &page[PAGE_HEADER..],
-    )
+    crc32_extend(crc32_extend(0, &page[0..12]), &page[PAGE_HEADER..])
 }
 
 /// The value codec (spec/fileformat/format.md): a 1-byte presence tag (`0x01` = NULL),
@@ -4918,6 +4976,82 @@ mod tests {
     #[test]
     fn crc32_known_vector() {
         assert_eq!(crc32_ieee(b"123456789"), 0xCBF4_3926);
+    }
+
+    fn crc32_slow_update(mut crc: u32, data: &[u8]) -> u32 {
+        for &byte in data {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (CRC32_IEEE_POLYNOMIAL & mask);
+            }
+        }
+        crc
+    }
+
+    fn crc32_slow(data: &[u8]) -> u32 {
+        !crc32_slow_update(0xFFFF_FFFF, data)
+    }
+
+    #[test]
+    fn crc32_slicing_matches_slow_oracle_and_composes() {
+        let mut backing = vec![0u8; 8 + 8192];
+        for (i, byte) in backing.iter_mut().enumerate() {
+            *byte = ((i * 37 + i / 7 + 11) & 0xFF) as u8;
+        }
+
+        let mut lengths: Vec<usize> = (0..=64).collect();
+        lengths.extend([127, 128, 129, 255, 256, 257, 1023, 4096, 8192]);
+        for offset in 0..8 {
+            for &len in &lengths {
+                if offset + len > backing.len() {
+                    continue;
+                }
+                let data = &backing[offset..offset + len];
+                assert_eq!(
+                    crc32_ieee(data),
+                    crc32_slow(data),
+                    "offset={offset} len={len}"
+                );
+            }
+        }
+
+        let data = &backing[3..3 + 8192];
+        let expected = crc32_ieee(data);
+        for split in 0..=data.len() {
+            let checksum = crc32_extend(crc32_extend(0, &data[..split]), &data[split..]);
+            assert_eq!(checksum, expected, "split={split}");
+        }
+    }
+
+    #[test]
+    fn page_crc_covers_both_spans_and_excludes_its_field() {
+        let mut page = vec![0u8; 256];
+        for (i, byte) in page.iter_mut().enumerate() {
+            *byte = ((i * 29 + 7) & 0xFF) as u8;
+        }
+        let mut covered = Vec::with_capacity(page.len() - 4);
+        covered.extend_from_slice(&page[..12]);
+        covered.extend_from_slice(&page[PAGE_HEADER..]);
+        let expected = crc32_ieee(&covered);
+        assert_eq!(page_crc(&page), expected);
+
+        let original = page_crc(&page);
+        for byte in &mut page[12..PAGE_HEADER] {
+            *byte ^= 0xFF;
+        }
+        assert_eq!(
+            page_crc(&page),
+            original,
+            "stored checksum field must be excluded"
+        );
+
+        for offset in [0, 11, PAGE_HEADER, page.len() - 1] {
+            let before = page_crc(&page);
+            page[offset] ^= 0x80;
+            assert_ne!(page_crc(&page), before, "protected offset {offset}");
+            page[offset] ^= 0x80;
+        }
     }
 
     #[test]
