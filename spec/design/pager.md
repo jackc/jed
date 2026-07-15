@@ -113,7 +113,11 @@ A fixed-capacity cache mapping `page_id → decoded page`, with:
   decode by touched column, keys are borrowed spans of the key blob, and record weights derive
   lazily. It owns no per-record key, row, weight, or directory objects, so resident leaf memory is
   `≈ cache_leaves × page_size` and the byte budget means what it says. This Packed representation is
-  results/cost/byte-neutral above the seam ([packed-leaf.md](packed-leaf.md)).
+  results/cost/byte-neutral above the seam ([packed-leaf.md](packed-leaf.md)). Rust and Go give the
+  page-id index an initial capacity hint of `min(cache_leaves, 8192)`: enough to populate the measured
+  million-row table's roughly 6,900 leaves without a rehash, but bounded so a very large caller cache
+  budget does not become an equally large eager allocation before any page is touched. This is
+  implementation machinery, not part of the memory-budget or observable-behavior contract.
 - **Eviction — CLOCK (second-chance).** A simple per-core CLOCK over the resident pages: a
   reference bit set on access, a hand that sweeps and evicts the first unreferenced, unpinned,
   clean page. CLOCK over strict LRU because it needs no per-access list surgery and is the

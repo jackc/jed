@@ -2,6 +2,37 @@ package jed
 
 import "testing"
 
+func BenchmarkBufferPoolPopulate(b *testing.B) {
+	const capacity = 32_768
+	const populated = 6_900
+	node := &pnode{}
+	b.ReportAllocs()
+	for range b.N {
+		pool := newBufferPool(capacity)
+		for page := range uint32(populated) {
+			pool.insert(page, node)
+		}
+	}
+}
+
+func TestBufferPoolInitialIndexReservationIsBounded(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		capacity int
+		want     int
+	}{
+		{capacity: 1, want: 1},
+		{capacity: 6_900, want: 6_900},
+		{capacity: 8_192, want: 8_192},
+		{capacity: int(^uint(0) >> 1), want: 8_192},
+	}
+	for _, tt := range tests {
+		if got := initialBufferPoolIndexCapacity(tt.capacity); got != tt.want {
+			t.Errorf("initialBufferPoolIndexCapacity(%d) = %d, want %d", tt.capacity, got, tt.want)
+		}
+	}
+}
+
 // counting returns a loader that records how many times it actually read a page (a cache miss),
 // returning a sentinel node carrying the page id.
 func counting(loads *int, page uint32) func() (*pnode, error) {

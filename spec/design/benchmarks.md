@@ -180,6 +180,28 @@ single-run tail outlier, not a claimed regression or contract. All native cores 
 checksum `f82d3b99ddaff0fb` and hot checksum `28f09c46d56e242a`. The allocation removal follows directly
 from the retained structure (`1 + V` integer arrays no longer exist); timings remain observational.
 
+**Bounded buffer-pool index reservation result (2026-07-15).** P2 improvement 1 gives the Rust and
+Go page-id indexes a bounded initial capacity hint of `min(cache_leaves, 8192)`. The bound covers the
+roughly 6,900 leaves populated by `point_lookup_pk_ramp`, but does not turn the default 32,768-leaf
+ceiling—or a caller's much larger configured ceiling—into an unbounded eager allocation. Five fresh
+opens before and after on the same Intel Core Ultra 9 285K host (Go 1.26.3, rustc 1.92.0) produced
+these medians:
+
+| Core / `point_lookup_pk_ramp` | Mean | p50 | p90 | p99 |
+|---|---:|---:|---:|---:|
+| Go before | 3.009 µs | 2.232 µs | 5.643 µs | 9.169 µs |
+| Go after | 2.987 µs | 2.203 µs | 5.741 µs | 9.540 µs |
+| Rust before | 2.896 µs | 2.131 µs | 7.595 µs | 10.139 µs |
+| Rust after | 2.935 µs | 2.187 µs | 7.780 µs | 10.192 µs |
+
+The end-to-end movements are all below the benchmark subsystem's 5% noise floor; the few eliminated
+rehashes are diluted across 50,000 measured probes. A focused 6,900-page pool-population probe makes
+the intended effect visible: Go's median moved from **361.5 to 200.2 µs**, **69 to 51 allocations**,
+and **1,042,895 to 1,010,336 allocated bytes** per population; Rust moved from **239.6 to 133.8 µs**
+and from **12 index growths to zero**. Rust's deterministic unit test pins the no-growth property and
+Go retains the focused allocation benchmark. Both end-to-end lanes kept checksum `f82d3b99ddaff0fb`;
+timings and runtime allocation counts remain observational.
+
 ## 1. Purpose and non-goals
 
 The benchmark suite answers two questions, continuously:

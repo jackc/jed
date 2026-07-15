@@ -1,6 +1,7 @@
 # Cold point-lookup optimization handoff
 
-Status: P0 and P1 implemented and verified 2026-07-15; P2 remains a follow-on. Written 2026-07-14 on
+Status: P0, P1, and P2 improvement 1 implemented and verified 2026-07-15; P2 improvements 2--4
+remain follow-ons. Written 2026-07-14 on
 branch `perf/point-lookup-cache` at
 `cbbdd184132649a894f72bc58d7be7e2f2d12f87`, then revised after evaluating standard-library,
 third-party, SIMD/intrinsic, assembly, alternate-CRC, and cryptographic-hash options.
@@ -344,9 +345,13 @@ require fault-time `XX001`; representation tests pin the page-backed storage. Th
 
 These are secondary and should be measured only after P0/P1:
 
-1. Pre-size the Rust and Go buffer-pool page-id maps to their configured capacity, or to a bounded
-   initial estimate, to avoid rehash spikes during cache population. Be mindful that the default
-   capacity is 32,768 entries, while callers may configure much larger budgets.
+1. **Complete (2026-07-15):** Rust and Go give the buffer-pool page-id index a bounded initial
+   capacity hint of `min(cache_leaves, 8192)`. This covers the diagnosed roughly 6,900-leaf population
+   without turning the default 32,768-leaf ceiling or a caller's larger ceiling into an unbounded eager
+   allocation. Focused before/after population probes moved Go from 361.5 to 200.2 us, 69 to 51
+   allocations, and 1,042,895 to 1,010,336 allocated bytes; Rust moved from 239.6 to 133.8 us and 12
+   index growths to zero. Five-run median end-to-end ramp movements stayed within the 5% noise floor
+   and retained checksum `f82d3b99ddaff0fb`; full results are in `spec/design/benchmarks.md`.
 2. Use safe positioned reads for the Rust file host where the standard library supports them, avoiding
    the current `seek` plus `read_exact`. Keep a correct portable fallback. The syscall trace indicates
    this is a small single-reader improvement.

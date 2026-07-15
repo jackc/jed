@@ -18,6 +18,15 @@ use std::sync::Arc;
 
 use crate::error::Result;
 
+/// Bound the eager page-id index reservation. 8,192 entries cover the diagnosed 6,900-leaf cold
+/// population without turning the default 32,768-leaf cache ceiling (or a caller's much larger
+/// budget) into an oversized allocation before a leaf is touched.
+const MAX_INITIAL_INDEX_CAPACITY: usize = 8 * 1024;
+
+fn initial_index_capacity(capacity: usize) -> usize {
+    capacity.min(MAX_INITIAL_INDEX_CAPACITY)
+}
+
 /// One resident page: its id, the cached value, and the CLOCK reference bit (set on access, cleared
 /// by the sweeping hand to grant a second chance).
 struct Slot<T> {
@@ -37,10 +46,11 @@ pub(crate) struct BufferPool<T> {
 impl<T> BufferPool<T> {
     /// A pool holding at most `capacity` pages (clamped to ≥ 1).
     pub(crate) fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
         BufferPool {
-            capacity: capacity.max(1),
+            capacity,
             slots: Vec::new(),
-            index: HashMap::new(),
+            index: HashMap::with_capacity(initial_index_capacity(capacity)),
             hand: 0,
         }
     }
@@ -201,5 +211,34 @@ mod tests {
         pool.get_or_load(1, counting(&loads, 1)).unwrap(); // 1 was evicted by 2 → reload
         assert_eq!(loads.get(), 3);
         assert_eq!(pool.resident(), 1);
+    }
+
+    #[test]
+    fn initial_index_reservation_is_bounded() {
+        assert_eq!(initial_index_capacity(1), 1);
+        assert_eq!(initial_index_capacity(6_900), 6_900);
+        assert_eq!(initial_index_capacity(8_192), 8_192);
+        assert_eq!(initial_index_capacity(usize::MAX), 8_192);
+
+        let pool = BufferPool::<u32>::new(6_900);
+        assert!(
+            pool.index.capacity() >= 6_900,
+            "constructor must apply the initial index reservation"
+        );
+
+        // The diagnosed million-row ramp touches about 6,900 leaves under the default 32,768-leaf
+        // pool. Pin the allocation property directly: that population must not grow/rehash the
+        // eagerly reserved page-id index.
+        let value = Arc::new(0u32);
+        let mut pool = BufferPool::new(32_768);
+        let reserved = pool.index.capacity();
+        for page in 0..6_900 {
+            pool.insert(page, Arc::clone(&value));
+        }
+        assert_eq!(
+            pool.index.capacity(),
+            reserved,
+            "diagnosed cold population must not reallocate the page-id index",
+        );
     }
 }

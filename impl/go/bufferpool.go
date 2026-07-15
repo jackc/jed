@@ -12,6 +12,15 @@ package jed
 // observes (results and cost are invariant to it), so each core may implement it idiomatically — like
 // P5.3's per-core concurrency.
 
+// maxInitialBufferPoolIndexCapacity bounds the eager page-id map reservation. 8,192 entries cover
+// the diagnosed 6,900-leaf cold population without turning the default 32,768-leaf cache ceiling (or
+// a caller's much larger budget) into an oversized allocation before a leaf is touched.
+const maxInitialBufferPoolIndexCapacity = 8 * 1024
+
+func initialBufferPoolIndexCapacity(capacity int) int {
+	return min(capacity, maxInitialBufferPoolIndexCapacity)
+}
+
 // bpSlot is one resident page: its id, the cached node, and the CLOCK reference bit (set on access,
 // cleared by the sweeping hand to grant a second chance).
 type bpSlot struct {
@@ -33,7 +42,10 @@ func newBufferPool(capacity int) *bufferPool {
 	if capacity < 1 {
 		capacity = 1
 	}
-	return &bufferPool{capacity: capacity, index: make(map[uint32]int)}
+	return &bufferPool{
+		capacity: capacity,
+		index:    make(map[uint32]int, initialBufferPoolIndexCapacity(capacity)),
+	}
 }
 
 // getOrLoad returns the decoded node for page: a cache hit returns the cached node (setting its
