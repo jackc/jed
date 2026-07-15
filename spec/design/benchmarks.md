@@ -157,6 +157,29 @@ and hot checksum `28f09c46d56e242a`, and the existing golden/corruption suites r
 timings are observational, while identical file bytes, answers, and corruption behavior are the
 correctness gates.
 
+**Zero-copy PAX directory result (2026-07-15).** Cold-fault P1 kept the complete fault-time scan of
+every key and variable-value end-offset directory, but retained those directories as byte
+ranges/payload offsets in the packed page rather than decoded `N`-entry integer arrays. That removes
+`1 + V` per-leaf allocations for a leaf with `V` variable-width columns without changing the file,
+cost, result, or corruption-timing contracts. The shared run in
+`bench/results/20260715-042240` produced:
+
+| Lane / native core | Mean | p50 | p90 | p99 |
+|---|---:|---:|---:|---:|
+| ramp — Go | 2.942 µs | 2.150 µs | 4.896 µs | 9.993 µs |
+| ramp — Rust | 2.798 µs | 2.077 µs | 7.527 µs | 9.586 µs |
+| ramp — TypeScript | 7.960 µs | 6.631 µs | 10.925 µs | 15.995 µs |
+| hot — Go | 1.989 µs | 1.857 µs | 2.398 µs | 7.406 µs |
+| hot — Rust | 2.000 µs | 1.977 µs | 2.198 µs | 2.433 µs |
+| hot — TypeScript | 6.371 µs | 5.870 µs | 7.158 µs | 12.157 µs |
+
+Against P0 above, ramp mean was effectively flat in Go, improved about **4% in Rust**, and improved
+about **7% in TypeScript**; TypeScript ramp p99 improved about **22%**, while Rust ramp p99 improved
+about **12%**. Hot medians/means remained within ordinary run variation; Go's isolated hot p99 is a
+single-run tail outlier, not a claimed regression or contract. All native cores again retained ramp
+checksum `f82d3b99ddaff0fb` and hot checksum `28f09c46d56e242a`. The allocation removal follows directly
+from the retained structure (`1 + V` integer arrays no longer exist); timings remain observational.
+
 ## 1. Purpose and non-goals
 
 The benchmark suite answers two questions, continuously:

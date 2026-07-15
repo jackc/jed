@@ -1,6 +1,6 @@
 # Cold point-lookup optimization handoff
 
-Status: P0 implemented and verified 2026-07-15; P1/P2 remain follow-ons. Written 2026-07-14 on
+Status: P0 and P1 implemented and verified 2026-07-15; P2 remains a follow-on. Written 2026-07-14 on
 branch `perf/point-lookup-cache` at
 `cbbdd184132649a894f72bc58d7be7e2f2d12f87`, then revised after evaluating standard-library,
 third-party, SIMD/intrinsic, assembly, alternate-CRC, and cryptographic-hash options.
@@ -311,7 +311,7 @@ the native ramp/hot benchmarks passed. Ramp mean / p50 / p90 / p99 was
 `28f09c46d56e242a` (hot). The safe Rust result meets the target closely enough that the optional
 dependency/SIMD escalation is not scheduled.
 
-## P1: reduce residual first-fault parsing and allocation
+## P1: reduce residual first-fault parsing and allocation — complete
 
 After P0, the Rust no-CRC diagnostic floor was about 4.8 us p90 and slicing-by-8 was about 7.9 us.
 The remaining cold work includes the page allocation/read and PAX directory validation/allocation.
@@ -328,6 +328,17 @@ validation once at fault time. This should:
 
 Do not defer or skip directory validation merely for speed; the current fail-closed behavior is part of
 the corruption contract.
+
+Completion result (2026-07-15): Rust and TypeScript retain numeric payload offsets and Go retains
+`[]byte` page views for the key and variable-value end-offset directories. All three cores still scan
+and validate every directory entry during the leaf fault, then read individual big-endian offsets in
+O(1) on access. This removes `1 + V` owned `N`-entry integer arrays per faulted leaf with `V`
+variable-width columns. Dedicated corruption tests cover descending key and value directories and
+require fault-time `XX001`; representation tests pin the page-backed storage. The final shared run
+(`bench/results/20260715-042240`) measured ramp mean / p50 / p90 / p99 at
+2.942/2.150/4.896/9.993 us Go, 2.798/2.077/7.527/9.586 us Rust, and
+7.960/6.631/10.925/15.995 us TypeScript. Ramp/hot checksums remained
+`f82d3b99ddaff0fb` / `28f09c46d56e242a`.
 
 ## P2: smaller residual and tail improvements
 
@@ -376,5 +387,5 @@ reaches about 9 us mean and 12/21 us p90/p99. Fully-hot performance stayed effec
 The browser fallback remains pure TypeScript and should be measured separately on each supported
 browser when browser performance becomes an active benchmark lane.
 
-P1 and the smaller residual work should then target the remaining gap to the no-CRC diagnostic floor
-without weakening the checksum guarantee.
+P1 removed the residual per-record directory allocations without weakening validation. The smaller P2
+work can target remaining page-read and cache-population tails without weakening the checksum guarantee.

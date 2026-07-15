@@ -2573,7 +2573,12 @@ function collectLeafOverflow(
         if (paxIsNull(pg.payload, dirs, c, i)) continue;
         // The value is discarded right after markChains (only its chain pages matter), so the
         // resolution handle is deliberately dead (null paging).
-        const v = readValueLazy(tyref, pg.payload, { pos: paxValueOff(dirs, c, i) }, null);
+        const v = readValueLazy(
+          tyref,
+          pg.payload,
+          { pos: paxValueOff(pg.payload, dirs, c, i) },
+          null,
+        );
         markChains([v], fetch, reached);
       }
     }
@@ -3135,16 +3140,25 @@ function parsePage(block: Uint8Array): Page {
 // value directory + tagged codec bytes (NULL = a zero-length span).
 type RegionDir =
   | { kind: "fixed"; width: number; bitmap: number; body: number }
-  | { kind: "var"; ends: number[]; body: number };
+  | { kind: "var"; ends: number; body: number };
 
 // A parsed PAX (column-major) leaf's directories (format.md v24 "Leaf node"). All offsets index into
 // the page payload; value bytes are read in place so the lazy decoder's zero-copy view still
 // references the shared page block.
 type PaxDirs = {
   keyBlob: number; // payload offset where the key blob starts
-  keyEnd: number[]; // N end offsets into the key blob (end-offset directory, v24)
+  keyEnd: number; // payload offset of the N-entry key end-offset directory (v24)
   regions: RegionDir[]; // K regions, in declaration order
 };
+
+// Read entry i from a validated big-endian end-offset directory retained in the immutable page.
+// Direct byte assembly avoids allocating a DataView or a decoded number array on the fault path.
+function paxDirEnd(payload: Uint8Array, directory: number, i: number): number {
+  const p = directory + i * 4;
+  return (
+    ((payload[p]! << 24) | (payload[p + 1]! << 16) | (payload[p + 2]! << 8) | payload[p + 3]!) >>> 0
+  );
+}
 
 // parsePaxLeaf decodes a v24 PAX leaf payload's directories (format.md "Leaf node"). Column regions
 // are validated contiguous, in order, and within the payload; a malformed directory, a set region
@@ -3154,26 +3168,26 @@ type PaxDirs = {
 function parsePaxLeaf(payload: Uint8Array, n: number, colTypes: ColType[]): PaxDirs {
   const k = colTypes.length;
   const cur = { pos: 0 };
-  const keyEnd: number[] = [];
+  const keyEnd = cur.pos;
   let prev = 0;
   for (let i = 0; i < n; i++) {
     const e = readU32(payload, cur);
     if (e < prev) throw engineError("data_corrupted", "PAX leaf key directory not ascending");
-    keyEnd.push(e);
     prev = e;
   }
   const keyBlob = cur.pos;
   cur.pos = keyBlob + prev;
   if (cur.pos > payload.length)
     throw engineError("data_corrupted", "PAX leaf key blob overruns page");
-  const colStart: number[] = [];
-  for (let i = 0; i <= k; i++) colStart.push(readU32(payload, cur));
-  if (colStart[0] !== cur.pos)
+  const colDir = cur.pos;
+  const colRegions = colDir + (k + 1) * 4;
+  const colCur = { pos: colDir };
+  let start = readU32(payload, colCur);
+  if (start !== colRegions)
     throw engineError("data_corrupted", "PAX leaf column directory start mismatch");
   const regions: RegionDir[] = [];
   for (let c = 0; c < k; c++) {
-    const start = colStart[c]!;
-    const end = colStart[c + 1]!;
+    const end = readU32(payload, colCur);
     if (start > end || end > payload.length)
       throw engineError("data_corrupted", "PAX leaf column region out of range");
     const cc = { pos: start };
@@ -3187,27 +3201,27 @@ function parsePaxLeaf(payload: Uint8Array, n: number, colTypes: ColType[]): PaxD
         throw engineError("data_corrupted", "PAX leaf fixed region extent mismatch");
       regions.push({ kind: "fixed", width, bitmap, body });
     } else {
-      const ends: number[] = [];
+      const ends = cc.pos;
       let vprev = 0;
       for (let i = 0; i < n; i++) {
         const e = readU32(payload, cc);
         if (e < vprev)
           throw engineError("data_corrupted", "PAX leaf value directory not ascending");
-        ends.push(e);
         vprev = e;
       }
       if (cc.pos + vprev !== end)
         throw engineError("data_corrupted", "PAX leaf variable region extent mismatch");
       regions.push({ kind: "var", ends, body: cc.pos });
     }
+    start = end;
   }
   return { keyBlob, keyEnd, regions };
 }
 
 // Key i's span within the payload.
 function paxKey(payload: Uint8Array, d: PaxDirs, i: number): Uint8Array {
-  const lo = d.keyBlob + (i === 0 ? 0 : d.keyEnd[i - 1]!);
-  const hi = d.keyBlob + d.keyEnd[i]!;
+  const lo = d.keyBlob + (i === 0 ? 0 : paxDirEnd(payload, d.keyEnd, i - 1));
+  const hi = d.keyBlob + paxDirEnd(payload, d.keyEnd, i);
   if (lo > hi || hi > payload.length)
     throw engineError("data_corrupted", "PAX leaf key directory out of range");
   return payload.subarray(lo, hi);
@@ -3218,25 +3232,25 @@ function paxKey(payload: Uint8Array, d: PaxDirs, i: number): Uint8Array {
 function paxIsNull(payload: Uint8Array, d: PaxDirs, c: number, i: number): boolean {
   const r = d.regions[c]!;
   if (r.kind === "fixed") return (payload[r.bitmap + (i >> 3)]! & (0x80 >> (i % 8))) !== 0;
-  const start = i === 0 ? 0 : r.ends[i - 1]!;
-  return r.ends[i]! === start;
+  const start = i === 0 ? 0 : paxDirEnd(payload, r.ends, i - 1);
+  return paxDirEnd(payload, r.ends, i) === start;
 }
 
 // paxValueOff: the payload offset where value (record i, column c)'s bytes begin — a fixed-width
 // slot (untagged body) or a variable value's tagged codec bytes. Meaningless for a NULL.
-function paxValueOff(d: PaxDirs, c: number, i: number): number {
+function paxValueOff(payload: Uint8Array, d: PaxDirs, c: number, i: number): number {
   const r = d.regions[c]!;
   if (r.kind === "fixed") return r.body + i * r.width;
-  return r.body + (i === 0 ? 0 : r.ends[i - 1]!);
+  return r.body + (i === 0 ? 0 : paxDirEnd(payload, r.ends, i - 1));
 }
 
 // paxValueLen: the bytes value (record i, column c) contributes to recordSize — the slot width
 // (fixed-width, NULL included) or the span length (variable; 0 for NULL). Derivable from the
 // directories alone, with NO value decode (packed-leaf.md §3/§5).
-function paxValueLen(d: PaxDirs, c: number, i: number): number {
+function paxValueLen(payload: Uint8Array, d: PaxDirs, c: number, i: number): number {
   const r = d.regions[c]!;
   if (r.kind === "fixed") return r.width;
-  return r.ends[i]! - (i === 0 ? 0 : r.ends[i - 1]!);
+  return paxDirEnd(payload, r.ends, i) - (i === 0 ? 0 : paxDirEnd(payload, r.ends, i - 1));
 }
 
 export function decodeLeafNode(
@@ -3250,7 +3264,7 @@ export function decodeLeafNode(
     throw engineError("data_corrupted", "demand-paged a non-leaf page");
   const n = pg.itemCount;
   // Packed form (packed-leaf.md §5): retain the page payload (a subarray view of the block — GC keeps
-  // the block alive, the equivalent of Rust's Arc<[u8]>) + the parsed PAX directories, and decode NO
+  // the block alive, the equivalent of Rust's Arc<[u8]>) + validated PAX directory offsets, and decode NO
   // values. parsePaxLeaf validated + parsed the directories with no value decode, so a malformed
   // directory still surfaces data_corrupted here; a malformed value body surfaces XX001 only when the
   // column is touched (§8). Keys and weights are derived from the directories alone (§3): the weight is
@@ -3271,7 +3285,7 @@ export function decodeLeafNode(
   const col = (i: number, c: number): Value => {
     if (paxIsNull(payload, dirs, c, i)) return nullValue();
     const ty = colTypes[c]!;
-    const cur = { pos: paxValueOff(dirs, c, i) };
+    const cur = { pos: paxValueOff(payload, dirs, c, i) };
     return fixedValueWidth(ty) !== null
       ? readInlineBody(ty, payload, cur, "construct")
       : readValueLazy(tyrefs[c]!, payload, cur, paging);
@@ -3283,7 +3297,7 @@ export function decodeLeafNode(
     },
     weight(i: number): number {
       let size = paxKey(payload, dirs, i).length;
-      for (let c = 0; c < colTypes.length; c++) size += paxValueLen(dirs, c, i);
+      for (let c = 0; c < colTypes.length; c++) size += paxValueLen(payload, dirs, c, i);
       return size;
     },
     col,

@@ -3576,9 +3576,8 @@ func pageBlock(image []byte, ps int, index uint32) ([]byte, error) {
 	return out, nil
 }
 
-// paxLeaf is a parsed PAX (column-major) leaf's directories + spans (format.md v23 "Leaf node").
-// keys and colVals are zero-copy views into the page payload; colOff[c] is column c's value
-// directory (N+1 prefix-sum offsets into colVals[c]).
+// paxLeaf is a validated PAX (column-major) leaf's page-backed directories + spans (format.md v24
+// "Leaf node"). keyEnd and each variable region's ends remain zero-copy views into the page payload.
 // paxRegion is one leaf column region's parsed shape (v24 — format.md "Leaf node"),
 // class-dependent: a fixed-width region is a null bitmap + dense untagged slots; a variable region
 // is an end-offset value directory + tagged codec bytes (NULL = a zero-length span).
@@ -3586,15 +3585,27 @@ type paxRegion struct {
 	// width > 0 ⇒ a fixed-width region (bitmap + body slots are meaningful); width == 0 ⇒ a
 	// variable region (ends + body blob).
 	width  int
-	bitmap []byte   // fixed: the ceil(N/8) null bitmap span (MSB-first, set = NULL)
-	ends   []uint32 // variable: N end offsets into the value blob (ends[i] = one past value i)
-	body   []byte   // the value bodies: N×width dense slots (fixed) or the value blob (variable)
+	bitmap []byte // fixed: the ceil(N/8) null bitmap span (MSB-first, set = NULL)
+	ends   []byte // variable: zero-copy N×u32 big-endian end-offset directory in the page
+	body   []byte // the value bodies: N×width dense slots (fixed) or the value blob (variable)
 }
 
 type paxLeaf struct {
-	keyBlob []byte   // the shared key bytes in the retained page payload
-	keyEnd  []uint32 // N end offsets into keyBlob; no per-record slice wrappers
+	keyBlob []byte // the shared key bytes in the retained page payload
+	keyEnd  []byte // zero-copy N×u32 big-endian end-offset directory in the retained page
 	regions []paxRegion
+}
+
+// paxDirEnd reads entry i from a directory that parsePaxLeaf already validated in full. Keeping
+// directories as page views removes their per-leaf integer-array allocations while retaining O(1)
+// access to keys and variable-width values.
+func paxDirEnd(directory []byte, i int) uint32 {
+	at := i * 4
+	_ = directory[at+3] // one bounds check for the four direct byte reads below
+	return uint32(directory[at])<<24 |
+		uint32(directory[at+1])<<16 |
+		uint32(directory[at+2])<<8 |
+		uint32(directory[at+3])
 }
 
 // parsePaxLeaf decodes a v24 PAX leaf payload's directories into key spans and per-column regions
@@ -3605,9 +3616,9 @@ type paxLeaf struct {
 func parsePaxLeaf(payload []byte, n int, colTypes []colType) (*paxLeaf, error) {
 	k := len(colTypes)
 	pos := 0
-	keyEnd := make([]uint32, n)
+	keyDir := pos
 	prev := uint32(0)
-	for i := range keyEnd {
+	for i := 0; i < n; i++ {
 		e, err := readU32(payload, &pos)
 		if err != nil {
 			return nil, err
@@ -3615,29 +3626,33 @@ func parsePaxLeaf(payload []byte, n int, colTypes []colType) (*paxLeaf, error) {
 		if e < prev {
 			return nil, newError(DataCorrupted, "PAX leaf key directory not ascending")
 		}
-		keyEnd[i] = e
 		prev = e
 	}
+	keyEnd := payload[keyDir:pos]
 	keyBlob := pos
 	if keyBlob+int(prev) > len(payload) {
 		return nil, newError(DataCorrupted, "PAX leaf key blob overruns page")
 	}
 	keyBytes := payload[keyBlob : keyBlob+int(prev)]
 	pos = keyBlob + int(prev)
-	colStart := make([]uint32, k+1)
-	for c := range colStart {
-		v, err := readU32(payload, &pos)
-		if err != nil {
-			return nil, err
-		}
-		colStart[c] = v
+	colDir := pos
+	colRegions := colDir + (k+1)*4
+	colPos := colDir
+	start32, err := readU32(payload, &colPos)
+	if err != nil {
+		return nil, err
 	}
-	if int(colStart[0]) != pos {
+	if int(start32) != colRegions {
 		return nil, newError(DataCorrupted, "PAX leaf column directory start mismatch")
 	}
 	regions := make([]paxRegion, k)
+	start := int(start32)
 	for c, ty := range colTypes {
-		start, end := int(colStart[c]), int(colStart[c+1])
+		end32, err := readU32(payload, &colPos)
+		if err != nil {
+			return nil, err
+		}
+		end := int(end32)
 		if start > end || end > len(payload) {
 			return nil, newError(DataCorrupted, "PAX leaf column region out of range")
 		}
@@ -3656,9 +3671,9 @@ func parsePaxLeaf(payload []byte, n int, colTypes []colType) (*paxLeaf, error) {
 			}
 			regions[c] = paxRegion{width: w, bitmap: payload[p:body], body: payload[body:end]}
 		} else {
-			ends := make([]uint32, n)
+			endsStart := p
 			vprev := uint32(0)
-			for i := range ends {
+			for i := 0; i < n; i++ {
 				e, err := readU32(payload, &p)
 				if err != nil {
 					return nil, err
@@ -3666,14 +3681,14 @@ func parsePaxLeaf(payload []byte, n int, colTypes []colType) (*paxLeaf, error) {
 				if e < vprev {
 					return nil, newError(DataCorrupted, "PAX leaf value directory not ascending")
 				}
-				ends[i] = e
 				vprev = e
 			}
 			if p > end || p+int(vprev) != end {
 				return nil, newError(DataCorrupted, "PAX leaf variable region extent mismatch")
 			}
-			regions[c] = paxRegion{ends: ends, body: payload[p:end]}
+			regions[c] = paxRegion{ends: payload[endsStart:p], body: payload[p:end]}
 		}
+		start = end
 	}
 	return &paxLeaf{keyBlob: keyBytes, keyEnd: keyEnd, regions: regions}, nil
 }
@@ -3682,9 +3697,9 @@ func parsePaxLeaf(payload []byte, n int, colTypes []colType) (*paxLeaf, error) {
 func (l *paxLeaf) key(i int) []byte {
 	lo := uint32(0)
 	if i > 0 {
-		lo = l.keyEnd[i-1]
+		lo = paxDirEnd(l.keyEnd, i-1)
 	}
-	return l.keyBlob[lo:l.keyEnd[i]]
+	return l.keyBlob[lo:paxDirEnd(l.keyEnd, i)]
 }
 
 // isNull reports whether value (record i, column c) is NULL — the region bitmap (fixed-width) or
@@ -3696,9 +3711,9 @@ func (l *paxLeaf) isNull(c, i int) bool {
 	}
 	lo := uint32(0)
 	if i > 0 {
-		lo = r.ends[i-1]
+		lo = paxDirEnd(r.ends, i-1)
 	}
-	return r.ends[i] == lo
+	return paxDirEnd(r.ends, i) == lo
 }
 
 // value returns the bytes of value (record i, column c), a view into the page payload: a
@@ -3711,9 +3726,9 @@ func (l *paxLeaf) value(c, i int) ([]byte, error) {
 	}
 	lo := uint32(0)
 	if i > 0 {
-		lo = r.ends[i-1]
+		lo = paxDirEnd(r.ends, i-1)
 	}
-	hi := r.ends[i]
+	hi := paxDirEnd(r.ends, i)
 	if int(hi) > len(r.body) {
 		return nil, newError(DataCorrupted, "PAX leaf value offset out of range")
 	}
@@ -3730,15 +3745,15 @@ func (l *paxLeaf) valueLen(c, i int) int {
 	}
 	lo := uint32(0)
 	if i > 0 {
-		lo = r.ends[i-1]
+		lo = paxDirEnd(r.ends, i-1)
 	}
-	return int(r.ends[i] - lo)
+	return int(paxDirEnd(r.ends, i) - lo)
 }
 
-// packedLeaf is a faulted leaf's block-backed resident form (packed-leaf.md §5): the parsed PAX
-// directories (views into the page block) plus the table's column types, retained instead of
+// packedLeaf is a faulted leaf's block-backed resident form (packed-leaf.md §5): the validated PAX
+// directory views plus the table's column types, retained instead of
 // discarded. It holds NO decoded storedRow — row/value reconstruct on demand via readValueLazy over
-// the O(1) column spans. Because dirs.keys/colVals are sub-slices of the page block, retaining them
+// the O(1) column spans. Because the directory/blob fields are sub-slices of the page block, retaining them
 // keeps that block alive (Go GC — the equivalent of Rust's Arc<[u8]> pin), so a resident leaf is
 // ≈ pageSize for fixed-width and variable-length data alike (§9). colTypes is a shared slice header
 // (the table's list), so a resident leaf copies no column types.

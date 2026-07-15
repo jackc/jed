@@ -1018,7 +1018,10 @@ Header (`item_count = N`, `next_page = 0`) followed by a **column-major (PAX)** 
 A leaf's payload size is `Σ record_size + leafOverhead(N, cols)` (*Page model* above). A
 single-column scan reads one contiguous run (`colStart[c] … colStart[c+1]`) — the columnar-scan
 enabler, now tag-free and dense for fixed-width columns. To parse: read `N` from the header, the
-table's column classes from the catalog, then the directories in order.
+table's column classes from the catalog, then the directories in order. A reader may retain the raw
+directory byte ranges and read individual big-endian entries on demand, but it must still scan and
+validate every end offset for ascending order and bounds during the page parse/fault; zero-copy
+retention does not defer corruption detection.
 
 ### Interior node (`page_type = 3`)
 

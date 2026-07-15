@@ -386,6 +386,45 @@ test("a faulted leaf shares one page block across its deferred values", () => {
   assert.equal(deferred, 12, "every deferrable present value defers (form (a))");
 });
 
+// P1 retains PAX directories as page offsets instead of decoded number arrays. The representation
+// is invisible, but its fail-closed half is observable: every directory entry must still be checked
+// at fault time, before a Packed leaf can enter the pool.
+test("a Packed leaf validates page-backed directories at fault", () => {
+  const colTypes: ColType[] = [{ kind: "scalar", scalar: "text" }];
+  const rows: Value[][] = [[textValue("alpha")], [textValue("bravo")], [textValue("charlie")]];
+  const keys = rows.map((_, i) => {
+    const key = new Uint8Array(4);
+    new DataView(key.buffer).setUint32(0, i, false);
+    return key;
+  });
+  let takeSeq = 100;
+  const overflow: OverflowPageOut[] = [];
+  const payload = encodeLeafPax(colTypes, keys, rows, 8192 - 16, () => ++takeSeq, overflow);
+  assert.equal(overflow.length, 0);
+
+  const assertFaultCorrupt = (corrupt: Uint8Array): void => {
+    const block = makePage(8192, PAGE_LEAF, rows.length, 0, corrupt);
+    assert.equal(
+      errCode(() => decodeLeafNode(block, 2, colTypes, null)),
+      "XX001",
+    );
+  };
+
+  const badKeys = payload.slice();
+  const keyView = new DataView(badKeys.buffer, badKeys.byteOffset, badKeys.byteLength);
+  keyView.setUint32(4, keyView.getUint32(0, false) - 1, false);
+  assertFaultCorrupt(badKeys);
+
+  const badValues = payload.slice();
+  const valueView = new DataView(badValues.buffer, badValues.byteOffset, badValues.byteLength);
+  const lastKeyEnd = valueView.getUint32((rows.length - 1) * 4, false);
+  const colDir = rows.length * 4 + lastKeyEnd;
+  const firstRegion = valueView.getUint32(colDir, false);
+  const valueDir = firstRegion + 1; // region flags byte
+  valueView.setUint32(valueDir + 4, valueView.getUint32(valueDir, false) - 1, false);
+  assertFaultCorrupt(badValues);
+});
+
 // The touched-column path (packed-leaf.md §4/§6, the PAX dividend): colAt reconstructs ONLY the
 // requested column of a Packed leaf, byte-identically to the whole-row reconstruction. Since B4
 // (bplus-reshape.md §5) the masked row form is gone — reconstruction is uniformly lazy and a

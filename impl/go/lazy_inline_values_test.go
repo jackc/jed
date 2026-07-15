@@ -375,6 +375,15 @@ func TestLazyInlineFaultedLeafSharesPageBlock(t *testing.T) {
 	if node.keyLen() != len(keys) {
 		t.Fatalf("logical key count = %d, want %d", node.keyLen(), len(keys))
 	}
+	if got, want := len(node.packed.dirs.keyEnd), 4*len(keys); got != want {
+		t.Fatalf("page-backed key directory bytes = %d, want %d", got, want)
+	}
+	if cap(node.packed.dirs.keyEnd) <= len(node.packed.dirs.keyEnd) {
+		t.Fatalf("key directory must remain a view into the retained page, not an owned offset array")
+	}
+	if got := node.packed.dirs.regions[1].ends; len(got) != 4*len(keys) || cap(got) <= len(got) {
+		t.Fatalf("variable directory must remain a page view; len=%d cap=%d", len(got), cap(got))
+	}
 	for i := range keys {
 		if !bytes.Equal(node.keyAt(i), keys[i]) {
 			t.Fatalf("keyAt(%d) differs from encoded key", i)
@@ -422,6 +431,53 @@ func TestLazyInlineFaultedLeafSharesPageBlock(t *testing.T) {
 	if deferred != 12 {
 		t.Fatalf("expected 12 deferred values, got %d", deferred)
 	}
+}
+
+// TestPackedLeafValidatesPageBackedDirectoriesAtFault pins the safety half of the P1 directory
+// representation: retaining raw directory bytes removes allocations, but every entry is still
+// scanned for ascending/bounds validity before the leaf enters the pool.
+func TestPackedLeafValidatesPageBackedDirectoriesAtFault(t *testing.T) {
+	t.Parallel()
+	colTypes := []colType{scalarColType(scalarText)}
+	rows := []storedRow{
+		{TextValue("alpha")},
+		{TextValue("bravo")},
+		{TextValue("charlie")},
+	}
+	keys := make([][]byte, len(rows))
+	for i := range keys {
+		keys[i] = binary.BigEndian.AppendUint32(nil, uint32(i))
+	}
+	takeSeq := uint32(100)
+	take := func() uint32 { takeSeq++; return takeSeq }
+	var overflow []overflowPageOut
+	payload := encodeLeafPAX(colTypes, keys, rows, 8192-pageHeader, take, &overflow)
+	if len(overflow) != 0 {
+		t.Fatalf("test values unexpectedly spilled")
+	}
+	assertFaultCorrupt := func(payload []byte) {
+		t.Helper()
+		block := makePage(8192, pageLeaf, uint32(len(rows)), 0, payload)
+		if _, err := decodeLeafNode(block, 2, colTypes, nil); err == nil {
+			t.Fatal("descending PAX directory must fail at leaf fault")
+		} else if ee, ok := err.(*EngineError); !ok || ee.Code() != "XX001" {
+			t.Fatalf("descending PAX directory: want XX001, got %v", err)
+		}
+	}
+
+	badKeys := bytes.Clone(payload)
+	firstKeyEnd := binary.BigEndian.Uint32(badKeys[0:4])
+	binary.BigEndian.PutUint32(badKeys[4:8], firstKeyEnd-1)
+	assertFaultCorrupt(badKeys)
+
+	badValues := bytes.Clone(payload)
+	lastKeyEnd := int(binary.BigEndian.Uint32(badValues[(len(rows)-1)*4:]))
+	colDir := len(rows)*4 + lastKeyEnd
+	firstRegion := int(binary.BigEndian.Uint32(badValues[colDir:]))
+	valueDir := firstRegion + 1 // region flags byte
+	firstValueEnd := binary.BigEndian.Uint32(badValues[valueDir:])
+	binary.BigEndian.PutUint32(badValues[valueDir+4:], firstValueEnd-1)
+	assertFaultCorrupt(badValues)
 }
 
 // TestPackedLeafTouchedColumnsAndSelfResolution — the touched-column path (packed-leaf.md §4/§6,

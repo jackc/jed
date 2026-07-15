@@ -2123,7 +2123,7 @@ fn collect_leaf_overflow(
                     if dirs.is_null(payload, c, i) {
                         continue;
                     }
-                    let mut pos = dirs.value_off(c, i);
+                    let mut pos = dirs.value_off(payload, c, i);
                     // The value is discarded right after `mark_chains` (only its chain pages
                     // matter), so the resolution handle is deliberately dead.
                     let v = read_value_lazy(
@@ -3373,9 +3373,9 @@ fn page_block(image: &[u8], ps: usize, index: u32) -> Result<Vec<u8>> {
     Ok(image[off..off + ps].to_vec())
 }
 
-/// A parsed PAX (column-major) leaf's directories (spec/fileformat/format.md v23 "Leaf node"). All
-/// offsets index into the page payload; value bytes are read in place (`value_off`) so the lazy
-/// decoder's zero-copy form still references the shared page block.
+/// A validated PAX (column-major) leaf's page-backed directories (spec/fileformat/format.md v24
+/// "Leaf node"). All offsets index into the page payload; value bytes are read in place
+/// (`value_off`) so the lazy decoder's zero-copy form still references the shared page block.
 /// One leaf column region's parsed shape (v24 — spec/fileformat/format.md "Leaf node"), class-
 /// dependent: a fixed-width region is a null bitmap + dense untagged slots; a variable region is
 /// an end-offset value directory + tagged codec bytes (NULL = zero-length span).
@@ -3388,29 +3388,42 @@ enum RegionDir {
         body: usize,
     },
     Var {
-        /// The `N` end offsets into the value blob (`ends[i]` = one past value `i`'s bytes).
-        ends: Vec<u32>,
+        /// Payload offset of the `N` big-endian end offsets into the value blob. The directory is
+        /// validated once at fault time and retained zero-copy in the immutable page block.
+        ends: usize,
         /// Payload offset of the value blob.
         body: usize,
     },
 }
 
 struct PaxDirs {
-    key_blob: usize,         // payload offset where the key blob starts
-    key_end: Vec<u32>,       // N end offsets into the key blob (end-offset directory, v24)
+    key_dir: usize,  // payload offset of the N-entry key end-offset directory (v24)
+    key_blob: usize, // payload offset where the key blob starts
     regions: Vec<RegionDir>, // K regions, in declaration order
 }
 
 impl PaxDirs {
+    /// Read entry `i` from a validated big-endian end-offset directory retained in `payload`.
+    #[inline]
+    fn end_offset(payload: &[u8], directory: usize, i: usize) -> u32 {
+        let at = directory + i * 4;
+        u32::from_be_bytes([
+            payload[at],
+            payload[at + 1],
+            payload[at + 2],
+            payload[at + 3],
+        ])
+    }
+
     /// Key `i`'s span within `payload`.
     fn key<'a>(&self, payload: &'a [u8], i: usize) -> Result<&'a [u8]> {
         let lo = self.key_blob
             + if i == 0 {
                 0
             } else {
-                self.key_end[i - 1] as usize
+                Self::end_offset(payload, self.key_dir, i - 1) as usize
             };
-        let hi = self.key_blob + self.key_end[i] as usize;
+        let hi = self.key_blob + Self::end_offset(payload, self.key_dir, i) as usize;
         if lo > hi || hi > payload.len() {
             return Err(corrupt("PAX leaf key directory out of range"));
         }
@@ -3423,48 +3436,63 @@ impl PaxDirs {
         match &self.regions[c] {
             RegionDir::Fixed { bitmap, .. } => payload[bitmap + i / 8] & (0x80 >> (i % 8)) != 0,
             RegionDir::Var { ends, .. } => {
-                let start = if i == 0 { 0 } else { ends[i - 1] };
-                ends[i] == start
+                let start = if i == 0 {
+                    0
+                } else {
+                    Self::end_offset(payload, *ends, i - 1)
+                };
+                Self::end_offset(payload, *ends, i) == start
             }
         }
     }
 
     /// The payload offset where value `(record i, column c)`'s bytes begin: a fixed-width slot
     /// (untagged body) or a variable value's tagged codec bytes. Meaningless for a NULL.
-    fn value_off(&self, c: usize, i: usize) -> usize {
+    fn value_off(&self, payload: &[u8], c: usize, i: usize) -> usize {
         match &self.regions[c] {
             RegionDir::Fixed { width, body, .. } => body + i * width,
-            RegionDir::Var { ends, body } => body + if i == 0 { 0 } else { ends[i - 1] as usize },
+            RegionDir::Var { ends, body } => {
+                body + if i == 0 {
+                    0
+                } else {
+                    Self::end_offset(payload, *ends, i - 1) as usize
+                }
+            }
         }
     }
 
     /// The bytes value `(record i, column c)` contributes to `record_size` — the slot width
     /// (fixed-width, NULL included) or the span length (variable; 0 for NULL). Derivable from the
     /// directories alone, with **no value decode** (packed-leaf.md §3/§5).
-    fn value_len(&self, c: usize, i: usize) -> usize {
+    fn value_len(&self, payload: &[u8], c: usize, i: usize) -> usize {
         match &self.regions[c] {
             RegionDir::Fixed { width, .. } => *width,
             RegionDir::Var { ends, .. } => {
-                (ends[i] - if i == 0 { 0 } else { ends[i - 1] }) as usize
+                let lo = if i == 0 {
+                    0
+                } else {
+                    Self::end_offset(payload, *ends, i - 1)
+                };
+                (Self::end_offset(payload, *ends, i) - lo) as usize
             }
         }
     }
 }
 
 /// A faulted leaf's **packed** resident form (packed-leaf.md §5): the whole page block plus the PAX
-/// directories `parse_pax_leaf` already produces, retained instead of discarded. Holds **no** decoded
+/// validated directory ranges `parse_pax_leaf` already produces, retained instead of discarded. Holds **no** decoded
 /// row vector — [`row`](PackedLeaf::row) / [`value`](PackedLeaf::value) reconstruct on demand via the
 /// same [`read_value_lazy`] the eager fault ran, over the O(1) column spans PAX writes on disk. The
 /// `block` `Arc` is the buffer-pool pin (§7): a reconstructed `Unfetched::Inline` value clones it, so
-/// its bytes outlive pool eviction. Resident cost is `≈ page_size` (§9) — the page block, the thin
-/// directory `u32` arrays, and a shared `Arc` to the table's column types.
+/// its bytes outlive pool eviction. Resident cost is `≈ page_size` (§9) — the page block, thin
+/// per-column descriptors with page offsets, and a shared `Arc` to the table's column types.
 pub(crate) struct PackedLeaf {
     /// The whole page image (one `page_size` buffer). Shared across every reconstructed inline value.
     block: Arc<Vec<u8>>,
     /// Offset of the payload within `block` — always `PAGE_HEADER` (the value directories index the
     /// payload; the shared block is needed whole so `Unfetched::Inline` offsets are block-relative).
     payload_off: usize,
-    /// The parsed PAX directories (key / column / per-column value directories).
+    /// Validated page offsets for the PAX directories plus the per-column region descriptors.
     dirs: PaxDirs,
     /// The table's resolved value column types — shared (`Arc`) across all this table's leaves, so a
     /// resident leaf adds no per-leaf column-type copy (§9).
@@ -3493,9 +3521,10 @@ impl PackedLeaf {
 
     /// The exact serialized record size, derived only when size-driven mutation/rebalance needs it.
     pub(crate) fn record_weight(&self, i: usize) -> u32 {
+        let payload = &self.block[self.payload_off..];
         let mut size = self.key(i).len();
         for c in 0..self.col_types.len() {
-            size += self.dirs.value_len(c, i);
+            size += self.dirs.value_len(payload, c, i);
         }
         size as u32
     }
@@ -3511,7 +3540,7 @@ impl PackedLeaf {
             return Ok(Value::Null);
         }
         let ty = &self.col_types[c];
-        let mut pos = self.dirs.value_off(c, i);
+        let mut pos = self.dirs.value_off(payload, c, i);
         match fixed_value_width(ty) {
             // A fixed-width slot is the untagged inline body — decoded eagerly (deferring a
             // fixed-width scalar buys nothing, lazy-record.md §6).
@@ -3549,14 +3578,13 @@ impl PackedLeaf {
 fn parse_pax_leaf(payload: &[u8], n: usize, col_types: &[ColType]) -> Result<PaxDirs> {
     let k = col_types.len();
     let mut pos = 0usize;
-    let mut key_end = Vec::with_capacity(n);
+    let key_dir = pos;
     let mut prev = 0u32;
     for _ in 0..n {
         let e = read_u32(payload, &mut pos)?;
         if e < prev {
             return Err(corrupt("PAX leaf key directory not ascending"));
         }
-        key_end.push(e);
         prev = e;
     }
     let key_blob = pos;
@@ -3564,17 +3592,21 @@ fn parse_pax_leaf(payload: &[u8], n: usize, col_types: &[ColType]) -> Result<Pax
     if pos > payload.len() {
         return Err(corrupt("PAX leaf key blob overruns page"));
     }
-    let mut col_start = Vec::with_capacity(k + 1);
-    for _ in 0..=k {
-        col_start.push(read_u32(payload, &mut pos)?);
-    }
-    if col_start[0] as usize != pos {
+    let col_dir = pos;
+    let col_dir_len = (k + 1)
+        .checked_mul(4)
+        .ok_or_else(|| corrupt("PAX leaf column directory out of range"))?;
+    let col_regions = col_dir
+        .checked_add(col_dir_len)
+        .ok_or_else(|| corrupt("PAX leaf column directory out of range"))?;
+    let mut col_pos = col_dir;
+    let mut start = read_u32(payload, &mut col_pos)? as usize;
+    if start != col_regions {
         return Err(corrupt("PAX leaf column directory start mismatch"));
     }
     let mut regions = Vec::with_capacity(k);
-    for (c, ty) in col_types.iter().enumerate() {
-        let start = col_start[c] as usize;
-        let end = col_start[c + 1] as usize;
+    for ty in col_types {
+        let end = read_u32(payload, &mut col_pos)? as usize;
         if start > end || end > payload.len() {
             return Err(corrupt("PAX leaf column region out of range"));
         }
@@ -3596,14 +3628,13 @@ fn parse_pax_leaf(payload: &[u8], n: usize, col_types: &[ColType]) -> Result<Pax
                 });
             }
             None => {
-                let mut ends = Vec::with_capacity(n);
+                let ends = p;
                 let mut vprev = 0u32;
                 for _ in 0..n {
                     let e = read_u32(payload, &mut p)?;
                     if e < vprev {
                         return Err(corrupt("PAX leaf value directory not ascending"));
                     }
-                    ends.push(e);
                     vprev = e;
                 }
                 if p + vprev as usize != end {
@@ -3612,10 +3643,11 @@ fn parse_pax_leaf(payload: &[u8], n: usize, col_types: &[ColType]) -> Result<Pax
                 regions.push(RegionDir::Var { ends, body: p });
             }
         }
+        start = end;
     }
     Ok(PaxDirs {
+        key_dir,
         key_blob,
-        key_end,
         regions,
     })
 }
@@ -5696,6 +5728,15 @@ mod tests {
             "a Packed leaf keeps no per-record key or weight objects"
         );
         assert_eq!(node.len(), keys.len());
+        let dirs = &node.packed.as_ref().unwrap().dirs;
+        assert_eq!(
+            dirs.key_dir, 0,
+            "the key directory is retained by page offset, not decoded"
+        );
+        assert!(
+            matches!(dirs.regions[1], RegionDir::Var { ends, .. } if ends > dirs.key_blob),
+            "variable directories are retained by page offset, not decoded"
+        );
         for i in 0..keys.len() {
             assert_eq!(node.key_at(i), keys[i]);
             assert_eq!(
@@ -5756,6 +5797,68 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// P1 keeps PAX end-offset directories as page-backed byte ranges, but validation remains an
+    /// eager fault-time contract. Checksum-valid descending key/value directories must still fail
+    /// before a Packed leaf can enter the pool.
+    #[test]
+    fn packed_leaf_validates_page_backed_directories_at_fault() {
+        let col_types = vec![ColType::Scalar(ScalarType::Text)];
+        let rows = [
+            vec![Value::Text("alpha".into())],
+            vec![Value::Text("bravo".into())],
+            vec![Value::Text("charlie".into())],
+        ];
+        let keys: Vec<Vec<u8>> = (0..rows.len())
+            .map(|i| (i as u32).to_be_bytes().to_vec())
+            .collect();
+        let row_refs: Vec<&[Value]> = rows.iter().map(Vec::as_slice).collect();
+        let mut take_seq = 100u32;
+        let mut take = || {
+            let page = take_seq;
+            take_seq += 1;
+            page
+        };
+        let mut overflow = Vec::new();
+        let payload = encode_leaf_pax(
+            &col_types,
+            &keys,
+            &row_refs,
+            8192 - PAGE_HEADER,
+            &mut take,
+            &mut overflow,
+        );
+        assert!(overflow.is_empty());
+
+        let assert_fault_corrupt = |payload: Vec<u8>| {
+            let block = make_page(8192, PAGE_LEAF, rows.len() as u32, 0, &payload);
+            let err = match decode_leaf_node(
+                block,
+                2,
+                Arc::new(col_types.clone()),
+                std::sync::Weak::new(),
+            ) {
+                Err(err) => err,
+                Ok(_) => panic!("descending PAX directory must fail at leaf fault"),
+            };
+            assert_eq!(err.state, SqlState::DataCorrupted);
+        };
+
+        let mut bad_keys = payload.clone();
+        let first_key_end = read_u32_at(&bad_keys, 0).unwrap();
+        bad_keys[4..8].copy_from_slice(&(first_key_end - 1).to_be_bytes());
+        assert_fault_corrupt(bad_keys);
+
+        let mut bad_values = payload;
+        let last_key_end = read_u32_at(&bad_values, (rows.len() - 1) * 4).unwrap() as usize;
+        let col_dir = rows.len() * 4 + last_key_end;
+        let first_region = read_u32_at(&bad_values, col_dir).unwrap() as usize;
+        let value_dir = first_region + 1; // region flags byte
+        let first_value_end = read_u32_at(&bad_values, value_dir).unwrap();
+        bad_values[value_dir + 4..value_dir + 8]
+            .copy_from_slice(&(first_value_end - 1).to_be_bytes());
+        assert_fault_corrupt(bad_values);
     }
 
     /// The touched-column path (packed-leaf.md §4/§6, the PAX dividend): `col_at`/`row_at_masked`

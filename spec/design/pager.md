@@ -107,9 +107,11 @@ A fixed-capacity cache mapping `page_id → decoded page`, with:
   database thrashed the pool under the default, paying a fault + leaf decode on most point lookups.
   256 MiB keeps the dominant RAM-sized case fully resident; a host that wants the old bound passes
   `cache_bytes` explicitly.) The budget is a *handle* setting, not an
-  on-disk parameter. A resident clean leaf is the retained page block plus shared PAX directories:
-  rows decode by touched column, keys are borrowed spans of the key blob, and record weights derive
-  lazily. It owns no per-record key, row, or weight objects, so resident leaf memory is
+  on-disk parameter. A resident clean leaf is the retained page block plus thin PAX region
+  descriptors; the key and variable-value end-offset directories remain validated byte ranges in
+  that block and are read big-endian on access instead of being copied into integer arrays. Rows
+  decode by touched column, keys are borrowed spans of the key blob, and record weights derive
+  lazily. It owns no per-record key, row, weight, or directory objects, so resident leaf memory is
   `≈ cache_leaves × page_size` and the byte budget means what it says. This Packed representation is
   results/cost/byte-neutral above the seam ([packed-leaf.md](packed-leaf.md)).
 - **Eviction — CLOCK (second-chance).** A simple per-core CLOCK over the resident pages: a

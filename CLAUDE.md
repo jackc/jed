@@ -478,8 +478,10 @@ cross-core-identical and owns that consequence (the host-extension boundary, §1
   value into an inflated `Value` tree — **design landed**, [spec/design/lazy-record.md](spec/design/lazy-record.md),
   the last of the four lazy-decode levels and the successor to streaming.md's "S5"; it makes the
   buffer-pool **byte budget honest** — resident leaf memory `≈ resident_leaves × page_size` rather
-  than the inflated decoded form; clean Packed leaves also keep keys as borrowed page spans and
-  derive record weights lazily, so they carry no per-record key/weight objects — and is
+  than the inflated decoded form; clean Packed leaves also keep keys as borrowed page spans,
+  retain validated PAX end-offset directories as page-backed byte ranges rather than decoded
+  per-record integer arrays, and derive record weights lazily, so they carry no per-record
+  key/weight/directory objects — and is
   results/cost/byte-neutral above the seam, so no
   `format_version` bump). The binding constraint on
   present work: **no code above the storage seam may harden a full-residency assumption** — no

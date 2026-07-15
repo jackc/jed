@@ -17,7 +17,10 @@
 > ([bplus-reshape.md](bplus-reshape.md) status note). (d) Since the 2026-07 point-lookup pass, a
 > clean Packed leaf also retains **keys and record weights only as page-backed directory facts**:
 > navigation borrows key spans, weights are derived lazily, and owned keys/weights appear only at
-> the Packed→Decoded mutation boundary. Body text below is kept as
+> the Packed→Decoded mutation boundary. (e) Since the 2026-07 cold-fault pass, those PAX
+> end-offset directories themselves stay as **validated byte ranges in the retained page**: fault
+> parsing still scans every entry for ascending/bounds validation, then access reads the needed
+> big-endian `u32` directly instead of retaining per-record integer arrays. Body text below is kept as
 > the design rationale; where it says "interior nodes are always Decoded" or "B-tree stores
 > records in interior nodes too", read it as v23 history.
 >
@@ -131,9 +134,10 @@ row-major on disk — v23 regroups leaves only — and read constantly by naviga
 - **Decoded** — `vals: Vec<Row>` / `[]storedRow`, as today. The form for **in-memory / `from_image` /
   mutated / dirty** leaves. A pure in-memory database (no pager) stays fully Decoded — it has nothing to
   page from and no resident pressure to relieve (lazy-record §4's carve-out, verbatim).
-- **Packed** — the leaf's whole page image + the **parsed PAX directories** (`key_end` plus the
-  fixed/variable column-region directories). Holds **no per-record key objects, decoded rows, or
-  eager weights**. Produced **only** by `decode_leaf_node` on a demand-paged fault.
+- **Packed** — the leaf's whole page image + **validated, page-backed PAX directory ranges**
+  (`key_end` plus the variable column end-offset directories) and thin per-column region
+  descriptors. Holds **no per-record key objects, decoded rows, eager weights, or decoded directory
+  arrays**. Produced **only** by `decode_leaf_node` on a demand-paged fault.
 
 Navigation uses a form-neutral `key_at(i)` accessor: Decoded returns its owned key and Packed returns a
 borrowed span of the page's key blob. Binary search therefore reads the retained bytes directly and
@@ -177,28 +181,29 @@ is still the correct, layout-independent first slice.
 
 Like lazy-record's (a)/(b) choice ([lazy-record.md §5](lazy-record.md)), the Packed form is
 **invisible** — results and cost are identical either way (§8) — so it is **not** a §8 byte contract and
-each core chooses idiomatically. The representation is **the parsed PAX directories**, retained instead
-of discarded:
+each core chooses idiomatically. The representation is **validated views/offsets for the PAX
+directories**, retained instead of decoded into owned integer arrays and then discarded:
 
 - **Rust** — `packed: Option<PackedLeaf>` on `Node` (leaves only; `None` for Decoded/interior), where
-  `PackedLeaf { block: Arc<Vec<u8>>, dirs: PaxDirs }` — `PaxDirs { key_end, regions, … }` is exactly the
-  struct `parse_pax_leaf` already returns ([format.rs](../../impl/rust/src/format.rs)). A block-slice is
+  `PackedLeaf { block: Arc<Vec<u8>>, dirs: PaxDirs }` — `PaxDirs { key_dir, regions, … }` retains
+  payload offsets for the key and variable-value directories plus one descriptor per column
+  ([format.rs](../../impl/rust/src/format.rs)). A block-slice is
   `(Arc clone, off, len)`; the `Arc` keeps the page alive past pool eviction (the existing
   `Unfetched::Inline` L3 mechanism, generalized from "held when a value defers" to "the leaf's backing
   store").
-- **Go** — the retained `*paxLeaf` (`{keyBlob, keyEnd, regions}`); `key(i)` and the column accessors
-  return `[]byte` subslices and therefore GC-alive views of the page. There is no resident `[][]byte`
-  key directory.
-- **TS** — the retained parsed directories over a `Uint8Array.subarray` view of the block
-  (single-threaded).
+- **Go** — the retained `*paxLeaf` (`{keyBlob, keyEnd, regions}`); `keyEnd` and variable `ends` are
+  `[]byte` views into the page, while `key(i)` and the column accessors return page subslices. There
+  is no resident decoded end-offset array.
+- **TS** — numeric payload offsets for the key and variable-value directories over the retained
+  `Uint8Array.subarray` block view (single-threaded), plus one descriptor per column.
 
 The decisive difference from the pre-PAX prototype: **no fault-time offset pass.** Row-major needed a
 `decode_record_lazy` cursor advance to compute per-record start offsets (`rec_off`) at fault time. PAX
-delivers the boundary index **on disk** — `parse_pax_leaf` reads the directories in one pass with **no
-value decode at all** — so the fault does no per-value copy, no per-value decode, and no boundary
-computation: it parses the directory `u32`s (already required to validate the page) and retains them
-with the block. Keys are block spans located from the shared `key_end` directory; search compares those
-spans directly.
+delivers the boundary index **on disk** — `parse_pax_leaf` scans the directories in one pass with **no
+value decode at all**, validates every entry's ordering and bounds, and retains only their page ranges
+or offsets. The fault therefore does no per-value copy, no per-value decode, no boundary computation,
+and no decoded end-offset-array allocation. Keys are block spans located by direct big-endian reads
+from the shared `key_end` directory; search compares those spans directly.
 
 ---
 
@@ -208,8 +213,9 @@ The pre-PAX prototype carried a deferred **S3**: a write-once, on-leaf per-*colu
 `aOffset`) so repeated scans of a cached row-major leaf could skip re-walking each record's columns
 left-to-right by their length prefixes. **PAX obsoletes this.** The whole rationale was "avoid
 re-deriving column boundaries"; PAX's **value directories (`colOff`) *are* those boundaries**, written
-in the page, parsed once at fault, and giving `value(c, i)` in O(1) by array index — no left-to-right
-walk ever, first scan or hundredth. There is nothing left to memoize at the column-span level.
+in the page, validated once at fault, and giving `value(c, i)` in O(1) by a direct big-endian directory
+read — no left-to-right walk ever, first scan or hundredth. There is nothing left to memoize at the
+column-span level.
 
 The one residual the prototype's S3 gestured at — skipping a nested `jsonb` / array / composite
 **structural** re-walk *inside* a value on repeated access — is a separate, much narrower concern (it is
@@ -276,8 +282,9 @@ lands independently — no new capability flag.
 ## 9. Memory — the honest buffer-pool bound, now for all data
 
 The dividend lazy-record §9 could not reach for fixed-width. Under Packed a resident leaf is **≈ its
-page block** (one `page_size` buffer + the thin directory `u32` arrays — themselves a slice of the
-parse — shared across every reader of that leaf), the literal PG/SQLite model. Resident memory becomes
+page block** (one `page_size` buffer + thin per-column descriptors; the end-offset directory bytes are
+already inside that buffer and are not copied into per-record `u32` arrays), the literal PG/SQLite
+model. Resident memory becomes
 `≈ pinned_pages × page_size` for **fixed-width and variable-length alike**, so the `cache_bytes` budget
 finally *means what it says*, and the narrow-fixed-width blow-up is gone. This is a real step toward the
 larger-than-RAM end state (CLAUDE.md §9): a faulted leaf holds compact page bytes + column offsets, not
@@ -297,8 +304,9 @@ expanded row vectors.
   lazy-record.
 - **The large-value / lazy-record path** — `Unfetched::Inline` block-slices are exactly what `row_at`
   reconstructs; this generalizes the resident store, it does not replace the value path.
-- **The PAX on-disk parse** — `parse_pax_leaf` / `parsePaxLeaf` is unchanged; packed-leaf **retains** its
-  result instead of discarding it.
+- **PAX validation and corruption timing** — `parse_pax_leaf` / `parsePaxLeaf` still scans and validates
+  every directory entry at fault. Only the retained representation changes from decoded end-offset
+  arrays to page-backed ranges/offsets.
 - **Snapshot / watermark / mutation contracts** — composition only (§7).
 
 ---
@@ -325,6 +333,12 @@ expanded row vectors.
   only the touched columns byte-identically to the whole row. Representation-invariant tests also
   pin that a faulted leaf has empty resident key/weight vectors and that key/weight access matches
   the encoder facts.
+- **Cold-fault P1 — zero-copy PAX directories.** ✅ **landed in all three cores 2026-07.** Fault
+  parsing still scans every key and variable-value end offset and rejects descending/out-of-bounds
+  directories immediately, but retains a byte range (Go) or payload offset (Rust/TypeScript) instead
+  of an owned `N`-entry integer array. Direct big-endian reads preserve O(1) key/value location while
+  removing `1 + V` per-leaf allocations for `V` variable-width columns. White-box tests pin both the
+  page-backed representation and fault-time `XX001` behavior for malformed directories.
 - **S3 — touched-column-only reconstruction wired through the executor (the PAX dividend).** *Landed
   in all three cores 2026-07 (Track A1, a per-core internal optimization like the vectorized executor —
   results/cost/byte-neutral, no `format_version` bump). Go first (`materializeRel`/`scanRange`/`storeScan`
