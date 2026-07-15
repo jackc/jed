@@ -17,7 +17,9 @@ story (`spec/design/hosts.md` §5).
 Not `wasm32-unknown-unknown`: WASI gives the core a working `std::fs` (so a `.jed` file opens
 through a host **preopen**) and `getrandom` a backend (WASI `random_get`) with **no Cargo feature**,
 and Node ships a built-in WASI host (`node:wasi`). The module is a **reactor** (exports
-`_initialize`, no `_start`).
+`_initialize`, no `_start`). Rust `std` does not expose an OS temp directory on this target, so the
+wrapper currently has no external-sort spill backing; sorts stay resident until the configurable
+spill-target seam lands, while ordinary database paging continues through the preopen.
 
 ## Build
 

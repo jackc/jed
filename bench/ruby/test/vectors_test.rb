@@ -41,4 +41,10 @@ class VectorsTest < Minitest::Test
     assert_equal 9, Bench.percentile(samples, 90)
     assert_equal 9, Bench.percentile(samples, 99)
   end
+
+  def test_write_target_extraction_covers_insert_update_and_delete
+    assert_equal "orders", Bench.write_table("INSERT INTO orders VALUES ($1)")
+    assert_equal "orders", Bench.write_table("UPDATE orders SET v = $1")
+    assert_equal "orders", Bench.write_table("DELETE FROM orders WHERE id=$1")
+  end
 end

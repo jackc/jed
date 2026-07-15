@@ -97,6 +97,22 @@ impl Default for OpenOptions {
     }
 }
 
+/// The native file host spills blocking operators into the OS scratch directory. Rust's
+/// `wasm32-wasip1` standard library deliberately has no `temp_dir` implementation (it panics even
+/// when the WASI host exposes preopened database paths), so that host has no spill backing until a
+/// caller-selectable spill target lands. A missing spill target keeps sorts resident; it does not
+/// affect ordinary file paging through a WASI preopen.
+fn default_spill_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "wasi")]
+    {
+        None
+    }
+    #[cfg(not(target_os = "wasi"))]
+    {
+        Some(std::env::temp_dir())
+    }
+}
+
 impl Engine {
     /// Create a **new** file-backed database at `path` with `opts` (the page size is locked into
     /// the file). The path must not already exist — `58P02` otherwise. An initial empty image is
@@ -111,7 +127,7 @@ impl Engine {
         }
         let mut db = Engine::new();
         db.path = Some(path.to_path_buf());
-        db.spill_dir = Some(std::env::temp_dir());
+        db.spill_dir = default_spill_dir();
         db.page_size = opts.page_size;
         db.committed.txid = 1; // the initial empty image is committed as txid 1
         db.write_full_image(opts.no_sync)?; // lay down the from-scratch image; later commits are incremental
@@ -175,7 +191,7 @@ impl Engine {
         let capacity = cache_leaves(opts.cache_bytes, pager.page_size());
         let mut db = Engine::open_paged(pager, capacity)?;
         db.path = Some(path.to_path_buf());
-        db.spill_dir = Some(std::env::temp_dir());
+        db.spill_dir = default_spill_dir();
         db.read_only = opts.read_only;
         // `0` means "the default budget", not "unlimited" — the zero value is a safe finite budget
         // (matching Go/TS). Unbounded/never-spill is a runtime-only mode via `set_work_mem(0)`.

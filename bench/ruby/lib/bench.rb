@@ -139,15 +139,16 @@ module Bench
     File.exist?(path) ? File.read(path).strip : ""
   end
 
-  # The target table of a write statement — the word after INTO / FROM — for the post-run count.
-  def insert_table(sql)
+  # The target table of a write statement — the word after INTO (INSERT), UPDATE, or FROM (DELETE) —
+  # for the post-run count.
+  def write_table(sql)
     fields = sql.split
     fields.each_with_index do |f, i|
-      if (f.casecmp?("INTO") || f.casecmp?("FROM")) && i + 1 < fields.length
+      if (f.casecmp?("INTO") || f.casecmp?("UPDATE") || f.casecmp?("FROM")) && i + 1 < fields.length
         return fields[i + 1].split("(").first
       end
     end
-    raise "write bench SQL has no INSERT INTO / DELETE FROM table: #{sql}"
+    raise "write bench SQL has no INSERT / UPDATE / DELETE target table: #{sql}"
   end
 
   # One stream of args across warmup + measured iterations (benchmarks.md §3) — a serial counter or
@@ -263,7 +264,7 @@ module Bench
     allocs_per_op = (GC.stat(:total_allocated_objects) - alloc0) / (w.warmup + w.iterations)
 
     if w.kind != "query"
-      table = insert_table(w.sql)
+      table = write_table(w.sql)
       n = eng.query_int("SELECT count(*) FROM #{table}")
       expect = w.kind == "write_rollback" ? dataset_table_rows(corpus_dir, w.dataset, table) : (w.warmup + w.iterations)
       raise "post-run count(*) of #{table}: got #{n}, want #{expect}" if n != expect

@@ -126,6 +126,9 @@ filesystem is read-only ([api.md](api.md) §2.1). Scratch files are created excl
 permissions, via stdlib file I/O only (no new dependency — CLAUDE.md §14; memory-safe, no
 `unsafe`/cgo — §13), and are deleted as the merge drains each one. Failure to create or extend a
 run is `58030 io_error`; the sorter never evades `work_mem` by retaining the overflow in memory.
+`wasm32-wasip1` is the host exception: WASI preopens provide database-file access, but Rust `std`
+has no OS temp-directory implementation for that target. Until the spill-target override lands,
+the WASI wrapper supplies no scratch target and its sorts remain resident, like the OPFS host.
 
 ## 5. Streaming the input (the single-table feed)
 
