@@ -245,6 +245,11 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     eagerly sizing to arbitrarily large caller cache budgets. Focused population time and allocation
     evidence is recorded in [benchmarks.md](spec/design/benchmarks.md); results, cost, and bytes are
     unchanged. → [pager.md](spec/design/pager.md)
+  - [x] **Rust positioned page reads** — the file host uses safe standard-library positioned reads on
+    Unix/Windows and retains a serialized `seek` + `read_exact` fallback elsewhere. The focused 8 KiB
+    read probe improved 10.4% with allocations unchanged; the end-to-end cold ramp stayed inside
+    benchmark noise with the same checksum. → [benchmarks.md](spec/design/benchmarks.md),
+    [hosts.md](spec/design/hosts.md)
   - [ ] **Rust CoW insert deep-clone** — `node_insert` rebuilds a path node with `Vec::clone`, deep-copying every key (`Vec<Vec<u8>>`) + row where Go's `[][]byte` copy is pointer-shallow (why `insert_rollback` is rust 21.6ms vs go 10.3ms). Fix: share entry storage (`Arc<[u8]>` keys / `Arc`-shared rows). Rust-only, no byte or cost change. _(size: M)_
   - [ ] **Full-scan materialization** — `full_scan_agg` clones every row into a buffer before aggregating (143–281ms vs PG ~13ms). Streaming aggregation over the scan visitor is the contained first step; the full fix is the spill item above. _(size: M–L)_
 - [x] **Large values — overflow pages + compression (TOAST-equivalent)** — large `text`/`bytea`/`decimal`/`json` pushed out-of-line onto overflow-page chains (`format_version` 3), optionally LZ4-compressed first via a deterministic hand-rolled block codec (no third-party dep — a library fails §8 byte-identity). → [large-values.md](spec/design/large-values.md), [lz4.md](spec/fileformat/lz4.md)

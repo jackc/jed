@@ -202,6 +202,33 @@ and from **12 index growths to zero**. Rust's deterministic unit test pins the n
 Go retains the focused allocation benchmark. Both end-to-end lanes kept checksum `f82d3b99ddaff0fb`;
 timings and runtime allocation counts remain observational.
 
+**Rust positioned-read result (2026-07-15).** P2 improvement 2 replaces the Rust file host's
+`seek` + `read_exact` page reads with safe standard-library positioned I/O: Unix uses
+`FileExt::read_exact_at`, Windows uses an exact-read loop over `FileExt::seek_read`, and targets without
+either trait keep the correct serialized cursor-based fallback. This changes no page buffer, file byte,
+cost, result, or error contract. On the same Linux / Intel Core Ultra 9 285K host (rustc 1.92.0), five
+runs of a temporary OS-cache-hot probe over random 8 KiB reads from `large.jed` produced:
+
+| Focused file-host probe | Median time/read | Allocations/read | Allocated bytes/read |
+|---|---:|---:|---:|
+| `seek` + `read_exact` before | 872 ns | 1 | 8,192 |
+| positioned read after | 781 ns | 1 | 8,192 |
+
+The focused host operation improved **10.4%**; allocation count and bytes are intentionally unchanged
+because `read_at` still returns one owned page buffer. A separate five-fresh-open
+`point_lookup_pk_ramp` comparison showed that the small fault-only win is diluted below end-to-end
+noise:
+
+| Rust `point_lookup_pk_ramp` | Mean | p50 | p90 | p99 |
+|---|---:|---:|---:|---:|
+| before | 2.910 µs | 2.161 µs | 7.557 µs | 10.105 µs |
+| after | 2.983 µs | 2.288 µs | 7.857 µs | 9.544 µs |
+
+Every run retained checksum `f82d3b99ddaff0fb`. The focused allocation/time probe was temporary
+instrumentation (the same review-evidence status as the prepared-lookup allocation probes above),
+while the permanent unit test pins exact reads, short-read `58030`, and cursor preservation on the
+positioned platforms.
+
 ## 1. Purpose and non-goals
 
 The benchmark suite answers two questions, continuously:

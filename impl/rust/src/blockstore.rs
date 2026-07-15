@@ -13,7 +13,10 @@
 //! (hosts.md §3).
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom, Write};
+
+#[cfg(not(any(unix, windows)))]
+use std::io::Read;
 
 use crate::error::{EngineError, Result, SqlState};
 
@@ -43,11 +46,12 @@ pub(crate) trait BlockStore: Send {
     fn set_size(&mut self, bytes: u64) -> Result<()>;
 }
 
-/// The **file** storage host (spec/design/hosts.md §4): a `std::fs::File`, positioned `seek`+read/write
-/// with a data-only `fdatasync` barrier ([`sync`](FileBlockStore::sync)) and a durable-grow
-/// `write`+`sync_all` ([`set_size`](FileBlockStore::set_size)). Pure `std::fs`, no dependency,
-/// memory-safe (CLAUDE.md §13); cross-platform `seek`+read/write (no Unix-only `pread`). The file is
-/// closed when this value drops (RAII), so the pager needs no explicit `close`.
+/// The **file** storage host (spec/design/hosts.md §4): a `std::fs::File`, safe positioned reads on
+/// Unix/Windows with a portable `seek`+`read_exact` fallback, cursor-based writes, a data-only
+/// `fdatasync` barrier ([`sync`](FileBlockStore::sync)), and durable-grow `write`+`sync_all`
+/// ([`set_size`](FileBlockStore::set_size)). Pure `std::fs`, no dependency, memory-safe
+/// (CLAUDE.md §13). The file is closed when this value drops (RAII), so the pager needs no explicit
+/// `close`.
 pub(crate) struct FileBlockStore {
     file: File,
     /// `fsync=off` (the host setting, api.md §2.1): make [`sync`](FileBlockStore::sync) and the
@@ -69,8 +73,7 @@ impl FileBlockStore {
 impl BlockStore for FileBlockStore {
     fn read_at(&mut self, offset: u64, len: usize) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; len];
-        self.file.seek(SeekFrom::Start(offset)).map_err(io_error)?;
-        self.file.read_exact(&mut buf).map_err(io_error)?;
+        file_read_exact_at(&mut self.file, &mut buf, offset).map_err(io_error)?;
         Ok(buf)
     }
 
@@ -110,6 +113,44 @@ impl BlockStore for FileBlockStore {
         }
         Ok(())
     }
+}
+
+/// Safe `pread`-style I/O where the standard library exposes it. Unlike `seek` + `read_exact`, this
+/// is one positioned read operation for the usual full-page case and leaves the file cursor alone.
+#[cfg(unix)]
+fn file_read_exact_at(file: &mut File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+
+    file.read_exact_at(buf, offset)
+}
+
+/// Windows' safe standard-library positioned primitive may return a short read, so retain
+/// `read_exact` semantics with a small retry loop without touching the shared file cursor.
+#[cfg(windows)]
+fn file_read_exact_at(file: &mut File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+
+    let mut read = 0usize;
+    while read < buf.len() {
+        let at = offset.checked_add(read as u64).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "offset overflow")
+        })?;
+        let n = file.seek_read(&mut buf[read..], at)?;
+        if n == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+        }
+        read += n;
+    }
+    Ok(())
+}
+
+/// WASI and any future target without a safe standard-library positioned-read trait keep the
+/// correct portable implementation. The `BlockStore` is already driven through `&mut self` behind
+/// the pager lock, so moving its private cursor is safe; only the extra seek syscall remains.
+#[cfg(not(any(unix, windows)))]
+fn file_read_exact_at(file: &mut File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    file.seek(SeekFrom::Start(offset))?;
+    file.read_exact(buf)
 }
 
 /// The pure in-memory storage host (bplus-reshape.md B3): a growable byte vector with the same
@@ -183,7 +224,41 @@ fn checked_end(offset: u64, len: usize) -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BlockStore, MemoryBlockStore};
+    use std::fs::OpenOptions;
+    use std::io::{Seek, SeekFrom, Write};
+
+    use super::{BlockStore, FileBlockStore, MemoryBlockStore};
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn file_block_store_read_is_positioned_and_exact() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "jed-blockstore-positioned-read-{}-{nonce}.tmp",
+            std::process::id(),
+        ));
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"0123456789").unwrap();
+        file.seek(SeekFrom::Start(3)).unwrap();
+        let mut store = FileBlockStore::new(file, true);
+
+        assert_eq!(store.read_at(5, 3).unwrap(), b"567");
+        assert_eq!(store.file.stream_position().unwrap(), 3);
+        let err = store.read_at(8, 3).unwrap_err();
+        assert_eq!(err.code(), "58030");
+        assert_eq!(store.file.stream_position().unwrap(), 3);
+
+        drop(store);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn memory_block_store_grows_with_zero_fill_and_copies_reads() {

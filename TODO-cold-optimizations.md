@@ -1,6 +1,6 @@
 # Cold point-lookup optimization handoff
 
-Status: P0, P1, and P2 improvement 1 implemented and verified 2026-07-15; P2 improvements 2--4
+Status: P0, P1, and P2 improvements 1--2 implemented and verified 2026-07-15; P2 improvements 3--4
 remain follow-ons. Written 2026-07-14 on
 branch `perf/point-lookup-cache` at
 `cbbdd184132649a894f72bc58d7be7e2f2d12f87`, then revised after evaluating standard-library,
@@ -352,9 +352,15 @@ These are secondary and should be measured only after P0/P1:
    allocations, and 1,042,895 to 1,010,336 allocated bytes; Rust moved from 239.6 to 133.8 us and 12
    index growths to zero. Five-run median end-to-end ramp movements stayed within the 5% noise floor
    and retained checksum `f82d3b99ddaff0fb`; full results are in `spec/design/benchmarks.md`.
-2. Use safe positioned reads for the Rust file host where the standard library supports them, avoiding
-   the current `seek` plus `read_exact`. Keep a correct portable fallback. The syscall trace indicates
-   this is a small single-reader improvement.
+2. **Complete (2026-07-15):** the Rust file host uses safe standard-library positioned reads on Unix
+   (`FileExt::read_exact_at`) and Windows (an exact-read loop over `FileExt::seek_read`), avoiding the
+   cursor mutation and extra seek syscall. Targets without either trait retain the correct serialized
+   `seek` + `read_exact` fallback. A five-run focused OS-cache-hot 8 KiB read probe moved from **872 to
+   781 ns/read (10.4% faster)** while remaining exactly **1 allocation and 8,192 allocated bytes per
+   read**; the owned page buffer is unchanged. Five fresh end-to-end Rust ramp runs remained within
+   noise: median mean / p50 / p90 / p99 moved from **2.910/2.161/7.557/10.105 µs** to
+   **2.983/2.288/7.857/9.544 µs**, retaining checksum `f82d3b99ddaff0fb`. Full results and runtime/host
+   context are in `spec/design/benchmarks.md`.
 3. For concurrent cold faults, stop holding the global pool lock across file read, checksum, and PAX
    parse. The current Rust path holds the pool mutex through the loader; Go uses one mutex for pager and
    pool. Use a per-page loading/single-flight state or an unlock-load-recheck insertion protocol, while

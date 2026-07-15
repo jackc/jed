@@ -92,9 +92,12 @@ which it already does.
 
 - **`read_at` / `write_at` are positioned and do not move a shared cursor.** Concurrent reads
   by lock-free readers (transactions.md §10) and the writer must not interfere through a shared
-  seek position. Map to `pread`/`pwrite`-style positioned I/O (Rust `seek`+read/write on an
-  owned handle, Go `ReadAt`/`WriteAt`, OPFS `read`/`write` with an `at` option). A short read
-  past `size()` is the host's error, surfaced as `58030 io_error` (§4).
+  seek position. Map to `pread`/`pwrite`-style positioned I/O (Rust's safe `FileExt` read on
+  Unix/Windows, Go `ReadAt`/`WriteAt`, OPFS `read`/`write` with an `at` option). A Rust target whose
+  standard library exposes no safe positioned-read trait uses `seek` + `read_exact` on the
+  block store's private handle under the pager lock: still correct and serialized, with only the
+  extra seek syscall. A short read past `size()` is the host's error, surfaced as `58030 io_error`
+  (§4).
 - **`write_at` is *staged*, not durable.** It may land in an OS page cache; only `sync()`
   guarantees durability. The commit recipe (storage.md §4) relies on this exactly: write all
   dirty body pages, `sync()`, write the meta slot, `sync()` — the two barriers are the only
@@ -178,7 +181,7 @@ guard, since `read_at` surfaces a short read as `58030` — same `XX001` outcome
 | host | backing | status | notes |
 |---|---|---|---|
 | **in-memory** | a `Vec`/slice of bytes (or pages) | ✅ `MemoryBlockStore` host + engine wiring (bplus-reshape.md B3) | the natural fit for the RAM-sized target (CLAUDE.md §9) and the default for tests/conformance — no filesystem, fully deterministic. `sync()` is a no-op at the host seam. The engine reads/writes it through the **same pager + Packed leaf path as a file** (a pinned, unbounded pool — resident by definition): `commit` packs the dirty pages into the store — the file commit minus durability — and `resident_leaves()` is a real gauge. |
-| **Rust file** | `std::fs::File`, positioned read/write + `fsync`/`fdatasync` | ✅ built (`FileBlockStore`, `blockstore.rs`) | pure `std::fs`, no dependency, memory-safe (CLAUDE.md §13). Cross-platform `seek`+read/write (no Unix-only `pread`). Closes the file on drop (RAII). |
+| **Rust file** | `std::fs::File`, positioned read/write + `fsync`/`fdatasync` | ✅ built (`FileBlockStore`, `blockstore.rs`) | pure `std::fs`, no dependency, memory-safe (CLAUDE.md §13). Reads use safe standard-library positioned I/O on Unix/Windows (`read_exact_at` / a `seek_read` exact-read loop), with a correct serialized `seek`+`read_exact` fallback elsewhere. Closes the file on drop (RAII). |
 | **Go file** | `os.File` `ReadAt`/`WriteAt`/`Truncate`/`Sync` | ✅ built (`fileBlockStore`, `blockstore.go`) | pure Go — **no cgo, no FFI** (CLAUDE.md §2). `fdatasync` via `syscall.Fdatasync` behind a `linux` build tag (`blockstore_datasync_linux.go`), full `Sync` fallback elsewhere. |
 | **Node `fs`** | `openSync`/positioned `writeSync`/`fsyncSync` | ✅ built (`FileBlockStore`, `impl/ts/src/fileblockstore.ts`) | the TS core's durable backing; the `node:fs` impl is isolated in `fileblockstore.ts` (the browser-clean `BlockStore` interface is `blockstore.ts`; the host program layer is `file.ts`) precisely so OPFS is a sibling, not a reshape — and so `node:fs` never reaches a browser bundle. |
 | **Browser / OPFS** | `FileSystemSyncAccessHandle` (`read`/`write`/`truncate`/`getSize`/`flush`) | ✅ built (`OpfsBlockStore`, `impl/ts/src/opfsblockstore.ts`; TS only) | the synchronous access-handle API maps one-to-one onto the §2 `BlockStore` surface (§5). Acquired async at the bootstrap edge (`opfs.ts`); the engine runs in a Web Worker driven by an async client (`src/browser/`). Validated by file-host byte parity (the existing goldens). |
