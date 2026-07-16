@@ -1349,14 +1349,26 @@ func loadEnginePaged(pgr *pager, capacity int) (*engine, error) {
 		return nil, newError(DataCorrupted, "invalid page size")
 	}
 	paging := newSharedPaging(pgr, capacity)
+	return loadEngineSharedPaging(paging)
+}
+
+// loadEngineSharedPaging reloads the newest committed root through an existing pager/pool while a
+// shared-file participant holds commit SH. Co-resident body pages are append-only, so cached leaves
+// remain valid and only the catalog/interior skeleton is rebuilt.
+func loadEngineSharedPaging(paging *sharedPaging) (*engine, error) {
+	pgr := paging.pgr
+	pageSize := int(pgr.pageSize)
+	if !pageSizeValid(pageSize) {
+		return nil, newError(DataCorrupted, "invalid page size")
+	}
 
 	// Select the live meta from slots 0 and 1 (highest valid txid; the lone valid slot on a torn
 	// write), read as individual blocks through the pager.
-	b0, err := pgr.readBlock(0)
+	b0, err := paging.readBlock(0)
 	if err != nil {
 		return nil, err
 	}
-	b1, err := pgr.readBlock(1)
+	b1, err := paging.readBlock(1)
 	if err != nil {
 		return nil, err
 	}
@@ -1375,7 +1387,7 @@ func loadEnginePaged(pgr *pager, capacity int) (*engine, error) {
 	// walk — so the catalog + skeleton load no longer tracks a reached set.
 	catPage := mt.rootPage
 	for catPage != 0 {
-		block, err := pgr.readBlock(catPage)
+		block, err := paging.readBlock(catPage)
 		if err != nil {
 			return nil, err
 		}
@@ -1847,7 +1859,9 @@ func serializeFreeList(persist, safe []uint32, cap, ps int, next uint32) ([]dirt
 // no reader pins a version older than it — commitDurable checks oldest_live ≥ generation before reuse.
 func planFreeList(snap *snapshot, paging *sharedPaging, catRoot uint32, written []dirtyPage, freeRemaining []uint32, pageCount, liveAtCompaction uint32, genTxid uint64, cap, ps int, canReclaim, canReuse bool) ([]dirtyPage, uint32, []uint32, uint32, uint32, uint64, error) {
 	const minCompactPages = 16 // don't churn a tiny store
-	compact := canReclaim && pageCount > minCompactPages && uint64(pageCount) > 2*uint64(liveAtCompaction)
+	// liveAtCompaction==0 is the shared-file handoff sentinel: reconstruct on the first proven-alone
+	// commit even when the file is still below the ordinary amortization threshold.
+	compact := canReclaim && (liveAtCompaction == 0 || (pageCount > minCompactPages && uint64(pageCount) > 2*uint64(liveAtCompaction)))
 	persistList := freeRemaining
 	newLive := liveAtCompaction
 	newGen := genTxid

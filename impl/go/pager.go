@@ -145,6 +145,19 @@ func (p *pager) readBlock(index uint32) ([]byte, error) {
 	return p.store.readAt(int64(index)*int64(p.pageSize), int(p.pageSize))
 }
 
+// refreshAllocatedPages reconciles the physical high-water after a foreign process appended.
+func (p *pager) refreshAllocatedPages() error {
+	size, err := p.store.size()
+	if err != nil {
+		return err
+	}
+	pages := uint32(size / int64(p.pageSize))
+	if pages > p.allocatedPages {
+		p.allocatedPages = pages
+	}
+	return nil
+}
+
 // writeBlock writes one page (bytes) at block index. Overwrites in place — persist always reserves
 // the high-water first, so the target is already-allocated space (a reused free page, or a
 // preallocated slot past the old high-water). bytes is one page wide.

@@ -153,6 +153,16 @@ impl Pager {
         self.page_size
     }
 
+    /// Reconcile the physical allocation high-water after another process appended to the file.
+    /// This must run before a shared participant plans its own append; otherwise its stale local
+    /// `allocated_pages` could ask the host to resize below the foreign process's real file length.
+    pub(crate) fn refresh_allocated_pages(&mut self) -> Result<()> {
+        let size = self.store.size()?;
+        let pages = (size / self.page_size as u64) as u32;
+        self.allocated_pages = self.allocated_pages.max(pages);
+        Ok(())
+    }
+
     /// Read one page (block `index`) — random access, the demand-paging read path (P6.4b). Converts
     /// the page index to a byte offset for the host's [`read_at`](BlockStore::read_at).
     pub(crate) fn read_block(&mut self, index: u32) -> Result<Vec<u8>> {

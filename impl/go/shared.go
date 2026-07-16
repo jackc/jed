@@ -117,6 +117,166 @@ type sharedCore struct {
 	// writer gate. nil/empty when nothing is attached — the common case, byte-for-byte the
 	// pre-attachment behavior. Session-local temp is NOT here (it is session-private, on sessionState).
 	attachments map[string]*attachment
+	coordinator *fileCoordinator
+	planEpoch   atomic.Uint64
+}
+
+func (c *sharedCore) acquireWriter(timeoutMs uint64) error {
+	c.writeMu.Lock()
+	if c.coordinator == nil {
+		return nil
+	}
+	if err := c.coordinator.checkPID(); err != nil {
+		c.writeMu.Unlock()
+		return err
+	}
+	switch c.coordinator.lease() {
+	case leaseShared:
+		if err := c.coordinator.lockWriter(timeoutMs); err != nil {
+			c.writeMu.Unlock()
+			return err
+		}
+		if err := c.refreshShared(); err != nil {
+			c.coordinator.unlockWriter()
+			c.writeMu.Unlock()
+			return err
+		}
+	case leasePoisoned:
+		c.writeMu.Unlock()
+		return newError(IoError, "shared-file coordinator is poisoned")
+	}
+	return nil
+}
+
+func (c *sharedCore) releaseWriter() {
+	if c.coordinator != nil && c.coordinator.lease() == leaseShared {
+		c.coordinator.unlockWriter()
+	}
+	c.writeMu.Unlock()
+}
+
+func (c *sharedCore) refreshShared() error {
+	coord := c.coordinator
+	if coord == nil || coord.lease() != leaseShared {
+		return nil
+	}
+	if err := coord.checkPID(); err != nil {
+		return err
+	}
+	c.liveMu.Lock()
+	defer c.liveMu.Unlock()
+	if coord.lease() != leaseShared {
+		return nil
+	}
+	if err := coord.lockCommitShared(); err != nil {
+		return err
+	}
+	defer coord.unlockCommit()
+	return c.reloadFromPager()
+}
+
+func (c *sharedCore) reloadFromPager() error {
+	c.storage.mu.Lock()
+	if err := c.storage.paging.withPager(func(p *pager) error { return p.refreshAllocatedPages() }); err != nil {
+		c.storage.mu.Unlock()
+		return err
+	}
+	loaded, err := loadEngineSharedPaging(c.storage.paging)
+	if err != nil {
+		c.storage.mu.Unlock()
+		return err
+	}
+	current := c.roots.Load().committed.txid
+	if loaded.committed.txid <= current {
+		c.storage.mu.Unlock()
+		return nil
+	}
+	c.storage.pageCount = loaded.pageCount
+	c.storage.freePages = loaded.freePages
+	c.storage.liveAtCompaction = loaded.liveAtCompaction
+	c.storage.freeGenTxid = loaded.freeGenTxid
+	c.storage.mu.Unlock()
+	rt := c.roots.Load()
+	c.roots.Store(&roots{committed: loaded.committed, attached: rt.attached})
+	c.planEpoch.Add(1)
+	return nil
+}
+
+func (c *sharedCore) coordinationTick() {
+	coord := c.coordinator
+	if coord == nil {
+		return
+	}
+	var err error
+	switch coord.lease() {
+	case leaseAlone:
+		err = c.tryDowngrade(coord)
+	case leaseShared:
+		err = c.tryUpgrade(coord)
+	}
+	if err != nil {
+		coord.setLease(leasePoisoned)
+	}
+}
+
+func (c *sharedCore) tryDowngrade(coord *fileCoordinator) error {
+	noArrival, err := coord.tryArrivalExclusive()
+	if err != nil {
+		return classifyLockError(err)
+	}
+	if noArrival {
+		coord.unlockArrival()
+		return nil
+	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	c.liveMu.Lock()
+	defer c.liveMu.Unlock()
+	if err := coord.lockTransition(); err != nil {
+		return err
+	}
+	defer coord.unlockTransition()
+	retry, err := coord.tryArrivalExclusive()
+	if err != nil {
+		return classifyLockError(err)
+	}
+	if retry {
+		coord.unlockArrival()
+		return nil
+	}
+	return coord.downgradePresence()
+}
+
+func (c *sharedCore) tryUpgrade(coord *fileCoordinator) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	c.liveMu.Lock()
+	defer c.liveMu.Unlock()
+	if err := coord.lockTransition(); err != nil {
+		return err
+	}
+	defer coord.unlockTransition()
+	arrival, err := coord.tryArrivalExclusive()
+	if err != nil {
+		return classifyLockError(err)
+	}
+	if !arrival {
+		return nil
+	}
+	defer coord.unlockArrival()
+	upgraded, err := coord.tryUpgradePresence()
+	if err != nil || !upgraded {
+		return err
+	}
+	if err := coord.lockCommitShared(); err != nil {
+		return err
+	}
+	err = c.reloadFromPager()
+	coord.unlockCommit()
+	if err == nil {
+		coord.setLease(leaseAlone)
+	}
+	return err
 }
 
 // attachMode is an attachment's write disposition (attached-databases.md §4). A read-only attachment
@@ -204,9 +364,61 @@ func (c *sharedCore) persist(snap *snapshot) error {
 	// Both consult the SAME registry; single-handle / all-readers-current keeps oldest_live == committed, so
 	// both hold and the behavior (and on-disk bytes) are identical to an ungated commit.
 	oldest := c.oldestLiveVersion(snap.txid)
-	canReclaim := oldest == snap.txid
-	canReuse := oldest >= c.storage.freeGenTxid
+	shared := c.coordinator != nil && c.coordinator.lease() == leaseShared
+	canReclaim := !shared && oldest == snap.txid
+	canReuse := !shared && oldest >= c.storage.freeGenTxid
+	if shared && c.storage.path != "" {
+		err := c.storage.commitShared(snap, c.coordinator)
+		if err != nil {
+			c.coordinator.setLease(leasePoisoned)
+		}
+		return err
+	}
 	return c.storage.commitDurable(snap, canReclaim, canReuse)
+}
+
+func (st *storage) commitShared(snap *snapshot, coordinator *fileCoordinator) error {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	write, err := snap.incrementalImage(st.pageSize, st.pageCount, st.freePages, false, st.paging)
+	if err != nil {
+		return err
+	}
+	meta := metaPage(st.pageSize, snap.txid, write.rootPage, write.pageCount, 0)
+	if err := st.paging.withPager(func(p *pager) error {
+		if err := p.refreshAllocatedPages(); err != nil {
+			return err
+		}
+		if err := p.reserve(write.pageCount); err != nil {
+			return err
+		}
+		for _, pg := range write.pages {
+			if err := p.writeBlock(pg.index, pg.bytes); err != nil {
+				return err
+			}
+		}
+		return p.sync()
+	}); err != nil {
+		return err
+	}
+	if err := coordinator.lockCommitExclusive(); err != nil {
+		return err
+	}
+	err = st.paging.withPager(func(p *pager) error {
+		if err := p.writeBlock(uint32(snap.txid&1), meta); err != nil {
+			return err
+		}
+		return p.sync()
+	})
+	coordinator.unlockCommit()
+	if err != nil {
+		return err
+	}
+	st.pageCount = write.pageCount
+	st.freePages = nil
+	st.liveAtCompaction = 0
+	st.freeGenTxid = snap.txid
+	return nil
 }
 
 // commitDurable durably publishes snap into this storage via an incremental copy-on-write commit
@@ -499,11 +711,13 @@ func (c *sharedCore) path() string { return c.storage.path }
 // context — a file's fileBlockStore or an in-memory memoryBlockStore — so this is the one
 // constructor for both hosts. The committed snapshot's stores already carry the shared paging, so
 // every pinned snapshot faults clean pages through the one pool (pager.md).
-func sharedCoreFromEngine(e *engine) *sharedCore {
+func sharedCoreFromEngine(e *engine) *sharedCore { return sharedCoreFromEngineCoordinated(e, nil) }
+
+func sharedCoreFromEngineCoordinated(e *engine, coordinator *fileCoordinator) *sharedCore {
 	if e.paging == nil {
 		panic("every engine lifted into a shared core carries a paging context (B3)")
 	}
-	c := &sharedCore{live: make(map[uint64]int)}
+	c := &sharedCore{live: make(map[uint64]int), coordinator: coordinator}
 	c.roots.Store(&roots{committed: e.committed})
 	c.storage = &storage{
 		pageSize:  e.pageSize,
@@ -519,6 +733,9 @@ func sharedCoreFromEngine(e *engine) *sharedCore {
 		reclaimWithinSession: true,
 		liveAtCompaction:     e.liveAtCompaction,
 		freeGenTxid:          e.freeGenTxid, // the loaded free-list is "as of" the committed version (§8 reuse gate)
+	}
+	if coordinator != nil {
+		coordinator.startProbe(c.coordinationTick)
 	}
 	return c
 }
@@ -585,11 +802,18 @@ func CreateDatabase(opts CreateOptions) (*Database, error) {
 	if opts.Path == "" {
 		return newInMemoryWithPageSize(pageSize), nil
 	}
-	e, err := create(opts.Path, databaseOptions{PageSize: pageSize, noSync: opts.SkipFsync})
+	coordinator, path, err := prepareCreateCoordinator(opts.Path, opts.Locking, opts.FileLockTimeoutMs)
 	if err != nil {
 		return nil, err
 	}
-	return databaseOver(sharedCoreFromEngine(e)), nil
+	e, err := create(path, databaseOptions{PageSize: pageSize, noSync: opts.SkipFsync})
+	if err != nil {
+		if coordinator != nil {
+			coordinator.close()
+		}
+		return nil, err
+	}
+	return databaseOver(sharedCoreFromEngineCoordinated(e, coordinator)), nil
 }
 
 // newInMemoryWithPageSize builds a fresh, empty in-memory database that serializes/splits at
@@ -624,11 +848,28 @@ func OpenDatabase(path string) (*Database, error) {
 // OpenDatabaseWithOptions opens an existing file-backed database at path with explicit open settings
 // (buffer-pool budget, read-only mode, work-mem) and returns the host handle with its default session.
 func OpenDatabaseWithOptions(path string, opts OpenOptions) (*Database, error) {
-	e, err := openWithOptions(path, opts)
+	coordinator, real, err := prepareOpenCoordinator(path, opts.Locking, opts.FileLockTimeoutMs)
 	if err != nil {
 		return nil, err
 	}
-	return databaseOver(sharedCoreFromEngine(e)), nil
+	if coordinator != nil {
+		if err := coordinator.lockCommitShared(); err != nil {
+			coordinator.close()
+			return nil, err
+		}
+	}
+	opts.Locking = LockingNone
+	e, err := openWithOptions(real, opts)
+	if coordinator != nil {
+		coordinator.unlockCommit()
+	}
+	if err != nil {
+		if coordinator != nil {
+			coordinator.close()
+		}
+		return nil, err
+	}
+	return databaseOver(sharedCoreFromEngineCoordinated(e, coordinator)), nil
 }
 
 // databaseOver wraps a shared core as the host handle.
@@ -696,8 +937,10 @@ func (db *Database) Attach(name string, source AttachSource, readOnly bool) erro
 		root = e.committed // its stores fault through st.paging; loadEnginePaged bound storePaging too
 	}
 	c := db.core
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
+	if err := c.acquireWriter(0); err != nil {
+		return err
+	}
+	defer c.releaseWriter()
 	if lname == "main" || lname == "temp" || c.attachments[lname] != nil {
 		if st != nil {
 			_ = st.close() // release the just-opened file — the name is taken
@@ -741,8 +984,10 @@ func (db *Database) Attach(name string, source AttachSource, readOnly bool) erro
 func (db *Database) Detach(name string) error {
 	lname := strings.ToLower(name)
 	c := db.core
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
+	if err := c.acquireWriter(0); err != nil {
+		return err
+	}
+	defer c.releaseWriter()
 	if lname == "main" || lname == "temp" || c.attachments[lname] == nil {
 		return newError(UndefinedObject, `database "`+name+`" is not attached`)
 	}
@@ -839,7 +1084,8 @@ func (s *Database) ReadSession() *Session {
 	engine.core = s.core
 	engine.attachedCommitted = rt.attached
 	engine.readOnly = true // the executor rejects writes (25006) / poisons a read-only block
-	return &Session{core: s.core, engine: engine, access: accessReadOnly, pinned: true, pinVersion: v, baseVersion: v}
+	refresh := s.core.coordinator != nil && s.core.coordinator.lease() == leaseShared
+	return &Session{core: s.core, engine: engine, access: accessReadOnly, pinned: true, pinVersion: v, baseVersion: v, refreshOnNextRead: refresh}
 }
 
 // WriteSession opens a READ WRITE session with an eager open write block (spec/design/session.md
@@ -854,7 +1100,11 @@ func (s *Database) WriteSession() *Session {
 		// read-only one — a write through it is 25006, mirroring PostgreSQL hot standby.
 		return s.ReadSession()
 	}
-	s.core.writeMu.Lock()
+	if err := s.core.acquireWriter(0); err != nil {
+		failed := s.ReadSession()
+		failed.pendingErr = err
+		return failed
+	}
 	rt := s.core.roots.Load()
 	base := rt.committed
 	// committed is the immutable base (the writer mutates only working, which beginTx clones off it).
@@ -881,7 +1131,8 @@ func (s *Database) Session(opts SessionOptions) *Session {
 		engine.core = s.core
 		engine.attachedCommitted = rt.attached
 		engine.readOnly = true // the executor enforces read-only too (rejects BEGIN READ WRITE, poisons a read-only block)
-		return &Session{core: s.core, engine: engine, access: accessReadOnly, pinned: true, pinVersion: v, baseVersion: v}
+		refresh := s.core.coordinator != nil && s.core.coordinator.lease() == leaseShared
+		return &Session{core: s.core, engine: engine, access: accessReadOnly, pinned: true, pinVersion: v, baseVersion: v, refreshOnNextRead: refresh}
 	}
 	rt := s.core.roots.Load()
 	snap := rt.committed
@@ -953,7 +1204,6 @@ func (db *Database) UpgradeCollations() (int, error) {
 func (db *Database) Close() error {
 	c := db.core
 	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
 	if st := c.storage; st.paging != nil {
 		_ = st.paging.close()
 		st.paging = nil
@@ -964,6 +1214,11 @@ func (db *Database) Close() error {
 		_ = att.storage.close()
 	}
 	c.attachments = nil
+	c.writeMu.Unlock()
+	if c.coordinator != nil {
+		c.coordinator.close()
+		c.coordinator = nil
+	}
 	return nil
 }
 
@@ -993,7 +1248,9 @@ type Session struct {
 	pinVersion uint64
 	// baseVersion is the committed version the current working set / pin is based on; the published
 	// version is baseVersion+1 (the monotonic commit counter, transactions.md §8).
-	baseVersion uint64
+	baseVersion       uint64
+	pendingErr        error
+	refreshOnNextRead bool
 }
 
 // queryValues is the unexported raw (sql, []Value) -> *Rows seam this session's ergonomic
@@ -1001,6 +1258,14 @@ type Session struct {
 // (CREATE/INSERT/…) returns a cursor with no output columns carrying the command tag
 // (RowsAffected/Cost) — Exec is just this drained-and-discarded.
 func (s *Session) queryValues(sql string, params []Value) (*Rows, error) {
+	if s.pendingErr != nil {
+		return nil, s.pendingErr
+	}
+	if s.core.coordinator != nil {
+		if err := s.core.coordinator.checkPID(); err != nil {
+			return nil, err
+		}
+	}
 	stmt, err := s.engine.parse(sql)
 	if err != nil {
 		return nil, err
@@ -1015,6 +1280,23 @@ func (s *Session) queryValues(sql string, params []Value) (*Rows, error) {
 // (the *Prepared methods pass the statement's stmtCache), so a prepared query streams and pins its
 // snapshot exactly like an ad-hoc one but reuses its cached plan across executes.
 func (s *Session) queryStmt(stmt statement, params []Value, sc *stmtCache) (*Rows, error) {
+	if s.pendingErr != nil {
+		return nil, s.pendingErr
+	}
+	if s.core.coordinator != nil {
+		if err := s.core.coordinator.checkPID(); err != nil {
+			return nil, err
+		}
+	}
+	if s.engine.session.tx == nil && !stmtIsWrite(stmt) {
+		if s.access == accessReadOnly {
+			if err := s.refreshInitialRead(); err != nil {
+				return nil, err
+			}
+		} else if err := s.core.refreshShared(); err != nil {
+			return nil, err
+		}
+	}
 	// Route the read before building the streaming cursor (spec/design/streaming.md §4): an autocommit
 	// (non-block, writable access) read re-pins the latest committed so the snapshot is current
 	// (PG-faithful); a read-only session uses its existing pin, and an open block uses its working set.
@@ -1105,6 +1387,26 @@ func (s *Session) queryStmt(stmt statement, params []Value, sc *stmtCache) (*Row
 	return rowsFromOutcome(out), nil
 }
 
+func (s *Session) refreshInitialRead() error {
+	if !s.refreshOnNextRead {
+		return nil
+	}
+	if err := s.core.refreshShared(); err != nil {
+		return err
+	}
+	if s.pinned {
+		s.core.deregisterPin(s.pinVersion)
+	}
+	rt, v := s.core.pinLatest()
+	s.baseVersion = v
+	s.pinVersion = v
+	s.pinned = true
+	s.engine.committed = rt.committed
+	s.engine.attachedCommitted = rt.attached
+	s.refreshOnNextRead = false
+	return nil
+}
+
 // Prepare parses sql once into a reusable prepared statement (spec/design/api.md §2.4): a standalone
 // value bound to no session — this session only supplies the parse (its 54000 input-size limit).
 // Run it with QueryPrepared / ExecPrepared / QueryRowPrepared on any handle over this database; the
@@ -1154,7 +1456,9 @@ func (s *Session) dispatch(stmt statement, params []Value) (outcome, error) {
 	}
 	// Autocommit write — the lazy gate (§2.4): take it, capture the latest committed as the working
 	// base, run, publish at the next version on success, release.
-	s.core.writeMu.Lock()
+	if err := s.core.acquireWriter(s.engine.session.lockTimeoutMs); err != nil {
+		return outcome{}, err
+	}
 	s.gateHeld = true
 	s.refreshCommitted()
 	out, err := s.engine.ExecuteStmtParams(stmt, params)
@@ -1162,7 +1466,7 @@ func (s *Session) dispatch(stmt statement, params []Value) (outcome, error) {
 		// A persist I/O failure surfaces as the statement's error and publishes nothing.
 		err = s.publish()
 	}
-	s.core.writeMu.Unlock()
+	s.core.releaseWriter()
 	s.gateHeld = false
 	return out, err
 }
@@ -1184,10 +1488,15 @@ func (s *Session) beginBlock(writable, modeSet bool) (outcome, error) {
 		rw = true // the session(opts) engine is not read-only ⇒ a bare BEGIN defaults READ WRITE
 	}
 	if rw {
-		s.core.writeMu.Lock()
+		if err := s.core.acquireWriter(s.engine.session.lockTimeoutMs); err != nil {
+			return outcome{}, err
+		}
 		s.gateHeld = true
 		s.refreshCommitted()
 	} else {
+		if err := s.core.refreshShared(); err != nil {
+			return outcome{}, err
+		}
 		// A READ ONLY block pins its snapshot atomically (load+register under one lock, §8), so the
 		// version it reads can never be reclaimed in a load→register gap.
 		rt, v := s.core.pinLatest()
@@ -1202,7 +1511,7 @@ func (s *Session) beginBlock(writable, modeSet bool) (outcome, error) {
 		// beginTx rejected (e.g. BEGIN READ WRITE on a read-only session → 25006): release the writer
 		// gate this begin eagerly acquired so the session is not left holding it (the read-only branch
 		// acquires no gate and beginTx does not error there).
-		s.core.writeMu.Unlock()
+		s.core.releaseWriter()
 		s.gateHeld = false
 	}
 	return out, err
@@ -1232,7 +1541,7 @@ func (s *Session) endBlock(commit bool) (outcome, error) {
 // the shared-core bookkeeping common to ending a block, closing, and an un-ended session.
 func (s *Session) finishBlock() {
 	if s.gateHeld {
-		s.core.writeMu.Unlock()
+		s.core.releaseWriter()
 		s.gateHeld = false
 	}
 	if s.pinned {
@@ -1464,14 +1773,16 @@ func (s *Session) SetDefaultCollation(name string) error {
 	if s.engine.session.tx != nil {
 		return s.engine.SetDefaultCollation(name) // part of the open block; publishes on its commit
 	}
-	s.core.writeMu.Lock()
+	if err := s.core.acquireWriter(s.engine.session.lockTimeoutMs); err != nil {
+		return err
+	}
 	s.gateHeld = true
 	s.refreshCommitted()
 	err := s.engine.SetDefaultCollation(name)
 	if err == nil {
 		err = s.publish()
 	}
-	s.core.writeMu.Unlock()
+	s.core.releaseWriter()
 	s.gateHeld = false
 	return err
 }
@@ -1493,6 +1804,9 @@ func (s *Session) LifetimeCost() int64 { return *s.engine.session.lifetimeTotal 
 // MaxSQLLength / SetMaxSQLLength — the input-SQL byte limit (0 ⇒ unlimited).
 func (s *Session) MaxSQLLength() int     { return s.engine.session.maxSQLLength }
 func (s *Session) SetMaxSQLLength(b int) { s.engine.session.maxSQLLength = b }
+
+func (s *Session) LockTimeoutMs() uint64      { return s.engine.session.lockTimeoutMs }
+func (s *Session) SetLockTimeoutMs(ms uint64) { s.engine.session.lockTimeoutMs = ms }
 
 // WorkMem / SetWorkMem — the work-memory budget in bytes (0 ⇒ unlimited).
 func (s *Session) WorkMem() int     { return s.engine.session.workMem }
@@ -1566,14 +1880,16 @@ func (s *Session) UpgradeCollations() (int, error) {
 		return s.engine.UpgradeCollations()
 	}
 	// Autocommit: take the lazy gate, upgrade the latest committed, publish on change (§2.4).
-	s.core.writeMu.Lock()
+	if err := s.core.acquireWriter(s.engine.session.lockTimeoutMs); err != nil {
+		return 0, err
+	}
 	s.gateHeld = true
 	s.refreshCommitted()
 	n, err := s.engine.UpgradeCollations()
 	if err == nil && n > 0 {
 		err = s.publish()
 	}
-	s.core.writeMu.Unlock()
+	s.core.releaseWriter()
 	s.gateHeld = false
 	return n, err
 }

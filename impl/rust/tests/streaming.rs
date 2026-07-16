@@ -246,6 +246,7 @@ fn bare_handle_query_pins_watermark_under_reclamation() {
         path: Some(path.clone()),
         page_size: 256,
         skip_fsync: true,
+        ..CreateOptions::default()
     })
     .unwrap();
     db.execute("CREATE TABLE t (id i64 PRIMARY KEY, v i64)", &[])

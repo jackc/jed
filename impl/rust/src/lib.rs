@@ -25,6 +25,7 @@ mod bufferpool;
 mod cancel;
 mod catalog;
 mod collation;
+mod coordinator;
 mod cost;
 mod costs;
 mod cursor;

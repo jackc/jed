@@ -1914,6 +1914,17 @@ impl Engine {
             return Err(corrupt("invalid page size"));
         }
         let paging = SharedPaging::new(pager, capacity);
+        Self::open_shared_paging(paging)
+    }
+
+    /// Reload the newest committed snapshot through an existing pager/pool. Shared-file participants
+    /// use this after reading the two meta slots under `commit SH`; body pages remain immutable while
+    /// co-resident, so the existing buffer pool is valid and only the catalog/interior skeleton changes.
+    pub(crate) fn open_shared_paging(paging: Arc<SharedPaging>) -> Result<Engine> {
+        let page_size = paging.pager().page_size() as usize;
+        if !page_size_valid(page_size) {
+            return Err(corrupt("invalid page size"));
+        }
 
         // Select the live meta from slots 0 and 1 (highest valid txid; the lone valid slot on a torn
         // write), read as individual blocks through the pager.
@@ -2240,9 +2251,13 @@ pub(crate) fn plan_free_list(
     can_reuse: bool,
 ) -> Result<(Vec<(u32, Vec<u8>)>, u32, Vec<u32>, u32, u32, u64)> {
     const MIN_COMPACT_PAGES: u32 = 16; // don't churn a tiny store
+    // `live_at_compaction == 0` is the shared-file handoff sentinel: co-resident commits deliberately
+    // persisted no free list, so the first proven-alone commit reconstructs immediately even for a
+    // small file. Ordinary stores retain the amortized >16-page / >2× trigger.
     let compact = can_reclaim
-        && page_count > MIN_COMPACT_PAGES
-        && (page_count as u64) > 2 * live_at_compaction as u64;
+        && (live_at_compaction == 0
+            || (page_count > MIN_COMPACT_PAGES
+                && (page_count as u64) > 2 * live_at_compaction as u64));
     let (persist_list, new_live, new_gen) = if compact {
         let mut reached = reachable_pages(snap, paging, cat_root)?;
         for (index, _) in written {

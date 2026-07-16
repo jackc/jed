@@ -59,7 +59,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 
 /// A test-only seam (compiled out of production entirely): fires in [`Session::publish`] AFTER the
 /// durable persist but BEFORE the roots swap — the window in which the just-committed version is durable
@@ -73,12 +74,13 @@ use crate::api::{PreparedStatement, Rows, Transaction};
 use crate::ast::Statement;
 use crate::cancel::CancellationToken;
 use crate::catalog::{CompositeType, Table};
+use crate::coordinator::{FileCoordinator, LeaseState};
 use crate::error::{EngineError, Result, SqlState};
 use crate::executor::{
     CachedPlan, CollationInfo, Engine, Outcome, ScriptSummary, SessionOptions, SessionState,
     Snapshot, TxStatus, stmt_is_write,
 };
-use crate::file::{CreateOptions, DatabaseOptions, OpenOptions};
+use crate::file::{CreateOptions, DatabaseOptions, Locking, OpenOptions};
 use crate::privileges::{PrivilegeSet, Privileges};
 use crate::value::Value;
 use std::cell::RefCell;
@@ -422,6 +424,46 @@ impl Storage {
         Ok(())
     }
 
+    /// Conservative co-resident commit (locking.md §5.3): append every dirty page at/above the
+    /// newest logical high-water, persist no free-list chain, and gate only alternate-meta
+    /// publication. Old body/free-list pages stay immutable until presence EX is recovered.
+    fn commit_file_shared(
+        &mut self,
+        snap: &Snapshot,
+        write: crate::format::IncrementalWrite,
+        coordinator: &FileCoordinator,
+    ) -> Result<()> {
+        let meta = crate::format::meta_page(
+            self.page_size,
+            snap.txid,
+            write.root_page,
+            write.page_count,
+            0,
+        );
+        {
+            let mut pager = self.paging.pager();
+            pager.refresh_allocated_pages()?;
+            pager.reserve(write.page_count)?;
+            for (index, bytes) in &write.pages {
+                pager.write_block(*index, bytes)?;
+            }
+            pager.sync()?;
+        }
+        let commit = coordinator.lock_commit_exclusive()?;
+        {
+            let mut pager = self.paging.pager();
+            pager.write_block((snap.txid & 1) as u32, &meta)?;
+            pager.sync()?;
+        }
+        drop(commit);
+        self.page_count = write.page_count;
+        self.free_pages.clear();
+        // Force the first later alone commit to reconstruct the reclaimable set.
+        self.live_at_compaction = 0;
+        self.free_gen_txid = snap.txid;
+        Ok(())
+    }
+
     /// The IN-MEMORY branch of [`commit_durable`]: a `MemoryBlockStore` is never reopened, so it keeps
     /// its free-list in RAM and persists NO `page_type 7` pages (writing them would waste memory pages);
     /// the meta write + `sync` are no-ops on the store. Within-session reclamation is a **post-commit**
@@ -519,11 +561,15 @@ pub(crate) struct Shared {
     /// by [`Database::detach`] (host-API, §4), both under the writer gate — so the `Mutex` never
     /// contends. Empty when nothing is attached (the common case). Session-local temp is NOT here.
     attachments: Mutex<HashMap<String, Attachment>>,
+    /// Native file coordination. `None` for memory or explicit `locking=none`.
+    coordinator: Option<FileCoordinator>,
+    /// Advances when a foreign txid is adopted; prepared plans clear lazily when this changes.
+    plan_epoch: AtomicU64,
 }
 
 impl Shared {
     /// Block until no writer is active, then claim the writer gate.
-    fn acquire_writer(&self) {
+    fn acquire_local_writer(&self) {
         let mut active = self.writer_active.lock().expect("writer lock not poisoned");
         while *active {
             active = self
@@ -534,11 +580,159 @@ impl Shared {
         *active = true;
     }
 
+    /// Claim the in-process writer gate, then (while shared) the OS writer gate and newest meta.
+    fn acquire_writer(&self, timeout_ms: u64) -> Result<()> {
+        self.acquire_local_writer();
+        let Some(coordinator) = &self.coordinator else {
+            return Ok(());
+        };
+        if let Err(e) = coordinator.check_pid() {
+            self.release_local_writer();
+            return Err(e);
+        }
+        match coordinator.state() {
+            LeaseState::Shared => {
+                if let Err(e) = coordinator.lock_writer(timeout_ms) {
+                    self.release_local_writer();
+                    return Err(e);
+                }
+                if let Err(e) = self.refresh_shared() {
+                    coordinator.unlock_writer();
+                    self.release_local_writer();
+                    return Err(e);
+                }
+                Ok(())
+            }
+            LeaseState::Poisoned => {
+                self.release_local_writer();
+                Err(EngineError::new(
+                    SqlState::IoError,
+                    "shared-file coordinator is poisoned",
+                ))
+            }
+            LeaseState::Alone | LeaseState::Exclusive => Ok(()),
+        }
+    }
+
     /// Release the writer gate and wake one waiter.
     fn release_writer(&self) {
+        if let Some(coordinator) = &self.coordinator
+            && coordinator.state() == LeaseState::Shared
+        {
+            coordinator.unlock_writer();
+        }
+        self.release_local_writer();
+    }
+
+    fn release_local_writer(&self) {
         let mut active = self.writer_active.lock().expect("writer lock not poisoned");
         *active = false;
         self.writer_free.notify_one();
+    }
+
+    /// Adopt a foreign meta/root while shared. The commit SH gate covers both meta reads and the
+    /// catalog/interior reload; body pages are append-only and therefore safe after it is released.
+    fn refresh_shared(&self) -> Result<()> {
+        let Some(coordinator) = &self.coordinator else {
+            return Ok(());
+        };
+        if coordinator.state() != LeaseState::Shared {
+            return Ok(());
+        }
+        coordinator.check_pid()?;
+        let _live = self.live.lock().expect("live lock not poisoned");
+        if coordinator.state() != LeaseState::Shared {
+            return Ok(());
+        }
+        let _commit = coordinator.lock_commit_shared()?;
+        self.reload_from_pager()
+    }
+
+    /// Reload the newest CRC-valid meta through this handle's existing pager. Caller holds the
+    /// relevant local barrier and (when shared) commit SH.
+    fn reload_from_pager(&self) -> Result<()> {
+        let paging = self
+            .storage
+            .lock()
+            .expect("storage lock not poisoned")
+            .paging
+            .clone();
+        paging.pager().refresh_allocated_pages()?;
+        let engine = Engine::open_shared_paging(paging)?;
+        let current = self
+            .roots
+            .read()
+            .expect("roots lock not poisoned")
+            .committed
+            .txid;
+        if engine.committed.txid <= current {
+            return Ok(());
+        }
+        {
+            let mut storage = self.storage.lock().expect("storage lock not poisoned");
+            storage.page_count = engine.page_count;
+            storage.free_pages = engine.free_pages.clone();
+            storage.live_at_compaction = engine.live_at_compaction;
+            storage.free_gen_txid = engine.free_gen_txid;
+        }
+        let mut roots = self.roots.write().expect("roots lock not poisoned");
+        roots.committed = Arc::new(engine.committed);
+        self.plan_epoch.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+
+    /// One background alone↔shared lease probe. Foreground work never calls this path.
+    fn coordination_tick(&self) {
+        let Some(coordinator) = &self.coordinator else {
+            return;
+        };
+        let result = match coordinator.state() {
+            LeaseState::Alone => self.try_downgrade(coordinator),
+            LeaseState::Shared => self.try_upgrade(coordinator),
+            LeaseState::Exclusive | LeaseState::Poisoned => Ok(()),
+        };
+        if result.is_err() {
+            coordinator.set_state(LeaseState::Poisoned);
+        }
+    }
+
+    fn try_downgrade(&self, coordinator: &FileCoordinator) -> Result<()> {
+        if let Some(no_arrival) = coordinator.try_arrival_exclusive()? {
+            drop(no_arrival);
+            return Ok(());
+        }
+        self.acquire_local_writer();
+        let result = (|| {
+            let _live = self.live.lock().expect("live lock not poisoned");
+            let _transition = coordinator.lock_transition()?;
+            let retry = coordinator.try_arrival_exclusive()?;
+            if retry.is_none() {
+                coordinator.downgrade_presence()?;
+            }
+            drop(retry);
+            Ok(())
+        })();
+        self.release_local_writer();
+        result
+    }
+
+    fn try_upgrade(&self, coordinator: &FileCoordinator) -> Result<()> {
+        self.acquire_local_writer();
+        let result = (|| {
+            let _live = self.live.lock().expect("live lock not poisoned");
+            let _transition = coordinator.lock_transition()?;
+            let Some(_arrival) = coordinator.try_arrival_exclusive()? else {
+                return Ok(());
+            };
+            if coordinator.try_upgrade_presence()? {
+                let _commit = coordinator.lock_commit_shared()?;
+                self.reload_from_pager()?;
+                coordinator.set_state(LeaseState::Alone);
+            }
+            Ok(())
+        })();
+        self.release_local_writer();
+        result
     }
 
     /// Pin the committed root (an `Arc` clone under a momentary read lock) — returns the file
@@ -750,10 +944,38 @@ impl Shared {
         // so both hold and behavior (and on-disk bytes) are identical to an ungated commit. The watermark is
         // computed BEFORE the storage lock so the `live` lock is never held under it (a clean lock order).
         let oldest = self.oldest_live_version(snap.txid);
-        let can_reclaim = oldest == snap.txid;
+        let shared = self
+            .coordinator
+            .as_ref()
+            .is_some_and(|c| c.state() == LeaseState::Shared);
+        let can_reclaim = !shared && oldest == snap.txid;
         let mut st = self.storage.lock().expect("storage lock not poisoned");
-        let can_reuse = oldest >= st.free_gen_txid;
-        st.commit_durable(snap, can_reclaim, can_reuse)
+        let can_reuse = !shared && oldest >= st.free_gen_txid;
+        if shared && st.path.is_some() {
+            let write = snap.incremental_image(
+                st.page_size,
+                st.page_count,
+                &st.free_pages,
+                false,
+                Some(&st.paging),
+            )?;
+            let result = st.commit_file_shared(
+                snap,
+                write,
+                self.coordinator
+                    .as_ref()
+                    .expect("shared state has coordinator"),
+            );
+            if result.is_err() {
+                self.coordinator
+                    .as_ref()
+                    .expect("shared state has coordinator")
+                    .set_state(LeaseState::Poisoned);
+            }
+            result
+        } else {
+            st.commit_durable(snap, can_reclaim, can_reuse)
+        }
     }
 
     /// Whether MAIN is file-backed (durable) rather than in-memory — the input to the one-durable-writer
@@ -871,6 +1093,10 @@ impl Database {
     /// `Arc<SharedPaging>`, so every pinned/cloned snapshot faults clean pages through the one pool
     /// (spec/design/pager.md).
     fn from_engine(engine: Engine) -> Database {
+        Self::from_engine_coordinated(engine, None)
+    }
+
+    fn from_engine_coordinated(engine: Engine, coordinator: Option<FileCoordinator>) -> Database {
         let paging = engine
             .paging
             .clone()
@@ -890,7 +1116,7 @@ impl Database {
             live_at_compaction: engine.live_at_compaction,
             free_gen_txid: engine.free_gen_txid,
         };
-        Database(Arc::new(Shared {
+        let shared = Arc::new(Shared {
             roots: RwLock::new(Roots {
                 committed: Arc::new(engine.committed),
                 attached: HashMap::new(),
@@ -900,7 +1126,18 @@ impl Database {
             live: Mutex::new(LiveRegistry::default()),
             storage: Mutex::new(storage),
             attachments: Mutex::new(HashMap::new()),
-        }))
+            coordinator,
+            plan_epoch: AtomicU64::new(0),
+        });
+        if let Some(coordinator) = &shared.coordinator {
+            let weak: Weak<Shared> = Arc::downgrade(&shared);
+            coordinator.start_probe(Arc::new(move || {
+                if let Some(shared) = weak.upgrade() {
+                    shared.coordination_tick();
+                }
+            }));
+        }
+        Database(shared)
     }
 
     /// Build an **in-memory** shared core from an existing database image (the bytes a file-backed
@@ -1020,13 +1257,21 @@ impl Database {
             opts.page_size
         };
         match opts.path {
-            Some(path) => Ok(Database::from_engine(Engine::create(
-                path,
-                DatabaseOptions {
-                    page_size,
-                    no_sync: opts.skip_fsync,
-                },
-            )?)),
+            Some(path) => {
+                let coordinator =
+                    FileCoordinator::create(&path, opts.locking, opts.file_lock_timeout_ms)?;
+                let canonical = coordinator
+                    .as_ref()
+                    .map_or(path.as_path(), FileCoordinator::path);
+                let engine = Engine::create(
+                    canonical,
+                    DatabaseOptions {
+                        page_size,
+                        no_sync: opts.skip_fsync,
+                    },
+                )?;
+                Ok(Database::from_engine_coordinated(engine, coordinator))
+            }
             None => Ok(Database::in_memory(page_size)), // in-memory never fsyncs; skip_fsync is a no-op
         }
     }
@@ -1040,9 +1285,25 @@ impl Database {
     /// (the buffer-pool budget, read-only mode, work-mem). (The shared-core analogue of
     /// [`Engine::open_with_options`].)
     pub fn open_with_options<P: AsRef<Path>>(path: P, opts: OpenOptions) -> Result<Database> {
-        Ok(Database::from_engine(Engine::open_with_options(
-            path, opts,
-        )?))
+        let coordinator =
+            FileCoordinator::open(path.as_ref(), opts.locking, opts.file_lock_timeout_ms)?;
+        let canonical = coordinator
+            .as_ref()
+            .map_or(path.as_ref(), FileCoordinator::path);
+        let commit = match &coordinator {
+            Some(c) => Some(c.lock_commit_shared()?),
+            None => None,
+        };
+        let engine = Engine::open_with_options(
+            canonical,
+            OpenOptions {
+                // Coordination is already established at the shared-core layer.
+                locking: Locking::None,
+                ..opts
+            },
+        )?;
+        drop(commit);
+        Ok(Database::from_engine_coordinated(engine, coordinator))
     }
 
     /// The committed version currently published (the monotonic commit counter, transactions.md
@@ -1112,7 +1373,7 @@ impl Database {
         } else {
             None
         };
-        self.0.acquire_writer();
+        self.0.acquire_writer(0)?;
         let result = (|| {
             {
                 let atts = self
@@ -1172,7 +1433,7 @@ impl Database {
     /// released, under the writer gate.
     pub fn detach(&self, name: &str) -> Result<()> {
         let lname = name.to_ascii_lowercase();
-        self.0.acquire_writer();
+        self.0.acquire_writer(0)?;
         let result = (|| {
             {
                 let atts = self
@@ -1225,6 +1486,13 @@ impl Database {
             gate_held: false,
             pinned: Some(version),
             base_version: version,
+            pending_error: None,
+            refresh_on_next_read: self
+                .0
+                .coordinator
+                .as_ref()
+                .is_some_and(|c| c.state() == LeaseState::Shared),
+            plan_epoch: self.0.plan_epoch.load(Ordering::Acquire),
         }
     }
 
@@ -1240,7 +1508,11 @@ impl Database {
             // read-only one — a write through it is `25006`, mirroring PostgreSQL hot standby.
             return self.read_session();
         }
-        self.0.acquire_writer();
+        if let Err(error) = self.0.acquire_writer(0) {
+            let mut session = self.read_session();
+            session.pending_error = Some(error);
+            return session;
+        }
         let (base, attached) = self.0.pin_roots();
         let base_version = base.txid;
         let mut engine = Engine::from_snapshot((*base).clone());
@@ -1257,6 +1529,9 @@ impl Database {
             gate_held: true,
             pinned: None,
             base_version,
+            pending_error: None,
+            refresh_on_next_read: false,
+            plan_epoch: self.0.plan_epoch.load(Ordering::Acquire),
         }
     }
 
@@ -1297,6 +1572,14 @@ impl Database {
             gate_held: false,
             pinned,
             base_version: version,
+            pending_error: None,
+            refresh_on_next_read: access == Access::ReadOnly
+                && self
+                    .0
+                    .coordinator
+                    .as_ref()
+                    .is_some_and(|c| c.state() == LeaseState::Shared),
+            plan_epoch: self.0.plan_epoch.load(Ordering::Acquire),
         }
     }
 }
@@ -1332,6 +1615,12 @@ pub struct Session {
     /// The committed version the current working set / pin is based on; the published version is
     /// `base_version + 1` (the monotonic commit counter, transactions.md §8).
     base_version: u64,
+    /// Deferred host error for infallible eager-session constructors (notably `write_session`).
+    pending_error: Option<EngineError>,
+    /// A stable read session refreshes once, immediately before its first observable statement.
+    refresh_on_next_read: bool,
+    /// Last foreign-refresh epoch observed by this session's prepared-plan cache.
+    plan_epoch: u64,
 }
 
 impl Session {
@@ -1359,6 +1648,12 @@ impl Session {
     /// row at a time; a data-modifying `WITH` (a write) still falls back to the materialized `dispatch`
     /// path.
     pub fn query(&mut self, sql: &str, params: &[Value]) -> Result<Rows> {
+        if let Some(error) = &self.pending_error {
+            return Err(error.clone());
+        }
+        if let Some(coordinator) = &self.shared.coordinator {
+            coordinator.check_pid()?;
+        }
         let ast = self.engine.parse(sql)?;
         self.query_ast(ast, params)
     }
@@ -1382,6 +1677,26 @@ impl Session {
         params: &[Value],
         cache: Option<&RefCell<Option<CachedPlan>>>,
     ) -> Result<Rows> {
+        if let Some(error) = &self.pending_error {
+            return Err(error.clone());
+        }
+        if let Some(coordinator) = &self.shared.coordinator {
+            coordinator.check_pid()?;
+        }
+        if !self.engine.in_transaction() && !stmt_is_write(ast) {
+            if self.access == Access::ReadOnly {
+                self.refresh_initial_read()?;
+            } else {
+                self.shared.refresh_shared()?;
+            }
+        }
+        let epoch = self.shared.plan_epoch.load(Ordering::Acquire);
+        if epoch != self.plan_epoch {
+            if let Some(cache) = cache {
+                cache.borrow_mut().take();
+            }
+            self.plan_epoch = epoch;
+        }
         // Route the read before building the streaming cursor: an autocommit (non-block, writable
         // access) read re-pins the latest committed so the snapshot is current (PG-faithful); a
         // read-only session uses its existing pin, and an open block uses its working set. The re-pin is
@@ -1456,6 +1771,27 @@ impl Session {
         // poison) and self-poisons on a regular statement error, so its nuanced poisoning is left
         // intact — only the lazy-lane reads above, which bypass it, are poisoned here.
         Ok(Rows::from_outcome(self.dispatch(ast.clone(), params)?))
+    }
+
+    fn refresh_initial_read(&mut self) -> Result<()> {
+        if !self.refresh_on_next_read {
+            return Ok(());
+        }
+        self.shared.refresh_shared()?;
+        if let Some(version) = self.pinned.take() {
+            self.shared
+                .live
+                .lock()
+                .expect("live lock not poisoned")
+                .deregister(version);
+        }
+        let (snap, attached, version) = self.shared.pin_latest();
+        self.base_version = version;
+        self.engine.committed = (*snap).clone();
+        self.engine.attached_committed = attached;
+        self.pinned = Some(version);
+        self.refresh_on_next_read = false;
+        Ok(())
     }
 
     /// Run a (possibly mutating) statement under a [`CancellationToken`] (spec/design/api.md §11.4):
@@ -1533,7 +1869,8 @@ impl Session {
         // Autocommit write — the lazy gate (§2.4): take it, capture the latest committed as the
         // working base, run, publish (persist + swap) at the next version on success, release. A
         // persist I/O failure surfaces as the statement's error and publishes nothing.
-        self.shared.acquire_writer();
+        self.shared
+            .acquire_writer(self.engine.session.lock_timeout_ms())?;
         self.gate_held = true;
         self.refresh_committed();
         let result = match self.engine.execute_stmt_params(ast, params) {
@@ -1559,10 +1896,12 @@ impl Session {
         }
         let rw = writable.unwrap_or(true);
         if rw {
-            self.shared.acquire_writer();
+            self.shared
+                .acquire_writer(self.engine.session.lock_timeout_ms())?;
             self.gate_held = true;
             self.refresh_committed();
         } else {
+            self.shared.refresh_shared()?;
             // A READ ONLY block pins its snapshot atomically (load+register under one lock, §8), so the
             // version it reads can never be reclaimed in a load→register gap.
             let (snap, attached, version) = self.shared.pin_latest();
@@ -1854,7 +2193,8 @@ impl Session {
             // Part of the open block; it publishes when the block commits.
             return self.engine.set_default_collation(name);
         }
-        self.shared.acquire_writer();
+        self.shared
+            .acquire_writer(self.engine.session.lock_timeout_ms())?;
         self.gate_held = true;
         self.refresh_committed();
         let result = match self.engine.set_default_collation(name) {
@@ -2025,7 +2365,8 @@ impl Session {
         if self.engine.in_transaction() {
             return self.engine.upgrade_collations();
         }
-        self.shared.acquire_writer();
+        self.shared
+            .acquire_writer(self.engine.session.lock_timeout_ms())?;
         self.gate_held = true;
         self.refresh_committed();
         let result = match self.engine.upgrade_collations() {
