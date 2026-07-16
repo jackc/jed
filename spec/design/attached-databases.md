@@ -279,9 +279,9 @@ scratch **attaches a `Database`-scoped in-memory database** instead. The reframi
 lifetime), which would visibly clash with any future **multi-process** file access, where the *file* is
 the sharing boundary — two processes on the same file would not see each other's "shared" temp. An
 attachment makes the scope **explicit at attach time** and decoupled from the file axis, which is the
-honest model. (Multi-process file access is now spec'd in [locking.md](locking.md): a file attachment
-takes the same default-exclusive per-file lock as `main` at attach time; shared multi-process access
-is the recorded follow-on there.)
+honest model. (Multi-process file access is now spec'd in [locking.md](locking.md): every file
+attachment joins its own per-file shared coordination bundle at attach time, independently of
+`main`; the existing one-durable-writer rule remains until this document's super-journal slice.)
 
 > **Decided (§6, 2026-07-03): retire the `SHARED TEMP` surface.** The `SHARED` keyword,
 > `allow_shared_temp_ddl`, `shared_temp_mem`, the `Database`-level shared-temp snapshot, and the

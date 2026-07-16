@@ -252,6 +252,7 @@ because they have different conformance contracts**:
 | `max_sql_length` | A — envelope | 1 MiB | parse-size abort (`54000`) | `# max_sql_length:` (existing) |
 | `lifetime_max_cost` | A — envelope | `0` (unlimited) | per-session cumulative abort (`54P02`) | concurrency-style schedule |
 | `idle_in_transaction_timeout` | A — envelope | `0` (off) | auto-rollback of an idle open txn (`25P03`, §2.2) | ordered schedule *(deferred, §11)* |
+| `lock_timeout_ms` | A — envelope | `0` (no deadline) | shared cross-process writer-gate wait (`55P03`, locking.md §5.2) | real-process coordination suite |
 | `work_mem` | A — envelope | 256 MiB | *when* an operator spills (never results) | invariant (spill.md §6) |
 | session variables | B — semantic | empty | `current_setting()` / `SHOW` results | `# set:` |
 | `time_zone` | B — semantic | `UTC` | `timestamptz`↔`date`/`text` casts, `AT TIME ZONE` | `# timezone:` |
@@ -590,6 +591,7 @@ Extends the [api.md §6](api.md) table; same shape across cores, idiomatic spell
 | close session | `session.close()` + `Drop` | `session.Close() error` | `session.close(): void` |
 | run a script | `session.execute_script(sql) -> Result<ScriptSummary>` | `session.ExecuteScript(sql) (ScriptSummary, error)` | `session.executeScript(sql): ScriptSummary` |
 | set lifetime budget | `session.set_lifetime_max_cost(n)` | `session.SetLifetimeMaxCost(n)` | `session.setLifetimeMaxCost(n)` |
+| set writer-lock timeout | `session.set_lock_timeout_ms(n)` | `session.SetLockTimeoutMs(n)` | `session.setLockTimeoutMs(n)` |
 | cumulative cost gauge | `session.lifetime_cost() -> i64` | `session.LifetimeCost() int64` | `session.lifetimeCost: number` |
 | default privileges | `SessionOptions { default_privileges }` | `SessionOptions{ DefaultPrivileges }` | `{ defaultPrivileges }` |
 | grant / revoke | `session.grant(privs, on)` / `session.revoke(privs, on)` | `session.Grant` / `session.Revoke` | `session.grant` / `session.revoke` |
@@ -603,6 +605,9 @@ random/clock sources ([api.md §6/§8/§10](api.md)) — relocate onto `Session`
 (the bare `Database` proxies them to its default session for back-compat). `read_only` is the one
 exception: its *physical* form stays a `Database` open option ([api.md §2.1](api.md), `25006`),
 and its session-level *authorization* role is superseded by the privilege model (§5.3, `42501`).
+`lock_timeout_ms` is an additive host-only Bucket-A setting from [locking.md](locking.md): it controls
+only how long a shared file writer waits for the cross-process gate, uses monotonic host time, and has
+no effect for in-memory or presence-EX fast-path writes.
 
 ## 9. Determinism & the conformance contract
 

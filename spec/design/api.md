@@ -133,24 +133,26 @@ implicit transaction *is* read-only). Because no write transaction can open, no 
 publishes; the file is additionally opened **without write access**, so the OS enforces what
 the guards promise (a read-only handle works on a read-only filesystem). The handle exposes
 `read_only()` / `ReadOnly()` / `.readOnly`. Like the memory budget it is a handle setting, not
-stored in the file. (Under the default file lock — next paragraph — a read-only handle still
-holds the file exclusively; it is a promise about *this handle's* behavior, not an invitation
-for a concurrent writer.)
+stored in the file. Under shared coordination (next paragraph), read-only processes may coexist
+with writers: the handle still never writes, and its pinned pages stay immutable because co-resident
+commits are append-only.
 
-**File lock — an open-time property ([locking.md](locking.md)).** `create`, `open`, and file
-`attach` acquire an **exclusive whole-file lock by default**, held for the handle's lifetime
-and released at `close`/`detach` (kernel-owned, so a crash leaves no stale lock; mechanism per
-host in locking.md §4). A second open of a locked file — from another process *or* the same
-one — fails **`55006 object_in_use`**, or waits up to **`opts.lock_timeout_ms`** (default `0`
-= fail immediately) before failing: the zero-downtime-deploy knob — the incoming process opens
-with a generous timeout and acquires the moment the outgoing process closes (locking.md §1).
-**`opts.locking`** — `exclusive` (default) | `none` — is the escape hatch for externally
-coordinated access, static files, and network filesystems, where the caller owns the
-aloneness guarantee the engine otherwise enforces. A host with no locking mechanism at all
-fails the default closed (`0A000`, locking.md §2.2) rather than silently not enforcing.
-In-memory databases have no file and no lock. Same shape across cores (Rust `OpenOptions {
-locking, lock_timeout_ms }` / Go `OpenOptions { Locking, LockTimeoutMs }`, zero value =
-exclusive / TS `{ locking, lockTimeoutMs }`).
+**File coordination — an open-time property ([locking.md](locking.md)).** `create`, `open`, and
+`AttachSource::file` use `locking = auto` (the zero-value/default) | `shared` | `exclusive` | `none`.
+On a capable local file host `auto` selects **shared multi-process access** through the stable
+`<path>.lock/` OS-lock bundle; OPFS selects its inherent exclusive access. A one-process shared handle
+normally holds the presence-EX fast-path lease, so its foreground transaction path is identical to the
+uncoordinated path. Co-resident processes refresh meta at transaction begin, share one global writer,
+and commit append-only. `exclusive` never opens a join window. `none` is the unsafe escape hatch for an
+externally coordinated or static file; network filesystems require that external coordinator. An
+unsupported requested mode fails closed `0A000`.
+
+`file_lock_timeout_ms` (default **5000**, `0` = fail immediately) bounds shared join / exclusive open
+and returns `55006` on expiry. It is distinct from the session `lock_timeout_ms` (`0` = no deadline),
+which bounds the cross-process writer gate and returns `55P03`. Both use monotonic host time and are
+unmetered. File attachments carry these fields in `AttachSource::file(path, options)`; create/open use
+their idiomatic options structs (`locking`, `file_lock_timeout_ms` / `Locking`, `FileLockTimeoutMs` /
+`locking`, `fileLockTimeoutMs`). In-memory databases have no bundle and ignore file-lock options.
 
 **Work-memory budget — a handle setting ([spill.md](spill.md) §3).** `open`'s `opts.work_mem`
 (Rust `OpenOptions { work_mem }` / Go `OpenOptions { WorkMem }` / TS `{ workMem }`; default
@@ -533,7 +535,7 @@ only and the engine has no wire protocol).
 | upgrade collations — clear a version-skew (collation.md §12) | `db.upgrade_collations() -> usize` | `db.UpgradeCollations() (int, error)` | `db.upgradeCollations(): number` |
 | attach a database (attached-databases.md §4) | `db.attach(name, source, read_only) -> Result<()>` | `db.Attach(name, source, readOnly) error` | `db.attach(name, source, readOnly): void` |
 | detach a database | `db.detach(name) -> Result<()>` | `db.Detach(name) error` | `db.detach(name): void` |
-| attach source (memory now, file = Slice 2) | `AttachSource::memory()` / `AttachSource::file(path)` | `AttachMemory()` / `AttachFile(path)` | `attachMemory()` / `attachFile(path)` |
+| attach source | `AttachSource::memory()` / `AttachSource::file(path, opts)` | `AttachMemory()` / `AttachFile(path, opts)` | `attachMemory()` / `attachFile(path, opts)` |
 | table lookup (catalog — doc-hidden tooling, §6) | `db.table(name) -> Option<&Table>` | `db.Table(name) (*catTable, bool)` | `db.table(name): Table \| undefined` |
 
 **Per-language divergences, deliberate and documented:**

@@ -244,17 +244,15 @@ sits so the options stay open (CLAUDE.md §9).
   reconstruction still faults its leaves to find `max key + 1` (most tables have a PK; bounded by the
   pool).
 - **Multi-process file locking** — ⏳ **decided, spec'd ([locking.md](locking.md)), not
-  built.** Everything above assumes the engine is alone with the file (the open-time
-  free-list walk, the buffer pool, the in-process watermark); today nothing enforces it — two
-  handles on one file is undefined corruption. The decided immediate implementation is an
-  **exclusive-by-default whole-file lock** at `open`/`create`/`attach` (second open `55006`,
-  or bounded wait via `lock_timeout_ms` — the zero-downtime-deploy pattern, locking.md §1),
-  which turns this doc's aloneness *assumptions* into enforced invariants with no new gating
-  (locking.md §5). **Shared multi-process access** (presence + write-gate locks, append-only
-  commits while co-resident, the lease refinement that keeps the alone case at exclusive-mode
-  cost) is designed and **recorded as an unscheduled follow-on** (locking.md §7); it is where
-  reclamation, compaction, and free-list persistence gain a *cross-process* "provably alone"
-  gate alongside the watermark.
+  built.** Separate handles currently have independent buffer pools, persisted-free-list state,
+  watermarks, and writer gates, so the same file is unsafe. The revised first slice is shared access:
+  the stable `<path>.lock/` bundle provides presence/arrival/transition/writer/commit OS locks. An
+  uncontended presence-EX lease preserves the current foreground path and v29 allocator. While
+  co-resident, begins refresh the newest meta, one global writer commits append-only with
+  `free_list_head = 0`, and body pages stay immutable. Free-page reuse, free-list persistence/rebuild,
+  truncation, and compaction require presence-EX proof of aloneness plus the existing in-process
+  watermark. The bundle, rather than the replaceable database inode, remains locked across future
+  `to_image` compaction (locking.md §3–§6).
 - **File compaction / shrink (returning space to the OS)** — ⏳ **approach decided, not built.**
   The free-list (above) recycles dead space for *jed*, but it never gives it back: `page_count` is
   a monotonic high-water (plus the pager.md §7 preallocation slack), so the file is **grow-only** —

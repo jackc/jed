@@ -13,6 +13,13 @@ implementation (CLAUDE.md §2), the only thing that says two cores agree is that
 produce identical results on the same shared, declarative tests. Everything here is in
 service of that: one format, deterministic expected output, machine-legible failures.
 
+Two sibling formats cover concurrency that a one-handle SQL transcript cannot express:
+`# format: concurrency` files model named in-process sessions, while
+`process/*.process.toml` drives real Rust/Go/Node processes over one file. The latter is the planned
+Layer 4 shared-lock contract from [concurrency-testing.md](concurrency-testing.md) §10 and
+[locking.md](locking.md) §9; it becomes an in-CI capability gate with the locking slice rather than
+being mirrored separately in each core.
+
 ## 1. Format: sqllogictest-style
 
 Plain-text, declarative, one **record** per directive, records separated by blank lines.

@@ -352,6 +352,12 @@ This is the spine of the project. Treat it as the contract, not an afterthought.
   binary per core in the `bench/` modules (reusing the splitmix64 PRNG + FNV answer checksum), checked
   by per-snapshot invariants + a confluent final-state checksum that must agree across cores (Go under
   `-race`, Rust over real threads, TS via a seeded-sequential interleaver).
+  **Layer 4 (`rake concurrency:process`) is designed, not built:** one shared
+  `spec/conformance/process/*.process.toml` corpus drives real Rust/Go/Node actor processes in every
+  supported pairing over one file. Explicit barriers, kill hooks, and invariant checks cover the
+  shared OS-lock protocol, crash release, meta recovery, and cross-core interoperability. It joins
+  `rake ci` with the `file.shared_process` capability and is release-blocking for shared file access;
+  this behavior must not live only in three mirrored per-core tests.
 - **Bootstrap the corpus via differential testing against PostgreSQL.** The real PG
   service is the **result oracle** (§1): run a supported-subset query against it, capture
   output, emit a corpus entry. Generates a large, *correct* corpus cheaply. Where our
@@ -623,19 +629,25 @@ cross-core-identical and owns that consequence (the host-extension boundary, §1
   **explicit** and `close` does **not** auto-flush (uncommitted changes are discarded); an
   in-memory `commit` is a no-op success, so the operation stays uniform and forward-compatible
   with the future §3 staging-buffer transactions. Same shape across all three cores.
-- **Multi-process access: exclusive-by-default file locking (`spec/design/locking.md`) —
-  decided, spec'd, not yet built.** The engine assumes it is alone with the file (free-list
-  reconstruct-on-open, buffer pool, the in-process watermark); the lock makes that an enforced
-  invariant instead of a hope: `open`/`create`/file-`attach` take an **exclusive whole-file
-  lock** by default (Unix `flock`, Windows share-mode-0, TS a cooperative side-car, OPFS
-  inherent — normative per-OS so cores mutually exclude), a second open fails `55006` or waits
-  up to `lock_timeout_ms` — which serves the zero-downtime deploy (the new process waits for
-  the old to close; requests queue seconds, no shared state). `locking = none` is the explicit
-  opt-out. **Shared multi-process access** (co-resident writers: presence + write-gate locks,
-  append-only commits while co-resident, the lease refinement making the alone case cost
-  what exclusive mode costs) is **designed and recorded as an unscheduled follow-on**
-  (locking.md §7) — v1 deliberately stays exclusive-only so the follow-on's lock-state space
-  stays unambiguous.
+- **Multi-process access: shared-by-default coordination (`spec/design/locking.md`) — decided,
+  spec'd, not yet built.** Separate opens are unsafe today because their buffer pools, persisted
+  free-list state, in-process watermarks, and writer gates do not interact. The revised first slice is
+  the full shared protocol: a stable, version-marked `<path>.lock/` bundle carries crash-clean
+  whole-file OS locks for presence, arrival, transition, one global writer, and the short
+  commit-publication gate. On capable
+  local hosts `locking = auto` selects shared. One process normally holds a presence-EX fast-path
+  lease, so foreground reads/writes perform **no coordination syscall or meta pread** and use the
+  current v29 allocator unchanged; a background probe notices a crash-clean arrival lock and opens a
+  join window. While co-resident, transaction begin refreshes meta, writers serialize globally, and
+  commits are append-only (`free_list_head = 0`). Reuse/reclamation/truncation/compaction require
+  presence-EX proof of aloneness plus the in-process watermark. No format bump or persisted
+  `catalog_gen` is required for correctness. Rust/Go use `flock`/`LockFileEx` without dependencies;
+  Node needs a narrow native OS-lock host adapter and the preferred direction is a first-party minimal
+  Rust Node-API addon (host calls only, not a Rust-core wrapper) with reproducible prebuilds. Its bounded
+  §14 FFI/unsafe exception, exact `napi-rs` pins, and artifact matrix require explicit human approval.
+  PID/mtime stale-lock heuristics are forbidden; an unsupported host fails closed. OPFS remains
+  inherently exclusive. The first rollout must drain every pre-protocol binary because an advisory
+  protocol cannot coordinate with a process that does not participate.
 
 ---
 

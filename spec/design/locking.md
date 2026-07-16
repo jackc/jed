@@ -1,295 +1,421 @@
-# File locking & multi-process access — design
+# File locking & shared multi-process access — design
 
-> What happens when more than one process (or more than one handle) opens the same database
-> file. This doc fixes the **decided immediate implementation** — an **exclusive-by-default
-> whole-file lock** acquired at `open`/`create`/`attach` (§2–§6) — and **records** the designed
-> but deliberately unscheduled follow-on: **shared multi-process access with the lease
-> refinement** (§7). [hosts.md](hosts.md) owns the host backing beneath the seam; [api.md](api.md)
-> §2.1 owns the open-option surface; [storage.md](storage.md) §4/§6 own the commit model and the
-> reclamation this doc's rules protect. When a decision here changes, update
-> [CLAUDE.md](../../CLAUDE.md) §9 and those docs in the same edit.
+> What happens when more than one process opens the same database file. This document fixes the
+> **shared-by-default protocol**: every lock-capable file host may admit multiple processes, while the
+> engine preserves one global writer, immutable pinned snapshots, crash-safe publication, and
+> corruption-free reclamation. The common one-process case holds an OS-backed fast-path lease and
+> performs **no locking or meta-read work on foreground transaction paths**. Contention deliberately
+> takes the slower path. [hosts.md](hosts.md) owns the host backing; [api.md](api.md) §2.1 owns the
+> options; [storage.md](storage.md) §4/§6 own persistence and reclamation. When a decision here changes,
+> update those docs, [CLAUDE.md](../../CLAUDE.md) §9, [AGENTS.md](../../AGENTS.md), and
+> [TODO.md](../../TODO.md) together.
 
-## 1. The problem, and the staging decision
+## 1. Decision and status
 
-The engine assumes it is **alone with the file**. Every load-bearing storage mechanism bakes
-that in: the free-list is reconstructed on open from the committed root's reachable set and
-consumed all session (storage.md §6) — a second committing process would double-allocate the
-same "free" pages; the buffer pool caches pages assuming their bytes never change beneath it
-(pager.md §3); the reader-liveness watermark that gates page reuse is an **in-process**
-registry (transactions.md §8); and two writers would both alternate the meta slots against
-different bases. Two handles on one file — from two processes *or* one — is silent lost
-updates at best and file corruption at worst, with no defined error. That is the gap.
+The engine currently coordinates concurrent sessions only when they share one in-process `Database`.
+Separate opens have separate buffer pools, free-list state, reader watermarks, and writer gates. Without
+cross-process coordination, two handles can reuse the same page, overwrite a page cached by the other,
+or publish meta slots from different bases. That is undefined corruption today.
 
-**Decision (2026-07-04): stage it in two steps.**
+**Decision (revised 2026-07-16): build shared multi-process access as the first locking slice.**
 
-1. **Exclusive-by-default locking** (§2–§6) is the **immediate implementation**: one handle
-   owns the file, a second open fails with a defined error (or waits, bounded by a timeout).
-   Corruption-by-concurrency becomes structurally impossible, at zero steady-state cost.
-2. **Shared multi-process access** — concurrent processes over one file, with the **lease
-   refinement** that keeps its alone-case overhead at effectively zero — is **designed and
-   recorded in §7 but not scheduled**. v1 deliberately reserves the lock-state space §7 needs
-   (§2.2), so the follow-on is additive, not a migration.
+- `locking = auto` is the zero-value/default. On a capable local file host it selects `shared`; on a
+  host whose storage primitive is inherently exclusive (OPFS), it selects `exclusive`.
+- `shared` admits concurrent processes and enforces **one writer globally**. Readers keep pinned
+  snapshots and block only during the short meta-publication window, not for the writer's transaction.
+- `exclusive` keeps one process on the file and never opens a join window. It remains useful for a
+  caller that wants immediate contention errors or cannot tolerate a coordination sidecar.
+- `none` skips jed coordination. It is an unsafe expert escape hatch for a host that enforces the same
+  invariant externally; the caller owns every consequence.
 
-**Why shared mode was demoted.** The motivating scenario was the zero-downtime (blue/green)
-web-app deploy: old and new versions co-resident, both possibly writing. On analysis the
-scenario is served *without* co-residency: the new process opens with a generous
-`lock_timeout_ms` and simply **waits for the old process to close**; it exposes a liveness
-endpoint that needs no database access, so the orchestrator promotes it and requests queue for
-the few seconds the old process takes to drain. No true downtime, no shared-state machinery.
-Co-resident *writing* remains a real (rarer) want — §7 records the full design for when it is.
+The earlier exclusive-first proposal is superseded. The motivating deploy no longer has to wait for
+the old process to close: old and new processes may overlap, with writes serialized by the protocol.
 
-**PG/SQLite posture (CLAUDE.md §1).** PostgreSQL is no guide here (a server owns its files
-outright). SQLite — the deployment-model north star — defaults to *shared* access via
-rollback/WAL locking and pays for it on every transaction. jed deliberately diverges:
-**exclusive by default** (the overwhelmingly common embedded case pays nothing), shared as a
-recorded opt-in follow-on. Recorded here per the §1 divergence rule.
+The protocol is designed against the **current format (v29)**. On-disk free-list persistence and
+continuous within-session reclamation already landed in v25. No format bump and no persisted
+`catalog_gen` are required for correctness: after a foreign `txid`, the deliberately-slow contended path
+reloads the snapshot and invalidates persistent plan caches wholesale. A persistent catalog generation
+is only a later multi-process performance optimization.
 
-## 2. v1 semantics — the exclusive lock
+## 2. Safety invariants
 
-### 2.1 Acquisition, lifetime, release
+These are normative. An implementation that cannot uphold them fails closed (`0A000`); it never falls
+back to a PID file, mtime lease, or best-effort stale-lock recovery.
 
-- **One lock per database file.** `create` and `open` acquire it on the main file;
-  `db.attach` of a **file** attachment acquires an independent lock on that file
-  (attached-databases.md §2 — the lock is per *file*, the sharing boundary). An in-memory
-  database or attachment has no file and no lock.
-- **Acquired before the first content read.** `open` takes the lock **before** reading or
-  validating the header, so a torn state written by a concurrent (soon-to-be-excluded) writer
-  can never be observed. `create` opens the fresh file (`O_EXCL` — it never clobbers, api.md
-  §2.1) and locks it before writing the initial image; if another process wins the
-  vanishingly-rare race between file creation and lock acquisition, the loser fails `55006`
-  like any contended open.
-- **Held for the handle's lifetime**, released at `close`/`detach` (and by the OS at process
-  death — the lock is kernel-owned state on Unix/Windows, so a crash leaves **no stale lock**;
-  the TS side-car is the one exception, §4).
-- **Read-only opens take the same exclusive lock.** A read-only handle (api.md §2.1) still
-  assumes the file is static beneath it — its buffer pool, catalog, and snapshot are all
-  invalidated by a foreign commit — so it must exclude writers, and in v1 that means excluding
-  everyone. This is also deliberate forward-compatibility: v1 never takes a *shared* OS lock,
-  reserving that state for §7.4 (where `LOCK_SH` must unambiguously mean "a shared-protocol
-  participant is present"). Multi-reader coexistence arrives with the follow-on, not before.
+1. **Join before read.** A process becomes a participant before reading a meta slot or body page.
+2. **One global writer.** A write transaction owns the cross-process writer gate from snapshot refresh
+   through commit/rollback.
+3. **Publication is gated.** A transaction begin cannot adopt a meta slot while a writer is publishing
+   it. The visible cross-process commit point remains the completed meta publication.
+4. **Pages are immutable while co-resident.** A shared-mode commit is append-only: no free-page reuse,
+   no truncation, no free-list rewrite, and no compaction while another process may have a snapshot.
+5. **Destructive storage work requires proof of aloneness.** Reuse, free-list persistence/rebuild,
+   truncation, and whole-file replacement require the presence-exclusive lease **and** the existing
+   in-process reader watermark.
+6. **The OS lock is the authority.** Leases never expire and are never stolen. Process death releases
+   the locks. Wall-clock time controls only how long a caller waits, never ownership.
+7. **The uncontended foreground path is unchanged.** Once one process holds the presence-exclusive
+   lease, reads do not pread meta, writes do not acquire OS gates, and commits use the existing v29
+   allocator and durability recipe.
+8. **Only protocol participants may overlap.** A pre-protocol jed binary or any other process that
+   ignores advisory locks is outside the safety boundary. The first rollout must drain every such
+   opener before a protocol-aware process starts; later compatible versions may overlap normally.
 
-### 2.2 The open-option surface (api.md §2.1)
+## 3. Stable coordination bundle
 
-Two open-time options, on `create`, `open`, and `attach` alike (idiomatic per core, the
-`cache_bytes` shapes):
+### 3.1 Identity and lifetime
 
-- **`locking`** — `exclusive` (**default**) | `none`. `none` skips lock acquisition entirely:
-  for hosts that coordinate exclusivity externally, for read-only inspection of a file known
-  static, and for filesystems where the primitive is unreliable (NFS, §3). With `none` the
-  pre-lock guarantees are the caller's problem — the v1 engine still *assumes* aloneness; the
-  option changes who enforces it. (Go: the zero value of the `Locking` field is `exclusive`,
-  so the uninitialized-struct default is the safe one.)
-- **`lock_timeout_ms`** — non-negative integer, default **0**. `0` = fail immediately if the
-  lock is held; `N` = wait up to `N` ms for the holder to release, then fail. This is the
-  deploy knob (§1): the incoming process opens with, say, `lock_timeout_ms: 60_000` and
-  acquires the instant the outgoing process closes. (Implementations poll a non-blocking
-  acquire — interval non-normative, ~10 ms — because `flock` has no native timeout.)
+Every file database has a persistent, non-data coordination directory beside it:
 
-**Errors.** A lock that cannot be acquired — immediately at `lock_timeout_ms = 0`, or on
-timeout expiry — is **`55006 object_in_use`** (already registered, `spec/errors/registry.toml`;
-the code detach-in-use uses, and PostgreSQL's code for "in use by another"), with `{detail}`
-naming the path. A host with **no locking mechanism at all** (§4: wasm32-wasip1) **fails
-closed**: `locking = exclusive` (the default) is `0A000 feature_not_supported`
-("file locking unavailable on this host; open with locking = none") — an explicit one-line
-opt-out beats silently unenforced exclusivity (the CLAUDE.md §13 legibility rule).
+```text
+<database-path>.lock/
+  protocol-v1
+  presence
+  arrival
+  transition
+  writer
+  commit
+```
 
-## 3. What the lock does — and does not — protect
+The files are empty. `protocol-v1` is an immutable format marker; the other five files' **OS lock
+state**, not contents or timestamps, is authoritative. jed creates missing bundle entries safely
+before joining, never unlinks the bundle automatically, and backs up or replicates only the database
+file. Keeping the bundle stable solves the inode-replacement problem: `to_image` compaction may
+atomically replace the database path without moving the locks to an unlinked old inode.
 
-- **jed-vs-jed, everywhere the OS allows.** On **Unix** the lock is **advisory** (`flock`):
-  every jed core respects it, but a non-jed process (`cp`, a backup tool, a rogue writer) is
-  not stopped. On **Windows** v1 uses **share-mode exclusion** (§4), which is **mandatory** —
-  no other process can open the file at all while a jed handle holds it.
-- **Same-process double-open becomes a defined error.** `flock` locks belong to the *open file
-  description*, and Windows share modes to the *handle*, so a second `open` of the same path
-  **within one process** also fails `55006`. This closes a real existing hazard (two handles =
-  two pagers = corruption) that previously had no defined behavior, and makes the contract
-  testable in a single process (§6).
-- **Local filesystems only.** `flock` over NFS/CIFS ranges from unreliable to lying;
-  networked filesystems are **unsupported** for locking (the SQLite posture). Use
-  `locking = none` there and coordinate externally.
-- **Mixed-core caveat.** The TS core cannot take or observe OS locks (§4); its side-car is
-  cooperative among TS processes only. A deployment must not point a TS-core process and a
-  Go/Rust-core process at one live file and expect either to exclude the other — declared
-  unsupported rather than papered over (the realistic co-residency case, one app's old/new
-  versions, is same-core by construction).
+The durable database state remains one file: the bundle contains no database bytes, recovery facts,
+owner identity, or generation counter, and copying the `.jed` file to a new path is sufficient to copy
+the database. The tradeoff is one version marker and five persistent empty local lock files beside an
+opened database. They are deliberately not auto-removed: unlink-and-recreate would let an opener on the
+old inode and an opener on the new inode enter different lock domains.
 
-## 4. Mechanism per host (normative)
+Bundle creation is idempotent and no database byte is read until the marker and all five regular lock
+files exist and have been opened without following a final-component symlink. A process takes
+`arrival` before its final marker validation, so a future protocol migration can exclude new joiners.
+An unknown `protocol-v*` marker fails `0A000`. An incompatible future version must migrate only while
+holding `arrival EX`, `transition EX`, and `presence EX`, and must continue honoring the v1 lock names;
+it must never create a second lock domain. A v1 opener revalidates the marker after acquiring
+`arrival SH`.
 
-Cross-core interop is the point: **on a given OS, every lock-capable core MUST use exactly
-the mechanism specified here**, or a Rust process and a Go process would not exclude each
-other. This table is the contract (hosts.md §4 carries the capability column):
+`open` resolves symlinks and keys the in-process coordinator registry by the normalized real path.
+Hard-linked database files are rejected in coordinated modes (`55006` with detail): path-adjacent lock
+bundles cannot prove that two hard-link names share an inode, and silently accepting them would split
+the lock domain. External rename/replacement of a live database and deletion/replacement of its lock
+bundle are unsupported non-cooperating filesystem mutations, just like a non-jed writer ignoring an
+advisory Unix lock.
 
-| host / core | mechanism | tier | notes |
-|---|---|---|---|
-| **Rust file, Unix** | `flock(LOCK_EX \| LOCK_NB)` via std `File::try_lock` (stable since 1.89) | `os` | **zero dependencies** — one reason v1 needs no §14 proposal. Timeout = poll `try_lock`. |
-| **Go file, Unix** | `syscall.Flock(fd, LOCK_EX \| LOCK_NB)` | `os` | std `syscall`, pure Go, no cgo (CLAUDE.md §2). Same lock kind as Rust ⇒ mutual exclusion holds. |
-| **Rust file, Windows** | open with **share mode 0** (`OpenOptionsExt::share_mode(0)`) | `os` (mandatory) | exclusion via the open itself — no `LockFileEx` range to keep in cross-core agreement, and it is OS-enforced against non-jed processes too. |
-| **Go file, Windows** | `syscall.CreateFile` with `dwShareMode = 0` | `os` (mandatory) | must match Rust's choice (share mode, not `LockFileEx`) — symmetric conflicts, same semantics. |
-| **TS / Node** | side-car lock file `<path>.lock` (`O_EXCL` create; contents: ASCII pid) | `cooperative` | Node has no `flock`/`fcntl` surface. On `EEXIST`: read pid, probe liveness (`process.kill(pid, 0)`), remove-and-retry once if dead, else `55006`. **Best-effort**: a crash leaves a stale file until pid-liveness recovery, pid reuse and pid namespaces (two containers sharing a volume) can defeat the probe. Removed on `close`. |
-| **Browser / OPFS** | `createSyncAccessHandle` **is** the lock | `inherent` | the browser grants one sync access handle per file — exclusivity by construction (hosts.md §5); a second open fails at acquisition. `locking = none` is meaningless here (the exclusivity is not jed's to waive). |
-| **wasm32-wasip1 (impl/wasm)** | none available | `unavailable` | WASI preview1 has no lock primitive: default-exclusive opens fail `0A000` (§2.2); callers pass `locking = none`. |
-| **Ruby gem** | inherits Rust | `os` | wraps the Rust core over the C ABI — conforms by construction (CLAUDE.md §2). |
-| **in-memory** | n/a | — | no file; a `MemoryBlockStore` is process-private by nature. |
+For `create`, the parent directory is resolved and the absent target is normalized as
+`real_parent/basename`. Creation initializes the bundle and uses the **exclusive acquisition loop**
+(§4.1) before publishing the initial file. It then rechecks nonexistence and keeps the existing
+temp-file + fsync + no-clobber atomic-rename recipe; the lock never depends on the temporary or final
+database inode. A competing creator therefore serializes on the bundle and receives `58P02` after the
+winner publishes instead of clobbering it. After creation, `auto` may enter the ordinary shared
+fast-path lease without releasing presence.
 
-**Decided against: a universal side-car.** Having Go/Rust *also* create/check `<path>.lock`
-would let them cooperate with TS processes — but it imports the side-car's failure mode
-(stale files needing heuristic recovery) into the cores whose OS locks are otherwise
-crash-clean, to serve a mixed-core co-residency we declare unsupported anyway (§3). The
-side-car stays TS-only; the mixed-core rule is documented instead.
+The bundle is local-filesystem coordination. NFS/CIFS/network filesystems are unsupported unless the
+caller uses `locking = none` and supplies an external coordinator.
 
-**Where it lives.** Locking is part of the **host program layer's file open** (api.md), like
-the class-58 open errors (hosts.md §4) — *not* a `BlockStore` method. The five-method byte
-seam stays untouched; a `BlockStore` never knows whether its file is locked.
+The first coordinated open of a pre-locking database may need to create the bundle. If the database is
+on a read-only directory and the bundle is absent, open fails `58030` with remediation detail rather
+than proceeding uncoordinated. `create` always leaves a complete bundle for later read-only opens.
 
-## 5. Interaction with reclamation, compaction, and the pager
+### 3.2 Lock operations
 
-The exclusive lock **enforces what the storage layer already assumes** — it adds no new
-gating and relaxes none:
+Each file is locked as a whole in shared (`SH`) or exclusive (`EX`) mode:
 
-- **Free-list reconstruct-on-open** (storage.md §6) is sound precisely because no other
-  process can commit between the walk and this handle's own commits. Under the lock that
-  precondition is guaranteed rather than hoped.
-- **The deferred within-session continuous reclamation and on-disk free-list persistence**
-  (the P6.2 follow-ons) stay gated only on the **in-process** watermark
-  (transactions.md §8) — correct under v1, since no cross-process reader can exist.
-- **Compaction / shrink** (storage.md §6, decided `to_image` mechanism) and the lighter
-  trailing-free truncation are writer operations that replace or shorten the file under
-  readers; under v1 all readers are in-process, so the watermark remains the only gate.
-  (In §7's shared mode, every one of these acquires a *cross-process* aloneness proof —
-  that, not v1, is where the reclamation/locking coupling gets real.)
-- **Cost & determinism.** Lock acquisition is host-level work, unmetered (like `fsync` —
-  cost.md §3); nothing SQL-visible changes. `lock_timeout_ms` is wall-clock and therefore
-  nondeterministic, but it is **host-API-surface** nondeterminism outside the conformance
-  corpus (the corpus never opens a contended file), the same posture as host-initiated
-  `57014` cancellation — no `determinism_exceptions.toml` entry is needed.
+| lock | long-lived owner | purpose |
+|---|---|---|
+| `presence` | every participant: normally SH; the alone lease: EX | participant liveness and proof of aloneness |
+| `arrival` | a joining process: SH until it obtains presence | crash-clean notification that an EX lease must open a join window |
+| `transition` | one process briefly: EX | serializes presence SH↔EX transitions |
+| `writer` | a contended write transaction: EX | the global single-writer gate |
+| `commit` | txn begin: SH briefly; publishing writer: EX briefly | prevents a begin from observing an in-progress meta publication |
 
-## 6. Testing
+On Unix the primitive is `flock` on each dedicated file. On Windows it is `LockFileEx` over the same
+whole-file range. Separate files avoid byte-range/OFD portability, keep Rust on safe `std::fs::File`
+locking, keep Go pure (`syscall.Flock` / Windows syscall), and give Node one narrow native host
+operation to bind. Every core on a given OS MUST use these same primitives.
 
-Locking is **host-API surface + host-state introspection** — structurally out of the corpus's
-reach, so per-core unit tests are the right home (the CLAUDE.md §10 criteria):
+The bundle is opened once per database handle and held until `close`; open failures close every acquired
+file. A process-local registry rejects a second independent open of the same real path (`55006`) rather
+than relying on platform-specific same-process lock ownership. Local callers share sessions from one
+`Database`, which already supplies the intended in-process concurrency. A handle inherited across
+`fork` is invalid: every operation verifies the opener PID, closes the child's inherited descriptor
+copies, clears the inherited registry entry, and requires the child to reopen. Fork-without-exec code
+must not retain an inherited handle indefinitely; ordinary spawn/exec paths inherit no bundle
+descriptors (`CLOEXEC`).
 
-- second `open` of a held path fails `55006`; succeeds after `close` (both orders);
-  `flock`'s per-open-file-description semantics make this testable **within one process** on
-  every OS, no child-process harness needed.
-- `lock_timeout_ms`: contended open waits, acquires when the holder closes within the
-  timeout, fails `55006` past it.
-- `locking = none` bypasses acquisition (two handles open — caller's problem, documented).
-- read-only open is excluded by, and excludes, a writable holder.
-- file `attach` locks the attached file independently; `detach` releases it.
-- TS: stale side-car with a dead pid is recovered; a live pid's side-car is `55006`.
-- crash-release needs no test on Unix/Windows (kernel-owned); the TS side-car's stale path
-  is the test above.
+## 4. The uncontended lease
 
-A two-real-process stress lane (spawn, contend, assert `55006`) can join the bench-family
-harness later if wanted; it is not required for the contract.
+The “lease” is a performance state, not a time lease. It is backed continuously by `presence EX`; it
+cannot expire or be stolen. The periodic work only gives newcomers a bounded opportunity to join.
 
-## 7. Follow-on (recorded, NOT scheduled): shared mode with the lease refinement
+### 4.1 Join
 
-Everything below is a **design record** so the follow-on starts from decisions, not
-archaeology. None of it is committed work; the trigger would be a real workload needing
-co-resident writers (the case §1's wait-on-open pattern cannot serve).
+A shared opener, before reading the database:
 
-### 7.1 Requirements carried forward
+1. takes `arrival SH`;
+2. waits for `presence SH` (bounded by the open timeout);
+3. releases `arrival SH`;
+4. takes `commit SH`, reads and validates both meta slots, adopts the newest committed root, then
+   releases `commit SH`.
 
-Shared access must be **opt-in per handle**, must preserve the §3 single-writer semantics
-*globally* (writers in different processes queue; no merge/retry model), and must cost
-**effectively nothing when only one process is actually present** — the co-resident state is
-a rare, minutes-long window, not the steady state. Per-core asymmetry is acceptable
-(Go/Rust support it; TS/OPFS never will — a declared host capability, conformance-tier
-style).
+If an existing process holds `presence EX`, step 2 waits safely. Its held `arrival SH` is the
+crash-clean doorbell the lease holder observes. If the opener dies, the OS removes both locks.
 
-### 7.2 The protocol
+An **exclusive** opener also holds `arrival SH`, but it must not wait on `presence EX` while holding
+`transition`: that would prevent an alone shared holder from downgrading. Instead it loops: take
+`transition EX`, try `presence EX` once, release `transition` on conflict, and wait before retrying.
+Holding `transition` only for the nonblocking attempt prevents it from stealing the temporary
+presence-unlocked gap of another process's SH↔EX conversion. It releases `arrival` only after it owns
+`presence EX`. Exclusive mode then never runs the background join-window probe.
 
-Two logical locks (byte ranges, §7.4) plus the existing meta discipline:
+### 4.2 Alone → shared
 
-- **Presence** — held for the handle's lifetime: SH by every shared-mode handle.
-- **Write gate** — EX for the duration of each write transaction: the transactions.md §10
-  in-process `write_lock` extended across processes. Gate **before** snapshot: on acquiring
-  it the writer `pread`s the meta and adopts the newest committed root as its base, so
-  cross-process writes are sequentially consistent with no new transaction semantics.
-  Blocking bounded by a `lock_timeout` → **`55P03 lock_not_available`** (register with that
-  slice; v1 deliberately leaves it unregistered).
-- **Read/txn begin freshness** — no lock: `pread` both meta slots (~64 B), CRC-validate,
-  adopt the newest valid root. A torn read of the slot a writer is mid-writing fails its CRC
-  and falls back to the other slot — the newest *committed* state; this is exactly the
-  existing open-time slot arbitration (format.md *Opening*), reused per transaction.
-- **Commit** — while holding the gate, **atomically try-convert presence SH→EX**:
-  - **success ⇒ provably alone** (no other process has the file open): reuse free-list
-    pages, truncate, persist the free-list — full v1 behavior; downgrade after publish.
-  - **failure ⇒ co-resident**: commit **append-only** (allocate past the high-water only;
-    never reuse, never truncate). Any root any other process could have pinned stays intact,
-    so readers need no per-transaction registration at all — and page content becomes
-    immutable-once-written for the duration, which is what keeps every process's buffer
-    pool valid across foreign commits (only the root moves).
+An alone coordinator polls in the background. Foreground queries and commits do not poll. The
+no-arrival poll touches only the separate `arrival` OS lock; it does not take the local writer gate or
+reader registry. Polling backs off aggressively while no joiner appears (the target steady state is at
+most one probe per second; exact intervals are non-normative) and resets to a short interval after a
+join/leave transition. The resulting join delay is an intentional multi-process performance tradeoff.
 
-Orphans accumulated during a co-resident window are recovered by the next reconstruct-on-open
-(and better by §7.5). A process's *own* tracked frees stay reusable once it is alone again —
-a page dead in the committed root can never be resurrected by a serialized successor.
+1. It tries `arrival EX`. If that succeeds, no joiner is waiting; it releases it and remains alone.
+2. On conflict, it takes the **local transition barrier**: the existing local writer gate plus the
+   existing reader-pin registry lock. This prevents a local writer or transaction begin from
+   straddling the mode change; already-pinned readers continue normally.
+3. It takes `transition EX` and retries `arrival EX` (the original joiner may have timed out).
+4. If the retry succeeds, it releases the locks and remains alone.
+5. If it still conflicts, it marks the local coordinator `shared`, then changes
+   `presence EX → SH`, and releases `transition` and the local barrier. Waiting joiners acquire
+   `presence SH` and proceed.
 
-### 7.3 The lease refinement (the alone-case tax killer)
+The conversion need not be atomic. `transition EX` prevents another participant from making itself
+temporarily invisible during a competing conversion; the waiting joiner's `arrival SH` keeps the
+holder from concluding that nobody is waiting. A read that pinned the local root before the barrier
+remains safe because every later co-resident commit is append-only; a begin after it sees `shared` and
+refreshes meta. The writer half of the barrier prevents two fast-path writers from straddling the
+downgrade. Because pinning and the mode check share the already-existing registry lock, the alone path
+adds no new foreground synchronization primitive.
 
-The base protocol costs an alone shared-mode process ~1 µs of meta `pread` per transaction
-begin. The lease removes it: when alone, **keep holding presence-EX between commits**, and
-toggle EX→SH→EX on a short period (~10–50 ms; two fcntls, amortized nothing). While EX is
-held, foreign commits are impossible, so readers **skip the freshness pread entirely** —
-behavior and cost identical to exclusive mode. The toggle is the entry window: a newcomer's
-SH acquisition lands inside it (bounded open latency, tens of ms — irrelevant for a deploy),
-and the holder's failed re-upgrade *is* the arrival signal, degrading it to §7.2 co-resident
-behavior. Conversion atomicity (§7.4) makes the failed re-upgrade safe: the holder keeps SH;
-correctness never depends on winning the race.
+### 4.3 Shared → alone
 
-### 7.4 Lock primitives, and why v1 reserved the state space
+Shared coordinators periodically try to regain the fast path:
 
-Three findings from the design analysis, recorded so they are not re-derived:
+1. take the local transition barrier (writer gate + reader-pin registry lock);
+2. take `transition EX`;
+3. try `arrival EX`; if it conflicts, stop and remain shared;
+4. while holding `arrival EX`, release this process's `presence SH` and try `presence EX`;
+5. on conflict, reacquire `presence SH` before releasing the other locks;
+6. on success, refresh the newest meta/root under `commit SH`, reconcile pager high-water and
+   invalidate persistent plan caches if `txid` advanced, then mark the coordinator `alone` and release
+   the local barrier.
 
-- **`flock` cannot carry the shared protocol.** Its lock conversions are documented
-  non-atomic (drop-then-reacquire — fatal for the lease's downgrade/upgrade), it is
-  whole-file (no second range for the write gate), and one lock per open file description.
-  The follow-on needs **OFD `fcntl` range locks** on Unix (`F_OFD_SETLK` — atomic
-  conversion, per-OFD ownership, immune to the classic close-any-fd-drops-locks hazard;
-  Linux ≥ 3.15, macOS too) and **`LockFileEx` ranges** on Windows, at **sentinel offsets
-  past any real page** (the SQLite locking-page trick — Windows range locks are mandatory
-  and must not sit on bytes readers actually `pread`).
-- **Layering against v1 binaries.** `flock` and `fcntl` locks do not interact, so a
-  shared-mode process must *also* hold the v1-layer lock to be visible to old binaries:
-  it takes **`flock LOCK_SH`** for its lifetime (never converted — presence/lease/gate all
-  live on the fcntl ranges). Because **v1 is exclusive-only and never takes `LOCK_SH`**
-  (§2.1), SH on the v1 layer unambiguously means "shared-protocol participant": an old
-  exclusive binary's `LOCK_EX` and any shared cohort mutually exclude, in both directions.
-  On Windows the same falls out of share modes: v1's share-mode-0 conflicts symmetrically
-  with the shared cohort's `read|write` sharing. This is the forward-compatibility §2.1
-  bought by keeping v1 EX-only.
-- **Dependencies (§14 — explicit confirmation required before building).** Rust std has no
-  `fcntl`: the shared slice needs a small edge dependency (`rustix` or `libc`) in the host
-  layer — clause-1 territory, but it is a named proposal awaiting a yes, not a default. Go
-  can stay dependency-free (`syscall.FcntlFlock` + hardcoded per-OS `F_OFD_*` constants,
-  or `x/sys` — also a §14 call).
+Holding `arrival EX` prevents an entrant from becoming invisible between the SH release and EX
+acquire. `transition EX` prevents two existing participants from dropping their SH locks at once. A
+successful `presence EX` is therefore a real proof that no foreign process has a pinned snapshot.
 
-### 7.5 Synergies to bundle
+## 5. Transactions while shared
 
-- **On-disk free-list persistence** (the P6.2 follow-on; meta offset 28 is reserved for it)
-  should land **with or before** shared mode: it fixes the known O(file-size) open — which
-  bites hardest exactly when a process opens mid-deploy — and, because writers serialize on
-  the gate, each commit can extend its predecessor's persisted list, so pages freed by a
-  departed process's commits are *known* (not leaked until reopen) to the survivor. No
-  per-page txid tags needed: a listed page is dead w.r.t. the committed root; *reuse* is
-  separately gated on aloneness + the in-process watermark.
-- **A `catalog_gen` meta field** (bump on DDL), so a foreign commit that touched no schema
-  doesn't force a catalog reload / plan-cache flush (the prepared-statement cache's `catGen`
-  invalidation extends across processes). Bundle both meta additions into **one**
-  `format_version` bump.
-- **Reclamation/compaction gating generalizes cleanly**: every "structural" file operation
-  (free-page reuse, truncation, compaction, free-list persist) becomes a privilege of the
-  **proven-alone** state — one rule covering v1 (trivially alone) and shared mode (§7.2's
-  try-convert). The watermark stays the in-process half of the same predicate.
+### 5.1 Read begin
 
-### 7.6 Explicitly deferred doors (beyond even the follow-on)
+An alone process pins its current in-process committed snapshot exactly as today. A shared process:
 
-- **LMDB-style reader table** (per-snapshot txid pins in a shared side-car, so a writer can
-  reclaim *while* co-resident with readers): strictly more precise, real machinery (slot
-  allocation, dead-pid sweeping, shared mmap — TS excluded), only worth it if long-lived
-  many-process operation becomes a real workload. The sentinel-range space reserves room.
-- **mmap of the meta page** as a freshness fast-path: saves only the ~1 µs pread the lease
-  already eliminates; costs a Rust `unsafe`/dependency question (§13/§14), has no TS/OPFS
-  analog, and punches through the `BlockStore` seam. Recorded as rejected-for-now with the
-  reasoning, so it is not re-proposed cold.
+1. takes `commit SH`;
+2. positioned-reads both meta slots directly (never through the buffer pool), validates CRCs, and picks
+   the highest valid `txid`;
+3. if `txid` advanced, reloads the catalog/interior skeleton, updates pager `page_count`, and
+   invalidates persistent plans for that database;
+4. pins that snapshot in the existing in-process reader registry;
+5. releases `commit SH`.
+
+The query then runs lock-free over the pin. `commit SH` protects only the meta adoption, not the query.
+Since co-resident writers never overwrite body pages, the referenced pages remain immutable.
+
+### 5.2 Write begin and rollback
+
+An alone write uses only the existing local writer gate. A shared write holds `writer EX` for the whole
+transaction. After acquiring it, and before making the working snapshot, it performs the same
+`commit SH` meta refresh as a read begin. This produces one global serialization order for writers with
+no merge/retry semantics. Rollback discards staging and releases `writer EX`.
+
+Writer-gate waiting uses the session `lock_timeout_ms` (default `0` = wait without a deadline) and
+fails `55P03 lock_not_available` on expiry. Waiting is host work and uses a monotonic clock; it is not
+part of deterministic SQL cost.
+
+### 5.3 Append-only shared commit
+
+While `presence` is SH, a writer must use the deliberately conservative path:
+
+- allocate every dirty tree/catalog/overflow/index page at or beyond the latest committed
+  `page_count`; never consume `free_pages`;
+- do not rebuild or rewrite the v25 free-list chain;
+- publish the new meta with `free_list_head = 0`; old free-list and orphan pages remain available to
+  the fallback meta or become reclaimable when a process is later proven alone;
+- never truncate or replace the file.
+
+The writer may write and sync its appended body pages without `commit EX`. For the short publish
+window it takes `commit EX`, writes and syncs the alternate meta slot, publishes the same snapshot to
+its local core, then releases `commit EX` and `writer EX`. A begin that won `commit SH` first adopts the
+old meta; one that wins afterward adopts the new meta. This preserves the existing “readers block only
+during commit” model across processes.
+
+An I/O error after meta write has an indeterminate commit outcome, as with any durable database. The
+handle becomes poisoned and retains its gates until close; recovery on the next open chooses the
+highest CRC-valid meta. It must never continue writing from an assumed prior root.
+
+## 6. Reclamation, compaction, and buffers
+
+- **Free-page reuse and free-list persistence** require `presence EX` plus the existing local
+  watermark. After a co-resident interval, the first alone commit reconstructs/replans the free list
+  from the current committed root and lets the watermark defer reuse of pages reachable by local old
+  pins. Shared-mode file growth is intentional; aloneness recovers it.
+- **Buffer pools remain valid while shared** because foreign processes append body pages. Meta is read
+  directly. When an alone writer later reuses a page, the ordinary commit invalidation removes any
+  stale local decode of that page before the new root is published.
+- **Whole-file compaction** requires `presence EX`, the local watermark drained, and the local writer
+  gate. The stable lock bundle remains locked while the database file handle is closed, a fresh image
+  is atomically renamed into place, and the pager reopens the replacement. A new process cannot join
+  through the rename because `presence EX` lives on the unchanged bundle.
+- **Trailing truncation** has the same aloneness rule. Shared commits never lower `page_count`.
+- **Attachments** coordinate independently per file. The existing one-durable-writer-per-transaction
+  rule remains until the super-journal slice; acquiring several file writer gates is not introduced by
+  this protocol.
+
+## 7. Host/API surface
+
+### 7.1 Options
+
+File `create`, `open`, and `AttachSource::file` carry:
+
+- `locking`: `auto` (default) | `shared` | `exclusive` | `none`;
+- `file_lock_timeout_ms`: nonnegative integer, default **5000**; `0` fails immediately. It bounds join
+  and exclusive-open acquisition only. Implementations poll nonblocking OS acquisition with a
+  monotonic deadline so cancellation/timeout behavior is uniform.
+
+The session setting `lock_timeout_ms` separately bounds the shared writer gate; `0` means no deadline,
+matching PostgreSQL's `lock_timeout` default. These names deliberately distinguish open/join liveness
+from transaction lock waiting.
+
+`AttachSource::file(path, options)` owns attachment options; the boolean attachment mode still decides
+read-only vs read-write. `create` stores only applicable file-lock options from `CreateOptions`; an
+in-memory create ignores them.
+
+### 7.2 Errors
+
+- open/join or exclusive acquisition deadline: `55006 object_in_use`, with the real path in detail;
+- writer-gate deadline: `55P03 lock_not_available` (registered with this slice);
+- requested protocol unavailable on the host: `0A000 feature_not_supported`;
+- unknown coordination protocol marker: `0A000` with supported-version detail;
+- unsupported OS/filesystem lock operation (`ENOSYS`/`EOPNOTSUPP` equivalent): `0A000`;
+- other lock/bundle I/O failure: `58030 io_error`;
+- hard-linked database in a coordinated mode: `55006` with remediation detail.
+
+All acquired locks and descriptors are released on every failed open path. Timeout measurement and
+background lease polling are unmetered host work and never enter SQL cost.
+
+### 7.3 Host capability matrix
+
+| host | `auto` | mechanism / status |
+|---|---|---|
+| Rust local file, Unix | shared | five `std::fs::File` whole-file locks (`flock`); no dependency |
+| Go local file, Unix | shared | five `syscall.Flock` locks; pure Go, no dependency |
+| Rust/Go local file, Windows | shared | `LockFileEx` whole-file locks; Rust std / pure Go syscall |
+| Node file | shared when native lock host is installed | the exact Unix `flock` / Windows `LockFileEx` bundle; §8 |
+| Browser/OPFS | exclusive | the sync access handle is inherently exclusive; explicit `shared` is `0A000` |
+| wasm32-wasip1 | unavailable | `auto`/`shared`/`exclusive` fail `0A000`; only explicit `none` proceeds |
+| Ruby gem | shared | inherits the Rust host |
+| in-memory | n/a | process-private; no coordination bundle |
+
+## 8. TypeScript / Node decision gate
+
+Node v26 still exposes no standard `flock`/`LockFileEx` API. A PID sidecar, `mkdir`+mtime lease, or
+automatic “stale” deletion cannot meet §2: PID reuse/namespaces and stop-the-world/event-loop pauses can
+let an old owner resume after another process has stolen its lease. Adding fencing would require an
+atomic compare-and-swap primitive the filesystem API does not provide. Those approaches are rejected.
+
+Therefore a corruption-safe Node shared host requires a **narrow native OS-lock adapter** over an
+already-open coordination file. Its complete primitive surface is nonblocking `try_lock_shared`,
+nonblocking `try_lock_exclusive`, and `unlock`, plus stable busy/unsupported/I/O error classification.
+Timeout and cancellation loops stay in the language host, so no native call can become an
+uncancellable wait. The adapter performs no database I/O and cannot affect values, costs, or bytes.
+
+The preferred direction is a **first-party minimal Rust Node-API addon** whose source lives with jed,
+owns only coordination-file handles, and delegates locking to safe `std::fs::File` methods. It is a
+host adapter, not a wrapper around the Rust database core; SQL/storage behavior remains independently
+implemented in TypeScript. Stable Node-API plus reproducible prebuilt artifacts preserve the package's
+no-consumer-build-step goal.
+
+The dependency candidate, audited on 2026-07-16 but **not approved or added**, is
+`napi = 3.10.5`, `napi-derive = 3.5.10`, and build-only `napi-build = 2.3.2`, all exact-pinned with the
+transitive lockfile committed. No npm build CLI is needed; Rake drives the ordinary Cargo builds. The
+proposed initial artifact matrix is Linux glibc x64/arm64, Linux musl x64/arm64, macOS x64/arm64, and
+Windows x64, built against stable Node-API 8. Artifacts ship inside the package with a SHA-256 manifest
+and provenance; installation runs no script and downloads nothing. A platform without a matching
+artifact fails closed. `fs-ext-extra-prebuilt@2.2.9` was also evaluated and is not recommended: it uses
+NAN rather than stable Node-API, runs an install script, ships a much broader filesystem surface, and
+has a narrow maintainer base.
+
+The Node file host loads the addon conditionally; browser/OPFS bundles never import it. The alone probe
+uses an unreferenced timer so an idle database does not keep the process alive. Because jed's current
+Node embedding API is synchronous, a contended open or writer wait blocks the calling thread (and hence
+the event loop if called there) while the host repeats nonblocking attempts with a monotonic deadline.
+That does not weaken safety, but it is a real ergonomics cost: applications that permit long
+cross-process write transactions should run jed in a worker thread or choose finite timeouts. An async
+embedding surface is a separate API slice, not hidden inside the lock protocol.
+
+This is an explicit architecture/dependency gate: CLAUDE.md §14 currently forbids dependencies that
+introduce FFI/unsafe code. Before the Node slice, a human must approve both (a) a bounded exception for
+this host-only Node-API adapter and (b) the exact versions and artifact matrix above. If that exception
+is rejected, Node `shared` fails closed with `0A000`; it does not silently weaken the protocol. OPFS
+remains inherently exclusive and does not need the adapter.
+
+## 9. Verification contract
+
+This surface is host state, so focused per-core tests are necessary, but a real-process suite is
+**required**, not optional.
+
+### 9.1 Deterministic protocol tests
+
+- modeled state-machine tests for join, downgrade, upgrade, reader begin, writer handoff, timeouts, and
+  every acquisition failure cleanup;
+- legacy first-rollout and unknown-marker tests prove the implementation fails closed rather than
+  claiming coordination with a nonparticipant;
+- a joining process holds `arrival` while blocked and cannot be starved by an alone lease;
+- two transition attempts cannot both become presence-EX;
+- meta refresh invalidates plans only after a foreign `txid` and adopts the correct page high-water;
+- shared commits allocate append-only and write `free_list_head = 0`; later alone reclamation recovers
+  the orphans without touching a pinned local snapshot;
+- hard links fail and symlink aliases share one coordinator identity.
+
+### 9.2 Cross-process/interoperability tests
+
+- Rust↔Go, Rust↔Node, and Go↔Node join/read/write handoff over one file on every supported OS lane;
+- concurrent readers plus serialized writers produce a confluent final checksum;
+- kill a participant at each join/write/body-sync/meta-publish phase; surviving processes either
+  continue from the old meta or recover the new valid meta, never corrupt;
+- process death releases presence/writer/commit locks without stale recovery;
+- compaction replacement while alone retains exclusion through the stable bundle;
+- real timeout and cancellation paths use the documented SQLSTATEs.
+
+### 9.3 Fast-path performance gate
+
+The resident single-process benchmarks run before/after. Once presence-EX is acquired, instrumentation
+must show **zero foreground coordination syscalls and zero per-transaction meta preads**. Point lookup,
+short read transaction, and durable commit throughput must remain within the repository's normal noise
+threshold; a regression blocks the slice. Background lease-probe CPU/syscall rate is reported
+separately and bounded by the polling interval.
+
+## 10. Implementation slices
+
+1. **Coordinator foundation (all native cores):** lock bundle, canonical identity/hard-link rejection,
+   modes/options/errors, join/close, local duplicate-open guard, and the lease state machine. Node uses
+   a test fake until §8's decision is approved; its real `shared` path fails closed.
+2. **Shared reads and global writer:** commit gate, direct meta freshness, full snapshot/plan invalidation,
+   writer gate + `55P03`, and concurrency tests.
+3. **Append-only shared commit:** no-reuse allocator mode, zero free-list head, publish gate, crash/fault
+   matrix, and alone recovery/reclamation.
+4. **Node OS-lock host:** only after the explicit §8 approval; add Rust↔Go↔Node real-process lanes.
+5. **Compaction integration and public docs:** stable-bundle handoff for the later compaction slice;
+   update website examples/status when shared locking becomes user-visible.
+
+The shared feature is not “landed” until slices 1–4 are green together. Rust/Go-only shared behavior is
+an intermediate branch state, not a released cross-core capability.

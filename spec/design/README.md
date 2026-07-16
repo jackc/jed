@@ -51,10 +51,9 @@ Each doc explains *why* a decision was made and points at the **data** that enco
 - [hosts.md](hosts.md) — the formal storage-host (`BlockStore`) interface: the five-method
   byte device every host implements, the host catalog (in-memory / file / OPFS), and where
   the encryption codec and replication tee sit relative to the seam (CLAUDE.md §9).
-- [locking.md](locking.md) — file locking & multi-process access: the exclusive-by-default
-  whole-file lock at `open`/`create`/`attach` (`55006`, `lock_timeout_ms`, the per-host
-  mechanism table — the decided immediate implementation), and the recorded shared-mode +
-  lease-refinement follow-on (CLAUDE.md §9).
+- [locking.md](locking.md) — shared multi-process file coordination: the stable five-lock bundle,
+  global writer + short commit gate, append-only co-resident commits, and the OS-backed presence-EX
+  lease that preserves the one-process foreground fast path (CLAUDE.md §9).
 - [replication.md](replication.md) — replication by block-shipping the per-commit page-delta
   (no WAL — copy-on-write already gives atomicity + concurrency): the change record, the
   replica apply recipe, keyless replicas, PITR at commit granularity, and the write-amplification

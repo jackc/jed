@@ -196,13 +196,12 @@ out-of-range header is `XX001 data_corrupted`. These are raised in the **host pr
 that the layer maps. The class is a stable category (api.md §7).
 
 **File locking is a host-layer duty, not a `BlockStore` method ([locking.md](locking.md)).**
-The default-exclusive whole-file lock (locking.md §2) is acquired by the host program layer's
-file open — before the first content read — like the class-58 errors above; the five-method
-byte seam stays lock-unaware. Each host declares a **locking tier** (locking.md §4, normative
-per OS so cores mutually exclude): `os` (Rust/Go — `flock` on Unix, share-mode-0 on Windows),
-`cooperative` (TS — the `<path>.lock` side-car, best-effort), `inherent` (OPFS —
-`createSyncAccessHandle` *is* the lock), `unavailable` (wasm32-wasip1 — default-exclusive
-opens fail closed, `0A000`).
+The host program layer joins the stable `<path>.lock/` coordination bundle **before the first content
+read**; the five-method byte seam remains lock-unaware. Each host declares a tier: `os-shared`
+(Rust/Go local files — whole-file `flock` on Unix, `LockFileEx` on Windows), `native-adapter-shared`
+(Node, only with the explicitly approved adapter), `inherent-exclusive` (OPFS sync access handle), or
+`unavailable` (wasm32-wasip1). Unsupported requested coordination fails closed `0A000`; there is no
+cooperative PID/mtime fallback. See locking.md §3/§7 for the normative five-lock protocol.
 
 ## 5. The OPFS host (the build target)
 
@@ -326,10 +325,10 @@ as it crosses. See the two docs for the full designs.
     OPFS-backed `SpillSink` is the path); read-only multi-handle via `createSyncAccessHandle({ mode })`
     (not portable yet); and running the real-browser e2e in CI (needs a headless-Chromium binary, today
     outside `rake ci`).
-- **File locking** — ⏳ **decided, spec'd ([locking.md](locking.md)), not built**: the
-  default-exclusive whole-file lock (§4 above) as the immediate implementation; shared
-  multi-process access with the lease refinement is the recorded follow-on (locking.md §7 —
-  OFD `fcntl`/`LockFileEx` sentinel ranges, a Rust edge dependency needing §14 confirmation).
+- **Shared multi-process file coordination** — ⏳ **decided, spec'd
+  ([locking.md](locking.md)), not built**: the five-file OS-lock bundle, append-only contended commit,
+  and presence-EX uncontended lease are the first locking slice. Rust/Go need no dependency. Node's
+  narrow native OS-lock adapter is an explicit §14/FFI decision gate; no package is approved yet.
 - **Encryption codec** — ⏳ design door ([encryption.md](encryption.md)); not built. Crypto is a
   §14 vetted-library decision requiring explicit confirmation before any dependency lands.
 - **Replication tee** — ⏳ design door ([replication.md](replication.md)); block-shipping decided,

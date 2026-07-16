@@ -45,20 +45,22 @@ multi-threaded run consistent with the order must also produce. True CPU paralle
 *separate*, non-deterministic concern handled by a stress layer that checks invariants rather
 than exact transcripts.
 
-## 3. Three layers
+## 3. Four layers
 
 | Layer | Tests | Deterministic? | In `rake ci`? | Single-thread core (TS) |
 |---|---|---|---|---|
 | **1. Schedule** | snapshot isolation, cross-handle visibility, the watermark | yes — explicit total order | yes (conformance) | runs identically (sequential) |
 | **2. Await** | write-gate blocking | yes — equivalent serial order | yes | modeled (no real block) |
 | **3. Stress** | races, commit atomicity, reclamation-under-load | no — random schedule | no (bench-family) | seeded sequential interleave, or skip |
+| **4. Process** | shared-file OS protocol, cross-core interoperability, crash release | barrier-directed; timing outcomes bounded | yes once `file.shared_process` lands | Node participates through the native adapter |
 
 Layers 1–2 join the differential contract. Layer 3 belongs to the benchmarks family
 ([benchmarks.md](benchmarks.md)): nondeterministic schedule, deterministic *checked answer*.
-**All three layers have landed.** Layers 1–2 run on all three cores (stepped-sequential everywhere;
+**The first three layers have landed.** Layers 1–2 run on all three cores (stepped-sequential everywhere;
 the stepped-threaded mode on Go and Rust). **Layer 3** (§6) lands as `stress/*.stress.toml` + `rake
 stress`, **outside `rake ci`** (bench-family), with real-threads workers on Go (under the race
-detector) and Rust and a seeded-sequential interleaver on TS.
+detector) and Rust and a seeded-sequential interleaver on TS. **Layer 4** (§10) is the required,
+not-yet-built real-process contract for [locking.md](locking.md).
 
 ## 4. Layer 1 — the deterministic schedule format
 
@@ -344,6 +346,9 @@ the "spec is the contract" net, Layer 3 inside the "checked-answer benchmarks" n
   Validated by `rake verify`; **in `rake ci`** for any core declaring them.
 - `stress/*.stress.toml` + a `rake stress` task — Layer 3; **outside `rake ci`**, registered
   alongside the determinism ledger as timing-nondeterministic (like `bench/`).
+- `spec/conformance/process/*.process.toml` + `rake concurrency:process` — Layer 4; one shared
+  language-neutral scenario is driven against same-core and Rust↔Go↔Node actor combinations. It enters
+  `rake ci` when `file.shared_process` lands; Windows/macOS run the same corpus in their platform lanes.
 
 ### Capabilities (Layers 1–2)
 
@@ -383,3 +388,32 @@ the "spec is the contract" net, Layer 3 inside the "checked-answer benchmarks" n
   `stress/balance_transfer.stress.toml` (the balance-transfer sum invariant + confluent final
   state). Most valuable once file-backed sharing is wired (§6), but already exercises commit
   atomicity, snapshot isolation under contention, and the watermark over the real concurrent paths.
+- **Layer 4 — designed by locking.md, not built.** It is release-blocking for shared file access and
+  owns the `file.shared_process` capability. The feature is not represented by three mirrored unit
+  suites: the one process corpus below drives every supported core pairing over the same file.
+
+## 10. Layer 4 — real-process shared-file protocol (planned)
+
+Layer 4 exists because Layers 1–3 cannot exercise kernel lock lifetime, process death, or two native
+cores interpreting one bundle. A `.process.toml` scenario declares named actors (`rust`, `go`, or
+`node`), one temporary database path, and an explicit sequence of commands and barriers. Each core
+supplies a small test-only actor binary that accepts create/open/begin/query/commit/rollback/close and
+named fault-hook commands over stdin and returns framed results over stdout. The shared Ruby driver
+owns scheduling, deadlines, process kill, and transcript comparison.
+
+The corpus, not per-core copies, covers:
+
+- first-rollout/unknown-marker failure, join, alone→shared→alone transitions, and open/writer timeout;
+- Rust↔Go, Rust↔Node, Go↔Node, and same-core reader/writer handoff;
+- a reader pinned before a foreign commit, append-only page allocation, meta refresh, and plan
+  invalidation after foreign `txid`;
+- kill after every lock acquisition, body sync, and meta-publication hook; the survivor must select a
+  valid old/new meta and the kernel must release every dead actor's locks;
+- compaction lock continuity, symlink identity, hard-link rejection, and bundle-entry replacement
+  failure; and
+- a confluent multi-writer checksum plus a file-format verifier pass after every crash scenario.
+
+Timing is never an expected value. The driver uses barriers to establish happens-before facts and only
+asserts “still blocked before release,” “completed before the documented deadline,” or the specified
+SQLSTATE. No sleep establishes correctness. Platform lanes may use generous outer watchdogs, but the
+protocol's own timeout uses each core's monotonic clock.

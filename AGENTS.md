@@ -111,6 +111,16 @@ files in the same change.
 - Key encoding must preserve logical order in raw byte order.
 - Do not assume on-disk page bytes are plaintext-comparable; leave room for the
   encryption-at-rest design.
+- Shared multi-process file access is the decided first locking slice, not an
+  exclusive-only precursor. Coordinate through the stable `<path>.lock/` OS-lock
+  bundle in `spec/design/locking.md`: one global writer, meta freshness at
+  transaction begin, append-only commits while co-resident, and reuse/compaction
+  only when presence-exclusive proves aloneness. The one-process foreground path
+  must retain zero coordination syscalls and zero per-transaction meta reads.
+- Never use PID files, mtime leases, or automatic stale-lock stealing for database
+  safety. A host without the required crash-clean OS lock fails closed.
+- Treat the lock-bundle protocol version as a compatibility boundary. Pre-protocol
+  binaries cannot overlap safely and must be drained once during first rollout.
 - Replication, where relevant, is block-delta shipping at the block seam, not a
   WAL.
 - The deterministic hash JOIN is currently in-memory; grace-hash partitioning is

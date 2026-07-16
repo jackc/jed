@@ -417,8 +417,12 @@ a temp image before every record to exercise the on-disk read path, where the fs
   not observe the pointer change (CLAUDE.md §3's "readers block only during commit" is the
   conservative statement; the immutable-snapshot model does better). A read-write transaction
   takes the **exclusive write lock** at `begin`/`BEGIN` and holds it until commit/rollback, so
-  at most one writer exists at a time (§3). Concurrency between cores' hosts is the host's
-  problem (CLAUDE.md §3), now mediated by snapshots + this one lock.
+  at most one writer exists at a time (§3). Within one `Database`, snapshots + this local gate are the
+  mechanism. For separate processes over one file, [locking.md](locking.md) extends the same rule with
+  a global OS-backed writer gate: a presence-EX process keeps this exact fast path, while co-resident
+  writers acquire the cross-process gate before refreshing their base snapshot. Cross-process readers
+  take only the short commit gate while adopting meta, then run lock-free over immutable appended
+  pages.
 
 - **`Database` is the shared core; a `Session` is the per-caller handle** (the converged shape,
   [session.md §2.4](session.md) — was a separate `SharedDb` minting `ReadHandle`/`WriteHandle`).
