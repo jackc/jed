@@ -85,12 +85,15 @@ export class TableStore {
     this.paging = paging;
   }
 
-  // clone returns an independent O(1) snapshot of the store: the PMap clone shares structure
-  // (nodes are immutable), so mutating one store leaves the clone untouched. The foundation of
-  // the transaction model (spec/design/transactions.md §2). The shared paging context is shared, not
-  // copied (one pool per database).
+  // clone returns an independent O(1) snapshot of the store. PMap.clone shares the root while
+  // invalidating its private mutation generation, so a later INSERT path-copies before it can reuse
+  // a dirty suffix (transactions.md §3). The shared paging context is shared, not copied.
   clone(): TableStore {
     return new TableStore(this.cap, this.colTypes, this.rows.clone(), this.nextRowid, this.paging);
+  }
+
+  freezeMutationGeneration(): void {
+    this.rows.freezeMutationGeneration();
   }
 
   // attachPaging attaches this database's shared paging context (the demand-paged file load,

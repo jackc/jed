@@ -502,6 +502,39 @@ value batteries, incremental persistence/reclamation tests, and exact split-shap
 Because table and ordered secondary-index stores share `PMap`, the same path covers both trees; delete
 and rebalance deliberately remain path-copy.
 
+**INSERT performance slice-4 result (2026-07-16).** Commit `7f66dd58` is the Slice-3 / Go+TS
+path-copy control. Slice 4 stamps Go and TypeScript INSERT-built dirty nodes with an opaque private
+mutation-generation token. Snapshot/store clone, pull-cursor creation, mutable working-snapshot
+cursor capture, and publication invalidate the token; only an active-token match plus `page == 0`
+permits in-place leaf/interior edits. The first write after an alias path-copies as before, while later
+writes reuse that new dirty suffix. Delete/rebalance remains path-copy. Five CPU-2-pinned control and
+current processes retained checksum `ac02f0205c4f05c5`:
+
+| Core | Path-copy median process mean | Transient median process mean | Change |
+|---|---:|---:|---:|
+| Go / auto (shared) | 11.661 ms | 3.821 ms | -67.2% |
+| TypeScript / auto (shared) | 16.182 ms | 14.983 ms | -7.4% |
+
+TypeScript's elapsed samples remain GC-bimodal, so its allocation trace is the stronger attribution.
+One complete 3-warmup + 30-measured V8 trace reduced between-GC allocated bytes from 1,949,253,680
+to 909,015,976 (-53.4%), total GC events from 48 to 31, and scavenges from 46 to 29. Three Go
+`runtime.MemStats` probes, forced to a collected heap after warmup and bounded around the 30 measured
+transactions, produced these medians:
+
+| Go probe / complete measured lane | Path-copy | Transient | Change |
+|---|---:|---:|---:|
+| allocated bytes | 1,332,089,704 | 139,878,568 | -89.5% |
+| mallocs | 2,045,434 | 1,456,979 | -28.8% |
+| GC cycles | 568 | 45 | -92.1% |
+| GC pause | 2.571 ms | 0.221 ms | -91.4% |
+
+Three paired control processes stayed within the 5% gate with identical checksums: Go hot prepared
+PK lookup +1.82%, full-scan aggregate/filter +0.08%, and durable one-row commit -0.21%; TypeScript
+respectively -1.90%, -0.89%, and +1.27%. Focused tests compare root-to-leaf object identity across
+unaliased reuse, clone and cursor invalidation, and the clean-page guard. Existing rollback,
+writable-CTE, attachment, commit, and write-transaction-cursor guards exercise the corresponding
+snapshot-generation boundaries. The transient is therefore retained in both cores.
+
 ## 1. Purpose and non-goals
 
 The benchmark suite answers two questions, continuously:

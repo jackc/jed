@@ -3,10 +3,10 @@
 // per-table data B+tree").
 //
 // Keyed by the encoded key bytes (compared lexicographically = memcmp = the order-preserving
-// key encoding's contract, spec/design/encoding.md). Every mutation returns a new map that shares
-// structure with the old one; nodes are immutable by convention, so `clone()` (which shares the
-// root) is an O(1) independent snapshot. That cheap, structurally-shared snapshot carries the §3
-// staging-buffer / transaction model (transactions.md §2).
+// key encoding's contract, spec/design/encoding.md). Every mutation preserves prior roots by
+// path-copying shared/published nodes. `clone()` is the explicit O(1) alias boundary; it invalidates
+// the private mutation-generation token that lets later INSERTs reuse an unaliased dirty suffix
+// (transactions.md §3).
 //
 // This IS the on-disk B+tree, node-for-page (v24). Records live ONLY in leaves; an interior node
 // is a record-free routing skeleton — separator keys + child pointers. A separator is a COPY of a
@@ -21,6 +21,17 @@
 
 import type { Row } from "./storage.ts";
 import type { Value } from "./value.ts";
+
+// TypeScript has no object-uniqueness query, so a private object identity is the ownership proof for
+// dirty INSERT transients (transactions.md §3). The module-private symbol makes the node stamp
+// unforgeable outside this module and keeps it out of structuredClone/serialization. It is runtime
+// state only: never rendered, hashed, persisted, or metered.
+type MutationGeneration = { active: boolean };
+const mutationOwner: unique symbol = Symbol("jed.pmap.mutationOwner");
+
+function newMutationGeneration(): MutationGeneration {
+  return { active: true };
+}
 
 // PackedLeaf is the block-backed resident form of a demand-paged clean leaf (packed-leaf.md §5): the
 // page block + the parsed PAX directories, reconstructing rows on demand instead of storing a decoded
@@ -64,6 +75,7 @@ export type PNode = {
   // serialized.
   packed?: PackedLeaf;
   page: number;
+  [mutationOwner]?: MutationGeneration;
 };
 
 // rowAt reconstructs value row i — the value-read seam (packed-leaf.md §4), on a LEAF. A Decoded
@@ -316,12 +328,21 @@ function childSlot(n: PNode, key: Uint8Array): number {
 
 // newLeaf / newInterior build a fresh DIRTY node (page 0) — every copy-on-write rebuild goes
 // through here. An interior node carries no records (empty vals/weights, v24).
-function newLeaf(keys: Uint8Array[], vals: Row[], weights: number[]): PNode {
-  return { keys, vals, weights, children: [], page: 0 };
+function newLeaf(
+  keys: Uint8Array[],
+  vals: Row[],
+  weights: number[],
+  owner?: MutationGeneration,
+): PNode {
+  return { keys, vals, weights, children: [], page: 0, [mutationOwner]: owner };
 }
 
-function newInterior(keys: Uint8Array[], children: Child[]): PNode {
-  return { keys, vals: [], weights: [], children, page: 0 };
+function newInterior(
+  keys: Uint8Array[],
+  children: Child[],
+  owner?: MutationGeneration,
+): PNode {
+  return { keys, vals: [], weights: [], children, page: 0, [mutationOwner]: owner };
 }
 
 // PMap is a persistent ordered map from encoded key to Row. `clone()` is an O(1) independent
@@ -334,14 +355,28 @@ function newInterior(keys: Uint8Array[], children: Child[]): PNode {
 export class PMap {
   private root: PNode | null;
   private rowCount: bigint | null;
+  private generation: MutationGeneration;
 
   constructor(root: PNode | null = null, rowCount: bigint | null = 0n) {
     this.root = root;
     this.rowCount = rowCount;
+    this.generation = newMutationGeneration();
   }
 
   clone(): PMap {
+    this.freezeMutationGeneration();
     return new PMap(this.root, this.rowCount);
+  }
+
+  // Invalidate every node stamped by this generation without walking the tree. A later INSERT
+  // obtains a fresh token and path-copies the first touched suffix; repeated invalidation is safe.
+  freezeMutationGeneration(): void {
+    this.generation.active = false;
+  }
+
+  private currentMutationGeneration(): MutationGeneration {
+    if (!this.generation.active) this.generation = newMutationGeneration();
+    return this.generation;
   }
 
   // getCount returns the exact nonnegative row count, or null for an index skeleton whose count is
@@ -399,17 +434,18 @@ export class PMap {
     shape: LeafShape,
     src: LeafSource | null,
   ): Row | undefined {
+    const generation = this.currentMutationGeneration();
     if (this.root === null) {
-      this.root = newLeaf([key], [val], [weight]);
+      this.root = newLeaf([key], [val], [weight], generation);
       if (this.rowCount !== null) this.rowCount += 1n;
       return undefined;
     }
     const ctx: InsCtx = { old: undefined, replaced: false };
-    const out = nodeInsert(this.root, key, val, weight, ctx, src, cap, shape);
+    const out = nodeInsert(this.root, key, val, weight, ctx, generation, src, cap, shape);
     this.root =
       out.whole !== null
         ? out.whole
-        : newInterior([out.sep], [residentRef(out.left), residentRef(out.right)]);
+        : newInterior([out.sep], [residentRef(out.left), residentRef(out.right)], generation);
     if (!ctx.replaced && this.rowCount !== null) this.rowCount += 1n;
     return ctx.old;
   }
@@ -699,20 +735,23 @@ export class PMap {
   // circuit, cost.md §3). It yields the stored row reference (like scanRange's callback); the GC keeps
   // a faulted leaf's row alive as long as a pulled row references it, even after the pool evicts the
   // leaf. A faulted-leaf read error in resolveChild propagates as a thrown exception.
-  *scanRangeIter(b: KeyBound, src: LeafSource | null): Generator<[Uint8Array, Row]> {
-    if (this.root !== null) yield* walkIter(this.root, b, src);
+  scanRangeIter(b: KeyBound, src: LeafSource | null): Generator<[Uint8Array, Row]> {
+    this.freezeMutationGeneration();
+    return this.root === null ? emptyPairIter() : walkIter(this.root, b, src);
   }
 
   // scanRangeRevIter is scanRangeIter in reverse — the pull-model equivalent of scanRangeRev,
   // yielding the in-bound pairs in DESCENDING key order (the exact reverse of scanRangeIter).
-  *scanRangeRevIter(b: KeyBound, src: LeafSource | null): Generator<[Uint8Array, Row]> {
-    if (this.root !== null) yield* walkRevIter(this.root, b, src);
+  scanRangeRevIter(b: KeyBound, src: LeafSource | null): Generator<[Uint8Array, Row]> {
+    this.freezeMutationGeneration();
+    return this.root === null ? emptyPairIter() : walkRevIter(this.root, b, src);
   }
 
   // SELECT's row-only pull form: identical range traversal without allocating an unused [key,row]
   // tuple for every emitted record.
-  *scanRowsIter(b: KeyBound, src: LeafSource | null, reverse: boolean): Generator<Row> {
-    if (this.root !== null) yield* walkRowsIter(this.root, b, src, reverse);
+  scanRowsIter(b: KeyBound, src: LeafSource | null, reverse: boolean): Generator<Row> {
+    this.freezeMutationGeneration();
+    return this.root === null ? emptyRowIter() : walkRowsIter(this.root, b, src, reverse);
   }
 
   // demoteCleanLeaves demotes every CLEAN, PERSISTED resident leaf to its OnDisk(page) reference —
@@ -763,6 +802,9 @@ export class PMap {
     }
   }
 }
+
+function* emptyPairIter(): Generator<[Uint8Array, Row]> {}
+function* emptyRowIter(): Generator<Row> {}
 
 // walkIter mirrors PMap.scanRange's recursive in-order walk, yielding [key, row] instead of calling a
 // visit callback — so it is identical by construction (same structure, same windowing, same descent
@@ -885,12 +927,13 @@ function buildLeaf(
   cap: number,
   shape: LeafShape,
   edited: number | null,
+  owner?: MutationGeneration,
 ): InsOut {
   const n = keys.length;
   let total = 0;
   for (const w of weights) total += w;
   const pay = total + leafOverhead(n, shape);
-  if (pay <= cap || n < 2) return { whole: newLeaf(keys, vals, weights) };
+  if (pay <= cap || n < 2) return { whole: newLeaf(keys, vals, weights, owner) };
 
   const prefix = new Array<number>(n + 1);
   prefix[0] = 0;
@@ -900,13 +943,13 @@ function buildLeaf(
   const m = splitPoint(1, n - 1, pay, cap, edited === n - 1, leftpayload, rightpayload);
   // Unreachable under the RECORD_MAX cap (a two-record leaf always fits — format.md "Why the
   // record cap"); defensively leave the node whole (0A000 at serialize).
-  if (m === null) return { whole: newLeaf(keys, vals, weights) };
+  if (m === null) return { whole: newLeaf(keys, vals, weights, owner) };
 
   return {
     whole: null,
-    left: newLeaf(keys.slice(0, m), vals.slice(0, m), weights.slice(0, m)),
+    left: newLeaf(keys.slice(0, m), vals.slice(0, m), weights.slice(0, m), owner),
     sep: keys[m]!,
-    right: newLeaf(keys.slice(m), vals.slice(m), weights.slice(m)),
+    right: newLeaf(keys.slice(m), vals.slice(m), weights.slice(m), owner),
   };
 }
 
@@ -921,12 +964,13 @@ function buildInterior(
   children: Child[],
   cap: number,
   edited: number | null,
+  owner?: MutationGeneration,
 ): InsOut | null {
   const n = keys.length;
   let seps = 0;
   for (const k of keys) seps += k.length;
   const pay = 8 * n + 4 + seps;
-  if (pay <= cap || n < 2) return { whole: newInterior(keys, children) };
+  if (pay <= cap || n < 2) return { whole: newInterior(keys, children, owner) };
 
   let m: number;
   if (n === 2) {
@@ -947,9 +991,9 @@ function buildInterior(
 
   return {
     whole: null,
-    left: newInterior(keys.slice(0, m), children.slice(0, m + 1)),
+    left: newInterior(keys.slice(0, m), children.slice(0, m + 1), owner),
     sep: keys[m]!,
-    right: newInterior(keys.slice(m + 1), children.slice(m + 1)),
+    right: newInterior(keys.slice(m + 1), children.slice(m + 1), owner),
   };
 }
 
@@ -963,19 +1007,38 @@ function nodeInsert(
   val: Row,
   weight: number,
   ctx: InsCtx,
+  generation: MutationGeneration,
   src: LeafSource | null,
   cap: number,
   shape: LeafShape,
 ): InsOut {
   if (isLeaf(n)) {
     const { index, found } = search(n, key);
+    // Only this active generation may own a dirty node. Clone/cursor/publication invalidates the
+    // token before exposing an alias; clean and old-generation nodes retain the path-copy fallback.
+    if (n.page === 0 && n[mutationOwner] === generation && generation.active) {
+      if (found) {
+        ctx.old = n.vals[index];
+        ctx.replaced = true;
+        n.vals[index] = val;
+        n.weights[index] = weight;
+      } else {
+        n.keys.splice(index, 0, key);
+        n.vals.splice(index, 0, val);
+        n.weights.splice(index, 0, weight);
+      }
+      if (payload(n, shape) <= cap || nodeLen(n) < 2) return { whole: n };
+      // The unchanged builder selects the exact split point/separator. This edited node is
+      // abandoned when its returned halves replace it.
+      return buildLeaf(n.keys, n.vals, n.weights, cap, shape, index, generation);
+    }
     const { keys, vals, weights } = decodedParts(n);
     if (found) {
       ctx.old = vals[index];
       ctx.replaced = true;
       vals[index] = val;
       weights[index] = weight;
-      return buildLeaf(keys, vals, weights, cap, shape, index);
+      return buildLeaf(keys, vals, weights, cap, shape, index, generation);
     }
     return buildLeaf(
       insertAt(keys, index, key),
@@ -984,23 +1047,48 @@ function nodeInsert(
       cap,
       shape,
       index,
+      generation,
     );
   }
   // Fault the target child (a resident interior, or an OnDisk leaf brought in for mutation — it
   // becomes a dirty resident node on the rebuilt path).
   const i = childSlot(n, key);
-  const sub = nodeInsert(resolveChild(n.children[i], src), key, val, weight, ctx, src, cap, shape);
+  const sub = nodeInsert(
+    resolveChild(n.children[i], src),
+    key,
+    val,
+    weight,
+    ctx,
+    generation,
+    src,
+    cap,
+    shape,
+  );
+  if (n.page === 0 && n[mutationOwner] === generation && generation.active) {
+    if (sub.whole !== null) {
+      n.children[i] = residentRef(sub.whole);
+      return { whole: n };
+    }
+    n.keys.splice(i, 0, sub.sep);
+    n.children[i] = residentRef(sub.left);
+    n.children.splice(i + 1, 0, residentRef(sub.right));
+    if (payload(n, shape) <= cap || n.keys.length < 2) return { whole: n };
+    const out = buildInterior(n.keys, n.children, cap, i, generation);
+    if (out === null)
+      throw new Error("insert-path interior split always has a valid split point");
+    return out;
+  }
   if (sub.whole !== null) {
     // This node's separators are unchanged, so it cannot overflow — rebuild whole.
     const children = n.children.slice();
     children[i] = residentRef(sub.whole);
-    return { whole: newInterior(n.keys.slice(), children) };
+    return { whole: newInterior(n.keys.slice(), children, generation) };
   }
   const keys = insertAt(n.keys, i, sub.sep);
   let children = n.children.slice();
   children[i] = residentRef(sub.left);
   children = insertAt(children, i + 1, residentRef(sub.right));
-  const out = buildInterior(keys, children, cap, i);
+  const out = buildInterior(keys, children, cap, i, generation);
   if (out === null) {
     // The cap arithmetic guarantees a valid split point on the insert path (format.md "Why the
     // record cap") — reaching here would be an internal invariant break, not a data condition.

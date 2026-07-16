@@ -5,10 +5,10 @@ package jed
 // per-table data B+tree").
 //
 // Keyed by the encoded key bytes (compared with bytes.Compare = memcmp = the order-preserving
-// key encoding's contract, spec/design/encoding.md). Every mutation returns a new map that shares
-// structure with the old one; nodes are immutable by convention (never mutated after construction),
-// so copying a PMap value (which shares the root pointer) is an O(1) independent snapshot. That
-// cheap, structurally-shared snapshot carries the §3 staging-buffer / transaction model.
+// key encoding's contract, spec/design/encoding.md). Every mutation preserves prior roots by
+// path-copying shared/published nodes. An explicit pMap.clone is an O(1) independent snapshot; a raw
+// pMap value copy is not an ownership boundary because the private mutation-generation token must be
+// invalidated when a root is aliased (transactions.md §3).
 //
 // This IS the on-disk B+tree, node-for-page (v24). Records live ONLY in leaves; an interior node is
 // a record-free routing skeleton — separator keys + child pointers. A separator is a COPY of a
@@ -27,7 +27,24 @@ package jed
 import (
 	"bytes"
 	"sort"
+	"sync/atomic"
 )
+
+// mutationGeneration is the private ownership proof for Go dirty-node transients
+// (transactions.md §3). A clone, cursor pin, or publication atomically invalidates the token;
+// subsequent INSERTs path-copy old-generation nodes under a fresh token. The byte makes the object
+// non-zero-sized: distinct pointers to zero-sized Go values are not guaranteed to compare unequal.
+// Neither the token nor a node's owner is serialized, rendered, hashed, or metered.
+type mutationGeneration struct {
+	active atomic.Bool
+	_      byte
+}
+
+func newMutationGeneration() *mutationGeneration {
+	g := &mutationGeneration{}
+	g.active.Store(true)
+	return g
+}
 
 // pnode is one B+tree node. A decoded LEAF has no children and
 // len(keys) == len(vals) == len(weights); a packed leaf keeps all three in its page-backed packed
@@ -53,6 +70,7 @@ type pnode struct {
 	// Packed→Decoded first, §7). A Packed leaf is always clean (page != 0), so it is never serialized.
 	packed *packedLeaf
 	page   uint32
+	owner  *mutationGeneration
 }
 
 // rowAt reconstructs value row i as a storedRow — the value-read seam (packed-leaf.md §4), on a
@@ -233,8 +251,9 @@ func (n *pnode) childSlot(key []byte) int {
 	return sort.Search(len(n.keys), func(i int) bool { return bytes.Compare(n.keys[i], key) > 0 })
 }
 
-// PMap is a persistent ordered map from encoded key to Row. A value copy is an O(1) independent
-// snapshot (the root pointer is shared; nodes are immutable).
+// PMap is a persistent ordered map from encoded key to Row. clone is the only supported O(1)
+// snapshot operation: it invalidates the generation that previously owned the shared root. A raw
+// value copy would share an active owner token and must not be used as an alias boundary.
 //
 // length is the exact nonnegative row count when known. Table maps are built from empty or restored
 // with their v28 catalog count and maintain it across Insert/Remove. Index maps loaded from a disk
@@ -245,10 +264,41 @@ type pMap struct {
 	root          *pnode
 	length        int64
 	lengthUnknown bool
+	generation    *mutationGeneration
 }
 
 // NewPMap returns an empty map (known count 0).
 func newPMap() pMap { return pMap{} }
+
+// clone returns an independent O(1) root alias. Invalidation is atomic because a writer may fork a
+// committed root while concurrent readers retain it. The returned working map starts with a fresh
+// token; every shared node still bears the invalid old token and is therefore copied on first touch.
+func (m *pMap) clone() pMap {
+	m.freezeMutationGeneration()
+	return pMap{
+		root:          m.root,
+		length:        m.length,
+		lengthUnknown: m.lengthUnknown,
+		generation:    newMutationGeneration(),
+	}
+}
+
+// freezeMutationGeneration makes every node stamped by the current generation ineligible for
+// further in-place mutation. It does not walk the tree and is safe to call repeatedly/concurrently.
+func (m *pMap) freezeMutationGeneration() {
+	if m.generation != nil {
+		m.generation.active.Store(false)
+	}
+}
+
+// mutationGeneration returns the active token for this map's next INSERT. Only a working map calls
+// this mutating helper; committed readers merely invalidate tokens atomically at alias boundaries.
+func (m *pMap) mutationGeneration() *mutationGeneration {
+	if m.generation == nil || !m.generation.active.Load() {
+		m.generation = newMutationGeneration()
+	}
+	return m.generation
+}
 
 // Count returns the exact nonnegative row count and whether it is known. Only disk-loaded index
 // skeletons use the unknown state; table skeletons receive the v28 catalog count.
@@ -306,8 +356,9 @@ func (m *pMap) GetCounted(key []byte, src leafSource) (storedRow, bool, int, int
 // present (an overwrite); otherwise nil and false (a new insert, which grows the length). An
 // overwrite can change the weight, so it too may overflow and split.
 func (m *pMap) Insert(key []byte, val storedRow, weight uint32, cap int, shape leafShape, src leafSource) (storedRow, bool, error) {
+	generation := m.mutationGeneration()
 	if m.root == nil {
-		m.root = &pnode{keys: [][]byte{key}, vals: []storedRow{val}, weights: []uint32{weight}}
+		m.root = &pnode{keys: [][]byte{key}, vals: []storedRow{val}, weights: []uint32{weight}, owner: generation}
 		if !m.lengthUnknown {
 			m.length++
 		}
@@ -315,7 +366,7 @@ func (m *pMap) Insert(key []byte, val storedRow, weight uint32, cap int, shape l
 	}
 	var old storedRow
 	replaced := false
-	out, err := nodeInsert(m.root, key, val, weight, &old, &replaced, src, cap, shape)
+	out, err := nodeInsert(m.root, key, val, weight, &old, &replaced, generation, src, cap, shape)
 	if err != nil {
 		return nil, false, err
 	}
@@ -325,6 +376,7 @@ func (m *pMap) Insert(key []byte, val storedRow, weight uint32, cap int, shape l
 		m.root = &pnode{
 			keys:     [][]byte{out.sep},
 			children: []childRef{residentRef(out.left), residentRef(out.right)},
+			owner:    generation,
 		}
 	}
 	if !replaced && !m.lengthUnknown {
@@ -919,6 +971,9 @@ type rangeCursor struct {
 // rangeCursor returns a pull cursor over the (key, row) pairs within b. The first node on the stack is
 // the root (always resident); descendants fault through src on descent. See rangeCursor (the type).
 func (m *pMap) rangeCursor(b keyBound, src leafSource, reverse bool) *rangeCursor {
+	// The cursor retains the current root after this call. Invalidate its generation before capturing
+	// the first frame so a later write through the same working map path-copies the pinned path.
+	m.freezeMutationGeneration()
 	c := &rangeCursor{bound: b, src: src, reverse: reverse}
 	if m.root != nil {
 		c.stack = append(c.stack, newScanFrame(m.root, b))
@@ -1028,7 +1083,7 @@ func splitPoint(mLo, mHi, payload, cap int, rightEdge bool, leftpayload, rightpa
 // just-inserted/replaced record (-1 for the delete path's merge-overflow, which splits balanced). A
 // leaf with a single over-cap record is left whole (defensive — the oversize surfaces as 0A000 when
 // serialized).
-func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap int, shape leafShape, edited int) insOut {
+func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap int, shape leafShape, edited int, owner *mutationGeneration) insOut {
 	n := len(keys)
 	payload := 0
 	for _, w := range weights {
@@ -1036,7 +1091,7 @@ func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap int, shape
 	}
 	payload += leafOverhead(n, shape)
 	if payload <= cap || n < 2 {
-		return insOut{whole: &pnode{keys: keys, vals: vals, weights: weights}}
+		return insOut{whole: &pnode{keys: keys, vals: vals, weights: weights, owner: owner}}
 	}
 	prefix := make([]int, n+1)
 	for i, w := range weights {
@@ -1049,12 +1104,12 @@ func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap int, shape
 	if !ok {
 		// Unreachable under the RECORD_MAX cap (a two-record leaf always fits — format.md "Why the
 		// record cap"); defensively leave the node whole (0A000 at serialize).
-		return insOut{whole: &pnode{keys: keys, vals: vals, weights: weights}}
+		return insOut{whole: &pnode{keys: keys, vals: vals, weights: weights, owner: owner}}
 	}
 	return insOut{
-		left:  &pnode{keys: cloneKeys(keys[:m]), vals: cloneVals(vals[:m]), weights: cloneWeights(weights[:m])},
+		left:  &pnode{keys: cloneKeys(keys[:m]), vals: cloneVals(vals[:m]), weights: cloneWeights(weights[:m]), owner: owner},
 		sep:   keys[m],
-		right: &pnode{keys: cloneKeys(keys[m:]), vals: cloneVals(vals[m:]), weights: cloneWeights(weights[m:])},
+		right: &pnode{keys: cloneKeys(keys[m:]), vals: cloneVals(vals[m:]), weights: cloneWeights(weights[m:]), owner: owner},
 	}
 }
 
@@ -1064,14 +1119,14 @@ func buildLeaf(keys [][]byte, vals []storedRow, weights []uint32, cap int, shape
 // reachable with near-cap separators) the split is pinned to m = 1, producing a legal N = 0 right
 // interior (the degenerate fan-out contract). Returns ok=false when the node overflows and no valid
 // split point exists — the caller (only the interior MERGE path can hit it) abandons the merge.
-func buildInterior(keys [][]byte, children []childRef, cap int, edited int) (insOut, bool) {
+func buildInterior(keys [][]byte, children []childRef, cap int, edited int, owner *mutationGeneration) (insOut, bool) {
 	n := len(keys)
 	payload := 8*n + 4
 	for _, k := range keys {
 		payload += len(k)
 	}
 	if payload <= cap || n < 2 {
-		return insOut{whole: &pnode{keys: keys, children: children}}, true
+		return insOut{whole: &pnode{keys: keys, children: children, owner: owner}}, true
 	}
 	var m int
 	if n == 2 {
@@ -1093,9 +1148,9 @@ func buildInterior(keys [][]byte, children []childRef, cap int, edited int) (ins
 		}
 	}
 	return insOut{
-		left:  &pnode{keys: cloneKeys(keys[:m]), children: cloneChildren(children[:m+1])},
+		left:  &pnode{keys: cloneKeys(keys[:m]), children: cloneChildren(children[:m+1]), owner: owner},
 		sep:   keys[m],
-		right: &pnode{keys: cloneKeys(keys[m+1:]), children: cloneChildren(children[m+1:])},
+		right: &pnode{keys: cloneKeys(keys[m+1:]), children: cloneChildren(children[m+1:]), owner: owner},
 	}, true
 }
 
@@ -1103,9 +1158,29 @@ func buildInterior(keys [][]byte, children []childRef, cap int, edited int) (ins
 // via childSlot); on overwrite it sets *old/*replaced and rebuilds with the value+weight replaced
 // (which may now overflow). Splits propagate back up: a leaf split copies its boundary key up, an
 // interior receiving a separator may push-split in turn.
-func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedRow, replaced *bool, src leafSource, cap int, shape leafShape) (insOut, error) {
+func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedRow, replaced *bool, generation *mutationGeneration, src leafSource, cap int, shape leafShape) (insOut, error) {
 	if n.isLeaf() {
 		i, found := n.search(key)
+		// Only this active generation may own a dirty node. A clone/cursor/publication invalidates the
+		// token before exposing an alias; a clean or old-generation node takes the path-copy fallback.
+		if n.page == 0 && n.owner == generation && generation.active.Load() {
+			if found {
+				*old = n.vals[i]
+				*replaced = true
+				n.vals[i] = val
+				n.weights[i] = weight
+			} else {
+				n.keys = insertKeyAtMutable(n.keys, i, key)
+				n.vals = insertValAtMutable(n.vals, i, val)
+				n.weights = insertWeightAtMutable(n.weights, i, weight)
+			}
+			if n.payload(shape) <= cap || n.keyLen() < 2 {
+				return insOut{whole: n}, nil
+			}
+			// The unchanged builder selects the exact split point/separator. The edited node is
+			// abandoned when the returned halves replace it, so handing it the vectors is safe.
+			return buildLeaf(n.keys, n.vals, n.weights, cap, shape, i, generation), nil
+		}
 		keys, vals, weights, err := n.decodedParts()
 		if err != nil {
 			return insOut{}, err
@@ -1120,7 +1195,7 @@ func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedR
 			vals = insertValAt(vals, i, val)
 			weights = insertWeightAt(weights, i, weight)
 		}
-		return buildLeaf(keys, vals, weights, cap, shape, i), nil
+		return buildLeaf(keys, vals, weights, cap, shape, i, generation), nil
 	}
 	// Fault the target child (a resident interior, or an OnDisk leaf brought in for mutation — it
 	// becomes a dirty resident node on the rebuilt path).
@@ -1129,21 +1204,38 @@ func nodeInsert(n *pnode, key []byte, val storedRow, weight uint32, old *storedR
 	if err != nil {
 		return insOut{}, err
 	}
-	sub, err := nodeInsert(childNode, key, val, weight, old, replaced, src, cap, shape)
+	sub, err := nodeInsert(childNode, key, val, weight, old, replaced, generation, src, cap, shape)
 	if err != nil {
 		return insOut{}, err
+	}
+	if n.page == 0 && n.owner == generation && generation.active.Load() {
+		if sub.whole != nil {
+			n.children[i] = residentRef(sub.whole)
+			return insOut{whole: n}, nil
+		}
+		n.keys = insertKeyAtMutable(n.keys, i, sub.sep)
+		n.children[i] = residentRef(sub.left)
+		n.children = insertChildAtMutable(n.children, i+1, residentRef(sub.right))
+		if n.payload(shape) <= cap || len(n.keys) < 2 {
+			return insOut{whole: n}, nil
+		}
+		out, ok := buildInterior(n.keys, n.children, cap, i, generation)
+		if !ok {
+			panic("insert-path interior split always has a valid split point")
+		}
+		return out, nil
 	}
 	if sub.whole != nil {
 		// This node's separators are unchanged, so it cannot overflow — rebuild whole.
 		children := cloneChildren(n.children)
 		children[i] = residentRef(sub.whole)
-		return insOut{whole: &pnode{keys: cloneKeys(n.keys), children: children}}, nil
+		return insOut{whole: &pnode{keys: cloneKeys(n.keys), children: children, owner: generation}}, nil
 	}
 	keys := insertKeyAt(n.keys, i, sub.sep)
 	children := cloneChildren(n.children)
 	children[i] = residentRef(sub.left)
 	children = insertChildAt(children, i+1, residentRef(sub.right))
-	out, ok := buildInterior(keys, children, cap, i)
+	out, ok := buildInterior(keys, children, cap, i, generation)
 	if !ok {
 		panic("insert-path interior split always has a valid split point")
 	}
@@ -1260,7 +1352,7 @@ func mergeAt(n *pnode, j int, src leafSource, cap int, shape leafShape) (*pnode,
 		mweights := make([]uint32, 0, len(leftWeights)+len(rightWeights))
 		mweights = append(mweights, leftWeights...)
 		mweights = append(mweights, rightWeights...)
-		merged = buildLeaf(mkeys, mvals, mweights, cap, shape, -1) // merge-overflow: balanced
+		merged = buildLeaf(mkeys, mvals, mweights, cap, shape, -1, nil) // merge-overflow: balanced
 	} else {
 		mkeys := make([][]byte, 0, len(left.keys)+1+len(right.keys))
 		mkeys = append(mkeys, left.keys...)
@@ -1270,7 +1362,7 @@ func mergeAt(n *pnode, j int, src leafSource, cap int, shape leafShape) (*pnode,
 		mchildren = append(mchildren, left.children...)
 		mchildren = append(mchildren, right.children...)
 		var ok bool
-		merged, ok = buildInterior(mkeys, mchildren, cap, -1)
+		merged, ok = buildInterior(mkeys, mchildren, cap, -1, nil)
 		if !ok {
 			// No valid 2-way split point (near-cap separators): abandon the merge — the two
 			// children and the parent separator stay exactly as they were (underfull tolerated).
@@ -1360,6 +1452,36 @@ func insertChildAt(s []childRef, i int, x childRef) []childRef {
 	out[i] = x
 	copy(out[i+1:], s[i:])
 	return out
+}
+
+// Mutable insertion helpers are confined to generation-owned dirty nodes. append reuses capacity
+// when available and grows normally otherwise; copy shifts the suffix without changing key order.
+func insertKeyAtMutable(s [][]byte, i int, x []byte) [][]byte {
+	s = append(s, nil)
+	copy(s[i+1:], s[i:])
+	s[i] = x
+	return s
+}
+
+func insertValAtMutable(s []storedRow, i int, x storedRow) []storedRow {
+	s = append(s, nil)
+	copy(s[i+1:], s[i:])
+	s[i] = x
+	return s
+}
+
+func insertWeightAtMutable(s []uint32, i int, x uint32) []uint32 {
+	s = append(s, 0)
+	copy(s[i+1:], s[i:])
+	s[i] = x
+	return s
+}
+
+func insertChildAtMutable(s []childRef, i int, x childRef) []childRef {
+	s = append(s, childRef{})
+	copy(s[i+1:], s[i:])
+	s[i] = x
+	return s
 }
 
 func removeKeyAt(s [][]byte, i int) [][]byte {

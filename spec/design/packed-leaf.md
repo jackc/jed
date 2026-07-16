@@ -251,9 +251,11 @@ No new lifetime model — it composes with the three already in place ([lazy-rec
 A mutated leaf is always Decoded (and dirty, page `0`), so serialization (`serialize_dirty`, which
 only touches dirty nodes, re-emits PAX column-major from the Decoded rows) stays unchanged. Rust may
 subsequently edit that Decoded leaf in place for INSERT only when `Arc::get_mut` proves unique
-ownership and `page == 0`; a Packed/clean or aliased leaf always takes the ordinary rebuild path
-([transactions.md §3](transactions.md)). Delete/rebalance stays copy-on-write. The write side stays
-metered by `value_compress` per stored row version ([cost.md §3](cost.md)).
+ownership; Go/TypeScript require the leaf's private mutation-generation stamp to match the map's
+still-active token. All three additionally require `page == 0`; a Packed/clean or aliased leaf always
+takes the ordinary rebuild path ([transactions.md §3](transactions.md)). Delete/rebalance stays
+copy-on-write. The write side stays metered by `value_compress` per stored row version
+([cost.md §3](cost.md)).
 
 ---
 

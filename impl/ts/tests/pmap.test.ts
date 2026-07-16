@@ -203,6 +203,70 @@ test("pmap: clone is an independent snapshot", () => {
   checkInvariants(other);
 });
 
+test("pmap: insert reuses only current-generation dirty paths", () => {
+  const path = (pm: PMap, k: Uint8Array): PNode[] => {
+    let n = pm.rootNode();
+    assert.notEqual(n, null, "nonempty map has no root");
+    const out: PNode[] = [];
+    while (n !== null) {
+      out.push(n);
+      if (n.children.length === 0) return out;
+      let i = 0;
+      while (i < n.keys.length && compare(n.keys[i]!, k) <= 0) i++;
+      n = n.children[i]!.node;
+      assert.notEqual(n, null, "test map unexpectedly contains an on-disk child");
+    }
+    throw new Error("unreachable");
+  };
+  const samePath = (a: PNode[], b: PNode[]): boolean =>
+    a.length === b.length && a.every((n, i) => n === b[i]);
+
+  const pm = new PMap();
+  for (let k = 0; k < 2000; k++) pm.insert(key(k), row(k), W, CAP, SHAPE, null);
+  assert.ok(pm.height() > 2, "test needs a multi-level dirty path");
+
+  // Repeated equal-weight overwrites under one unaliased generation retain every node object.
+  const before = path(pm, key(777));
+  assert.deepEqual(pm.insert(key(777), row(-777), W, CAP, SHAPE, null), row(777));
+  assert.ok(samePath(path(pm, key(777)), before), "current-generation dirty path was rebuilt");
+
+  // Snapshot clone invalidates the generation. The next write path-copies while the pin retains
+  // its prior value; the following unaliased write can reuse the new path.
+  const pin = pm.clone();
+  const shared = path(pm, key(777));
+  pm.insert(key(777), row(-778), W, CAP, SHAPE, null);
+  assert.ok(!samePath(path(pm, key(777)), shared), "snapshot-aliased path mutated in place");
+  assert.deepEqual(pin.get(key(777), null), row(-777));
+  const owned = path(pm, key(777));
+  pm.insert(key(777), row(-779), W, CAP, SHAPE, null);
+  assert.ok(samePath(path(pm, key(777)), owned), "fresh generation did not retain dirty path");
+
+  // A pull cursor pins the current root at creation (before its generator body is first advanced).
+  const exact: KeyBound = { lo: key(777), loInc: true, hi: key(777), hiInc: true };
+  const cursor = pm.scanRangeIter(exact, null);
+  const cursorPath = path(pm, key(777));
+  pm.insert(key(777), row(-780), W, CAP, SHAPE, null);
+  assert.ok(!samePath(path(pm, key(777)), cursorPath), "cursor-aliased path mutated in place");
+  const got = cursor.next();
+  assert.equal(got.done, false);
+  assert.deepEqual(got.value![1], row(-779));
+
+  // The ownership stamp is symbol-keyed private runtime state: structured cloning a node carries
+  // none of it into the clone (and the file serializer likewise enumerates only format fields).
+  const structured = structuredClone(pm.rootNode()!);
+  assert.equal(Object.getOwnPropertySymbols(structured).length, 0);
+
+  // Clean page state is an independent guard even when the generation identity still matches.
+  const clean = new PMap();
+  clean.insert(key(1), row(1), W, CAP, SHAPE, null);
+  const cleanRoot = clean.rootNode()!;
+  cleanRoot.page = 9;
+  clean.insert(key(1), row(-1), W, CAP, SHAPE, null);
+  assert.notEqual(clean.rootNode(), cleanRoot, "clean node was mutated in place");
+  checkInvariants(pm);
+  checkInvariants(clean);
+});
+
 test("pmap: empty and single", () => {
   const pm = new PMap();
   assert.equal(pmCount(pm), 0);

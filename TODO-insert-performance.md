@@ -406,26 +406,34 @@ Required generation boundaries include:
 
 Tasks:
 
-- [ ] Inventory every snapshot/root clone in Go and TypeScript before adding an owner field. A plain
+- [x] Inventory every snapshot/root clone in Go and TypeScript before adding an owner field. A plain
   pointer/object reference offers no uniqueness proof.
-- [ ] Specify a `MutationGeneration`/owner token as private runtime state, never persisted, rendered,
+- [x] Specify a `MutationGeneration`/owner token as private runtime state, never persisted, rendered,
   hashed, or metered.
-- [ ] Rotate the generation whenever an existing root becomes an immutable alias. Old-generation
+- [x] Rotate the generation whenever an existing root becomes an immutable alias. Old-generation
   nodes are copied on the next touched path; new path nodes receive the new generation.
-- [ ] Freeze/clear ownership on commit so published nodes are never mutable.
-- [ ] Go: keep the token inside the engine/working snapshot and nodes; do not use finalizers, unsafe
+- [x] Freeze/clear ownership on commit so published nodes are never mutable.
+- [x] Go: keep the token inside the engine/working snapshot and nodes; do not use finalizers, unsafe
   pointer identity, or reflection.
-- [ ] TypeScript: use an unforgeable private object/token identity rather than a numeric value that
+- [x] TypeScript: use an unforgeable private object/token identity rather than a numeric value that
   could collide after wraparound; do not expose it through serialization or structured cloning.
-- [ ] Keep Packed/clean leaves immutable. The first mutation materializes/copies them exactly as now.
-- [ ] Preserve the same split/merge builders and exact page-fit rules.
-- [ ] Add tests that deliberately rotate generations through writable CTE pins, cursors, rollback,
+- [x] Keep Packed/clean leaves immutable. The first mutation materializes/copies them exactly as now.
+- [x] Preserve the same split/merge builders and exact page-fit rules.
+- [x] Add tests that deliberately rotate generations through writable CTE pins, cursors, rollback,
   attachments, and commit.
-- [ ] Measure GC bytes, pauses, and elapsed time. If the gain is marginal, retain immutable shallow
+- [x] Measure GC bytes, pauses, and elapsed time. If the gain is marginal, retain immutable shallow
   copies and document why Rust alone received the deeper tree optimization.
 
 Rust may use the same conceptual generation in documentation, but its implementation should continue
 to require `Arc::get_mut` as the final uniqueness proof.
+
+The Slice-3 commit `7f66dd58` was retained as the control. Five CPU-2-pinned processes reduced the
+Go lane from 11.661 ms to 3.821 ms (-67.2%) and the TypeScript lane from 16.182 ms to 14.983 ms
+(-7.4%), with identical checksums. Go's median 30-transaction probe reduced allocated bytes 89.5%,
+GC cycles 92.1%, and GC pause 91.4%; V8's complete-lane trace reduced between-GC allocated bytes
+53.4% and scavenges from 46 to 29. Hot PK lookup, full scan, and durable-write paired controls all
+stayed within 2%. Durable evidence and the exact token/alias inventory are in
+`spec/design/benchmarks.md` and `spec/design/transactions.md`.
 
 Exit: either Go/TypeScript gain a proven transient path under an explicit aliasing invariant, or the
 slice closes with measurements showing their existing shallow-copy approach is preferable.

@@ -3,10 +3,10 @@ package jed
 // In-memory storage seam (CLAUDE.md §9). A table's rows are held in a PMap — a persistent
 // (copy-on-write) ordered map keyed by the primary-key encoding (spec/design/encoding.md), so
 // iteration is in key order (the order-preserving encoding makes that the correct logical order
-// with no comparator) and the whole store is an O(1) clone that snapshots independently of its
-// source. That cheap, structurally-shared clone is what carries the §3 staging-buffer /
-// transaction model (spec/design/transactions.md §2): a TableStore clone is the committed
-// version a reader holds while a writer mutates its own copy.
+// with no comparator) and the whole store has an explicit O(1) clone that snapshots independently
+// of its source. That cheap, structurally-shared clone is what carries the §3 staging-buffer /
+// transaction model (spec/design/transactions.md §2): a TableStore clone is the committed version a
+// reader holds while a writer mutates its own copy.
 
 // Row is a stored row: one value per column, in column order.
 type storedRow []Value
@@ -43,13 +43,15 @@ func newTableStore(cap int, colTypes []colType) *tableStore {
 	return &tableStore{cap: cap, colTypes: colTypes, shape: leafShapeFor(colTypes)}
 }
 
-// clone returns an independent O(1) snapshot of the store: the PMap value-copy shares structure
-// (nodes are immutable), so mutating one store leaves the clone untouched. The foundation of the
-// transaction model (spec/design/transactions.md §2). The shared paging context is shared, not copied
-// (one pool per database).
+// clone returns an independent O(1) snapshot of the store. pMap.clone shares the root while
+// invalidating its private mutation generation, so a later INSERT path-copies before it can reuse a
+// dirty suffix (transactions.md §3). The shared paging context is shared, not copied (one pool per
+// database).
 func (s *tableStore) clone() *tableStore {
-	return &tableStore{rows: s.rows, nextRowid: s.nextRowid, cap: s.cap, colTypes: s.colTypes, shape: s.shape, paging: s.paging}
+	return &tableStore{rows: s.rows.clone(), nextRowid: s.nextRowid, cap: s.cap, colTypes: s.colTypes, shape: s.shape, paging: s.paging}
 }
+
+func (s *tableStore) freezeMutationGeneration() { s.rows.freezeMutationGeneration() }
 
 // attachPaging attaches this database's shared paging context (the demand-paged file load, format.go):
 // the store's OnDisk leaves now fault through the pool. One pool per database, shared by every store

@@ -1405,6 +1405,7 @@ func (db *engine) UpgradeCollations() (int, error) {
 		return 0, err
 	}
 	if n > 0 {
+		work.freezeMutationGenerations()
 		db.committed = work
 	}
 	return n, nil

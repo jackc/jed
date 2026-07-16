@@ -216,6 +216,7 @@ func (db *engine) commitTx() (outcome, error) {
 		if err := db.persist(working); err != nil { // no-op for an in-memory database
 			return outcome{}, err
 		}
+		working.freezeMutationGenerations()
 		db.committed = working
 	}
 	// A dirty session-local temp domain materializes its working snapshot into its MemoryBlockStore
@@ -226,6 +227,7 @@ func (db *engine) commitTx() (outcome, error) {
 			return outcome{}, err
 		}
 	}
+	tx.tempWorking.freezeMutationGenerations()
 	db.session.tempCommitted = tx.tempWorking
 	// Adopt each dirtied host-attached database (attached-databases.md §5, the N-root commit) and adopt it
 	// into this engine's pinned attached view, so publish swaps a new roots.attached. An IN-MEMORY
@@ -269,6 +271,7 @@ func (db *engine) commitTx() (outcome, error) {
 			} else if err := att.storage.persistTemp(ws, canReclaim); err != nil {
 				return outcome{}, err
 			}
+			ws.freezeMutationGenerations()
 			na[name] = ws
 		}
 		db.attachedCommitted = na

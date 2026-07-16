@@ -164,6 +164,13 @@ export class Snapshot {
     return c;
   }
 
+  // Publish every table/index root as immutable private runtime state. This is O(number of stores),
+  // walks no B+tree, and changes no logical/file/cost-visible fact.
+  freezeMutationGenerations(): void {
+    for (const store of this.stores.values()) store.freezeMutationGeneration();
+    for (const store of this.indexStores.values()) store.freezeMutationGeneration();
+  }
+
   // bumpCatGen advances the catalog generation — called by every schema mutator (see catGen). A
   // SELECT plan cached against a prior generation is thereby invalidated on the next execute.
   bumpCatGen(): void {

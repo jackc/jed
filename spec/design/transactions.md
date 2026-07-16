@@ -100,17 +100,30 @@ operations: `get`, logical `insert→new`, `remove→new`, in-order `iter`, and 
 Each mutation **path-copies every shared/published node** from root→leaf and shares the untouched
 siblings, so every prior root is provably unchanged and a snapshot is an O(1) reference clone.
 
-**Rust unique-dirty INSERT transient (2026-07, no format change).** Rust avoids repeatedly
-deep-cloning decoded leaf keys/rows during a write transaction, but only under two simultaneous
-proofs: `Arc::get_mut` proves the node is uniquely owned, and `page == 0` proves it is dirty and
-unpublished. A clean node is never edited even when unique; a dirty node with any snapshot/cursor/
-read-pin alias is copied exactly as before. A qualifying leaf edits its key/row/weight vectors in
-place; a qualifying interior replaces the changed child or inserts a propagated separator in place.
-Overflow still moves those vectors through the unchanged size-fit and split builders, preserving the
-exact split point, separator, tree shape, and bytes. This first transient covers insert/overwrite
-only; delete/rebalance deliberately remains pure path-copy. Go and TypeScript retain their shallow
-entry-copy representation in this slice—the transient rule is a private Rust ownership optimization,
-not a new cross-core logical state.
+**Dirty INSERT transients (2026-07, no format change).** All three cores avoid rebuilding a dirty,
+unpublished root-to-leaf suffix on every INSERT, but the ownership proof is language-specific. Rust
+requires both `Arc::get_mut` uniqueness and `page == 0`. Go and TypeScript cannot infer uniqueness
+from an ordinary pointer/object reference, so each `PMap` instead carries a private opaque
+**mutation-generation token** and every node created by its INSERT path is stamped with that token.
+A Go/TypeScript node may be edited only when `page == 0`, its stamp is the map's current token, and
+that token is still active. The Go token is a non-zero-sized private pointer with an atomic active
+bit; the TypeScript token is a private object identity (not a wrapping number) and its node stamp is
+stored under a module-private symbol, which structured cloning and serialization do not expose.
+
+Creating an immutable alias invalidates the current token. The next INSERT obtains a fresh token,
+copies every old-generation node on the touched path, and stamps the replacements; later INSERTs may
+reuse that newly owned dirty suffix. The invalidation boundaries are the complete root-alias
+inventory: snapshot/store clone (transaction fork, statement rollback/read pin, writable-CTE
+pre-statement pin, and attachment working-root fork), pull-cursor/scan creation, a streaming cursor's
+clone of any mutable working snapshot, and commit/publication of main, temp, and attachment roots.
+Loaded/Packed nodes and post-commit nodes are clean and therefore ineligible independently of the
+token. Go code must call the explicit `PMap` clone operation; a raw struct copy is not an ownership
+boundary.
+
+In every core a qualifying leaf edits its key/row/weight vectors in place; a qualifying interior
+replaces the changed child or inserts a propagated separator in place. Overflow still runs the same
+size-fit and split builders, preserving the exact split point, separator, tree shape, and bytes. This
+transient covers insert/overwrite only; delete/rebalance deliberately remains pure path-copy.
 
 **Decided shape: a copy-on-write B+tree** (v24 — [bplus-reshape.md](bplus-reshape.md); it was
 a CLRS-style B-tree with records at every level through v23). Chosen deliberately as the

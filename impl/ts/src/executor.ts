@@ -2143,7 +2143,10 @@ export class Engine {
   upgradeCollations(): number {
     const work = this.committed.clone();
     const n = work.upgradeCollations(this.pageSize);
-    if (n > 0) this.committed = work;
+    if (n > 0) {
+      work.freezeMutationGenerations();
+      this.committed = work;
+    }
     return n;
   }
 
@@ -2400,6 +2403,7 @@ export class Engine {
       // persistHook (if any) throws on an I/O failure before committed is swapped, so committed is
       // left untouched (the commit failed; the working snapshot is discarded).
       if (this.persistHook !== null) this.persistHook(this, working);
+      working.freezeMutationGenerations();
       this.committed = working;
     }
     // Adopt the transaction's temp changes into the committed temp snapshot (temp-tables.md §5) — the
@@ -2411,6 +2415,7 @@ export class Engine {
     if (tx.tempDirty && this.tempStorage !== null) {
       persistTemp(this.tempStorage, tx.tempWorking, this.openStreams === 0);
     }
+    tx.tempWorking.freezeMutationGenerations();
     this.session.tempCommitted = tx.tempWorking;
     // Adopt each dirtied host-attached database (attached-databases.md §5, the N-root commit):
     // materialize its working snapshot into the attachment's in-RAM block store (persistTemp-style — the
@@ -2454,6 +2459,7 @@ export class Engine {
         } else {
           persistTemp(att.storage, ws, canReclaim);
         }
+        ws.freezeMutationGenerations();
         na.set(name, ws);
       }
       this.attachedCommitted = na;
@@ -13142,14 +13148,32 @@ export class Engine {
   // its filter/projection against this engine, so the streaming cursor is self-contained — it does not
   // reference the live handle, so it survives Database.query's transient session (streaming.md §5).
   snapshotEngine(): Engine {
+    let mainSnap = this.readSnap();
+    let tempSnap = this.tempSnap();
+    let attached = this.attachReadView();
+    // A cursor opened inside a write transaction may outlive later statements that mutate these
+    // working Snapshot objects in place. Give that uncommon path explicit root aliases; TableStore /
+    // PMap clone invalidates each mutation generation before the cursor retains it. Autocommit and
+    // read-only cursors keep the allocation-focused pointer capture because published snapshots are
+    // immutable and a future writer forks them before mutation.
+    const tx = this.session.tx;
+    if (tx !== null && tx.writable) {
+      mainSnap = mainSnap.clone();
+      tempSnap = tempSnap.clone();
+      if (tx.attachWorking !== undefined && tx.attachWorking.size > 0) {
+        const view = new Map(attached);
+        for (const [name, snap] of tx.attachWorking) view.set(name, snap.clone());
+        attached = view;
+      }
+    }
     // This is a read-only execution context, not a new database. Allocate the two thin objects it
     // actually needs instead of running Engine/SessionState constructors that build empty catalog,
     // temp-catalog, privilege, seam, and session-state graphs only to replace their roots below.
     const e = Object.create(Engine.prototype) as Engine;
-    e.committed = this.readSnap();
+    e.committed = mainSnap;
     e.core = null;
-    e.attachedCommitted = this.attachReadView();
-    e.session = SessionState.frozenRead(this.session, this.tempSnap());
+    e.attachedCommitted = attached;
+    e.session = SessionState.frozenRead(this.session, tempSnap);
     e.pageSize = this.pageSize;
     e.paging = this.paging;
     e.path = this.path;

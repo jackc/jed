@@ -258,13 +258,16 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     detaches old loads and prevents stale page-id reinsertion. Focused synchronization + reader/writer
     race tests and the shared cold r1/r4 benchmark are recorded in [pager.md](spec/design/pager.md) and
     [benchmarks.md](spec/design/benchmarks.md). TypeScript remains single-threaded.
-  - [x] **INSERT guardrail + execution/cache/tree path (slices 0–3)** — pinned immutable snapshot/cursor,
+  - [x] **INSERT guardrail + execution/cache/tree path (slices 0–4)** — pinned immutable snapshot/cursor,
     attachment, split/overwrite/rollback, writable-CTE collision, exact-cost, and byte-golden behavior
     across the three cores; recorded paired attribution/allocation evidence, specified exact INSERT
     error/write order, removed one-row batch sets/buffers, and cached immutable prepared-INSERT
     resolution metadata behind schema/identity signatures in Rust, Go, and TypeScript. Rust now edits
     only `Arc::get_mut`-unique dirty INSERT paths in place, cutting its 1,000-row allocation probe by
-    89.0% and shared rollback latency by 88.2%; shared remains 8.6% slower than exclusive. →
+    89.0% and shared rollback latency by 88.2%; shared remains 8.6% slower than exclusive. Go and
+    TypeScript use private mutation-generation tokens to reuse only transaction-owned dirty paths;
+    Go's lane improved 67.2% with 89.5% fewer allocated bytes, while TypeScript improved 7.4% with
+    53.4% fewer traced allocated bytes. →
     [benchmarks.md](spec/design/benchmarks.md), [temporary slice plan](TODO-insert-performance.md)
   - [ ] _follow-on:_ evaluate unique-dirty mutation for remove/rebalance separately; Slice 3 deliberately
     leaves DELETE on the pure copy-on-write path until its own allocation evidence justifies the extra

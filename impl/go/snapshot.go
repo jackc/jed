@@ -172,6 +172,17 @@ func (s *snapshot) clone() *snapshot {
 	return &snapshot{txid: s.txid, catGen: s.catGen, estimatorIdentity: s.estimatorIdentity, estimatorBaseRevision: s.estimatorBaseRevision, estimatorRevisions: estimatorRevisions, statistics: statistics, tables: tables, types: types, stores: stores, indexStores: indexStores, sequences: sequences, collations: collations, defaultCollation: s.defaultCollation, gistTrees: gistTrees, storePaging: s.storePaging}
 }
 
+// freezeMutationGenerations publishes every table/index root as immutable private runtime state.
+// It is O(number of stores), walks no B+tree, and changes no logical/file/cost-visible fact.
+func (s *snapshot) freezeMutationGenerations() {
+	for _, store := range s.stores {
+		store.freezeMutationGeneration()
+	}
+	for _, store := range s.indexStores {
+		store.freezeMutationGeneration()
+	}
+}
+
 func (s *snapshot) columnStatistics(table string, column int) *columnStatistics {
 	return s.statistics[strings.ToLower(table)][column]
 }

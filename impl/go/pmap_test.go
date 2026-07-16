@@ -207,7 +207,7 @@ func TestPMapCloneIsIndependentSnapshot(t *testing.T) {
 	for k := uint64(0); k < 2000; k++ {
 		base.Insert(pmKey(k), pmRow(int64(k)), pmW, pmCap, pmShape, nil)
 	}
-	snap := base // an O(1) value-copy snapshot
+	snap := base.clone()
 	// Capture the complete encoded-key/value sequence before the working copy starts changing.
 	// Equality after the churn below is the byte/value alias guard for transient mutation work: an
 	// unsafe in-place edit of a shared leaf must make this test fail.
@@ -217,7 +217,7 @@ func TestPMapCloneIsIndependentSnapshot(t *testing.T) {
 	}
 
 	// Mutate a separate copy heavily; the snapshot must be untouched.
-	other := base
+	other := base.clone()
 	for k := uint64(0); k < 2000; k++ {
 		other.Insert(pmKey(k), pmRow(-int64(k)), pmW, pmCap, pmShape, nil) // overwrite every value
 	}
@@ -258,6 +258,95 @@ func TestPMapCloneIsIndependentSnapshot(t *testing.T) {
 		t.Fatal("other key 2500 wrong")
 	}
 	pmCheckInvariants(t, &other)
+}
+
+func TestPMapInsertReusesOnlyCurrentGenerationDirtyPaths(t *testing.T) {
+	t.Parallel()
+	path := func(pm *pMap, key []byte) []*pnode {
+		n := pm.root
+		if n == nil {
+			t.Fatal("nonempty map has nil root")
+		}
+		var out []*pnode
+		for {
+			out = append(out, n)
+			if n.isLeaf() {
+				return out
+			}
+			n = n.children[n.childSlot(key)].node
+			if n == nil {
+				t.Fatal("test map unexpectedly contains an on-disk child")
+			}
+		}
+	}
+
+	var pm pMap
+	for k := uint64(0); k < 2000; k++ {
+		if _, _, err := pm.Insert(pmKey(k), pmRow(int64(k)), pmW, pmCap, pmShape, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if pm.height() <= 2 {
+		t.Fatal("test needs a multi-level dirty path")
+	}
+
+	// Repeated equal-weight overwrites under one unaliased generation retain every node address.
+	before := path(&pm, pmKey(777))
+	if _, _, err := pm.Insert(pmKey(777), pmRow(-777), pmW, pmCap, pmShape, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(path(&pm, pmKey(777)), before) {
+		t.Fatal("current-generation dirty path was rebuilt")
+	}
+
+	// Snapshot clone invalidates the generation. The next write path-copies while the pin retains
+	// its old node identities and value; the following unaliased write may reuse the new path.
+	pin := pm.clone()
+	shared := path(&pm, pmKey(777))
+	if _, _, err := pm.Insert(pmKey(777), pmRow(-778), pmW, pmCap, pmShape, nil); err != nil {
+		t.Fatal(err)
+	}
+	if reflect.DeepEqual(path(&pm, pmKey(777)), shared) {
+		t.Fatal("snapshot-aliased path was mutated in place")
+	}
+	if got, _, _ := pin.Get(pmKey(777), nil); !reflect.DeepEqual(got, pmRow(-777)) {
+		t.Fatalf("snapshot value changed: %v", got)
+	}
+	owned := path(&pm, pmKey(777))
+	if _, _, err := pm.Insert(pmKey(777), pmRow(-779), pmW, pmCap, pmShape, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(path(&pm, pmKey(777)), owned) {
+		t.Fatal("fresh generation did not retain its dirty path")
+	}
+
+	// A pull cursor is another immutable root alias. It must keep the value from cursor-open time
+	// while a later write copies the touched path.
+	b := keyBound{lo: pmKey(777), loInc: true, hi: pmKey(777), hiInc: true}
+	c := pm.rangeCursor(b, nil, false)
+	cursorPath := path(&pm, pmKey(777))
+	if _, _, err := pm.Insert(pmKey(777), pmRow(-780), pmW, pmCap, pmShape, nil); err != nil {
+		t.Fatal(err)
+	}
+	if reflect.DeepEqual(path(&pm, pmKey(777)), cursorPath) {
+		t.Fatal("cursor-aliased path was mutated in place")
+	}
+	_, got, ok, err := c.next()
+	if err != nil || !ok || !reflect.DeepEqual(got, pmRow(-779)) {
+		t.Fatalf("pinned cursor got %v/%v/%v, want -779", got, ok, err)
+	}
+
+	// Clean page state is an independent guard even when the generation still matches.
+	var clean pMap
+	clean.Insert(pmKey(1), pmRow(1), pmW, pmCap, pmShape, nil)
+	cleanRoot := clean.root
+	cleanRoot.page = 9
+	clean.Insert(pmKey(1), pmRow(-1), pmW, pmCap, pmShape, nil)
+	if clean.root == cleanRoot {
+		t.Fatal("clean node was mutated in place")
+	}
+	pmCheckInvariants(t, &pm)
+	pmCheckInvariants(t, &clean)
 }
 
 // Wide values (near RECORD_MAX) force tiny fan-out — the stress case for the split point and the

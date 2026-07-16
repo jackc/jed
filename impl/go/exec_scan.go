@@ -24,6 +24,28 @@ import (
 // this engine, so the streaming Rows is self-contained (it does not reference the live handle, so it
 // survives Database.queryValues's transient session, streaming.md §5).
 func (db *engine) snapshotEngine() *engine {
+	mainSnap := db.readSnap()
+	tempSnap := db.tempSnap()
+	attached := db.attachReadView()
+	// A cursor opened inside a write transaction may outlive later statements that mutate these
+	// working Snapshot objects in place. Give that uncommon path explicit root aliases; tableStore /
+	// pMap clone invalidates each mutation generation before the cursor can retain it. Autocommit and
+	// read-only cursors keep the allocation-focused pointer capture because published snapshots are
+	// already immutable and a future writer forks them before mutation.
+	if tx := db.session.tx; tx != nil && tx.writable {
+		mainSnap = mainSnap.clone()
+		tempSnap = tempSnap.clone()
+		if len(tx.attachWorking) > 0 {
+			view := make(map[string]*snapshot, len(attached))
+			for name, snap := range attached {
+				view[name] = snap
+			}
+			for name, snap := range tx.attachWorking {
+				view[name] = snap.clone()
+			}
+			attached = view
+		}
+	}
 	s := db.session // struct copy: shares the seam (func fields), the lifetime gauge (pointer), and the
 	// read-only maps (vars/sessionSeq); reset the per-statement / transaction state below.
 	s.tx = nil
@@ -34,9 +56,9 @@ func (db *engine) snapshotEngine() *engine {
 	s.pendingSeq = nil
 	s.pendingCurrval = nil
 	s.pendingLastName = ""
-	s.tempCommitted = db.tempSnap()
+	s.tempCommitted = tempSnap
 	return &engine{
-		committed: db.readSnap(),
+		committed: mainSnap,
 		session:   s,
 		pageSize:  db.pageSize,
 		paging:    db.paging,
@@ -46,7 +68,7 @@ func (db *engine) snapshotEngine() *engine {
 		// The frozen read engine carries the same pinned attachment view so a streaming read of an
 		// attached database (attached-databases.md §5) resolves through it; it never commits (read-only),
 		// so it needs no core back-ref. tempCommitted above already froze the temp snapshot.
-		attachedCommitted: db.attachReadView(),
+		attachedCommitted: attached,
 	}
 }
 
