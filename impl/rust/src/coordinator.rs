@@ -92,6 +92,7 @@ impl FileCoordinator {
                 io_error("resolve database path", e)
             }
         })?;
+        #[cfg(any(unix, windows))]
         reject_hard_link(&path)?;
         Self::acquire(path, mode, timeout_ms)
     }

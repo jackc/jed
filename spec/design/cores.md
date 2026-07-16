@@ -361,13 +361,21 @@ sub-100 µs lanes were effectively tied (0.98×; TS won 8), and pure TS was 2.04
 write lanes. Ordinary Node calls cost 2.01× over native Rust by geometric mean. See
 [benchmarks.md §7.3](benchmarks.md) for selected results and boundary details.
 
+That full-corpus run predates the INSERT tree-transient optimization. The final affected-write rerun
+has the wrapper at 7.600 ms versus pure TS at 15.335 ms for 1,000 rolled-back inserts, 0.462 ms versus
+0.654 ms for secondary UPDATE, near the native cores for the fsync-dominated durable commit, and
+4.250 ms versus 3.689 ms for point-set DELETE. The old “pure TS wins writes” aggregate is therefore
+not a durable product rule; write results are mixed and move with core optimization. The wrapper still
+pays a 2.82× boundary/host tax over native Rust on rollback INSERT.
+
 This evidence does **not** justify replacing the TypeScript Node engine merely because locking needs a
 native helper. The locking fast path makes no foreground addon calls while one process is alone, so the
 narrow helper preserves existing common-case performance. The full wrap is compelling for heavy reads
-and Rust-owned parallel readers, but currently regresses several cheap and write workloads and expands
-the native artifact from three lock operations to the entire engine API. Current leaning: keep native
-TS plus the narrow helper as the default proposal, retain the full wrapper experiment, and revisit an
-optional or primary native package only with a production-complete API and workload-driven evidence.
+and Rust-owned parallel readers, wins some optimized writes, but still regresses several cheap calls
+and DELETE while expanding the native artifact from three lock operations to the entire engine API.
+Current leaning: keep native TS plus the narrow helper as the default proposal, retain the full
+wrapper experiment, and revisit an optional or primary native package only with a
+production-complete API and workload-driven evidence.
 
 ## 6. Current recommendation / status
 

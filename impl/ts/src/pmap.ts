@@ -337,11 +337,7 @@ function newLeaf(
   return { keys, vals, weights, children: [], page: 0, [mutationOwner]: owner };
 }
 
-function newInterior(
-  keys: Uint8Array[],
-  children: Child[],
-  owner?: MutationGeneration,
-): PNode {
+function newInterior(keys: Uint8Array[], children: Child[], owner?: MutationGeneration): PNode {
   return { keys, vals: [], weights: [], children, page: 0, [mutationOwner]: owner };
 }
 
@@ -1074,8 +1070,7 @@ function nodeInsert(
     n.children.splice(i + 1, 0, residentRef(sub.right));
     if (payload(n, shape) <= cap || n.keys.length < 2) return { whole: n };
     const out = buildInterior(n.keys, n.children, cap, i, generation);
-    if (out === null)
-      throw new Error("insert-path interior split always has a valid split point");
+    if (out === null) throw new Error("insert-path interior split always has a valid split point");
     return out;
   }
   if (sub.whole !== null) {

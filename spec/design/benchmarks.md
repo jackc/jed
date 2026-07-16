@@ -25,7 +25,8 @@ wrapper was 1.38× faster by geometric mean, but that aggregate hides the produc
 lanes favored the wrapper by 1.55×, and pure TypeScript won the five write lanes by 2.04× geometric
 mean. Rust-owned reader threads made the wrapper 3.76× faster across the four concurrent lanes. The
 Node boundary itself cost 2.01× over native Rust by geometric mean on the single-process lanes. These
-results do not select the production Node package; §7.3 records the experiment and its limits.
+results predate the INSERT tree-transient work. The final affected-write rerun reverses the old
+rollback-INSERT result while remaining mixed overall; §7.3 records both experiments and their limits.
 
 **Top-k result (2026-07-13).** On the permanent `order_by_limit` lane, every jed core and
 PostgreSQL returned checksum `6350e1a54bbefa1d`. Median per-query time moved from the 2026-07-01
@@ -535,6 +536,98 @@ unaliased reuse, clone and cursor invalidation, and the clean-page guard. Existi
 writable-CTE, attachment, commit, and write-transaction-cursor guards exercise the corresponding
 snapshot-generation boundaries. The transient is therefore retained in both cores.
 
+**INSERT performance slice-5 final gate (2026-07-16).** The final tree is Slice-4 commit `b2cb33d3`
+plus one integration-only Rust target-gating correction: the native hard-link check is compiled only
+on Unix/Windows, so the documented `wasm32-wasip1` `locking=none` build works again. No SQL, cost,
+file-byte, or native locking behavior changed. The final `insert_rollback` run used the Slice-0 host
+and protocol (Linux 6.17 / glibc 2.39, Intel Core Ultra 9 285K, rustc 1.92.0, Go 1.26.3, Node
+24.16.0), pinned every process to CPU 2, discarded one process warmup, and retained five processes.
+Rust alternated `shared, exclusive` within every pair. Every run returned checksum
+`ac02f0205c4f05c5`; each final cell below is the median of that statistic across the five retained
+processes.
+
+| Core / locking | Slice-0 mean | Final mean | Change | Minimum | p50 | p90 | p99 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Rust / shared | 24.546 ms | 2.684 ms | -89.1% | 2.629 ms | 2.681 ms | 2.728 ms | 2.747 ms |
+| Rust / exclusive | 19.376 ms | 2.480 ms | -87.2% | 2.422 ms | 2.481 ms | 2.516 ms | 2.535 ms |
+| Go / auto (shared) | 12.174 ms | 3.818 ms | -68.6% | 2.584 ms | 3.886 ms | 4.645 ms | 4.747 ms |
+| TypeScript / auto (shared) | 18.880 ms | 15.381 ms | -18.5% | 7.891 ms | 14.712 ms | 20.876 ms | 25.771 ms |
+
+Rust/shared remains **8.2% slower by mean** (8.1% by p50) than Rust/exclusive. The original 26.7%
+gap is materially smaller, but the final 5% target is **not met**. The alone lease still performs zero
+foreground coordination syscalls and zero per-transaction meta reads; the remaining difference is the
+Linux/glibc allocator-mode effect of having started the background join-probe thread. `locking=auto`
+therefore remains the safe shared default, while `locking=exclusive` remains the explicit
+single-process maximum-performance choice.
+
+The final allocation/GC decision uses the isolated retained probes from Slices 3–4 rather than adding
+instrumentation to this timing run. Rust unique-dirty mutation removes 89.0% of allocator calls and
+94.0% of requested bytes versus the Slice-2 path-copy control. Go generation-owned transients remove
+89.5% of allocated bytes, 92.1% of GC cycles, and 91.4% of GC pause versus its Slice-3 path-copy
+control. TypeScript removes 53.4% of between-GC allocated bytes and 17 of 46 scavenges. The rejected
+Rust shared-entry and hybrid prototypes remain recorded above; no allocator, arena, or dependency was
+added.
+
+The complete final primary matrix used a disposable fingerprinted dataset, one CPU-2-pinned process
+per core, and each lane's authored warmup plus measured iterations. Times are per rolled-back
+transaction; the long-value lane inserts 100 × 16 KiB values, the others perform 1,000 row writes.
+The mixed lane maintains primary, ordinary, expression, partial, and unique-secondary indexes. Every
+checksum agreed across Rust, Go, and TypeScript (the ordinary lanes produced `31fa351a8f12676d`, the
+long-value lane `179e820b35045fba`). The disposable corpus/data/results are not committed.
+
+| Final primary lane | Go | Rust/shared | TypeScript |
+|---|---:|---:|---:|
+| no secondary index | 1.086 ms | 1.055 ms | 4.792 ms |
+| mixed secondary indexes | 5.067 ms | 3.867 ms | 17.117 ms |
+| integer-only row | 1.255 ms | 1.271 ms | 3.263 ms |
+| variable-width text row | 1.275 ms | 1.320 ms | 5.651 ms |
+| 16 KiB text, 100 rows | 10.755 ms | 8.687 ms | 263.628 ms |
+| transaction batch 1 | 0.024 ms | 0.035 ms | 0.068 ms |
+| transaction batch 10 | 0.043 ms | 0.047 ms | 0.080 ms |
+| transaction batch 100 | 0.133 ms | 0.141 ms | 0.453 ms |
+| transaction batch 1,000 | 1.063 ms | 1.059 ms | 2.625 ms |
+| ten-row statement × 100 | 1.084 ms | 0.857 ms | 1.926 ms |
+
+The permanent affected-lane matrix then ran from the checked-in corpus, again pinned to CPU 2. Each
+cell is one harness process mean after the lane's built-in warmup. Checksums agreed across all three
+cores in all twelve lanes; the result covers durable commit, reusable UPDATE/DELETE tree work, hot
+and cold PK lookup, full scan, and one/four-reader resident and cold-fault paths.
+
+| Permanent lane | Go | Rust/shared | TypeScript |
+|---|---:|---:|---:|
+| `insert_rollback` | 3.965 ms | 2.693 ms | 15.335 ms |
+| `insert_commit_durable` | 3.182 ms | 3.444 ms | 4.018 ms |
+| `secondary_lookup` | 0.015 ms | 0.012 ms | 0.043 ms |
+| `secondary_update` | 0.275 ms | 0.379 ms | 0.654 ms |
+| `secondary_pointset_delete` | 2.337 ms | 3.966 ms | 3.689 ms |
+| `point_lookup_pk_ramp` | 0.003 ms | 0.003 ms | 0.011 ms |
+| `point_lookup_pk` | 0.002 ms | 0.002 ms | 0.007 ms |
+| `full_scan_agg_filter` | 33.337 ms | 50.530 ms | 143.357 ms |
+| `concurrent_read_pk_r1` | 0.012 ms/op | 0.008 ms/op | 0.032 ms/op |
+| `concurrent_read_pk_r4` | 0.012 ms/op | 0.008 ms/op | 0.021 ms/op |
+| `concurrent_read_pk_cold_r1` | 0.030 ms/op | 0.031 ms/op | 0.068 ms/op |
+| `concurrent_read_pk_cold_r4` | 0.029 ms/op | 0.030 ms/op | 0.066 ms/op |
+
+The final CPU-pinned Node/Rust write subset also agreed on every checksum. Unlike the pre-transient
+full wrapper run, the optimized wrapper now wins rollback INSERT and UPDATE over pure TypeScript,
+durable commit is fsync-noisy and close, and TypeScript still wins the point-set DELETE. The delivery
+decision therefore remains workload-dependent, not “native TS wins writes” or “the wrapper always
+runs at Rust speed.”
+
+| Affected write lane | Pure TS | Node/Rust wrap | Native Rust |
+|---|---:|---:|---:|
+| `insert_rollback` | 15.335 ms | 7.600 ms | 2.693 ms |
+| `insert_commit_durable` | 4.018 ms | 3.425 ms | 3.444 ms |
+| `secondary_update` | 0.654 ms | 0.462 ms | 0.379 ms |
+| `secondary_pointset_delete` | 3.689 ms | 4.250 ms | 3.966 ms |
+
+The integration gate passed the three core unit suites, shared conformance/cost corpus in memory and
+disk modes, byte-exact goldens and cross-core round trips, Go's full race suite, stepped Rust/Go race
+conformance, every Rust/Go/Node real-process pairing, TS Node/browser/worker typechecks, and the real
+Chromium OPFS durability tests. The full `rake ci` gate also passed, including all core/consumer
+tests, the 2,280-check cross-core NoREC sweep, and the reducer self-test. No `/web` change is needed
+because SQL and host APIs are unchanged.
+
 ## 1. Purpose and non-goals
 
 The benchmark suite answers two questions, continuously:
@@ -957,11 +1050,24 @@ beside it to distinguish core differences from binding overhead. Selected means:
 | hot PK reads, four readers | 18.1 µs/op | 3.3 µs/op | wrap 5.42× faster |
 | cold-populating PK reads, four readers | 65.5 µs/op | 8.9 µs/op | wrap 7.38× faster |
 
+That table is the pre-INSERT-transient full-corpus experiment. The final Slice-5 CPU-pinned affected
+write rerun uses the optimized cores:
+
+| Affected write lane | Pure TS | Node/Rust wrap | Native Rust |
+|---|---:|---:|---:|
+| 1,000 inserts then rollback | 15.335 ms | 7.600 ms | 2.693 ms |
+| one-row durable commit | 4.018 ms | 3.425 ms | 3.444 ms |
+| secondary-index UPDATE | 0.654 ms | 0.462 ms | 0.379 ms |
+| point-set DELETE | 3.689 ms | 4.250 ms | 3.966 ms |
+
 The concurrent hook intentionally makes one Node call around the whole threaded phase; its near-zero
 delta from the native Rust control is not the cost of ordinary per-query Node calls. Conversely, the
 single-process wrapper/native-Rust comparison includes the ordinary boundary: 2.01× geometric-mean
-tax overall and 2.77× on the 13 cheap lanes. The comparison therefore supports a workload split, not
-the slogan that a native wrapper always runs at Rust speed.
+tax overall and 2.77× on the 13 cheap lanes in the full pre-transient run. The final write rerun shows
+why the comparison must be refreshed after core work: the wrapper now wins INSERT and UPDATE over
+pure TS but remains 2.82× slower than native Rust on rollback INSERT, while pure TS still wins DELETE.
+The comparison therefore supports a workload split, not the slogan that either Node engine always
+wins or that a native wrapper runs at Rust speed.
 
 ## 8. Write benchmarks and the scratch database
 

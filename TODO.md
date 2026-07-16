@@ -211,7 +211,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 > full-residency assumption above the storage seam.
 
 - [x] **Shared multi-process file access** — ✅ **landed** ([locking.md](spec/design/locking.md)). The stable `protocol-v1` bundle, alone fast path, global writer, commit/meta gate, append-only shared commits, foreign-plan invalidation, independently coordinated file attachments, and Rust↔Go↔Node real-process matrix are implemented. `locking = auto` is shared on capable local hosts. Pre-protocol binaries still require a one-time drain. → [locking.md](spec/design/locking.md)
-  - [x] **Node OS-lock adapter + delivery decision** — the independent TypeScript engine is retained and uses the narrow first-party `impl/ts/native-lock` Node-API adapter; the exact pins and bounded host-only native exception are approved. The full Rust wrapper remains an experimental reach package because its benchmark win is workload-dependent (heavy/parallel reads) and pure TS wins cheap/write lanes. → [locking.md §8](spec/design/locking.md), [benchmarks.md §7.3](spec/design/benchmarks.md)
+  - [x] **Node OS-lock adapter + delivery decision** — the independent TypeScript engine is retained and uses the narrow first-party `impl/ts/native-lock` Node-API adapter; the exact pins and bounded host-only native exception are approved. The full Rust wrapper remains an experimental reach package because its benchmark win is workload-dependent: heavy/parallel reads and the final optimized INSERT/UPDATE subset favor the wrapper, many cheap calls and point-set DELETE favor pure TS, and ordinary calls retain a material boundary tax. → [locking.md §8](spec/design/locking.md), [benchmarks.md §7.3](spec/design/benchmarks.md)
   - [ ] **Node prebuilt distribution matrix** — ship no-install-script Node-API-8 artifacts for Linux glibc/musl x64+arm64, macOS x64+arm64, and Windows x64 with SHA-256/provenance and packaging tests. Source/dev builds already use `rake ts:lock_build`; missing production artifacts fail closed `0A000`.
   - [ ] **Expanded shared-file fault/platform matrix** — extend the landed real-process handoff, timeout, pinned-reader, killed-writer, and attachment scenarios with deterministic body-sync/meta-publish fault hooks, compaction continuity once compaction exists, symlink/hard-link process lanes, and every supported Windows/macOS packaging lane.
 - [ ] **File compaction / shrink (return space to the OS)** — ⏳ **approach decided, not built.** The free-list recycles dead space for jed but `page_count` is a monotonic high-water, so the file is grow-only. Decided mechanism: a **host-invoked compaction** that re-serializes the committed snapshot through the from-scratch `to_image` serializer into a fresh file + atomic swap (the `create` temp-file + fsync + rename recipe), reclaiming all dead space + defragmenting (the SQLite `VACUUM` / PG `VACUUM FULL` flavor) crash-safely. Explicit / host-invoked; under the shared protocol it requires presence-EX proof of cross-process aloneness **and** a drained in-process reader watermark. The stable lock bundle remains held across close/rename/reopen, so the replacement never escapes coordination. A lighter in-place trailing-free truncation stays open as a cheaper partial complement. → [storage.md §6](spec/design/storage.md) _(size: M–L; deps: page reclamation (done), shared coordinator; §9)_
@@ -258,17 +258,22 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     detaches old loads and prevents stale page-id reinsertion. Focused synchronization + reader/writer
     race tests and the shared cold r1/r4 benchmark are recorded in [pager.md](spec/design/pager.md) and
     [benchmarks.md](spec/design/benchmarks.md). TypeScript remains single-threaded.
-  - [x] **INSERT guardrail + execution/cache/tree path (slices 0–4)** — pinned immutable snapshot/cursor,
+  - [x] **INSERT guardrail + execution/cache/tree path (slices 0–5)** — pinned immutable snapshot/cursor,
     attachment, split/overwrite/rollback, writable-CTE collision, exact-cost, and byte-golden behavior
     across the three cores; recorded paired attribution/allocation evidence, specified exact INSERT
     error/write order, removed one-row batch sets/buffers, and cached immutable prepared-INSERT
     resolution metadata behind schema/identity signatures in Rust, Go, and TypeScript. Rust now edits
     only `Arc::get_mut`-unique dirty INSERT paths in place, cutting its 1,000-row allocation probe by
-    89.0% and shared rollback latency by 88.2%; shared remains 8.6% slower than exclusive. Go and
+    89.0%; end-to-end shared rollback latency is 89.1% below Slice 0. Go and
     TypeScript use private mutation-generation tokens to reuse only transaction-owned dirty paths;
-    Go's lane improved 67.2% with 89.5% fewer allocated bytes, while TypeScript improved 7.4% with
-    53.4% fewer traced allocated bytes. →
-    [benchmarks.md](spec/design/benchmarks.md), [temporary slice plan](TODO-insert-performance.md)
+    Go's end-to-end lane improved 68.6% with 89.5% fewer transient-path allocated bytes, while
+    TypeScript improved 18.5% end-to-end with 53.4% fewer traced allocated bytes in the isolated
+    transient comparison. The complete final primary/regression matrices, Node/Rust write rerun,
+    races, process corpus, OPFS tests, and full merge gate are recorded in the canonical benchmark
+    doc. Rust/shared remains truthfully **8.2% slower** than `exclusive`, outside the 5% goal, despite
+    zero foreground coordination syscalls/meta reads; `exclusive` is the maximum-performance
+    single-process option. → [benchmarks.md](spec/design/benchmarks.md),
+    [locking.md §9.3](spec/design/locking.md)
   - [ ] _follow-on:_ evaluate unique-dirty mutation for remove/rebalance separately; Slice 3 deliberately
     leaves DELETE on the pure copy-on-write path until its own allocation evidence justifies the extra
     mutable merge/split cases. Rust-only, no byte or cost change. _(size: M)_
