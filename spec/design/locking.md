@@ -12,10 +12,11 @@
 
 ## 1. Decision and status
 
-The engine currently coordinates concurrent sessions only when they share one in-process `Database`.
-Separate opens have separate buffer pools, free-list state, reader watermarks, and writer gates. Without
-cross-process coordination, two handles can reuse the same page, overwrite a page cached by the other,
-or publish meta slots from different bases. That is undefined corruption today.
+**Status: landed on the Rust, Go, and Node/TypeScript local-file hosts (2026-07-16).** Public
+`Database` opens and file attachments participate before reading database bytes; the shared
+`file.shared_process` actor corpus runs every same-core and cross-core pairing in
+`rake concurrency:process` and `rake ci`. `locking = none`, pre-protocol binaries, and non-cooperating
+file mutation remain explicitly outside the safety boundary.
 
 **Decision (revised 2026-07-16): build shared multi-process access as the first locking slice.**
 
@@ -140,10 +141,10 @@ The bundle is opened once per database handle and held until `close`; open failu
 file. A process-local registry rejects a second independent open of the same real path (`55006`) rather
 than relying on platform-specific same-process lock ownership. Local callers share sessions from one
 `Database`, which already supplies the intended in-process concurrency. A handle inherited across
-`fork` is invalid: every operation verifies the opener PID, closes the child's inherited descriptor
-copies, clears the inherited registry entry, and requires the child to reopen. Fork-without-exec code
-must not retain an inherited handle indefinitely; ordinary spawn/exec paths inherit no bundle
-descriptors (`CLOEXEC`).
+`fork` is invalid: every operation that can write verifies the opener PID and requires the child to
+reopen. A child must promptly close/drop the inherited handle even if it only attempted a read;
+fork-without-exec code must not retain inherited descriptor copies indefinitely. Ordinary spawn/exec
+paths inherit no bundle descriptors (`CLOEXEC`).
 
 ## 4. The uncontended lease
 
@@ -277,8 +278,12 @@ highest CRC-valid meta. It must never continue writing from an assumed prior roo
   through the rename because `presence EX` lives on the unchanged bundle.
 - **Trailing truncation** has the same aloneness rule. Shared commits never lower `page_count`.
 - **Attachments** coordinate independently per file. The existing one-durable-writer-per-transaction
-  rule remains until the super-journal slice; acquiring several file writer gates is not introduced by
-  this protocol.
+  rule remains until the super-journal slice. Because the current BEGIN surface does not declare which
+  durable database it may later write, a writable transaction conservatively acquires the writer gate
+  of `main` and every read-write file attachment that is currently shared, in normalized UTF-8 path
+  order. This prevents stale-base overwrite and cross-handle deadlock. It deliberately trades
+  multi-process performance for safety; alone/exclusive coordinators add no foreground syscall, so the
+  common one-process case is unchanged. A future target-declaring transaction API may narrow the set.
 
 ## 7. Host/API surface
 
@@ -295,9 +300,11 @@ The session setting `lock_timeout_ms` separately bounds the shared writer gate; 
 matching PostgreSQL's `lock_timeout` default. These names deliberately distinguish open/join liveness
 from transaction lock waiting.
 
-`AttachSource::file(path, options)` owns attachment options; the boolean attachment mode still decides
-read-only vs read-write. `create` stores only applicable file-lock options from `CreateOptions`; an
-in-memory create ignores them.
+File attachment sources own attachment options; the boolean attachment mode still decides read-only
+vs read-write. The idiomatic spellings are Rust `AttachSource::file(path).locking(...)
+.file_lock_timeout_ms(...)`, Go `AttachFileWithOptions(path, AttachFileOptions{...})`, and TypeScript
+`attachFile(path, { locking, fileLockTimeoutMs })`. `create` stores only applicable file-lock options
+from `CreateOptions`; an in-memory create ignores them.
 
 Go represents `file_lock_timeout_ms` as `*uint64`: `nil` is the 5000 ms default and a non-nil pointer
 to `0` is the explicit immediate attempt. This is required to preserve both the zero-value options
@@ -359,7 +366,7 @@ were effectively tied (0.98×; TypeScript won 8) and pure TypeScript was 2.04× 
 on the five write lanes. The Node boundary cost 2.01× over native Rust across single-process lanes.
 This is a meaningful heavy-read/parallelism win, not a universal win and not zero-cost Rust speed.
 
-**Current proposal:** use the narrow adapter for the TypeScript Node host. Requiring one bounded native
+**Decision:** use the narrow adapter for the TypeScript Node host. Requiring one bounded native
 locking component does not erase the distinction between a TypeScript engine and a full Rust engine:
 the narrow path keeps the existing single-process foreground path unchanged, preserves independent TS
 conformance, keeps host functions in-language, and ships much less native surface. Keep `impl/node` as
@@ -369,9 +376,9 @@ product instead chooses the full wrapper, say explicitly whether the native TS c
 shared Node files through the adapter or treats the OS-lock host as unavailable; wrapping Rust must not
 silently count as an independent TypeScript conformance result.
 
-The exact prototype dependencies, approved and added only to the separate experimental host artifact,
-are `napi = 3.10.5`, `napi-derive = 3.5.10`, and build-only `napi-build = 2.3.2`, all exact-pinned with
-the transitive lockfile committed. The proposed production artifact matrix for either native choice is
+The exact dependencies approved for the narrow production host and the separate experiment are
+`napi = 3.10.5`, `napi-derive = 3.5.10`, and build-only `napi-build = 2.3.2`, all exact-pinned with
+transitive lockfiles committed. The remaining production distribution matrix is
 Linux glibc x64/arm64, Linux musl x64/arm64, macOS x64/arm64, and Windows x64, built against stable
 Node-API 8. Artifacts ship inside the package with a SHA-256 manifest and provenance; installation runs
 no script and downloads nothing. A platform without a matching artifact fails closed.
@@ -387,11 +394,10 @@ That does not weaken safety, but it is a real ergonomics cost: applications that
 cross-process write transactions should run jed in a worker thread or choose finite timeouts. An async
 embedding surface is a separate API slice, not hidden inside the lock protocol.
 
-Production remains an explicit architecture/distribution gate: CLAUDE.md §14 ordinarily rejects
-dependencies that introduce FFI/unsafe code. The prototype authorizes the exact pins for comparison;
-shipping either package still requires accepting the bounded Node-API exception and verifying the
-artifact matrix above. If no native artifact is accepted, Node `shared` fails closed with `0A000`; it
-does not silently weaken the protocol. OPFS remains inherently exclusive and does not need an addon.
+The bounded Node-API host exception is recorded in CLAUDE.md §14. Completing and verifying the prebuilt
+artifact matrix above remains a packaging gate; a package without a matching artifact fails Node
+`shared` closed with `0A000` and never weakens the protocol. OPFS remains inherently exclusive and does
+not need an addon.
 
 ## 9. Verification contract
 
@@ -442,5 +448,5 @@ separately and bounded by the polling interval.
 5. **Compaction integration and public docs:** stable-bundle handoff for the later compaction slice;
    update website examples/status when shared locking becomes user-visible.
 
-The shared feature is not “landed” until slices 1–4 are green together. Rust/Go-only shared behavior is
-an intermediate branch state, not a released cross-core capability.
+Slices 1–4 are landed together. Slice 5's public status work is landed; its compaction handoff remains
+coupled to the still-deferred compaction feature itself.

@@ -51,6 +51,9 @@ func run() error {
 		switch command {
 		case "EXEC":
 			_, err = db.Exec(context.Background(), sql(argument))
+		case "ATTACH":
+			parts := strings.SplitN(argument, "\t", 3)
+			err = db.Attach(parts[0], jed.AttachFile(parts[2]), parts[1] == "1")
 		case "QUERY_I64":
 			value, err = queryI64(db, sql(argument))
 		case "READ_OPEN":

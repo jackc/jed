@@ -1,27 +1,51 @@
 schema_version = 1
-name = "shared-handoff-and-crash-release"
-description = "Two independent cores share snapshots, serialize writers, and recover a killed writer gate."
+name = "shared-file-attachment-handoff"
+description = "Two handles with independent main files coordinate one writable file attachment."
 requires = ["file.shared_process"]
 
 [[step]]
-actor = "a"
+actor = "b"
 command = "start"
 argument = "create"
+path = "attachment"
 
 [[step]]
-actor = "a"
+actor = "b"
 command = "exec"
 sql = "CREATE TABLE t (id i64 PRIMARY KEY)"
 
 [[step]]
-actor = "a"
+actor = "b"
 command = "exec"
 sql = "INSERT INTO t VALUES (1)"
 
 [[step]]
 actor = "b"
+command = "close"
+
+[[step]]
+actor = "a"
 command = "start"
-argument = "open"
+argument = "create"
+path = "main_a"
+
+[[step]]
+actor = "a"
+command = "attach"
+name = "work"
+path = "attachment"
+
+[[step]]
+actor = "b"
+command = "start"
+argument = "create"
+path = "main_b"
+
+[[step]]
+actor = "b"
+command = "attach"
+name = "work"
+path = "attachment"
 
 [[step]]
 actor = "a"
@@ -30,18 +54,18 @@ command = "read_open"
 [[step]]
 actor = "a"
 command = "read_query_i64"
-sql = "SELECT id FROM t ORDER BY id"
+sql = "SELECT id FROM work.t ORDER BY id"
 expect = "1"
 
 [[step]]
 actor = "b"
 command = "exec"
-sql = "INSERT INTO t VALUES (2)"
+sql = "INSERT INTO work.t VALUES (2)"
 
 [[step]]
 actor = "a"
 command = "read_query_i64"
-sql = "SELECT id FROM t ORDER BY id"
+sql = "SELECT id FROM work.t ORDER BY id"
 expect = "1"
 
 [[step]]
@@ -51,7 +75,7 @@ command = "read_close"
 [[step]]
 actor = "a"
 command = "query_i64"
-sql = "SELECT id FROM t ORDER BY id"
+sql = "SELECT id FROM work.t ORDER BY id"
 expect = "1,2"
 
 [[step]]
@@ -62,7 +86,7 @@ argument = "0"
 [[step]]
 actor = "a"
 command = "write_exec"
-sql = "INSERT INTO t VALUES (3)"
+sql = "INSERT INTO work.t VALUES (3)"
 
 [[step]]
 actor = "b"
@@ -76,23 +100,8 @@ command = "write_commit"
 
 [[step]]
 actor = "b"
-command = "write_open"
-argument = "5000"
-
-[[step]]
-actor = "b"
-command = "write_exec"
-sql = "INSERT INTO t VALUES (4)"
-
-[[step]]
-actor = "b"
-command = "write_commit"
-
-[[step]]
-actor = "a"
-command = "query_i64"
-sql = "SELECT id FROM t ORDER BY id"
-expect = "1,2,3,4"
+command = "exec"
+sql = "INSERT INTO work.t VALUES (4)"
 
 [[step]]
 actor = "b"
@@ -102,7 +111,7 @@ argument = "0"
 [[step]]
 actor = "b"
 command = "write_exec"
-sql = "INSERT INTO t VALUES (5)"
+sql = "INSERT INTO work.t VALUES (5)"
 
 [[step]]
 actor = "b"
@@ -111,12 +120,12 @@ command = "kill"
 [[step]]
 actor = "a"
 command = "exec"
-sql = "INSERT INTO t VALUES (6)"
+sql = "INSERT INTO work.t VALUES (6)"
 
 [[step]]
 actor = "a"
 command = "query_i64"
-sql = "SELECT id FROM t ORDER BY id"
+sql = "SELECT id FROM work.t ORDER BY id"
 expect = "1,2,3,4,6"
 
 [[step]]

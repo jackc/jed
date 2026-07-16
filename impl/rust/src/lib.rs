@@ -933,6 +933,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // constraint — name, table_name, type, columns (text[]), expression, ref_table, ref_columns
     // (text[]) (introspection.md §5.1).
     "introspect.constraints",
+    // Stable lock-bundle protocol for safe shared multi-process main files and file attachments.
+    "file.shared_process",
 ];
 
 /// Parse and execute one SQL statement against a low-level [`Engine`] (no bind parameters).

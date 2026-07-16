@@ -666,10 +666,34 @@ export function* bufferedRows(
 // non-null, a FileBlockStore behind the pager, committed durably via commitDurableAttachment) or
 // in-memory (storage.path is null, a MemoryBlockStore, committed via persistTemp). The storage Engine's
 // path is the sole source of the file/memory distinction.
+export type LeaseState = "alone" | "shared" | "exclusive" | "poisoned";
+
+// Host-owned OS coordination surface. It lives beside Attachment so the executor can select the
+// shared append-only commit without importing the Node host.
+export interface FileCoordinatorHost {
+  readonly path: string;
+  state: LeaseState;
+  checkPid(): void;
+  startProbe(tick: () => void): void;
+  lockCommitShared(): void;
+  lockCommitExclusive(): void;
+  unlockCommit(): void;
+  lockWriter(timeoutMs: number): void;
+  unlockWriter(): void;
+  tryArrivalExclusive(): boolean;
+  unlockArrival(): void;
+  lockTransition(): void;
+  unlockTransition(): void;
+  downgradePresence(): void;
+  tryUpgradePresence(): boolean;
+  close(): void;
+}
+
 export type Attachment = {
   name: string; // lowercased qualifier name (the registry key)
   readOnly: boolean; // a read-only attachment rejects every write (DML + DDL) with 25006 (§4)
   storage: Engine; // the block store (file or in-memory) + pager + page accounting
+  coordinator: FileCoordinatorHost | null;
 };
 
 // AttachmentCore is the minimal view of the shared core the executor needs for attachment routing

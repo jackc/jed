@@ -71,9 +71,12 @@ class Actor
   end
 end
 
-def actor_command(step)
+def actor_command(step, dir)
   command = step.fetch("command").upcase
-  argument = if step.key?("sql")
+  argument = if step.fetch("command") == "attach"
+               [step.fetch("name"), step.fetch("read_only", false) ? "1" : "0",
+                File.join(dir, "#{step.fetch('path')}.jed")].join("\t")
+             elsif step.key?("sql")
                step.fetch("sql").unpack1("H*")
              else
                step.fetch("argument", "").to_s
@@ -86,7 +89,6 @@ def run_scenario(path, first_core, second_core)
   raise "#{path}: schema_version must be 1" unless data["schema_version"] == 1
   name = data.fetch("name")
   Dir.mktmpdir("jed-process-") do |dir|
-    database = File.join(dir, "shared.jed")
     actors = {}
     begin
       data.fetch("step").each_with_index do |step, index|
@@ -95,7 +97,8 @@ def run_scenario(path, first_core, second_core)
           command = step.fetch("command")
           if command == "start"
             core = actor_name == "a" ? first_core : second_core
-            actors[actor_name] = Actor.new(core, step.fetch("argument"), database)
+            actor_path = File.join(dir, "#{step.fetch('path', 'shared')}.jed")
+            actors[actor_name] = Actor.new(core, step.fetch("argument"), actor_path)
             next
           end
           actor = actors.fetch(actor_name)
@@ -109,7 +112,7 @@ def run_scenario(path, first_core, second_core)
             actors.delete(actor_name)
             next
           end
-          wire, argument = actor_command(step)
+          wire, argument = actor_command(step, dir)
           result = actor.command(wire, argument)
           if expected = step["expect_error"]
             unless result[0] == :error && result[1] == expected

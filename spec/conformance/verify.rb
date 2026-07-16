@@ -7,8 +7,8 @@
 #
 #   1. every capability a profile lists is a defined capability
 #   2. every profile `includes` names a defined profile (no cycles)
-#   3. every capability a .test file `requires:` is a defined capability
-#   4. no orphan capabilities (defined but never required by any test)
+#   3. every capability a .test or .process.toml file requires is defined
+#   4. no orphan capabilities (defined, never required by any corpus file)
 #   5. every .test file carries exactly one `# requires:` line
 #   6. every `# cost: N` directive parses as a non-negative integer, and any file using
 #      one declares the `resource.cost_metering` capability (CLAUDE.md §13)
@@ -20,6 +20,7 @@ require "toml-rb"
 
 CONF_DIR = __dir__
 SUITES_DIR = File.join(CONF_DIR, "suites")
+PROCESS_DIR = File.join(CONF_DIR, "process")
 
 def fail!(msg)
   warn "FAIL: #{msg}"
@@ -119,6 +120,18 @@ def main
       unless reqs.include?("resource.sql_length_limit")
         fail!("#{rel}: uses `# max_sql_length:` but does not require `resource.sql_length_limit`")
       end
+    end
+  end
+
+  # Layer-4 host/process scenarios are not sqllogictest files, but they participate in the same
+  # capability taxonomy through a top-level TOML `requires` array.
+  Dir.glob(File.join(PROCESS_DIR, "*.process.toml")).sort.each do |path|
+    rel = path.delete_prefix("#{CONF_DIR}/")
+    reqs = TomlRB.load_file(path)["requires"] || []
+    fail!("#{rel}: empty `requires` array") if reqs.empty?
+    reqs.each do |capability|
+      fail!("#{rel}: requires undefined capability #{capability}") unless cap_set.include?(capability)
+      required_anywhere << capability
     end
   end
 

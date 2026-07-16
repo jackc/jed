@@ -52,6 +52,7 @@ package jed
 // drives the single-handle path and mints additional concurrent sessions.
 
 import (
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -100,7 +101,8 @@ type sharedCore struct {
 	roots atomic.Pointer[roots]
 	// writeMu is the single-writer gate: a goroutine holds it for its whole write transaction, so a
 	// second Write blocks until the holder commits or rolls back (CLAUDE.md §3 — at most one writer).
-	writeMu sync.Mutex
+	writeMu          sync.Mutex
+	heldCoordinators []*fileCoordinator // exact shared writer locks acquired with writeMu
 	// liveMu guards live, the live-reader registry (transactions.md §8): pinned version → refcount.
 	// Its minimum key is the reclamation watermark (several readers may pin the same version).
 	liveMu sync.Mutex
@@ -116,63 +118,184 @@ type sharedCore struct {
 	// key. Populated by Database.Attach / cleared by Database.Detach (host-API, §4), both under the
 	// writer gate. nil/empty when nothing is attached — the common case, byte-for-byte the
 	// pre-attachment behavior. Session-local temp is NOT here (it is session-private, on sessionState).
-	attachments map[string]*attachment
-	coordinator *fileCoordinator
-	planEpoch   atomic.Uint64
+	attachmentsMu   sync.RWMutex
+	attachments     map[string]*attachment
+	attachmentCount atomic.Int64
+	coordinator     *fileCoordinator
+	planEpoch       atomic.Uint64
 }
 
 func (c *sharedCore) acquireWriter(timeoutMs uint64) error {
 	c.writeMu.Lock()
-	if c.coordinator == nil {
-		return nil
+	if c.attachmentCount.Load() == 0 {
+		if c.coordinator == nil {
+			return nil
+		}
+		if err := c.coordinator.checkPID(); err != nil {
+			c.writeMu.Unlock()
+			return err
+		}
+		switch c.coordinator.lease() {
+		case leaseAlone, leaseExclusive:
+			return nil
+		case leasePoisoned:
+			c.writeMu.Unlock()
+			return newError(IoError, "shared-file coordinator is poisoned")
+		}
 	}
-	if err := c.coordinator.checkPID(); err != nil {
+	coordinators := c.writableCoordinators()
+	held := make([]*fileCoordinator, 0, len(coordinators))
+	unlock := func() {
+		for i := len(held) - 1; i >= 0; i-- {
+			held[i].unlockWriter()
+		}
+	}
+	for _, coordinator := range coordinators {
+		if err := coordinator.checkPID(); err != nil {
+			unlock()
+			c.writeMu.Unlock()
+			return err
+		}
+		switch coordinator.lease() {
+		case leaseShared:
+			if err := coordinator.lockWriter(timeoutMs); err != nil {
+				unlock()
+				c.writeMu.Unlock()
+				return err
+			}
+			held = append(held, coordinator)
+		case leasePoisoned:
+			unlock()
+			c.writeMu.Unlock()
+			return newError(IoError, "shared-file coordinator is poisoned")
+		}
+	}
+	if err := c.refreshShared(); err != nil {
+		unlock()
 		c.writeMu.Unlock()
 		return err
 	}
-	switch c.coordinator.lease() {
-	case leaseShared:
-		if err := c.coordinator.lockWriter(timeoutMs); err != nil {
-			c.writeMu.Unlock()
-			return err
-		}
-		if err := c.refreshShared(); err != nil {
-			c.coordinator.unlockWriter()
-			c.writeMu.Unlock()
-			return err
-		}
-	case leasePoisoned:
-		c.writeMu.Unlock()
-		return newError(IoError, "shared-file coordinator is poisoned")
-	}
+	c.heldCoordinators = held
 	return nil
 }
 
 func (c *sharedCore) releaseWriter() {
-	if c.coordinator != nil && c.coordinator.lease() == leaseShared {
-		c.coordinator.unlockWriter()
+	for i := len(c.heldCoordinators) - 1; i >= 0; i-- {
+		c.heldCoordinators[i].unlockWriter()
 	}
+	c.heldCoordinators = nil
 	c.writeMu.Unlock()
 }
 
-func (c *sharedCore) refreshShared() error {
-	coord := c.coordinator
-	if coord == nil || coord.lease() != leaseShared {
+func (c *sharedCore) writableCoordinators() []*fileCoordinator {
+	c.attachmentsMu.RLock()
+	defer c.attachmentsMu.RUnlock()
+	coordinators := make([]*fileCoordinator, 0, len(c.attachments)+1)
+	if c.coordinator != nil {
+		coordinators = append(coordinators, c.coordinator)
+	}
+	for _, attachment := range c.attachments {
+		if attachment.mode == attachReadWrite && attachment.coordinator != nil {
+			coordinators = append(coordinators, attachment.coordinator)
+		}
+	}
+	sort.Slice(coordinators, func(i, j int) bool { return coordinators[i].path < coordinators[j].path })
+	return coordinators
+}
+
+func (c *sharedCore) hasSharedCoordinator() bool {
+	if c.coordinator != nil && c.coordinator.lease() == leaseShared {
+		return true
+	}
+	if c.attachmentCount.Load() == 0 {
+		return false
+	}
+	c.attachmentsMu.RLock()
+	defer c.attachmentsMu.RUnlock()
+	for _, attachment := range c.attachments {
+		if attachment.coordinator != nil && attachment.coordinator.lease() == leaseShared {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *sharedCore) checkCoordinatorPIDs() error {
+	if c.coordinator != nil {
+		if err := c.coordinator.checkPID(); err != nil {
+			return err
+		}
+	}
+	if c.attachmentCount.Load() == 0 {
 		return nil
 	}
-	if err := coord.checkPID(); err != nil {
-		return err
+	c.attachmentsMu.RLock()
+	defer c.attachmentsMu.RUnlock()
+	for _, attachment := range c.attachments {
+		if attachment.coordinator != nil {
+			if err := attachment.coordinator.checkPID(); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (c *sharedCore) attachment(name string) *attachment {
+	c.attachmentsMu.RLock()
+	defer c.attachmentsMu.RUnlock()
+	return c.attachments[name]
+}
+
+func (c *sharedCore) refreshShared() error {
+	if !c.hasSharedCoordinator() {
+		return nil
 	}
 	c.liveMu.Lock()
 	defer c.liveMu.Unlock()
-	if coord.lease() != leaseShared {
-		return nil
+	if coord := c.coordinator; coord != nil && coord.lease() == leaseShared {
+		if err := coord.checkPID(); err != nil {
+			return err
+		}
+		if err := coord.lockCommitShared(); err != nil {
+			return err
+		}
+		err := c.reloadFromPager()
+		coord.unlockCommit()
+		if err != nil {
+			return err
+		}
 	}
-	if err := coord.lockCommitShared(); err != nil {
-		return err
+	type coordinatedAttachment struct {
+		name  string
+		coord *fileCoordinator
 	}
-	defer coord.unlockCommit()
-	return c.reloadFromPager()
+	c.attachmentsMu.RLock()
+	coordinated := make([]coordinatedAttachment, 0, len(c.attachments))
+	for name, attachment := range c.attachments {
+		if attachment.coordinator != nil {
+			coordinated = append(coordinated, coordinatedAttachment{name: name, coord: attachment.coordinator})
+		}
+	}
+	c.attachmentsMu.RUnlock()
+	sort.Slice(coordinated, func(i, j int) bool { return coordinated[i].coord.path < coordinated[j].coord.path })
+	for _, attachment := range coordinated {
+		if attachment.coord.lease() != leaseShared {
+			continue
+		}
+		if err := attachment.coord.checkPID(); err != nil {
+			return err
+		}
+		if err := attachment.coord.lockCommitShared(); err != nil {
+			return err
+		}
+		err := c.reloadAttachmentFromPager(attachment.name)
+		attachment.coord.unlockCommit()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (c *sharedCore) reloadFromPager() error {
@@ -202,6 +325,42 @@ func (c *sharedCore) reloadFromPager() error {
 	return nil
 }
 
+func (c *sharedCore) reloadAttachmentFromPager(name string) error {
+	attachment := c.attachment(name)
+	if attachment == nil {
+		return nil
+	}
+	attachment.storage.mu.Lock()
+	if err := attachment.storage.paging.withPager(func(p *pager) error { return p.refreshAllocatedPages() }); err != nil {
+		attachment.storage.mu.Unlock()
+		return err
+	}
+	loaded, err := loadEngineSharedPaging(attachment.storage.paging)
+	if err != nil {
+		attachment.storage.mu.Unlock()
+		return err
+	}
+	current := c.roots.Load().attached[name]
+	if current != nil && loaded.committed.txid <= current.txid {
+		attachment.storage.mu.Unlock()
+		return nil
+	}
+	attachment.storage.pageCount = loaded.pageCount
+	attachment.storage.freePages = loaded.freePages
+	attachment.storage.liveAtCompaction = loaded.liveAtCompaction
+	attachment.storage.freeGenTxid = loaded.freeGenTxid
+	attachment.storage.mu.Unlock()
+	old := c.roots.Load()
+	attached := make(map[string]*snapshot, len(old.attached))
+	for key, root := range old.attached {
+		attached[key] = root
+	}
+	attached[name] = loaded.committed
+	c.roots.Store(&roots{committed: old.committed, attached: attached})
+	c.planEpoch.Add(1)
+	return nil
+}
+
 func (c *sharedCore) coordinationTick() {
 	coord := c.coordinator
 	if coord == nil {
@@ -212,7 +371,20 @@ func (c *sharedCore) coordinationTick() {
 	case leaseAlone:
 		err = c.tryDowngrade(coord)
 	case leaseShared:
-		err = c.tryUpgrade(coord)
+		err = c.tryUpgrade(coord, "")
+	}
+	if err != nil {
+		coord.setLease(leasePoisoned)
+	}
+}
+
+func (c *sharedCore) coordinationTickAttachment(name string, coord *fileCoordinator) {
+	var err error
+	switch coord.lease() {
+	case leaseAlone:
+		err = c.tryDowngrade(coord)
+	case leaseShared:
+		err = c.tryUpgrade(coord, name)
 	}
 	if err != nil {
 		coord.setLease(leasePoisoned)
@@ -247,7 +419,7 @@ func (c *sharedCore) tryDowngrade(coord *fileCoordinator) error {
 	return coord.downgradePresence()
 }
 
-func (c *sharedCore) tryUpgrade(coord *fileCoordinator) error {
+func (c *sharedCore) tryUpgrade(coord *fileCoordinator, attachment string) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	c.liveMu.Lock()
@@ -271,7 +443,11 @@ func (c *sharedCore) tryUpgrade(coord *fileCoordinator) error {
 	if err := coord.lockCommitShared(); err != nil {
 		return err
 	}
-	err = c.reloadFromPager()
+	if attachment == "" {
+		err = c.reloadFromPager()
+	} else {
+		err = c.reloadAttachmentFromPager(attachment)
+	}
 	coord.unlockCommit()
 	if err == nil {
 		coord.setLease(leaseAlone)
@@ -298,9 +474,10 @@ const (
 // committed via persistTemp). The storage kind is the sole source of the file/memory distinction — no
 // separate flag.
 type attachment struct {
-	name    string     // lowercased qualifier name (the map key)
-	mode    attachMode // readWrite | readOnly (§4)
-	storage *storage   // the block store (file or in-memory) + pager + page accounting
+	name        string           // lowercased qualifier name (the map key)
+	mode        attachMode       // readWrite | readOnly (§4)
+	storage     *storage         // the block store (file or in-memory) + pager + page accounting
+	coordinator *fileCoordinator // independent file lock domain; nil for memory/locking=none
 }
 
 // isFile reports whether this attachment is file-backed (durable, Slice 2) rather than in-memory. A
@@ -756,8 +933,16 @@ type Database struct {
 // (Slice 1b); a FILE source opens an existing single-file jed database on disk (Slice 2). Build one
 // with AttachMemory() or AttachFile(path).
 type AttachSource struct {
-	file bool   // false = in-memory (Slice 1b); true = file-backed (Slice 2)
-	path string // the file path, when file is true
+	file              bool   // false = in-memory (Slice 1b); true = file-backed (Slice 2)
+	path              string // the file path, when file is true
+	locking           Locking
+	fileLockTimeoutMs *uint64
+}
+
+// AttachFileOptions controls one file attachment's independent coordination domain.
+type AttachFileOptions struct {
+	Locking           Locking
+	FileLockTimeoutMs *uint64
 }
 
 // AttachMemory returns a source for a fresh, empty in-memory attachment (attached-databases.md §6).
@@ -768,7 +953,12 @@ func AttachMemory() AttachSource { return AttachSource{} }
 // its own page space, §2). Combine with readOnly=true (the natural reference-database mode) to open it
 // O_RDONLY as well as reject every write (25006); readOnly=false opens it O_RDWR so DDL/DML can target
 // it (subject to the one-durable-writer rule, §5).
-func AttachFile(path string) AttachSource { return AttachSource{file: true, path: path} }
+func AttachFile(path string) AttachSource { return AttachFileWithOptions(path, AttachFileOptions{}) }
+
+// AttachFileWithOptions returns a coordinated file attachment source with explicit lock settings.
+func AttachFileWithOptions(path string, opts AttachFileOptions) AttachSource {
+	return AttachSource{file: true, path: path, locking: opts.Locking, fileLockTimeoutMs: opts.FileLockTimeoutMs}
+}
 
 // CreateOptions are the settings for creating a fresh database (spec/design/api.md §2.1). Path
 // selects the backing: the zero value "" builds an in-memory database (never touches the
@@ -916,9 +1106,28 @@ func (db *Database) Attach(name string, source AttachSource, readOnly bool) erro
 	// standalone engine over the file, whose committed snapshot + storage identity become the attachment.
 	var st *storage
 	var root *snapshot
+	var coordinator *fileCoordinator
 	if source.file {
-		e, err := openWithOptions(source.path, OpenOptions{ReadOnly: readOnly})
+		var real string
+		var err error
+		coordinator, real, err = prepareOpenCoordinator(source.path, source.locking, source.fileLockTimeoutMs)
 		if err != nil {
+			return err
+		}
+		if coordinator != nil {
+			if err := coordinator.lockCommitShared(); err != nil {
+				coordinator.close()
+				return err
+			}
+		}
+		e, err := openWithOptions(real, OpenOptions{ReadOnly: readOnly, Locking: LockingNone})
+		if coordinator != nil {
+			coordinator.unlockCommit()
+		}
+		if err != nil {
+			if coordinator != nil {
+				coordinator.close()
+			}
 			return err
 		}
 		st = &storage{
@@ -938,12 +1147,23 @@ func (db *Database) Attach(name string, source AttachSource, readOnly bool) erro
 	}
 	c := db.core
 	if err := c.acquireWriter(0); err != nil {
+		if st != nil {
+			_ = st.close()
+		}
+		if coordinator != nil {
+			coordinator.close()
+		}
 		return err
 	}
 	defer c.releaseWriter()
+	c.attachmentsMu.Lock()
 	if lname == "main" || lname == "temp" || c.attachments[lname] != nil {
+		c.attachmentsMu.Unlock()
 		if st != nil {
 			_ = st.close() // release the just-opened file — the name is taken
+		}
+		if coordinator != nil {
+			coordinator.close()
 		}
 		return newError(DuplicateObject, `database "`+name+`" already exists`)
 	}
@@ -962,7 +1182,9 @@ func (db *Database) Attach(name string, source AttachSource, readOnly bool) erro
 	if c.attachments == nil {
 		c.attachments = make(map[string]*attachment)
 	}
-	c.attachments[lname] = &attachment{name: lname, mode: mode, storage: st}
+	c.attachments[lname] = &attachment{name: lname, mode: mode, storage: st, coordinator: coordinator}
+	c.attachmentCount.Add(1)
+	c.attachmentsMu.Unlock()
 	old := c.roots.Load()
 	na := make(map[string]*snapshot, len(old.attached)+1)
 	for k, v := range old.attached {
@@ -972,6 +1194,9 @@ func (db *Database) Attach(name string, source AttachSource, readOnly bool) erro
 	c.liveMu.Lock() // publish under the pin lock (§8), like Session.publish
 	c.roots.Store(&roots{committed: old.committed, attached: na})
 	c.liveMu.Unlock()
+	if coordinator != nil {
+		coordinator.startProbe(func() { c.coordinationTickAttachment(lname, coordinator) })
+	}
 	return nil
 }
 
@@ -987,18 +1212,24 @@ func (db *Database) Detach(name string) error {
 	if err := c.acquireWriter(0); err != nil {
 		return err
 	}
-	defer c.releaseWriter()
+	c.attachmentsMu.Lock()
 	if lname == "main" || lname == "temp" || c.attachments[lname] == nil {
+		c.attachmentsMu.Unlock()
+		c.releaseWriter()
 		return newError(UndefinedObject, `database "`+name+`" is not attached`)
 	}
 	c.liveMu.Lock()
 	inUse := len(c.live) > 0
 	c.liveMu.Unlock()
 	if inUse {
+		c.attachmentsMu.Unlock()
+		c.releaseWriter()
 		return newError(ObjectInUse, `cannot detach database "`+name+`" while it is in use`)
 	}
 	att := c.attachments[lname]
 	delete(c.attachments, lname)
+	c.attachmentCount.Add(-1)
+	c.attachmentsMu.Unlock()
 	old := c.roots.Load()
 	na := make(map[string]*snapshot, len(old.attached))
 	for k, v := range old.attached {
@@ -1009,9 +1240,14 @@ func (db *Database) Detach(name string) error {
 	c.liveMu.Lock() // publish under the pin lock (§8), like Session.publish
 	c.roots.Store(&roots{committed: old.committed, attached: na})
 	c.liveMu.Unlock()
+	c.releaseWriter()
 	// Release a file attachment's OS handle once it is unpublished and unreferenced (a no-op for an
 	// in-memory attachment). No live reader can still fault it — detach-in-use was rejected above.
-	return att.storage.close()
+	err := att.storage.close()
+	if att.coordinator != nil {
+		att.coordinator.close()
+	}
+	return err
 }
 
 // committedEngine builds a transient read engine over the latest committed snapshot for catalog
@@ -1084,7 +1320,7 @@ func (s *Database) ReadSession() *Session {
 	engine.core = s.core
 	engine.attachedCommitted = rt.attached
 	engine.readOnly = true // the executor rejects writes (25006) / poisons a read-only block
-	refresh := s.core.coordinator != nil && s.core.coordinator.lease() == leaseShared
+	refresh := s.core.hasSharedCoordinator()
 	return &Session{core: s.core, engine: engine, access: accessReadOnly, pinned: true, pinVersion: v, baseVersion: v, refreshOnNextRead: refresh, planEpoch: s.core.planEpoch.Load()}
 }
 
@@ -1131,7 +1367,7 @@ func (s *Database) Session(opts SessionOptions) *Session {
 		engine.core = s.core
 		engine.attachedCommitted = rt.attached
 		engine.readOnly = true // the executor enforces read-only too (rejects BEGIN READ WRITE, poisons a read-only block)
-		refresh := s.core.coordinator != nil && s.core.coordinator.lease() == leaseShared
+		refresh := s.core.hasSharedCoordinator()
 		return &Session{core: s.core, engine: engine, access: accessReadOnly, pinned: true, pinVersion: v, baseVersion: v, refreshOnNextRead: refresh, planEpoch: s.core.planEpoch.Load()}
 	}
 	rt := s.core.roots.Load()
@@ -1210,11 +1446,21 @@ func (db *Database) Close() error {
 	}
 	// Release any still-attached file databases (an in-memory attachment's close is a no-op), so the
 	// host need not detach before Close (attached-databases.md §4). Order-independent (just closing).
+	c.attachmentsMu.Lock()
+	coordinators := make([]*fileCoordinator, 0, len(c.attachments))
 	for _, att := range c.attachments {
 		_ = att.storage.close()
+		if att.coordinator != nil {
+			coordinators = append(coordinators, att.coordinator)
+		}
 	}
 	c.attachments = nil
+	c.attachmentCount.Store(0)
+	c.attachmentsMu.Unlock()
 	c.writeMu.Unlock()
+	for _, coordinator := range coordinators {
+		coordinator.close()
+	}
 	if c.coordinator != nil {
 		c.coordinator.close()
 		c.coordinator = nil
@@ -1262,11 +1508,6 @@ func (s *Session) queryValues(sql string, params []Value) (*Rows, error) {
 	if s.pendingErr != nil {
 		return nil, s.pendingErr
 	}
-	if s.core.coordinator != nil {
-		if err := s.core.coordinator.checkPID(); err != nil {
-			return nil, err
-		}
-	}
 	stmt, err := s.engine.parse(sql)
 	if err != nil {
 		return nil, err
@@ -1283,11 +1524,6 @@ func (s *Session) queryValues(sql string, params []Value) (*Rows, error) {
 func (s *Session) queryStmt(stmt statement, params []Value, sc *stmtCache) (*Rows, error) {
 	if s.pendingErr != nil {
 		return nil, s.pendingErr
-	}
-	if s.core.coordinator != nil {
-		if err := s.core.coordinator.checkPID(); err != nil {
-			return nil, err
-		}
 	}
 	if s.engine.session.tx == nil && !stmtIsWrite(stmt) {
 		if s.access == accessReadOnly {
@@ -1574,6 +1810,9 @@ func (s *Session) refreshCommitted() {
 // any host, bplus-reshape.md B3) and the root is stored only on success, so a persist I/O failure
 // leaves the shared committed state (and this session's version) unchanged and surfaces the error.
 func (s *Session) publish() error {
+	if err := s.core.checkCoordinatorPIDs(); err != nil {
+		return err
+	}
 	snap := s.engine.committed
 	snap.txid = s.baseVersion + 1 // advance the shared version on every commit
 	if err := s.core.persist(snap); err != nil {

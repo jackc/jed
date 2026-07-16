@@ -32,6 +32,25 @@ returns, so the new state is on disk (an in-memory database has nothing to flush
 statements **atomically**, run them in one `update` closure — or on a single session's explicit
 `begin` / `commit` block, where a `rollback` (or dropping the session) discards the uncommitted work.
 
+## Sharing a file between processes
+
+Local file databases use crash-clean **shared multi-process coordination by default**. Several Rust,
+Go, or Node processes may open the same file at once; readers keep stable snapshots, while one writer
+at a time commits globally. The usual one-process case holds an exclusive fast-path lease, so queries
+and commits add no foreground lock calls or extra metadata reads. Contended processes take the slower,
+append-only commit path.
+
+Set the open/create `locking` option to `shared` to require this behavior, `exclusive` to reject other
+processes, or `none` only when an external coordinator provides the same safety. `auto` (the default)
+selects shared on supported local hosts. `file_lock_timeout_ms` / `FileLockTimeoutMs` /
+`fileLockTimeoutMs` bounds open/join waiting (default 5 seconds); the separate session
+`lock_timeout_ms` / `LockTimeoutMs` / `lockTimeoutMs` bounds writer waiting and reports `55P03`.
+
+Node uses a small first-party native helper solely for OS file locks because Node has no standard
+`flock`/`LockFileEx` API. SQL and storage still run in the independent TypeScript engine; browser/OPFS
+builds do not load the helper. A missing platform artifact fails closed instead of using PID or mtime
+leases.
+
 ## In-memory databases
 
 Every example on the **SQL** pages of these docs runs against an in-memory database, right in your

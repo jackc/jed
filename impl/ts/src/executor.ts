@@ -167,7 +167,7 @@ import {
   type TimeZoneInfo,
 } from "./timezone.ts";
 import { crc32Ieee, newTempStorage, pagePayload, recordCompressUnits } from "./format.ts";
-import { commitDurableAttachment, persistTemp } from "./persist.ts";
+import { commitDurableAttachment, persistSharedBody, persistTemp } from "./persist.ts";
 import { Decimal, workLinear } from "./decimal.ts";
 import { encodeBool, encodeInt, encodeTerminated } from "./encoding.ts";
 import {
@@ -2414,7 +2414,25 @@ export class Engine {
         // dirty here (the one-durable-writer check above), so ≤1 fsync path runs.
         if (att.storage.path !== null) {
           ws.txid = (this.attachedCommitted.get(name)?.txid ?? 0n) + 1n; // alternating meta slot + reopen
-          commitDurableAttachment(att.storage, ws, canReclaim);
+          if (att.coordinator?.state === "shared") {
+            try {
+              const pending = persistSharedBody(att.storage, ws);
+              att.coordinator.lockCommitExclusive();
+              try {
+                pending.publishMeta();
+              } finally {
+                att.coordinator.unlockCommit();
+              }
+              ws.demoteCleanLeaves();
+            } catch (error) {
+              att.coordinator.state = "poisoned";
+              throw error;
+            }
+          } else {
+            // A local reader pins every attached root, so reuse is safe only after that common
+            // watermark drains.
+            commitDurableAttachment(att.storage, ws, canReclaim, canReclaim);
+          }
         } else {
           persistTemp(att.storage, ws, canReclaim);
         }

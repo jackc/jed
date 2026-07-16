@@ -264,6 +264,7 @@ fn file_backed_readers_run_concurrently_with_a_committing_writer() {
     assert_eq!(core.version(), 42);
 
     // Reopen from scratch: every committed row is durable on disk.
+    drop(core);
     drop(db);
     let mut reopened = Database::open_with_options(
         &path,

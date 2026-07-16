@@ -162,8 +162,13 @@ function commitInMemory(
 // (persistImpl — v25 persists the free-list in-commit for a file store), then the post-commit residency
 // flip (demoteCleanLeaves — bplus-reshape.md B4). The caller advances snap.txid before calling. Runs
 // under the writer gate. An in-memory attachment uses persistTemp instead (no fsync).
-export function commitDurableAttachment(db: Engine, snap: Snapshot, canReclaim: boolean): void {
-  persistImpl(db, snap, canReclaim);
+export function commitDurableAttachment(
+  db: Engine,
+  snap: Snapshot,
+  canReclaim: boolean,
+  canReuse = true,
+): void {
+  persistImpl(db, snap, canReclaim, canReuse);
   snap.demoteCleanLeaves();
 }
 

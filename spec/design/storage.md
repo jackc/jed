@@ -243,10 +243,9 @@ sits so the options stay open (CLAUDE.md §9).
   meta/free-list pages — not O(file). The lone exception is a **no-PK** table, whose synthetic-rowid
   reconstruction still faults its leaves to find `max key + 1` (most tables have a PK; bounded by the
   pool).
-- **Multi-process file locking** — ⏳ **decided, spec'd ([locking.md](locking.md)), not
-  built.** Separate handles currently have independent buffer pools, persisted-free-list state,
-  watermarks, and writer gates, so the same file is unsafe. The revised first slice is shared access:
-  the stable `<path>.lock/` bundle provides presence/arrival/transition/writer/commit OS locks. An
+- **Multi-process file locking** — ✅ **landed ([locking.md](locking.md)).** Protocol-aware handles and
+  file attachments share the same file safely through a stable `<path>.lock/` bundle carrying
+  presence/arrival/transition/writer/commit OS locks. An
   uncontended presence-EX lease preserves the current foreground path and v29 allocator. While
   co-resident, begins refresh the newest meta, one global writer commits append-only with
   `free_list_head = 0`, and body pages stay immutable. Free-page reuse, free-list persistence/rebuild,

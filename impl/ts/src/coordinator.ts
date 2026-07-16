@@ -16,7 +16,7 @@ import process from "node:process";
 
 import { engineError } from "./errors.ts";
 import type { Locking } from "./file.ts";
-import type { FileCoordinatorHost, LeaseState } from "./shared.ts";
+import type { FileCoordinatorHost, LeaseState } from "./session.ts";
 
 const PROTOCOL_MARKER = "protocol-v1";
 const LOCK_NAMES = ["presence", "arrival", "transition", "writer", "commit"] as const;

@@ -7,6 +7,7 @@ import {
   createDatabase,
   type Database,
   EngineError,
+  attachFile,
   openDatabase,
   render,
   type Session,
@@ -43,6 +44,11 @@ for await (const line of createInterface({ input: process.stdin, crlfDelay: Infi
       case "EXEC":
         database.execute(sql(argument));
         break;
+      case "ATTACH": {
+        const [name, readOnly, attachmentPath] = argument.split("\t", 3);
+        database.attach(name!, attachFile(attachmentPath!), readOnly === "1");
+        break;
+      }
       case "QUERY_I64":
         value = queryI64(database, sql(argument));
         break;

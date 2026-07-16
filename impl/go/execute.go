@@ -237,14 +237,25 @@ func (db *engine) commitTx() (outcome, error) {
 		canReclaim := db.core == nil || !db.core.hasLiveReaders()
 		for name := range tx.attachDirty {
 			ws := tx.attachWorking[name]
-			att := db.core.attachments[name]
+			att := db.core.attachment(name)
 			if att == nil {
 				continue // detached mid-transaction (unreachable under the writer gate) — nothing to persist
 			}
 			if att.isFile() {
 				// Advance the version for the alternating meta slot + reopen (like the main file commit).
 				ws.txid = db.attachedCommitted[name].txid + 1
-				if err := att.storage.commitDurable(ws, canReclaim, true); err != nil {
+				var err error
+				if att.coordinator != nil && att.coordinator.lease() == leaseShared {
+					err = att.storage.commitShared(ws, att.coordinator)
+					if err != nil {
+						att.coordinator.setLease(leasePoisoned)
+					}
+				} else {
+					// A local reader pins every attached root, so reuse is safe only once that common
+					// watermark has drained.
+					err = att.storage.commitDurable(ws, canReclaim, canReclaim)
+				}
+				if err != nil {
 					return outcome{}, err
 				}
 				ws.demoteCleanLeaves() // post-commit residency flip (bplus-reshape.md B4), like Session.publish
@@ -270,7 +281,7 @@ func (db *engine) checkOneDurableWriter(tx *activeTx) error {
 	}
 	if db.core != nil {
 		for name := range tx.attachDirty {
-			if att := db.core.attachments[name]; att != nil && att.isFile() {
+			if att := db.core.attachment(name); att != nil && att.isFile() {
 				durable++
 			}
 		}

@@ -182,7 +182,23 @@ export function open(path: string, opts: OpenOptions = {}): Engine {
 // Register the Node file host as the file-attach opener (attached-databases.md §4, Slice 2): importing
 // file.ts (the node host) enables `db.attach(name, attachFile(path))` without shared.ts importing a host
 // module (it stays browser-clean). The OPFS host registers its own. Read-only opens the file O_RDONLY.
-registerFileAttachOpener((path, readOnly) => open(path, { readOnly }));
+registerFileAttachOpener((source, readOnly) => {
+  const path = source.path!;
+  const coordinator = FileCoordinator.open(path, source.locking, source.fileLockTimeoutMs);
+  try {
+    coordinator?.lockCommitShared();
+    let engine: Engine;
+    try {
+      engine = open(coordinator?.path ?? path, { readOnly, locking: "none" });
+    } finally {
+      coordinator?.unlockCommit();
+    }
+    return { engine, coordinator };
+  } catch (error) {
+    coordinator?.close();
+    throw error;
+  }
+});
 
 // createDatabase makes a fresh database — in-memory (opts.path absent) or file-backed (opts.path set)
 // — and returns the host Database handle with its default session (spec/design/api.md §2.1/§2.1.1). A

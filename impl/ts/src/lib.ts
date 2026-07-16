@@ -793,6 +793,8 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // constraint — name, table_name, type, columns (text[]), expression, ref_table, ref_columns
   // (text[]) (introspection.md §5.1).
   "introspect.constraints",
+  // Stable lock-bundle protocol for safe shared multi-process main files and file attachments.
+  "file.shared_process",
 ];
 
 // THIS FILE IS THE PUBLIC API of the TS core (CLAUDE.md §2 — the embedding surface): the converged

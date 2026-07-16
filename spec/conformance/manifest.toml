@@ -1287,6 +1287,10 @@ description = "The jed_constraints catalog relation (spec/design/introspection.m
 # An implementation "meets" a profile iff its declared capability set is a superset
 # of the profile's (transitive) capabilities.
 
+[[capability]]
+id = "file.shared_process"
+description = "Crash-clean shared multi-process access to one file (and independently coordinated file attachments): stable protocol-v1 lock bundle, one global writer with 55P03 timeout, immutable pinned snapshots, commit-gated meta refresh, append-only co-resident commits, and a zero-foreground-lock alone lease (spec/design/locking.md). Host/process conformance, not SQL corpus records."
+
 [[profile]]
 id = "core"
 title = "The \"it's alive\" milestone — integer DDL/DML/SELECT (CLAUDE.md §11 step 5)"

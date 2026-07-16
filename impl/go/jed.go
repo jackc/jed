@@ -789,6 +789,8 @@ var SupportedCapabilities = []string{
 	// constraint — name, table_name, type, columns (text[]), expression, ref_table, ref_columns
 	// (text[]) (introspection.md §5.1).
 	"introspect.constraints",
+	// Stable lock-bundle protocol for safe shared multi-process main files and file attachments.
+	"file.shared_process",
 }
 
 // Execute parses and executes one SQL statement against db (no bind parameters).

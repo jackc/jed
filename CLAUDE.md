@@ -94,8 +94,11 @@ language, because hardening the spec was never the reason to add it.
    §9) has since **landed** in this core (`spec/design/hosts.md` §5): the engine runs in a Web Worker
    over an `OpfsBlockStore`, validated by file-host byte parity — proof the host-agnostic seam paid
    off. Rust, Go, and this TS core **are** the differential set; the honesty work is theirs.
-   A separate experimental native Node-API package (`impl/node`) wraps the Rust core for a
-   shipping-performance comparison; it is a reach artifact, never a fourth conformance voice.
+   The Node file host uses a first-party, narrow Node-API helper (`impl/ts/native-lock`) only for
+   crash-clean OS file locks; SQL, storage, types, and execution remain the independent TS core, and
+   the browser build imports no native code. A separate experimental Node-API package (`impl/node`)
+   wraps the whole Rust core for a shipping-performance comparison; it is a reach artifact, never a
+   fourth conformance voice.
 
 **Beyond the differential set — best experience per language.** For every language past
 core #3 the question is not "how much new divergence does it surface" (usually little) but
@@ -356,7 +359,7 @@ This is the spine of the project. Treat it as the contract, not an afterthought.
   binary per core in the `bench/` modules (reusing the splitmix64 PRNG + FNV answer checksum), checked
   by per-snapshot invariants + a confluent final-state checksum that must agree across cores (Go under
   `-race`, Rust over real threads, TS via a seeded-sequential interleaver).
-  **Layer 4 (`rake concurrency:process`) is designed, not built:** one shared
+  **Layer 4 (`rake concurrency:process`) is landed and release-blocking:** one shared
   `spec/conformance/process/*.process.toml` corpus drives real Rust/Go/Node actor processes in every
   supported pairing over one file. Explicit barriers, kill hooks, and invariant checks cover the
   shared OS-lock protocol, crash release, meta recovery, and cross-core interoperability. It joins
@@ -633,9 +636,8 @@ cross-core-identical and owns that consequence (the host-extension boundary, §1
   **explicit** and `close` does **not** auto-flush (uncommitted changes are discarded); an
   in-memory `commit` is a no-op success, so the operation stays uniform and forward-compatible
   with the future §3 staging-buffer transactions. Same shape across all three cores.
-- **Multi-process access: shared-by-default coordination (`spec/design/locking.md`) — decided,
-  spec'd, not yet built.** Separate opens are unsafe today because their buffer pools, persisted
-  free-list state, in-process watermarks, and writer gates do not interact. The revised first slice is
+- **Multi-process access: shared-by-default coordination (`spec/design/locking.md`) — landed.**
+  Protocol-aware separate opens and file attachments now share
   the full shared protocol: a stable, version-marked `<path>.lock/` bundle carries crash-clean
   whole-file OS locks for presence, arrival, transition, one global writer, and the short
   commit-publication gate. On capable
@@ -646,13 +648,13 @@ cross-core-identical and owns that consequence (the host-extension boundary, §1
   commits are append-only (`free_list_head = 0`). Reuse/reclamation/truncation/compaction require
   presence-EX proof of aloneness plus the in-process watermark. No format bump or persisted
   `catalog_gen` is required for correctness. Rust/Go use `flock`/`LockFileEx` without dependencies;
-  Node needs native OS locking. The current proposal remains a first-party minimal Rust Node-API lock
-  adapter (host calls only, not a Rust-core wrapper) with reproducible prebuilds. A full Rust-core
+  Node needs native OS locking. The chosen implementation is a first-party minimal Rust Node-API lock
+  adapter (host calls only, not a Rust-core wrapper). A full Rust-core
   Node wrapper was built and benchmarked first: it wins heavy/parallel reads but is not universally
   faster, losing most cheap-query and write comparisons; ordinary Node calls also retain a material
-  boundary tax (`spec/design/benchmarks.md` §7.3). The exact `napi-rs` pins are approved for that
-  separate experiment; production still requires the bounded §14 FFI/unsafe exception and artifact
-  matrix decision.
+  boundary tax (`spec/design/benchmarks.md` §7.3). The exact `napi-rs` pins are approved for both the
+  experiment and the bounded production lock-host exception; completing the no-install-script
+  prebuilt artifact/provenance matrix remains packaging work, not a protocol gap.
   PID/mtime stale-lock heuristics are forbidden; an unsupported host fails closed. OPFS remains
   inherently exclusive. The first rollout must drain every pre-protocol binary because an advisory
   protocol cannot coordinate with a process that does not participate.
@@ -1078,3 +1080,9 @@ which clause above justifies it and why, and wait for a yes.
   the cautionary tale) nor make two cores diverge. Clause 2's speedup is conditioned on this.
 - **Bounded surface.** Dependencies live at well-defined edges (crypto, compression),
   never inside the parser / planner / executor / type-system core (§2/§5).
+
+**Approved bounded Node lock-host exception (2026-07-16).** `impl/ts/native-lock` may use the
+exact-pinned safe-Rust `napi = 3.10.5`, `napi-derive = 3.5.10`, and build-only `napi-build = 2.3.2`
+graph to expose whole-file try-lock/unlock operations that Node does not provide. It performs no
+database I/O or SQL work, keeps Go pure and the TS engine independent, and is excluded from browser
+bundles. No broader native surface inherits this exception.

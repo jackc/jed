@@ -484,7 +484,7 @@ namespace :migrate do
     end
 
     desc "Run the TS jed-migrate package's tests (bare Node via type-stripping — no install)"
-    task :ts do
+    task ts: "ts:lock_build" do
       puts "migrate: ts"
       sh "node", "--test", *Dir[File.join(MIGRATE_TS_DIR, "tests/*.test.ts")]
     end
@@ -870,8 +870,8 @@ task test: %w[conformance unit cli:test ruby:test migrate:test]
 # sweep + the reducer self-test. So `test` is example-based truth (corpus ×3 + unit + CLI); `ci`
 # wraps it with static hygiene, spec integrity, and property/metamorphic fuzzing. Each step is
 # `sh`/task-failure propagating, so `rake ci` exits non-zero on the first failure.
-desc "Full merge gate: rake test (corpus ×3 + unit + CLI) + spec verify + fmt + lint + NoREC/TLP sweep + reducer self-test"
-task ci: %w[verify fmt lint test] do
+desc "Full merge gate: tests + real-process locking + spec/static/metamorphic verification"
+task ci: %w[verify fmt lint test concurrency:process] do
   Rake::Task["corpus:norec_sweep"].invoke
   Rake::Task["corpus:reduce_selftest"].invoke
 end

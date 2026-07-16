@@ -59,6 +59,7 @@ import {
   type ScanCacheHolder,
   type SessionOptions,
   type TxStatus,
+  type FileCoordinatorHost,
 } from "./executor.ts";
 import { PreparedStatement, Rows, rowsFromOutcome, Transaction } from "./api.ts";
 import {
@@ -100,28 +101,15 @@ import type { Privileges, PrivilegeSet } from "./privileges.ts";
 import type { ClockFunc, RandomFill } from "./seam.ts";
 import type { Value } from "./value.ts";
 
-export type LeaseState = "alone" | "shared" | "exclusive" | "poisoned";
-
-// Host-owned OS coordination surface. Keeping this structural interface here lets the browser-clean
-// shared core implement policy without importing Node; file.ts supplies the Node coordinator and
-// OPFS supplies no coordinator because its sync access handle is already exclusive.
-export interface FileCoordinatorHost {
-  readonly path: string;
-  state: LeaseState;
-  checkPid(): void;
-  startProbe(tick: () => void): void;
-  lockCommitShared(): void;
-  lockCommitExclusive(): void;
-  unlockCommit(): void;
-  lockWriter(timeoutMs: number): void;
-  unlockWriter(): void;
-  tryArrivalExclusive(): boolean;
-  unlockArrival(): void;
-  lockTransition(): void;
-  unlockTransition(): void;
-  downgradePresence(): void;
-  tryUpgradePresence(): boolean;
-  close(): void;
+const pathEncoder = new TextEncoder();
+function compareFilePaths(left: string, right: string): number {
+  const a = pathEncoder.encode(left);
+  const b = pathEncoder.encode(right);
+  const length = Math.min(a.length, b.length);
+  for (let index = 0; index < length; index++) {
+    if (a[index] !== b[index]) return a[index]! - b[index]!;
+  }
+  return a.length - b.length;
 }
 
 // databaseFromSnapshot builds a session-local handle whose committed root is `snap`. It retains the
@@ -170,6 +158,7 @@ class SharedCore {
   live = new Map<bigint, number>();
   // writerActive is true while a write transaction is open (at most one — CLAUDE.md §3).
   writerActive = false;
+  private heldWriterCoordinators: FileCoordinatorHost[] = [];
   // storage is the Engine that owns the storage identity (the pager + buffer pool + the mutable page
   // accounting: paging/pageSize/pageCount/freePages) — since B3 (bplus-reshape.md) EVERY core has
   // one: a file-backed core over a FileBlockStore, an in-memory core over a MemoryBlockStore (with a
@@ -196,23 +185,36 @@ class SharedCore {
       throw engineError("active_sql_transaction", "there is already a writer in progress");
     }
     this.writerActive = true;
-    try {
+    if (this.attachments.size === 0) {
       const coordinator = this.coordinator;
       if (coordinator === null) return;
-      coordinator.checkPid();
-      if (coordinator.state === "poisoned") {
-        throw engineError("io_error", "shared-file coordinator is poisoned");
+      try {
+        coordinator.checkPid();
+        if (coordinator.state === "alone" || coordinator.state === "exclusive") return;
+        if (coordinator.state === "poisoned") {
+          throw engineError("io_error", "shared-file coordinator is poisoned");
+        }
+      } catch (error) {
+        this.writerActive = false;
+        throw error;
       }
-      if (coordinator.state === "shared") {
-        coordinator.lockWriter(timeoutMs);
-        try {
-          this.refreshShared();
-        } catch (error) {
-          coordinator.unlockWriter();
-          throw error;
+    }
+    const held: FileCoordinatorHost[] = [];
+    try {
+      for (const coordinator of this.writableCoordinators()) {
+        coordinator.checkPid();
+        if (coordinator.state === "poisoned") {
+          throw engineError("io_error", "shared-file coordinator is poisoned");
+        }
+        if (coordinator.state === "shared") {
+          coordinator.lockWriter(timeoutMs);
+          held.push(coordinator);
         }
       }
+      this.refreshShared();
+      this.heldWriterCoordinators = held;
     } catch (error) {
+      for (const coordinator of held.reverse()) coordinator.unlockWriter();
       this.writerActive = false;
       throw error;
     }
@@ -220,23 +222,65 @@ class SharedCore {
 
   releaseWriter(): void {
     if (!this.writerActive) return;
-    if (this.coordinator?.state === "shared") this.coordinator.unlockWriter();
+    if (this.heldWriterCoordinators.length !== 0) {
+      for (const coordinator of this.heldWriterCoordinators.reverse()) coordinator.unlockWriter();
+      this.heldWriterCoordinators.length = 0;
+    }
     this.writerActive = false;
+  }
+
+  private writableCoordinators(): FileCoordinatorHost[] {
+    const coordinators: FileCoordinatorHost[] = [];
+    if (this.coordinator !== null) coordinators.push(this.coordinator);
+    for (const attachment of this.attachments.values()) {
+      if (!attachment.readOnly && attachment.coordinator !== null) {
+        coordinators.push(attachment.coordinator);
+      }
+    }
+    coordinators.sort((a, b) => compareFilePaths(a.path, b.path));
+    return coordinators;
+  }
+
+  hasSharedCoordinator(): boolean {
+    if (this.coordinator?.state === "shared") return true;
+    for (const attachment of this.attachments.values()) {
+      if (attachment.coordinator?.state === "shared") return true;
+    }
+    return false;
   }
 
   checkPid(): void {
     this.coordinator?.checkPid();
+    for (const attachment of this.attachments.values()) attachment.coordinator?.checkPid();
   }
 
   refreshShared(): void {
+    if (!this.hasSharedCoordinator()) return;
     const coordinator = this.coordinator;
-    if (coordinator === null || coordinator.state !== "shared") return;
-    coordinator.checkPid();
-    coordinator.lockCommitShared();
-    try {
-      this.reloadFromPager();
-    } finally {
-      coordinator.unlockCommit();
+    if (coordinator?.state === "shared") {
+      coordinator.checkPid();
+      coordinator.lockCommitShared();
+      try {
+        this.reloadFromPager();
+      } finally {
+        coordinator.unlockCommit();
+      }
+    }
+    const attachments = [...this.attachments.entries()]
+      .filter((entry): entry is [string, Attachment & { coordinator: FileCoordinatorHost }] =>
+        Boolean(entry[1].coordinator),
+      )
+      .sort((a, b) => compareFilePaths(a[1].coordinator.path, b[1].coordinator.path));
+    for (const [name, attachment] of attachments) {
+      const attachedCoordinator = attachment.coordinator;
+      if (attachedCoordinator.state !== "shared") continue;
+      attachedCoordinator.checkPid();
+      attachedCoordinator.lockCommitShared();
+      try {
+        this.reloadAttachmentFromPager(name, attachment);
+      } finally {
+        attachedCoordinator.unlockCommit();
+      }
     }
   }
 
@@ -254,12 +298,39 @@ class SharedCore {
     this.planEpoch++;
   }
 
+  private reloadAttachmentFromPager(name: string, attachment: Attachment): void {
+    const paging = attachment.storage.paging;
+    if (paging === null) return;
+    paging.refreshAllocatedPages();
+    const loaded = loadEnginePaged(paging);
+    const current = this.attached.get(name);
+    if (current !== undefined && loaded.committed.txid <= current.txid) return;
+    attachment.storage.pageCount = loaded.pageCount;
+    attachment.storage.freePages = loaded.freePages;
+    attachment.storage.liveAtCompaction = loaded.liveAtCompaction;
+    attachment.storage.freeGenTxid = loaded.freeGenTxid;
+    const attached = new Map(this.attached);
+    attached.set(name, loaded.committed);
+    this.attached = attached;
+    this.planEpoch++;
+  }
+
   coordinationTick(): void {
     const coordinator = this.coordinator;
     if (coordinator === null || this.writerActive) return;
     try {
       if (coordinator.state === "alone") this.tryDowngrade(coordinator);
-      else if (coordinator.state === "shared") this.tryUpgrade(coordinator);
+      else if (coordinator.state === "shared") this.tryUpgrade(coordinator, null);
+    } catch {
+      coordinator.state = "poisoned";
+    }
+  }
+
+  coordinationTickAttachment(name: string, coordinator: FileCoordinatorHost): void {
+    if (this.writerActive) return;
+    try {
+      if (coordinator.state === "alone") this.tryDowngrade(coordinator);
+      else if (coordinator.state === "shared") this.tryUpgrade(coordinator, name);
     } catch {
       coordinator.state = "poisoned";
     }
@@ -282,7 +353,7 @@ class SharedCore {
     }
   }
 
-  private tryUpgrade(coordinator: FileCoordinatorHost): void {
+  private tryUpgrade(coordinator: FileCoordinatorHost, attachment: string | null): void {
     coordinator.lockTransition();
     try {
       if (!coordinator.tryArrivalExclusive()) return;
@@ -290,7 +361,11 @@ class SharedCore {
         if (!coordinator.tryUpgradePresence()) return;
         coordinator.lockCommitShared();
         try {
-          this.reloadFromPager();
+          if (attachment === null) this.reloadFromPager();
+          else {
+            const attached = this.attachments.get(attachment);
+            if (attached !== undefined) this.reloadAttachmentFromPager(attachment, attached);
+          }
         } finally {
           coordinator.unlockCommit();
         }
@@ -393,7 +468,12 @@ class SharedCore {
 // (spec/design/attached-databases.md §4). A MEMORY source is a fresh, empty in-memory database
 // (Slice 1b); a FILE source opens an existing single-file jed database on disk (Slice 2). Build one with
 // attachMemory() or attachFile(path).
-export type AttachSource = { file: boolean; path?: string };
+export type AttachSource = {
+  file: boolean;
+  path?: string;
+  locking?: "auto" | "shared" | "exclusive" | "none";
+  fileLockTimeoutMs?: number;
+};
 
 // attachMemory returns a source for a fresh, empty in-memory attachment (attached-databases.md §6).
 export function attachMemory(): AttachSource {
@@ -404,8 +484,11 @@ export function attachMemory(): AttachSource {
 // (attached-databases.md §4, Slice 2). The file's own page size is honored (each attachment is its own
 // page space, §2). With readOnly=true it is opened read-only (as well as write-rejected, 25006);
 // readOnly=false opens it read-write so DDL/DML can target it (subject to the one-durable-writer rule, §5).
-export function attachFile(path: string): AttachSource {
-  return { file: true, path };
+export function attachFile(
+  path: string,
+  options: Pick<AttachSource, "locking" | "fileLockTimeoutMs"> = {},
+): AttachSource {
+  return { file: true, path, ...options };
 }
 
 // fileAttachOpener is the host-injected file opener for a file-backed attachment (attached-databases.md
@@ -414,11 +497,14 @@ export function attachFile(path: string): AttachSource {
 // file.ts, not shared.ts, owns open/create). Returns the opened storage Engine (its committed snapshot +
 // paging become the attachment). null until a host registers one → a file attach then throws
 // feature_not_supported (a pure in-memory build has no file layer to reach).
-let fileAttachOpener: ((path: string, readOnly: boolean) => Engine) | null = null;
+type OpenedAttachment = { engine: Engine; coordinator: FileCoordinatorHost | null };
+let fileAttachOpener: ((source: AttachSource, readOnly: boolean) => OpenedAttachment) | null = null;
 
 // registerFileAttachOpener installs the host file layer that Database.attach uses for a file source
 // (called once, at file.ts module load). The OPFS host would register its own.
-export function registerFileAttachOpener(fn: (path: string, readOnly: boolean) => Engine): void {
+export function registerFileAttachOpener(
+  fn: (source: AttachSource, readOnly: boolean) => OpenedAttachment,
+): void {
   fileAttachOpener = fn;
 }
 
@@ -493,15 +579,19 @@ export class Database {
     const c = this.core;
     let storage: Engine;
     let root: Snapshot;
+    let coordinator: FileCoordinatorHost | null = null;
     if (source.file) {
       if (fileAttachOpener === null) {
         // A pure in-memory build (no node/OPFS host imported) has no file layer to reach.
         throw engineError("feature_not_supported", "file attachment needs a host file layer");
       }
       // Open the file BEFORE the dup check (an open may throw 58P01/XX001); on a name conflict close it.
-      const engine = fileAttachOpener(source.path!, readOnly);
+      const opened = fileAttachOpener(source, readOnly);
+      const engine = opened.engine;
+      coordinator = opened.coordinator;
       if (lname === "main" || lname === "temp" || c.attachments.has(lname)) {
         engine.paging?.close(); // release the just-opened file — the name is taken
+        coordinator?.close();
         throw engineError("duplicate_object", `database "${name}" already exists`);
       }
       // v25: a file attachment persists + reclaims like the main file domain.
@@ -520,11 +610,23 @@ export class Database {
       empty.storePaging = storage.paging;
       root = empty;
     }
-    c.attachments.set(lname, { name: lname, readOnly, storage });
-    // Publish a NEW attached map so a live reader's pinned map is unaffected.
-    const na = new Map(c.attached);
-    na.set(lname, root);
-    c.attached = na;
+    try {
+      c.acquireWriter(0);
+    } catch (error) {
+      storage.paging?.close();
+      coordinator?.close();
+      throw error;
+    }
+    try {
+      // Publish a NEW attached map so a live reader's pinned map is unaffected.
+      c.attachments.set(lname, { name: lname, readOnly, storage, coordinator });
+      const na = new Map(c.attached);
+      na.set(lname, root);
+      c.attached = na;
+    } finally {
+      c.releaseWriter();
+    }
+    coordinator?.startProbe(() => c.coordinationTickAttachment(lname, coordinator!));
   }
 
   // detach removes a previously attached database (spec/design/attached-databases.md §4/§8). A host-API
@@ -536,20 +638,27 @@ export class Database {
   detach(name: string): void {
     const lname = name.toLowerCase();
     const c = this.core;
-    if (lname === "main" || lname === "temp" || !c.attachments.has(lname)) {
-      throw engineError("undefined_object", `database "${name}" is not attached`);
+    c.acquireWriter(0);
+    let att: Attachment;
+    try {
+      if (lname === "main" || lname === "temp" || !c.attachments.has(lname)) {
+        throw engineError("undefined_object", `database "${name}" is not attached`);
+      }
+      if (c.hasLiveReaders()) {
+        throw engineError("object_in_use", `cannot detach database "${name}" while it is in use`);
+      }
+      att = c.attachments.get(lname)!;
+      c.attachments.delete(lname);
+      const na = new Map(c.attached);
+      na.delete(lname);
+      c.attached = na;
+    } finally {
+      c.releaseWriter();
     }
-    if (c.hasLiveReaders()) {
-      throw engineError("object_in_use", `cannot detach database "${name}" while it is in use`);
-    }
-    const att = c.attachments.get(lname)!;
-    c.attachments.delete(lname);
-    const na = new Map(c.attached);
-    na.delete(lname);
-    c.attached = na;
     // Release a file attachment's OS handle once it is unpublished and unreferenced (a no-op for an
     // in-memory attachment). No live reader can still fault it — detach-in-use was rejected above.
     att.storage.paging?.close();
+    att.coordinator?.close();
   }
 
   // readSession opens a READ ONLY session over a consistent snapshot (spec/design/session.md §2.4,
@@ -764,7 +873,10 @@ export class Database {
     }
     // Release any still-attached file databases (an in-memory attachment's close is a no-op), so the host
     // need not detach before close (attached-databases.md §4). Order-independent (just closing).
-    for (const att of this.core.attachments.values()) att.storage.paging?.close();
+    for (const att of this.core.attachments.values()) {
+      att.storage.paging?.close();
+      att.coordinator?.close();
+    }
     this.core.attachments = new Map();
     this.core.coordinator?.close();
     this.core.coordinator = null;
@@ -928,7 +1040,6 @@ export class Session {
   // DEFERRED cursor (streaming.md §7) that defers the whole run to the first pull and yields the result
   // one row at a time; a data-modifying WITH (a write) still falls back to the materialized dispatch path.
   query(sql: string, params: Value[] = []): Rows {
-    this.core.checkPid();
     return this.queryStmt(this.engine.parse(sql), params, null); // one-shot: no cross-call plan cache (still plans once)
   }
 
@@ -939,7 +1050,6 @@ export class Session {
   // query (queryPrepared passes the statement's ScanCacheHolder), so a prepared query streams and
   // pins its snapshot exactly like an ad-hoc one but reuses its cached plan across executes.
   private queryStmt(stmt: Statement, params: Value[], holder: ScanCacheHolder | null): Rows {
-    this.core.checkPid();
     // Route the read before building the lazy cursor: an autocommit (non-block, writable access) read
     // re-pins the latest committed so the snapshot is current; a read-only session uses its existing
     // pin, and an open block uses its working set.
@@ -1180,6 +1290,7 @@ export class Session {
   // updated only on success, so a persist I/O failure throws and leaves the shared committed state (and
   // this session's version) unchanged. In-memory persist is a no-op.
   private publish(): void {
+    this.core.checkPid();
     const snap = this.engine.committed;
     snap.txid = this.baseVersion + 1n; // advance the shared version on every commit
     this.core.persist(snap); // durable before publish (packs into the byte store, any host)

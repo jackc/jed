@@ -111,17 +111,17 @@ files in the same change.
 - Key encoding must preserve logical order in raw byte order.
 - Do not assume on-disk page bytes are plaintext-comparable; leave room for the
   encryption-at-rest design.
-- Shared multi-process file access is the decided first locking slice, not an
-  exclusive-only precursor. Coordinate through the stable `<path>.lock/` OS-lock
-  bundle in `spec/design/locking.md`: one global writer, meta freshness at
+- Shared multi-process file access is landed across Rust, Go, and
+  Node/TypeScript. Coordinate through the stable `<path>.lock/` OS-lock bundle
+  in `spec/design/locking.md`: one global writer, meta freshness at
   transaction begin, append-only commits while co-resident, and reuse/compaction
   only when presence-exclusive proves aloneness. The one-process foreground path
   must retain zero coordination syscalls and zero per-transaction meta reads.
 - Never use PID files, mtime leases, or automatic stale-lock stealing for database
   safety. A host without the required crash-clean OS lock fails closed.
-- Node shared locking requires native OS-lock code. The current delivery proposal
-  keeps the independent TypeScript engine and adds a minimal Node-API lock helper;
-  its alone lease makes no foreground addon calls. A full Rust-core Node wrapper
+- Node shared locking uses the approved minimal Node-API lock helper while
+  keeping the independent TypeScript engine; its alone lease makes no foreground
+  addon calls. A full Rust-core Node wrapper
   exists only as a reach experiment: it wins heavy/parallel reads but not cheap
   queries or writes uniformly, and it is not a TypeScript conformance voice.
 - Treat the lock-bundle protocol version as a compatibility boundary. Pre-protocol

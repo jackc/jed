@@ -4,7 +4,8 @@ use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
 use jed::{
-    CreateOptions, Database, EngineError, Locking, OpenOptions, Session, SessionOptions, Value,
+    AttachSource, CreateOptions, Database, EngineError, Locking, OpenOptions, Session,
+    SessionOptions, Value,
 };
 
 fn main() {
@@ -47,6 +48,15 @@ fn run() -> Result<(), EngineError> {
         let result = match command {
             "EXEC" => {
                 decode_sql(argument).and_then(|sql| database.execute(&sql, &[]).map(|_| "".into()))
+            }
+            "ATTACH" => {
+                let mut parts = argument.splitn(3, '\t');
+                let name = parts.next().expect("ATTACH name");
+                let read_only = parts.next().expect("ATTACH read-only") == "1";
+                let path = parts.next().expect("ATTACH path");
+                database
+                    .attach(name, AttachSource::file(path), read_only)
+                    .map(|_| String::new())
             }
             "QUERY_I64" => decode_sql(argument).and_then(|sql| query_i64(&mut database, &sql)),
             "READ_OPEN" => {

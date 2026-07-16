@@ -1122,7 +1122,7 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 		// attachment's committed root on first write and marks it dirty. Its NEW stores bind to the
 		// attachment's own paging (the storePaging seam — the same one temp/in-memory main use).
 		ws := db.attachWriteSnap(attachName)
-		ws.storePaging = db.core.attachments[attachName].storage.paging
+		ws.storePaging = db.core.attachment(attachName).storage.paging
 		mainTypes := db.readSnap().types
 		colTypes := make([]colType, len(table.Columns))
 		for i, c := range table.Columns {
@@ -3201,7 +3201,7 @@ func (db *engine) executeCreateIndex(ci *createIndex) (outcome, error) {
 		// The attachment's index catalog entry + (empty) store live in its working snapshot, published
 		// into roots.attached at commit (attached-databases.md §5/§6). attachWriteSnap marks it dirty.
 		ws := db.attachWriteSnap(attachName)
-		ws.storePaging = db.core.attachments[attachName].storage.paging
+		ws.storePaging = db.core.attachment(attachName).storage.paging
 		ws.putIndex(tableKey, def, db.attachPageSize(attachName)) // the attachment's own page space (§2)
 	case db.isTempTable(ci.Table):
 		db.session.tx.tempDirty = true

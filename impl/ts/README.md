@@ -27,6 +27,11 @@ Style (CLAUDE.md §10): **boring, explicit code over clever abstraction.**
 - **No iteration-order leak.** JS `Map` is insertion-ordered, so storage sorts on
   iteration; encoded keys are held as a binary string (byte == code unit) so the default
   string sort is exactly unsigned byte order (CLAUDE.md §8).
+- **Independent engine, narrow native Node lock host.** SQL, storage, types, execution, and file
+  bytes are TypeScript. Node's shared-file host loads the `jed_lock.node` artifact built from
+  `native-lock/` solely for
+  crash-clean whole-file OS locks because Node exposes no standard `flock`/`LockFileEx`; the alone
+  lease makes no foreground addon call. Browser/OPFS and in-memory paths do not import it.
 
 ## Toolchain (no build step)
 
@@ -36,14 +41,16 @@ Targets modern Node (≥ 22.18 / ≥ 23.6; pinned to `node 24` in `../../mise.to
 constructor parameter properties; string-literal unions and discriminated unions instead.
 Relative imports carry an explicit `.ts` extension.
 
-Dev-dependencies are **type-check only** (no runtime footprint): `typescript` and
-`@types/node`. The engine, the unit tests, and the conformance harness all run on **bare
-Node with no `npm install`**.
+Dev-dependencies are **type-check only** (no npm runtime footprint): `typescript` and
+`@types/node`. The engine, the unit tests, and the conformance harness run on **bare Node with no
+`npm install`**. File-backed Node use additionally needs the matching first-party prebuilt lock
+artifact; repository tests build it from exact-pinned safe Rust sources with `rake ts:lock_build`.
 
 ```sh
 mise exec -- node src/bin/conformance.ts   # run the shared conformance corpus (no install)
 mise exec -- node --test tests/*.test.ts   # unit tests (no install)
 mise exec -- npm install && mise exec -- npx tsc --noEmit   # type-check (the one install)
+rake ts:lock_build                         # build the local Node OS-lock host
 ```
 
 Spec data tables (e.g. `spec/encoding/integers.toml`) are read in tests by a tiny

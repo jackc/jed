@@ -388,11 +388,11 @@ the "spec is the contract" net, Layer 3 inside the "checked-answer benchmarks" n
   `stress/balance_transfer.stress.toml` (the balance-transfer sum invariant + confluent final
   state). Most valuable once file-backed sharing is wired (§6), but already exercises commit
   atomicity, snapshot isolation under contention, and the watermark over the real concurrent paths.
-- **Layer 4 — designed by locking.md, not built.** It is release-blocking for shared file access and
+- **Layer 4 — landed.** It is release-blocking for shared file access and
   owns the `file.shared_process` capability. The feature is not represented by three mirrored unit
   suites: the one process corpus below drives every supported core pairing over the same file.
 
-## 10. Layer 4 — real-process shared-file protocol (planned)
+## 10. Layer 4 — real-process shared-file protocol
 
 Layer 4 exists because Layers 1–3 cannot exercise kernel lock lifetime, process death, or two native
 cores interpreting one bundle. A `.process.toml` scenario declares named actors (`rust`, `go`, or

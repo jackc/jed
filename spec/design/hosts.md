@@ -325,10 +325,10 @@ as it crosses. See the two docs for the full designs.
     OPFS-backed `SpillSink` is the path); read-only multi-handle via `createSyncAccessHandle({ mode })`
     (not portable yet); and running the real-browser e2e in CI (needs a headless-Chromium binary, today
     outside `rake ci`).
-- **Shared multi-process file coordination** — ⏳ **decided, spec'd
-  ([locking.md](locking.md)), not built**: the five-file OS-lock bundle, append-only contended commit,
-  and presence-EX uncontended lease are the first locking slice. Rust/Go need no dependency. Node's
-  narrow native OS-lock adapter is an explicit §14/FFI decision gate; no package is approved yet.
+- **Shared multi-process file coordination** — ✅ **landed
+  ([locking.md](locking.md))**: the five-file OS-lock bundle, append-only contended commit,
+  and presence-EX uncontended lease run in Rust, Go, and Node. Rust/Go need no dependency; Node uses
+  the approved narrow `impl/ts/native-lock` adapter. Prebuilt-package matrix work remains.
 - **Encryption codec** — ⏳ design door ([encryption.md](encryption.md)); not built. Crypto is a
   §14 vetted-library decision requiring explicit confirmation before any dependency lands.
 - **Replication tee** — ⏳ design door ([replication.md](replication.md)); block-shipping decided,

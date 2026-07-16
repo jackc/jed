@@ -601,7 +601,7 @@ func (db *engine) checkAttachmentWritable(scope *string) error {
 	if name == "main" || name == "temp" {
 		return nil
 	}
-	if att := db.core.attachments[name]; att != nil && att.mode == attachReadOnly {
+	if att := db.core.attachment(name); att != nil && att.mode == attachReadOnly {
 		return newError(ReadOnlySqlTransaction,
 			`cannot write to read-only database "`+*scope+`"`)
 	}
@@ -677,7 +677,7 @@ func (db *engine) attachWriteSnap(name string) *snapshot {
 // FILE attachment carries its own page size, baked into the file, which may differ from main's; an
 // in-memory attachment matches main. The attachment is known to exist (the qualifier gate passed).
 func (db *engine) attachPageSize(name string) uint32 {
-	return db.core.attachments[name].storage.pageSize
+	return db.core.attachment(name).storage.pageSize
 }
 
 // attachReadView returns the current READ view of every attached database — the transaction's working
