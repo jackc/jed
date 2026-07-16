@@ -14,6 +14,8 @@
 # Native Node-API Rust wrap; Cargo.lock is committed, the platform addon is generated.
 /impl/node/target/
 /impl/node/jed_node.node
+/impl/ts/native-lock/target/
+/impl/ts/jed_lock.node
 # Built gem packages.
 /impl/ruby/*.gem
 
@@ -22,6 +24,8 @@
 /impl/go/bin/
 # `go build ./cmd/mutate` (the mutation-testing harness) drops a binary here.
 /impl/go/mutate
+# Real-process conformance actor (built by concurrency:process).
+/impl/go/process_actor
 
 # TS core: installed dev-dependencies (typescript + @types/node for the engine; vite +
 # @playwright/test for the browser/OPFS host's demo + e2e — dev-only, spec/design/hosts.md §5).

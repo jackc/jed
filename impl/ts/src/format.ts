@@ -2751,7 +2751,12 @@ export function planFreeList(
   newGen: bigint;
 } {
   const MIN_COMPACT_PAGES = 16; // don't churn a tiny store
-  const compact = canReclaim && pageCount > MIN_COMPACT_PAGES && pageCount > 2 * liveAtCompaction;
+  // liveAtCompaction=0 is the shared-mode orphan sentinel: a co-resident commit deliberately
+  // persisted no reusable free list, so the first proven-alone commit must reconstruct regardless
+  // of the ordinary periodic threshold.
+  const compact =
+    canReclaim &&
+    (liveAtCompaction === 0 || (pageCount > MIN_COMPACT_PAGES && pageCount > 2 * liveAtCompaction));
   let persistList = freeRemaining;
   let newLive = liveAtCompaction;
   let newGen = genTxid;

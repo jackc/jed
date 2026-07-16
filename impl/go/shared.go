@@ -1085,7 +1085,7 @@ func (s *Database) ReadSession() *Session {
 	engine.attachedCommitted = rt.attached
 	engine.readOnly = true // the executor rejects writes (25006) / poisons a read-only block
 	refresh := s.core.coordinator != nil && s.core.coordinator.lease() == leaseShared
-	return &Session{core: s.core, engine: engine, access: accessReadOnly, pinned: true, pinVersion: v, baseVersion: v, refreshOnNextRead: refresh}
+	return &Session{core: s.core, engine: engine, access: accessReadOnly, pinned: true, pinVersion: v, baseVersion: v, refreshOnNextRead: refresh, planEpoch: s.core.planEpoch.Load()}
 }
 
 // WriteSession opens a READ WRITE session with an eager open write block (spec/design/session.md
@@ -1112,7 +1112,7 @@ func (s *Database) WriteSession() *Session {
 	engine.core = s.core
 	engine.attachedCommitted = rt.attached
 	_, _ = engine.beginTx(true, true)
-	return &Session{core: s.core, engine: engine, access: accessReadWrite, gateHeld: true, baseVersion: base.txid}
+	return &Session{core: s.core, engine: engine, access: accessReadWrite, gateHeld: true, baseVersion: base.txid, planEpoch: s.core.planEpoch.Load()}
 }
 
 // Session mints an ADDITIONAL configured session over this database (spec/design/session.md
@@ -1132,14 +1132,14 @@ func (s *Database) Session(opts SessionOptions) *Session {
 		engine.attachedCommitted = rt.attached
 		engine.readOnly = true // the executor enforces read-only too (rejects BEGIN READ WRITE, poisons a read-only block)
 		refresh := s.core.coordinator != nil && s.core.coordinator.lease() == leaseShared
-		return &Session{core: s.core, engine: engine, access: accessReadOnly, pinned: true, pinVersion: v, baseVersion: v, refreshOnNextRead: refresh}
+		return &Session{core: s.core, engine: engine, access: accessReadOnly, pinned: true, pinVersion: v, baseVersion: v, refreshOnNextRead: refresh, planEpoch: s.core.planEpoch.Load()}
 	}
 	rt := s.core.roots.Load()
 	snap := rt.committed
 	engine := &engine{committed: snap, pageSize: s.core.pageSize(), path: s.core.storage.path, spillDir: s.core.storage.spillDir, session: newSessionWithOptions(opts)}
 	engine.core = s.core
 	engine.attachedCommitted = rt.attached
-	return &Session{core: s.core, engine: engine, access: accessReadWrite, baseVersion: snap.txid}
+	return &Session{core: s.core, engine: engine, access: accessReadWrite, baseVersion: snap.txid, planEpoch: s.core.planEpoch.Load()}
 }
 
 // --- Bare convenience methods (CLAUDE.md §2 / spec/design/session.md §2.4): each mints a FRESH
@@ -1251,6 +1251,7 @@ type Session struct {
 	baseVersion       uint64
 	pendingErr        error
 	refreshOnNextRead bool
+	planEpoch         uint64
 }
 
 // queryValues is the unexported raw (sql, []Value) -> *Rows seam this session's ergonomic
@@ -1296,6 +1297,12 @@ func (s *Session) queryStmt(stmt statement, params []Value, sc *stmtCache) (*Row
 		} else if err := s.core.refreshShared(); err != nil {
 			return nil, err
 		}
+	}
+	if epoch := s.core.planEpoch.Load(); epoch != s.planEpoch {
+		if sc != nil {
+			sc.p.Store(nil)
+		}
+		s.planEpoch = epoch
 	}
 	// Route the read before building the streaming cursor (spec/design/streaming.md §4): an autocommit
 	// (non-block, writable access) read re-pins the latest committed so the snapshot is current

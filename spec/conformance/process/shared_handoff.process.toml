@@ -1,0 +1,123 @@
+schema_version = 1
+name = "shared-handoff-and-crash-release"
+description = "Two independent cores share snapshots, serialize writers, and recover a killed writer gate."
+
+[[step]]
+actor = "a"
+command = "start"
+argument = "create"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "CREATE TABLE t (id i64 PRIMARY KEY)"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t VALUES (1)"
+
+[[step]]
+actor = "b"
+command = "start"
+argument = "open"
+
+[[step]]
+actor = "a"
+command = "read_open"
+
+[[step]]
+actor = "a"
+command = "read_query_i64"
+sql = "SELECT id FROM t ORDER BY id"
+expect = "1"
+
+[[step]]
+actor = "b"
+command = "exec"
+sql = "INSERT INTO t VALUES (2)"
+
+[[step]]
+actor = "a"
+command = "read_query_i64"
+sql = "SELECT id FROM t ORDER BY id"
+expect = "1"
+
+[[step]]
+actor = "a"
+command = "read_close"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT id FROM t ORDER BY id"
+expect = "1,2"
+
+[[step]]
+actor = "a"
+command = "write_open"
+argument = "0"
+
+[[step]]
+actor = "a"
+command = "write_exec"
+sql = "INSERT INTO t VALUES (3)"
+
+[[step]]
+actor = "b"
+command = "write_open"
+argument = "50"
+expect_error = "55P03"
+
+[[step]]
+actor = "a"
+command = "write_commit"
+
+[[step]]
+actor = "b"
+command = "write_open"
+argument = "5000"
+
+[[step]]
+actor = "b"
+command = "write_exec"
+sql = "INSERT INTO t VALUES (4)"
+
+[[step]]
+actor = "b"
+command = "write_commit"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT id FROM t ORDER BY id"
+expect = "1,2,3,4"
+
+[[step]]
+actor = "b"
+command = "write_open"
+argument = "0"
+
+[[step]]
+actor = "b"
+command = "write_exec"
+sql = "INSERT INTO t VALUES (5)"
+
+[[step]]
+actor = "b"
+command = "kill"
+
+[[step]]
+actor = "a"
+command = "exec"
+sql = "INSERT INTO t VALUES (6)"
+
+[[step]]
+actor = "a"
+command = "query_i64"
+sql = "SELECT id FROM t ORDER BY id"
+expect = "1,2,3,4,6"
+
+[[step]]
+actor = "a"
+command = "close"

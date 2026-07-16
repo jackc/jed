@@ -89,6 +89,10 @@ export class SharedPaging {
     this.pager.sync();
   }
 
+  refreshAllocatedPages(): void {
+    this.pager.refreshAllocatedPages();
+  }
+
   // armFault arms a one-shot commit fault on the backing pager — the fault-injection seam
   // (spec/design/storage.md §7), used by the crash-recovery tests. Testing only.
   armFault(fault: CommitFault): void {

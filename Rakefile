@@ -199,6 +199,20 @@ NODE_WRAP_ARTIFACT = File.join(
 NODE_WRAP_MODULE = File.join(NODE_WRAP_DIR, "jed_node.node")
 GO_DIR        = File.join(__dir__, "impl/go")
 TS_DIR        = File.join(__dir__, "impl/ts")
+TS_LOCK_MANIFEST = File.join(TS_DIR, "native-lock/Cargo.toml")
+TS_LOCK_ARTIFACT = File.join(
+  TS_DIR,
+  "native-lock/target/release",
+  case RbConfig::CONFIG["host_os"]
+  when /darwin/
+    "libjed_lock.dylib"
+  when /mswin|mingw|cygwin/
+    "jed_lock.dll"
+  else
+    "libjed_lock.so"
+  end,
+)
+TS_LOCK_MODULE = File.join(TS_DIR, "jed_lock.node")
 TS_FORMAT_DIRS = %w[impl/ts impl/node bench/ts migrate/ts] # biome (mise-pinned); biome.json scopes paths + excludes generated
 WEB_DIR       = "web"                # prettier (npm-pinned); reuses web's format / format:check scripts
 # jed-migrate (spec at /migrate/design.md): a CONSUMER of the engine per language, NOT a core — like
@@ -242,6 +256,11 @@ namespace :fmt do
     puts "rust: cargo fmt --check"
     unless system("cargo", "fmt", "--check", "--manifest-path", RUST_MANIFEST)
       failures << "rust"
+    end
+
+    puts "ts-lock: cargo fmt --check"
+    unless system("cargo", "fmt", "--check", "--manifest-path", TS_LOCK_MANIFEST)
+      failures << "ts-lock"
     end
 
     puts "cli:  cargo fmt --check"
@@ -290,6 +309,7 @@ namespace :fmt do
   desc "Rewrite core, host-artifact, tooling, and web sources with pinned formatters"
   task :fix do
     sh "cargo", "fmt", "--manifest-path", RUST_MANIFEST
+    sh "cargo", "fmt", "--manifest-path", TS_LOCK_MANIFEST
     sh "cargo", "fmt", "--manifest-path", CLI_MANIFEST
     sh "cargo", "fmt", "--manifest-path", RUBY_EXT_MANIFEST
     sh "cargo", "fmt", "--manifest-path", WASM_MANIFEST
@@ -519,6 +539,16 @@ namespace :node do
   end
 end
 
+# ts:lock_build — the production narrow Node-API OS-lock host for the independent TypeScript core.
+# It exposes no SQL/storage behavior; the TypeScript engine remains an independent conformance voice.
+namespace :ts do
+  desc "Build the TypeScript core's narrow native OS-lock adapter"
+  task :lock_build do
+    sh "cargo", "build", "--release", "--manifest-path", TS_LOCK_MANIFEST
+    FileUtils.cp(TS_LOCK_ARTIFACT, TS_LOCK_MODULE)
+  end
+end
+
 # concurrency — the stepped-THREADED concurrency conformance (spec/design/concurrency-testing.md
 # §4.3), run under the race detector. The binary harnesses already run every `# format: concurrency`
 # schedule stepped-SEQUENTIALLY inside the normal conformance walk (the canonical, timing-free result
@@ -529,6 +559,13 @@ end
 # when touching the shared-handle concurrency model. TS has no threaded mode (JS has no shared-memory
 # threads for live objects), so it is sequential-only and not run here.
 namespace :concurrency do
+  desc "Run the real-process shared-file corpus across every Rust/Go/Node pairing"
+  task process: "ts:lock_build" do
+    sh "cargo", "build", "--release", "--bin", "process_actor", "--manifest-path", RUST_MANIFEST
+    sh "go", "build", "-o", File.join(GO_DIR, "process_actor"), "./cmd/process_actor", chdir: GO_DIR
+    sh RbConfig.ruby, File.join(__dir__, "scripts/process_conformance.rb")
+  end
+
   desc "Run the stepped-threaded concurrency conformance under the race detector (Go + Rust)"
   task :race do
     puts "go:   go test -race (one goroutine per session, turn-token order)"
@@ -784,7 +821,7 @@ namespace :conformance do
   end
 
   desc "Walk the conformance corpus on the TS core, both storage modes"
-  task :ts do
+  task ts: "ts:lock_build" do
     puts "conformance: ts (memory)"
     Dir.chdir(TS_DIR) { sh "npm", "run", "--silent", "conformance" }
     puts "conformance: ts (disk)"
@@ -812,7 +849,7 @@ namespace :unit do
   end
 
   desc "Run the TS core's unit tests"
-  task :ts do
+  task ts: "ts:lock_build" do
     puts "unit: ts"
     Dir.chdir(TS_DIR) { sh "npm", "run", "--silent", "test" }
   end

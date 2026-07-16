@@ -51,6 +51,40 @@ export function persistImpl(
   return write;
 }
 
+// Shared-process commit is deliberately append-only (locking.md §5.3): it never consumes the
+// persisted free list, rewrites its chain, truncates, or replaces the file. Body pages become durable
+// first; the caller owns commit EX only for publishMeta, keeping reader admission blocked for the
+// shortest window.
+export function persistSharedBody(
+  db: Engine,
+  snap: Snapshot,
+): {
+  write: IncrementalWrite;
+  publishMeta: () => void;
+} {
+  const write = incrementalImage(snap, db.pageSize, db.pageCount, db.freePages, db.paging, false);
+  const paging = db.paging;
+  if (paging === null) return { write, publishMeta: () => {} };
+  paging.refreshAllocatedPages();
+  paging.reserve(write.pageCount);
+  for (const pg of write.pages) paging.writeBlock(pg.index, pg.bytes);
+  paging.sync();
+  return {
+    write,
+    publishMeta: () => {
+      const meta = metaPage(db.pageSize, snap.txid, write.rootPage, write.pageCount, 0);
+      paging.writeBlock(Number(snap.txid & 1n), meta);
+      paging.sync();
+      db.pageCount = write.pageCount;
+      db.freePages = [];
+      // Zero is the orphan sentinel: the first later alone commit rebuilds the free list instead of
+      // trusting reachability facts from before a co-resident interval.
+      db.liveAtCompaction = 0;
+      db.freeGenTxid = snap.txid;
+    },
+  };
+}
+
 // commitFile is the FILE branch of persistImpl (v25). Write the tree + catalog first (unsynced) so the
 // in-commit reachability walk can read the new catalog back through the pager (read-your-writes); then
 // planFreeList serializes the persisted free-list (drawn from freeRemaining, so persisting never grows

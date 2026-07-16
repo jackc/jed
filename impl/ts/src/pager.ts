@@ -190,6 +190,13 @@ export class Pager {
     this.allocatedPages = target;
   }
 
+  // Refresh the physical high-water after a foreign process appended pages. Shared-mode writers
+  // reserve from the committed page_count, but the pager's allocation cache must also learn the
+  // file's current length so it never tries to regrow from a stale value.
+  refreshAllocatedPages(): void {
+    this.allocatedPages = Math.floor(this.store.size() / this.pageSize);
+  }
+
   // sync is the metadata-free durability barrier — the host's data-only sync (fdatasync). Called twice
   // per commit — body pages, then the meta — to honour the body-before-meta write-ordering rule
   // (format.md, file.ts persistImpl). Data-only (not a full fsync) so an overwrite into the

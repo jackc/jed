@@ -1,0 +1,27 @@
+# First-party Node-API host adapter for the independent TypeScript core. This crate exposes only
+# whole-file OS lock operations; it performs no database I/O and is not a conformance core.
+
+[package]
+name = "jed-node-lock"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Minimal Node-API file-lock host for the jed TypeScript core."
+
+[lib]
+name = "jed_lock"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+napi = { version = "=3.10.5", default-features = false, features = ["napi8"] }
+napi-derive = "=3.5.10"
+
+[build-dependencies]
+napi-build = "=2.3.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

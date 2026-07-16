@@ -61,7 +61,12 @@ import {
   type TxStatus,
 } from "./executor.ts";
 import { PreparedStatement, Rows, rowsFromOutcome, Transaction } from "./api.ts";
-import { loadEngine, newAttachedStorage, toImage as toImageBytes } from "./format.ts";
+import {
+  loadEngine,
+  loadEnginePaged,
+  newAttachedStorage,
+  toImage as toImageBytes,
+} from "./format.ts";
 import type { CompositeType, Table } from "./catalog.ts";
 import type { Row } from "./storage.ts";
 import type { Cursor } from "./cursor.ts";
@@ -74,7 +79,7 @@ import {
   Statement as ErgoStatement,
 } from "./ergonomic.ts";
 import { engineError } from "./errors.ts";
-import { persistImpl } from "./persist.ts";
+import { persistImpl, persistSharedBody } from "./persist.ts";
 import type { Statement } from "./ast.ts";
 
 // afterPersistHook is a test-only seam (null in production, a single null-check per commit): it fires in
@@ -94,6 +99,30 @@ import type { ScriptSummary } from "./split.ts";
 import type { Privileges, PrivilegeSet } from "./privileges.ts";
 import type { ClockFunc, RandomFill } from "./seam.ts";
 import type { Value } from "./value.ts";
+
+export type LeaseState = "alone" | "shared" | "exclusive" | "poisoned";
+
+// Host-owned OS coordination surface. Keeping this structural interface here lets the browser-clean
+// shared core implement policy without importing Node; file.ts supplies the Node coordinator and
+// OPFS supplies no coordinator because its sync access handle is already exclusive.
+export interface FileCoordinatorHost {
+  readonly path: string;
+  state: LeaseState;
+  checkPid(): void;
+  startProbe(tick: () => void): void;
+  lockCommitShared(): void;
+  lockCommitExclusive(): void;
+  unlockCommit(): void;
+  lockWriter(timeoutMs: number): void;
+  unlockWriter(): void;
+  tryArrivalExclusive(): boolean;
+  unlockArrival(): void;
+  lockTransition(): void;
+  unlockTransition(): void;
+  downgradePresence(): void;
+  tryUpgradePresence(): boolean;
+  close(): void;
+}
 
 // databaseFromSnapshot builds a session-local handle whose committed root is `snap`. It retains the
 // shared storage identity's independent host scratch sink for spill; the snapshot's stores continue
@@ -153,10 +182,125 @@ class SharedCore {
   // readOnly marks a read-only file-backed core (api.md §2.1): every session is then read-only, a
   // write is 25006. Always false for an in-memory core.
   readOnly = false;
+  coordinator: FileCoordinatorHost | null;
+  planEpoch = 0;
 
-  constructor(snap: Snapshot, storage: Engine) {
+  constructor(snap: Snapshot, storage: Engine, coordinator: FileCoordinatorHost | null = null) {
     this.committed = snap;
     this.storage = storage;
+    this.coordinator = coordinator;
+  }
+
+  acquireWriter(timeoutMs: number): void {
+    if (this.writerActive) {
+      throw engineError("active_sql_transaction", "there is already a writer in progress");
+    }
+    this.writerActive = true;
+    try {
+      const coordinator = this.coordinator;
+      if (coordinator === null) return;
+      coordinator.checkPid();
+      if (coordinator.state === "poisoned") {
+        throw engineError("io_error", "shared-file coordinator is poisoned");
+      }
+      if (coordinator.state === "shared") {
+        coordinator.lockWriter(timeoutMs);
+        try {
+          this.refreshShared();
+        } catch (error) {
+          coordinator.unlockWriter();
+          throw error;
+        }
+      }
+    } catch (error) {
+      this.writerActive = false;
+      throw error;
+    }
+  }
+
+  releaseWriter(): void {
+    if (!this.writerActive) return;
+    if (this.coordinator?.state === "shared") this.coordinator.unlockWriter();
+    this.writerActive = false;
+  }
+
+  checkPid(): void {
+    this.coordinator?.checkPid();
+  }
+
+  refreshShared(): void {
+    const coordinator = this.coordinator;
+    if (coordinator === null || coordinator.state !== "shared") return;
+    coordinator.checkPid();
+    coordinator.lockCommitShared();
+    try {
+      this.reloadFromPager();
+    } finally {
+      coordinator.unlockCommit();
+    }
+  }
+
+  private reloadFromPager(): void {
+    const paging = this.storage.paging;
+    if (paging === null) return;
+    paging.refreshAllocatedPages();
+    const loaded = loadEnginePaged(paging);
+    if (loaded.committed.txid <= this.committed.txid) return;
+    this.storage.pageCount = loaded.pageCount;
+    this.storage.freePages = loaded.freePages;
+    this.storage.liveAtCompaction = loaded.liveAtCompaction;
+    this.storage.freeGenTxid = loaded.freeGenTxid;
+    this.committed = loaded.committed;
+    this.planEpoch++;
+  }
+
+  coordinationTick(): void {
+    const coordinator = this.coordinator;
+    if (coordinator === null || this.writerActive) return;
+    try {
+      if (coordinator.state === "alone") this.tryDowngrade(coordinator);
+      else if (coordinator.state === "shared") this.tryUpgrade(coordinator);
+    } catch {
+      coordinator.state = "poisoned";
+    }
+  }
+
+  private tryDowngrade(coordinator: FileCoordinatorHost): void {
+    if (coordinator.tryArrivalExclusive()) {
+      coordinator.unlockArrival();
+      return;
+    }
+    coordinator.lockTransition();
+    try {
+      if (coordinator.tryArrivalExclusive()) {
+        coordinator.unlockArrival();
+        return;
+      }
+      coordinator.downgradePresence();
+    } finally {
+      coordinator.unlockTransition();
+    }
+  }
+
+  private tryUpgrade(coordinator: FileCoordinatorHost): void {
+    coordinator.lockTransition();
+    try {
+      if (!coordinator.tryArrivalExclusive()) return;
+      try {
+        if (!coordinator.tryUpgradePresence()) return;
+        coordinator.lockCommitShared();
+        try {
+          this.reloadFromPager();
+        } finally {
+          coordinator.unlockCommit();
+        }
+        coordinator.state = "alone";
+      } finally {
+        coordinator.unlockArrival();
+      }
+    } finally {
+      coordinator.unlockTransition();
+    }
   }
 
   // pageSize is the byte store's page size (fixed into the file/image at creation). Minted sessions
@@ -181,6 +325,22 @@ class SharedCore {
     // Both consult the SAME registry; single-handle / all-readers-current keeps oldest_live == committed,
     // so both hold and behavior (and on-disk bytes) are identical to an ungated commit.
     const oldest = this.oldestLiveVersion(snap.txid);
+    const coordinator = this.coordinator;
+    if (coordinator !== null && coordinator.state === "shared" && this.storage.path !== null) {
+      try {
+        const pending = persistSharedBody(this.storage, snap);
+        coordinator.lockCommitExclusive();
+        try {
+          pending.publishMeta();
+        } finally {
+          coordinator.unlockCommit();
+        }
+      } catch (error) {
+        coordinator.state = "poisoned";
+        throw error;
+      }
+      return;
+    }
     persistImpl(this.storage, snap, oldest === snap.txid, oldest >= this.storage.freeGenTxid);
   }
 
@@ -289,19 +449,22 @@ export class Database {
   // shared.ts stays browser-clean by not importing it). The committed snapshot's stores already
   // carry the shared paging, so every pinned/cloned snapshot faults clean pages through the one pool
   // (spec/design/pager.md).
-  static fromEngine(engine: Engine): Database {
+  static fromEngine(engine: Engine, coordinator: FileCoordinatorHost | null = null): Database {
     // v25: the main domain (file or in-memory) reclaims within-session — the open path reads the
     // persisted free-list and no longer reconstructs it, so mid-session orphans must be returned at each
     // commit or they would leak permanently (format.md *Reclamation*).
     engine.reclaimWithinSession = true;
-    const core = new SharedCore(engine.committed, engine);
+    const core = new SharedCore(engine.committed, engine, coordinator);
     core.readOnly = engine.readOnly;
+    coordinator?.startProbe(() => core.coordinationTick());
     return Database.over(core);
   }
 
   // version is the committed version currently published (the monotonic commit counter,
   // transactions.md §8). Advances by 1 on every WriteHandle.commit.
   get version(): bigint {
+    this.core.checkPid();
+    this.core.refreshShared();
     return this.core.committed.txid;
   }
 
@@ -395,6 +558,8 @@ export class Database {
   // writer interleaves commits — and a write through it is 25006. The caller must close() it to
   // deregister (advancing the watermark), since JS has no destructor. (The old SharedDb.read().)
   readSession(): Session {
+    this.core.checkPid();
+    this.core.refreshShared();
     const snap = this.core.committed; // pin (immutable — no clone)
     this.core.register(snap.txid);
     const engine = databaseFromSnapshot(snap, this.core);
@@ -416,17 +581,19 @@ export class Database {
       // one — a write through it is 25006, mirroring PostgreSQL hot standby.
       return this.readSession();
     }
-    if (this.core.writerActive) {
-      throw engineError("active_sql_transaction", "there is already a writer in progress");
+    this.core.acquireWriter(0);
+    try {
+      const base = this.core.committed;
+      // committed = the immutable base; beginTx clones it to working.
+      const engine = databaseFromSnapshot(base, this.core);
+      engine.core = this.core;
+      engine.attachedCommitted = this.core.attached; // pin the attached roots together (§5)
+      engine.beginTx(true);
+      return new Session(this.core, engine, "rw", base.txid, null, true);
+    } catch (error) {
+      this.core.releaseWriter();
+      throw error;
     }
-    this.core.writerActive = true;
-    const base = this.core.committed;
-    // committed = the immutable base; beginTx clones it to working.
-    const engine = databaseFromSnapshot(base, this.core);
-    engine.core = this.core;
-    engine.attachedCommitted = this.core.attached; // pin the attached roots together (§5)
-    engine.beginTx(true);
-    return new Session(this.core, engine, "rw", base.txid, null, true);
   }
 
   // session mints an ADDITIONAL configured session over this database (spec/design/session.md
@@ -437,6 +604,8 @@ export class Database {
   // BEGIN/COMMIT/ROLLBACK open and end an explicit block. (The old db.newSession swap → an
   // independent owns-its-Engine session.)
   session(opts: SessionOptions = {}): Session {
+    this.core.checkPid();
+    if (this.core.readOnly) this.core.refreshShared();
     const snap = this.core.committed;
     const engine = databaseFromSnapshot(snap, this.core);
     engine.session = new SessionState(opts);
@@ -597,6 +766,8 @@ export class Database {
     // need not detach before close (attached-databases.md §4). Order-independent (just closing).
     for (const att of this.core.attachments.values()) att.storage.paging?.close();
     this.core.attachments = new Map();
+    this.core.coordinator?.close();
+    this.core.coordinator = null;
   }
 
   // fromImage lifts a from-scratch on-disk image (spec/fileformat/format.md) into an in-memory host
@@ -720,6 +891,7 @@ export class Session {
   // The committed version the current working set / pin is based on; the published version is
   // baseVersion+1 (the monotonic commit counter, transactions.md §8).
   private baseVersion: bigint;
+  private planEpoch: number;
   private closed = false;
 
   constructor(
@@ -736,6 +908,7 @@ export class Session {
     this.baseVersion = baseVersion;
     this.pinnedVersion = pinnedVersion;
     this.gateHeld = gateHeld;
+    this.planEpoch = core.planEpoch;
   }
 
   // execute runs a (possibly mutating) statement on this session, binding $N params (spec/design/
@@ -755,6 +928,7 @@ export class Session {
   // DEFERRED cursor (streaming.md §7) that defers the whole run to the first pull and yields the result
   // one row at a time; a data-modifying WITH (a write) still falls back to the materialized dispatch path.
   query(sql: string, params: Value[] = []): Rows {
+    this.core.checkPid();
     return this.queryStmt(this.engine.parse(sql), params, null); // one-shot: no cross-call plan cache (still plans once)
   }
 
@@ -765,11 +939,17 @@ export class Session {
   // query (queryPrepared passes the statement's ScanCacheHolder), so a prepared query streams and
   // pins its snapshot exactly like an ad-hoc one but reuses its cached plan across executes.
   private queryStmt(stmt: Statement, params: Value[], holder: ScanCacheHolder | null): Rows {
+    this.core.checkPid();
     // Route the read before building the lazy cursor: an autocommit (non-block, writable access) read
     // re-pins the latest committed so the snapshot is current; a read-only session uses its existing
     // pin, and an open block uses its working set.
     if (this.access !== "ro" && this.engine.session.tx === null && !stmtIsWrite(stmt)) {
+      this.core.refreshShared();
       this.refreshCommitted();
+    }
+    if (this.planEpoch !== this.core.planEpoch) {
+      if (holder !== null) holder.cache = null;
+      this.planEpoch = this.core.planEpoch;
     }
     // A read served by a lazy lane never reaches the materialized dispatch, so enforce the read-path
     // admission gates (failed-block 25P02 / lifetime 54P02 / privilege 42501) here — after refreshing so
@@ -933,6 +1113,7 @@ export class Session {
       this.acquireGate();
       this.refreshCommitted();
     } else {
+      this.core.refreshShared();
       this.refreshCommitted();
       this.core.register(this.baseVersion);
       this.pinnedVersion = this.baseVersion;
@@ -961,17 +1142,14 @@ export class Session {
   // acquireGate takes the single-writer flag, throwing 25001 if another writer is open (JS cannot
   // block its one thread — the faithful single-writer analog is to reject, transactions.md §10).
   private acquireGate(): void {
-    if (this.core.writerActive) {
-      throw engineError("active_sql_transaction", "there is already a writer in progress");
-    }
-    this.core.writerActive = true;
+    this.core.acquireWriter(this.engine.session.lockTimeoutMs);
     this.gateHeld = true;
   }
 
   // releaseGate releases the single-writer flag (if held).
   private releaseGate(): void {
     if (this.gateHeld) {
-      this.core.writerActive = false;
+      this.core.releaseWriter();
       this.gateHeld = false;
     }
   }

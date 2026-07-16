@@ -28,6 +28,7 @@ import { Pager } from "./pager.ts";
 import { persistImpl } from "./persist.ts";
 import { buildInMemory, Database, registerFileAttachOpener } from "./shared.ts";
 import { FileSpillSink } from "./spillfile.ts";
+import { FileCoordinator } from "./coordinator.ts";
 
 // DatabaseOptions are the settings for a newly-created database file (spec/design/api.md §2).
 // pageSize is fixed into the file's meta at creation and cannot change thereafter.
@@ -192,7 +193,17 @@ registerFileAttachOpener((path, readOnly) => open(path, { readOnly }));
 export function createDatabase(opts: CreateOptions = {}): Database {
   const pageSize = opts.pageSize || DEFAULT_PAGE_SIZE;
   if (opts.path !== undefined) {
-    return Database.fromEngine(create(opts.path, { pageSize, noSync: opts.skipFsync }));
+    const coordinator = FileCoordinator.create(opts.path, opts.locking, opts.fileLockTimeoutMs);
+    try {
+      const engine = create(coordinator?.path ?? opts.path, {
+        pageSize,
+        noSync: opts.skipFsync,
+      });
+      return Database.fromEngine(engine, coordinator);
+    } catch (error) {
+      coordinator?.close();
+      throw error;
+    }
   }
   return buildInMemory(pageSize); // in-memory never fsyncs; skipFsync is a no-op
 }
@@ -200,7 +211,20 @@ export function createDatabase(opts: CreateOptions = {}): Database {
 // openDatabase opens an existing file-backed database at path with optional open settings and returns
 // the host Database handle with its default session (the back-compat bridge, spec/design/session.md §2.4).
 export function openDatabase(path: string, opts: OpenOptions = {}): Database {
-  return Database.fromEngine(open(path, opts));
+  const coordinator = FileCoordinator.open(path, opts.locking, opts.fileLockTimeoutMs);
+  try {
+    coordinator?.lockCommitShared();
+    let engine: Engine;
+    try {
+      engine = open(coordinator?.path ?? path, { ...opts, locking: "none" });
+    } finally {
+      coordinator?.unlockCommit();
+    }
+    return Database.fromEngine(engine, coordinator);
+  } catch (error) {
+    coordinator?.close();
+    throw error;
+  }
 }
 
 // residentLeaves is the number of leaf pages currently resident in the buffer pool — 0 for an
