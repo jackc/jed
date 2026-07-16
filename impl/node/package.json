@@ -1,0 +1,11 @@
+{
+  "name": "@jed/node-rust",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Experimental native Node.js package wrapping the safe jed Rust core.",
+  "type": "module",
+  "exports": "./index.ts",
+  "scripts": {
+    "test": "node --test test/*.test.ts"
+  }
+}

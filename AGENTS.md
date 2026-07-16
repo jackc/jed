@@ -119,6 +119,11 @@ files in the same change.
   must retain zero coordination syscalls and zero per-transaction meta reads.
 - Never use PID files, mtime leases, or automatic stale-lock stealing for database
   safety. A host without the required crash-clean OS lock fails closed.
+- Node shared locking requires native OS-lock code. The current delivery proposal
+  keeps the independent TypeScript engine and adds a minimal Node-API lock helper;
+  its alone lease makes no foreground addon calls. A full Rust-core Node wrapper
+  exists only as a reach experiment: it wins heavy/parallel reads but not cheap
+  queries or writes uniformly, and it is not a TypeScript conformance voice.
 - Treat the lock-bundle protocol version as a compatibility boundary. Pre-protocol
   binaries cannot overlap safely and must be drained once during first rollout.
 - Replication, where relevant, is block-delta shipping at the block seam, not a

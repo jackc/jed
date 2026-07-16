@@ -319,40 +319,61 @@ background lease polling are unmetered host work and never enter SQL cost.
 | Rust local file, Unix | shared | five `std::fs::File` whole-file locks (`flock`); no dependency |
 | Go local file, Unix | shared | five `syscall.Flock` locks; pure Go, no dependency |
 | Rust/Go local file, Windows | shared | `LockFileEx` whole-file locks; Rust std / pure Go syscall |
-| Node file | shared when native lock host is installed | the exact Unix `flock` / Windows `LockFileEx` bundle; §8 |
+| Node/TS file | shared when native lock host is installed | the narrow Unix `flock` / Windows `LockFileEx` adapter; §8 |
+| Node/Rust wrap | shared | inherits the Rust local-file host; experimental delivery choice, §8 |
 | Browser/OPFS | exclusive | the sync access handle is inherently exclusive; explicit `shared` is `0A000` |
 | wasm32-wasip1 | unavailable | `auto`/`shared`/`exclusive` fail `0A000`; only explicit `none` proceeds |
 | Ruby gem | shared | inherits the Rust host |
 | in-memory | n/a | process-private; no coordination bundle |
 
-## 8. TypeScript / Node decision gate
+## 8. TypeScript / Node delivery decision
 
 Node v26 still exposes no standard `flock`/`LockFileEx` API. A PID sidecar, `mkdir`+mtime lease, or
 automatic “stale” deletion cannot meet §2: PID reuse/namespaces and stop-the-world/event-loop pauses can
 let an old owner resume after another process has stolen its lease. Adding fencing would require an
 atomic compare-and-swap primitive the filesystem API does not provide. Those approaches are rejected.
 
-Therefore a corruption-safe Node shared host requires a **narrow native OS-lock adapter** over an
-already-open coordination file. Its complete primitive surface is nonblocking `try_lock_shared`,
-nonblocking `try_lock_exclusive`, and `unlock`, plus stable busy/unsupported/I/O error classification.
-Timeout and cancellation loops stay in the language host, so no native call can become an
-uncancellable wait. The adapter performs no database I/O and cannot affect values, costs, or bytes.
+Therefore a corruption-safe Node shared host needs native code. There are two honest delivery choices:
 
-The preferred direction is a **first-party minimal Rust Node-API addon** whose source lives with jed,
-owns only coordination-file handles, and delegates locking to safe `std::fs::File` methods. It is a
-host adapter, not a wrapper around the Rust database core; SQL/storage behavior remains independently
-implemented in TypeScript. Stable Node-API plus reproducible prebuilt artifacts preserve the package's
-no-consumer-build-step goal.
+1. keep SQL/storage in the independent TypeScript core and add a **narrow native OS-lock adapter** over
+   already-open coordination files; or
+2. ship a Node package that wraps the whole Rust core and inherits Rust's lock host.
 
-The dependency candidate, audited on 2026-07-16 but **not approved or added**, is
-`napi = 3.10.5`, `napi-derive = 3.5.10`, and build-only `napi-build = 2.3.2`, all exact-pinned with the
-transitive lockfile committed. No npm build CLI is needed; Rake drives the ordinary Cargo builds. The
-proposed initial artifact matrix is Linux glibc x64/arm64, Linux musl x64/arm64, macOS x64/arm64, and
-Windows x64, built against stable Node-API 8. Artifacts ship inside the package with a SHA-256 manifest
-and provenance; installation runs no script and downloads nothing. A platform without a matching
-artifact fails closed. `fs-ext-extra-prebuilt@2.2.9` was also evaluated and is not recommended: it uses
-NAN rather than stable Node-API, runs an install script, ships a much broader filesystem surface, and
-has a narrow maintainer base.
+The narrow adapter's complete primitive surface is nonblocking `try_lock_shared`, nonblocking
+`try_lock_exclusive`, and `unlock`, plus stable busy/unsupported/I/O error classification. Timeout and
+cancellation loops stay in the language host, so no native call can become an uncancellable wait. It
+performs no database I/O and cannot affect values, costs, or bytes. Under the §4 alone lease it is not
+called on foreground transaction paths, so it preserves the current pure-TS single-process query and
+write performance; only open/close and the bounded background arrival probe cross Node-API.
+
+The full-wrapper alternative was built as `impl/node` before choosing. It wraps the safe Rust core over
+Node-API, exposes prepared calls through a compact buffer boundary, and runs the complete benchmark
+corpus as `jed/node/rust-wrap` ([benchmarks.md §7.3](benchmarks.md)). On the 2026-07-16 same-host run all
+159 pure-TS/wrapper/native-Rust results agreed on checksums. The wrapper was 1.38× faster by geometric
+mean over 49 single-process lanes and 3.76× over the four concurrent lanes, but the 13 sub-100 µs lanes
+were effectively tied (0.98×; TypeScript won 8) and pure TypeScript was 2.04× faster by geometric mean
+on the five write lanes. The Node boundary cost 2.01× over native Rust across single-process lanes.
+This is a meaningful heavy-read/parallelism win, not a universal win and not zero-cost Rust speed.
+
+**Current proposal:** use the narrow adapter for the TypeScript Node host. Requiring one bounded native
+locking component does not erase the distinction between a TypeScript engine and a full Rust engine:
+the narrow path keeps the existing single-process foreground path unchanged, preserves independent TS
+conformance, keeps host functions in-language, and ships much less native surface. Keep `impl/node` as
+an experimental reach artifact and reconsider it as an optional or primary Node package only after its
+full API, worker-thread ergonomics, platform distribution, and write regressions are evaluated. If the
+product instead chooses the full wrapper, say explicitly whether the native TS core still supports
+shared Node files through the adapter or treats the OS-lock host as unavailable; wrapping Rust must not
+silently count as an independent TypeScript conformance result.
+
+The exact prototype dependencies, approved and added only to the separate experimental host artifact,
+are `napi = 3.10.5`, `napi-derive = 3.5.10`, and build-only `napi-build = 2.3.2`, all exact-pinned with
+the transitive lockfile committed. The proposed production artifact matrix for either native choice is
+Linux glibc x64/arm64, Linux musl x64/arm64, macOS x64/arm64, and Windows x64, built against stable
+Node-API 8. Artifacts ship inside the package with a SHA-256 manifest and provenance; installation runs
+no script and downloads nothing. A platform without a matching artifact fails closed.
+`fs-ext-extra-prebuilt@2.2.9` was also evaluated and is not recommended: it uses NAN rather than stable
+Node-API, runs an install script, ships a much broader filesystem surface, and has a narrow maintainer
+base.
 
 The Node file host loads the addon conditionally; browser/OPFS bundles never import it. The alone probe
 uses an unreferenced timer so an idle database does not keep the process alive. Because jed's current
@@ -362,11 +383,11 @@ That does not weaken safety, but it is a real ergonomics cost: applications that
 cross-process write transactions should run jed in a worker thread or choose finite timeouts. An async
 embedding surface is a separate API slice, not hidden inside the lock protocol.
 
-This is an explicit architecture/dependency gate: CLAUDE.md §14 currently forbids dependencies that
-introduce FFI/unsafe code. Before the Node slice, a human must approve both (a) a bounded exception for
-this host-only Node-API adapter and (b) the exact versions and artifact matrix above. If that exception
-is rejected, Node `shared` fails closed with `0A000`; it does not silently weaken the protocol. OPFS
-remains inherently exclusive and does not need the adapter.
+Production remains an explicit architecture/distribution gate: CLAUDE.md §14 ordinarily rejects
+dependencies that introduce FFI/unsafe code. The prototype authorizes the exact pins for comparison;
+shipping either package still requires accepting the bounded Node-API exception and verifying the
+artifact matrix above. If no native artifact is accepted, Node `shared` fails closed with `0A000`; it
+does not silently weaken the protocol. OPFS remains inherently exclusive and does not need an addon.
 
 ## 9. Verification contract
 
@@ -413,7 +434,7 @@ separately and bounded by the polling interval.
    writer gate + `55P03`, and concurrency tests.
 3. **Append-only shared commit:** no-reuse allocator mode, zero free-list head, publish gate, crash/fault
    matrix, and alone recovery/reclamation.
-4. **Node OS-lock host:** only after the explicit §8 approval; add Rust↔Go↔Node real-process lanes.
+4. **Node OS-lock host:** after the production §8 decision; add Rust↔Go↔Node real-process lanes.
 5. **Compaction integration and public docs:** stable-bundle handoff for the later compaction slice;
    update website examples/status when shared locking becomes user-visible.
 

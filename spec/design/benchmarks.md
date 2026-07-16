@@ -16,6 +16,17 @@ is the permanent blocking-sort top-k lane: one million fixed
 rows, K=100, cross-engine checksum equality, and the scan-dominated timing/memory payoff. This document is the
 canonical record for the `bench/` subsystem.
 
+**Native Node wrapper experiment (2026-07-16).** `impl/node` and
+`bench/ts/src/bench-node-rust.ts` provide a Node-API wrapper around the safe Rust core and run all 53
+jed lanes against the pure TypeScript core. The same-host control run also included the native Rust
+harness: all **159 results agreed on answer checksums**. Across the 49 single-process lanes, the
+wrapper was 1.38× faster by geometric mean, but that aggregate hides the product-relevant split: the
+13 sub-100 µs lanes were effectively tied (0.98× wrapper speedup; TypeScript won 8), the 36 heavier
+lanes favored the wrapper by 1.55×, and pure TypeScript won the five write lanes by 2.04× geometric
+mean. Rust-owned reader threads made the wrapper 3.76× faster across the four concurrent lanes. The
+Node boundary itself cost 2.01× over native Rust by geometric mean on the single-process lanes. These
+results do not select the production Node package; §7.3 records the experiment and its limits.
+
 **Top-k result (2026-07-13).** On the permanent `order_by_limit` lane, every jed core and
 PostgreSQL returned checksum `6350e1a54bbefa1d`. Median per-query time moved from the 2026-07-01
 pre-top-k run to **145 ms Go** (2.07 s before, −93%), **140 ms Rust** (643 ms before, −78%), and
@@ -598,6 +609,8 @@ by the independent Ruby reference, like the PRNG vectors).
 | | `postgres` (porsager) | PG client; raw `$N` via `sql.unsafe` |
 | | `node:sqlite` | built-in (Node ≥ 22), zero dep |
 | | `smol-toml` | corpus parsing (Node has no built-in TOML) |
+| `impl/node` + `bench/ts` | `jed` via `impl/rust` | experimental native Node reach artifact under test |
+| | exact-pinned `napi` / `napi-derive` / build-only `napi-build` | stable Node-API binding; approved for this experiment |
 | `bench/ruby` | jed via the **gem** (`require "jed"` ← `impl/ruby/lib`) | the wrapped core under test |
 | | `toml-rb` | corpus parsing — **already a project dev dep** (root Gemfile), no new dep |
 | | `bigdecimal` | transitively via the gem |
@@ -646,6 +659,40 @@ Unlike the Ruby gem wrap (§7.1), the wasm ABI exposes `jed_prepare`/`jed_stmt_q
 mirrors the native cores' "parse once, run many" — the delta isolates execution, not parse overhead.
 The artifact is an optimized release build (`opt-level=3`, full LTO, stripped); a size-first build
 (`opt-level="z"`) trades speed for a smaller module.
+
+### 7.3 The native Node/Rust variant (`jed/node/rust-wrap`)
+
+`impl/node` is an experimental Node-API package that wraps the safe Rust core. Its TypeScript façade
+exposes create/open, execute/query, and prepared statements; a compact little-endian buffer carries
+`bigint`/`string`/`null` binds and results. The benchmark measures parameter encoding, the Node-API
+crossing, Rust execution, result transfer, JavaScript decoding, and checksum folding. The prototype's
+typed-value surface is deliberately only what the benchmark corpus needs, so it is not yet a
+production replacement for the native TS API.
+
+The addon uses exact pins `napi 3.10.5`, `napi-derive 3.5.10`, and build-only `napi-build 2.3.2` in a
+separate host-artifact crate; neither core manifest changes. The local stripped Linux x64 artifact is
+4.7 MiB (2.1 MiB gzip). A distributable package would still require the platform/prebuild/provenance
+matrix in [locking.md §8](locking.md), complete value/error/session/host-function APIs, and worker-thread
+guidance for long synchronous calls.
+
+The full 2026-07-16 run is reproducible with `rake bench:node_compare`; a native Rust control was run
+beside it to distinguish core differences from binding overhead. Selected means:
+
+| Lane | Pure TS | Node/Rust wrap | Direction |
+|---|---:|---:|---:|
+| fully-hot four-column PK lookup | 6.8 µs | 8.4 µs | TS 1.23× faster |
+| full scan `count + sum` | 65.0 ms | 16.5 ms | wrap 3.94× faster |
+| non-indexed top-100 | 300 ms | 140 ms | wrap 2.14× faster |
+| 1,000 inserts then rollback | 13.0 ms | 67.8 ms | TS 5.20× faster |
+| one-row durable commit | 3.58 ms | 3.50 ms | within noise |
+| hot PK reads, four readers | 18.1 µs/op | 3.3 µs/op | wrap 5.42× faster |
+| cold-populating PK reads, four readers | 65.5 µs/op | 8.9 µs/op | wrap 7.38× faster |
+
+The concurrent hook intentionally makes one Node call around the whole threaded phase; its near-zero
+delta from the native Rust control is not the cost of ordinary per-query Node calls. Conversely, the
+single-process wrapper/native-Rust comparison includes the ordinary boundary: 2.01× geometric-mean
+tax overall and 2.77× on the 13 cheap lanes. The comparison therefore supports a workload split, not
+the slogan that a native wrapper always runs at Rust speed.
 
 ## 8. Write benchmarks and the scratch database
 

@@ -60,8 +60,9 @@ artifact," a grudging fallback) undersold it: wrapping the Rust core is frequent
 engineering judgment between two poles:
 
 - **Wrap the Rust core** when **performance** and **byte-exact-behavior-for-free** dominate.
-  The engine runs at Rust speed and conforms by construction; you build a binding +
-  packaging layer, not an engine. Wrap the **safe Rust** core (memory safety, CLAUDE.md §13).
+  The engine's internal work runs in Rust and conforms by construction; you build a binding +
+  packaging layer, not an engine. Host-observed calls still pay binding and marshalling costs, which
+  can dominate cheap operations. Wrap the **safe Rust** core (memory safety, CLAUDE.md §13).
 - **Write a native core** when **cleaner, simpler integration** dominates: no FFI boundary,
   idiomatic in-process host-defined functions, a pure single-language package, and none of
   the per-platform native-artifact build/sign/ship burden.
@@ -183,7 +184,7 @@ divergence is deliberate and visible.
   the immutable snapshot for inter-query — no marshaling chokepoint under high read
   concurrency. Native here is plausibly the *best experience*, not merely the honest one.
 - **Swift — leans *wrap*, and parallelism strengthens that.** A wrapped Rust core (UniFFI +
-  XCFramework) presents a clean Swift API, runs at Rust speed, and Apple's
+  XCFramework) presents a clean Swift API, keeps engine work in Rust, and Apple's
   static-link/packaging path is well-trodden (the old CLAUDE.md §2 "asterisk"). ARC makes a
   native Swift core slower on hot paths *and* is its worst liability under parallel reads
   (atomic-refcount contention on shared structure, §2.2); wrapping sidesteps that entirely by
@@ -314,14 +315,19 @@ buy with the parallel-porting tax. The economics invert:
   More cores have diminishing divergence yield (§3); more *coverage* does not. Test
   infrastructure is the higher-leverage hardening investment in the meantime.
 
-## 5. The one genuinely open choice: native TS vs. Rust→WASM for the browser
+## 5. Browser and Node are separate delivery choices
 
-CLAUDE.md §2 leaves JS "TBD" between a native TS implementation and a Rust→WASM wrap. §1–4
-above resolve everything *except* this, because the two goals pull apart:
+CLAUDE.md §2 leaves JS delivery choices after the native TS conformance core. Browser and Node must
+not be collapsed into one answer: browser can use native TS or Rust→WASM, while Node can use native
+TS or a native Node-API wrap of Rust.
+
+### 5.1 Browser: native TS vs. Rust→WASM
+
+For the browser, the two goals pull apart:
 
 - For **divergence** (hardening the spec): only a **native** TS core helps; a WASM wrap is
   the Rust core and surfaces nothing.
-- For **shipping** (a browser/Node artifact): a **Rust→WASM** wrap is the cheap, correct-
+- For **shipping** (a browser artifact): a **Rust→WASM** wrap is the cheap, correct-
   by-construction path.
 
 These are not mutually exclusive. The defensible split is: **maintain a native TS core as a
@@ -338,6 +344,30 @@ does not pre-empt the decision above; it exists today as a **benchmark engine**
 (`jed/wasm/wrap`, `spec/design/benchmarks.md` §7.2, driven from Node over `node:wasi`) and a proof
 that the wrap path works end-to-end. Its answer checksums are cross-checked against the native cores
 by the benchmark harness, so it is correct-by-construction in practice as well as in principle.
+
+### 5.2 Node: native TS plus a lock helper vs. a full Rust wrap
+
+The shared-file protocol creates a sharper Node choice because Node has no standard whole-file OS-lock
+API. Corruption safety rules out PID/mtime lockfiles, so a shared Node package needs *some* native code:
+either a three-operation lock helper beneath the TS core or the whole Rust engine behind Node-API.
+Package purity therefore no longer decides the question by itself, but native **surface area**, hot-call
+marshalling, host functions, worker-thread ergonomics, and actual workload performance still do.
+
+The `impl/node` experiment wraps the safe Rust core and runs all 53 jed benchmark lanes. In the
+2026-07-16 same-host run all 159 pure-TS/wrapper/native-Rust results agreed on checksums. The wrapper
+was 1.38× faster by geometric mean over 49 single-process lanes and 3.76× across the four concurrent
+lanes. That aggregate split sharply: it was 1.55× faster on 36 heavier single-process lanes, the 13
+sub-100 µs lanes were effectively tied (0.98×; TS won 8), and pure TS was 2.04× faster across five
+write lanes. Ordinary Node calls cost 2.01× over native Rust by geometric mean. See
+[benchmarks.md §7.3](benchmarks.md) for selected results and boundary details.
+
+This evidence does **not** justify replacing the TypeScript Node engine merely because locking needs a
+native helper. The locking fast path makes no foreground addon calls while one process is alone, so the
+narrow helper preserves existing common-case performance. The full wrap is compelling for heavy reads
+and Rust-owned parallel readers, but currently regresses several cheap and write workloads and expands
+the native artifact from three lock operations to the entire engine API. Current leaning: keep native
+TS plus the narrow helper as the default proposal, retain the full wrapper experiment, and revisit an
+optional or primary native package only with a production-complete API and workload-driven evidence.
 
 ## 6. Current recommendation / status
 
@@ -362,8 +392,9 @@ The live question is now **goal 2 — language reach**, governed by §2, not §1
    so a corpus blind spot can't hide a subtle bug. A successful from-spec build doubles as a
    spec-completeness proof. Wraps can ship earlier (they conform by construction, §2); for more
    hardening *meanwhile*, build the Phase 8 generative harness, not a 4th core.
-4. **Ship Ruby / browser-JS as wrappers** (gem → Rust, package → Rust-WASM) when the
-   ecosystem is wanted; the native TS core already covers the JS *conformance* voice (§5). The
+4. **Ship Ruby / browser-JS as wrappers** (gem → Rust, browser package → Rust-WASM) when the
+   ecosystem is wanted; decide Node separately under §5.2. The native TS core already covers the JS
+   *conformance* voice. The
    **Ruby gem** has begun on this path — slice 1 (the gem + the C-ABI/`fiddle` FFI seam over the
    safe Rust core) is built; see [ruby.md](ruby.md) and TODO.md Phase 9.
 5. **Browser build** remains the §5 split: native-TS-for-conformance *and*

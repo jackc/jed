@@ -148,14 +148,15 @@ task :verify do
   puts "\nAll spec checks passed."
 end
 
-# fmt — formatting gate for every core + the web module. The formatters are VERSION-PINNED so
+# fmt — formatting gate for cores, host/tooling packages, and web. The formatters are VERSION-PINNED so
 # they are reproducible across contributors; this task is what makes the pins load-bearing.
 # Without a check, formatting silently drifts from the pinned tools (it had, in BOTH the Rust
 # and Go cores, before this gate). The pins, one per surface:
 #   rust              — rustfmt (ships with rust 1.92.0, mise-pinned); `cargo fmt`.
 #   go                — gofumpt (mise-pinned go tool); a stricter SUPERSET of gofmt (its output
 #                       is always gofmt-clean too), chosen because mise already pins it.
-#   impl/ts, bench/ts — biome (mise-pinned; biome.json at repo root). 2-space, lineWidth 100. The
+#   impl/ts, impl/node, bench/ts, migrate/ts — biome (mise-pinned; biome.json at repo root).
+#                       2-space, lineWidth 100. The
 #                       @generated TS files (operators/costs/ranges_gen/sqlstate) are EXCLUDED
 #                       there, so the codegen drift check (`rake verify`) stays their single source
 #                       of truth. Biome's LINTER is on with a tailored ruleset (noNonNullAssertion /
@@ -181,9 +182,24 @@ RUBY_EXT_MANIFEST = File.join(RUBY_GEM_DIR, "ext/Cargo.toml") # its native-exten
 WASM_MANIFEST = File.join(__dir__, "impl/wasm/Cargo.toml")    # the wasm32-wasip1 wrap of the core (host artifact)
 WASM_TARGET   = "wasm32-wasip1"
 WASM_ARTIFACT = File.join(__dir__, "impl/wasm/target", WASM_TARGET, "release/jed_wasm.wasm")
+NODE_WRAP_DIR = File.join(__dir__, "impl/node")               # experimental native Node-API wrap of the Rust core
+NODE_WRAP_MANIFEST = File.join(NODE_WRAP_DIR, "Cargo.toml")
+NODE_WRAP_ARTIFACT = File.join(
+  NODE_WRAP_DIR,
+  "target/release",
+  case RbConfig::CONFIG["host_os"]
+  when /darwin/
+    "libjed_node.dylib"
+  when /mswin|mingw|cygwin/
+    "jed_node.dll"
+  else
+    "libjed_node.so"
+  end,
+)
+NODE_WRAP_MODULE = File.join(NODE_WRAP_DIR, "jed_node.node")
 GO_DIR        = File.join(__dir__, "impl/go")
 TS_DIR        = File.join(__dir__, "impl/ts")
-TS_CORE_DIRS  = %w[impl/ts bench/ts migrate/ts] # biome (mise-pinned); biome.json scopes paths + excludes generated
+TS_FORMAT_DIRS = %w[impl/ts impl/node bench/ts migrate/ts] # biome (mise-pinned); biome.json scopes paths + excludes generated
 WEB_DIR       = "web"                # prettier (npm-pinned); reuses web's format / format:check scripts
 # jed-migrate (spec at /migrate/design.md): a CONSUMER of the engine per language, NOT a core — like
 # cli/ and bench/, its deps never touch a core manifest (CLAUDE.md §14). Its three package suites run
@@ -219,7 +235,7 @@ def npm_ci_if_stale(dir)
 end
 
 namespace :fmt do
-  desc "Check Rust + Go + TypeScript (cores) + web formatting against the pinned tools (the gate)"
+  desc "Check core, host-artifact, tooling, and web formatting against pinned tools"
   task :check do
     failures = []
 
@@ -243,6 +259,11 @@ namespace :fmt do
       failures << "wasm"
     end
 
+    puts "node-wrap: cargo fmt --check (the native Node-API Rust wrap)"
+    unless system("cargo", "fmt", "--check", "--manifest-path", NODE_WRAP_MANIFEST)
+      failures << "node-wrap"
+    end
+
     puts "migrate-rust: cargo fmt --check (the jed-migrate Rust crate)"
     unless system("cargo", "fmt", "--check", "--manifest-path", MIGRATE_RUST_MANIFEST)
       failures << "migrate-rust"
@@ -255,8 +276,8 @@ namespace :fmt do
       failures << "go"
     end
 
-    puts "ts:   biome format #{TS_CORE_DIRS.join(' ')}"
-    failures << "ts" unless system("biome", "format", *TS_CORE_DIRS)
+    puts "ts:   biome format #{TS_FORMAT_DIRS.join(' ')}"
+    failures << "ts" unless system("biome", "format", *TS_FORMAT_DIRS)
 
     puts "web:  prettier --check #{WEB_DIR}"
     npm_ci_if_stale(WEB_DIR)
@@ -266,22 +287,23 @@ namespace :fmt do
     puts "\nFormatting clean (rust + go + ts + web)."
   end
 
-  desc "Rewrite Rust + Go + TypeScript (cores) + web sources in place with the pinned formatters"
+  desc "Rewrite core, host-artifact, tooling, and web sources with pinned formatters"
   task :fix do
     sh "cargo", "fmt", "--manifest-path", RUST_MANIFEST
     sh "cargo", "fmt", "--manifest-path", CLI_MANIFEST
     sh "cargo", "fmt", "--manifest-path", RUBY_EXT_MANIFEST
     sh "cargo", "fmt", "--manifest-path", WASM_MANIFEST
+    sh "cargo", "fmt", "--manifest-path", NODE_WRAP_MANIFEST
     sh "cargo", "fmt", "--manifest-path", MIGRATE_RUST_MANIFEST
     sh "gofumpt", "-w", GO_DIR, MIGRATE_GO_DIR
-    sh "biome", "format", "--write", *TS_CORE_DIRS
+    sh "biome", "format", "--write", *TS_FORMAT_DIRS
     npm_ci_if_stale(WEB_DIR)
     sh "npm", "run", "--silent", "--prefix", WEB_DIR, "format"
   end
 end
 
 # Bare `rake fmt` runs the gate; `rake fmt:fix` applies it.
-desc "Check formatting of the cores + web (alias for fmt:check)"
+desc "Check formatting of cores, host artifacts, tooling, and web (alias for fmt:check)"
 task fmt: "fmt:check"
 
 # lint — the Biome linter for the TS cores, kept deliberately SEPARATE from fmt (above) so a lint
@@ -290,23 +312,24 @@ task fmt: "fmt:check"
 # failing the gate. The tree is currently warning-clean: the deliberate cross-core float literals
 # Biome flags (log10(e) in decimal.ts) are suppressed inline with justified biome-ignore comments,
 # since the suggested Math.LOG10E is a different f64 that would break the §8 byte-identity.
-# Scope is the TS cores only: web is prettier-only here, with its own `npm run check` (svelte-check)
+# Scope is the TS core and host/tooling packages only: web is prettier-only here, with its own
+# `npm run check` (svelte-check)
 # as the web type gate (outside rake ci); the @generated files stay excluded via biome.json.
 namespace :lint do
   desc "Lint the TypeScript cores with Biome's tailored ruleset (errors fail; warnings advise)"
   task :check do
-    puts "ts:   biome lint #{TS_CORE_DIRS.join(' ')}"
-    abort "lint: Biome reported errors — `rake lint:fix` applies the safe ones" unless system("biome", "lint", *TS_CORE_DIRS)
+    puts "ts:   biome lint #{TS_FORMAT_DIRS.join(' ')}"
+    abort "lint: Biome reported errors — `rake lint:fix` applies the safe ones" unless system("biome", "lint", *TS_FORMAT_DIRS)
   end
 
   desc "Apply Biome's SAFE lint fixes to the TS cores (unsafe fixes stay per-rule + manual)"
   task :fix do
-    sh "biome", "lint", "--write", *TS_CORE_DIRS
+    sh "biome", "lint", "--write", *TS_FORMAT_DIRS
   end
 end
 
 # Bare `rake lint` runs the gate; `rake lint:fix` applies the safe fixes.
-desc "Lint the TypeScript cores with Biome (alias for lint:check)"
+desc "Lint TypeScript core and host/tooling packages with Biome (alias for lint:check)"
 task lint: "lint:check"
 
 # codegen — the "middle path" (CLAUDE.md §5): (re)generate per-language source from the
@@ -479,6 +502,23 @@ namespace :ruby do
   end
 end
 
+# node — an EXPERIMENTAL native Node-API HOST ARTIFACT wrapping the safe Rust core. This is not a
+# fourth core: it exists to measure the product choice between shipping the independent TypeScript
+# core and shipping a Node package backed by Rust. The checked-in TS façade has no npm dependencies;
+# exact-pinned napi-rs crates build the local .node module.
+namespace :node do
+  desc "Build the experimental native Node/Rust package"
+  task :build do
+    sh "cargo", "build", "--release", "--manifest-path", NODE_WRAP_MANIFEST
+    FileUtils.cp(NODE_WRAP_ARTIFACT, NODE_WRAP_MODULE)
+  end
+
+  desc "Build and run the experimental native Node/Rust package seam tests"
+  task test: :build do
+    sh "node", "--test", *Dir[File.join(NODE_WRAP_DIR, "test/*.test.ts")]
+  end
+end
+
 # concurrency — the stepped-THREADED concurrency conformance (spec/design/concurrency-testing.md
 # §4.3), run under the race detector. The binary harnesses already run every `# format: concurrency`
 # schedule stepped-SEQUENTIALLY inside the normal conformance walk (the canonical, timing-free result
@@ -508,7 +548,7 @@ namespace :bench do
   BENCH_RUST_BINS = %w[bench-jed bench-pg bench-sqlite].freeze
   BENCH_TS_BINS = %w[bench-jed bench-pg bench-sqlite].freeze
 
-  desc "Build all benchmark binaries (Go + Rust release; TS installs deps if absent)"
+  desc "Build all benchmark binaries and wrapped host artifacts"
   task :build do
     # Every Go binary except the cgo SQLite baseline builds with CGO_ENABLED=0, proving the
     # cgo surface stays confined to bench-sqlite-cgo (benchmarks.md §7).
@@ -522,6 +562,7 @@ namespace :bench do
     # The wasm bench (bench/ts/src/bench-wasm.ts) drives the core compiled to wasm32-wasip1. Build
     # the artifact here (needs `rustup target add wasm32-wasip1` once; cargo errors clearly if absent).
     sh "cargo", "build", "--release", "--quiet", "--target", WASM_TARGET, "--manifest-path", WASM_MANIFEST
+    Rake::Task["node:build"].invoke
   end
 
   desc "Generate/refresh the benchmark databases (fingerprint-gated; [force] to override)"
@@ -547,6 +588,8 @@ namespace :bench do
     BENCH_TS_BINS.each do |bin|
       sh "node", "bench/ts/src/#{bin}.ts", "bench/corpus", "bench/data", File.join(dir, "ts-#{bin}.jsonl"), *filter
     end
+    sh "node", "bench/ts/src/bench-node-rust.ts", "bench/corpus", "bench/data",
+       File.join(dir, "node-rust-bench-jed.jsonl"), *filter
     # The Ruby gem bench (jed/ruby/wrap) — its delta vs jed/rust/core is the binding overhead
     # (benchmarks.md §7). Spawned under `with_unbundled_env` because the Rakefile loads
     # `bundler/setup`, which would otherwise restrict the child to the root Gemfile and block the
@@ -561,6 +604,25 @@ namespace :bench do
        "bench/corpus", "bench/data", File.join(dir, "wasm-bench-jed.jsonl"), *filter
     Rake::Task["bench:report"].invoke(dir)
     Rake::Task["bench:html"].invoke(dir)
+  end
+
+  desc "Compare every jed benchmark through pure TS, Node/Rust wrap, and native Rust control"
+  task :node_compare, [:filter] => "node:build" do |_, args|
+    npm_ci_if_stale("bench/ts")
+    sh "cargo", "build", "--release", "--quiet", "--manifest-path", "bench/rust/Cargo.toml",
+       "--bin", "bench-jed"
+    stamp = Time.now.utc.strftime("%Y%m%d-%H%M%S")
+    dir = File.join("bench/results", "#{stamp}-node-compare")
+    FileUtils.mkdir_p(dir)
+    filter = args[:filter] ? [args[:filter]] : []
+    sh "node", "bench/ts/src/bench-jed.ts", "bench/corpus", "bench/data",
+       File.join(dir, "ts-bench-jed.jsonl"), *filter
+    sh "node", "bench/ts/src/bench-node-rust.ts", "bench/corpus", "bench/data",
+       File.join(dir, "node-rust-bench-jed.jsonl"), *filter
+    sh "bench/rust/target/release/bench-jed", "bench/corpus", "bench/data",
+       File.join(dir, "rust-bench-jed.jsonl"), *filter
+    Rake::Task["bench:report"].invoke(dir)
+    Rake::Task["bench:markdown"].invoke(dir)
   end
 
   desc "Aggregate a results dir into a comparison table (default: newest)"

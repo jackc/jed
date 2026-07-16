@@ -25,6 +25,8 @@
     "includes": [
       "impl/ts/**/*.ts",
       "impl/ts/**/*.js",
+      "impl/node/**/*.ts",
+      "impl/node/**/*.js",
       "bench/ts/**/*.ts",
       "bench/ts/**/*.js",
       "migrate/ts/**/*.ts",

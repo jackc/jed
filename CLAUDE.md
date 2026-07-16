@@ -94,6 +94,8 @@ language, because hardening the spec was never the reason to add it.
    §9) has since **landed** in this core (`spec/design/hosts.md` §5): the engine runs in a Web Worker
    over an `OpfsBlockStore`, validated by file-host byte parity — proof the host-agnostic seam paid
    off. Rust, Go, and this TS core **are** the differential set; the honesty work is theirs.
+   A separate experimental native Node-API package (`impl/node`) wraps the Rust core for a
+   shipping-performance comparison; it is a reach artifact, never a fourth conformance voice.
 
 **Beyond the differential set — best experience per language.** For every language past
 core #3 the question is not "how much new divergence does it surface" (usually little) but
@@ -101,7 +103,8 @@ core #3 the question is not "how much new divergence does it surface" (usually l
 engineering judgment between two first-class options:
 
 - **Wrap the Rust core** when *performance* and *byte-exact-behavior-for-free* dominate: the
-  engine runs at Rust speed and conforms by construction. Wrapping is a **first-class
+  engine's internal work runs in Rust and conforms by construction. Host-observed calls still pay
+  binding and marshalling costs, which can dominate cheap operations. Wrapping is a **first-class
   choice, not a fallback exception.** When wrapping, wrap the **safe Rust** core (§13).
 - **Write a native core** when *cleaner, simpler integration* dominates: no FFI boundary,
   idiomatic in-process host-defined functions, a pure single-language package, and none of
@@ -121,7 +124,8 @@ Decide per language, on the merits, and record the call in `spec/design/cores.md
    in-process host functions); **Java** is the most conflicted (wrap for performance
    pre-Valhalla, native for clean pure-JAR packaging). Two pivots decide it, and can pull
    apart: (a) **host-defined functions** — hot-path per-row favors native (no FFI/upcall per
-   call), occasional/coarse favors wrap (engine at Rust speed); (b) **parallelism** — the §3
+   call), occasional/coarse favors wrap (the boundary is amortized and Rust execution dominates);
+   (b) **parallelism** — the §3
    immutable-snapshot read path is near-lock-free, so the question is cheap cross-thread
    sharing + CPU fan-out, where **wrapping Rust gives every host Rayon-grade intra-query
    parallelism for free** (and notably sidesteps Swift's ARC-contention problem), while
@@ -642,9 +646,13 @@ cross-core-identical and owns that consequence (the host-extension boundary, §1
   commits are append-only (`free_list_head = 0`). Reuse/reclamation/truncation/compaction require
   presence-EX proof of aloneness plus the in-process watermark. No format bump or persisted
   `catalog_gen` is required for correctness. Rust/Go use `flock`/`LockFileEx` without dependencies;
-  Node needs a narrow native OS-lock host adapter and the preferred direction is a first-party minimal
-  Rust Node-API addon (host calls only, not a Rust-core wrapper) with reproducible prebuilds. Its bounded
-  §14 FFI/unsafe exception, exact `napi-rs` pins, and artifact matrix require explicit human approval.
+  Node needs native OS locking. The current proposal remains a first-party minimal Rust Node-API lock
+  adapter (host calls only, not a Rust-core wrapper) with reproducible prebuilds. A full Rust-core
+  Node wrapper was built and benchmarked first: it wins heavy/parallel reads but is not universally
+  faster, losing most cheap-query and write comparisons; ordinary Node calls also retain a material
+  boundary tax (`spec/design/benchmarks.md` §7.3). The exact `napi-rs` pins are approved for that
+  separate experiment; production still requires the bounded §14 FFI/unsafe exception and artifact
+  matrix decision.
   PID/mtime stale-lock heuristics are forbidden; an unsupported host fails closed. OPFS remains
   inherently exclusive. The first rollout must drain every pre-protocol binary because an advisory
   protocol cannot coordinate with a process that does not participate.

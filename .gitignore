@@ -11,6 +11,9 @@
 /impl/ruby/ext/target/
 # WASM (wasm32-wasip1) wrap's build artifacts; impl/wasm/Cargo.lock IS committed.
 /impl/wasm/target/
+# Native Node-API Rust wrap; Cargo.lock is committed, the platform addon is generated.
+/impl/node/target/
+/impl/node/jed_node.node
 # Built gem packages.
 /impl/ruby/*.gem
 
