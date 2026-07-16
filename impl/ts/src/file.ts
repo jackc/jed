@@ -46,7 +46,15 @@ export type DatabaseOptions = { pageSize?: number; noSync?: boolean };
 // commits write identical bytes in the same order but skip the fdatasync barrier. DEV/TESTING ONLY —
 // durable across a process crash, not an OS crash / power loss. Ignored for an in-memory database (no
 // path) which never fsyncs. Byte/cost/result-neutral; default false.
-export type CreateOptions = { path?: string; pageSize?: number; skipFsync?: boolean };
+export type Locking = "auto" | "shared" | "exclusive" | "none";
+
+export type CreateOptions = {
+  path?: string;
+  pageSize?: number;
+  skipFsync?: boolean;
+  locking?: Locking;
+  fileLockTimeoutMs?: number;
+};
 
 // create makes a new file-backed database at path with opts (the page size is locked into the
 // file). The path must not already exist — 58P02 otherwise. An initial empty image is written
@@ -120,6 +128,8 @@ export type OpenOptions = {
   readOnly?: boolean;
   workMem?: number;
   skipFsync?: boolean;
+  locking?: Locking;
+  fileLockTimeoutMs?: number;
 };
 
 // open opens an existing file-backed database at path with optional open settings (the memory budget,

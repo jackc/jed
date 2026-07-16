@@ -113,6 +113,7 @@ type SessionOptions struct {
 	// rejected at admission). Sibling to MaxCost, which bounds one statement.
 	LifetimeMaxCost int64
 	MaxSQLLength    int
+	LockTimeoutMs   uint64
 	WorkMem         int
 	// DefaultPrivileges is the table-privilege set granted to every table — the GRANT … ON ALL TABLES
 	// default (spec/design/session.md §5.3). nil ⇒ all four (the default), so a fresh session is
@@ -212,6 +213,8 @@ type sessionState struct {
 	// unlimited; default DefaultMaxSQLLength (1 MiB). Over-limit input is rejected 54000 at parse,
 	// before lexing.
 	maxSQLLength int
+	// lockTimeoutMs bounds the shared cross-process writer gate; zero waits indefinitely.
+	lockTimeoutMs uint64
 	// workMem is the work-memory budget in bytes (spec/design/spill.md §2): the memory a blocking
 	// operator (the ORDER BY external merge sort) holds before it spills. 0 = unlimited; default
 	// DefaultWorkMem. Never changes what a query observes (spill.md §6); an in-memory database
@@ -309,6 +312,7 @@ func newSessionWithOptions(opts SessionOptions) sessionState {
 		lifetimeMaxCost: opts.LifetimeMaxCost,
 		lifetimeTotal:   new(int64),
 		maxSQLLength:    opts.MaxSQLLength,
+		lockTimeoutMs:   opts.LockTimeoutMs,
 		workMem:         opts.WorkMem,
 		privileges:      newPrivileges(),
 		allowDDL:        true,

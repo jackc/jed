@@ -299,6 +299,10 @@ from transaction lock waiting.
 read-only vs read-write. `create` stores only applicable file-lock options from `CreateOptions`; an
 in-memory create ignores them.
 
+Go represents `file_lock_timeout_ms` as `*uint64`: `nil` is the 5000 ms default and a non-nil pointer
+to `0` is the explicit immediate attempt. This is required to preserve both the zero-value options
+struct and the observable distinction between omitted and explicit zero.
+
 ### 7.2 Errors
 
 - open/join or exclusive acquisition deadline: `55006 object_in_use`, with the real path in detail;

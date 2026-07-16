@@ -45,6 +45,8 @@ export class SessionState {
   // The maximum input SQL length in bytes (CLAUDE.md §13; cost.md §7); 0 = unlimited; default
   // DEFAULT_MAX_SQL_LENGTH. Over-limit input is rejected 54000 at parse, before lexing.
   maxSqlLength: number;
+  // Cross-process writer-gate deadline in milliseconds; zero waits indefinitely.
+  lockTimeoutMs: number;
   // The work-memory budget in bytes (spec/design/spill.md §2): the memory a blocking operator holds
   // before it spills. 0 = unlimited; default DEFAULT_WORK_MEM. Never changes what a query observes.
   workMem: number;
@@ -111,6 +113,7 @@ export class SessionState {
     this.maxCost = opts.maxCost ?? 0n;
     this.lifetime = new LifetimeBudget(opts.lifetimeMaxCost ?? 0n);
     this.maxSqlLength = opts.maxSqlLength ?? DEFAULT_MAX_SQL_LENGTH;
+    this.lockTimeoutMs = opts.lockTimeoutMs ?? 0;
     // 0 (or unset) ⇒ the default budget, not unlimited — the zero value stays a safe finite budget
     // (unlike maxCost/lifetimeMaxCost, whose default genuinely is 0 ⇒ unlimited). Unbounded/never-spill
     // is reached at runtime via setWorkMem(0). Matches Go/Rust (api.md §2.1).
@@ -150,6 +153,7 @@ export class SessionState {
     frozen.maxCost = source.maxCost;
     frozen.lifetime = source.lifetime;
     frozen.maxSqlLength = source.maxSqlLength;
+    frozen.lockTimeoutMs = source.lockTimeoutMs;
     frozen.workMem = source.workMem;
     frozen.seam = source.seam;
     frozen.sessionSeq = source.sessionSeq;

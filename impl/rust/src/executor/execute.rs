@@ -385,6 +385,14 @@ impl Engine {
         self.session.max_sql_length
     }
 
+    pub fn set_lock_timeout_ms(&mut self, milliseconds: u64) {
+        self.session.lock_timeout_ms = milliseconds;
+    }
+
+    pub fn lock_timeout_ms(&self) -> u64 {
+        self.session.lock_timeout_ms
+    }
+
     /// Whether this handle was opened read-only (spec/design/api.md §2.1): every transaction
     /// defaults to READ ONLY, writes are `25006`, and the file is never written.
     pub fn read_only(&self) -> bool {

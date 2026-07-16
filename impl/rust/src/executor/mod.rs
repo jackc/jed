@@ -530,6 +530,8 @@ pub struct SessionOptions {
     pub lifetime_max_cost: i64,
     /// Maximum input SQL length in bytes; `0` ⇒ unlimited. Default [`DEFAULT_MAX_SQL_LENGTH`].
     pub max_sql_length: usize,
+    /// Cross-process writer-gate deadline in milliseconds (`0` = wait without a deadline).
+    pub lock_timeout_ms: u64,
     /// Work-memory budget in bytes; `0` ⇒ **the default** (256 MiB), same as unset (unlike its
     /// `max_cost`/`lifetime_max_cost` siblings, whose default genuinely is `0` ⇒ unlimited). An
     /// unbounded/never-spill budget is a runtime-only mode via [`set_work_mem`](SessionState::set_work_mem)`(0)`,
@@ -571,6 +573,7 @@ impl Default for SessionOptions {
             max_cost: 0,
             lifetime_max_cost: 0,
             max_sql_length: DEFAULT_MAX_SQL_LENGTH,
+            lock_timeout_ms: 0,
             work_mem: crate::spill::DEFAULT_WORK_MEM,
             default_privileges: PrivilegeSet::ALL_TABLE,
             allow_ddl: true,
@@ -641,6 +644,8 @@ pub struct SessionState {
     /// §8, cost.md §7). `0` ⇒ **unlimited**; default [`DEFAULT_MAX_SQL_LENGTH`] (1 MiB). An
     /// over-limit statement is rejected `54000` at [`parse`](Engine::parse), before lexing.
     pub(crate) max_sql_length: usize,
+    /// Cross-process writer-gate deadline in milliseconds (`0` = wait without a deadline).
+    pub(crate) lock_timeout_ms: u64,
     /// The work-memory budget in **bytes** (spec/design/spill.md §2): the memory a blocking operator
     /// (the `ORDER BY` external merge sort) holds resident before it spills. `0` ⇒ unlimited (never
     /// spill); default [`DEFAULT_WORK_MEM`](crate::spill::DEFAULT_WORK_MEM). Never changes what a
@@ -756,6 +761,7 @@ impl SessionState {
             lifetime_total: std::rc::Rc::new(std::cell::Cell::new(0)),
             cancel: None,
             max_sql_length: opts.max_sql_length,
+            lock_timeout_ms: opts.lock_timeout_ms,
             // `0` means "the default budget", not "unlimited" — the zero value stays a safe finite
             // budget (matching Go/TS). Unbounded/never-spill is reached via `set_work_mem(0)`.
             work_mem: if opts.work_mem == 0 {
@@ -857,6 +863,14 @@ impl SessionState {
     /// The current input-SQL byte limit.
     pub fn max_sql_length(&self) -> usize {
         self.max_sql_length
+    }
+
+    pub fn set_lock_timeout_ms(&mut self, milliseconds: u64) {
+        self.lock_timeout_ms = milliseconds;
+    }
+
+    pub fn lock_timeout_ms(&self) -> u64 {
+        self.lock_timeout_ms
     }
     /// Set the work-memory budget in bytes; `0` ⇒ unlimited.
     pub fn set_work_mem(&mut self, bytes: usize) {

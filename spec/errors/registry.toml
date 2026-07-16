@@ -684,6 +684,17 @@ name = "object_in_use"
 class = "object not in prerequisite state"
 template = "{detail}"
 
+# 55P03 lock_not_available — a shared-file write transaction could not acquire
+# the cross-process writer gate before the session's lock_timeout_ms expired
+# (../design/locking.md §5.2). PostgreSQL uses this exact SQLSTATE for lock
+# acquisition failures. Timing is host-observed and belongs to the real-process
+# suite rather than deterministic SQL conformance.
+[[error]]
+code = "55P03"
+name = "lock_not_available"
+class = "object not in prerequisite state"
+template = "could not obtain the database writer lock"
+
 # --- operator intervention (class 57) ---------------------------------------
 # 57014 query_canceled — a running statement was canceled through the host's
 # cancellation handle (Go context.Context, Rust cancellation token, TS

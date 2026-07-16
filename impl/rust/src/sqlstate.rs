@@ -166,6 +166,8 @@ pub enum SqlState {
     ObjectNotInPrerequisiteState,
     /// 55006 — {detail}
     ObjectInUse,
+    /// 55P03 — could not obtain the database writer lock
+    LockNotAvailable,
     /// 57014 — canceling statement due to user request
     QueryCanceled,
     /// 58030 — I/O error: {detail}
@@ -261,6 +263,7 @@ impl SqlState {
             SqlState::TempStorageLimitExceeded => "54P03",
             SqlState::ObjectNotInPrerequisiteState => "55000",
             SqlState::ObjectInUse => "55006",
+            SqlState::LockNotAvailable => "55P03",
             SqlState::QueryCanceled => "57014",
             SqlState::IoError => "58030",
             SqlState::UndefinedFile => "58P01",
@@ -360,6 +363,7 @@ pub const ERRORS: &[ErrorDesc] = &[
     ErrorDesc { code: "54P03", name: "temp_storage_limit_exceeded", class: "program limit exceeded" },
     ErrorDesc { code: "55000", name: "object_not_in_prerequisite_state", class: "object not in prerequisite state" },
     ErrorDesc { code: "55006", name: "object_in_use", class: "object not in prerequisite state" },
+    ErrorDesc { code: "55P03", name: "lock_not_available", class: "object not in prerequisite state" },
     ErrorDesc { code: "57014", name: "query_canceled", class: "operator intervention" },
     ErrorDesc { code: "58030", name: "io_error", class: "system error" },
     ErrorDesc { code: "58P01", name: "undefined_file", class: "system error" },

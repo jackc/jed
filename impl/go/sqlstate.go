@@ -169,6 +169,8 @@ const (
 	ObjectNotInPrerequisiteState
 	// ObjectInUse is 55006 — {detail}.
 	ObjectInUse
+	// LockNotAvailable is 55P03 — could not obtain the database writer lock.
+	LockNotAvailable
 	// QueryCanceled is 57014 — canceling statement due to user request.
 	QueryCanceled
 	// IoError is 58030 — I/O error: {detail}.
@@ -340,6 +342,8 @@ func (s SqlState) Code() string {
 		return "55000"
 	case ObjectInUse:
 		return "55006"
+	case LockNotAvailable:
+		return "55P03"
 	case QueryCanceled:
 		return "57014"
 	case IoError:
@@ -445,6 +449,7 @@ var errorDescs = []errorDesc{
 	{Code: "54P03", Name: "temp_storage_limit_exceeded", Class: "program limit exceeded"},
 	{Code: "55000", Name: "object_not_in_prerequisite_state", Class: "object not in prerequisite state"},
 	{Code: "55006", Name: "object_in_use", Class: "object not in prerequisite state"},
+	{Code: "55P03", Name: "lock_not_available", Class: "object not in prerequisite state"},
 	{Code: "57014", Name: "query_canceled", Class: "operator intervention"},
 	{Code: "58030", Name: "io_error", Class: "system error"},
 	{Code: "58P01", Name: "undefined_file", Class: "system error"},

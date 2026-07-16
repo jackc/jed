@@ -991,6 +991,7 @@ export type SessionOptions = {
   // admission). Sibling to maxCost, which bounds one statement.
   lifetimeMaxCost?: bigint;
   maxSqlLength?: number;
+  lockTimeoutMs?: number;
   // The work-memory budget in bytes before a blocking operator spills (spill.md §3). 0 (or absent) ⇒
   // the default (256 MiB), same as unset — use setWorkMem(0) for the 0 ⇒ unlimited (never-spill) form.
   // Unlike maxCost/lifetimeMaxCost, whose default genuinely is 0 ⇒ unlimited (api.md §2.1).

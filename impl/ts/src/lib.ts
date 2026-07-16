@@ -817,7 +817,7 @@ export { PreparedStatement, Rows, Transaction } from "./api.ts";
 export { Statement } from "./ergonomic.ts";
 export type { JsParam, JsValue, Row, RunResult } from "./ergonomic.ts";
 export { createDatabase, openDatabase } from "./file.ts";
-export type { CreateOptions, OpenOptions } from "./file.ts";
+export type { CreateOptions, Locking, OpenOptions } from "./file.ts";
 // `Outcome` is the engine's INTERNAL materialized statement result (the pre-total-`query` shape) — NOT
 // part of the public embedding surface. The public seam is `query -> Rows` (a non-query statement is a
 // Rows with no output columns, carrying the command tag); `run`/`execute` return `RunResult`. Outcome

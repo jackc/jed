@@ -1147,6 +1147,13 @@ export class Session {
   get maxSqlLength(): number {
     return this.engine.session.maxSqlLength;
   }
+
+  get lockTimeoutMs(): number {
+    return this.engine.session.lockTimeoutMs;
+  }
+  set lockTimeoutMs(milliseconds: number) {
+    this.engine.session.lockTimeoutMs = milliseconds;
+  }
   setMaxSqlLength(bytes: number): void {
     this.engine.session.maxSqlLength = bytes;
   }

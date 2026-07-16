@@ -567,6 +567,9 @@ type CreateOptions struct {
 	// durable across a process crash, not an OS crash / power loss. Ignored for an in-memory database
 	// (opts.Path == "") which never fsyncs. Byte/cost/result-neutral; default false.
 	SkipFsync bool
+	Locking   Locking
+	// nil is the 5s default; &0 requests one immediate acquisition attempt.
+	FileLockTimeoutMs *uint64
 }
 
 // CreateDatabase makes a fresh database — in-memory (opts.Path == "") or file-backed (opts.Path set)

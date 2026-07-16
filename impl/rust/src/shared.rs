@@ -1922,6 +1922,14 @@ impl Session {
     pub fn max_sql_length(&self) -> usize {
         self.engine.session.max_sql_length()
     }
+
+    pub fn set_lock_timeout_ms(&mut self, milliseconds: u64) {
+        self.engine.session.set_lock_timeout_ms(milliseconds);
+    }
+
+    pub fn lock_timeout_ms(&self) -> u64 {
+        self.engine.session.lock_timeout_ms()
+    }
     /// Set the work-memory budget in bytes; `0` ⇒ unlimited.
     pub fn set_work_mem(&mut self, bytes: usize) {
         self.engine.session.set_work_mem(bytes);

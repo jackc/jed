@@ -15,6 +15,16 @@ import (
 	"path/filepath"
 )
 
+// Locking selects the shared-file coordination mode (spec/design/locking.md §7.1).
+type Locking uint8
+
+const (
+	LockingAuto Locking = iota
+	LockingShared
+	LockingExclusive
+	LockingNone
+)
+
 // databaseOptions are the settings for a newly-created database file (spec/design/api.md §2).
 // PageSize is fixed into the file's meta at creation and cannot change thereafter.
 type databaseOptions struct {
@@ -91,6 +101,9 @@ type OpenOptions struct {
 	// DEV/TESTING ONLY: the data survives a process crash (the OS page cache still flushes) but NOT an
 	// OS crash / power loss. Never changes what a query observes or the on-disk bytes; default false.
 	SkipFsync bool
+	Locking   Locking
+	// nil is the 5s default; a non-nil pointer (including &0) is an explicit deadline.
+	FileLockTimeoutMs *uint64
 }
 
 // Open opens an existing file-backed database at path with default open settings — the buffer-pool

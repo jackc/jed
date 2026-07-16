@@ -15,6 +15,18 @@ use crate::executor::{DEFAULT_PAGE_SIZE, Engine, Snapshot};
 use crate::pager::Pager;
 use crate::paging::{DEFAULT_CACHE_BYTES, SharedPaging, cache_leaves};
 
+/// Cross-process coordination mode for a file database (spec/design/locking.md §7.1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Locking {
+    #[default]
+    Auto,
+    Shared,
+    Exclusive,
+    None,
+}
+
+pub const DEFAULT_FILE_LOCK_TIMEOUT_MS: u64 = 5_000;
+
 /// Settings for a newly-created database file (spec/design/api.md §2). `page_size` is fixed
 /// into the file's meta at creation and cannot change thereafter.
 #[derive(Clone, Copy, Debug)]
@@ -42,7 +54,7 @@ impl Default for DatabaseOptions {
 /// creation and fixes an in-memory database's tree fan-out, so it is meaningful for both backings.
 /// The default value (`path: None`, `page_size: 0`) is a default in-memory database at the default
 /// page size.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct CreateOptions {
     pub path: Option<PathBuf>,
     pub page_size: u32,
@@ -51,6 +63,20 @@ pub struct CreateOptions {
     /// ONLY — durable across a process crash, not an OS crash / power loss. Ignored for an in-memory
     /// database (`path: None`) which never fsyncs. Byte/cost/result-neutral; default `false`.
     pub skip_fsync: bool,
+    pub locking: Locking,
+    pub file_lock_timeout_ms: u64,
+}
+
+impl Default for CreateOptions {
+    fn default() -> Self {
+        CreateOptions {
+            path: None,
+            page_size: 0,
+            skip_fsync: false,
+            locking: Locking::Auto,
+            file_lock_timeout_ms: DEFAULT_FILE_LOCK_TIMEOUT_MS,
+        }
+    }
 }
 
 /// Open-time settings for a file-backed database (spec/design/api.md §2.1). Unlike
@@ -84,6 +110,8 @@ pub struct OpenOptions {
     /// DEV/TESTING ONLY: the data survives a process crash (the OS page cache still flushes) but NOT an
     /// OS crash / power loss. Never changes what a query observes or the on-disk bytes; default `false`.
     pub skip_fsync: bool,
+    pub locking: Locking,
+    pub file_lock_timeout_ms: u64,
 }
 
 impl Default for OpenOptions {
@@ -93,6 +121,8 @@ impl Default for OpenOptions {
             read_only: false,
             work_mem: crate::spill::DEFAULT_WORK_MEM,
             skip_fsync: false,
+            locking: Locking::Auto,
+            file_lock_timeout_ms: DEFAULT_FILE_LOCK_TIMEOUT_MS,
         }
     }
 }
