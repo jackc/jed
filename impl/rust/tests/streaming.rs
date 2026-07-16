@@ -143,11 +143,15 @@ fn streaming_cursor_pins_its_snapshot_and_watermark() {
     // The live cursor pins v1 in the watermark.
     assert_eq!(db.oldest_live_txid(), 1, "open cursor pins its version");
 
-    // A concurrent writer commits two more rows (version 2) while the cursor is open.
+    // A concurrent writer repeatedly rebuilds the same rightmost working leaf while the cursor is
+    // open. This is the focused committed-root alias guard for insert-transient work: the pinned
+    // root must remain byte/value-stable through every mutation, then a fresh reader must see them.
     {
         let mut w = db.write_session();
-        w.query_outcome("INSERT INTO t VALUES (4, 40), (5, 50)", &[])
-            .unwrap();
+        for id in 4..=67 {
+            w.query_outcome(&format!("INSERT INTO t VALUES ({id}, {})", id * 10), &[])
+                .unwrap();
+        }
         w.commit().unwrap();
     }
     assert_eq!(db.version(), 2);
@@ -171,17 +175,49 @@ fn streaming_cursor_pins_its_snapshot_and_watermark() {
     drop(rows);
     assert_eq!(db.oldest_live_txid(), 2, "closed cursor releases its pin");
 
-    // A fresh streaming read sees the writer's rows.
+    // A fresh streaming read sees every committed row.
     let (fresh, _) = streamed(&mut reader, "SELECT id FROM t ORDER BY id");
+    assert_eq!(fresh.len(), 67);
+    assert_eq!(fresh.first(), Some(&vec![Value::Int(1)]));
+    assert_eq!(fresh.last(), Some(&vec![Value::Int(67)]));
+}
+
+/// A cursor opened inside a write transaction owns its working root. Later writes through the same
+/// session remain visible to later statements but never leak into the open cursor.
+#[test]
+fn write_transaction_cursor_is_stable_across_later_inserts() {
+    let db = seeded(3);
+    let mut writer = db.session(SessionOptions::default());
+    writer.begin(true).unwrap();
+    writer
+        .query_outcome("INSERT INTO t VALUES (4, 40)", &[])
+        .unwrap();
+
+    let mut pinned = writer.query("SELECT id FROM t ORDER BY id", &[]).unwrap();
+    assert_eq!((&mut pinned).next(), Some(vec![Value::Int(1)]));
+    for id in 5..=67 {
+        writer
+            .query_outcome(&format!("INSERT INTO t VALUES ({id}, {})", id * 10), &[])
+            .unwrap();
+    }
+
+    // The transaction itself reads its latest working root.
     assert_eq!(
-        fresh,
-        vec![
-            vec![Value::Int(1)],
-            vec![Value::Int(2)],
-            vec![Value::Int(3)],
-            vec![Value::Int(4)],
-            vec![Value::Int(5)],
-        ]
+        eager(&mut writer, "SELECT count(*) FROM t").0,
+        vec![vec![Value::Int(67)]]
+    );
+    // The older cursor remains frozen at its open-time working root (ids 1..=4).
+    let rest: Vec<Value> = (&mut pinned).map(|row| row[0].clone()).collect();
+    assert_eq!(rest, vec![Value::Int(2), Value::Int(3), Value::Int(4)]);
+    pinned.error().unwrap();
+    pinned.close();
+    drop(pinned);
+
+    writer.commit().unwrap();
+    let mut fresh = db.session(SessionOptions::default());
+    assert_eq!(
+        eager(&mut fresh, "SELECT count(*) FROM t").0,
+        vec![vec![Value::Int(67)]]
     );
 }
 

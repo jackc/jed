@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -174,10 +175,14 @@ func TestStreamingCursorPinsSnapshot(t *testing.T) {
 		t.Fatalf("open cursor must pin v1, oldest=%d", db.OldestLiveTxid())
 	}
 
-	// A concurrent writer commits two more rows (version 2) while the cursor is open.
+	// A concurrent writer repeatedly rebuilds the same rightmost working leaf while the cursor is
+	// open. This is the focused committed-root alias guard for insert-transient work: the pinned
+	// root must remain byte/value-stable through every mutation, then a fresh reader must see them.
 	w := db.WriteSession()
-	if _, err := queryOutcome(w, "INSERT INTO t VALUES (4, 40), (5, 50)", nil); err != nil {
-		t.Fatal(err)
+	for id := int64(4); id <= 67; id++ {
+		if _, err := queryOutcome(w, fmt.Sprintf("INSERT INTO t VALUES (%d, %d)", id, id*10), nil); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := w.Commit(); err != nil {
 		t.Fatal(err)
@@ -204,10 +209,62 @@ func TestStreamingCursorPinsSnapshot(t *testing.T) {
 		t.Fatalf("closed cursor must release its pin, oldest=%d", db.OldestLiveTxid())
 	}
 
-	// A fresh streaming read sees the writer's rows.
+	// A fresh streaming read sees every committed row.
 	fresh, _ := streamResult(t, reader, "SELECT id FROM t ORDER BY id")
-	if len(fresh) != 5 {
-		t.Fatalf("fresh read = %d rows, want 5", len(fresh))
+	if len(fresh) != 67 || fresh[0][0].Int != 1 || fresh[66][0].Int != 67 {
+		t.Fatalf("fresh read endpoints/length = %v/%v/%d, want 1/67/67", fresh[0][0], fresh[len(fresh)-1][0], len(fresh))
+	}
+}
+
+// A cursor opened inside a write transaction owns its working root. Later writes through the same
+// session remain visible to later statements but never leak into the open cursor.
+func TestWriteTransactionCursorStableAcrossLaterInserts(t *testing.T) {
+	t.Parallel()
+	db := seededKV(t, 3)
+	writer := db.Session(SessionOptions{})
+	defer writer.Close()
+	if err := writer.Begin(true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queryOutcome(writer, "INSERT INTO t VALUES (4, 40)", nil); err != nil {
+		t.Fatal(err)
+	}
+	pinned, err := writer.queryValues("SELECT id FROM t ORDER BY id", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pinned.Next() || pinned.Row()[0].Int != 1 {
+		t.Fatal("first pinned row != 1")
+	}
+	for id := int64(5); id <= 67; id++ {
+		if _, err := queryOutcome(writer, fmt.Sprintf("INSERT INTO t VALUES (%d, %d)", id, id*10), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	latest, _ := eagerResult(t, writer, "SELECT count(*) FROM t")
+	if len(latest) != 1 || latest[0][0].Int != 67 {
+		t.Fatalf("latest working count = %v, want 67", latest)
+	}
+	var rest []int64
+	for pinned.Next() {
+		rest = append(rest, pinned.Row()[0].Int)
+	}
+	if err := pinned.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(rest, []int64{2, 3, 4}) {
+		t.Fatalf("pinned cursor rest = %v, want [2 3 4]", rest)
+	}
+	_ = pinned.Close()
+	if err := writer.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	fresh := db.Session(SessionOptions{})
+	defer fresh.Close()
+	got, _ := eagerResult(t, fresh, "SELECT count(*) FROM t")
+	if len(got) != 1 || got[0][0].Int != 67 {
+		t.Fatalf("fresh committed count = %v, want 67", got)
 	}
 }
 

@@ -704,10 +704,13 @@ fn run_file(text: &str, disk: bool) -> std::result::Result<(), String> {
         // committed state carries on the file; the fresh session re-receives the per-record directives
         // applied just below). Writes reopen too — an UPDATE/DELETE over a faulted leaf exercises the
         // resolve-and-rewrite path. No-op in memory mode or after a fixture swap (which is `# skip: disk`).
-        // Reassigning drops the old handle first (no file lock — src/paging.rs), so the reopen reads the
-        // just-committed image.
+        // Drop the session and handle explicitly before reopening. Assignment evaluates its right-hand
+        // side before dropping the previous value, which shared coordination correctly rejects as a
+        // duplicate in-process open of the same path.
         if disk && on_temp {
             let p = tmp_path.as_ref().expect("disk mode has a temp path");
+            drop(sess);
+            drop(db);
             db = Database::open_with_options(
                 p,
                 jed::OpenOptions {

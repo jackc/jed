@@ -664,3 +664,36 @@ whether or not the table has FKs, and a parent `DELETE`/`UPDATE`'s child scan is
 table's size is itself bounded by the metered work that populated it, the same reasoning `UNIQUE`
 relies on, §5; the backing-index follow-on would make the scan a probe.) A runtime error inside an
 expression along the way (none arise from FK checks themselves) propagates as itself.
+
+## 7. INSERT validation and write order
+
+Plain `INSERT` uses the following canonical two-phase order. The order is observable through error
+precedence and deterministic cost, so a specialized execution path must reproduce it exactly.
+
+1. Build each declaration-order candidate row: apply `DEFAULT`/omission, coerce and range-check each
+   value, and enforce `NOT NULL`, all in column order.
+2. Evaluate `CHECK` constraints in their name order.
+3. Encode and probe the primary key. For a multi-row statement, also reject a key claimed by an
+   earlier candidate.
+4. Probe unique indexes in catalog/name order. Building each uniqueness prefix evaluates that
+   index's partial predicate and expression keys; for a multi-row statement, also reject a prefix
+   claimed by an earlier candidate.
+5. Compute the row's `value_compress` units, then evaluate every index's predicate/expression in
+   catalog order to prepare its phase-2 entry prefix. A unique index is therefore evaluated once for
+   its constraint probe and again for its maintained entry, as it is on the general path today.
+6. After every candidate reaches that point, validate foreign keys in name order against the
+   statement end state, then exclusion constraints in name order against stored rows and the other
+   candidates.
+7. Charge the accumulated compression units and enforce the cost ceiling. Although the units are
+   computed at step 5, this deferred guard is load-bearing: FK/exclusion errors win over `54P01`.
+8. Evaluate `RETURNING` over the validated candidates while the pre-statement read pin is still
+   visible.
+9. Phase 2 writes table rows in candidate order, allocating synthetic rowids only now, then writes
+   secondary-index entries in catalog order. A table- or unique-index collision hidden from phase 1
+   by a writable-CTE read pin is still reported here as `23505`.
+
+The single-candidate `INSERT ... VALUES (...)` fast path may replace within-batch sets and row-batch
+buffers with local values, but it follows these same steps. `INSERT ... SELECT`, multi-row `VALUES`,
+and `ON CONFLICT` retain the general batch paths. This is an in-memory execution choice only: it does
+not change cost, affected-row counts, estimator revisions, sequence/default flushing, snapshots, or
+persisted bytes.

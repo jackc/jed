@@ -2,7 +2,10 @@
 
 use std::time::Instant;
 
-use jed::{CreateOptions, Database, PreparedStatement, Session, SessionOptions, Value};
+use jed::{
+    CreateOptions, Database, Locking, OpenOptions, PreparedStatement, Session, SessionOptions,
+    Value,
+};
 
 use jed_bench::{
     Arg, BoxResult, Checksum, ConcurrentOutcome, Config, Engine, main_with, read_sidecar,
@@ -18,8 +21,10 @@ fn main() {
 }
 
 struct JedEngine {
-    // The persistent connection the bench drives (BEGIN/COMMIT/ROLLBACK span calls). It owns an
-    // `Arc<Shared>`, so it keeps the storage alive after the local `Database` handle is dropped.
+    // The persistent connection the bench drives (BEGIN/COMMIT/ROLLBACK span calls). Keep the
+    // Database handle too so concurrent-read workers can share it; opening the same coordinated
+    // path a second time in-process is deliberately rejected by the public API.
+    db: Database,
     sess: Session,
     stmt: Option<PreparedStatement>,
     data_dir: String,
@@ -28,16 +33,19 @@ struct JedEngine {
 }
 
 fn open(data_dir: &str, dataset: &str) -> BoxResult<Box<dyn Engine>> {
+    let locking = bench_locking()?;
     if dataset == "scratch" {
         let dir = format!("{data_dir}/scratch-rust-{}", std::process::id());
         std::fs::create_dir_all(&dir)?;
         let db = Database::create(CreateOptions {
             path: Some(std::path::PathBuf::from(format!("{dir}/scratch.jed"))),
+            locking,
             ..Default::default()
         })
         .map_err(|e| e.to_string())?;
         let sess = db.session(SessionOptions::default());
         return Ok(Box::new(JedEngine {
+            db,
             sess,
             stmt: None,
             data_dir: data_dir.to_string(),
@@ -45,15 +53,43 @@ fn open(data_dir: &str, dataset: &str) -> BoxResult<Box<dyn Engine>> {
             scratch: Some(dir),
         }));
     }
-    let db = Database::open(format!("{data_dir}/{dataset}.jed")).map_err(|e| e.to_string())?;
+    let db = Database::open_with_options(
+        format!("{data_dir}/{dataset}.jed"),
+        OpenOptions {
+            locking,
+            ..Default::default()
+        },
+    )
+    .map_err(|e| e.to_string())?;
     let sess = db.session(SessionOptions::default());
     Ok(Box::new(JedEngine {
+        db,
         sess,
         stmt: None,
         data_dir: data_dir.to_string(),
         dataset: dataset.to_string(),
         scratch: None,
     }))
+}
+
+/// Optional benchmark-only coordination override. Ordinary runs keep the public API's `auto`
+/// default; insert-performance attribution can set `JED_BENCH_LOCKING=shared|exclusive|none`
+/// without carrying a source patch between paired samples.
+fn bench_locking() -> BoxResult<Locking> {
+    match std::env::var("JED_BENCH_LOCKING") {
+        Err(std::env::VarError::NotPresent) => Ok(Locking::Auto),
+        Ok(value) => match value.as_str() {
+            "auto" => Ok(Locking::Auto),
+            "shared" => Ok(Locking::Shared),
+            "exclusive" => Ok(Locking::Exclusive),
+            "none" => Ok(Locking::None),
+            _ => Err(format!(
+                "invalid JED_BENCH_LOCKING {value:?}: expected auto, shared, exclusive, or none"
+            )
+            .into()),
+        },
+        Err(error) => Err(error.into()),
+    }
 }
 
 impl Drop for JedEngine {
@@ -150,8 +186,7 @@ impl Engine for JedEngine {
         meas: Vec<Vec<Vec<Arg>>>,
         expect_rows: Option<usize>,
     ) -> BoxResult<Option<ConcurrentOutcome>> {
-        let path = format!("{}/{}.jed", self.data_dir, self.dataset);
-        let core = Database::open(&path).map_err(|e| e.to_string())?;
+        let core = self.db.clone();
         let sql = sql.to_string();
 
         // Pass 1 — warmup, untimed.

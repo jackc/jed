@@ -13,7 +13,8 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { type Engine, create, execute } from "../src/tooling.ts";
+import { begin } from "../src/api.ts";
+import { type Engine, create, execute, toImage } from "../src/tooling.ts";
 
 function cost(db: Engine, sql: string): bigint {
   return execute(db, sql).cost;
@@ -52,5 +53,20 @@ test("split shape costs are pinned", () => {
   // (interior records could terminate a v23 descent early), so each of the 17 table
   // fetches pays the full root→leaf path.
   assert.equal(cost(shuf, "CREATE INDEX t_v_idx ON t (v)"), 143n);
+  assert.equal(cost(shuf, "SELECT id FROM t WHERE v = 3"), 105n);
+
+  // The complete INSERT mutation guard: the committed shape above already contains table-leaf and
+  // table-interior splits plus a split secondary index. In one working root, overwrite an existing
+  // table row/index entry, append enough rows to split both trees again, and pin the resulting exact
+  // node counts through cost. Rollback must restore the byte-exact committed image and original costs.
+  const before = toImage(shuf, 256, 1n);
+  const tx = begin(shuf, true);
+  execute(shuf, "UPDATE t SET v = 42 WHERE id = 120");
+  for (let id = 121; id <= 220; id++) execute(shuf, `INSERT INTO t VALUES (${id}, ${id % 7})`);
+  assert.equal(cost(shuf, "SELECT count(*) FROM t"), 477n);
+  assert.equal(cost(shuf, "SELECT id FROM t WHERE v = 3"), 199n);
+  tx.rollback();
+  assert.deepEqual(toImage(shuf, 256, 1n), before, "rollback changed the committed image");
+  assert.equal(cost(shuf, "SELECT count(*) FROM t"), 265n);
   assert.equal(cost(shuf, "SELECT id FROM t WHERE v = 3"), 105n);
 });

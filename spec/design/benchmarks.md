@@ -270,6 +270,131 @@ The r1 and r4 checksums were respectively `f086f7634186c3f4` and `c72e6d5fabdc50
 native core. Wall-clock movement is observational and includes parse/plan work on every query; the
 focused synchronization tests, rather than a timing threshold, are the regression gate.
 
+**INSERT performance slice-0 baseline (2026-07-16).** Before changing INSERT execution or tree
+ownership, commit `e5f8bed3` was measured on Linux 6.17 / glibc 2.39 on an Intel Core Ultra 9 285K
+with rustc 1.92.0, Go 1.26.3, and Node 24.16.0. Each `insert_rollback` sample is one measured
+transaction containing 1,000 executions of the prepared four-column INSERT into `small.orders`,
+then rollback. Runs were pinned to CPU 2 and alternated by pair; one shared/exclusive warmup pair was
+discarded, then five pairs were retained. Go and TypeScript used the same discarded-warmup + five-run
+shape. Each cell below is the median of that statistic across the five retained runs:
+
+| Core / locking | Mean | Minimum | p50 | p90 | p99 |
+|---|---:|---:|---:|---:|---:|
+| Rust / shared | 24.546 ms | 23.980 ms | 24.547 ms | 24.696 ms | 24.769 ms |
+| Rust / exclusive | 19.376 ms | 19.143 ms | 19.353 ms | 19.537 ms | 19.566 ms |
+| Go / auto (shared) | 12.174 ms | 11.888 ms | 12.119 ms | 12.418 ms | 12.535 ms |
+| TypeScript / auto (shared) | 18.880 ms | 12.467 ms | 15.389 ms | 28.379 ms | 35.624 ms |
+
+Every retained run produced checksum `ac02f0205c4f05c5`. Rust shared was **26.7% slower** than
+exclusive by the median mean (26.8% by p50), establishing the glibc/background-thread attribution
+before any INSERT optimization. The TypeScript tail is visibly GC-sensitive; timings remain
+observational. The Rust harness accepts benchmark-only `JED_BENCH_LOCKING=auto|shared|exclusive|none`
+so later paired runs do not require source patches; absence keeps the normal `auto` default.
+
+A separate temporary Rust counting-allocator probe (removed after collection) bounded the same
+1,000-row transaction and attributed approximately:
+
+| Phase | Allocation/reallocation calls | Requested bytes |
+|---|---:|---:|
+| parameter binding and pre-`insert_rows` resolution | 38,000 | 3.3 MiB |
+| INSERT validation and temporary structures | 370,000 | 50 MiB |
+| table and secondary-index tree mutation | 306,000 | 39 MiB |
+| total | 716,000 | 93 MiB |
+
+About 75% of calls requested 16 bytes or less. Requested bytes are cumulative allocator traffic, not
+retained memory, and the counting allocator perturbs timing, so these figures are attribution evidence
+only and are not compared to Go or V8 object counts.
+
+Slice 0 also pins the immutable-tree preconditions before optimization. The mirrored `split_shape`
+tests cover table leaf/interior splits and secondary-index splits by exact costs, then overwrite and
+append in a working root (costs 477/199), roll back, and require both the byte-exact committed image
+and original costs (265/105) to return. The mirrored `PMap` tests retain the complete encoded-key/value
+sequence across heavy clone mutation. Streaming tests pin a committed root through 64 same-leaf
+inserts and pin a write-transaction cursor while later statements mutate its working root; attachment
+tests do the same for main and attached roots simultaneously. The existing `pk_table.jed`,
+`tall_tree.jed`, `index_table.jed`, and `max_sep_table.jed` fixtures independently pin the leaf,
+interior, ordinary-index, and degenerate-index shapes through Rust, Go, TypeScript, and the Ruby
+encoder/decoder. `cte/data_modifying_errors.test` already pins the phase-2 insert/insert collision
+hidden by a writable-CTE read pin, while the mirrored writable-CTE tests pin same-leaf lexical
+last-write behavior. As a mutation-sensitivity check, temporarily returning decoded TypeScript leaf
+arrays without shallow copies made `pmap: clone is an independent snapshot` fail on the first
+overwritten value; restoring the immutable copy made the suite pass. No experimental mutation remains.
+
+**INSERT performance slice-1 result (2026-07-16).** Commit `e5f8bed3` remains the before control;
+the slice-1 working tree specializes exactly one plain `INSERT ... VALUES` candidate and retains the
+batch path for multi-row, `INSERT ... SELECT`, and `ON CONFLICT`. The same CPU-2 pin, discarded
+process warmup, and five retained runs used by the slice-0 baseline produced the following medians of
+per-run statistics. Every run retained checksum `ac02f0205c4f05c5`.
+
+| Core / locking | Mean | Change | Minimum | p50 | p90 | p99 |
+|---|---:|---:|---:|---:|---:|---:|
+| Rust / shared | 23.928 ms | -2.5% | 23.681 ms | 23.910 ms | 24.162 ms | 24.184 ms |
+| Rust / exclusive | 19.057 ms | -1.6% | 18.812 ms | 19.011 ms | 19.189 ms | 19.207 ms |
+| Go / auto (shared) | 11.929 ms | -2.0% | 11.695 ms | 11.890 ms | 12.100 ms | 12.251 ms |
+| TypeScript / auto (shared) | 16.706 ms | -11.5% | 10.549 ms | 14.001 ms | 25.296 ms | 31.379 ms |
+
+The Rust shared/exclusive gap is still **25.6% by mean** (25.8% by p50), only slightly below the
+slice-0 26.7%. Slice 1 therefore improves the common statement shape but does **not** solve the
+glibc/background-thread regression; the Rust CoW entry-sharing and prepared-INSERT slices remain the
+material follow-ons. A freshly rebuilt Node/Rust wrapper measured 29.489 ms mean (29.205 ms p50) on
+the same lane and checksum, versus 16.706 ms pure TypeScript and 23.928 ms native Rust/shared; this is
+the wrapper regression subset, not a claim about all Node workloads.
+
+Temporary probes were run outside the timing samples, then removed. Go's `runtime.MemStats` boundary
+covered the 1,000 inserts but excluded `BEGIN`/`ROLLBACK`; a forced batch-path control used the same
+post-slice source. V8 `--trace-gc-nvp` covered the complete 3-warmup + 30-measured process and used
+forced collections only to bound the first and residual allocation intervals. Rust used the same
+counting-allocator boundary as slice 0.
+
+| Core / probe | Forced batch path | Single-row path | Effect |
+|---|---:|---:|---:|
+| Rust calls / transaction | 707,057 | 707,057 | whole-lane counter indistinguishable |
+| Rust requested bytes / transaction | 92,492,630 | 92,492,630 | whole-lane counter indistinguishable |
+| Go mallocs / transaction | 85,144 | 80,144 | -5,000 (-5.9%; five per row) |
+| Go allocated bytes / transaction | 44,866,920 | 44,722,872 | -144,048 (-0.3%) |
+| Go GCs / transaction, median | 19 | 19 | unchanged |
+| V8 allocated bytes / complete lane | 2,057,753,168 | 2,012,076,272 | -45,676,896 (-2.2%) |
+| V8 natural GCs / complete lane | 51 (48 scavenges) | 50 (47 scavenges) | one fewer scavenge |
+
+Rust's immutable B+tree rebuilding dominates the transaction counter; its reason to retain this
+slice is the repeatable elapsed-time reduction and the explicit one-row control flow, not a claimed
+allocator win. Go and TypeScript directly demonstrate the removed batch-temporary traffic.
+
+A temporary scratch-only matrix (not added to the permanent cross-engine corpus) exercised the
+fast path without secondary indexes; with ordinary, unique, expression, and partial indexes;
+integer-only, variable-text, and 16 KiB long-value rows; transaction batches of 1/10/100/1,000; and
+a true ten-candidate statement forced through the retained batch path. Times are mean transaction
+latencies; every core returned the zero-row rollback checksum `4eb8c6181d9224ca` in every lane.
+
+| Scratch lane | Go | Rust | TypeScript |
+|---|---:|---:|---:|
+| no secondary index, 1,000 rows | 3.232 ms | 10.534 ms | 5.973 ms |
+| four mixed secondary indexes, 1,000 rows | 21.242 ms | 42.053 ms | 26.059 ms |
+| integer-only, 1,000 rows | 3.195 ms | 8.739 ms | 4.765 ms |
+| variable text, 1,000 rows | 2.557 ms | 5.682 ms | 12.892 ms |
+| 16 KiB text, 100 rows | 10.860 ms | 10.956 ms | 271.393 ms |
+| transaction batch 1 / 10 / 100 / 1,000 | 0.002 / 0.023 / 0.259 / 3.229 ms | 0.003 / 0.018 / 0.468 / 10.417 ms | 0.017 / 0.027 / 0.309 / 3.634 ms |
+| ten-row statement × 100 | 3.599 ms | 13.249 ms | 3.316 ms |
+
+Finally, three same-host process pairs compared the pre-slice engine with slice 1. The disposable
+control worktree carried only the Go/Rust benchmark-handle lifetime fixes required by shared locking;
+engine code stayed at `e5f8bed3`. Each cell is the delta between the median before and median after
+process. All before/after checksums matched; the largest regression was +3.72%, inside the 5% gate.
+
+| Regression lane | Go | Rust | TypeScript |
+|---|---:|---:|---:|
+| hot prepared PK lookup | -2.40% | +2.58% | -10.91% |
+| cold PK ramp | +1.02% | +1.06% | -1.00% |
+| full scan aggregate | -0.44% | -1.99% | -0.78% |
+| resident concurrent reader | -0.70% | +1.35% | -0.49% |
+| durable one-row commit | -1.80% | +3.72% | -6.70% |
+| secondary-index UPDATE | -0.38% | +0.20% | -2.69% |
+| secondary point-set DELETE | +0.62% | -0.37% | +0.77% |
+
+The measurements also found and fixed a Go benchmark lifecycle issue exposed by shared locking:
+each run now closes its owning `Database`, and concurrent readers are minted from that already-open
+handle instead of attempting an illegal second in-process open.
+
 ## 1. Purpose and non-goals
 
 The benchmark suite answers two questions, continuously:
@@ -529,6 +654,10 @@ Every benchmark binary takes the same positional arguments:
 bench-<engine> <corpus_dir> <data_dir> <out_path> [name_filter_substring]
 bench-setup    <corpus_dir> <data_dir> [--engine jed|sqlite|pg|all] [--force]
 ```
+
+The Rust jed harness additionally accepts `JED_BENCH_LOCKING=auto|shared|exclusive|none` for paired
+coordination attribution. It is benchmark-only and absent by default, so normal runs exercise the
+public API's `auto` default.
 
 PG binaries use the standard `PG*` environment (the devcontainer points it at the Unix
 socket). Human-readable progress goes to stderr; results go to `out_path` as JSONL,

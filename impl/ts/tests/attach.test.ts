@@ -135,6 +135,66 @@ test("attach lifecycle: create, populate, read, detach", () => {
   assert.equal(errCode(db.session(), "SELECT v FROM mydb.t"), "42P01");
 });
 
+// Pin main and attached working roots through write-transaction cursors, churn both rightmost leaves,
+// and prove neither old root nor either database aliases the other's mutation state. Rollback restores
+// both committed roots together.
+test("attachment working roots and cursors do not alias", () => {
+  const db = memDb();
+  db.attach("work", attachMemory(), false);
+  const s = db.session();
+  try {
+    s.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
+    s.execute("CREATE TABLE work.t (id i32 PRIMARY KEY, v i32)");
+    s.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)");
+    s.execute("INSERT INTO work.t VALUES (1, 100), (2, 200), (3, 300)");
+    s.begin(true);
+    const mainPin = s.query("SELECT id, v FROM t ORDER BY id");
+    const workPin = s.query("SELECT id, v FROM work.t ORDER BY id");
+    const mainIt = mainPin[Symbol.iterator]();
+    const workIt = workPin[Symbol.iterator]();
+    assert.deepEqual(mainIt.next().value, [
+      { kind: "int", int: 1n },
+      { kind: "int", int: 10n },
+    ]);
+    assert.deepEqual(workIt.next().value, [
+      { kind: "int", int: 1n },
+      { kind: "int", int: 100n },
+    ]);
+    for (let id = 4; id <= 40; id++) {
+      s.execute(`INSERT INTO t VALUES (${id}, ${id * 10})`);
+      s.execute(`INSERT INTO work.t VALUES (${id}, ${id * 100})`);
+    }
+    assert.deepEqual(intCol(s, "SELECT count(*) FROM t"), [40n]);
+    assert.deepEqual(intCol(s, "SELECT count(*) FROM work.t"), [40n]);
+
+    const mainRest: bigint[] = [];
+    for (let next = mainIt.next(); !next.done; next = mainIt.next()) {
+      const value = next.value[1]!;
+      if (value.kind === "int") mainRest.push(value.int);
+    }
+    const workRest: bigint[] = [];
+    for (let next = workIt.next(); !next.done; next = workIt.next()) {
+      const value = next.value[1]!;
+      if (value.kind === "int") workRest.push(value.int);
+    }
+    assert.deepEqual(mainRest, [20n, 30n]);
+    assert.deepEqual(workRest, [200n, 300n]);
+    mainPin.close();
+    workPin.close();
+    s.rollback();
+
+    const fresh = db.session();
+    try {
+      assert.deepEqual(intCol(fresh, "SELECT count(*) FROM t"), [3n]);
+      assert.deepEqual(intCol(fresh, "SELECT count(*) FROM work.t"), [3n]);
+    } finally {
+      fresh.close();
+    }
+  } finally {
+    s.close();
+  }
+});
+
 // TestAttachReadOnlyRejectsWrites — a read-only attachment rejects every write (DML + DDL) with 25006
 // before any I/O (attached-databases.md §4), while a bare/main write is unaffected.
 test("read-only attachment rejects writes (25006)", () => {

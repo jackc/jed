@@ -1022,6 +1022,18 @@ export type FkDependent = {
 
 type EstimateCteContext = { bindings: CteBinding[]; modes: CteMode[]; bodies: EstimatedPlan[] };
 
+// Internal selection predicate exported only from this implementation module so the per-core
+// invariant test can pin the fast-path boundary without adding anything to the public lib.ts API.
+export function singleValuesInsertEligible(
+  candidateCount: number,
+  hasConflict: boolean,
+): boolean {
+  return candidateCount === 1 && !hasConflict;
+}
+
+const ZERO_STORAGE_KEY = new Uint8Array(8);
+const EMPTY_STORAGE_KEY = new Uint8Array(0);
+
 export class Engine {
   // The last committed, immutable state — what fresh readers (and autocommit reads) see.
   committed: Snapshot;
@@ -8333,6 +8345,8 @@ export class Engine {
     // above), resolving each slot: a literal, a bound $N, or a DEFAULT keyword → that column's
     // default (a constant, or its expression evaluated for this row through the shared stmtRng).
     // The shared insertRows then builds the declaration-order row and applies OMITTED defaults.
+    const useSingle = singleValuesInsertEligible(rowsIn.length, cplan !== null);
+    let singleValues: Value[] | null = null;
     const rows: Value[][] = [];
     for (const values of rowsIn) {
       const rv: Value[] = new Array(arity);
@@ -8369,7 +8383,8 @@ export class Engine {
           }
         }
       }
-      rows.push(rv);
+      if (useSingle) singleValues = rv;
+      else rows.push(rv);
     }
     // Uncorrelated subqueries in the RETURNING list and the DO UPDATE SET/WHERE fold once
     // (cost.md §3), reading the pre-statement snapshot (grammar.md §32).
@@ -8379,22 +8394,41 @@ export class Engine {
     }
     this.foldConflictPlan(cplan, bound, foldCost);
     meter.charge(foldCost.value);
-    const { affected, returned } = this.runInsertRows(
-      table,
-      store,
-      ins.db,
-      pk,
-      checks,
-      defaultExprs,
-      stmtRng,
-      provided,
-      rows,
-      cplan,
-      ret?.nodes ?? null,
-      bound,
-      ctx,
-      meter,
-    );
+    const { affected, returned } = useSingle
+      ? {
+          affected: 1,
+          returned: this.insertOne(
+            table,
+            store,
+            ins.db,
+            pk,
+            checks,
+            defaultExprs,
+            stmtRng,
+            provided,
+            singleValues!,
+            ret?.nodes ?? null,
+            bound,
+            ctx,
+            meter,
+          ),
+        }
+      : this.runInsertRows(
+          table,
+          store,
+          ins.db,
+          pk,
+          checks,
+          defaultExprs,
+          stmtRng,
+          provided,
+          rows,
+          cplan,
+          ret?.nodes ?? null,
+          bound,
+          ctx,
+          meter,
+        );
     this.markEstimatorMutation(ins.db, ins.table);
     return dmlOutcome(ret?.names ?? null, ret?.types ?? null, returned, affected, meter.accrued);
   }
@@ -8581,9 +8615,7 @@ export class Engine {
         const probe = fkProbe(fk, parent, parentColls, pr.row, fk.columns);
         if (probe === null) continue; // a NULL local column → exempt (MATCH SIMPLE)
         if (batch.has(fkProbeBytes(probe).join(","))) continue;
-        if (!this.fkProbeHits(probe, fk.refTable)) {
-          throw fkViolationInsert(relation, fk.name);
-        }
+        this.validateInsertFkStored(relation, fk, probe);
       }
     }
 
@@ -8596,14 +8628,8 @@ export class Engine {
     if (exclusions.length > 0) {
       const tcols = table.columns;
       for (const exc of exclusions) {
-        const ikey = exc.index.toLowerCase();
         for (const pr of prepared) {
-          const probe = exclusionProbeQuery(tcols, exc, pr.row);
-          if (probe === null) continue; // exempt
-          const tree = this.readSnap().gistTreeFor(ikey);
-          const conflict =
-            tree !== undefined && gistSearch(tree, probe.query, probe.strats).keys.length > 0;
-          if (conflict) {
+          if (this.insertExclusionConflictsStored(tcols, exc, pr.row)) {
             throw exclusionViolation(table.name, exc.name);
           }
         }
@@ -8673,6 +8699,174 @@ export class Engine {
       }
     }
     return returned;
+  }
+
+  // Plain one-candidate INSERT ... VALUES specialization. It follows the general path's exact
+  // validation/write order (constraints.md §7) while keeping the candidate, key, and per-index
+  // entries in local values: no one-row Sets, byte-to-string joins, prepared-row array, mapped
+  // prefix array, or phase-2 per-index buffers.
+  private insertOne(
+    table: Table,
+    store: TableStore,
+    dbScope: string | undefined,
+    pk: number[],
+    checks: NamedCheck[],
+    defaultExprs: (RExpr | null)[],
+    rng: StmtRng,
+    provided: number[],
+    values: Value[],
+    returning: RExpr[] | null,
+    params: Value[],
+    ctes: CteCtx,
+    meter: Meter,
+  ): Value[][] | null {
+    const colTypes = store.columnTypes();
+    const colls = this.columnCollations(table.columns);
+    const readStore = this.lkpStoreScoped(dbScope, table.name);
+    const rindexes = this.resolveTableIndexes(table);
+    const maintenanceEnv = this.maintenanceEnv(rng);
+
+    const row: Row = new Array(table.columns.length);
+    for (let i = 0; i < table.columns.length; i++) {
+      const col = table.columns[i]!;
+      const p = provided[i]!;
+      const candidate =
+        p >= 0 ? values[p]! : this.evalDefault(col, defaultExprs[i]!, rng, meter);
+      try {
+        row[i] = coerceForStore(
+          candidate,
+          colTypes[i]!,
+          col.decimal,
+          col.varcharLen,
+          col.notNull,
+          col.name,
+        );
+      } catch (e) {
+        throw stampTable(e, table.name);
+      }
+    }
+
+    if (checks.length > 0) {
+      meter.guard();
+      const checkEnv: EvalEnv = {
+        params: [],
+        outer: [],
+        runSubquery: (p, o) => this.execQueryPlan(p, o, [], EMPTY_CTE_CTX),
+        seam: this.session.seam,
+        rng,
+        ctes: EMPTY_CTE_CTX,
+        exec: this,
+      };
+      evalChecks(checks, table.name, row, checkEnv, meter);
+    }
+
+    let key: Uint8Array | null = null;
+    if (pk.length > 0) {
+      key = encodePkKey(table, pk, colls, row);
+      if (readStore.get(key) !== undefined) {
+        throw uniqueViolation(table.name, pkeyName(table.name));
+      }
+    }
+
+    for (const rindex of rindexes) {
+      if (!rindex.unique) continue;
+      const prefix = indexPrefixKey(table.columns, colls, rindex, row, maintenanceEnv);
+      if (prefix === null) continue;
+      const stored = this.lkpIndexStoreScoped(dbScope, rindex.name.toLowerCase()).rangeEntries(
+        uniqueProbeBound(prefix),
+      );
+      if (stored.length > 0) throw uniqueViolation(table.name, rindex.name);
+    }
+
+    const cunits = BigInt(store.writeCompressUnits(key ?? ZERO_STORAGE_KEY, row));
+
+    // One group per index is required because a GIN row can produce several entries. The batch-only
+    // outer row dimension is absent, and a direct loop avoids the general path's mapped arrays.
+    const indexEntries: Uint8Array[][] = [];
+    for (const rindex of rindexes) {
+      indexEntries.push(
+        indexEntryKeys(
+          table.columns,
+          colls,
+          rindex,
+          EMPTY_STORAGE_KEY,
+          row,
+          maintenanceEnv,
+        ),
+      );
+    }
+
+    const relation = table.name;
+    for (const fk of this.table(table.name)?.fks ?? []) {
+      const parent = this.table(fk.refTable);
+      if (parent === undefined) continue;
+      const parentColls = this.columnCollations(parent.columns);
+      const supplied =
+        fk.refTable.toLowerCase() === relation.toLowerCase()
+          ? fkProbe(fk, parent, parentColls, row, fk.refColumns)
+          : null;
+      const probe = fkProbe(fk, parent, parentColls, row, fk.columns);
+      if (probe === null) continue;
+      if (supplied !== null && cmpBytes(fkProbeBytes(supplied), fkProbeBytes(probe)) === 0) {
+        continue;
+      }
+      this.validateInsertFkStored(relation, fk, probe);
+    }
+
+    for (const exc of this.table(table.name)?.exclusions ?? []) {
+      if (this.insertExclusionConflictsStored(table.columns, exc, row)) {
+        throw exclusionViolation(table.name, exc.name);
+      }
+    }
+
+    meter.charge(COSTS.valueCompress * cunits);
+    meter.guard();
+
+    const returned =
+      returning !== null
+        ? this.projectReturning(returning, [row], null, params, ctes, meter)
+        : null;
+
+    key ??= encodeInt("i64", store.allocRowid());
+    for (const entries of indexEntries) {
+      for (let i = 0; i < entries.length; i++) {
+        const prefix = entries[i]!;
+        const entry = new Uint8Array(prefix.length + key.length);
+        entry.set(prefix, 0);
+        entry.set(key, prefix.length);
+        entries[i] = entry;
+      }
+    }
+    if (!store.insert(key, row)) {
+      throw uniqueViolation(table.name, pkeyName(table.name));
+    }
+    for (let i = 0; i < table.indexes.length; i++) {
+      const def = table.indexes[i]!;
+      const istore = this.writeIndexStoreScoped(dbScope, def.name.toLowerCase());
+      for (const entry of indexEntries[i]!) {
+        if (!istore.insert(entry, [])) throw uniqueViolation(table.name, def.name);
+      }
+    }
+    return returned;
+  }
+
+  // Complete one child-side FK check after the caller handles the statement end-state match. The
+  // batch and one-row paths share the stored probe and violation construction.
+  private validateInsertFkStored(relation: string, fk: ForeignKey, probe: FkProbe): void {
+    if (!this.fkProbeHits(probe, fk.refTable)) throw fkViolationInsert(relation, fk.name);
+  }
+
+  // Probe resident GiST rows for one exclusion candidate. The batch caller separately retains its
+  // pairwise end-state pass; the stored-row semantics are shared.
+  private insertExclusionConflictsStored(
+    columns: Column[],
+    exc: ExclusionConstraint,
+    row: Row,
+  ): boolean {
+    const probe = exclusionProbeQuery(columns, exc, row);
+    if (probe === null) return false;
+    const tree = this.readSnap().gistTreeFor(exc.index.toLowerCase());
+    return tree !== undefined && gistSearch(tree, probe.query, probe.strats).keys.length > 0;
   }
 
   // resolveOnConflict resolves an ON CONFLICT clause (spec/design/upsert.md §2/§5) into a

@@ -1692,6 +1692,10 @@ mod tests {
                 .unwrap();
         }
         let snap = base.clone();
+        // Capture the complete encoded-key/value sequence before the working clone starts changing.
+        // Equality after the churn below is the byte/value alias guard for transient mutation work:
+        // an unsafe in-place edit of a shared leaf must make this test fail.
+        let snap_before = snap.iter(None).unwrap();
 
         let mut other = base.clone();
         for k in 0..2000 {
@@ -1714,6 +1718,7 @@ mod tests {
             assert_eq!(snap.get(&key(k), None).unwrap(), Some(row(k as i64)));
         }
         let snap_rows: Vec<_> = snap.iter(None).unwrap();
+        assert_eq!(snap_rows, snap_before, "pinned key/value bytes changed");
         assert_eq!(snap_rows.len(), 2000);
         assert_eq!(snap_rows[0], (key(0), row(0)));
         assert_eq!(snap_rows[1999], (key(1999), row(1999)));

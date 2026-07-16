@@ -31,23 +31,23 @@ fn cost(db: &mut Session, sql: &str) -> i64 {
 /// A 121-row table at the fixture page size (256): id bigint pk, v integer = id % 7.
 /// Ascending inserts pks 0..120 in order; shuffled inserts the permutation (i*37) mod
 /// 121 — deterministic, identical in every core.
-fn split_shape_db(name: &str, shuffled: bool) -> Session {
+fn split_shape_db(name: &str, shuffled: bool) -> (Database, Session) {
     let path = tmp(name);
     let _ = std::fs::remove_file(&path);
-    let mut db = Database::create(CreateOptions {
+    let database = Database::create(CreateOptions {
         path: Some(std::path::PathBuf::from(&path)),
         skip_fsync: true,
         page_size: 256,
         ..Default::default()
     })
-    .unwrap()
-    .session(SessionOptions::default());
+    .unwrap();
+    let mut db = database.session(SessionOptions::default());
     run(&mut db, "CREATE TABLE t (id bigint PRIMARY KEY, v integer)");
     for i in 0..121 {
         let pk = if shuffled { (i * 37) % 121 } else { i };
         run(&mut db, &format!("INSERT INTO t VALUES ({pk}, {})", pk % 7));
     }
-    db
+    (database, db)
 }
 
 #[test]
@@ -58,9 +58,9 @@ fn split_shape_costs_are_pinned() {
     // hundreds of near-empty nodes and this cost exploded. The counts dropped from v23
     // (268/278/156) with the v24 B+tree (format.md): interior nodes are a record-free
     // separator skeleton with far higher fan-out, so a full scan touches fewer pages.
-    let mut asc = split_shape_db("split_shape_asc.jed", false);
+    let (_, mut asc) = split_shape_db("split_shape_asc.jed", false);
     assert_eq!(cost(&mut asc, "SELECT count(*) FROM t"), 258);
-    let mut shuf = split_shape_db("split_shape_shuf.jed", true);
+    let (shuf_db, mut shuf) = split_shape_db("split_shape_shuf.jed", true);
     assert_eq!(cost(&mut shuf, "SELECT count(*) FROM t"), 265);
 
     // Sorted index build (indexes.md §1) packs the index tree like the ascending case;
@@ -70,5 +70,26 @@ fn split_shape_costs_are_pinned() {
     // (interior records could terminate a v23 descent early), so each of the 17 table
     // fetches pays the full root→leaf path.
     assert_eq!(cost(&mut shuf, "CREATE INDEX t_v_idx ON t (v)"), 143);
+    assert_eq!(cost(&mut shuf, "SELECT id FROM t WHERE v = 3"), 105);
+
+    // The complete INSERT mutation guard: the committed shape above already contains table-leaf
+    // and table-interior splits plus a split secondary index. In one working root, overwrite an
+    // existing table row/index entry, append enough rows to split both trees again, and pin the
+    // resulting exact node counts through cost. Rollback must restore the byte-exact committed image
+    // and its original costs. This fails if working-tree mutation aliases the committed root.
+    let before = shuf_db.to_image(256, 1).unwrap();
+    shuf.begin(true).unwrap();
+    run(&mut shuf, "UPDATE t SET v = 42 WHERE id = 120");
+    for id in 121..=220 {
+        run(
+            &mut shuf,
+            &format!("INSERT INTO t VALUES ({id}, {})", id % 7),
+        );
+    }
+    assert_eq!(cost(&mut shuf, "SELECT count(*) FROM t"), 477);
+    assert_eq!(cost(&mut shuf, "SELECT id FROM t WHERE v = 3"), 199);
+    shuf.rollback().unwrap();
+    assert_eq!(shuf_db.to_image(256, 1).unwrap(), before);
+    assert_eq!(cost(&mut shuf, "SELECT count(*) FROM t"), 265);
     assert_eq!(cost(&mut shuf, "SELECT id FROM t WHERE v = 3"), 105);
 }

@@ -86,6 +86,76 @@ func TestAttachLifecycle(t *testing.T) {
 	}
 }
 
+// TestAttachmentWorkingRootsAndCursorsDoNotAlias pins main and attached working roots through
+// write-transaction cursors, churns both rightmost leaves, and proves neither old root nor either
+// database aliases the other's mutation state. Rollback restores both committed roots together.
+func TestAttachmentWorkingRootsAndCursorsDoNotAlias(t *testing.T) {
+	t.Parallel()
+	db := memDB()
+	if err := db.Attach("work", AttachMemory(), false); err != nil {
+		t.Fatal(err)
+	}
+	s := db.Session(SessionOptions{})
+	defer s.Close()
+	attachExec(t, s, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
+	attachExec(t, s, "CREATE TABLE work.t (id i32 PRIMARY KEY, v i32)")
+	attachExec(t, s, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+	attachExec(t, s, "INSERT INTO work.t VALUES (1, 100), (2, 200), (3, 300)")
+	if err := s.Begin(true); err != nil {
+		t.Fatal(err)
+	}
+	mainPin, err := s.queryValues("SELECT id, v FROM t ORDER BY id", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workPin, err := s.queryValues("SELECT id, v FROM work.t ORDER BY id", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !mainPin.Next() || mainPin.Row()[0].Int != 1 || mainPin.Row()[1].Int != 10 {
+		t.Fatalf("main first row = %v", mainPin.Row())
+	}
+	if !workPin.Next() || workPin.Row()[0].Int != 1 || workPin.Row()[1].Int != 100 {
+		t.Fatalf("work first row = %v", workPin.Row())
+	}
+	for id := int64(4); id <= 40; id++ {
+		attachExec(t, s, "INSERT INTO t VALUES ("+strconv.FormatInt(id, 10)+", "+strconv.FormatInt(id*10, 10)+")")
+		attachExec(t, s, "INSERT INTO work.t VALUES ("+strconv.FormatInt(id, 10)+", "+strconv.FormatInt(id*100, 10)+")")
+	}
+	for _, sql := range []string{"SELECT count(*) FROM t", "SELECT count(*) FROM work.t"} {
+		out, err := queryOutcome(s, sql, nil)
+		if err != nil || len(out.Rows) != 1 || out.Rows[0][0].Int != 40 {
+			t.Fatalf("%s = %v, err=%v", sql, out.Rows, err)
+		}
+	}
+	var mainRest, workRest []int64
+	for mainPin.Next() {
+		mainRest = append(mainRest, mainPin.Row()[1].Int)
+	}
+	for workPin.Next() {
+		workRest = append(workRest, workPin.Row()[1].Int)
+	}
+	if len(mainRest) != 2 || mainRest[0] != 20 || mainRest[1] != 30 {
+		t.Fatalf("main pinned rest = %v", mainRest)
+	}
+	if len(workRest) != 2 || workRest[0] != 200 || workRest[1] != 300 {
+		t.Fatalf("work pinned rest = %v", workRest)
+	}
+	_ = mainPin.Close()
+	_ = workPin.Close()
+	if err := s.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	fresh := db.Session(SessionOptions{})
+	defer fresh.Close()
+	for _, sql := range []string{"SELECT count(*) FROM t", "SELECT count(*) FROM work.t"} {
+		out, err := queryOutcome(fresh, sql, nil)
+		if err != nil || len(out.Rows) != 1 || out.Rows[0][0].Int != 3 {
+			t.Fatalf("after rollback %s = %v, err=%v", sql, out.Rows, err)
+		}
+	}
+}
+
 // TestAttachReadOnlyRejectsWrites — a read-only attachment rejects every write (DML + DDL) with 25006
 // before any I/O (attached-databases.md §4), while a bare/main write is unaffected.
 func TestAttachReadOnlyRejectsWrites(t *testing.T) {

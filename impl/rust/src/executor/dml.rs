@@ -4,6 +4,24 @@
 
 use super::*;
 
+#[inline]
+fn single_values_insert_eligible(candidate_count: usize, has_conflict: bool) -> bool {
+    candidate_count == 1 && !has_conflict
+}
+
+#[cfg(test)]
+mod insert_fast_path_tests {
+    use super::single_values_insert_eligible;
+
+    #[test]
+    fn only_one_plain_values_candidate_is_eligible() {
+        assert!(single_values_insert_eligible(1, false));
+        assert!(!single_values_insert_eligible(0, false));
+        assert!(!single_values_insert_eligible(2, false));
+        assert!(!single_values_insert_eligible(1, true));
+    }
+}
+
 impl Engine {
     /// Analyze and run an INSERT whose rows come from a `VALUES` list or a `SELECT`
     /// (spec/design/grammar.md §12 / §24). An optional column list names the target columns
@@ -237,7 +255,11 @@ impl Engine {
                 // evaluated for this row through the shared `stmt_rng`). The shared `insert_rows`
                 // then builds the declaration-order row, applies any OMITTED defaults, and
                 // validates it.
-                let mut rows: Vec<Vec<Value>> = Vec::with_capacity(rows_in.len());
+                let use_single =
+                    single_values_insert_eligible(rows_in.len(), conflict_plan.is_some());
+                let mut single_values: Option<Vec<Value>> = None;
+                let mut rows: Vec<Vec<Value>> =
+                    Vec::with_capacity(if use_single { 0 } else { rows_in.len() });
                 for values in &rows_in {
                     let mut rv = vec![Value::Null; arity];
                     for (i, col) in columns.iter().enumerate() {
@@ -276,7 +298,12 @@ impl Engine {
                             };
                         }
                     }
-                    rows.push(rv);
+                    if use_single {
+                        debug_assert!(single_values.is_none());
+                        single_values = Some(rv);
+                    } else {
+                        rows.push(rv);
+                    }
                 }
                 let mut ret_nodes = ret;
                 if let Some((nodes, _, _)) = &mut ret_nodes {
@@ -288,22 +315,43 @@ impl Engine {
                     }
                 }
                 self.fold_conflict_plan(&mut conflict_plan, &bound, &mut meter.accrued)?;
-                let (affected, returned) = self.run_insert_rows(
-                    &table,
-                    db.as_deref(),
-                    &columns,
-                    &pk,
-                    &checks,
-                    &default_exprs,
-                    &stmt_rng,
-                    &provided,
-                    rows,
-                    conflict_plan.as_ref(),
-                    ret_nodes.as_ref().map(|(nodes, _, _)| nodes.as_slice()),
-                    &bound,
-                    ctx,
-                    &mut meter,
-                )?;
+                let returning_nodes = ret_nodes.as_ref().map(|(nodes, _, _)| nodes.as_slice());
+                let (affected, returned) = match single_values {
+                    Some(values) => (
+                        1,
+                        self.insert_one(
+                            &table,
+                            db.as_deref(),
+                            &columns,
+                            &pk,
+                            &checks,
+                            &default_exprs,
+                            &stmt_rng,
+                            &provided,
+                            values,
+                            returning_nodes,
+                            &bound,
+                            ctx,
+                            &mut meter,
+                        )?,
+                    ),
+                    None => self.run_insert_rows(
+                        &table,
+                        db.as_deref(),
+                        &columns,
+                        &pk,
+                        &checks,
+                        &default_exprs,
+                        &stmt_rng,
+                        &provided,
+                        rows,
+                        conflict_plan.as_ref(),
+                        returning_nodes,
+                        &bound,
+                        ctx,
+                        &mut meter,
+                    )?,
+                };
                 self.mark_estimator_mutation(db.as_deref(), &table);
                 Ok(match (ret_nodes, returned) {
                     (Some((_, names, types)), Some(rows)) => Outcome::Query {
@@ -691,9 +739,7 @@ impl Engine {
                 if batch.contains(probe.bytes()) {
                     continue;
                 }
-                if !self.fk_probe_hits(&probe, &fk.ref_table)? {
-                    return Err(EngineError::fk_violation_insert(&relation, &fk.name));
-                }
+                self.validate_insert_fk_stored(&relation, fk, &probe)?;
             }
         }
 
@@ -714,14 +760,7 @@ impl Engine {
             for exc in &exclusions {
                 let ikey = exc.index.to_ascii_lowercase();
                 for (_, row) in &prepared {
-                    let Some((q, strats)) = exclusion_probe_query(&tcols, exc, row) else {
-                        continue; // exempt (NULL / empty range)
-                    };
-                    let conflict = match self.gist_tree(&ikey) {
-                        Some(tree) => !tree.search(&q, &strats).0.is_empty(),
-                        None => false,
-                    };
-                    if conflict {
+                    if self.insert_exclusion_conflicts_stored(&tcols, exc, row, &ikey) {
                         return Err(EngineError::exclusion_violation(&relation, &exc.name));
                     }
                 }
@@ -786,6 +825,187 @@ impl Engine {
             for ek in index_inserts[k].drain(..) {
                 if !istore.insert(ek, Vec::new())? {
                     // A cross-sub-statement unique-index collision under the read pin (as above).
+                    return Err(EngineError::unique_violation(&relation, &def.name));
+                }
+            }
+        }
+        Ok(returned)
+    }
+
+    /// Plain one-candidate `INSERT ... VALUES` specialization. It is deliberately separate from
+    /// `insert_rows`: the batch path retains its within-statement sets and end-state loops, while
+    /// this path keeps the one row/key/index-prefix set in local values. The validation and write
+    /// order is identical to `insert_rows` (constraints.md §7).
+    #[allow(clippy::too_many_arguments)]
+    fn insert_one(
+        &mut self,
+        table: &str,
+        db_scope: Option<&str>,
+        columns: &[Column],
+        pk: &[(usize, Type)],
+        checks: &[(String, RExpr)],
+        default_exprs: &[Option<RExpr>],
+        rng: &std::cell::Cell<crate::seam::StmtRng>,
+        provided: &[Option<usize>],
+        values: Vec<Value>,
+        returning: Option<&[RExpr]>,
+        params: &[Value],
+        ctes: CteCtx,
+        meter: &mut Meter,
+    ) -> Result<Option<Vec<Vec<Value>>>> {
+        let n = columns.len();
+        let (relation, indexes) = self
+            .table_scoped(db_scope, table)
+            .map(|t| (t.name.clone(), t.indexes.clone()))
+            .unwrap_or_else(|| (table.to_string(), Vec::new()));
+        let rindexes: Vec<ResolvedIndex> = match self.table_scoped(db_scope, table) {
+            Some(t) => self.resolve_table_indexes(t)?,
+            None => Vec::new(),
+        };
+        let col_types: Vec<ColType> = self.store_scoped(db_scope, table).col_types().to_vec();
+        let colls = self.column_collations(columns);
+
+        let mut row = Vec::with_capacity(n);
+        for (i, col) in columns.iter().enumerate() {
+            let candidate = match provided[i] {
+                Some(p) => values[p].clone(),
+                None => self.eval_default(col, default_exprs[i].as_ref(), rng, meter)?,
+            };
+            row.push(
+                coerce_for_store(
+                    candidate,
+                    &col_types[i],
+                    col.decimal,
+                    col.varchar_len,
+                    col.not_null,
+                    &col.name,
+                )
+                .map_err(|e| e.with_table(&relation))?,
+            );
+        }
+
+        self.eval_checks(checks, &row, rng, &relation, meter)?;
+
+        let env = EvalEnv {
+            exec: self,
+            params: &[],
+            outer: &[],
+            rng,
+            ctes: CteCtx::empty(),
+        };
+
+        let key = if pk.is_empty() {
+            None
+        } else {
+            let key = encode_pk_key(pk, &colls, &row)?;
+            if self.store_scoped(db_scope, table).get(&key)?.is_some() {
+                return Err(EngineError::unique_violation(
+                    &relation,
+                    format!("{}_pkey", relation.to_ascii_lowercase()),
+                ));
+            }
+            Some(key)
+        };
+
+        for rindex in rindexes.iter().filter(|d| d.unique) {
+            let Some(prefix) = index_prefix_key(columns, &colls, rindex, &row, &env)? else {
+                continue;
+            };
+            let stored = !self
+                .index_store_scoped(db_scope, &rindex.name.to_ascii_lowercase())
+                .range_entries(&unique_probe_bound(&prefix))?
+                .is_empty();
+            if stored {
+                return Err(EngineError::unique_violation(&relation, &rindex.name));
+            }
+        }
+
+        let placeholder = [0u8; 8];
+        let kb = key.as_deref().unwrap_or(&placeholder);
+        let cunits = self
+            .store_scoped(db_scope, table)
+            .write_compress_units(kb, &row) as i64;
+
+        // One group per index is still required because a GIN entry can have several keys, but the
+        // batch-only outer row dimension and the later per-index drain buffers are absent.
+        let mut index_entries: Vec<Vec<Vec<u8>>> = Vec::with_capacity(rindexes.len());
+        for rindex in &rindexes {
+            index_entries.push(index_entry_keys(columns, &colls, rindex, &[], &row, &env)?);
+        }
+
+        for fk in self
+            .table(table)
+            .map(|t| t.foreign_keys.clone())
+            .unwrap_or_default()
+        {
+            let Some(parent) = self.table(&fk.ref_table) else {
+                continue;
+            };
+            let parent_colls = self.column_collations(&parent.columns);
+            let supplied = if fk.ref_table.eq_ignore_ascii_case(&relation) {
+                fk_probe(&fk, parent, &parent_colls, &row, &fk.ref_columns)?
+                    .map(|p| p.bytes().to_vec())
+            } else {
+                None
+            };
+            let Some(probe) = fk_probe(&fk, parent, &parent_colls, &row, &fk.columns)? else {
+                continue;
+            };
+            if supplied.as_deref() == Some(probe.bytes()) {
+                continue;
+            }
+            self.validate_insert_fk_stored(&relation, &fk, &probe)?;
+        }
+
+        let exclusions: Vec<ExclusionConstraint> = self
+            .table(table)
+            .map(|t| t.exclusions.clone())
+            .unwrap_or_default();
+        if !exclusions.is_empty() {
+            let tcols: Vec<Column> = self
+                .table(table)
+                .map(|t| t.columns.clone())
+                .unwrap_or_default();
+            for exc in &exclusions {
+                let ikey = exc.index.to_ascii_lowercase();
+                if self.insert_exclusion_conflicts_stored(&tcols, exc, &row, &ikey) {
+                    return Err(EngineError::exclusion_violation(&relation, &exc.name));
+                }
+            }
+        }
+
+        meter.charge(COSTS.value_compress * cunits);
+        meter.guard()?;
+
+        let returned = match returning {
+            Some(nodes) => {
+                Some(self.project_returning(nodes, &[&row], None, params, ctes, meter)?)
+            }
+            None => None,
+        };
+
+        let key = match key {
+            Some(key) => key,
+            None => {
+                let rowid = self.store_mut_scoped(db_scope, table).alloc_rowid();
+                encode_int(ScalarType::Int64, rowid)
+            }
+        };
+        for entries in &mut index_entries {
+            for entry in entries {
+                entry.extend_from_slice(&key);
+            }
+        }
+        if !self.store_mut_scoped(db_scope, table).insert(key, row)? {
+            return Err(EngineError::unique_violation(
+                &relation,
+                format!("{}_pkey", relation.to_ascii_lowercase()),
+            ));
+        }
+        for (def, entries) in indexes.iter().zip(index_entries) {
+            let istore = self.index_store_mut_scoped(db_scope, &def.name.to_ascii_lowercase());
+            for entry in entries {
+                if !istore.insert(entry, Vec::new())? {
                     return Err(EngineError::unique_violation(&relation, &def.name));
                 }
             }
@@ -1391,6 +1611,38 @@ impl Engine {
             }
         }
         Ok((affected, returned))
+    }
+
+    /// Complete one INSERT child-side FK check after the caller has handled this statement's
+    /// end-state match. Shared by the batch and one-row paths so the stored-probe violation stays
+    /// identical (constraints.md §6.4/§7).
+    fn validate_insert_fk_stored(
+        &self,
+        relation: &str,
+        fk: &ForeignKeyConstraint,
+        probe: &FkProbe,
+    ) -> Result<()> {
+        if !self.fk_probe_hits(probe, &fk.ref_table)? {
+            return Err(EngineError::fk_violation_insert(relation, &fk.name));
+        }
+        Ok(())
+    }
+
+    /// Test one candidate against the resident rows for an exclusion constraint. Batch-only
+    /// pairwise end-state checks remain in the batch caller; this stored probe is common to both
+    /// INSERT paths (gist.md §7, constraints.md §7).
+    fn insert_exclusion_conflicts_stored(
+        &self,
+        columns: &[Column],
+        exc: &ExclusionConstraint,
+        row: &Row,
+        index_key: &str,
+    ) -> bool {
+        let Some((query, strats)) = exclusion_probe_query(columns, exc, row) else {
+            return false;
+        };
+        self.gist_tree(index_key)
+            .is_some_and(|tree| !tree.search(&query, &strats).0.is_empty())
     }
 
     /// Evaluate the table's CHECK constraints on one candidate row (constraints.md §4.4): TRUE

@@ -7,6 +7,10 @@ import (
 	"strings"
 )
 
+func singleValuesInsertEligible(candidateCount int, hasConflict bool) bool {
+	return candidateCount == 1 && !hasConflict
+}
+
 // Row mutation — INSERT / UPDATE / DELETE and ON CONFLICT (spec/design/constraints.md, upsert.md).
 // This file holds secondary-index entry encoding (indexEntryKey/indexPrefixKey/gistEntries/ginEntries,
 // exclusion-constraint probing), the ON CONFLICT arbiter and conflict plan (resolveArbiter/
@@ -1060,7 +1064,13 @@ func (db *engine) executeInsert(ins *insert, params []Value, ctx cteCtx) (outcom
 	// above) resolving each slot: a literal, a bound $N, or a DEFAULT keyword → that column's
 	// default (a constant, or its expression evaluated for this row through the shared stmtRng).
 	// The shared insertRows then builds the declaration-order row and applies OMITTED defaults.
-	rows := make([][]Value, 0, len(ins.Rows))
+	useSingle := singleValuesInsertEligible(len(ins.Rows), cplan != nil)
+	var singleValues []Value
+	rowCap := len(ins.Rows)
+	if useSingle {
+		rowCap = 0
+	}
+	rows := make([][]Value, 0, rowCap)
 	for _, values := range ins.Rows {
 		rv := make([]Value, arity)
 		for i, col := range table.Columns {
@@ -1104,7 +1114,11 @@ func (db *engine) executeInsert(ins *insert, params []Value, ctx cteCtx) (outcom
 				}
 			}
 		}
-		rows = append(rows, rv)
+		if useSingle {
+			singleValues = rv
+		} else {
+			rows = append(rows, rv)
+		}
 	}
 	// Uncorrelated subqueries in the RETURNING list fold once (cost.md §3), reading the
 	// pre-statement snapshot (grammar.md §32). They see the statement's CTE bindings via ctx.
@@ -1116,7 +1130,14 @@ func (db *engine) executeInsert(ins *insert, params []Value, ctx cteCtx) (outcom
 	if err := db.foldConflictPlan(cplan, bound, &meter.Accrued); err != nil {
 		return outcome{}, err
 	}
-	affected, returned, err := db.runInsertRows(table, store, ins.DB, pk, checks, defaultExprs, stmtRng, provided, rows, cplan, retNodes, bound, ctx, meter)
+	var affected int64
+	var returned [][]Value
+	if useSingle {
+		returned, err = db.insertOne(table, store, ins.DB, pk, checks, defaultExprs, stmtRng, provided, singleValues, retNodes, bound, ctx, meter)
+		affected = 1
+	} else {
+		affected, returned, err = db.runInsertRows(table, store, ins.DB, pk, checks, defaultExprs, stmtRng, provided, rows, cplan, retNodes, bound, ctx, meter)
+	}
 	if err != nil {
 		return outcome{}, err
 	}
@@ -1336,12 +1357,8 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 			if _, inBatch := batch[string(probe.bytes)]; inBatch {
 				continue
 			}
-			hit, err := db.fkProbeHits(probe, fk.RefTable)
-			if err != nil {
+			if err := db.validateInsertFKStored(relation, fk, probe); err != nil {
 				return nil, err
-			}
-			if !hit {
-				return nil, newFKViolationInsert(relation, fk.Name)
 			}
 		}
 	}
@@ -1354,18 +1371,8 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 	if len(table.Exclusions) > 0 {
 		tcols := table.Columns
 		for _, exc := range table.Exclusions {
-			ikey := strings.ToLower(exc.Index)
 			for _, pr := range prepared {
-				q, strats, ok := exclusionProbeQuery(tcols, exc, pr.row)
-				if !ok {
-					continue // exempt
-				}
-				conflict := false
-				if tree := db.readSnap().gistTreeFor(ikey); tree != nil {
-					hits, _, _ := tree.search(q, strats)
-					conflict = len(hits) > 0
-				}
-				if conflict {
+				if db.insertExclusionConflictsStored(tcols, exc, pr.row) {
 					return nil, newExclusionViolation(table.Name, exc.Name)
 				}
 			}
@@ -1445,6 +1452,203 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 		}
 	}
 	return returned, nil
+}
+
+// insertOne is the plain one-candidate INSERT ... VALUES specialization. It retains the general
+// path's validation and write order (constraints.md §7) but needs no within-batch maps, stringified
+// byte keys, prepared-row slice, or per-index write buffers.
+func (db *engine) insertOne(table *catTable, store *tableStore, dbScope *string, pk []int, checks []namedCheck, defaultExprs []*rExpr, rng *stmtRng, provided []int, values []Value, returning []*rExpr, params []Value, ctes cteCtx, meter *costMeter) ([][]Value, error) {
+	n := len(table.Columns)
+	colls := db.columnCollations(table.Columns)
+	rindexes, err := db.resolveTableIndexes(table)
+	if err != nil {
+		return nil, err
+	}
+	env := &evalEnv{exec: db, rng: rng}
+
+	row := make(storedRow, n)
+	for i, col := range table.Columns {
+		var candidate Value
+		if p := provided[i]; p >= 0 {
+			candidate = values[p]
+		} else {
+			candidate, err = db.evalDefault(col, defaultExprs[i], rng, meter)
+			if err != nil {
+				return nil, err
+			}
+		}
+		row[i], err = coerceForStore(candidate, store.colTypes[i], col.Decimal, col.VarcharLen, col.NotNull, col.Name)
+		if err != nil {
+			return nil, stampTable(err, table.Name)
+		}
+	}
+
+	if len(checks) > 0 {
+		if err := meter.Guard(); err != nil {
+			return nil, err
+		}
+		if err := evalChecks(checks, table.Name, row, env, meter); err != nil {
+			return nil, err
+		}
+	}
+
+	var key []byte
+	if len(pk) > 0 {
+		key, err = encodePkKey(table, pk, colls, row)
+		if err != nil {
+			return nil, err
+		}
+		if _, exists, err := db.lkpStoreScoped(dbScope, table.Name).Get(key); err != nil {
+			return nil, err
+		} else if exists {
+			return nil, newUniqueViolation(table.Name, pkeyName(table.Name))
+		}
+	}
+
+	for i := range rindexes {
+		rindex := &rindexes[i]
+		if !rindex.Unique {
+			continue
+		}
+		prefix, ok, err := indexPrefixKey(table.Columns, colls, rindex, row, env)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
+		stored, err := db.lkpIndexStoreScoped(dbScope, strings.ToLower(rindex.Name)).RangeEntries(uniqueProbeBound(prefix))
+		if err != nil {
+			return nil, err
+		}
+		if len(stored) > 0 {
+			return nil, newUniqueViolation(table.Name, rindex.Name)
+		}
+	}
+
+	kb := key
+	var placeholder [8]byte
+	if kb == nil {
+		kb = placeholder[:]
+	}
+	cunits := int64(store.WriteCompressUnits(kb, row))
+
+	// One group per index remains necessary because one GIN row can produce several entries. The
+	// batch-only outer row dimension is gone, and these owned prefixes become final entries in place.
+	indexEntries := make([][][]byte, len(rindexes))
+	for i := range rindexes {
+		indexEntries[i], err = indexEntryKeys(table.Columns, colls, &rindexes[i], nil, row, env)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	relation := table.Name
+	for fki := range table.ForeignKeys {
+		fk := &table.ForeignKeys[fki]
+		parent, ok := db.Table(fk.RefTable)
+		if !ok {
+			continue
+		}
+		parentColls := db.columnCollations(parent.Columns)
+		var supplied fkProbe
+		suppliedOK := false
+		if strings.EqualFold(fk.RefTable, relation) {
+			supplied, suppliedOK, err = buildFkProbe(fk, parent, parentColls, row, fk.RefColumns)
+			if err != nil {
+				return nil, err
+			}
+		}
+		probe, probeOK, err := buildFkProbe(fk, parent, parentColls, row, fk.Columns)
+		if err != nil {
+			return nil, err
+		}
+		if !probeOK {
+			continue
+		}
+		if suppliedOK && bytes.Equal(supplied.bytes, probe.bytes) {
+			continue
+		}
+		if err := db.validateInsertFKStored(relation, fk, probe); err != nil {
+			return nil, err
+		}
+	}
+
+	for _, exc := range table.Exclusions {
+		if db.insertExclusionConflictsStored(table.Columns, exc, row) {
+			return nil, newExclusionViolation(table.Name, exc.Name)
+		}
+	}
+
+	meter.Charge(costs.ValueCompress * cunits)
+	if err := meter.Guard(); err != nil {
+		return nil, err
+	}
+
+	var returned [][]Value
+	if returning != nil {
+		returned, err = db.projectReturning(returning, []storedRow{row}, nil, params, ctes, meter)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if key == nil {
+		key = encodeInt(scalarInt64, store.AllocRowid())
+	}
+	for i := range indexEntries {
+		for j := range indexEntries[i] {
+			indexEntries[i][j] = append(indexEntries[i][j], key...)
+		}
+	}
+	inserted, err := store.Insert(key, row)
+	if err != nil {
+		return nil, err
+	}
+	if !inserted {
+		return nil, newUniqueViolation(table.Name, pkeyName(table.Name))
+	}
+	for i, def := range table.Indexes {
+		istore := db.writeIndexStoreScoped(dbScope, strings.ToLower(def.Name))
+		for _, entry := range indexEntries[i] {
+			inserted, err := istore.Insert(entry, nil)
+			if err != nil {
+				return nil, err
+			}
+			if !inserted {
+				return nil, newUniqueViolation(table.Name, def.Name)
+			}
+		}
+	}
+	return returned, nil
+}
+
+// validateInsertFKStored completes one child-side FK check after the caller handles the statement
+// end-state match. The batch and one-row paths share the stored probe and violation construction.
+func (db *engine) validateInsertFKStored(relation string, fk *foreignKey, probe fkProbe) error {
+	hit, err := db.fkProbeHits(probe, fk.RefTable)
+	if err != nil {
+		return err
+	}
+	if !hit {
+		return newFKViolationInsert(relation, fk.Name)
+	}
+	return nil
+}
+
+// insertExclusionConflictsStored probes the resident GiST rows for one candidate. The batch caller
+// separately retains its pairwise end-state pass; the stored-row semantics are shared.
+func (db *engine) insertExclusionConflictsStored(columns []catColumn, exc exclusionConstraint, row storedRow) bool {
+	query, strats, ok := exclusionProbeQuery(columns, exc, row)
+	if !ok {
+		return false
+	}
+	tree := db.readSnap().gistTreeFor(strings.ToLower(exc.Index))
+	if tree == nil {
+		return false
+	}
+	hits, _, _ := tree.search(query, strats)
+	return len(hits) > 0
 }
 
 // foldConflictPlan folds globally-uncorrelated subqueries in a DO UPDATE's SET/WHERE once (their

@@ -149,9 +149,11 @@ test("streaming cursor pins its snapshot and watermark", () => {
     assert.equal(first.value[0]!.kind === "int" ? first.value[0]!.int : -1n, 1n);
     assert.equal(db.oldestLiveTxid(), 1n, "open cursor pins its version");
 
-    // A concurrent writer commits two more rows (version 2) while the cursor is open.
+    // A concurrent writer repeatedly rebuilds the same rightmost working leaf while the cursor is
+    // open. This is the focused committed-root alias guard for insert-transient work: the pinned root
+    // must remain byte/value-stable through every mutation, then a fresh reader must see them.
     const w = db.writeSession();
-    w.execute("INSERT INTO t VALUES (4, 40), (5, 50)");
+    for (let id = 4; id <= 67; id++) w.execute(`INSERT INTO t VALUES (${id}, ${id * 10})`);
     w.commit();
     assert.equal(db.version, 2n);
     assert.equal(db.oldestLiveTxid(), 1n, "watermark held at the cursor's pin");
@@ -169,9 +171,45 @@ test("streaming cursor pins its snapshot and watermark", () => {
     assert.equal(db.oldestLiveTxid(), 2n, "closed cursor releases its pin");
 
     const fresh = streamResult(reader, "SELECT id FROM t ORDER BY id");
-    assert.equal(fresh.rows.length, 5, "a fresh read sees the writer's rows");
+    assert.equal(fresh.rows.length, 67, "a fresh read sees every committed row");
+    assert.deepEqual(fresh.rows[0], [intValue(1n)]);
+    assert.deepEqual(fresh.rows[66], [intValue(67n)]);
   } finally {
     reader.close();
+  }
+});
+
+// A cursor opened inside a write transaction owns its working root. Later writes through the same
+// session remain visible to later statements but never leak into the open cursor.
+test("write-transaction cursor is stable across later inserts", () => {
+  const db = seededKV(3);
+  const writer = db.session();
+  try {
+    writer.begin(true);
+    writer.execute("INSERT INTO t VALUES (4, 40)");
+    const pinned = writer.query("SELECT id FROM t ORDER BY id");
+    const it = pinned[Symbol.iterator]();
+    assert.deepEqual(it.next().value, [intValue(1n)]);
+    for (let id = 5; id <= 67; id++) writer.execute(`INSERT INTO t VALUES (${id}, ${id * 10})`);
+
+    assert.deepEqual(eagerResult(writer, "SELECT count(*) FROM t").rows, [[intValue(67n)]]);
+    const rest: bigint[] = [];
+    for (let next = it.next(); !next.done; next = it.next()) {
+      const value = next.value[0]!;
+      if (value.kind === "int") rest.push(value.int);
+    }
+    assert.deepEqual(rest, [2n, 3n, 4n], "cursor stays frozen at its open-time working root");
+    pinned.close();
+    writer.commit();
+
+    const fresh = db.session();
+    try {
+      assert.deepEqual(eagerResult(fresh, "SELECT count(*) FROM t").rows, [[intValue(67n)]]);
+    } finally {
+      fresh.close();
+    }
+  } finally {
+    writer.close();
   }
 });
 

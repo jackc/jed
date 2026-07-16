@@ -84,10 +84,14 @@ func (e *engine) Close() error {
 	if e.sess != nil {
 		e.sess.Close()
 	}
+	var err error
+	if e.db != nil {
+		err = e.db.Close()
+	}
 	if e.scratch != "" {
 		os.RemoveAll(e.scratch)
 	}
-	return nil
+	return err
 }
 
 func (e *engine) Prepare(sql string) (bench.Stmt, error) {
@@ -142,24 +146,19 @@ func (s *jedStmt) Query(args []any, sum *bench.Checksum) (int, error) {
 
 func (s *jedStmt) Close() error { return nil }
 
-// NewReaderPool opens a Database over the dataset file and mints n reader Sessions — the
-// slice-7 concurrent-session path (spec/design/benchmarks.md §8.1). Each Session shares
-// the one Database's committed snapshot + buffer pool and reads without blocking (§3), so
-// the concurrent_read bench measures how the lock-free read path scales with readers.
+// NewReaderPool mints n reader Sessions from the Database already opened for this run — the
+// slice-7 concurrent-session path (spec/design/benchmarks.md §8.1). Each Session shares the one
+// Database's committed snapshot + buffer pool and reads without blocking (§3), so the
+// concurrent_read bench measures how the lock-free read path scales with readers.
 func (e *engine) NewReaderPool(n int) (bench.ReaderPool, error) {
-	db, err := jed.OpenDatabase(filepath.Join(e.dataDir, e.dataset+".jed"))
-	if err != nil {
-		return nil, err
-	}
 	readers := make([]*jed.Session, n)
 	for i := range readers {
-		readers[i] = db.ReadSession()
+		readers[i] = e.db.ReadSession()
 	}
-	return &jedPool{db: db, readers: readers}, nil
+	return &jedPool{readers: readers}, nil
 }
 
 type jedPool struct {
-	db      *jed.Database
 	readers []*jed.Session
 }
 
@@ -169,7 +168,7 @@ func (p *jedPool) Close() error {
 	for _, s := range p.readers {
 		s.Close()
 	}
-	return p.db.Close()
+	return nil
 }
 
 // jedReader runs one query through a reader Session, re-parsing the SQL each call — deliberate

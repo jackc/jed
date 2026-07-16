@@ -208,6 +208,13 @@ func TestPMapCloneIsIndependentSnapshot(t *testing.T) {
 		base.Insert(pmKey(k), pmRow(int64(k)), pmW, pmCap, pmShape, nil)
 	}
 	snap := base // an O(1) value-copy snapshot
+	// Capture the complete encoded-key/value sequence before the working copy starts changing.
+	// Equality after the churn below is the byte/value alias guard for transient mutation work: an
+	// unsafe in-place edit of a shared leaf must make this test fail.
+	snapKeysBefore, snapValsBefore, err := snap.inorder(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Mutate a separate copy heavily; the snapshot must be untouched.
 	other := base
@@ -229,6 +236,13 @@ func TestPMapCloneIsIndependentSnapshot(t *testing.T) {
 		if !reflect.DeepEqual(got, pmRow(int64(k))) {
 			t.Fatalf("snapshot mutated at %d", k)
 		}
+	}
+	snapKeysAfter, snapValsAfter, err := snap.inorder(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(snapKeysAfter, snapKeysBefore) || !reflect.DeepEqual(snapValsAfter, snapValsBefore) {
+		t.Fatal("pinned key/value bytes changed")
 	}
 	pmCheckInvariants(t, &snap)
 	if pmLen(t, &other) != 2500 {

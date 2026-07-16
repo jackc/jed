@@ -11,6 +11,7 @@ package jed
 // impl/rust/tests/split_shape.rs and impl/ts/tests/split_shape.test.ts.
 
 import (
+	"bytes"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -63,5 +64,36 @@ func TestSplitShapeCostsArePinned(t *testing.T) {
 	// (interior records could terminate a v23 descent early), so each of the 17 table
 	// fetches pays the full root→leaf path.
 	pin(shuf, "CREATE INDEX t_v_idx ON t (v)", 143)
+	pin(shuf, "SELECT id FROM t WHERE v = 3", 105)
+
+	// The complete INSERT mutation guard: the committed shape above already contains table-leaf and
+	// table-interior splits plus a split secondary index. In one working root, overwrite an existing
+	// table row/index entry, append enough rows to split both trees again, and pin the resulting exact
+	// node counts through cost. Rollback must restore the byte-exact committed image and original costs.
+	before, err := shuf.ToImage(256, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := shuf.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	siRun(t, shuf, "UPDATE t SET v = 42 WHERE id = 120")
+	for id := 121; id <= 220; id++ {
+		siRun(t, shuf, fmt.Sprintf("INSERT INTO t VALUES (%d, %d)", id, id%7))
+	}
+	pin(shuf, "SELECT count(*) FROM t", 477)
+	pin(shuf, "SELECT id FROM t WHERE v = 3", 199)
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	after, err := shuf.ToImage(256, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("rollback changed the committed image")
+	}
+	pin(shuf, "SELECT count(*) FROM t", 265)
 	pin(shuf, "SELECT id FROM t WHERE v = 3", 105)
 }

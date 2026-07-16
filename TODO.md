@@ -258,6 +258,12 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     detaches old loads and prevents stale page-id reinsertion. Focused synchronization + reader/writer
     race tests and the shared cold r1/r4 benchmark are recorded in [pager.md](spec/design/pager.md) and
     [benchmarks.md](spec/design/benchmarks.md). TypeScript remains single-threaded.
+  - [x] **INSERT guardrail + one-row execution path (slices 0–1)** — pinned immutable snapshot/cursor,
+    attachment, split/overwrite/rollback, writable-CTE collision, exact-cost, and byte-golden behavior
+    across the three cores; recorded paired attribution/allocation evidence, specified exact INSERT
+    error/write order, and removed one-row batch sets/buffers in Rust, Go, and TypeScript. Rust shared
+    remains 25.6% slower than exclusive, so prepared-INSERT caching and CoW sharing remain follow-ons. →
+    [benchmarks.md](spec/design/benchmarks.md), [temporary slice plan](TODO-insert-performance.md)
   - [ ] **Rust CoW insert deep-clone** — `node_insert` rebuilds a path node with `Vec::clone`, deep-copying every key (`Vec<Vec<u8>>`) + row where Go's `[][]byte` copy is pointer-shallow (why `insert_rollback` is rust 21.6ms vs go 10.3ms). Fix: share entry storage (`Arc<[u8]>` keys / `Arc`-shared rows). Rust-only, no byte or cost change. _(size: M)_
   - [ ] **Full-scan materialization** — `full_scan_agg` clones every row into a buffer before aggregating (143–281ms vs PG ~13ms). Streaming aggregation over the scan visitor is the contained first step; the full fix is the spill item above. _(size: M–L)_
 - [x] **Large values — overflow pages + compression (TOAST-equivalent)** — large `text`/`bytea`/`decimal`/`json` pushed out-of-line onto overflow-page chains (`format_version` 3), optionally LZ4-compressed first via a deterministic hand-rolled block codec (no third-party dep — a library fails §8 byte-identity). → [large-values.md](spec/design/large-values.md), [lz4.md](spec/fileformat/lz4.md)

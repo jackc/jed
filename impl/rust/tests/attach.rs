@@ -116,6 +116,85 @@ fn attach_lifecycle() {
     assert_eq!(err_code(&mut s3, "SELECT v FROM mydb.t"), "42P01");
 }
 
+/// Main and attached databases carry independent working roots. Pin both through write-transaction
+/// cursors, churn their rightmost leaves, and prove neither old root nor either database aliases the
+/// other's mutation state. Rollback must restore both committed roots together.
+#[test]
+fn attachment_working_roots_and_cursors_do_not_alias() {
+    let db = mem_db();
+    db.attach("work", AttachSource::memory(), false)
+        .expect("attach");
+    let mut s = db.session(SessionOptions::default());
+    exec(&mut s, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
+    exec(&mut s, "CREATE TABLE work.t (id i32 PRIMARY KEY, v i32)");
+    exec(&mut s, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)");
+    exec(
+        &mut s,
+        "INSERT INTO work.t VALUES (1, 100), (2, 200), (3, 300)",
+    );
+
+    s.begin(true).expect("begin");
+    let mut main_pin = s.query("SELECT id, v FROM t ORDER BY id", &[]).unwrap();
+    let mut work_pin = s
+        .query("SELECT id, v FROM work.t ORDER BY id", &[])
+        .unwrap();
+    assert_eq!(
+        (&mut main_pin).next(),
+        Some(vec![Value::Int(1), Value::Int(10)])
+    );
+    assert_eq!(
+        (&mut work_pin).next(),
+        Some(vec![Value::Int(1), Value::Int(100)])
+    );
+
+    for id in 4..=40 {
+        exec(&mut s, &format!("INSERT INTO t VALUES ({id}, {})", id * 10));
+        exec(
+            &mut s,
+            &format!("INSERT INTO work.t VALUES ({id}, {})", id * 100),
+        );
+    }
+    assert_eq!(query_ints(&mut s, "SELECT count(*) FROM t"), vec![40]);
+    assert_eq!(query_ints(&mut s, "SELECT count(*) FROM work.t"), vec![40]);
+
+    assert_eq!(
+        (&mut main_pin).collect::<Vec<_>>(),
+        vec![
+            vec![Value::Int(2), Value::Int(20)],
+            vec![Value::Int(3), Value::Int(30)]
+        ]
+    );
+    assert_eq!(
+        (&mut work_pin).collect::<Vec<_>>(),
+        vec![
+            vec![Value::Int(2), Value::Int(200)],
+            vec![Value::Int(3), Value::Int(300)]
+        ]
+    );
+    main_pin.error().unwrap();
+    work_pin.error().unwrap();
+    main_pin.close();
+    work_pin.close();
+    drop(main_pin);
+    drop(work_pin);
+
+    s.rollback().expect("rollback");
+    let mut fresh = db.session(SessionOptions::default());
+    assert_eq!(query_ints(&mut fresh, "SELECT count(*) FROM t"), vec![3]);
+    assert_eq!(
+        query_ints(&mut fresh, "SELECT count(*) FROM work.t"),
+        vec![3]
+    );
+    assert_eq!(
+        query_ints(&mut fresh, "SELECT v FROM t WHERE id = 3"),
+        vec![30]
+    );
+    assert_eq!(
+        query_ints(&mut fresh, "SELECT v FROM work.t WHERE id = 3"),
+        vec![300]
+    );
+}
+
 /// A read-only attachment rejects every write (DML + DDL) with 25006 before any I/O (§4), while a
 /// bare/main write is unaffected.
 #[test]

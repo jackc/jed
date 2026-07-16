@@ -181,6 +181,10 @@ test("pmap: clone is an independent snapshot", () => {
   const base = new PMap();
   for (let k = 0; k < 2000; k++) base.insert(key(k), row(k), W, CAP, SHAPE, null);
   const snap = base.clone();
+  // Capture the complete encoded-key/value sequence before the working clone starts changing.
+  // Equality after the churn below is the byte/value alias guard for transient mutation work: an
+  // unsafe in-place edit of a shared leaf must make this test fail.
+  const snapBefore = snap.inorder(null);
 
   // Mutate a separate clone heavily; the snapshot must be untouched.
   const other = base.clone();
@@ -190,6 +194,7 @@ test("pmap: clone is an independent snapshot", () => {
 
   assert.equal(pmCount(snap), 2000);
   for (let k = 0; k < 2000; k++) assert.deepEqual(snap.get(key(k), null), row(k));
+  assert.deepEqual(snap.inorder(null), snapBefore, "pinned key/value bytes changed");
   checkInvariants(snap);
   assert.equal(pmCount(other), 2500);
   assert.equal(other.get(key(0), null), undefined);
