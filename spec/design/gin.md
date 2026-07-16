@@ -194,11 +194,11 @@ generalized from **one** entry per row to **a set**:
 - **INSERT**: after a row is stored, insert the opclass's extracted entries (zero or more)
   into the index.
 - **DELETE**: after a row is removed, remove its entries.
-- **UPDATE**: compute the old and new **term sets**; if they differ, remove the old
-  entries and insert the new — if equal (the update did not change the indexed array's
-  element set), leave the tree untouched (the same byte-identical-dirty-set rule as an
-  ordered index). The row's storage key cannot change (the PK-assignment narrowing,
-  CLAUDE.md §11 step 6), so suffixes are stable.
+- **UPDATE**: compute the old and new **entry sets** (`term ‖ storage_key`) and apply
+  the set difference — shared entries stay untouched (the same byte-identical-dirty-set
+  rule as an ordered index). Changing only the indexed array moves entries for terms that
+  enter or leave its element set; assigning a primary-key member re-keys the row and moves
+  every entry because every storage-key suffix changes (CLAUDE.md §11 step 6).
 - **CREATE INDEX on a non-empty table** scans the table once (cost: §6), extracts every
   row's term entries, and inserts them **sorted by entry key** — ascending inserts pack the
   built tree's leaves the same way the ordered build does. The sort over the full

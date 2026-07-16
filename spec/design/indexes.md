@@ -184,11 +184,12 @@ phase 1 recomputes identically, so phase 2's tree edits still cannot fail:
 - **DELETE**: after a row is removed, remove its entries.
 - **UPDATE**: for each rewritten row, compute the old and new entry keys; if they
   **differ**, remove the old and insert the new — if they are **equal** (the update did
-  not touch this index's columns), leave the tree node untouched. The skip is part of
-  the contract, not an optimization detail: it keeps the copy-on-write dirty set — and
-  therefore the incremental commit's written pages — byte-identical across cores
-  (CLAUDE.md §8). The row's storage key cannot change (the PK-assignment narrowing,
-  CLAUDE.md §11 step 6), so the suffix is stable.
+  not change either the indexed value or the row's storage key), leave the tree node
+  untouched. The skip is part of the contract, not an optimization detail: it keeps the
+  copy-on-write dirty set — and therefore the incremental commit's written pages —
+  byte-identical across cores (CLAUDE.md §8). Assigning a primary-key member **re-keys**
+  the row, so every index entry for that row moves even when its indexed value is unchanged:
+  the storage-key suffix changed (CLAUDE.md §11 step 6).
 - **CREATE INDEX on a non-empty table** builds the index by scanning the table once in
   key order (cost: §5), **evaluating each expression key per row** (a failure aborts the
   build before the index is registered — nothing is created, matching PG), then inserting
@@ -449,8 +450,10 @@ value enters the probe exactly like a column value. Enforcement:
   does not conflict). So `UPDATE t SET v = v + 1` and a two-row value *swap* both
   succeed — the end state is unique — where PostgreSQL's per-row check fails on the
   transient collision (§7; PG's report depends on heap order, which jed has no analogue
-  of). A genuine conflict with an untouched row traps 23505 as usual. The storage key
-  cannot change (the PK-assignment narrowing), so suffixes are stable.
+  of). A genuine conflict with an untouched row traps 23505 as usual. A primary-key
+  assignment may also change the rewritten row's storage-key suffix; uniqueness remains
+  a check over the value prefix, while §4 maintenance replaces the old suffixed entry
+  with the new one.
 - **DELETE** cannot violate uniqueness; no probe.
 - **`CREATE UNIQUE INDEX` on a non-empty table** verifies the §1 build's computed
   entries pairwise (the same exempt-NULL prefix rule) before the index is registered; a
