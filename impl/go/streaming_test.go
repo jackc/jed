@@ -937,7 +937,7 @@ func preparedStreamResult(t *testing.T, s *Session, sql string, params []Value) 
 	if err != nil {
 		t.Fatalf("prepare %q: %v", sql, err)
 	}
-	rows, err := s.queryStmt(stmt.ast, params, &stmt.sc)
+	rows, err := s.queryStmt(stmt.ast, params, &stmt.sc, &stmt.ic)
 	if err != nil {
 		t.Fatalf("query prepared %q: %v", sql, err)
 	}
@@ -1016,7 +1016,7 @@ func TestPreparedQueryEarlyExitChargesLess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	full, err := s.queryStmt(stmt.ast, nil, &stmt.sc)
+	full, err := s.queryStmt(stmt.ast, nil, &stmt.sc, &stmt.ic)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1028,7 +1028,7 @@ func TestPreparedQueryEarlyExitChargesLess(t *testing.T) {
 	fullCost := full.Cost()
 	_ = full.Close()
 
-	rows, err := s.queryStmt(stmt.ast, nil, &stmt.sc)
+	rows, err := s.queryStmt(stmt.ast, nil, &stmt.sc, &stmt.ic)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1060,7 +1060,7 @@ func TestPreparedQueryPinsSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rows, err := reader.queryStmt(stmt.ast, nil, &stmt.sc)
+	rows, err := reader.queryStmt(stmt.ast, nil, &stmt.sc, &stmt.ic)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1109,7 +1109,7 @@ func TestPreparedQueryMidDrainCostAbort(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rows, err := s.queryStmt(stmt.ast, nil, &stmt.sc)
+	rows, err := s.queryStmt(stmt.ast, nil, &stmt.sc, &stmt.ic)
 	if err != nil {
 		t.Fatalf("query (build) must not abort: %v", err)
 	}

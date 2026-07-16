@@ -56,6 +56,7 @@ import {
   Snapshot,
   stmtIsWrite,
   type Outcome,
+  type InsertCacheHolder,
   type ScanCacheHolder,
   type SessionOptions,
   type TxStatus,
@@ -1040,7 +1041,7 @@ export class Session {
   // DEFERRED cursor (streaming.md §7) that defers the whole run to the first pull and yields the result
   // one row at a time; a data-modifying WITH (a write) still falls back to the materialized dispatch path.
   query(sql: string, params: Value[] = []): Rows {
-    return this.queryStmt(this.engine.parse(sql), params, null); // one-shot: no cross-call plan cache (still plans once)
+    return this.queryStmt(this.engine.parse(sql), params, null, null); // one-shot: no cross-call plan cache (still plans once)
   }
 
   // queryStmt routes an already-parsed query AST through the session's lazy lanes — the autocommit
@@ -1049,7 +1050,12 @@ export class Session {
   // write, a data-modifying WITH). Shared by query (parse-then-route, holder null) and a prepared
   // query (queryPrepared passes the statement's ScanCacheHolder), so a prepared query streams and
   // pins its snapshot exactly like an ad-hoc one but reuses its cached plan across executes.
-  private queryStmt(stmt: Statement, params: Value[], holder: ScanCacheHolder | null): Rows {
+  private queryStmt(
+    stmt: Statement,
+    params: Value[],
+    holder: ScanCacheHolder | null,
+    insertHolder: InsertCacheHolder | null,
+  ): Rows {
     // Route the read before building the lazy cursor: an autocommit (non-block, writable access) read
     // re-pins the latest committed so the snapshot is current; a read-only session uses its existing
     // pin, and an open block uses its working set.
@@ -1059,6 +1065,7 @@ export class Session {
     }
     if (this.planEpoch !== this.core.planEpoch) {
       if (holder !== null) holder.cache = null;
+      if (insertHolder !== null) insertHolder.cache = null;
       this.planEpoch = this.core.planEpoch;
     }
     // A read served by a lazy lane never reaches the materialized dispatch, so enforce the read-path
@@ -1113,7 +1120,7 @@ export class Session {
     // The dispatch fall-through handles transaction control (a nested BEGIN's 25001 must NOT poison) and
     // self-poisons on a regular statement error (executeStmtParams), so its nuanced poisoning is left
     // intact — only the lazy-lane reads above, which bypass it, are poisoned here.
-    return rowsFromOutcome(this.dispatch(stmt, params));
+    return rowsFromOutcome(this.dispatch(stmt, params, insertHolder));
   }
 
   // executeCancelable runs a statement under an AbortSignal (spec/design/api.md §11.4): if the signal
@@ -1153,7 +1160,7 @@ export class Session {
   // ad-hoc query — so a prepared query streams and pins its snapshot identically — but reuses its
   // cached plan across executes (and across sessions of one database, spec/design/api.md §2.4).
   queryPrepared(stmt: PreparedStatement, params: Value[] = []): Rows {
-    return this.queryStmt(stmt.ast, params, stmt.scHolder);
+    return this.queryStmt(stmt.ast, params, stmt.scHolder, stmt.icHolder);
   }
 
   // --- better-sqlite3-style ergonomic methods (spec/design/api.md §11): a reusable prepared
@@ -1177,7 +1184,11 @@ export class Session {
     return new ErgoStatement(this, sql).all(...params);
   }
 
-  private dispatch(stmt: Statement, params: Value[]): Outcome {
+  private dispatch(
+    stmt: Statement,
+    params: Value[],
+    insertHolder: InsertCacheHolder | null,
+  ): Outcome {
     if (this.access === "ro") {
       if (stmtIsWrite(stmt)) {
         throw engineError(
@@ -1185,7 +1196,7 @@ export class Session {
           "cannot execute a write statement against a read-only snapshot",
         );
       }
-      return this.engine.executeStmtParams(stmt, params);
+      return this.engine.executeStmtParams(stmt, params, insertHolder);
     }
     if (stmt.kind === "begin") return this.beginBlock(stmt.writable);
     if (stmt.kind === "commit") return this.endBlock(true);
@@ -1193,19 +1204,19 @@ export class Session {
     if (this.engine.session.tx !== null) {
       // Inside an open block (an eager write session, or this session after BEGIN): run on the
       // working set. The gate is already held for a writable block.
-      return this.engine.executeStmtParams(stmt, params);
+      return this.engine.executeStmtParams(stmt, params, insertHolder);
     }
     if (!stmtIsWrite(stmt)) {
       // Autocommit read: pin the latest committed for this one statement (PG-faithful); no gate.
       this.refreshCommitted();
-      return this.engine.executeStmtParams(stmt, params);
+      return this.engine.executeStmtParams(stmt, params, insertHolder);
     }
     // Autocommit write — the lazy gate (§2.4): take it (throwing 25001 if another writer is open),
     // capture the latest committed as the working base, run, publish on success, release.
     this.acquireGate();
     try {
       this.refreshCommitted();
-      const out = this.engine.executeStmtParams(stmt, params);
+      const out = this.engine.executeStmtParams(stmt, params, insertHolder);
       this.publish();
       return out;
     } finally {

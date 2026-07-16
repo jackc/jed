@@ -25,7 +25,7 @@ func queryOutcome(q valueQuerier, sql string, params []Value) (outcome, error) {
 // prepOutcome is queryOutcome for a prepared statement, run on s — a statement is a standalone
 // value; the handle passed at each execute supplies the session (spec/design/api.md §2.4).
 func prepOutcome(s *Session, p *PreparedStatement, params []Value) (outcome, error) {
-	rows, err := s.queryStmt(p.ast, params, &p.sc)
+	rows, err := s.queryStmt(p.ast, params, &p.sc, &p.ic)
 	if err != nil {
 		return outcome{}, err
 	}

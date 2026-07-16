@@ -57,6 +57,12 @@ func stmtKind(stmt statement) string {
 // dispatchStmt routes one parsed statement to its executor. The autocommit transaction handling
 // (capture / durable commit / rollback-on-error) lives in ExecuteStmtParams.
 func (db *engine) dispatchStmt(stmt statement, params []Value) (outcome, error) {
+	return db.dispatchStmtCached(stmt, params, nil, false)
+}
+
+// dispatchStmtCached is dispatchStmt with the private prepared-INSERT slot. Admission remains ahead
+// of cache lookup, so a hit cannot bypass lifetime or privilege gates (api.md §2.4).
+func (db *engine) dispatchStmtCached(stmt statement, params []Value, ic *insertStmtCache, allowInsertFill bool) (outcome, error) {
 	// Lifetime budget admission (spec/design/session.md §5.4): once the session's cumulative cost has
 	// reached lifetime_max_cost, every further statement is rejected 54P02 BEFORE it can accrue —
 	// checked ahead of privileges/existence, so an exhausted session runs nothing. A no-op when the
@@ -73,7 +79,7 @@ func (db *engine) dispatchStmt(stmt statement, params []Value) (outcome, error) 
 	if err := db.checkPrivileges(stmt); err != nil {
 		return outcome{}, err
 	}
-	out, err := db.dispatchStmtBody(stmt, params)
+	out, err := db.dispatchStmtBodyCached(stmt, params, ic, allowInsertFill)
 	// Keep each GiST index's resident R-tree current: after a statement that mutated the main image,
 	// rebuild it from the (now-updated) leaf store so the next read descends a fresh tree (gist.md
 	// §3/§4.1). A no-op for reads / temp-only writes (mainDirty unset).
@@ -98,6 +104,10 @@ func (db *engine) rebuildMainGistTreesIfDirty() error {
 }
 
 func (db *engine) dispatchStmtBody(stmt statement, params []Value) (outcome, error) {
+	return db.dispatchStmtBodyCached(stmt, params, nil, false)
+}
+
+func (db *engine) dispatchStmtBodyCached(stmt statement, params []Value, ic *insertStmtCache, allowInsertFill bool) (outcome, error) {
 	switch {
 	case stmt.Analyze != nil:
 		if err := rejectParamsForDDL(params); err != nil {
@@ -155,7 +165,7 @@ func (db *engine) dispatchStmtBody(stmt statement, params []Value) (outcome, err
 		}
 		return db.executeDropSequence(stmt.DropSequence)
 	case stmt.Insert != nil:
-		return db.executeInsert(stmt.Insert, params, cteCtx{})
+		return db.executeInsertCached(stmt.Insert, params, cteCtx{}, ic, allowInsertFill)
 	case stmt.Select != nil:
 		return db.executeSelect(stmt.Select, params)
 	case stmt.SetOp != nil:
@@ -1202,13 +1212,17 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 // Cannot fail for a catalog produced by CREATE TABLE or a well-formed file (both
 // validated); a hand-corrupted expression surfaces its natural resolve error.
 func (db *engine) resolveChecks(table *catTable) ([]namedCheck, error) {
+	return db.resolveChecksWithParams(table, &paramTypes{})
+}
+
+func (db *engine) resolveChecksWithParams(table *catTable, ptypes *paramTypes) ([]namedCheck, error) {
 	if len(table.Checks) == 0 {
 		return nil, nil
 	}
 	s := singleScope(db, table)
 	out := make([]namedCheck, 0, len(table.Checks))
 	for i := range table.Checks {
-		node, _, err := resolve(s, table.Checks[i].Expr, nil, &aggCtx{collecting: false}, &paramTypes{})
+		node, _, err := resolve(s, table.Checks[i].Expr, nil, &aggCtx{collecting: false}, ptypes)
 		if err != nil {
 			return nil, err
 		}
@@ -1224,6 +1238,10 @@ func (db *engine) resolveChecks(table *catTable) ([]namedCheck, error) {
 // default or no default. The default resolves against an EMPTY scope (no columns; a column
 // reference was rejected 0A000 at CREATE TABLE) with the column's type as the operand hint.
 func (db *engine) resolveDefaultExprs(table *catTable) ([]*rExpr, error) {
+	return db.resolveDefaultExprsWithParams(table, &paramTypes{})
+}
+
+func (db *engine) resolveDefaultExprsWithParams(table *catTable, ptypes *paramTypes) ([]*rExpr, error) {
 	out := make([]*rExpr, len(table.Columns))
 	for i := range table.Columns {
 		de := table.Columns[i].DefaultExpr
@@ -1231,7 +1249,7 @@ func (db *engine) resolveDefaultExprs(table *catTable) ([]*rExpr, error) {
 			continue
 		}
 		colScalar := table.Columns[i].Type.ScalarTy()
-		node, _, err := resolve(emptyScope(db), de.Expr, &colScalar, &aggCtx{collecting: false}, &paramTypes{})
+		node, _, err := resolve(emptyScope(db), de.Expr, &colScalar, &aggCtx{collecting: false}, ptypes)
 		if err != nil {
 			return nil, err
 		}
@@ -1247,6 +1265,10 @@ func (db *engine) resolveDefaultExprs(table *catTable) ([]*rExpr, error) {
 // cannot newly fail (an aggregate/window/subquery/param was rejected then, and re-resolving with a
 // non-collecting aggCtx is inert). Returns an owned resolvedIndex.
 func (db *engine) resolveIndex(table *catTable, def indexDef) (resolvedIndex, error) {
+	return db.resolveIndexWithParams(table, def, &paramTypes{})
+}
+
+func (db *engine) resolveIndexWithParams(table *catTable, def indexDef, ptypes *paramTypes) (resolvedIndex, error) {
 	keys := make([]resolvedKey, 0, len(def.Keys))
 	for _, k := range def.Keys {
 		if k.Expr == nil {
@@ -1254,7 +1276,7 @@ func (db *engine) resolveIndex(table *catTable, def indexDef) (resolvedIndex, er
 			continue
 		}
 		s := singleScope(db, table)
-		node, rtype, err := resolve(s, k.Expr.Expr, nil, &aggCtx{collecting: false}, &paramTypes{})
+		node, rtype, err := resolve(s, k.Expr.Expr, nil, &aggCtx{collecting: false}, ptypes)
 		if err != nil {
 			return resolvedIndex{}, err
 		}
@@ -1277,7 +1299,7 @@ func (db *engine) resolveIndex(table *catTable, def indexDef) (resolvedIndex, er
 	var predicate *rExpr
 	if def.Predicate != nil {
 		s := singleScope(db, table)
-		node, err := resolveBooleanFilter(s, &def.Predicate.Expr, &paramTypes{})
+		node, err := resolveBooleanFilter(s, &def.Predicate.Expr, ptypes)
 		if err != nil {
 			return resolvedIndex{}, err
 		}
@@ -1289,9 +1311,13 @@ func (db *engine) resolveIndex(table *catTable, def indexDef) (resolvedIndex, er
 // resolveTableIndexes resolves every index of a table once per statement (the maintenance driver —
 // INSERT / UPDATE / DELETE build their resolvedIndex list up front, parallel to table.Indexes).
 func (db *engine) resolveTableIndexes(table *catTable) ([]resolvedIndex, error) {
+	return db.resolveTableIndexesWithParams(table, &paramTypes{})
+}
+
+func (db *engine) resolveTableIndexesWithParams(table *catTable, ptypes *paramTypes) ([]resolvedIndex, error) {
 	out := make([]resolvedIndex, 0, len(table.Indexes))
 	for _, def := range table.Indexes {
-		ri, err := db.resolveIndex(table, def)
+		ri, err := db.resolveIndexWithParams(table, def, ptypes)
 		if err != nil {
 			return nil, err
 		}

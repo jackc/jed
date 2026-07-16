@@ -7,12 +7,26 @@
 // never cached.
 
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
-import { Engine, execute, intValue, prepare, queryPrepared } from "../src/tooling.ts";
+import {
+  Engine,
+  EngineError,
+  execute,
+  intValue,
+  loadUnicodeData,
+  prepare,
+  PrivilegeSet,
+  queryPrepared,
+  toImage,
+} from "../src/tooling.ts";
+import { loadedCollation } from "../src/collation.ts";
 import { attachMemory } from "../src/shared.ts";
 import { ExplainRender } from "../src/scope.ts";
 import type { Value } from "../src/value.ts";
+import { textValue } from "../src/value.ts";
 import { memDb } from "./mem_db.ts";
+import { specPath } from "./tomlmini.ts";
 
 type PreparedLike = ReturnType<typeof prepare>;
 
@@ -30,6 +44,26 @@ function cacheOf(
       };
     }
   ).scHolder.cache;
+}
+
+function insertCacheOf(
+  stmt: PreparedLike,
+): { plan: unknown; signature: { catGen: bigint } } | null {
+  return (
+    stmt as unknown as {
+      icHolder: { cache: { plan: unknown; signature: { catGen: bigint } } | null };
+    }
+  ).icHolder.cache;
+}
+
+function caught(fn: () => unknown): { code: string; message: string } {
+  try {
+    fn();
+  } catch (e) {
+    if (e instanceof EngineError) return { code: e.code(), message: e.message };
+    throw e;
+  }
+  throw new Error("expected EngineError");
 }
 
 function drain(
@@ -87,6 +121,214 @@ test("plan cache: point lookup reuses the plan, cost-identical", () => {
 
   // A no-match param.
   assert.deepEqual(drain(db, stmt, [intValue(999n)]).rows, []);
+});
+
+test("insert cache: estimator revisions do not invalidate the immutable plan", () => {
+  const db = new Engine();
+  execute(db, "CREATE TABLE ins (id i32 PRIMARY KEY, v i32)");
+  const stmt = prepare(db, "INSERT INTO ins VALUES ($1, $2) RETURNING id, v");
+
+  const first = drain(db, stmt, [intValue(1n), intValue(10n)]);
+  assert.deepEqual(first.rows, [[intValue(1n), intValue(10n)]]);
+  const cached = insertCacheOf(stmt);
+  assert.notEqual(cached, null);
+  const plan = cached!.plan;
+
+  const second = drain(db, stmt, [intValue(2n), intValue(20n)]);
+  assert.deepEqual(second.rows, [[intValue(2n), intValue(20n)]]);
+  assert.equal(insertCacheOf(stmt)!.plan, plan, "successful INSERT revision caused a re-plan");
+  assert.equal(second.cost, first.cost);
+});
+
+test("insert cache: row-only transaction fills then hits", () => {
+  const db = new Engine();
+  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
+  const stmt = prepare(db, "INSERT INTO t VALUES ($1, $2)");
+  execute(db, "BEGIN");
+  drain(db, stmt, [intValue(1n), intValue(10n)]);
+  const plan = insertCacheOf(stmt)!.plan;
+  drain(db, stmt, [intValue(2n), intValue(20n)]);
+  assert.equal(insertCacheOf(stmt)!.plan, plan);
+  execute(db, "ROLLBACK");
+});
+
+test("insert cache: Transaction.executePrepared fills then hits", () => {
+  const db = memDb();
+  db.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
+  const stmt = db.prepareStatement("INSERT INTO t VALUES ($1, $2)");
+  const session = db.session({});
+
+  session.update((tx) => {
+    tx.executePrepared(stmt, [intValue(1n), intValue(10n)]);
+    const plan = insertCacheOf(stmt)!.plan;
+    tx.executePrepared(stmt, [intValue(2n), intValue(20n)]);
+    assert.equal(insertCacheOf(stmt)!.plan, plan);
+  });
+
+  session.close();
+  db.close();
+});
+
+test("insert cache: mutable and complex shapes remain uncached", () => {
+  const db = new Engine();
+  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, note text)");
+  const regex = prepare(db, "INSERT INTO t VALUES ($1, $2) RETURNING note ~ 'a'");
+  const first = drain(db, regex, [intValue(1n), textValue("abc")]);
+  const second = drain(db, regex, [intValue(2n), textValue("abd")]);
+  assert.equal(insertCacheOf(regex), null);
+  assert.equal(first.cost, second.cost);
+
+  const subquery = prepare(db, "INSERT INTO t VALUES ($1, $2) RETURNING (SELECT max(id) FROM t)");
+  drain(db, subquery, [intValue(3n), textValue("x")]);
+  assert.equal(insertCacheOf(subquery), null);
+
+  for (const sql of [
+    "INSERT INTO t SELECT 4, 'select'",
+    "INSERT INTO t VALUES (4, 'conflict') ON CONFLICT DO NOTHING",
+  ]) {
+    const stmt = prepare(db, sql);
+    drain(db, stmt);
+    assert.equal(insertCacheOf(stmt), null, sql);
+  }
+});
+
+test("insert cache: catalog, database, attachment, and temp identities invalidate", () => {
+  const db = new Engine();
+  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
+  const stmt = prepare(db, "INSERT INTO t VALUES ($1, $2)");
+  drain(db, stmt, [intValue(1n), intValue(10n)]);
+  let plan = insertCacheOf(stmt)!.plan;
+
+  // The documented database-wide catGen policy deliberately misses on unrelated DDL.
+  execute(db, "CREATE TABLE unrelated (id i32 PRIMARY KEY)");
+  drain(db, stmt, [intValue(2n), intValue(20n)]);
+  assert.notEqual(insertCacheOf(stmt)!.plan, plan);
+  plan = insertCacheOf(stmt)!.plan;
+
+  execute(db, "CREATE INDEX t_v_idx ON t (v)");
+  drain(db, stmt, [intValue(3n), intValue(30n)]);
+  assert.notEqual(insertCacheOf(stmt)!.plan, plan, "index DDL did not invalidate");
+  plan = insertCacheOf(stmt)!.plan;
+
+  // A working catalog may use but never replace the committed slot. Rollback restores the old hit.
+  execute(db, "BEGIN");
+  execute(db, "DROP INDEX t_v_idx");
+  drain(db, stmt, [intValue(4n), intValue(40n)]);
+  assert.equal(insertCacheOf(stmt)!.plan, plan);
+  execute(db, "ROLLBACK");
+  drain(db, stmt, [intValue(5n), intValue(50n)]);
+  assert.equal(insertCacheOf(stmt)!.plan, plan);
+
+  execute(db, "DROP TABLE t");
+  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
+  drain(db, stmt, [intValue(9n), intValue(90n)]);
+  assert.notEqual(insertCacheOf(stmt)!.plan, plan, "DROP/CREATE served a stale target plan");
+
+  // Same generation and shape on another core must still miss and refill under that core identity.
+  const other = new Engine();
+  execute(other, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
+  const beforeOther = insertCacheOf(stmt)!.plan;
+  drain(other, stmt, [intValue(1n), intValue(100n)]);
+  assert.notEqual(insertCacheOf(stmt)!.plan, beforeOther, "cross-database false hit");
+
+  const shared = memDb();
+  shared.attach("aux", attachMemory(), false);
+  const s = shared.session({});
+  s.execute("CREATE TABLE aux.t (id i32 PRIMARY KEY, v i32)");
+  const attached = shared.prepareStatement("INSERT INTO aux.t VALUES ($1, $2)");
+  s.executePrepared(attached, [intValue(1n), intValue(10n)]);
+  const attachedPlan = insertCacheOf(attached)!.plan;
+  shared.detach("aux");
+  shared.attach("aux", attachMemory(), false);
+  s.execute("CREATE TABLE aux.t (id i32 PRIMARY KEY, v i32)");
+  s.executePrepared(attached, [intValue(2n), intValue(20n)]);
+  assert.notEqual(insertCacheOf(attached)!.plan, attachedPlan, "re-attached database false hit");
+  s.close();
+  shared.close();
+
+  const shadowed = memDb();
+  const b = shadowed.session({});
+  b.execute("CREATE TEMP TABLE t (id i32 PRIMARY KEY, v i32)");
+  const a = shadowed.session({});
+  a.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
+  const shadowStmt = shadowed.prepareStatement("INSERT INTO t VALUES ($1, $2)");
+  a.executePrepared(shadowStmt, [intValue(1n), intValue(10n)]);
+  const persistentPlan = insertCacheOf(shadowStmt)!.plan;
+  b.executePrepared(shadowStmt, [intValue(1n), intValue(111n)]);
+  assert.equal(insertCacheOf(shadowStmt)!.plan, persistentPlan, "temp execution replaced cache");
+  a.executePrepared(shadowStmt, [intValue(2n), intValue(20n)]);
+  assert.equal(insertCacheOf(shadowStmt)!.plan, persistentPlan, "temp shadow poisoned old hit");
+  a.close();
+  b.close();
+  shadowed.close();
+});
+
+test("insert cache: every execute rechecks privilege and read-only gates", () => {
+  const db = memDb();
+  const writer = db.session({});
+  writer.execute("CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
+  const stmt = db.prepareStatement("INSERT INTO t VALUES ($1, $2)");
+  writer.executePrepared(stmt, [intValue(1n), intValue(10n)]);
+  const plan = insertCacheOf(stmt)!.plan;
+
+  const restricted = db.session({ defaultPrivileges: PrivilegeSet.empty().with("select") });
+  assert.deepEqual(
+    caught(() => restricted.executePrepared(stmt, [intValue(2n), intValue(20n)])).code,
+    "42501",
+  );
+  assert.equal(insertCacheOf(stmt)!.plan, plan);
+
+  assert.equal(
+    caught(() => writer.view((tx) => tx.executePrepared(stmt, [intValue(2n), intValue(20n)]))).code,
+    "25006",
+  );
+  assert.equal(insertCacheOf(stmt)!.plan, plan);
+  restricted.close();
+  writer.close();
+  db.close();
+});
+
+test("insert cache: collation upgrade invalidates resolved collation identities", () => {
+  loadUnicodeData(readFileSync(specPath("collation/fixtures/unicode.jucd")));
+  const db = new Engine();
+  execute(db, 'CREATE TABLE t (id i32 PRIMARY KEY, x text COLLATE "unicode")');
+  const stmt = prepare(db, "INSERT INTO t VALUES ($1, $2)");
+  drain(db, stmt, [intValue(1n), textValue("a")]);
+  const plan = insertCacheOf(stmt)!.plan;
+  const loaded = loadedCollation("unicode")!;
+  db.committed.collations.set("unicode", { ...loaded, unicodeVersion: "0.0.0" });
+  assert.equal(db.upgradeCollations(), 1);
+  drain(db, stmt, [intValue(2n), textValue("b")]);
+  assert.notEqual(insertCacheOf(stmt)!.plan, plan);
+});
+
+test("insert cache: hit and fresh resolution are result, error, cost, and byte identical", () => {
+  const cachedDb = new Engine();
+  const freshDb = new Engine();
+  const schema = "CREATE TABLE t (id i32 PRIMARY KEY, v i32 CHECK (v > 0), note text DEFAULT 'x')";
+  execute(cachedDb, schema);
+  execute(freshDb, schema);
+  execute(cachedDb, "CREATE UNIQUE INDEX t_v_idx ON t (v)");
+  execute(freshDb, "CREATE UNIQUE INDEX t_v_idx ON t (v)");
+  const stmt = prepare(cachedDb, "INSERT INTO t (id, v) VALUES ($1, $2) RETURNING id, note");
+
+  drain(cachedDb, stmt, [intValue(1n), intValue(10n)]);
+  execute(freshDb, "INSERT INTO t (id, v) VALUES (1, 10) RETURNING id, note");
+  const plan = insertCacheOf(stmt)!.plan;
+  const hit = drain(cachedDb, stmt, [intValue(2n), intValue(20n)]);
+  const fresh = execute(freshDb, "INSERT INTO t (id, v) VALUES (2, 20) RETURNING id, note");
+  assert.equal(fresh.kind, "query");
+  assert.equal(insertCacheOf(stmt)!.plan, plan);
+  assert.deepEqual(hit.rows, fresh.kind === "query" ? fresh.rows : []);
+  assert.equal(hit.cost, fresh.cost);
+  assert.deepEqual(toImage(cachedDb, 8192, 1n), toImage(freshDb, 8192, 1n));
+
+  const hitErr = caught(() => drain(cachedDb, stmt, [intValue(2n), intValue(20n)]));
+  const freshErr = caught(() =>
+    execute(freshDb, "INSERT INTO t (id, v) VALUES (2, 20) RETURNING id, note"),
+  );
+  assert.deepEqual(hitErr, freshErr);
+  assert.deepEqual(toImage(cachedDb, 8192, 1n), toImage(freshDb, 8192, 1n));
 });
 
 test("plan cache: estimator revision tracks relevant relations only", () => {

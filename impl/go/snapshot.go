@@ -475,6 +475,10 @@ func (s *snapshot) upgradeCollations(pageSize uint32) (int, error) {
 			s.collations[name] = loaded
 		}
 	}
+	// A prepared DML plan may retain resolved collation identities even when the skewed collation
+	// appears only on a non-key column (and therefore triggered no putTable rebuild above). Treat the
+	// host migration as one catalog mutation so every such plan misses after the upgrade.
+	s.bumpCatGen()
 	return len(skewed), nil
 }
 

@@ -64,8 +64,8 @@ Relevant current code:
   allocate replacement arrays/path nodes.
 - Before Slice 1, all three `insertRows` implementations built multi-row validation collections for
   a one-row prepared execution.
-- Prepared-plan caching currently targets reusable SELECT plans. A prepared INSERT still performs
-  substantial resolution and maintenance setup on every execution.
+- Before Slice 2, prepared-plan caching targeted reusable SELECT plans. A prepared INSERT still
+  performed substantial resolution and maintenance setup on every execution.
 
 ## Non-negotiable invariants
 
@@ -271,34 +271,34 @@ after every execution. The initial INSERT signature should validate schema/ident
 
 Tasks:
 
-- [ ] Specify the prepared cache as a tagged entry or separate SELECT/DML slots; do not force a DML
+- [x] Specify the prepared cache as a tagged entry or separate SELECT/DML slots; do not force a DML
   plan into the SELECT-plan type.
-- [ ] Define exact INSERT-cache eligibility and invalidation in `spec/design/api.md`.
-- [ ] Decide whether one `PreparedStatement` may retain one SELECT and one INSERT entry or only the
+- [x] Define exact INSERT-cache eligibility and invalidation in `spec/design/api.md`.
+- [x] Decide whether one `PreparedStatement` may retain one SELECT and one INSERT entry or only the
   entry appropriate to its parsed statement kind. Prefer the smallest explicit surface.
-- [ ] Re-check privileges, read-only state, transaction state, cost/lifetime limits, parameter count
+- [x] Re-check privileges, read-only state, transaction state, cost/lifetime limits, parameter count
   and types, and temp shadowing on every execution even on a cache hit.
-- [ ] Preserve per-execution folding/evaluation for defaults, CHECKs, index predicates/expressions,
+- [x] Preserve per-execution folding/evaluation for defaults, CHECKs, index predicates/expressions,
   RETURNING, and host-injected seams.
-- [ ] Rust: extend the `PreparedStatement` cache behind its existing thread-affine `RefCell`/`Rc`
+- [x] Rust: extend the `PreparedStatement` cache behind its existing thread-affine `RefCell`/`Rc`
   model; do not broaden `Send`/`Sync` as part of this optimization.
-- [ ] Go: retain goroutine-safe prepared-statement sharing. Publish immutable DML entries through an
+- [x] Go: retain goroutine-safe prepared-statement sharing. Publish immutable DML entries through an
   atomic slot or an equally narrow synchronization mechanism; concurrent valid fills may be
   last-writer-wins.
-- [ ] TypeScript: store the immutable entry on `PreparedStatement`; avoid retaining an `Engine` or
+- [x] TypeScript: store the immutable entry on `PreparedStatement`; avoid retaining an `Engine` or
   session through closures.
-- [ ] Add an internal cache-hit counter/seam in tests only, not in the public API or deterministic SQL
+- [x] Add an internal cache-hit counter/seam in tests only, not in the public API or deterministic SQL
   cost.
-- [ ] Assert that the second successful INSERT is still a cache hit even though the relation's
+- [x] Assert that the second successful INSERT is still a cache hit even though the relation's
   estimator revision changed.
-- [ ] Assert misses for another database, detach/reattach, relevant DDL, target drop/recreate, index or
+- [x] Assert misses for another database, detach/reattach, relevant DDL, target drop/recreate, index or
   constraint changes, collation upgrade, and temp shadowing.
-- [ ] Assert unrelated-table DDL follows the chosen catalog-generation policy (a conservative miss is
+- [x] Assert unrelated-table DDL follows the chosen catalog-generation policy (a conservative miss is
   acceptable if documented).
-- [ ] Assert rolled-back DDL/working-state execution never replaces a valid committed cache entry.
-- [ ] Assert a cached plan cannot bypass a newly restrictive privilege envelope or read-only session.
-- [ ] Assert cache hit and fresh resolution produce identical result, error, cost, and tree bytes.
-- [ ] Benchmark prepared versus one-shot INSERT separately so parse savings are not confused with DML
+- [x] Assert rolled-back DDL/working-state execution never replaces a valid committed cache entry.
+- [x] Assert a cached plan cannot bypass a newly restrictive privilege envelope or read-only session.
+- [x] Assert cache hit and fresh resolution produce identical result, error, cost, and tree bytes.
+- [x] Benchmark prepared versus one-shot INSERT separately so parse savings are not confused with DML
   resolution savings.
 
 Follow-ons after the INSERT cache is proven:
@@ -309,6 +309,15 @@ Follow-ons after the INSERT cache is proven:
   relation signature rather than the INSERT schema signature.
 - [ ] Evaluate `INSERT ... SELECT` only after its source query plan can compose with the existing
   SELECT cache without capturing per-execution folds.
+
+Evidence is recorded in `spec/design/benchmarks.md` under “INSERT performance slice-2 result.” Against
+the Slice-1 prepared/fresh-resolution control, the cached `insert_rollback` lane improved by 5.8%
+Rust/shared, 2.8% Go, and 6.7% TypeScript with the same checksum. Temporary allocation probes removed
+25 allocator calls and 2,886 requested bytes per row in Rust, 11 allocations per row in Go, and 2.2%
+of whole-process V8 allocated bytes. The separately measured one-shot form remained 11.6–18.2% slower
+than the cache, but includes parsing and is not used to attribute resolution savings. Paired hot-read,
+full-scan, and durable-write controls stayed within 5%; the Rust shared/exclusive gap is still 25.8%,
+so the motivating glibc regression remains open.
 
 Exit: repeated prepared INSERTs skip static resolution safely in all three cores, while every listed
 invalidation and per-execution gate remains effective.

@@ -358,6 +358,53 @@ commit. `close` is idempotent.
     identity as a `Weak` (the weak count keeps the allocation address alive, so the pointer-equality
     identity check cannot alias a later database).
 
+- **Prepared INSERT cache.** A `PreparedStatement` has separate, typed SELECT and INSERT cache
+  slots rather than coercing DML metadata into the SELECT-plan type. Its parsed statement kind is
+  immutable, so at most the slot appropriate to that kind can ever be populated. The initial DML
+  eligibility is a top-level plain `INSERT ... VALUES` with one or more VALUES candidates and a
+  persistent (main or attached) target. `ON CONFLICT`, writable-CTE wrappers, `INSERT ... SELECT`,
+  temporary targets, and resolved structures containing an uncorrelated subquery or a
+  precompiled-regex per-execution cost flag are re-resolved on every execution. The last exclusion
+  is the same mutable-plan-state rule as SELECT; a later slice may admit it by separating that state
+  from the immutable entry.
+
+  An INSERT entry contains only immutable resolution results: the normalized target scope/name,
+  target-column mapping and stored column types, primary-key ordinals/types, resolved default and
+  CHECK expression structure, resolved ordered index descriptors (including expression keys and
+  partial predicates), FK/exclusion descriptors, collation identities, finalized parameter types,
+  and the resolved RETURNING projection/metadata. It never contains bound parameter values,
+  evaluated defaults, entropy/clock/sequence results, a session or transaction, a working root,
+  store/pager/cursor objects, privileges or limits, pending rows/keys/index entries, a meter, or a
+  mutation token. The entry is read-only after publication; Go publishes it through a lock-free
+  atomic slot and concurrent correct fills are last-writer-wins.
+
+  INSERT validity deliberately has its own schema signature, not SELECT's estimator signature. It
+  is the exact tuple `(owning core identity, target database identity, target catalog generation,
+  lowercased target relation name)`. A bare target additionally misses when the executing session's
+  temp domain shadows that name; an explicit `main` target does not. An attached target contributes
+  the attachment snapshot's identity/generation, so detach/reattach misses even when the replacement
+  has the same schema. Relevant DDL, target drop/recreate, index/constraint changes, and collation
+  catalog changes move the target catalog generation. Unrelated DDL in that same target database is
+  a documented conservative miss; DDL in another database is not. A host collation-set replacement
+  advances the shared plan epoch and clears both typed slots before either can be consulted.
+  Successful row mutation advances only estimator revisions and therefore does **not** invalidate an
+  INSERT entry.
+
+  Every execution, including a hit, still re-runs failed-block/read-only admission, privilege and
+  attachment-writability checks, lifetime/cost/cancellation gates, parameter count/type binding,
+  temp-shadow validation, and collation-version writability. It creates a fresh meter and statement
+  entropy/clock state, evaluates defaults/CHECKs/index expressions and predicates/RETURNING anew,
+  reads current sequence and transaction state, and performs the unchanged two-phase validation and
+  write order. A hit changes only unmetered resolution work, so results, structured errors, cost,
+  abort points, tree shape, and file bytes are identical to a miss.
+
+  The slot is filled only after a successful execution whose visible target signature exactly
+  matches the committed-base signature. That includes the first INSERT in an explicit transaction
+  which has performed row writes but no catalog DDL, so the remaining repeated INSERTs in that block
+  can hit; row mutation does not move the schema signature. A valid committed entry may likewise be
+  consulted inside a transaction when its signature still matches. A miss against working or
+  rolled-back DDL never replaces that entry, so rollback restores the old hit without cache repair.
+
 ### 2.5 Concurrent sessions: parallel readers + a single writer
 
 > **Converged by [session.md §2.4](session.md).** The first design (P5.3b) made this a *separate*

@@ -91,6 +91,13 @@ type stmtCache struct {
 	p atomic.Pointer[scanCache]
 }
 
+// insertStmtCache is the separately typed prepared-INSERT slot (api.md §2.4). Keeping it separate
+// from stmtCache prevents DML metadata from being forced into the SELECT-plan type. The parsed AST
+// is immutable, so only one of a PreparedStatement's two slots can ever fill.
+type insertStmtCache struct {
+	p atomic.Pointer[insertCache]
+}
+
 // planCacheable reports whether a resolved scan plan may be memoized on a prepared statement. The
 // subquery / precompiled-regex exclusion is tracked separately (paramTypes.uncacheable, set at the
 // node's birth — a folded uncorrelated subquery bakes in one execution's params, and a precompiled

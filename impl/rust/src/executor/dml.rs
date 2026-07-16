@@ -22,7 +22,118 @@ mod insert_fast_path_tests {
     }
 }
 
+pub(crate) struct CachedInsert {
+    pub(crate) signature: InsertTargetSignature,
+    pub(crate) plan: std::rc::Rc<InsertValuesPlan>,
+}
+
+pub(crate) struct InsertTargetSignature {
+    core: Option<std::sync::Weak<crate::shared::Shared>>,
+    database: std::sync::Arc<EstimatorDatabaseIdentity>,
+    cat_gen: u64,
+    table: String,
+}
+
+struct InsertAlwaysTarget {
+    col: usize,
+    pos: usize,
+}
+
+/// Immutable resolution-derived metadata for a plain `INSERT ... VALUES`. No execution/session
+/// state, store, pager, root, bound value, meter, or statement seam is retained here.
+pub(crate) struct InsertValuesPlan {
+    table: Table,
+    col_types: Vec<ColType>,
+    pk: Vec<(usize, Type)>,
+    checks: Vec<(String, RExpr)>,
+    default_exprs: Vec<Option<RExpr>>,
+    rindexes: Vec<ResolvedIndex>,
+    colls: Vec<Option<std::sync::Arc<Collation>>>,
+    provided: Vec<Option<usize>>,
+    arity: usize,
+    returning: Option<(Vec<RExpr>, Vec<String>, Vec<String>)>,
+    param_types: Vec<ScalarType>,
+    cacheable: bool,
+}
+
 impl Engine {
+    fn insert_target_signature(
+        &self,
+        db_scope: Option<&str>,
+        table_name: &str,
+    ) -> Option<InsertTargetSignature> {
+        let table = table_name.to_ascii_lowercase();
+        let snap = match db_scope {
+            None => {
+                if self.temp_read_snap().table_by_key(&table).is_some() {
+                    return None;
+                }
+                self.read_snap()
+            }
+            Some(scope) if scope.eq_ignore_ascii_case("temp") => return None,
+            Some(scope) if scope.eq_ignore_ascii_case("main") => self.read_snap(),
+            Some(scope) => self.attach_read_snap(&scope.to_ascii_lowercase())?,
+        };
+        snap.table_by_key(&table)?;
+        Some(InsertTargetSignature {
+            core: self.core.as_ref().map(std::sync::Arc::downgrade),
+            database: snap.estimator_identity.clone(),
+            cat_gen: snap.cat_gen,
+            table,
+        })
+    }
+
+    /// Fill guard for explicit transactions: row writes preserve this signature, so the first
+    /// INSERT in a long block may fill and later executions may hit. Any working catalog change
+    /// makes the visible signature differ from this committed-base signature and cannot publish.
+    fn committed_insert_target_signature(
+        &self,
+        db_scope: Option<&str>,
+        table_name: &str,
+    ) -> Option<InsertTargetSignature> {
+        let table = table_name.to_ascii_lowercase();
+        let snap = match db_scope {
+            None => {
+                if self.temp_read_snap().table_by_key(&table).is_some() {
+                    return None;
+                }
+                &self.committed
+            }
+            Some(scope) if scope.eq_ignore_ascii_case("temp") => return None,
+            Some(scope) if scope.eq_ignore_ascii_case("main") => &self.committed,
+            Some(scope) => self
+                .attached_committed
+                .get(&scope.to_ascii_lowercase())?
+                .as_ref(),
+        };
+        snap.table_by_key(&table)?;
+        Some(InsertTargetSignature {
+            core: self.core.as_ref().map(std::sync::Arc::downgrade),
+            database: snap.estimator_identity.clone(),
+            cat_gen: snap.cat_gen,
+            table,
+        })
+    }
+
+    fn insert_target_signature_matches(
+        &self,
+        db_scope: Option<&str>,
+        want: &InsertTargetSignature,
+    ) -> bool {
+        let Some(got) = self.insert_target_signature(db_scope, &want.table) else {
+            return false;
+        };
+        let core_matches = match (&got.core, &want.core) {
+            (Some(got), Some(want)) => std::sync::Weak::ptr_eq(got, want),
+            (None, None) => true,
+            _ => false,
+        };
+        core_matches
+            && std::sync::Arc::ptr_eq(&got.database, &want.database)
+            && got.cat_gen == want.cat_gen
+            && got.table == want.table
+    }
+
     /// Analyze and run an INSERT whose rows come from a `VALUES` list or a `SELECT`
     /// (spec/design/grammar.md §12 / §24). An optional column list names the target columns
     /// (unknown → 42703, duplicate → 42701); an unlisted column, or a `DEFAULT` keyword slot,
@@ -41,6 +152,28 @@ impl Engine {
         params: &[Value],
         ctx: CteCtx,
     ) -> Result<Outcome> {
+        self.execute_insert_cached(ins, params, ctx, None, false)
+    }
+
+    pub(crate) fn execute_insert_cached(
+        &mut self,
+        ins: Insert,
+        params: &[Value],
+        ctx: CteCtx,
+        insert_cache: Option<&std::cell::RefCell<Option<CachedInsert>>>,
+        allow_cache_fill: bool,
+    ) -> Result<Outcome> {
+        // Slice 2 caches only a plain VALUES disposition. Writable-CTE children reach this method
+        // without a cache slot; SELECT and ON CONFLICT retain the existing general path.
+        if matches!(&ins.source, InsertSource::Values(_)) && ins.on_conflict.is_none() {
+            return self.execute_insert_values_cached(
+                &ins,
+                params,
+                ctx,
+                insert_cache,
+                allow_cache_fill,
+            );
+        }
         let Insert {
             table,
             db,
@@ -326,6 +459,9 @@ impl Engine {
                             &pk,
                             &checks,
                             &default_exprs,
+                            &[],
+                            &[],
+                            &col_types,
                             &stmt_rng,
                             &provided,
                             values,
@@ -524,6 +660,355 @@ impl Engine {
         }
     }
 
+    fn execute_insert_values_cached(
+        &mut self,
+        ins: &Insert,
+        params: &[Value],
+        ctx: CteCtx,
+        insert_cache: Option<&std::cell::RefCell<Option<CachedInsert>>>,
+        allow_cache_fill: bool,
+    ) -> Result<Outcome> {
+        check_catalog_rel_write(&ins.table)?;
+        self.check_attachment_writable(ins.db.as_deref())?;
+        self.check_table_qualifier(ins.db.as_deref(), &ins.table)?;
+
+        if let Some(cell) = insert_cache {
+            let hit = {
+                let cached = cell.borrow();
+                cached
+                    .as_ref()
+                    .filter(|cached| {
+                        self.insert_target_signature_matches(ins.db.as_deref(), &cached.signature)
+                    })
+                    .map(|cached| std::rc::Rc::clone(&cached.plan))
+            };
+            if let Some(plan) = hit {
+                self.ensure_collations_writable(&plan.table.columns)?;
+                return self.execute_insert_values_plan(ins, params, ctx, &plan);
+            }
+        }
+
+        let plan = self.resolve_insert_values_plan(ins, ctx)?;
+        if !plan.cacheable {
+            return self.execute_insert_values_uncached(ins, params, ctx, plan);
+        }
+        let signature = self.insert_target_signature(ins.db.as_deref(), &ins.table);
+        let committed_signature =
+            self.committed_insert_target_signature(ins.db.as_deref(), &ins.table);
+        let out = self.execute_insert_values_plan(ins, params, ctx, &plan)?;
+        if let (Some(cell), Some(signature), Some(committed_signature)) =
+            (insert_cache, signature, committed_signature)
+        {
+            let schema_is_committed = {
+                let core_matches = match (&signature.core, &committed_signature.core) {
+                    (Some(a), Some(b)) => std::sync::Weak::ptr_eq(a, b),
+                    (None, None) => true,
+                    _ => false,
+                };
+                core_matches
+                    && std::sync::Arc::ptr_eq(&signature.database, &committed_signature.database)
+                    && signature.cat_gen == committed_signature.cat_gen
+                    && signature.table == committed_signature.table
+            };
+            if allow_cache_fill && plan.cacheable && schema_is_committed {
+                cell.borrow_mut().replace(CachedInsert {
+                    signature: committed_signature,
+                    plan: std::rc::Rc::new(plan),
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    fn resolve_insert_values_plan(&self, ins: &Insert, ctx: CteCtx) -> Result<InsertValuesPlan> {
+        let tdef = self
+            .table_scoped(ins.db.as_deref(), &ins.table)
+            .ok_or_else(|| {
+                EngineError::new(
+                    SqlState::UndefinedTable,
+                    format!("table does not exist: {}", ins.table),
+                )
+            })?;
+        let table = tdef.clone();
+        self.ensure_collations_writable(&table.columns)?;
+        let col_types = self
+            .store_scoped(ins.db.as_deref(), &ins.table)
+            .col_types()
+            .to_vec();
+        let mut ptypes = ParamTypes::default();
+        let checks = self.resolve_checks_with_params(&table, &mut ptypes)?;
+        let default_exprs = self.resolve_default_exprs_with_params(&table, &mut ptypes)?;
+        let rindexes = self.resolve_table_indexes_with_params(&table, &mut ptypes)?;
+        let colls = self.column_collations(&table.columns);
+        let pk = table
+            .pk_indices()
+            .into_iter()
+            .map(|i| (i, table.columns[i].ty.clone()))
+            .collect();
+
+        let n = table.columns.len();
+        let has_list = ins.columns.is_some();
+        let (mut provided, arity): (Vec<Option<usize>>, usize) = match &ins.columns {
+            Some(names) => {
+                let mut provided = vec![None; n];
+                for (p, name) in names.iter().enumerate() {
+                    let idx = table
+                        .columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(name))
+                        .ok_or_else(|| {
+                            EngineError::new(
+                                SqlState::UndefinedColumn,
+                                format!("column {name} of relation {} does not exist", table.name),
+                            )
+                        })?;
+                    if provided[idx].is_some() {
+                        return Err(EngineError::new(
+                            SqlState::DuplicateColumn,
+                            format!(
+                                "column {} specified more than once",
+                                table.columns[idx].name
+                            ),
+                        ));
+                    }
+                    provided[idx] = Some(p);
+                }
+                (provided, names.len())
+            }
+            None => ((0..n).map(Some).collect(), n),
+        };
+        if ins.overriding == Some(Overriding::User) {
+            for (i, col) in table.columns.iter().enumerate() {
+                if col.identity.is_some() {
+                    provided[i] = None;
+                }
+            }
+        }
+        let always_targeted: Vec<InsertAlwaysTarget> = if ins.overriding == Some(Overriding::System)
+        {
+            Vec::new()
+        } else {
+            table
+                .columns
+                .iter()
+                .enumerate()
+                .filter_map(|(i, col)| match (col.identity, provided[i]) {
+                    (Some(IdentityKind::Always), Some(p)) => {
+                        Some(InsertAlwaysTarget { col: i, pos: p })
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let InsertSource::Values(rows) = &ins.source else {
+            unreachable!("plain VALUES cache called for a SELECT source")
+        };
+        for values in rows {
+            if values.len() != arity {
+                return Err(EngineError::new(
+                    SqlState::SyntaxError,
+                    format!(
+                        "INSERT row has {} values but {} {} expected for table {}",
+                        values.len(),
+                        arity,
+                        if has_list {
+                            "target columns are"
+                        } else {
+                            "columns are"
+                        },
+                        table.name,
+                    ),
+                ));
+            }
+            for (i, col) in table.columns.iter().enumerate() {
+                if let Some(p) = provided[i] {
+                    if let (Some(InsertValue::Param(nn)), Type::Scalar(s)) =
+                        (values.get(p), &col.ty)
+                    {
+                        ptypes.note((*nn as usize) - 1, Some(*s))?;
+                    }
+                }
+            }
+        }
+        for target in &always_targeted {
+            if rows
+                .iter()
+                .any(|values| !matches!(values[target.pos], InsertValue::Default))
+            {
+                return Err(EngineError::new(
+                    SqlState::GeneratedAlways,
+                    format!(
+                        "cannot insert a non-DEFAULT value into column {}",
+                        table.columns[target.col].name
+                    ),
+                ));
+            }
+        }
+        let returning = match &ins.returning {
+            Some(items) => {
+                Some(self.resolve_returning(&ins.table, items, false, ctx.bindings, &mut ptypes)?)
+            }
+            None => None,
+        };
+        let cacheable = !ptypes.uncacheable;
+        let param_types = ptypes.finalize()?;
+        Ok(InsertValuesPlan {
+            table,
+            col_types,
+            pk,
+            checks,
+            default_exprs,
+            rindexes,
+            colls,
+            provided,
+            arity,
+            returning,
+            param_types,
+            cacheable,
+        })
+    }
+
+    fn execute_insert_values_uncached(
+        &mut self,
+        ins: &Insert,
+        params: &[Value],
+        ctx: CteCtx,
+        mut plan: InsertValuesPlan,
+    ) -> Result<Outcome> {
+        let bound = bind_params(params, &plan.param_types)?;
+        let mut meter = self.session.new_meter();
+        if let Some((nodes, _, _)) = &mut plan.returning {
+            for node in nodes {
+                self.fold_uncorrelated_in_rexpr(node, &bound, ctx, &mut meter.accrued)?;
+            }
+        }
+        self.execute_insert_values_plan_with_bound(ins, &bound, ctx, &plan, meter)
+    }
+
+    fn execute_insert_values_plan(
+        &mut self,
+        ins: &Insert,
+        params: &[Value],
+        ctx: CteCtx,
+        plan: &InsertValuesPlan,
+    ) -> Result<Outcome> {
+        let bound = bind_params(params, &plan.param_types)?;
+        let meter = self.session.new_meter();
+        self.execute_insert_values_plan_with_bound(ins, &bound, ctx, plan, meter)
+    }
+
+    fn execute_insert_values_plan_with_bound(
+        &mut self,
+        ins: &Insert,
+        bound: &[Value],
+        ctx: CteCtx,
+        plan: &InsertValuesPlan,
+        mut meter: Meter,
+    ) -> Result<Outcome> {
+        let InsertSource::Values(rows_in) = &ins.source else {
+            unreachable!("plain VALUES cache called for a SELECT source")
+        };
+        let stmt_rng = std::cell::Cell::new(crate::seam::StmtRng::new());
+        let use_single = rows_in.len() == 1;
+        let mut single_values: Option<Vec<Value>> = None;
+        let mut rows: Vec<Vec<Value>> =
+            Vec::with_capacity(if use_single { 0 } else { rows_in.len() });
+        for values in rows_in {
+            let mut rv = vec![Value::Null; plan.arity];
+            for (i, col) in plan.table.columns.iter().enumerate() {
+                if let Some(p) = plan.provided[i] {
+                    rv[p] = match &values[p] {
+                        InsertValue::Default => self.eval_default(
+                            col,
+                            plan.default_exprs[i].as_ref(),
+                            &stmt_rng,
+                            &mut meter,
+                        )?,
+                        InsertValue::Lit(Literal::Text(s))
+                            if matches!(&plan.col_types[i], ColType::Scalar(sc) if sc.is_date())
+                                && crate::date::date_clock_special(s).is_some() =>
+                        {
+                            let (offset_days, epoch) = crate::date::date_clock_special(s)
+                                .expect("guard matched a special");
+                            if epoch {
+                                Value::Date(0)
+                            } else {
+                                date_clock_value(self, &stmt_rng, &mut meter, offset_days)?
+                            }
+                        }
+                        other => materialize_insert_value(other, &plan.col_types[i], bound)?,
+                    };
+                }
+            }
+            if use_single {
+                single_values = Some(rv);
+            } else {
+                rows.push(rv);
+            }
+        }
+        let returning = plan
+            .returning
+            .as_ref()
+            .map(|(nodes, _, _)| nodes.as_slice());
+        let (affected, returned) = match single_values {
+            Some(values) => (
+                1,
+                self.insert_one(
+                    &plan.table.name,
+                    ins.db.as_deref(),
+                    &plan.table.columns,
+                    &plan.pk,
+                    &plan.checks,
+                    &plan.default_exprs,
+                    &plan.rindexes,
+                    &plan.colls,
+                    &plan.col_types,
+                    &stmt_rng,
+                    &plan.provided,
+                    values,
+                    returning,
+                    bound,
+                    ctx,
+                    &mut meter,
+                )?,
+            ),
+            None => {
+                let returned = self.insert_rows(
+                    &plan.table.name,
+                    ins.db.as_deref(),
+                    &plan.table.columns,
+                    &plan.pk,
+                    &plan.checks,
+                    &plan.default_exprs,
+                    &plan.rindexes,
+                    &plan.colls,
+                    &plan.col_types,
+                    &stmt_rng,
+                    &plan.provided,
+                    rows,
+                    returning,
+                    bound,
+                    ctx,
+                    &mut meter,
+                )?;
+                (rows_in.len() as i64, returned)
+            }
+        };
+        self.mark_estimator_mutation(ins.db.as_deref(), &ins.table);
+        Ok(match (&plan.returning, returned) {
+            (Some((_, names, types)), Some(rows)) => Outcome::Query {
+                column_names: names.clone(),
+                column_types: types.clone(),
+                rows,
+                cost: meter.accrued,
+            },
+            _ => Outcome::Statement {
+                cost: meter.accrued,
+                rows_affected: Some(affected),
+            },
+        })
+    }
+
     /// Phase 1 + phase 2 of an INSERT, shared by the `VALUES` and `SELECT` sources. Each element
     /// of `rows` is one row's candidate values indexed by VALUE POSITION `p` (length `arity`);
     /// the declaration-order stored row is built via `provided` (an omitted column takes its
@@ -550,6 +1035,9 @@ impl Engine {
         pk: &[(usize, Type)],
         checks: &[(String, RExpr)],
         default_exprs: &[Option<RExpr>],
+        rindexes: &[ResolvedIndex],
+        colls: &[Option<std::sync::Arc<Collation>>],
+        col_types: &[ColType],
         rng: &std::cell::Cell<crate::seam::StmtRng>,
         provided: &[Option<usize>],
         rows: Vec<Vec<Value>>,
@@ -567,19 +1055,6 @@ impl Engine {
             .table_scoped(db_scope, table)
             .map(|t| (t.name.clone(), t.indexes.clone()))
             .unwrap_or_else(|| (table.to_string(), Vec::new()));
-        // Resolve the table's indexes once for this statement (column ordinals + resolved
-        // expression keys — spec/design/indexes.md §4), parallel to `indexes`. An expression key
-        // is evaluated per row (unmetered) to build its entry; done in phase 1 (below) so a failing
-        // expression aborts before any write (all-or-nothing).
-        let rindexes: Vec<ResolvedIndex> = match self.table_scoped(db_scope, table) {
-            Some(t) => self.resolve_table_indexes(t)?,
-            None => Vec::new(),
-        };
-        // The columns' resolved `ColType`s, for composite-aware store coercion (composite.md §4).
-        let col_types: Vec<ColType> = self.store_scoped(db_scope, table).col_types().to_vec();
-        // Per-column frozen collations for the collated text key form (§2.12), resolved once before
-        // any mutation; `None` everywhere for a C-only / non-text table (the fast path).
-        let colls = self.column_collations(columns);
         let mut prepared: Vec<(Option<Vec<u8>>, Row)> = Vec::with_capacity(rows.len());
         // Per prepared row, the secondary-index entry keys WITHOUT the storage-key suffix — one
         // sub-vec per index (rindexes order), computed with the eval env in phase 1 (so expression
@@ -694,7 +1169,7 @@ impl Engine {
             // expression key, so an eval error aborts here before any write; unmetered). Phase 2
             // appends the final storage key.
             let mut row_prefixes: Vec<Vec<Vec<u8>>> = Vec::with_capacity(rindexes.len());
-            for rindex in &rindexes {
+            for rindex in rindexes {
                 row_prefixes.push(index_entry_keys(columns, &colls, rindex, &[], &row, &env)?);
             }
             entry_prefixes.push(row_prefixes);
@@ -845,6 +1320,9 @@ impl Engine {
         pk: &[(usize, Type)],
         checks: &[(String, RExpr)],
         default_exprs: &[Option<RExpr>],
+        rindexes: &[ResolvedIndex],
+        colls: &[Option<std::sync::Arc<Collation>>],
+        col_types: &[ColType],
         rng: &std::cell::Cell<crate::seam::StmtRng>,
         provided: &[Option<usize>],
         values: Vec<Value>,
@@ -858,13 +1336,6 @@ impl Engine {
             .table_scoped(db_scope, table)
             .map(|t| (t.name.clone(), t.indexes.clone()))
             .unwrap_or_else(|| (table.to_string(), Vec::new()));
-        let rindexes: Vec<ResolvedIndex> = match self.table_scoped(db_scope, table) {
-            Some(t) => self.resolve_table_indexes(t)?,
-            None => Vec::new(),
-        };
-        let col_types: Vec<ColType> = self.store_scoped(db_scope, table).col_types().to_vec();
-        let colls = self.column_collations(columns);
-
         let mut row = Vec::with_capacity(n);
         for (i, col) in columns.iter().enumerate() {
             let candidate = match provided[i] {
@@ -929,7 +1400,7 @@ impl Engine {
         // One group per index is still required because a GIN entry can have several keys, but the
         // batch-only outer row dimension and the later per-index drain buffers are absent.
         let mut index_entries: Vec<Vec<Vec<u8>>> = Vec::with_capacity(rindexes.len());
-        for rindex in &rindexes {
+        for rindex in rindexes {
             index_entries.push(index_entry_keys(columns, &colls, rindex, &[], &row, &env)?);
         }
 
@@ -1779,6 +2250,12 @@ impl Engine {
             ),
             None => {
                 let inserted = rows.len() as i64;
+                let rindexes = match self.table_scoped(db_scope, table) {
+                    Some(t) => self.resolve_table_indexes(t)?,
+                    None => Vec::new(),
+                };
+                let colls = self.column_collations(columns);
+                let col_types = self.store_scoped(db_scope, table).col_types().to_vec();
                 let returned = self.insert_rows(
                     table,
                     db_scope,
@@ -1786,6 +2263,9 @@ impl Engine {
                     pk,
                     checks,
                     default_exprs,
+                    &rindexes,
+                    &colls,
+                    &col_types,
                     rng,
                     provided,
                     rows,

@@ -92,6 +92,9 @@ type PreparedStatement struct {
 	// against, so DDL — or executing on a different database — re-plans. Zero value is empty.
 	// Query-only — a write / materialized shape never touches it.
 	sc stmtCache
+	// ic is the separately typed prepared-INSERT slot. The AST kind is fixed, so a statement can
+	// populate sc or ic, never both (spec/design/api.md §2.4).
+	ic insertStmtCache
 }
 
 // queryValues is a one-shot: parse + run a statement, binding params, returning a row cursor. A
@@ -108,7 +111,7 @@ func (db *engine) queryValues(sql string, params []Value) (*Rows, error) {
 	if err != nil {
 		return nil, err
 	}
-	return db.queryStmt(stmt, params, nil) // one-shot: no cross-call plan cache (still plans once)
+	return db.queryStmt(stmt, params, nil, nil) // one-shot: no cross-call plan cache (still plans once)
 }
 
 // queryStmt routes an already-parsed query AST through the lazy scan (streaming/buffered) then
@@ -118,7 +121,7 @@ func (db *engine) queryValues(sql string, params []Value) (*Rows, error) {
 // (the *Prepared methods pass the statement's stmtCache), so a prepared query streams identically to
 // an ad-hoc one but reuses its cached plan across executes. (This is the bare single-handle engine;
 // the watermark pin lives on the shared-core Session.queryValues path.)
-func (db *engine) queryStmt(stmt statement, params []Value, sc *stmtCache) (*Rows, error) {
+func (db *engine) queryStmt(stmt statement, params []Value, sc *stmtCache, ic *insertStmtCache) (*Rows, error) {
 	// A read served by a lazy lane skips the materialized dispatch, so enforce the read-path admission
 	// gates (25P02 / 54P02 / 42501) up front — reads only (transaction control must work in a failed
 	// block; a write is gated inside dispatch on the fall-through). Keeps the bare-engine queryValues a
@@ -141,7 +144,7 @@ func (db *engine) queryStmt(stmt statement, params []Value, sc *stmtCache) (*Row
 	// The fall-through handles transaction control (BEGIN/COMMIT/ROLLBACK — a nested BEGIN's 25001 must
 	// NOT poison) and self-poisons on a regular statement error (ExecuteStmtParams), so its nuanced
 	// poisoning is left intact — only the lazy-lane reads above, which bypass it, are poisoned here.
-	out, err := db.ExecuteStmtParams(stmt, params)
+	out, err := db.executeStmtParamsCached(stmt, params, ic)
 	if err != nil {
 		return nil, err
 	}

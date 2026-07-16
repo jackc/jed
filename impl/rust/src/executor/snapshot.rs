@@ -416,6 +416,10 @@ impl Snapshot {
                 self.put_collation(loaded);
             }
         }
+        // A prepared DML plan may retain resolved collation identities even when the skewed
+        // collation appears only on a non-key column (and therefore caused no `put_table` rebuild
+        // above). The host migration is one catalog mutation for cache invalidation purposes.
+        self.bump_cat_gen();
         Ok(skewed.len())
     }
 

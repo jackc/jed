@@ -163,7 +163,7 @@ func TestPrepareExecuteAndQueryWithParams(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rows, err := db.queryStmt(sel.ast, []Value{IntValue(200)}, &sel.sc)
+	rows, err := db.queryStmt(sel.ast, []Value{IntValue(200)}, &sel.sc, &sel.ic)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -395,6 +395,66 @@ The measurements also found and fixed a Go benchmark lifecycle issue exposed by 
 each run now closes its owning `Database`, and concurrent readers are minted from that already-open
 handle instead of attempting an illegal second in-process open.
 
+**INSERT performance slice-2 result (2026-07-16).** Commit `606285f1` is the Slice-1 control: its
+prepared statement reuses the parsed INSERT AST but deliberately has no DML-resolution cache. The
+Slice-2 engine adds a separate immutable prepared-INSERT cache for plain `INSERT ... VALUES`, while
+retaining fresh resolution for `INSERT ... SELECT`, `ON CONFLICT`, writable CTEs, subqueries, and
+precompiled-regex shapes. The existing CPU-2-pinned `insert_rollback` lane used five retained
+old/current process pairs for Go and TypeScript and six for Rust. Each cell is the median statistic
+across those process results; every run retained checksum `ac02f0205c4f05c5`.
+
+| Core / locking | Slice 1 mean | Slice 2 mean | Change | Minimum | p50 | p90 | p99 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Rust / shared | 24.060 ms | 22.652 ms | -5.8% | 22.429 ms | 22.648 ms | 22.807 ms | 22.865 ms |
+| Go / auto (shared) | 11.976 ms | 11.643 ms | -2.8% | 11.398 ms | 11.623 ms | 11.818 ms | 11.900 ms |
+| TypeScript / auto (shared) | 17.020 ms | 15.879 ms | -6.7% | 10.713 ms | 13.221 ms | 23.631 ms | 29.152 ms |
+
+The cache is exercised inside the lane's explicit transaction: the first INSERT may fill only when
+the visible target schema exactly matches the committed schema, and the remaining 999 executions
+hit. Working DDL cannot fill or overwrite an older committed entry. Estimator revisions are absent
+from the DML signature because successful INSERTs advance them; database/attachment identity,
+catalog generation, lowercased target name, and temp-shadow state remain validity inputs. Exact
+cache-hit tests in all three cores cover DDL, drop/recreate, detach/reattach, collation upgrade,
+another core, temp shadowing, rollback restoration, privileges, read-only state, result/error/cost,
+and serialized tree bytes. Go additionally races concurrent sessions against the atomic cache slot.
+
+One-shot execution was measured separately with temporary benchmark-only routing and then removed.
+It averaged 13.759 ms Go, 25.284 ms Rust, and 18.623 ms TypeScript: respectively 18.2%, 11.6%, and
+17.3% slower than the cached prepared lane. These one-shot values include parsing as well as DML
+resolution and therefore are **not** used to attribute the cache's pure resolution savings; the
+Slice-1 prepared control above is the attribution baseline.
+
+Temporary allocation probes were also removed after collection:
+
+| Core / probe | Slice 1 / fresh resolution | Slice 2 / cached | Effect |
+|---|---:|---:|---:|
+| Rust allocator calls / transaction | 644,625 | 619,625 | -25,000 (-3.9%; 25 per row) |
+| Rust requested bytes / transaction | 91,781,589 | 88,895,589 | -2,886,000 (-3.1%; 2,886 per row) |
+| Go allocations / transaction | 36,547 | 25,546 | -11,001 (-30.1%; 11 per row) |
+| Go allocated bytes / transaction | 29,136,910 | 28,520,862 | -616,048 (-2.1%) |
+| V8 allocated bytes / complete lane | 1,988,316,072 | 1,945,251,584 | -43,064,488 (-2.2%) |
+| V8 scavenges / complete lane | 48 | 46 | two fewer |
+
+The Go allocation comparison clears only the DML cache between executions, so both sides retain the
+same prepared AST. The Rust counts bound the same 1,000-row transaction. V8 tracing covers one full
+harness process and is allocation/GC evidence rather than object-count equivalence with native cores.
+
+Three paired result processes sampled unrelated hot lookup, cold ramp, and full-scan controls; three
+durable-write pairs were sufficient for Rust/TypeScript, while Go's noisy fsync lane was extended to
+nine alternated pairs. All before/after checksums matched. Every median stayed within the 5% gate:
+
+| Regression lane | Go | Rust | TypeScript |
+|---|---:|---:|---:|
+| hot prepared PK lookup | +3.33% | -1.06% | -0.41% |
+| cold PK ramp | -2.96% | +0.40% | +0.99% |
+| full scan aggregate + filter | +1.41% | -1.78% | -0.70% |
+| durable one-row commit | +0.52% | +2.16% | -2.32% |
+
+Finally, five exclusive Rust runs measured 18.006 ms mean (17.816 ms minimum, 18.003 ms p50,
+18.118 ms p90, 18.173 ms p99). Slice 2's Rust/shared mean remains **25.8% slower** than exclusive.
+The prepared cache materially reduces work but does not solve the glibc/background-thread gap; Rust
+copy-on-write entry sharing remains the next material INSERT follow-on.
+
 ## 1. Purpose and non-goals
 
 The benchmark suite answers two questions, continuously:

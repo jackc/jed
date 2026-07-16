@@ -44,6 +44,112 @@ type resolvedIndex struct {
 	Predicate *rExpr
 }
 
+type insertAlwaysTarget struct{ col, pos int }
+
+// insertValuesPlan is the immutable, resolution-derived part of a plain INSERT ... VALUES. It owns
+// no session, transaction, store, pager, parameter value, meter, or statement seam. A cache hit
+// reuses this structure while all dynamic gates/evaluation remain in executeInsertValuesPlan.
+type insertValuesPlan struct {
+	table          *catTable
+	colTypes       []colType
+	pk             []int
+	checks         []namedCheck
+	defaultExprs   []*rExpr
+	rindexes       []resolvedIndex
+	colls          []*Collation
+	provided       []int
+	arity          int
+	retNodes       []*rExpr
+	retNames       []string
+	retTypes       []string
+	ptys           []scalarType
+	cacheable      bool
+	alwaysTargeted []insertAlwaysTarget
+}
+
+// insertTargetSignature is schema-only: estimator revisions are deliberately absent because every
+// successful INSERT advances them. database is the target snapshot/attachment identity; core keeps
+// a prepared statement from crossing owning Database handles even if a target token were shared.
+type insertTargetSignature struct {
+	core     *sharedCore
+	database *estimatorDatabaseIdentity
+	catGen   uint64
+	table    string
+}
+
+type insertCache struct {
+	sig  insertTargetSignature
+	plan *insertValuesPlan
+}
+
+func (db *engine) insertTargetSignature(dbScope *string, tableName string) (insertTargetSignature, bool) {
+	table := strings.ToLower(tableName)
+	var snap *snapshot
+	if dbScope == nil {
+		if _, ok := db.tempSnap().tableByKey(table); ok {
+			return insertTargetSignature{}, false
+		}
+		snap = db.readSnap()
+	} else {
+		switch strings.ToLower(*dbScope) {
+		case "temp":
+			return insertTargetSignature{}, false
+		case "main":
+			snap = db.readSnap()
+		default:
+			snap = db.attachReadSnap(strings.ToLower(*dbScope))
+		}
+	}
+	if snap == nil {
+		return insertTargetSignature{}, false
+	}
+	if _, ok := snap.tableByKey(table); !ok {
+		return insertTargetSignature{}, false
+	}
+	return insertTargetSignature{
+		core: db.core, database: snap.estimatorIdentity, catGen: snap.catGen, table: table,
+	}, true
+}
+
+// committedInsertTargetSignature is the fill guard: an explicit write transaction may publish a
+// plan only while its visible target schema still exactly matches the committed base. Row writes do
+// not change this signature, so the first INSERT in a long transaction can fill and the remainder
+// can hit; working DDL (including unrelated catalog DDL) makes it differ and therefore cannot fill.
+func (db *engine) committedInsertTargetSignature(dbScope *string, tableName string) (insertTargetSignature, bool) {
+	table := strings.ToLower(tableName)
+	var snap *snapshot
+	if dbScope == nil {
+		if _, ok := db.tempSnap().tableByKey(table); ok {
+			return insertTargetSignature{}, false
+		}
+		snap = db.committed
+	} else {
+		switch strings.ToLower(*dbScope) {
+		case "temp":
+			return insertTargetSignature{}, false
+		case "main":
+			snap = db.committed
+		default:
+			snap = db.attachedCommitted[strings.ToLower(*dbScope)]
+		}
+	}
+	if snap == nil {
+		return insertTargetSignature{}, false
+	}
+	if _, ok := snap.tableByKey(table); !ok {
+		return insertTargetSignature{}, false
+	}
+	return insertTargetSignature{
+		core: db.core, database: snap.estimatorIdentity, catGen: snap.catGen, table: table,
+	}, true
+}
+
+func (db *engine) insertTargetSignatureMatches(dbScope *string, want insertTargetSignature) bool {
+	got, ok := db.insertTargetSignature(dbScope, want.table)
+	return ok && got.core == want.core && got.database == want.database &&
+		got.catGen == want.catGen && got.table == want.table
+}
+
 // columnOrdinals returns the plain-column ordinals of a GIN/GiST index (always all columns, this
 // slice); it panics on an expression key (a GIN/GiST expression key is structurally impossible).
 func (r *resolvedIndex) columnOrdinals() []int {
@@ -763,6 +869,10 @@ func (db *engine) rowConflictsCommitted(store *tableStore, table *catTable, pk [
 }
 
 func (db *engine) executeInsert(ins *insert, params []Value, ctx cteCtx) (outcome, error) {
+	return db.executeInsertCached(ins, params, ctx, nil, false)
+}
+
+func (db *engine) executeInsertCached(ins *insert, params []Value, ctx cteCtx, ic *insertStmtCache, allowCacheFill bool) (outcome, error) {
 	// A catalog relation is read-only (introspection.md §5): a DML target naming one is 42809,
 	// checked by NAME before qualifier validation (the built-in resolves in every database).
 	if err := checkCatalogRelWrite(ins.Table); err != nil {
@@ -780,6 +890,11 @@ func (db *engine) executeInsert(ins *insert, params []Value, ctx cteCtx) (outcom
 	// the conflict path resolves index stores unscoped. A clean 0A000 before any planning.
 	if ins.OnConflict != nil && isAttachmentScope(ins.DB) {
 		return outcome{}, newError(FeatureNotSupported, "ON CONFLICT on an attached-database table is not supported yet")
+	}
+	// Slice 2 caches only a top-level plain VALUES disposition. Writable CTE children reach this
+	// method without a cache slot; SELECT and ON CONFLICT retain the existing general path.
+	if ins.Select == nil && ins.OnConflict == nil {
+		return db.executeInsertValuesCached(ins, params, ctx, ic, allowCacheFill)
 	}
 	table, ok := db.lkpTableScoped(ins.DB, ins.Table) // scope-aware temp-first (temp-tables.md §3)
 	if !ok {
@@ -1133,7 +1248,7 @@ func (db *engine) executeInsert(ins *insert, params []Value, ctx cteCtx) (outcom
 	var affected int64
 	var returned [][]Value
 	if useSingle {
-		returned, err = db.insertOne(table, store, ins.DB, pk, checks, defaultExprs, stmtRng, provided, singleValues, retNodes, bound, ctx, meter)
+		returned, err = db.insertOne(table, store, ins.DB, pk, checks, defaultExprs, nil, nil, stmtRng, provided, singleValues, retNodes, bound, ctx, meter)
 		affected = 1
 	} else {
 		affected, returned, err = db.runInsertRows(table, store, ins.DB, pk, checks, defaultExprs, stmtRng, provided, rows, cplan, retNodes, bound, ctx, meter)
@@ -1143,6 +1258,246 @@ func (db *engine) executeInsert(ins *insert, params []Value, ctx cteCtx) (outcom
 	}
 	db.markEstimatorMutation(ins.DB, ins.Table)
 	return dmlOutcome(retNames, retTypes, returned, affected, meter.Accrued), nil
+}
+
+// executeInsertValuesCached resolves or reuses the immutable part of a plain INSERT ... VALUES,
+// then performs all per-execution binding, gates, default/constraint/index/RETURNING evaluation and
+// writes against the current working snapshot. Planning is unmetered; the execution below is the
+// same one-row/batch path used before the cache existed.
+func (db *engine) executeInsertValuesCached(ins *insert, params []Value, ctx cteCtx, ic *insertStmtCache, allowCacheFill bool) (outcome, error) {
+	if ic != nil {
+		if cached := ic.p.Load(); cached != nil && db.insertTargetSignatureMatches(ins.DB, cached.sig) {
+			if err := db.ensureCollationsWritable(cached.plan.table.Columns); err != nil {
+				return outcome{}, err
+			}
+			return db.executeInsertValuesPlan(ins, params, ctx, cached.plan, false)
+		}
+	}
+
+	plan, err := db.resolveInsertValuesPlan(ins, ctx)
+	if err != nil {
+		return outcome{}, err
+	}
+	sig, hasSig := db.insertTargetSignature(ins.DB, ins.Table)
+	out, err := db.executeInsertValuesPlan(ins, params, ctx, plan, !plan.cacheable)
+	if err != nil {
+		return outcome{}, err
+	}
+	committedSig, committedOK := db.committedInsertTargetSignature(ins.DB, ins.Table)
+	if ic != nil && allowCacheFill && hasSig && committedOK && plan.cacheable &&
+		sig.core == committedSig.core && sig.database == committedSig.database &&
+		sig.catGen == committedSig.catGen && sig.table == committedSig.table {
+		ic.p.Store(&insertCache{sig: committedSig, plan: plan})
+	}
+	return out, nil
+}
+
+func (db *engine) resolveInsertValuesPlan(ins *insert, ctx cteCtx) (*insertValuesPlan, error) {
+	table, ok := db.lkpTableScoped(ins.DB, ins.Table)
+	if !ok {
+		return nil, newError(UndefinedTable, "table does not exist: "+ins.Table)
+	}
+	if err := db.ensureCollationsWritable(table.Columns); err != nil {
+		return nil, err
+	}
+	store := db.lkpStoreScoped(ins.DB, ins.Table)
+	ptypes := &paramTypes{}
+	checks, err := db.resolveChecksWithParams(table, ptypes)
+	if err != nil {
+		return nil, err
+	}
+	defaultExprs, err := db.resolveDefaultExprsWithParams(table, ptypes)
+	if err != nil {
+		return nil, err
+	}
+	rindexes, err := db.resolveTableIndexesWithParams(table, ptypes)
+	if err != nil {
+		return nil, err
+	}
+
+	n := len(table.Columns)
+	provided := make([]int, n)
+	arity := n
+	if ins.Columns != nil {
+		for i := range provided {
+			provided[i] = -1
+		}
+		for p, name := range ins.Columns {
+			idx := table.ColumnIndex(name)
+			if idx < 0 {
+				return nil, newError(UndefinedColumn, fmt.Sprintf(
+					"column %s of relation %s does not exist", name, table.Name,
+				))
+			}
+			if provided[idx] >= 0 {
+				return nil, newError(DuplicateColumn,
+					"column "+table.Columns[idx].Name+" specified more than once")
+			}
+			provided[idx] = p
+		}
+		arity = len(ins.Columns)
+	} else {
+		for i := range provided {
+			provided[i] = i
+		}
+	}
+
+	if ins.Overriding != nil && *ins.Overriding == overridingUser {
+		for i, col := range table.Columns {
+			if col.Identity != nil {
+				provided[i] = -1
+			}
+		}
+	}
+	var alwaysTargeted []insertAlwaysTarget
+	if !(ins.Overriding != nil && *ins.Overriding == overridingSystem) {
+		for i, col := range table.Columns {
+			if col.Identity != nil && *col.Identity == identityAlways && provided[i] >= 0 {
+				alwaysTargeted = append(alwaysTargeted, insertAlwaysTarget{col: i, pos: provided[i]})
+			}
+		}
+	}
+
+	for _, values := range ins.Rows {
+		if len(values) != arity {
+			expected := "columns are"
+			if ins.Columns != nil {
+				expected = "target columns are"
+			}
+			return nil, newError(SyntaxError, fmt.Sprintf(
+				"INSERT row has %d values but %d %s expected for table %s",
+				len(values), arity, expected, table.Name,
+			))
+		}
+		for i, col := range table.Columns {
+			if p := provided[i]; p >= 0 {
+				if iv := values[p]; iv.IsParam && !col.Type.IsComposite() {
+					ct := col.Type.ScalarTy()
+					if err := ptypes.note(int(iv.Param)-1, &ct); err != nil {
+						return nil, err
+					}
+				}
+			}
+		}
+	}
+	for _, at := range alwaysTargeted {
+		for _, values := range ins.Rows {
+			if !values[at.pos].IsDefault {
+				return nil, newError(GeneratedAlways, fmt.Sprintf(
+					"cannot insert a non-DEFAULT value into column %s", table.Columns[at.col].Name,
+				))
+			}
+		}
+	}
+
+	var retNodes []*rExpr
+	var retNames []string
+	var retTypes []string
+	if ins.Returning != nil {
+		if retNodes, retNames, retTypes, err = db.resolveReturning(table, *ins.Returning, false, ctx.bindings, ptypes); err != nil {
+			return nil, err
+		}
+	}
+	ptys, err := ptypes.finalize()
+	if err != nil {
+		return nil, err
+	}
+	return &insertValuesPlan{
+		table:          table,
+		colTypes:       append([]colType(nil), store.colTypes...),
+		pk:             table.PKIndices(),
+		checks:         checks,
+		defaultExprs:   defaultExprs,
+		rindexes:       rindexes,
+		colls:          db.columnCollations(table.Columns),
+		provided:       provided,
+		arity:          arity,
+		retNodes:       retNodes,
+		retNames:       retNames,
+		retTypes:       retTypes,
+		ptys:           ptys,
+		cacheable:      !ptypes.uncacheable,
+		alwaysTargeted: alwaysTargeted,
+	}, nil
+}
+
+func (db *engine) executeInsertValuesPlan(ins *insert, params []Value, ctx cteCtx, plan *insertValuesPlan, foldReturning bool) (outcome, error) {
+	bound, err := bindParams(params, plan.ptys)
+	if err != nil {
+		return outcome{}, err
+	}
+	store := db.writeStoreScoped(ins.DB, ins.Table)
+	stmtRng := newStmtRng()
+	meter := db.session.newMeter()
+	useSingle := len(ins.Rows) == 1
+	var singleValues []Value
+	rowCap := len(ins.Rows)
+	if useSingle {
+		rowCap = 0
+	}
+	rows := make([][]Value, 0, rowCap)
+	for _, values := range ins.Rows {
+		rv := make([]Value, plan.arity)
+		for i, col := range plan.table.Columns {
+			if p := plan.provided[i]; p >= 0 {
+				iv := values[p]
+				if iv.IsDefault {
+					dv, err := db.evalDefault(col, plan.defaultExprs[i], stmtRng, meter)
+					if err != nil {
+						return outcome{}, err
+					}
+					rv[p] = dv
+				} else if ct := plan.colTypes[i]; ct.Elem == nil && ct.RangeElem == nil && !ct.Composite &&
+					ct.Scalar == scalarDate && !iv.IsParam && !iv.IsArray && !iv.IsRow &&
+					iv.Lit.Kind == literalText && dateClockIsSpecial(iv.Lit.Str) {
+					off, epoch, _ := dateClockSpecial(iv.Lit.Str)
+					if epoch {
+						rv[p] = DateValue(0)
+					} else {
+						dv, err := dateClockValue(db, stmtRng, meter, int64(off))
+						if err != nil {
+							return outcome{}, err
+						}
+						rv[p] = dv
+					}
+				} else {
+					mv, err := materializeInsertValue(iv, plan.colTypes[i], bound)
+					if err != nil {
+						return outcome{}, err
+					}
+					rv[p] = mv
+				}
+			}
+		}
+		if useSingle {
+			singleValues = rv
+		} else {
+			rows = append(rows, rv)
+		}
+	}
+	if foldReturning {
+		for _, node := range plan.retNodes {
+			if err := db.foldUncorrelatedInRExpr(node, bound, ctx, &meter.Accrued); err != nil {
+				return outcome{}, err
+			}
+		}
+	}
+	var affected int64
+	var returned [][]Value
+	if useSingle {
+		returned, err = db.insertOne(plan.table, store, ins.DB, plan.pk, plan.checks, plan.defaultExprs,
+			plan.rindexes, plan.colls, stmtRng, plan.provided, singleValues, plan.retNodes, bound, ctx, meter)
+		affected = 1
+	} else {
+		returned, err = db.insertRows(plan.table, store, ins.DB, plan.pk, plan.checks, plan.defaultExprs,
+			plan.rindexes, plan.colls, stmtRng, plan.provided, rows, plan.retNodes, bound, ctx, meter)
+		affected = int64(len(rows))
+	}
+	if err != nil {
+		return outcome{}, err
+	}
+	db.markEstimatorMutation(ins.DB, ins.Table)
+	return dmlOutcome(plan.retNames, plan.retTypes, returned, affected, meter.Accrued), nil
 }
 
 // insertRows runs phase 1 + phase 2 of an INSERT, shared by the VALUES and SELECT sources. Each
@@ -1158,19 +1513,8 @@ func (db *engine) executeInsert(ins *insert, params []Value, ctx cteCtx) (outcom
 // validated rows after every check passes and BEFORE phase 2 writes — so its subqueries
 // observe the pre-statement snapshot and a ceiling abort stays all-or-nothing; params feeds
 // its $Ns. Returns the projected output rows, nil without a clause.
-func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string, pk []int, checks []namedCheck, defaultExprs []*rExpr, rng *stmtRng, provided []int, rows [][]Value, returning []*rExpr, params []Value, ctes cteCtx, meter *costMeter) ([][]Value, error) {
+func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string, pk []int, checks []namedCheck, defaultExprs []*rExpr, rindexes []resolvedIndex, colls []*Collation, rng *stmtRng, provided []int, rows [][]Value, returning []*rExpr, params []Value, ctes cteCtx, meter *costMeter) ([][]Value, error) {
 	n := len(table.Columns)
-	// Per-column frozen collations for the collated text key form (§2.12), resolved before any
-	// mutation; nil everywhere for a C-only / non-text table (the fast path).
-	colls := db.columnCollations(table.Columns)
-	// Resolve the table's indexes once for this statement (column ordinals + resolved expression
-	// keys — indexes.md §4), parallel to table.Indexes. An expression key is evaluated per row
-	// (unmetered) to build its entry; done in phase 1 (below) so a failing expression aborts before
-	// any write (all-or-nothing).
-	rindexes, err := db.resolveTableIndexes(table)
-	if err != nil {
-		return nil, err
-	}
 	// The eval env for phase-1 index-expression evaluation (index eval is unmetered; params/CTEs
 	// are empty — an index expression cannot reference them). The per-statement rng is shared with
 	// the CHECK / default evaluation.
@@ -1457,13 +1801,9 @@ func (db *engine) insertRows(table *catTable, store *tableStore, dbScope *string
 // insertOne is the plain one-candidate INSERT ... VALUES specialization. It retains the general
 // path's validation and write order (constraints.md §7) but needs no within-batch maps, stringified
 // byte keys, prepared-row slice, or per-index write buffers.
-func (db *engine) insertOne(table *catTable, store *tableStore, dbScope *string, pk []int, checks []namedCheck, defaultExprs []*rExpr, rng *stmtRng, provided []int, values []Value, returning []*rExpr, params []Value, ctes cteCtx, meter *costMeter) ([][]Value, error) {
+func (db *engine) insertOne(table *catTable, store *tableStore, dbScope *string, pk []int, checks []namedCheck, defaultExprs []*rExpr, rindexes []resolvedIndex, colls []*Collation, rng *stmtRng, provided []int, values []Value, returning []*rExpr, params []Value, ctes cteCtx, meter *costMeter) ([][]Value, error) {
 	n := len(table.Columns)
-	colls := db.columnCollations(table.Columns)
-	rindexes, err := db.resolveTableIndexes(table)
-	if err != nil {
-		return nil, err
-	}
+	var err error
 	env := &evalEnv{exec: db, rng: rng}
 
 	row := make(storedRow, n)
@@ -1680,7 +2020,12 @@ func (db *engine) runInsertRows(table *catTable, store *tableStore, dbScope *str
 		// path takes no dbScope.
 		return db.insertRowsOnConflict(table, store, pk, checks, defaultExprs, rng, provided, rows, conflict, returning, params, ctes, meter)
 	}
-	returned, err := db.insertRows(table, store, dbScope, pk, checks, defaultExprs, rng, provided, rows, returning, params, ctes, meter)
+	rindexes, err := db.resolveTableIndexes(table)
+	if err != nil {
+		return 0, nil, err
+	}
+	returned, err := db.insertRows(table, store, dbScope, pk, checks, defaultExprs, rindexes,
+		db.columnCollations(table.Columns), rng, provided, rows, returning, params, ctes, meter)
 	if err != nil {
 		return 0, nil, err
 	}

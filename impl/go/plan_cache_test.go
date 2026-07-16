@@ -22,7 +22,7 @@ import (
 // (every column read via Value.Int — the tests use integer columns) plus the final accrued cost.
 func drainQ(t *testing.T, s *Session, stmt *PreparedStatement, params ...Value) ([][]int64, int64) {
 	t.Helper()
-	rows, err := s.queryStmt(stmt.ast, params, &stmt.sc)
+	rows, err := s.queryStmt(stmt.ast, params, &stmt.sc, &stmt.ic)
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}
@@ -132,6 +132,385 @@ func TestPlanCachePointLookupReuses(t *testing.T) {
 	r4, _ := drainQ(t, db, stmt, IntValue(999))
 	if len(r4) != 0 {
 		t.Fatalf("execute 4 (no match) rows = %v", r4)
+	}
+}
+
+func TestInsertCacheEstimatorRevisionDoesNotInvalidate(t *testing.T) {
+	t.Parallel()
+	s := memDB().Session(SessionOptions{})
+	mustExec(t, s, "CREATE TABLE ins (id i32 PRIMARY KEY, v i32)")
+	stmt, err := s.Prepare("INSERT INTO ins VALUES ($1, $2) RETURNING id, v")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := prepOutcome(s, stmt, []Value{IntValue(1), IntValue(10)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := stmt.ic.p.Load()
+	if entry == nil {
+		t.Fatal("expected INSERT cache fill")
+	}
+	plan := entry.plan
+	second, err := prepOutcome(s, stmt, []Value{IntValue(2), IntValue(20)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stmt.ic.p.Load(); got == nil || got.plan != plan {
+		t.Fatal("successful INSERT estimator revision caused a re-plan")
+	}
+	if first.Cost != second.Cost {
+		t.Fatalf("cache-hit cost = %d, want %d", second.Cost, first.Cost)
+	}
+	if len(second.Rows) != 1 || second.Rows[0][0].Int != 2 || second.Rows[0][1].Int != 20 {
+		t.Fatalf("second rows = %v", second.Rows)
+	}
+}
+
+func TestInsertCacheFillsInRowOnlyTransaction(t *testing.T) {
+	t.Parallel()
+	s := memDB().Session(SessionOptions{})
+	mustExec(t, s, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
+	stmt, err := s.Prepare("INSERT INTO t VALUES ($1, $2)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Begin(true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := prepOutcome(s, stmt, []Value{IntValue(1), IntValue(10)}); err != nil {
+		t.Fatal(err)
+	}
+	entry := stmt.ic.p.Load()
+	if entry == nil {
+		t.Fatal("first INSERT in a row-only transaction did not fill")
+	}
+	if _, err := prepOutcome(s, stmt, []Value{IntValue(2), IntValue(20)}); err != nil {
+		t.Fatal(err)
+	}
+	if stmt.ic.p.Load().plan != entry.plan {
+		t.Fatal("second INSERT in transaction did not hit")
+	}
+	if err := s.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestInsertCacheEligibilityExcludesMutableAndComplexShapes(t *testing.T) {
+	t.Parallel()
+	s := memDB().Session(SessionOptions{})
+	mustExec(t, s, "CREATE TABLE t (id i32 PRIMARY KEY, note text)")
+
+	rx, err := s.Prepare("INSERT INTO t VALUES ($1, $2) RETURNING note ~ 'a'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := prepOutcome(s, rx, []Value{IntValue(1), TextValue("abc")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := prepOutcome(s, rx, []Value{IntValue(2), TextValue("abd")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rx.ic.p.Load() != nil || first.Cost != second.Cost {
+		t.Fatal("precompiled-regex RETURNING must re-resolve with identical per-execute cost")
+	}
+
+	subquery, err := s.Prepare("INSERT INTO t VALUES ($1, $2) RETURNING (SELECT max(id) FROM t)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := prepOutcome(s, subquery, []Value{IntValue(3), TextValue("x")}); err != nil {
+		t.Fatal(err)
+	}
+	if subquery.ic.p.Load() != nil {
+		t.Fatal("RETURNING subquery plan must not cache")
+	}
+
+	for _, sql := range []string{
+		"INSERT INTO t SELECT 4, 'select'",
+		"INSERT INTO t VALUES (4, 'conflict') ON CONFLICT DO NOTHING",
+	} {
+		stmt, err := s.Prepare(sql)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := prepOutcome(s, stmt, nil); err != nil {
+			t.Fatal(err)
+		}
+		if stmt.ic.p.Load() != nil {
+			t.Fatalf("ineligible shape cached: %s", sql)
+		}
+	}
+}
+
+func TestInsertCacheInvalidationIdentities(t *testing.T) {
+	t.Parallel()
+	s := memDB().Session(SessionOptions{})
+	mustExec(t, s, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
+	stmt, err := s.Prepare("INSERT INTO t VALUES ($1, $2)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := prepOutcome(s, stmt, []Value{IntValue(1), IntValue(10)}); err != nil {
+		t.Fatal(err)
+	}
+	plan := stmt.ic.p.Load().plan
+
+	mustExec(t, s, "CREATE TABLE unrelated (id i32 PRIMARY KEY)")
+	if _, err := prepOutcome(s, stmt, []Value{IntValue(2), IntValue(20)}); err != nil {
+		t.Fatal(err)
+	}
+	if stmt.ic.p.Load().plan == plan {
+		t.Fatal("documented conservative unrelated-DDL miss did not occur")
+	}
+	plan = stmt.ic.p.Load().plan
+	mustExec(t, s, "CREATE INDEX t_v_idx ON t (v)")
+	if _, err := prepOutcome(s, stmt, []Value{IntValue(3), IntValue(30)}); err != nil {
+		t.Fatal(err)
+	}
+	if stmt.ic.p.Load().plan == plan {
+		t.Fatal("index DDL did not invalidate")
+	}
+	plan = stmt.ic.p.Load().plan
+
+	if err := s.Begin(true); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, s, "DROP INDEX t_v_idx")
+	if _, err := prepOutcome(s, stmt, []Value{IntValue(4), IntValue(40)}); err != nil {
+		t.Fatal(err)
+	}
+	if stmt.ic.p.Load().plan != plan {
+		t.Fatal("working DDL execution replaced the committed cache entry")
+	}
+	if err := s.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := prepOutcome(s, stmt, []Value{IntValue(5), IntValue(50)}); err != nil {
+		t.Fatal(err)
+	}
+	if stmt.ic.p.Load().plan != plan {
+		t.Fatal("rollback did not restore the old cache hit")
+	}
+
+	mustExec(t, s, "DROP TABLE t")
+	mustExec(t, s, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
+	if _, err := prepOutcome(s, stmt, []Value{IntValue(9), IntValue(90)}); err != nil {
+		t.Fatal(err)
+	}
+	if stmt.ic.p.Load().plan == plan {
+		t.Fatal("DROP/CREATE served a stale target plan")
+	}
+
+	other := memDB().Session(SessionOptions{})
+	mustExec(t, other, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
+	beforeOther := stmt.ic.p.Load().plan
+	if _, err := prepOutcome(other, stmt, []Value{IntValue(1), IntValue(100)}); err != nil {
+		t.Fatal(err)
+	}
+	if stmt.ic.p.Load().plan == beforeOther {
+		t.Fatal("cross-database false hit")
+	}
+
+	base := memDB()
+	if err := base.Attach("aux", AttachMemory(), false); err != nil {
+		t.Fatal(err)
+	}
+	attachedSession := base.Session(SessionOptions{})
+	mustExec(t, attachedSession, "CREATE TABLE aux.t (id i32 PRIMARY KEY, v i32)")
+	attached, err := base.Prepare("INSERT INTO aux.t VALUES ($1, $2)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := prepOutcome(attachedSession, attached, []Value{IntValue(1), IntValue(10)}); err != nil {
+		t.Fatal(err)
+	}
+	attachedPlan := attached.ic.p.Load().plan
+	if err := base.Detach("aux"); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Attach("aux", AttachMemory(), false); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, attachedSession, "CREATE TABLE aux.t (id i32 PRIMARY KEY, v i32)")
+	if _, err := prepOutcome(attachedSession, attached, []Value{IntValue(2), IntValue(20)}); err != nil {
+		t.Fatal(err)
+	}
+	if attached.ic.p.Load().plan == attachedPlan {
+		t.Fatal("re-attached database false hit")
+	}
+
+	shadowed := memDB()
+	b := shadowed.Session(SessionOptions{})
+	mustExec(t, b, "CREATE TEMP TABLE t (id i32 PRIMARY KEY, v i32)")
+	a := shadowed.Session(SessionOptions{})
+	mustExec(t, a, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
+	shadowStmt, err := shadowed.Prepare("INSERT INTO t VALUES ($1, $2)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := prepOutcome(a, shadowStmt, []Value{IntValue(1), IntValue(10)}); err != nil {
+		t.Fatal(err)
+	}
+	persistentPlan := shadowStmt.ic.p.Load().plan
+	if _, err := prepOutcome(b, shadowStmt, []Value{IntValue(1), IntValue(111)}); err != nil {
+		t.Fatal(err)
+	}
+	if shadowStmt.ic.p.Load().plan != persistentPlan {
+		t.Fatal("temp execution replaced the persistent entry")
+	}
+	if _, err := prepOutcome(a, shadowStmt, []Value{IntValue(2), IntValue(20)}); err != nil {
+		t.Fatal(err)
+	}
+	if shadowStmt.ic.p.Load().plan != persistentPlan {
+		t.Fatal("temp shadow poisoned the old hit")
+	}
+}
+
+func TestInsertCacheRechecksPrivilegeAndReadOnly(t *testing.T) {
+	t.Parallel()
+	base := memDB()
+	writer := base.Session(SessionOptions{})
+	mustExec(t, writer, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
+	stmt, err := base.Prepare("INSERT INTO t VALUES ($1, $2)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := prepOutcome(writer, stmt, []Value{IntValue(1), IntValue(10)}); err != nil {
+		t.Fatal(err)
+	}
+	plan := stmt.ic.p.Load().plan
+	readOnlyPrivileges := PrivSetEmpty.With(PrivSelect)
+	restricted := base.Session(SessionOptions{DefaultPrivileges: &readOnlyPrivileges})
+	if _, err := prepOutcome(restricted, stmt, []Value{IntValue(2), IntValue(20)}); sessCode(t, err) != "42501" {
+		t.Fatalf("cached INSERT privilege gate = %v, want 42501", err)
+	}
+	if stmt.ic.p.Load().plan != plan {
+		t.Fatal("failed privilege gate changed cache")
+	}
+	if err := writer.Begin(false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := prepOutcome(writer, stmt, []Value{IntValue(2), IntValue(20)}); sessCode(t, err) != "25006" {
+		t.Fatalf("cached INSERT read-only gate = %v, want 25006", err)
+	}
+	_ = writer.Rollback()
+	if stmt.ic.p.Load().plan != plan {
+		t.Fatal("failed read-only gate changed cache")
+	}
+}
+
+func TestInsertCacheCollationUpgradeInvalidates(t *testing.T) {
+	loadFixtureBundle(t)
+	base := memDB()
+	s := base.Session(SessionOptions{})
+	mustExec(t, s, `CREATE TABLE t (id i32 PRIMARY KEY, x text COLLATE "unicode")`)
+	stmt, err := base.Prepare("INSERT INTO t VALUES ($1, $2)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := prepOutcome(s, stmt, []Value{IntValue(1), TextValue("a")}); err != nil {
+		t.Fatal(err)
+	}
+	plan := stmt.ic.p.Load().plan
+	loaded := LoadedCollation("unicode")
+	skewed := *loaded
+	skewed.UnicodeVersion = "0.0.0"
+	s.engine.committed.collations["unicode"] = &skewed
+	if n, err := s.UpgradeCollations(); err != nil || n != 1 {
+		t.Fatalf("upgrade = (%d, %v), want (1, nil)", n, err)
+	}
+	if _, err := prepOutcome(s, stmt, []Value{IntValue(2), TextValue("b")}); err != nil {
+		t.Fatal(err)
+	}
+	if stmt.ic.p.Load().plan == plan {
+		t.Fatal("collation upgrade retained stale resolved collation identities")
+	}
+}
+
+func TestInsertCacheHitMatchesFreshResolution(t *testing.T) {
+	t.Parallel()
+	cachedDB := memDB().Session(SessionOptions{})
+	freshDB := memDB().Session(SessionOptions{})
+	for _, s := range []*Session{cachedDB, freshDB} {
+		mustExec(t, s, "CREATE TABLE t (id i32 PRIMARY KEY, v i32 CHECK (v > 0), note text DEFAULT 'x')")
+		mustExec(t, s, "CREATE UNIQUE INDEX t_v_idx ON t (v)")
+	}
+	stmt, err := cachedDB.Prepare("INSERT INTO t (id, v) VALUES ($1, $2) RETURNING id, note")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := prepOutcome(cachedDB, stmt, []Value{IntValue(1), IntValue(10)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queryOutcome(freshDB, "INSERT INTO t (id, v) VALUES (1, 10) RETURNING id, note", nil); err != nil {
+		t.Fatal(err)
+	}
+	plan := stmt.ic.p.Load().plan
+	hit, err := prepOutcome(cachedDB, stmt, []Value{IntValue(2), IntValue(20)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := queryOutcome(freshDB, "INSERT INTO t (id, v) VALUES (2, 20) RETURNING id, note", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stmt.ic.p.Load().plan != plan || !reflect.DeepEqual(hit.Rows, fresh.Rows) || hit.Cost != fresh.Cost {
+		t.Fatalf("hit/fresh differ: rows=%v/%v cost=%d/%d", hit.Rows, fresh.Rows, hit.Cost, fresh.Cost)
+	}
+	cachedImage, err := cachedDB.ToImage(8192, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	freshImage, err := freshDB.ToImage(8192, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(cachedImage, freshImage) {
+		t.Fatal("cache hit and fresh resolution produced different tree bytes")
+	}
+	_, hitErr := prepOutcome(cachedDB, stmt, []Value{IntValue(2), IntValue(20)})
+	_, freshErr := queryOutcome(freshDB, "INSERT INTO t (id, v) VALUES (2, 20) RETURNING id, note", nil)
+	if sessCode(t, hitErr) != sessCode(t, freshErr) || hitErr.Error() != freshErr.Error() {
+		t.Fatalf("hit/fresh errors differ: %v / %v", hitErr, freshErr)
+	}
+}
+
+func TestInsertCacheConcurrentSessions(t *testing.T) {
+	base := memDB()
+	seed := base.Session(SessionOptions{})
+	mustExec(t, seed, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
+	stmt, err := base.Prepare("INSERT INTO t VALUES ($1, $2)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const goroutines, iterations = 8, 40
+	errCh := make(chan error, goroutines)
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			s := base.Session(SessionOptions{})
+			defer s.Close()
+			for i := 0; i < iterations; i++ {
+				id := int64(g*iterations + i + 1)
+				if _, err := prepOutcome(s, stmt, []Value{IntValue(id), IntValue(id)}); err != nil {
+					errCh <- err
+					return
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+	if stmt.ic.p.Load() == nil {
+		t.Fatal("concurrent fills left cache empty")
 	}
 }
 

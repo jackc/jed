@@ -13,7 +13,13 @@ import {
   type RunResult,
   Statement as ErgoStatement,
 } from "./ergonomic.ts";
-import { type Engine, type Outcome, type ScanCacheHolder, stmtIsWrite } from "./executor.ts";
+import {
+  type Engine,
+  type InsertCacheHolder,
+  type Outcome,
+  type ScanCacheHolder,
+  stmtIsWrite,
+} from "./executor.ts";
 import type { Value } from "./value.ts";
 
 // PreparedStatement is a parsed, reusable statement (spec/design/api.md §2.4): a standalone value
@@ -35,6 +41,8 @@ export class PreparedStatement {
    * a write / materialized shape never touches it.
    */
   readonly scHolder: ScanCacheHolder = { cache: null };
+  /** @internal The separately typed prepared-INSERT slot (api.md §2.4). */
+  readonly icHolder: InsertCacheHolder = { cache: null };
 
   constructor(ast: Statement) {
     this.ast = ast;
@@ -59,7 +67,7 @@ export function executePrepared(
 // but reuses its cached plan across executes (spec/design/api.md §2.4). The shared-core surface is
 // Database/Session/Transaction.queryPrepared.
 export function queryPrepared(db: Engine, stmt: PreparedStatement, params: Value[] = []): Rows {
-  return queryStmt(db, stmt.ast, params, stmt.scHolder);
+  return queryStmt(db, stmt.ast, params, stmt.scHolder, stmt.icHolder);
 }
 
 // Rows is a cursor over a query's rows (spec/design/api.md §4). It is a thin wrapper over a Cursor
@@ -203,7 +211,7 @@ export function prepare(db: Engine, sql: string): PreparedStatement {
 // at a time. (This is the bare single-handle Engine; the watermark pin lives on the shared-core
 // Session.query path.)
 export function query(db: Engine, sql: string, params: Value[] = []): Rows {
-  return queryStmt(db, db.parse(sql), params, null);
+  return queryStmt(db, db.parse(sql), params, null, null);
 }
 
 // queryStmt routes an already-parsed query AST through the plan-once scan (streaming/buffered) then
@@ -217,6 +225,7 @@ function queryStmt(
   stmt: Statement,
   params: Value[],
   holder: ScanCacheHolder | null,
+  insertHolder: InsertCacheHolder | null,
 ): Rows {
   // attachBlockPoison: a DRAIN-time read fault inside an open block aborts it (open-time lane errors are
   // poisoned by the catch below); a no-op for an autocommit read. The hook re-checks the block at error
@@ -254,7 +263,7 @@ function queryStmt(
   // control) self-poisons in executeStmtParams's block branch with the right nuance (a nested BEGIN's
   // 25001 must NOT poison), so it is left intact — only the lazy-lane reads above, which bypass it, are
   // poisoned by the catch.
-  return rowsFromOutcome(db.executeStmtParams(stmt, params));
+  return rowsFromOutcome(db.executeStmtParams(stmt, params, insertHolder));
 }
 
 // querySql is an alias for query, symmetric with the Rust/Go QuerySQL naming (api.md §6).
@@ -311,11 +320,11 @@ export class Transaction {
   }
 
   // queryPrepared runs a prepared query within this transaction (against its working set), returning
-  // a row cursor — the prepared analogue of query. Like query, the transaction path is materialized
-  // (no lazy lane), so the plan cache is neither consulted nor filled here — an in-block execute is
-  // correct but unmemoized, matching fill-only-from-committed (api.md §2.4).
+  // a row cursor — the prepared analogue of query. The transaction path is materialized (no lazy
+  // SELECT lane), but it still threads the independent INSERT cache so a row-only block whose visible
+  // schema matches committed state can fill and reuse immutable DML resolution (api.md §2.4).
   queryPrepared(stmt: PreparedStatement, params: Value[] = []): Rows {
-    return rowsFromOutcome(this.db.executeStmtParams(stmt.ast, params));
+    return rowsFromOutcome(this.db.executeStmtParams(stmt.ast, params, stmt.icHolder));
   }
 
   // executeCancelable runs a statement within this transaction under an AbortSignal (spec/design/

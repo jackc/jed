@@ -6,7 +6,7 @@ use crate::ast::Statement;
 use crate::cancel::CancellationToken;
 use crate::cursor::Cursor;
 use crate::error::{EngineError, Result, SqlState};
-use crate::executor::{CachedPlan, Engine, Outcome};
+use crate::executor::{CachedInsert, CachedPlan, Engine, Outcome};
 use crate::parser::Parser;
 use crate::value::Value;
 use std::cell::RefCell;
@@ -29,6 +29,9 @@ pub struct PreparedStatement {
     /// Empty until the first cacheable query execute fills it; invalidated automatically when the
     /// catalog generation moves (spec/design/api.md §2.4).
     cache: RefCell<Option<CachedPlan>>,
+    /// Separately typed prepared-INSERT slot. The parsed AST kind is immutable, so at most one of
+    /// the SELECT and INSERT slots can ever fill (spec/design/api.md §2.4).
+    insert_cache: RefCell<Option<CachedInsert>>,
 }
 
 impl PreparedStatement {
@@ -45,6 +48,10 @@ impl PreparedStatement {
     /// plan across executes (and across sessions of one database).
     pub(crate) fn cache(&self) -> &RefCell<Option<CachedPlan>> {
         &self.cache
+    }
+
+    pub(crate) fn insert_cache(&self) -> &RefCell<Option<CachedInsert>> {
+        &self.insert_cache
     }
 }
 
@@ -279,8 +286,12 @@ impl Transaction<'_> {
     /// cursor — the prepared analogue of [`query`](Transaction::query). Reuses the statement's cached
     /// plan when this database + committed catalog still match it (spec/design/api.md §2.4).
     pub fn query_prepared(&mut self, stmt: &PreparedStatement, params: &[Value]) -> Result<Rows> {
-        self.db
-            .query_ast_cached(stmt.ast(), params, Some(stmt.cache()))
+        self.db.query_ast_cached(
+            stmt.ast(),
+            params,
+            Some(stmt.cache()),
+            Some(stmt.insert_cache()),
+        )
     }
 
     /// Run a statement within this transaction under a [`CancellationToken`] (spec/design/api.md
@@ -406,6 +417,7 @@ impl Engine {
         Ok(PreparedStatement {
             ast: self.parse(sql)?,
             cache: RefCell::new(None),
+            insert_cache: RefCell::new(None),
         })
     }
 
@@ -437,7 +449,7 @@ impl Engine {
     /// AST), so a prepared query streams identically to an ad-hoc one. (The bare single-handle
     /// [`Engine`]; the watermark pin lives on the shared-core [`Session`](crate::Session) path.)
     pub(crate) fn query_ast(&mut self, ast: Statement, params: &[Value]) -> Result<Rows> {
-        self.query_ast_cached(&ast, params, None)
+        self.query_ast_cached(&ast, params, None, None)
     }
 
     /// [`query_ast`](Engine::query_ast) with an optional prepared-statement plan cache: a scan-shaped
@@ -450,6 +462,7 @@ impl Engine {
         ast: &Statement,
         params: &[Value],
         cache: Option<&RefCell<Option<CachedPlan>>>,
+        insert_cache: Option<&RefCell<Option<CachedInsert>>>,
     ) -> Result<Rows> {
         // A read served by a lazy lane skips the materialized `execute_stmt_params`, so enforce the
         // read-path admission gates (25P02 / 54P02 / 42501) up front — reads only (transaction control
@@ -483,9 +496,11 @@ impl Engine {
         // The fall-through handles transaction control (a nested BEGIN's 25001 must NOT poison) and
         // self-poisons on a regular statement error (`execute_stmt_params`), so its nuanced poisoning
         // is left intact — only the lazy-lane reads above, which bypass it, are poisoned here.
-        Ok(Rows::from_outcome(
-            self.execute_stmt_params(ast.clone(), params)?,
-        ))
+        Ok(Rows::from_outcome(self.execute_stmt_params_cached(
+            ast.clone(),
+            params,
+            insert_cache,
+        )?))
     }
 
     /// Run a multi-statement `sql` **script** on the default session (spec/design/session.md §4.2):

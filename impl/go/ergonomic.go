@@ -172,14 +172,14 @@ func (tx *Transaction) QueryRow(ctx context.Context, sql string, args ...any) *R
 func (db *Database) QueryPrepared(ctx context.Context, stmt *PreparedStatement, args ...any) (*Rows, error) {
 	s := db.Session(SessionOptions{})
 	defer s.Close()
-	return ergoQuery(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.queryStmt(stmt.ast, p, &stmt.sc) })
+	return ergoQuery(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.queryStmt(stmt.ast, p, &stmt.sc, &stmt.ic) })
 }
 
 // ExecPrepared runs a prepared statement on a fresh autocommit session and returns its command tag.
 func (db *Database) ExecPrepared(ctx context.Context, stmt *PreparedStatement, args ...any) (Result, error) {
 	s := db.Session(SessionOptions{})
 	defer s.Close()
-	return ergoExec(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.queryStmt(stmt.ast, p, &stmt.sc) })
+	return ergoExec(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.queryStmt(stmt.ast, p, &stmt.sc, &stmt.ic) })
 }
 
 // QueryRowPrepared runs a prepared query and returns a one-row handle; a setup error defers to Row.Scan.
@@ -190,12 +190,12 @@ func (db *Database) QueryRowPrepared(ctx context.Context, stmt *PreparedStatemen
 
 // QueryPrepared runs a prepared query on this session (its pinned snapshot, privileges, temp domain).
 func (s *Session) QueryPrepared(ctx context.Context, stmt *PreparedStatement, args ...any) (*Rows, error) {
-	return ergoQuery(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.queryStmt(stmt.ast, p, &stmt.sc) })
+	return ergoQuery(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.queryStmt(stmt.ast, p, &stmt.sc, &stmt.ic) })
 }
 
 // ExecPrepared runs a prepared statement on this session and returns its command tag.
 func (s *Session) ExecPrepared(ctx context.Context, stmt *PreparedStatement, args ...any) (Result, error) {
-	return ergoExec(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.queryStmt(stmt.ast, p, &stmt.sc) })
+	return ergoExec(ctx, s.engine, args, func(p []Value) (*Rows, error) { return s.queryStmt(stmt.ast, p, &stmt.sc, &stmt.ic) })
 }
 
 // QueryRowPrepared runs a prepared query and returns a one-row handle; a setup error defers to Row.Scan.
@@ -206,12 +206,12 @@ func (s *Session) QueryRowPrepared(ctx context.Context, stmt *PreparedStatement,
 
 // QueryPrepared runs a prepared query within this transaction (against its working set).
 func (tx *Transaction) QueryPrepared(ctx context.Context, stmt *PreparedStatement, args ...any) (*Rows, error) {
-	return ergoQuery(ctx, tx.db, args, func(p []Value) (*Rows, error) { return tx.db.queryStmt(stmt.ast, p, &stmt.sc) })
+	return ergoQuery(ctx, tx.db, args, func(p []Value) (*Rows, error) { return tx.db.queryStmt(stmt.ast, p, &stmt.sc, &stmt.ic) })
 }
 
 // ExecPrepared runs a prepared statement within this transaction and returns its command tag.
 func (tx *Transaction) ExecPrepared(ctx context.Context, stmt *PreparedStatement, args ...any) (Result, error) {
-	return ergoExec(ctx, tx.db, args, func(p []Value) (*Rows, error) { return tx.db.queryStmt(stmt.ast, p, &stmt.sc) })
+	return ergoExec(ctx, tx.db, args, func(p []Value) (*Rows, error) { return tx.db.queryStmt(stmt.ast, p, &stmt.sc, &stmt.ic) })
 }
 
 // QueryRowPrepared runs a prepared query and returns a one-row handle; a setup error defers to Row.Scan.

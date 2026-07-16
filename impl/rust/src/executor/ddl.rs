@@ -156,6 +156,18 @@ impl Engine {
     /// Dispatch one parsed statement to its executor. The autocommit transaction handling
     /// (capture / durable commit / rollback-on-error) lives in `execute_stmt_params`.
     pub(crate) fn dispatch_stmt(&mut self, stmt: Statement, params: &[Value]) -> Result<Outcome> {
+        self.dispatch_stmt_cached(stmt, params, None, false)
+    }
+
+    /// `dispatch_stmt` with the private prepared-INSERT slot. Admission stays before cache lookup,
+    /// so a hit cannot bypass lifetime or privilege gates (spec/design/api.md §2.4).
+    pub(crate) fn dispatch_stmt_cached(
+        &mut self,
+        stmt: Statement,
+        params: &[Value],
+        insert_cache: Option<&std::cell::RefCell<Option<CachedInsert>>>,
+        allow_insert_fill: bool,
+    ) -> Result<Outcome> {
         // Lifetime budget admission (spec/design/session.md §5.4): once the session's cumulative cost
         // has reached `lifetime_max_cost`, every further statement is rejected `54P02` **before it can
         // accrue** — checked ahead of privileges/existence, so an exhausted session runs nothing. A
@@ -169,7 +181,7 @@ impl Engine {
         // common path pays nothing. The physical access-mode gate (`25006`) is checked earlier in
         // `execute_stmt_params`, so it wins when both apply.
         self.check_privileges(&stmt)?;
-        let out = self.dispatch_stmt_body(stmt, params);
+        let out = self.dispatch_stmt_body_cached(stmt, params, insert_cache, allow_insert_fill);
         // Keep each GiST index's resident R-tree current: after a statement that mutated the main
         // image, rebuild it from the (now-updated) leaf store so the next read descends a fresh tree
         // (spec/design/gist.md §3/§4.1). A no-op for reads / temp-only writes (main_dirty unset).
@@ -187,6 +199,16 @@ impl Engine {
         &mut self,
         stmt: Statement,
         params: &[Value],
+    ) -> Result<Outcome> {
+        self.dispatch_stmt_body_cached(stmt, params, None, false)
+    }
+
+    pub(crate) fn dispatch_stmt_body_cached(
+        &mut self,
+        stmt: Statement,
+        params: &[Value],
+        insert_cache: Option<&std::cell::RefCell<Option<CachedInsert>>>,
+        allow_insert_fill: bool,
     ) -> Result<Outcome> {
         match stmt {
             Statement::Analyze(analyze) => {
@@ -233,7 +255,13 @@ impl Engine {
                 reject_params_for_ddl(params)?;
                 self.execute_alter_sequence(als)
             }
-            Statement::Insert(ins) => self.execute_insert(ins, params, CteCtx::empty()),
+            Statement::Insert(ins) => self.execute_insert_cached(
+                ins,
+                params,
+                CteCtx::empty(),
+                insert_cache,
+                allow_insert_fill,
+            ),
             Statement::Select(sel) => self.execute_select(sel, params),
             Statement::SetOp(so) => self.execute_set_op(so, params),
             Statement::With(wq) => self.execute_with(wq, params),
@@ -3573,19 +3601,21 @@ impl Engine {
     /// for a catalog produced by CREATE TABLE or a well-formed file (both validated); a
     /// hand-corrupted expression surfaces its natural resolve error.
     pub(crate) fn resolve_checks(&self, table: &Table) -> Result<Vec<(String, RExpr)>> {
+        self.resolve_checks_with_params(table, &mut ParamTypes::default())
+    }
+
+    pub(crate) fn resolve_checks_with_params(
+        &self,
+        table: &Table,
+        params: &mut ParamTypes,
+    ) -> Result<Vec<(String, RExpr)>> {
         if table.checks.is_empty() {
             return Ok(Vec::new());
         }
         let scope = Scope::single(self, table);
         let mut out = Vec::with_capacity(table.checks.len());
         for c in &table.checks {
-            let (node, _) = resolve(
-                &scope,
-                &c.expr,
-                None,
-                &mut AggCtx::Forbidden,
-                &mut ParamTypes::default(),
-            )?;
+            let (node, _) = resolve(&scope, &c.expr, None, &mut AggCtx::Forbidden, params)?;
             out.push((c.name.clone(), node));
         }
         Ok(out)
@@ -3599,19 +3629,23 @@ impl Engine {
     /// re-resolving with `AggCtx::Forbidden` is inert). Returns an owned [`ResolvedIndex`], so the
     /// write paths can hold it while mutating stores.
     pub(crate) fn resolve_index(&self, table: &Table, def: &IndexDef) -> Result<ResolvedIndex> {
+        self.resolve_index_with_params(table, def, &mut ParamTypes::default())
+    }
+
+    pub(crate) fn resolve_index_with_params(
+        &self,
+        table: &Table,
+        def: &IndexDef,
+        params: &mut ParamTypes,
+    ) -> Result<ResolvedIndex> {
         let mut keys = Vec::with_capacity(def.keys.len());
         for k in &def.keys {
             match k {
                 IndexKey::Column(ord) => keys.push(ResolvedKey::Column(*ord)),
                 IndexKey::Expr(e) => {
                     let scope = Scope::single(self, table);
-                    let (rexpr, rtype) = resolve(
-                        &scope,
-                        &e.expr,
-                        None,
-                        &mut AggCtx::Forbidden,
-                        &mut ParamTypes::default(),
-                    )?;
+                    let (rexpr, rtype) =
+                        resolve(&scope, &e.expr, None, &mut AggCtx::Forbidden, params)?;
                     let ty = resolved_to_key_type(&rtype)
                         .expect("index expression result type validated indexable at CREATE INDEX");
                     let coll = resolve_deriv(scope.catalog, derive_collation(&scope, &e.expr)?)?;
@@ -3626,11 +3660,7 @@ impl Engine {
             None => None,
             Some(p) => {
                 let scope = Scope::single(self, table);
-                Some(resolve_boolean_filter(
-                    &scope,
-                    &p.expr,
-                    &mut ParamTypes::default(),
-                )?)
+                Some(resolve_boolean_filter(&scope, &p.expr, params)?)
             }
         };
         Ok(ResolvedIndex {
@@ -3645,10 +3675,18 @@ impl Engine {
     /// Resolve every index of a table once per statement (the maintenance driver — INSERT / UPDATE
     /// / DELETE build their `ResolvedIndex` list up front, parallel to `table.indexes`).
     pub(crate) fn resolve_table_indexes(&self, table: &Table) -> Result<Vec<ResolvedIndex>> {
+        self.resolve_table_indexes_with_params(table, &mut ParamTypes::default())
+    }
+
+    pub(crate) fn resolve_table_indexes_with_params(
+        &self,
+        table: &Table,
+        params: &mut ParamTypes,
+    ) -> Result<Vec<ResolvedIndex>> {
         table
             .indexes
             .iter()
-            .map(|d| self.resolve_index(table, d))
+            .map(|d| self.resolve_index_with_params(table, d, params))
             .collect()
     }
 
@@ -3726,6 +3764,14 @@ impl Engine {
     /// a column reference was rejected 0A000 at CREATE TABLE) with the column's type as the
     /// adaptable-operand hint.
     pub(crate) fn resolve_default_exprs(&self, table: &Table) -> Result<Vec<Option<RExpr>>> {
+        self.resolve_default_exprs_with_params(table, &mut ParamTypes::default())
+    }
+
+    pub(crate) fn resolve_default_exprs_with_params(
+        &self,
+        table: &Table,
+        params: &mut ParamTypes,
+    ) -> Result<Vec<Option<RExpr>>> {
         let mut out = Vec::with_capacity(table.columns.len());
         for col in &table.columns {
             match &col.default_expr {
@@ -3736,7 +3782,7 @@ impl Engine {
                         &de.expr,
                         Some(col.ty.scalar()),
                         &mut AggCtx::Forbidden,
-                        &mut ParamTypes::default(),
+                        params,
                     )?;
                     out.push(Some(node));
                 }

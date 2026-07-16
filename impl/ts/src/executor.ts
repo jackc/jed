@@ -2214,7 +2214,11 @@ export class Engine {
   //     persistHook, synchronous=on). Any failure — in the statement or the durable write — restores
   //     the captured state (rollback-on-error, discarding partial work and any rowid allocations,
   //     §7). For an in-memory database persistHook is null, so autocommit is pure in-memory.
-  executeStmtParams(stmt: Statement, params: Value[]): Outcome {
+  executeStmtParams(
+    stmt: Statement,
+    params: Value[],
+    insertHolder: InsertCacheHolder | null = null,
+  ): Outcome {
     switch (stmt.kind) {
       case "begin":
         return this.beginTx(stmt.writable);
@@ -2247,7 +2251,9 @@ export class Engine {
             "cannot execute " + stmtKind(stmt) + " in a read-only transaction",
           );
         }
-        const outcome = this.dispatchStmt(stmt, params);
+        // The INSERT cache's visible-vs-committed signature guard permits row-only blocks to fill
+        // while preventing working DDL from publishing a plan.
+        const outcome = this.dispatchStmt(stmt, params, insertHolder, true);
         // Enforce the temp-storage budget after a successful temp write (temp-tables.md §7): an
         // over-budget statement (session-local tempBuffers) throws 54P03, which aborts the block (the
         // staged temp rows roll back at ROLLBACK). A no-op for non-temp statements.
@@ -2267,7 +2273,7 @@ export class Engine {
     // error. Because the write mutates only working, an error leaves committed untouched (no restore
     // needed); rolled-back rowid allocations vanish with working (§7).
     if (!stmtIsWrite(stmt)) {
-      return this.dispatchStmt(stmt, params);
+      return this.dispatchStmt(stmt, params, null, false);
     }
     // On a read-only handle the implicit transaction is READ ONLY (PostgreSQL hot-standby
     // behavior — api.md §2.1), so an autocommit write fails exactly like a write inside a
@@ -2281,7 +2287,7 @@ export class Engine {
     this.session.tx = this.newTx(true);
     let outcome: Outcome;
     try {
-      outcome = this.dispatchStmt(stmt, params);
+      outcome = this.dispatchStmt(stmt, params, insertHolder, true);
       // Enforce the temp-storage budget before committing (temp-tables.md §7): an over-budget temp
       // write in this implicit transaction (session-local tempBuffers) is discarded (rolling back temp
       // + main) and surfaces 54P03.
@@ -2677,7 +2683,12 @@ export class Engine {
     }
   }
 
-  private dispatchStmt(stmt: Statement, params: Value[]): Outcome {
+  private dispatchStmt(
+    stmt: Statement,
+    params: Value[],
+    insertHolder: InsertCacheHolder | null = null,
+    allowInsertFill = false,
+  ): Outcome {
     // Lifetime budget admission (spec/design/session.md §5.4): once the session's cumulative cost has
     // reached lifetime_max_cost, every further statement is rejected 54P02 BEFORE it can accrue —
     // checked ahead of privileges/existence, so an exhausted session runs nothing. A no-op when the
@@ -2690,7 +2701,7 @@ export class Engine {
     // physical access-mode gate (25006) is checked earlier in executeStmtParams, so it wins when both
     // apply.
     this.checkPrivileges(stmt);
-    const out = this.dispatchStmtBody(stmt, params);
+    const out = this.dispatchStmtBody(stmt, params, insertHolder, allowInsertFill);
     // Keep each GiST index's resident R-tree current: after a statement that mutated the main image,
     // rebuild it from the (now-updated) leaf store so the next read descends a fresh tree (gist.md
     // §3/§4.1). A no-op for reads / temp-only writes (mainDirty unset), preserving the
@@ -2701,7 +2712,12 @@ export class Engine {
     return out;
   }
 
-  private dispatchStmtBody(stmt: Statement, params: Value[]): Outcome {
+  private dispatchStmtBody(
+    stmt: Statement,
+    params: Value[],
+    insertHolder: InsertCacheHolder | null = null,
+    allowInsertFill = false,
+  ): Outcome {
     switch (stmt.kind) {
       case "analyze":
         rejectParamsForDDL(params);
@@ -2737,7 +2753,13 @@ export class Engine {
         rejectParamsForDDL(params);
         return this.executeDropSequence(stmt);
       case "insert":
-        return this.executeInsert(stmt, params, EMPTY_CTE_CTX);
+        return this.executeInsertCached(
+          stmt,
+          params,
+          EMPTY_CTE_CTX,
+          insertHolder,
+          allowInsertFill,
+        );
       case "select":
         return this.executeSelect(stmt, params);
       case "setOp":
@@ -5188,7 +5210,7 @@ export class Engine {
   // expression against a one-relation scope, in the catalog's (evaluation/name) order.
   // Cannot fail for a catalog produced by CREATE TABLE or a well-formed file (both
   // validated); a hand-corrupted expression surfaces its natural resolve error.
-  private resolveChecks(table: Table): NamedCheck[] {
+  private resolveChecks(table: Table, ptypes: ParamTypes = new ParamTypes()): NamedCheck[] {
     if (table.checks.length === 0) return [];
     const scope = Scope.single(this, table);
     return table.checks.map((c) => ({
@@ -5198,7 +5220,7 @@ export class Engine {
         c.expr,
         null,
         { collecting: false, groupKeys: [], specs: [] },
-        new ParamTypes(),
+        ptypes,
       ).node,
     }));
   }
@@ -5226,7 +5248,11 @@ export class Engine {
   // cannot newly fail (an aggregate/window/subquery/param was rejected then, and re-resolving under
   // the Forbidden agg mode is inert). Returns an owned ResolvedIndex, so the write paths can hold it
   // while mutating stores.
-  resolveIndex(table: Table, def: IndexDef): ResolvedIndex {
+  resolveIndex(
+    table: Table,
+    def: IndexDef,
+    ptypes: ParamTypes = new ParamTypes(),
+  ): ResolvedIndex {
     const keys: ResolvedKey[] = def.keys.map((k) => {
       if (k.kind === "column") return { kind: "column", column: k.column };
       const scope = Scope.single(this, table);
@@ -5235,7 +5261,7 @@ export class Engine {
         k.expr,
         null,
         { collecting: false, groupKeys: [], specs: [] },
-        new ParamTypes(),
+        ptypes,
       );
       const ty = resolvedToKeyType(type);
       if (ty === null) {
@@ -5251,7 +5277,7 @@ export class Engine {
       predicate = resolveBooleanFilter(
         Scope.single(this, table),
         def.predicate.expr,
-        new ParamTypes(),
+        ptypes,
       );
     }
     return { name: def.name, unique: def.unique, kind: def.kind, keys, predicate };
@@ -5259,8 +5285,8 @@ export class Engine {
 
   // resolveTableIndexes resolves every index of a table once per statement (the maintenance driver —
   // INSERT / UPDATE / DELETE build their ResolvedIndex list up front, parallel to table.indexes).
-  resolveTableIndexes(table: Table): ResolvedIndex[] {
-    return table.indexes.map((d) => this.resolveIndex(table, d));
+  resolveTableIndexes(table: Table, ptypes: ParamTypes = new ParamTypes()): ResolvedIndex[] {
+    return table.indexes.map((d) => this.resolveIndex(table, d, ptypes));
   }
 
   // indexEntries is a row's secondary-index entry keys for maintenance (spec/design/indexes.md §4),
@@ -5314,7 +5340,10 @@ export class Engine {
   // constant default or no default. The default resolves against an EMPTY scope (no columns; a
   // column reference was rejected 0A000 at CREATE TABLE) with the column's type as the operand
   // hint.
-  private resolveDefaultExprs(table: Table): (RExpr | null)[] {
+  private resolveDefaultExprs(
+    table: Table,
+    ptypes: ParamTypes = new ParamTypes(),
+  ): (RExpr | null)[] {
     return table.columns.map((col) => {
       if (col.defaultExpr === null) return null;
       return resolve(
@@ -5322,7 +5351,7 @@ export class Engine {
         col.defaultExpr.expr,
         typeScalar(col.type),
         { collecting: false, groupKeys: [], specs: [] },
-        new ParamTypes(),
+        ptypes,
       ).node;
     });
   }
@@ -8086,6 +8115,326 @@ export class Engine {
   // (literals + constant defaults), SELECT is the embedded query's accrued cost. The SELECT
   // source additionally validates output arity (42601) and per-column type assignability (42804)
   // up front, before any row is produced — so both fire even over an empty source.
+  private executeInsertCached(
+    ins: Insert,
+    params: Value[],
+    ctx: CteCtx,
+    holder: InsertCacheHolder | null,
+    allowFill: boolean,
+  ): Outcome {
+    // INSERT ... SELECT and ON CONFLICT keep the general planner. Writable-CTE INSERTs call
+    // executeInsert directly, so this route is necessarily a top-level plain VALUES statement.
+    if (ins.source.kind !== "values" || ins.onConflict !== null) {
+      return this.executeInsert(ins, params, ctx);
+    }
+    return this.executeInsertValuesCached(ins, params, ctx, holder, allowFill);
+  }
+
+  // The exact catalog signature of a persistent INSERT target. A bare name that currently resolves
+  // to temp and an explicit temp target are deliberately uncacheable; attachments contribute their
+  // own snapshot identity, so detach/re-attach cannot alias an old entry.
+  private insertTargetSignature(
+    scope: string | undefined,
+    tableName: string,
+  ): InsertTargetSignature | null {
+    let snap: Snapshot | undefined;
+    if (scope === undefined) {
+      if (this.isTempTable(tableName)) return null;
+      snap = this.readSnap();
+    } else {
+      const db = scope.toLowerCase();
+      if (db === "temp") return null;
+      snap = db === "main" ? this.readSnap() : this.attachReadSnap(db);
+    }
+    const table = tableName.toLowerCase();
+    if (snap === undefined || snap.table(table) === undefined) return null;
+    return {
+      core: this.core ?? this,
+      database: snap.estimatorIdentity,
+      catGen: snap.catGen,
+      table,
+    };
+  }
+
+  // Fill guard for explicit transactions. Row writes preserve this committed schema signature, so
+  // the first INSERT in a long block can fill; working DDL changes catGen (or target identity) and
+  // therefore cannot publish its resolved plan into the prepared statement.
+  private committedInsertTargetSignature(
+    scope: string | undefined,
+    tableName: string,
+  ): InsertTargetSignature | null {
+    let snap: Snapshot | undefined;
+    if (scope === undefined) {
+      if (this.isTempTable(tableName)) return null;
+      snap = this.committed;
+    } else {
+      const db = scope.toLowerCase();
+      if (db === "temp") return null;
+      snap = db === "main" ? this.committed : this.attachedCommitted.get(db);
+    }
+    const table = tableName.toLowerCase();
+    if (snap === undefined || snap.table(table) === undefined) return null;
+    return {
+      core: this.core ?? this,
+      database: snap.estimatorIdentity,
+      catGen: snap.catGen,
+      table,
+    };
+  }
+
+  private insertSignatureMatches(a: InsertTargetSignature, b: InsertTargetSignature): boolean {
+    return (
+      a.core === b.core &&
+      a.database === b.database &&
+      a.catGen === b.catGen &&
+      a.table === b.table
+    );
+  }
+
+  private executeInsertValuesCached(
+    ins: Insert,
+    params: Value[],
+    ctx: CteCtx,
+    holder: InsertCacheHolder | null,
+    allowFill: boolean,
+  ): Outcome {
+    // Keep every dynamic authorization/routing/collation gate ahead of cache lookup. The outer
+    // dispatch already checked lifetime admission and privileges for this execution.
+    checkCatalogRelWrite(ins.table);
+    this.checkAttachmentWritable(ins.db);
+    this.checkTableQualifier(ins.db, ins.table);
+    const table = this.lkpTableScoped(ins.db, ins.table);
+    if (!table) throw engineError("undefined_table", "table does not exist: " + ins.table);
+    this.ensureCollationsWritable(table.columns);
+
+    const signature = this.insertTargetSignature(ins.db, ins.table);
+    let plan: InsertValuesPlan;
+    if (
+      signature !== null &&
+      holder?.cache !== null &&
+      holder?.cache !== undefined &&
+      this.insertSignatureMatches(holder.cache.signature, signature)
+    ) {
+      plan = holder.cache.plan;
+    } else {
+      plan = this.resolveInsertValuesPlan(ins, table, ctx);
+    }
+
+    const committedSignature = this.committedInsertTargetSignature(ins.db, ins.table);
+    const outcome = this.executeInsertValuesPlan(ins, plan, params, ctx);
+    // A working transaction may consume an exactly matching committed entry and may publish only
+    // while its visible schema signature still equals committed state. Uncacheable expression
+    // shapes, temp targets, and working DDL leave the existing slot untouched.
+    if (
+      allowFill &&
+      signature !== null &&
+      committedSignature !== null &&
+      this.insertSignatureMatches(signature, committedSignature) &&
+      plan.cacheable
+    ) {
+      holder && (holder.cache = { signature, plan });
+    }
+    return outcome;
+  }
+
+  // Resolve the immutable half of a plain INSERT ... VALUES. One ParamTypes accumulator is threaded
+  // through defaults, checks, index expressions, VALUES slots, and RETURNING so both type inference
+  // and the subquery/precompiled-regex cache exclusion cover the complete reusable graph.
+  private resolveInsertValuesPlan(ins: Insert, table: Table, ctx: CteCtx): InsertValuesPlan {
+    const ptypes = new ParamTypes();
+    const checks = this.resolveChecks(table, ptypes);
+    const defaultExprs = this.resolveDefaultExprs(table, ptypes);
+    const rindexes = this.resolveTableIndexes(table, ptypes);
+    const colTypes = this.lkpStoreScoped(ins.db, table.name).columnTypes();
+    const colls = this.columnCollations(table.columns);
+    const pk = pkIndices(table);
+
+    const n = table.columns.length;
+    const provided = new Array<number>(n);
+    let arity = n;
+    if (ins.columns !== null) {
+      provided.fill(-1);
+      for (let p = 0; p < ins.columns.length; p++) {
+        const name = ins.columns[p]!;
+        const idx = columnIndex(table, name);
+        if (idx < 0) {
+          throw engineError(
+            "undefined_column",
+            `column ${name} of relation ${table.name} does not exist`,
+          );
+        }
+        if (provided[idx]! >= 0) {
+          throw engineError(
+            "duplicate_column",
+            "column " + table.columns[idx]!.name + " specified more than once",
+          );
+        }
+        provided[idx] = p;
+      }
+      arity = ins.columns.length;
+    } else {
+      for (let i = 0; i < n; i++) provided[i] = i;
+    }
+
+    if (ins.overriding === "user") {
+      for (let i = 0; i < n; i++) {
+        if (table.columns[i]!.identity !== null) provided[i] = -1;
+      }
+    }
+    const alwaysTargeted: { col: number; pos: number }[] = [];
+    if (ins.overriding !== "system") {
+      for (let i = 0; i < n; i++) {
+        if (table.columns[i]!.identity === "always" && provided[i]! >= 0) {
+          alwaysTargeted.push({ col: i, pos: provided[i]! });
+        }
+      }
+    }
+
+    const rows = ins.source.kind === "values" ? ins.source.rows : [];
+    for (const values of rows) {
+      if (values.length !== arity) {
+        const which = ins.columns !== null ? "target columns are" : "columns are";
+        throw engineError(
+          "syntax_error",
+          `INSERT row has ${values.length} values but ${arity} ${which} expected for table ${table.name}`,
+        );
+      }
+      for (let i = 0; i < n; i++) {
+        const p = provided[i]!;
+        if (p >= 0 && p < values.length) {
+          const iv = values[p]!;
+          const ct = table.columns[i]!.type;
+          if (iv.kind === "param" && ct.kind === "scalar") ptypes.note(iv.index - 1, ct.scalar);
+        }
+      }
+    }
+    for (const at of alwaysTargeted) {
+      if (rows.some((values) => values[at.pos]!.kind !== "default")) {
+        throw engineError(
+          "generated_always",
+          `cannot insert a non-DEFAULT value into column ${table.columns[at.col]!.name}`,
+        );
+      }
+    }
+    const returning =
+      ins.returning !== null
+        ? this.resolveReturning(table, ins.returning, false, ctx.bindings, ptypes)
+        : null;
+    const ptys = ptypes.finalize();
+    return {
+      table,
+      colTypes,
+      pk,
+      checks,
+      defaultExprs,
+      rindexes,
+      colls,
+      provided,
+      arity,
+      returning,
+      ptys,
+      cacheable: !ptypes.uncacheable,
+    };
+  }
+
+  private executeInsertValuesPlan(
+    ins: Insert,
+    plan: InsertValuesPlan,
+    params: Value[],
+    ctx: CteCtx,
+  ): Outcome {
+    const bound = bindParams(params, plan.ptys);
+    const meter = this.session.newMeter();
+    const rng = new StmtRng();
+    const store = this.writeStoreScoped(ins.db, ins.table);
+    const rowsIn = ins.source.kind === "values" ? ins.source.rows : [];
+    const rows: Value[][] = [];
+    let singleValues: Value[] | null = null;
+    const useSingle = singleValuesInsertEligible(rowsIn.length, false);
+    for (const values of rowsIn) {
+      const rv: Value[] = new Array(plan.arity);
+      for (let i = 0; i < plan.table.columns.length; i++) {
+        const col = plan.table.columns[i]!;
+        const p = plan.provided[i]!;
+        if (p < 0) continue;
+        const iv = values[p]!;
+        const ct = plan.colTypes[i]!;
+        if (iv.kind === "default") {
+          rv[p] = this.evalDefault(col, plan.defaultExprs[i]!, rng, meter);
+        } else if (
+          ct.kind === "scalar" &&
+          ct.scalar === "date" &&
+          iv.kind === "lit" &&
+          iv.lit.kind === "text" &&
+          dateClockSpecial(iv.lit.text) !== null
+        ) {
+          const sp = dateClockSpecial(iv.lit.text)!;
+          rv[p] = sp.epoch
+            ? dateValue(0n)
+            : dateClockValue(this, rng, this.session.seam, meter, sp.offsetDays);
+        } else {
+          rv[p] = materializeInsertValue(iv, ct, bound);
+        }
+      }
+      if (useSingle) singleValues = rv;
+      else rows.push(rv);
+    }
+
+    let returning = plan.returning?.nodes ?? null;
+    if (!plan.cacheable && returning !== null) {
+      const foldCost = { value: 0n };
+      returning = returning.map((node) =>
+        this.foldUncorrelatedInRExpr(node, bound, ctx, foldCost),
+      );
+      meter.charge(foldCost.value);
+    }
+    const returned = useSingle
+      ? this.insertOne(
+          plan.table,
+          store,
+          ins.db,
+          plan.pk,
+          plan.checks,
+          plan.defaultExprs,
+          plan.rindexes,
+          plan.colls,
+          plan.colTypes,
+          rng,
+          plan.provided,
+          singleValues!,
+          returning,
+          bound,
+          ctx,
+          meter,
+        )
+      : this.insertRows(
+          plan.table,
+          store,
+          ins.db,
+          plan.pk,
+          plan.checks,
+          plan.defaultExprs,
+          plan.rindexes,
+          plan.colls,
+          plan.colTypes,
+          rng,
+          plan.provided,
+          rows,
+          returning,
+          bound,
+          ctx,
+          meter,
+        );
+    this.markEstimatorMutation(ins.db, ins.table);
+    return dmlOutcome(
+      plan.returning?.names ?? null,
+      plan.returning?.types ?? null,
+      returned,
+      rowsIn.length,
+      meter.accrued,
+    );
+  }
+
   private executeInsert(ins: Insert, params: Value[], ctx: CteCtx): Outcome {
     // A catalog relation is read-only (introspection.md §5): a DML target naming one is 42809,
     // checked by NAME before qualifier validation (the built-in resolves in every database).
@@ -8404,6 +8753,9 @@ export class Engine {
             pk,
             checks,
             defaultExprs,
+            this.resolveTableIndexes(table),
+            this.columnCollations(table.columns),
+            store.columnTypes(),
             stmtRng,
             provided,
             singleValues!,
@@ -8455,6 +8807,9 @@ export class Engine {
     pk: number[],
     checks: NamedCheck[],
     defaultExprs: (RExpr | null)[],
+    rindexes: ResolvedIndex[],
+    colls: (Collation | null)[],
+    colTypes: ColType[],
     rng: StmtRng,
     provided: number[],
     rows: Value[][],
@@ -8466,10 +8821,6 @@ export class Engine {
     const n = table.columns.length;
     // The columns' resolved ColTypes (a scalar, or a composite resolved to its field tree), for
     // composite-aware store coercion (spec/design/composite.md §4).
-    const colTypes = store.columnTypes();
-    // Per-column frozen collations for the collated text key form (§2.12); null everywhere for a
-    // C-only / non-text table (the fast path).
-    const colls = this.columnCollations(table.columns);
     // Phase-1 existence probes read the VISIBLE snapshot (the read pin under a data-modifying WITH —
     // writable-cte.md §2; else working == read-your-writes), so a self-insert sees the pre-insert
     // state and an earlier sub-statement's staged key is invisible here (its collision is caught at
@@ -8481,7 +8832,6 @@ export class Engine {
     // — spec/design/indexes.md §4), parallel to table.indexes. An expression key is evaluated per row
     // (unmetered) to build its entry; done in phase 1 (below) so a failing expression aborts before any
     // write (all-or-nothing).
-    const rindexes = this.resolveTableIndexes(table);
     // The eval env for phase-1 index-expression evaluation (unmetered; params/CTEs empty — an index
     // expression cannot reference them). Reuses the statement rng (an immutable index expr never reads it).
     const env = this.maintenanceEnv(rng);
@@ -8712,6 +9062,9 @@ export class Engine {
     pk: number[],
     checks: NamedCheck[],
     defaultExprs: (RExpr | null)[],
+    rindexes: ResolvedIndex[],
+    colls: (Collation | null)[],
+    colTypes: ColType[],
     rng: StmtRng,
     provided: number[],
     values: Value[],
@@ -8720,10 +9073,7 @@ export class Engine {
     ctes: CteCtx,
     meter: Meter,
   ): Value[][] | null {
-    const colTypes = store.columnTypes();
-    const colls = this.columnCollations(table.columns);
     const readStore = this.lkpStoreScoped(dbScope, table.name);
-    const rindexes = this.resolveTableIndexes(table);
     const maintenanceEnv = this.maintenanceEnv(rng);
 
     const row: Row = new Array(table.columns.length);
@@ -9058,6 +9408,9 @@ export class Engine {
         meter,
       );
     }
+    const rindexes = this.resolveTableIndexes(table);
+    const colls = this.columnCollations(table.columns);
+    const colTypes = store.columnTypes();
     const returned = this.insertRows(
       table,
       store,
@@ -9065,6 +9418,9 @@ export class Engine {
       pk,
       checks,
       defaultExprs,
+      rindexes,
+      colls,
+      colTypes,
       rng,
       provided,
       rows,
@@ -22685,6 +23041,37 @@ export type EstimatorInputSignature = {
 // threads it through queryStmt → tryScanQuery (executor.ts is import-cycle-free of api.ts, so the
 // holder — not the PreparedStatement — crosses the seam). null cache = empty.
 export type ScanCacheHolder = { cache: ScanCache | null };
+
+// InsertCache is the independent prepared-INSERT slot (spec/design/api.md §2.4). The signature
+// deliberately omits estimator revisions: INSERT planning depends on catalog shape, database
+// identity, and collation-plan epoch, not row-count estimates. A plan is immutable after fill and
+// contains only resolved catalog/expression metadata; every execute still binds parameters, draws
+// statement entropy/time, applies gates, validates rows, and opens a fresh write transaction.
+export type InsertTargetSignature = {
+  core: AttachmentCore | Engine;
+  database: object;
+  catGen: bigint;
+  table: string;
+};
+export type InsertValuesPlan = {
+  table: Table;
+  colTypes: ColType[];
+  pk: number[];
+  checks: NamedCheck[];
+  defaultExprs: (RExpr | null)[];
+  rindexes: ResolvedIndex[];
+  colls: (Collation | null)[];
+  provided: number[];
+  arity: number;
+  returning: { nodes: RExpr[]; names: string[]; types: string[] } | null;
+  ptys: ScalarType[];
+  cacheable: boolean;
+};
+export type InsertCache = {
+  signature: InsertTargetSignature;
+  plan: InsertValuesPlan;
+};
+export type InsertCacheHolder = { cache: InsertCache | null };
 
 // CteMode is how a referenced CTE is evaluated (spec/design/cte.md §3, cost.md §3). Decided per CTE
 // from its reference count and [NOT] MATERIALIZED hint: a single-reference CTE is "inline", a

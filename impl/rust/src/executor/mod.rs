@@ -52,6 +52,7 @@ mod access_path;
 mod aggregate;
 mod ddl;
 mod dml;
+pub(crate) use dml::CachedInsert;
 mod eval;
 mod exec_emit;
 mod exec_scan;

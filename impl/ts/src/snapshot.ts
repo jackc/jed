@@ -461,6 +461,10 @@ export class Snapshot {
       const loaded = loadedCollation(name);
       if (loaded !== undefined) this.collations.set(name, loaded);
     }
+    // A prepared DML plan may retain resolved collation identities even when the skewed collation
+    // appears only on a non-key column (and therefore caused no putTable rebuild above). Treat the
+    // host migration as one catalog mutation so every such plan misses after the upgrade.
+    this.bumpCatGen();
     return skewed.size;
   }
 

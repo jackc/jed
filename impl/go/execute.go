@@ -37,6 +37,13 @@ func (db *engine) ExecuteStmt(stmt statement) (outcome, error) {
 //     durable write — restores the captured state (rollback-on-error, discarding partial work and
 //     any rowid allocations, §7). For an in-memory database persist is a no-op.
 func (db *engine) ExecuteStmtParams(stmt statement, params []Value) (outcome, error) {
+	return db.executeStmtParamsCached(stmt, params, nil)
+}
+
+// executeStmtParamsCached is ExecuteStmtParams with the private prepared-INSERT slot threaded to
+// dispatch. The slot may be consulted inside a transaction and filled when the target signature
+// still matches committed state; working DDL makes the executor's committed-base guard refuse it.
+func (db *engine) executeStmtParamsCached(stmt statement, params []Value, ic *insertStmtCache) (outcome, error) {
 	switch {
 	case stmt.Begin != nil:
 		return db.beginTx(stmt.Begin.Writable, stmt.Begin.ModeSet)
@@ -65,7 +72,7 @@ func (db *engine) ExecuteStmtParams(stmt statement, params []Value) (outcome, er
 			err = newError(ReadOnlySqlTransaction,
 				"cannot execute "+stmtKind(stmt)+" in a read-only transaction")
 		} else {
-			out, err = db.dispatchStmt(stmt, params)
+			out, err = db.dispatchStmtCached(stmt, params, ic, true)
 		}
 		// Enforce the temp-storage budget after a successful temp write (temp-tables.md §7): an
 		// over-budget statement (session-local tempBuffers) becomes a 54P03 error, which aborts the
@@ -98,7 +105,7 @@ func (db *engine) ExecuteStmtParams(stmt statement, params []Value) (outcome, er
 			"cannot execute "+stmtKind(stmt)+" in a read-only transaction")
 	}
 	db.session.tx = db.newTx(true)
-	out, err := db.dispatchStmt(stmt, params)
+	out, err := db.dispatchStmtCached(stmt, params, ic, true)
 	// Enforce the temp-storage budget before committing (temp-tables.md §7): an over-budget temp write
 	// in this implicit transaction (session-local tempBuffers) is discarded (rolling back the temp +
 	// main changes) and surfaces 54P03.

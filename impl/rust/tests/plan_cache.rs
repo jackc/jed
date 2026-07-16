@@ -7,7 +7,9 @@
 // cache actually engages (skips planning) is proved by the point_lookup_pk benchmark, not here.
 
 use jed::value::Value;
-use jed::{AttachSource, CreateOptions, Database, Session, SessionOptions};
+use jed::{
+    AttachSource, CreateOptions, Database, Privilege, PrivilegeSet, Session, SessionOptions,
+};
 
 // Compile-time guard (the `static_assertions::assert_not_impl_any!` pattern): `PreparedStatement` is
 // INTENTIONALLY `!Send` — its plan cache holds an `Rc<SelectPlan>` (the plan is `!Sync` via a regex
@@ -70,6 +72,11 @@ fn cached_explain(s: &Session, stmt: &jed::PreparedStatement) -> Vec<Vec<Value>>
     render.rows
 }
 
+fn insert_plan_ptr(stmt: &jed::PreparedStatement) -> *const () {
+    let cached = stmt.insert_cache().borrow();
+    std::rc::Rc::as_ptr(&cached.as_ref().expect("expected INSERT cache").plan).cast()
+}
+
 fn seed_orders(s: &mut Session, n: i64) {
     exec(s, "CREATE TABLE orders (id i32 PRIMARY KEY, amount i32)");
     for i in 1..=n {
@@ -103,6 +110,308 @@ fn point_lookup_reuse_is_cost_identical() {
     // A no-match param.
     let (r4, _) = drain(&mut s, &stmt, &[Value::Int(999)]);
     assert!(r4.is_empty());
+}
+
+#[test]
+fn insert_cache_ignores_estimator_revision() {
+    let mut s = mem();
+    exec(&mut s, "CREATE TABLE ins (id i32 PRIMARY KEY, v i32)");
+    let stmt = s
+        .prepare("INSERT INTO ins VALUES ($1, $2) RETURNING id, v")
+        .unwrap();
+
+    let (first, first_cost) = drain(&mut s, &stmt, &[Value::Int(1), Value::Int(10)]);
+    assert_eq!(first, vec![vec![Value::Int(1), Value::Int(10)]]);
+    let plan = {
+        let cached = stmt.insert_cache().borrow();
+        std::rc::Rc::as_ptr(&cached.as_ref().expect("INSERT cache fill").plan)
+    };
+
+    let (second, second_cost) = drain(&mut s, &stmt, &[Value::Int(2), Value::Int(20)]);
+    assert_eq!(second, vec![vec![Value::Int(2), Value::Int(20)]]);
+    let second_plan = {
+        let cached = stmt.insert_cache().borrow();
+        std::rc::Rc::as_ptr(&cached.as_ref().expect("INSERT cache retained").plan)
+    };
+    assert_eq!(
+        second_plan, plan,
+        "successful INSERT revision caused a re-plan"
+    );
+    assert_eq!(second_cost, first_cost);
+}
+
+#[test]
+fn insert_cache_fills_in_row_only_transaction() {
+    let mut s = mem();
+    exec(&mut s, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
+    let stmt = s.prepare("INSERT INTO t VALUES ($1, $2)").unwrap();
+    s.begin(true).unwrap();
+    s.execute_prepared(&stmt, &[Value::Int(1), Value::Int(10)])
+        .unwrap();
+    let plan = insert_plan_ptr(&stmt);
+    s.execute_prepared(&stmt, &[Value::Int(2), Value::Int(20)])
+        .unwrap();
+    assert_eq!(
+        insert_plan_ptr(&stmt),
+        plan,
+        "second in-block INSERT missed"
+    );
+    s.rollback().unwrap();
+}
+
+#[test]
+fn insert_cache_excludes_mutable_and_complex_shapes() {
+    let mut s = mem();
+    exec(&mut s, "CREATE TABLE t (id i32 PRIMARY KEY, note text)");
+    let regex = s
+        .prepare("INSERT INTO t VALUES ($1, $2) RETURNING note ~ 'a'")
+        .unwrap();
+    let (_, first_cost) = drain(&mut s, &regex, &[Value::Int(1), Value::Text("abc".into())]);
+    let (_, second_cost) = drain(&mut s, &regex, &[Value::Int(2), Value::Text("abd".into())]);
+    assert!(regex.insert_cache().borrow().is_none());
+    assert_eq!(first_cost, second_cost);
+
+    let subquery = s
+        .prepare("INSERT INTO t VALUES ($1, $2) RETURNING (SELECT max(id) FROM t)")
+        .unwrap();
+    let _ = drain(&mut s, &subquery, &[Value::Int(3), Value::Text("x".into())]);
+    assert!(subquery.insert_cache().borrow().is_none());
+
+    for sql in [
+        "INSERT INTO t SELECT 4, 'select'",
+        "INSERT INTO t VALUES (4, 'conflict') ON CONFLICT DO NOTHING",
+    ] {
+        let stmt = s.prepare(sql).unwrap();
+        s.execute_prepared(&stmt, &[]).unwrap();
+        assert!(stmt.insert_cache().borrow().is_none(), "cached {sql}");
+    }
+}
+
+#[test]
+fn insert_cache_invalidation_identities() {
+    let mut s = mem();
+    exec(&mut s, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
+    let stmt = s.prepare("INSERT INTO t VALUES ($1, $2)").unwrap();
+    s.execute_prepared(&stmt, &[Value::Int(1), Value::Int(10)])
+        .unwrap();
+    let mut plan = insert_plan_ptr(&stmt);
+
+    exec(&mut s, "CREATE TABLE unrelated (id i32 PRIMARY KEY)");
+    s.execute_prepared(&stmt, &[Value::Int(2), Value::Int(20)])
+        .unwrap();
+    assert_ne!(
+        insert_plan_ptr(&stmt),
+        plan,
+        "unrelated DDL must conservatively miss"
+    );
+    plan = insert_plan_ptr(&stmt);
+
+    exec(&mut s, "CREATE INDEX t_v_idx ON t (v)");
+    s.execute_prepared(&stmt, &[Value::Int(3), Value::Int(30)])
+        .unwrap();
+    assert_ne!(insert_plan_ptr(&stmt), plan, "index DDL did not invalidate");
+    plan = insert_plan_ptr(&stmt);
+
+    s.begin(true).unwrap();
+    exec(&mut s, "DROP INDEX t_v_idx");
+    s.execute_prepared(&stmt, &[Value::Int(4), Value::Int(40)])
+        .unwrap();
+    assert_eq!(
+        insert_plan_ptr(&stmt),
+        plan,
+        "working DDL execution replaced committed cache"
+    );
+    s.rollback().unwrap();
+    s.execute_prepared(&stmt, &[Value::Int(5), Value::Int(50)])
+        .unwrap();
+    assert_eq!(insert_plan_ptr(&stmt), plan, "rollback lost old hit");
+
+    exec(&mut s, "DROP TABLE t");
+    exec(&mut s, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
+    s.execute_prepared(&stmt, &[Value::Int(9), Value::Int(90)])
+        .unwrap();
+    assert_ne!(
+        insert_plan_ptr(&stmt),
+        plan,
+        "DROP/CREATE served stale plan"
+    );
+
+    let db2 = Database::create(CreateOptions::default()).unwrap();
+    let mut s2 = db2.session(SessionOptions::default());
+    exec(&mut s2, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
+    let before_other = insert_plan_ptr(&stmt);
+    s2.execute_prepared(&stmt, &[Value::Int(1), Value::Int(100)])
+        .unwrap();
+    assert_ne!(
+        insert_plan_ptr(&stmt),
+        before_other,
+        "cross-database false hit"
+    );
+
+    let attached_db = Database::create(CreateOptions::default()).unwrap();
+    attached_db
+        .attach("aux", AttachSource::memory(), false)
+        .unwrap();
+    let mut attached_session = attached_db.session(SessionOptions::default());
+    exec(
+        &mut attached_session,
+        "CREATE TABLE aux.t (id i32 PRIMARY KEY, v i32)",
+    );
+    let attached = attached_db
+        .prepare("INSERT INTO aux.t VALUES ($1, $2)")
+        .unwrap();
+    attached_session
+        .execute_prepared(&attached, &[Value::Int(1), Value::Int(10)])
+        .unwrap();
+    let attached_plan = insert_plan_ptr(&attached);
+    attached_db.detach("aux").unwrap();
+    attached_db
+        .attach("aux", AttachSource::memory(), false)
+        .unwrap();
+    exec(
+        &mut attached_session,
+        "CREATE TABLE aux.t (id i32 PRIMARY KEY, v i32)",
+    );
+    attached_session
+        .execute_prepared(&attached, &[Value::Int(2), Value::Int(20)])
+        .unwrap();
+    assert_ne!(
+        insert_plan_ptr(&attached),
+        attached_plan,
+        "re-attached database false hit"
+    );
+
+    let shadow_db = Database::create(CreateOptions::default()).unwrap();
+    let mut b = shadow_db.session(SessionOptions::default());
+    exec(&mut b, "CREATE TEMP TABLE t (id i32 PRIMARY KEY, v i32)");
+    let mut a = shadow_db.session(SessionOptions::default());
+    exec(&mut a, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
+    let shadow_stmt = shadow_db.prepare("INSERT INTO t VALUES ($1, $2)").unwrap();
+    a.execute_prepared(&shadow_stmt, &[Value::Int(1), Value::Int(10)])
+        .unwrap();
+    let persistent_plan = insert_plan_ptr(&shadow_stmt);
+    b.execute_prepared(&shadow_stmt, &[Value::Int(1), Value::Int(111)])
+        .unwrap();
+    assert_eq!(
+        insert_plan_ptr(&shadow_stmt),
+        persistent_plan,
+        "temp execution replaced cache"
+    );
+    a.execute_prepared(&shadow_stmt, &[Value::Int(2), Value::Int(20)])
+        .unwrap();
+    assert_eq!(insert_plan_ptr(&shadow_stmt), persistent_plan);
+}
+
+#[test]
+fn insert_cache_rechecks_privilege_and_read_only() {
+    let db = Database::create(CreateOptions::default()).unwrap();
+    let mut writer = db.session(SessionOptions::default());
+    exec(&mut writer, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
+    let stmt = db.prepare("INSERT INTO t VALUES ($1, $2)").unwrap();
+    writer
+        .execute_prepared(&stmt, &[Value::Int(1), Value::Int(10)])
+        .unwrap();
+    let plan = insert_plan_ptr(&stmt);
+
+    let mut restricted = db.session(SessionOptions {
+        default_privileges: PrivilegeSet::EMPTY.with(Privilege::Select),
+        ..SessionOptions::default()
+    });
+    let err = restricted
+        .execute_prepared(&stmt, &[Value::Int(2), Value::Int(20)])
+        .unwrap_err();
+    assert_eq!(err.code(), "42501");
+    assert_eq!(insert_plan_ptr(&stmt), plan);
+
+    writer.begin(false).unwrap();
+    let err = writer
+        .execute_prepared(&stmt, &[Value::Int(2), Value::Int(20)])
+        .unwrap_err();
+    assert_eq!(err.code(), "25006");
+    writer.rollback().unwrap();
+    assert_eq!(insert_plan_ptr(&stmt), plan);
+}
+
+#[test]
+fn insert_cache_collation_upgrade_invalidates() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../spec/collation/fixtures/unicode.jucd");
+    jed::load_unicode_data(&std::fs::read(path).unwrap()).unwrap();
+    let mut db = crate::executor::Engine::new();
+    crate::execute(
+        &mut db,
+        "CREATE TABLE t (id i32 PRIMARY KEY, x text COLLATE \"unicode\")",
+    )
+    .unwrap();
+    let stmt = db.prepare("INSERT INTO t VALUES ($1, $2)").unwrap();
+    crate::api::Transaction::borrow(&mut db)
+        .execute_prepared(&stmt, &[Value::Int(1), Value::Text("a".into())])
+        .unwrap();
+    let plan = insert_plan_ptr(&stmt);
+    let loaded = jed::loaded_collation("unicode").unwrap();
+    let mut skewed = (*loaded).clone();
+    skewed.unicode_version = "0.0.0".to_string();
+    db.committed.put_collation(std::sync::Arc::new(skewed));
+    assert_eq!(db.upgrade_collations().unwrap(), 1);
+    crate::api::Transaction::borrow(&mut db)
+        .execute_prepared(&stmt, &[Value::Int(2), Value::Text("b".into())])
+        .unwrap();
+    assert_ne!(insert_plan_ptr(&stmt), plan);
+}
+
+#[test]
+fn insert_cache_hit_matches_fresh_resolution() {
+    let db_cached = Database::create(CreateOptions::default()).unwrap();
+    let db_fresh = Database::create(CreateOptions::default()).unwrap();
+    let mut cached = db_cached.session(SessionOptions::default());
+    let mut fresh = db_fresh.session(SessionOptions::default());
+    for s in [&mut cached, &mut fresh] {
+        exec(
+            s,
+            "CREATE TABLE t (id i32 PRIMARY KEY, v i32 CHECK (v > 0), note text DEFAULT 'x')",
+        );
+        exec(s, "CREATE UNIQUE INDEX t_v_idx ON t (v)");
+    }
+    let stmt = db_cached
+        .prepare("INSERT INTO t (id, v) VALUES ($1, $2) RETURNING id, note")
+        .unwrap();
+    let _ = drain(&mut cached, &stmt, &[Value::Int(1), Value::Int(10)]);
+    exec(
+        &mut fresh,
+        "INSERT INTO t (id, v) VALUES (1, 10) RETURNING id, note",
+    );
+    let plan = insert_plan_ptr(&stmt);
+    let (hit_rows, hit_cost) = drain(&mut cached, &stmt, &[Value::Int(2), Value::Int(20)]);
+    let fresh_stmt = db_fresh
+        .prepare("INSERT INTO t (id, v) VALUES ($1, $2) RETURNING id, note")
+        .unwrap();
+    let (fresh_rows, fresh_cost) = drain(&mut fresh, &fresh_stmt, &[Value::Int(2), Value::Int(20)]);
+    assert_eq!(insert_plan_ptr(&stmt), plan);
+    assert_eq!(hit_rows, fresh_rows);
+    assert_eq!(hit_cost, fresh_cost);
+    assert_eq!(
+        db_cached.to_image(8192, 1).unwrap(),
+        db_fresh.to_image(8192, 1).unwrap(),
+        "tree bytes differ"
+    );
+
+    let hit_err = cached
+        .query_prepared(&stmt, &[Value::Int(2), Value::Int(20)])
+        .err()
+        .expect("duplicate error");
+    let fresh_error_stmt = db_fresh
+        .prepare("INSERT INTO t (id, v) VALUES ($1, $2) RETURNING id, note")
+        .unwrap();
+    let fresh_err = fresh
+        .query_prepared(&fresh_error_stmt, &[Value::Int(2), Value::Int(20)])
+        .err()
+        .expect("duplicate error");
+    assert_eq!(hit_err.code(), fresh_err.code());
+    assert_eq!(hit_err.to_string(), fresh_err.to_string());
+    assert_eq!(
+        db_cached.to_image(8192, 1).unwrap(),
+        db_fresh.to_image(8192, 1).unwrap()
+    );
 }
 
 /// P2 row-statistics validity is relation-scoped: unrelated writes retain the exact cached plan,

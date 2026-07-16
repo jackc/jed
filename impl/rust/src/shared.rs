@@ -77,8 +77,8 @@ use crate::catalog::{CompositeType, Table};
 use crate::coordinator::{FileCoordinator, LeaseState};
 use crate::error::{EngineError, Result, SqlState};
 use crate::executor::{
-    CachedPlan, CollationInfo, Engine, Outcome, ScriptSummary, SessionOptions, SessionState,
-    Snapshot, TxStatus, stmt_is_write,
+    CachedInsert, CachedPlan, CollationInfo, Engine, Outcome, ScriptSummary, SessionOptions,
+    SessionState, Snapshot, TxStatus, stmt_is_write,
 };
 use crate::file::{CreateOptions, DatabaseOptions, Locking, OpenOptions};
 use crate::privileges::{PrivilegeSet, Privileges};
@@ -1964,7 +1964,7 @@ impl Session {
     /// [`query_prepared`](Session::query_prepared) (route the prepared AST), so a prepared query
     /// streams and pins its snapshot exactly like an ad-hoc one.
     fn query_ast(&mut self, ast: Statement, params: &[Value]) -> Result<Rows> {
-        self.query_ast_cached(&ast, params, None)
+        self.query_ast_cached(&ast, params, None, None)
     }
 
     /// [`query_ast`](Session::query_ast) with an optional prepared-statement plan cache: a scan-shaped
@@ -1975,6 +1975,7 @@ impl Session {
         ast: &Statement,
         params: &[Value],
         cache: Option<&RefCell<Option<CachedPlan>>>,
+        insert_cache: Option<&RefCell<Option<CachedInsert>>>,
     ) -> Result<Rows> {
         if let Some(error) = &self.pending_error {
             return Err(error.clone());
@@ -1989,6 +1990,9 @@ impl Session {
         let epoch = self.shared.plan_epoch.load(Ordering::Acquire);
         if epoch != self.plan_epoch {
             if let Some(cache) = cache {
+                cache.borrow_mut().take();
+            }
+            if let Some(cache) = insert_cache {
                 cache.borrow_mut().take();
             }
             self.plan_epoch = epoch;
@@ -2066,7 +2070,11 @@ impl Session {
         // The dispatch fall-through handles transaction control (a nested BEGIN's 25001 must NOT
         // poison) and self-poisons on a regular statement error, so its nuanced poisoning is left
         // intact — only the lazy-lane reads above, which bypass it, are poisoned here.
-        Ok(Rows::from_outcome(self.dispatch(ast.clone(), params)?))
+        Ok(Rows::from_outcome(self.dispatch(
+            ast.clone(),
+            params,
+            insert_cache,
+        )?))
     }
 
     fn refresh_initial_read(&mut self) -> Result<()> {
@@ -2135,13 +2143,20 @@ impl Session {
     /// gate for a writable block); a statement inside an open block runs against the working set; an
     /// autocommit read pins the latest committed for that statement; an autocommit write takes the
     /// gate, publishes, and releases it.
-    fn dispatch(&mut self, ast: Statement, params: &[Value]) -> Result<Outcome> {
+    fn dispatch(
+        &mut self,
+        ast: Statement,
+        params: &[Value],
+        insert_cache: Option<&RefCell<Option<CachedInsert>>>,
+    ) -> Result<Outcome> {
         if self.access == Access::ReadOnly {
             // Every read-only session sets `engine.read_only`, so the executor itself enforces it
             // (PostgreSQL hot-standby — api.md §2.1): an autocommit write / an in-block write / an
             // explicit `BEGIN READ WRITE` all fail `25006`, and an in-block write poisons the block
             // (`25P02` thereafter, §6). No gate / publish is needed for a read-only session.
-            return self.engine.execute_stmt_params(ast, params);
+            return self
+                .engine
+                .execute_stmt_params_cached(ast, params, insert_cache);
         }
         match &ast {
             Statement::Begin { writable } => return self.begin_block(*writable),
@@ -2152,7 +2167,9 @@ impl Session {
         if self.engine.in_transaction() {
             // Inside an open block (an eager write session, or this session after BEGIN): run on the
             // working set. The gate is already held for a writable block.
-            return self.engine.execute_stmt_params(ast, params);
+            return self
+                .engine
+                .execute_stmt_params_cached(ast, params, insert_cache);
         }
         if !stmt_is_write(&ast) {
             // Autocommit read: the snapshot was already pinned + committed set upstream (query_ast_cached's
@@ -2160,7 +2177,9 @@ impl Session {
             // that pin is held across this synchronous materialize (transactions.md §8) — so the read's
             // version is visible to the reclamation watermark for the whole fault. Re-loading committed here
             // would both double-work and (on a read-only session) break snapshot stability.
-            return self.engine.execute_stmt_params(ast, params);
+            return self
+                .engine
+                .execute_stmt_params_cached(ast, params, insert_cache);
         }
         // Autocommit write — the lazy gate (§2.4): take it, capture the latest committed as the
         // working base, run, publish (persist + swap) at the next version on success, release. A
@@ -2169,7 +2188,10 @@ impl Session {
             .acquire_writer(self.engine.session.lock_timeout_ms())?;
         self.gate_held = true;
         self.refresh_committed();
-        let result = match self.engine.execute_stmt_params(ast, params) {
+        let result = match self
+            .engine
+            .execute_stmt_params_cached(ast, params, insert_cache)
+        {
             Ok(outcome) => self.publish().map(|()| outcome),
             Err(e) => Err(e),
         };
@@ -2693,7 +2715,12 @@ impl Session {
     /// watermark — so a prepared query streams identically to a one-shot one, but reuses its cached
     /// plan across executes (spec/design/api.md §2.4).
     pub fn query_prepared(&mut self, stmt: &PreparedStatement, params: &[Value]) -> Result<Rows> {
-        self.query_ast_cached(stmt.ast(), params, Some(stmt.cache()))
+        self.query_ast_cached(
+            stmt.ast(),
+            params,
+            Some(stmt.cache()),
+            Some(stmt.insert_cache()),
+        )
     }
 }
 

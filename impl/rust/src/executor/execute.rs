@@ -655,6 +655,19 @@ impl Engine {
     ///   discarding partial work and any rowid allocations (§7). For an in-memory database
     ///   `persist` is a no-op, so autocommit is pure in-memory visibility.
     pub fn execute_stmt_params(&mut self, stmt: Statement, params: &[Value]) -> Result<Outcome> {
+        self.execute_stmt_params_cached(stmt, params, None)
+    }
+
+    /// `execute_stmt_params` with the private prepared-INSERT slot threaded to dispatch. A valid
+    /// committed entry may be consulted in a block; a successful execution may publish a new entry
+    /// only when its visible target signature still exactly matches committed state
+    /// (spec/design/api.md §2.4).
+    pub(crate) fn execute_stmt_params_cached(
+        &mut self,
+        stmt: Statement,
+        params: &[Value],
+        insert_cache: Option<&std::cell::RefCell<Option<CachedInsert>>>,
+    ) -> Result<Outcome> {
         match stmt {
             Statement::Begin { writable } => return self.begin_tx(writable),
             Statement::Commit => return self.commit_tx(),
@@ -690,7 +703,9 @@ impl Engine {
                     ),
                 ))
             } else {
-                self.dispatch_stmt(stmt, params)
+                // INSERT cache fill remains guarded by an exact visible-vs-committed schema
+                // signature, so row-only blocks may fill while working DDL cannot.
+                self.dispatch_stmt_cached(stmt, params, insert_cache, true)
             };
             // Enforce the temp-storage budget after a successful temp write (temp-tables.md §7): an
             // over-budget statement (session-local `temp_buffers`) becomes a `54P03` error, which
@@ -738,7 +753,7 @@ impl Engine {
             attach_working: HashMap::new(),
             attach_dirty: HashSet::new(),
         });
-        match self.dispatch_stmt(stmt, params) {
+        match self.dispatch_stmt_cached(stmt, params, insert_cache, true) {
             Ok(outcome) => {
                 // Enforce the temp-storage budget before committing (temp-tables.md §7): if this
                 // (implicit) transaction's temp write pushed the session over `temp_buffers`, discard

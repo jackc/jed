@@ -1512,7 +1512,7 @@ func (s *Session) queryValues(sql string, params []Value) (*Rows, error) {
 	if err != nil {
 		return nil, err
 	}
-	return s.queryStmt(stmt, params, nil) // one-shot: no cross-call plan cache (still plans once)
+	return s.queryStmt(stmt, params, nil, nil) // one-shot: no cross-call plan cache (still plans once)
 }
 
 // queryStmt routes an already-parsed query AST through the session's lazy lanes — the autocommit
@@ -1521,7 +1521,7 @@ func (s *Session) queryValues(sql string, params []Value) (*Rows, error) {
 // a data-modifying WITH). Shared by Query (parse-then-route, sc nil) and a prepared query
 // (the *Prepared methods pass the statement's stmtCache), so a prepared query streams and pins its
 // snapshot exactly like an ad-hoc one but reuses its cached plan across executes.
-func (s *Session) queryStmt(stmt statement, params []Value, sc *stmtCache) (*Rows, error) {
+func (s *Session) queryStmt(stmt statement, params []Value, sc *stmtCache, ic *insertStmtCache) (*Rows, error) {
 	if s.pendingErr != nil {
 		return nil, s.pendingErr
 	}
@@ -1537,6 +1537,9 @@ func (s *Session) queryStmt(stmt statement, params []Value, sc *stmtCache) (*Row
 	if epoch := s.core.planEpoch.Load(); epoch != s.planEpoch {
 		if sc != nil {
 			sc.p.Store(nil)
+		}
+		if ic != nil {
+			ic.p.Store(nil)
 		}
 		s.planEpoch = epoch
 	}
@@ -1623,7 +1626,7 @@ func (s *Session) queryStmt(stmt statement, params []Value, sc *stmtCache) (*Row
 	// 25001 must NOT poison the block) and self-poisons on a regular statement error (ExecuteStmtParams),
 	// so its nuanced poisoning is left intact — only the lazy-lane reads above, which bypass it, are
 	// poisoned here.
-	out, err := s.dispatch(stmt, params)
+	out, err := s.dispatch(stmt, params, ic)
 	if err != nil {
 		return nil, err
 	}
@@ -1668,13 +1671,13 @@ func (s *Session) Prepare(sql string) (*PreparedStatement, error) {
 // a writable block); a statement inside an open block runs against the working set; an autocommit
 // read pins the latest committed for that statement; an autocommit write takes the gate, publishes,
 // and releases it.
-func (s *Session) dispatch(stmt statement, params []Value) (outcome, error) {
+func (s *Session) dispatch(stmt statement, params []Value, ic *insertStmtCache) (outcome, error) {
 	if s.access == accessReadOnly {
 		// Every read-only session sets engine.readOnly, so the executor enforces it (PostgreSQL
 		// hot-standby — api.md §2.1): an autocommit write / an in-block write / an explicit BEGIN READ
 		// WRITE all fail 25006, and an in-block write poisons the block (25P02 thereafter, §6). No gate
 		// / publish is needed for a read-only session.
-		return s.engine.ExecuteStmtParams(stmt, params)
+		return s.engine.executeStmtParamsCached(stmt, params, ic)
 	}
 	switch {
 	case stmt.Begin != nil:
@@ -1687,7 +1690,7 @@ func (s *Session) dispatch(stmt statement, params []Value) (outcome, error) {
 	if s.engine.session.tx != nil {
 		// Inside an open block (an eager write session, or this session after BEGIN): run on the
 		// working set. The gate is already held for a writable block.
-		return s.engine.ExecuteStmtParams(stmt, params)
+		return s.engine.executeStmtParamsCached(stmt, params, ic)
 	}
 	if !stmtIsWrite(stmt) {
 		// Autocommit read: the snapshot was already pinned + committed set upstream (queryStmt's atomic
@@ -1695,7 +1698,7 @@ func (s *Session) dispatch(stmt statement, params []Value) (outcome, error) {
 		// is held across this synchronous materialize (transactions.md §8) — so the read's version is
 		// visible to the reclamation watermark for the whole fault. Re-loading committed here would both
 		// double-work and (on a read-only session) break snapshot stability, so we run on the pinned base.
-		return s.engine.ExecuteStmtParams(stmt, params)
+		return s.engine.executeStmtParamsCached(stmt, params, ic)
 	}
 	// Autocommit write — the lazy gate (§2.4): take it, capture the latest committed as the working
 	// base, run, publish at the next version on success, release.
@@ -1704,7 +1707,7 @@ func (s *Session) dispatch(stmt statement, params []Value) (outcome, error) {
 	}
 	s.gateHeld = true
 	s.refreshCommitted()
-	out, err := s.engine.ExecuteStmtParams(stmt, params)
+	out, err := s.engine.executeStmtParamsCached(stmt, params, ic)
 	if err == nil {
 		// A persist I/O failure surfaces as the statement's error and publishes nothing.
 		err = s.publish()
