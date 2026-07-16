@@ -330,47 +330,55 @@ one that produces a material improvement.
 
 ### Candidate A — shared immutable leaf entries
 
-- [ ] Replace deep-cloned Rust key/row ownership in decoded leaves with a representation whose outer
+- [x] Replace deep-cloned Rust key/row ownership in decoded leaves with a representation whose outer
   leaf/path copy retains immutable entry storage cheaply, such as `Arc<[u8]>` keys and appropriately
   shared immutable rows.
-- [ ] Keep borrowed `key_at` and owned `row_at` behavior unchanged above the representation seam.
-- [ ] Measure atomic reference-count traffic on hot reads and serial inserts; do not accept a broad
+- [x] Keep borrowed `key_at` and owned `row_at` behavior unchanged above the representation seam.
+- [x] Measure atomic reference-count traffic on hot reads and serial inserts; do not accept a broad
   read regression to improve one write lane.
-- [ ] Verify large/unfetched values, composites, arrays, ranges, JSON, and variable-width text do not
+- [x] Verify large/unfetched values, composites, arrays, ranges, JSON, and variable-width text do not
   gain accidental eager materialization.
-- [ ] Verify dirty serialization emits identical bytes and does not retain obsolete page blocks.
+- [x] Verify dirty serialization emits identical bytes and does not retain obsolete page blocks.
 
 ### Candidate B — mutate uniquely owned dirty nodes in place
 
-- [ ] Add an internal mutation helper that may edit a node only when both conditions hold:
+- [x] Add an internal mutation helper that may edit a node only when both conditions hold:
   1. `Arc::get_mut` proves the Rust node is uniquely owned; and
   2. the node is dirty/unpublished (`page == 0`).
-- [ ] If either condition fails, use the existing copy-on-write rebuild unchanged.
-- [ ] On a unique dirty leaf, insert/replace within its key/row/weight vectors and run the same
+- [x] If either condition fails, use the existing copy-on-write rebuild unchanged.
+- [x] On a unique dirty leaf, insert/replace within its key/row/weight vectors and run the same
   page-fit/split logic.
-- [ ] On a unique dirty interior node, replace the changed child in place; if a split propagates,
+- [x] On a unique dirty interior node, replace the changed child in place; if a split propagates,
   run the same separator insertion and split logic.
-- [ ] Never mutate a clean node in place even if it appears uniquely owned; this keeps the durable
+- [x] Never mutate a clean node in place even if it appears uniquely owned; this keeps the durable
   fallback and publication invariant obvious.
-- [ ] Use `Arc::get_mut`, not an unsafe uniqueness assumption or a manually inspected refcount.
-- [ ] Check that helper-created temporary `Arc` clones do not accidentally defeat uniqueness before
+- [x] Use `Arc::get_mut`, not an unsafe uniqueness assumption or a manually inspected refcount.
+- [x] Check that helper-created temporary `Arc` clones do not accidentally defeat uniqueness before
   the decision point.
 
 ### Selection and implementation
 
-- [ ] Compare A, B, and a small hybrid. Record allocations, bytes, `insert_rollback`, hot lookup, full
+- [x] Compare A, B, and a small hybrid. Record allocations, bytes, `insert_rollback`, hot lookup, full
   scan, and compile/code-complexity impact.
-- [ ] Prefer unique-dirty in-place mutation if it captures most of the gain without changing the
+- [x] Prefer unique-dirty in-place mutation if it captures most of the gain without changing the
   stored key/row representation.
-- [ ] Prefer shared entries if uniqueness is rarely available or writable-CTE/cursor aliases make the
+- [x] Prefer shared entries if uniqueness is rarely available or writable-CTE/cursor aliases make the
   transient path ineffective.
-- [ ] Do not keep both unless each provides a separately demonstrated gain.
-- [ ] Apply the chosen mechanism to table and ordered secondary-index B+trees through their common
+- [x] Do not keep both unless each provides a separately demonstrated gain.
+- [x] Apply the chosen mechanism to table and ordered secondary-index B+trees through their common
   `PMap`; do not build an INSERT-only tree.
-- [ ] Cover remove/rebalance only in a separate follow-up after insert/replace is proven. An INSERT
+- [x] Cover remove/rebalance only in a separate follow-up after insert/replace is proven. An INSERT
   optimization must not quietly reshape DELETE.
-- [ ] Replace the existing open `TODO.md` Rust CoW item with the durable result or a narrower remaining
+- [x] Replace the existing open `TODO.md` Rust CoW item with the durable result or a narrower remaining
   follow-on when the slice lands.
+
+Candidate A (`Arc<[u8]>` keys plus `Arc<Row>` values) reduced the allocation probe to 107,571 calls /
+36.50 MB and `insert_rollback` to 10.68 ms shared, but changed the representation throughout the
+serializer and ran the hot prepared lookup about 4% slower. Candidate B reduced the probe further to
+73,952 calls / 5.41 MB and the lane to 2.67 ms shared. The hybrid raised calls to 87,878 and slowed
+the lane to 3.11 ms, so only B remains. Five retained Slice-2/current pairs show an 88.2% latency
+reduction with identical checksum; the final shared/exclusive gap is 8.6%. Durable evidence is in
+`spec/design/benchmarks.md` under “INSERT performance slice-3 result.”
 
 Exit: Rust no longer deep-clones every existing key and row on repeated inserts into the same leaf;
 goldens and snapshot tests remain exact; representative reads do not regress.

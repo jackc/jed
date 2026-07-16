@@ -245,12 +245,15 @@ No new lifetime model — it composes with the three already in place ([lazy-rec
 - **The streaming cursor's snapshot.** A row of block-slice values a streaming `Rows` yields is
   `'static` for the same reason its `Unfetched::Inline` values already are.
 
-**Mutation.** A copy-on-write insert/delete descends to a leaf and rebuilds it. On reaching a **Packed**
-leaf it first **materializes keys, rows, and weights together to Decoded** (`decoded_parts()`), then the
-existing `build` / `node_insert` / `node_remove` / `merge_rebalance` logic runs **unchanged** — a
-mutated leaf is always Decoded (and dirty, page `0`), so serialization (`serialize_dirty`, which only
-touches dirty nodes, re-emits PAX column-major from the Decoded rows) also stays unchanged. The write
-side stays metered by `value_compress` per stored row version ([cost.md §3](cost.md)).
+**Mutation.** A copy-on-write insert/delete descends to a leaf. On reaching a **Packed** leaf it first
+**materializes keys, rows, and weights together to Decoded** (`decoded_parts()`), then the existing
+`build` / `node_insert` / `node_remove` / `merge_rebalance` logic runs with the same split/merge rules.
+A mutated leaf is always Decoded (and dirty, page `0`), so serialization (`serialize_dirty`, which
+only touches dirty nodes, re-emits PAX column-major from the Decoded rows) stays unchanged. Rust may
+subsequently edit that Decoded leaf in place for INSERT only when `Arc::get_mut` proves unique
+ownership and `page == 0`; a Packed/clean or aliased leaf always takes the ordinary rebuild path
+([transactions.md §3](transactions.md)). Delete/rebalance stays copy-on-write. The write side stays
+metered by `value_compress` per stored row version ([cost.md §3](cost.md)).
 
 ---
 

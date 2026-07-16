@@ -455,6 +455,53 @@ Finally, five exclusive Rust runs measured 18.006 ms mean (17.816 ms minimum, 18
 The prepared cache materially reduces work but does not solve the glibc/background-thread gap; Rust
 copy-on-write entry sharing remains the next material INSERT follow-on.
 
+**INSERT performance slice-3 result (2026-07-16).** Commit `6ea56620` is the Slice-2 control. Three
+Rust prototypes used the same correctness suite, CPU-2-pinned `insert_rollback` lane, and temporary
+counting-allocator boundary around 1,000 cached prepared executions. Candidate A stored decoded keys
+and rows behind `Arc`; Candidate B edited only a dirty (`page == 0`) node for which `Arc::get_mut`
+proved unique ownership; the hybrid combined both. Every prototype retained checksum
+`ac02f0205c4f05c5`.
+
+| Prototype | Alloc/realloc calls | Requested bytes | Shared mean | Exclusive mean | Representation impact |
+|---|---:|---:|---:|---:|---|
+| Slice 2 path-copy | 674,827 | 89,576,333 | 22.610 ms | 18.026 ms | existing `Vec<Vec<u8>>` / `Vec<Row>` |
+| A: shared entries | 107,571 | 36,498,931 | 10.682 ms | 10.216 ms | changes node entries and serializer seams |
+| B: unique dirty | 73,952 | 5,406,047 | 2.666 ms | 2.467 ms | localized to Rust `PMap::insert` |
+| A+B hybrid | 87,878 | 4,985,447 | 3.118 ms | 2.806 ms | both mechanisms |
+
+Candidate A's decoded read path borrowed through the `Arc` and therefore performed no per-entry
+refcount bump, but retained an extra pointer indirection. Six alternated hot-lookup processes put its
+median mean at 2.426 µs/op versus 2.333 µs/op for the unchanged representation (+4.0%); three
+full-scan processes put it at 49.706 ms versus 51.676 ms (-3.8%, noise). More importantly, B captured
+substantially more of the INSERT gain without changing the read representation. The hybrid saved only
+420,600 requested bytes beyond B while adding 13,926 calls and slowing shared INSERT by about 17%.
+Candidate B is therefore the sole retained mechanism.
+
+The final attribution run used five alternated Slice-2/current shared-process pairs, after the same
+discarded build/process warmup shape as the earlier slices. Each cell is the median per-process
+statistic; checksums remained identical.
+
+| Rust/shared | Slice 2 | Slice 3 | Change |
+|---|---:|---:|---:|
+| Mean | 22.610 ms | 2.666 ms | -88.2% |
+| Minimum | 22.379 ms | 2.586 ms | -88.4% |
+| p50 | 22.594 ms | 2.664 ms | -88.2% |
+| p90 | 22.777 ms | 2.706 ms | -88.1% |
+| p99 | 22.832 ms | 2.721 ms | -88.1% |
+
+The retained allocator comparison removes **600,875 calls (89.0%)** and **84,170,286 requested
+bytes (94.0%)** per transaction. Five final shared/exclusive pairs measured 2.679 ms shared and
+2.467 ms exclusive, an **8.6%** remaining gap—far below Slice 2's 25.8%, but still outside the 5%
+goal, so the background-thread/glibc effect is reduced rather than claimed eliminated.
+
+The implementation preserves the existing copy-on-write fallback whenever a snapshot, cursor,
+writable-CTE read pin, or other root alias exists, and never mutates a clean node even when unique.
+The focused multi-level test proves both guards by node identity. The full Rust unit/integration suite
+(793 tests), shared byte-fixture verifier, snapshot/cursor/writable-CTE/attachment guards, lazy large
+value batteries, incremental persistence/reclamation tests, and exact split-shape costs all pass.
+Because table and ordered secondary-index stores share `PMap`, the same path covers both trees; delete
+and rebalance deliberately remain path-copy.
+
 ## 1. Purpose and non-goals
 
 The benchmark suite answers two questions, continuously:

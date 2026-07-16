@@ -69,10 +69,13 @@ Transaction          = read:  { snapshot: ref<Snapshot> }                 # no w
 ```
 
 - A **write** transaction builds each statement's effect against `working` — the persistent
-  structures (§3) copy only the touched paths, so producing the new `working` does **not**
-  mutate `committed`. After the statement's two-phase validation (§6) the new root is adopted
-  into `working`. Read-your-writes within the transaction falls out: a write is immediately
-  visible to the next statement on the same transaction because that statement reads `working`.
+  structures (§3) copy every touched path that is shared or published, so producing the new
+  `working` does **not** mutate `committed`. Rust may reuse a uniquely owned, dirty touched-path
+  suffix under the exact rule in §3; a committed root, cursor pin, or writable-CTE read pin makes
+  `Arc::get_mut` fail and therefore takes the ordinary copy-on-write path. After the statement's
+  two-phase validation (§6) the new root is adopted into `working`. Read-your-writes within the
+  transaction falls out: a write is immediately visible to the next statement on the same
+  transaction because that statement reads `working`.
 - A **read** transaction holds a committed `Snapshot` by reference and never builds a working
   root — it cannot mutate (§4.3). Many may be open at once.
 - **Commit** (of a write tx) publishes `working` — `committed := working`, **a single pointer
@@ -93,9 +96,21 @@ CLAUDE.md §12).
 The one new primitive. It replaces the current per-table store (a mutable
 `BTreeMap`/hash-map-plus-sort) with a **persistent (immutable, structurally-shared) ordered
 map** keyed by the encoded-key bytes (memcmp order — [encoding.md](encoding.md)). Required
-operations: `get`, `insert→new`, `remove→new`, in-order `iter`, and `range` (for later).
-Each mutation **path-copies** root→leaf and shares the untouched siblings, so the prior root
-is provably unchanged and a snapshot is an O(1) reference clone.
+operations: `get`, logical `insert→new`, `remove→new`, in-order `iter`, and `range` (for later).
+Each mutation **path-copies every shared/published node** from root→leaf and shares the untouched
+siblings, so every prior root is provably unchanged and a snapshot is an O(1) reference clone.
+
+**Rust unique-dirty INSERT transient (2026-07, no format change).** Rust avoids repeatedly
+deep-cloning decoded leaf keys/rows during a write transaction, but only under two simultaneous
+proofs: `Arc::get_mut` proves the node is uniquely owned, and `page == 0` proves it is dirty and
+unpublished. A clean node is never edited even when unique; a dirty node with any snapshot/cursor/
+read-pin alias is copied exactly as before. A qualifying leaf edits its key/row/weight vectors in
+place; a qualifying interior replaces the changed child or inserts a propagated separator in place.
+Overflow still moves those vectors through the unchanged size-fit and split builders, preserving the
+exact split point, separator, tree shape, and bytes. This first transient covers insert/overwrite
+only; delete/rebalance deliberately remains pure path-copy. Go and TypeScript retain their shallow
+entry-copy representation in this slice—the transient rule is a private Rust ownership optimization,
+not a new cross-core logical state.
 
 **Decided shape: a copy-on-write B+tree** (v24 — [bplus-reshape.md](bplus-reshape.md); it was
 a CLRS-style B-tree with records at every level through v23). Chosen deliberately as the

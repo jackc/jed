@@ -3,10 +3,10 @@
 //! per-table data B+tree").
 //!
 //! Keyed by the encoded key bytes (`Vec<u8>`, whose `Ord` is lexicographic = the
-//! order-preserving key encoding's memcmp contract, spec/design/encoding.md). Every mutation
-//! returns a **new** map that shares structure with the old one — the old root is provably
-//! unchanged — so a snapshot is an O(1) `Arc` clone and a commit is a pointer swap
-//! (transactions.md §2).
+//! order-preserving key encoding's memcmp contract, spec/design/encoding.md). A mutation path-copies
+//! every node that is shared or published; uniquely owned dirty nodes may instead be edited in place.
+//! Either way every prior root is provably unchanged, so a snapshot is an O(1) `Arc` clone and a
+//! commit is a pointer swap (transactions.md §2/§3).
 //!
 //! **This is the on-disk B+tree, node-for-page (v24).** Records live **only in leaves**; an
 //! interior node is a record-free routing skeleton — separator keys + child pointers. A separator
@@ -22,9 +22,11 @@
 //!
 //! Each [`Node`] also carries a set-once on-disk **page id** (`0` = dirty/unpersisted): an
 //! incremental commit writes only the dirty nodes a mutation introduced (format.rs / file.rs).
-//! Copy-on-write builds every new node dirty; a node persisted once is never rewritten while it
-//! stays shared. `AtomicU32` keeps the shared tree `Send + Sync` (P5.3b) under a relaxed set-once
-//! store — the node is otherwise immutable.
+//! Copy-on-write builds every new node dirty; Rust may edit such a node in place only when
+//! [`Arc::get_mut`] also proves it uniquely owned. A clean node is never edited, even when unique,
+//! and a shared dirty node takes the ordinary path-copy fallback. A node persisted once is never
+//! rewritten. `AtomicU32` keeps the shared tree `Send + Sync` (P5.3b) under a relaxed set-once
+//! store; published nodes remain immutable.
 //!
 //! Boring and explicit (CLAUDE.md §10): one `Node` type (a leaf has no children; an interior has
 //! no vals/weights), recursive insert with split-on-overflow (leaf copy-up / interior push-up,
@@ -33,7 +35,7 @@
 //! format.md "Delete").
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::error::Result;
 use crate::format::{LeafShape, PackedLeaf, leaf_overhead};
@@ -95,7 +97,8 @@ fn child(node: &Node, i: usize, src: Option<&dyn LeafSource>) -> Result<Arc<Node
 /// `packed` representation and leaves those vectors empty. An **interior** node has `children.len() ==
 /// keys.len() + 1` and **empty** `vals`/`weights` — its keys are the routing separators, its
 /// payload is derived from the separator bytes themselves (v24, record-free). Nodes are shared
-/// behind `Arc`; a mutation clones only the root→leaf path and shares every untouched subtree.
+/// behind `Arc`; a mutation clones the shared/published portion of the root→leaf path, may edit a
+/// unique dirty suffix in place, and shares every untouched subtree.
 pub(crate) struct Node {
     pub(crate) keys: Vec<Vec<u8>>,
     /// The decoded value rows, one per key — populated for a **Decoded leaf** (a writer's
@@ -340,6 +343,9 @@ impl Node {
 /// the right leaf's first key up (no record leaves the leaf level); an interior split **pushes**
 /// its median separator up (format.md "Fan-out").
 enum Ins {
+    /// The uniquely owned dirty node passed to `node_insert` was edited in place. Its parent/root
+    /// already points at the result, so no replacement `Arc` is needed.
+    Kept,
     Whole(Arc<Node>),
     Split {
         left: Arc<Node>,
@@ -682,17 +688,19 @@ impl PMap {
         src: Option<&dyn LeafSource>,
     ) -> Result<Option<Row>> {
         let mut old = None;
-        let new_root = match &self.root {
-            None => Node::new_leaf(vec![key], vec![val], vec![weight]),
+        match self.root.as_mut() {
+            None => self.root = Some(Node::new_leaf(vec![key], vec![val], vec![weight])),
             Some(root) => match node_insert(root, key, val, weight, &mut old, src, cap, shape)? {
-                Ins::Whole(n) => n,
-                Ins::Split { left, sep, right } => Node::new_interior(
-                    vec![sep],
-                    vec![Child::Resident(left), Child::Resident(right)],
-                ),
+                Ins::Kept => {}
+                Ins::Whole(n) => self.root = Some(n),
+                Ins::Split { left, sep, right } => {
+                    self.root = Some(Node::new_interior(
+                        vec![sep],
+                        vec![Child::Resident(left), Child::Resident(right)],
+                    ));
+                }
             },
-        };
-        self.root = Some(new_root);
+        }
         if old.is_none() {
             // Maintain the count only when it is known (`Some`). A disk-loaded index skeleton stays
             // `None`; table skeletons receive the exact v28 base count.
@@ -1160,7 +1168,7 @@ impl RangeCursor {
 /// interior receiving a separator may push-split in turn.
 #[allow(clippy::too_many_arguments)]
 fn node_insert(
-    node: &Arc<Node>,
+    node: &mut Arc<Node>,
     key: Vec<u8>,
     val: Row,
     weight: u32,
@@ -1171,6 +1179,37 @@ fn node_insert(
 ) -> Result<Ins> {
     if node.is_leaf() {
         let found = node.search(&key);
+        // A dirty node has never been published. When this Arc is also unique, editing its vectors
+        // cannot affect a snapshot/cursor/read pin. Clean nodes stay immutable even if unique so
+        // incremental serialization and the publication invariant remain obvious.
+        if node.page.load(Ordering::Relaxed) == 0
+            && let Some(node) = Arc::get_mut(node)
+        {
+            debug_assert!(node.packed.is_none(), "a dirty leaf is decoded");
+            let i = match found {
+                Ok(i) => {
+                    *old = Some(std::mem::replace(&mut node.vals[i], val));
+                    node.weights[i] = weight;
+                    i
+                }
+                Err(i) => {
+                    node.keys.insert(i, key);
+                    node.vals.insert(i, val);
+                    node.weights.insert(i, weight);
+                    i
+                }
+            };
+            let payload = node.total_weight() + leaf_overhead(node.len(), shape);
+            if payload <= cap || node.len() < 2 {
+                return Ok(Ins::Kept);
+            }
+            // The same builder chooses the exact split point and separator bytes. Move the edited
+            // vectors out rather than cloning them; the returned nodes replace this emptied one.
+            let keys = std::mem::take(&mut node.keys);
+            let vals = std::mem::take(&mut node.vals);
+            let weights = std::mem::take(&mut node.weights);
+            return Ok(build_leaf(keys, vals, weights, cap, shape, Some(i)));
+        }
         let (mut keys, mut vals, mut weights) = node.decoded_parts()?;
         let i = match found {
             Ok(i) => {
@@ -1190,8 +1229,57 @@ fn node_insert(
     // Fault the target child (a `Resident` interior, or an `OnDisk` leaf brought in for
     // mutation — it becomes a dirty resident node on the rebuilt path).
     let i = node.child_slot(&key);
-    let c = child(node, i, src)?;
-    match node_insert(&c, key, val, weight, old, src, cap, shape)? {
+    if node.page.load(Ordering::Relaxed) == 0
+        && let Some(node) = Arc::get_mut(node)
+    {
+        let sub = match &mut node.children[i] {
+            Child::Resident(c) => node_insert(c, key, val, weight, old, src, cap, shape)?,
+            Child::OnDisk(page) => {
+                let mut c = match src {
+                    Some(s) => s.load_leaf(*page)?,
+                    None => {
+                        unreachable!("demand-paged leaf {page} reached with no buffer-pool source")
+                    }
+                };
+                match node_insert(&mut c, key, val, weight, old, src, cap, shape)? {
+                    // A loaded leaf is clean (and the pool also retains it), so this is defensive.
+                    Ins::Kept => Ins::Whole(c),
+                    out => out,
+                }
+            }
+        };
+        return match sub {
+            Ins::Kept => Ok(Ins::Kept),
+            Ins::Whole(c) => {
+                node.children[i] = Child::Resident(c);
+                Ok(Ins::Kept)
+            }
+            Ins::Split { left, sep, right } => {
+                node.keys.insert(i, sep);
+                node.children[i] = Child::Resident(left);
+                node.children.insert(i + 1, Child::Resident(right));
+                let payload =
+                    8 * node.keys.len() + 4 + node.keys.iter().map(Vec::len).sum::<usize>();
+                if payload <= cap || node.keys.len() < 2 {
+                    Ok(Ins::Kept)
+                } else {
+                    let keys = std::mem::take(&mut node.keys);
+                    let children = std::mem::take(&mut node.children);
+                    Ok(build_interior(keys, children, cap, Some(i))
+                        .expect("insert-path interior split always has a valid split point"))
+                }
+            }
+        };
+    }
+    let mut c = child(node, i, src)?;
+    match node_insert(&mut c, key, val, weight, old, src, cap, shape)? {
+        // The local Arc clone means a resident child cannot be unique here. Keep this arm
+        // defensive for a future child representation: rebuilding the parent preserves its link.
+        Ins::Kept => {
+            let mut children = node.children.clone();
+            children[i] = Child::Resident(c);
+            Ok(Ins::Whole(Node::new_interior(node.keys.clone(), children)))
+        }
         Ins::Whole(c) => {
             // This node's separators are unchanged, so it cannot overflow — rebuild whole.
             let mut children = node.children.clone();
@@ -1325,6 +1413,7 @@ fn merge_at(
     let mut keys = node.keys.clone();
     let mut children = node.children.clone();
     match merged {
+        Ins::Kept => unreachable!("fresh merge builders never edit an existing node"),
         Ins::Whole(m) => {
             keys.remove(j);
             children[j] = Child::Resident(m);
@@ -1729,6 +1818,64 @@ mod tests {
         assert_eq!(other.get(&key(1000), None).unwrap(), Some(row(-1000)));
         assert_eq!(other.get(&key(2500), None).unwrap(), Some(row(2500)));
         check_invariants(&other);
+    }
+
+    #[test]
+    fn insert_reuses_only_unique_dirty_paths() {
+        fn path(pm: &PMap, key: &[u8]) -> Vec<*const Node> {
+            let mut node = pm.root.as_ref().expect("nonempty map");
+            let mut out = Vec::new();
+            loop {
+                out.push(Arc::as_ptr(node));
+                if node.is_leaf() {
+                    return out;
+                }
+                node = node.children[node.child_slot(key)].resident();
+            }
+        }
+
+        let mut pm = PMap::new();
+        for k in 0..2000 {
+            pm.insert(key(k), row(k as i64), W, CAP, SHAPE, None)
+                .unwrap();
+        }
+        assert!(pm.height() > 2, "test needs a multi-level dirty path");
+
+        // An equal-weight overwrite cannot split. Every node on this unaliased dirty path stays at
+        // the same address, proving both the leaf edit and interior child replacement were in place.
+        let before = path(&pm, &key(777));
+        assert_eq!(
+            pm.insert(key(777), row(-777), W, CAP, SHAPE, None).unwrap(),
+            Some(row(777))
+        );
+        assert_eq!(path(&pm, &key(777)), before);
+        assert_eq!(pm.get(&key(777), None).unwrap(), Some(row(-777)));
+
+        // A snapshot alias defeats Arc::get_mut. The working map path-copies while the pin retains
+        // the old path and value bytes.
+        let pin = pm.clone();
+        let shared_before = path(&pm, &key(777));
+        pm.insert(key(777), row(-778), W, CAP, SHAPE, None).unwrap();
+        assert_ne!(path(&pm, &key(777)), shared_before);
+        assert_eq!(pin.get(&key(777), None).unwrap(), Some(row(-777)));
+        assert_eq!(pm.get(&key(777), None).unwrap(), Some(row(-778)));
+        drop(pin);
+
+        // Page 0 is an independent condition. Simulate a uniquely held persisted root: even though
+        // Arc::get_mut would succeed, the clean root is rebuilt and never edited in place.
+        let mut clean = PMap::new();
+        clean.insert(key(1), row(1), W, CAP, SHAPE, None).unwrap();
+        let clean_root = Arc::as_ptr(clean.root.as_ref().unwrap());
+        clean
+            .root
+            .as_ref()
+            .unwrap()
+            .page
+            .store(9, Ordering::Relaxed);
+        clean.insert(key(1), row(-1), W, CAP, SHAPE, None).unwrap();
+        assert_ne!(Arc::as_ptr(clean.root.as_ref().unwrap()), clean_root);
+        assert_eq!(clean.get(&key(1), None).unwrap(), Some(row(-1)));
+        check_invariants(&clean);
     }
 
     #[test]
