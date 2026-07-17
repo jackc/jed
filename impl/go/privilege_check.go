@@ -583,7 +583,7 @@ func collectInsertPrivs(ins *insert, req *privReq, locals map[string]bool) {
 			collectExprPrivs(ins.OnConflict.Filter, req, locals)
 		}
 	}
-	collectItemsPrivs(ins.Returning, req, locals)
+	collectReturningPrivs(ins.Returning, req, locals)
 }
 
 func collectUpdatePrivs(upd *update, req *privReq, locals map[string]bool) {
@@ -605,7 +605,7 @@ func collectUpdatePrivs(upd *update, req *privReq, locals map[string]bool) {
 	if upd.Filter != nil {
 		collectExprPrivs(upd.Filter, req, locals)
 	}
-	collectItemsPrivs(upd.Returning, req, locals)
+	collectReturningPrivs(upd.Returning, req, locals)
 }
 
 func collectDeletePrivs(del *deleteStmt, req *privReq, locals map[string]bool) {
@@ -617,7 +617,7 @@ func collectDeletePrivs(del *deleteStmt, req *privReq, locals map[string]bool) {
 	if del.Filter != nil {
 		collectExprPrivs(del.Filter, req, locals)
 	}
-	collectItemsPrivs(del.Returning, req, locals)
+	collectReturningPrivs(del.Returning, req, locals)
 }
 
 func collectQueryPrivs(qe *queryExpr, req *privReq, locals map[string]bool) {
@@ -725,12 +725,12 @@ func collectTableRefPrivs(t *tableRef, req *privReq, locals map[string]bool) {
 	}
 }
 
-func collectItemsPrivs(items *selectItems, req *privReq, locals map[string]bool) {
-	if items == nil {
+func collectReturningPrivs(returning *returningClause, req *privReq, locals map[string]bool) {
+	if returning == nil {
 		return
 	}
-	for i := range items.Items {
-		collectExprPrivs(&items.Items[i].Expr, req, locals)
+	for i := range returning.Items.Items {
+		collectExprPrivs(&returning.Items.Items[i].Expr, req, locals)
 	}
 }
 

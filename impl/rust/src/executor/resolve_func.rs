@@ -2557,7 +2557,7 @@ pub(crate) fn collect_insert_privs(ins: &Insert, req: &mut PrivReq, locals: &Has
             }
         }
     }
-    collect_items_privs(&ins.returning, req, locals);
+    collect_returning_privs(&ins.returning, req, locals);
 }
 
 pub(crate) fn collect_update_privs(upd: &Update, req: &mut PrivReq, locals: &HashSet<String>) {
@@ -2576,7 +2576,7 @@ pub(crate) fn collect_update_privs(upd: &Update, req: &mut PrivReq, locals: &Has
     if let Some(f) = &upd.filter {
         collect_expr_privs(f, req, locals);
     }
-    collect_items_privs(&upd.returning, req, locals);
+    collect_returning_privs(&upd.returning, req, locals);
 }
 
 pub(crate) fn collect_delete_privs(del: &Delete, req: &mut PrivReq, locals: &HashSet<String>) {
@@ -2588,7 +2588,7 @@ pub(crate) fn collect_delete_privs(del: &Delete, req: &mut PrivReq, locals: &Has
     if let Some(f) = &del.filter {
         collect_expr_privs(f, req, locals);
     }
-    collect_items_privs(&del.returning, req, locals);
+    collect_returning_privs(&del.returning, req, locals);
 }
 
 pub(crate) fn collect_query_privs(qe: &QueryExpr, req: &mut PrivReq, locals: &HashSet<String>) {
@@ -2683,12 +2683,16 @@ pub(crate) fn collect_table_ref_privs(t: &TableRef, req: &mut PrivReq, locals: &
     }
 }
 
-pub(crate) fn collect_items_privs(
-    items: &Option<SelectItems>,
+pub(crate) fn collect_returning_privs(
+    returning: &Option<ReturningClause>,
     req: &mut PrivReq,
     locals: &HashSet<String>,
 ) {
-    if let Some(SelectItems::Items(list)) = items {
+    if let Some(ReturningClause {
+        items: SelectItems::Items(list),
+        ..
+    }) = returning
+    {
         for it in list {
             collect_expr_privs(&it.expr, req, locals);
         }

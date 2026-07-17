@@ -36,6 +36,7 @@ import type {
   OrderKey,
   Overriding,
   QueryExpr,
+  ReturningClause,
   Select,
   SelectItem,
   SelectItems,
@@ -2839,6 +2840,17 @@ class Parser {
     return [null, first];
   }
 
+  // Whether the cursor has the exact `identifier "." identifier` shape. Expression
+  // disambiguation uses it so a keyword-spelled relation label wins over the keyword's literal,
+  // unary, or keyword-led primary meaning (spec/design/grammar.md §3).
+  private atQualifiedColumnRef(): boolean {
+    return (
+      this.peekKindAt(0) === "word" &&
+      this.peekKindAt(1) === "dot" &&
+      this.peekKindAt(2) === "word"
+    );
+  }
+
   // parseQualifiedTableName parses `qualified_table ::= (identifier ".")? identifier` in DML-target
   // position (spec/design/attached-databases.md §3): an optional database qualifier followed by the
   // table name. Returns [db, name] where db is undefined for a bare (implicit-scope) name. The
@@ -3035,13 +3047,51 @@ class Parser {
   // parseReturning parses an optional terminal `RETURNING <select_items>` clause (shared by
   // INSERT/UPDATE/DELETE — spec/design/grammar.md §32). RETURNING is not reserved (§3): it is
   // a clause only in this trailing position (and it joins the table_ref implicit-alias stop
-  // set, so an `INSERT ... SELECT` source never swallows it — §15). The item list is the
-  // ordinary select-items production (`*` or expressions with optional AS labels); an empty
-  // list fails in parseExpr (42601).
-  private parseReturning(): SelectItems | null {
+  // set, so an `INSERT ... SELECT` source never swallows it — §15). An optional
+  // `WITH (OLD AS o, NEW AS n)` prefix aliases either row-version pseudo-relation; AS is mandatory
+  // and each version may occur once. The item list is the ordinary select-items production (`*` or
+  // expressions with optional AS labels); an empty list fails in parseExpr (42601).
+  private parseReturning(): ReturningClause | null {
     if (this.peekKeyword() !== "returning") return null;
     this.advance(); // RETURNING
-    return this.parseSelectItems();
+    let oldAlias: string | null = null;
+    let newAlias: string | null = null;
+    if (
+      this.peekKeyword() === "with" &&
+      this.peekKindAt(1) === "lparen" &&
+      (this.peekKeywordAt(2) === "old" || this.peekKeywordAt(2) === "new") &&
+      this.peekKeywordAt(3) === "as"
+    ) {
+      this.advance(); // WITH
+      this.expect("lparen");
+      for (;;) {
+        const version = this.peekKeyword();
+        if (version !== "old" && version !== "new") {
+          throw engineError("syntax_error", "expected OLD or NEW in RETURNING WITH");
+        }
+        this.advance();
+        this.expectKeyword("as");
+        const alias = this.expectIdentifier();
+        if (version === "old") {
+          if (oldAlias !== null) {
+            throw engineError("syntax_error", "OLD cannot be specified multiple times");
+          }
+          oldAlias = alias;
+        } else {
+          if (newAlias !== null) {
+            throw engineError("syntax_error", "NEW cannot be specified multiple times");
+          }
+          newAlias = alias;
+        }
+        if (this.peek().kind === "comma") {
+          this.advance();
+          continue;
+        }
+        this.expect("rparen");
+        break;
+      }
+    }
+    return { oldAlias, newAlias, items: this.parseSelectItems() };
   }
 
   private parseSelectItems(): SelectItems {
@@ -3130,7 +3180,10 @@ class Parser {
   }
 
   private parseNot(): Expr {
-    if (this.peekKeyword() === "not") {
+    // A qualified column has structural priority over keyword-led expressions (§3): `not.v`
+    // starts with the relation label `not`, not the unary operator. The primary parser applies
+    // the same rule before literals / CAST / CASE / current-date spellings.
+    if (this.peekKeyword() === "not" && !this.atQualifiedColumnRef()) {
       this.advance();
       // right-associative: NOT NOT x — each NOT is one more AST level (recursion here, so the
       // depth guard also protects the parser's own stack).
@@ -3558,6 +3611,15 @@ class Parser {
   // parsePrimary parses a parenthesized expression, CAST(...), a literal (integer,
   // TRUE/FALSE, NULL), or a column reference.
   private parsePrimary(): Expr {
+    // Every word is legal as an identifier (§3), including spellings otherwise dispatched below
+    // as literals or keyword-led expressions. Recognize the unambiguous `identifier.identifier`
+    // shape first so a relation alias such as `null`, `cast`, or `case` remains usable.
+    if (this.atQualifiedColumnRef()) {
+      const qualifier = this.expectIdentifier();
+      this.expect("dot");
+      const name = this.expectIdentifier();
+      return { kind: "qualifiedColumn", qualifier, name };
+    }
     if (this.peek().kind === "lparen") {
       this.advance();
       // `(SELECT ...)` is a scalar subquery (grammar.md §26), disambiguated by a leading `SELECT`

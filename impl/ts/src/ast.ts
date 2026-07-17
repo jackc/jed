@@ -824,7 +824,7 @@ export type Insert = {
   onConflict: OnConflict | null;
   // The optional terminal RETURNING clause (spec/design/grammar.md §32): project each stored
   // row, turning the statement into a query result. Null = no clause.
-  returning: SelectItems | null;
+  returning: ReturningClause | null;
 };
 
 // OnConflict is the `ON CONFLICT [target] action` clause (spec/design/upsert.md §1). `target` is
@@ -1059,7 +1059,7 @@ export type Update = {
   filter: Expr | null;
   // The optional terminal RETURNING clause (spec/design/grammar.md §32): project each matched
   // row's NEW (post-assignment) values. Null = no clause.
-  returning: SelectItems | null;
+  returning: ReturningClause | null;
 };
 
 // Delete is `DELETE FROM <table> [WHERE ...]`. No WHERE deletes every row; the WHERE
@@ -1073,7 +1073,16 @@ export type Delete = {
   // (spec/design/attached-databases.md §3). undefined = implicit scope.
   db?: string;
   filter: Expr | null;
-  returning: SelectItems | null;
+  returning: ReturningClause | null;
+};
+
+// A DML RETURNING clause. oldAlias / newAlias are the optional PostgreSQL-18
+// `WITH (OLD AS o, NEW AS n)` row-version aliases; aliasing a version hides its standard qualifier
+// (spec/design/grammar.md §32).
+export type ReturningClause = {
+  oldAlias: string | null;
+  newAlias: string | null;
+  items: SelectItems;
 };
 
 // Begin/Commit/Rollback are the explicit transaction-control statements (grammar.md §27,

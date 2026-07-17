@@ -264,9 +264,9 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // The RETURNING clause on INSERT/UPDATE/DELETE — the statement becomes a query result
   // projecting each affected row (grammar.md §32, cost.md §3).
   "dml.returning",
-  // The old./new. row-version qualifiers in a RETURNING list (PG 18 semantics): old.col =
-  // the pre-statement value, new.col = the post-statement value, the absent side the
-  // all-NULL row (grammar.md §32).
+  // The old./new. row-version qualifiers and WITH (OLD AS o, NEW AS n) aliases in a
+  // RETURNING list (PG 18 semantics): old.col = the pre-statement value, new.col = the
+  // post-statement value, the absent side the all-NULL row (grammar.md §32).
   "dml.returning_old_new",
   // INSERT ... ON CONFLICT [target] { DO NOTHING | DO UPDATE SET … [WHERE …] } — UPSERT
   // (spec/design/upsert.md, grammar.md §46): arbiter inference / ON CONSTRAINT, the

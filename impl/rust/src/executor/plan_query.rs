@@ -181,28 +181,32 @@ impl Engine {
         rename: Option<&[String]>,
         ptypes: &mut ParamTypes,
     ) -> Result<(Box<Table>, DmCte)> {
-        let (table_name, returning, base_is_old, stmt): (&str, &Option<SelectItems>, bool, DmStmt) =
-            match body {
-                CteBody::Insert(ins) => (
-                    &ins.table,
-                    &ins.returning,
-                    false,
-                    DmStmt::Insert(ins.clone()),
-                ),
-                CteBody::Update(upd) => (
-                    &upd.table,
-                    &upd.returning,
-                    false,
-                    DmStmt::Update(upd.clone()),
-                ),
-                CteBody::Delete(del) => (
-                    &del.table,
-                    &del.returning,
-                    true,
-                    DmStmt::Delete(del.clone()),
-                ),
-                CteBody::Query(_) => unreachable!("plan_dm_cte requires a data-modifying body"),
-            };
+        let (table_name, returning, base_is_old, stmt): (
+            &str,
+            &Option<ReturningClause>,
+            bool,
+            DmStmt,
+        ) = match body {
+            CteBody::Insert(ins) => (
+                &ins.table,
+                &ins.returning,
+                false,
+                DmStmt::Insert(ins.clone()),
+            ),
+            CteBody::Update(upd) => (
+                &upd.table,
+                &upd.returning,
+                false,
+                DmStmt::Update(upd.clone()),
+            ),
+            CteBody::Delete(del) => (
+                &del.table,
+                &del.returning,
+                true,
+                DmStmt::Delete(del.clone()),
+            ),
+            CteBody::Query(_) => unreachable!("plan_dm_cte requires a data-modifying body"),
+        };
         let tdef = self.table(table_name).ok_or_else(|| {
             EngineError::new(
                 SqlState::UndefinedTable,
@@ -220,11 +224,11 @@ impl Engine {
                     },
                 ))
             }
-            Some(items) => {
-                let mut scope = Scope::returning(self, tdef, base_is_old);
+            Some(returning) => {
+                let mut scope = Scope::returning(self, tdef, base_is_old, returning)?;
                 scope.ctes = bindings;
                 let (_, names, types) =
-                    resolve_projections(&scope, items, &mut AggCtx::Forbidden, ptypes)?;
+                    resolve_projections(&scope, &returning.items, &mut AggCtx::Forbidden, ptypes)?;
                 let table = cte_synthetic_table_cols(lname, &names, &types, rename)?;
                 Ok((
                     table,

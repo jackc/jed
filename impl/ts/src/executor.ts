@@ -39,6 +39,7 @@ import type {
   OrderKey,
   QueryExpr,
   RefAction,
+  ReturningClause,
   Select,
   SelectItems,
   SetOp,
@@ -10171,16 +10172,16 @@ export class Engine {
   // baseIsOld true for DELETE).
   private resolveReturning(
     table: Table,
-    items: SelectItems,
+    returning: ReturningClause,
     baseIsOld: boolean,
     ctes: CteBinding[],
     ptypes: ParamTypes,
   ): { nodes: RExpr[]; names: string[]; types: string[] } {
-    const scope = Scope.returning(this, table, baseIsOld);
+    const scope = Scope.returning(this, table, baseIsOld, returning);
     scope.ctes = ctes;
     const { nodes, names, types } = resolveProjections(
       scope,
-      items,
+      returning.items,
       { collecting: false, groupKeys: [], specs: [] },
       ptypes,
     );
@@ -11134,7 +11135,7 @@ export class Engine {
     ptypes: ParamTypes,
   ): { table: Table; dm: DmCte } {
     let tableName: string;
-    let returning: SelectItems | null;
+    let returning: ReturningClause | null;
     let baseIsOld: boolean;
     let stmt: DmStmt;
     if (body.kind === "insert") {
@@ -11163,11 +11164,11 @@ export class Engine {
       const table = cteSyntheticTableCols(lname, [], [], rename);
       return { table, dm: { stmt, noReturning: true } };
     }
-    const scope = Scope.returning(this, tdef, baseIsOld);
+    const scope = Scope.returning(this, tdef, baseIsOld, returning);
     scope.ctes = bindings;
     const { names, types } = resolveProjections(
       scope,
-      returning,
+      returning.items,
       { collecting: false, groupKeys: [], specs: [] },
       ptypes,
     );

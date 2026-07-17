@@ -4114,19 +4114,58 @@ func (p *parser) parseOptionalWhere() (*exprNode, error) {
 // parseReturning parses an optional terminal `RETURNING <select_items>` clause (shared by
 // INSERT/UPDATE/DELETE — spec/design/grammar.md §32). RETURNING is not reserved (§3): it is a
 // clause only in this trailing position (and it joins the table_ref implicit-alias stop set,
-// so an `INSERT ... SELECT` source never swallows it — §15). The item list is the ordinary
-// select-items production (`*` or expressions with optional AS labels); an empty list fails
-// in parseExpr (42601).
-func (p *parser) parseReturning() (*selectItems, error) {
+// so an `INSERT ... SELECT` source never swallows it — §15). An optional
+// `WITH (OLD AS o, NEW AS n)` prefix aliases either row-version pseudo-relation; AS is mandatory
+// and each version may occur once. The item list is the ordinary select-items production (`*` or
+// expressions with optional AS labels); an empty list fails in parseExpr (42601).
+func (p *parser) parseReturning() (*returningClause, error) {
 	if p.peekKeyword() != "returning" {
 		return nil, nil
 	}
 	p.advance() // RETURNING
+	var oldAlias, newAlias *string
+	if p.peekKeyword() == "with" && p.peekKindAt(1) == tokLParen &&
+		(p.peekKeywordAt(2) == "old" || p.peekKeywordAt(2) == "new") && p.peekKeywordAt(3) == "as" {
+		p.advance() // WITH
+		if err := p.expect(tokLParen); err != nil {
+			return nil, err
+		}
+		for {
+			version := p.peekKeyword()
+			if version != "old" && version != "new" {
+				return nil, newError(SyntaxError, "expected OLD or NEW in RETURNING WITH")
+			}
+			p.advance()
+			if err := p.expectKeyword("as"); err != nil {
+				return nil, err
+			}
+			alias, err := p.expectIdentifier()
+			if err != nil {
+				return nil, err
+			}
+			slot := &oldAlias
+			if version == "new" {
+				slot = &newAlias
+			}
+			if *slot != nil {
+				return nil, newError(SyntaxError, strings.ToUpper(version)+" cannot be specified multiple times")
+			}
+			*slot = &alias
+			if p.peek().Kind == tokComma {
+				p.advance()
+				continue
+			}
+			if err := p.expect(tokRParen); err != nil {
+				return nil, err
+			}
+			break
+		}
+	}
 	items, err := p.parseSelectItems()
 	if err != nil {
 		return nil, err
 	}
-	return &items, nil
+	return &returningClause{OldAlias: oldAlias, NewAlias: newAlias, Items: items}, nil
 }
 
 func (p *parser) parseSelectItems() (selectItems, error) {
@@ -4244,7 +4283,10 @@ func (p *parser) parseAnd() (exprNode, error) {
 }
 
 func (p *parser) parseNot() (exprNode, error) {
-	if p.peekKeyword() == "not" {
+	// A qualified column has structural priority over keyword-led expressions (§3): `not.v`
+	// starts with the relation label `not`, not the unary operator. The primary parser applies
+	// the same rule before literals / CAST / CASE / current-date spellings.
+	if p.peekKeyword() == "not" && !p.atQualifiedColumnRef() {
 		p.advance()
 		// right-associative: NOT NOT x — each NOT is one more AST level (recursion here, so the
 		// depth guard also protects the parser's own stack).
@@ -4821,6 +4863,23 @@ func (p *parser) parsePostfix() (exprNode, error) {
 // parsePrimary parses a parenthesized expression, CAST(...), a literal (integer,
 // TRUE/FALSE, NULL), or a column reference.
 func (p *parser) parsePrimary() (exprNode, error) {
+	// Every word is legal as an identifier (§3), including spellings otherwise dispatched below
+	// as literals or keyword-led expressions. Recognize the unambiguous `identifier.identifier`
+	// shape first so a relation alias such as `null`, `cast`, or `case` remains usable.
+	if p.atQualifiedColumnRef() {
+		qualifier, err := p.expectIdentifier()
+		if err != nil {
+			return exprNode{}, err
+		}
+		if err := p.expect(tokDot); err != nil {
+			return exprNode{}, err
+		}
+		name, err := p.expectIdentifier()
+		if err != nil {
+			return exprNode{}, err
+		}
+		return exprNode{Kind: exprQualifiedColumn, Qualifier: qualifier, Column: name}, nil
+	}
 	if p.peek().Kind == tokLParen {
 		p.advance()
 		// `(SELECT ...)` is a scalar subquery (grammar.md §26), disambiguated by a leading
@@ -5613,6 +5672,13 @@ func (p *parser) parseColumnRef() (string, string, error) {
 		return first, second, nil
 	}
 	return "", first, nil
+}
+
+// atQualifiedColumnRef reports the exact `identifier "." identifier` shape. It is used by
+// expression disambiguation so a keyword-spelled relation label wins over the keyword's literal,
+// unary, or keyword-led primary meaning (spec/design/grammar.md §3).
+func (p *parser) atQualifiedColumnRef() bool {
+	return p.peekKindAt(0) == tokWord && p.peekKindAt(1) == tokDot && p.peekKindAt(2) == tokWord
 }
 
 // parseQualifiedTableName parses `qualified_table ::= (identifier ".")? identifier` in DML-target

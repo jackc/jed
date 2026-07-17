@@ -2594,10 +2594,13 @@ func defaultOrNull(col catColumn) Value {
 // The scope is the RETURNING scope (returningScope — the table at offset 0 plus the
 // old/new qualifier-only pseudo-relations over the [base | other] projection row, with
 // baseIsOld true for DELETE).
-func (db *engine) resolveReturning(table *catTable, items selectItems, baseIsOld bool, ctes []*cteBinding, ptypes *paramTypes) ([]*rExpr, []string, []string, error) {
-	s := returningScope(db, table, baseIsOld)
+func (db *engine) resolveReturning(table *catTable, returning returningClause, baseIsOld bool, ctes []*cteBinding, ptypes *paramTypes) ([]*rExpr, []string, []string, error) {
+	s, err := returningScope(db, table, baseIsOld, &returning)
+	if err != nil {
+		return nil, nil, nil, err
+	}
 	s.ctes = ctes
-	nodes, names, types, err := resolveProjections(s, items, &aggCtx{collecting: false}, ptypes)
+	nodes, names, types, err := resolveProjections(s, returning.Items, &aggCtx{collecting: false}, ptypes)
 	if err != nil {
 		return nil, nil, nil, err
 	}

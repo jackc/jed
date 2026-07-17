@@ -64,8 +64,8 @@ import type {
   JsonOnBehavior,
   JsonWrapper,
   QueryExpr,
+  ReturningClause,
   Select,
-  SelectItems,
   SeqOptions,
   SeqRestart,
   SetOp,
@@ -147,20 +147,43 @@ export class Scope {
   // projection row [base | other]. baseIsOld says which version the base row is: false for
   // INSERT/UPDATE (base = the new row, `old` reads the other half), true for DELETE (base =
   // the old row, `new` reads the other half) — the absent version is the all-NULL row the
-  // caller appends. A target table literally named old/new SHADOWS that qualifier (the
-  // pseudo-relation is suppressed; PostgreSQL's probed rule — its WITH (OLD AS o, ...)
-  // aliasing escape stays deferred).
-  static returning(catalog: Engine, t: Table, baseIsOld: boolean): Scope {
+  // caller appends. Explicit WITH (OLD AS o, NEW AS n) aliases are installed first and hide that
+  // version's standard name; an unaliased default is suppressed when its label is already occupied
+  // (including by the target table). Explicit aliases may not collide with the target or each other
+  // (42712).
+  static returning(
+    catalog: Engine,
+    t: Table,
+    baseIsOld: boolean,
+    returning: ReturningClause,
+  ): Scope {
     const n = t.columns.length;
     const label = t.name.toLowerCase();
     const oldOffset = baseIsOld ? 0 : n;
     const newOffset = baseIsOld ? n : 0;
     const rels: ScopeRel[] = [{ label, table: t, offset: 0 }];
-    for (const pseudo of [
-      { label: "old", offset: oldOffset },
-      { label: "new", offset: newOffset },
+    for (const explicit of [
+      { alias: returning.oldAlias, offset: oldOffset },
+      { alias: returning.newAlias, offset: newOffset },
     ]) {
-      if (label !== pseudo.label) {
+      if (explicit.alias !== null) {
+        const alias = explicit.alias.toLowerCase();
+        if (rels.some((r) => r.label === alias)) {
+          throw engineError("duplicate_alias", `table name ${alias} specified more than once`);
+        }
+        rels.push({
+          label: alias,
+          table: t,
+          offset: explicit.offset,
+          qualifierOnly: true,
+        });
+      }
+    }
+    for (const pseudo of [
+      { label: "old", offset: oldOffset, aliased: returning.oldAlias !== null },
+      { label: "new", offset: newOffset, aliased: returning.newAlias !== null },
+    ]) {
+      if (!pseudo.aliased && !rels.some((r) => r.label === pseudo.label)) {
         rels.push({
           label: pseudo.label,
           table: t,
@@ -633,9 +656,9 @@ export function countCteRefsDml(body: CteBody, name: string): number {
 }
 
 // countReturningRefs counts references to CTE `name` in a RETURNING item list's sublinks.
-export function countReturningRefs(returning: SelectItems | null, name: string): number {
-  if (returning === null || returning.kind !== "list") return 0;
-  return returning.items.reduce((a, it) => a + countSelfRefsExpr(it.expr, name), 0);
+export function countReturningRefs(returning: ReturningClause | null, name: string): number {
+  if (returning === null || returning.items.kind !== "list") return 0;
+  return returning.items.items.reduce((a, it) => a + countSelfRefsExpr(it.expr, name), 0);
 }
 
 // countSelfRefsQuery counts self-references to name anywhere in a query expression (deep — FROM
@@ -1508,7 +1531,7 @@ export function collectInsertPrivs(ins: Insert, req: PrivReq, locals: Set<string
     for (const a of ins.onConflict.assignments) collectExprPrivs(a.value, req, locals);
     if (ins.onConflict.filter !== null) collectExprPrivs(ins.onConflict.filter, req, locals);
   }
-  collectItemsPrivs(ins.returning, req, locals);
+  collectReturningPrivs(ins.returning, req, locals);
 }
 
 export function collectUpdatePrivs(upd: Update, req: PrivReq, locals: Set<string>): void {
@@ -1522,7 +1545,7 @@ export function collectUpdatePrivs(upd: Update, req: PrivReq, locals: Set<string
   if (reads) req.tables.push({ name: upd.table, priv: "select" });
   for (const a of upd.assignments) collectExprPrivs(a.value, req, locals);
   if (upd.filter !== null) collectExprPrivs(upd.filter, req, locals);
-  collectItemsPrivs(upd.returning, req, locals);
+  collectReturningPrivs(upd.returning, req, locals);
 }
 
 export function collectDeletePrivs(del: Delete, req: PrivReq, locals: Set<string>): void {
@@ -1532,7 +1555,7 @@ export function collectDeletePrivs(del: Delete, req: PrivReq, locals: Set<string
     req.tables.push({ name: del.table, priv: "select" });
   }
   if (del.filter !== null) collectExprPrivs(del.filter, req, locals);
-  collectItemsPrivs(del.returning, req, locals);
+  collectReturningPrivs(del.returning, req, locals);
 }
 
 export function collectQueryPrivs(qe: QueryExpr, req: PrivReq, locals: Set<string>): void {
@@ -1607,13 +1630,13 @@ export function collectTableRefPrivs(t: TableRef, req: PrivReq, locals: Set<stri
   }
 }
 
-export function collectItemsPrivs(
-  items: SelectItems | null,
+export function collectReturningPrivs(
+  returning: ReturningClause | null,
   req: PrivReq,
   locals: Set<string>,
 ): void {
-  if (items !== null && items.kind === "list") {
-    for (const it of items.items) collectExprPrivs(it.expr, req, locals);
+  if (returning !== null && returning.items.kind === "list") {
+    for (const it of returning.items.items) collectExprPrivs(it.expr, req, locals);
   }
 }
 

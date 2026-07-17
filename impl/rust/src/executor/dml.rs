@@ -2289,16 +2289,16 @@ impl Engine {
     pub(crate) fn resolve_returning(
         &self,
         table: &str,
-        items: &SelectItems,
+        returning: &ReturningClause,
         base_is_old: bool,
         ctes: &[CteBinding],
         ptypes: &mut ParamTypes,
     ) -> Result<(Vec<RExpr>, Vec<String>, Vec<String>)> {
         let tdef = self.table(table).expect("INSERT target resolved above");
-        let mut scope = Scope::returning(self, tdef, base_is_old);
+        let mut scope = Scope::returning(self, tdef, base_is_old, returning)?;
         scope.ctes = ctes;
         let (nodes, names, types) =
-            resolve_projections(&scope, items, &mut AggCtx::Forbidden, ptypes)?;
+            resolve_projections(&scope, &returning.items, &mut AggCtx::Forbidden, ptypes)?;
         Ok((nodes, names, type_names(&types)))
     }
 
@@ -2399,11 +2399,15 @@ impl Engine {
         // RETURNING resolves against its own scope: DELETE's base row IS the old row
         // (bare = `old.` = the deleted values; `new.` is the all-NULL side — grammar.md §32).
         let mut ret = match &del.returning {
-            Some(items) => {
-                let mut rscope = Scope::returning(self, table, true);
+            Some(returning) => {
+                let mut rscope = Scope::returning(self, table, true, returning)?;
                 rscope.ctes = ctx.bindings;
-                let (nodes, names, types) =
-                    resolve_projections(&rscope, items, &mut AggCtx::Forbidden, &mut ptypes)?;
+                let (nodes, names, types) = resolve_projections(
+                    &rscope,
+                    &returning.items,
+                    &mut AggCtx::Forbidden,
+                    &mut ptypes,
+                )?;
                 Some((nodes, names, type_names(&types)))
             }
             None => None,
@@ -2796,11 +2800,15 @@ impl Engine {
         // own scope: UPDATE's base row is the NEW row (bare = `new.` = post-assignment), and
         // `old.` reads the pre-update half of [base | other] (grammar.md §32).
         let mut ret = match &upd.returning {
-            Some(items) => {
-                let mut rscope = Scope::returning(self, table, false);
+            Some(returning) => {
+                let mut rscope = Scope::returning(self, table, false, returning)?;
                 rscope.ctes = ctx.bindings;
-                let (nodes, names, types) =
-                    resolve_projections(&rscope, items, &mut AggCtx::Forbidden, &mut ptypes)?;
+                let (nodes, names, types) = resolve_projections(
+                    &rscope,
+                    &returning.items,
+                    &mut AggCtx::Forbidden,
+                    &mut ptypes,
+                )?;
                 Some((nodes, names, type_names(&types)))
             }
             None => None,

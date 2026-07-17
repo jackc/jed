@@ -11,9 +11,10 @@ use crate::ast::{
     CreateType, Cte, CteBody, DefaultDef, Delete, DropIndex, DropSequence, DropTable, DropType,
     ExcludeDef, Expr, ForeignKeyDef, GroupItem, IdentitySpec, IndexKeyElem, IndexPredicate, Insert,
     InsertSource, InsertValue, JoinClause, JoinKind, JsonOnBehavior, JsonPredicateKind, JsonTable,
-    JsonWrapper, JtColumn, Literal, OnConflict, OrderKey, Overriding, QueryExpr, RefAction, Select,
-    SelectItem, SelectItems, SeqOptions, SetOp, SetOpKind, Statement, SubscriptSpec, TableRef,
-    TypeFieldDef, TypeMod, UnaryOp, UniqueDef, Update, WindowDef, WithExpr, WithQuery,
+    JsonWrapper, JtColumn, Literal, OnConflict, OrderKey, Overriding, QueryExpr, RefAction,
+    ReturningClause, Select, SelectItem, SelectItems, SeqOptions, SetOp, SetOpKind, Statement,
+    SubscriptSpec, TableRef, TypeFieldDef, TypeMod, UnaryOp, UniqueDef, Update, WindowDef,
+    WithExpr, WithQuery,
 };
 use crate::ast::{FrameBound, FrameExclusion, FrameMode, WindowFrame, WindowOrderKey};
 use crate::decimal::Decimal;
@@ -3532,14 +3533,71 @@ impl Parser {
     /// INSERT/UPDATE/DELETE — spec/design/grammar.md §32). `RETURNING` is not reserved (§3):
     /// it is a clause only in this trailing position (and it joins the table_ref
     /// implicit-alias stop set, so an `INSERT ... SELECT` source never swallows it — §15).
-    /// The item list is the ordinary select-items production (`*` or expressions with
-    /// optional `AS` labels); an empty list fails in `parse_expr` (42601).
-    fn parse_returning(&mut self) -> Result<Option<SelectItems>> {
+    /// The optional `WITH (OLD AS o, NEW AS n)` prefix aliases either row-version
+    /// pseudo-relation; `AS` is mandatory and each version may occur once. The item list is
+    /// the ordinary select-items production (`*` or expressions with optional `AS` labels);
+    /// an empty list fails in `parse_expr` (42601).
+    fn parse_returning(&mut self) -> Result<Option<ReturningClause>> {
         if self.peek_keyword().as_deref() != Some("returning") {
             return Ok(None);
         }
         self.advance(); // RETURNING
-        Ok(Some(self.parse_select_items()?))
+        let mut old_alias = None;
+        let mut new_alias = None;
+        if self.peek_keyword().as_deref() == Some("with")
+            && matches!(self.peek_at(1), Token::LParen)
+            && matches!(
+                self.peek_keyword_at(2).as_deref(),
+                Some("old") | Some("new")
+            )
+            && self.peek_keyword_at(3).as_deref() == Some("as")
+        {
+            self.advance(); // WITH
+            self.expect(&Token::LParen)?;
+            loop {
+                let version = self.peek_keyword().ok_or_else(|| {
+                    EngineError::new(
+                        SqlState::SyntaxError,
+                        "expected OLD or NEW in RETURNING WITH",
+                    )
+                })?;
+                if version != "old" && version != "new" {
+                    return Err(EngineError::new(
+                        SqlState::SyntaxError,
+                        "expected OLD or NEW in RETURNING WITH",
+                    ));
+                }
+                self.advance();
+                self.expect_keyword("as")?;
+                let alias = self.expect_identifier()?;
+                let slot = if version == "old" {
+                    &mut old_alias
+                } else {
+                    &mut new_alias
+                };
+                if slot.is_some() {
+                    return Err(EngineError::new(
+                        SqlState::SyntaxError,
+                        format!(
+                            "{} cannot be specified multiple times",
+                            version.to_ascii_uppercase()
+                        ),
+                    ));
+                }
+                *slot = Some(alias);
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    continue;
+                }
+                self.expect(&Token::RParen)?;
+                break;
+            }
+        }
+        Ok(Some(ReturningClause {
+            old_alias,
+            new_alias,
+            items: self.parse_select_items()?,
+        }))
     }
 
     /// Parse an optional trailing `WHERE <expr>` (shared by SELECT/UPDATE/DELETE). The
@@ -3646,7 +3704,10 @@ impl Parser {
     }
 
     fn parse_not(&mut self) -> Result<Expr> {
-        if self.peek_keyword().as_deref() == Some("not") {
+        // A qualified column has structural priority over keyword-led expressions (§3): `not.v`
+        // starts with the relation label `not`, not the unary operator. The primary parser applies
+        // the same rule before literals / CAST / CASE / current-date spellings.
+        if self.peek_keyword().as_deref() == Some("not") && !self.at_qualified_column_ref() {
             self.advance();
             // right-associative: NOT NOT x — each NOT is one more AST level (recursion here, so
             // the depth guard also protects the parser's own stack).
@@ -4171,6 +4232,15 @@ impl Parser {
     /// A primary: a parenthesized expression, `CAST(...)`, a literal (integer,
     /// `TRUE`/`FALSE`, `NULL`), or a column reference.
     fn parse_primary(&mut self) -> Result<Expr> {
+        // Every word is legal as an identifier (§3), including spellings otherwise dispatched
+        // below as literals or keyword-led expressions. Recognize the unambiguous
+        // `identifier.identifier` shape first so aliases such as `null`, `cast`, or `case` work.
+        if self.at_qualified_column_ref() {
+            let qualifier = self.expect_identifier()?;
+            self.expect(&Token::Dot)?;
+            let name = self.expect_identifier()?;
+            return Ok(Expr::QualifiedColumn { qualifier, name });
+        }
         if matches!(self.peek(), Token::LParen) {
             self.advance();
             // `(SELECT ...)` is a scalar subquery (grammar.md §26), disambiguated by a leading
@@ -4885,6 +4955,15 @@ impl Parser {
         } else {
             Ok((None, first))
         }
+    }
+
+    /// Whether the cursor has the exact `identifier "." identifier` shape. Expression
+    /// disambiguation uses it so a keyword-spelled relation label wins over the keyword's literal,
+    /// unary, or keyword-led primary meaning (spec/design/grammar.md §3).
+    fn at_qualified_column_ref(&self) -> bool {
+        matches!(self.peek_at(0), Token::Word(_))
+            && matches!(self.peek_at(1), Token::Dot)
+            && matches!(self.peek_at(2), Token::Word(_))
     }
 
     /// Parse `qualified_table ::= (identifier ".")? identifier` in DML-target position

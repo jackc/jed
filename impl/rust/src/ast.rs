@@ -501,7 +501,7 @@ pub struct Insert {
     pub on_conflict: Option<OnConflict>,
     /// The optional terminal `RETURNING` clause (spec/design/grammar.md §32): project each
     /// stored row, turning the statement into a query result. `None` = no clause.
-    pub returning: Option<SelectItems>,
+    pub returning: Option<ReturningClause>,
 }
 
 /// The `ON CONFLICT [target] action` clause (spec/design/upsert.md §1).
@@ -591,7 +591,7 @@ pub struct Update {
     pub filter: Option<Expr>,
     /// The optional terminal `RETURNING` clause (spec/design/grammar.md §32): project each
     /// matched row's NEW (post-assignment) values.
-    pub returning: Option<SelectItems>,
+    pub returning: Option<ReturningClause>,
 }
 
 /// One `SET <column> = <expr>` clause.
@@ -616,7 +616,17 @@ pub struct Delete {
     pub filter: Option<Expr>,
     /// The optional terminal `RETURNING` clause (spec/design/grammar.md §32): project each
     /// deleted row's OLD values.
-    pub returning: Option<SelectItems>,
+    pub returning: Option<ReturningClause>,
+}
+
+/// A DML `RETURNING` clause. `old_alias` / `new_alias` are the optional PostgreSQL-18
+/// `WITH (OLD AS o, NEW AS n)` row-version aliases; aliasing a version hides its standard
+/// qualifier (spec/design/grammar.md §32).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ReturningClause {
+    pub old_alias: Option<String>,
+    pub new_alias: Option<String>,
+    pub items: SelectItems,
 }
 
 /// A table reference in a FROM clause: a table name with an optional alias (`orders o`

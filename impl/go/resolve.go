@@ -116,10 +116,10 @@ func emptyScope(catalog *engine) *scope {
 // [base | other]. baseIsOld says which version the base row is: false for INSERT/UPDATE
 // (base = the new row, `old` reads the other half), true for DELETE (base = the old row,
 // `new` reads the other half) — the absent version is the all-NULL row the caller appends.
-// A target table literally named old/new SHADOWS that qualifier (the pseudo-relation is
-// suppressed; PostgreSQL's probed rule — its WITH (OLD AS o, ...) aliasing escape stays
-// deferred).
-func returningScope(catalog *engine, t *catTable, baseIsOld bool) *scope {
+// Explicit WITH (OLD AS o, NEW AS n) aliases are installed first and hide that version's standard
+// name; an unaliased default is suppressed when its label is already occupied (including by the
+// target table). Explicit aliases may not collide with the target or each other (42712).
+func returningScope(catalog *engine, t *catTable, baseIsOld bool, returning *returningClause) (*scope, error) {
 	n := len(t.Columns)
 	label := strings.ToLower(t.Name)
 	oldOffset, newOffset := n, 0
@@ -127,15 +127,34 @@ func returningScope(catalog *engine, t *catTable, baseIsOld bool) *scope {
 		oldOffset, newOffset = 0, n
 	}
 	rels := []scopeRel{{label: label, table: t, offset: 0}}
-	for _, pseudo := range []struct {
-		label  string
+	for _, explicit := range []struct {
+		alias  *string
 		offset int
-	}{{"old", oldOffset}, {"new", newOffset}} {
-		if label != pseudo.label {
+	}{{returning.OldAlias, oldOffset}, {returning.NewAlias, newOffset}} {
+		if explicit.alias != nil {
+			alias := strings.ToLower(*explicit.alias)
+			for _, rel := range rels {
+				if rel.label == alias {
+					return nil, newError(DuplicateAlias, "table name "+alias+" specified more than once")
+				}
+			}
+			rels = append(rels, scopeRel{label: alias, table: t, offset: explicit.offset, qualifierOnly: true})
+		}
+	}
+	for _, pseudo := range []struct {
+		label   string
+		offset  int
+		aliased bool
+	}{{"old", oldOffset, returning.OldAlias != nil}, {"new", newOffset, returning.NewAlias != nil}} {
+		occupied := false
+		for _, rel := range rels {
+			occupied = occupied || rel.label == pseudo.label
+		}
+		if !pseudo.aliased && !occupied {
 			rels = append(rels, scopeRel{label: pseudo.label, table: t, offset: pseudo.offset, qualifierOnly: true})
 		}
 	}
-	return &scope{rels: rels, catalog: catalog, allowSubquery: true}
+	return &scope{rels: rels, catalog: catalog, allowSubquery: true}, nil
 }
 
 // onConflictExcludedScope is the scope a DO UPDATE's SET/WHERE resolve against

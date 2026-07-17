@@ -231,5 +231,16 @@ arbitrate on (matched by column set; you can also write `ON CONSTRAINT account_p
   only when the proposed balance is larger; otherwise the row is left untouched.
 - **`RETURNING`** — append `RETURNING id, balance` to see the affected (inserted or updated) rows.
 
+`RETURNING` can also compare row versions. `old.balance` is the value before the change and
+`new.balance` the value after it; an `INSERT` has an all-`NULL` old row and a `DELETE` an all-`NULL`
+new row. Use aliases when the names would be clearer—or when the target table itself is named
+`old` or `new`:
+
+```sql
+UPDATE account SET balance = balance + 25
+  WHERE id = 1
+  RETURNING WITH (OLD AS before, NEW AS after) before.balance, after.balance;
+```
+
 A conflict on a constraint *other* than the arbiter still raises `23505`, and a single statement that
 would update the same existing row twice raises `21000`. The whole statement is all-or-nothing.

@@ -53,6 +53,12 @@ encodes:
 - Keyword terminals in the grammar (`"SELECT"`, `"FROM"`, …) denote a case-insensitive
   match, while punctuation terminals (`"("`, `"="`) match literally.
 
+A qualified reference's structural `identifier "." identifier` shape takes precedence over
+every expression-keyword interpretation of its first word. Thus relation aliases such as
+`null`, `cast`, `case`, `not`, and `current_date` remain usable as `null.v`, `cast.v`, and so
+on; the leading word is not parsed as a literal, conditional, unary operator, or clock form.
+This priority follows directly from accepting every bare word wherever `identifier` appears.
+
 This is a CLAUDE.md §8 divergence hotspot: if one core folded case differently, or
 reserved a word another did not, the corpus would diverge. Recording the rule in the
 grammar keeps all cores honest. (Canonical *output* names — `i16` not `smallint` — are
@@ -1720,7 +1726,7 @@ overrides like `on`'s — conformance.md §5).
 ## 32. `RETURNING` — DML that produces rows
 
 `INSERT`, `UPDATE`, and `DELETE` take an optional **terminal** `RETURNING` clause —
-`returning_clause ::= "RETURNING" select_items` — turning the statement into one that
+`returning_clause ::= "RETURNING" returning_aliases? select_items` — turning the statement into one that
 produces a **query result** (column names + rows, the same `Outcome` shape a `SELECT`
 returns; [api.md](api.md) §3). The item list is the ordinary `select_items` production:
 general expressions with optional `AS` output labels, or the standalone `*` glob expanding
@@ -1785,12 +1791,10 @@ probed: `RETURNING (SELECT old.v + s.a FROM s ...)`). Resolution rules:
 - **Only in `RETURNING`.** In any other clause (`SET`, `WHERE`, a `SELECT`), `old`/`new`
   are ordinary identifiers — an unknown qualifier is the usual `42P01`
   (*missing FROM-clause entry*), exactly PostgreSQL's behavior (probed).
-- **The table name shadows the qualifier** (probed): if the target table is itself named
-  `old` (or `new`), that qualifier keeps its ordinary table-qualified meaning — the
-  row-version pseudo-relation is suppressed. PostgreSQL recovers the hidden version via
-  `RETURNING WITH (OLD AS o, NEW AS n)` aliasing; jed defers that form (a deliberate,
-  relaxable narrowing — the unaliased qualifiers are the whole feature surface this
-  slice; [../../TODO.md](../../TODO.md)).
+- **The table name shadows an unaliased qualifier** (probed): if the target table is itself
+  named `old` (or `new`), that qualifier keeps its ordinary table-qualified meaning and the
+  same-named row-version pseudo-relation is suppressed. The aliasing form below recovers the
+  hidden version.
 - An unknown column under a qualifier is `42703`; **bare** `old`/`new` are ordinary column
   references (a column may be named either — they resolve normally, never to a row
   version). `old.*`/`new.*` are **qualified stars** (§15) — they expand that row version's
@@ -1805,6 +1809,32 @@ row when the statement has no such version), and `old`/`new` are **qualifier-onl
 pseudo-relations over it — invisible to bare-column resolution (no new ambiguity) and to
 every other statement's scope. Cost: the qualifiers are leaves like any column, and the
 **touched set** distinguishes the sides — [cost.md](cost.md) §3 "`RETURNING`".
+
+**Row-version aliases** (PostgreSQL 18, probed). An optional list immediately after
+`RETURNING` renames either or both pseudo-relations before the item list:
+
+```sql
+UPDATE account SET balance = balance + 10
+RETURNING WITH (OLD AS o, NEW AS n) o.balance, n.balance;
+```
+
+The production is
+`returning_aliases ::= "WITH" "(" returning_alias ("," returning_alias)* ")"`, where
+`returning_alias ::= ("OLD" | "NEW") "AS" identifier`. `AS` is required. Order is free,
+but `OLD` and `NEW` may each appear at most once; repeating either is `42601`. Naming both
+versions with the same alias, or colliding an explicit alias with the target relation's
+label, is `42712` (*duplicate alias*). An explicit alias is qualifier-only and works for
+qualified columns, qualified stars, and correlated references inside item subqueries.
+Consistent with §3's no-reserved-word rule, the prefix is recognized by the structural
+`WITH ( OLD|NEW AS` shape; `with` remains an ordinary identifier in every other expression
+shape.
+
+Aliasing one version hides that version's standard name; the other version keeps its
+standard name when the name is otherwise free. Explicit aliases are installed before
+unaliased defaults: consequently `WITH (OLD AS new)` makes `new` name the old row and
+suppresses the unaliased new-row pseudo-relation. This priority is what lets an alias recover
+`OLD` for a target table literally named `old`, while preserving the target table's ordinary
+meaning under `old.*`. Bare and target-table-qualified references are unchanged.
 
 **Cost.** Each returned row charges `row_produced` plus its items' metered evaluation,
 and the items' column references join an UPDATE/DELETE's touched set —

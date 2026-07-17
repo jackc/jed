@@ -11,9 +11,9 @@ pub(crate) use crate::ast::{
     CreateIndex, CreateSequence, CreateTable, CreateType, Cte, CteBody, DefaultDef, Delete,
     DropIndex, DropSequence, DropTable, DropType, Expr, GroupItem, IndexKeyElem, Insert,
     InsertSource, InsertValue, JoinKind, JsonOnBehavior, JsonPredicateKind, JsonTable, JsonWrapper,
-    JtColumn, Literal, OnConflict, OrderKey, Overriding, QueryExpr, RefAction, Select, SelectItems,
-    SeqOptions, SetOp, SetOpKind, Statement, SubscriptSpec, TableRef, TypeFieldDef, TypeMod,
-    UnaryOp, Update, WindowDef, WithExpr, WithQuery,
+    JtColumn, Literal, OnConflict, OrderKey, Overriding, QueryExpr, RefAction, ReturningClause,
+    Select, SelectItems, SeqOptions, SetOp, SetOpKind, Statement, SubscriptSpec, TableRef,
+    TypeFieldDef, TypeMod, UnaryOp, Update, WindowDef, WithExpr, WithQuery,
 };
 pub(crate) use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
@@ -1493,10 +1493,16 @@ impl<'a> Scope<'a> {
     /// row `[base | other]`. `base_is_old` says which version the base row is: false for
     /// INSERT/UPDATE (base = the new row, `old` reads the other half), true for DELETE
     /// (base = the old row, `new` reads the other half) — the absent version is the all-NULL
-    /// row the caller appends. A target table literally named `old`/`new` SHADOWS that
-    /// qualifier (the pseudo-relation is suppressed; PostgreSQL's probed rule — its
-    /// `WITH (OLD AS o, ...)` aliasing escape stays deferred).
-    fn returning(catalog: &'a Engine, table: &'a Table, base_is_old: bool) -> Scope<'a> {
+    /// row the caller appends. Explicit `WITH (OLD AS o, NEW AS n)` aliases are installed
+    /// first and hide that version's standard name; an unaliased default is suppressed when
+    /// its label is already occupied (including by the target table). Explicit aliases may not
+    /// collide with the target or each other (`42712`).
+    fn returning(
+        catalog: &'a Engine,
+        table: &'a Table,
+        base_is_old: bool,
+        returning: &ReturningClause,
+    ) -> Result<Scope<'a>> {
         let n = table.columns.len();
         let label = table.name.to_ascii_lowercase();
         let (old_offset, new_offset) = if base_is_old { (0, n) } else { (n, 0) };
@@ -1508,8 +1514,33 @@ impl<'a> Scope<'a> {
             cte: None,
             db: None,
         }];
-        for (pseudo, offset) in [("old", old_offset), ("new", new_offset)] {
-            if label != pseudo {
+        for (alias, offset) in [
+            (returning.old_alias.as_deref(), old_offset),
+            (returning.new_alias.as_deref(), new_offset),
+        ] {
+            if let Some(alias) = alias {
+                let alias = alias.to_ascii_lowercase();
+                if rels.iter().any(|r| r.label == alias) {
+                    return Err(EngineError::new(
+                        SqlState::DuplicateAlias,
+                        format!("table name {alias} specified more than once"),
+                    ));
+                }
+                rels.push(ScopeRel {
+                    label: alias,
+                    table,
+                    offset,
+                    qualifier_only: true,
+                    cte: None,
+                    db: None,
+                });
+            }
+        }
+        for (pseudo, offset, aliased) in [
+            ("old", old_offset, returning.old_alias.is_some()),
+            ("new", new_offset, returning.new_alias.is_some()),
+        ] {
+            if !aliased && !rels.iter().any(|r| r.label == pseudo) {
                 rels.push(ScopeRel {
                     label: pseudo.to_string(),
                     table,
@@ -1520,7 +1551,7 @@ impl<'a> Scope<'a> {
                 });
             }
         }
-        Scope {
+        Ok(Scope {
             rels,
             parent: None,
             catalog,
@@ -1528,7 +1559,7 @@ impl<'a> Scope<'a> {
             ctes: &[],
             merges: Vec::new(),
             hidden: Vec::new(),
-        }
+        })
     }
 
     /// The scope a DO UPDATE's `SET`/`WHERE` resolve against (spec/design/upsert.md §5): the
@@ -3316,9 +3347,12 @@ fn count_cte_refs_dml(body: &CteBody, name: &str) -> usize {
 }
 
 /// References to CTE `name` in a `RETURNING` item list's sublinks.
-fn count_returning_refs(returning: &Option<SelectItems>, name: &str) -> usize {
+fn count_returning_refs(returning: &Option<ReturningClause>, name: &str) -> usize {
     match returning {
-        Some(SelectItems::Items(items)) => items
+        Some(ReturningClause {
+            items: SelectItems::Items(items),
+            ..
+        }) => items
             .iter()
             .map(|it| count_self_refs_expr(&it.expr, name))
             .sum(),

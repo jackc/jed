@@ -5,7 +5,7 @@
 # RETURNING buffer; the parts run in lexical order, each data-modifying CTE always to completion and
 # materialized, and the whole statement is one all-or-nothing transaction. Rows verified against the
 # live PostgreSQL 18 oracle.
-# requires: ddl.create_table, ddl.primary_key, ddl.column_default, dml.insert, dml.insert_multi_row, dml.insert_select, dml.update, dml.delete, dml.returning, query.select, query.select_star, query.column_alias, query.where_eq, query.comparison_order, query.order_by, query.aggregates, query.cross_join, query.table_alias, query.qualified_column, query.cte, query.cte_data_modifying, expr.arithmetic, types.i32, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, ddl.column_default, dml.insert, dml.insert_multi_row, dml.insert_select, dml.update, dml.delete, dml.returning, dml.returning_old_new, query.select, query.select_star, query.column_alias, query.where_eq, query.comparison_order, query.order_by, query.aggregates, query.cross_join, query.table_alias, query.qualified_column, query.cte, query.cte_data_modifying, expr.arithmetic, types.i32, resource.cost_metering
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, v i32 DEFAULT 7, w i32)
@@ -53,6 +53,20 @@ SELECT id, v FROM u ORDER BY id
 11
 2
 21
+
+# Row-version aliases participate in the CTE's planned output schema and its materialized
+# RETURNING buffer exactly like the standard old/new qualifiers.
+# names: v, v
+# cost: 7
+query II nosort
+WITH u AS (
+  UPDATE t SET v = v + 1 WHERE id = 3
+  RETURNING WITH (OLD AS o, NEW AS n) o.v, n.v
+)
+SELECT * FROM u
+----
+30
+31
 
 # A DELETE-CTE returns the deleted OLD row, fed to the main query (id 6 was added above).
 # names: id, v

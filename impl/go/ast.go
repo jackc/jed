@@ -520,7 +520,7 @@ type insert struct {
 	OnConflict *onConflict
 	// Returning is the optional terminal RETURNING clause (spec/design/grammar.md §32):
 	// project each stored row, turning the statement into a query result. Nil = no clause.
-	Returning *selectItems
+	Returning *returningClause
 }
 
 // OnConflict is the `ON CONFLICT [target] action` clause (spec/design/upsert.md §1).
@@ -590,7 +590,7 @@ type update struct {
 	Filter      *exprNode
 	// Returning is the optional terminal RETURNING clause (spec/design/grammar.md §32):
 	// project each matched row's NEW (post-assignment) values. Nil = no clause.
-	Returning *selectItems
+	Returning *returningClause
 }
 
 // Assignment is one `SET <Column> = <Value>` clause; Value is a general expression.
@@ -613,7 +613,16 @@ type deleteStmt struct {
 	Filter *exprNode
 	// Returning is the optional terminal RETURNING clause (spec/design/grammar.md §32):
 	// project each deleted row's OLD values. Nil = no clause.
-	Returning *selectItems
+	Returning *returningClause
+}
+
+// returningClause is a DML RETURNING clause. OldAlias / NewAlias are the optional PostgreSQL-18
+// `WITH (OLD AS o, NEW AS n)` row-version aliases; aliasing a version hides its standard qualifier
+// (spec/design/grammar.md §32).
+type returningClause struct {
+	OldAlias *string
+	NewAlias *string
+	Items    selectItems
 }
 
 // TableRef is a table reference in a FROM clause: a table name with an optional alias

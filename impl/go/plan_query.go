@@ -149,7 +149,7 @@ func (db *engine) planCteBindings(ctes []cte, recursive bool, ptypes *paramTypes
 // be a base table — a CTE name / missing table is 42P01 (§1).
 func (db *engine) planDmCte(lname string, body *cteBody, bindings []*cteBinding, rename []string, ptypes *paramTypes) (*catTable, *dmCte, error) {
 	var tableName string
-	var returning *selectItems
+	var returning *returningClause
 	var baseIsOld bool
 	dm := &dmCte{}
 	switch {
@@ -175,9 +175,12 @@ func (db *engine) planDmCte(lname string, body *cteBody, bindings []*cteBinding,
 		}
 		return table, dm, nil
 	}
-	s := returningScope(db, tdef, baseIsOld)
+	s, err := returningScope(db, tdef, baseIsOld, returning)
+	if err != nil {
+		return nil, nil, err
+	}
 	s.ctes = bindings
-	_, names, types, err := resolveProjections(s, *returning, &aggCtx{collecting: false}, ptypes)
+	_, names, types, err := resolveProjections(s, returning.Items, &aggCtx{collecting: false}, ptypes)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -873,13 +876,13 @@ func countCteRefsDml(body *cteBody, name string) int {
 
 // countReturningRefs counts references to CTE name in a RETURNING item list's sublinks (the star
 // form RETURNING * has no expressions, so it contributes none).
-func countReturningRefs(returning *selectItems, name string) int {
-	if returning == nil || returning.All {
+func countReturningRefs(returning *returningClause, name string) int {
+	if returning == nil || returning.Items.All {
 		return 0
 	}
 	n := 0
-	for i := range returning.Items {
-		n += countSelfRefsExpr(returning.Items[i].Expr, name)
+	for i := range returning.Items.Items {
+		n += countSelfRefsExpr(returning.Items.Items[i].Expr, name)
 	}
 	return n
 }

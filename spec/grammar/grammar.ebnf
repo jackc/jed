@@ -448,14 +448,18 @@ delete         ::= "DELETE" "FROM" qualified_table where_clause? returning_claus
  * expressions, "AS" output labels, the standalone "*" glob), resolved against the target table
  * only; subqueries are allowed (they observe the pre-statement snapshot), aggregates are 42803.
  * The qualifiers "old" and "new" name the row's two versions (old.col = pre-statement, new.col
- * = post-statement; the absent side is the all-NULL row) — no new production: they are ordinary
- * qualified column references resolved as qualifier-only pseudo-relations, valid only here, and
- * shadowed by a target table actually named old/new (../design/grammar.md §32; PG 18 semantics).
+ * = post-statement; the absent side is the all-NULL row). The optional WITH list renames either
+ * or both qualifier-only pseudo-relations; AS is required, each version may occur at most once,
+ * and a renamed version's standard name is hidden (../design/grammar.md §32; PG 18 semantics).
  * "RETURNING" is NOT reserved (§3): it is recognized positionally as the trailing clause, and it
  * joins the table_ref implicit-alias stop-keyword set so an INSERT ... SELECT source never
  * swallows it as an alias (../design/grammar.md §15). Row order is unspecified (no ORDER BY
  * exists here — one after the clause is 42601). */
-returning_clause ::= "RETURNING" select_items
+returning_clause ::= "RETURNING" returning_aliases? select_items
+
+returning_aliases ::= "WITH" "(" returning_alias ("," returning_alias)* ")"
+
+returning_alias ::= ("OLD" | "NEW") "AS" identifier
 
 /* --- transaction control (../design/transactions.md §4, ../design/grammar.md §27) --------- */
 
@@ -1173,8 +1177,10 @@ frame_exclusion ::= "EXCLUDE" ("CURRENT" "ROW" | "GROUP" | "TIES" | "NO" "OTHERS
  * match in two or more relations is 42702 ambiguous_column, exactly one match resolves. A
  * qualified name names exactly one relation (an unknown label is 42P01, a label with no
  * such column is 42703) and is never ambiguous (../design/grammar.md §15). The "." is the
- * `Dot` token (see the lexical layer). The "rel.*" QUALIFIED STAR is a select-item form,
- * not a column_ref (see select_item). */
+ * `Dot` token (see the lexical layer). This structural identifier-dot-identifier shape takes
+ * precedence over any expression-keyword meaning of the first word (§3), so keyword-spelled
+ * relation aliases remain usable. The "rel.*" QUALIFIED STAR is a select-item form, not a
+ * column_ref (see select_item). */
 column_ref     ::= identifier ("." identifier)?
 
 /* INSERT takes literals only (no expressions, no columns). A leading "-" before
