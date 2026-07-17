@@ -87,7 +87,10 @@ fn one(db: &mut Session, sql: &str) -> Value {
 fn host_scalar_function_over_literals() {
     let mut db = db_with_ext(registry(vec![add_i64()]), &[]);
     assert_eq!(one(&mut db, "SELECT host_add(2, 3)"), Value::Int(5));
-    assert_eq!(one(&mut db, "SELECT host_add(host_add(1, 1), 40)"), Value::Int(42));
+    assert_eq!(
+        one(&mut db, "SELECT host_add(host_add(1, 1), 40)"),
+        Value::Int(42)
+    );
 }
 
 #[test]
@@ -100,7 +103,10 @@ fn host_scalar_function_over_columns() {
         ],
     );
     let mut rows = query(&mut db, "SELECT host_add(a, b) FROM t ORDER BY id");
-    let got: Vec<Value> = rows.drain(..).map(|r| r.into_iter().next().unwrap()).collect();
+    let got: Vec<Value> = rows
+        .drain(..)
+        .map(|r| r.into_iter().next().unwrap())
+        .collect();
     assert_eq!(got, vec![Value::Int(30), Value::Int(101)]);
 }
 
@@ -193,7 +199,10 @@ fn declared_cost_is_charged_per_call() {
         )
         .cost(cost)
     }
-    let mut db = db_with_ext(registry(vec![const0("host_c0", 0), const0("host_c1000", 1000)]), &[]);
+    let mut db = db_with_ext(
+        registry(vec![const0("host_c0", 0), const0("host_c1000", 1000)]),
+        &[],
+    );
     let c0 = db.query_outcome("SELECT host_c0()", &[]).unwrap().cost();
     let c1000 = db.query_outcome("SELECT host_c1000()", &[]).unwrap().cost();
     assert_eq!(c1000 - c0, 1000);
@@ -217,7 +226,9 @@ fn declared_cost_gates_max_cost_ceiling() {
     .session(SessionOptions::default());
     db.set_max_cost(1000);
     assert_eq!(
-        db.query_outcome("SELECT host_heavy()", &[]).unwrap_err().code(),
+        db.query_outcome("SELECT host_heavy()", &[])
+            .unwrap_err()
+            .code(),
         "54P01"
     );
 }
@@ -234,7 +245,9 @@ fn wrong_result_type_is_rejected() {
     );
     let mut db = db_with_ext(registry(vec![liar]), &[]);
     assert_eq!(
-        db.query_outcome("SELECT host_liar()", &[]).unwrap_err().code(),
+        db.query_outcome("SELECT host_liar()", &[])
+            .unwrap_err()
+            .code(),
         "22000"
     );
 }

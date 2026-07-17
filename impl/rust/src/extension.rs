@@ -144,7 +144,10 @@ impl ExtensionRegistry {
         {
             return Err(EngineError::new(
                 SqlState::DuplicateFunction,
-                format!("host function {} already registered with this signature", f.name),
+                format!(
+                    "host function {} already registered with this signature",
+                    f.name
+                ),
             ));
         }
         self.functions.push(f);
@@ -194,7 +197,10 @@ impl std::fmt::Debug for ExtensionRegistry {
 pub(crate) fn value_matches_result(v: &Value, ty: ScalarType) -> bool {
     match v {
         Value::Null => true,
-        Value::Int(_) => matches!(ty, ScalarType::Int16 | ScalarType::Int32 | ScalarType::Int64),
+        Value::Int(_) => matches!(
+            ty,
+            ScalarType::Int16 | ScalarType::Int32 | ScalarType::Int64
+        ),
         Value::Bool(_) => ty == ScalarType::Bool,
         Value::Float32(_) => ty == ScalarType::Float32,
         Value::Float64(_) => ty == ScalarType::Float64,

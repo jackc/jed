@@ -1347,7 +1347,10 @@ impl Database {
     /// so an in-memory tree must be built at the size it will serialize to; that is why
     /// [`CreateOptions::page_size`] is meaningful for the in-memory backing too.
     fn in_memory(page_size: u32) -> Database {
-        Self::in_memory_with(page_size, Arc::new(crate::extension::ExtensionRegistry::default()))
+        Self::in_memory_with(
+            page_size,
+            Arc::new(crate::extension::ExtensionRegistry::default()),
+        )
     }
 
     /// [`in_memory`](Self::in_memory) carrying a host extension registry (the in-memory branch of

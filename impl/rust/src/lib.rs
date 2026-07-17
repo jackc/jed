@@ -88,15 +88,15 @@ pub use decimal::Decimal;
 // path is unchanged.
 pub use ergonomic::{FromValue, Params, Row, ToValue};
 pub use error::{EngineError, Result, SqlState};
-// Host extensibility (spec/design/extensibility.md §4.2) — the host registers scalar functions into
-// an `ExtensionRegistry` and hands it to `create`/`open` via `CreateOptions`/`OpenOptions`. The
-// scalar type set is on the public surface here because a host names it to declare signatures.
-pub use extension::{ExtensionRegistry, HostFunction, HostKernel, Volatility};
-pub use types::ScalarType;
 pub use executor::{
     CollationInfo, DEFAULT_MAX_SQL_LENGTH, DEFAULT_PAGE_SIZE, ScriptSummary, SessionOptions,
     TxStatus,
 };
+// Host extensibility (spec/design/extensibility.md §4.2) — the host registers scalar functions into
+// an `ExtensionRegistry` and hands it to `create`/`open` via `CreateOptions`/`OpenOptions`.
+pub use extension::{ExtensionRegistry, HostFunction, HostKernel, Volatility};
+// The scalar type set is on the public surface (a host names it to declare host-function signatures).
+pub use types::ScalarType;
 // The low-level single-threaded `Engine` is a purely INTERNAL concern — not the public embedding
 // API and not reachable by any external crate. The converged §2.4 handles ([`Database`] /
 // [`Session`]) are the only surface; every consumer (the integration tests, the `cli/` REPL, the

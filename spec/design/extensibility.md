@@ -14,12 +14,16 @@
 > disappear) to "**who owns the cross-core determinism contract**" (where it is load-bearing and
 > must stay). §2 is that argument; everything else follows from it.
 >
-> **Status: a framework + proposal — with the §5 dispatch foundation built and composite types
-> landed.** Two pieces are real: (a) resolution for the **built-in** named scalar functions and
-> aggregates is data-driven over the generated catalog tables (§5, all three cores, behaviour-preserving);
-> (b) **composite (row) types have shipped** as a landed feature ([composite.md](composite.md),
-> `format_version` 9 — the *open type* pivot §3 rests on). **Everything else here remains a
-> proposal**: the `TypeExpr` model (§3), host scalar functions (§4.2), host scalar types (§4.3),
+> **Status: a framework + proposal — with the §5 dispatch foundation built, composite types landed,
+> and the host-function injection seam (§14 step 3) shipped.** Three pieces are real: (a) resolution
+> for the **built-in** named scalar functions and aggregates is data-driven over the generated catalog
+> tables (§5, all three cores, behaviour-preserving); (b) **composite (row) types have shipped** as a
+> landed feature ([composite.md](composite.md), `format_version` 9 — the *open type* pivot §3 rests
+> on); (c) **host scalar functions over existing types have shipped** (§4.2 / §14 step 3, all three
+> cores): a host registers scalar functions into a frozen `ExtensionRegistry` at open/create and they
+> resolve + evaluate through a registry dispatch arm beside the built-in one — the function *seam* of
+> §5.1, ephemeral (no persisted use). **Everything else here remains a proposal**: the `TypeExpr`
+> model (§3), host scalar types (§4.3),
 > the persisted host-type catalog (§6), the extension registration surface (§7), the host-code index
 > connection (§8), host-code cost metering (§9), the host determinism ledger (§10), the graded
 > missing-on-reopen verdict (§11), and the host-extension conformance harness (§12). The doc defines
@@ -729,6 +733,16 @@ cleanup, not a prerequisite. A suggested sequence:
    host-code registry**, so it lands earliest.
 3. **Runtime host scalar *functions* over existing types only** (§4.2), *no persisted use* — the
    function-registry injection seam + signature overloading + volatility/cross-core/cost, batch-of-one.
+   ✅ **landed (all three cores)**: an `ExtensionRegistry` a host builds and passes in
+   `CreateOptions`/`OpenOptions`, frozen for the handle and shared into every session (streaming
+   included); a separate `HostFunc`/`hostFunc` resolved node reached **by id** through the registry
+   alongside the untouched built-in dispatch; built-ins win an exact-signature collision; `cost`
+   (design (a) static weight) charged per call + guarded against the ceiling; wrong-typed kernel
+   results caught (`22000`); `42723` for a duplicate registration. **Deferred to later slices**:
+   the vectorized/batched kernel ABI (batch-of-one only for now), non-strict host functions, host
+   functions over container args, and runtime *enforcement* of the `volatility`/`cross_core`
+   declarations (recorded but not yet acted on — no host function is constant-folded, and there is no
+   runtime taint mechanism yet, matching how `float` is handled at the spec layer, §2).
 4. **Catalog-bound, versioned functions + resolved-dependency persistence** for expression/partial
    indexes (§7/§8.1) — the soundness fix that lets a host function appear in a persisted index.
 5. **Opaque host scalar *types*** (Storable/Equatable/Ordered) + **derived `array<host-type>`** (§3.1,
@@ -781,9 +795,9 @@ When a section here is ratified, update **in the same change** (mirrors [determi
 | §2 | Determinism-ownership is the line that moves | **proposed** (the governing principle) |
 | §3 | The `TypeExpr` model + the capability ladder + the closed container axis | **proposed** (composite arm is **landed**) |
 | §4.1 | Composite types (derived codec, G2 free, self-describing) | **landed as a type**; composite-**as-key** proposed (recommended early) |
-| §4.2 | Host scalar functions (registry, signature overloads, vectorized, cost, volatility) | **proposed** (built-in dispatch built, §5) |
+| §4.2 | Host scalar functions (registry, signature overloads, vectorized, cost, volatility) | **landed** (all 3 cores): ephemeral registry + resolve + eval seam, exact-signature overloading, cost charged/gated, strict, wrong-type-caught, 42723. Vectorized ABI, non-strict, container args, volatility/cross-core *enforcement* deferred (§14 step 3) |
 | §4.3 | Host scalar types (Storable→Indexed ladder, `type_code 21`, opaque) | **proposed** |
-| §5 | Dispatch — registry the many, inline the few (§5.1 splits the **seam** from the **dogfood**; function seam first) | **built** for built-in scalar functions + aggregates (all 3 cores, behaviour-preserving). Host injection seam + type-vtable depth **proposed** (Fork A, §13) |
+| §5 | Dispatch — registry the many, inline the few (§5.1 splits the **seam** from the **dogfood**; function seam first) | **built** for built-in scalar functions + aggregates *and* the **host function injection seam** (§14 step 3, all 3 cores): a host kernel is reached by id through the frozen registry alongside the inlined built-in arms. Type-vtable depth (Fork A) + the type-method seam (step 5) **proposed** |
 | §6 | Persisted host-type catalog + on-disk representation (`type_code 21`, `format_version 30`) | **proposed** |
 | §7 | Registration (ephemeral registry) vs. schema (DDL) + 5-field component identity | **proposed** |
 | §8 | The index connection — expression indexes (resolved-dependency persistence) + opclass registry | **proposed** (§8.1 is the recommended first index connection) |
