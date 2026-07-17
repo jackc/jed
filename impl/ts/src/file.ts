@@ -22,6 +22,7 @@ import { dirname } from "node:path";
 import { FileBlockStore } from "./fileblockstore.ts";
 import { DEFAULT_PAGE_SIZE, Engine } from "./executor.ts";
 import { engineError } from "./errors.ts";
+import type { ExtensionRegistry } from "./extension.ts";
 import { loadEnginePaged, toImage } from "./format.ts";
 import { cacheLeaves, DEFAULT_CACHE_BYTES, SharedPaging } from "./paging.ts";
 import { Pager } from "./pager.ts";
@@ -55,6 +56,10 @@ export type CreateOptions = {
   skipFsync?: boolean;
   locking?: Locking;
   fileLockTimeoutMs?: number;
+  // Host extensions to register on this database (spec/design/extensibility.md §7): scalar functions
+  // the host supplies, FROZEN for the handle's lifetime and shared into every session. Not stored in
+  // the file — a host reopens with its own registry (the ephemeral, no-persisted-use rule of §14).
+  extensions?: ExtensionRegistry;
 };
 
 // create makes a new file-backed database at path with opts (the page size is locked into the
@@ -131,6 +136,10 @@ export type OpenOptions = {
   skipFsync?: boolean;
   locking?: Locking;
   fileLockTimeoutMs?: number;
+  // Host extensions to register on this handle (spec/design/extensibility.md §7): scalar functions
+  // the host supplies, FROZEN for the handle's lifetime. A handle setting like the rest — not stored
+  // in the file, so a reopening host brings its own (§14 step 3).
+  extensions?: ExtensionRegistry;
 };
 
 // open opens an existing file-backed database at path with optional open settings (the memory budget,
@@ -215,13 +224,14 @@ export function createDatabase(opts: CreateOptions = {}): Database {
         pageSize,
         noSync: opts.skipFsync,
       });
-      return Database.fromEngine(engine, coordinator);
+      return Database.fromEngine(engine, coordinator, opts.extensions ?? null);
     } catch (error) {
       coordinator?.close();
       throw error;
     }
   }
-  return buildInMemory(pageSize); // in-memory never fsyncs; skipFsync is a no-op
+  // in-memory never fsyncs; skipFsync is a no-op
+  return buildInMemory(pageSize, opts.extensions ?? null);
 }
 
 // openDatabase opens an existing file-backed database at path with optional open settings and returns
@@ -236,7 +246,7 @@ export function openDatabase(path: string, opts: OpenOptions = {}): Database {
     } finally {
       coordinator?.unlockCommit();
     }
-    return Database.fromEngine(engine, coordinator);
+    return Database.fromEngine(engine, coordinator, opts.extensions ?? null);
   } catch (error) {
     coordinator?.close();
     throw error;

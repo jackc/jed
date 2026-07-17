@@ -2273,6 +2273,10 @@ export function renderRExpr(e: RExpr): string {
       return explainCall(e.greatest ? "greatest" : "least", e.args);
     case "scalarFunc":
       return explainCall(e.func, e.args);
+    case "hostFunc":
+      // The host function name is carried on the node so EXPLAIN renders it without the registry
+      // (extensibility.md §5.1).
+      return explainCall(e.name, e.args);
     case "arrayFunc":
       return explainCall(e.func, e.args);
     case "rangeFunc":

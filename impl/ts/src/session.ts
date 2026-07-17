@@ -1,6 +1,7 @@
 import type { ActiveTx, SessionOptions, TxStatus } from "./snapshot.ts";
 import { LifetimeBudget, Meter } from "./cost.ts";
 import { Seam } from "./seam.ts";
+import type { ExtensionRegistry } from "./extension.ts";
 import type { SequenceDef } from "./catalog.ts";
 import { Privileges } from "./privileges.ts";
 import { Snapshot, requireCustomVarName, txStatusOf } from "./snapshot.ts";
@@ -56,6 +57,11 @@ export class SessionState {
   // host-injectable functions, each unset ⇒ the platform primitive. Tests inject seededRandomSource +
   // fixedClock (the # seed: / # clock: directives) for byte-identical cross-core output.
   seam: Seam;
+  // The frozen host extension registry (spec/design/extensibility.md §7): the scalar functions the
+  // host registered at open/create. Set from the shared core at session mint; a streaming cursor's
+  // frozen engine shares the same SessionState reference (so it sees the same functions). null when
+  // no extensions were supplied — the built-in-only path.
+  extensions: ExtensionRegistry | null;
   // SESSION currval state (sequences.md §6): the last value nextval/setval(…,true) produced IN THIS
   // SESSION for each sequence (lowercased name). NOT in the snapshot, NOT persisted.
   sessionSeq: Map<string, bigint>;
@@ -122,6 +128,7 @@ export class SessionState {
     // is reached at runtime via setWorkMem(0). Matches Go/Rust (api.md §2.1).
     this.workMem = opts.workMem ? opts.workMem : DEFAULT_WORK_MEM;
     this.seam = new Seam();
+    this.extensions = null; // set from the shared core at session mint (extensibility.md §7)
     this.sessionSeq = new Map();
     this.sessionLastName = null;
     this.pendingSeq = new Map();
@@ -160,6 +167,7 @@ export class SessionState {
     frozen.lockTimeoutMs = source.lockTimeoutMs;
     frozen.workMem = source.workMem;
     frozen.seam = source.seam;
+    frozen.extensions = source.extensions; // shared frozen host-function registry (extensibility.md §7)
     frozen.sessionSeq = source.sessionSeq;
     frozen.sessionLastName = source.sessionLastName;
     frozen.pendingSeq = new Map();

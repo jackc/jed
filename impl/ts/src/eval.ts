@@ -127,6 +127,7 @@ import {
 import { Decimal, workDiv, workLinear, workMod, workMul } from "./decimal.ts";
 import type { Interval } from "./interval.ts";
 import { type EngineError, engineError } from "./errors.ts";
+import { valueMatchesResult } from "./extension.ts";
 import { not3, or3, valueCmp } from "./window.ts";
 import type { JsonMember, JsonNode } from "./json.ts";
 import {
@@ -1090,6 +1091,36 @@ export function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         }
       }
       return best ?? nullValue();
+    }
+    case "hostFunc": {
+      // A host-defined scalar function (spec/design/extensibility.md §4.2 / §5.1): the injection
+      // seam. The kernel is reached BY ID through the frozen registry — the path the compiled
+      // scalarFunc dispatch cannot offer a host.
+      const hf = env.exec.session.extensions!.functionAt(e.id);
+      // The declared static cost (cost.md §6 design (a)), charged once per call; arguments charge
+      // their own. Guard immediately after (the size-scaled-charge discipline) so a large declared
+      // weight aborts BEFORE the kernel runs.
+      m.charge(hf.cost);
+      m.guard();
+      // STRICT: a NULL argument short-circuits to NULL before the kernel runs (§4.2), so the kernel
+      // never sees a NULL — exactly like the built-in scalar-function arm.
+      const hvals: Value[] = [];
+      for (const a of e.args) {
+        const v = evalExpr(a, row, env, m);
+        if (v.kind === "null") return nullValue(); // NULL propagates
+        hvals.push(v);
+      }
+      const out = hf.kernel(hvals);
+      // Defend jed's own strict type system against a misbehaving host kernel (CLAUDE.md §13 — the
+      // host owns its consequences, but a wrong-typed value must never reach jed's codecs /
+      // comparators): the returned value must be NULL or match the declared scalar result type.
+      if (!valueMatchesResult(out, e.result)) {
+        throw engineError(
+          "data_exception",
+          `host function returned a value not matching its declared result type ${e.result}`,
+        );
+      }
+      return out;
     }
     case "scalarFunc": {
       // One operator_eval per call (the uniform weight); arguments charge their own.

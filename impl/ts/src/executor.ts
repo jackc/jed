@@ -2899,7 +2899,7 @@ export class Engine {
         add(expr.els);
         for (const arm of expr.arms) { add(arm.cond); add(arm.result); }
         return;
-      case "greatestLeast": case "coalesce": case "scalarFunc": case "arrayFunc":
+      case "greatestLeast": case "coalesce": case "scalarFunc": case "hostFunc": case "arrayFunc":
       case "regexFunc": case "rangeFunc": case "rangeCtor": case "rangeOp":
       case "rangeSetOp": case "variadic": case "jsonBuild": case "jsonSetInsert":
       case "jsonObjectFromArrays": case "jsonPathFn": case "jsonSqlFn": addMany(expr.args); return;
@@ -16766,6 +16766,7 @@ export class Engine {
       case "greatestLeast":
       case "coalesce":
       case "scalarFunc":
+      case "hostFunc":
       case "arrayFunc":
       case "regexFunc":
       case "rangeFunc":
@@ -18690,6 +18691,7 @@ function estimatorOperatorNodes(expr: RExpr | null): bigint {
     case "greatestLeast":
     case "coalesce":
     case "scalarFunc":
+    case "hostFunc":
     case "arrayFunc":
     case "regexFunc":
     case "rangeFunc":
@@ -21613,6 +21615,7 @@ export function rexprReferencesOuter(e: RExpr, depth: number): boolean {
     case "greatestLeast":
     case "coalesce":
     case "scalarFunc":
+    case "hostFunc":
     case "arrayFunc":
     case "regexFunc":
     case "rangeFunc":
@@ -21828,6 +21831,7 @@ export function collectTouched(e: RExpr, depth: number, touched: boolean[]): voi
     case "greatestLeast":
     case "coalesce":
     case "scalarFunc":
+    case "hostFunc":
     case "arrayFunc":
     case "regexFunc":
     case "rangeFunc":
@@ -22227,6 +22231,7 @@ export function rebasePlaceholderCols(e: RExpr, from: number, target: number): v
     case "greatestLeast":
     case "coalesce":
     case "scalarFunc":
+    case "hostFunc":
     case "arrayFunc":
     case "regexFunc":
     case "rangeFunc":
@@ -22685,6 +22690,13 @@ export type RExpr =
       result: ScalarType;
       argWidth?: ScalarType;
     }
+  // A HOST-defined scalar-function call (spec/design/extensibility.md §4.2 / §5.1) — the injection
+  // seam that reaches a host-registered kernel, which the compiled scalarFunc dispatch cannot. `id`
+  // indexes the frozen ExtensionRegistry on the session; `name` is carried so EXPLAIN renders it
+  // without the registry; `result` is the declared scalar result type. STRICT (a NULL arg → NULL,
+  // short-circuited in eval like "scalarFunc"). A distinct kind so the built-in path stays
+  // monomorphized (§5) and no built-in id-reasoning applies to host code.
+  | { kind: "hostFunc"; id: number; name: string; args: RExpr[]; result: ScalarType }
   // A polymorphic array-function call (spec/design/array-functions.md §3), evaluated per row.
   // Distinct from "scalarFunc": it resolves over anyarray/anyelement (§2) and its builders return an
   // array; the result type lives in the surrounding ResolvedType (carried out of resolve), not on the
@@ -27582,7 +27594,10 @@ export function resolveFuncCall(
     if (!ok(tys[0]!) || !ok(tys[1]!) || !ok(tys[2]!)) throw noFuncOverload("width_bucket");
     return scalarFuncNode("width_bucket", rargs, "i32", undefined);
   }
-  if (isScalarFuncName(lname)) {
+  // A built-in scalar function OR a host-registered one (extensibility.md §4.2 — a host-only name
+  // routes here too; resolveScalarFunc tries the built-in catalog first, then the host registry).
+  // Host functions are positional-only, so rejectNamed applies to them as well.
+  if (isScalarFuncName(lname) || (scope.catalog.session.extensions?.hasFunction(lname) ?? false)) {
     rejectNamed(lname, e.argNames);
     return resolveScalarFunc(scope, e, ag, params);
   }
@@ -27920,7 +27935,15 @@ export function resolveScalarFunc(
   // (extensibility.md §5) — by the SPELLED name, so `power(numeric,numeric)` and `power(float,float)`
   // both resolve (the decimal `power` row has no `pow` alias, matching Rust/Go).
   const desc = lookupScalarOverload(name, tys);
-  if (!desc) throw noFuncOverload(name);
+  if (!desc) {
+    // Host-registered scalar function (extensibility.md §4.2): exact scalar signature, no implicit
+    // promotion. A built-in overload (above) always wins; a host function is reached only when no
+    // built-in matches. Use the ORIGINAL name (not the char_length→length built-in alias rewrite).
+    // `id` indexes the frozen registry; the kernel is reached by id at eval.
+    const host = resolveHostScalar(scope, e.name.toLowerCase(), rargs, tys);
+    if (host) return host;
+    throw noFuncOverload(name);
+  }
   // Eval-kernel aliases that share a backing kernel id: `power(x, y)` is PG's name for jed's pow (the
   // name gap, float.md §8); `ceiling` is PG's alias of `ceil` (functions.md §9). The catalog lookup
   // above used the spelled name (both have catalog rows); the kernel reuses pow/ceil.
@@ -27952,6 +27975,34 @@ export function scalarFuncNode(
 ): { node: RExpr; type: ResolvedType } {
   return {
     node: { kind: "scalarFunc", func, args, result, argWidth },
+    type: resolvedTypeOf(result),
+  };
+}
+
+// resolveHostScalar resolves (name, arg types) against the session's frozen host-function registry
+// (spec/design/extensibility.md §4.2): every argument must be a scalar type (a container/NULL
+// argument matches no host signature this slice), and the whole signature must match a registered
+// function exactly. Returns a "hostFunc" node + its public type, or null (the caller falls through to
+// 42883).
+function resolveHostScalar(
+  scope: Scope,
+  name: string,
+  rargs: RExpr[],
+  tys: ResolvedType[],
+): { node: RExpr; type: ResolvedType } | null {
+  const registry = scope.catalog.session.extensions;
+  if (!registry) return null;
+  const argScalars: ScalarType[] = [];
+  for (const t of tys) {
+    const st = resolvedToScalar(t);
+    if (st === null) return null;
+    argScalars.push(st);
+  }
+  const id = registry.resolveHost(name, argScalars);
+  if (id === null) return null;
+  const result = registry.functionAt(id).result;
+  return {
+    node: { kind: "hostFunc", id, name, args: rargs, result },
     type: resolvedTypeOf(result),
   };
 }

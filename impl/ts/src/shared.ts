@@ -70,6 +70,7 @@ import {
   toImage as toImageBytes,
 } from "./format.ts";
 import type { CompositeType, Table } from "./catalog.ts";
+import type { ExtensionRegistry } from "./extension.ts";
 import type { Row } from "./storage.ts";
 import type { Cursor } from "./cursor.ts";
 import { throwIfAborted } from "./cancel.ts";
@@ -174,6 +175,10 @@ class SharedCore {
   readOnly = false;
   coordinator: FileCoordinatorHost | null;
   planEpoch = 0;
+  // The frozen host extension registry (spec/design/extensibility.md §7): the scalar functions the
+  // host supplied in the create/open options, shared (by reference) into every minted session's
+  // SessionState. null when no extensions were supplied.
+  extensions: ExtensionRegistry | null = null;
 
   constructor(snap: Snapshot, storage: Engine, coordinator: FileCoordinatorHost | null = null) {
     this.committed = snap;
@@ -536,13 +541,18 @@ export class Database {
   // shared.ts stays browser-clean by not importing it). The committed snapshot's stores already
   // carry the shared paging, so every pinned/cloned snapshot faults clean pages through the one pool
   // (spec/design/pager.md).
-  static fromEngine(engine: Engine, coordinator: FileCoordinatorHost | null = null): Database {
+  static fromEngine(
+    engine: Engine,
+    coordinator: FileCoordinatorHost | null = null,
+    extensions: ExtensionRegistry | null = null,
+  ): Database {
     // v25: the main domain (file or in-memory) reclaims within-session — the open path reads the
     // persisted free-list and no longer reconstructs it, so mid-session orphans must be returned at each
     // commit or they would leak permanently (format.md *Reclamation*).
     engine.reclaimWithinSession = true;
     const core = new SharedCore(engine.committed, engine, coordinator);
     core.readOnly = engine.readOnly;
+    core.extensions = extensions; // frozen at open/create, shared into every session (§7)
     coordinator?.startProbe(() => core.coordinationTick());
     return Database.over(core);
   }
@@ -676,6 +686,7 @@ export class Database {
     // The attached roots are pinned together with the committed root (attached-databases.md §5), so the
     // session sees a consistent cross-database snapshot; it routes attachment persists via the core.
     engine.core = this.core;
+    engine.session.extensions = this.core.extensions; // the frozen host registry (extensibility.md §7)
     engine.attachedCommitted = this.core.attached;
     return new Session(this.core, engine, "ro", snap.txid, snap.txid);
   }
@@ -697,6 +708,7 @@ export class Database {
       // committed = the immutable base; beginTx clones it to working.
       const engine = databaseFromSnapshot(base, this.core);
       engine.core = this.core;
+      engine.session.extensions = this.core.extensions; // the frozen host registry (extensibility.md §7)
       engine.attachedCommitted = this.core.attached; // pin the attached roots together (§5)
       engine.beginTx(true);
       return new Session(this.core, engine, "rw", base.txid, null, true);
@@ -720,6 +732,7 @@ export class Database {
     const engine = databaseFromSnapshot(snap, this.core);
     engine.session = new SessionState(opts);
     engine.core = this.core;
+    engine.session.extensions = this.core.extensions; // the frozen host registry (extensibility.md §7)
     engine.attachedCommitted = this.core.attached; // pin the attached roots together (§5)
     // A read-only file-backed core mints read-only sessions (a write is 25006); it pins the committed
     // version in the watermark like a read session. A writable core mints the autocommit lazy-gate one.
@@ -979,9 +992,12 @@ export class Database {
 // from-scratch image, read/written through the same pager + Packed path as a file (loadEngine is the
 // paged open over a memory store). txid 0 is the pre-first-commit version (the same committed version
 // an in-memory core always started at); the first commit publishes txid 1 into the alternate meta slot.
-export function buildInMemory(pageSize: number): Database {
+export function buildInMemory(
+  pageSize: number,
+  extensions: ExtensionRegistry | null = null,
+): Database {
   const image = toImageBytes(new Snapshot(0n), pageSize, 0n);
-  return Database.fromEngine(loadEngine(image));
+  return Database.fromEngine(loadEngine(image), null, extensions);
 }
 
 // Access is the access mode a Session was minted with (spec/design/session.md §2.4/§5.1). Distinct
