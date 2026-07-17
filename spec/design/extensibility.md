@@ -37,7 +37,9 @@
 > **resolved-dependency persistence** (§8, a soundness fix) and the **opclass registry** (§8.2);
 > the blunt `XX002`-brick reopen failure is replaced by the **graded per-object verdict** already
 > designed in [compatibility.md](compatibility.md) (§11); and cost is stated as **cooperative
-> accounting, not a sandbox** (§9).
+> accounting, not a sandbox** (§9). §5 now separates the dispatch **seam** (add an arm — the host
+> prerequisite) from the **dogfood** (remove built-in arms — optional, benchmark-gated) and sequences
+> the **function seam before the type seam** (§5.1/§14).
 
 > **Governing principle — the host-extension boundary ([CLAUDE.md](../../CLAUDE.md) §13).** Read
 > this whole doc through one lens: jed's fundamental guarantees (cross-core byte-identity, self-describing
@@ -394,6 +396,34 @@ load-bearing only for **fixed-width** comparators. For **variable-width** types 
 register. Because the dispatch decision is made at type granularity, keeping built-in integers
 inlined costs nothing and forces nothing — so Fork A (§13) is a *measurement*, not a doctrine.
 
+### 5.1 The seam is not the dogfood — start with the function seam
+
+Two moves hide inside "make dispatch a registry," and separating them is what makes host
+extensibility incremental instead of a big-bang reshape:
+
+- **The seam** — *add* a registry dispatch path (`TypeExpr::Nominal(id)`, or a host function id → a
+  registered fn-pointer) **alongside** the built-in arms. This is the actual prerequisite for host
+  types/functions: host-registered code cannot be reached through a compiled `match` on a closed
+  enum.
+- **The dogfood** — *remove* the built-in arms and route jed's own types/functions through that same
+  registry. This is **optional**, **benchmark-gated**, and **not on the host-extension path** at all.
+
+They feel like one decision; they are not. The seam ships with every built-in arm still inlined;
+"remove the match arms" is the dogfood (Fork A, §13). Two consequences for *where to start*:
+
+1. **The function seam precedes the type seam.** Function *resolution* is already data-driven (the
+   built half above); the remaining work is the id → kernel injection seam (today a compiled
+   `ScalarFunc` enum → `match`; a host kernel needs a registered fn-pointer reachable by id). That
+   seam delivers **host functions over existing types** (§4.2) — a whole extension category that
+   needs **no** type registry and touches **none** of the per-value type-method hot loops. So it is
+   the cheapest first move (§14 step 3), ahead of the type-method catalog (§14 step 5, the
+   prerequisite for host *types*).
+2. **The corpus gates the seam; benchmarks gate the dogfood.** A registry refactor is
+   behaviour-preserving — rows/cost stay byte-identical, so the corpus passes unchanged (exactly how
+   the resolution restructure was verified). But the hot-loop regression the dogfood risks is
+   **wall-clock**, invisible to the corpus — a `rake bench:diff` fact. So the seam is *corpus*-gated
+   (safe, behaviour-preserving) and the dogfood is a separate *benchmark* measurement.
+
 ---
 
 ## 6. On-disk + catalog representation
@@ -655,9 +685,14 @@ provides the cases and (for multi-core) runs them everywhere, and may relax what
 **Fork A — how far the type-vtable dogfood goes.** The **function** side is no longer a fork —
 registry-izing resolution + named-function evaluation is the recommendation outright (§5). The only
 thing open is the **built-in type method-set**:
-- **(recommended) Inline the fixed-width comparators, registry the rest.** `int*`/`uuid`/`timestamp`
-  compare/codec stay monomorphized; host types — and, if benchmarks bless it, the variable-width
-  built-ins — dispatch through the registry. Keeps the SQLite-footprint hot path.
+- **(recommended) Registry the variable-width built-ins + host types; inline the fixed-width
+  built-ins.** Route `text`/`decimal`/`interval`/`bytea` through the registry **as the anti-rot
+  move**: their `compare` already does real work (codepoint walk, limb compare), so the indirect
+  call is *noise*, and now the extension path is the same path jed's own hottest non-integer types
+  run on — exercised by the whole existing corpus, so it cannot bitrot. `int*`/`bool`/`uuid`/
+  `timestamp`/`date` stay monomorphized (one-instruction comparators, where inlining is the whole
+  game). This buys the full dogfood's "shared path can't rot" benefit **without** the fixed-width
+  regression, and keeps the SQLite-footprint hot path.
 - **Full type-vtable dogfood** (fixed-width included) is **benchmark-gated, not principled**: land the
   inlined version, measure the fixed-width regression under the registry, dogfood the rest only if in
   the noise.
@@ -683,7 +718,10 @@ methods outright.
 ## 14. Delivery order
 
 Front-load the wins that need **no** new machinery; defer the registry/opclass reshape (which the §5
-code audit shows touches every dispatch site in every core). A suggested sequence:
+code audit shows touches every dispatch site in every core). In dispatch terms (§5.1): the **function
+seam** (step 3) precedes the **type-method catalog** (step 5), and each is an *added* registry arm,
+never a removal of built-in arms — the full type-vtable dogfood (Fork A) is a later, benchmark-gated
+cleanup, not a prerequisite. A suggested sequence:
 
 1. **Rewrite this doc against current reality** ✅ (this revision) — ratify `TypeExpr`, component
    identity, and the capability vocabulary.
@@ -745,7 +783,7 @@ When a section here is ratified, update **in the same change** (mirrors [determi
 | §4.1 | Composite types (derived codec, G2 free, self-describing) | **landed as a type**; composite-**as-key** proposed (recommended early) |
 | §4.2 | Host scalar functions (registry, signature overloads, vectorized, cost, volatility) | **proposed** (built-in dispatch built, §5) |
 | §4.3 | Host scalar types (Storable→Indexed ladder, `type_code 21`, opaque) | **proposed** |
-| §5 | Dispatch — registry the many, inline the few | **built** for built-in scalar functions + aggregates (all 3 cores, behaviour-preserving). Host injection seam + type-vtable depth **proposed** (Fork A, §13) |
+| §5 | Dispatch — registry the many, inline the few (§5.1 splits the **seam** from the **dogfood**; function seam first) | **built** for built-in scalar functions + aggregates (all 3 cores, behaviour-preserving). Host injection seam + type-vtable depth **proposed** (Fork A, §13) |
 | §6 | Persisted host-type catalog + on-disk representation (`type_code 21`, `format_version 30`) | **proposed** |
 | §7 | Registration (ephemeral registry) vs. schema (DDL) + 5-field component identity | **proposed** |
 | §8 | The index connection — expression indexes (resolved-dependency persistence) + opclass registry | **proposed** (§8.1 is the recommended first index connection) |
