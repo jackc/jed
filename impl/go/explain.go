@@ -1409,6 +1409,10 @@ func renderRExpr(e *rExpr) string {
 		return explainExprCall("least", e.sargs)
 	case reScalarFunc:
 		return explainExprCall(explainScalarFunc(e.sfunc), e.sargs)
+	case reHostFunc:
+		// The host function name is carried on the node (cText) so EXPLAIN renders it without the
+		// registry (extensibility.md §5.1).
+		return explainExprCall(e.cText, e.sargs)
 	case reArrayFunc:
 		return explainExprCall(explainArrayFunc(e.afunc), e.sargs)
 	case reRangeFunc:

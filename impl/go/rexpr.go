@@ -429,6 +429,13 @@ const (
 	// reScalarFunc is a scalar-function call (abs/round, spec/design/functions.md §9),
 	// evaluated per row in any context.
 	reScalarFunc
+	// reHostFunc is a HOST-defined scalar-function call (spec/design/extensibility.md §4.2 / §5.1) —
+	// the injection seam that reaches a host-registered kernel, which the compiled scalarFunc switch
+	// cannot. Reuses `index` for the frozen-registry id, `cText` for the (lowercased) name (so
+	// EXPLAIN renders it without the registry), `sargs` for the argument nodes, and `result` for the
+	// declared scalar result type. STRICT (a NULL arg → NULL, short-circuited in eval like
+	// reScalarFunc). Kept a distinct kind so the built-in path stays monomorphized (§5).
+	reHostFunc
 	// reArrayFunc is a polymorphic array-function call (spec/design/array-functions.md §3),
 	// evaluated per row. Distinct from reScalarFunc: it resolves over anyarray/anyelement (§2) and
 	// its builders return an array; NULL handling is per-kernel (the introspectors propagate, the

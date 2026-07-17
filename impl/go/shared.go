@@ -123,6 +123,10 @@ type sharedCore struct {
 	attachmentCount atomic.Int64
 	coordinator     *fileCoordinator
 	planEpoch       atomic.Uint64
+	// extensions is the frozen host extension registry (spec/design/extensibility.md §7): the scalar
+	// functions the host supplied in the create/open options, shared (by pointer) into every minted
+	// session's sessionState. nil when no extensions were supplied.
+	extensions *ExtensionRegistry
 }
 
 func (c *sharedCore) acquireWriter(timeoutMs uint64) error {
@@ -977,6 +981,11 @@ type CreateOptions struct {
 	Locking   Locking
 	// nil is the 5s default; &0 requests one immediate acquisition attempt.
 	FileLockTimeoutMs *uint64
+	// Extensions are host extensions to register on this database (spec/design/extensibility.md §7):
+	// scalar functions the host supplies, FROZEN for the handle's lifetime and shared into every
+	// session. nil ⇒ no extensions. Not stored in the file — a host reopens with its own registry
+	// (the ephemeral, no-persisted-use rule of §14 step 3).
+	Extensions *ExtensionRegistry
 }
 
 // CreateDatabase makes a fresh database — in-memory (opts.Path == "") or file-backed (opts.Path set)
@@ -990,7 +999,9 @@ func CreateDatabase(opts CreateOptions) (*Database, error) {
 		pageSize = DefaultPageSize
 	}
 	if opts.Path == "" {
-		return newInMemoryWithPageSize(pageSize), nil
+		db := newInMemoryWithPageSize(pageSize)
+		db.core.extensions = opts.Extensions // frozen at create, shared into every session (§7)
+		return db, nil
 	}
 	coordinator, path, err := prepareCreateCoordinator(opts.Path, opts.Locking, opts.FileLockTimeoutMs)
 	if err != nil {
@@ -1003,7 +1014,9 @@ func CreateDatabase(opts CreateOptions) (*Database, error) {
 		}
 		return nil, err
 	}
-	return databaseOver(sharedCoreFromEngineCoordinated(e, coordinator)), nil
+	c := sharedCoreFromEngineCoordinated(e, coordinator)
+	c.extensions = opts.Extensions // frozen at create, shared into every session (§7)
+	return databaseOver(c), nil
 }
 
 // newInMemoryWithPageSize builds a fresh, empty in-memory database that serializes/splits at
@@ -1059,7 +1072,9 @@ func OpenDatabaseWithOptions(path string, opts OpenOptions) (*Database, error) {
 		}
 		return nil, err
 	}
-	return databaseOver(sharedCoreFromEngineCoordinated(e, coordinator)), nil
+	c := sharedCoreFromEngineCoordinated(e, coordinator)
+	c.extensions = opts.Extensions // frozen at open, shared into every session (§7)
+	return databaseOver(c), nil
 }
 
 // databaseOver wraps a shared core as the host handle.
@@ -1318,6 +1333,7 @@ func (s *Database) ReadSession() *Session {
 	// immutable pinned snapshot directly — no clone. The attached roots are pinned together (§5).
 	engine := &engine{committed: snap, pageSize: s.core.pageSize(), path: s.core.storage.path, spillDir: s.core.storage.spillDir, session: newSession()}
 	engine.core = s.core
+	engine.session.extensions = s.core.extensions // the frozen host registry (extensibility.md §7)
 	engine.attachedCommitted = rt.attached
 	engine.readOnly = true // the executor rejects writes (25006) / poisons a read-only block
 	refresh := s.core.hasSharedCoordinator()
@@ -1346,6 +1362,7 @@ func (s *Database) WriteSession() *Session {
 	// committed is the immutable base (the writer mutates only working, which beginTx clones off it).
 	engine := &engine{committed: base, pageSize: s.core.pageSize(), path: s.core.storage.path, spillDir: s.core.storage.spillDir, session: newSession()}
 	engine.core = s.core
+	engine.session.extensions = s.core.extensions // the frozen host registry (extensibility.md §7)
 	engine.attachedCommitted = rt.attached
 	_, _ = engine.beginTx(true, true)
 	return &Session{core: s.core, engine: engine, access: accessReadWrite, gateHeld: true, baseVersion: base.txid, planEpoch: s.core.planEpoch.Load()}
@@ -1365,6 +1382,7 @@ func (s *Database) Session(opts SessionOptions) *Session {
 		rt, v := s.core.pinLatest()
 		engine := &engine{committed: rt.committed, pageSize: s.core.pageSize(), path: s.core.storage.path, spillDir: s.core.storage.spillDir, session: newSessionWithOptions(opts)}
 		engine.core = s.core
+		engine.session.extensions = s.core.extensions // the frozen host registry (extensibility.md §7)
 		engine.attachedCommitted = rt.attached
 		engine.readOnly = true // the executor enforces read-only too (rejects BEGIN READ WRITE, poisons a read-only block)
 		refresh := s.core.hasSharedCoordinator()
@@ -1374,6 +1392,7 @@ func (s *Database) Session(opts SessionOptions) *Session {
 	snap := rt.committed
 	engine := &engine{committed: snap, pageSize: s.core.pageSize(), path: s.core.storage.path, spillDir: s.core.storage.spillDir, session: newSessionWithOptions(opts)}
 	engine.core = s.core
+	engine.session.extensions = s.core.extensions // the frozen host registry (extensibility.md §7)
 	engine.attachedCommitted = rt.attached
 	return &Session{core: s.core, engine: engine, access: accessReadWrite, baseVersion: snap.txid, planEpoch: s.core.planEpoch.Load()}
 }

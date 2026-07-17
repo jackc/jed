@@ -2429,6 +2429,42 @@ func (e *rExpr) eval(row storedRow, env *evalEnv, m *costMeter) (Value, error) {
 			return NullValue(), nil
 		}
 		return best, nil
+	case reHostFunc:
+		// A host-defined scalar function (spec/design/extensibility.md §4.2 / §5.1): the injection
+		// seam. The kernel is reached BY ID through the frozen registry — the path the compiled
+		// scalarFunc switch cannot offer a host.
+		hf := env.exec.session.extensions.function(e.index)
+		// The declared static cost (cost.md §6 design (a)), charged once per call; arguments charge
+		// their own. Guard immediately after (the size-scaled-charge discipline) so a large declared
+		// weight aborts BEFORE the kernel runs.
+		m.Charge(hf.cost)
+		if err := m.Guard(); err != nil {
+			return Value{}, err
+		}
+		// STRICT: a NULL argument short-circuits to NULL before the kernel runs (§4.2), so the kernel
+		// never sees a NULL — exactly like the built-in scalar-function arm.
+		hvals := make([]Value, 0, len(e.sargs))
+		for _, a := range e.sargs {
+			v, err := a.eval(row, env, m)
+			if err != nil {
+				return Value{}, err
+			}
+			if v.Kind == ValNull {
+				return NullValue(), nil // NULL propagates
+			}
+			hvals = append(hvals, v)
+		}
+		out, err := hf.kernel(hvals)
+		if err != nil {
+			return Value{}, err
+		}
+		// Defend jed's own strict type system against a misbehaving host kernel (CLAUDE.md §13 — the
+		// host owns its consequences, but a wrong-typed value must never reach jed's codecs /
+		// comparators): the returned value must be NULL or match the declared scalar result type.
+		if !valueMatchesResult(out, e.result) {
+			return Value{}, newError(DataException, "host function returned a value not matching its declared result type "+e.result.CanonicalName())
+		}
+		return out, nil
 	case reScalarFunc:
 		// One operator_eval per call (the uniform weight); arguments charge their own.
 		m.Charge(costs.OperatorEval)

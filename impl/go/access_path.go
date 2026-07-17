@@ -1247,6 +1247,11 @@ func rexprIsConstant(e *rExpr) bool {
 		// conservatively not a "constant", so no plan-time consumer ever evaluates it without a
 		// live statement environment (date.md §6).
 		return false
+	case reHostFunc:
+		// A host function is conservatively NEVER constant (extensibility.md §4.2): it may be
+		// volatile, and this slice folds none, so it must not be treated as a literal for estimator
+		// selectivity nor as a one-time constant operand for a GiST/GIN index match.
+		return false
 	}
 	if e.operand != nil && !rexprIsConstant(e.operand) {
 		return false

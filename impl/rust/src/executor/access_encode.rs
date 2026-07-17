@@ -2706,6 +2706,10 @@ pub(crate) fn rexpr_is_constant(e: &RExpr) -> bool {
         // zone) — conservatively not a "constant", so no plan-time consumer ever evaluates it
         // without a live statement environment (date.md §6).
         RExpr::DateClock { .. } => false,
+        // A host function is conservatively NEVER constant (extensibility.md §4.2): it may be
+        // volatile, and this slice folds none, so it must not be treated as a literal for
+        // estimator selectivity nor as a one-time constant operand for a GiST/GIN index match.
+        RExpr::HostFunc { .. } => false,
         RExpr::ConstInt(_)
         | RExpr::ConstBool(_)
         | RExpr::ConstText(_)
@@ -2774,7 +2778,6 @@ pub(crate) fn rexpr_is_constant(e: &RExpr) -> bool {
         RExpr::Coalesce { args, .. }
         | RExpr::GreatestLeast { args, .. }
         | RExpr::ScalarFunc { args, .. }
-        | RExpr::HostFunc { args, .. }
         | RExpr::ArrayFunc { args, .. }
         | RExpr::RangeFunc { args, .. }
         | RExpr::RegexFunc { args, .. }

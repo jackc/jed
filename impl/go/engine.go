@@ -287,6 +287,11 @@ type sessionState struct {
 	// and cleared when it finishes (success or error); nil for every other statement, where reads fall
 	// through to working/committed as usual (readSnap).
 	readPin *snapshot
+	// extensions is the frozen host extension registry (spec/design/extensibility.md §7): the scalar
+	// functions the host registered at open/create. Set from sharedCore.extensions at session mint;
+	// snapshotEngine's sessionState struct-copy shares the same pointer (so a streaming cursor sees
+	// the same functions). nil when no extensions were supplied — the built-in-only path.
+	extensions *ExtensionRegistry
 }
 
 // requireCustomVarName validates + canonicalizes a session-variable name (spec/design/session.md

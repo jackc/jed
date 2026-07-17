@@ -104,6 +104,10 @@ type OpenOptions struct {
 	Locking   Locking
 	// nil is the 5s default; a non-nil pointer (including &0) is an explicit deadline.
 	FileLockTimeoutMs *uint64
+	// Extensions are host extensions to register on this handle (spec/design/extensibility.md §7):
+	// scalar functions the host supplies, FROZEN for the handle's lifetime. A handle setting like the
+	// rest — not stored in the file, so a reopening host brings its own (§14 step 3). nil ⇒ none.
+	Extensions *ExtensionRegistry
 }
 
 // Open opens an existing file-backed database at path with default open settings — the buffer-pool

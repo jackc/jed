@@ -2590,7 +2590,10 @@ func resolveFuncCall(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramTypes)
 		}
 		return resolveBinary(s, &binaryExpr{Op: opMod, Lhs: *fc.Args[0], Rhs: *fc.Args[1]}, ag, params)
 	}
-	if isScalarFuncName(name) {
+	// A built-in scalar function OR a host-registered one (extensibility.md §4.2 — a host-only name
+	// routes here too; resolveScalarFunc tries the built-in catalog first, then the host registry).
+	// Host functions are positional-only, so rejectNamed applies to them as well.
+	if isScalarFuncName(name) || s.catalog.session.extensions.hasFunction(name) {
 		if err := rejectNamed(name, fc.ArgNames); err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -2872,14 +2875,46 @@ func resolveScalarFunc(s *scope, fc *funcCallExpr, ag *aggCtx, params *paramType
 	// range-checks for integers, its width for floats); round's numeric overloads return decimal,
 	// its float overloads f64; the remaining float functions return f64; the uuid
 	// extractors/generators return their catalog scalar id.
-	desc := lookupScalarOverload(name, tys)
-	if desc == nil {
-		return nil, resolvedType{}, noFuncOverload(name)
+	// A built-in overload wins over any host overload of the same signature (extensibility.md §4.2),
+	// so the built-in catalog is consulted first; a host function is reached only when no built-in
+	// matches (a host-only name, or a host overload over a signature the built-in name does not
+	// accept).
+	if desc := lookupScalarOverload(name, tys); desc != nil {
+		fn := scalarFuncID(name, tys)
+		result := scalarResultType(desc.Result, tys)
+		return &rExpr{kind: reScalarFunc, sfunc: fn, sargs: rargs, result: result}, resolvedTypeOf(result), nil
 	}
-	fn := scalarFuncID(name, tys)
-	result := scalarResultType(desc.Result, tys)
-	rt := resolvedTypeOf(result)
-	return &rExpr{kind: reScalarFunc, sfunc: fn, sargs: rargs, result: result}, rt, nil
+	// Host-registered scalar function (extensibility.md §4.2): exact scalar signature, no implicit
+	// promotion. index holds the frozen-registry id; cText carries the name for EXPLAIN.
+	if id, result, ok := resolveHostScalar(s, name, tys); ok {
+		return &rExpr{kind: reHostFunc, index: id, cText: name, sargs: rargs, result: result}, resolvedTypeOf(result), nil
+	}
+	return nil, resolvedType{}, noFuncOverload(name)
+}
+
+// resolveHostScalar resolves (name, arg types) against the session's frozen host-function registry
+// (spec/design/extensibility.md §4.2): every argument must be a scalar type (a container/NULL
+// argument matches no host signature this slice), and the whole signature must match a registered
+// function exactly. Returns the host-function id (a stable registry index) + its declared scalar
+// result type, or ok=false (the caller falls through to 42883).
+func resolveHostScalar(s *scope, name string, tys []resolvedType) (int, scalarType, bool) {
+	reg := s.catalog.session.extensions
+	if reg == nil {
+		return 0, 0, false
+	}
+	argScalars := make([]scalarType, len(tys))
+	for i, t := range tys {
+		st, ok := resolvedToScalar(t)
+		if !ok {
+			return 0, 0, false
+		}
+		argScalars[i] = st
+	}
+	id, ok := reg.resolveHost(name, argScalars)
+	if !ok {
+		return 0, 0, false
+	}
+	return id, reg.function(id).result, true
 }
 
 // variadicNotArray is the 42804 raised when a VARIADIC operand is not an array (array-functions.md
