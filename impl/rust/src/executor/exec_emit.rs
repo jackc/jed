@@ -1484,8 +1484,9 @@ impl Engine {
     /// the referenced table's name. Unmetered, like the PK/UNIQUE probes (cost.md §3).
     pub(crate) fn fk_probe_hits(&self, probe: &FkProbe, parent_table: &str) -> Result<bool> {
         match probe {
-            FkProbe::Pk(key) => Ok(self.store(parent_table).get(key)?.is_some()),
+            FkProbe::Pk(key) => Ok(self.read_snap().store(parent_table).get(key)?.is_some()),
             FkProbe::Unique { index, prefix } => Ok(!self
+                .read_snap()
                 .index_store(index)
                 .range_entries(&unique_probe_bound(prefix))?
                 .is_empty()),
@@ -1510,7 +1511,7 @@ impl Engine {
         // `target` is in the parent's stored-key byte space, so the child probe encodes a collated
         // parent key column with the PARENT's collation (§2.12).
         let parent_colls = self.column_collations(&parent.columns);
-        for (k, row) in self.store(child_table).iter_entries()? {
+        for (k, row) in self.read_snap().store(child_table).iter_entries()? {
             if exclude.contains(&k) {
                 continue;
             }

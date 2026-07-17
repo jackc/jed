@@ -140,3 +140,48 @@ fn parent_update_end_state_swap_allowed() {
         "23503"
     );
 }
+
+/// Generated actions for a persistent FK stay in `main` when this session has a same-named temp
+/// table created before another session created the persistent child (temp-tables.md §3).
+#[test]
+fn action_preserves_main_scope_across_temp_overlap() {
+    let db = Database::create(CreateOptions::default()).unwrap();
+    let mut shadowed = db.session(SessionOptions::default());
+    shadowed
+        .query_outcome(
+            "CREATE TEMP TABLE c (temp_id i32 PRIMARY KEY, scratch text)",
+            &[],
+        )
+        .unwrap();
+    shadowed
+        .query_outcome("INSERT INTO c VALUES (99, 'keep')", &[])
+        .unwrap();
+
+    let mut persistent = db.session(SessionOptions::default());
+    for sql in [
+        "CREATE TABLE p (id i32 PRIMARY KEY)",
+        "CREATE TABLE c (id i32 PRIMARY KEY, pid i32 REFERENCES p ON DELETE CASCADE)",
+        "INSERT INTO p VALUES (1)",
+        "INSERT INTO c VALUES (10, 1)",
+    ] {
+        persistent.query_outcome(sql, &[]).unwrap();
+    }
+
+    shadowed
+        .query_outcome("DELETE FROM main.p WHERE id = 1", &[])
+        .unwrap();
+    assert!(
+        persistent
+            .query("SELECT id FROM c", &[])
+            .unwrap()
+            .collect::<Vec<_>>()
+            .is_empty()
+    );
+    assert_eq!(
+        shadowed
+            .query("SELECT temp_id, scratch FROM c", &[])
+            .unwrap()
+            .collect::<Vec<_>>(),
+        vec![vec![Value::Int(99), Value::Text("keep".to_string())]]
+    );
+}

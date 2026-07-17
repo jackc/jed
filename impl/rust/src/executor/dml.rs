@@ -58,6 +58,16 @@ pub(crate) struct InsertValuesPlan {
 
 const MAX_FK_ACTION_DEPTH: usize = 256;
 
+/// One inbound NO ACTION/RESTRICT probe saved until every generated write in the recursive closure
+/// has finished. `update` means the old parent key must first be re-probed in the final state.
+pub(super) struct FkDeferredCheck {
+    parent: Table,
+    child_table: String,
+    fk: ForeignKeyConstraint,
+    probe: FkProbe,
+    update: bool,
+}
+
 /// Combine a non-empty expression list as a balanced binary tree. Referential-action predicates
 /// are synthesized from an arbitrary parent batch; balancing keeps resolver/evaluator stack depth
 /// logarithmic rather than proportional to the number of changed rows (constraints.md §6.6).
@@ -85,11 +95,34 @@ fn balanced_fk_expr(mut exprs: Vec<Expr>, op: BinaryOp) -> Expr {
 /// One FK-tuple equality in the PARENT key's collation. The ordinary SQL comparison path is reused
 /// by generated UPDATE/DELETE, but an explicitly collated parent text key must not accidentally use
 /// a differently-collated child column while finding action targets.
+fn fk_action_value_expr(ty: &Type, value: &Value, params: &mut Vec<Value>) -> Result<Expr> {
+    match ty {
+        Type::Scalar(_) => {
+            let id = u32::try_from(params.len() + 1).map_err(|_| {
+                EngineError::new(
+                    SqlState::StatementTooComplex,
+                    "referential action generated too many bound values",
+                )
+            })?;
+            params.push(value.clone());
+            Ok(Expr::Param(id))
+        }
+        Type::Array(_) | Type::Range(_) => Ok(Expr::Cast {
+            inner: Box::new(Expr::Literal(Literal::Text(value.render()))),
+            type_name: ty.canonical_name(),
+            type_mod: None,
+        }),
+        Type::Composite(_) => {
+            unreachable!("foreign-key action key is a keyable scalar, array, or range")
+        }
+    }
+}
+
 fn fk_action_match_expr(
     parent: &Table,
     child: &Table,
     fk: &ForeignKeyConstraint,
-    params: &[u32],
+    values: &[Expr],
 ) -> Expr {
     let mut parts = Vec::with_capacity(fk.columns.len());
     for (slot, (&local, &referenced)) in fk.columns.iter().zip(&fk.ref_columns).enumerate() {
@@ -109,40 +142,37 @@ fn fk_action_match_expr(
         parts.push(Expr::Binary {
             op: BinaryOp::Eq,
             lhs: Box::new(lhs),
-            rhs: Box::new(Expr::Param(params[slot])),
+            rhs: Box::new(values[slot].clone()),
         });
     }
     balanced_fk_expr(parts, BinaryOp::And)
 }
 
 /// Build the disjunction selecting every child row whose FK tuple equals one of `old_tuples`.
-/// Returns the bound values and their 1-based parameter ids so ON UPDATE CASCADE can reuse each
-/// condition in its per-column CASE expression without duplicating values.
+/// Returns the scalar bound values and each tuple's typed operands so ON UPDATE CASCADE can reuse
+/// each condition in its per-column CASE expression without duplicating values.
 fn fk_action_predicate(
     parent: &Table,
     child: &Table,
     fk: &ForeignKeyConstraint,
     old_tuples: &[Vec<Value>],
-) -> Result<(Expr, Vec<Value>, Vec<Vec<u32>>)> {
+) -> Result<(Expr, Vec<Value>, Vec<Vec<Expr>>)> {
     let mut values = Vec::new();
-    let mut ids = Vec::with_capacity(old_tuples.len());
+    let mut operands = Vec::with_capacity(old_tuples.len());
     let mut matches = Vec::with_capacity(old_tuples.len());
     for tuple in old_tuples {
-        let mut tuple_ids = Vec::with_capacity(tuple.len());
-        for value in tuple {
-            let id = u32::try_from(values.len() + 1).map_err(|_| {
-                EngineError::new(
-                    SqlState::StatementTooComplex,
-                    "referential action generated too many bound values",
-                )
-            })?;
-            values.push(value.clone());
-            tuple_ids.push(id);
+        let mut tuple_values = Vec::with_capacity(tuple.len());
+        for (slot, value) in tuple.iter().enumerate() {
+            tuple_values.push(fk_action_value_expr(
+                &parent.columns[fk.ref_columns[slot]].ty,
+                value,
+                &mut values,
+            )?);
         }
-        matches.push(fk_action_match_expr(parent, child, fk, &tuple_ids));
-        ids.push(tuple_ids);
+        matches.push(fk_action_match_expr(parent, child, fk, &tuple_values));
+        operands.push(tuple_values);
     }
-    Ok((balanced_fk_expr(matches, BinaryOp::Or), values, ids))
+    Ok((balanced_fk_expr(matches, BinaryOp::Or), values, operands))
 }
 
 impl Engine {
@@ -1734,6 +1764,7 @@ impl Engine {
     pub(crate) fn insert_rows_on_conflict(
         &mut self,
         table: &str,
+        db_scope: Option<&str>,
         columns: &[Column],
         pk: &[(usize, Type)],
         checks: &[(String, RExpr)],
@@ -2130,7 +2161,12 @@ impl Engine {
                 }
             }
         }
-        self.apply_fk_update_actions(&fk_parent, &fk_updates, meter)?;
+        self.apply_fk_update_actions(
+            &fk_parent,
+            &fk_updates,
+            meter,
+            self.main_dml_target(db_scope, table),
+        )?;
         Ok((affected, returned))
     }
 
@@ -2281,10 +2317,11 @@ impl Engine {
     ) -> Result<(i64, Option<Vec<Vec<Value>>>)> {
         match conflict {
             // ON CONFLICT is reached only for a reserved scope (an attachment target is 0A000 in
-            // `execute_insert`), where the bare temp-first funnels resolve the store correctly, so the
-            // conflict path takes no `db_scope`.
+            // `execute_insert`). Keep `db_scope` so generated parent-side FK actions retain main
+            // versus temp.
             Some(plan) => self.insert_rows_on_conflict(
                 table,
+                db_scope,
                 columns,
                 pk,
                 checks,
@@ -2472,7 +2509,7 @@ impl Engine {
             FkAction::Cascade => self.run_fk_action_delete(
                 Delete {
                     table: child.name.clone(),
-                    db: None,
+                    db: Some("main".to_string()),
                     filter: Some(filter),
                     returning: None,
                 },
@@ -2492,7 +2529,7 @@ impl Engine {
                 self.run_fk_action_update(
                     Update {
                         table: child.name.clone(),
-                        db: None,
+                        db: Some("main".to_string()),
                         assignments,
                         filter: Some(filter),
                         returning: None,
@@ -2519,40 +2556,39 @@ impl Engine {
             return Ok(());
         }
         let old_tuples: Vec<Vec<Value>> = transitions.iter().map(|x| x.0.clone()).collect();
-        let (filter, mut params, old_ids) = fk_action_predicate(parent, child, fk, &old_tuples)?;
+        let (filter, mut params, old_values) = fk_action_predicate(parent, child, fk, &old_tuples)?;
         let assignments = match fk.on_update {
             FkAction::Cascade => {
-                let mut new_ids = Vec::with_capacity(transitions.len());
+                let mut new_values = Vec::with_capacity(transitions.len());
                 for (_, new_tuple) in transitions {
-                    let mut ids = Vec::with_capacity(new_tuple.len());
-                    for value in new_tuple {
-                        let id = u32::try_from(params.len() + 1).map_err(|_| {
-                            EngineError::new(
-                                SqlState::StatementTooComplex,
-                                "referential action generated too many bound values",
-                            )
-                        })?;
-                        params.push(value.clone());
-                        ids.push(id);
+                    let mut values = Vec::with_capacity(new_tuple.len());
+                    for (slot, value) in new_tuple.iter().enumerate() {
+                        values.push(fk_action_value_expr(
+                            &parent.columns[fk.ref_columns[slot]].ty,
+                            value,
+                            &mut params,
+                        )?);
                     }
-                    new_ids.push(ids);
+                    new_values.push(values);
                 }
                 fk.columns
                     .iter()
                     .enumerate()
                     .map(|(slot, &column)| {
-                        let whens = old_ids
+                        let whens = old_values
                             .iter()
                             .enumerate()
-                            .map(|(i, ids)| {
-                                (
-                                    fk_action_match_expr(parent, child, fk, ids),
+                            .map(|(i, values)| {
+                                let result = if child.columns[column].ty.as_scalar().is_some() {
                                     Expr::Cast {
-                                        inner: Box::new(Expr::Param(new_ids[i][slot])),
+                                        inner: Box::new(new_values[i][slot].clone()),
                                         type_name: child.columns[column].ty.canonical_name(),
                                         type_mod: None,
-                                    },
-                                )
+                                    }
+                                } else {
+                                    new_values[i][slot].clone()
+                                };
+                                (fk_action_match_expr(parent, child, fk, values), result)
                             })
                             .collect();
                         crate::ast::Assignment {
@@ -2583,7 +2619,7 @@ impl Engine {
         self.run_fk_action_update(
             Update {
                 table: child.name.clone(),
-                db: None,
+                db: Some("main".to_string()),
                 assignments,
                 filter: Some(filter),
                 returning: None,
@@ -2591,6 +2627,40 @@ impl Engine {
             params,
             meter,
         )
+    }
+
+    /// Validate every deferred inbound edge after the recursive write closure reaches a fixed
+    /// point. Taking the queue avoids borrowing session state while probing the final snapshot.
+    fn flush_fk_deferred_checks(&mut self) -> Result<()> {
+        let checks = std::mem::take(&mut self.session.fk_deferred_checks);
+        for check in checks {
+            if check.update && self.fk_probe_hits(&check.probe, &check.parent.name)? {
+                continue;
+            }
+            if self.fk_child_references(
+                &check.child_table,
+                &check.fk,
+                &check.parent,
+                check.probe.bytes(),
+                &HashSet::new(),
+            )? {
+                return Err(EngineError::fk_violation_delete(
+                    &check.parent.name,
+                    &check.fk.name,
+                    &check.child_table,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a DML target resolves to the persistent main catalog. FKs involving temp/attached
+    /// tables are rejected at DDL; an explicit main qualifier survives a same-named temp overlap.
+    fn main_dml_target(&self, scope: Option<&str>, table: &str) -> bool {
+        match scope {
+            Some(scope) => scope.eq_ignore_ascii_case("main"),
+            None => !self.is_temp_table(table),
+        }
     }
 
     /// Parent DELETE action closure. Write actions run first for every inbound FK; NO ACTION /
@@ -2601,12 +2671,23 @@ impl Engine {
         parent: &Table,
         rows: &[(Vec<u8>, Row)],
         meter: &mut Meter,
+        main_target: bool,
     ) -> Result<()> {
         if rows.is_empty() {
             return Ok(());
         }
+        if !main_target {
+            return Ok(());
+        }
+        let root = self.session.fk_action_depth == 0;
+        if root {
+            assert!(
+                self.session.fk_deferred_checks.is_empty(),
+                "foreign-key deferred-check queue leaked across statements"
+            );
+        }
         let saved_pin = self.session.read_pin.take();
-        let result = (|| {
+        let mut result = (|| {
             let referencers = self.fk_referencers(&parent.name);
             let parent_colls = self.column_collations(&parent.columns);
             for (child_name, fk) in &referencers {
@@ -2614,6 +2695,7 @@ impl Engine {
                     continue;
                 }
                 let child = self
+                    .read_snap()
                     .table(child_name)
                     .expect("foreign-key child exists")
                     .clone();
@@ -2634,24 +2716,24 @@ impl Engine {
                     else {
                         continue;
                     };
-                    if self.fk_child_references(
-                        child_name,
-                        fk,
-                        parent,
-                        probe.bytes(),
-                        &HashSet::new(),
-                    )? {
-                        return Err(EngineError::fk_violation_delete(
-                            &parent.name,
-                            &fk.name,
-                            child_name,
-                        ));
-                    }
+                    self.session.fk_deferred_checks.push(FkDeferredCheck {
+                        parent: parent.clone(),
+                        child_table: child_name.clone(),
+                        fk: fk.clone(),
+                        probe,
+                        update: false,
+                    });
                 }
             }
             Ok(())
         })();
+        if result.is_ok() && root {
+            result = self.flush_fk_deferred_checks();
+        }
         self.session.read_pin = saved_pin;
+        if root {
+            self.session.fk_deferred_checks.clear();
+        }
         result
     }
 
@@ -2661,12 +2743,23 @@ impl Engine {
         parent: &Table,
         updates: &[(Vec<u8>, Vec<u8>, Row, Row)],
         meter: &mut Meter,
+        main_target: bool,
     ) -> Result<()> {
         if updates.is_empty() {
             return Ok(());
         }
+        if !main_target {
+            return Ok(());
+        }
+        let root = self.session.fk_action_depth == 0;
+        if root {
+            assert!(
+                self.session.fk_deferred_checks.is_empty(),
+                "foreign-key deferred-check queue leaked across statements"
+            );
+        }
         let saved_pin = self.session.read_pin.take();
-        let result = (|| {
+        let mut result = (|| {
             let referencers = self.fk_referencers(&parent.name);
             let parent_colls = self.column_collations(&parent.columns);
             for (child_name, fk) in &referencers {
@@ -2674,6 +2767,7 @@ impl Engine {
                     continue;
                 }
                 let child = self
+                    .read_snap()
                     .table(child_name)
                     .expect("foreign-key child exists")
                     .clone();
@@ -2712,28 +2806,27 @@ impl Engine {
                     if new_probe
                         .as_ref()
                         .is_some_and(|p| p.bytes() == old_probe.bytes())
-                        || self.fk_probe_hits(&old_probe, &parent.name)?
                     {
                         continue;
                     }
-                    if self.fk_child_references(
-                        child_name,
-                        fk,
-                        parent,
-                        old_probe.bytes(),
-                        &HashSet::new(),
-                    )? {
-                        return Err(EngineError::fk_violation_delete(
-                            &parent.name,
-                            &fk.name,
-                            child_name,
-                        ));
-                    }
+                    self.session.fk_deferred_checks.push(FkDeferredCheck {
+                        parent: parent.clone(),
+                        child_table: child_name.clone(),
+                        fk: fk.clone(),
+                        probe: old_probe,
+                        update: true,
+                    });
                 }
             }
             Ok(())
         })();
+        if result.is_ok() && root {
+            result = self.flush_fk_deferred_checks();
+        }
         self.session.read_pin = saved_pin;
+        if root {
+            self.session.fk_deferred_checks.clear();
+        }
         result
     }
 
@@ -2950,7 +3043,12 @@ impl Engine {
             }
         }
         self.mark_estimator_mutation(del.db.as_deref(), &del.table);
-        self.apply_fk_delete_actions(&fk_parent, &matched, &mut meter)?;
+        self.apply_fk_delete_actions(
+            &fk_parent,
+            &matched,
+            &mut meter,
+            self.main_dml_target(del.db.as_deref(), &del.table),
+        )?;
         Ok(match (ret, returned) {
             (Some((_, names, types)), Some(rows)) => Outcome::Query {
                 column_names: names,
@@ -3585,7 +3683,12 @@ impl Engine {
             }
         }
         self.mark_estimator_mutation(upd.db.as_deref(), &upd.table);
-        self.apply_fk_update_actions(&fk_parent, &updates, &mut meter)?;
+        self.apply_fk_update_actions(
+            &fk_parent,
+            &updates,
+            &mut meter,
+            self.main_dml_target(upd.db.as_deref(), &upd.table),
+        )?;
         Ok(match (ret, returned) {
             (Some((_, names, types)), Some(rows)) => Outcome::Query {
                 column_names: names,

@@ -974,10 +974,10 @@ func buildFkProbe(fk *foreignKey, parent *catTable, parentColls []*Collation, ro
 func (db *engine) fkProbeHits(probe fkProbe, parentTable string) (bool, error) {
 	switch probe.kind {
 	case fkProbePk:
-		_, ok, err := db.lkpStore(parentTable).Get(probe.bytes)
+		_, ok, err := db.readSnap().store(parentTable).Get(probe.bytes)
 		return ok, err
 	default: // fkProbeUnique
-		entries, err := db.lkpIndexStore(probe.index).RangeEntries(uniqueProbeBound(probe.bytes))
+		entries, err := db.readSnap().indexStore(probe.index).RangeEntries(uniqueProbeBound(probe.bytes))
 		if err != nil {
 			return false, err
 		}
@@ -993,7 +993,7 @@ func (db *engine) fkProbeHits(probe fkProbe, parentTable string) (bool, error) {
 // whose child IS the table being mutated (so its deleted/updated rows must not count). parent is
 // the referenced table's catalog. Unmetered validation.
 func (db *engine) fkChildReferences(childTable string, fk *foreignKey, parent *catTable, target []byte, exclude map[string]struct{}) (bool, error) {
-	entries, err := db.lkpStore(childTable).EntriesInKeyOrder()
+	entries, err := db.readSnap().store(childTable).EntriesInKeyOrder()
 	if err != nil {
 		return false, err
 	}

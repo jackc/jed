@@ -9,6 +9,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { type Handle, dbWith, errCode, query } from "./util.ts";
+import { memDb } from "./mem_db.ts";
 
 function fkNames(db: Handle, table: string): string[] {
   return db.table(table)!.fks.map((f) => f.name);
@@ -77,4 +78,25 @@ test("FK parent UPDATE end-state swap allowed", () => {
     errCode(() => db.execute("UPDATE p SET code = 999 WHERE id = 1")),
     "23503",
   );
+});
+
+// Generated actions for a persistent FK stay in main when this session has a same-named temp table
+// created before another session created the persistent child (temp-tables.md §3).
+test("FK action preserves main scope across temp overlap", () => {
+  const db = memDb();
+  const shadowed = db.session({});
+  shadowed.execute("CREATE TEMP TABLE c (temp_id i32 PRIMARY KEY, scratch text)");
+  shadowed.execute("INSERT INTO c VALUES (99, 'keep')");
+
+  const persistent = db.session({});
+  persistent.execute("CREATE TABLE p (id i32 PRIMARY KEY)");
+  persistent.execute("CREATE TABLE c (id i32 PRIMARY KEY, pid i32 REFERENCES p ON DELETE CASCADE)");
+  persistent.execute("INSERT INTO p VALUES (1)");
+  persistent.execute("INSERT INTO c VALUES (10, 1)");
+
+  shadowed.execute("DELETE FROM main.p WHERE id = 1");
+  assert.deepEqual(query(persistent, "SELECT id FROM c"), []);
+  assert.deepEqual(query(shadowed, "SELECT temp_id, scratch FROM c"), [["99", "keep"]]);
+  persistent.close();
+  shadowed.close();
 });

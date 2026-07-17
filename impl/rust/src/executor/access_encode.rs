@@ -3428,6 +3428,7 @@ pub(crate) fn encode_array_key(elem_ty: &Type, a: &ArrayVal) -> Result<Vec<u8>> 
 
 /// A built foreign-key probe (spec/design/constraints.md §6.4/§6.8): the bytes to look up in the
 /// parent, tagged with which physical tree to probe.
+#[derive(Clone)]
 pub(crate) enum FkProbe {
     /// The parent's PK storage key (bare member encodings concatenated, in PK key order).
     Pk(Vec<u8>),

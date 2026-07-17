@@ -2016,9 +2016,8 @@ func (db *engine) foldConflictPlan(plan *conflictPlan, bound []Value, accrued *i
 func (db *engine) runInsertRows(table *catTable, store *tableStore, dbScope *string, pk []int, checks []namedCheck, defaultExprs []*rExpr, rng *stmtRng, provided []int, rows [][]Value, conflict *conflictPlan, returning []*rExpr, params []Value, ctes cteCtx, meter *costMeter) (int64, [][]Value, error) {
 	if conflict != nil {
 		// ON CONFLICT is reached only for a reserved scope (an attachment target is 0A000 in
-		// executeInsert), where the bare temp-first funnels resolve the store correctly, so the conflict
-		// path takes no dbScope.
-		return db.insertRowsOnConflict(table, store, pk, checks, defaultExprs, rng, provided, rows, conflict, returning, params, ctes, meter)
+		// executeInsert). Keep dbScope so generated parent-side FK actions retain main versus temp.
+		return db.insertRowsOnConflict(table, store, dbScope, pk, checks, defaultExprs, rng, provided, rows, conflict, returning, params, ctes, meter)
 	}
 	rindexes, err := db.resolveTableIndexes(table)
 	if err != nil {
@@ -2038,7 +2037,7 @@ func (db *engine) runInsertRows(table *catTable, store *tableStore, dbScope *str
 // inserts + updates are then validated against the statement END STATE (PK / unique / CHECK / FK)
 // before phase 2 writes anything (all-or-nothing). returning projects the AFFECTED rows (inserts
 // with an all-NULL old side, updates with their pre-update existing row).
-func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, pk []int, checks []namedCheck, defaultExprs []*rExpr, rng *stmtRng, provided []int, rows [][]Value, plan *conflictPlan, returning []*rExpr, params []Value, ctes cteCtx, meter *costMeter) (int64, [][]Value, error) {
+func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, dbScope *string, pk []int, checks []namedCheck, defaultExprs []*rExpr, rng *stmtRng, provided []int, rows [][]Value, plan *conflictPlan, returning []*rExpr, params []Value, ctes cteCtx, meter *costMeter) (int64, [][]Value, error) {
 	n := len(table.Columns)
 	relation := table.Name
 	// Per-column frozen collations for the collated text key form (§2.12), resolved before any
@@ -2528,7 +2527,7 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, pk []
 			}
 		}
 	}
-	if err := db.applyFkUpdateActions(table, fkUpdates, meter); err != nil {
+	if err := db.applyFkUpdateActions(table, fkUpdates, meter, db.mainDmlTarget(dbScope, table.Name)); err != nil {
 		return 0, nil, err
 	}
 	return affected, returned, nil
@@ -2622,6 +2621,17 @@ type fkUpdateTransition struct {
 	oldRow storedRow
 }
 
+// fkDeferredCheck is one inbound NO ACTION/RESTRICT probe saved until every generated write in the
+// recursive closure has finished. update is true when the old parent key may have been restored by
+// a later action and must be re-probed before checking the child.
+type fkDeferredCheck struct {
+	parent     *catTable
+	childTable string
+	fk         foreignKey
+	probe      fkProbe
+	update     bool
+}
+
 // balancedFkExpr combines a non-empty expression list without making resolver/evaluator depth
 // proportional to the number of parent rows in a generated referential-action predicate.
 func balancedFkExpr(exprs []exprNode, op binaryOp) exprNode {
@@ -2639,8 +2649,23 @@ func balancedFkExpr(exprs []exprNode, op binaryOp) exprNode {
 	return exprs[0]
 }
 
+// fkActionValueExpr builds a typed constant for generated action SQL. Public bind-parameter
+// inference is intentionally scalar-only, so keyable containers use their byte-exact text output
+// under an explicit cast while scalars retain the ordinary parameter path.
+func fkActionValueExpr(ty dataType, value Value, params *[]Value) exprNode {
+	if _, ok := ty.AsScalar(); ok {
+		*params = append(*params, value)
+		return exprNode{Kind: exprParam, Param: uint64(len(*params))}
+	}
+	if !ty.IsArray() && !ty.IsRange() {
+		panic("foreign-key action key is a keyable scalar, array, or range")
+	}
+	inner := exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalText, Str: value.Render()}}
+	return exprNode{Kind: exprCast, Cast: &castExpr{Inner: inner, TypeName: ty.CanonicalName()}}
+}
+
 // fkActionMatchExpr builds one child FK-tuple equality in the parent's key collation.
-func fkActionMatchExpr(parent, child *catTable, fk *foreignKey, params []uint64) exprNode {
+func fkActionMatchExpr(parent, child *catTable, fk *foreignKey, values []exprNode) exprNode {
 	parts := make([]exprNode, 0, len(fk.Columns))
 	for slot, local := range fk.Columns {
 		lhs := exprNode{Kind: exprColumn, Column: child.Columns[local].Name}
@@ -2649,28 +2674,27 @@ func fkActionMatchExpr(parent, child *catTable, fk *foreignKey, params []uint64)
 				Inner: lhs, Collation: parent.Columns[fk.RefColumns[slot]].Collation,
 			}}
 		}
-		rhs := exprNode{Kind: exprParam, Param: params[slot]}
-		parts = append(parts, newBinaryExpr(opEq, lhs, rhs))
+		parts = append(parts, newBinaryExpr(opEq, lhs, values[slot]))
 	}
 	return balancedFkExpr(parts, opAnd)
 }
 
 // fkActionPredicate selects child rows whose FK tuple equals any old parent tuple. It also returns
-// each tuple's parameter ids so ON UPDATE CASCADE can reuse the same conditions in CASE arms.
-func fkActionPredicate(parent, child *catTable, fk *foreignKey, oldTuples [][]Value) (exprNode, []Value, [][]uint64) {
+// each tuple's typed operands so ON UPDATE CASCADE can reuse the conditions in CASE arms.
+func fkActionPredicate(parent, child *catTable, fk *foreignKey, oldTuples [][]Value) (exprNode, []Value, [][]exprNode) {
 	var values []Value
-	ids := make([][]uint64, 0, len(oldTuples))
+	operands := make([][]exprNode, 0, len(oldTuples))
 	matches := make([]exprNode, 0, len(oldTuples))
 	for _, tuple := range oldTuples {
-		tupleIDs := make([]uint64, 0, len(tuple))
-		for _, value := range tuple {
-			values = append(values, value)
-			tupleIDs = append(tupleIDs, uint64(len(values)))
+		tupleOperands := make([]exprNode, 0, len(tuple))
+		for slot, value := range tuple {
+			ty := parent.Columns[fk.RefColumns[slot]].Type
+			tupleOperands = append(tupleOperands, fkActionValueExpr(ty, value, &values))
 		}
-		ids = append(ids, tupleIDs)
-		matches = append(matches, fkActionMatchExpr(parent, child, fk, tupleIDs))
+		operands = append(operands, tupleOperands)
+		matches = append(matches, fkActionMatchExpr(parent, child, fk, tupleOperands))
 	}
-	return balancedFkExpr(matches, opOr), values, ids
+	return balancedFkExpr(matches, opOr), values, operands
 }
 
 // runFkActionUpdate/Delete execute generated work through the ordinary DML pipeline. The nested
@@ -2735,7 +2759,8 @@ func (db *engine) runFkDeleteAction(parent, child *catTable, fk *foreignKey, old
 	filter, params, _ := fkActionPredicate(parent, child, fk, oldTuples)
 	switch fk.OnDelete {
 	case fkCascade:
-		return db.runFkActionDelete(&deleteStmt{Table: child.Name, Filter: &filter}, params, meter)
+		main := "main"
+		return db.runFkActionDelete(&deleteStmt{Table: child.Name, DB: &main, Filter: &filter}, params, meter)
 	case fkSetNull, fkSetDefault:
 		assignments := make([]assignment, 0, len(fk.Columns))
 		for _, column := range fk.Columns {
@@ -2744,7 +2769,8 @@ func (db *engine) runFkDeleteAction(parent, child *catTable, fk *foreignKey, old
 				Value: exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalNull}},
 			})
 		}
-		return db.runFkActionUpdate(&update{Table: child.Name, Assignments: assignments, Filter: &filter}, params, meter)
+		main := "main"
+		return db.runFkActionUpdate(&update{Table: child.Name, DB: &main, Assignments: assignments, Filter: &filter}, params, meter)
 	default:
 		return nil
 	}
@@ -2758,27 +2784,29 @@ func (db *engine) runFkUpdateAction(parent, child *catTable, fk *foreignKey, tra
 	for i := range transitions {
 		oldTuples[i] = transitions[i][0]
 	}
-	filter, params, oldIDs := fkActionPredicate(parent, child, fk, oldTuples)
+	filter, params, oldOperands := fkActionPredicate(parent, child, fk, oldTuples)
 	assignments := make([]assignment, 0, len(fk.Columns))
 	switch fk.OnUpdate {
 	case fkCascade:
-		newIDs := make([][]uint64, 0, len(transitions))
+		newOperands := make([][]exprNode, 0, len(transitions))
 		for _, transition := range transitions {
-			ids := make([]uint64, 0, len(transition[1]))
-			for _, value := range transition[1] {
-				params = append(params, value)
-				ids = append(ids, uint64(len(params)))
+			operands := make([]exprNode, 0, len(transition[1]))
+			for slot, value := range transition[1] {
+				ty := parent.Columns[fk.RefColumns[slot]].Type
+				operands = append(operands, fkActionValueExpr(ty, value, &params))
 			}
-			newIDs = append(newIDs, ids)
+			newOperands = append(newOperands, operands)
 		}
 		for slot, column := range fk.Columns {
 			whens := make([]caseWhen, 0, len(transitions))
-			for i, ids := range oldIDs {
-				param := exprNode{Kind: exprParam, Param: newIDs[i][slot]}
-				result := exprNode{Kind: exprCast, Cast: &castExpr{
-					Inner: param, TypeName: child.Columns[column].Type.CanonicalName(),
-				}}
-				whens = append(whens, caseWhen{Cond: fkActionMatchExpr(parent, child, fk, ids), Result: result})
+			for i, operands := range oldOperands {
+				result := newOperands[i][slot]
+				if _, scalar := child.Columns[column].Type.AsScalar(); scalar {
+					result = exprNode{Kind: exprCast, Cast: &castExpr{
+						Inner: result, TypeName: child.Columns[column].Type.CanonicalName(),
+					}}
+				}
+				whens = append(whens, caseWhen{Cond: fkActionMatchExpr(parent, child, fk, operands), Result: result})
 			}
 			els := exprNode{Kind: exprColumn, Column: child.Columns[column].Name}
 			assignments = append(assignments, assignment{
@@ -2796,15 +2824,51 @@ func (db *engine) runFkUpdateAction(parent, child *catTable, fk *foreignKey, tra
 	default:
 		return nil
 	}
-	return db.runFkActionUpdate(&update{Table: child.Name, Assignments: assignments, Filter: &filter}, params, meter)
+	main := "main"
+	return db.runFkActionUpdate(&update{Table: child.Name, DB: &main, Assignments: assignments, Filter: &filter}, params, meter)
+}
+
+// flushFkDeferredChecks validates the complete recursive closure. The queue order is the
+// deterministic depth-first action visitation order; no check can enqueue more work.
+func (db *engine) flushFkDeferredChecks() error {
+	for i := range db.session.fkDeferredChecks {
+		check := &db.session.fkDeferredChecks[i]
+		if check.update {
+			present, err := db.fkProbeHits(check.probe, check.parent.Name)
+			if err != nil {
+				return err
+			}
+			if present {
+				continue
+			}
+		}
+		referenced, err := db.fkChildReferences(check.childTable, &check.fk, check.parent, check.probe.bytes, map[string]struct{}{})
+		if err != nil {
+			return err
+		}
+		if referenced {
+			return newFKViolationDelete(check.parent.Name, check.fk.Name, check.childTable)
+		}
+	}
+	return nil
 }
 
 // applyFkDeleteActions runs generated write actions first, then validates NO ACTION/RESTRICT
 // against the resulting action closure. Generated work temporarily sees the working snapshot even
 // when the originating statement belongs to a writable CTE.
-func (db *engine) applyFkDeleteActions(parent *catTable, rows []storedRow, meter *costMeter) (err error) {
+func (db *engine) applyFkDeleteActions(parent *catTable, rows []storedRow, meter *costMeter, mainTarget bool) (err error) {
 	if len(rows) == 0 {
 		return nil
+	}
+	if !mainTarget {
+		return nil // foreign keys involving temp/attached tables are not supported (temp-tables.md §8)
+	}
+	root := db.session.fkActionDepth == 0
+	if root {
+		if len(db.session.fkDeferredChecks) != 0 {
+			panic("foreign-key deferred-check queue leaked across statements")
+		}
+		defer func() { db.session.fkDeferredChecks = nil }()
 	}
 	savedPin := db.session.readPin
 	db.session.readPin = nil
@@ -2816,7 +2880,7 @@ func (db *engine) applyFkDeleteActions(parent *catTable, rows []storedRow, meter
 		if r.fk.OnDelete == fkNoAction || r.fk.OnDelete == fkRestrict {
 			continue
 		}
-		child, ok := db.Table(r.childTable)
+		child, ok := db.readSnap().table(r.childTable)
 		if !ok {
 			panic("foreign-key child exists")
 		}
@@ -2849,21 +2913,30 @@ func (db *engine) applyFkDeleteActions(parent *catTable, rows []storedRow, meter
 			if !ok {
 				continue
 			}
-			referenced, err := db.fkChildReferences(r.childTable, &r.fk, parent, probe.bytes, map[string]struct{}{})
-			if err != nil {
-				return err
-			}
-			if referenced {
-				return newFKViolationDelete(parent.Name, r.fk.Name, r.childTable)
-			}
+			db.session.fkDeferredChecks = append(db.session.fkDeferredChecks, fkDeferredCheck{
+				parent: parent, childTable: r.childTable, fk: r.fk, probe: probe,
+			})
 		}
+	}
+	if root {
+		return db.flushFkDeferredChecks()
 	}
 	return nil
 }
 
-func (db *engine) applyFkUpdateActions(parent *catTable, updates []fkUpdateTransition, meter *costMeter) (err error) {
+func (db *engine) applyFkUpdateActions(parent *catTable, updates []fkUpdateTransition, meter *costMeter, mainTarget bool) (err error) {
 	if len(updates) == 0 {
 		return nil
+	}
+	if !mainTarget {
+		return nil
+	}
+	root := db.session.fkActionDepth == 0
+	if root {
+		if len(db.session.fkDeferredChecks) != 0 {
+			panic("foreign-key deferred-check queue leaked across statements")
+		}
+		defer func() { db.session.fkDeferredChecks = nil }()
 	}
 	savedPin := db.session.readPin
 	db.session.readPin = nil
@@ -2875,7 +2948,7 @@ func (db *engine) applyFkUpdateActions(parent *catTable, updates []fkUpdateTrans
 		if r.fk.OnUpdate == fkNoAction || r.fk.OnUpdate == fkRestrict {
 			continue
 		}
-		child, ok := db.Table(r.childTable)
+		child, ok := db.readSnap().table(r.childTable)
 		if !ok {
 			panic("foreign-key child exists")
 		}
@@ -2928,23 +3001,25 @@ func (db *engine) applyFkUpdateActions(parent *catTable, updates []fkUpdateTrans
 			if newOK && bytes.Equal(newProbe.bytes, oldProbe.bytes) {
 				continue
 			}
-			present, err := db.fkProbeHits(oldProbe, parent.Name)
-			if err != nil {
-				return err
-			}
-			if present {
-				continue
-			}
-			referenced, err := db.fkChildReferences(r.childTable, &r.fk, parent, oldProbe.bytes, map[string]struct{}{})
-			if err != nil {
-				return err
-			}
-			if referenced {
-				return newFKViolationDelete(parent.Name, r.fk.Name, r.childTable)
-			}
+			db.session.fkDeferredChecks = append(db.session.fkDeferredChecks, fkDeferredCheck{
+				parent: parent, childTable: r.childTable, fk: r.fk, probe: oldProbe, update: true,
+			})
 		}
 	}
+	if root {
+		return db.flushFkDeferredChecks()
+	}
 	return nil
+}
+
+// mainDmlTarget reports whether a target resolves to the persistent main catalog. FKs involving
+// temp/attached tables are rejected at DDL, while an explicit main qualifier must survive a
+// same-named session-temp overlap.
+func (db *engine) mainDmlTarget(scope *string, table string) bool {
+	if scope != nil {
+		return strings.EqualFold(*scope, "main")
+	}
+	return !db.isTempTable(table)
 }
 
 // executeDelete analyzes and runs a DELETE: resolve the table and optional predicate,
@@ -3172,7 +3247,7 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (ou
 	for i := range matched {
 		deletedRows[i] = matched[i].row
 	}
-	if err := db.applyFkDeleteActions(table, deletedRows, meter); err != nil {
+	if err := db.applyFkDeleteActions(table, deletedRows, meter, db.mainDmlTarget(del.DB, del.Table)); err != nil {
 		return outcome{}, err
 	}
 	return dmlOutcome(retNames, retTypes, returned, int64(len(matched)), meter.Accrued), nil
@@ -3838,7 +3913,7 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 	for i := range updates {
 		fkUpdates[i] = fkUpdateTransition{newRow: updates[i].row, oldRow: updates[i].oldRow}
 	}
-	if err := db.applyFkUpdateActions(table, fkUpdates, meter); err != nil {
+	if err := db.applyFkUpdateActions(table, fkUpdates, meter, db.mainDmlTarget(upd.DB, upd.Table)); err != nil {
 		return outcome{}, err
 	}
 	return dmlOutcome(retNames, retTypes, returned, int64(len(updates)), meter.Accrued), nil

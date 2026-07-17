@@ -263,6 +263,7 @@ import {
   intValue,
   isTrue,
   nullValue,
+  render as valueRender,
   renderByteaHex,
   renderFloat,
   renderUuid,
@@ -1133,6 +1134,15 @@ export class Engine {
   openStreams: number;
   // Per-top-level-statement de-duplication for transactional estimator-revision advances.
   private estimatorTouched = new Set<string>();
+  // Inbound NO ACTION/RESTRICT probes deferred until the outermost recursive action closure has
+  // reached its fixed point (§6.6). Empty between statements.
+  private fkDeferredChecks: {
+    parent: Table;
+    childTable: string;
+    fk: ForeignKey;
+    probe: FkProbe;
+    update: boolean;
+  }[] = [];
 
   constructor() {
     this.committed = new Snapshot();
@@ -7353,11 +7363,10 @@ export class Engine {
   // `parentTable` is the referenced table's name. Unmetered, like the PK/UNIQUE probes (cost.md §3).
   private fkProbeHits(probe: FkProbe, parentTable: string): boolean {
     if (probe.kind === "pk") {
-      return this.lkpStore(parentTable).get(probe.bytes) !== undefined;
+      return this.readSnap().store(parentTable).get(probe.bytes) !== undefined;
     }
     return (
-      this.readSnap().indexStore(probe.index).rangeEntries(uniqueProbeBound(probe.prefix)).length >
-      0
+      this.readSnap().indexStore(probe.index).rangeEntries(uniqueProbeBound(probe.prefix)).length > 0
     );
   }
 
@@ -7378,7 +7387,7 @@ export class Engine {
     // target is in the parent's stored-key byte space, so the child probe encodes a collated parent
     // key column with the PARENT's collation (§2.12).
     const parentColls = this.columnCollations(parent.columns);
-    for (const e of this.lkpStore(childTable).entriesInKeyOrder()) {
+    for (const e of this.readSnap().store(childTable).entriesInKeyOrder()) {
       if (exclude.has(e.key.join(","))) continue;
       const probe = fkProbe(fk, parent, parentColls, e.row, fk.columns);
       if (probe !== null && bytesEq(fkProbeBytes(probe), target)) return true;
@@ -9781,8 +9790,9 @@ export class Engine {
     store: TableStore,
     // dbScope is the INSERT target's explicit database qualifier (attached-databases.md §5), threaded
     // to insertRows so its existence / unique-index probes resolve stores in the right database.
-    // undefined for a bare (implicit-scope) target. ON CONFLICT is reached only for a reserved scope (an
-    // attachment target is gated 0A000 up front), so the conflict path takes no scope.
+    // undefined for a bare (implicit-scope) target. ON CONFLICT is reached only for a reserved scope
+    // (an attachment target is gated 0A000 up front); it still retains this scope for generated
+    // parent-side FK actions.
     dbScope: string | undefined,
     pk: number[],
     checks: NamedCheck[],
@@ -9800,6 +9810,7 @@ export class Engine {
       return this.insertRowsOnConflict(
         table,
         store,
+        dbScope,
         pk,
         checks,
         defaultExprs,
@@ -9846,6 +9857,7 @@ export class Engine {
   private insertRowsOnConflict(
     table: Table,
     store: TableStore,
+    dbScope: string | undefined,
     pk: number[],
     checks: NamedCheck[],
     defaultExprs: (RExpr | null)[],
@@ -10161,7 +10173,7 @@ export class Engine {
         }
       }
     }
-    this.applyFkUpdateActions(table, fkUpdates, meter);
+    this.applyFkUpdateActions(table, fkUpdates, meter, this.mainDmlTarget(dbScope, table.name));
     return { affected, returned };
   }
 
@@ -10240,12 +10252,30 @@ export class Engine {
     return exprs[0]!;
   }
 
+  // Build a typed constant for generated action SQL. Public parameter inference is intentionally
+  // scalar-only, so keyable containers use their byte-exact text output under an explicit cast.
+  private fkActionValueExpr(type: Type, value: Value, params: Value[]): Expr {
+    if (type.kind === "scalar") {
+      params.push(value);
+      return { kind: "param", index: params.length };
+    }
+    if (type.kind !== "array" && type.kind !== "range") {
+      throw new Error("foreign-key action key is a keyable scalar, array, or range");
+    }
+    return {
+      kind: "cast",
+      inner: { kind: "literal", literal: { kind: "text", text: valueRender(value) } },
+      typeName: typeCanonicalName(type),
+      typeMod: null,
+    };
+  }
+
   // One child FK-tuple equality in the parent key's collation.
   private fkActionMatchExpr(
     parent: Table,
     child: Table,
     fk: ForeignKey,
-    params: number[],
+    values: Expr[],
   ): Expr {
     const parts: Expr[] = fk.columns.map((local, slot) => {
       const referenced = fk.refColumns[slot]!;
@@ -10254,7 +10284,7 @@ export class Engine {
       if (parentColumn.type.kind === "scalar" && parentColumn.type.scalar === "text") {
         lhs = { kind: "collate", inner: lhs, collation: parentColumn.collation ?? "C" };
       }
-      return { kind: "binary", op: "eq", lhs, rhs: { kind: "param", index: params[slot]! } };
+      return { kind: "binary", op: "eq", lhs, rhs: values[slot]! };
     });
     return this.balancedFkExpr(parts, "and");
   }
@@ -10264,20 +10294,18 @@ export class Engine {
     child: Table,
     fk: ForeignKey,
     oldTuples: Value[][],
-  ): { filter: Expr; params: Value[]; ids: number[][] } {
+  ): { filter: Expr; params: Value[]; values: Expr[][] } {
     const params: Value[] = [];
-    const ids: number[][] = [];
+    const values: Expr[][] = [];
     const matches: Expr[] = [];
     for (const tuple of oldTuples) {
-      const tupleIds: number[] = [];
-      for (const value of tuple) {
-        params.push(value);
-        tupleIds.push(params.length);
-      }
-      ids.push(tupleIds);
-      matches.push(this.fkActionMatchExpr(parent, child, fk, tupleIds));
+      const tupleValues = tuple.map((value, slot) =>
+        this.fkActionValueExpr(parent.columns[fk.refColumns[slot]!]!.type, value, params),
+      );
+      values.push(tupleValues);
+      matches.push(this.fkActionMatchExpr(parent, child, fk, tupleValues));
     }
-    return { filter: this.balancedFkExpr(matches, "or"), params, ids };
+    return { filter: this.balancedFkExpr(matches, "or"), params, values };
   }
 
   // Generated statements share the originating statement's remaining ceiling and lifetime
@@ -10335,7 +10363,7 @@ export class Engine {
     const { filter, params } = this.fkActionPredicate(parent, child, fk, oldTuples);
     if (fk.onDelete === "cascade") {
       this.runFkActionDelete(
-        { kind: "delete", table: child.name, filter, returning: null },
+        { kind: "delete", table: child.name, db: "main", filter, returning: null },
         params,
         meter,
       );
@@ -10344,6 +10372,7 @@ export class Engine {
         {
           kind: "update",
           table: child.name,
+          db: "main",
           assignments: fk.columns.map((column) => ({
             column: child.columns[column]!.name,
             isDefault: fk.onDelete === "setDefault",
@@ -10370,11 +10399,14 @@ export class Engine {
     const action = this.fkActionPredicate(parent, child, fk, oldTuples);
     const assignments: import("./ast.ts").Assignment[] = [];
     if (fk.onUpdate === "cascade") {
-      const newIds = transitions.map(([, newTuple]) =>
-        newTuple.map((value) => {
-          action.params.push(value);
-          return action.params.length;
-        }),
+      const newValues = transitions.map(([, newTuple]) =>
+        newTuple.map((value, slot) =>
+          this.fkActionValueExpr(
+            parent.columns[fk.refColumns[slot]!]!.type,
+            value,
+            action.params,
+          ),
+        ),
       );
       fk.columns.forEach((column, slot) => {
         assignments.push({
@@ -10383,14 +10415,17 @@ export class Engine {
           value: {
             kind: "case",
             operand: null,
-            whens: action.ids.map((ids, i) => ({
-              cond: this.fkActionMatchExpr(parent, child, fk, ids),
-              result: {
-                kind: "cast",
-                inner: { kind: "param", index: newIds[i]![slot]! },
-                typeName: typeCanonicalName(child.columns[column]!.type),
-                typeMod: null,
-              },
+            whens: action.values.map((values, i) => ({
+              cond: this.fkActionMatchExpr(parent, child, fk, values),
+              result:
+                child.columns[column]!.type.kind === "scalar"
+                  ? {
+                      kind: "cast",
+                      inner: newValues[i]![slot]!,
+                      typeName: typeCanonicalName(child.columns[column]!.type),
+                      typeMod: null,
+                    }
+                  : newValues[i]![slot]!,
             })),
             els: { kind: "column", name: child.columns[column]!.name },
           },
@@ -10411,6 +10446,7 @@ export class Engine {
       {
         kind: "update",
         table: child.name,
+        db: "main",
         assignments,
         filter: action.filter,
         returning: null,
@@ -10420,8 +10456,43 @@ export class Engine {
     );
   }
 
-  private applyFkDeleteActions(parent: Table, rows: Row[], meter: Meter): void {
+  private flushFkDeferredChecks(): void {
+    const checks = this.fkDeferredChecks;
+    this.fkDeferredChecks = [];
+    for (const check of checks) {
+      if (check.update && this.fkProbeHits(check.probe, check.parent.name)) continue;
+      if (
+        this.fkChildReferences(
+          check.childTable,
+          check.fk,
+          check.parent,
+          fkProbeBytes(check.probe),
+          new Set(),
+        )
+      ) {
+        throw fkViolationDelete(check.parent.name, check.fk.name, check.childTable);
+      }
+    }
+  }
+
+  // Whether a DML target resolves to the persistent main catalog. FKs involving temp/attached
+  // tables are rejected at DDL; an explicit main qualifier survives a same-named temp overlap.
+  private mainDmlTarget(scope: string | undefined, table: string): boolean {
+    return scope === undefined ? !this.isTempTable(table) : scope.toLowerCase() === "main";
+  }
+
+  private applyFkDeleteActions(
+    parent: Table,
+    rows: Row[],
+    meter: Meter,
+    mainTarget: boolean,
+  ): void {
     if (rows.length === 0) return;
+    if (!mainTarget) return;
+    const root = this.session.fkActionDepth === 0;
+    if (root && this.fkDeferredChecks.length !== 0) {
+      throw new Error("foreign-key deferred-check queue leaked across statements");
+    }
     const savedPin = this.session.readPin;
     this.session.readPin = null;
     try {
@@ -10429,7 +10500,7 @@ export class Engine {
       const parentColls = this.columnCollations(parent.columns);
       for (const { childTable, fk } of referencers) {
         if (fk.onDelete === "noAction" || fk.onDelete === "restrict") continue;
-        const child = this.table(childTable);
+        const child = this.readSnap().table(childTable);
         if (child === undefined) throw new Error("foreign-key child exists");
         const oldTuples: Value[][] = [];
         for (const row of rows) {
@@ -10442,16 +10513,21 @@ export class Engine {
         if (fk.onDelete !== "noAction" && fk.onDelete !== "restrict") continue;
         for (const row of rows) {
           const probe = fkProbe(fk, parent, parentColls, row, fk.refColumns);
-          if (
-            probe !== null &&
-            this.fkChildReferences(childTable, fk, parent, fkProbeBytes(probe), new Set())
-          ) {
-            throw fkViolationDelete(parent.name, fk.name, childTable);
+          if (probe !== null) {
+            this.fkDeferredChecks.push({
+              parent,
+              childTable,
+              fk,
+              probe,
+              update: false,
+            });
           }
         }
       }
+      if (root) this.flushFkDeferredChecks();
     } finally {
       this.session.readPin = savedPin;
+      if (root) this.fkDeferredChecks = [];
     }
   }
 
@@ -10459,8 +10535,14 @@ export class Engine {
     parent: Table,
     updates: { row: Row; oldRow: Row }[],
     meter: Meter,
+    mainTarget: boolean,
   ): void {
     if (updates.length === 0) return;
+    if (!mainTarget) return;
+    const root = this.session.fkActionDepth === 0;
+    if (root && this.fkDeferredChecks.length !== 0) {
+      throw new Error("foreign-key deferred-check queue leaked across statements");
+    }
     const savedPin = this.session.readPin;
     this.session.readPin = null;
     try {
@@ -10468,7 +10550,7 @@ export class Engine {
       const parentColls = this.columnCollations(parent.columns);
       for (const { childTable, fk } of referencers) {
         if (fk.onUpdate === "noAction" || fk.onUpdate === "restrict") continue;
-        const child = this.table(childTable);
+        const child = this.readSnap().table(childTable);
         if (child === undefined) throw new Error("foreign-key child exists");
         const transitions: [Value[], Value[]][] = [];
         for (const u of updates) {
@@ -10490,16 +10572,19 @@ export class Engine {
           if (oldProbe === null) continue;
           const newProbe = fkProbe(fk, parent, parentColls, u.row, fk.refColumns);
           if (newProbe !== null && bytesEq(fkProbeBytes(newProbe), fkProbeBytes(oldProbe))) continue;
-          if (this.fkProbeHits(oldProbe, parent.name)) continue;
-          if (
-            this.fkChildReferences(childTable, fk, parent, fkProbeBytes(oldProbe), new Set())
-          ) {
-            throw fkViolationDelete(parent.name, fk.name, childTable);
-          }
+          this.fkDeferredChecks.push({
+            parent,
+            childTable,
+            fk,
+            probe: oldProbe,
+            update: true,
+          });
         }
       }
+      if (root) this.flushFkDeferredChecks();
     } finally {
       this.session.readPin = savedPin;
+      if (root) this.fkDeferredChecks = [];
     }
   }
 
@@ -10675,6 +10760,7 @@ export class Engine {
       table,
       matched.map((m) => m.row),
       meter,
+      this.mainDmlTarget(del.db, del.table),
     );
     return dmlOutcome(
       ret?.names ?? null,
@@ -11181,7 +11267,7 @@ export class Engine {
       }
     }
     this.markEstimatorMutation(upd.db, upd.table);
-    this.applyFkUpdateActions(table, updates, meter);
+    this.applyFkUpdateActions(table, updates, meter, this.mainDmlTarget(upd.db, upd.table));
     return dmlOutcome(
       ret?.names ?? null,
       ret?.types ?? null,

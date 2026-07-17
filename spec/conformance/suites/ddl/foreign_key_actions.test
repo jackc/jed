@@ -5,7 +5,7 @@
 # records below agree with PostgreSQL 18 except the final, ledgered NO ACTION closure-order case.
 # jed's end-state key-swap posture remains the documented constraints.md §6.7 divergence and is
 # kept out of this corpus.
-# requires: ddl.create_table, ddl.primary_key, ddl.unique, ddl.check, ddl.foreign_key, ddl.alter_table, dml.insert, dml.update, dml.delete, query.select, query.order_by, types.i32, null.three_valued, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, ddl.unique, ddl.check, ddl.foreign_key, ddl.alter_table, dml.insert, dml.update, dml.delete, query.select, query.order_by, types.i32, types.array, types.range, null.three_valued, resource.cost_metering
 
 # --- CASCADE updates child keys and recursively deletes descendants ----------------------------
 
@@ -324,3 +324,83 @@ query I nosort
 DELETE FROM sibling_p WHERE id = 1 RETURNING id
 ----
 1
+
+# A nested cascade must not validate its inbound NO ACTION edge until later write-action siblings
+# of the outer mutation have run. act_close_a sorts before act_close_b, so the recursive delete of
+# a observes b temporarily; the sibling p -> b cascade then removes it before the closure boundary.
+statement ok
+CREATE TABLE act_close_p (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE act_close_a (id i32 PRIMARY KEY, pid i32 REFERENCES act_close_p ON DELETE CASCADE)
+
+statement ok
+CREATE TABLE act_close_b (id i32 PRIMARY KEY, pid i32 REFERENCES act_close_p ON DELETE CASCADE, aid i32 REFERENCES act_close_a)
+
+statement ok
+INSERT INTO act_close_p VALUES (1)
+
+statement ok
+INSERT INTO act_close_a VALUES (10, 1)
+
+statement ok
+INSERT INTO act_close_b VALUES (20, 1, 10)
+
+statement ok
+DELETE FROM act_close_p WHERE id = 1
+
+query I rowsort
+SELECT id FROM act_close_a
+----
+
+query I rowsort
+SELECT id FROM act_close_b
+----
+
+# Generated action predicates preserve container key types rather than routing arrays/ranges
+# through the public scalar-only parameter inference path.
+statement ok
+CREATE TABLE act_array_p (id i32[] PRIMARY KEY)
+
+statement ok
+CREATE TABLE act_array_c (id i32 PRIMARY KEY, pid i32[] REFERENCES act_array_p ON DELETE CASCADE)
+
+statement ok
+INSERT INTO act_array_p VALUES (ARRAY[1, 2])
+
+statement ok
+INSERT INTO act_array_c VALUES (10, ARRAY[1, 2])
+
+statement ok
+DELETE FROM act_array_p WHERE id = ARRAY[1, 2]
+
+query I rowsort
+SELECT id FROM act_array_c
+----
+
+statement ok
+CREATE TABLE act_range_p (id i32range PRIMARY KEY)
+
+statement ok
+CREATE TABLE act_range_c (id i32 PRIMARY KEY, pid i32range REFERENCES act_range_p ON UPDATE CASCADE ON DELETE CASCADE)
+
+statement ok
+INSERT INTO act_range_p VALUES ('[1,5)')
+
+statement ok
+INSERT INTO act_range_c VALUES (10, '[1,5)')
+
+statement ok
+UPDATE act_range_p SET id = '[2,6)'::i32range WHERE id = '[1,5)'::i32range
+
+query R rowsort
+SELECT pid FROM act_range_c
+----
+[2,6)
+
+statement ok
+DELETE FROM act_range_p WHERE id = '[2,6)'::i32range
+
+query I rowsort
+SELECT id FROM act_range_c
+----

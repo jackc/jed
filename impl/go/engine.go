@@ -196,6 +196,9 @@ type sessionState struct {
 	maxCost int64
 	// fkActionDepth bounds recursive generated referential-action statements (§6.6).
 	fkActionDepth int
+	// fkDeferredChecks holds inbound NO ACTION/RESTRICT probes until the outermost generated
+	// referential-action closure reaches its fixed point (§6.6). It is empty between statements.
+	fkDeferredChecks []fkDeferredCheck
 	// lifetimeMaxCost is the per-session cumulative cost budget (spec/design/session.md §5.4), or 0
 	// for unlimited. Bounds the whole session: the instant lifetimeTotal reaches it the in-flight
 	// statement aborts 54P02, and once spent every further statement is rejected 54P02 at admission.

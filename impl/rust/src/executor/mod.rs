@@ -878,6 +878,9 @@ pub struct SessionState {
     /// arbitrarily long FK chain across cheap DDL statements, so generated child DML is capped at
     /// 256 nested calls to keep every core's native stack bounded (`54001`).
     pub(crate) fk_action_depth: usize,
+    /// Inbound NO ACTION/RESTRICT probes deferred until the outermost recursive action closure has
+    /// reached its fixed point (§6.6). Empty between statements.
+    fk_deferred_checks: Vec<dml::FkDeferredCheck>,
 }
 
 /// Validate + canonicalize a session-variable name (spec/design/session.md §6.1). A variable must be
@@ -949,6 +952,7 @@ impl SessionState {
                 .unwrap_or(crate::timezone::ZoneRef::Fixed(0)),
             read_pin: None,
             fk_action_depth: 0,
+            fk_deferred_checks: Vec::new(),
         }
     }
 

@@ -131,3 +131,39 @@ func TestForeignKeyParentUpdateEndStateSwap(t *testing.T) {
 		t.Fatalf("orphaning update: got %s, want 23503", got)
 	}
 }
+
+// Generated actions for a persistent FK must stay in main even when the executing session has a
+// same-named temp relation. The overlap is legal when the temp table is created first in another
+// session (temp-tables.md §3).
+func TestForeignKeyActionPreservesMainScopeAcrossTempOverlap(t *testing.T) {
+	base := memDB()
+	shadowed := base.Session(SessionOptions{})
+	defer shadowed.Close()
+	mustExec(t, shadowed, "CREATE TEMP TABLE c (temp_id i32 PRIMARY KEY, scratch text)")
+	mustExec(t, shadowed, "INSERT INTO c VALUES (99, 'keep')")
+
+	persistent := base.Session(SessionOptions{})
+	defer persistent.Close()
+	mustExec(t, persistent, "CREATE TABLE p (id i32 PRIMARY KEY)")
+	mustExec(t, persistent, "CREATE TABLE c (id i32 PRIMARY KEY, pid i32 REFERENCES p ON DELETE CASCADE)")
+	mustExec(t, persistent, "INSERT INTO p VALUES (1)")
+	mustExec(t, persistent, "INSERT INTO c VALUES (10, 1)")
+
+	mustExec(t, shadowed, "DELETE FROM main.p WHERE id = 1")
+	persistentOut, err := queryOutcome(persistent, "SELECT id, pid FROM c", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tempOut, err := queryOutcome(shadowed, "SELECT temp_id, scratch FROM c", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persistentRows := persistentOut.Rows
+	tempRows := tempOut.Rows
+	if len(persistentRows) != 0 {
+		t.Fatalf("persistent child rows after cascade = %v, want empty (temp rows %v)", persistentRows, tempRows)
+	}
+	if len(tempRows) != 1 || tempRows[0][0].Int != 99 || tempRows[0][1].str() != "keep" {
+		t.Fatalf("temp shadow rows after main cascade = %v, want [[99 keep]]", tempRows)
+	}
+}
