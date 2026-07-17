@@ -1121,8 +1121,8 @@ export type QueryExpr = Select | SetOp | WithExpr;
 // WithExpr is a nested `WITH … query_expr` (spec/design/cte.md §7): the CTE list `ctes` (forward-only
 // visibility; self-referencing when `recursive`) prefixing the inner query expression `body`, in a
 // subquery / derived-table / CTE-body position — as opposed to the top-level WithQuery (which may
-// prefix a data-modifying primary). The CTEs are visible only within `body` (and to each other); the
-// enclosing statement's CTE bindings are NOT inherited — a documented narrowing (cte.md §7). A
+// prefix a data-modifying primary). The CTEs are visible only within `body` (and to each other),
+// layered over the enclosing statement's visible CTE bindings (cte.md §7). A
 // data-modifying CTE here is rejected at planning (0A000 — PostgreSQL restricts a DML-WITH to the
 // statement top level).
 export type WithExpr = {

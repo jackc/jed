@@ -69,7 +69,7 @@ func (db *engine) executeWith(wq *withQuery, params []Value) (outcome, error) {
 // the recursive UNION shape, so it is always non-recursive. The refs counters are bumped as later
 // query bodies / a query primary reference each binding (a data-modifying part's references are
 // static-counted by the orchestrator, since it is not planned here).
-func (db *engine) planCteBindings(ctes []cte, recursive bool, ptypes *paramTypes) ([]*cteBinding, error) {
+func (db *engine) planCteBindings(ctes []cte, recursive bool, inherited []*cteBinding, ptypes *paramTypes) ([]*cteBinding, error) {
 	bindings := make([]*cteBinding, 0, len(ctes))
 	for i := range ctes {
 		cte := &ctes[i]
@@ -93,7 +93,8 @@ func (db *engine) planCteBindings(ctes []cte, recursive bool, ptypes *paramTypes
 		if isRecursive {
 			// The body is `anchor UNION[ALL] recursive_term` (analyzeRecursiveCte verified).
 			so := cte.Body.AsQuery().SetOp
-			anchorPlan, err := db.planQuery(so.Lhs, nil, bindings, ptypes)
+			visible := append(append([]*cteBinding{}, inherited...), bindings...)
+			anchorPlan, err := db.planQuery(so.Lhs, nil, visible, ptypes)
 			if err != nil {
 				return nil, err
 			}
@@ -105,7 +106,8 @@ func (db *engine) planCteBindings(ctes []cte, recursive bool, ptypes *paramTypes
 				name: lname, table: table, plan: anchorPlan, hint: cte.Materialized,
 			})
 			bi := len(bindings) - 1
-			rhsPlan, err := db.planQuery(so.Rhs, nil, bindings, ptypes)
+			visible = append(append([]*cteBinding{}, inherited...), bindings...)
+			rhsPlan, err := db.planQuery(so.Rhs, nil, visible, ptypes)
 			if err != nil {
 				return nil, err
 			}
@@ -116,7 +118,8 @@ func (db *engine) planCteBindings(ctes []cte, recursive bool, ptypes *paramTypes
 			continue
 		}
 		if q := cte.Body.AsQuery(); q != nil {
-			plan, err := db.planQuery(*q, nil, bindings, ptypes)
+			visible := append(append([]*cteBinding{}, inherited...), bindings...)
+			plan, err := db.planQuery(*q, nil, visible, ptypes)
 			if err != nil {
 				return nil, err
 			}
@@ -131,7 +134,8 @@ func (db *engine) planCteBindings(ctes []cte, recursive bool, ptypes *paramTypes
 		}
 		// A data-modifying CTE (writable-cte.md): resolve its RETURNING schema for the synthetic
 		// relation + capture the statement to run later.
-		table, dm, err := db.planDmCte(lname, &cte.Body, bindings, cte.Columns, ptypes)
+		visible := append(append([]*cteBinding{}, inherited...), bindings...)
+		table, dm, err := db.planDmCte(lname, &cte.Body, visible, cte.Columns, ptypes)
 		if err != nil {
 			return nil, err
 		}
@@ -199,7 +203,7 @@ func (db *engine) planDmCte(lname string, body *cteBody, bindings []*cteBinding,
 // CTE context. Cost composes like set operations — a sum of the parts.
 func (db *engine) runWith(wq *withQuery, params []Value) (selectResult, error) {
 	ptypes := &paramTypes{}
-	bindings, err := db.planCteBindings(wq.Ctes, wq.Recursive, ptypes)
+	bindings, err := db.planCteBindings(wq.Ctes, wq.Recursive, nil, ptypes)
 	if err != nil {
 		return selectResult{}, err
 	}
@@ -219,7 +223,7 @@ func (db *engine) runWith(wq *withQuery, params []Value) (selectResult, error) {
 		return selectResult{}, err
 	}
 	modes := cteModes(bindings)
-	buffers, totalCost, err := db.materializeCtes(bindings, modes, bound)
+	buffers, totalCost, err := db.materializeCtes(bindings, modes, bound, cteCtx{})
 	if err != nil {
 		return selectResult{}, err
 	}
@@ -244,7 +248,7 @@ func (db *engine) runWith(wq *withQuery, params []Value) (selectResult, error) {
 // here (the orchestrator runs it for its effect — executeWithDml); its buffer slot is left empty for
 // the orchestrator to fill. Returns the filled buffers + the accrued materialization cost (a later
 // body sees the earlier buffers).
-func (db *engine) materializeCtes(bindings []*cteBinding, modes []cteMode, bound []Value) ([][]storedRow, int64, error) {
+func (db *engine) materializeCtes(bindings []*cteBinding, modes []cteMode, bound []Value, inherited cteCtx) ([][]storedRow, int64, error) {
 	var totalCost int64
 	buffers := make([][]storedRow, 0, len(bindings))
 	for i := range bindings {
@@ -258,7 +262,7 @@ func (db *engine) materializeCtes(bindings []*cteBinding, modes []cteMode, bound
 		var buf []storedRow
 		switch {
 		case bindings[i].recursive != nil:
-			b, err := db.materializeRecursive(i, bindings[i].recursive, modes, bindings, buffers, bound, &totalCost)
+			b, err := db.materializeRecursive(i, bindings[i].recursive, modes, bindings, buffers, bound, inherited, &totalCost)
 			if err != nil {
 				return nil, 0, err
 			}
@@ -266,7 +270,7 @@ func (db *engine) materializeCtes(bindings []*cteBinding, modes []cteMode, bound
 		case bindings[i].isDml():
 			// A data-modifying CTE's buffer is filled by the orchestrator, not here.
 		case modes[i] == cteMaterialize:
-			ctx := cteCtx{modes: modes[:i], bindings: bindings[:i], buffers: buffers}
+			ctx := inherited.extend(modes[:i], bindings[:i], buffers)
 			cplan := bindings[i].plan
 			r, err := db.execQueryPlan(&cplan, nil, bound, ctx)
 			if err != nil {
@@ -288,7 +292,7 @@ func (db *engine) materializeCtes(bindings []*cteBinding, modes []cteMode, bound
 // the per-statement ceiling between iterations, so a non-terminating recursion of cheap iterations
 // still aborts 54P01 at the identical accrued cost in every core (recursive-cte.md §5).
 func (db *engine) materializeRecursive(ci int, rt *recursiveTerm,
-	modes []cteMode, bindings []*cteBinding, priorBuffers [][]storedRow, params []Value, totalCost *int64,
+	modes []cteMode, bindings []*cteBinding, priorBuffers [][]storedRow, params []Value, inherited cteCtx, totalCost *int64,
 ) ([]storedRow, error) {
 	anchorPlan := &bindings[ci].plan
 	maxCost := db.session.maxCost
@@ -304,7 +308,7 @@ func (db *engine) materializeRecursive(ci int, rt *recursiveTerm,
 	rhsTypes := rt.plan.columnTypes()
 
 	// Evaluate the anchor: its rows seed both the result and the first working table.
-	ctx0 := cteCtx{modes: modes[:ci], bindings: bindings[:ci], buffers: priorBuffers}
+	ctx0 := inherited.extend(modes[:ci], bindings[:ci], priorBuffers)
 	ar, err := db.execQueryPlan(anchorPlan, nil, params, ctx0)
 	if err != nil {
 		return nil, err
@@ -344,7 +348,7 @@ func (db *engine) materializeRecursive(ci int, rt *recursiveTerm,
 	for len(working) > 0 {
 		rhsBuffers[ci] = working
 		working = nil
-		ctx := cteCtx{modes: modes[:ci+1], bindings: bindings[:ci+1], buffers: rhsBuffers}
+		ctx := inherited.extend(modes[:ci+1], bindings[:ci+1], rhsBuffers)
 		cplan := rt.plan
 		rr, err := db.execQueryPlan(&cplan, nil, params, ctx)
 		if err != nil {
@@ -388,7 +392,7 @@ func (db *engine) executeWithDml(wq *withQuery, params []Value) (outcome, error)
 func (db *engine) runWithDml(wq *withQuery, params []Value) (outcome, error) {
 	ptypes := &paramTypes{}
 	// (1) Plan every CTE binding (query plans + data-modifying RETURNING schemas).
-	bindings, err := db.planCteBindings(wq.Ctes, wq.Recursive, ptypes)
+	bindings, err := db.planCteBindings(wq.Ctes, wq.Recursive, nil, ptypes)
 	if err != nil {
 		return outcome{}, err
 	}
@@ -445,7 +449,7 @@ func (db *engine) runWithDml(wq *withQuery, params []Value) (outcome, error) {
 		var buf []storedRow
 		switch {
 		case bindings[i].recursive != nil:
-			b, rerr := db.materializeRecursive(i, bindings[i].recursive, modes, bindings, buffers, bound, &totalCost)
+			b, rerr := db.materializeRecursive(i, bindings[i].recursive, modes, bindings, buffers, bound, cteCtx{}, &totalCost)
 			if rerr != nil {
 				return outcome{}, rerr
 			}
@@ -638,7 +642,23 @@ func countSelfRefsQuery(qe queryExpr, name string) int {
 	if qe.SetOp != nil {
 		return countSelfRefsQuery(qe.SetOp.Lhs, name) + countSelfRefsQuery(qe.SetOp.Rhs, name)
 	}
-	return 0
+	// A nested WITH inherits this binding until an inner same-named CTE is declared. That inner
+	// binding shadows the outer one for later bodies and the main query, but its own non-recursive
+	// body still sees the outer binding (cte.md §7).
+	n := 0
+	shadowed := false
+	for i := range qe.With.Ctes {
+		if !shadowed {
+			n += countCteRefsDml(&qe.With.Ctes[i].Body, name)
+		}
+		if strings.EqualFold(qe.With.Ctes[i].Name, name) {
+			shadowed = true
+		}
+	}
+	if !shadowed {
+		n += countSelfRefsQuery(*qe.With.Body, name)
+	}
+	return n
 }
 
 // countSelfRefsSelect counts self-references in a SELECT: its FROM relations (deep) plus all of its
@@ -1174,7 +1194,7 @@ func (db *engine) planQuery(qe queryExpr, parent *scope, ctes []*cteBinding, pty
 		return queryPlan{sel: sp}, nil
 	}
 	if qe.With != nil {
-		wp, err := db.planWithExpr(qe.With, parent, ptypes)
+		wp, err := db.planWithExpr(qe.With, parent, ctes, ptypes)
 		if err != nil {
 			return queryPlan{}, err
 		}
@@ -1187,29 +1207,28 @@ func (db *engine) planQuery(qe queryExpr, parent *scope, ctes []*cteBinding, pty
 	return queryPlan{setop: sop}, nil
 }
 
-// planWithExpr plans a nested `WITH … query_expr` (spec/design/cte.md §7) into a withPlan. The
-// nested CTEs establish their OWN scope: the bodies and the inner main query see ONLY these CTEs
-// (and the catalog) — the enclosing statement's CTE bindings are NOT inherited (a documented
-// narrowing, cte.md §7), so planCteBindings and the body are planned without the outer ctes. The
+// planWithExpr plans a nested `WITH … query_expr` (spec/design/cte.md §7) into a withPlan. Its CTEs
+// inherit the enclosing bindings and shadow same-named bindings from their declaration onward. The
 // inner main query keeps the enclosing parent (so a LATERAL derived-table body still correlates to
-// its left siblings), while the CTE bodies stay independent (parent=nil, inside planCteBindings). A
+// its left siblings), while CTE bodies stay independent (parent=nil, inside planCteBindings). A
 // data-modifying CTE here is rejected 0A000 — PostgreSQL restricts a DML-WITH to the top level.
-func (db *engine) planWithExpr(we *withExpr, parent *scope, ptypes *paramTypes) (*withPlan, error) {
+func (db *engine) planWithExpr(we *withExpr, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (*withPlan, error) {
 	for i := range we.Ctes {
 		if we.Ctes[i].Body.IsDataModifying() {
 			return nil, newError(FeatureNotSupported,
 				fmt.Sprintf("WITH clause containing a data-modifying statement (%s) is only supported at the top level", we.Ctes[i].Name))
 		}
 	}
-	bindings, err := db.planCteBindings(we.Ctes, we.Recursive, ptypes)
+	bindings, err := db.planCteBindings(we.Ctes, we.Recursive, ctes, ptypes)
 	if err != nil {
 		return nil, err
 	}
-	body, err := db.planQuery(*we.Body, parent, bindings, ptypes)
+	visible := append(append([]*cteBinding{}, ctes...), bindings...)
+	body, err := db.planQuery(*we.Body, parent, visible, ptypes)
 	if err != nil {
 		return nil, err
 	}
-	return &withPlan{bindings: bindings, modes: cteModes(bindings), body: body}, nil
+	return &withPlan{bindings: bindings, modes: cteModes(bindings), body: body, inheritedLen: len(ctes)}, nil
 }
 
 // execQueryPlan executes a resolved plan against an outer-row environment (outer = the enclosing
@@ -1225,7 +1244,7 @@ func (db *engine) execQueryPlan(plan *queryPlan, outer []storedRow, params []Val
 		return db.execValuesPlan(plan.values, outer, params, ctes)
 	}
 	if plan.with != nil {
-		return db.execWithPlan(plan.with, outer, params)
+		return db.execWithPlan(plan.with, outer, params, ctes)
 	}
 	return db.execSetOpPlan(plan.setop, outer, params, ctes)
 }
@@ -1238,18 +1257,18 @@ func (db *engine) execHiddenQueryPlan(plan *queryPlan, outer []storedRow, params
 	return db.execQueryPlan(plan, outer, params, ctes)
 }
 
-// execWithPlan executes a nested WITH plan (spec/design/cte.md §7): materialize its CTE bindings
-// once (in list order, charging their cost), build a FRESH CTE context over them (the nested CTEs
-// establish their own scope — the enclosing context is NOT chained in, the documented narrowing
-// §7), and run the inner body against it. The body still sees the outer row environment (so a
+// execWithPlan executes a nested WITH plan (spec/design/cte.md §7): retain the exact inherited
+// prefix visible at plan time, materialize the local bindings once, layer them over that prefix, and
+// run the inner body. The body still sees the outer row environment (so a
 // LATERAL nested-WITH derived-table body correlates to its left siblings). The materialization cost
 // folds into the body's cost — the same shape as the top-level runWith (cte.md §3).
-func (db *engine) execWithPlan(wp *withPlan, outer []storedRow, params []Value) (selectResult, error) {
-	buffers, totalCost, err := db.materializeCtes(wp.bindings, wp.modes, params)
+func (db *engine) execWithPlan(wp *withPlan, outer []storedRow, params []Value, ctes cteCtx) (selectResult, error) {
+	inherited := ctes.prefix(wp.inheritedLen)
+	buffers, totalCost, err := db.materializeCtes(wp.bindings, wp.modes, params, inherited)
 	if err != nil {
 		return selectResult{}, err
 	}
-	ctx := cteCtx{modes: wp.modes, bindings: wp.bindings, buffers: buffers}
+	ctx := inherited.extend(wp.modes, wp.bindings, buffers)
 	r, err := db.execQueryPlan(&wp.body, outer, params, ctx)
 	if err != nil {
 		return selectResult{}, err

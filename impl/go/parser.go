@@ -2598,9 +2598,9 @@ func (p *parser) parseQueryExprNode() (queryExpr, error) {
 
 // parseWithStatement parses `query_statement ::= with_clause? query_expr` — a top-level query
 // prefixed by a WITH clause defining common table expressions (spec/design/cte.md). WITH RECURSIVE
-// (spec/design/recursive-cte.md) sets the Recursive flag and lets a CTE reference itself; the CTE
-// bodies and the main body are WITH-less query_exprs (the top-level-only narrowing — a nested WITH
-// surfaces as 42601 because a body must begin with SELECT).
+// (spec/design/recursive-cte.md) sets the Recursive flag and lets a CTE reference itself.
+// Parenthesized CTE query bodies are subquery_exprs and may carry a nested WITH (cte.md §7); the
+// top-level primary is unprefixed, so a bare second WITH remains invalid.
 func (p *parser) parseWithStatement() (statement, error) {
 	if err := p.expectKeyword("with"); err != nil {
 		return statement{}, err
@@ -2628,7 +2628,7 @@ func (p *parser) parseWithStatement() (statement, error) {
 		}
 	}
 	// The primary may be a data-modifying statement (spec/design/writable-cte.md): a leading
-	// INSERT/UPDATE/DELETE keyword selects it, otherwise a WITH-less query_expr.
+	// INSERT/UPDATE/DELETE keyword selects it, otherwise an unprefixed query_expr.
 	body, err := p.parseCteBody(false)
 	if err != nil {
 		return statement{}, err
@@ -2639,8 +2639,8 @@ func (p *parser) parseWithStatement() (statement, error) {
 // parseCteBody parses a cte_body (spec/design/writable-cte.md): a data-modifying
 // INSERT/UPDATE/DELETE when one leads, otherwise a query. parenthesized is true for a CTE body
 // inside ( … ) (the closing ) is the caller's), false for the WITH primary (it runs to end of
-// statement). A query body parsed here is the WITH-less query_expr (the top-level-only nested-WITH
-// narrowing — a nested WITH surfaces as a leftover 42601).
+// statement). A parenthesized query body uses subquery_expr and may carry a nested WITH; the
+// top-level primary uses an unprefixed query_expr.
 func (p *parser) parseCteBody(parenthesized bool) (cteBody, error) {
 	switch p.peekKeyword() {
 	case "insert", "update", "delete":

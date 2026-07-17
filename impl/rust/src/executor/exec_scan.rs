@@ -1105,12 +1105,13 @@ impl Engine {
             Statement::With(wq) => {
                 // The planning prefix of `run_with` (cte.md): plan the CTE bindings, then the body with
                 // them visible. The body's column names/types are the WITH's output names/types.
-                let bindings = self.plan_cte_bindings(&wq.ctes, wq.recursive, &mut ptypes)?;
+                let bindings = self.plan_cte_bindings(&wq.ctes, wq.recursive, &[], &mut ptypes)?;
                 let body_q = wq
                     .body
                     .as_query()
                     .expect("a pure-query WITH (DML excluded by stmt_is_write)");
-                self.plan_query(body_q, None, &bindings, &mut ptypes)?
+                let visible: Vec<&CteBinding> = bindings.iter().collect();
+                self.plan_query(body_q, None, &visible, &mut ptypes)?
             }
             _ => unreachable!("try_deferred_query only calls this for SetOp / With"),
         };
@@ -1860,12 +1861,12 @@ impl Engine {
         if let Some(ci) = rel.cte {
             let rows = match env.ctes.modes[ci] {
                 CteMode::Materialize => {
-                    let buf = &env.ctes.buffers[ci];
+                    let buf = env.ctes.buffers[ci];
                     for _ in buf {
                         meter.guard()?;
                         meter.charge(COSTS.cte_scan_row);
                     }
-                    buf.clone()
+                    buf.to_vec()
                 }
                 CteMode::Inline => {
                     // Only a plain (query) CTE is ever inlined; a data-modifying CTE is always

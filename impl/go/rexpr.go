@@ -1142,13 +1142,14 @@ type queryPlan struct {
 }
 
 // withPlan is a planned nested `WITH … query_expr` (spec/design/cte.md §7): the nested CTE bindings
-// + their inline/materialize modes, and the inner query plan that references them. At execution the
-// bindings are materialized once and body runs against a fresh CTE context (they establish their
-// own scope — the enclosing context is NOT chained in, the documented narrowing §7).
+// + their inline/materialize modes, and the inner query plan that references them. inheritedLen pins
+// the enclosing binding prefix visible at this exact plan position; execution layers the local
+// bindings over that prefix.
 type withPlan struct {
-	bindings []*cteBinding
-	modes    []cteMode
-	body     queryPlan
+	bindings     []*cteBinding
+	modes        []cteMode
+	body         queryPlan
+	inheritedLen int
 }
 
 // columnTypes returns the plan's output column types (for a subquery's plan-time column-count
@@ -1267,6 +1268,33 @@ type cteCtx struct {
 	modes    []cteMode
 	bindings []*cteBinding
 	buffers  [][]storedRow
+}
+
+// prefix returns the exact enclosing CTE prefix visible when a nested WITH was planned. A CTE body
+// may execute later against its statement's full context, so blindly inheriting the full slices
+// would expose later bindings that were not yet in scope at the nested plan position.
+func (c cteCtx) prefix(n int) cteCtx {
+	if n < 0 || n > len(c.bindings) {
+		panic("invalid inherited CTE prefix")
+	}
+	return cteCtx{modes: c.modes[:n], bindings: c.bindings[:n], buffers: c.buffers[:n]}
+}
+
+// extend layers local CTE bindings over an inherited context while preserving the flat indices
+// stored in planned FROM relations. The returned slices are independent headers/backing arrays.
+func (c cteCtx) extend(modes []cteMode, bindings []*cteBinding, buffers [][]storedRow) cteCtx {
+	out := cteCtx{
+		modes:    make([]cteMode, 0, len(c.modes)+len(modes)),
+		bindings: make([]*cteBinding, 0, len(c.bindings)+len(bindings)),
+		buffers:  make([][]storedRow, 0, len(c.buffers)+len(buffers)),
+	}
+	out.modes = append(out.modes, c.modes...)
+	out.modes = append(out.modes, modes...)
+	out.bindings = append(out.bindings, c.bindings...)
+	out.bindings = append(out.bindings, bindings...)
+	out.buffers = append(out.buffers, c.buffers...)
+	out.buffers = append(out.buffers, buffers...)
+	return out
 }
 
 // planRel is one relation in a SELECT plan: the table name (looked up in the store at exec), the

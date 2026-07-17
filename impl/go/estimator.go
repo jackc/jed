@@ -1975,8 +1975,22 @@ func (db *engine) estimateSetOpPlan(sop *setOpPlan, ctx *estimateCTECtx) estimat
 	return plan
 }
 
-func (db *engine) estimateWithPlan(wp *withPlan) estimatedPlan {
-	ctx := &estimateCTECtx{bindings: wp.bindings, modes: wp.modes, bodies: make([]estimatedPlan, len(wp.bindings))}
+func (db *engine) estimateWithPlan(wp *withPlan, inherited *estimateCTECtx) estimatedPlan {
+	ctx := &estimateCTECtx{}
+	if inherited != nil {
+		if wp.inheritedLen < 0 || wp.inheritedLen > len(inherited.bindings) {
+			panic("invalid inherited CTE estimate prefix")
+		}
+		ctx.bindings = append(ctx.bindings, inherited.bindings[:wp.inheritedLen]...)
+		ctx.modes = append(ctx.modes, inherited.modes[:wp.inheritedLen]...)
+		ctx.bodies = append(ctx.bodies, inherited.bodies[:wp.inheritedLen]...)
+	} else if wp.inheritedLen != 0 {
+		panic("missing inherited CTE estimate context")
+	}
+	localBase := len(ctx.bindings)
+	ctx.bindings = append(ctx.bindings, wp.bindings...)
+	ctx.modes = append(ctx.modes, wp.modes...)
+	ctx.bodies = append(ctx.bodies, make([]estimatedPlan, len(wp.bindings))...)
 	definitionNodes := make([]planEstimate, 0)
 	var bindingContribution planEstimate
 	for i, binding := range wp.bindings {
@@ -1984,7 +1998,7 @@ func (db *engine) estimateWithPlan(wp *withPlan) estimatedPlan {
 		if !binding.isDml() {
 			body = db.estimateQueryPlan(binding.plan, ctx)
 		}
-		ctx.bodies[i] = body
+		ctx.bodies[localBase+i] = body
 		mode := cteInline
 		if i < len(wp.modes) {
 			mode = wp.modes[i]
@@ -2017,7 +2031,7 @@ func (db *engine) estimateQueryPlan(qp queryPlan, ctx *estimateCTECtx) estimated
 	case qp.values != nil:
 		return db.estimateValuesPlan(qp.values, ctx)
 	case qp.with != nil:
-		return db.estimateWithPlan(qp.with)
+		return db.estimateWithPlan(qp.with, ctx)
 	default:
 		return leafEstimatedPlan(planEstimate{})
 	}

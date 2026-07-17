@@ -35,10 +35,13 @@ SELECT name, price FROM kitchen ORDER BY price DESC;`;
 )
 SELECT n FROM series ORDER BY n;`;
 
-	const nestedWith = `SELECT category, cheapest
+	const nestedWith = `WITH prices AS (
+  SELECT category, price FROM product
+)
+SELECT category, cheapest
 FROM (
   WITH cheap AS (
-    SELECT category, min(price) AS cheapest FROM product GROUP BY category
+    SELECT category, min(price) AS cheapest FROM prices GROUP BY category
   )
   SELECT category, cheapest FROM cheap WHERE cheapest <= 10
 ) AS s
@@ -235,11 +238,11 @@ nested CTEs (including `WITH RECURSIVE`) get the full machinery above:
 
 <LiveSql {seed} query={nestedWith} rows={2} />
 
-A nested `WITH` establishes its **own** scope: its CTEs are visible only inside that parenthesized
-query. One difference from PostgreSQL: a nested `WITH` does **not** inherit the *enclosing*
-statement's CTEs — an outer CTE name referenced inside an inner `WITH` resolves to a base table (or is
-an error), not the outer CTE. Data-modifying CTEs (`INSERT`/`UPDATE`/`DELETE`) stay top-level only, as
-in PostgreSQL.
+A nested `WITH` establishes a **child** scope: its CTEs are visible only inside that parenthesized
+query, and it inherits CTEs visible in the enclosing statement. An inner CTE with the same name
+shadows the outer one after it is declared; its own non-recursive body still sees the outer binding
+because a CTE cannot see itself. Data-modifying CTEs (`INSERT`/`UPDATE`/`DELETE`) stay top-level only,
+as in PostgreSQL.
 
 ## Derived tables (`FROM (SELECT …) AS t`)
 

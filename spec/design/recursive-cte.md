@@ -189,5 +189,3 @@ bump).
   (`0A000` today; PostgreSQL allows both).
 - **Mutual recursion** between WITH items (`0A000` in PostgreSQL; `42P01` in jed today).
 - **`ORDER BY` / `LIMIT` in a recursive query** (`0A000` in both engines today).
-- The inherited [cte.md](cte.md) §6 follow-ons — data-modifying CTEs, `WITH` on `UPDATE`/`DELETE`,
-  nested `WITH`.

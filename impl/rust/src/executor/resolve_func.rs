@@ -2595,11 +2595,9 @@ pub(crate) fn collect_query_privs(qe: &QueryExpr, req: &mut PrivReq, locals: &Ha
     match qe {
         QueryExpr::Select(s) => collect_select_privs(s, req, locals),
         QueryExpr::SetOp(so) => collect_setop_privs(so, req, locals),
-        // A nested `WITH` establishes its own CTE scope (spec/design/cte.md §7): the enclosing
-        // locals are NOT inherited (an enclosing CTE name resolves to a base table inside, so it is
-        // privilege-checked), and the nested CTE names shadow base tables only within this node.
+        // A nested WITH inherits the enclosing CTE names, then adds its own forward-visible names.
         QueryExpr::With(we) => {
-            let mut scope = HashSet::new();
+            let mut scope = locals.clone();
             for cte in &we.ctes {
                 collect_cte_body_privs(&cte.body, req, &scope);
                 scope.insert(cte.name.to_ascii_lowercase());

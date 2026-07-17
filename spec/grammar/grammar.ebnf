@@ -504,9 +504,10 @@ query_expr     ::= set_expr order_by? limit_offset?
 
 /* A SUBQUERY expression — the body of a parenthesized query (a derived table, a scalar / IN /
  * EXISTS / ANY/ALL subquery, a set-op operand, or a CTE body) — is a query_expr OPTIONALLY prefixed
- * by its OWN with_clause: a NESTED WITH (../design/cte.md §7). The nested CTEs establish their own
- * scope (visible only within this body; the enclosing statement's CTEs are NOT inherited — a
- * documented divergence from PG). A nested WITH is recognized by the shape "WITH RECURSIVE …" /
+ * by its OWN with_clause: a NESTED WITH (../design/cte.md §7). The nested CTEs establish a child
+ * scope (visible only within this body) over the enclosing statement's visible CTE bindings. An
+ * inner same-named binding shadows its inherited binding from declaration onward. A nested WITH is
+ * recognized by the shape "WITH RECURSIVE …" /
  * "WITH <name> (" / "WITH <name> AS" (so `with` stays a legal identifier elsewhere). A
  * data-modifying CTE in a nested WITH is rejected 0A000 (DML-WITH is top-level only — matching PG). */
 subquery_expr  ::= with_clause? query_expr
@@ -526,8 +527,8 @@ subquery_expr  ::= with_clause? query_expr
  * duplicate CTE name in one list is 42712. A CTE body is an INDEPENDENT query — not correlated to
  * where it is referenced.
  *   A WITH prefix attaches at the STATEMENT top level AND, as a NESTED WITH (subquery_expr,
- * ../design/cte.md §7), to any parenthesized subquery / derived table / CTE body — establishing its
- * own scope (enclosing CTEs not inherited). The top-level primary itself does not re-prefix a second
+ * ../design/cte.md §7), to any parenthesized subquery / derived table / CTE body — establishing a
+ * child scope over its inherited CTE bindings. The top-level primary itself does not re-prefix a second
  * WITH (a bare "WITH … WITH …" is a 42601). DATA-MODIFYING CTEs and WITH on a data-modifying primary have landed
  * (../design/writable-cte.md, grammar.md §48): a cte body, and the WITH primary, may be an INSERT/UPDATE/DELETE
  * (with its own optional RETURNING). Every sub-statement reads ONE pre-statement snapshot (they

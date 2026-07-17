@@ -816,8 +816,8 @@ pub enum QueryExpr {
     /// A nested `WITH` clause prefixing a query expression, in a subquery / derived-table / CTE-body
     /// position (spec/design/cte.md §7) — as opposed to the top-level [`WithQuery`] (which may prefix
     /// a data-modifying primary). The CTEs are visible only within this node's own body (and to each
-    /// other, forward-only); the enclosing statement's CTE bindings are NOT inherited — a documented
-    /// narrowing (cte.md §7). Boxed to keep the recursive `QueryExpr` type sized.
+    /// other, forward-only), layered over the enclosing statement's visible CTE bindings (cte.md
+    /// §7). Boxed to keep the recursive `QueryExpr` type sized.
     With(Box<WithExpr>),
 }
 

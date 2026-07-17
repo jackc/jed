@@ -41,9 +41,10 @@ SELECT x, y FROM c CROSS JOIN a
 
 **Nested `WITH` is supported (§7).** Besides the statement top level, a `WITH` may prefix a
 *parenthesized* query expression — a subquery, a derived table, or another CTE's body
-(`spec/design/cte.md` §7). Its CTEs are visible only inside that nested query; the enclosing
-statement's CTE bindings are **not** inherited (a documented narrowing — §7). CTE *references*
-inside nested subqueries (without a nested `WITH`) are fully supported (§2).
+(`spec/design/cte.md` §7). Its CTEs are visible only inside that nested query, which also inherits
+the enclosing statement's CTE bindings. An inner binding shadows an inherited binding of the same
+name from its declaration onward (§7). CTE *references* inside nested subqueries (without a nested
+`WITH`) are fully supported (§2).
 
 ## 2. Scope machinery
 
@@ -112,7 +113,6 @@ The deterministic cost formula for both paths is specified in [cost.md](cost.md)
 | MORE column-rename aliases than body columns | `42P10` | `invalid_column_reference`; fewer is a legal partial rename. |
 | Outer column referenced inside a body | `42703` / `42P01` | A body is not correlated (§2). |
 | Data-modifying CTE in a nested `WITH` | `0A000` | DML-`WITH` is top-level only (§7), matching PostgreSQL. |
-| Enclosing CTE referenced inside a nested `WITH` | `42P01` | The nested scope does not inherit enclosing CTEs (§7) — a documented divergence from PG. |
 
 ## 5. Cross-core determinism
 
@@ -150,8 +150,7 @@ purely a query-plan construct — no `format_version` bump).
 - ~~**`WITH` on `UPDATE`/`DELETE`**~~ — ✅ **landed** with the above ([writable-cte.md](writable-cte.md)):
   the `WITH`-prefixed primary may be an `INSERT`/`UPDATE`/`DELETE`.
 - ~~**Nested `WITH`** inside a subquery / CTE body~~ — ✅ **landed** (§7): a `WITH` may now prefix any
-  parenthesized query expression. The one residual narrowing is enclosing-CTE *visibility* (an inner
-  `WITH` does not inherit the enclosing statement's CTE bindings — §7), a documented follow-on.
+  parenthesized query expression, including full enclosing-CTE visibility with inner-name shadowing.
 
 **Landed since:**
 
@@ -177,24 +176,29 @@ list). It is reached at every position that already admits a parenthesized subqu
 (`FROM ( … )`), a scalar subquery, `IN`/`EXISTS`/`ANY`/`ALL ( … )`, a set-operation operand, and a
 CTE body.
 
-**Own scope, no inheritance (the one narrowing).** A nested `WITH` establishes its **own** CTE scope.
-Inside it, the nested CTEs are visible — to each other (forward-only) and to the inner main query —
-with the full §2/§3 machinery (duplicate name `42712`, self/forward reference `42P01`, the
-column-rename list, `[NOT] MATERIALIZED`, and `WITH RECURSIVE`). But the **enclosing** statement's CTE
-bindings are **not** inherited: an enclosing CTE name referenced inside a nested `WITH` resolves to a
-base table (or `42P01` if none), *not* the enclosing CTE. PostgreSQL inherits them, so this is a
-**documented divergence** (per-core unit tests pin it); full enclosing-scope visibility is a scoped
-follow-on. Outside the nested `WITH`, the enclosing CTEs are intact — only the inner query loses
-visibility of them.
+**Inherited scope + inner shadowing.** A nested `WITH` establishes a child CTE scope. It inherits the
+enclosing statement's visible bindings, then adds its own CTEs with the usual forward-only rule.
+Consequently, an enclosing CTE is visible in every inner CTE body and in the inner main query until
+an inner CTE of the same name is declared. That inner declaration shadows the inherited binding for
+later inner CTEs and the main query, but not for its **own** non-recursive body: because a binding is
+not in scope for itself (§2), the body still resolves the inherited binding (or a base table if none
+exists). This matches PostgreSQL. The nested list otherwise retains the full §2/§3 machinery
+(duplicate name `42712` within that list, self/forward reference `42P01`, the column-rename list,
+`[NOT] MATERIALIZED`, and `WITH RECURSIVE`). The child bindings remain invisible outside the nested
+query.
 
 **Planning & execution.** A nested `WITH` plans to a `QueryPlan::With { bindings, modes, body }`: the
-nested CTE bindings (planned against each other only, via the same `plan_cte_bindings`), their
-inline/materialize modes ([cost.md](cost.md) §3), and the inner body plan. At execution the node
-materializes its CTEs **once**, builds a fresh CTE context over them, and runs the body — the same
-materialize-then-execute shape as the top-level `run_with`, so the deterministic cost is identical
-across cores. A nested `WITH` adds **no** correlation frame: its body sees the same outer-row
-environment as the node's position (so a `LATERAL` derived-table body whose `WITH` wraps it still
-correlates to its left siblings), while the CTE bodies stay independent (`parent = None`).
+nested CTE bindings planned against the inherited bindings plus their earlier inner siblings, their
+inline/materialize modes ([cost.md](cost.md) §3), and the inner body plan. The plan records the exact
+inherited prefix visible at that position, because a nested `WITH` inside an earlier CTE body must not
+accidentally see later bindings merely because the enclosing statement's full runtime context has
+since been assembled. At execution the node materializes its CTEs **once**, layers their context over
+that inherited prefix, and runs the body — the same materialize-then-execute shape as the top-level
+`run_with`, so the deterministic cost is identical across cores. References from the child scope bump
+the inherited binding's ordinary static reference count, preserving the §3 inline/materialize rule.
+A nested `WITH` adds **no** correlation frame: its body sees the same outer-row environment as the
+node's position (so a `LATERAL` derived-table body whose `WITH` wraps it still correlates to its left
+siblings), while the CTE bodies stay independent (`parent = None`).
 
 **Data-modifying CTEs stay top-level only.** A nested `WITH` whose CTE body is an
 `INSERT`/`UPDATE`/`DELETE` is rejected `0A000` (`is only supported at the top level`) — this

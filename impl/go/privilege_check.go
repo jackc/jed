@@ -626,10 +626,11 @@ func collectQueryPrivs(qe *queryExpr, req *privReq, locals map[string]bool) {
 	} else if qe.SetOp != nil {
 		collectSetopPrivs(qe.SetOp, req, locals)
 	} else if qe.With != nil {
-		// A nested WITH establishes its own CTE scope (spec/design/cte.md §7): the enclosing locals
-		// are NOT inherited (an enclosing CTE name resolves to a base table inside, so it is
-		// privilege-checked), and the nested CTE names shadow base tables only within this node.
+		// A nested WITH inherits the enclosing CTE names, then adds its own forward-visible names.
 		scope := map[string]bool{}
+		for name := range locals {
+			scope[name] = true
+		}
 		for i := range qe.With.Ctes {
 			collectCteBodyPrivs(&qe.With.Ctes[i].Body, req, scope)
 			scope[strings.ToLower(qe.With.Ctes[i].Name)] = true

@@ -387,7 +387,7 @@ type explainWithPlan struct {
 
 func (db *engine) planExplainWithDml(wq *withQuery) (*explainWithPlan, error) {
 	ptypes := &paramTypes{}
-	bindings, err := db.planCteBindings(wq.Ctes, wq.Recursive, ptypes)
+	bindings, err := db.planCteBindings(wq.Ctes, wq.Recursive, nil, ptypes)
 	if err != nil {
 		return nil, err
 	}
@@ -626,7 +626,7 @@ func (db *engine) planExplainInner(inner *statement) (queryPlan, error) {
 		if body == nil {
 			return queryPlan{}, newError(FeatureNotSupported, "writable WITH requires the DML EXPLAIN renderer")
 		}
-		wp, err := db.planWithExpr(&withExpr{Ctes: inner.With.Ctes, Recursive: inner.With.Recursive, Body: body}, nil, ptypes)
+		wp, err := db.planWithExpr(&withExpr{Ctes: inner.With.Ctes, Recursive: inner.With.Recursive, Body: body}, nil, nil, ptypes)
 		if err != nil {
 			return queryPlan{}, err
 		}

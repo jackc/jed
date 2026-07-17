@@ -2,7 +2,7 @@
 # functions, set operations, derived tables / subqueries, CTEs, VALUES, and set-returning functions.
 # The plan tree is rendered in pre-order (depth-numbered), so the rows read top-down as the executor's
 # pipeline reads bottom-up. Deterministic and cross-core-identical, asserted with `nosort`.
-# requires: ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.secondary_index, dml.insert, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.point_lookup, query.composite_pk_pushdown, query.interval_set, query.index_range, query.bounded_limit_streaming, query.limit, query.order_by, query.order_by_ordinal, query.order_by_index_scan, query.order_by_join_scan, query.order_by_join_inl, query.aggregates, query.group_by, query.having, query.join_inner, query.cross_join, query.join_pushdown, query.index_nested_loop, query.hash_join, query.union, query.derived_table, query.subquery_scalar, query.cte, query.window, query.window_aggregate, query.set_returning, query.values, query.explain, cast.explicit, types.i16, types.i32, types.text
+# requires: ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.secondary_index, dml.insert, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.point_lookup, query.composite_pk_pushdown, query.interval_set, query.index_range, query.bounded_limit_streaming, query.limit, query.order_by, query.order_by_ordinal, query.order_by_index_scan, query.order_by_join_scan, query.order_by_join_inl, query.aggregates, query.group_by, query.having, query.join_inner, query.cross_join, query.join_pushdown, query.index_nested_loop, query.hash_join, query.union, query.derived_table, query.subquery_scalar, query.cte, query.cte_nested, query.window, query.window_aggregate, query.set_returning, query.values, query.explain, cast.explicit, types.i16, types.i32, types.text
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, v i32, s text)
@@ -231,6 +231,53 @@ CTE Scan c
 -
 1
 4
+
+# A nested WITH estimate retains the enclosing CTE body, so its inherited scan has the same
+# deterministic cardinality/cost facts as a top-level CTE scan.
+query ITTII nosort
+EXPLAIN WITH e AS (SELECT v FROM t)
+SELECT * FROM (WITH inner_c AS (SELECT v FROM e) SELECT v FROM inner_c) s
+----
+0
+WITH
+ctes=1
+1
+6
+1
+CTE e
+inlined
+1
+0
+2
+Scan t
+Full scan; touched=1
+1
+3
+1
+Subquery s
+-
+1
+6
+2
+WITH
+ctes=1
+1
+5
+3
+CTE inner_c
+inlined
+1
+0
+4
+CTE Scan e
+-
+1
+4
+3
+CTE Scan inner_c
+-
+1
+5
 
 # A window function adds a Window node carrying the number of window functions.
 query ITTII nosort

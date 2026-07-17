@@ -2291,7 +2291,7 @@ impl Engine {
         table: &str,
         returning: &ReturningClause,
         base_is_old: bool,
-        ctes: &[CteBinding],
+        ctes: &[&CteBinding],
         ptypes: &mut ParamTypes,
     ) -> Result<(Vec<RExpr>, Vec<String>, Vec<String>)> {
         let tdef = self.table(table).expect("INSERT target resolved above");

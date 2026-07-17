@@ -163,7 +163,7 @@ completion, §3); only its *count* is invisible.
 | Data-modifying statement targets a relation that is not a base table (e.g. a CTE name with no base table) | `42P01` | The target resolves against the catalog only (§1). |
 | Two data-modifying parts insert the same key | `23505` | A staged write colliding with an earlier staged write of the same statement (§7). Matches PostgreSQL. |
 | `WITH RECURSIVE` with a data-modifying CTE | — | **Allowed.** `RECURSIVE` only *enables* self-reference ([recursive-cte.md](recursive-cte.md) §1); a non-self-referencing data-modifying CTE in a `RECURSIVE` list is an ordinary data-modifying CTE (a data-modifying body is never the `anchor UNION recursive` shape, so it is never analyzed as recursive). PostgreSQL agrees. |
-| Nested `WITH` (in a subquery / CTE body) | `42601` | The top-level-only narrowing ([cte.md](cte.md) §1), unchanged. |
+| Data-modifying CTE in a nested `WITH` | `0A000` | Data-modifying CTEs remain statement-top-level only; a query-only nested `WITH` is supported with inherited enclosing CTE visibility ([cte.md](cte.md) §7). |
 
 Every other error is inherited unchanged: a duplicate CTE name is `42712`; a self/forward reference
 is `42P01`; a too-long rename list is `42P10`; the data-modifying body's own resolution/validation
@@ -237,7 +237,6 @@ change — a CTE is a query-plan construct.
 
 **Deferred (unchanged from [cte.md](cte.md) §6 / [TODO.md](../../TODO.md)):**
 
-- **Nested `WITH`** inside a subquery or CTE body (top-level-only narrowing, `42601`).
 - The recursive-CTE deferrals ([recursive-cte.md](recursive-cte.md) §8) — `SEARCH`/`CYCLE`, a
   set-op / `FROM`-subquery recursive term, mutual recursion.
 - `ON CONFLICT` referential-action follow-ons are inherited from their own slices unchanged; a

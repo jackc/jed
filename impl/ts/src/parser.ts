@@ -1921,9 +1921,9 @@ class Parser {
   // parseWithStatement parses `query_statement ::= with_clause? ( query_expr | insert | update |
   // delete )` — a top-level statement prefixed by a WITH clause defining common table expressions
   // (spec/design/cte.md, spec/design/writable-cte.md). WITH RECURSIVE (spec/design/recursive-cte.md)
-  // sets the `recursive` flag and lets a CTE reference itself; the CTE bodies and the main body are
-  // WITH-less cte_bodies (the top-level-only narrowing — a nested WITH surfaces as 42601 because a
-  // body must begin with SELECT/INSERT/UPDATE/DELETE).
+  // sets the `recursive` flag and lets a CTE reference itself. Parenthesized CTE query bodies are
+  // subquery_exprs and may carry a nested WITH (cte.md §7); the top-level primary is unprefixed, so
+  // a bare second WITH remains invalid.
   private parseWithStatement(): Statement {
     this.expectKeyword("with");
     // `WITH RECURSIVE …` enables self-reference (recursive-cte.md). RECURSIVE in this position is
@@ -1945,7 +1945,7 @@ class Parser {
       }
     }
     // The primary may be a data-modifying statement (spec/design/writable-cte.md): a leading
-    // INSERT/UPDATE/DELETE keyword selects it, otherwise a WITH-less query_expr.
+    // INSERT/UPDATE/DELETE keyword selects it, otherwise an unprefixed query_expr.
     const body = this.parseCteBody(false);
     return { kind: "with", ctes, body, recursive };
   }
@@ -1953,8 +1953,8 @@ class Parser {
   // parseCteBody parses a `cte_body` (spec/design/writable-cte.md): a data-modifying
   // INSERT/UPDATE/DELETE when one leads, otherwise a query. `parenthesized` is true for a CTE body
   // inside `( … )` (the closing `)` is the caller's), false for the WITH primary (it runs to end of
-  // statement). A query body parsed here is the WITH-less query_expr (the top-level-only nested-WITH
-  // narrowing — a nested `WITH` surfaces as a leftover 42601).
+  // statement). A parenthesized query body uses subquery_expr and may carry a nested WITH; the
+  // top-level primary uses an unprefixed query_expr.
   private parseCteBody(parenthesized: boolean): CteBody {
     const kw = this.peekKeyword();
     if (kw === "insert" || kw === "update" || kw === "delete") {

@@ -185,8 +185,8 @@ func (db *engine) planSelect(sel *selectStmt, parent *scope, ctes []*cteBinding,
 			// binding's reference count (the inline-vs-materialize decision — cost.md §3).
 			lname := strings.ToLower(tref.Name)
 			ci := -1
-			for j, b := range ctes {
-				if b.name == lname {
+			for j := len(ctes) - 1; j >= 0; j-- {
+				if ctes[j].name == lname {
 					ci = j
 					break
 				}

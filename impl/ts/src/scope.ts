@@ -665,10 +665,19 @@ export function countReturningRefs(returning: ReturningClause | null, name: stri
 // relations at every nesting level plus expression sublinks).
 export function countSelfRefsQuery(qe: QueryExpr, name: string): number {
   if (qe.kind === "select") return countSelfRefsSelect(qe, name);
-  // A nested WITH establishes its own CTE scope (spec/design/cte.md §7): an enclosing CTE name is
-  // NOT visible inside it (a reference there resolves to a base table / the nested CTE, never the
-  // enclosing one), so it contributes no self-reference to the enclosing name.
-  if (qe.kind === "withExpr") return 0;
+  if (qe.kind === "withExpr") {
+    // A nested WITH inherits this binding until an inner same-named CTE is declared. That inner
+    // binding shadows it for later bodies and the main query, but its own non-recursive body still
+    // sees the inherited binding (cte.md §7).
+    let n = 0;
+    let shadowed = false;
+    for (const cte of qe.ctes) {
+      if (!shadowed) n += countCteRefsDml(cte.body, name);
+      if (cte.name.toLowerCase() === name) shadowed = true;
+    }
+    if (!shadowed) n += countSelfRefsQuery(qe.body, name);
+    return n;
+  }
   return countSelfRefsQuery(qe.lhs, name) + countSelfRefsQuery(qe.rhs, name);
 }
 
@@ -1561,10 +1570,8 @@ export function collectDeletePrivs(del: Delete, req: PrivReq, locals: Set<string
 export function collectQueryPrivs(qe: QueryExpr, req: PrivReq, locals: Set<string>): void {
   if (qe.kind === "setOp") collectSetOpPrivs(qe, req, locals);
   else if (qe.kind === "withExpr") {
-    // A nested WITH establishes its own CTE scope (spec/design/cte.md §7): the enclosing locals are
-    // NOT inherited (an enclosing CTE name resolves to a base table inside, so it is
-    // privilege-checked), and the nested CTE names shadow base tables only within this node.
-    const scope = new Set<string>();
+    // A nested WITH inherits the enclosing CTE names, then adds its own forward-visible names.
+    const scope = new Set(locals);
     for (const cte of qe.ctes) {
       collectCteBodyPrivs(cte.body, req, scope);
       scope.add(cte.name.toLowerCase());

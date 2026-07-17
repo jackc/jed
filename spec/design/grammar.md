@@ -2333,7 +2333,7 @@ by the body's own context (§26); a `$N` with no type context errors `42P18` as 
 | Ambiguous bare reference to a duplicated body output column | `42702` | Within one relation or across two (cte.md §2). |
 | Outer / sibling column referenced inside the body | `42703` / `42P01` | The body is not correlated / not LATERAL. |
 | Leading `(` in FROM not followed by `SELECT`, `VALUES`, or `WITH` | `42601` | No parenthesized-join FROM this slice — a **documented divergence** (PG parses `(a JOIN b …)`; the override ledger records it). |
-| Nested `WITH` inside the body | ✅ | **Landed** (cte.md §7): a derived-table body may be a `WITH`-prefixed query, establishing its own CTE scope. |
+| Nested `WITH` inside the body | ✅ | **Landed** (cte.md §7): a derived-table body may be a `WITH`-prefixed query, establishing a child scope over the enclosing visible CTEs. |
 | VALUES-body rows of differing arity | `42601` | `VALUES lists must all be the same length` (the §12 rule). |
 | VALUES-body columns whose row types do not unify | `42804` | `datatype_mismatch`, the set-operation unification rule (§25). |
 | Column reference / aggregate / no-context `$N` in a VALUES-body value | `42703` / `42803` / `42P18` | The body is a non-`LATERAL` constant relation (no FROM/outer row). |
@@ -2349,7 +2349,7 @@ by the body's own context (§26); a `$N` with no type context errors `42P18` as 
   starting a `SELECT` is `42601`.
 - **A `WITH` *inside* the body** (nested `WITH`) — ✅ **landed** (cte.md §7): a derived-table body,
   like any parenthesized subquery, may be a `WITH`-prefixed query (`subquery_expr`), establishing its
-  own CTE scope (the enclosing statement's CTEs are not inherited — a documented divergence). *(The
+  own child CTE scope over the enclosing statement's visible bindings. *(The
   `VALUES` body itself has **landed** — see "The VALUES body" above; its own residual narrowings are a
   trailing `ORDER BY`/`LIMIT` on the body and general expressions in the `INSERT … VALUES` slot.)*
 - **Top-level `UPDATE`/`DELETE` FROM** stays single-table (§15) — a derived table reaches them only

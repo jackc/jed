@@ -731,7 +731,7 @@ func (db *engine) deferredColumnMeta(stmt statement) ([]string, []string, error)
 		// The planning prefix of runWith (cte.md): plan the CTE bindings, then the body with them
 		// visible. The body's columns are the WITH's output columns.
 		var bindings []*cteBinding
-		bindings, err = db.planCteBindings(stmt.With.Ctes, stmt.With.Recursive, ptypes)
+		bindings, err = db.planCteBindings(stmt.With.Ctes, stmt.With.Recursive, nil, ptypes)
 		if err == nil {
 			bodyQ := stmt.With.Body.AsQuery() // pure-query WITH (DML excluded by stmtIsWrite)
 			plan, err = db.planQuery(*bodyQ, nil, bindings, ptypes)

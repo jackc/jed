@@ -267,7 +267,7 @@ impl Engine {
         r: &mut ExplainRender,
         inner: &Statement,
         depth: i64,
-        bindings: &[CteBinding],
+        bindings: &[&CteBinding],
     ) -> Result<()> {
         match inner {
             Statement::Insert(ins) => self.explain_insert(r, ins, depth, bindings),
@@ -293,9 +293,12 @@ impl Engine {
         wq: &WithQuery,
     ) -> Result<(Vec<CteBinding>, Vec<CteMode>, Option<QueryPlan>)> {
         let mut ptypes = ParamTypes::default();
-        let bindings = self.plan_cte_bindings(&wq.ctes, wq.recursive, &mut ptypes)?;
+        let bindings = self.plan_cte_bindings(&wq.ctes, wq.recursive, &[], &mut ptypes)?;
         let primary = match &wq.body {
-            CteBody::Query(query) => Some(self.plan_query(query, None, &bindings, &mut ptypes)?),
+            CteBody::Query(query) => {
+                let visible: Vec<&CteBinding> = bindings.iter().collect();
+                Some(self.plan_query(query, None, &visible, &mut ptypes)?)
+            }
             _ => None,
         };
         for cte in &wq.ctes {
@@ -336,13 +339,16 @@ impl Engine {
                 CteSource::Query(plan) => self.render_query_plan(r, plan, depth + 2)?,
                 CteSource::Dml(dm) => match &dm.stmt {
                     DmStmt::Insert(insert) => {
-                        self.explain_insert(r, insert, depth + 2, &bindings[..i])?
+                        let visible: Vec<&CteBinding> = bindings[..i].iter().collect();
+                        self.explain_insert(r, insert, depth + 2, &visible)?
                     }
                     DmStmt::Update(update) => {
-                        self.explain_update(r, update, depth + 2, &bindings[..i])?
+                        let visible: Vec<&CteBinding> = bindings[..i].iter().collect();
+                        self.explain_update(r, update, depth + 2, &visible)?
                     }
                     DmStmt::Delete(delete) => {
-                        self.explain_delete(r, delete, depth + 2, &bindings[..i])?
+                        let visible: Vec<&CteBinding> = bindings[..i].iter().collect();
+                        self.explain_delete(r, delete, depth + 2, &visible)?
                     }
                 },
             }
@@ -350,10 +356,11 @@ impl Engine {
         if let Some(primary) = primary {
             return self.render_query_plan(r, &primary, depth + 1);
         }
+        let visible: Vec<&CteBinding> = bindings.iter().collect();
         match &wq.body {
-            CteBody::Insert(insert) => self.explain_insert(r, insert, depth + 1, &bindings),
-            CteBody::Update(update) => self.explain_update(r, update, depth + 1, &bindings),
-            CteBody::Delete(delete) => self.explain_delete(r, delete, depth + 1, &bindings),
+            CteBody::Insert(insert) => self.explain_insert(r, insert, depth + 1, &visible),
+            CteBody::Update(update) => self.explain_update(r, update, depth + 1, &visible),
+            CteBody::Delete(delete) => self.explain_delete(r, delete, depth + 1, &visible),
             CteBody::Query(_) => unreachable!("a query primary was planned above"),
         }
     }
@@ -366,7 +373,7 @@ impl Engine {
         r: &mut ExplainRender,
         ins: &Insert,
         depth: i64,
-        bindings: &[CteBinding],
+        bindings: &[&CteBinding],
     ) -> Result<()> {
         if self.table(&ins.table).is_none() {
             return Err(EngineError::new(
@@ -397,7 +404,7 @@ impl Engine {
         r: &mut ExplainRender,
         upd: &Update,
         depth: i64,
-        bindings: &[CteBinding],
+        bindings: &[&CteBinding],
     ) -> Result<()> {
         let table = self.table(&upd.table).ok_or_else(|| {
             EngineError::new(
@@ -423,7 +430,7 @@ impl Engine {
         r: &mut ExplainRender,
         del: &Delete,
         depth: i64,
-        bindings: &[CteBinding],
+        bindings: &[&CteBinding],
     ) -> Result<()> {
         let table = self.table(&del.table).ok_or_else(|| {
             EngineError::new(
@@ -444,7 +451,7 @@ impl Engine {
         &self,
         table: &Table,
         where_: Option<&Expr>,
-        bindings: &[CteBinding],
+        bindings: &[&CteBinding],
     ) -> Result<Option<RExpr>> {
         match where_ {
             None => Ok(None),
@@ -493,7 +500,7 @@ impl Engine {
         table: &Table,
         del: &Delete,
         filter: Option<&RExpr>,
-        bindings: &[CteBinding],
+        bindings: &[&CteBinding],
     ) -> Result<Vec<bool>> {
         let mut mask = vec![false; table.columns.len()];
         if let Some(filter) = filter {
@@ -523,7 +530,7 @@ impl Engine {
         table: &Table,
         upd: &Update,
         filter: Option<&RExpr>,
-        bindings: &[CteBinding],
+        bindings: &[&CteBinding],
     ) -> Result<Vec<bool>> {
         let mut mask = vec![false; table.columns.len()];
         if let Some(filter) = filter {
@@ -631,7 +638,7 @@ impl Engine {
                     recursive: wq.recursive,
                     body: Box::new(body.clone()),
                 };
-                let wp = self.plan_with_expr(&we, None, &mut ptypes)?;
+                let wp = self.plan_with_expr(&we, None, &[], &mut ptypes)?;
                 Ok(QueryPlan::With(Box::new(wp)))
             }
             _ => Err(EngineError::new(

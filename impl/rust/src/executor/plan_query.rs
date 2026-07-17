@@ -81,6 +81,7 @@ impl Engine {
         &self,
         ctes: &[Cte],
         recursive: bool,
+        inherited: &[&CteBinding],
         ptypes: &mut ParamTypes,
     ) -> Result<Vec<CteBinding>> {
         let mut bindings: Vec<CteBinding> = Vec::new();
@@ -108,7 +109,9 @@ impl Engine {
                         _ => unreachable!("analyze_recursive_cte ensures a UNION body"),
                     };
                     // Plan the anchor (self NOT in scope) — its column types fix the relation.
-                    let anchor_plan = self.plan_query(anchor, None, &bindings, ptypes)?;
+                    let visible: Vec<&CteBinding> =
+                        inherited.iter().copied().chain(bindings.iter()).collect();
+                    let anchor_plan = self.plan_query(anchor, None, &visible, ptypes)?;
                     let table = cte_synthetic_table(&lname, &anchor_plan, cte.columns.as_deref())?;
                     bindings.push(CteBinding {
                         name: lname,
@@ -120,7 +123,9 @@ impl Engine {
                     });
                     // Plan the recursive term with the self-binding now visible.
                     let i = bindings.len() - 1;
-                    let rhs_plan = self.plan_query(recursive_term, None, &bindings, ptypes)?;
+                    let visible: Vec<&CteBinding> =
+                        inherited.iter().copied().chain(bindings.iter()).collect();
+                    let rhs_plan = self.plan_query(recursive_term, None, &visible, ptypes)?;
                     let CteSource::Query(anchor_ref) = &bindings[i].source else {
                         unreachable!("the anchor binding was just pushed as a query source")
                     };
@@ -132,7 +137,9 @@ impl Engine {
                 }
                 CteShape::NonRecursive => match &cte.body {
                     CteBody::Query(q) => {
-                        let plan = self.plan_query(q, None, &bindings, ptypes)?;
+                        let visible: Vec<&CteBinding> =
+                            inherited.iter().copied().chain(bindings.iter()).collect();
+                        let plan = self.plan_query(q, None, &visible, ptypes)?;
                         let table = cte_synthetic_table(&lname, &plan, cte.columns.as_deref())?;
                         bindings.push(CteBinding {
                             name: lname,
@@ -146,10 +153,12 @@ impl Engine {
                     dm_body => {
                         // A data-modifying CTE (writable-cte.md): resolve its RETURNING schema for the
                         // synthetic relation + capture the statement to run later.
+                        let visible: Vec<&CteBinding> =
+                            inherited.iter().copied().chain(bindings.iter()).collect();
                         let (table, dm) = self.plan_dm_cte(
                             &lname,
                             dm_body,
-                            &bindings,
+                            &visible,
                             cte.columns.as_deref(),
                             ptypes,
                         )?;
@@ -177,7 +186,7 @@ impl Engine {
         &self,
         lname: &str,
         body: &CteBody,
-        bindings: &[CteBinding],
+        bindings: &[&CteBinding],
         rename: Option<&[String]>,
         ptypes: &mut ParamTypes,
     ) -> Result<(Box<Table>, DmCte)> {
@@ -250,20 +259,19 @@ impl Engine {
     /// parts.
     pub(crate) fn run_with(&self, wq: WithQuery, params: &[Value]) -> Result<SelectResult> {
         let mut ptypes = ParamTypes::default();
-        let bindings = self.plan_cte_bindings(&wq.ctes, wq.recursive, &mut ptypes)?;
+        let bindings = self.plan_cte_bindings(&wq.ctes, wq.recursive, &[], &mut ptypes)?;
         // (2) Plan the main body with all bindings visible (the pure-query path always has a query
         //     primary — a data-modifying primary routes to execute_with_dml).
         let body_q = wq.body.as_query().expect("run_with is the pure-query path");
-        let mut plan = self.plan_query(body_q, None, &bindings, &mut ptypes)?;
+        let visible: Vec<&CteBinding> = bindings.iter().collect();
+        let mut plan = self.plan_query(body_q, None, &visible, &mut ptypes)?;
         let bound = bind_params(params, &ptypes.finalize()?)?;
         let modes = cte_modes(&bindings);
-        let (buffers, total_cost) = self.materialize_ctes(&bindings, &modes, &bound)?;
+        let (buffers, total_cost) =
+            self.materialize_ctes(&bindings, &modes, &bound, CteCtx::empty())?;
         // (5) Fold + execute the main body against the full CTE context.
-        let ctx = CteCtx {
-            modes: &modes,
-            bindings: &bindings,
-            buffers: &buffers,
-        };
+        let view = CteCtxView::extend(CteCtx::empty(), &modes, &bindings, &buffers);
+        let ctx = view.ctx();
         let mut subquery_cost: i64 = 0;
         self.fold_uncorrelated_in_plan(&mut plan, &bound, ctx, &mut subquery_cost)?;
         let mut r = self.exec_query_plan(&plan, &[], &bound, ctx)?;
@@ -284,6 +292,7 @@ impl Engine {
         bindings: &[CteBinding],
         modes: &[CteMode],
         bound: &[Value],
+        inherited: CteCtx,
     ) -> Result<(Vec<Vec<Row>>, i64)> {
         let mut total_cost: i64 = 0;
         let mut buffers: Vec<Vec<Row>> = Vec::with_capacity(bindings.len());
@@ -307,6 +316,7 @@ impl Engine {
                     bindings,
                     &buffers,
                     bound,
+                    inherited,
                     &mut total_cost,
                 )?
             } else {
@@ -314,11 +324,9 @@ impl Engine {
                     // A data-modifying CTE's buffer is filled by the orchestrator, not here.
                     CteSource::Dml(_) => Vec::new(),
                     CteSource::Query(plan) if modes[i] == CteMode::Materialize => {
-                        let ctx = CteCtx {
-                            modes: &modes[..i],
-                            bindings: &bindings[..i],
-                            buffers: &buffers,
-                        };
+                        let view =
+                            CteCtxView::extend(inherited, &modes[..i], &bindings[..i], &buffers);
+                        let ctx = view.ctx();
                         let r = self.exec_query_plan(plan, &[], bound, ctx)?;
                         total_cost += r.cost;
                         r.rows
@@ -349,6 +357,7 @@ impl Engine {
         bindings: &[CteBinding],
         prior_buffers: &[Vec<Row>],
         params: &[Value],
+        inherited: CteCtx,
         total_cost: &mut i64,
     ) -> Result<Vec<Row>> {
         let CteSource::Query(anchor_plan) = &bindings[ci].source else {
@@ -369,11 +378,8 @@ impl Engine {
 
         // Evaluate the anchor: its rows seed both the result and the first working table.
         let ar = {
-            let ctx = CteCtx {
-                modes: &modes[..ci],
-                bindings: &bindings[..ci],
-                buffers: prior_buffers,
-            };
+            let view = CteCtxView::extend(inherited, &modes[..ci], &bindings[..ci], prior_buffers);
+            let ctx = view.ctx();
             self.exec_query_plan(anchor_plan, &[], params, ctx)?
         };
         *total_cost += ar.cost;
@@ -400,11 +406,9 @@ impl Engine {
         while !working.is_empty() {
             rhs_buffers[ci] = std::mem::take(&mut working);
             let rr = {
-                let ctx = CteCtx {
-                    modes: &modes[..=ci],
-                    bindings: &bindings[..=ci],
-                    buffers: &rhs_buffers,
-                };
+                let view =
+                    CteCtxView::extend(inherited, &modes[..=ci], &bindings[..=ci], &rhs_buffers);
+                let ctx = view.ctx();
                 self.exec_query_plan(&rt.plan, &[], params, ctx)?
             };
             *total_cost += rr.cost;
@@ -449,13 +453,16 @@ impl Engine {
         } = wq;
         let mut ptypes = ParamTypes::default();
         // (1) Plan every CTE binding (query plans + data-modifying RETURNING schemas).
-        let bindings = self.plan_cte_bindings(&ctes, recursive, &mut ptypes)?;
+        let bindings = self.plan_cte_bindings(&ctes, recursive, &[], &mut ptypes)?;
         // (2) Plan a query primary now (to bump refs + surface resolution errors, incl. a 0A000 FROM
         //     reference to a no-RETURNING data-modifying CTE). A data-modifying primary is resolved
         //     and run later (it sees the bindings via the threaded context); its references are
         //     static-counted in (2b).
         let mut primary_plan = match &body {
-            CteBody::Query(q) => Some(self.plan_query(q, None, &bindings, &mut ptypes)?),
+            CteBody::Query(q) => {
+                let visible: Vec<&CteBinding> = bindings.iter().collect();
+                Some(self.plan_query(q, None, &visible, &mut ptypes)?)
+            }
             _ => None,
         };
         // (2b) Add the references each NON-planned data-modifying part (a data-modifying CTE body, or
@@ -503,23 +510,20 @@ impl Engine {
                     &bindings,
                     &buffers,
                     &bound,
+                    CteCtx::empty(),
                     &mut total_cost,
                 )?
             } else if matches!(bindings[i].source, CteSource::Dml(_)) {
-                let ctx = CteCtx {
-                    modes: &modes[..i],
-                    bindings: &bindings[..i],
-                    buffers: &buffers,
-                };
+                let view =
+                    CteCtxView::extend(CteCtx::empty(), &modes[..i], &bindings[..i], &buffers);
+                let ctx = view.ctx();
                 let (rows, cost) = self.exec_dm_cte(i, &bindings, &bound, ctx)?;
                 total_cost += cost;
                 rows
             } else if modes[i] == CteMode::Materialize {
-                let ctx = CteCtx {
-                    modes: &modes[..i],
-                    bindings: &bindings[..i],
-                    buffers: &buffers,
-                };
+                let view =
+                    CteCtxView::extend(CteCtx::empty(), &modes[..i], &bindings[..i], &buffers);
+                let ctx = view.ctx();
                 let CteSource::Query(plan) = &bindings[i].source else {
                     unreachable!("the data-modifying arm was handled above")
                 };
@@ -547,11 +551,8 @@ impl Engine {
                 let mut plan = primary_plan
                     .take()
                     .expect("a query primary was planned in (2)");
-                let ctx = CteCtx {
-                    modes: &modes,
-                    bindings: &bindings,
-                    buffers: &buffers,
-                };
+                let view = CteCtxView::extend(CteCtx::empty(), &modes, &bindings, &buffers);
+                let ctx = view.ctx();
                 let mut subquery_cost: i64 = 0;
                 self.fold_uncorrelated_in_plan(&mut plan, &bound, ctx, &mut subquery_cost)?;
                 let r = self.exec_query_plan(&plan, &[], &bound, ctx)?;
@@ -563,27 +564,18 @@ impl Engine {
                 }
             }
             CteBody::Insert(ins) => {
-                let ctx = CteCtx {
-                    modes: &modes,
-                    bindings: &bindings,
-                    buffers: &buffers,
-                };
+                let view = CteCtxView::extend(CteCtx::empty(), &modes, &bindings, &buffers);
+                let ctx = view.ctx();
                 self.execute_insert(*ins, params, ctx)?
             }
             CteBody::Update(upd) => {
-                let ctx = CteCtx {
-                    modes: &modes,
-                    bindings: &bindings,
-                    buffers: &buffers,
-                };
+                let view = CteCtxView::extend(CteCtx::empty(), &modes, &bindings, &buffers);
+                let ctx = view.ctx();
                 self.execute_update(*upd, params, ctx)?
             }
             CteBody::Delete(del) => {
-                let ctx = CteCtx {
-                    modes: &modes,
-                    bindings: &bindings,
-                    buffers: &buffers,
-                };
+                let view = CteCtxView::extend(CteCtx::empty(), &modes, &bindings, &buffers);
+                let ctx = view.ctx();
                 self.execute_delete(*del, params, ctx)?
             }
         };
@@ -655,7 +647,7 @@ impl Engine {
         &'a self,
         qe: &QueryExpr,
         parent: Option<&Scope<'a>>,
-        ctes: &'a [CteBinding],
+        ctes: &'a [&'a CteBinding],
         ptypes: &mut ParamTypes,
     ) -> Result<QueryPlan> {
         match qe {
@@ -666,23 +658,22 @@ impl Engine {
                 self.plan_set_op(so, parent, ctes, ptypes)?,
             ))),
             QueryExpr::With(we) => Ok(QueryPlan::With(Box::new(
-                self.plan_with_expr(we, parent, ptypes)?,
+                self.plan_with_expr(we, parent, ctes, ptypes)?,
             ))),
         }
     }
 
-    /// Plan a nested `WITH … query_expr` (spec/design/cte.md §7) into a `WithPlan`. The nested CTEs
-    /// establish their OWN scope: the bodies and the inner main query see ONLY these CTEs (and the
-    /// catalog) — the enclosing statement's CTE bindings are NOT inherited (a documented narrowing,
-    /// cte.md §7), so `plan_cte_bindings` and the body are planned without the outer `ctes`. The
+    /// Plan a nested `WITH … query_expr` (spec/design/cte.md §7) into a `WithPlan`. Its CTEs inherit
+    /// the enclosing bindings and shadow same-named bindings from their declaration onward. The
     /// inner main query keeps the enclosing `parent` (so a `LATERAL` derived-table body still
-    /// correlates to its left siblings), while the CTE bodies stay independent (`parent = None`,
-    /// inside `plan_cte_bindings`). A data-modifying CTE here is rejected `0A000` — PostgreSQL
+    /// correlates to its left siblings), while CTE bodies stay independent (`parent = None`). A
+    /// data-modifying CTE here is rejected `0A000` — PostgreSQL
     /// restricts a DML-`WITH` to the statement top level.
     pub(crate) fn plan_with_expr<'a>(
         &'a self,
         we: &WithExpr,
         parent: Option<&Scope<'a>>,
+        ctes: &'a [&'a CteBinding],
         ptypes: &mut ParamTypes,
     ) -> Result<WithPlan> {
         if let Some(c) = we.ctes.iter().find(|c| c.body.is_data_modifying()) {
@@ -694,13 +685,15 @@ impl Engine {
                 ),
             ));
         }
-        let bindings = self.plan_cte_bindings(&we.ctes, we.recursive, ptypes)?;
-        let body = self.plan_query(&we.body, parent, &bindings, ptypes)?;
+        let bindings = self.plan_cte_bindings(&we.ctes, we.recursive, ctes, ptypes)?;
+        let visible: Vec<&CteBinding> = ctes.iter().copied().chain(bindings.iter()).collect();
+        let body = self.plan_query(&we.body, parent, &visible, ptypes)?;
         let modes = cte_modes(&bindings);
         Ok(WithPlan {
             bindings,
             modes,
             body,
+            inherited_len: ctes.len(),
         })
     }
 
@@ -720,7 +713,7 @@ impl Engine {
             QueryPlan::Select(sp) => self.exec_select_plan(sp, outer, params, ctes),
             QueryPlan::SetOp(sop) => self.exec_set_op_plan(sop, outer, params, ctes),
             QueryPlan::Values(vp) => self.exec_values_plan(vp, outer, params, ctes),
-            QueryPlan::With(wp) => self.exec_with_plan(wp, outer, params),
+            QueryPlan::With(wp) => self.exec_with_plan(wp, outer, params, ctes),
         };
         if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
             profile.end_frame();
@@ -747,10 +740,9 @@ impl Engine {
         result
     }
 
-    /// Execute a nested `WITH` plan (spec/design/cte.md §7): materialize its CTE bindings once (in
-    /// list order, charging their cost), build a FRESH CTE context over them (the nested CTEs
-    /// establish their own scope — the enclosing context is NOT chained in, the documented narrowing
-    /// §7), and run the inner body against it. The body still sees the `outer` row environment (so a
+    /// Execute a nested `WITH` plan (spec/design/cte.md §7): retain the exact inherited prefix
+    /// visible at plan time, materialize the local bindings once, layer them over that prefix, and
+    /// run the inner body. The body still sees the `outer` row environment (so a
     /// `LATERAL` nested-WITH derived-table body correlates to its left siblings). The materialization
     /// cost folds into the body's cost — the same shape as the top-level `run_with` (cte.md §3).
     pub(crate) fn exec_with_plan(
@@ -758,13 +750,13 @@ impl Engine {
         wp: &WithPlan,
         outer: &[&[Value]],
         params: &[Value],
+        ctes: CteCtx,
     ) -> Result<SelectResult> {
-        let (buffers, total_cost) = self.materialize_ctes(&wp.bindings, &wp.modes, params)?;
-        let ctx = CteCtx {
-            modes: &wp.modes,
-            bindings: &wp.bindings,
-            buffers: &buffers,
-        };
+        let inherited = ctes.prefix(wp.inherited_len);
+        let (buffers, total_cost) =
+            self.materialize_ctes(&wp.bindings, &wp.modes, params, inherited)?;
+        let view = CteCtxView::extend(inherited, &wp.modes, &wp.bindings, &buffers);
+        let ctx = view.ctx();
         let mut r = self.exec_query_plan(&wp.body, outer, params, ctx)?;
         r.cost += total_cost;
         if let Some(profile) = self.explain_actual.borrow_mut().as_mut() {
@@ -780,7 +772,7 @@ impl Engine {
         &'a self,
         so: &SetOp,
         parent: Option<&Scope<'a>>,
-        ctes: &'a [CteBinding],
+        ctes: &'a [&'a CteBinding],
         ptypes: &mut ParamTypes,
     ) -> Result<SetOpPlan> {
         let lhs = self.plan_query(&so.lhs, parent, ctes, ptypes)?;
@@ -854,7 +846,7 @@ impl Engine {
         &'a self,
         rows: &[Vec<Expr>],
         parent: Option<&Scope<'a>>,
-        ctes: &'a [CteBinding],
+        ctes: &'a [&'a CteBinding],
         ptypes: &mut ParamTypes,
     ) -> Result<ValuesPlan> {
         // The parser guarantees at least one row, each with at least one value.

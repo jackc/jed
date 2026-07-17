@@ -25,7 +25,7 @@ impl Engine {
         &'a self,
         sel: &Select,
         parent: Option<&Scope<'a>>,
-        ctes: &'a [CteBinding],
+        ctes: &'a [&'a CteBinding],
         ptypes: &mut ParamTypes,
     ) -> Result<SelectPlan> {
         // Build the FROM scope (spec/design/grammar.md §15/§44): resolve each table reference (42P01
@@ -231,7 +231,7 @@ impl Engine {
                 derived_meta.push(None);
                 derived_plans.push(None);
                 let lname = tref.name.to_ascii_lowercase();
-                src = match ctes.iter().position(|b| b.name == lname) {
+                src = match ctes.iter().rposition(|b| b.name == lname) {
                     Some(ci) => {
                         // A data-modifying CTE with no RETURNING produces no columns, so a FROM
                         // reference to it is 0A000 (writable-cte.md §5; PostgreSQL's

@@ -1118,9 +1118,9 @@ impl Engine {
                 }
                 Ok(())
             }
-            // A nested `WITH` body is not folded here against the enclosing `ctes` — its inner
-            // subqueries reference the nested CTEs (a different scope, materialized only when the
-            // node runs), so they are left to the evaluator, exactly like a derived table's body
+            // A nested `WITH` body is not folded here against only the enclosing `ctes` — its inner
+            // subqueries reference a child context (inherited prefix + local bindings) assembled
+            // only when the node runs, so they are left to the evaluator, like a derived table body
             // (spec/design/cte.md §7). The whole nested-WITH subquery is itself folded by the caller
             // if it is uncorrelated (executed once via `exec_with_plan`).
             QueryPlan::With(_) => Ok(()),

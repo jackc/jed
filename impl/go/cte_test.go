@@ -107,31 +107,3 @@ func TestCteRecursiveHintIsInert(t *testing.T) {
 		}
 	}
 }
-
-// TestNestedWithDoesNotInheritEnclosingCtes pins the nested-WITH narrowing (spec/design/cte.md §7): a
-// nested WITH establishes its OWN CTE scope and does NOT inherit the enclosing statement's CTE
-// bindings — a documented DIVERGENCE from PostgreSQL (which inherits them), so it cannot live in the
-// oracle corpus. Inside the nested WITH, an enclosing CTE name with no base table is 42P01; one that
-// shadows a base table reads the BASE TABLE (PG would read the CTE).
-func TestNestedWithDoesNotInheritEnclosingCtes(t *testing.T) {
-	t.Parallel()
-	// (a) No base table named e: the inner reference to the enclosing CTE e is unresolved -> 42P01.
-	db := cteT3(t)
-	_, err := queryOutcome(db, "WITH e AS (SELECT 1 AS v) SELECT * FROM (WITH ic AS (SELECT v FROM e) SELECT v FROM ic) s", nil)
-	if ee, ok := err.(*EngineError); !ok || ee.Code() != "42P01" {
-		t.Fatalf("enclosing CTE inside a nested WITH: want 42P01, got %v", err)
-	}
-
-	// (b) A base table e exists: inside the nested WITH the enclosing CTE e is invisible, so the
-	// reference resolves to the BASE TABLE (rows are the table's, not the CTE's). PG diverges.
-	db = dbWith(
-		t,
-		"CREATE TABLE e (v i32 PRIMARY KEY)",
-		"INSERT INTO e VALUES (7), (8)",
-	)
-	got := firstInts(queryRows(t, db,
-		"WITH e AS (SELECT 1 AS v) SELECT v FROM (WITH ic AS (SELECT v FROM e) SELECT v FROM ic) s ORDER BY v"))
-	if !eqInts(got, 7, 8) {
-		t.Fatalf("nested WITH reads the BASE TABLE e, not the enclosing CTE; got %v", got)
-	}
-}

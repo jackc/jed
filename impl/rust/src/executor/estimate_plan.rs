@@ -1019,11 +1019,35 @@ impl Engine {
         out
     }
 
-    fn estimate_with_plan(&self, plan: &WithPlan) -> EstimatedPlan {
-        let mut ctx = EstimateCteCtx {
-            modes: plan.modes.clone(),
-            bodies: Vec::with_capacity(plan.bindings.len()),
+    fn estimate_with_plan(
+        &self,
+        plan: &WithPlan,
+        inherited: Option<&EstimateCteCtx>,
+    ) -> EstimatedPlan {
+        let mut ctx = match inherited {
+            Some(inherited) => {
+                assert!(
+                    plan.inherited_len <= inherited.bodies.len(),
+                    "invalid inherited CTE estimate prefix"
+                );
+                EstimateCteCtx {
+                    modes: inherited.modes[..plan.inherited_len].to_vec(),
+                    bodies: inherited.bodies[..plan.inherited_len].to_vec(),
+                }
+            }
+            None => {
+                assert_eq!(
+                    plan.inherited_len, 0,
+                    "missing inherited CTE estimate context"
+                );
+                EstimateCteCtx {
+                    modes: Vec::new(),
+                    bodies: Vec::new(),
+                }
+            }
         };
+        ctx.modes.extend_from_slice(&plan.modes);
+        ctx.bodies.reserve(plan.bindings.len());
         let mut definition_nodes = Vec::new();
         let mut binding_contribution = PlanEstimate::empty(0);
         for (index, binding) in plan.bindings.iter().enumerate() {
@@ -1058,7 +1082,7 @@ impl Engine {
             QueryPlan::Select(select) => self.estimate_select_plan(select, ctx),
             QueryPlan::SetOp(set_op) => self.estimate_set_op_plan(set_op, ctx),
             QueryPlan::Values(values) => self.estimate_values_plan(values, ctx),
-            QueryPlan::With(with) => self.estimate_with_plan(with),
+            QueryPlan::With(with) => self.estimate_with_plan(with, ctx),
         }
     }
 
@@ -1117,6 +1141,7 @@ impl Engine {
         bindings: &[CteBinding],
         ctx: Option<&EstimateCteCtx>,
     ) -> Result<Vec<PlanEstimate>> {
+        let visible: Vec<&CteBinding> = bindings.iter().collect();
         let plan = match inner {
             Statement::Insert(insert) => {
                 if self
@@ -1134,7 +1159,7 @@ impl Engine {
                         let query = self.plan_query(
                             &QueryExpr::Select(select.clone()),
                             None,
-                            bindings,
+                            &visible,
                             &mut ptypes,
                         )?;
                         self.estimate_query_plan(&query, ctx)
@@ -1154,7 +1179,7 @@ impl Engine {
                             format!("table does not exist: {}", update.table),
                         )
                     })?;
-                let filter = self.explain_dml_filter(table, update.filter.as_ref(), bindings)?;
+                let filter = self.explain_dml_filter(table, update.filter.as_ref(), &visible)?;
                 let scan =
                     self.estimate_mutation_scan(table, update.db.as_deref(), filter.as_ref(), ctx);
                 EstimatedPlan::parent(scan.root.clone(), &[&scan])
@@ -1168,7 +1193,7 @@ impl Engine {
                             format!("table does not exist: {}", delete.table),
                         )
                     })?;
-                let filter = self.explain_dml_filter(table, delete.filter.as_ref(), bindings)?;
+                let filter = self.explain_dml_filter(table, delete.filter.as_ref(), &visible)?;
                 let scan =
                     self.estimate_mutation_scan(table, delete.db.as_deref(), filter.as_ref(), ctx);
                 EstimatedPlan::parent(scan.root.clone(), &[&scan])

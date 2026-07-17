@@ -1323,7 +1323,7 @@ fn build_prefix_scope<'s>(
     synthetic: &'s [Box<Table>],
     parent: Option<&'s Scope<'s>>,
     catalog: &'s Engine,
-    ctes: &'s [CteBinding],
+    ctes: &'s [&'s CteBinding],
 ) -> Scope<'s> {
     Scope {
         rels: finalized
@@ -1436,7 +1436,7 @@ pub(crate) struct Scope<'a> {
     /// The statement's CTE bindings visible here (spec/design/cte.md §2). Inherited DIRECTLY down
     /// into nested scopes (a subquery sees the same `ctes`), NOT via the `parent` chain — so CTE
     /// lookup never counts as a correlation level. Empty for every non-`WITH` statement.
-    ctes: &'a [CteBinding],
+    ctes: &'a [&'a CteBinding],
     /// `USING` / `NATURAL` merged columns (spec/design/grammar.md §15) — a bare reference to a merge
     /// name resolves to its `index` (checked before the per-relation search, so it is never the
     /// underlying copies' `42702` ambiguity). Empty for every scope except a SELECT whose FROM has a
@@ -2909,14 +2909,15 @@ pub(crate) enum QueryPlan {
     With(Box<WithPlan>),
 }
 
-/// A planned nested `WITH … query_expr` (spec/design/cte.md §7). `bindings` are the nested CTEs
-/// (planned against each other only — not the enclosing scope), `modes` their per-binding
-/// inline/materialize decision ([`cte_modes`]), and `body` the inner query that references them.
-/// At execution the bindings are materialized once and `body` runs against a fresh CTE context.
+/// A planned nested `WITH … query_expr` (spec/design/cte.md §7). `bindings` are the nested CTEs,
+/// `modes` their per-binding inline/materialize decision ([`cte_modes`]), and `body` the inner query.
+/// `inherited_len` pins the enclosing binding prefix visible at this exact plan position; execution
+/// layers the local bindings over that prefix.
 pub(crate) struct WithPlan {
     bindings: Vec<CteBinding>,
     modes: Vec<CteMode>,
     body: QueryPlan,
+    inherited_len: usize,
 }
 
 impl QueryPlan {
@@ -3139,10 +3140,25 @@ fn count_self_refs_query(qe: &QueryExpr, name: &str) -> usize {
         QueryExpr::SetOp(so) => {
             count_self_refs_query(&so.lhs, name) + count_self_refs_query(&so.rhs, name)
         }
-        // A nested `WITH` establishes its own CTE scope (spec/design/cte.md §7): an enclosing CTE
-        // name is NOT visible inside it (a reference there resolves to a base table / the nested
-        // CTE, never the enclosing one), so it contributes no self-reference to the enclosing name.
-        QueryExpr::With(_) => 0,
+        QueryExpr::With(we) => {
+            // A nested WITH inherits this binding until an inner same-named CTE is declared. That
+            // inner binding shadows it for later bodies and the main query, but its own
+            // non-recursive body still sees the inherited binding (cte.md §7).
+            let mut n = 0;
+            let mut shadowed = false;
+            for cte in &we.ctes {
+                if !shadowed {
+                    n += count_cte_refs_dml(&cte.body, name);
+                }
+                if cte.name.eq_ignore_ascii_case(name) {
+                    shadowed = true;
+                }
+            }
+            if !shadowed {
+                n += count_self_refs_query(&we.body, name);
+            }
+            n
+        }
     }
 }
 
@@ -3612,17 +3628,66 @@ pub(crate) enum CteMode {
 #[derive(Clone, Copy)]
 pub(crate) struct CteCtx<'a> {
     modes: &'a [CteMode],
-    bindings: &'a [CteBinding],
-    buffers: &'a [Vec<Row>],
+    bindings: &'a [&'a CteBinding],
+    buffers: &'a [&'a [Row]],
 }
 
-impl CteCtx<'_> {
+impl<'a> CteCtx<'a> {
     /// The empty context — no CTEs in scope (every non-`WITH` execution path).
     fn empty() -> CteCtx<'static> {
         CteCtx {
             modes: &[],
             bindings: &[],
             buffers: &[],
+        }
+    }
+
+    /// The exact enclosing prefix visible where a nested WITH was planned. A CTE body can execute
+    /// later against the statement's full context; truncation prevents later siblings leaking in.
+    fn prefix(self, len: usize) -> CteCtx<'a> {
+        assert!(len <= self.bindings.len(), "invalid inherited CTE prefix");
+        CteCtx {
+            modes: &self.modes[..len],
+            bindings: &self.bindings[..len],
+            buffers: &self.buffers[..len],
+        }
+    }
+}
+
+/// Owned slice headers for a flattened CTE execution context. Binding/buffer data stays borrowed;
+/// only the small reference/mode vectors are composed when entering a nested WITH or a CTE prefix.
+pub(crate) struct CteCtxView<'a> {
+    modes: Vec<CteMode>,
+    bindings: Vec<&'a CteBinding>,
+    buffers: Vec<&'a [Row]>,
+}
+
+impl<'a> CteCtxView<'a> {
+    fn extend(
+        inherited: CteCtx<'a>,
+        modes: &'a [CteMode],
+        bindings: &'a [CteBinding],
+        buffers: &'a [Vec<Row>],
+    ) -> CteCtxView<'a> {
+        let mut view = CteCtxView {
+            modes: Vec::with_capacity(inherited.modes.len() + modes.len()),
+            bindings: Vec::with_capacity(inherited.bindings.len() + bindings.len()),
+            buffers: Vec::with_capacity(inherited.buffers.len() + buffers.len()),
+        };
+        view.modes.extend_from_slice(inherited.modes);
+        view.modes.extend_from_slice(modes);
+        view.bindings.extend_from_slice(inherited.bindings);
+        view.bindings.extend(bindings.iter());
+        view.buffers.extend_from_slice(inherited.buffers);
+        view.buffers.extend(buffers.iter().map(Vec::as_slice));
+        view
+    }
+
+    fn ctx(&self) -> CteCtx<'_> {
+        CteCtx {
+            modes: &self.modes,
+            bindings: &self.bindings,
+            buffers: &self.buffers,
         }
     }
 }

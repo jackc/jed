@@ -22,7 +22,7 @@ impl Engine {
         alias: Option<&str>,
         column_defs: Option<&[TypeFieldDef]>,
         parent: Option<&Scope<'a>>,
-        ctes: &'a [CteBinding],
+        ctes: &'a [&'a CteBinding],
         ptypes: &mut ParamTypes,
     ) -> Result<(Box<Table>, Vec<RExpr>, SrfKind)> {
         // The args see only params/outer — never sibling FROM tables (non-LATERAL); CTE bindings
@@ -422,7 +422,7 @@ impl Engine {
         jt: &JsonTable,
         alias: Option<&str>,
         parent: Option<&Scope<'a>>,
-        ctes: &'a [CteBinding],
+        ctes: &'a [&'a CteBinding],
         ptypes: &mut ParamTypes,
     ) -> Result<(Box<Table>, Vec<RExpr>, JtPlan)> {
         // The ctx / root path see only params + the lateral prefix (never sibling columns of THIS
