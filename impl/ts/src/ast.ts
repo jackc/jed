@@ -518,7 +518,7 @@ export type CreateTable = {
   // Every `FOREIGN KEY (cols) REFERENCES …` of the statement — the column-level
   // `REFERENCES` form collects as a one-member list — in TEXTUAL DEFINITION ORDER (it drives
   // resolution and naming — spec/design/constraints.md §6). CREATE TABLE's execution resolves
-  // each (42703/42701/42P01/42830/42804), rejects unsupported actions (0A000), and names the
+  // each (42703/42701/42P01/42830/42804), stores its actions, and names the
   // unnamed ones (42710).
   fks: ForeignKeyDef[];
   // Every table-level `[CONSTRAINT name] EXCLUDE [USING gist] (col WITH op [, …])` of the
@@ -541,8 +541,8 @@ export type ExcludeDef = {
 };
 
 // RefAction is a referential action for `ON DELETE` / `ON UPDATE` (spec/design/constraints.md
-// §6.6). Only "noAction" (the default) and "restrict" are supported — identical in jed (no
-// deferrable constraints); the write-actions parse but are rejected 0A000 at CREATE TABLE.
+// §6.6). "noAction" and "restrict" are identical in jed (there are no deferrable constraints);
+// write actions generate ordinary DML through the action closure.
 export type RefAction = "noAction" | "restrict" | "cascade" | "setNull" | "setDefault";
 
 // ForeignKeyDef is one parsed `FOREIGN KEY` / `REFERENCES` constraint (spec/design/grammar.md

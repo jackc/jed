@@ -2386,8 +2386,8 @@ appear in either order and at most once each; a repeat is `42601`.
 columns (`42703`/`42701`), looks up the parent table (`42P01`), matches the referenced columns to the
 parent's PRIMARY KEY or a UNIQUE constraint (`42830` — none matching, or a referencing/referenced
 count mismatch), type-checks corresponding columns (`42804`), names the constraint (`42710` against
-the per-table constraint namespace), and rejects an unsupported `referential_action` (`0A000` —
-CASCADE / SET NULL / SET DEFAULT) ([constraints.md §6](constraints.md)). PostgreSQL *reserves*
+the per-table constraint namespace), and stores the selected `referential_action` for parent-side
+execution ([constraints.md §6](constraints.md)). PostgreSQL *reserves*
 `FOREIGN` / `REFERENCES`, so the jed-only non-reserved surface carries oracle overrides like `on`'s
 (conformance.md §5). `MATCH FULL` / `MATCH PARTIAL` are not in the grammar (MATCH SIMPLE only).
 

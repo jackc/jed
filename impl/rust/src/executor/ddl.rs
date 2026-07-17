@@ -1070,7 +1070,7 @@ impl Engine {
         // self-reference); resolve the referenced columns (default to the parent PK, 42830 if it
         // has none); check the arity (42830); name the constraint (explicit collision 42710, else
         // derive `<table>_<cols>_fkey` with a suffix walk through the constraint namespace);
-        // reject the unsupported write-actions (0A000); require the referenced columns to be the
+        // resolve the selected actions; require the referenced columns to be the
         // parent PK or a UNIQUE set (42830); and require same-type pairing (42804, stricter than
         // PG). An FK owns no B-tree — enforcement probes the parent at every write (§6.4/§6.5).
         let mut resolved_fks: Vec<ForeignKeyConstraint> = Vec::with_capacity(ct.foreign_keys.len());
@@ -1196,7 +1196,7 @@ impl Engine {
                     candidate
                 }
             };
-            // 6. Reject the unsupported write-actions (§6.6).
+            // 6. Resolve and store the selected referential actions (§6.6).
             let on_delete = fk_action(fk.on_delete, "DELETE")?;
             let on_update = fk_action(fk.on_update, "UPDATE")?;
             // 7. The referenced columns must be the parent's PK or a UNIQUE set (§6.2).

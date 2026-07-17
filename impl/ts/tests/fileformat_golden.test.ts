@@ -186,9 +186,8 @@ function partialIndexTableDB(): Engine {
 // fkTableDB has FOREIGN KEY constraints (v11 — spec/design/constraints.md §6): pins the catalog
 // foreign-key list. Parent `p` (a PK + two UNIQUE constraints, the FK targets); child `c` with
 // four FKs covering every shape — a named FK to the UNIQUE column (c_code_fk), a self-reference to
-// the PK (c_mgr_fkey), an auto-named FK to the PK (c_pid_fkey), and an auto-named COMPOSITE FK to
-// the two-column UNIQUE with ON DELETE RESTRICT (c_x_y_fkey, the lone non-zero actions byte). Must
-// match the Ruby reference's FK_TABLE (spec/fileformat/verify.rb).
+// the PK (c_mgr_fkey), an auto-named FK to the PK (c_pid_fkey), and an auto-named COMPOSITE FK.
+// Their action bytes collectively pin every v30 action code and match the Ruby FK_TABLE fixture.
 function fkTableDB(): Engine {
   const db = goldenDb();
   run(db, "CREATE TABLE p (pid i32 PRIMARY KEY, code i32 UNIQUE, a i32, b i32, UNIQUE (a, b))");
@@ -196,9 +195,9 @@ function fkTableDB(): Engine {
   run(
     db,
     "CREATE TABLE c (id i32 PRIMARY KEY, pid i32, pcode i32, x i32, y i32, mgr i32, " +
-      "FOREIGN KEY (pid) REFERENCES p (pid), " +
-      "CONSTRAINT c_code_fk FOREIGN KEY (pcode) REFERENCES p (code), " +
-      "FOREIGN KEY (x, y) REFERENCES p (a, b) ON DELETE RESTRICT, " +
+      "FOREIGN KEY (pid) REFERENCES p (pid) ON DELETE RESTRICT, " +
+      "CONSTRAINT c_code_fk FOREIGN KEY (pcode) REFERENCES p (code) ON DELETE SET NULL, " +
+      "FOREIGN KEY (x, y) REFERENCES p (a, b) ON DELETE CASCADE ON UPDATE SET DEFAULT, " +
       "FOREIGN KEY (mgr) REFERENCES c (id))",
   );
   run(db, "INSERT INTO c VALUES (10, 1, 100, 10, 20, NULL), (11, 2, 200, 30, 40, 10)");

@@ -35,6 +35,8 @@ export class SessionState {
   // The execution-cost ceiling (CLAUDE.md §13; api.md §8), or 0n for unlimited. Bounds every statement
   // run on this session: its Meter aborts 54P01 the instant accrued cost reaches it.
   maxCost: bigint;
+  // Recursive generated referential-action statement depth (constraints.md §6.6).
+  fkActionDepth: number;
   // The per-session cumulative cost budget (spec/design/session.md §5.4) and the session's running
   // CUMULATIVE cost, held together in a LifetimeBudget object shared (by reference) with every
   // statement Meter, which live-charges into it — so partial cost of an aborted statement counts and
@@ -111,6 +113,7 @@ export class SessionState {
   constructor(opts: SessionOptions = {}) {
     this.tx = null;
     this.maxCost = opts.maxCost ?? 0n;
+    this.fkActionDepth = 0;
     this.lifetime = new LifetimeBudget(opts.lifetimeMaxCost ?? 0n);
     this.maxSqlLength = opts.maxSqlLength ?? DEFAULT_MAX_SQL_LENGTH;
     this.lockTimeoutMs = opts.lockTimeoutMs ?? 0;
@@ -151,6 +154,7 @@ export class SessionState {
     const frozen = Object.create(SessionState.prototype) as SessionState;
     frozen.tx = null;
     frozen.maxCost = source.maxCost;
+    frozen.fkActionDepth = source.fkActionDepth;
     frozen.lifetime = source.lifetime;
     frozen.maxSqlLength = source.maxSqlLength;
     frozen.lockTimeoutMs = source.lockTimeoutMs;

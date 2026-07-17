@@ -874,6 +874,10 @@ pub struct SessionState {
     /// runs and cleared when it finishes (success or error); `None` for every other statement, where
     /// reads fall through to `working`/`committed` as usual ([`Engine::read_snap`]).
     pub(crate) read_pin: Option<Snapshot>,
+    /// Current recursive referential-action depth (constraints.md §6.6). A schema can assemble an
+    /// arbitrarily long FK chain across cheap DDL statements, so generated child DML is capped at
+    /// 256 nested calls to keep every core's native stack bounded (`54001`).
+    pub(crate) fk_action_depth: usize,
 }
 
 /// Validate + canonicalize a session-variable name (spec/design/session.md §6.1). A variable must be
@@ -944,6 +948,7 @@ impl SessionState {
             time_zone: crate::timezone::resolve_zone(&opts.time_zone)
                 .unwrap_or(crate::timezone::ZoneRef::Fixed(0)),
             read_pin: None,
+            fk_action_depth: 0,
         }
     }
 
@@ -3979,26 +3984,15 @@ fn catalog_type_text(ty: &Type, dec: Option<&DecimalTypmod>, vlen: Option<u32>) 
 /// NAME follows PostgreSQL's single-column function-alias rule — the table alias when one is given,
 /// else the function name — and its TYPE is `col_ty` (the promoted integer for `generate_series`,
 /// the bound element type for `unnest`).
-/// Map a parsed referential action to its persisted form, rejecting the unsupported write-actions
-/// (CASCADE / SET NULL / SET DEFAULT) as `0A000` (spec/design/constraints.md §6.6). `clause` is
-/// `"DELETE"` or `"UPDATE"` for the message.
-fn fk_action(a: RefAction, clause: &str) -> Result<FkAction> {
-    match a {
-        RefAction::NoAction => Ok(FkAction::NoAction),
-        RefAction::Restrict => Ok(FkAction::Restrict),
-        RefAction::Cascade => Err(EngineError::new(
-            SqlState::FeatureNotSupported,
-            format!("ON {clause} CASCADE is not supported"),
-        )),
-        RefAction::SetNull => Err(EngineError::new(
-            SqlState::FeatureNotSupported,
-            format!("ON {clause} SET NULL is not supported"),
-        )),
-        RefAction::SetDefault => Err(EngineError::new(
-            SqlState::FeatureNotSupported,
-            format!("ON {clause} SET DEFAULT is not supported"),
-        )),
-    }
+/// Map a parsed referential action to its persisted form (constraints.md §6.6).
+fn fk_action(a: RefAction, _clause: &str) -> Result<FkAction> {
+    Ok(match a {
+        RefAction::NoAction => FkAction::NoAction,
+        RefAction::Restrict => FkAction::Restrict,
+        RefAction::Cascade => FkAction::Cascade,
+        RefAction::SetNull => FkAction::SetNull,
+        RefAction::SetDefault => FkAction::SetDefault,
+    })
 }
 
 /// A column-ordinal list as a sorted, deduplicated set (for the order-independent FK

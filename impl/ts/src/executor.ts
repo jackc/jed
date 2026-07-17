@@ -5283,7 +5283,7 @@ export class Engine {
     // self-reference); resolve the referenced columns (default to the parent PK, 42704 if it has
     // none); check the arity (42830); name the constraint (explicit collision 42710, else derive
     // `<table>_<cols>_fkey` with a suffix walk through the constraint namespace); reject the
-    // unsupported write-actions (0A000); require the referenced columns to be the parent PK or a
+    // selected actions; require the referenced columns to be the parent PK or a
     // UNIQUE set (42830); and require same-type pairing (42804, stricter than PG). An FK owns no
     // B-tree — enforcement probes the parent at every write (§6.4/§6.5).
     const resolvedFks: ForeignKey[] = [];
@@ -5374,7 +5374,7 @@ export class Engine {
         fkName = base;
         for (let suffix = 1; nameTakenFk(fkName); suffix++) fkName = base + suffix.toString();
       }
-      // 6. Reject the unsupported write-actions (§6.6).
+      // 6. Resolve and store the selected referential actions (§6.6).
       const onDelete = fkAction(fk.onDelete, "DELETE");
       const onUpdate = fkAction(fk.onUpdate, "UPDATE");
       // 7. The referenced columns must be the parent's PK or a UNIQUE set (§6.2).
@@ -10077,32 +10077,8 @@ export class Engine {
       }
     }
 
-    // FOREIGN KEY parent-side (constraints.md §6.5): an updated referenced row must not strand a
-    // child (only a referenced UNIQUE column is at risk; inserts add rows, never strand a child).
-    const referencers = this.fkReferencers(relation);
-    if (referencers.length > 0 && updates.length > 0) {
-      const parent = this.table(relation)!;
-      const updatedKeys = new Set<string>(updates.map((u) => u.key.join(",")));
-      for (const { childTable, fk } of referencers) {
-        // parent is the insert target itself, so its key columns use colls (§2.12).
-        const newPresent = new Set<string>();
-        for (const u of updates) {
-          const p = fkProbe(fk, parent, colls, u.newRow, fk.refColumns);
-          if (p !== null) newPresent.add(fkProbeBytes(p).join(","));
-        }
-        for (const u of updates) {
-          const oldProbe = fkProbe(fk, parent, colls, u.oldRow, fk.refColumns);
-          if (oldProbe === null) continue;
-          const newProbe = fkProbe(fk, parent, colls, u.newRow, fk.refColumns);
-          if (newProbe !== null && bytesEq(fkProbeBytes(newProbe), fkProbeBytes(oldProbe)))
-            continue;
-          if (newPresent.has(fkProbeBytes(oldProbe).join(","))) continue;
-          if (this.fkChildReferences(childTable, fk, parent, fkProbeBytes(oldProbe), updatedKeys)) {
-            throw fkViolationDelete(parent.name, fk.name, childTable);
-          }
-        }
-      }
-    }
+    // Parent-side validation/actions for DO UPDATE run after phase 2, like ordinary UPDATE.
+    const fkUpdates = updates.map((u) => ({ row: u.newRow, oldRow: u.oldRow }));
 
     // Meter the disposition-plan compression attempts (value_compress, cost.md §3) for the inserted
     // + updated rows; enforce the ceiling BEFORE phase 2 writes (all-or-nothing).
@@ -10185,6 +10161,7 @@ export class Engine {
         }
       }
     }
+    this.applyFkUpdateActions(table, fkUpdates, meter);
     return { affected, returned };
   }
 
@@ -10246,6 +10223,284 @@ export class Engine {
       out.push(nodes.map((node) => evalExpr(node, combined, env, meter)));
     });
     return out;
+  }
+
+  // Combine a non-empty expression list as a balanced tree so a large parent batch does not make
+  // generated referential-action predicates linear in resolver/evaluator stack depth.
+  private balancedFkExpr(exprs: Expr[], op: BinaryOp): Expr {
+    while (exprs.length > 1) {
+      const next: Expr[] = [];
+      for (let i = 0; i < exprs.length; i += 2) {
+        const lhs = exprs[i]!;
+        const rhs = exprs[i + 1];
+        next.push(rhs === undefined ? lhs : { kind: "binary", op, lhs, rhs });
+      }
+      exprs = next;
+    }
+    return exprs[0]!;
+  }
+
+  // One child FK-tuple equality in the parent key's collation.
+  private fkActionMatchExpr(
+    parent: Table,
+    child: Table,
+    fk: ForeignKey,
+    params: number[],
+  ): Expr {
+    const parts: Expr[] = fk.columns.map((local, slot) => {
+      const referenced = fk.refColumns[slot]!;
+      let lhs: Expr = { kind: "column", name: child.columns[local]!.name };
+      const parentColumn = parent.columns[referenced]!;
+      if (parentColumn.type.kind === "scalar" && parentColumn.type.scalar === "text") {
+        lhs = { kind: "collate", inner: lhs, collation: parentColumn.collation ?? "C" };
+      }
+      return { kind: "binary", op: "eq", lhs, rhs: { kind: "param", index: params[slot]! } };
+    });
+    return this.balancedFkExpr(parts, "and");
+  }
+
+  private fkActionPredicate(
+    parent: Table,
+    child: Table,
+    fk: ForeignKey,
+    oldTuples: Value[][],
+  ): { filter: Expr; params: Value[]; ids: number[][] } {
+    const params: Value[] = [];
+    const ids: number[][] = [];
+    const matches: Expr[] = [];
+    for (const tuple of oldTuples) {
+      const tupleIds: number[] = [];
+      for (const value of tuple) {
+        params.push(value);
+        tupleIds.push(params.length);
+      }
+      ids.push(tupleIds);
+      matches.push(this.fkActionMatchExpr(parent, child, fk, tupleIds));
+    }
+    return { filter: this.balancedFkExpr(matches, "or"), params, ids };
+  }
+
+  // Generated statements share the originating statement's remaining ceiling and lifetime
+  // counter. Their accrued statement cost is folded into the caller without charging lifetime twice.
+  private runFkActionUpdate(update: Update, params: Value[], meter: Meter): void {
+    meter.guard();
+    if (this.session.fkActionDepth >= 256) {
+      throw engineError(
+        "statement_too_complex",
+        "referential action depth exceeds the maximum of 256",
+      );
+    }
+    const savedLimit = this.session.maxCost;
+    this.session.maxCost = savedLimit > 0n ? savedLimit - meter.accrued : 0n;
+    this.session.fkActionDepth++;
+    try {
+      const out = this.executeUpdate(update, params, EMPTY_CTE_CTX);
+      meter.accrued += out.cost;
+    } finally {
+      this.session.fkActionDepth--;
+      this.session.maxCost = savedLimit;
+    }
+    meter.guard();
+  }
+
+  private runFkActionDelete(del: Delete, params: Value[], meter: Meter): void {
+    meter.guard();
+    if (this.session.fkActionDepth >= 256) {
+      throw engineError(
+        "statement_too_complex",
+        "referential action depth exceeds the maximum of 256",
+      );
+    }
+    const savedLimit = this.session.maxCost;
+    this.session.maxCost = savedLimit > 0n ? savedLimit - meter.accrued : 0n;
+    this.session.fkActionDepth++;
+    try {
+      const out = this.executeDelete(del, params, EMPTY_CTE_CTX);
+      meter.accrued += out.cost;
+    } finally {
+      this.session.fkActionDepth--;
+      this.session.maxCost = savedLimit;
+    }
+    meter.guard();
+  }
+
+  private runFkDeleteAction(
+    parent: Table,
+    child: Table,
+    fk: ForeignKey,
+    oldTuples: Value[][],
+    meter: Meter,
+  ): void {
+    if (oldTuples.length === 0) return;
+    const { filter, params } = this.fkActionPredicate(parent, child, fk, oldTuples);
+    if (fk.onDelete === "cascade") {
+      this.runFkActionDelete(
+        { kind: "delete", table: child.name, filter, returning: null },
+        params,
+        meter,
+      );
+    } else if (fk.onDelete === "setNull" || fk.onDelete === "setDefault") {
+      this.runFkActionUpdate(
+        {
+          kind: "update",
+          table: child.name,
+          assignments: fk.columns.map((column) => ({
+            column: child.columns[column]!.name,
+            isDefault: fk.onDelete === "setDefault",
+            value: { kind: "literal", literal: { kind: "null" } },
+          })),
+          filter,
+          returning: null,
+        },
+        params,
+        meter,
+      );
+    }
+  }
+
+  private runFkUpdateAction(
+    parent: Table,
+    child: Table,
+    fk: ForeignKey,
+    transitions: [Value[], Value[]][],
+    meter: Meter,
+  ): void {
+    if (transitions.length === 0) return;
+    const oldTuples = transitions.map(([oldTuple]) => oldTuple);
+    const action = this.fkActionPredicate(parent, child, fk, oldTuples);
+    const assignments: import("./ast.ts").Assignment[] = [];
+    if (fk.onUpdate === "cascade") {
+      const newIds = transitions.map(([, newTuple]) =>
+        newTuple.map((value) => {
+          action.params.push(value);
+          return action.params.length;
+        }),
+      );
+      fk.columns.forEach((column, slot) => {
+        assignments.push({
+          column: child.columns[column]!.name,
+          isDefault: false,
+          value: {
+            kind: "case",
+            operand: null,
+            whens: action.ids.map((ids, i) => ({
+              cond: this.fkActionMatchExpr(parent, child, fk, ids),
+              result: {
+                kind: "cast",
+                inner: { kind: "param", index: newIds[i]![slot]! },
+                typeName: typeCanonicalName(child.columns[column]!.type),
+                typeMod: null,
+              },
+            })),
+            els: { kind: "column", name: child.columns[column]!.name },
+          },
+        });
+      });
+    } else if (fk.onUpdate === "setNull" || fk.onUpdate === "setDefault") {
+      for (const column of fk.columns) {
+        assignments.push({
+          column: child.columns[column]!.name,
+          isDefault: fk.onUpdate === "setDefault",
+          value: { kind: "literal", literal: { kind: "null" } },
+        });
+      }
+    } else {
+      return;
+    }
+    this.runFkActionUpdate(
+      {
+        kind: "update",
+        table: child.name,
+        assignments,
+        filter: action.filter,
+        returning: null,
+      },
+      action.params,
+      meter,
+    );
+  }
+
+  private applyFkDeleteActions(parent: Table, rows: Row[], meter: Meter): void {
+    if (rows.length === 0) return;
+    const savedPin = this.session.readPin;
+    this.session.readPin = null;
+    try {
+      const referencers = this.fkReferencers(parent.name);
+      const parentColls = this.columnCollations(parent.columns);
+      for (const { childTable, fk } of referencers) {
+        if (fk.onDelete === "noAction" || fk.onDelete === "restrict") continue;
+        const child = this.table(childTable);
+        if (child === undefined) throw new Error("foreign-key child exists");
+        const oldTuples: Value[][] = [];
+        for (const row of rows) {
+          if (fkProbe(fk, parent, parentColls, row, fk.refColumns) !== null)
+            oldTuples.push(fk.refColumns.map((column) => row[column]!));
+        }
+        this.runFkDeleteAction(parent, child, fk, oldTuples, meter);
+      }
+      for (const { childTable, fk } of referencers) {
+        if (fk.onDelete !== "noAction" && fk.onDelete !== "restrict") continue;
+        for (const row of rows) {
+          const probe = fkProbe(fk, parent, parentColls, row, fk.refColumns);
+          if (
+            probe !== null &&
+            this.fkChildReferences(childTable, fk, parent, fkProbeBytes(probe), new Set())
+          ) {
+            throw fkViolationDelete(parent.name, fk.name, childTable);
+          }
+        }
+      }
+    } finally {
+      this.session.readPin = savedPin;
+    }
+  }
+
+  private applyFkUpdateActions(
+    parent: Table,
+    updates: { row: Row; oldRow: Row }[],
+    meter: Meter,
+  ): void {
+    if (updates.length === 0) return;
+    const savedPin = this.session.readPin;
+    this.session.readPin = null;
+    try {
+      const referencers = this.fkReferencers(parent.name);
+      const parentColls = this.columnCollations(parent.columns);
+      for (const { childTable, fk } of referencers) {
+        if (fk.onUpdate === "noAction" || fk.onUpdate === "restrict") continue;
+        const child = this.table(childTable);
+        if (child === undefined) throw new Error("foreign-key child exists");
+        const transitions: [Value[], Value[]][] = [];
+        for (const u of updates) {
+          const oldProbe = fkProbe(fk, parent, parentColls, u.oldRow, fk.refColumns);
+          if (oldProbe === null) continue;
+          const newProbe = fkProbe(fk, parent, parentColls, u.row, fk.refColumns);
+          if (newProbe !== null && bytesEq(fkProbeBytes(newProbe), fkProbeBytes(oldProbe))) continue;
+          transitions.push([
+            fk.refColumns.map((column) => u.oldRow[column]!),
+            fk.refColumns.map((column) => u.row[column]!),
+          ]);
+        }
+        this.runFkUpdateAction(parent, child, fk, transitions, meter);
+      }
+      for (const { childTable, fk } of referencers) {
+        if (fk.onUpdate !== "noAction" && fk.onUpdate !== "restrict") continue;
+        for (const u of updates) {
+          const oldProbe = fkProbe(fk, parent, parentColls, u.oldRow, fk.refColumns);
+          if (oldProbe === null) continue;
+          const newProbe = fkProbe(fk, parent, parentColls, u.row, fk.refColumns);
+          if (newProbe !== null && bytesEq(fkProbeBytes(newProbe), fkProbeBytes(oldProbe))) continue;
+          if (this.fkProbeHits(oldProbe, parent.name)) continue;
+          if (
+            this.fkChildReferences(childTable, fk, parent, fkProbeBytes(oldProbe), new Set())
+          ) {
+            throw fkViolationDelete(parent.name, fk.name, childTable);
+          }
+        }
+      }
+    } finally {
+      this.session.readPin = savedPin;
+    }
   }
 
   // executeDelete resolves the table and optional predicate, collects the keys of
@@ -10379,28 +10634,8 @@ export class Engine {
     this.recordExplainActual("Scan " + del.table, scanActual);
     if (filter !== null) this.recordExplainActual("Filter", filterActual);
 
-    // FOREIGN KEY parent-side (constraints.md §6.5): a DELETE must not strand a child. For each
-    // inbound FK, every deleted row's referenced tuple disappears (the referenced columns are
-    // unique, so each is unique to its row); if a child still references it → 23503. Unmetered,
-    // before phase 2 (all-or-nothing). For a self-reference the child IS this table, whose end
-    // state excludes the rows being deleted.
-    const delReferencers = this.fkReferencers(del.table);
-    if (delReferencers.length > 0) {
-      const parent = this.table(del.table)!;
-      const deletedKeys = new Set<string>(matched.map((m) => m.key.join(",")));
-      const empty = new Set<string>();
-      for (const { childTable, fk } of delReferencers) {
-        const exclude = childTable.toLowerCase() === del.table.toLowerCase() ? deletedKeys : empty;
-        for (const m of matched) {
-          // parent is the delete target itself, so its key columns use colls (§2.12).
-          const probe = fkProbe(fk, parent, colls, m.row, fk.refColumns);
-          if (probe === null) continue; // a NULL referenced value cannot be referenced (MATCH SIMPLE)
-          if (this.fkChildReferences(childTable, fk, parent, fkProbeBytes(probe), exclude)) {
-            throw fkViolationDelete(parent.name, fk.name, childTable);
-          }
-        }
-      }
-    }
+    // Parent-side validation and generated referential actions run after phase 2 against the
+    // action-closure state. `table` remains the catalog snapshot defining the deleted values.
 
     // The RETURNING projection (grammar.md §32, cost.md §3): evaluate over the matched rows'
     // OLD values before anything is removed — subqueries in the list read the pre-statement
@@ -10436,6 +10671,11 @@ export class Engine {
       for (const ek of toRemove[kx]!) istore.remove(ek);
     }
     this.markEstimatorMutation(del.db, del.table);
+    this.applyFkDeleteActions(
+      table,
+      matched.map((m) => m.row),
+      meter,
+    );
     return dmlOutcome(
       ret?.names ?? null,
       ret?.types ?? null,
@@ -10845,58 +11085,8 @@ export class Engine {
       }
     }
 
-    // FOREIGN KEY parent-side (constraints.md §6.5): an UPDATE of a referenced row must not strand
-    // a child. A referenced column — PRIMARY KEY (now re-keyable) or UNIQUE — may change. For each
-    // inbound FK, a referenced tuple DISAPPEARS when an updated row's old value is absent from the
-    // statement's new end state (old − new over the updated rows); if a child still references a
-    // disappearing tuple → 23503. Unmetered, phase 1. A self-reference's child IS this table: the
-    // committed scan excludes the rows being updated (their NEW references are checked separately,
-    // newChildRefs, since a re-key can leave an updated row pointing at its own now-vacated value —
-    // the child-side probe reads the pre-update parent, so it cannot see that).
-    const updReferencers = this.fkReferencers(upd.table);
-    if (updReferencers.length > 0) {
-      const parent = this.table(upd.table)!;
-      const updatedKeys = new Set<string>(updates.map((u) => u.key.join(",")));
-      const empty = new Set<string>();
-      for (const { childTable, fk } of updReferencers) {
-        const selfRef = childTable.toLowerCase() === upd.table.toLowerCase();
-        // The referenced tuples the updated rows now supply (so a swap re-supplies one).
-        // parent is the update target itself, so its key columns use colls (§2.12).
-        const newPresent = new Set<string>();
-        for (const u of updates) {
-          const p = fkProbe(fk, parent, colls, u.row, fk.refColumns);
-          if (p !== null) newPresent.add(fkProbeBytes(p).join(","));
-        }
-        // For a self-reference, the FK tuples the updated rows now POINT AT (their new
-        // local-column values): an updated row referencing a disappearing tuple dangles.
-        const newChildRefs = new Set<string>();
-        if (selfRef) {
-          for (const u of updates) {
-            const p = fkProbe(fk, parent, colls, u.row, fk.columns);
-            if (p !== null) newChildRefs.add(fkProbeBytes(p).join(","));
-          }
-        }
-        const exclude = selfRef ? updatedKeys : empty;
-        for (const u of updates) {
-          const oldProbe = fkProbe(fk, parent, colls, u.oldRow, fk.refColumns);
-          if (oldProbe === null) continue; // a NULL old referenced value was referenced by nothing
-          // Unchanged tuples (incl. a NULL → already skipped) do not disappear.
-          const newProbe = fkProbe(fk, parent, colls, u.row, fk.refColumns);
-          if (newProbe !== null && bytesEq(fkProbeBytes(newProbe), fkProbeBytes(oldProbe)))
-            continue;
-          // Re-supplied by another updated row (e.g. a value swap) → not disappearing.
-          if (newPresent.has(fkProbeBytes(oldProbe).join(","))) continue;
-          // Stranded if a committed (non-updated) child OR an updated row's NEW reference
-          // still points at the disappearing tuple.
-          if (
-            this.fkChildReferences(childTable, fk, parent, fkProbeBytes(oldProbe), exclude) ||
-            newChildRefs.has(fkProbeBytes(oldProbe).join(","))
-          ) {
-            throw fkViolationDelete(parent.name, fk.name, childTable);
-          }
-        }
-      }
-    }
+    // Parent-side validation and generated actions run after the target rows reach their new
+    // statement state. `table` remains the catalog snapshot defining each old/new transition.
 
     // Each rewritten row's disposition plan may attempt compression (a record over RECORD_MAX)
     // — meter the attempts (value_compress, cost.md §3) and enforce the ceiling BEFORE phase 2
@@ -10991,6 +11181,7 @@ export class Engine {
       }
     }
     this.markEstimatorMutation(upd.db, upd.table);
+    this.applyFkUpdateActions(table, updates, meter);
     return dmlOutcome(
       ret?.names ?? null,
       ret?.types ?? null,
@@ -20374,14 +20565,9 @@ export function fkTypesEqual(a: Type, b: Type): boolean {
   return false;
 }
 
-// fkAction maps a parsed referential action to its persisted form, rejecting the unsupported
-// write-actions (CASCADE / SET NULL / SET DEFAULT) as 0A000 (spec/design/constraints.md §6.6).
-// `clause` is "DELETE" or "UPDATE" for the message.
-export function fkAction(a: RefAction, clause: string): FkAction {
-  if (a === "noAction") return "noAction";
-  if (a === "restrict") return "restrict";
-  const word = a === "cascade" ? "CASCADE" : a === "setNull" ? "SET NULL" : "SET DEFAULT";
-  throw engineError("feature_not_supported", "ON " + clause + " " + word + " is not supported");
+// fkAction maps a parsed referential action to its persisted form.
+export function fkAction(a: RefAction, _clause: string): FkAction {
+  return a;
 }
 
 // prefixSuccessor is the byte-successor of a prefix: the smallest byte string greater

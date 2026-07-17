@@ -132,10 +132,7 @@ type exclusionConstraint struct {
 }
 
 // FkAction is the persisted referential action for a foreign key's `ON DELETE` / `ON UPDATE`
-// (spec/design/constraints.md §6.6). Only FkNoAction (the default) and FkRestrict are
-// supported — they are identical in jed (no deferrable constraints). The write-actions
-// (CASCADE / SET NULL / SET DEFAULT) are rejected 0A000 at CREATE TABLE, so never reach here;
-// the on-disk encoding reserves codes for them (format.md).
+// (spec/design/constraints.md §6.6).
 type fkAction int
 
 const (
@@ -143,6 +140,12 @@ const (
 	fkNoAction fkAction = iota
 	// FkRestrict is RESTRICT, on-disk code 1.
 	fkRestrict
+	// FkCascade is CASCADE, on-disk code 2.
+	fkCascade
+	// FkSetNull is SET NULL, on-disk code 3.
+	fkSetNull
+	// FkSetDefault is SET DEFAULT, on-disk code 4.
+	fkSetDefault
 )
 
 // ForeignKey is one resolved FOREIGN KEY constraint of a table (spec/design/constraints.md §6):

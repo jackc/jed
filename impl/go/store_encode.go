@@ -740,9 +740,7 @@ func rExprConstToValue(e *rExpr) (Value, error) {
 	}
 }
 
-// fkAction maps a parsed referential action to its persisted form, rejecting the unsupported
-// write-actions (CASCADE / SET NULL / SET DEFAULT) as 0A000 (spec/design/constraints.md §6.6).
-// clause is "DELETE" or "UPDATE" for the message.
+// newFkAction maps a parsed referential action to its persisted form.
 func newFkAction(a refAction, clause string) (fkAction, error) {
 	switch a {
 	case refNoAction:
@@ -750,11 +748,11 @@ func newFkAction(a refAction, clause string) (fkAction, error) {
 	case refRestrict:
 		return fkRestrict, nil
 	case refCascade:
-		return 0, newError(FeatureNotSupported, "ON "+clause+" CASCADE is not supported")
+		return fkCascade, nil
 	case refSetNull:
-		return 0, newError(FeatureNotSupported, "ON "+clause+" SET NULL is not supported")
+		return fkSetNull, nil
 	case refSetDefault:
-		return 0, newError(FeatureNotSupported, "ON "+clause+" SET DEFAULT is not supported")
+		return fkSetDefault, nil
 	default:
 		return 0, newError(FeatureNotSupported, "ON "+clause+" action is not supported")
 	}

@@ -56,6 +56,95 @@ pub(crate) struct InsertValuesPlan {
     cacheable: bool,
 }
 
+const MAX_FK_ACTION_DEPTH: usize = 256;
+
+/// Combine a non-empty expression list as a balanced binary tree. Referential-action predicates
+/// are synthesized from an arbitrary parent batch; balancing keeps resolver/evaluator stack depth
+/// logarithmic rather than proportional to the number of changed rows (constraints.md §6.6).
+fn balanced_fk_expr(mut exprs: Vec<Expr>, op: BinaryOp) -> Expr {
+    debug_assert!(!exprs.is_empty());
+    while exprs.len() > 1 {
+        let mut next = Vec::with_capacity(exprs.len().div_ceil(2));
+        let mut it = exprs.into_iter();
+        while let Some(lhs) = it.next() {
+            if let Some(rhs) = it.next() {
+                next.push(Expr::Binary {
+                    op,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                });
+            } else {
+                next.push(lhs);
+            }
+        }
+        exprs = next;
+    }
+    exprs.pop().unwrap()
+}
+
+/// One FK-tuple equality in the PARENT key's collation. The ordinary SQL comparison path is reused
+/// by generated UPDATE/DELETE, but an explicitly collated parent text key must not accidentally use
+/// a differently-collated child column while finding action targets.
+fn fk_action_match_expr(
+    parent: &Table,
+    child: &Table,
+    fk: &ForeignKeyConstraint,
+    params: &[u32],
+) -> Expr {
+    let mut parts = Vec::with_capacity(fk.columns.len());
+    for (slot, (&local, &referenced)) in fk.columns.iter().zip(&fk.ref_columns).enumerate() {
+        let mut lhs = Expr::Column(child.columns[local].name.clone());
+        if matches!(
+            parent.columns[referenced].ty,
+            Type::Scalar(ScalarType::Text)
+        ) {
+            lhs = Expr::Collate {
+                inner: Box::new(lhs),
+                collation: parent.columns[referenced]
+                    .collation
+                    .clone()
+                    .unwrap_or_else(|| "C".to_string()),
+            };
+        }
+        parts.push(Expr::Binary {
+            op: BinaryOp::Eq,
+            lhs: Box::new(lhs),
+            rhs: Box::new(Expr::Param(params[slot])),
+        });
+    }
+    balanced_fk_expr(parts, BinaryOp::And)
+}
+
+/// Build the disjunction selecting every child row whose FK tuple equals one of `old_tuples`.
+/// Returns the bound values and their 1-based parameter ids so ON UPDATE CASCADE can reuse each
+/// condition in its per-column CASE expression without duplicating values.
+fn fk_action_predicate(
+    parent: &Table,
+    child: &Table,
+    fk: &ForeignKeyConstraint,
+    old_tuples: &[Vec<Value>],
+) -> Result<(Expr, Vec<Value>, Vec<Vec<u32>>)> {
+    let mut values = Vec::new();
+    let mut ids = Vec::with_capacity(old_tuples.len());
+    let mut matches = Vec::with_capacity(old_tuples.len());
+    for tuple in old_tuples {
+        let mut tuple_ids = Vec::with_capacity(tuple.len());
+        for value in tuple {
+            let id = u32::try_from(values.len() + 1).map_err(|_| {
+                EngineError::new(
+                    SqlState::StatementTooComplex,
+                    "referential action generated too many bound values",
+                )
+            })?;
+            values.push(value.clone());
+            tuple_ids.push(id);
+        }
+        matches.push(fk_action_match_expr(parent, child, fk, &tuple_ids));
+        ids.push(tuple_ids);
+    }
+    Ok((balanced_fk_expr(matches, BinaryOp::Or), values, ids))
+}
+
 impl Engine {
     fn insert_target_signature(
         &self,
@@ -1908,54 +1997,14 @@ impl Engine {
             }
         }
 
-        // FOREIGN KEY parent-side (constraints.md §6.5): an updated referenced row must not strand
-        // a child. A referenced PK column cannot change (PK assignment is 0A000), so only a
-        // referenced UNIQUE column is at risk; a tuple DISAPPEARS when an updated row's old value
-        // is absent from the statement's new end state. (Inserts add rows, never strand a child.)
-        let referencers = self.fk_referencers(table);
-        if !referencers.is_empty() && !updates.is_empty() {
-            let parent = self.table(table).expect("insert target exists").clone();
-            let updated_keys: HashSet<Vec<u8>> =
-                updates.iter().map(|(k, _, _)| k.clone()).collect();
-            for (child_table, fk) in &referencers {
-                // `parent` is the insert target itself, so its key columns use `colls` (§2.12).
-                let mut new_present: HashSet<Vec<u8>> = HashSet::new();
-                for (_, nr, _) in &updates {
-                    if let Some(p) = fk_probe(fk, &parent, &colls, nr, &fk.ref_columns)? {
-                        new_present.insert(p.bytes().to_vec());
-                    }
-                }
-                for (_, new_row, old_row) in &updates {
-                    let Some(old_probe) = fk_probe(fk, &parent, &colls, old_row, &fk.ref_columns)?
-                    else {
-                        continue;
-                    };
-                    if let Some(new_probe) =
-                        fk_probe(fk, &parent, &colls, new_row, &fk.ref_columns)?
-                    {
-                        if new_probe.bytes() == old_probe.bytes() {
-                            continue; // unchanged tuple
-                        }
-                    }
-                    if new_present.contains(old_probe.bytes()) {
-                        continue; // re-supplied by another updated row
-                    }
-                    if self.fk_child_references(
-                        child_table,
-                        fk,
-                        &parent,
-                        old_probe.bytes(),
-                        &updated_keys,
-                    )? {
-                        return Err(EngineError::fk_violation_delete(
-                            &parent.name,
-                            &fk.name,
-                            child_table,
-                        ));
-                    }
-                }
-            }
-        }
+        // Parent-side validation/actions for DO UPDATE run after phase 2, like ordinary UPDATE.
+        let fk_parent = self.table(table).expect("insert target exists").clone();
+        let fk_updates: Vec<(Vec<u8>, Vec<u8>, Row, Row)> = updates
+            .iter()
+            .map(|(key, new_row, old_row)| {
+                (key.clone(), key.clone(), new_row.clone(), old_row.clone())
+            })
+            .collect();
 
         // Meter the disposition-plan compression attempts (value_compress, cost.md §3) for the
         // inserted + updated rows, and enforce the ceiling BEFORE phase 2 writes (all-or-nothing).
@@ -2081,6 +2130,7 @@ impl Engine {
                 }
             }
         }
+        self.apply_fk_update_actions(&fk_parent, &fk_updates, meter)?;
         Ok((affected, returned))
     }
 
@@ -2345,6 +2395,348 @@ impl Engine {
         Ok(out)
     }
 
+    /// Run one generated referential-action UPDATE with the remaining originating-statement cost
+    /// ceiling. The nested meter live-charges the shared lifetime budget; its accrued total is then
+    /// folded into the caller's statement meter without charging lifetime a second time.
+    fn run_fk_action_update(
+        &mut self,
+        update: Update,
+        params: Vec<Value>,
+        meter: &mut Meter,
+    ) -> Result<()> {
+        meter.guard()?;
+        if self.session.fk_action_depth >= MAX_FK_ACTION_DEPTH {
+            return Err(EngineError::new(
+                SqlState::StatementTooComplex,
+                format!("referential action depth exceeds the maximum of {MAX_FK_ACTION_DEPTH}"),
+            ));
+        }
+        let saved_limit = self.session.max_cost;
+        self.session.max_cost = if saved_limit > 0 {
+            saved_limit.saturating_sub(meter.accrued)
+        } else {
+            0
+        };
+        self.session.fk_action_depth += 1;
+        let result = self.execute_update(update, &params, CteCtx::empty());
+        self.session.fk_action_depth -= 1;
+        self.session.max_cost = saved_limit;
+        let out = result?;
+        meter.accrued = meter.accrued.saturating_add(out.cost());
+        meter.guard()
+    }
+
+    /// DELETE sibling of [`run_fk_action_update`].
+    fn run_fk_action_delete(
+        &mut self,
+        delete: Delete,
+        params: Vec<Value>,
+        meter: &mut Meter,
+    ) -> Result<()> {
+        meter.guard()?;
+        if self.session.fk_action_depth >= MAX_FK_ACTION_DEPTH {
+            return Err(EngineError::new(
+                SqlState::StatementTooComplex,
+                format!("referential action depth exceeds the maximum of {MAX_FK_ACTION_DEPTH}"),
+            ));
+        }
+        let saved_limit = self.session.max_cost;
+        self.session.max_cost = if saved_limit > 0 {
+            saved_limit.saturating_sub(meter.accrued)
+        } else {
+            0
+        };
+        self.session.fk_action_depth += 1;
+        let result = self.execute_delete(delete, &params, CteCtx::empty());
+        self.session.fk_action_depth -= 1;
+        self.session.max_cost = saved_limit;
+        let out = result?;
+        meter.accrued = meter.accrued.saturating_add(out.cost());
+        meter.guard()
+    }
+
+    /// Apply one inbound FK's generated DELETE-side action to `old_tuples`.
+    fn run_fk_delete_action(
+        &mut self,
+        parent: &Table,
+        child: &Table,
+        fk: &ForeignKeyConstraint,
+        old_tuples: &[Vec<Value>],
+        meter: &mut Meter,
+    ) -> Result<()> {
+        if old_tuples.is_empty() {
+            return Ok(());
+        }
+        let (filter, params, _) = fk_action_predicate(parent, child, fk, old_tuples)?;
+        match fk.on_delete {
+            FkAction::Cascade => self.run_fk_action_delete(
+                Delete {
+                    table: child.name.clone(),
+                    db: None,
+                    filter: Some(filter),
+                    returning: None,
+                },
+                params,
+                meter,
+            ),
+            FkAction::SetNull | FkAction::SetDefault => {
+                let assignments = fk
+                    .columns
+                    .iter()
+                    .map(|&column| crate::ast::Assignment {
+                        column: child.columns[column].name.clone(),
+                        is_default: fk.on_delete == FkAction::SetDefault,
+                        value: Expr::Literal(Literal::Null),
+                    })
+                    .collect();
+                self.run_fk_action_update(
+                    Update {
+                        table: child.name.clone(),
+                        db: None,
+                        assignments,
+                        filter: Some(filter),
+                        returning: None,
+                    },
+                    params,
+                    meter,
+                )
+            }
+            FkAction::NoAction | FkAction::Restrict => Ok(()),
+        }
+    }
+
+    /// Apply one inbound FK's generated UPDATE-side action. `transitions` is the parent batch's
+    /// positional old/new referenced values, already filtered to rows whose tuple changed.
+    fn run_fk_update_action(
+        &mut self,
+        parent: &Table,
+        child: &Table,
+        fk: &ForeignKeyConstraint,
+        transitions: &[(Vec<Value>, Vec<Value>)],
+        meter: &mut Meter,
+    ) -> Result<()> {
+        if transitions.is_empty() {
+            return Ok(());
+        }
+        let old_tuples: Vec<Vec<Value>> = transitions.iter().map(|x| x.0.clone()).collect();
+        let (filter, mut params, old_ids) = fk_action_predicate(parent, child, fk, &old_tuples)?;
+        let assignments = match fk.on_update {
+            FkAction::Cascade => {
+                let mut new_ids = Vec::with_capacity(transitions.len());
+                for (_, new_tuple) in transitions {
+                    let mut ids = Vec::with_capacity(new_tuple.len());
+                    for value in new_tuple {
+                        let id = u32::try_from(params.len() + 1).map_err(|_| {
+                            EngineError::new(
+                                SqlState::StatementTooComplex,
+                                "referential action generated too many bound values",
+                            )
+                        })?;
+                        params.push(value.clone());
+                        ids.push(id);
+                    }
+                    new_ids.push(ids);
+                }
+                fk.columns
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, &column)| {
+                        let whens = old_ids
+                            .iter()
+                            .enumerate()
+                            .map(|(i, ids)| {
+                                (
+                                    fk_action_match_expr(parent, child, fk, ids),
+                                    Expr::Cast {
+                                        inner: Box::new(Expr::Param(new_ids[i][slot])),
+                                        type_name: child.columns[column].ty.canonical_name(),
+                                        type_mod: None,
+                                    },
+                                )
+                            })
+                            .collect();
+                        crate::ast::Assignment {
+                            column: child.columns[column].name.clone(),
+                            is_default: false,
+                            value: Expr::Case {
+                                operand: None,
+                                whens,
+                                els: Some(Box::new(Expr::Column(
+                                    child.columns[column].name.clone(),
+                                ))),
+                            },
+                        }
+                    })
+                    .collect()
+            }
+            FkAction::SetNull | FkAction::SetDefault => fk
+                .columns
+                .iter()
+                .map(|&column| crate::ast::Assignment {
+                    column: child.columns[column].name.clone(),
+                    is_default: fk.on_update == FkAction::SetDefault,
+                    value: Expr::Literal(Literal::Null),
+                })
+                .collect(),
+            FkAction::NoAction | FkAction::Restrict => return Ok(()),
+        };
+        self.run_fk_action_update(
+            Update {
+                table: child.name.clone(),
+                db: None,
+                assignments,
+                filter: Some(filter),
+                returning: None,
+            },
+            params,
+            meter,
+        )
+    }
+
+    /// Parent DELETE action closure. Write actions run first for every inbound FK; NO ACTION /
+    /// RESTRICT then inspect the resulting state. The writable-CTE read pin is temporarily removed
+    /// so generated DML sees the parent and earlier generated writes in the transaction working set.
+    fn apply_fk_delete_actions(
+        &mut self,
+        parent: &Table,
+        rows: &[(Vec<u8>, Row)],
+        meter: &mut Meter,
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let saved_pin = self.session.read_pin.take();
+        let result = (|| {
+            let referencers = self.fk_referencers(&parent.name);
+            let parent_colls = self.column_collations(&parent.columns);
+            for (child_name, fk) in &referencers {
+                if matches!(fk.on_delete, FkAction::NoAction | FkAction::Restrict) {
+                    continue;
+                }
+                let child = self
+                    .table(child_name)
+                    .expect("foreign-key child exists")
+                    .clone();
+                let mut old_tuples = Vec::new();
+                for (_, row) in rows {
+                    if fk_probe(fk, parent, &parent_colls, row, &fk.ref_columns)?.is_some() {
+                        old_tuples.push(fk.ref_columns.iter().map(|&i| row[i].clone()).collect());
+                    }
+                }
+                self.run_fk_delete_action(parent, &child, fk, &old_tuples, meter)?;
+            }
+            for (child_name, fk) in &referencers {
+                if !matches!(fk.on_delete, FkAction::NoAction | FkAction::Restrict) {
+                    continue;
+                }
+                for (_, row) in rows {
+                    let Some(probe) = fk_probe(fk, parent, &parent_colls, row, &fk.ref_columns)?
+                    else {
+                        continue;
+                    };
+                    if self.fk_child_references(
+                        child_name,
+                        fk,
+                        parent,
+                        probe.bytes(),
+                        &HashSet::new(),
+                    )? {
+                        return Err(EngineError::fk_violation_delete(
+                            &parent.name,
+                            &fk.name,
+                            child_name,
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        })();
+        self.session.read_pin = saved_pin;
+        result
+    }
+
+    /// Parent UPDATE action closure, parallel to [`apply_fk_delete_actions`].
+    fn apply_fk_update_actions(
+        &mut self,
+        parent: &Table,
+        updates: &[(Vec<u8>, Vec<u8>, Row, Row)],
+        meter: &mut Meter,
+    ) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let saved_pin = self.session.read_pin.take();
+        let result = (|| {
+            let referencers = self.fk_referencers(&parent.name);
+            let parent_colls = self.column_collations(&parent.columns);
+            for (child_name, fk) in &referencers {
+                if matches!(fk.on_update, FkAction::NoAction | FkAction::Restrict) {
+                    continue;
+                }
+                let child = self
+                    .table(child_name)
+                    .expect("foreign-key child exists")
+                    .clone();
+                let mut transitions = Vec::new();
+                for (_, _, new_row, old_row) in updates {
+                    let Some(old_probe) =
+                        fk_probe(fk, parent, &parent_colls, old_row, &fk.ref_columns)?
+                    else {
+                        continue;
+                    };
+                    let new_probe = fk_probe(fk, parent, &parent_colls, new_row, &fk.ref_columns)?;
+                    if new_probe
+                        .as_ref()
+                        .is_some_and(|p| p.bytes() == old_probe.bytes())
+                    {
+                        continue;
+                    }
+                    transitions.push((
+                        fk.ref_columns.iter().map(|&i| old_row[i].clone()).collect(),
+                        fk.ref_columns.iter().map(|&i| new_row[i].clone()).collect(),
+                    ));
+                }
+                self.run_fk_update_action(parent, &child, fk, &transitions, meter)?;
+            }
+            for (child_name, fk) in &referencers {
+                if !matches!(fk.on_update, FkAction::NoAction | FkAction::Restrict) {
+                    continue;
+                }
+                for (_, _, new_row, old_row) in updates {
+                    let Some(old_probe) =
+                        fk_probe(fk, parent, &parent_colls, old_row, &fk.ref_columns)?
+                    else {
+                        continue;
+                    };
+                    let new_probe = fk_probe(fk, parent, &parent_colls, new_row, &fk.ref_columns)?;
+                    if new_probe
+                        .as_ref()
+                        .is_some_and(|p| p.bytes() == old_probe.bytes())
+                        || self.fk_probe_hits(&old_probe, &parent.name)?
+                    {
+                        continue;
+                    }
+                    if self.fk_child_references(
+                        child_name,
+                        fk,
+                        parent,
+                        old_probe.bytes(),
+                        &HashSet::new(),
+                    )? {
+                        return Err(EngineError::fk_violation_delete(
+                            &parent.name,
+                            &fk.name,
+                            child_name,
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        })();
+        self.session.read_pin = saved_pin;
+        result
+    }
+
     /// Analyze and run a DELETE: resolve the table and optional predicate, collect
     /// the keys of matching rows (only a TRUE predicate matches — Kleene), then
     /// remove them. No WHERE deletes every row. Keys are collected before mutating
@@ -2370,6 +2762,7 @@ impl Engine {
                     format!("table does not exist: {}", del.table),
                 )
             })?;
+        let fk_parent = table.clone();
         // Refuse the write if any collated key is version-skewed (slice 2d, collation.md §12, XX002):
         // a DELETE must locate + remove a stored key, which a skewed encoding cannot match.
         self.ensure_collations_writable(&table.columns)?;
@@ -2517,41 +2910,8 @@ impl Engine {
             }
         }
 
-        // FOREIGN KEY parent-side (constraints.md §6.5): a DELETE must not strand a child. For
-        // each inbound FK, every deleted row's referenced tuple disappears (the referenced columns
-        // are unique, so each is unique to its row); if a child still references it → 23503.
-        // Unmetered, before phase 2 (all-or-nothing). For a self-reference the child IS this table,
-        // whose end state excludes the rows being deleted.
-        let referencers = self.fk_referencers(&del.table);
-        if !referencers.is_empty() {
-            let parent = self
-                .table(&del.table)
-                .expect("delete target exists")
-                .clone();
-            let deleted_keys: HashSet<Vec<u8>> = matched.iter().map(|(k, _)| k.clone()).collect();
-            let empty: HashSet<Vec<u8>> = HashSet::new();
-            for (child_table, fk) in &referencers {
-                let exclude = if child_table.eq_ignore_ascii_case(&del.table) {
-                    &deleted_keys
-                } else {
-                    &empty
-                };
-                for (_, row) in &matched {
-                    // `parent` is the delete target itself, so its key columns use `colls` (§2.12).
-                    let Some(probe) = fk_probe(fk, &parent, &colls, row, &fk.ref_columns)? else {
-                        continue; // a NULL referenced value cannot be referenced (MATCH SIMPLE)
-                    };
-                    if self.fk_child_references(child_table, fk, &parent, probe.bytes(), exclude)? {
-                        return Err(EngineError::fk_violation_delete(
-                            &parent.name,
-                            &fk.name,
-                            child_table,
-                        ));
-                    }
-                }
-            }
-        }
-
+        // Parent-side FK checks/actions run after phase 2 against the statement's action-closure
+        // end state (§6.6). Keep the pre-mutation catalog + referenced values for that pass.
         // The RETURNING projection (grammar.md §32, cost.md §3): evaluate over the matched
         // rows' OLD values before anything is removed — subqueries in the list read the
         // pre-statement snapshot, and a 54P01 here deletes nothing (all-or-nothing).
@@ -2590,6 +2950,7 @@ impl Engine {
             }
         }
         self.mark_estimator_mutation(del.db.as_deref(), &del.table);
+        self.apply_fk_delete_actions(&fk_parent, &matched, &mut meter)?;
         Ok(match (ret, returned) {
             (Some((_, names, types)), Some(rows)) => Outcome::Query {
                 column_names: names,
@@ -2633,6 +2994,7 @@ impl Engine {
                     format!("table does not exist: {}", upd.table),
                 )
             })?;
+        let fk_parent = table.clone();
         // Refuse the write if any collated key is version-skewed (slice 2d, collation.md §12, XX002):
         // an UPDATE re-encodes + re-places keys, which a skewed encoding would corrupt.
         self.ensure_collations_writable(&table.columns)?;
@@ -3098,85 +3460,9 @@ impl Engine {
             }
         }
 
-        // FOREIGN KEY parent-side (constraints.md §6.5): an UPDATE of a referenced row must not
-        // strand a child. A referenced column — PRIMARY KEY (now re-keyable) or UNIQUE — may
-        // change. For each inbound FK, a referenced tuple DISAPPEARS when an updated row's old
-        // value is absent from the statement's new end state (`old − new` over the updated rows);
-        // if a child still references a disappearing tuple → 23503. Unmetered, phase 1. A
-        // self-reference's child IS this table: the committed scan excludes the rows being updated
-        // (their NEW references are checked separately, `new_child_refs`, since a re-key can leave
-        // an updated row pointing at its own now-vacated value — the child-side probe reads the
-        // pre-update parent, so it cannot see that).
-        let referencers = self.fk_referencers(&upd.table);
-        if !referencers.is_empty() {
-            let parent = self
-                .table(&upd.table)
-                .expect("update target exists")
-                .clone();
-            let updated_keys: HashSet<Vec<u8>> =
-                updates.iter().map(|(k, _, _, _)| k.clone()).collect();
-            let empty: HashSet<Vec<u8>> = HashSet::new();
-            for (child_table, fk) in &referencers {
-                let self_ref = child_table.eq_ignore_ascii_case(&upd.table);
-                // `parent` is the update target itself, so its key columns use `colls` (§2.12).
-                // The referenced tuples the updated rows now supply (so a swap re-supplies one).
-                let mut new_present: HashSet<Vec<u8>> = HashSet::new();
-                for (_, _, new_row, _) in &updates {
-                    if let Some(p) = fk_probe(fk, &parent, &colls, new_row, &fk.ref_columns)? {
-                        new_present.insert(p.bytes().to_vec());
-                    }
-                }
-                // For a self-reference, the FK tuples the updated rows now POINT AT (their new
-                // local-column values): an updated row referencing a disappearing tuple dangles.
-                let new_child_refs: HashSet<Vec<u8>> = if self_ref {
-                    let mut s = HashSet::new();
-                    for (_, _, new_row, _) in &updates {
-                        if let Some(p) = fk_probe(fk, &parent, &colls, new_row, &fk.columns)? {
-                            s.insert(p.bytes().to_vec());
-                        }
-                    }
-                    s
-                } else {
-                    HashSet::new()
-                };
-                let exclude = if self_ref { &updated_keys } else { &empty };
-                for (_, _, new_row, old_row) in &updates {
-                    let Some(old_probe) = fk_probe(fk, &parent, &colls, old_row, &fk.ref_columns)?
-                    else {
-                        continue; // a NULL old referenced value was referenced by nothing
-                    };
-                    // Unchanged tuples (incl. a NULL→ already skipped) do not disappear.
-                    if let Some(new_probe) =
-                        fk_probe(fk, &parent, &colls, new_row, &fk.ref_columns)?
-                    {
-                        if new_probe.bytes() == old_probe.bytes() {
-                            continue;
-                        }
-                    }
-                    // Re-supplied by another updated row (e.g. a value swap) → not disappearing.
-                    if new_present.contains(old_probe.bytes()) {
-                        continue;
-                    }
-                    // Stranded if a committed (non-updated) child OR an updated row's NEW
-                    // reference still points at the disappearing tuple.
-                    if self.fk_child_references(
-                        child_table,
-                        fk,
-                        &parent,
-                        old_probe.bytes(),
-                        exclude,
-                    )? || new_child_refs.contains(old_probe.bytes())
-                    {
-                        return Err(EngineError::fk_violation_delete(
-                            &parent.name,
-                            &fk.name,
-                            child_table,
-                        ));
-                    }
-                }
-            }
-        }
-
+        // Parent-side checks and generated referential actions run after the target rows have
+        // reached their new statement state. Keep the catalog snapshot that defines the old/new
+        // transition; generated child writes recursively use the ordinary DML pipeline.
         // Each rewritten row's disposition plan may attempt compression (a record over
         // RECORD_MAX) — meter the attempts (value_compress, cost.md §3) and enforce the
         // ceiling BEFORE phase 2 writes anything, preserving all-or-nothing.
@@ -3249,8 +3535,8 @@ impl Engine {
             for (old_key, _, _, _) in &updates {
                 store.remove(old_key)?;
             }
-            for (_, new_key, row, _) in updates {
-                if !store.insert(new_key, row)? {
+            for (_, new_key, row, _) in &updates {
+                if !store.insert(new_key.clone(), row.clone())? {
                     // Reachable only under the writable-CTE read pin (writable-cte.md §7): an
                     // earlier sub-statement staged this key, unseen by phase 1. Aborts
                     // all-or-nothing, matching INSERT. For a single statement, phase 1's
@@ -3279,8 +3565,8 @@ impl Engine {
                 }
             }
         } else {
-            for (key, _, row, _) in updates {
-                store.replace(&key, row)?;
+            for (key, _, row, _) in &updates {
+                store.replace(key, row.clone())?;
             }
             for (k, def) in indexes.iter().enumerate() {
                 let istore =
@@ -3299,6 +3585,7 @@ impl Engine {
             }
         }
         self.mark_estimator_mutation(upd.db.as_deref(), &upd.table);
+        self.apply_fk_update_actions(&fk_parent, &updates, &mut meter)?;
         Ok(match (ret, returned) {
             (Some((_, names, types)), Some(rows)) => Outcome::Query {
                 column_names: names,

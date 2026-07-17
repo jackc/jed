@@ -1,12 +1,12 @@
 //! FOREIGN KEY constraints — `[CONSTRAINT name] FOREIGN KEY (cols) REFERENCES …` and the
 //! column-level `REFERENCES` (spec/design/constraints.md §6, grammar.md §43). Covers what the
-//! oracle corpus (`ddl/foreign_key.test`) cannot: the jed-specific divergences from PostgreSQL
-//! (strict same-type pairing, the deferred referential actions, the end-state parent UPDATE), and
+//! shared corpus (`ddl/foreign_key*.test`) cannot: the jed-specific divergences from PostgreSQL
+//! (strict same-type pairing and the end-state parent UPDATE), plus
 //! catalog introspection (constraint names, the resolved ordinals). The agreeing behavior — the
 //! 23503 enforcement at every write site, MATCH SIMPLE, the batch end state, 42830/2BP01 — is the
 //! corpus's job. Mirrored in impl/go/foreign_key_test.go and impl/ts/tests/foreign_key.test.ts.
 
-use jed::{CreateOptions, Database, Session, SessionOptions};
+use jed::{CreateOptions, Database, Session, SessionOptions, Value};
 
 fn db_with(sql: &[&str]) -> Session {
     let mut db = Database::create(CreateOptions::default())
@@ -77,32 +77,25 @@ fn strict_same_type_pairing() {
         .unwrap();
 }
 
-/// The referential actions CASCADE / SET NULL / SET DEFAULT parse but are rejected at CREATE TABLE
-/// (0A000); NO ACTION and RESTRICT are accepted (spec/design/constraints.md §6.6).
+/// All five actions are stored; their behavior lives in the shared conformance corpus (§6.6).
 #[test]
-fn referential_actions_narrowed() {
+fn referential_actions_catalog() {
     let mut db = db_with(&["CREATE TABLE p (id i32 PRIMARY KEY)"]);
-    assert_eq!(
-        err(
-            &mut db,
-            "CREATE TABLE c1 (x i32 REFERENCES p ON DELETE CASCADE)"
-        ),
-        "0A000"
-    );
-    assert_eq!(
-        err(
-            &mut db,
-            "CREATE TABLE c2 (x i32 REFERENCES p ON UPDATE SET NULL)"
-        ),
-        "0A000"
-    );
-    assert_eq!(
-        err(
-            &mut db,
-            "CREATE TABLE c3 (x i32 REFERENCES p ON DELETE SET DEFAULT)"
-        ),
-        "0A000"
-    );
+    db.query_outcome(
+        "CREATE TABLE c1 (x i32 REFERENCES p ON DELETE CASCADE)",
+        &[],
+    )
+    .unwrap();
+    db.query_outcome(
+        "CREATE TABLE c2 (x i32 REFERENCES p ON UPDATE SET NULL)",
+        &[],
+    )
+    .unwrap();
+    db.query_outcome(
+        "CREATE TABLE c3 (x i32 REFERENCES p ON DELETE SET DEFAULT)",
+        &[],
+    )
+    .unwrap();
     // NO ACTION / RESTRICT (and the default) are fine.
     db.query_outcome(
         "CREATE TABLE c4 (x i32 REFERENCES p ON DELETE NO ACTION ON UPDATE RESTRICT)",
@@ -122,6 +115,8 @@ fn parent_update_end_state_swap_allowed() {
         "INSERT INTO p VALUES (1, 100), (2, 200)",
         "CREATE TABLE c (id i32 PRIMARY KEY, pc i32 REFERENCES p (code))",
         "INSERT INTO c VALUES (10, 100), (11, 200)",
+        "CREATE TABLE cc (id i32 PRIMARY KEY, pc i32 REFERENCES p (code) ON UPDATE CASCADE)",
+        "INSERT INTO cc VALUES (20, 100), (21, 200)",
     ]);
     // Swap 100 ⇄ 200 across the two parent rows: the end state still contains {100, 200}, so both
     // children remain valid. jed accepts this (PG would reject the transient collision).
@@ -130,6 +125,15 @@ fn parent_update_end_state_swap_allowed() {
         &[],
     )
     .unwrap();
+    let rows = db.rows_in_key_order("cc").unwrap();
+    assert!(matches!(
+        rows[0].as_slice(),
+        [Value::Int(20), Value::Int(200)]
+    ));
+    assert!(matches!(
+        rows[1].as_slice(),
+        [Value::Int(21), Value::Int(100)]
+    ));
     // But genuinely removing a referenced value still traps 23503.
     assert_eq!(
         err(&mut db, "UPDATE p SET code = 999 WHERE id = 1"),

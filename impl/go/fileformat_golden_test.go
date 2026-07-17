@@ -180,18 +180,17 @@ func uniqueTableDB(t *testing.T) *Session {
 }
 
 // fkTableDB exercises FOREIGN KEY constraints (v11 — spec/design/constraints.md §6): a child
-// table c with four FKs — a default-PK reference, a named UNIQUE reference, a composite UNIQUE
-// reference with ON DELETE RESTRICT, and a self-reference — pinning the catalog foreign-key list
-// (the name + local/ref ordinals + actions byte). Must match the Ruby reference's FK_TABLE
+// table c with four FKs whose action bytes collectively pin every v30 action code — pinning the
+// catalog foreign-key list (the name + local/ref ordinals + actions byte). Must match FK_TABLE
 // (spec/fileformat/verify.rb).
 func fkTableDB(t *testing.T) *Session {
 	db := newInMemoryWithPageSize(goldenPageSize).Session(SessionOptions{})
 	run(t, db, "CREATE TABLE p (pid i32 PRIMARY KEY, code i32 UNIQUE, a i32, b i32, UNIQUE (a, b))")
 	run(t, db, "INSERT INTO p VALUES (1, 100, 10, 20), (2, 200, 30, 40)")
 	run(t, db, "CREATE TABLE c (id i32 PRIMARY KEY, pid i32, pcode i32, x i32, y i32, mgr i32, "+
-		"FOREIGN KEY (pid) REFERENCES p (pid), "+
-		"CONSTRAINT c_code_fk FOREIGN KEY (pcode) REFERENCES p (code), "+
-		"FOREIGN KEY (x, y) REFERENCES p (a, b) ON DELETE RESTRICT, "+
+		"FOREIGN KEY (pid) REFERENCES p (pid) ON DELETE RESTRICT, "+
+		"CONSTRAINT c_code_fk FOREIGN KEY (pcode) REFERENCES p (code) ON DELETE SET NULL, "+
+		"FOREIGN KEY (x, y) REFERENCES p (a, b) ON DELETE CASCADE ON UPDATE SET DEFAULT, "+
 		"FOREIGN KEY (mgr) REFERENCES c (id))")
 	run(t, db, "INSERT INTO c VALUES (10, 1, 100, 10, 20, NULL), (11, 2, 200, 30, 40, 10)")
 	return db

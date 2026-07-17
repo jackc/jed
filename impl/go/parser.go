@@ -697,7 +697,7 @@ func (p *parser) parseReferencesClause() (string, []string, refAction, refAction
 }
 
 // parseReferentialAction parses one referential_action (spec/design/grammar.md §43). All five
-// PG actions parse; CASCADE / SET NULL / SET DEFAULT are rejected later at CREATE TABLE (0A000).
+// All five PostgreSQL actions are resolved and persisted by CREATE/ALTER TABLE.
 func (p *parser) parseReferentialAction() (refAction, error) {
 	switch p.peekKeyword() {
 	case "no":

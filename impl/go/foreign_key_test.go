@@ -2,8 +2,8 @@ package jed
 
 // FOREIGN KEY constraints — `[CONSTRAINT name] FOREIGN KEY (cols) REFERENCES …` and the
 // column-level `REFERENCES` (spec/design/constraints.md §6, grammar.md §43). Covers what the
-// oracle corpus (ddl/foreign_key.test) cannot: the jed-specific divergences from PostgreSQL
-// (strict same-type pairing, the deferred referential actions, the end-state parent UPDATE), and
+// shared corpus (ddl/foreign_key*.test) cannot: the jed-specific divergences from PostgreSQL
+// (strict same-type pairing and the end-state parent UPDATE), plus
 // catalog introspection (constraint names, the resolved ordinals). The agreeing behavior — the
 // 23503 enforcement at every write site, MATCH SIMPLE, the batch end state, 42830/2BP01 — is the
 // corpus's job. Mirrors impl/rust/tests/foreign_key.rs and impl/ts/tests/foreign_key.test.ts.
@@ -87,9 +87,9 @@ func TestForeignKeyStrictTypePairing(t *testing.T) {
 	}
 }
 
-// CASCADE / SET NULL / SET DEFAULT parse but are rejected at CREATE TABLE (0A000); NO ACTION and
-// RESTRICT are accepted (constraints.md §6.6).
-func TestForeignKeyReferentialActionsNarrowed(t *testing.T) {
+// All five referential actions are stored by CREATE TABLE (constraints.md §6.6); their shared
+// behavior lives in the language-neutral conformance corpus.
+func TestForeignKeyReferentialActionsCatalog(t *testing.T) {
 	t.Parallel()
 	db := fkSetup(t, "CREATE TABLE p (id i32 PRIMARY KEY)")
 	for _, sql := range []string{
@@ -97,8 +97,8 @@ func TestForeignKeyReferentialActionsNarrowed(t *testing.T) {
 		"CREATE TABLE c2 (x i32 REFERENCES p ON UPDATE SET NULL)",
 		"CREATE TABLE c3 (x i32 REFERENCES p ON DELETE SET DEFAULT)",
 	} {
-		if got := fkErr(t, db, sql); got != "0A000" {
-			t.Fatalf("%q: got %s, want 0A000", sql, got)
+		if _, err := queryOutcome(db, sql, nil); err != nil {
+			t.Fatalf("%q: %v", sql, err)
 		}
 	}
 	if _, err := queryOutcome(db, "CREATE TABLE c4 (x i32 REFERENCES p ON DELETE NO ACTION ON UPDATE RESTRICT)", nil); err != nil {
@@ -117,9 +117,15 @@ func TestForeignKeyParentUpdateEndStateSwap(t *testing.T) {
 		"INSERT INTO p VALUES (1, 100), (2, 200)",
 		"CREATE TABLE c (id i32 PRIMARY KEY, pc i32 REFERENCES p (code))",
 		"INSERT INTO c VALUES (10, 100), (11, 200)",
+		"CREATE TABLE cc (id i32 PRIMARY KEY, pc i32 REFERENCES p (code) ON UPDATE CASCADE)",
+		"INSERT INTO cc VALUES (20, 100), (21, 200)",
 	)
 	if _, err := queryOutcome(db, "UPDATE p SET code = CASE code WHEN 100 THEN 200 ELSE 100 END", nil); err != nil {
 		t.Fatalf("referenced-value swap should succeed (end state): %v", err)
+	}
+	out, err := queryOutcome(db, "SELECT id, pc FROM cc ORDER BY id", nil)
+	if err != nil || len(out.Rows) != 2 || out.Rows[0][1].Int != 200 || out.Rows[1][1].Int != 100 {
+		t.Fatalf("cascaded swap rows: %v, err=%v", out.Rows, err)
 	}
 	if got := fkErr(t, db, "UPDATE p SET code = 999 WHERE id = 1"); got != "23503" {
 		t.Fatalf("orphaning update: got %s, want 23503", got)

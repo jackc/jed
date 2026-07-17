@@ -500,9 +500,9 @@ FK constraints resolve **after** the table-level `PRIMARY KEY`, the `UNIQUE` con
    (CLAUDE.md §4) is the overriding reason, recorded in §6.7. Because the referenced columns are a
    PK/unique key, they are already key-encodable; same-type pairing makes the local columns
    key-encodable too, so no separate `0A000` type gate is needed.
-6. **Referential actions.** `NO ACTION` (the default) and `RESTRICT` are accepted and stored;
-   `CASCADE`, `SET NULL`, `SET DEFAULT` parse but are rejected — **`0A000`** (`ON DELETE/UPDATE
-   <action> is not supported`) — a documented narrowing (§6.6).
+6. **Referential actions.** `NO ACTION` (the default), `RESTRICT`, `CASCADE`, `SET NULL`, and
+   `SET DEFAULT` are accepted and stored. The three write actions are executed by the parent-side
+   mutation closure described in §6.6.
 7. **Naming.** An explicit `CONSTRAINT <name>` is used as written; otherwise the name is derived,
    PostgreSQL's algorithm: lowercased `<table>_<localcol>_<localcol>…_fkey` (every local column in
    list order, joined by `_`), suffix-walked past the table's **constraint namespace** (its checks
@@ -555,12 +555,14 @@ against the **committed parent state plus the statement's end state**, exactly a
 
 ### 6.5 Enforcement — the parent side (DELETE / UPDATE of the referenced table)
 
-A parent mutation must not leave a child pointing at a key that no longer exists. For each FK in any
-**other** table (and the table itself, for a self-reference) that references this table, in phase 1:
+A parent mutation must not leave a child pointing at a key that no longer exists. The directly
+targeted parent rows are written in phase 2; the action closure then visits each FK in any **other**
+table (and the table itself, for a self-reference) that references this table:
 
 - **DELETE.** For each deleted parent row, the referenced tuple **disappears** unless another
   (non-deleted) parent row still carries it — but the referenced columns are unique, so a deleted
-  row's tuple is unique to it. If any child row references that tuple → **`23503`**:
+  row's tuple is unique to it. A non-writing action rejects any child row that still references that
+  tuple after the write actions finish → **`23503`**:
 
   ```
   update or delete on table <table> violates foreign key constraint <name>
@@ -570,11 +572,11 @@ A parent mutation must not leave a child pointing at a key that no longer exists
   **UNIQUE** — may change. jed computes the set of referenced tuples that were present in the
   updated rows' **old** values but are **absent from the statement's end state** (`old_tuples −
   new_tuples`, over the updated rows; untouched rows keep their values and, by uniqueness, cannot
-  hold a disappearing tuple). For each such **disappearing** tuple, if a child references it →
-  **`23503`**. For a **self-referencing** FK the child *is* this table, so "references it" includes
+  hold a disappearing tuple). A non-writing action rejects each such **disappearing** tuple when a
+  child still references it after write actions finish → **`23503`**. For a **self-referencing** FK
+  the child *is* this table, so "references it" includes
   an updated row's **own new** local-column value: re-keying a row away from an id it still points
-  at strands itself (`23503`), since the committed child-scan reads the pre-update parent and
-  cannot see the row's new key. A referenced-value **swap** (or a key cascade) therefore succeeds
+  at strands itself (`23503`). A referenced-value **swap** (or a key cascade) therefore succeeds
   (the end state still contains every referenced tuple) where PostgreSQL's per-row check fails on
   the transient — the same end-state divergence `UNIQUE` carries (§6.7, [indexes.md §7](indexes.md)).
 
@@ -588,15 +590,45 @@ deterministic: referencing tables in ascending lowercased-name order, then FKs i
 
 ### 6.6 Referential actions
 
-The grammar accepts the full `ON DELETE` / `ON UPDATE` action set; this slice **supports only**
-`NO ACTION` and `RESTRICT`, which are **identical in jed**: both reject a parent mutation that would
-orphan a child (§6.5). PostgreSQL distinguishes them by *deferrability* (NO ACTION may be deferred to
-end-of-statement, RESTRICT is immediate), but jed has no deferrable constraints and validates every
-constraint at the statement boundary anyway, so the distinction is unobservable. `CASCADE`,
-`SET NULL`, `SET DEFAULT` — which would *write* the child during a parent mutation — are rejected at
-CREATE TABLE (`0A000`) and deferred to a later slice; supporting them means threading cascading
-child writes through the parent's two-phase pass. The stored action is persisted (§6.9) so the
-catalog is forward-compatible, but only `NO ACTION`/`RESTRICT` are ever written today.
+The grammar and executor support the full `ON DELETE` / `ON UPDATE` action set:
+
+- **`NO ACTION` / `RESTRICT`** reject a parent mutation whose final action-closure state would
+  orphan a child (`23503`, §6.5). They are identical in jed: PostgreSQL distinguishes them through
+  deferrability (`NO ACTION` may be deferred, `RESTRICT` is immediate), but jed has no deferred
+  constraints and validates both at the statement boundary.
+- **`ON DELETE CASCADE`** deletes every child row whose complete, non-NULL FK tuple matched a
+  deleted parent tuple. Those child deletes recursively apply their own inbound actions.
+- **`ON UPDATE CASCADE`** assigns each matching child FK tuple the parent row's new referenced
+  values, positionally. Every changed parent row contributes an `old tuple -> new tuple` mapping.
+  The mappings are applied as one child-table update, so a multi-row key swap does not visit an
+  already-cascaded child twice.
+- **`SET NULL`** assigns SQL NULL to **every** local member column of the matching FK. Ordinary
+  assignment validation follows: a `NOT NULL` member raises `23502` and the entire originating
+  statement is rolled back.
+- **`SET DEFAULT`** assigns each local member column its declared default, or NULL when the column
+  has no default, once per affected child row. Expression defaults use the same host-injected
+  clock/entropy/sequence seams as ordinary DML. The resulting row is validated normally; in
+  particular, a default tuple that names no parent raises `23503`.
+
+Actions run inside the originating statement's all-or-nothing mutation closure. The directly
+targeted parent rows are phase-2-written first; then inbound write actions run to a fixed point;
+finally `NO ACTION`/`RESTRICT` checks observe that resulting state. This ordering lets a cascade
+remove or repair a child before a sibling non-writing FK is checked. Generated UPDATEs and DELETEs
+use the ordinary row pipeline: coercion / NOT NULL, CHECK, PK/UNIQUE/EXCLUDE, outgoing FKs, index
+maintenance, and further inbound actions. A failure at any depth discards the whole statement (or
+aborts the containing explicit transaction), including every already-staged parent/child write.
+
+For one parent mutation batch, referencing tables are visited by ascending lowercased table name,
+then FK name. Within one FK, matching child rows use storage-key order. Write actions run in that
+order; the non-writing checks run only after every sibling write action. A cycle terminates naturally
+once its next generated mutation matches no current row. Cascading call depth is capped at 256;
+exceeding it is `54001` (`statement_too_complex`) so an FK chain assembled across many DDL statements
+cannot overflow a core's native stack.
+
+`RETURNING` and the DML command tag remain those of the directly named statement: generated child
+rows are not appended and do not increase `rows_affected`. Their deterministic scan, expression,
+and compression work **does** accrue to the originating statement's cost and to its `max_cost` /
+`lifetime_max_cost` ceilings. The reverse FK match itself remains unmetered, as before (§6.11).
 
 ### 6.7 Divergences from PostgreSQL (documented per CLAUDE.md §1)
 
@@ -607,17 +639,19 @@ catalog is forward-compatible, but only `NO ACTION`/`RESTRICT` are ever written 
   values, or otherwise keeps every referenced tuple present in the end state, succeeds where PG's
   per-row check fails on the transient — the two-phase / all-or-nothing model (CLAUDE.md §11
   step 6), the same divergence `UNIQUE` carries ([indexes.md §7](indexes.md)).
-- **Referential actions.** Only `NO ACTION`/`RESTRICT`; `CASCADE`/`SET NULL`/`SET DEFAULT` are
-  `0A000` (§6.6).
+- **NO ACTION equals RESTRICT.** PostgreSQL can defer `NO ACTION` while `RESTRICT` is immediate;
+  jed has no deferred-constraint machinery, so both inspect the statement's final action closure
+  (§6.6).
 - **No DETAIL line.** The `23503` message is a single line in jed's house style (no PG `DETAIL: Key
   (…)=(…) is …` second line); the code matches.
 - **Constraint namespace only.** An FK name lives in the per-table **constraint** namespace (with
   CHECK), not the relation namespace — `CREATE TABLE fk_name (…)` does not collide with an FK named
   `fk_name`. PG keeps constraint names per-table too, so this matches PG; the note is only that, like
   the PK's `_pkey`, jed does not reserve FK names in the relation namespace.
-- **No system catalog surface / `ALTER TABLE`.** FKs are observable only via their enforcement and
-  the per-core host catalog; there is no `pg_constraint`, no `ALTER TABLE … ADD/DROP CONSTRAINT`, and
-  no `ON DELETE … CASCADE` at `DROP TABLE` (see §6.10).
+- **No PostgreSQL system-catalog surface.** FKs are observable through enforcement, the per-core
+  host catalog, and jed's `jed_constraints` surface; there is no `pg_constraint`. `ALTER TABLE …
+  ADD/DROP CONSTRAINT` supports FKs, while `DROP TABLE … CASCADE` remains outside the grammar
+  (§6.10).
 
 ### 6.8 Key-order mapping
 
@@ -630,15 +664,18 @@ parent column's type ([encoding.md §2.3](encoding.md)). The concatenation is ex
 storage key (PK case) or unique-index prefix (UNIQUE case), so the probe is `memcmp`-correct with no
 special-casing.
 
-### 6.9 Persistence (`format_version` 11)
+### 6.9 Persistence (`format_version` 11; action encoding revised in version 30)
 
-Each table's catalog entry gains a **foreign-key list**, after the index list and before the
+Each table's catalog entry has a **foreign-key list**, after the index list and before the
 trailing root-page pointer ([../fileformat/format.md](../fileformat/format.md)): an `fk_count`
 followed, per FK, by the **constraint name**, the **local-column ordinal list** (count + ordinals,
 in declaration/list order), the **referenced table name**, the **referenced-column ordinal list**
-(count + ordinals, in list order — ordinals into the *parent* table), and a **flags/action byte**
-(`on_delete` and `on_update` actions, two bits each; remaining bits reserved, written 0 and
-read-validated → `XX001`). The list is held in **ascending lowercased-name order** (the catalog's
+(count + ordinals, in list order — ordinals into the *parent* table), and a **flags/action byte**.
+Since `format_version` 30 each action occupies three bits (`NO ACTION = 0`, `RESTRICT = 1`,
+`CASCADE = 2`, `SET NULL = 3`, `SET DEFAULT = 4`): `on_delete` uses bits 0–2, `on_update` bits
+3–5, and bits 6–7 are reserved, written 0 and read-validated to `XX001`. This supersedes v11's
+two-bit-per-action layout, which could represent only the two actions then implemented. The list is
+held in **ascending lowercased-name order** (the catalog's
 standing deterministic order, like checks and indexes), which is also the §6.4 child-side
 name-evaluation order. An FK creates no B-tree, so — unlike an index — it stores no root page. On
 load the referenced-table/column names and ordinals are read back verbatim; a dangling reference in
@@ -657,13 +694,15 @@ always fine and takes its FK with it. (`DROP TABLE` cost stays zero — a pure c
 
 ### 6.11 Cost
 
-FK enforcement is **unmetered** validation work, like the primary-key duplicate check and the
-uniqueness probes (cost.md §3 "What is NOT metered"): a child `INSERT`/`UPDATE` accrues the same cost
-whether or not the table has FKs, and a parent `DELETE`/`UPDATE`'s child scan is not charged. (The
-`max_cost` ceiling therefore does not bound the parent-side child scan — acceptable because the child
-table's size is itself bounded by the metered work that populated it, the same reasoning `UNIQUE`
-relies on, §5; the backing-index follow-on would make the scan a probe.) A runtime error inside an
-expression along the way (none arise from FK checks themselves) propagates as itself.
+FK **validation and reverse matching** are unmetered, like the primary-key duplicate check and the
+uniqueness probes (cost.md §3 "What is NOT metered"): a child `INSERT`/`UPDATE` that only validates
+an FK accrues the same cost whether or not the constraint exists, and the parent-side scan that
+discovers matching children is not charged. (The `max_cost` ceiling therefore does not directly
+bound that reverse scan — acceptable because the child table's size is itself bounded by the metered
+work that populated it, the same reasoning `UNIQUE` relies on, §5; the backing-index follow-on would
+make it a probe.) A referential **write action**, however, executes the ordinary generated child
+UPDATE/DELETE pipeline and charges its scan, expression, and compression units to the originating
+statement (§6.6). Runtime errors in a `SET DEFAULT` expression propagate as themselves.
 
 ## 7. INSERT validation and write order
 

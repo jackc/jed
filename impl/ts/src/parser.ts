@@ -666,7 +666,7 @@ class Parser {
   }
 
   // parseReferentialAction parses one referential_action (spec/design/grammar.md §43). All five
-  // PG actions parse; CASCADE / SET NULL / SET DEFAULT are rejected later at CREATE TABLE (0A000).
+  // All five PostgreSQL actions are resolved and persisted by CREATE/ALTER TABLE.
   private parseReferentialAction(): RefAction {
     const kw = this.peekKeyword();
     if (kw === "no") {

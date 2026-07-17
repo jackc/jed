@@ -1,0 +1,326 @@
+# FOREIGN KEY referential actions (spec/design/constraints.md §6.6).
+# Parent DELETE/UPDATE executes CASCADE / SET NULL / SET DEFAULT through the ordinary child-row
+# mutation pipeline, recursively and inside the originating statement's all-or-nothing boundary.
+# Direct RETURNING/row counts remain scoped to the named parent mutation. Every successful/error
+# records below agree with PostgreSQL 18 except the final, ledgered NO ACTION closure-order case.
+# jed's end-state key-swap posture remains the documented constraints.md §6.7 divergence and is
+# kept out of this corpus.
+# requires: ddl.create_table, ddl.primary_key, ddl.unique, ddl.check, ddl.foreign_key, ddl.alter_table, dml.insert, dml.update, dml.delete, query.select, query.order_by, types.i32, null.three_valued, resource.cost_metering
+
+# --- CASCADE updates child keys and recursively deletes descendants ----------------------------
+
+statement ok
+CREATE TABLE act_p (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE act_c (id i32 PRIMARY KEY, pid i32 REFERENCES act_p ON UPDATE CASCADE ON DELETE CASCADE)
+
+statement ok
+CREATE TABLE act_g (id i32 PRIMARY KEY, cid i32 REFERENCES act_c ON DELETE CASCADE)
+
+statement ok
+INSERT INTO act_p VALUES (1), (2)
+
+statement ok
+INSERT INTO act_c VALUES (10, 1), (20, 1), (30, 2)
+
+statement ok
+INSERT INTO act_g VALUES (100, 10), (200, 20), (300, 30)
+
+# The generated child UPDATE's ordinary scan/eval work accrues to the parent statement. RETURNING
+# remains scoped to the directly updated parent row rather than including generated child rows.
+# cost: 17
+query I nosort
+UPDATE act_p SET id = 11 WHERE id = 1 RETURNING id
+----
+11
+
+query II rowsort
+SELECT id, pid FROM act_c ORDER BY id
+----
+10
+11
+20
+11
+30
+2
+
+statement ok
+DELETE FROM act_p WHERE id = 11
+
+query II rowsort
+SELECT id, pid FROM act_c ORDER BY id
+----
+30
+2
+
+query II rowsort
+SELECT id, cid FROM act_g ORDER BY id
+----
+300
+30
+
+# --- composite SET NULL assigns every local member on UPDATE and DELETE ------------------------
+
+statement ok
+CREATE TABLE sn_p (a i32, b i32, PRIMARY KEY (a, b))
+
+statement ok
+CREATE TABLE sn_c (id i32 PRIMARY KEY, x i32, y i32, FOREIGN KEY (x, y) REFERENCES sn_p (a, b) ON UPDATE SET NULL ON DELETE SET NULL)
+
+statement ok
+INSERT INTO sn_p VALUES (1, 1), (2, 2)
+
+statement ok
+INSERT INTO sn_c VALUES (10, 1, 1), (20, 2, 2)
+
+statement ok
+UPDATE sn_p SET a = 3, b = 3 WHERE a = 1
+
+statement ok
+DELETE FROM sn_p WHERE a = 2
+
+query III rowsort
+SELECT id, x, y FROM sn_c ORDER BY id
+----
+10
+NULL
+NULL
+20
+NULL
+NULL
+
+# --- SET DEFAULT uses each member's declared default, or NULL when absent ----------------------
+
+statement ok
+CREATE TABLE sd_p (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO sd_p VALUES (1), (2), (7)
+
+statement ok
+CREATE TABLE sd_c (id i32 PRIMARY KEY, pid i32 DEFAULT 7 REFERENCES sd_p ON UPDATE SET DEFAULT ON DELETE SET DEFAULT)
+
+statement ok
+CREATE TABLE sd_null (id i32 PRIMARY KEY, pid i32 REFERENCES sd_p ON DELETE SET DEFAULT)
+
+statement ok
+INSERT INTO sd_c VALUES (10, 1), (20, 2)
+
+statement ok
+INSERT INTO sd_null VALUES (30, 2)
+
+statement ok
+UPDATE sd_p SET id = 11 WHERE id = 1
+
+statement ok
+DELETE FROM sd_p WHERE id = 2
+
+query II rowsort
+SELECT id, pid FROM sd_c ORDER BY id
+----
+10
+7
+20
+7
+
+query II rowsort
+SELECT id, pid FROM sd_null
+----
+30
+NULL
+
+# --- generated writes use ordinary validation and roll the parent mutation back on failure -----
+
+statement ok
+CREATE TABLE fail_p (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO fail_p VALUES (1), (2)
+
+statement ok
+CREATE TABLE fail_nn (id i32 PRIMARY KEY, pid i32 NOT NULL REFERENCES fail_p ON DELETE SET NULL)
+
+statement ok
+INSERT INTO fail_nn VALUES (10, 1)
+
+statement error 23502
+DELETE FROM fail_p WHERE id = 1
+
+query I rowsort
+SELECT id FROM fail_p ORDER BY id
+----
+1
+2
+
+query II rowsort
+SELECT id, pid FROM fail_nn
+----
+10
+1
+
+statement ok
+CREATE TABLE fail_default (id i32 PRIMARY KEY, pid i32 DEFAULT 99 REFERENCES fail_p ON DELETE SET DEFAULT)
+
+statement ok
+INSERT INTO fail_default VALUES (20, 2)
+
+statement error 23503
+DELETE FROM fail_p WHERE id = 2
+
+query II rowsort
+SELECT id, pid FROM fail_default
+----
+20
+2
+
+statement ok
+CREATE TABLE fail_check_p (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO fail_check_p VALUES (1)
+
+statement ok
+CREATE TABLE fail_check (id i32 PRIMARY KEY, pid i32 REFERENCES fail_check_p ON UPDATE CASCADE, CHECK (pid < 10))
+
+statement ok
+INSERT INTO fail_check VALUES (30, 1)
+
+statement error 23514
+UPDATE fail_check_p SET id = 20 WHERE id = 1
+
+query I rowsort
+SELECT id FROM fail_check_p
+----
+1
+
+query II rowsort
+SELECT id, pid FROM fail_check
+----
+30
+1
+
+# --- self-reference and composite CASCADE -------------------------------------------------------
+
+statement ok
+CREATE TABLE action_node (id i32 PRIMARY KEY, parent i32 REFERENCES action_node ON UPDATE CASCADE ON DELETE CASCADE)
+
+statement ok
+INSERT INTO action_node VALUES (1, NULL), (2, 1), (3, 2)
+
+statement ok
+UPDATE action_node SET id = 10 WHERE id = 1
+
+query II rowsort
+SELECT id, parent FROM action_node ORDER BY id
+----
+10
+NULL
+2
+10
+3
+2
+
+statement ok
+DELETE FROM action_node WHERE id = 10
+
+query I rowsort
+SELECT id FROM action_node ORDER BY id
+----
+
+statement ok
+CREATE TABLE cc_p (a i32, b i32, PRIMARY KEY (a, b))
+
+statement ok
+CREATE TABLE cc_c (id i32 PRIMARY KEY, x i32, y i32, FOREIGN KEY (x, y) REFERENCES cc_p (a, b) ON UPDATE CASCADE ON DELETE CASCADE)
+
+statement ok
+INSERT INTO cc_p VALUES (1, 2)
+
+statement ok
+INSERT INTO cc_c VALUES (10, 1, 2), (20, 1, 2)
+
+statement ok
+UPDATE cc_p SET a = 3, b = 4 WHERE a = 1
+
+query III rowsort
+SELECT id, x, y FROM cc_c ORDER BY id
+----
+10
+3
+4
+20
+3
+4
+
+statement ok
+DELETE FROM cc_p WHERE a = 3
+
+query I rowsort
+SELECT id FROM cc_c ORDER BY id
+----
+
+# ALTER TABLE uses the same action resolution and executor path.
+statement ok
+CREATE TABLE alt_act_p (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE alt_act_c (id i32 PRIMARY KEY, pid i32)
+
+statement ok
+ALTER TABLE alt_act_c ADD CONSTRAINT alt_act_fk FOREIGN KEY (pid) REFERENCES alt_act_p ON DELETE CASCADE
+
+statement ok
+INSERT INTO alt_act_p VALUES (1)
+
+statement ok
+INSERT INTO alt_act_c VALUES (1, 1)
+
+statement ok
+DELETE FROM alt_act_p WHERE id = 1
+
+query I rowsort
+SELECT id FROM alt_act_c
+----
+
+# ON CONFLICT DO UPDATE is a parent UPDATE and runs the same action closure.
+statement ok
+CREATE TABLE upsert_act_p (id i32 PRIMARY KEY, code i32 UNIQUE)
+
+statement ok
+CREATE TABLE upsert_act_c (id i32 PRIMARY KEY, code i32 REFERENCES upsert_act_p (code) ON UPDATE CASCADE)
+
+statement ok
+INSERT INTO upsert_act_p VALUES (1, 10)
+
+statement ok
+INSERT INTO upsert_act_c VALUES (1, 10)
+
+statement ok
+INSERT INTO upsert_act_p VALUES (1, 20) ON CONFLICT (id) DO UPDATE SET code = excluded.code
+
+query I rowsort
+SELECT code FROM upsert_act_c
+----
+20
+
+# Write actions close before sibling NO ACTION checks. Deleting this parent cascades the child row,
+# so the sibling FK no longer observes an orphan in the final closure state. PostgreSQL executes
+# the alphabetically earlier immediate NO ACTION trigger first and raises 23503; jed deliberately
+# treats NO ACTION like RESTRICT at its final action-closure boundary (constraints.md §6.6/§6.7).
+statement ok
+CREATE TABLE sibling_p (id i32 PRIMARY KEY)
+
+statement ok
+CREATE TABLE sibling_c (id i32 PRIMARY KEY, a i32, b i32, CONSTRAINT a_check FOREIGN KEY (a) REFERENCES sibling_p, CONSTRAINT z_write FOREIGN KEY (b) REFERENCES sibling_p ON DELETE CASCADE)
+
+statement ok
+INSERT INTO sibling_p VALUES (1)
+
+statement ok
+INSERT INTO sibling_c VALUES (1, 1, 1)
+
+query I nosort
+DELETE FROM sibling_p WHERE id = 1 RETURNING id
+----
+1

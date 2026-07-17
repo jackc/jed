@@ -15,7 +15,13 @@ and (b) write the same logical database to bytes that equal the golden *exactly*
 other's output. A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 29)
+## Version scope (`format_version` 30)
+
+`format_version` **30** — **foreign-key referential actions**
+([../design/constraints.md §6](../design/constraints.md)). The existing `fk_actions` byte now
+contains two three-bit action codes, enabling `CASCADE`, `SET NULL`, and `SET DEFAULT` without
+changing the table-entry shape. Files without foreign keys still move to v30 by the version
+bytes/meta CRC under the exact-version clean break.
 
 `format_version` **29** — **persisted deterministic column statistics**
 ([../design/statistics.md](../design/statistics.md)). The catalog stream gains `entry_kind = 4`
@@ -478,7 +484,7 @@ and slot selection):
 | offset | size | field |
 |---|---|---|
 | 0  | 4 | `magic` = `4A 45 44 42` (ASCII `JEDB`, for the engine `jed`) |
-| 4  | 2 | `format_version` (u16) — current = **`29`** |
+| 4  | 2 | `format_version` (u16) — current = **`30`** |
 | 6  | 2 | reserved (0) |
 | 8  | 4 | `page_size` (u32) |
 | 12 | 8 | `txid` (u64) — commit counter; the highest valid slot wins on open |
@@ -624,7 +630,7 @@ columns and the index list after the checks, and retires column-flag bit0):
 | &nbsp;&nbsp;`fk_ref_table` | UTF-8 (original case) — the referenced (parent) table name |
 | &nbsp;&nbsp;`fk_ref_count` | u16 — the referenced column count; must equal `fk_local_count` (else `XX001`) |
 | &nbsp;&nbsp;`fk_ref_ordinal` ×`fk_ref_count` | u16 each — referenced-column ordinals into the **parent** table, in list order |
-| &nbsp;&nbsp;`fk_actions` | u8 — bits 0–1 `on_delete`, bits 2–3 `on_update` (`0` = NO ACTION, `1` = RESTRICT; `2`/`3` reserved for CASCADE/SET NULL/SET DEFAULT, not written this slice); bits 4–7 reserved, written 0 (a set reserved bit, or an unknown 2-bit action, is `XX001`) |
+| &nbsp;&nbsp;`fk_actions` | u8 — **v30:** bits 0–2 `on_delete`, bits 3–5 `on_update` (`0` = NO ACTION, `1` = RESTRICT, `2` = CASCADE, `3` = SET NULL, `4` = SET DEFAULT; `5…7` reserved); bits 6–7 reserved, written 0. A set reserved bit or reserved action code is `XX001` |
 | `excl_count` | u16 — the table's `EXCLUDE` constraint count (v21; 0 for a table with none) |
 | &nbsp;&nbsp;`excl_name_len` | u16 |
 | &nbsp;&nbsp;`excl_name` | UTF-8 (original case) — the constraint name |

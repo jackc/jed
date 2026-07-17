@@ -246,7 +246,7 @@ sits so the options stay open (CLAUDE.md §9).
 - **Multi-process file locking** — ✅ **landed ([locking.md](locking.md)).** Protocol-aware handles and
   file attachments share the same file safely through a stable `<path>.lock/` bundle carrying
   presence/arrival/transition/writer/commit OS locks. An
-  uncontended presence-EX lease preserves the current foreground path and v29 allocator. While
+  uncontended presence-EX lease preserves the current foreground path and v30 allocator. While
   co-resident, begins refresh the newest meta, one global writer commits append-only with
   `free_list_head = 0`, and body pages stay immutable. Free-page reuse, free-list persistence/rebuild,
   truncation, and compaction require presence-EX proof of aloneness plus the existing in-process

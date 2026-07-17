@@ -643,7 +643,7 @@ cross-core-identical and owns that consequence (the host-extension boundary, §1
   commit-publication gate. On capable
   local hosts `locking = auto` selects shared. One process normally holds a presence-EX fast-path
   lease, so foreground reads/writes perform **no coordination syscall or meta pread** and use the
-  current v29 allocator unchanged; a background probe notices a crash-clean arrival lock and opens a
+  current v30 allocator unchanged; a background probe notices a crash-clean arrival lock and opens a
   join window. While co-resident, transaction begin refreshes meta, writers serialize globally, and
   commits are append-only (`free_list_head = 0`). Reuse/reclamation/truncation/compaction require
   presence-EX proof of aloneness plus the in-process watermark. No format bump or persisted

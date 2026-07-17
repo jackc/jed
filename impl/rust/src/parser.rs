@@ -546,7 +546,7 @@ impl Parser {
     }
 
     /// Parse one `referential_action` (spec/design/grammar.md §43). All five PG actions parse;
-    /// CASCADE / SET NULL / SET DEFAULT are rejected later at CREATE TABLE (0A000).
+    /// All five PostgreSQL actions are resolved and persisted by CREATE/ALTER TABLE.
     fn parse_referential_action(&mut self) -> Result<RefAction> {
         match self.peek_keyword().as_deref() {
             Some("no") => {

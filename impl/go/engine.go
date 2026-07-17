@@ -194,6 +194,8 @@ type sessionState struct {
 	// unlimited. Bounds every statement run on this session: its Meter aborts 54P01 the instant
 	// accrued cost reaches it. The primary guard for untrusted queries.
 	maxCost int64
+	// fkActionDepth bounds recursive generated referential-action statements (§6.6).
+	fkActionDepth int
 	// lifetimeMaxCost is the per-session cumulative cost budget (spec/design/session.md §5.4), or 0
 	// for unlimited. Bounds the whole session: the instant lifetimeTotal reaches it the in-flight
 	// statement aborts 54P02, and once spent every further statement is rejected 54P02 at admission.

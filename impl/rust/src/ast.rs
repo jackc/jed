@@ -171,7 +171,7 @@ pub struct CreateTable {
     /// Every `FOREIGN KEY (cols) REFERENCES …` of the statement — the column-level
     /// `REFERENCES` form collects as a one-member list — in **textual definition order** (it
     /// drives resolution and naming — spec/design/constraints.md §6). CREATE TABLE's execution
-    /// resolves each (42703/42701/42P01/42830/42804), rejects unsupported actions (0A000), and
+    /// resolves each (42703/42701/42P01/42830/42804), stores its referential actions, and
     /// names the unnamed ones (42710).
     pub foreign_keys: Vec<ForeignKeyDef>,
     /// Every table-level `[CONSTRAINT name] EXCLUDE [USING gist] (col WITH op [, …])` of the
@@ -187,9 +187,7 @@ pub struct CreateTable {
     pub db: Option<String>,
 }
 
-/// A referential action for `ON DELETE` / `ON UPDATE` (spec/design/constraints.md §6.6). Only
-/// `NoAction` (the default) and `Restrict` are supported — identical in jed (no deferrable
-/// constraints); the write-actions parse but are rejected `0A000` at CREATE TABLE.
+/// A referential action for `ON DELETE` / `ON UPDATE` (spec/design/constraints.md §6.6).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RefAction {
     NoAction,

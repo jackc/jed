@@ -802,8 +802,8 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 	// (42703/42701) against this table; look up the parent (42P01, or the table itself for a
 	// self-reference); resolve the referenced columns (default to the parent PK, 42704 if it
 	// has none); check the arity (42830); name the constraint (explicit collision 42710, else
-	// derive `<table>_<cols>_fkey` with a suffix walk through the constraint namespace); reject
-	// the unsupported write-actions (0A000); require the referenced columns to be the parent PK
+	// derive `<table>_<cols>_fkey` with a suffix walk through the constraint namespace); resolve
+	// the selected actions; require the referenced columns to be the parent PK
 	// or a UNIQUE set (42830); and require same-type pairing (42804, stricter than PG). An FK
 	// owns no B-tree — enforcement probes the parent at every write (§6.4/§6.5).
 	resolvedFks := make([]foreignKey, 0, len(ct.ForeignKeys))
@@ -924,7 +924,7 @@ func (db *engine) executeCreateTable(ct *createTable) (outcome, error) {
 				name = base + strconv.Itoa(suffix)
 			}
 		}
-		// 6. Reject the unsupported write-actions (§6.6).
+		// 6. Resolve and store the selected referential actions (§6.6).
 		onDelete, err := newFkAction(fk.OnDelete, "DELETE")
 		if err != nil {
 			return outcome{}, err

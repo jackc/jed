@@ -1,14 +1,14 @@
 // FOREIGN KEY constraints — `[CONSTRAINT name] FOREIGN KEY (cols) REFERENCES …` and the
 // column-level `REFERENCES` (spec/design/constraints.md §6, grammar.md §43). Covers what the
-// oracle corpus (ddl/foreign_key.test) cannot: the jed-specific divergences from PostgreSQL
-// (strict same-type pairing, the deferred referential actions, the end-state parent UPDATE), and
+// shared corpus (ddl/foreign_key*.test) cannot: the jed-specific divergences from PostgreSQL
+// (strict same-type pairing and the end-state parent UPDATE), plus
 // catalog introspection (constraint names). The agreeing behavior — the 23503 enforcement at every
 // write site, MATCH SIMPLE, the batch end state, 42830/2BP01 — is the corpus's job. Mirrors
 // impl/rust/tests/foreign_key.rs and impl/go/foreign_key_test.go.
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { type Handle, dbWith, errCode } from "./util.ts";
+import { type Handle, dbWith, errCode, query } from "./util.ts";
 
 function fkNames(db: Handle, table: string): string[] {
   return db.table(table)!.fks.map((f) => f.name);
@@ -47,22 +47,12 @@ test("FK strict same-type pairing (42804)", () => {
   db.execute("CREATE TABLE c3 (x i32 REFERENCES p)"); // same type — accepted
 });
 
-// CASCADE / SET NULL / SET DEFAULT parse but are rejected at CREATE TABLE (0A000); NO ACTION and
-// RESTRICT are accepted (constraints.md §6.6).
-test("FK referential actions narrowed (0A000)", () => {
+// All five actions are stored; their behavior lives in the shared conformance corpus (§6.6).
+test("FK referential actions catalog", () => {
   const db = dbWith(["CREATE TABLE p (id i32 PRIMARY KEY)"]);
-  assert.equal(
-    errCode(() => db.execute("CREATE TABLE c1 (x i32 REFERENCES p ON DELETE CASCADE)")),
-    "0A000",
-  );
-  assert.equal(
-    errCode(() => db.execute("CREATE TABLE c2 (x i32 REFERENCES p ON UPDATE SET NULL)")),
-    "0A000",
-  );
-  assert.equal(
-    errCode(() => db.execute("CREATE TABLE c3 (x i32 REFERENCES p ON DELETE SET DEFAULT)")),
-    "0A000",
-  );
+  db.execute("CREATE TABLE c1 (x i32 REFERENCES p ON DELETE CASCADE)");
+  db.execute("CREATE TABLE c2 (x i32 REFERENCES p ON UPDATE SET NULL)");
+  db.execute("CREATE TABLE c3 (x i32 REFERENCES p ON DELETE SET DEFAULT)");
   db.execute("CREATE TABLE c4 (x i32 REFERENCES p ON DELETE NO ACTION ON UPDATE RESTRICT)");
 });
 
@@ -75,8 +65,14 @@ test("FK parent UPDATE end-state swap allowed", () => {
     "INSERT INTO p VALUES (1, 100), (2, 200)",
     "CREATE TABLE c (id i32 PRIMARY KEY, pc i32 REFERENCES p (code))",
     "INSERT INTO c VALUES (10, 100), (11, 200)",
+    "CREATE TABLE cc (id i32 PRIMARY KEY, pc i32 REFERENCES p (code) ON UPDATE CASCADE)",
+    "INSERT INTO cc VALUES (20, 100), (21, 200)",
   ]);
   db.execute("UPDATE p SET code = CASE code WHEN 100 THEN 200 ELSE 100 END"); // swap — end state valid
+  assert.deepEqual(query(db, "SELECT id, pc FROM cc ORDER BY id"), [
+    ["20", "200"],
+    ["21", "100"],
+  ]);
   assert.equal(
     errCode(() => db.execute("UPDATE p SET code = 999 WHERE id = 1")),
     "23503",

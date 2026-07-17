@@ -1169,3 +1169,12 @@ reason = "jed: NATURAL FULL JOIN with a common column is 0A000 — its merged co
 file = "expr/date_part.test"
 sql = "SELECT date_part('julian', DATE '2024-01-15')"
 reason = "jed: `julian` is a DEFERRED extract field on every source type (0A000 — timezones.md §9.2: for a timestamp it is a non-terminating decimal whose exact scale is PG-internal), and date_part inherits EXTRACT's field matrix verbatim after the date→timestamp widening. PostgreSQL computes it (2460325). The same documented divergence EXTRACT carries."
+
+# --- FOREIGN KEY action closure ordering. jed has no deferred constraints and defines NO ACTION
+# and RESTRICT identically at the final generated-action closure boundary (constraints.md §6.6).
+# PostgreSQL's alphabetically earlier immediate NO ACTION trigger fires before the later CASCADE
+# trigger in this case, so it reports 23503 instead of letting CASCADE remove the child row.
+[[override]]
+file = "ddl/foreign_key_actions.test"
+sql = "DELETE FROM sibling_p WHERE id = 1 RETURNING id"
+reason = "jed: generated FK write actions run to closure before sibling NO ACTION/RESTRICT checks, so z_write cascades the only child row and a_check sees no orphan. PostgreSQL runs the alphabetically earlier immediate a_check trigger first and raises 23503. This follows jed's documented no-deferrability rule: NO ACTION equals RESTRICT and both inspect the statement's final action closure (constraints.md §6.6/§6.7)."

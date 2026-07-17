@@ -57,9 +57,6 @@ Each intentional divergence is recorded in the relevant design doc in the
 
 jed implements a broad surface, but notable gaps remain. As representative (not exhaustive) examples:
 
-- Foreign-key referential **actions** beyond the default — `ON DELETE`/`ON UPDATE` with `CASCADE`,
-  `SET NULL`, or `SET DEFAULT` — are rejected at `CREATE TABLE` (`0A000`); `NO ACTION` (the default)
-  and `RESTRICT` are supported.
 - Some date/time surface is pending — `to_char` / `to_timestamp`, `date_part`, `age`, and a separate
   `time` type.
 - Spill-to-disk covers `ORDER BY`; the spilling hash join, aggregate, and `DISTINCT` are still in

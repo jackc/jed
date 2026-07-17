@@ -181,8 +181,8 @@ type createTable struct {
 	// ForeignKeys is every `FOREIGN KEY (cols) REFERENCES …` of the statement — the
 	// column-level `REFERENCES` form collects as a one-member list — in TEXTUAL DEFINITION
 	// ORDER (it drives resolution and naming — spec/design/constraints.md §6). CREATE TABLE's
-	// execution resolves each (42703/42701/42P01/42830/42804), rejects unsupported actions
-	// (0A000), and names the unnamed ones (42710).
+	// execution resolves each (42703/42701/42P01/42830/42804), stores its actions, and names the
+	// unnamed ones (42710).
 	ForeignKeys []foreignKeyDef
 	// Excludes is every table-level `[CONSTRAINT name] EXCLUDE [USING gist] (col WITH op [, …])`
 	// of the statement, in TEXTUAL DEFINITION ORDER (spec/design/gist.md §7). Execution resolves
@@ -217,9 +217,7 @@ type excludeElementDef struct {
 }
 
 // RefAction is a referential action for `ON DELETE` / `ON UPDATE`
-// (spec/design/constraints.md §6.6). Only NoAction (the default) and Restrict are
-// supported — identical in jed (no deferrable constraints); the write-actions parse but
-// are rejected 0A000 at CREATE TABLE.
+// (spec/design/constraints.md §6.6).
 type refAction int
 
 const (
@@ -227,11 +225,11 @@ const (
 	refNoAction refAction = iota
 	// RefRestrict is RESTRICT.
 	refRestrict
-	// RefCascade is CASCADE (parses; rejected 0A000).
+	// RefCascade is CASCADE.
 	refCascade
-	// RefSetNull is SET NULL (parses; rejected 0A000).
+	// RefSetNull is SET NULL.
 	refSetNull
-	// RefSetDefault is SET DEFAULT (parses; rejected 0A000).
+	// RefSetDefault is SET DEFAULT.
 	refSetDefault
 )
 

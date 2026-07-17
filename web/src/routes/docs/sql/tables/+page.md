@@ -10,7 +10,7 @@
 INSERT INTO account VALUES (1, 'Ada', 100.00), (2, 'Grace', 50.00);
 CREATE TABLE txn (
   id         i32 PRIMARY KEY,
-  account_id i32 NOT NULL REFERENCES account,
+  account_id i32 NOT NULL REFERENCES account ON DELETE CASCADE ON UPDATE CASCADE,
   amount     numeric(12,2) NOT NULL
 );
 INSERT INTO txn VALUES (1, 1, 25.00), (2, 2, 10.00);`;
@@ -41,11 +41,16 @@ Things to try in the panel above:
 - **PRIMARY KEY** uniqueness — `INSERT INTO account VALUES (1, 'Dup', 1);` &rarr; error `23505`
 - **NOT NULL** — `INSERT INTO account VALUES (4, NULL, 1);` &rarr; error `23502`
 - **FOREIGN KEY** — `INSERT INTO txn VALUES (3, 99, 5);` &rarr; error `23503` (no account `99`)
-- **FOREIGN KEY** (parent side) — `DELETE FROM account WHERE id = 1;` &rarr; error `23503` (txn `1`
-  still references it)
+- **FOREIGN KEY action** — `DELETE FROM account WHERE id = 1; SELECT * FROM txn;` &rarr; the
+  referencing txn row is deleted by `ON DELETE CASCADE`
 
 Each is rejected before anything is written — a statement is all-or-nothing. See the
 [error reference](../../reference/errors/) for every code.
+
+Foreign keys accept `ON DELETE` and `ON UPDATE` with `NO ACTION` (the default), `RESTRICT`,
+`CASCADE`, `SET NULL`, or `SET DEFAULT`. Actions recurse through dependent tables. `SET DEFAULT`
+uses each referencing column's declared default, or `NULL` when it has none; generated changes run
+the same type, `NOT NULL`, `CHECK`, uniqueness, and foreign-key checks as an ordinary statement.
 
 ## Applying defaults
 

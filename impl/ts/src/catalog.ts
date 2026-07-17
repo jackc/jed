@@ -111,11 +111,8 @@ export type ExclusionConstraint = {
 };
 
 // FkAction is the persisted referential action for a foreign key's `ON DELETE` / `ON UPDATE`
-// (spec/design/constraints.md §6.6). Only "noAction" (the default) and "restrict" are supported —
-// they are identical in jed (no deferrable constraints). The write-actions (CASCADE / SET NULL /
-// SET DEFAULT) are rejected 0A000 at CREATE TABLE, so never reach here; the on-disk encoding
-// reserves codes for them (format.md).
-export type FkAction = "noAction" | "restrict";
+// (spec/design/constraints.md §6.6).
+export type FkAction = "noAction" | "restrict" | "cascade" | "setNull" | "setDefault";
 
 // ForeignKey is one resolved FOREIGN KEY constraint of a table (spec/design/constraints.md §6):
 // its (per-table constraint-namespace) name, the referencing column ordinals into THIS table in

@@ -175,14 +175,16 @@ impl IndexDef {
 }
 
 /// The persisted referential action for a foreign key's `ON DELETE` / `ON UPDATE`
-/// (spec/design/constraints.md §6.6). Only `NoAction` (the default) and `Restrict` are
-/// supported — they are identical in jed (no deferrable constraints). The write-actions
-/// (CASCADE / SET NULL / SET DEFAULT) are rejected `0A000` at CREATE TABLE, so never reach here;
-/// the on-disk encoding reserves codes for them (format.md).
+/// (spec/design/constraints.md §6.6). `NoAction` and `Restrict` are identical in jed (there are no
+/// deferrable constraints); write actions generate ordinary DML through the action closure. The
+/// v30 action byte assigns each variant a stable three-bit code (format.md).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FkAction {
     NoAction,
     Restrict,
+    Cascade,
+    SetNull,
+    SetDefault,
 }
 
 /// One resolved `FOREIGN KEY` constraint of a table (spec/design/constraints.md §6): its

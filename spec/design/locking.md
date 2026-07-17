@@ -33,7 +33,7 @@ file mutation remain explicitly outside the safety boundary.
 The earlier exclusive-first proposal is superseded. The motivating deploy no longer has to wait for
 the old process to close: old and new processes may overlap, with writes serialized by the protocol.
 
-The protocol is designed against the **current format (v29)**. On-disk free-list persistence and
+The protocol is designed against the **current format (v30)**. On-disk free-list persistence and
 continuous within-session reclamation already landed in v25. No format bump and no persisted
 `catalog_gen` are required for correctness: after a foreign `txid`, the deliberately-slow contended path
 reloads the snapshot and invalidates persistent plan caches wholesale. A persistent catalog generation
@@ -58,7 +58,7 @@ back to a PID file, mtime lease, or best-effort stale-lock recovery.
    the locks. Wall-clock time controls only how long a caller waits, never ownership.
 7. **The uncontended foreground coordination path is unchanged.** Once one process holds the
    presence-exclusive lease, reads do not pread meta, writes do not acquire OS gates, and commits use
-   the existing v29 allocator and durability recipe. The background probe still makes the Rust
+   the existing v30 allocator and durability recipe. The background probe still makes the Rust
    process multithreaded and can change glibc allocator performance even though it adds no foreground
    coordination work (§9.3).
 8. **Only protocol participants may overlap.** A pre-protocol jed binary or any other process that

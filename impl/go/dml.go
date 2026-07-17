@@ -2376,57 +2376,10 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, pk []
 		}
 	}
 
-	// FOREIGN KEY parent-side (constraints.md §6.5): an updated referenced row must not strand a
-	// child (only a referenced UNIQUE column is at risk; inserts add rows, never strand a child).
-	referencers := db.fkReferencers(relation)
-	if len(referencers) > 0 && len(updates) > 0 {
-		parent, _ := db.Table(relation)
-		updatedKeys := make(map[string]struct{}, len(updates))
-		for _, u := range updates {
-			updatedKeys[string(u.key)] = struct{}{}
-		}
-		for ri := range referencers {
-			r := &referencers[ri]
-			// parent is the insert target itself, so its key columns use colls (§2.12).
-			newPresent := make(map[string]struct{})
-			for _, u := range updates {
-				probe, ok, err := buildFkProbe(&r.fk, parent, colls, u.newRow, r.fk.RefColumns)
-				if err != nil {
-					return 0, nil, err
-				}
-				if ok {
-					newPresent[string(probe.bytes)] = struct{}{}
-				}
-			}
-			for _, u := range updates {
-				oldProbe, ok, err := buildFkProbe(&r.fk, parent, colls, u.oldRow, r.fk.RefColumns)
-				if err != nil {
-					return 0, nil, err
-				}
-				if !ok {
-					continue
-				}
-				newProbe, ok, err := buildFkProbe(&r.fk, parent, colls, u.newRow, r.fk.RefColumns)
-				if err != nil {
-					return 0, nil, err
-				}
-				if ok {
-					if bytes.Equal(newProbe.bytes, oldProbe.bytes) {
-						continue
-					}
-				}
-				if _, present := newPresent[string(oldProbe.bytes)]; present {
-					continue
-				}
-				referenced, err := db.fkChildReferences(r.childTable, &r.fk, parent, oldProbe.bytes, updatedKeys)
-				if err != nil {
-					return 0, nil, err
-				}
-				if referenced {
-					return 0, nil, newFKViolationDelete(parent.Name, r.fk.Name, r.childTable)
-				}
-			}
-		}
+	// Parent-side validation/actions for DO UPDATE run after phase 2, like ordinary UPDATE.
+	fkUpdates := make([]fkUpdateTransition, len(updates))
+	for i := range updates {
+		fkUpdates[i] = fkUpdateTransition{newRow: updates[i].newRow, oldRow: updates[i].oldRow}
 	}
 
 	// Meter the disposition-plan compression attempts (value_compress, cost.md §3) for the
@@ -2575,6 +2528,9 @@ func (db *engine) insertRowsOnConflict(table *catTable, store *tableStore, pk []
 			}
 		}
 	}
+	if err := db.applyFkUpdateActions(table, fkUpdates, meter); err != nil {
+		return 0, nil, err
+	}
 	return affected, returned, nil
 }
 
@@ -2657,6 +2613,338 @@ func dmlOutcome(retNames []string, retTypes []string, returned [][]Value, affect
 		return outcome{Kind: outcomeQuery, ColumnNames: retNames, ColumnTypes: retTypes, Rows: returned, Cost: cost}
 	}
 	return outcome{Kind: outcomeStatement, Cost: cost, RowsAffected: affected, HasRowsAffected: true}
+}
+
+const maxFkActionDepth = 256
+
+type fkUpdateTransition struct {
+	newRow storedRow
+	oldRow storedRow
+}
+
+// balancedFkExpr combines a non-empty expression list without making resolver/evaluator depth
+// proportional to the number of parent rows in a generated referential-action predicate.
+func balancedFkExpr(exprs []exprNode, op binaryOp) exprNode {
+	for len(exprs) > 1 {
+		next := make([]exprNode, 0, (len(exprs)+1)/2)
+		for i := 0; i < len(exprs); i += 2 {
+			if i+1 == len(exprs) {
+				next = append(next, exprs[i])
+			} else {
+				next = append(next, newBinaryExpr(op, exprs[i], exprs[i+1]))
+			}
+		}
+		exprs = next
+	}
+	return exprs[0]
+}
+
+// fkActionMatchExpr builds one child FK-tuple equality in the parent's key collation.
+func fkActionMatchExpr(parent, child *catTable, fk *foreignKey, params []uint64) exprNode {
+	parts := make([]exprNode, 0, len(fk.Columns))
+	for slot, local := range fk.Columns {
+		lhs := exprNode{Kind: exprColumn, Column: child.Columns[local].Name}
+		if ty, ok := parent.Columns[fk.RefColumns[slot]].Type.AsScalar(); ok && ty == scalarText {
+			lhs = exprNode{Kind: exprCollate, Collate: &collateExpr{
+				Inner: lhs, Collation: parent.Columns[fk.RefColumns[slot]].Collation,
+			}}
+		}
+		rhs := exprNode{Kind: exprParam, Param: params[slot]}
+		parts = append(parts, newBinaryExpr(opEq, lhs, rhs))
+	}
+	return balancedFkExpr(parts, opAnd)
+}
+
+// fkActionPredicate selects child rows whose FK tuple equals any old parent tuple. It also returns
+// each tuple's parameter ids so ON UPDATE CASCADE can reuse the same conditions in CASE arms.
+func fkActionPredicate(parent, child *catTable, fk *foreignKey, oldTuples [][]Value) (exprNode, []Value, [][]uint64) {
+	var values []Value
+	ids := make([][]uint64, 0, len(oldTuples))
+	matches := make([]exprNode, 0, len(oldTuples))
+	for _, tuple := range oldTuples {
+		tupleIDs := make([]uint64, 0, len(tuple))
+		for _, value := range tuple {
+			values = append(values, value)
+			tupleIDs = append(tupleIDs, uint64(len(values)))
+		}
+		ids = append(ids, tupleIDs)
+		matches = append(matches, fkActionMatchExpr(parent, child, fk, tupleIDs))
+	}
+	return balancedFkExpr(matches, opOr), values, ids
+}
+
+// runFkActionUpdate/Delete execute generated work through the ordinary DML pipeline. The nested
+// meter live-charges the shared lifetime counter; its statement total is folded into the caller
+// without charging lifetime twice.
+func (db *engine) runFkActionUpdate(stmt *update, params []Value, meter *costMeter) error {
+	if err := meter.Guard(); err != nil {
+		return err
+	}
+	if db.session.fkActionDepth >= maxFkActionDepth {
+		return newError(StatementTooComplex, fmt.Sprintf(
+			"referential action depth exceeds the maximum of %d", maxFkActionDepth,
+		))
+	}
+	savedLimit := db.session.maxCost
+	if savedLimit > 0 {
+		db.session.maxCost = savedLimit - meter.Accrued
+	} else {
+		db.session.maxCost = 0
+	}
+	db.session.fkActionDepth++
+	out, err := db.executeUpdate(stmt, params, cteCtx{})
+	db.session.fkActionDepth--
+	db.session.maxCost = savedLimit
+	if err != nil {
+		return err
+	}
+	meter.Accrued += out.Cost
+	return meter.Guard()
+}
+
+func (db *engine) runFkActionDelete(stmt *deleteStmt, params []Value, meter *costMeter) error {
+	if err := meter.Guard(); err != nil {
+		return err
+	}
+	if db.session.fkActionDepth >= maxFkActionDepth {
+		return newError(StatementTooComplex, fmt.Sprintf(
+			"referential action depth exceeds the maximum of %d", maxFkActionDepth,
+		))
+	}
+	savedLimit := db.session.maxCost
+	if savedLimit > 0 {
+		db.session.maxCost = savedLimit - meter.Accrued
+	} else {
+		db.session.maxCost = 0
+	}
+	db.session.fkActionDepth++
+	out, err := db.executeDelete(stmt, params, cteCtx{})
+	db.session.fkActionDepth--
+	db.session.maxCost = savedLimit
+	if err != nil {
+		return err
+	}
+	meter.Accrued += out.Cost
+	return meter.Guard()
+}
+
+func (db *engine) runFkDeleteAction(parent, child *catTable, fk *foreignKey, oldTuples [][]Value, meter *costMeter) error {
+	if len(oldTuples) == 0 {
+		return nil
+	}
+	filter, params, _ := fkActionPredicate(parent, child, fk, oldTuples)
+	switch fk.OnDelete {
+	case fkCascade:
+		return db.runFkActionDelete(&deleteStmt{Table: child.Name, Filter: &filter}, params, meter)
+	case fkSetNull, fkSetDefault:
+		assignments := make([]assignment, 0, len(fk.Columns))
+		for _, column := range fk.Columns {
+			assignments = append(assignments, assignment{
+				Column: child.Columns[column].Name, IsDefault: fk.OnDelete == fkSetDefault,
+				Value: exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalNull}},
+			})
+		}
+		return db.runFkActionUpdate(&update{Table: child.Name, Assignments: assignments, Filter: &filter}, params, meter)
+	default:
+		return nil
+	}
+}
+
+func (db *engine) runFkUpdateAction(parent, child *catTable, fk *foreignKey, transitions [][2][]Value, meter *costMeter) error {
+	if len(transitions) == 0 {
+		return nil
+	}
+	oldTuples := make([][]Value, len(transitions))
+	for i := range transitions {
+		oldTuples[i] = transitions[i][0]
+	}
+	filter, params, oldIDs := fkActionPredicate(parent, child, fk, oldTuples)
+	assignments := make([]assignment, 0, len(fk.Columns))
+	switch fk.OnUpdate {
+	case fkCascade:
+		newIDs := make([][]uint64, 0, len(transitions))
+		for _, transition := range transitions {
+			ids := make([]uint64, 0, len(transition[1]))
+			for _, value := range transition[1] {
+				params = append(params, value)
+				ids = append(ids, uint64(len(params)))
+			}
+			newIDs = append(newIDs, ids)
+		}
+		for slot, column := range fk.Columns {
+			whens := make([]caseWhen, 0, len(transitions))
+			for i, ids := range oldIDs {
+				param := exprNode{Kind: exprParam, Param: newIDs[i][slot]}
+				result := exprNode{Kind: exprCast, Cast: &castExpr{
+					Inner: param, TypeName: child.Columns[column].Type.CanonicalName(),
+				}}
+				whens = append(whens, caseWhen{Cond: fkActionMatchExpr(parent, child, fk, ids), Result: result})
+			}
+			els := exprNode{Kind: exprColumn, Column: child.Columns[column].Name}
+			assignments = append(assignments, assignment{
+				Column: child.Columns[column].Name,
+				Value:  exprNode{Kind: exprCase, Case: &caseExpr{Whens: whens, Els: &els}},
+			})
+		}
+	case fkSetNull, fkSetDefault:
+		for _, column := range fk.Columns {
+			assignments = append(assignments, assignment{
+				Column: child.Columns[column].Name, IsDefault: fk.OnUpdate == fkSetDefault,
+				Value: exprNode{Kind: exprLiteral, Literal: &literal{Kind: literalNull}},
+			})
+		}
+	default:
+		return nil
+	}
+	return db.runFkActionUpdate(&update{Table: child.Name, Assignments: assignments, Filter: &filter}, params, meter)
+}
+
+// applyFkDeleteActions runs generated write actions first, then validates NO ACTION/RESTRICT
+// against the resulting action closure. Generated work temporarily sees the working snapshot even
+// when the originating statement belongs to a writable CTE.
+func (db *engine) applyFkDeleteActions(parent *catTable, rows []storedRow, meter *costMeter) (err error) {
+	if len(rows) == 0 {
+		return nil
+	}
+	savedPin := db.session.readPin
+	db.session.readPin = nil
+	defer func() { db.session.readPin = savedPin }()
+	referencers := db.fkReferencers(parent.Name)
+	parentColls := db.columnCollations(parent.Columns)
+	for i := range referencers {
+		r := &referencers[i]
+		if r.fk.OnDelete == fkNoAction || r.fk.OnDelete == fkRestrict {
+			continue
+		}
+		child, ok := db.Table(r.childTable)
+		if !ok {
+			panic("foreign-key child exists")
+		}
+		var oldTuples [][]Value
+		for _, row := range rows {
+			if _, ok, probeErr := buildFkProbe(&r.fk, parent, parentColls, row, r.fk.RefColumns); probeErr != nil {
+				return probeErr
+			} else if ok {
+				tuple := make([]Value, len(r.fk.RefColumns))
+				for j, column := range r.fk.RefColumns {
+					tuple[j] = row[column]
+				}
+				oldTuples = append(oldTuples, tuple)
+			}
+		}
+		if err := db.runFkDeleteAction(parent, child, &r.fk, oldTuples, meter); err != nil {
+			return err
+		}
+	}
+	for i := range referencers {
+		r := &referencers[i]
+		if r.fk.OnDelete != fkNoAction && r.fk.OnDelete != fkRestrict {
+			continue
+		}
+		for _, row := range rows {
+			probe, ok, err := buildFkProbe(&r.fk, parent, parentColls, row, r.fk.RefColumns)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				continue
+			}
+			referenced, err := db.fkChildReferences(r.childTable, &r.fk, parent, probe.bytes, map[string]struct{}{})
+			if err != nil {
+				return err
+			}
+			if referenced {
+				return newFKViolationDelete(parent.Name, r.fk.Name, r.childTable)
+			}
+		}
+	}
+	return nil
+}
+
+func (db *engine) applyFkUpdateActions(parent *catTable, updates []fkUpdateTransition, meter *costMeter) (err error) {
+	if len(updates) == 0 {
+		return nil
+	}
+	savedPin := db.session.readPin
+	db.session.readPin = nil
+	defer func() { db.session.readPin = savedPin }()
+	referencers := db.fkReferencers(parent.Name)
+	parentColls := db.columnCollations(parent.Columns)
+	for i := range referencers {
+		r := &referencers[i]
+		if r.fk.OnUpdate == fkNoAction || r.fk.OnUpdate == fkRestrict {
+			continue
+		}
+		child, ok := db.Table(r.childTable)
+		if !ok {
+			panic("foreign-key child exists")
+		}
+		var transitions [][2][]Value
+		for _, u := range updates {
+			oldProbe, ok, err := buildFkProbe(&r.fk, parent, parentColls, u.oldRow, r.fk.RefColumns)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				continue
+			}
+			newProbe, newOK, err := buildFkProbe(&r.fk, parent, parentColls, u.newRow, r.fk.RefColumns)
+			if err != nil {
+				return err
+			}
+			if newOK && bytes.Equal(newProbe.bytes, oldProbe.bytes) {
+				continue
+			}
+			var transition [2][]Value
+			transition[0] = make([]Value, len(r.fk.RefColumns))
+			transition[1] = make([]Value, len(r.fk.RefColumns))
+			for j, column := range r.fk.RefColumns {
+				transition[0][j] = u.oldRow[column]
+				transition[1][j] = u.newRow[column]
+			}
+			transitions = append(transitions, transition)
+		}
+		if err := db.runFkUpdateAction(parent, child, &r.fk, transitions, meter); err != nil {
+			return err
+		}
+	}
+	for i := range referencers {
+		r := &referencers[i]
+		if r.fk.OnUpdate != fkNoAction && r.fk.OnUpdate != fkRestrict {
+			continue
+		}
+		for _, u := range updates {
+			oldProbe, ok, err := buildFkProbe(&r.fk, parent, parentColls, u.oldRow, r.fk.RefColumns)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				continue
+			}
+			newProbe, newOK, err := buildFkProbe(&r.fk, parent, parentColls, u.newRow, r.fk.RefColumns)
+			if err != nil {
+				return err
+			}
+			if newOK && bytes.Equal(newProbe.bytes, oldProbe.bytes) {
+				continue
+			}
+			present, err := db.fkProbeHits(oldProbe, parent.Name)
+			if err != nil {
+				return err
+			}
+			if present {
+				continue
+			}
+			referenced, err := db.fkChildReferences(r.childTable, &r.fk, parent, oldProbe.bytes, map[string]struct{}{})
+			if err != nil {
+				return err
+			}
+			if referenced {
+				return newFKViolationDelete(parent.Name, r.fk.Name, r.childTable)
+			}
+		}
+	}
+	return nil
 }
 
 // executeDelete analyzes and runs a DELETE: resolve the table and optional predicate,
@@ -2830,44 +3118,8 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (ou
 		db.explainActual.record("Filter", filterActual)
 	}
 
-	// FOREIGN KEY parent-side (constraints.md §6.5): a DELETE must not strand a child. For each
-	// inbound FK, every deleted row's referenced tuple disappears (the referenced columns are
-	// unique, so each is unique to its row); if a child still references it → 23503. Unmetered,
-	// before phase 2 (all-or-nothing). For a self-reference the child IS this table, whose end
-	// state excludes the rows being deleted.
-	referencers := db.fkReferencers(del.Table)
-	if len(referencers) > 0 {
-		parent, _ := db.Table(del.Table)
-		deletedKeys := make(map[string]struct{}, len(matched))
-		for _, m := range matched {
-			deletedKeys[string(m.key)] = struct{}{}
-		}
-		empty := map[string]struct{}{}
-		for ri := range referencers {
-			r := &referencers[ri]
-			exclude := empty
-			if strings.EqualFold(r.childTable, del.Table) {
-				exclude = deletedKeys
-			}
-			for _, m := range matched {
-				// parent is the delete target itself, so its key columns use colls (§2.12).
-				probe, ok, err := buildFkProbe(&r.fk, parent, colls, m.row, r.fk.RefColumns)
-				if err != nil {
-					return outcome{}, err
-				}
-				if !ok {
-					continue // a NULL referenced value cannot be referenced (MATCH SIMPLE)
-				}
-				referenced, err := db.fkChildReferences(r.childTable, &r.fk, parent, probe.bytes, exclude)
-				if err != nil {
-					return outcome{}, err
-				}
-				if referenced {
-					return outcome{}, newFKViolationDelete(parent.Name, r.fk.Name, r.childTable)
-				}
-			}
-		}
-	}
+	// Parent-side validation and generated referential actions run after phase 2 against the
+	// action-closure state. `table` is the catalog snapshot defining the deleted values.
 
 	// The RETURNING projection (grammar.md §32, cost.md §3): evaluate over the matched rows'
 	// OLD values before anything is removed — subqueries in the list read the pre-statement
@@ -2916,6 +3168,13 @@ func (db *engine) executeDelete(del *deleteStmt, params []Value, ctx cteCtx) (ou
 		}
 	}
 	db.markEstimatorMutation(del.DB, del.Table)
+	deletedRows := make([]storedRow, len(matched))
+	for i := range matched {
+		deletedRows[i] = matched[i].row
+	}
+	if err := db.applyFkDeleteActions(table, deletedRows, meter); err != nil {
+		return outcome{}, err
+	}
 	return dmlOutcome(retNames, retTypes, returned, int64(len(matched)), meter.Accrued), nil
 }
 
@@ -3439,89 +3698,8 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 		}
 	}
 
-	// FOREIGN KEY parent-side (constraints.md §6.5): an UPDATE of a referenced row must not strand
-	// a child. A referenced column — PRIMARY KEY (now re-keyable) or UNIQUE — may change. For each
-	// inbound FK, a referenced tuple DISAPPEARS when an updated row's old value is absent from the
-	// statement's new end state (old − new over the updated rows); if a child still references a
-	// disappearing tuple → 23503. Unmetered, phase 1. A self-reference's child IS this table: the
-	// committed scan excludes the rows being updated (their NEW references are checked separately,
-	// newChildRefs, since a re-key can leave an updated row pointing at its own now-vacated value —
-	// the child-side probe reads the pre-update parent, so it cannot see that).
-	referencers := db.fkReferencers(upd.Table)
-	if len(referencers) > 0 {
-		parent, _ := db.Table(upd.Table)
-		updatedKeys := make(map[string]struct{}, len(updates))
-		for _, u := range updates {
-			updatedKeys[string(u.key)] = struct{}{}
-		}
-		empty := map[string]struct{}{}
-		for ri := range referencers {
-			r := &referencers[ri]
-			selfRef := strings.EqualFold(r.childTable, upd.Table)
-			// parent is the update target itself, so its key columns use colls (§2.12).
-			// The referenced tuples the updated rows now supply (so a swap re-supplies one).
-			newPresent := make(map[string]struct{})
-			for _, u := range updates {
-				probe, ok, err := buildFkProbe(&r.fk, parent, colls, u.row, r.fk.RefColumns)
-				if err != nil {
-					return outcome{}, err
-				}
-				if ok {
-					newPresent[string(probe.bytes)] = struct{}{}
-				}
-			}
-			// For a self-reference, the FK tuples the updated rows now POINT AT (their new
-			// local-column values): an updated row referencing a disappearing tuple dangles.
-			newChildRefs := make(map[string]struct{})
-			if selfRef {
-				for _, u := range updates {
-					probe, ok, err := buildFkProbe(&r.fk, parent, colls, u.row, r.fk.Columns)
-					if err != nil {
-						return outcome{}, err
-					}
-					if ok {
-						newChildRefs[string(probe.bytes)] = struct{}{}
-					}
-				}
-			}
-			exclude := empty
-			if selfRef {
-				exclude = updatedKeys
-			}
-			for _, u := range updates {
-				oldProbe, ok, err := buildFkProbe(&r.fk, parent, colls, u.oldRow, r.fk.RefColumns)
-				if err != nil {
-					return outcome{}, err
-				}
-				if !ok {
-					continue // a NULL old referenced value was referenced by nothing
-				}
-				// Unchanged tuples (incl. a NULL → already skipped) do not disappear.
-				newProbe, ok, err := buildFkProbe(&r.fk, parent, colls, u.row, r.fk.RefColumns)
-				if err != nil {
-					return outcome{}, err
-				}
-				if ok {
-					if bytes.Equal(newProbe.bytes, oldProbe.bytes) {
-						continue
-					}
-				}
-				// Re-supplied by another updated row (e.g. a value swap) → not disappearing.
-				if _, present := newPresent[string(oldProbe.bytes)]; present {
-					continue
-				}
-				// Stranded if a committed (non-updated) child OR an updated row's NEW reference
-				// still points at the disappearing tuple.
-				referenced, err := db.fkChildReferences(r.childTable, &r.fk, parent, oldProbe.bytes, exclude)
-				if err != nil {
-					return outcome{}, err
-				}
-				if _, dangles := newChildRefs[string(oldProbe.bytes)]; referenced || dangles {
-					return outcome{}, newFKViolationDelete(parent.Name, r.fk.Name, r.childTable)
-				}
-			}
-		}
-	}
+	// Parent-side validation and generated actions run after the target rows reach their new
+	// statement state. `table` remains the catalog snapshot defining each old/new transition.
 
 	// Each rewritten row's disposition plan may attempt compression (a record over RECORD_MAX)
 	// — meter the attempts (value_compress, cost.md §3) and enforce the ceiling BEFORE phase 2
@@ -3656,6 +3834,13 @@ func (db *engine) executeUpdate(upd *update, params []Value, ctx cteCtx) (outcom
 		}
 	}
 	db.markEstimatorMutation(upd.DB, upd.Table)
+	fkUpdates := make([]fkUpdateTransition, len(updates))
+	for i := range updates {
+		fkUpdates[i] = fkUpdateTransition{newRow: updates[i].row, oldRow: updates[i].oldRow}
+	}
+	if err := db.applyFkUpdateActions(table, fkUpdates, meter); err != nil {
+		return outcome{}, err
+	}
 	return dmlOutcome(retNames, retTypes, returned, int64(len(updates)), meter.Accrued), nil
 }
 

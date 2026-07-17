@@ -25,7 +25,8 @@
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 29 # format_version 29: deterministic per-column statistics use kind-4 catalog entries;
+VERSION = 30 # format_version 30: FK actions use two three-bit fields in the actions byte;
+# format_version 29: deterministic per-column statistics use kind-4 catalog entries;
 # format_version 28: every table catalog entry appends row_count i64 (big-endian
 # two's-complement, restricted to nonnegative values) after root_data_page. The reference derives it
 # from the declarative rows and rejects `(root == 0) != (count == 0)` on decode. format_version 27:
@@ -1027,15 +1028,15 @@ COMPOSITE_ARRAY_FIELD_TABLE = {
 # parent `p` (a PK + two UNIQUE constraints, the FK targets) and child `c` carrying four FKs that
 # cover every shape: `c_code_fk` (named, references the UNIQUE column code), `c_mgr_fkey` (a
 # self-reference to c's own PK), `c_pid_fkey` (auto-named, references the PK), and `c_x_y_fkey`
-# (auto-named, COMPOSITE — references the two-column UNIQUE (a,b) — with ON DELETE RESTRICT, the lone
-# non-zero actions byte). FKs are emitted in ascending lowercased-name order; an FK owns no B-tree.
+# (auto-named, COMPOSITE — references the two-column UNIQUE (a,b)). Together their actions bytes pin
+# every v30 action code. FKs are emitted in ascending lowercased-name order; an FK owns no B-tree.
 # The cores build this via
 #   CREATE TABLE p (pid i32 PRIMARY KEY, code i32 UNIQUE, a i32, b i32, UNIQUE (a, b))
 #   INSERT INTO p VALUES (1, 100, 10, 20), (2, 200, 30, 40)
 #   CREATE TABLE c (id i32 PRIMARY KEY, pid i32, pcode i32, x i32, y i32, mgr i32,
-#     FOREIGN KEY (pid) REFERENCES p (pid),
-#     CONSTRAINT c_code_fk FOREIGN KEY (pcode) REFERENCES p (code),
-#     FOREIGN KEY (x, y) REFERENCES p (a, b) ON DELETE RESTRICT,
+#     FOREIGN KEY (pid) REFERENCES p (pid) ON DELETE RESTRICT,
+#     CONSTRAINT c_code_fk FOREIGN KEY (pcode) REFERENCES p (code) ON DELETE SET NULL,
+#     FOREIGN KEY (x, y) REFERENCES p (a, b) ON DELETE CASCADE ON UPDATE SET DEFAULT,
 #     FOREIGN KEY (mgr) REFERENCES c (id))
 #   INSERT INTO c VALUES (10, 1, 100, 10, 20, NULL), (11, 2, 200, 30, 40, 10)
 FK_TABLE = {
@@ -1052,10 +1053,10 @@ FK_TABLE = {
       columns: [col("id", "i32", pk: true), col("pid", "i32"), col("pcode", "i32"),
                 col("x", "i32"), col("y", "i32"), col("mgr", "i32")],
       fks: [
-        { name: "c_code_fk", local: [2], ref_table: "p", ref: [1] },
+        { name: "c_code_fk", local: [2], ref_table: "p", ref: [1], actions: 3 },
         { name: "c_mgr_fkey", local: [5], ref_table: "c", ref: [0] },
-        { name: "c_pid_fkey", local: [1], ref_table: "p", ref: [0] },
-        { name: "c_x_y_fkey", local: [3, 4], ref_table: "p", ref: [2, 3], actions: 1 }
+        { name: "c_pid_fkey", local: [1], ref_table: "p", ref: [0], actions: 1 },
+        { name: "c_x_y_fkey", local: [3, 4], ref_table: "p", ref: [2, 3], actions: 34 }
       ],
       rows: [[10, 1, 100, 10, 20, nil], [11, 2, 200, 30, 40, 10]] }
   ]
@@ -3143,8 +3144,8 @@ def decode_table_entry(buf, pos)
     raise "fk column count mismatch (local != ref)" if local.size != ref.size
 
     ab, pos = take(buf, pos, 1)
-    raise "reserved fk action bits set / unsupported action (only NO ACTION/RESTRICT — v11)" \
-      if (ab.getbyte(0) & ~0b1111) != 0 || (ab.getbyte(0) & 0b11) > 1 || ((ab.getbyte(0) >> 2) & 0b11) > 1
+    raise "reserved fk action bits set / unsupported action code" \
+      if (ab.getbyte(0) & ~0b11_1111) != 0 || (ab.getbyte(0) & 0b111) > 4 || ((ab.getbyte(0) >> 3) & 0b111) > 4
     fks << { name: fname, local: local, ref_table: rtable, ref: ref, actions: ab.getbyte(0) }
   end
   # EXCLUDE constraints (v21): name + backing GiST index name + the (column ordinal, operator) element

@@ -93,7 +93,8 @@ const MAGIC: [u8; 4] = *b"JEDB";
 /// v28 = **transactional table row counts** (spec/design/estimator.md §5): every table catalog entry
 /// appends an exact nonnegative big-endian `i64` count after `root_data_page`; root zero iff count
 /// zero. The count is installed beside the demand-paged skeleton, keeping open off the leaf level.
-const FORMAT_VERSION: u16 = 29;
+/// v30 = three-bit FOREIGN KEY action codes: CASCADE / SET NULL / SET DEFAULT are persisted.
+const FORMAT_VERSION: u16 = 30;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
 /// (`page_type`, `item_count`, `next_page`) plus a 4-byte per-page `crc32` (offset 12).
 pub(crate) const PAGE_HEADER: usize = 16;
@@ -3104,7 +3105,7 @@ fn table_entry_bytes(
     }
     // Foreign keys (v11): count, then per FK the name, the local-column ordinals (into THIS
     // table, list order), the referenced table name, the referenced-column ordinals (into the
-    // PARENT, list order), and the actions byte (bits 0-1 on_delete, bits 2-3 on_update) — in the
+    // PARENT, list order), and the v30 actions byte (bits 0-2 on_delete, bits 3-5 on_update) — in the
     // catalog's ascending lowercased-name order (spec/design/constraints.md §6.9). An FK owns no
     // B-tree (no root page).
     out.extend_from_slice(&(table.foreign_keys.len() as u16).to_be_bytes());
@@ -3123,7 +3124,7 @@ fn table_entry_bytes(
         for &c in &fk.ref_columns {
             out.extend_from_slice(&(c as u16).to_be_bytes());
         }
-        out.push(fk_action_code(fk.on_delete) | (fk_action_code(fk.on_update) << 2));
+        out.push(fk_action_code(fk.on_delete) | (fk_action_code(fk.on_update) << 3));
     }
     // EXCLUDE constraints (v21): count, then per exclusion the name, the backing GiST index name,
     // and the `(column ordinal, operator strategy)` element vector — in the catalog's ascending
@@ -3166,20 +3167,25 @@ fn exclusion_op_from_code(c: u8) -> Result<ExclusionOp> {
     }
 }
 
-/// The 2-bit on-disk code for a referential action (format.md): NO ACTION = 0, RESTRICT = 1.
+/// The v30 three-bit on-disk code for a referential action (format.md).
 fn fk_action_code(a: FkAction) -> u8 {
     match a {
         FkAction::NoAction => 0,
         FkAction::Restrict => 1,
+        FkAction::Cascade => 2,
+        FkAction::SetNull => 3,
+        FkAction::SetDefault => 4,
     }
 }
 
-/// Decode a 2-bit referential-action code; an unsupported code (2/3, reserved for the deferred
-/// write-actions) in an otherwise-valid file is `XX001`.
+/// Decode a v30 three-bit referential-action code; reserved codes are `XX001`.
 fn fk_action_from_code(c: u8) -> Result<FkAction> {
     match c {
         0 => Ok(FkAction::NoAction),
         1 => Ok(FkAction::Restrict),
+        2 => Ok(FkAction::Cascade),
+        3 => Ok(FkAction::SetNull),
+        4 => Ok(FkAction::SetDefault),
         _ => Err(corrupt("unsupported foreign-key action code")),
     }
 }
@@ -4252,7 +4258,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
             ref_cols.push(read_u16(buf, pos)? as usize);
         }
         let actions = read_u8(buf, pos)?;
-        if actions & !0b1111 != 0 {
+        if actions & !0b11_1111 != 0 {
             return Err(corrupt("reserved foreign-key action bit set"));
         }
         foreign_keys.push(ForeignKeyConstraint {
@@ -4260,8 +4266,8 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, i64, V
             columns: cols,
             ref_table,
             ref_columns: ref_cols,
-            on_delete: fk_action_from_code(actions & 0b11)?,
-            on_update: fk_action_from_code((actions >> 2) & 0b11)?,
+            on_delete: fk_action_from_code(actions & 0b111)?,
+            on_update: fk_action_from_code((actions >> 3) & 0b111)?,
         });
     }
     // EXCLUDE constraints (v21): name + backing index name + the `(column ordinal, operator)`

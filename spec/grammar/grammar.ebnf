@@ -203,8 +203,8 @@ column_constraint ::= "PRIMARY" "KEY"
 /* The REFERENCES clause shared by a column-level foreign key and a table-level FOREIGN KEY.
  * The referenced-column list is optional (defaults to the parent's PRIMARY KEY). The ON
  * DELETE / ON UPDATE actions may appear in either order and at most once each; NO ACTION and
- * RESTRICT behave identically in jed, CASCADE / SET NULL / SET DEFAULT are rejected at CREATE
- * TABLE (0A000). MATCH FULL / MATCH PARTIAL are not in the grammar (MATCH SIMPLE only). */
+ * RESTRICT behave identically in jed; CASCADE / SET NULL / SET DEFAULT generate ordinary child
+ * DML through the action closure. MATCH FULL / MATCH PARTIAL are not in the grammar. */
 references_clause  ::= "REFERENCES" identifier ("(" identifier ("," identifier)* ")")?
                        ("ON" ("DELETE" | "UPDATE") referential_action)*
 referential_action ::= "NO" "ACTION" | "RESTRICT" | "CASCADE" | "SET" "NULL" | "SET" "DEFAULT"
