@@ -10,7 +10,7 @@
 // which pull `node:fs` and cannot load in a browser bundle.
 
 import { EngineError } from '$jed/errors.ts';
-import { Engine, type Outcome } from '$jed/executor.ts';
+import { Engine, indexKeyLabel, type Outcome } from '$jed/executor.ts';
 import { createOpfs, openOpfs, closeOpfs } from '$jed/opfs.ts';
 import { parseSQL } from '$jed/parser.ts';
 import type { Statement } from '$jed/ast.ts';
@@ -141,7 +141,7 @@ function schemaOf(id: string): SchemaResult {
       primaryKey: t.pk.map((ord) => t.columns[ord]!.name),
       indexes: t.indexes.map((ix) => ({
         name: ix.name,
-        columns: ix.columns.map((ord) => t.columns[ord]!.name),
+        columns: ix.keys.map((key) => indexKeyLabel(key, t)),
         unique: ix.unique
       }))
     };

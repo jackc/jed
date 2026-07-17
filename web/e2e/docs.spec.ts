@@ -81,9 +81,7 @@ test('the tables page enforces a CHECK constraint live and resets to seed', asyn
   await expect(panel.getByTestId('result-rows')).toContainText('Ada');
 });
 
-test('the tables page enforces a FOREIGN KEY constraint live (23503) and resets to seed', async ({
-  page
-}) => {
+test('the tables page enforces a FOREIGN KEY and cascades parent deletes', async ({ page }) => {
   await page.goto('/docs/sql/tables/');
   const panel = page.getByTestId('live-sql');
   await expect(panel.getByTestId('result-rows')).toContainText('Ada');
@@ -93,10 +91,13 @@ test('the tables page enforces a FOREIGN KEY constraint live (23503) and resets 
   await panel.getByTestId('run-button').click();
   await expect(panel.getByTestId('error-code')).toHaveText('23503');
 
-  // The parent side: deleting an account still referenced by a txn also traps 23503.
-  await panel.getByTestId('sql-input').fill('DELETE FROM account WHERE id = 1');
+  // The parent side follows the declared ON DELETE CASCADE and removes txn 1 with account 1.
+  await panel
+    .getByTestId('sql-input')
+    .fill('DELETE FROM account WHERE id = 1; SELECT account_id FROM txn ORDER BY id');
   await panel.getByTestId('run-button').click();
-  await expect(panel.getByTestId('error-code')).toHaveText('23503');
+  await expect(panel.getByTestId('error-code')).toHaveCount(0);
+  await expect(panel.getByTestId('result-rows').locator('td')).toHaveText(['2']);
 
   await panel.getByTestId('reset-button').click();
   await expect(panel.getByTestId('result-rows')).toContainText('Ada');

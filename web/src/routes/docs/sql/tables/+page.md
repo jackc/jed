@@ -44,8 +44,8 @@ Things to try in the panel above:
 - **FOREIGN KEY action** — `DELETE FROM account WHERE id = 1; SELECT * FROM txn;` &rarr; the
   referencing txn row is deleted by `ON DELETE CASCADE`
 
-Each is rejected before anything is written — a statement is all-or-nothing. See the
-[error reference](../../reference/errors/) for every code.
+Each constraint violation is rejected before anything is written — a statement is all-or-nothing.
+See the [error reference](../../reference/errors/) for every code.
 
 Foreign keys accept `ON DELETE` and `ON UPDATE` with `NO ACTION` (the default), `RESTRICT`,
 `CASCADE`, `SET NULL`, or `SET DEFAULT`. Actions recurse through dependent tables. `SET DEFAULT`

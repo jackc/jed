@@ -333,8 +333,8 @@ task fmt: "fmt:check"
 # Biome flags (log10(e) in decimal.ts) are suppressed inline with justified biome-ignore comments,
 # since the suggested Math.LOG10E is a different f64 that would break the §8 byte-identity.
 # Scope is the TS core and host/tooling packages only: web is prettier-only here, with its own
-# `npm run check` (svelte-check)
-# as the web type gate (outside rake ci); the @generated files stay excluded via biome.json.
+# `npm run check` (svelte-check) as the web type gate in `rake ci`; the @generated files stay
+# excluded via biome.json.
 namespace :lint do
   desc "Lint the TypeScript cores with Biome's tailored ruleset (errors fail; warnings advise)"
   task :check do
@@ -351,6 +351,16 @@ end
 # Bare `rake lint` runs the gate; `rake lint:fix` applies the safe fixes.
 desc "Lint TypeScript core and host/tooling packages with Biome (alias for lint:check)"
 task lint: "lint:check"
+
+# web:check — svelte-check follows the website's $jed imports into the browser-consumed TS core
+# modules, catching drift at that downstream boundary as well as errors in the Svelte application.
+namespace :web do
+  desc "Type-check the website and its browser-consumed TypeScript core modules"
+  task :check do
+    npm_ci_if_stale(WEB_DIR)
+    sh "npm", "run", "--silent", "--prefix", WEB_DIR, "check"
+  end
+end
 
 # codegen — the "middle path" (CLAUDE.md §5): (re)generate per-language source from the
 # canonical spec data tables: the operator descriptor tables from spec/functions/catalog.toml,
@@ -866,12 +876,13 @@ task test: %w[conformance unit cli:test ruby:test migrate:test]
 
 # ci — the full merge gate, a SUPERSET of `rake test`. Adds the checks that aren't example-based
 # tests: spec-data + byte-fixture verification + codegen-drift (`verify`), the formatter gate
-# (`fmt`), the TS linter (`lint`), and generative differential testing — the NoREC/TLP metamorphic
-# sweep + the reducer self-test. So `test` is example-based truth (corpus ×3 + unit + CLI); `ci`
-# wraps it with static hygiene, spec integrity, and property/metamorphic fuzzing. Each step is
-# `sh`/task-failure propagating, so `rake ci` exits non-zero on the first failure.
+# (`fmt`), the TS linter (`lint`), the downstream web type check (`web:check`), and generative
+# differential testing — the NoREC/TLP metamorphic sweep + the reducer self-test. So `test` is
+# example-based truth (corpus ×3 + unit + CLI); `ci` wraps it with static hygiene, spec integrity,
+# and property/metamorphic fuzzing. Each step is `sh`/task-failure propagating, so `rake ci` exits
+# non-zero on the first failure.
 desc "Full merge gate: tests + real-process locking + spec/static/metamorphic verification"
-task ci: %w[verify fmt lint test concurrency:process] do
+task ci: %w[verify fmt lint web:check test concurrency:process] do
   Rake::Task["corpus:norec_sweep"].invoke
   Rake::Task["corpus:reduce_selftest"].invoke
 end

@@ -45,6 +45,24 @@ test('editing and running updates the grid and shows cost', async ({ page }) => 
   await expect(page.getByTestId('total-cost')).toContainText('cost');
 });
 
+test('schema sidebar refreshes with column and expression indexes', async ({ page }) => {
+  const pageErrors: string[] = [];
+  page.on('pageerror', (error) => pageErrors.push(error.message));
+
+  await page.goto('/tool/');
+  await expect(page.getByTestId('run-button')).toBeEnabled();
+  await setEditor(
+    page,
+    'CREATE INDEX note_body_idx ON note (body); CREATE INDEX note_lower_idx ON note (lower(body));'
+  );
+  await page.getByTestId('run-button').click();
+
+  const sidebar = page.getByTestId('schema-sidebar');
+  await expect(sidebar).toContainText('note_body_idx');
+  await expect(sidebar).toContainText('note_lower_idx');
+  expect(pageErrors).toEqual([]);
+});
+
 test('OPFS is supported and the file manager is available', async ({ page }) => {
   await page.goto('/tool/');
   await expect(page.getByTestId('create-db')).toBeVisible();

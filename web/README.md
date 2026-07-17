@@ -17,7 +17,7 @@ npm run dev            # dev server
 npm run build          # static build into ./build (+ Pagefind search index)
 npm run preview        # SvelteKit preview (note: does NOT serve the post-build Pagefind files)
 npm run test:browser   # build + serve build/ wholesale + Playwright interactive-feature tests
-npm run check          # svelte-check (advisory; see tsconfig note about the core under DOM lib)
+npm run check          # svelte-check (website + browser-consumed TS core modules)
 ```
 
 The deploy target is a GitHub Pages project page (`.github/workflows/web-deploy.yml`), which gates

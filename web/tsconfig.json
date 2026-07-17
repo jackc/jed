@@ -13,10 +13,6 @@
     "strict": true,
     "moduleResolution": "bundler"
   }
-  // NOTE: `svelte-check` follows the $jed alias into the TS core source and reports ONE spurious
-  // lib-mismatch there (crypto in seam.ts) because it checks the core under the app's DOM lib. The
-  // core is type-checked by its OWN tsconfig (impl/ts: esnext lib + node types) and Vite bundles it
-  // fine, so this is advisory only — the website's gates are `npm run build` and `npm run test:browser`.
   // Path aliases are handled by https://svelte.dev/docs/kit/configuration#alias
   // except $lib which is handled by https://svelte.dev/docs/kit/configuration#files
   //

@@ -1,8 +1,8 @@
 # Build and deploy the jed website (/web) to GitHub Pages (CLAUDE.md §6/§10). The site is entirely
-# static (SvelteKit adapter-static); this workflow gates on the interactive-feature Playwright suite
-# (the contract for the live database / language switcher / OPFS tool), then builds with the project
-# base path and publishes the artifact. The website is a non-core tooling module, so this is separate
-# from the engine's Rake CI.
+# static (SvelteKit adapter-static); this workflow gates on svelte-check and the interactive-feature
+# Playwright suite (the contract for the live database / language switcher / OPFS tool), then builds
+# with the project base path and publishes the artifact. The website is a non-core tooling module,
+# so this is separate from the engine's Rake CI.
 
 name: Deploy website
 
@@ -41,6 +41,9 @@ jobs:
           cache-dependency-path: web/package-lock.json
 
       - run: npm ci
+
+      - name: Type check
+        run: npm run check
 
       - name: Install Playwright Chromium
         run: npx playwright install --with-deps chromium

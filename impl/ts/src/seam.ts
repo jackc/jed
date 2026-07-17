@@ -36,7 +36,7 @@ export class Seam {
   // identical entropy semantics, no behavior change (the default source is not conformance-checked; the
   // # seed: directive injects seededRandomSource). getRandomValues fills ≤ 65536 bytes per call; uuid
   // fills are 8/16 bytes, but chunk for generality.
-  fill(buf: Uint8Array): void {
+  fill(buf: Uint8Array<ArrayBuffer>): void {
     if (this.randomFill) {
       this.randomFill(buf);
       return;
