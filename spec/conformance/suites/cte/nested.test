@@ -198,6 +198,11 @@ SELECT v FROM (WITH RECURSIVE r(v) AS (SELECT 1 UNION ALL SELECT v + 1 FROM r WH
 2
 3
 
+# A nested recursive CTE shadows an inherited same-named binding throughout its body. A reference
+# in its anchor is therefore an illegal recursive reference, not a reference to the outer CTE.
+statement error 42P19
+WITH e AS (SELECT 1 AS v) SELECT * FROM (WITH RECURSIVE e(v) AS (SELECT v FROM e UNION ALL SELECT v + 1 FROM e WHERE v < 3) SELECT * FROM e) s
+
 # A DATA-MODIFYING CTE in a nested WITH is rejected — DML-WITH is top-level only (matching PostgreSQL).
 statement error 0A000
 SELECT x FROM (WITH c AS (INSERT INTO t VALUES (9, 90) RETURNING n) SELECT n AS x FROM c) s

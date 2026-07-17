@@ -93,6 +93,14 @@ func (db *engine) planCteBindings(ctes []cte, recursive bool, inherited []*cteBi
 		if isRecursive {
 			// The body is `anchor UNION[ALL] recursive_term` (analyzeRecursiveCte verified).
 			so := cte.Body.AsQuery().SetOp
+			// The recursive CTE's name shadows an inherited binding throughout its body. In
+			// particular, an anchor reference must not fall through to an outer same-named CTE:
+			// PostgreSQL treats it as an illegal recursive reference, not an inherited one.
+			if hasCteBinding(inherited, lname) && countSelfRefsQuery(so.Lhs, lname) > 0 {
+				return nil, newError(InvalidRecursion, fmt.Sprintf(
+					"recursive reference to query %q must not appear within its non-recursive term", lname,
+				))
+			}
 			visible := append(append([]*cteBinding{}, inherited...), bindings...)
 			anchorPlan, err := db.planQuery(so.Lhs, nil, visible, ptypes)
 			if err != nil {
@@ -144,6 +152,15 @@ func (db *engine) planCteBindings(ctes []cte, recursive bool, inherited []*cteBi
 		})
 	}
 	return bindings, nil
+}
+
+func hasCteBinding(bindings []*cteBinding, name string) bool {
+	for _, binding := range bindings {
+		if binding.name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // planDmCte plans a data-modifying CTE body (spec/design/writable-cte.md): resolve its RETURNING
