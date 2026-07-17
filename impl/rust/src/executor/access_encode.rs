@@ -1304,6 +1304,7 @@ pub(crate) fn estimator_operator_nodes(expr: Option<&RExpr>) -> i64 {
         RExpr::Coalesce { args, .. }
         | RExpr::GreatestLeast { args, .. }
         | RExpr::ScalarFunc { args, .. }
+        | RExpr::HostFunc { args, .. }
         | RExpr::ArrayFunc { args, .. }
         | RExpr::RangeFunc { args, .. }
         | RExpr::RegexFunc { args, .. }
@@ -1395,6 +1396,7 @@ pub(crate) fn estimator_expression_children(expr: &RExpr) -> Vec<&RExpr> {
         RExpr::Coalesce { args, .. }
         | RExpr::GreatestLeast { args, .. }
         | RExpr::ScalarFunc { args, .. }
+        | RExpr::HostFunc { args, .. }
         | RExpr::ArrayFunc { args, .. }
         | RExpr::RangeFunc { args, .. }
         | RExpr::RegexFunc { args, .. }
@@ -2772,6 +2774,7 @@ pub(crate) fn rexpr_is_constant(e: &RExpr) -> bool {
         RExpr::Coalesce { args, .. }
         | RExpr::GreatestLeast { args, .. }
         | RExpr::ScalarFunc { args, .. }
+        | RExpr::HostFunc { args, .. }
         | RExpr::ArrayFunc { args, .. }
         | RExpr::RangeFunc { args, .. }
         | RExpr::RegexFunc { args, .. }

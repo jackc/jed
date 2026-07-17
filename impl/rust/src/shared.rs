@@ -588,6 +588,11 @@ pub(crate) struct Shared {
     coordinator: Option<Arc<FileCoordinator>>,
     /// Advances when a foreign txid is adopted; prepared plans clear lazily when this changes.
     plan_epoch: AtomicU64,
+    /// The frozen host extension registry (spec/design/extensibility.md §7): the scalar functions the
+    /// host supplied in the create/open options, shared into every minted session's [`SessionState`].
+    /// An empty default when no extensions were supplied. `Send + Sync` (its kernels are), so the
+    /// `Send + Sync` [`Database`] is unaffected.
+    extensions: Arc<crate::extension::ExtensionRegistry>,
 }
 
 impl Shared {
@@ -1342,6 +1347,15 @@ impl Database {
     /// so an in-memory tree must be built at the size it will serialize to; that is why
     /// [`CreateOptions::page_size`] is meaningful for the in-memory backing too.
     fn in_memory(page_size: u32) -> Database {
+        Self::in_memory_with(page_size, Arc::new(crate::extension::ExtensionRegistry::default()))
+    }
+
+    /// [`in_memory`](Self::in_memory) carrying a host extension registry (the in-memory branch of
+    /// [`Database::create`] with `CreateOptions::extensions`).
+    fn in_memory_with(
+        page_size: u32,
+        extensions: Arc<crate::extension::ExtensionRegistry>,
+    ) -> Database {
         // B3 (bplus-reshape.md): an in-memory database is a `MemoryBlockStore` seeded with the
         // empty from-scratch image, read/written through the same pager + Packed path as a file.
         // txid 0 is the pre-first-commit version (the same committed version an in-memory core
@@ -1350,7 +1364,7 @@ impl Database {
             .to_image(page_size, 0)
             .expect("an empty in-memory image always serializes");
         let engine = Engine::from_image(&image).expect("an empty in-memory image always loads");
-        Database::from_engine(engine)
+        Database::from_engine_coordinated(engine, None, extensions)
     }
 
     /// Build a shared core from a freshly opened/created/loaded [`Engine`] (file.rs / `from_image`):
@@ -1361,10 +1375,18 @@ impl Database {
     /// `Arc<SharedPaging>`, so every pinned/cloned snapshot faults clean pages through the one pool
     /// (spec/design/pager.md).
     fn from_engine(engine: Engine) -> Database {
-        Self::from_engine_coordinated(engine, None)
+        Self::from_engine_coordinated(
+            engine,
+            None,
+            Arc::new(crate::extension::ExtensionRegistry::default()),
+        )
     }
 
-    fn from_engine_coordinated(engine: Engine, coordinator: Option<FileCoordinator>) -> Database {
+    fn from_engine_coordinated(
+        engine: Engine,
+        coordinator: Option<FileCoordinator>,
+        extensions: Arc<crate::extension::ExtensionRegistry>,
+    ) -> Database {
         let coordinator = coordinator.map(Arc::new);
         let paging = engine
             .paging
@@ -1400,6 +1422,7 @@ impl Database {
             attachment_count: AtomicUsize::new(0),
             coordinator,
             plan_epoch: AtomicU64::new(0),
+            extensions,
         });
         if let Some(coordinator) = &shared.coordinator {
             let weak: Weak<Shared> = Arc::downgrade(&shared);
@@ -1528,6 +1551,9 @@ impl Database {
         } else {
             opts.page_size
         };
+        // Frozen at create, shared into every minted session (extensibility.md §7). Captured before
+        // the `opts.path` move below.
+        let extensions = opts.extensions.clone();
         match opts.path {
             Some(path) => {
                 let coordinator =
@@ -1542,9 +1568,14 @@ impl Database {
                         no_sync: opts.skip_fsync,
                     },
                 )?;
-                Ok(Database::from_engine_coordinated(engine, coordinator))
+                Ok(Database::from_engine_coordinated(
+                    engine,
+                    coordinator,
+                    extensions,
+                ))
             }
-            None => Ok(Database::in_memory(page_size)), // in-memory never fsyncs; skip_fsync is a no-op
+            // in-memory never fsyncs; skip_fsync is a no-op
+            None => Ok(Database::in_memory_with(page_size, extensions)),
         }
     }
 
@@ -1557,6 +1588,9 @@ impl Database {
     /// (the buffer-pool budget, read-only mode, work-mem). (The shared-core analogue of
     /// [`Engine::open_with_options`].)
     pub fn open_with_options<P: AsRef<Path>>(path: P, opts: OpenOptions) -> Result<Database> {
+        // Frozen at open, shared into every minted session (extensibility.md §7). Captured before the
+        // `..opts` move below (the Engine layer ignores it — extensions live on the shared core).
+        let extensions = opts.extensions.clone();
         let coordinator =
             FileCoordinator::open(path.as_ref(), opts.locking, opts.file_lock_timeout_ms)?;
         let canonical = coordinator
@@ -1575,7 +1609,11 @@ impl Database {
             },
         )?;
         drop(commit);
-        Ok(Database::from_engine_coordinated(engine, coordinator))
+        Ok(Database::from_engine_coordinated(
+            engine,
+            coordinator,
+            extensions,
+        ))
     }
 
     /// The committed version currently published (the monotonic commit counter, transactions.md
@@ -1790,6 +1828,7 @@ impl Database {
         engine.read_only = true; // the executor rejects writes (25006) / poisons a read-only block
         engine.core = Some(self.0.clone()); // route to the attachment registry (§5)
         engine.attached_committed = attached; // pin the attached roots together (§5)
+        engine.session.extensions = self.0.extensions.clone(); // the frozen host registry (extensibility.md §7)
         Session {
             shared: self.0.clone(),
             engine,
@@ -1826,6 +1865,7 @@ impl Database {
         self.0.configure_engine(&mut engine);
         engine.core = Some(self.0.clone()); // route to the attachment registry (§5)
         engine.attached_committed = attached; // pin the attached roots together (§5)
+        engine.session.extensions = self.0.extensions.clone(); // the frozen host registry (extensibility.md §7)
         engine
             .begin_tx(Some(true))
             .expect("a fresh handle has no open transaction");
@@ -1866,6 +1906,7 @@ impl Database {
         engine.core = Some(self.0.clone()); // route to the attachment registry (§5)
         engine.attached_committed = attached; // pin the attached roots together (§5)
         engine.session = SessionState::with_options(opts);
+        engine.session.extensions = self.0.extensions.clone(); // the frozen host registry (extensibility.md §7)
         if pinned.is_some() {
             // The engine enforces read-only too, so `begin_tx` rejects an explicit `BEGIN READ WRITE`
             // (25006) and downgrades a plain `BEGIN` to a read-only block (the access check above only

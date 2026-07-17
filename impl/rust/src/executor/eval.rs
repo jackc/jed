@@ -1565,6 +1565,43 @@ impl RExpr {
                 }
                 Ok(best.unwrap_or(Value::Null))
             }
+            RExpr::HostFunc {
+                id, args, result, ..
+            } => {
+                // A host-defined scalar function (spec/design/extensibility.md §4.2 / §5.1): the
+                // injection seam. The kernel is reached BY ID through the frozen registry — the path
+                // a compiled `match` on the closed `ScalarFunc` enum cannot offer a host.
+                let hf = env.exec.session.extensions.function(*id);
+                // The declared static cost (cost.md §6 design (a)), charged once per call; arguments
+                // charge their own. Guard immediately after (the size-scaled-charge discipline,
+                // cost.md §3) so a large declared weight aborts BEFORE the kernel runs.
+                m.charge(hf.cost);
+                m.guard()?;
+                // STRICT: a NULL argument short-circuits to NULL before the kernel runs (§4.2), so
+                // the kernel never sees a NULL — exactly like the built-in scalar-function arm.
+                let mut vals = Vec::with_capacity(args.len());
+                for a in args {
+                    let v = a.eval(row, env, m)?;
+                    if matches!(v, Value::Null) {
+                        return Ok(Value::Null); // NULL propagates
+                    }
+                    vals.push(v);
+                }
+                let out = (hf.kernel)(&vals)?;
+                // Defend jed's own strict type system against a misbehaving host kernel (CLAUDE.md
+                // §13 — the host owns its consequences, but a wrong-typed value must never reach
+                // jed's codecs / comparators): the returned value must be NULL or match the declared
+                // scalar result type.
+                if !crate::extension::value_matches_result(&out, *result) {
+                    return Err(EngineError::new(
+                        SqlState::DataException,
+                        format!(
+                            "host function returned a value not matching its declared result type {result:?}"
+                        ),
+                    ));
+                }
+                Ok(out)
+            }
             RExpr::ScalarFunc { func, args, result } => {
                 // One operator_eval per call (the uniform weight); arguments charge their own.
                 m.charge(COSTS.operator_eval);

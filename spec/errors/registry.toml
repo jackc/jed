@@ -421,6 +421,16 @@ class = "syntax error or access rule violation"
 template = "function does not exist: {name}"
 
 [[error]]
+code = "42723"
+name = "duplicate_function"
+class = "syntax error or access rule violation"
+# Host-extension registration (spec/design/extensibility.md §4.2): a second host scalar function
+# with an IDENTICAL (name, arg-types) signature. Signature-level, not name-level — a host may
+# overload a name across argument types (PG overloads by input type). The DDL `CREATE FUNCTION …
+# LANGUAGE HOST` collision (step 4) will reuse this code.
+template = "duplicate function: {detail}"
+
+[[error]]
 code = "42P18"
 name = "indeterminate_datatype"
 class = "syntax error or access rule violation"

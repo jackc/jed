@@ -66,6 +66,7 @@ export type SqlState =
   | "invalid_table_definition" // 42P16 — invalid table definition: {detail}
   | "grouping_error" // 42803 — column {name} must appear in the GROUP BY clause or be used in an aggregate function
   | "undefined_function" // 42883 — function does not exist: {name}
+  | "duplicate_function" // 42723 — duplicate function: {detail}
   | "indeterminate_datatype" // 42P18 — could not determine data type of parameter ${index}
   | "invalid_recursion" // 42P19 — {detail}
   | "undefined_parameter" // 42P02 — there is no parameter ${index}
@@ -152,6 +153,7 @@ const CODES: Record<SqlState, string> = {
   invalid_table_definition: "42P16",
   grouping_error: "42803",
   undefined_function: "42883",
+  duplicate_function: "42723",
   indeterminate_datatype: "42P18",
   invalid_recursion: "42P19",
   undefined_parameter: "42P02",
@@ -254,6 +256,7 @@ export const ERRORS: readonly ErrorDesc[] = [
   { code: "42P16", name: "invalid_table_definition", class: "syntax error or access rule violation" },
   { code: "42803", name: "grouping_error", class: "syntax error or access rule violation" },
   { code: "42883", name: "undefined_function", class: "syntax error or access rule violation" },
+  { code: "42723", name: "duplicate_function", class: "syntax error or access rule violation" },
   { code: "42P18", name: "indeterminate_datatype", class: "syntax error or access rule violation" },
   { code: "42P19", name: "invalid_recursion", class: "syntax error or access rule violation" },
   { code: "42P02", name: "undefined_parameter", class: "syntax error or access rule violation" },

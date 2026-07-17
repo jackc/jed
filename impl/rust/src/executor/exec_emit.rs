@@ -1349,6 +1349,7 @@ impl Engine {
             RExpr::Coalesce { args, .. }
             | RExpr::GreatestLeast { args, .. }
             | RExpr::ScalarFunc { args, .. }
+            | RExpr::HostFunc { args, .. }
             | RExpr::ArrayFunc { args, .. }
             | RExpr::RangeFunc { args, .. }
             | RExpr::RegexFunc { args, .. }

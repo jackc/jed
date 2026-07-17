@@ -816,6 +816,13 @@ pub struct SessionState {
     /// `Clone`): a `uuidv7()` / `now()` in a streaming projection then draws from the same injected
     /// source as the eager path, keeping the result byte-identical under full drain (streaming.md §6).
     pub(crate) seam: std::rc::Rc<crate::seam::Seam>,
+    /// The host-supplied extension registry (spec/design/extensibility.md §7): the scalar functions a
+    /// host registered at open/create, **frozen** for the handle's lifetime and shared (`Arc`) across
+    /// every session minted from the handle (and a streaming cursor's frozen engine). An empty default
+    /// registry for a handle opened with no extensions, so the built-in-only path is unaffected. `Arc`
+    /// (not `Rc` like the seam) because the `Send + Sync` [`Database`](crate::Database) holds the master
+    /// copy on its shared core — the kernels are `Send + Sync`.
+    pub(crate) extensions: std::sync::Arc<crate::extension::ExtensionRegistry>,
     /// **SessionState** `currval` state (spec/design/sequences.md §6): the last value `nextval`/
     /// `setval(…,true)` produced **in this session** for each sequence (lowercased name). NOT in the
     /// snapshot and NOT persisted — strictly session-local, as in PostgreSQL.
@@ -932,6 +939,9 @@ impl SessionState {
                 opts.work_mem
             },
             seam: std::rc::Rc::new(crate::seam::Seam::default()),
+            // Default = no host extensions; a handle created/opened with a registry overrides this on
+            // its minted sessions (shared.rs) — the bare/default session stays extension-free.
+            extensions: std::sync::Arc::new(crate::extension::ExtensionRegistry::default()),
             session_seq: HashMap::new(),
             session_last_name: None,
             pending_seq: std::cell::RefCell::new(HashMap::new()),
@@ -2749,6 +2759,22 @@ pub(crate) enum RExpr {
     /// Arguments propagate NULL.
     ScalarFunc {
         func: ScalarFunc,
+        args: Vec<RExpr>,
+        result: ScalarType,
+    },
+    /// A **host-defined** scalar-function call (spec/design/extensibility.md §4.2 / §5.1) — the
+    /// injection seam that reaches a host-registered kernel a compiled `match` on the closed
+    /// [`ScalarFunc`] enum cannot. `id` indexes the frozen [`ExtensionRegistry`](crate::extension)
+    /// on the session; `result` is the host's declared scalar result type. STRICT (a NULL arg → NULL,
+    /// short-circuited in eval like [`RExpr::ScalarFunc`]). Kept a **separate** variant so the
+    /// built-in path stays a monomorphized inline `match` (§5) and no built-in id-reasoning applies
+    /// to host code.
+    HostFunc {
+        id: usize,
+        /// The (lowercased) function name, carried on the node so EXPLAIN can render it without the
+        /// registry (which the `&RExpr`-only printer does not have). Redundant with the registry
+        /// entry at `id`; a few bytes per node.
+        name: String,
         args: Vec<RExpr>,
         result: ScalarType,
     },

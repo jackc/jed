@@ -99,6 +99,8 @@ mod foreign_key;
 mod generate_series;
 #[path = "../tests/gist_index.rs"]
 mod gist_index;
+#[path = "../tests/host_functions.rs"]
+mod host_functions;
 #[path = "../tests/identity.rs"]
 mod identity;
 #[path = "../tests/incremental.rs"]

@@ -758,6 +758,7 @@ pub(crate) fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
         RExpr::Coalesce { args, .. }
         | RExpr::GreatestLeast { args, .. }
         | RExpr::ScalarFunc { args, .. }
+        | RExpr::HostFunc { args, .. }
         | RExpr::ArrayFunc { args, .. }
         | RExpr::RangeFunc { args, .. }
         | RExpr::RegexFunc { args, .. }
@@ -914,6 +915,7 @@ pub(crate) fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
         RExpr::Coalesce { args, .. }
         | RExpr::GreatestLeast { args, .. }
         | RExpr::ScalarFunc { args, .. }
+        | RExpr::HostFunc { args, .. }
         | RExpr::ArrayFunc { args, .. }
         | RExpr::RangeFunc { args, .. }
         | RExpr::RegexFunc { args, .. }

@@ -9,9 +9,12 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use std::sync::Arc;
+
 use crate::blockstore::FileBlockStore;
 use crate::error::{EngineError, Result, SqlState};
 use crate::executor::{DEFAULT_PAGE_SIZE, Engine, Snapshot};
+use crate::extension::ExtensionRegistry;
 use crate::pager::Pager;
 use crate::paging::{DEFAULT_CACHE_BYTES, SharedPaging, cache_leaves};
 
@@ -65,6 +68,11 @@ pub struct CreateOptions {
     pub skip_fsync: bool,
     pub locking: Locking,
     pub file_lock_timeout_ms: u64,
+    /// Host extensions to register on this database (spec/design/extensibility.md §7): scalar
+    /// functions the host supplies, **frozen** for the handle's lifetime and shared into every
+    /// session. Default empty (no extensions). Not stored in the file — a host reopens with its own
+    /// registry (the ephemeral, no-persisted-use rule of §14 step 3).
+    pub extensions: Arc<ExtensionRegistry>,
 }
 
 impl Default for CreateOptions {
@@ -75,6 +83,7 @@ impl Default for CreateOptions {
             skip_fsync: false,
             locking: Locking::Auto,
             file_lock_timeout_ms: DEFAULT_FILE_LOCK_TIMEOUT_MS,
+            extensions: Arc::new(ExtensionRegistry::default()),
         }
     }
 }
@@ -82,7 +91,9 @@ impl Default for CreateOptions {
 /// Open-time settings for a file-backed database (spec/design/api.md §2.1). Unlike
 /// [`DatabaseOptions`] (create-time, fixed into the file), these are **handle** settings — not stored
 /// in the file, so a different host may reopen the same file with different ones.
-#[derive(Clone, Copy, Debug)]
+///
+/// No longer `Copy` since it carries the host extension registry (`Arc`); still cheap to `Clone`.
+#[derive(Clone, Debug)]
 pub struct OpenOptions {
     /// The buffer-pool budget **in bytes**: roughly the maximum memory the resident leaf cache holds
     /// at once (spec/design/pager.md §3, P6.4b/c). Bytes, not a page count, so the budget does not
@@ -112,6 +123,11 @@ pub struct OpenOptions {
     pub skip_fsync: bool,
     pub locking: Locking,
     pub file_lock_timeout_ms: u64,
+    /// Host extensions to register on this handle (spec/design/extensibility.md §7): scalar functions
+    /// the host supplies, **frozen** for the handle's lifetime. A handle setting like the rest — not
+    /// stored in the file, so a reopening host brings its own (§14 step 3: no persisted use). Default
+    /// empty.
+    pub extensions: Arc<ExtensionRegistry>,
 }
 
 impl Default for OpenOptions {
@@ -123,6 +139,7 @@ impl Default for OpenOptions {
             skip_fsync: false,
             locking: Locking::Auto,
             file_lock_timeout_ms: DEFAULT_FILE_LOCK_TIMEOUT_MS,
+            extensions: Arc::new(ExtensionRegistry::default()),
         }
     }
 }

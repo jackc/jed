@@ -124,6 +124,8 @@ pub enum SqlState {
     GroupingError,
     /// 42883 — function does not exist: {name}
     UndefinedFunction,
+    /// 42723 — duplicate function: {detail}
+    DuplicateFunction,
     /// 42P18 — could not determine data type of parameter ${index}
     IndeterminateDatatype,
     /// 42P19 — {detail}
@@ -242,6 +244,7 @@ impl SqlState {
             SqlState::InvalidTableDefinition => "42P16",
             SqlState::GroupingError => "42803",
             SqlState::UndefinedFunction => "42883",
+            SqlState::DuplicateFunction => "42723",
             SqlState::IndeterminateDatatype => "42P18",
             SqlState::InvalidRecursion => "42P19",
             SqlState::UndefinedParameter => "42P02",
@@ -342,6 +345,7 @@ pub const ERRORS: &[ErrorDesc] = &[
     ErrorDesc { code: "42P16", name: "invalid_table_definition", class: "syntax error or access rule violation" },
     ErrorDesc { code: "42803", name: "grouping_error", class: "syntax error or access rule violation" },
     ErrorDesc { code: "42883", name: "undefined_function", class: "syntax error or access rule violation" },
+    ErrorDesc { code: "42723", name: "duplicate_function", class: "syntax error or access rule violation" },
     ErrorDesc { code: "42P18", name: "indeterminate_datatype", class: "syntax error or access rule violation" },
     ErrorDesc { code: "42P19", name: "invalid_recursion", class: "syntax error or access rule violation" },
     ErrorDesc { code: "42P02", name: "undefined_parameter", class: "syntax error or access rule violation" },

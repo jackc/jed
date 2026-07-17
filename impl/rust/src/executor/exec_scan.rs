@@ -712,6 +712,7 @@ impl Engine {
         dst.cancel = src.cancel.clone();
         dst.work_mem = src.work_mem;
         dst.seam = src.seam.clone(); // shared seam (Rc) — uuid/clock draw from the injected source
+        dst.extensions = src.extensions.clone(); // shared frozen host-function registry (extensibility.md §7)
         dst.vars = src.vars.clone();
         dst.time_zone = src.time_zone.clone();
         dst.session_seq = src.session_seq.clone(); // currval/lastval reads stay faithful

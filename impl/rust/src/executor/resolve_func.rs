@@ -345,7 +345,10 @@ pub(crate) fn resolve_func_call(
         }
         return resolve_binary(scope, BinaryOp::Mod, &args[0], &args[1], agg, params);
     }
-    if is_scalar_func_name(&lname) {
+    // A built-in scalar function OR a host-registered one (extensibility.md §4.2 — a host-only name
+    // routes here too; `resolve_scalar_func` tries the built-in catalog first, then the host
+    // registry). Host functions are positional-only, so `reject_named` applies to them as well.
+    if is_scalar_func_name(&lname) || scope.catalog.session.extensions.has_function(&lname) {
         reject_named(&lname, arg_names)?;
         return resolve_scalar_func(scope, &lname, args, star, agg, params);
     }
@@ -753,27 +756,65 @@ pub(crate) fn resolve_scalar_func(
     // (its boundary range-checks for integers; its width for floats, the only `promoted` float fn);
     // round's decimal/integer overloads return numeric, its float overloads f64; the remaining
     // float functions return f64; the uuid extractors/generators return their catalog scalar id.
-    let desc = lookup_scalar_overload(name, &tys).ok_or_else(|| no_func_overload(name))?;
-    let result = scalar_result_type(desc.result, &tys);
-    let func = scalar_func_id(name);
-    // Promote float arguments to f64 when the function computes at f64 (every float
-    // overload except `abs(f32)`, which keeps its width). The eval then sees one width.
-    let widen_args = !matches!(func, ScalarFunc::Abs);
-    if widen_args && result == ScalarType::Float64 {
-        rargs = rargs
-            .into_iter()
-            .zip(tys.iter())
-            .map(|(r, t)| widen_float_to_f64(r, t))
-            .collect();
+    // A built-in overload wins over any host overload of the same signature (extensibility.md §4.2),
+    // so the built-in catalog is consulted first; a host function is reached only when no built-in
+    // matches (a host-only name, or a host overload over a signature the built-in name does not
+    // accept).
+    if let Some(desc) = lookup_scalar_overload(name, &tys) {
+        let result = scalar_result_type(desc.result, &tys);
+        let func = scalar_func_id(name);
+        // Promote float arguments to f64 when the function computes at f64 (every float
+        // overload except `abs(f32)`, which keeps its width). The eval then sees one width.
+        let widen_args = !matches!(func, ScalarFunc::Abs);
+        if widen_args && result == ScalarType::Float64 {
+            rargs = rargs
+                .into_iter()
+                .zip(tys.iter())
+                .map(|(r, t)| widen_float_to_f64(r, t))
+                .collect();
+        }
+        return Ok((
+            RExpr::ScalarFunc {
+                func,
+                args: rargs,
+                result,
+            },
+            resolved_type_of(result),
+        ));
     }
-    Ok((
-        RExpr::ScalarFunc {
-            func,
-            args: rargs,
-            result,
-        },
-        resolved_type_of(result),
-    ))
+    // Host-registered scalar function (extensibility.md §4.2): exact scalar signature, no implicit
+    // promotion. `id` indexes the frozen registry; the kernel is reached by id at eval.
+    if let Some((id, result)) = resolve_host_scalar(scope, name, &tys) {
+        return Ok((
+            RExpr::HostFunc {
+                id,
+                name: name.to_string(),
+                args: rargs,
+                result,
+            },
+            resolved_type_of(result),
+        ));
+    }
+    Err(no_func_overload(name))
+}
+
+/// Resolve `(name, arg types)` against the session's frozen host-function registry
+/// (spec/design/extensibility.md §4.2): every argument must be a *scalar* type (a container/NULL
+/// argument matches no host signature this slice), and the whole signature must match a registered
+/// function exactly. Returns the host-function `id` (a stable registry index) + its declared scalar
+/// result type, or `None` (the caller falls through to `42883`).
+fn resolve_host_scalar(
+    scope: &Scope,
+    name: &str,
+    tys: &[ResolvedType],
+) -> Option<(usize, ScalarType)> {
+    let registry = &scope.catalog.session.extensions;
+    let mut arg_scalars = Vec::with_capacity(tys.len());
+    for t in tys {
+        arg_scalars.push(resolved_to_scalar(t)?);
+    }
+    let id = registry.resolve(name, &arg_scalars)?;
+    Some((id, registry.function(id).result))
 }
 
 /// The 42804 raised when a `VARIADIC` operand is not an array (array-functions.md §12 / §7).
@@ -1970,6 +2011,7 @@ pub(crate) fn render_rexpr(e: &RExpr) -> String {
             explain_call(if *greatest { "greatest" } else { "least" }, args)
         }
         RExpr::ScalarFunc { func, args, .. } => explain_call(&explain_scalar_func(*func), args),
+        RExpr::HostFunc { name, args, .. } => explain_call(name, args),
         RExpr::ArrayFunc { func, args } => explain_call(explain_array_func(func), args),
         RExpr::RangeFunc { func, args } => explain_call(explain_range_func(*func), args),
         RExpr::RegexFunc { func, args, .. } => explain_call(explain_regex_func(*func), args),

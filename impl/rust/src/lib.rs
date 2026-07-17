@@ -38,6 +38,7 @@ mod error;
 mod estimator;
 mod estimator_constants;
 mod executor;
+mod extension;
 mod file;
 mod format;
 mod gist;
@@ -87,6 +88,11 @@ pub use decimal::Decimal;
 // path is unchanged.
 pub use ergonomic::{FromValue, Params, Row, ToValue};
 pub use error::{EngineError, Result, SqlState};
+// Host extensibility (spec/design/extensibility.md §4.2) — the host registers scalar functions into
+// an `ExtensionRegistry` and hands it to `create`/`open` via `CreateOptions`/`OpenOptions`. The
+// scalar type set is on the public surface here because a host names it to declare signatures.
+pub use extension::{ExtensionRegistry, HostFunction, HostKernel, Volatility};
+pub use types::ScalarType;
 pub use executor::{
     CollationInfo, DEFAULT_MAX_SQL_LENGTH, DEFAULT_PAGE_SIZE, ScriptSummary, SessionOptions,
     TxStatus,
